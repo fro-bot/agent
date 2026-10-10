@@ -5,6 +5,7 @@ import type {TokenUsage} from '../../shared/types.js'
 import type {ExecutionDeadline} from './retry.js'
 import {
   classifyContextOverflowError,
+  classifyModelNotFoundError,
   classifyProviderAuthError,
   classifyQuotaError,
   createAgentError,
@@ -279,8 +280,17 @@ export function classifyRetryStatusError(status: unknown): ErrorInfo | null {
   )
 }
 
+/**
+ * Errors that cannot recover within a run settle on first observation (no poll grace cycles, no retry).
+ * `model_not_found` belongs here: a wrong model id or unreachable catalog is identical on every attempt.
+ */
 function isTerminalProviderError(error: ErrorInfo): boolean {
-  return error.type === 'context_overflow' || error.type === 'quota_exceeded' || error.type === 'provider_auth_error'
+  return (
+    error.type === 'context_overflow' ||
+    error.type === 'quota_exceeded' ||
+    error.type === 'provider_auth_error' ||
+    error.type === 'model_not_found'
+  )
 }
 
 /** True when a thrown stream error reflects a shutdown we asked for, not one the transport handed us. */
@@ -1067,10 +1077,20 @@ export async function processEventStream(
             classificationPath = 'structured'
             llmError = mergeActivityError(llmError, terminalError, activityTracker, undefined, classificationPath)
           } else if (llmError == null || isTerminalProviderError(llmError) === false) {
-            const errorStr = normalizeSessionError(sessionError)
+            // OpenCode reports an unresolvable model as a bare `UnknownError`; the allowlisted model id and
+            // suggestions only exist in its message, so surface them instead of the name-only diagnostic.
+            const modelNotFoundError = classifyModelNotFoundError({kind: 'session-error', message})
+            const errorStr = modelNotFoundError?.message ?? normalizeSessionError(sessionError)
             let genericError: ErrorInfo
             let genericClassificationPath: ClassificationPath
-            if (isLlmFetchError(errorStr)) {
+            if (modelNotFoundError != null) {
+              logger.error('Session error classified as model not found', {
+                sessionId,
+                error: modelNotFoundError.message,
+              })
+              genericError = modelNotFoundError
+              genericClassificationPath = 'fallback'
+            } else if (isLlmFetchError(errorStr)) {
               genericError = createLLMFetchError(errorStr, model ?? undefined)
               genericClassificationPath = 'fallback'
             } else if (status === 429) {

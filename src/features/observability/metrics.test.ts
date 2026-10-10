@@ -245,6 +245,20 @@ describe('createMetricsCollector', () => {
     expect(collector.getMetrics().errors[0]).toHaveProperty('classificationPath', 'structured')
   })
 
+  it('records the suggested action only when one is given', () => {
+    // #given a collector
+    const collector = createMetricsCollector()
+
+    // #when recording one error with and one without a suggested action
+    collector.recordError('model_not_found', 'Model not found: a/b.', false, 'fallback', 'Fix the model id')
+    collector.recordError('Other', 'plain', true)
+
+    // #then only the first carries the property
+    const [withAction, withoutAction] = collector.getMetrics().errors
+    expect(withAction).toHaveProperty('suggestedAction', 'Fix the model id')
+    expect(withoutAction).not.toHaveProperty('suggestedAction')
+  })
+
   it('returns frozen metrics snapshot', () => {
     // #given
     const collector = createMetricsCollector()

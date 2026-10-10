@@ -3,6 +3,7 @@ import type {
   OutputModeMigrationState,
   OutputModeRequestState,
   OwnershipLedger,
+  ResponseMode,
 } from '@fro-bot/runtime'
 import type {OpenCodeServerHandle} from '../features/agent/index.js'
 import type {ReactionContext} from '../features/agent/types.js'
@@ -26,6 +27,7 @@ import {runAcquireLock, type LeaseController} from './phases/acquire-lock.js'
 import {runBootstrap} from './phases/bootstrap.js'
 import {runCacheRestore} from './phases/cache-restore.js'
 import {runCleanup} from './phases/cleanup.js'
+import {runBlockedLabelClear} from './phases/coordination-clear.js'
 import {runCoordinationDecline} from './phases/coordination-decline.js'
 import {runDedup, saveDedupMarker} from './phases/dedup.js'
 import {computeDrainDeadlineMs, resolveRequestedOutputModeState, runDrain, runExecute} from './phases/execute.js'
@@ -86,6 +88,8 @@ export async function run(): Promise<number> {
   let ownershipUnresolved = false
   let triggerContext: TriggerContext | null = null
   let dedupEntity: DeduplicationEntity | null = null
+  // Hoisted for the post-cleanup blocked-label clear in the `finally` block; null until bootstrap resolves inputs.
+  let responseMode: ResponseMode | null = null
   // Tracks failure/skip explicitly, set at each early-return site below, rather than
   // inferring delivery from `exitCode === 0` in the `finally` block. `return 1`/`return 0`
   // inside the `try` block already fixes this invocation's returned number before `finally`
@@ -137,6 +141,7 @@ export async function run(): Promise<number> {
     detectedOpencodeVersion = bootstrap.opencodeResult.version
     storeConfig = bootstrap.inputs.storeConfig
     sessionRetention = bootstrap.inputs.sessionRetention
+    responseMode = bootstrap.inputs.responseMode
 
     const routing = await runRouting(bootstrap, startTime)
     if ('skipped' in routing) {
@@ -439,6 +444,20 @@ export async function run(): Promise<number> {
 
     setInvocationOutcomeOutput(finalOutcome)
     await writeInvocationOutcomeSummary(finalOutcome, finalIncompleteReasons, bootstrapLogger, skipDetail ?? undefined)
+
+    // A succeeded run clears the `agent: blocked` label a PRIOR run's coordination decline left on this item.
+    // Last, after every output/summary is written: best-effort, deadline-bounded, never throws. The phase itself
+    // no-ops for any other outcome (including this run's own declined/errored lock), response-mode none, and
+    // non-issue/PR targets.
+    if (githubClient != null && triggerContext != null && responseMode != null) {
+      await runBlockedLabelClear({
+        githubClient,
+        triggerContext,
+        outcome: finalOutcome,
+        responseMode,
+        logger: bootstrapLogger,
+      })
+    }
   }
 
   return exitCode

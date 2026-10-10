@@ -18,6 +18,14 @@ export const DEFAULT_TIMEOUT_MS = 1800000 // 30 minutes
 // byte-for-byte identical to today while making the budget observable/adjustable.
 export const DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS = 5000
 
+// Value pinned into OPENCODE_CLIENT for the Action's OpenCode server. Upstream offers the
+// interactive `question` tool only when the client is `app`, `cli` or `desktop` (or
+// OPENCODE_ENABLE_QUESTION_TOOL is set) -- `tool/registry.ts:207` at the pinned base_version --
+// and the unset default is `cli`. Nobody can answer a question in CI, so any non-interactive
+// value keeps the tool out of the registry entirely. Distinct from `run`/`acp` (other upstream
+// and oMo clients) so it is attributable in the models.dev user agent and OTLP attributes.
+export const NON_INTERACTIVE_OPENCODE_CLIENT = 'fro-bot-action'
+
 // Bound on bootstrapOpenCodeServer's instance-scoped readiness probe -- time-to-first-
 // answer, distinct from DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS's time-to-listen budget above.
 // Not operator-tunable via an action input.

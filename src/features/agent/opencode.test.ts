@@ -1640,6 +1640,45 @@ describe('verifyOpenCodeAvailable', () => {
   })
 })
 
+/** Runs `executeOpenCode` against a root `session.error` UnknownError carrying `message`. */
+async function runWithUnknownError(message: string, logger: Logger) {
+  const mockServer = createMockServer()
+  let promptCallCount = 0
+  const mockClient = {
+    session: {
+      create: vi.fn().mockResolvedValue({data: {id: 'ses_123'}}),
+      promptAsync: vi.fn().mockImplementation(async () => {
+        promptCallCount++
+        return Promise.resolve({data: {parts: [{type: 'text', text: 'Response'}]}})
+      }),
+      status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}}),
+    },
+    event: {
+      subscribe: vi.fn().mockImplementation(async (options?: {signal?: AbortSignal}) =>
+        createPromptStartedEventStream(
+          mockClient.session.promptAsync,
+          [
+            {
+              type: 'session.error',
+              properties: {sessionID: 'ses_123', error: {name: 'UnknownError', data: {message}}},
+            },
+          ] as unknown as Event[],
+          options?.signal,
+        ),
+      ),
+    },
+  }
+  vi.mocked(createOpencode).mockResolvedValue({
+    client: mockClient,
+    server: mockServer,
+  } as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+  const resultPromise = executeOpenCode(createMockPromptOptions(), logger)
+  await vi.advanceTimersByTimeAsync(10_000)
+  const result = await resultPromise
+  return {result, promptCallCount}
+}
+
 describe('executeOpenCode retry behavior', () => {
   let mockLogger: Logger
 
@@ -1943,6 +1982,46 @@ describe('executeOpenCode retry behavior', () => {
       'LLM fetch error detected, retrying with continuation prompt',
       expect.any(Object),
     )
+  })
+
+  describe('session.error UnknownError settlement', () => {
+    const GRACE_LOG = 'Session error persisted through grace period'
+    const RETRY_LOG = 'LLM fetch error detected, retrying with continuation prompt'
+
+    it('ends the run on the first model_not_found with no grace cycles and no retry', async () => {
+      // #given a session.error whose message says the requested model cannot be resolved
+      // #when the run executes
+      const {result, promptCallCount} = await runWithUnknownError(
+        'Model not found: anthropic/claude-sonnet-5-5. Did you mean: claude-sonnet-4-5?',
+        mockLogger,
+      )
+
+      // #then one prompt was sent, the grace path never ran, and no retry was attempted
+      expect(promptCallCount).toBe(1)
+      expect(mockLogger.error).not.toHaveBeenCalledWith(GRACE_LOG, expect.any(Object))
+      expect(mockLogger.warning).not.toHaveBeenCalledWith(RETRY_LOG, expect.any(Object))
+
+      // #then the classified error, message, and hint survive to the result
+      expect(result.success).toBe(false)
+      expect(result.llmError?.type).toBe('model_not_found')
+      expect(result.llmError?.retryable).toBe(false)
+      expect(result.llmError?.message).toBe(
+        'Model not found: anthropic/claude-sonnet-5-5. Did you mean: claude-sonnet-4-5?',
+      )
+      expect(result.llmError?.suggestedAction).toBeDefined()
+    })
+
+    it('keeps the grace period for an UnknownError that is not model_not_found', async () => {
+      // #given an unrelated UnknownError
+      // #when the run executes
+      const {result, promptCallCount} = await runWithUnknownError('something unrelated broke', mockLogger)
+
+      // #then it still waits out the poll grace period before failing, and is not retried
+      expect(promptCallCount).toBe(1)
+      expect(mockLogger.error).toHaveBeenCalledWith(GRACE_LOG, expect.objectContaining({sessionId: 'ses_123'}))
+      expect(result.success).toBe(false)
+      expect(result.llmError?.type).not.toBe('model_not_found')
+    })
   })
 
   it('fails the execution boundary on poll-only auth_unavailable with no SSE auth event', async () => {

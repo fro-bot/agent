@@ -459,6 +459,7 @@ export async function runExecute(
       result.llmError.message,
       result.llmError.retryable,
       result.classificationPath,
+      result.llmError.suggestedAction,
     )
   }
   for (const pr of result.prsCreated) {

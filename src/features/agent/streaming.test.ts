@@ -1238,6 +1238,127 @@ describe('processEventStream — structured failure capture on the activity trac
     expect(activityTracker.terminalProviderError).toBeUndefined()
   })
 
+  it('a model-not-found UnknownError keeps the real cause instead of collapsing to name=UnknownError', async () => {
+    // #given the exact session.error payload OpenCode publishes when the requested model can't be resolved
+    // (opencode v1.18.34 session/prompt.ts:604-610: NamedError.Unknown({message}).toObject())
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const logger = createMockLogger()
+    const modelNotFoundEvent: Event = {
+      type: 'session.error',
+      properties: {
+        sessionID: ROOT_SESSION_ID,
+        error: {
+          name: 'UnknownError',
+          data: {message: 'Model not found: anthropic/claude-sonnet-5-5. Did you mean: claude-sonnet-4-5?'},
+        },
+      },
+    } as unknown as Event
+
+    // #when the event is processed
+    const result = await processEventStream(
+      createMockEventStream([modelNotFoundEvent]),
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      logger,
+      activityTracker,
+    )
+
+    // #then the failure is classified as its own kind and names the model and suggestion
+    expect(result.llmError?.type).toBe('model_not_found')
+    expect(result.llmError?.message).toContain('anthropic/claude-sonnet-5-5')
+    expect(result.llmError?.message).toContain('claude-sonnet-4-5')
+    expect(result.llmError?.message).not.toContain('name=UnknownError')
+    // #then it is terminal on first observation, so the poll loop settles without a grace period
+    expect(activityTracker.terminalProviderError?.type).toBe('model_not_found')
+    expect(activityTracker.genericError).toBeUndefined()
+
+    // #then the tracker string carries the cause too
+    expect(activityTracker.sessionError).toContain('anthropic/claude-sonnet-5-5')
+
+    // #then the diagnostic is logged with the model id
+    expect(logger.error).toHaveBeenCalledWith('Session error classified as model not found', {
+      sessionId: ROOT_SESSION_ID,
+      error: 'Model not found: anthropic/claude-sonnet-5-5. Did you mean: claude-sonnet-4-5?',
+    })
+  })
+
+  it('a later Cause.pretty duplicate of the model-not-found error does not displace the first', async () => {
+    // #given the two session.error events promptAsync's failure produces: the clean message first, then the
+    // Cause.pretty rendering (handlers/session.ts:319-322)
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const clean: Event = {
+      type: 'session.error',
+      properties: {
+        sessionID: ROOT_SESSION_ID,
+        error: {name: 'UnknownError', data: {message: 'Model not found: anthropic/claude-sonnet-5-5.'}},
+      },
+    } as unknown as Event
+    const pretty: Event = {
+      type: 'session.error',
+      properties: {
+        sessionID: ROOT_SESSION_ID,
+        error: {
+          name: 'UnknownError',
+          data: {message: 'ProviderModelNotFoundError: Model not found: anthropic/claude-sonnet-5-5.\n    at x'},
+        },
+      },
+    } as unknown as Event
+
+    // #when both are processed
+    const result = await processEventStream(
+      createMockEventStream([clean, pretty]),
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then exactly the first classified error stands
+    expect(result.llmError?.type).toBe('model_not_found')
+    expect(result.llmError?.message).toBe('Model not found: anthropic/claude-sonnet-5-5.')
+  })
+
+  it('an UnknownError without a model-not-found message keeps the bounded name-only diagnostic', async () => {
+    // #given an UnknownError whose message is unrelated (and could carry provider text we must not echo)
+    const activityTracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const event: Event = {
+      type: 'session.error',
+      properties: {
+        sessionID: ROOT_SESSION_ID,
+        error: {name: 'UnknownError', data: {message: 'token sk-live-123 leaked in provider text'}},
+      },
+    } as unknown as Event
+
+    // #when processed
+    const result = await processEventStream(
+      createMockEventStream([event]),
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then behavior is unchanged: generic configuration error, provider text not echoed
+    expect(result.llmError?.type).toBe('configuration')
+    expect(result.llmError?.message).toBe('Agent error: name=UnknownError')
+    expect(JSON.stringify(result.llmError)).not.toContain('sk-live-123')
+  })
+
   it('a classified root retry status no longer sets terminal lifecycle state, but its failure still merges with full precedence', async () => {
     // #given an activity tracker and a root session.status retry classified as terminal (quota)
     const activityTracker: ActivityTracker = {

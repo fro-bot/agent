@@ -73,7 +73,10 @@ const DENY_SUFFIXES: readonly string[] = [
   '_CREDENTIAL',
 ]
 
-const DENY_EXACT_KEYS: ReadonlySet<string> = new Set(['GITHUB_TOKEN', 'GH_TOKEN'])
+// OPENCODE_PURE sits under the allowed OPENCODE_ prefix but makes the server skip every external plugin
+// (packages/opencode/src/plugin/index.ts:181), which would silently drop the task-reuse guard and the
+// Systematic plugin from a CI run. An operator's value must never reach the agent server.
+const DENY_EXACT_KEYS: ReadonlySet<string> = new Set(['GITHUB_TOKEN', 'GH_TOKEN', 'OPENCODE_PURE'])
 
 const DENY_PREFIXES: readonly string[] = ['AWS_', 'INPUT_']
 

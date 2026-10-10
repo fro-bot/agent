@@ -109,6 +109,19 @@ describe('filterAgentEnv', () => {
     expect(result).toEqual({OPENCODE_CONFIG_CONTENT: '{}'})
   })
 
+  it('drops OPENCODE_PURE, which would make the server skip every plugin including the task-reuse guard', () => {
+    // #given an operator environment that sets OPENCODE_PURE in several spellings the server's flag parser accepts
+    for (const value of ['1', 'true', 'yes', 'on']) {
+      const env = {OPENCODE_PURE: value, OPENCODE_CONFIG_CONTENT: '{}', PATH: '/usr/bin'}
+
+      // #when
+      const result = filterAgentEnv(env)
+
+      // #then only the plugin-skipping switch is withheld; the rest of the OPENCODE_ prefix still passes
+      expect(result).toEqual({OPENCODE_CONFIG_CONTENT: '{}', PATH: '/usr/bin'})
+    }
+  })
+
   it('retains GH_CONFIG_DIR (load-bearing: off-env gh auth relies on this reaching the child)', () => {
     // #given
     const env = {GH_CONFIG_DIR: '/tmp/gh-config-xyz', PATH: '/usr/bin'}

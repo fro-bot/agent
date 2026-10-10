@@ -12,6 +12,7 @@ import type {ExecutionDeadline} from './retry.js'
 import type {ActivityTracker} from './streaming.js'
 import {
   classifyContextOverflowError,
+  classifyModelNotFoundError,
   classifyProviderAuthError,
   classifyQuotaError,
   createAgentError,
@@ -436,6 +437,12 @@ function classifyAssistantMessageError(
     classifyQuotaError({kind: 'session-error', status: status ?? undefined, code: code ?? undefined})
   if (terminalError != null) return {error: terminalError, classificationPath: 'structured'}
 
+  const modelNotFoundError = classifyModelNotFoundError({
+    kind: 'session-error',
+    message: getStringProperty(messageError, 'message') ?? getStringProperty(errorData, 'message') ?? undefined,
+  })
+  if (modelNotFoundError != null) return {error: modelNotFoundError, classificationPath: 'fallback'}
+
   const errorStr = normalizeSessionError(messageError)
   if (isLlmFetchError(errorStr))
     return {error: createLLMFetchError(errorStr, model ?? undefined), classificationPath: 'fallback'}
@@ -481,7 +488,9 @@ interface MessageCompletionCandidate {
  * user message with no newer unanswered one (the pending-parent barrier); `time.completed`
  * present; `finish` present and not `tool-calls`/`unknown`; no non-provider-executed tool call left
  * pending/running (a continuation the upstream prompt loop would still run another iteration for);
- * and no renewed root activity since the request was issued (revision check). Confirms the same
+ * and no renewed root activity since the request was issued (revision check; a stale response never
+ * mutates turn state, but its assistant error is still classified -- failure evidence is not
+ * revision-scoped). Confirms the same
  * qualified candidate remains latest across two consecutive polls before returning it.
  *
  * Returns a CANDIDATE, not a settlement, and never mutates `currentTurnTerminalSignalReceived` --
@@ -518,6 +527,18 @@ async function detectMessageActivity(
     signal,
     deadline,
   )
+
+  // Renewed root activity observed while this request was in flight makes the response stale.
+  // Captured once, immediately after the await and before anything below can advance the revision
+  // itself (a FRESH response registering a missed parent turn does), so it reflects only drift
+  // that happened during the request. Staleness gates every TURN-STATE mutation below -- parent
+  // registration (which would otherwise overwrite a newer pending parent SSE registered
+  // mid-request, discarding that freshness evidence), latest-root-user bookkeeping, completion
+  // candidates, and two-poll confirmation memory -- but NOT failure evidence: an error on the
+  // newest assistant message is authoritative whenever it was observed, exactly as before the
+  // revision guard existed, so the stale rejection sits after the error classification.
+  const isStaleResponse = rootFreshness != null && rootFreshness.revision !== requestRevision
+
   const messages = Array.isArray(messagesResponse.data) ? messagesResponse.data : []
   let latestAssistantMessage: unknown = null
   let latestAssistantMessageInfo: unknown = null
@@ -549,6 +570,7 @@ async function detectMessageActivity(
   // already knows the turn. The barrier clears only through the existing resolution path, when a
   // qualified terminal reply to this turn is admitted.
   if (
+    !isStaleResponse &&
     rootFreshness != null &&
     newestRootUserMessageId != null &&
     newestRootUserMessageId !== submittedPromptMessageId &&
@@ -566,7 +588,6 @@ async function detectMessageActivity(
     return null
   }
 
-  activityTracker.firstMeaningfulEventReceived = true
   const latestAssistantMessageId = getStringProperty(latestAssistantMessageInfo, 'id')
   if (latestAssistantMessageId == null) {
     activityTracker.completedAssistantMessageId = undefined
@@ -575,9 +596,13 @@ async function detectMessageActivity(
 
   // An assistant carrying an error is failure evidence, never a clean candidate -- classified
   // through the same bounded precedence as SSE `session.error`, so it settles as a failure
-  // instead of silently falling through to a generic timeout.
+  // instead of silently falling through to a generic timeout. Deliberately BEFORE the stale
+  // rejection below and not revision-scoped: failure evidence does not become less true because
+  // root activity advanced while the request was in flight, and discarding it would let a missed
+  // `session.error` plus an SSE idle settle a provider failure as a completion.
   const messageError = getObjectProperty(latestAssistantMessageInfo, 'error')
   if (messageError != null) {
+    activityTracker.firstMeaningfulEventReceived = true
     activityTracker.completedAssistantMessageId = undefined
     const model = getStringProperty(latestAssistantMessageInfo, 'modelID')
     const classified = classifyAssistantMessageError(messageError, model)
@@ -602,6 +627,17 @@ async function detectMessageActivity(
     }
     return {settlement: {kind: 'failure-observed'}, failures: [failure]}
   }
+
+  // A stale response with no failure evidence is an interrupted observation: it must not become a
+  // completion candidate or seed confirmation memory, and confirmation memory is reset. Every path
+  // out of this function below this point is therefore reached only by a response that was fresh
+  // at the await.
+  if (isStaleResponse) {
+    activityTracker.completedAssistantMessageId = undefined
+    return null
+  }
+
+  activityTracker.firstMeaningfulEventReceived = true
 
   const completedAt = getNumberProperty(getObjectProperty(latestAssistantMessageInfo, 'time'), 'completed')
   if (completedAt == null) {
@@ -686,7 +722,9 @@ async function detectMessageActivity(
     }
   }
 
-  // Renewed root activity observed while this request was in flight invalidates the response.
+  // Retained after the stale rejection above: the revision can still advance within this call, when
+  // a FRESH response registers a parent turn it discovered (a missed injected turn). That
+  // advancement must still defer confirmation, so the same check stands here.
   if (rootFreshness != null && rootFreshness.revision !== requestRevision) {
     activityTracker.completedAssistantMessageId = undefined
     return null

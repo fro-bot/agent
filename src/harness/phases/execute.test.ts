@@ -703,6 +703,34 @@ describe('runExecute overflow recovery', () => {
     expect(result.llmError?.type).toBe('quota_exceeded')
   })
 
+  it('records the suggested action of an LLM error into the run metrics', async () => {
+    // #given the attempt fails with a classified error that carries a suggested action
+    vi.mocked(executeOpenCode).mockResolvedValueOnce(
+      createAgentResult({
+        llmError: {
+          type: 'model_not_found',
+          message: 'Model not found: a/b.',
+          retryable: false,
+          suggestedAction: 'Fix the model id',
+        },
+        classificationPath: 'fallback',
+      }),
+    )
+    const metrics = createMetrics()
+
+    // #when the execute phase runs
+    await runExecute(createBootstrap(1_000), createRouting(), createCacheRestore(), createSessionPrep(), metrics, 0)
+
+    // #then the metric carries the action alongside the message
+    expect(metrics.recordError).toHaveBeenCalledWith(
+      'model_not_found',
+      'Model not found: a/b.',
+      false,
+      'fallback',
+      'Fix the model id',
+    )
+  })
+
   it('leaves a successful first attempt unchanged', async () => {
     // #given the first attempt completes successfully
     const successfulResult = createAgentResult({

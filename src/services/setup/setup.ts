@@ -14,6 +14,7 @@ import {parseAuthJsonInput, populateAuthJson} from './auth-json.js'
 import {installBun} from './bun.js'
 import {buildCIConfig, isOmoSlimVersionVerified, pluginPrefix} from './ci-config.js'
 import {configureGhAuth, configureGitIdentity} from './gh-auth.js'
+import {defaultOpenCodeConfigDir} from './no-task-reuse-config.js'
 import {installOmoSlim} from './omo-slim.js'
 import {installOmo} from './omo.js'
 import {FALLBACK_VERSION, getLatestVersion, installOpenCode, opencodeBinaryPath, toolCacheVersion} from './opencode.js'
@@ -21,6 +22,13 @@ import {writeSessionToolsFile} from './session-tools-config.js'
 import {writeSystematicConfig} from './systematic-config.js'
 import {installSystematicPlugin} from './systematic-plugin.js'
 import {restoreToolsCache, saveToolsCache} from './tools-cache.js'
+
+// OpenCode reads boolean env flags through Effect's Config.boolean (true/yes/on/1/y vs false/no/off/0/n) and
+// the older Flag helpers ("true"/"1"); anything non-empty that is not an explicit "off" word counts as set.
+function isTruthyFlag(value: string | undefined): boolean {
+  const normalized = value?.trim().toLowerCase() ?? ''
+  return normalized !== '' && !['0', 'false', 'no', 'off', 'n'].includes(normalized)
+}
 
 export async function runSetup(inputs: SetupInputs, githubToken: string): Promise<SetupResult | null> {
   const startTime = Date.now()
@@ -60,7 +68,7 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
     const runnerToolCache = process.env.RUNNER_TOOL_CACHE ?? '/opt/hostedtoolcache'
     const toolCachePath = join(runnerToolCache, 'opencode')
     const bunCachePath = join(runnerToolCache, 'bun')
-    const configDir = join(homedir(), '.config', 'opencode')
+    const configDir = defaultOpenCodeConfigDir()
     const opencodeCachePath = join(homedir(), '.cache', 'opencode')
     const runnerOS = getRunnerOS()
 
@@ -199,6 +207,16 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
     // plugin tools (when present) override by id at registry time, so this
     // never needs to be gated on enableOmo.
     await writeSessionToolsFile(configDir, logger)
+
+    // OPENCODE_PURE makes OpenCode skip every external plugin (plugin/index.ts:181), Systematic and the
+    // task-reuse guard included, and the guard's config layer is no exception. filterAgentEnv denies it for
+    // the server child; say so rather than letting an operator think it took effect. (The guard itself is
+    // provisioned at server start, not here: features/agent/server-adapter.ts.)
+    if (isTruthyFlag(process.env.OPENCODE_PURE)) {
+      logger.warning(
+        'OPENCODE_PURE is set in the runner environment; it is withheld from the OpenCode server so the task-reuse guard and Systematic plugins still load.',
+      )
+    }
 
     const ciConfigResult = buildCIConfig(
       {

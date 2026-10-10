@@ -160,7 +160,8 @@ export interface GitHubOAuthDeps {
   /**
    * Server-side session store. When present, a successful OAuth callback mints
    * a fresh session and sets the __Host- session cookie. When absent, the
-   * callback returns a coarse JSON identity response (pre-session-layer posture).
+   * callback returns a coarse JSON identity response (pre-session-layer posture;
+   * there is no session to land in, so no default-path redirect applies).
    */
   readonly sessionStore?: SessionStore
   /**
@@ -208,6 +209,9 @@ export interface GitHubOAuthConfig {
   /**
    * Allowlisted same-origin return paths for post-auth redirect.
    * Only paths in this list are accepted as return_to targets.
+   *
+   * The FIRST entry doubles as the default landing path: when sign-in completes
+   * with no captured return_to, the callback redirects there (still validated).
    */
   readonly allowedReturnPaths: readonly string[]
   /**
@@ -338,26 +342,61 @@ function deriveCodeChallenge(verifier: string): string {
 // ---------------------------------------------------------------------------
 
 /**
+ * Characters that must never appear in a redirect target: backslash (WHATWG URL
+ * parsing treats `\` as `/`, so `/\evil.example` resolves cross-origin), whitespace,
+ * and control characters (U+0000–U+001F, U+007F; `\p{Cc}` also covers the C1 range).
+ * Browsers strip tab/CR/LF inside URLs, so embedded controls can re-form `//`.
+ */
+const UNSAFE_RETURN_PATH_CHARS = /[\\\s\p{Cc}]/u
+
+/**
  * Validate a return_to path as same-origin and allowlisted.
  *
  * Returns the validated path string, or null if invalid.
  * Rejects:
  *   - Absolute URLs (http://, https://, //)
+ *   - Backslashes, whitespace and control characters
+ *   - Paths whose resolution against publicOrigin leaves that origin, or whose
+ *     resolved path/search/hash is not itself allowlisted
  *   - Paths not in the allowlist
  *   - Empty strings
+ *
+ * A percent-encoded backslash (`%5C`) is accepted: URL parsing never decodes it
+ * into a path separator, so it stays an inert in-origin path character and the
+ * same-origin resolution check below proves it.
  */
-function validateReturnPath(returnTo: string, allowedPaths: readonly string[]): string | null {
+export function validateReturnPath(
+  returnTo: string,
+  allowedPaths: readonly string[],
+  publicOrigin: string,
+): string | null {
   if (returnTo === '') return null
 
   // Reject absolute URLs and protocol-relative URLs
   if (/^https?:\/\//i.test(returnTo)) return null
   if (returnTo.startsWith('//')) return null
 
+  // Reject anything the URL parser would normalise into a different target
+  if (UNSAFE_RETURN_PATH_CHARS.test(returnTo)) return null
+
   // Must start with /
   if (returnTo.startsWith('/') === false) return null
 
   // Must be in the allowlist (exact match)
   if (allowedPaths.includes(returnTo) === false) return null
+
+  // Resolve exactly as a browser following the Location header would: the result
+  // must stay on the public origin and still be an allowlisted path.
+  let base: URL
+  let resolved: URL
+  try {
+    base = new URL(publicOrigin)
+    resolved = new URL(returnTo, base)
+  } catch {
+    return null
+  }
+  if (resolved.origin !== base.origin) return null
+  if (allowedPaths.includes(`${resolved.pathname}${resolved.search}${resolved.hash}`) === false) return null
 
   return returnTo
 }
@@ -440,6 +479,18 @@ const OAUTH_START_PATH = '/operator/auth/github/start'
 export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config: GitHubOAuthConfig): void {
   const callbackUri = `${config.publicOrigin}${config.callbackPath}`
 
+  // Default post-auth landing path, used when no (valid) return_to was captured
+  // (e.g. /start opened directly): the first allowedReturnPaths entry — the
+  // config default is ['/operator'], the operator UI. It runs through the same
+  // validator as every other redirect target, so a misconfigured entry (absolute
+  // URL, protocol-relative, non-rooted) or an empty list yields null and can
+  // never become an open redirect.
+  const [firstAllowedPath] = config.allowedReturnPaths
+  const defaultLandingPath =
+    firstAllowedPath === undefined
+      ? null
+      : validateReturnPath(firstAllowedPath, config.allowedReturnPaths, config.publicOrigin)
+
   // ── GET /operator/auth/github/start ────────────────────────────────────────
 
   registerPublicRoute(app, 'GET', OAUTH_START_PATH, async (c: Context): Promise<Response> => {
@@ -488,7 +539,7 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
     const returnTo = c.req.query('return_to')
     let redirectTarget: string | undefined
     if (returnTo !== undefined && returnTo !== '') {
-      const validated = validateReturnPath(returnTo, config.allowedReturnPaths)
+      const validated = validateReturnPath(returnTo, config.allowedReturnPaths, config.publicOrigin)
       if (validated === null) {
         deps.logger.warn({}, 'oauth start rejected: invalid return_to target')
         return badRequestResponse(c)
@@ -811,12 +862,26 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
       // from what was checked at /start, and stored targets must never be trusted
       // unconditionally. Use the returned validated path, not the raw stored value.
       if (stateEntry.redirectTarget !== undefined && stateEntry.redirectTarget !== '') {
-        const validatedPath = validateReturnPath(stateEntry.redirectTarget, config.allowedReturnPaths)
+        const validatedPath = validateReturnPath(
+          stateEntry.redirectTarget,
+          config.allowedReturnPaths,
+          config.publicOrigin,
+        )
         if (validatedPath !== null) {
           return c.redirect(validatedPath, 302)
         }
       }
 
+      // No usable captured return path: land on the default operator landing
+      // path rather than a bare identity JSON page.
+      if (defaultLandingPath !== null) {
+        return c.redirect(defaultLandingPath, 302)
+      }
+
+      // Misconfigured allowlist (empty, or first entry fails validation): the
+      // session is already minted, so never invent a redirect target — fall back
+      // to the coarse identity response rather than risk an open redirect.
+      deps.sessionDeps.logger.warn({}, 'oauth callback: no valid default landing path — returning identity JSON')
       return c.json({githubUserId, login}, 200)
     }
 

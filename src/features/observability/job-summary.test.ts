@@ -252,6 +252,51 @@ describe('writeJobSummary', () => {
     )
   })
 
+  it('shows the escaped suggested action after the message when an error has one', async () => {
+    // #given an error record whose suggested action contains markup and a newline
+    const error = {
+      timestamp: '2024-01-01T00:00:00Z',
+      type: 'model_not_found',
+      message: 'Model not found: acme/x.',
+      recoverable: false,
+      suggestedAction: 'Set <model> | `id`\nthen retry',
+    }
+    const options = createMockOptions({metrics: createMockMetrics({errors: [error]})})
+
+    // #when writing the job summary
+    await writeJobSummary(options, logger)
+
+    // #then the action is appended and escaped like other summary text
+    expect(core.summary.addRaw).toHaveBeenCalledWith(
+      '- **model_not_found** (❌ Failed): Model not found: acme/x. Suggested action: Set &lt;model&gt; &#124; &#96;id&#96; then retry\n',
+    )
+  })
+
+  it('renders an error without a suggested action exactly as before', async () => {
+    // #given error records with no suggested action (absent and undefined)
+    const options = createMockOptions({
+      metrics: createMockMetrics({
+        errors: [
+          {timestamp: '2024-01-01T00:00:00Z', type: 'RateLimit', message: 'API limited', recoverable: true},
+          {
+            timestamp: '2024-01-01T00:00:01Z',
+            type: 'NetworkError',
+            message: 'Timeout',
+            recoverable: false,
+            suggestedAction: undefined,
+          },
+        ],
+      }),
+    })
+
+    // #when writing the job summary
+    await writeJobSummary(options, logger)
+
+    // #then the lines carry no suggested-action text
+    expect(core.summary.addRaw).toHaveBeenCalledWith('- **RateLimit** (🔄 Recovered): API limited\n')
+    expect(core.summary.addRaw).toHaveBeenCalledWith('- **NetworkError** (❌ Failed): Timeout\n')
+  })
+
   it('omits optional sections when empty', async () => {
     // #given
     const options = createMockOptions({

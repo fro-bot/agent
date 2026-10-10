@@ -11,6 +11,7 @@ Environment bootstrap logic: Bun runtime, OpenCode CLI, and oMo plugin installat
 | **Setup**      | `setup.ts`             | Orchestration entry point (runSetup) (209 L)            |
 | **CI Config**  | `ci-config.ts`         | CI config assembly + Systematic plugin injection (43 L) |
 | **Systematic** | `systematic-config.ts` | Systematic config writer (deep-merge) (36 L)            |
+| **Reuse guard**| `no-task-reuse-config.ts` | Writes the task-reuse guard plugin; builds its `file://` spec and the server config that carries it |
 | **Adapters**   | `adapters.ts`          | Exec/tool-cache adapter factories (20 L)                |
 | **OpenCode**   | `opencode.ts`          | CLI resolution & installation (169 L)                   |
 | **Bun**        | `bun.ts`               | Bun runtime setup (required for oMo) (170 L)            |
@@ -44,11 +45,13 @@ Environment bootstrap logic: Bun runtime, OpenCode CLI, and oMo plugin installat
 - **Dynamic Version**: Resolves 'latest' via GitHub Releases API.
 - **Verification**: Validates binaries (`--version`) BEFORE caching.
 - **Systematic Bundling**: `buildCIConfig()` ensures `@fro.bot/systematic@<version>` exists in OpenCode CI plugins.
+- **Task-reuse guard (fail-closed)**: `writeNoTaskReuseFile` copies `dist/no-task-reuse.js` (built from `deploy/plugins/no-task-reuse.mjs`, the same file the gateway image bakes) to `<configDir>/fro-bot/no-task-reuse.mjs`, and `taskReuseGuardServerConfig` builds `{plugin: [file:// URL]}`. Both are used by the Action's server-start choke point (`bootstrapOpenCodeServer`, `src/features/agent/server-adapter.ts`), NOT by setup or `buildCIConfig`: the guard rides the SDK's `OPENCODE_CONFIG_CONTENT` layer, which loads after every user/project/global file and cannot be dropped by them, so no user config file is read or edited and setup never lists the guard (one channel; a preinstalled OpenCode that skips setup is guarded too). It rejects any `task` call with a truthy `task_id`, so a background dispatch can never reuse a settled child session (#1757). If the file cannot be written, no server starts. Keep the file out of `<configDir>/plugin(s)/` (OpenCode auto-scans those). `<configDir>` is `$XDG_CONFIG_HOME/opencode` (else `~/.config/opencode`), the directory the server reads. Boundary on model behavior, not a sandbox: earlier-layer plugins still load before it, and `OPENCODE_PURE` would skip it (denied by `filterAgentEnv`; setup warns).
 - `parseOmoProviders` moved to `src/harness/config/omo-providers.ts`.
 
 ## SECURITY
 
 - **Permissions**: `auth.json` written with `0o600` (owner-only).
+- **Plugin switches**: `OPENCODE_PURE` makes OpenCode skip every external plugin (the reuse guard and Systematic). `filterAgentEnv` denies it for the server child and setup warns when it is set; keep it in the deny-set.
 - **Ephemeral**: Credentials never cached; fresh from secrets each run.
 - **Identity**: Git user forced to `${bot}[bot]` for audit trails.
 - **Isolation**: Binaries cached by version/arch to prevent pollution.
