@@ -110,12 +110,13 @@ describe('deploy/plugins/no-task-reuse.mjs (source of truth)', () => {
 
 describe('dist/no-task-reuse.js (the bundle the Action ships)', () => {
   it('behaves exactly as the source, case for case', async () => {
-    // #given the committed bundle (skipped when this checkout has not built dist/)
+    // #given the committed bundle: a missing one is a packaging fault, not a reason to skip the check, because
+    // the Action copies this file and an unbuilt checkout would otherwise pass while shipping no guard
     const present = await fs.access(DIST_ASSET_PATH).then(
       () => true,
       () => false,
     )
-    if (!present) return
+    expect(present, `${DIST_ASSET_PATH} is missing: run \`bun run build\` and commit dist/`).toBe(true)
     const built = (await import(pathToFileURL(DIST_ASSET_PATH).href)) as PluginModule
 
     // #then the exports and the model-visible rejection are identical to the source

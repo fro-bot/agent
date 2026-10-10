@@ -14,7 +14,12 @@ import {parseAuthJsonInput, populateAuthJson} from './auth-json.js'
 import {installBun} from './bun.js'
 import {buildCIConfig, isOmoSlimVersionVerified, pluginPrefix} from './ci-config.js'
 import {configureGhAuth, configureGitIdentity} from './gh-auth.js'
-import {defaultOpenCodeConfigDir, writeNoTaskReuseFile} from './no-task-reuse-config.js'
+import {
+  defaultOpenCodeConfigDir,
+  normalizeTaskReuseGuardPlugins,
+  noTaskReusePluginSpec,
+  provisionTaskReuseGuard,
+} from './no-task-reuse-config.js'
 import {installOmoSlim} from './omo-slim.js'
 import {installOmo} from './omo.js'
 import {FALLBACK_VERSION, getLatestVersion, installOpenCode, opencodeBinaryPath, toolCacheVersion} from './opencode.js'
@@ -210,8 +215,10 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
 
     // Task-reuse guard: unlike the session tools above this is fail-CLOSED. buildCIConfig registers it
     // unconditionally, and OpenCode only logs a plugin it cannot load, so a missing file would silently
-    // reopen the settled-child reuse gap (#1757). A throw here is caught below and fails setup.
-    await writeNoTaskReuseFile(configDir, logger)
+    // reopen the settled-child reuse gap (#1757). A throw here is caught below and fails setup. The same
+    // helper runs again before every server start (features/agent/server-adapter.ts), which is what covers
+    // a runner whose OpenCode was already installed and never reached this function.
+    await provisionTaskReuseGuard(configDir, logger)
 
     // OPENCODE_PURE skips every external plugin, the guard and Systematic included. filterAgentEnv denies
     // it for the server child; say so rather than letting an operator think it took effect.
@@ -289,14 +296,17 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
         }
       }
 
-      const mergedConfig = {...existingConfig, ...ciConfigResult.config, plugin: mergedPlugins}
+      // Restored or operator entries can list the guard first, twice, or as a tuple; the merge above keeps
+      // whichever came first. Re-normalize so the written list has exactly one bare guard entry, last.
+      const guardedPlugins = normalizeTaskReuseGuardPlugins(mergedPlugins, noTaskReusePluginSpec(configDir), logger)
+      const mergedConfig = {...existingConfig, ...ciConfigResult.config, plugin: guardedPlugins}
       const mergedConfigJson = JSON.stringify(mergedConfig, null, 2)
       core.exportVariable('OPENCODE_CONFIG_CONTENT', mergedConfigJson)
       await writeFile(opencodeConfigPath, mergedConfigJson)
       logger.info('Wrote merged OpenCode config', {
         path: opencodeConfigPath,
-        pluginCount: mergedPlugins.length,
-        plugins: mergedPlugins,
+        pluginCount: guardedPlugins.length,
+        plugins: guardedPlugins,
       })
     } else {
       // Disabled mode: start fresh from CI config — no merge with existing local/restored opencode.json

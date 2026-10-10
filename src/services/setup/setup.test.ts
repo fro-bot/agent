@@ -131,11 +131,11 @@ vi.mock('./session-tools-config.js', () => ({
   writeSessionToolsFile: vi.fn().mockResolvedValue(undefined),
 }))
 
-// Keep the real path/spec helpers (the config must reference the exact path the writer targets) and
-// mock only the filesystem write, so tests can assert it ran and drive its failure.
+// Keep the real path/spec/normalizer helpers (the config must reference the exact path the provisioner
+// targets) and mock only the filesystem provisioning, so tests can assert it ran and drive its failure.
 vi.mock('./no-task-reuse-config.js', async importOriginal => {
   const actual = await importOriginal<typeof import('./no-task-reuse-config.js')>()
-  return {...actual, writeNoTaskReuseFile: vi.fn().mockResolvedValue('/mock/no-task-reuse.mjs')}
+  return {...actual, provisionTaskReuseGuard: vi.fn().mockResolvedValue(undefined)}
 })
 
 vi.mock('./systematic-plugin.js', () => ({
@@ -197,7 +197,7 @@ describe('setup', () => {
 
     // Re-apply session-tools-config mock cleared by vi.resetAllMocks() above.
     vi.mocked(sessionToolsConfig.writeSessionToolsFile).mockResolvedValue(undefined)
-    vi.mocked(noTaskReuseConfig.writeNoTaskReuseFile).mockResolvedValue('/mock/no-task-reuse.mjs')
+    vi.mocked(noTaskReuseConfig.provisionTaskReuseGuard).mockResolvedValue(undefined)
     vi.mocked(systematicPlugin.installSystematicPlugin).mockResolvedValue({status: 'installed', duration: 1})
   })
 
@@ -660,17 +660,17 @@ describe('setup', () => {
         expect(typeof configDirArg).toBe('string')
       })
 
-      it('writes the task-reuse guard and registers it in the config OpenCode loads', async () => {
+      it('provisions the task-reuse guard and registers it in the config OpenCode loads', async () => {
         // #given an operator config that tries to clear the plugin list
         const opencodeConfig = JSON.stringify({plugin: []})
 
         // #when
         const result = await runSetup(createSetupInputs({opencodeConfig}), 'ghs_test_token')
 
-        // #then the writer ran against the config dir, and the written config references that exact file
+        // #then the provisioner ran against the config dir, and the written config references that exact file
         expect(result).not.toBeNull()
-        expect(noTaskReuseConfig.writeNoTaskReuseFile).toHaveBeenCalledTimes(1)
-        const [configDirArg] = vi.mocked(noTaskReuseConfig.writeNoTaskReuseFile).mock.calls[0] ?? []
+        expect(noTaskReuseConfig.provisionTaskReuseGuard).toHaveBeenCalledTimes(1)
+        const [configDirArg] = vi.mocked(noTaskReuseConfig.provisionTaskReuseGuard).mock.calls[0] ?? []
         expect(typeof configDirArg).toBe('string')
         const guardSpec = noTaskReuseConfig.noTaskReusePluginSpec(String(configDirArg))
         const configFile = vi
@@ -682,7 +682,7 @@ describe('setup', () => {
 
       it('fails setup, and writes no config, when the task-reuse guard cannot be installed', async () => {
         // #given the bundled asset is missing
-        vi.mocked(noTaskReuseConfig.writeNoTaskReuseFile).mockRejectedValue(new Error('asset missing'))
+        vi.mocked(noTaskReuseConfig.provisionTaskReuseGuard).mockRejectedValue(new Error('asset missing'))
 
         // #when
         const result = await runSetup(createSetupInputs(), 'ghs_test_token')
@@ -815,6 +815,33 @@ describe('setup', () => {
           .mock.calls.find(([name]) => name === 'OPENCODE_CONFIG_CONTENT')
         const plugins = (JSON.parse(String(configExportCall?.[1])) as {plugin: unknown[]}).plugin
         expect(plugins).toContain(noTaskReuseConfig.noTaskReusePluginSpec(defaultConfigDirForTest()))
+      })
+
+      it('writes exactly one bare guard entry, last, when a restored opencode.json lists it first, twice and as a tuple', async () => {
+        // #given a restored opencode.json whose guard entries lead the list, repeat, and carry options
+        const guardSpec = noTaskReuseConfig.noTaskReusePluginSpec(defaultConfigDirForTest())
+        vi.mocked(fs.readFile).mockResolvedValue(
+          JSON.stringify({
+            plugin: [guardSpec, 'other-plugin@1.0.0', [guardSpec, {mode: 'off'}], guardSpec, 'late-plugin@2.0.0'],
+          }),
+        )
+
+        // #when
+        const result = await runSetup(createSetupInputs({enableOmo: true}), 'ghs_test_token')
+
+        // #then the config handed to the server AND the file on disk list the guard once, last, as the bare spec
+        expect(result).not.toBeNull()
+        const exported = vi.mocked(core.exportVariable).mock.calls.find(([name]) => name === 'OPENCODE_CONFIG_CONTENT')
+        const written = vi
+          .mocked(fs.writeFile)
+          .mock.calls.find(([filePath]) => typeof filePath === 'string' && filePath.endsWith('opencode.json'))
+        for (const serialized of [exported?.[1], written?.[1]]) {
+          const plugins = (JSON.parse(String(serialized)) as {plugin: unknown[]}).plugin
+          expect(plugins.at(-1)).toBe(guardSpec)
+          expect(plugins.filter(p => p === guardSpec)).toHaveLength(1)
+          expect(plugins.some(p => Array.isArray(p))).toBe(false)
+          expect(plugins).toEqual(expect.arrayContaining(['other-plugin@1.0.0', 'late-plugin@2.0.0']))
+        }
       })
 
       it('writes the session tools file in enabled mode too', async () => {

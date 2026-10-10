@@ -6,10 +6,21 @@ import {
   bootstrapOpenCodeServer as bootstrapRuntimeOpenCodeServer,
   ensureOpenCodeAvailable as ensureRuntimeOpenCodeAvailable,
 } from '@fro-bot/runtime'
+import {defaultOpenCodeConfigDir, provisionTaskReuseGuard} from '../../services/setup/no-task-reuse-config.js'
 import {runtimeSetupAdapter} from '../../services/setup/runtime-setup-adapter.js'
+import {toErrorMessage} from '../../shared/errors.js'
+import {err} from '../../shared/types.js'
 
 export type {OpenCodeServerHandle} from '@fro-bot/runtime'
 
+/**
+ * The single choke point every Action OpenCode server start passes through (`runCacheRestore` is the only
+ * caller). Provisions the task-reuse guard (#1757) first, whether or not `runSetup` ran: a runner with OpenCode
+ * already installed returns early from `ensureOpenCodeAvailable` (`didSetup: false`) and would otherwise start a
+ * server whose global config knows nothing of the guard. Fail-closed: if the guard file or its registration
+ * cannot be written, no server starts. Action-only by construction — the gateway uses the runtime bootstrap
+ * directly and loads the same plugin through its managed config instead.
+ */
 export async function bootstrapOpenCodeServer(
   signal: AbortSignal,
   logger: Logger,
@@ -17,6 +28,13 @@ export async function bootstrapOpenCodeServer(
   timeoutMs?: number,
   readinessTimeoutMs?: number,
 ) {
+  try {
+    await provisionTaskReuseGuard(defaultOpenCodeConfigDir(), logger)
+  } catch (error) {
+    return err(
+      new Error(`Refusing to start OpenCode without the task-reuse guard: ${toErrorMessage(error)}`, {cause: error}),
+    )
+  }
   return bootstrapRuntimeOpenCodeServer(signal, logger, workspacePath, timeoutMs, readinessTimeoutMs)
 }
 

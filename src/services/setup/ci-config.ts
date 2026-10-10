@@ -10,7 +10,11 @@ import {
   RESPONSE_FILE_DIR_SEGMENT,
 } from '@fro-bot/runtime'
 import {DEFAULT_OMO_SLIM_VERSION} from '../../shared/constants.js'
-import {defaultOpenCodeConfigDir, noTaskReusePluginSpec} from './no-task-reuse-config.js'
+import {
+  defaultOpenCodeConfigDir,
+  normalizeTaskReuseGuardPlugins,
+  noTaskReusePluginSpec,
+} from './no-task-reuse-config.js'
 
 export interface CIConfigResult {
   readonly config: Record<string, unknown>
@@ -359,38 +363,6 @@ function scopeAttachmentDirectoryPermission(
   }
 }
 
-/**
- * Guarantee the task-reuse guard plugin is in the final `plugin` list, last, in every mode.
- *
- * The guard rejects any `task` call carrying a `task_id` (`deploy/plugins/no-task-reuse.mjs`, the same
- * file the gateway image bakes). The Action's background-subagent ledger keys one entry per child session
- * and expects one completion notice per child (upstream's notice names the session, never the job), so a
- * `task_id` that resumes a settled child would start a second job the ledger cannot see. Rejecting the
- * resume keeps every dispatch on a fresh child session instead of inferring job identity.
- *
- * Like the Systematic plugin and the `subagent_depth` pin, this is enforced by the CI config assembly and
- * is not operator-overridable. An operator `plugin` array cannot drop it (it is re-appended), an entry for
- * the guard's own path is normalized to the bare spec (so no options or alternate form can neuter it), and
- * a `plugin` value that is not an array is discarded with a warning (at parse time, see `buildCIConfig`). OpenCode has no config key that
- * disables a single plugin; `OPENCODE_PURE` is the env-side switch and `filterAgentEnv` denies it.
- *
- * This is a boundary on model behavior, not a sandbox: the agent runs as the runner user, and anything
- * that user can write into the OpenCode config dir or a project `.opencode/plugin` runs inside the same
- * server process.
- */
-function ensureTaskReuseGuard(ciConfig: Record<string, unknown>, guardSpec: string, logger: Logger): void {
-  const entries: unknown[] = Array.isArray(ciConfig.plugin) ? (ciConfig.plugin as unknown[]) : []
-  const specifierOf = (entry: unknown): unknown => (Array.isArray(entry) ? (entry as unknown[])[0] : entry)
-  const guardEntries = entries.filter(entry => specifierOf(entry) === guardSpec)
-  if (guardEntries.some(entry => entry !== guardSpec)) {
-    logger.warning(
-      'OpenCode config supplied options for the task-reuse guard plugin; they are discarded and the guard is enforced unmodified.',
-    )
-  }
-
-  ciConfig.plugin = [...entries.filter(entry => specifierOf(entry) !== guardSpec), guardSpec]
-}
-
 export function buildCIConfig(
   inputs: {
     opencodeConfig: string | null
@@ -565,7 +537,17 @@ export function buildCIConfig(
     })
   }
 
-  ensureTaskReuseGuard(ciConfig, noTaskReusePluginSpec(inputs.configDir ?? defaultOpenCodeConfigDir()), logger)
+  // Enforced, not defaulted, like the Systematic plugin and the `subagent_depth` pin: an operator `plugin` array
+  // (including `[]`) cannot drop the task-reuse guard (`deploy/plugins/no-task-reuse.mjs`, the file the gateway
+  // image bakes), and a tuple/options form is normalized to the bare spec with a warning. The Action's
+  // background-subagent ledger keys one entry per child session and expects one completion notice per child,
+  // so a `task_id` that resumes a settled child would start a second job the ledger cannot see. A boundary on
+  // model behavior, not a sandbox: the agent runs as the runner user.
+  ciConfig.plugin = normalizeTaskReuseGuardPlugins(
+    ciConfig.plugin,
+    noTaskReusePluginSpec(inputs.configDir ?? defaultOpenCodeConfigDir()),
+    logger,
+  )
 
   return {config: ciConfig, error: null}
 }

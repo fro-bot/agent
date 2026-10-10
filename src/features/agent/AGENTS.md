@@ -85,6 +85,7 @@ The Action derives the response surface from trusted routing context and carries
 
 - **SDK Lifecycle (RFC-013)**: Spawn server → connect client → create session → send prompt → stream events → close
 - **No `question` tool in CI**: `bootstrapOpenCodeServer` (runtime `server.ts`) pins `OPENCODE_CLIENT=fro-bot-action` and clears `OPENCODE_ENABLE_QUESTION_TOOL` so upstream never registers the tool (`tool/registry.ts:207`); a pending question has no server timeout and nobody can answer. Do not rely on `permission.question: deny` — agent-level `allow` (oMo) overrides it. Do not add `question.*` stream handling unless the tool is re-enabled
+- **Task-reuse guard at server start**: `server-adapter.ts`'s `bootstrapOpenCodeServer` (the Action's only server-start path) runs `provisionTaskReuseGuard` before the runtime bootstrap and returns an `err` without starting if it fails. This covers `didSetup: false` runs where `runSetup` never executed; the gateway uses the runtime bootstrap directly and is unaffected (#1757)
 - **Connection Retry**: 30 retries with 1s delay to account for async server startup
 - **Event Streaming**: SSE subscription provides real-time progress logging to CI console
 - **Reaction-based UX**: Non-fatal state machine (Eyes → Hooray/Confused); failures never crash execution
