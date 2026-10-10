@@ -135,15 +135,18 @@ function messageUpdatedEvent(sessionID: string): Event {
 function messageUpdatedEventWithTokens(
   sessionID: string,
   tokens: {input: number; output: number; reasoning: number; cache: {read: number; write: number}},
+  extra: {readonly id?: string; readonly cost?: number; readonly modelID?: string} = {},
 ): Event {
   return {
     type: 'message.updated',
     properties: {
       sessionID,
-      info: {role: 'assistant', tokens},
+      info: {role: 'assistant', tokens, ...extra},
     },
   } as unknown as Event
 }
+
+const ZERO_TOKENS = {input: 0, output: 0, reasoning: 0, cache: {read: 0, write: 0}}
 
 function sessionErrorEvent(sessionID: string): Event {
   return {type: 'session.error', properties: {sessionID, error: 'boom'}} as unknown as Event
@@ -1535,11 +1538,19 @@ describe('processEventStream — ownership check widens descendant events, no-le
     expect(result.tokens).not.toBeNull()
   })
 
-  it("message.updated: a root-only run (no ledger) reports the root session's totals unchanged", async () => {
-    // #given two message.updated reports on the root session only, no ledger
+  it("message.updated: a root-only run (no ledger) sums every assistant message's usage", async () => {
+    // #given two DISTINCT assistant messages (two prompt-loop turns) on the root session, no ledger
     const eventStream = createMockEventStream([
-      messageUpdatedEventWithTokens(ROOT_SESSION_ID, {input: 10, output: 5, reasoning: 1, cache: {read: 2, write: 3}}),
-      messageUpdatedEventWithTokens(ROOT_SESSION_ID, {input: 20, output: 8, reasoning: 2, cache: {read: 4, write: 6}}),
+      messageUpdatedEventWithTokens(
+        ROOT_SESSION_ID,
+        {input: 10, output: 5, reasoning: 1, cache: {read: 2, write: 3}},
+        {id: 'msg_1', cost: 0.01},
+      ),
+      messageUpdatedEventWithTokens(
+        ROOT_SESSION_ID,
+        {input: 20, output: 8, reasoning: 2, cache: {read: 4, write: 6}},
+        {id: 'msg_2', cost: 0.02},
+      ),
     ])
 
     // #when processed without a ledger
@@ -1550,8 +1561,130 @@ describe('processEventStream — ownership check widens descendant events, no-le
       createMockLogger(),
     )
 
-    // #then the latest root report wins, exactly as plain assignment always produced
+    // #then both turns count — upstream reports usage per message, not cumulatively per session
+    expect(result.tokens).toEqual({input: 30, output: 13, reasoning: 3, cache: {read: 6, write: 9}})
+    expect(result.cost).toBeCloseTo(0.03, 10)
+  })
+
+  it('message.updated: repeated updates of the SAME message id count once (latest wins)', async () => {
+    // #given one assistant message that fires message.updated three times as it progresses
+    // (created with zeros, step-finish with usage, then completed with the same usage)
+    const zero = {input: 0, output: 0, reasoning: 0, cache: {read: 0, write: 0}}
+    const final = {input: 100, output: 40, reasoning: 5, cache: {read: 30, write: 10}}
+    const eventStream = createMockEventStream([
+      messageUpdatedEventWithTokens(ROOT_SESSION_ID, zero, {id: 'msg_1', cost: 0}),
+      messageUpdatedEventWithTokens(ROOT_SESSION_ID, final, {id: 'msg_1', cost: 0.05}),
+      messageUpdatedEventWithTokens(ROOT_SESSION_ID, final, {id: 'msg_1', cost: 0.05}),
+    ])
+
+    // #when processed
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+    )
+
+    // #then the message is counted exactly once at its latest value
+    expect(result.tokens).toEqual(final)
+    expect(result.cost).toBe(0.05)
+  })
+
+  it('message.updated: a multi-turn root session reports the sum, not just the last turn', async () => {
+    // #given three assistant messages, each updated twice (in-progress then finished) — the shape
+    // that made run 38026680860 report only the final turn's tiny totals
+    const turn = (n: number) => ({input: n, output: n * 2, reasoning: 0, cache: {read: n * 10, write: n}})
+    const eventStream = createMockEventStream([
+      messageUpdatedEventWithTokens(ROOT_SESSION_ID, turn(1), {id: 'msg_1', cost: 0.001}),
+      messageUpdatedEventWithTokens(ROOT_SESSION_ID, turn(1), {id: 'msg_1', cost: 0.001}),
+      messageUpdatedEventWithTokens(ROOT_SESSION_ID, turn(2), {id: 'msg_2', cost: 0.002}),
+      messageUpdatedEventWithTokens(ROOT_SESSION_ID, turn(2), {id: 'msg_2', cost: 0.002}),
+      messageUpdatedEventWithTokens(ROOT_SESSION_ID, turn(3), {id: 'msg_3', cost: 0.003, modelID: 'm-latest'}),
+      messageUpdatedEventWithTokens(ROOT_SESSION_ID, turn(3), {id: 'msg_3', cost: 0.003, modelID: 'm-latest'}),
+    ])
+
+    // #when processed
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+    )
+
+    // #then tokens and cost are summed over all three messages; model is the latest seen
+    expect(result.tokens).toEqual({input: 6, output: 12, reasoning: 0, cache: {read: 60, write: 6}})
+    expect(result.cost).toBeCloseTo(0.006, 10)
+    expect(result.model).toBe('m-latest')
+  })
+
+  it('message.updated: cost is null when no message reports a cost, summed when only some do', async () => {
+    // #given a message without a cost field
+    const noCost = await processEventStream(
+      createMockEventStream([messageUpdatedEventWithTokens(ROOT_SESSION_ID, ZERO_TOKENS, {id: 'msg_1'})]),
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+    )
+
+    // #given one message with a cost and one without
+    const someCost = await processEventStream(
+      createMockEventStream([
+        messageUpdatedEventWithTokens(ROOT_SESSION_ID, ZERO_TOKENS, {id: 'msg_1'}),
+        messageUpdatedEventWithTokens(ROOT_SESSION_ID, ZERO_TOKENS, {id: 'msg_2', cost: 0.5}),
+      ]),
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+    )
+
+    // #then
+    expect(noCost.cost).toBeNull()
+    expect(someCost.cost).toBe(0.5)
+  })
+
+  it('message.updated: an id-less assistant payload falls back to one latest-wins slot per session', async () => {
+    // #given two reports lacking `info.id` (malformed — upstream always sets it)
+    const eventStream = createMockEventStream([
+      messageUpdatedEventWithTokens(ROOT_SESSION_ID, {input: 10, output: 5, reasoning: 1, cache: {read: 2, write: 3}}),
+      messageUpdatedEventWithTokens(ROOT_SESSION_ID, {input: 20, output: 8, reasoning: 2, cache: {read: 4, write: 6}}),
+    ])
+
+    // #when processed
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+    )
+
+    // #then the usage is neither dropped nor double-counted
     expect(result.tokens).toEqual({input: 20, output: 8, reasoning: 2, cache: {read: 4, write: 6}})
+  })
+
+  it('message.updated: only messages delivered on the stream count — a resumed session’s earlier history never arrives', async () => {
+    // #given a resumed session: its earlier messages (msg_old_*) exist in the store but, because the
+    // SSE stream only carries events published after subscription, only this invocation's message is
+    // ever delivered
+    const eventStream = createMockEventStream([
+      messageUpdatedEventWithTokens(
+        ROOT_SESSION_ID,
+        {input: 7, output: 3, reasoning: 0, cache: {read: 1, write: 1}},
+        {id: 'msg_new_1', cost: 0.01},
+      ),
+    ])
+
+    // #when processed
+    const result = await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+    )
+
+    // #then the totals are exactly this invocation's delivered message; nothing is reconstructed from history
+    expect(result.tokens).toEqual({input: 7, output: 3, reasoning: 0, cache: {read: 1, write: 1}})
+    expect(result.cost).toBe(0.01)
+    expect([...(result.usageByMessage?.keys() ?? [])]).toEqual(['msg_new_1'])
   })
 
   it('message.updated: two owned sessions each reporting tokens sum rather than overwrite', async () => {
@@ -1607,14 +1740,32 @@ describe('processEventStream — ownership check widens descendant events, no-le
     expect(result.tokens).toEqual({input: 17, output: 8, reasoning: 1, cache: {read: 3, write: 4}})
   })
 
-  it('message.updated: repeated cumulative reports from one session count once, not twice', async () => {
-    // #given a ledger adopting a child, with the child reporting twice (a growing cumulative total for the same message)
+  it("message.updated: an adopted descendant's messages are added to the root's, with repeats deduped per message", async () => {
+    // #given a ledger adopting a child; root has one message, the child has two messages and the
+    // first of them reports twice
     const ledger: OwnershipLedger = createOwnershipLedger()
     ledger.adopt(CHILD_SESSION_ID, 'do the thing')
     const eventStream = createMockEventStream([
-      messageUpdatedEventWithTokens(ROOT_SESSION_ID, {input: 10, output: 5, reasoning: 1, cache: {read: 2, write: 3}}),
-      messageUpdatedEventWithTokens(CHILD_SESSION_ID, {input: 5, output: 2, reasoning: 0, cache: {read: 0, write: 0}}),
-      messageUpdatedEventWithTokens(CHILD_SESSION_ID, {input: 7, output: 3, reasoning: 0, cache: {read: 1, write: 1}}),
+      messageUpdatedEventWithTokens(
+        ROOT_SESSION_ID,
+        {input: 10, output: 5, reasoning: 1, cache: {read: 2, write: 3}},
+        {id: 'msg_root', cost: 0.1},
+      ),
+      messageUpdatedEventWithTokens(
+        CHILD_SESSION_ID,
+        {input: 5, output: 2, reasoning: 0, cache: {read: 0, write: 0}},
+        {id: 'msg_c1', cost: 0.01},
+      ),
+      messageUpdatedEventWithTokens(
+        CHILD_SESSION_ID,
+        {input: 6, output: 2, reasoning: 0, cache: {read: 1, write: 0}},
+        {id: 'msg_c1', cost: 0.02},
+      ),
+      messageUpdatedEventWithTokens(
+        CHILD_SESSION_ID,
+        {input: 7, output: 3, reasoning: 0, cache: {read: 1, write: 1}},
+        {id: 'msg_c2', cost: 0.03},
+      ),
     ])
 
     // #when processed with the ledger supplied
@@ -1629,9 +1780,9 @@ describe('processEventStream — ownership check widens descendant events, no-le
       ledger,
     )
 
-    // #then the child's second (cumulative) report replaces its first, not adds to it —
-    // sum is root (10) + child's LATEST report (7) = 17, not 10 + 5 + 7 = 22
-    expect(result.tokens).toEqual({input: 17, output: 8, reasoning: 1, cache: {read: 3, write: 4}})
+    // #then root + child's LATEST msg_c1 + child's msg_c2
+    expect(result.tokens).toEqual({input: 23, output: 10, reasoning: 1, cache: {read: 4, write: 4}})
+    expect(result.cost).toBeCloseTo(0.15, 10)
   })
 
   it('session.error: without a ledger a foreign session never sets llmError, same as before', async () => {

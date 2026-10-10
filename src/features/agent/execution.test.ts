@@ -342,6 +342,85 @@ describe('executeOpenCode — ownership ledger threading (Unit 11)', () => {
       vi.useRealTimers()
     }
   })
+
+  it('sums usage across retried attempts by message id instead of keeping only the last attempt', async () => {
+    // #given attempt 1 saw msg_1 (finished) and a partial msg_2; attempt 2 re-observes msg_2 with its
+    // final usage and adds msg_3 — the in-flight msg_2 straddles both attempts' event streams
+    vi.useFakeTimers()
+    vi.resetModules()
+    const tokens = (input: number) => ({input, output: 0, reasoning: 0, cache: {read: 0, write: 0}})
+    const baseResult = {
+      prsCreated: [],
+      commitsCreated: [],
+      commentsPosted: 0,
+    }
+    const retryableFailure = {
+      success: false,
+      error: 'transient rate limit',
+      llmError: {type: 'rate_limit', message: 'rate limited', retryable: true},
+      outcome: 'turn_failed_retryable',
+      shouldRetry: true,
+      settlement: {kind: 'failure-observed'},
+      eventStreamResult: {
+        ...baseResult,
+        tokens: tokens(15),
+        model: 'model-a',
+        cost: 0.015,
+        llmError: {type: 'rate_limit', message: 'rate limited', retryable: true},
+        usageByMessage: new Map([
+          ['msg_1', {tokens: tokens(10), cost: 0.01}],
+          ['msg_2', {tokens: tokens(5), cost: 0.005}],
+        ]),
+      },
+    }
+    const success = {
+      success: true,
+      error: null,
+      llmError: null,
+      outcome: 'completed',
+      shouldRetry: false,
+      settlement: {kind: 'completion-observed'},
+      eventStreamResult: {
+        ...baseResult,
+        tokens: tokens(40),
+        model: 'model-b',
+        cost: 0.04,
+        llmError: null,
+        usageByMessage: new Map([
+          ['msg_2', {tokens: tokens(20), cost: 0.02}],
+          ['msg_3', {tokens: tokens(20), cost: 0.02}],
+        ]),
+      },
+    }
+    const sendPromptToSession = vi.fn().mockResolvedValueOnce(retryableFailure).mockResolvedValueOnce(success)
+    vi.doMock('./prompt-sender.js', () => ({
+      sendPromptToSession,
+      buildContinuationPrompt: vi.fn().mockReturnValue('continue'),
+    }))
+
+    try {
+      const {executeOpenCode: freshExecuteOpenCode} = await import('./execution.js')
+      vi.mocked(createOpencode).mockResolvedValue({
+        client: createMockClient([]) as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+        server: {url: 'http://127.0.0.1:4096', close: vi.fn()},
+      })
+
+      // #when executeOpenCode retries once
+      const resultPromise = freshExecuteOpenCode(createMockPromptOptions(), mockLogger)
+      await vi.advanceTimersByTimeAsync(10_000)
+      const result = await resultPromise
+
+      // #then msg_1 (10) + msg_2's latest report (20) + msg_3 (20) = 50 — not attempt 2's 40 alone
+      expect(sendPromptToSession).toHaveBeenCalledTimes(2)
+      expect(result.tokenUsage?.input).toBe(50)
+      expect(result.cost).toBeCloseTo(0.05, 10)
+      expect(result.model).toBe('model-b')
+    } finally {
+      vi.doUnmock('./prompt-sender.js')
+      vi.resetModules()
+      vi.useRealTimers()
+    }
+  })
 })
 
 function createDisabledProviders() {

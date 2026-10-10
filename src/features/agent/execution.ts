@@ -38,6 +38,7 @@ import {
   type ExecutionDeadline,
 } from './retry.js'
 import {waitForAbortableDelay} from './session-poll.js'
+import {mergeAttemptUsage} from './streaming.js'
 
 const SESSION_ABORT_TIMEOUT_MS = 2_000
 const PERMISSION_REPLY_TIMEOUT_MS = 5_000
@@ -328,7 +329,7 @@ export async function executeOpenCode(
         }
       })()
 
-      final = mergeArtifactResults(result.eventStreamResult, final)
+      final = mergeAttemptUsage(mergeArtifactResults(result.eventStreamResult, final), final)
       if (result.eventStreamResult.discontinuity != null) observationGap = true
 
       if (result.success) {
