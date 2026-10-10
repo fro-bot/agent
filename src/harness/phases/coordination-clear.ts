@@ -27,12 +27,19 @@ function resolveTargetNumber(context: TriggerContext): number | null {
   return target.kind === 'issue' || target.kind === 'pr' ? target.number : null
 }
 
-async function clearIfStale(options: BlockedLabelClearOptions, issueNumber: number): Promise<void> {
+async function clearIfStale(
+  options: BlockedLabelClearOptions,
+  issueNumber: number,
+  signal: AbortSignal,
+): Promise<void> {
   const {githubClient, triggerContext, logger} = options
   const repoString = `${triggerContext.repo.owner}/${triggerContext.repo.repo}`
 
   // One cheap call first: the common case is that the label is not there and nothing else is touched.
-  const labels = await listLabelsOnIssue(githubClient, repoString, issueNumber, logger)
+  const labels = await listLabelsOnIssue(githubClient, repoString, issueNumber, logger, signal)
+  // Promise.race cannot cancel this function, so after every await it must check that the deadline has not passed:
+  // nothing new may start once it has.
+  if (signal.aborted) return
   if (labels == null) {
     logger.info('Not clearing blocked label: labels could not be read', {issueNumber})
     return
@@ -50,7 +57,9 @@ async function clearIfStale(options: BlockedLabelClearOptions, issueNumber: numb
     issueNumber,
     [BLOCKED_LABEL, WORKING_LABEL],
     logger,
+    signal,
   )
+  if (signal.aborted) return
   if (times == null) {
     logger.info('Not clearing blocked label: issue events could not be read', {issueNumber})
     return
@@ -85,7 +94,10 @@ async function clearIfStale(options: BlockedLabelClearOptions, issueNumber: numb
   // read above and this remove is cleared along with the stale label. The anchor is stamped at acknowledge (after
   // bootstrap and lock acquisition), so a decline landing between run start and acknowledge is also cleared. Same-
   // target overlap is prevented by the workflow's per-target concurrency group (fro-bot-<issue/pr number>).
-  const removed = await removeLabelFromIssue(githubClient, repoString, issueNumber, BLOCKED_LABEL, logger)
+  //
+  // Last cancellation point: once the DELETE is issued it cannot be recalled, so the check sits immediately before it.
+  if (signal.aborted) return
+  const removed = await removeLabelFromIssue(githubClient, repoString, issueNumber, BLOCKED_LABEL, logger, signal)
   if (removed) logger.info('Cleared stale blocked label after a successful run', {issueNumber})
 }
 
@@ -102,15 +114,28 @@ export async function runBlockedLabelClear(options: BlockedLabelClearOptions): P
   const issueNumber = resolveTargetNumber(triggerContext)
   if (issueNumber == null) return
 
+  const controller = new AbortController()
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
     const deadline = new Promise<'timeout'>(resolve => {
       timer = setTimeout(() => {
+        // Abort first so in-flight requests are cancelled and the clear starts nothing new after this point.
+        controller.abort()
         resolve('timeout')
       }, options.deadlineMs ?? BLOCKED_LABEL_CLEAR_DEADLINE_MS)
     })
-    const result = await Promise.race([clearIfStale(options, issueNumber).then(() => 'done' as const), deadline])
-    if (result === 'timeout') logger.warning('Blocked label clear timed out; leaving the label in place', {issueNumber})
+    const result = await Promise.race([
+      clearIfStale(options, issueNumber, controller.signal).then(() => 'done' as const),
+      deadline,
+    ])
+    if (result === 'timeout') {
+      logger.warning(
+        'Blocked label clear timed out; no further requests will be started (a DELETE already issued may still complete)',
+        {
+          issueNumber,
+        },
+      )
+    }
   } catch (error) {
     logger.warning('Failed to clear blocked label (non-fatal)', {error: toErrorMessage(error)})
   } finally {

@@ -3,7 +3,7 @@ import type {TriggerContext, TriggerTarget} from '../../features/triggers/types.
 import type {Octokit} from '../../services/github/types.js'
 import * as core from '@actions/core'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
-import {addLabelsToIssue, ensureLabelExists, removeLabelFromIssue} from '../../services/github/api.js'
+import {addLabelsToIssue, ensureLabelExists, removeLabelFromIssueWithOutcome} from '../../services/github/api.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {
   BLOCKED_LABEL,
@@ -25,7 +25,7 @@ vi.mock('@actions/core', () => ({
 vi.mock('../../services/github/api.js', () => ({
   addLabelsToIssue: vi.fn().mockResolvedValue(true),
   ensureLabelExists: vi.fn().mockResolvedValue(true),
-  removeLabelFromIssue: vi.fn().mockResolvedValue(true),
+  removeLabelFromIssueWithOutcome: vi.fn().mockResolvedValue('removed'),
 }))
 
 const client = {} as Octokit
@@ -139,8 +139,14 @@ describe('runCoordinationDecline', () => {
     })
 
     // #then the label is removed, then added back -- in that order
-    expect(removeLabelFromIssue).toHaveBeenCalledWith(client, 'fro-bot/agent', 7, BLOCKED_LABEL, expect.anything())
-    const removeOrder = vi.mocked(removeLabelFromIssue).mock.invocationCallOrder[0]
+    expect(removeLabelFromIssueWithOutcome).toHaveBeenCalledWith(
+      client,
+      'fro-bot/agent',
+      7,
+      BLOCKED_LABEL,
+      expect.anything(),
+    )
+    const removeOrder = vi.mocked(removeLabelFromIssueWithOutcome).mock.invocationCallOrder[0]
     const addOrder = vi.mocked(addLabelsToIssue).mock.invocationCallOrder[0]
     expect(removeOrder).toBeLessThan(addOrder as number)
   })
@@ -157,7 +163,7 @@ describe('runCoordinationDecline', () => {
     })
 
     // #then neither remove nor add is called
-    expect(removeLabelFromIssue).not.toHaveBeenCalled()
+    expect(removeLabelFromIssueWithOutcome).not.toHaveBeenCalled()
     expect(addLabelsToIssue).not.toHaveBeenCalled()
   })
 

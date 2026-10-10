@@ -15,6 +15,7 @@ import {
   listLabelsOnIssue,
   parseRepoString,
   removeLabelFromIssue,
+  removeLabelFromIssueWithOutcome,
 } from './api.js'
 import {createMockOctokit} from './test-helpers.js'
 
@@ -259,6 +260,41 @@ describe('addLabelsToIssue', () => {
 
     // #then
     expect(result).toBe(false)
+  })
+})
+
+describe('removeLabelFromIssueWithOutcome', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('reports removed, absent (404) and failed distinctly', async () => {
+    // #given three clients: remove succeeds, 404s, and 500s
+    const ok = createMockOctokit()
+    const missing = createMockOctokit()
+    vi.mocked(missing.rest.issues.removeLabel).mockRejectedValue(Object.assign(new Error('Not Found'), {status: 404}))
+    const broken = createMockOctokit()
+    vi.mocked(broken.rest.issues.removeLabel).mockRejectedValue(Object.assign(new Error('boom'), {status: 500}))
+
+    // #when / #then each outcome is distinguishable
+    expect(await removeLabelFromIssueWithOutcome(ok, 'owner/repo', 1, 'bug', createMockLogger())).toBe('removed')
+    expect(await removeLabelFromIssueWithOutcome(missing, 'owner/repo', 1, 'bug', createMockLogger())).toBe('absent')
+    expect(await removeLabelFromIssueWithOutcome(broken, 'owner/repo', 1, 'bug', createMockLogger())).toBe('failed')
+  })
+
+  it('forwards an abort signal as request.signal only when one is given', async () => {
+    // #given a client and a signal
+    const client = createMockOctokit()
+    const {signal} = new AbortController()
+
+    // #when removing with and without the signal
+    await removeLabelFromIssueWithOutcome(client, 'owner/repo', 1, 'bug', createMockLogger(), signal)
+    await removeLabelFromIssueWithOutcome(client, 'owner/repo', 1, 'bug', createMockLogger())
+
+    // #then only the first call carries a request option
+    const calls = vi.mocked(client.rest.issues.removeLabel).mock.calls
+    expect(calls[0]?.[0]).toMatchObject({request: {signal}})
+    expect(calls[1]?.[0]).not.toHaveProperty('request')
   })
 })
 

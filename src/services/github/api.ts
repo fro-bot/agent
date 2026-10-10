@@ -180,6 +180,52 @@ export async function addLabelsToIssue(
   }
 }
 
+/** What a label removal actually did: `absent` is the tolerated 404 (nothing was on the item to remove). */
+export type RemoveLabelOutcome = 'removed' | 'absent' | 'failed'
+
+/** Octokit request option carrying an optional abort signal; omitted entirely when there is none. */
+function signalOption(signal: AbortSignal | undefined): {readonly request?: {readonly signal: AbortSignal}} {
+  return signal == null ? {} : {request: {signal}}
+}
+
+/**
+ * Remove a label from an issue or PR, distinguishing a real removal from the tolerated 404 (`absent`) so callers
+ * that must act only when a label was actually taken off can tell them apart.
+ */
+export async function removeLabelFromIssueWithOutcome(
+  client: Octokit,
+  repoString: string,
+  issueNumber: number,
+  label: string,
+  logger: Logger,
+  signal?: AbortSignal,
+): Promise<RemoveLabelOutcome> {
+  try {
+    const {owner, repo} = parseRepoString(repoString)
+    await client.rest.issues.removeLabel({
+      owner,
+      repo,
+      issue_number: issueNumber,
+      name: label,
+      ...signalOption(signal),
+    })
+    logger.debug('Removed label from issue', {issueNumber, label})
+    return 'removed'
+  } catch (error) {
+    // 404 = label not on issue, which is fine
+    if (error instanceof Error && 'status' in error && (error as {status: number}).status === 404) {
+      logger.debug('Label was not present on issue', {issueNumber, label})
+      return 'absent'
+    }
+    logger.warning('Failed to remove label from issue', {
+      issueNumber,
+      label,
+      error: toErrorMessage(error),
+    })
+    return 'failed'
+  }
+}
+
 /**
  * Remove a label from an issue or PR.
  * Returns true if label was removed or wasn't present.
@@ -190,30 +236,9 @@ export async function removeLabelFromIssue(
   issueNumber: number,
   label: string,
   logger: Logger,
+  signal?: AbortSignal,
 ): Promise<boolean> {
-  try {
-    const {owner, repo} = parseRepoString(repoString)
-    await client.rest.issues.removeLabel({
-      owner,
-      repo,
-      issue_number: issueNumber,
-      name: label,
-    })
-    logger.debug('Removed label from issue', {issueNumber, label})
-    return true
-  } catch (error) {
-    // 404 = label not on issue, which is fine
-    if (error instanceof Error && 'status' in error && (error as {status: number}).status === 404) {
-      logger.debug('Label was not present on issue', {issueNumber, label})
-      return true
-    }
-    logger.warning('Failed to remove label from issue', {
-      issueNumber,
-      label,
-      error: toErrorMessage(error),
-    })
-    return false
-  }
+  return (await removeLabelFromIssueWithOutcome(client, repoString, issueNumber, label, logger, signal)) !== 'failed'
 }
 
 /**
@@ -225,6 +250,7 @@ export async function listLabelsOnIssue(
   repoString: string,
   issueNumber: number,
   logger: Logger,
+  signal?: AbortSignal,
 ): Promise<readonly string[] | null> {
   try {
     const {owner, repo} = parseRepoString(repoString)
@@ -233,6 +259,7 @@ export async function listLabelsOnIssue(
       repo,
       issue_number: issueNumber,
       per_page: 100,
+      ...signalOption(signal),
     })
     return data.map(label => label.name)
   } catch (error) {
@@ -268,7 +295,7 @@ interface IssueEventLike {
  * bounded look-back toward page 1 until every requested label has been seen. Page 1 is reused, never refetched, so
  * a single-page item costs one call. The returned map is keyed by the label strings passed in and omits labels with
  * no `labeled` event within the scanned pages. Returns `null` on any API failure so "unreadable" is distinguishable
- * from "not found".
+ * from "not found". An optional `signal` is forwarded to Octokit and stops the page walk once aborted.
  */
 export async function getLatestLabeledEventTimes(
   client: Octokit,
@@ -276,6 +303,7 @@ export async function getLatestLabeledEventTimes(
   issueNumber: number,
   labels: readonly string[],
   logger: Logger,
+  signal?: AbortSignal,
 ): Promise<ReadonlyMap<string, number> | null> {
   try {
     const {owner, repo} = parseRepoString(repoString)
@@ -286,6 +314,7 @@ export async function getLatestLabeledEventTimes(
         issue_number: issueNumber,
         per_page: EVENTS_PAGE_SIZE,
         page,
+        ...signalOption(signal),
       })
 
     const wanted = new Map(labels.map(label => [label.toLowerCase(), label]))
@@ -308,6 +337,8 @@ export async function getLatestLabeledEventTimes(
         if (found.has(label) === false) found.set(label, at)
       }
       if (found.size === wanted.size || page <= 1 || scanned + 1 >= MAX_EVENT_PAGES_SCANNED) break
+      // Stop walking pages once the caller's deadline has passed; "unreadable" keeps the caller on its safe path.
+      if (signal?.aborted === true) return null
       page -= 1
       response = page === 1 ? first : await fetchPage(page)
     }

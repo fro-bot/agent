@@ -104,6 +104,16 @@ async function clear(
   return logger
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>(r => {
+    resolve = r
+  })
+  return {promise, resolve}
+}
+
+const settle = async () => new Promise<void>(resolve => setTimeout(resolve, 10))
+
 describe('runBlockedLabelClear', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -315,10 +325,60 @@ describe('runBlockedLabelClear', () => {
       // #then the step returns, logs the timeout, and removes nothing
       expect(c.removeLabel).not.toHaveBeenCalled()
       expect(logger.warning).toHaveBeenCalledWith(
-        'Blocked label clear timed out; leaving the label in place',
+        expect.stringContaining('Blocked label clear timed out'),
         expect.anything(),
       )
       expect(BLOCKED_LABEL_CLEAR_DEADLINE_MS).toBeLessThanOrEqual(30_000)
+    })
+  })
+
+  describe('after the deadline', () => {
+    it('starts no DELETE when the labels read resolves only after the timeout', async () => {
+      // #given a labels read that is held until after the deadline, then yields a stale blocked label
+      const c = createClient()
+      const gate = deferred<{data: readonly {name: string}[]}>()
+      c.listLabelsOnIssue.mockImplementation(async () => gate.promise)
+
+      // #when the clear times out and only then does the read resolve
+      const logger = await clear(c.client, {deadlineMs: 20})
+      gate.resolve({data: [{name: BLOCKED_LABEL}]})
+      await settle()
+
+      // #then the timeout was logged and no later read or DELETE was started
+      expect(logger.warning).toHaveBeenCalledWith(
+        expect.stringContaining('Blocked label clear timed out'),
+        expect.anything(),
+      )
+      expect(c.listEvents).not.toHaveBeenCalled()
+      expect(c.removeLabel).not.toHaveBeenCalled()
+    })
+
+    it('starts no DELETE when the events read resolves only after the timeout', async () => {
+      // #given an events read held until after the deadline, whose result would justify clearing
+      const c = createClient()
+      const gate = deferred<{data: readonly unknown[]; headers: Record<string, string>}>()
+      c.listEvents.mockImplementation(async () => gate.promise)
+
+      // #when the clear times out and only then does the read resolve
+      await clear(c.client, {deadlineMs: 20})
+      gate.resolve({data: [blockedEvent(), workingEvent()], headers: {}})
+      await settle()
+
+      // #then the DELETE is never issued
+      expect(c.removeLabel).not.toHaveBeenCalled()
+    })
+
+    it('hands Octokit an abort signal that fires at the deadline', async () => {
+      // #given a hung labels read
+      const c = createClient()
+      c.listLabelsOnIssue.mockImplementation(async () => new Promise(() => {}))
+
+      // #when the clear times out
+      await clear(c.client, {deadlineMs: 20})
+
+      // #then the read was given a request signal and it has been aborted
+      const params = c.listLabelsOnIssue.mock.calls[0]?.[0] as {request?: {signal: AbortSignal}}
+      expect(params.request?.signal.aborted).toBe(true)
     })
   })
 
