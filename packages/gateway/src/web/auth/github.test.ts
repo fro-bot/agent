@@ -44,7 +44,7 @@ import {makeTrustedProxyIngressPolicy} from '../ingress/policy.js'
 import {resolveClient, unsafeResolvedClientAddressForTest} from '../ingress/resolve-client.js'
 import {parseTrustedProxyAddress} from '../ingress/trusted-proxy-address.js'
 import {assertAllPrivilegedRoutesWrapped, isPublicRoute, registerPublicRoute} from '../operator-route.js'
-import {buildGitHubOAuthRoutes, createInMemoryStateStore} from './github.js'
+import {buildGitHubOAuthRoutes, createInMemoryStateStore, validateReturnPath} from './github.js'
 import {createInMemorySessionStore, SESSION_COOKIE_NAME} from './session.js'
 
 /**
@@ -3379,5 +3379,185 @@ describe('GET /operator/auth/github/callback — allowlist check before session 
     // #then — redirected (default landing path), session created
     expect(res.status).toBe(302) // no return_to captured → redirect to default landing path
     expect(sessionStore.size()).toBe(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// validateReturnPath — unit tests (backslash / control-char / cross-origin hardening)
+// ---------------------------------------------------------------------------
+
+describe('validateReturnPath', () => {
+  const origin = 'https://operator.example.com'
+  const allowed = [
+    '/operator',
+    '/operator/runs',
+    String.raw`/\evil.example/landing`,
+    String.raw`/operator\runs`,
+    '/operator\n',
+    '/operator\t',
+    '/operator\u0000',
+    '/operator\u007F',
+    '/operator x',
+    '/operator\u00A0x',
+    '/%5Cevil',
+    '//evil.example',
+    'https://evil.example/x',
+  ]
+
+  it.each([['/operator'], ['/operator/runs']])('accepts ordinary allowlisted path %s', path => {
+    // #given an ordinary allowlisted path
+    // #when validated
+    const result = validateReturnPath(path, allowed, origin)
+
+    // #then it is returned unchanged
+    expect(result).toBe(path)
+  })
+
+  it.each([
+    ['a leading backslash (host-relative form)', String.raw`/\evil.example/landing`],
+    ['an embedded backslash', String.raw`/operator\runs`],
+    ['a trailing newline', '/operator\n'],
+    ['a trailing tab', '/operator\t'],
+    ['a NUL byte', '/operator\u0000'],
+    ['DEL', '/operator\u007F'],
+    ['an ASCII space', '/operator x'],
+    ['a non-breaking space', '/operator\u00A0x'],
+  ])('rejects %s even when the exact string is allowlisted', (_label, candidate) => {
+    // #given the candidate is literally present in the allowlist
+    expect(allowed).toContain(candidate)
+
+    // #when validated
+    const result = validateReturnPath(candidate, allowed, origin)
+
+    // #then the character screen rejects it
+    expect(result).toBeNull()
+  })
+
+  it('accepts a percent-encoded backslash because URL parsing never decodes it into a separator', () => {
+    // #given /%5Cevil is allowlisted
+    // #when validated
+    const result = validateReturnPath('/%5Cevil', allowed, origin)
+
+    // #then it is accepted, and a browser resolves it to the same origin
+    expect(result).toBe('/%5Cevil')
+    expect(new URL('/%5Cevil', origin).origin).toBe(origin)
+  })
+
+  it.each([['//evil.example'], ['https://evil.example/x']])('rejects %s (protocol-relative / absolute URL)', path => {
+    // #given the candidate is allowlisted
+    // #when validated
+    const result = validateReturnPath(path, allowed, origin)
+
+    // #then it is rejected
+    expect(result).toBeNull()
+  })
+
+  it('rejects an unparseable public origin (fail closed)', () => {
+    // #given a broken origin
+    // #when validated
+    const result = validateReturnPath('/operator', allowed, 'not a url')
+
+    // #then
+    expect(result).toBeNull()
+  })
+
+  it('rejects a path whose resolved form is not itself allowlisted (dot-segment escape)', () => {
+    // #given /operator/../admin is allowlisted but resolves to /admin
+    const result = validateReturnPath('/operator/../admin', ['/operator/../admin'], origin)
+
+    // #then
+    expect(result).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// OAuth callback — unsafe backslash target must never become a redirect
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/auth/github/callback — backslash open-redirect hardening', () => {
+  const evilPath = String.raw`/\evil.example/landing`
+
+  it('falls back to identity JSON (no Location) when the first allowed default is a backslash path', async () => {
+    // #given — the default (first entry) is /\evil.example/landing, no return_to captured
+    const stateStore = createInMemoryStateStore()
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    stateStore.set('valid-state-value', {
+      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
+      issuedAt: now,
+      consumed: false,
+    })
+    const deps = makeStubDeps({
+      stateStore,
+      clock: () => now + 1000,
+      fetch: makeSuccessFetch({userId: 42, login: 'octocat'}),
+    })
+    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
+    const config = makeStubConfig({allowedReturnPaths: [evilPath, '/operator']})
+    const app = buildTestAppWithSession(deps, config, sessionStore, sessionDeps)
+
+    // #when
+    const res = await app.fetch(
+      new Request(
+        'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
+      ),
+    )
+
+    // #then — 200 identity JSON, no redirect, session still minted once, warning logged
+    expect(res.status).toBe(200)
+    expect(res.headers.get('location')).toBeNull()
+    expect(await res.json()).toMatchObject({githubUserId: 42, login: 'octocat'})
+    expect(sessionStore.size()).toBe(1)
+    expect(sessionDeps.logger.warn).toHaveBeenCalledWith({}, expect.stringContaining('no valid default landing path'))
+  })
+
+  it('rejects an explicit allowlisted backslash return_to and lands on the default /operator', async () => {
+    // #given — captured redirectTarget is the (allowlisted) backslash path; default is /operator
+    const stateStore = createInMemoryStateStore()
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    stateStore.set('valid-state-value', {
+      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
+      issuedAt: now,
+      consumed: false,
+      redirectTarget: evilPath,
+    })
+    const deps = makeStubDeps({
+      stateStore,
+      clock: () => now + 1000,
+      fetch: makeSuccessFetch({userId: 42, login: 'octocat'}),
+    })
+    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
+    const config = makeStubConfig({allowedReturnPaths: ['/operator', evilPath]})
+    const app = buildTestAppWithSession(deps, config, sessionStore, sessionDeps)
+
+    // #when
+    const res = await app.fetch(
+      new Request(
+        'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
+      ),
+    )
+
+    // #then — redirected to the safe default, never to the backslash target
+    expect(res.status).toBe(302)
+    expect(res.headers.get('location')).toBe('/operator')
+    expect(sessionStore.size()).toBe(1)
+  })
+
+  it('rejects an explicit backslash return_to at /start (400, no state minted)', async () => {
+    // #given — the backslash path is allowlisted
+    const stateStore = createInMemoryStateStore()
+    const deps = makeStubDeps({stateStore})
+    const config = makeStubConfig({allowedReturnPaths: ['/operator', evilPath]})
+    const app = buildTestApp(deps, config)
+
+    // #when
+    const res = await app.fetch(
+      new Request(`https://operator.example.com/operator/auth/github/start?return_to=${encodeURIComponent(evilPath)}`),
+    )
+
+    // #then
+    expect(res.status).toBe(400)
+    expect(stateStore.size()).toBe(0)
   })
 })

@@ -12,6 +12,7 @@ import process from 'node:process'
 import {GatewayIntentBits} from 'discord.js'
 import {Effect, Either} from 'effect'
 import {parseAllowlistText} from './web/auth/allowlist.js'
+import {validateReturnPath} from './web/auth/github.js'
 import {makeTrustedProxyIngressPolicy} from './web/ingress/policy.js'
 import {matchesTrustedProxyAddress, parseTrustedProxyAddress} from './web/ingress/trusted-proxy-address.js'
 import {
@@ -946,6 +947,18 @@ export function loadGatewayConfig(): GatewayConfig {
             .split(',')
             .map(p => p.trim())
             .filter(p => p.length > 0)
+
+    // Fail loud on an unsafe entry (backslash, control/whitespace, absolute or
+    // protocol-relative URL, non-rooted path): the first entry is also the
+    // default post-sign-in redirect, so it must pass the same validator the
+    // OAuth routes apply at runtime.
+    for (const entry of oauthAllowedReturnPaths) {
+      if (validateReturnPath(entry, [entry], parsedPublicOrigin.origin) === null) {
+        throw new Error(
+          `Invalid GATEWAY_OPERATOR_OAUTH_ALLOWED_RETURN_PATHS entry: ${JSON.stringify(entry)} (must be a same-origin path starting with a single "/" and containing no backslash, whitespace, or control characters)`,
+        )
+      }
+    }
 
     const rawStateTtlMs = readOptionalSecret('GATEWAY_OPERATOR_OAUTH_STATE_TTL_MS')
     let oauthStateTtlMs = 600_000 // 10 minutes default
