@@ -437,7 +437,9 @@ export function createDrainCompletion(options: DrainCompletionOptions): DrainCom
       .filter(id => !noticedChildren.has(id) && !cancelExempt.has(id))
     if (unfenced.length > 0) return reject('notice-not-observed', {children: unfenced})
 
-    // Delivery fence: the reply the user will read must already be in the sink. Ids only in the log, never text.
+    // Delivery fence: the reply the user will read must already have been accepted from the stream — in the sink, or
+    // (whitespace only) held by run-core's segment-boundary tracker, which flushes it to the sink before
+    // `runOpenCodeCore` settles. Ids only in the log, never text.
     if (isReplyDelivered !== undefined) {
       const replyParts = followUpReplyText(rootFacts, latestUserId, streamNoticeMessageIds)
       if (!isReplyDelivered(replyParts))
