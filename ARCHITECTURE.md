@@ -167,6 +167,10 @@ main.ts
         │     (onPermissionAsked auto-denies any permission.asked event immediately —
         │      there is no interactive approval path in CI, so an unanswered ask must
         │      never be left to block the run until the execution deadline)
+     (the `question` tool is never offered: bootstrapOpenCodeServer pins
+      OPENCODE_CLIENT=fro-bot-action and clears OPENCODE_ENABLE_QUESTION_TOOL, so
+      upstream does not register it — nobody can answer in CI and a pending
+      question has no server-side timeout; see "OpenCode Question Tool Disabled")
         │     (processEventStream observes owned descendants via a per-invocation
         │      OwnershipLedger: a completed `task` tool call carrying
         │      metadata.background === true adopts the child session id, after which
@@ -454,6 +458,12 @@ A `ready` outcome's own admission gates already guarantee a clean, attached, no-
 ### OpenCode File Watcher Disabled By Default
 
 Neither surface consumes file-change events — the Action's stream handler and the gateway both read message and tool lifecycle events only — so `bootstrapOpenCodeServer` (`packages/runtime/src/agent/server.ts`) sets `OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER=true` before spawn, alongside the pinned `FRO_BOT_OPENCODE_URL`, so the child captures it at spawn time and it survives the `OPENCODE_`-prefix allowlist in `filterAgentEnv`. It only defaults the value when unset or an empty string — GitHub Actions materializes an unset `env:` input as `''`, not an absent key, and OpenCode's boolean config parsing does not treat `''` as true — so an operator who explicitly set it (including to `false`) is never overridden. `deploy/workspace.Dockerfile` bakes the same default (`ENV OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER=true`) into the gateway's workspace container image, overridable per-deployment via `deploy/compose.yaml`/`deploy/.env`. The accepted tradeoff: OpenCode caches the VCS branch and refreshes that cache from watcher events, so it can go stale after a checkout — more visible on the long-lived workspace container than in short-lived CI.
+
+### OpenCode Question Tool Disabled (Action)
+
+Nobody can answer an interactive `question` in a CI run, and a pending question has no server-side timeout, so a model that called the tool held the run until the execution deadline (#1756). Upstream registers the tool only when `flags.client` is `app`/`cli`/`desktop` or `OPENCODE_ENABLE_QUESTION_TOOL` is set (`tool/registry.ts:207`), and `client` defaults to `cli` (`effect/runtime-flags.ts:56`). `bootstrapOpenCodeServer` (`packages/runtime/src/agent/server.ts`, `pinQuestionToolOff`) therefore pins `OPENCODE_CLIENT=fro-bot-action` (`NON_INTERACTIVE_OPENCODE_CLIENT`) and deletes `OPENCODE_ENABLE_QUESTION_TOOL` before spawn; both survive the `OPENCODE_`-prefix allowlist in `filterAgentEnv`. The tool is then absent from the registry, so the model is never offered it and the stream needs no `question.*` handling. Unlike the watcher default above, an operator value does **not** win — it is overridden with a warning, the same stance as the `subagent_depth` pin in `buildCIConfig`.
+
+A config-level `permission.question: 'deny'` was rejected as the mechanism: the top-level `permission` block is merged into each agent _before_ that agent's own `permission` (`agent/agent.ts:138-150`, `:293`; last matching rule wins), so any agent that ships `permission.question: 'allow'` re-enables the tool — oMo's Sisyphus and Prometheus agents do. The only other upstream readers of the client value are telemetry-shaped (models.dev user agent, OTLP `opencode.client` attribute, the `x-opencode-client` header sent to `opencode*` providers) plus the experimental `plan` tool, which is off. The gateway does not go through this bootstrap and keeps the tool: it answers questions through Discord.
 
 ### Mitmproxy Egress Topology (Workspace)
 
