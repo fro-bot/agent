@@ -208,6 +208,7 @@ A few inputs most workflows touch:
 | `response-mode` | No | `github` | `github` posts one comment/review; `none` suppresses all GitHub writes |
 | `review-skip-label` | No | `skip-agent-review` | PR label that suppresses automatic PR-event reviews (case-insensitive); authorized mentions and review requests naming the bot still run; empty disables |
 | `brokered-push-extra-paths` | No | Empty | Comma-separated relative path prefixes added to brokered pushes; protected surfaces are denied at the root by prefix screening and within opted-in prefixes by segment/basename screening; default-allowlisted files remain governed by default rules; do not include secrets or execution surfaces |
+| `matrix-context` | No | `${{ toJSON(matrix) }}` | Internal; do not set. Derives a short hash that keeps one matrix leg's cache key, log artifact name, and run-scoped session key distinct from its sibling legs (with `GITHUB_JOB`) |
 
 **Outputs**
 

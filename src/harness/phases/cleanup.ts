@@ -35,6 +35,7 @@ import {
   getGitHubRunAttempt,
   getGitHubRunId,
   getGitHubWorkspace,
+  getInvocationIdentity,
   getOpenCodeAuthPath,
   getOpenCodeLogPath,
   getOpenCodeStoragePath,
@@ -430,6 +431,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
         logPath: getOpenCodeLogPath(),
         runId: getGitHubRunId(),
         runAttempt: getGitHubRunAttempt(),
+        invocationIdentity: getInvocationIdentity(),
         logger: artifactLogger,
       })
       if (artifactUploaded) {

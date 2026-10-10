@@ -34,6 +34,7 @@ describe('uploadLogArtifact', () => {
       logPath: '/nonexistent/path',
       runId: 12345,
       runAttempt: 1,
+      invocationIdentity: null,
       logger,
     })
 
@@ -59,6 +60,7 @@ describe('uploadLogArtifact', () => {
       logPath: '/empty/log',
       runId: 12345,
       runAttempt: 1,
+      invocationIdentity: null,
       logger,
     })
 
@@ -89,6 +91,7 @@ describe('uploadLogArtifact', () => {
       logPath: '/logs',
       runId: 99,
       runAttempt: 2,
+      invocationIdentity: null,
       logger,
     })
 
@@ -124,6 +127,7 @@ describe('uploadLogArtifact', () => {
       logPath: '/logs',
       runId: 12345,
       runAttempt: 1,
+      invocationIdentity: null,
       logger,
     })
 
@@ -153,6 +157,7 @@ describe('uploadLogArtifact', () => {
       logPath: '/logs',
       runId: 1,
       runAttempt: 1,
+      invocationIdentity: null,
       retentionDays: 30,
       compressionLevel: 0,
       logger,
@@ -182,7 +187,7 @@ describe('uploadLogArtifact', () => {
     const logger = createMockLogger()
 
     // #when upload is attempted
-    await uploadLogArtifact({logPath: '/logs', runId: 1, runAttempt: 1, logger})
+    await uploadLogArtifact({logPath: '/logs', runId: 1, runAttempt: 1, invocationIdentity: null, logger})
 
     // #then only files are included, not directories
     expect(mockUploadArtifact).toHaveBeenCalledWith(
@@ -191,5 +196,48 @@ describe('uploadLogArtifact', () => {
       '/logs',
       expect.any(Object),
     )
+  })
+
+  it('names the artifact per job so two jobs of one run do not upload under the same name', async () => {
+    // #given Remediate then Observe in one run and attempt, each with files and a succeeding upload
+    const fs = await import('node:fs/promises')
+    vi.mocked(fs.access).mockResolvedValue(undefined)
+    vi.mocked(fs.readdir).mockResolvedValue([
+      {name: 'opencode.log', parentPath: '/logs', isFile: () => true, isDirectory: () => false},
+    ] as unknown as Awaited<ReturnType<typeof fs.readdir>>)
+    mockUploadArtifact.mockResolvedValue({size: 1, id: 1})
+    const {uploadLogArtifact} = await import('./upload.js')
+
+    // #when each job uploads
+    for (const invocationIdentity of ['fro-bot-remediate', 'fro-bot-observe']) {
+      await uploadLogArtifact({
+        logPath: '/logs',
+        runId: 38026680860,
+        runAttempt: 1,
+        invocationIdentity,
+        logger: createMockLogger(),
+      })
+    }
+
+    // #then the names differ and keep run ID / attempt before the job
+    const names = mockUploadArtifact.mock.calls.map(call => String(call[0]))
+    expect(names).toEqual([
+      'opencode-logs-38026680860-1-fro-bot-remediate',
+      'opencode-logs-38026680860-1-fro-bot-observe',
+    ])
+  })
+
+  it('re-run attempt 2 of the same job uploads under a distinct name from attempt 1', async () => {
+    // #given the same job's attempt 1 and re-run attempt 2
+    const {buildLogArtifactName} = await import('./upload.js')
+
+    // #when naming both
+    const attempt1 = buildLogArtifactName(38026680860, 1, 'fro-bot-observe')
+    const attempt2 = buildLogArtifactName(38026680860, 2, 'fro-bot-observe')
+
+    // #then distinct, and a null identity (outside a runner) keeps the legacy shape
+    expect(attempt1).toBe('opencode-logs-38026680860-1-fro-bot-observe')
+    expect(attempt2).toBe('opencode-logs-38026680860-2-fro-bot-observe')
+    expect(buildLogArtifactName(99, 2, null)).toBe('opencode-logs-99-2')
   })
 })

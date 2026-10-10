@@ -150,7 +150,7 @@ describe('buildSaveCacheKey', () => {
     const runAttempt = 1
 
     // #when building save cache key
-    const key = buildSaveCacheKey(components, runId, runAttempt)
+    const key = buildSaveCacheKey(components, runId, runAttempt, null)
 
     // #then run ID and run attempt are appended to primary key, in that order
     expect(key).toBe('opencode-storage-github-owner-repo-main-Linux-12345678-1')
@@ -167,7 +167,7 @@ describe('buildSaveCacheKey', () => {
     const runId = 9876543210
 
     // #when building save cache key
-    const key = buildSaveCacheKey(components, runId, 1)
+    const key = buildSaveCacheKey(components, runId, 1, null)
 
     // #then key includes full run ID
     expect(key).toContain('9876543210')
@@ -185,8 +185,8 @@ describe('buildSaveCacheKey', () => {
     const runId = 12345678
 
     // #when building the save key for attempt 1 and attempt 2 of the same run
-    const attempt1Key = buildSaveCacheKey(components, runId, 1)
-    const attempt2Key = buildSaveCacheKey(components, runId, 2)
+    const attempt1Key = buildSaveCacheKey(components, runId, 1, null)
+    const attempt2Key = buildSaveCacheKey(components, runId, 2, null)
 
     // #then the keys are distinct -- without this, attempt 2's save would collide with
     // attempt 1's entry, throw "already exists", fold into 'persisted', and the post hook
@@ -208,7 +208,7 @@ describe('buildSaveCacheKey', () => {
     }
 
     // #when building the save key with that default
-    const key = buildSaveCacheKey(components, 12345678, 1)
+    const key = buildSaveCacheKey(components, 12345678, 1, null)
 
     // #then the key ends in the literal suffix produced by the default attempt value
     expect(key.endsWith('-1')).toBe(true)
@@ -222,7 +222,7 @@ describe('buildSaveCacheKey', () => {
       ref: 'main',
       os: 'Linux',
     }
-    const saveKey = buildSaveCacheKey(components, 12345678, 2)
+    const saveKey = buildSaveCacheKey(components, 12345678, 2, null)
 
     // #when building the restore keys for the same components
     const [refScoped, repoScoped] = buildRestoreKeys(components)
@@ -233,5 +233,58 @@ describe('buildSaveCacheKey', () => {
     expect(repoScoped).toBeDefined()
     expect(saveKey.startsWith(refScoped as string)).toBe(true)
     expect(saveKey.startsWith(repoScoped as string)).toBe(true)
+  })
+
+  describe('invocation identity (job / matrix leg)', () => {
+    const components: CacheKeyComponents = {
+      agentIdentity: 'github',
+      repo: 'fro-bot/.github',
+      ref: 'main',
+      os: 'Linux',
+    }
+    const runId = 38026680860
+
+    it('appends the identity after run ID and run attempt', () => {
+      // #given a job identity
+      // #when building the save key
+      const key = buildSaveCacheKey(components, runId, 1, 'fro-bot-remediate')
+
+      // #then the identity is the last segment
+      expect(key).toBe('opencode-storage-github-fro-bot-.github-main-Linux-38026680860-1-fro-bot-remediate')
+    })
+
+    it('gives two jobs in the same run and attempt distinct save keys (the Remediate/Observe collision)', () => {
+      // #given two needs:-chained jobs of one run, same attempt
+      // #when each builds its save key
+      const remediate = buildSaveCacheKey(components, runId, 1, 'fro-bot-remediate')
+      const observe = buildSaveCacheKey(components, runId, 1, 'fro-bot-observe')
+
+      // #then they differ, so Observe's save can never be blocked by Remediate's reservation
+      expect(remediate).not.toBe(observe)
+    })
+
+    it('re-run of the same job (attempt 2): distinct key from attempt 1, so the re-run can save', () => {
+      // #given the same job in attempt 1 and its re-run attempt 2
+      const attempt1 = buildSaveCacheKey(components, runId, 1, 'fro-bot-observe')
+      const attempt2 = buildSaveCacheKey(components, runId, 2, 'fro-bot-observe')
+
+      // #then distinct (attempt 2 does not hit attempt 1's reservation) and same job suffix
+      expect(attempt2).not.toBe(attempt1)
+      expect(attempt1).toBe('opencode-storage-github-fro-bot-.github-main-Linux-38026680860-1-fro-bot-observe')
+      expect(attempt2).toBe('opencode-storage-github-fro-bot-.github-main-Linux-38026680860-2-fro-bot-observe')
+    })
+
+    it('restore prefixes match new identity-qualified keys AND old keys without an identity suffix', () => {
+      // #given a new-format key, and an old-format key written before the identity suffix existed
+      const newKey = buildSaveCacheKey(components, runId, 2, 'fro-bot-observe')
+      const oldKey = 'opencode-storage-github-fro-bot-.github-main-Linux-38026680860-1'
+      const [refScoped, repoScoped] = buildRestoreKeys(components)
+
+      // #then both restore-key prefixes match both formats
+      for (const key of [newKey, oldKey]) {
+        expect(key.startsWith(refScoped as string)).toBe(true)
+        expect(key.startsWith(repoScoped as string)).toBe(true)
+      }
+    })
   })
 })
