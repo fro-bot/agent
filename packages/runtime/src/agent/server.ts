@@ -1,4 +1,5 @@
 import type {Result} from '@bfra.me/es/result'
+import type {Config} from '@opencode-ai/sdk'
 import type {SessionClient} from '../session/index.js'
 import type {Logger} from '../shared/logger.js'
 import type {SetupAdapter, SetupInputs} from './setup-adapter.js'
@@ -284,12 +285,24 @@ function pinQuestionToolOff(logger: Logger): void {
   }
 }
 
+export interface BootstrapOpenCodeServerOptions {
+  /**
+   * OpenCode config handed to the SDK, which spawns the server with `OPENCODE_CONFIG_CONTENT` set to it.
+   * Upstream loads that env var as its own config layer AFTER the global file, `OPENCODE_CONFIG`, project
+   * config and `.opencode` dirs (`config/config.ts:482-490`), and plugin lists from separate layers
+   * concatenate (`:365-367`, `:344-363`), so a plugin passed here cannot be dropped by any of the earlier
+   * layers. Omit it and the SDK sends `{}`, exactly as before this option existed.
+   */
+  readonly config?: Config
+}
+
 export async function bootstrapOpenCodeServer(
   signal: AbortSignal,
   logger: Logger,
   workspacePath: string,
   timeoutMs: number = DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS,
   readinessTimeoutMs: number = DEFAULT_SERVER_READINESS_TIMEOUT_MS,
+  options: BootstrapOpenCodeServerOptions = {},
 ): Promise<Result<OpenCodeServerHandle, Error>> {
   const startedAt = Date.now()
   // Time spent inside createOpencode specifically — the only window timeoutMs governs.
@@ -354,7 +367,14 @@ export async function bootstrapOpenCodeServer(
       process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS = 'true'
     }
     pinQuestionToolOff(logger)
-    const spawnOptions = {signal, hostname: '127.0.0.1', port, timeout: timeoutMs}
+    // `config` is spread in only when given, so the default call hands the SDK exactly the options it always did.
+    const spawnOptions = {
+      signal,
+      hostname: '127.0.0.1',
+      port,
+      timeout: timeoutMs,
+      ...(options.config === undefined ? {} : {config: options.config}),
+    }
     // Measured separately from the total: timeoutMs bounds this call alone, so comparing
     // it against time that also covers port acquisition would misreport the real margin.
     // Keeping both also separates a slow port bind from slow server init, which are

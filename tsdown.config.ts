@@ -84,4 +84,16 @@ export default defineConfig([
     },
     noExternal: sharedNoExternal,
   },
+  {
+    // The task-reuse guard shares ONE source with the gateway image: deploy/plugins/no-task-reuse.mjs is
+    // dependency-free plain ESM, so this build only relocates it to dist/no-task-reuse.js (setup copies it
+    // into the CI OpenCode config dir). Unminified so the shipped guard is readable in review.
+    entry: ['deploy/plugins/no-task-reuse.mjs'],
+    fixedExtension: false,
+    deps: {onlyBundle: false},
+    minify: false,
+    sourcemap: false,
+    dts: false,
+    clean: false,
+  },
 ])
