@@ -1742,8 +1742,10 @@ describe('runOpenCodeCore', () => {
         partDeltaWithPartId('new', 'part-b'),
       ])
 
-      // #then part-a's continuation is intact and the boundary lands before part-b's visible text
-      expect(sink.buffered()).toBe('hel lo\n\nnew')
+      // #then part-a's continuation is intact (part-b's space is neither emitted nor consumed by it), and part-b's
+      // space lands after the boundary, in one append with its visible text (it used to be emitted early: "hel lo\n\nnew")
+      expect(sink.buffered()).toBe('hello\n\n new')
+      expect(sink._appended).toEqual(['hel', 'lo', '\n\n new'])
     })
 
     it('a whitespace-only lead-in of a new part followed by an anonymous delta does not hand it the boundary', async () => {
@@ -1754,8 +1756,10 @@ describe('runOpenCodeCore', () => {
         nextTextDeltaStringEvent('lo'),
       ])
 
-      // #then the anonymous delta is appended untouched
-      expect(sink.buffered()).toBe('hel lo')
+      // #then the anonymous delta is appended untouched and part-b's space stays held (it used to be emitted before
+      // it: "hel lo") until the stream ends, when it is flushed as-is with no separator
+      expect(sink._appended).toEqual(['hel', 'lo', ' '])
+      expect(sink.buffered()).toBe('hello ')
     })
 
     it('a part that starts empty is separated when it becomes visible after another part', async () => {
@@ -1771,32 +1775,78 @@ describe('runOpenCodeCore', () => {
     })
 
     it.each([
-      ['one newline, together', ['\nb']],
-      ['one newline, split', ['\n', 'b']],
-      ['two newlines, together', ['\n\nb']],
-      ['two newlines, split after both', ['\n\n', 'b']],
-      ['two newlines, split between them', ['\n', '\nb']],
-      ['two newlines, one per delta', ['\n', '\n', 'b']],
-      ['three newlines, together', ['\n\n\nb']],
-      ['three newlines, split', ['\n', '\n\n', 'b']],
-    ])('leading newlines are chunking-independent — %s', async (_label, chunks) => {
+      ['one newline, together', ['\nb'], 'a\n\nb'],
+      ['one newline, split', ['\n', 'b'], 'a\n\nb'],
+      ['two newlines, together', ['\n\nb'], 'a\n\nb'],
+      ['two newlines, split after both', ['\n\n', 'b'], 'a\n\nb'],
+      ['two newlines, split between them', ['\n', '\nb'], 'a\n\nb'],
+      ['two newlines, one per delta', ['\n', '\n', 'b'], 'a\n\nb'],
+      ['three newlines, together', ['\n\n\nb'], 'a\n\n\nb'],
+      ['three newlines, split', ['\n', '\n\n', 'b'], 'a\n\n\nb'],
+      ['code indentation, together', ['\n    code'], 'a\n\n    code'],
+      ['code indentation, split immediately before the code', ['\n    ', 'code'], 'a\n\n    code'],
+      ['code indentation, split inside the indentation', ['\n  ', '  code'], 'a\n\n    code'],
+      ['code indentation, split after the newline', ['\n', '    code'], 'a\n\n    code'],
+      ['code indentation, one delta per character of the lead-in', ['\n', ' ', ' ', ' ', ' ', 'code'], 'a\n\n    code'],
+    ])('leading whitespace is chunking-independent — %s', async (_label, chunks, expected) => {
       // #given the same part-2 text delivered in different chunkings after part-1's "a"
       const sink = await runSegmentEvents([
         partDeltaWithPartId('a', 'part-1'),
         ...chunks.map(chunk => partDeltaWithPartId(chunk, 'part-2')),
       ])
 
-      // #then the separation depends only on the part's text, never on the chunking
-      const lead = chunks.join('').length - 1
-      expect(sink.buffered()).toBe(`a${'\n'.repeat(Math.max(2, lead))}b`)
-      // and each chunk reached the sink unchanged (the separator is its own append)
-      const separator = '\n'.repeat(Math.max(0, 2 - lead))
-      expect(sink._appended).toEqual([
-        'a',
-        ...chunks.slice(0, -1),
-        ...(separator.length > 0 ? [separator] : []),
-        chunks.at(-1),
+      // #then the output depends only on the part's text, never on the chunking, and indentation stays attached to
+      // the text it indents (the separator goes BEFORE the lead-in)
+      expect(sink.buffered()).toBe(expected)
+      // and the lead-in is held, then released with its text and the separator as ONE append
+      expect(sink._appended).toEqual(['a', expected.slice(1)])
+    })
+
+    it('whitespace held for a part that never becomes visible is flushed as-is when the stream ends', async () => {
+      // #given part-2 only ever streams indentation after part-1's text
+      const sink = await runSegmentEvents([
+        partDeltaWithPartId('a', 'part-1'),
+        partDeltaWithPartId('\n', 'part-2'),
+        partDeltaWithPartId('  ', 'part-2'),
       ])
+
+      // #then nothing was emitted early; the held text reaches the sink once, in order, with no separator
+      expect(sink._appended).toEqual(['a', '\n  '])
+    })
+
+    it('held whitespace still reaches the sink when the run fails', async () => {
+      // #given part-2 holds a lead-in and the session then errors
+      const sink = makeSink()
+      const handle = makeHandle({
+        subscribe: async () =>
+          subscribeOk([
+            partDeltaWithPartId('a', 'part-1'),
+            partDeltaWithPartId('\n', 'part-2'),
+            sessionErrorEvent('sess-123'),
+          ]),
+      })
+
+      // #when
+      await expect(runOpenCodeCore({...buildParams(handle), sink, coordinator: makeCoordinator()})).rejects.toThrow()
+
+      // #then the held text was flushed on the way out, not lost
+      expect(sink._appended).toEqual(['a', '\n'])
+    })
+
+    it('a held lead-in is released only by its own segment, never by a tool summary or another part', async () => {
+      // #given part-b holds a lead-in, a tool summary lands, part-a continues, then part-b becomes visible
+      const sink = await runSegmentEvents([
+        partDeltaWithPartId('a1', 'part-a'),
+        partDeltaWithPartId('\n    ', 'part-b'),
+        partUpdatedToolEvent('edit', 'completed', {input: {filePath: 'src/foo.ts', newString: 'x', oldString: 'y'}}),
+        partDeltaWithPartId('a2', 'part-a'),
+        partDeltaWithPartId('code', 'part-b'),
+      ])
+
+      // #then part-b's indentation is emitted once, right before its code, and part-a's continuation is not split
+      const out = sink.buffered()
+      expect(out).toMatch(/^a1\n.*foo\.ts.*\na2\n\n {4}code$/s)
+      expect(sink._appended.at(-1)).toBe('\n\n    code')
     })
 
     it('text part → tool summary → text part: one blank line after the summary, not two', async () => {

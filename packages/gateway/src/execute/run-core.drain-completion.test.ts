@@ -1594,13 +1594,11 @@ describe('runOpenCodeCore — drain completion for background work', () => {
       // and does not reorder)
       expect(run.outcome()).toEqual({ok: true})
       expect(replyOutput(run)).toBe('Two. \n\nOne. \n\nThree.')
+      // (each boundary is appended together with the part's first text: the separator used to be its own append)
       expect(run.sink.appended.filter(chunk => chunk !== '\nbackground task\n')).toEqual([
-        '\n',
-        'Two. ',
-        '\n\n',
-        'One. ',
-        '\n\n',
-        'Three.',
+        '\nTwo. ',
+        '\n\nOne. ',
+        '\n\nThree.',
       ])
     })
 
@@ -1716,6 +1714,56 @@ describe('runOpenCodeCore — drain completion for background work', () => {
       // #then the separator sits between the parts in the sink but is not part of the fence's evidence
       expect(replyOutput(run)).toBe('One. \n\nTwo.')
       expect(run.outcome()).toEqual({ok: true})
+    })
+
+    it('a whitespace-only final part held back by the boundary is flushed before completion: admitted, and in the final text', async () => {
+      // #given persisted "One." and a whitespace-only final part "\n", both streamed by part id
+      const run = await startFollowUp([textPart('p1', 'One.'), textPart('p2', '\n')])
+      await run.emit(textDeltaEvent('One.', 'p1'))
+      await run.emit(textDeltaEvent('\n', 'p2'))
+
+      // #when the root goes idle
+      await run.emit(idleEvent())
+      await run.done
+
+      // #then the fence admits it rather than ending drain-timeout, and the held "\n" reached the sink, unseparated
+      expect(run.outcome()).toEqual({ok: true})
+      expect(replyOutput(run)).toBe('One.\n')
+    })
+
+    it('a whitespace-only final part streamed by legacy identity is flushed too (end-anchored match)', async () => {
+      // #given persisted "One. " and "\n", delivered as legacy deltas that carry message/text identity
+      const identified = (text: string, textID: string): object => ({
+        type: 'session.next.text.delta',
+        properties: {sessionID: ROOT, assistantMessageID: 'msg-reply-2', textID, delta: text},
+      })
+      const run = await startFollowUp([textPart('p1', 'One. '), textPart('p2', '\n')])
+      await run.emit(identified('One. ', 'text-1'))
+      await run.emit(identified('\n', 'text-2'))
+
+      // #when the root goes idle
+      await run.emit(idleEvent())
+      await run.done
+
+      // #then
+      expect(run.outcome()).toEqual({ok: true})
+      expect(replyOutput(run)).toBe('One. \n')
+    })
+
+    it('an indented follow-up part keeps its indentation after the separator through the fence', async () => {
+      // #given persisted "One." and "\n    code", the second streamed as indentation then code
+      const run = await startFollowUp([textPart('p1', 'One.'), textPart('p2', '\n    code')])
+      await run.emit(textDeltaEvent('One.', 'p1'))
+      await run.emit(textDeltaEvent('\n    ', 'p2'))
+      await run.emit(textDeltaEvent('code', 'p2'))
+
+      // #when the root goes idle
+      await run.emit(idleEvent())
+      await run.done
+
+      // #then admitted, with the indentation still attached to the code
+      expect(run.outcome()).toEqual({ok: true})
+      expect(replyOutput(run)).toBe('One.\n\n    code')
     })
 
     it.each([

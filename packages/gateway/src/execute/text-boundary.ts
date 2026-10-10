@@ -9,36 +9,47 @@
  *
  * Rules:
  * - A boundary is a Markdown paragraph break: exactly one blank line (`\n\n`) between the visible text before and
- *   after. It tops up whatever newlines the output already ends with PLUS the newlines the new text itself leads
+ *   after. It tops up whatever newlines the output already ends with PLUS the newlines the new segment itself leads
  *   with: none → `\n\n`, one → `\n`, two or more → nothing (a single newline is completed to a blank line rather than
- *   skipped, because a lone newline does not separate Markdown paragraphs — the very bug being fixed). Counting the
- *   delta's own leading newlines makes the result independent of how the segment's text was chunked: `"\nb"` in one
- *   delta and `"\n"` then `"b"` both yield a single blank line.
- * - Never at the very start of output: nothing non-whitespace has been appended yet.
- * - A segment is REGISTERED, and its boundary decided, only on its first non-whitespace delta. Whitespace-only
- *   deltas pass through to the sink as they arrive and neither register the segment nor open a boundary, so a
- *   segment that starts empty or whitespace-only and becomes visible later is still judged against what precedes it
- *   at that moment (not at the moment it was first mentioned).
- * - Never inside a segment: a registered (already visible) segment never opens a boundary, so interleaved deltas of
- *   concurrently streaming parts are not split mid-part. A boundary is decided per segment at registration and
- *   consumed there — it is never parked globally, so it can not leak onto another segment's continuation.
- * - Deltas that carry no segment identity (`null`) never register and are never separated: anonymous token deltas
- *   have no knowable boundary, and guessing one would split a part. They also never consume another segment's
- *   boundary, because no boundary is deferred.
+ *   skipped, because a lone newline does not separate Markdown paragraphs — the very bug being fixed).
+ * - The separator goes BEFORE the segment's leading whitespace, never after it. Whitespace is semantic in Markdown
+ *   (`"\n    code"` is an indented code block; `"\n\n    code"` too, but `"\n    \ncode"` is plain text), and the sink
+ *   is append-only, so a separator can not be repaired in after indentation was already emitted. Hence the HOLD below.
+ * - Never at the very start of output: nothing non-whitespace has been appended yet. Until then whitespace passes
+ *   straight through, because no boundary is possible.
+ * - A segment is REGISTERED, and its boundary decided, only on its first non-whitespace delta.
+ * - HOLD: while the output has visible content and a segment is not yet registered, that segment's whitespace-only
+ *   deltas are held per segment instead of emitted. On the segment's first visible delta ONE string is emitted:
+ *   `separator + held + text`, where the separator is computed over `held + text` (its leading newlines). The result
+ *   is byte-identical however the segment's leading whitespace is chunked, and the indentation stays attached to
+ *   the text it indents. A segment that becomes visible later is still judged against what precedes it at that
+ *   moment (not at the moment it was first mentioned).
+ * - Held text belongs to its segment alone: another segment's continuation (or an anonymous delta) neither emits nor
+ *   consumes it. `flush` releases whatever is still held, as-is and with no separator (a segment that never became
+ *   visible has no boundary to open). The caller must flush at the end of the stream so no text is lost.
+ * - Never inside a segment: a registered (already visible) segment never opens a boundary, and its whitespace passes
+ *   straight through, so interleaved deltas of concurrently streaming parts are not split mid-part. A boundary is
+ *   decided per segment at registration and consumed there — it is never parked globally.
+ * - Deltas that carry no segment identity (`null`) never register, are never held and never separated: anonymous
+ *   token deltas have no knowable boundary, and guessing one would split a part.
  * - Tool summaries (which carry their own newlines) are fed through `noteAppended`, so the trailing-newline count
  *   accounts for them and text after a summary is topped up rather than double-separated.
  *
- * The tracker only decides the separator string. It owns no part text: the reply-delivery fence records each part's
- * own text, never the separator.
+ * The tracker returns the exact string to append; it owns no delivery evidence. The reply-delivery fence records
+ * each part's own text (never the separator) as the delta is accepted — see `run-core.ts` for why that is safe with
+ * hold-and-flush.
  */
 
 export interface TextBoundaryTracker {
   /**
-   * The separator to append BEFORE `text`, given the segment it belongs to. Returns `''` when none is due. The
-   * caller must then append the separator (if any) and `text`, and report both through `noteAppended`.
+   * Accept a text delta of `segmentKey` and return the string to append to the sink NOW: possibly empty (a held
+   * lead-in or an empty delta), possibly `separator + held + text`. The tracker has already accounted for the
+   * returned string; the caller must append it verbatim and not report it again.
    */
-  readonly separatorBefore: (segmentKey: string | null, text: string) => string
-  /** Record anything appended to the sink, so the trailing-newline count and content flag stay accurate. */
+  readonly append: (segmentKey: string | null, text: string) => string
+  /** Release all held text, in the order its segments were first held. Returns `''` when nothing is held. */
+  readonly flush: () => string
+  /** Record text appended to the sink outside the tracker (tool summaries), so the newline count stays accurate. */
   readonly noteAppended: (text: string) => void
 }
 
@@ -66,26 +77,49 @@ function leadingNewlines(text: string): number {
 export function createTextBoundaryTracker(): TextBoundaryTracker {
   // Segments that have emitted visible text. Registration happens on the first non-whitespace delta only.
   const visibleSegments = new Set<string>()
+  // Whitespace-only lead-ins of segments that are not visible yet, per segment (Map keeps first-held order).
+  const held = new Map<string, string>()
   let hasContent = false
   let newlinesAtEnd = 0
 
+  function noteAppended(text: string): void {
+    const trailing = trailingNewlines(text)
+    if (trailing === null) {
+      newlinesAtEnd += text.split('\n').length - 1
+    } else {
+      hasContent = true
+      newlinesAtEnd = trailing
+    }
+  }
+
+  function commit(text: string): string {
+    noteAppended(text)
+    return text
+  }
+
   return {
-    separatorBefore: (segmentKey, text) => {
-      // Anonymous text and whitespace-only lead-ins never register a segment or open a boundary.
-      if (segmentKey === null || text.trim() === '' || visibleSegments.has(segmentKey)) return ''
-      visibleSegments.add(segmentKey)
-      // Only a segment that follows visible text needs a boundary; the first one never does.
-      if (!hasContent) return ''
-      return '\n'.repeat(Math.max(0, 2 - newlinesAtEnd - leadingNewlines(text)))
-    },
-    noteAppended: text => {
-      const trailing = trailingNewlines(text)
-      if (trailing === null) {
-        newlinesAtEnd += text.split('\n').length - 1
-      } else {
-        hasContent = true
-        newlinesAtEnd = trailing
+    append: (segmentKey, text) => {
+      if (segmentKey === null || visibleSegments.has(segmentKey) || text === '') return commit(text)
+      const lead = held.get(segmentKey) ?? ''
+      if (text.trim() === '') {
+        // No boundary is possible before any visible output, so there is nothing to hold for.
+        if (!hasContent) return commit(text)
+        held.set(segmentKey, lead + text)
+        return ''
       }
+      held.delete(segmentKey)
+      visibleSegments.add(segmentKey)
+      const segmentText = lead + text
+      // Only a segment that follows visible text needs a boundary; the first one never does.
+      if (!hasContent) return commit(segmentText)
+      const separator = '\n'.repeat(Math.max(0, 2 - newlinesAtEnd - leadingNewlines(segmentText)))
+      return commit(separator + segmentText)
     },
+    flush: () => {
+      const text = [...held.values()].join('')
+      held.clear()
+      return commit(text)
+    },
+    noteAppended,
   }
 }
