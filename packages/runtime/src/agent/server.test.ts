@@ -4,6 +4,7 @@ import net from 'node:net'
 import process from 'node:process'
 import {createOpencode} from '@opencode-ai/sdk'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import {NON_INTERACTIVE_OPENCODE_CLIENT} from '../shared/constants.js'
 import {bootstrapOpenCodeServer, ensureOpenCodeAvailable, isPortOpen, waitForServerQuiescence} from './server.js'
 
 vi.mock('@opencode-ai/sdk', () => ({
@@ -62,6 +63,21 @@ function createMockClient(
   }),
 ) {
   return {session: {list: vi.fn(sessionList)}}
+}
+
+async function captureSpawnEnv(logger: Logger) {
+  const captured: {client?: string; enableQuestionTool?: string} = {}
+  vi.mocked(createOpencode).mockImplementation(async options => {
+    captured.client = process.env.OPENCODE_CLIENT
+    captured.enableQuestionTool = process.env.OPENCODE_ENABLE_QUESTION_TOOL
+    const port = (options as {port?: number}).port
+    return {
+      client: createMockClient() as never,
+      server: {url: `http://127.0.0.1:${String(port)}`, close: vi.fn()},
+    }
+  })
+  const result = await bootstrapOpenCodeServer(new AbortController().signal, logger, WORKSPACE_PATH)
+  return {captured, result}
 }
 
 describe('bootstrapOpenCodeServer', () => {
@@ -339,6 +355,78 @@ describe('bootstrapOpenCodeServer', () => {
     // #then
     expect(result.success).toBe(true)
     expect(capturedBackgroundSubagentsFlag).toBe('true')
+  })
+
+  describe('question tool pin (#1756)', () => {
+    it('spawns with a non-interactive OPENCODE_CLIENT so upstream never registers the question tool', async () => {
+      // #given the unset default, which upstream treats as the interactive `cli` client
+      delete process.env.OPENCODE_CLIENT
+      delete process.env.OPENCODE_ENABLE_QUESTION_TOOL
+      const logger = createMockLogger()
+
+      // #when
+      const {captured, result} = await captureSpawnEnv(logger)
+
+      // #then the value is read inside createOpencode, i.e. after withScrubbedEnv filtered the env,
+      // so this also proves the pin survives the allowlist
+      expect(result.success).toBe(true)
+      expect(captured.client).toBe(NON_INTERACTIVE_OPENCODE_CLIENT)
+      expect(['app', 'cli', 'desktop']).not.toContain(captured.client)
+      expect(logger.warning).not.toHaveBeenCalled()
+    })
+
+    it.each(['cli', 'app', 'desktop'])(
+      'overrides an operator-set interactive OPENCODE_CLIENT=%s and warns',
+      async operatorClient => {
+        // #given
+        process.env.OPENCODE_CLIENT = operatorClient
+        const logger = createMockLogger()
+
+        // #when
+        const {captured, result} = await captureSpawnEnv(logger)
+
+        // #then
+        expect(result.success).toBe(true)
+        expect(captured.client).toBe(NON_INTERACTIVE_OPENCODE_CLIENT)
+        expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining('question tool is disabled'), {
+          overriddenClient: true,
+          overriddenEnableQuestionTool: false,
+        })
+      },
+    )
+
+    it('clears an operator-set OPENCODE_ENABLE_QUESTION_TOOL before spawn and warns', async () => {
+      // #given the enable flag registers the tool regardless of the client value
+      process.env.OPENCODE_ENABLE_QUESTION_TOOL = 'true'
+      const logger = createMockLogger()
+
+      // #when
+      const {captured, result} = await captureSpawnEnv(logger)
+
+      // #then
+      expect(result.success).toBe(true)
+      expect(captured.enableQuestionTool).toBeUndefined()
+      expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining('question tool is disabled'), {
+        overriddenClient: false,
+        overriddenEnableQuestionTool: true,
+      })
+    })
+
+    it('treats empty-string values (an unset Actions `env:` input) as unset without warning', async () => {
+      // #given
+      process.env.OPENCODE_CLIENT = ''
+      process.env.OPENCODE_ENABLE_QUESTION_TOOL = ''
+      const logger = createMockLogger()
+
+      // #when
+      const {captured, result} = await captureSpawnEnv(logger)
+
+      // #then
+      expect(result.success).toBe(true)
+      expect(captured.client).toBe(NON_INTERACTIVE_OPENCODE_CLIENT)
+      expect(captured.enableQuestionTool).toBeUndefined()
+      expect(logger.warning).not.toHaveBeenCalled()
+    })
   })
 
   it('fails the bootstrap when the actual server URL differs from the pinned port', async () => {
