@@ -3,7 +3,7 @@ import type {TriggerContext} from '../../features/triggers/types.js'
 import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
 import * as core from '@actions/core'
-import {addLabelsToIssue, ensureLabelExists} from '../../services/github/api.js'
+import {addLabelsToIssue, ensureLabelExists, removeLabelFromIssueWithOutcome} from '../../services/github/api.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {escapeSummaryText as cell} from '../../shared/summary-escape.js'
 import {parseActionHolderRunId} from './acquire-lock.js'
@@ -23,6 +23,25 @@ export interface CoordinationDeclineOptions {
   /** Parsed `response-mode` input; `none` promises no label changes. */
   readonly responseMode: ResponseMode
   readonly logger: Logger
+  /** Delays before each retry of a failed re-add (one retry per entry). Overridable for tests. */
+  readonly restoreBackoffMs?: readonly number[]
+}
+
+/** Two retries after the first failed add, with a short growing pause for transient API errors. */
+const DEFAULT_RESTORE_BACKOFF_MS: readonly number[] = [250, 750]
+
+/**
+ * `applied`: the label is on the item. `failed`: it could not be applied, but nothing was lost (it was not there
+ * before either, or the remove itself failed so any existing label is still in place). `lost`: an existing label was
+ * removed for the re-stamp and every attempt to put it back failed, so the persistent blocked signal is gone.
+ */
+type BlockedLabelResult = 'applied' | 'failed' | 'lost'
+
+async function sleep(ms: number): Promise<void> {
+  if (ms <= 0) return
+  await new Promise<void>(resolve => {
+    setTimeout(resolve, ms)
+  })
 }
 
 /** Issue/PR number the blocked label applies to, or `null` for repository-level, discussion, and manual triggers. */
@@ -84,8 +103,9 @@ async function applyBlockedLabel(
   client: Octokit,
   context: TriggerContext,
   issueNumber: number,
+  backoffMs: readonly number[],
   logger: Logger,
-): Promise<boolean> {
+): Promise<BlockedLabelResult> {
   try {
     const repoString = `${context.repo.owner}/${context.repo.repo}`
     const exists = await ensureLabelExists(
@@ -96,11 +116,28 @@ async function applyBlockedLabel(
       BLOCKED_LABEL_DESCRIPTION,
       logger,
     )
-    if (exists === false) return false
-    return await addLabelsToIssue(client, repoString, issueNumber, [BLOCKED_LABEL], logger)
+    if (exists === false) return 'failed'
+    // Re-stamp: adding a label that is already present creates no new `labeled` event, so a later successful run
+    // could not tell this skip from an older one. Remove first (a 404 for an absent label is tolerated; any other
+    // remove failure is logged there and we still add so the label is visible).
+    const removal = await removeLabelFromIssueWithOutcome(client, repoString, issueNumber, BLOCKED_LABEL, logger)
+    if (await addLabelsToIssue(client, repoString, issueNumber, [BLOCKED_LABEL], logger)) return 'applied'
+    // Only an actual removal puts the persistent signal at risk; an absent or still-present label loses nothing.
+    if (removal !== 'removed') return 'failed'
+
+    for (const delayMs of backoffMs) {
+      await sleep(delayMs)
+      if (await addLabelsToIssue(client, repoString, issueNumber, [BLOCKED_LABEL], logger)) return 'applied'
+    }
+    logger.error('Blocked label could not be restored after the re-stamp removed it', {
+      issueNumber,
+      reason: 'restore-failed-after-remove',
+      attempts: backoffMs.length + 1,
+    })
+    return 'lost'
   } catch (error) {
     logger.warning('Failed to apply blocked label (non-fatal)', {error: toErrorMessage(error)})
-    return false
+    return 'failed'
   }
 }
 
@@ -109,6 +146,7 @@ async function writeCoordinationSkipSummary(
   holder: LockRecord | null,
   reason: string,
   labelStatus: string,
+  labelLostIssueNumber: number | null,
   logger: Logger,
 ): Promise<void> {
   try {
@@ -131,11 +169,17 @@ async function writeCoordinationSkipSummary(
         ],
         [`Label <code>${BLOCKED_LABEL}</code>`, labelStatus],
       ])
-      .addRaw(
-        '\nNo agent execution occurred. This request was not automatically requeued.\n\n' +
-          '**Recovery:** re-run this workflow, or mention the bot again after the other run finishes. ' +
-          'Editing the issue alone does not retrigger it. Remove the `agent: blocked` label manually after re-triggering.\n',
+    if (labelLostIssueNumber != null) {
+      core.summary.addRaw(
+        `\n**Action needed:** the \`${BLOCKED_LABEL}\` label could not be re-applied to #${cell(String(labelLostIssueNumber))}; add it manually.\n`,
       )
+    }
+    core.summary.addRaw(
+      '\nNo agent execution occurred. This request was not automatically requeued.\n\n' +
+        '**Recovery:** re-run this workflow, or mention the bot again after the other run finishes. ' +
+        'Editing the issue alone does not retrigger it. The `agent: blocked` label is removed automatically when a ' +
+        'later run for this item succeeds; remove it manually if needed.\n',
+    )
 
     await core.summary.write()
   } catch (error) {
@@ -146,7 +190,8 @@ async function writeCoordinationSkipSummary(
 /**
  * Makes a coordination-contended skip visible without breaking the Response Protocol (no comment, no reaction):
  * a job-summary section, a warning annotation, and — for routed issue/PR targets — the `agent: blocked` label,
- * which stays until an operator removes it. Every step is best-effort; this never throws.
+ * re-stamped (removed, then added) so every skip emits a fresh `labeled` event. A later successful run for the same
+ * item clears it (`coordination-clear.ts`). Every step is best-effort; this never throws.
  */
 export async function runCoordinationDecline(options: CoordinationDeclineOptions): Promise<void> {
   const {githubClient, triggerContext, holder, reason, responseMode, logger} = options
@@ -154,13 +199,21 @@ export async function runCoordinationDecline(options: CoordinationDeclineOptions
 
   const issueNumber = resolveLabelTarget(triggerContext)
   let labelStatus = 'not applicable (no issue or pull request target)'
+  let labelLostIssueNumber: number | null = null
   if (issueNumber != null && responseMode === 'none') {
     labelStatus = 'not applied (response-mode is none)'
   } else if (issueNumber != null) {
-    const applied = await applyBlockedLabel(githubClient, triggerContext, issueNumber, logger)
-    labelStatus = applied ? 'applied' : 'not applied (labeling failed)'
+    const result = await applyBlockedLabel(
+      githubClient,
+      triggerContext,
+      issueNumber,
+      options.restoreBackoffMs ?? DEFAULT_RESTORE_BACKOFF_MS,
+      logger,
+    )
+    labelStatus = result === 'applied' ? 'applied' : 'not applied (labeling failed)'
+    if (result === 'lost') labelLostIssueNumber = issueNumber
   }
 
-  await writeCoordinationSkipSummary(triggerContext, holder, reasonText, labelStatus, logger)
+  await writeCoordinationSkipSummary(triggerContext, holder, reasonText, labelStatus, labelLostIssueNumber, logger)
   core.warning(`Fro Bot skipped this run: ${reasonText} No agent execution occurred; re-run the workflow to retry.`)
 }
