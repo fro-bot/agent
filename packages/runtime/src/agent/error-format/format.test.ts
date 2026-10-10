@@ -2,6 +2,7 @@ import type {ContextOverflowErrorInput, ProviderAuthErrorInput} from './types.js
 import {describe, expect, expectTypeOf, it} from 'vitest'
 import {
   classifyContextOverflowError,
+  classifyModelNotFoundError,
   classifyProviderAuthError,
   classifyQuotaError,
   createAgentError,
@@ -568,6 +569,124 @@ describe('agent/error-format/format', () => {
       // #then each remains in its original category
       expect(authError?.type).toBe('provider_auth_error')
       expect(quotaError?.type).toBe('quota_exceeded')
+    })
+  })
+
+  describe('model not found errors', () => {
+    // Real upstream shape: opencode v1.18.34 `SessionPrompt.getModel` (session/prompt.ts:594-611) publishes
+    // `session.error` with `NamedError.Unknown({message: `Model not found: ${provider}/${model}.${hint}`}).toObject()`,
+    // i.e. `{name: 'UnknownError', data: {message}}`; `ModelNotFoundError.message` (provider/provider.ts:1192-1200)
+    // uses the identical text.
+    const UPSTREAM_MESSAGE =
+      'Model not found: anthropic/claude-sonnet-5-5. Did you mean: claude-sonnet-4-5, claude-sonnet-4, claude-opus-4-1?'
+
+    it('classifies the upstream UnknownError message as its own model_not_found kind with the model and suggestions', () => {
+      // #given the message OpenCode publishes in the session.error payload
+      // #when classifying it
+      const error = classifyModelNotFoundError({kind: 'session-error', message: UPSTREAM_MESSAGE})
+
+      // #then it is a non-retryable model_not_found carrying the requested id and every suggestion
+      expect(error?.type).toBe('model_not_found')
+      expect(error?.retryable).toBe(false)
+      expect(error?.message).toBe(
+        'Model not found: anthropic/claude-sonnet-5-5. Did you mean: claude-sonnet-4-5, claude-sonnet-4, claude-opus-4-1?',
+      )
+    })
+
+    it('gives an actionable hint naming the wrong-id and unreachable-catalog causes', () => {
+      // #given a classified model-not-found failure
+      const error = classifyModelNotFoundError({kind: 'session-error', message: UPSTREAM_MESSAGE})
+
+      // #then the suggested action names both plausible causes and the catalog host
+      expect(error?.suggestedAction).toContain('model id')
+      expect(error?.suggestedAction).toContain('models.opencode.ai')
+    })
+
+    it('classifies the promptAsync Cause.pretty variant with an error-class prefix and trailing stack lines', () => {
+      // #given the second session.error OpenCode publishes (handlers/session.ts:319-322), whose message is
+      // Cause.pretty(cause) of the Die(ProviderModelNotFoundError) — class prefix plus stack frames
+      const message = [
+        'ProviderModelNotFoundError: Model not found: anthropic/claude-sonnet-5-5.',
+        '    at <anonymous> (/$bunfs/root/src/cli/cmd/serve.js:1:1)',
+        '    at secret-token-sentinel',
+      ].join('\n')
+
+      // #when classifying it
+      const error = classifyModelNotFoundError({kind: 'session-error', message})
+
+      // #then the model is recovered, no suggestions are invented, and stack text is not echoed
+      expect(error?.type).toBe('model_not_found')
+      expect(error?.message).toBe('Model not found: anthropic/claude-sonnet-5-5.')
+      expect(JSON.stringify(error)).not.toContain('secret-token-sentinel')
+      expect(JSON.stringify(error)).not.toContain('bunfs')
+    })
+
+    it('keeps dots inside the model id and returns null without a recognizable provider/model id', () => {
+      // #given a model id containing dots, and messages that do not carry the upstream shape
+      const dotted = classifyModelNotFoundError({
+        kind: 'session-error',
+        message: 'Model not found: openai/gpt-4.1. Did you mean: gpt-4.1-mini?',
+      })
+
+      // #then the dotted id survives intact
+      expect(dotted?.message).toBe('Model not found: openai/gpt-4.1. Did you mean: gpt-4.1-mini?')
+
+      // #then unrelated or malformed messages are not classified
+      expect(classifyModelNotFoundError({kind: 'session-error', message: 'fetch failed'})).toBeNull()
+      expect(classifyModelNotFoundError({kind: 'session-error', message: 'Model not found: nothing'})).toBeNull()
+      expect(classifyModelNotFoundError({kind: 'session-error'})).toBeNull()
+    })
+
+    it('drops suggestions that are not plain model ids and caps their count', () => {
+      // #given suggestions mixing valid ids, free text, and more entries than the cap
+      const message =
+        'Model not found: anthropic/x. Did you mean: a-1, b-2, c-3, d-4, e-5, f-6, Authorization: Bearer sk-live-123?'
+
+      // #when classifying it
+      const error = classifyModelNotFoundError({kind: 'session-error', message})
+
+      // #then only the first five well-formed ids are kept and no free text leaks
+      expect(error?.message).toBe('Model not found: anthropic/x. Did you mean: a-1, b-2, c-3, d-4, e-5?')
+      expect(JSON.stringify(error)).not.toContain('sk-live-123')
+    })
+
+    it('drops a malformed suggestion that falls within the cap', () => {
+      // #given fewer than five suggestions, one of them free text
+      const message = 'Model not found: anthropic/x. Did you mean: a-1, Authorization: Bearer sk-live-123, b-2?'
+
+      // #when classifying it
+      const error = classifyModelNotFoundError({kind: 'session-error', message})
+
+      // #then the free text is filtered out, not just truncated away
+      expect(error?.message).toBe('Model not found: anthropic/x. Did you mean: a-1, b-2?')
+      expect(JSON.stringify(error)).not.toContain('sk-live-123')
+    })
+
+    it('keeps a 128-character suggestion and drops a 129-character one', () => {
+      // #given suggestions at and just over the length limit
+      const atLimit = 'm'.repeat(128)
+      const overLimit = 'n'.repeat(129)
+      const message = `Model not found: anthropic/x. Did you mean: ${atLimit}, ${overLimit}?`
+
+      // #when classifying it
+      const error = classifyModelNotFoundError({kind: 'session-error', message})
+
+      // #then only the suggestion within the limit survives
+      expect(error?.message).toBe(`Model not found: anthropic/x. Did you mean: ${atLimit}?`)
+    })
+
+    it('renders the Model Not Found label, cause, and hint in the comment body', () => {
+      // #given a classified model-not-found failure
+      const error = classifyModelNotFoundError({kind: 'session-error', message: UPSTREAM_MESSAGE})
+
+      // #when formatting it for a comment
+      const body = formatErrorComment(error ?? createAgentError('unreachable'))
+
+      // #then the reader sees the real cause and what to do about it
+      expect(body).toContain('**Model Not Found**')
+      expect(body).toContain('anthropic/claude-sonnet-5-5')
+      expect(body).toContain('claude-sonnet-4-5')
+      expect(body).toContain('**Suggested action:**')
     })
   })
 

@@ -1,4 +1,5 @@
 import type {Result} from '@bfra.me/es/result'
+import type {Config} from '@opencode-ai/sdk'
 import type {SessionClient} from '../session/index.js'
 import type {Logger} from '../shared/logger.js'
 import type {SetupAdapter, SetupInputs} from './setup-adapter.js'
@@ -11,6 +12,7 @@ import {
   DEFAULT_SERVER_READINESS_TIMEOUT_MS,
   DEFAULT_SHUTDOWN_QUIESCE_POLL_INTERVAL_MS,
   DEFAULT_SHUTDOWN_QUIESCE_TIMEOUT_MS,
+  NON_INTERACTIVE_OPENCODE_CLIENT,
 } from '../shared/constants.js'
 import {toErrorMessage} from '../shared/errors.js'
 import {err, ok} from '../shared/types.js'
@@ -242,12 +244,65 @@ async function attemptReadinessProbe(
   }
 }
 
+/**
+ * Keep upstream's interactive `question` tool out of the registry for this server.
+ *
+ * Nobody can answer a question in CI, and a pending question has no server-side timeout, so a
+ * model that calls the tool holds the run until its deadline (#1756). Upstream registers the
+ * tool iff `flags.client` is `app`/`cli`/`desktop` OR `OPENCODE_ENABLE_QUESTION_TOOL` is set
+ * (`tool/registry.ts:207`; `client` defaults to `cli`, `effect/runtime-flags.ts:56`), so this
+ * pins the client to a non-interactive value and clears the enable flag. The tool is then absent
+ * from the registry rather than merely denied, which is what makes this airtight: a top-level
+ * config `permission.question: 'deny'` is merged into each agent BEFORE that agent's own
+ * `permission` block (`agent/agent.ts:138-150`, `:293`, last matching rule wins), so an agent
+ * that ships `permission.question: 'allow'` -- oMo's Sisyphus and Prometheus do -- silently
+ * re-enables it. A config-level deny cannot guarantee absence; a missing registry entry can.
+ *
+ * Unlike the watcher/background-subagent defaults above, an operator value does NOT win: this
+ * is a correctness pin, not a stylistic default. An operator-supplied different value is
+ * recorded by a warning. Both vars survive `filterAgentEnv` (`OPENCODE_` is an allowlisted
+ * prefix) and, like the other flags set here, are deliberately left in place after spawn.
+ *
+ * The only other upstream readers of the client value are telemetry-shaped: the models.dev
+ * user agent (`core/src/models-dev.ts:23`), the OTLP `opencode.client` attribute
+ * (`core/src/observability/otlp.ts:43`), the `x-opencode-client` header sent only to
+ * `opencode*` providers (`session/llm/request.ts:195`), and the `plan` tool, which needs
+ * `experimentalPlanMode && client === 'cli'` (`tool/registry.ts:248`) and is off here anyway.
+ */
+function pinQuestionToolOff(logger: Logger): void {
+  const operatorClient = process.env.OPENCODE_CLIENT
+  const operatorEnable = process.env.OPENCODE_ENABLE_QUESTION_TOOL
+  const overridesClient =
+    operatorClient !== undefined && operatorClient !== '' && operatorClient !== NON_INTERACTIVE_OPENCODE_CLIENT
+  const overridesEnable = operatorEnable !== undefined && operatorEnable !== ''
+  process.env.OPENCODE_CLIENT = NON_INTERACTIVE_OPENCODE_CLIENT
+  delete process.env.OPENCODE_ENABLE_QUESTION_TOOL
+  if (overridesClient || overridesEnable) {
+    logger.warning(
+      'OPENCODE_CLIENT / OPENCODE_ENABLE_QUESTION_TOOL overridden: the OpenCode question tool is disabled for CI runs because nobody can answer it',
+      {overriddenClient: overridesClient, overriddenEnableQuestionTool: overridesEnable},
+    )
+  }
+}
+
+export interface BootstrapOpenCodeServerOptions {
+  /**
+   * OpenCode config handed to the SDK, which spawns the server with `OPENCODE_CONFIG_CONTENT` set to it.
+   * Upstream loads that env var as its own config layer AFTER the global file, `OPENCODE_CONFIG`, project
+   * config and `.opencode` dirs (`config/config.ts:482-490`), and plugin lists from separate layers
+   * concatenate (`:365-367`, `:344-363`), so a plugin passed here cannot be dropped by any of the earlier
+   * layers. Omit it and the SDK sends `{}`, exactly as before this option existed.
+   */
+  readonly config?: Config
+}
+
 export async function bootstrapOpenCodeServer(
   signal: AbortSignal,
   logger: Logger,
   workspacePath: string,
   timeoutMs: number = DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS,
   readinessTimeoutMs: number = DEFAULT_SERVER_READINESS_TIMEOUT_MS,
+  options: BootstrapOpenCodeServerOptions = {},
 ): Promise<Result<OpenCodeServerHandle, Error>> {
   const startedAt = Date.now()
   // Time spent inside createOpencode specifically — the only window timeoutMs governs.
@@ -311,7 +366,15 @@ export async function bootstrapOpenCodeServer(
     ) {
       process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS = 'true'
     }
-    const spawnOptions = {signal, hostname: '127.0.0.1', port, timeout: timeoutMs}
+    pinQuestionToolOff(logger)
+    // `config` is spread in only when given, so the default call hands the SDK exactly the options it always did.
+    const spawnOptions = {
+      signal,
+      hostname: '127.0.0.1',
+      port,
+      timeout: timeoutMs,
+      ...(options.config === undefined ? {} : {config: options.config}),
+    }
     // Measured separately from the total: timeoutMs bounds this call alone, so comparing
     // it against time that also covers port acquisition would misreport the real margin.
     // Keeping both also separates a slow port bind from slow server init, which are

@@ -515,8 +515,19 @@ export async function runFinalizeWithResult(
     return finish(0, posted ? 'comment' : 'none')
   } else {
     logger.warning('Cannot post error comment: missing target context')
+    logger.error('Agent execution failed with no delivery surface to report it', {
+      type: execution.llmError.type,
+      error: execution.llmError.message,
+      suggestedAction: execution.llmError.suggestedAction,
+    })
+    const failure =
+      'Agent execution failed with a recoverable LLM error, and no delivery surface was available to report it.'
+    // Only `model_not_found` is built from allowlisted fields (see `classifyModelNotFoundError`), so only its
+    // cause is safe to echo into the failure annotation; other types may carry provider-derived text.
     core.setFailed(
-      'Agent execution failed with a recoverable LLM error, and no delivery surface was available to report it.',
+      execution.llmError.type === 'model_not_found'
+        ? `${failure} Cause: ${execution.llmError.message} ${execution.llmError.suggestedAction ?? ''}`.trim()
+        : failure,
     )
     return finish(execution.exitCode === 0 ? 1 : execution.exitCode)
   }

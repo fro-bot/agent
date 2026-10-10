@@ -645,6 +645,31 @@ describe('setup', () => {
         expect(typeof configDirArg).toBe('string')
       })
 
+      it('warns that OPENCODE_PURE is withheld from the server when the runner sets it', async () => {
+        // #given an operator environment with OPENCODE_PURE
+        process.env.OPENCODE_PURE = 'true'
+
+        // #when
+        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
+
+        // #then setup still succeeds (the variable is denied by filterAgentEnv, not by failing the run) but says so
+        expect(result).not.toBeNull()
+        expect(core.setFailed).not.toHaveBeenCalled()
+        expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('OPENCODE_PURE is set'))
+      })
+
+      it.each(['', '0', 'false'])('does not warn about OPENCODE_PURE when it is %j', async value => {
+        // #given GitHub Actions materializing an unset `env:` input as '' (or an explicit off value)
+        process.env.OPENCODE_PURE = value
+
+        // #when
+        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
+
+        // #then
+        expect(result).not.toBeNull()
+        expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('OPENCODE_PURE is set'))
+      })
+
       it('writes fresh config without merging existing opencode.json', async () => {
         // #given - simulate existing opencode.json with stale oMo data
         vi.mocked(fs.readFile).mockResolvedValue(

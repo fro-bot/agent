@@ -68,6 +68,10 @@ vi.mock('./phases/coordination-decline.js', () => ({
   runCoordinationDecline: vi.fn().mockResolvedValue(undefined),
 }))
 
+vi.mock('./phases/coordination-clear.js', () => ({
+  runBlockedLabelClear: vi.fn().mockResolvedValue(undefined),
+}))
+
 vi.mock('./phases/dedup.js', () => ({
   runDedup: vi.fn(),
   saveDedupMarker: vi.fn(),
@@ -1014,6 +1018,51 @@ describe('invocation outcome cross-product (src/harness/outcome.ts)', () => {
       expect.anything(),
     )
     expect(vi.mocked(setInvocationOutcomeOutput)).toHaveBeenCalledWith('succeeded')
+  })
+
+  it('hands the final outcome and response mode to the blocked-label clear after a succeeded run', async () => {
+    // #given a clean successful run
+    const {runBlockedLabelClear} = await import('./phases/coordination-clear.js')
+    await mockHappyPathThrough({})
+
+    // #when the run finishes
+    expect(await run()).toBe(0)
+
+    // #then the clear step receives the final 'succeeded' outcome and the parsed response mode
+    expect(vi.mocked(runBlockedLabelClear)).toHaveBeenCalledWith(
+      expect.objectContaining({outcome: 'succeeded', responseMode: 'github'}),
+    )
+  })
+
+  it('hands a non-succeeded outcome to the blocked-label clear so it can no-op (incomplete run)', async () => {
+    // #given an incomplete run (observation gap)
+    const {runBlockedLabelClear} = await import('./phases/coordination-clear.js')
+    await mockHappyPathThrough({observationGap: true})
+
+    // #when the run finishes
+    await run()
+
+    // #then the outcome passed is not 'succeeded'
+    expect(vi.mocked(runBlockedLabelClear)).toHaveBeenCalledWith(expect.objectContaining({outcome: 'incomplete'}))
+  })
+
+  it('hands a skipped outcome to the blocked-label clear when this run was lock-declined', async () => {
+    // #given the lock is held by another run
+    const {runBootstrap} = await import('./phases/bootstrap.js')
+    const {runRouting} = await import('./phases/routing.js')
+    const {runDedup} = await import('./phases/dedup.js')
+    const {runAcquireLock} = await import('./phases/acquire-lock.js')
+    const {runBlockedLabelClear} = await import('./phases/coordination-clear.js')
+    vi.mocked(runBootstrap).mockResolvedValue(createBootstrap())
+    vi.mocked(runRouting).mockResolvedValue(createRouting())
+    vi.mocked(runDedup).mockResolvedValue({shouldProceed: true, entity: null})
+    vi.mocked(runAcquireLock).mockResolvedValue({outcome: 'held-by-other', holder: null, reason: 'conflict'})
+
+    // #when the run is declined
+    expect(await run()).toBe(0)
+
+    // #then the clear step is told the run was skipped (so it must not clear)
+    expect(vi.mocked(runBlockedLabelClear)).toHaveBeenCalledWith(expect.objectContaining({outcome: 'skipped'}))
   })
 
   it('genuine failure + uncertainty -> failure preserved, incompleteness retained (still reports incomplete, not failed)', async () => {
