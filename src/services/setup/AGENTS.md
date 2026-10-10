@@ -11,6 +11,7 @@ Environment bootstrap logic: Bun runtime, OpenCode CLI, and oMo plugin installat
 | **Setup**      | `setup.ts`             | Orchestration entry point (runSetup) (209 L)            |
 | **CI Config**  | `ci-config.ts`         | CI config assembly + Systematic plugin injection (43 L) |
 | **Systematic** | `systematic-config.ts` | Systematic config writer (deep-merge) (36 L)            |
+| **Reuse guard**| `no-task-reuse-config.ts` | Writes the task-reuse guard plugin; builds its `file://` spec |
 | **Adapters**   | `adapters.ts`          | Exec/tool-cache adapter factories (20 L)                |
 | **OpenCode**   | `opencode.ts`          | CLI resolution & installation (169 L)                   |
 | **Bun**        | `bun.ts`               | Bun runtime setup (required for oMo) (170 L)            |
@@ -44,11 +45,13 @@ Environment bootstrap logic: Bun runtime, OpenCode CLI, and oMo plugin installat
 - **Dynamic Version**: Resolves 'latest' via GitHub Releases API.
 - **Verification**: Validates binaries (`--version`) BEFORE caching.
 - **Systematic Bundling**: `buildCIConfig()` ensures `@fro.bot/systematic@<version>` exists in OpenCode CI plugins.
+- **Task-reuse guard (fail-closed)**: `runSetup` copies `dist/no-task-reuse.js` (built from `deploy/plugins/no-task-reuse.mjs`, the same file the gateway image bakes) to `<configDir>/fro-bot/no-task-reuse.mjs`; `buildCIConfig()` appends its `file://` URL as the last `plugin` entry in every mode via `ensureTaskReuseGuard`. It rejects any `task` call with a truthy `task_id`, so a background dispatch can never reuse a settled child session (#1757). Not operator-overridable (re-appended after any `plugin` array, tuple/option forms normalized, non-array values discarded, each with a warning). If the asset cannot be copied, setup fails — OpenCode only logs a plugin that fails to load, so a soft failure would silently disable the guard. Keep the file out of `<configDir>/plugin(s)/` (OpenCode auto-scans those). Boundary on model behavior, not a sandbox: the agent runs as the runner user.
 - `parseOmoProviders` moved to `src/harness/config/omo-providers.ts`.
 
 ## SECURITY
 
 - **Permissions**: `auth.json` written with `0o600` (owner-only).
+- **Plugin switches**: `OPENCODE_PURE` makes OpenCode skip every external plugin (the reuse guard and Systematic). `filterAgentEnv` denies it for the server child and setup warns when it is set; keep it in the deny-set.
 - **Ephemeral**: Credentials never cached; fresh from secrets each run.
 - **Identity**: Git user forced to `${bot}[bot]` for audit trails.
 - **Isolation**: Binaries cached by version/arch to prevent pollution.

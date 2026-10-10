@@ -2,6 +2,10 @@ import type {Logger} from './types.js'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {buildCIConfig, pluginPrefix} from './ci-config.js'
+import {defaultOpenCodeConfigDir, noTaskReusePluginSpec} from './no-task-reuse-config.js'
+
+// The task-reuse guard `buildCIConfig` appends last in every mode (see the 'task-reuse guard' suite below).
+const GUARD = noTaskReusePluginSpec(defaultOpenCodeConfigDir())
 
 function createLogger(): Logger {
   return createMockLogger()
@@ -49,7 +53,11 @@ describe('buildCIConfig', () => {
 
       // #then
       expect(result.error).toBeNull()
-      expect(result.config).toEqual({autoupdate: false, plugin: ['@fro.bot/systematic@2.1.0'], subagent_depth: 1})
+      expect(result.config).toEqual({
+        autoupdate: false,
+        plugin: ['@fro.bot/systematic@2.1.0', GUARD],
+        subagent_depth: 1,
+      })
     })
 
     it('merges user config keys and appends systematic plugin', () => {
@@ -67,7 +75,7 @@ describe('buildCIConfig', () => {
       expect(result.config).toEqual({
         autoupdate: true,
         model: 'claude-opus-4-5',
-        plugin: ['@fro.bot/systematic@2.1.0'],
+        plugin: ['@fro.bot/systematic@2.1.0', GUARD],
         subagent_depth: 1,
       })
     })
@@ -86,7 +94,7 @@ describe('buildCIConfig', () => {
       expect(result.error).toBeNull()
       expect(result.config).toEqual({
         autoupdate: false,
-        plugin: ['custom-plugin@1.0.0', '@fro.bot/systematic@2.1.0'],
+        plugin: ['custom-plugin@1.0.0', '@fro.bot/systematic@2.1.0', GUARD],
         subagent_depth: 1,
       })
     })
@@ -109,7 +117,7 @@ describe('buildCIConfig', () => {
       expect(result.error).toBeNull()
       expect(result.config).toEqual({
         autoupdate: false,
-        plugin: ['custom-plugin@1.0.0', '@fro.bot/systematic@9.9.9'],
+        plugin: ['custom-plugin@1.0.0', '@fro.bot/systematic@9.9.9', GUARD],
         subagent_depth: 1,
       })
     })
@@ -161,7 +169,7 @@ describe('buildCIConfig', () => {
       expect(result.error).toBeNull()
       expect(result.config).toEqual({
         autoupdate: false,
-        plugin: ['@fro.bot/systematic@2.1.0'],
+        plugin: ['@fro.bot/systematic@2.1.0', GUARD],
         default_agent: 'build',
         subagent_depth: 1,
         agent: {
@@ -228,7 +236,7 @@ describe('buildCIConfig', () => {
 
       // #then
       expect(result.error).toBeNull()
-      expect(result.config.plugin).toEqual(['custom-plugin@1.0.0', '@fro.bot/systematic@2.1.0'])
+      expect(result.config.plugin).toEqual(['custom-plugin@1.0.0', '@fro.bot/systematic@2.1.0', GUARD])
       expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining('plugin'))
     })
 
@@ -248,7 +256,7 @@ describe('buildCIConfig', () => {
 
       // #then
       expect(result.error).toBeNull()
-      expect(result.config.plugin).toEqual(['custom-plugin@1.0.0', '@fro.bot/systematic@2.1.0'])
+      expect(result.config.plugin).toEqual(['custom-plugin@1.0.0', '@fro.bot/systematic@2.1.0', GUARD])
       expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining('plugin'))
     })
 
@@ -268,7 +276,7 @@ describe('buildCIConfig', () => {
 
       // #then
       expect(result.error).toBeNull()
-      expect(result.config.plugin).toEqual(['custom-plugin@1.0.0', '@fro.bot/systematic@2.1.0'])
+      expect(result.config.plugin).toEqual(['custom-plugin@1.0.0', '@fro.bot/systematic@2.1.0', GUARD])
       expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining('plugin'))
     })
 
@@ -310,7 +318,7 @@ describe('buildCIConfig', () => {
 
       // #then - only oMo removed
       expect(result.error).toBeNull()
-      expect(result.config.plugin).toEqual(['plugin-a@1.0.0', 'plugin-b@2.0.0', '@fro.bot/systematic@2.1.0'])
+      expect(result.config.plugin).toEqual(['plugin-a@1.0.0', 'plugin-b@2.0.0', '@fro.bot/systematic@2.1.0', GUARD])
       expect(result.config.default_agent).toBe('build')
     })
 
@@ -912,6 +920,125 @@ describe('buildCIConfig', () => {
       expect(disabled.config).not.toHaveProperty('permission')
       expect(omo.config).not.toHaveProperty('permission')
       expect(omoSlim.config).not.toHaveProperty('permission')
+    })
+  })
+
+  describe('task-reuse guard plugin (#1757)', () => {
+    const modes = [
+      {name: 'oMo enabled', enableOmo: true, enableOmoSlim: false},
+      {name: 'oMo disabled', enableOmo: false, enableOmoSlim: false},
+      {name: 'OMO Slim', enableOmo: false, enableOmoSlim: true},
+    ] as const
+
+    function build(opencodeConfig: string | null, mode: (typeof modes)[number], configDir?: string) {
+      const logger = createLogger()
+      const result = buildCIConfig(
+        {
+          opencodeConfig,
+          systematicVersion: '2.1.0',
+          enableOmo: mode.enableOmo,
+          enableOmoSlim: mode.enableOmoSlim,
+          omoSlimVersion: '1.1.1',
+          configDir,
+        },
+        logger,
+      )
+      return {result, logger}
+    }
+
+    it.each(modes)('registers the guard as the last plugin with no operator config ($name)', mode => {
+      // #given no operator config
+      // #when the CI config is built
+      const {result} = build(null, mode)
+
+      // #then the guard is present exactly once and last, so it sees arguments after every other plugin
+      expect(result.error).toBeNull()
+      const plugins = result.config.plugin as string[]
+      expect(plugins.filter(p => p === GUARD)).toHaveLength(1)
+      expect(plugins.at(-1)).toBe(GUARD)
+    })
+
+    it.each(modes)('keeps the guard when the operator supplies an empty plugin array ($name)', mode => {
+      // #given an operator config that tries to clear the plugin list
+      // #when the CI config is built
+      const {result} = build('{"plugin":[]}', mode)
+
+      // #then the guard (and the Systematic plugin) are still enforced
+      expect(result.config.plugin).toContain(GUARD)
+      expect(result.config.plugin).toContain('@fro.bot/systematic@2.1.0')
+    })
+
+    it.each(modes)('keeps the guard alongside other operator plugins ($name)', mode => {
+      // #given an operator config with its own plugins
+      // #when the CI config is built
+      const {result} = build('{"plugin":["custom-plugin@1.0.0",["tuple-plugin",{"opt":1}]]}', mode)
+
+      // #then operator plugins survive and the guard is added after them
+      const plugins = result.config.plugin as unknown[]
+      expect(plugins).toContain('custom-plugin@1.0.0')
+      expect(plugins).toContainEqual(['tuple-plugin', {opt: 1}])
+      expect(plugins.at(-1)).toBe(GUARD)
+    })
+
+    it('does not warn when the operator config says nothing about the guard', () => {
+      // #given/#when
+      const {logger} = build('{"plugin":["custom-plugin@1.0.0"]}', modes[1])
+
+      // #then
+      expect(logger.warning).not.toHaveBeenCalledWith(expect.stringContaining('task-reuse guard'))
+    })
+
+    it('does not duplicate the guard when the operator already lists its exact spec, and does not warn', () => {
+      // #given an operator config that already names the guard (e.g. a restored opencode.json)
+      const {result, logger} = build(JSON.stringify({plugin: [GUARD, 'custom-plugin@1.0.0']}), modes[1])
+
+      // #then it appears once, moved last, with no warning
+      const plugins = result.config.plugin as string[]
+      expect(plugins.filter(p => p === GUARD)).toHaveLength(1)
+      expect(plugins.at(-1)).toBe(GUARD)
+      expect(logger.warning).not.toHaveBeenCalledWith(expect.stringContaining('task-reuse guard'))
+    })
+
+    it('normalizes an operator entry for the guard that carries options, and warns', () => {
+      // #given the guard listed in tuple form with operator-chosen options
+      const {result, logger} = build(JSON.stringify({plugin: [[GUARD, {disabled: true}]]}), modes[1])
+
+      // #then the options are discarded: one bare-string entry remains
+      const plugins = result.config.plugin as unknown[]
+      expect(plugins.filter(p => (Array.isArray(p) ? p[0] : p) === GUARD)).toEqual([GUARD])
+      expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining('task-reuse guard plugin'))
+    })
+
+    it('discards a non-array plugin value with a warning and still enforces the guard', () => {
+      // #given an operator config whose plugin value is not an array
+      const {result, logger} = build('{"plugin":"custom-plugin@1.0.0"}', modes[1])
+
+      // #then the malformed value is replaced by the enforced list and the operator is told
+      const plugins = result.config.plugin as string[]
+      expect(plugins).not.toContain('custom-plugin@1.0.0')
+      expect(plugins).toContain(GUARD)
+      expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining('plugin must be an array'), {
+        receivedType: 'string',
+      })
+    })
+
+    it('points the guard at the config dir setup wrote it into', () => {
+      // #given a non-default config dir
+      const {result} = build(null, modes[1], '/runner/home/.config/opencode')
+
+      // #then the spec is the absolute file:// URL of <configDir>/fro-bot/no-task-reuse.mjs
+      expect(result.config.plugin).toContain('file:///runner/home/.config/opencode/fro-bot/no-task-reuse.mjs')
+    })
+
+    it('defaults the guard location to ~/.config/opencode, outside the auto-scanned plugin directories', () => {
+      // #given/#when
+      const {result} = build(null, modes[1])
+
+      // #then it is a file:// URL under .config/opencode/fro-bot, not .config/opencode/plugin(s)
+      const guard = (result.config.plugin as string[]).at(-1) ?? ''
+      expect(guard.startsWith('file:///')).toBe(true)
+      expect(guard.endsWith('/.config/opencode/fro-bot/no-task-reuse.mjs')).toBe(true)
+      expect(guard).not.toMatch(/\/plugins?\//)
     })
   })
 

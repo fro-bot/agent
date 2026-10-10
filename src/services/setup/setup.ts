@@ -14,6 +14,7 @@ import {parseAuthJsonInput, populateAuthJson} from './auth-json.js'
 import {installBun} from './bun.js'
 import {buildCIConfig, isOmoSlimVersionVerified, pluginPrefix} from './ci-config.js'
 import {configureGhAuth, configureGitIdentity} from './gh-auth.js'
+import {defaultOpenCodeConfigDir, writeNoTaskReuseFile} from './no-task-reuse-config.js'
 import {installOmoSlim} from './omo-slim.js'
 import {installOmo} from './omo.js'
 import {FALLBACK_VERSION, getLatestVersion, installOpenCode, opencodeBinaryPath, toolCacheVersion} from './opencode.js'
@@ -21,6 +22,13 @@ import {writeSessionToolsFile} from './session-tools-config.js'
 import {writeSystematicConfig} from './systematic-config.js'
 import {installSystematicPlugin} from './systematic-plugin.js'
 import {restoreToolsCache, saveToolsCache} from './tools-cache.js'
+
+// OpenCode reads boolean env flags through Effect's Config.boolean (true/yes/on/1/y vs false/no/off/0/n) and
+// the older Flag helpers ("true"/"1"); anything non-empty that is not an explicit "off" word counts as set.
+function isTruthyFlag(value: string | undefined): boolean {
+  const normalized = value?.trim().toLowerCase() ?? ''
+  return normalized !== '' && !['0', 'false', 'no', 'off', 'n'].includes(normalized)
+}
 
 export async function runSetup(inputs: SetupInputs, githubToken: string): Promise<SetupResult | null> {
   const startTime = Date.now()
@@ -60,7 +68,7 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
     const runnerToolCache = process.env.RUNNER_TOOL_CACHE ?? '/opt/hostedtoolcache'
     const toolCachePath = join(runnerToolCache, 'opencode')
     const bunCachePath = join(runnerToolCache, 'bun')
-    const configDir = join(homedir(), '.config', 'opencode')
+    const configDir = defaultOpenCodeConfigDir()
     const opencodeCachePath = join(homedir(), '.cache', 'opencode')
     const runnerOS = getRunnerOS()
 
@@ -200,6 +208,19 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
     // never needs to be gated on enableOmo.
     await writeSessionToolsFile(configDir, logger)
 
+    // Task-reuse guard: unlike the session tools above this is fail-CLOSED. buildCIConfig registers it
+    // unconditionally, and OpenCode only logs a plugin it cannot load, so a missing file would silently
+    // reopen the settled-child reuse gap (#1757). A throw here is caught below and fails setup.
+    await writeNoTaskReuseFile(configDir, logger)
+
+    // OPENCODE_PURE skips every external plugin, the guard and Systematic included. filterAgentEnv denies
+    // it for the server child; say so rather than letting an operator think it took effect.
+    if (isTruthyFlag(process.env.OPENCODE_PURE)) {
+      logger.warning(
+        'OPENCODE_PURE is set in the runner environment; it is withheld from the OpenCode server so the task-reuse guard and Systematic plugins still load.',
+      )
+    }
+
     const ciConfigResult = buildCIConfig(
       {
         opencodeConfig: inputs.opencodeConfig,
@@ -209,6 +230,7 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
         omoSlimVersion: inputs.omoSlimVersion,
         omoSlimPreset: inputs.omoSlimPreset,
         integrationWorkDir: process.env.FRO_BOT_INTEGRATION_WORK_DIR,
+        configDir,
       },
       logger,
     )
@@ -256,8 +278,12 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
       const mergedPlugins = [...existingPlugins]
       for (const ciPlugin of ciPlugins) {
         if (typeof ciPlugin !== 'string') continue
+        // `file://` specs (the task-reuse guard) are identified by their exact URL: pluginPrefix would cut
+        // a path at any '@' and could match an unrelated entry.
         const prefix = pluginPrefix(ciPlugin)
-        const alreadyPresent = mergedPlugins.some(p => typeof p === 'string' && pluginPrefix(p) === prefix)
+        const alreadyPresent = ciPlugin.startsWith('file://')
+          ? mergedPlugins.includes(ciPlugin)
+          : mergedPlugins.some(p => typeof p === 'string' && pluginPrefix(p) === prefix)
         if (!alreadyPresent) {
           mergedPlugins.push(ciPlugin)
         }
