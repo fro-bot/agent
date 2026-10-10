@@ -9,16 +9,22 @@
  *
  * Rules:
  * - A boundary is a Markdown paragraph break: exactly one blank line (`\n\n`) between the visible text before and
- *   after. It tops up whatever newlines the output already ends with: none → `\n\n`, one → `\n`, two or more → nothing
- *   (a single trailing `\n` is completed to a blank line rather than skipped, because a lone newline does not
- *   separate Markdown paragraphs — the very bug being fixed).
+ *   after. It tops up whatever newlines the output already ends with PLUS the newlines the new text itself leads
+ *   with: none → `\n\n`, one → `\n`, two or more → nothing (a single newline is completed to a blank line rather than
+ *   skipped, because a lone newline does not separate Markdown paragraphs — the very bug being fixed). Counting the
+ *   delta's own leading newlines makes the result independent of how the segment's text was chunked: `"\nb"` in one
+ *   delta and `"\n"` then `"b"` both yield a single blank line.
  * - Never at the very start of output: nothing non-whitespace has been appended yet.
- * - Only between DIFFERENT segments, decided on the first non-whitespace text of the new segment, so a whitespace-only
- *   lead-in neither triggers a boundary nor gets doubled up with it.
- * - Never inside a segment: a segment already seen never opens a new boundary, so interleaved deltas of concurrently
- *   streaming parts are not split mid-part.
- * - Deltas that carry no segment identity (`null`) are never separated: anonymous token deltas have no knowable
- *   boundary, and guessing one would split a part.
+ * - A segment is REGISTERED, and its boundary decided, only on its first non-whitespace delta. Whitespace-only
+ *   deltas pass through to the sink as they arrive and neither register the segment nor open a boundary, so a
+ *   segment that starts empty or whitespace-only and becomes visible later is still judged against what precedes it
+ *   at that moment (not at the moment it was first mentioned).
+ * - Never inside a segment: a registered (already visible) segment never opens a boundary, so interleaved deltas of
+ *   concurrently streaming parts are not split mid-part. A boundary is decided per segment at registration and
+ *   consumed there — it is never parked globally, so it can not leak onto another segment's continuation.
+ * - Deltas that carry no segment identity (`null`) never register and are never separated: anonymous token deltas
+ *   have no knowable boundary, and guessing one would split a part. They also never consume another segment's
+ *   boundary, because no boundary is deferred.
  * - Tool summaries (which carry their own newlines) are fed through `noteAppended`, so the trailing-newline count
  *   accounts for them and text after a summary is topped up rather than double-separated.
  *
@@ -47,22 +53,30 @@ function trailingNewlines(text: string): number | null {
   return null
 }
 
+/** Newlines in the leading whitespace run of `text` (the text is known to hold a non-whitespace character). */
+function leadingNewlines(text: string): number {
+  let count = 0
+  for (const char of text) {
+    if (char === '\n') count += 1
+    else if (char.trim() !== '') break
+  }
+  return count
+}
+
 export function createTextBoundaryTracker(): TextBoundaryTracker {
-  const seenSegments = new Set<string>()
+  // Segments that have emitted visible text. Registration happens on the first non-whitespace delta only.
+  const visibleSegments = new Set<string>()
   let hasContent = false
   let newlinesAtEnd = 0
-  let boundaryPending = false
 
   return {
     separatorBefore: (segmentKey, text) => {
-      if (segmentKey !== null && !seenSegments.has(segmentKey)) {
-        seenSegments.add(segmentKey)
-        // Only a segment that follows visible text needs a boundary; the first one never does.
-        if (hasContent) boundaryPending = true
-      }
-      if (!boundaryPending || text.trim() === '') return ''
-      boundaryPending = false
-      return '\n'.repeat(Math.max(0, 2 - newlinesAtEnd))
+      // Anonymous text and whitespace-only lead-ins never register a segment or open a boundary.
+      if (segmentKey === null || text.trim() === '' || visibleSegments.has(segmentKey)) return ''
+      visibleSegments.add(segmentKey)
+      // Only a segment that follows visible text needs a boundary; the first one never does.
+      if (!hasContent) return ''
+      return '\n'.repeat(Math.max(0, 2 - newlinesAtEnd - leadingNewlines(text)))
     },
     noteAppended: text => {
       const trailing = trailingNewlines(text)

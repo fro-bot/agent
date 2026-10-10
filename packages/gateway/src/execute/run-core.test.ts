@@ -1733,6 +1733,72 @@ describe('runOpenCodeCore', () => {
       expect(sink.buffered()).toBe('a  ')
     })
 
+    it('a whitespace-only lead-in of a new part followed by a continuation of an existing part does not split it', async () => {
+      // #given part-b opens with whitespace, part-a resumes mid-word, then part-b becomes visible
+      const sink = await runSegmentEvents([
+        partDeltaWithPartId('hel', 'part-a'),
+        partDeltaWithPartId(' ', 'part-b'),
+        partDeltaWithPartId('lo', 'part-a'),
+        partDeltaWithPartId('new', 'part-b'),
+      ])
+
+      // #then part-a's continuation is intact and the boundary lands before part-b's visible text
+      expect(sink.buffered()).toBe('hel lo\n\nnew')
+    })
+
+    it('a whitespace-only lead-in of a new part followed by an anonymous delta does not hand it the boundary', async () => {
+      // #given
+      const sink = await runSegmentEvents([
+        partDeltaWithPartId('hel', 'part-a'),
+        partDeltaWithPartId(' ', 'part-b'),
+        nextTextDeltaStringEvent('lo'),
+      ])
+
+      // #then the anonymous delta is appended untouched
+      expect(sink.buffered()).toBe('hel lo')
+    })
+
+    it('a part that starts empty is separated when it becomes visible after another part', async () => {
+      // #given part-a is announced empty, part-b is the first visible text, then part-a becomes visible
+      const sink = await runSegmentEvents([
+        partDeltaWithPartId('', 'part-a'),
+        partDeltaWithPartId('two', 'part-b'),
+        partDeltaWithPartId('one', 'part-a'),
+      ])
+
+      // #then
+      expect(sink.buffered()).toBe('two\n\none')
+    })
+
+    it.each([
+      ['one newline, together', ['\nb']],
+      ['one newline, split', ['\n', 'b']],
+      ['two newlines, together', ['\n\nb']],
+      ['two newlines, split after both', ['\n\n', 'b']],
+      ['two newlines, split between them', ['\n', '\nb']],
+      ['two newlines, one per delta', ['\n', '\n', 'b']],
+      ['three newlines, together', ['\n\n\nb']],
+      ['three newlines, split', ['\n', '\n\n', 'b']],
+    ])('leading newlines are chunking-independent — %s', async (_label, chunks) => {
+      // #given the same part-2 text delivered in different chunkings after part-1's "a"
+      const sink = await runSegmentEvents([
+        partDeltaWithPartId('a', 'part-1'),
+        ...chunks.map(chunk => partDeltaWithPartId(chunk, 'part-2')),
+      ])
+
+      // #then the separation depends only on the part's text, never on the chunking
+      const lead = chunks.join('').length - 1
+      expect(sink.buffered()).toBe(`a${'\n'.repeat(Math.max(2, lead))}b`)
+      // and each chunk reached the sink unchanged (the separator is its own append)
+      const separator = '\n'.repeat(Math.max(0, 2 - lead))
+      expect(sink._appended).toEqual([
+        'a',
+        ...chunks.slice(0, -1),
+        ...(separator.length > 0 ? [separator] : []),
+        chunks.at(-1),
+      ])
+    })
+
     it('text part → tool summary → text part: one blank line after the summary, not two', async () => {
       // #given
       const sink = await runSegmentEvents([
