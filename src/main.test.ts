@@ -26,6 +26,16 @@ afterAll(() => {
   rmSync(mockBinDir, {recursive: true, force: true})
 })
 
+function isolatedHomeEnv(): Record<string, string> {
+  return {
+    HOME: path.join(testDataDir, 'home'),
+    XDG_CONFIG_HOME: path.join(testDataDir, 'xdg-config'),
+    XDG_DATA_HOME: testDataDir,
+    XDG_STATE_HOME: path.join(testDataDir, 'xdg-state'),
+    XDG_CACHE_HOME: path.join(testDataDir, 'xdg-cache'),
+  }
+}
+
 const projectRoot = path.resolve(fileURLToPath(new URL('.', import.meta.url)), '..')
 const distMainPath = path.join(projectRoot, 'dist', 'main.js')
 const MAIN_CHILD_TIMEOUT_MS = 10_000
@@ -40,8 +50,8 @@ function assertDistBundle(): void {
  * Uses spawn instead of exec to avoid shell escaping issues with
  * environment variable names containing hyphens.
  *
- * Sets XDG_DATA_HOME to an isolated temp directory to prevent tests
- * from accessing or modifying local development OpenCode data.
+ * The child runs the real bundled Action, which writes into the OpenCode config dir (the task-reuse guard) and data
+ * dir, so HOME and every XDG dir point inside testDataDir: it must never touch the developer's real home.
  */
 async function runNode(
   args: readonly string[],
@@ -53,7 +63,7 @@ async function runNode(
     const pathEnv = mockBinDir + path.delimiter + (process.env.PATH ?? '')
 
     const child = spawn(process.execPath, args, {
-      env: {...process.env, ...env, XDG_DATA_HOME: testDataDir, PATH: pathEnv},
+      env: {...process.env, ...env, ...isolatedHomeEnv(), PATH: pathEnv},
       cwd: projectRoot,
       shell: false,
     })
@@ -163,11 +173,12 @@ it('fails when server bootstrap fails', {timeout: 15000}, async () => {
     GITHUB_ACTOR: 'testuser',
     GITHUB_WORKSPACE: testDataDir,
     SKIP_CACHE: 'true',
-    XDG_DATA_HOME: testDataDir,
   })
 
   expect(code).not.toBe(0)
   expect(stdout).toContain('bootstrap')
+  // #then the guard the Action writes before every server start landed in the child's isolated config dir
+  expect(existsSync(path.join(testDataDir, 'xdg-config', 'opencode', 'fro-bot', 'no-task-reuse.mjs'))).toBe(true)
 })
 
 it('kills a child that exceeds its timeout and preserves partial output', async () => {

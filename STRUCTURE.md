@@ -54,7 +54,7 @@ fro-bot/agent/
 │   ├── scripts/                # Plain Node ESM (.mjs) deploy helpers; node --test runner
 │   └── tests/                  # Real-container acceptance harness (uid isolation)
 │
-├── scripts/                    # Repo-level build scripts (build-action-dist, unicode checks, release)
+├── scripts/                    # Repo-level build scripts (build-action-dist, unicode checks, release); `vitest-home-isolation.setup.ts` gives every Vitest run a temp HOME/XDG
 │   └── release/                # Release dispatch scripts
 │
 ├── .github/

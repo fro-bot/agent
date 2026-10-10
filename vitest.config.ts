@@ -1,3 +1,5 @@
+import {fileURLToPath} from 'node:url'
+
 import {defineConfig} from 'vitest/config'
 
 import {incompleteRunReporterPlugin} from './scripts/vitest-incomplete-run-reporter.ts'
@@ -8,6 +10,9 @@ import {incompleteRunReporterPlugin} from './scripts/vitest-incomplete-run-repor
 export default defineConfig({
   plugins: [incompleteRunReporterPlugin()],
   test: {
+    // Runs before each test file imports app modules: HOME and XDG_* point at a throwaway temp tree so no test can
+    // touch the developer's real home. Resolves from this config's root, which every suite shares.
+    setupFiles: [fileURLToPath(new URL('./scripts/vitest-home-isolation.setup.ts', import.meta.url))],
     exclude: [
       '**/node_modules/**',
       '**/dist/**',
