@@ -7,10 +7,12 @@ import {chmod, mkdir, open, rm, symlink, writeFile} from 'node:fs/promises'
 import {join} from 'node:path'
 import process from 'node:process'
 
-import {describe, expect, it} from 'vitest'
+import {describe, expect, it, vi} from 'vitest'
 import {measureSealedTree, measureSealedTreeFromFd, runAgentWalk, runWalkScriptForTesting} from './agent-walk.js'
 import {AGENT_GID, AGENT_UID} from './identity.js'
-import {makeTempDir} from './update-fixtures/helpers.js'
+import {makeTempDir, REAL_GIT_TEST_TIMEOUT_MS} from './update-fixtures/helpers.js'
+
+vi.setConfig({testTimeout: REAL_GIT_TEST_TIMEOUT_MS})
 
 function opts(rootPath: string, overrides: Partial<Parameters<typeof runAgentWalk>[0]> = {}) {
   return {

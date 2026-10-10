@@ -16,7 +16,7 @@ import {chmod, mkdir, rename, rm, symlink, writeFile} from 'node:fs/promises'
 import {join} from 'node:path'
 import process from 'node:process'
 
-import {afterAll, afterEach, beforeAll, beforeEach, describe, expect, it} from 'vitest'
+import {afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi} from 'vitest'
 import {buildCloneGitEnv} from './clone.js'
 import {runGit} from './git-safety.js'
 import {runPackStream} from './git-stream.js'
@@ -38,6 +38,7 @@ import {
   isolatedGitEnv,
   makeTempDir,
   opensslAvailable,
+  REAL_GIT_TEST_TIMEOUT_MS,
   sentinelFired,
   sentinelPath,
   startLoopbackListener,
@@ -48,6 +49,8 @@ import {
   reconcileUpdateJournalsOnStartup,
   runTrackedInvocation,
 } from './update.js'
+
+vi.setConfig({testTimeout: REAL_GIT_TEST_TIMEOUT_MS})
 
 const OWNER = 'acme'
 const REPO = 'widgets'

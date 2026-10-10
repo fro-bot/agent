@@ -1,32 +1,52 @@
-import {describe, expect, it} from 'vitest'
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {sleep} from './async.js'
 
 describe('sleep', () => {
-  it('resolves after specified delay', async () => {
-    // #given
-    const delayMs = 50
-
-    // #when
-    const start = Date.now()
-    await sleep(delayMs)
-    const elapsed = Date.now() - start
-
-    // #then
-    expect(elapsed).toBeGreaterThanOrEqual(delayMs - 10)
-    expect(elapsed).toBeLessThan(delayMs + 50)
+  // Fake timers make the delay contract deterministic: wall-clock assertions (`elapsed < delay + slack`)
+  // measure host scheduling latency, not `sleep`, and flake under load.
+  beforeEach(() => {
+    vi.useFakeTimers()
   })
 
-  it('resolves immediately for 0ms', async () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('resolves after specified delay, and not before', async () => {
     // #given
-    const delayMs = 0
+    const delayMs = 50
+    let resolved = false
 
     // #when
-    const start = Date.now()
-    await sleep(delayMs)
-    const elapsed = Date.now() - start
+    const pending = sleep(delayMs).then(() => {
+      resolved = true
+    })
+    await vi.advanceTimersByTimeAsync(delayMs - 1)
+
+    // #then it has not resolved one tick early
+    expect(resolved).toBe(false)
+
+    // #when the full delay elapses
+    await vi.advanceTimersByTimeAsync(1)
+    await pending
 
     // #then
-    expect(elapsed).toBeLessThan(20)
+    expect(resolved).toBe(true)
+  })
+
+  it('resolves on the first timer tick for 0ms, without waiting for any further time', async () => {
+    // #given
+    let resolved = false
+
+    // #when
+    const pending = sleep(0).then(() => {
+      resolved = true
+    })
+    await vi.advanceTimersByTimeAsync(0)
+    await pending
+
+    // #then
+    expect(resolved).toBe(true)
   })
 
   it('throws for negative duration', async () => {

@@ -29,6 +29,16 @@ import {promisify} from 'node:util'
 const execFileAsync = promisify(execFile)
 
 /**
+ * Per-test timeout for suites that spawn the REAL git binary (staging clones, pack import, quarantine, size
+ * walks). Vitest's 5s default is too tight when the host is loaded (load average 30+ is routine on a shared
+ * dev box): worst-case durations of 5–13s were measured for tests that finish in well under 1s unloaded.
+ * 30s is ~2.4x the slowest measured case. Opt a file in with
+ * `vi.setConfig({testTimeout: REAL_GIT_TEST_TIMEOUT_MS})`; this bounds only the test body — every spawn
+ * under test still carries its own production deadline (`timeoutMs`/`deadlineMs`), so a hang is still caught.
+ */
+export const REAL_GIT_TEST_TIMEOUT_MS = 30_000
+
+/**
  * Every scenario in this suite runs as a real assertion on host git — none of them needed actual
  * uid switching between the service identity and AGENT_UID (10001), so there is currently no
  * `WORKSPACE_FIXTURES_IN_IMAGE`-gated test to skip outside the image. If a future scenario in this
