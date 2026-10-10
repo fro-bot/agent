@@ -481,6 +481,15 @@ describe('restore/save object-store integration flow', () => {
     expect(core.summary.addHeading).toHaveBeenCalledWith('Fro Bot Agent Run — Cache Save Declined', 2)
     expect(core.summary.write).toHaveBeenCalled()
 
+    // #and the body is HTML: a Reason paragraph with a <strong> label and the note as a blockquote,
+    // each on its own line with no blank line (which would hand the rest to the Markdown parser)
+    const declineBody = String(vi.mocked(core.summary).addRaw.mock.calls[0]![0])
+    expect(declineBody).toMatch(
+      /^<p>The session cache was not saved at this point because the SQLite write-ahead log could not be checkpointed\.<\/p>\n<p><strong>Reason:<\/strong> [^<>]+<\/p>\n<blockquote>A retry from the post-action hook may still save the cache later in this run\. Only if that retry also fails does the next run risk restoring an older session\.<\/blockquote>\n$/,
+    )
+    expect(declineBody).not.toContain('**')
+    expect(declineBody).not.toContain('\n\n')
+
     holder.exec('COMMIT')
     holder.close()
   })

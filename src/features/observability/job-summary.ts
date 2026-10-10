@@ -6,7 +6,7 @@ import type {CommentSummaryOptions} from './types.js'
 import * as core from '@actions/core'
 import {toCacheSaveStateValue} from '../../shared/cache-save-result.js'
 import {toErrorMessage} from '../../shared/errors.js'
-import {escapeSummaryText} from '../../shared/summary-escape.js'
+import {htmlCode, htmlCodeSpans, htmlLink, htmlParagraph, htmlStrong, htmlText} from '../../shared/summary-html.js'
 import {formatCacheStatus, formatDuration} from './run-summary.js'
 
 /**
@@ -161,7 +161,7 @@ export async function writeCacheSaveResultSummary(
 
     const remediation = cacheSaveResultRemediation(result, phase)
     if (remediation != null) {
-      core.summary.addRaw(`${remediation}\n`)
+      core.summary.addRaw(`${htmlParagraph(htmlCodeSpans(remediation))}\n`)
     }
 
     // Declared here (not folded into a fifth OUTCOME_TO_REMEDIATION variant per specific
@@ -172,7 +172,7 @@ export async function writeCacheSaveResultSummary(
     // second channel -- it augments the same 'Session Persistence' row this function
     // always writes.
     if (declineReason != null && result.outcome === 'ownership-declined') {
-      core.summary.addRaw(`**Reason:** ${declineReason}\n`)
+      core.summary.addRaw(`${htmlParagraph(`${htmlStrong('Reason:')} ${htmlText(declineReason)}`)}\n`)
     }
 
     await core.summary.write()
@@ -218,9 +218,9 @@ export interface InvocationSkipDetail {
 const REVIEW_REQUEST_DOC_URL =
   'https://github.com/fro-bot/agent/blob/main/docs/wiki/Troubleshooting.md#review-access-and-the-review-request-path'
 
-/** One-line remediation per skip reason; reasons without an entry need none. */
+/** One-line remediation per skip reason, as an HTML fragment; reasons without an entry need none. */
 const SKIP_REASON_HINTS: Readonly<Partial<Record<SkipReason, string>>> = {
-  unauthorized_author: `If this is a pull request, a maintainer can request a review from the bot to have it processed — see [Review access and the review-request path](${REVIEW_REQUEST_DOC_URL}).`,
+  unauthorized_author: `If this is a pull request, a maintainer can request a review from the bot to have it processed — see ${htmlLink('Review access and the review-request path', REVIEW_REQUEST_DOC_URL)}.`,
 }
 
 /**
@@ -250,23 +250,23 @@ export async function writeInvocationOutcomeSummary(
 
     if (outcome === 'incomplete' && incompleteReasons.length > 0) {
       core.summary.addRaw(
-        '\nA useful result may exist, but this invocation could not certify completion. Unresolved:\n',
+        `${htmlParagraph('A useful result may exist, but this invocation could not certify completion. Unresolved:')}\n`,
       )
-      core.summary.addList([...incompleteReasons])
+      core.summary.addList(incompleteReasons.map(reason => htmlText(reason)))
     }
 
     if (outcome === 'skipped') {
       core.summary.addRaw(
-        '\nThis invocation intentionally attempted no delivery (no matching trigger, a deduplicated repeat, or coordination-lock contention).\n',
+        `${htmlParagraph('This invocation intentionally attempted no delivery (no matching trigger, a deduplicated repeat, or coordination-lock contention).')}\n`,
       )
 
       if (skip !== undefined) {
         core.summary.addRaw(
-          `\n**Skip reason:** <code>${escapeSummaryText(skip.reason)}</code> — ${escapeSummaryText(skip.message)}\n`,
+          `${htmlParagraph(`${htmlStrong('Skip reason:')} ${htmlCode(skip.reason)} — ${htmlText(skip.message)}`)}\n`,
         )
         const hint = SKIP_REASON_HINTS[skip.reason]
         if (hint !== undefined) {
-          core.summary.addRaw(`\n${hint}\n`)
+          core.summary.addRaw(`${htmlParagraph(hint)}\n`)
         }
       }
     }
@@ -318,19 +318,19 @@ function writeBackgroundWorkSummary(ledger: OwnershipLedger | undefined): void {
   core.summary.addHeading('Background Work', 3)
 
   if (unfinished.length === 0) {
-    core.summary.addRaw('All background work finished.\n')
+    core.summary.addRaw(`${htmlParagraph('All background work finished.')}\n`)
   } else {
-    core.summary.addRaw('**Did not finish:**\n')
+    core.summary.addRaw(`${htmlParagraph(htmlStrong('Did not finish:'))}\n`)
     core.summary.addList(
       unfinished.map(entry => {
-        return `${entry.label} (${UNFINISHED_ENTRY_STATE_LABELS[entry.state]})`
+        return htmlText(`${entry.label} (${UNFINISHED_ENTRY_STATE_LABELS[entry.state]})`)
       }),
     )
   }
 
   if (unknownCount > 0) {
     core.summary.addRaw(
-      `\u26A0\uFE0F **Degraded:** ${unknownCount} ${unknownCount === 1 ? 'entry' : 'entries'} could not be confirmed finished or cancelled; treat any associated changes as unverified.\n`,
+      `${htmlParagraph(`\u26A0\uFE0F ${htmlStrong('Degraded:')} ${unknownCount} ${unknownCount === 1 ? 'entry' : 'entries'} could not be confirmed finished or cancelled; treat any associated changes as unverified.`)}\n`,
     )
   }
 }
@@ -355,26 +355,28 @@ export async function writeJobSummary(
         {data: 'Field', header: true},
         {data: 'Value', header: true},
       ],
-      ['Event', eventType],
-      ['Repository', repo],
-      ['Ref', ref],
-      ['Run ID', `[${runId}](${runUrl})`],
-      ['Agent', agent],
-      ['Output Mode', resolvedOutputMode ?? 'N/A'],
-      ['Delivery Kind', deliveryKind],
-      ['Cache Status', formatCacheStatus(metrics.cacheStatus)],
-      ['Duration', metrics.duration == null ? 'N/A' : formatDuration(metrics.duration)],
+      ['Event', htmlText(eventType)],
+      ['Repository', htmlText(repo)],
+      ['Ref', htmlText(ref)],
+      ['Run ID', htmlLink(String(runId), runUrl)],
+      ['Agent', htmlText(agent)],
+      ['Output Mode', htmlText(resolvedOutputMode ?? 'N/A')],
+      ['Delivery Kind', htmlText(deliveryKind)],
+      ['Cache Status', htmlText(formatCacheStatus(metrics.cacheStatus))],
+      ['Duration', htmlText(metrics.duration == null ? 'N/A' : formatDuration(metrics.duration))],
     ])
 
     if (metrics.sessionsUsed.length > 0 || metrics.sessionsCreated.length > 0) {
       core.summary.addHeading('Sessions', 3)
 
       if (metrics.sessionsUsed.length > 0) {
-        core.summary.addRaw(`**Used:** ${metrics.sessionsUsed.join(', ')}\n`)
+        core.summary.addRaw(`${htmlParagraph(`${htmlStrong('Used:')} ${htmlText(metrics.sessionsUsed.join(', '))}`)}\n`)
       }
 
       if (metrics.sessionsCreated.length > 0) {
-        core.summary.addRaw(`**Created:** ${metrics.sessionsCreated.join(', ')}\n`)
+        core.summary.addRaw(
+          `${htmlParagraph(`${htmlStrong('Created:')} ${htmlText(metrics.sessionsCreated.join(', '))}`)}\n`,
+        )
       }
     }
 
@@ -393,11 +395,11 @@ export async function writeJobSummary(
       ])
 
       if (metrics.model != null) {
-        core.summary.addRaw(`**Model:** ${metrics.model}\n`)
+        core.summary.addRaw(`${htmlParagraph(`${htmlStrong('Model:')} ${htmlText(metrics.model)}`)}\n`)
       }
 
       if (metrics.cost != null) {
-        core.summary.addRaw(`**Cost:** $${metrics.cost.toFixed(4)}\n`)
+        core.summary.addRaw(`${htmlParagraph(`${htmlStrong('Cost:')} $${metrics.cost.toFixed(4)}`)}\n`)
       }
     }
 
@@ -405,28 +407,29 @@ export async function writeJobSummary(
       core.summary.addHeading('Created Artifacts', 3)
 
       if (metrics.prsCreated.length > 0) {
-        core.summary.addList([...metrics.prsCreated])
+        core.summary.addList(metrics.prsCreated.map(url => htmlLink(url, url)))
       }
 
       if (metrics.commitsCreated.length > 0) {
-        core.summary.addList(metrics.commitsCreated.map(sha => `Commit \`${sha.slice(0, 7)}\``))
+        core.summary.addList(metrics.commitsCreated.map(sha => `Commit ${htmlCode(sha.slice(0, 7))}`))
       }
 
       if (metrics.commentsPosted > 0) {
-        core.summary.addRaw(`**Comments Posted:** ${metrics.commentsPosted}\n`)
+        core.summary.addRaw(`${htmlParagraph(`${htmlStrong('Comments Posted:')} ${metrics.commentsPosted}`)}\n`)
       }
     }
 
     if (metrics.errors.length > 0) {
       core.summary.addHeading('Errors', 3)
 
-      for (const error of metrics.errors) {
-        const status = error.recoverable ? '🔄 Recovered' : '❌ Failed'
-        const classification = error.classificationPath == null ? '' : `, classification: ${error.classificationPath}`
-        const action =
-          error.suggestedAction == null ? '' : ` Suggested action: ${escapeSummaryText(error.suggestedAction)}`
-        core.summary.addRaw(`- **${error.type}** (${status}${classification}): ${error.message}${action}\n`)
-      }
+      core.summary.addList(
+        metrics.errors.map(error => {
+          const status = error.recoverable ? '🔄 Recovered' : '❌ Failed'
+          const classification = error.classificationPath == null ? '' : `, classification: ${error.classificationPath}`
+          const action = error.suggestedAction == null ? '' : ` Suggested action: ${error.suggestedAction}`
+          return `${htmlStrong(error.type)} ${htmlText(`(${status}${classification}): ${error.message}${action}`)}`
+        }),
+      )
     }
 
     writeBackgroundWorkSummary(ownershipLedger)

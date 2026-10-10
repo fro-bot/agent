@@ -32,6 +32,7 @@ formatTokenUsage(usage, model) // Detailed token display
 - **Idempotent replacement**: Uses `BOT_COMMENT_MARKER` to find/replace existing summaries
 - **Logger injection**: `writeJobSummary()` uses injected logger for non-blocking warnings
 - **Graceful degradation**: Job summary failures never fail the workflow execution
+- **Job summary is HTML, not Markdown**: `core.summary.addTable`/`addList` emit HTML blocks, and GitHub renders no Markdown inside them (or in Markdown lines that follow one without a blank line). Build every dynamic value with `src/shared/summary-html.ts` (`htmlText`, `htmlLink`, `htmlStrong`, `htmlCode`, `htmlParagraph`, `htmlLines`) — plain text in, escaped exactly once — and put each `addRaw` line in its own `<p>`. Never emit `**bold**`, `[text](url)`, backticks, or a blank line into the job summary (the PR/issue comment footer in `run-summary.ts` is real Markdown and keeps its own table)
 
 ## DATA FLOW
 

@@ -21,6 +21,7 @@ import {writeJobSummary} from '../../features/observability/index.js'
 import {createExecAdapter} from '../../services/setup/adapters.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {createLogger} from '../../shared/logger.js'
+import {htmlParagraph, htmlText} from '../../shared/summary-html.js'
 import {setActionOutputs, setDeliveryKindOutput} from '../config/outputs.js'
 
 /**
@@ -238,7 +239,7 @@ export async function runFinalizeWithResult(
     setDeliveryKindOutput(deliveryKind)
     if (execution.overflowRecovery?.recovered === true) {
       core.summary.addRaw(
-        `Recovered from context overflow (fresh review session; archived ${execution.overflowRecovery.archivedSessionId})\n`,
+        `${htmlParagraph(htmlText(`Recovered from context overflow (fresh review session; archived ${execution.overflowRecovery.archivedSessionId})`))}\n`,
       )
     }
     await writeJobSummary({...baseSummaryOptions, deliveryKind}, logger, execution.ownershipLedger)
