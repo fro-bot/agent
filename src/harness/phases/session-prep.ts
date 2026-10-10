@@ -18,7 +18,7 @@ import {
   parseAttachmentUrls,
   validateAttachments,
 } from '../../features/attachments/index.js'
-import {getGitHubWorkspace} from '../../shared/env.js'
+import {getGitHubWorkspace, getInvocationIdentity} from '../../shared/env.js'
 import {createLogger} from '../../shared/logger.js'
 import {normalizeWorkspacePath} from '../../shared/paths.js'
 
@@ -93,7 +93,7 @@ export async function runSessionPrep(
   const sessionLogger = createLogger({phase: 'session'})
   const normalizedWorkspace = normalizeWorkspacePath(getGitHubWorkspace())
 
-  const logicalKey = buildLogicalKey(routing.triggerResult.context)
+  const logicalKey = buildLogicalKey(routing.triggerResult.context, getInvocationIdentity())
   const sessionTitle = logicalKey == null ? null : buildSessionTitle(logicalKey)
   let continueSessionId: string | null = null
   let isContinuation = false

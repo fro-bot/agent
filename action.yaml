@@ -154,6 +154,14 @@ inputs:
     description: Comma-separated path prefixes for brokered pushes; protected surfaces remain denied
     required: false
     default: ''
+  matrix-context:
+    description: >-
+      Internal; do not set. Defaults to the calling job's matrix context (`toJSON(matrix)`), used only to
+      derive a short stable hash that keeps the cache save key, log artifact name, and run-scoped session
+      key of one matrix leg distinct from its sibling legs. `null`/`{}`/empty (a job without a matrix)
+      adds nothing. Together with `GITHUB_JOB` this forms the invocation identity.
+    required: false
+    default: ${{ toJSON(matrix) }}
 
 outputs:
   session-id:

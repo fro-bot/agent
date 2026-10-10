@@ -622,7 +622,7 @@ function prepareScenarioPrompt(
     },
     triggerContext,
   )
-  const logicalKey = buildLogicalKey(triggerContext)
+  const logicalKey = buildLogicalKey(triggerContext, null)
 
   return {
     scenarioInput,

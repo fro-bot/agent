@@ -32,7 +32,7 @@ The prompt is assembled in this order:
 
 1. **`<harness_rules>`** — Non-negotiable operational rules. These take precedence over everything else, including user-supplied instructions. Contains the response protocol (exactly one comment or review per run), the bot identification marker, and CI behavioral constraints. The exact wording is **delivery-mode-aware** (see [Response Delivery Modes](#response-delivery-modes)): a `model-gh` run is instructed to post its own comment or review via `gh`, whereas a `file-convention` run is told to write its answer to the response file instead of calling `gh` at all.
 
-2. **`<identity>`** — Thread identity: logical key (e.g., `issue-42` or `dispatch-12345`) and continuation status. Helps the agent understand whether it's continuing a prior conversation or starting fresh.
+2. **`<identity>`** — Thread identity: logical key (e.g., `issue-42` or `dispatch-12345-fro-bot-observe`, where run-scoped keys carry the job) and continuation status. Helps the agent understand whether it's continuing a prior conversation or starting fresh.
 
 3. **`<environment>`** — Static metadata: repository name, branch/ref, event type, actor, run ID, and cache status.
 

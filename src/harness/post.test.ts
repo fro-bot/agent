@@ -1,4 +1,5 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import {toCacheSaveStateValue} from '../shared/cache-save-result.js'
 import {createMockLogger} from '../shared/test-helpers.js'
 import {ok} from '../shared/types.js'
 
@@ -46,6 +47,8 @@ describe('post action', () => {
     process.env.GITHUB_RUN_ID = '12345'
     process.env.GITHUB_RUN_ATTEMPT = '1'
     process.env.RUNNER_OS = 'Linux'
+    delete process.env.GITHUB_JOB
+    delete process.env['INPUT_MATRIX-CONTEXT']
   })
 
   afterEach(() => {
@@ -55,6 +58,8 @@ describe('post action', () => {
     delete process.env.GITHUB_RUN_ID
     delete process.env.GITHUB_RUN_ATTEMPT
     delete process.env.RUNNER_OS
+    delete process.env.GITHUB_JOB
+    delete process.env['INPUT_MATRIX-CONTEXT']
   })
 
   describe('runPost', () => {
@@ -157,6 +162,35 @@ describe('post action', () => {
 
       expect(saveCache).toHaveBeenCalled()
       expect(logger.info).toHaveBeenCalledWith('Post-action cache saved', expect.any(Object))
+    })
+
+    it('retries the save when the main step\'s "already exists" collision was recorded (cache-rejected -> not-persisted)', async () => {
+      // #given the main step hit an "already exists" reservation collision, which saveCache now
+      // reports as cache-rejected -- so cleanup handed off the not-persisted state value
+      const handedOff = toCacheSaveStateValue({cachePersisted: false, storePersisted: false, outcome: 'cache-rejected'})
+      expect(handedOff).toBe('not-persisted')
+      const core = await import('@actions/core')
+      vi.mocked(core.getState).mockImplementation((key: string) => {
+        if (key === 'shouldSaveCache') return 'true'
+        if (key === 'cacheSaved') return handedOff
+        return ''
+      })
+      const {saveCache} = await import('../services/cache/index.js')
+      vi.mocked(saveCache).mockResolvedValue({cachePersisted: false, storePersisted: false, outcome: 'cache-rejected'})
+
+      const {runPost} = await import('./post.js')
+      const logger = createMockLogger()
+
+      // #when the post hook runs
+      await runPost({logger})
+
+      // #then it retries once (rather than treating the collision as success) and reports the
+      // retry's own not-persisted outcome
+      expect(saveCache).toHaveBeenCalledTimes(1)
+      expect(logger.info).toHaveBeenCalledWith(
+        'Post-action cache save did not persist (cache-rejected)',
+        expect.any(Object),
+      )
     })
 
     it('attempts the save when the cacheSaved state key is entirely absent (main step crashed before cleanup ran)', async () => {
@@ -407,6 +441,30 @@ describe('post action', () => {
       await runPost({logger})
 
       expect(uploadLogArtifact).toHaveBeenCalledWith(expect.objectContaining({runId: 12345, runAttempt: 1}))
+    })
+
+    it('uploads the artifact under the same job identity the main step would have used', async () => {
+      // #given a post hook running inside the Observe job of a run
+      process.env.OPENCODE_PROMPT_ARTIFACT = 'true'
+      process.env.GITHUB_JOB = 'fro-bot-observe'
+      const core = await import('@actions/core')
+      vi.mocked(core.getState).mockImplementation((key: string) => {
+        if (key === 'shouldSaveCache') return 'true'
+        if (key === 'cacheSaved') return 'durable'
+        return ''
+      })
+      const {uploadLogArtifact} = await import('../services/artifact/index.js')
+      vi.mocked(uploadLogArtifact).mockResolvedValue(true)
+
+      const {runPost} = await import('./post.js')
+
+      // #when the post hook runs
+      await runPost({logger: createMockLogger()})
+
+      // #then the job identity is passed through to the artifact name
+      expect(uploadLogArtifact).toHaveBeenCalledWith(
+        expect.objectContaining({runId: 12345, runAttempt: 1, invocationIdentity: 'fro-bot-observe'}),
+      )
     })
 
     it('should skip artifact upload when already uploaded by main action', async () => {

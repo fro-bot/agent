@@ -95,7 +95,7 @@ A `declined-for-safety` result is a different investigation than `not-persisted`
 
 Note what `not-persisted` cannot tell you. A rejected write surfaces as a single `-1` from `@actions/cache` with no detail, so the action cannot distinguish a policy denial from a reservation collision, a server error, or an upload failure. Do not infer the cause from the trigger type — the mapping is a strong prior, not a fact about the individual run.
 
-Re-runs are a separate case. Each run attempt writes its own cache entry, keyed by run ID _and_ run attempt, so a re-run no longer collides with the first attempt's entry and silently discards its own state.
+Re-runs and multi-job runs are a separate case. Each run attempt of each job writes its own cache entry, keyed by run ID, run attempt, _and_ the job (`GITHUB_JOB`, plus a matrix-leg hash), so neither a re-run nor a sibling job in the same run collides with another entry and silently discards its own state. A thrown "already exists" collision is reported as `not-persisted`, not as success. The log artifact is named the same way — `opencode-logs-<run-id>-<attempt>-<job>` (for example `opencode-logs-38026680860-1-fro-bot-observe`) — so `gh run download` returns one job's logs per name.
 
 See [[Session Persistence]] for how memory survives across runs.
 

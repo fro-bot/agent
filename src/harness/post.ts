@@ -12,6 +12,7 @@ import {
   getGitHubRunAttempt,
   getGitHubRunId,
   getGitHubWorkspace,
+  getInvocationIdentity,
   getOpenCodeAuthPath,
   getOpenCodeLogPath,
   getOpenCodeStoragePath,
@@ -247,6 +248,7 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
           logPath: getOpenCodeLogPath(),
           runId: getGitHubRunId(),
           runAttempt: getGitHubRunAttempt(),
+          invocationIdentity: getInvocationIdentity(),
           logger: artifactLogger,
         })
       } catch (error) {

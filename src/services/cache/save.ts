@@ -6,7 +6,7 @@ import process from 'node:process'
 import * as core from '@actions/core'
 import {createS3Adapter, syncSessionsToStore} from '@fro-bot/runtime'
 import {STORAGE_VERSION} from '../../shared/constants.js'
-import {getGitHubRunAttempt} from '../../shared/env.js'
+import {getGitHubRunAttempt, getInvocationIdentity} from '../../shared/env.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {buildSaveCacheKey} from './cache-key.js'
 import {checkpointDatabase} from './checkpoint.js'
@@ -132,9 +132,10 @@ export async function saveCache(options: SaveCacheOptions): Promise<CacheSaveRes
   }
 
   // Sourced independently of options, the same way runId's caller derives it, rather than
-  // widening SaveCacheOptions -- runAttempt is a process-wide runner fact, not per-call
-  // configuration.
-  const saveKey = buildSaveCacheKey(components, runId, getGitHubRunAttempt())
+  // widening SaveCacheOptions -- runAttempt and the invocation identity (job + matrix leg) are
+  // process-wide runner facts, not per-call configuration. Deriving both here is also what
+  // guarantees the post-action retry (post.ts) saves under exactly the key cleanup would have.
+  const saveKey = buildSaveCacheKey(components, runId, getGitHubRunAttempt(), getInvocationIdentity())
   // Tracked across the try block (and visible to the catch below) because the store sync
   // and the cache write are independent backends: a thrown error from the cache write
   // (including the caught "already exists" collision) must not erase whatever the object
@@ -210,14 +211,13 @@ export async function saveCache(options: SaveCacheOptions): Promise<CacheSaveRes
     return {cachePersisted: true, storePersisted, outcome: 'persisted'}
   } catch (error) {
     if (error instanceof Error && error.message.includes('already exists')) {
-      logger.info('Cache key already exists, skipping save')
-      // Fold-in, not a separate outcome: the save key now includes both run ID and run
-      // attempt, so a "key already exists" collision is confined to a genuine duplicate
-      // save within the same attempt (e.g. a concurrent job) -- some other save already
-      // committed this key, so the state is durably present under it regardless of which
-      // one wrote it. Distinguishing it from a normal success would not change what a
-      // caller should do with the result.
-      return {cachePersisted: true, storePersisted, outcome: 'persisted'}
+      // Not a success: the key is identity-qualified (run, attempt, job), so an "already exists"
+      // here means someone else holds the reservation for this invocation's key -- it says
+      // nothing about whether THIS invocation's state landed under it. Reporting it as persisted
+      // would suppress the post-hook retry and hide lost session state (the false success this
+      // used to mask). Same outcome as the `-1` sentinel for the identical reservation collision.
+      logger.warning("Cache key already exists; this invocation's state was not saved under it", {saveKey})
+      return {cachePersisted: false, storePersisted, outcome: 'cache-rejected'}
     }
 
     logger.warning('Cache save failed', {
