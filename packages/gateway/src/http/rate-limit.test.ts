@@ -70,8 +70,8 @@ describe('createRateLimiter', () => {
     })
   })
 
-  describe('opportunistic eviction', () => {
-    it('evicts expired windows on subsequent calls', () => {
+  describe('lazy per-key window expiry', () => {
+    it('renews an expired window the next time the key is touched', () => {
       // #given — multiple keys
       let now = 0
       const limiter = createRateLimiter({limit: 1, windowMs: 60_000, clock: () => now})
@@ -90,43 +90,119 @@ describe('createRateLimiter', () => {
   })
 
   // ---------------------------------------------------------------------------
-  // FIX 2: MAX_KEYS cap — bounded map (memory-sink defence)
+  // MAX_KEYS cap — bounded map, window-renewal FIFO eviction (#1652)
   // ---------------------------------------------------------------------------
 
-  describe('MAX_KEYS cap — map does not grow unbounded', () => {
-    it('treats new keys as rate-limited once cap is reached (no evictions available)', () => {
-      // #given — fill the map to the cap with unique keys in a single window (no expiry)
-      // We use a limit high enough that we never hit per-key denial during seeding.
-      const MAX_KEYS = 10_000
-      const now = 1_000_000
-      const limiter = createRateLimiter({limit: MAX_KEYS + 1, windowMs: 60_000, clock: () => now})
+  describe('MAX_KEYS cap — bounded, new keys are always admitted', () => {
+    const MAX_KEYS = 10_000
+    const WINDOW = 60_000
 
-      // Seed exactly MAX_KEYS entries — all should be allowed
+    /** limit-1 limiter saturated with `key-0 … key-9999`, all active in one window. */
+    function makeSaturated(clock: () => number) {
+      const limiter = createRateLimiter({limit: 1, windowMs: WINDOW, clock})
       for (let i = 0; i < MAX_KEYS; i++) {
         expect(limiter.allow(`key-${i}`)).toBe(true)
       }
+      return limiter
+    }
 
-      // #when — try to add one more distinct key beyond the cap
-      const overCapAllowed = limiter.allow('key-over-cap')
+    it('admits a never-seen key when the map is saturated with active keys', () => {
+      // #given — the map is full of active counters
+      const now = 1_000_000
+      const limiter = makeSaturated(() => now)
 
-      // #then — denied (map is at cap; no expired entries to evict)
-      expect(overCapAllowed).toBe(false)
+      // #when — a key that has never been seen arrives
+      const admitted = limiter.allow('fresh-client')
+
+      // #then — admitted (previously refused) and then limited like any other key
+      expect(admitted).toBe(true)
+      expect(limiter.allow('fresh-client')).toBe(false)
     })
 
-    it('allows new keys again once old entries expire and eviction frees space', () => {
-      // #given — fill the map to the cap at t=0
-      const MAX_KEYS = 10_000
-      let now = 0
-      const limiter = createRateLimiter({limit: MAX_KEYS + 1, windowMs: 60_000, clock: () => now})
+    it('retains the active counters of surviving keys when a newcomer evicts the oldest', () => {
+      // #given
+      const now = 1_000_000
+      const limiter = makeSaturated(() => now)
 
-      for (let i = 0; i < MAX_KEYS; i++) {
-        limiter.allow(`key-${i}`)
+      // #when — one newcomer displaces exactly one key (the oldest, key-0)
+      limiter.allow('fresh-client')
+
+      // #then — every other key keeps its exhausted counter
+      expect(limiter.allow('key-1')).toBe(false)
+      expect(limiter.allow(`key-${MAX_KEYS - 1}`)).toBe(false)
+    })
+
+    it('accepted best-effort behavior: evicting an active key resets its bucket', () => {
+      // #given — key-0 is the oldest and has used its whole allowance
+      const now = 1_000_000
+      const limiter = makeSaturated(() => now)
+      expect(limiter.allow('key-0')).toBe(false)
+
+      // #when — cardinality pressure evicts it
+      limiter.allow('fresh-client')
+
+      // #then — its bucket starts over: this is the documented tradeoff
+      expect(limiter.allow('key-0')).toBe(true)
+    })
+
+    it('an expired-window renewal moves the key to the tail, so it outlives older keys', () => {
+      // #given — saturated at t=0; at t>window every entry is expired
+      let now = 0
+      const limiter = makeSaturated(() => now)
+      now = WINDOW + 1
+
+      // #when — key-0 renews (delete-then-set → youngest), then a newcomer forces one eviction
+      expect(limiter.allow('key-0')).toBe(true)
+      now += 1
+      limiter.allow('fresh-client')
+
+      // #then — the evicted key was the oldest remaining (key-1), not the renewed key-0,
+      // whose fresh counter is still enforced
+      expect(limiter.allow('key-0')).toBe(false)
+    })
+
+    it('ordinary hits do not promote a key (FIFO by window start, not LRU)', () => {
+      // #given — limit 2 so key-0 can be hit again without being denied
+      const now = 1_000_000
+      const limiter = createRateLimiter({limit: 2, windowMs: WINDOW, clock: () => now})
+      for (let i = 0; i < MAX_KEYS; i++) limiter.allow(`key-${i}`)
+
+      // #when — key-0 is hit again (a within-window hit), then a newcomer arrives
+      expect(limiter.allow('key-0')).toBe(true)
+      limiter.allow('fresh-client')
+
+      // #then — key-0 was still the oldest and was evicted: its counter restarted
+      // (count 1 of 2), so two more hits fit; it would be denied on the 2nd if retained
+      expect(limiter.allow('key-0')).toBe(true)
+      expect(limiter.allow('key-0')).toBe(true)
+    })
+
+    it('stays bounded under repeated churn of new keys', () => {
+      // #given
+      const now = 1_000_000
+      const limiter = createRateLimiter({limit: 1, windowMs: WINDOW, clock: () => now})
+
+      // #when — three full capacities of distinct keys flow through
+      for (let i = 0; i < MAX_KEYS * 3; i++) {
+        expect(limiter.allow(`churn-${i}`)).toBe(true)
       }
 
-      // #when — advance past the window so all existing entries are expired
-      now = 60_001
+      // #then — only the newest MAX_KEYS remain: the newest is still counted, the oldest is gone
+      expect(limiter.allow(`churn-${MAX_KEYS * 3 - 1}`)).toBe(false)
+      expect(limiter.allow(`churn-${MAX_KEYS * 2}`)).toBe(false)
+      expect(limiter.allow('churn-0')).toBe(true)
+      expect(limiter.allow(`churn-${MAX_KEYS - 1}`)).toBe(true)
+    })
 
-      // #then — a new key triggers eviction and is then accepted
+    it('admits new keys again once old entries expire', () => {
+      // #given
+      let now = 0
+      const limiter = makeSaturated(() => now)
+
+      // #when
+      now = WINDOW + 1
+
+      // #then
       expect(limiter.allow('fresh-key')).toBe(true)
     })
   })

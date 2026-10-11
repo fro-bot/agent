@@ -1,15 +1,31 @@
 /**
- * In-memory fixed-window rate limiter for the POST /v1/announce webhook.
+ * In-memory fixed-window rate limiter, shared by the announce webhook and the
+ * operator HTTP surface.
  *
- * Limits requests per source key (typically client IP) to a configurable
- * number of requests per time window. Defaults to 60 requests per minute.
+ * Limits requests per key (an authenticated user id, a fixed producer key, or a
+ * derived abuse-accounting key) to a configurable number of requests per time
+ * window. Defaults to 60 requests per minute.
  *
- * Uses fixed-window counting (not sliding window). Opportunistic eviction
- * of expired windows on each call.
+ * Uses fixed-window counting (not sliding window). Expiry is lazy and per key:
+ * a key whose window has elapsed is renewed the next time it is touched. There
+ * is no sweep — `allow()` is O(1) regardless of how many keys are tracked.
  *
- * Hard cap: the store is bounded to MAX_KEYS entries. When the cap is reached,
- * expired keys are evicted first; if still over, the incoming key is treated as
- * rate-limited rather than growing the map unboundedly (memory-sink defence).
+ * Hard cap: the store is bounded to MAX_KEYS entries. A NEW key arriving at
+ * capacity is always admitted: the oldest key (by insertion / window-renewal
+ * order) is evicted first. A new client is therefore never refused because of
+ * unrelated traffic.
+ *
+ * Ordering is FIFO by window start, not LRU: ordinary hits within a window do
+ * not promote a key; only a window renewal (delete-then-set, since `Map.set`
+ * on an existing key keeps its position) moves it to the tail.
+ *
+ * Best-effort under cardinality pressure: evicting a key discards its counter,
+ * so an ACTIVE bucket evicted at capacity starts over at count 1 on its next
+ * request. Under a flood of distinct keys the limiter degrades to "recent
+ * keys are limited" rather than failing closed for newcomers. Callers must not
+ * rely on it as a hard quota against an adversary that controls key
+ * cardinality — bound the key space upstream (e.g. derived /64 accounting
+ * keys) instead.
  */
 
 /** Default: 60 requests per minute. */
@@ -50,32 +66,24 @@ export function createRateLimiter(opts?: RateLimiterOptions): RateLimiter {
 
   const store = new Map<string, WindowEntry>()
 
-  function evictExpired(nowMs: number): void {
-    for (const [key, entry] of store) {
-      if (nowMs - entry.windowStart >= windowMs) {
-        store.delete(key)
-      }
-    }
-  }
-
   function allow(key: string): boolean {
     const nowMs = clock()
-    evictExpired(nowMs)
-
     const entry = store.get(key)
+
     if (entry === undefined) {
-      // New key — check cap before inserting
+      // New key. At capacity, make room by evicting the oldest key (the first
+      // in Map iteration order) rather than refusing the newcomer.
       if (store.size >= MAX_KEYS) {
-        // Map is at capacity after eviction; treat as rate-limited rather
-        // than growing unboundedly. Legitimate traffic from this IP will
-        // succeed once expired windows clear on a subsequent call.
-        return false
+        const oldest = store.keys().next()
+        if (oldest.done !== true) {
+          store.delete(oldest.value)
+        }
       }
       store.set(key, {windowStart: nowMs, count: 1})
       return true
     }
 
-    // Same window
+    // Same window: enforce the count. Hits do not change the key's position.
     if (nowMs - entry.windowStart < windowMs) {
       if (entry.count >= limit) {
         return false
@@ -84,7 +92,9 @@ export function createRateLimiter(opts?: RateLimiterOptions): RateLimiter {
       return true
     }
 
-    // Window has expired — reset
+    // Window has expired — renew. `Map.set` on an existing key does NOT move it
+    // to the tail, so delete first to make the renewed key the youngest.
+    store.delete(key)
     store.set(key, {windowStart: nowMs, count: 1})
     return true
   }
