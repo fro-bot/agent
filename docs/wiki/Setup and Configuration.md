@@ -1,7 +1,7 @@
 ---
 type: subsystem
 last-updated: "2026-10-11"
-updated-by: "27d08f8201656db6da2c60758bd4a0579fa2f6bb"
+updated-by: "18890129"
 sources:
   - src/harness/config/outputs.ts
   - packages/runtime/src/agent/attachment-dir.ts
@@ -17,6 +17,9 @@ sources:
   - src/services/setup/opencode.ts
   - src/services/setup/types.ts
   - packages/runtime/src/agent/server.ts
+  - src/features/agent/server-adapter.ts
+  - src/services/setup/no-task-reuse-config.ts
+  - deploy/plugins/no-task-reuse.mjs
   - packages/harness/src/platform.ts
   - src/services/setup/bun.ts
   - src/services/setup/omo.ts
@@ -110,7 +113,7 @@ The OMO Slim default is currently `2.2.25`, on the stable release line tracked i
 
 Bun plays a dual role: it is both the runtime that runs the oMo / OMO Slim installer in CI _and_ the package manager for this project's own workspace. The repository migrated from pnpm to Bun, which moved workspace configuration into `bunfig.toml`, replaced `pnpm install` with `bun install`, and changed how cache keys and license attribution are derived. Because the project's tooling itself depends on Bun, the Bun version is pinned and is baked into the tools-cache key (see [Tools Cache](#tools-cache)) so a Bun bump cleanly invalidates stale tooling.
 
-The default `DEFAULT_OPENCODE_VERSION` is a **harness build** (currently `1.18.30+harness.7c479429`) rather than a plain upstream OpenCode release. See [Harness Builds](#harness-builds) for what that means and how it changes the install path.
+The default `DEFAULT_OPENCODE_VERSION` is a **harness build** (currently `1.18.34+harness.6546eb64`) rather than a plain upstream OpenCode release. See [Harness Builds](#harness-builds) for what that means and how it changes the install path.
 
 ## Harness Builds
 
@@ -120,9 +123,9 @@ OpenCode is consumed in two forms. A _stock_ version is a plain upstream release
 
 A harness build has one identity but two written forms, and understanding why they differ explains most of the surrounding machinery.
 
-The **build-metadata form** — `1.18.30+harness.7c479429` — is what the binary self-reports and what the version pin in `packages/runtime/src/shared/constants.ts` records. The `+` segment is SemVer build metadata (§10), which is deliberately excluded from version precedence.
+The **build-metadata form** — `1.18.34+harness.6546eb64` — is what the binary self-reports and what the version pin in `packages/runtime/src/shared/constants.ts` records. The `+` segment is SemVer build metadata (§10), which is deliberately excluded from version precedence.
 
-The **prerelease form** — `1.18.30-harness.7c479429` — is the published GitHub release tag, the npm package version, and the tool-cache key.
+The **prerelease form** — `1.18.34-harness.6546eb64` — is the published GitHub release tag, the npm package version, and the tool-cache key.
 
 The prerelease form is not cosmetic. Harness releases live in the same tag namespace as the action's own `v0.x` product releases, and that namespace has two adversarial readers. Semantic-release scans tags matching `^v(.+)` to compute the next product version, so harness tags dropped the `v` prefix in mid-2026 to stay invisible to it. But bare-semver tags with build metadata created a second problem: because SemVer strips build metadata for precedence, Renovate's `github-tags` datasource — which discovers candidates from git tags, not release objects — read `1.18.21+harness.22dee0ee` as a _stable_ `1.18.21` that outranked the real `v0.x` action line, quietly breaking grouped update branches in consuming repositories. Marking the GitHub release object as a prerelease does not help, because candidate discovery never looks at release objects.
 
@@ -134,11 +137,11 @@ Moving the tag to a genuine SemVer prerelease identifier fixes it at the level o
 
 - **Download source** — Harness versions are routed to the `fro-bot/agent` releases URL instead of the upstream `anomalyco/opencode` releases, with the tag derived through the prerelease conversion. Percent-encoding of `+` as `%2B` is retained for the migrated legacy tags, since GitHub stores tags URL-encoded and a raw `+` is misread as a space. Stock versions keep their conventional `v`-prefixed upstream URL.
 
-- **Checksum verification** — Every harness archive is verified against a `SHA256SUMS` manifest published alongside the binary in the same release. Stock downloads have no such manifest and are not checksum-verified by the action. Before any URL is constructed, the version string is validated against a strict semver-ish pattern as a defense-in-depth guard against path traversal or shell metacharacters. A harness pin that fails to download or verify is **fail-closed** — the run aborts rather than silently substituting a stock binary. Stock-version installation failures can retry the stock fallback (`FALLBACK_VERSION`, currently `1.18.30`); that version is also used when `latest` resolution fails.
+- **Checksum verification** — Every harness archive is verified against a `SHA256SUMS` manifest published alongside the binary in the same release. Stock downloads have no such manifest and are not checksum-verified by the action. Before any URL is constructed, the version string is validated against a strict semver-ish pattern as a defense-in-depth guard against path traversal or shell metacharacters. A harness pin that fails to download or verify is **fail-closed** — the run aborts rather than silently substituting a stock binary. Stock-version installation failures can retry the stock fallback (`FALLBACK_VERSION`, currently `1.18.34`); that version is also used when `latest` resolution fails.
 
 - **Tool-cache identity** — `@actions/tool-cache` runs versions through `semver.clean()` internally, which strips `+harness.<sha>` build metadata and would collapse a harness build onto a stock cache entry of the same base version. The prerelease form survives `semver.clean()` intact, so using it as the cache key guarantees a harness build and a stock build of the same base version never share a cache slot. Logs and the binary's own `--version` output keep the build-metadata form.
 
-If the `latest` resolution path needs a fallback, the setup module falls back to a known-good stock version (`FALLBACK_VERSION`, currently `1.18.30`) rather than a harness build. An explicitly-pinned harness build does not fall back — a failed download or checksum mismatch fails the run.
+If the `latest` resolution path needs a fallback, the setup module falls back to a known-good stock version (`FALLBACK_VERSION`, currently `1.18.34`) rather than a harness build. An explicitly-pinned harness build does not fall back — a failed download or checksum mismatch fails the run.
 
 Because the tag shape is now load-bearing for two external tools and is derived in more than one place — the release workflow, the npm version builder, and the setup module — the test suite carries drift guards that read the repository's source text and fail if one producer is changed without the others. These guards exist because an earlier mirrored copy of the harness-version predicate asserted the opposite of production behavior and still passed, testing its own copy rather than the module.
 
@@ -190,6 +193,10 @@ User values win on conflicts. In default mode, `oh-my-openagent` and `oh-my-open
 The deployed workspace splits authority between the service and the model-driven process. The workspace-agent retains the privileges needed for protected clone staging, journals, and network fetches; the OpenCode process and its tools run as an unprivileged account. On startup the entrypoint migrates existing root-owned checkouts through a symlink-aware filesystem handoff, while protected secrets and state remain under root-owned paths (`deploy/workspace-entrypoint.sh`, `deploy/compose.yaml`). Fresh clones are handed off before agent execution. This keeps the checkout writable by the agent without giving it ownership of the credential and maintenance directories.
 
 The same bearer used by the gateway to attach to the OpenCode proxy on port 9200 also protects the workspace control API on port 9100. Clone, inspect, update, recovery, and backup routes check it before parsing request bodies; only health and readiness are unauthenticated (`apps/workspace-agent/src/server.ts`). Without that boundary, an agent tool running inside the container could call the loopback control API to mutate its own checkout outside the gateway's admission path. [[Architecture Overview]] describes how the gateway and workspace divide checkout preparation.
+
+### Server-start task-reuse guard
+
+The Action's server adapter (`src/features/agent/server-adapter.ts`) installs a separate local plugin before every server start, including runs that skipped tool installation because OpenCode was already present. `src/services/setup/no-task-reuse-config.ts` copies the bundled guard derived from `deploy/plugins/no-task-reuse.mjs` and supplies its absolute `file://` URL through the SDK's server config layer. A write failure prevents the server from starting. The guard rejects subagent session reuse before execution, preserving the one-child-session-per-background-job assumption described in [[Background Subagents and Ownership]]. It does not depend on the Systematic plugin or on the tools-cache install path.
 
 ## Tools Cache
 

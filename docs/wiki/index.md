@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-10-04"
-updated-by: "27d08f8201656db6da2c60758bd4a0579fa2f6bb"
+last-updated: "2026-10-11"
+updated-by: "18890129"
 sources:
   - docs/wiki/Architecture Overview.md
   - docs/wiki/Background Subagents and Ownership.md
@@ -38,7 +38,7 @@ An Obsidian-powered project wiki maintained by Fro Bot. This vault provides huma
 | [Background Subagents and Ownership](Background%20Subagents%20and%20Ownership.md) | subsystem | How the harness tracks, drains, and settles background subagent work that outlives the turn that dispatched it |
 | [Prompt Architecture](Prompt%20Architecture.md) | subsystem | How the multi-section XML-tagged prompt is assembled and why each section exists |
 | [Setup and Configuration](Setup%20and%20Configuration.md) | subsystem | Tool installation, configuration assembly, credentials, caching, and oMo/OMO Slim version gating |
-| [Operator Web Control Surface](Operator%20Web%20Control%20Surface.md) | subsystem | Authenticated browser surface for gateway runs, including checkout provenance, preparation outcomes, and live observation |
+| [Operator Web Control Surface](Operator%20Web%20Control%20Surface.md) | subsystem | Authenticated browser surface for gateway runs, OAuth admission, checkout provenance, live observation, and push health |
 
 ### Conventions
 

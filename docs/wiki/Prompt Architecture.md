@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-09-20"
-updated-by: "schedule-d7190410-35540552880"
+last-updated: "2026-10-11"
+updated-by: "18890129"
 sources:
   - packages/runtime/src/agent/prompt.ts
   - packages/runtime/src/agent/response-file.ts
@@ -69,6 +69,8 @@ The `getTriggerDirective()` function returns a `{directive, appendMode}` pair fo
 | `schedule` / `workflow_dispatch` | The custom prompt itself | No — custom prompt IS the directive |
 
 For schedule and dispatch events, `appendMode: false` means the custom prompt completely replaces the directive. This is because these events have no inherent context — the prompt input is the entire instruction.
+
+The delivery preamble separates **code delivery** from other task-required GitHub operations. In `working-dir` mode, edits stay in the checkout and the caller workflow owns commits, pushes, and PR creation; the agent cannot switch branches or deliver code itself. That boundary still permits explicitly requested issues, comments, or reports when the run is posting-enabled (`buildDeliveryModePreamble` in `packages/runtime/src/agent/prompt.ts`). If either `responseMode` or `responseDelivery` is `none`, the same preamble explicitly forbids those posts. Keeping both signals aligned prevents a non-posting run from receiving contradictory permission inside its task section.
 
 ## Reference Files
 
