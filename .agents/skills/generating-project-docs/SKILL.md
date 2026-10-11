@@ -61,7 +61,7 @@ Order: centered `<picture>` dark/light header → badges → ` · `-separated na
 
 `# Architecture` orientation (1–2 sentences, point at `STRUCTURE.md` and `AGENTS.md`) → `## Bird's-Eye Overview` → `## Codemap` (symbol → file table, sourced from `AGENTS.md`'s CODE MAP + the per-package `AGENTS.md` files) → `## Invariants` (numbered, CI-enforced: 4-layer import rule, committed `dist/`, strict booleans, functions-only, one-comment response protocol) → `## Data Flow` (three trigger-keyed ASCII trees: action, gateway mention-loop, harness release) → `## Cross-Cutting Concerns` (redaction gate, NormalizedEvent, OIDC trusted-publishing, S3 conditional-write lock, egress topology). Cross-link the matching `docs/wiki/` deep-dive page from each major section.
 
-**Size budget: about 50 KB.** The sections before `## Cross-Cutting Concerns` take roughly 32 KB; Cross-Cutting gets the rest. If an edit would push the file past the budget, move detail to the wiki instead of growing the doc.
+**Size budget: about 40 KB.** The sections before `## Cross-Cutting Concerns` take roughly 20 KB; Cross-Cutting gets the rest. Codemap rows carry one short role phrase; Data Flow trees stay at phase level. Full row text and annotated trees live in the wiki (`Architecture Overview` and `Execution Lifecycle`). If an edit would push the file past the budget, move detail to the wiki instead of growing the doc.
 
 **Cross-Cutting Concerns subsection format.** One `### <Mechanism> (<Surface>)` heading per mechanism; keep existing headings stable because code and docs link to their anchors. Each body is 3–10 lines (about 1 KB at most):
 
