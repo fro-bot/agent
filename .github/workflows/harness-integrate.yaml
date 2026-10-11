@@ -118,6 +118,26 @@ jobs:
       - name: Create the integration workdir
         run: mkdir -p "${{ runner.temp }}/harness-integrate-work"
 
+      # Trusted inline no-post mint. MUST stay a plain run: step invoking the
+      # checked-in script — never a marketplace action with a post: hook (the
+      # runner re-supplies INPUT_* — including the private key — during the
+      # post phase, and a prompt-injected earlier step can tamper the on-disk
+      # post script; see docs/plans/2026-07-11-002-feat-inline-app-token-mint-integrate-plan.md).
+      # This mint runs BEFORE Run Fro Bot so the App private key is never present
+      # on the runner after agent-influenced code runs: no step after the agent
+      # receives APPLICATION_ID or APPLICATION_PRIVATE_KEY. The App secrets are
+      # mapped to THIS step's env only — never job-level. The minted token
+      # reaches the trusted push step only as the masked step output
+      # steps.mint-app-token.outputs.github-token — never GITHUB_ENV or job env.
+      # Its 1-hour lifetime covers the agent run; observed integrate jobs
+      # complete in 5–20 minutes.
+      - name: Mint scoped App token for trusted finalization
+        id: mint-app-token
+        run: node --experimental-strip-types scripts/harness/mint-app-token.ts
+        env:
+          APPLICATION_ID: ${{ secrets.APPLICATION_ID }}
+          APPLICATION_PRIVATE_KEY: ${{ secrets.APPLICATION_PRIVATE_KEY }}
+
       # SYNC: keep the shared merge inputs in step with fro-bot.yaml's Run Fro Bot step
       - name: Run Fro Bot
         uses: ./
@@ -141,19 +161,6 @@ jobs:
           output-mode: working-dir
           opencode-config: ${{ secrets.OPENCODE_CONFIG }}
           timeout: '0'
-
-      # Trusted inline no-post mint. MUST stay a plain run: step invoking the
-      # checked-in script — never a marketplace action with a post: hook (the
-      # runner re-supplies INPUT_* — including the private key — during the
-      # post phase, and a prompt-injected earlier step can tamper the on-disk
-      # post script; see docs/plans/2026-07-11-002-feat-inline-app-token-mint-integrate-plan.md).
-      # The App secrets are mapped to THIS step's env only — never job-level.
-      - name: Mint scoped App token for trusted finalization
-        id: mint-app-token
-        run: node --experimental-strip-types scripts/harness/mint-app-token.ts
-        env:
-          APPLICATION_ID: ${{ secrets.APPLICATION_ID }}
-          APPLICATION_PRIVATE_KEY: ${{ secrets.APPLICATION_PRIVATE_KEY }}
 
       - name: Freeze, build, validate, and push candidate
         id: trusted-integrate
