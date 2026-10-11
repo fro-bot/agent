@@ -441,6 +441,47 @@ async function runAndCaptureMentionDeps(
   return capturedDeps
 }
 
+/** Runs the gateway program and returns the push-health status the operator server would report. */
+async function startAndReadPushHealth(options: {
+  readonly push: boolean
+  readonly selfTest?: 'pass' | 'fail' | 'throw'
+}): Promise<string | undefined> {
+  if (options.selfTest === 'pass') {
+    selfTestCasMock.mockResolvedValueOnce({success: true, data: undefined})
+  } else if (options.selfTest === 'fail') {
+    selfTestCasMock.mockResolvedValueOnce({
+      success: false,
+      error: Object.assign(new Error('cas contended-write self-test failed'), {
+        code: 'OPERATOR_PUSH_SELF_TEST_CAS_FAILURE' as const,
+      }),
+    })
+  } else if (options.selfTest === 'throw') {
+    selfTestCasMock.mockRejectedValueOnce(new Error('adapter connection refused'))
+  }
+  const fakeConfig = makeFakeConfig({
+    announce: undefined,
+    operatorWeb: makeOperatorWebConfig(),
+    ...(options.push ? {operatorPush: makeOperatorPushConfig()} : {}),
+  })
+  const startOperatorServerSpy = vi.fn().mockReturnValue(makeFakeServerHandle())
+  const deps = {
+    makeClient: () => makeFakeClient() as unknown as import('discord.js').Client,
+    setupReadinessFlag: vi.fn(),
+    login: vi.fn().mockResolvedValue(undefined),
+    startAnnounceServer: vi.fn(),
+    startOperatorServer: startOperatorServerSpy,
+    runProviderSelfTest: vi.fn(async () => {}),
+  }
+
+  await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+  const [serverDeps] = startOperatorServerSpy.mock.calls[0] as [
+    import('./web/server.js').OperatorServerDeps,
+    import('./web/server.js').OperatorServerConfig,
+  ]
+  return serverDeps.operatorPushHealth?.()
+}
+
 describe('makeGatewayProgram', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -1488,6 +1529,40 @@ describe('button interaction handler (approval flow)', () => {
       import('./web/server.js').OperatorServerConfig,
     ]
     expect(serverDeps.operatorPushStore).toBeUndefined()
+  })
+
+  describe('operator push health (startup gate)', () => {
+    it('reports disabled (so the session field is omitted) when push is not configured', async () => {
+      // #when
+      const status = await startAndReadPushHealth({push: false})
+
+      // #then
+      expect(status).toBe('disabled')
+    })
+
+    it('reports ready when the startup CAS self-test passes', async () => {
+      // #when
+      const status = await startAndReadPushHealth({push: true, selfTest: 'pass'})
+
+      // #then
+      expect(status).toBe('ready')
+    })
+
+    it('reports degraded when the startup CAS self-test fails, even though push routes are not mounted', async () => {
+      // #when
+      const status = await startAndReadPushHealth({push: true, selfTest: 'fail'})
+
+      // #then
+      expect(status).toBe('degraded')
+    })
+
+    it('reports degraded when the startup CAS self-test throws', async () => {
+      // #when
+      const status = await startAndReadPushHealth({push: true, selfTest: 'throw'})
+
+      // #then
+      expect(status).toBe('degraded')
+    })
   })
 
   it('operator push absent from config: push omitted, self-test never called', async () => {

@@ -704,3 +704,42 @@ describe('parseOperatorPushUnsubscribeRequest — error paths', () => {
     expect(parseOperatorPushUnsubscribeRequest({endpoint: ''}).success).toBe(false)
   })
 })
+
+// ---------------------------------------------------------------------------
+// parseOperatorSessionInfo — optional push health
+// ---------------------------------------------------------------------------
+
+describe('parseOperatorSessionInfo — optional push health', () => {
+  const base = {operatorId: 1, login: 'octocat', expiresAt: 1_000}
+
+  it('accepts a session without push (push unconfigured)', () => {
+    // #when
+    const result = parseOperatorSessionInfo(base)
+
+    // #then
+    expect(result.success).toBe(true)
+  })
+
+  it.each(['ready', 'degraded', 'unknown'])('accepts push.status %s', status => {
+    // #when
+    const result = parseOperatorSessionInfo({...base, push: {status}})
+
+    // #then
+    expect(result.success).toBe(true)
+  })
+
+  it.each([
+    ['disabled status (never on the wire)', {status: 'disabled'}],
+    ['unknown status string', {status: 'healthy'}],
+    ['missing status', {}],
+    ['non-object push', 'ready'],
+    ['array push', ['ready']],
+    ['null push', null],
+  ])('rejects a malformed push field: %s', (_label, push) => {
+    // #when
+    const result = parseOperatorSessionInfo({...base, push})
+
+    // #then
+    expect(result.success).toBe(false)
+  })
+})

@@ -23,6 +23,7 @@
 
 import type {Hono} from 'hono'
 import type {OperatorSessionInfo} from '../../operator-contract/responses.js'
+import type {PushHealthStatus} from '../operator-push/push-health.js'
 import type {BrowserGuardDeps} from './csrf.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
 import {SESSION_ABSOLUTE_TTL_MS, SESSION_IDLE_TTL_MS} from './session.js'
@@ -42,8 +43,10 @@ import {SESSION_ABSOLUTE_TTL_MS, SESSION_IDLE_TTL_MS} from './session.js'
  *   - operatorId: stable GitHub numeric user ID
  *   - login: GitHub display login (mutable, for display only)
  *   - expiresAt: ms-since-epoch timestamp of the sooner of absolute or idle expiry
+ *   - push (optional): `{status}` coarse push health, present only when `getPushHealth`
+ *     is supplied and push is configured. Reading it is a pure in-memory derivation.
  */
-export function buildSessionInfoRoute(app: Hono, deps: BrowserGuardDeps): void {
+export function buildSessionInfoRoute(app: Hono, deps: BrowserGuardDeps, getPushHealth?: () => PushHealthStatus): void {
   registerOperatorRoute(app, 'GET', '/operator/session', c => {
     // The browser guard has already run (via the privileged-route guard seam).
     // Read the authenticated context stored by the guard wrapper.
@@ -79,10 +82,14 @@ export function buildSessionInfoRoute(app: Hono, deps: BrowserGuardDeps): void {
     // serve a cached response to a different origin or fetch context.
     c.header('Vary', 'Origin, Sec-Fetch-Site, Sec-Fetch-Mode, Sec-Fetch-Dest')
 
+    // Push health is authenticated-only (this route is privileged) and omitted
+    // entirely when push is unconfigured, so those responses are unchanged.
+    const pushStatus = getPushHealth?.()
     const responseBody: OperatorSessionInfo = {
       operatorId: entry.githubUserId,
       login: entry.login,
       expiresAt,
+      ...(pushStatus === undefined || pushStatus === 'disabled' ? {} : {push: {status: pushStatus}}),
     }
 
     return c.json(responseBody, 200)

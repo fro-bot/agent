@@ -14,6 +14,7 @@ import type {OperatorAllowlist} from './web/auth/allowlist.js'
 import type {OperatorIngressPolicy} from './web/ingress/policy.js'
 import type {IngressRejection, ResolvedClientAddress} from './web/ingress/resolve-client.js'
 import type {PushDispatcher} from './web/operator-push/dispatcher.js'
+import type {PushHealthStatus} from './web/operator-push/push-health.js'
 import type {OperatorPushSubscriptionStore} from './web/operator-push/subscription-store.js'
 import type {VapidPublicKeyInfo} from './web/operator-push/vapid.js'
 import type {OperatorServerConfig, OperatorServerDeps} from './web/server.js'
@@ -64,6 +65,8 @@ import {extractRawIngressInput} from './web/ingress/hono-context.js'
 import {resolveClient} from './web/ingress/resolve-client.js'
 import {createDedupeCache} from './web/operator-push/dedupe-cache.js'
 import {createPushDispatcher} from './web/operator-push/dispatcher.js'
+import {observePushStoreHealth} from './web/operator-push/push-health-store.js'
+import {createPushHealthTracker} from './web/operator-push/push-health.js'
 import {createPushSender} from './web/operator-push/push-sender.js'
 import {createOperatorPushSubscriptionStore} from './web/operator-push/subscription-store.js'
 import {shouldNotify} from './web/operator-push/trigger-policy.js'
@@ -199,6 +202,12 @@ export interface BuildOperatorServerInputs {
     readonly vapidPublicKeyInfo: VapidPublicKeyInfo
   }
   /**
+   * Passive push-health reader, supplied whenever push is configured — including
+   * when the startup self-test failed and `operatorPush` is therefore absent.
+   * Surfaces on the authenticated session response only.
+   */
+  readonly operatorPushHealth?: () => PushHealthStatus
+  /**
    * Operator push session-revoke hook — opt-in, present only when push is
    * enabled. Registered onto every session minted through the OAuth
    * callback so a subsequent logout (or TTL expiry) deactivates that
@@ -261,6 +270,7 @@ export function buildOperatorServerInputs(inputs: BuildOperatorServerInputs): {
     launchWorkDeps,
     dispatchWorkflow,
     operatorPush,
+    operatorPushHealth,
     onSessionRevoke,
     operatorWebConfig,
   } = inputs
@@ -338,6 +348,7 @@ export function buildOperatorServerInputs(inputs: BuildOperatorServerInputs): {
     // caller passed operatorPush (push enabled + self-test passed upstream).
     operatorPushStore: operatorPush?.store,
     operatorPushVapidKeyInfo: operatorPush?.vapidPublicKeyInfo,
+    operatorPushHealth,
   }
 
   const config: OperatorServerConfig = {
@@ -864,6 +875,11 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       // crash gateway startup — it only disables the push surface (the rest of
       // the operator server still starts) so a misconfigured/incompatible object
       // store can never silently corrupt subscription ownership transfers.
+      // Passive push-health tracker, created BEFORE the startup gate so a
+      // self-test failure/throw is reportable (the dispatcher and routes only
+      // exist after a pass). In-memory only; read on the authenticated session
+      // response. Stays `disabled` (field omitted) when push is not configured.
+      const pushHealth = createPushHealthTracker({clock: () => Date.now()})
       let operatorPush:
         | {
             readonly store: OperatorPushSubscriptionStore
@@ -873,6 +889,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       if (config.operatorPush === undefined) {
         emitAudit({kind: 'push.disabled', correlationId: 'startup', reason: 'config_absent'}, logger)
       } else {
+        pushHealth.markConfigured()
         const pushStore = createOperatorPushSubscriptionStore({
           adapter: s3Adapter,
           logger,
@@ -887,7 +904,11 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           catch: error => (error instanceof Error ? error : new Error(String(error))),
         }).pipe(Effect.catchAll(error => Effect.succeed(err(error))))
         if (selfTest.success === true) {
-          operatorPush = {store: pushStore, vapidPublicKeyInfo: config.operatorPush.vapidPublicKeyInfo}
+          pushHealth.recordStartup('passed')
+          // Every route and dispatcher store call goes through the observed
+          // store so backend outcomes feed the tracker at the I/O boundary.
+          const observedStore = observePushStoreHealth(pushStore, pushHealth)
+          operatorPush = {store: observedStore, vapidPublicKeyInfo: config.operatorPush.vapidPublicKeyInfo}
 
           // Construct the push sender + broadcast dispatcher now that the store
           // has passed its CAS self-test. Assigning the module-scoped
@@ -897,7 +918,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           // alike, since both share runEngineDeps.
           const pushSender = createPushSender({logger})
           operatorPushDispatcher = createPushDispatcher({
-            store: pushStore,
+            store: observedStore,
             sender: pushSender,
             dedupeCache: createDedupeCache({windowMs: config.operatorPush.dedupeWindowMs, clock: () => Date.now()}),
             triggerPolicy: {shouldNotify},
@@ -912,8 +933,10 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
             },
             logger,
             auditLogger: logger,
+            pushHealth,
           })
         } else {
+          pushHealth.recordStartup('failed')
           logger.warn({err: selfTest.error.message}, 'operator push disabled — object store failed CAS self-test')
           emitAudit({kind: 'push.disabled', correlationId: 'startup', reason: 'self_test_failed'}, logger)
         }
@@ -947,6 +970,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
         launchWorkDeps: runEngineDeps,
         dispatchWorkflow,
         operatorPush,
+        operatorPushHealth: pushHealth.getStatus,
         // Session revoke → operator push deactivation. Only registered when
         // push is enabled (operatorPush is present here iff the self-test
         // above succeeded). Fail-soft: a throwing deactivateForOperator must

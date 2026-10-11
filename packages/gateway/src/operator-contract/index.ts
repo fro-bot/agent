@@ -70,6 +70,8 @@ export type {
   OperatorCsrfToken,
   OperatorError,
   OperatorOk,
+  OperatorPushHealth,
+  OperatorPushHealthStatus,
   OperatorPushInactiveReason,
   OperatorPushSubscribeRequest,
   OperatorPushSubscriptionListResponse,
@@ -79,6 +81,7 @@ export type {
   OperatorPushVapidKeyResponse,
   OperatorSessionInfo,
 } from './responses.js'
+export {OPERATOR_PUSH_HEALTH_STATUSES} from './responses.js'
 export type {
   OperatorFailureKind,
   OperatorRunStatus,

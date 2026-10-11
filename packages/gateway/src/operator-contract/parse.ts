@@ -28,10 +28,20 @@ import type {
 } from './responses.js'
 
 import {err, ok} from '@fro-bot/runtime'
+import {OPERATOR_PUSH_HEALTH_STATUSES} from './responses.js'
 
 // ---------------------------------------------------------------------------
 // OperatorSessionInfo
 // ---------------------------------------------------------------------------
+
+function hasValidOperatorPushHealthShape(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false
+  }
+
+  const status = (value as Record<string, unknown>).status
+  return typeof status === 'string' && (OPERATOR_PUSH_HEALTH_STATUSES as readonly string[]).includes(status)
+}
 
 function hasValidOperatorSessionInfoShape(value: unknown): value is OperatorSessionInfo {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -44,7 +54,8 @@ function hasValidOperatorSessionInfoShape(value: unknown): value is OperatorSess
     Number.isInteger(candidate.operatorId) &&
     typeof candidate.login === 'string' &&
     typeof candidate.expiresAt === 'number' &&
-    Number.isFinite(candidate.expiresAt)
+    Number.isFinite(candidate.expiresAt) &&
+    (candidate.push === undefined || hasValidOperatorPushHealthShape(candidate.push))
   )
 }
 

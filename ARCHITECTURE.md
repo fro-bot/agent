@@ -106,6 +106,7 @@ Symbols verified against the live source tree. Where a symbol has moved to `pack
 | `OPERATOR_CONTRACT_VERSION` | Constant | `packages/gateway/src/operator-contract/version.ts` | Build-time-pinned operator contract version (`1.10.0`) |
 | `resolveClient` | Function | `packages/gateway/src/web/ingress/resolve-client.ts` | Trusted-proxy-aware client-address resolution for the operator-surface accounting keys (health, OAuth start/callback, and guarded-logout rate limits; the OAuth attempt cap) and the exact OAuth binding; returns a branded `ResolvedClientAddress` or a closed `IngressRejection` — never a fallback key |
 | `parseCanonicalAddress` | Function | `packages/gateway/src/web/ingress/canonical-address.ts` | Single strict IPv4/IPv6 parser shared by socket, X-Forwarded-For, and configured-peer parsing |
+| `createPushHealthTracker` / `observePushStoreHealth` | Function | `packages/gateway/src/web/operator-push/{push-health,push-health-store}.ts` | Passive in-memory operator push health (`disabled \| ready \| degraded \| unknown`, 1-hour staleness), fed only by existing store and dispatch operations; surfaced as the optional `push: {status}` on the authenticated `GET /operator/session` and nowhere else. `ready` is observed readiness, not guaranteed delivery |
 
 ## Invariants
 

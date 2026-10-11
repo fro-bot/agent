@@ -43,6 +43,8 @@ sources:
   - packages/gateway/src/web/operator-push/subscription-route.ts
   - packages/gateway/src/web/operator-push/subscription-store.ts
   - packages/gateway/src/web/operator-push/dispatcher.ts
+  - packages/gateway/src/web/operator-push/push-health.ts
+  - packages/gateway/src/web/operator-push/push-health-store.ts
   - packages/gateway/src/web/operator-push/trigger-policy.ts
   - packages/gateway/src/web/operator-push/vapid.ts
   - packages/gateway/src/web/operator-push/vapid-public-key-route.ts
@@ -110,7 +112,7 @@ The privileged surface currently exposes:
 - `GET /operator/runs/:runId/questions` — list the run's currently-open agent-question requests (read-level repository authorization).
 - `POST /operator/runs/:runId/questions/:requestId/decision` — answer or skip one agent-question request (write-level repository authorization). See [Answering Agent Questions](#answering-agent-questions).
 - `GET /operator/repos` — list the repositories the operator is authorized to launch against.
-- `GET /operator/session` and `GET /operator/session/csrf` — current session info and a fresh CSRF token.
+- `GET /operator/session` and `GET /operator/session/csrf` — current session info (with an optional coarse `push` health field — see [Push health](#push-health)) and a fresh CSRF token.
 - `POST /operator/auth/logout` — end the session.
 
 The unauthenticated set is just the health check and the two OAuth endpoints (`GET /operator/auth/github/start`, `GET /operator/auth/github/callback`).
@@ -252,6 +254,20 @@ The surface exposes four authenticated operator routes (`web/operator-push/`):
 **Dispatch and deduplication.** Only three lifecycle events fan out a push: a run entering the approval-pending state, a run registering an agent question, and a run reaching the `FAILED` phase. Neither successful completion nor an operator logout sends a notification (logout instead _deactivates_ that operator's subscriptions). The dispatcher (`web/operator-push/dispatcher.ts`) coalesces bursts through a bounded in-memory dedupe cache (`dedupe-cache.ts`, default five-minute window keyed by the run/approval id and event kind; one question nudge per run covers every question the run asks within the window), so a flurry of retries on one run does not spam every browser. Each broadcast records a single coarse `push.dispatch` audit entry carrying only delivered/dead/failed counts. When the push relay reports an endpoint is gone (HTTP 410/404), the dispatcher deactivates that subscription in place rather than retrying it.
 
 **SSRF defense in depth.** Because a subscription endpoint is an attacker-influenceable URL that the gateway later makes an outbound request to, the surface guards it twice. A _parse-time_ check (`validate-endpoint.ts`, sharing IP classification with `ip-classification.ts`) rejects the endpoint as written at subscribe time — non-HTTPS schemes, loopback and private/link-local literals, and bare dotless hostnames are refused before a record is ever stored. A second _connect-time_ guard in the sender (`push-sender.ts`) closes the DNS-rebinding gap: it resolves the endpoint host itself, classifies every candidate address, and refuses to open the socket if any resolves into an internal range — so a hostname that passed validation but now points at a private IP still cannot reach the internal network. Endpoint URLs and key material are never logged; only coarse rejection-reason enums surface.
+
+### Push health
+
+Push is wired only after the startup CAS self-test passes, so a failure after boot (or at boot) would otherwise be invisible: the routes stay mounted and the public health route cannot tell. The authenticated `GET /operator/session` response therefore carries an optional `push: {status}` field, where `status` is `ready`, `degraded`, or `unknown`. The field is **omitted entirely when push is not configured**, so those responses are unchanged, and `disabled` never appears on the wire. The public `GET /operator/health` is unchanged (`{ok, contractVersion}`), as are the ingress pipeline, rate-limit accounting keys, and the route inventory. The field is an additive, optional member of the operator contract (`OperatorSessionInfo.push`).
+
+**Semantics.** The status is derived from a passive, in-memory tracker (`web/operator-push/push-health.ts`) that is created before the startup gate, seeded with the self-test result, and updated only from store and dispatch operations that already happen. There is no polling, no persisted history, and no I/O when the status is read.
+
+- `ready` means the subsystem was **observed ready** recently. It is **not a guarantee of delivery**: a relay "accepted" is not proof that a browser received the notification.
+- `degraded` means the startup self-test failed or threw (held until restart), or the most recent fresh observation of the store backend or relay delivery failed.
+- `unknown` means push is configured but nothing fresh has been observed — startup is pending, or every observation is older than one hour. Stale never means "still healthy".
+
+Store reads, store writes, and relay delivery are tracked as separate components, each keeping only its latest outcome. A successful read therefore cannot clear a failed write or a relay failure, and there is no sticky "ever failed" flag: a later successful observation of the same component clears its failure. Backend observations are recorded at the store boundary (`push-health-store.ts`); an ownership denial is a policy outcome, not a backend failure, and is never recorded. A failed dead-subscription cleanup (`markDead`) is recorded as a backend write failure. Any relay failure in a broadcast degrades; a broadcast with at least one accepted send and no failures can clear it. Broadcasts that send nothing — no subscriptions, deduped, or every record skipped as stale-key — establish neither success nor failure.
+
+**Exposure.** Only the coarse status leaves the process, and only to an authenticated, allowlisted operator: no counts (not even zero or nonzero), timestamps, endpoints, hashes, ids, trigger kinds, error text, or VAPID material.
 
 ### VAPID key rotation and leak response
 

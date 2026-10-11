@@ -12,6 +12,7 @@
  * Mirrors the structure of csrf-route tests and session.test.ts.
  */
 
+import type {PushHealthStatus} from '../operator-push/push-health.js'
 import type {BrowserGuardDeps} from './csrf.js'
 import type {SessionEntry, SessionStore} from './session.js'
 
@@ -77,7 +78,12 @@ function makeStubBrowserGuardDeps(overrides?: Partial<BrowserGuardDeps>): Browse
  */
 function buildTestApp(
   deps: BrowserGuardDeps,
-  opts?: {guardInstalled?: boolean; sessionId?: string; githubUserId?: number},
+  opts?: {
+    guardInstalled?: boolean
+    sessionId?: string
+    githubUserId?: number
+    getPushHealth?: () => PushHealthStatus
+  },
 ): Hono {
   const app = new Hono()
   const guardInstalled = opts?.guardInstalled !== false
@@ -90,7 +96,7 @@ function buildTestApp(
     })
   }
 
-  buildSessionInfoRoute(app, deps)
+  buildSessionInfoRoute(app, deps, opts?.getPushHealth)
   return app
 }
 
@@ -401,5 +407,94 @@ describe('buildSessionInfoRoute — integration: real guard touch updates expire
     // The key assertion: expiresAt reflects the guard-refreshed lastAccessedAt (= nowMs),
     // not the original issuedAt-based lastAccessedAt that was set at session creation.
     expect(body.expiresAt).toBe(expectedIdleExpiry)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Push health (authenticated-only, optional)
+// ---------------------------------------------------------------------------
+
+describe('buildSessionInfoRoute — push health', () => {
+  const nowMs = 1_000_000
+  const entry: SessionEntry = {
+    githubUserId: 42,
+    login: 'octocat',
+    issuedAt: nowMs - 1000,
+    lastAccessedAt: nowMs - 500,
+    revoked: false,
+  }
+
+  async function fetchSession(getPushHealth?: () => PushHealthStatus): Promise<Record<string, unknown>> {
+    const deps = makeStubBrowserGuardDeps({sessionStore: makeStubSessionStore(entry), clock: () => nowMs})
+    const app = buildTestApp(deps, {githubUserId: 42, getPushHealth})
+    const res = await app.fetch(new Request('http://localhost/operator/session', {method: 'GET'}))
+    expect(res.status).toBe(200)
+    return (await res.json()) as Record<string, unknown>
+  }
+
+  it.each(['ready', 'degraded', 'unknown'] as const)(
+    'includes exactly {status: %s} and nothing else under push',
+    async status => {
+      // #given push is configured and reports a status
+      // #when
+      const body = await fetchSession(() => status)
+
+      // #then the allowlist: only push.status, no counts/timestamps/ids
+      expect(Object.keys(body).sort()).toEqual(['expiresAt', 'login', 'operatorId', 'push'])
+      expect(body.push).toEqual({status})
+      expect(Object.keys(body.push as object)).toEqual(['status'])
+    },
+  )
+
+  it('omits push entirely when no push health reader is supplied (push unconfigured)', async () => {
+    // #when
+    const body = await fetchSession(undefined)
+
+    // #then the response is byte-identical to the pre-push shape
+    expect(Object.keys(body).sort()).toEqual(['expiresAt', 'login', 'operatorId'])
+    expect('push' in body).toBe(false)
+  })
+
+  it('omits push when the tracker reports disabled', async () => {
+    // #when
+    const body = await fetchSession(() => 'disabled')
+
+    // #then
+    expect('push' in body).toBe(false)
+  })
+
+  it('reads the status per request (not cached at registration)', async () => {
+    // #given a status that changes between requests
+    let status: PushHealthStatus = 'ready'
+    const deps = makeStubBrowserGuardDeps({sessionStore: makeStubSessionStore(entry), clock: () => nowMs})
+    const app = buildTestApp(deps, {githubUserId: 42, getPushHealth: () => status})
+
+    // #when
+    const first = (await (await app.fetch(new Request('http://localhost/operator/session'))).json()) as {
+      push?: {status: string}
+    }
+    status = 'degraded'
+    const second = (await (await app.fetch(new Request('http://localhost/operator/session'))).json()) as {
+      push?: {status: string}
+    }
+
+    // #then
+    expect(first.push?.status).toBe('ready')
+    expect(second.push?.status).toBe('degraded')
+  })
+
+  it('does not consult the push health reader on the unauthenticated 401 path', async () => {
+    // #given an expired/missing session entry
+    const getPushHealth = vi.fn((): PushHealthStatus => 'degraded')
+    const deps = makeStubBrowserGuardDeps({sessionStore: makeStubSessionStore(undefined), clock: () => nowMs})
+    const app = buildTestApp(deps, {getPushHealth})
+
+    // #when
+    const res = await app.fetch(new Request('http://localhost/operator/session'))
+
+    // #then
+    expect(res.status).toBe(401)
+    expect(await res.json()).toEqual({error: 'unauthorized'})
+    expect(getPushHealth).not.toHaveBeenCalled()
   })
 })

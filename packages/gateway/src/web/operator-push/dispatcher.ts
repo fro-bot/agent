@@ -40,6 +40,7 @@ import type {OperatorPushTriggerKind} from '../../operator-contract/responses.js
 import type {OperatorFailureKind} from '../../operator-contract/run-status.js'
 import type {AuditLogger} from '../audit.js'
 import type {DedupeCache} from './dedupe-cache.js'
+import type {PushHealthTracker} from './push-health.js'
 import type {PushSender} from './push-sender.js'
 import type {OperatorPushSubscriptionStore, SubscriptionRecord} from './subscription-store.js'
 import type {TriggerDecision} from './trigger-policy.js'
@@ -76,6 +77,12 @@ export interface CreatePushDispatcherDeps {
   readonly logger: DispatcherLogger
   /** Audit logger — one coarse push.dispatch summary event is emitted per broadcast. */
   readonly auditLogger: AuditLogger
+  /**
+   * Optional passive health sink. Receives one relay observation per broadcast
+   * that actually attempted delivery. Backend (store) observations are NOT
+   * recorded here — they come from the observed store at the I/O boundary.
+   */
+  readonly pushHealth?: Pick<PushHealthTracker, 'recordRelay'>
 }
 
 export interface PushDispatcher {
@@ -89,7 +96,7 @@ export interface PushDispatcher {
 }
 
 export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispatcher {
-  const {store, sender, dedupeCache, triggerPolicy, vapidConfig, logger, auditLogger} = deps
+  const {store, sender, dedupeCache, triggerPolicy, vapidConfig, logger, auditLogger, pushHealth} = deps
 
   async function broadcast(kind: OperatorPushTriggerKind, dedupeId: string, payload: string): Promise<void> {
     const dedupeKey = `${dedupeId}:${kind}`
@@ -165,6 +172,15 @@ export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispat
     // this point, so a zero-count event can only mean "all subscribers were
     // skipped".
     emitAudit({kind: 'push.dispatch', correlationId: dedupeId, trigger: kind, delivered, dead, failed}, auditLogger)
+
+    // Relay health: any relay failure degrades; a broadcast with at least one
+    // accepted send and no failures can clear it. A broadcast that delivered
+    // nothing (all dead, or all skipped as stale-key) establishes neither.
+    if (failed > 0) {
+      pushHealth?.recordRelay('failed')
+    } else if (delivered > 0) {
+      pushHealth?.recordRelay('ok')
+    }
   }
 
   async function dispatchToRecord(

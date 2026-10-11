@@ -302,6 +302,51 @@ describe('GET /operator/health — happy path', () => {
   })
 })
 
+describe('GET /operator/health — push health stays off the public surface', () => {
+  it('returns the unchanged {ok, contractVersion} body even when push health is degraded', async () => {
+    // #given a push health reader reporting degraded
+    const port = await findFreePort()
+    const server = createOperatorServer(
+      {...makeStubDeps(), operatorPushHealth: () => 'degraded'},
+      makeStubConfig({bindPort: port}),
+    )
+
+    try {
+      // #when an anonymous caller hits the public health route
+      const res = await fetch(`http://127.0.0.1:${port}/operator/health`)
+      const text = await res.text()
+
+      // #then no push field and no byte of push state leaks
+      expect(res.status).toBe(200)
+      expect(JSON.parse(text)).toEqual({ok: true, contractVersion: OPERATOR_CONTRACT_VERSION})
+      expect(text).not.toContain('push')
+      expect(text).not.toContain('degraded')
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it('does not change the route inventory when a push health reader is supplied', () => {
+    // #given
+    const app = buildOperatorApp({...makeStubDeps(), operatorPushHealth: () => 'ready'}, makeStubConfig())
+
+    // #when
+    const seen = new Set<string>()
+    const routes = app.routes
+      .map((route: RouteEntry) => ({method: route.method, path: route.path}))
+      .filter((route: RouteEntry) => {
+        if (route.method === 'ALL' && route.path === '/*') return false
+        const key = `${route.method}:${route.path}`
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+
+    // #then
+    expect(routes).toEqual([{method: 'GET', path: '/operator/health'}])
+  })
+})
+
 // ---------------------------------------------------------------------------
 // Shutdown — operator server closes cleanly
 // ---------------------------------------------------------------------------
