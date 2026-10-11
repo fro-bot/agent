@@ -26,7 +26,7 @@ tags:
 
 ## Context
 
-The `harness-integrate` path runs a prompt-injectable merge step that needs `git push` authority to land its result. The previous credential was `FRO_BOT_PAT`, a durable, broadly-scoped personal access token reaching that untrusted step. Issue #1126 (PRs #1179, #1182) replaces it with a GitHub App installation token minted inline, inside the same job, scoped to exactly `contents: write` on exactly the target repository, with a roughly one-hour TTL.
+The `harness-integrate` path runs a prompt-injectable merge step; a separate trusted step pushes its result. The previous credential was `FRO_BOT_PAT`, a durable, broadly-scoped personal access token reaching that untrusted step. Issue #1126 (PRs #1179, #1182) replaces it with a GitHub App installation token minted inline, inside the same job and before the model step, scoped to exactly `contents: write` on exactly the target repository, with a roughly one-hour TTL. The model step gets only the read-only workflow token; the scoped App token is consumed by the trusted-integrate push step via a masked step output.
 
 This sits on the credential-minimization ladder: scrub copies of a credential from the environment (hygiene) → mint a short-lived, narrowly-scoped token per run (minimization) → remove the credential from the untrusted step entirely when its only use is posting a result (removal — see `docs/solutions/best-practices/response-file-is-untrusted-input-2026-07-11.md`). Inline minting is the middle rung: for use when the untrusted step genuinely needs creation/push agency, not just the ability to report a result.
 
@@ -46,7 +46,7 @@ Reference implementation: `scripts/harness/mint-app-token.ts`, covered by 36 uni
 
 ## Why This Matters
 
-A durable PAT reaching a prompt-injectable step is a standing liability: if that step is compromised or manipulated, the blast radius is whatever the PAT can do, for as long as it's valid — which in practice is indefinitely. A minted token bounds both dimensions: scope (exactly `contents: write` on one repository) and lifetime (~1 hour). The residual risk is real but smaller and clearly named: the minted token bounds what the untrusted step holds, but the App **key** used to mint it still carries the App's full installed scope — the key itself is not in the untrusted step's blast radius under this design, but a dedicated, minimally-scoped App (rather than reusing a broader existing App) is the natural follow-up (tracked as issue #1180).
+A durable PAT reaching a prompt-injectable step is a standing liability: if that step is compromised or manipulated, the blast radius is whatever the PAT can do, for as long as it's valid — which in practice is indefinitely. A minted token bounds both dimensions: scope (exactly `contents: write` on one repository) and lifetime (~1 hour). The residual risk is real but smaller and clearly named: the minted token is never handed to the untrusted step, but the App **key** used to mint it still carries the App's full installed scope — the key is used before the model step and no later step receives it, but a dedicated, minimally-scoped App (rather than reusing a broader existing App) is the natural follow-up (tracked as issue #1180).
 
 ## When to Apply
 

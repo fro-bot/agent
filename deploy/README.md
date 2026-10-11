@@ -361,7 +361,7 @@ All privileged operator endpoints are under `/operator/` and require a valid ses
 | `POST` | `/operator/runs/:runId/questions/:requestId/decision` | Session + CSRF + repo write/admin | Answer or skip an agent question (`{decision: 'skip'}` or `{decision: 'answer', answers}`; options by index, free text up to 4,000 characters; a refused body is `400 {error: 'bad request', reason, questionIndex}`) |
 | `GET` | `/operator/runs/:runId/questions` | Session | List pending agent-question requests for a run (repo-scoped read authz) |
 
-Operator contract: v1.9.0. Unauthorized, redacted, and unknown resources all return the same generic not-found response — no existence oracle.
+Operator contract: v1.10.0. Unauthorized, redacted, and unknown resources all return the same generic not-found response — no existence oracle.
 
 Sessions have an 8-hour absolute lifetime and a 30-minute idle timeout. The gateway restart clears all sessions (global logout).
 
@@ -458,7 +458,7 @@ Both images build on `node:<ver>-alpine3.24@sha256:…`, and the workspace runti
 
 #### Reuse guard (baked plugin + managed config)
 
-Gateway runs reject any `task` tool call that carries a non-empty `task_id` before the task executes (see "Background Subagent Ownership Ledger (Gateway)" in `ARCHITECTURE.md` for why). The workspace image bakes two root-owned, read-only files for this:
+Gateway runs reject any `task` tool call that carries a non-empty `task_id` before the task executes (see [Background Subagents and Ownership](../docs/wiki/Background%20Subagents%20and%20Ownership.md#background-subagent-ownership-ledger-gateway) for why). The workspace image bakes two root-owned, read-only files for this:
 
 - `/usr/local/lib/fro-bot/plugins/no-task-reuse.mjs` — an OpenCode server plugin (source: `deploy/plugins/no-task-reuse.mjs`) whose `tool.execute.before` hook throws a fixed error for `tool === 'task'` with a truthy `task_id`. The tool part ends in `error` with that message, the model sees it, and the turn continues.
 - `/etc/opencode/opencode.json` (source: `deploy/managed-config/opencode.json`) — OpenCode's Linux **managed config** layer. It is merged LAST (after the agent's own config, project config and `OPENCODE_CONFIG_CONTENT`) and plugin arrays are concatenated, so nothing written under `/home/opencode` or into a checkout can remove the entry. The OpenCode child's environment is built from a fixed allowlist, so `OPENCODE_PURE` and `OPENCODE_TEST_MANAGED_CONFIG_DIR` cannot reach it.
@@ -547,7 +547,7 @@ If an update or recovery subprocess's termination cannot be confirmed, the works
 
 ### Deploy coordination
 
-Operator contract **1.9.0** carries the agent-question frame and routes, the `waiting_for_question` run status, checked remote evidence on `checkoutProvenance`, and the optional `checkoutPreparation` field. **The `fro-bot/dashboard` contract pin must move to 1.9.0 at the same time this gateway version deploys** — the dashboard's SSE reader matches the contract version exactly and fails closed on a mismatch. Merging this change is safe on its own; deploying it to production alone, without the matching dashboard release, is not.
+Operator contract **1.10.0** exports the push trigger kinds (`OPERATOR_PUSH_TRIGGER_KINDS`); the authenticated session response may carry an optional `push: {status}` (`ready | degraded | unknown`), which consumers may ignore. It also carries (since 1.9.0) the agent-question frame and routes, the `waiting_for_question` run status, checked remote evidence on `checkoutProvenance`, and the optional `checkoutPreparation` field. **The `fro-bot/dashboard` contract pin must move to 1.10.0 at the same time this gateway version deploys** — the dashboard's SSE reader matches the contract version exactly and fails closed on a mismatch. Merging this change is safe on its own; deploying it to production alone, without the matching dashboard release, is not.
 
 The gateway and workspace images must roll together, for the same reason as the control-API bearer above: an older gateway does not send the bearer or request shapes a newer workspace expects, and vice versa.
 

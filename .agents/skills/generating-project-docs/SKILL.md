@@ -1,6 +1,6 @@
 ---
 name: generating-project-docs
-description: Use when creating, refreshing, or updating the project's living documentation — README.md, ARCHITECTURE.md, STRUCTURE.md, CONTRIBUTING.md, SECURITY.md, or a single section within one of them.
+description: Use before any edit to the project's living documentation — README.md, ARCHITECTURE.md, STRUCTURE.md, CONTRIBUTING.md, SECURITY.md — including creating or refreshing a doc, updating a single section, or adding or changing a section as part of a feature or fix PR.
 ---
 
 # Generating Project Docs
@@ -19,7 +19,7 @@ This project's **living** documentation is generated from live-repo facts and ke
 | `CONTRIBUTING.md` | Human contributors | Setup, commands, testing, commit/PR conventions |
 | `SECURITY.md` | Security reporters | Reporting channel, supported versions, OpenSSF |
 
-**Not owned here:** `AGENTS.md` (agent-operational knowledge base — hand-maintained; the living docs reference it and it references them, but this skill does not regenerate it), the `RFCs/` specs and `RFCS.md` index (referenced, not regenerated), the `docs/wiki/` Obsidian vault (long-form deep dives — the living docs cross-link *down* to it; this skill does not modify wiki content), and the 19 per-directory `AGENTS.md` files.
+**Not owned here:** `AGENTS.md` (agent-operational knowledge base — hand-maintained; the living docs reference it and it references them, but this skill does not regenerate it), the `RFCs/` specs and `RFCS.md` index (referenced, not regenerated), the `docs/wiki/` Obsidian vault (long-form deep dives — the living docs cross-link *down* to it; this skill does not regenerate wiki pages, but it adds an anchored section to an existing page when moving detail out of a living doc), and the 19 per-directory `AGENTS.md` files.
 
 ## Core Rules (Non-Negotiable)
 
@@ -34,7 +34,8 @@ This project's **living** documentation is generated from live-repo facts and ke
 3. **Preserve the existing doc's evolved structure on re-runs.** Update only what drifted. Do not replace a doc that has grown its own shape with a generic template.
 4. **Section-scoped updates replace only the target section.** Read the current doc, swap the named section, leave everything around it byte-for-byte.
 5. **No leakage.** No session IDs, agent/tool names, internal process, or planning taxonomy in any public doc.
-6. **Exclude non-source trees from any derivation.** Skip `node_modules/`, `dist/`, `.slim/` (cloned dep sources), `.context/`, `.sisyphus/`. Account for the `deploy/scripts/` carve-out (plain Node ESM `.mjs`, `node --test`, not a workspace package) when counting tests or source.
+6. **Living docs summarize; the wiki holds the detail.** A new or changed mechanism gets a short summary in the living doc plus a link to its `docs/wiki/` deep dive. Design rationale, incident history, per-path matrices, and symbol-level walkthroughs go in the wiki page (add an anchored section to the best-fitting existing page), never appended to a living doc.
+7. **Exclude non-source trees from any derivation.** Skip `node_modules/`, `dist/`, `.slim/` (cloned dep sources), `.context/`, `.sisyphus/`. Account for the `deploy/scripts/` carve-out (plain Node ESM `.mjs`, `node --test`, not a workspace package) when counting tests or source.
 
 ## This Repo's Shape (Read Before Generating)
 
@@ -59,6 +60,14 @@ Order: centered `<picture>` dark/light header → badges → ` · `-separated na
 ### ARCHITECTURE.md
 
 `# Architecture` orientation (1–2 sentences, point at `STRUCTURE.md` and `AGENTS.md`) → `## Bird's-Eye Overview` → `## Codemap` (symbol → file table, sourced from `AGENTS.md`'s CODE MAP + the per-package `AGENTS.md` files) → `## Invariants` (numbered, CI-enforced: 4-layer import rule, committed `dist/`, strict booleans, functions-only, one-comment response protocol) → `## Data Flow` (three trigger-keyed ASCII trees: action, gateway mention-loop, harness release) → `## Cross-Cutting Concerns` (redaction gate, NormalizedEvent, OIDC trusted-publishing, S3 conditional-write lock, egress topology). Cross-link the matching `docs/wiki/` deep-dive page from each major section.
+
+**Size budget: about 40 KB.** The sections before `## Cross-Cutting Concerns` take roughly 20 KB; Cross-Cutting gets the rest. Codemap rows carry one short role phrase; Data Flow trees stay at phase level. Full row text and annotated trees live in the wiki (`Architecture Overview` and `Execution Lifecycle`). If an edit would push the file past the budget, move detail to the wiki instead of growing the doc.
+
+**Cross-Cutting Concerns subsection format.** One `### <Mechanism> (<Surface>)` heading per mechanism; keep existing headings stable because code and docs link to their anchors. Each body is 3–10 lines (about 1 KB at most):
+
+1. One short paragraph: what the mechanism is and where it lives (files, symbols).
+2. A few bullets: the invariants a contributor must not break.
+3. A closing `> See also: [<Wiki Page>](docs/wiki/<Page%20Name>.md#<anchor>)` link to the deep dive.
 
 ### STRUCTURE.md
 

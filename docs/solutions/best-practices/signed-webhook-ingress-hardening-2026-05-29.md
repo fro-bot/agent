@@ -158,9 +158,12 @@ if (rateLimiter.allow(PRODUCER_KEY) === false) {
 ```
 
 ```ts
-// rate-limit.ts — bounded key cardinality (still enforced; the announce path now uses one key)
-if (store.size >= MAX_KEYS) return false
+// rate-limit.ts — bounded key cardinality (still enforced; the announce path now uses one key).
+// Since #1652 a new key at capacity evicts the OLDEST key instead of being refused.
+if (store.size >= MAX_KEYS) store.delete(store.keys().next().value)
 ```
+
+(The limiter originally refused any new key once full. That fails closed for everyone — an unrelated flood locked out unseen clients — so it now evicts the oldest key; see [bound attacker-controlled cardinality by evicting](bound-attacker-cardinality-by-evicting-not-refusing-2026-10-10.md).)
 
 The original design rate-limited **before** authentication on the socket address. Behind an ingress that terminates connections, that key collapses every caller (and an attacker) onto the proxy's address, so a flood of unsigned requests drained the bucket and the legitimate producer got `429` (#1645). An `X-Forwarded-For` key is no better — it is caller-spoofable (unlimited buckets plus an unbounded key map). Rate limiting before authentication also cannot tell a flood from the producer, and rate limiting _after_ HMAC but keyed on the source does not fix the collapse either.
 

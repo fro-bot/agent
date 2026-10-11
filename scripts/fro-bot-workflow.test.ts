@@ -605,7 +605,7 @@ describe('harness integration workflow wiring', () => {
     expect(job.permissions).toEqual({'id-token': 'write', contents: 'read'})
   })
 
-  it('mints the write-capable token only after the model step and before trusted freeze', () => {
+  it('mints the write-capable token before the model step so the App key is gone before agent-influenced code runs', () => {
     // #given
     const steps = stepsFor(integratePath, 'integrate')
     const mint = steps.findIndex(step => step.id === 'mint')
@@ -613,11 +613,81 @@ describe('harness integration workflow wiring', () => {
     const authoritative = steps.findIndex(step => step.name === 'Run Fro Bot')
     const trustedFreeze = steps.findIndex(step => step.id === 'trusted-integrate')
 
-    // #then the model runs before any write-capable credential exists
+    // #then the App mint precedes the agent, and trusted freeze follows the agent
     expect(mint).toBeGreaterThanOrEqual(0)
+    expect(appMint).toBeGreaterThanOrEqual(0)
     expect(authoritative).toBeGreaterThan(mint)
-    expect(appMint).toBeGreaterThan(authoritative)
-    expect(trustedFreeze).toBeGreaterThan(appMint)
+    expect(appMint).toBeLessThan(authoritative)
+    expect(trustedFreeze).toBeGreaterThan(authoritative)
+  })
+
+  it('never hands the App id or private key to any step after the model step', () => {
+    // #given
+    const job = rawJob(integratePath, 'integrate')
+    const steps = stepsFor(integratePath, 'integrate')
+    const authoritative = steps.findIndex(step => step.name === 'Run Fro Bot')
+    expect(authoritative).toBeGreaterThanOrEqual(0)
+
+    // #then job-level env would reach every step, including the agent
+    const jobEnv = JSON.stringify(job.env ?? {})
+    expect(jobEnv).not.toContain('APPLICATION_PRIVATE_KEY')
+    expect(jobEnv).not.toContain('APPLICATION_ID')
+
+    // #then neither the agent step nor any later step references the App credentials (secrets or env)
+    for (const step of steps.slice(authoritative)) {
+      const serialized = JSON.stringify(step)
+      expect(serialized).not.toContain('APPLICATION_PRIVATE_KEY')
+      expect(serialized).not.toContain('APPLICATION_ID')
+    }
+  })
+
+  it('keeps the integrate mint a plain checked-in script with only the App secrets in its own env', () => {
+    // #given
+    const steps = stepsFor(integratePath, 'integrate')
+    const appMint = stepById(steps, 'mint-app-token')
+
+    // #then the mint is a plain run: step (no marketplace action, so no post: hook)
+    expect(appMint.run).toBe('node --experimental-strip-types scripts/harness/mint-app-token.ts')
+    expect(appMint.uses).toBeUndefined()
+    expect(appMint.env).toEqual({
+      APPLICATION_ID: '${' + '{ secrets.APPLICATION_ID }}',
+      APPLICATION_PRIVATE_KEY: '${' + '{ secrets.APPLICATION_PRIVATE_KEY }}',
+    })
+  })
+
+  it('caps the agent step to leave the 1-hour App token headroom for the trusted push', () => {
+    // #given
+    const steps = stepsFor(integratePath, 'integrate')
+    const runFroBot = steps.find(step => step.name === 'Run Fro Bot')
+    if (runFroBot === undefined) throw new TypeError('Run Fro Bot step is missing')
+
+    // #then
+    const agentTimeout = runFroBot['timeout-minutes']
+    expect(typeof agentTimeout).toBe('number')
+    expect(agentTimeout as number).toBeLessThanOrEqual(45)
+  })
+
+  it('delivers the minted token to the push step only via a step output, never GITHUB_ENV or job env', () => {
+    // #given
+    const job = rawJob(integratePath, 'integrate')
+    const steps = stepsFor(integratePath, 'integrate')
+    const appMint = stepById(steps, 'mint-app-token')
+    const trusted = stepById(steps, 'trusted-integrate')
+    const trustedEnv = trusted.env as Record<string, unknown>
+    const appTokenExpression = '${' + '{ steps.mint-app-token.outputs.github-token }}'
+
+    // #then the push step reads the step output
+    expect(trustedEnv.GH_TOKEN).toBe(appTokenExpression)
+    // and no step writes the token into the shared environment file
+    for (const step of steps) {
+      expect(String(step.run ?? '')).not.toContain('GITHUB_ENV')
+    }
+    expect(String(appMint.run)).not.toContain('GITHUB_ENV')
+    // and neither the job env nor any step other than the push step references the minted output
+    expect(JSON.stringify(job.env ?? {})).not.toContain('mint-app-token')
+    for (const step of steps.filter(candidate => candidate.id !== 'trusted-integrate')) {
+      expect(JSON.stringify(step)).not.toContain('steps.mint-app-token.outputs')
+    }
   })
 
   it('gives the model only the read-only workflow token and reserves the App token for trusted push', () => {

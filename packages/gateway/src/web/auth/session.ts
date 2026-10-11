@@ -203,7 +203,7 @@ export interface SessionDeps {
    * (backwards-compatible for tests that don't care about rate limiting).
    * A resolution failure is never treated as a fallback 'unknown' key.
    */
-  readonly getSourceKey?: (c: Context) => Effect.Effect<ResolvedClientAddress, IngressRejection>
+  readonly resolveClientAddress?: (c: Context) => Effect.Effect<ResolvedClientAddress, IngressRejection>
 }
 
 // ---------------------------------------------------------------------------
@@ -447,14 +447,13 @@ export function buildLogoutRoutes(
     // trust-aware resolved client address. When no resolver is configured,
     // rate limiting is skipped entirely (test back-compat) — never a fallback
     // 'unknown' key that every unresolvable request would share.
-    if (deps.rateLimiter !== undefined && deps.getSourceKey !== undefined) {
-      const resolved = Effect.runSync(Effect.either(deps.getSourceKey(c)))
+    if (deps.rateLimiter !== undefined && deps.resolveClientAddress !== undefined) {
+      const resolved = Effect.runSync(Effect.either(deps.resolveClientAddress(c)))
       if (resolved._tag === 'Left') {
         deps.logger.warn({reason: resolved.left.kind}, 'logout rejected: ingress resolution failed')
         return respondForIngressRejection(c, resolved.left)
       }
-      const sourceKey = resolved.right.canonical
-      if (deps.rateLimiter.allow(sourceKey) === false) {
+      if (deps.rateLimiter.allow(resolved.right.accountingKey) === false) {
         deps.logger.warn({}, 'logout rejected: rate limited')
         return rateLimitedResponse(c)
       }

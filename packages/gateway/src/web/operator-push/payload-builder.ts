@@ -9,10 +9,11 @@
  * passthrough from internal state.
  */
 
+import type {OperatorPushTriggerKind} from '../../operator-contract/responses.js'
 import type {OperatorFailureKind} from '../../operator-contract/run-status.js'
 
 export interface PushPayloadData {
-  readonly type: 'approval' | 'question' | 'run_failed'
+  readonly type: OperatorPushTriggerKind
   readonly route: string
   readonly failureLabel?: OperatorFailureKind
 }

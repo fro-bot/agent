@@ -40,7 +40,7 @@ import {Effect} from 'effect'
 import {Hono} from 'hono'
 import {describe, expect, it, vi} from 'vitest'
 import {extractRawIngressInput} from '../ingress/hono-context.js'
-import {makeTrustedProxyIngressPolicy} from '../ingress/policy.js'
+import {makeDirectIngressPolicy, makeTrustedProxyIngressPolicy} from '../ingress/policy.js'
 import {resolveClient, unsafeResolvedClientAddressForTest} from '../ingress/resolve-client.js'
 import {parseTrustedProxyAddress} from '../ingress/trusted-proxy-address.js'
 import {assertAllPrivilegedRoutesWrapped, isPublicRoute, registerPublicRoute} from '../operator-route.js'
@@ -48,7 +48,7 @@ import {buildGitHubOAuthRoutes, createInMemoryStateStore, validateReturnPath} fr
 import {createInMemorySessionStore, SESSION_COOKIE_NAME} from './session.js'
 
 /**
- * Build a stub ResolvedClientAddress for test getSourceKey stubs. The branded
+ * Build a stub ResolvedClientAddress for test resolveClientAddress stubs. The branded
  * type can only be produced by resolveClient() in production; tests use the
  * sanctioned test-only constructor to stand in for a fixed resolved client
  * identity.
@@ -60,6 +60,14 @@ function stubResolved(canonical: string): ResolvedClientAddress {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** The state value makeStubDeps mints by default (a fixed string). */
+const DEFAULT_TEST_STATE = 'test-state-value-32-bytes-long-ok'
+
+/** Counts which of `candidates` the store still knows — observed via get(), not a production size(). */
+function countKnown(store: OAuthStateStore, candidates: readonly string[]): number {
+  return candidates.filter(candidate => store.get(candidate) !== undefined).length
+}
 
 /** Captured audit log record — kind + any additional fields. */
 interface CapturedAuditRecord {
@@ -157,10 +165,10 @@ function makeStubDeps(overrides?: Partial<GitHubOAuthDeps>): GitHubOAuthDeps {
     fetch: makeSuccessFetch(),
     clock: () => Date.now(),
     generateVerifier: () => 'test-verifier-32-bytes-long-enough-for-pkce',
-    generateState: () => 'test-state-value-32-bytes-long-ok',
+    generateState: () => DEFAULT_TEST_STATE,
     stateStore: createInMemoryStateStore(),
     // In tests, resolve to a fixed source key — no real socket available.
-    getSourceKey: () => Effect.succeed(stubResolved('test-source-key')),
+    resolveClientAddress: () => Effect.succeed(stubResolved('test-source-key')),
     rateLimiter: makePassRateLimiter(),
     ...overrides,
   }
@@ -338,8 +346,7 @@ describe('GET /operator/auth/github/start — redirect target validation', () =>
 
     // #then — rejected; no state minted
     expect(res.status).toBe(400)
-    const stateCount = stateStore.size()
-    expect(stateCount).toBe(0)
+    expect(stateStore.get(DEFAULT_TEST_STATE)).toBeUndefined()
   })
 
   it('rejects cross-origin redirect targets before state is minted', async () => {
@@ -357,7 +364,7 @@ describe('GET /operator/auth/github/start — redirect target validation', () =>
 
     // #then — rejected; no state minted
     expect(res.status).toBe(400)
-    expect(stateStore.size()).toBe(0)
+    expect(stateStore.get(DEFAULT_TEST_STATE)).toBeUndefined()
   })
 
   it('rejects paths not in the allowlist before state is minted', async () => {
@@ -375,7 +382,7 @@ describe('GET /operator/auth/github/start — redirect target validation', () =>
 
     // #then — rejected; no state minted
     expect(res.status).toBe(400)
-    expect(stateStore.size()).toBe(0)
+    expect(stateStore.get(DEFAULT_TEST_STATE)).toBeUndefined()
   })
 
   it('accepts a valid allowlisted path as redirect target', async () => {
@@ -391,7 +398,7 @@ describe('GET /operator/auth/github/start — redirect target validation', () =>
 
     // #then — accepted; state minted
     expect(res.status).toBe(302)
-    expect(stateStore.size()).toBe(1)
+    expect(stateStore.get(DEFAULT_TEST_STATE)).toBeDefined()
   })
 
   it('accepts no return_to param (defaults to no redirect target)', async () => {
@@ -407,7 +414,7 @@ describe('GET /operator/auth/github/start — redirect target validation', () =>
 
     // #then — accepted; state minted with no redirectTarget
     expect(res.status).toBe(302)
-    expect(stateStore.size()).toBe(1)
+    expect(stateStore.get(DEFAULT_TEST_STATE)).toBeDefined()
     const stored = stateStore.get('test-state-value-32-bytes-long-ok')
     if (stored === undefined) throw new Error('expected state to be stored')
     expect(stored.redirectTarget).toBeUndefined()
@@ -426,7 +433,7 @@ describe('GET /operator/auth/github/start — redirect target validation', () =>
 
     // #then — rejected; no state minted
     expect(res.status).toBe(400)
-    expect(stateStore.size()).toBe(0)
+    expect(stateStore.get(DEFAULT_TEST_STATE)).toBeUndefined()
   })
 })
 
@@ -512,10 +519,10 @@ describe('GET /operator/auth/github/start — rate limiter', () => {
     expect(res.status).toBe(429)
   })
 
-  it('calls rateLimiter.allow with the source key on start', async () => {
+  it('calls rateLimiter.allow with the derived accounting key on start', async () => {
     // #given
     const rateLimiter = makePassRateLimiter()
-    const deps = makeStubDeps({rateLimiter, getSourceKey: () => Effect.succeed(stubResolved('fixed-key'))})
+    const deps = makeStubDeps({rateLimiter, resolveClientAddress: () => Effect.succeed(stubResolved('203.0.113.5'))})
     const config = makeStubConfig()
     const app = buildTestApp(deps, config)
 
@@ -523,8 +530,8 @@ describe('GET /operator/auth/github/start — rate limiter', () => {
     const req = new Request('https://operator.example.com/operator/auth/github/start')
     await app.fetch(req)
 
-    // #then — rate limiter was called with the source key
-    expect(rateLimiter.allow).toHaveBeenCalledWith('fixed-key')
+    // #then — rate limiter was called with the derived /32 accounting key
+    expect(rateLimiter.allow).toHaveBeenCalledWith('ipv4/32:203.0.113.5')
   })
 })
 
@@ -690,7 +697,7 @@ describe('GET /operator/auth/github/callback — rate limiter', () => {
     expect(res.status).toBe(429)
   })
 
-  it('calls rateLimiter.allow with the source key on callback', async () => {
+  it('calls rateLimiter.allow with the derived accounting key on callback', async () => {
     // #given
     const rateLimiter = makePassRateLimiter()
     const stateStore = createInMemoryStateStore()
@@ -704,7 +711,7 @@ describe('GET /operator/auth/github/callback — rate limiter', () => {
       rateLimiter,
       stateStore,
       clock: () => now + 1000,
-      getSourceKey: () => Effect.succeed(stubResolved('fixed-key')),
+      resolveClientAddress: () => Effect.succeed(stubResolved('2001:db8:1:2::9')),
     })
     const config = makeStubConfig()
     const app = buildTestApp(deps, config)
@@ -715,8 +722,8 @@ describe('GET /operator/auth/github/callback — rate limiter', () => {
     )
     await app.fetch(req)
 
-    // #then — rate limiter was called with the source key
-    expect(rateLimiter.allow).toHaveBeenCalledWith('fixed-key')
+    // #then — rate limiter was called with the /64 accounting key, not the exact address
+    expect(rateLimiter.allow).toHaveBeenCalledWith('ipv6/64:2001:0db8:0001:0002')
   })
 })
 
@@ -734,7 +741,8 @@ describe('GET /operator/auth/github/callback — source key binding', () => {
       codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
       issuedAt: now,
       consumed: false,
-      sourceKey: 'ip-1',
+      boundAddress: 'ip-1',
+      accountingKey: 'acct-ip-1',
     })
 
     const auditLogger = makeAuditLogger()
@@ -742,7 +750,7 @@ describe('GET /operator/auth/github/callback — source key binding', () => {
       stateStore,
       clock: () => now + 1000,
       auditLogger,
-      getSourceKey: () => Effect.succeed(stubResolved('ip-2')), // different from mint-time key
+      resolveClientAddress: () => Effect.succeed(stubResolved('ip-2')), // different from mint-time key
     })
     const config = makeStubConfig()
     const app = buildTestApp(deps, config)
@@ -763,7 +771,7 @@ describe('GET /operator/auth/github/callback — source key binding', () => {
     // counts against the cap — this is the part that must not be missed
     const entry = stateStore.get('valid-state-value')
     expect(entry?.consumed).toBe(true)
-    expect(stateStore.countOutstanding('ip-1')).toBe(0)
+    expect(stateStore.countOutstanding('acct-ip-1')).toBe(0)
 
     // #and — failure audit event emitted with source_key_mismatch reason
     const failureEvent = auditLogger.records.find(r => r.kind === 'auth.callback.failure')
@@ -779,7 +787,7 @@ describe('GET /operator/auth/github/callback — source key binding', () => {
       codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
       issuedAt: now,
       consumed: false,
-      sourceKey: 'ip-1',
+      boundAddress: 'ip-1',
     })
 
     let stateCounter = 0
@@ -787,7 +795,7 @@ describe('GET /operator/auth/github/callback — source key binding', () => {
       stateStore,
       clock: () => now,
       generateState: () => `retry-state-${++stateCounter}`,
-      getSourceKey: () => Effect.succeed(stubResolved('ip-2')), // stable from here on
+      resolveClientAddress: () => Effect.succeed(stubResolved('ip-2')), // stable from here on
     })
     const config = makeStubConfig()
     const app = buildTestApp(deps, config)
@@ -825,7 +833,7 @@ describe('GET /operator/auth/github/callback — source key binding', () => {
       codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
       issuedAt: now,
       consumed: false,
-      sourceKey: 'ip-2',
+      boundAddress: 'ip-2',
       bounced: true,
     })
 
@@ -834,7 +842,7 @@ describe('GET /operator/auth/github/callback — source key binding', () => {
       stateStore,
       clock: () => now,
       auditLogger,
-      getSourceKey: () => Effect.succeed(stubResolved('ip-3')), // mismatches again
+      resolveClientAddress: () => Effect.succeed(stubResolved('ip-3')), // mismatches again
     })
     const config = makeStubConfig()
     const app = buildTestApp(deps, config)
@@ -871,13 +879,13 @@ describe('GET /operator/auth/github/callback — source key binding', () => {
       codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
       issuedAt: now,
       consumed: false,
-      sourceKey: 'victim-ip',
+      boundAddress: 'victim-ip',
     })
 
     const attackerDeps = makeStubDeps({
       stateStore,
       clock: () => now,
-      getSourceKey: () => Effect.succeed(stubResolved('attacker-ip')),
+      resolveClientAddress: () => Effect.succeed(stubResolved('attacker-ip')),
     })
     const config = makeStubConfig()
     const attackerApp = buildTestApp(attackerDeps, config)
@@ -895,7 +903,7 @@ describe('GET /operator/auth/github/callback — source key binding', () => {
     const victimDeps = makeStubDeps({
       stateStore,
       clock: () => now,
-      getSourceKey: () => Effect.succeed(stubResolved('victim-ip')),
+      resolveClientAddress: () => Effect.succeed(stubResolved('victim-ip')),
     })
     const victimApp = buildTestApp(victimDeps, config)
     const victimRes = await victimApp.fetch(
@@ -921,7 +929,7 @@ describe('GET /operator/auth/github/callback — source key binding', () => {
       codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
       issuedAt: now,
       consumed: true,
-      sourceKey: 'ip-1',
+      boundAddress: 'ip-1',
     })
 
     const expiredStore = createInMemoryStateStore()
@@ -929,7 +937,7 @@ describe('GET /operator/auth/github/callback — source key binding', () => {
       codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
       issuedAt: now,
       consumed: false,
-      sourceKey: 'ip-1',
+      boundAddress: 'ip-1',
     })
 
     const scenarios: readonly {
@@ -946,7 +954,7 @@ describe('GET /operator/auth/github/callback — source key binding', () => {
       const deps = makeStubDeps({
         stateStore: scenario.stateStore,
         clock: scenario.clock,
-        getSourceKey: () => Effect.succeed(stubResolved('ip-2')), // mismatched from the bound key, if any
+        resolveClientAddress: () => Effect.succeed(stubResolved('ip-2')), // mismatched from the bound key, if any
       })
       const config = makeStubConfig({stateTtlMs: ttlMs})
       const app = buildTestApp(deps, config)
@@ -972,13 +980,13 @@ describe('GET /operator/auth/github/callback — source key binding', () => {
       codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
       issuedAt: now,
       consumed: false,
-      sourceKey: 'ip-1',
+      boundAddress: 'ip-1',
     })
 
     const deps = makeStubDeps({
       stateStore,
       clock: () => now + 1000,
-      getSourceKey: () => Effect.succeed(stubResolved('ip-1')),
+      resolveClientAddress: () => Effect.succeed(stubResolved('ip-1')),
     })
     const config = makeStubConfig()
     const app = buildTestApp(deps, config)
@@ -993,21 +1001,21 @@ describe('GET /operator/auth/github/callback — source key binding', () => {
     expect(res.status).toBe(200)
   })
 
-  it('accepts callback when state has no sourceKey bound (legacy/test entries)', async () => {
-    // #given — state minted without a sourceKey
+  it('accepts callback when state has no boundAddress bound (legacy/test entries)', async () => {
+    // #given — state minted without a boundAddress
     const stateStore = createInMemoryStateStore()
     const now = Date.now()
     stateStore.set('valid-state-value', {
       codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
       issuedAt: now,
       consumed: false,
-      // no sourceKey
+      // no boundAddress
     })
 
     const deps = makeStubDeps({
       stateStore,
       clock: () => now + 1000,
-      getSourceKey: () => Effect.succeed(stubResolved('any-key')),
+      resolveClientAddress: () => Effect.succeed(stubResolved('any-key')),
     })
     const config = makeStubConfig()
     const app = buildTestApp(deps, config)
@@ -1018,7 +1026,7 @@ describe('GET /operator/auth/github/callback — source key binding', () => {
     )
     const res = await app.fetch(req)
 
-    // #then — accepted (no sourceKey bound means no binding check)
+    // #then — accepted (no boundAddress bound means no binding check)
     expect(res.status).toBe(200)
   })
 })
@@ -1036,7 +1044,7 @@ describe('GET /operator/auth/github/callback — provider error state consumptio
       codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
       issuedAt: now,
       consumed: false,
-      sourceKey: 'test-source-key',
+      boundAddress: 'test-source-key',
     })
 
     const deps = makeStubDeps({stateStore, clock: () => now + 1000})
@@ -1091,13 +1099,13 @@ describe('GET /operator/auth/github/callback — provider error state consumptio
       codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
       issuedAt: now,
       consumed: false,
-      sourceKey: 'ip-1',
+      boundAddress: 'ip-1',
     })
 
     const deps = makeStubDeps({
       stateStore,
       clock: () => now + 1000,
-      getSourceKey: () => Effect.succeed(stubResolved('ip-2')), // different source
+      resolveClientAddress: () => Effect.succeed(stubResolved('ip-2')), // different source
     })
     const config = makeStubConfig()
     const app = buildTestApp(deps, config)
@@ -1125,7 +1133,7 @@ describe('GET /operator/auth/github/callback — provider error state consumptio
       codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
       issuedAt,
       consumed: false,
-      sourceKey: 'test-source-key',
+      boundAddress: 'test-source-key',
     })
 
     const deps = makeStubDeps({
@@ -1153,8 +1161,8 @@ describe('GET /operator/auth/github/callback — provider error state consumptio
 // ---------------------------------------------------------------------------
 // OAuth callback — source key binding through the REAL trusted-proxy resolver
 //
-// The tests above stub getSourceKey with a fixed/varying string — they prove
-// the *comparison* logic. These tests wire getSourceKey to the real
+// The tests above stub resolveClientAddress with a fixed/varying string — they prove
+// the *comparison* logic. These tests wire resolveClientAddress to the real
 // resolveClient() + OperatorIngressPolicy (the exact production composition
 // from program.ts), fed crafted RawIngressInput per call, to prove the
 // *resolution* itself: that start and callback traversing different trusted
@@ -1175,14 +1183,14 @@ describe('GET /operator/auth/github/callback — source key binding via the real
   ])
 
   /** Resolves each successive call against the real resolver, one RawIngressInput per call, in order. */
-  function makeSequencedRealGetSourceKey(
+  function makeSequencedRealResolveClientAddress(
     rawInputsInCallOrder: readonly RawIngressInput[],
-  ): GitHubOAuthDeps['getSourceKey'] {
+  ): GitHubOAuthDeps['resolveClientAddress'] {
     let callIndex = 0
     return () => {
       const raw = rawInputsInCallOrder[callIndex]
       callIndex += 1
-      if (raw === undefined) throw new Error('makeSequencedRealGetSourceKey: more calls than configured inputs')
+      if (raw === undefined) throw new Error('makeSequencedRealResolveClientAddress: more calls than configured inputs')
       return resolveClient(raw, trustedProxyPolicy)
     }
   }
@@ -1190,7 +1198,7 @@ describe('GET /operator/auth/github/callback — source key binding via the real
   it('start through trusted proxy A, callback through trusted proxy B, same client — binding passes', async () => {
     // #given — start traverses proxy A, callback traverses proxy B; same client XFF both times
     const deps = makeStubDeps({
-      getSourceKey: makeSequencedRealGetSourceKey([
+      resolveClientAddress: makeSequencedRealResolveClientAddress([
         {socketAddress: PROXY_A, forwardedForHeaders: ['203.0.113.5']},
         {socketAddress: PROXY_B, forwardedForHeaders: ['203.0.113.5']},
       ]),
@@ -1211,7 +1219,7 @@ describe('GET /operator/auth/github/callback — source key binding via the real
     // #given — same trusted proxy both times; client written as plain IPv4 at
     // mint, as its IPv4-mapped-IPv6 form at callback
     const deps = makeStubDeps({
-      getSourceKey: makeSequencedRealGetSourceKey([
+      resolveClientAddress: makeSequencedRealResolveClientAddress([
         {socketAddress: PROXY_A, forwardedForHeaders: ['203.0.113.5']},
         {socketAddress: PROXY_A, forwardedForHeaders: ['::ffff:203.0.113.5']},
       ]),
@@ -1231,7 +1239,7 @@ describe('GET /operator/auth/github/callback — source key binding via the real
   it('a genuinely different client — the existing protection is still enforced (never completes the original flow)', async () => {
     // #given — different XFF client at callback than at mint
     const deps = makeStubDeps({
-      getSourceKey: makeSequencedRealGetSourceKey([
+      resolveClientAddress: makeSequencedRealResolveClientAddress([
         {socketAddress: PROXY_A, forwardedForHeaders: ['203.0.113.5']}, // mint (original client)
         {socketAddress: PROXY_A, forwardedForHeaders: ['203.0.113.9']}, // attacker's first attempt
         {socketAddress: PROXY_A, forwardedForHeaders: ['203.0.113.9']}, // attacker replays the same original state
@@ -1267,7 +1275,7 @@ describe('GET /operator/auth/github/callback — source key binding via the real
     const stateStore = createInMemoryStateStore()
     const deps = makeStubDeps({
       stateStore,
-      getSourceKey: makeSequencedRealGetSourceKey([
+      resolveClientAddress: makeSequencedRealResolveClientAddress([
         {socketAddress: PROXY_A, forwardedForHeaders: ['203.0.113.5']},
         {socketAddress: PROXY_A, forwardedForHeaders: ['203.0.113.9']},
       ]),
@@ -1294,7 +1302,9 @@ describe('GET /operator/auth/github/callback — source key binding via the real
     const deps = makeStubDeps({
       stateStore,
       rateLimiter,
-      getSourceKey: makeSequencedRealGetSourceKey([{socketAddress: undefined, forwardedForHeaders: []}]),
+      resolveClientAddress: makeSequencedRealResolveClientAddress([
+        {socketAddress: undefined, forwardedForHeaders: []},
+      ]),
     })
     const app = buildTestApp(deps, makeStubConfig())
 
@@ -1304,8 +1314,184 @@ describe('GET /operator/auth/github/callback — source key binding via the real
     // #then — 503, never a fallback key
     expect(res.status).toBe(503)
     expect(rateLimiter.allow).not.toHaveBeenCalled()
-    expect(stateStore.size()).toBe(0)
+    expect(stateStore.get(DEFAULT_TEST_STATE)).toBeUndefined()
   })
+})
+
+// ---------------------------------------------------------------------------
+// Derived accounting keys vs exact binding (#1652)
+//
+// Counting (rate-limit bucket + outstanding-attempt slot) uses the derived
+// accounting key (IPv6 /64, IPv4 /32). The OAuth binding stays on the exact
+// canonical address. The client address is read from a test header and run
+// through the REAL resolver, so derivation is production code, not a stub.
+// ---------------------------------------------------------------------------
+
+describe('OAuth accounting keys vs exact binding (#1652)', () => {
+  const TEST_CLIENT_HEADER = 'x-test-client'
+  const directPolicy = makeDirectIngressPolicy()
+
+  function headerResolvedResolveClientAddress(): GitHubOAuthDeps['resolveClientAddress'] {
+    return (c: Context) =>
+      resolveClient({socketAddress: c.req.header(TEST_CLIENT_HEADER), forwardedForHeaders: []}, directPolicy)
+  }
+
+  async function startFrom(app: Hono, client: string): Promise<Response> {
+    return app.fetch(
+      new Request('https://operator.example.com/operator/auth/github/start', {
+        headers: {[TEST_CLIENT_HEADER]: client},
+      }),
+    )
+  }
+
+  function makeAppWith(overrides: Partial<GitHubOAuthDeps> = {}, config?: GitHubOAuthConfig) {
+    let stateCounter = 0
+    const stateStore = createInMemoryStateStore()
+    const deps = makeStubDeps({
+      stateStore,
+      generateState: () => `acct-state-${++stateCounter}`,
+      resolveClientAddress: headerResolvedResolveClientAddress(),
+      ...overrides,
+    })
+    return {app: buildTestApp(deps, config ?? makeStubConfig({maxOutstandingAttemptsPerKey: 1})), deps, stateStore}
+  }
+
+  it('addresses in the same /64 share one outstanding-attempt slot; an adjacent /64 is independent', async () => {
+    // #given — one outstanding attempt allowed per accounting key
+    const {app} = makeAppWith()
+
+    // #when — two different addresses in one /64, then a neighbouring /64
+    const first = await startFrom(app, '2001:db8:1:2::1')
+    const sameSlash64 = await startFrom(app, '2001:db8:1:2:aaaa:bbbb:cccc:dddd')
+    const adjacent = await startFrom(app, '2001:db8:1:3::1')
+
+    // #then — the second address in the /64 is refused by the shared slot; the adjacent /64 is not
+    expect(first.status).toBe(302)
+    expect(sameSlash64.status).toBe(429)
+    expect(adjacent.status).toBe(302)
+  })
+
+  it('iPv4 and its IPv4-mapped forms share one outstanding-attempt slot', async () => {
+    // #given
+    const {app} = makeAppWith()
+
+    // #when
+    const plain = await startFrom(app, '203.0.113.7')
+    const dotted = await startFrom(app, '::ffff:203.0.113.7')
+    const hex = await startFrom(app, '::ffff:cb00:7107')
+    const other = await startFrom(app, '203.0.113.8')
+
+    // #then
+    expect(plain.status).toBe(302)
+    expect(dotted.status).toBe(429)
+    expect(hex.status).toBe(429)
+    expect(other.status).toBe(302)
+  })
+
+  it('records the exact canonical address for binding and the derived key for counting', async () => {
+    // #given
+    const {app, stateStore} = makeAppWith({}, makeStubConfig())
+
+    // #when
+    await startFrom(app, '2001:db8:1:2::1')
+
+    // #then — two distinct fields on the stored entry
+    const entry = stateStore.get('acct-state-1')
+    expect(entry?.boundAddress).toBe('2001:0db8:0001:0002:0000:0000:0000:0001')
+    expect(entry?.accountingKey).toBe('ipv6/64:2001:0db8:0001:0002')
+  })
+
+  it('start and callback spend the same shared rate-limit bucket for addresses in one /64', async () => {
+    // #given — a recording limiter
+    const keys: string[] = []
+    const rateLimiter: RateLimiter = {
+      allow: key => {
+        keys.push(key)
+        return true
+      },
+    }
+    const {app} = makeAppWith({rateLimiter}, makeStubConfig())
+
+    // #when — start from one address, callback (no state) from another address in the same /64
+    await startFrom(app, '2001:db8:1:2::1')
+    await app.fetch(
+      new Request('https://operator.example.com/operator/auth/github/callback?state=x&code=y', {
+        headers: {[TEST_CLIENT_HEADER]: '2001:db8:1:2::2'},
+      }),
+    )
+
+    // #then — one bucket key for both routes
+    expect(keys).toEqual(['ipv6/64:2001:0db8:0001:0002', 'ipv6/64:2001:0db8:0001:0002'])
+  })
+
+  it('an address change within the same /64 still trips the exact binding mismatch', async () => {
+    // #given — state minted from one address, callback from another address in the same /64
+    const fetchSpy = makeSuccessFetch()
+    const {app, stateStore} = makeAppWith({fetch: fetchSpy}, makeStubConfig())
+    const startRes = await startFrom(app, '2001:db8:1:2::1')
+    const state = new URL(startRes.headers.get('location') ?? '').searchParams.get('state') ?? ''
+
+    // #when
+    const res = await app.fetch(
+      new Request(`https://operator.example.com/operator/auth/github/callback?state=${state}&code=test-code`, {
+        headers: {[TEST_CLIENT_HEADER]: '2001:db8:1:2::2'},
+      }),
+    )
+
+    // #then — exact binding refuses it: bounced to /start, state consumed, NO token exchange
+    expect(res.status).toBe(302)
+    expect(res.headers.get('location') ?? '').toContain('retry=1')
+    expect(stateStore.get(state)?.consumed).toBe(true)
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it('a provider-error callback from another address in the same /64 does not consume the state', async () => {
+    // #given — state minted from one address, provider-error callback from another address in the same /64
+    const fetchSpy = makeSuccessFetch()
+    const {app, stateStore} = makeAppWith({fetch: fetchSpy}, makeStubConfig())
+    const startRes = await startFrom(app, '2001:db8:1:2::1')
+    const state = new URL(startRes.headers.get('location') ?? '').searchParams.get('state') ?? ''
+
+    // #when
+    const res = await app.fetch(
+      new Request(`https://operator.example.com/operator/auth/github/callback?error=access_denied&state=${state}`, {
+        headers: {[TEST_CLIENT_HEADER]: '2001:db8:1:2::2'},
+      }),
+    )
+
+    // #then — refused on the exact binding: the attempt stays outstanding and GitHub is never contacted
+    expect(res.status).toBe(400)
+    expect(stateStore.get(state)?.consumed).toBe(false)
+    expect(stateStore.countOutstanding('ipv6/64:2001:0db8:0001:0002')).toBe(1)
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['dotted IPv4-mapped IPv6', '::ffff:203.0.113.5'],
+    ['hex IPv4-mapped IPv6', '::ffff:cb00:7105'],
+  ])(
+    'a dual-stack respelling (%s) of the starting IPv4 address still matches the exact binding',
+    async (_label, mapped) => {
+      // #given — state minted from plain IPv4; canonicalization normalizes mapped forms to IPv4
+      const fetchSpy = makeSuccessFetch()
+      const {app, stateStore} = makeAppWith({fetch: fetchSpy}, makeStubConfig())
+      const startRes = await startFrom(app, '203.0.113.5')
+      const state = new URL(startRes.headers.get('location') ?? '').searchParams.get('state') ?? ''
+      expect(stateStore.get(state)?.boundAddress).toBe('203.0.113.5')
+
+      // #when — the callback arrives with the mapped spelling
+      const res = await app.fetch(
+        new Request(`https://operator.example.com/operator/auth/github/callback?state=${state}&code=test-code`, {
+          headers: {[TEST_CLIENT_HEADER]: mapped},
+        }),
+      )
+
+      // #then — no mismatch: completes the flow (token exchange happened), no bounce
+      expect(res.status).toBe(200)
+      expect(res.headers.get('location')).toBeNull()
+      expect(fetchSpy).toHaveBeenCalled()
+    },
+  )
 })
 
 // ---------------------------------------------------------------------------
@@ -1317,7 +1503,7 @@ describe('GET /operator/auth/github/callback — source key binding via the real
 // actual Context. This section serves the OAuth routes over a genuine TCP
 // socket (mirroring the announce-server precedent in http/server.test.ts, and
 // startRealOperatorServer in web/server.test.ts) so getConnInfo(c) inside
-// extractRawIngressInput returns a real remote address, and getSourceKey is
+// extractRawIngressInput returns a real remote address, and resolveClientAddress is
 // the exact production composition — resolveClient(extractRawIngressInput(c),
 // policy), as wired in program.ts — rather than a stub or a sequenced fixture.
 // ---------------------------------------------------------------------------
@@ -1353,10 +1539,10 @@ describe('GET /operator/auth/github/start — source key resolution via a real H
       // a fixed string, which would collide across the sequential requests
       // below and overwrite each other's state-store entry.
       generateState: () => `real-context-state-${++stateCounter}`,
-      // The real production composition (see program.ts getSourceKey) — not a
+      // The real production composition (see program.ts resolveClientAddress) — not a
       // stub returning a fixed/sequenced key. getConnInfo(c) requires a genuine
       // socket, which only a real serve() listener (not app.fetch()) provides.
-      getSourceKey: (c: Context) => resolveClient(extractRawIngressInput(c), trustedLoopbackPolicy),
+      resolveClientAddress: (c: Context) => resolveClient(extractRawIngressInput(c), trustedLoopbackPolicy),
     })
     const app = buildTestApp(deps, config)
     const port = await findFreePortForOAuthServer()
@@ -1952,29 +2138,19 @@ describe('createInMemoryStateStore', () => {
     expect(entry.consumed).toBe(true)
   })
 
-  it('counts outstanding (unconsumed) entries for a source key', () => {
+  it('counts outstanding (unconsumed) entries for an accounting key', () => {
     // #given
     const store = createInMemoryStateStore()
-    store.set('state-1', {codeVerifier: 'v1', issuedAt: 1000, consumed: false, sourceKey: 'ip-1'})
-    store.set('state-2', {codeVerifier: 'v2', issuedAt: 1000, consumed: false, sourceKey: 'ip-1'})
-    store.set('state-3', {codeVerifier: 'v3', issuedAt: 1000, consumed: true, sourceKey: 'ip-1'})
-    store.set('state-4', {codeVerifier: 'v4', issuedAt: 1000, consumed: false, sourceKey: 'ip-2'})
+    store.set('state-1', {codeVerifier: 'v1', issuedAt: 1000, consumed: false, accountingKey: 'acct-1'})
+    store.set('state-2', {codeVerifier: 'v2', issuedAt: 1000, consumed: false, accountingKey: 'acct-1'})
+    store.set('state-3', {codeVerifier: 'v3', issuedAt: 1000, consumed: true, accountingKey: 'acct-1'})
+    store.set('state-4', {codeVerifier: 'v4', issuedAt: 1000, consumed: false, accountingKey: 'acct-2'})
+    // exact binding key alone never counts toward an accounting slot
+    store.set('state-5', {codeVerifier: 'v5', issuedAt: 1000, consumed: false, boundAddress: 'acct-1'})
 
-    // #when / #then — only unconsumed entries for ip-1
-    expect(store.countOutstanding('ip-1')).toBe(2)
-    expect(store.countOutstanding('ip-2')).toBe(1)
-  })
-
-  it('reports correct size', () => {
-    // #given
-    const store = createInMemoryStateStore()
-
-    // #when
-    store.set('s1', {codeVerifier: 'v1', issuedAt: 1000, consumed: false})
-    store.set('s2', {codeVerifier: 'v2', issuedAt: 1000, consumed: false})
-
-    // #then
-    expect(store.size()).toBe(2)
+    // #when / #then — only unconsumed entries carrying that accounting key
+    expect(store.countOutstanding('acct-1')).toBe(2)
+    expect(store.countOutstanding('acct-2')).toBe(1)
   })
 
   it('evictStale removes consumed entries', () => {
@@ -1990,7 +2166,7 @@ describe('createInMemoryStateStore', () => {
     // #then — consumed entry is removed; active entry remains
     expect(store.get('consumed')).toBeUndefined()
     expect(store.get('active')).toBeDefined()
-    expect(store.size()).toBe(1)
+    expect(countKnown(store, ['consumed', 'active'])).toBe(1)
   })
 
   it('evictStale removes expired entries', () => {
@@ -2007,7 +2183,7 @@ describe('createInMemoryStateStore', () => {
     // #then — expired entry is removed; fresh entry remains
     expect(store.get('expired')).toBeUndefined()
     expect(store.get('fresh')).toBeDefined()
-    expect(store.size()).toBe(1)
+    expect(countKnown(store, ['expired', 'fresh'])).toBe(1)
   })
 
   it('evictStale removes both consumed and expired entries in one pass', () => {
@@ -2023,100 +2199,392 @@ describe('createInMemoryStateStore', () => {
     store.evictStale(now, ttlMs)
 
     // #then — only active entry remains
-    expect(store.size()).toBe(1)
+    expect(countKnown(store, ['consumed', 'expired', 'active'])).toBe(1)
     expect(store.get('active')).toBeDefined()
   })
 
-  it('evictStale with empty store is a no-op', () => {
+  it('evictStale on an empty store does not throw', () => {
     // #given
     const store = createInMemoryStateStore()
 
-    // #when / #then — no throw
+    // #when / #then
     expect(() => store.evictStale(Date.now(), 600_000)).not.toThrow()
-    expect(store.size()).toBe(0)
   })
 })
 
 // ---------------------------------------------------------------------------
-// Auth start — global store ceiling (prevents unbounded Map growth)
+// Auth start — bounded state store evicts the oldest instead of refusing (#1652)
+//
+// Order of operations in /start: (1) reclaim consumed + expired states,
+// (2) enforce the per-accounting-key outstanding cap, (3) validate the request,
+// (4) at the insertion point, if the store is full evict the oldest remaining
+// state, (5) insert synchronously. The store owns bounded insertion.
 // ---------------------------------------------------------------------------
 
-describe('GET /operator/auth/github/start — global store ceiling', () => {
-  it('rejects new starts when total live entries across all source keys meet the global cap', async () => {
-    // #given — many distinct source keys, each with one outstanding entry
-    // Use a small per-source cap (1) so each source key can mint exactly one entry.
-    // The global cap is what we are testing here: once total live entries reach it,
-    // /start must fail closed regardless of which source key is requesting.
-    const stateStore = createInMemoryStateStore()
-    let stateCounter = 0
-    let sourceCounter = 0
+describe('GET /operator/auth/github/start — full state store evicts the oldest (#1652)', () => {
+  const CLIENT_HEADER = 'x-test-client'
 
+  interface EvictionHarness {
+    readonly app: Hono
+    readonly stateStore: ReturnType<typeof createInMemoryStateStore>
+    readonly fetchSpy: GitHubOAuthDeps['fetch']
+    readonly clock: {now: number}
+    readonly start: (client: string, query?: string) => Promise<Response>
+    readonly callback: (client: string, state: string, extra?: string) => Promise<Response>
+    /** Mint a state from `client` and return its value (throws if start did not redirect). */
+    readonly mint: (client: string) => Promise<string>
+    /** How many of the state values generated so far the store still knows (observed via get()). */
+    readonly knownCount: () => number
+  }
+
+  function makeEvictionHarness(opts: {
+    readonly maxEntries?: number
+    readonly perKeyCap?: number
+    readonly ttlMs?: number
+    readonly fetch?: GitHubOAuthDeps['fetch']
+  }): EvictionHarness {
+    let stateCounter = 0
+    const generated: string[] = []
+    const stateStore =
+      opts.maxEntries === undefined ? createInMemoryStateStore() : createInMemoryStateStore(opts.maxEntries)
+    const fetchSpy = opts.fetch ?? makeSuccessFetch()
+    const clock = {now: 1_000_000}
     const deps = makeStubDeps({
       stateStore,
-      generateState: () => `state-${++stateCounter}`,
-      // Each request gets a unique source key so per-source cap never triggers.
-      getSourceKey: () => Effect.succeed(stubResolved(`source-${++sourceCounter}`)),
+      fetch: fetchSpy,
+      clock: () => clock.now,
+      generateState: () => {
+        const state = `st-${++stateCounter}`
+        generated.push(state)
+        return state
+      },
+      resolveClientAddress: (c: Context) =>
+        Effect.succeed(stubResolved(c.req.header(CLIENT_HEADER) ?? 'missing-client')),
     })
-    // Per-source cap is high (100) so it never fires; global cap is what we hit.
-    const config = makeStubConfig({maxOutstandingAttemptsPerKey: 100})
+    const config = makeStubConfig({
+      maxOutstandingAttemptsPerKey: opts.perKeyCap ?? 5,
+      ...(opts.ttlMs === undefined ? {} : {stateTtlMs: opts.ttlMs}),
+    })
     const app = buildTestApp(deps, config)
-
-    const makeReq = () => new Request('https://operator.example.com/operator/auth/github/start')
-
-    // #when — fill the store up to the global ceiling
-    // We need to know the ceiling value; import it from the module under test.
-    // Since it's an internal constant, we drive it via observable behavior:
-    // keep minting until we get a 429, then verify the store size is bounded.
-    const responses: Response[] = []
-    for (let i = 0; i < 1100; i++) {
-      const res = await app.fetch(makeReq())
-      responses.push(res)
-      if (res.status === 429) break
+    const start = async (client: string, query = ''): Promise<Response> =>
+      app.fetch(
+        new Request(`https://operator.example.com/operator/auth/github/start${query}`, {
+          headers: {[CLIENT_HEADER]: client},
+        }),
+      )
+    const callback = async (client: string, state: string, extra = ''): Promise<Response> =>
+      app.fetch(
+        new Request(
+          `https://operator.example.com/operator/auth/github/callback?state=${state}&code=test-code${extra}`,
+          {headers: {[CLIENT_HEADER]: client}},
+        ),
+      )
+    const mint = async (client: string): Promise<string> => {
+      const res = await start(client)
+      const state = new URL(res.headers.get('location') ?? 'https://x.invalid').searchParams.get('state')
+      if (res.status !== 302 || state === null) throw new Error(`expected a state mint, got ${res.status}`)
+      return state
     }
+    const knownCount = (): number => countKnown(stateStore, generated)
+    return {app, stateStore, fetchSpy, clock, start, callback, mint, knownCount}
+  }
 
-    // #then — at least one request was rejected (global cap enforced)
-    const rejectedCount = responses.filter(r => r.status === 429).length
-    expect(rejectedCount).toBeGreaterThan(0)
+  it('admits a new start into a full store, stays bounded, and evicts exactly the oldest entry', async () => {
+    // #given — a store of 3, filled by three distinct clients
+    const h = makeEvictionHarness({maxEntries: 3})
+    const s1 = await h.mint('203.0.113.1')
+    const s2 = await h.mint('203.0.113.2')
+    const s3 = await h.mint('203.0.113.3')
+    expect(h.knownCount()).toBe(3)
 
-    // #and — the store size is bounded (did not grow to 1100)
-    expect(stateStore.size()).toBeLessThan(1100)
+    // #when — a fourth, eligible client starts
+    const s4 = await h.mint('203.0.113.4')
+
+    // #then — admitted, still 3 entries, only the oldest is gone
+    expect(h.knownCount()).toBe(3)
+    expect(h.stateStore.get(s1)).toBeUndefined()
+    expect(h.stateStore.get(s2)).toBeDefined()
+    expect(h.stateStore.get(s3)).toBeDefined()
+    expect(h.stateStore.get(s4)).toBeDefined()
   })
 
-  it('allows new starts after global ceiling entries expire (evict-before-count)', async () => {
-    // #given — fill store to global ceiling with distinct source keys, then advance clock
-    const ttlMs = 10 * 60 * 1000
-    const stateStore = createInMemoryStateStore()
-    let stateCounter = 0
-    let sourceCounter = 0
-    let currentTime = 1000
+  it('rejects the evicted entry callback with the ordinary 400, no bounce, and no token exchange', async () => {
+    // #given — s1 was evicted by a newer start
+    const h = makeEvictionHarness({maxEntries: 2})
+    const s1 = await h.mint('203.0.113.1')
+    await h.mint('203.0.113.2')
+    await h.mint('203.0.113.3')
+    expect(h.stateStore.get(s1)).toBeUndefined()
 
-    const deps = makeStubDeps({
-      stateStore,
-      generateState: () => `state-${++stateCounter}`,
-      getSourceKey: () => Effect.succeed(stubResolved(`source-${++sourceCounter}`)),
-      clock: () => currentTime,
-    })
-    const config = makeStubConfig({maxOutstandingAttemptsPerKey: 100, stateTtlMs: ttlMs})
-    const app = buildTestApp(deps, config)
+    // #when — the evicted attempt's owner returns from GitHub
+    const res = await h.callback('203.0.113.1', s1)
 
-    const makeReq = () => new Request('https://operator.example.com/operator/auth/github/start')
+    // #then — unknown state: plain 400, no redirect, GitHub never contacted
+    expect(res.status).toBe(400)
+    expect(res.headers.get('location')).toBeNull()
+    expect(h.fetchSpy).not.toHaveBeenCalled()
+  })
 
-    // Fill until we hit the global cap
-    for (let i = 0; i < 1100; i++) {
-      const res = await app.fetch(makeReq())
-      if (res.status === 429) break
+  it('stays bounded at the production default of 1,000 and evicts the oldest on the 1,001st start', async () => {
+    // #given — 1,000 distinct clients, one outstanding state each
+    const h = makeEvictionHarness({})
+    const first = await h.mint('10.0.0.0')
+    for (let i = 1; i < 1000; i++) {
+      await h.mint(`10.0.${Math.floor(i / 256)}.${i % 256}`)
     }
+    expect(h.knownCount()).toBe(1000)
 
-    // Verify we hit the cap
-    const capHitRes = await app.fetch(makeReq())
-    expect(capHitRes.status).toBe(429)
+    // #when — one more
+    const res = await h.start('198.51.100.9')
 
-    // #when — advance clock past TTL so all entries expire
-    currentTime = 1000 + ttlMs + 1
+    // #then — admitted instead of 429; bounded; the first state is the one that went
+    expect(res.status).toBe(302)
+    expect(h.knownCount()).toBe(1000)
+    expect(h.stateStore.get(first)).toBeUndefined()
+  })
 
-    // #then — new start succeeds because evictStale runs before global size check
-    const resAfterExpiry = await app.fetch(makeReq())
-    expect(resAfterExpiry.status).toBe(302)
+  it('an invalid start (bad return_to) against a full store evicts nothing', async () => {
+    // #given
+    const h = makeEvictionHarness({maxEntries: 2})
+    const s1 = await h.mint('203.0.113.1')
+    const s2 = await h.mint('203.0.113.2')
+
+    // #when — a fresh client sends an invalid return_to
+    const res = await h.start('203.0.113.3', '?return_to=https://evil.example.com/')
+
+    // #then — rejected, and the store is untouched
+    expect(res.status).toBe(400)
+    expect(h.knownCount()).toBe(2)
+    expect(h.stateStore.get(s1)).toBeDefined()
+    expect(h.stateStore.get(s2)).toBeDefined()
+  })
+
+  it('a start rejected by the per-key outstanding cap against a full store evicts nothing', async () => {
+    // #given — per-key cap 1; store of 2 filled by two clients
+    const h = makeEvictionHarness({maxEntries: 2, perKeyCap: 1})
+    const s1 = await h.mint('203.0.113.1')
+    const s2 = await h.mint('203.0.113.2')
+
+    // #when — the first client tries again while its slot is held
+    const res = await h.start('203.0.113.1')
+
+    // #then — 429, and nothing was evicted to make room
+    expect(res.status).toBe(429)
+    expect(h.knownCount()).toBe(2)
+    expect(h.stateStore.get(s1)).toBeDefined()
+    expect(h.stateStore.get(s2)).toBeDefined()
+  })
+
+  it('reclaims consumed and stale entries first, so no live entry is evicted while reclaimable ones exist', async () => {
+    // #given — store of 3: s1 will go stale, s2 will be consumed, s3 stays live
+    const ttlMs = 60_000
+    const h = makeEvictionHarness({maxEntries: 3, ttlMs})
+    const t0 = 1_000
+    h.clock.now = t0
+    const s1 = await h.mint('203.0.113.1')
+    h.clock.now = t0 + ttlMs / 2
+    const s2 = await h.mint('203.0.113.2')
+    h.clock.now = t0 + ttlMs / 2 + 1
+    const s3 = await h.mint('203.0.113.3')
+    h.stateStore.consume(s2)
+    h.clock.now = t0 + ttlMs + 1_000 // s1 is now older than the TTL; s3 is still inside it
+
+    // #when — a new start arrives at a nominally full store
+    const s4 = await h.mint('203.0.113.4')
+
+    // #then — the reclaimable pair was dropped; the live s3 survived
+    expect(h.stateStore.get(s1)).toBeUndefined()
+    expect(h.stateStore.get(s2)).toBeUndefined()
+    expect(h.stateStore.get(s3)).toBeDefined()
+    expect(h.stateStore.get(s4)).toBeDefined()
+    expect(h.knownCount()).toBe(2)
+  })
+
+  it('bounce/retry and terminal mismatch still work under saturation', async () => {
+    // #given — store of 2, full of A and E after B's state was consumed by a mismatching callback
+    const h = makeEvictionHarness({maxEntries: 2})
+    const sA = await h.mint('203.0.113.1')
+    const sB = await h.mint('203.0.113.2')
+    const bounce = await h.callback('203.0.113.99', sB)
+    expect(bounce.status).toBe(302)
+    expect(bounce.headers.get('location') ?? '').toContain('retry=1')
+    expect(h.stateStore.get(sB)?.consumed).toBe(true)
+    await h.mint('203.0.113.5')
+
+    // #when — the bounced client follows the redirect into a FULL store
+    const retry = await h.start('203.0.113.99', '?retry=1')
+    const retryState = new URL(retry.headers.get('location') ?? 'https://x.invalid').searchParams.get('state') ?? ''
+
+    // #then — admitted by evicting the oldest (sA); the new state is marked bounced
+    expect(retry.status).toBe(302)
+    expect(h.stateStore.get(sA)).toBeUndefined()
+    expect(h.stateStore.get(retryState)?.bounced).toBe(true)
+
+    // #when — the address shifts AGAIN on the retried state
+    const second = await h.callback('203.0.113.98', retryState)
+
+    // #then — terminal: plain 400, no further bounce, state consumed, no token exchange
+    expect(second.status).toBe(400)
+    expect(second.headers.get('location')).toBeNull()
+    expect(h.stateStore.get(retryState)?.consumed).toBe(true)
+    expect(h.fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it('provider-error handling still consumes a live state minted after an eviction', async () => {
+    // #given — store of 2; sC's start evicted the oldest (sA), so sC is a fresh live state in a full store
+    const h = makeEvictionHarness({maxEntries: 2})
+    const sA = await h.mint('203.0.113.1')
+    await h.mint('203.0.113.2')
+    const sC = await h.mint('203.0.113.3')
+    expect(h.stateStore.get(sA)).toBeUndefined()
+    expect(h.stateStore.get(sC)?.consumed).toBe(false)
+
+    // #when — the provider reports an error for sC from its own client
+    const res = await h.callback('203.0.113.3', sC, '&error=access_denied')
+
+    // #then — fails closed with 400, the live state is consumed, GitHub is never contacted
+    expect(res.status).toBe(400)
+    expect(h.stateStore.get(sC)?.consumed).toBe(true)
+    expect(h.fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it('replay of a completed state is rejected, and stays rejected after later starts reclaim or evict it', async () => {
+    // #given — store of 2 holding s1 and sB; sB completes a sign-in (2 fetches: token + user)
+    const h = makeEvictionHarness({maxEntries: 2})
+    await h.mint('203.0.113.1')
+    const sB = await h.mint('203.0.113.2')
+    const first = await h.callback('203.0.113.2', sB)
+    expect(first.status).toBe(200)
+    expect(h.fetchSpy).toHaveBeenCalledTimes(2)
+
+    // #when — replay while the consumed record is still present
+    const immediateReplay = await h.callback('203.0.113.2', sB)
+
+    // #then — rejected without touching GitHub
+    expect(immediateReplay.status).toBe(400)
+    expect(h.fetchSpy).toHaveBeenCalledTimes(2)
+
+    // #when — two more starts push the store through reclaim (consumed sB) and eviction (s1)
+    await h.mint('203.0.113.3')
+    await h.mint('203.0.113.4')
+    expect(h.stateStore.get(sB)).toBeUndefined()
+    const lateReplay = await h.callback('203.0.113.2', sB)
+
+    // #then — still a plain 400, no further token exchange
+    expect(lateReplay.status).toBe(400)
+    expect(lateReplay.headers.get('location')).toBeNull()
+    expect(h.fetchSpy).toHaveBeenCalledTimes(2)
+  })
+
+  it('consumes the state before the first external await, under saturation', async () => {
+    // #given — the token-exchange fetch observes the store at the moment it is called
+    const observed: boolean[] = []
+    let probe: (() => boolean) | undefined
+    const probingFetch: GitHubOAuthDeps['fetch'] = vi.fn(async (url: string | URL | Request) => {
+      observed.push(probe?.() ?? false)
+      const urlStr = typeof url === 'string' ? url : url instanceof URL ? url.toString() : url.url
+      if (urlStr.includes('access_token')) return new Response(JSON.stringify({access_token: 't'}), {status: 200})
+      return new Response(JSON.stringify({id: 7, login: 'octocat'}), {status: 200})
+    })
+    const h = makeEvictionHarness({maxEntries: 2, fetch: probingFetch})
+    await h.mint('203.0.113.1')
+    const sB = await h.mint('203.0.113.2')
+    await h.mint('203.0.113.3') // evicts the oldest; store is saturated again
+    const sC = await h.mint('203.0.113.4')
+    probe = () => h.stateStore.get(sC)?.consumed === true
+
+    // #when
+    const res = await h.callback('203.0.113.4', sC)
+
+    // #then — consumed by the time GitHub is first contacted; the earlier-evicted sB stays unknown
+    expect(res.status).toBe(200)
+    expect(observed[0]).toBe(true)
+    expect(h.stateStore.get(sB)).toBeUndefined()
+  })
+})
+
+describe('createInMemoryStateStore — bounded insertion (#1652)', () => {
+  const entry = (issuedAt = 1000) => ({codeVerifier: 'v', issuedAt, consumed: false})
+
+  it('evicts the oldest entry when inserting a new key into a full store', () => {
+    // #given
+    const store = createInMemoryStateStore(2)
+    store.set('a', entry())
+    store.set('b', entry())
+
+    // #when
+    store.set('c', entry())
+
+    // #then
+    expect(countKnown(store, ['a', 'b', 'c'])).toBe(2)
+    expect(store.get('a')).toBeUndefined()
+    expect(store.get('b')).toBeDefined()
+    expect(store.get('c')).toBeDefined()
+  })
+
+  it('stays bounded under sustained churn', () => {
+    // #given
+    const store = createInMemoryStateStore(5)
+
+    // #when
+    for (let i = 0; i < 500; i++) store.set(`s-${i}`, entry())
+
+    // #then — only the 5 newest survive
+    expect(
+      countKnown(
+        store,
+        Array.from({length: 500}, (_, i) => `s-${i}`),
+      ),
+    ).toBe(5)
+    expect(store.get('s-494')).toBeUndefined()
+    expect(store.get('s-495')).toBeDefined()
+    expect(store.get('s-499')).toBeDefined()
+  })
+
+  it('re-minting an existing state value does not evict a different entry', () => {
+    // #given
+    const store = createInMemoryStateStore(2)
+    store.set('a', entry())
+    store.set('b', entry())
+
+    // #when
+    store.set('b', entry(2000))
+
+    // #then
+    expect(countKnown(store, ['a', 'b'])).toBe(2)
+    expect(store.get('a')).toBeDefined()
+    expect(store.get('b')?.issuedAt).toBe(2000)
+  })
+
+  it('an evicted state is never resurrected by later activity', () => {
+    // #given
+    const store = createInMemoryStateStore(1)
+    store.set('a', entry())
+    store.set('b', entry())
+
+    // #when
+    store.consume('a')
+    store.evictStale(10_000, 600_000)
+
+    // #then
+    expect(store.get('a')).toBeUndefined()
+    expect(countKnown(store, ['a', 'b'])).toBe(1)
+  })
+
+  it.each([
+    ['zero', 0],
+    ['a negative value', -1],
+    ['NaN', Number.NaN],
+    ['a fractional value', 1.5],
+    ['Infinity', Number.POSITIVE_INFINITY],
+  ])('fails fast with a RangeError when maxEntries is %s', (_label, maxEntries) => {
+    // #given / #when / #then — a non-positive or non-integer bound is a programming error
+    expect(() => createInMemoryStateStore(maxEntries)).toThrow(RangeError)
+  })
+
+  it('accepts a bound of exactly 1', () => {
+    // #given / #when / #then
+    expect(() => createInMemoryStateStore(1)).not.toThrow()
   })
 })
 
@@ -2138,7 +2606,7 @@ describe('GET /operator/auth/github/start — validateReturnPath backslash/encod
 
     // #then — rejected; no state minted (backslash does not start with /)
     expect(res.status).toBe(400)
-    expect(stateStore.size()).toBe(0)
+    expect(stateStore.get(DEFAULT_TEST_STATE)).toBeUndefined()
   })
 
   it('rejects encoded-slash path (/%2fevil.com open-redirect attempt)', async () => {
@@ -2154,7 +2622,7 @@ describe('GET /operator/auth/github/start — validateReturnPath backslash/encod
 
     // #then — rejected; not in allowlist (exact-match allowlist prevents bypass)
     expect(res.status).toBe(400)
-    expect(stateStore.size()).toBe(0)
+    expect(stateStore.get(DEFAULT_TEST_STATE)).toBeUndefined()
   })
 
   it('rejects uppercase encoded-slash path (/%2Fevil.com)', async () => {
@@ -2170,7 +2638,7 @@ describe('GET /operator/auth/github/start — validateReturnPath backslash/encod
 
     // #then — rejected; not in allowlist
     expect(res.status).toBe(400)
-    expect(stateStore.size()).toBe(0)
+    expect(stateStore.get(DEFAULT_TEST_STATE)).toBeUndefined()
   })
 })
 
@@ -3558,6 +4026,6 @@ describe('GET /operator/auth/github/callback — backslash open-redirect hardeni
 
     // #then
     expect(res.status).toBe(400)
-    expect(stateStore.size()).toBe(0)
+    expect(stateStore.get(DEFAULT_TEST_STATE)).toBeUndefined()
   })
 })
