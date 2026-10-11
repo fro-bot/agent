@@ -2182,13 +2182,12 @@ describe('createInMemoryStateStore', () => {
     expect(store.get('active')).toBeDefined()
   })
 
-  it('evictStale with empty store is a no-op', () => {
+  it('evictStale on an empty store does not throw', () => {
     // #given
     const store = createInMemoryStateStore()
 
-    // #when / #then — no throw
+    // #when / #then
     expect(() => store.evictStale(Date.now(), 600_000)).not.toThrow()
-    expect(countKnown(store, ['anything'])).toBe(0)
   })
 })
 

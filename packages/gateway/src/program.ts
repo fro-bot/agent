@@ -265,8 +265,8 @@ export function buildOperatorServerInputs(inputs: BuildOperatorServerInputs): {
     operatorWebConfig,
   } = inputs
 
-  // Build the source key extractor for OAuth outstanding-attempt counting and
-  // source-key binding. Resolves through the trusted-proxy-aware ingress
+  // Build the client-address resolver for OAuth attempt counting (accountingKey)
+  // and callback binding (canonical, stored as boundAddress). Resolves through the trusted-proxy-aware ingress
   // policy: the TCP socket address is used directly for an untrusted peer,
   // or the first untrusted address in a trusted proxy's X-Forwarded-For
   // chain. A resolution failure (missing/invalid socket, missing/malformed
