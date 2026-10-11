@@ -45,6 +45,10 @@ A privacy delete for an operator marks every one of their active subscription re
 
 The subscription lifecycle is recorded on the same coarse audit trail as the rest of the operator surface (see the [Operator Web Control Surface](../wiki/Operator%20Web%20Control%20Surface.md) wiki page): an operator subscribing, unsubscribing, having a subscription deactivated, and per-broadcast dispatch summaries. Every one of these audit records carries only the operator's GitHub user ID, coarse enum reasons, and counts — never an endpoint, a key, or notification payload content.
 
+## Push health status
+
+The authenticated operator session response may include a coarse `push.status` (`ready`, `degraded`, or `unknown`). It is derived in memory from the outcomes of calls that already happen, is returned only to the authenticated operator, and is never persisted or included in exports or audit events.
+
 ## Enablement
 
 Push is disabled by default. Turning it on in a given deployment requires provisioning VAPID key material as server-only configuration and accepting the retention policy described here — there is no way to enable the surface without both.

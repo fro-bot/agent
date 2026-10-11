@@ -65,7 +65,7 @@ import {extractRawIngressInput} from './web/ingress/hono-context.js'
 import {resolveClient} from './web/ingress/resolve-client.js'
 import {createDedupeCache} from './web/operator-push/dedupe-cache.js'
 import {createPushDispatcher} from './web/operator-push/dispatcher.js'
-import {observePushStoreHealth} from './web/operator-push/push-health-store.js'
+import {observePushAdapterHealth} from './web/operator-push/push-health-adapter.js'
 import {createPushHealthTracker} from './web/operator-push/push-health.js'
 import {createPushSender} from './web/operator-push/push-sender.js'
 import {createOperatorPushSubscriptionStore} from './web/operator-push/subscription-store.js'
@@ -875,11 +875,10 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       // crash gateway startup — it only disables the push surface (the rest of
       // the operator server still starts) so a misconfigured/incompatible object
       // store can never silently corrupt subscription ownership transfers.
-      // Passive push-health tracker, created BEFORE the startup gate so a
-      // self-test failure/throw is reportable (the dispatcher and routes only
-      // exist after a pass). In-memory only; read on the authenticated session
-      // response. Stays `disabled` (field omitted) when push is not configured.
-      const pushHealth = createPushHealthTracker({clock: () => Date.now()})
+      // Passive push-health tracker, created before the startup gate so a
+      // self-test failure or throw is reportable. Monotonic clock: staleness
+      // must not follow wall-clock steps.
+      const pushHealth = createPushHealthTracker({clock: () => performance.now()})
       let operatorPush:
         | {
             readonly store: OperatorPushSubscriptionStore
@@ -889,9 +888,8 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       if (config.operatorPush === undefined) {
         emitAudit({kind: 'push.disabled', correlationId: 'startup', reason: 'config_absent'}, logger)
       } else {
-        pushHealth.markConfigured()
         const pushStore = createOperatorPushSubscriptionStore({
-          adapter: s3Adapter,
+          adapter: observePushAdapterHealth(s3Adapter, pushHealth),
           logger,
         })
         // Effect.tryPromise (not Effect.promise) so a throwing adapter — not
@@ -904,11 +902,8 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           catch: error => (error instanceof Error ? error : new Error(String(error))),
         }).pipe(Effect.catchAll(error => Effect.succeed(err(error))))
         if (selfTest.success === true) {
-          pushHealth.recordStartup('passed')
-          // Every route and dispatcher store call goes through the observed
-          // store so backend outcomes feed the tracker at the I/O boundary.
-          const observedStore = observePushStoreHealth(pushStore, pushHealth)
-          operatorPush = {store: observedStore, vapidPublicKeyInfo: config.operatorPush.vapidPublicKeyInfo}
+          pushHealth.recordStartup('ok')
+          operatorPush = {store: pushStore, vapidPublicKeyInfo: config.operatorPush.vapidPublicKeyInfo}
 
           // Construct the push sender + broadcast dispatcher now that the store
           // has passed its CAS self-test. Assigning the module-scoped
@@ -918,7 +913,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           // alike, since both share runEngineDeps.
           const pushSender = createPushSender({logger})
           operatorPushDispatcher = createPushDispatcher({
-            store: observedStore,
+            store: pushStore,
             sender: pushSender,
             dedupeCache: createDedupeCache({windowMs: config.operatorPush.dedupeWindowMs, clock: () => Date.now()}),
             triggerPolicy: {shouldNotify},

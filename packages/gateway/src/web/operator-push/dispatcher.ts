@@ -79,10 +79,10 @@ export interface CreatePushDispatcherDeps {
   readonly auditLogger: AuditLogger
   /**
    * Optional passive health sink. Receives one relay observation per broadcast
-   * that actually attempted delivery. Backend (store) observations are NOT
-   * recorded here — they come from the observed store at the I/O boundary.
+   * that attempted delivery. Backend observations come from the observed
+   * object-store adapter, not from here.
    */
-  readonly pushHealth?: Pick<PushHealthTracker, 'recordRelay'>
+  readonly pushHealth?: Pick<PushHealthTracker, 'nextSequence' | 'recordRelay'>
 }
 
 export interface PushDispatcher {
@@ -100,6 +100,7 @@ export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispat
 
   async function broadcast(kind: OperatorPushTriggerKind, dedupeId: string, payload: string): Promise<void> {
     const dedupeKey = `${dedupeId}:${kind}`
+    const relayStart = pushHealth?.nextSequence() ?? 0
 
     // List first: a transient list failure must not consume the dedupe
     // slot, or a retry of the same event within the dedupe window would be
@@ -177,9 +178,9 @@ export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispat
     // accepted send and no failures can clear it. A broadcast that delivered
     // nothing (all dead, or all skipped as stale-key) establishes neither.
     if (failed > 0) {
-      pushHealth?.recordRelay('failed')
+      pushHealth?.recordRelay('failed', relayStart)
     } else if (delivered > 0) {
-      pushHealth?.recordRelay('ok')
+      pushHealth?.recordRelay('ok', relayStart)
     }
   }
 

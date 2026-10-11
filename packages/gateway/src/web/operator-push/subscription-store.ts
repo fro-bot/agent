@@ -199,20 +199,11 @@ export interface OperatorPushSubscriptionStoreDeps {
 }
 
 export interface StoreError extends Error {
-  /**
-   * `OPERATOR_PUSH_OWNERSHIP_DENIED` marks a policy denial (the caller does not
-   * own the record), not an operational failure — observers such as the push
-   * health tracker must not treat it as a backend fault.
-   */
-  readonly code: 'OPERATOR_PUSH_STORE_ERROR' | 'OPERATOR_PUSH_OWNERSHIP_DENIED'
+  readonly code: 'OPERATOR_PUSH_STORE_ERROR'
 }
 
 export function createStoreError(message: string): StoreError {
   return Object.assign(new Error(message), {code: 'OPERATOR_PUSH_STORE_ERROR' as const})
-}
-
-export function createOwnershipDeniedError(message: string): StoreError {
-  return Object.assign(new Error(message), {code: 'OPERATOR_PUSH_OWNERSHIP_DENIED' as const})
 }
 
 export interface SelfTestCasFailure extends Error {
@@ -675,7 +666,7 @@ export function createOperatorPushSubscriptionStore(
       const {record: current, etag} = existing.data
       if (current.operatorId !== args.operatorId) {
         // Fail closed — a different operator cannot unsubscribe someone else's record.
-        return err(createOwnershipDeniedError('unsubscribe: endpoint is not owned by this operator'))
+        return err(createStoreError('unsubscribe: endpoint is not owned by this operator'))
       }
 
       const now = clock()
@@ -978,7 +969,7 @@ export function createOperatorPushSubscriptionStore(
       const {record: current, etag} = existing.data
       if (current.operatorId !== args.operatorId) {
         // Fail closed — a different operator cannot deactivate someone else's record.
-        return err(createOwnershipDeniedError('markDead: endpoint is not owned by this operator'))
+        return err(createStoreError('markDead: endpoint is not owned by this operator'))
       }
       if (current.active === false) {
         return ok(undefined) // Already inactive — no-op.

@@ -1,4 +1,4 @@
-import type {CoordinationConfig} from '@fro-bot/runtime'
+import type {CoordinationConfig, ObjectStoreAdapter} from '@fro-bot/runtime'
 
 import type {GatewayConfig} from './config.js'
 import type {GatewayLogger} from './discord/client.js'
@@ -142,6 +142,13 @@ vi.mock('./web/operator-push/subscription-store.js', async importOriginal => {
       selfTestCas: selfTestCasMock,
     })),
   }
+})
+
+// Spy (pass-through) on the adapter observer so program tests can assert the subscription store is
+// built over the observed adapter and that it shares the tracker behind the session status.
+vi.mock('./web/operator-push/push-health-adapter.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('./web/operator-push/push-health-adapter.js')>()
+  return {...actual, observePushAdapterHealth: vi.fn(actual.observePushAdapterHealth)}
 })
 
 const {makeDiscordClientFromConfig, makeGatewayProgram, makeLogger} = await import('./program.js')
@@ -1532,6 +1539,54 @@ describe('button interaction handler (approval flow)', () => {
   })
 
   describe('operator push health (startup gate)', () => {
+    it('builds the subscription store over the health-observed adapter, sharing the status tracker', async () => {
+      // #given
+      selfTestCasMock.mockResolvedValueOnce({success: true, data: undefined})
+      const startOperatorServerSpy = vi.fn().mockReturnValue(makeFakeServerHandle())
+      const deps = {
+        makeClient: () => makeFakeClient() as unknown as import('discord.js').Client,
+        setupReadinessFlag: vi.fn(),
+        login: vi.fn().mockResolvedValue(undefined),
+        startAnnounceServer: vi.fn(),
+        startOperatorServer: startOperatorServerSpy,
+        runProviderSelfTest: vi.fn(async () => {}),
+      }
+      const {observePushAdapterHealth} = await import('./web/operator-push/push-health-adapter.js')
+      const {createOperatorPushSubscriptionStore} = await import('./web/operator-push/subscription-store.js')
+      vi.mocked(observePushAdapterHealth).mockClear()
+      vi.mocked(createOperatorPushSubscriptionStore).mockClear()
+
+      // #when
+      await Effect.runPromise(
+        makeGatewayProgram(
+          deps,
+          makeFakeConfig({
+            announce: undefined,
+            operatorWeb: makeOperatorWebConfig(),
+            operatorPush: makeOperatorPushConfig(),
+          }),
+        ),
+      )
+
+      // #then the store's adapter is the observer's output
+      const observeCall = vi.mocked(observePushAdapterHealth).mock.calls[0]
+      const observed: unknown = vi.mocked(observePushAdapterHealth).mock.results[0]?.value
+      expect(observeCall).toBeDefined()
+      expect(vi.mocked(createOperatorPushSubscriptionStore)).toHaveBeenCalledWith(
+        expect.objectContaining({adapter: observed as ObjectStoreAdapter}),
+      )
+
+      // #and the observer's tracker is the one behind the session status
+      const [serverDeps] = startOperatorServerSpy.mock.calls[0] as [
+        import('./web/server.js').OperatorServerDeps,
+        import('./web/server.js').OperatorServerConfig,
+      ]
+      expect(serverDeps.operatorPushHealth?.()).toBe('ready')
+      const tracker = observeCall?.[1]
+      tracker?.recordBackend('write', 'failed', tracker.nextSequence())
+      expect(serverDeps.operatorPushHealth?.()).toBe('degraded')
+    })
+
     it('reports disabled (so the session field is omitted) when push is not configured', async () => {
       // #when
       const status = await startAndReadPushHealth({push: false})

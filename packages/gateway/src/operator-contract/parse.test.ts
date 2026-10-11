@@ -717,15 +717,15 @@ describe('parseOperatorSessionInfo — optional push health', () => {
     const result = parseOperatorSessionInfo(base)
 
     // #then
-    expect(result.success).toBe(true)
+    expect(result).toEqual({success: true, data: base})
   })
 
-  it.each(['ready', 'degraded', 'unknown'])('accepts push.status %s', status => {
+  it.each(['ready', 'degraded', 'unknown'])('keeps a valid push.status %s', status => {
     // #when
     const result = parseOperatorSessionInfo({...base, push: {status}})
 
     // #then
-    expect(result.success).toBe(true)
+    expect(result).toEqual({success: true, data: {...base, push: {status}}})
   })
 
   it.each([
@@ -735,9 +735,18 @@ describe('parseOperatorSessionInfo — optional push health', () => {
     ['non-object push', 'ready'],
     ['array push', ['ready']],
     ['null push', null],
-  ])('rejects a malformed push field: %s', (_label, push) => {
+  ])('strips a malformed push field and still parses the session: %s', (_label, push) => {
     // #when
     const result = parseOperatorSessionInfo({...base, push})
+
+    // #then the optional diagnostic never rejects an otherwise valid session
+    expect(result).toEqual({success: true, data: base})
+    expect(result.success && 'push' in result.data).toBe(false)
+  })
+
+  it('still rejects when a required field is invalid, regardless of push', () => {
+    // #when
+    const result = parseOperatorSessionInfo({...base, operatorId: 'x', push: {status: 'ready'}})
 
     // #then
     expect(result.success).toBe(false)
