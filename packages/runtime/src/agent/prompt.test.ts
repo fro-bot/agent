@@ -2052,6 +2052,65 @@ describe('buildTaskSection', () => {
     )
   })
 
+  const buildNonPostingScheduleOptions = (overrides: Partial<PromptOptions>): PromptOptions => ({
+    responseSurface: 'issue-comment',
+    context: createMockContext({
+      eventName: 'schedule',
+      issueNumber: null,
+      issueTitle: null,
+      issueType: null,
+      commentBody: null,
+    }),
+    customPrompt: 'Run maintenance and open a report issue.',
+    cacheStatus: 'hit',
+    triggerContext: createMockTriggerContext({eventType: 'schedule', target: null, commentBody: null}),
+    resolvedOutputMode: 'working-dir',
+    ...overrides,
+  })
+
+  const expectNonPostingWorkingDirPreamble = (taskBlock: string): void => {
+    // #then the task preamble does not grant posting and states the non-posting rule
+    expect(taskBlock).not.toContain('GitHub operations the task explicitly requires')
+    expect(taskBlock).toContain('This run is non-posting: do not create GitHub comments, issues, or reports.')
+    // #then the shell wording and code-delivery prohibitions are unchanged
+    expect(taskBlock).toContain('run shell commands that do not deliver code')
+    expect(taskBlock).toContain(
+      '- Forbidden actions: `git branch`, `git commit`, `git push`, `gh pr create`, `gh pr merge`, branch creation, branch switching, any tool/skill that delivers via branch+PR.',
+    )
+  }
+
+  it.each([
+    {label: 'responseMode none + responseDelivery none (production shape)', responseDelivery: 'none'},
+    {label: 'responseMode none alone', responseDelivery: undefined},
+  ] as const)(
+    'working-dir preamble does not grant GitHub posting when responseMode is none: $label',
+    ({responseDelivery}) => {
+      // #given a non-posting schedule run resolved to working-dir
+      const options = buildNonPostingScheduleOptions({responseMode: 'none', responseDelivery})
+
+      // #when
+      const prompt = buildAgentPrompt(options, mockLogger).text
+
+      // #then agent_context still carries the non-posting rule
+      expect(getXmlBlock(prompt, 'agent_context')).toContain(
+        'Do NOT create GitHub comments, reviews, issues, discussions, reactions, or labels',
+      )
+      expectNonPostingWorkingDirPreamble(getXmlBlock(prompt, 'task'))
+    },
+  )
+
+  it('working-dir preamble does not grant GitHub posting when only responseDelivery is none', () => {
+    // #given a schedule run whose delivery is none but responseMode was left at its default
+    const options = buildNonPostingScheduleOptions({responseDelivery: 'none'})
+
+    // #when
+    const prompt = buildAgentPrompt(options, mockLogger).text
+
+    // #then harness_rules already declares silent automation, and the preamble agrees
+    expect(getXmlBlock(prompt, 'harness_rules')).toContain('This run is silent automation')
+    expectNonPostingWorkingDirPreamble(getXmlBlock(prompt, 'task'))
+  })
+
   it('renders branch-pr preamble before ## Task heading for workflow_dispatch with output-mode: branch-pr', () => {
     // #given
     const options: PromptOptions = {

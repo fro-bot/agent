@@ -6,6 +6,7 @@
  */
 
 import type {Logger} from '../shared/logger.js'
+import type {ResponseMode} from '../shared/types.js'
 import type {ResolvedOutputMode} from './output-mode.js'
 import type {ResponseDelivery} from './response-delivery.js'
 import type {
@@ -135,14 +136,17 @@ function buildReviewCommentDirective(context: TriggerContext): string {
   return lines.join('\n')
 }
 
-function buildDeliveryModePreamble(resolvedMode: ResolvedOutputMode): string {
+function buildDeliveryModePreamble(resolvedMode: ResolvedOutputMode, nonPosting: boolean): string {
   if (resolvedMode === 'working-dir') {
+    const githubOperations = nonPosting
+      ? 'This run is non-posting: do not create GitHub comments, issues, or reports.'
+      : 'GitHub operations the task explicitly requires (for example issues, comments, or reports) are also permitted.'
     return [
       '## Delivery Mode',
       '- **Resolved output mode:** `working-dir`',
       '- Write all requested file changes directly in the checked-out working tree.',
       '- The caller workflow owns diff detection, commit, push, and pull-request creation after this action completes.',
-      '- Available actions: read files, edit files, create files in the working tree, run shell commands that do not deliver code. GitHub operations the task explicitly requires (for example issues, comments, or reports) are also permitted.',
+      `- Available actions: read files, edit files, create files in the working tree, run shell commands that do not deliver code. ${githubOperations}`,
       '- Forbidden actions: `git branch`, `git commit`, `git push`, `gh pr create`, `gh pr merge`, branch creation, branch switching, any tool/skill that delivers via branch+PR.',
       '- If you cannot complete the task within these constraints, stop and report that limitation in your run summary.',
       '',
@@ -164,12 +168,15 @@ export function buildTaskSection(
   promptInput: string | null,
   resolvedMode: ResolvedOutputMode | null,
   responseDelivery: ResponseDelivery = 'model-gh',
+  responseMode: ResponseMode = 'github',
 ): string {
   const {directive} = getTriggerDirective(context, promptInput, responseDelivery)
+  // Same signal as <agent_context> (responseMode) and <harness_rules> (responseDelivery): either one means non-posting.
+  const nonPosting = responseMode === 'none' || responseDelivery === 'none'
   const lines: string[] = []
 
   if ((context.eventType === 'schedule' || context.eventType === 'workflow_dispatch') && resolvedMode != null) {
-    lines.push(buildDeliveryModePreamble(resolvedMode))
+    lines.push(buildDeliveryModePreamble(resolvedMode, nonPosting))
   }
 
   lines.push('## Task')
@@ -413,7 +420,13 @@ export function buildAgentPrompt(options: PromptOptions, logger: Logger): Prompt
     parts.push(
       wrapXml(
         'task',
-        buildTaskSection(options.triggerContext, customPrompt, resolvedOutputMode ?? null, responseDelivery),
+        buildTaskSection(
+          options.triggerContext,
+          customPrompt,
+          resolvedOutputMode ?? null,
+          responseDelivery,
+          options.responseMode ?? 'github',
+        ),
       ),
     )
   } else if (context.commentBody == null) {
