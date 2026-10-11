@@ -109,7 +109,7 @@ describe('buildLogicalKey', () => {
     })
 
     // #when
-    const result = buildLogicalKey(context)
+    const result = buildLogicalKey(context, null)
 
     // #then
     expect(result).toEqual({key: 'issue-12', entityType: 'issue', entityId: '12'})
@@ -123,7 +123,7 @@ describe('buildLogicalKey', () => {
     })
 
     // #when
-    const result = buildLogicalKey(context)
+    const result = buildLogicalKey(context, null)
 
     // #then
     expect(result).toEqual({key: 'pr-347', entityType: 'pr', entityId: '347'})
@@ -137,7 +137,7 @@ describe('buildLogicalKey', () => {
     })
 
     // #when
-    const result = buildLogicalKey(context)
+    const result = buildLogicalKey(context, null)
 
     // #then
     expect(result).toEqual({key: 'discussion-5', entityType: 'discussion', entityId: '5'})
@@ -151,7 +151,7 @@ describe('buildLogicalKey', () => {
     })
 
     // #when
-    const result = buildLogicalKey(context)
+    const result = buildLogicalKey(context, null)
 
     // #then
     expect(result).toEqual({key: 'issue-42', entityType: 'issue', entityId: '42'})
@@ -165,7 +165,7 @@ describe('buildLogicalKey', () => {
     })
 
     // #when
-    const result = buildLogicalKey(context)
+    const result = buildLogicalKey(context, null)
 
     // #then
     expect(result).toEqual({key: 'pr-88', entityType: 'pr', entityId: '88'})
@@ -179,7 +179,7 @@ describe('buildLogicalKey', () => {
     })
 
     // #when
-    const result = buildLogicalKey(context)
+    const result = buildLogicalKey(context, null)
 
     // #then
     expect(result).toEqual({key: 'pr-99', entityType: 'pr', entityId: '99'})
@@ -194,7 +194,7 @@ describe('buildLogicalKey', () => {
     })
 
     // #when
-    const result = buildLogicalKey(context)
+    const result = buildLogicalKey(context, null)
 
     // #then
     expect(result).toEqual({
@@ -214,7 +214,7 @@ describe('buildLogicalKey', () => {
     })
 
     // #when
-    const result = buildLogicalKey(context)
+    const result = buildLogicalKey(context, null)
 
     // #then — format is schedule-<8hex>-<runId>
     expect(result?.key).toMatch(/^schedule-[0-9a-f]{8}-9999$/)
@@ -227,8 +227,8 @@ describe('buildLogicalKey', () => {
     const context2 = createTriggerContext({eventType: 'schedule', action: '0 6 * * *', target: null, runId: 42})
 
     // #when
-    const key1 = buildLogicalKey(context1)
-    const key2 = buildLogicalKey(context2)
+    const key1 = buildLogicalKey(context1, null)
+    const key2 = buildLogicalKey(context2, null)
 
     // #then
     expect(key1).toEqual(key2)
@@ -240,8 +240,8 @@ describe('buildLogicalKey', () => {
     const context2 = createTriggerContext({eventType: 'schedule', action: '0 6 * * *', target: null, runId: 200})
 
     // #when
-    const key1 = buildLogicalKey(context1)
-    const key2 = buildLogicalKey(context2)
+    const key1 = buildLogicalKey(context1, null)
+    const key2 = buildLogicalKey(context2, null)
 
     // #then
     expect(key1?.key).not.toEqual(key2?.key)
@@ -258,7 +258,7 @@ describe('buildLogicalKey', () => {
     })
 
     // #when
-    const result = buildLogicalKey(context)
+    const result = buildLogicalKey(context, null)
 
     // #then — key still has runId appended
     expect(result?.key).toMatch(/^schedule-[0-9a-f]{8}-77$/)
@@ -274,10 +274,65 @@ describe('buildLogicalKey', () => {
     })
 
     // #when
-    const result = buildLogicalKey(context)
+    const result = buildLogicalKey(context, null)
 
     // #then
     expect(result).toEqual({key: 'dispatch-90210', entityType: 'dispatch', entityId: '90210'})
+  })
+
+  it('qualifies the schedule key with the invocation identity so two jobs in one run get distinct keys', () => {
+    // #given two jobs of the same scheduled run (same cron, same runId), e.g. needs:-chained
+    // "Remediate" then "Observe"
+    const context = createTriggerContext({eventType: 'schedule', action: '0 6 * * *', target: null, runId: 38026680860})
+
+    // #when each job builds its logical key
+    const remediate = buildLogicalKey(context, 'fro-bot-remediate')
+    const observe = buildLogicalKey(context, 'fro-bot-observe')
+
+    // #then the keys differ (Observe must not continue Remediate's root session) and carry the job
+    expect(remediate?.key).not.toBe(observe?.key)
+    expect(remediate?.key).toMatch(/^schedule-[0-9a-f]{8}-38026680860-fro-bot-remediate$/)
+    expect(observe?.key).toMatch(/^schedule-[0-9a-f]{8}-38026680860-fro-bot-observe$/)
+    expect(observe?.entityId).toMatch(/^[0-9a-f]{8}-38026680860-fro-bot-observe$/)
+  })
+
+  it('keeps the schedule key stable for the same job and run (a re-run of the job resumes its session)', () => {
+    // #given the same job resolving its key twice for the same run -- a re-run attempt changes
+    // GITHUB_RUN_ATTEMPT only, which is deliberately not an input to the logical key
+    const context = createTriggerContext({eventType: 'schedule', action: '0 6 * * *', target: null, runId: 4242})
+
+    // #when
+    const attempt1 = buildLogicalKey(context, 'fro-bot-observe')
+    const attempt2 = buildLogicalKey(context, 'fro-bot-observe')
+
+    // #then
+    expect(attempt1).toEqual(attempt2)
+  })
+
+  it('qualifies the dispatch key with the invocation identity (run-scoped, like schedule)', () => {
+    // #given two jobs of one workflow_dispatch run
+    const context = createTriggerContext({eventType: 'workflow_dispatch', runId: 90210, target: null})
+
+    // #when
+    const first = buildLogicalKey(context, 'job-a')
+    const second = buildLogicalKey(context, 'job-b')
+
+    // #then
+    expect(first).toEqual({key: 'dispatch-90210-job-a', entityType: 'dispatch', entityId: '90210-job-a'})
+    expect(second?.key).toBe('dispatch-90210-job-b')
+  })
+
+  it('does not qualify entity-bound keys (issue, pr, discussion): jobs on one object intentionally share a thread', () => {
+    // #given an issue comment and a PR review handled by different jobs
+    const issue = createTriggerContext({eventType: 'issue_comment', target: createTarget('issue', 12)})
+    const pr = createTriggerContext({eventType: 'pull_request', target: createTarget('pr', 347)})
+    const discussion = createTriggerContext({eventType: 'discussion_comment', target: createTarget('discussion', 17)})
+
+    // #when keys are built with an identity
+    // #then the identity is not part of the key
+    expect(buildLogicalKey(issue, 'job-a')?.key).toBe('issue-12')
+    expect(buildLogicalKey(pr, 'job-a')?.key).toBe('pr-347')
+    expect(buildLogicalKey(discussion, 'job-b')?.key).toBe('discussion-17')
   })
 
   it('returns null for unsupported events', () => {
@@ -288,7 +343,7 @@ describe('buildLogicalKey', () => {
     })
 
     // #when
-    const result = buildLogicalKey(context)
+    const result = buildLogicalKey(context, null)
 
     // #then
     expect(result).toBeNull()
@@ -302,7 +357,7 @@ describe('buildLogicalKey', () => {
     })
 
     // #when
-    const result = buildLogicalKey(context)
+    const result = buildLogicalKey(context, null)
 
     // #then
     expect(result).toBeNull()
@@ -316,8 +371,8 @@ describe('buildLogicalKey', () => {
     })
 
     // #when
-    const first = buildLogicalKey(context)
-    const second = buildLogicalKey(context)
+    const first = buildLogicalKey(context, null)
+    const second = buildLogicalKey(context, null)
 
     // #then
     expect(first).toEqual(second)

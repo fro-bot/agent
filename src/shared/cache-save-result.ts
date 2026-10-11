@@ -14,8 +14,11 @@
  *   confirm the writer had stopped, or the coordination lease could not be renewed.
  *   Neither backend was attempted. See `runCleanup` (`src/harness/phases/cleanup.ts`)
  *   for which of the three conditions produced it.
- * - `cache-rejected`: the Actions cache write returned its `-1` failure sentinel. `@actions/cache@6.2.0`
- *   distinguishes a policy denial (`CacheWriteDeniedError`) from a reservation collision
+ * - `cache-rejected`: the Actions cache write did not persist: either it returned the `-1`
+ *   failure sentinel, or it threw an "already exists" reservation collision (a held reservation
+ *   on this invocation's identity-qualified key -- never treated as this invocation's success,
+ *   because it proves nothing about whether this invocation's state landed under that key).
+ *   `@actions/cache@6.2.0` distinguishes a policy denial (`CacheWriteDeniedError`) from a reservation collision
  *   (`ReserveCacheError`) internally, but neither survives the `saveCache()` call
  *   boundary — both return `-1` with no further detail, as does a `FinalizeCacheError`, a
  *   5xx server error, or an upload/archive failure (verified in `@actions/cache`'s
@@ -27,14 +30,13 @@
  *   this call — a self-hosted runner or customized environment can hold a writable token
  *   even on a comment trigger, and a transient service failure can happen regardless of
  *   token permissions.
- * - `cache-error`: the save threw an error other than a caught "already exists" collision
- *   (see below). Distinct from `cache-rejected`: this is a thrown exception, not the `-1`
- *   sentinel.
- * - `persisted`: the save reached a durable state through at least one backend. This
- *   includes the case where `cacheAdapter.saveCache` throws an "already exists" error —
- *   folded in here (not a separate outcome) because the cache key is durably written
- *   either way: some other job's concurrent save already committed it, so the state is
- *   present under that key regardless of which run wrote it.
+ * - `cache-error`: the save threw an error other than an "already exists" collision
+ *   (which maps to `cache-rejected`, above). Distinct from `cache-rejected`: this is a thrown
+ *   exception, not a rejected write.
+ * - `persisted`: the save reached a durable state through at least one backend. An "already
+ *   exists" throw from `cacheAdapter.saveCache` is NOT folded in here any more: it used to be,
+ *   on the theory that some concurrent save had committed the key, but with job-agnostic keys
+ *   that "someone" was a different job and this invocation's state was silently lost.
  */
 export type CacheSaveOutcome =
   | 'skipped-by-configuration'

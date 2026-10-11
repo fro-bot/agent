@@ -921,7 +921,7 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
     const core = await import('@actions/core')
     expect(core.summary.addHeading).toHaveBeenCalledWith('Session Persistence', 3)
     const remediationText = vi.mocked(core.summary.addRaw).mock.calls.flat().join(' ')
-    expect(remediationText).toContain('**Reason:**')
+    expect(remediationText).toContain('<strong>Reason:</strong>')
     expect(remediationText).toContain('background subagent work')
   })
 

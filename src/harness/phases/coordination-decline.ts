@@ -5,7 +5,7 @@ import type {Logger} from '../../shared/logger.js'
 import * as core from '@actions/core'
 import {addLabelsToIssue, ensureLabelExists, removeLabelFromIssueWithOutcome} from '../../services/github/api.js'
 import {toErrorMessage} from '../../shared/errors.js'
-import {escapeSummaryText as cell} from '../../shared/summary-escape.js'
+import {htmlCode, htmlLink, htmlParagraph, htmlStrong, htmlText} from '../../shared/summary-html.js'
 import {parseActionHolderRunId} from './acquire-lock.js'
 
 export const BLOCKED_LABEL = 'agent: blocked' as const
@@ -77,26 +77,26 @@ function describeEntity(context: TriggerContext): string {
     const base = `https://github.com/${owner}/${repo}`
     switch (target.kind) {
       case 'issue':
-        return `<a href="${base}/issues/${target.number}">issue #${target.number}</a>`
+        return htmlLink(`issue #${target.number}`, `${base}/issues/${target.number}`)
       case 'pr':
-        return `<a href="${base}/pull/${target.number}">pull request #${target.number}</a>`
+        return htmlLink(`pull request #${target.number}`, `${base}/pull/${target.number}`)
       case 'discussion':
-        return `<a href="${base}/discussions/${target.number}">discussion #${target.number}</a>`
+        return htmlLink(`discussion #${target.number}`, `${base}/discussions/${target.number}`)
       case 'manual':
         break
     }
   }
-  return 'repository-level invocation'
+  return htmlText('repository-level invocation')
 }
 
 function describeHolder(context: TriggerContext, holder: LockRecord | null): string {
-  if (holder == null) return 'unknown'
+  if (holder == null) return htmlText('unknown')
   const holderRunId = parseActionHolderRunId(holder.holder_id)
   if (holder.surface === 'github' && holderRunId != null) {
     const url = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${holderRunId}`
-    return `${cell(holder.surface)} (Action run <a href="${url}">${holderRunId}</a>)`
+    return `${htmlText(holder.surface)} (Action run ${htmlLink(String(holderRunId), url)})`
   }
-  return cell(holder.surface)
+  return htmlText(holder.surface)
 }
 
 async function applyBlockedLabel(
@@ -153,32 +153,36 @@ async function writeCoordinationSkipSummary(
     const expiry = leaseExpiry(holder)
     core.summary
       .addHeading('Fro Bot Agent Run — Skipped (Coordination)', 2)
-      .addRaw(`${cell(reason)}\n\n`)
+      .addRaw(`${htmlParagraph(htmlText(reason))}\n`)
       .addTable([
         [
           {data: 'Detail', header: true},
           {data: 'Value', header: true},
         ],
         ['Target', describeEntity(context)],
-        ['Trigger', `<code>${cell(context.eventType)}.${cell(context.action ?? 'unknown')}</code>`],
-        ['Reason', cell(reason)],
+        ['Trigger', htmlCode(`${context.eventType}.${context.action ?? 'unknown'}`)],
+        ['Reason', htmlText(reason)],
         ['Last observed holder', describeHolder(context, holder)],
         [
           'Lease expiry (observed)',
-          expiry == null ? 'unknown' : `<code>${expiry}</code> — NOT an estimated completion time`,
+          expiry == null ? htmlText('unknown') : `${htmlCode(expiry)} — NOT an estimated completion time`,
         ],
-        [`Label <code>${BLOCKED_LABEL}</code>`, labelStatus],
+        [`Label ${htmlCode(BLOCKED_LABEL)}`, htmlText(labelStatus)],
       ])
     if (labelLostIssueNumber != null) {
       core.summary.addRaw(
-        `\n**Action needed:** the \`${BLOCKED_LABEL}\` label could not be re-applied to #${cell(String(labelLostIssueNumber))}; add it manually.\n`,
+        `${htmlParagraph(
+          `${htmlStrong('Action needed:')} the ${htmlCode(BLOCKED_LABEL)} label could not be re-applied to #${labelLostIssueNumber}; add it manually.`,
+        )}\n`,
       )
     }
     core.summary.addRaw(
-      '\nNo agent execution occurred. This request was not automatically requeued.\n\n' +
-        '**Recovery:** re-run this workflow, or mention the bot again after the other run finishes. ' +
-        'Editing the issue alone does not retrigger it. The `agent: blocked` label is removed automatically when a ' +
-        'later run for this item succeeds; remove it manually if needed.\n',
+      `${htmlParagraph('No agent execution occurred. This request was not automatically requeued.')}\n` +
+        `${htmlParagraph(
+          `${htmlStrong('Recovery:')} re-run this workflow, or mention the bot again after the other run finishes. ` +
+            `Editing the issue alone does not retrigger it. The ${htmlCode(BLOCKED_LABEL)} label is removed automatically when a ` +
+            'later run for this item succeeds; remove it manually if needed.',
+        )}\n`,
     )
 
     await core.summary.write()

@@ -131,3 +131,18 @@ describe('action.yaml literal defaults agree with their TypeScript constants', (
     },
   )
 })
+
+describe('action.yaml matrix-context input feeds the invocation identity', () => {
+  it('defaults to toJSON(matrix) so a matrix leg gets a distinct invocation identity', () => {
+    // #given the committed action.yaml metadata
+    const input = readActionYamlInputs()['matrix-context']
+
+    // #when reading its default
+    // #then it must be the expression getInvocationIdentity() (packages/runtime/src/shared/
+    // invocation-identity.ts) reads back via INPUT_MATRIX-CONTEXT. `matrix` is an allowed context
+    // for input defaults in the action metadata schema; dropping this default silently collapses
+    // every matrix leg of a job onto one cache key / artifact name / run-scoped session key.
+    // eslint-disable-next-line no-template-curly-in-string -- the literal expression text is the value under test
+    expect(input?.default).toBe('${{ toJSON(matrix) }}')
+  })
+})

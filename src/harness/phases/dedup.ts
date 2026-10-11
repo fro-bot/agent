@@ -6,6 +6,7 @@ import * as core from '@actions/core'
 import {restoreDeduplicationMarker, saveDeduplicationMarker} from '../../services/cache/dedup.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {createLogger} from '../../shared/logger.js'
+import {htmlCode, htmlLink, htmlParagraph, htmlStrong} from '../../shared/summary-html.js'
 
 const DEDUP_EVENT_TYPES = new Set(['pull_request', 'issues'])
 
@@ -142,19 +143,23 @@ async function writeDedupSkipSummary(
 
     core.summary
       .addHeading('Fro Bot Agent Run — Skipped (Dedup)', 2)
-      .addRaw(`Execution skipped because the agent already ran for **${entityLabel}** recently.\n\n`)
+      .addRaw(
+        `${htmlParagraph(`Execution skipped because the agent already ran for ${htmlStrong(entityLabel)} recently.`)}\n`,
+      )
       .addTable([
         [
           {data: 'Detail', header: true},
           {data: 'Value', header: true},
         ],
-        ['Current action', `\`${triggerContext.eventType}.${triggerContext.action ?? 'unknown'}\``],
-        ['Prior run', `[${marker.runId}](${priorRunUrl})`],
-        ['Prior action', `\`${marker.eventType}.${marker.action}\``],
+        ['Current action', htmlCode(`${triggerContext.eventType}.${triggerContext.action ?? 'unknown'}`)],
+        ['Prior run', htmlLink(String(marker.runId), priorRunUrl)],
+        ['Prior action', htmlCode(`${marker.eventType}.${marker.action}`)],
         ['Time since prior run', `${ageSeconds}s`],
         ['Dedup window', `${windowSeconds}s`],
       ])
-      .addRaw('\n> Dedup is best-effort suppression. Use workflow concurrency groups to prevent overlapping runs.\n')
+      .addRaw(
+        '<blockquote>Dedup is best-effort suppression. Use workflow concurrency groups to prevent overlapping runs.</blockquote>\n',
+      )
 
     await core.summary.write()
   } catch (error) {

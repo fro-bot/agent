@@ -12,7 +12,7 @@ import {constants, existsSync, mkdirSync, statSync} from 'node:fs'
 import {lstat, mkdir, open, readdir, readFile, readlink, rename, rm, symlink, writeFile} from 'node:fs/promises'
 import {join} from 'node:path'
 import process from 'node:process'
-import {afterEach, beforeEach, describe, expect, it} from 'vitest'
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {runAgentWalk} from './agent-walk.js'
 import {listBackups} from './backups.js'
@@ -35,8 +35,13 @@ import {
   isolatedGitEnv,
   makeTempDir,
   opensslAvailable,
+  REAL_GIT_TEST_TIMEOUT_MS,
 } from './update-fixtures/helpers.js'
 import {executeUpdate} from './update.js'
+
+// Every describe in this file drives real git (staging clones, pack import, quarantine, size walks).
+// File-level so no describe is left on vitest's 5s default under load.
+vi.setConfig({testTimeout: REAL_GIT_TEST_TIMEOUT_MS})
 
 const OPENSSL_AVAILABLE = opensslAvailable()
 
@@ -455,7 +460,7 @@ describe('previewRecovery — the filesystem size/entry-count walk is bounded, a
   })
 })
 
-describe('executeRecovery — happy path (real remote, real git)', {timeout: 30_000}, () => {
+describe('executeRecovery — happy path (real remote, real git)', () => {
   it.skipIf(!OPENSSL_AVAILABLE)(
     'preserves a dirty checkout byte-for-byte in quarantine and installs a clean checkout a follow-up executeUpdate reports unchanged',
     async () => {
@@ -551,7 +556,7 @@ describe('executeRecovery — happy path (real remote, real git)', {timeout: 30_
   )
 })
 
-describe('executeRecovery -- F8: genuine split-identity ownership (root only)', {timeout: 30_000}, () => {
+describe('executeRecovery -- F8: genuine split-identity ownership (root only)', () => {
   it.skipIf(process.getuid?.() !== 0)(
     'installs the checkout owned by the REAL agent uid/gid, distinct from the root service; the quarantine envelope and its metadata stay root-owned',
     async () => {
@@ -701,7 +706,7 @@ describe(
   },
 )
 
-describe('executeRecovery — opaque checkout (hostile config)', {timeout: 30_000}, () => {
+describe('executeRecovery — opaque checkout (hostile config)', () => {
   it.skipIf(!OPENSSL_AVAILABLE)('recovers a hostile-config checkout without ever running git in it', async () => {
     // #given a checkout with a planted filter driver — not on the closed config allowlist
     await setupCleanCheckout()
@@ -736,7 +741,7 @@ describe('executeRecovery — opaque checkout (hostile config)', {timeout: 30_00
   })
 })
 
-describe('executeRecovery — fingerprint mismatch refuses checkout-changed', {timeout: 30_000}, () => {
+describe('executeRecovery — fingerprint mismatch refuses checkout-changed', () => {
   it.skipIf(!OPENSSL_AVAILABLE)('a new local commit landing after preview refuses and moves nothing', async () => {
     // #given
     await setupCleanCheckout()
@@ -798,7 +803,7 @@ async function createFakeGeneration(owner: string, repo: string, id: string, siz
   )
 }
 
-describe('executeRecovery — quota and disk-space preflight refuse before building', {timeout: 30_000}, () => {
+describe('executeRecovery — quota and disk-space preflight refuse before building', () => {
   it.skipIf(!OPENSSL_AVAILABLE)('refuses quota-exceeded at 5 generations, moving nothing', async () => {
     // #given
     await setupCleanCheckout()
@@ -953,7 +958,7 @@ describe('executeRecovery — E4: retention accounting fails closed', () => {
   )
 })
 
-describe('executeRecovery — no checkout installs without quarantine', {timeout: 30_000}, () => {
+describe('executeRecovery — no checkout installs without quarantine', () => {
   it.skipIf(!OPENSSL_AVAILABLE)('installs a fresh checkout with no prior generation written', async () => {
     // #given no checkout at all for this owner/repo
     const preview = await previewRecovery(req(), deps())
@@ -976,7 +981,7 @@ describe('executeRecovery — no checkout installs without quarantine', {timeout
   })
 })
 
-describe('executeRecovery — concurrency serializes with itself and with executeUpdate', {timeout: 30_000}, () => {
+describe('executeRecovery — concurrency serializes with itself and with executeUpdate', () => {
   it.skipIf(!OPENSSL_AVAILABLE)(
     'a second concurrent recover, started with the same (now-stale) fingerprint, is fully serialized behind the first',
     async () => {

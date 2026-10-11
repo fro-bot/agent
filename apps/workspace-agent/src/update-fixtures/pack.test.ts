@@ -19,7 +19,7 @@ import {readdir, readFile, rm, writeFile} from 'node:fs/promises'
 import {join} from 'node:path'
 import process from 'node:process'
 
-import {afterEach, beforeEach, describe, expect, it} from 'vitest'
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {runPackStream} from '../git-stream.js'
 import {
   commitFile,
@@ -27,9 +27,12 @@ import {
   initRepo,
   isolatedGitEnv,
   makeTempDir,
+  REAL_GIT_TEST_TIMEOUT_MS,
   startLoopbackListener,
   writeExecutableScript,
 } from './helpers.js'
+
+vi.setConfig({testTimeout: REAL_GIT_TEST_TIMEOUT_MS})
 
 /** Minimal, working env for the shell/node script stubs below — real command resolution (`sh`, `node`, `cat`, `sleep`, `yes`, `head`) needs `PATH`; these fixtures are not testing git's own env sealing, so a plain PATH is fine. */
 const SCRIPT_ENV: Record<string, string> = {PATH: process.env.PATH ?? '/usr/bin:/bin'}

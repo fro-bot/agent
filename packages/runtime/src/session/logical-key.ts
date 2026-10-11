@@ -29,7 +29,25 @@ function buildScheduleHash(value: string): string {
   return createHash('sha256').update(value).digest('hex').slice(0, 8)
 }
 
-export function buildLogicalKey(context: TriggerContext): LogicalSessionKey | null {
+function withIdentity(entityId: string, invocationIdentity: string | null): string {
+  return invocationIdentity == null ? entityId : `${entityId}-${invocationIdentity}`
+}
+
+/**
+ * Builds the logical session key for a trigger.
+ *
+ * Entity-bound keys (issue, PR, discussion) name a GitHub object and are intentionally shared
+ * across runs AND across jobs: two jobs working the same issue/PR continue one thread.
+ *
+ * Run-scoped keys (schedule, workflow_dispatch) name the *run*, so the job that is executing
+ * is part of the entity: two jobs of one run (e.g. a `needs:`-chained "Remediate" then
+ * "Observe") are different tasks, and without `invocationIdentity` the second would continue
+ * the first's root session. These keys are `...-{runId}-{invocationIdentity}`. The key is
+ * deliberately NOT attempt-scoped: re-running the same job (new `GITHUB_RUN_ATTEMPT`, same
+ * run ID and job) resolves to the same key and continues the same session. `invocationIdentity`
+ * is `getInvocationIdentity()`; `null` (outside a runner) omits the segment.
+ */
+export function buildLogicalKey(context: TriggerContext, invocationIdentity: string | null): LogicalSessionKey | null {
   if (context.eventType === 'unsupported') {
     return null
   }
@@ -50,12 +68,12 @@ export function buildLogicalKey(context: TriggerContext): LogicalSessionKey | nu
     const hashSeed =
       scheduleExpression != null && scheduleExpression.trim().length > 0 ? scheduleExpression : context.action
     const hash = buildScheduleHash(hashSeed ?? 'default')
-    return buildEntityKey('schedule', `${hash}-${context.runId}`)
+    return buildEntityKey('schedule', withIdentity(`${hash}-${context.runId}`, invocationIdentity))
   }
 
   if (context.eventType === 'workflow_dispatch') {
     const runId = String(context.runId)
-    return buildEntityKey('dispatch', runId)
+    return buildEntityKey('dispatch', withIdentity(runId, invocationIdentity))
   }
 
   if (context.target == null) {

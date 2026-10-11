@@ -37,7 +37,7 @@ import {mkdir, rm, writeFile} from 'node:fs/promises'
 import {join} from 'node:path'
 import process from 'node:process'
 
-import {afterEach, beforeEach, describe, expect, it} from 'vitest'
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {buildNetworkGitProfile} from '../git-safety.js'
 import {
   currentGitVersion,
@@ -48,10 +48,13 @@ import {
   isolatedGitEnv,
   makeTempDir,
   opensslAvailable,
+  REAL_GIT_TEST_TIMEOUT_MS,
   startHttpsLoopbackListener,
   startLoopbackListener,
   writeExecutableScript,
 } from './helpers.js'
+
+vi.setConfig({testTimeout: REAL_GIT_TEST_TIMEOUT_MS})
 
 /** Computed once at module load: gates the http.sslVerify/http.sslCAInfo fixtures, which need a real self-signed certificate. Reported as a skip, not a silent pass, when unavailable — see the report for what this means for CI/the workspace image (openssl is apk-installed there). */
 const OPENSSL_AVAILABLE = opensslAvailable()
