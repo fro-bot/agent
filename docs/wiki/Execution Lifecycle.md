@@ -1,6 +1,6 @@
 ---
 type: architecture
-last-updated: "2026-09-20"
+last-updated: "2026-10-11"
 updated-by: "schedule-d7190410-35540552880"
 sources:
   - src/harness/config/state-keys.ts
@@ -51,6 +51,7 @@ sources:
   - RFCs/RFC-012-Agent-Execution-Main-Action.md
   - RFCs/RFC-017-Post-Action-Cache-Hook.md
   - RFCs/RFC-019-S3-Storage-Backend.md
+  - ARCHITECTURE.md
 summary: "Phase-by-phase walkthrough of a single action run, from bootstrap through drain, review reconciliation, brokered push, and the final invocation outcome"
 ---
 
@@ -255,3 +256,88 @@ Two scoped S3 conditional-write locks (`If-None-Match` / `If-Match`) coordinate 
 **Scope.** This is snapshot corroboration, not fencing. It checks current OpenCode activity at one instant; it does not prevent a stale holder from resuming later, cover detached writers outside OpenCode, prove an old Action finished, or fix ordinary premature-release paths. Hard exclusion (an epoch checked by the workspace on each mutating request) remains future work (#1655, Phase 2).
 
 **Stuck busy status.** While the workspace status endpoint is unavailable (`unknown`), expired gateway leases stay blocked — a stopped container cannot be corroborated, so stopping it does not unblock anything. If a repo's workspace reports `busy` and the lease has expired, first wait for or cancel that repo's running sessions. If it stays busy, pause gateway admissions and restart the workspace service (keep the volume; the restart ends its sessions), wait until its status endpoint is reachable again, then run the guarded `force-release-lock` or retry acquisition — the check now reports `clear`. There is no unguarded bypass.
+
+### Annotated Action Phase Pipeline
+
+The fully annotated tree that [ARCHITECTURE.md](../../ARCHITECTURE.md) condenses in its Data Flow section.
+
+```
+main.ts
+  └─→ harness/run.ts (run)
+        │
+        ├─→ bootstrap phase
+        │     parseActionInputs → ensureOpenCodeAvailable
+        │
+        ├─→ routing phase
+        │     parseGitHubContext → normalizeEvent → routeEvent
+        │     (produces TriggerResult; skips if no matching trigger)
+        │
+        ├─→ dedup phase
+        │     skip if agent already ran for this PR/issue within dedup window
+
+        ├─→ coordination-lock phase
+        │     acquire per-repo Action lock (`action.json`) when S3 is enabled; fail closed on lock error
+        │
+        ├─→ acknowledge phase
+        │     acknowledgeReceipt (reaction + comment stub)
+        │
+        ├─→ cache-restore phase
+        │     restore from S3 first → fall back to Actions cache when needed
+        │     → repair the restored SQLite database before the server opens it:
+        │       checkpoint its WAL, or clean-slate it if SQLite reports it structurally corrupt
+        │     → bootstrapOpenCodeServer probes instance-scoped readiness (session.list) before
+        │       reporting the server bootstrapped, not just listening
+        │
+        ├─→ session-prep phase
+        │     processAttachments → buildAgentPrompt (packages/runtime)
+        │
+        ├─→ execute phase
+        │     executeOpenCode → bootstrapOpenCodeServer → sendPromptToSession
+        │       → runPromptAttempt → processEventStream (SSE)
+        │     (onPermissionAsked auto-denies any permission.asked event immediately —
+        │      there is no interactive approval path in CI, so an unanswered ask must
+        │      never be left to block the run until the execution deadline)
+     (the `question` tool is never offered: bootstrapOpenCodeServer pins
+      OPENCODE_CLIENT=fro-bot-action and clears OPENCODE_ENABLE_QUESTION_TOOL, so
+      upstream does not register it — nobody can answer in CI and a pending
+      question has no server-side timeout; see "OpenCode Question Tool Disabled")
+        │     (processEventStream observes owned descendants via a per-invocation
+        │      OwnershipLedger: a completed `task` tool call carrying
+        │      metadata.background === true adopts the child session id, after which
+        │      its deltas/tools/permission-asks route like the root's, its token
+        │      totals sum into the run's reported usage, and its session.error marks
+        │      the entry unknown rather than ending the run's own turn)
+        │
+        ├─→ drain phase
+        │     runDrain: owned background work settles before anything below
+        │       publishes, persists, or releases — reconciles once immediately, then
+        │       polls until the ledger drains or the run's deadline
+        │       (computeDrainDeadlineMs: total timeout minus a 30s teardown reserve
+        │       minus time execution already spent) expires, at which point every
+        │       unsettled entry is session.abort-ed (no-op when execution never ran,
+        │       e.g. SKIP_AGENT_EXECUTION=true)
+        │
+        ├─→ review-reconciliation phase
+        │     reconcile formal review state after agent execution
+
+        ├─→ finalize phase
+        │     set outputs → writeJobSummary (includes a "Background Work" section
+        │       naming any ownership-ledger entry that did not settle) → enforce/
+        │       deliver response contract (review-required, review-permitted, or
+        │       comment-only from trusted routing context)
+        │
+        └─→ cleanup phase
+              prune sessions → shutdown server → sync artifacts and metadata
+              → saveCache — declined outright (`ownership-declined`) if the ownership
+                ledger, server shutdown quiescence, or the coordination lease cannot
+                confirm no writer remains live; otherwise checkpoints the WAL before
+                capturing files (S3 before Actions cache)
+                → toCacheSaveStateValue derives CACHE_SAVED state + cache-save-result output + job-summary row
+              → release lock in finally
+
+post.ts (separate Action step)
+  └─→ harness/post.ts (runPost)
+        └─→ saveCache retry — skipped when CACHE_SAVED already reports durable/store-only/skipped/
+              declined-for-safety; an absent or unrecognized state retries (not-persisted). Writes its own
+              job-summary row on retry (no cache-save-result output: post: steps run after every other step)
+```

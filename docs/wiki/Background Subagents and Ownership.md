@@ -1,6 +1,6 @@
 ---
 type: subsystem
-last-updated: "2026-09-27"
+last-updated: "2026-10-11"
 updated-by: "e6efc1f1"
 sources:
   - packages/runtime/src/agent/ownership-ledger.ts
@@ -31,6 +31,7 @@ sources:
   - docs/plans/2026-09-14-001-feat-background-subagent-ownership-plan.md
   - docs/brainstorms/2026-09-13-opencode-background-subagents-requirements.md
   - docs/solutions/integration-issues/permission-ask-dropped-by-ownership-filter-2026-09-19.md
+  - ARCHITECTURE.md
 summary: "How the harness tracks, drains, and settles background subagent work that outlives the turn that dispatched it"
 ---
 

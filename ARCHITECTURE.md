@@ -16,7 +16,7 @@ Supporting packages: `@fro-bot/runtime` (`packages/runtime/`) owns shared runtim
 
 ## Codemap
 
-Symbols verified against the live source tree. Where a symbol has moved to `packages/runtime/`, the canonical location is noted.
+Symbols verified against the live source tree. Where a symbol has moved to `packages/runtime/`, the canonical location is noted. Per-directory `AGENTS.md` files list the finer-grained helpers; unabridged rows are in [Architecture Overview](docs/wiki/Architecture%20Overview.md#codemap-reference).
 
 ### Action / Root `src/`
 
@@ -27,24 +27,21 @@ Symbols verified against the live source tree. Where a symbol has moved to `pack
 | `runSetup` | Function | `src/services/setup/setup.ts` | Setup orchestration |
 | `buildCIConfig` | Function | `src/services/setup/ci-config.ts` | CI config assembly with plugin injection |
 | `writeSystematicConfig` | Function | `src/services/setup/systematic-config.ts` | Systematic plugin config writer |
-| `installSystematicPlugin` | Function | `src/services/setup/systematic-plugin.ts` | Setup-time Systematic plugin install (keeps npm install off the server's boot path) |
+| `installSystematicPlugin` | Function | `src/services/setup/systematic-plugin.ts` | Setup-time Systematic install |
 | `restoreCache` | Function | `src/services/cache/restore.ts` | Restore OpenCode state |
-| `saveCache` | Function | `src/services/cache/save.ts` | Persist state to cache; returns a `CacheSaveResult` (two independent persistence axes + a named outcome), not a boolean |
-| `toCacheSaveStateValue` | Function | `src/shared/cache-save-result.ts` | Exhaustiveness-pinned mapper from `CacheSaveResult` to the `CACHE_SAVED` state handoff value |
-| `checkpointDatabase` | Function | `src/services/cache/checkpoint.ts` | Merge SQLite WAL into main DB before save/restore hand-off |
-| `verifyDatabaseUsable` | Function | `src/services/cache/integrity.ts` | Restore-side probe for structurally corrupt SQLite files |
-| `isStructuralCorruptionError` | Function | `src/services/cache/sqlite-errors.ts` | Positive-allowlist classifier for SQLite corruption vs. transient errors |
+| `saveCache` | Function | `src/services/cache/save.ts` | Persist state; returns a `CacheSaveResult` |
+| `toCacheSaveStateValue` | Function | `src/shared/cache-save-result.ts` | `CacheSaveResult` → `CACHE_SAVED` value |
+| `checkpointDatabase` | Function | `src/services/cache/checkpoint.ts` | Merge SQLite WAL into the main DB |
 | `executeOpenCode` | Function | `src/features/agent/execution.ts` | SDK execution orchestration |
-| `runDrain` | Function | `src/harness/phases/execute.ts` | Drain phase: blocks publish/persist/release until this run's owned background work settles or the run's deadline expires |
-| `normalizeEvent` | Function | `src/services/github/context.ts` | Raw payload → typed NormalizedEvent |
-| `parseGitHubContext` | Function | `src/services/github/context.ts` | Global context → typed GitHubContext |
-| `routeEvent` | Function | `src/features/triggers/router.ts` | Event routing orchestration |
+| `runDrain` | Function | `src/harness/phases/execute.ts` | Drain phase for owned background work |
+| `normalizeEvent` / `parseGitHubContext` | Function | `src/services/github/context.ts` | Raw payload → `NormalizedEvent`; global context → `GitHubContext` |
+| `routeEvent` | Function | `src/features/triggers/router.ts` | Event routing |
 | `postComment` | Function | `src/features/comments/writer.ts` | Create or update comment |
 | `submitReview` | Function | `src/features/reviews/reviewer.ts` | Submit PR review |
 | `parseActionInputs` | Function | `src/harness/config/inputs.ts` | Parse/validate inputs |
 | `createLogger` | Function | `src/shared/logger.ts` | Logger with redaction |
 | `ActionInputs` | Interface | `src/shared/types.ts` | Input schema |
-| `NormalizedEvent` | Union | `src/services/github/types.ts` | 8-variant discriminated event union |
+| `NormalizedEvent` | Union | `src/services/github/types.ts` | 8-variant event union |
 | `TriggerResult` | Interface | `src/features/triggers/types.ts` | Routing decision |
 
 ### `packages/runtime/` (canonical prompt + agent primitives)
@@ -53,60 +50,50 @@ Symbols verified against the live source tree. Where a symbol has moved to `pack
 
 | Symbol | Type | Location | Role |
 | --- | --- | --- | --- |
-| `buildAgentPrompt` | Function | `packages/runtime/src/agent/prompt.ts` | XML-tagged prompt with authority hierarchy |
-| `buildAgentContextSection` | Function | `packages/runtime/src/agent/prompt.ts` | Consolidated agent operations block |
-| `buildHarnessRulesSection` | Function | `packages/runtime/src/agent/prompt-thread.ts` | Non-negotiable rules with precedence declaration |
+| `buildAgentPrompt` / `buildAgentContextSection` | Function | `packages/runtime/src/agent/prompt.ts` | XML-tagged prompt with authority hierarchy |
+| `buildHarnessRulesSection` | Function | `packages/runtime/src/agent/prompt-thread.ts` | Non-negotiable harness rules |
 | `sendPromptToSession` | Function | `src/features/agent/prompt-sender.ts` | Send prompt to SDK session |
-| `runPromptAttempt` | Function | `src/features/agent/retry.ts` | Execute prompt with retry logic |
-| `pollForSessionCompletion` | Function | `src/features/agent/session-poll.ts` | Poll SDK for completion status |
+| `runPromptAttempt` | Function | `src/features/agent/retry.ts` | Prompt with retry logic |
+| `pollForSessionCompletion` | Function | `src/features/agent/session-poll.ts` | Poll SDK for completion |
 | `processEventStream` | Function | `src/features/agent/streaming.ts` | Process SDK event stream |
-| `bootstrapOpenCodeServer` | Function | `packages/runtime/src/agent/server.ts` (delegate: `src/features/agent/server-adapter.ts`) | Initialize SDK server lifecycle; probes instance-scoped readiness before reporting success |
-| `createOwnershipLedger` | Function | `packages/runtime/src/agent/ownership-ledger.ts` | In-memory 3-state (outstanding/settled/unknown) ledger for background subagent executions, keyed by child session id |
-| `reconcileLedgerOnce` / `createLedgerReconciler` | Function | `packages/runtime/src/agent/ledger-reconcile.ts` | Settles tracked ledger entries whose settlement event the SSE stream never delivered, against `children()`/`liveSessionIds()` (both scoped to the run's directory); never adopts an untracked session |
-| `createRemoteQuestionClient` | Function | `packages/runtime/src/agent/remote-question-client.ts` | Narrow v2-SDK client over OpenCode's `question` reply/reject endpoints (the v1 client does not expose them); every call carries the workspace `directory` |
+| `bootstrapOpenCodeServer` | Function | `packages/runtime/src/agent/server.ts` (delegate: `src/features/agent/server-adapter.ts`) | SDK server lifecycle |
+| `createOwnershipLedger` | Function | `packages/runtime/src/agent/ownership-ledger.ts` | Background subagent ownership ledger |
+| `reconcileLedgerOnce` / `createLedgerReconciler` | Function | `packages/runtime/src/agent/ledger-reconcile.ts` | Settle dropped ledger entries |
+| `createRemoteQuestionClient` | Function | `packages/runtime/src/agent/remote-question-client.ts` | v2-SDK `question` reply/reject client |
 | `TriggerDirective` | Interface | `packages/runtime/src/agent/prompt.ts` | Directive + appendMode for triggers |
 | `DEFAULT_SYSTEMATIC_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned Systematic version |
-| `DEFAULT_OPENCODE_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned harness build version (OpenCode base + carries) |
+| `DEFAULT_OPENCODE_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned harness build version |
 
 ### `packages/gateway/`
 
 | Symbol | Type | Location | Role |
 | --- | --- | --- | --- |
-| `runMention` | Function | `packages/gateway/src/execute/run.ts` | Full mention execution lifecycle |
-| `launchWork` | Function | `packages/gateway/src/execute/run.ts` | Fire-and-return web launch path |
-| `buildDiscordPrompt` | Function | `packages/gateway/src/execute/prompt.ts` | Discord-specific prompt builder |
+| `runMention` / `launchWork` | Function | `packages/gateway/src/execute/run.ts` | Mention lifecycle; fire-and-return web launch |
+| `buildDiscordPrompt` | Function | `packages/gateway/src/execute/prompt.ts` | Discord prompt builder |
 | `buildOperatorApp` | Function | `packages/gateway/src/web/server.ts` | Operator Hono app factory |
-| `createWorkflowDispatcher` | Function | `packages/gateway/src/github/dispatch.ts` | `/fro-bot dispatch` GitHub Actions workflow-dispatch adapter (fire-and-forget; no queue, concurrency, or local run-state) |
-| `createDiscordApprovalOnPending` | Function | `packages/gateway/src/approvals/discord-transport.ts` | Discord approval transport; auto-denies on a terminal (channel/thread-gone) delivery failure |
-| `createRequestGate` | Function | `packages/gateway/src/approvals/request-gate.ts` | Shared lifecycle core for human-wait requests: the `open → claimed → confirmed` state machine, scope check, registry-owned deadline, echo settlement, run teardown, and one terminal notification per request. Backs both the approval and question registries |
-| `createQuestionRegistry` | Function | `packages/gateway/src/approvals/question-registry.ts` | Question family of the gate: `answer` / `skip` decisions, answer validation, empty-reply skip at the deadline, reject on teardown, pending queries by scope and by run |
-| `createQuestionCoordinator` | Function | `packages/gateway/src/approvals/question-coordinator.ts` | Per-run seam for `question.*` events: computes the deadline (or skips immediately), registers, announces through `onRegistered`, rejects malformed asks, and rejects still-pending questions at run end |
-| `createDiscordQuestionOnRegistered` | Function | `packages/gateway/src/approvals/discord-question-transport.ts` | Discord question transport: posts the single-question prompt (or the web-fallback notice) into the run thread and attaches the settled render; a delivery failure never settles the question |
-| `handleQuestionInteraction` | Function | `packages/gateway/src/discord/question-interactions.ts` | Option/Skip/text buttons, select menu, and answer modal: authorizes, maps option indices to raw labels, and decides through the gate with a Discord actor scoped to the thread |
-| `buildPendingQuestionsRoute` / `buildQuestionDecisionRoute` | Function | `packages/gateway/src/web/operator/{pending-questions-route,question-decision-route}.ts` | `GET /operator/runs/:runId/questions` (read-level reconciliation listing) and `POST /operator/runs/:runId/questions/:requestId/decision` (write-level answer or skip; a refused body is `400 {error: 'bad request', reason, questionIndex}`, the standard operator error envelope) |
-| `createWebQuestionOnRegistered` | Function | `packages/gateway/src/web/operator/web-question.ts` | Web question transport: emits the SSE open frame after registration and attaches the settle-frame render; fail-soft |
-| `createQuestionEffects` | Function | `packages/gateway/src/execute/question-client.ts` | Per-run `replyQuestion` / `rejectQuestion` effects over the v2 SDK client; failures collapse to reason codes, never SDK error text |
-| `recoverStaleRuns` | Function | `packages/gateway/src/execute/recovery.ts` | Startup sweep: terminalizes stale active runs only when the repo's OpenCode workspace is confirmed clear (busy/unknown leaves run and lock untouched); never deletes coordination locks |
-| `classifyInspectResult` | Function | `packages/gateway/src/execute/provenance.ts` | Classifies a workspace `inspect()` result into a run-blocking `checkout-substituted` failure or a `CheckoutProvenance` the run carries forward |
-| `parseOperatorCheckoutProvenance` | Function | `packages/gateway/src/operator-contract/provenance.ts` | Field-by-field validator projecting persisted `runState.details.checkoutProvenance` into the wire-decoupled operator DTO |
-| `inspectCheckout` | Function | `apps/workspace-agent/src/inspect.ts` | `POST /inspect` handler: read-only report of an existing checkout (HEAD, worktree state, in-progress operation) |
-| `executeClone` | Function | `apps/workspace-agent/src/clone.ts` | `POST /clone` handler: clones into root-owned staging, validates HEAD, hands ownership to the agent uid, then publishes by `rename` |
-| `handOffToAgent` | Function | `apps/workspace-agent/src/handoff.ts` | Filesystem-only (`lstat`/`lchown`) ownership walk of a staged clone to `AGENT_UID`/`AGENT_GID`; bounded by deadline and entry cap |
-| `buildOpencodeLaunchSpec` | Function | `apps/workspace-agent/src/opencode-server.ts` | Single launch spec for every OpenCode spawn: fixed executable path, agent uid/gid, allowlist-constructed env (`buildOpencodeEnv`) |
-| `gitInvocation` | Function | `apps/workspace-agent/src/git-safety.ts` | Shared neutralized, credential-free git invocation (sealed config, exact `safe.directory`) for any git run against an agent-owned checkout |
-| `createApp` | Function | `apps/workspace-agent/src/server.ts` | Workspace control-API Hono app; required `auth` union (`bearer` \| `disabled-for-tests`) gates every route except `/healthz`/`/readyz` |
-| `withRepoLock` | Function | `apps/workspace-agent/src/repo-mutex.ts` | Single per-repo operation mutex (keyed by `repoMutexKey`) shared by clone, update, recovery, and backup deletion; `markRepoHeld` sets a sticky maintenance hold on any unconfirmed subprocess termination, cleared only by a workspace restart |
-| `readJournal` / `writeJournal` | Function | `apps/workspace-agent/src/journal.ts` | Root-owned update/recovery journal store (temp-then-rename; parsed reads where `malformed` is never `absent`) |
-| `executeUpdate` | Function | `apps/workspace-agent/src/update.ts` | `POST /update` handler: network-free admission, then the root-owned bare fetch store, then a pack-stream import, then a journaled fast-forward |
-| `previewRecovery` / `executeRecovery` | Function | `apps/workspace-agent/src/recover.ts` | `POST /recover/preview` (stateless fingerprint) and `POST /recover` (quarantine-and-replace) handlers |
-| `listBackups` / `deleteBackup` | Function | `apps/workspace-agent/src/backups.ts` | `GET`/`DELETE /backups/:owner/:repo[/:id]` handlers over quarantine generations |
-| `runAgentWalk` / `measureSealedTree` | Function | `apps/workspace-agent/src/agent-walk.ts` | Agent-uid checkout size/entry-count walker; `measureSealedTree` measures a sealed tree through a root-opened fd when a plain agent-uid walk can't traverse it |
-| `readUpdateNetworkConfig` | Function | `apps/workspace-agent/src/config.ts` | Reads the egress-proxy and CA-bundle settings `/update`'s network half needs, once at startup |
-| `createRecoverCheckoutCommand` / `createCheckoutBackupCommand` | Function | `packages/gateway/src/discord/commands/{recover-checkout,checkout-backup}.ts` | `/fro-bot recover-checkout` and `/fro-bot checkout-backup list\|delete`; the Recover button on a refusal reply shares the same flow via `discord/recover-checkout-button.ts` |
-| `OPERATOR_CONTRACT_VERSION` | Constant | `packages/gateway/src/operator-contract/version.ts` | Build-time-pinned operator contract version (`1.10.0`) |
-| `resolveClient` | Function | `packages/gateway/src/web/ingress/resolve-client.ts` | Trusted-proxy-aware client-address resolution for the operator-surface accounting keys (health, OAuth start/callback, and guarded-logout rate limits; the OAuth attempt cap) and the exact OAuth binding; returns a branded `ResolvedClientAddress` or a closed `IngressRejection` — never a fallback key |
-| `parseCanonicalAddress` | Function | `packages/gateway/src/web/ingress/canonical-address.ts` | Single strict IPv4/IPv6 parser shared by socket, X-Forwarded-For, and configured-peer parsing |
-| `createPushHealthTracker` / `observePushAdapterHealth` | Function | `packages/gateway/src/web/operator-push/{push-health,push-health-adapter}.ts` | Passive in-memory operator push health (`disabled \| ready \| degraded \| unknown`, 1-hour staleness on a monotonic clock). Backend outcomes are observed at the object-store adapter the subscription store is built over (reads vs writes; a completed call is `ok`: `NoSuchKey`/`NotFound`, 412, 409 by code, 404/412/409 by status only without a code; a 404 `NoSuchBucket` is `failed`; the store reports CAS-retry exhaustion as a write failure ordered by when the record finished; a throwing `markDead` cleanup never feeds relay health), relay outcomes once per broadcast; each component keeps its latest-by-start observation. Surfaced only as the optional `push: {status}` on the authenticated `GET /operator/session`. `ready` is observed readiness, not guaranteed delivery |
+| `createWorkflowDispatcher` | Function | `packages/gateway/src/github/dispatch.ts` | `/fro-bot dispatch` workflow-dispatch adapter |
+| `createDiscordApprovalOnPending` | Function | `packages/gateway/src/approvals/discord-transport.ts` | Discord approval transport |
+| `createRequestGate` | Function | `packages/gateway/src/approvals/request-gate.ts` | Shared approval/question settlement gate |
+| `createQuestionRegistry` | Function | `packages/gateway/src/approvals/question-registry.ts` | Question family of the gate |
+| `createQuestionCoordinator` | Function | `packages/gateway/src/approvals/question-coordinator.ts` | Per-run `question.*` event seam |
+| `createDiscordQuestionOnRegistered` | Function | `packages/gateway/src/approvals/discord-question-transport.ts` | Discord question transport |
+| `buildPendingQuestionsRoute` / `buildQuestionDecisionRoute` | Function | `packages/gateway/src/web/operator/{pending-questions-route,question-decision-route}.ts` | Question list and answer/skip routes |
+| `recoverStaleRuns` | Function | `packages/gateway/src/execute/recovery.ts` | Startup stale-run sweep |
+| `classifyInspectResult` | Function | `packages/gateway/src/execute/provenance.ts` | `inspect()` → failure or `CheckoutProvenance` |
+| `parseOperatorCheckoutProvenance` | Function | `packages/gateway/src/operator-contract/provenance.ts` | Persisted provenance → operator DTO |
+| `inspectCheckout` | Function | `apps/workspace-agent/src/inspect.ts` | `POST /inspect` read-only checkout report |
+| `executeClone` | Function | `apps/workspace-agent/src/clone.ts` | `POST /clone` via root staging + handoff |
+| `executeUpdate` | Function | `apps/workspace-agent/src/update.ts` | `POST /update` journaled fast-forward |
+| `previewRecovery` / `executeRecovery` | Function | `apps/workspace-agent/src/recover.ts` | `POST /recover/preview` and `/recover` |
+| `listBackups` / `deleteBackup` | Function | `apps/workspace-agent/src/backups.ts` | `/backups/:owner/:repo[/:id]` handlers |
+| `buildOpencodeLaunchSpec` | Function | `apps/workspace-agent/src/opencode-server.ts` | Single OpenCode launch spec (agent uid, allowlisted env) |
+| `gitInvocation` | Function | `apps/workspace-agent/src/git-safety.ts` | Neutralized credential-free git invocation |
+| `createApp` | Function | `apps/workspace-agent/src/server.ts` | Control-API Hono app; required `auth` union |
+| `withRepoLock` | Function | `apps/workspace-agent/src/repo-mutex.ts` | Per-repo mutation mutex and maintenance hold |
+| `createRecoverCheckoutCommand` / `createCheckoutBackupCommand` | Function | `packages/gateway/src/discord/commands/{recover-checkout,checkout-backup}.ts` | `/fro-bot recover-checkout` and `checkout-backup` |
+| `OPERATOR_CONTRACT_VERSION` | Constant | `packages/gateway/src/operator-contract/version.ts` | Pinned operator contract version (`1.10.0`) |
+| `resolveClient` / `parseCanonicalAddress` | Function | `packages/gateway/src/web/ingress/{resolve-client,canonical-address}.ts` | Trusted-proxy-aware client address; strict IP parser |
+| `createPushHealthTracker` / `observePushAdapterHealth` | Function | `packages/gateway/src/web/operator-push/{push-health,push-health-adapter}.ts` | Passive operator push health |
 
 ## Invariants
 
@@ -116,11 +103,11 @@ These are CI-enforced constraints. Violating any of them breaks the build or the
 2. **Committed `dist/` must stay in sync.** CI runs `bun run build` and fails if `git diff dist/` shows changes. The pre-push hook enforces the same check locally. Never edit `dist/` by hand.
 3. **Strict booleans.** No implicit falsy checks (`!value`). Use explicit comparisons (`=== null`, `=== undefined`, `.length === 0`). Enforced by ESLint.
 4. **Functions only — no classes for stateful patterns.** Closures, not ES6 classes, carry state across the codebase (the only classes are a handful of `Error` subclasses in the gateway). Enforced by convention and code review.
-5. **Exactly one comment or review per invocation (Response Protocol).** Exactly one GitHub comment or PR review is delivered per Action run. For `pull_request`/`issue_comment`/`issues` triggers this is **action-enforced**: the model writes its response to a run-scoped file and the harness posts it once via the Octokit writers, binding the target and surface to the trusted event. For `workflow_dispatch`/`schedule` the model still self-posts via `gh`, and the one-response rule remains prompt-enforced in `buildHarnessRulesSection()`. The Action's response surface is derived from trusted routing context: `pull_request` is review-required; an authorized `issue_comment` mention on a pull request is review-permitted (a verdict submits a real review, while omitting it posts a comment); all other response-file-triggered paths are comment-only. The response file cannot select its own target or surface.
+5. **Exactly one comment or review per invocation (Response Protocol).** Exactly one GitHub comment or PR review is delivered per Action run. For `pull_request`/`issue_comment`/`issues` triggers this is **action-enforced**: the model writes its response to a run-scoped file and the harness posts it once via the Octokit writers, binding the target and surface to the trusted event (the response file cannot select its own). For `workflow_dispatch`/`schedule` the model still self-posts via `gh`, and the one-response rule remains prompt-enforced in `buildHarnessRulesSection()`.
 6. **`NormalizedEvent` is never bypassed.** All webhook payloads must pass through `normalizeEvent()` before routing. The router never reads `context.payload` directly. Raw event access is an anti-pattern caught in code review.
 7. **No type suppression.** `as any`, `@ts-ignore`, and `@ts-expect-error` are forbidden project-wide.
 8. **Redaction-before-query (gateway operator surface).** On operator-web routes, the denylist check runs after the server-owned binding lookup (the predicate consumes the binding's deny keys) and before any authorization check, run-state read, or GitHub API call. A repo redacted in `metadata/repos.yaml` is never queried and never reaches the audit stream. Cold-start failure → deny all (fail-closed). Discord surfaces do not currently consult the denylist post-binding.
-9. **No unauthenticated operator-surface client key is ever guessed, and derived accounting keys never stand in for exact identity (gateway ingress).** The client behind every public operator-surface request is a `ResolvedClientAddress` returned by `resolveClient()` (`packages/gateway/src/web/ingress/resolve-client.ts`) against the configured `OperatorIngressPolicy`. That one value carries two deliberately separate things. The **exact canonical identity** (`.canonical`) is the only thing trust and binding decisions use: configured-peer equality (`web/ingress/trusted-proxy-address.ts`) and the OAuth `boundAddress` binding compared on callback. The **derived accounting key** (`.accountingKey`, a branded `AccountingKey`: IPv6 → /64, IPv4 → /32, IPv4-mapped IPv6 already normalized to IPv4) is used only to count or bucket traffic — the health, OAuth start/callback, and logout rate-limit buckets and the OAuth outstanding-attempt slot. Aggregation happens after `resolveClient` has selected the client, never in `canonical-address.ts`, because widening identity there would widen proxy trust (an address in the same /64 as a trusted proxy is not trusted). The one exception is a fully headerless `/operator/health` probe from a trusted peer, which stays keyed on that peer's exact canonical socket address under the health-only limiter: it is a configured proxy, so its key space is bounded by operator configuration, and the unprefixed exact string cannot collide with a prefixed accounting key (see Operator Ingress Trust Policy below). Logout is **not** an unauthenticated route: the session, allowlist, origin, and CSRF guard run first, and only an authenticated logout resolves the client and spends the shared OAuth/logout budget — though anonymous OAuth traffic can still exhaust that shared bucket. An unresolvable request rejects before any bucket or state entry is allocated — it is never collapsed onto a shared fallback key. `GATEWAY_OPERATOR_TRUSTED_PROXIES` is required whenever the operator surface is enabled; `loadGatewayConfig()` throws at startup without it.
+9. **Client identity is never guessed, and derived accounting keys never stand in for exact identity (gateway ingress).** The client behind every public operator-surface request is a `ResolvedClientAddress` returned by `resolveClient()` (`packages/gateway/src/web/ingress/resolve-client.ts`) against the configured `OperatorIngressPolicy`. Trust and binding decisions (configured-peer equality, the OAuth `boundAddress`) use only its exact canonical identity (`.canonical`); the derived `.accountingKey` (IPv6 → /64, IPv4 → /32) only counts or buckets traffic (rate-limit buckets, the OAuth outstanding-attempt slot), and aggregation happens after `resolveClient`, never in `canonical-address.ts`. An unresolvable request rejects before any bucket or state entry is allocated — it is never collapsed onto a shared fallback key. `GATEWAY_OPERATOR_TRUSTED_PROXIES` is required whenever the operator surface is enabled (see Operator Ingress Trust Policy below).
 
 > See also: [Conventions and Patterns](docs/wiki/Conventions%20and%20Patterns.md)
 
@@ -138,82 +125,42 @@ main.ts
         │
         ├─→ bootstrap phase
         │     parseActionInputs → ensureOpenCodeAvailable
-        │
         ├─→ routing phase
-        │     parseGitHubContext → normalizeEvent → routeEvent
-        │     (produces TriggerResult; skips if no matching trigger)
-        │
+        │     parseGitHubContext → normalizeEvent → routeEvent (TriggerResult; skip if no match)
         ├─→ dedup phase
-        │     skip if agent already ran for this PR/issue within dedup window
-
+        │     skip if the agent already ran for this PR/issue within the dedup window
         ├─→ coordination-lock phase
-        │     acquire per-repo Action lock (`action.json`) when S3 is enabled; fail closed on lock error
-        │
+        │     per-repo Action lock (`action.json`) when S3 is enabled; fail closed on lock error
         ├─→ acknowledge phase
         │     acknowledgeReceipt (reaction + comment stub)
-        │
         ├─→ cache-restore phase
-        │     restore from S3 first → fall back to Actions cache when needed
-        │     → repair the restored SQLite database before the server opens it:
-        │       checkpoint its WAL, or clean-slate it if SQLite reports it structurally corrupt
-        │     → bootstrapOpenCodeServer probes instance-scoped readiness (session.list) before
-        │       reporting the server bootstrapped, not just listening
-        │
+        │     S3 first → Actions cache; repair the restored SQLite database (WAL checkpoint or
+        │     clean slate); bootstrapOpenCodeServer probes instance-scoped readiness
         ├─→ session-prep phase
         │     processAttachments → buildAgentPrompt (packages/runtime)
-        │
         ├─→ execute phase
-        │     executeOpenCode → bootstrapOpenCodeServer → sendPromptToSession
-        │       → runPromptAttempt → processEventStream (SSE)
-        │     (onPermissionAsked auto-denies any permission.asked event immediately —
-        │      there is no interactive approval path in CI, so an unanswered ask must
-        │      never be left to block the run until the execution deadline)
-     (the `question` tool is never offered: bootstrapOpenCodeServer pins
-      OPENCODE_CLIENT=fro-bot-action and clears OPENCODE_ENABLE_QUESTION_TOOL, so
-      upstream does not register it — nobody can answer in CI and a pending
-      question has no server-side timeout; see "OpenCode Question Tool Disabled")
-        │     (processEventStream observes owned descendants via a per-invocation
-        │      OwnershipLedger: a completed `task` tool call carrying
-        │      metadata.background === true adopts the child session id, after which
-        │      its deltas/tools/permission-asks route like the root's, its token
-        │      totals sum into the run's reported usage, and its session.error marks
-        │      the entry unknown rather than ending the run's own turn)
-        │
+        │     executeOpenCode → sendPromptToSession → runPromptAttempt → processEventStream (SSE)
+        │     (permission asks auto-denied; `question` tool never offered; adopted background
+        │      children tracked by a per-invocation OwnershipLedger)
         ├─→ drain phase
-        │     runDrain: owned background work settles before anything below
-        │       publishes, persists, or releases — reconciles once immediately, then
-        │       polls until the ledger drains or the run's deadline
-        │       (computeDrainDeadlineMs: total timeout minus a 30s teardown reserve
-        │       minus time execution already spent) expires, at which point every
-        │       unsettled entry is session.abort-ed (no-op when execution never ran,
-        │       e.g. SKIP_AGENT_EXECUTION=true)
-        │
+        │     runDrain: owned background work settles before anything below publishes,
+        │     persists, or releases (bounded by the run's deadline)
         ├─→ review-reconciliation phase
         │     reconcile formal review state after agent execution
-
         ├─→ finalize phase
-        │     set outputs → writeJobSummary (includes a "Background Work" section
-        │       naming any ownership-ledger entry that did not settle) → enforce/
-        │       deliver response contract (review-required, review-permitted, or
-        │       comment-only from trusted routing context)
-        │
+        │     set outputs → writeJobSummary → deliver the response contract (review-required,
+        │     review-permitted, or comment-only from trusted routing context)
         └─→ cleanup phase
-              prune sessions → shutdown server → sync artifacts and metadata
-              → saveCache — declined outright (`ownership-declined`) if the ownership
-                ledger, server shutdown quiescence, or the coordination lease cannot
-                confirm no writer remains live; otherwise checkpoints the WAL before
-                capturing files (S3 before Actions cache)
-                → toCacheSaveStateValue derives CACHE_SAVED state + cache-save-result output + job-summary row
+              prune sessions → shutdown server → sync artifacts → saveCache (declined as
+              `ownership-declined` when a live writer cannot be ruled out) → CACHE_SAVED state
               → release lock in finally
 
 post.ts (separate Action step)
   └─→ harness/post.ts (runPost)
-        └─→ saveCache retry — skipped when CACHE_SAVED already reports durable/store-only/skipped/
-              declined-for-safety; an absent or unrecognized state retries (not-persisted). Writes its own
-              job-summary row on retry (no cache-save-result output: post: steps run after every other step)
+        └─→ saveCache retry unless CACHE_SAVED is durable/store-only/skipped/declined-for-safety
 ```
 
-> See also: [Execution Lifecycle](docs/wiki/Execution%20Lifecycle.md)
+> See also: [Execution Lifecycle](docs/wiki/Execution%20Lifecycle.md#annotated-action-phase-pipeline)
 
 ### 2. Gateway Mention-Loop
 
@@ -224,70 +171,36 @@ Discord messageCreate event
   └─→ packages/gateway/src/discord/mentions.ts
         │
         ├─→ thread guard (skip if already in a thread)
-        ├─→ authorization gate
-        │     guild.members.fetch() [REST, never cache]
-        │     → role check (GATEWAY_TRIGGER_ROLE_ID) or ManageChannels
-        │     → fail-closed on any resolution error
-        │
-        ├─→ binding lookup
-        │     S3 object-store index → RepoBinding
-        │
+        ├─→ authorization gate (REST member fetch, role or ManageChannels; fail closed)
+        ├─→ binding lookup (S3 object-store index → RepoBinding)
         └─→ runMention (packages/gateway/src/execute/run.ts)
               │
-              ├─→ concurrency cap + per-channel FIFO queue
-              ├─→ thread creation on source message
-              ├─→ S3 conditional-write lock acquisition
-              │     (coordination/lock.ts; heartbeat renews lease; expired takeover needs a clear workspace check)
-              │
+              ├─→ concurrency cap + per-channel FIFO queue → thread creation on source message
+              ├─→ S3 conditional-write lock (coordination/lock.ts; heartbeat renews the lease)
               ├─→ checkout preparation (under the repo lock, before EXECUTING)
-              │     POST /update — network-free admission, then the bare fetch store,
-              │     then a pack-stream import, then a journaled fast-forward
-              │     → `no-checkout` retries once through ensureClone (fresh clone), then
-              │       retries /update; `checkout-substituted` fails the run before any
-              │       agent session starts; every other refused/failed outcome ends the
-              │       run before EXECUTING with a CheckoutPreparation record and a reply
-              │       (Discord replies carry a one-click Recover button)
-              │     → CheckoutProvenance (checked remote evidence) persisted with the
-              │       EXECUTING transition on a `ready` outcome
-              │
-              ├─→ run-state lifecycle
-              │     PENDING → ACKNOWLEDGED → EXECUTING
-              │
+              │     POST /update (clone only on `no-checkout`) → CheckoutProvenance persisted
+              │     with EXECUTING; refused/failed ends the run with a CheckoutPreparation reply
+              ├─→ run-state lifecycle: PENDING → ACKNOWLEDGED → EXECUTING
               ├─→ execute/run-core.ts
-              │     buildDiscordPrompt (+ provenance block appended) → OpenCode (workspace:9200, bearer auth)
+              │     buildDiscordPrompt → OpenCode (workspace:9200, bearer auth)
               │     → SSE event stream → discord/streaming.ts → thread reply
-              │
-              ├─→ background dispatch observation (ownership ledger)
-              │     `task` tool completes with state.metadata.background === true
-              │     → ledger.adopt(childSessionId) + coordinator.addOwnedSession
-              │     → descendant's deltas/tools/approvals now route like the root's
-              │
-              ├─→ tool approval (if any tool set to `ask`; root or adopted descendant)
-              │     permission.asked → Discord embed (Approve/Deny buttons)
-              │     → approval registry → workspace resume/reject
-              │     (a terminal Discord delivery failure — channel/thread gone —
-              │      auto-denies on the server instead of hanging out the run budget)
-              │
-              ├─→ agent question (`question` tool; root or adopted descendant)
-              │     question.asked → question registry, deadline computed from the budget left
-              │     (too little budget → skipped at once with an empty reply)
-              │     → web: SSE `question` frame; Discord: prompt in the thread (single-question
-              │       shapes) or a notice pointing at the operator web surface
-              │     → answer/skip from either surface, or the deadline skip (empty reply)
-              │     (pauses the inactivity watchdog while any approval or question is pending)
-              │
+              ├─→ background dispatch observation: completed `task` with
+              │     state.metadata.background === true → ledger.adopt + coordinator.addOwnedSession
+              ├─→ tool approval (root or adopted descendant)
+              │     permission.asked → Discord embed (Approve/Deny) → approval registry; a terminal
+              │     Discord delivery failure auto-denies on the server
+              ├─→ agent question (root or adopted descendant)
+              │     question.asked → question registry (deadline from the budget left) → web SSE
+              │     frame or Discord prompt → answer/skip, or deadline skip with an empty reply
+              │     (pending approvals and questions pause the inactivity watchdog)
               └─→ completion
-                    root session.idle with a background dispatch adopted → drain
-                      (periodic reconciliation until settled or the run deadline expires)
-                      (completion needs ledger settlement AND each child's completion notice or cancel
-                      evidence AND root freshness; human waits are independent: a pending question never
-                      holds or ends it, and the inactivity watchdog stays paused for the whole drain)
-                    code-written "started from" provenance line appended to the final reply
+                    root session.idle with an adopted dispatch → drain (ledger settlement, child
+                    notices, root freshness); provenance line appended to the final reply
                     run → COMPLETED; heartbeat stop; lock release
                     on failure → FAILED; coarse error reply to thread
 ```
 
-> See also: [Architecture Overview](docs/wiki/Architecture%20Overview.md) · [Operator Web Control Surface](docs/wiki/Operator%20Web%20Control%20Surface.md)
+> See also: [Architecture Overview](docs/wiki/Architecture%20Overview.md#annotated-data-flow) · [Operator Web Control Surface](docs/wiki/Operator%20Web%20Control%20Surface.md)
 
 ### 3. Harness Release Pipeline
 
@@ -298,29 +211,18 @@ harness-release.yaml (workflow_dispatch OR push: harness-v* tag)
   │
   ├─→ prepare-integrate job
   │     resolve base_version → render prompt from packages/harness/prompt.txt
-  │     → emit: base_version, rendered_prompt, has_refs
-  │
   ├─→ integrate job (skipped when has_refs == 'false')
-  │     uses: .github/workflows/fro-bot.yaml (Fro Bot agent, secrets: inherit)
-  │     agent:
-  │       clone anomalyco/opencode → create integration branch at base tag
-  │       → merge configured refs (harness.config.json carry-policy allowlist)
-  │       → build + verify host CLI
-  │       → push to refs/harness-integrate/<version>
-  │
+  │     .github/workflows/fro-bot.yaml agent: clone anomalyco/opencode → merge configured refs
+  │     (harness.config.json carry policy) → build + verify → push refs/harness-integrate/<version>
   ├─→ build matrix (linux-x64, linux-arm64, darwin-x64, darwin-arm64)
-  │     needs: [prepare-integrate, integrate]
-  │     fetch refs/harness-integrate/<version> (or stock tag if has_refs=false)
-  │     → build-platform.ts --source-tree <tree> --integration-commit <sha>
-  │     → emit: integration_commit
-  │
+  │     fetch the integration ref (or stock tag) → build-platform.ts → emit integration_commit
   └─→ publish job (all-or-nothing; requires build + release-binaries success)
         OIDC trusted publishing (id-token: write, publish job only)
         → npm publish @fro.bot/harness + 4 per-platform packages
         → GitHub Release (OpenCode-shaped assets + SHA256SUMS)
 ```
 
-> See also: [Architecture Overview](docs/wiki/Architecture%20Overview.md)
+> See also: [Architecture Overview](docs/wiki/Architecture%20Overview.md#annotated-data-flow)
 
 ## Cross-Cutting Concerns
 

@@ -1,6 +1,6 @@
 ---
 type: subsystem
-last-updated: "2026-10-04"
+last-updated: "2026-10-11"
 updated-by: "27d08f8201656db6da2c60758bd4a0579fa2f6bb"
 sources:
   - src/harness/config/outputs.ts
@@ -38,6 +38,7 @@ sources:
   - action.yaml
   - RFCs/RFC-011-Setup-Action-Environment-Bootstrap.md
   - RFCs/RFC-019-S3-Storage-Backend.md
+  - ARCHITECTURE.md
 summary: "Tool installation, configuration assembly, credentials, caching, and oMo/OMO Slim version gating"
 ---
 

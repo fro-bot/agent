@@ -1,6 +1,6 @@
 ---
 type: subsystem
-last-updated: "2026-09-27"
+last-updated: "2026-10-11"
 updated-by: "e6efc1f1"
 sources:
   - packages/gateway/src/execute/run.ts
@@ -73,6 +73,7 @@ sources:
   - packages/gateway/src/operator-contract/repo-summary.ts
   - packages/gateway/src/operator-contract/version.ts
   - docs/decisions/2026-06-19-s2-operator-auth-authority.md
+  - ARCHITECTURE.md
 summary: "Authenticated browser surface for gateway runs, including checkout provenance, preparation outcomes, and live observation"
 ---
 
@@ -340,6 +341,12 @@ Because `/start` and `/callback` resolve through the same resolver and the same 
 **Abuse accounting, shared quotas, and eviction (#1652).** Exact identity and abuse accounting are different questions. A routed IPv6 /64 hands one host 2^64 distinct exact addresses — unbounded free keys for the rate-limit map and the OAuth state store — so counting uses `ResolvedClientAddress.accountingKey` instead (`ipv6/64:<first four groups>`, `ipv4/32:<dotted quad>`; the family prefix keeps derived keys from colliding with an exact canonical string used as a key elsewhere). Consequences to keep in mind: legitimate distinct clients behind one /64 or one IPv4 share a bucket and an outstanding-attempt slot, and the shared OAuth/logout bucket (20/min) is spent by anonymous `/start` and `/callback` traffic as well as authenticated logout. The OAuth binding is not relaxed: `OAuthStateEntry` carries the exact `boundAddress` (compared on callback) and the derived `accountingKey` (counted for the per-key cap of 5) as separate fields, so a client moving within one /64 shares its attempt budget but still trips the exact mismatch bounce.
 
 Both bounded stores admit rather than refuse. The OAuth state store (1,000 entries, 600,000 ms TTL) owns bounded insertion: `/start` reclaims consumed and expired states, enforces the per-key cap, validates the request, and only then — at insertion — evicts the oldest remaining state if the store is full and inserts synchronously. A rejected or invalid start never evicts. An evicted state is simply unknown: its callback gets the ordinary 400 with no bounce, and consume-before-external-await, replay rejection, and the single bounce/retry are unchanged. The rate limiter (`packages/gateway/src/http/rate-limit.ts`, 10,000 keys) has no sweep: expiry is lazy per key, a renewed key is deleted and re-set so it moves to the tail, and a new key at capacity evicts the oldest key (window-renewal FIFO, not LRU — ordinary hits do not promote a key). Both are best-effort under cardinality pressure, and this gives **admission, not guaranteed completion**: a flood can evict an operator's in-flight sign-in attempt (they must start again), and evicting an active rate-limit counter resets that key's bucket. This is consistent with the accepted burned-flow tradeoff above.
+
+### Operator Ingress Invariant: Exact Identity vs. Accounting Key
+
+The unabridged form of invariant 9 in [ARCHITECTURE.md](../../ARCHITECTURE.md).
+
+**No unauthenticated operator-surface client key is ever guessed, and derived accounting keys never stand in for exact identity (gateway ingress).** The client behind every public operator-surface request is a `ResolvedClientAddress` returned by `resolveClient()` (`packages/gateway/src/web/ingress/resolve-client.ts`) against the configured `OperatorIngressPolicy`. That one value carries two deliberately separate things. The **exact canonical identity** (`.canonical`) is the only thing trust and binding decisions use: configured-peer equality (`web/ingress/trusted-proxy-address.ts`) and the OAuth `boundAddress` binding compared on callback. The **derived accounting key** (`.accountingKey`, a branded `AccountingKey`: IPv6 → /64, IPv4 → /32, IPv4-mapped IPv6 already normalized to IPv4) is used only to count or bucket traffic — the health, OAuth start/callback, and logout rate-limit buckets and the OAuth outstanding-attempt slot. Aggregation happens after `resolveClient` has selected the client, never in `canonical-address.ts`, because widening identity there would widen proxy trust (an address in the same /64 as a trusted proxy is not trusted). The one exception is a fully headerless `/operator/health` probe from a trusted peer, which stays keyed on that peer's exact canonical socket address under the health-only limiter: it is a configured proxy, so its key space is bounded by operator configuration, and the unprefixed exact string cannot collide with a prefixed accounting key (see Operator Ingress Trust Policy above). Logout is **not** an unauthenticated route: the session, allowlist, origin, and CSRF guard run first, and only an authenticated logout resolves the client and spends the shared OAuth/logout budget — though anonymous OAuth traffic can still exhaust that shared bucket. An unresolvable request rejects before any bucket or state entry is allocated — it is never collapsed onto a shared fallback key. `GATEWAY_OPERATOR_TRUSTED_PROXIES` is required whenever the operator surface is enabled; `loadGatewayConfig()` throws at startup without it.
 
 ## Relationship to Other Surfaces
 
