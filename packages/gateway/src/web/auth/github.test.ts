@@ -1445,6 +1445,27 @@ describe('OAuth accounting keys vs exact binding (#1652)', () => {
     expect(fetchSpy).not.toHaveBeenCalled()
   })
 
+  it('a provider-error callback from another address in the same /64 does not consume the state', async () => {
+    // #given — state minted from one address, provider-error callback from another address in the same /64
+    const fetchSpy = makeSuccessFetch()
+    const {app, stateStore} = makeAppWith({fetch: fetchSpy}, makeStubConfig())
+    const startRes = await startFrom(app, '2001:db8:1:2::1')
+    const state = new URL(startRes.headers.get('location') ?? '').searchParams.get('state') ?? ''
+
+    // #when
+    const res = await app.fetch(
+      new Request(`https://operator.example.com/operator/auth/github/callback?error=access_denied&state=${state}`, {
+        headers: {[TEST_CLIENT_HEADER]: '2001:db8:1:2::2'},
+      }),
+    )
+
+    // #then — refused on the exact binding: the attempt stays outstanding and GitHub is never contacted
+    expect(res.status).toBe(400)
+    expect(stateStore.get(state)?.consumed).toBe(false)
+    expect(stateStore.countOutstanding('ipv6/64:2001:0db8:0001:0002')).toBe(1)
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
   it.each([
     ['dotted IPv4-mapped IPv6', '::ffff:203.0.113.5'],
     ['hex IPv4-mapped IPv6', '::ffff:cb00:7105'],
