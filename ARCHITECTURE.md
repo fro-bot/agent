@@ -278,7 +278,7 @@ The harness release workflow publishes to npm via OIDC (no long-lived npm token)
 
 `getInvocationIdentity` (`packages/runtime/src/shared/invocation-identity.ts`) adds the job-level component that `GITHUB_RUN_ID` + `GITHUB_RUN_ATTEMPT` lack: sanitized `GITHUB_JOB`, plus `-m<8 hex>` for a matrix leg. It is deterministic and derived from env, never handed off through state.
 
-- Run-scoped keys carry it, after `runId-runAttempt`: the cache save key (`buildSaveCacheKey`), the log artifact name, and schedule/dispatch session keys (`buildLogicalKey`, `packages/runtime/src/session/logical-key.ts`).
+- The cache save key (`buildSaveCacheKey`) and the log artifact name carry it after `runId-runAttempt`; schedule/dispatch session keys (`buildLogicalKey`, `packages/runtime/src/session/logical-key.ts`) carry it after the run ID only, so a rerun resumes the same session.
 - Entity-bound keys (`issue-{n}`, `pr-{n}`, `discussion-{n}`) stay unqualified; logical keys stay run-scoped, not attempt-scoped.
 
 > See also: [Session Persistence](docs/wiki/Session%20Persistence.md#invocation-identity-job-qualified-keys)
@@ -288,7 +288,7 @@ The harness release workflow publishes to npm via OIDC (no long-lived npm token)
 Per-repo S3 conditional-write locks (`If-None-Match` / `If-Match`) built by `getLockKey` (`packages/runtime/src/coordination/lock.ts`): gateway runs exclude each other on `locks/repo.json`, Action runs on `locks/action.json`; the surfaces do not exclude each other. The Action side is `src/harness/phases/acquire-lock.ts` (15-minute TTL, renewed by timer), released in `cleanup.ts`.
 
 - With S3 configured, a lock error fails the Action closed; a contended Action exits 0 as `skipped`; a run without the lock never persists session state.
-- An expired lease is never replaced on time alone: `acquireLock` needs a `ConfirmExpiredHolder` `clear` result, and the gateway corroborates via `packages/gateway/src/execute/repo-quiescence.ts`. This is snapshot corroboration, not fencing.
+- Gateway takeover of an expired lease needs a `ConfirmExpiredHolder` `clear` result, corroborated via `packages/gateway/src/execute/repo-quiescence.ts`; this is snapshot corroboration, not fencing. The Action reclaims an expired lease without corroboration only when the holder is an Action holder (`action:{runId}:{attempt}`), via `reclaimableWithoutConfirmation`.
 
 > See also: [Execution Lifecycle](docs/wiki/Execution%20Lifecycle.md#s3-conditional-write-locks-gateway-repojson-action-actionjson)
 
