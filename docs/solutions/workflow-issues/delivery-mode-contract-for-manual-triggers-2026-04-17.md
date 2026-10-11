@@ -121,7 +121,7 @@ function buildDeliveryModePreamble(resolvedMode: ResolvedOutputMode): string {
       '- **Resolved output mode:** `working-dir`',
       '- Write all requested file changes directly in the checked-out working tree.',
       '- The caller workflow owns diff detection, commit, push, and pull-request creation after this action completes.',
-      '- Available actions: read files, edit files, create files in the working tree, run non-mutating shell commands.',
+      '- Available actions: read files, edit files, create files in the working tree, run shell commands that do not deliver code. GitHub operations the task explicitly requires (for example issues, comments, or reports) are also permitted.',
       '- Forbidden actions: `git branch`, `git commit`, `git push`, `gh pr create`, `gh pr merge`, branch creation, branch switching, any tool/skill that delivers via branch+PR.',
       '- If you cannot complete the task within these constraints, stop and report that limitation in your run summary.',
       '',
@@ -244,8 +244,10 @@ The prompt artifact shows:
 - **Resolved output mode:** `working-dir`
 - Write all requested file changes directly in the checked-out working tree.
 - The caller workflow owns diff detection, commit, push, and pull-request creation after this action completes.
-- Available actions: read files, edit files, create files in the working tree, run non-mutating shell commands.
+- Available actions: read files, edit files, create files in the working tree, run shell commands that do not deliver code. GitHub operations the task explicitly requires (for example issues, comments, or reports) are also permitted.
 - Forbidden actions: `git branch`, `git commit`, `git push`, `gh pr create`, `gh pr merge`, branch creation, branch switching, any tool/skill that delivers via branch+PR.
+
+In a non-posting run (`response-mode: none`), the GitHub-operations sentence is replaced by `This run is non-posting: do not create GitHub comments, issues, or reports.`, matching the `<agent_context>` rule.
 
 ## Task
 [task body...]
