@@ -129,9 +129,9 @@ jobs:
       # mapped to THIS step's env only — never job-level. The minted token
       # reaches the trusted push step only as the masked step output
       # steps.mint-app-token.outputs.github-token — never GITHUB_ENV or job env.
-      # The 1-hour token must outlive the agent run plus the trusted push, so
-      # the agent step is capped at 40 minutes; observed integrate jobs take
-      # 5–20 minutes.
+      # The token lives 1 hour. The agent step is capped at 40 minutes to leave
+      # headroom for the trusted push; a finalization that runs past expiry
+      # fails closed at the push. Observed integrate jobs take 5–20 minutes.
       - name: Mint scoped App token for trusted finalization
         id: mint-app-token
         run: node --experimental-strip-types scripts/harness/mint-app-token.ts

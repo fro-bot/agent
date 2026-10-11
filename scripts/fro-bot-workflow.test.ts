@@ -655,7 +655,7 @@ describe('harness integration workflow wiring', () => {
     })
   })
 
-  it('caps the agent step so the 1-hour App token outlives the agent run plus the trusted push', () => {
+  it('caps the agent step to leave the 1-hour App token headroom for the trusted push', () => {
     // #given
     const steps = stepsFor(integratePath, 'integrate')
     const runFroBot = steps.find(step => step.name === 'Run Fro Bot')
