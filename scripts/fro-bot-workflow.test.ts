@@ -623,9 +623,15 @@ describe('harness integration workflow wiring', () => {
 
   it('never hands the App id or private key to any step after the model step', () => {
     // #given
+    const job = rawJob(integratePath, 'integrate')
     const steps = stepsFor(integratePath, 'integrate')
     const authoritative = steps.findIndex(step => step.name === 'Run Fro Bot')
     expect(authoritative).toBeGreaterThanOrEqual(0)
+
+    // #then job-level env would reach every step, including the agent
+    const jobEnv = JSON.stringify(job.env ?? {})
+    expect(jobEnv).not.toContain('APPLICATION_PRIVATE_KEY')
+    expect(jobEnv).not.toContain('APPLICATION_ID')
 
     // #then neither the agent step nor any later step references the App credentials (secrets or env)
     for (const step of steps.slice(authoritative)) {
@@ -633,6 +639,32 @@ describe('harness integration workflow wiring', () => {
       expect(serialized).not.toContain('APPLICATION_PRIVATE_KEY')
       expect(serialized).not.toContain('APPLICATION_ID')
     }
+  })
+
+  it('keeps the integrate mint a plain checked-in script with only the App secrets in its own env', () => {
+    // #given
+    const steps = stepsFor(integratePath, 'integrate')
+    const appMint = stepById(steps, 'mint-app-token')
+
+    // #then the mint is a plain run: step (no marketplace action, so no post: hook)
+    expect(appMint.run).toBe('node --experimental-strip-types scripts/harness/mint-app-token.ts')
+    expect(appMint.uses).toBeUndefined()
+    expect(appMint.env).toEqual({
+      APPLICATION_ID: '${' + '{ secrets.APPLICATION_ID }}',
+      APPLICATION_PRIVATE_KEY: '${' + '{ secrets.APPLICATION_PRIVATE_KEY }}',
+    })
+  })
+
+  it('caps the agent step so the 1-hour App token outlives the agent run plus the trusted push', () => {
+    // #given
+    const steps = stepsFor(integratePath, 'integrate')
+    const runFroBot = steps.find(step => step.name === 'Run Fro Bot')
+    if (runFroBot === undefined) throw new TypeError('Run Fro Bot step is missing')
+
+    // #then
+    const agentTimeout = runFroBot['timeout-minutes']
+    expect(typeof agentTimeout).toBe('number')
+    expect(agentTimeout as number).toBeLessThanOrEqual(45)
   })
 
   it('delivers the minted token to the push step only via a step output, never GITHUB_ENV or job env', () => {
