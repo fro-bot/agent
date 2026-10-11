@@ -891,7 +891,8 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
         const pushStore = createOperatorPushSubscriptionStore({
           adapter: observePushAdapterHealth(s3Adapter, pushHealth),
           logger,
-          onCasExhausted: () => pushHealth.recordBackend('write', 'failed', pushHealth.nextSequence()),
+          // Ticket taken where a record's CAS processing ends exhausted; reported against that ticket.
+          captureCasExhaustion: pushHealth.captureWriteFailure,
         })
         // Taken before the self-test so the self-test's own observations (e.g. a denied cleanup delete) supersede it.
         const startupTicket = pushHealth.nextSequence()

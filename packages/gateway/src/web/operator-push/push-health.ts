@@ -29,6 +29,8 @@ export interface PushHealthTracker {
   readonly nextSequence: () => number
   /** Outcome of an object-store call that began at `startSequence`. */
   readonly recordBackend: (kind: PushHealthBackendKind, outcome: PushHealthOutcome, startSequence: number) => void
+  /** Takes a ticket now; the returned function records a write failure against that ticket whenever it is called. */
+  readonly captureWriteFailure: () => () => void
   /** Outcome of a broadcast that attempted delivery and began at `startSequence`. */
   readonly recordRelay: (outcome: PushHealthOutcome, startSequence: number) => void
   readonly getStatus: () => PushHealthStatus
@@ -80,6 +82,11 @@ export function createPushHealthTracker(deps: PushHealthTrackerDeps): PushHealth
     }
   }
 
+  function captureWriteFailure(): () => void {
+    const startSequence = nextSequence()
+    return () => recordBackend('write', 'failed', startSequence)
+  }
+
   function recordRelay(outcome: PushHealthOutcome, startSequence: number): void {
     relay = newest(relay, {outcome, atMs: clock(), startSequence})
   }
@@ -116,5 +123,5 @@ export function createPushHealthTracker(deps: PushHealthTrackerDeps): PushHealth
     return freshOk === true && staleFailure === false ? 'ready' : 'unknown'
   }
 
-  return {recordStartup, nextSequence, recordBackend, recordRelay, getStatus}
+  return {recordStartup, nextSequence, recordBackend, captureWriteFailure, recordRelay, getStatus}
 }

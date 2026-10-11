@@ -35,6 +35,7 @@ function createFaultableAdapter() {
   const faults: Faults = {list: undefined, get: undefined, put: undefined, del: undefined}
   let etagCounter = 0
   const calls = {count: 0}
+  const hold: {key?: string; release?: () => void; reached?: () => void} = {}
 
   const adapter: ObjectStoreAdapter = {
     upload: async () => ok(undefined),
@@ -67,13 +68,19 @@ function createFaultableAdapter() {
     },
     getObject: async key => {
       calls.count += 1
+      if (hold.key === key) {
+        hold.reached?.()
+        await new Promise<void>(resolve => {
+          hold.release = resolve
+        })
+      }
       if (faults.get !== undefined) return faultResult(faults.get, 'get')
       const current = backing.get(key)
       if (current === undefined) return err(createObjectStoreOperationError('no such key', {httpStatusCode: 404}))
       return ok({data: current.data, etag: current.etag})
     },
   }
-  return {adapter, faults, calls}
+  return {adapter, faults, calls, backing, hold}
 }
 
 function setup() {
@@ -85,7 +92,7 @@ function setup() {
   const store = createOperatorPushSubscriptionStore({
     adapter: observed,
     logger: {debug: vi.fn(), warn: vi.fn()},
-    onCasExhausted: () => tracker.recordBackend('write', 'failed', tracker.nextSequence()),
+    captureCasExhaustion: tracker.captureWriteFailure,
   })
   return {...fake, tracker, time, observed, store}
 }
@@ -375,6 +382,33 @@ describe('observePushAdapterHealth — store-level behavior at the I/O boundary'
     expect(tracker.getStatus()).toBe('degraded')
   })
 
+  it("orders a sweep's exhaustion report by when the skipped record finished, not the sweep's completion", async () => {
+    // #given two active records; the sweep skips A (CAS contention), then pauses on B
+    const {store, tracker, faults, backing, hold} = setup()
+    await store.subscribe(SUBSCRIBE_INPUT)
+    await store.subscribe({...SUBSCRIBE_INPUT, endpoint: 'https://push.example.com/send/2'})
+    const [, keyB] = Array.from(backing.keys())
+    faults.put = 412
+    const reachedB = new Promise<void>(resolve => {
+      hold.reached = resolve
+    })
+    hold.key = keyB
+    const sweep = store.deactivateForOperator({operatorId: 'operator-a'})
+    await reachedB
+
+    // #when a newer subscribe rewrites A successfully while the sweep is paused, then the sweep completes
+    faults.put = undefined
+    const rewrite = await store.subscribe(SUBSCRIBE_INPUT)
+    hold.key = undefined
+    hold.release?.()
+    const result = await sweep
+
+    // #then the sweep did skip A, but its report is bound to A's end, older than the newer successful write
+    expect(rewrite.success).toBe(true)
+    expect(result.success && result.data.skipped).toBe(1)
+    expect(tracker.getStatus()).toBe('ready')
+  })
+
   it('degrades when subscribe exhausts its CAS retries', async () => {
     // #given
     const {store, tracker, faults} = setup()
@@ -509,6 +543,36 @@ describe('observePushAdapterHealth — startup self-test', () => {
 })
 
 describe('observePushAdapterHealth — dispatcher integration', () => {
+  it('does not record a relay failure when the markDead cleanup throws, so a later dead-only broadcast recovers', async () => {
+    // #given an active subscription whose relay answers 410, and a backend whose cleanup write throws
+    const {store, tracker, faults} = setup()
+    await store.subscribe(SUBSCRIBE_INPUT)
+    const dispatcher = createPushDispatcher({
+      store,
+      sender: {sendNotification: vi.fn(async () => ({outcome: 'dead-subscription' as const, statusCode: 410}))},
+      dedupeCache: createDedupeCache(),
+      triggerPolicy: {shouldNotify},
+      vapidConfig: {subject: 'mailto:ops@example.com', publicKey: 'pub', privateKey: 'priv', keyVersion: '1'},
+      logger: {debug: vi.fn(), warn: vi.fn()},
+      auditLogger: {info: vi.fn(), warn: vi.fn()},
+      pushHealth: tracker,
+    })
+    faults.put = 'throw'
+
+    // #when the cleanup throws
+    await dispatcher.dispatchRunFailed('run-1')
+
+    // #then the backend write failure degrades
+    expect(tracker.getStatus()).toBe('degraded')
+
+    // #when the backend recovers and another dead-only broadcast cleans up successfully
+    faults.put = undefined
+    await dispatcher.dispatchRunFailed('run-2')
+
+    // #then no relay failure was ever recorded, so the write success clears it
+    expect(tracker.getStatus()).toBe('ready')
+  })
+
   it('records a failed dead-subscription cleanup (markDead write) as a backend write failure', async () => {
     // #given an active subscription whose relay answers 410, and a backend that rejects the cleanup write
     const {store, tracker, faults} = setup()

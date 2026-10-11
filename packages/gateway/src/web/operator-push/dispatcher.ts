@@ -209,9 +209,15 @@ export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispat
         return 'delivered'
       }
       case 'dead-subscription': {
-        const marked = await store.markDead({operatorId: record.operatorId, endpoint: record.endpoint})
-        if (marked.success === false) {
-          logger.warn({kind}, 'operator push dispatch: failed to mark dead subscription')
+        // Cleanup is not a send outcome: a throw is logged like an err Result and the record still counts
+        // as dead, so it never feeds relay health (the observed adapter records the backend failure).
+        try {
+          const marked = await store.markDead({operatorId: record.operatorId, endpoint: record.endpoint})
+          if (marked.success === false) {
+            logger.warn({kind}, 'operator push dispatch: failed to mark dead subscription')
+          }
+        } catch {
+          logger.warn({kind}, 'operator push dispatch: marking dead subscription threw')
         }
         // Counted in the broadcast's coarse 'dead' tally — not separately
         // audited per record; a per-record deactivation event would leak

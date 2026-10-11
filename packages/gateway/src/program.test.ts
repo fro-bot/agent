@@ -1616,7 +1616,7 @@ describe('button interaction handler (approval flow)', () => {
       const {createOperatorPushSubscriptionStore} = await import('./web/operator-push/subscription-store.js')
       selfTestCasMock.mockImplementationOnce(async () => {
         const storeDeps = vi.mocked(createOperatorPushSubscriptionStore).mock.calls.at(-1)?.[0]
-        storeDeps?.onCasExhausted?.()
+        storeDeps?.captureCasExhaustion?.()()
         return {success: true, data: undefined} as const
       })
 

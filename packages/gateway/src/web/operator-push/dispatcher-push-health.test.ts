@@ -128,23 +128,32 @@ describe('createPushDispatcher — push health: relay delivery', () => {
     expect(tracker.getStatus()).toBe('degraded')
   })
 
-  it('degrades when markDead rejects after a 410', async () => {
-    // #given
-    const {dispatcher, tracker} = setup({
-      records: [makeRecord(1)],
-      outcomes: [{outcome: 'dead-subscription', statusCode: 410}],
+  it('records no relay failure when markDead rejects after a 410', async () => {
+    // #given a relay that answers 410 and a cleanup that throws
+    const recordRelay = vi.fn()
+    const tracker = {nextSequence: () => 1, recordRelay}
+    const sender = makeSender([{outcome: 'dead-subscription', statusCode: 410}])
+    const dispatcher = createPushDispatcher({
       store: {
+        listAllActiveRecords: async () => ({success: true as const, data: [makeRecord(1)]}),
         markDead: vi.fn(async () => {
           throw new Error('store down')
         }),
       },
+      sender,
+      dedupeCache: createDedupeCache(),
+      triggerPolicy: {shouldNotify},
+      vapidConfig: VAPID_CONFIG,
+      logger: {debug: vi.fn(), warn: vi.fn()},
+      auditLogger: {info: vi.fn(), warn: vi.fn()},
+      pushHealth: tracker,
     })
 
     // #when
     await dispatcher.dispatchRunFailed('run-1')
 
-    // #then the rejected cleanup is counted as a failed record
-    expect(tracker.getStatus()).toBe('degraded')
+    // #then cleanup failures belong to backend health, never to relay health
+    expect(recordRelay).not.toHaveBeenCalled()
   })
 
   it('clears a relay failure after a later broadcast that is attempted and succeeds', async () => {
