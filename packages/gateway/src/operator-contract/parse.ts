@@ -9,10 +9,11 @@
  * - Effect Schema is never used here — exported surface is plain TS + Result only.
  * - NO-ORACLE: error messages are FIXED reason strings. They never echo, interpolate,
  *   or stringify any part of the input. Even a garbled fragment is forbidden.
- * - Extra-field policy: IGNORE extra fields (permissive structural subtyping).
- *   The guard checks only the required fields; unknown extra fields are silently
- *   ignored. The parsed value is typed as the interface, so extra fields are not
- *   accessible via the type.
+ * - Field policy: required fields are checked and a failure rejects the value. An optional
+ *   diagnostic field (`OperatorSessionInfo.push`) is validated when present and dropped
+ *   if malformed, so it can never reject an otherwise valid value. Extra fields are
+ *   ignored (permissive structural subtyping): the parsed value is typed as the
+ *   interface, so they are not accessible via the type.
  */
 
 import type {Result} from '@fro-bot/runtime'
@@ -21,6 +22,7 @@ import type {
   OperatorCsrfToken,
   OperatorError,
   OperatorOk,
+  OperatorPushHealth,
   OperatorPushSubscribeRequest,
   OperatorPushUnsubscribeRequest,
   OperatorPushVapidKeyResponse,
@@ -28,12 +30,24 @@ import type {
 } from './responses.js'
 
 import {err, ok} from '@fro-bot/runtime'
+import {OPERATOR_PUSH_HEALTH_STATUSES} from './responses.js'
 
 // ---------------------------------------------------------------------------
 // OperatorSessionInfo
 // ---------------------------------------------------------------------------
 
-function hasValidOperatorSessionInfoShape(value: unknown): value is OperatorSessionInfo {
+function hasValidOperatorPushHealthShape(value: unknown): value is OperatorPushHealth {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false
+  }
+
+  const status = (value as Record<string, unknown>).status
+  return typeof status === 'string' && (OPERATOR_PUSH_HEALTH_STATUSES as readonly string[]).includes(status)
+}
+
+function hasValidOperatorSessionInfoShape(
+  value: unknown,
+): value is Omit<OperatorSessionInfo, 'push'> & {readonly push?: unknown} {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     return false
   }
@@ -51,8 +65,9 @@ function hasValidOperatorSessionInfoShape(value: unknown): value is OperatorSess
 /**
  * Parse an unknown value as OperatorSessionInfo.
  *
- * Returns ok(value) when the input has the required shape.
- * Returns err(Error) with a FIXED reason string when validation fails —
+ * Returns ok(value) when the input has the required shape; a malformed optional
+ * `push` is dropped rather than rejecting the session.
+ * Returns err(Error) with a FIXED reason string when a required field is invalid —
  * the error message never echoes any part of the input.
  */
 export function parseOperatorSessionInfo(input: unknown): Result<OperatorSessionInfo, Error> {
@@ -60,7 +75,12 @@ export function parseOperatorSessionInfo(input: unknown): Result<OperatorSession
     return err(new Error('invalid operator session info shape'))
   }
 
-  return ok(input)
+  return ok({
+    operatorId: input.operatorId,
+    login: input.login,
+    expiresAt: input.expiresAt,
+    ...(hasValidOperatorPushHealthShape(input.push) ? {push: {status: input.push.status}} : {}),
+  })
 }
 
 // ---------------------------------------------------------------------------

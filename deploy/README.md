@@ -547,7 +547,7 @@ If an update or recovery subprocess's termination cannot be confirmed, the works
 
 ### Deploy coordination
 
-Operator contract **1.10.0** exports the push trigger kinds (`OPERATOR_PUSH_TRIGGER_KINDS`) and carries (since 1.9.0) the agent-question frame and routes, the `waiting_for_question` run status, checked remote evidence on `checkoutProvenance`, and the optional `checkoutPreparation` field. **The `fro-bot/dashboard` contract pin must move to 1.10.0 at the same time this gateway version deploys** — the dashboard's SSE reader matches the contract version exactly and fails closed on a mismatch. Merging this change is safe on its own; deploying it to production alone, without the matching dashboard release, is not.
+Operator contract **1.10.0** exports the push trigger kinds (`OPERATOR_PUSH_TRIGGER_KINDS`); the authenticated session response may carry an optional `push: {status}` (`ready | degraded | unknown`), which consumers may ignore. It also carries (since 1.9.0) the agent-question frame and routes, the `waiting_for_question` run status, checked remote evidence on `checkoutProvenance`, and the optional `checkoutPreparation` field. **The `fro-bot/dashboard` contract pin must move to 1.10.0 at the same time this gateway version deploys** — the dashboard's SSE reader matches the contract version exactly and fails closed on a mismatch. Merging this change is safe on its own; deploying it to production alone, without the matching dashboard release, is not.
 
 The gateway and workspace images must roll together, for the same reason as the control-API bearer above: an older gateway does not send the bearer or request shapes a newer workspace expects, and vice versa.
 

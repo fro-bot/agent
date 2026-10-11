@@ -43,6 +43,7 @@ import type {GitHubOAuthConfig, GitHubOAuthDeps} from './auth/github.js'
 import type {RepoAuthzCache} from './auth/repo-authz.js'
 import type {SessionDeps, SessionStore} from './auth/session.js'
 import type {OperatorIngressPolicy} from './ingress/policy.js'
+import type {PushHealthStatus} from './operator-push/push-health.js'
 import type {SubscriptionRouteSessionStore} from './operator-push/subscription-route.js'
 import type {OperatorPushSubscriptionStore} from './operator-push/subscription-store.js'
 import type {VapidPublicKeyInfo} from './operator-push/vapid.js'
@@ -302,6 +303,13 @@ export interface OperatorServerDeps {
    * Required when operatorPushStore is present; ignored otherwise.
    */
   readonly operatorPushVapidKeyInfo?: VapidPublicKeyInfo
+  /**
+   * Passive push-health reader for the authenticated GET /operator/session
+   * response. Supplied whenever push is configured (even if startup left it
+   * disabled), so a failed startup self-test surfaces as `degraded`. When
+   * absent, the session response carries no `push` field.
+   */
+  readonly operatorPushHealth?: () => PushHealthStatus
 }
 
 export interface OperatorServerConfig {
@@ -738,7 +746,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   // Route: GET /operator/session — privileged (requires session + allowlist).
   // Returns current session info (operatorId, login, expiresAt) for the authenticated session.
   if (browserGuardDeps !== undefined) {
-    buildSessionInfoRoute(app, browserGuardDeps)
+    buildSessionInfoRoute(app, browserGuardDeps, deps.operatorPushHealth)
   }
 
   // ── Run-stream SSE endpoint ─────────────────────────────────────────────────

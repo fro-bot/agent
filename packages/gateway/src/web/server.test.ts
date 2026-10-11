@@ -302,6 +302,69 @@ describe('GET /operator/health — happy path', () => {
   })
 })
 
+describe('GET /operator/health — push health stays off the public surface', () => {
+  it('returns the unchanged {ok, contractVersion} body even when push health is degraded', async () => {
+    // #given a push health reader reporting degraded
+    const port = await findFreePort()
+    const server = createOperatorServer(
+      {...makeStubDeps(), operatorPushHealth: () => 'degraded'},
+      makeStubConfig({bindPort: port}),
+    )
+
+    try {
+      // #when an anonymous caller hits the public health route
+      const res = await fetch(`http://127.0.0.1:${port}/operator/health`)
+      const text = await res.text()
+
+      // #then no push field and no byte of push state leaks
+      expect(res.status).toBe(200)
+      expect(JSON.parse(text)).toEqual({ok: true, contractVersion: OPERATOR_CONTRACT_VERSION})
+      expect(text).not.toContain('push')
+      expect(text).not.toContain('degraded')
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it('does not change the route inventory when a push health reader is supplied', () => {
+    // #given the same full browser-guard deps with and without a push health reader
+    const inventory = (operatorPushHealth?: OperatorServerDeps['operatorPushHealth']): RouteEntry[] => {
+      const sessionStore = createInMemorySessionStore()
+      const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+      const app = buildOperatorApp(
+        makeStubDeps({
+          sessionStore,
+          sessionDeps: makeStubSessionDeps(),
+          allowlist,
+          csrfSecret,
+          auditLogger,
+          logger,
+          operatorPushHealth,
+        }),
+        makeStubConfig(),
+      )
+      const seen = new Set<string>()
+      return app.routes
+        .map((route: RouteEntry) => ({method: route.method, path: route.path}))
+        .filter((route: RouteEntry) => {
+          if (route.method === 'ALL' && route.path === '/*') return false
+          const key = `${route.method}:${route.path}`
+          if (seen.has(key)) return false
+          seen.add(key)
+          return true
+        })
+    }
+
+    // #when
+    const without = inventory()
+    const withReader = inventory(() => 'ready')
+
+    // #then the guarded inventory (which includes the session routes) is identical
+    expect(without).toContainEqual({method: 'GET', path: '/operator/session'})
+    expect(withReader).toEqual(without)
+  })
+})
+
 // ---------------------------------------------------------------------------
 // Shutdown — operator server closes cleanly
 // ---------------------------------------------------------------------------
@@ -2650,4 +2713,98 @@ describe('buildOperatorApp — run stream resolves an evicted terminal run from 
       }
     },
   )
+})
+
+// ---------------------------------------------------------------------------
+// GET /operator/session — push health (authenticated, optional)
+// ---------------------------------------------------------------------------
+
+async function fetchSession(operatorPushHealth?: OperatorServerDeps['operatorPushHealth']) {
+  const sessionStore = createInMemorySessionStore()
+  const now = Date.now()
+  const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
+  if (sessionId === undefined) throw new Error('expected session to be created')
+
+  const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+  const app = buildOperatorApp(
+    makeStubDeps({
+      sessionStore,
+      sessionDeps: makeStubSessionDeps({clock: () => now}),
+      allowlist,
+      csrfSecret,
+      auditLogger,
+      logger,
+      rateLimiter: {allow: () => true},
+      operatorPushHealth,
+    }),
+    makeStubConfig({publicOrigin: 'https://operator.example.com'}),
+  )
+
+  const res = await app.fetch(
+    new Request('http://127.0.0.1/operator/session', {
+      headers: {cookie: `${SESSION_COOKIE_NAME}=${sessionId}`, origin: 'https://operator.example.com'},
+    }),
+  )
+  return {res, body: (await res.json()) as Record<string, unknown>}
+}
+
+describe('GET /operator/session — push health through buildOperatorApp', () => {
+  it.each(['ready', 'degraded', 'unknown'] as const)(
+    'returns push: {status: %s} to an authenticated operator',
+    async status => {
+      // #when
+      const {res, body} = await fetchSession(() => status)
+
+      // #then
+      expect(res.status).toBe(200)
+      expect(body.push).toEqual({status})
+      expect(Object.keys(body).sort()).toEqual(['expiresAt', 'login', 'operatorId', 'push'])
+    },
+  )
+
+  it('omits push when no reader is supplied', async () => {
+    // #when
+    const {res, body} = await fetchSession(undefined)
+
+    // #then
+    expect(res.status).toBe(200)
+    expect('push' in body).toBe(false)
+  })
+
+  it('omits push when the reader reports disabled', async () => {
+    // #when
+    const {res, body} = await fetchSession(() => 'disabled')
+
+    // #then
+    expect(res.status).toBe(200)
+    expect('push' in body).toBe(false)
+  })
+
+  it('does not expose push health to an unauthenticated caller', async () => {
+    // #given a reader that would report degraded
+    const sessionStore = createInMemorySessionStore()
+    const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+    const app = buildOperatorApp(
+      makeStubDeps({
+        sessionStore,
+        sessionDeps: makeStubSessionDeps(),
+        allowlist,
+        csrfSecret,
+        auditLogger,
+        logger,
+        rateLimiter: {allow: () => true},
+        operatorPushHealth: () => 'degraded',
+      }),
+      makeStubConfig({publicOrigin: 'https://operator.example.com'}),
+    )
+
+    // #when no session cookie is presented
+    const res = await app.fetch(
+      new Request('http://127.0.0.1/operator/session', {headers: {origin: 'https://operator.example.com'}}),
+    )
+
+    // #then
+    expect(res.status).toBe(401)
+    expect(await res.text()).not.toContain('degraded')
+  })
 })

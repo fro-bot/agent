@@ -196,6 +196,13 @@ export interface OperatorPushSubscriptionStoreDeps {
    * smaller.
    */
   readonly tombstoneRetentionMs?: number
+  /**
+   * Called at the instant a CAS conflict is detected (retries spent, or a delete lost its CAS race), before
+   * any follow-up awaits. Returns the function that reports it, which the store may call later (sweeps
+   * report once, after the loop). The observer binds its ordering position to the capture instant, so a
+   * late report cannot supersede a write that started after the conflict.
+   */
+  readonly captureCasExhaustion?: () => () => void
 }
 
 export interface StoreError extends Error {
@@ -368,6 +375,7 @@ export function createOperatorPushSubscriptionStore(
   deps: OperatorPushSubscriptionStoreDeps,
 ): OperatorPushSubscriptionStore {
   const {adapter, logger} = deps
+  const captureCasExhaustion = deps.captureCasExhaustion ?? (() => () => {})
   const keyPrefix = deps.keyPrefix ?? DEFAULT_KEY_PREFIX
   const tombstonePrefix = DEFAULT_TOMBSTONE_PREFIX
   const clock = deps.clock ?? Date.now
@@ -609,6 +617,7 @@ export function createOperatorPushSubscriptionStore(
     }
 
     if (written === null) {
+      captureCasExhaustion()()
       return err(createStoreError('subscribe: exceeded max CAS retry attempts'))
     }
 
@@ -688,6 +697,7 @@ export function createOperatorPushSubscriptionStore(
       }
       return ok(undefined)
     }
+    captureCasExhaustion()()
     return err(createStoreError('unsubscribe: exceeded max CAS retry attempts'))
   }
 
@@ -712,6 +722,7 @@ export function createOperatorPushSubscriptionStore(
 
     let updated = 0
     let skipped = 0
+    let lastSkippedReport: (() => void) | undefined
     for (const key of keys.data) {
       const maxAttempts = 5
       let settled = false
@@ -755,12 +766,14 @@ export function createOperatorPushSubscriptionStore(
       }
       if (settled === false) {
         skipped += 1
+        lastSkippedReport = captureCasExhaustion()
         logger.warn(
           {key, operatorId: args.operatorId},
           'operator push subscription store: deactivateForOperator CAS retry exhausted for key — record not updated',
         )
       }
     }
+    lastSkippedReport?.()
     return ok({updated, skipped})
   }
 
@@ -816,6 +829,7 @@ export function createOperatorPushSubscriptionStore(
 
     let deleted = 0
     let skipped = 0
+    let lastSkippedReport: (() => void) | undefined
     for (const key of keys.data) {
       const fetched = await cas.data.getObject(key)
       if (fetched.success === false) {
@@ -866,6 +880,8 @@ export function createOperatorPushSubscriptionStore(
       // plausibly a concurrent transfer). Do NOT count this as deleted: the
       // secrets are still on disk under whatever the current object holds.
       skipped += 1
+      // Captured at detection, before the rollback reads below: a later re-subscribe must outrank this report.
+      lastSkippedReport = captureCasExhaustion()
       logger.warn(
         {key, operatorId: args.operatorId},
         'operator push subscription store: deleteForOperator lost the physical-delete CAS race — secrets remain on disk pending a later prune or transfer',
@@ -907,6 +923,7 @@ export function createOperatorPushSubscriptionStore(
         }
       }
     }
+    lastSkippedReport?.()
     return ok({deleted, skipped})
   }
 
@@ -994,6 +1011,7 @@ export function createOperatorPushSubscriptionStore(
       }
       return ok(undefined)
     }
+    captureCasExhaustion()()
     return err(createStoreError('markDead: exceeded max CAS retry attempts'))
   }
 

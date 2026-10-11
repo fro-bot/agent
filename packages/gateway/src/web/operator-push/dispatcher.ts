@@ -40,6 +40,7 @@ import type {OperatorPushTriggerKind} from '../../operator-contract/responses.js
 import type {OperatorFailureKind} from '../../operator-contract/run-status.js'
 import type {AuditLogger} from '../audit.js'
 import type {DedupeCache} from './dedupe-cache.js'
+import type {PushHealthTracker} from './push-health.js'
 import type {PushSender} from './push-sender.js'
 import type {OperatorPushSubscriptionStore, SubscriptionRecord} from './subscription-store.js'
 import type {TriggerDecision} from './trigger-policy.js'
@@ -76,6 +77,12 @@ export interface CreatePushDispatcherDeps {
   readonly logger: DispatcherLogger
   /** Audit logger — one coarse push.dispatch summary event is emitted per broadcast. */
   readonly auditLogger: AuditLogger
+  /**
+   * Optional passive health sink. Receives one relay observation per broadcast
+   * that attempted delivery. Backend observations come from the observed
+   * object-store adapter, not from here.
+   */
+  readonly pushHealth?: Pick<PushHealthTracker, 'nextSequence' | 'recordRelay'>
 }
 
 export interface PushDispatcher {
@@ -89,10 +96,11 @@ export interface PushDispatcher {
 }
 
 export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispatcher {
-  const {store, sender, dedupeCache, triggerPolicy, vapidConfig, logger, auditLogger} = deps
+  const {store, sender, dedupeCache, triggerPolicy, vapidConfig, logger, auditLogger, pushHealth} = deps
 
   async function broadcast(kind: OperatorPushTriggerKind, dedupeId: string, payload: string): Promise<void> {
     const dedupeKey = `${dedupeId}:${kind}`
+    const relayStart = pushHealth?.nextSequence() ?? 0
 
     // List first: a transient list failure must not consume the dedupe
     // slot, or a retry of the same event within the dedupe window would be
@@ -165,6 +173,15 @@ export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispat
     // this point, so a zero-count event can only mean "all subscribers were
     // skipped".
     emitAudit({kind: 'push.dispatch', correlationId: dedupeId, trigger: kind, delivered, dead, failed}, auditLogger)
+
+    // Relay health: any relay failure degrades; a broadcast with at least one
+    // accepted send and no failures can clear it. A broadcast that delivered
+    // nothing (all dead, or all skipped as stale-key) establishes neither.
+    if (failed > 0) {
+      pushHealth?.recordRelay('failed', relayStart)
+    } else if (delivered > 0) {
+      pushHealth?.recordRelay('ok', relayStart)
+    }
   }
 
   async function dispatchToRecord(
@@ -192,9 +209,15 @@ export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispat
         return 'delivered'
       }
       case 'dead-subscription': {
-        const marked = await store.markDead({operatorId: record.operatorId, endpoint: record.endpoint})
-        if (marked.success === false) {
-          logger.warn({kind}, 'operator push dispatch: failed to mark dead subscription')
+        // Cleanup is not a send outcome: a throw is logged like an err Result and the record still counts
+        // as dead, so it never feeds relay health (the observed adapter records the backend failure).
+        try {
+          const marked = await store.markDead({operatorId: record.operatorId, endpoint: record.endpoint})
+          if (marked.success === false) {
+            logger.warn({kind}, 'operator push dispatch: failed to mark dead subscription')
+          }
+        } catch {
+          logger.warn({kind}, 'operator push dispatch: marking dead subscription threw')
         }
         // Counted in the broadcast's coarse 'dead' tally — not separately
         // audited per record; a per-record deactivation event would leak
