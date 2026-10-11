@@ -148,7 +148,7 @@ WORKDIR /app
 # in the form <base>+harness.<sha>. Bumped in lockstep with the action default
 # by the harness-release workflow; merge the auto-PR to advance both surfaces.
 ARG OPENCODE_VERSION=1.18.34+harness.6546eb64
-ARG SYSTEMATIC_VERSION=3.21.5
+ARG SYSTEMATIC_VERSION=3.21.6
 
 # System packages, pinned to exact Alpine 3.24 versions (the base tag's
 # `-alpine3.24` suffix and the apk registryUrls in .github/renovate.json5 name
