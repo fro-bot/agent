@@ -44,6 +44,12 @@
  *     subsequent legitimate callback then hits the already-consumed branch and 400s).
  *     This is accepted: recovery is "sign in again," and not releasing the attempt
  *     reproduces the outstanding-attempt-cap outage this module exists to fix.
+ *   - Known tradeoff: the state store is bounded (1,000 entries). When it is full, /start
+ *     evicts the OLDEST remaining state instead of refusing, so admission of a new start is
+ *     never denied by other clients' abandoned or flooded attempts. The cost is that a flood
+ *     can evict an operator's in-flight attempt: that callback finds an unknown state, gets
+ *     the ordinary 400 (no automatic bounce), and the operator must start again. Admission,
+ *     not guaranteed completion — consistent with the burned-flow policy above.
  */
 
 import type {Context, Hono} from 'hono'
@@ -97,7 +103,11 @@ export interface OAuthStateEntry {
 
 /** Server-side state store interface for OAuth state entries. */
 export interface OAuthStateStore {
-  /** Store a state entry. */
+  /**
+   * Store a state entry. Bounded insertion: when the store is at capacity and
+   * `stateValue` is new, the oldest remaining entry is evicted first, then the
+   * new one is inserted, synchronously.
+   */
   set: (stateValue: string, entry: OAuthStateEntry) => void
   /** Retrieve a state entry by value. Returns undefined if not found. */
   get: (stateValue: string) => OAuthStateEntry | undefined
@@ -282,6 +292,20 @@ export function buildGitHubOAuthDeps(
 // ---------------------------------------------------------------------------
 
 /**
+ * Global ceiling on total live entries in the OAuth state store across all
+ * accounting keys.
+ *
+ * Bounds worst-case memory (~1 MB; each entry is ~200 bytes) when many
+ * distinct accounting keys each stay below the per-key outstanding cap. When
+ * the store is full, the store itself admits a new state by evicting the
+ * OLDEST remaining one (insertion order) rather than refusing — see
+ * createInMemoryStateStore. Admission is guaranteed; completion of an evicted
+ * attempt is not (its callback finds an unknown state and gets the ordinary
+ * 400, so that sign-in has to be retried).
+ */
+const MAX_GLOBAL_STATE_STORE_ENTRIES = 1_000
+
+/**
  * Create a simple in-memory OAuth state store.
  *
  * Suitable for v1 single-process deployment. Gateway restart clears all state
@@ -289,12 +313,35 @@ export function buildGitHubOAuthDeps(
  *
  * Supports eviction of consumed and expired entries via evictStale() to bound
  * memory growth. Call evictStale() periodically or on each request.
+ *
+ * The store owns bounded insertion: `set` never grows the store past
+ * `maxEntries`. When inserting a NEW state into a full store it first evicts
+ * the oldest remaining entry (Map iteration is insertion order, and entries
+ * are never re-inserted, so the first key is the oldest-minted state). The
+ * eviction and the insert happen in one synchronous step, so no caller can
+ * observe an over-capacity store or race another insert past the bound. An
+ * evicted state is simply unknown afterwards: it is never resurrected and its
+ * callback receives the ordinary unknown-state rejection.
+ *
+ * Callers (the `/start` route) reclaim consumed/expired entries and enforce
+ * the per-key cap BEFORE calling `set`, so a rejected or invalid start never
+ * evicts anything.
+ *
+ * @param maxEntries - Hard bound on live entries (default 1,000).
  */
-export function createInMemoryStateStore(): OAuthStateStore {
+export function createInMemoryStateStore(maxEntries: number = MAX_GLOBAL_STATE_STORE_ENTRIES): OAuthStateStore {
   const entries = new Map<string, OAuthStateEntry>()
 
   return {
     set(stateValue: string, entry: OAuthStateEntry): void {
+      // Re-minting an existing state value replaces it in place (and moves it
+      // to the tail) without needing capacity.
+      entries.delete(stateValue)
+      while (entries.size >= maxEntries) {
+        const oldest = entries.keys().next()
+        if (oldest.done === true) break
+        entries.delete(oldest.value)
+      }
       entries.set(stateValue, entry)
     },
 
@@ -447,18 +494,6 @@ function parseUserResponse(data: unknown): UserResponse | null {
 const GITHUB_FETCH_TIMEOUT_MS = 8_000
 
 /**
- * Global ceiling on total live entries in the OAuth state store across all source keys.
- *
- * Prevents unbounded Map growth when many distinct source keys each stay below the
- * per-source outstanding cap. Once the store reaches this size, /start fails closed
- * until stale entries are evicted (evictStale runs before the check on every request).
- *
- * Sized to be generous for legitimate concurrent flows (1000 simultaneous OAuth starts
- * across all users) while bounding worst-case memory to ~1 MB (each entry is ~200 bytes).
- */
-const MAX_GLOBAL_STATE_STORE_ENTRIES = 1_000
-
-/**
  * Path for the OAuth start route. Shared between the route registration and
  * the retry-bounce redirect built on a source-key mismatch (see the
  * callback's binding check), so the two never drift apart.
@@ -533,12 +568,6 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
       return rateLimitedResponse(c)
     }
 
-    // Check global store ceiling to prevent unbounded Map growth across distinct source keys.
-    if (deps.stateStore.size() >= MAX_GLOBAL_STATE_STORE_ENTRIES) {
-      deps.logger.warn({}, 'oauth start rejected: global state store ceiling reached')
-      return rateLimitedResponse(c)
-    }
-
     // Retry-bounce marker: set only on the redirect this route's own callback
     // builds after a source-key mismatch (see buildGitHubOAuthRoutes callback
     // handler). Purely an availability bound on the retry loop — it carries no
@@ -564,7 +593,10 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
     const stateValue = deps.generateState()
     const codeChallenge = deriveCodeChallenge(codeVerifier)
 
-    // Store state server-side. Code verifier NEVER leaves the server.
+    // Store state server-side. Code verifier NEVER leaves the server. The store
+    // owns bounded insertion: if it is full it evicts its oldest remaining state
+    // here, at the insertion point — only after the per-key cap and request
+    // validation above have passed, so rejected starts never evict anything.
     deps.stateStore.set(stateValue, {
       codeVerifier,
       issuedAt: deps.clock(),

@@ -2169,85 +2169,329 @@ describe('createInMemoryStateStore', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Auth start — global store ceiling (prevents unbounded Map growth)
+// Auth start — bounded state store evicts the oldest instead of refusing (#1652)
+//
+// Order of operations in /start: (1) reclaim consumed + expired states,
+// (2) enforce the per-accounting-key outstanding cap, (3) validate the request,
+// (4) at the insertion point, if the store is full evict the oldest remaining
+// state, (5) insert synchronously. The store owns bounded insertion.
 // ---------------------------------------------------------------------------
 
-describe('GET /operator/auth/github/start — global store ceiling', () => {
-  it('rejects new starts when total live entries across all source keys meet the global cap', async () => {
-    // #given — many distinct source keys, each with one outstanding entry
-    // Use a small per-source cap (1) so each source key can mint exactly one entry.
-    // The global cap is what we are testing here: once total live entries reach it,
-    // /start must fail closed regardless of which source key is requesting.
-    const stateStore = createInMemoryStateStore()
-    let stateCounter = 0
-    let sourceCounter = 0
+describe('GET /operator/auth/github/start — full state store evicts the oldest (#1652)', () => {
+  const CLIENT_HEADER = 'x-test-client'
 
+  interface EvictionHarness {
+    readonly app: Hono
+    readonly stateStore: ReturnType<typeof createInMemoryStateStore>
+    readonly fetchSpy: GitHubOAuthDeps['fetch']
+    readonly clock: {now: number}
+    readonly start: (client: string, query?: string) => Promise<Response>
+    readonly callback: (client: string, state: string, extra?: string) => Promise<Response>
+    /** Mint a state from `client` and return its value (throws if start did not redirect). */
+    readonly mint: (client: string) => Promise<string>
+  }
+
+  function makeEvictionHarness(opts: {
+    readonly maxEntries?: number
+    readonly perKeyCap?: number
+    readonly fetch?: GitHubOAuthDeps['fetch']
+  }): EvictionHarness {
+    let stateCounter = 0
+    const stateStore =
+      opts.maxEntries === undefined ? createInMemoryStateStore() : createInMemoryStateStore(opts.maxEntries)
+    const fetchSpy = opts.fetch ?? makeSuccessFetch()
+    const clock = {now: 1_000_000}
     const deps = makeStubDeps({
       stateStore,
-      generateState: () => `state-${++stateCounter}`,
-      // Each request gets a unique source key so per-source cap never triggers.
-      getSourceKey: () => Effect.succeed(stubResolved(`source-${++sourceCounter}`)),
+      fetch: fetchSpy,
+      clock: () => clock.now,
+      generateState: () => `st-${++stateCounter}`,
+      getSourceKey: (c: Context) => Effect.succeed(stubResolved(c.req.header(CLIENT_HEADER) ?? 'missing-client')),
     })
-    // Per-source cap is high (100) so it never fires; global cap is what we hit.
-    const config = makeStubConfig({maxOutstandingAttemptsPerKey: 100})
+    const config = makeStubConfig({maxOutstandingAttemptsPerKey: opts.perKeyCap ?? 5})
     const app = buildTestApp(deps, config)
-
-    const makeReq = () => new Request('https://operator.example.com/operator/auth/github/start')
-
-    // #when — fill the store up to the global ceiling
-    // We need to know the ceiling value; import it from the module under test.
-    // Since it's an internal constant, we drive it via observable behavior:
-    // keep minting until we get a 429, then verify the store size is bounded.
-    const responses: Response[] = []
-    for (let i = 0; i < 1100; i++) {
-      const res = await app.fetch(makeReq())
-      responses.push(res)
-      if (res.status === 429) break
+    const start = async (client: string, query = ''): Promise<Response> =>
+      app.fetch(
+        new Request(`https://operator.example.com/operator/auth/github/start${query}`, {
+          headers: {[CLIENT_HEADER]: client},
+        }),
+      )
+    const callback = async (client: string, state: string, extra = ''): Promise<Response> =>
+      app.fetch(
+        new Request(
+          `https://operator.example.com/operator/auth/github/callback?state=${state}&code=test-code${extra}`,
+          {headers: {[CLIENT_HEADER]: client}},
+        ),
+      )
+    const mint = async (client: string): Promise<string> => {
+      const res = await start(client)
+      const state = new URL(res.headers.get('location') ?? 'https://x.invalid').searchParams.get('state')
+      if (res.status !== 302 || state === null) throw new Error(`expected a state mint, got ${res.status}`)
+      return state
     }
+    return {app, stateStore, fetchSpy, clock, start, callback, mint}
+  }
 
-    // #then — at least one request was rejected (global cap enforced)
-    const rejectedCount = responses.filter(r => r.status === 429).length
-    expect(rejectedCount).toBeGreaterThan(0)
+  it('admits a new start into a full store, stays bounded, and evicts exactly the oldest entry', async () => {
+    // #given — a store of 3, filled by three distinct clients
+    const h = makeEvictionHarness({maxEntries: 3})
+    const s1 = await h.mint('203.0.113.1')
+    const s2 = await h.mint('203.0.113.2')
+    const s3 = await h.mint('203.0.113.3')
+    expect(h.stateStore.size()).toBe(3)
 
-    // #and — the store size is bounded (did not grow to 1100)
-    expect(stateStore.size()).toBeLessThan(1100)
+    // #when — a fourth, eligible client starts
+    const s4 = await h.mint('203.0.113.4')
+
+    // #then — admitted, still 3 entries, only the oldest is gone
+    expect(h.stateStore.size()).toBe(3)
+    expect(h.stateStore.get(s1)).toBeUndefined()
+    expect(h.stateStore.get(s2)).toBeDefined()
+    expect(h.stateStore.get(s3)).toBeDefined()
+    expect(h.stateStore.get(s4)).toBeDefined()
   })
 
-  it('allows new starts after global ceiling entries expire (evict-before-count)', async () => {
-    // #given — fill store to global ceiling with distinct source keys, then advance clock
-    const ttlMs = 10 * 60 * 1000
-    const stateStore = createInMemoryStateStore()
-    let stateCounter = 0
-    let sourceCounter = 0
-    let currentTime = 1000
+  it('rejects the evicted entry callback with the ordinary 400, no bounce, and no token exchange', async () => {
+    // #given — s1 was evicted by a newer start
+    const h = makeEvictionHarness({maxEntries: 2})
+    const s1 = await h.mint('203.0.113.1')
+    await h.mint('203.0.113.2')
+    await h.mint('203.0.113.3')
+    expect(h.stateStore.get(s1)).toBeUndefined()
 
-    const deps = makeStubDeps({
-      stateStore,
-      generateState: () => `state-${++stateCounter}`,
-      getSourceKey: () => Effect.succeed(stubResolved(`source-${++sourceCounter}`)),
-      clock: () => currentTime,
-    })
-    const config = makeStubConfig({maxOutstandingAttemptsPerKey: 100, stateTtlMs: ttlMs})
-    const app = buildTestApp(deps, config)
+    // #when — the evicted attempt's owner returns from GitHub
+    const res = await h.callback('203.0.113.1', s1)
 
-    const makeReq = () => new Request('https://operator.example.com/operator/auth/github/start')
+    // #then — unknown state: plain 400, no redirect, GitHub never contacted
+    expect(res.status).toBe(400)
+    expect(res.headers.get('location')).toBeNull()
+    expect(h.fetchSpy).not.toHaveBeenCalled()
+  })
 
-    // Fill until we hit the global cap
-    for (let i = 0; i < 1100; i++) {
-      const res = await app.fetch(makeReq())
-      if (res.status === 429) break
+  it('stays bounded at the production default of 1,000 and evicts the oldest on the 1,001st start', async () => {
+    // #given — 1,000 distinct clients, one outstanding state each
+    const h = makeEvictionHarness({})
+    const first = await h.mint('10.0.0.0')
+    for (let i = 1; i < 1000; i++) {
+      await h.mint(`10.0.${Math.floor(i / 256)}.${i % 256}`)
     }
+    expect(h.stateStore.size()).toBe(1000)
 
-    // Verify we hit the cap
-    const capHitRes = await app.fetch(makeReq())
-    expect(capHitRes.status).toBe(429)
+    // #when — one more
+    const res = await h.start('198.51.100.9')
 
-    // #when — advance clock past TTL so all entries expire
-    currentTime = 1000 + ttlMs + 1
+    // #then — admitted instead of 429; bounded; the first state is the one that went
+    expect(res.status).toBe(302)
+    expect(h.stateStore.size()).toBe(1000)
+    expect(h.stateStore.get(first)).toBeUndefined()
+  })
 
-    // #then — new start succeeds because evictStale runs before global size check
-    const resAfterExpiry = await app.fetch(makeReq())
-    expect(resAfterExpiry.status).toBe(302)
+  it('an invalid start (bad return_to) against a full store evicts nothing', async () => {
+    // #given
+    const h = makeEvictionHarness({maxEntries: 2})
+    const s1 = await h.mint('203.0.113.1')
+    const s2 = await h.mint('203.0.113.2')
+
+    // #when — a fresh client sends an invalid return_to
+    const res = await h.start('203.0.113.3', '?return_to=https://evil.example.com/')
+
+    // #then — rejected, and the store is untouched
+    expect(res.status).toBe(400)
+    expect(h.stateStore.size()).toBe(2)
+    expect(h.stateStore.get(s1)).toBeDefined()
+    expect(h.stateStore.get(s2)).toBeDefined()
+  })
+
+  it('a start rejected by the per-key outstanding cap against a full store evicts nothing', async () => {
+    // #given — per-key cap 1; store of 2 filled by two clients
+    const h = makeEvictionHarness({maxEntries: 2, perKeyCap: 1})
+    const s1 = await h.mint('203.0.113.1')
+    const s2 = await h.mint('203.0.113.2')
+
+    // #when — the first client tries again while its slot is held
+    const res = await h.start('203.0.113.1')
+
+    // #then — 429, and nothing was evicted to make room
+    expect(res.status).toBe(429)
+    expect(h.stateStore.size()).toBe(2)
+    expect(h.stateStore.get(s1)).toBeDefined()
+    expect(h.stateStore.get(s2)).toBeDefined()
+  })
+
+  it('reclaims consumed and stale entries first, so no live entry is evicted while reclaimable ones exist', async () => {
+    // #given — store of 3: s1 will go stale, s2 will be consumed, s3 stays live
+    const h = makeEvictionHarness({maxEntries: 3})
+    h.clock.now = 1_000
+    const s1 = await h.mint('203.0.113.1')
+    h.clock.now = 500_000
+    const s2 = await h.mint('203.0.113.2')
+    h.clock.now = 500_001
+    const s3 = await h.mint('203.0.113.3')
+    h.stateStore.consume(s2)
+    h.clock.now = 1_000 + 10 * 60 * 1000 + 1_500 // s1 now older than the 10 min TTL
+
+    // #when — a new start arrives at a nominally full store
+    const s4 = await h.mint('203.0.113.4')
+
+    // #then — the reclaimable pair was dropped; the live s3 survived
+    expect(h.stateStore.get(s1)).toBeUndefined()
+    expect(h.stateStore.get(s2)).toBeUndefined()
+    expect(h.stateStore.get(s3)).toBeDefined()
+    expect(h.stateStore.get(s4)).toBeDefined()
+    expect(h.stateStore.size()).toBe(2)
+  })
+
+  it('bounce/retry and terminal mismatch still work under saturation', async () => {
+    // #given — store of 2, full of A and E after B's state was consumed by a mismatching callback
+    const h = makeEvictionHarness({maxEntries: 2})
+    const sA = await h.mint('203.0.113.1')
+    const sB = await h.mint('203.0.113.2')
+    const bounce = await h.callback('203.0.113.99', sB)
+    expect(bounce.status).toBe(302)
+    expect(bounce.headers.get('location') ?? '').toContain('retry=1')
+    expect(h.stateStore.get(sB)?.consumed).toBe(true)
+    await h.mint('203.0.113.5')
+
+    // #when — the bounced client follows the redirect into a FULL store
+    const retry = await h.start('203.0.113.99', '?retry=1')
+    const retryState = new URL(retry.headers.get('location') ?? 'https://x.invalid').searchParams.get('state') ?? ''
+
+    // #then — admitted by evicting the oldest (sA); the new state is marked bounced
+    expect(retry.status).toBe(302)
+    expect(h.stateStore.get(sA)).toBeUndefined()
+    expect(h.stateStore.get(retryState)?.bounced).toBe(true)
+
+    // #when — the address shifts AGAIN on the retried state
+    const second = await h.callback('203.0.113.98', retryState)
+
+    // #then — terminal: plain 400, no further bounce, state consumed, no token exchange
+    expect(second.status).toBe(400)
+    expect(second.headers.get('location')).toBeNull()
+    expect(h.stateStore.get(retryState)?.consumed).toBe(true)
+    expect(h.fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it('provider-error handling still consumes the matching state under saturation', async () => {
+    // #given — store of 2; the oldest was evicted by a third start
+    const h = makeEvictionHarness({maxEntries: 2})
+    const sA = await h.mint('203.0.113.1')
+    const sB = await h.mint('203.0.113.2')
+    await h.mint('203.0.113.3')
+
+    // #when — provider error for the surviving state and for the evicted one
+    const errB = await h.callback('203.0.113.2', sB, '&error=access_denied')
+    const errA = await h.callback('203.0.113.1', sA, '&error=access_denied')
+
+    // #then — both fail closed with 400; the surviving state is consumed
+    expect(errB.status).toBe(400)
+    expect(errA.status).toBe(400)
+    expect(h.stateStore.get(sB)?.consumed).toBe(true)
+    expect(h.fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it('replay of a completed state is still rejected under saturation', async () => {
+    // #given — a full store whose newest state completes a sign-in
+    const h = makeEvictionHarness({maxEntries: 2})
+    await h.mint('203.0.113.1')
+    const sB = await h.mint('203.0.113.2')
+
+    // #when — complete once, then replay
+    const first = await h.callback('203.0.113.2', sB)
+    const replay = await h.callback('203.0.113.2', sB)
+
+    // #then
+    expect(first.status).toBe(200)
+    expect(replay.status).toBe(400)
+  })
+
+  it('consumes the state before the first external await, under saturation', async () => {
+    // #given — the token-exchange fetch observes the store at the moment it is called
+    const observed: boolean[] = []
+    let probe: (() => boolean) | undefined
+    const probingFetch: GitHubOAuthDeps['fetch'] = vi.fn(async (url: string | URL | Request) => {
+      observed.push(probe?.() ?? false)
+      const urlStr = typeof url === 'string' ? url : url instanceof URL ? url.toString() : url.url
+      if (urlStr.includes('access_token')) return new Response(JSON.stringify({access_token: 't'}), {status: 200})
+      return new Response(JSON.stringify({id: 7, login: 'octocat'}), {status: 200})
+    })
+    const h = makeEvictionHarness({maxEntries: 2, fetch: probingFetch})
+    await h.mint('203.0.113.1')
+    const sB = await h.mint('203.0.113.2')
+    await h.mint('203.0.113.3') // evicts the oldest; store is saturated again
+    const sC = await h.mint('203.0.113.4')
+    probe = () => h.stateStore.get(sC)?.consumed === true
+
+    // #when
+    const res = await h.callback('203.0.113.4', sC)
+
+    // #then — consumed by the time GitHub is first contacted; the earlier-evicted sB stays unknown
+    expect(res.status).toBe(200)
+    expect(observed[0]).toBe(true)
+    expect(h.stateStore.get(sB)).toBeUndefined()
+  })
+})
+
+describe('createInMemoryStateStore — bounded insertion (#1652)', () => {
+  const entry = (issuedAt = 1000) => ({codeVerifier: 'v', issuedAt, consumed: false})
+
+  it('evicts the oldest entry when inserting a new key into a full store', () => {
+    // #given
+    const store = createInMemoryStateStore(2)
+    store.set('a', entry())
+    store.set('b', entry())
+
+    // #when
+    store.set('c', entry())
+
+    // #then
+    expect(store.size()).toBe(2)
+    expect(store.get('a')).toBeUndefined()
+    expect(store.get('b')).toBeDefined()
+    expect(store.get('c')).toBeDefined()
+  })
+
+  it('stays bounded under sustained churn', () => {
+    // #given
+    const store = createInMemoryStateStore(5)
+
+    // #when
+    for (let i = 0; i < 500; i++) store.set(`s-${i}`, entry())
+
+    // #then — only the 5 newest survive
+    expect(store.size()).toBe(5)
+    expect(store.get('s-494')).toBeUndefined()
+    expect(store.get('s-495')).toBeDefined()
+    expect(store.get('s-499')).toBeDefined()
+  })
+
+  it('re-minting an existing state value does not evict a different entry', () => {
+    // #given
+    const store = createInMemoryStateStore(2)
+    store.set('a', entry())
+    store.set('b', entry())
+
+    // #when
+    store.set('b', entry(2000))
+
+    // #then
+    expect(store.size()).toBe(2)
+    expect(store.get('a')).toBeDefined()
+    expect(store.get('b')?.issuedAt).toBe(2000)
+  })
+
+  it('an evicted state is never resurrected by later activity', () => {
+    // #given
+    const store = createInMemoryStateStore(1)
+    store.set('a', entry())
+    store.set('b', entry())
+
+    // #when
+    store.consume('a')
+    store.evictStale(10_000, 600_000)
+
+    // #then
+    expect(store.get('a')).toBeUndefined()
+    expect(store.size()).toBe(1)
   })
 })
 
