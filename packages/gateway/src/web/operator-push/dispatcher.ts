@@ -36,6 +36,7 @@
  * replace the sequential loop.
  */
 
+import type {OperatorPushTriggerKind} from '../../operator-contract/responses.js'
 import type {OperatorFailureKind} from '../../operator-contract/run-status.js'
 import type {AuditLogger} from '../audit.js'
 import type {DedupeCache} from './dedupe-cache.js'
@@ -90,11 +91,7 @@ export interface PushDispatcher {
 export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispatcher {
   const {store, sender, dedupeCache, triggerPolicy, vapidConfig, logger, auditLogger} = deps
 
-  async function broadcast(
-    kind: 'approval' | 'question' | 'run_failed',
-    dedupeId: string,
-    payload: string,
-  ): Promise<void> {
+  async function broadcast(kind: OperatorPushTriggerKind, dedupeId: string, payload: string): Promise<void> {
     const dedupeKey = `${dedupeId}:${kind}`
 
     // List first: a transient list failure must not consume the dedupe
@@ -171,7 +168,7 @@ export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispat
   }
 
   async function dispatchToRecord(
-    kind: 'approval' | 'question' | 'run_failed',
+    kind: OperatorPushTriggerKind,
     record: SubscriptionRecord,
     payload: string,
   ): Promise<'delivered' | 'dead' | 'failed' | 'skipped'> {
