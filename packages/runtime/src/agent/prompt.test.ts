@@ -2020,6 +2020,38 @@ describe('buildTaskSection', () => {
     expect(taskBlock).toContain('Update README.md with the latest setup steps.')
   })
 
+  it('working-dir preamble allows non-delivery shell and task-required GitHub operations while still forbidding code delivery', () => {
+    // #given a workflow_dispatch run resolved to working-dir
+    const options: PromptOptions = {
+      responseSurface: 'issue-comment',
+      context: createMockContext({
+        eventName: 'workflow_dispatch',
+        issueNumber: null,
+        issueTitle: null,
+        issueType: null,
+        commentBody: null,
+      }),
+      customPrompt: 'Run maintenance and open a report issue.',
+      cacheStatus: 'hit',
+      triggerContext: createMockTriggerContext({eventType: 'workflow_dispatch', target: null, commentBody: null}),
+      resolvedOutputMode: 'working-dir',
+    }
+
+    // #when
+    const taskBlock = getXmlBlock(buildAgentPrompt(options, mockLogger).text, 'task')
+
+    // #then shell is gated on not delivering code, not on being non-mutating, and task-required GitHub ops are allowed
+    expect(taskBlock).toContain('run shell commands that do not deliver code')
+    expect(taskBlock).toContain(
+      'GitHub operations the task explicitly requires (for example issues, comments, or reports) are also permitted.',
+    )
+    expect(taskBlock).not.toContain('non-mutating')
+    // #then the code-delivery prohibition list is unchanged
+    expect(taskBlock).toContain(
+      '- Forbidden actions: `git branch`, `git commit`, `git push`, `gh pr create`, `gh pr merge`, branch creation, branch switching, any tool/skill that delivers via branch+PR.',
+    )
+  })
+
   it('renders branch-pr preamble before ## Task heading for workflow_dispatch with output-mode: branch-pr', () => {
     // #given
     const options: PromptOptions = {
