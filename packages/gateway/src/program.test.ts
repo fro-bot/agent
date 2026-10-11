@@ -1872,7 +1872,7 @@ describe('button interaction handler (approval flow)', () => {
     expect(typeof serverDeps.githubOAuth?.fetch).toBe('function')
     expect(typeof serverDeps.githubOAuth?.generateVerifier).toBe('function')
     expect(typeof serverDeps.githubOAuth?.generateState).toBe('function')
-    expect(typeof serverDeps.githubOAuth?.getSourceKey).toBe('function')
+    expect(typeof serverDeps.githubOAuth?.resolveClientAddress).toBe('function')
     expect(serverDeps.githubOAuth?.stateStore).toBeDefined()
 
     // #and — config carries OAuth fields from GatewayConfig

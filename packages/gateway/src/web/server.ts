@@ -133,7 +133,7 @@ export interface OperatorServerDeps {
    */
   readonly isShuttingDown?: () => boolean
   /**
-   * Optional injectable rate limiter for unauthenticated socket-keyed limits.
+   * Optional injectable rate limiter for unauthenticated accounting-keyed limits.
    * Shared by the OAuth start/callback routes and the logout route — NOT by
    * the health route, which uses its own independent instance (see
    * healthRateLimiter below) so health polling cannot starve sign-in.
@@ -324,7 +324,7 @@ export interface OperatorServerConfig {
    * for which peer addresses may be trusted to supply X-Forwarded-For /
    * X-Forwarded-Host / X-Forwarded-Proto — used by the forwarded-header
    * origin-trust middleware, the health route, and (via the caller wiring
-   * githubOAuth deps and sessionDeps.getSourceKey with the same policy) the
+   * githubOAuth deps and sessionDeps.resolveClientAddress with the same policy) the
    * OAuth and logout routes.
    */
   readonly ingressPolicy: OperatorIngressPolicy
@@ -413,8 +413,9 @@ function isTrustedPeer(socketAddress: string | undefined, policy: OperatorIngres
 export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServerConfig): Hono {
   const checkShuttingDown = deps.isShuttingDown ?? (() => false)
   // Use the shared RateLimiter from http/rate-limit.ts with operator defaults.
-  // Keyed on socket/proxy IP (see rate-limit call in the health route below).
-  // Per-client/post-auth identity keying is added when auth routes land.
+  // Keyed on the derived abuse-accounting key of the resolved client
+  // (ResolvedClientAddress.accountingKey: IPv6 /64, IPv4 /32) — see the health
+  // route below and the OAuth/logout routes. Post-auth routes key on user id.
   const rateLimiter =
     deps.rateLimiter ??
     createRateLimiter({limit: DEFAULT_UNAUTH_LIMIT, windowMs: DEFAULT_UNAUTH_WINDOW_MS, clock: deps.clock})
@@ -464,11 +465,12 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
     }),
   )
 
-  // 3. Unauthenticated socket-keyed rate limit — applied per-route (not middleware)
+  // 3. Unauthenticated accounting-keyed rate limit — applied per-route (not middleware)
   //    to avoid Hono's middleware context type mismatch with getConnInfo.
   //    The rate-limit check is called from each route handler.
-  //    Keyed on the actual TCP socket remote address — NOT X-Forwarded-For,
-  //    which is caller-spoofable. This matches the announce server pattern.
+  //    Keyed on the resolved client's accounting key (via resolveClient): X-Forwarded-For
+  //    is honoured only from configured trusted peers, and trust/binding decisions
+  //    stay on the exact `.canonical` address.
 
   // 4. Forwarded-header origin trust — decided by the ingress policy, not by
   //    whether the forwarded values happen to match the public origin. A
@@ -539,7 +541,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   // rateLimiter.allow(key) before performing any work. This is not optional.
   //
   // Why per-route (not middleware): Hono's middleware context type does not
-  // expose getConnInfo, so the socket-keyed rate limit must be called from
+  // expose getConnInfo, so the accounting-keyed rate limit must be called from
   // within each route handler where the full context is available.
   //
   // For unauthenticated routes: key via resolveClient(), which trusts the
@@ -553,7 +555,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   //
   // Exception: authenticated long-lived streaming routes (e.g. the run-stream route)
   // use the per-operator stream-slot cap (gate 7, keyed on numeric githubUserId) for
-  // backpressure instead of the socket-keyed rateLimiter — stronger keying for that case.
+  // backpressure instead of the accounting-keyed rateLimiter — stronger keying for that case.
   //
   // Failure to call rateLimiter.allow() in a new route is a security defect.
   // The ingress-pin test (http/ingress-pin.test.ts) will catch any new route
@@ -582,16 +584,19 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
     const raw = extractRawIngressInput(c)
     const resolved = Effect.runSync(Effect.either(resolveClient(raw, config.ingressPolicy)))
 
-    let sourceKey: string
+    let limiterKey: string
     if (resolved._tag === 'Right') {
-      sourceKey = resolved.right.canonical
+      limiterKey = resolved.right.accountingKey
     } else if (
       resolved.left.kind === 'missing-forwarded-for' &&
       (c as OpenContext).get(HEADERLESS_HEALTH_PROBE_KEY) === true
     ) {
       // Narrow, health-only exception: a headerless probe from a trusted-proxy
-      // peer is not a forwarded client request. Key on the peer's own address
-      // under the health-only budget — this must never become a generic
+      // peer is not a forwarded client request. Key on the peer's own EXACT
+      // canonical address (deliberately not the derived /64 accounting key: the
+      // peer is a configured proxy, so this key space is bounded by operator
+      // configuration, and the unprefixed exact string cannot collide with any
+      // prefixed client accounting key) under the health-only budget — this must never become a generic
       // missing-XFF fallback for any other route. The verdict comes verbatim
       // from the middleware (HEADERLESS_HEALTH_PROBE_KEY) — never re-derived
       // here — so a request with valid forwarded host/proto but no
@@ -602,13 +607,13 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
         deps.logger.warn({reason: 'socket-invalid'}, 'operator health rejected: ingress resolution failed')
         return unavailableResponse(c)
       }
-      sourceKey = canonicalAddressToString(socketCanonical)
+      limiterKey = canonicalAddressToString(socketCanonical)
     } else {
       deps.logger.warn({reason: resolved.left.kind}, 'operator health rejected: ingress resolution failed')
       return respondForIngressRejection(c, resolved.left)
     }
 
-    if (healthLimiter.allow(sourceKey) === false) {
+    if (healthLimiter.allow(limiterKey) === false) {
       deps.logger.warn({}, 'operator request rate limited (unauthenticated)')
       return rateLimitedResponse(c)
     }
@@ -625,7 +630,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   //   GET /operator/auth/github/callback — public OAuth redirect callback
   if (deps.githubOAuth !== undefined && config.githubOAuth !== undefined) {
     // Thread the shared rate limiter into the OAuth deps so both OAuth routes
-    // participate in the same per-socket budget as the health route.
+    // participate in the same per-accounting-key budget as the logout route.
     const oauthDepsWithRateLimiter = {...deps.githubOAuth, rateLimiter}
     buildGitHubOAuthRoutes(app, oauthDepsWithRateLimiter, config.githubOAuth)
   } else if (deps.githubOAuth !== undefined || config.githubOAuth !== undefined) {
@@ -699,8 +704,8 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   // Logout is always a privileged route protected by session + allowlist + origin + CSRF.
   // Providing sessionStore/sessionDeps without browserGuardDeps is a programming error —
   // a public mutating logout path is a CSRF footgun and is not supported.
-  // Thread the shared rate limiter and socket-derived source key into the logout route
-  // so it participates in the same per-socket budget as the health and OAuth routes.
+  // Thread the shared rate limiter and the resolveClient-based client resolver into the
+  // logout route so it participates in the same per-accounting-key budget as the OAuth routes.
   if (deps.sessionStore !== undefined && deps.sessionDeps !== undefined) {
     if (browserGuardDeps === undefined) {
       throw new Error(
@@ -713,7 +718,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
     const sessionDepsWithRateLimiter = {
       ...deps.sessionDeps,
       rateLimiter,
-      getSourceKey: (c: Context) => resolveClient(extractRawIngressInput(c), config.ingressPolicy),
+      resolveClientAddress: (c: Context) => resolveClient(extractRawIngressInput(c), config.ingressPolicy),
     }
     buildLogoutRoutes(app, deps.sessionStore, sessionDepsWithRateLimiter, browserGuardDeps)
   }

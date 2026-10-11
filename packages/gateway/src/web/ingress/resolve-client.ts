@@ -8,15 +8,54 @@ import {matchesTrustedProxyAddress} from './trusted-proxy-address.js'
 declare const resolvedClientBrand: unique symbol
 
 /**
- * The result of trusted-proxy-aware client-address resolution. Opaque and
- * module-private to construct: the brand field and the object literal shape
- * that satisfies it are never exported, so no code outside this file can
- * fabricate one from a raw string. `resolveClient` (below) is the only
- * production operation that returns one.
+ * The result of trusted-proxy-aware client-address resolution. The brand marks
+ * `resolveClient` (below) as the single intended producer. That is a
+ * convention enforced by code review, not by the compiler: a type assertion
+ * (`as`) compiles anywhere, and no lint rule forbids it. Do not construct one
+ * outside this file.
  */
 export interface ResolvedClientAddress {
   readonly [resolvedClientBrand]: true
+  /**
+   * Exact canonical identity (IPv4 dotted decimal, IPv6 as eight 4-digit hex
+   * groups). Use this for trust and binding decisions — never aggregated.
+   */
   readonly canonical: string
+  /**
+   * Derived abuse-accounting key (IPv6 → /64, IPv4 → /32). Use this ONLY to
+   * count or bucket traffic (rate-limit buckets, outstanding-attempt slots) —
+   * never for trust or binding, which stay on the exact `canonical`.
+   */
+  readonly accountingKey: AccountingKey
+}
+
+declare const accountingKeyBrand: unique symbol
+
+/**
+ * Opaque abuse-accounting key derived from a resolved client address: the /64
+ * prefix for native IPv6, the full /32 address for IPv4 (IPv4-mapped IPv6 is
+ * already normalized to IPv4 by the parser). The brand marks `resolveClient`
+ * (via `ResolvedClientAddress`) as the single intended producer; like the
+ * `ResolvedClientAddress` brand, that is enforced by review, not by the
+ * compiler. The key text is family-prefixed so it cannot collide with an exact
+ * canonical string used as a key elsewhere (e.g. the headerless health-probe
+ * peer).
+ *
+ * Why it exists: a routed IPv6 /64 hands one host 2^64 distinct exact
+ * addresses, i.e. unbounded free abuse-accounting keys. Aggregating the key
+ * (not the identity) closes that while leaving trust/binding exact.
+ */
+export type AccountingKey = string & {readonly [accountingKeyBrand]: true}
+
+function toAccountingKey(address: CanonicalAddress): AccountingKey {
+  if (address.family === 'ipv4') {
+    return `ipv4/32:${address.octets.join('.')}` as AccountingKey
+  }
+  const prefix = address.groups
+    .slice(0, 4)
+    .map(group => group.toString(16).padStart(4, '0'))
+    .join(':')
+  return `ipv6/64:${prefix}` as AccountingKey
 }
 
 declare const socketAddressBrand: unique symbol
@@ -70,7 +109,10 @@ function isTrusted(candidate: CanonicalAddress, policy: OperatorIngressPolicy): 
 }
 
 function toResolved(canonical: CanonicalAddress): ResolvedClientAddress {
-  return {canonical: canonicalAddressToString(canonical)} as ResolvedClientAddress
+  return {
+    canonical: canonicalAddressToString(canonical),
+    accountingKey: toAccountingKey(canonical),
+  } as ResolvedClientAddress
 }
 
 /**
@@ -78,13 +120,18 @@ function toResolved(canonical: CanonicalAddress): ResolvedClientAddress {
  *
  * Production code must never call this — the only production source of a
  * `ResolvedClientAddress` is `resolveClient()` above. This exists solely so
- * test fixtures that stub `getSourceKey` (or similar) can hand back a value
+ * test fixtures that stub `resolveClientAddress` (or similar) can hand back a value
  * of the right type without reaching for `as unknown as ResolvedClientAddress`
  * at each call site, which would otherwise be the only way to satisfy the
  * type from outside this module. Name is deliberately loud and greppable.
  */
 export function unsafeResolvedClientAddressForTest(canonical: string): ResolvedClientAddress {
-  return {canonical} as ResolvedClientAddress
+  const parsed = parseCanonicalAddress(canonical)
+  // Parseable input is normalized exactly like production; opaque labels (e.g. 'ip-1') pass through under a 1:1 `test-raw:` key.
+  if (parsed === undefined) {
+    return {canonical, accountingKey: `test-raw:${canonical}` as AccountingKey} as ResolvedClientAddress
+  }
+  return toResolved(parsed)
 }
 
 /**
