@@ -584,14 +584,17 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
 
     let sourceKey: string
     if (resolved._tag === 'Right') {
-      sourceKey = resolved.right.canonical
+      sourceKey = resolved.right.accountingKey
     } else if (
       resolved.left.kind === 'missing-forwarded-for' &&
       (c as OpenContext).get(HEADERLESS_HEALTH_PROBE_KEY) === true
     ) {
       // Narrow, health-only exception: a headerless probe from a trusted-proxy
-      // peer is not a forwarded client request. Key on the peer's own address
-      // under the health-only budget — this must never become a generic
+      // peer is not a forwarded client request. Key on the peer's own EXACT
+      // canonical address (deliberately not the derived /64 accounting key: the
+      // peer is a configured proxy, so this key space is bounded by operator
+      // configuration, and the unprefixed exact string cannot collide with any
+      // prefixed client accounting key) under the health-only budget — this must never become a generic
       // missing-XFF fallback for any other route. The verdict comes verbatim
       // from the middleware (HEADERLESS_HEALTH_PROBE_KEY) — never re-derived
       // here — so a request with valid forwarded host/proto but no

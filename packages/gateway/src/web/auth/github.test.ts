@@ -40,7 +40,7 @@ import {Effect} from 'effect'
 import {Hono} from 'hono'
 import {describe, expect, it, vi} from 'vitest'
 import {extractRawIngressInput} from '../ingress/hono-context.js'
-import {makeTrustedProxyIngressPolicy} from '../ingress/policy.js'
+import {makeDirectIngressPolicy, makeTrustedProxyIngressPolicy} from '../ingress/policy.js'
 import {resolveClient, unsafeResolvedClientAddressForTest} from '../ingress/resolve-client.js'
 import {parseTrustedProxyAddress} from '../ingress/trusted-proxy-address.js'
 import {assertAllPrivilegedRoutesWrapped, isPublicRoute, registerPublicRoute} from '../operator-route.js'
@@ -512,10 +512,10 @@ describe('GET /operator/auth/github/start — rate limiter', () => {
     expect(res.status).toBe(429)
   })
 
-  it('calls rateLimiter.allow with the source key on start', async () => {
+  it('calls rateLimiter.allow with the derived accounting key on start', async () => {
     // #given
     const rateLimiter = makePassRateLimiter()
-    const deps = makeStubDeps({rateLimiter, getSourceKey: () => Effect.succeed(stubResolved('fixed-key'))})
+    const deps = makeStubDeps({rateLimiter, getSourceKey: () => Effect.succeed(stubResolved('203.0.113.5'))})
     const config = makeStubConfig()
     const app = buildTestApp(deps, config)
 
@@ -523,8 +523,8 @@ describe('GET /operator/auth/github/start — rate limiter', () => {
     const req = new Request('https://operator.example.com/operator/auth/github/start')
     await app.fetch(req)
 
-    // #then — rate limiter was called with the source key
-    expect(rateLimiter.allow).toHaveBeenCalledWith('fixed-key')
+    // #then — rate limiter was called with the derived /32 accounting key
+    expect(rateLimiter.allow).toHaveBeenCalledWith('ipv4/32:203.0.113.5')
   })
 })
 
@@ -690,7 +690,7 @@ describe('GET /operator/auth/github/callback — rate limiter', () => {
     expect(res.status).toBe(429)
   })
 
-  it('calls rateLimiter.allow with the source key on callback', async () => {
+  it('calls rateLimiter.allow with the derived accounting key on callback', async () => {
     // #given
     const rateLimiter = makePassRateLimiter()
     const stateStore = createInMemoryStateStore()
@@ -704,7 +704,7 @@ describe('GET /operator/auth/github/callback — rate limiter', () => {
       rateLimiter,
       stateStore,
       clock: () => now + 1000,
-      getSourceKey: () => Effect.succeed(stubResolved('fixed-key')),
+      getSourceKey: () => Effect.succeed(stubResolved('2001:db8:1:2::9')),
     })
     const config = makeStubConfig()
     const app = buildTestApp(deps, config)
@@ -715,8 +715,8 @@ describe('GET /operator/auth/github/callback — rate limiter', () => {
     )
     await app.fetch(req)
 
-    // #then — rate limiter was called with the source key
-    expect(rateLimiter.allow).toHaveBeenCalledWith('fixed-key')
+    // #then — rate limiter was called with the /64 accounting key, not the exact address
+    expect(rateLimiter.allow).toHaveBeenCalledWith('ipv6/64:2001:0db8:0001:0002')
   })
 })
 
@@ -735,6 +735,7 @@ describe('GET /operator/auth/github/callback — source key binding', () => {
       issuedAt: now,
       consumed: false,
       sourceKey: 'ip-1',
+      accountingKey: 'acct-ip-1',
     })
 
     const auditLogger = makeAuditLogger()
@@ -763,7 +764,7 @@ describe('GET /operator/auth/github/callback — source key binding', () => {
     // counts against the cap — this is the part that must not be missed
     const entry = stateStore.get('valid-state-value')
     expect(entry?.consumed).toBe(true)
-    expect(stateStore.countOutstanding('ip-1')).toBe(0)
+    expect(stateStore.countOutstanding('acct-ip-1')).toBe(0)
 
     // #and — failure audit event emitted with source_key_mismatch reason
     const failureEvent = auditLogger.records.find(r => r.kind === 'auth.callback.failure')
@@ -1305,6 +1306,134 @@ describe('GET /operator/auth/github/callback — source key binding via the real
     expect(res.status).toBe(503)
     expect(rateLimiter.allow).not.toHaveBeenCalled()
     expect(stateStore.size()).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Derived accounting keys vs exact binding (#1652)
+//
+// Counting (rate-limit bucket + outstanding-attempt slot) uses the derived
+// accounting key (IPv6 /64, IPv4 /32). The OAuth binding stays on the exact
+// canonical address. The client address is read from a test header and run
+// through the REAL resolver, so derivation is production code, not a stub.
+// ---------------------------------------------------------------------------
+
+describe('OAuth accounting keys vs exact binding (#1652)', () => {
+  const TEST_CLIENT_HEADER = 'x-test-client'
+  const directPolicy = makeDirectIngressPolicy()
+
+  function headerResolvedGetSourceKey(): GitHubOAuthDeps['getSourceKey'] {
+    return (c: Context) =>
+      resolveClient({socketAddress: c.req.header(TEST_CLIENT_HEADER), forwardedForHeaders: []}, directPolicy)
+  }
+
+  async function startFrom(app: Hono, client: string): Promise<Response> {
+    return app.fetch(
+      new Request('https://operator.example.com/operator/auth/github/start', {
+        headers: {[TEST_CLIENT_HEADER]: client},
+      }),
+    )
+  }
+
+  function makeAppWith(overrides: Partial<GitHubOAuthDeps> = {}, config?: GitHubOAuthConfig) {
+    let stateCounter = 0
+    const stateStore = createInMemoryStateStore()
+    const deps = makeStubDeps({
+      stateStore,
+      generateState: () => `acct-state-${++stateCounter}`,
+      getSourceKey: headerResolvedGetSourceKey(),
+      ...overrides,
+    })
+    return {app: buildTestApp(deps, config ?? makeStubConfig({maxOutstandingAttemptsPerKey: 1})), deps, stateStore}
+  }
+
+  it('addresses in the same /64 share one outstanding-attempt slot; an adjacent /64 is independent', async () => {
+    // #given — one outstanding attempt allowed per accounting key
+    const {app} = makeAppWith()
+
+    // #when — two different addresses in one /64, then a neighbouring /64
+    const first = await startFrom(app, '2001:db8:1:2::1')
+    const sameSlash64 = await startFrom(app, '2001:db8:1:2:aaaa:bbbb:cccc:dddd')
+    const adjacent = await startFrom(app, '2001:db8:1:3::1')
+
+    // #then — the second address in the /64 is refused by the shared slot; the adjacent /64 is not
+    expect(first.status).toBe(302)
+    expect(sameSlash64.status).toBe(429)
+    expect(adjacent.status).toBe(302)
+  })
+
+  it('iPv4 and its IPv4-mapped forms share one outstanding-attempt slot', async () => {
+    // #given
+    const {app} = makeAppWith()
+
+    // #when
+    const plain = await startFrom(app, '203.0.113.7')
+    const dotted = await startFrom(app, '::ffff:203.0.113.7')
+    const hex = await startFrom(app, '::ffff:cb00:7107')
+    const other = await startFrom(app, '203.0.113.8')
+
+    // #then
+    expect(plain.status).toBe(302)
+    expect(dotted.status).toBe(429)
+    expect(hex.status).toBe(429)
+    expect(other.status).toBe(302)
+  })
+
+  it('records the exact canonical address for binding and the derived key for counting', async () => {
+    // #given
+    const {app, stateStore} = makeAppWith({}, makeStubConfig())
+
+    // #when
+    await startFrom(app, '2001:db8:1:2::1')
+
+    // #then — two distinct fields on the stored entry
+    const entry = stateStore.get('acct-state-1')
+    expect(entry?.sourceKey).toBe('2001:0db8:0001:0002:0000:0000:0000:0001')
+    expect(entry?.accountingKey).toBe('ipv6/64:2001:0db8:0001:0002')
+  })
+
+  it('start and callback spend the same shared rate-limit bucket for addresses in one /64', async () => {
+    // #given — a recording limiter
+    const keys: string[] = []
+    const rateLimiter: RateLimiter = {
+      allow: key => {
+        keys.push(key)
+        return true
+      },
+    }
+    const {app} = makeAppWith({rateLimiter}, makeStubConfig())
+
+    // #when — start from one address, callback (no state) from another address in the same /64
+    await startFrom(app, '2001:db8:1:2::1')
+    await app.fetch(
+      new Request('https://operator.example.com/operator/auth/github/callback?state=x&code=y', {
+        headers: {[TEST_CLIENT_HEADER]: '2001:db8:1:2::2'},
+      }),
+    )
+
+    // #then — one bucket key for both routes
+    expect(keys).toEqual(['ipv6/64:2001:0db8:0001:0002', 'ipv6/64:2001:0db8:0001:0002'])
+  })
+
+  it('an address change within the same /64 still trips the exact binding mismatch', async () => {
+    // #given — state minted from one address, callback from another address in the same /64
+    const fetchSpy = makeSuccessFetch()
+    const {app, stateStore} = makeAppWith({fetch: fetchSpy}, makeStubConfig())
+    const startRes = await startFrom(app, '2001:db8:1:2::1')
+    const state = new URL(startRes.headers.get('location') ?? '').searchParams.get('state') ?? ''
+
+    // #when
+    const res = await app.fetch(
+      new Request(`https://operator.example.com/operator/auth/github/callback?state=${state}&code=test-code`, {
+        headers: {[TEST_CLIENT_HEADER]: '2001:db8:1:2::2'},
+      }),
+    )
+
+    // #then — exact binding refuses it: bounced to /start, state consumed, NO token exchange
+    expect(res.status).toBe(302)
+    expect(res.headers.get('location') ?? '').toContain('retry=1')
+    expect(stateStore.get(state)?.consumed).toBe(true)
+    expect(fetchSpy).not.toHaveBeenCalled()
   })
 })
 
@@ -1952,17 +2081,19 @@ describe('createInMemoryStateStore', () => {
     expect(entry.consumed).toBe(true)
   })
 
-  it('counts outstanding (unconsumed) entries for a source key', () => {
+  it('counts outstanding (unconsumed) entries for an accounting key', () => {
     // #given
     const store = createInMemoryStateStore()
-    store.set('state-1', {codeVerifier: 'v1', issuedAt: 1000, consumed: false, sourceKey: 'ip-1'})
-    store.set('state-2', {codeVerifier: 'v2', issuedAt: 1000, consumed: false, sourceKey: 'ip-1'})
-    store.set('state-3', {codeVerifier: 'v3', issuedAt: 1000, consumed: true, sourceKey: 'ip-1'})
-    store.set('state-4', {codeVerifier: 'v4', issuedAt: 1000, consumed: false, sourceKey: 'ip-2'})
+    store.set('state-1', {codeVerifier: 'v1', issuedAt: 1000, consumed: false, accountingKey: 'acct-1'})
+    store.set('state-2', {codeVerifier: 'v2', issuedAt: 1000, consumed: false, accountingKey: 'acct-1'})
+    store.set('state-3', {codeVerifier: 'v3', issuedAt: 1000, consumed: true, accountingKey: 'acct-1'})
+    store.set('state-4', {codeVerifier: 'v4', issuedAt: 1000, consumed: false, accountingKey: 'acct-2'})
+    // exact binding key alone never counts toward an accounting slot
+    store.set('state-5', {codeVerifier: 'v5', issuedAt: 1000, consumed: false, sourceKey: 'acct-1'})
 
-    // #when / #then — only unconsumed entries for ip-1
-    expect(store.countOutstanding('ip-1')).toBe(2)
-    expect(store.countOutstanding('ip-2')).toBe(1)
+    // #when / #then — only unconsumed entries carrying that accounting key
+    expect(store.countOutstanding('acct-1')).toBe(2)
+    expect(store.countOutstanding('acct-2')).toBe(1)
   })
 
   it('reports correct size', () => {

@@ -453,8 +453,7 @@ export function buildLogoutRoutes(
         deps.logger.warn({reason: resolved.left.kind}, 'logout rejected: ingress resolution failed')
         return respondForIngressRejection(c, resolved.left)
       }
-      const sourceKey = resolved.right.canonical
-      if (deps.rateLimiter.allow(sourceKey) === false) {
+      if (deps.rateLimiter.allow(resolved.right.accountingKey) === false) {
         deps.logger.warn({}, 'logout rejected: rate limited')
         return rateLimitedResponse(c)
       }

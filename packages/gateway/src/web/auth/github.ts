@@ -74,8 +74,18 @@ export interface OAuthStateEntry {
   consumed: boolean
   /** Optional same-origin return path bound at state mint time. */
   readonly redirectTarget?: string
-  /** Source key (socket IP) for outstanding-attempt counting. */
+  /**
+   * Exact canonical client address bound at mint time. Compared verbatim on
+   * callback (cross-address replay binding) — never aggregated.
+   */
   readonly sourceKey?: string
+  /**
+   * Derived abuse-accounting key (IPv6 /64, IPv4 /32) used ONLY for
+   * outstanding-attempt counting. Deliberately separate from `sourceKey`: a
+   * client moving within one /64 shares the attempt budget but still trips
+   * the exact binding mismatch.
+   */
+  readonly accountingKey?: string
   /**
    * True when this state entry was itself minted as the retry target of a
    * source-key-mismatch bounce (see the callback's binding check). Bounds
@@ -93,8 +103,8 @@ export interface OAuthStateStore {
   get: (stateValue: string) => OAuthStateEntry | undefined
   /** Mark a state entry as consumed (one-time use). */
   consume: (stateValue: string) => void
-  /** Count outstanding (unconsumed) entries for a given source key. */
-  countOutstanding: (sourceKey: string) => number
+  /** Count outstanding (unconsumed) entries for a given derived accounting key. */
+  countOutstanding: (accountingKey: string) => number
   /** Total number of entries in the store. */
   size: () => number
   /**
@@ -299,10 +309,10 @@ export function createInMemoryStateStore(): OAuthStateStore {
       }
     },
 
-    countOutstanding(sourceKey: string): number {
+    countOutstanding(accountingKey: string): number {
       let count = 0
       for (const entry of entries.values()) {
-        if (entry.sourceKey === sourceKey && entry.consumed === false) {
+        if (entry.accountingKey === accountingKey && entry.consumed === false) {
           count++
         }
       }
@@ -502,10 +512,12 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
       deps.logger.warn({reason: resolved.left.kind}, 'oauth start rejected: ingress resolution failed')
       return respondForIngressRejection(c, resolved.left)
     }
+    // Exact identity (binding) and derived key (counting) are kept apart on purpose.
     const sourceKey = resolved.right.canonical
+    const accountingKey = resolved.right.accountingKey
 
-    // Rate limit check — shared with the operator app, keyed on socket address.
-    if (deps.rateLimiter.allow(sourceKey) === false) {
+    // Rate limit check — shared with the operator app, keyed on the derived accounting key.
+    if (deps.rateLimiter.allow(accountingKey) === false) {
       deps.logger.warn({}, 'oauth start rejected: rate limited')
       return rateLimitedResponse(c)
     }
@@ -515,7 +527,7 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
     deps.stateStore.evictStale(deps.clock(), config.stateTtlMs)
 
     // Check outstanding attempt cap before doing any work.
-    const outstanding = deps.stateStore.countOutstanding(sourceKey)
+    const outstanding = deps.stateStore.countOutstanding(accountingKey)
     if (outstanding >= config.maxOutstandingAttemptsPerKey) {
       deps.logger.warn({}, 'oauth start rejected: outstanding attempt cap exceeded')
       return rateLimitedResponse(c)
@@ -559,6 +571,7 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
       consumed: false,
       ...(redirectTarget === undefined ? {} : {redirectTarget}),
       sourceKey,
+      accountingKey,
       ...(isRetryBounce ? {bounced: true} : {}),
     })
 
@@ -593,10 +606,12 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
       deps.logger.warn({reason: resolved.left.kind}, 'oauth callback rejected: ingress resolution failed')
       return respondForIngressRejection(c, resolved.left)
     }
+    // Binding compares the exact canonical address; only the rate-limit
+    // bucket uses the derived accounting key.
     const sourceKey = resolved.right.canonical
 
-    // Rate limit check — shared with the operator app, keyed on socket address.
-    if (deps.rateLimiter.allow(sourceKey) === false) {
+    // Rate limit check — shared with the operator app, keyed on the derived accounting key.
+    if (deps.rateLimiter.allow(resolved.right.accountingKey) === false) {
       deps.logger.warn({}, 'oauth callback rejected: rate limited')
       return rateLimitedResponse(c)
     }

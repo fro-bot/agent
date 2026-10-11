@@ -834,6 +834,158 @@ describe('GET /operator/health — trusted-proxy client separation (regression p
 })
 
 // ---------------------------------------------------------------------------
+// #1652: health buckets use the derived accounting key; the headerless-probe
+// exception stays on the exact peer address.
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/health — derived accounting keys (#1652)', () => {
+  const forwardedOrigin = {'x-forwarded-host': 'operator.example.com', 'x-forwarded-proto': 'https'}
+
+  it('clients in one /64 behind a trusted proxy share a bucket; an adjacent /64 is independent', async () => {
+    // #given — per-key limit of 1
+    const {port, close} = await startRealOperatorServer(
+      makeStubDeps({healthRateLimiter: createRateLimiter({limit: 1, windowMs: 60_000})}),
+      {ingressPolicy: makeTrustedLoopbackPolicy()},
+    )
+    try {
+      const get = async (xff: string) =>
+        fetch(`http://127.0.0.1:${port}/operator/health`, {headers: {...forwardedOrigin, 'x-forwarded-for': xff}})
+
+      // #when
+      const first = await get('2001:db8:1:2::1')
+      const sameSlash64 = await get('2001:db8:1:2:aaaa::9')
+      const adjacent = await get('2001:db8:1:3::1')
+
+      // #then
+      expect(first.status).toBe(200)
+      expect(sameSlash64.status).toBe(429)
+      expect(adjacent.status).toBe(200)
+    } finally {
+      await close()
+    }
+  })
+
+  it('an IPv4 client and its IPv4-mapped spellings share one health bucket', async () => {
+    // #given
+    const {port, close} = await startRealOperatorServer(
+      makeStubDeps({healthRateLimiter: createRateLimiter({limit: 1, windowMs: 60_000})}),
+      {ingressPolicy: makeTrustedLoopbackPolicy()},
+    )
+    try {
+      const get = async (xff: string) =>
+        fetch(`http://127.0.0.1:${port}/operator/health`, {headers: {...forwardedOrigin, 'x-forwarded-for': xff}})
+
+      // #when / #then
+      expect((await get('203.0.113.7')).status).toBe(200)
+      expect((await get('::ffff:203.0.113.7')).status).toBe(429)
+      expect((await get('::ffff:cb00:7107')).status).toBe(429)
+    } finally {
+      await close()
+    }
+  })
+
+  it('a resolved client is keyed on the derived key, the headerless probe on the exact peer address', async () => {
+    // #given — a recording health limiter behind a trusted loopback proxy
+    const keys: string[] = []
+    const healthRateLimiter = {
+      allow: (key: string) => {
+        keys.push(key)
+        return true
+      },
+    }
+    const {port, close} = await startRealOperatorServer(makeStubDeps({healthRateLimiter}), {
+      ingressPolicy: makeTrustedLoopbackPolicy(),
+    })
+    try {
+      // #when — one forwarded client, one fully headerless probe
+      await fetch(`http://127.0.0.1:${port}/operator/health`, {
+        headers: {...forwardedOrigin, 'x-forwarded-for': '203.0.113.7'},
+      })
+      await fetch(`http://127.0.0.1:${port}/operator/health`)
+
+      // #then — derived key for the client, exact (unprefixed) canonical for the proxy peer
+      expect(keys).toEqual(['ipv4/32:203.0.113.7', '127.0.0.1'])
+    } finally {
+      await close()
+    }
+  })
+})
+
+describe('POST /operator/auth/logout — anonymous traffic cannot spend the shared bucket (#1652)', () => {
+  it('an unauthenticated logout is rejected by the guard before the shared limiter is consulted', async () => {
+    // #given — logout wired with a recording shared limiter, no session presented
+    const sessionStore = createInMemorySessionStore()
+    const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+    const rateLimiter = {allow: vi.fn(() => true)}
+    const {port, close} = await startRealOperatorServer(
+      makeStubDeps({
+        sessionStore,
+        sessionDeps: makeStubSessionDeps(),
+        allowlist,
+        csrfSecret,
+        auditLogger,
+        logger,
+        rateLimiter,
+      }),
+      {publicOrigin: 'https://operator.example.com'},
+    )
+    try {
+      // #when
+      const res = await fetch(`http://127.0.0.1:${port}/operator/auth/logout`, {
+        method: 'POST',
+        headers: {origin: 'https://operator.example.com'},
+      })
+
+      // #then — 401 from the guard, and the OAuth/logout budget is untouched
+      expect(res.status).toBe(401)
+      expect(rateLimiter.allow).not.toHaveBeenCalled()
+    } finally {
+      await close()
+    }
+  })
+
+  it('an authenticated logout spends the shared bucket on the derived accounting key', async () => {
+    // #given
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
+    if (sessionId === undefined) throw new Error('expected session to be created')
+    const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+    const csrfToken = generateCsrfToken({sessionId, operatorId: 42, nowMs: now + 1000, secret: csrfSecret})
+    const rateLimiter = {allow: vi.fn(() => true)}
+    const {port, close} = await startRealOperatorServer(
+      makeStubDeps({
+        sessionStore,
+        sessionDeps: makeStubSessionDeps({clock: () => now + 1000}),
+        allowlist,
+        csrfSecret,
+        auditLogger,
+        logger,
+        rateLimiter,
+      }),
+      {publicOrigin: 'https://operator.example.com'},
+    )
+    try {
+      // #when
+      const res = await fetch(`http://127.0.0.1:${port}/operator/auth/logout`, {
+        method: 'POST',
+        headers: {
+          cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+          origin: 'https://operator.example.com',
+          'x-csrf-token': csrfToken,
+        },
+      })
+
+      // #then
+      expect(res.status).toBe(200)
+      expect(rateLimiter.allow).toHaveBeenCalledWith('ipv4/32:127.0.0.1')
+    } finally {
+      await close()
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Health limiter independence — health polling cannot starve sign-in, and vice versa.
 // ---------------------------------------------------------------------------
 
