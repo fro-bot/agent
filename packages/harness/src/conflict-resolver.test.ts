@@ -108,7 +108,12 @@ async function removeRepository(repo: ConflictRepository): Promise<void> {
   await fs.rm(repo.runnerTempDir, {recursive: true, force: true})
 }
 
-describe('resolveConflict', () => {
+// Every resolveConflict test builds a real git repository and some spawn real subprocesses; the 5s vitest
+// default is too tight on a loaded host (worst measured ~2.1s at load ~25). Each subprocess still carries its
+// own `modelTimeoutMs`, so a hang is caught independently of this test-body bound.
+const REAL_GIT_TEST_TIMEOUT_MS = 30_000
+
+describe('resolveConflict', {timeout: REAL_GIT_TEST_TIMEOUT_MS}, () => {
   let repo: ConflictRepository | undefined
 
   beforeEach(async () => {
@@ -500,7 +505,8 @@ describe('resolveConflict', () => {
 
     // #when
     const failedProcess = await resolveConflict(makeRequest(repo, {opencodeBin: failureScript}), {
-      modelTimeoutMs: 500,
+      // Must comfortably exceed node's cold start under load so this exercises the exit-code path, not the timer.
+      modelTimeoutMs: 15_000,
     })
     const timedOutProcess = await resolveConflict(makeRequest(repo, {opencodeBin: timeoutScript}), {
       modelTimeoutMs: 20,

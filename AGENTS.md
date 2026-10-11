@@ -36,6 +36,7 @@ Highest-traffic entry points — see [STRUCTURE.md](STRUCTURE.md) for the full d
 - **Adapter pattern**: `CacheAdapter`, `ExecAdapter` for testable I/O
 - **Prettier**: 120-char line width via `@bfra.me/prettier-config/120-proof`
 - **Vitest**: Colocated `.test.ts` files; BDD comments (`// #given`, `// #when`, `// #then`)
+- **Test isolation**: Every Vitest run gets a throwaway temp `HOME` + `XDG_*` (`scripts/vitest-home-isolation.setup.ts`, via root `vitest.config.ts` `setupFiles`); tests must never read or write the real home, and pass explicit env/dirs when asserting default-path resolution. Live evals (`FRO_BOT_EVAL=1`) opt out
 - **Exception**: `deploy/scripts/` uses plain Node ESM (`.mjs`) with the built-in `node --test` runner — not Vitest, not a workspace package, no build step; run in CI via the `workspace-smoke` job
 
 ## ANTI-PATTERNS (THIS PROJECT)

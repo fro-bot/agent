@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => ({
   parseAttachmentUrls: vi.fn(),
   createLogger: vi.fn(),
   getGitHubWorkspace: vi.fn(),
+  getInvocationIdentity: vi.fn(),
   normalizeWorkspacePath: vi.fn(),
 }))
 
@@ -35,7 +36,10 @@ vi.mock('../../features/attachments/index.js', () => ({
   validateAttachments: vi.fn(),
 }))
 
-vi.mock('../../shared/env.js', () => ({getGitHubWorkspace: mocks.getGitHubWorkspace}))
+vi.mock('../../shared/env.js', () => ({
+  getGitHubWorkspace: mocks.getGitHubWorkspace,
+  getInvocationIdentity: mocks.getInvocationIdentity,
+}))
 vi.mock('../../shared/paths.js', () => ({normalizeWorkspacePath: mocks.normalizeWorkspacePath}))
 vi.mock('../../shared/logger.js', () => ({createLogger: mocks.createLogger}))
 
@@ -125,6 +129,7 @@ describe('runSessionPrep', () => {
     vi.clearAllMocks()
     mocks.createLogger.mockReturnValue(sessionLogger)
     mocks.getGitHubWorkspace.mockReturnValue('/workspace')
+    mocks.getInvocationIdentity.mockReturnValue('fro-bot-observe')
     mocks.normalizeWorkspacePath.mockImplementation((value: string) => value)
     mocks.parseAttachmentUrls.mockReturnValue([])
     mocks.buildLogicalKey.mockReturnValue(logicalKey)
@@ -148,6 +153,18 @@ describe('runSessionPrep', () => {
     expect(result.logicalKey).toEqual(logicalKey)
     expect(result.continueSessionId).toBe('session-continuation')
     expect(result.isContinuation).toBe(true)
+  })
+
+  it("resolves the logical key with the running job's invocation identity", async () => {
+    // #given the Observe job of a run is preparing its session
+    const routing = createRouting()
+
+    // #when session preparation builds the logical key
+    await runSessionPrep(createBootstrap(), routing, createCacheRestore(), createMetrics())
+
+    // #then run-scoped (schedule/dispatch) keys are qualified by the job, so Observe cannot
+    // continue Remediate's root session
+    expect(mocks.buildLogicalKey).toHaveBeenCalledWith(routing.triggerResult.context, 'fro-bot-observe')
   })
 
   it('allows the eval treatment to omit only eager injected context', async () => {

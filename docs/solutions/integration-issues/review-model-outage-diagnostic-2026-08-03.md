@@ -48,7 +48,7 @@ The required `Test GitHub Action` check (the Fro Bot PR-review job) failed ~1 se
 Pull the run's `opencode.log` artifact — the provider-specific error lives only there:
 
 ```bash
-gh run download <run-id> -n opencode-logs-<run-id>-<N>   # artifact name is run-suffixed
+gh run download <run-id> -n opencode-logs-<run-id>-<N>-<job>   # run-, attempt- and job-suffixed (older runs: no -<job>)
 ```
 
 For this outage the log revealed:

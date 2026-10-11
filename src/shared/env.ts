@@ -4,6 +4,7 @@ export {
   getGitHubRunAttempt,
   getGitHubRunId,
   getGitHubWorkspace,
+  getInvocationIdentity,
   getOpenCodeAuthPath,
   getOpenCodeLogPath,
   getOpenCodeStoragePath,

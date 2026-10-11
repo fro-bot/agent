@@ -45,6 +45,7 @@ import {createDrainCompletion, parseSyntheticNoticePart} from './drain-completio
 import {formatToolPart} from './format-part.js'
 import {createReplyDeliveryTracker} from './reply-delivery.js'
 import {settleOwnedSessions} from './settle-owned-sessions.js'
+import {createTextBoundaryTracker} from './text-boundary.js'
 
 // ---------------------------------------------------------------------------
 // Typed error
@@ -601,6 +602,13 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   const replyDelivery = createReplyDeliveryTracker()
 
   // Only ROOT text counts: the fence is about the parent's follow-up reply, not a descendant's output.
+  //
+  // Recorded when the delta is ACCEPTED, not when it is appended: the boundary tracker may hold a not-yet-visible
+  // segment's whitespace lead-in. The invariant that makes this safe is "everything the fence has counted is either in
+  // the sink or held by the tracker, and the held text is flushed when the event loop exits". Flushing earlier (before
+  // the gate's check) would be unsafe: a validation that is later rejected would have released a lead-in whose
+  // segment can still become visible, and the separator could no longer go before it. Admission aborts the loop, so
+  // the flush in its `finally` runs on the admitted path as well, before `runCore` returns.
   function recordDelivered(eventSessionID: string | null, partId: string | null, text: string): void {
     if (drainCompletion !== undefined && eventSessionID === sessionId) replyDelivery.recordDelta(partId, text)
   }
@@ -776,6 +784,28 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // never reply text: nothing carrying one of these ids may reach the sink.
   const noticePartIds = new Set<string>()
 
+  // Segment boundaries: the sinks are append-only and see only strings, so separate text parts would otherwise run
+  // together ("...can do.The README..."). Part identity exists only here; the separator is inserted once, through
+  // the sink, so Discord, the web sink and the final output all receive the same text. Tool summaries go through
+  // `trackedSink` so they are accounted for. See `text-boundary.ts` for the rule.
+  const textBoundary = createTextBoundaryTracker()
+  const trackedSink: CoreStreamSink = {
+    append: text => {
+      sink.append(text)
+      textBoundary.noteAppended(text)
+    },
+  }
+
+  // Appends a text delta. The tracker returns exactly what to append now: the delta itself, `separator + held + text`
+  // for a segment's first visible delta, or nothing while a not-yet-visible segment's whitespace lead-in is held.
+  // The delivery fence records the part's own text separately, as the delta is accepted, and never sees the
+  // separator. That is safe because held text is flushed to the sink when the event loop exits (see its `finally`)
+  // and nothing reads the sink before then.
+  function appendSegmentText(segmentKey: string | null, text: string): void {
+    const emit = textBoundary.append(segmentKey, text)
+    if (emit.length > 0) sink.append(emit)
+  }
+
   // Wrap the raw event stream in an abort-aware iterator so we do not block
   // indefinitely waiting for the next event when the signal fires mid-stream.
   // The inner generator races each `next()` call against the abort signal so
@@ -933,12 +963,20 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
             const delta = getObjectProperty(eventPayload, 'delta')
             const deltaType = getStringProperty(delta, 'type')
             const deltaText = getStringProperty(delta, 'text')
+            // Identity: the part id; a delta without one falls back to its message id. Neither → no boundary.
+            const segmentMessageId = getStringProperty(eventPayload, 'messageID')
+            const segmentKey =
+              deltaPartId === null
+                ? segmentMessageId === null
+                  ? null
+                  : `message:${segmentMessageId}`
+                : `part:${deltaPartId}`
             if (deltaType === 'text' && deltaText != null) {
-              sink.append(deltaText)
+              appendSegmentText(segmentKey, deltaText)
               recordDelivered(eventSessionID, deltaPartId, deltaText)
               markActivity()
             } else if (typeof delta === 'string' && getStringProperty(eventPayload, 'field') === 'text') {
-              sink.append(delta)
+              appendSegmentText(segmentKey, delta)
               recordDelivered(eventSessionID, deltaPartId, delta)
               markActivity()
             }
@@ -952,7 +990,12 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           const deltaRaw = getObjectProperty(eventPayload, 'delta')
           const deltaText = typeof deltaRaw === 'string' ? deltaRaw : (getStringProperty(deltaRaw, 'text') ?? null)
           if (deltaText != null) {
-            sink.append(deltaText)
+            // Legacy shape carries `assistantMessageID` + `textID` (no partID): that pair is the segment identity.
+            // With neither there is nothing to key on, so no boundary is ever guessed between anonymous deltas.
+            const assistantMessageId = getStringProperty(eventPayload, 'assistantMessageID')
+            const textId = getStringProperty(eventPayload, 'textID')
+            const segmentKey = assistantMessageId === null ? null : `legacy:${assistantMessageId}:${textId ?? ''}`
+            appendSegmentText(segmentKey, deltaText)
             recordDelivered(eventSessionID, null, deltaText)
             markActivity()
           }
@@ -1020,7 +1063,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
                     status: status === 'error' ? 'error' : 'completed',
                   },
                 },
-                sink,
+                trackedSink,
                 logger,
                 onActivity,
               )
@@ -1065,7 +1108,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
                     status: 'completed',
                   },
                 },
-                sink,
+                trackedSink,
                 logger,
                 onActivity,
               )
@@ -1274,6 +1317,11 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     // The watchdog is gone: stop reacting to gate notifications and late releases.
     humanWaitsClosed = true
     unsubscribeHumanWaitTerminal?.()
+    // Release whitespace still held for segments that never became visible. The delivery fence already counted it
+    // as delivered, so it must reach the sink on EVERY exit (idle, admitted drain, abort, error). Nothing reads the
+    // sink before this point; callers take the final text after `runCore` settles.
+    const heldTail = textBoundary.flush()
+    if (heldTail.length > 0) sink.append(heldTail)
   }
 
   // Drain completed successfully: the ledger reported drain-complete and

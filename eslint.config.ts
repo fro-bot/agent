@@ -84,6 +84,7 @@ export default defineConfig(
             '**/*.test.ts',
             '**/*.spec.ts',
             '**/*.fixture.ts',
+            '**/*.setup.ts',
             '**/test-helpers.ts',
             '**/__fixtures__/**',
             '**/*.config.ts',

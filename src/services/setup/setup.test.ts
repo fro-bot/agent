@@ -1,6 +1,7 @@
 import type {SetupInputs} from './types.js'
 
 import * as fs from 'node:fs/promises'
+import {homedir} from 'node:os'
 import {join} from 'node:path'
 import * as core from '@actions/core'
 import * as exec from '@actions/exec'
@@ -565,18 +566,18 @@ describe('setup', () => {
       })
 
       it('creates the OpenCode config directory before writing disabled-mode config', async () => {
-        // #given - disabled mode does not run oMo, so setup owns config dir creation
+        // #given - disabled mode does not run oMo, so setup owns config dir creation; with XDG_CONFIG_HOME unset the
+        // default is `~/.config/opencode` under the suite's isolated (temp) HOME
+        delete process.env.XDG_CONFIG_HOME
+        const configDir = join(homedir(), '.config', 'opencode')
 
         // #when
         const result = await runSetup(createSetupInputs(), 'ghs_test_token')
 
         // #then
         expect(result).not.toBeNull()
-        expect(fs.mkdir).toHaveBeenCalledWith(expect.stringMatching(/\.config\/opencode$/), {recursive: true})
-        expect(fs.writeFile).toHaveBeenCalledWith(
-          expect.stringMatching(/\.config\/opencode\/opencode\.json$/),
-          expect.any(String),
-        )
+        expect(fs.mkdir).toHaveBeenCalledWith(configDir, {recursive: true})
+        expect(fs.writeFile).toHaveBeenCalledWith(join(configDir, 'opencode.json'), expect.any(String))
       })
 
       it('does not call Bun installer, bunx, installOmo, or writeOmoConfig', async () => {

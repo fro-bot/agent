@@ -7,6 +7,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import {DatabaseSync} from 'node:sqlite'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import {toCacheSaveStateValue} from '../../shared/cache-save-result.js'
 import {ok} from '../../shared/types.js'
 import {
   checkpointDatabase,
@@ -988,6 +989,29 @@ describe('restoreCache', () => {
   })
 })
 
+async function captureSaveKey(
+  paths: {readonly storagePath: string; readonly authPath: string},
+  env: {readonly job: string; readonly attempt: string; readonly matrix?: string},
+): Promise<string> {
+  await fs.mkdir(paths.storagePath, {recursive: true})
+  await fs.writeFile(path.join(paths.storagePath, 'session.db'), 'test data')
+  vi.stubEnv('GITHUB_JOB', env.job)
+  vi.stubEnv('GITHUB_RUN_ATTEMPT', env.attempt)
+  vi.stubEnv('INPUT_MATRIX-CONTEXT', env.matrix ?? '')
+  const saveCacheMock = vi.fn(async (_paths: readonly string[], _key: string) => 12345)
+  await saveCache({
+    components: testComponents,
+    runId: 38026680860,
+    logger: createTestLogger(),
+    storagePath: paths.storagePath,
+    authPath: paths.authPath,
+    cacheAdapter: {restoreCache: async () => undefined, saveCache: saveCacheMock},
+  })
+  const key = saveCacheMock.mock.calls[0]?.[1]
+  if (key == null) throw new Error('saveCache adapter was not called')
+  return key
+}
+
 describe('saveCache', () => {
   let tempDir: string
   let storagePath: string
@@ -997,6 +1021,10 @@ describe('saveCache', () => {
     // saveCache folds the runner's GITHUB_RUN_ATTEMPT into the save key; pin it so expected
     // keys don't change when CI re-runs a job (attempt 2+).
     vi.stubEnv('GITHUB_RUN_ATTEMPT', '1')
+    // Likewise the invocation identity (GITHUB_JOB + matrix leg): pin it empty so a CI runner's
+    // own GITHUB_JOB does not leak into the expected keys. Identity cases stub it explicitly.
+    vi.stubEnv('GITHUB_JOB', '')
+    vi.stubEnv('INPUT_MATRIX-CONTEXT', '')
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cache-test-'))
     storagePath = path.join(tempDir, 'storage')
     authPath = path.join(tempDir, 'auth.json')
@@ -1593,30 +1621,117 @@ describe('saveCache', () => {
     expect(saveCacheSpy).toHaveBeenCalledTimes(1)
   })
 
-  it('handles "already exists" error gracefully', async () => {
-    // #given storage with content and "already exists" error
+  it('maps an "already exists" reservation collision to cache-rejected, never to this invocation\'s success', async () => {
+    // #given storage with content and a cache adapter that throws the reservation-collision
+    // error seen when another job already holds the key (the Remediate/Observe incident)
     await fs.mkdir(storagePath, {recursive: true})
     await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
 
+    const logger: Logger = {debug: vi.fn(), info: vi.fn(), warning: vi.fn(), error: vi.fn()}
     const adapter = createMockCacheAdapter({
       saveError: new Error(
         'Unable to reserve cache with key, another job may be creating this cache. More details: Cache already exists.',
       ),
     })
-    const options: SaveCacheOptions = {
+
+    // #when saving cache
+    const result = await saveCache({
+      components: testComponents,
+      runId: 98765,
+      logger,
+      storagePath,
+      authPath,
+      cacheAdapter: adapter,
+    })
+
+    // #then it is reported as NOT persisted (same outcome as the -1 sentinel for the same
+    // collision), and loudly: the post hook then retries (state value not-persisted)
+    expect(result).toEqual({cachePersisted: false, storePersisted: false, outcome: 'cache-rejected'})
+    expect(toCacheSaveStateValue(result)).toBe('not-persisted')
+    expect(logger.warning).toHaveBeenCalledWith(
+      "Cache key already exists; this invocation's state was not saved under it",
+      {saveKey: 'opencode-storage-github-owner-repo-main-Linux-98765-1'},
+    )
+  })
+
+  it('an "already exists" collision keeps store-only durability when the object store already persisted', async () => {
+    // #given an adapter that throws the collision, but an object store that fully landed
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
+
+    vi.resetModules()
+    vi.doMock('@fro-bot/runtime', async () => {
+      const actual = await vi.importActual<typeof import('@fro-bot/runtime')>('@fro-bot/runtime')
+      return {...actual, syncSessionsToStore: vi.fn(async () => ({uploaded: 2, failed: 0}))}
+    })
+    const {saveCache: saveCacheWithSync} = await import('./index.js')
+
+    // #when
+    const result = await saveCacheWithSync({
       components: testComponents,
       runId: 98765,
       logger: createTestLogger(),
       storagePath,
       authPath,
-      cacheAdapter: adapter,
-    }
+      cacheAdapter: createMockCacheAdapter({saveError: new Error('Cache already exists')}),
+      storeConfig: testStoreConfig,
+      storeAdapter: createMockStoreAdapter(),
+    })
 
-    // #when saving cache
-    const result = await saveCache(options)
+    // #then cache not persisted, store persisted -> store-only (retry skipped: durability achieved)
+    expect(result).toEqual({cachePersisted: false, storePersisted: true, outcome: 'cache-rejected'})
+    expect(toCacheSaveStateValue(result)).toBe('store-only')
 
-    // #then returns true (treated as success)
-    expect(result).toMatchObject({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
+    vi.doUnmock('@fro-bot/runtime')
+    vi.resetModules()
+  })
+
+  describe('invocation identity in the save key', () => {
+    const saveKeyFor = async (env: {job: string; attempt: string; matrix?: string}): Promise<string> =>
+      captureSaveKey({storagePath, authPath}, env)
+
+    it('gives two jobs in the same run and attempt distinct save keys', async () => {
+      // #given Remediate then Observe, same run, same attempt
+      // #when each saves
+      const remediate = await saveKeyFor({job: 'fro-bot-remediate', attempt: '1'})
+      const observe = await saveKeyFor({job: 'fro-bot-observe', attempt: '1'})
+
+      // #then keys differ and carry the job after run ID and attempt
+      expect(remediate).toBe('opencode-storage-github-owner-repo-main-Linux-38026680860-1-fro-bot-remediate')
+      expect(observe).toBe('opencode-storage-github-owner-repo-main-Linux-38026680860-1-fro-bot-observe')
+    })
+
+    it('re-run attempt 2 of the same job saves under a distinct, savable key', async () => {
+      // #given the same job in attempt 1 and in its re-run
+      const attempt1 = await saveKeyFor({job: 'fro-bot-observe', attempt: '1'})
+      const attempt2 = await saveKeyFor({job: 'fro-bot-observe', attempt: '2'})
+
+      // #then the re-run does not collide with attempt 1's reservation
+      expect(attempt2).not.toBe(attempt1)
+      expect(attempt2).toBe('opencode-storage-github-owner-repo-main-Linux-38026680860-2-fro-bot-observe')
+    })
+
+    it('the post-hook retry derives the identical key the main step tried (no state hand-off needed)', async () => {
+      // #given the main step's save was rejected under the Observe job's key
+      const mainStep = await saveKeyFor({job: 'fro-bot-observe', attempt: '2'})
+
+      // #when the post hook (a separate process in the same job, so the same GITHUB_JOB and
+      // INPUT_MATRIX-CONTEXT env) retries the save
+      const postRetry = await saveKeyFor({job: 'fro-bot-observe', attempt: '2'})
+
+      // #then it saves under exactly the same identity-qualified key
+      expect(postRetry).toBe(mainStep)
+    })
+
+    it('distinguishes matrix legs of the same job', async () => {
+      // #given two legs of one matrix job on the same OS
+      const legA = await saveKeyFor({job: 'agent', attempt: '1', matrix: '{"task":"a"}'})
+      const legB = await saveKeyFor({job: 'agent', attempt: '1', matrix: '{"task":"b"}'})
+
+      // #then distinct keys
+      expect(legA).not.toBe(legB)
+      expect(legA).toMatch(/-38026680860-1-agent-m[0-9a-f]{8}$/)
+    })
   })
 
   it('returns false on other save errors', async () => {

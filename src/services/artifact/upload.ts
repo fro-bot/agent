@@ -3,17 +3,30 @@ import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import {DefaultArtifactClient} from '@actions/artifact'
 
+/**
+ * Artifact name: `opencode-logs-{runId}-{runAttempt}[-{invocationIdentity}]`. Artifact names must be
+ * unique per run, so the job identity (sanitized `GITHUB_JOB` plus a matrix-leg hash) is what keeps
+ * two jobs of one run from uploading under, and `gh run download` merging into, the same name.
+ * `null` (outside a runner) omits the segment.
+ */
+export function buildLogArtifactName(runId: number, runAttempt: number, invocationIdentity: string | null): string {
+  const base = `opencode-logs-${runId}-${runAttempt}`
+  return invocationIdentity == null ? base : `${base}-${invocationIdentity}`
+}
+
 export interface ArtifactUploadOptions {
   readonly logPath: string
   readonly runId: number
   readonly runAttempt: number
+  /** Job/matrix-leg identity from `getInvocationIdentity()`; qualifies the artifact name. */
+  readonly invocationIdentity: string | null
   readonly retentionDays?: number
   readonly compressionLevel?: number
   readonly logger: Logger
 }
 
 export async function uploadLogArtifact(options: ArtifactUploadOptions): Promise<boolean> {
-  const {logPath, runId, runAttempt, retentionDays = 7, compressionLevel = 9, logger} = options
+  const {logPath, runId, runAttempt, invocationIdentity, retentionDays = 7, compressionLevel = 9, logger} = options
 
   try {
     await fs.access(logPath)
@@ -28,7 +41,7 @@ export async function uploadLogArtifact(options: ArtifactUploadOptions): Promise
     return false
   }
 
-  const artifactName = `opencode-logs-${runId}-${runAttempt}`
+  const artifactName = buildLogArtifactName(runId, runAttempt, invocationIdentity)
   const client = new DefaultArtifactClient()
 
   try {

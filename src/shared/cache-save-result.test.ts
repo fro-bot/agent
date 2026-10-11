@@ -33,16 +33,16 @@ const OUTCOME_EXPECTATIONS = {
   },
   'cache-rejected': {
     description:
-      'the Actions cache write returned its -1 sentinel; an inference covering both a denial and a collision, never distinguished',
+      'the Actions cache write returned its -1 sentinel or threw an "already exists" collision; an inference covering both a denial and a collision, never distinguished',
     backendsAttempted: true,
   },
   'cache-error': {
-    description: 'the save threw an error other than a caught "already exists" collision',
+    description: 'the save threw an error other than an "already exists" collision',
     backendsAttempted: true,
   },
   persisted: {
     description:
-      'the save reached a durable state through at least one backend, including a folded-in "already exists" collision',
+      'the save reached a durable state through at least one backend; an "already exists" collision is not durability',
     backendsAttempted: true,
   },
 } as const satisfies Record<CacheSaveOutcome, OutcomeExpectation>

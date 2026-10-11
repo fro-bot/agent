@@ -460,7 +460,7 @@ describe('runFinalize file-convention delivery', () => {
     // #then the recovery marker is visible in the job summary and delivery remains singular
     expect(exitCode).toBe(0)
     expect(mocks.summaryAddRaw).toHaveBeenCalledWith(
-      expect.stringContaining('Recovered from context overflow (fresh review session; archived archived-session-1)'),
+      '<p>Recovered from context overflow (fresh review session; archived archived-session-1)</p>\n',
     )
     expect(mocks.runResponsePost).toHaveBeenCalledTimes(1)
   })
