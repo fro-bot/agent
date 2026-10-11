@@ -133,7 +133,7 @@ export interface OperatorServerDeps {
    */
   readonly isShuttingDown?: () => boolean
   /**
-   * Optional injectable rate limiter for unauthenticated socket-keyed limits.
+   * Optional injectable rate limiter for unauthenticated accounting-keyed limits.
    * Shared by the OAuth start/callback routes and the logout route — NOT by
    * the health route, which uses its own independent instance (see
    * healthRateLimiter below) so health polling cannot starve sign-in.
@@ -413,8 +413,9 @@ function isTrustedPeer(socketAddress: string | undefined, policy: OperatorIngres
 export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServerConfig): Hono {
   const checkShuttingDown = deps.isShuttingDown ?? (() => false)
   // Use the shared RateLimiter from http/rate-limit.ts with operator defaults.
-  // Keyed on socket/proxy IP (see rate-limit call in the health route below).
-  // Per-client/post-auth identity keying is added when auth routes land.
+  // Keyed on the derived abuse-accounting key of the resolved client
+  // (ResolvedClientAddress.accountingKey: IPv6 /64, IPv4 /32) — see the health
+  // route below and the OAuth/logout routes. Post-auth routes key on user id.
   const rateLimiter =
     deps.rateLimiter ??
     createRateLimiter({limit: DEFAULT_UNAUTH_LIMIT, windowMs: DEFAULT_UNAUTH_WINDOW_MS, clock: deps.clock})
@@ -464,7 +465,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
     }),
   )
 
-  // 3. Unauthenticated socket-keyed rate limit — applied per-route (not middleware)
+  // 3. Unauthenticated accounting-keyed rate limit — applied per-route (not middleware)
   //    to avoid Hono's middleware context type mismatch with getConnInfo.
   //    The rate-limit check is called from each route handler.
   //    Keyed on the actual TCP socket remote address — NOT X-Forwarded-For,
@@ -539,7 +540,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   // rateLimiter.allow(key) before performing any work. This is not optional.
   //
   // Why per-route (not middleware): Hono's middleware context type does not
-  // expose getConnInfo, so the socket-keyed rate limit must be called from
+  // expose getConnInfo, so the accounting-keyed rate limit must be called from
   // within each route handler where the full context is available.
   //
   // For unauthenticated routes: key via resolveClient(), which trusts the
@@ -553,7 +554,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   //
   // Exception: authenticated long-lived streaming routes (e.g. the run-stream route)
   // use the per-operator stream-slot cap (gate 7, keyed on numeric githubUserId) for
-  // backpressure instead of the socket-keyed rateLimiter — stronger keying for that case.
+  // backpressure instead of the accounting-keyed rateLimiter — stronger keying for that case.
   //
   // Failure to call rateLimiter.allow() in a new route is a security defect.
   // The ingress-pin test (http/ingress-pin.test.ts) will catch any new route
@@ -628,7 +629,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   //   GET /operator/auth/github/callback — public OAuth redirect callback
   if (deps.githubOAuth !== undefined && config.githubOAuth !== undefined) {
     // Thread the shared rate limiter into the OAuth deps so both OAuth routes
-    // participate in the same per-socket budget as the health route.
+    // participate in the same per-accounting-key budget as the logout route.
     const oauthDepsWithRateLimiter = {...deps.githubOAuth, rateLimiter}
     buildGitHubOAuthRoutes(app, oauthDepsWithRateLimiter, config.githubOAuth)
   } else if (deps.githubOAuth !== undefined || config.githubOAuth !== undefined) {
@@ -703,7 +704,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   // Providing sessionStore/sessionDeps without browserGuardDeps is a programming error —
   // a public mutating logout path is a CSRF footgun and is not supported.
   // Thread the shared rate limiter and socket-derived source key into the logout route
-  // so it participates in the same per-socket budget as the health and OAuth routes.
+  // so it participates in the same per-accounting-key budget as the OAuth routes.
   if (deps.sessionStore !== undefined && deps.sessionDeps !== undefined) {
     if (browserGuardDeps === undefined) {
       throw new Error(

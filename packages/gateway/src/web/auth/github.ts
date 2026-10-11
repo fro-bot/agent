@@ -165,16 +165,17 @@ export interface GitHubOAuthDeps {
    * In tests, a stub may return `Effect.succeed(...)` for a fixed resolved
    * address, or `Effect.fail(...)` to exercise a rejection path.
    *
-   * The global rate limiter in buildOperatorApp already applies socket-keyed
-   * limits; this key is used only for the per-OAuth-flow outstanding-attempt cap
-   * and for source key binding validation on callback.
+   * The resolved address carries two keys: the derived `accountingKey` (IPv6
+   * /64, IPv4 /32) drives the rate-limit bucket and the outstanding-attempt
+   * cap; the exact `canonical` address is the source-key binding validated on
+   * callback.
    */
   readonly getSourceKey: (c: Context) => Effect.Effect<ResolvedClientAddress, IngressRejection>
   /**
    * Rate limiter shared with the operator app.
    * Applied to both /start and /callback before any work is performed.
    * Must be the same instance as the one used in buildOperatorApp so that
-   * OAuth routes participate in the same per-socket budget.
+   * OAuth routes participate in the same per-accounting-key budget.
    */
   readonly rateLimiter: RateLimiter
   /**
@@ -517,7 +518,7 @@ const OAUTH_START_PATH = '/operator/auth/github/start'
  *
  * Both routes apply the shared rate limiter before any work. The rate limiter
  * must be the same instance used in buildOperatorApp so OAuth routes participate
- * in the same per-socket budget.
+ * in the same per-accounting-key budget.
  *
  * Call this from buildOperatorApp after the global middleware is set up.
  */
