@@ -1,6 +1,8 @@
 // Operator API contract version — build-time pinned, never negotiated over the wire.
 //
 // Changelog (latest first):
+//   1.10.0 — export `OPERATOR_PUSH_TRIGGER_KINDS` / `OperatorPushTriggerKind` (additive): the closed
+//            set of push notification triggers, which is also the wire `data.type`.
 //   1.9.0 — pending-question surface: `question` SSE frame, PendingQuestionDTO, answer/skip request
 //           types, and the `waiting_for_question` run status (additive). Every question and answer
 //           string is untrusted plain text that consumers must render inertly.
@@ -18,4 +20,4 @@
 // Security constraint: the version is BUILD-TIME pinned and is never supplied or
 // negotiated over the wire. Any endpoint reading a version header must reject
 // unrecognized versions fail-closed.
-export const OPERATOR_CONTRACT_VERSION = '1.9.0'
+export const OPERATOR_CONTRACT_VERSION = '1.10.0'

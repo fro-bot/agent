@@ -103,7 +103,7 @@ Symbols verified against the live source tree. Where a symbol has moved to `pack
 | `runAgentWalk` / `measureSealedTree` | Function | `apps/workspace-agent/src/agent-walk.ts` | Agent-uid checkout size/entry-count walker; `measureSealedTree` measures a sealed tree through a root-opened fd when a plain agent-uid walk can't traverse it |
 | `readUpdateNetworkConfig` | Function | `apps/workspace-agent/src/config.ts` | Reads the egress-proxy and CA-bundle settings `/update`'s network half needs, once at startup |
 | `createRecoverCheckoutCommand` / `createCheckoutBackupCommand` | Function | `packages/gateway/src/discord/commands/{recover-checkout,checkout-backup}.ts` | `/fro-bot recover-checkout` and `/fro-bot checkout-backup list\|delete`; the Recover button on a refusal reply shares the same flow via `discord/recover-checkout-button.ts` |
-| `OPERATOR_CONTRACT_VERSION` | Constant | `packages/gateway/src/operator-contract/version.ts` | Build-time-pinned operator contract version (`1.9.0`) |
+| `OPERATOR_CONTRACT_VERSION` | Constant | `packages/gateway/src/operator-contract/version.ts` | Build-time-pinned operator contract version (`1.10.0`) |
 | `resolveClient` | Function | `packages/gateway/src/web/ingress/resolve-client.ts` | Trusted-proxy-aware client-address resolution for the operator-surface accounting keys (health, OAuth start/callback, and guarded-logout rate limits; the OAuth attempt cap) and the exact OAuth binding; returns a branded `ResolvedClientAddress` or a closed `IngressRejection` — never a fallback key |
 | `parseCanonicalAddress` | Function | `packages/gateway/src/web/ingress/canonical-address.ts` | Single strict IPv4/IPv6 parser shared by socket, X-Forwarded-For, and configured-peer parsing |
 

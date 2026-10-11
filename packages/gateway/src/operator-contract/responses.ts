@@ -97,6 +97,14 @@ export interface OperatorPushVapidKeyResponse {
   readonly keyVersion: string
 }
 
+/**
+ * The closed set of events that produce an operator push notification. The
+ * kind crosses the wire as `data.type` on the push payload. The union is
+ * derived from the tuple so the two cannot drift.
+ */
+export const OPERATOR_PUSH_TRIGGER_KINDS = ['approval', 'question', 'run_failed'] as const
+export type OperatorPushTriggerKind = (typeof OPERATOR_PUSH_TRIGGER_KINDS)[number]
+
 /** Coarse, non-oracle reasons a subscription record became inactive. */
 export type OperatorPushInactiveReason = 'unsubscribed' | 'dead' | 'revoked' | 'session-revoked'
 
