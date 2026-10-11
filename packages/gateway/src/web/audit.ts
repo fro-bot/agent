@@ -5,6 +5,7 @@
  */
 
 import type {DispatchOutcome} from '../github/dispatch.js'
+import type {OperatorPushTriggerKind} from '../operator-contract/responses.js'
 
 export interface AuditLogger {
   readonly info: (ctx: Record<string, unknown>, msg: string) => void
@@ -287,7 +288,7 @@ export interface PushDispatchEvent {
   readonly kind: 'push.dispatch'
   /** The triggering run/approval id — same redaction class as requestId/runId. */
   readonly correlationId: string
-  readonly trigger: 'approval' | 'question' | 'run_failed'
+  readonly trigger: OperatorPushTriggerKind
   readonly delivered: number
   readonly dead: number
   readonly failed: number

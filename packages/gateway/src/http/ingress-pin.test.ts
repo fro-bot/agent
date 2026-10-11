@@ -190,7 +190,7 @@ function makeOAuthStubDeps(): GitHubOAuthDeps {
     generateVerifier: () => 'stub-verifier-32-bytes-long-enough-for-pkce',
     generateState: () => 'stub-state-value-32-bytes-long-ok',
     stateStore: createInMemoryStateStore(),
-    getSourceKey: () => Effect.succeed(unsafeResolvedClientAddressForTest('stub-source-key')),
+    resolveClientAddress: () => Effect.succeed(unsafeResolvedClientAddressForTest('stub-source-key')),
     // rateLimiter is overwritten by buildOperatorApp with the shared instance;
     // provide a pass-through stub so the type is satisfied.
     rateLimiter: {allow: () => true},

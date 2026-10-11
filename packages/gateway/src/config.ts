@@ -206,7 +206,7 @@ export interface GatewayConfig {
      */
     readonly oauthStateTtlMs: number
     /**
-     * Maximum outstanding (unconsumed) OAuth attempts per source key.
+     * Maximum outstanding (unconsumed) OAuth attempts per accounting key (IPv6 /64, IPv4 /32).
      * Read from GATEWAY_OPERATOR_OAUTH_MAX_OUTSTANDING_ATTEMPTS.
      * Defaults to 5.
      */

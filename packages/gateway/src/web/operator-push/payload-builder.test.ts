@@ -1,4 +1,5 @@
 import {describe, expect, it} from 'vitest'
+import {OPERATOR_PUSH_TRIGGER_KINDS} from '../../operator-contract/index.js'
 import {buildApprovalPayload, buildFailedRunPayload, buildQuestionPayload} from './payload-builder.js'
 
 const FORBIDDEN_SUBSTRINGS = [
@@ -112,5 +113,18 @@ describe('buildFailedRunPayload', () => {
   it('never carries forbidden fields', () => {
     assertNoForbiddenFields(buildFailedRunPayload('session-error'))
     assertNoForbiddenFields(buildFailedRunPayload('unrecognized-raw-value'))
+  })
+})
+
+describe('payload builders — trigger kinds match the operator contract', () => {
+  // #given the three payload builders
+  // #when each builds its payload
+  // #then the set of `data.type` values is exactly the contract's trigger kinds
+  it('produces exactly OPERATOR_PUSH_TRIGGER_KINDS as data.type', () => {
+    const types = [buildApprovalPayload(), buildQuestionPayload(), buildFailedRunPayload()].map(
+      payload => payload.data.type,
+    )
+
+    expect([...types].sort()).toEqual([...OPERATOR_PUSH_TRIGGER_KINDS].sort())
   })
 })

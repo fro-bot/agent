@@ -64,19 +64,24 @@ export {assertRedactionApplied, AUTHORIZATION_OBLIGATION, REDACTION_OBLIGATION} 
 export type {RedactionContext} from './redaction.js'
 export type {RepoSummary} from './repo-summary.js'
 export {toRepoSummary} from './repo-summary.js'
+export {OPERATOR_PUSH_TRIGGER_KINDS} from './responses.js'
 export type {
   OperatorCancelResponse,
   OperatorCsrfToken,
   OperatorError,
   OperatorOk,
+  OperatorPushHealth,
+  OperatorPushHealthStatus,
   OperatorPushInactiveReason,
   OperatorPushSubscribeRequest,
   OperatorPushSubscriptionListResponse,
   OperatorPushSubscriptionMetadata,
+  OperatorPushTriggerKind,
   OperatorPushUnsubscribeRequest,
   OperatorPushVapidKeyResponse,
   OperatorSessionInfo,
 } from './responses.js'
+export {OPERATOR_PUSH_HEALTH_STATUSES} from './responses.js'
 export type {
   OperatorFailureKind,
   OperatorRunStatus,

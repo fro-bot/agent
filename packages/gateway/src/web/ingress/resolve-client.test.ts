@@ -2,7 +2,7 @@ import {Effect} from 'effect'
 import {describe, expect, it} from 'vitest'
 
 import {makeDirectIngressPolicy, makeTrustedProxyIngressPolicy, type OperatorIngressPolicy} from './policy.js'
-import {resolveClient, type RawIngressInput} from './resolve-client.js'
+import {resolveClient, unsafeResolvedClientAddressForTest, type RawIngressInput} from './resolve-client.js'
 import {parseTrustedProxyAddress, type TrustedProxyAddress} from './trusted-proxy-address.js'
 
 function peer(raw: string): TrustedProxyAddress {
@@ -248,5 +248,101 @@ describe('resolveClient — rejection shape', () => {
     const left = expectLeft(result)
     expect(Object.keys(left)).toEqual(['kind'])
     expect(left).not.toHaveProperty('canonical')
+  })
+})
+
+/** Resolves a direct (no-proxy) client and returns both identities, failing the test on rejection. */
+async function resolveBoth(socketAddress: string, policy: OperatorIngressPolicy = makeDirectIngressPolicy()) {
+  const result = await resolve(input(socketAddress), policy)
+  if (result._tag !== 'Right') throw new Error('expected a resolved client')
+  return {canonical: result.right.canonical, accountingKey: result.right.accountingKey}
+}
+
+describe('resolveClient — abuse-accounting key derivation', () => {
+  // #given two native IPv6 addresses inside one /64
+  // #when resolved
+  // #then they share an accounting key but keep distinct exact canonical identities
+  it('maps addresses in the same /64 to one accounting key while canonical identity stays exact', async () => {
+    const a = await resolveBoth('2001:db8:1:2::1')
+    const b = await resolveBoth('2001:db8:1:2:ffff:ffff:ffff:ffff')
+    expect(a.accountingKey).toBe(b.accountingKey)
+    expect(a.canonical).not.toBe(b.canonical)
+    expect(a.canonical).toBe('2001:0db8:0001:0002:0000:0000:0000:0001')
+  })
+
+  // #given two IPv6 addresses in adjacent /64s
+  // #when resolved
+  // #then their accounting keys differ
+  it('keeps adjacent /64s independent', async () => {
+    const a = await resolveBoth('2001:db8:1:2::1')
+    const b = await resolveBoth('2001:db8:1:3::1')
+    const c = await resolveBoth('2001:db8:1:1::1')
+    expect(a.accountingKey).not.toBe(b.accountingKey)
+    expect(a.accountingKey).not.toBe(c.accountingKey)
+  })
+
+  // #given an IPv4 address and its IPv4-mapped IPv6 spellings (dotted and hex)
+  // #when resolved
+  // #then all share the one /32 key, and a different IPv4 does not
+  it('maps IPv4 and its IPv4-mapped forms (dotted and hex) to the same /32 key', async () => {
+    const plain = await resolveBoth('203.0.113.7')
+    const dotted = await resolveBoth('::ffff:203.0.113.7')
+    const hex = await resolveBoth('::ffff:cb00:7107')
+    const other = await resolveBoth('203.0.113.8')
+    expect(dotted.accountingKey).toBe(plain.accountingKey)
+    expect(hex.accountingKey).toBe(plain.accountingKey)
+    expect(other.accountingKey).not.toBe(plain.accountingKey)
+  })
+
+  // #given an XFF-selected client behind a trusted proxy
+  // #when resolved
+  // #then the key derives from the selected client, not the proxy socket
+  it('derives the key from the selected forwarded client, not the proxy', async () => {
+    const policy = trustedProxyPolicy(P1)
+    const viaProxy = await resolve(input(P1, ['2001:db8:9:9::5']), policy)
+    const direct = await resolveBoth('2001:db8:9:9::77')
+    if (viaProxy._tag !== 'Right') throw new Error('expected a resolved client')
+    expect(viaProxy.right.accountingKey).toBe(direct.accountingKey)
+  })
+
+  // #given a configured trusted proxy and a different address in the same /64
+  // #when that neighbour connects claiming a forwarded client
+  // #then it is NOT trusted: XFF is ignored and the neighbour itself is selected
+  it('does not trust an address merely because it shares a /64 with a trusted proxy', async () => {
+    const policy = trustedProxyPolicy('2001:db8:5:5::1')
+    const neighbour = await resolve(input('2001:db8:5:5::2', ['198.51.100.200']), policy)
+    if (neighbour._tag !== 'Right') throw new Error('expected a resolved client')
+    expect(neighbour.right.canonical).toBe('2001:0db8:0005:0005:0000:0000:0000:0002')
+    const proxyItself = await resolve(input('2001:db8:5:5::1', ['198.51.100.200']), policy)
+    if (proxyItself._tag !== 'Right') throw new Error('expected a resolved client')
+    expect(proxyItself.right.canonical).toBe('198.51.100.200')
+  })
+
+  // #given an IPv4 key and an IPv6 key
+  // #when compared with an exact canonical string
+  // #then no derived key can collide with an exact canonical string used as a key elsewhere
+  it('never collides with an exact canonical string', async () => {
+    const v4 = await resolveBoth('203.0.113.7')
+    const v6 = await resolveBoth('2001:db8:1:2::1')
+    expect(v4.accountingKey).not.toBe(v4.canonical)
+    expect(v6.accountingKey).not.toBe(v6.canonical)
+    expect(v4.accountingKey).not.toBe(v6.accountingKey)
+  })
+})
+
+describe('unsafeResolvedClientAddressForTest — accounting key', () => {
+  // #given the test-only constructor
+  // #when given a real address it derives exactly as production; opaque labels stay 1:1
+  it('derives like production for real addresses and keeps opaque labels distinct', async () => {
+    const real = unsafeResolvedClientAddressForTest('203.0.113.7')
+    const prod = await resolveBoth('203.0.113.7')
+    expect(real.accountingKey).toBe(prod.accountingKey)
+    // normalized canonical form, same as production (not the raw spelling)
+    expect(unsafeResolvedClientAddressForTest('::ffff:203.0.113.7').canonical).toBe('203.0.113.7')
+    expect(unsafeResolvedClientAddressForTest('2001:db8::1').canonical).toBe('2001:0db8:0000:0000:0000:0000:0000:0001')
+    expect(unsafeResolvedClientAddressForTest('ip-1').canonical).toBe('ip-1')
+    expect(unsafeResolvedClientAddressForTest('ip-1').accountingKey).not.toBe(
+      unsafeResolvedClientAddressForTest('ip-2').accountingKey,
+    )
   })
 })

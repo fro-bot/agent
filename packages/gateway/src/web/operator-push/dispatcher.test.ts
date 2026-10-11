@@ -1,6 +1,7 @@
 import type {PushRelayResult} from './push-sender.js'
 import type {SubscriptionRecord} from './subscription-store.js'
 import {describe, expect, it, vi} from 'vitest'
+import {OPERATOR_PUSH_TRIGGER_KINDS} from '../../operator-contract/index.js'
 import {createDedupeCache} from './dedupe-cache.js'
 import {createPushDispatcher} from './dispatcher.js'
 import {createStoreError} from './subscription-store.js'
@@ -645,5 +646,27 @@ describe('createPushDispatcher — dispatchQuestionPending', () => {
     })
 
     await expect(dispatcher.dispatchQuestionPending('run-1')).resolves.toBeUndefined()
+  })
+})
+
+describe('createPushDispatcher — trigger kinds match the operator contract', () => {
+  // #given a dispatcher and one active subscription
+  // #when every dispatch entry point fires once
+  // #then the audited triggers and the wire `data.type` values are exactly the contract's trigger kinds
+  it('emits exactly OPERATOR_PUSH_TRIGGER_KINDS as audit triggers and payload types', async () => {
+    const {dispatcher, sender, auditLogger} = build()
+
+    await dispatcher.dispatchApprovalPending('a-1')
+    await dispatcher.dispatchQuestionPending('q-1')
+    await dispatcher.dispatchRunFailed('r-1')
+
+    const triggers = (auditLogger.info.mock.calls as unknown as [{trigger: string}, string][]).map(
+      call => call[0].trigger,
+    )
+    const wireTypes = (sender.sendNotification.mock.calls as unknown as [unknown, string][]).map(
+      call => (JSON.parse(call[1]) as {data: {type: string}}).data.type,
+    )
+    expect([...triggers].sort()).toEqual([...OPERATOR_PUSH_TRIGGER_KINDS].sort())
+    expect(wireTypes).toEqual(triggers)
   })
 })
