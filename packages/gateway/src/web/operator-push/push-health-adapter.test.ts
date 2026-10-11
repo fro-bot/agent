@@ -35,7 +35,7 @@ function createFaultableAdapter() {
   const faults: Faults = {list: undefined, get: undefined, put: undefined, del: undefined}
   let etagCounter = 0
   const calls = {count: 0}
-  const hold: {key?: string; release?: () => void; reached?: () => void} = {}
+  const hold: {key?: string; passes?: number; release?: () => void; reached?: () => void} = {}
 
   const adapter: ObjectStoreAdapter = {
     upload: async () => ok(undefined),
@@ -68,7 +68,10 @@ function createFaultableAdapter() {
     },
     getObject: async key => {
       calls.count += 1
-      if (hold.key === key) {
+      if (hold.key === key && (hold.passes ?? 0) > 0) {
+        hold.passes = (hold.passes ?? 0) - 1
+      } else if (hold.key === key) {
+        hold.key = undefined
         hold.reached?.()
         await new Promise<void>(resolve => {
           hold.release = resolve
@@ -445,9 +448,10 @@ describe('observePushAdapterHealth — store-level behavior at the I/O boundary'
   })
 
   it('degrades when a privacy delete loses its physical-delete CAS race', async () => {
-    // #given an active record whose physical delete loses the race
+    // #given an inactive record (so no rollback follows) whose physical delete loses the race
     const {store, tracker, faults} = setup()
     await store.subscribe(SUBSCRIBE_INPUT)
+    await store.unsubscribe({operatorId: 'operator-a', endpoint: SUBSCRIBE_INPUT.endpoint})
     faults.del = 412
 
     // #when
@@ -456,6 +460,32 @@ describe('observePushAdapterHealth — store-level behavior at the I/O boundary'
     // #then
     expect(result.success && result.data.skipped).toBe(1)
     expect(tracker.getStatus()).toBe('degraded')
+  })
+
+  it('captures privacy-delete exhaustion before the rollback reads, so a re-subscribe during them outranks it', async () => {
+    // #given an active record whose physical delete loses the CAS race, and a paused rollback reread
+    const {store, tracker, faults, backing, hold} = setup()
+    await store.subscribe(SUBSCRIBE_INPUT)
+    const [recordKey] = Array.from(backing.keys())
+    faults.del = 412
+    hold.key = recordKey
+    hold.passes = 1 // the sweep's first read passes; its rollback reread pauses
+    const reachedReread = new Promise<void>(resolve => {
+      hold.reached = resolve
+    })
+    const sweep = store.deleteForOperator({operatorId: 'operator-a'})
+    await reachedReread
+
+    // #when the same endpoint re-subscribes successfully while the reread is paused, then the sweep resumes
+    faults.del = undefined
+    const resubscribe = await store.subscribe(SUBSCRIBE_INPUT)
+    hold.release?.()
+    const result = await sweep
+
+    // #then the sweep still reports the skip, but its failure is older than the successful re-subscribe
+    expect(resubscribe.success).toBe(true)
+    expect(result).toEqual({success: true, data: {deleted: 0, skipped: 1}})
+    expect(tracker.getStatus()).toBe('ready')
   })
 
   it('records a hard write failure during a revoke', async () => {
