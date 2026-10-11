@@ -744,6 +744,15 @@ describe('parseOperatorSessionInfo — optional push health', () => {
     expect(result.success && 'push' in result.data).toBe(false)
   })
 
+  it('projects a valid push to exactly {status}, dropping extra fields', () => {
+    // #when
+    const result = parseOperatorSessionInfo({...base, push: {status: 'ready', lastObservedAtMs: 1, detail: 'x'}})
+
+    // #then
+    expect(result).toEqual({success: true, data: {...base, push: {status: 'ready'}}})
+    expect(result.success && Object.keys(result.data.push ?? {})).toEqual(['status'])
+  })
+
   it('still rejects when a required field is invalid, regardless of push', () => {
     // #when
     const result = parseOperatorSessionInfo({...base, operatorId: 'x', push: {status: 'ready'}})

@@ -1611,6 +1611,22 @@ describe('button interaction handler (approval flow)', () => {
       expect(status).toBe('degraded')
     })
 
+    it("lets the self-test's own later observations supersede the startup seed", async () => {
+      // #given a self-test that passes but whose store reports CAS exhaustion while it runs
+      const {createOperatorPushSubscriptionStore} = await import('./web/operator-push/subscription-store.js')
+      selfTestCasMock.mockImplementationOnce(async () => {
+        const storeDeps = vi.mocked(createOperatorPushSubscriptionStore).mock.calls.at(-1)?.[0]
+        storeDeps?.onCasExhausted?.()
+        return {success: true, data: undefined} as const
+      })
+
+      // #when
+      const status = await startAndReadPushHealth({push: true})
+
+      // #then the startup ticket was taken before the self-test, so the in-test failure wins
+      expect(status).toBe('degraded')
+    })
+
     it('reports degraded when the startup CAS self-test throws', async () => {
       // #when
       const status = await startAndReadPushHealth({push: true, selfTest: 'throw'})

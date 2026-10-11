@@ -34,7 +34,7 @@ describe('createPushHealthTracker — startup', () => {
     const {tracker} = makeTracker()
 
     // #when
-    tracker.recordStartup('ok')
+    tracker.recordStartup('ok', tracker.nextSequence())
 
     // #then
     expect(tracker.getStatus()).toBe('ready')
@@ -45,7 +45,7 @@ describe('createPushHealthTracker — startup', () => {
     const {tracker, time} = makeTracker()
 
     // #when
-    tracker.recordStartup('failed')
+    tracker.recordStartup('failed', tracker.nextSequence())
     time.nowMs += 10 * HOUR
 
     // #then — unavailable until restart; an old failure is never softened to unknown
@@ -55,7 +55,7 @@ describe('createPushHealthTracker — startup', () => {
   it('does not let later successes clear a failed startup', () => {
     // #given
     const {tracker, backend, relay} = makeTracker()
-    tracker.recordStartup('failed')
+    tracker.recordStartup('failed', tracker.nextSequence())
 
     // #when
     backend('read', 'ok')
@@ -71,7 +71,7 @@ describe('createPushHealthTracker — failure, recovery, staleness', () => {
   it('degrades on a backend failure, recovers on success, then goes unknown after one hour', () => {
     // #given a healthy started tracker
     const {tracker, time, backend} = makeTracker()
-    tracker.recordStartup('ok')
+    tracker.recordStartup('ok', tracker.nextSequence())
 
     // #when a write fails after startup
     time.nowMs += 1000
@@ -97,7 +97,7 @@ describe('createPushHealthTracker — failure, recovery, staleness', () => {
   it('is still ready one millisecond before the staleness window and unknown exactly at it', () => {
     // #given
     const {tracker, time} = makeTracker()
-    tracker.recordStartup('ok')
+    tracker.recordStartup('ok', tracker.nextSequence())
 
     // #when / #then
     time.nowMs += HOUR - 1
@@ -109,7 +109,7 @@ describe('createPushHealthTracker — failure, recovery, staleness', () => {
   it('goes unknown (not ready) when a failure ages out while other observations are fresh', () => {
     // #given a relay failure, then only fresh backend successes
     const {tracker, time, backend, relay} = makeTracker()
-    tracker.recordStartup('ok')
+    tracker.recordStartup('ok', tracker.nextSequence())
     relay('failed')
     expect(tracker.getStatus()).toBe('degraded')
 
@@ -124,7 +124,7 @@ describe('createPushHealthTracker — failure, recovery, staleness', () => {
   it('has no sticky ever-failed flag: a later success of the same component clears degraded', () => {
     // #given
     const {tracker, relay} = makeTracker()
-    tracker.recordStartup('ok')
+    tracker.recordStartup('ok', tracker.nextSequence())
     relay('failed')
 
     // #when
@@ -137,7 +137,7 @@ describe('createPushHealthTracker — failure, recovery, staleness', () => {
   it('reports a stable status across repeated reads with a constant clock', () => {
     // #given
     const {tracker, backend} = makeTracker()
-    tracker.recordStartup('ok')
+    tracker.recordStartup('ok', tracker.nextSequence())
     backend('write', 'failed')
 
     // #when / #then
@@ -153,7 +153,7 @@ describe('createPushHealthTracker — component isolation', () => {
   it('does not let a read success clear a write failure', () => {
     // #given
     const {tracker, backend} = makeTracker()
-    tracker.recordStartup('ok')
+    tracker.recordStartup('ok', tracker.nextSequence())
     backend('write', 'failed')
 
     // #when
@@ -166,7 +166,7 @@ describe('createPushHealthTracker — component isolation', () => {
   it('does not let a read success clear a relay failure', () => {
     // #given
     const {tracker, backend, relay} = makeTracker()
-    tracker.recordStartup('ok')
+    tracker.recordStartup('ok', tracker.nextSequence())
     relay('failed')
 
     // #when
@@ -179,7 +179,7 @@ describe('createPushHealthTracker — component isolation', () => {
   it('does not let a relay success clear a backend write failure', () => {
     // #given
     const {tracker, backend, relay} = makeTracker()
-    tracker.recordStartup('ok')
+    tracker.recordStartup('ok', tracker.nextSequence())
     backend('write', 'failed')
 
     // #when
@@ -194,7 +194,7 @@ describe('createPushHealthTracker — ordering by start', () => {
   it('does not let an older operation that finishes late clear a newer failure', () => {
     // #given an older read starts, then a newer read starts and fails
     const {tracker} = makeTracker()
-    tracker.recordStartup('ok')
+    tracker.recordStartup('ok', tracker.nextSequence())
     const olderStart = tracker.nextSequence()
     const newerStart = tracker.nextSequence()
     tracker.recordBackend('read', 'failed', newerStart)
@@ -210,7 +210,7 @@ describe('createPushHealthTracker — ordering by start', () => {
   it('does not let an older failure that finishes late overwrite a newer success', () => {
     // #given an older write starts, then a newer write starts and succeeds
     const {tracker} = makeTracker()
-    tracker.recordStartup('ok')
+    tracker.recordStartup('ok', tracker.nextSequence())
     const olderStart = tracker.nextSequence()
     const newerStart = tracker.nextSequence()
     tracker.recordBackend('write', 'ok', newerStart)
@@ -225,7 +225,7 @@ describe('createPushHealthTracker — ordering by start', () => {
   it('applies the same start ordering to relay observations', () => {
     // #given
     const {tracker} = makeTracker()
-    tracker.recordStartup('ok')
+    tracker.recordStartup('ok', tracker.nextSequence())
     const olderStart = tracker.nextSequence()
     const newerStart = tracker.nextSequence()
     tracker.recordRelay('failed', newerStart)
@@ -242,7 +242,7 @@ describe('createPushHealthTracker — clock steps', () => {
   it('treats observations as not fresh when the clock steps backward', () => {
     // #given a ready tracker
     const {tracker, time} = makeTracker()
-    tracker.recordStartup('ok')
+    tracker.recordStartup('ok', tracker.nextSequence())
     expect(tracker.getStatus()).toBe('ready')
 
     // #when the clock steps back, so every observation has a negative age
@@ -255,7 +255,7 @@ describe('createPushHealthTracker — clock steps', () => {
   it('does not report a backward-stepped failure as degraded or healthy', () => {
     // #given a fresh failure
     const {tracker, time, backend} = makeTracker()
-    tracker.recordStartup('ok')
+    tracker.recordStartup('ok', tracker.nextSequence())
     backend('write', 'failed')
 
     // #when the clock steps back
@@ -268,7 +268,7 @@ describe('createPushHealthTracker — clock steps', () => {
   it('ages a just-recorded observation out when the clock steps forward past the window', () => {
     // #given
     const {tracker, time} = makeTracker()
-    tracker.recordStartup('ok')
+    tracker.recordStartup('ok', tracker.nextSequence())
 
     // #when the clock jumps forward by more than the window
     time.nowMs += HOUR + 1
@@ -280,7 +280,7 @@ describe('createPushHealthTracker — clock steps', () => {
   it('recovers once a fresh observation is recorded after a backward step', () => {
     // #given
     const {tracker, time, backend} = makeTracker()
-    tracker.recordStartup('ok')
+    tracker.recordStartup('ok', tracker.nextSequence())
     time.nowMs -= 5000
     expect(tracker.getStatus()).toBe('unknown')
 

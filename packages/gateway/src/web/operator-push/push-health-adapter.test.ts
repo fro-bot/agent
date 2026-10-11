@@ -9,7 +9,7 @@ import {createPushHealthTracker} from './push-health.js'
 import {createOperatorPushSubscriptionStore} from './subscription-store.js'
 import {shouldNotify} from './trigger-policy.js'
 
-type Fault = number | 'throw' | 'unstructured' | undefined
+type Fault = number | {readonly status: number; readonly code: string} | 'throw' | 'unstructured' | undefined
 
 interface Faults {
   list: Fault
@@ -21,6 +21,11 @@ interface Faults {
 function faultResult(fault: Exclude<Fault, undefined>, label: string) {
   if (fault === 'throw') throw new Error(`${label} exploded`)
   if (fault === 'unstructured') return err(new Error(`${label}: getaddrinfo ENOTFOUND bucket.example.com`))
+  if (typeof fault === 'object') {
+    return err(
+      createObjectStoreOperationError(`${label} failed`, {httpStatusCode: fault.status, errorCode: fault.code}),
+    )
+  }
   return err(createObjectStoreOperationError(`${label} failed`, {httpStatusCode: fault}))
 }
 
@@ -75,9 +80,13 @@ function setup() {
   const fake = createFaultableAdapter()
   const time = {nowMs: 1_000_000}
   const tracker = createPushHealthTracker({clock: () => time.nowMs})
-  tracker.recordStartup('ok')
+  tracker.recordStartup('ok', tracker.nextSequence())
   const observed = observePushAdapterHealth(fake.adapter, tracker)
-  const store = createOperatorPushSubscriptionStore({adapter: observed, logger: {debug: vi.fn(), warn: vi.fn()}})
+  const store = createOperatorPushSubscriptionStore({
+    adapter: observed,
+    logger: {debug: vi.fn(), warn: vi.fn()},
+    onCasExhausted: () => tracker.recordBackend('write', 'failed', tracker.nextSequence()),
+  })
   return {...fake, tracker, time, observed, store}
 }
 
@@ -120,6 +129,81 @@ describe('observePushAdapterHealth — outcome mapping', () => {
     expect(tracker.getStatus()).toBe('ready')
   })
 
+  it('classifies by structured code before status: NoSuchKey, NotFound, PreconditionFailed and ConditionalRequestConflict are answers', async () => {
+    // #given each answer code, with a status that would otherwise be a failure
+    const codes = ['NoSuchKey', 'NotFound', 'PreconditionFailed', 'ConditionalRequestConflict']
+    for (const code of codes) {
+      const {observed, tracker, faults} = setup()
+      faults.get = {status: 500, code}
+
+      // #when
+      await observed.getObject?.('k')
+
+      // #then
+      expect({code, status: tracker.getStatus()}).toEqual({code, status: 'ready'})
+    }
+  })
+
+  it('counts HTTP 409 ConditionalRequestConflict on a conditional write as a working backend', async () => {
+    // #given
+    const {observed, tracker, faults} = setup()
+    faults.put = {status: 409, code: 'ConditionalRequestConflict'}
+
+    // #when
+    await observed.conditionalPut?.('k', 'v', {ifNoneMatch: '*'})
+
+    // #then contention is not a backend fault (a single one; sustained exhaustion is reported by the store)
+    expect(tracker.getStatus()).toBe('ready')
+  })
+
+  it('counts a bare HTTP 409 (no code) as a working backend', async () => {
+    // #given
+    const {observed, tracker, faults} = setup()
+    faults.put = 409
+
+    // #when
+    await observed.conditionalPut?.('k', 'v', {ifNoneMatch: '*'})
+
+    // #then
+    expect(tracker.getStatus()).toBe('ready')
+  })
+
+  it('counts a 404 NoSuchBucket on list as a backend failure', async () => {
+    // #given
+    const {observed, tracker, faults} = setup()
+    faults.list = {status: 404, code: 'NoSuchBucket'}
+
+    // #when
+    await observed.list('p/')
+
+    // #then a missing bucket is a fault even though its status is 404
+    expect(tracker.getStatus()).toBe('degraded')
+  })
+
+  it('counts a 404 NoSuchBucket on conditionalPut as a backend failure', async () => {
+    // #given
+    const {observed, tracker, faults} = setup()
+    faults.put = {status: 404, code: 'NoSuchBucket'}
+
+    // #when
+    await observed.conditionalPut?.('k', 'v', {ifMatch: 'e'})
+
+    // #then
+    expect(tracker.getStatus()).toBe('degraded')
+  })
+
+  it('counts an unrecognized code as a failure even with an answer-like status', async () => {
+    // #given
+    const {observed, tracker, faults} = setup()
+    faults.get = {status: 412, code: 'InternalError'}
+
+    // #when
+    await observed.getObject?.('k')
+
+    // #then
+    expect(tracker.getStatus()).toBe('degraded')
+  })
+
   it.each([403, 429, 500, 503, 'unstructured'] as const)('counts %s as a backend failure', async fault => {
     // #given
     const {observed, tracker, faults} = setup()
@@ -139,6 +223,16 @@ describe('observePushAdapterHealth — outcome mapping', () => {
 
     // #when / #then
     await expect(observed.list('p/')).rejects.toThrow('list exploded')
+    expect(tracker.getStatus()).toBe('degraded')
+  })
+
+  it('counts a throwing conditionalPut as a write failure and re-throws it unchanged', async () => {
+    // #given
+    const {observed, tracker, faults} = setup()
+    faults.put = 'throw'
+
+    // #when / #then
+    await expect(observed.conditionalPut?.('k', 'v', {ifNoneMatch: '*'})).rejects.toThrow('put exploded')
     expect(tracker.getStatus()).toBe('degraded')
   })
 
@@ -224,32 +318,110 @@ describe('observePushAdapterHealth — store-level behavior at the I/O boundary'
   })
 
   it('keeps a write failure when only the read inside a write method recovers', async () => {
-    // #given a write failure
+    // #given a subscribe whose read fails
     const {store, tracker, faults} = setup()
-    faults.put = 500
+    faults.get = 500
     await store.subscribe(SUBSCRIBE_INPUT)
+    expect(tracker.getStatus()).toBe('degraded')
 
-    // #when a read-only call succeeds
-    await store.listAllActiveRecords()
+    // #when the next subscribe's read succeeds but its write fails
+    faults.get = undefined
+    faults.put = 500
+    const second = await store.subscribe(SUBSCRIBE_INPUT)
+
+    // #then the read recovered inside a write method, the write failure stands
+    expect(second.success).toBe(false)
+    expect(tracker.getStatus()).toBe('degraded')
+
+    // #and a write success is what finally clears it
+    faults.put = undefined
+    await store.subscribe(SUBSCRIBE_INPUT)
+    expect(tracker.getStatus()).toBe('ready')
+  })
+
+  it('observes every real adapter call of a CAS-exhausted revoke', async () => {
+    // #given a spy tracker and a store without the exhaustion callback
+    const fake = createFaultableAdapter()
+    const recordBackend = vi.fn<(kind: PushHealthBackendKind, outcome: PushHealthOutcome, start: number) => void>()
+    let sequence = 0
+    const observed = observePushAdapterHealth(fake.adapter, {nextSequence: () => (sequence += 1), recordBackend})
+    const store = createOperatorPushSubscriptionStore({adapter: observed, logger: {debug: vi.fn(), warn: vi.fn()}})
+    await store.subscribe(SUBSCRIBE_INPUT)
+    fake.faults.put = 412
+    const callsBefore = fake.calls.count
+    recordBackend.mockClear()
+
+    // #when the revoke exhausts its retries
+    const revoke = await store.deactivateForOperator({operatorId: 'operator-a'})
+
+    // #then every real adapter call produced exactly one observation
+    expect(revoke.success && revoke.data.skipped).toBe(1)
+    expect(recordBackend).toHaveBeenCalledTimes(fake.calls.count - callsBefore)
+    expect(fake.calls.count - callsBefore).toBeGreaterThan(5)
+  })
+
+  it('degrades when a revoke exhausts its CAS retries after a healthy state', async () => {
+    // #given a healthy tracker and an active record whose every conditional write loses the race (412)
+    const {store, tracker, faults} = setup()
+    await store.subscribe(SUBSCRIBE_INPUT)
+    faults.put = 412
+    expect(tracker.getStatus()).toBe('ready')
+
+    // #when
+    const revoke = await store.deactivateForOperator({operatorId: 'operator-a'})
+
+    // #then a single 412 is a working backend, but sustained contention (skipped > 0) is a write failure
+    expect(revoke.success && revoke.data.skipped).toBe(1)
+    expect(tracker.getStatus()).toBe('degraded')
+  })
+
+  it('degrades when subscribe exhausts its CAS retries', async () => {
+    // #given
+    const {store, tracker, faults} = setup()
+    faults.put = 412
+
+    // #when
+    const result = await store.subscribe(SUBSCRIBE_INPUT)
+
+    // #then
+    expect(result.success).toBe(false)
+    expect(tracker.getStatus()).toBe('degraded')
+  })
+
+  it('degrades when unsubscribe or markDead exhaust their CAS retries', async () => {
+    // #given an active record
+    const {store, tracker, faults} = setup()
+    await store.subscribe(SUBSCRIBE_INPUT)
+    faults.put = 412
+
+    // #when unsubscribe exhausts
+    await store.unsubscribe({operatorId: 'operator-a', endpoint: SUBSCRIBE_INPUT.endpoint})
+    // #then
+    expect(tracker.getStatus()).toBe('degraded')
+
+    // #when the backend writes again, then markDead exhausts
+    faults.put = undefined
+    await store.subscribe(SUBSCRIBE_INPUT)
+    expect(tracker.getStatus()).toBe('ready')
+    faults.put = 412
+    await store.markDead({operatorId: 'operator-a', endpoint: SUBSCRIBE_INPUT.endpoint})
 
     // #then
     expect(tracker.getStatus()).toBe('degraded')
   })
 
-  it('records each real call of a CAS-exhausted revoke; contention alone is not a backend fault', async () => {
-    // #given an active record whose every conditional write loses the CAS race (412)
-    const {store, tracker, faults, calls} = setup()
+  it('degrades when a privacy delete loses its physical-delete CAS race', async () => {
+    // #given an active record whose physical delete loses the race
+    const {store, tracker, faults} = setup()
     await store.subscribe(SUBSCRIBE_INPUT)
-    faults.put = 412
-    const before = calls.count
+    faults.del = 412
 
-    // #when the revoke exhausts its retries
-    const revoke = await store.deactivateForOperator({operatorId: 'operator-a'})
+    // #when
+    const result = await store.deleteForOperator({operatorId: 'operator-a'})
 
-    // #then skipped > 0, every real adapter call was observed, and a precondition failure is a working backend
-    expect(revoke.success && revoke.data.skipped).toBe(1)
-    expect(calls.count - before).toBeGreaterThan(5)
-    expect(tracker.getStatus()).toBe('ready')
+    // #then
+    expect(result.success && result.data.skipped).toBe(1)
+    expect(tracker.getStatus()).toBe('degraded')
   })
 
   it('records a hard write failure during a revoke', async () => {
@@ -285,7 +457,7 @@ describe('observePushAdapterHealth — store-level behavior at the I/O boundary'
   it('does not let an older call that finishes after a newer failure clear it', async () => {
     // #given two reads in flight: the older one is held open
     const tracker = createPushHealthTracker({clock: () => 0})
-    tracker.recordStartup('ok')
+    tracker.recordStartup('ok', tracker.nextSequence())
     let releaseOlder: (() => void) | undefined
     let call = 0
     const adapter: ObjectStoreAdapter = {
@@ -312,6 +484,26 @@ describe('observePushAdapterHealth — store-level behavior at the I/O boundary'
     await older
 
     // #then the late success of the older call must not clear the newer failure
+    expect(tracker.getStatus()).toBe('degraded')
+  })
+})
+
+describe('observePushAdapterHealth — startup self-test', () => {
+  it('is degraded when the real self-test passes but its cleanup delete is denied (403)', async () => {
+    // #given the real self-test over the observed adapter, with the cleanup delete denied
+    const fake = createFaultableAdapter()
+    const tracker = createPushHealthTracker({clock: () => 1_000_000})
+    const observed = observePushAdapterHealth(fake.adapter, tracker)
+    const store = createOperatorPushSubscriptionStore({adapter: observed, logger: {debug: vi.fn(), warn: vi.fn()}})
+    fake.faults.del = 403
+
+    // #when the startup ticket is taken before the self-test, as program.ts does
+    const startupTicket = tracker.nextSequence()
+    const result = await store.selfTestCas()
+    tracker.recordStartup('ok', startupTicket)
+
+    // #then the self-test passes (cleanup is best-effort) but its own denied delete supersedes the seed
+    expect(result.success).toBe(true)
     expect(tracker.getStatus()).toBe('degraded')
   })
 })

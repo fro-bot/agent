@@ -79,7 +79,7 @@ export function parseOperatorSessionInfo(input: unknown): Result<OperatorSession
     operatorId: input.operatorId,
     login: input.login,
     expiresAt: input.expiresAt,
-    ...(hasValidOperatorPushHealthShape(input.push) ? {push: input.push} : {}),
+    ...(hasValidOperatorPushHealthShape(input.push) ? {push: {status: input.push.status}} : {}),
   })
 }
 

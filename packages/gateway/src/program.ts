@@ -891,7 +891,10 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
         const pushStore = createOperatorPushSubscriptionStore({
           adapter: observePushAdapterHealth(s3Adapter, pushHealth),
           logger,
+          onCasExhausted: () => pushHealth.recordBackend('write', 'failed', pushHealth.nextSequence()),
         })
+        // Taken before the self-test so the self-test's own observations (e.g. a denied cleanup delete) supersede it.
+        const startupTicket = pushHealth.nextSequence()
         // Effect.tryPromise (not Effect.promise) so a throwing adapter — not
         // just a Result-typed failure — is caught here and degrades to
         // "push disabled" rather than becoming an unrecoverable defect that
@@ -902,7 +905,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           catch: error => (error instanceof Error ? error : new Error(String(error))),
         }).pipe(Effect.catchAll(error => Effect.succeed(err(error))))
         if (selfTest.success === true) {
-          pushHealth.recordStartup('ok')
+          pushHealth.recordStartup('ok', startupTicket)
           operatorPush = {store: pushStore, vapidPublicKeyInfo: config.operatorPush.vapidPublicKeyInfo}
 
           // Construct the push sender + broadcast dispatcher now that the store
@@ -931,7 +934,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
             pushHealth,
           })
         } else {
-          pushHealth.recordStartup('failed')
+          pushHealth.recordStartup('failed', startupTicket)
           logger.warn({err: selfTest.error.message}, 'operator push disabled — object store failed CAS self-test')
           emitAudit({kind: 'push.disabled', correlationId: 'startup', reason: 'self_test_failed'}, logger)
         }

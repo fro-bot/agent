@@ -50,7 +50,7 @@ function makeDispatcher(options: {
   const time = {nowMs: 1_000_000}
   const tracker = options.tracker ?? createPushHealthTracker({clock: () => time.nowMs})
   if (options.tracker === undefined) {
-    tracker.recordStartup('ok')
+    tracker.recordStartup('ok', tracker.nextSequence())
   }
   const store: DispatchStore = {
     listAllActiveRecords: vi.fn(async () => ({success: true as const, data: options.records})),
@@ -82,7 +82,7 @@ function setup(options: {
 async function failThenRun(second: (tracker: ReturnType<typeof createPushHealthTracker>) => Promise<void>) {
   const time = {nowMs: 1_000_000}
   const tracker = createPushHealthTracker({clock: () => time.nowMs})
-  tracker.recordStartup('ok')
+  tracker.recordStartup('ok', tracker.nextSequence())
   const failing = makeDispatcher({
     records: [makeRecord(1)],
     sender: makeSender([{outcome: 'error'}]),

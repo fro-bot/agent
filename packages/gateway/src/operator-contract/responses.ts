@@ -36,8 +36,8 @@ export interface OperatorSessionInfo {
  *   This is observed readiness, NOT guaranteed delivery to a browser.
  * - `degraded`: the startup self-test failed, or the most recent fresh
  *   observation of the store backend or relay delivery failed.
- * - `unknown`: configured, but nothing fresh has been observed (startup pending
- *   or every observation is older than one hour). Never read as healthy.
+ * - `unknown`: configured, but nothing fresh has been observed (every observation
+ *   is older than one hour). Never read as healthy.
  *
  * Push that is not configured is reported by omitting `push` from the session
  * response, so there is no `disabled` value on the wire.

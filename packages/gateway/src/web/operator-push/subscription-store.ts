@@ -196,6 +196,11 @@ export interface OperatorPushSubscriptionStoreDeps {
    * smaller.
    */
   readonly tombstoneRetentionMs?: number
+  /**
+   * Called each time a CAS retry loop gives up (or a delete loses its CAS race), so an observer can
+   * report sustained write contention. The store never reads it back.
+   */
+  readonly onCasExhausted?: () => void
 }
 
 export interface StoreError extends Error {
@@ -368,6 +373,7 @@ export function createOperatorPushSubscriptionStore(
   deps: OperatorPushSubscriptionStoreDeps,
 ): OperatorPushSubscriptionStore {
   const {adapter, logger} = deps
+  const onCasExhausted = deps.onCasExhausted ?? (() => {})
   const keyPrefix = deps.keyPrefix ?? DEFAULT_KEY_PREFIX
   const tombstonePrefix = DEFAULT_TOMBSTONE_PREFIX
   const clock = deps.clock ?? Date.now
@@ -609,6 +615,7 @@ export function createOperatorPushSubscriptionStore(
     }
 
     if (written === null) {
+      onCasExhausted()
       return err(createStoreError('subscribe: exceeded max CAS retry attempts'))
     }
 
@@ -688,6 +695,7 @@ export function createOperatorPushSubscriptionStore(
       }
       return ok(undefined)
     }
+    onCasExhausted()
     return err(createStoreError('unsubscribe: exceeded max CAS retry attempts'))
   }
 
@@ -761,6 +769,8 @@ export function createOperatorPushSubscriptionStore(
         )
       }
     }
+    // After the loop, so later calls in the same sweep cannot supersede the report.
+    if (skipped > 0) onCasExhausted()
     return ok({updated, skipped})
   }
 
@@ -907,6 +917,7 @@ export function createOperatorPushSubscriptionStore(
         }
       }
     }
+    if (skipped > 0) onCasExhausted()
     return ok({deleted, skipped})
   }
 
@@ -994,6 +1005,7 @@ export function createOperatorPushSubscriptionStore(
       }
       return ok(undefined)
     }
+    onCasExhausted()
     return err(createStoreError('markDead: exceeded max CAS retry attempts'))
   }
 

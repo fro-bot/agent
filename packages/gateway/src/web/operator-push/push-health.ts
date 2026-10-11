@@ -20,8 +20,11 @@ export interface PushHealthTrackerDeps {
 }
 
 export interface PushHealthTracker {
-  /** Outcome of the startup CAS self-test; also marks push configured. A failure holds `degraded` until restart. */
-  readonly recordStartup: (outcome: PushHealthOutcome) => void
+  /**
+   * Outcome of the startup CAS self-test; also marks push configured. A failure holds `degraded` until
+   * restart. Pass a ticket taken BEFORE the self-test ran, so the self-test's own later observations win.
+   */
+  readonly recordStartup: (outcome: PushHealthOutcome, startSequence: number) => void
   /** Start ticket for an operation. Pass it back when recording so an older operation cannot overwrite a newer one. */
   readonly nextSequence: () => number
   /** Outcome of an object-store call that began at `startSequence`. */
@@ -56,14 +59,14 @@ export function createPushHealthTracker(deps: PushHealthTrackerDeps): PushHealth
     return current === undefined || incoming.startSequence > current.startSequence ? incoming : current
   }
 
-  function recordStartup(outcome: PushHealthOutcome): void {
+  function recordStartup(outcome: PushHealthOutcome, startSequence: number): void {
     configured = true
     if (outcome === 'failed') {
       startupFailed = true
       return
     }
     // The CAS self-test exercises the store's read and write paths.
-    const observation: Observation = {outcome: 'ok', atMs: clock(), startSequence: nextSequence()}
+    const observation: Observation = {outcome: 'ok', atMs: clock(), startSequence}
     read = newest(read, observation)
     write = newest(write, observation)
   }
