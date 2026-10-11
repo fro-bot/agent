@@ -17,10 +17,27 @@ import {
 import {extractCommitShas, extractGithubUrls} from '../../services/github/urls.js'
 import {outputTextContent, outputToolExecution} from '../../shared/console.js'
 
+/**
+ * Usage reported by ONE assistant message. OpenCode reports `tokens` and `cost` per message (each
+ * prompt-loop iteration creates a new assistant message), never cumulatively per session.
+ */
+export interface MessageUsage {
+  readonly tokens: TokenUsage
+  readonly cost: number | null
+}
+
 export interface EventStreamResult {
+  /** Sum across every assistant message of every owned session (see `summarizeMessageUsage`). */
   readonly tokens: TokenUsage | null
   readonly model: string | null
+  /** Sum across every assistant message of every owned session; `null` when no message reported a cost. */
   readonly cost: number | null
+  /**
+   * The per-message ledger `tokens`/`cost` were summed from, keyed by assistant message id. Carried so
+   * a caller that runs several attempts against one session (LLM retries) can merge ledgers by message
+   * id — latest report wins — instead of letting the last attempt's totals replace the earlier ones.
+   */
+  readonly usageByMessage?: ReadonlyMap<string, MessageUsage>
   readonly prsCreated: string[]
   readonly commitsCreated: string[]
   readonly commentsPostedUrls?: string[]
@@ -452,29 +469,61 @@ function getObjectProperty(value: unknown, property: string): unknown {
 }
 
 /**
- * Sums each owned session's latest-reported token totals into the run's overall cost.
- * Per-session latest-wins (see `tokensBySession` in `processEventStream`) plus a sum
- * across sessions gives the true run cost without a single session's report clobbering
- * another's. An empty map (no ledger, or no message.updated seen yet) yields `null`,
- * matching the pre-fix behavior of an untouched `tokens` variable.
+ * Folds a per-message usage ledger into the run's token and cost totals.
+ *
+ * Upstream OpenCode reports usage on each assistant MESSAGE for that message only
+ * (`ctx.assistantMessage.tokens`/`.cost` in `session/processor.ts` `step-finish`), and the prompt loop
+ * creates a fresh assistant message per iteration — so a multi-turn run's true usage is the sum over
+ * all of its messages. The same message re-fires `message.updated` as it progresses (created with
+ * zeros, step-finish, completed); the ledger keeps only the latest report per message id, so those
+ * repeats are counted once. An empty ledger yields `tokens: null`; `cost` is `null` unless at least one
+ * message reported a numeric cost.
  */
-function sumOwnedSessionTokens(tokensBySession: ReadonlyMap<string, TokenUsage>): TokenUsage | null {
-  if (tokensBySession.size === 0) return null
+export function summarizeMessageUsage(usageByMessage: ReadonlyMap<string, MessageUsage>): {
+  readonly tokens: TokenUsage | null
+  readonly cost: number | null
+} {
+  if (usageByMessage.size === 0) return {tokens: null, cost: null}
 
   let input = 0
   let output = 0
   let reasoning = 0
   let cacheRead = 0
   let cacheWrite = 0
-  for (const sessionTokens of tokensBySession.values()) {
-    input += sessionTokens.input
-    output += sessionTokens.output
-    reasoning += sessionTokens.reasoning
-    cacheRead += sessionTokens.cache.read
-    cacheWrite += sessionTokens.cache.write
+  let cost: number | null = null
+  for (const usage of usageByMessage.values()) {
+    input += usage.tokens.input
+    output += usage.tokens.output
+    reasoning += usage.tokens.reasoning
+    cacheRead += usage.tokens.cache.read
+    cacheWrite += usage.tokens.cache.write
+    if (usage.cost !== null) cost = (cost ?? 0) + usage.cost
   }
 
-  return {input, output, reasoning, cache: {read: cacheRead, write: cacheWrite}}
+  return {tokens: {input, output, reasoning, cache: {read: cacheRead, write: cacheWrite}}, cost}
+}
+
+/** Merges two per-message ledgers by message id; `next` wins on a shared id (it is the later observation). */
+export function mergeMessageUsage(
+  prior: ReadonlyMap<string, MessageUsage> | undefined,
+  next: ReadonlyMap<string, MessageUsage> | undefined,
+): ReadonlyMap<string, MessageUsage> {
+  return new Map([...(prior ?? []), ...(next ?? [])])
+}
+
+/**
+ * Folds an earlier attempt's usage into a later attempt's result. Each LLM-retry attempt runs its own
+ * `processEventStream`, so without this the last attempt's totals would replace every earlier
+ * attempt's. Ledgers merge by message id (the later report wins when an in-flight message straddles
+ * two attempts), then `tokens`/`cost` are re-derived from the merged ledger. `model` keeps the
+ * latest attempt's value, falling back to the earlier one.
+ */
+export function mergeAttemptUsage(latest: EventStreamResult, prior: EventStreamResult): EventStreamResult {
+  const usageByMessage = mergeMessageUsage(prior.usageByMessage, latest.usageByMessage)
+  if (usageByMessage.size === 0) return {...latest, model: latest.model ?? prior.model}
+
+  const {tokens, cost} = summarizeMessageUsage(usageByMessage)
+  return {...latest, tokens, cost, model: latest.model ?? prior.model, usageByMessage}
 }
 
 const SESSION_ERROR_FIELD_MAX_LENGTH = 256
@@ -620,17 +669,16 @@ export async function processEventStream(
   ownershipLedger?: OwnershipLedger,
 ): Promise<EventStreamResult> {
   let lastText = ''
-  // Per-session latest-reported totals. OpenCode reports cumulative totals per
-  // message (see message.tokens in the upstream session store, and
-  // ctx.assistantMessage.tokens = usage.tokens in processor.ts) rather than
-  // deltas, so the latest report for a given session is that session's running
-  // total — taking the latest per session and summing across owned sessions
-  // gives the run's true cost. A root-only run (the only case before ownership
-  // widening) has exactly one key here, so the sum equals what plain
-  // assignment always produced.
-  const tokensBySession = new Map<string, TokenUsage>()
+  // Per-message usage ledger, latest report wins per assistant message id. Upstream reports `tokens`
+  // and `cost` on each assistant message for THAT message only (processor.ts `step-finish`:
+  // `assistantMessage.tokens = usage.tokens`, `assistantMessage.cost += usage.cost`), a new assistant
+  // message is created per prompt-loop iteration, and one message re-fires `message.updated` several
+  // times. Per-session latest-wins would therefore keep only the final turn; keying by message id
+  // dedupes the repeats while every turn of every owned session (root + adopted descendants) still
+  // contributes to the sum. The stream only carries events published after subscription, so messages
+  // from a resumed session's earlier invocations never appear here.
+  const usageByMessage = new Map<string, MessageUsage>()
   let model: string | null = null
-  let cost: number | null = null
   const prsCreated: string[] = []
   const commitsCreated: string[] = []
   const commentsPostedUrls: string[] = []
@@ -943,7 +991,7 @@ export async function processEventStream(
             // (`pollForSessionCompletionObservation` in session-poll.ts) -- an explicit availability
             // tradeoff: a barrier-bearing turn cannot finish from SSE alone when REST is unavailable.
           }
-          const sessionTokens: TokenUsage = {
+          const messageTokens: TokenUsage = {
             input: getNumberProperty(tokensData, 'input') ?? 0,
             output: getNumberProperty(tokensData, 'output') ?? 0,
             reasoning: getNumberProperty(tokensData, 'reasoning') ?? 0,
@@ -952,12 +1000,15 @@ export async function processEventStream(
               write: getNumberProperty(getObjectProperty(tokensData, 'cache'), 'write') ?? 0,
             },
           }
-          // eventSessionID is narrowed to string here: isOwnedSession is a type guard that
-          // rejects null ids, so this branch only runs when it resolved to a real session id.
-          tokensBySession.set(eventSessionID, sessionTokens)
+          const messageCost = getNumberProperty(msg, 'cost')
+          // Upstream always sets `info.id`. An id-less payload is malformed; fall back to one slot per
+          // session (latest wins) rather than dropping its usage or minting a fresh key per report.
+          // eventSessionID is narrowed to string here: isOwnedSession is a type guard that rejects
+          // null ids, so this branch only runs when it resolved to a real session id.
+          const messageKey = getStringProperty(msg, 'id') ?? `unidentified:${eventSessionID}`
+          usageByMessage.set(messageKey, {tokens: messageTokens, cost: messageCost})
           model = getStringProperty(msg, 'modelID')
-          cost = getNumberProperty(msg, 'cost')
-          logger.debug('Token usage received', {tokens: sessionTokens, model, cost})
+          logger.debug('Token usage received', {messageKey, tokens: messageTokens, model, cost: messageCost})
         }
       } else if (eventType === 'session.status') {
         const statusEventSessionID = getSessionID(eventPayload)
@@ -1214,10 +1265,12 @@ export async function processEventStream(
   }
 
   if (lastText.length > 0) outputTextContent(lastText)
+  const usage = summarizeMessageUsage(usageByMessage)
   return {
-    tokens: sumOwnedSessionTokens(tokensBySession),
+    tokens: usage.tokens,
     model,
-    cost,
+    cost: usage.cost,
+    usageByMessage,
     prsCreated,
     commitsCreated,
     commentsPostedUrls,
