@@ -1,31 +1,22 @@
 /**
  * In-memory fixed-window rate limiter, shared by the announce webhook and the
- * operator HTTP surface.
+ * operator HTTP surface. Limits requests per key (a user id, a fixed producer
+ * key, or a derived abuse-accounting key) to a configurable count per window
+ * (default 60 per minute).
  *
- * Limits requests per key (an authenticated user id, a fixed producer key, or a
- * derived abuse-accounting key) to a configurable number of requests per time
- * window. Defaults to 60 requests per minute.
- *
- * Uses fixed-window counting (not sliding window). Expiry is lazy and per key:
- * a key whose window has elapsed is renewed the next time it is touched. There
- * is no sweep — `allow()` is O(1) regardless of how many keys are tracked.
- *
- * Hard cap: the store is bounded to MAX_KEYS entries. A NEW key arriving at
- * capacity is always admitted: the oldest key (by insertion / window-renewal
- * order) is evicted first. A new client is therefore never refused because of
- * unrelated traffic.
- *
- * Ordering is FIFO by window start, not LRU: ordinary hits within a window do
- * not promote a key; only a window renewal (delete-then-set, since `Map.set`
- * on an existing key keeps its position) moves it to the tail.
- *
- * Best-effort under cardinality pressure: evicting a key discards its counter,
- * so an ACTIVE bucket evicted at capacity starts over at count 1 on its next
- * request. Under a flood of distinct keys the limiter degrades to "recent
- * keys are limited" rather than failing closed for newcomers. Callers must not
- * rely on it as a hard quota against an adversary that controls key
- * cardinality — bound the key space upstream (e.g. derived /64 accounting
- * keys) instead.
+ * - Expiry is lazy and per key: an elapsed window is renewed the next time the
+ *   key is touched. There is no sweep, so hits and renewals are O(1) in the
+ *   number of tracked keys.
+ * - The map is bounded to MAX_KEYS. A new key at capacity is always admitted by
+ *   evicting the oldest key first; that admission is amortized, not strictly
+ *   O(1) (`Map.keys().next()` skips deleted slots not yet compacted, about 9 us
+ *   at 10,000 keys under sustained churn).
+ * - Eviction order is FIFO by window start, not LRU: hits do not promote a key;
+ *   a window renewal deletes and re-sets it so it moves to the tail.
+ * - Best-effort under cardinality pressure: evicting an active key resets its
+ *   bucket. Bound the key space upstream (e.g. derived /64 accounting keys)
+ *   rather than relying on this as a hard quota against an adversary who
+ *   controls key cardinality.
  */
 
 /** Default: 60 requests per minute. */

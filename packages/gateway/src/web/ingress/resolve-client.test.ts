@@ -337,6 +337,10 @@ describe('unsafeResolvedClientAddressForTest — accounting key', () => {
     const real = unsafeResolvedClientAddressForTest('203.0.113.7')
     const prod = await resolveBoth('203.0.113.7')
     expect(real.accountingKey).toBe(prod.accountingKey)
+    // normalized canonical form, same as production (not the raw spelling)
+    expect(unsafeResolvedClientAddressForTest('::ffff:203.0.113.7').canonical).toBe('203.0.113.7')
+    expect(unsafeResolvedClientAddressForTest('2001:db8::1').canonical).toBe('2001:0db8:0000:0000:0000:0000:0000:0001')
+    expect(unsafeResolvedClientAddressForTest('ip-1').canonical).toBe('ip-1')
     expect(unsafeResolvedClientAddressForTest('ip-1').accountingKey).not.toBe(
       unsafeResolvedClientAddressForTest('ip-2').accountingKey,
     )

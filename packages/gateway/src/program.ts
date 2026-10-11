@@ -233,7 +233,7 @@ export interface BuildOperatorServerInputs {
  * program-scoped instances.
  *
  * Constructs operator-local pieces (rate limiter, session store, OAuth deps,
- * getSourceKey) internally. The caller passes already-constructed program-scoped
+ * resolveClientAddress) internally. The caller passes already-constructed program-scoped
  * instances (denylistCache, bindingsStore, runObservationManager, runIndex,
  * approvalRegistry) in.
  *
@@ -272,7 +272,7 @@ export function buildOperatorServerInputs(inputs: BuildOperatorServerInputs): {
   // chain. A resolution failure (missing/invalid socket, missing/malformed
   // forwarded chain) is propagated as an IngressRejection — never silently
   // collapsed to a fallback key every failing request would share.
-  const getSourceKey = (c: Context): Effect.Effect<ResolvedClientAddress, IngressRejection> =>
+  const resolveClientAddress = (c: Context): Effect.Effect<ResolvedClientAddress, IngressRejection> =>
     resolveClient(extractRawIngressInput(c), operatorWebConfig.ingressPolicy)
 
   // Build the shared rate limiter for the operator surface.
@@ -295,7 +295,7 @@ export function buildOperatorServerInputs(inputs: BuildOperatorServerInputs): {
   const githubOAuthDeps = buildGitHubOAuthDeps(
     logger,
     logger,
-    getSourceKey,
+    resolveClientAddress,
     operatorRateLimiter,
     sessionStore,
     sessionDeps,
@@ -921,7 +921,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
 
       // Build the operator server deps and config via the shared helper.
       // The helper constructs operator-local pieces (rate limiter, session store,
-      // OAuth deps, getSourceKey) and wires the program-scoped instances.
+      // OAuth deps, resolveClientAddress) and wires the program-scoped instances.
       // Using the helper here ensures production and the offline diagnostic share
       // the same wiring path — a future edit that drops a dep from the helper
       // will be caught by the diagnostic before it reaches production.

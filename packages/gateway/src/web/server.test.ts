@@ -45,7 +45,7 @@ import {buildOperatorApp, createOperatorServer} from './server.js'
 import {createRunObservationManager} from './sse/manager.js'
 
 /**
- * Build a stub ResolvedClientAddress for test getSourceKey stubs. The branded
+ * Build a stub ResolvedClientAddress for test resolveClientAddress stubs. The branded
  * type can only be produced by resolveClient() in production; tests use the
  * sanctioned test-only constructor to stand in for a fixed resolved client
  * identity.
@@ -179,7 +179,7 @@ function makeStubGitHubOAuthDeps(overrides?: Partial<GitHubOAuthDeps>): GitHubOA
     generateVerifier: () => 'stub-verifier-32-bytes-long-enough-for-pkce',
     generateState: () => 'stub-state-value-32-bytes-long-ok',
     stateStore: createInMemoryStateStore(),
-    getSourceKey: () => Effect.succeed(stubResolved('stub-source-key')),
+    resolveClientAddress: () => Effect.succeed(stubResolved('stub-source-key')),
     // rateLimiter is overwritten by buildOperatorApp with the shared instance;
     // provide a pass-through stub so the type is satisfied.
     rateLimiter: {allow: () => true},
@@ -909,6 +909,33 @@ describe('GET /operator/health — derived accounting keys (#1652)', () => {
       await close()
     }
   })
+
+  it('a headerless probe from an IPv6 trusted peer keeps the exact, unprefixed, unaggregated key', async () => {
+    // #given — an IPv6 trusted proxy peer, injected as the socket address (no real IPv6 socket needed)
+    const keys: string[] = []
+    const healthRateLimiter = {
+      allow: (key: string) => {
+        keys.push(key)
+        return true
+      },
+    }
+    const proxy = '2001:db8:aa:bb::1'
+    const app = buildOperatorApp(
+      makeStubDeps({healthRateLimiter}),
+      makeStubConfig({
+        ingressPolicy: makeTrustedProxyIngressPolicy([Effect.runSync(parseTrustedProxyAddress(proxy))]),
+      }),
+    )
+
+    // #when — a fully headerless health probe from the proxy itself
+    const res = await app.fetch(new Request('http://localhost/operator/health'), {
+      incoming: {socket: {remoteAddress: proxy}},
+    })
+
+    // #then — accepted, keyed on the exact eight-group canonical address (not an ipv6/64: key)
+    expect(res.status).toBe(200)
+    expect(keys).toEqual(['2001:0db8:00aa:00bb:0000:0000:0000:0001'])
+  })
 })
 
 describe('POST /operator/auth/logout — anonymous traffic cannot spend the shared bucket (#1652)', () => {
@@ -982,6 +1009,62 @@ describe('POST /operator/auth/logout — anonymous traffic cannot spend the shar
     } finally {
       await close()
     }
+  })
+
+  it('authenticated logouts from one /64 share a bucket; an adjacent /64 is independent', async () => {
+    // #given — direct policy (the socket IS the client), a limit-1 shared bucket, and three
+    // authenticated operators, each with their own session + CSRF token
+    const sessionStore = createInMemorySessionStore()
+    const now = Date.now()
+    const {logger, auditLogger, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
+    const allowlist = loadAllowlistFromText('41\n42\n43\n', logger)
+    const operators = [41, 42, 43].map(githubUserId => {
+      const sessionId = sessionStore.create({githubUserId, login: `op${githubUserId}`}, '', now)
+      if (sessionId === undefined) throw new Error('expected session to be created')
+      const csrfToken = generateCsrfToken({
+        sessionId,
+        operatorId: githubUserId,
+        nowMs: now + 1000,
+        secret: csrfSecret,
+      })
+      return {sessionId, csrfToken}
+    })
+    const app = buildOperatorApp(
+      makeStubDeps({
+        sessionStore,
+        sessionDeps: makeStubSessionDeps({clock: () => now + 1000}),
+        allowlist,
+        csrfSecret,
+        auditLogger,
+        logger,
+        rateLimiter: createRateLimiter({limit: 1, windowMs: 60_000}),
+      }),
+      makeStubConfig({publicOrigin: 'https://operator.example.com'}),
+    )
+    const logoutFrom = async (remoteAddress: string, operator: (typeof operators)[number]) =>
+      app.fetch(
+        new Request('http://localhost/operator/auth/logout', {
+          method: 'POST',
+          headers: {
+            cookie: `${SESSION_COOKIE_NAME}=${operator.sessionId}`,
+            origin: 'https://operator.example.com',
+            'x-csrf-token': operator.csrfToken,
+          },
+        }),
+        {incoming: {socket: {remoteAddress}}},
+      )
+    const [first, second, third] = operators
+    if (first === undefined || second === undefined || third === undefined) throw new Error('expected 3 operators')
+
+    // #when
+    const fromSlash64 = await logoutFrom('2001:db8:7:7::1', first)
+    const sameSlash64 = await logoutFrom('2001:db8:7:7:aaaa::2', second)
+    const adjacent = await logoutFrom('2001:db8:7:8::1', third)
+
+    // #then — the second address in the /64 is throttled by the shared bucket; the adjacent /64 is not
+    expect(fromSlash64.status).toBe(200)
+    expect(sameSlash64.status).toBe(429)
+    expect(adjacent.status).toBe(200)
   })
 })
 

@@ -23,12 +23,13 @@
  *     change mid-flow. Every other rejection reason — unknown state, already-consumed
  *     state, expired state, provider error — is unaffected and still 400s.
  *   - Numeric GitHub user id is the authority; login is display metadata only.
- *   - Source key for outstanding-attempt counting is injected by the caller and must
+ *   - The client address is injected by the caller (`resolveClientAddress`) and must
  *     resolve through the trusted-proxy-aware ingress resolver (resolveClient), never
  *     directly from caller-spoofable headers and never a fallback key on resolution
- *     failure.
- *   - Callback validates that the current source key matches the source key bound at
- *     state mint time, preventing cross-IP state replay. Because both mint and consume
+ *     failure. It carries two keys: the derived `accountingKey` (rate-limit bucket and
+ *     outstanding-attempt counting only) and the exact `canonical` address (the binding).
+ *   - Callback validates that the current exact client address matches the
+ *     `boundAddress` recorded at state mint time, preventing cross-IP state replay. Because both mint and consume
  *     resolve through the same resolver and the same policy, a client whose start and
  *     callback traverse different trusted proxies still resolves to the same key. On a
  *     mismatch, the outstanding attempt is released (same consume() as the success
@@ -44,12 +45,9 @@
  *     subsequent legitimate callback then hits the already-consumed branch and 400s).
  *     This is accepted: recovery is "sign in again," and not releasing the attempt
  *     reproduces the outstanding-attempt-cap outage this module exists to fix.
- *   - Known tradeoff: the state store is bounded (1,000 entries). When it is full, /start
- *     evicts the OLDEST remaining state instead of refusing, so admission of a new start is
- *     never denied by other clients' abandoned or flooded attempts. The cost is that a flood
- *     can evict an operator's in-flight attempt: that callback finds an unknown state, gets
- *     the ordinary 400 (no automatic bounce), and the operator must start again. Admission,
- *     not guaranteed completion — consistent with the burned-flow policy above.
+ *   - Known tradeoff: the state store is bounded and a full store evicts its oldest state
+ *     (see createInMemoryStateStore), so a flood can evict an in-flight attempt — admission,
+ *     not guaranteed completion.
  */
 
 import type {Context, Hono} from 'hono'
@@ -81,13 +79,13 @@ export interface OAuthStateEntry {
   /** Optional same-origin return path bound at state mint time. */
   readonly redirectTarget?: string
   /**
-   * Exact canonical client address bound at mint time. Compared verbatim on
-   * callback (cross-address replay binding) — never aggregated.
+   * Exact canonical client address bound at mint time. Used only for the
+   * callback binding check (cross-address replay) — never aggregated.
    */
-  readonly sourceKey?: string
+  readonly boundAddress?: string
   /**
    * Derived abuse-accounting key (IPv6 /64, IPv4 /32) used ONLY for
-   * outstanding-attempt counting. Deliberately separate from `sourceKey`: a
+   * outstanding-attempt counting. Deliberately separate from `boundAddress`: a
    * client moving within one /64 shares the attempt budget but still trips
    * the exact binding mismatch.
    */
@@ -103,11 +101,7 @@ export interface OAuthStateEntry {
 
 /** Server-side state store interface for OAuth state entries. */
 export interface OAuthStateStore {
-  /**
-   * Store a state entry. Bounded insertion: when the store is at capacity and
-   * `stateValue` is new, the oldest remaining entry is evicted first, then the
-   * new one is inserted, synchronously.
-   */
+  /** Store a state entry; a full store evicts its oldest entry first (see createInMemoryStateStore). */
   set: (stateValue: string, entry: OAuthStateEntry) => void
   /** Retrieve a state entry by value. Returns undefined if not found. */
   get: (stateValue: string) => OAuthStateEntry | undefined
@@ -115,8 +109,6 @@ export interface OAuthStateStore {
   consume: (stateValue: string) => void
   /** Count outstanding (unconsumed) entries for a given derived accounting key. */
   countOutstanding: (accountingKey: string) => number
-  /** Total number of entries in the store. */
-  size: () => number
   /**
    * Evict consumed and expired entries from the store.
    * Call periodically to bound memory growth.
@@ -156,7 +148,7 @@ export interface GitHubOAuthDeps {
   readonly stateStore: OAuthStateStore
   /**
    * Injectable trusted-proxy-aware client resolver for outstanding-attempt
-   * counting and source-key binding. Must resolve through the same
+   * counting and callback address binding. Must resolve through the same
    * `resolveClient` + `OperatorIngressPolicy` used everywhere else on the
    * operator surface — never a caller-spoofable header read directly, and
    * never a fallback fixed key on resolution failure.
@@ -167,10 +159,10 @@ export interface GitHubOAuthDeps {
    *
    * The resolved address carries two keys: the derived `accountingKey` (IPv6
    * /64, IPv4 /32) drives the rate-limit bucket and the outstanding-attempt
-   * cap; the exact `canonical` address is the source-key binding validated on
-   * callback.
+   * cap; the exact `canonical` address is the binding validated on callback
+   * (`boundAddress`).
    */
-  readonly getSourceKey: (c: Context) => Effect.Effect<ResolvedClientAddress, IngressRejection>
+  readonly resolveClientAddress: (c: Context) => Effect.Effect<ResolvedClientAddress, IngressRejection>
   /**
    * Rate limiter shared with the operator app.
    * Applied to both /start and /callback before any work is performed.
@@ -236,7 +228,7 @@ export interface GitHubOAuthConfig {
    */
   readonly allowedReturnPaths: readonly string[]
   /**
-   * Maximum outstanding (unconsumed) OAuth attempts per source key.
+   * Maximum outstanding (unconsumed) OAuth attempts per accounting key.
    * Prevents state store exhaustion from unauthenticated floods.
    */
   readonly maxOutstandingAttemptsPerKey: number
@@ -256,15 +248,15 @@ export interface GitHubOAuthConfig {
  * Build production GitHubOAuthDeps with real CSPRNG generators, global fetch,
  * Date.now clock, and a fresh in-memory state store.
  *
- * The caller must supply logger, auditLogger, getSourceKey, and rateLimiter
+ * The caller must supply logger, auditLogger, resolveClientAddress, and rateLimiter
  * because those depend on the surrounding server context (logger from program.ts,
- * source key from getConnInfo which requires the Hono context, rateLimiter from
+ * client resolver from the Hono context via resolveClient, rateLimiter from
  * the shared operator app instance).
  */
 export function buildGitHubOAuthDeps(
   logger: OAuthLogger,
   auditLogger: AuditLogger,
-  getSourceKey: (c: Context) => Effect.Effect<ResolvedClientAddress, IngressRejection>,
+  resolveClientAddress: (c: Context) => Effect.Effect<ResolvedClientAddress, IngressRejection>,
   rateLimiter: RateLimiter,
   sessionStore?: SessionStore,
   sessionDeps?: SessionDeps,
@@ -279,7 +271,7 @@ export function buildGitHubOAuthDeps(
     generateVerifier: () => randomBytes(32).toString('base64url'),
     generateState: () => randomBytes(32).toString('base64url'),
     stateStore: createInMemoryStateStore(),
-    getSourceKey,
+    resolveClientAddress,
     rateLimiter,
     ...(sessionStore === undefined ? {} : {sessionStore}),
     ...(sessionDeps === undefined ? {} : {sessionDeps}),
@@ -292,18 +284,7 @@ export function buildGitHubOAuthDeps(
 // In-memory state store
 // ---------------------------------------------------------------------------
 
-/**
- * Global ceiling on total live entries in the OAuth state store across all
- * accounting keys.
- *
- * Bounds worst-case memory (~1 MB; each entry is ~200 bytes) when many
- * distinct accounting keys each stay below the per-key outstanding cap. When
- * the store is full, the store itself admits a new state by evicting the
- * OLDEST remaining one (insertion order) rather than refusing — see
- * createInMemoryStateStore. Admission is guaranteed; completion of an evicted
- * attempt is not (its callback finds an unknown state and gets the ordinary
- * 400, so that sign-in has to be retried).
- */
+/** Global ceiling on live OAuth states across all accounting keys (~1 MB worst case at ~200 bytes each). */
 const MAX_GLOBAL_STATE_STORE_ENTRIES = 1_000
 
 /**
@@ -315,22 +296,23 @@ const MAX_GLOBAL_STATE_STORE_ENTRIES = 1_000
  * Supports eviction of consumed and expired entries via evictStale() to bound
  * memory growth. Call evictStale() periodically or on each request.
  *
- * The store owns bounded insertion: `set` never grows the store past
- * `maxEntries`. When inserting a NEW state into a full store it first evicts
- * the oldest remaining entry (Map iteration is insertion order, and entries
- * are never re-inserted, so the first key is the oldest-minted state). The
- * eviction and the insert happen in one synchronous step, so no caller can
- * observe an over-capacity store or race another insert past the bound. An
- * evicted state is simply unknown afterwards: it is never resurrected and its
- * callback receives the ordinary unknown-state rejection.
- *
- * Callers (the `/start` route) reclaim consumed/expired entries and enforce
- * the per-key cap BEFORE calling `set`, so a rejected or invalid start never
- * evicts anything.
+ * The store owns bounded insertion: `set` never leaves more than `maxEntries`
+ * states. Inserting a new state into a full store first evicts the oldest
+ * remaining one (Map insertion order), synchronously, so an eligible start is
+ * always admitted. An evicted state is unknown afterwards: its callback gets the
+ * ordinary 400 with no bounce and it is never resurrected. This is admission,
+ * not guaranteed completion — a flood can evict an in-flight attempt and the
+ * operator must start again. `/start` reclaims consumed and expired states and
+ * enforces the per-key cap before calling `set`, so a rejected or invalid start
+ * never evicts anything.
  *
  * @param maxEntries - Hard bound on live entries (default 1,000).
+ * @throws {RangeError} when `maxEntries` is not a positive safe integer.
  */
 export function createInMemoryStateStore(maxEntries: number = MAX_GLOBAL_STATE_STORE_ENTRIES): OAuthStateStore {
+  if (Number.isSafeInteger(maxEntries) === false || maxEntries < 1) {
+    throw new RangeError(`createInMemoryStateStore: maxEntries must be a positive safe integer, got ${maxEntries}`)
+  }
   const entries = new Map<string, OAuthStateEntry>()
 
   return {
@@ -365,10 +347,6 @@ export function createInMemoryStateStore(maxEntries: number = MAX_GLOBAL_STATE_S
         }
       }
       return count
-    },
-
-    size(): number {
-      return entries.size
     },
 
     evictStale(nowMs: number, ttlMs: number): void {
@@ -543,13 +521,13 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
     // Resolve the trust-aware client address for rate limiting and
     // outstanding-attempt counting. A resolution failure allocates neither a
     // rate-limit bucket nor OAuth state — never falls back to a shared key.
-    const resolved = Effect.runSync(Effect.either(deps.getSourceKey(c)))
+    const resolved = Effect.runSync(Effect.either(deps.resolveClientAddress(c)))
     if (resolved._tag === 'Left') {
       deps.logger.warn({reason: resolved.left.kind}, 'oauth start rejected: ingress resolution failed')
       return respondForIngressRejection(c, resolved.left)
     }
     // Exact identity (binding) and derived key (counting) are kept apart on purpose.
-    const sourceKey = resolved.right.canonical
+    const clientAddress = resolved.right.canonical
     const accountingKey = resolved.right.accountingKey
 
     // Rate limit check — shared with the operator app, keyed on the derived accounting key.
@@ -594,16 +572,14 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
     const stateValue = deps.generateState()
     const codeChallenge = deriveCodeChallenge(codeVerifier)
 
-    // Store state server-side. Code verifier NEVER leaves the server. The store
-    // owns bounded insertion: if it is full it evicts its oldest remaining state
-    // here, at the insertion point — only after the per-key cap and request
-    // validation above have passed, so rejected starts never evict anything.
+    // Store state server-side. Code verifier NEVER leaves the server. A full store
+    // evicts its oldest state here, only after the checks above have passed.
     deps.stateStore.set(stateValue, {
       codeVerifier,
       issuedAt: deps.clock(),
       consumed: false,
       ...(redirectTarget === undefined ? {} : {redirectTarget}),
-      sourceKey,
+      boundAddress: clientAddress,
       accountingKey,
       ...(isRetryBounce ? {bounced: true} : {}),
     })
@@ -634,14 +610,14 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
     // Resolve the trust-aware client address for rate limiting and source
     // key binding validation. A resolution failure allocates neither a
     // rate-limit bucket nor OAuth state — never falls back to a shared key.
-    const resolved = Effect.runSync(Effect.either(deps.getSourceKey(c)))
+    const resolved = Effect.runSync(Effect.either(deps.resolveClientAddress(c)))
     if (resolved._tag === 'Left') {
       deps.logger.warn({reason: resolved.left.kind}, 'oauth callback rejected: ingress resolution failed')
       return respondForIngressRejection(c, resolved.left)
     }
     // Binding compares the exact canonical address; only the rate-limit
     // bucket uses the derived accounting key.
-    const sourceKey = resolved.right.canonical
+    const clientAddress = resolved.right.canonical
 
     // Rate limit check — shared with the operator app, keyed on the derived accounting key.
     if (deps.rateLimiter.allow(resolved.right.accountingKey) === false) {
@@ -667,7 +643,7 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
           stateEntry !== undefined &&
           stateEntry.consumed === false &&
           nowMs - stateEntry.issuedAt <= config.stateTtlMs &&
-          (stateEntry.sourceKey === undefined || stateEntry.sourceKey === sourceKey)
+          (stateEntry.boundAddress === undefined || stateEntry.boundAddress === clientAddress)
         ) {
           deps.stateStore.consume(stateParam)
         }
@@ -745,7 +721,7 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
     // bounced attacker gains nothing: they land on a fresh /start with no
     // code, no verifier, and no session — they still need their own
     // allowlisted GitHub account to finish any flow from there.
-    if (stateEntry.sourceKey !== undefined && stateEntry.sourceKey !== sourceKey) {
+    if (stateEntry.boundAddress !== undefined && stateEntry.boundAddress !== clientAddress) {
       // Release the outstanding attempt regardless of outcome (retry or
       // terminate) — this is the part that must not be missed, or the bounce
       // itself reproduces the original outage at a smaller scale.

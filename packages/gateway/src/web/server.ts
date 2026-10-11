@@ -324,7 +324,7 @@ export interface OperatorServerConfig {
    * for which peer addresses may be trusted to supply X-Forwarded-For /
    * X-Forwarded-Host / X-Forwarded-Proto — used by the forwarded-header
    * origin-trust middleware, the health route, and (via the caller wiring
-   * githubOAuth deps and sessionDeps.getSourceKey with the same policy) the
+   * githubOAuth deps and sessionDeps.resolveClientAddress with the same policy) the
    * OAuth and logout routes.
    */
   readonly ingressPolicy: OperatorIngressPolicy
@@ -468,8 +468,9 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   // 3. Unauthenticated accounting-keyed rate limit — applied per-route (not middleware)
   //    to avoid Hono's middleware context type mismatch with getConnInfo.
   //    The rate-limit check is called from each route handler.
-  //    Keyed on the actual TCP socket remote address — NOT X-Forwarded-For,
-  //    which is caller-spoofable. This matches the announce server pattern.
+  //    Keyed on the resolved client's accounting key (via resolveClient): X-Forwarded-For
+  //    is honoured only from configured trusted peers, and trust/binding decisions
+  //    stay on the exact `.canonical` address.
 
   // 4. Forwarded-header origin trust — decided by the ingress policy, not by
   //    whether the forwarded values happen to match the public origin. A
@@ -583,9 +584,9 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
     const raw = extractRawIngressInput(c)
     const resolved = Effect.runSync(Effect.either(resolveClient(raw, config.ingressPolicy)))
 
-    let sourceKey: string
+    let limiterKey: string
     if (resolved._tag === 'Right') {
-      sourceKey = resolved.right.accountingKey
+      limiterKey = resolved.right.accountingKey
     } else if (
       resolved.left.kind === 'missing-forwarded-for' &&
       (c as OpenContext).get(HEADERLESS_HEALTH_PROBE_KEY) === true
@@ -606,13 +607,13 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
         deps.logger.warn({reason: 'socket-invalid'}, 'operator health rejected: ingress resolution failed')
         return unavailableResponse(c)
       }
-      sourceKey = canonicalAddressToString(socketCanonical)
+      limiterKey = canonicalAddressToString(socketCanonical)
     } else {
       deps.logger.warn({reason: resolved.left.kind}, 'operator health rejected: ingress resolution failed')
       return respondForIngressRejection(c, resolved.left)
     }
 
-    if (healthLimiter.allow(sourceKey) === false) {
+    if (healthLimiter.allow(limiterKey) === false) {
       deps.logger.warn({}, 'operator request rate limited (unauthenticated)')
       return rateLimitedResponse(c)
     }
@@ -703,8 +704,8 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   // Logout is always a privileged route protected by session + allowlist + origin + CSRF.
   // Providing sessionStore/sessionDeps without browserGuardDeps is a programming error —
   // a public mutating logout path is a CSRF footgun and is not supported.
-  // Thread the shared rate limiter and socket-derived source key into the logout route
-  // so it participates in the same per-accounting-key budget as the OAuth routes.
+  // Thread the shared rate limiter and the resolveClient-based client resolver into the
+  // logout route so it participates in the same per-accounting-key budget as the OAuth routes.
   if (deps.sessionStore !== undefined && deps.sessionDeps !== undefined) {
     if (browserGuardDeps === undefined) {
       throw new Error(
@@ -717,7 +718,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
     const sessionDepsWithRateLimiter = {
       ...deps.sessionDeps,
       rateLimiter,
-      getSourceKey: (c: Context) => resolveClient(extractRawIngressInput(c), config.ingressPolicy),
+      resolveClientAddress: (c: Context) => resolveClient(extractRawIngressInput(c), config.ingressPolicy),
     }
     buildLogoutRoutes(app, deps.sessionStore, sessionDepsWithRateLimiter, browserGuardDeps)
   }
