@@ -458,7 +458,7 @@ Both images build on `node:<ver>-alpine3.24@sha256:…`, and the workspace runti
 
 #### Reuse guard (baked plugin + managed config)
 
-Gateway runs reject any `task` tool call that carries a non-empty `task_id` before the task executes (see "Background Subagent Ownership Ledger (Gateway)" in `ARCHITECTURE.md` for why). The workspace image bakes two root-owned, read-only files for this:
+Gateway runs reject any `task` tool call that carries a non-empty `task_id` before the task executes (see [Background Subagents and Ownership](../docs/wiki/Background%20Subagents%20and%20Ownership.md#background-subagent-ownership-ledger-gateway) for why). The workspace image bakes two root-owned, read-only files for this:
 
 - `/usr/local/lib/fro-bot/plugins/no-task-reuse.mjs` — an OpenCode server plugin (source: `deploy/plugins/no-task-reuse.mjs`) whose `tool.execute.before` hook throws a fixed error for `tool === 'task'` with a truthy `task_id`. The tool part ends in `error` with that message, the model sees it, and the turn continues.
 - `/etc/opencode/opencode.json` (source: `deploy/managed-config/opencode.json`) — OpenCode's Linux **managed config** layer. It is merged LAST (after the agent's own config, project config and `OPENCODE_CONFIG_CONTENT`) and plugin arrays are concatenated, so nothing written under `/home/opencode` or into a checkout can remove the entry. The OpenCode child's environment is built from a fixed allowlist, so `OPENCODE_PURE` and `OPENCODE_TEST_MANAGED_CONFIG_DIR` cannot reach it.
