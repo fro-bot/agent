@@ -49,7 +49,7 @@ Terminology: the **shim** is the `opencode` entry point, the **passthrough** is 
 
 ### Deferred to Separate Tasks
 
-- A `workspace-smoke` assertion that `/app/node_modules/.bin/opencode` is absent from the images. The guard invariant in Unit 3 covers the cause.
+- A `workspace-smoke` assertion that `/app/node_modules/.bin/opencode` is absent from the images. Unit 3's resolver-default scenario covers the one repo spawn that could reach the shim.
 
 ## Context & Research
 
@@ -62,7 +62,7 @@ Terminology: the **shim** is the `opencode` entry point, the **passthrough** is 
   - the dev PATH fallback, which returns bare `opencode`.
 - `packages/harness/tsdown.config.ts` has the entries `src/cli.ts` and `src/postinstall.ts`. `files` already ships `dist`.
 - `packages/harness/src/postinstall.ts` claims "Using opencode on PATH as fallback" at three sites (lines 35, 52, 69). `resolveBinary` does not do that without an escape hatch.
-- `packages/harness/src/integrate-command.ts` and `packages/harness/src/conflict-resolver.ts` default to bare `opencode` (`packages/harness/harness.config.json`). So does the runtime SDK path (`packages/runtime/src/agent/server.ts` `createOpencode`). None of them reach the shim today, because no workspace package depends on `@fro.bot/harness` and Bun therefore never links its bins.
+- Bare-`opencode` defaults. Bun links workspace bins regardless of dependents, so a checkout with harness `dist/` built has `node_modules/.bin/opencode` → the shim, and bare `opencode` under `bun run` resolves to it. The only bare-`opencode` spawn in repo code was the legacy (non-`--candidate`) integrate conflict resolver. Its literal `opencode` default now resolves through `resolveBinaryNoProbe` (`selectOpenCodeExecutable` in `packages/harness/src/conflict-resolver.ts`). The other callers do not depend on PATH: CI's `harness-integrate` uses `--candidate`, evals use an explicit binary path, and the runtime reaches OpenCode through the SDK API (`packages/runtime/src/agent/server.ts`).
 - `packages/runtime/src/agent/server.ts` `ensureOpenCodeAvailable` and `src/features/agent/server.ts` `verifyOpenCodeAvailable` accept any `opencode` that answers `--version`. The version regex keeps only `x.y.z`.
 - `packages/harness/src/integrate.test.ts`: executable `#!/bin/sh` fixtures. `apps/workspace-agent/src/update-fixtures/pack.test.ts`: real-process group signal tests.
 - Upstream `packages/opencode/src/cli/cmd/tui.ts` uses SIGUSR2 for TUI reload. `src/installation/index.ts` and `src/cli/upgrade.ts` drive `npm i -g opencode-ai` upgrades.
@@ -127,7 +127,7 @@ Terminology: the **shim** is the `opencode` entry point, the **passthrough** is 
 
 - **Separate Node entry point, JS shim only.** There is no native-replace, because mise and Bun skip lifecycle scripts by default. There is no shell-script bin, because it would duplicate module resolution. `process.execve` is not used either: it is experimental, and ENOENT aborts with SIGABRT on Node 24.21.
 - **The bin is declared in source** (`packages/harness/package.json`). The publish step rewrites only `version` and `optionalDependencies`, so `bin` survives (`.github/workflows/harness-release.yaml`). The release workflow does not change.
-- **Dev-shadowing guard.** Bun links a workspace package's bins only when another workspace package depends on it. No workspace package depends on `@fro.bot/harness`, so no checkout, CI job, or image gets a `.bin/opencode` link. That is why the runtime SDK path and `harness integrate`'s bare-`opencode` default are safe. A guard test pins this invariant (Unit 3).
+- **Dev-shadowing guard.** Bun links workspace bins regardless of dependents, so a checkout with harness `dist/` built gets `node_modules/.bin/opencode` → the shim. The guard is therefore in the one spawn that could reach it: the legacy non-`--candidate` integrate conflict resolver's literal `opencode` default resolves through `resolveBinaryNoProbe` (`selectOpenCodeExecutable`), so it spawns an absolute resolved path. CI's `harness-integrate` uses `--candidate`, evals use an explicit binary path, and the runtime goes through the SDK API. Dev users who run bare `opencode` under `bun run` must set `OPENCODE_PATH`.
 - **Spawn mode.** The child is non-detached, uses `stdio: 'inherit'`, and is signalled directly. It stays in the terminal's foreground group, so TTY reads, Ctrl-C, and SIGWINCH behave as they do for stock opencode.
 - **Forward every caught signal.** SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGUSR1, and SIGUSR2 are always forwarded. A signal delivered to the whole foreground group, such as Ctrl-C or a terminal hangup, may reach the child twice. That is accepted and documented, because JS handlers cannot tell PID-directed from group-directed delivery, and dropping PID-directed signals is worse. Listening on SIGUSR1 also stops Node opening its inspector.
 - **Exit propagation lives in the entry point.** The helper only reports how the child ended: an exit code, a signal, or a spawn error. The entry point then acts on it:
@@ -138,16 +138,16 @@ Terminology: the **shim** is the `opencode` entry point, the **passthrough** is 
 - **Spawn failure codes.** ENOENT exits 127 and EACCES exits 126, each with a message. The resolver's executable check must not turn a permission failure into a generic 127. A signal that arrives before the child exists is held and delivered on spawn. If spawn fails, the shim exits immediately.
 - **No-probe resolution** for the shim and the passthrough. Resolution checks only that the platform binary path exists and is executable. The SDK's 5-second start deadline is the binding constraint. Unit 3 measures the built shim's overhead and runs a real SDK start/close.
 - **Self-exec guard by identity.** A candidate is rejected when its realpath, or its `(dev, ino)`, matches either harness entry point. That catches symlinks, hardlinks, and npm/bun `.bin` layouts. When a candidate is not a recognizable native binary (mise shims resolve to the mise executable), the shim fails closed and tells the user to set `OPENCODE_PATH` to the native binary. A copied wrapper can still recurse, and that is documented. There is no env marker, because the binary may legitimately spawn `opencode`.
-- **Action version pin (R6).** `ensureOpenCodeAvailable` reuses an existing binary only when its full `--version` output matches the pinned version, harness suffix included. Otherwise it runs setup. This is a behavior change: a workflow that pre-installed a different OpenCode now gets the pinned build.
-- **Autoupdate is a verified ship gate.** Unit 3 confirms from the pinned upstream source, plus a fixture run, that a harness install leaves autoupdate and `upgrade` without a stock-install path. If it would replace the binary, implementation stops for a decision.
+- **Action version pin (R6).** `ensureOpenCodeAvailable` reuses an existing binary only on an exact match with the pinned version after normalizing `-harness.` → `+harness.`. Non-exact pins (`latest`, ranges, partial versions) never reuse an existing binary. Otherwise it runs setup. This is a behavior change: a workflow that pre-installed a different OpenCode now gets the pinned build.
+- **Autoupdate gate (verified).** A harness install is detected as install method `unknown` (upstream `installation/index.ts`), so autoupdate returns early (`cli/upgrade.ts`), and `opencode upgrade` stops at a default-No prompt. Caveats: `opencode upgrade --method <pm>` installs stock, and a co-installed stock `opencode-ai` under the same package manager is the autoupdate target.
 - **Environment passes through unchanged.** This is the CLI contract, distinct from the Action's `withScrubbedEnv` child policy.
 
 ## Open Questions
 
 ### Resolved During Planning
 
-- Dev shadowing: the bin stays in source, with a clear non-zero exit when no platform package is present. The no-dependency invariant prevents linking today (user decision; guard test in Unit 3).
-- `opencode upgrade`: documented as unsupported, with pure passthrough kept. Autoupdate behavior is verified as a ship gate (user decision).
+- Dev shadowing: the bin stays in source, with a clear non-zero exit when no platform package is present. Bun links the shim into checkouts regardless, so the legacy integrate conflict resolver's bare default resolves through `resolveBinaryNoProbe`, and dev users running bare `opencode` under `bun run` set `OPENCODE_PATH` (user decision; resolver-default scenario in Unit 3).
+- `opencode upgrade`: documented as unsupported, with pure passthrough kept. Autoupdate was verified as a ship gate and leaves the harness build alone (user decision).
 - Probe: skipped in the shim and the passthrough, and kept in `harness doctor` (user decision).
 - Signals: all catchable ones are forwarded, with duplicates accepted (user decision).
 - Self-exec: identity checks, and fail closed on opaque dispatchers (user decision).
@@ -158,7 +158,6 @@ Terminology: the **shim** is the `opencode` entry point, the **passthrough** is 
 
 - Exact helper and option names, and whether no-probe resolution is an option on `resolveBinary` or a sibling export.
 - How the resolver recognizes "native binary" versus "opaque dispatcher". It could check for a non-script executable header, or the absence of a shebang interpreter. Pick the narrowest check that rejects mise shims and accepts the platform binary and test fixtures.
-- The exact version comparison for R6, given what the harness binary and stock OpenCode print for `--version`.
 
 ## High-Level Technical Design
 
@@ -179,7 +178,7 @@ sequenceDiagram
 
 ## Implementation Units
 
-- [ ] **Unit 1: Shared exec helper**
+- [x] **Unit 1: Shared exec helper**
 
 **Goal:** One async helper that runs the resolved binary, forwards signals, and reports how the child ended.
 
@@ -214,7 +213,7 @@ sequenceDiagram
 **Verification:**
 - The scenarios pass on Linux CI. Reverting to `spawnSync` fails the forwarding tests.
 
-- [ ] **Unit 2: No-probe resolution and identity guard**
+- [x] **Unit 2: No-probe resolution and identity guard**
 
 **Goal:** Resolve the patched binary cheaply, never to a harness entry point, and fail closed on opaque dispatchers.
 
@@ -245,7 +244,7 @@ sequenceDiagram
 **Verification:**
 - Resolution never returns bare `opencode`, never returns a harness entry point, and never returns an opaque dispatcher.
 
-- [ ] **Unit 3: Entry points, packaging, and the autoupdate gate**
+- [x] **Unit 3: Entry points, packaging, and the autoupdate gate**
 
 **Goal:** Ship the `opencode` bin, route both entry points through the helper, and prove the built package works.
 
@@ -260,12 +259,15 @@ sequenceDiagram
 - Modify: `packages/harness/package.json`, adding `bin.opencode` → `./dist/opencode.mjs`
 - Modify: `bun.lock`, regenerated for the workspace bin entry
 - Modify: `packages/harness/src/postinstall.ts`, correcting all three fallback messages
-- Test: `packages/harness/src/opencode.test.ts`, `packages/harness/src/package-invariants.test.ts`
+- Modify: `packages/harness/src/conflict-resolver.ts`, so the literal `opencode` default resolves through `resolveBinaryNoProbe` (`selectOpenCodeExecutable`)
+- Create: `packages/harness/src/run-passthrough.ts`, the shared outcome-to-exit mapping used by both entry points
+- Create: `packages/harness/src/shim-test-kit.ts`, shared fixtures for the shim tests
+- Test: `packages/harness/src/opencode.test.ts`, `packages/harness/src/package-invariants.test.ts`, `packages/harness/src/conflict-resolver.test.ts`, `packages/harness/src/opencode-pty.test.ts`, `packages/harness/src/opencode-sdk-smoke.test.ts`, `packages/harness/src/packaging-smoke.test.ts`
 
 **Approach:**
 - `opencode.ts` has a `#!/usr/bin/env node` shebang and no reserved subcommands. It maps the helper outcome to an exit as described in Key Technical Decisions.
 - `harness` keeps its reserved set (`info`, `patches`, `doctor`, `integrate`, `--help`, `--version`) and uses the same outcome mapping.
-- Autoupdate gate: in the pinned upstream source (`src/installation/index.ts`, `src/cli/upgrade.ts`), confirm what install method is detected for a harness global install and what autoupdate does with it. Confirm it with a fixture run. If a stock install would run, stop and report.
+- Autoupdate gate: verified against the pinned upstream source (`src/installation/index.ts`, `src/cli/upgrade.ts`); see Key Technical Decisions for the result and its caveats.
 
 **Test scenarios:**
 - Happy path: the `opencode` entry with `OPENCODE_PATH` set to an argv-echo fixture passes `--version`, `info`, `doctor`, and `upgrade` through unchanged.
@@ -275,17 +277,17 @@ sequenceDiagram
 - Edge case: a child that dies by SIGPIPE makes the shim exit `128 + SIGPIPE`, using the platform constant.
 - Error path: with no platform package and no override, the `opencode` entry exits non-zero with remediation and no stock fallback.
 - Package invariant: `bin` has exactly `harness` and `opencode`, and the tsdown entries include `src/opencode.ts`.
-- Package invariant: no workspace package depends on `@fro.bot/harness`. This is the dev-shadowing guard.
-- Packaging smoke (mandatory, not skippable): after build, `npm pack` the package. In isolated prefixes, install it with npm, with bun, and with mise `npm:`, with lifecycle scripts disabled. With a fixture platform binary or `OPENCODE_PATH`, `opencode --version` reaches the fixture.
+- Resolver default (dev-shadowing guard): the integrate conflict resolver's bare `opencode` default spawns the absolute resolved path. An explicit override is honored as given. When resolution fails, the resolver reports a remediation error and creates no scratch dirs.
+- Packaging smoke: after build, `npm pack` the package. In isolated prefixes, install it with npm and with bun, with lifecycle scripts disabled. With a fixture platform binary or `OPENCODE_PATH`, `opencode --version` reaches the fixture. The mise `npm:` install is a manual check, since it is registry-only; it is recorded as an `it.todo`.
 - SDK smoke: `createOpencode` against a PATH whose `opencode` is the built shim, pointing at a fixture `serve`, starts within the SDK deadline. `close()` leaves no child. Record the shim's startup overhead.
 
 **Verification:**
 - The harness package's typecheck, lint, tests, and build pass.
-- The packaging and SDK smoke tests pass on Linux CI.
+- The packaging and SDK smoke tests pass on Linux CI. The mise `npm:` smoke is manual.
 - Darwin is verified manually with the same smoke script, with the result recorded in the PR.
 - The autoupdate gate result is recorded.
 
-- [ ] **Unit 4: Action pins the OpenCode version it reuses**
+- [x] **Unit 4: Action pins the OpenCode version it reuses**
 
 **Goal:** The Action reuses an existing `opencode` only at the pinned version.
 
@@ -296,23 +298,25 @@ sequenceDiagram
 **Files:**
 - Modify: `packages/runtime/src/agent/server.ts` (`ensureOpenCodeAvailable`)
 - Modify: `src/features/agent/server.ts` (`verifyOpenCodeAvailable` returns the full version string)
+- Modify: `src/services/setup/runtime-setup-adapter.ts`, where the production `--version` parse lives
 - Modify: `dist/` (rebuilt; committed per the repo's dist invariant)
-- Test: `packages/runtime/src/agent/server.test.ts`, `src/features/agent/opencode.test.ts`
+- Test: `packages/runtime/src/agent/server.test.ts`, `src/features/agent/opencode.test.ts`, `src/services/setup/runtime-setup-adapter.test.ts`, `src/main.test.ts` (its fixture pins `opencode-version` to the fake's version)
 
 **Approach:**
 - `verifyOpenCodeAvailable` reports the full trimmed version line.
-- `ensureOpenCodeAvailable` treats an existing binary as available only on an exact match with the pinned version. A mismatch logs both values and runs setup.
+- `ensureOpenCodeAvailable` treats an existing binary as available only on an exact match with the pinned version after normalizing `-harness.` → `+harness.`. Non-exact pins (`latest`, ranges, partial versions) never reuse an existing binary. A mismatch logs both values and runs setup.
 
 **Test scenarios:**
 - Happy path: an existing `OPENCODE_PATH` binary reporting the pinned version is reused, and no setup runs.
 - Edge case: a PATH `opencode` reporting a different version (a stock build or an older harness) triggers setup, logs both versions, and sets `OPENCODE_PATH` to the downloaded binary.
 - Edge case: an existing binary whose version output cannot be parsed triggers setup.
+- Edge case: a `-harness.` pin matches an existing binary reporting the `+harness.` form, and a non-exact pin (`latest`, a range, a partial version) never reuses an existing binary.
 - Error path: when setup fails after a mismatch, the existing failure path stays unchanged.
 
 **Verification:**
 - Root typecheck, lint, tests, and build pass, and `dist/` is rebuilt with no stray diff.
 
-- [ ] **Unit 5: Docs**
+- [x] **Unit 5: Docs**
 
 **Goal:** Document the new command, its caveats, and the Action's version pin.
 
@@ -352,7 +356,7 @@ sequenceDiagram
 - **Unchanged invariants:**
   - The workspace image spawns `/usr/local/bin/opencode` by absolute path with a fixed PATH.
   - The gateway image spawns no OpenCode.
-  - No workspace package depends on `@fro.bot/harness`, so no image, checkout, or CI job links `.bin/opencode`.
+  - Bun links the shim as `node_modules/.bin/opencode` in any checkout with harness `dist/` built. The only repo spawn that could reach it is the legacy integrate conflict resolver, which resolves its default through `resolveBinaryNoProbe`. Dev users running bare `opencode` under `bun run` set `OPENCODE_PATH`.
   - Evals locate `harness` and the platform package directly.
   - The `bin` map survives `harness-release.yaml`'s package rewrite.
 - **Error propagation:** Resolution failures exit non-zero with remediation. Spawn failures exit 127 or 126. Child signal deaths re-raise or map to `128+n`. A SIGKILL to the shim, or an uncaught shim exception, cannot be forwarded; this is documented.
@@ -363,7 +367,7 @@ sequenceDiagram
 | Risk | Mitigation |
 |------|------------|
 | npm global install fails with EEXIST when `opencode-ai` is installed | Documented. mise installs are per tool. |
-| Autoupdate or `upgrade` replaces the harness build with stock | Verified as a ship gate in Unit 3. Implementation stops if the replacement path exists. |
+| Autoupdate or `upgrade` replaces the harness build with stock | Verified: a harness install is detected as method `unknown`. Residual: `--method <pm>` installs stock, and a co-installed `opencode-ai` is the autoupdate target. |
 | Duplicate signal delivery on Ctrl-C or hangup | Accepted and documented. The PTY test bounds it to at most two deliveries. |
 | A copied wrapper on PATH recurses | Identity guard plus fail-closed dispatcher rejection. Residual risk is documented. |
 | Unit 4 changes Action behavior for pre-installed OpenCode | Version mismatch logs both values and downloads the pinned build. Release notes call it out. |
