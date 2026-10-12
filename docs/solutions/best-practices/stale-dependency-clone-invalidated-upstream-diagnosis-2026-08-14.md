@@ -35,7 +35,7 @@ Treat a pinned clone as authoritative for exactly one thing: what the currently 
 
 > Both are pinned to the `base_version` in `packages/harness/harness.config.json`, so what you read is what the harness ships. Re-pin them when that base moves — a source check against a stale clone can be confidently wrong.
 
-Before concluding that upstream has not addressed something, check upstream's commit log on its actual default branch. For `anomalyco/opencode` that is `dev`, not `main` — a `main`-oriented check sees nothing even when the fix has landed.
+Before concluding that upstream has not addressed something, check upstream's commit log on its actual default branch. For `anomalyco/opencode` that was `dev`, not `main` — a `main`-oriented check sees nothing even when the fix has landed. Since 2026-10-10 `dev` carries OpenCode 2 and the v1 line the harness ships lives on `v1`, so check `origin/v1` for fixes to the pinned base.
 
 ## Why This Matters
 
@@ -66,7 +66,7 @@ gh search issues --repo anomalyco/opencode "session not responding"
 Direct, against the branch that actually receives fixes:
 
 ```sh
-git -C <clone> log --oneline origin/dev -- packages/opencode/src/session/
+git -C <clone> log --oneline origin/v1 -- packages/opencode/src/session/   # origin/dev before 2026-10-10
 git merge-base --is-ancestor <commit> <tag> && echo "contained in tag"
 ```
 
