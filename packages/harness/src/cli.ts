@@ -7,15 +7,16 @@
  *   --version / --help: harness-own (prints provenance / usage)
  *   Everything else: passed through to the resolved patched binary.
  *
- * This is the ONLY entry point for the @fro.bot/harness package.
+ * This is the entry point for the `harness` command. The `opencode` command is the separate, subcommand-free
+ * shim in opencode.ts.
  * No classes; functions only; explicit boolean checks; no as-any.
  */
 
-import {spawnSync} from 'node:child_process'
 import process from 'node:process'
 import {cmdIntegrate} from './integrate-command.js'
 import {formatProvenance, getProvenance} from './provenance.js'
 import {probeBinary, resolveBinary} from './resolve-binary.js'
+import {runPassthrough} from './run-passthrough.js'
 import {buildHarnessVersion} from './version.js'
 
 function printUsage(): void {
@@ -122,27 +123,12 @@ function cmdDoctor(): number {
   return 0
 }
 
-function cmdPassthrough(args: readonly string[]): number {
-  let binary
-  try {
-    binary = resolveBinary()
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error)
-    console.error(`[harness] ${msg}`)
-    return 1
-  }
-
-  const result = spawnSync(binary.path, [...args], {
-    stdio: 'inherit',
-    env: process.env,
-  })
-
-  if (result.error !== undefined) {
-    console.error(`[harness] Failed to spawn ${binary.path}: ${result.error.message}`)
-    return 1
-  }
-
-  return result.status ?? 1
+/**
+ * Passthrough shares the `opencode` shim's no-probe resolution, signal forwarding and exit propagation.
+ * It exits the process itself, so it never resolves to a value.
+ */
+async function cmdPassthrough(args: readonly string[]): Promise<void> {
+  await runPassthrough({label: 'harness', args})
 }
 
 async function main(): Promise<void> {
@@ -185,8 +171,7 @@ async function main(): Promise<void> {
 
   // Anything not in the reserved set passes through.
   // This includes no-args (which opencode handles as its own help/default).
-  const code = cmdPassthrough(args)
-  process.exit(code)
+  await cmdPassthrough(args)
 }
 
 main().catch(error => {
