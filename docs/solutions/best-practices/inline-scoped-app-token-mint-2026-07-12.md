@@ -38,7 +38,7 @@ The shipped pattern is a checklist, not just a single trick:
 - **Key scoped to the mint step's env only**, never job-level — apply `core.setSecret` immediately on reading the key, before any parsing touches it.
 - **Constant-class error messages**: never interpolate a caught error, the PEM contents, or an API response body into a thrown error or log line.
 - **All-or-nothing echo validation on both axes**: validate the response's `permissions` (the requested set plus the implied `metadata: read` grant every installation token carries — see the companion doc, `docs/solutions/logic-errors/app-token-echo-includes-implied-metadata-read-2026-07-12.md`) and the response's `repository` (exactly the intended repository, nothing broader).
-- **Mint as late as possible**: run checkout and setup steps on the default `GITHUB_TOKEN` (`contents: read` is sufficient for those), so the minted token's short TTL is spent on the actual work, not idle earlier in the job.
+- **Mint as late as possible, but before any untrusted step**: run checkout and setup on the default `GITHUB_TOKEN` (`contents: read` is enough for those), so the minted token's short TTL goes on the actual work rather than sitting idle. The mint still has to come before the agent step, so no step after the agent ever receives the App key. See `same-job-phase-split-not-a-security-boundary-2026-07-04.md`, "Mint before the agent, not after".
 - **Fail closed**: any mint failure stops the job before the untrusted step runs. There is no durable fallback token to fall back to.
 - **Zero new dependencies**: an RS256 App JWT is roughly 15 lines of `node:crypto` — no new library is warranted for this.
 
@@ -46,7 +46,7 @@ Reference implementation: `scripts/harness/mint-app-token.ts`, covered by 36 uni
 
 ## Why This Matters
 
-A durable PAT reaching a prompt-injectable step is a standing liability: if that step is compromised or manipulated, the blast radius is whatever the PAT can do, for as long as it's valid — which in practice is indefinitely. A minted token bounds both dimensions: scope (exactly `contents: write` on one repository) and lifetime (~1 hour). The residual risk is real but smaller and clearly named: the minted token is never handed to the untrusted step, but the App **key** used to mint it still carries the App's full installed scope — the key is used before the model step and no later step receives it, but a dedicated, minimally-scoped App (rather than reusing a broader existing App) is the natural follow-up (tracked as issue #1180).
+A durable PAT reaching a prompt-injectable step is a standing liability: if that step is compromised or manipulated, the blast radius is whatever the PAT can do, for as long as it's valid — which in practice is indefinitely. A minted token bounds both dimensions: scope (exactly `contents: write` on one repository) and lifetime (~1 hour). The residual risk is real but smaller and clearly named: the minted token is never handed to the untrusted step, but the App **key** used to mint it still carries the App's full installed scope — the key is used before the model step and no later step receives it, Issue #1180 originally proposed a dedicated, minimally-scoped App as the follow-up. It was closed by #1792 with a smaller fix: the mint step moved ahead of the agent step, so no step after the agent receives the key.
 
 ## When to Apply
 
