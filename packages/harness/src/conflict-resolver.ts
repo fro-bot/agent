@@ -20,6 +20,8 @@ import path from 'node:path'
 import process from 'node:process'
 import {promisify} from 'node:util'
 import {formatPipelineError} from './format-error.js'
+import {resolveBinaryNoProbe, type ResolveNoProbeResult} from './resolve-binary.js'
+import {harnessEntryPoints} from './run-passthrough.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -119,6 +121,27 @@ export interface ConflictResolverOptions {
   readonly removeAttempt?: (attemptRoot: string) => Promise<void>
   readonly modelTimeoutMs?: number
   readonly logger?: ConflictResolverLogger
+  /** Test seam: how the patched binary is located when the request's `opencodeBin` is the bare default. */
+  readonly resolveDefaultOpenCode?: () => ResolveNoProbeResult
+}
+
+/** The configured `opencodeBin` value that means "the patched binary", not "whatever `opencode` is on PATH". */
+const DEFAULT_OPENCODE_BIN = 'opencode'
+
+/**
+ * Pick the executable for the model turn. The bare default `opencode` is never spawned by name: PATH may hold the
+ * harness shim (workspace `.bin` under `bun run`) or a stock build. It resolves to the patched binary instead
+ * (OPENCODE_PATH, else the platform package), or fails with the resolver's remediation message. Any other value —
+ * an explicit path from `opencode_bin` — is used exactly as given.
+ */
+export function selectOpenCodeExecutable(
+  configured: string,
+  resolveDefault: () => ResolveNoProbeResult = () => resolveBinaryNoProbe({entryPoints: harnessEntryPoints()}),
+): {readonly ok: true; readonly path: string} | {readonly ok: false; readonly error: string} {
+  if (configured !== DEFAULT_OPENCODE_BIN) return {ok: true, path: configured}
+  const resolved = resolveDefault()
+  if (resolved.ok === true) return {ok: true, path: resolved.path}
+  return {ok: false, error: `cannot locate the patched opencode binary for conflict resolution: ${resolved.message}`}
 }
 
 export interface ConflictResolverDiagnostics {
@@ -726,6 +749,14 @@ export async function resolveConflict(
     return failure(0, 'short-lived broker model auth JSON is required', [])
   }
 
+  // A caller-supplied model runner never spawns the binary, so only the real path needs it located.
+  let executable = request.opencodeBin
+  if (options.runModel === undefined) {
+    const selected = selectOpenCodeExecutable(request.opencodeBin, options.resolveDefaultOpenCode)
+    if (selected.ok === false) return failure(0, selected.error, [])
+    executable = selected.path
+  }
+
   const logger = options.logger ?? silentLogger
   const removeAttempt =
     options.removeAttempt ?? (async (attemptRoot: string) => fs.rm(attemptRoot, {recursive: true, force: true}))
@@ -766,7 +797,7 @@ export async function resolveConflict(
       }
       const modelOutcome =
         options.runModel === undefined
-          ? await runOpenCodeModel(turn, attemptRequest, timeoutMs)
+          ? await runOpenCodeModel(turn, {...attemptRequest, opencodeBin: executable}, timeoutMs)
           : await options.runModel(turn)
       contextRequests = normalizeContextRequests([
         ...(modelOutcome?.contextRequests ?? []),
