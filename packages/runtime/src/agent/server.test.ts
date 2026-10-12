@@ -1155,6 +1155,52 @@ describe('ensureOpenCodeAvailable', () => {
   })
 
   it.each([
+    ['a v-prefixed harness release-tag pin', 'v1.18.29-harness.88b6b5fb', PINNED_VERSION],
+    ['a v-prefixed harness plus-form pin', 'v1.18.29+harness.88b6b5fb', PINNED_VERSION],
+    ['a v-prefixed stock pin', 'v1.18.29', '1.18.29'],
+  ])('reuses an existing binary for %s without running setup', async (_label, pin, reported) => {
+    // #given the installer accepts a leading `v`, and the binary reports the bare version
+    const logger = createMockLogger()
+    const setupAdapter = {
+      verifyOpenCodeAvailable: vi.fn(async () => ({available: true, version: reported})),
+      runSetup: vi.fn(async () => null),
+      addToPath: vi.fn(),
+    }
+
+    // #when
+    const result = await ensureOpenCodeAvailable({...createEnsureOptions(logger), opencodeVersion: pin}, setupAdapter)
+
+    // #then it is the same build, so it is reused
+    expect(setupAdapter.runSetup).not.toHaveBeenCalled()
+    expect(result.didSetup).toBe(false)
+  })
+
+  it.each([
+    ['vlatest', PINNED_VERSION],
+    ['v1.18', '1.18.29'],
+    ['latest', '1.18.29'],
+  ])('still runs setup for the non-exact pin %s', async (pin, reported) => {
+    // #given a non-exact selector, which no binary ever prints
+    const logger = createMockLogger()
+    const setupAdapter = {
+      verifyOpenCodeAvailable: vi.fn(async () => ({available: true, version: reported})),
+      runSetup: vi.fn(async () => ({
+        opencodePath: INSTALL_DIR,
+        opencodeBinaryPath: INSTALL_BINARY,
+        opencodeVersion: PINNED_VERSION,
+      })),
+      addToPath: vi.fn(),
+    }
+
+    // #when
+    const result = await ensureOpenCodeAvailable({...createEnsureOptions(logger), opencodeVersion: pin}, setupAdapter)
+
+    // #then the pinned download runs
+    expect(setupAdapter.runSetup).toHaveBeenCalledTimes(1)
+    expect(result.didSetup).toBe(true)
+  })
+
+  it.each([
     ['stock opencode of the same base version', '1.18.29'],
     ['an older harness build', '1.18.20+harness.deadbeef'],
     ['a different harness commit on the same base', '1.18.29+harness.00000000'],

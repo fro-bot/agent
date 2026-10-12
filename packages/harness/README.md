@@ -87,7 +87,7 @@ The shim runs the binary as a direct child with inherited stdio and stays in you
 
 - **Signals:** `SIGINT`, `SIGTERM`, `SIGHUP`, `SIGQUIT`, `SIGUSR1`, and `SIGUSR2` are forwarded to the child. A signal sent to the whole foreground group, such as Ctrl-C or a terminal hangup, may therefore reach the child twice.
 - **Cases that cannot be forwarded:** `SIGKILL` sent to the shim, or an uncaught error inside it, can leave the server running.
-- **Hangup protection does not carry through the shim:** Node resets inherited signal ignores at startup, so `nohup opencode serve` and `trap '' HUP` do not protect a server that runs through the shim. To keep a server alive across a hangup, run the native binary directly: set `OPENCODE_PATH` to it, or use the platform package's `bin/opencode`.
+- **Hangup protection does not carry through the shim:** Node resets inherited signal ignores at startup, so `nohup opencode serve` and `trap '' HUP` do not protect a server that runs through the shim. To keep a server alive across a hangup, invoke the native binary directly, not through the shim: `nohup "$OPENCODE_PATH" serve` with `OPENCODE_PATH` set to the native binary, or the platform package's `bin/opencode`. (Setting `OPENCODE_PATH` alone still launches it through the shim.)
 
 Exit codes:
 

@@ -322,6 +322,49 @@ describe.skipIf(process.platform === 'win32')('execBinary', () => {
       for (const signal of FORWARDED_SIGNALS) expect(host.listenerCount(signal)).toBe(0)
     })
 
+    it('keeps supervising the child when forwarding a signal fails, repeatedly', async () => {
+      // #given a child whose kill() fails with EPERM (reported as an 'error' event) for every forwarded signal
+      const host = new EventEmitter()
+      let realKill: ChildProcess['kill'] | undefined
+      let spawnedChild: ChildProcess | undefined
+      const outcomePromise = execBinary(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+        signalHost: host,
+        spawnFn: (command, args, options) => {
+          const child = spawn(command, [...args], options)
+          spawnedChild = child
+          realKill = child.kill.bind(child)
+          child.kill = () => {
+            child.emit('error', Object.assign(new Error('kill EPERM'), {code: 'EPERM'}))
+            return false
+          }
+          return child
+        },
+      })
+      let settled = false
+      const tracked = outcomePromise.then(outcome => {
+        settled = true
+        return outcome
+      })
+
+      try {
+        // #when two signals are forwarded and each forward fails (an unhandled 'error' would throw from emit)
+        host.emit('SIGTERM')
+        host.emit('SIGTERM')
+        await new Promise<void>(resolve => setTimeout(resolve, 100))
+
+        // #then supervision continues: the promise is still pending and the listeners are still installed
+        expect(settled).toBe(false)
+        expect(host.listenerCount('SIGTERM')).toBe(1)
+      } finally {
+        // The test (not the helper) ends the real child, and the helper reports that real exit.
+        realKill?.('SIGKILL')
+      }
+      const outcome = await tracked
+      expect(outcome).toEqual({kind: 'signaled', signal: 'SIGKILL'})
+      for (const signal of FORWARDED_SIGNALS) expect(host.listenerCount(signal)).toBe(0)
+      expect(spawnedChild?.listenerCount('error')).toBe(0)
+    })
+
     it('holds a signal emitted before the child exists and delivers it after spawn', async () => {
       // #given a host that emits SIGTERM while spawn is in flight
       const host = new EventEmitter()

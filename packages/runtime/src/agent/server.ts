@@ -506,11 +506,17 @@ export interface EnsureOpenCodeOptions {
  *
  * The harness binary self-reports `<base>+harness.<sha>` (`packages/harness/scripts/verify-binary.ts`
  * pins that exactly), while the Action's setup also accepts the equivalent `<base>-harness.<sha>`
- * release-tag spelling as `opencode-version`. Only that one spelling difference is folded; everything
- * else (including `latest` and ranges, which no binary ever prints) compares as-is, so those never match.
+ * release-tag spelling as `opencode-version`. The installer also accepts a leading `v` (`v1.18.34`,
+ * `v1.18.34-harness.<sha>`; see `assertValidVersion` and `buildDownloadUrl` in services/setup/opencode.ts),
+ * and no binary prints one. Only those two spelling differences are folded -- a single `v` that precedes a
+ * digit, and `-harness.` vs `+harness.`. Everything else (including `latest`, `vlatest`, and partial versions,
+ * which no binary ever prints) compares as-is, so those never match.
  */
 function canonicalOpenCodeVersion(version: string): string {
-  return version.trim().replace(/^(\d+\.\d+\.\d+)-harness\./, '$1+harness.')
+  return version
+    .trim()
+    .replace(/^v(?=\d)/, '')
+    .replace(/^(\d+\.\d+\.\d+)-harness\./, '$1+harness.')
 }
 
 export async function ensureOpenCodeAvailable(

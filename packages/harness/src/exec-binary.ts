@@ -86,9 +86,11 @@ export async function execBinary(
 
   return new Promise<ExecOutcome>(resolve => {
     let settled = false
+    let detachErrorHandler = (): void => {}
     const settle = (outcome: ExecOutcome): void => {
       if (settled) return
       settled = true
+      detachErrorHandler()
       removeListeners()
       resolve(outcome)
     }
@@ -102,10 +104,16 @@ export async function execBinary(
     }
     child = spawned
 
-    spawned.once('error', error => {
-      // 'error' also fires for failed kill()/IPC on a live child; only a child that never started ends here.
+    // 'error' also fires for a failed kill() (for example EPERM on a forwarded signal) or IPC on a LIVE child. Those
+    // must neither end supervision nor go unhandled -- an 'error' with no listener throws -- so the handler stays
+    // attached until the outcome settles, and only a child that never started is treated as a spawn failure.
+    const onError = (error: Error): void => {
       if (spawned.pid === undefined) settle(toSpawnError(error))
-    })
+    }
+    spawned.on('error', onError)
+    detachErrorHandler = () => {
+      spawned.off('error', onError)
+    }
     spawned.once('exit', (code, signal) => {
       settle(outcomeFromExit(code, signal))
     })
