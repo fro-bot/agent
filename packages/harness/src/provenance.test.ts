@@ -206,6 +206,20 @@ describe('formatProvenance integration commit row', () => {
   })
 })
 
+describe('formatProvenance with an empty carry', () => {
+  it('shows the raw SHA, not a fro-bot/agent link, when there are no integration refs', () => {
+    // #given — the commit is the stock upstream tag tip, never pushed to fro-bot/agent
+    const p: Provenance = {...builtProvenance, integrationRefs: []}
+
+    // #when
+    const output = formatProvenance(p)
+
+    // #then
+    expect(output).toContain(`  integration commit: ${FIXTURE_SHA}`)
+    expect(output).not.toContain('github.com/fro-bot/agent')
+  })
+})
+
 describe('formatVersionLine', () => {
   it('appends the full integration SHA after build', () => {
     // #given / #when

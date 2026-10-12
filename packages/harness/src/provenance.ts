@@ -125,6 +125,17 @@ export function integrationCommitUrl(sha: string): string {
 }
 
 /**
+ * Returns how `info` and `patches` display the integration commit, or null when there is none.
+ * Only a commit carried on top of integration refs was pushed to `refs/harness-integrate/*` in
+ * fro-bot/agent, so only then does it link there. With no refs the commit is the stock upstream
+ * tag's tip, which lives in the upstream repository and is shown as the raw SHA.
+ */
+function displayIntegrationCommit(p: Provenance): string | null {
+  if (p.integrationCommit === null) return null
+  return p.integrationRefs.length > 0 ? integrationCommitUrl(p.integrationCommit) : p.integrationCommit
+}
+
+/**
  * Formats the one-line `harness --version` output.
  */
 export function formatVersionLine(p: Provenance): string {
@@ -138,7 +149,7 @@ export function formatProvenance(p: Provenance): string {
   const lines: string[] = [
     `harness (patched OpenCode)`,
     `  base:               ${p.baseVersion}`,
-    `  integration commit: ${p.integrationCommit === null ? '(unbuilt/dev scaffold)' : integrationCommitUrl(p.integrationCommit)}`,
+    `  integration commit: ${displayIntegrationCommit(p) ?? '(unbuilt/dev scaffold)'}`,
     `  build sha:          ${p.buildSha}`,
   ]
   if (p.integrationRefs.length > 0) {
@@ -171,8 +182,9 @@ export function formatPatches(p: Provenance): string {
       lines.push(`    reason: ${r.reason}`)
     }
   }
-  if (p.integrationCommit !== null) {
-    lines.push(`\nFrozen integration commit: ${integrationCommitUrl(p.integrationCommit)}`)
+  const commit = displayIntegrationCommit(p)
+  if (commit !== null) {
+    lines.push(`\nFrozen integration commit: ${commit}`)
   }
   return lines.join('\n')
 }
