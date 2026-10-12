@@ -1,7 +1,7 @@
 ---
 type: convention
-last-updated: "2026-09-20"
-updated-by: "schedule-d7190410-35540552880"
+last-updated: "2026-10-11"
+updated-by: "18890129"
 sources:
   - AGENTS.md
   - src/harness/outcome.ts
@@ -19,6 +19,10 @@ sources:
   - src/services/github/context.ts
   - src/services/github/types.ts
   - src/features/triggers/router.ts
+  - vitest.config.ts
+  - scripts/vitest-home-isolation.ts
+  - scripts/vitest-home-isolation.setup.ts
+  - scripts/vitest-incomplete-run-reporter.ts
 summary: "Coding conventions, architectural patterns, and anti-patterns enforced across the project"
 ---
 
@@ -112,7 +116,7 @@ The rule carries one named exception, and naming it explicitly is the point — 
 
 ## Veto, Not Certificate
 
-A recurring distinction in the harness's safety logic is worth stating on its own, because it shapes several unrelated gates: a known defect may *veto* an action, but the absence of that defect does not *certify* the action is safe. The invocation-outcome assessment gates reversible certificates (the dedup marker, the success reaction) on the full verification picture, while irreversible ones (a brokered push, a formal review approval) are gated on a narrower "known execution veto" — an observation gap or unresolved background ownership. Reading a passing veto check as proof of correctness is precisely the inversion the comments in those modules guard against. The related habit shows up in the ownership ledger, where an `unknown` state is never collapsed into `settled`: not knowing is a reason to keep waiting, not a reason to proceed. See [[Background Subagents and Ownership]].
+A recurring distinction in the harness's safety logic is worth stating on its own, because it shapes several unrelated gates: a known defect may _veto_ an action, but the absence of that defect does not _certify_ the action is safe. The invocation-outcome assessment gates reversible certificates (the dedup marker, the success reaction) on the full verification picture, while irreversible ones (a brokered push, a formal review approval) are gated on a narrower "known execution veto" — an observation gap or unresolved background ownership. Reading a passing veto check as proof of correctness is precisely the inversion the comments in those modules guard against. The related habit shows up in the ownership ledger, where an `unknown` state is never collapsed into `settled`: not knowing is a reason to keep waiting, not a reason to proceed. See [[Background Subagents and Ownership]].
 
 ## Defaulting on Unset or Empty
 
@@ -131,6 +135,10 @@ Test files use BDD-style comments to structure assertions:
 ```
 
 External dependencies (`@actions/core`, `@actions/github`, `@opencode-ai/sdk`) are mocked with `vi.mock()`. Internal modules are not mocked — tests exercise real code paths through the layer below.
+
+The root `vitest.config.ts` supplies a setup file before each test file imports application modules. `scripts/vitest-home-isolation.ts` redirects HOME and the XDG config, data, state, and cache paths into a disposable temporary tree, so tests that exercise default path resolution do not touch a developer's OpenCode history or credentials. It verifies that `os.homedir()` follows the override and fails rather than running unisolated; live evals (`FRO_BOT_EVAL=1`) opt out because their runner manages its own sandbox and needs real provider authentication.
+
+The same shared configuration installs an incomplete-run reporter (`scripts/vitest-incomplete-run-reporter.ts`). A worker crash can leave discovered tests with no result even when the completed tests passed. The reporter makes that missing coverage fail the run rather than allowing a partial result to appear green.
 
 One directory sits outside this convention. `deploy/scripts/` is plain Node ESM (`.mjs`) tested with the built-in `node --test` runner: it is not a workspace package, has no build step, and is exercised in CI by a dedicated smoke job. The split is deliberate — deployment scripts run on hosts where the monorepo's toolchain may not exist, so they are kept dependency-free rather than folded into Vitest.
 
@@ -155,18 +163,11 @@ Solved problems are written up under `docs/solutions/`, organized by category, e
 
 The project uses conventional commits: `type(scope): description`. Types include `feat`, `fix`, `docs`, `refactor`, `test`, `build`, `ci`, `chore`. The scope indicates the module or area affected.
 
-## Anti-Patterns
+## Boundary-Preserving Patterns
 
-The following are explicitly forbidden:
+The conventions above preserve a few recurring boundaries: typed normalization separates external webhook payloads from business logic, injected loggers keep credential redaction on the output path, and non-force ref updates avoid replacing another writer's work. Type suppressions and hidden global context would weaken the evidence these boundaries provide, which explains their absence from the project's normal implementation style.
 
-- **Type suppression** — `as any`, `@ts-ignore`, `@ts-expect-error` are never used.
-- **Raw event access** — Always use `NormalizedEvent`; never read `context.payload`.
-- **Global context** — Never use `github.context` directly; always go through `parseGitHubContext()`.
-- **Console.log** — Use the injected logger with redaction.
-- **Force push** — Always `force: false` on ref updates.
-- **Blocking on UX** — Reactions and labels are secondary; API failures for them must not halt execution.
-- **Multiple comments** — The response protocol requires exactly one comment or review per invocation.
-- **Classes** — Functions only, project-wide.
+User-facing acknowledgment is deliberately secondary to execution. Reactions and labels can fail without stopping the agent, whereas response delivery has its own explicit success contract. The operational rules are maintained in `AGENTS.md`; these patterns explain the architectural reasons behind them.
 
 ## Response Protocol
 

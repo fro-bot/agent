@@ -1,4 +1,5 @@
 import type {ConflictModelTurn, ConflictResolutionRequest, ConflictResolverResult} from './conflict-resolver.js'
+import type {ResolveNoProbeResult} from './resolve-binary.js'
 import {Buffer} from 'node:buffer'
 import {execFileSync} from 'node:child_process'
 import crypto from 'node:crypto'
@@ -6,7 +7,7 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import {buildConflictResolverConfig, resolveConflict} from './conflict-resolver.js'
+import {buildConflictResolverConfig, resolveConflict, selectOpenCodeExecutable} from './conflict-resolver.js'
 
 interface ConflictRepository {
   readonly workDir: string
@@ -523,6 +524,67 @@ describe('resolveConflict', {timeout: REAL_GIT_TEST_TIMEOUT_MS}, () => {
     )
   })
 
+  it('spawns the absolute path from the no-probe resolver when opencodeBin is the bare default', async () => {
+    // #given the bare default `opencode`, and a resolver that locates a (script) binary by absolute path
+    if (repo === undefined) throw new Error('test repository was not created')
+    const script = await writeExecutableScript(
+      "import fs from 'node:fs'\nimport path from 'node:path'\nfs.writeFileSync(path.join(process.cwd(), 'conflict.txt'), 'resolved binary ran\\n')",
+    )
+    const resolveDefaultOpenCode = vi.fn((): ResolveNoProbeResult => ({
+      ok: true,
+      path: script,
+      source: 'platform-package',
+      isBuilt: true,
+    }))
+
+    // #when the resolver runs the real model subprocess
+    const result = await resolveConflict(makeRequest(repo, {opencodeBin: 'opencode'}), {resolveDefaultOpenCode})
+
+    // #then it ran the resolved absolute path (a bare `opencode` spawn could never have produced this repair)
+    expect(resolveDefaultOpenCode).toHaveBeenCalled()
+    expect(result.ok).toBe(true)
+    expect(await fs.readFile(path.join(repo.workDir, 'conflict.txt'), 'utf8')).toBe('resolved binary ran\n')
+  })
+
+  it('honours an explicit opencodeBin without consulting the resolver', async () => {
+    // #given an explicit script path in opencodeBin
+    if (repo === undefined) throw new Error('test repository was not created')
+    const script = await writeExecutableScript(
+      "import fs from 'node:fs'\nimport path from 'node:path'\nfs.writeFileSync(path.join(process.cwd(), 'conflict.txt'), 'explicit binary ran\\n')",
+    )
+    const resolveDefaultOpenCode = vi.fn((): ResolveNoProbeResult => ({
+      ok: false,
+      kind: 'not-found',
+      message: 'must not be consulted',
+    }))
+
+    // #when
+    const result = await resolveConflict(makeRequest(repo, {opencodeBin: script}), {resolveDefaultOpenCode})
+
+    // #then the explicit value ran and the resolver was never asked
+    expect(result.ok).toBe(true)
+    expect(resolveDefaultOpenCode).not.toHaveBeenCalled()
+    expect(await fs.readFile(path.join(repo.workDir, 'conflict.txt'), 'utf8')).toBe('explicit binary ran\n')
+  })
+
+  it('fails with the resolver remediation, before any scratch work, when the default cannot be resolved', async () => {
+    // #given the bare default and a resolver that fails closed
+    if (repo === undefined) throw new Error('test repository was not created')
+    const message = 'Platform binary not found.\n  Remediation: set OPENCODE_PATH to the native harness opencode binary'
+
+    // #when
+    const result = await resolveConflict(makeRequest(repo, {opencodeBin: 'opencode'}), {
+      resolveDefaultOpenCode: () => ({ok: false, kind: 'not-found', message}),
+    })
+
+    // #then the integrate failure carries the remediation, and no attempt scratch was created
+    if (result.ok) throw new Error('an unresolvable binary must fail the resolver')
+    expect(result.error).toContain('cannot locate the patched opencode binary')
+    expect(result.error).toContain('set OPENCODE_PATH to the native harness opencode binary')
+    expect(result.attempts).toBe(0)
+    expect(await fs.readdir(repo.runnerTempDir)).toEqual([])
+  })
+
   it('proves the real subprocess receives private broker auth/config without denied credentials', async () => {
     // #given
     if (repo === undefined) throw new Error('test repository was not created')
@@ -634,4 +696,39 @@ describe('resolveConflict', {timeout: REAL_GIT_TEST_TIMEOUT_MS}, () => {
       expect(result.ok).toBe(true)
     },
   )
+})
+
+describe('selectOpenCodeExecutable', () => {
+  it('returns an explicit path unchanged and never calls the resolver', () => {
+    // #given / #when
+    const resolveDefault = vi.fn((): ResolveNoProbeResult => ({ok: false, kind: 'not-found', message: 'unused'}))
+    const selected = selectOpenCodeExecutable('/opt/custom/opencode', resolveDefault)
+
+    // #then
+    expect(selected).toEqual({ok: true, path: '/opt/custom/opencode'})
+    expect(resolveDefault).not.toHaveBeenCalled()
+  })
+
+  it('treats the literal default as "use the resolved patched binary"', () => {
+    // #given / #when
+    const selected = selectOpenCodeExecutable('opencode', () => ({
+      ok: true,
+      path: '/abs/harness-darwin-arm64/bin/opencode',
+      source: 'platform-package',
+      isBuilt: true,
+    }))
+
+    // #then it is the absolute resolver path, never the bare name
+    expect(selected).toEqual({ok: true, path: '/abs/harness-darwin-arm64/bin/opencode'})
+  })
+
+  it('surfaces the resolver message when the default cannot be resolved', () => {
+    // #given / #when
+    const selected = selectOpenCodeExecutable('opencode', () => ({ok: false, kind: 'self-reference', message: 'loop!'}))
+
+    // #then
+    expect(selected.ok).toBe(false)
+    if (selected.ok) throw new Error('expected a failure')
+    expect(selected.error).toContain('loop!')
+  })
 })

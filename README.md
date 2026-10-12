@@ -196,7 +196,7 @@ A few inputs most workflows touch:
 | `enable-omo-slim` | No | `false` | Enable OMO Slim orchestration (mutually exclusive with `enable-omo`) |
 | `model` | No | — | Model override in `provider/model` format |
 | `timeout` | No | `1800000` | OpenCode execution timeout in milliseconds; Action-internal only, not the job timeout (`0` = no Action-internal deadline) |
-| `opencode-version` | No | Source-pinned | OpenCode CLI version to install |
+| `opencode-version` | No | Source-pinned | OpenCode CLI version to install. An existing opencode is reused only when it reports exactly this version (the `-harness.` and `+harness.` spellings are equivalent); otherwise the pinned build is installed. |
 | `omo-version` | No | Source-pinned | oMo version to install |
 | `systematic-version` | No | Source-pinned | Systematic plugin version to register |
 | `skip-cache` | No | `false` | Skip session cache restore |
