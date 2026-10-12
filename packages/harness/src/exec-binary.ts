@@ -142,7 +142,8 @@ function toSpawnError(error: unknown): ExecOutcome {
  *
  * - exit code → that code
  * - SIGINT/SIGTERM/SIGHUP/SIGQUIT → re-raise on self (after the caller removes its own listeners)
- * - any other signal → `128 + signal number` (Node ignores or handles these itself, so re-raising would not kill us)
+ * - any other signal → `128 + signal number` (re-raising SIGPIPE or SIGUSR1 would not end the process, since Node
+ *   ignores SIGPIPE and SIGUSR1 starts the inspector; the remaining signals use the same mapping for one rule)
  * - neither code nor signal → 1
  * - spawn error: ENOENT → 127, EACCES → 126, otherwise 1
  */
