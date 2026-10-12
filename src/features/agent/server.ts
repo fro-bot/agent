@@ -23,7 +23,9 @@ export async function verifyOpenCodeAvailable(
       },
       silent: true,
     })
-    const versionMatch = /(\d+\.\d+\.\d+)/.exec(version)
+    // Full version token including any prerelease/build suffix (e.g. `1.18.34+harness.6546eb64`): the
+    // caller compares it for exact equality with the pinned version, so a bare x.y.z would not do.
+    const versionMatch = /(\d+\.\d+\.\d+(?:-[\w.-]+)?(?:\+[\w.-]+)?)/.exec(version)
     const parsedVersion: string | null = versionMatch?.[1] ?? null
     logger.debug('OpenCode version verified', {version: parsedVersion})
     return {available: true, version: parsedVersion}

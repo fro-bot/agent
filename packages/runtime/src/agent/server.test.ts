@@ -24,11 +24,12 @@ const WORKSPACE_PATH = '/workspace/repo'
 
 const INSTALL_DIR = '/opt/hostedtoolcache/opencode/1.18.29-harness.88b6b5fb/x64'
 const INSTALL_BINARY = `${INSTALL_DIR}/opencode`
+const PINNED_VERSION = '1.18.29+harness.88b6b5fb'
 
 function createEnsureOptions(logger: Logger) {
   return {
     logger,
-    opencodeVersion: '1.18.29+harness.88b6b5fb',
+    opencodeVersion: PINNED_VERSION,
     githubToken: 'ghs_test',
     authJson: '{}',
     enableOmo: false,
@@ -1112,6 +1113,167 @@ describe('ensureOpenCodeAvailable', () => {
     expect(secondAdapter.runSetup).not.toHaveBeenCalled()
     expect(result.path).toBe(INSTALL_BINARY)
     expect(result.didSetup).toBe(false)
+  })
+
+  it('reuses an OPENCODE_PATH binary that reports the pinned version and runs no setup', async () => {
+    // #given an operator-supplied binary reporting exactly the pinned harness version
+    const logger = createMockLogger()
+    process.env.OPENCODE_PATH = '/usr/local/bin/my-opencode'
+    const setupAdapter = {
+      verifyOpenCodeAvailable: vi.fn(async () => ({available: true, version: PINNED_VERSION})),
+      runSetup: vi.fn(async () => null),
+      addToPath: vi.fn(),
+    }
+
+    // #when availability is checked
+    const result = await ensureOpenCodeAvailable(createEnsureOptions(logger), setupAdapter)
+
+    // #then it is reused as-is
+    expect(setupAdapter.runSetup).not.toHaveBeenCalled()
+    expect(result).toEqual({path: '/usr/local/bin/my-opencode', version: PINNED_VERSION, didSetup: false})
+    expect(process.env.OPENCODE_PATH).toBe('/usr/local/bin/my-opencode')
+  })
+
+  it('treats the hyphen release-tag spelling of the pin as equal to the binary-reported plus form', async () => {
+    // #given a pin written as the release tag (`-harness.`) and a binary that self-reports `+harness.`
+    const logger = createMockLogger()
+    const setupAdapter = {
+      verifyOpenCodeAvailable: vi.fn(async () => ({available: true, version: PINNED_VERSION})),
+      runSetup: vi.fn(async () => null),
+      addToPath: vi.fn(),
+    }
+
+    // #when
+    const result = await ensureOpenCodeAvailable(
+      {...createEnsureOptions(logger), opencodeVersion: '1.18.29-harness.88b6b5fb'},
+      setupAdapter,
+    )
+
+    // #then it is the same build, so it is reused
+    expect(setupAdapter.runSetup).not.toHaveBeenCalled()
+    expect(result.didSetup).toBe(false)
+  })
+
+  it.each([
+    ['stock opencode of the same base version', '1.18.29'],
+    ['an older harness build', '1.18.20+harness.deadbeef'],
+    ['a different harness commit on the same base', '1.18.29+harness.00000000'],
+  ])('runs setup when a PATH opencode is %s', async (_label, foundVersion) => {
+    // #given no OPENCODE_PATH, a PATH opencode reporting a non-pinned version, and a working setup
+    const logger = createMockLogger()
+    const addToPath = vi.fn()
+    const setupAdapter = {
+      verifyOpenCodeAvailable: vi.fn(async () => ({available: true, version: foundVersion})),
+      runSetup: vi.fn(async () => ({
+        opencodePath: INSTALL_DIR,
+        opencodeBinaryPath: INSTALL_BINARY,
+        opencodeVersion: PINNED_VERSION,
+      })),
+      addToPath,
+    }
+
+    // #when
+    const result = await ensureOpenCodeAvailable(createEnsureOptions(logger), setupAdapter)
+
+    // #then both versions are logged, the pinned build is downloaded, and OPENCODE_PATH points at it
+    expect(logger.info).toHaveBeenCalledWith(
+      'Existing OpenCode does not match the pinned version, running auto-setup',
+      expect.objectContaining({foundVersion, requestedVersion: PINNED_VERSION, source: 'PATH'}),
+    )
+    expect(setupAdapter.runSetup).toHaveBeenCalledTimes(1)
+    expect(addToPath).toHaveBeenCalledWith(INSTALL_DIR)
+    expect(process.env.OPENCODE_PATH).toBe(INSTALL_BINARY)
+    expect(result).toEqual({path: INSTALL_BINARY, version: PINNED_VERSION, didSetup: true})
+  })
+
+  it('warns and replaces an OPENCODE_PATH binary that reports a different version', async () => {
+    // #given an explicit OPENCODE_PATH to a non-pinned build
+    const logger = createMockLogger()
+    process.env.OPENCODE_PATH = '/usr/local/bin/stock-opencode'
+    const setupAdapter = {
+      verifyOpenCodeAvailable: vi.fn(async () => ({available: true, version: '1.18.29'})),
+      runSetup: vi.fn(async () => ({
+        opencodePath: INSTALL_DIR,
+        opencodeBinaryPath: INSTALL_BINARY,
+        opencodeVersion: PINNED_VERSION,
+      })),
+      addToPath: vi.fn(),
+    }
+
+    // #when
+    const result = await ensureOpenCodeAvailable(createEnsureOptions(logger), setupAdapter)
+
+    // #then the operator override is replaced and the mismatch is loud
+    expect(logger.warning).toHaveBeenCalledWith(
+      'Existing OpenCode does not match the pinned version, running auto-setup',
+      expect.objectContaining({foundVersion: '1.18.29', requestedVersion: PINNED_VERSION, source: 'OPENCODE_PATH'}),
+    )
+    expect(process.env.OPENCODE_PATH).toBe(INSTALL_BINARY)
+    expect(result.didSetup).toBe(true)
+  })
+
+  it('runs setup when an existing binary answers but its version cannot be parsed', async () => {
+    // #given a binary that exits 0 but prints nothing parseable (version: null)
+    const logger = createMockLogger()
+    const setupAdapter = {
+      verifyOpenCodeAvailable: vi.fn(async () => ({available: true, version: null})),
+      runSetup: vi.fn(async () => ({
+        opencodePath: INSTALL_DIR,
+        opencodeBinaryPath: INSTALL_BINARY,
+        opencodeVersion: PINNED_VERSION,
+      })),
+      addToPath: vi.fn(),
+    }
+
+    // #when
+    const result = await ensureOpenCodeAvailable(createEnsureOptions(logger), setupAdapter)
+
+    // #then it is not trusted
+    expect(setupAdapter.runSetup).toHaveBeenCalledTimes(1)
+    expect(result.didSetup).toBe(true)
+  })
+
+  it.each(['latest', '^1.18.0', '1.18'])(
+    'never reuses an existing binary when the requested version is %s',
+    async requested => {
+      // #given a non-exact request and a binary that reports a concrete version
+      const logger = createMockLogger()
+      const setupAdapter = {
+        verifyOpenCodeAvailable: vi.fn(async () => ({available: true, version: PINNED_VERSION})),
+        runSetup: vi.fn(async () => ({
+          opencodePath: INSTALL_DIR,
+          opencodeBinaryPath: INSTALL_BINARY,
+          opencodeVersion: PINNED_VERSION,
+        })),
+        addToPath: vi.fn(),
+      }
+
+      // #when
+      const result = await ensureOpenCodeAvailable(
+        {...createEnsureOptions(logger), opencodeVersion: requested},
+        setupAdapter,
+      )
+
+      // #then setup resolves the request; there is no exact match to reuse
+      expect(setupAdapter.runSetup).toHaveBeenCalledTimes(1)
+      expect(result.didSetup).toBe(true)
+    },
+  )
+
+  it('keeps the existing failure path when setup returns null after a mismatch', async () => {
+    // #given a mismatching binary and a setup that fails
+    const logger = createMockLogger()
+    const setupAdapter = {
+      verifyOpenCodeAvailable: vi.fn(async () => ({available: true, version: '1.18.29'})),
+      runSetup: vi.fn(async () => null),
+      addToPath: vi.fn(),
+    }
+
+    // #when / #then it throws exactly as it does when nothing was found
+    await expect(ensureOpenCodeAvailable(createEnsureOptions(logger), setupAdapter)).rejects.toThrow(
+      'Auto-setup failed: runSetup returned null',
+    )
+    expect(process.env.OPENCODE_PATH).toBeUndefined()
   })
 })
 

@@ -1622,6 +1622,27 @@ describe('verifyOpenCodeAvailable', () => {
     expect(mockLogger.debug).toHaveBeenCalledWith('OpenCode not available, will attempt auto-setup')
   })
 
+  it.each([
+    ['1.18.34+harness.6546eb64\n', '1.18.34+harness.6546eb64'],
+    ['opencode version 1.18.34+harness.6546eb64\n', '1.18.34+harness.6546eb64'],
+    ['1.2.3-rc.1\n', '1.2.3-rc.1'],
+    ['1.18.34\n', '1.18.34'],
+  ])('reports the full version token including any suffix for %j', async (output, expected) => {
+    // #given
+    vi.mocked(exec.exec).mockImplementation(async (_cmd, _args, options) => {
+      if (options?.listeners?.stdout != null) {
+        options.listeners.stdout(Buffer.from(output))
+      }
+      return 0
+    })
+
+    // #when
+    const result = await verifyOpenCodeAvailable(null, mockLogger)
+
+    // #then the caller can compare it for exact equality with a pinned version
+    expect(result).toEqual({available: true, version: expected})
+  })
+
   it('returns version=null when version not parseable', async () => {
     // #given
     vi.mocked(exec.exec).mockImplementation(async (_cmd, _args, options) => {
