@@ -55,7 +55,7 @@ Both commands share the name `opencode` with the stock `opencode-ai` package, so
 
 In order:
 
-1. **`OPENCODE_PATH`** — an explicit path. It must be the native binary, not a script or a dispatcher such as a mise shim.
+1. **`OPENCODE_PATH`** — an explicit, **absolute** path to the native binary, not a script or a dispatcher such as a mise shim. A bare or relative value is resolved against the current directory and is never looked up on `PATH`.
 2. **The platform package** — `@fro.bot/harness-<os>-<arch>`, resolved from the installed harness.
 3. **`HARNESS_ALLOW_PATH_FALLBACK=1`** — searches `PATH` for a native `opencode`. For development only.
 
@@ -65,7 +65,7 @@ Resolution never runs the binary to check it. Candidates are rejected rather tha
 - not executable;
 - one of the harness's own entry points, which would recurse forever. This check compares real paths and inodes, so symlinks and hardlinks to the shim are caught. A copy of the shim is a different file and is not recognized as one.
 
-`harness doctor` is the exception: it runs the binary with `--version` and compares it with the expected build.
+`harness doctor` is the exception: it runs the binary with `--version` and compares it with the expected build. It also prints the binary the `opencode` command will run (`opencode command:`) and exits non-zero if that resolution fails, even when the probe passed.
 
 ## Upgrading
 

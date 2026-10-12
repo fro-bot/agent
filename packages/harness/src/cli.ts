@@ -15,8 +15,8 @@
 import process from 'node:process'
 import {cmdIntegrate} from './integrate-command.js'
 import {formatProvenance, getProvenance} from './provenance.js'
-import {probeBinary, resolveBinary} from './resolve-binary.js'
-import {runPassthrough} from './run-passthrough.js'
+import {probeBinary, resolveBinary, resolveBinaryNoProbe} from './resolve-binary.js'
+import {harnessEntryPoints, runPassthrough} from './run-passthrough.js'
 import {buildHarnessVersion} from './version.js'
 
 function printUsage(): void {
@@ -67,7 +67,34 @@ function cmdPatches(): void {
   }
 }
 
+/**
+ * What the `opencode` command and the `harness` passthrough will actually run. Resolved the way they resolve it
+ * (no probe, absolute paths only, never a harness entry point), which can differ from the probing check: a bare
+ * `OPENCODE_PATH=opencode` is spawned through PATH by the probe but is a not-found for the shim.
+ * Returns true when the shim would run a binary.
+ */
+function reportShimResolution(): boolean {
+  const resolved = resolveBinaryNoProbe({entryPoints: harnessEntryPoints()})
+  if (resolved.ok) {
+    console.log(`  opencode command:   ${resolved.path} (source: ${resolved.source})`)
+    return true
+  }
+  console.error(`\n[FAIL] The opencode command would not run (${resolved.kind}):`)
+  // Continuation lines of the message already carry two spaces; align them under the first line's indent.
+  console.error(`       ${resolved.message.replaceAll('\n', '\n     ')}`)
+  return false
+}
+
 function cmdDoctor(): number {
+  const probeCode = cmdDoctorProbe()
+  const shimOk = reportShimResolution()
+  if (probeCode !== 0) return probeCode
+  if (!shimOk) return 1
+  console.log('\n[OK] Binary is present and runnable.')
+  return 0
+}
+
+function cmdDoctorProbe(): number {
   let binary
   try {
     binary = resolveBinary()
@@ -119,7 +146,6 @@ function cmdDoctor(): number {
     return 1
   }
 
-  console.log('\n[OK] Binary is present and runnable.')
   return 0
 }
 

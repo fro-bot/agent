@@ -244,6 +244,55 @@ describe('harness passthrough', () => {
   })
 })
 
+describe('harness doctor reports the binary the opencode command will run', () => {
+  it('prints the absolute path and source for an absolute native OPENCODE_PATH, and exits 0', async () => {
+    // #given an absolute native fixture that answers --version
+    // #when doctor runs
+    const doctor = start(staged.cliEntry, ['doctor'], {OPENCODE_PATH: fixture})
+    const exit = await withTimeout('doctor exit', doctor.exited)
+
+    // #then it names the exact file the shim will exec, with its source
+    expect(exit).toEqual({code: 0, signal: null})
+    expect(doctor.stdout()).toContain(`  opencode command:   ${fixture} (source: override)`)
+    expect(doctor.stdout()).toContain('[OK] Binary is present and runnable.')
+  })
+
+  it('fails when a bare OPENCODE_PATH passes the probe through PATH but the shim cannot resolve it', async () => {
+    // #given OPENCODE_PATH=opencode, with a native `opencode` on PATH so the probe succeeds
+    const pathDir = path.join(root, 'doctor-path-bin')
+    mkdirSync(pathDir, {recursive: true})
+    copyFileSync(fixture, path.join(pathDir, 'opencode'))
+
+    // #when doctor runs
+    const doctor = start(staged.cliEntry, ['doctor'], {
+      OPENCODE_PATH: 'opencode',
+      PATH: `${pathDir}${path.delimiter}${process.env.PATH ?? ''}`,
+    })
+    const exit = await withTimeout('doctor exit', doctor.exited)
+
+    // #then the probe line is still reported, but the shim's not-found makes doctor fail
+    expect(exit.code).not.toBe(0)
+    expect(doctor.stdout()).toContain('binary version:')
+    expect(doctor.stderr()).toContain('[FAIL] The opencode command would not run (not-found)')
+    expect(doctor.stderr()).toContain('must be an absolute path to the native binary')
+    expect(doctor.stdout()).not.toContain('[OK]')
+  })
+
+  it('reports self-reference and fails for an OPENCODE_PATH symlink to the shim', async () => {
+    // #given OPENCODE_PATH pointing at the shim through a symlink
+    const link = path.join(root, 'doctor-opencode-link')
+    symlinkSync(staged.opencodeEntry, link)
+
+    // #when doctor runs
+    const doctor = start(staged.cliEntry, ['doctor'], {OPENCODE_PATH: link})
+    const exit = await withTimeout('doctor exit', doctor.exited)
+
+    // #then the shim resolution is reported as a self-reference
+    expect(exit.code).not.toBe(0)
+    expect(doctor.stderr()).toContain('The opencode command would not run (self-reference)')
+  })
+})
+
 describe('opencode shim: signals', () => {
   it('forwards SIGTERM to the child; the child dies by SIGTERM and so does the shim', async () => {
     // #given the shim running a serve fixture with default signal dispositions (the SDK `proc.kill()` path)

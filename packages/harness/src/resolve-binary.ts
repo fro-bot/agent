@@ -374,7 +374,11 @@ function checkExplicitCandidate(
       ok: false,
       kind: 'not-found',
       candidate,
-      message: `${label} ${candidate} does not exist.\n  Remediation: ${REMEDIATION_HINT}.`,
+      message:
+        `${label} ${candidate} does not exist.\n` +
+        `  ${label} must be an absolute path to the native binary; a bare or relative value is resolved against the ` +
+        `current directory, never looked up on PATH.\n` +
+        `  Remediation: ${REMEDIATION_HINT}.`,
     }
   }
   if (state.state === 'not-file') {

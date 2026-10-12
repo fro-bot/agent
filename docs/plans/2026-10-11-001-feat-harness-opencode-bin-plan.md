@@ -254,7 +254,7 @@ sequenceDiagram
 
 **Files:**
 - Create: `packages/harness/src/opencode.ts`
-- Modify: `packages/harness/src/cli.ts`, so that `cmdPassthrough` uses the helper and no-probe resolution
+- Modify: `packages/harness/src/cli.ts`, so that `cmdPassthrough` uses the helper and no-probe resolution; `harness doctor` also reports the binary the shim will run (`opencode command:`) and fails when that resolution fails
 - Modify: `packages/harness/tsdown.config.ts`, adding the entry
 - Modify: `packages/harness/package.json`, adding `bin.opencode` → `./dist/opencode.mjs`
 - Modify: `bun.lock`, regenerated for the workspace bin entry
@@ -297,13 +297,12 @@ sequenceDiagram
 
 **Files:**
 - Modify: `packages/runtime/src/agent/server.ts` (`ensureOpenCodeAvailable`)
-- Modify: `src/features/agent/server.ts` (`verifyOpenCodeAvailable` returns the full version string)
-- Modify: `src/services/setup/runtime-setup-adapter.ts`, where the production `--version` parse lives
+- Modify: `src/services/setup/runtime-setup-adapter.ts`, where the production `--version` parse lives (the unused `src/features/agent/server.ts` copy was removed in the review fix round)
 - Modify: `dist/` (rebuilt; committed per the repo's dist invariant)
 - Test: `packages/runtime/src/agent/server.test.ts`, `src/features/agent/opencode.test.ts`, `src/services/setup/runtime-setup-adapter.test.ts`, `src/main.test.ts` (its fixture pins `opencode-version` to the fake's version)
 
 **Approach:**
-- `verifyOpenCodeAvailable` reports the full trimmed version line.
+- The adapter's `verifyOpenCodeAvailable` returns the extracted full version token (including any `-`/`+` suffix), not a bare `x.y.z`.
 - `ensureOpenCodeAvailable` treats an existing binary as available only on an exact match with the pinned version after normalizing `-harness.` → `+harness.`. Non-exact pins (`latest`, ranges, partial versions) never reuse an existing binary. A mismatch logs both values and runs setup.
 
 **Test scenarios:**
