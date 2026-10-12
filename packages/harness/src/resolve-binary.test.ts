@@ -250,6 +250,32 @@ describe('resolveBinaryNoProbe: OPENCODE_PATH', () => {
     expectFailure(result, 'not-found')
   })
 
+  // Root ignores directory modes, so the EACCES this relies on cannot happen there.
+  it.skipIf(process.getuid?.() === 0)(
+    'reports not-executable (not not-found) with the errno when the path cannot be inspected',
+    () => {
+      // #given an override under a directory with mode 0000, so stat fails with EACCES rather than ENOENT
+      const locked = mkdir('locked')
+      const candidate = fakeNative(path.join(locked, 'opencode'))
+      fs.chmodSync(locked, 0o000)
+
+      try {
+        // #when
+        const result = resolveBinaryNoProbe({
+          entryPoints: [shim, cli],
+          env: {OPENCODE_PATH: candidate},
+          locatePlatformPackage: () => null,
+        })
+
+        // #then it is a permission problem that names the real error, not a missing file
+        const message = expectFailure(result, 'not-executable')
+        expect(message).toContain('EACCES')
+      } finally {
+        fs.chmodSync(locked, 0o755)
+      }
+    },
+  )
+
   it('reports not-executable for a directory override', () => {
     // #given OPENCODE_PATH pointing at a directory (tool-cache dir regression)
     const dir = mkdir('a-directory')

@@ -55,7 +55,7 @@ Both commands share the name `opencode` with the stock `opencode-ai` package, so
 
 In order:
 
-1. **`OPENCODE_PATH`** — an explicit, **absolute** path to the native binary, not a script or a dispatcher such as a mise shim. A bare or relative value is resolved against the current directory and is never looked up on `PATH`.
+1. **`OPENCODE_PATH`** — an explicit path to the native binary (an absolute path is recommended), not a script or a dispatcher such as a mise shim. A bare or relative value resolves against the current directory and is never looked up on `PATH`.
 2. **The platform package** — `@fro.bot/harness-<os>-<arch>`, resolved from the installed harness.
 3. **`HARNESS_ALLOW_PATH_FALLBACK=1`** — searches `PATH` for a native `opencode`. For development only.
 

@@ -264,17 +264,22 @@ describe('harness doctor reports the binary the opencode command will run', () =
     copyFileSync(fixture, path.join(pathDir, 'opencode'))
 
     // #when doctor runs
-    const doctor = start(staged.cliEntry, ['doctor'], {
-      OPENCODE_PATH: 'opencode',
-      PATH: `${pathDir}${path.delimiter}${process.env.PATH ?? ''}`,
-    })
+    const emptyCwd = path.join(root, 'doctor-empty-cwd')
+    mkdirSync(emptyCwd, {recursive: true})
+    const doctor = start(
+      staged.cliEntry,
+      ['doctor'],
+      {OPENCODE_PATH: 'opencode', PATH: `${pathDir}${path.delimiter}${process.env.PATH ?? ''}`},
+      emptyCwd,
+    )
     const exit = await withTimeout('doctor exit', doctor.exited)
 
     // #then the probe line is still reported, but the shim's not-found makes doctor fail
     expect(exit.code).not.toBe(0)
     expect(doctor.stdout()).toContain('binary version:')
     expect(doctor.stderr()).toContain('[FAIL] The opencode command would not run (not-found)')
-    expect(doctor.stderr()).toContain('must be an absolute path to the native binary')
+    expect(doctor.stderr()).toContain('never looked up on PATH')
+    expect(doctor.stderr()).toContain('an absolute path to the native binary is recommended')
     expect(doctor.stdout()).not.toContain('[OK]')
   })
 
@@ -290,6 +295,7 @@ describe('harness doctor reports the binary the opencode command will run', () =
     // #then the shim resolution is reported as a self-reference
     expect(exit.code).not.toBe(0)
     expect(doctor.stderr()).toContain('The opencode command would not run (self-reference)')
+    expect(doctor.stdout()).not.toContain('[OK]')
   })
 })
 

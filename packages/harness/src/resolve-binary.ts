@@ -236,23 +236,36 @@ const REMEDIATION_HINT = 'set OPENCODE_PATH to the native harness opencode binar
 
 type CandidateState =
   | {readonly state: 'missing'}
+  /** The path exists but could not be examined (for example EACCES on a parent directory). `code` is the errno. */
+  | {readonly state: 'unreadable'; readonly code: string}
   | {readonly state: 'not-file'}
   | {readonly state: 'ok'; readonly stat: fs.Stats; readonly real: string}
+
+/** Only these mean "there is no such file"; anything else (EACCES, ELOOP, …) is a different problem. */
+function isAbsentError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code
+  return code === 'ENOENT' || code === 'ENOTDIR'
+}
+
+function errnoOf(error: unknown): string {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code
+  return typeof code === 'string' ? code : 'UNKNOWN'
+}
 
 function inspectCandidate(candidate: string): CandidateState {
   let stat: fs.Stats
   try {
     stat = fs.statSync(candidate)
-  } catch {
-    return {state: 'missing'}
+  } catch (error) {
+    return isAbsentError(error) ? {state: 'missing'} : {state: 'unreadable', code: errnoOf(error)}
   }
   if (stat.isFile() === false) {
     return {state: 'not-file'}
   }
   try {
     return {state: 'ok', stat, real: fs.realpathSync(candidate)}
-  } catch {
-    return {state: 'missing'}
+  } catch (error) {
+    return isAbsentError(error) ? {state: 'missing'} : {state: 'unreadable', code: errnoOf(error)}
   }
 }
 
@@ -348,13 +361,14 @@ function opaqueFailure(candidate: string, label: string): ResolveNoProbeResult {
   }
 }
 
-function notExecutableFailure(candidate: string, label: string): ResolveNoProbeResult {
+function notExecutableFailure(candidate: string, label: string, errorCode?: string): ResolveNoProbeResult {
+  const detail = errorCode === undefined ? '' : ` Could not inspect it: ${errorCode}.`
   return {
     ok: false,
     kind: 'not-executable',
     candidate,
     message:
-      `${label} ${candidate} is not an executable file (permission denied or not a regular file).\n` +
+      `${label} ${candidate} is not an executable file (permission denied or not a regular file).${detail}\n` +
       `  Remediation: fix the file mode (chmod +x) or reinstall the package.`,
   }
 }
@@ -376,10 +390,13 @@ function checkExplicitCandidate(
       candidate,
       message:
         `${label} ${candidate} does not exist.\n` +
-        `  ${label} must be an absolute path to the native binary; a bare or relative value is resolved against the ` +
-        `current directory, never looked up on PATH.\n` +
+        `  A bare or relative ${label} value resolves against the current directory and is never looked up on PATH; ` +
+        `an absolute path to the native binary is recommended.\n` +
         `  Remediation: ${REMEDIATION_HINT}.`,
     }
+  }
+  if (state.state === 'unreadable') {
+    return notExecutableFailure(candidate, label, state.code)
   }
   if (state.state === 'not-file') {
     return notExecutableFailure(candidate, label)
@@ -458,6 +475,9 @@ export function resolveBinaryNoProbe(options: ResolveNoProbeOptions): ResolveNoP
         return notExecutableFailure(binaryPath, 'Platform binary')
       }
       return {ok: true, path: binaryPath, source: 'platform-package', isBuilt: true}
+    }
+    if (state.state === 'unreadable') {
+      return notExecutableFailure(binaryPath, 'Platform binary', state.code)
     }
     if (state.state === 'not-file') {
       return notExecutableFailure(binaryPath, 'Platform binary')
