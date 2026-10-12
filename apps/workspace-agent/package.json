@@ -10,13 +10,13 @@
     "dev": "node --watch dist/main.mjs",
     "fix": "bunx eslint --fix src",
     "lint": "bunx eslint src",
-    "test": "bunx vitest run --passWithNoTests src"
+    "test": "bunx vitest run --config ../../vitest.config.ts --passWithNoTests src"
   },
   "dependencies": {
     "@hono/node-server": "2.1.4",
     "hono": "4.13.13"
   },
   "devDependencies": {
-    "vitest": "4.1.11"
+    "vitest": "5.0.3"
   }
 }

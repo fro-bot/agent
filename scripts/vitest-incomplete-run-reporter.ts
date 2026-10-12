@@ -7,7 +7,7 @@
  * path, a single fragile mechanism. This reporter acts on the collected-vs-reported mismatch directly:
  * it names every module/test with no result and forces a non-zero exit code.
  *
- * Reporter API relied on (vitest 4.1.x): `onTestRunEnd(testModules, unhandledErrors, reason)`,
+ * Reporter API relied on (vitest 5.x): `onTestRunEnd(testModules, unhandledErrors, reason)`,
  * `TestModule.state()` / `.relativeModuleId` / `.children.allTests()`, `TestCase.result().state` /
  * `.fullName`. Reporters run after Vitest sets its own exit code and nothing resets it afterward.
  */

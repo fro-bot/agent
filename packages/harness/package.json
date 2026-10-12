@@ -31,7 +31,7 @@
     "fix": "bunx eslint --fix src scripts",
     "lint": "bunx eslint src scripts",
     "postinstall": "node dist/postinstall.mjs || true",
-    "test": "bunx vitest run --passWithNoTests src scripts"
+    "test": "bunx vitest run --config ../../vitest.config.ts --passWithNoTests src scripts"
   },
   "engines": {
     "node": ">=24"
