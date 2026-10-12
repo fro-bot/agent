@@ -55,27 +55,45 @@ function locatePlatformPackageRoot(packageName: string): string | null {
   }
 }
 
+/** Where the host-platform binary would live, and which package is expected to provide it. */
+interface PlatformBinaryLookup {
+  /** The `@fro.bot/harness-<os>-<arch>` package name, or a placeholder when the host is unsupported. */
+  readonly expectedPackage: string
+  /** Absolute binary path inside the installed platform package; null when unsupported or not installed. */
+  readonly binaryPath: string | null
+}
+
+/**
+ * The one chain both resolvers use: host platform → installed package root → `bin/opencode` path, plus the package
+ * name to cite in remediation. It only computes paths; callers decide how far to trust the file.
+ */
+function lookupPlatformBinary(
+  locate: (packageName: string) => string | null = locatePlatformPackageRoot,
+): PlatformBinaryLookup {
+  const platformResult = getHostPlatformInfo()
+  if (!platformResult.ok) {
+    // Unsupported platform — no platform binary available.
+    return {expectedPackage: '@fro.bot/harness-<os>-<arch>', binaryPath: null}
+  }
+  const info = platformResult.info
+  const root = locate(info.packageName)
+  return {
+    expectedPackage: info.packageName,
+    binaryPath: root === null ? null : binaryPathInPackage(root, info),
+  }
+}
+
 /**
  * Attempts to resolve the host-platform binary from the installed
  * @fro.bot/harness-<os>-<arch> optionalDependencies package.
  *
- * Returns the binary path if found and executable, or null otherwise.
+ * Returns the binary path if found and runnable (`--version` probe), or null otherwise.
  */
-function resolveOptionalDepBinary(): string | null {
-  const platformResult = getHostPlatformInfo()
-  if (!platformResult.ok) {
-    // Unsupported platform — no platform binary available.
+function resolveOptionalDepBinary(locate: ((packageName: string) => string | null) | undefined): string | null {
+  const {binaryPath} = lookupPlatformBinary(locate)
+  if (binaryPath === null) {
     return null
   }
-
-  const info = platformResult.info
-
-  const platformPkgRoot = locatePlatformPackageRoot(info.packageName)
-  if (platformPkgRoot === null) {
-    return null
-  }
-
-  const binaryPath = binaryPathInPackage(platformPkgRoot, info)
 
   // Basic executable probe — confirm the binary runs before returning it.
   try {
@@ -100,11 +118,15 @@ function resolveOptionalDepBinary(): string | null {
  *   - HARNESS_ALLOW_PATH_FALLBACK=1  — explicit opt-in for dev/CI without platform binary.
  *   - OPENCODE_PATH set              — explicit override already provided; PATH fallback is moot.
  */
-function isDevEscapeHatchActive(): boolean {
-  return (
-    process.env.HARNESS_ALLOW_PATH_FALLBACK === '1' ||
-    (process.env.OPENCODE_PATH !== undefined && process.env.OPENCODE_PATH.length > 0)
-  )
+function isDevEscapeHatchActive(env: Readonly<Record<string, string | undefined>>): boolean {
+  return env.HARNESS_ALLOW_PATH_FALLBACK === '1' || (env.OPENCODE_PATH !== undefined && env.OPENCODE_PATH.length > 0)
+}
+
+export interface ResolveBinaryOptions {
+  /** Environment to read OPENCODE_PATH and HARNESS_ALLOW_PATH_FALLBACK from. Defaults to process.env. */
+  readonly env?: Readonly<Record<string, string | undefined>>
+  /** Test seam: locate the installed platform package root. Defaults to Node module resolution. */
+  readonly locatePlatformPackage?: (packageName: string) => string | null
 }
 
 /**
@@ -118,15 +140,17 @@ function isDevEscapeHatchActive(): boolean {
  *
  * @throws {Error} when no platform binary is found and no dev escape hatch is active.
  */
-export function resolveBinary(): ResolvedBinary {
+export function resolveBinary(options: ResolveBinaryOptions = {}): ResolvedBinary {
+  const env = options.env ?? process.env
+
   // 0. Explicit override — always wins.
-  const override = process.env.OPENCODE_PATH
+  const override = env.OPENCODE_PATH
   if (override !== undefined && override.length > 0) {
     return {resolved: true, path: override, isBuilt: false}
   }
 
   // 1. Host-platform optionalDependencies binary.
-  const optionalBinary = resolveOptionalDepBinary()
+  const optionalBinary = resolveOptionalDepBinary(options.locatePlatformPackage)
   if (optionalBinary !== null) {
     return {resolved: true, path: optionalBinary, isBuilt: true}
   }
@@ -134,13 +158,12 @@ export function resolveBinary(): ResolvedBinary {
   // 2. No platform binary found.
   //    In dev/unbuilt environments with an explicit escape hatch, fall back to PATH.
   //    In production (no escape hatch), fail closed with an actionable error.
-  if (isDevEscapeHatchActive()) {
+  if (isDevEscapeHatchActive(env)) {
     return {resolved: true, path: 'opencode', isBuilt: false}
   }
 
   // Determine which platform package was expected for the error message.
-  const platformResult = getHostPlatformInfo()
-  const expectedPkg = platformResult.ok ? platformResult.info.packageName : '@fro.bot/harness-<os>-<arch>'
+  const {expectedPackage: expectedPkg} = lookupPlatformBinary(options.locatePlatformPackage)
 
   throw new Error(
     `[harness] Platform binary not found. Expected package: ${expectedPkg}\n` +
@@ -209,7 +232,7 @@ export interface ResolveNoProbeOptions {
   readonly locatePlatformPackage?: (packageName: string) => string | null
 }
 
-const OPAQUE_REMEDIATION = 'set OPENCODE_PATH to the native harness opencode binary'
+const REMEDIATION_HINT = 'set OPENCODE_PATH to the native harness opencode binary'
 
 type CandidateState =
   | {readonly state: 'missing'}
@@ -247,6 +270,10 @@ function isExecutable(candidate: string): boolean {
  * (thin or fat). `#!` scripts and every other format are "opaque" — mise shims
  * resolve to the mise executable or a wrapper script, and we cannot prove those
  * run the patched build, so they fail closed. Reads 4 bytes; never spawns.
+ *
+ * This is a FORMAT (magic-byte) check only. It rules out scripts and dispatchers;
+ * it does not prove the file is the patched harness build (a stock native opencode
+ * passes it too).
  */
 function isNativeBinary(candidate: string): boolean {
   const header = Buffer.alloc(4)
@@ -303,9 +330,9 @@ function selfReferenceFailure(candidate: string, label: string): ResolveNoProbeR
     kind: 'self-reference',
     candidate,
     message:
-      `[harness] ${label} ${candidate} points back at a harness entry point (opencode shim or harness cli); ` +
+      `${label} ${candidate} points back at a harness entry point (opencode shim or harness cli); ` +
       `refusing to exec it to avoid infinite recursion.\n` +
-      `  Remediation: ${OPAQUE_REMEDIATION}.`,
+      `  Remediation: ${REMEDIATION_HINT}.`,
   }
 }
 
@@ -315,9 +342,9 @@ function opaqueFailure(candidate: string, label: string): ResolveNoProbeResult {
     kind: 'opaque-dispatcher',
     candidate,
     message:
-      `[harness] ${label} ${candidate} is not a native binary (script or dispatcher such as a mise shim); ` +
+      `${label} ${candidate} is not a native binary (script or dispatcher such as a mise shim); ` +
       `it cannot be proven to be the patched build.\n` +
-      `  Remediation: ${OPAQUE_REMEDIATION}.`,
+      `  Remediation: ${REMEDIATION_HINT}.`,
   }
 }
 
@@ -327,7 +354,7 @@ function notExecutableFailure(candidate: string, label: string): ResolveNoProbeR
     kind: 'not-executable',
     candidate,
     message:
-      `[harness] ${label} ${candidate} is not an executable file (permission denied or not a regular file).\n` +
+      `${label} ${candidate} is not an executable file (permission denied or not a regular file).\n` +
       `  Remediation: fix the file mode (chmod +x) or reinstall the package.`,
   }
 }
@@ -347,7 +374,7 @@ function checkExplicitCandidate(
       ok: false,
       kind: 'not-found',
       candidate,
-      message: `[harness] ${label} ${candidate} does not exist.\n  Remediation: ${OPAQUE_REMEDIATION}.`,
+      message: `${label} ${candidate} does not exist.\n  Remediation: ${REMEDIATION_HINT}.`,
     }
   }
   if (state.state === 'not-file') {
@@ -407,7 +434,6 @@ function walkPath(
  */
 export function resolveBinaryNoProbe(options: ResolveNoProbeOptions): ResolveNoProbeResult {
   const env = options.env ?? process.env
-  const locate = options.locatePlatformPackage ?? locatePlatformPackageRoot
   const isSelf = buildSelfMatcher(options.entryPoints)
 
   // 0. Explicit override.
@@ -417,25 +443,20 @@ export function resolveBinaryNoProbe(options: ResolveNoProbeOptions): ResolveNoP
   }
 
   // 1. Platform package. A present-but-unusable binary is a hard failure, not a reason to fall through.
-  const platformResult = getHostPlatformInfo()
-  const expectedPkg = platformResult.ok ? platformResult.info.packageName : '@fro.bot/harness-<os>-<arch>'
-  if (platformResult.ok) {
-    const root = locate(platformResult.info.packageName)
-    if (root !== null) {
-      const binaryPath = binaryPathInPackage(root, platformResult.info)
-      const state = inspectCandidate(binaryPath)
-      if (state.state === 'ok') {
-        if (isSelf(state)) {
-          return selfReferenceFailure(binaryPath, 'Platform binary')
-        }
-        if (isExecutable(binaryPath) === false) {
-          return notExecutableFailure(binaryPath, 'Platform binary')
-        }
-        return {ok: true, path: binaryPath, source: 'platform-package', isBuilt: true}
+  const {expectedPackage: expectedPkg, binaryPath} = lookupPlatformBinary(options.locatePlatformPackage)
+  if (binaryPath !== null) {
+    const state = inspectCandidate(binaryPath)
+    if (state.state === 'ok') {
+      if (isSelf(state)) {
+        return selfReferenceFailure(binaryPath, 'Platform binary')
       }
-      if (state.state === 'not-file') {
+      if (isExecutable(binaryPath) === false) {
         return notExecutableFailure(binaryPath, 'Platform binary')
       }
+      return {ok: true, path: binaryPath, source: 'platform-package', isBuilt: true}
+    }
+    if (state.state === 'not-file') {
+      return notExecutableFailure(binaryPath, 'Platform binary')
     }
   }
 
@@ -451,9 +472,9 @@ export function resolveBinaryNoProbe(options: ResolveNoProbeOptions): ResolveNoP
     ok: false,
     kind: 'not-found',
     message:
-      `[harness] Platform binary not found. Expected package: ${expectedPkg}\n` +
+      `Platform binary not found. Expected package: ${expectedPkg}\n` +
       `  Remediation: ensure ${expectedPkg} is installed as an optionalDependency,\n` +
-      `  or ${OPAQUE_REMEDIATION},\n` +
+      `  or ${REMEDIATION_HINT},\n` +
       `  or set HARNESS_ALLOW_PATH_FALLBACK=1 to search PATH for a native opencode (dev only).`,
   }
 }

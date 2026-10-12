@@ -10,6 +10,7 @@ import process from 'node:process'
 import {afterAll, afterEach, beforeAll, describe, expect, it} from 'vitest'
 
 import {execBinary, exitStatusFor, FORWARDED_SIGNALS} from './exec-binary.js'
+import {isGone, readPid} from './shim-test-kit.js'
 
 const WAIT_TIMEOUT_MS = 10_000
 const POLL_INTERVAL_MS = 10
@@ -88,21 +89,6 @@ async function waitFor(description: string, predicate: () => boolean): Promise<v
       throw new Error(`Timed out after ${WAIT_TIMEOUT_MS}ms waiting for ${description}`)
     }
     await new Promise<void>(resolve => setTimeout(resolve, POLL_INTERVAL_MS))
-  }
-}
-
-function readPid(file: string): number | undefined {
-  if (existsSync(file) === false) return undefined
-  const pid = Number.parseInt(readFileSync(file, 'utf8'), 10)
-  return Number.isNaN(pid) ? undefined : pid
-}
-
-function isGone(pid: number): boolean {
-  try {
-    process.kill(pid, 0)
-    return false
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === 'ESRCH'
   }
 }
 
@@ -368,6 +354,21 @@ describe.skipIf(process.platform === 'win32')('execBinary', () => {
 
       // #then the outcome is a spawn error with code ENOENT
       expect(outcome).toMatchObject({kind: 'spawn-error', code: 'ENOENT'})
+      for (const signal of FORWARDED_SIGNALS) expect(host.listenerCount(signal)).toBe(0)
+    })
+
+    it('reports a synchronous spawn throw as a spawn error and removes its listeners', async () => {
+      // #given a spawn function that throws synchronously (for example fd exhaustion)
+      const host = new EventEmitter()
+      const spawnFn = (): never => {
+        throw Object.assign(new Error('spawn EMFILE'), {code: 'EMFILE'})
+      }
+
+      // #when executing through it
+      const outcome = await execBinary('/irrelevant', [], {signalHost: host, spawnFn})
+
+      // #then the throw became an outcome, and no listener leaked on the injected host
+      expect(outcome).toEqual({kind: 'spawn-error', code: 'EMFILE', message: 'spawn EMFILE'})
       for (const signal of FORWARDED_SIGNALS) expect(host.listenerCount(signal)).toBe(0)
     })
 

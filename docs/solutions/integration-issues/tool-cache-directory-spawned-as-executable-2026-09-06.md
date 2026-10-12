@@ -89,7 +89,7 @@ One value was serving two distinct roles under one name. `tc.cacheDir` / `tc.fin
 The second manifestation shows why this class of bug hides. `ensureOpenCodeAvailable` assigned the directory to `process.env.OPENCODE_PATH`, which is read back as an executable in three places:
 
 - its own `verifyOpenCodeAvailable` call eleven lines earlier — `src/services/setup/runtime-setup-adapter.ts:13` spawns it with `--version`
-- `@fro.bot/harness`'s `resolveBinary()`, which returns the override verbatim as `path` (`packages/harness/src/resolve-binary.ts:118-120`) for the wrapper CLI to exec — and which the package's own remediation text calls *"an explicit binary path"* (`resolve-binary.ts:143`), a published npm contract
+- `@fro.bot/harness`'s `resolveBinary()`, which returns the override verbatim as `path` (`packages/harness/src/resolve-binary.ts:118-120`) for the wrapper CLI to exec — and which the package's own remediation text calls *"an explicit binary path"* (`resolve-binary.ts:143`), a published npm contract. *(Update: the probing `resolveBinary()` — used by `harness doctor` — still returns the override verbatim. The no-probe resolver that the `opencode` shim and the `harness` passthrough use now validates it: an absolute native executable that is not a harness entry point.)*
 - every scrubbed child process, since `filterAgentEnv`'s `ALLOW_PREFIXES` includes `OPENCODE_` (`packages/runtime/src/agent/filter-env.ts:61`)
 
 That produced no CI symptom for one reason: the tool-cache install unpacks the harness release tarball, which carries the binary at archive root, straight onto `PATH`. The real binary never reads `OPENCODE_PATH`. Only the npm wrapper does — so the failure was reserved for mise installs, local runs, and the gateway workspace container.

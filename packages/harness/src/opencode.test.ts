@@ -1,4 +1,13 @@
-import {chmodSync, copyFileSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync} from 'node:fs'
+import {
+  chmodSync,
+  copyFileSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
@@ -49,8 +58,13 @@ afterAll(() => {
   removeDir(root)
 })
 
-function start(entry: string, args: readonly string[], env: Record<string, string | undefined>): RunningProcess {
-  const proc = startNodeEntry(entry, args, cleanEnv(env))
+function start(
+  entry: string,
+  args: readonly string[],
+  env: Record<string, string | undefined>,
+  cwd?: string,
+): RunningProcess {
+  const proc = startNodeEntry(entry, args, cleanEnv(env), 'ignore', cwd)
   running.push(proc)
   return proc
 }
@@ -112,6 +126,60 @@ describe('opencode shim: argv and exit passthrough', () => {
 
     // #then the shim exits 3
     expect(await withTimeout('shim exit', shim.exited)).toEqual({code: 3, signal: null})
+  })
+
+  it('hands the child an absolute OPENCODE_PATH even when the override was relative', async () => {
+    // #given a RELATIVE OPENCODE_PATH, resolved against the shim's cwd
+    const relative = `./${path.basename(fixture)}`
+
+    // #when the shim runs a fixture that reports the OPENCODE_PATH it received
+    const shim = start(
+      staged.opencodeEntry,
+      [],
+      {OPENCODE_PATH: relative, FIXTURE_PRINT_ENV: '1'},
+      path.dirname(fixture),
+    )
+    const exit = await withTimeout('shim exit', shim.exited)
+
+    // #then the child saw the absolute path, not the relative spelling
+    expect(exit).toEqual({code: 0, signal: null})
+    // (macOS reports the cwd through its realpath: /var → /private/var)
+    expect(JSON.parse(shim.stdout())).toEqual({OPENCODE_PATH: realpathSync(fixture)})
+  })
+
+  it('lets a nested shim started from another cwd resolve the same file', async () => {
+    // #given a relative override and a child that launches the shim again from `/`
+    const relative = `./${path.basename(fixture)}`
+
+    // #when the outer shim runs it
+    const shim = start(
+      staged.opencodeEntry,
+      [],
+      {OPENCODE_PATH: relative, FIXTURE_NESTED_SHIM: staged.opencodeEntry, FIXTURE_NODE: process.execPath},
+      path.dirname(fixture),
+    )
+    const exit = await withTimeout('shim exit', shim.exited)
+
+    // #then the inner shim reached the same fixture (a relative path would not exist from `/`)
+    expect(exit).toEqual({code: 0, signal: null})
+    expect(JSON.parse(shim.stdout()) as string[]).toEqual(['inner'])
+  })
+
+  it('does not invent OPENCODE_PATH when the binary was not selected by it', async () => {
+    // #given the PATH fallback resolves the fixture and OPENCODE_PATH is unset
+    const walkDir = path.join(root, 'walk-bin')
+    mkdirSync(walkDir, {recursive: true})
+    copyFileSync(fixture, path.join(walkDir, 'opencode'))
+    const shim = start(staged.opencodeEntry, [], {
+      HARNESS_ALLOW_PATH_FALLBACK: '1',
+      PATH: walkDir,
+      FIXTURE_PRINT_ENV: '1',
+    })
+
+    // #then the child sees no OPENCODE_PATH
+    const exit = await withTimeout('shim exit', shim.exited)
+    expect(exit).toEqual({code: 0, signal: null})
+    expect(JSON.parse(shim.stdout())).toEqual({OPENCODE_PATH: null})
   })
 
   it('exits 128 + SIGPIPE when the child dies by SIGPIPE', async () => {

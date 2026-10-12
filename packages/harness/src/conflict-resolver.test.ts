@@ -570,8 +570,7 @@ describe('resolveConflict', {timeout: REAL_GIT_TEST_TIMEOUT_MS}, () => {
   it('fails with the resolver remediation, before any scratch work, when the default cannot be resolved', async () => {
     // #given the bare default and a resolver that fails closed
     if (repo === undefined) throw new Error('test repository was not created')
-    const message =
-      '[harness] Platform binary not found.\n  Remediation: set OPENCODE_PATH to the native harness opencode binary'
+    const message = 'Platform binary not found.\n  Remediation: set OPENCODE_PATH to the native harness opencode binary'
 
     // #when
     const result = await resolveConflict(makeRequest(repo, {opencodeBin: 'opencode'}), {

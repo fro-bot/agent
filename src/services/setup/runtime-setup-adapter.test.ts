@@ -43,6 +43,21 @@ describe('runtimeSetupAdapter.verifyOpenCodeAvailable', () => {
     expect(result).toEqual({available: true, version: '1.18.34'})
   })
 
+  it.each([
+    ['opencode version 1.18.34+harness.6546eb64\n', '1.18.34+harness.6546eb64'],
+    ['1.2.3-rc.1\n', '1.2.3-rc.1'],
+    ['opencode version 1.2.3\n', '1.2.3'],
+  ])('reports the full version token, ignoring a text prefix, for %j', async (output, expected) => {
+    // #given
+    stubVersionOutput(output)
+
+    // #when
+    const result = await runtimeSetupAdapter.verifyOpenCodeAvailable(null, createMockLogger())
+
+    // #then the caller can compare it for exact equality with a pinned version
+    expect(result).toEqual({available: true, version: expected})
+  })
+
   it('reports version=null for unparseable output', async () => {
     // #given
     stubVersionOutput('unknown output')

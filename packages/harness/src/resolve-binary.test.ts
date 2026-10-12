@@ -38,6 +38,8 @@ function expectFailure(result: ResolveNoProbeResult, kind: string): string {
   expect(result.ok).toBe(false)
   if (result.ok) throw new Error('unreachable')
   expect(result.kind).toBe(kind)
+  // Callers add their own label; the resolver's text must not carry one (it nested as `[opencode] [harness] …`).
+  expect(result.message).not.toContain('[harness]')
   return result.message
 }
 
@@ -87,6 +89,25 @@ describe('resolveBinaryNoProbe: platform package', () => {
     const message = expectFailure(result, 'not-executable')
     expect(message).toContain('chmod +x')
   })
+
+  for (const [label, entry] of [
+    ['shim', () => shim],
+    ['harness cli', () => cli],
+  ] as const) {
+    it(`rejects a platform binary that is a symlink to the ${label} as self-reference`, () => {
+      // #given a platform package whose bin/opencode is a link back to a harness entry point
+      const root = mkdir('self-platform-pkg')
+      fs.mkdirSync(path.join(root, 'bin'), {recursive: true})
+      fs.symlinkSync(entry(), path.join(root, 'bin', 'opencode'))
+
+      // #when
+      const result = resolveBinaryNoProbe({entryPoints: [shim, cli], env: {}, locatePlatformPackage: () => root})
+
+      // #then it is refused instead of being exec'd (which would recurse)
+      const message = expectFailure(result, 'self-reference')
+      expect(message).toContain('Platform binary')
+    })
+  }
 
   it('reports not-found naming the platform package when absent and no override', () => {
     // #given no platform package and no override
@@ -314,6 +335,23 @@ describe('resolveBinaryNoProbe: PATH walk', () => {
     expect(result).toMatchObject({ok: true, path: native})
   })
 
+  it('skips a non-executable opencode and resolves the next native one', () => {
+    // #given PATH = [dir with a 0644 opencode, dir with a native opencode]
+    const dirA = mkdir('dir-a')
+    writeExecutable(path.join(dirA, 'opencode'), 'not runnable', 0o644)
+    const native = fakeNative(path.join(tmp, 'dir-b', 'opencode'))
+
+    // #when
+    const result = resolveBinaryNoProbe({
+      entryPoints: [shim, cli],
+      env: {HARNESS_ALLOW_PATH_FALLBACK: optIn, PATH: [dirA, path.dirname(native)].join(path.delimiter)},
+      locatePlatformPackage: () => null,
+    })
+
+    // #then the non-executable file is passed over, as a shell would
+    expect(result).toEqual({ok: true, path: native, source: 'path-walk', isBuilt: false})
+  })
+
   it('fails closed with opaque-dispatcher when the first non-self candidate is a shell script', () => {
     // #given PATH = [shim, sh dispatcher, native]; the dispatcher must not be skipped past
     const first = mkdir('first')
@@ -416,39 +454,51 @@ describe('resolveBinaryNoProbe: PATH walk', () => {
 })
 
 describe('resolveBinary (probing contract, unchanged)', () => {
-  const saved = {override: process.env.OPENCODE_PATH, fallback: process.env.HARNESS_ALLOW_PATH_FALLBACK}
-
-  afterEach(() => {
-    for (const [key, value] of [
-      ['OPENCODE_PATH', saved.override],
-      ['HARNESS_ALLOW_PATH_FALLBACK', saved.fallback],
-    ] as const) {
-      if (value === undefined) delete process.env[key]
-      else process.env[key] = value
-    }
-  })
-
   it('still honours OPENCODE_PATH verbatim without validation', () => {
     // #given
-    process.env.OPENCODE_PATH = '/some/custom/opencode'
-
     // #when
-    const result = resolveBinary()
+    const result = resolveBinary({env: {OPENCODE_PATH: '/some/custom/opencode'}, locatePlatformPackage: () => null})
 
     // #then
     expect(result).toEqual({resolved: true, path: '/some/custom/opencode', isBuilt: false})
   })
 
-  it('still returns bare opencode under the dev escape hatch when no platform binary exists', () => {
-    // #given
-    delete process.env.OPENCODE_PATH
-    process.env.HARNESS_ALLOW_PATH_FALLBACK = '1'
+  it('locates the platform binary through the shared locator and probes it', () => {
+    // #given a platform package whose binary answers --version
+    const {root} = platformPackage('#!/bin/sh\necho 1.0.0\n')
 
     // #when
-    const result = resolveBinary()
+    const result = resolveBinary({env: {}, locatePlatformPackage: () => root})
 
-    // #then either a built platform artifact or the legacy bare-command fallback
-    expect(result.resolved).toBe(true)
-    expect(result.isBuilt ? path.isAbsolute(result.path) : result.path === 'opencode').toBe(true)
+    // #then it is the package's bin/opencode, flagged as a built artifact
+    expect(result).toEqual({resolved: true, path: path.join(root, 'bin', 'opencode'), isBuilt: true})
+  })
+
+  it('ignores a platform binary that fails its --version probe', () => {
+    // #given a platform binary that exits non-zero
+    const {root} = platformPackage('#!/bin/sh\nexit 3\n')
+
+    // #when / #then it is not trusted, so with no escape hatch resolution fails closed
+    expect(() => resolveBinary({env: {}, locatePlatformPackage: () => root})).toThrow('Platform binary not found')
+  })
+
+  it('still returns bare opencode under the dev escape hatch when no platform binary exists', () => {
+    // #given the escape hatch and a forced "no platform package"
+    // #when
+    const result = resolveBinary({env: {HARNESS_ALLOW_PATH_FALLBACK: '1'}, locatePlatformPackage: () => null})
+
+    // #then exactly the legacy bare-command fallback
+    expect(result).toEqual({resolved: true, path: 'opencode', isBuilt: false})
+  })
+
+  it('throws the existing remediation (with its [harness] label) without an escape hatch', () => {
+    // #given no override, no escape hatch, no platform package
+    const platform = getHostPlatformInfo()
+    if (!platform.ok) throw new Error('host platform unsupported')
+
+    // #when / #then
+    expect(() => resolveBinary({env: {}, locatePlatformPackage: () => null})).toThrow(
+      `[harness] Platform binary not found. Expected package: ${platform.info.packageName}`,
+    )
   })
 })

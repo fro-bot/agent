@@ -38,8 +38,6 @@ export {
 export {bootstrapOpenCodeServer, ensureOpenCodeAvailable} from './server-adapter.js'
 export type {OpenCodeServerHandle} from './server-adapter.js'
 
-export {verifyOpenCodeAvailable} from './server.js'
-
 // Types
 export type {
   AcknowledgmentState,

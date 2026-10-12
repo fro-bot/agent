@@ -24,6 +24,7 @@ const POLL_INTERVAL_MS = 10
 // argv as JSON and exits with FIXTURE_EXIT_CODE. Compiled by `bun build --compile`, so it is a NATIVE executable that
 // receives every argument verbatim (the resolver rejects `#!` scripts and node itself would eat `--version`).
 const FIXTURE_SOURCE = String.raw`
+import {spawnSync} from 'node:child_process'
 import {appendFileSync, writeFileSync} from 'node:fs'
 
 const env = process.env
@@ -51,6 +52,15 @@ if (args[0] === 'serve') {
   writeIfSet('FIXTURE_PID', String(process.pid))
   console.log('opencode server listening on http://127.0.0.1:' + port)
   writeIfSet('FIXTURE_READY', 'ready')
+} else if (env.FIXTURE_NESTED_SHIM !== undefined && env.FIXTURE_NODE !== undefined) {
+  // Behaves like a tool that launches \`opencode\` again from somewhere else: runs the shim from a different cwd,
+  // with the environment this process received.
+  const nestedEnv = {...env}
+  delete nestedEnv.FIXTURE_NESTED_SHIM
+  const nested = spawnSync(env.FIXTURE_NODE, [env.FIXTURE_NESTED_SHIM, 'inner'], {cwd: '/', env: nestedEnv, stdio: 'inherit'})
+  process.exit(nested.status ?? 1)
+} else if (env.FIXTURE_PRINT_ENV === '1') {
+  console.log(JSON.stringify({OPENCODE_PATH: env.OPENCODE_PATH ?? null}))
 } else {
   console.log(JSON.stringify(args))
   process.exit(Number.parseInt(env.FIXTURE_EXIT_CODE ?? '0', 10))
@@ -197,8 +207,9 @@ export function startNodeEntry(
   args: readonly string[],
   env: NodeJS.ProcessEnv,
   stdin: 'ignore' | 'pipe' = 'ignore',
+  cwd?: string,
 ): RunningProcess {
-  const proc = spawn(process.execPath, [entry, ...args], {env, stdio: [stdin, 'pipe', 'pipe']})
+  const proc = spawn(process.execPath, [entry, ...args], {env, cwd, stdio: [stdin, 'pipe', 'pipe']})
   let out = ''
   let err = ''
   proc.stdout?.setEncoding('utf8')

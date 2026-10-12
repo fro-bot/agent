@@ -45,11 +45,6 @@ export function exitCodeForResolveFailure(kind: ResolveFailureKind): number {
   return kind === 'not-executable' ? 126 : 127
 }
 
-/** Resolver messages carry a `[harness]` prefix; swap it for the entry point's own label. */
-export function labelMessage(label: PassthroughLabel, message: string): string {
-  return `[${label}] ${message.replace(/^\[harness\]\s*/, '')}`
-}
-
 /**
  * Act on how the child ended. Never returns.
  *
@@ -74,11 +69,15 @@ export function applyExitStatus(status: ExitStatus): void {
 export async function runPassthrough(options: PassthroughOptions): Promise<void> {
   const resolved = resolveBinaryNoProbe({entryPoints: harnessEntryPoints()})
   if (resolved.ok === false) {
-    console.error(labelMessage(options.label, resolved.message))
+    console.error(`[${options.label}] ${resolved.message}`)
     process.exit(exitCodeForResolveFailure(resolved.kind))
   }
 
-  const outcome = await execBinary(resolved.path, options.args)
+  // An override may be relative to this process's cwd. Hand descendants the absolute path so a nested shim started
+  // from another cwd resolves the same file. A platform-package or PATH-walk result is found without the variable,
+  // so it is left unset (setting it would turn a discovered binary into an "explicit" one).
+  const env = resolved.source === 'override' ? {...process.env, OPENCODE_PATH: resolved.path} : process.env
+  const outcome = await execBinary(resolved.path, options.args, {env})
   if (outcome.kind === 'spawn-error') {
     console.error(`[${options.label}] Failed to spawn ${resolved.path}: ${outcome.message}`)
   }
