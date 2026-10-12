@@ -14,7 +14,7 @@
 
 import process from 'node:process'
 import {cmdIntegrate} from './integrate-command.js'
-import {formatProvenance, getProvenance} from './provenance.js'
+import {formatPatches, formatProvenance, formatVersionLine, getProvenance} from './provenance.js'
 import {probeBinary, resolveBinary, resolveBinaryNoProbe} from './resolve-binary.js'
 import {harnessEntryPoints, runPassthrough} from './run-passthrough.js'
 import {buildHarnessVersion} from './version.js'
@@ -49,22 +49,7 @@ function cmdInfo(): void {
 }
 
 function cmdPatches(): void {
-  const p = getProvenance()
-  if (p.integrationRefs.length === 0) {
-    console.log('No integration refs configured (dev scaffold).')
-    return
-  }
-  console.log('Integration refs:')
-  for (const r of p.integrationRefs) {
-    const status = r.upstreamStatus === undefined ? '' : ` [${r.upstreamStatus}]`
-    console.log(`  - ${r.ref}${status}`)
-    if (r.reason !== undefined) {
-      console.log(`    reason: ${r.reason}`)
-    }
-  }
-  if (p.integrationCommit !== null) {
-    console.log(`\nFrozen integration commit: ${p.integrationCommit}`)
-  }
+  console.log(formatPatches(getProvenance()))
 }
 
 /**
@@ -168,8 +153,7 @@ async function main(): Promise<void> {
 
   // --version: harness-own provenance version
   if (args[0] === '--version' || args[0] === '-v') {
-    const p = getProvenance()
-    console.log(`@fro.bot/harness base:${p.baseVersion} build:${p.buildSha}`)
+    console.log(formatVersionLine(getProvenance()))
     process.exit(0)
   }
 

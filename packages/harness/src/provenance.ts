@@ -28,6 +28,9 @@ export interface Provenance {
   readonly buildSha: string
 }
 
+/** The repository that hosts the pushed `refs/harness-integrate/<base_version>` integration commits. */
+const INTEGRATION_REPO_URL = 'https://github.com/fro-bot/agent'
+
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 
 /**
@@ -114,13 +117,28 @@ export function getProvenance(): Provenance {
 }
 
 /**
+ * Returns the commit page URL for a frozen integration commit.
+ * The commit is pushed to `fro-bot/agent` under `refs/harness-integrate/<base_version>`.
+ */
+export function integrationCommitUrl(sha: string): string {
+  return `${INTEGRATION_REPO_URL}/commit/${sha}`
+}
+
+/**
+ * Formats the one-line `harness --version` output.
+ */
+export function formatVersionLine(p: Provenance): string {
+  return `@fro.bot/harness base:${p.baseVersion} build:${p.buildSha} integration:${p.integrationCommit ?? 'dev'}`
+}
+
+/**
  * Formats provenance as a human-readable string for `harness info`.
  */
 export function formatProvenance(p: Provenance): string {
   const lines: string[] = [
     `harness (patched OpenCode)`,
     `  base:               ${p.baseVersion}`,
-    `  integration commit: ${p.integrationCommit ?? '(unbuilt/dev scaffold)'}`,
+    `  integration commit: ${p.integrationCommit === null ? '(unbuilt/dev scaffold)' : integrationCommitUrl(p.integrationCommit)}`,
     `  build sha:          ${p.buildSha}`,
   ]
   if (p.integrationRefs.length > 0) {
@@ -134,6 +152,27 @@ export function formatProvenance(p: Provenance): string {
     }
   } else {
     lines.push(`  integration refs:   (none — dev scaffold)`)
+  }
+  return lines.join('\n')
+}
+
+/**
+ * Formats the integration refs and frozen commit for `harness patches`.
+ */
+export function formatPatches(p: Provenance): string {
+  if (p.integrationRefs.length === 0) {
+    return 'No integration refs configured (dev scaffold).'
+  }
+  const lines: string[] = ['Integration refs:']
+  for (const r of p.integrationRefs) {
+    const status = r.upstreamStatus === undefined ? '' : ` [${r.upstreamStatus}]`
+    lines.push(`  - ${r.ref}${status}`)
+    if (r.reason !== undefined) {
+      lines.push(`    reason: ${r.reason}`)
+    }
+  }
+  if (p.integrationCommit !== null) {
+    lines.push(`\nFrozen integration commit: ${integrationCommitUrl(p.integrationCommit)}`)
   }
   return lines.join('\n')
 }
