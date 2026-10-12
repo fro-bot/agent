@@ -1,7 +1,7 @@
 ---
 type: subsystem
 last-updated: "2026-10-11"
-updated-by: "e6efc1f1"
+updated-by: "18890129"
 sources:
   - packages/gateway/src/execute/run.ts
   - packages/gateway/src/execute/run-core.ts
@@ -9,6 +9,8 @@ sources:
   - packages/gateway/src/execute/preparation-reply.ts
   - packages/gateway/src/execute/recovery.ts
   - packages/gateway/src/web/server.ts
+  - packages/gateway/src/web/ingress/resolve-client.ts
+  - packages/gateway/src/http/rate-limit.ts
   - packages/gateway/src/web/operator-route.ts
   - packages/gateway/src/web/operator-route-smoke.ts
   - packages/gateway/src/web/operator/launch-route.ts
@@ -74,7 +76,7 @@ sources:
   - packages/gateway/src/operator-contract/version.ts
   - docs/decisions/2026-06-19-s2-operator-auth-authority.md
   - ARCHITECTURE.md
-summary: "Authenticated browser surface for gateway runs, including checkout provenance, preparation outcomes, and live observation"
+summary: "Authenticated browser surface for gateway runs, OAuth admission, checkout provenance, live observation, and push health"
 ---
 
 # Operator Web Control Surface
@@ -125,6 +127,14 @@ The unauthenticated set is just the health check and the two OAuth endpoints (`G
 Sign-in is a hand-rolled GitHub OAuth flow using PKCE and an anti-forgery `state` value. The start endpoint generates the PKCE verifier server-side (it is never written to a cookie or returned to the browser), stores the `state` server-side with a short TTL and an outstanding-attempt cap, and redirects to GitHub. The callback validates `state` as one-time, exchanges the code with the stored verifier, and reads the authenticated user's stable numeric GitHub ID and display login. After the session is minted, the callback redirects to the validated `return_to` captured at start; when none was captured (for example, the start URL was opened directly) it redirects to a default landing path — the first entry of the return-path allowlist (`/operator` by default) — validated by the same same-origin allowlist check, so a misconfigured default can never become an open redirect.
 
 Two properties matter throughout: the **numeric user ID is the authority** for every later authorization and audit decision, while the login is treated as mutable display metadata; and every authentication failure branch returns the same coarse response so the surface gives no oracle about why a request was rejected.
+
+### Admission under capacity pressure
+
+Unauthenticated request accounting uses a derived key from `web/ingress/resolve-client.ts`: IPv4 clients keep a /32 bucket, while native IPv6 clients share their /64 prefix's budget. Trust decisions and the OAuth callback binding still use the **exact canonical address**, so moving within a /64 does not bypass the address binding. Authenticated routes account by numeric operator ID. Health has an independent limiter, preventing routine probes from spending the sign-in budget.
+
+The shared fixed-window limiter (`http/rate-limit.ts`) bounds its map to 10,000 keys by evicting the oldest window when a new key arrives at capacity. Hits do not promote a bucket; renewing an expired window moves it to the tail. This preserves admission for a new legitimate client instead of letting an address flood fill the map and deny everyone else. The tradeoff is explicit: an evicted active bucket loses its count, so the limiter is best-effort under cardinality pressure, not a hard adversarial quota.
+
+The OAuth state store applies the same availability principle with a 1,000-entry bound. After stale-state reclamation, the per-accounting-key outstanding-attempt check, and start-request validation, a new state may evict the oldest remaining state. An evicted attempt's callback becomes an ordinary unknown-state rejection; it does not resurrect the state or trigger a retry bounce. This guarantees eligible starts can be admitted, not that every in-flight sign-in survives a flood. The PKCE verifier and exact-address binding remain attached to the newly minted state (`web/auth/github.ts`).
 
 ### Sessions (`web/auth/session.ts`)
 

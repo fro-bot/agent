@@ -1,7 +1,7 @@
 ---
 type: subsystem
 last-updated: "2026-10-11"
-updated-by: "schedule-d7190410-35540552880"
+updated-by: "18890129"
 sources:
   - src/services/cache/cache-key.ts
   - src/shared/cache-save-result.ts
@@ -9,6 +9,8 @@ sources:
   - packages/runtime/src/session/search.ts
   - packages/runtime/src/session/prune.ts
   - packages/runtime/src/session/logical-key.ts
+  - packages/runtime/src/shared/invocation-identity.ts
+  - src/services/artifact/upload.ts
   - packages/runtime/src/session/archive.ts
   - packages/runtime/src/session/writeback.ts
   - packages/runtime/src/session/types.ts
