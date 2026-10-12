@@ -12,8 +12,9 @@
  * Exits 0 on success or when no platform binary is available (optional dep not installed).
  * The `|| true` in package.json scripts.postinstall ensures install never fails here.
  *
- * A missing binary is NOT a fatal install error — the harness falls back to the
- * dev scaffold (opencode on PATH). The action setup fails loud if the binary is
+ * A missing binary is NOT a fatal install error — install still succeeds, but the
+ * `opencode` shim and `harness` then exit non-zero with remediation until a platform
+ * binary or OPENCODE_PATH is provided. The action setup fails loud if the binary is
  * absent in CI, where it is required.
  */
 
@@ -32,7 +33,7 @@ function main(): void {
   const platformResult = getHostPlatformInfo()
   if (!platformResult.ok) {
     log(`Platform not supported: ${platformResult.error}`)
-    log('No platform binary available. Using opencode on PATH as fallback.')
+    log('No platform binary is available for this os/arch. Set OPENCODE_PATH to a native opencode binary.')
     process.exit(0)
   }
 
@@ -49,7 +50,7 @@ function main(): void {
     platformPkgRoot = path.dirname(pkgJsonPath)
   } catch {
     log(`Platform package ${info.packageName} not found (optional dependency not installed).`)
-    log('Using opencode on PATH as fallback.')
+    log(`No platform binary is available. Install ${info.packageName} (supported os/arch only) or set OPENCODE_PATH.`)
     process.exit(0)
   }
 
@@ -66,7 +67,7 @@ function main(): void {
     log('Platform binary ready.')
   } catch {
     log(`Binary found but not executable: ${binaryPath}`)
-    log('Using opencode on PATH as fallback.')
+    log(`No usable platform binary. Reinstall ${info.packageName} or set OPENCODE_PATH to a native opencode binary.`)
   }
 }
 

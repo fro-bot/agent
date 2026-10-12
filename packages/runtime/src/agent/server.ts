@@ -501,6 +501,24 @@ export interface EnsureOpenCodeOptions {
   readonly credential: SetupInputs['credential']
 }
 
+/**
+ * Canonical form for comparing a pinned OpenCode version with what a binary reports.
+ *
+ * The harness binary self-reports `<base>+harness.<sha>` (`packages/harness/scripts/verify-binary.ts`
+ * pins that exactly), while the Action's setup also accepts the equivalent `<base>-harness.<sha>`
+ * release-tag spelling as `opencode-version`. The installer also accepts a leading `v` (`v1.18.34`,
+ * `v1.18.34-harness.<sha>`; see `assertValidVersion` and `buildDownloadUrl` in services/setup/opencode.ts),
+ * and no binary prints one. Only those two spelling differences are folded -- a single `v` that precedes a
+ * digit, and `-harness.` vs `+harness.`. Everything else (including `latest`, `vlatest`, and partial versions,
+ * which no binary ever prints) compares as-is, so those never match.
+ */
+function canonicalOpenCodeVersion(version: string): string {
+  return version
+    .trim()
+    .replace(/^v(?=\d)/, '')
+    .replace(/^(\d+\.\d+\.\d+)-harness\./, '$1+harness.')
+}
+
 export async function ensureOpenCodeAvailable(
   options: EnsureOpenCodeOptions,
   setupAdapter: SetupAdapter,
@@ -509,12 +527,28 @@ export async function ensureOpenCodeAvailable(
   const existingPath = process.env.OPENCODE_PATH ?? null
   const check = await setupAdapter.verifyOpenCodeAvailable(existingPath, logger)
 
+  // An existing binary is reused only when it reports exactly the pinned version, harness suffix
+  // included. Anything else that merely answers `--version` -- stock opencode, an older harness build,
+  // a global @fro.bot/harness shim on PATH -- must not displace the pinned, checksum-verified download.
   if (check.available && check.version != null) {
-    logger.info('OpenCode already available', {version: check.version})
-    return {path: existingPath ?? 'opencode', version: check.version, didSetup: false}
+    if (canonicalOpenCodeVersion(check.version) === canonicalOpenCodeVersion(opencodeVersion)) {
+      logger.info('OpenCode already available', {version: check.version})
+      return {path: existingPath ?? 'opencode', version: check.version, didSetup: false}
+    }
+    const mismatch = {
+      foundVersion: check.version,
+      requestedVersion: opencodeVersion,
+      source: existingPath === null ? 'PATH' : 'OPENCODE_PATH',
+    }
+    // An explicit OPENCODE_PATH is an operator choice about to be replaced; surface that louder than a PATH hit.
+    if (existingPath === null) {
+      logger.info('Existing OpenCode does not match the pinned version, running auto-setup', mismatch)
+    } else {
+      logger.warning('Existing OpenCode does not match the pinned version, running auto-setup', mismatch)
+    }
+  } else {
+    logger.info('OpenCode not found, running auto-setup', {requestedVersion: opencodeVersion})
   }
-
-  logger.info('OpenCode not found, running auto-setup', {requestedVersion: opencodeVersion})
   const setupInputs: SetupInputs = {
     opencodeVersion,
     authJson: options.authJson,

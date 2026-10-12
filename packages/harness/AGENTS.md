@@ -19,7 +19,22 @@ harness --version            Print harness provenance version
 harness --help               Print usage
 ```
 
-**Disambiguation rule:** `info`, `patches`, `doctor` are harness-own subcommands. `--version` and `--help` are harness-own. Everything else passes through to the patched binary with inherited stdio, env, and exit code propagation.
+**Disambiguation rule:** `info`, `patches`, `doctor`, `integrate` are harness-own subcommands. `--version` and `--help` are harness-own. Everything else passes through to the patched binary with inherited stdio, env, signal forwarding, and exit propagation.
+
+The package ships two bins (`bin` in `package.json`; `package-invariants.test.ts` pins exactly these two):
+
+- `harness` → `dist/cli.mjs` — the contract above.
+- `opencode` → `dist/opencode.mjs` — a pure passthrough with **no** reserved subcommands (`upgrade` included), so tools that look `opencode` up by name get the patched build. User-facing detail (install caveats, upgrades, signals, exit codes) lives in [README.md](README.md), which ships to npm.
+
+### Entry-point modules
+
+- `opencode.ts` — the `opencode` entry point; calls `runPassthrough({label: 'opencode', ...})`.
+- `run-passthrough.ts` — shared by `opencode.ts` and `cli.ts`: resolves without probing, runs `execBinary`, applies the exit status. Owns `harnessEntryPoints` (the self-reference set) and the 126/127 mapping.
+- `exec-binary.ts` — non-detached child with inherited stdio; forwards `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT`/`SIGUSR1`/`SIGUSR2`; reports how the child ended and never exits or re-raises itself (`exitStatusFor` maps the outcome: exit code, re-raise for INT/TERM/HUP/QUIT, `128+n` for other signals, 127/126 for ENOENT/EACCES spawns).
+- `resolve-binary.ts` — `resolveBinary` (probes with `--version`; used by `harness doctor`) and `resolveBinaryNoProbe` (stat/realpath/4-byte header read only; used by both passthrough entry points). `resolveBinaryNoProbe` order: `OPENCODE_PATH` (must be native), platform package, then a PATH walk only under `HARNESS_ALLOW_PATH_FALLBACK=1`. It rejects self-references (realpath or `dev:ino` match), non-native binaries (anything but ELF/Mach-O), and non-executables, and never returns a bare command name.
+- Why no probe: the OpenCode SDK's start deadline makes a per-invocation `--version` spawn too expensive.
+- Dev shadowing: the root `node_modules/.bin/opencode` link points at the workspace shim, so a bare `opencode` under `bun run` is the shim. Code that needs the patched binary must go through the resolver, not spawn `opencode` by name.
+- `conflict-resolver.ts` — the bare default `opencodeBin` (`opencode`) resolves through `resolveBinaryNoProbe` (`selectOpenCodeExecutable`) rather than being spawned by name; an explicit `opencode_bin` path is used as given. An unresolvable default fails the model turn with the resolver's remediation message.
 
 ## Provenance Model
 
@@ -36,7 +51,7 @@ The harness ships as a main `@fro.bot/harness` package + per-platform packages:
 - `@fro.bot/harness-darwin-x64`
 - `@fro.bot/harness-darwin-arm64`
 
-Each per-platform package contains only that platform's native binary. The main package's `bin` shim + `postinstall` resolver (`resolve-binary.ts` → `platform.ts`) select the host's binary by computed package name (`@fro.bot/harness-<os>-<arch>`) and verify it before exec; `OPENCODE_PATH` and a bare `opencode` on PATH are honored as fallbacks for local/unbuilt use.
+Each per-platform package contains only that platform's native binary. The `postinstall` resolver and the bins' resolver (`resolve-binary.ts` → `platform.ts`) select the host's binary by computed package name (`@fro.bot/harness-<os>-<arch>`). `OPENCODE_PATH` (native binary only) overrides it; a PATH search for a native `opencode` is honored only under `HARNESS_ALLOW_PATH_FALLBACK=1` (dev). `postinstall` is advisory (`|| true`) and is skipped by managers that disable lifecycle scripts, so the bins must not depend on it.
 
 The per-platform packages are **not listed in the source `package.json` `optionalDependencies`** — that keeps the workspace `bun.lock` clean (the packages only exist on npm after a release). The release workflow **injects** `optionalDependencies` (pinned to the release version) into the published main package's `package.json` at publish time.
 
@@ -47,7 +62,7 @@ Harness builds target **linux and darwin only** (x64 + arm64); Windows is unsupp
 The harness is distributed through **two channels** from one release run:
 
 - **npm** — for local `bunx @fro.bot/harness` / `mise` use. Published as a SemVer **prerelease**: `<base>-harness.<short8>` (e.g. `1.17.3-harness.ed359558`), with the `latest` dist-tag set explicitly (prereleases are not `latest` by default).
-- **GitHub Release** — for the Fro Bot action to download (the same way it downloads stock OpenCode). The release tag uses the same SemVer **prerelease** string as npm: `<base>-harness.<short8>` (no `v`), carrying OpenCode-shaped assets `opencode-{linux-x64,linux-arm64}.tar.gz` / `opencode-{darwin-x64,darwin-arm64}.zip` (binary at archive root) plus `SHA256SUMS`.
+- **GitHub Release** — for the Fro Bot action to download (the same way it downloads stock OpenCode); the Action setup consumes this tarball, not the npm package. The release tag uses the same SemVer **prerelease** string as npm: `<base>-harness.<short8>` (no `v`), carrying OpenCode-shaped assets `opencode-{linux-x64,linux-arm64}.tar.gz` / `opencode-{darwin-x64,darwin-arm64}.zip` (binary at archive root) plus `SHA256SUMS`.
 
 The tag has no `v` so semantic-release's `^v(.+)` scan ignores harness releases. The `-harness.` prerelease identifier keeps them out of Renovate stable candidates. The binary self-reports the `+harness.<sha>` build-metadata form (`harness --version`).
 
@@ -174,13 +189,13 @@ Drop a carried ref when: upstream stable release includes it; it stops applying 
 ## Build
 
 ```bash
-bun run --filter @fro.bot/harness build       # type-check + bundle → dist/cli.mjs
+bun run --filter @fro.bot/harness build       # type-check + bundle → dist/{cli,opencode,postinstall}.mjs
 bun run --filter @fro.bot/harness check-types # tsc --noEmit only
 bun run --filter @fro.bot/harness test        # vitest
 bun run --filter @fro.bot/harness lint        # eslint
 ```
 
-The build produces `dist/cli.mjs` — the `harness` bin entry point.
+The build produces `dist/cli.mjs` (the `harness` bin), `dist/opencode.mjs` (the `opencode` bin), and `dist/postinstall.mjs` (the install-time check); the entries are listed in `tsdown.config.ts`.
 
 ## Attribution
 

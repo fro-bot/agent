@@ -7,6 +7,10 @@ import process from 'node:process'
 import {fileURLToPath, pathToFileURL} from 'node:url'
 import {afterAll, beforeAll, expect, it} from 'vitest'
 
+// The fake `opencode` reports this version, and runMain pins the same value via `opencode-version`: the Action only
+// reuses an existing binary whose `--version` exactly equals the pin, so the two must stay in lockstep.
+const MOCK_OPENCODE_VERSION = '1.1.2'
+
 // Isolated temp directories for test data and mock tools
 let testDataDir: string
 let mockBinDir: string
@@ -17,7 +21,7 @@ beforeAll(() => {
 
   // Create mock opencode binary that responds to --version
   const mockOpenCode = path.join(mockBinDir, 'opencode')
-  writeFileSync(mockOpenCode, '#!/bin/sh\necho "OpenCode 1.1.2"', 'utf8')
+  writeFileSync(mockOpenCode, `#!/bin/sh\necho "OpenCode ${MOCK_OPENCODE_VERSION}"`, 'utf8')
   chmodSync(mockOpenCode, 0o755)
 })
 
@@ -111,6 +115,7 @@ async function runMain(
   return runNode(
     ['--input-type=module', '-e', `import(${JSON.stringify(importTarget)});`],
     {
+      'INPUT_OPENCODE-VERSION': MOCK_OPENCODE_VERSION,
       ...env,
       GITHUB_API_URL: 'http://127.0.0.1:1',
     },

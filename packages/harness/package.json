@@ -16,7 +16,8 @@
   "author": "Fro Bot <agent@fro.bot>",
   "type": "module",
   "bin": {
-    "harness": "./dist/cli.mjs"
+    "harness": "./dist/cli.mjs",
+    "opencode": "./dist/opencode.mjs"
   },
   "files": [
     "LICENSE",

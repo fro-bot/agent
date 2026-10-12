@@ -117,7 +117,7 @@ fro-bot/agent/
 | `@fro-bot/action` | `apps/action/` | Thin wrapper re-exporting root `src/`; build produces committed `dist/` |
 | `@fro-bot/workspace-agent` | `apps/workspace-agent/` | Hono HTTP service in the workspace container |
 | `@fro-bot/gateway` | `packages/gateway/` | Discord daemon, operator web surface, mention loop, redaction |
-| `@fro.bot/harness` | `packages/harness/` | Patched-OpenCode build and publish pipeline |
+| `@fro.bot/harness` | `packages/harness/` | Patched-OpenCode build and publish pipeline; ships the `harness` and `opencode` commands |
 | `@fro-bot/runtime` | `packages/runtime/` | Shared runtime primitives; owns authoritative version-pin constants |
 
 ### CI Workflows

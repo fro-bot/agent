@@ -3,17 +3,14 @@ import type {Logger} from '../../shared/logger.js'
 import type {ExecutionDeadline} from './retry.js'
 import type {OpenCodeServerHandle} from './server-adapter.js'
 import type {ExecutionConfig, PromptOptions} from './types.js'
-import {Buffer} from 'node:buffer'
 import * as fs from 'node:fs/promises'
 import process from 'node:process'
 
-import * as exec from '@actions/exec'
 import {createOpencode} from '@opencode-ai/sdk'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import * as envUtils from '../../shared/env.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {executeOpenCode} from './execution.js'
-import {verifyOpenCodeAvailable} from './server.js'
 import {INITIAL_ACTIVITY_TIMEOUT_MS, pollForSessionCompletion, waitForEventProcessorShutdown} from './session-poll.js'
 import {logServerEvent, processEventStream, type ActivityTracker} from './streaming.js'
 
@@ -1561,82 +1558,6 @@ describe('executeOpenCode', () => {
 
     // #then
     expect(fs.writeFile).not.toHaveBeenCalled()
-  })
-})
-
-describe('verifyOpenCodeAvailable', () => {
-  let mockLogger: Logger
-
-  beforeEach(() => {
-    mockLogger = createMockLogger()
-    vi.clearAllMocks()
-  })
-
-  afterEach(() => {
-    vi.restoreAllMocks()
-  })
-
-  it('returns available=true when opencode --version succeeds', async () => {
-    // #given
-    vi.mocked(exec.exec).mockImplementation(async (_cmd, _args, options) => {
-      if (options?.listeners?.stdout != null) {
-        options.listeners.stdout(Buffer.from('opencode version 1.2.3\n'))
-      }
-      return 0
-    })
-
-    // #when
-    const result = await verifyOpenCodeAvailable(null, mockLogger)
-
-    // #then
-    expect(result.available).toBe(true)
-    expect(result.version).toBe('1.2.3')
-  })
-
-  it('uses custom opencodePath when provided', async () => {
-    // #given
-    vi.mocked(exec.exec).mockImplementation(async (_cmd, _args, options) => {
-      if (options?.listeners?.stdout != null) {
-        options.listeners.stdout(Buffer.from('v2.0.0'))
-      }
-      return 0
-    })
-
-    // #when
-    await verifyOpenCodeAvailable('/custom/opencode', mockLogger)
-
-    // #then
-    expect(exec.exec).toHaveBeenCalledWith('/custom/opencode', ['--version'], expect.any(Object))
-  })
-
-  it('returns available=false when opencode command fails', async () => {
-    // #given
-    vi.mocked(exec.exec).mockRejectedValue(new Error('Command not found'))
-
-    // #when
-    const result = await verifyOpenCodeAvailable(null, mockLogger)
-
-    // #then
-    expect(result.available).toBe(false)
-    expect(result.version).toBeNull()
-    expect(mockLogger.debug).toHaveBeenCalledWith('OpenCode not available, will attempt auto-setup')
-  })
-
-  it('returns version=null when version not parseable', async () => {
-    // #given
-    vi.mocked(exec.exec).mockImplementation(async (_cmd, _args, options) => {
-      if (options?.listeners?.stdout != null) {
-        options.listeners.stdout(Buffer.from('unknown output'))
-      }
-      return 0
-    })
-
-    // #when
-    const result = await verifyOpenCodeAvailable(null, mockLogger)
-
-    // #then
-    expect(result.available).toBe(true)
-    expect(result.version).toBeNull()
   })
 })
 

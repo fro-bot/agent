@@ -7,15 +7,16 @@
  *   --version / --help: harness-own (prints provenance / usage)
  *   Everything else: passed through to the resolved patched binary.
  *
- * This is the ONLY entry point for the @fro.bot/harness package.
+ * This is the entry point for the `harness` command. The `opencode` command is the separate, subcommand-free
+ * shim in opencode.ts.
  * No classes; functions only; explicit boolean checks; no as-any.
  */
 
-import {spawnSync} from 'node:child_process'
 import process from 'node:process'
 import {cmdIntegrate} from './integrate-command.js'
-import {formatProvenance, getProvenance} from './provenance.js'
-import {probeBinary, resolveBinary} from './resolve-binary.js'
+import {formatPatches, formatProvenance, formatVersionLine, getProvenance} from './provenance.js'
+import {probeBinary, resolveBinary, resolveBinaryNoProbe} from './resolve-binary.js'
+import {harnessEntryPoints, runPassthrough} from './run-passthrough.js'
 import {buildHarnessVersion} from './version.js'
 
 function printUsage(): void {
@@ -48,25 +49,37 @@ function cmdInfo(): void {
 }
 
 function cmdPatches(): void {
-  const p = getProvenance()
-  if (p.integrationRefs.length === 0) {
-    console.log('No integration refs configured (dev scaffold).')
-    return
+  console.log(formatPatches(getProvenance()))
+}
+
+/**
+ * What the `opencode` command and the `harness` passthrough will actually run. Resolved the way they resolve it
+ * (no probe, absolute paths only, never a harness entry point), which can differ from the probing check: a bare
+ * `OPENCODE_PATH=opencode` is spawned through PATH by the probe but is a not-found for the shim.
+ * Returns true when the shim would run a binary.
+ */
+function reportShimResolution(): boolean {
+  const resolved = resolveBinaryNoProbe({entryPoints: harnessEntryPoints()})
+  if (resolved.ok) {
+    console.log(`  opencode command:   ${resolved.path} (source: ${resolved.source})`)
+    return true
   }
-  console.log('Integration refs:')
-  for (const r of p.integrationRefs) {
-    const status = r.upstreamStatus === undefined ? '' : ` [${r.upstreamStatus}]`
-    console.log(`  - ${r.ref}${status}`)
-    if (r.reason !== undefined) {
-      console.log(`    reason: ${r.reason}`)
-    }
-  }
-  if (p.integrationCommit !== null) {
-    console.log(`\nFrozen integration commit: ${p.integrationCommit}`)
-  }
+  console.error(`\n[FAIL] The opencode command would not run (${resolved.kind}):`)
+  // Continuation lines of the message already carry two spaces; align them under the first line's indent.
+  console.error(`       ${resolved.message.replaceAll('\n', '\n     ')}`)
+  return false
 }
 
 function cmdDoctor(): number {
+  const probeCode = cmdDoctorProbe()
+  const shimOk = reportShimResolution()
+  if (probeCode !== 0) return probeCode
+  if (!shimOk) return 1
+  console.log('\n[OK] Binary is present and runnable.')
+  return 0
+}
+
+function cmdDoctorProbe(): number {
   let binary
   try {
     binary = resolveBinary()
@@ -118,31 +131,15 @@ function cmdDoctor(): number {
     return 1
   }
 
-  console.log('\n[OK] Binary is present and runnable.')
   return 0
 }
 
-function cmdPassthrough(args: readonly string[]): number {
-  let binary
-  try {
-    binary = resolveBinary()
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error)
-    console.error(`[harness] ${msg}`)
-    return 1
-  }
-
-  const result = spawnSync(binary.path, [...args], {
-    stdio: 'inherit',
-    env: process.env,
-  })
-
-  if (result.error !== undefined) {
-    console.error(`[harness] Failed to spawn ${binary.path}: ${result.error.message}`)
-    return 1
-  }
-
-  return result.status ?? 1
+/**
+ * Passthrough shares the `opencode` shim's no-probe resolution, signal forwarding and exit propagation.
+ * It exits the process itself, so it never resolves to a value.
+ */
+async function cmdPassthrough(args: readonly string[]): Promise<void> {
+  await runPassthrough({label: 'harness', args})
 }
 
 async function main(): Promise<void> {
@@ -156,8 +153,7 @@ async function main(): Promise<void> {
 
   // --version: harness-own provenance version
   if (args[0] === '--version' || args[0] === '-v') {
-    const p = getProvenance()
-    console.log(`@fro.bot/harness base:${p.baseVersion} build:${p.buildSha}`)
+    console.log(formatVersionLine(getProvenance()))
     process.exit(0)
   }
 
@@ -185,8 +181,7 @@ async function main(): Promise<void> {
 
   // Anything not in the reserved set passes through.
   // This includes no-args (which opencode handles as its own help/default).
-  const code = cmdPassthrough(args)
-  process.exit(code)
+  await cmdPassthrough(args)
 }
 
 main().catch(error => {

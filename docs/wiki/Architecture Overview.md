@@ -1,7 +1,7 @@
 ---
 type: architecture
 last-updated: "2026-10-11"
-updated-by: "e6efc1f1"
+updated-by: "18890129"
 sources:
   - src/main.ts
   - src/post.ts
@@ -29,6 +29,7 @@ sources:
   - packages/gateway/src/github/dispatch.ts
   - packages/gateway/src/github/app-client.ts
   - packages/gateway/src/web/server.ts
+  - packages/gateway/src/web/ingress/resolve-client.ts
   - packages/gateway/src/approvals/coordinator.ts
   - packages/gateway/src/approvals/request-gate.ts
   - packages/gateway/src/approvals/question-registry.ts
@@ -39,6 +40,7 @@ sources:
   - src/features/triggers/skip-conditions-pr.ts
   - src/features/delegated/brokered-push.ts
   - scripts/harness/mint-app-token.ts
+  - .github/workflows/harness-integrate.yaml
   - packages/harness/harness.config.json
   - apps/workspace-agent/src/main.ts
   - apps/workspace-agent/src/server.ts
@@ -52,6 +54,9 @@ sources:
   - action.yaml
   - bunfig.toml
   - ARCHITECTURE.md
+  - vitest.config.ts
+  - scripts/vitest-home-isolation.ts
+  - scripts/vitest-incomplete-run-reporter.ts
 summary: "Monorepo structure, module map, and the boundary between gateway execution and workspace checkout management"
 ---
 
@@ -105,6 +110,8 @@ The CLI is a drop-in replacement — all arguments pass through to the patched O
 
 The package ships as `@fro.bot/harness` (the main resolver) plus four per-platform packages (`@fro.bot/harness-linux-x64`, `-linux-arm64`, `-darwin-x64`, `-darwin-arm64`), each containing only its native binary. The main package's `postinstall` resolver picks the host platform's binary, verifies it, and symlinks it; `OPENCODE_PATH` and a bare `opencode` on `PATH` are honored as fallbacks for local or unbuilt use. Per-platform `optionalDependencies` are injected at publish time and are not listed in the workspace `package.json`.
 
+The dedicated integration workflow (`.github/workflows/harness-integrate.yaml`) mints the App push token **before** running the merge agent. Its private key is supplied only to that pre-agent step, so no later step reintroduces it after agent-influenced code has run. The masked token output reaches trusted finalization, not the agent's environment. A 40-minute cap on the agent step leaves headroom within the token's roughly one-hour lifetime; a push after expiry fails closed rather than minting again in the modified workspace.
+
 ### Gateway Package (`packages/gateway/`)
 
 The Discord gateway (`@fro-bot/gateway`) is a long-running daemon that bridges Discord mentions to Fro Bot agent runs and executes those runs end-to-end against a remote OpenCode server. Key modules:
@@ -113,7 +120,7 @@ The Discord gateway (`@fro-bot/gateway`) is a long-running daemon that bridges D
 
 **Execute** (`execute/`) — The agent-execution pipeline triggered by an `@fro-bot` mention or a web launch. `run.ts` orchestrates the full run: acquires the coordination lock, creates a run-state record with heartbeat, and delegates to `run-core.ts` for session creation, prompt send, and event-stream routing. `opencode-attach.ts` connects to the remote OpenCode server, `prompt.ts` builds the Discord prompt, `concurrency.ts` enforces per-channel run limits via a serial queue (`queue.ts`), and `recovery.ts` handles interrupted runs. An in-memory abort registry (`abort-registry.ts`) plus `cancel.ts` back operator-initiated cancellation: a run registered under its `runId` can be aborted mid-flight and settles as `CANCELLED` rather than `FAILED` (see [[Operator Web Control Surface]]). `run-core.ts` also counts inbound events so a stalled run can be distinguished from a lost-event timeout. Permission events emitted by OpenCode during a run are forwarded to Discord approval buttons via the approvals subsystem.
 
-The gateway has no separate drain stage because it does not need one: `run-core.ts` does not return until the run's ownership ledger drains, so the heartbeat stop, terminal transition, and concurrency-slot handoff in `run.ts` all happen after owned background work has settled. `settle-owned-sessions.ts` is the termination barrier every post-ledger error passes through — it aborts unsettled sessions, confirms by reconciliation rather than trusting the abort response, and re-raises the original error marked _quarantined_ when it cannot confirm. A quarantined failure holds the channel's slot for a bounded window instead of handing the workspace to the next queued run. `recovery.ts` reads persisted ownership back on restart and refuses to release a stale run's lock when the claim names work it cannot verify is finished. See [[Background Subagents and Ownership]].
+The gateway has no separate drain stage because it does not need one: `run-core.ts` does not return until the run's ownership ledger drains and the parent's follow-up reply is confirmed, so the heartbeat stop, terminal transition, and concurrency-slot handoff in `run.ts` all happen after owned background work has settled. `settle-owned-sessions.ts` is the termination barrier every post-ledger error passes through — it aborts unsettled sessions, confirms by reconciliation rather than trusting the abort response, and re-raises the original error marked _quarantined_ when it cannot confirm. A quarantined failure holds the channel's slot for a bounded window instead of handing the workspace to the next queued run. On restart, `recovery.ts` checks the repository's OpenCode workspace status rather than persisted ownership: a busy or unconfirmable workspace blocks stale-run terminalization, and recovery never deletes coordination locks. See [[Background Subagents and Ownership]].
 
 **Approvals** (`approvals/`) — Discord approval UI for OpenCode permission gate events. When OpenCode asks for a file-system or shell permission during a gateway run, the coordinator (`coordinator.ts`) registers the pending request and the registry (`registry.ts`) manages the entry lifecycle across all in-flight runs. A Discord button click claims the entry (preventing duplicate replies), calls back to OpenCode's reply endpoint, and the authoritative `permission.replied` event from the SDK confirms settlement. The registry is the single source of truth; the coordinator is a thin forwarder bridging the SDK event stream to the registry.
 
@@ -145,7 +152,7 @@ The OpenCode server (`opencode-server.ts`) binds to loopback only; a bearer-toke
 
 The runtime package exports five module groups:
 
-**Agent** (`agent/`) — Prompt construction, output-mode and response-delivery resolution, server bootstrapping, and reference file management (see [[Prompt Architecture]]). The runtime supplies the _primitives_ an execution needs; it no longer owns an execution orchestrator. A `refactor(agent)` pass (commit `f5b8d69`) collapsed a previously duplicated execution stack — the runtime once exported its own `executeOpenCode`, retry, and prompt-sender modules that ran in parallel with the action layer's — down to a single owning implementation in `src/features/agent/`. That layer now drives the SDK session, retry policy, and continuation prompt itself, calling the runtime for the lower-level pieces below; the retry backoff constants live beside the retry logic that consumes them rather than being declared in two places. Spawns of the OpenCode child are wrapped in a deny-by-default environment filter (`filter-env.ts` / `with-scrubbed-env.ts`) so credential-shaped variables never reach the agent process (see [[Setup and Configuration]]). Error classification lives in a dedicated `error-format/` submodule that canonically owns the `ErrorType` union and `ErrorInfo` shape (re-exported from `types.ts` for callers), so the action and gateway format agent failures identically and the terminal-vs-transient distinction stays in one place (see [[Execution Lifecycle]]). The terminal kinds are a closed set — quota exhaustion and provider authentication failures — and their classifiers accept only bounded, provider-neutral fields, keeping provider-controlled text out of the trusted failure summary. Also provides `remote-client.ts`, which wraps a remote OpenCode server as an `OpenCodeServerHandle` so the gateway can execute runs without owning the server process.
+**Agent** (`agent/`) — Prompt construction, output-mode and response-delivery resolution, server bootstrapping, and reference file management (see [[Prompt Architecture]]). The runtime supplies the _primitives_ an execution needs; it no longer owns an execution orchestrator. A `refactor(agent)` pass (commit `f5b8d69`) collapsed a previously duplicated execution stack — the runtime once exported its own `executeOpenCode`, retry, and prompt-sender modules that ran in parallel with the action layer's — down to a single owning implementation in `src/features/agent/`. That layer now drives the SDK session, retry policy, and continuation prompt itself, calling the runtime for the lower-level pieces below; the retry backoff constants live beside the retry logic that consumes them rather than being declared in two places. Spawns of the OpenCode child are wrapped in a deny-by-default environment filter (`filter-env.ts` / `with-scrubbed-env.ts`) so credential-shaped variables never reach the agent process (see [[Setup and Configuration]]). Error classification lives in a dedicated `error-format/` submodule that canonically owns the `ErrorType` union and `ErrorInfo` shape (re-exported from `types.ts` for callers), so the action and gateway share failure formatting (see [[Execution Lifecycle]]). Quota exhaustion, provider authentication failures, and unresolvable models stop Action retries; classifiers project structured markers or validated identifiers into trusted diagnostics rather than echoing raw provider text. Also provides `remote-client.ts`, which wraps a remote OpenCode server as an `OpenCodeServerHandle` so the gateway can execute runs without owning the server process.
 
 **Ownership** (`agent/ownership-ledger.ts`, `agent/ledger-reconcile.ts`) — A per-invocation, three-state ledger tracking background subagent executions the run owns, plus the reconciler that settles entries whose completion event the SSE stream never delivered. Both surfaces share it: the Action drains against it before publishing or persisting, and the gateway holds its concurrency slot against it. It is keyed on the child session id rather than the dispatch job id, because upstream reuses job ids and a job-keyed entry could be settled by a notification for a different execution. See [[Background Subagents and Ownership]].
 
@@ -237,7 +244,7 @@ The full, unabridged symbol rows for entries that [ARCHITECTURE.md](../../ARCHIT
 | `readUpdateNetworkConfig` | Function | `apps/workspace-agent/src/config.ts` | Reads the egress-proxy and CA-bundle settings `/update`'s network half needs, once at startup |
 | `createRecoverCheckoutCommand` / `createCheckoutBackupCommand` | Function | `packages/gateway/src/discord/commands/{recover-checkout,checkout-backup}.ts` | `/fro-bot recover-checkout` and `/fro-bot checkout-backup list\|delete`; the Recover button on a refusal reply shares the same flow via `discord/recover-checkout-button.ts` |
 | `OPERATOR_CONTRACT_VERSION` | Constant | `packages/gateway/src/operator-contract/version.ts` | Build-time-pinned operator contract version (`1.10.0`) |
-| `resolveClient` | Function | `packages/gateway/src/web/ingress/resolve-client.ts` | Trusted-proxy-aware client-address resolution for the operator-surface accounting keys (health, OAuth start/callback, and guarded-logout rate limits; the OAuth attempt cap) and the exact OAuth binding; returns a branded `ResolvedClientAddress` or a closed `IngressRejection` — never a fallback key |
+| `resolveClient` | Function | `packages/gateway/src/web/ingress/resolve-client.ts` | Trusted-proxy-aware client-address resolution returning an exact canonical address for OAuth binding and a separate IPv4 /32 or IPv6 /64 abuse-accounting key for rate limits and the OAuth attempt cap; returns a branded `ResolvedClientAddress` or a closed `IngressRejection` — never a fallback key |
 | `parseCanonicalAddress` | Function | `packages/gateway/src/web/ingress/canonical-address.ts` | Single strict IPv4/IPv6 parser shared by socket, X-Forwarded-For, and configured-peer parsing |
 | `createPushHealthTracker` / `observePushAdapterHealth` | Function | `packages/gateway/src/web/operator-push/{push-health,push-health-adapter}.ts` | Passive in-memory operator push health (`disabled \| ready \| degraded \| unknown`, 1-hour staleness on a monotonic clock). Backend outcomes are observed at the object-store adapter the subscription store is built over (reads vs writes; a completed call is `ok`: `NoSuchKey`/`NotFound`, 412, 409 by code, 404/412/409 by status only without a code; a 404 `NoSuchBucket` is `failed`; the store reports CAS-retry exhaustion as a write failure ordered by when the record finished; a throwing `markDead` cleanup never feeds relay health), relay outcomes once per broadcast; each component keeps its latest-by-start observation. Surfaced only as the optional `push: {status}` on the authenticated `GET /operator/session`. `ready` is observed readiness, not guaranteed delivery |
 
@@ -362,7 +369,7 @@ The project uses `tsdown` (an esbuild-based bundler) to produce `dist/main.js` a
 
 The runtime package (`packages/runtime/`) is consumed as a workspace dependency via its TypeScript source — no separate build step is required for development, though it has its own `tsdown` config for publishing.
 
-Testing uses Vitest with colocated `.test.ts` files. The project follows test-driven development: failing test first, minimal implementation, then refactor.
+Testing uses Vitest with colocated `.test.ts` files. The project follows test-driven development: failing test first, minimal implementation, then refactor. Shared test configuration isolates HOME and XDG paths and detects worker crashes that leave tests without results; [[Conventions and Patterns]] describes those boundaries.
 
 ## RFCs
 
