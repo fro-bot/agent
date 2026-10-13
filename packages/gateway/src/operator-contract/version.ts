@@ -1,6 +1,11 @@
 // Operator API contract version — build-time pinned, never negotiated over the wire.
 //
 // Changelog (latest first):
+//   1.11.0 — `RunSummaryStatus` gains `waiting_for_approval` and `waiting_for_question` (additive):
+//            `GET /operator/runs` summaries overlay the same registry-derived waiting status as the
+//            SSE stream (approval before question, only on a `running` base). Question push
+//            notifications now carry `data.runId` and `route: '/operator#<runId>'` (a deep link to the
+//            asking run; falls back to `/` for a non-conforming ID).
 //   1.10.0 — export `OPERATOR_PUSH_TRIGGER_KINDS` / `OperatorPushTriggerKind` (additive): the closed
 //            set of push notification triggers, which is also the wire `data.type`.
 //            Also adds the optional `OperatorSessionInfo.push: {status}` (`ready | degraded | unknown`) and
@@ -22,4 +27,4 @@
 // Security constraint: the version is BUILD-TIME pinned and is never supplied or
 // negotiated over the wire. Any endpoint reading a version header must reject
 // unrecognized versions fail-closed.
-export const OPERATOR_CONTRACT_VERSION = '1.10.0'
+export const OPERATOR_CONTRACT_VERSION = '1.11.0'

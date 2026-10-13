@@ -46,14 +46,19 @@
  * `submit`, `settleEcho`, `settleNow`, `retire`, and the family/all dispose calls. There is no
  * way to clear a timer, remove an entry, or emit the terminal event on its own.
  *
- * ### Terminal notification
+ * ### Open and terminal notification
+ *
+ * Every `put` emits one {@link OpenEvent} to the registered open listeners after the entry is
+ * inserted, replacements included. A replacement that moves the request id to another scope names
+ * the scope it left in `displacedScopeId`, because the displaced entry emits no terminal event.
+ * A throwing open listener is logged and never aborts the `put`.
  *
  * Every entry emits exactly one {@link TerminalEvent} to the registered
  * listeners when it leaves the gate: echo, deadline, fail-close, or teardown.
  * The event does not depend on an echo arriving, and an echo that arrives
  * after the entry already left finds nothing to settle, so it cannot emit a
- * second event. Re-registering a request id replaces its entry without an
- * event; the replacement emits when it leaves.
+ * second event. Re-registering a request id replaces its entry without a
+ * terminal event; the replacement emits when it leaves.
  */
 
 import type {GatewayLogger} from '../discord/client.js'
@@ -170,6 +175,18 @@ export interface TerminalEvent {
 
 export type TerminalListener = (event: TerminalEvent) => void
 
+/** Notification that a request was registered and now blocks its run. Carries identifiers only. */
+export interface OpenEvent {
+  readonly requestID: string
+  readonly sessionID: string
+  readonly family: RequestFamily
+  readonly scopeId: string
+  /** Set only when a replacement moved the request id out of another scope; that scope stopped waiting on it. */
+  readonly displacedScopeId?: string
+}
+
+export type OpenListener = (event: OpenEvent) => void
+
 // ---------------------------------------------------------------------------
 // Gate interface
 // ---------------------------------------------------------------------------
@@ -220,7 +237,8 @@ export interface RequestGate {
    * Insert an entry and arm its deadline timer when `deadlineMs` is positive. When an entry for
    * the same request id is already registered it is replaced and returned: its timer is cleared
    * and its terminal notification suppressed, because the request id stays pending under the
-   * replacement (the replacement emits when it leaves).
+   * replacement (the replacement emits when it leaves). Open listeners are notified once per
+   * call, replacement or not, after the entry is registered.
    */
   readonly put: (entry: GateEntry, deadlineMs: number | undefined) => GateEntry | undefined
   /** Log a settled-render failure without raising it. Families call this from their render wrapper's catch. */
@@ -263,6 +281,8 @@ export interface RequestGate {
   readonly disposeAllAcrossFamilies: (reason: string) => Promise<void>
   /** Subscribe to terminal notifications. Returns an unsubscribe function. */
   readonly onTerminal: (listener: TerminalListener) => () => void
+  /** Subscribe to open notifications, one per `put`. Returns an unsubscribe function. */
+  readonly onOpen: (listener: OpenListener) => () => void
 }
 
 // ---------------------------------------------------------------------------
@@ -273,6 +293,7 @@ export function createRequestGate(deps: {readonly logger: GatewayLogger}): Reque
   const {logger} = deps
   const entries = new Map<string, GateEntry>()
   const listeners = new Set<TerminalListener>()
+  const openListeners = new Set<OpenListener>()
 
   function label(entry: GateEntry): string {
     return entry.family === 'approval' ? 'ApprovalRegistry' : 'QuestionRegistry'
@@ -318,7 +339,28 @@ export function createRequestGate(deps: {readonly logger: GatewayLogger}): Reque
       }, deadlineMs)
       entry.timer.unref?.()
     }
+    emitOpen(entry, replaced !== undefined && replaced.scopeId !== entry.scopeId ? replaced.scopeId : undefined)
     return replaced
+  }
+
+  function emitOpen(entry: GateEntry, displacedScopeId: string | undefined): void {
+    const event: OpenEvent = {
+      requestID: entry.requestID,
+      sessionID: entry.sessionID,
+      family: entry.family,
+      scopeId: entry.scopeId,
+      ...(displacedScopeId === undefined ? {} : {displacedScopeId}),
+    }
+    for (const listener of Array.from(openListeners)) {
+      try {
+        listener(event)
+      } catch (error) {
+        logger.error(
+          {requestID: entry.requestID, family: entry.family, ...errorFields(entry, error)},
+          'RequestGate: open listener threw — continuing',
+        )
+      }
+    }
   }
 
   function remove(entry: GateEntry): void {
@@ -640,6 +682,13 @@ export function createRequestGate(deps: {readonly logger: GatewayLogger}): Reque
     }
   }
 
+  function onOpen(listener: OpenListener): () => void {
+    openListeners.add(listener)
+    return () => {
+      openListeners.delete(listener)
+    }
+  }
+
   return {
     get,
     list,
@@ -654,5 +703,6 @@ export function createRequestGate(deps: {readonly logger: GatewayLogger}): Reque
     disposeFamilyAll,
     disposeAllAcrossFamilies,
     onTerminal,
+    onOpen,
   }
 }

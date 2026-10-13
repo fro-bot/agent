@@ -19,7 +19,7 @@ When an operator opts in, the browser creates a [W3C Push API](https://www.w3.or
 
 ## What a notification contains
 
-Every push notification uses fixed, neutral copy: a short message indicating something needs attention, a link that opens the operator dashboard, and — for failures — a label drawn from a small, pre-defined, allowlisted set of failure categories (for example, a timeout or a workspace error). The payload never includes the run's repository, prompt, or any of its output, and a question notification never includes the question or its options. An operator who wants details opens the dashboard, authenticates, and sees them there under the normal authorization rules — the push payload itself carries none of it.
+Every push notification uses fixed, neutral copy: a short message indicating something needs attention, a link that opens the operator dashboard (for a question notification, a same-origin link to the run that is asking, and that run's opaque identifier in the encrypted payload), and — for failures — a label drawn from a small, pre-defined, allowlisted set of failure categories (for example, a timeout or a workspace error). The payload never includes the run's repository, prompt, or any of its output, and a question notification never includes the question or its options; the run identifier is the only run-specific value it carries. An operator who wants details opens the dashboard, authenticates, and sees them there under the normal authorization rules — the push payload itself carries none of it.
 
 ## Retention
 

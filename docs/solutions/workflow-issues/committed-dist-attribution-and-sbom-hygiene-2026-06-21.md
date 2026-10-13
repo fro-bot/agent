@@ -94,21 +94,11 @@ postUpgradeTasks: {
 
 These three commands are the ones `bfra-me/renovate-action` allowlists for `postUpgradeTasks`; a bespoke command outside the allowlist is silently dropped, so any dist transform must ride inside an allowlisted command (e.g. as the final step of `build`). So dependency PRs regenerate the notice deterministically and the unconditional dist-diff gate verifies it — no exception required. The same allowlist constraint, and why committed-dist transforms must live in `build` rather than only a bundler hook, is covered in [Escape committed dist/ artifacts independently of the bundler lifecycle](durable-dist-hidden-unicode-fix-2026-06-22.md).
 
-### 6. SBOM is a separate lane from the NOTICE — ship it as a non-blocking CI artifact
+### 6. The SBOM is a separate lane from the NOTICE — and the repo no longer generates one
 
-The human-readable legal notice and the machine-readable SBOM serve different consumers. Generate the SBOM with a CycloneDX tool (`@cyclonedx/cyclonedx-npm` via `bunx`), upload it as a CI artifact, and keep it **non-blocking** — it is informational, not a build gate, and a generation failure must not fail the build.
+The human-readable legal notice and a machine-readable SBOM serve different consumers, and only the notice is load-bearing. The repo no longer generates a CI SBOM. Under Bun, `@cyclonedx/cyclonedx-npm` can't run via `bunx`: it rejects bun as `npm_execpath`. Run via npm instead, it walks bun's `node_modules` with `npm ls` and reports about 120 extraneous or invalid entries, so the output looks valid but is wrong.
 
-```yaml
-- name: Generate the dependency SBOM
-  id: sbom
-  continue-on-error: true
-  run: bunx @cyclonedx/cyclonedx-npm --output-format JSON --output-file sbom.cdx.json
-- uses: actions/upload-artifact@...
-  if: ${{ steps.sbom.outcome == 'success' }}   # gate on the step, not file existence — a shell redirect creates the file even on failure
-  with:
-    name: sbom-cyclonedx
-    path: sbom.cdx.json
-```
+The lesson to keep: a `continue-on-error` informational step can fail silently for months. If one is reintroduced, use a lockfile-reading generator. cdxgen reads `bun.lock` and covers workspaces; Syft 1.46+ reads `bun.lock` but omits workspace packages. Also make sure someone notices when the artifact stops being produced.
 
 ### 7. Probe empirically before assuming a root cause
 
@@ -123,12 +113,12 @@ The initial assumption was non-determinism, but two consecutive clean builds pro
 | Fail closed on total failure only | A silent empty notice (fail-soft) shipping with no attribution; or an over-eager hard-fail on a benign per-dep gap |
 | Fix the file model, don't exempt it | A carve-out that lets the exempted file rot indefinitely |
 | `ignorePaths` is scan-only | Wrongly assuming Renovate won't commit dist, and either keeping an unnecessary carve-out or breaking dep PRs |
-| SBOM as non-blocking artifact | A broken SBOM run failing the build, or a redirect-created empty SBOM being uploaded |
+| Informational steps need an owner | A `continue-on-error` SBOM step failing on every run for months with nobody noticing the artifact had stopped |
 | Probe before assuming | Building the wrong fix (e.g. determinism machinery the file didn't need); acting on a false-positive review finding |
 
 ## When to Apply
 
-Any project that commits a bundled or vendored `dist/` and redistributes third-party dependencies — GitHub Actions especially, where consumers pull by tag/SHA. Also when deciding an SBOM/license-attribution strategy: the modern split is a committed human-readable notice plus a CI-generated machine-readable SBOM artifact.
+Any project that commits a bundled or vendored `dist/` and redistributes third-party dependencies — GitHub Actions especially, where consumers pull by tag/SHA. Also when deciding an SBOM/license-attribution strategy: the committed human-readable notice comes first, and any machine-readable SBOM is optional and must come from a lockfile-reading generator with something that notices when it stops producing output.
 
 ## Examples
 

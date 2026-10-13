@@ -1,17 +1,18 @@
 /**
- * Tests for the gate's terminal notification as seen through the approval family.
+ * Tests for the gate's open and terminal notifications.
  *
- * Every approval emits exactly one terminal event when it leaves the gate,
- * whether or not OpenCode's echo follows.
+ * Every `put` emits one open event. Every approval emits exactly one terminal event when it
+ * leaves the gate, whether or not OpenCode's echo follows.
  */
 
 import type {GatewayLogger} from '../discord/client.js'
 import type {PermissionRequest} from './coordinator.js'
 import type {RegisterParams, RenderFn} from './registry.js'
-import type {ApprovalGateEntry, QuestionGateEntry, TerminalEvent} from './request-gate.js'
+import type {ApprovalGateEntry, OpenEvent, QuestionGateEntry, RequestGate, TerminalEvent} from './request-gate.js'
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
+import {createQuestionRegistry} from './question-registry.js'
 import {createApprovalRegistry} from './registry.js'
 import {createRequestGate} from './request-gate.js'
 
@@ -245,6 +246,221 @@ describe('terminal listeners', () => {
   })
 })
 
+function questionEntry(requestID: string, scopeId = 'chan_1'): QuestionGateEntry {
+  return {
+    ...makeEntry(requestID),
+    family: 'question',
+    scopeId,
+    payload: {
+      questions: [],
+      runId: null,
+      effects: {replyQuestion: vi.fn(), rejectQuestion: vi.fn()},
+      renderFns: [],
+    },
+  }
+}
+
+function listenForOpen(gate: RequestGate): OpenEvent[] {
+  const opens: OpenEvent[] = []
+  gate.onOpen(event => {
+    opens.push(event)
+  })
+  return opens
+}
+
+describe('open notification', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('put emits exactly one open event with identifiers only, for either family', () => {
+    // #given an open listener
+    const {gate} = setup()
+    const opens = listenForOpen(gate)
+
+    // #when an approval and a question register
+    gate.put(makeEntry('per_1'), undefined)
+    gate.put(questionEntry('que_1', 'thread_9'), undefined)
+
+    // #then one event per put, carrying the family and scope
+    expect(opens).toEqual([
+      {requestID: 'per_1', sessionID: 'ses_1', family: 'approval', scopeId: 'chan_1'},
+      {requestID: 'que_1', sessionID: 'ses_1', family: 'question', scopeId: 'thread_9'},
+    ])
+  })
+
+  it('fires after the entry is inserted: listeners see it registered and pending', () => {
+    // #given a listener that inspects the gate
+    const {gate} = setup()
+    const seen: {registered: boolean; pending: boolean}[] = []
+    gate.onOpen(event => {
+      seen.push({
+        registered: gate.get(event.requestID) !== undefined,
+        pending: gate.hasPendingForScope(event.family, event.scopeId),
+      })
+    })
+
+    // #when
+    gate.put(makeEntry('per_1'), 1_000)
+
+    // #then
+    expect(seen).toEqual([{registered: true, pending: true}])
+  })
+
+  it('a replacement put emits an open event for the new entry and no terminal event', async () => {
+    // #given a registered approval
+    const {gate, terminals} = setup()
+    gate.put(makeEntry('per_1'), 1_000)
+    const opens = listenForOpen(gate)
+
+    // #when the request id is re-registered
+    const replacement = makeEntry('per_1')
+    gate.put(replacement, undefined)
+    await vi.advanceTimersByTimeAsync(5_000)
+
+    // #then the replacement is announced once and nothing terminal fired for either entry
+    expect(opens).toEqual([{requestID: 'per_1', sessionID: 'ses_1', family: 'approval', scopeId: 'chan_1'}])
+    expect(terminals).toEqual([])
+    expect(gate.get('per_1')).toBe(replacement)
+  })
+
+  it('a replacement can carry a different scope: the event names the new scope and the displaced one', () => {
+    // #given an approval registered under one scope
+    const {gate, terminals} = setup()
+    gate.put({...makeEntry('per_1'), scopeId: 'chan_old'}, undefined)
+    const opens = listenForOpen(gate)
+
+    // #when the same request id is re-registered under another scope
+    gate.put({...makeEntry('per_1'), scopeId: 'chan_new'}, undefined)
+
+    // #then the event names the new scope and the displaced one; the old scope gets no terminal event
+    expect(opens.map(event => [event.scopeId, event.displacedScopeId])).toEqual([['chan_new', 'chan_old']])
+    expect(terminals).toEqual([])
+    expect(gate.hasPendingForScope('approval', 'chan_new')).toBe(true)
+    expect(gate.hasPendingForScope('approval', 'chan_old')).toBe(false)
+  })
+
+  it('a same-scope replacement and a first registration carry no displacedScopeId', () => {
+    // #given an approval, replaced within its own scope
+    const {gate} = setup()
+    const opens = listenForOpen(gate)
+
+    // #when it is registered, then replaced under the same scope
+    gate.put(makeEntry('per_1'), undefined)
+    gate.put(makeEntry('per_1'), undefined)
+
+    // #then neither event has the field at all
+    expect(opens).toHaveLength(2)
+    for (const event of opens) expect(Object.prototype.hasOwnProperty.call(event, 'displacedScopeId')).toBe(false)
+  })
+
+  it('a duplicate question register never reaches put and emits nothing', () => {
+    // #given a registered question
+    const logger = makeLogger()
+    const gate = createRequestGate({logger})
+    const questions = createQuestionRegistry({logger, gate})
+    const params = {
+      requestID: 'que_1',
+      sessionID: 'ses_1',
+      questionScopeId: 'thread_1',
+      questions: [],
+      effects: {replyQuestion: vi.fn(), rejectQuestion: vi.fn()},
+      deadlineMs: 60_000,
+    }
+    expect(questions.register(params)).toEqual({kind: 'registered'})
+    const opens = listenForOpen(gate)
+
+    // #when the same request id registers again
+    const outcome = questions.register(params)
+
+    // #then it is a duplicate and no open event fired
+    expect(outcome).toEqual({kind: 'duplicate'})
+    expect(opens).toEqual([])
+  })
+
+  it('a throwing open listener is logged and does not break put, later listeners or the timer', async () => {
+    // #given a throwing listener ahead of a healthy one
+    const {gate, logger, terminals} = setup()
+    gate.onOpen(() => {
+      throw new Error('listener bug')
+    })
+    const second = vi.fn()
+    gate.onOpen(second)
+    const entry = makeEntry('per_1')
+
+    // #when
+    const replaced = gate.put(entry, 1_000)
+
+    // #then the entry is registered, the error is logged, the next listener ran, and the deadline still arms
+    expect(replaced).toBeUndefined()
+    expect(gate.get('per_1')).toBe(entry)
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({requestID: 'per_1', family: 'approval'}),
+      expect.stringContaining('open listener threw'),
+    )
+    expect(second).toHaveBeenCalledOnce()
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(entry.ops.postDeadlineReply).toHaveBeenCalledOnce()
+    expect(terminals.map(event => event.outcome)).toEqual(['deadline'])
+  })
+
+  it('a question-family listener failure logs the error name only, never its message', () => {
+    // #given a listener that throws text
+    const {gate, logger} = setup()
+    gate.onOpen(() => {
+      throw new TypeError('QUESTION-TEXT-LEAK')
+    })
+
+    // #when
+    gate.put(questionEntry('que_1'), undefined)
+
+    // #then
+    expect(JSON.stringify(vi.mocked(logger.error).mock.calls)).not.toContain('QUESTION-TEXT-LEAK')
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({requestID: 'que_1', errName: 'TypeError'}),
+      expect.any(String),
+    )
+  })
+
+  it('an unsubscribed listener receives nothing', () => {
+    // #given
+    const {gate} = setup()
+    const listener = vi.fn()
+    const unsubscribe = gate.onOpen(listener)
+    unsubscribe()
+
+    // #when
+    gate.put(makeEntry('per_1'), undefined)
+
+    // #then
+    expect(listener).not.toHaveBeenCalled()
+  })
+
+  it('open precedes terminal, and terminal still fires once after the entry is removed', async () => {
+    // #given open and terminal listeners that record order and registration state
+    const {gate} = setup()
+    const order: string[] = []
+    gate.onOpen(event => {
+      order.push(`open:${event.requestID}:${gate.get(event.requestID) === undefined ? 'gone' : 'live'}`)
+    })
+    gate.onTerminal(event => {
+      order.push(`terminal:${event.requestID}:${gate.get(event.requestID) === undefined ? 'gone' : 'live'}`)
+    })
+    const entry = makeEntry('per_1')
+
+    // #when the entry registers and an echo settles it
+    gate.put(entry, undefined)
+    await gate.settleEcho(entry, async () => undefined)
+
+    // #then
+    expect(order).toEqual(['open:per_1:live', 'terminal:per_1:gone'])
+  })
+})
+
 // ---------------------------------------------------------------------------
 // Gate-owned lifecycle operations: the paired steps never run on their own
 // ---------------------------------------------------------------------------
@@ -294,6 +510,7 @@ describe('gate lifecycle surface', () => {
       'hasPendingForScope',
       'list',
       'logRenderFailure',
+      'onOpen',
       'onTerminal',
       'put',
       'retire',

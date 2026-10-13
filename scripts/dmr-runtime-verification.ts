@@ -30,6 +30,7 @@ const SHA_RE = /^[0-9a-f]{40}$/
 // undercounts the sweep.
 const REPO_SLUG_RE = /\b(\w(?:[\w.-]*\w)?\/\.?\w(?:[\w.-]*\w)?)\b/
 const TARGET_HEADINGS = new Set(['checkout posture verified', 'migration merged'])
+// Bounds every buffered response; see compareCommits for why its direction matters.
 const MAX_RESPONSE_BYTES = 2_000_000
 // GitHub secondary rate limits trigger on concurrency, not just request volume;
 // bounding the sweep keeps a 403 from making the whole run flaky.
@@ -47,6 +48,11 @@ export interface WorkflowRunSummary {
 export interface GithubClient {
   readonly listWorkflowRuns: (repository: string) => Promise<readonly WorkflowRunSummary[]>
   readonly getWorkflowFileAtSha: (repository: string, sha: string) => Promise<string>
+  /**
+   * Returns how many commits reachable from `base` are missing from `head` (the `base` side's lead
+   * over `head`). The sweep calls it as `compareCommits(PREFLIGHT_COMMIT, pin)`, so 0 means the pin
+   * contains the whole preflight.
+   */
   readonly compareCommits: (base: string, head: string) => Promise<number>
   readonly getIssueBody: (owner: string, repo: string, issueNumber: number) => Promise<string>
   readonly resolveRef: (ref: string) => Promise<string>
@@ -399,12 +405,16 @@ export function createGithubClient(token: string, fetchImpl: typeof fetch = fetc
       )
     },
     async compareCommits(base, head) {
-      const body = await getJson(`https://api.github.com/repos/fro-bot/agent/compare/${base}...${head}`)
-      const behindBy = (body as {behind_by?: unknown} | null)?.behind_by
-      if (typeof behindBy !== 'number') {
+      // Reversed (head...base, read ahead_by): base...head would also return every commit and patched
+      // file between them, which overflows MAX_RESPONSE_BYTES for a current head.
+      const body = await getJson(
+        `https://api.github.com/repos/fro-bot/agent/compare/${encodeURIComponent(head)}...${encodeURIComponent(base)}?per_page=1`,
+      )
+      const aheadBy = (body as {ahead_by?: unknown} | null)?.ahead_by
+      if (typeof aheadBy !== 'number') {
         throw new TypeError('malformed-compare-response')
       }
-      return behindBy
+      return aheadBy
     },
     async getIssueBody(owner, repo, issueNumber) {
       const body = await getJson(`https://api.github.com/repos/${owner}/${repo}/issues/${issueNumber}`)

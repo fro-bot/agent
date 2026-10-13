@@ -294,7 +294,14 @@ export function makeStreamSinkMock(
     markVisibleOutputPending?: ReturnType<typeof vi.fn>
     hasVisibleOutput?: ReturnType<typeof vi.fn>
   } = {},
-) {
+): {
+  append: ReturnType<typeof vi.fn>
+  flush: ReturnType<typeof vi.fn>
+  buffered: ReturnType<typeof vi.fn>
+  markVisibleOutputSent: ReturnType<typeof vi.fn>
+  markVisibleOutputPending: ReturnType<typeof vi.fn>
+  hasVisibleOutput: ReturnType<typeof vi.fn>
+} {
   return {
     append: overrides.append ?? vi.fn(),
     flush: overrides.flush ?? vi.fn().mockResolvedValue({kind: 'sent' as const, charCount: 10}),

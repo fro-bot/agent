@@ -89,7 +89,8 @@ export interface PushDispatcher {
   dispatchApprovalPending: (approvalId: string) => Promise<void>
   /**
    * Nudge operators that an agent question is waiting. Deduped per run: one nudge covers every
-   * question the run asks within the dedupe window. Carries no question content by construction.
+   * question the run asks within the dedupe window. Carries no question content by construction;
+   * the run id only deep-links the notification.
    */
   dispatchQuestionPending: (runId: string) => Promise<void>
   dispatchRunFailed: (runId: string, failureLabel?: OperatorFailureKind) => Promise<void>
@@ -253,7 +254,7 @@ export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispat
 
   async function dispatchQuestionPending(runId: string): Promise<void> {
     try {
-      const payload = JSON.stringify(buildQuestionPayload())
+      const payload = JSON.stringify(buildQuestionPayload(runId))
       await broadcast('question', runId, payload)
     } catch {
       logger.warn({runId}, 'operator push dispatch: question dispatch threw — continuing')

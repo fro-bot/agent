@@ -112,20 +112,6 @@ jobs:
         with:
           name: dist
           path: dist/
-      # The SBOM is an informational artifact, not a build gate — a generation
-      # failure must not fail the build.
-      # pnpm sbom has no Bun equivalent; using @cyclonedx/cyclonedx-npm as a non-blocking substitute.
-      # Unlike the prior `pnpm sbom --prod`, this scans node_modules and so includes dev
-      # dependencies. The SBOM is informational only, so the broader scope is acceptable.
-      - name: Generate the dependency SBOM
-        id: sbom
-        continue-on-error: true
-        run: bunx @cyclonedx/cyclonedx-npm --output-format JSON --output-file sbom.cdx.json
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: ${{ steps.sbom.outcome == 'success' }}
-        with:
-          name: sbom-cyclonedx
-          path: sbom.cdx.json
 
   test:
     name: Test
@@ -979,7 +965,7 @@ jobs:
     steps:
       - id: get-app-token
         name: Get GitHub App Installation Token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ secrets.APPLICATION_ID }}
           private-key: ${{ secrets.APPLICATION_PRIVATE_KEY }}
