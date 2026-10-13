@@ -7,6 +7,7 @@
  * - Edge: denied/keyless repo (projectRunStatus → null) yields null.
  * - Safety: the closed DTO contains ONLY the contract fields — no details passthrough.
  * - Scope: scopeIdFor returns thread_id for discord, run_id for non-discord.
+ * - Split: projectRunBase never overlays; overlayWaitingStatus is the one synchronous overlay.
  *
  * Test seam: projectRunStatus is injected via the deps object so tests can drive
  * it without needing a real binding store or denylist. This avoids the async I/O
@@ -22,11 +23,11 @@ import type {
   OperatorRunStatus,
   OperatorWebStatus,
 } from '../../operator-contract/index.js'
-import type {ProjectRunObservationDeps} from './projection.js'
+import type {ProjectRunObservationDeps, WaitingPredicates} from './projection.js'
 
 import {describe, expect, it} from 'vitest'
 
-import {projectRunObservation, scopeIdFor} from './projection.js'
+import {overlayWaitingStatus, projectRunBase, projectRunObservation, scopeIdFor} from './projection.js'
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -690,5 +691,175 @@ describe('projectRunObservation — checkout fields', () => {
 
     // #then no field is dropped
     expect(result).toEqual(full)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// overlayWaitingStatus — the exported synchronous overlay
+// ---------------------------------------------------------------------------
+
+function makePredicates(pendingApprovalScopes: readonly string[], pendingQuestionScopes: readonly string[]) {
+  return {
+    hasPendingApproval: (scopeId: string) => pendingApprovalScopes.includes(scopeId),
+    hasPendingQuestion: (scopeId: string) => pendingQuestionScopes.includes(scopeId),
+  } satisfies WaitingPredicates
+}
+
+describe('overlayWaitingStatus', () => {
+  it('returns waiting_for_approval for running with a pending approval', () => {
+    // #given a running status and a pending approval in scope
+    const predicates = makePredicates(['scope-1'], [])
+
+    // #when overlaying
+    const result = overlayWaitingStatus('running', 'scope-1', predicates)
+
+    // #then approval wins
+    expect(result).toBe('waiting_for_approval')
+  })
+
+  it('returns waiting_for_question for running with only a pending question', () => {
+    // #given a running status and a pending question only
+    const predicates = makePredicates([], ['scope-1'])
+
+    // #when overlaying
+    const result = overlayWaitingStatus('running', 'scope-1', predicates)
+
+    // #then the question overlay applies
+    expect(result).toBe('waiting_for_question')
+  })
+
+  it('returns waiting_for_approval when both are pending', () => {
+    // #given both families pending
+    const predicates = makePredicates(['scope-1'], ['scope-1'])
+
+    // #when overlaying
+    const result = overlayWaitingStatus('running', 'scope-1', predicates)
+
+    // #then approval takes precedence
+    expect(result).toBe('waiting_for_approval')
+  })
+
+  it('returns running when nothing is pending in the scope', () => {
+    // #given pending entries only in another scope
+    const predicates = makePredicates(['other'], ['other'])
+
+    // #when overlaying
+    const result = overlayWaitingStatus('running', 'scope-1', predicates)
+
+    // #then the status is unchanged
+    expect(result).toBe('running')
+  })
+
+  it.each(['queued', 'blocked', 'succeeded', 'failed', 'cancelled'] as const)(
+    'leaves %s unchanged even with pending approval and question',
+    status => {
+      // #given a non-running status with stale pending entries
+      const predicates = makePredicates(['scope-1'], ['scope-1'])
+
+      // #when overlaying
+      const result = overlayWaitingStatus(status, 'scope-1', predicates)
+
+      // #then the overlay does not apply
+      expect(result).toBe(status)
+    },
+  )
+
+  it('does not consult the predicates for a non-running status', () => {
+    // #given spy predicates
+    let calls = 0
+    const predicates: WaitingPredicates = {
+      hasPendingApproval: () => {
+        calls += 1
+        return true
+      },
+      hasPendingQuestion: () => {
+        calls += 1
+        return true
+      },
+    }
+
+    // #when overlaying a terminal status
+    overlayWaitingStatus('succeeded', 'scope-1', predicates)
+
+    // #then neither registry was read
+    expect(calls).toBe(0)
+  })
+
+  it('passes the scope id through to both predicates', () => {
+    // #given predicates that record the scopes they receive
+    const seen: string[] = []
+    const predicates: WaitingPredicates = {
+      hasPendingApproval: scopeId => {
+        seen.push(`a:${scopeId}`)
+        return false
+      },
+      hasPendingQuestion: scopeId => {
+        seen.push(`q:${scopeId}`)
+        return false
+      },
+    }
+
+    // #when overlaying a running status
+    overlayWaitingStatus('running', 'scope-9', predicates)
+
+    // #then approval is read first, then question, both with the scope
+    expect(seen).toEqual(['a:scope-9', 'q:scope-9'])
+  })
+
+  it('composes with scopeIdFor: discord keys on thread_id, web on run_id', () => {
+    // #given pending entries keyed by thread and by run id
+    const predicates = makePredicates(['thread-d'], ['run-w'])
+    const discord = makeRunState({surface: 'discord', thread_id: 'thread-d', run_id: 'run-d'})
+    const web = makeRunState({surface: 'web', thread_id: 'thread-w', run_id: 'run-w'})
+
+    // #when overlaying each run under its own scope
+    const discordStatus = overlayWaitingStatus('running', scopeIdFor(discord), predicates)
+    const webStatus = overlayWaitingStatus('running', scopeIdFor(web), predicates)
+
+    // #then each run sees only its own scope's entries
+    expect(discordStatus).toBe('waiting_for_approval')
+    expect(webStatus).toBe('waiting_for_question')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// projectRunBase — async base projection, never overlaid
+// ---------------------------------------------------------------------------
+
+describe('projectRunBase', () => {
+  it('returns running (no overlay) even when the scope has pending entries', async () => {
+    // #given a running bridge result; base deps carry no overlay predicates
+    const deps = makeDeps(makeBaseStatus())
+
+    // #when projecting the base
+    const result = await projectRunBase(makeRunState(), deps)
+
+    // #then the status is the plain base status
+    expect(result?.status).toBe('running')
+  })
+
+  it('returns null for a denied or keyless repo', async () => {
+    // #given the bridge returns null
+    const deps = makeDeps(null)
+
+    // #when projecting the base
+    const result = await projectRunBase(makeRunState(), deps)
+
+    // #then nothing is surfaced
+    expect(result).toBeNull()
+  })
+
+  it('copies only contract fields from the bridge result', async () => {
+    // #given a bridge result carrying an extra, non-contract key
+    const leaky = {...makeBaseStatus(), holder_id: 'should-not-leak'} as OperatorRunStatus
+    const deps = makeDeps(leaky)
+
+    // #when projecting the base
+    const result = await projectRunBase(makeRunState(), deps)
+
+    // #then the extra key is dropped
+    expect(Object.keys(result as object).sort()).toEqual(
+      ['entityRef', 'phase', 'runId', 'stale', 'startedAt', 'status', 'surface'].sort(),
+    )
   })
 })
