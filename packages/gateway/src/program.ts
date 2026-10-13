@@ -56,6 +56,7 @@ import {createWorkflowDispatcher} from './github/dispatch.js'
 import {createRateLimiter} from './http/rate-limit.js'
 import {createDenylistCache} from './redaction/denylist.js'
 import {createAppClientMetadataReader} from './redaction/reader-app-client.js'
+import {projectRunStatusWithKey} from './redaction/surface-gate.js'
 import {forceReleaseStaleLockEffect} from './runtime-effect.js'
 import {DEFAULT_DRAIN_MS, installShutdownHandlers, isShuttingDown} from './shutdown.js'
 import {emitAudit} from './web/audit.js'
@@ -72,7 +73,6 @@ import {createOperatorPushSubscriptionStore} from './web/operator-push/subscript
 import {shouldNotify} from './web/operator-push/trigger-policy.js'
 import {createWebQuestionOnRegistered} from './web/operator/web-question.js'
 import {createRunObservationManager} from './web/sse/manager.js'
-import {projectRunObservation} from './web/sse/projection.js'
 import {createWorkspaceClient} from './workspace-api/client.js'
 import {ensureWorkspaceClone} from './workspace-api/ensure-clone.js'
 
@@ -521,15 +521,19 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       logger,
     })
     const runObservationManager = createRunObservationManager({
-      projectRunObservation: async runState =>
-        projectRunObservation(runState, {
+      // The manager retains the resolved repository key for refresh-time denylist checks.
+      projectBase: async runState =>
+        projectRunStatusWithKey(runState, {
           nowMs: Date.now(),
           staleThresholdMs: DEFAULT_STALE_THRESHOLD_MS,
           bindingsLookup: bindingsStore,
           isRepoDenied: denylistCache.isRepoDenied,
-          hasPendingForScope: scopeId => approvalRegistry.hasPendingForScope(scopeId),
-          hasPendingQuestionForScope: scopeId => questionRegistry.hasPendingForScope(scopeId),
         }),
+      waiting: {
+        hasPendingApproval: scopeId => approvalRegistry.hasPendingForScope(scopeId),
+        hasPendingQuestion: scopeId => questionRegistry.hasPendingForScope(scopeId),
+      },
+      isRepoDenied: denylistCache.isRepoDenied,
       logger,
       setInterval: (cb, ms) => setInterval(cb, ms),
       clearInterval: id => clearInterval(id),
@@ -537,6 +541,19 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       clearTimeout: id => clearTimeout(id),
       now: () => Date.now(),
     })
+
+    // A request opening or leaving the gate changes what a run is waiting on. The gate spans both
+    // request families, so two subscriptions cover approvals and questions on every surface.
+    const unsubscribeWaitingRefresh = [
+      requestGate.onOpen(event => {
+        runObservationManager.refreshScope(event.scopeId)
+        // A replacement that moved the request out of another scope emits no terminal event for it.
+        if (event.displacedScopeId !== undefined) runObservationManager.refreshScope(event.displacedScopeId)
+      }),
+      requestGate.onTerminal(event => {
+        runObservationManager.refreshScope(event.scopeId)
+      }),
+    ]
 
     // Prime the denylist cache once at startup so isRepoDenied reads primed state
     // rather than deny-all. A prime failure is logged but must not crash startup —
@@ -1059,7 +1076,9 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       // Stop the denylist background refresh — no new refreshes after shutdown starts.
       clearInterval(denylistRefreshInterval)
 
-      // Shut down the run-observation manager — closes all SSE subscriptions and clears timers.
+      // Stop refreshing status from gate events, then shut down the run-observation manager —
+      // closes all SSE subscriptions and clears timers.
+      for (const unsubscribe of unsubscribeWaitingRefresh) unsubscribe()
       runObservationManager.shutdown()
 
       // Dispose pending approvals and questions before draining runs — ensures pending

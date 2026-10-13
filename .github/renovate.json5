@@ -223,6 +223,13 @@
       allowedVersions: '<25',
     },
     {
+      // package.json `overrides` are security floors (#1365) capped below the major their dependents require
+      // (postcss needs nanoid ^3, cosmiconfig needs js-yaml ^4); a major must be raised deliberately, not proposed.
+      matchDepTypes: ['overrides'],
+      matchUpdateTypes: ['major'],
+      enabled: false,
+    },
+    {
       // `fix` is autofix-only, and update branches touch manifests, lockfiles,
       // and workflow YAML — none of which ESLint reads. Running it repo-wide on
       // every branch costs ~95s to change nothing, so it runs only for the

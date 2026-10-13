@@ -117,6 +117,7 @@ function makeStubApprovalRegistry() {
   return {
     handleDecision: async () => 'not-found' as const,
     describePendingForScope: () => [],
+    hasPendingForScope: () => false,
   }
 }
 
@@ -125,6 +126,7 @@ function makeStubQuestionRegistry() {
     decide: async () => ({kind: 'not-found' as const}),
     describePendingForRun: () => [],
     isClaimed: () => false,
+    hasPendingForScope: () => false,
   }
 }
 

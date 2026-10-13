@@ -91,7 +91,7 @@ Symbols verified against the live source tree. Where a symbol has moved to `pack
 | `createApp` | Function | `apps/workspace-agent/src/server.ts` | Control-API Hono app; required `auth` union |
 | `withRepoLock` | Function | `apps/workspace-agent/src/repo-mutex.ts` | Per-repo mutation mutex and maintenance hold |
 | `createRecoverCheckoutCommand` / `createCheckoutBackupCommand` | Function | `packages/gateway/src/discord/commands/{recover-checkout,checkout-backup}.ts` | `/fro-bot recover-checkout` and `checkout-backup` |
-| `OPERATOR_CONTRACT_VERSION` | Constant | `packages/gateway/src/operator-contract/version.ts` | Pinned operator contract version (`1.10.0`) |
+| `OPERATOR_CONTRACT_VERSION` | Constant | `packages/gateway/src/operator-contract/version.ts` | Pinned operator contract version (`1.11.0`) |
 | `resolveClient` / `parseCanonicalAddress` | Function | `packages/gateway/src/web/ingress/{resolve-client,canonical-address}.ts` | Trusted-proxy-aware client address; strict IP parser |
 | `createPushHealthTracker` / `observePushAdapterHealth` | Function | `packages/gateway/src/web/operator-push/{push-health,push-health-adapter}.ts` | Passive operator push health |
 

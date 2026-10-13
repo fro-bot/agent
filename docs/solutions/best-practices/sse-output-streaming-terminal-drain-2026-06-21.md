@@ -136,16 +136,26 @@ while (sub.queue.length > 0) {
 
 ### 5. Guard against out-of-order async projections
 
-If the observations feeding the stream are async and can resolve out of causal order, a stale **non-terminal** state resolving *after* terminal must not regress the cached terminal status or evict the replay entry. Track a per-run terminal-seen set and drop late non-terminal observations:
+If the observations feeding the stream are async and can resolve out of causal order, a stale **non-terminal** state resolving *after* terminal must not regress the cached terminal status or evict the replay entry. Two guards cover the two directions. A **cancellation token** per `observe()` covers observations already in flight: a terminal-phase observe marks the run's registered tokens cancelled synchronously, before its own projection await and whatever that projection returns, and a cancelled non-terminal result is discarded after its await. Tokens leave in a `finally`, so memory is bounded by observations in flight, and no timer can revalidate a cancelled one. A **TTL-bounded terminal-seen set** covers observations that start later: fence it synchronously at terminal entry, expire each entry after the replay TTL, and drop late non-terminal observations:
 
 ```ts
-if (isTerminal(projected.status) === false && terminalRuns.has(runId) === true) {
-  logger.warn(/* ... */, 'non-terminal observe arrived after terminal — dropping stale observation')
-  return
+if (TERMINAL_PHASES.has(runState.phase)) {
+  cancelInFlightObservations(runId) // tokens, before the await
+  fenceTerminalRun(runId) // TTL-bounded
 }
-if (isTerminal(projected.status) === true) {
-  terminalRuns.add(runId)
-  // ...cache the terminal replay entry...
+const token = registerInFlightObservation(runId)
+try {
+  // ...await the projection...
+  if (isTerminal(projected.status) === false && (token.cancelled || terminalRuns.has(runId))) {
+    logger.warn(/* ... */, 'non-terminal observe arrived after terminal — dropping stale observation')
+    return
+  }
+  if (isTerminal(projected.status) === true) {
+    fenceTerminalRun(runId) // restart the window to span the replay entry
+    // ...cache the terminal replay entry...
+  }
+} finally {
+  unregisterInFlightObservation(runId, token)
 }
 ```
 

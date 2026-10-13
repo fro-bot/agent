@@ -4,9 +4,11 @@ import {defineConfig} from 'vitest/config'
 
 import {incompleteRunReporterPlugin} from './scripts/vitest-incomplete-run-reporter.ts'
 
-// Package suites run `vitest` from their own directory and resolve this config by walking up, so the plugin
-// below applies to every suite `bun run test` runs. It fails the run when a worker crash left tests with no
-// result (see scripts/vitest-incomplete-run-reporter.ts).
+// Vitest 5 no longer walks up to find a config, so every package suite (runtime, gateway, harness, workspace-agent)
+// runs `vitest` from its own directory with `--config ../../vitest.config.ts` to share this file; the Action suite sets
+// `--root` to the repo root. The workspace-test Docker stage copies this file and its imports for the same reason. The
+// plugin below fails the run when a worker crash left tests with no result (see
+// scripts/vitest-incomplete-run-reporter.ts).
 export default defineConfig({
   plugins: [incompleteRunReporterPlugin()],
   test: {

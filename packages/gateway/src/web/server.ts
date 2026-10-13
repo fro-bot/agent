@@ -264,18 +264,26 @@ export interface OperatorServerDeps {
    * and auditLogger), the following routes are registered:
    *   - POST /operator/runs/:runId/approvals/:requestId/decision (write-gated)
    *   - GET  /operator/runs/:runId/approvals (read-gated, enumeration)
-   * When absent, neither route is registered (opt-in).
+   * When absent, neither route is registered (opt-in). GET /operator/runs also
+   * requires it (waiting overlay), as well as questionRegistry.
    */
-  readonly approvalRegistry?: Pick<ApprovalRegistry, 'handleDecision' | 'describePendingForScope'>
+  readonly approvalRegistry?: Pick<
+    ApprovalRegistry,
+    'handleDecision' | 'describePendingForScope' | 'hasPendingForScope'
+  >
   /**
    * Question registry for the question routes. When present (alongside the browser guard,
    * sessionStore, runIndex, denylistCache, bindingsLookup, allowlist, and auditLogger), the
    * following routes are registered:
    *   - POST /operator/runs/:runId/questions/:requestId/decision (write-gated; answer or skip)
    *   - GET  /operator/runs/:runId/questions (read-gated, enumeration)
-   * When absent, neither route is registered (opt-in).
+   * When absent, neither route is registered (opt-in). GET /operator/runs also
+   * requires it (waiting overlay), as well as approvalRegistry.
    */
-  readonly questionRegistry?: Pick<QuestionRegistry, 'decide' | 'describePendingForRun' | 'isClaimed'>
+  readonly questionRegistry?: Pick<
+    QuestionRegistry,
+    'decide' | 'describePendingForRun' | 'isClaimed' | 'hasPendingForScope'
+  >
   /**
    * Cancel-run engine dependencies (queue, abort registry, approvals, Discord
    * client, coordination config/identity) for the cancel route's `cancelRun`
@@ -843,7 +851,8 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   // ── Run-index listing endpoint ─────────────────────────────────────────────
   //
   // Registered only when the full browser guard is present AND listBindings,
-  // denylistCache, sessionStore, and runIndex are provided.
+  // denylistCache, sessionStore, runIndex, approvalRegistry, and questionRegistry
+  // are provided (the registries feed the waiting overlay).
   // Route: GET /operator/runs — privileged (requires session + allowlist).
   // Returns a bounded, repo-scoped, newest-first list of run summaries for all
   // repositories the operator is authorized to access.
@@ -857,8 +866,9 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   //   6. checkRepoAuthz() per surviving binding — keep only authorized repos
   //   7. listRunsForRepo() per authorized binding — enumerate run-states
   //   8. toRunSummary() projection — drop null (entity_ref mismatch) + warn
-  //   9. Flatten; sort newest-first by createdAt; cap at MAX_RUNS_PER_LISTING
-  //  10. Cache-Control: no-store, private; return 200 {runs: RunSummary[]}
+  //   9. overlayWaitingStatus() against the registries, after listRunsForRepo resolves
+  //  10. Flatten; sort newest-first by createdAt; cap at MAX_RUNS_PER_LISTING
+  //  11. Cache-Control: no-store, private; return 200 {runs: RunSummary[]}
   if (
     browserGuardDeps !== undefined &&
     deps.sessionStore !== undefined &&
@@ -866,7 +876,9 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
     deps.listBindings !== undefined &&
     deps.allowlist !== undefined &&
     deps.auditLogger !== undefined &&
-    deps.runIndex !== undefined
+    deps.runIndex !== undefined &&
+    deps.approvalRegistry !== undefined &&
+    deps.questionRegistry !== undefined
   ) {
     const clock = deps.sessionDeps?.clock ?? (() => Date.now())
     buildRunsRoute(app, {
@@ -883,6 +895,8 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
         cache: deps.repoAuthzCache ?? createRepoAuthzCache(),
       },
       listRunsForRepo: deps.runIndex.listRunsForRepo.bind(deps.runIndex),
+      approvalRegistry: deps.approvalRegistry,
+      questionRegistry: deps.questionRegistry,
       logger: deps.logger,
       now: clock,
     })

@@ -9,7 +9,7 @@
     "check-types": "bunx tsc -p tsconfig.json --noEmit",
     "fix": "bunx eslint --fix src",
     "lint": "bunx eslint src",
-    "test": "bunx vitest run --passWithNoTests src"
+    "test": "bunx vitest run --config ../../vitest.config.ts --passWithNoTests src"
   },
   "dependencies": {
     "@fro-bot/runtime": "workspace:*",

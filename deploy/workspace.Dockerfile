@@ -117,6 +117,11 @@ FROM build-deps AS workspace-test
 # so this is confined to the test-only stage rather than added to runtime.
 RUN apk add --no-cache git=2.54.0-r0 git-daemon=2.54.0-r0 openssl
 
+# Vitest 5 does not walk up to find a config, so the suite (run with `--config ../../vitest.config.ts`) needs the
+# root config plus the local modules it imports (setup file, home-isolation helper, incomplete-run reporter).
+COPY vitest.config.ts ./
+COPY scripts/vitest-home-isolation.ts scripts/vitest-home-isolation.setup.ts scripts/vitest-incomplete-run-reporter.ts scripts/
+
 CMD ["sh", "-c", "set -e; git --version; exec bun run --filter @fro-bot/workspace-agent test"]
 
 # ── Stage 1 (continued): build (prune dev deps to production-only) ───────────
@@ -148,7 +153,7 @@ WORKDIR /app
 # in the form <base>+harness.<sha>. Bumped in lockstep with the action default
 # by the harness-release workflow; merge the auto-PR to advance both surfaces.
 ARG OPENCODE_VERSION=1.19.0+harness.caa47272
-ARG SYSTEMATIC_VERSION=3.21.8
+ARG SYSTEMATIC_VERSION=3.22.1
 
 # System packages, pinned to exact Alpine 3.24 versions (the base tag's
 # `-alpine3.24` suffix and the apk registryUrls in .github/renovate.json5 name

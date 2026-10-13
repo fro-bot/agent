@@ -17,13 +17,23 @@ import type {
   OperatorCheckoutProvenance,
   OperatorRunStatus,
   QuestionFrameData,
+  RunStatusRepoKey,
 } from '../../operator-contract/index.js'
-import type {ObservationFrame, OutputFrame, RunObservationManager, RunObservationManagerDeps} from './manager.js'
+import type {RunStatusProjection} from '../../redaction/surface-gate.js'
+import type {
+  ObservationFrame,
+  OutputFrame,
+  RunObservationManager,
+  RunObservationManagerDeps,
+  ScopeRefresher,
+} from './manager.js'
+import type {WaitingPredicates} from './projection.js'
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
+import {PHASE_TO_WEB_STATUS} from '../../operator-contract/run-status.js'
+import {projectRunStatusWithKey} from '../../redaction/surface-gate.js'
 import {createRunObservationManager, MAX_OPEN_QUESTION_REPLAY_PER_RUN} from './manager.js'
-import {projectRunObservation} from './projection.js'
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -151,16 +161,29 @@ function makeFakeTimerSystem(startMs = 0): FakeTimerSystem {
 // Manager factory helper
 // ---------------------------------------------------------------------------
 
-type ProjectFn = RunObservationManagerDeps['projectRunObservation']
+type ProjectFn = (runState: RunState) => Promise<OperatorRunStatus | null>
+
+const DEFAULT_REPO_KEY: RunStatusRepoKey = {databaseId: 1, nodeId: 'R_1'}
+const NO_WAITING: WaitingPredicates = {hasPendingApproval: () => false, hasPendingQuestion: () => false}
+
+/** Adapts a status-returning test projector (null = denied) to the manager's base-projection dep. */
+function toProjectBase(projectFn: ProjectFn): RunObservationManagerDeps['projectBase'] {
+  return async runState => {
+    const status = await projectFn(runState)
+    return status === null ? {kind: 'denied'} : {kind: 'projected', status, repoKey: DEFAULT_REPO_KEY}
+  }
+}
 
 function makeManager(
   projectFn: ProjectFn,
   overrides: Partial<RunObservationManagerDeps> = {},
   fakeTimers?: FakeTimerSystem,
-): {manager: RunObservationManager; timers: FakeTimerSystem} {
+): {manager: RunObservationManager & ScopeRefresher; timers: FakeTimerSystem} {
   const timers = fakeTimers ?? makeFakeTimerSystem()
   const manager = createRunObservationManager({
-    projectRunObservation: projectFn,
+    projectBase: toProjectBase(projectFn),
+    waiting: NO_WAITING,
+    isRepoDenied: () => false,
     logger: {
       info: vi.fn(),
       warn: vi.fn(),
@@ -701,7 +724,7 @@ describe('denied-repo omission', () => {
 
   it('cold-start deny-all: null projection at manager boundary yields no cache entry and no emitted frame', async () => {
     // Pins the fail-closed posture at the manager boundary: when the denylist cache is
-    // unprimed (cold start), projectRunObservation returns null (deny-all). The manager
+    // unprimed (cold start), projectBase returns denied (deny-all). The manager
     // must produce no observable output — no cache write, no frame to any subscriber.
 
     // #given a manager whose projection always returns null (unprimed denylist → deny-all)
@@ -753,7 +776,9 @@ describe('observer-only invariant — LOAD-BEARING', () => {
     // mutators, TypeScript would require them and this test would fail to compile.
 
     const deps: RunObservationManagerDeps = {
-      projectRunObservation: async () => null,
+      projectBase: async () => ({kind: 'denied'}),
+      waiting: NO_WAITING,
+      isRepoDenied: () => false,
       logger: {info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn()},
       setInterval: globalThis.setInterval.bind(globalThis),
       clearInterval: globalThis.clearInterval.bind(globalThis),
@@ -773,7 +798,9 @@ describe('observer-only invariant — LOAD-BEARING', () => {
 
     // All present keys are in the allowed set
     const allowedKeys = new Set([
-      'projectRunObservation',
+      'projectBase',
+      'waiting',
+      'isRepoDenied',
       'logger',
       'setInterval',
       'clearInterval',
@@ -1203,9 +1230,9 @@ describe('run isolation', () => {
 // 11. Error path: throwing projectFn is caught, logged, no cache/frame
 // ===========================================================================
 
-describe('error path — throwing projectRunObservation', () => {
+describe('error path — throwing projectBase', () => {
   it('a rejecting projectFn is caught, logged, and produces no cache entry and no frame', async () => {
-    // #given a manager whose projectRunObservation always rejects
+    // #given a manager whose projectBase always rejects
     const projectFn: ProjectFn = async () => {
       throw new Error('projection exploded')
     }
@@ -1233,7 +1260,7 @@ describe('error path — throwing projectRunObservation', () => {
     // #then the warn logger was called (error was logged)
     expect(warnSpy).toHaveBeenCalledWith(
       expect.objectContaining({runId: 'run-001'}),
-      expect.stringContaining('projectRunObservation threw'),
+      expect.stringContaining('projectBase threw'),
     )
 
     // #then no cache entry was created (subscribing again gets reset)
@@ -1915,6 +1942,7 @@ describe('observer-only invariant — observeOutput extension', () => {
     // #then the manager has only the expected public API
     const allowedManagerKeys = new Set([
       'observe',
+      'refreshScope',
       'observeOutput',
       'observeApproval',
       'observeQuestion',
@@ -1932,7 +1960,9 @@ describe('observer-only invariant — observeOutput extension', () => {
   it('runObservationManagerDeps type still has no mutating run API after observeOutput addition', () => {
     // #given the RunObservationManagerDeps type (compile-time structural check)
     const deps: RunObservationManagerDeps = {
-      projectRunObservation: async () => null,
+      projectBase: async () => ({kind: 'denied'}),
+      waiting: NO_WAITING,
+      isRepoDenied: () => false,
       logger: {info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn()},
       setInterval: globalThis.setInterval.bind(globalThis),
       clearInterval: globalThis.clearInterval.bind(globalThis),
@@ -1952,7 +1982,9 @@ describe('observer-only invariant — observeOutput extension', () => {
 
     // All present keys are in the allowed set (includes new terminal replay TTL deps)
     const allowedKeys = new Set([
-      'projectRunObservation',
+      'projectBase',
+      'waiting',
+      'isRepoDenied',
       'logger',
       'setInterval',
       'clearInterval',
@@ -3004,7 +3036,7 @@ describe('observeQuestion — reconnect reconciliation', () => {
 
 describe('status frame — checkout fields through the real projection', () => {
   it('delivers checkoutProvenance and checkoutPreparation on the emitted status frame', async () => {
-    // #given a manager wired to the real projectRunObservation and a run carrying both fields
+    // #given a manager wired to the real projectRunStatusWithKey and a run carrying both fields
     const provenance: OperatorCheckoutProvenance = {
       kind: 'observed',
       observation: {
@@ -3017,15 +3049,14 @@ describe('status frame — checkout fields through the real projection', () => {
     }
     const preparation: OperatorCheckoutPreparation = {outcome: 'refused', reason: 'dirty', changedPaths: ['a.ts']}
     const runState = makeRunState({details: {checkoutProvenance: provenance, checkoutPreparation: preparation}})
-    const projectFn: ProjectFn = async state =>
-      projectRunObservation(state, {
+    const projectBase: RunObservationManagerDeps['projectBase'] = async state =>
+      projectRunStatusWithKey(state, {
         nowMs: 1_000_000,
         staleThresholdMs: 60_000,
         bindingsLookup: {getBindingByRepo: async () => ({success: true, data: {databaseId: 1, nodeId: 'R_1'}})},
         isRepoDenied: () => false,
-        hasPendingForScope: () => false,
       })
-    const {manager} = makeManager(projectFn)
+    const {manager} = makeManager(async () => null, {projectBase})
     const {frames} = collectFrames(manager, 'run-001')
 
     // #when the run is observed
@@ -3581,5 +3612,1057 @@ describe('subscribe — durable projection is re-guarded after it resolves (#163
     expect(closes).toEqual(['terminal'])
 
     manager.shutdown()
+  })
+})
+
+// ===========================================================================
+// Waiting-status refresh: live status and replay follow registry truth
+// ===========================================================================
+
+/** In-memory stand-in for the approval and question registries, keyed by scope and request id. */
+function makeRegistryFake() {
+  const approvals = new Map<string, Set<string>>()
+  const questions = new Map<string, Set<string>>()
+
+  const has = (registry: Map<string, Set<string>>, scopeId: string): boolean => (registry.get(scopeId)?.size ?? 0) > 0
+  const open = (registry: Map<string, Set<string>>, scopeId: string, requestID: string): void => {
+    const ids = registry.get(scopeId) ?? new Set<string>()
+    ids.add(requestID)
+    registry.set(scopeId, ids)
+  }
+  const close = (registry: Map<string, Set<string>>, scopeId: string, requestID: string): void => {
+    registry.get(scopeId)?.delete(requestID)
+  }
+
+  return {
+    predicates: {
+      hasPendingApproval: (scopeId: string) => has(approvals, scopeId),
+      hasPendingQuestion: (scopeId: string) => has(questions, scopeId),
+    } satisfies WaitingPredicates,
+    openApproval: (scopeId: string, requestID = 'a-1') => {
+      open(approvals, scopeId, requestID)
+    },
+    closeApproval: (scopeId: string, requestID = 'a-1') => {
+      close(approvals, scopeId, requestID)
+    },
+    openQuestion: (scopeId: string, requestID = 'q-1') => {
+      open(questions, scopeId, requestID)
+    },
+    closeQuestion: (scopeId: string, requestID = 'q-1') => {
+      close(questions, scopeId, requestID)
+    },
+  }
+}
+
+function makeWaitingHarness(options: Partial<RunObservationManagerDeps> & {readonly project?: ProjectFn} = {}) {
+  const {project, ...overrides} = options
+  const registries = makeRegistryFake()
+  const denial = {denied: false}
+  const warn = vi.fn()
+  const {manager, timers} = makeManager(project ?? projectByPhase, {
+    waiting: registries.predicates,
+    isRepoDenied: () => denial.denied,
+    logger: {info: vi.fn(), warn, error: vi.fn(), debug: vi.fn()},
+    ...overrides,
+  })
+  return {manager, timers, registries, denial, warn}
+}
+
+function statusNames(frames: readonly ObservationFrame[]): string[] {
+  return frames.flatMap(frame => (frame.type === 'status' ? [frame.data.status] : []))
+}
+
+/** Observe, then flush so the writer task has delivered the frame. */
+async function observeAndDrain(manager: RunObservationManager, runState: RunState): Promise<void> {
+  await manager.observe(runState)
+  await drain()
+}
+
+/** Open a request in the fake, then run the refresh the gate's open listener would trigger. */
+async function openQuestionAndRefresh(
+  harness: ReturnType<typeof makeWaitingHarness>,
+  scopeId: string,
+  requestID = 'q-1',
+): Promise<void> {
+  harness.registries.openQuestion(scopeId, requestID)
+  harness.manager.refreshScope(scopeId)
+  await drain()
+}
+
+async function closeQuestionAndRefresh(
+  harness: ReturnType<typeof makeWaitingHarness>,
+  scopeId: string,
+  requestID = 'q-1',
+): Promise<void> {
+  harness.registries.closeQuestion(scopeId, requestID)
+  harness.manager.refreshScope(scopeId)
+  await drain()
+}
+
+describe('waiting refresh — live status and replay', () => {
+  it('flips a running run to waiting_for_question live when a question opens, and replay matches', async () => {
+    // #given an observed running run with a live subscriber
+    const harness = makeWaitingHarness()
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    await observeAndDrain(harness.manager, makeRunState())
+
+    // #when a question opens for the run's scope
+    await openQuestionAndRefresh(harness, 'run-001')
+
+    // #then the live stream shows waiting, and a late subscriber's snapshot agrees
+    expect(statusNames(frames)).toEqual(['running', 'waiting_for_question'])
+    const late = collectFrames(harness.manager, 'run-001')
+    await drain()
+    expect(statusNames(late.frames)).toEqual(['waiting_for_question'])
+
+    harness.manager.shutdown()
+  })
+
+  it('returns to running once the question leaves the registry, and replay matches', async () => {
+    // #given a run waiting on a question
+    const harness = makeWaitingHarness()
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    await observeAndDrain(harness.manager, makeRunState())
+    await openQuestionAndRefresh(harness, 'run-001')
+
+    // #when the question leaves the registry
+    await closeQuestionAndRefresh(harness, 'run-001')
+
+    // #then live status and the replay snapshot both read running
+    expect(statusNames(frames)).toEqual(['running', 'waiting_for_question', 'running'])
+    const late = collectFrames(harness.manager, 'run-001')
+    await drain()
+    expect(statusNames(late.frames)).toEqual(['running'])
+
+    harness.manager.shutdown()
+  })
+
+  it('applies approval over question, and recomputes both families when one settles', async () => {
+    // #given a run with a question already open
+    const harness = makeWaitingHarness()
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    await observeAndDrain(harness.manager, makeRunState())
+    await openQuestionAndRefresh(harness, 'run-001')
+
+    // #when an approval opens over it, then settles, then the question settles
+    harness.registries.openApproval('run-001')
+    harness.manager.refreshScope('run-001')
+    await drain()
+    harness.registries.closeApproval('run-001')
+    harness.manager.refreshScope('run-001')
+    await drain()
+    await closeQuestionAndRefresh(harness, 'run-001')
+
+    // #then approval wins, its settle lands on waiting_for_question, and the last settle returns to running
+    expect(statusNames(frames)).toEqual([
+      'running',
+      'waiting_for_question',
+      'waiting_for_approval',
+      'waiting_for_question',
+      'running',
+    ])
+
+    harness.manager.shutdown()
+  })
+
+  it('sends no frame while a second question keeps the scope waiting', async () => {
+    // #given two open questions in one scope
+    const harness = makeWaitingHarness()
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    await observeAndDrain(harness.manager, makeRunState())
+    await openQuestionAndRefresh(harness, 'run-001', 'q-1')
+    await openQuestionAndRefresh(harness, 'run-001', 'q-2')
+
+    // #when Q1 settles, then Q2 settles
+    await closeQuestionAndRefresh(harness, 'run-001', 'q-1')
+    const framesAfterQ1 = statusNames(frames).length
+    await closeQuestionAndRefresh(harness, 'run-001', 'q-2')
+
+    // #then the first settle is silent and the second returns to running
+    expect(statusNames(frames).slice(0, framesAfterQ1)).toEqual(['running', 'waiting_for_question'])
+    expect(statusNames(frames)).toEqual(['running', 'waiting_for_question', 'running'])
+
+    harness.manager.shutdown()
+  })
+
+  it('sends no extra frame when a refresh yields the status already cached (claim released back to open)', async () => {
+    // #given a run waiting on a question
+    const harness = makeWaitingHarness()
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    await observeAndDrain(harness.manager, makeRunState())
+    await openQuestionAndRefresh(harness, 'run-001')
+
+    // #when the same request reopens (a replacement put, or a failed claim returning to open)
+    harness.manager.refreshScope('run-001')
+    await drain()
+
+    // #then the status did not change, so no frame is sent
+    expect(statusNames(frames)).toEqual(['running', 'waiting_for_question'])
+
+    harness.manager.shutdown()
+  })
+
+  it('commits waiting on the first observe when the request opened before it, without an earlier frame', async () => {
+    // #given a request that opened before the run was ever observed
+    const harness = makeWaitingHarness()
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    harness.registries.openQuestion('run-001')
+
+    // #when a refresh fires for the unobserved run, then the first observe lands
+    harness.manager.refreshScope('run-001')
+    await drain()
+    expect(statusNames(frames)).toEqual([])
+    await observeAndDrain(harness.manager, makeRunState())
+
+    // #then the first frame already reads waiting
+    expect(statusNames(frames)).toEqual(['waiting_for_question'])
+
+    harness.manager.shutdown()
+  })
+
+  it('keeps the base stale flag when a request settles on a run idle past the stale threshold', async () => {
+    // #given a run whose base projection is already stale
+    const staleProject: ProjectFn = async runState => makeOperatorRunStatus({runId: runState.run_id, stale: true})
+    const harness = makeWaitingHarness({project: staleProject})
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    await observeAndDrain(harness.manager, makeRunState())
+
+    // #when a question opens and settles
+    await openQuestionAndRefresh(harness, 'run-001')
+    await closeQuestionAndRefresh(harness, 'run-001')
+
+    // #then every frame carries stale: true, taken from the retained base and not recomputed
+    const staleFlags = frames.flatMap(frame => (frame.type === 'status' ? [frame.data.stale] : []))
+    expect(staleFlags).toEqual([true, true, true])
+    expect(statusNames(frames)).toEqual(['running', 'waiting_for_question', 'running'])
+
+    harness.manager.shutdown()
+  })
+
+  it('scopes a Discord run by its thread and a web run by its run id', async () => {
+    // #given a Discord run in thread T and a github run, each observed
+    const harness = makeWaitingHarness()
+    const discord = collectFrames(harness.manager, 'run-d')
+    const github = collectFrames(harness.manager, 'run-g')
+    await observeAndDrain(harness.manager, makeRunState({run_id: 'run-d', surface: 'discord', thread_id: 'T'}))
+    await observeAndDrain(harness.manager, makeRunState({run_id: 'run-g', surface: 'github', thread_id: 'ignored'}))
+
+    // #when requests open under the thread id and under the github run id
+    await openQuestionAndRefresh(harness, 'T')
+    await openQuestionAndRefresh(harness, 'run-g', 'q-2')
+
+    // #then each run waits only for its own scope
+    expect(statusNames(discord.frames)).toEqual(['running', 'waiting_for_question'])
+    expect(statusNames(github.frames)).toEqual(['running', 'waiting_for_question'])
+
+    // #when only the thread's question leaves
+    await closeQuestionAndRefresh(harness, 'T')
+
+    // #then only the Discord run returns to running
+    expect(statusNames(discord.frames)).toEqual(['running', 'waiting_for_question', 'running'])
+    expect(statusNames(github.frames)).toEqual(['running', 'waiting_for_question'])
+
+    harness.manager.shutdown()
+  })
+})
+
+describe('waiting refresh — races against in-flight projections', () => {
+  it('race A: a request put and removed during the first projection await leaves the run running', async () => {
+    // #given a first observe held at its projection await
+    const gate = makeDeferred<OperatorRunStatus | null>()
+    const harness = makeWaitingHarness({project: async () => gate.promise})
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    const inFlight = harness.manager.observe(makeRunState())
+
+    // #when a question opens and leaves while the projection is pending
+    await openQuestionAndRefresh(harness, 'run-001')
+    await closeQuestionAndRefresh(harness, 'run-001')
+    gate.resolve(makeOperatorRunStatus())
+    await inFlight
+    await drain()
+
+    // #then the commit reads the registry as it is now: running, no waiting frame
+    expect(statusNames(frames)).toEqual(['running'])
+
+    harness.manager.shutdown()
+  })
+
+  it('race A: a request still open at commit time lands as waiting with no intermediate running frame', async () => {
+    // #given a first observe held at its projection await
+    const gate = makeDeferred<OperatorRunStatus | null>()
+    const harness = makeWaitingHarness({project: async () => gate.promise})
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    const inFlight = harness.manager.observe(makeRunState())
+
+    // #when a question opens during the await and is still open when the projection resolves
+    await openQuestionAndRefresh(harness, 'run-001')
+    gate.resolve(makeOperatorRunStatus())
+    await inFlight
+    await drain()
+
+    // #then the only status frame already reads waiting
+    expect(statusNames(frames)).toEqual(['waiting_for_question'])
+
+    harness.manager.shutdown()
+  })
+
+  it('race B: a newer lifecycle observation committing while a request is open is overlaid against the live registry', async () => {
+    // #given a run waiting on a question, then a second observe held at its projection await
+    const second = makeDeferred<OperatorRunStatus | null>()
+    let call = 0
+    const project: ProjectFn = async () => {
+      call++
+      return call === 1 ? makeOperatorRunStatus() : second.promise
+    }
+    const harness = makeWaitingHarness({project})
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    await observeAndDrain(harness.manager, makeRunState())
+    await openQuestionAndRefresh(harness, 'run-001')
+    const inFlight = harness.manager.observe(makeRunState())
+
+    // #when the newer observation resolves with a changed base while the question is still open
+    second.resolve(makeOperatorRunStatus({stale: true}))
+    await inFlight
+    await drain()
+
+    // #then the new base wins and the overlay is applied on top of it
+    const last = frames.findLast(frame => frame.type === 'status')
+    expect(last).toMatchObject({type: 'status', data: {status: 'waiting_for_question', stale: true}})
+
+    harness.manager.shutdown()
+  })
+
+  it('race B: a question that leaves during the second projection await does not stick', async () => {
+    // #given a run waiting on a question, then a second observe held at its projection await
+    const second = makeDeferred<OperatorRunStatus | null>()
+    let call = 0
+    const project: ProjectFn = async () => {
+      call++
+      return call === 1 ? makeOperatorRunStatus() : second.promise
+    }
+    const harness = makeWaitingHarness({project})
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    await observeAndDrain(harness.manager, makeRunState())
+    await openQuestionAndRefresh(harness, 'run-001')
+    const inFlight = harness.manager.observe(makeRunState())
+
+    // #when the question leaves, then the newer observation resolves
+    await closeQuestionAndRefresh(harness, 'run-001')
+    second.resolve(makeOperatorRunStatus({stale: true}))
+    await inFlight
+    await drain()
+
+    // #then the run ends running, never waiting
+    expect(statusNames(frames).at(-1)).toBe('running')
+
+    harness.manager.shutdown()
+  })
+
+  it('race C: a terminal observation that wins over an in-flight non-terminal one stays terminal', async () => {
+    // #given a non-terminal observe held at its await, and a terminal observe held behind it
+    const running = makeDeferred<OperatorRunStatus | null>()
+    const completed = makeDeferred<OperatorRunStatus | null>()
+    const pending = [running, completed]
+    const project: ProjectFn = async () => pending.shift()?.promise ?? null
+    const harness = makeWaitingHarness({project})
+    const {frames, closes} = collectFrames(harness.manager, 'run-001')
+    const first = harness.manager.observe(makeRunState({phase: 'EXECUTING'}))
+    const second = harness.manager.observe(makeRunState({phase: 'COMPLETED'}))
+
+    // #when the terminal one resolves first, then the stale non-terminal one
+    completed.resolve(makeOperatorRunStatus({phase: 'COMPLETED', status: 'succeeded'}))
+    await second
+    running.resolve(makeOperatorRunStatus())
+    await first
+    await drain()
+
+    // #then the stale observation is dropped and a later request opening changes nothing
+    await openQuestionAndRefresh(harness, 'run-001')
+    expect(statusNames(frames)).toEqual(['succeeded'])
+    expect(closes).toEqual(['terminal'])
+
+    harness.manager.shutdown()
+  })
+})
+
+describe('waiting refresh — retained state is the resurrection guard', () => {
+  it('terminal first: a request opening after the terminal observe emits and caches nothing, even after replay eviction', async () => {
+    // #given a replay cache that holds one terminal run, and run-001 observed running then terminal
+    const harness = makeWaitingHarness({terminalReplayMaxEntries: 1})
+    const live = collectFrames(harness.manager, 'run-001')
+    await observeAndDrain(harness.manager, makeRunState())
+    await observeAndDrain(harness.manager, makeRunState({phase: 'COMPLETED'}))
+
+    // #given a second terminal run evicting run-001's replay entry (which also clears its terminalRuns guard)
+    await observeAndDrain(harness.manager, makeRunState({run_id: 'run-002', phase: 'COMPLETED'}))
+
+    // #when a question opens for the finished run's scope
+    await openQuestionAndRefresh(harness, 'run-001')
+
+    // #then the live subscriber saw only running then succeeded
+    expect(statusNames(live.frames)).toEqual(['running', 'succeeded'])
+
+    // #then no status was cached: a new subscriber gets only a reset
+    const late = collectFrames(harness.manager, 'run-001')
+    await drain()
+    expect(statusNames(late.frames)).toEqual([])
+    expect(late.frames.map(frame => frame.type)).toEqual(['reset'])
+
+    harness.manager.shutdown()
+  })
+
+  it('terminal first: a request opening while the terminal replay entry exists leaves replay terminal', async () => {
+    // #given a finished run whose replay entry is still cached
+    const harness = makeWaitingHarness()
+    await observeAndDrain(harness.manager, makeRunState())
+    await observeAndDrain(harness.manager, makeRunState({phase: 'COMPLETED'}))
+
+    // #when a question opens for its scope
+    await openQuestionAndRefresh(harness, 'run-001')
+
+    // #then replay is the terminal status and the stream closes terminal
+    const late = collectFrames(harness.manager, 'run-001')
+    await drain()
+    expect(statusNames(late.frames)).toEqual(['succeeded'])
+    expect(late.closes).toEqual(['terminal'])
+
+    harness.manager.shutdown()
+  })
+
+  it('a null projection drops retained state: later gate events emit nothing and write nothing', async () => {
+    // #given a running run whose next projection comes back null (repository denied)
+    let call = 0
+    const project: ProjectFn = async () => (++call === 1 ? makeOperatorRunStatus() : null)
+    const harness = makeWaitingHarness({project})
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    await observeAndDrain(harness.manager, makeRunState())
+    await observeAndDrain(harness.manager, makeRunState())
+
+    // #when a question opens afterwards (the denylist predicate itself reports not-denied)
+    await openQuestionAndRefresh(harness, 'run-001')
+
+    // #then nothing was emitted, and the cache still holds the pre-denial status
+    expect(statusNames(frames)).toEqual(['running'])
+    const late = collectFrames(harness.manager, 'run-001')
+    await drain()
+    expect(statusNames(late.frames)).toEqual(['running'])
+
+    harness.manager.shutdown()
+  })
+
+  it('a run whose first projection is null is never retained', async () => {
+    // #given a denied repository from the start
+    const harness = makeWaitingHarness({project: async () => null})
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    await observeAndDrain(harness.manager, makeRunState())
+
+    // #when requests open and leave
+    await openQuestionAndRefresh(harness, 'run-001')
+    await closeQuestionAndRefresh(harness, 'run-001')
+
+    // #then no frame and no cache entry exist
+    expect(statusNames(frames)).toEqual([])
+    const late = collectFrames(harness.manager, 'run-001')
+    await drain()
+    expect(late.frames.map(frame => frame.type)).toEqual(['reset'])
+
+    harness.manager.shutdown()
+  })
+
+  it('mid-run denial: the refresh-time denylist check drops the run and emits nothing', async () => {
+    // #given a running run whose repository becomes denied with no lifecycle observation in between
+    const harness = makeWaitingHarness()
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    await observeAndDrain(harness.manager, makeRunState())
+    harness.denial.denied = true
+
+    // #when a question opens
+    await openQuestionAndRefresh(harness, 'run-001')
+
+    // #then no frame is emitted and the cache is untouched
+    expect(statusNames(frames)).toEqual(['running'])
+    const late = collectFrames(harness.manager, 'run-001')
+    await drain()
+    expect(statusNames(late.frames)).toEqual(['running'])
+
+    // #when the denial lifts and the question leaves
+    harness.denial.denied = false
+    await closeQuestionAndRefresh(harness, 'run-001')
+
+    // #then the dropped run is not refreshed again
+    expect(statusNames(frames)).toEqual(['running'])
+
+    harness.manager.shutdown()
+  })
+})
+
+describe('waiting refresh — scope index', () => {
+  it('re-keys a run that adopts its thread, and never collides two pre-ACK runs', async () => {
+    // #given two pre-ACK Discord runs that both carry an empty thread id
+    const harness = makeWaitingHarness()
+    const runA = collectFrames(harness.manager, 'run-A')
+    const runB = collectFrames(harness.manager, 'run-B')
+    await observeAndDrain(
+      harness.manager,
+      makeRunState({run_id: 'run-A', surface: 'discord', thread_id: '', phase: 'PENDING'}),
+    )
+    await observeAndDrain(
+      harness.manager,
+      makeRunState({run_id: 'run-B', surface: 'discord', thread_id: '', phase: 'PENDING'}),
+    )
+
+    // #when run A adopts thread T and a question opens under T
+    await observeAndDrain(harness.manager, makeRunState({run_id: 'run-A', surface: 'discord', thread_id: 'T'}))
+    await openQuestionAndRefresh(harness, 'T')
+
+    // #then only run A refreshes
+    expect(statusNames(runA.frames)).toEqual(['queued', 'running', 'waiting_for_question'])
+    expect(statusNames(runB.frames)).toEqual(['queued'])
+
+    // #when a request registers under the empty scope
+    await openQuestionAndRefresh(harness, '', 'q-empty')
+
+    // #then neither run is touched
+    expect(statusNames(runA.frames)).toEqual(['queued', 'running', 'waiting_for_question'])
+    expect(statusNames(runB.frames)).toEqual(['queued'])
+
+    harness.manager.shutdown()
+  })
+
+  it('indexes the new thread before the projection await, so a request opening during it refreshes the run', async () => {
+    // #given a running Discord run with no thread yet, and a second observe (the thread adoption) held at its await
+    const adoption = makeDeferred<OperatorRunStatus | null>()
+    let call = 0
+    const project: ProjectFn = async () => {
+      call++
+      return call === 1 ? makeOperatorRunStatus() : adoption.promise
+    }
+    const harness = makeWaitingHarness({project})
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    await observeAndDrain(harness.manager, makeRunState({surface: 'discord', thread_id: ''}))
+    const inFlight = harness.manager.observe(makeRunState({surface: 'discord', thread_id: 'T'}))
+
+    // #when a question opens under T while the adoption projection is still pending
+    await openQuestionAndRefresh(harness, 'T')
+
+    // #then the run already reads waiting, before the projection resolves
+    expect(statusNames(frames)).toEqual(['running', 'waiting_for_question'])
+
+    adoption.resolve(makeOperatorRunStatus())
+    await inFlight
+    await drain()
+    expect(statusNames(frames).at(-1)).toBe('waiting_for_question')
+
+    harness.manager.shutdown()
+  })
+
+  it('empty scope: a pending entry under "" never overlays a run that has no thread yet', async () => {
+    // #given a request registered under the empty scope and a running Discord run with no thread id
+    const harness = makeWaitingHarness()
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    harness.registries.openQuestion('')
+
+    // #when the run is observed running
+    await observeAndDrain(harness.manager, makeRunState({surface: 'discord', thread_id: ''}))
+
+    // #then the run reads running, so it can never get stuck waiting on a scope that is never refreshed
+    expect(statusNames(frames)).toEqual(['running'])
+
+    harness.manager.shutdown()
+  })
+
+  it('a refresh that throws for one run is logged and does not stop the rest of the scope', async () => {
+    // #given two Discord runs in one thread; the first one's repository key makes the denylist check throw
+    const projectBase: RunObservationManagerDeps['projectBase'] = async runState => ({
+      kind: 'projected',
+      status: makeOperatorRunStatus({runId: runState.run_id}),
+      repoKey: {databaseId: null, nodeId: runState.run_id === 'run-bad' ? 'bad' : 'good'},
+    })
+    const harness = makeWaitingHarness({
+      projectBase,
+      isRepoDenied: repoKey => {
+        if (repoKey.nodeId === 'bad') throw new Error('denylist unavailable')
+        return false
+      },
+    })
+    const good = collectFrames(harness.manager, 'run-good')
+    await observeAndDrain(harness.manager, makeRunState({run_id: 'run-bad', surface: 'discord', thread_id: 'T'}))
+    await observeAndDrain(harness.manager, makeRunState({run_id: 'run-good', surface: 'discord', thread_id: 'T'}))
+
+    // #when a question opens in the shared thread
+    harness.registries.openQuestion('T')
+    expect(() => {
+      harness.manager.refreshScope('T')
+    }).not.toThrow()
+    await drain()
+
+    // #then the healthy run still flips to waiting and the failure is logged
+    expect(statusNames(good.frames)).toEqual(['running', 'waiting_for_question'])
+    expect(harness.warn).toHaveBeenCalledWith(
+      expect.objectContaining({runId: 'run-bad'}),
+      expect.stringContaining('scope refresh threw'),
+    )
+
+    harness.manager.shutdown()
+  })
+})
+
+describe('waiting refresh — frame ordering', () => {
+  it('delivers the settle frame before the status flip, and a settle frame alone does not flip status', async () => {
+    // #given a run waiting on a question, with the question frame delivered
+    const harness = makeWaitingHarness()
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    await observeAndDrain(harness.manager, makeRunState())
+    await openQuestionAndRefresh(harness, 'run-001')
+    harness.manager.observeQuestion('run-001', openQuestion('q-1'))
+
+    // #when the settle frame renders while the entry is still registered (the deadline path)
+    harness.manager.observeQuestion('run-001', {requestID: 'q-1', runId: 'run-001', settled: true})
+    await drain()
+
+    // #then the status still reads waiting
+    expect(statusNames(frames)).toEqual(['running', 'waiting_for_question'])
+
+    // #when the entry leaves the registry and onTerminal refreshes the scope
+    await closeQuestionAndRefresh(harness, 'run-001')
+
+    // #then the flip to running follows the settle frame
+    const order = frames.map(frame => (frame.type === 'status' ? frame.data.status : frame.type))
+    expect(order).toEqual(['reset', 'running', 'waiting_for_question', 'question', 'question', 'running'])
+
+    harness.manager.shutdown()
+  })
+
+  it('a subscriber connecting between the settle frame and onTerminal gets waiting, then running, equal to live', async () => {
+    // #given a run waiting on a question whose settle frame has been rendered
+    const harness = makeWaitingHarness()
+    await observeAndDrain(harness.manager, makeRunState())
+    await openQuestionAndRefresh(harness, 'run-001')
+    harness.manager.observeQuestion('run-001', openQuestion('q-1'))
+    harness.manager.observeQuestion('run-001', {requestID: 'q-1', runId: 'run-001', settled: true})
+
+    // #when a subscriber connects before the entry leaves, and then it leaves
+    const between = collectFrames(harness.manager, 'run-001')
+    await drain()
+    await closeQuestionAndRefresh(harness, 'run-001')
+
+    // #then it sees the snapshot waiting, then running; a subscriber after removal sees running
+    expect(statusNames(between.frames)).toEqual(['waiting_for_question', 'running'])
+    const after = collectFrames(harness.manager, 'run-001')
+    await drain()
+    expect(statusNames(after.frames)).toEqual(['running'])
+
+    harness.manager.shutdown()
+  })
+
+  it('a teardown disposing three entries in one scope ends at running with no duplicate frames', async () => {
+    // #given two questions and an approval open in one scope
+    const harness = makeWaitingHarness()
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    await observeAndDrain(harness.manager, makeRunState())
+    await openQuestionAndRefresh(harness, 'run-001', 'q-1')
+    await openQuestionAndRefresh(harness, 'run-001', 'q-2')
+    harness.registries.openApproval('run-001')
+    harness.manager.refreshScope('run-001')
+    await drain()
+
+    // #when the teardown removes them one by one, refreshing after each
+    harness.registries.closeApproval('run-001')
+    harness.manager.refreshScope('run-001')
+    harness.registries.closeQuestion('run-001', 'q-1')
+    harness.manager.refreshScope('run-001')
+    harness.registries.closeQuestion('run-001', 'q-2')
+    harness.manager.refreshScope('run-001')
+    await drain()
+
+    // #then each distinct status appears once, in order
+    expect(statusNames(frames)).toEqual([
+      'running',
+      'waiting_for_question',
+      'waiting_for_approval',
+      'waiting_for_question',
+      'running',
+    ])
+
+    harness.manager.shutdown()
+  })
+})
+
+describe('waiting refresh — shutdown', () => {
+  it('a refresh after shutdown reads no registry, writes no cache, and arms no timer', async () => {
+    // #given an observed run, then a shut-down manager
+    const harness = makeWaitingHarness()
+    await observeAndDrain(harness.manager, makeRunState())
+    harness.manager.shutdown()
+    const hasPendingQuestion = vi.spyOn(harness.registries.predicates, 'hasPendingQuestion')
+    const hasPendingApproval = vi.spyOn(harness.registries.predicates, 'hasPendingApproval')
+
+    // #when a request opens and a refresh arrives
+    harness.registries.openQuestion('run-001')
+    harness.manager.refreshScope('run-001')
+    await drain()
+
+    // #then nothing was read or scheduled, and a new subscriber is closed outright
+    expect(hasPendingQuestion).not.toHaveBeenCalled()
+    expect(hasPendingApproval).not.toHaveBeenCalled()
+    expect(harness.timers.activeTimerCount()).toBe(0)
+    const late = collectFrames(harness.manager, 'run-001')
+    expect(late.closes).toEqual(['shutdown'])
+    expect(late.frames).toEqual([])
+  })
+
+  it('an observe in flight across shutdown does not repopulate the caches or arm a replay timer', async () => {
+    // #given a terminal observe held at its projection await
+    const gate = makeDeferred<OperatorRunStatus | null>()
+    const harness = makeWaitingHarness({project: async () => gate.promise})
+    const inFlight = harness.manager.observe(makeRunState({phase: 'COMPLETED'}))
+
+    // #when the manager shuts down and then the projection resolves
+    harness.manager.shutdown()
+    gate.resolve(makeOperatorRunStatus({phase: 'COMPLETED', status: 'succeeded'}))
+    await inFlight
+    await drain()
+
+    // #then no terminal replay entry or eviction timer was created
+    expect(harness.timers.activeTimerCount()).toBe(0)
+  })
+})
+
+// ===========================================================================
+// Binding store unavailable: a transient read error keeps the last good state
+// ===========================================================================
+
+/** A projector whose binding store can be switched into a failing state. */
+function makeFlakyStore() {
+  const state = {unavailable: false}
+  const projectBase: RunObservationManagerDeps['projectBase'] = async runState =>
+    state.unavailable
+      ? {kind: 'unavailable'}
+      : {
+          kind: 'projected',
+          status: makeOperatorRunStatus({runId: runState.run_id}),
+          repoKey: DEFAULT_REPO_KEY,
+        }
+  return {state, projectBase}
+}
+
+/** The base status for a run in its phase, as the real projection would map it. */
+function projectByPhaseStatus(runState: RunState): OperatorRunStatus {
+  return makeOperatorRunStatus({
+    runId: runState.run_id,
+    phase: runState.phase,
+    status: PHASE_TO_WEB_STATUS[runState.phase],
+  })
+}
+
+/** An EXECUTING projection held open, and a terminal projection that resolves per `terminal`. */
+function makeHeldExecuting(terminal: 'unavailable' | 'denied' | 'throws') {
+  const executing = makeDeferred<RunStatusProjection>()
+  const projectBase: RunObservationManagerDeps['projectBase'] = async runState => {
+    if (runState.phase === 'EXECUTING') return executing.promise
+    if (terminal === 'throws') throw new Error('store exploded')
+    return terminal === 'unavailable' ? {kind: 'unavailable'} : {kind: 'denied'}
+  }
+  const resolveExecuting = (runState: RunState): void => {
+    executing.resolve({kind: 'projected', status: projectByPhaseStatus(runState), repoKey: DEFAULT_REPO_KEY})
+  }
+  return {projectBase, resolveExecuting}
+}
+
+describe('waiting refresh — binding store unavailable', () => {
+  it('a store error on the EXECUTING observe keeps the last base, so a later question still shows waiting', async () => {
+    // #given a run observed while the store was healthy, then re-observed while it fails
+    const store = makeFlakyStore()
+    const harness = makeWaitingHarness({projectBase: store.projectBase})
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    await observeAndDrain(harness.manager, makeRunState())
+    store.state.unavailable = true
+    await observeAndDrain(harness.manager, makeRunState())
+
+    // #when a question opens afterwards
+    await openQuestionAndRefresh(harness, 'run-001')
+
+    // #then the failed observe emitted nothing, and the refresh works from the last good base
+    expect(statusNames(frames)).toEqual(['running', 'waiting_for_question'])
+
+    // #then the failure was logged with the run id only
+    expect(harness.warn).toHaveBeenCalledWith({runId: 'run-001'}, expect.stringContaining('binding store unavailable'))
+
+    harness.manager.shutdown()
+  })
+
+  it('the refresh-time denylist check still applies to the retained key after a store error', async () => {
+    // #given a run kept across a store error
+    const store = makeFlakyStore()
+    const harness = makeWaitingHarness({projectBase: store.projectBase})
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    await observeAndDrain(harness.manager, makeRunState())
+    store.state.unavailable = true
+    await observeAndDrain(harness.manager, makeRunState())
+
+    // #when the repository becomes denied and a question opens
+    harness.denial.denied = true
+    await openQuestionAndRefresh(harness, 'run-001')
+
+    // #then nothing is emitted
+    expect(statusNames(frames)).toEqual(['running'])
+
+    harness.manager.shutdown()
+  })
+
+  it('a store error on the very first observe emits and caches nothing, and the next good observe works', async () => {
+    // #given a store that fails on the first observe, with no retained state yet
+    const store = makeFlakyStore()
+    store.state.unavailable = true
+    const harness = makeWaitingHarness({projectBase: store.projectBase})
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    await observeAndDrain(harness.manager, makeRunState())
+    await openQuestionAndRefresh(harness, 'run-001')
+
+    // #then nothing was emitted or cached
+    expect(statusNames(frames)).toEqual([])
+    const probe = collectFrames(harness.manager, 'run-001')
+    await drain()
+    expect(probe.frames.map(frame => frame.type)).toEqual(['reset'])
+
+    // #when the store recovers and the run is observed again with the question still open
+    store.state.unavailable = false
+    await observeAndDrain(harness.manager, makeRunState())
+
+    // #then the observation commits normally, overlaid against the live registry
+    expect(statusNames(frames)).toEqual(['waiting_for_question'])
+
+    harness.manager.shutdown()
+  })
+
+  /** A projector that reports `unavailable` for a chosen run and phase, and a healthy projection otherwise. */
+  function makeUnavailableFor(runId: string, phase: RunState['phase']): RunObservationManagerDeps['projectBase'] {
+    return async runState =>
+      runState.run_id === runId && runState.phase === phase
+        ? {kind: 'unavailable'}
+        : {kind: 'projected', status: projectByPhaseStatus(runState), repoKey: DEFAULT_REPO_KEY}
+  }
+
+  it('releases a finished run whose terminal projection is unavailable, so a sibling in the thread refreshes alone', async () => {
+    // #given two Discord runs sharing thread T, both running
+    const harness = makeWaitingHarness({projectBase: makeUnavailableFor('run-A', 'COMPLETED')})
+    const finished = collectFrames(harness.manager, 'run-A')
+    const sibling = collectFrames(harness.manager, 'run-B')
+    await observeAndDrain(harness.manager, makeRunState({run_id: 'run-A', surface: 'discord', thread_id: 'T'}))
+    await observeAndDrain(harness.manager, makeRunState({run_id: 'run-B', surface: 'discord', thread_id: 'T'}))
+
+    // #when run A's terminal observation hits a binding-store error
+    await observeAndDrain(
+      harness.manager,
+      makeRunState({run_id: 'run-A', surface: 'discord', thread_id: 'T', phase: 'COMPLETED'}),
+    )
+
+    // #when an approval opens in the shared thread, and then, separately, a question
+    harness.registries.openApproval('T')
+    harness.manager.refreshScope('T')
+    await drain()
+    harness.registries.closeApproval('T')
+    await openQuestionAndRefresh(harness, 'T')
+
+    // #then the sibling follows the registries, and the finished run emits nothing and stays open
+    expect(statusNames(sibling.frames)).toEqual(['running', 'waiting_for_approval', 'waiting_for_question'])
+    expect(statusNames(finished.frames)).toEqual(['running'])
+    expect(finished.closes).toEqual([])
+
+    harness.manager.shutdown()
+  })
+
+  it('leaves nothing behind when the first observe and the terminal observe are both unavailable', async () => {
+    // #given a run whose every projection is unavailable, and a healthy sibling in the same thread
+    const harness = makeWaitingHarness({
+      projectBase: async runState =>
+        runState.run_id === 'run-A'
+          ? {kind: 'unavailable'}
+          : {kind: 'projected', status: projectByPhaseStatus(runState), repoKey: DEFAULT_REPO_KEY},
+    })
+    const unreadable = collectFrames(harness.manager, 'run-A')
+    const sibling = collectFrames(harness.manager, 'run-B')
+    await observeAndDrain(harness.manager, makeRunState({run_id: 'run-A', surface: 'discord', thread_id: 'T'}))
+    await observeAndDrain(harness.manager, makeRunState({run_id: 'run-B', surface: 'discord', thread_id: 'T'}))
+    await observeAndDrain(
+      harness.manager,
+      makeRunState({run_id: 'run-A', surface: 'discord', thread_id: 'T', phase: 'FAILED'}),
+    )
+
+    // #when a question opens in the shared thread
+    await openQuestionAndRefresh(harness, 'T')
+
+    // #then only the sibling refreshes, and the unreadable run never emitted or cached anything
+    expect(statusNames(sibling.frames)).toEqual(['running', 'waiting_for_question'])
+    expect(statusNames(unreadable.frames)).toEqual([])
+    const probe = collectFrames(harness.manager, 'run-A')
+    await drain()
+    expect(probe.frames.map(frame => frame.type)).toEqual(['reset'])
+
+    harness.manager.shutdown()
+  })
+
+  it.each(Object.keys(PHASE_TO_WEB_STATUS) as RunState['phase'][])(
+    'keeps or releases retained state on an unavailable %s observation according to its status being terminal',
+    async phase => {
+      // #given a run observed healthy while running, then re-observed in the phase with the store failing
+      const store = makeFlakyStore()
+      const harness = makeWaitingHarness({projectBase: store.projectBase})
+      const {frames} = collectFrames(harness.manager, 'run-001')
+      await observeAndDrain(harness.manager, makeRunState({surface: 'discord', thread_id: 'T', phase: 'EXECUTING'}))
+      store.state.unavailable = true
+      await observeAndDrain(harness.manager, makeRunState({surface: 'discord', thread_id: 'T', phase}))
+
+      // #when a question opens in the thread
+      await openQuestionAndRefresh(harness, 'T')
+
+      // #then a terminal phase released the state (no waiting frame); every other phase kept it
+      const isTerminalPhase = ['succeeded', 'failed', 'cancelled'].includes(PHASE_TO_WEB_STATUS[phase])
+      const waitedAfterwards = statusNames(frames).includes('waiting_for_question')
+      expect(waitedAfterwards).toBe(!isTerminalPhase)
+
+      harness.manager.shutdown()
+    },
+  )
+
+  describe('terminal fence — an older in-flight observation cannot undo terminal cleanup', () => {
+    it.each(['unavailable', 'denied', 'throws'] as const)(
+      'discards a late EXECUTING projection after a %s terminal projection: no retain, no emit, no replay',
+      async terminal => {
+        // #given a held EXECUTING projection, a terminal observe whose projection does not succeed, and a sibling
+        const held = makeHeldExecuting(terminal)
+        const harness = makeWaitingHarness({projectBase: held.projectBase})
+        const finished = collectFrames(harness.manager, 'run-A')
+        const executingState = makeRunState({run_id: 'run-A', surface: 'discord', thread_id: 'T'})
+        const inFlight = harness.manager.observe(executingState)
+        await harness.manager.observe({...executingState, phase: 'COMPLETED'})
+
+        // #when the older EXECUTING projection resolves successfully
+        held.resolveExecuting(executingState)
+        await inFlight
+        await drain()
+
+        // #then it emitted no frame, and a later request in the thread does not reach the finished run
+        const sibling = collectFrames(harness.manager, 'run-B')
+        await observeAndDrain(harness.manager, makeRunState({run_id: 'run-B', surface: 'discord', thread_id: 'T'}))
+        await openQuestionAndRefresh(harness, 'T')
+        expect(statusNames(finished.frames)).toEqual([])
+        expect(statusNames(sibling.frames)).toEqual(['running', 'waiting_for_question'])
+
+        // #then no running replay was installed for the finished run
+        const reconnect = collectFrames(harness.manager, 'run-A')
+        await drain()
+        expect(reconnect.frames.map(frame => frame.type)).toEqual(['reset'])
+
+        harness.manager.shutdown()
+      },
+    )
+
+    it.each(['unavailable', 'denied', 'throws'] as const)(
+      'still discards a late EXECUTING projection after the fence TTL has expired (%s terminal)',
+      async terminal => {
+        // #given a held EXECUTING projection and a terminal observe whose projection does not succeed
+        const held = makeHeldExecuting(terminal)
+        const harness = makeWaitingHarness({projectBase: held.projectBase, terminalReplayTtlMs: 1_000})
+        const finished = collectFrames(harness.manager, 'run-A')
+        const executingState = makeRunState({run_id: 'run-A', surface: 'discord', thread_id: 'T'})
+        const inFlight = harness.manager.observe(executingState)
+        await harness.manager.observe({...executingState, phase: 'COMPLETED'})
+
+        // #when the fence timer fires, and only then the older projection resolves
+        harness.timers.advance(1_001)
+        held.resolveExecuting(executingState)
+        await inFlight
+        await drain()
+
+        // #then it still emitted nothing, and no retained state was recreated for the finished run
+        const sibling = collectFrames(harness.manager, 'run-B')
+        await observeAndDrain(harness.manager, makeRunState({run_id: 'run-B', surface: 'discord', thread_id: 'T'}))
+        await openQuestionAndRefresh(harness, 'T')
+        expect(statusNames(finished.frames)).toEqual([])
+        expect(statusNames(sibling.frames)).toEqual(['running', 'waiting_for_question'])
+
+        // #then no running replay exists for the finished run
+        const reconnect = collectFrames(harness.manager, 'run-A')
+        await drain()
+        expect(reconnect.frames.map(frame => frame.type)).toEqual(['reset'])
+
+        harness.manager.shutdown()
+      },
+    )
+
+    it('lets a successful terminal projection still emit and close after an older in-flight EXECUTING', async () => {
+      // #given a held EXECUTING projection and a terminal observe that succeeds
+      const executing = makeDeferred<RunStatusProjection>()
+      const projectBase: RunObservationManagerDeps['projectBase'] = async runState =>
+        runState.phase === 'EXECUTING'
+          ? executing.promise
+          : {kind: 'projected', status: projectByPhaseStatus(runState), repoKey: DEFAULT_REPO_KEY}
+      const harness = makeWaitingHarness({projectBase})
+      const {frames, closes} = collectFrames(harness.manager, 'run-001')
+      const inFlight = harness.manager.observe(makeRunState())
+      await observeAndDrain(harness.manager, makeRunState({phase: 'COMPLETED'}))
+
+      // #when the older projection resolves afterwards
+      executing.resolve({kind: 'projected', status: projectByPhaseStatus(makeRunState()), repoKey: DEFAULT_REPO_KEY})
+      await inFlight
+      await drain()
+
+      // #then only the terminal status was delivered, and the stream closed
+      expect(statusNames(frames)).toEqual(['succeeded'])
+      expect(closes).toEqual(['terminal'])
+
+      harness.manager.shutdown()
+    })
+
+    it('expires the fence after the replay TTL, leaving no timer behind', async () => {
+      // #given a terminal observe whose projection was unavailable (no replay entry), and no subscribers
+      const harness = makeWaitingHarness({
+        projectBase: async () => ({kind: 'unavailable'}),
+        terminalReplayTtlMs: 1_000,
+      })
+      await harness.manager.observe(makeRunState({phase: 'COMPLETED'}))
+      expect(harness.timers.activeTimerCount()).toBe(1)
+
+      // #when the TTL passes
+      harness.timers.advance(1_001)
+
+      // #then the fence timer is gone
+      expect(harness.timers.activeTimerCount()).toBe(0)
+    })
+
+    it('releases the fence timer at shutdown', async () => {
+      // #given a fenced run
+      const harness = makeWaitingHarness({projectBase: async () => ({kind: 'unavailable'})})
+      await harness.manager.observe(makeRunState({phase: 'COMPLETED'}))
+      expect(harness.timers.activeTimerCount()).toBe(1)
+
+      // #when the manager shuts down
+      harness.manager.shutdown()
+
+      // #then no timer remains
+      expect(harness.timers.activeTimerCount()).toBe(0)
+    })
+  })
+
+  it('a real denial still drops the retained state, unlike a store error', async () => {
+    // #given a run whose next projection is denied
+    let call = 0
+    const projectBase: RunObservationManagerDeps['projectBase'] = async runState =>
+      ++call === 1
+        ? {kind: 'projected', status: makeOperatorRunStatus({runId: runState.run_id}), repoKey: DEFAULT_REPO_KEY}
+        : {kind: 'denied'}
+    const harness = makeWaitingHarness({projectBase})
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    await observeAndDrain(harness.manager, makeRunState())
+    await observeAndDrain(harness.manager, makeRunState())
+
+    // #when a question opens
+    await openQuestionAndRefresh(harness, 'run-001')
+
+    // #then the run was dropped: no waiting frame
+    expect(statusNames(frames)).toEqual(['running'])
+
+    harness.manager.shutdown()
   })
 })

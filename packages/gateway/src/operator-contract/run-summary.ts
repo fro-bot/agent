@@ -23,18 +23,19 @@ import type {OperatorFailureKind} from './run-status.js'
 import {PHASE_TO_WEB_STATUS, toOperatorFailureKind} from './run-status.js'
 
 /**
- * The 5-value status set producible by toRunSummary via PHASE_TO_WEB_STATUS.
+ * The 7-value status set a run summary can carry.
  *
- * 'blocked' and 'waiting_for_approval' are endpoint-layer overlays derived from
- * queue/registry state — they are NEVER produced by toRunSummary (which maps
- * RunPhase only). The ?? 'failed' fallback also produces 'failed', which is in
- * this set.
+ * toRunSummary maps RunPhase only, producing the five lifecycle values via
+ * PHASE_TO_WEB_STATUS (PENDING → 'queued', ACKNOWLEDGED/EXECUTING → 'running',
+ * COMPLETED → 'succeeded', FAILED → 'failed', CANCELLED → 'cancelled'; the
+ * ?? 'failed' fallback stays in this set).
  *
- * Derived from PHASE_TO_WEB_STATUS values:
- *   PENDING → 'queued', ACKNOWLEDGED → 'running', EXECUTING → 'running',
- *   COMPLETED → 'succeeded', FAILED → 'failed', CANCELLED → 'cancelled'
+ * 'waiting_for_approval' and 'waiting_for_question' are registry overlays
+ * applied by the runs route after toRunSummary, only on a 'running' base.
+ * 'blocked' is never carried by a summary.
  */
-export type RunSummaryStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+export type RunSummaryStatus =
+  'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'waiting_for_approval' | 'waiting_for_question'
 
 /**
  * Operator-safe projection of a run's summary.
@@ -84,6 +85,8 @@ function extractEntityRefRepo(entityRef: string): {owner: string; repo: string} 
 /**
  * Pure builder: project a RunState to a RunSummary, scoped to a binding.
  *
+ * Maps lifecycle phase only; waiting overlays are the caller's concern.
+ *
  * Returns null when the run's entity_ref owner/repo does not match the
  * binding's owner/repo. This omits runs that do not belong to the binding's
  * repo (corruption/rename guard). The caller is responsible for warn-logging
@@ -118,9 +121,9 @@ export function toRunSummary(
   // Fail-closed: an unrecognized phase (data corruption / version skew) surfaces
   // as 'failed', not as undefined — a missing status key would silently drop the
   // field from JSON output.
-  // PHASE_TO_WEB_STATUS values are all in RunSummaryStatus (queued/running/succeeded/
-  // failed/cancelled); 'blocked'/'waiting_for_approval' are never in the map.
-  // The ?? 'failed' fallback is also in RunSummaryStatus. Direct indexing typechecks
+  // PHASE_TO_WEB_STATUS values are lifecycle statuses only (queued/running/succeeded/
+  // failed/cancelled), all in RunSummaryStatus; the waiting overlays are applied by the
+  // caller. The ?? 'failed' fallback is also in RunSummaryStatus. Direct indexing typechecks
   // because runState.phase is RunPhase and PHASE_TO_WEB_STATUS is Record<RunPhase, ...>.
   const status: RunSummaryStatus = (PHASE_TO_WEB_STATUS[runState.phase] ?? 'failed') as RunSummaryStatus
 

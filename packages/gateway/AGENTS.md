@@ -81,7 +81,7 @@ The command is idempotent: a binding is skipped once it carries a usable deny ke
 - Agent questions settle only through `questionRegistry.decide` (and the gate's deadline, echo, and teardown paths). No transport may reply to or reject a question any other way. See [Agent questions](#agent-questions).
 - `OperatorIdentity` is always constructed **server-side** from the authenticated session. It is never deserialized from a request payload.
 - `OPERATOR_CONTRACT_VERSION` is **build-time pinned** and never negotiated over the wire. Any endpoint reading a version header must reject unrecognized versions fail-closed.
-- The current contract version is `1.10.0`. The dashboard's SSE reader matches the version exactly and fails closed on a mismatch, so a gateway release and the dashboard release pinning the same version deploy as a pair.
+- The current contract version is `1.11.0`. The dashboard's SSE reader matches the version exactly and fails closed on a mismatch, so a gateway release and the dashboard release pinning the same version deploy as a pair.
 - The dashboard's `operator-client.ts` is a **non-canonical downstream fixture**; it does not define the contract.
 
 This Gateway operator-auth surface (`packages/gateway/src/web/auth/`) is the **single S2 operator-auth authority** (ratified [#951](https://github.com/fro-bot/agent/issues/951); ADR: `docs/decisions/2026-06-19-s2-operator-auth-authority.md`). The dashboard delegates interactive operator auth to it and maintains no parallel operator identity — it rides the gateway session (same-origin via `GATEWAY_OPERATOR_PUBLIC_ORIGIN`) and the gateway's numeric-GitHub-user-ID allowlist is the **single allowlist source of truth**. Do not add a second operator OAuth/session/allowlist anywhere downstream.

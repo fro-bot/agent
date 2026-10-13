@@ -15,15 +15,16 @@
  *   7. checkRepoAuthz() per surviving binding — keep only authorized repos
  *   8. listRunsForRepo() per authorized binding — enumerate run-states
  *   9. toRunSummary() projection — drop null (entity_ref mismatch) + warn
- *  10. Flatten; sort newest-first by createdAt; cap at MAX_RUNS_PER_LISTING
- *  11. Cache-Control: no-store, private; return 200 {runs: RunSummary[]}
+ *  10. overlayWaitingStatus() — registries read after listRunsForRepo resolves
+ *  11. Flatten; sort newest-first by createdAt; cap at MAX_RUNS_PER_LISTING
+ *  12. Cache-Control: no-store, private; return 200 {runs: RunSummary[]}
  *
  * Security invariants:
  *   - Denylisted repos are dropped before checkRepoAuthz is called (no oracle).
  *   - Unauthorized repos are silently omitted (no oracle).
  *   - Denied/unauthorized repos' run-states are never read (authz fan-out bounds GitHub calls).
  *   - Store errors return a coarse error; no partial list leaks.
- *   - Response carries only {runId, repo, status, createdAt, updatedAt?}.
+ *   - Response carries only {runId, repo, status, createdAt, updatedAt?, failureKind?}.
  *   - Result is capped at MAX_RUNS_PER_LISTING (no pagination machinery).
  *   - Token is never logged.
  *   - Rate limit is operator-keyed (not socket-keyed) to prevent OAuth-budget
@@ -32,6 +33,8 @@
 
 import type {RunState} from '@fro-bot/runtime'
 import type {Hono} from 'hono'
+import type {QuestionRegistry} from '../../approvals/question-registry.js'
+import type {ApprovalRegistry} from '../../approvals/registry.js'
 import type {RepoBinding} from '../../bindings/types.js'
 import type {RateLimiter} from '../../http/rate-limit.js'
 import type {RunSummary} from '../../operator-contract/run-summary.js'
@@ -44,6 +47,7 @@ import {bindingToRepoKey, filterDeniedRecords} from '../../redaction/surface-gat
 import {checkRepoAuthz} from '../auth/repo-authz.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
 import {rateLimitedResponse} from '../safe-response.js'
+import {overlayWaitingStatus, scopeIdFor} from '../sse/projection.js'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -121,6 +125,13 @@ export interface RunsRouteDeps {
    */
   readonly listRunsForRepo: (repo: string, limit?: number) => Promise<readonly RunState[]>
   /**
+   * Registries for the waiting overlay. Required: an absent registry would
+   * silently drop its waiting state, so server.ts mounts the route only when
+   * both are present.
+   */
+  readonly approvalRegistry: Pick<ApprovalRegistry, 'hasPendingForScope'>
+  readonly questionRegistry: Pick<QuestionRegistry, 'hasPendingForScope'>
+  /**
    * Optional injectable per-minute rate limiter (operator-keyed).
    * When absent, a fresh limiter is created with RUNS_RATE_LIMIT_PER_MIN.
    */
@@ -144,6 +155,10 @@ export interface RunsRouteDeps {
 export function buildRunsRoute(app: Hono, deps: RunsRouteDeps): void {
   // Per-operator rate limiter (operator-keyed, not socket-keyed).
   // Keyed on string(githubUserId) so the limit is per-operator, not per-repo.
+  const waitingPredicates = {
+    hasPendingApproval: (scopeId: string) => deps.approvalRegistry.hasPendingForScope(scopeId),
+    hasPendingQuestion: (scopeId: string) => deps.questionRegistry.hasPendingForScope(scopeId),
+  }
   const perMinLimiter =
     deps.perMinRateLimiter ??
     createRateLimiter({limit: RUNS_RATE_LIMIT_PER_MIN, windowMs: RUNS_RATE_WINDOW_MIN_MS, clock: deps.now})
@@ -273,13 +288,16 @@ export function buildRunsRoute(app: Hono, deps: RunsRouteDeps): void {
       // Project each run via the closed-DTO builder.
       // toRunSummary returns null when entity_ref owner/repo does not match the
       // binding (corruption/rename guard). Drop nulls and warn-log.
+      // The waiting overlay reads the registries here, after listRunsForRepo has
+      // resolved and only for repos that passed the denylist and authz gates.
       for (const runState of runs) {
         const summary = toRunSummary(runState, binding)
         if (summary === null) {
           deps.logger.warn({githubUserId, repo, runId: runState.run_id}, 'runs: run omitted — entity_ref mismatch')
           continue
         }
-        allSummaries.push(summary)
+        const status = overlayWaitingStatus(summary.status, scopeIdFor(runState), waitingPredicates)
+        allSummaries.push(status === summary.status ? summary : {...summary, status})
       }
     }
 
