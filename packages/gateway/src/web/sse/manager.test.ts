@@ -30,6 +30,7 @@ import type {WaitingPredicates} from './projection.js'
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
+import {PHASE_TO_WEB_STATUS} from '../../operator-contract/run-status.js'
 import {projectRunStatusWithKey} from '../../redaction/surface-gate.js'
 import {createRunObservationManager, MAX_OPEN_QUESTION_REPLAY_PER_RUN} from './manager.js'
 
@@ -4344,6 +4345,15 @@ function makeFlakyStore() {
   return {state, projectBase}
 }
 
+/** The base status for a run in its phase, as the real projection would map it. */
+function projectByPhaseStatus(runState: RunState): OperatorRunStatus {
+  return makeOperatorRunStatus({
+    runId: runState.run_id,
+    phase: runState.phase,
+    status: PHASE_TO_WEB_STATUS[runState.phase],
+  })
+}
+
 describe('waiting refresh — binding store unavailable', () => {
   it('a store error on the EXECUTING observe keeps the last base, so a later question still shows waiting', async () => {
     // #given a run observed while the store was healthy, then re-observed while it fails
@@ -4409,6 +4419,96 @@ describe('waiting refresh — binding store unavailable', () => {
 
     harness.manager.shutdown()
   })
+
+  /** A projector that reports `unavailable` for a chosen run and phase, and a healthy projection otherwise. */
+  function makeUnavailableFor(runId: string, phase: RunState['phase']): RunObservationManagerDeps['projectBase'] {
+    return async runState =>
+      runState.run_id === runId && runState.phase === phase
+        ? {kind: 'unavailable'}
+        : {kind: 'projected', status: projectByPhaseStatus(runState), repoKey: DEFAULT_REPO_KEY}
+  }
+
+  it('releases a finished run whose terminal projection is unavailable, so a sibling in the thread refreshes alone', async () => {
+    // #given two Discord runs sharing thread T, both running
+    const harness = makeWaitingHarness({projectBase: makeUnavailableFor('run-A', 'COMPLETED')})
+    const finished = collectFrames(harness.manager, 'run-A')
+    const sibling = collectFrames(harness.manager, 'run-B')
+    await observeAndDrain(harness.manager, makeRunState({run_id: 'run-A', surface: 'discord', thread_id: 'T'}))
+    await observeAndDrain(harness.manager, makeRunState({run_id: 'run-B', surface: 'discord', thread_id: 'T'}))
+
+    // #when run A's terminal observation hits a binding-store error
+    await observeAndDrain(
+      harness.manager,
+      makeRunState({run_id: 'run-A', surface: 'discord', thread_id: 'T', phase: 'COMPLETED'}),
+    )
+
+    // #when an approval opens in the shared thread, and then, separately, a question
+    harness.registries.openApproval('T')
+    harness.manager.refreshScope('T')
+    await drain()
+    harness.registries.closeApproval('T')
+    await openQuestionAndRefresh(harness, 'T')
+
+    // #then the sibling follows the registries, and the finished run emits nothing and stays open
+    expect(statusNames(sibling.frames)).toEqual(['running', 'waiting_for_approval', 'waiting_for_question'])
+    expect(statusNames(finished.frames)).toEqual(['running'])
+    expect(finished.closes).toEqual([])
+
+    harness.manager.shutdown()
+  })
+
+  it('leaves nothing behind when the first observe and the terminal observe are both unavailable', async () => {
+    // #given a run whose every projection is unavailable, and a healthy sibling in the same thread
+    const harness = makeWaitingHarness({
+      projectBase: async runState =>
+        runState.run_id === 'run-A'
+          ? {kind: 'unavailable'}
+          : {kind: 'projected', status: projectByPhaseStatus(runState), repoKey: DEFAULT_REPO_KEY},
+    })
+    const unreadable = collectFrames(harness.manager, 'run-A')
+    const sibling = collectFrames(harness.manager, 'run-B')
+    await observeAndDrain(harness.manager, makeRunState({run_id: 'run-A', surface: 'discord', thread_id: 'T'}))
+    await observeAndDrain(harness.manager, makeRunState({run_id: 'run-B', surface: 'discord', thread_id: 'T'}))
+    await observeAndDrain(
+      harness.manager,
+      makeRunState({run_id: 'run-A', surface: 'discord', thread_id: 'T', phase: 'FAILED'}),
+    )
+
+    // #when a question opens in the shared thread
+    await openQuestionAndRefresh(harness, 'T')
+
+    // #then only the sibling refreshes, and the unreadable run never emitted or cached anything
+    expect(statusNames(sibling.frames)).toEqual(['running', 'waiting_for_question'])
+    expect(statusNames(unreadable.frames)).toEqual([])
+    const probe = collectFrames(harness.manager, 'run-A')
+    await drain()
+    expect(probe.frames.map(frame => frame.type)).toEqual(['reset'])
+
+    harness.manager.shutdown()
+  })
+
+  it.each(Object.keys(PHASE_TO_WEB_STATUS) as RunState['phase'][])(
+    'keeps or releases retained state on an unavailable %s observation according to its status being terminal',
+    async phase => {
+      // #given a run observed healthy while running, then re-observed in the phase with the store failing
+      const store = makeFlakyStore()
+      const harness = makeWaitingHarness({projectBase: store.projectBase})
+      const {frames} = collectFrames(harness.manager, 'run-001')
+      await observeAndDrain(harness.manager, makeRunState({surface: 'discord', thread_id: 'T', phase: 'EXECUTING'}))
+      store.state.unavailable = true
+      await observeAndDrain(harness.manager, makeRunState({surface: 'discord', thread_id: 'T', phase}))
+
+      // #when a question opens in the thread
+      await openQuestionAndRefresh(harness, 'T')
+
+      // #then a terminal phase released the state (no waiting frame); every other phase kept it
+      const isTerminalPhase = ['succeeded', 'failed', 'cancelled'].includes(PHASE_TO_WEB_STATUS[phase])
+      const waitedAfterwards = statusNames(frames).includes('waiting_for_question')
+      expect(waitedAfterwards).toBe(!isTerminalPhase)
+
+      harness.manager.shutdown()
+    },
+  )
 
   it('a real denial still drops the retained state, unlike a store error', async () => {
     // #given a run whose next projection is denied

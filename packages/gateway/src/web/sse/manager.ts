@@ -88,6 +88,9 @@ function isTerminal(status: OperatorRunStatus['status']): boolean {
   return TERMINAL_STATUSES.has(status)
 }
 
+/** The run phases that project to a terminal status. */
+const TERMINAL_PHASES: ReadonlySet<RunState['phase']> = new Set(['COMPLETED', 'FAILED', 'CANCELLED'])
+
 // ---------------------------------------------------------------------------
 // Frame types (closed union — only these three types are ever enqueued)
 // ---------------------------------------------------------------------------
@@ -1172,9 +1175,13 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     }
 
     // Store error: the repository is unknown, not denied. Keep the last good state so a later request
-    // still refreshes the run; emit and cache nothing for this observation.
+    // still refreshes the run; emit and cache nothing for this observation. A terminal run has no
+    // later lifecycle observation to release that state, so it is released here.
     if (projection.kind === 'unavailable') {
-      logger.warn({runId}, 'manager: binding store unavailable — keeping the last status')
+      logger.warn({runId}, 'manager: binding store unavailable — observation not applied')
+      if (TERMINAL_PHASES.has(runState.phase) === true) {
+        dropRunState(runId)
+      }
       return
     }
 
@@ -1429,8 +1436,6 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
   // Durable cache-miss resolution
   // ---------------------------------------------------------------------------
 
-  const DURABLE_TERMINAL_PHASES: ReadonlySet<RunState['phase']> = new Set(['COMPLETED', 'FAILED', 'CANCELLED'])
-
   /**
    * True while the subscriber is still on the undecided live path: not dropped or draining,
    * the manager is up, and no live observation has landed a snapshot for the run since the
@@ -1469,7 +1474,7 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
       logger.warn({subId: sub.id, runId, err: String(error)}, 'manager: durable run-state read failed — staying live')
       return
     }
-    if (runState === undefined || runState.run_id !== runId || DURABLE_TERMINAL_PHASES.has(runState.phase) === false) {
+    if (runState === undefined || runState.run_id !== runId || TERMINAL_PHASES.has(runState.phase) === false) {
       return
     }
     if (isAwaitingLiveResolution(sub) === false) {
