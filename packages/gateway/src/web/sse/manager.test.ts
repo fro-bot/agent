@@ -4558,6 +4558,39 @@ describe('waiting refresh — binding store unavailable', () => {
       },
     )
 
+    it.each(['unavailable', 'denied', 'throws'] as const)(
+      'still discards a late EXECUTING projection after the fence TTL has expired (%s terminal)',
+      async terminal => {
+        // #given a held EXECUTING projection and a terminal observe whose projection does not succeed
+        const held = makeHeldExecuting(terminal)
+        const harness = makeWaitingHarness({projectBase: held.projectBase, terminalReplayTtlMs: 1_000})
+        const finished = collectFrames(harness.manager, 'run-A')
+        const executingState = makeRunState({run_id: 'run-A', surface: 'discord', thread_id: 'T'})
+        const inFlight = harness.manager.observe(executingState)
+        await harness.manager.observe({...executingState, phase: 'COMPLETED'})
+
+        // #when the fence timer fires, and only then the older projection resolves
+        harness.timers.advance(1_001)
+        held.resolveExecuting(executingState)
+        await inFlight
+        await drain()
+
+        // #then it still emitted nothing, and no retained state was recreated for the finished run
+        const sibling = collectFrames(harness.manager, 'run-B')
+        await observeAndDrain(harness.manager, makeRunState({run_id: 'run-B', surface: 'discord', thread_id: 'T'}))
+        await openQuestionAndRefresh(harness, 'T')
+        expect(statusNames(finished.frames)).toEqual([])
+        expect(statusNames(sibling.frames)).toEqual(['running', 'waiting_for_question'])
+
+        // #then no running replay exists for the finished run
+        const reconnect = collectFrames(harness.manager, 'run-A')
+        await drain()
+        expect(reconnect.frames.map(frame => frame.type)).toEqual(['reset'])
+
+        harness.manager.shutdown()
+      },
+    )
+
     it('lets a successful terminal projection still emit and close after an older in-flight EXECUTING', async () => {
       // #given a held EXECUTING projection and a terminal observe that succeeds
       const executing = makeDeferred<RunStatusProjection>()

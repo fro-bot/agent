@@ -489,10 +489,11 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
 
   /**
    * Runs whose terminal observation has begun: set synchronously when a terminal-phase observe() starts,
-   * whether or not its projection later succeeds. An older non-terminal observation that resolves
-   * afterwards is discarded, and approval/question frames for the run are dropped. Each entry expires
-   * after the terminal replay TTL (timer in terminalRunTimers), so the set is bounded by the terminal
-   * observations seen per TTL window; replay eviction and shutdown release it earlier.
+   * whether or not its projection later succeeds. A non-terminal observation that starts afterwards is
+   * discarded, and approval/question frames for the run are dropped. In-flight older observations are
+   * cancelled by token instead (see inFlightObservations). Each entry expires after the terminal replay
+   * TTL (timer in terminalRunTimers), so the set is bounded by the terminal observations seen per TTL
+   * window; replay eviction and shutdown release it earlier.
    */
   const terminalRuns = new Set<string>()
   const terminalRunTimers = new Map<string, ReturnType<typeof globalThis.setTimeout>>()
@@ -619,6 +620,45 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
       terminalRunTimers.delete(runId)
     }
     terminalRuns.delete(runId)
+  }
+
+  /**
+   * Observation-local cancellation. Each observe() registers a token before its await; a terminal-phase
+   * observe cancels the run's tokens already registered. Unlike terminalRuns, a cancelled token never
+   * expires, so no timer can revalidate an invalidated observation. Tokens leave in a finally, and a
+   * run's set is deleted when empty: memory is bounded by observations in flight.
+   */
+  interface ObservationToken {
+    cancelled: boolean
+  }
+  const inFlightObservations = new Map<string, Set<ObservationToken>>()
+
+  function registerInFlightObservation(runId: string): ObservationToken {
+    const token: ObservationToken = {cancelled: false}
+    let tokens = inFlightObservations.get(runId)
+    if (tokens === undefined) {
+      tokens = new Set()
+      inFlightObservations.set(runId, tokens)
+    }
+    tokens.add(token)
+    return token
+  }
+
+  function unregisterInFlightObservation(runId: string, token: ObservationToken): void {
+    const tokens = inFlightObservations.get(runId)
+    if (tokens === undefined) {
+      return
+    }
+    tokens.delete(token)
+    if (tokens.size === 0) {
+      inFlightObservations.delete(runId)
+    }
+  }
+
+  function cancelInFlightObservations(runId: string): void {
+    for (const token of inFlightObservations.get(runId) ?? []) {
+      token.cancelled = true
+    }
   }
 
   /** Fence the run as terminal for one replay TTL; re-fencing restarts the window. */
@@ -1179,12 +1219,29 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     // must find this run, and a run adopting its thread must re-key at once.
     indexRunScope(runId, scopeIdFor(runState))
 
-    // A terminal observation invalidates every older in-flight observation of the run, whether or not
-    // its own projection succeeds. Fence before the await; no terminal status is fabricated.
+    // A terminal observation cancels every older in-flight observation of the run, and fences later
+    // arrivals, whether or not its own projection succeeds. Both happen before the await; no terminal
+    // status is fabricated.
     const isTerminalPhase = TERMINAL_PHASES.has(runState.phase)
     if (isTerminalPhase === true) {
+      cancelInFlightObservations(runId)
       fenceTerminalRun(runId)
     }
+
+    const token = registerInFlightObservation(runId)
+    try {
+      await applyObservation(runState, token, isTerminalPhase)
+    } finally {
+      unregisterInFlightObservation(runId, token)
+    }
+  }
+
+  async function applyObservation(
+    runState: RunState,
+    token: ObservationToken,
+    isTerminalPhase: boolean,
+  ): Promise<void> {
+    const runId = runState.run_id
 
     // Project the base status — `denied` for a denied/keyless repo, `unavailable` when the binding store failed
     let projection: RunStatusProjection
@@ -1221,6 +1278,17 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     }
 
     const observed = projection.status
+
+    // A terminal observation began while this one was in flight: discard a non-terminal result, however
+    // long ago the terminal fence expired.
+    if (isTerminal(observed.status) === false && token.cancelled === true) {
+      logger.warn(
+        {runId, status: observed.status},
+        'manager: observation cancelled by a terminal observation — dropping',
+      )
+      dropRunState(runId)
+      return
+    }
 
     // Guard against stale non-terminal observations arriving out of causal order.
     // If two concurrent observe() calls resolve out of order (COMPLETED resolves first,
@@ -1740,6 +1808,7 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     }
     terminalRunTimers.clear()
     terminalRuns.clear()
+    inFlightObservations.clear()
   }
 
   return {
