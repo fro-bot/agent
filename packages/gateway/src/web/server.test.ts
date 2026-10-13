@@ -2656,7 +2656,8 @@ describe('buildOperatorApp — run stream resolves an evicted terminal run from 
 
       // #given an SSE manager with NO replay entry for either run (the cache-miss / restart case)
       const manager = createRunObservationManager({
-        projectRunBase: async runState => ({
+        projectBase: async runState => ({
+          kind: 'projected',
           status: {
             runId: runState.run_id,
             entityRef: runState.entity_ref,

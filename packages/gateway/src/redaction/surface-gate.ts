@@ -20,6 +20,12 @@
  * denylist cache) treats null/null as denied — fail closed. No surface-time GitHub
  * call is made to resolve repo identity; keys come from the binding only.
  *
+ * A binding-store read error is a distinct outcome from a missing binding. Callers that
+ * only need the fail-closed key (`resolveBindingDenyKeys`, `resolveRunRepoKey`,
+ * `projectRunStatus`) still see it as null/null. `projectRunStatusWithKey` reports it as
+ * `unavailable`, so a caller holding earlier state can keep it instead of treating a
+ * transient error as a denial.
+ *
  * ## filterDeniedRecords — denylist-filter-first primitive
  *
  * Any operator path that builds a working set from multiple records MUST call
@@ -76,6 +82,40 @@ export function bindingToRepoKey(binding: {readonly databaseId?: number | null; 
 }
 
 // ---------------------------------------------------------------------------
+// Binding lookup — deny keys, with a store error kept distinct from a missing binding
+// ---------------------------------------------------------------------------
+
+const NULL_KEY: RunStatusRepoKey = {databaseId: null, nodeId: null}
+
+/** `unavailable`: the binding store read failed. `resolved`: a key, null/null when no usable binding exists. */
+type DenyKeyLookup = {readonly kind: 'resolved'; readonly repoKey: RunStatusRepoKey} | {readonly kind: 'unavailable'}
+
+const UNAVAILABLE: DenyKeyLookup = {kind: 'unavailable'}
+
+async function lookupBindingDenyKeys(
+  owner: string,
+  repo: string,
+  bindingsLookup: BindingsLookup,
+): Promise<DenyKeyLookup> {
+  let result: Awaited<ReturnType<BindingsLookup['getBindingByRepo']>>
+  try {
+    result = await bindingsLookup.getBindingByRepo(owner, repo)
+  } catch {
+    return UNAVAILABLE
+  }
+
+  if (result.success === false) {
+    return UNAVAILABLE
+  }
+
+  if (result.data === null) {
+    return {kind: 'resolved', repoKey: NULL_KEY}
+  }
+
+  return {kind: 'resolved', repoKey: bindingToRepoKey(result.data)}
+}
+
+// ---------------------------------------------------------------------------
 // resolveBindingDenyKeys — shared fail-closed binding → deny-key resolution
 // ---------------------------------------------------------------------------
 
@@ -95,24 +135,8 @@ export async function resolveBindingDenyKeys(
   repo: string,
   bindingsLookup: BindingsLookup,
 ): Promise<RunStatusRepoKey> {
-  const NULL_KEY: RunStatusRepoKey = {databaseId: null, nodeId: null}
-
-  let result: Awaited<ReturnType<BindingsLookup['getBindingByRepo']>>
-  try {
-    result = await bindingsLookup.getBindingByRepo(owner, repo)
-  } catch {
-    return NULL_KEY
-  }
-
-  if (result.success === false) {
-    return NULL_KEY
-  }
-
-  if (result.data === null) {
-    return NULL_KEY
-  }
-
-  return bindingToRepoKey(result.data)
+  const lookup = await lookupBindingDenyKeys(owner, repo, bindingsLookup)
+  return lookup.kind === 'resolved' ? lookup.repoKey : NULL_KEY
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +167,15 @@ function parseEntityRef(entityRef: string): {owner: string; repo: string} | null
   return {owner, repo}
 }
 
+async function lookupRunDenyKeys(runState: RunState, bindingsLookup: BindingsLookup): Promise<DenyKeyLookup> {
+  const parsed = parseEntityRef(runState.entity_ref)
+  if (parsed === null) {
+    return {kind: 'resolved', repoKey: NULL_KEY}
+  }
+
+  return lookupBindingDenyKeys(parsed.owner, parsed.repo, bindingsLookup)
+}
+
 /**
  * Resolve a run's entity_ref to its binding's deny keys.
  *
@@ -160,23 +193,16 @@ function parseEntityRef(entityRef: string): {owner: string; repo: string} | null
  * @returns The repo's deny keys, or {databaseId: null, nodeId: null} on any failure.
  */
 export async function resolveRunRepoKey(runState: RunState, bindingsLookup: BindingsLookup): Promise<RunStatusRepoKey> {
-  const NULL_KEY: RunStatusRepoKey = {databaseId: null, nodeId: null}
-
-  const parsed = parseEntityRef(runState.entity_ref)
-  if (parsed === null) {
-    return NULL_KEY
-  }
-
-  const {owner, repo} = parsed
-  return resolveBindingDenyKeys(owner, repo, bindingsLookup)
+  const lookup = await lookupRunDenyKeys(runState, bindingsLookup)
+  return lookup.kind === 'resolved' ? lookup.repoKey : NULL_KEY
 }
 
 // ---------------------------------------------------------------------------
-// projectRunStatus — per-run projection helper
+// projectRunStatusWithKey / projectRunStatus — per-run projection
 // ---------------------------------------------------------------------------
 
 /**
- * Options for projectRunStatus.
+ * Options for projectRunStatus and projectRunStatusWithKey.
  */
 export interface ProjectRunStatusOpts {
   readonly nowMs: number
@@ -186,33 +212,98 @@ export interface ProjectRunStatusOpts {
 }
 
 /**
- * Per-run projection helper: resolves deny keys from the binding and projects
- * the run to an OperatorRunStatus (or null if denied/omitted).
- *
- * This is the impure entry point for per-run status projection. It:
- * 1. Resolves the run's entity_ref → binding → deny keys (async, binding store).
- * 2. Calls the pure toOperatorRunStatus with those keys + the isRepoDenied predicate.
- * 3. Returns null if the repo is denied (or if the binding is missing/keyless — fail closed).
+ * Outcome of projecting a run through the redaction bridge.
+ * - `projected`: the closed status (no waiting overlay) and the repository key it was gated on.
+ * - `denied`: the repository is denied, or has no usable binding or deny key. Nothing is surfaced.
+ * - `unavailable`: the binding store read failed, so the run's repository is unknown. Nothing is
+ *   surfaced, and the failure says nothing about whether the repository is denied.
+ */
+export type RunStatusProjection =
+  | {readonly kind: 'projected'; readonly status: OperatorRunStatus; readonly repoKey: RunStatusRepoKey}
+  | {readonly kind: 'denied'}
+  | {readonly kind: 'unavailable'}
+
+/**
+ * Closed-DTO copy of the contract projection: only the operator-contract fields.
+ * Destructuring `status` exhaustively makes a new OperatorRunStatus field a type error below until it is copied here.
+ */
+function toClosedStatus(status: OperatorRunStatus): OperatorRunStatus {
+  const {
+    runId,
+    entityRef,
+    surface,
+    phase,
+    status: webStatus,
+    startedAt,
+    stale,
+    failureKind,
+    checkoutProvenance,
+    checkoutPreparation,
+    ...uncopied
+  } = status
+  uncopied satisfies Record<string, never>
+
+  return {
+    runId,
+    entityRef,
+    surface,
+    phase,
+    status: webStatus,
+    startedAt,
+    stale,
+    ...(failureKind === undefined ? {} : {failureKind}),
+    ...(checkoutProvenance === undefined ? {} : {checkoutProvenance}),
+    ...(checkoutPreparation === undefined ? {} : {checkoutPreparation}),
+  }
+}
+
+/**
+ * Per-run projection with the repository key it used. The one redaction-bridge sequence:
+ * 1. Looks the run's entity_ref up in the binding store once (async I/O).
+ * 2. Calls the pure toOperatorRunStatus with that key + the isRepoDenied predicate, which checks
+ *    the denylist before it reads any run field.
+ * 3. Returns the closed status with the key, `denied` for a denied or keyless repo (fail closed),
+ *    or `unavailable` when the store read failed.
  *
  * The App client / GitHub is NOT called to resolve repo identity — keys come from
  * the binding only (denylist-before-query invariant).
+ */
+export async function projectRunStatusWithKey(
+  runState: RunState,
+  opts: ProjectRunStatusOpts,
+): Promise<RunStatusProjection> {
+  const lookup = await lookupRunDenyKeys(runState, opts.bindingsLookup)
+  if (lookup.kind === 'unavailable') {
+    return {kind: 'unavailable'}
+  }
+
+  const status = toOperatorRunStatus(runState, {
+    nowMs: opts.nowMs,
+    staleThresholdMs: opts.staleThresholdMs,
+    repoKey: lookup.repoKey,
+    isRepoDenylisted: opts.isRepoDenied,
+  })
+  if (status === null) {
+    return {kind: 'denied'}
+  }
+
+  return {kind: 'projected', status: toClosedStatus(status), repoKey: lookup.repoKey}
+}
+
+/**
+ * Per-run projection helper: the status of `projectRunStatusWithKey`, or null when the run is
+ * denied, omitted, or its binding could not be read (fail closed).
  *
  * @param runState - The run to project.
  * @param opts - Projection options including the binding lookup and denylist predicate.
- * @returns The projected OperatorRunStatus, or null if the repo is denied/omitted.
+ * @returns The projected OperatorRunStatus, or null if the repo is denied/omitted/unreadable.
  */
 export async function projectRunStatus(
   runState: RunState,
   opts: ProjectRunStatusOpts,
 ): Promise<OperatorRunStatus | null> {
-  const repoKey = await resolveRunRepoKey(runState, opts.bindingsLookup)
-
-  return toOperatorRunStatus(runState, {
-    nowMs: opts.nowMs,
-    staleThresholdMs: opts.staleThresholdMs,
-    repoKey,
-    isRepoDenylisted: opts.isRepoDenied,
-  })
+  const projection = await projectRunStatusWithKey(runState, opts)
+  return projection.kind === 'projected' ? projection.status : null
 }
 
 // ---------------------------------------------------------------------------

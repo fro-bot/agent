@@ -3,7 +3,8 @@
  *
  * Covers:
  * 1. resolveRunRepoKey: resolves a run's entity_ref → binding → deny keys.
- * 2. projectRunStatus: per-run projection helper (null = denied/omitted).
+ * 2. projectRunStatus: per-run projection helper (null = denied/omitted/unreadable).
+ *    projectRunStatusWithKey: the same sequence with the resolved key and a three-way result.
  * 3. filterDeniedRecords: working-set-filter-first helper.
  *
  * Security invariants tested:
@@ -22,7 +23,13 @@ import type {RepoKey} from './denylist.js'
 import type {BindingsLookup} from './surface-gate.js'
 
 import {describe, expect, it, vi} from 'vitest'
-import {bindingToRepoKey, filterDeniedRecords, projectRunStatus, resolveRunRepoKey} from './surface-gate.js'
+import {
+  bindingToRepoKey,
+  filterDeniedRecords,
+  projectRunStatus,
+  projectRunStatusWithKey,
+  resolveRunRepoKey,
+} from './surface-gate.js'
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -322,6 +329,225 @@ describe('projectRunStatus', () => {
 
     // #then the run is omitted — redaction wins regardless of authz
     expect(result).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// projectRunStatus — store errors fail closed
+// ---------------------------------------------------------------------------
+
+describe('projectRunStatus — binding store errors', () => {
+  const opts = (bindingsLookup: BindingsLookup) => ({
+    nowMs: BASE_NOW_MS,
+    staleThresholdMs: STALE_THRESHOLD_MS,
+    bindingsLookup,
+    isRepoDenied: allowAll,
+  })
+
+  it('returns null when the binding store returns an error (fail closed)', async () => {
+    // #given a store that reports an error, and a denylist that would allow the repo
+    // #when projecting
+    const result = await projectRunStatus(makeRunState(), opts(fakeErrorBindingsLookup()))
+
+    // #then the run is omitted
+    expect(result).toBeNull()
+  })
+
+  it('returns null when the binding store throws (fail closed)', async () => {
+    // #given a store that throws
+    const lookup: BindingsLookup = {getBindingByRepo: vi.fn().mockRejectedValue(new Error('network down'))}
+
+    // #when projecting
+    const result = await projectRunStatus(makeRunState(), opts(lookup))
+
+    // #then the run is omitted
+    expect(result).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// projectRunStatusWithKey
+// ---------------------------------------------------------------------------
+
+describe('projectRunStatusWithKey', () => {
+  const resolvedKey = {databaseId: 42, nodeId: 'MDEwOlJlcG9zaXRvcnk0Mg=='}
+  const opts = (bindingsLookup: BindingsLookup, isRepoDenied: (key: RepoKey) => boolean = allowAll) => ({
+    nowMs: BASE_NOW_MS,
+    staleThresholdMs: STALE_THRESHOLD_MS,
+    bindingsLookup,
+    isRepoDenied,
+  })
+
+  it('returns the closed status and the resolved key after exactly one binding lookup', async () => {
+    // #given a bound, allowed repository
+    const getBindingByRepo = vi.fn().mockResolvedValue({success: true, data: makeBinding()})
+
+    // #when projecting
+    const result = await projectRunStatusWithKey(makeRunState(), opts({getBindingByRepo}))
+
+    // #then it is projected with the key the binding resolved
+    expect(result).toMatchObject({
+      kind: 'projected',
+      status: {runId: 'run-test-001', status: 'running', stale: false},
+      repoKey: resolvedKey,
+    })
+    expect(getBindingByRepo).toHaveBeenCalledExactlyOnceWith('acme', 'widget')
+  })
+
+  it('hands the resolved key to the denylist predicate', async () => {
+    // #given a predicate that records its argument
+    const isRepoDenied = vi.fn(() => false)
+
+    // #when projecting
+    await projectRunStatusWithKey(makeRunState(), opts(fakeBindingsLookup(makeBinding()), isRepoDenied))
+
+    // #then it saw the resolved key
+    expect(isRepoDenied).toHaveBeenCalledExactlyOnceWith(resolvedKey)
+  })
+
+  it('is denied when the denylist matches', async () => {
+    // #when the binding's key is on the denylist
+    const result = await projectRunStatusWithKey(
+      makeRunState(),
+      opts(fakeBindingsLookup(makeBinding()), makeDenyById(42)),
+    )
+
+    // #then nothing is surfaced, not even the key
+    expect(result).toEqual({kind: 'denied'})
+  })
+
+  it('is denied when there is no binding, or it has no deny keys (fail closed)', async () => {
+    // #when the binding is missing, or legacy without keys
+    const missing = await projectRunStatusWithKey(makeRunState(), opts(fakeBindingsLookup(null), denyMissingKey))
+    const legacy = await projectRunStatusWithKey(
+      makeRunState(),
+      opts(fakeBindingsLookup(makeBinding({databaseId: undefined, nodeId: undefined})), denyMissingKey),
+    )
+
+    // #then both are denied
+    expect(missing).toEqual({kind: 'denied'})
+    expect(legacy).toEqual({kind: 'denied'})
+  })
+
+  it('is denied when the entity_ref cannot be parsed, without a binding lookup', async () => {
+    // #given a run whose entity_ref has no owner/repo
+    const getBindingByRepo = vi.fn()
+
+    // #when projecting
+    const result = await projectRunStatusWithKey(
+      makeRunState({entity_ref: 'garbage'}),
+      opts({getBindingByRepo}, denyMissingKey),
+    )
+
+    // #then it is denied and the store was never read
+    expect(result).toEqual({kind: 'denied'})
+    expect(getBindingByRepo).not.toHaveBeenCalled()
+  })
+
+  it('is unavailable — not denied — when the binding store errors or throws, and never consults the denylist', async () => {
+    // #given a denylist spy and two failing stores
+    const isRepoDenied = vi.fn(() => true)
+    const thrown: BindingsLookup = {getBindingByRepo: vi.fn().mockRejectedValue(new Error('network down'))}
+
+    // #when projecting through each
+    const errored = await projectRunStatusWithKey(makeRunState(), opts(fakeErrorBindingsLookup(), isRepoDenied))
+    const threw = await projectRunStatusWithKey(makeRunState(), opts(thrown, isRepoDenied))
+
+    // #then both report unavailable and no deny decision was made
+    expect(errored).toEqual({kind: 'unavailable'})
+    expect(threw).toEqual({kind: 'unavailable'})
+    expect(isRepoDenied).not.toHaveBeenCalled()
+  })
+
+  it('never applies a waiting overlay', async () => {
+    // #given a running discord run
+    // #when projecting
+    const result = await projectRunStatusWithKey(
+      makeRunState({surface: 'discord', thread_id: 'T'}),
+      opts(fakeBindingsLookup(makeBinding())),
+    )
+
+    // #then the status is the plain base status
+    expect(result.kind === 'projected' && result.status.status).toBe('running')
+  })
+
+  it.each([
+    ['PENDING', 'queued'],
+    ['ACKNOWLEDGED', 'running'],
+    ['EXECUTING', 'running'],
+    ['COMPLETED', 'succeeded'],
+    ['FAILED', 'failed'],
+    ['CANCELLED', 'cancelled'],
+  ] as const)('maps %s to %s', async (phase, expected) => {
+    // #when projecting a run in the phase
+    const result = await projectRunStatusWithKey(makeRunState({phase}), opts(fakeBindingsLookup(makeBinding())))
+
+    // #then the base status matches
+    expect(result.kind === 'projected' && result.status.status).toBe(expected)
+  })
+
+  it('copies only contract fields — run details and holder data never reach the output', async () => {
+    // #given a run whose details carry sensitive internal data
+    const runState = makeRunState({
+      holder_id: 'holder-secret',
+      thread_id: 'thread-secret',
+      details: {
+        rawOutput: 'secret tool output',
+        workspacePath: '/home/runner/workspace/acme/widget',
+        toolArgs: ['--token', 'ghp_supersecret'],
+        internalUrl: 'http://internal.corp/api',
+      },
+    })
+
+    // #when projecting
+    const result = await projectRunStatusWithKey(runState, opts(fakeBindingsLookup(makeBinding())))
+
+    // #then the output has exactly the contract fields and none of the sensitive values
+    if (result.kind !== 'projected') throw new Error('expected a projected status')
+    expect(Object.keys(result.status).sort()).toEqual(
+      ['entityRef', 'phase', 'runId', 'stale', 'startedAt', 'status', 'surface'].sort(),
+    )
+    const serialized = JSON.stringify(result)
+    for (const leaked of ['secret tool output', '/home/runner/workspace', 'ghp_supersecret', 'http://internal.corp']) {
+      expect(serialized).not.toContain(leaked)
+    }
+    expect(serialized).not.toContain('holder-secret')
+    expect(serialized).not.toContain('thread-secret')
+  })
+
+  it('omits failureKind and checkout keys when absent, carries them when present', async () => {
+    // #given a plain run, and a failed run with a failure kind and both checkout records
+    const provenance = {
+      kind: 'observed',
+      observation: {
+        head: {kind: 'attached', branch: 'main', sha: 'a'.repeat(40)},
+        worktree: {kind: 'clean'},
+        operationInProgress: 'none',
+        observedAt: '2026-01-01T00:00:00.000Z',
+      },
+      remote: {kind: 'not-checked'},
+    }
+    const preparation = {outcome: 'refused', reason: 'dirty', changedPaths: ['src/index.ts']}
+    const plain = await projectRunStatusWithKey(makeRunState(), opts(fakeBindingsLookup(makeBinding())))
+    const full = await projectRunStatusWithKey(
+      makeRunState({
+        phase: 'FAILED',
+        details: {failureKind: 'inactivity-timeout', checkoutProvenance: provenance, checkoutPreparation: preparation},
+      }),
+      opts(fakeBindingsLookup(makeBinding())),
+    )
+
+    // #then absent fields are not keys at all; present fields round-trip
+    if (plain.kind !== 'projected' || full.kind !== 'projected') throw new Error('expected projected statuses')
+    for (const key of ['failureKind', 'checkoutProvenance', 'checkoutPreparation']) {
+      expect(Object.prototype.hasOwnProperty.call(plain.status, key)).toBe(false)
+    }
+    expect(full.status).toMatchObject({
+      status: 'failed',
+      failureKind: 'inactivity-timeout',
+      checkoutProvenance: provenance,
+      checkoutPreparation: preparation,
+    })
   })
 })
 

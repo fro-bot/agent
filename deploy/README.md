@@ -353,7 +353,7 @@ All privileged operator endpoints are under `/operator/` and require a valid ses
 | `GET` | `/operator/session/csrf` | Session | Get a signed CSRF token for mutating requests |
 | `GET` | `/operator/session` | Session | Get current session info (operatorId, login, expiresAt) |
 | `GET` | `/operator/repos` | Session | Scoped, denylist-filtered list of bound repos the operator may launch against |
-| `GET` | `/operator/runs` | Session | Session-gated, repo-scoped, denylist-filtered run enumeration; returns `{runs: RunSummary[]}` newest-first, capped at 100 |
+| `GET` | `/operator/runs` | Session | Session-gated, repo-scoped, denylist-filtered run enumeration; returns `{runs: RunSummary[]}` newest-first, capped at 100; mounts only when both the approval and question registries are wired, like the other dependency-gated routes |
 | `POST` | `/operator/runs` | Session + CSRF | Launch a run against a bound repo (returns 202 `{runId}`) |
 | `GET` | `/operator/runs/:runId/stream` | Session | SSE stream of run status/output (repo-scoped read authz, continuous) |
 | `POST` | `/operator/runs/:runId/approvals/:requestId/decision` | Session + CSRF + repo write/admin | Submit a tool-approval decision (once/always/reject) |

@@ -2600,7 +2600,7 @@ describe('GET /operator/runs/:runId/stream — durable cache-miss resolution (#1
 
   function makeRealManager(project?: (runState: RunState) => Promise<OperatorRunStatus | null>) {
     return createRunObservationManager({
-      projectRunBase: async runState => {
+      projectBase: async runState => {
         const status = await (
           project ??
           (async (state: RunState): Promise<OperatorRunStatus | null> => ({
@@ -2613,7 +2613,7 @@ describe('GET /operator/runs/:runId/stream — durable cache-miss resolution (#1
             stale: false,
           }))
         )(runState)
-        return status === null ? null : {status, repoKey: {databaseId: 1, nodeId: 'R_1'}}
+        return status === null ? {kind: 'denied'} : {kind: 'projected', status, repoKey: {databaseId: 1, nodeId: 'R_1'}}
       },
       waiting: {hasPendingApproval: () => false, hasPendingQuestion: () => false},
       isRepoDenied: () => false,

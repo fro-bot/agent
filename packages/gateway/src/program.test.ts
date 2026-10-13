@@ -116,11 +116,11 @@ vi.mock('./redaction/denylist.js', async importOriginal => {
   }
 })
 
-// Pass-through spy on the run repository-key lookup so the waiting-status wiring test can resolve
-// a key without touching the object store.
+// Pass-through spy on the keyed redaction-bridge projection so the waiting-status wiring test can
+// project a run without touching the object store.
 vi.mock('./redaction/surface-gate.js', async importOriginal => {
   const actual = await importOriginal<typeof import('./redaction/surface-gate.js')>()
-  return {...actual, resolveRunRepoKey: vi.fn(actual.resolveRunRepoKey)}
+  return {...actual, projectRunStatusWithKey: vi.fn(actual.projectRunStatusWithKey)}
 })
 
 // Mockable seam for the operator push self-test gate. Each test controls
@@ -2761,6 +2761,24 @@ function makeRunningRun(
   }
 }
 
+/** Makes the next keyed projection return the run's base status without a binding-store read. */
+async function projectOnce(run: import('@fro-bot/runtime').RunState): Promise<void> {
+  const {projectRunStatusWithKey} = await import('./redaction/surface-gate.js')
+  vi.mocked(projectRunStatusWithKey).mockResolvedValueOnce({
+    kind: 'projected',
+    status: {
+      runId: run.run_id,
+      entityRef: run.entity_ref,
+      surface: run.surface,
+      phase: run.phase,
+      status: 'running',
+      startedAt: run.started_at,
+      stale: false,
+    },
+    repoKey: {databaseId: 42, nodeId: 'R_42'},
+  })
+}
+
 function subscribeStatuses(manager: RunObservationManager, runId: string): string[] {
   const statuses: string[] = []
   manager.subscribe(runId, {
@@ -2803,9 +2821,9 @@ describe('waiting status wiring', () => {
   it('flips the live status to waiting_for_question when a question registers, and back when it leaves', async () => {
     // #given the program wired with a real gate, registries and manager, and a running run being observed
     const {manager, questionRegistry} = await startWithRealRegistries()
-    const {resolveRunRepoKey} = await import('./redaction/surface-gate.js')
-    vi.mocked(resolveRunRepoKey).mockResolvedValueOnce({databaseId: 42, nodeId: 'R_42'})
-    await manager.observe(makeRunningRun())
+    const run = makeRunningRun()
+    await projectOnce(run)
+    await manager.observe(run)
     const statuses = subscribeStatuses(manager, 'run-wait-1')
     await flush()
     expect(statuses).toEqual(['running'])
@@ -2828,9 +2846,9 @@ describe('waiting status wiring', () => {
   it('flips a Discord run to waiting_for_approval when an approval registers under its thread', async () => {
     // #given a running Discord run in thread thread_1
     const {manager, approvalRegistry} = await startWithRealRegistries()
-    const {resolveRunRepoKey} = await import('./redaction/surface-gate.js')
-    vi.mocked(resolveRunRepoKey).mockResolvedValueOnce({databaseId: 42, nodeId: 'R_42'})
-    await manager.observe(makeRunningRun({surface: 'discord', thread_id: 'thread_1'}))
+    const run = makeRunningRun({surface: 'discord', thread_id: 'thread_1'})
+    await projectOnce(run)
+    await manager.observe(run)
     const statuses = subscribeStatuses(manager, 'run-wait-1')
     await flush()
 
@@ -2855,9 +2873,9 @@ describe('waiting status wiring', () => {
   it('pins the empty-scope case: a Discord run with no thread yet is not overlaid by a request under ""', async () => {
     // #given a running Discord run whose thread id is still empty
     const {manager, questionRegistry} = await startWithRealRegistries()
-    const {resolveRunRepoKey} = await import('./redaction/surface-gate.js')
-    vi.mocked(resolveRunRepoKey).mockResolvedValueOnce({databaseId: 42, nodeId: 'R_42'})
-    await manager.observe(makeRunningRun({surface: 'discord', thread_id: ''}))
+    const run = makeRunningRun({surface: 'discord', thread_id: ''})
+    await projectOnce(run)
+    await manager.observe(run)
     const statuses = subscribeStatuses(manager, 'run-wait-1')
     await flush()
 

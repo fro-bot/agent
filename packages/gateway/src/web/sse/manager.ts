@@ -3,13 +3,14 @@
  *
  * `observe(runState)` projects the run through the redaction bridge, overlays the
  * live waiting state, caches the latest status per run, and fans it to that run's
- * subscribers. A denied/keyless projection (null) is dropped — never cached, never
- * emitted. The manager retains each live run's base status (overlay not applied) and
- * a scope index; `refreshScope(scopeId)` reapplies the overlay synchronously when a
- * request opens or leaves, so live status and replay track registry truth. Retained
- * state exists only between a non-null non-terminal observation and the run's
- * terminal observation, a null projection, a refresh-time denial, or shutdown; a
- * refresh never commits without it. Fan-out serializes
+ * subscribers. A denied/keyless projection is dropped — never cached, never
+ * emitted. An unavailable one (the binding store failed) emits and caches nothing and
+ * keeps the run's last good state. The manager retains each live run's base status
+ * (overlay not applied) and a scope index; `refreshScope(scopeId)` reapplies the
+ * overlay synchronously when a request opens or leaves, so live status and replay
+ * track registry truth. Retained state exists only between a projected non-terminal
+ * observation and the run's terminal observation, a denied projection, a refresh-time
+ * denial, or shutdown; a refresh never commits without it. Fan-out serializes
  * once and enqueues per subscriber; it never awaits a write, so a slow consumer
  * cannot stall publishing. A subscriber whose queue exceeds the byte cap is
  * dropped locally without affecting peers, and fan-out iterates a snapshot of the
@@ -34,7 +35,8 @@ import type {
   QuestionFrameData,
   RunStatusRepoKey,
 } from '../../operator-contract/index.js'
-import type {ProjectedRunBase, WaitingPredicates} from './projection.js'
+import type {RunStatusProjection} from '../../redaction/surface-gate.js'
+import type {WaitingPredicates} from './projection.js'
 
 import {isDeepStrictEqual} from 'node:util'
 
@@ -202,11 +204,11 @@ export interface ObservationManagerLogger {
 export interface RunObservationManagerDeps {
   /**
    * Project a RunState to its base status — redaction applied, waiting overlay NOT applied — together
-   * with the run's repository key (null for denied/keyless repos). The key is the one the redaction
-   * bridge resolved, so retaining it costs no second binding lookup.
+   * with the run's repository key, or `denied` / `unavailable` (see RunStatusProjection). The key is
+   * the one the redaction bridge resolved, so retaining it costs no second binding lookup.
    * Injected so the manager test doesn't need a real bindings store.
    */
-  readonly projectRunBase: (runState: RunState) => Promise<ProjectedRunBase | null>
+  readonly projectBase: (runState: RunState) => Promise<RunStatusProjection>
 
   /** Live registry reads for the waiting overlay. Both families are required. */
   readonly waiting: WaitingPredicates
@@ -553,22 +555,33 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     unindexRun(runId)
   }
 
-  /**
-   * Overlay the live waiting state on a base status, then cache and fan out. A refresh sets
-   * `skipUnchanged` so a status equal to the cached one sends no frame; a lifecycle observation always
-   * emits. Scope comes from the index; an unindexed run has no overlay.
-   */
-  function commitOverlaidStatus(runId: string, base: OperatorRunStatus, skipUnchanged: boolean): void {
+  /** Overlay the live waiting state on a base status. Scope comes from the index; an unindexed run has no overlay. */
+  function overlaidStatus(runId: string, base: OperatorRunStatus): OperatorRunStatus {
     const scopeId = scopeByRun.get(runId)
     const status = scopeId === undefined ? base.status : overlayWaitingStatus(base.status, scopeId, deps.waiting)
-    const next = status === base.status ? base : {...base, status}
+    return status === base.status ? base : {...base, status}
+  }
+
+  /** Cache the status BEFORE fan-out, then fan it out to the run's subscribers. */
+  function cacheAndEmit(runId: string, status: OperatorRunStatus): void {
+    latestStatusCache.set(runId, status)
+    const frame: StatusFrame = {type: 'status', data: status}
+    fanOut(runId, frame)
+  }
+
+  /** A lifecycle observation always emits, even when the overlaid status equals the cached one. */
+  function commitLifecycleStatus(runId: string, base: OperatorRunStatus): void {
+    cacheAndEmit(runId, overlaidStatus(runId, base))
+  }
+
+  /** A scope refresh emits only when the overlaid status differs from the cached one. */
+  function commitRefreshedStatus(runId: string, base: OperatorRunStatus): void {
+    const next = overlaidStatus(runId, base)
     const cached = latestStatusCache.get(runId)
-    if (skipUnchanged === true && cached !== undefined && isDeepStrictEqual(cached, next)) {
+    if (cached !== undefined && isDeepStrictEqual(cached, next)) {
       return
     }
-    latestStatusCache.set(runId, next)
-    const frame: StatusFrame = {type: 'status', data: next}
-    fanOut(runId, frame)
+    cacheAndEmit(runId, next)
   }
 
   // ---------------------------------------------------------------------------
@@ -1138,12 +1151,12 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     // must find this run, and a run adopting its thread must re-key at once.
     indexRunScope(runId, scopeIdFor(runState))
 
-    // Project the base status — may return null for denied/keyless repos
-    let projectedBase: ProjectedRunBase | null
+    // Project the base status — `denied` for a denied/keyless repo, `unavailable` when the binding store failed
+    let projection: RunStatusProjection
     try {
-      projectedBase = await deps.projectRunBase(runState)
+      projection = await deps.projectBase(runState)
     } catch (error) {
-      logger.warn({runId, err: String(error)}, 'manager: projectRunBase threw — dropping observation')
+      logger.warn({runId, err: String(error)}, 'manager: projectBase threw — dropping observation')
       return
     }
 
@@ -1152,21 +1165,28 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
       return
     }
 
-    // Null projection: denied/keyless repo — drop immediately, no cache, no emit; later gate events skip the run
-    if (projectedBase === null) {
+    // Denied/keyless repo: drop immediately, no cache, no emit; later gate events skip the run
+    if (projection.kind === 'denied') {
       dropRunState(runId)
       return
     }
 
-    const projected = projectedBase.status
+    // Store error: the repository is unknown, not denied. Keep the last good state so a later request
+    // still refreshes the run; emit and cache nothing for this observation.
+    if (projection.kind === 'unavailable') {
+      logger.warn({runId}, 'manager: binding store unavailable — keeping the last status')
+      return
+    }
+
+    const observed = projection.status
 
     // Guard against stale non-terminal observations arriving out of causal order.
     // If two concurrent observe() calls resolve out of order (COMPLETED resolves first,
     // then EXECUTING resolves), the non-terminal path must not overwrite the terminal
     // replay entry or regress the cached status.
-    if (isTerminal(projected.status) === false && terminalRuns.has(runId) === true) {
+    if (isTerminal(observed.status) === false && terminalRuns.has(runId) === true) {
       logger.warn(
-        {runId, status: projected.status},
+        {runId, status: observed.status},
         'manager: non-terminal observe arrived after terminal — dropping stale observation',
       )
       dropRunState(runId)
@@ -1176,22 +1196,22 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     // On a non-terminal status, clear any stale terminal replay cache entry for this
     // runId (avoids stale replay if runId is reused after a previous terminal run).
     // Only reached when terminalRuns does NOT contain this runId (guard above).
-    if (isTerminal(projected.status) === false) {
+    if (isTerminal(observed.status) === false) {
       evictTerminalReplayEntry(runId)
 
       // Retain the base, then overlay the registries as they stand now (not as they stood before the
       // await). The cache is updated BEFORE fan-out.
-      retainedRuns.set(runId, {base: projected, repoKey: projectedBase.repoKey})
-      commitOverlaidStatus(runId, projected, false)
+      retainedRuns.set(runId, {base: observed, repoKey: projection.repoKey})
+      commitLifecycleStatus(runId, observed)
       return
     }
 
     // Build the status frame (closed DTO — only the contract fields)
     // The projection already returns a closed OperatorRunStatus; we wrap it in a frame.
-    const frame: StatusFrame = {type: 'status', data: projected}
+    const frame: StatusFrame = {type: 'status', data: observed}
 
     // Update the latest-status cache BEFORE fan-out
-    latestStatusCache.set(runId, projected)
+    latestStatusCache.set(runId, observed)
 
     // Fan out to all current subscribers (non-blocking — never awaits writes)
     fanOut(runId, frame)
@@ -1229,7 +1249,7 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
 
     const newEntry: TerminalReplayCacheEntry = {
       finalOutput,
-      terminalStatus: projected,
+      terminalStatus: observed,
       expiresAt,
       evictionTimer,
     }
@@ -1269,7 +1289,7 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
           dropRunState(runId)
           continue
         }
-        commitOverlaidStatus(runId, retained.base, true)
+        commitRefreshedStatus(runId, retained.base)
       } catch (error) {
         logger.warn({runId, err: String(error)}, 'manager: scope refresh threw — skipping run')
       }
@@ -1456,22 +1476,22 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
       return
     }
 
-    let projectedBase: ProjectedRunBase | null
+    let projection: RunStatusProjection
     try {
-      projectedBase = await deps.projectRunBase(runState)
+      projection = await deps.projectBase(runState)
     } catch (error) {
       logger.warn(
         {subId: sub.id, runId, err: String(error)},
-        'manager: projectRunBase threw for durable state — staying live',
+        'manager: projectBase threw for durable state — staying live',
       )
       return
     }
-    // Null projection (denied/keyless repo) reveals nothing: no frame, no close.
+    // A denied/keyless repo or an unreadable binding reveals nothing: no frame, no close.
     // A terminal status carries no waiting overlay, so the base is the final status.
-    if (projectedBase === null || isTerminal(projectedBase.status.status) === false) {
+    if (projection.kind !== 'projected' || isTerminal(projection.status.status) === false) {
       return
     }
-    const projected = projectedBase.status
+    const projected = projection.status
     if (isAwaitingLiveResolution(sub) === false) {
       return
     }

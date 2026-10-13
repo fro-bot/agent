@@ -56,6 +56,7 @@ import {createWorkflowDispatcher} from './github/dispatch.js'
 import {createRateLimiter} from './http/rate-limit.js'
 import {createDenylistCache} from './redaction/denylist.js'
 import {createAppClientMetadataReader} from './redaction/reader-app-client.js'
+import {projectRunStatusWithKey} from './redaction/surface-gate.js'
 import {forceReleaseStaleLockEffect} from './runtime-effect.js'
 import {DEFAULT_DRAIN_MS, installShutdownHandlers, isShuttingDown} from './shutdown.js'
 import {emitAudit} from './web/audit.js'
@@ -72,7 +73,6 @@ import {createOperatorPushSubscriptionStore} from './web/operator-push/subscript
 import {shouldNotify} from './web/operator-push/trigger-policy.js'
 import {createWebQuestionOnRegistered} from './web/operator/web-question.js'
 import {createRunObservationManager} from './web/sse/manager.js'
-import {projectRunBaseWithKey} from './web/sse/projection.js'
 import {createWorkspaceClient} from './workspace-api/client.js'
 import {ensureWorkspaceClone} from './workspace-api/ensure-clone.js'
 
@@ -522,8 +522,8 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
     })
     const runObservationManager = createRunObservationManager({
       // The manager retains the resolved repository key for refresh-time denylist checks.
-      projectRunBase: async runState =>
-        projectRunBaseWithKey(runState, {
+      projectBase: async runState =>
+        projectRunStatusWithKey(runState, {
           nowMs: Date.now(),
           staleThresholdMs: DEFAULT_STALE_THRESHOLD_MS,
           bindingsLookup: bindingsStore,

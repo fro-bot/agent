@@ -29,7 +29,7 @@ Wiring Web Push dispatch into gateway event sources (pending-approval, failed-ru
 
 When the recipient identity is genuinely absent at the event seam **and** the notification payload is repo-neutral, broadcast to all active subscriptions rather than plumbing identity through shared state to make targeting possible. The operator dashboard here is a shared console — any authorized operator can act on any run's approval — so "notify the launcher specifically" doesn't even match the interaction model; any operator is a valid recipient.
 
-Broadcasting is safe specifically because the payload carries only a neutral nudge ("something needs attention, open the dashboard") plus a coarse allowlisted label, and never run/repo/prompt content. A broadcast leaks no content — only a timing signal that *some* event happened, which is an accepted tradeoff for a shared console of trusted operators.
+Broadcasting is safe specifically because the payload carries only a neutral nudge ("something needs attention, open the dashboard") plus a coarse allowlisted label, and never repo or prompt content. Question pushes also carry an opaque, allowlisted run ID and a same-origin deep link (`/operator#<runId>`) so the notification opens the run that is asking; they carry no repository, prompt, question text or other run details, and the copy is fixed. With a single operator the ID is acceptable in a broadcast: it is opaque, and the dashboard's run view keeps its own redaction gate. A broadcast leaks no run content — only a timing signal that *some* event happened, which is an accepted tradeoff for a shared console of trusted operators.
 
 ## Why This Matters
 
@@ -40,7 +40,7 @@ The payload is the guard: broadcast is only acceptable when the payload is genui
 ## When to Apply
 
 - Repo-neutral background nudges (push/email) fired from identity-less seams on a shared, multi-operator surface where any authorized operator is a valid recipient.
-- Do **not** broadcast if the payload carries recipient-specific or sensitive content (run details, repo names, prompt text) — scope it, and the identity plumbing becomes worth the cost.
+- Do **not** broadcast if the payload carries recipient-specific or sensitive content (run details beyond an opaque run ID, repo names, prompt text) — scope it, and the identity plumbing becomes worth the cost.
 
 ## Examples
 

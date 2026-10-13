@@ -1,41 +1,26 @@
 /**
- * projection.test.ts — Tests for the run-status projection.
+ * projection.test.ts — Tests for the waiting-status overlay.
  *
  * Covers:
- * - Happy path: each RunPhase maps to the expected base OperatorWebStatus.
- * - Overlay: waiting_for_approval overrides 'running' when hasPendingForScope → true.
- * - Edge: denied/keyless repo (projectRunStatus → null) yields null.
- * - Safety: the closed DTO contains ONLY the contract fields — no details passthrough.
- * - Scope: scopeIdFor returns thread_id for discord, run_id for non-discord.
- * - Keyed base: projectRunBaseWithKey returns the resolved repo key after one binding lookup.
- * - Split: projectRunBase never overlays; overlayWaitingStatus is the one synchronous overlay.
+ * - scopeIdFor: thread_id for discord, run_id for non-discord.
+ * - overlayWaitingStatus: precedence (approval over question) and the running-only gate.
+ * - Composition: the keyed redaction-bridge base (projectRunStatusWithKey) plus the overlay —
+ *   the sequence the SSE manager runs — for each phase, scope and denied repo.
  *
- * Test seam: projectRunStatus is injected via the deps object so tests can drive
- * it without needing a real binding store or denylist. This avoids the async I/O
- * of the real bridge while still testing the projection logic in full.
+ * The base projection's closed-DTO, key and fail-closed behavior is covered in
+ * redaction/surface-gate.test.ts.
  *
  * BDD comments: #given / #when / #then.
  */
 
 import type {RunState} from '@fro-bot/runtime'
-import type {
-  OperatorCheckoutPreparation,
-  OperatorCheckoutProvenance,
-  OperatorRunStatus,
-  OperatorWebStatus,
-} from '../../operator-contract/index.js'
-import type {BindingsLookup} from '../../redaction/surface-gate.js'
-import type {ProjectRunObservationDeps, WaitingPredicates} from './projection.js'
+import type {OperatorRunStatus, OperatorWebStatus} from '../../operator-contract/index.js'
+import type {WaitingPredicates} from './projection.js'
 
-import {describe, expect, it, vi} from 'vitest'
+import {describe, expect, it} from 'vitest'
 
-import {
-  overlayWaitingStatus,
-  projectRunBase,
-  projectRunBaseWithKey,
-  projectRunObservation,
-  scopeIdFor,
-} from './projection.js'
+import {projectRunStatusWithKey} from '../../redaction/surface-gate.js'
+import {overlayWaitingStatus, scopeIdFor} from './projection.js'
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -59,38 +44,35 @@ function makeRunState(overrides: Partial<RunState> = {}): RunState {
   }
 }
 
-function makeBaseStatus(overrides: Partial<OperatorRunStatus> = {}): OperatorRunStatus {
+function makePredicates(pendingApprovalScopes: readonly string[], pendingQuestionScopes: readonly string[]) {
   return {
-    runId: 'run-001',
-    entityRef: 'acme/widget#1',
-    surface: 'github',
-    phase: 'EXECUTING',
-    status: 'running',
-    startedAt: '2024-01-01T00:00:00.000Z',
-    stale: false,
-    ...overrides,
-  }
+    hasPendingApproval: (scopeId: string) => pendingApprovalScopes.includes(scopeId),
+    hasPendingQuestion: (scopeId: string) => pendingQuestionScopes.includes(scopeId),
+  } satisfies WaitingPredicates
 }
 
+const NONE_PENDING = makePredicates([], [])
+
 /**
- * Build a deps object with a stubbed projectRunStatus that returns the given value.
- * hasPendingForScope defaults to always-false (no pending approval).
+ * The production sequence: keyed base through the real redaction bridge (stub binding store), then the
+ * overlay under the run's scope. Null when the bridge yields no status.
  */
-function makeDeps(
-  baseStatus: OperatorRunStatus | null,
-  hasPendingForScope: (scopeId: string) => boolean = () => false,
-  hasPendingQuestionForScope?: (scopeId: string) => boolean,
-): ProjectRunObservationDeps {
-  return {
+async function projectAndOverlay(
+  runState: RunState,
+  predicates: WaitingPredicates,
+  options: {readonly denied?: boolean} = {},
+): Promise<OperatorRunStatus | null> {
+  const projection = await projectRunStatusWithKey(runState, {
     nowMs: BASE_NOW_MS,
     staleThresholdMs: STALE_THRESHOLD_MS,
-    bindingsLookup: {getBindingByRepo: async () => ({success: true, data: null})},
-    isRepoDenied: () => false,
-    hasPendingForScope,
-    ...(hasPendingQuestionForScope === undefined ? {} : {hasPendingQuestionForScope}),
-    // Inject a stub so tests don't need a real binding store
-    _projectRunStatus: async () => baseStatus,
+    bindingsLookup: {getBindingByRepo: async () => ({success: true, data: {databaseId: 1, nodeId: 'R_1'}})},
+    isRepoDenied: () => options.denied === true,
+  })
+  if (projection.kind !== 'projected') {
+    return null
   }
+  const status = overlayWaitingStatus(projection.status.status, scopeIdFor(runState), predicates)
+  return status === projection.status.status ? projection.status : {...projection.status, status}
 }
 
 // ---------------------------------------------------------------------------
@@ -133,585 +115,8 @@ describe('scopeIdFor', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Happy path: RunPhase → base OperatorWebStatus
-// ---------------------------------------------------------------------------
-
-describe('projectRunObservation — phase → base status mapping', () => {
-  const phases: {phase: RunState['phase']; expectedStatus: OperatorWebStatus}[] = [
-    {phase: 'PENDING', expectedStatus: 'queued'},
-    {phase: 'ACKNOWLEDGED', expectedStatus: 'running'},
-    {phase: 'EXECUTING', expectedStatus: 'running'},
-    {phase: 'COMPLETED', expectedStatus: 'succeeded'},
-    {phase: 'FAILED', expectedStatus: 'failed'},
-    {phase: 'CANCELLED', expectedStatus: 'cancelled'},
-  ]
-
-  for (const {phase, expectedStatus} of phases) {
-    it(`maps ${phase} → ${expectedStatus}`, async () => {
-      // #given a run in the given phase and a base status from the bridge
-      const runState = makeRunState({phase})
-      const baseStatus = makeBaseStatus({phase, status: expectedStatus})
-      const deps = makeDeps(baseStatus)
-
-      // #when projecting
-      const result = await projectRunObservation(runState, deps)
-
-      // #then the status matches the expected base
-      expect(result).not.toBeNull()
-      expect(result?.status).toBe(expectedStatus)
-    })
-  }
-})
-
-// ---------------------------------------------------------------------------
-// Overlay: waiting_for_approval
-// ---------------------------------------------------------------------------
-
-describe('projectRunObservation — waiting_for_approval overlay', () => {
-  it('overrides running → waiting_for_approval when hasPendingForScope is true', async () => {
-    // #given a running run whose scope has a pending approval
-    const runState = makeRunState({phase: 'EXECUTING', surface: 'github', run_id: 'run-001'})
-    const baseStatus = makeBaseStatus({phase: 'EXECUTING', status: 'running'})
-    const deps = makeDeps(baseStatus, scopeId => scopeId === 'run-001')
-
-    // #when projecting
-    const result = await projectRunObservation(runState, deps)
-
-    // #then status is overridden to waiting_for_approval
-    expect(result).not.toBeNull()
-    expect(result?.status).toBe('waiting_for_approval')
-  })
-
-  it('uses thread_id as scope for discord runs when checking pending approval', async () => {
-    // #given a discord run whose thread_id scope has a pending approval
-    const runState = makeRunState({surface: 'discord', thread_id: 'thread-discord-42', run_id: 'run-001'})
-    const baseStatus = makeBaseStatus({surface: 'discord', status: 'running'})
-    // Only the thread_id scope triggers the overlay
-    const deps = makeDeps(baseStatus, scopeId => scopeId === 'thread-discord-42')
-
-    // #when projecting
-    const result = await projectRunObservation(runState, deps)
-
-    // #then status is overridden to waiting_for_approval (via thread_id scope)
-    expect(result).not.toBeNull()
-    expect(result?.status).toBe('waiting_for_approval')
-  })
-
-  it('does NOT override when hasPendingForScope is false', async () => {
-    // #given a running run with no pending approval
-    const runState = makeRunState({phase: 'EXECUTING'})
-    const baseStatus = makeBaseStatus({phase: 'EXECUTING', status: 'running'})
-    const deps = makeDeps(baseStatus, () => false)
-
-    // #when projecting
-    const result = await projectRunObservation(runState, deps)
-
-    // #then status remains running (no overlay)
-    expect(result?.status).toBe('running')
-  })
-
-  it('does NOT produce blocked — no source exists in v1', async () => {
-    // #given any run state
-    const runState = makeRunState()
-    const baseStatus = makeBaseStatus()
-    const deps = makeDeps(baseStatus, () => false)
-
-    // #when projecting
-    const result = await projectRunObservation(runState, deps)
-
-    // #then blocked is never produced
-    expect(result?.status).not.toBe('blocked')
-  })
-
-  it('does NOT override a terminal succeeded status even when hasPendingForScope is true', async () => {
-    // #given a run that has already completed (base status = succeeded) but a stale
-    // approval entry still reports pending for the scope
-    const runState = makeRunState({phase: 'COMPLETED', surface: 'github', run_id: 'run-terminal-1'})
-    const baseStatus = makeBaseStatus({phase: 'COMPLETED', status: 'succeeded'})
-    // hasPendingForScope returns true — simulates a stale approval entry
-    const deps = makeDeps(baseStatus, () => true)
-
-    // #when projecting
-    const result = await projectRunObservation(runState, deps)
-
-    // #then the terminal status is preserved — overlay does NOT apply
-    expect(result).not.toBeNull()
-    expect(result?.status).toBe('succeeded')
-    expect(result?.status).not.toBe('waiting_for_approval')
-  })
-
-  it('does NOT override a terminal failed status even when hasPendingForScope is true', async () => {
-    // #given a run that has failed (base status = failed) but a stale approval entry lingers
-    const runState = makeRunState({phase: 'FAILED', surface: 'github', run_id: 'run-terminal-2'})
-    const baseStatus = makeBaseStatus({phase: 'FAILED', status: 'failed'})
-    const deps = makeDeps(baseStatus, () => true)
-
-    // #when projecting
-    const result = await projectRunObservation(runState, deps)
-
-    // #then the terminal status is preserved
-    expect(result).not.toBeNull()
-    expect(result?.status).toBe('failed')
-    expect(result?.status).not.toBe('waiting_for_approval')
-  })
-
-  it('does NOT override a queued status (waiting_for_approval only applies to running)', async () => {
-    // #given a run in PENDING phase (queued) with a pending approval scope
-    const runState = makeRunState({phase: 'PENDING', surface: 'github', run_id: 'run-queued-1'})
-    const baseStatus = makeBaseStatus({phase: 'PENDING', status: 'queued'})
-    const deps = makeDeps(baseStatus, () => true)
-
-    // #when projecting
-    const result = await projectRunObservation(runState, deps)
-
-    // #then queued status is preserved — overlay only applies to running
-    expect(result).not.toBeNull()
-    expect(result?.status).toBe('queued')
-    expect(result?.status).not.toBe('waiting_for_approval')
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Overlay: waiting_for_question (approval takes precedence)
-// ---------------------------------------------------------------------------
-
-describe('projectRunObservation — waiting_for_question overlay', () => {
-  it('overrides running → waiting_for_question when only a question is pending', async () => {
-    // #given a running run whose scope has a pending question but no approval
-    const runState = makeRunState({surface: 'github', run_id: 'run-001'})
-    const deps = makeDeps(
-      makeBaseStatus(),
-      () => false,
-      scopeId => scopeId === 'run-001',
-    )
-
-    // #when projecting
-    const result = await projectRunObservation(runState, deps)
-
-    // #then the status is waiting_for_question
-    expect(result?.status).toBe('waiting_for_question')
-  })
-
-  it('keys the question overlay by the discord thread id, like approvals', async () => {
-    // #given a discord run whose thread scope has a pending question
-    const runState = makeRunState({surface: 'discord', thread_id: 'thread-q', run_id: 'run-001'})
-    const deps = makeDeps(
-      makeBaseStatus({surface: 'discord'}),
-      () => false,
-      scopeId => scopeId === 'thread-q',
-    )
-
-    // #when projecting
-    const result = await projectRunObservation(runState, deps)
-
-    // #then the question overlay applies via the thread scope
-    expect(result?.status).toBe('waiting_for_question')
-  })
-
-  it('shows waiting_for_approval while an approval and a question are both pending', async () => {
-    // #given both families pending for the run's scope
-    const deps = makeDeps(
-      makeBaseStatus(),
-      () => true,
-      () => true,
-    )
-
-    // #when projecting
-    const result = await projectRunObservation(makeRunState(), deps)
-
-    // #then approval takes precedence
-    expect(result?.status).toBe('waiting_for_approval')
-  })
-
-  it('moves approval → question → running as each pending item settles', async () => {
-    // #given mutable pending state for both families
-    let approvalPending = true
-    let questionPending = true
-    const deps = makeDeps(
-      makeBaseStatus(),
-      () => approvalPending,
-      () => questionPending,
-    )
-    const runState = makeRunState()
-
-    // #when / #then the status follows the precedence as items settle
-    expect((await projectRunObservation(runState, deps))?.status).toBe('waiting_for_approval')
-    approvalPending = false
-    expect((await projectRunObservation(runState, deps))?.status).toBe('waiting_for_question')
-    questionPending = false
-    expect((await projectRunObservation(runState, deps))?.status).toBe('running')
-  })
-
-  it('applies no question overlay when the predicate is absent', async () => {
-    // #given deps without a question predicate
-    const deps = makeDeps(makeBaseStatus(), () => false)
-
-    // #when projecting
-    const result = await projectRunObservation(makeRunState(), deps)
-
-    // #then the status stays running
-    expect(result?.status).toBe('running')
-  })
-
-  it.each([
-    ['succeeded', 'COMPLETED'],
-    ['failed', 'FAILED'],
-    ['cancelled', 'CANCELLED'],
-    ['queued', 'PENDING'],
-  ] as const)('does not overlay a %s status even with a stale pending question', async (status, phase) => {
-    // #given a non-running run and a stale pending question
-    const deps = makeDeps(
-      makeBaseStatus({phase, status}),
-      () => false,
-      () => true,
-    )
-
-    // #when projecting
-    const result = await projectRunObservation(makeRunState({phase}), deps)
-
-    // #then the base status is preserved
-    expect(result?.status).toBe(status)
-  })
-
-  it('does not call the question predicate when the bridge returns null', async () => {
-    // #given a denied repo and a spy predicate
-    let called = false
-    const deps = makeDeps(
-      null,
-      () => false,
-      () => {
-        called = true
-        return true
-      },
-    )
-
-    // #when projecting
-    const result = await projectRunObservation(makeRunState(), deps)
-
-    // #then null is returned and the predicate was never consulted
-    expect(result).toBeNull()
-    expect(called).toBe(false)
-  })
-
-  it('round-trips waiting_for_question through JSON as a valid OperatorWebStatus', async () => {
-    // #given a projected waiting_for_question status
-    const deps = makeDeps(
-      makeBaseStatus(),
-      () => false,
-      () => true,
-    )
-    const result = await projectRunObservation(makeRunState(), deps)
-
-    // #when serialized and parsed as an SSE status frame would be
-    const parsed = JSON.parse(JSON.stringify(result)) as OperatorRunStatus
-    const allowed: readonly OperatorWebStatus[] = [
-      'queued',
-      'blocked',
-      'running',
-      'waiting_for_approval',
-      'waiting_for_question',
-      'succeeded',
-      'failed',
-      'cancelled',
-    ]
-
-    // #then the status survives and is in the contract set
-    expect(parsed.status).toBe('waiting_for_question')
-    expect(allowed).toContain(parsed.status)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Edge: denied / keyless repo → null
-// ---------------------------------------------------------------------------
-
-describe('projectRunObservation — denied/keyless repo', () => {
-  it('returns null when the bridge returns null (denied repo)', async () => {
-    // #given a run whose repo is on the denylist (bridge returns null)
-    const runState = makeRunState()
-    const deps = makeDeps(null)
-
-    // #when projecting
-    const result = await projectRunObservation(runState, deps)
-
-    // #then null is returned (contract omission — no record)
-    expect(result).toBeNull()
-  })
-
-  it('does not call hasPendingForScope when the bridge returns null', async () => {
-    // #given a denied run
-    const runState = makeRunState()
-    let pendingCalled = false
-    const deps = makeDeps(null, () => {
-      pendingCalled = true
-      return true
-    })
-
-    // #when projecting
-    await projectRunObservation(runState, deps)
-
-    // #then hasPendingForScope was never called (short-circuit on null)
-    expect(pendingCalled).toBe(false)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Safety: closed DTO — no details passthrough
-// ---------------------------------------------------------------------------
-
-describe('projectRunObservation — closed DTO safety', () => {
-  it('output contains ONLY the contract fields — no details passthrough', async () => {
-    // #given a run whose details carry sensitive internal data
-    const runState = makeRunState({
-      details: {
-        rawOutput: 'secret tool output',
-        workspacePath: '/home/runner/workspace/acme/widget',
-        toolArgs: ['--token', 'ghp_supersecret'],
-        internalUrl: 'http://internal.corp/api',
-        holder_id: 'should-not-leak',
-      },
-    })
-    const baseStatus = makeBaseStatus()
-    const deps = makeDeps(baseStatus)
-
-    // #when projecting
-    const result = await projectRunObservation(runState, deps)
-
-    // #then the result is non-null
-    expect(result).not.toBeNull()
-
-    // #then the serialized DTO contains NONE of the sensitive values
-    const serialized = JSON.stringify(result)
-    expect(serialized).not.toContain('rawOutput')
-    expect(serialized).not.toContain('secret tool output')
-    expect(serialized).not.toContain('workspacePath')
-    expect(serialized).not.toContain('/home/runner/workspace')
-    expect(serialized).not.toContain('toolArgs')
-    expect(serialized).not.toContain('ghp_supersecret')
-    expect(serialized).not.toContain('internalUrl')
-    expect(serialized).not.toContain('http://internal.corp')
-    expect(serialized).not.toContain('details')
-
-    // #then the result has EXACTLY the contract fields (structural allowlist proof)
-    const contractFields = new Set(['runId', 'entityRef', 'surface', 'phase', 'status', 'startedAt', 'stale'])
-    const resultKeys = new Set(Object.keys(result as object))
-    expect(resultKeys).toEqual(contractFields)
-  })
-
-  it('carries failureKind through from the bridge result when present (FAILED)', async () => {
-    // #given a FAILED base status carrying a failureKind from the bridge
-    const runState = makeRunState({phase: 'FAILED'})
-    const baseStatus = makeBaseStatus({phase: 'FAILED', status: 'failed', failureKind: 'inactivity-timeout'})
-    const deps = makeDeps(baseStatus)
-
-    // #when projecting
-    const result = await projectRunObservation(runState, deps)
-
-    // #then failureKind is copied through from base
-    expect(result).not.toBeNull()
-    expect(result?.failureKind).toBe('inactivity-timeout')
-  })
-
-  it('omits failureKind when absent from the bridge result (non-FAILED)', async () => {
-    // #given a non-FAILED base status with no failureKind
-    const runState = makeRunState({phase: 'EXECUTING'})
-    const baseStatus = makeBaseStatus({phase: 'EXECUTING', status: 'running'})
-    const deps = makeDeps(baseStatus)
-
-    // #when projecting
-    const result = await projectRunObservation(runState, deps)
-
-    // #then failureKind is absent (not undefined-valued key, structurally omitted)
-    expect(result).not.toBeNull()
-    expect(Object.prototype.hasOwnProperty.call(result as object, 'failureKind')).toBe(false)
-  })
-
-  it('does not spread runState — holder_id and thread_id are absent from output', async () => {
-    // #given a run with holder_id and thread_id
-    const runState = makeRunState({holder_id: 'holder-secret', thread_id: 'thread-secret'})
-    const baseStatus = makeBaseStatus()
-    const deps = makeDeps(baseStatus)
-
-    // #when projecting
-    const result = await projectRunObservation(runState, deps)
-
-    // #then holder_id and thread_id are not in the output
-    expect(result).not.toBeNull()
-    const serialized = JSON.stringify(result)
-    expect(serialized).not.toContain('holder_id')
-    expect(serialized).not.toContain('holder-secret')
-    expect(serialized).not.toContain('thread_id')
-    expect(serialized).not.toContain('thread-secret')
-  })
-
-  it('copies only the explicit OperatorRunStatus fields from the bridge result', async () => {
-    // #given a base status with all contract fields populated
-    const baseStatus: OperatorRunStatus = {
-      runId: 'run-closed-dto',
-      entityRef: 'org/repo#5',
-      surface: 'github',
-      phase: 'COMPLETED',
-      status: 'succeeded',
-      startedAt: '2024-06-01T12:00:00.000Z',
-      stale: false,
-    }
-    const runState = makeRunState({run_id: 'run-closed-dto', phase: 'COMPLETED'})
-    const deps = makeDeps(baseStatus)
-
-    // #when projecting
-    const result = await projectRunObservation(runState, deps)
-
-    // #then each contract field is copied exactly
-    expect(result?.runId).toBe('run-closed-dto')
-    expect(result?.entityRef).toBe('org/repo#5')
-    expect(result?.surface).toBe('github')
-    expect(result?.phase).toBe('COMPLETED')
-    expect(result?.status).toBe('succeeded')
-    expect(result?.startedAt).toBe('2024-06-01T12:00:00.000Z')
-    expect(result?.stale).toBe(false)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Checkout fields (contract 1.8.0): carried from the deny-gated bridge result
-// ---------------------------------------------------------------------------
-
-describe('projectRunObservation — checkout fields', () => {
-  const PROVENANCE: OperatorCheckoutProvenance = {
-    kind: 'observed',
-    observation: {
-      head: {kind: 'attached', branch: 'main', sha: 'a'.repeat(40)},
-      worktree: {kind: 'clean'},
-      operationInProgress: 'none',
-      observedAt: '2026-01-01T00:00:00.000Z',
-    },
-    remote: {kind: 'not-checked'},
-  }
-  const PREPARATION: OperatorCheckoutPreparation = {
-    outcome: 'refused',
-    reason: 'dirty',
-    changedPaths: ['src/index.ts'],
-  }
-
-  it('carries checkoutProvenance through from the bridge result when present', async () => {
-    // #given an EXECUTING base status carrying checkout provenance
-    const baseStatus = makeBaseStatus({checkoutProvenance: PROVENANCE})
-
-    // #when projecting
-    const result = await projectRunObservation(makeRunState(), makeDeps(baseStatus))
-
-    // #then the provenance is copied through unchanged
-    expect(result?.checkoutProvenance).toEqual(PROVENANCE)
-  })
-
-  it('carries checkoutPreparation through from the bridge result when present', async () => {
-    // #given a FAILED base status carrying a preparation refusal
-    const baseStatus = makeBaseStatus({phase: 'FAILED', status: 'failed', checkoutPreparation: PREPARATION})
-
-    // #when projecting
-    const result = await projectRunObservation(makeRunState({phase: 'FAILED'}), makeDeps(baseStatus))
-
-    // #then the preparation is copied through unchanged
-    expect(result?.checkoutPreparation).toEqual(PREPARATION)
-  })
-
-  it('omits both checkout keys when the bridge result lacks them', async () => {
-    // #given a base status recorded before the checkout fields existed
-    const baseStatus = makeBaseStatus()
-
-    // #when projecting
-    const result = await projectRunObservation(makeRunState(), makeDeps(baseStatus))
-
-    // #then neither key is present (not an undefined-valued key)
-    expect(result).not.toBeNull()
-    expect(Object.prototype.hasOwnProperty.call(result as object, 'checkoutProvenance')).toBe(false)
-    expect(Object.prototype.hasOwnProperty.call(result as object, 'checkoutPreparation')).toBe(false)
-  })
-
-  it('keeps the checkout fields through the waiting_for_approval overlay', async () => {
-    // #given a running base status with provenance and a pending approval for the run
-    const baseStatus = makeBaseStatus({checkoutProvenance: PROVENANCE})
-    const deps = makeDeps(baseStatus, () => true)
-
-    // #when projecting
-    const result = await projectRunObservation(makeRunState(), deps)
-
-    // #then the status is overlaid and the provenance is preserved
-    expect(result?.status).toBe('waiting_for_approval')
-    expect(result?.checkoutProvenance).toEqual(PROVENANCE)
-  })
-
-  it('surfaces the fields end to end through the real redaction bridge', async () => {
-    // #given a non-denied run whose stored details carry both checkout fields
-    const runState = makeRunState({
-      details: {checkoutProvenance: PROVENANCE, checkoutPreparation: PREPARATION},
-    })
-    const deps: ProjectRunObservationDeps = {
-      ...makeDeps(null),
-      bindingsLookup: {getBindingByRepo: async () => ({success: true, data: {databaseId: 1, nodeId: 'R_1'}})},
-      _projectRunStatus: undefined,
-    }
-
-    // #when projecting through the real bridge
-    const result = await projectRunObservation(runState, deps)
-
-    // #then both fields reach the projected status
-    expect(result?.checkoutProvenance).toEqual(PROVENANCE)
-    expect(result?.checkoutPreparation).toEqual(PREPARATION)
-  })
-
-  it('gives a denied run no checkout fields — the deny gate wins', async () => {
-    // #given a run carrying both checkout fields whose repo is denied
-    const runState = makeRunState({
-      details: {checkoutProvenance: PROVENANCE, checkoutPreparation: PREPARATION},
-    })
-    const deps: ProjectRunObservationDeps = {
-      ...makeDeps(null),
-      bindingsLookup: {getBindingByRepo: async () => ({success: true, data: {databaseId: 1, nodeId: 'R_1'}})},
-      isRepoDenied: () => true,
-      _projectRunStatus: undefined,
-    }
-
-    // #when projecting through the real bridge
-    const result = await projectRunObservation(runState, deps)
-
-    // #then nothing is surfaced at all
-    expect(result).toBeNull()
-  })
-
-  it('copies every OperatorRunStatus field — a fully populated status round-trips unchanged', async () => {
-    // #given a status with every contract field set; Required<> makes a new field a type error here
-    const full: Required<OperatorRunStatus> = {
-      runId: 'run-001',
-      entityRef: 'acme/widget#1',
-      surface: 'github',
-      phase: 'FAILED',
-      status: 'failed',
-      startedAt: '2024-01-01T00:00:00.000Z',
-      stale: false,
-      failureKind: 'inactivity-timeout',
-      checkoutProvenance: PROVENANCE,
-      checkoutPreparation: PREPARATION,
-    }
-
-    // #when projecting
-    const result = await projectRunObservation(makeRunState({phase: 'FAILED'}), makeDeps(full))
-
-    // #then no field is dropped
-    expect(result).toEqual(full)
-  })
-})
-
-// ---------------------------------------------------------------------------
 // overlayWaitingStatus — the exported synchronous overlay
 // ---------------------------------------------------------------------------
-
-function makePredicates(pendingApprovalScopes: readonly string[], pendingQuestionScopes: readonly string[]) {
-  return {
-    hasPendingApproval: (scopeId: string) => pendingApprovalScopes.includes(scopeId),
-    hasPendingQuestion: (scopeId: string) => pendingQuestionScopes.includes(scopeId),
-  } satisfies WaitingPredicates
-}
 
 describe('overlayWaitingStatus', () => {
   it('returns waiting_for_approval for running with a pending approval', () => {
@@ -831,156 +236,172 @@ describe('overlayWaitingStatus', () => {
 })
 
 // ---------------------------------------------------------------------------
-// projectRunBase — async base projection, never overlaid
+// Keyed base + overlay composition
 // ---------------------------------------------------------------------------
 
-describe('projectRunBase', () => {
-  it('returns running (no overlay) even when the scope has pending entries', async () => {
-    // #given a running bridge result; base deps carry no overlay predicates
-    const deps = makeDeps(makeBaseStatus())
+describe('keyed base + overlay — phase → status mapping', () => {
+  const phases: {phase: RunState['phase']; expectedStatus: OperatorWebStatus}[] = [
+    {phase: 'PENDING', expectedStatus: 'queued'},
+    {phase: 'ACKNOWLEDGED', expectedStatus: 'running'},
+    {phase: 'EXECUTING', expectedStatus: 'running'},
+    {phase: 'COMPLETED', expectedStatus: 'succeeded'},
+    {phase: 'FAILED', expectedStatus: 'failed'},
+    {phase: 'CANCELLED', expectedStatus: 'cancelled'},
+  ]
 
-    // #when projecting the base
-    const result = await projectRunBase(makeRunState(), deps)
+  for (const {phase, expectedStatus} of phases) {
+    it(`maps ${phase} → ${expectedStatus} with nothing pending`, async () => {
+      // #when projecting a run in the phase
+      const result = await projectAndOverlay(makeRunState({phase}), NONE_PENDING)
 
-    // #then the status is the plain base status
+      // #then the status is the base status, never blocked
+      expect(result?.status).toBe(expectedStatus)
+      expect(result?.status).not.toBe('blocked')
+    })
+  }
+})
+
+describe('keyed base + overlay — waiting overlay', () => {
+  it('overlays a running web run to waiting_for_approval under its run id', async () => {
+    // #when a running github run has a pending approval under its run id
+    const result = await projectAndOverlay(makeRunState(), makePredicates(['run-001'], []))
+
+    // #then it waits for approval
+    expect(result?.status).toBe('waiting_for_approval')
+  })
+
+  it('overlays a running discord run under its thread id, not its run id', async () => {
+    // #given a discord run with a pending approval keyed by thread and a pending question keyed by run id
+    const runState = makeRunState({surface: 'discord', thread_id: 'thread-d', run_id: 'run-d'})
+
+    // #when projecting
+    const result = await projectAndOverlay(runState, makePredicates(['thread-d'], ['run-d']))
+
+    // #then only the thread-keyed approval counts
+    expect(result?.status).toBe('waiting_for_approval')
+  })
+
+  it('overlays waiting_for_question when only a question is pending', async () => {
+    // #when only a question is pending for the scope
+    const result = await projectAndOverlay(makeRunState(), makePredicates([], ['run-001']))
+
+    // #then it waits for the question
+    expect(result?.status).toBe('waiting_for_question')
+  })
+
+  it('shows waiting_for_approval while an approval and a question are both pending', async () => {
+    // #when both families are pending
+    const result = await projectAndOverlay(makeRunState(), makePredicates(['run-001'], ['run-001']))
+
+    // #then approval takes precedence
+    expect(result?.status).toBe('waiting_for_approval')
+  })
+
+  it('moves approval → question → running as each pending item settles', async () => {
+    // #given mutable pending state for both families
+    let approvalPending = true
+    let questionPending = true
+    const predicates: WaitingPredicates = {
+      hasPendingApproval: () => approvalPending,
+      hasPendingQuestion: () => questionPending,
+    }
+
+    // #when / #then the status follows the precedence as items settle
+    expect((await projectAndOverlay(makeRunState(), predicates))?.status).toBe('waiting_for_approval')
+    approvalPending = false
+    expect((await projectAndOverlay(makeRunState(), predicates))?.status).toBe('waiting_for_question')
+    questionPending = false
+    expect((await projectAndOverlay(makeRunState(), predicates))?.status).toBe('running')
+  })
+
+  it('stays running with nothing pending in the scope', async () => {
+    // #when pending entries exist only for another scope
+    const result = await projectAndOverlay(makeRunState(), makePredicates(['other'], ['other']))
+
+    // #then the status is unchanged
     expect(result?.status).toBe('running')
   })
 
-  it('returns null for a denied or keyless repo', async () => {
-    // #given the bridge returns null
-    const deps = makeDeps(null)
+  it.each([
+    ['succeeded', 'COMPLETED'],
+    ['failed', 'FAILED'],
+    ['cancelled', 'CANCELLED'],
+    ['queued', 'PENDING'],
+  ] as const)('does not overlay a %s status even with stale pending entries', async (status, phase) => {
+    // #when a non-running run has pending entries in both families
+    const result = await projectAndOverlay(makeRunState({phase}), makePredicates(['run-001'], ['run-001']))
 
-    // #when projecting the base
-    const result = await projectRunBase(makeRunState(), deps)
-
-    // #then nothing is surfaced
-    expect(result).toBeNull()
+    // #then the base status is preserved
+    expect(result?.status).toBe(status)
   })
 
-  it('copies only contract fields from the bridge result', async () => {
-    // #given a bridge result carrying an extra, non-contract key
-    const leaky = {...makeBaseStatus(), holder_id: 'should-not-leak'} as OperatorRunStatus
-    const deps = makeDeps(leaky)
+  it('keeps checkout fields through the overlay', async () => {
+    // #given a running run with checkout provenance
+    const provenance = {
+      kind: 'observed',
+      observation: {
+        head: {kind: 'attached', branch: 'main', sha: 'a'.repeat(40)},
+        worktree: {kind: 'clean'},
+        operationInProgress: 'none',
+        observedAt: '2026-01-01T00:00:00.000Z',
+      },
+      remote: {kind: 'not-checked'},
+    }
 
-    // #when projecting the base
-    const result = await projectRunBase(makeRunState(), deps)
-
-    // #then the extra key is dropped
-    expect(Object.keys(result as object).sort()).toEqual(
-      ['entityRef', 'phase', 'runId', 'stale', 'startedAt', 'status', 'surface'].sort(),
+    // #when a pending approval overlays it
+    const result = await projectAndOverlay(
+      makeRunState({details: {checkoutProvenance: provenance}}),
+      makePredicates(['run-001'], []),
     )
+
+    // #then the status is overlaid and the provenance is preserved
+    expect(result?.status).toBe('waiting_for_approval')
+    expect(result?.checkoutProvenance).toEqual(provenance)
+  })
+
+  it('round-trips waiting_for_question through JSON as a valid OperatorWebStatus', async () => {
+    // #given a projected waiting_for_question status
+    const result = await projectAndOverlay(makeRunState(), makePredicates([], ['run-001']))
+
+    // #when serialized and parsed as an SSE status frame would be
+    const parsed = JSON.parse(JSON.stringify(result)) as OperatorRunStatus
+    const allowed: readonly OperatorWebStatus[] = [
+      'queued',
+      'blocked',
+      'running',
+      'waiting_for_approval',
+      'waiting_for_question',
+      'succeeded',
+      'failed',
+      'cancelled',
+    ]
+
+    // #then the status survives and is in the contract set
+    expect(parsed.status).toBe('waiting_for_question')
+    expect(allowed).toContain(parsed.status)
   })
 })
 
-// ---------------------------------------------------------------------------
-// projectRunBaseWithKey — base projection plus the resolved repository key
-// ---------------------------------------------------------------------------
-
-describe('projectRunBaseWithKey', () => {
-  const resolvedKey = {databaseId: 42, nodeId: 'R_42'}
-
-  function makeKeyedDeps(options: {
-    readonly binding?: {readonly databaseId?: number; readonly nodeId?: string} | null
-    readonly isRepoDenied?: (repoKey: {readonly databaseId: number | null; readonly nodeId: string | null}) => boolean
-  }) {
-    const getBindingByRepo = vi.fn(async () => ({
-      success: true as const,
-      data: options.binding === undefined ? resolvedKey : options.binding,
-    }))
-    const deps = {
-      nowMs: BASE_NOW_MS,
-      staleThresholdMs: STALE_THRESHOLD_MS,
-      bindingsLookup: {getBindingByRepo} as unknown as BindingsLookup,
-      isRepoDenied: options.isRepoDenied ?? (() => false),
+describe('keyed base + overlay — denied repo', () => {
+  it('yields nothing and never consults the registries', async () => {
+    // #given a denied repository and spy predicates
+    let consulted = false
+    const predicates: WaitingPredicates = {
+      hasPendingApproval: () => {
+        consulted = true
+        return true
+      },
+      hasPendingQuestion: () => {
+        consulted = true
+        return true
+      },
     }
-    return {deps, getBindingByRepo}
-  }
-
-  it('returns the base status and the key the binding resolved, after exactly one lookup', async () => {
-    // #given a bound repository that is not denied
-    const {deps, getBindingByRepo} = makeKeyedDeps({})
 
     // #when projecting
-    const result = await projectRunBaseWithKey(makeRunState(), deps)
+    const result = await projectAndOverlay(makeRunState(), predicates, {denied: true})
 
-    // #then the status is the closed base status and the key is the one resolved
-    expect(result?.status).toMatchObject({runId: 'run-001', status: 'running', stale: false})
-    expect(result?.repoKey).toEqual(resolvedKey)
-    expect(getBindingByRepo).toHaveBeenCalledExactlyOnceWith('acme', 'widget')
-  })
-
-  it('passes the resolved key to the denylist predicate', async () => {
-    // #given a predicate that records the key it is asked about
-    const isRepoDenied = vi.fn(() => false)
-    const {deps} = makeKeyedDeps({isRepoDenied})
-
-    // #when projecting
-    await projectRunBaseWithKey(makeRunState(), deps)
-
-    // #then the predicate saw the resolved key
-    expect(isRepoDenied).toHaveBeenCalledExactlyOnceWith(resolvedKey)
-  })
-
-  it('returns null for a denied repository', async () => {
-    // #given the denylist rejects the resolved key
-    const {deps} = makeKeyedDeps({isRepoDenied: key => key.databaseId === 42})
-
-    // #when projecting
-    const result = await projectRunBaseWithKey(makeRunState(), deps)
-
-    // #then nothing is surfaced, not even the key
+    // #then no status is produced and the registries were not read
     expect(result).toBeNull()
-  })
-
-  it('returns null for a keyless repository (no binding), failing closed', async () => {
-    // #given no binding, and the denylist's fail-closed rule for a null/null key
-    const {deps} = makeKeyedDeps({
-      binding: null,
-      isRepoDenied: key => key.databaseId === null && key.nodeId === null,
-    })
-
-    // #when projecting
-    const result = await projectRunBaseWithKey(makeRunState(), deps)
-
-    // #then the run is omitted
-    expect(result).toBeNull()
-  })
-
-  it('never applies the waiting overlay', async () => {
-    // #given a running run (the overlay is a separate synchronous step)
-    const {deps} = makeKeyedDeps({})
-
-    // #when projecting
-    const result = await projectRunBaseWithKey(makeRunState({surface: 'discord', thread_id: 'T'}), deps)
-
-    // #then the status is the plain base status
-    expect(result?.status.status).toBe('running')
-  })
-
-  it('copies only contract fields, dropping run details', async () => {
-    // #given a run whose free-form details carry non-contract data
-    const {deps} = makeKeyedDeps({})
-    const runState = makeRunState({details: {secret: 'should-not-leak'}})
-
-    // #when projecting
-    const result = await projectRunBaseWithKey(runState, deps)
-
-    // #then the status carries exactly the contract fields
-    expect(Object.keys(result?.status ?? {}).sort()).toEqual(
-      ['entityRef', 'phase', 'runId', 'stale', 'startedAt', 'status', 'surface'].sort(),
-    )
-  })
-
-  it('carries failureKind for a failed run through the closed copy', async () => {
-    // #given a FAILED run with a known failure kind
-    const {deps} = makeKeyedDeps({})
-    const runState = makeRunState({phase: 'FAILED', details: {failureKind: 'timeout'}})
-
-    // #when projecting
-    const result = await projectRunBaseWithKey(runState, deps)
-
-    // #then the status is failed and the mapped failureKind survives
-    expect(result?.status.status).toBe('failed')
-    expect(result?.status.failureKind).toBeDefined()
+    expect(consulted).toBe(false)
   })
 })

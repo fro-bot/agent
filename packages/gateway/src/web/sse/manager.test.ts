@@ -30,8 +30,8 @@ import type {WaitingPredicates} from './projection.js'
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
+import {projectRunStatusWithKey} from '../../redaction/surface-gate.js'
 import {createRunObservationManager, MAX_OPEN_QUESTION_REPLAY_PER_RUN} from './manager.js'
-import {projectRunBase} from './projection.js'
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -164,11 +164,11 @@ type ProjectFn = (runState: RunState) => Promise<OperatorRunStatus | null>
 const DEFAULT_REPO_KEY: RunStatusRepoKey = {databaseId: 1, nodeId: 'R_1'}
 const NO_WAITING: WaitingPredicates = {hasPendingApproval: () => false, hasPendingQuestion: () => false}
 
-/** Adapts a status-returning test projector to the manager's base-projection dep. */
-function toProjectRunBase(projectFn: ProjectFn): RunObservationManagerDeps['projectRunBase'] {
+/** Adapts a status-returning test projector (null = denied) to the manager's base-projection dep. */
+function toProjectBase(projectFn: ProjectFn): RunObservationManagerDeps['projectBase'] {
   return async runState => {
     const status = await projectFn(runState)
-    return status === null ? null : {status, repoKey: DEFAULT_REPO_KEY}
+    return status === null ? {kind: 'denied'} : {kind: 'projected', status, repoKey: DEFAULT_REPO_KEY}
   }
 }
 
@@ -179,7 +179,7 @@ function makeManager(
 ): {manager: RunObservationManager & ScopeRefresher; timers: FakeTimerSystem} {
   const timers = fakeTimers ?? makeFakeTimerSystem()
   const manager = createRunObservationManager({
-    projectRunBase: toProjectRunBase(projectFn),
+    projectBase: toProjectBase(projectFn),
     waiting: NO_WAITING,
     isRepoDenied: () => false,
     logger: {
@@ -722,7 +722,7 @@ describe('denied-repo omission', () => {
 
   it('cold-start deny-all: null projection at manager boundary yields no cache entry and no emitted frame', async () => {
     // Pins the fail-closed posture at the manager boundary: when the denylist cache is
-    // unprimed (cold start), projectRunBase returns null (deny-all). The manager
+    // unprimed (cold start), projectBase returns denied (deny-all). The manager
     // must produce no observable output — no cache write, no frame to any subscriber.
 
     // #given a manager whose projection always returns null (unprimed denylist → deny-all)
@@ -774,7 +774,7 @@ describe('observer-only invariant — LOAD-BEARING', () => {
     // mutators, TypeScript would require them and this test would fail to compile.
 
     const deps: RunObservationManagerDeps = {
-      projectRunBase: async () => null,
+      projectBase: async () => ({kind: 'denied'}),
       waiting: NO_WAITING,
       isRepoDenied: () => false,
       logger: {info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn()},
@@ -796,7 +796,7 @@ describe('observer-only invariant — LOAD-BEARING', () => {
 
     // All present keys are in the allowed set
     const allowedKeys = new Set([
-      'projectRunBase',
+      'projectBase',
       'waiting',
       'isRepoDenied',
       'logger',
@@ -1228,9 +1228,9 @@ describe('run isolation', () => {
 // 11. Error path: throwing projectFn is caught, logged, no cache/frame
 // ===========================================================================
 
-describe('error path — throwing projectRunBase', () => {
+describe('error path — throwing projectBase', () => {
   it('a rejecting projectFn is caught, logged, and produces no cache entry and no frame', async () => {
-    // #given a manager whose projectRunBase always rejects
+    // #given a manager whose projectBase always rejects
     const projectFn: ProjectFn = async () => {
       throw new Error('projection exploded')
     }
@@ -1258,7 +1258,7 @@ describe('error path — throwing projectRunBase', () => {
     // #then the warn logger was called (error was logged)
     expect(warnSpy).toHaveBeenCalledWith(
       expect.objectContaining({runId: 'run-001'}),
-      expect.stringContaining('projectRunBase threw'),
+      expect.stringContaining('projectBase threw'),
     )
 
     // #then no cache entry was created (subscribing again gets reset)
@@ -1958,7 +1958,7 @@ describe('observer-only invariant — observeOutput extension', () => {
   it('runObservationManagerDeps type still has no mutating run API after observeOutput addition', () => {
     // #given the RunObservationManagerDeps type (compile-time structural check)
     const deps: RunObservationManagerDeps = {
-      projectRunBase: async () => null,
+      projectBase: async () => ({kind: 'denied'}),
       waiting: NO_WAITING,
       isRepoDenied: () => false,
       logger: {info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn()},
@@ -1980,7 +1980,7 @@ describe('observer-only invariant — observeOutput extension', () => {
 
     // All present keys are in the allowed set (includes new terminal replay TTL deps)
     const allowedKeys = new Set([
-      'projectRunBase',
+      'projectBase',
       'waiting',
       'isRepoDenied',
       'logger',
@@ -3034,7 +3034,7 @@ describe('observeQuestion — reconnect reconciliation', () => {
 
 describe('status frame — checkout fields through the real projection', () => {
   it('delivers checkoutProvenance and checkoutPreparation on the emitted status frame', async () => {
-    // #given a manager wired to the real projectRunBase and a run carrying both fields
+    // #given a manager wired to the real projectRunStatusWithKey and a run carrying both fields
     const provenance: OperatorCheckoutProvenance = {
       kind: 'observed',
       observation: {
@@ -3047,14 +3047,14 @@ describe('status frame — checkout fields through the real projection', () => {
     }
     const preparation: OperatorCheckoutPreparation = {outcome: 'refused', reason: 'dirty', changedPaths: ['a.ts']}
     const runState = makeRunState({details: {checkoutProvenance: provenance, checkoutPreparation: preparation}})
-    const projectFn: ProjectFn = async state =>
-      projectRunBase(state, {
+    const projectBase: RunObservationManagerDeps['projectBase'] = async state =>
+      projectRunStatusWithKey(state, {
         nowMs: 1_000_000,
         staleThresholdMs: 60_000,
         bindingsLookup: {getBindingByRepo: async () => ({success: true, data: {databaseId: 1, nodeId: 'R_1'}})},
         isRepoDenied: () => false,
       })
-    const {manager} = makeManager(projectFn)
+    const {manager} = makeManager(async () => null, {projectBase})
     const {frames} = collectFrames(manager, 'run-001')
 
     // #when the run is observed
@@ -4171,12 +4171,13 @@ describe('waiting refresh — scope index', () => {
 
   it('a refresh that throws for one run is logged and does not stop the rest of the scope', async () => {
     // #given two Discord runs in one thread; the first one's repository key makes the denylist check throw
-    const projectRunBase: RunObservationManagerDeps['projectRunBase'] = async runState => ({
+    const projectBase: RunObservationManagerDeps['projectBase'] = async runState => ({
+      kind: 'projected',
       status: makeOperatorRunStatus({runId: runState.run_id}),
       repoKey: {databaseId: null, nodeId: runState.run_id === 'run-bad' ? 'bad' : 'good'},
     })
     const harness = makeWaitingHarness({
-      projectRunBase,
+      projectBase,
       isRepoDenied: repoKey => {
         if (repoKey.nodeId === 'bad') throw new Error('denylist unavailable')
         return false
@@ -4322,5 +4323,111 @@ describe('waiting refresh — shutdown', () => {
 
     // #then no terminal replay entry or eviction timer was created
     expect(harness.timers.activeTimerCount()).toBe(0)
+  })
+})
+
+// ===========================================================================
+// Binding store unavailable: a transient read error keeps the last good state
+// ===========================================================================
+
+/** A projector whose binding store can be switched into a failing state. */
+function makeFlakyStore() {
+  const state = {unavailable: false}
+  const projectBase: RunObservationManagerDeps['projectBase'] = async runState =>
+    state.unavailable
+      ? {kind: 'unavailable'}
+      : {
+          kind: 'projected',
+          status: makeOperatorRunStatus({runId: runState.run_id}),
+          repoKey: DEFAULT_REPO_KEY,
+        }
+  return {state, projectBase}
+}
+
+describe('waiting refresh — binding store unavailable', () => {
+  it('a store error on the EXECUTING observe keeps the last base, so a later question still shows waiting', async () => {
+    // #given a run observed while the store was healthy, then re-observed while it fails
+    const store = makeFlakyStore()
+    const harness = makeWaitingHarness({projectBase: store.projectBase})
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    await observeAndDrain(harness.manager, makeRunState())
+    store.state.unavailable = true
+    await observeAndDrain(harness.manager, makeRunState())
+
+    // #when a question opens afterwards
+    await openQuestionAndRefresh(harness, 'run-001')
+
+    // #then the failed observe emitted nothing, and the refresh works from the last good base
+    expect(statusNames(frames)).toEqual(['running', 'waiting_for_question'])
+
+    // #then the failure was logged with the run id only
+    expect(harness.warn).toHaveBeenCalledWith({runId: 'run-001'}, expect.stringContaining('binding store unavailable'))
+
+    harness.manager.shutdown()
+  })
+
+  it('the refresh-time denylist check still applies to the retained key after a store error', async () => {
+    // #given a run kept across a store error
+    const store = makeFlakyStore()
+    const harness = makeWaitingHarness({projectBase: store.projectBase})
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    await observeAndDrain(harness.manager, makeRunState())
+    store.state.unavailable = true
+    await observeAndDrain(harness.manager, makeRunState())
+
+    // #when the repository becomes denied and a question opens
+    harness.denial.denied = true
+    await openQuestionAndRefresh(harness, 'run-001')
+
+    // #then nothing is emitted
+    expect(statusNames(frames)).toEqual(['running'])
+
+    harness.manager.shutdown()
+  })
+
+  it('a store error on the very first observe emits and caches nothing, and the next good observe works', async () => {
+    // #given a store that fails on the first observe, with no retained state yet
+    const store = makeFlakyStore()
+    store.state.unavailable = true
+    const harness = makeWaitingHarness({projectBase: store.projectBase})
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    await observeAndDrain(harness.manager, makeRunState())
+    await openQuestionAndRefresh(harness, 'run-001')
+
+    // #then nothing was emitted or cached
+    expect(statusNames(frames)).toEqual([])
+    const probe = collectFrames(harness.manager, 'run-001')
+    await drain()
+    expect(probe.frames.map(frame => frame.type)).toEqual(['reset'])
+
+    // #when the store recovers and the run is observed again with the question still open
+    store.state.unavailable = false
+    await observeAndDrain(harness.manager, makeRunState())
+
+    // #then the observation commits normally, overlaid against the live registry
+    expect(statusNames(frames)).toEqual(['waiting_for_question'])
+
+    harness.manager.shutdown()
+  })
+
+  it('a real denial still drops the retained state, unlike a store error', async () => {
+    // #given a run whose next projection is denied
+    let call = 0
+    const projectBase: RunObservationManagerDeps['projectBase'] = async runState =>
+      ++call === 1
+        ? {kind: 'projected', status: makeOperatorRunStatus({runId: runState.run_id}), repoKey: DEFAULT_REPO_KEY}
+        : {kind: 'denied'}
+    const harness = makeWaitingHarness({projectBase})
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    await observeAndDrain(harness.manager, makeRunState())
+    await observeAndDrain(harness.manager, makeRunState())
+
+    // #when a question opens
+    await openQuestionAndRefresh(harness, 'run-001')
+
+    // #then the run was dropped: no waiting frame
+    expect(statusNames(frames)).toEqual(['running'])
+
+    harness.manager.shutdown()
   })
 })
