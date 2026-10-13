@@ -170,7 +170,7 @@ sequenceDiagram
 
 ## Implementation Units
 
-- [ ] **Unit 1: RequestGate open notification**
+- [x] **Unit 1: RequestGate open notification**
 
 **Goal:** Every registration, replacements included, notifies listeners with the family and scope, so status can refresh at the moment a request opens.
 
@@ -202,7 +202,7 @@ sequenceDiagram
 
 **Verification:** Every `put` path notifies, no listener can break registration, and terminal ordering is unchanged.
 
-- [ ] **Unit 2: Split projection into base and overlay**
+- [x] **Unit 2: Split projection into base and overlay**
 
 **Goal:** A synchronous, exported overlay that the manager and the run list can reapply without another redaction call.
 
@@ -233,7 +233,7 @@ sequenceDiagram
 
 **Verification:** One overlay implementation, reachable synchronously, and the existing projection behavior is unchanged.
 
-- [ ] **Unit 3: Manager waiting refresh**
+- [x] **Unit 3: Manager waiting refresh**
 
 **Goal:** Live status and replay change when a request opens and after it is removed, with no stale or resurrected waiting state.
 
@@ -285,7 +285,7 @@ sequenceDiagram
 
 **Verification:** Live and replay always agree with registry truth, terminal runs stay terminal, and no race test leaves a stuck waiting state.
 
-- [ ] **Unit 4: Run-summary waiting status and contract 1.11.0**
+- [x] **Unit 4: Run-summary waiting status and contract 1.11.0**
 
 **Goal:** The run list shows waiting runs, and the contract version and every pin move together.
 
@@ -320,7 +320,7 @@ sequenceDiagram
 
 **Verification:** Waiting runs appear in summaries, the route can't silently unmount, and every pin reads 1.11.0.
 
-- [ ] **Unit 5: Question push deep link**
+- [x] **Unit 5: Question push deep link**
 
 **Goal:** A question notification opens the run that is asking.
 
@@ -352,7 +352,7 @@ sequenceDiagram
 
 **Verification:** Question pushes deep-link to the run, and every non-conforming ID degrades to the old behavior.
 
-- [ ] **Unit 6: Docs**
+- [x] **Unit 6: Docs**
 
 **Goal:** Docs describe the shipped behavior and the 1.11.0 pairing.
 
