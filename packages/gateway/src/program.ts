@@ -547,6 +547,8 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
     const unsubscribeWaitingRefresh = [
       requestGate.onOpen(event => {
         runObservationManager.refreshScope(event.scopeId)
+        // A replacement that moved the request out of another scope emits no terminal event for it.
+        if (event.displacedScopeId !== undefined) runObservationManager.refreshScope(event.displacedScopeId)
       }),
       requestGate.onTerminal(event => {
         runObservationManager.refreshScope(event.scopeId)

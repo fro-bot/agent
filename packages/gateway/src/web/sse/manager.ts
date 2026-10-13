@@ -488,11 +488,14 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
   let isShutdown = false
 
   /**
-   * Tracks which runIds have reached terminal state. Used to guard against
-   * stale non-terminal observe() calls that arrive out of causal order after
-   * a terminal observe() has already committed the replay cache entry.
+   * Runs whose terminal observation has begun: set synchronously when a terminal-phase observe() starts,
+   * whether or not its projection later succeeds. An older non-terminal observation that resolves
+   * afterwards is discarded, and approval/question frames for the run are dropped. Each entry expires
+   * after the terminal replay TTL (timer in terminalRunTimers), so the set is bounded by the terminal
+   * observations seen per TTL window; replay eviction and shutdown release it earlier.
    */
   const terminalRuns = new Set<string>()
+  const terminalRunTimers = new Map<string, ReturnType<typeof globalThis.setTimeout>>()
 
   /** Running total of estimated bytes stored in terminalReplayCache. */
   let terminalReplayCacheBytes = 0
@@ -609,6 +612,28 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     return bytes
   }
 
+  function releaseTerminalFence(runId: string): void {
+    const timer = terminalRunTimers.get(runId)
+    if (timer !== undefined) {
+      deps.clearTimeout(timer)
+      terminalRunTimers.delete(runId)
+    }
+    terminalRuns.delete(runId)
+  }
+
+  /** Fence the run as terminal for one replay TTL; re-fencing restarts the window. */
+  function fenceTerminalRun(runId: string): void {
+    releaseTerminalFence(runId)
+    terminalRuns.add(runId)
+    terminalRunTimers.set(
+      runId,
+      deps.setTimeout(() => {
+        terminalRunTimers.delete(runId)
+        terminalRuns.delete(runId)
+      }, terminalReplayTtlMs),
+    )
+  }
+
   function evictTerminalReplayEntry(runId: string): void {
     const entry = terminalReplayCache.get(runId)
     if (entry !== undefined) {
@@ -621,7 +646,7 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
       // Belt-and-suspenders: clear the seq counter so a re-used runId starts fresh
       outputSeqCounters.delete(runId)
       // Clear the terminal guard so a re-used runId is not permanently blocked
-      terminalRuns.delete(runId)
+      releaseTerminalFence(runId)
     }
   }
 
@@ -1154,12 +1179,22 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     // must find this run, and a run adopting its thread must re-key at once.
     indexRunScope(runId, scopeIdFor(runState))
 
+    // A terminal observation invalidates every older in-flight observation of the run, whether or not
+    // its own projection succeeds. Fence before the await; no terminal status is fabricated.
+    const isTerminalPhase = TERMINAL_PHASES.has(runState.phase)
+    if (isTerminalPhase === true) {
+      fenceTerminalRun(runId)
+    }
+
     // Project the base status — `denied` for a denied/keyless repo, `unavailable` when the binding store failed
     let projection: RunStatusProjection
     try {
       projection = await deps.projectBase(runState)
     } catch (error) {
       logger.warn({runId, err: String(error)}, 'manager: projectBase threw — dropping observation')
+      if (isTerminalPhase === true) {
+        dropRunState(runId)
+      }
       return
     }
 
@@ -1179,7 +1214,7 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     // later lifecycle observation to release that state, so it is released here.
     if (projection.kind === 'unavailable') {
       logger.warn({runId}, 'manager: binding store unavailable — observation not applied')
-      if (TERMINAL_PHASES.has(runState.phase) === true) {
+      if (isTerminalPhase === true) {
         dropRunState(runId)
       }
       return
@@ -1244,8 +1279,8 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     // Evict any existing entry for this runId before creating a new one
     evictTerminalReplayEntry(runId)
 
-    // Mark this runId as terminal so stale non-terminal observations are rejected
-    terminalRuns.add(runId)
+    // Restart the terminal fence so it spans the replay entry's lifetime
+    fenceTerminalRun(runId)
 
     const expiresAt = deps.now() + terminalReplayTtlMs
     // Use evictTerminalReplayEntry in the TTL callback so byte accounting,
@@ -1700,6 +1735,10 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     }
     terminalReplayCache.clear()
     terminalReplayCacheBytes = 0
+    for (const timer of terminalRunTimers.values()) {
+      deps.clearTimeout(timer)
+    }
+    terminalRunTimers.clear()
     terminalRuns.clear()
   }
 

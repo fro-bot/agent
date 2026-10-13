@@ -49,7 +49,9 @@
  * ### Open and terminal notification
  *
  * Every `put` emits one {@link OpenEvent} to the registered open listeners after the entry is
- * inserted, replacements included. A throwing open listener is logged and never aborts the `put`.
+ * inserted, replacements included. A replacement that moves the request id to another scope names
+ * the scope it left in `displacedScopeId`, because the displaced entry emits no terminal event.
+ * A throwing open listener is logged and never aborts the `put`.
  *
  * Every entry emits exactly one {@link TerminalEvent} to the registered
  * listeners when it leaves the gate: echo, deadline, fail-close, or teardown.
@@ -179,6 +181,8 @@ export interface OpenEvent {
   readonly sessionID: string
   readonly family: RequestFamily
   readonly scopeId: string
+  /** Set only when a replacement moved the request id out of another scope; that scope stopped waiting on it. */
+  readonly displacedScopeId?: string
 }
 
 export type OpenListener = (event: OpenEvent) => void
@@ -335,16 +339,17 @@ export function createRequestGate(deps: {readonly logger: GatewayLogger}): Reque
       }, deadlineMs)
       entry.timer.unref?.()
     }
-    emitOpen(entry)
+    emitOpen(entry, replaced !== undefined && replaced.scopeId !== entry.scopeId ? replaced.scopeId : undefined)
     return replaced
   }
 
-  function emitOpen(entry: GateEntry): void {
+  function emitOpen(entry: GateEntry, displacedScopeId: string | undefined): void {
     const event: OpenEvent = {
       requestID: entry.requestID,
       sessionID: entry.sessionID,
       family: entry.family,
       scopeId: entry.scopeId,
+      ...(displacedScopeId === undefined ? {} : {displacedScopeId}),
     }
     for (const listener of Array.from(openListeners)) {
       try {

@@ -136,15 +136,17 @@ while (sub.queue.length > 0) {
 
 ### 5. Guard against out-of-order async projections
 
-If the observations feeding the stream are async and can resolve out of causal order, a stale **non-terminal** state resolving *after* terminal must not regress the cached terminal status or evict the replay entry. Track a per-run terminal-seen set and drop late non-terminal observations:
+If the observations feeding the stream are async and can resolve out of causal order, a stale **non-terminal** state resolving *after* terminal must not regress the cached terminal status or evict the replay entry. Track a per-run terminal-seen set, fence it synchronously when a terminal-phase observation starts (before its projection await, so a terminal projection that fails still invalidates older in-flight ones), expire each entry after the replay TTL, and drop late non-terminal observations:
 
 ```ts
+if (TERMINAL_PHASES.has(runState.phase)) fenceTerminalRun(runId) // before the await; TTL-bounded
+// ...await the projection...
 if (isTerminal(projected.status) === false && terminalRuns.has(runId) === true) {
   logger.warn(/* ... */, 'non-terminal observe arrived after terminal — dropping stale observation')
   return
 }
 if (isTerminal(projected.status) === true) {
-  terminalRuns.add(runId)
+  fenceTerminalRun(runId) // restart the window to span the replay entry
   // ...cache the terminal replay entry...
 }
 ```

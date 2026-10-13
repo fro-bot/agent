@@ -328,7 +328,7 @@ describe('open notification', () => {
     expect(gate.get('per_1')).toBe(replacement)
   })
 
-  it('a replacement can carry a different scope: the event names the new scope and the old scope stops being pending', () => {
+  it('a replacement can carry a different scope: the event names the new scope and the displaced one', () => {
     // #given an approval registered under one scope
     const {gate, terminals} = setup()
     gate.put({...makeEntry('per_1'), scopeId: 'chan_old'}, undefined)
@@ -337,12 +337,25 @@ describe('open notification', () => {
     // #when the same request id is re-registered under another scope
     gate.put({...makeEntry('per_1'), scopeId: 'chan_new'}, undefined)
 
-    // #then only the new scope is announced; the old scope gets no terminal event, so a subscriber
-    // that tracks per-scope state must re-check the old scope itself
-    expect(opens.map(event => event.scopeId)).toEqual(['chan_new'])
+    // #then the event names the new scope and the displaced one; the old scope gets no terminal event
+    expect(opens.map(event => [event.scopeId, event.displacedScopeId])).toEqual([['chan_new', 'chan_old']])
     expect(terminals).toEqual([])
     expect(gate.hasPendingForScope('approval', 'chan_new')).toBe(true)
     expect(gate.hasPendingForScope('approval', 'chan_old')).toBe(false)
+  })
+
+  it('a same-scope replacement and a first registration carry no displacedScopeId', () => {
+    // #given an approval, replaced within its own scope
+    const {gate} = setup()
+    const opens = listenForOpen(gate)
+
+    // #when it is registered, then replaced under the same scope
+    gate.put(makeEntry('per_1'), undefined)
+    gate.put(makeEntry('per_1'), undefined)
+
+    // #then neither event has the field at all
+    expect(opens).toHaveLength(2)
+    for (const event of opens) expect(Object.prototype.hasOwnProperty.call(event, 'displacedScopeId')).toBe(false)
   })
 
   it('a duplicate question register never reaches put and emits nothing', () => {

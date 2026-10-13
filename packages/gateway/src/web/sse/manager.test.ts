@@ -19,6 +19,7 @@ import type {
   QuestionFrameData,
   RunStatusRepoKey,
 } from '../../operator-contract/index.js'
+import type {RunStatusProjection} from '../../redaction/surface-gate.js'
 import type {
   ObservationFrame,
   OutputFrame,
@@ -4354,6 +4355,20 @@ function projectByPhaseStatus(runState: RunState): OperatorRunStatus {
   })
 }
 
+/** An EXECUTING projection held open, and a terminal projection that resolves per `terminal`. */
+function makeHeldExecuting(terminal: 'unavailable' | 'denied' | 'throws') {
+  const executing = makeDeferred<RunStatusProjection>()
+  const projectBase: RunObservationManagerDeps['projectBase'] = async runState => {
+    if (runState.phase === 'EXECUTING') return executing.promise
+    if (terminal === 'throws') throw new Error('store exploded')
+    return terminal === 'unavailable' ? {kind: 'unavailable'} : {kind: 'denied'}
+  }
+  const resolveExecuting = (runState: RunState): void => {
+    executing.resolve({kind: 'projected', status: projectByPhaseStatus(runState), repoKey: DEFAULT_REPO_KEY})
+  }
+  return {projectBase, resolveExecuting}
+}
+
 describe('waiting refresh — binding store unavailable', () => {
   it('a store error on the EXECUTING observe keeps the last base, so a later question still shows waiting', async () => {
     // #given a run observed while the store was healthy, then re-observed while it fails
@@ -4509,6 +4524,93 @@ describe('waiting refresh — binding store unavailable', () => {
       harness.manager.shutdown()
     },
   )
+
+  describe('terminal fence — an older in-flight observation cannot undo terminal cleanup', () => {
+    it.each(['unavailable', 'denied', 'throws'] as const)(
+      'discards a late EXECUTING projection after a %s terminal projection: no retain, no emit, no replay',
+      async terminal => {
+        // #given a held EXECUTING projection, a terminal observe whose projection does not succeed, and a sibling
+        const held = makeHeldExecuting(terminal)
+        const harness = makeWaitingHarness({projectBase: held.projectBase})
+        const finished = collectFrames(harness.manager, 'run-A')
+        const executingState = makeRunState({run_id: 'run-A', surface: 'discord', thread_id: 'T'})
+        const inFlight = harness.manager.observe(executingState)
+        await harness.manager.observe({...executingState, phase: 'COMPLETED'})
+
+        // #when the older EXECUTING projection resolves successfully
+        held.resolveExecuting(executingState)
+        await inFlight
+        await drain()
+
+        // #then it emitted no frame, and a later request in the thread does not reach the finished run
+        const sibling = collectFrames(harness.manager, 'run-B')
+        await observeAndDrain(harness.manager, makeRunState({run_id: 'run-B', surface: 'discord', thread_id: 'T'}))
+        await openQuestionAndRefresh(harness, 'T')
+        expect(statusNames(finished.frames)).toEqual([])
+        expect(statusNames(sibling.frames)).toEqual(['running', 'waiting_for_question'])
+
+        // #then no running replay was installed for the finished run
+        const reconnect = collectFrames(harness.manager, 'run-A')
+        await drain()
+        expect(reconnect.frames.map(frame => frame.type)).toEqual(['reset'])
+
+        harness.manager.shutdown()
+      },
+    )
+
+    it('lets a successful terminal projection still emit and close after an older in-flight EXECUTING', async () => {
+      // #given a held EXECUTING projection and a terminal observe that succeeds
+      const executing = makeDeferred<RunStatusProjection>()
+      const projectBase: RunObservationManagerDeps['projectBase'] = async runState =>
+        runState.phase === 'EXECUTING'
+          ? executing.promise
+          : {kind: 'projected', status: projectByPhaseStatus(runState), repoKey: DEFAULT_REPO_KEY}
+      const harness = makeWaitingHarness({projectBase})
+      const {frames, closes} = collectFrames(harness.manager, 'run-001')
+      const inFlight = harness.manager.observe(makeRunState())
+      await observeAndDrain(harness.manager, makeRunState({phase: 'COMPLETED'}))
+
+      // #when the older projection resolves afterwards
+      executing.resolve({kind: 'projected', status: projectByPhaseStatus(makeRunState()), repoKey: DEFAULT_REPO_KEY})
+      await inFlight
+      await drain()
+
+      // #then only the terminal status was delivered, and the stream closed
+      expect(statusNames(frames)).toEqual(['succeeded'])
+      expect(closes).toEqual(['terminal'])
+
+      harness.manager.shutdown()
+    })
+
+    it('expires the fence after the replay TTL, leaving no timer behind', async () => {
+      // #given a terminal observe whose projection was unavailable (no replay entry), and no subscribers
+      const harness = makeWaitingHarness({
+        projectBase: async () => ({kind: 'unavailable'}),
+        terminalReplayTtlMs: 1_000,
+      })
+      await harness.manager.observe(makeRunState({phase: 'COMPLETED'}))
+      expect(harness.timers.activeTimerCount()).toBe(1)
+
+      // #when the TTL passes
+      harness.timers.advance(1_001)
+
+      // #then the fence timer is gone
+      expect(harness.timers.activeTimerCount()).toBe(0)
+    })
+
+    it('releases the fence timer at shutdown', async () => {
+      // #given a fenced run
+      const harness = makeWaitingHarness({projectBase: async () => ({kind: 'unavailable'})})
+      await harness.manager.observe(makeRunState({phase: 'COMPLETED'}))
+      expect(harness.timers.activeTimerCount()).toBe(1)
+
+      // #when the manager shuts down
+      harness.manager.shutdown()
+
+      // #then no timer remains
+      expect(harness.timers.activeTimerCount()).toBe(0)
+    })
+  })
 
   it('a real denial still drops the retained state, unlike a store error', async () => {
     // #given a run whose next projection is denied

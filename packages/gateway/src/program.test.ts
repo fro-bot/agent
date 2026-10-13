@@ -2870,6 +2870,44 @@ describe('waiting status wiring', () => {
     expect(statuses).toEqual(['running', 'waiting_for_approval', 'running'])
   })
 
+  it('refreshes both scopes when a replacement moves a request id: the old run clears, the new run waits', async () => {
+    // #given two running Discord runs in different threads, an approval pending in thread_old
+    const {manager, approvalRegistry} = await startWithRealRegistries()
+    const runOld = makeRunningRun({run_id: 'run-old', surface: 'discord', thread_id: 'thread_old'})
+    const runNew = makeRunningRun({run_id: 'run-new', surface: 'discord', thread_id: 'thread_new'})
+    await projectOnce(runOld)
+    await manager.observe(runOld)
+    await projectOnce(runNew)
+    await manager.observe(runNew)
+    const oldStatuses = subscribeStatuses(manager, 'run-old')
+    const newStatuses = subscribeStatuses(manager, 'run-new')
+    const registerIn = (approvalScopeId: string) => {
+      approvalRegistry.register({
+        requestID: 'per_move',
+        sessionID: 'ses_1',
+        approvalScopeId,
+        directory: '/ws',
+        request: {requestID: 'per_move', sessionID: 'ses_1', permission: 'bash', patterns: ['ls'], title: 'Run ls'},
+        effects: {postReply: vi.fn().mockResolvedValue({ok: true})},
+      })
+    }
+    registerIn('thread_old')
+    await flush()
+    expect(oldStatuses).toEqual(['running', 'waiting_for_approval'])
+
+    // #when the same request id is re-registered under thread_new (no terminal event for the old entry)
+    registerIn('thread_new')
+    await flush()
+
+    // #then live: the old run returns to running and the new run waits
+    expect(oldStatuses).toEqual(['running', 'waiting_for_approval', 'running'])
+    expect(newStatuses).toEqual(['running', 'waiting_for_approval'])
+
+    // #then replay agrees for a subscriber connecting now
+    expect(subscribeStatuses(manager, 'run-old')).toEqual(['running'])
+    expect(subscribeStatuses(manager, 'run-new')).toEqual(['waiting_for_approval'])
+  })
+
   it('pins the empty-scope case: a Discord run with no thread yet is not overlaid by a request under ""', async () => {
     // #given a running Discord run whose thread id is still empty
     const {manager, questionRegistry} = await startWithRealRegistries()
