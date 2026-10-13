@@ -122,6 +122,8 @@ function makeBaseDeps(
     logger: {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
     now: () => 0,
     listRunsForRepo: vi.fn(async (repo: string) => runsByRepo.get(repo) ?? []),
+    approvalRegistry: {hasPendingForScope: vi.fn(() => false)},
+    questionRegistry: {hasPendingForScope: vi.fn(() => false)},
     ...overrides,
   }
 }
@@ -980,5 +982,193 @@ describe('GET /operator/runs — per-repo limit (read-amplification fix)', () =>
     for (const call of listRunsForRepo.mock.calls as [string, number][]) {
       expect(call[1]).toBe(MAX_RUNS_PER_LISTING)
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Waiting overlay — registry truth layered on the lifecycle status
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/runs — waiting overlay', () => {
+  const alpha = makeBinding('acme', 'alpha')
+
+  async function listStatuses(
+    runs: RunState[],
+    pending: {approval?: ReadonlySet<string>; question?: ReadonlySet<string>},
+    extra: Partial<RunsRouteDeps> = {},
+  ): Promise<Record<string, string>> {
+    const approvalRegistry = {hasPendingForScope: vi.fn((scopeId: string) => pending.approval?.has(scopeId) === true)}
+    const questionRegistry = {hasPendingForScope: vi.fn((scopeId: string) => pending.question?.has(scopeId) === true)}
+    const deps = makeBaseDeps(
+      {
+        listBindings: vi.fn(async () => ({success: true as const, data: [alpha]})),
+        repoAuthzDeps: makeRepoAuthzDeps(new Set(['acme/alpha'])),
+        approvalRegistry,
+        questionRegistry,
+        ...extra,
+      },
+      new Map([['acme/alpha', runs]]),
+    )
+    const res = await buildTestApp(deps).fetch(new Request('http://localhost/operator/runs'))
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as {runs: {runId: string; status: string}[]}
+    return Object.fromEntries(body.runs.map(r => [r.runId, r.status]))
+  }
+
+  it('lists a running run with a pending approval as waiting_for_approval', async () => {
+    // #given a web run (scoped by run id) with a pending approval
+    const run = makeRunState('acme', 'alpha', 'run-1', '2024-01-01T00:00:00Z', {surface: 'web'})
+
+    // #when
+    const statuses = await listStatuses([run], {approval: new Set(['run-1'])})
+
+    // #then
+    expect(statuses).toEqual({'run-1': 'waiting_for_approval'})
+  })
+
+  it('lists a running run with only a pending question as waiting_for_question', async () => {
+    // #given
+    const run = makeRunState('acme', 'alpha', 'run-1', '2024-01-01T00:00:00Z', {surface: 'web'})
+
+    // #when
+    const statuses = await listStatuses([run], {question: new Set(['run-1'])})
+
+    // #then
+    expect(statuses).toEqual({'run-1': 'waiting_for_question'})
+  })
+
+  it('lists approval over question when both are pending', async () => {
+    // #given
+    const run = makeRunState('acme', 'alpha', 'run-1', '2024-01-01T00:00:00Z', {surface: 'web'})
+
+    // #when
+    const statuses = await listStatuses([run], {approval: new Set(['run-1']), question: new Set(['run-1'])})
+
+    // #then
+    expect(statuses).toEqual({'run-1': 'waiting_for_approval'})
+  })
+
+  it('keeps a running run without pending requests as running', async () => {
+    // #given
+    const run = makeRunState('acme', 'alpha', 'run-1', '2024-01-01T00:00:00Z', {surface: 'web'})
+
+    // #when
+    const statuses = await listStatuses([run], {})
+
+    // #then
+    expect(statuses).toEqual({'run-1': 'running'})
+  })
+
+  it('keeps the lifecycle status of queued and terminal runs that still have a pending entry', async () => {
+    // #given queued, succeeded, failed and cancelled runs, each with an undisposed entry in both families
+    const phases = [
+      ['run-q', 'PENDING'],
+      ['run-s', 'COMPLETED'],
+      ['run-f', 'FAILED'],
+      ['run-c', 'CANCELLED'],
+    ] as const
+    const runs = phases.map(([id, phase]) =>
+      makeRunState('acme', 'alpha', id, '2024-01-01T00:00:00Z', {surface: 'web', phase}),
+    )
+    const ids = new Set(phases.map(([id]) => id))
+
+    // #when
+    const statuses = await listStatuses(runs, {approval: ids, question: ids})
+
+    // #then
+    expect(statuses).toEqual({'run-q': 'queued', 'run-s': 'succeeded', 'run-f': 'failed', 'run-c': 'cancelled'})
+  })
+
+  it('scopes Discord runs by thread id and web runs by run id', async () => {
+    // #given an entry registered under the thread id and one under a web run id
+    const discord = makeRunState('acme', 'alpha', 'run-d', '2024-01-02T00:00:00Z', {
+      surface: 'discord',
+      thread_id: 'thread-9',
+    })
+    const web = makeRunState('acme', 'alpha', 'run-w', '2024-01-01T00:00:00Z', {surface: 'web'})
+    // a Discord entry keyed by run id and a web entry keyed by a thread id must not match
+    const discordByRunId = makeRunState('acme', 'alpha', 'run-d2', '2024-01-03T00:00:00Z', {
+      surface: 'discord',
+      thread_id: 'thread-10',
+    })
+    const webByThreadId = makeRunState('acme', 'alpha', 'run-w2', '2024-01-04T00:00:00Z', {
+      surface: 'web',
+      thread_id: 'thread-11',
+    })
+
+    // #when
+    const statuses = await listStatuses([discord, web, discordByRunId, webByThreadId], {
+      approval: new Set(['thread-9', 'run-w', 'run-d2', 'thread-11']),
+    })
+
+    // #then
+    expect(statuses).toEqual({
+      'run-d': 'waiting_for_approval',
+      'run-w': 'waiting_for_approval',
+      'run-d2': 'running',
+      'run-w2': 'running',
+    })
+  })
+
+  it('omits a run whose entity_ref mismatches without consulting the registries for it', async () => {
+    // #given a mismatched run (dropped by toRunSummary) and a pending entry for its scope
+    const mismatched = makeRunState('other', 'repo', 'run-x', '2024-01-01T00:00:00Z', {surface: 'web'})
+    const approvalRegistry = {hasPendingForScope: vi.fn(() => true)}
+
+    // #when
+    const statuses = await listStatuses([mismatched], {}, {approvalRegistry})
+
+    // #then
+    expect(statuses).toEqual({})
+    expect(approvalRegistry.hasPendingForScope).not.toHaveBeenCalled()
+  })
+
+  it('reads the registries only after listRunsForRepo resolves', async () => {
+    // #given
+    const order: string[] = []
+    const run = makeRunState('acme', 'alpha', 'run-1', '2024-01-01T00:00:00Z', {surface: 'web'})
+    const listRunsForRepo = vi.fn(async () => {
+      order.push('list')
+      return [run]
+    })
+    const approvalRegistry = {
+      hasPendingForScope: vi.fn(() => {
+        order.push('registry')
+        return false
+      }),
+    }
+
+    // #when
+    await listStatuses([run], {}, {listRunsForRepo, approvalRegistry})
+
+    // #then
+    expect(order).toEqual(['list', 'registry'])
+  })
+
+  it('never reads the registries or run-states for a denied repo (denylist filters first)', async () => {
+    // #given a denylisted repo whose run scope has a pending entry
+    const denied = makeBinding('acme', 'denied-repo', {databaseId: 999, nodeId: 'R_denied'})
+    const deniedRun = makeRunState('acme', 'denied-repo', 'run-denied', '2024-01-01T00:00:00Z', {surface: 'web'})
+    const approvalRegistry = {hasPendingForScope: vi.fn(() => true)}
+    const questionRegistry = {hasPendingForScope: vi.fn(() => true)}
+    const listRunsForRepo = vi.fn(async () => [deniedRun])
+    const deps = makeBaseDeps({
+      listBindings: vi.fn(async () => ({success: true as const, data: [denied]})),
+      isRepoDenied: vi.fn((key: RepoKey) => key.databaseId === 999),
+      repoAuthzDeps: makeRepoAuthzDeps(new Set(['acme/denied-repo'])),
+      listRunsForRepo,
+      approvalRegistry,
+      questionRegistry,
+    })
+
+    // #when
+    const res = await buildTestApp(deps).fetch(new Request('http://localhost/operator/runs'))
+
+    // #then the repo is omitted and nothing was read for it
+    expect(res.status).toBe(200)
+    expect(((await res.json()) as {runs: unknown[]}).runs).toEqual([])
+    expect(listRunsForRepo).not.toHaveBeenCalled()
+    expect(approvalRegistry.hasPendingForScope).not.toHaveBeenCalled()
+    expect(questionRegistry.hasPendingForScope).not.toHaveBeenCalled()
   })
 })

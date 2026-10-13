@@ -554,7 +554,7 @@ describe('createPushDispatcher — dispatchQuestionPending', () => {
   // #given an active subscription
   // #when a question nudge is dispatched
   // #then the wire payload is the fixed question copy and nothing else
-  it('sends the fixed-copy question payload to every active subscription', async () => {
+  it('sends the fixed-copy question payload with the run deep link to every active subscription', async () => {
     const {dispatcher, sender} = build({
       records: [
         makeRecord({endpointHash: 'h1', endpoint: 'https://push.example.com/1', operatorId: 'operator-a'}),
@@ -570,9 +570,40 @@ describe('createPushDispatcher — dispatchQuestionPending', () => {
       expect(JSON.parse(payload)).toEqual({
         title: 'operator.question_pending.title',
         body: 'operator.question_pending.body',
-        data: {type: 'question', route: '/'},
+        data: {type: 'question', route: '/operator#run-1', runId: 'run-1'},
       })
     }
+  })
+
+  // #given a run id outside the allowlist
+  // #when a question nudge is dispatched
+  // #then the wire payload falls back to the root route with no runId
+  it('sends the root route without runId for a non-allowlisted run id', async () => {
+    const {dispatcher, sender} = build()
+
+    await dispatcher.dispatchQuestionPending('a#b')
+
+    const [payload] = (sender.sendNotification.mock.calls as unknown as [unknown, string][]).map(call => call[1])
+    expect(JSON.parse(payload as string)).toEqual({
+      title: 'operator.question_pending.title',
+      body: 'operator.question_pending.body',
+      data: {type: 'question', route: '/'},
+    })
+  })
+
+  // #given approval and run-failed nudges
+  // #when they are dispatched
+  // #then their wire routes stay /
+  it('keeps route / on approval and run-failed wire payloads', async () => {
+    const {dispatcher, sender} = build()
+
+    await dispatcher.dispatchApprovalPending('a-1')
+    await dispatcher.dispatchRunFailed('r-1')
+
+    const routes = (sender.sendNotification.mock.calls as unknown as [unknown, string][]).map(
+      call => (JSON.parse(call[1]) as {data: {route: string}}).data.route,
+    )
+    expect(routes).toEqual(['/', '/'])
   })
 
   // #given no subscribers
@@ -598,6 +629,27 @@ describe('createPushDispatcher — dispatchQuestionPending', () => {
     await dispatcher.dispatchQuestionPending('run-2')
 
     expect(sender.sendNotification).toHaveBeenCalledTimes(2)
+    const routes = (sender.sendNotification.mock.calls as unknown as [unknown, string][]).map(
+      call => (JSON.parse(call[1]) as {data: {route: string}}).data.route,
+    )
+    expect(routes).toEqual(['/operator#run-1', '/operator#run-2'])
+  })
+
+  // #given an empty run id (never a real run) and other runs
+  // #when question nudges are dispatched
+  // #then the empty id degrades to / and never suppresses another run's nudge
+  it('does not let an empty run id suppress other runs', async () => {
+    const {dispatcher, sender} = build()
+
+    await dispatcher.dispatchQuestionPending('')
+    await dispatcher.dispatchQuestionPending('run-1')
+    await dispatcher.dispatchQuestionPending('run-2')
+
+    expect(sender.sendNotification).toHaveBeenCalledTimes(3)
+    const routes = (sender.sendNotification.mock.calls as unknown as [unknown, string][]).map(
+      call => (JSON.parse(call[1]) as {data: {route: string}}).data.route,
+    )
+    expect(routes).toEqual(['/', '/operator#run-1', '/operator#run-2'])
   })
 
   // #given the same id used by an approval nudge

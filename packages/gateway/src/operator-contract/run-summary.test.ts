@@ -8,10 +8,11 @@
  * - Closed-DTO: output has only the declared keys (no internal fields)
  * - Consistency guard: entity_ref owner/repo mismatch → null
  * - Unrecognized phase → 'failed' (fail-closed)
+ * - RunSummaryStatus has 7 members; toRunSummary never produces a waiting status
  */
 
 import type {RunState} from '@fro-bot/runtime'
-import type {OperatorWebStatus, RunSummary} from './index.js'
+import type {OperatorWebStatus, RunSummary, RunSummaryStatus} from './index.js'
 
 import {assert, describe, expect, it} from 'vitest'
 import {toRunSummary} from './run-summary.js'
@@ -397,5 +398,46 @@ describe('toRunSummary — runId field', () => {
     // #then runId equals run_id
     assert(result !== null, 'expected a non-null summary')
     expect(result.runId).toBe('run-xyz-789')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// RunSummaryStatus — closed 7-member set
+// ---------------------------------------------------------------------------
+
+describe('RunSummaryStatus', () => {
+  // Type-level exhaustiveness: a missing or extra key fails `tsc` against RunSummaryStatus.
+  const STATUS_MEMBERS = {
+    queued: true,
+    running: true,
+    succeeded: true,
+    failed: true,
+    cancelled: true,
+    waiting_for_approval: true,
+    waiting_for_question: true,
+  } as const satisfies Record<RunSummaryStatus, true>
+
+  it('has exactly 7 members, including both waiting statuses', () => {
+    // #given the exhaustive member table
+    const members = Object.keys(STATUS_MEMBERS)
+
+    // #then
+    expect(members).toHaveLength(7)
+    expect(members).toContain('waiting_for_approval')
+    expect(members).toContain('waiting_for_question')
+  })
+
+  it('toRunSummary never produces a waiting status (the overlay is the caller’s concern)', () => {
+    // #given every run phase
+    const phases = ['PENDING', 'ACKNOWLEDGED', 'EXECUTING', 'COMPLETED', 'FAILED', 'CANCELLED'] as const
+
+    // #when each is projected
+    const statuses = phases.map(phase => toRunSummary(makeRunState({phase}), BINDING_A)?.status)
+
+    // #then none is a waiting status
+    for (const status of statuses) {
+      expect(status).not.toBe('waiting_for_approval')
+      expect(status).not.toBe('waiting_for_question')
+    }
   })
 })

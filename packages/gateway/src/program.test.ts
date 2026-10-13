@@ -3,6 +3,7 @@ import type {CoordinationConfig, ObjectStoreAdapter} from '@fro-bot/runtime'
 import type {GatewayConfig} from './config.js'
 import type {GatewayLogger} from './discord/client.js'
 import type {CoordinationLogger} from './runtime-effect.js'
+import type {ObservationFrame, RunObservationManager, ScopeRefresher} from './web/sse/manager.js'
 
 import {GatewayIntentBits} from 'discord.js'
 import {Effect} from 'effect'
@@ -113,6 +114,13 @@ vi.mock('./redaction/denylist.js', async importOriginal => {
       isRepoDenied: vi.fn().mockReturnValue(false),
     }),
   }
+})
+
+// Pass-through spy on the keyed redaction-bridge projection so the waiting-status wiring test can
+// project a run without touching the object store.
+vi.mock('./redaction/surface-gate.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('./redaction/surface-gate.js')>()
+  return {...actual, projectRunStatusWithKey: vi.fn(actual.projectRunStatusWithKey)}
 })
 
 // Mockable seam for the operator push self-test gate. Each test controls
@@ -2686,5 +2694,267 @@ describe('launch route wiring — POST /operator/runs', () => {
       __resetShuttingDownForTests()
       vi.restoreAllMocks()
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Waiting-status wiring — the real RequestGate, registries and run-observation manager
+// ---------------------------------------------------------------------------
+
+/** Starts the program with the real approval registry and returns the live objects the operator server receives. */
+async function startWithRealRegistries() {
+  const {createApprovalRegistry} = await import('./approvals/registry.js')
+  const actualRegistry = await vi.importActual<typeof import('./approvals/registry.js')>('./approvals/registry.js')
+  vi.mocked(createApprovalRegistry).mockImplementationOnce(registryDeps =>
+    actualRegistry.createApprovalRegistry(registryDeps),
+  )
+  const fakeClient = {...makeFakeClient(), destroy: vi.fn().mockResolvedValue(undefined)}
+  const closingHandle = {close: vi.fn((cb?: (err?: Error) => void) => cb?.())}
+  const startOperatorServer = vi.fn().mockReturnValue(closingHandle)
+  const deps = {
+    makeClient: () => fakeClient as unknown as import('discord.js').Client,
+    setupReadinessFlag: vi.fn(),
+    login: vi.fn().mockResolvedValue(undefined),
+    startAnnounceServer: vi.fn(),
+    startOperatorServer,
+    runProviderSelfTest: vi.fn(async () => {}),
+  }
+  const listenersBefore = process.listeners('SIGTERM')
+  await Effect.runPromise(
+    makeGatewayProgram(deps, makeFakeConfig({announce: undefined, operatorWeb: makeOperatorWebConfig()})),
+  )
+  const shutdownHandler = process.listeners('SIGTERM').find(listener => !listenersBefore.includes(listener))
+  if (shutdownHandler === undefined) throw new Error('the shutdown handler was not installed')
+  const [serverDeps] = startOperatorServer.mock.calls[0] as [import('./web/server.js').OperatorServerDeps]
+  const runDeps = serverDeps.launchWorkDeps
+  if (
+    runDeps?.questionRegistry === undefined ||
+    runDeps.requestGate === undefined ||
+    serverDeps.runObservationManager === undefined
+  ) {
+    throw new Error('the registries, request gate and observation manager were not wired')
+  }
+  return {
+    approvalRegistry: runDeps.approvalRegistry,
+    questionRegistry: runDeps.questionRegistry,
+    requestGate: runDeps.requestGate,
+    // The program builds the manager with the refresh seam; the server deps type exposes only the narrower contract.
+    manager: serverDeps.runObservationManager as RunObservationManager & ScopeRefresher,
+    shutdownHandler,
+  }
+}
+
+function makeRunningRun(
+  overrides: Partial<import('@fro-bot/runtime').RunState> = {},
+): import('@fro-bot/runtime').RunState {
+  return {
+    run_id: 'run-wait-1',
+    surface: 'github',
+    thread_id: '',
+    entity_ref: 'acme/widget#1',
+    phase: 'EXECUTING',
+    started_at: new Date().toISOString(),
+    last_heartbeat: new Date().toISOString(),
+    holder_id: 'holder-1',
+    details: {},
+    ...overrides,
+  }
+}
+
+/** Makes the next keyed projection return the run's base status without a binding-store read. */
+async function projectOnce(run: import('@fro-bot/runtime').RunState): Promise<void> {
+  const {projectRunStatusWithKey} = await import('./redaction/surface-gate.js')
+  vi.mocked(projectRunStatusWithKey).mockResolvedValueOnce({
+    kind: 'projected',
+    status: {
+      runId: run.run_id,
+      entityRef: run.entity_ref,
+      surface: run.surface,
+      phase: run.phase,
+      status: 'running',
+      startedAt: run.started_at,
+      stale: false,
+    },
+    repoKey: {databaseId: 42, nodeId: 'R_42'},
+  })
+}
+
+function subscribeStatuses(manager: RunObservationManager, runId: string): string[] {
+  const statuses: string[] = []
+  manager.subscribe(runId, {
+    onEvent: (frame: ObservationFrame) => {
+      if (frame.type === 'status') statuses.push(frame.data.status)
+    },
+    onClose: () => undefined,
+  })
+  return statuses
+}
+
+const flush = async (): Promise<void> => {
+  await new Promise(resolve => setTimeout(resolve, 0))
+}
+
+type WiredQuestionRegistry = NonNullable<
+  NonNullable<import('./web/server.js').OperatorServerDeps['launchWorkDeps']>['questionRegistry']
+>
+
+const askQuestion = (questionRegistry: WiredQuestionRegistry): void => {
+  questionRegistry.register({
+    requestID: 'que_1',
+    sessionID: 'ses_1',
+    questionScopeId: 'run-wait-1',
+    questions: [{question: 'Which?', header: 'H', options: [{label: 'a', description: ''}]}],
+    effects: {
+      replyQuestion: vi.fn().mockResolvedValue({ok: true}),
+      rejectQuestion: vi.fn().mockResolvedValue({ok: true}),
+    },
+    deadlineMs: 60_000,
+  })
+}
+
+describe('waiting status wiring', () => {
+  afterEach(() => {
+    __resetShuttingDownForTests()
+    vi.restoreAllMocks()
+  })
+
+  it('flips the live status to waiting_for_question when a question registers, and back when it leaves', async () => {
+    // #given the program wired with a real gate, registries and manager, and a running run being observed
+    const {manager, questionRegistry} = await startWithRealRegistries()
+    const run = makeRunningRun()
+    await projectOnce(run)
+    await manager.observe(run)
+    const statuses = subscribeStatuses(manager, 'run-wait-1')
+    await flush()
+    expect(statuses).toEqual(['running'])
+
+    // #when a question registers through the question registry
+    askQuestion(questionRegistry)
+    await flush()
+
+    // #then the live status flips with no lifecycle observation in between
+    expect(statuses).toEqual(['running', 'waiting_for_question'])
+
+    // #when the question leaves the gate
+    await questionRegistry.disposeAll('test teardown')
+    await flush()
+
+    // #then the status returns to running
+    expect(statuses).toEqual(['running', 'waiting_for_question', 'running'])
+  })
+
+  it('flips a Discord run to waiting_for_approval when an approval registers under its thread', async () => {
+    // #given a running Discord run in thread thread_1
+    const {manager, approvalRegistry} = await startWithRealRegistries()
+    const run = makeRunningRun({surface: 'discord', thread_id: 'thread_1'})
+    await projectOnce(run)
+    await manager.observe(run)
+    const statuses = subscribeStatuses(manager, 'run-wait-1')
+    await flush()
+
+    // #when a Discord approval registers (a path that never reaches observeApproval)
+    approvalRegistry.register({
+      requestID: 'per_1',
+      sessionID: 'ses_1',
+      approvalScopeId: 'thread_1',
+      directory: '/ws',
+      request: {requestID: 'per_1', sessionID: 'ses_1', permission: 'bash', patterns: ['ls'], title: 'Run ls'},
+      effects: {postReply: vi.fn().mockResolvedValue({ok: true})},
+    })
+    await flush()
+
+    // #then the live status reads waiting_for_approval, and it clears when the entry leaves
+    expect(statuses).toEqual(['running', 'waiting_for_approval'])
+    await approvalRegistry.disposeAll('test teardown')
+    await flush()
+    expect(statuses).toEqual(['running', 'waiting_for_approval', 'running'])
+  })
+
+  it('refreshes both scopes when a replacement moves a request id: the old run clears, the new run waits', async () => {
+    // #given two running Discord runs in different threads, an approval pending in thread_old
+    const {manager, approvalRegistry} = await startWithRealRegistries()
+    const runOld = makeRunningRun({run_id: 'run-old', surface: 'discord', thread_id: 'thread_old'})
+    const runNew = makeRunningRun({run_id: 'run-new', surface: 'discord', thread_id: 'thread_new'})
+    await projectOnce(runOld)
+    await manager.observe(runOld)
+    await projectOnce(runNew)
+    await manager.observe(runNew)
+    const oldStatuses = subscribeStatuses(manager, 'run-old')
+    const newStatuses = subscribeStatuses(manager, 'run-new')
+    const registerIn = (approvalScopeId: string) => {
+      approvalRegistry.register({
+        requestID: 'per_move',
+        sessionID: 'ses_1',
+        approvalScopeId,
+        directory: '/ws',
+        request: {requestID: 'per_move', sessionID: 'ses_1', permission: 'bash', patterns: ['ls'], title: 'Run ls'},
+        effects: {postReply: vi.fn().mockResolvedValue({ok: true})},
+      })
+    }
+    registerIn('thread_old')
+    await flush()
+    expect(oldStatuses).toEqual(['running', 'waiting_for_approval'])
+
+    // #when the same request id is re-registered under thread_new (no terminal event for the old entry)
+    registerIn('thread_new')
+    await flush()
+
+    // #then live: the old run returns to running and the new run waits
+    expect(oldStatuses).toEqual(['running', 'waiting_for_approval', 'running'])
+    expect(newStatuses).toEqual(['running', 'waiting_for_approval'])
+
+    // #then replay agrees for a subscriber connecting now
+    expect(subscribeStatuses(manager, 'run-old')).toEqual(['running'])
+    expect(subscribeStatuses(manager, 'run-new')).toEqual(['waiting_for_approval'])
+  })
+
+  it('pins the empty-scope case: a Discord run with no thread yet is not overlaid by a request under ""', async () => {
+    // #given a running Discord run whose thread id is still empty
+    const {manager, questionRegistry} = await startWithRealRegistries()
+    const run = makeRunningRun({surface: 'discord', thread_id: ''})
+    await projectOnce(run)
+    await manager.observe(run)
+    const statuses = subscribeStatuses(manager, 'run-wait-1')
+    await flush()
+
+    // #when a question registers under the empty scope
+    questionRegistry.register({
+      requestID: 'que_empty',
+      sessionID: 'ses_1',
+      questionScopeId: '',
+      questions: [{question: 'Which?', header: 'H', options: [{label: 'a', description: ''}]}],
+      effects: {
+        replyQuestion: vi.fn().mockResolvedValue({ok: true}),
+        rejectQuestion: vi.fn().mockResolvedValue({ok: true}),
+      },
+      deadlineMs: 60_000,
+    })
+    await flush()
+
+    // #then the run stays running
+    expect(statuses).toEqual(['running'])
+  })
+
+  it('stops refreshing from gate events once shutdown has unsubscribed the listeners', async () => {
+    // #given a wired program with a spy on the manager's refresh seam
+    const {manager, questionRegistry, shutdownHandler} = await startWithRealRegistries()
+    const refreshScope = vi.spyOn(manager, 'refreshScope')
+    const exited = new Promise<number | string | null | undefined>(resolve => {
+      vi.spyOn(process, 'exit').mockImplementation((code?: number | string | null) => {
+        resolve(code)
+        return undefined as never
+      })
+    })
+
+    // #given one question registered before shutdown (one open notification)
+    askQuestion(questionRegistry)
+    expect(refreshScope).toHaveBeenCalledExactlyOnceWith('run-wait-1')
+
+    // #when shutdown disposes the pending entry through the gate
+    shutdownHandler('SIGTERM')
+    expect(await exited).toBe(0)
+
+    // #then the terminal notification did not reach the manager
+    expect(refreshScope).toHaveBeenCalledOnce()
   })
 })

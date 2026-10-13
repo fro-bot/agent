@@ -4,9 +4,11 @@
  * Security invariant: the returned payload NEVER carries repo, prompt,
  * command, run output, endpoint, keys, tokens, cookies, CSRF token,
  * idempotency key, session id, or a raw (unmapped) failure kind. Every
- * value in the payload is a fixed i18n copy key or a member of a closed,
- * operator-safe allowlist (`OperatorFailureKind`) — never a free-form
- * passthrough from internal state.
+ * value in the payload is a fixed i18n copy key, a member of a closed,
+ * operator-safe allowlist (`OperatorFailureKind`), or the run ID of a
+ * question push. The run ID is the only dynamic value: an opaque identifier
+ * inside an encrypted payload, admitted only if it passes `RUN_ID_PATTERN`.
+ * The copy stays fixed — never a free-form passthrough from internal state.
  */
 
 import type {OperatorPushTriggerKind} from '../../operator-contract/responses.js'
@@ -15,6 +17,7 @@ import type {OperatorFailureKind} from '../../operator-contract/run-status.js'
 export interface PushPayloadData {
   readonly type: OperatorPushTriggerKind
   readonly route: string
+  readonly runId?: string
   readonly failureLabel?: OperatorFailureKind
 }
 
@@ -58,16 +61,22 @@ export function buildApprovalPayload(): PushPayload {
   }
 }
 
+/** Run IDs admitted into a push route: UUIDs and other short URL-safe identifiers (`\w` is ASCII-only here). */
+const RUN_ID_PATTERN = /^[\w-]{1,128}$/
+
 /**
- * Builds the fixed-copy payload for an agent-question notification. Takes no
- * arguments on purpose: question text, options, repo, and prompt must never
- * reach a push payload.
+ * Builds the fixed-copy payload for an agent-question notification. The run ID
+ * deep-links to `/operator#<runId>` only when it matches `RUN_ID_PATTERN`;
+ * anything else routes to `/` with no `runId`. Question text, options, repo,
+ * and prompt must never reach a push payload.
  */
-export function buildQuestionPayload(): PushPayload {
+export function buildQuestionPayload(runId: string): PushPayload {
   return {
     title: 'operator.question_pending.title',
     body: 'operator.question_pending.body',
-    data: {type: 'question', route: '/'},
+    data: RUN_ID_PATTERN.test(runId)
+      ? {type: 'question', route: `/operator#${encodeURIComponent(runId)}`, runId}
+      : {type: 'question', route: '/'},
   }
 }
 

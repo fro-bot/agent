@@ -5,6 +5,7 @@
  *   - Happy path: all deps present → runOperatorRouteSmoke returns 0, all expected routes present.
  *   - Regression guard (non-vacuous): listBindings absent → GET /operator/repos absent → returns non-zero.
  *   - Regression guard: run-stream deps absent → GET /operator/runs/:runId/stream absent → returns non-zero.
+ *   - GET /operator/runs needs both registries (waiting overlay): mounts and returns 200 with both, absent without either.
  *   - buildOperatorServerInputs parity: the helper produces deps that, fed to buildOperatorApp,
  *     mount the same full route set as production.
  *
@@ -17,6 +18,7 @@ import {describe, expect, it, vi} from 'vitest'
 
 import {buildOperatorServerInputs} from '../program.js'
 import {loadAllowlistFromText} from './auth/allowlist.js'
+import {SESSION_COOKIE_NAME} from './auth/session.js'
 import {makeTrustedProxyIngressPolicy} from './ingress/policy.js'
 import {parseTrustedProxyAddress} from './ingress/trusted-proxy-address.js'
 import {EXPECTED_OPERATOR_ROUTES, runOperatorRouteSmoke} from './operator-route-smoke.js'
@@ -75,6 +77,16 @@ function makeStubApprovalRegistry() {
   return {
     handleDecision: async () => 'not-found' as const,
     describePendingForScope: () => [],
+    hasPendingForScope: () => false,
+  }
+}
+
+function makeStubQuestionRegistry() {
+  return {
+    decide: async () => ({kind: 'not-found' as const}),
+    describePendingForRun: () => [],
+    isClaimed: () => false,
+    hasPendingForScope: () => false,
   }
 }
 
@@ -126,6 +138,7 @@ describe('buildOperatorServerInputs — parity with production wiring', () => {
     const runObservationManager = makeStubRunObservationManager()
     const runIndex = makeStubRunIndex()
     const approvalRegistry = makeStubApprovalRegistry()
+    const questionRegistry = makeStubQuestionRegistry()
     const operatorWebConfig = makeStubOperatorWebConfig()
 
     // #when — build inputs via the shared helper
@@ -137,6 +150,7 @@ describe('buildOperatorServerInputs — parity with production wiring', () => {
       runObservationManager,
       runIndex,
       approvalRegistry,
+      questionRegistry,
       launchWorkDeps: makeStubLaunchWorkDeps(),
       dispatchWorkflow: makeStubDispatchWorkflow(),
       operatorWebConfig,
@@ -167,11 +181,71 @@ describe('buildOperatorServerInputs — parity with production wiring', () => {
     expect(routeSet).toContain('GET:/operator/session/csrf')
     expect(routeSet).toContain('GET:/operator/session')
     expect(routeSet).toContain('GET:/operator/repos')
+    expect(routeSet).toContain('GET:/operator/runs')
     expect(routeSet).toContain('POST:/operator/runs')
     expect(routeSet).toContain('GET:/operator/runs/:runId/stream')
     expect(routeSet).toContain('GET:/operator/runs/:runId/approvals')
     expect(routeSet).toContain('POST:/operator/runs/:runId/approvals/:requestId/decision')
   })
+
+  it('mounts GET /operator/runs and returns 200 with production-shaped deps', async () => {
+    // #given — the production deps path with both registries present and a live session
+    const {deps, config} = buildOperatorServerInputs({
+      logger: makeStubLogger(),
+      isShuttingDown: () => false,
+      denylistCache: makeStubDenylistCache(),
+      bindingsStore: makeStubBindingsStore(),
+      runObservationManager: makeStubRunObservationManager(),
+      runIndex: makeStubRunIndex(),
+      approvalRegistry: makeStubApprovalRegistry(),
+      questionRegistry: makeStubQuestionRegistry(),
+      launchWorkDeps: makeStubLaunchWorkDeps(),
+      dispatchWorkflow: makeStubDispatchWorkflow(),
+      operatorWebConfig: makeStubOperatorWebConfig(),
+    })
+    const app = buildOperatorApp(deps, config)
+    const sessionId = deps.sessionStore?.create({githubUserId: 42, login: 'octocat'}, '', Date.now())
+    if (sessionId === undefined) throw new Error('expected session to be created')
+
+    // #when — the allowlisted operator lists runs
+    const res = await app.fetch(
+      new Request('http://localhost/operator/runs', {
+        headers: {cookie: `${SESSION_COOKIE_NAME}=${sessionId}`, origin: 'https://operator.smoke.test'},
+      }),
+    )
+
+    // #then — the route is mounted and answers
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({runs: []})
+  })
+
+  it.each(['approvalRegistry', 'questionRegistry'] as const)(
+    'omitting %s causes GET /operator/runs to be absent (the waiting overlay needs both registries)',
+    registry => {
+      // #given — production deps path with one registry omitted
+      const {deps, config} = buildOperatorServerInputs({
+        logger: makeStubLogger(),
+        isShuttingDown: () => false,
+        denylistCache: makeStubDenylistCache(),
+        bindingsStore: makeStubBindingsStore(),
+        runObservationManager: makeStubRunObservationManager(),
+        runIndex: makeStubRunIndex(),
+        approvalRegistry: registry === 'approvalRegistry' ? undefined : makeStubApprovalRegistry(),
+        questionRegistry: registry === 'questionRegistry' ? undefined : makeStubQuestionRegistry(),
+        launchWorkDeps: makeStubLaunchWorkDeps(),
+        dispatchWorkflow: makeStubDispatchWorkflow(),
+        operatorWebConfig: makeStubOperatorWebConfig(),
+      })
+
+      // #when
+      const app = buildOperatorApp(deps, config)
+
+      // #then
+      const routePaths = app.routes.map((r: {method: string; path: string}) => `${r.method}:${r.path}`)
+      expect(routePaths).not.toContain('GET:/operator/runs')
+      expect(routePaths).toContain('POST:/operator/runs')
+    },
+  )
 
   it('threads operatorPush deps through to mount the push routes', () => {
     // #given — operatorPush deps present (mirrors a passed self-test)

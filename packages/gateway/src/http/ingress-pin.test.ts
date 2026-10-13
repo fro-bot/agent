@@ -129,6 +129,8 @@ const EXPECTED_OPERATOR_ROUTES_WITH_BROWSER_GUARD: readonly {method: string; pat
   {method: 'POST', path: '/operator/runs/:runId/approvals/:requestId/decision'},
   {method: 'POST', path: '/operator/runs/:runId/cancel'},
   {method: 'GET', path: '/operator/runs/:runId/approvals'},
+  {method: 'POST', path: '/operator/runs/:runId/questions/:requestId/decision'},
+  {method: 'GET', path: '/operator/runs/:runId/questions'},
   {method: 'GET', path: '/operator/push/vapid-key'},
   {method: 'POST', path: '/operator/push/subscriptions'},
   {method: 'POST', path: '/operator/push/subscriptions/unsubscribe'},
@@ -251,6 +253,15 @@ function makeBrowserGuardStubDeps(): OperatorServerDeps {
     approvalRegistry: {
       handleDecision: vi.fn(async () => 'ok' as const),
       describePendingForScope: vi.fn(() => []),
+      hasPendingForScope: vi.fn(() => false),
+    },
+    // Provide questionRegistry so the question routes and GET /operator/runs (waiting overlay)
+    // are registered in the pinned inventory.
+    questionRegistry: {
+      decide: vi.fn(async () => ({kind: 'not-found' as const})),
+      describePendingForRun: vi.fn(() => []),
+      isClaimed: vi.fn(() => false),
+      hasPendingForScope: vi.fn(() => false),
     },
     // Provide getBindingByRepo and launchWorkDeps so the launch route is registered.
     getBindingByRepo: vi.fn(async () => ({success: true as const, data: null})),
