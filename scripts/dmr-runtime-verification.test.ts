@@ -389,6 +389,71 @@ describe('createGithubClient', () => {
     expect(capturedUrl).toContain(encodeURIComponent(maliciousRef))
   })
 
+  it('compares pin...preflight with per_page=1 and returns ahead_by', async () => {
+    // #given a compare response where the preflight is 134 commits ahead of the pin
+    const capturedUrls: string[] = []
+    const fakeFetch: typeof fetch = async (input): Promise<Response> => {
+      capturedUrls.push(String(input))
+      return fakeJsonResponse({ahead_by: 134, behind_by: 0})
+    }
+    const client = createGithubClient('token', fakeFetch)
+
+    // #when the sweep's call shape (base = preflight, head = pin) reaches the live client
+    const result = await client.compareCommits(PREFLIGHT_COMMIT, PIN_BEHIND)
+
+    // #then the request is reversed and bounded, and ahead_by is the reported value
+    expect(capturedUrls).toEqual([
+      `https://api.github.com/repos/fro-bot/agent/compare/${PIN_BEHIND}...${PREFLIGHT_COMMIT}?per_page=1`,
+    ])
+    expect(result).toBe(134)
+  })
+
+  it('rejects a compare response whose ahead_by is not a number', async () => {
+    // #given a compare response carrying only the old field
+    const fakeFetch: typeof fetch = async (): Promise<Response> => fakeJsonResponse({behind_by: 3, ahead_by: '3'})
+    const client = createGithubClient('token', fakeFetch)
+
+    // #when / #then
+    await expect(client.compareCommits(PREFLIGHT_COMMIT, PIN_BEHIND)).rejects.toThrow('malformed-compare-response')
+  })
+
+  it('verifies a current pin end-to-end through the live client (ahead_by 0)', async () => {
+    // #given a pin that already contains the preflight, so the reversed compare is empty
+    const fakeFetch: typeof fetch = async (): Promise<Response> => fakeJsonResponse({ahead_by: 0, behind_by: 5})
+    const realClient = createGithubClient('token', fakeFetch)
+    const client = makeClient({
+      listWorkflowRuns: async () => [run()],
+      getWorkflowFileAtSha: async () => workflowYaml(PIN_VERIFIED),
+      compareCommits: realClient.compareCommits,
+    })
+
+    // #when
+    const result = await sweepRepository(client, 'o/r')
+
+    // #then
+    expect(result.status).toBe('verified')
+    expect(result.behindBy).toBe(0)
+  })
+
+  it('does not verify a pin behind the preflight end-to-end through the live client (ahead_by N)', async () => {
+    // #given a pin missing 134 preflight commits
+    const fakeFetch: typeof fetch = async (): Promise<Response> => fakeJsonResponse({ahead_by: 134, behind_by: 0})
+    const realClient = createGithubClient('token', fakeFetch)
+    const client = makeClient({
+      listWorkflowRuns: async () => [run()],
+      getWorkflowFileAtSha: async () => workflowYaml(PIN_BEHIND),
+      compareCommits: realClient.compareCommits,
+    })
+
+    // #when
+    const result = await sweepRepository(client, 'o/r')
+
+    // #then
+    expect(result.status).toBe('not-verified')
+    expect(result.behindBy).toBe(134)
+    expect(result.detail).toBe('behind-preflight')
+  })
+
   it('rejects a resolved sha that does not match the 40-hex shape, keeping it out of compareCommits', async () => {
     // #given resolveRef's upstream response returns a non-SHA string
     const fakeFetch: typeof fetch = async (): Promise<Response> => fakeJsonResponse({sha: 'not-a-real-sha'})

@@ -30,6 +30,9 @@ const SHA_RE = /^[0-9a-f]{40}$/
 // undercounts the sweep.
 const REPO_SLUG_RE = /\b(\w(?:[\w.-]*\w)?\/\.?\w(?:[\w.-]*\w)?)\b/
 const TARGET_HEADINGS = new Set(['checkout posture verified', 'migration merged'])
+// Bounds every buffered response. The compare request below is direction- and size-sensitive: a
+// forward compare from an old base to a recent pin returns up to 250 commits plus 300 patched
+// files (2.24 MB for preflight...v0.122.0), which exceeds this cap.
 const MAX_RESPONSE_BYTES = 2_000_000
 // GitHub secondary rate limits trigger on concurrency, not just request volume;
 // bounding the sweep keeps a 403 from making the whole run flaky.
@@ -47,6 +50,11 @@ export interface WorkflowRunSummary {
 export interface GithubClient {
   readonly listWorkflowRuns: (repository: string) => Promise<readonly WorkflowRunSummary[]>
   readonly getWorkflowFileAtSha: (repository: string, sha: string) => Promise<string>
+  /**
+   * Returns how many commits reachable from `base` are missing from `head` (the `base` side's lead
+   * over `head`). The sweep calls it as `compareCommits(PREFLIGHT_COMMIT, pin)`, so 0 means the pin
+   * contains the whole preflight.
+   */
   readonly compareCommits: (base: string, head: string) => Promise<number>
   readonly getIssueBody: (owner: string, repo: string, issueNumber: number) => Promise<string>
   readonly resolveRef: (ref: string) => Promise<string>
@@ -399,12 +407,20 @@ export function createGithubClient(token: string, fetchImpl: typeof fetch = fetc
       )
     },
     async compareCommits(base, head) {
-      const body = await getJson(`https://api.github.com/repos/fro-bot/agent/compare/${base}...${head}`)
-      const behindBy = (body as {behind_by?: unknown} | null)?.behind_by
-      if (typeof behindBy !== 'number') {
+      // Compare head...base (reversed) so the commits `base` has and `head` lacks are reported as
+      // `ahead_by`. Comparing base...head would put the same number in `behind_by`, but would also
+      // return the commits and patched files between them, overflowing MAX_RESPONSE_BYTES for a
+      // recent head. With the reversed direction a current head yields an empty comparison, and
+      // per_page=1 caps the commit list for a stale one. Both refs are SHAs validated upstream
+      // (SHA_RE); encoding keeps the request inside the fro-bot/agent compare path regardless.
+      const body = await getJson(
+        `https://api.github.com/repos/fro-bot/agent/compare/${encodeURIComponent(head)}...${encodeURIComponent(base)}?per_page=1`,
+      )
+      const aheadBy = (body as {ahead_by?: unknown} | null)?.ahead_by
+      if (typeof aheadBy !== 'number') {
         throw new TypeError('malformed-compare-response')
       }
-      return behindBy
+      return aheadBy
     },
     async getIssueBody(owner, repo, issueNumber) {
       const body = await getJson(`https://api.github.com/repos/${owner}/${repo}/issues/${issueNumber}`)
