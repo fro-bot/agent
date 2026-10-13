@@ -7,6 +7,7 @@
  * - Edge: denied/keyless repo (projectRunStatus → null) yields null.
  * - Safety: the closed DTO contains ONLY the contract fields — no details passthrough.
  * - Scope: scopeIdFor returns thread_id for discord, run_id for non-discord.
+ * - Keyed base: projectRunBaseWithKey returns the resolved repo key after one binding lookup.
  * - Split: projectRunBase never overlays; overlayWaitingStatus is the one synchronous overlay.
  *
  * Test seam: projectRunStatus is injected via the deps object so tests can drive
@@ -23,11 +24,18 @@ import type {
   OperatorRunStatus,
   OperatorWebStatus,
 } from '../../operator-contract/index.js'
+import type {BindingsLookup} from '../../redaction/surface-gate.js'
 import type {ProjectRunObservationDeps, WaitingPredicates} from './projection.js'
 
-import {describe, expect, it} from 'vitest'
+import {describe, expect, it, vi} from 'vitest'
 
-import {overlayWaitingStatus, projectRunBase, projectRunObservation, scopeIdFor} from './projection.js'
+import {
+  overlayWaitingStatus,
+  projectRunBase,
+  projectRunBaseWithKey,
+  projectRunObservation,
+  scopeIdFor,
+} from './projection.js'
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -861,5 +869,118 @@ describe('projectRunBase', () => {
     expect(Object.keys(result as object).sort()).toEqual(
       ['entityRef', 'phase', 'runId', 'stale', 'startedAt', 'status', 'surface'].sort(),
     )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// projectRunBaseWithKey — base projection plus the resolved repository key
+// ---------------------------------------------------------------------------
+
+describe('projectRunBaseWithKey', () => {
+  const resolvedKey = {databaseId: 42, nodeId: 'R_42'}
+
+  function makeKeyedDeps(options: {
+    readonly binding?: {readonly databaseId?: number; readonly nodeId?: string} | null
+    readonly isRepoDenied?: (repoKey: {readonly databaseId: number | null; readonly nodeId: string | null}) => boolean
+  }) {
+    const getBindingByRepo = vi.fn(async () => ({
+      success: true as const,
+      data: options.binding === undefined ? resolvedKey : options.binding,
+    }))
+    const deps = {
+      nowMs: BASE_NOW_MS,
+      staleThresholdMs: STALE_THRESHOLD_MS,
+      bindingsLookup: {getBindingByRepo} as unknown as BindingsLookup,
+      isRepoDenied: options.isRepoDenied ?? (() => false),
+    }
+    return {deps, getBindingByRepo}
+  }
+
+  it('returns the base status and the key the binding resolved, after exactly one lookup', async () => {
+    // #given a bound repository that is not denied
+    const {deps, getBindingByRepo} = makeKeyedDeps({})
+
+    // #when projecting
+    const result = await projectRunBaseWithKey(makeRunState(), deps)
+
+    // #then the status is the closed base status and the key is the one resolved
+    expect(result?.status).toMatchObject({runId: 'run-001', status: 'running', stale: false})
+    expect(result?.repoKey).toEqual(resolvedKey)
+    expect(getBindingByRepo).toHaveBeenCalledExactlyOnceWith('acme', 'widget')
+  })
+
+  it('passes the resolved key to the denylist predicate', async () => {
+    // #given a predicate that records the key it is asked about
+    const isRepoDenied = vi.fn(() => false)
+    const {deps} = makeKeyedDeps({isRepoDenied})
+
+    // #when projecting
+    await projectRunBaseWithKey(makeRunState(), deps)
+
+    // #then the predicate saw the resolved key
+    expect(isRepoDenied).toHaveBeenCalledExactlyOnceWith(resolvedKey)
+  })
+
+  it('returns null for a denied repository', async () => {
+    // #given the denylist rejects the resolved key
+    const {deps} = makeKeyedDeps({isRepoDenied: key => key.databaseId === 42})
+
+    // #when projecting
+    const result = await projectRunBaseWithKey(makeRunState(), deps)
+
+    // #then nothing is surfaced, not even the key
+    expect(result).toBeNull()
+  })
+
+  it('returns null for a keyless repository (no binding), failing closed', async () => {
+    // #given no binding, and the denylist's fail-closed rule for a null/null key
+    const {deps} = makeKeyedDeps({
+      binding: null,
+      isRepoDenied: key => key.databaseId === null && key.nodeId === null,
+    })
+
+    // #when projecting
+    const result = await projectRunBaseWithKey(makeRunState(), deps)
+
+    // #then the run is omitted
+    expect(result).toBeNull()
+  })
+
+  it('never applies the waiting overlay', async () => {
+    // #given a running run (the overlay is a separate synchronous step)
+    const {deps} = makeKeyedDeps({})
+
+    // #when projecting
+    const result = await projectRunBaseWithKey(makeRunState({surface: 'discord', thread_id: 'T'}), deps)
+
+    // #then the status is the plain base status
+    expect(result?.status.status).toBe('running')
+  })
+
+  it('copies only contract fields, dropping run details', async () => {
+    // #given a run whose free-form details carry non-contract data
+    const {deps} = makeKeyedDeps({})
+    const runState = makeRunState({details: {secret: 'should-not-leak'}})
+
+    // #when projecting
+    const result = await projectRunBaseWithKey(runState, deps)
+
+    // #then the status carries exactly the contract fields
+    expect(Object.keys(result?.status ?? {}).sort()).toEqual(
+      ['entityRef', 'phase', 'runId', 'stale', 'startedAt', 'status', 'surface'].sort(),
+    )
+  })
+
+  it('carries failureKind for a failed run through the closed copy', async () => {
+    // #given a FAILED run with a known failure kind
+    const {deps} = makeKeyedDeps({})
+    const runState = makeRunState({phase: 'FAILED', details: {failureKind: 'timeout'}})
+
+    // #when projecting
+    const result = await projectRunBaseWithKey(runState, deps)
+
+    // #then the status is failed and the mapped failureKind survives
+    expect(result?.status.status).toBe('failed')
+    expect(result?.status.failureKind).toBeDefined()
   })
 })

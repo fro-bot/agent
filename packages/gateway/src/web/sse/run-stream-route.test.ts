@@ -2600,17 +2600,23 @@ describe('GET /operator/runs/:runId/stream — durable cache-miss resolution (#1
 
   function makeRealManager(project?: (runState: RunState) => Promise<OperatorRunStatus | null>) {
     return createRunObservationManager({
-      projectRunObservation:
-        project ??
-        (async runState => ({
-          runId: runState.run_id,
-          entityRef: runState.entity_ref,
-          surface: runState.surface,
-          phase: runState.phase,
-          status: STATUS_BY_PHASE[runState.phase] ?? 'running',
-          startedAt: runState.started_at,
-          stale: false,
-        })),
+      projectRunBase: async runState => {
+        const status = await (
+          project ??
+          (async (state: RunState): Promise<OperatorRunStatus | null> => ({
+            runId: state.run_id,
+            entityRef: state.entity_ref,
+            surface: state.surface,
+            phase: state.phase,
+            status: STATUS_BY_PHASE[state.phase] ?? 'running',
+            startedAt: state.started_at,
+            stale: false,
+          }))
+        )(runState)
+        return status === null ? null : {status, repoKey: {databaseId: 1, nodeId: 'R_1'}}
+      },
+      waiting: {hasPendingApproval: () => false, hasPendingQuestion: () => false},
+      isRepoDenied: () => false,
       logger: {info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn()},
       setInterval: globalThis.setInterval.bind(globalThis),
       clearInterval: globalThis.clearInterval.bind(globalThis),

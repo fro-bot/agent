@@ -5,17 +5,19 @@
  * repo yields null and is never surfaced. The result is a closed DTO that copies
  * only the operator-contract fields — RunState and its free-form details never
  * reach the output. The projection is split in two: an async base (redaction
- * bridge, no overlay) and a synchronous overlay. When the run's scope has a
+ * bridge, no overlay; `projectRunBaseWithKey` also returns the resolved repository
+ * key) and a synchronous overlay. When the run's scope has a
  * pending approval the overlay yields waiting_for_approval; failing that, a
  * pending question yields waiting_for_question. Callers that hold a retained
  * base (the SSE manager) or a summary (the run list) reapply the overlay alone.
  */
 
 import type {RunState} from '@fro-bot/runtime'
-import type {OperatorRunStatus} from '../../operator-contract/index.js'
+import type {OperatorRunStatus, RunStatusRepoKey} from '../../operator-contract/index.js'
 import type {BindingsLookup} from '../../redaction/surface-gate.js'
 
-import {projectRunStatus} from '../../redaction/surface-gate.js'
+import {toOperatorRunStatus} from '../../operator-contract/index.js'
+import {projectRunStatus, resolveRunRepoKey} from '../../redaction/surface-gate.js'
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -33,6 +35,18 @@ export interface ProjectRunBaseDeps {
   readonly isRepoDenied: (repoKey: {readonly databaseId: number | null; readonly nodeId: string | null}) => boolean
   readonly _projectRunStatus?: (runState: RunState, deps: ProjectRunBaseDeps) => Promise<OperatorRunStatus | null>
 }
+
+/**
+ * A base status plus the repository key resolved for it, so a caller can re-run the
+ * denylist check later without a second binding lookup.
+ */
+export interface ProjectedRunBase {
+  readonly status: OperatorRunStatus
+  readonly repoKey: RunStatusRepoKey
+}
+
+/** Deps for `projectRunBaseWithKey`: the base deps without the test-only bridge override. */
+export type ProjectRunBaseWithKeyDeps = Omit<ProjectRunBaseDeps, '_projectRunStatus'>
 
 /**
  * Registry reads for the waiting overlay, both keyed by the `scopeIdFor` scope.
@@ -96,19 +110,10 @@ export function overlayWaitingStatus<S extends string>(
 // ---------------------------------------------------------------------------
 
 /**
- * Returns null for a denied or keyless repo (the caller omits it), otherwise a
- * closed DTO carrying only operator-contract fields, with no waiting overlay.
+ * Closed-DTO copy of a deny-gated bridge result: only the operator-contract fields.
+ * Destructuring `base` exhaustively makes a new OperatorRunStatus field a type error below until it is copied here.
  */
-export async function projectRunBase(runState: RunState, deps: ProjectRunBaseDeps): Promise<OperatorRunStatus | null> {
-  const bridgeFn = deps._projectRunStatus ?? callRealBridge
-  const base = await bridgeFn(runState, deps)
-  if (base === null) {
-    return null
-  }
-
-  // Copy only the contract fields from the deny-gated bridge result (base), never from runState —
-  // preserves the deny-gate (a denied repo's base is null before any field). Destructuring `base`
-  // exhaustively makes a new OperatorRunStatus field a type error below until it is copied here.
+function toClosedBase(base: OperatorRunStatus): OperatorRunStatus {
   const {
     runId,
     entityRef,
@@ -136,6 +141,41 @@ export async function projectRunBase(runState: RunState, deps: ProjectRunBaseDep
     ...(checkoutProvenance === undefined ? {} : {checkoutProvenance}),
     ...(checkoutPreparation === undefined ? {} : {checkoutPreparation}),
   }
+}
+
+/**
+ * Returns null for a denied or keyless repo (the caller omits it), otherwise a
+ * closed DTO carrying only operator-contract fields, with no waiting overlay.
+ */
+export async function projectRunBase(runState: RunState, deps: ProjectRunBaseDeps): Promise<OperatorRunStatus | null> {
+  const bridgeFn = deps._projectRunStatus ?? callRealBridge
+  const base = await bridgeFn(runState, deps)
+  if (base === null) {
+    return null
+  }
+  return toClosedBase(base)
+}
+
+/**
+ * `projectRunBase` plus the repository key it used, with exactly one binding lookup.
+ * The deny check runs inside `toOperatorRunStatus` before any field is read, so a denied or keyless
+ * repo returns null.
+ */
+export async function projectRunBaseWithKey(
+  runState: RunState,
+  deps: ProjectRunBaseWithKeyDeps,
+): Promise<ProjectedRunBase | null> {
+  const repoKey = await resolveRunRepoKey(runState, deps.bindingsLookup)
+  const base = toOperatorRunStatus(runState, {
+    nowMs: deps.nowMs,
+    staleThresholdMs: deps.staleThresholdMs,
+    repoKey,
+    isRepoDenylisted: deps.isRepoDenied,
+  })
+  if (base === null) {
+    return null
+  }
+  return {status: toClosedBase(base), repoKey}
 }
 
 // ---------------------------------------------------------------------------

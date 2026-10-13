@@ -1,9 +1,15 @@
 /**
  * In-memory pub/sub for run-status observation.
  *
- * `observe(runState)` projects the run through the redaction bridge, caches the
- * latest status per run, and fans it to that run's subscribers. A denied/keyless
- * projection (null) is dropped — never cached, never emitted. Fan-out serializes
+ * `observe(runState)` projects the run through the redaction bridge, overlays the
+ * live waiting state, caches the latest status per run, and fans it to that run's
+ * subscribers. A denied/keyless projection (null) is dropped — never cached, never
+ * emitted. The manager retains each live run's base status (overlay not applied) and
+ * a scope index; `refreshScope(scopeId)` reapplies the overlay synchronously when a
+ * request opens or leaves, so live status and replay track registry truth. Retained
+ * state exists only between a non-null non-terminal observation and the run's
+ * terminal observation, a null projection, a refresh-time denial, or shutdown; a
+ * refresh never commits without it. Fan-out serializes
  * once and enqueues per subscriber; it never awaits a write, so a slow consumer
  * cannot stall publishing. A subscriber whose queue exceeds the byte cap is
  * dropped locally without affecting peers, and fan-out iterates a snapshot of the
@@ -26,7 +32,13 @@ import type {
   OperatorOutputFrame,
   OperatorRunStatus,
   QuestionFrameData,
+  RunStatusRepoKey,
 } from '../../operator-contract/index.js'
+import type {ProjectedRunBase, WaitingPredicates} from './projection.js'
+
+import {isDeepStrictEqual} from 'node:util'
+
+import {overlayWaitingStatus, scopeIdFor} from './projection.js'
 
 // ---------------------------------------------------------------------------
 // Constants (injectable for tests)
@@ -189,11 +201,21 @@ export interface ObservationManagerLogger {
  */
 export interface RunObservationManagerDeps {
   /**
-   * Project a RunState to an OperatorRunStatus (or null for denied/keyless repos).
+   * Project a RunState to its base status — redaction applied, waiting overlay NOT applied — together
+   * with the run's repository key (null for denied/keyless repos). The key is the one the redaction
+   * bridge resolved, so retaining it costs no second binding lookup.
    * Injected so the manager test doesn't need a real bindings store.
-   * In production, wire to projectRunObservation from projection.ts.
    */
-  readonly projectRunObservation: (runState: RunState) => Promise<OperatorRunStatus | null>
+  readonly projectRunBase: (runState: RunState) => Promise<ProjectedRunBase | null>
+
+  /** Live registry reads for the waiting overlay. Both families are required. */
+  readonly waiting: WaitingPredicates
+
+  /**
+   * Synchronous denylist check, re-run on every scope refresh so a repository denied mid-run stops
+   * emitting without waiting for a lifecycle observation.
+   */
+  readonly isRepoDenied: (repoKey: RunStatusRepoKey) => boolean
 
   /** Logger with redaction. */
   readonly logger: ObservationManagerLogger
@@ -219,11 +241,26 @@ export interface RunObservationManagerDeps {
 // Public manager interface
 // ---------------------------------------------------------------------------
 
+/**
+ * The refresh seam, kept off {@link RunObservationManager}: only the program wiring that subscribes to
+ * the request gate calls it, so route and launch consumers never depend on it.
+ */
+export interface ScopeRefresher {
+  /**
+   * Reapply the waiting overlay to every live run in the scope, synchronously. Call it when a
+   * request in the scope opens or leaves the request gate. Emits and caches only on a status
+   * change; a run without retained state, or whose repository is now denied, is skipped.
+   * No-op after shutdown.
+   */
+  readonly refreshScope: (scopeId: string) => void
+}
+
 export interface RunObservationManager {
   /**
-   * Observe a run state transition. Projects via the injected function.
-   * A null projection is dropped immediately (no cache, no emit, no side effect).
-   * A non-null projection updates the latest-status cache and fans out to subscribers.
+   * Observe a run state transition. Projects the base status via the injected function.
+   * A null projection is dropped (no cache, no emit) and the run's retained state is released.
+   * A non-null projection retains the base, overlays the live waiting state read at commit time,
+   * updates the latest-status cache, and fans out to subscribers.
    * On a terminal status, clears the cache entry and closes subscribers cleanly.
    * NEVER awaits a subscriber write — strictly non-blocking.
    */
@@ -382,7 +419,7 @@ function estimateFrameBytes(frame: ObservationFrame): number {
 // Factory
 // ---------------------------------------------------------------------------
 
-export function createRunObservationManager(deps: RunObservationManagerDeps): RunObservationManager {
+export function createRunObservationManager(deps: RunObservationManagerDeps): RunObservationManager & ScopeRefresher {
   const {logger} = deps
 
   // ---------------------------------------------------------------------------
@@ -462,6 +499,77 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
    * request on settle, per run on terminal, and entirely on shutdown.
    */
   const openQuestionFrames = new Map<string, Map<string, QuestionFrame>>()
+
+  /**
+   * Per live run: the last base status (overlay not applied) and its repository key. A scope refresh
+   * commits only for a run with an entry here. Deleted on the terminal observation, a null projection,
+   * a refresh-time denial, and shutdown. Unlike terminalRuns it is not cleared by replay eviction.
+   */
+  const retainedRuns = new Map<string, {readonly base: OperatorRunStatus; readonly repoKey: RunStatusRepoKey}>()
+
+  /** Scope index: scopeId → run IDs, and the inverse. Empty scopes (pre-ACK Discord runs) are never indexed. */
+  const runsByScope = new Map<string, Set<string>>()
+  const scopeByRun = new Map<string, string>()
+
+  // ---------------------------------------------------------------------------
+  // Internal: scope index and retained state
+  // ---------------------------------------------------------------------------
+
+  function unindexRun(runId: string): void {
+    const scopeId = scopeByRun.get(runId)
+    if (scopeId === undefined) {
+      return
+    }
+    scopeByRun.delete(runId)
+    const runIds = runsByScope.get(scopeId)
+    if (runIds !== undefined) {
+      runIds.delete(runId)
+      if (runIds.size === 0) {
+        runsByScope.delete(scopeId)
+      }
+    }
+  }
+
+  /** Synchronous: runs before observe's first await, so a gate event during the await finds the run. */
+  function indexRunScope(runId: string, scopeId: string): void {
+    if (scopeByRun.get(runId) === scopeId) {
+      return
+    }
+    unindexRun(runId)
+    if (scopeId === '') {
+      return
+    }
+    scopeByRun.set(runId, scopeId)
+    let runIds = runsByScope.get(scopeId)
+    if (runIds === undefined) {
+      runIds = new Set()
+      runsByScope.set(scopeId, runIds)
+    }
+    runIds.add(runId)
+  }
+
+  function dropRunState(runId: string): void {
+    retainedRuns.delete(runId)
+    unindexRun(runId)
+  }
+
+  /**
+   * Overlay the live waiting state on a base status, then cache and fan out. A refresh sets
+   * `skipUnchanged` so a status equal to the cached one sends no frame; a lifecycle observation always
+   * emits. Scope comes from the index; an unindexed run has no overlay.
+   */
+  function commitOverlaidStatus(runId: string, base: OperatorRunStatus, skipUnchanged: boolean): void {
+    const scopeId = scopeByRun.get(runId)
+    const status = scopeId === undefined ? base.status : overlayWaitingStatus(base.status, scopeId, deps.waiting)
+    const next = status === base.status ? base : {...base, status}
+    const cached = latestStatusCache.get(runId)
+    if (skipUnchanged === true && cached !== undefined && isDeepStrictEqual(cached, next)) {
+      return
+    }
+    latestStatusCache.set(runId, next)
+    const frame: StatusFrame = {type: 'status', data: next}
+    fanOut(runId, frame)
+  }
 
   // ---------------------------------------------------------------------------
   // Internal: terminal replay cache management
@@ -1014,29 +1122,43 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
   // observe
   // ---------------------------------------------------------------------------
 
+  /** Read through a call: shutdown() can flip the flag across an await, which TS cannot see. */
+  function isShutDownNow(): boolean {
+    return isShutdown
+  }
+
   const observe = async (runState: RunState): Promise<void> => {
     if (isShutdown === true) {
       return
     }
 
-    // Project the run state — may return null for denied/keyless repos
-    let projected: OperatorRunStatus | null
-    try {
-      projected = await deps.projectRunObservation(runState)
-    } catch (error) {
-      logger.warn(
-        {runId: runState.run_id, err: String(error)},
-        'manager: projectRunObservation threw — dropping observation',
-      )
-      return
-    }
-
-    // Null projection: denied/keyless repo — drop immediately, no cache, no emit
-    if (projected === null) {
-      return
-    }
-
     const runId = runState.run_id
+
+    // Index the scope before the first await: a request that opens during the projection await
+    // must find this run, and a run adopting its thread must re-key at once.
+    indexRunScope(runId, scopeIdFor(runState))
+
+    // Project the base status — may return null for denied/keyless repos
+    let projectedBase: ProjectedRunBase | null
+    try {
+      projectedBase = await deps.projectRunBase(runState)
+    } catch (error) {
+      logger.warn({runId, err: String(error)}, 'manager: projectRunBase threw — dropping observation')
+      return
+    }
+
+    // A shutdown during the await must not repopulate the caches it just cleared.
+    if (isShutDownNow() === true) {
+      return
+    }
+
+    // Null projection: denied/keyless repo — drop immediately, no cache, no emit; later gate events skip the run
+    if (projectedBase === null) {
+      dropRunState(runId)
+      return
+    }
+
+    const projected = projectedBase.status
 
     // Guard against stale non-terminal observations arriving out of causal order.
     // If two concurrent observe() calls resolve out of order (COMPLETED resolves first,
@@ -1047,6 +1169,7 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
         {runId, status: projected.status},
         'manager: non-terminal observe arrived after terminal — dropping stale observation',
       )
+      dropRunState(runId)
       return
     }
 
@@ -1055,6 +1178,12 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     // Only reached when terminalRuns does NOT contain this runId (guard above).
     if (isTerminal(projected.status) === false) {
       evictTerminalReplayEntry(runId)
+
+      // Retain the base, then overlay the registries as they stand now (not as they stood before the
+      // await). The cache is updated BEFORE fan-out.
+      retainedRuns.set(runId, {base: projected, repoKey: projectedBase.repoKey})
+      commitOverlaidStatus(runId, projected, false)
+      return
     }
 
     // Build the status frame (closed DTO — only the contract fields)
@@ -1067,50 +1196,83 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     // Fan out to all current subscribers (non-blocking — never awaits writes)
     fanOut(runId, frame)
 
-    // On terminal status: transition to graceful drain instead of hard abort.
+    // Terminal: the run no longer has a base to overlay, and no scope to refresh.
+    dropRunState(runId)
+
+    // Transition to graceful drain instead of hard abort.
     // markRunSubscribersForTerminalDrain does NOT clear queues — it lets
     // drainQueue deliver all already-queued frames (including the terminal status
     // frame just enqueued above) before finalizing the subscriber.
-    if (isTerminal(projected.status) === true) {
-      latestStatusCache.delete(runId)
-      outputSeqCounters.delete(runId)
-      // A terminal run has no pending question; late subscribers get the terminal replay only.
-      openQuestionFrames.delete(runId)
+    latestStatusCache.delete(runId)
+    outputSeqCounters.delete(runId)
+    // A terminal run has no pending question; late subscribers get the terminal replay only.
+    openQuestionFrames.delete(runId)
 
-      // Move final output to terminal replay cache (with TTL) instead of
-      // deleting it. Late subscribers connecting within the TTL receive the cached
-      // final output then terminal status, then the stream closes gracefully.
-      const finalOutput = latestOutputCache.get(runId)
-      latestOutputCache.delete(runId)
+    // Move final output to terminal replay cache (with TTL) instead of
+    // deleting it. Late subscribers connecting within the TTL receive the cached
+    // final output then terminal status, then the stream closes gracefully.
+    const finalOutput = latestOutputCache.get(runId)
+    latestOutputCache.delete(runId)
 
-      // Evict any existing entry for this runId before creating a new one
+    // Evict any existing entry for this runId before creating a new one
+    evictTerminalReplayEntry(runId)
+
+    // Mark this runId as terminal so stale non-terminal observations are rejected
+    terminalRuns.add(runId)
+
+    const expiresAt = deps.now() + terminalReplayTtlMs
+    // Use evictTerminalReplayEntry in the TTL callback so byte accounting,
+    // seq counter, and terminalRuns are all cleaned up on natural expiry.
+    const evictionTimer = deps.setTimeout(() => {
       evictTerminalReplayEntry(runId)
+    }, terminalReplayTtlMs)
 
-      // Mark this runId as terminal so stale non-terminal observations are rejected
-      terminalRuns.add(runId)
+    const newEntry: TerminalReplayCacheEntry = {
+      finalOutput,
+      terminalStatus: projected,
+      expiresAt,
+      evictionTimer,
+    }
+    terminalReplayCache.set(runId, newEntry)
+    // Track the byte cost of this new entry for the byte-budget cap
+    terminalReplayCacheBytes += estimateReplayCacheEntryBytes(newEntry)
 
-      const expiresAt = deps.now() + terminalReplayTtlMs
-      // Use evictTerminalReplayEntry in the TTL callback so byte accounting,
-      // seq counter, and terminalRuns are all cleaned up on natural expiry.
-      const evictionTimer = deps.setTimeout(() => {
-        evictTerminalReplayEntry(runId)
-      }, terminalReplayTtlMs)
+    // Enforce both the entry-count cap and the byte budget
+    enforceTerminalReplayCap()
 
-      const newEntry: TerminalReplayCacheEntry = {
-        finalOutput,
-        terminalStatus: projected,
-        expiresAt,
-        evictionTimer,
+    // Graceful drain: deliver all queued frames (including terminal status) then close
+    markRunSubscribersForTerminalDrain(runId)
+  }
+
+  // ---------------------------------------------------------------------------
+  // refreshScope
+  // ---------------------------------------------------------------------------
+
+  const refreshScope = (scopeId: string): void => {
+    if (isShutdown === true) {
+      return
+    }
+    const runIds = runsByScope.get(scopeId)
+    if (runIds === undefined) {
+      return
+    }
+
+    for (const runId of Array.from(runIds)) {
+      const retained = retainedRuns.get(runId)
+      if (retained === undefined) {
+        continue
       }
-      terminalReplayCache.set(runId, newEntry)
-      // Track the byte cost of this new entry for the byte-budget cap
-      terminalReplayCacheBytes += estimateReplayCacheEntryBytes(newEntry)
-
-      // Enforce both the entry-count cap and the byte budget
-      enforceTerminalReplayCap()
-
-      // Graceful drain: deliver all queued frames (including terminal status) then close
-      markRunSubscribersForTerminalDrain(runId)
+      try {
+        // The denylist is TTL-cached, so a repository can be denied while its run is live. Check
+        // before the overlay so a newly denied run emits nothing and is not refreshed again.
+        if (deps.isRepoDenied(retained.repoKey) === true) {
+          dropRunState(runId)
+          continue
+        }
+        commitOverlaidStatus(runId, retained.base, true)
+      } catch (error) {
+        logger.warn({runId, err: String(error)}, 'manager: scope refresh threw — skipping run')
+      }
     }
   }
 
@@ -1294,20 +1456,22 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
       return
     }
 
-    let projected: OperatorRunStatus | null
+    let projectedBase: ProjectedRunBase | null
     try {
-      projected = await deps.projectRunObservation(runState)
+      projectedBase = await deps.projectRunBase(runState)
     } catch (error) {
       logger.warn(
         {subId: sub.id, runId, err: String(error)},
-        'manager: projectRunObservation threw for durable state — staying live',
+        'manager: projectRunBase threw for durable state — staying live',
       )
       return
     }
     // Null projection (denied/keyless repo) reveals nothing: no frame, no close.
-    if (projected === null || isTerminal(projected.status) === false) {
+    // A terminal status carries no waiting overlay, so the base is the final status.
+    if (projectedBase === null || isTerminal(projectedBase.status.status) === false) {
       return
     }
+    const projected = projectedBase.status
     if (isAwaitingLiveResolution(sub) === false) {
       return
     }
@@ -1499,6 +1663,9 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     latestOutputCache.clear()
     outputSeqCounters.clear()
     openQuestionFrames.clear()
+    retainedRuns.clear()
+    runsByScope.clear()
+    scopeByRun.clear()
 
     // Clear terminal replay cache (cancel all eviction timers)
     for (const entry of terminalReplayCache.values()) {
@@ -1511,5 +1678,14 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     terminalRuns.clear()
   }
 
-  return {observe, observeOutput, observeApproval, observeQuestion, subscribe, abortSubscription, shutdown}
+  return {
+    observe,
+    refreshScope,
+    observeOutput,
+    observeApproval,
+    observeQuestion,
+    subscribe,
+    abortSubscription,
+    shutdown,
+  }
 }
