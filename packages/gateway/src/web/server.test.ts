@@ -19,7 +19,6 @@ import type {AddressInfo} from 'node:net'
 import type {RunState} from '@fro-bot/runtime'
 import type {ServerType} from '@hono/node-server'
 
-import type {OperatorRunStatus} from '../operator-contract/index.js'
 import type {GitHubOAuthConfig, GitHubOAuthDeps} from './auth/github.js'
 import type {RepoAuthzCache} from './auth/repo-authz.js'
 import type {SessionDeps} from './auth/session.js'
@@ -2335,6 +2334,7 @@ function makeStubApprovalRegistry(): NonNullable<OperatorServerDeps['approvalReg
   return {
     handleDecision: async () => 'not-found' as const,
     describePendingForScope: () => [],
+    hasPendingForScope: () => false,
   }
 }
 
@@ -2343,6 +2343,7 @@ function makeStubQuestionRegistry(): NonNullable<OperatorServerDeps['questionReg
     decide: async () => ({kind: 'not-found' as const}),
     describePendingForRun: () => [],
     isClaimed: () => false,
+    hasPendingForScope: () => false,
   }
 }
 
@@ -2453,7 +2454,7 @@ describe('buildOperatorApp — v1.5.0 full route-registration smoke (drift guard
     expect(routes).toHaveLength(expectedV15Routes.size)
   })
 
-  it('dep-gated negative case: without the question registry only the question routes are absent', () => {
+  it('dep-gated negative case: without the question registry the question routes and the run listing are absent', () => {
     // #given — every privileged dep except the question registry
     const sessionStore = createInMemorySessionStore()
     const app = buildOperatorApp(
@@ -2464,12 +2465,30 @@ describe('buildOperatorApp — v1.5.0 full route-registration smoke (drift guard
     // #when
     const routeSet = new Set(extractRoutes(app).map(r => `${r.method}:${r.path}`))
 
-    // #then — exactly the two question routes are missing from the expected inventory
+    // #then — the two question routes and GET /operator/runs (waiting overlay needs the registry) are missing
     const missing = EXPECTED_OPERATOR_ROUTES.map(r => `${r.method}:${r.path}`).filter(key => !routeSet.has(key))
     expect(missing.toSorted()).toEqual([
+      'GET:/operator/runs',
       'GET:/operator/runs/:runId/questions',
       'POST:/operator/runs/:runId/questions/:requestId/decision',
     ])
+  })
+
+  it('dep-gated negative case: without the approval registry the approval routes and the run listing are absent', () => {
+    // #given — every privileged dep except the approval registry
+    const sessionStore = createInMemorySessionStore()
+    const app = buildOperatorApp(
+      {...makeFullPrivilegedDeps(sessionStore), approvalRegistry: undefined},
+      makeStubConfig({githubOAuth: makeStubGitHubOAuthConfig()}),
+    )
+
+    // #when
+    const routeSet = new Set(extractRoutes(app).map(r => `${r.method}:${r.path}`))
+
+    // #then — GET /operator/runs is among the missing routes
+    const missing = EXPECTED_OPERATOR_ROUTES.map(r => `${r.method}:${r.path}`).filter(key => !routeSet.has(key))
+    expect(missing).toContain('GET:/operator/runs')
+    expect(missing).toContain('GET:/operator/runs/:runId/approvals')
   })
 
   it('question decision route: a body over 64 KiB is rejected before session or run lookup', async () => {
@@ -2637,15 +2656,20 @@ describe('buildOperatorApp — run stream resolves an evicted terminal run from 
 
       // #given an SSE manager with NO replay entry for either run (the cache-miss / restart case)
       const manager = createRunObservationManager({
-        projectRunObservation: async (runState): Promise<OperatorRunStatus | null> => ({
-          runId: runState.run_id,
-          entityRef: runState.entity_ref,
-          surface: runState.surface,
-          phase: runState.phase,
-          status: runState.phase === 'COMPLETED' ? 'succeeded' : 'running',
-          startedAt: runState.started_at,
-          stale: false,
+        projectRunBase: async runState => ({
+          status: {
+            runId: runState.run_id,
+            entityRef: runState.entity_ref,
+            surface: runState.surface,
+            phase: runState.phase,
+            status: runState.phase === 'COMPLETED' ? 'succeeded' : 'running',
+            startedAt: runState.started_at,
+            stale: false,
+          },
+          repoKey: {databaseId: 1, nodeId: 'R_1'},
         }),
+        waiting: {hasPendingApproval: () => false, hasPendingQuestion: () => false},
+        isRepoDenied: () => false,
         logger: makeLogger(),
         setInterval: globalThis.setInterval.bind(globalThis),
         clearInterval: globalThis.clearInterval.bind(globalThis),
