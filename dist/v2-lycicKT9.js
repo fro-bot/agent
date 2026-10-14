@@ -1,0 +1,1 @@
+import"./rolldown-runtime-B--rR4-3.js";import{r as e,t}from"./client-CJuA0K5g.js";e();export{t as createOpencodeClient};

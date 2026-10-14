@@ -78,7 +78,7 @@
     "@bfra.me/es": "0.1.0",
     "@fro-bot/runtime": "workspace:*",
     "@octokit/auth-app": "8.3.1",
-    "@opencode-ai/sdk": "1.18.35"
+    "@opencode-ai/sdk": "1.19.0"
   },
   "devDependencies": {
     "@bfra.me/eslint-config": "0.54.0",
@@ -99,11 +99,11 @@
     "read-package-up": "12.0.0",
     "semantic-release": "25.0.9",
     "simple-git-hooks": "2.14.0",
-    "tsdown": "0.23.0",
+    "tsdown": "0.23.1",
     "typescript": "6.0.3",
     "vitest": "5.0.3"
   },
-  "packageManager": "bun@1.4.2",
+  "packageManager": "bun@1.4.3",
   "trustedDependencies": [
     "esbuild",
     "simple-git-hooks",
