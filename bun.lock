@@ -15,7 +15,7 @@
         "@bfra.me/es": "0.1.0",
         "@fro-bot/runtime": "workspace:*",
         "@octokit/auth-app": "8.3.1",
-        "@opencode-ai/sdk": "1.18.35",
+        "@opencode-ai/sdk": "1.19.0",
       },
       "devDependencies": {
         "@bfra.me/eslint-config": "0.54.0",
@@ -89,7 +89,7 @@
       "version": "0.0.0-development",
       "dependencies": {
         "@bfra.me/es": "0.1.0",
-        "@opencode-ai/sdk": "1.18.35",
+        "@opencode-ai/sdk": "1.19.0",
         "zod": "4.6.5",
       },
     },
@@ -343,7 +343,7 @@
 
     "@octokit/webhooks-types": ["@octokit/webhooks-types@7.6.1", "", {}, "sha512-S8u2cJzklBC0FgTwWVLaM8tMrDuDMVE4xiTK4EYXM9GntyvrdbSoxqDQa+Fh57CCNApyIpyeqPhhFEmHPfrXgw=="],
 
-    "@opencode-ai/sdk": ["@opencode-ai/sdk@1.18.35", "", { "dependencies": { "cross-spawn": "7.0.6" } }, "sha512-cp3IFKwnqgeUbflrrwz/WmG/dALVyM2k0LA1aqCvWe58Tu4utNTNw+BwZzQEML1HxDaLrIB+Fc4Ztb8S16Ijcw=="],
+    "@opencode-ai/sdk": ["@opencode-ai/sdk@1.19.0", "", { "dependencies": { "cross-spawn": "7.0.6" } }, "sha512-lDFYTD6qxzq1mfwxF6Kq1DAs6rEwF4xoZ2I3G1sB7hAZ8Yb28JurtSmmcK7ZzZ8Z4qBUYbZimHJ6DM4JFq5amw=="],
 
     "@ota-meshi/ast-token-store": ["@ota-meshi/ast-token-store@0.3.0", "", {}, "sha512-XRO0zi2NIUKq2lUk3T1ecFSld1fMWRKE6naRFGkgkdeosx7IslyUKNv5Dcb5PJTja9tHJoFu0v/7yEpAkrkrTg=="],
 
