@@ -36,6 +36,16 @@ function createMemoryStore(initial: Readonly<Record<string, LockRecord>> = {}) {
     objects.set(key, {data: JSON.stringify(record), etag: `etag-${++version}`})
   }
 
+  /** The store's real conditional write, usable from a test double that mutates the store first. */
+  const put = async (key: string, data: string, options: {ifNoneMatch?: string; ifMatch?: string}) => {
+    const found = objects.get(key)
+    if (options.ifNoneMatch === '*' && found != null) return err(new Error('PreconditionFailed'))
+    if (options.ifMatch != null && found?.etag !== options.ifMatch) return err(new Error('PreconditionFailed'))
+    const etag = `etag-${++version}`
+    objects.set(key, {data, etag})
+    return ok({etag})
+  }
+
   const adapter: Required<ObjectStoreAdapter> = {
     upload: vi.fn(async () => ok(undefined)),
     download: vi.fn(async () => ok(undefined)),
@@ -45,14 +55,7 @@ function createMemoryStore(initial: Readonly<Record<string, LockRecord>> = {}) {
       const found = objects.get(key)
       return found == null ? err(new Error('NoSuchKey')) : ok({...found})
     }),
-    conditionalPut: vi.fn(async (key: string, data: string, options: {ifNoneMatch?: string; ifMatch?: string}) => {
-      const found = objects.get(key)
-      if (options.ifNoneMatch === '*' && found != null) return err(new Error('PreconditionFailed'))
-      if (options.ifMatch != null && found?.etag !== options.ifMatch) return err(new Error('PreconditionFailed'))
-      const etag = `etag-${++version}`
-      objects.set(key, {data, etag})
-      return ok({etag})
-    }),
+    conditionalPut: vi.fn(put),
     conditionalDelete: vi.fn(async (key: string, options: {ifMatch: string}) => {
       const found = objects.get(key)
       if (options.ifMatch != null && found?.etag !== options.ifMatch) return err(new Error('PreconditionFailed'))
@@ -70,7 +73,7 @@ function createMemoryStore(initial: Readonly<Record<string, LockRecord>> = {}) {
     staleThresholdMs: 60_000,
     pendingStaleThresholdMs: 30 * 60_000,
   }
-  return {config, objects, adapter}
+  return {config, objects, adapter, put}
 }
 
 describe('lock scope', () => {
@@ -317,13 +320,16 @@ describe('create/read release race', () => {
 })
 
 describe('acquireLock — reclaimableBeforeExpiry', () => {
-  const liveActionLease = (holderId: string) =>
-    lockRecord({holder_id: holderId, surface: 'github', acquired_at: '2026-04-24T18:14:30.000Z'})
-  const earlierAttemptOnly = (holder: LockRecord) => holder.holder_id === 'action:1:1'
+  // The fixture clock is 18:15:00; a lease renewed at 18:13:00 has been unrenewed for 120s.
+  const leaseRenewedAt = (holderId: string, renewedAt: string) =>
+    lockRecord({holder_id: holderId, surface: 'github', acquired_at: renewedAt})
+  const staleActionLease = (holderId: string) => leaseRenewedAt(holderId, '2026-04-24T18:13:00.000Z')
+  const earlierAttemptOnly = vi.fn((holder: LockRecord, _observedAt: Date) => holder.holder_id === 'action:1:1')
 
   beforeEach(() => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-04-24T18:15:00.000Z'))
+    earlierAttemptOnly.mockClear()
   })
 
   afterEach(() => {
@@ -331,8 +337,8 @@ describe('acquireLock — reclaimableBeforeExpiry', () => {
   })
 
   it('takes over an unexpired lease the predicate approves and audits a distinct source', async () => {
-    // #given a live lease held by an earlier attempt
-    const {config, objects} = createMemoryStore({[ACTION_KEY]: liveActionLease('action:1:1')})
+    // #given an unexpired lease held by an earlier attempt
+    const {config, objects} = createMemoryStore({[ACTION_KEY]: staleActionLease('action:1:1')})
     const logger = createLogger()
 
     // #when a later attempt acquires with the pre-expiry predicate
@@ -341,9 +347,13 @@ describe('acquireLock — reclaimableBeforeExpiry', () => {
       reclaimableBeforeExpiry: earlierAttemptOnly,
     })
 
-    // #then the lease is replaced without waiting for expiry
+    // #then the lease is replaced without waiting for expiry, and the predicate saw the expiry-check clock
     expect(result.success === true && result.data.outcome).toBe('acquired')
     expect(JSON.parse(objects.get(ACTION_KEY)?.data ?? '{}')).toMatchObject({holder_id: 'action:1:2'})
+    expect(earlierAttemptOnly).toHaveBeenCalledWith(
+      expect.objectContaining({holder_id: 'action:1:1'}),
+      new Date('2026-04-24T18:15:00.000Z'),
+    )
     expect(logger.info).toHaveBeenLastCalledWith(
       'lock-takeover-outcome',
       expect.objectContaining({decision: 'taken-over', confirmationSource: 'holder-superseded'}),
@@ -351,8 +361,8 @@ describe('acquireLock — reclaimableBeforeExpiry', () => {
   })
 
   it('keeps an unexpired lease the predicate rejects', async () => {
-    // #given a live lease held by a different run
-    const {config, objects} = createMemoryStore({[ACTION_KEY]: liveActionLease('action:9:1')})
+    // #given a lease held by a different run
+    const {config, objects} = createMemoryStore({[ACTION_KEY]: staleActionLease('action:9:1')})
 
     // #when a later attempt acquires with the pre-expiry predicate
     const result = await acquireLock(config, 'owner/repo', 'action:1:2', 'github', '1', createLogger(), {
@@ -366,15 +376,14 @@ describe('acquireLock — reclaimableBeforeExpiry', () => {
   })
 
   it('does not reclaim when the holder renews between the read and the conditional write', async () => {
-    // #given a live earlier-attempt lease that renews (new etag) while the takeover is in flight
-    const {config, objects, adapter} = createMemoryStore({[ACTION_KEY]: liveActionLease('action:1:1')})
-    const renewedBody = JSON.stringify(liveActionLease('action:1:1'))
-    vi.mocked(adapter.conditionalPut)
-      .mockResolvedValueOnce(err(new Error('PreconditionFailed')))
-      .mockImplementationOnce(async key => {
-        objects.set(key, {data: renewedBody, etag: 'etag-renewed'})
-        return err(new Error('PreconditionFailed'))
-      })
+    // #given a lease that renews (new etag) just before the takeover's conditional write lands
+    const {config, objects, adapter, put} = createMemoryStore({[ACTION_KEY]: staleActionLease('action:1:1')})
+    const observedEtag = objects.get(ACTION_KEY)?.etag
+    const renewedBody = JSON.stringify(leaseRenewedAt('action:1:1', '2026-04-24T18:15:00.000Z'))
+    vi.mocked(adapter.conditionalPut).mockImplementation(async (key, data, options) => {
+      if (options?.ifMatch !== undefined) objects.set(key, {data: renewedBody, etag: 'etag-renewed'})
+      return put(key, data, options ?? {})
+    })
 
     // #when a later attempt tries to take over
     const result = await acquireLock(config, 'owner/repo', 'action:1:2', 'github', '1', createLogger(), {
@@ -382,7 +391,12 @@ describe('acquireLock — reclaimableBeforeExpiry', () => {
       reclaimableBeforeExpiry: earlierAttemptOnly,
     })
 
-    // #then it loses the etag race and the renewed record survives
+    // #then the takeover sent the observed etag, lost the real etag race, and the renewed record survives
+    const takeoverWrite = vi
+      .mocked(adapter.conditionalPut)
+      .mock.calls.find(([, , options]) => options?.ifMatch !== undefined)
+    expect(observedEtag).toBeDefined()
+    expect(takeoverWrite?.[2]).toEqual({ifMatch: observedEtag})
     expect(result).toEqual(ok({acquired: false, outcome: 'conflict', etag: null, holder: null}))
     expect(JSON.parse(objects.get(ACTION_KEY)?.data ?? '{}')).toMatchObject({holder_id: 'action:1:1'})
   })
@@ -452,5 +466,55 @@ describe('releaseLockIfHolder', () => {
 
     // #then
     expect(result.success).toBe(false)
+  })
+
+  it('leaves a sibling job’s lock alone when holder ids differ only by job identity', async () => {
+    // #given two jobs of one run and attempt; the "test" job holds the lock
+    const {config, objects} = createMemoryStore({[ACTION_KEY]: holderRecord('action:1:1:test')})
+
+    // #when the "build" job's post hook releases by its own holder id
+    const result = await releaseLockIfHolder(config, 'owner/repo', 'action:1:1:build', createLogger(), 'action')
+
+    // #then
+    expect(result).toEqual(ok('not-holder'))
+    expect(objects.has(ACTION_KEY)).toBe(true)
+  })
+
+  it('treats a NotFound on the delete as no-lock', async () => {
+    // #given the lock vanishes between the read and the delete
+    const {config, adapter} = createMemoryStore({[ACTION_KEY]: holderRecord('action:1:1')})
+    vi.mocked(adapter.conditionalDelete).mockResolvedValueOnce(err(new Error('NoSuchKey')))
+
+    // #when
+    const result = await releaseLockIfHolder(config, 'owner/repo', 'action:1:1', createLogger(), 'action')
+
+    // #then
+    expect(result).toEqual(ok('no-lock'))
+  })
+
+  it('returns an error for a generic delete failure', async () => {
+    // #given
+    const {config, adapter} = createMemoryStore({[ACTION_KEY]: holderRecord('action:1:1')})
+    vi.mocked(adapter.conditionalDelete).mockResolvedValueOnce(err(new Error('503 slow down')))
+
+    // #when
+    const result = await releaseLockIfHolder(config, 'owner/repo', 'action:1:1', createLogger(), 'action')
+
+    // #then
+    expect(result.success).toBe(false)
+  })
+
+  it('returns an error for a malformed lock body and deletes nothing', async () => {
+    // #given
+    const {config, adapter, objects} = createMemoryStore()
+    objects.set(ACTION_KEY, {data: 'not json', etag: 'etag-bad'})
+
+    // #when
+    const result = await releaseLockIfHolder(config, 'owner/repo', 'action:1:1', createLogger(), 'action')
+
+    // #then
+    expect(result.success).toBe(false)
+    expect(adapter.conditionalDelete).not.toHaveBeenCalled()
+    expect(objects.has(ACTION_KEY)).toBe(true)
   })
 })

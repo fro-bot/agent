@@ -185,7 +185,7 @@ export async function acquireLock(
 
   const observedAt = new Date()
   const expired = isStale(holder.data, observedAt)
-  const superseded = expired === false && options.reclaimableBeforeExpiry?.(holder.data) === true
+  const superseded = expired === false && options.reclaimableBeforeExpiry?.(holder.data, observedAt) === true
   if (expired === false && superseded === false) {
     return ok({acquired: false, outcome: 'active-holder', etag: null, holder: holder.data})
   }
