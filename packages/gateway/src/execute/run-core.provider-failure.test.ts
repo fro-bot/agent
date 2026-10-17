@@ -5,11 +5,12 @@
  * closes, so a missed detection shows up as `inactivity-timeout` at the full window instead.
  */
 
-import type {OpenCodeServerHandle} from '@fro-bot/runtime'
+import type {OpenCodeServerHandle, OwnershipLedger} from '@fro-bot/runtime'
 import type {PermissionCoordinator} from '../approvals/coordinator.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {DiscordStreamSink} from '../discord/streaming.js'
 
+import {createOwnershipLedger} from '@fro-bot/runtime'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
 import {RunCoreError, runOpenCodeCore} from './run-core.js'
@@ -64,11 +65,21 @@ interface Run {
   readonly emit: (event: object) => Promise<void>
   readonly outcome: () => Outcome | undefined
   readonly done: Promise<void>
+  readonly abort: ReturnType<typeof vi.fn>
   readonly logger: GatewayLogger
 }
 
 /** Starts a run over an open stream the test feeds one event at a time. */
-function startRun(options: {readonly owned?: readonly string[]; readonly controller?: AbortController} = {}): Run {
+interface StartOptions {
+  readonly owned?: readonly string[]
+  readonly controller?: AbortController
+  readonly ownershipLedger?: OwnershipLedger
+  /** Live-session map `session.status` reports; defaults to nothing live. */
+  readonly live?: Readonly<Record<string, object>>
+  readonly abort?: () => Promise<unknown>
+}
+
+function startRun(options: StartOptions = {}): Run {
   vi.useFakeTimers()
   const queue: object[] = []
   let wake: (() => void) | null = null
@@ -92,8 +103,8 @@ function startRun(options: {readonly owned?: readonly string[]; readonly control
       messages: vi.fn().mockResolvedValue({data: [], error: null}),
       promptAsync: vi.fn().mockResolvedValue({data: {}, error: null}),
       children: vi.fn().mockResolvedValue({data: [], error: null}),
-      status: vi.fn().mockResolvedValue({data: {}, error: null}),
-      abort: vi.fn().mockResolvedValue({data: {}, error: null}),
+      status: vi.fn().mockResolvedValue({data: options.live ?? {}, error: null}),
+      abort: vi.fn(options.abort ?? (async () => ({data: {}, error: null}))),
     },
     event: {subscribe: vi.fn().mockResolvedValue({stream: stream()})},
     postSessionIdPermissionsPermissionId: vi.fn().mockResolvedValue({error: null}),
@@ -114,6 +125,7 @@ function startRun(options: {readonly owned?: readonly string[]; readonly control
     signal: (options.controller ?? new AbortController()).signal,
     logger,
     coordinator: makeCoordinator(options.owned),
+    ...(options.ownershipLedger === undefined ? {} : {ownershipLedger: options.ownershipLedger}),
     inactivityTimeoutMs: WINDOW,
   }).then(
     () => {
@@ -136,6 +148,7 @@ function startRun(options: {readonly owned?: readonly string[]; readonly control
     },
     outcome: () => settled,
     done,
+    abort: client.session.abort,
     logger,
   }
 }
@@ -151,6 +164,19 @@ function assistantMessage(error: object | undefined, sessionID = ROOT, role = 'a
   return {
     type: 'message.updated',
     properties: {sessionID, info: {id: 'msg-1', sessionID, role, ...(error === undefined ? {} : {error})}},
+  }
+}
+
+/** An assistant message whose session id appears ONLY on `info`, so the nested fallback runs alone. */
+function nestedOnlyAssistantMessage(error: object): object {
+  return {type: 'message.updated', properties: {info: {id: 'msg-1', sessionID: ROOT, role: 'assistant', error}}}
+}
+
+/** A compaction part whose session id appears ONLY on `part`, so the nested fallback runs alone. */
+function nestedOnlyCompactionPart(sessionID = ROOT): object {
+  return {
+    type: 'message.part.updated',
+    properties: {part: {id: 'part-compaction', messageID: 'msg-compaction', sessionID, type: 'compaction', auto: true}},
   }
 }
 
@@ -289,6 +315,112 @@ describe('runOpenCodeCore — provider rejection fails fast (#1836)', () => {
       expectFailed(run, 'Provider failure: session error')
       expect(loggedText(run.logger)).not.toContain('SECRET')
       expect(loggedText(run.logger)).toContain('"errorName":"unknown"')
+    })
+  })
+
+  describe('a classified retry stops the live root before the run fails', () => {
+    const authRetry = retryStatus({
+      action: {reason: 'auth_unavailable', provider: 'p', title: 't', message: 'm', label: 'l'},
+    })
+
+    function settledLedger(): OwnershipLedger {
+      const ledger = createOwnershipLedger()
+      ledger.adopt(CHILD, 'child')
+      ledger.settle(CHILD)
+      return ledger
+    }
+
+    it.each([
+      ['no ledger', undefined],
+      ['an empty ledger', createOwnershipLedger()],
+      ['a settled ledger', settledLedger()],
+    ])('aborts the root and confirms it quiescent with %s', async (_label, ownershipLedger) => {
+      // #given — OpenCode is mid-retry, so the root is live
+      const run = startRun({...(ownershipLedger === undefined ? {} : {ownershipLedger})})
+
+      // #when
+      await run.emit(authRetry)
+
+      // #then — the failure is unchanged, and only returned after the root was aborted and checked
+      expectFailed(run, 'Provider failure: provider auth unavailable')
+      expect(run.abort).toHaveBeenCalledTimes(1)
+      expect(run.abort).toHaveBeenCalledWith(expect.objectContaining({path: {id: ROOT}}))
+      expect((run.outcome() as {error: RunCoreError}).error.quarantined).toBe(false)
+    })
+
+    it('quarantines the run when the root stays live after the abort', async () => {
+      // #given — the directory's live set keeps reporting the root
+      const run = startRun({live: {[ROOT]: {type: 'retry'}}})
+
+      // #when — the bounded teardown budget runs out
+      await run.emit(authRetry)
+      await vi.advanceTimersByTimeAsync(20_000)
+
+      // #then — same kind and message, with quarantine as extra evidence
+      const outcome = run.outcome()
+      expect(outcome?.ok).toBe(false)
+      const error = (outcome as {error: RunCoreError}).error
+      expect(error.kind).toBe('session-error')
+      expect(error.message).toBe('Provider failure: provider auth unavailable')
+      expect(error.quarantined).toBe(true)
+    })
+
+    it('quarantines the run when the abort fails and the root stays live', async () => {
+      // #given
+      const run = startRun({
+        live: {[ROOT]: {type: 'retry'}},
+        abort: async () => {
+          throw new Error(`abort refused ${SECRET}`)
+        },
+      })
+
+      // #when
+      await run.emit(authRetry)
+      await vi.advanceTimersByTimeAsync(20_000)
+
+      // #then — quarantined, and the abort error text is not echoed
+      const error = (run.outcome() as {error: RunCoreError}).error
+      expect(error.kind).toBe('session-error')
+      expect(error.quarantined).toBe(true)
+      expect(error.message).not.toContain('SECRET')
+    })
+
+    it('does not abort the root for a terminal error, which fires after OpenCode set it idle', async () => {
+      // #given
+      const run = startRun({ownershipLedger: createOwnershipLedger()})
+
+      // #when — processor.ts halt publishes the error and sets idle in one step
+      await run.emit(sessionError({name: 'ProviderAuthError', data: {providerID: 'p', message: 'x'}}))
+
+      // #then
+      expectFailed(run, 'Provider failure: provider auth unavailable')
+      expect(run.abort).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('nested-only session ids', () => {
+    it('classifies an assistant message that carries its session id only on info', async () => {
+      // #given
+      const run = startRun()
+
+      // #when
+      await run.emit(nestedOnlyAssistantMessage({name: 'ProviderAuthError', data: {providerID: 'p', message: 'x'}}))
+
+      // #then
+      expectFailed(run, 'Provider failure: provider auth unavailable')
+    })
+
+    it('clears a pending overflow on a compaction part that carries its session id only on part', async () => {
+      // #given
+      const run = startRun()
+
+      // #when
+      await run.emit(sessionError({name: 'ContextOverflowError', data: {message: 'x'}}))
+      await run.emit(nestedOnlyCompactionPart())
+      await run.emit({type: 'session.idle', properties: {sessionID: ROOT}})
+
+      // #then
+      expect(run.outcome()).toEqual({ok: true})
     })
   })
 

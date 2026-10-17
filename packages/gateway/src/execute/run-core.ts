@@ -37,6 +37,7 @@ import type {ProviderFailure} from './provider-failure.js'
 import {
   createInactivityTimer,
   createLedgerReconciler,
+  createOwnershipLedger,
   createSdkLedgerReconcileAdapter,
   reconcileLedgerOnce,
 } from '@fro-bot/runtime'
@@ -696,17 +697,20 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // and confirmed quiescent first (`confirmRootQuiescent`), inside the same teardown budget, and an unconfirmed
   // root is quarantined exactly like an unconfirmed child. Runs that never adopted background work are never
   // `draining`, so they keep the original fast path.
-  async function throwWithBarrier(kind: RunCoreErrorKind, message: string): Promise<never> {
+  async function throwWithBarrier(kind: RunCoreErrorKind, message: string, rootLive = false): Promise<never> {
+    // `rootLive`: the caller knows the root is still executing (a provider retry mid-backoff), so it takes the same
+    // root teardown as the follow-up window, even with an empty or settled ledger — or none at all.
     const rootFollowUpOpen =
-      drainCompletion !== undefined && draining === true && drainDoneController.signal.aborted === false
-    if (ledger === undefined || (ledger.isDrainComplete() === true && rootFollowUpOpen === false)) {
+      rootLive || (drainCompletion !== undefined && draining === true && drainDoneController.signal.aborted === false)
+    const barrierLedger = ledger ?? (rootLive ? createOwnershipLedger() : undefined)
+    if (barrierLedger === undefined || (barrierLedger.isDrainComplete() === true && rootFollowUpOpen === false)) {
       throw new RunCoreError(kind, message)
     }
     const settlement = await settleOwnedSessions({
       client,
       directory,
       rootSessionId: sessionId,
-      ledger,
+      ledger: barrierLedger,
       logger,
       ...(rootFollowUpOpen ? {confirmRootQuiescent: true} : {}),
     })
@@ -726,13 +730,16 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // Fails the run on a provider rejection OpenCode will not recover from (#1836). Reuses `session-error`:
   // a new operator failure kind would be a contract change. Only the fixed `reason` and a sanitized error
   // name leave the classifier; the provider's own message is never logged or placed in the error.
-  async function failFromProvider(failure: ProviderFailure, source: string): Promise<never> {
+  // `rootLive`: only a retry status — OpenCode is mid-backoff and will keep going. Every terminal source
+  // (`session.error`, `message.updated`, overflow at idle) fires after `halt` has set the root idle
+  // (processor.ts:613-639), so the root is already stopped there.
+  async function failFromProvider(failure: ProviderFailure, source: string, rootLive = false): Promise<never> {
     logger.error(
       {sessionId, source, errorName: failure.errorName, reason: failure.reason},
       'run-core: provider rejected the request — failing run',
     )
     clearInactivity()
-    throw await throwWithBarrier('session-error', `Provider failure: ${failure.reason}`)
+    throw await throwWithBarrier('session-error', `Provider failure: ${failure.reason}`, rootLive)
   }
 
   // ── 2. Subscribe to events — directory threaded to query (SSE-routing) ─────
@@ -1382,7 +1389,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         // Root only: a child's retry never fails the parent through this path.
         if (getEventSessionID(rawEvent) === sessionId) {
           const retryFailure = classifyRetryStatus(getObjectProperty(eventPayload, 'status'))
-          if (retryFailure !== null) throw await failFromProvider(retryFailure, 'session.status')
+          if (retryFailure !== null) throw await failFromProvider(retryFailure, 'session.status', true)
         }
       } else {
         // Unrecognized event type — log at debug so a lost-event/routing gap (events arriving
