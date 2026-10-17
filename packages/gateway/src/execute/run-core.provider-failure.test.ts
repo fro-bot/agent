@@ -68,7 +68,7 @@ interface Run {
 }
 
 /** Starts a run over an open stream the test feeds one event at a time. */
-function startRun(options: {readonly owned?: readonly string[]} = {}): Run {
+function startRun(options: {readonly owned?: readonly string[]; readonly controller?: AbortController} = {}): Run {
   vi.useFakeTimers()
   const queue: object[] = []
   let wake: (() => void) | null = null
@@ -111,7 +111,7 @@ function startRun(options: {readonly owned?: readonly string[]} = {}): Run {
     directory: '/workspace/repo',
     promptText: 'Fix the bug please',
     sink: makeSink(),
-    signal: new AbortController().signal,
+    signal: (options.controller ?? new AbortController()).signal,
     logger,
     coordinator: makeCoordinator(options.owned),
     inactivityTimeoutMs: WINDOW,
@@ -341,17 +341,6 @@ describe('runOpenCodeCore — provider rejection fails fast (#1836)', () => {
       expect((outcome as {error: RunCoreError}).error.kind).toBe('inactivity-timeout')
     })
 
-    it('does not fail on an aborted assistant message', async () => {
-      // #given
-      const run = startRun()
-
-      // #when — OpenCode marks the message aborted (operator cancel path owns that outcome)
-      await run.emit(assistantMessage({name: 'MessageAbortedError', data: {message: 'Aborted'}}))
-
-      // #then
-      expect(run.outcome()).toBeUndefined()
-    })
-
     it('ignores a non-assistant message and an assistant message without an error', async () => {
       // #given
       const run = startRun()
@@ -443,16 +432,51 @@ describe('runOpenCodeCore — provider rejection fails fast (#1836)', () => {
       expectFailed(run, 'Provider failure: session error')
     })
 
-    it('does not fail the run on a session.error carrying MessageAbortedError', async () => {
+    it('fails the run on an abort the gateway did not cause (session.error, then idle)', async () => {
+      // #given — another client called POST /session/:id/abort; no gateway signal has fired
+      const run = startRun()
+
+      // #when — upstream publishes session.error(MessageAbortedError) and then session.idle
+      await run.emit(sessionError({name: 'MessageAbortedError', data: {message: 'Aborted'}}))
+
+      // #then — failed, not completed with partial output
+      expectFailed(run, 'Provider failure: session error')
+      expect(vi.mocked(run.logger.error)).toHaveBeenCalledWith(
+        {sessionId: ROOT, source: 'session.error', errorName: 'MessageAbortedError', reason: 'session error'},
+        expect.any(String),
+      )
+    })
+
+    it('leaves a gateway-caused abort to the cancel path', async () => {
+      // #given
+      const controller = new AbortController()
+      const run = startRun({controller})
+
+      // #when — the gateway aborts, then the abort events upstream publishes for it arrive
+      controller.abort()
+      await run.emit(sessionError({name: 'MessageAbortedError', data: {message: 'Aborted'}}))
+      await run.emit({type: 'session.idle', properties: {sessionID: ROOT}})
+
+      // #then — the existing signal path reports it; no provider failure
+      const outcome = run.outcome()
+      expect(outcome?.ok).toBe(false)
+      expect((outcome as {error: RunCoreError}).error.kind).toBe('timeout')
+      expect(loggedText(run.logger)).not.toContain('provider rejected the request')
+    })
+
+    it('fails the run on an external abort carried by an assistant message.updated', async () => {
       // #given
       const run = startRun()
 
-      // #when — the abort signal, not this event, ends the loop
-      await run.emit(sessionError({name: 'MessageAbortedError', data: {message: 'Aborted'}}))
+      // #when
+      await run.emit(assistantMessage({name: 'MessageAbortedError', data: {message: 'Aborted'}}))
 
-      // #then — no RunCoreError, no provider failure logged
-      expect(run.outcome()).toBeUndefined()
-      expect(vi.mocked(run.logger.error)).not.toHaveBeenCalled()
+      // #then
+      expectFailed(run, 'Provider failure: session error')
+      expect(vi.mocked(run.logger.error)).toHaveBeenCalledWith(
+        {sessionId: ROOT, source: 'message.updated', errorName: 'MessageAbortedError', reason: 'session error'},
+        expect.any(String),
+      )
     })
 
     it('completes when compaction follows a ContextOverflowError session.error (compaction on)', async () => {
@@ -503,16 +527,64 @@ describe('runOpenCodeCore — provider rejection fails fast (#1836)', () => {
       expectFailed(run, 'Provider failure: session error')
     })
 
-    it('ignores a child ContextOverflowError', async () => {
+    it('fails the run when an owned child overflows and goes idle uncompacted (compaction off)', async () => {
+      // #given
+      const run = startRun({owned: [CHILD]})
+
+      // #when — the child's output is lost; the root has not gone idle
+      await run.emit(sessionError({name: 'ContextOverflowError', data: {message: SECRET}}, CHILD))
+      expect(run.outcome()).toBeUndefined()
+      await run.emit({type: 'session.idle', properties: {sessionID: CHILD}})
+
+      // #then
+      expectFailed(run, 'Provider failure: session error')
+      expect(vi.mocked(run.logger.error)).toHaveBeenCalledWith(
+        {sessionId: ROOT, source: 'session.idle', errorName: 'ContextOverflowError', reason: 'session error'},
+        expect.any(String),
+      )
+      expect(loggedText(run.logger)).not.toContain('SECRET')
+    })
+
+    it('lets an owned child recover through its own compaction (compaction on)', async () => {
       // #given
       const run = startRun({owned: [CHILD]})
 
       // #when
       await run.emit(sessionError({name: 'ContextOverflowError', data: {message: 'x'}}, CHILD))
+      await run.emit(compactionPart(CHILD))
+      await run.emit({type: 'session.idle', properties: {sessionID: CHILD}})
       await run.emit({type: 'session.idle', properties: {sessionID: ROOT}})
 
-      // #then — the child's overflow never arms the root
+      // #then
       expect(run.outcome()).toEqual({ok: true})
+    })
+
+    it('re-arms on a second overflow after a compaction', async () => {
+      // #given
+      const run = startRun()
+
+      // #when — overflow, compaction, a second overflow, then idle with no second compaction
+      await run.emit(sessionError({name: 'ContextOverflowError', data: {message: 'x'}}))
+      await run.emit(compactionPart())
+      await run.emit(sessionError({name: 'ContextOverflowError', data: {message: 'x'}}))
+      expect(run.outcome()).toBeUndefined()
+      await run.emit({type: 'session.idle', properties: {sessionID: ROOT}})
+
+      // #then
+      expectFailed(run, 'Provider failure: session error')
+    })
+
+    it('treats an overflow with no session id as the root', async () => {
+      // #given
+      const run = startRun()
+
+      // #when
+      await run.emit({type: 'session.error', properties: {error: {name: 'ContextOverflowError', data: {message: 'x'}}}})
+      expect(run.outcome()).toBeUndefined()
+      await run.emit({type: 'session.idle', properties: {sessionID: ROOT}})
+
+      // #then
+      expectFailed(run, 'Provider failure: session error')
     })
 
     it('still fails normally when a terminal error follows a ContextOverflowError', async () => {

@@ -720,6 +720,9 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     throw new RunCoreError(kind, message, true)
   }
 
+  // An abort the gateway did not cause (see the `session.error` and `message.updated` branches).
+  const ABORTED_FAILURE: ProviderFailure = {reason: 'session error', errorName: 'MessageAbortedError'}
+
   // Fails the run on a provider rejection OpenCode will not recover from (#1836). Reuses `session-error`:
   // a new operator failure kind would be a contract change. Only the fixed `reason` and a sanitized error
   // name leave the classifier; the provider's own message is never logged or placed in the error.
@@ -800,13 +803,15 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // the only way to distinguish them from text deltas.
   const reasoningPartIds = new Set<string>()
 
-  // Set by a ROOT `ContextOverflowError` session.error. With auto-compaction on (the default) OpenCode publishes
-  // it and compacts: `compaction.create` (compaction.ts:559-582) then writes a root user message with a
-  // `compaction` part, the first root event of the recovery (called from prompt.ts:1322 after processor.ts:629-631).
-  // With compaction off OpenCode halts instead (processor.ts:621-628): `session.error`, then `session.idle`, with
-  // the errored `message.updated` only after. So the flag is cleared by that compaction part and, if root idle
-  // arrives first, the overflow was unrecovered and the run fails.
-  let overflowPending = false
+  // Sessions (root or owned child) with a `ContextOverflowError` session.error not yet recovered. With
+  // auto-compaction on (the default) OpenCode publishes it and compacts: `compaction.create`
+  // (compaction.ts:559-582) then writes that session's user message with a `compaction` part, the first event of
+  // the recovery (called from prompt.ts:1322 after processor.ts:629-631). With compaction off OpenCode halts
+  // instead (processor.ts:621-628): `session.error`, then that session's `session.idle`, with the errored
+  // `message.updated` only after. So a session's own compaction part clears its entry and, if its idle arrives
+  // first, the overflow was unrecovered and the run fails. A null session id is keyed to the root, as run-core
+  // already treats it.
+  const overflowPending = new Set<string>()
 
   // Part IDs of synthetic background-task notices. A notice is the harness talking to the parent agent,
   // never reply text: nothing carrying one of these ids may reach the sink.
@@ -978,13 +983,11 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       // the routing below, so a run that adopted nothing sees no behavioural difference.
       observeRootForDrain(rawEvent, eventType, eventPayload)
 
-      if (overflowPending === true && eventType === 'message.part.updated') {
+      if (overflowPending.size > 0 && eventType === 'message.part.updated') {
         const part = getObjectProperty(eventPayload, 'part')
-        if (
-          (getSessionID(eventPayload) ?? getSessionID(part)) === sessionId &&
-          getStringProperty(part, 'type') === 'compaction'
-        ) {
-          overflowPending = false
+        const partSessionId = getSessionID(eventPayload) ?? getSessionID(part)
+        if (partSessionId !== null && getStringProperty(part, 'type') === 'compaction') {
+          overflowPending.delete(partSessionId)
         }
       }
 
@@ -1270,11 +1273,12 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         // working. Root idle is the signal to CONSIDER finishing; whether that
         // is actually allowed is the ledger's call, below.
         const eventSessionID = getEventSessionID(rawEvent)
+        // Any session's idle with an overflow nothing compacted: OpenCode stopped it (compaction off). A child's
+        // output is lost with it, so fail rather than let the root complete.
+        if (eventSessionID !== null && overflowPending.has(eventSessionID)) {
+          throw await failFromProvider({reason: 'session error', errorName: 'ContextOverflowError'}, 'session.idle')
+        }
         if (eventSessionID === sessionId) {
-          // Idle with an overflow nothing compacted: OpenCode stopped (compaction off). Fail, don't complete.
-          if (overflowPending === true) {
-            throw await failFromProvider({reason: 'session error', errorName: 'ContextOverflowError'}, 'session.idle')
-          }
           // Background-only gate: a run that never adopted a dispatch (no ledger, or an empty one) completes
           // on root idle exactly as it always has. Once ANY dispatch was adopted, a settled ledger is not
           // enough — see the drain-completion gate below.
@@ -1341,12 +1345,15 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           // classifier: only a fixed reason survives, never the provider's text.
           const errorText = getStringProperty(eventPayload, 'error')
           const structuredError = errorText === null ? getObjectProperty(eventPayload, 'error') : null
-          // An abort is the harness or operator stopping the run; the abort signal ends the loop. A root context
-          // overflow is not decided here: compaction may follow, so it only arms `overflowPending` (see above).
-          // A child's overflow is the child's problem.
+          // A context overflow is not decided here: compaction may follow, so it only arms `overflowPending`.
+          // An abort is exempt only when the gateway caused it (the combined signal ends the loop); an abort
+          // from any other client (`POST /session/:id/abort`) is followed by an idle that would otherwise
+          // complete the run with partial output.
           if (isContextOverflowError(structuredError)) {
-            if (eventSessionID === sessionId) overflowPending = true
-          } else if (isAbortedError(structuredError) === false) {
+            overflowPending.add(eventSessionID ?? sessionId)
+          } else if (isAbortedError(structuredError)) {
+            if (combinedSignal.aborted === false) throw await failFromProvider(ABORTED_FAILURE, 'session.error')
+          } else {
             const failure = errorText === null ? classifyStructuredError(structuredError) : classifyErrorText(errorText)
             throw await failFromProvider(failure, 'session.error')
           }
@@ -1361,8 +1368,12 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           getStringProperty(info, 'role') === 'assistant'
         ) {
           const messageError = getObjectProperty(info, 'error')
-          if (messageError !== null && typeof messageError === 'object' && isAbortedError(messageError) === false) {
-            throw await failFromProvider(classifyStructuredError(messageError), 'message.updated')
+          if (messageError !== null && typeof messageError === 'object') {
+            if (isAbortedError(messageError)) {
+              if (combinedSignal.aborted === false) throw await failFromProvider(ABORTED_FAILURE, 'message.updated')
+            } else {
+              throw await failFromProvider(classifyStructuredError(messageError), 'message.updated')
+            }
           }
         }
       } else if (eventType === 'session.status') {

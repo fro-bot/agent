@@ -15,6 +15,11 @@
  *   `message` is the text of a retried (often 5xx) failure and is not evidence the retry is hopeless.
  * - Message-text matching applies to terminal error payloads only (`session.error`, assistant
  *   `info.error`), where OpenCode has already stopped retrying.
+ *
+ * Retry-status trade-off: `action.reason: 'auth_unavailable'` is the production shape captured in #1253
+ * (fixture: `docs/plans/2026-07-24-001-fix-provider-auth-fast-fail-plan.md`). A retried 5xx whose only
+ * auth or model signal is its text is NOT failed fast: OpenCode retries 5xx as transient, so such a run
+ * waits for the terminal error instead of risking a false failure on a recoverable outage.
  */
 
 import {classifyModelNotFoundError, classifyProviderAuthError} from '@fro-bot/runtime'
