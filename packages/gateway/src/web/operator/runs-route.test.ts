@@ -371,7 +371,6 @@ describe('GET /operator/runs — error paths', () => {
     const [ctx] = warnSpy.mock.calls[0] as [Record<string, unknown>]
     expect(ctx).toHaveProperty('githubUserId')
     expect('token' in ctx).toBe(false)
-    expect('oauthToken' in ctx).toBe(false)
   })
 })
 

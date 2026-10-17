@@ -43,7 +43,6 @@ import type {GitHubOAuthConfig, GitHubOAuthDeps} from './auth/github.js'
 import type {DurableSessionStore, SessionDeps} from './auth/session.js'
 import type {OperatorIngressPolicy} from './ingress/policy.js'
 import type {PushHealthStatus} from './operator-push/push-health.js'
-import type {SubscriptionRouteSessionStore} from './operator-push/subscription-route.js'
 import type {OperatorPushSubscriptionStore} from './operator-push/subscription-store.js'
 import type {VapidPublicKeyInfo} from './operator-push/vapid.js'
 import type {IdempotencyGuard} from './operator/idempotency.js'
@@ -1141,7 +1140,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
     deps.auditLogger !== undefined
   ) {
     const clock = deps.sessionDeps?.clock ?? (() => Date.now())
-    const sessionStoreForPush: SubscriptionRouteSessionStore = deps.sessionStore
+    const sessionStoreForPush: Pick<DurableSessionStore, 'get'> = deps.sessionStore
     buildVapidPublicKeyRoute(app, {
       vapidPublicKeyInfo: deps.operatorPushVapidKeyInfo,
       logger: deps.logger,

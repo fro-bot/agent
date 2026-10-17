@@ -36,7 +36,7 @@ import type {PermissionReply} from '../../operator-contract/approval.js'
 import type {DenylistCache} from '../../redaction/denylist.js'
 import type {BindingsLookup} from '../../redaction/surface-gate.js'
 import type {ApprovalRejectedReason, AuditLogger} from '../audit.js'
-import type {SessionReader} from '../auth/session.js'
+import type {DurableSessionStore} from '../auth/session.js'
 import type {OperatorLogger} from '../server.js'
 import {toOperatorDecisionState} from '../../operator-contract/approval.js'
 import {emitAudit} from '../audit.js'
@@ -51,7 +51,7 @@ import {resolveRepoAccess, resolveRepoFromRunIndex} from './route-helpers.js'
 /** Dependencies for the decision route. */
 export interface DecisionRouteDeps {
   /** Session store for the actor's display login. */
-  readonly sessionStore: SessionReader
+  readonly sessionStore: Pick<DurableSessionStore, 'get'>
   /** Server-owned run index for runId → repo resolution. */
   readonly runIndex: Pick<RunIndex, 'lookup'>
   /** Denylist cache for pre-decision redaction check. */
@@ -122,8 +122,6 @@ function decisionOutcomeToRejectedReason(outcome: Exclude<DecisionOutcome, 'ok'>
  */
 export function buildDecisionRoute(app: Hono, deps: DecisionRouteDeps): void {
   registerOperatorRoute(app, 'POST', '/operator/runs/:runId/approvals/:requestId/decision', async c => {
-    const nowMs = deps.now()
-
     // ── Gate 1: Read authenticated context set by the guard ──────────────────
     // In production the guard always sets this; undefined is unreachable.
     // Return not-found as a safe fallback (no oracle — same shape as all denials).
@@ -205,7 +203,7 @@ export function buildDecisionRoute(app: Hono, deps: DecisionRouteDeps): void {
       // ── Gate 6: Build WebOperatorActor from the operator auth context ──────
       // The actor is the typed identity for attribution on the settled decision.
       // We need the login from the session store.
-      const sessionEntry = deps.sessionStore.get(sessionId, nowMs)
+      const sessionEntry = deps.sessionStore.get(sessionId)
       if (sessionEntry === undefined) {
         deps.logger.warn({githubUserId, runId, gate: 'no-session'}, 'decision: denied — session missing')
         return notFoundResponse(c)

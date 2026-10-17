@@ -18,7 +18,7 @@ import type {RepoBinding} from '../../bindings/types.js'
 import type {LaunchAdmission, LaunchWorkRequest} from '../../execute/launch-types.js'
 import type {RunMentionDeps} from '../../execute/run.js'
 import type {RepoKey} from '../../redaction/denylist.js'
-import type {LaunchRouteBindingsLookup, LaunchRouteDeps, LaunchRouteSessionStore} from './launch-route.js'
+import type {LaunchRouteBindingsLookup, LaunchRouteDeps} from './launch-route.js'
 import {Hono} from 'hono'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {launchWork} from '../../execute/run.js'
@@ -71,9 +71,9 @@ function makeBinding(overrides?: Partial<RepoBinding>): RepoBinding {
   }
 }
 
-function makeSessionStore(overrides?: Partial<LaunchRouteSessionStore>): LaunchRouteSessionStore {
+function makeSessionStore(overrides?: Partial<LaunchRouteDeps['sessionStore']>): LaunchRouteDeps['sessionStore'] {
   return {
-    get: vi.fn((_sessionId: string, _nowMs: number) => ({githubUserId: 1001, login: 'alice'})),
+    get: vi.fn((_sessionId: string) => ({githubUserId: 1001, login: 'alice', issuedAt: 0})),
     ...overrides,
   }
 }

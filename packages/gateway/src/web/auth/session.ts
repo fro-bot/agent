@@ -1,18 +1,21 @@
 /**
- * Server-side opaque session store for the operator web surface.
+ * Durable server-side session store for the operator web surface.
  *
- * - In-memory store: create, get, touch, delete, scavenge, size.
- * - 8-hour absolute TTL and 30-minute idle TTL enforced on every get().
- * - Session IDs: 256-bit CSPRNG entropy (base64url, 43 chars).
+ * - An in-memory map is authoritative for reads; every session also has a signed record in the object
+ *   store (see session-persistence.ts), written before the session is accepted and revoked before a
+ *   revoke is acknowledged.
+ * - Sessions live a fixed 7 days from login (DURABLE_SESSION_TTL_MS). No idle timeout, and nothing extends it.
+ * - A gateway restart keeps sessions: `load()` restores them from the object store before the server starts.
+ * - Session IDs: 256-bit CSPRNG entropy (base64url, 43 chars). Only sha256(ID) is stored or held in memory.
  * - Session cap to bound memory growth.
- * - Revocation hooks: called on delete().
+ * - The store holds no OAuth token. The token is used for `GET /user` at login and then dropped.
  * - Cookie helpers: buildSessionCookieValue, parseSessionCookie.
  * - POST /operator/auth/logout route builder.
  *
  * Security invariants:
  *   - Session IDs are never logged or included in error responses.
- *   - Logout is idempotent: unknown session IDs return 200 (no oracle).
- *   - Gateway restart is global logout: in-memory sessions are gone.
+ *   - Logout is durable first: a 200 means the revoke is stored, and a 503 means the session is still valid.
+ *   - Only a deliberate rotation of GATEWAY_OPERATOR_CSRF_SECRET revokes every stored session at once.
  */
 
 import type {Result} from '@fro-bot/runtime'
@@ -39,9 +42,6 @@ import {hashSessionId} from './session-persistence.js'
 /** Cookie name — __Host- prefix enforces Secure, Path=/, no Domain. */
 export const SESSION_COOKIE_NAME = '__Host-session'
 
-/** Absolute session lifetime: 8 hours. */
-export const SESSION_ABSOLUTE_TTL_MS = 8 * 60 * 60 * 1000
-
 /**
  * Durable session lifetime: a fixed 7 days from login. Idle time does not shorten it and no request extends it.
  *
@@ -54,9 +54,6 @@ export const DURABLE_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000
 
 /** Cookie `Max-Age` for a durable session, in seconds. Equals {@link DURABLE_SESSION_TTL_MS}. */
 export const SESSION_COOKIE_MAX_AGE_SECONDS = DURABLE_SESSION_TTL_MS / 1000
-
-/** Idle session lifetime: 30 minutes since last access. */
-export const SESSION_IDLE_TTL_MS = 30 * 60 * 1000
 
 /**
  * Maximum number of live sessions in the store.
@@ -76,122 +73,6 @@ export interface SessionIdentity {
   readonly login: string
 }
 
-/**
- * A single session entry stored server-side.
- *
- * Security invariant: `oauthToken` is an in-memory-only, session-bound secret.
- * It is never written to disk, never included in any cookie, never logged, and
- * never returned to the operator via any API response. It lives and dies with
- * this entry — dropped on revocation, TTL expiry, and scavenge.
- */
-export interface SessionEntry extends SessionIdentity {
-  /** Timestamp (ms since epoch) when this session was created. */
-  readonly issuedAt: number
-  /** Timestamp (ms since epoch) of the last access (create or touch). */
-  lastAccessedAt: number
-  /** Whether this session has been explicitly revoked. */
-  revoked: boolean
-  /**
-   * GitHub OAuth access token retained server-side for privileged route use.
-   *
-   * At-rest boundary: in-memory only. No disk, no logs, no cookie.
-   * Scope: repo read (minimum required by checkRepoAuthz).
-   * Lifetime: bound to this session entry — cleared on revocation, TTL expiry,
-   * and on first detected GitHub token expiry/revocation (via dropOperatorToken).
-   *
-   * NEVER expose this field in SessionIdentity, OperatorSessionInfo, or any
-   * operator-facing response. Access only through getOperatorToken().
-   *
-   * Optional so that stub/test SessionEntry literals do not need to carry it.
-   */
-  oauthToken?: string | undefined
-}
-
-/** Revocation hook callback — called with the session ID when the session is deleted. */
-export type RevocationHook = (sessionId: string) => void
-
-/** Server-side session store interface. */
-export interface SessionStore {
-  /**
-   * Create a new session for the given identity, retaining the OAuth token server-side.
-   *
-   * The token is stored in-memory only, bound to this session entry. It is never
-   * written to disk, never included in any cookie, and never returned to the operator.
-   *
-   * Returns the new session ID, or undefined if the session cap is reached.
-   */
-  create: (identity: SessionIdentity, oauthToken: string, nowMs: number) => string | undefined
-  /**
-   * Retrieve a session entry by ID.
-   * Returns undefined if not found, expired (absolute or idle), or revoked.
-   * Does NOT update lastAccessedAt — call touch() separately.
-   * Returns a Readonly view to prevent external mutation of revoked/lastAccessedAt bypassing hooks.
-   *
-   * Security: the returned entry does NOT expose the oauthToken field — use
-   * getOperatorToken() for the narrow token accessor.
-   */
-  get: (sessionId: string, nowMs: number) => Readonly<Omit<SessionEntry, 'oauthToken'>> | undefined
-  /**
-   * Update lastAccessedAt to extend the idle TTL.
-   * No-op for unknown or revoked sessions.
-   */
-  touch: (sessionId: string, nowMs: number) => void
-  /**
-   * Revoke a session immediately.
-   * No-op for unknown sessions.
-   * Triggers any registered revocation hooks.
-   * The retained OAuth token is dropped with the entry.
-   */
-  delete: (sessionId: string) => void
-  /**
-   * Register a revocation hook for a specific session ID.
-   * The hook is called with the session ID when delete() is called for that session.
-   * Multiple hooks per session are supported.
-   */
-  onRevoke: (sessionId: string, hook: RevocationHook) => void
-  /**
-   * Remove expired and revoked entries from the store.
-   * Call periodically to bound memory growth.
-   * Retained OAuth tokens are dropped with their entries.
-   */
-  scavenge: (nowMs: number) => void
-  /** Total number of entries in the store (including revoked, not yet scavenged). */
-  size: () => number
-  /**
-   * Return the retained OAuth token for a live, non-revoked, non-expired session.
-   *
-   * Returns undefined when:
-   *   - The session ID is unknown.
-   *   - The session is revoked or TTL-expired.
-   *   - The token was explicitly dropped via dropOperatorToken().
-   *
-   * Re-auth contract (deferred to 4b): a 4b route calls get() to confirm the
-   * session is valid, then getOperatorToken(). A valid session with undefined
-   * token means re-auth is needed (distinct from no-session). The typed re-auth
-   * result shape is designed with the 4b consumer. Return type stays
-   * `string | undefined` for v1.
-   *
-   * Security: the token is NEVER logged, never included in any response, and
-   * never returned via get(). This is the only sanctioned accessor.
-   */
-  getOperatorToken: (sessionId: string, nowMs: number) => string | undefined
-  /**
-   * Drop the retained OAuth token for a session without revoking the session itself.
-   *
-   * Call this when checkRepoAuthz (or any token-using path) fails in a way
-   * consistent with an expired or revoked GitHub token. The session remains valid
-   * for non-token operations, but subsequent getOperatorToken() calls return undefined,
-   * signalling to the caller that re-authentication is needed.
-   *
-   * Re-auth signal: when getOperatorToken() returns undefined for a live session,
-   * the caller should surface a distinct "re-authenticate" response to the operator
-   * (not a generic permission denial) so the browser can redirect to /start.
-   *
-   * No-op for unknown or revoked sessions.
-   */
-  dropOperatorToken: (sessionId: string) => void
-}
-
 /** Logger interface for the session module. */
 export interface SessionLogger {
   readonly debug: (ctx: Record<string, unknown>, msg: string) => void
@@ -206,14 +87,6 @@ export interface DurableSession extends SessionIdentity {
 }
 
 /** `cap` and `not_ready` are refusals before any write; `write_failed` is a failed durable create. */
-/**
- * What a route needs from the session store: the identity of a live session. The clock argument is ignored
- * by the durable store, which reads its own clock; Unit 7 drops it.
- */
-export interface SessionReader {
-  readonly get: (sessionId: string, nowMs: number) => DurableSession | undefined
-}
-
 export type DurableCreateResult =
   {readonly outcome: 'ok'; readonly sessionId: string} | {readonly outcome: 'cap' | 'write_failed' | 'not_ready'}
 
@@ -297,153 +170,6 @@ export interface SessionDeps {
  */
 function generateSessionId(): string {
   return randomBytes(32).toString('base64url')
-}
-
-// ---------------------------------------------------------------------------
-// In-memory session store
-// ---------------------------------------------------------------------------
-
-/**
- * Create a simple in-memory session store.
- *
- * Suitable for v1 single-process deployment. Gateway restart clears all sessions
- * (global logout — acceptable for v1).
- *
- * Session IDs are 256-bit CSPRNG values (base64url, 43 chars). At that entropy
- * level, enumeration is computationally infeasible; Map.get() is the correct
- * lookup — no timing-safe comparison is needed or useful here.
- */
-export function createInMemorySessionStore(): SessionStore {
-  const entries = new Map<string, SessionEntry>()
-  const hooks = new Map<string, RevocationHook[]>()
-
-  function isExpired(entry: SessionEntry, nowMs: number): boolean {
-    if (nowMs - entry.issuedAt > SESSION_ABSOLUTE_TTL_MS) return true
-    if (nowMs - entry.lastAccessedAt > SESSION_IDLE_TTL_MS) return true
-    return false
-  }
-
-  return {
-    create(identity: SessionIdentity, oauthToken: string, nowMs: number): string | undefined {
-      // Opportunistically scavenge expired/revoked entries before checking the cap.
-      // This makes cap behavior live-entry-based and fixes re-auth after stale session
-      // deletion: the revoked slot is reclaimed without requiring a manual scavenge() call.
-      if (entries.size >= SESSION_MAX_ENTRIES) {
-        for (const [key, entry] of entries) {
-          if (entry.revoked === true || isExpired(entry, nowMs)) {
-            entries.delete(key)
-            hooks.delete(key)
-          }
-        }
-      }
-
-      if (entries.size >= SESSION_MAX_ENTRIES) return undefined
-
-      const sessionId = generateSessionId()
-      const entry: SessionEntry = {
-        githubUserId: identity.githubUserId,
-        login: identity.login,
-        issuedAt: nowMs,
-        lastAccessedAt: nowMs,
-        revoked: false,
-        // Token is in-memory only: no disk, no logs, no cookie.
-        // Scope: repo read (minimum required by checkRepoAuthz).
-        oauthToken,
-      }
-      entries.set(sessionId, entry)
-      return sessionId
-    },
-
-    get(sessionId: string, nowMs: number): Omit<SessionEntry, 'oauthToken'> | undefined {
-      const entry = entries.get(sessionId)
-      if (entry === undefined) return undefined
-      if (entry.revoked === true) return undefined
-      if (isExpired(entry, nowMs)) return undefined
-      // Return a projection that excludes oauthToken — the token is never in the public entry.
-      // Build the public entry by copying only the known public fields.
-      const publicEntry: Omit<SessionEntry, 'oauthToken'> = {
-        githubUserId: entry.githubUserId,
-        login: entry.login,
-        issuedAt: entry.issuedAt,
-        lastAccessedAt: entry.lastAccessedAt,
-        revoked: entry.revoked,
-      }
-      return publicEntry
-    },
-
-    touch(sessionId: string, nowMs: number): void {
-      const entry = entries.get(sessionId)
-      if (entry === undefined) return
-      if (entry.revoked === true) return
-      entry.lastAccessedAt = nowMs
-    },
-
-    delete(sessionId: string): void {
-      const entry = entries.get(sessionId)
-      if (entry === undefined) return
-      // Clear the token from heap before marking revoked so it doesn't linger
-      // in memory after revocation. Hooks run after the token is cleared.
-      entry.oauthToken = undefined
-      entry.revoked = true
-
-      const sessionHooks = hooks.get(sessionId)
-      if (sessionHooks !== undefined) {
-        for (const hook of sessionHooks) {
-          try {
-            hook(sessionId)
-          } catch {
-            // Swallow hook failures — revocation must not be blocked by hook errors.
-          }
-        }
-        hooks.delete(sessionId)
-      }
-    },
-
-    onRevoke(sessionId: string, hook: RevocationHook): void {
-      const existing = hooks.get(sessionId)
-      if (existing === undefined) {
-        hooks.set(sessionId, [hook])
-      } else {
-        existing.push(hook)
-      }
-    },
-
-    scavenge(nowMs: number): void {
-      // TTL-expired sessions (absolute or idle timeout) are removed here
-      // WITHOUT firing revocation hooks — only delete() runs hooks. So a
-      // TTL-expired session's operator push subscriptions are not
-      // immediately deactivated; they are reclaimed later by the
-      // subscription store's own inactive-record pruning.
-      for (const [key, entry] of entries) {
-        if (entry.revoked === true || isExpired(entry, nowMs)) {
-          // Clear the token from heap before removing the entry so it doesn't
-          // linger in memory after TTL eviction or scavenge.
-          entry.oauthToken = undefined
-          entries.delete(key)
-          hooks.delete(key)
-        }
-      }
-    },
-
-    size(): number {
-      return entries.size
-    },
-
-    getOperatorToken(sessionId: string, nowMs: number): string | undefined {
-      const entry = entries.get(sessionId)
-      if (entry === undefined) return undefined
-      if (entry.revoked === true) return undefined
-      if (isExpired(entry, nowMs)) return undefined
-      return entry.oauthToken
-    },
-
-    dropOperatorToken(sessionId: string): void {
-      const entry = entries.get(sessionId)
-      if (entry === undefined) return
-      if (entry.revoked === true) return
-      entry.oauthToken = undefined
-    },
-  }
 }
 
 // ---------------------------------------------------------------------------

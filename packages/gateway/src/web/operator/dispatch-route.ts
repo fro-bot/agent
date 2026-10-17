@@ -27,9 +27,10 @@ import type {DispatchOutcome, DispatchWorkflow} from '../../github/dispatch.js'
 import type {RateLimiter} from '../../http/rate-limit.js'
 import type {DenylistCache} from '../../redaction/denylist.js'
 import type {AuditLogger} from '../audit.js'
+import type {DurableSessionStore} from '../auth/session.js'
 import type {OperatorLogger} from '../server.js'
 import type {IdempotencyGuard} from './idempotency.js'
-import type {LaunchRouteBindingsLookup, LaunchRouteSessionStore} from './launch-route.js'
+import type {LaunchRouteBindingsLookup} from './launch-route.js'
 import {createHash, randomUUID} from 'node:crypto'
 import {createRateLimiter} from '../../http/rate-limit.js'
 import {emitAudit} from '../audit.js'
@@ -58,7 +59,7 @@ const DISPATCH_IDEMPOTENCY_MAX_ENTRIES = 10_000
 // ---------------------------------------------------------------------------
 
 export interface DispatchRouteDeps {
-  readonly sessionStore: LaunchRouteSessionStore
+  readonly sessionStore: Pick<DurableSessionStore, 'get'>
   readonly bindingsLookup: LaunchRouteBindingsLookup
   /** Primed and consulted by resolveRepoAccess after the binding is found. */
   readonly denylistCache: Pick<DenylistCache, 'getDenylistState' | 'isRepoDenied'>
@@ -111,7 +112,6 @@ export function buildDispatchRoute(app: Hono, deps: DispatchRouteDeps): void {
   const inFlightDispatches = new Map<string, InFlightDispatch>()
 
   registerOperatorRoute(app, 'POST', '/operator/dispatch', async c => {
-    const nowMs = deps.now()
     const authCtx = getOperatorAuthContext(c)
     if (authCtx === undefined) {
       deps.logger.warn({gate: 'no-auth-ctx'}, 'dispatch: denied')
@@ -125,7 +125,7 @@ export function buildDispatchRoute(app: Hono, deps: DispatchRouteDeps): void {
       return rateLimitedResponse(c)
     }
 
-    if (deps.sessionStore.get(sessionId, nowMs) === undefined) {
+    if (deps.sessionStore.get(sessionId) === undefined) {
       deps.logger.warn({githubUserId, gate: 'no-session'}, 'dispatch: denied — session missing')
       return notFoundResponse(c)
     }

@@ -44,6 +44,7 @@ import type {RunMentionDeps} from '../../execute/run.js'
 import type {RateLimiter} from '../../http/rate-limit.js'
 import type {ApprovalFrameData} from '../../operator-contract/approval-frame.js'
 import type {DenylistCache} from '../../redaction/denylist.js'
+import type {DurableSessionStore} from '../auth/session.js'
 import type {OperatorLogger} from '../server.js'
 import type {RunObservationManager} from '../sse/manager.js'
 import type {IdempotencyGuard} from './idempotency.js'
@@ -74,16 +75,6 @@ const LAUNCH_RATE_WINDOW_HR_MS = 60 * 60_000
 // ---------------------------------------------------------------------------
 
 /**
- * Minimal session store interface required by the launch route: identity only.
- */
-export interface LaunchRouteSessionStore {
-  readonly get: (
-    sessionId: string,
-    nowMs: number,
-  ) => {readonly githubUserId: number; readonly login: string} | undefined
-}
-
-/**
  * Minimal binding store interface required by the launch route.
  */
 export interface LaunchRouteBindingsLookup {
@@ -98,7 +89,7 @@ export interface LaunchRouteBindingsLookup {
 /** Dependencies for the launch route. */
 export interface LaunchRouteDeps {
   /** Session store for identity retrieval. */
-  readonly sessionStore: LaunchRouteSessionStore
+  readonly sessionStore: Pick<DurableSessionStore, 'get'>
   /** Binding store for server-owned repo resolution. */
   readonly bindingsLookup: LaunchRouteBindingsLookup
   /** Denylist cache: primed and consulted by resolveRepoAccess after the binding is found. */
@@ -176,8 +167,6 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
     createRateLimiter({limit: LAUNCH_RATE_LIMIT_PER_HR, windowMs: LAUNCH_RATE_WINDOW_HR_MS, clock: deps.now})
 
   registerOperatorRoute(app, 'POST', '/operator/runs', async c => {
-    const nowMs = deps.now()
-
     // ── Gate 1: Read authenticated context set by the guard ──────────────────
     // In production the guard always sets this; undefined is unreachable.
     // Return not-found as a safe fallback (no oracle — same shape as all denials).
@@ -199,7 +188,7 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
     }
 
     // ── Gate 3: Resolve session identity for the requester attribution ────
-    const sessionEntry = deps.sessionStore.get(sessionId, nowMs)
+    const sessionEntry = deps.sessionStore.get(sessionId)
     if (sessionEntry === undefined) {
       deps.logger.warn({githubUserId, gate: 'no-session'}, 'launch: denied — session missing')
       return notFoundResponse(c)

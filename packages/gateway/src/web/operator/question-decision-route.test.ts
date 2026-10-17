@@ -332,7 +332,7 @@ describe('POST question decision — gates and no-oracle denials', () => {
     const registry = makeRegistry()
     const effects = makeEffects()
     register(registry, effects)
-    const sessionStore = {...makeSessionStore(), get: vi.fn((_sessionId: string, _nowMs: number) => undefined)}
+    const sessionStore = {...makeSessionStore(), get: vi.fn((_sessionId: string) => undefined)}
     const deps = makeDeps(registry, {sessionStore})
 
     // #when

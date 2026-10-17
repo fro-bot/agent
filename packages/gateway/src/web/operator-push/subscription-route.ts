@@ -38,6 +38,7 @@ import type {
   OperatorPushSubscriptionMetadata,
 } from '../../operator-contract/index.js'
 import type {AuditLogger} from '../audit.js'
+import type {DurableSessionStore} from '../auth/session.js'
 import type {OperatorLogger} from '../server.js'
 import type {OperatorPushSubscriptionStore, SubscriptionMetadata} from './subscription-store.js'
 import {createRateLimiter} from '../../http/rate-limit.js'
@@ -76,18 +77,10 @@ const MAX_ACTIVE_SUBSCRIPTIONS_PER_OPERATOR = 20
 // Types
 // ---------------------------------------------------------------------------
 
-/** Minimal session store interface required by the push subscription routes. */
-export interface SubscriptionRouteSessionStore {
-  readonly get: (
-    sessionId: string,
-    nowMs: number,
-  ) => {readonly githubUserId: number; readonly login: string} | undefined
-}
-
 /** Dependencies for the push subscription routes. */
 export interface SubscriptionRouteDeps {
   /** Session store for identity resolution. */
-  readonly sessionStore: SubscriptionRouteSessionStore
+  readonly sessionStore: Pick<DurableSessionStore, 'get'>
   /** Durable subscription-record store. */
   readonly store: Pick<OperatorPushSubscriptionStore, 'subscribe' | 'unsubscribe' | 'listMetadataForOperator'>
   /** Current VAPID key version — stamped onto every subscribe call. */
@@ -158,8 +151,6 @@ export function buildSubscriptionRoutes(app: Hono, deps: SubscriptionRouteDeps):
 
   // ── POST /operator/push/subscriptions ─────────────────────────────────────
   registerOperatorRoute(app, 'POST', '/operator/push/subscriptions', async c => {
-    const nowMs = deps.now()
-
     // ── Gate 2: Read authenticated context set by the guard ────────────────
     const authCtx = getOperatorAuthContext(c)
     if (authCtx === undefined) {
@@ -176,7 +167,7 @@ export function buildSubscriptionRoutes(app: Hono, deps: SubscriptionRouteDeps):
     }
 
     // Resolve session identity — required for attribution, mirrors launch-route gate 3.
-    const sessionEntry = deps.sessionStore.get(sessionId, nowMs)
+    const sessionEntry = deps.sessionStore.get(sessionId)
     if (sessionEntry === undefined) {
       deps.logger.warn({githubUserId, gate: 'no-session'}, 'push-subscribe: denied — session missing')
       return notFoundResponse(c)

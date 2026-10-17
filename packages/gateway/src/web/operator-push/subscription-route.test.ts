@@ -45,7 +45,7 @@ function makeStore(overrides?: Partial<SubscriptionRouteDeps['store']>): Subscri
 
 function makeSessionStore(): SubscriptionRouteDeps['sessionStore'] {
   return {
-    get: vi.fn((_sessionId: string, _nowMs: number) => ({githubUserId: 1001, login: 'alice'})),
+    get: vi.fn((_sessionId: string) => ({githubUserId: 1001, login: 'alice', issuedAt: 0})),
   }
 }
 

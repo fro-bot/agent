@@ -29,12 +29,10 @@ import {buildDecisionRoute} from './decision-route.js'
 
 function makeSessionStore(overrides?: Partial<DecisionRouteDeps['sessionStore']>): DecisionRouteDeps['sessionStore'] {
   return {
-    get: vi.fn((_sessionId: string, _nowMs: number) => ({
+    get: vi.fn((_sessionId: string) => ({
       githubUserId: 1001,
       login: 'alice',
       issuedAt: 0,
-      lastAccessedAt: 0,
-      revoked: false,
     })),
     ...overrides,
   }

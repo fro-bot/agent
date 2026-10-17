@@ -43,12 +43,10 @@ vi.mock('../../execute/cancel.js', () => ({
 
 function makeSessionStore(overrides?: Partial<CancelRouteDeps['sessionStore']>): CancelRouteDeps['sessionStore'] {
   return {
-    get: vi.fn((_sessionId: string, _nowMs: number) => ({
+    get: vi.fn((_sessionId: string) => ({
       githubUserId: 1001,
       login: 'alice',
       issuedAt: 0,
-      lastAccessedAt: 0,
-      revoked: false,
     })),
     ...overrides,
   }

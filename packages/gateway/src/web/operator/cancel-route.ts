@@ -32,7 +32,7 @@ import type {RateLimiter} from '../../http/rate-limit.js'
 import type {DenylistCache} from '../../redaction/denylist.js'
 import type {BindingsLookup} from '../../redaction/surface-gate.js'
 import type {AuditLogger} from '../audit.js'
-import type {SessionReader} from '../auth/session.js'
+import type {DurableSessionStore} from '../auth/session.js'
 import type {OperatorLogger} from '../server.js'
 import {cancelRun} from '../../execute/cancel.js'
 import {createRateLimiter} from '../../http/rate-limit.js'
@@ -56,7 +56,7 @@ const CANCEL_RATE_WINDOW_MIN_MS = 60_000
 /** Dependencies for the cancel route. */
 export interface CancelRouteDeps {
   /** Session store for the actor's display login. */
-  readonly sessionStore: SessionReader
+  readonly sessionStore: Pick<DurableSessionStore, 'get'>
   /** Server-owned run index for runId → repo resolution. */
   readonly runIndex: Pick<RunIndex, 'lookup'>
   /** Denylist cache for pre-cancel redaction check. */
@@ -100,8 +100,6 @@ export function buildCancelRoute(app: Hono, deps: CancelRouteDeps): void {
     createRateLimiter({limit: CANCEL_RATE_LIMIT_PER_MIN, windowMs: CANCEL_RATE_WINDOW_MIN_MS, clock: deps.now})
 
   registerOperatorRoute(app, 'POST', '/operator/runs/:runId/cancel', async c => {
-    const nowMs = deps.now()
-
     // ── Gate 1: Read authenticated context set by the guard ──────────────────
     // In production the guard always sets this; undefined is unreachable.
     // Return not-found as a safe fallback (no oracle — same shape as all denials).
@@ -171,7 +169,7 @@ export function buildCancelRoute(app: Hono, deps: CancelRouteDeps): void {
     // shape rather than propagating to Hono as a distinguishable 500.
     try {
       // ── Gate 6: Build CancelActorContext from the operator auth context ────
-      const sessionEntry = deps.sessionStore.get(sessionId, nowMs)
+      const sessionEntry = deps.sessionStore.get(sessionId)
       if (sessionEntry === undefined) {
         deps.logger.warn({githubUserId, runId, gate: 'no-session'}, 'cancel: denied — session missing')
         emitAudit(

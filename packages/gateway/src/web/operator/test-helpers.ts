@@ -27,12 +27,10 @@ export function makeAuditLogger() {
 
 export function makeSessionStore() {
   return {
-    get: vi.fn((_sessionId: string, _nowMs: number) => ({
+    get: vi.fn((_sessionId: string) => ({
       githubUserId: 1001,
       login: 'alice',
       issuedAt: 0,
-      lastAccessedAt: 0,
-      revoked: false,
     })),
   }
 }

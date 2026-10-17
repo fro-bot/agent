@@ -39,7 +39,7 @@ import type {QuestionDecisionErrorResponse, QuestionDecisionResponse} from '../.
 import type {DenylistCache} from '../../redaction/denylist.js'
 import type {BindingsLookup} from '../../redaction/surface-gate.js'
 import type {AuditLogger, QuestionRejectedReason} from '../audit.js'
-import type {SessionReader} from '../auth/session.js'
+import type {DurableSessionStore} from '../auth/session.js'
 import type {OperatorLogger} from '../server.js'
 import {emitAudit} from '../audit.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
@@ -48,7 +48,7 @@ import {parseQuestionDecisionBody, resolveQuestionAnswers} from './question-choi
 import {resolveRepoAccess, resolveRepoFromRunIndex} from './route-helpers.js'
 
 export interface QuestionDecisionRouteDeps {
-  readonly sessionStore: SessionReader
+  readonly sessionStore: Pick<DurableSessionStore, 'get'>
   readonly runIndex: Pick<RunIndex, 'lookup'>
   readonly denylistCache: DenylistCache
   readonly bindingsLookup: BindingsLookup
@@ -85,8 +85,6 @@ function rejectedReason(outcome: Exclude<QuestionDecisionOutcome, {readonly kind
  */
 export function buildQuestionDecisionRoute(app: Hono, deps: QuestionDecisionRouteDeps): void {
   registerOperatorRoute(app, 'POST', '/operator/runs/:runId/questions/:requestId/decision', async c => {
-    const nowMs = deps.now()
-
     const authCtx = getOperatorAuthContext(c)
     if (authCtx === undefined) {
       deps.logger.warn({gate: 'no-auth-ctx'}, 'question-decision: denied')
@@ -141,7 +139,7 @@ export function buildQuestionDecisionRoute(app: Hono, deps: QuestionDecisionRout
 
     // Gates 6–9: post-authz. A throw here is denied with the same shape as an authz denial.
     try {
-      const sessionEntry = deps.sessionStore.get(sessionId, nowMs)
+      const sessionEntry = deps.sessionStore.get(sessionId)
       if (sessionEntry === undefined) {
         deps.logger.warn({githubUserId, runId, gate: 'no-session'}, 'question-decision: denied — session missing')
         return notFoundResponse(c)

@@ -5,7 +5,7 @@ import type {DispatchOutcome, DispatchWorkflow} from '../../github/dispatch.js'
 import type {RepoKey} from '../../redaction/denylist.js'
 import type {AuditLogger} from '../audit.js'
 import type {DispatchRouteDeps} from './dispatch-route.js'
-import type {LaunchRouteBindingsLookup, LaunchRouteSessionStore} from './launch-route.js'
+import type {LaunchRouteBindingsLookup} from './launch-route.js'
 import {Hono} from 'hono'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {setOperatorRouteGuard} from '../operator-route.js'
@@ -27,9 +27,9 @@ function makeBinding(overrides?: Partial<RepoBinding>): RepoBinding {
   }
 }
 
-function makeSessionStore(overrides?: Partial<LaunchRouteSessionStore>): LaunchRouteSessionStore {
+function makeSessionStore(overrides?: Partial<DispatchRouteDeps['sessionStore']>): DispatchRouteDeps['sessionStore'] {
   return {
-    get: vi.fn(() => ({githubUserId: 1001, login: 'alice'})),
+    get: vi.fn(() => ({githubUserId: 1001, login: 'alice', issuedAt: 0})),
     ...overrides,
   }
 }

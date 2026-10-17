@@ -87,8 +87,6 @@ const STUB_SESSION = {
   githubUserId: 99,
   login: 'testuser',
   issuedAt: 0,
-  lastAccessedAt: 0,
-  revoked: false,
 } as const
 
 function makeSessionStore(overrides?: Partial<RunStreamRouteDeps['sessionStore']>): RunStreamRouteDeps['sessionStore'] {
