@@ -56,7 +56,6 @@ export interface QuestionDecisionRouteDeps {
   readonly registry: Pick<QuestionRegistry, 'decide' | 'describePendingForRun' | 'isClaimed'>
   readonly auditLogger: AuditLogger
   readonly logger: OperatorLogger
-  readonly now: () => number
 }
 
 const BAD_REQUEST: QuestionDecisionErrorResponse = {error: 'bad request', reason: 'malformed', questionIndex: null}

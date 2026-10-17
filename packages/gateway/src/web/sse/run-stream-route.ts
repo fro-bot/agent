@@ -72,8 +72,6 @@ export interface RunStreamRouteDeps {
   readonly manager: RunObservationManager
   /** Structured logger. */
   readonly logger: OperatorLogger
-  /** Injectable clock. */
-  readonly now: () => number
   /**
    * Maximum concurrent SSE streams per operator (keyed on numeric githubUserId).
    * Defaults to 5 when omitted.

@@ -48,7 +48,6 @@ function makeDeps(
     registry,
     auditLogger,
     logger,
-    now: () => 0,
     ...overrides,
   } satisfies QuestionDecisionRouteDeps
 }

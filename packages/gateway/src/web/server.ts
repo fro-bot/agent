@@ -776,7 +776,6 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
     deps.allowlist !== undefined &&
     deps.auditLogger !== undefined
   ) {
-    const clock = deps.sessionDeps?.clock ?? (() => Date.now())
     buildRunStreamRoute(app, {
       sessionStore: deps.sessionStore,
       runIndex: deps.runIndex,
@@ -787,7 +786,6 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
       auditLogger: deps.auditLogger,
       manager: deps.runObservationManager,
       logger: deps.logger,
-      now: clock,
     })
   }
 
@@ -969,7 +967,6 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
     deps.allowlist !== undefined &&
     deps.auditLogger !== undefined
   ) {
-    const clock = deps.sessionDeps?.clock ?? (() => Date.now())
     buildDecisionRoute(app, {
       sessionStore: deps.sessionStore,
       runIndex: deps.runIndex,
@@ -978,7 +975,6 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
       registry: deps.approvalRegistry,
       auditLogger: deps.auditLogger,
       logger: deps.logger,
-      now: clock,
     })
   }
 
@@ -1100,7 +1096,6 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
       registry: deps.questionRegistry,
       auditLogger: deps.auditLogger,
       logger: deps.logger,
-      now: clock,
     })
     buildPendingQuestionsRoute(app, {
       runIndex: deps.runIndex,

@@ -64,8 +64,6 @@ export interface DecisionRouteDeps {
   readonly auditLogger: AuditLogger
   /** Structured logger. */
   readonly logger: OperatorLogger
-  /** Injectable clock. */
-  readonly now: () => number
 }
 
 // ---------------------------------------------------------------------------

@@ -93,7 +93,6 @@ function makeDeps(overrides?: Partial<DecisionRouteDeps>): DecisionRouteDeps {
     registry: makeRegistry(),
     auditLogger: makeAuditLogger(),
     logger: {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
-    now: () => 0,
     ...overrides,
   }
 }

@@ -156,7 +156,6 @@ function makeDeps(overrides?: Partial<RunStreamRouteDeps>): RunStreamRouteDeps {
     auditLogger: makeAuditLogger(),
     manager: makeManager(),
     logger: makeLogger(),
-    now: () => 0,
     ...overrides,
   }
 }
