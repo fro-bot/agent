@@ -80,6 +80,11 @@ export interface LockAcquisitionOptions {
   readonly confirmExpiredHolder?: ConfirmExpiredHolder
   /** Holders whose expired leases may be reclaimed without corroboration (e.g. the Action's own surface). */
   readonly reclaimableWithoutConfirmation?: (holder: LockRecord) => boolean
+  /**
+   * Holders whose UNEXPIRED lease may be replaced because the caller knows they can no longer write (e.g. an earlier
+   * attempt of the same workflow run). The takeover still uses the observed ETag, so a racing renewal wins.
+   */
+  readonly reclaimableBeforeExpiry?: (holder: LockRecord) => boolean
 }
 
 /** Logger for lock operations that emit audit events (`info`) alongside diagnostics (`debug`). */

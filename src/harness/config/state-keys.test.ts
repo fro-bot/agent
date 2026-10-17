@@ -28,6 +28,10 @@ describe('state-keys', () => {
       expect(STATE_KEYS.CLEANUP_METADATA_WRITTEN).toBe('cleanupMetadataWritten')
     })
 
+    it('contains lockHolderId key', () => {
+      expect(STATE_KEYS.LOCK_HOLDER_ID).toBe('lockHolderId')
+    })
+
     it('contains object store config state keys', () => {
       expect(STATE_KEYS.S3_ENABLED).toBe('storeConfig.enabled')
       expect(STATE_KEYS.S3_BUCKET).toBe('storeConfig.bucket')
@@ -41,7 +45,7 @@ describe('state-keys', () => {
     })
 
     it('has correct number of keys', () => {
-      expect(Object.keys(STATE_KEYS)).toHaveLength(15)
+      expect(Object.keys(STATE_KEYS)).toHaveLength(16)
     })
 
     it('values are string type compatible', () => {

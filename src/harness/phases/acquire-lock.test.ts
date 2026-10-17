@@ -1,12 +1,17 @@
 import type {LockAcquisitionResult, LockRecord, ObjectStoreConfig} from '@fro-bot/runtime'
+import * as core from '@actions/core'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {err, ok} from '../../shared/types.js'
-import {parseActionHolderRunId, runAcquireLock} from './acquire-lock.js'
+import {STATE_KEYS} from '../config/state-keys.js'
+import {parseActionHolderRunId, releaseActionLockIfHeld, runAcquireLock} from './acquire-lock.js'
 
 const acquireLockMock = vi.hoisted(() => vi.fn())
 const createS3AdapterMock = vi.hoisted(() => vi.fn(() => ({})))
 const renewLeaseMock = vi.hoisted(() => vi.fn())
+const releaseLockIfHolderMock = vi.hoisted(() => vi.fn())
+
+vi.mock('@actions/core', () => ({saveState: vi.fn()}))
 
 vi.mock('@fro-bot/runtime', async () => {
   const actual = await vi.importActual<typeof import('@fro-bot/runtime')>('@fro-bot/runtime')
@@ -15,6 +20,7 @@ vi.mock('@fro-bot/runtime', async () => {
     acquireLock: acquireLockMock,
     createS3Adapter: createS3AdapterMock,
     renewLease: renewLeaseMock,
+    releaseLockIfHolder: releaseLockIfHolderMock,
   }
 })
 
@@ -126,8 +132,13 @@ describe('runAcquireLock', () => {
       'github',
       '99999',
       expect.any(Object),
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- vitest asymmetric matcher typing
-      {scope: 'action', reclaimableWithoutConfirmation: expect.any(Function)},
+      /* eslint-disable @typescript-eslint/no-unsafe-assignment -- vitest asymmetric matcher typing */
+      {
+        scope: 'action',
+        reclaimableWithoutConfirmation: expect.any(Function),
+        reclaimableBeforeExpiry: expect.any(Function),
+      },
+      /* eslint-enable @typescript-eslint/no-unsafe-assignment */
     )
   })
 
@@ -704,5 +715,126 @@ describe('parseActionHolderRunId', () => {
     // #when parsed
     // #then only well-formed Action ids with a numeric run id yield a run id
     expect(parseActionHolderRunId(holderId)).toBe(expected)
+  })
+})
+
+async function predicateFor(runId: string, runAttempt: number): Promise<(holder: LockRecord) => boolean> {
+  const result = await runAcquireLock({
+    storeConfig: createStoreConfig(),
+    repo: 'fro-bot/agent',
+    runId,
+    runAttempt,
+    logger: createMockLogger(),
+  })
+  if (result.outcome === 'acquired') await result.renewal.stop()
+  const options = acquireLockMock.mock.calls[0]?.[6] as {reclaimableBeforeExpiry: (holder: LockRecord) => boolean}
+  return options.reclaimableBeforeExpiry
+}
+
+describe('runAcquireLock same-run takeover predicate', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    renewLeaseMock.mockResolvedValue(ok({etag: '"etag-renewed"'}))
+    acquireLockMock.mockResolvedValue(lockOk({acquired: true, outcome: 'acquired', etag: '"etag"', holder: null}))
+  })
+
+  it.each([
+    ['an earlier attempt of the same run', 'action:1234:1', 'github', 3, true],
+    ['the immediately preceding attempt', 'action:1234:2', 'github', 3, true],
+    ['the same attempt', 'action:1234:3', 'github', 3, false],
+    ['a later attempt', 'action:1234:4', 'github', 3, false],
+    ['a different run', 'action:9999:1', 'github', 3, false],
+    ['an unparseable holder', 'action:1234:abc', 'github', 3, false],
+    ['a zero attempt', 'action:1234:0', 'github', 3, false],
+    ['a gateway holder id', 'gateway:instance-1:run-99', 'github', 3, false],
+    ['an Action-shaped id on a non-github surface', 'action:1234:1', 'discord', 3, false],
+  ] as const)('%s → %s', async (_label, holderId, surface, attempt, expected) => {
+    // #given the current invocation is attempt 3 of run 1234
+    const reclaimable = await predicateFor('1234', attempt)
+
+    // #when the predicate sees the existing holder
+    const result = reclaimable(createLockRecord({holder_id: holderId, surface}))
+
+    // #then only a strictly earlier attempt of the same run on the github surface is reclaimable
+    expect(result).toBe(expected)
+  })
+})
+
+describe('runAcquireLock holder state handoff', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    renewLeaseMock.mockResolvedValue(ok({etag: '"etag-renewed"'}))
+  })
+
+  it('records the holder id for the post hook once the lock is acquired', async () => {
+    // #given
+    acquireLockMock.mockResolvedValue(lockOk({acquired: true, outcome: 'acquired', etag: '"etag"', holder: null}))
+
+    // #when
+    const result = await runAcquireLock({
+      storeConfig: createStoreConfig(),
+      repo: 'fro-bot/agent',
+      runId: '1234',
+      runAttempt: 2,
+      logger: createMockLogger(),
+    })
+    if (result.outcome === 'acquired') await result.renewal.stop()
+
+    // #then
+    expect(core.saveState).toHaveBeenCalledWith(STATE_KEYS.LOCK_HOLDER_ID, 'action:1234:2')
+  })
+
+  it.each([
+    [
+      'held by another',
+      lockOk({acquired: false, outcome: 'active-holder', etag: null, holder: createLockRecord()}),
+      createStoreConfig(),
+    ],
+    ['an acquisition error', lockErr(new Error('boom')), createStoreConfig()],
+    ['S3 disabled', lockErr(new Error('unused')), createStoreConfig({enabled: false})],
+  ])('records nothing when %s', async (_label, acquireResult, storeConfig) => {
+    // #given
+    acquireLockMock.mockResolvedValue(acquireResult)
+
+    // #when
+    await runAcquireLock({
+      storeConfig,
+      repo: 'fro-bot/agent',
+      runId: '1234',
+      runAttempt: 2,
+      logger: createMockLogger(),
+    })
+
+    // #then
+    expect(core.saveState).not.toHaveBeenCalled()
+  })
+})
+
+describe('releaseActionLockIfHeld', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('releases on the Action scope by holder id', async () => {
+    // #given
+    releaseLockIfHolderMock.mockResolvedValue(ok('released'))
+
+    // #when
+    const result = await releaseActionLockIfHeld({
+      storeConfig: createStoreConfig(),
+      repo: 'fro-bot/agent',
+      holderId: 'action:1234:1',
+      logger: createMockLogger(),
+    })
+
+    // #then
+    expect(result).toEqual(ok('released'))
+    expect(releaseLockIfHolderMock).toHaveBeenCalledWith(
+      expect.objectContaining({lockTtlSeconds: 900}),
+      'fro-bot/agent',
+      'action:1234:1',
+      expect.any(Object),
+      'action',
+    )
   })
 })

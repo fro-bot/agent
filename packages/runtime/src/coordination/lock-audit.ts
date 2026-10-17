@@ -29,7 +29,8 @@ export type HolderRunEvidence =
     }
   | {readonly kind: 'unknown'; readonly reason: string}
 
-export type ConfirmationSource = RepoQuiescence['source'] | 'holder-surface-reclaimable' | 'no-corroborator'
+export type ConfirmationSource =
+  RepoQuiescence['source'] | 'holder-surface-reclaimable' | 'holder-superseded' | 'no-corroborator'
 
 export interface TakeoverAuditContext {
   readonly operation: TakeoverOperation

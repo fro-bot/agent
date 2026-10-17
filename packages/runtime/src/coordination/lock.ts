@@ -184,12 +184,15 @@ export async function acquireLock(
   }
 
   const observedAt = new Date()
-  if (isStale(holder.data, observedAt) === false) {
+  const expired = isStale(holder.data, observedAt)
+  const superseded = expired === false && options.reclaimableBeforeExpiry?.(holder.data) === true
+  if (expired === false && superseded === false) {
     return ok({acquired: false, outcome: 'active-holder', etag: null, holder: holder.data})
   }
 
   // Expired lease: a clock fact, not proof the holder stopped writing. Replace it only with corroboration
   // (or when the holder's surface is explicitly reclaimable); the ETag observed here is the only one ever used.
+  // A superseded lease is replaced immediately, under the same ETag precondition.
   const observedEtag = existing.data.etag
   const auditContext: TakeoverAuditContext = {
     operation: 'acquire',
@@ -204,7 +207,9 @@ export async function acquireLock(
 
   let source: ConfirmationSource
   let quiescence: RepoQuiescence | null = null
-  if (options.reclaimableWithoutConfirmation?.(holder.data) === true) {
+  if (superseded === true) {
+    source = 'holder-superseded'
+  } else if (options.reclaimableWithoutConfirmation?.(holder.data) === true) {
     source = 'holder-surface-reclaimable'
   } else if (options.confirmExpiredHolder === undefined) {
     source = 'no-corroborator'
@@ -265,6 +270,61 @@ export async function releaseLock(
 
   logger.debug('Releasing lock', {key: key.data, repo})
   return conditionalDelete.data(key.data, {ifMatch: etag})
+}
+
+/** Outcome of `releaseLockIfHolder`; only `released` deleted anything. */
+export type ReleaseIfHolderOutcome = 'released' | 'no-lock' | 'not-holder' | 'conflict'
+
+/**
+ * Deletes the lock only while its stored `holder_id` is `holderId`. Reads the lock, checks the holder, then deletes
+ * `If-Match` on the ETag it read, so a successor that replaces the lock in between survives (`conflict`).
+ */
+export async function releaseLockIfHolder(
+  config: CoordinationConfig,
+  repo: string,
+  holderId: string,
+  logger: {debug: (message: string, context?: Record<string, unknown>) => void},
+  scope: LockScope = 'repo',
+): Promise<Result<ReleaseIfHolderOutcome, Error>> {
+  const key = getLockKey(config, repo, scope)
+  if (key.success === false) {
+    return err(key.error)
+  }
+
+  const getObject = resolveGetObject(config)
+  if (getObject.success === false) {
+    return err(getObject.error)
+  }
+
+  const conditionalDelete = resolveConditionalDelete(config)
+  if (conditionalDelete.success === false) {
+    return err(conditionalDelete.error)
+  }
+
+  const fetched = await getObject.data(key.data)
+  if (fetched.success === false) {
+    return isNotFound(fetched.error) === true ? ok('no-lock') : err(fetched.error)
+  }
+
+  const record = parseLockRecord(fetched.data.data)
+  if (record.success === false) {
+    return err(record.error)
+  }
+
+  if (record.data.holder_id !== holderId) {
+    logger.debug('Lock held by another holder; not releasing', {key: key.data, repo, heldBy: record.data.holder_id})
+    return ok('not-holder')
+  }
+
+  logger.debug('Releasing lock held by this holder', {key: key.data, repo, holderId})
+  const deleted = await conditionalDelete.data(key.data, {ifMatch: fetched.data.etag})
+  if (deleted.success === true) {
+    return ok('released')
+  }
+  if (isPreconditionFailed(deleted.error) === true) {
+    return ok('conflict')
+  }
+  return isNotFound(deleted.error) === true ? ok('no-lock') : err(deleted.error)
 }
 
 export async function renewLease(

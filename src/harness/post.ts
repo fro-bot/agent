@@ -21,6 +21,7 @@ import {
 import {toErrorMessage} from '../shared/errors.js'
 import {createLogger} from '../shared/logger.js'
 import {STATE_KEYS} from './config/state-keys.js'
+import {releaseActionLockIfHeld} from './phases/acquire-lock.js'
 
 export interface PostOptions {
   logger?: Logger
@@ -64,9 +65,48 @@ function reconstructStoreConfigFromState(): ObjectStoreConfig | undefined {
   }
 }
 
+/**
+ * Frees the Action lock when the main step died holding it (cancelled or killed before cleanup's release). The main
+ * step records its holder id on acquisition and clears it after a successful release, so no record means nothing to
+ * do. The delete is conditional on the stored holder, so a successor's lock is never touched. Never throws.
+ */
+async function releaseOrphanedLock(logger: Logger): Promise<void> {
+  try {
+    const holderId = readOptionalState(STATE_KEYS.LOCK_HOLDER_ID)
+    if (holderId == null) return
+
+    const storeConfig = reconstructStoreConfigFromState()
+    if (storeConfig?.enabled !== true) return
+
+    const repo = getGitHubRepository()
+    const released = await releaseActionLockIfHeld({
+      storeConfig,
+      repo,
+      holderId,
+      logger: createLogger({phase: 'post-lock-release'}),
+    })
+    if (released.success === false) {
+      logger.warning('Post-action lock release failed (non-fatal)', {error: released.error.message, repo, holderId})
+      return
+    }
+    logger.info('Post-action lock release', {outcome: released.data, repo, holderId})
+  } catch (error) {
+    logger.warning('Post-action lock release threw (non-fatal)', {error: toErrorMessage(error)})
+  }
+}
+
 export async function runPost(options: PostOptions = {}): Promise<void> {
   const logger = options.logger ?? createLogger({phase: 'post'})
 
+  // Release runs last so it cannot free the lock before the cache save and session sync it protects have finished.
+  try {
+    await persistRunState(logger)
+  } finally {
+    await releaseOrphanedLock(logger)
+  }
+}
+
+async function persistRunState(logger: Logger): Promise<void> {
   const shouldSaveCache = core.getState(STATE_KEYS.SHOULD_SAVE_CACHE)
   // parseCacheSaveStateValue treats an absent key (main step crashed before cleanup ran)
   // or an unrecognized value (e.g. 'true' from an older action version, or corrupted

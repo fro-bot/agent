@@ -1,5 +1,13 @@
-import type {CoordinationConfig, LockRecord, LockScope, ObjectStoreConfig} from '@fro-bot/runtime'
+import type {
+  CoordinationConfig,
+  LockRecord,
+  LockScope,
+  ObjectStoreConfig,
+  ReleaseIfHolderOutcome,
+} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
+import type {Result} from '../../shared/types.js'
+import * as core from '@actions/core'
 import {
   acquireLock,
   createS3Adapter,
@@ -7,9 +15,11 @@ import {
   DEFAULT_LOCK_TTL_SECONDS,
   DEFAULT_PENDING_STALE_THRESHOLD_MS,
   DEFAULT_STALE_THRESHOLD_MS,
+  releaseLockIfHolder,
   renewLease,
 } from '@fro-bot/runtime'
 import {createLogger} from '../../shared/logger.js'
+import {STATE_KEYS} from '../config/state-keys.js'
 
 /**
  * The Action's lock object (`.../locks/action.json`), distinct from the gateway's `repo.json`.
@@ -257,13 +267,67 @@ function isActionHolderId(holderId: string): boolean {
 }
 
 /**
- * Extracts the workflow run id from an Action holder id, or `null` for anything that is not a well-formed
- * `action:{numeric runId}:{attempt}` id. The holder id comes from S3, so callers must not trust other shapes.
+ * Splits an Action holder id into its run id and attempt, or `null` for anything that is not a well-formed
+ * `action:{numeric runId}:{attempt >= 1}` id. The holder id comes from S3, so callers must not trust other shapes.
  */
+function parseActionHolderId(holderId: string): {readonly runId: string; readonly attempt: number} | null {
+  if (isActionHolderId(holderId) === false) return null
+  const [, runId, attemptText] = holderId.split(':')
+  const attempt = Number(attemptText)
+  if (runId == null || Number.isSafeInteger(attempt) === false || attempt < 1) return null
+  return {runId, attempt}
+}
+
+/** Extracts the workflow run id from an Action holder id; `null` for any other shape. */
 export function parseActionHolderRunId(holderId: string): string | null {
   if (isActionHolderId(holderId) === false) return null
   const runId = holderId.split(':')[1]
   return runId ?? null
+}
+
+/**
+ * True for a GitHub-surface Action holder that is a strictly earlier attempt of this run. GitHub starts a re-run
+ * only after the previous attempt finished, post steps included, so such a holder has no live writer.
+ */
+function isEarlierAttemptOfRun(holder: LockRecord, runId: string, runAttempt: number): boolean {
+  if (holder.surface !== 'github') return false
+  const parsed = parseActionHolderId(holder.holder_id)
+  return parsed != null && parsed.runId === runId && parsed.attempt < runAttempt
+}
+
+function createActionCoordinationConfig(storeConfig: ObjectStoreConfig, logger: Logger): CoordinationConfig {
+  return {
+    storeAdapter: createS3Adapter(storeConfig, logger),
+    storeConfig,
+    lockTtlSeconds: DEFAULT_LOCK_TTL_SECONDS,
+    heartbeatIntervalMs: DEFAULT_HEARTBEAT_INTERVAL_MS,
+    staleThresholdMs: DEFAULT_STALE_THRESHOLD_MS,
+    pendingStaleThresholdMs: DEFAULT_PENDING_STALE_THRESHOLD_MS,
+  }
+}
+
+export interface ReleaseActionLockOptions {
+  readonly storeConfig: ObjectStoreConfig
+  readonly repo: string
+  readonly holderId: string
+  readonly logger: Logger
+}
+
+/**
+ * Deletes the Action lock only while it is still held by `holderId`. Used by the post hook to free a lock whose
+ * main step died before cleanup's release; never touches a successor's lock.
+ */
+export async function releaseActionLockIfHeld(
+  options: ReleaseActionLockOptions,
+): Promise<Result<ReleaseIfHolderOutcome, Error>> {
+  const {storeConfig, repo, holderId, logger} = options
+  return releaseLockIfHolder(
+    createActionCoordinationConfig(storeConfig, logger),
+    repo,
+    holderId,
+    logger,
+    ACTION_LOCK_SCOPE,
+  )
 }
 
 /**
@@ -330,19 +394,14 @@ export async function runAcquireLock(options: AcquireLockPhaseOptions): Promise<
   let config: CoordinationConfig
   let result: Awaited<ReturnType<typeof acquireLock>>
   try {
-    config = {
-      storeAdapter: createS3Adapter(storeConfig, logger),
-      storeConfig,
-      lockTtlSeconds: DEFAULT_LOCK_TTL_SECONDS,
-      heartbeatIntervalMs: DEFAULT_HEARTBEAT_INTERVAL_MS,
-      staleThresholdMs: DEFAULT_STALE_THRESHOLD_MS,
-      pendingStaleThresholdMs: DEFAULT_PENDING_STALE_THRESHOLD_MS,
-    }
+    config = createActionCoordinationConfig(storeConfig, logger)
     // A killed runner's expired lease must not wedge the repo: reclaim expired Action leases (surface + Action holder
-    // id) without corroboration. Anything else on this key is skipped.
+    // id) without corroboration. A lease held by an earlier attempt of this run is reclaimed before expiry. Anything
+    // else on this key is skipped.
     result = await acquireLock(config, repo, holderId, 'github', runId, logger, {
       scope: ACTION_LOCK_SCOPE,
       reclaimableWithoutConfirmation: holder => holder.surface === 'github' && isActionHolderId(holder.holder_id),
+      reclaimableBeforeExpiry: holder => isEarlierAttemptOfRun(holder, runId, runAttempt),
     })
   } catch (error_) {
     // A thrown adapter/acquire error must reach run.ts's fail-closed `error` path, not escape as a generic crash.
@@ -358,6 +417,8 @@ export async function runAcquireLock(options: AcquireLockPhaseOptions): Promise<
 
   if (result.data.acquired === true) {
     logger.info('Lock acquired', {repo, holderId, etag: result.data.etag})
+    // Lets the post hook free the lock if this process dies before cleanup releases it.
+    core.saveState(STATE_KEYS.LOCK_HOLDER_ID, holderId)
     const renewal = createLeaseController(config, repo, holderId, runId, result.data.etag, logger)
     return {outcome: 'acquired', lockEtag: result.data.etag, renewal}
   }
