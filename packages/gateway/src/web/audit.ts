@@ -310,7 +310,7 @@ export interface SessionRestoreCounts {
   readonly expired: number
   readonly revoked: number
   readonly notAllowlisted: number
-  readonly macFailed: number
+  readonly unsigned: number
   readonly futureDated: number
   readonly overCap: number
   readonly readFailed: number

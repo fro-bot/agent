@@ -23,15 +23,15 @@
  *   1 — one or more expected routes are absent (names the missing routes)
  */
 
-import {Buffer} from 'node:buffer'
+import type {ObjectStoreAdapter} from '@fro-bot/runtime'
 
-import {ok} from '@fro-bot/runtime'
+import {Buffer} from 'node:buffer'
+import {err, ok} from '@fro-bot/runtime'
 import {Effect} from 'effect'
 import {buildOperatorServerInputs} from '../program.js'
 import {loadAllowlistFromText} from './auth/allowlist.js'
 import {createSessionPersistence, deriveSessionRecordKey} from './auth/session-persistence.js'
 import {createDurableSessionStore, DURABLE_SESSION_TTL_MS} from './auth/session.js'
-import {createTestObjectStore} from './auth/test-object-store.js'
 import {makeTrustedProxyIngressPolicy} from './ingress/policy.js'
 import {parseTrustedProxyAddress} from './ingress/trusted-proxy-address.js'
 import {buildOperatorApp} from './server.js'
@@ -80,9 +80,22 @@ function makeNoopLogger() {
   }
 }
 
+/** An adapter that holds nothing: lists are empty, reads miss, writes fail. The smoke never loads the store. */
+function makeEmptyObjectStoreAdapter(): ObjectStoreAdapter {
+  const unsupported = async () => err(new Error('smoke stub: no object store'))
+  return {
+    upload: unsupported,
+    download: unsupported,
+    list: async () => ok([]),
+    getObject: unsupported,
+    conditionalPut: unsupported,
+    conditionalDelete: unsupported,
+  }
+}
+
 /**
- * The real durable session store over the shared in-memory object-store fake. It is never loaded: the route
- * inventory only checks that the dependency is present, and no request is served.
+ * The real durable session store over an empty stub adapter. It is never loaded: the route inventory only
+ * checks that the dependency is present, and no request is served.
  */
 function makeStubSessionStore(
   logger: ReturnType<typeof makeNoopLogger>,
@@ -92,7 +105,7 @@ function makeStubSessionStore(
   const clock = () => Date.now()
   return createDurableSessionStore({
     persistence: createSessionPersistence({
-      adapter: createTestObjectStore().adapter,
+      adapter: makeEmptyObjectStoreAdapter(),
       logger,
       clock,
       macKey: deriveSessionRecordKey(Buffer.from(csrfSecret, 'base64url')),

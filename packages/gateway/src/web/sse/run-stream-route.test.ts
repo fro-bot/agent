@@ -1304,6 +1304,68 @@ describe('GET /operator/runs/:runId/stream — lease: binding removed mid-stream
   })
 })
 
+describe('GET /operator/runs/:runId/stream — lease: bounded repo-access read', () => {
+  it('closes the stream when a lease-tick binding read never settles within the timeout', async () => {
+    // #given — the gate read succeeds, then every later binding read hangs
+    let reads = 0
+    const bindingsLookup: BindingsLookup = {
+      getBindingByRepo: vi.fn(async () => {
+        reads++
+        if (reads === 1) return BOUND
+        return new Promise<never>(() => undefined)
+      }),
+    }
+    const stream = await openLeasedStream({bindingsLookup, leaseRepoAccessTimeoutMs: 20})
+
+    // #when — a tick starts a read that never answers
+    await stream.fakeTimer.tick()
+    expect(stream.unsubscribeCalls()).toBe(0)
+    await new Promise<void>(resolve => setTimeout(resolve, 60))
+
+    // #then — the timeout counts as unavailable and closes the stream
+    expect(stream.unsubscribeCalls()).toBe(1)
+    expect(vi.mocked(stream.logger.warn).mock.calls.map(call => call[0])).toEqual([
+      {githubUserId: 99, gate: 'repo-unavailable'},
+    ])
+    await stream.res.body?.cancel()
+  })
+
+  it('does not start a second check while the previous one is still in flight', async () => {
+    // #given — a lease-tick read that stays pending until the test releases it
+    let release!: (value: typeof BOUND) => void
+    const pending = new Promise<typeof BOUND>(resolve => {
+      release = resolve
+    })
+    let reads = 0
+    const bindingsLookup: BindingsLookup = {
+      getBindingByRepo: vi.fn(async () => {
+        reads++
+        return reads === 2 ? pending : BOUND
+      }),
+    }
+    const stream = await openLeasedStream({bindingsLookup, leaseRepoAccessTimeoutMs: 60_000})
+    expect(reads).toBe(1) // the gate
+
+    // #when — three ticks fire while the first check is pending
+    await stream.fakeTimer.tick()
+    await stream.fakeTimer.tick()
+    await stream.fakeTimer.tick()
+
+    // #then — only the first tick read the binding
+    expect(reads).toBe(2)
+
+    // #when — the pending read answers and a later tick fires
+    release(BOUND)
+    await new Promise<void>(resolve => setTimeout(resolve, 0))
+    await stream.fakeTimer.tick()
+
+    // #then — checks resume, and the stream is still open
+    expect(reads).toBe(3)
+    expect(stream.unsubscribeCalls()).toBe(0)
+    await stream.res.body?.cancel()
+  })
+})
+
 describe('GET /operator/runs/:runId/stream — lease: operator removed from the allowlist mid-stream', () => {
   it('closes the stream on the next tick and emits exactly one authz.denied (not_allowlisted)', async () => {
     // #given — allowlisted at open; removed before the tick

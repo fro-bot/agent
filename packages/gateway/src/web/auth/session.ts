@@ -112,35 +112,37 @@ export interface SessionRestoreFailure {
 
 export interface DurableSessionStore {
   /** Mints a new session ID, writes the signed record, then inserts it in memory. Never reuses an ID. */
-  create: (identity: SessionIdentity) => Promise<DurableCreateResult>
+  readonly create: (identity: SessionIdentity) => Promise<DurableCreateResult>
   /** Map-only. A miss makes no object-store call. Undefined for unknown, revoked or expired IDs. */
-  get: (sessionId: string) => DurableSession | undefined
+  readonly get: (sessionId: string) => DurableSession | undefined
   /**
    * Durable-first revoke. The object-store write happens before the in-memory revoke and the hook, so a
    * failed write reports `persist_failed` and leaves the session valid. Repeat revokes succeed without a
    * second hook. An ID that is not in memory is revoked by hash and fires no hook.
    */
-  revoke: (sessionId: string, options?: DurableRevokeOptions) => Promise<DurableRevokeResult>
+  readonly revoke: (sessionId: string, options?: DurableRevokeOptions) => Promise<DurableRevokeResult>
   /**
-   * Startup load: self-test, signed load, load policy, then push replay. Any failure leaves the store
-   * not ready, so `create` reports `not_ready` and no restored ID is accepted.
+   * Startup load: self-test, signed load, load policy, then push replay. A self-test or list failure, or a
+   * load past its deadline, leaves the store not ready: `create` reports `not_ready` and no restored ID is
+   * accepted. A single record whose read fails twice is counted as `readFailed` and dropped, and the load
+   * still completes.
    */
-  load: () => Promise<Result<SessionRestoreSummary, SessionRestoreFailure>>
+  readonly load: () => Promise<Result<SessionRestoreSummary, SessionRestoreFailure>>
   /** Removes expired and revoked entries from memory. Never touches the object store and fires no hook. */
-  scavenge: () => number
+  readonly scavenge: () => number
   /** Deletes stored records past the retention bound. Delegates to the persistence sweep. */
-  sweep: SessionPersistence['sweep']
+  readonly sweep: SessionPersistence['sweep']
   /** Entries in memory, including revoked and expired ones not yet scavenged. */
-  size: () => number
+  readonly size: () => number
   /** True once `load` has succeeded. */
-  isReady: () => boolean
+  readonly isReady: () => boolean
 }
 
 /** Dependencies for session-related routes (injectable for testing). */
 export interface SessionDeps {
   readonly logger: SessionLogger
   readonly auditLogger: AuditLogger
-  /** Injectable clock for TTL checks. Defaults to Date.now. */
+  /** Injectable clock for CSRF intervals and route time checks. The durable store reads its own clock. */
   readonly clock: () => number
   /**
    * Shared rate limiter for the logout route.
@@ -186,7 +188,7 @@ export interface DurableSessionStoreDeps {
   /**
    * Fires once per revocation with the user's ID, including for restored sessions. It does not fire for
    * rotation, TTL expiry or an ID that is not in memory. Load replays it once per user whose revoked record
-   * is stored and who has no live restored session. It must be idempotent.
+   * is stored, until `revokedAt` plus the TTL, and who has no live restored session. It must be idempotent.
    */
   readonly onSessionRevoked?: (githubUserId: number) => void
   /** Live-session cap. Defaults to {@link SESSION_MAX_ENTRIES}. */
@@ -433,16 +435,19 @@ export function createDurableSessionStore(deps: DurableSessionStoreDeps): Durabl
 
     const restoreCounts: SessionRestoreCounts = {
       loaded: kept.length,
-      expired: counts.tooOld,
+      expired: counts.expired,
       revoked: storedRevoked,
       notAllowlisted,
-      macFailed: counts.macFailed,
+      unsigned: counts.unsigned,
       futureDated: counts.futureDated,
       overCap: overCap.length,
       readFailed: counts.readFailed,
     }
     const summary: SessionRestoreSummary = {...restoreCounts, replayedUsers, revokeFailed: failedRevokes.size}
-    logger.info({...summary, rotated, malformed: counts.malformed}, 'session restore finished')
+    logger.info(
+      {...summary, rotated, malformed: counts.malformed, unrecognized: counts.unrecognized},
+      'session restore finished',
+    )
     emitAudit(
       {
         kind: 'auth.session.restore',

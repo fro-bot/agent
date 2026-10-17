@@ -125,6 +125,7 @@ function plantRecord(
     readonly issuedAt?: number
     readonly status?: SessionRecordStatus
     readonly githubUserId?: number
+    readonly revokedAt?: number
     readonly macKey?: Uint8Array
   } = {},
 ): void {
@@ -134,6 +135,7 @@ function plantRecord(
     login: LOGIN,
     issuedAt: fields.issuedAt ?? NOW,
     status: fields.status ?? 'active',
+    ...(fields.revokedAt === undefined ? {} : {revokedAt: fields.revokedAt}),
   })
   harness.store.seed(buildSessionKey(keyHash), JSON.stringify(record))
 }
@@ -536,7 +538,7 @@ describe('load policy', () => {
       expired: 1,
       revoked: 1,
       notAllowlisted: 1,
-      macFailed: 1,
+      unsigned: 1,
       futureDated: 1,
       overCap: 0,
       readFailed: 0,
@@ -602,7 +604,7 @@ describe('load policy', () => {
     const loaded = await harness.session.load()
 
     // #then it is rejected and the ID is not accepted
-    expect(loaded.success && loaded.data).toMatchObject({loaded: 0, macFailed: 1})
+    expect(loaded.success && loaded.data).toMatchObject({loaded: 0, unsigned: 1})
     expect(harness.session.get(attackerId)).toBeUndefined()
   })
 
@@ -786,6 +788,55 @@ describe('push replay', () => {
     expect(deactivations).toEqual([false, true])
     expect(activeAfterLogout.success && activeAfterLogout.data).toHaveLength(1)
     expect(activeAfterRestart.success && activeAfterRestart.data).toHaveLength(0)
+  })
+
+  it('replays a late-session logout after issuedAt plus 7 days but not after revokedAt plus 7 days', async () => {
+    // #given a session logged out on day 6, whose deactivation (the hook) ran once and is assumed to have failed
+    const store = createTestObjectStore()
+    const clock = {now: NOW}
+    const a = await createReadyHarness({store, clock})
+    const sessionId = await createSession(a)
+    clock.now = NOW + 6 * DAY_MS
+    await a.session.revoke(sessionId)
+    expect(a.hook).toHaveBeenCalledTimes(1)
+
+    // #when the gateway restarts after the session's own 7 days, but within 7 days of the logout
+    clock.now = NOW + 7 * DAY_MS + 1000
+    const within = createHarness({store, clock})
+    const loadedWithin = await within.session.load()
+
+    // #then the deactivation is replayed even though the login lifetime has ended
+    expect(loadedWithin.success && loadedWithin.data.replayedUsers).toBe(1)
+    expect(within.hook.mock.calls).toEqual([[OPERATOR_ID]])
+    expect(within.session.get(sessionId)).toBeUndefined()
+
+    // #when the gateway restarts after revokedAt plus 7 days
+    clock.now = NOW + 6 * DAY_MS + TTL_MS + 1000
+    const after = createHarness({store, clock})
+    const loadedAfter = await after.session.load()
+
+    // #then the record is expired and nothing is replayed
+    expect(loadedAfter.success && loadedAfter.data.replayedUsers).toBe(0)
+    expect(after.hook).not.toHaveBeenCalled()
+  })
+
+  it('stamps revokedAt on a rotation and still skips it at replay', async () => {
+    // #given a session rotated late in its life
+    const store = createTestObjectStore()
+    const clock = {now: NOW}
+    const a = await createReadyHarness({store, clock})
+    const sessionId = await createSession(a)
+    clock.now = NOW + 6 * DAY_MS
+    await a.session.revoke(sessionId, {rotate: true})
+
+    // #when the gateway restarts past the session's own expiry
+    clock.now = NOW + 7 * DAY_MS + 1000
+    const b = createHarness({store, clock})
+    const loaded = await b.session.load()
+
+    // #then the rotated record is kept for the window but never replayed
+    expect(loaded.success && loaded.data.replayedUsers).toBe(0)
+    expect(b.hook).not.toHaveBeenCalled()
   })
 
   it('skips rotated records', async () => {

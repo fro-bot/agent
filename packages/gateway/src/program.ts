@@ -82,6 +82,9 @@ import {ensureWorkspaceClone} from './workspace-api/ensure-clone.js'
 /** One hourly tick scavenges the session map and sweeps stored records: retention is the TTL plus this interval. */
 const SESSION_MAINTENANCE_INTERVAL_MS = 60 * 60_000
 
+/** The one clock for the session store, its persistence and the operator server's guard and routes. */
+const operatorWebClock = (): number => Date.now()
+
 // ---------------------------------------------------------------------------
 // Pure helper — builds the coordination config from the shared S3 adapter and
 // gateway config. Extracted to avoid repeating the 5-field literal at every
@@ -296,7 +299,7 @@ export function buildOperatorServerInputs(inputs: BuildOperatorServerInputs): {
   const sessionDeps = {
     logger,
     auditLogger: logger,
-    clock: () => Date.now(),
+    clock: operatorWebClock,
   }
 
   // Build production GitHub OAuth deps with real CSPRNG, fetch, and clock.
@@ -999,11 +1002,11 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
         persistence: createSessionPersistence({
           adapter: s3Adapter,
           logger,
-          clock: () => Date.now(),
+          clock: operatorWebClock,
           macKey: deriveSessionRecordKey(Buffer.from(config.operatorWeb.csrfSecret, 'base64url')),
           absoluteTtlMs: DURABLE_SESSION_TTL_MS,
         }),
-        clock: () => Date.now(),
+        clock: operatorWebClock,
         logger,
         auditLogger: logger,
         allowlist: config.operatorWeb.allowlist,

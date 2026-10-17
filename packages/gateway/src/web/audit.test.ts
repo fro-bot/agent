@@ -1577,7 +1577,7 @@ describe('emitAudit — auth.session.restore', () => {
     expired: 2,
     revoked: 3,
     notAllowlisted: 4,
-    macFailed: 5,
+    unsigned: 5,
     futureDated: 6,
     overCap: 7,
     readFailed: 8,

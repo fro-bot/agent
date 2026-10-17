@@ -59,10 +59,12 @@ export interface SessionRecord {
   readonly login: string
   readonly issuedAt: number
   readonly status: SessionRecordStatus
+  /** When the record was revoked or rotated. Covered by the MAC. Absent on an `active` record. */
+  readonly revokedAt?: number
   readonly mac: string
 }
 
-/** A record that passed shape, MAC, future-date and age checks. `keyHash` is the hash from its object key. */
+/** A record that passed shape, MAC, future-date and retention checks. `keyHash` is the hash from its object key. */
 export interface LoadedSession {
   readonly keyHash: string
   readonly githubUserId: number
@@ -143,10 +145,15 @@ export type RevokeOutcome = 'written' | 'already' | 'absent' | 'invalid'
 export interface LoadCounts {
   readonly listed: number
   readonly loaded: number
+  /** Records past their retention: `issuedAt` plus the TTL for an active record, the later of that and `revokedAt` plus the TTL for a revoked one. */
+  readonly expired: number
+  /** Records that fail their MAC. */
+  readonly unsigned: number
+  /** Records not shaped like a record. */
   readonly malformed: number
-  readonly macFailed: number
+  /** Keys under the prefix whose name is not a key hash. */
+  readonly unrecognized: number
   readonly futureDated: number
-  readonly tooOld: number
   readonly readFailed: number
   readonly absent: number
   readonly truncated: number
@@ -159,15 +166,15 @@ export interface LoadOutcome {
 
 export interface SweepCounts {
   readonly listed: number
-  /** Records removed: past the TTL, unsigned (failed the MAC) or malformed. */
+  /** Records removed: past retention, unsigned and past the TTL by their claimed age, or malformed. */
   readonly deleted: number
   /** Deletes that lost to a concurrent write or removal (412 or 404). */
   readonly raced: number
   readonly deleteFailed: number
   readonly kept: number
-  /** Records found past the TTL. */
+  /** Signed records found past retention. */
   readonly expired: number
-  /** Records found with a failing MAC, whatever their claimed age. */
+  /** Records found with a failing MAC, whatever their claimed age. Only those past the TTL by claimed age are deleted. */
   readonly unsigned: number
   /** Records found that are not shaped like a record. */
   readonly malformed: number
@@ -188,7 +195,10 @@ export interface SessionPersistence {
   ) => Promise<Result<RevokeOutcome, SessionPersistenceError>>
   /** Lists and verifies every record. A list failure or timeout is an error, never an empty result. */
   readonly load: () => Promise<Result<LoadOutcome, SessionPersistenceError>>
-  /** Deletes records past the TTL, plus every record that fails its MAC or is malformed, whatever its age. */
+  /**
+   * Deletes records past retention and malformed records. A record that fails its MAC is deleted only when its
+   * claimed `issuedAt` is past the TTL, so a wrong-secret process cannot erase live sessions.
+   */
   readonly sweep: () => Promise<Result<SweepCounts, SessionPersistenceError>>
   /** Proves the adapter has real CAS and a working list. Run at startup before load. */
   readonly selfTest: () => Promise<Result<void, SessionPersistenceError>>
@@ -233,6 +243,7 @@ function computeMac(macKey: Uint8Array, keyHash: string, fields: RecordFields): 
     fields.login,
     fields.issuedAt,
     fields.status,
+    fields.revokedAt ?? null,
   ])
   return createHmac('sha256', macKey).update(body).digest('base64url')
 }
@@ -264,7 +275,7 @@ function parseSessionRecord(data: string): SessionRecord | null {
     return null
   }
   const candidate = parsed as Partial<Record<keyof SessionRecord, unknown>>
-  const {githubUserId, login, issuedAt, status, mac} = candidate
+  const {githubUserId, login, issuedAt, status, revokedAt, mac} = candidate
   if (
     typeof githubUserId !== 'number' ||
     Number.isSafeInteger(githubUserId) === false ||
@@ -276,12 +287,16 @@ function parseSessionRecord(data: string): SessionRecord | null {
     Number.isSafeInteger(issuedAt) === false ||
     issuedAt < 0 ||
     isRecordStatus(status) === false ||
+    (revokedAt !== undefined &&
+      (typeof revokedAt !== 'number' || Number.isSafeInteger(revokedAt) === false || revokedAt < 0)) ||
     typeof mac !== 'string' ||
     mac.length === 0
   ) {
     return null
   }
-  return {githubUserId, login, issuedAt, status, mac}
+  return revokedAt === undefined
+    ? {githubUserId, login, issuedAt, status, mac}
+    : {githubUserId, login, issuedAt, status, revokedAt, mac}
 }
 
 // ---------------------------------------------------------------------------
@@ -441,7 +456,12 @@ export function createSessionPersistence(deps: SessionPersistenceDeps): SessionP
   const scanTimeoutMs = deps.scanTimeoutMs ?? DEFAULT_SCAN_TIMEOUT_MS
   const scanMaxKeys = deps.scanMaxKeys ?? DEFAULT_SCAN_MAX_KEYS
 
-  function isExpired(issuedAt: number): boolean {
+  /** Retention end: the later of login expiry and, for a revoked record, `revokedAt` plus the TTL. */
+  function isPastRetention(record: Pick<SessionRecord, 'issuedAt' | 'revokedAt'>): boolean {
+    return clock() >= Math.max(record.issuedAt, record.revokedAt ?? record.issuedAt) + absoluteTtlMs
+  }
+
+  function isLoginExpired(issuedAt: number): boolean {
     return clock() >= issuedAt + absoluteTtlMs
   }
 
@@ -450,7 +470,12 @@ export function createSessionPersistence(deps: SessionPersistenceDeps): SessionP
   }
 
   async function readEntry(ops: SessionObjectOps, keyHash: string): Promise<ScanEntry> {
-    const fetched = await timedCall(async () => ops.getObject(buildSessionKey(keyHash)), operationTimeoutMs)
+    const read = async () => timedCall(async () => ops.getObject(buildSessionKey(keyHash)), operationTimeoutMs)
+    let fetched = await read()
+    // One retry: a transient read failure would otherwise log the operator out at restart.
+    if (fetched.success === false && fetched.error.reason !== 'not_found') {
+      fetched = await read()
+    }
     if (fetched.success === false) {
       return {keyHash, outcome: fetched.error.reason === 'not_found' ? {kind: 'absent'} : {kind: 'failed'}}
     }
@@ -577,6 +602,7 @@ export function createSessionPersistence(deps: SessionPersistenceDeps): SessionP
         login: current.login,
         issuedAt: current.issuedAt,
         status,
+        revokedAt: clock(),
       })
       const written = await timedCall(
         async () => ops.data.conditionalPut(key, JSON.stringify(next), {ifMatch: fetched.data.etag}),
@@ -618,10 +644,10 @@ export function createSessionPersistence(deps: SessionPersistenceDeps): SessionP
     }
 
     const sessions: LoadedSession[] = []
-    let malformed = scanned.data.unrecognized
-    let macFailed = 0
+    let malformed = 0
+    let unsigned = 0
     let futureDated = 0
-    let tooOld = 0
+    let expired = 0
     let readFailed = 0
     let absent = 0
     for (const {keyHash, outcome} of scanned.data.entries) {
@@ -633,12 +659,14 @@ export function createSessionPersistence(deps: SessionPersistenceDeps): SessionP
         malformed += 1
       } else if (outcome.macValid === false) {
         // The MAC is checked before any claim in the record is trusted, even to classify it.
-        macFailed += 1
+        unsigned += 1
       } else if (isFutureDated(outcome.record.issuedAt)) {
         futureDated += 1
-      } else if (isExpired(outcome.record.issuedAt)) {
-        tooOld += 1
+      } else if (isPastRetention(outcome.record)) {
+        expired += 1
       } else {
+        // A revoked or rotated record past its login lifetime is still returned: the push replay needs it
+        // until `revokedAt` plus the TTL.
         const {githubUserId, login, issuedAt, status} = outcome.record
         sessions.push({keyHash, githubUserId, login, issuedAt, status})
       }
@@ -647,10 +675,11 @@ export function createSessionPersistence(deps: SessionPersistenceDeps): SessionP
     const counts: LoadCounts = {
       listed: scanned.data.listed,
       loaded: sessions.length,
+      expired,
+      unsigned,
       malformed,
-      macFailed,
+      unrecognized: scanned.data.unrecognized,
       futureDated,
-      tooOld,
       readFailed,
       absent,
       truncated: scanned.data.truncated,
@@ -690,11 +719,15 @@ export function createSessionPersistence(deps: SessionPersistenceDeps): SessionP
           malformed += 1
           doomed.set(keyHash, outcome.etag)
         } else if (outcome.macValid === false) {
-          // A failing MAC means the claimed `issuedAt` cannot be trusted, so the age rule cannot apply.
-          // Load rejects the record anyway, so removing it loses nothing.
+          // A record signed under another secret may still be live there, so it is deleted only once its
+          // claimed age is past the TTL. A false age claim can only keep a record, never erase a live one.
           unsigned += 1
-          doomed.set(keyHash, outcome.etag)
-        } else if (isExpired(outcome.record.issuedAt)) {
+          if (isLoginExpired(outcome.record.issuedAt)) {
+            doomed.set(keyHash, outcome.etag)
+          } else {
+            kept += 1
+          }
+        } else if (isPastRetention(outcome.record)) {
           expiredFound += 1
           doomed.set(keyHash, outcome.etag)
         } else {

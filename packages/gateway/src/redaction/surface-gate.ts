@@ -21,8 +21,7 @@
  * call is made to resolve repo identity; keys come from the binding only.
  *
  * A binding-store read error is a distinct outcome from a missing binding. Callers that
- * only need the fail-closed key (`resolveBindingDenyKeys`, `resolveRunRepoKey`,
- * `projectRunStatus`) still see it as null/null. `projectRunStatusWithKey` reports it as
+ * only need the fail-closed key (`resolveRunRepoKey`, `projectRunStatus`) still see it as null/null. `projectRunStatusWithKey` reports it as
  * `unavailable`, so a caller holding earlier state can keep it instead of treating a
  * transient error as a denial.
  *
@@ -128,30 +127,6 @@ export async function lookupBindingDenyKeys<B extends BindingDenyKeySource>(
   }
 
   return {kind: 'resolved', repoKey: bindingToRepoKey(result.data), binding: result.data}
-}
-
-// ---------------------------------------------------------------------------
-// resolveBindingDenyKeys — shared fail-closed binding → deny-key resolution
-// ---------------------------------------------------------------------------
-
-/**
- * Resolve deny-keys for a repo by calling getBindingByRepo directly.
- *
- * Fail-closed: returns {databaseId: null, nodeId: null} on store error,
- * missing binding, or missing keys. Try/catch is internal — callers never
- * see a thrown error from this function.
- *
- * Used by both resolveRunRepoKey (entity_ref path) and the run-stream route
- * (owner/repo already resolved from RunIndex) so the fail-closed logic lives
- * in exactly one place.
- */
-export async function resolveBindingDenyKeys(
-  owner: string,
-  repo: string,
-  bindingsLookup: BindingsLookup,
-): Promise<RunStatusRepoKey> {
-  const lookup = await lookupBindingDenyKeys(owner, repo, bindingsLookup)
-  return lookup.kind === 'resolved' ? lookup.repoKey : NULL_KEY
 }
 
 // ---------------------------------------------------------------------------

@@ -83,6 +83,11 @@ export interface RunStreamRouteDeps {
    */
   readonly leaseIntervalMs?: number
   /**
+   * Bound (ms) on the repo-access read inside one lease tick. A read that does not settle in time counts as
+   * `unavailable`, which closes the stream. Defaults to DEFAULT_LEASE_REPO_ACCESS_TIMEOUT_MS.
+   */
+  readonly leaseRepoAccessTimeoutMs?: number
+  /**
    * Injectable setInterval — defaults to globalThis.setInterval.
    * Injected in tests to drive lease ticks manually without real timers.
    */
@@ -113,6 +118,9 @@ export interface RunStreamRouteDeps {
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
+
+/** Default bound on one lease tick's repo-access read, the scale of the removed GitHub fetch timeout. */
+export const DEFAULT_LEASE_REPO_ACCESS_TIMEOUT_MS = 8_000
 
 /** Default maximum concurrent SSE streams per operator. */
 const DEFAULT_MAX_STREAMS_PER_OPERATOR = 5
@@ -216,6 +224,22 @@ async function writeFrame(stream: SSEStreamingApi, frame: ObservationFrame): Pro
 // Continuous-authz lease check
 // ---------------------------------------------------------------------------
 
+/** `resolveRepoAccess` under a deadline. A read that never settles reads as `unavailable`, which closes the stream. */
+async function resolveRepoAccessBounded(owner: string, repo: string, deps: RunStreamRouteDeps) {
+  const timeoutMs = deps.leaseRepoAccessTimeoutMs ?? DEFAULT_LEASE_REPO_ACCESS_TIMEOUT_MS
+  let timer: ReturnType<typeof globalThis.setTimeout> | undefined
+  const timedOut = new Promise<{readonly kind: 'unavailable'}>(resolve => {
+    timer = globalThis.setTimeout(() => {
+      resolve({kind: 'unavailable'})
+    }, timeoutMs)
+  })
+  try {
+    return await Promise.race([resolveRepoAccess(owner, repo, deps), timedOut])
+  } finally {
+    globalThis.clearTimeout(timer)
+  }
+}
+
 /**
  * Re-verify session, allowlist, and repo access for a live stream.
  *
@@ -265,7 +289,7 @@ async function runLeaseCheck(
   // ── Check 3: Repo still bound AND not denylisted ─────────────────────────────────
   // One binding read. A transient `unavailable` closes the stream (fail closed); the operator
   // reconnects through the full gate stack.
-  const access = await resolveRepoAccess(owner, repo, deps)
+  const access = await resolveRepoAccessBounded(owner, repo, deps)
   if (isCleaned() === true) return
   if (access.kind !== 'allowed') {
     deps.logger.warn(
@@ -479,7 +503,11 @@ export function buildRunStreamRoute(app: Hono, deps: RunStreamRouteDeps): void {
           // Start the continuous-authz lease timer.
           // Re-verifies session, allowlist, and repo access on each tick.
           // On any failure, closes this connection only (not run-wide).
+          // A tick is skipped while the previous check is still in flight, so a slow read never stacks checks.
+          let leaseCheckInFlight = false
           leaseTimer = setIntervalFn((): void => {
+            if (leaseCheckInFlight === true) return
+            leaseCheckInFlight = true
             // runLeaseCheck is async; fail-closed on unexpected error.
             runLeaseCheck(
               githubUserId,
@@ -492,11 +520,15 @@ export function buildRunStreamRoute(app: Hono, deps: RunStreamRouteDeps): void {
                 cleanup('lease-failed')
                 resolve()
               },
-            ).catch((error: unknown) => {
-              deps.logger.warn({githubUserId, error}, 'run-stream: lease check threw — closing stream')
-              cleanup('lease-error')
-              resolve()
-            })
+            )
+              .catch((error: unknown) => {
+                deps.logger.warn({githubUserId, error}, 'run-stream: lease check threw — closing stream')
+                cleanup('lease-error')
+                resolve()
+              })
+              .finally(() => {
+                leaseCheckInFlight = false
+              })
           }, leaseIntervalMs)
         })
       } finally {

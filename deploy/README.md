@@ -376,9 +376,9 @@ Operator contract: v1.11.0. Unauthorized, redacted, and unknown resources all re
 
 **Sessions.** A session lasts 7 days from login. There is no idle timeout, nothing extends it, and it survives a gateway restart. Each session is stored as a signed record under `operator-web/sessions/` in the gateway's object store, keyed by a hash of the session ID. The justification for the 7-day lifetime (ASVS V7.1.1): one allowlisted operator, an installed app that is awkward to re-authenticate, a durable logout, a new session ID at every login, and the revoke-all control below. The OAuth token is used once, for `GET /user`, and is not stored. The authorize request asks for the `read:user` scope.
 
-**Logout.** A `200` from `POST /operator/auth/logout` means the revoke is stored. A `503` means it is not and the session is still valid, so retry. Logout and revoke deactivate that operator's push subscriptions, and a restart repairs a deactivation that failed.
+**Logout.** A `200` from `POST /operator/auth/logout` means the revoke is stored. A `503` means it is not and the session is still valid, so retry. Logout and revoke deactivate that operator's push subscriptions. If that deactivation fails, a gateway restart within 7 days of the logout repairs it, because a revoked session record is kept and replayed until 7 days after the revoke; after that window nothing repairs it.
 
-**Revoking every session.** Rotate `GATEWAY_OPERATOR_CSRF_SECRET` and redeploy. Every stored session then fails its signature check at the next startup, and in-flight CSRF tokens fail with it. Use this for a stolen device or a suspected leak. The next hourly sweep deletes the stale records.
+**Revoking every session.** Rotate `GATEWAY_OPERATOR_CSRF_SECRET` and redeploy. Every stored session then fails its signature check at the next startup, and in-flight CSRF tokens fail with it. Use this for a stolen device or a suspected leak. The next hourly sweep after each record's claimed 7 days deletes the stale records. Rotation does not deactivate push subscriptions, because records that fail their signature are never trusted, so nothing is replayed for them. If push is enabled, finish the procedure after the redeploy: sign in as the affected operator and sign out once. Logout deactivates every push subscription tied to that operator's GitHub identity, including the one on the lost device, and the operator then re-subscribes from the devices they keep. If signing in is not possible, delete that operator's records under `operator-push/subscriptions/by-endpoint/` in the object store; each record names its operator ID.
 
 Before deploying the session store, meet the object-store grant in [Operator session store rollout](#operator-session-store-rollout).
 
@@ -736,7 +736,7 @@ What operators see at rollout and after:
 - Sessions from before the upgrade do not exist, so each operator signs in once. CSRF tokens issued before the upgrade fail once, and the dashboard fetches a new one.
 - Without the grant, the startup self-test fails and the gateway still starts. The session store stays not ready, login returns `503`, and no earlier session is accepted until the grant is fixed and the gateway restarts. The log shows `session restore failed` with a coarse error class, and the audit event has `outcome: "failed"` and the failing phase.
 - The hashed session key appears in object-store info logs. It is a hash of the session ID, not a credential.
-- A stored session record is kept at most 7 days plus one hourly sweep. The sweep also deletes records that are malformed or fail their signature at any age.
+- A stored session record is kept until 7 days after login, or 7 days after the revoke for a revoked or rotated one, plus one hourly sweep. The sweep deletes malformed records at once. A record that fails its signature is deleted only once its claimed login time is more than 7 days old, so a gateway started with the wrong CSRF secret cannot erase live sessions.
 
 To end every session at once, follow the revoke-all steps under [Operator API surface](#operator-api-surface).
 

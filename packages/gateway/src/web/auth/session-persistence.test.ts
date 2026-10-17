@@ -4,7 +4,7 @@ import type {TestObjectStoreMethod, TestObjectStoreOptions} from './test-object-
 
 import {Buffer} from 'node:buffer'
 import {createObjectStoreOperationError, err, ok} from '@fro-bot/runtime'
-import {describe, expect, it} from 'vitest'
+import {describe, expect, it, vi} from 'vitest'
 import {
   buildSessionKey,
   createSessionPersistence,
@@ -83,7 +83,12 @@ function createHarness(options: HarnessOptions = {}): Harness {
 function plant(
   harness: Harness,
   keyHash: string,
-  fields: {readonly issuedAt: number; readonly status?: SessionRecordStatus; readonly githubUserId?: number},
+  fields: {
+    readonly issuedAt: number
+    readonly status?: SessionRecordStatus
+    readonly githubUserId?: number
+    readonly revokedAt?: number
+  },
   macKey: Uint8Array = MAC_KEY,
 ): string {
   const record = signSessionRecord(macKey, keyHash, {
@@ -91,6 +96,7 @@ function plant(
     login: 'operator',
     issuedAt: fields.issuedAt,
     status: fields.status ?? 'active',
+    ...(fields.revokedAt === undefined ? {} : {revokedAt: fields.revokedAt}),
   })
   return harness.store.seed(buildSessionKey(keyHash), JSON.stringify(record))
 }
@@ -194,7 +200,7 @@ describe('revoke', () => {
     // #then both writes succeed and load returns the verified statuses
     expect(revoked).toEqual(ok('written'))
     expect(rotated).toEqual(ok('written'))
-    expect(loaded.success && loaded.data.counts.macFailed).toBe(0)
+    expect(loaded.success && loaded.data.counts.unsigned).toBe(0)
     const statuses = new Map((loaded.success ? loaded.data.sessions : []).map(s => [s.keyHash, s.status]))
     expect(statuses.get(hashSessionId('a'))).toBe('revoked')
     expect(statuses.get(hashSessionId('b'))).toBe('rotated')
@@ -335,7 +341,7 @@ describe('load', () => {
 
     // #then the record is rejected and counted
     expect(loaded.success && loaded.data.sessions).toEqual([])
-    expect(loaded.success && loaded.data.counts.macFailed).toBe(1)
+    expect(loaded.success && loaded.data.counts.unsigned).toBe(1)
   })
 
   it('rejects a valid record copied to a different key', async () => {
@@ -354,7 +360,7 @@ describe('load', () => {
 
     // #then the key hash in the MAC does not match
     expect(loaded.success && loaded.data.sessions).toEqual([])
-    expect(loaded.success && loaded.data.counts.macFailed).toBe(1)
+    expect(loaded.success && loaded.data.counts.unsigned).toBe(1)
   })
 
   it('rejects a record signed under a different CSRF secret', async () => {
@@ -371,7 +377,7 @@ describe('load', () => {
 
     // #then every record fails the MAC
     expect(loaded.success && loaded.data.sessions).toEqual([])
-    expect(loaded.success && loaded.data.counts.macFailed).toBe(1)
+    expect(loaded.success && loaded.data.counts.unsigned).toBe(1)
   })
 
   it('rejects future-dated and too-old records and accepts one inside the skew allowance', async () => {
@@ -388,7 +394,7 @@ describe('load', () => {
     // #then future and expired records are counted and dropped
     expect(loaded.success).toBe(true)
     if (loaded.success === false) return
-    expect(loaded.data.counts).toMatchObject({listed: 4, loaded: 2, futureDated: 1, tooOld: 1, macFailed: 0})
+    expect(loaded.data.counts).toMatchObject({listed: 4, loaded: 2, futureDated: 1, expired: 1, unsigned: 0})
     expect(loaded.data.sessions.map(s => s.keyHash).sort()).toEqual([plantedHash('fresh'), plantedHash('skew')].sort())
   })
 
@@ -404,7 +410,7 @@ describe('load', () => {
     const loaded = await harness.persistence.load()
 
     // #then it counts as a MAC failure only
-    expect(loaded.success && loaded.data.counts).toMatchObject({macFailed: 1, futureDated: 0, tooOld: 0})
+    expect(loaded.success && loaded.data.counts).toMatchObject({unsigned: 1, futureDated: 0, expired: 0})
   })
 
   it('skips malformed and mistyped records and unrecognized keys without throwing', async () => {
@@ -435,7 +441,7 @@ describe('load', () => {
     expect(loaded.success).toBe(true)
     if (loaded.success === false) return
     expect(loaded.data.sessions).toEqual([])
-    expect(loaded.data.counts).toMatchObject({listed: 8, malformed: 8, loaded: 0})
+    expect(loaded.data.counts).toMatchObject({listed: 8, malformed: 6, unrecognized: 2, loaded: 0})
   })
 
   it('never exceeds the read concurrency bound', async () => {
@@ -488,13 +494,13 @@ describe('load', () => {
     expect(harness.store.callCount('getObject')).toBeLessThan(20)
   })
 
-  it('counts failed record reads and loads the rest', async () => {
-    // #given three records and one failing read
+  it('counts a record whose read fails twice and loads the rest', async () => {
+    // #given three records and one whose read fails on the attempt and on the retry
     const harness = createHarness({scanConcurrency: 1})
     for (const label of ['a', 'b', 'c']) {
       plant(harness, plantedHash(label), {issuedAt: NOW})
     }
-    harness.store.failNext('getObject', {match: key => key.includes(plantedHash('b'))})
+    harness.store.failNext('getObject', {match: key => key.includes(plantedHash('b')), times: 2})
 
     // #when the store loads
     const loaded = await harness.persistence.load()
@@ -503,6 +509,24 @@ describe('load', () => {
     expect(loaded.success).toBe(true)
     if (loaded.success === false) return
     expect(loaded.data.counts).toMatchObject({listed: 3, loaded: 2, readFailed: 1})
+  })
+
+  it('retries a failed record read once, so a transient failure keeps the session', async () => {
+    // #given a record whose first read fails
+    const harness = createHarness({scanConcurrency: 1})
+    for (const label of ['a', 'b']) {
+      plant(harness, plantedHash(label), {issuedAt: NOW})
+    }
+    harness.store.failNext('getObject', {match: key => key.includes(plantedHash('b'))})
+
+    // #when the store loads
+    const loaded = await harness.persistence.load()
+
+    // #then the retry succeeds and both sessions load
+    expect(loaded.success).toBe(true)
+    if (loaded.success === false) return
+    expect(loaded.data.counts).toMatchObject({listed: 2, loaded: 2, readFailed: 0})
+    expect(harness.store.callCount('getObject')).toBe(3)
   })
 
   it('counts a record removed between list and read as absent', async () => {
@@ -533,6 +557,127 @@ describe('load', () => {
     // #then the excess is counted and not read
     expect(loaded.success && loaded.data.counts).toMatchObject({listed: 5, loaded: 3, truncated: 2})
     expect(harness.store.callCount('getObject')).toBe(3)
+  })
+})
+
+function storedRecord(harness: Harness, keyHash: string): Record<string, unknown> {
+  return JSON.parse(harness.store.objects.get(buildSessionKey(keyHash))?.data ?? '{}') as Record<string, unknown>
+}
+
+describe('revokedAt', () => {
+  it('stamps the revoke time on a revoke and on a rotation, and not on an active record', async () => {
+    // #given an active session, then a revoke and a rotation at a later time
+    const harness = createHarness()
+    await harness.persistence.create({sessionId: 'a', githubUserId: OPERATOR_ID, login: 'operator', issuedAt: NOW})
+    await harness.persistence.create({sessionId: 'b', githubUserId: OPERATOR_ID, login: 'operator', issuedAt: NOW})
+    expect(storedRecord(harness, hashSessionId('a')).revokedAt).toBeUndefined()
+    harness.setNow(NOW + 5000)
+
+    // #when
+    await harness.persistence.revoke(hashSessionId('a'), 'revoked')
+    await harness.persistence.revoke(hashSessionId('b'), 'rotated')
+
+    // #then both records carry the revoke time, and the clock at creation is untouched
+    expect(storedRecord(harness, hashSessionId('a'))).toMatchObject({
+      status: 'revoked',
+      revokedAt: NOW + 5000,
+      issuedAt: NOW,
+    })
+    expect(storedRecord(harness, hashSessionId('b'))).toMatchObject({status: 'rotated', revokedAt: NOW + 5000})
+  })
+
+  it('covers revokedAt with the MAC: a record whose revokedAt was edited fails verification', async () => {
+    // #given a revoked record
+    const harness = createHarness()
+    await harness.persistence.create({sessionId: 'a', githubUserId: OPERATOR_ID, login: 'operator', issuedAt: NOW})
+    await harness.persistence.revoke(hashSessionId('a'), 'revoked')
+    const key = buildSessionKey(hashSessionId('a'))
+    const record = storedRecord(harness, hashSessionId('a'))
+
+    // #when its revokedAt is pushed forward to extend retention, and when it is stripped
+    harness.store.seed(key, JSON.stringify({...record, revokedAt: (record.revokedAt as number) + 1}))
+    const edited = await harness.persistence.load()
+    const stripped = Object.fromEntries(Object.entries(record).filter(([field]) => field !== 'revokedAt'))
+    harness.store.seed(key, JSON.stringify(stripped))
+    const removed = await harness.persistence.load()
+
+    // #then both fail the MAC
+    expect(edited.success && edited.data.counts).toMatchObject({unsigned: 1, loaded: 0})
+    expect(removed.success && removed.data.counts).toMatchObject({unsigned: 1, loaded: 0})
+  })
+
+  it('treats a mistyped revokedAt as malformed', async () => {
+    // #given a record whose revokedAt is a string
+    const harness = createHarness()
+    const signed = signSessionRecord(MAC_KEY, plantedHash('t'), {
+      githubUserId: OPERATOR_ID,
+      login: 'operator',
+      issuedAt: NOW,
+      status: 'revoked',
+      revokedAt: NOW,
+    })
+    harness.store.seed(buildSessionKey(plantedHash('t')), JSON.stringify({...signed, revokedAt: 'now'}))
+
+    // #when
+    const loaded = await harness.persistence.load()
+
+    // #then
+    expect(loaded.success && loaded.data.counts).toMatchObject({malformed: 1, loaded: 0})
+  })
+
+  it('load keeps a revoked record past login expiry until revokedAt plus the TTL, and drops it after', async () => {
+    // #given a session issued 6 days ago and revoked now, so its login lifetime ends in one day
+    const harness = createHarness()
+    const issuedAt = NOW - 6 * DAY_MS
+    plant(harness, plantedHash('late'), {issuedAt, status: 'revoked', revokedAt: NOW})
+
+    // #when the clock is just past the login expiry, and then just past revokedAt plus the TTL
+    harness.setNow(issuedAt + TTL_MS + 1)
+    const withinWindow = await harness.persistence.load()
+    harness.setNow(NOW + TTL_MS + 1)
+    const afterWindow = await harness.persistence.load()
+
+    // #then the record is returned while the window is open and counted expired after it
+    expect(withinWindow.success && withinWindow.data.sessions.map(s => s.status)).toEqual(['revoked'])
+    expect(afterWindow.success && afterWindow.data.sessions).toEqual([])
+    expect(afterWindow.success && afterWindow.data.counts.expired).toBe(1)
+  })
+
+  it('load still drops an active record at its login expiry', async () => {
+    // #given an active record issued exactly one TTL ago
+    const harness = createHarness()
+    plant(harness, plantedHash('act'), {issuedAt: NOW - TTL_MS})
+
+    // #when
+    const loaded = await harness.persistence.load()
+
+    // #then expiry for login validity stays on issuedAt
+    expect(loaded.success && loaded.data.counts).toMatchObject({expired: 1, loaded: 0})
+  })
+
+  it('sweep deletes a revoked record at max(issuedAt, revokedAt) plus the TTL, not earlier', async () => {
+    // #given a record issued 6 days ago and revoked now, and one revoked long ago on an old session
+    const harness = createHarness()
+    const issuedAt = NOW - 6 * DAY_MS
+    plant(harness, plantedHash('late'), {issuedAt, status: 'revoked', revokedAt: NOW})
+    plant(harness, plantedHash('early'), {issuedAt: NOW - 20 * DAY_MS, status: 'revoked', revokedAt: NOW - 10 * DAY_MS})
+
+    // #when swept past the issuedAt expiry of the late record
+    harness.setNow(issuedAt + TTL_MS + 1)
+    const first = await harness.persistence.sweep()
+
+    // #then only the record whose retention has ended goes
+    expect(first.success && first.data).toMatchObject({expired: 1, deleted: 1})
+    expect(harness.store.objects.has(buildSessionKey(plantedHash('late')))).toBe(true)
+    expect(harness.store.objects.has(buildSessionKey(plantedHash('early')))).toBe(false)
+
+    // #when swept after revokedAt plus the TTL
+    harness.setNow(NOW + TTL_MS)
+    const second = await harness.persistence.sweep()
+
+    // #then the late record goes too
+    expect(second.success && second.data).toMatchObject({expired: 1, deleted: 1})
+    expect(harness.store.objects.size).toBe(0)
   })
 })
 
@@ -578,20 +723,74 @@ describe('sweep', () => {
     expect(harness.store.callCount('conditionalDelete')).toBe(2)
   })
 
-  it('deletes unsigned records whatever their claimed age', async () => {
-    // #given a fresh unsigned record, one claiming a far-future issue time, and a signed fresh record
+  it('keeps a young unsigned record and counts it', async () => {
+    // #given an unsigned record claiming a recent issue time, and a signed one
     const harness = createHarness()
     const otherKey = deriveSessionRecordKey(Buffer.alloc(32, 1))
-    plant(harness, plantedHash('fresh-bad'), {issuedAt: NOW}, otherKey)
-    plant(harness, plantedHash('future-bad'), {issuedAt: NOW * 2}, otherKey)
+    plant(harness, plantedHash('young-bad'), {issuedAt: NOW - 1000}, otherKey)
     plant(harness, plantedHash('good'), {issuedAt: NOW})
 
     // #when the sweep runs
     const swept = await harness.persistence.sweep()
 
-    // #then the unsigned records go, since their claimed age cannot be trusted, and the signed one stays
-    expect(swept.success && swept.data).toMatchObject({unsigned: 2, deleted: 2, kept: 1})
-    expect([...harness.store.objects.keys()]).toEqual([buildSessionKey(plantedHash('good'))])
+    // #then both survive and the unsigned one is counted
+    expect(swept.success && swept.data).toMatchObject({unsigned: 1, deleted: 0, kept: 2})
+    expect(harness.store.objects.has(buildSessionKey(plantedHash('young-bad')))).toBe(true)
+    expect(harness.store.objects.has(buildSessionKey(plantedHash('good')))).toBe(true)
+  })
+
+  it('deletes an unsigned record whose claimed issue time is past the TTL', async () => {
+    // #given an unsigned record claiming an issue time past the TTL, one just inside it, and a signed record
+    const harness = createHarness()
+    const otherKey = deriveSessionRecordKey(Buffer.alloc(32, 1))
+    plant(harness, plantedHash('old-bad'), {issuedAt: NOW - TTL_MS - 1}, otherKey)
+    plant(harness, plantedHash('edge-bad'), {issuedAt: NOW - TTL_MS + 1000}, otherKey)
+    plant(harness, plantedHash('good'), {issuedAt: NOW})
+
+    // #when the sweep runs
+    const swept = await harness.persistence.sweep()
+
+    // #then only the one past the TTL goes
+    expect(swept.success && swept.data).toMatchObject({unsigned: 2, deleted: 1, kept: 2})
+    expect(harness.store.objects.has(buildSessionKey(plantedHash('old-bad')))).toBe(false)
+    expect(harness.store.objects.has(buildSessionKey(plantedHash('edge-bad')))).toBe(true)
+  })
+
+  it('keeps a record claiming a far-future issue time: a false claim can only keep a record', async () => {
+    // #given an unsigned record claiming an issue time far ahead
+    const harness = createHarness()
+    plant(harness, plantedHash('future-bad'), {issuedAt: NOW * 2}, deriveSessionRecordKey(Buffer.alloc(32, 1)))
+
+    // #when the sweep runs
+    const swept = await harness.persistence.sweep()
+
+    // #then it stays
+    expect(swept.success && swept.data).toMatchObject({unsigned: 1, deleted: 0, kept: 1})
+  })
+
+  it('leaves the correct-key records in place when a wrong-secret process loads and sweeps', async () => {
+    // #given sessions written under the right secret and a second process that holds a different secret
+    const right = createHarness()
+    plant(right, plantedHash('one'), {issuedAt: NOW - 1000})
+    plant(right, plantedHash('two'), {issuedAt: NOW})
+    const wrongKey = deriveSessionRecordKey(Buffer.alloc(32, 9))
+    const wrong = createSessionPersistence({
+      adapter: right.store.adapter,
+      logger: {debug: vi.fn(), info: vi.fn(), warn: vi.fn()},
+      clock: () => NOW,
+      macKey: wrongKey,
+      absoluteTtlMs: TTL_MS,
+    })
+
+    // #when the wrong-secret process loads and then sweeps
+    const loaded = await wrong.load()
+    const swept = await wrong.sweep()
+
+    // #then it restores nothing and deletes nothing, and the right-secret process still loads both
+    expect(loaded.success && loaded.data.counts).toMatchObject({loaded: 0, unsigned: 2})
+    expect(swept.success && swept.data).toMatchObject({unsigned: 2, deleted: 0})
+    const again = await right.persistence.load()
+    expect(again.success && again.data.counts).toMatchObject({loaded: 2})
   })
 
   it('does not delete a malformed record that was rewritten after the sweep read it', async () => {

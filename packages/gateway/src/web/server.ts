@@ -945,16 +945,15 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   //
   // Gate ordering:
   //   1. Guard (browser/session/allowlist/CSRF) — installed above (POST → requireCsrf=true)
-  //   2. RunIndex.lookup (server-owned runId → repo resolution)
-  //   3. Split owner/repo
-  //   4. resolveRepoAccess (bound AND not denylisted, one binding read)
-  //   5. Parse + validate decision from body ({decision: 'once'|'always'|'reject'})
-  //   6. Build WebOperatorActor from session
-  //   7. registry.handleDecision({requestID, approvalScopeId: runId, decision, actor})
-  //   8. Emit ApprovalDecisionEvent audit record
-  //   9. Map DecisionOutcome via toOperatorDecisionState → JSON {state}
+  //   2. resolveRepoFromRunIndex (server-owned runId → repo lookup + owner/repo split)
+  //   3. resolveRepoAccess (bound AND not denylisted, one binding read)
+  //   4. Parse + validate decision from body ({decision: 'once'|'always'|'reject'})
+  //   5. Build WebOperatorActor from session
+  //   6. registry.handleDecision({requestID, approvalScopeId: runId, decision, actor})
+  //   7. Emit ApprovalDecisionEvent audit record
+  //   8. Map DecisionOutcome via toOperatorDecisionState → JSON {state}
   //
-  // Every failure at gates 2–4 returns the identical no-oracle notFoundResponse.
+  // Every failure at gates 2–3 returns the identical no-oracle notFoundResponse.
   // A gate throw degrades to the same denial, not a distinguishable 500.
   // No continuous-authz lease — a decision is a single HTTP request.
   if (
@@ -987,16 +986,15 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   //
   // Gate ordering (mirrors the decision route):
   //   1. Guard (browser/session/allowlist/CSRF) — installed above (POST → requireCsrf=true)
-  //   2. RunIndex.lookup (server-owned runId → repo resolution)
-  //   3. Split owner/repo
-  //   4. resolveRepoAccess (bound AND not denylisted, one binding read)
-  //   5. Operator-keyed rate limit (AFTER authz)
-  //   6. Build CancelActorContext from session
-  //   7. cancelRun(params, deps) — transport-neutral orchestrator
-  //   8. Emit run.cancel.* audit record
-  //   9. Map CancelOutcome → JSON response
+  //   2. resolveRepoFromRunIndex (server-owned runId → repo lookup + owner/repo split)
+  //   3. resolveRepoAccess (bound AND not denylisted, one binding read)
+  //   4. Operator-keyed rate limit (AFTER authz)
+  //   5. Build CancelActorContext from session
+  //   6. cancelRun(params, deps) — transport-neutral orchestrator
+  //   7. Emit run.cancel.* audit record
+  //   8. Map CancelOutcome → JSON response
   //
-  // Every failure at gates 2–4 returns the identical no-oracle notFoundResponse.
+  // Every failure at gates 2–3 returns the identical no-oracle notFoundResponse.
   // A gate throw degrades to the same denial, not a distinguishable 500.
   if (
     browserGuardDeps !== undefined &&
@@ -1031,13 +1029,12 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   //
   // Gate ordering:
   //   1. Guard (browser/session/allowlist) — installed above (GET → requireCsrf=false)
-  //   2. RunIndex.lookup (server-owned runId → repo resolution)
-  //   3. Split owner/repo
-  //   4. resolveRepoAccess (bound AND not denylisted, one binding read)
-  //   5. Per-operator rate limit (operator-keyed)
-  //   6. registry.describePendingForScope(runId) → bounded DTO list (hard-capped)
+  //   2. resolveRepoFromRunIndex (server-owned runId → repo lookup + owner/repo split)
+  //   3. resolveRepoAccess (bound AND not denylisted, one binding read)
+  //   4. Per-operator rate limit (operator-keyed)
+  //   5. registry.describePendingForScope(runId) → bounded DTO list (hard-capped)
   //
-  // Every failure at gates 2–4 returns the identical no-oracle notFoundResponse.
+  // Every failure at gates 2–3 returns the identical no-oracle notFoundResponse.
   // A gate throw degrades to the same denial, not a distinguishable 500.
   // An authorized operator with no open requests returns 200 {approvals: []}.
   if (
