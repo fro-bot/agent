@@ -32,6 +32,7 @@ import type {QuestionCoordinator} from '../approvals/question-coordinator.js'
 import type {TerminalListener} from '../approvals/request-gate.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {DrainCompletion} from './drain-completion.js'
+import type {ProviderFailure} from './provider-failure.js'
 
 import {
   createInactivityTimer,
@@ -43,6 +44,7 @@ import {parsePermissionReply, parsePermissionRequest} from '../approvals/coordin
 import {parseQuestionEcho, parseQuestionRequest, safeLogId} from '../approvals/question-coordinator.js'
 import {createDrainCompletion, parseSyntheticNoticePart} from './drain-completion.js'
 import {formatToolPart} from './format-part.js'
+import {classifyRetryStatus, classifyStructuredError, isAbortedError} from './provider-failure.js'
 import {createReplyDeliveryTracker} from './reply-delivery.js'
 import {settleOwnedSessions} from './settle-owned-sessions.js'
 import {createTextBoundaryTracker} from './text-boundary.js'
@@ -712,6 +714,18 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     throw new RunCoreError(kind, message, true)
   }
 
+  // Fails the run on a provider rejection OpenCode will not recover from (#1836). Reuses `session-error`:
+  // a new operator failure kind would be a contract change. Only the fixed `reason` and a sanitized error
+  // name leave the classifier; the provider's own message is never logged or placed in the error.
+  async function failFromProvider(failure: ProviderFailure, source: string): Promise<never> {
+    logger.error(
+      {sessionId, source, errorName: failure.errorName, reason: failure.reason},
+      'run-core: provider rejected the request — failing run',
+    )
+    clearInactivity()
+    throw await throwWithBarrier('session-error', `Provider failure: ${failure.reason}`)
+  }
+
   // ── 2. Subscribe to events — directory threaded to query (SSE-routing) ─────
   // Subscribe BEFORE prompt to eliminate the race where permission.asked fires
   // before the SSE listener exists.
@@ -1295,10 +1309,39 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         // cannot attribute it to a specific session at all. Otherwise: ownership,
         // not root equality — a descendant's error is this run's problem too.
         if (eventSessionID === null || isOwnedSession(eventSessionID)) {
-          const errorDetail = getStringProperty(eventPayload, 'error') ?? 'unknown session error'
+          const errorText = getStringProperty(eventPayload, 'error')
+          // OpenCode also publishes structured errors (`{name, data}`); classify those instead of
+          // reporting them as unknown. Only a fixed reason survives, never the provider's message.
+          const structuredError = getObjectProperty(eventPayload, 'error')
+          if (errorText === null && structuredError !== null) {
+            throw await failFromProvider(classifyStructuredError(structuredError), 'session.error')
+          }
+          const errorDetail = errorText ?? 'unknown session error'
           logger.error({sessionId, detail: errorDetail}, 'run-core: session.error received')
           clearInactivity()
           throw await throwWithBarrier('session-error', `Session error: ${errorDetail}`)
+        }
+      } else if (eventType === 'message.updated') {
+        // Root assistant message with `info.error`: OpenCode's processor sets it only when it has stopped
+        // (retries exhausted or error non-retryable), so waiting for `session.idle` or inactivity is pointless.
+        // Root only — a child's failed message is the child's problem, handled via the ledger.
+        const info = getObjectProperty(eventPayload, 'info')
+        if (
+          (getSessionID(eventPayload) ?? getSessionID(info)) === sessionId &&
+          getStringProperty(info, 'role') === 'assistant'
+        ) {
+          const messageError = getObjectProperty(info, 'error')
+          if (messageError !== null && typeof messageError === 'object' && isAbortedError(messageError) === false) {
+            throw await failFromProvider(classifyStructuredError(messageError), 'message.updated')
+          }
+        }
+      } else if (eventType === 'session.status') {
+        // A retry that cannot succeed (provider auth missing, model unsupported) would otherwise sit through
+        // the whole retry/backoff budget. Transient retries (429/5xx/overload) classify to null and keep waiting.
+        // Root only: a child's retry never fails the parent through this path.
+        if (getEventSessionID(rawEvent) === sessionId) {
+          const retryFailure = classifyRetryStatus(getObjectProperty(eventPayload, 'status'))
+          if (retryFailure !== null) throw await failFromProvider(retryFailure, 'session.status')
         }
       } else {
         // Unrecognized event type — log at debug so a lost-event/routing gap (events arriving
