@@ -30,6 +30,7 @@ import {
   createInMemorySessionStore,
   parseSessionCookie,
   SESSION_ABSOLUTE_TTL_MS,
+  SESSION_COOKIE_MAX_AGE_SECONDS,
   SESSION_COOKIE_NAME,
   SESSION_IDLE_TTL_MS,
   SESSION_MAX_ENTRIES,
@@ -563,6 +564,33 @@ describe('buildSessionCookieValue', () => {
 
     // #then
     expect(cookieValue).toMatch(new RegExp(`^${SESSION_COOKIE_NAME}=`))
+  })
+})
+
+describe('buildSessionCookieValue — Max-Age', () => {
+  it('a set cookie carries Max-Age equal to the 7-day durable lifetime', () => {
+    // #given / #when
+    const cookieValue = buildSessionCookieValue('test-id')
+
+    // #then
+    expect(SESSION_COOKIE_MAX_AGE_SECONDS).toBe(604_800)
+    expect(cookieValue).toContain('Max-Age=604800')
+  })
+
+  it('the clear cookie keeps every other attribute of the set cookie and swaps only Max-Age', () => {
+    // #given
+    const attributes = (value: string): string[] => value.split('; ').slice(1)
+
+    // #when
+    const set = attributes(buildSessionCookieValue('test-id'))
+    const cleared = attributes(buildSessionCookieValue('', {clear: true}))
+
+    // #then
+    expect(set.filter(part => part.startsWith('Max-Age='))).toEqual(['Max-Age=604800'])
+    expect(cleared.filter(part => part.startsWith('Max-Age='))).toEqual(['Max-Age=0'])
+    expect(cleared.filter(part => part.startsWith('Max-Age=') === false)).toEqual(
+      set.filter(part => part.startsWith('Max-Age=') === false),
+    )
   })
 })
 

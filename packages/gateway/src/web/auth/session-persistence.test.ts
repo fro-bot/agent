@@ -299,6 +299,7 @@ describe('revoke', () => {
 
     // #then it fails with cas_exhausted after the bounded attempts and the record stays active
     expect(errorOf(result).kind).toBe('cas_exhausted')
+    expect(errorOf(result).retries).toBe(2)
     expect(harness.store.callCount('conditionalPut')).toBe(3)
     const stored = JSON.parse(harness.store.objects.get(buildSessionKey(plantedHash('hot')))?.data ?? '{}') as {
       status?: string
@@ -552,7 +553,7 @@ describe('sweep', () => {
     // #when the sweep runs
     const swept = await harness.persistence.sweep()
 
-    // #then only the expired records are deleted, whatever their MAC status
+    // #then the expired and the unsigned records are deleted
     expect(swept.success).toBe(true)
     if (swept.success === false) return
     expect(swept.data).toMatchObject({listed: 4, deleted: 2, kept: 2, raced: 0, deleteFailed: 0})
@@ -561,17 +562,53 @@ describe('sweep', () => {
     )
   })
 
-  it('leaves a malformed record alone', async () => {
-    // #given an unreadable object
+  it('deletes malformed records and leaves unrecognized key names alone', async () => {
+    // #given unreadable and mistyped objects, plus an unrecognized key name
     const harness = createHarness()
     harness.store.seed(buildSessionKey(plantedHash('junk')), 'junk')
+    harness.store.seed(buildSessionKey(plantedHash('array')), '[]')
+    harness.store.seed(`${SESSION_KEY_PREFIX}/not-a-hash.json`, '{}')
 
     // #when the sweep runs
     const swept = await harness.persistence.sweep()
 
-    // #then it is counted and kept, since it has no issue time
-    expect(swept.success && swept.data).toMatchObject({malformed: 1, deleted: 0})
-    expect(harness.store.objects.size).toBe(1)
+    // #then both malformed records are deleted, and the odd key is left alone
+    expect(swept.success && swept.data).toMatchObject({malformed: 2, unrecognized: 1, deleted: 2, kept: 0})
+    expect([...harness.store.objects.keys()]).toEqual([`${SESSION_KEY_PREFIX}/not-a-hash.json`])
+    expect(harness.store.callCount('conditionalDelete')).toBe(2)
+  })
+
+  it('deletes unsigned records whatever their claimed age', async () => {
+    // #given a fresh unsigned record, one claiming a far-future issue time, and a signed fresh record
+    const harness = createHarness()
+    const otherKey = deriveSessionRecordKey(Buffer.alloc(32, 1))
+    plant(harness, plantedHash('fresh-bad'), {issuedAt: NOW}, otherKey)
+    plant(harness, plantedHash('future-bad'), {issuedAt: NOW * 2}, otherKey)
+    plant(harness, plantedHash('good'), {issuedAt: NOW})
+
+    // #when the sweep runs
+    const swept = await harness.persistence.sweep()
+
+    // #then the unsigned records go, since their claimed age cannot be trusted, and the signed one stays
+    expect(swept.success && swept.data).toMatchObject({unsigned: 2, deleted: 2, kept: 1})
+    expect([...harness.store.objects.keys()]).toEqual([buildSessionKey(plantedHash('good'))])
+  })
+
+  it('does not delete a malformed record that was rewritten after the sweep read it', async () => {
+    // #given a malformed record that a writer replaces with a valid one after the read
+    const harness = createHarness()
+    harness.store.seed(buildSessionKey(plantedHash('swap')), 'junk')
+    harness.store.onBefore('conditionalDelete', () => {
+      harness.store.onBefore('conditionalDelete', undefined)
+      plant(harness, plantedHash('swap'), {issuedAt: NOW})
+    })
+
+    // #when the sweep runs
+    const swept = await harness.persistence.sweep()
+
+    // #then the stale etag loses the race and the valid record survives
+    expect(swept.success && swept.data).toMatchObject({malformed: 1, deleted: 0, raced: 1})
+    expect(harness.store.objects.has(buildSessionKey(plantedHash('swap')))).toBe(true)
   })
 
   it('loses a race to a concurrent write without error', async () => {

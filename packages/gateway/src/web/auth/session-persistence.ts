@@ -79,14 +79,22 @@ export interface SessionPersistenceError extends Error {
   readonly kind: SessionPersistenceErrorKind
   /** Coarse adapter error class (for example `http_503` or `AccessDenied`). Never an adapter message. */
   readonly errorClass: string
+  /** Retries made after the first attempt before the operation gave up. Zero for single-shot operations. */
+  readonly retries: number
 }
 
 export function createSessionPersistenceError(
   kind: SessionPersistenceErrorKind,
   message: string,
   errorClass = 'none',
+  retries = 0,
 ): SessionPersistenceError {
-  return Object.assign(new Error(message), {code: 'OPERATOR_SESSION_PERSISTENCE_ERROR' as const, kind, errorClass})
+  return Object.assign(new Error(message), {
+    code: 'OPERATOR_SESSION_PERSISTENCE_ERROR' as const,
+    kind,
+    errorClass,
+    retries,
+  })
 }
 
 export interface SessionPersistenceLogger {
@@ -151,12 +159,20 @@ export interface LoadOutcome {
 
 export interface SweepCounts {
   readonly listed: number
+  /** Records removed: past the TTL, unsigned (failed the MAC) or malformed. */
   readonly deleted: number
   /** Deletes that lost to a concurrent write or removal (412 or 404). */
   readonly raced: number
   readonly deleteFailed: number
   readonly kept: number
+  /** Records found past the TTL. */
+  readonly expired: number
+  /** Records found with a failing MAC, whatever their claimed age. */
+  readonly unsigned: number
+  /** Records found that are not shaped like a record. */
   readonly malformed: number
+  /** Keys under the prefix whose name is not a key hash. They are left alone. */
+  readonly unrecognized: number
   readonly readFailed: number
   readonly absent: number
   readonly truncated: number
@@ -172,7 +188,7 @@ export interface SessionPersistence {
   ) => Promise<Result<RevokeOutcome, SessionPersistenceError>>
   /** Lists and verifies every record. A list failure or timeout is an error, never an empty result. */
   readonly load: () => Promise<Result<LoadOutcome, SessionPersistenceError>>
-  /** Deletes records past the absolute TTL by `issuedAt`, whatever their MAC status. */
+  /** Deletes records past the TTL, plus every record that fails its MAC or is malformed, whatever its age. */
   readonly sweep: () => Promise<Result<SweepCounts, SessionPersistenceError>>
   /** Proves the adapter has real CAS and a working list. Run at startup before load. */
   readonly selfTest: () => Promise<Result<void, SessionPersistenceError>>
@@ -338,11 +354,12 @@ async function timedCall<T>(
   }
 }
 
-function failureToError(operation: string, failure: AdapterFailure): SessionPersistenceError {
+function failureToError(operation: string, failure: AdapterFailure, retries = 0): SessionPersistenceError {
   return createSessionPersistenceError(
     failure.reason === 'timeout' ? 'timeout' : 'store_error',
     `session ${operation} failed: ${failure.errorClass}`,
     failure.errorClass,
+    retries,
   )
 }
 
@@ -379,7 +396,7 @@ interface ScanEntry {
 interface ScanOutput {
   readonly entries: readonly ScanEntry[]
   readonly listed: number
-  /** Keys under the prefix whose name is not a key hash. Counted as malformed. */
+  /** Keys under the prefix whose name is not a key hash. Counted as malformed by load. */
   readonly unrecognized: number
   readonly truncated: number
 }
@@ -545,7 +562,7 @@ export function createSessionPersistence(deps: SessionPersistenceDeps): SessionP
         if (fetched.error.reason === 'not_found') {
           return ok('absent')
         }
-        return err(failureToError('revoke', fetched.error))
+        return err(failureToError('revoke', fetched.error, attempt))
       }
       const current = parseSessionRecord(fetched.data.data)
       // Load drops an unreadable or unsigned record, so there is nothing left to revoke.
@@ -572,11 +589,18 @@ export function createSessionPersistence(deps: SessionPersistenceDeps): SessionP
         return ok('absent')
       }
       if (written.error.reason !== 'precondition_failed') {
-        return err(failureToError('revoke', written.error))
+        return err(failureToError('revoke', written.error, attempt))
       }
       // Lost a race: re-read, and a concurrent revoke then reports `already`.
     }
-    return err(createSessionPersistenceError('cas_exhausted', 'session revoke exhausted its CAS attempts'))
+    return err(
+      createSessionPersistenceError(
+        'cas_exhausted',
+        'session revoke exhausted its CAS attempts',
+        'precondition_failed',
+        casMaxAttempts - 1,
+      ),
+    )
   }
 
   // -------------------------------------------------------------------------
@@ -651,52 +675,53 @@ export function createSessionPersistence(deps: SessionPersistenceDeps): SessionP
       }
 
       let kept = 0
-      let malformed = scanned.data.unrecognized
+      let expiredFound = 0
+      let unsigned = 0
+      let malformed = 0
       let readFailed = 0
       let absent = 0
-      const expired: {readonly keyHash: string; readonly etag: string}[] = []
+      const doomed = new Map<string, string>()
       for (const {keyHash, outcome} of scanned.data.entries) {
         if (outcome.kind === 'absent') {
           absent += 1
         } else if (outcome.kind === 'failed') {
           readFailed += 1
         } else if (outcome.kind === 'malformed') {
-          // No `issuedAt` to apply the age rule to, so it stays.
           malformed += 1
+          doomed.set(keyHash, outcome.etag)
+        } else if (outcome.macValid === false) {
+          // A failing MAC means the claimed `issuedAt` cannot be trusted, so the age rule cannot apply.
+          // Load rejects the record anyway, so removing it loses nothing.
+          unsigned += 1
+          doomed.set(keyHash, outcome.etag)
         } else if (isExpired(outcome.record.issuedAt)) {
-          // Deletion trusts nothing: the age rule applies whatever the MAC says.
-          expired.push({keyHash, etag: outcome.etag})
+          expiredFound += 1
+          doomed.set(keyHash, outcome.etag)
         } else {
           kept += 1
         }
       }
 
-      const etags = new Map(expired.map(entry => [entry.keyHash, entry.etag]))
       let deleted = 0
       let raced = 0
       let deleteFailed = 0
-      await runBounded(
-        expired.map(entry => entry.keyHash),
-        scanConcurrency,
-        state,
-        async keyHash => {
-          const etag = etags.get(keyHash)
-          if (etag === undefined) {
-            return
-          }
-          const removed = await timedCall(
-            async () => ops.data.conditionalDelete(buildSessionKey(keyHash), {ifMatch: etag}),
-            operationTimeoutMs,
-          )
-          if (removed.success) {
-            deleted += 1
-          } else if (removed.error.reason === 'precondition_failed' || removed.error.reason === 'not_found') {
-            raced += 1
-          } else {
-            deleteFailed += 1
-          }
-        },
-      )
+      await runBounded([...doomed.keys()], scanConcurrency, state, async keyHash => {
+        const etag = doomed.get(keyHash)
+        if (etag === undefined) {
+          return
+        }
+        const removed = await timedCall(
+          async () => ops.data.conditionalDelete(buildSessionKey(keyHash), {ifMatch: etag}),
+          operationTimeoutMs,
+        )
+        if (removed.success) {
+          deleted += 1
+        } else if (removed.error.reason === 'precondition_failed' || removed.error.reason === 'not_found') {
+          raced += 1
+        } else {
+          deleteFailed += 1
+        }
+      })
       if (state.cancelled) {
         return err(createSessionPersistenceError('timeout', 'session sweep exceeded its deadline', 'timeout'))
       }
@@ -706,7 +731,10 @@ export function createSessionPersistence(deps: SessionPersistenceDeps): SessionP
         raced,
         deleteFailed,
         kept,
+        expired: expiredFound,
+        unsigned,
         malformed,
+        unrecognized: scanned.data.unrecognized,
         readFailed,
         absent,
         truncated: scanned.data.truncated,

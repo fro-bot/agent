@@ -298,6 +298,52 @@ export interface PushDisabledEvent {
   readonly reason: PushDisabledReason
 }
 
+/** The step of the startup session restore that failed. */
+export type SessionRestorePhase = 'self_test' | 'load'
+
+/**
+ * Counts of stored session records by startup-load disposition. Counts only: no ID, hash, login or token.
+ * `loaded` is the live sessions restored into memory.
+ */
+export interface SessionRestoreCounts {
+  readonly loaded: number
+  readonly expired: number
+  readonly revoked: number
+  readonly notAllowlisted: number
+  readonly macFailed: number
+  readonly futureDated: number
+  readonly overCap: number
+  readonly readFailed: number
+}
+
+/** A durable revoke could not be written, so the session stays valid and the caller reports failure. */
+export interface AuthRevocationPersistFailedEvent {
+  readonly kind: 'auth.revocation.persist_failed'
+  /** Fixed label: the event never carries a session ID or hash. */
+  readonly correlationId: string
+  /** Retries made after the first attempt. */
+  readonly retries: number
+  /** Coarse adapter error class, never a message. */
+  readonly errorClass: string
+}
+
+/** The startup session restore finished and the session store is ready. */
+export interface AuthSessionRestoreReadyEvent {
+  readonly kind: 'auth.session.restore'
+  readonly correlationId: string
+  readonly outcome: 'ready'
+  readonly counts: SessionRestoreCounts
+}
+
+/** The startup session restore failed. The store stays not ready, and login returns 503, until restart. */
+export interface AuthSessionRestoreFailedEvent {
+  readonly kind: 'auth.session.restore'
+  readonly correlationId: string
+  readonly outcome: 'failed'
+  readonly phase: SessionRestorePhase
+  readonly errorClass: string
+}
+
 /** All security-critical audit events. */
 export type AuditEvent =
   | AuthStartEvent
@@ -305,6 +351,9 @@ export type AuditEvent =
   | AuthCallbackFailureEvent
   | AuthLogoutEvent
   | AuthRevocationEvent
+  | AuthRevocationPersistFailedEvent
+  | AuthSessionRestoreReadyEvent
+  | AuthSessionRestoreFailedEvent
   | AuthzDeniedEvent
   | LaunchAcceptedEvent
   | LaunchRejectedEvent
@@ -377,12 +426,15 @@ function redactIfSensitive(value: string): string {
  * Exhaustive log-level map: every AuditEvent kind must be present.
  * Adding a new variant without updating this map is a compile-time error.
  *
- * Note: 'approval.rejected', 'dispatch.completed', and 'push.disabled' are
- * intentionally absent — their levels are outcome/reason-dependent. See
- * approvalRejectedLevel(), dispatchCompletedLevel(), and pushDisabledLevel().
+ * Note: 'approval.rejected', 'dispatch.completed', 'push.disabled' and 'auth.session.restore'
+ * are intentionally absent — their levels are outcome/reason-dependent. See
+ * approvalRejectedLevel(), dispatchCompletedLevel(), pushDisabledLevel() and sessionRestoreLevel().
  */
 const LOG_LEVEL: Record<
-  Exclude<AuditEvent['kind'], 'approval.rejected' | 'question.rejected' | 'dispatch.completed' | 'push.disabled'>,
+  Exclude<
+    AuditEvent['kind'],
+    'approval.rejected' | 'question.rejected' | 'dispatch.completed' | 'push.disabled' | 'auth.session.restore'
+  >,
   'info' | 'warn'
 > = {
   'auth.start': 'info',
@@ -390,6 +442,7 @@ const LOG_LEVEL: Record<
   'auth.callback.failure': 'warn',
   'auth.logout': 'info',
   'auth.revocation': 'info',
+  'auth.revocation.persist_failed': 'warn',
   'authz.denied': 'warn',
   'launch.accepted': 'info',
   'launch.rejected': 'warn',
@@ -467,6 +520,13 @@ function pushDisabledLevel(reason: PushDisabledReason): 'info' | 'warn' {
   }
 }
 
+/** A restore that finished is routine; one that failed leaves login returning 503, so it is actionable. */
+function sessionRestoreLevel(
+  outcome: AuthSessionRestoreReadyEvent['outcome'] | AuthSessionRestoreFailedEvent['outcome'],
+): 'info' | 'warn' {
+  return outcome === 'ready' ? 'info' : 'warn'
+}
+
 /** Compile-time exhaustiveness guard — unreachable at runtime. */
 function assertNever(x: never): never {
   throw new Error(`Unhandled AuditEvent kind: ${JSON.stringify(x)}`)
@@ -503,6 +563,14 @@ export function emitAudit(event: AuditEvent, logger: AuditLogger): void {
     case 'run.cancel.requested':
       ctx.runId = redactIfSensitive(event.runId)
       break
+    case 'auth.revocation.persist_failed':
+      ctx.errorClass = redactIfSensitive(event.errorClass)
+      break
+    case 'auth.session.restore':
+      if (event.outcome === 'failed') {
+        ctx.errorClass = redactIfSensitive(event.errorClass)
+      }
+      break
     case 'auth.start':
     case 'auth.callback.failure':
     case 'auth.logout':
@@ -534,7 +602,9 @@ export function emitAudit(event: AuditEvent, logger: AuditLogger): void {
             ? dispatchCompletedLevel(event.outcome)
             : event.kind === 'push.disabled'
               ? pushDisabledLevel(event.reason)
-              : LOG_LEVEL[event.kind]
+              : event.kind === 'auth.session.restore'
+                ? sessionRestoreLevel(event.outcome)
+                : LOG_LEVEL[event.kind]
     if (level === 'warn') {
       logger.warn(ctx, msg)
     } else {
