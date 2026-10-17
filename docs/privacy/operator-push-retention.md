@@ -26,12 +26,21 @@ Every push notification uses fixed, neutral copy: a short message indicating som
 An active subscription record persists until one of the following happens:
 
 - The operator explicitly unsubscribes (opt-out) from the dashboard.
-- The operator's session is revoked — logging out (or a session expiring) deactivates every push subscription tied to that operator's GitHub identity, across all of their browsers and devices.
+- The operator logs out, or their session is otherwise revoked — this deactivates every push subscription tied to that operator's GitHub identity, across all of their browsers and devices. A session reaching its 7-day lifetime does not deactivate subscriptions. If a deactivation fails, the next gateway start repairs it: startup finds each user with a revoked session record and no live session, and deactivates that user's subscriptions again.
 - The push relay reports the subscription is dead (the browser/service has discarded it).
 - The VAPID key the subscription was signed under is revoked outside a normal rotation window.
 - The operator requests deletion (see Deletion, below).
 
 Once a record becomes inactive it is retained for 30 days — enough time for operational troubleshooting and audit correlation — and then purged automatically. Deletion additionally writes a durable tombstone at a separate key from the subscription record itself, so that restoring an older backup of just the subscription object cannot resurrect a record a privacy delete already removed. (A full-bucket restore that rewinds the entire object store, tombstones included, to a point before the delete is a disaster-recovery scenario outside the scope of this application-level protection.)
+
+## Operator session records
+
+Signing in to the operator surface creates a session record in the same object store. This is separate from push data, but the revoke and retention rules above depend on it.
+
+- **What a record holds:** the operator's numeric GitHub user ID, display login, the time of sign-in, a status (`active`, `revoked` or `rotated`), and an integrity signature. It holds no OAuth token and no session identifier.
+- **How it is keyed:** by a SHA-256 hash of the session identifier. The hashed key can appear in object-store info logs. It is not a credential: it cannot be turned back into the identifier or used as a cookie.
+- **How long it is kept:** a session lasts 7 days. A record is kept at most 7 days plus one hourly sweep interval, and the sweep deletes it then. The sweep also deletes any record that is malformed or fails its signature, at any age. A revoked record is kept until the sweep after it expires.
+- **Ending every session:** rotating `GATEWAY_OPERATOR_CSRF_SECRET` and redeploying invalidates every stored record at the next start. The next sweep deletes them.
 
 ## Export
 

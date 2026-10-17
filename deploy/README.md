@@ -358,21 +358,29 @@ All privileged operator endpoints are under `/operator/` and require a valid ses
 | `GET` | `/operator/health` | None | Health check |
 | `GET` | `/operator/auth/github/start` | None | Start OAuth login |
 | `GET` | `/operator/auth/github/callback` | None | OAuth callback (GitHub redirects here) |
-| `POST` | `/operator/auth/logout` | Session + CSRF | Invalidate session and clear cookie |
+| `POST` | `/operator/auth/logout` | Session + CSRF | Revoke the session durably, then clear the cookie. `200` means the revoke is stored; `503` means it is not and the session is still valid, so retry |
 | `GET` | `/operator/session/csrf` | Session | Get a signed CSRF token for mutating requests |
-| `GET` | `/operator/session` | Session | Get current session info (operatorId, login, expiresAt) |
-| `GET` | `/operator/repos` | Session | Scoped, denylist-filtered list of bound repos the operator may launch against |
-| `GET` | `/operator/runs` | Session | Session-gated, repo-scoped, denylist-filtered run enumeration; returns `{runs: RunSummary[]}` newest-first, capped at 100; mounts only when both the approval and question registries are wired, like the other dependency-gated routes |
+| `GET` | `/operator/session` | Session | Get current session info (operatorId, login, expiresAt, the fixed 7-day expiry) |
+| `GET` | `/operator/repos` | Session | Denylist-filtered list of bound repos the operator may launch against |
+| `GET` | `/operator/runs` | Session | Session-gated, binding-scoped, denylist-filtered run enumeration; returns `{runs: RunSummary[]}` newest-first, capped at 100; mounts only when both the approval and question registries are wired, like the other dependency-gated routes |
 | `POST` | `/operator/runs` | Session + CSRF | Launch a run against a bound repo (returns 202 `{runId}`) |
-| `GET` | `/operator/runs/:runId/stream` | Session | SSE stream of run status/output (repo-scoped read authz, continuous) |
-| `POST` | `/operator/runs/:runId/approvals/:requestId/decision` | Session + CSRF + repo write/admin | Submit a tool-approval decision (once/always/reject) |
-| `GET` | `/operator/runs/:runId/approvals` | Session | List pending tool-approval requests for a run (repo-scoped read authz) |
-| `POST` | `/operator/runs/:runId/questions/:requestId/decision` | Session + CSRF + repo write/admin | Answer or skip an agent question (`{decision: 'skip'}` or `{decision: 'answer', answers}`; options by index, free text up to 4,000 characters; a refused body is `400 {error: 'bad request', reason, questionIndex}`) |
-| `GET` | `/operator/runs/:runId/questions` | Session | List pending agent-question requests for a run (repo-scoped read authz) |
+| `GET` | `/operator/runs/:runId/stream` | Session | SSE stream of run status/output (binding and denylist re-checked continuously) |
+| `POST` | `/operator/runs/:runId/approvals/:requestId/decision` | Session + CSRF | Submit a tool-approval decision (once/always/reject) |
+| `GET` | `/operator/runs/:runId/approvals` | Session | List pending tool-approval requests for a run |
+| `POST` | `/operator/runs/:runId/questions/:requestId/decision` | Session + CSRF | Answer or skip an agent question (`{decision: 'skip'}` or `{decision: 'answer', answers}`; options by index, free text up to 4,000 characters; a refused body is `400 {error: 'bad request', reason, questionIndex}`) |
+| `GET` | `/operator/runs/:runId/questions` | Session | List pending agent-question requests for a run |
 
 Operator contract: v1.11.0. Unauthorized, redacted, and unknown resources all return the same generic not-found response — no existence oracle.
 
-Sessions have an 8-hour absolute lifetime and a 30-minute idle timeout. The gateway restart clears all sessions (global logout).
+**Repository access.** Every route that names a repository applies one rule, for reads and writes alike: the repository must be bound and not denylisted. The operator's own GitHub rights are not consulted, so write routes do not track them, and dispatch and launch act on GitHub as the Fro Bot GitHub App installation, not as the operator. A binding is the grant, and only the Discord users listed in `deploy/secrets/gateway-binder-allowlist` can create one (see [Current optional secrets](#current-optional-secrets)). The App installation's repository scope bounds what they can bind.
+
+**Sessions.** A session lasts 7 days from login. There is no idle timeout, nothing extends it, and it survives a gateway restart. Each session is stored as a signed record under `operator-web/sessions/` in the gateway's object store, keyed by a hash of the session ID. The justification for the 7-day lifetime (ASVS V7.1.1): one allowlisted operator, an installed app that is awkward to re-authenticate, a durable logout, a new session ID at every login, and the revoke-all control below. The OAuth token is used once, for `GET /user`, and is not stored. The authorize request asks for the `read:user` scope.
+
+**Logout.** A `200` from `POST /operator/auth/logout` means the revoke is stored. A `503` means it is not and the session is still valid, so retry. Logout and revoke deactivate that operator's push subscriptions, and a restart repairs a deactivation that failed.
+
+**Revoking every session.** Rotate `GATEWAY_OPERATOR_CSRF_SECRET` and redeploy. Every stored session then fails its signature check at the next startup, and in-flight CSRF tokens fail with it. Use this for a stolen device or a suspected leak. The next hourly sweep deletes the stale records.
+
+Before deploying the session store, meet the object-store grant in [Operator session store rollout](#operator-session-store-rollout).
 
 ### Operator runbook
 
@@ -418,7 +426,7 @@ Behind a reverse proxy, the TCP socket address the gateway sees on every inbound
 Follow these steps in order to deploy and operate the web surface:
 
 1. **Deploy the gateway image** — see [One-Time Setup](#one-time-setup) and [Starting the Stack](#starting-the-stack) for the Docker Compose setup and image build.
-2. **Set the enabling env** — configure the `GATEWAY_OPERATOR_*` vars above (bind host/port/origin, trusted proxies, OAuth credentials, CSRF secret, allowlist). See [Required secrets](#required-secrets) for the secret file commands and [Trusted proxies](#trusted-proxies) for the trusted-proxy list.
+2. **Set the enabling env** — configure the `GATEWAY_OPERATOR_*` vars above (bind host/port/origin, trusted proxies, OAuth credentials, CSRF secret, allowlist), and grant the gateway's object-store identity the session-key access in [Operator session store rollout](#operator-session-store-rollout). See [Required secrets](#required-secrets) for the secret file commands and [Trusted proxies](#trusted-proxies) for the trusted-proxy list.
 3. **Register the GitHub OAuth app callback URL** — the callback path is `/operator/auth/github/callback` on your public origin; see [OAuth callback URL](#oauth-callback-url) above.
 4. **Configure the operator allowlist** — add one numeric GitHub user ID per line to `deploy/secrets/gateway-operator-allowlist`; see the allowlist note in [Required secrets](#required-secrets).
 5. **Backfill deny keys for pre-gate bindings** — repos bound before deny-key capture was added will not appear in `GET /operator/repos` until their deny keys are populated. Run the backfill admin command (documented in [`packages/gateway/AGENTS.md`](../packages/gateway/AGENTS.md#redaction-gate)):
@@ -434,7 +442,7 @@ Follow these steps in order to deploy and operate the web surface:
 
 - [`gateway-control-surface-spine-2026-06-15.md`](../docs/solutions/best-practices/gateway-control-surface-spine-2026-06-15.md) — overall operator surface spine: route registration, browser guard, session/CSRF architecture.
 - [`web-operator-launch-surface-2026-06-20.md`](../docs/solutions/best-practices/web-operator-launch-surface-2026-06-20.md) — launch endpoint design: fire-and-return, idempotency, per-operator rate limiting.
-- [`authenticated-sse-run-observation-2026-06-20.md`](../docs/solutions/best-practices/authenticated-sse-run-observation-2026-06-20.md) — SSE run-observation stream: auth, repo-scoped read authz, continuous delivery.
+- [`authenticated-sse-run-observation-2026-06-20.md`](../docs/solutions/best-practices/authenticated-sse-run-observation-2026-06-20.md) — SSE run-observation stream: no-oracle gating, redaction, continuous delivery (its token-based authorization is superseded by the bindings-only predicate).
 - [`sse-output-streaming-terminal-drain-2026-06-21.md`](../docs/solutions/best-practices/sse-output-streaming-terminal-drain-2026-06-21.md) — SSE output streaming and terminal drain patterns.
 - [`signed-webhook-ingress-hardening-2026-05-29.md`](../docs/solutions/best-practices/signed-webhook-ingress-hardening-2026-05-29.md) — HMAC-signed ingress hardening (the announce surface that shares the gateway's HTTP layer).
 
@@ -599,7 +607,7 @@ A pending approval prompt is held in memory by the per-run coordinator. If the g
 
 The OpenCode `question` tool is enabled in gateway workspaces, and the gateway answers it. When an agent asks a question, the run pauses and operators can answer or skip it from the operator web surface or, for a Discord-launched run, from the run thread. Nothing in the base workspace config denies the tool. To stop agents from asking, set `"permission":{"question":"deny"}` in `WORKSPACE_OPENCODE_CONFIG`.
 
-Who can answer: a web operator needs write access to the run's repository, and a Discord user must pass the same `userIsAuthorized` rule as approvals. Discord users can answer only their own thread's question; web operators can answer any run's.
+Who can answer: an allowlisted web operator whose repository is bound and not denylisted, and a Discord user who passes the same `userIsAuthorized` rule as approvals. Discord users can answer only their own thread's question; web operators can answer any run's.
 
 Questions fail soft, unlike approvals. Each one has a deadline, a sub-deadline of the run timeout capped at 13 minutes. If it passes without an answer, the gateway replies with an empty answer, the agent sees the question as unanswered and continues, and the run does not fail. A question asked with 90 seconds or less of run time left is skipped immediately. A Discord post that cannot be delivered (for example the thread was deleted) does not settle the question; web answering and the deadline remain.
 
@@ -710,6 +718,27 @@ Set the variable in your `.env` file or `compose.override.yaml` (see `compose.ov
 AWS S3 deployments tag gateway run-state writes with `object-type=run-state`. Before deploying a release that emits these tags, the infrastructure operator must grant `s3:PutObjectTagging` and pass a tagged put/delete preflight. After deployment, verify the tag on a newly written run-state object and inventory the finite set of older untagged run-state records before enabling the exact-match lifecycle rule tracked in [marcusrbrown/infra#729](https://github.com/marcusrbrown/infra/issues/729). Custom S3 endpoints remain untagged.
 
 Treat `AccessDenied` on tagged writes as IAM drift: restore the permission or roll back the tagged runtime, but do not retry the write without its tag. Treat S3 timeouts and 5xx responses as provider failures under the existing retry and incident policy. If the lifecycle rule itself misbehaves, disable it and confirm the rule is absent before rolling back the runtime.
+
+#### Operator session store rollout
+
+The gateway stores operator sessions in the same bucket as its run state, under two prefixes at the bucket root: `operator-web/sessions/` (one signed record per session) and `operator-web/_self-test/` (the startup self-test). The gateway adapter does not prefix keys, so `operator-web/` sits outside the Action's default `fro-bot-state` prefix. Complete these before deploying a release that includes the session store.
+
+1. **Grant the gateway's object-store identity access to the session keys only.**
+   - `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on `arn:aws:s3:::<bucket>/operator-web/sessions/*` and `arn:aws:s3:::<bucket>/operator-web/_self-test/*`.
+   - `s3:ListBucket` on `arn:aws:s3:::<bucket>` with an `s3:prefix` condition covering `operator-web/sessions/` and `operator-web/_self-test/`.
+   - Use the equivalent bucket-scoped policy on S3-compatible stores.
+2. **Check that no other principal can write under `operator-web/`,** including the Action's S3 principal. A bucket-wide grant on the Action's principal would still reach it, even though its default prefix is `fro-bot-state`. Records are signed, so a planted record fails verification and is deleted by the next sweep, but the grant should not exist.
+3. **Create the binder allowlist before `docker compose up`.** Compose bind-mounts `deploy/secrets/gateway-binder-allowlist`, so a missing file fails the start. List the Discord user IDs that may run `/add-project`; an empty file makes `/add-project` refuse everyone. See [Current optional secrets](#current-optional-secrets).
+4. **Deploy, then verify.** The gateway log shows `session restore finished` and an `auth.session.restore` audit event with `outcome: "ready"`. Log in, restart the gateway, and confirm the same cookie still works.
+
+What operators see at rollout and after:
+
+- Sessions from before the upgrade do not exist, so each operator signs in once. CSRF tokens issued before the upgrade fail once, and the dashboard fetches a new one.
+- Without the grant, the startup self-test fails and the gateway still starts. The session store stays not ready, login returns `503`, and no earlier session is accepted until the grant is fixed and the gateway restarts. The log shows `session restore failed` with a coarse error class, and the audit event has `outcome: "failed"` and the failing phase.
+- The hashed session key appears in object-store info logs. It is a hash of the session ID, not a credential.
+- A stored session record is kept at most 7 days plus one hourly sweep. The sweep also deletes records that are malformed or fail their signature at any age.
+
+To end every session at once, follow the revoke-all steps under [Operator API surface](#operator-api-surface).
 
 ### Additional workspace egress hosts
 
