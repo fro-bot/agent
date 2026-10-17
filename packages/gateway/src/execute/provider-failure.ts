@@ -98,6 +98,14 @@ export function classifyRetryStatus(status: unknown): ProviderFailure | null {
 }
 
 /**
+ * Classify a plain-string `session.error` payload. The text is matched, never returned: an arbitrary
+ * string yields the fixed `session error` reason.
+ */
+export function classifyErrorText(text: string): ProviderFailure {
+  return {reason: classifyMessage(text) ?? 'session error', errorName: 'error-text'}
+}
+
+/**
  * True for OpenCode's abort marker. An abort is the operator or harness stopping the run, never a
  * provider rejection, so the assistant-message path must not report it as one.
  */

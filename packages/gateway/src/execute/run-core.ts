@@ -44,7 +44,7 @@ import {parsePermissionReply, parsePermissionRequest} from '../approvals/coordin
 import {parseQuestionEcho, parseQuestionRequest, safeLogId} from '../approvals/question-coordinator.js'
 import {createDrainCompletion, parseSyntheticNoticePart} from './drain-completion.js'
 import {formatToolPart} from './format-part.js'
-import {classifyRetryStatus, classifyStructuredError, isAbortedError} from './provider-failure.js'
+import {classifyErrorText, classifyRetryStatus, classifyStructuredError, isAbortedError} from './provider-failure.js'
 import {createReplyDeliveryTracker} from './reply-delivery.js'
 import {settleOwnedSessions} from './settle-owned-sessions.js'
 import {createTextBoundaryTracker} from './text-boundary.js'
@@ -1309,17 +1309,14 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         // cannot attribute it to a specific session at all. Otherwise: ownership,
         // not root equality — a descendant's error is this run's problem too.
         if (eventSessionID === null || isOwnedSession(eventSessionID)) {
+          // The payload is a string or a structured `{name, data}` object. Both go through the closed
+          // classifier: only a fixed reason survives, never the provider's text.
           const errorText = getStringProperty(eventPayload, 'error')
-          // OpenCode also publishes structured errors (`{name, data}`); classify those instead of
-          // reporting them as unknown. Only a fixed reason survives, never the provider's message.
-          const structuredError = getObjectProperty(eventPayload, 'error')
-          if (errorText === null && structuredError !== null) {
-            throw await failFromProvider(classifyStructuredError(structuredError), 'session.error')
-          }
-          const errorDetail = errorText ?? 'unknown session error'
-          logger.error({sessionId, detail: errorDetail}, 'run-core: session.error received')
-          clearInactivity()
-          throw await throwWithBarrier('session-error', `Session error: ${errorDetail}`)
+          const failure =
+            errorText === null
+              ? classifyStructuredError(getObjectProperty(eventPayload, 'error'))
+              : classifyErrorText(errorText)
+          throw await failFromProvider(failure, 'session.error')
         }
       } else if (eventType === 'message.updated') {
         // Root assistant message with `info.error`: OpenCode's processor sets it only when it has stopped

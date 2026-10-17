@@ -1,6 +1,6 @@
 import {describe, expect, it} from 'vitest'
 
-import {classifyRetryStatus, classifyStructuredError, isAbortedError} from './provider-failure.js'
+import {classifyErrorText, classifyRetryStatus, classifyStructuredError, isAbortedError} from './provider-failure.js'
 
 function retry(fields: Record<string, unknown>): object {
   return {type: 'retry', attempt: 1, message: '', next: 0, ...fields}
@@ -127,5 +127,26 @@ describe('isAbortedError', () => {
     expect(isAbortedError({name: 'MessageAbortedError'})).toBe(true)
     expect(isAbortedError({name: 'ProviderAuthError'})).toBe(false)
     expect(isAbortedError(null)).toBe(false)
+  })
+})
+
+describe('classifyErrorText', () => {
+  it.each([
+    ['auth_unavailable: no auth available', 'provider auth unavailable'],
+    ["'gpt-5.5' model is not supported when using Codex", 'model not available'],
+    ['Model not found: openai/gpt-9. Did you mean: gpt-5?', 'model not available'],
+    ['LLM quota exceeded', 'session error'],
+    ['', 'session error'],
+  ])('classifies %j', (text, reason) => {
+    // #given / #when / #then
+    expect(classifyErrorText(text).reason).toBe(reason)
+  })
+
+  it('never returns the input text', () => {
+    // #given / #when
+    const result = classifyErrorText('auth_unavailable sk-live-SECRET')
+
+    // #then
+    expect(JSON.stringify(result)).not.toContain('SECRET')
   })
 })

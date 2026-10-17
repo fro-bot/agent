@@ -414,18 +414,60 @@ describe('runOpenCodeCore — provider rejection fails fast (#1836)', () => {
       expectFailed(run, 'Provider failure: session error')
     })
 
-    it('keeps the string path as it was', async () => {
+    it.each([
+      [`auth_unavailable: no auth available (${SECRET})`, 'Provider failure: provider auth unavailable'],
+      [
+        `'gpt-5.5' model is not supported when using Codex with a ChatGPT account ${SECRET}`,
+        'Provider failure: model not available',
+      ],
+      [`Model not found: openai/gpt-9. Did you mean: gpt-5? ${SECRET}`, 'Provider failure: model not available'],
+    ])('classifies a string session.error carrying a provider body: %s', async (text, expectedMessage) => {
       // #given
       const run = startRun()
 
       // #when
-      await run.emit(sessionError('LLM quota exceeded'))
+      await run.emit(sessionError(text))
 
-      // #then
-      expectFailed(run, 'Session error: LLM quota exceeded')
+      // #then — the fixed reason, with no raw substring in the failure or any logger call
+      expectFailed(run, expectedMessage)
+      const logged = loggedText(run.logger)
+      for (const fragment of ['sk-live', 'SECRET', 'upstream.example', 'response-body', 'LEAK', 'gpt-9', 'ChatGPT']) {
+        expect(logged).not.toContain(fragment)
+      }
     })
 
-    it('keeps "unknown session error" when the payload has no error at all', async () => {
+    it('gives an arbitrary string a fixed "session error" reason and never echoes it', async () => {
+      // #given
+      const run = startRun()
+
+      // #when
+      await run.emit(sessionError(`LLM quota exceeded ${SECRET}`))
+
+      // #then — failureKind stays session-error (expectFailed asserts it); no raw text anywhere
+      expectFailed(run, 'Provider failure: session error')
+      const logged = loggedText(run.logger)
+      expect(logged).not.toContain('quota')
+      expect(logged).not.toContain('SECRET')
+      for (const call of vi.mocked(run.logger.error).mock.calls) {
+        expect(JSON.stringify(call)).toContain('"reason":"session error"')
+      }
+    })
+
+    it('logs only source, error name and reason for a string session.error', async () => {
+      // #given
+      const run = startRun()
+
+      // #when
+      await run.emit(sessionError(`auth_unavailable ${SECRET}`))
+
+      // #then
+      expect(vi.mocked(run.logger.error)).toHaveBeenCalledWith(
+        {sessionId: ROOT, source: 'session.error', errorName: 'error-text', reason: 'provider auth unavailable'},
+        expect.any(String),
+      )
+    })
+
+    it('reports a payload with no error as a fixed "session error"', async () => {
       // #given
       const run = startRun()
 
@@ -433,7 +475,7 @@ describe('runOpenCodeCore — provider rejection fails fast (#1836)', () => {
       await run.emit({type: 'session.error', properties: {sessionID: ROOT}})
 
       // #then
-      expectFailed(run, 'Session error: unknown session error')
+      expectFailed(run, 'Provider failure: session error')
     })
   })
 
