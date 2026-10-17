@@ -53,13 +53,17 @@ import {toOperatorRunStatus} from '../operator-contract/index.js'
  * Accepts the full BindingsStore from packages/gateway/src/bindings/store.ts
  * (structural subtype — no import coupling to the store module).
  */
-export interface BindingsLookup {
+export interface BindingsLookup<B extends BindingDenyKeySource = BindingDenyKeySource> {
   readonly getBindingByRepo: (
     owner: string,
     repo: string,
-  ) => Promise<
-    {success: true; data: {databaseId?: number | null; nodeId?: string} | null} | {success: false; error: Error}
-  >
+  ) => Promise<{success: true; data: B | null} | {success: false; error: Error}>
+}
+
+/** The slice of a binding the denylist reads: its optional repo identity keys. */
+export interface BindingDenyKeySource {
+  readonly databaseId?: number | null
+  readonly nodeId?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -87,17 +91,28 @@ export function bindingToRepoKey(binding: {readonly databaseId?: number | null; 
 
 const NULL_KEY: RunStatusRepoKey = {databaseId: null, nodeId: null}
 
-/** `unavailable`: the binding store read failed. `resolved`: a key, null/null when no usable binding exists. */
-type DenyKeyLookup = {readonly kind: 'resolved'; readonly repoKey: RunStatusRepoKey} | {readonly kind: 'unavailable'}
+/**
+ * `unavailable`: the binding store read failed.
+ * `resolved`: a key (null/null when no usable binding exists) plus the binding itself, or `null` when none is bound.
+ */
+export type DenyKeyLookup<B extends BindingDenyKeySource = BindingDenyKeySource> =
+  | {readonly kind: 'resolved'; readonly repoKey: RunStatusRepoKey; readonly binding: B | null}
+  | {readonly kind: 'unavailable'}
 
-const UNAVAILABLE: DenyKeyLookup = {kind: 'unavailable'}
+const UNAVAILABLE = {kind: 'unavailable'} as const
 
-async function lookupBindingDenyKeys(
+/**
+ * One binding read that answers both "what are the deny keys" and "what is the binding".
+ *
+ * A store error or throw is `unavailable`, kept distinct from a missing binding
+ * (`resolved` with a null/null key and a null binding). Never throws.
+ */
+export async function lookupBindingDenyKeys<B extends BindingDenyKeySource>(
   owner: string,
   repo: string,
-  bindingsLookup: BindingsLookup,
-): Promise<DenyKeyLookup> {
-  let result: Awaited<ReturnType<BindingsLookup['getBindingByRepo']>>
+  bindingsLookup: BindingsLookup<B>,
+): Promise<DenyKeyLookup<B>> {
+  let result: Awaited<ReturnType<BindingsLookup<B>['getBindingByRepo']>>
   try {
     result = await bindingsLookup.getBindingByRepo(owner, repo)
   } catch {
@@ -109,10 +124,10 @@ async function lookupBindingDenyKeys(
   }
 
   if (result.data === null) {
-    return {kind: 'resolved', repoKey: NULL_KEY}
+    return {kind: 'resolved', repoKey: NULL_KEY, binding: null}
   }
 
-  return {kind: 'resolved', repoKey: bindingToRepoKey(result.data)}
+  return {kind: 'resolved', repoKey: bindingToRepoKey(result.data), binding: result.data}
 }
 
 // ---------------------------------------------------------------------------
@@ -170,7 +185,7 @@ function parseEntityRef(entityRef: string): {owner: string; repo: string} | null
 async function lookupRunDenyKeys(runState: RunState, bindingsLookup: BindingsLookup): Promise<DenyKeyLookup> {
   const parsed = parseEntityRef(runState.entity_ref)
   if (parsed === null) {
-    return {kind: 'resolved', repoKey: NULL_KEY}
+    return {kind: 'resolved', repoKey: NULL_KEY, binding: null}
   }
 
   return lookupBindingDenyKeys(parsed.owner, parsed.repo, bindingsLookup)

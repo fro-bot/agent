@@ -1,14 +1,13 @@
 /**
  * Shared fixtures for the question route tests. Routes are exercised through the
  * real HTTP handlers with a REAL question registry and request gate; only the
- * OpenCode reply/reject effects, GitHub authz fetch, and session/run stores are
- * stubbed, so a test sees the same settlement behavior production does.
+ * OpenCode reply/reject effects and the session/run/binding stores are stubbed,
+ * so a test sees the same settlement behavior production does.
  */
 
 import type {QuestionPromptInput, QuestionSideEffects} from '../../approvals/question-registry.js'
 import type {RunLocation} from '../../execute/run-index.js'
 import type {RepoKey} from '../../redaction/denylist.js'
-import type {RepoAuthzDeps} from '../auth/repo-authz.js'
 import {Hono} from 'hono'
 import {vi} from 'vitest'
 import {createQuestionRegistry} from '../../approvals/question-registry.js'
@@ -28,7 +27,6 @@ export function makeAuditLogger() {
 
 export function makeSessionStore() {
   return {
-    getOperatorToken: vi.fn((_sessionId: string, _nowMs: number) => 'oauth-token-stub'),
     get: vi.fn((_sessionId: string, _nowMs: number) => ({
       githubUserId: 1001,
       login: 'alice',
@@ -54,50 +52,25 @@ export function makeDenylistCache(denied = false) {
   }
 }
 
-export function makeBindingsLookup() {
-  return {
-    getBindingByRepo: vi.fn(async (_owner: string, _repo: string) => ({
-      success: true as const,
-      data: {
-        owner: 'acme',
-        repo: 'widget',
-        channelId: 'ch-123',
-        channelName: 'widget-dev',
-        workspacePath: '/workspace/acme/widget',
-        createdAt: '2026-01-01T00:00:00Z',
-        createdByDiscordId: 'discord-user-1',
-        databaseId: 42,
-        nodeId: 'R_node_42',
-      },
-    })),
-  }
+export const WIDGET_BINDING = {
+  owner: 'acme',
+  repo: 'widget',
+  channelId: 'ch-123',
+  channelName: 'widget-dev',
+  workspacePath: '/workspace/acme/widget',
+  createdAt: '2026-01-01T00:00:00Z',
+  createdByDiscordId: 'discord-user-1',
+  databaseId: 42,
+  nodeId: 'R_node_42',
 }
 
-/** Authz deps whose GitHub permission fetch answers with the given permission body. */
-export function makeRepoAuthzDeps(permissions: Record<string, boolean>): RepoAuthzDeps {
-  return {
-    allowlist: {isAuthorized: vi.fn(() => true), size: 1},
-    fetch: vi.fn(
-      async () =>
-        new Response(JSON.stringify({permissions}), {status: 200, headers: {'content-type': 'application/json'}}),
-    ),
-    clock: () => 0,
-    random: () => 0.5,
-    auditLogger: {info: vi.fn(), warn: vi.fn()},
-    logger: {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
-    cache: {
-      get: vi.fn(() => undefined),
-      set: vi.fn(),
-      getInFlight: vi.fn(() => undefined),
-      setInFlight: vi.fn(),
-      deleteInFlight: vi.fn(),
-      tokenIdentityFor: vi.fn(() => 'stub-token-identity'),
-    },
-  }
+export function makeBindingsLookup(
+  result:
+    | {readonly success: true; readonly data: typeof WIDGET_BINDING | null}
+    | {readonly success: false; readonly error: Error} = {success: true, data: WIDGET_BINDING},
+) {
+  return {getBindingByRepo: vi.fn(async (_owner: string, _repo: string) => result)}
 }
-
-export const writeAuthz = (): RepoAuthzDeps => makeRepoAuthzDeps({push: true, admin: false})
-export const readOnlyAuthz = (): RepoAuthzDeps => makeRepoAuthzDeps({pull: true, push: false, admin: false})
 
 export function makeEffects() {
   return {

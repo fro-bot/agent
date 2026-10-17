@@ -14,22 +14,23 @@
  * Gate ordering (all must pass before launchWork is called):
  *   1. Guard (browser/session/allowlist/CSRF) — installed by buildOperatorApp
  *   2. Operator rate limit (3/min, 10/hr, operator-keyed)
- *   3. Resolve OAuth token via session store
+ *   3. Resolve session identity (display login for requester attribution)
  *   4. Parse and validate request body {repo, prompt, idempotencyKey?}
- *   5. Server-owned binding resolution via getBindingByRepo (never trust client)
- *   6. Denylist check (isRepoDenied) — before authz, no oracle
- *   7. checkRepoAuthz (allowlist + GitHub repo access)
- *   8. Empty-prompt fail-fast
- *   9. Per-operator idempotency guard (${githubUserId}:${clientKey})
- *  10. Generate runId + reserve idempotency key (if present)
- *  11. Await launchWork admission (returns LaunchAdmission, not the full run)
- *  12. On accepted: commit idempotency + return 202 {runId}
+ *   5. resolveRepoAccess — name validation, ONE server-owned binding read, then the
+ *      denylist (never trust the client); anything but `allowed` → 404
+ *   6. Empty-prompt fail-fast
+ *   7. Per-operator idempotency guard (${githubUserId}:${clientKey})
+ *   8. Generate runId + reserve idempotency key (if present)
+ *   9. Await launchWork admission (returns LaunchAdmission, not the full run)
+ *  10. On accepted: commit idempotency + return 202 {runId}
  *      On rejected/throw: rollback idempotency + return coarse error
  *
  * Security invariants:
- *   - Server-owned repo resolution: client body names a repo; server resolves
- *     via getBindingByRepo. Client-supplied binding/path/owner is ignored.
- *   - Denylist before authz: a denylisted repo never triggers a GitHub call.
+ *   - Server-owned repo resolution: client body names a repo; the server resolves
+ *     the binding via getBindingByRepo. Client-supplied binding/path/owner is ignored.
+ *   - A malformed owner/repo is denied with zero object-store calls.
+ *   - Unbound, denylisted and store-unavailable repos return the same 404 body; no
+ *     GitHub call is made and the operator's identity is never used against GitHub.
  *   - Per-operator idempotency: key is namespaced ${githubUserId}:${clientKey}
  *     so operator A cannot suppress operator B's launch.
  *   - No token/prompt/path/internal-id in responses or logs.
@@ -42,19 +43,17 @@ import type {RepoBinding} from '../../bindings/types.js'
 import type {RunMentionDeps} from '../../execute/run.js'
 import type {RateLimiter} from '../../http/rate-limit.js'
 import type {ApprovalFrameData} from '../../operator-contract/approval-frame.js'
-import type {RepoKey} from '../../redaction/denylist.js'
-import type {RepoAuthzDeps} from '../auth/repo-authz.js'
+import type {DenylistCache} from '../../redaction/denylist.js'
 import type {OperatorLogger} from '../server.js'
 import type {RunObservationManager} from '../sse/manager.js'
 import type {IdempotencyGuard} from './idempotency.js'
 import {randomUUID} from 'node:crypto'
 import {launchWork} from '../../execute/run.js'
 import {createRateLimiter} from '../../http/rate-limit.js'
-import {bindingToRepoKey} from '../../redaction/surface-gate.js'
-import {checkRepoAuthz} from '../auth/repo-authz.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
 import {notFoundResponse, rateLimitedResponse} from '../safe-response.js'
 import {IDEMPOTENCY_KEY_MAX_LENGTH} from './idempotency.js'
+import {resolveRepoAccess} from './route-helpers.js'
 import {createWebApprovalOnPending} from './web-approval.js'
 import {createWebReplySink, createWebStatusSink} from './web-sinks.js'
 
@@ -75,10 +74,9 @@ const LAUNCH_RATE_WINDOW_HR_MS = 60 * 60_000
 // ---------------------------------------------------------------------------
 
 /**
- * Minimal session store interface required by the launch route.
+ * Minimal session store interface required by the launch route: identity only.
  */
 export interface LaunchRouteSessionStore {
-  readonly getOperatorToken: (sessionId: string, nowMs: number) => string | undefined
   readonly get: (
     sessionId: string,
     nowMs: number,
@@ -99,17 +97,12 @@ export interface LaunchRouteBindingsLookup {
 
 /** Dependencies for the launch route. */
 export interface LaunchRouteDeps {
-  /** Session store for OAuth token and identity retrieval. */
+  /** Session store for identity retrieval. */
   readonly sessionStore: LaunchRouteSessionStore
   /** Binding store for server-owned repo resolution. */
   readonly bindingsLookup: LaunchRouteBindingsLookup
-  /**
-   * Denylist predicate — returns true when a repo's deny keys are on the denylist.
-   * Must be called BEFORE checkRepoAuthz (no oracle, no GitHub call for denied repos).
-   */
-  readonly isRepoDenied: (repoKey: RepoKey) => boolean
-  /** Repo authorization dependencies for checkRepoAuthz. */
-  readonly repoAuthzDeps: RepoAuthzDeps
+  /** Denylist cache: primed and consulted by resolveRepoAccess after the binding is found. */
+  readonly denylistCache: Pick<DenylistCache, 'getDenylistState' | 'isRepoDenied'>
   /** Per-operator idempotency guard. */
   readonly idempotencyGuard: IdempotencyGuard
   /** Engine dependencies for launchWork. launchWork owns run index registration. */
@@ -205,14 +198,7 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
       return rateLimitedResponse(c)
     }
 
-    // ── Gate 3: Resolve OAuth token ──────────────────────────────────────────
-    const token = deps.sessionStore.getOperatorToken(sessionId, nowMs)
-    if (token === undefined) {
-      deps.logger.warn({githubUserId, gate: 'no-token'}, 'launch: denied — token missing')
-      return notFoundResponse(c)
-    }
-
-    // Resolve session identity for the requester attribution.
+    // ── Gate 3: Resolve session identity for the requester attribution ────
     const sessionEntry = deps.sessionStore.get(sessionId, nowMs)
     if (sessionEntry === undefined) {
       deps.logger.warn({githubUserId, gate: 'no-session'}, 'launch: denied — session missing')
@@ -266,46 +252,28 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
     const idempotencyKey =
       typeof idempotencyKeyField === 'string' && idempotencyKeyField.length > 0 ? idempotencyKeyField : undefined
 
-    // ── Gate 5: Server-owned binding resolution ──────────────────────────────
-    // The server resolves the binding via getBindingByRepo. Client-supplied
-    // binding/path/owner is ignored. Unknown/unbound repo → coarse pre-launch error.
-    let binding: RepoBinding
-    try {
-      const bindingResult = await deps.bindingsLookup.getBindingByRepo(owner, repo)
-      if (bindingResult.success === false) {
-        deps.logger.warn({githubUserId, gate: 'binding-error'}, 'launch: denied — binding lookup error')
-        return c.json({error: 'not-found'}, 404)
-      }
-      if (bindingResult.data === null) {
-        deps.logger.warn({githubUserId, gate: 'unbound'}, 'launch: denied — repo not bound')
-        return c.json({error: 'not-found'}, 404)
-      }
-      binding = bindingResult.data
-    } catch {
-      deps.logger.warn({githubUserId, gate: 'binding-error'}, 'launch: denied — binding lookup threw')
-      return c.json({error: 'not-found'}, 404)
-    }
-
-    // ── Gate 6: Denylist check — BEFORE authz (no oracle, no GitHub call) ────
-    if (deps.isRepoDenied(bindingToRepoKey(binding)) === true) {
-      deps.logger.warn({githubUserId, gate: 'denylisted'}, 'launch: denied — repo denylisted')
+    // ── Gate 5: Repo access (bound AND not denylisted, fail-closed) ───────────
+    // The server resolves the binding via getBindingByRepo (one read); client-supplied
+    // binding/path/owner is ignored. A malformed name makes zero store calls. Unbound,
+    // denylisted and store-unavailable repos share one 404 body; unbound and denylisted
+    // also share one log label, so neither the response nor the log is an existence oracle.
+    const access = await resolveRepoAccess(owner, repo, deps)
+    if (access.kind !== 'allowed') {
+      deps.logger.warn(
+        {githubUserId, gate: access.kind === 'denied' ? 'repo-denied' : 'repo-unavailable'},
+        'launch: denied — repo access',
+      )
       return notFoundResponse(c)
     }
+    const binding = access.binding
 
-    // ── Gate 7: Repo authorization ────────────────────────────────────────────
-    const authzResult = await checkRepoAuthz(githubUserId, owner, repo, token, deps.repoAuthzDeps)
-    if (authzResult.authorized === false) {
-      deps.logger.warn({githubUserId, gate: 'authz-denied'}, 'launch: denied — repo authz failed')
-      return notFoundResponse(c)
-    }
-
-    // ── Gate 8: Empty-prompt fail-fast ────────────────────────────────────────
+    // ── Gate 6: Empty-prompt fail-fast ─────────────────────────────────────
     if (promptField.trim().length === 0) {
       deps.logger.warn({githubUserId, gate: 'empty-prompt'}, 'launch: denied — empty prompt')
       return c.json({error: 'prompt is required'}, 400)
     }
 
-    // ── Gate 9: Per-operator idempotency guard ────────────────────────────────
+    // ── Gate 7: Per-operator idempotency guard ────────────────────────────────
     // Key is namespaced: ${githubUserId}:${clientKey} so operator A cannot
     // suppress operator B's launch with the same client key.
     // check() returns the runId for BOTH reserved AND committed live entries —
@@ -320,7 +288,7 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
       }
     }
 
-    // ── Gate 10: Generate runId + reserve idempotency key ────────────────────
+    // ── Gate 8: Generate runId + reserve idempotency key ───────────────────
     // The route owns the runId so it can return 202 {runId} and pass it to
     // launchWork (which uses it for admission and run-index registration).
     // Reserve BEFORE launchWork so a concurrent duplicate during the admission
@@ -331,7 +299,7 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
       deps.idempotencyGuard.reserve(githubUserId, idempotencyKey, runId)
     }
 
-    // ── Gate 11: Await launchWork admission ───────────────────────────────────
+    // ── Gate 9: Await launchWork admission ───────────────────────────────────
     // Build the LaunchWorkRequest with web-specific sinks, real approval transport,
     // and web prompt builder. The channelId is a deterministic, namespaced,
     // opaque scope key that cannot equal a Discord snowflake.

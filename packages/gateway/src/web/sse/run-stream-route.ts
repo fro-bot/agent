@@ -3,20 +3,22 @@
  *
  * Gate ordering (all must pass before any byte is written):
  *   1. Guard (browser/session/allowlist/CSRF) — installed by buildOperatorApp
- *   2. Resolve session + OAuth token by sessionId
- *   3. Resolve runId → repo via RunIndex (server-owned; never client-supplied)
- *   4. Split owner/repo from the resolved location
- *   5. Resolve binding deny-keys; prime denylist; check isRepoDenied
- *   6. checkRepoAuthz (allowlist + GitHub repo access)
- *   7. Acquire per-operator stream slot (keyed on numeric githubUserId)
- *   8. Open SSE stream → deliver ready frame (contract version) + first snapshot/reset frame
+ *   2. Resolve runId → repo via RunIndex (server-owned; never client-supplied)
+ *   3. Split owner/repo from the resolved location
+ *   4. resolveRepoAccess (bound AND not denylisted, one binding read); anything but
+ *      `allowed` → not found
+ *   5. Acquire per-operator stream slot (keyed on numeric githubUserId)
+ *   6. Open SSE stream → deliver ready frame (contract version) + first snapshot/reset frame
  *      On a cache miss the manager may resolve the run from persisted state (read only after
- *      gates 1–7, so a denied or unauthorized caller never triggers a durable read).
+ *      gates 1–5, so a denied or unauthorized caller never triggers a durable read).
  *
- * Every failure at steps 2–6 returns the identical generic not-found shape.
- * Step 7 failure returns 429 (honest backpressure for an already-authorized operator).
+ * Every failure at steps 2–4 returns the identical generic not-found shape.
+ * Step 5 failure returns 429 (honest backpressure for an already-authorized operator).
  * There is NO authorized non-stream response — a distinguishable success would be
  * a run-resolved/authorized oracle.
+ *
+ * A live stream is re-verified on every lease tick (session, allowlist, repo access). Lease
+ * logs carry the operator id and a gate label only — never an owner, repo or run id.
  */
 
 import type {Socket} from 'node:net'
@@ -26,16 +28,16 @@ import type {Context, Hono} from 'hono'
 import type {RunIndex as FullRunIndex} from '../../execute/run-index.js'
 import type {DenylistCache} from '../../redaction/denylist.js'
 import type {BindingsLookup} from '../../redaction/surface-gate.js'
-import type {RepoAuthzDeps} from '../auth/repo-authz.js'
+import type {AuditLogger} from '../audit.js'
+import type {OperatorAllowlist} from '../auth/allowlist.js'
 import type {SessionStore} from '../auth/session.js'
 import type {OperatorLogger} from '../server.js'
 import type {ObservationFrame, RunObservationManager} from './manager.js'
 import {streamSSE, type SSEStreamingApi} from 'hono/streaming'
 import {OPERATOR_CONTRACT_VERSION} from '../../operator-contract/index.js'
-import {resolveBindingDenyKeys} from '../../redaction/surface-gate.js'
-import {checkRepoAuthz} from '../auth/repo-authz.js'
+import {emitAudit} from '../audit.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
-import {checkDenylist, resolveRepoFromRunIndex} from '../operator/route-helpers.js'
+import {resolveRepoAccess, resolveRepoFromRunIndex} from '../operator/route-helpers.js'
 import {notFoundResponse, rateLimitedResponse} from '../safe-response.js'
 import {DEFAULT_MAX_STREAM_DURATION_MS} from './manager.js'
 
@@ -45,8 +47,8 @@ import {DEFAULT_MAX_STREAM_DURATION_MS} from './manager.js'
 
 /** Dependencies for the run-stream route. */
 export interface RunStreamRouteDeps {
-  /** Session store for token retrieval. */
-  readonly sessionStore: SessionStore
+  /** Session store for the live-session check. Identity only — sessions hold no credential. */
+  readonly sessionStore: Pick<SessionStore, 'get'>
   /** Server-owned run index for runId → repo resolution. */
   readonly runIndex: Pick<FullRunIndex, 'lookup'>
   /**
@@ -59,8 +61,13 @@ export interface RunStreamRouteDeps {
   readonly denylistCache: DenylistCache
   /** Bindings lookup for deny-key resolution. */
   readonly bindingsLookup: BindingsLookup
-  /** Repo authorization dependencies. */
-  readonly repoAuthzDeps: RepoAuthzDeps
+  /**
+   * Operator allowlist. The browser guard enforces it per request; the lease re-checks it on every
+   * tick so an operator removed from the allowlist loses a live stream within one interval.
+   */
+  readonly allowlist: OperatorAllowlist
+  /** Audit logger — the lease emits `authz.denied` when an operator leaves the allowlist. */
+  readonly auditLogger: AuditLogger
   /** Run-observation manager for SSE subscription. */
   readonly manager: RunObservationManager
   /** Structured logger. */
@@ -73,7 +80,7 @@ export interface RunStreamRouteDeps {
    */
   readonly maxStreamsPerOperator?: number
   /**
-   * How often (ms) to re-verify session, token, redaction, and repo authz for a live stream.
+   * How often (ms) to re-verify session, allowlist, and repo access for a live stream.
    * Defaults to DEFAULT_LEASE_INTERVAL_MS when omitted.
    */
   readonly leaseIntervalMs?: number
@@ -121,9 +128,9 @@ const DEFAULT_MAX_STREAMS_PER_OPERATOR = 5
 const SOCKET_TIMEOUT_MS = 60_000
 
 /**
- * How often to re-verify session, token, redaction, and repo authz for a live stream.
- * A small multiple of the 15s heartbeat interval. Revocation detection is bounded by
- * checkRepoAuthz's positive cache TTL (~5m + 10% jitter) plus this interval.
+ * How often to re-verify session, allowlist, and repo access for a live stream.
+ * A small multiple of the 15s heartbeat interval. Operator-side revocation (unbind,
+ * denylist, allowlist removal, logout) closes a stream within one interval.
  */
 const DEFAULT_LEASE_INTERVAL_MS = 30_000
 
@@ -212,67 +219,61 @@ async function writeFrame(stream: SSEStreamingApi, frame: ObservationFrame): Pro
 // ---------------------------------------------------------------------------
 
 /**
- * Re-verify session, token, redaction, and repo authz for a live stream.
+ * Re-verify session, allowlist, and repo access for a live stream.
  *
- * Called on each lease tick. On any failure, invokes onFail() to close this
- * connection. Each await point is followed by a generation guard: if the
- * connection was already torn down (isCleaned() === true) before the async
- * work resolved, the tick is a no-op — no double cleanup, no late close.
+ * Called on each lease tick. On any failure — including a transient `unavailable` from the
+ * binding store — invokes onFail() to close this connection. Each await point is followed by a
+ * generation guard: if the connection was already torn down (isCleaned() === true) before the
+ * async work resolved, the tick is a no-op — no double cleanup, no late close.
  *
- * Does NOT call dropOperatorToken() on a generic github_denied result because
- * that result cannot distinguish a revoked token from a denied repo.
+ * Log contexts carry `githubUserId` and a gate label only: no owner, repo or run id, and one
+ * `repo-denied` label for both unbound and denylisted repos so the log is not an existence oracle.
+ * Only an allowlist removal emits an audit event; repo-level denials emit none.
  */
 async function runLeaseCheck(
   githubUserId: number,
   sessionId: string,
-  runId: string,
   owner: string,
   repo: string,
   deps: RunStreamRouteDeps,
   isCleaned: () => boolean,
   onFail: () => void,
 ): Promise<void> {
-  const nowMs = deps.now()
-
-  // ── Check 1: Session still valid ─────────────────────────────────────────
-  const session = deps.sessionStore.get(sessionId, nowMs)
+  // ── Check 1: Session still valid ─────────────────────────────────────────────────
+  const session = deps.sessionStore.get(sessionId, deps.now())
   if (isCleaned() === true) return
   if (session === undefined) {
-    deps.logger.warn({githubUserId, runId}, 'run-stream: lease closed — session expired')
+    deps.logger.warn({githubUserId, gate: 'session'}, 'run-stream: lease closed')
     onFail()
     return
   }
 
-  // ── Check 2: OAuth token still present ───────────────────────────────────
-  const freshToken = deps.sessionStore.getOperatorToken(sessionId, nowMs)
-  if (isCleaned() === true) return
-  if (freshToken === undefined) {
-    deps.logger.warn({githubUserId, runId}, 'run-stream: lease closed — token missing')
+  // ── Check 2: Operator still allowlisted ───────────────────────────────────────────
+  if (deps.allowlist.isAuthorized(githubUserId) === false) {
+    deps.logger.warn({githubUserId, gate: 'allowlist'}, 'run-stream: lease closed')
+    emitAudit(
+      {
+        kind: 'authz.denied',
+        correlationId: `run-stream-lease:${githubUserId}`,
+        githubUserId,
+        reason: 'not_allowlisted',
+      },
+      deps.auditLogger,
+    )
     onFail()
     return
   }
 
-  // ── Check 3: Repo still not denylisted ───────────────────────────────────
-  const denyKeys = await resolveBindingDenyKeys(owner, repo, deps.bindingsLookup)
+  // ── Check 3: Repo still bound AND not denylisted ─────────────────────────────────
+  // One binding read. A transient `unavailable` closes the stream (fail closed); the operator
+  // reconnects through the full gate stack.
+  const access = await resolveRepoAccess(owner, repo, deps)
   if (isCleaned() === true) return
-  await deps.denylistCache.getDenylistState()
-  if (isCleaned() === true) return
-  if (deps.denylistCache.isRepoDenied(denyKeys) === true) {
-    deps.logger.warn({githubUserId, runId, owner, repo}, 'run-stream: lease closed — repo denylisted')
-    onFail()
-    return
-  }
-
-  // ── Check 4: Repo authz still passes ─────────────────────────────────────
-  // Goes through checkRepoAuthz's cache; revocation detection is bounded by
-  // the positive cache TTL (~5m + 10% jitter) plus the lease interval.
-  // No cache-bypass — accepted for v1 (status-only data).
-  const authzResult = await checkRepoAuthz(githubUserId, owner, repo, freshToken, deps.repoAuthzDeps)
-  if (isCleaned() === true) return
-  if (authzResult.authorized === false) {
-    // Do NOT call dropOperatorToken here — github_denied cannot distinguish
-    // a revoked token from a denied repo. Only drop on a token-specific signal.
-    deps.logger.warn({githubUserId, runId, owner, repo}, 'run-stream: lease closed — authz denied')
+  if (access.kind !== 'allowed') {
+    deps.logger.warn(
+      {githubUserId, gate: access.kind === 'denied' ? 'repo-denied' : 'repo-unavailable'},
+      'run-stream: lease closed',
+    )
     onFail()
   }
 }
@@ -295,8 +296,6 @@ export function buildRunStreamRoute(app: Hono, deps: RunStreamRouteDeps): void {
   const maxStreams = deps.maxStreamsPerOperator ?? DEFAULT_MAX_STREAMS_PER_OPERATOR
 
   registerOperatorRoute(app, 'GET', '/operator/runs/:runId/stream', async (c: Context): Promise<Response> => {
-    const nowMs = deps.now()
-
     // ── Gate 1: Read authenticated context set by the guard ──────────────────
     // In production the guard always sets this; undefined is unreachable.
     // Return not-found as a safe fallback (no oracle — same shape as all denials).
@@ -308,28 +307,16 @@ export function buildRunStreamRoute(app: Hono, deps: RunStreamRouteDeps): void {
 
     const {githubUserId, sessionId} = authCtx
 
-    // ── Gate 2–6: Pre-stream authorization gates ─────────────────────────────
+    // ── Gates 2–4: Pre-stream authorization gates ─────────────────────────────────
     // Wrapped in try/catch so any unexpected throw returns the uniform not-found
     // shape rather than propagating to Hono as a 500 (which would be distinguishable
     // from the 404 and break the no-oracle property).
-    let token: string
     let runId: string
     let owner: string
     let repo: string
 
     try {
-      // ── Gate 2: Resolve OAuth token ────────────────────────────────────────
-      // A missing token means the session is dropped/expired/revoked and re-auth is needed.
-      // Return not-found independent of runId so a re-auth need never becomes a
-      // run-existence timing signal.
-      const resolvedToken = deps.sessionStore.getOperatorToken(sessionId, nowMs)
-      if (resolvedToken === undefined) {
-        deps.logger.warn({githubUserId, gate: 'no-token'}, 'run-stream: denied')
-        return notFoundResponse(c)
-      }
-      token = resolvedToken
-
-      // ── Gates 3–4: Resolve runId → {owner, repo} (server-owned) ──────────────
+      // ── Gates 2–3: Resolve runId → {owner, repo} (server-owned) ──────────────
       // The repo is NEVER taken from the client. RunIndex.lookup is the sole authority.
       // resolveRepoFromRunIndex handles the lookup + owner/repo split in one call.
       runId = c.req.param('runId') ?? ''
@@ -341,19 +328,15 @@ export function buildRunStreamRoute(app: Hono, deps: RunStreamRouteDeps): void {
       owner = resolved.owner
       repo = resolved.repo
 
-      // ── Gate 5: Redaction check (explicit pre-subscribe, fail-closed) ──────
-      // This runs BEFORE checkRepoAuthz so a denylisted repo never triggers a GitHub call.
-      const isDenied = await checkDenylist(owner, repo, deps.bindingsLookup, deps.denylistCache)
-      if (isDenied === true) {
-        deps.logger.warn({githubUserId, runId, gate: 'denylisted'}, 'run-stream: denied')
-        return notFoundResponse(c)
-      }
-
-      // ── Gate 6: Repo authorization ─────────────────────────────────────────
-      // Allowlist + GitHub repo access check. Fail-closed on any error.
-      const authzResult = await checkRepoAuthz(githubUserId, owner, repo, token, deps.repoAuthzDeps)
-      if (authzResult.authorized === false) {
-        deps.logger.warn({githubUserId, runId, gate: 'authz-denied'}, 'run-stream: denied')
+      // ── Gate 4: Repo access (bound AND not denylisted, fail-closed) ───────────────
+      // One binding read. Unbound and denylisted share one denial label so the log is
+      // not an existence oracle; repo-level denials emit no audit event.
+      const access = await resolveRepoAccess(owner, repo, deps)
+      if (access.kind !== 'allowed') {
+        deps.logger.warn(
+          {githubUserId, gate: access.kind === 'denied' ? 'repo-denied' : 'repo-unavailable'},
+          'run-stream: denied',
+        )
         return notFoundResponse(c)
       }
     } catch (error: unknown) {
@@ -361,7 +344,7 @@ export function buildRunStreamRoute(app: Hono, deps: RunStreamRouteDeps): void {
       return notFoundResponse(c)
     }
 
-    // ── Gate 7: Acquire per-operator stream slot ─────────────────────────────
+    // ── Gate 5: Acquire per-operator stream slot ─────────────────────────────────────
     // Keyed on numeric githubUserId (not session — a session key is bypassable
     // by opening multiple sessions). Over cap → 429 (honest backpressure for an
     // already-authorized operator; not a run oracle since authz already passed).
@@ -385,7 +368,7 @@ export function buildRunStreamRoute(app: Hono, deps: RunStreamRouteDeps): void {
       }
     }
 
-    // ── Gate 8: Open SSE stream ──────────────────────────────────────────────
+    // ── Gate 6: Open SSE stream ───────────────────────────────────────────
     // All gates passed. Transition directly into the SSE stream.
     // There is NO intermediate authorized response — the stream IS the success.
 
@@ -465,9 +448,9 @@ export function buildRunStreamRoute(app: Hono, deps: RunStreamRouteDeps): void {
             },
           }
           const readRunState = deps.readRunState
-          // The repo was resolved server-side at gate 3 and has passed redaction (gate 5) and
-          // authz (gate 6); the optional durable read is therefore strictly post-gate. With no
-          // reader wired the call is the original two-argument subscribe.
+          // The repo was resolved server-side at gate 2 and has passed repo access (gate 4); the
+          // optional durable read is therefore strictly post-gate. With no reader wired the call is
+          // the original two-argument subscribe.
           unsubscribe =
             readRunState === undefined
               ? deps.manager.subscribe(runId, callbacks)
@@ -496,14 +479,13 @@ export function buildRunStreamRoute(app: Hono, deps: RunStreamRouteDeps): void {
           }, routeMaxDurationMs)
 
           // Start the continuous-authz lease timer.
-          // Re-verifies session, token, redaction, and repo authz on each tick.
+          // Re-verifies session, allowlist, and repo access on each tick.
           // On any failure, closes this connection only (not run-wide).
           leaseTimer = setIntervalFn((): void => {
             // runLeaseCheck is async; fail-closed on unexpected error.
             runLeaseCheck(
               githubUserId,
               sessionId,
-              runId,
               owner,
               repo,
               deps,
@@ -513,7 +495,7 @@ export function buildRunStreamRoute(app: Hono, deps: RunStreamRouteDeps): void {
                 resolve()
               },
             ).catch((error: unknown) => {
-              deps.logger.warn({runId, githubUserId, error}, 'run-stream: lease check threw — closing stream')
+              deps.logger.warn({githubUserId, error}, 'run-stream: lease check threw — closing stream')
               cleanup('lease-error')
               resolve()
             })

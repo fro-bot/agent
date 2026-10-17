@@ -48,11 +48,12 @@ describe('REDACTION_OBLIGATION', () => {
     expect(REDACTION_OBLIGATION.toLowerCase()).toContain('node_id')
   })
 
-  it('references checkRepoAuthz (composes alongside, not instead of)', () => {
+  it('references resolveRepoAccess (composes alongside, not instead of)', () => {
     // #given — the redaction obligation constant
-    // #when — inspected for the checkRepoAuthz composition rule
-    // #then — checkRepoAuthz is mentioned
-    expect(REDACTION_OBLIGATION).toContain('checkRepoAuthz')
+    // #when — inspected for the repo-access composition rule
+    // #then — resolveRepoAccess is mentioned, and the removed GitHub-based check is not
+    expect(REDACTION_OBLIGATION).toContain('resolveRepoAccess')
+    expect(REDACTION_OBLIGATION).not.toContain('checkRepoAuthz')
   })
 
   it('is importable from the contract barrel (index.ts)', async () => {

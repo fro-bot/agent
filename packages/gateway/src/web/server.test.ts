@@ -20,7 +20,6 @@ import type {RunState} from '@fro-bot/runtime'
 import type {ServerType} from '@hono/node-server'
 
 import type {GitHubOAuthConfig, GitHubOAuthDeps} from './auth/github.js'
-import type {RepoAuthzCache} from './auth/repo-authz.js'
 import type {SessionDeps} from './auth/session.js'
 import type {ResolvedClientAddress} from './ingress/resolve-client.js'
 import type {OperatorServerConfig, OperatorServerDeps} from './server.js'
@@ -2491,11 +2490,44 @@ describe('buildOperatorApp — v1.5.0 full route-registration smoke (drift guard
     expect(missing).toContain('GET:/operator/runs/:runId/approvals')
   })
 
+  it.each(['denylistCache', 'bindingsLookup', 'runObservationManager', 'runIndex'] as const)(
+    'dep-gated negative case: without %s the run-stream route is unmounted and nothing else is',
+    omitted => {
+      // #given — every privileged dep except one of the stream route's own dependencies
+      const sessionStore = createInMemorySessionStore()
+      const app = buildOperatorApp(
+        {...makeFullPrivilegedDeps(sessionStore), [omitted]: undefined},
+        makeStubConfig({githubOAuth: makeStubGitHubOAuthConfig()}),
+      )
+
+      // #when
+      const routeSet = new Set(extractRoutes(app).map(r => `${r.method}:${r.path}`))
+
+      // #then — the stream route is among the missing routes (the omission is visible, not silent)
+      const missing = EXPECTED_OPERATOR_ROUTES.map(r => `${r.method}:${r.path}`).filter(key => !routeSet.has(key))
+      expect(missing).toContain('GET:/operator/runs/:runId/stream')
+    },
+  )
+
+  it.each(['allowlist', 'auditLogger'] as const)(
+    'omitting %s (a run-stream lease dependency) fails construction and names it instead of unmounting silently',
+    omitted => {
+      // #given — the stream route needs the allowlist and audit logger for its lease re-checks;
+      // both belong to the all-or-nothing browser guard
+      const sessionStore = createInMemorySessionStore()
+      const deps = {...makeFullPrivilegedDeps(sessionStore), [omitted]: undefined}
+
+      // #when / #then
+      expect(() => buildOperatorApp(deps, makeStubConfig({githubOAuth: makeStubGitHubOAuthConfig()}))).toThrow(
+        new RegExp(`Missing: ${omitted}`),
+      )
+    },
+  )
+
   it('question decision route: a body over 64 KiB is rejected before session or run lookup', async () => {
     // #given — the full route set with spies on the session and run-index lookups
     const sessionStore = createInMemorySessionStore()
     const getSpy = vi.spyOn(sessionStore, 'get')
-    const getTokenSpy = vi.spyOn(sessionStore, 'getOperatorToken')
     const lookup = vi.fn(async () => undefined)
     const base = makeFullPrivilegedDeps(sessionStore)
     const app = buildOperatorApp(
@@ -2516,7 +2548,6 @@ describe('buildOperatorApp — v1.5.0 full route-registration smoke (drift guard
     expect(res.status).toBe(413)
     expect(lookup).not.toHaveBeenCalled()
     expect(getSpy).not.toHaveBeenCalled()
-    expect(getTokenSpy).not.toHaveBeenCalled()
   })
 
   it('dep-gated negative case: without run/approval deps, privileged run/approval routes do NOT register', () => {
@@ -2623,15 +2654,6 @@ describe('buildOperatorApp — run stream resolves an evicted terminal run from 
     }
   }
 
-  const authorizedRepoAuthzCache = (): RepoAuthzCache => ({
-    get: () => ({authorized: true as const, expiresAt: Number.MAX_SAFE_INTEGER}),
-    set: () => undefined,
-    getInFlight: () => undefined,
-    setInFlight: () => undefined,
-    deleteInFlight: () => undefined,
-    tokenIdentityFor: () => 'stub-token-id',
-  })
-
   it(
     'emits ready, reset, terminal status then closes and releases the slot via the real server wiring',
     {timeout: 10_000},
@@ -2689,7 +2711,6 @@ describe('buildOperatorApp — run stream resolves an evicted terminal run from 
           },
           runObservationManager: manager,
           runIndex,
-          repoAuthzCache: authorizedRepoAuthzCache(),
           rateLimiter: {allow: () => true},
         }),
         makeStubConfig({publicOrigin: 'https://operator.example.com'}),

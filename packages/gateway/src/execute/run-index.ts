@@ -76,11 +76,6 @@ export interface RunIndex {
    *    Cache the result back into the accelerator.
    * 3. Return `undefined` only when no run-state exists anywhere (or the
    *    fallback scan times out — treated as not-found, not an error).
-   *
-   * getOperatorToken re-auth contract (deferred to 4b): a 4b route calls
-   * get() to confirm the session is valid, then getOperatorToken(). A valid
-   * session with undefined token means re-auth is needed (distinct from
-   * no-session). The typed re-auth result shape is designed with the 4b consumer.
    */
   lookup: (runId: string) => Promise<RunLocation | undefined>
 

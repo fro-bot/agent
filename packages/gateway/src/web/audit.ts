@@ -34,16 +34,13 @@ export type AuthCallbackFailureReason =
   | 'not_allowlisted'
   | 'unknown'
 
-/** Safe reasons for authorization denial. */
-export type AuthzDeniedReason =
-  | 'not_allowlisted'
-  | 'suspended'
-  | 'invalid_repo_name'
-  | 'github_denied'
-  | 'rate_limited'
-  | 'lookup_error'
-  | 'insufficient_permission'
-  | 'unknown'
+/**
+ * Safe reasons for operator-level authorization denial.
+ *
+ * Repo-level denials (unbound, denylisted, store unavailable, malformed name) emit no audit event at all,
+ * so only the operator-level reason the run-stream lease emits survives.
+ */
+export type AuthzDeniedReason = 'not_allowlisted'
 
 /** Safe reasons for launch rejection. */
 export type LaunchRejectedReason = 'binding_not_found' | 'concurrency_cap' | 'authz_denied' | 'unknown'

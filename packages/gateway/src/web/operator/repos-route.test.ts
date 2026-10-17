@@ -4,28 +4,24 @@
  * Gate ordering:
  *   1. Guard (browser/session/allowlist) — installed by buildOperatorApp
  *   2. Operator rate limit (20/min, operator-keyed) — before binding enumeration
- *   3. Resolve OAuth token via session store
- *   4. listBindings() — all bound repos
- *   5. filterDeniedRecords() — drop denylisted repos BEFORE any authz call
- *   6. Dedup by owner/repo, then cap before the authz fan-out
- *   7. checkRepoAuthz() per surviving binding — keep only authorized repos
- *   8. Map to RepoSummary[]; return 200
+ *   3. listBindings() — all bound repos
+ *   4. filterDeniedRecords() — drop denylisted repos
+ *   5. Dedup by owner/repo, then cap
+ *   6. Map to RepoSummary[]; return 200
  *
  * Security invariants:
- *   - Denylisted repos are dropped before checkRepoAuthz is called (no oracle).
- *   - Unauthorized repos are silently omitted (no oracle).
+ *   - Denylisted repos are silently omitted (no oracle).
  *   - Store errors return a coarse error; no partial list leaks.
  *   - Response carries no deny-keys, workspacePath, channelId, or internal IDs.
  *   - Result is capped at MAX_REPOS_PER_LISTING (no pagination machinery).
+ *   - One listBindings read; no per-repo store call and no GitHub call.
  */
 
 import type {RepoBinding} from '../../bindings/types.js'
 import type {RepoKey} from '../../redaction/denylist.js'
-import type {RepoAuthzDeps} from '../auth/repo-authz.js'
 import type {ReposRouteDeps} from './repos-route.js'
 import {Hono} from 'hono'
 import {describe, expect, it, vi} from 'vitest'
-import {createRepoAuthzCache} from '../auth/repo-authz.js'
 import {setOperatorRouteGuard} from '../operator-route.js'
 import {buildReposRoute, MAX_REPOS_PER_LISTING} from './repos-route.js'
 
@@ -105,28 +101,6 @@ function makeBinding(owner: string, repo: string, overrides: Partial<RepoBinding
   }
 }
 
-function makeRepoAuthzDeps(authorizedRepos: Set<string>, overrides: Partial<RepoAuthzDeps> = {}): RepoAuthzDeps {
-  return {
-    allowlist: {isAuthorized: () => true, size: 1},
-    fetch: vi.fn(async (url: string | URL | Request) => {
-      const urlStr = String(url)
-      const match = /\/repos\/([^/]+)\/([^/]+)$/.exec(urlStr)
-      if (match !== null) {
-        const key = `${match[1]}/${match[2]}`
-        const status = authorizedRepos.has(key) ? 200 : 404
-        return new Response('{}', {status})
-      }
-      return new Response('{}', {status: 404})
-    }),
-    clock: () => Date.now(),
-    random: () => 0,
-    auditLogger: {info: vi.fn(), warn: vi.fn()},
-    logger: {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
-    cache: createRepoAuthzCache(),
-    ...overrides,
-  }
-}
-
 /**
  * Build a minimal Hono app with the repos route registered.
  * Installs a stub guard that injects the given githubUserId and sessionId.
@@ -143,12 +117,8 @@ function buildTestApp(
 
 function makeBaseDeps(overrides: Partial<ReposRouteDeps> = {}): ReposRouteDeps {
   return {
-    sessionStore: {
-      getOperatorToken: vi.fn(() => 'tok-valid'),
-    },
     listBindings: vi.fn(async () => ({success: true as const, data: [] as RepoBinding[]})),
     isRepoDenied: vi.fn(() => false),
-    repoAuthzDeps: makeRepoAuthzDeps(new Set()),
     logger: {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
     now: () => 0,
     ...overrides,
@@ -160,18 +130,17 @@ function makeBaseDeps(overrides: Partial<ReposRouteDeps> = {}): ReposRouteDeps {
 // ---------------------------------------------------------------------------
 
 describe('GET /operator/repos — happy path', () => {
-  it('returns 200 with only the repos the operator is authorized for', async () => {
-    // #given 4 bindings, operator authorized for 2
+  it('returns 200 with every bound, non-denylisted repo', async () => {
+    // #given 4 bindings, two of them denylisted
     const bindings = [
-      makeBinding('acme', 'alpha'),
-      makeBinding('acme', 'beta'),
-      makeBinding('acme', 'gamma'),
-      makeBinding('acme', 'delta'),
+      makeBinding('acme', 'alpha', {databaseId: 1}),
+      makeBinding('acme', 'beta', {databaseId: 2}),
+      makeBinding('acme', 'gamma', {databaseId: 3}),
+      makeBinding('acme', 'delta', {databaseId: 4}),
     ]
-    const authorizedRepos = new Set(['acme/alpha', 'acme/gamma'])
     const deps = makeBaseDeps({
       listBindings: vi.fn(async () => ({success: true as const, data: bindings})),
-      repoAuthzDeps: makeRepoAuthzDeps(authorizedRepos),
+      isRepoDenied: vi.fn((key: RepoKey) => key.databaseId === 2 || key.databaseId === 4),
     })
     const app = buildTestApp(deps)
 
@@ -180,15 +149,9 @@ describe('GET /operator/repos — happy path', () => {
 
     // #then
     expect(res.status).toBe(200)
-    const body = (await res.json()) as unknown[]
-    expect(body).toHaveLength(2)
-    const owners = (body as {owner: string}[]).map(r => r.owner)
-    const repos = (body as {repo: string}[]).map(r => r.repo)
-    expect(owners).toContain('acme')
-    expect(repos).toContain('alpha')
-    expect(repos).toContain('gamma')
-    expect(repos).not.toContain('beta')
-    expect(repos).not.toContain('delta')
+    const body = (await res.json()) as {owner: string; repo: string}[]
+    expect(body.map(r => r.repo)).toEqual(['alpha', 'gamma'])
+    expect(body.every(r => r.owner === 'acme')).toBe(true)
   })
 
   it('returns 200 with [] when there are no bound repos', async () => {
@@ -207,12 +170,12 @@ describe('GET /operator/repos — happy path', () => {
     expect(body).toEqual([])
   })
 
-  it('returns 200 with [] when operator is authorized for none of the bound repos', async () => {
-    // #given 3 bindings, operator authorized for none
+  it('returns 200 with [] when every bound repo is denylisted', async () => {
+    // #given 3 bindings, all denylisted
     const bindings = [makeBinding('acme', 'alpha'), makeBinding('acme', 'beta'), makeBinding('acme', 'gamma')]
     const deps = makeBaseDeps({
       listBindings: vi.fn(async () => ({success: true as const, data: bindings})),
-      repoAuthzDeps: makeRepoAuthzDeps(new Set()),
+      isRepoDenied: vi.fn(() => true),
     })
     const app = buildTestApp(deps)
 
@@ -227,36 +190,34 @@ describe('GET /operator/repos — happy path', () => {
 })
 
 // ---------------------------------------------------------------------------
-// R19 scope — per-repo authz gates out unauthorized repos
+// Bindings-only — one store read, no per-repo calls
 // ---------------------------------------------------------------------------
 
-describe('GET /operator/repos — R19 scope', () => {
-  it('omits a bound repo the operator has no GitHub access to', async () => {
-    // #given 2 bindings, operator only authorized for one
-    const bindings = [makeBinding('acme', 'public-repo'), makeBinding('acme', 'private-repo')]
-    const authorizedRepos = new Set(['acme/public-repo'])
-    const deps = makeBaseDeps({
-      listBindings: vi.fn(async () => ({success: true as const, data: bindings})),
-      repoAuthzDeps: makeRepoAuthzDeps(authorizedRepos),
-    })
-    const app = buildTestApp(deps)
+describe('GET /operator/repos — bindings-only access', () => {
+  it('makes exactly one listBindings read and no GitHub call, whatever the binding count', async () => {
+    // #given 5 bindings and a global fetch spy
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    const bindings = Array.from({length: 5}, (_, i) => makeBinding('acme', `repo-${i}`))
+    const listBindings = vi.fn(async () => ({success: true as const, data: bindings}))
+    const app = buildTestApp(makeBaseDeps({listBindings}))
 
     // #when
     const res = await app.fetch(new Request('http://localhost/operator/repos'))
 
-    // #then private-repo is omitted
+    // #then
     expect(res.status).toBe(200)
-    const body = (await res.json()) as {repo: string}[]
-    expect(body.map(r => r.repo)).toEqual(['public-repo'])
+    expect(listBindings).toHaveBeenCalledOnce()
+    expect(fetchSpy).not.toHaveBeenCalled()
+    fetchSpy.mockRestore()
   })
 })
 
 // ---------------------------------------------------------------------------
-// Redaction — denylist filter runs BEFORE checkRepoAuthz
+// Redaction — denylist filter
 // ---------------------------------------------------------------------------
 
-describe('GET /operator/repos — denylist filter before authz', () => {
-  it('drops a denylisted repo and never calls checkRepoAuthz for it', async () => {
+describe('GET /operator/repos — denylist filter', () => {
+  it('drops a denylisted repo', async () => {
     // #given 2 bindings; one is denylisted
     const deniedBinding = makeBinding('acme', 'denied-repo', {databaseId: 999, nodeId: 'R_denied'})
     const allowedBinding = makeBinding('acme', 'allowed-repo', {databaseId: 1, nodeId: 'R_allowed'})
@@ -265,20 +226,9 @@ describe('GET /operator/repos — denylist filter before authz', () => {
     // isRepoDenied returns true only for the denied binding's keys
     const isRepoDenied = vi.fn((key: RepoKey) => key.databaseId === 999)
 
-    // checkRepoAuthz spy — should NOT be called for the denied binding
-    const authzFetch = vi.fn(async (url: string | URL | Request) => {
-      const urlStr = String(url)
-      // If called for denied-repo, that is a test failure
-      if (urlStr.includes('denied-repo')) {
-        throw new Error('checkRepoAuthz must not be called for a denylisted repo')
-      }
-      return new Response('{}', {status: 200})
-    }) as typeof globalThis.fetch
-
     const deps = makeBaseDeps({
       listBindings: vi.fn(async () => ({success: true as const, data: bindings})),
       isRepoDenied,
-      repoAuthzDeps: makeRepoAuthzDeps(new Set(['acme/allowed-repo']), {fetch: authzFetch}),
     })
     const app = buildTestApp(deps)
 
@@ -292,11 +242,22 @@ describe('GET /operator/repos — denylist filter before authz', () => {
 
     // isRepoDenied was called for both bindings
     expect(isRepoDenied).toHaveBeenCalledTimes(2)
+  })
 
-    // authzFetch was NOT called for denied-repo (would throw if it were)
-    const authzCalls = (authzFetch as ReturnType<typeof vi.fn>).mock.calls as [string | URL | Request][]
-    const calledUrls = authzCalls.map(([url]) => String(url))
-    expect(calledUrls.some(u => u.includes('denied-repo'))).toBe(false)
+  it('a binding with no deny keys is dropped by the fail-closed predicate', async () => {
+    // #given a legacy binding without databaseId/nodeId
+    const keyless = makeBinding('acme', 'legacy', {databaseId: undefined, nodeId: undefined})
+    const deps = makeBaseDeps({
+      listBindings: vi.fn(async () => ({success: true as const, data: [keyless]})),
+      isRepoDenied: vi.fn((key: RepoKey) => key.databaseId === null && key.nodeId === null),
+    })
+
+    // #when
+    const res = await buildTestApp(deps).fetch(new Request('http://localhost/operator/repos'))
+
+    // #then
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual([])
   })
 })
 
@@ -367,60 +328,6 @@ describe('GET /operator/repos — error paths', () => {
     expect('token' in ctx).toBe(false)
     expect('oauthToken' in ctx).toBe(false)
   })
-
-  it('returns a coarse error when the OAuth token is missing', async () => {
-    // #given session has no token (re-auth needed)
-    const deps = makeBaseDeps({
-      sessionStore: {getOperatorToken: vi.fn(() => undefined)},
-    })
-    const app = buildTestApp(deps)
-
-    // #when
-    const res = await app.fetch(new Request('http://localhost/operator/repos'))
-
-    // #then coarse error
-    expect(res.status).not.toBe(200)
-    const body = (await res.json()) as {error?: string}
-    expect(typeof body.error).toBe('string')
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Degraded path — authz throws for one repo, succeeds for the other
-// ---------------------------------------------------------------------------
-
-describe('GET /operator/repos — checkRepoAuthz throws (degraded path)', () => {
-  it('silently omits a repo when checkRepoAuthz throws — other repos still returned', async () => {
-    // #given — 2 bindings; checkRepoAuthz throws for broken-authz, succeeds for good-repo
-    const bindings = [makeBinding('acme', 'broken-authz'), makeBinding('acme', 'good-repo')]
-
-    // authzFetch throws for broken-authz, returns 200 for good-repo
-    const authzFetch = vi.fn(async (url: string | URL | Request) => {
-      const urlStr = String(url)
-      if (urlStr.includes('broken-authz')) {
-        throw new Error('GitHub API timeout')
-      }
-      return new Response('{}', {status: 200})
-    }) as typeof globalThis.fetch
-
-    const deps = makeBaseDeps({
-      listBindings: vi.fn(async () => ({success: true as const, data: bindings})),
-      repoAuthzDeps: makeRepoAuthzDeps(new Set(['acme/good-repo']), {fetch: authzFetch}),
-    })
-    const app = buildTestApp(deps)
-
-    // #when
-    const res = await app.fetch(new Request('http://localhost/operator/repos'))
-
-    // #then — 200 (not 500); broken-authz omitted; good-repo present
-    expect(res.status).toBe(200)
-    const body = (await res.json()) as {repo: string}[]
-    // Response is an array (not an error object)
-    expect(Array.isArray(body)).toBe(true)
-    const repos = body.map(r => r.repo)
-    expect(repos).toContain('good-repo')
-    expect(repos).not.toContain('broken-authz')
-  })
 })
 
 // ---------------------------------------------------------------------------
@@ -429,7 +336,7 @@ describe('GET /operator/repos — checkRepoAuthz throws (degraded path)', () => 
 
 describe('GET /operator/repos — response shape security', () => {
   it('serialized response items contain only owner, repo, and optional channelName', async () => {
-    // #given 1 authorized binding with all internal fields populated
+    // #given 1 bound binding with all internal fields populated
     const binding = makeBinding('acme', 'widget', {
       channelId: 'chan-secret',
       channelName: 'widget-channel',
@@ -440,7 +347,6 @@ describe('GET /operator/repos — response shape security', () => {
     })
     const deps = makeBaseDeps({
       listBindings: vi.fn(async () => ({success: true as const, data: [binding]})),
-      repoAuthzDeps: makeRepoAuthzDeps(new Set(['acme/widget'])),
     })
     const app = buildTestApp(deps)
 
@@ -472,13 +378,11 @@ describe('GET /operator/repos — response shape security', () => {
 
 describe('GET /operator/repos — hard cap', () => {
   it(`truncates results at MAX_REPOS_PER_LISTING (${MAX_REPOS_PER_LISTING})`, async () => {
-    // #given more bindings than the cap, all authorized
+    // #given more bindings than the cap, none denylisted
     const count = MAX_REPOS_PER_LISTING + 10
     const bindings = Array.from({length: count}, (_, i) => makeBinding('acme', `repo-${i}`))
-    const authorizedRepos = new Set(bindings.map(b => `${b.owner}/${b.repo}`))
     const deps = makeBaseDeps({
       listBindings: vi.fn(async () => ({success: true as const, data: bindings})),
-      repoAuthzDeps: makeRepoAuthzDeps(authorizedRepos),
     })
     const app = buildTestApp(deps)
 
@@ -498,11 +402,10 @@ describe('GET /operator/repos — hard cap', () => {
 
 describe('GET /operator/repos — contract', () => {
   it('response items have owner (string) and repo (string)', async () => {
-    // #given 1 authorized binding
+    // #given 1 bound binding
     const binding = makeBinding('myorg', 'myrepo')
     const deps = makeBaseDeps({
       listBindings: vi.fn(async () => ({success: true as const, data: [binding]})),
-      repoAuthzDeps: makeRepoAuthzDeps(new Set(['myorg/myrepo'])),
     })
     const app = buildTestApp(deps)
 
@@ -530,73 +433,35 @@ describe('GET /operator/repos — contract', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Fix — dedup bindings by owner/repo BEFORE the authz fan-out cap
+// Dedup bindings by owner/repo BEFORE the cap
 // ---------------------------------------------------------------------------
 
-describe('GET /operator/repos — dedup before authz cap', () => {
-  it('reaches the 101st unique repo when two earlier bindings share the same owner/repo', async () => {
+describe('GET /operator/repos — dedup before cap', () => {
+  it('reaches the 101st binding when two earlier bindings share the same owner/repo', async () => {
     // #given — 101 bindings: 2 share acme/shared (different channelIds), 98 distinct repos,
     // plus acme/last-unique. After dedup: 100 distinct repos, all within the cap of 100.
     // Without dedup-before-cap, last-unique (index 100) would be dropped by the cap.
-
     const sharedBindingA = makeBinding('acme', 'shared', {channelId: 'chan-shared-A'})
     const sharedBindingB = makeBinding('acme', 'shared', {channelId: 'chan-shared-B'})
-    // 98 distinct repos (indices 2..99 in the original list)
     const distinctBindings = Array.from({length: 98}, (_, i) =>
       makeBinding('acme', `repo-${i + 2}`, {channelId: `chan-repo-${i + 2}`}),
     )
     const lastUniqueBinding = makeBinding('acme', 'last-unique', {channelId: 'chan-last-unique'})
-
     const bindings = [sharedBindingA, sharedBindingB, ...distinctBindings, lastUniqueBinding]
-
-    // All repos are authorized
-    const authorizedRepos = new Set<string>([
-      'acme/shared',
-      ...distinctBindings.map(b => `${b.owner}/${b.repo}`),
-      'acme/last-unique',
-    ])
-
-    // Track which repos authz was called for
-    const authzFetch = vi.fn(async (url: string | URL | Request) => {
-      const urlStr = String(url)
-      const match = /\/repos\/([^/]+)\/([^/]+)$/.exec(urlStr)
-      if (match !== null) {
-        const key = `${match[1]}/${match[2]}`
-        const status = authorizedRepos.has(key) ? 200 : 404
-        return new Response('{}', {status})
-      }
-      return new Response('{}', {status: 404})
-    }) as typeof globalThis.fetch
 
     const deps = makeBaseDeps({
       listBindings: vi.fn(async () => ({success: true as const, data: bindings})),
-      repoAuthzDeps: makeRepoAuthzDeps(authorizedRepos, {fetch: authzFetch}),
     })
     const app = buildTestApp(deps)
 
     // #when
     const res = await app.fetch(new Request('http://localhost/operator/repos'))
 
-    // #then — status 200
+    // #then — response includes last-unique, and acme/shared exactly once
     expect(res.status).toBe(200)
-
-    // authz was called for acme/last-unique (dedup-before-cap allows it through)
-    const authzCalls = (authzFetch as ReturnType<typeof vi.fn>).mock.calls as [string | URL | Request][]
-    const calledUrls = authzCalls.map(([url]) => String(url))
-    expect(calledUrls.some(u => u.includes('last-unique'))).toBe(true)
-
-    // response includes last-unique
     const body = (await res.json()) as {owner: string; repo: string}[]
-    const repoNames = body.map(r => r.repo)
-    expect(repoNames).toContain('last-unique')
-
-    // acme/shared appears exactly once in the response
-    const sharedEntries = body.filter(r => r.owner === 'acme' && r.repo === 'shared')
-    expect(sharedEntries).toHaveLength(1)
-
-    // acme/shared was authz-checked exactly once
-    const sharedAuthzCalls = calledUrls.filter(u => u.endsWith('/repos/acme/shared'))
-    expect(sharedAuthzCalls).toHaveLength(1)
+    expect(body.map(r => r.repo)).toContain('last-unique')
+    expect(body.filter(r => r.owner === 'acme' && r.repo === 'shared')).toHaveLength(1)
   })
 })
 

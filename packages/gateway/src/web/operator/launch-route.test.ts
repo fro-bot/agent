@@ -18,7 +18,6 @@ import type {RepoBinding} from '../../bindings/types.js'
 import type {LaunchAdmission, LaunchWorkRequest} from '../../execute/launch-types.js'
 import type {RunMentionDeps} from '../../execute/run.js'
 import type {RepoKey} from '../../redaction/denylist.js'
-import type {RepoAuthzDeps} from '../auth/repo-authz.js'
 import type {LaunchRouteBindingsLookup, LaunchRouteDeps, LaunchRouteSessionStore} from './launch-route.js'
 import {Hono} from 'hono'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
@@ -74,7 +73,6 @@ function makeBinding(overrides?: Partial<RepoBinding>): RepoBinding {
 
 function makeSessionStore(overrides?: Partial<LaunchRouteSessionStore>): LaunchRouteSessionStore {
   return {
-    getOperatorToken: vi.fn((_sessionId: string, _nowMs: number) => 'oauth-token-stub'),
     get: vi.fn((_sessionId: string, _nowMs: number) => ({githubUserId: 1001, login: 'alice'})),
     ...overrides,
   }
@@ -89,24 +87,10 @@ function makeBindingsLookup(binding: RepoBinding | null = makeBinding()): Launch
   }
 }
 
-function makeRepoAuthzDeps(): RepoAuthzDeps {
+function makeDenylistCache(denied = false): LaunchRouteDeps['denylistCache'] {
   return {
-    allowlist: {isAuthorized: vi.fn(() => true), size: 1},
-    fetch: vi.fn(
-      async () => new Response('{"permission":"admin"}', {status: 200, headers: {'content-type': 'application/json'}}),
-    ),
-    clock: () => 0,
-    random: () => 0.5,
-    auditLogger: {info: vi.fn(), warn: vi.fn()},
-    logger: {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
-    cache: {
-      get: vi.fn(() => undefined),
-      set: vi.fn(),
-      getInFlight: vi.fn(() => undefined),
-      setInFlight: vi.fn(),
-      deleteInFlight: vi.fn(),
-      tokenIdentityFor: vi.fn(() => 'stub-token-identity'),
-    },
+    getDenylistState: vi.fn(async () => undefined),
+    isRepoDenied: vi.fn((_key: RepoKey) => denied),
   }
 }
 
@@ -180,8 +164,7 @@ function makeDeps(overrides?: Partial<LaunchRouteDeps>): LaunchRouteDeps {
   return {
     sessionStore: makeSessionStore(),
     bindingsLookup: makeBindingsLookup(),
-    isRepoDenied: vi.fn(() => false),
-    repoAuthzDeps: makeRepoAuthzDeps(),
+    denylistCache: makeDenylistCache(),
     idempotencyGuard: createIdempotencyGuard(),
     launchWorkDeps: makeLaunchWorkDeps(),
     logger: {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
@@ -500,39 +483,111 @@ describe('POST /operator/runs — R10 unbound repo', () => {
   })
 })
 
-describe('POST /operator/runs — R19 unauthorized repo', () => {
-  it('returns 404 when operator cannot access the repo', async () => {
-    // #given — authz denied (GitHub returns 403)
-    const repoAuthzDeps: RepoAuthzDeps = {
-      ...makeRepoAuthzDeps(),
-      fetch: vi.fn(async () => new Response('', {status: 403})),
-    }
-    const deps = makeDeps({repoAuthzDeps})
-    const app = buildApp(deps)
+describe('POST /operator/runs — binding store unavailable', () => {
+  it.each([{success: false as const, error: new Error('s3 down')}, 'throws' as const])(
+    'returns the uniform 404 and does not launch (%#)',
+    async failure => {
+      // #given — the binding read fails (error result or throw)
+      const bindingsLookup: LaunchRouteBindingsLookup = {
+        getBindingByRepo: vi.fn(async () => {
+          if (failure === 'throws') throw new Error('boom')
+          return failure
+        }),
+      }
+      const app = buildApp(makeDeps({bindingsLookup}))
+
+      // #when
+      const response = await postRuns(app, {repo: 'acme/widget', prompt: 'do something'})
+
+      // #then
+      expect(response.status).toBe(404)
+      expect(await response.json()).toEqual({error: 'not-found'})
+      expect(mockLaunchWork).not.toHaveBeenCalled()
+    },
+  )
+})
+
+describe('POST /operator/runs — malformed owner/repo', () => {
+  it.each([
+    'acme/..',
+    'acme/.',
+    'acme/a/b',
+    'acme/a\u0000b',
+    'acme/a b',
+    `acme/${'r'.repeat(101)}`,
+    `${'o'.repeat(40)}/widget`,
+    '-acme/widget',
+    'acme-/widget',
+  ])('returns 404 with ZERO binding reads for %j', async repoName => {
+    // #given
+    const bindingsLookup = makeBindingsLookup()
+    const denylistCache = makeDenylistCache()
+    const app = buildApp(makeDeps({bindingsLookup, denylistCache}))
 
     // #when
-    const response = await postRuns(app, {repo: 'acme/widget', prompt: 'do something'})
+    const response = await postRuns(app, {repo: repoName, prompt: 'do something'})
 
-    // #then — coarse 404
+    // #then — denied before the object store or the denylist is touched
     expect(response.status).toBe(404)
+    expect(await response.json()).toEqual({error: 'not-found'})
+    expect(bindingsLookup.getBindingByRepo).not.toHaveBeenCalled()
+    expect(denylistCache.getDenylistState).not.toHaveBeenCalled()
+    expect(mockLaunchWork).not.toHaveBeenCalled()
   })
 })
 
 describe('POST /operator/runs — denylisted repo', () => {
-  it('returns 404 when repo is denylisted (filter before authz)', async () => {
+  it('returns 404 when repo is denylisted, consulting the denylist with the binding keys', async () => {
     // #given — repo is denylisted
-    const isRepoDenied = vi.fn((_key: RepoKey) => true)
-    const repoAuthzDeps = makeRepoAuthzDeps()
-    const checkRepoAuthzSpy = vi.spyOn(repoAuthzDeps, 'fetch')
-    const deps = makeDeps({isRepoDenied, repoAuthzDeps})
-    const app = buildApp(deps)
+    const denylistCache = makeDenylistCache(true)
+    const app = buildApp(makeDeps({denylistCache}))
 
     // #when
     const response = await postRuns(app, {repo: 'acme/widget', prompt: 'do something'})
 
-    // #then — 404, no GitHub call (filter before authz)
+    // #then — 404, nothing launched
     expect(response.status).toBe(404)
-    expect(checkRepoAuthzSpy).not.toHaveBeenCalled()
+    expect(await response.json()).toEqual({error: 'not-found'})
+    expect(denylistCache.getDenylistState).toHaveBeenCalledOnce()
+    expect(denylistCache.isRepoDenied).toHaveBeenCalledExactlyOnceWith({databaseId: 42, nodeId: 'R_node_42'})
+    expect(mockLaunchWork).not.toHaveBeenCalled()
+  })
+
+  it('a binding with no deny keys is denied by the (fail-closed) denylist', async () => {
+    // #given — legacy binding without databaseId/nodeId; the fail-closed predicate denies a null/null key
+    const keylessBinding = makeBinding({databaseId: undefined, nodeId: undefined})
+    const denylistCache: LaunchRouteDeps['denylistCache'] = {
+      getDenylistState: vi.fn(async () => undefined),
+      isRepoDenied: vi.fn((key: RepoKey) => key.databaseId === null && key.nodeId === null),
+    }
+    const app = buildApp(makeDeps({bindingsLookup: makeBindingsLookup(keylessBinding), denylistCache}))
+
+    // #when
+    const response = await postRuns(app, {repo: 'acme/widget', prompt: 'do something'})
+
+    // #then
+    expect(response.status).toBe(404)
+    expect(mockLaunchWork).not.toHaveBeenCalled()
+  })
+
+  it('unbound and denylisted repos produce the same 404 body and the same log label', async () => {
+    // #given
+    const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const unbound = buildApp(makeDeps({logger, bindingsLookup: makeBindingsLookup(null)}))
+    const denied = buildApp(makeDeps({logger, denylistCache: makeDenylistCache(true)}))
+
+    // #when
+    const unboundResponse = await postRuns(unbound, {repo: 'acme/widget', prompt: 'do something'})
+    const deniedResponse = await postRuns(denied, {repo: 'acme/widget', prompt: 'do something'})
+
+    // #then
+    expect(unboundResponse.status).toBe(deniedResponse.status)
+    expect(await unboundResponse.text()).toBe(await deniedResponse.text())
+    const denialContexts = logger.warn.mock.calls.map(call => call[0] as unknown)
+    expect(denialContexts).toEqual([
+      {githubUserId: 1001, gate: 'repo-denied'},
+      {githubUserId: 1001, gate: 'repo-denied'},
+    ])
   })
 })
 

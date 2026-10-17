@@ -1235,52 +1235,6 @@ describe('emitAudit — approval.decision with once/always/reject', () => {
 })
 
 // ---------------------------------------------------------------------------
-// authz.denied — insufficient_permission reason
-// ---------------------------------------------------------------------------
-
-describe('emitAudit — authz.denied with insufficient_permission', () => {
-  it('emits a structured warn record with reason:"insufficient_permission"', () => {
-    // #given
-    const logger = makeLogger()
-    const event: AuditEvent = {
-      kind: 'authz.denied',
-      correlationId: 'corr-insuf',
-      githubUserId: 42,
-      reason: 'insufficient_permission',
-    }
-
-    // #when
-    emitAudit(event, logger)
-
-    // #then
-    expect(logger.warn).toHaveBeenCalledOnce()
-    expect(logger.info).not.toHaveBeenCalled()
-    expect(firstCallCtx(logger.warn)).toMatchObject({
-      kind: 'authz.denied',
-      reason: 'insufficient_permission',
-    })
-  })
-
-  it('reason enum "insufficient_permission" survives redaction', () => {
-    // #given
-    const logger = makeLogger()
-    const event: AuditEvent = {
-      kind: 'authz.denied',
-      correlationId: PLANTED_TOKEN,
-      githubUserId: 42,
-      reason: 'insufficient_permission',
-    }
-
-    // #when
-    emitAudit(event, logger)
-
-    // #then
-    assertNoSensitiveValues(logger)
-    expect(serializeAllCalls(logger)).toContain('insufficient_permission')
-  })
-})
-
-// ---------------------------------------------------------------------------
 // push.subscribed / push.unsubscribed
 // ---------------------------------------------------------------------------
 

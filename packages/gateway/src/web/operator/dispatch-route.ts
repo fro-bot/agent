@@ -9,13 +9,13 @@
  * Gate ordering:
  *   1. Guard (browser/session/allowlist/CSRF) — installed by buildOperatorApp
  *   2. Operator-keyed rate limit (3/min, 10/hr)
- *   3. Session token and server-side identity
+ *   3. Server-side session identity
  *   4. JSON body validation ({repo, task})
- *   5. Server-owned binding resolution
- *   6. Denylist check — before authz, with no oracle
- *   7. Write-level repo authorization
- *   8. Idempotency check/reservation
- *   9. DispatchWorkflow
+ *   5. resolveRepoAccess — name validation, ONE server-owned binding read, then the
+ *      denylist; the same predicate every other operator route uses. Anything but
+ *      `allowed` returns the uniform 404.
+ *   6. Idempotency check/reservation
+ *   7. DispatchWorkflow (runs as the Fro Bot GitHub App installation, not as the operator)
  *
  * All dispatcher outcomes are returned unchanged as 200 {outcome}. The audit
  * record contains only the outcome discriminant and optional run ID; request
@@ -23,23 +23,20 @@
  */
 
 import type {Hono} from 'hono'
-import type {RepoBinding} from '../../bindings/types.js'
 import type {DispatchOutcome, DispatchWorkflow} from '../../github/dispatch.js'
 import type {RateLimiter} from '../../http/rate-limit.js'
-import type {RepoKey} from '../../redaction/denylist.js'
+import type {DenylistCache} from '../../redaction/denylist.js'
 import type {AuditLogger} from '../audit.js'
-import type {RepoAuthzDeps} from '../auth/repo-authz.js'
 import type {OperatorLogger} from '../server.js'
 import type {IdempotencyGuard} from './idempotency.js'
 import type {LaunchRouteBindingsLookup, LaunchRouteSessionStore} from './launch-route.js'
 import {createHash, randomUUID} from 'node:crypto'
 import {createRateLimiter} from '../../http/rate-limit.js'
-import {bindingToRepoKey} from '../../redaction/surface-gate.js'
 import {emitAudit} from '../audit.js'
-import {checkRepoWriteAuthz} from '../auth/repo-authz.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
 import {notFoundResponse, rateLimitedResponse} from '../safe-response.js'
 import {IDEMPOTENCY_KEY_MAX_LENGTH} from './idempotency.js'
+import {resolveRepoAccess} from './route-helpers.js'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -63,9 +60,8 @@ const DISPATCH_IDEMPOTENCY_MAX_ENTRIES = 10_000
 export interface DispatchRouteDeps {
   readonly sessionStore: LaunchRouteSessionStore
   readonly bindingsLookup: LaunchRouteBindingsLookup
-  /** Must run before write authz so denied repos never trigger a GitHub query. */
-  readonly isRepoDenied: (repoKey: RepoKey) => boolean
-  readonly repoAuthzDeps: RepoAuthzDeps
+  /** Primed and consulted by resolveRepoAccess after the binding is found. */
+  readonly denylistCache: Pick<DenylistCache, 'getDenylistState' | 'isRepoDenied'>
   readonly dispatchWorkflow: DispatchWorkflow
   readonly idempotencyGuard: IdempotencyGuard
   readonly auditLogger: AuditLogger
@@ -129,11 +125,6 @@ export function buildDispatchRoute(app: Hono, deps: DispatchRouteDeps): void {
       return rateLimitedResponse(c)
     }
 
-    const token = deps.sessionStore.getOperatorToken(sessionId, nowMs)
-    if (token === undefined) {
-      deps.logger.warn({githubUserId, gate: 'no-token'}, 'dispatch: denied — token missing')
-      return notFoundResponse(c)
-    }
     if (deps.sessionStore.get(sessionId, nowMs) === undefined) {
       deps.logger.warn({githubUserId, gate: 'no-session'}, 'dispatch: denied — session missing')
       return notFoundResponse(c)
@@ -173,38 +164,14 @@ export function buildDispatchRoute(app: Hono, deps: DispatchRouteDeps): void {
     const idempotencyKey =
       typeof idempotencyKeyField === 'string' && idempotencyKeyField.length > 0 ? idempotencyKeyField : undefined
 
-    let binding: RepoBinding
-    try {
-      const bindingResult = await deps.bindingsLookup.getBindingByRepo(owner, repo)
-      if (bindingResult.success === false || bindingResult.data === null) {
-        deps.logger.warn({githubUserId, gate: 'binding'}, 'dispatch: denied — repo not bound')
-        return notFoundResponse(c)
-      }
-      binding = bindingResult.data
-    } catch {
-      deps.logger.warn({githubUserId, gate: 'binding'}, 'dispatch: denied — binding lookup failed')
-      return notFoundResponse(c)
-    }
-
-    try {
-      if (deps.isRepoDenied(bindingToRepoKey(binding)) === true) {
-        deps.logger.warn({githubUserId, gate: 'denylisted'}, 'dispatch: denied — repo denylisted')
-        return notFoundResponse(c)
-      }
-    } catch {
-      deps.logger.warn({githubUserId, gate: 'denylisted'}, 'dispatch: denied — denylist check failed')
-      return notFoundResponse(c)
-    }
-
-    let authzResult
-    try {
-      authzResult = await checkRepoWriteAuthz(githubUserId, owner, repo, token, deps.repoAuthzDeps)
-    } catch {
-      deps.logger.warn({githubUserId, gate: 'authz-denied'}, 'dispatch: denied — repo authz failed')
-      return notFoundResponse(c)
-    }
-    if (authzResult.authorized === false) {
-      deps.logger.warn({githubUserId, gate: 'authz-denied'}, 'dispatch: denied — repo authz failed')
+    // One binding read. Unbound and denylisted share one denial label so the log is not
+    // an existence oracle; a malformed name makes zero store calls.
+    const access = await resolveRepoAccess(owner, repo, deps)
+    if (access.kind !== 'allowed') {
+      deps.logger.warn(
+        {githubUserId, gate: access.kind === 'denied' ? 'repo-denied' : 'repo-unavailable'},
+        'dispatch: denied — repo access',
+      )
       return notFoundResponse(c)
     }
 

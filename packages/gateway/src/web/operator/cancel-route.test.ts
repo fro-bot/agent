@@ -21,7 +21,6 @@ import type {CancelOutcome} from '../../execute/cancel.js'
 import type {RunLocation} from '../../execute/run-index.js'
 import type {RepoKey} from '../../redaction/denylist.js'
 import type {AuditLogger} from '../audit.js'
-import type {RepoAuthzDeps} from '../auth/repo-authz.js'
 import type {CancelRouteDeps} from './cancel-route.js'
 import {Hono} from 'hono'
 import {describe, expect, it, vi} from 'vitest'
@@ -42,23 +41,8 @@ vi.mock('../../execute/cancel.js', () => ({
 // Stub factories (mirrors decision-route.test.ts)
 // ---------------------------------------------------------------------------
 
-function makeSessionStore(overrides?: {
-  getOperatorToken?: (sessionId: string, nowMs: number) => string | undefined
-  get?: (
-    sessionId: string,
-    nowMs: number,
-  ) =>
-    | {
-        readonly githubUserId: number
-        readonly login: string
-        readonly issuedAt: number
-        readonly lastAccessedAt: number
-        readonly revoked: boolean
-      }
-    | undefined
-}): CancelRouteDeps['sessionStore'] {
+function makeSessionStore(overrides?: Partial<CancelRouteDeps['sessionStore']>): CancelRouteDeps['sessionStore'] {
   return {
-    getOperatorToken: vi.fn((_sessionId: string, _nowMs: number) => 'oauth-token-stub'),
     get: vi.fn((_sessionId: string, _nowMs: number) => ({
       githubUserId: 1001,
       login: 'alice',
@@ -83,61 +67,24 @@ function makeDenylistCache(denied = false): CancelRouteDeps['denylistCache'] {
   }
 }
 
-function makeBindingsLookup(): CancelRouteDeps['bindingsLookup'] {
-  return {
-    getBindingByRepo: vi.fn(async (_owner: string, _repo: string) => ({
-      success: true as const,
-      data: {
-        owner: 'acme',
-        repo: 'widget',
-        channelId: 'ch-123',
-        channelName: 'widget-dev',
-        workspacePath: '/workspace/acme/widget',
-        createdAt: '2026-01-01T00:00:00Z',
-        createdByDiscordId: 'discord-user-1',
-        databaseId: 42,
-        nodeId: 'R_node_42',
-      },
-    })),
-  }
+const WIDGET_BINDING = {
+  owner: 'acme',
+  repo: 'widget',
+  channelId: 'ch-123',
+  channelName: 'widget-dev',
+  workspacePath: '/workspace/acme/widget',
+  createdAt: '2026-01-01T00:00:00Z',
+  createdByDiscordId: 'discord-user-1',
+  databaseId: 42,
+  nodeId: 'R_node_42',
 }
 
-function makeWriteRepoAuthzDeps(): RepoAuthzDeps {
-  return {
-    allowlist: {isAuthorized: vi.fn(() => true), size: 1},
-    fetch: vi.fn(
-      async () =>
-        new Response(JSON.stringify({permissions: {push: true, admin: false}}), {
-          status: 200,
-          headers: {'content-type': 'application/json'},
-        }),
-    ),
-    clock: () => 0,
-    random: () => 0.5,
-    auditLogger: {info: vi.fn(), warn: vi.fn()},
-    logger: {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
-    cache: {
-      get: vi.fn(() => undefined),
-      set: vi.fn(),
-      getInFlight: vi.fn(() => undefined),
-      setInFlight: vi.fn(),
-      deleteInFlight: vi.fn(),
-      tokenIdentityFor: vi.fn(() => 'stub-token-identity'),
-    },
-  }
-}
-
-function makeReadOnlyRepoAuthzDeps(): RepoAuthzDeps {
-  return {
-    ...makeWriteRepoAuthzDeps(),
-    fetch: vi.fn(
-      async () =>
-        new Response(JSON.stringify({permissions: {pull: true, push: false, admin: false}}), {
-          status: 200,
-          headers: {'content-type': 'application/json'},
-        }),
-    ),
-  }
+function makeBindingsLookup(
+  result:
+    | {readonly success: true; readonly data: typeof WIDGET_BINDING | null}
+    | {readonly success: false; readonly error: Error} = {success: true, data: WIDGET_BINDING},
+) {
+  return {getBindingByRepo: vi.fn(async (_owner: string, _repo: string) => result)}
 }
 
 function makeAuditLogger(): AuditLogger {
@@ -153,7 +100,6 @@ function makeDeps(overrides?: Partial<CancelRouteDeps>): CancelRouteDeps {
     runIndex: makeRunIndex(),
     denylistCache: makeDenylistCache(),
     bindingsLookup: makeBindingsLookup(),
-    repoAuthzDeps: makeWriteRepoAuthzDeps(),
     cancelRunDeps: {} as CancelRouteDeps['cancelRunDeps'],
     auditLogger: makeAuditLogger(),
     logger: {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
@@ -250,17 +196,6 @@ describe('POST cancel — no-oracle denials (load-bearing)', () => {
     expect(cancelRunMock).not.toHaveBeenCalled()
   })
 
-  it('no token → notFoundResponse, zero cancelRun calls', async () => {
-    cancelRunMock.mockReset()
-    const deps = makeDeps({sessionStore: makeSessionStore({getOperatorToken: () => undefined})})
-    const app = buildApp(deps)
-
-    const response = await postCancel(app, 'run-abc')
-
-    expect(response.status).toBe(404)
-    expect(cancelRunMock).not.toHaveBeenCalled()
-  })
-
   it('runIndex miss → notFoundResponse, zero cancelRun calls', async () => {
     cancelRunMock.mockReset()
     const deps = makeDeps({runIndex: {lookup: vi.fn(async () => undefined)}})
@@ -285,17 +220,72 @@ describe('POST cancel — no-oracle denials (load-bearing)', () => {
     expect(cancelRunMock).not.toHaveBeenCalled()
   })
 
-  it('read-only operator (insufficient_permission) → notFoundResponse, zero cancelRun calls', async () => {
+  it('unbound repo → notFoundResponse, zero cancelRun calls', async () => {
     cancelRunMock.mockReset()
-    const deps = makeDeps({repoAuthzDeps: makeReadOnlyRepoAuthzDeps()})
+    const deps = makeDeps({bindingsLookup: makeBindingsLookup({success: true, data: null})})
     const app = buildApp(deps)
 
     const response = await postCancel(app, 'run-abc')
 
     expect(response.status).toBe(404)
-    const body = (await response.json()) as {error: string}
-    expect(body.error).toBe('not-found')
+    expect(await response.json()).toEqual({error: 'not-found'})
     expect(cancelRunMock).not.toHaveBeenCalled()
+  })
+
+  it('binding store error or throw → notFoundResponse, zero cancelRun calls', async () => {
+    cancelRunMock.mockReset()
+    const failing = makeDeps({bindingsLookup: makeBindingsLookup({success: false, error: new Error('s3 down')})})
+    const throwing = makeDeps({
+      bindingsLookup: {
+        getBindingByRepo: vi.fn(async () => {
+          throw new Error('boom')
+        }),
+      },
+    })
+
+    for (const deps of [failing, throwing]) {
+      const response = await postCancel(buildApp(deps), 'run-abc')
+      expect(response.status).toBe(404)
+      expect(await response.json()).toEqual({error: 'not-found'})
+    }
+    expect(cancelRunMock).not.toHaveBeenCalled()
+  })
+
+  it('malformed owner/repo from the run index → notFoundResponse with zero binding reads', async () => {
+    cancelRunMock.mockReset()
+    const bindingsLookup = makeBindingsLookup()
+    const deps = makeDeps({runIndex: makeRunIndex({repo: 'acme/..', surface: 'web'}), bindingsLookup})
+    const app = buildApp(deps)
+
+    const response = await postCancel(app, 'run-abc')
+
+    expect(response.status).toBe(404)
+    expect(bindingsLookup.getBindingByRepo).not.toHaveBeenCalled()
+    expect(cancelRunMock).not.toHaveBeenCalled()
+  })
+
+  it('repo-level denial emits no audit event and logs carry no owner/repo/runId', async () => {
+    cancelRunMock.mockReset()
+    const auditLogger = makeAuditLogger()
+    const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const denied = makeDeps({auditLogger, logger, denylistCache: makeDenylistCache(true)})
+    const unbound = makeDeps({
+      auditLogger,
+      logger,
+      bindingsLookup: makeBindingsLookup({success: true, data: null}),
+    })
+
+    await postCancel(buildApp(denied), 'run-abc')
+    await postCancel(buildApp(unbound), 'run-abc')
+
+    expect(auditLogger.info).not.toHaveBeenCalled()
+    expect(auditLogger.warn).not.toHaveBeenCalled()
+    // Unbound and denylisted share one denial label (no existence oracle in the log).
+    const warnContexts = logger.warn.mock.calls.map(call => call[0] as unknown)
+    expect(warnContexts).toEqual([
+      {githubUserId: 1001, gate: 'repo-denied'},
+      {githubUserId: 1001, gate: 'repo-denied'},
+    ])
   })
 
   it('gate throw → identical notFoundResponse (no-oracle), zero cancelRun calls', async () => {
@@ -320,20 +310,24 @@ describe('POST cancel — no-oracle denials (load-bearing)', () => {
   it('all denial shapes are identical (same status + body)', async () => {
     const missDeps = makeDeps({runIndex: {lookup: vi.fn(async () => undefined)}})
     const deniedDeps = makeDeps({denylistCache: makeDenylistCache(true)})
-    const readOnlyDeps = makeDeps({repoAuthzDeps: makeReadOnlyRepoAuthzDeps()})
+    const unboundDeps = makeDeps({bindingsLookup: makeBindingsLookup({success: true, data: null})})
+    const unavailableDeps = makeDeps({
+      bindingsLookup: makeBindingsLookup({success: false, error: new Error('s3 down')}),
+    })
+    const malformedDeps = makeDeps({runIndex: makeRunIndex({repo: 'acme/..', surface: 'web'})})
 
     cancelRunMock.mockReset()
-    const missResp = await postCancel(buildApp(missDeps), 'run-abc')
-    const deniedResp = await postCancel(buildApp(deniedDeps), 'run-abc')
-    const readOnlyResp = await postCancel(buildApp(readOnlyDeps), 'run-abc')
+    const responses = await Promise.all(
+      [missDeps, deniedDeps, unboundDeps, unavailableDeps, malformedDeps].map(async deps =>
+        postCancel(buildApp(deps), 'run-abc'),
+      ),
+    )
 
-    expect(missResp.status).toBe(deniedResp.status)
-    expect(deniedResp.status).toBe(readOnlyResp.status)
-    const missBody = (await missResp.json()) as {error: string}
-    const deniedBody = (await deniedResp.json()) as {error: string}
-    const readOnlyBody = (await readOnlyResp.json()) as {error: string}
-    expect(missBody.error).toBe(deniedBody.error)
-    expect(deniedBody.error).toBe(readOnlyBody.error)
+    for (const response of responses) {
+      expect(response.status).toBe(404)
+      expect(await response.json()).toEqual({error: 'not-found'})
+    }
+    expect(cancelRunMock).not.toHaveBeenCalled()
   })
 })
 
@@ -404,7 +398,7 @@ describe('POST cancel — rate limiting', () => {
 
     const deniedDeps = makeDeps({denylistCache: makeDenylistCache(true), rateLimiter})
     const deniedApp = buildApp(deniedDeps)
-    // Denied at gate 5 (denylist) — before rate limiting — must not consume budget.
+    // Denied at gate 4 (repo access) — before rate limiting — must not consume budget.
     const deniedResponse = await postCancel(deniedApp, 'run-abc')
     expect(deniedResponse.status).toBe(404)
     expect(rateLimiter.allow).not.toHaveBeenCalled()
