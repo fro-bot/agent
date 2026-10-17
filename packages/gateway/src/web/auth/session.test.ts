@@ -17,7 +17,7 @@
 
 import type {AuditLogger} from '../audit.js'
 import type {BrowserGuardDeps} from './csrf.js'
-import type {SessionDeps, SessionStore} from './session.js'
+import type {DurableSessionStore, SessionDeps} from './session.js'
 import {Buffer} from 'node:buffer'
 import {Hono} from 'hono'
 import {describe, expect, it, vi} from 'vitest'
@@ -35,6 +35,7 @@ import {
   SESSION_IDLE_TTL_MS,
   SESSION_MAX_ENTRIES,
 } from './session.js'
+import {createTestSessionStore, createTestSessionStoreHarness, mintTestSession} from './test-session-store.js'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -670,7 +671,7 @@ const PUBLIC_ORIGIN = 'https://operator.example.com'
  * Logout is always a privileged route — this helper mirrors the production wiring in server.ts.
  */
 function buildTestLogoutApp(
-  store: SessionStore,
+  store: DurableSessionStore,
   deps: SessionDeps,
   guardDepsOverrides?: Partial<BrowserGuardDeps>,
 ): Hono {
@@ -706,10 +707,9 @@ function buildTestLogoutApp(
 describe('POST /operator/auth/logout — happy path (privileged route)', () => {
   it('returns 200 and clears the session cookie when session + CSRF are valid', async () => {
     // #given
-    const store = createInMemorySessionStore()
+    const store = await createTestSessionStore()
     const now = 1_000_000
-    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+    const sessionId = await mintTestSession(store, {githubUserId: 42, login: 'octocat'})
     const deps = makeStubDeps({clock: () => now + 1_000})
     const csrfToken = generateCsrfToken({sessionId, operatorId: 42, nowMs: now + 1_000, secret: TEST_CSRF_SECRET})
     const app = buildTestLogoutApp(store, deps)
@@ -729,15 +729,14 @@ describe('POST /operator/auth/logout — happy path (privileged route)', () => {
     expect(res.status).toBe(200)
 
     // #and — session is invalidated server-side
-    expect(store.get(sessionId, now + 2_000)).toBeUndefined()
+    expect(store.get(sessionId)).toBeUndefined()
   })
 
   it('sets a clear-cookie header on logout', async () => {
     // #given
-    const store = createInMemorySessionStore()
+    const store = await createTestSessionStore()
     const now = 1_000_000
-    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+    const sessionId = await mintTestSession(store, {githubUserId: 42, login: 'octocat'})
     const deps = makeStubDeps({clock: () => now + 1_000})
     const csrfToken = generateCsrfToken({sessionId, operatorId: 42, nowMs: now + 1_000, secret: TEST_CSRF_SECRET})
     const app = buildTestLogoutApp(store, deps)
@@ -761,10 +760,9 @@ describe('POST /operator/auth/logout — happy path (privileged route)', () => {
 
   it('emits auth.logout audit event with githubUserId', async () => {
     // #given
-    const store = createInMemorySessionStore()
+    const store = await createTestSessionStore()
     const now = 1_000_000
-    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+    const sessionId = await mintTestSession(store, {githubUserId: 42, login: 'octocat'})
     const auditLogger = makeAuditLogger()
     const deps = makeStubDeps({clock: () => now + 1_000, auditLogger})
     const csrfToken = generateCsrfToken({sessionId, operatorId: 42, nowMs: now + 1_000, secret: TEST_CSRF_SECRET})
@@ -790,10 +788,9 @@ describe('POST /operator/auth/logout — happy path (privileged route)', () => {
 
   it('audit event correlationId does NOT contain the raw session ID', async () => {
     // #given — session IDs are never logged (security invariant)
-    const store = createInMemorySessionStore()
+    const store = await createTestSessionStore()
     const now = 1_000_000
-    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+    const sessionId = await mintTestSession(store, {githubUserId: 42, login: 'octocat'})
     const auditLogger = makeAuditLogger()
     const deps = makeStubDeps({clock: () => now + 1_000, auditLogger})
     const csrfToken = generateCsrfToken({sessionId, operatorId: 42, nowMs: now + 1_000, secret: TEST_CSRF_SECRET})
@@ -828,7 +825,7 @@ describe('POST /operator/auth/logout — happy path (privileged route)', () => {
 describe('POST /operator/auth/logout — guard enforcement (privileged route)', () => {
   it('returns 401 when no session cookie is present (guard rejects unauthenticated requests)', async () => {
     // #given — logout is a privileged route; no session = 401
-    const store = createInMemorySessionStore()
+    const store = await createTestSessionStore()
     const deps = makeStubDeps()
     const app = buildTestLogoutApp(store, deps)
 
@@ -845,10 +842,9 @@ describe('POST /operator/auth/logout — guard enforcement (privileged route)', 
 
   it('returns 400 when session is valid but CSRF token is missing', async () => {
     // #given — valid session but no CSRF token
-    const store = createInMemorySessionStore()
+    const store = await createTestSessionStore()
     const now = 1_000_000
-    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+    const sessionId = await mintTestSession(store, {githubUserId: 42, login: 'octocat'})
     const deps = makeStubDeps({clock: () => now + 1_000})
     const app = buildTestLogoutApp(store, deps)
 
@@ -869,10 +865,9 @@ describe('POST /operator/auth/logout — guard enforcement (privileged route)', 
 
   it('returns 400 when Origin header is absent on mutating request', async () => {
     // #given — valid session and CSRF token but no Origin header
-    const store = createInMemorySessionStore()
+    const store = await createTestSessionStore()
     const now = 1_000_000
-    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+    const sessionId = await mintTestSession(store, {githubUserId: 42, login: 'octocat'})
     const deps = makeStubDeps({clock: () => now + 1_000})
     const csrfToken = generateCsrfToken({sessionId, operatorId: 42, nowMs: now + 1_000, secret: TEST_CSRF_SECRET})
     const app = buildTestLogoutApp(store, deps)
@@ -894,10 +889,9 @@ describe('POST /operator/auth/logout — guard enforcement (privileged route)', 
 
   it('returns 403 when operator is not in allowlist', async () => {
     // #given — session for user 99 who is NOT in the allowlist (allowlist has 42)
-    const store = createInMemorySessionStore()
+    const store = await createTestSessionStore()
     const now = 1_000_000
-    const sessionId = store.create({githubUserId: 99, login: 'notallowed'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+    const sessionId = await mintTestSession(store, {githubUserId: 99, login: 'notallowed'})
     const deps = makeStubDeps({clock: () => now + 1_000})
     const csrfToken = generateCsrfToken({sessionId, operatorId: 99, nowMs: now + 1_000, secret: TEST_CSRF_SECRET})
     const app = buildTestLogoutApp(store, deps)
@@ -921,7 +915,7 @@ describe('POST /operator/auth/logout — guard enforcement (privileged route)', 
 describe('POST /operator/auth/logout — unknown session ID', () => {
   it('returns 401 for an unknown session ID (guard rejects invalid session)', async () => {
     // #given — unknown session ID; guard rejects before handler runs
-    const store = createInMemorySessionStore()
+    const store = await createTestSessionStore()
     const deps = makeStubDeps()
     const app = buildTestLogoutApp(store, deps)
 
@@ -937,6 +931,103 @@ describe('POST /operator/auth/logout — unknown session ID', () => {
 
     // #then — guard rejects with 401 (invalid session)
     expect(res.status).toBe(401)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Logout — durable first
+// ---------------------------------------------------------------------------
+
+describe('POST /operator/auth/logout — durable first', () => {
+  const now = 1_000_000
+
+  async function setup(onSessionRevoked?: (githubUserId: number) => void) {
+    const harness = await createTestSessionStoreHarness(
+      onSessionRevoked === undefined ? {clock: () => now} : {clock: () => now, onSessionRevoked},
+    )
+    const sessionId = await mintTestSession(harness.store, {githubUserId: 42, login: 'octocat'})
+    const auditLogger = makeAuditLogger()
+    const deps = makeStubDeps({clock: () => now + 1_000, auditLogger})
+    const app = buildTestLogoutApp(harness.store, deps, {auditLogger, clock: () => now + 1_000})
+    const logout = async () =>
+      app.fetch(
+        new Request(`${PUBLIC_ORIGIN}/operator/auth/logout`, {
+          method: 'POST',
+          headers: {
+            cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+            origin: PUBLIC_ORIGIN,
+            'x-csrf-token': generateCsrfToken({
+              sessionId,
+              operatorId: 42,
+              nowMs: now + 1_000,
+              secret: TEST_CSRF_SECRET,
+            }),
+          },
+        }),
+      )
+    return {harness, sessionId, auditLogger, logout}
+  }
+
+  function storedStatus(harness: Awaited<ReturnType<typeof setup>>['harness']): string | undefined {
+    const [stored] = [...harness.objectStore.objects.values()]
+    return stored === undefined ? undefined : (JSON.parse(stored.data) as {status?: string}).status
+  }
+
+  it('answers 200 only after the stored record is revoked', async () => {
+    // #given a live session and an observer inside the durable write
+    const hook = vi.fn()
+    const {harness, sessionId, logout} = await setup(hook)
+    const observed: {validDuringWrite?: boolean} = {}
+    harness.objectStore.onBefore('conditionalPut', () => {
+      observed.validDuringWrite = harness.store.get(sessionId) !== undefined
+    })
+
+    // #when the operator logs out
+    const res = await logout()
+
+    // #then the session was still valid during the write, and the record is revoked by the time of the 200
+    expect(res.status).toBe(200)
+    expect(observed.validDuringWrite).toBe(true)
+    expect(storedStatus(harness)).toBe('revoked')
+    expect(harness.store.get(sessionId)).toBeUndefined()
+    expect(hook).toHaveBeenCalledExactlyOnceWith(42)
+  })
+
+  it('returns 503 with Retry-After, keeps the cookie and leaves the session valid when the write fails', async () => {
+    // #given a durable write that fails
+    const hook = vi.fn()
+    const {harness, sessionId, auditLogger, logout} = await setup(hook)
+    harness.objectStore.failNext('conditionalPut')
+
+    // #when the operator logs out
+    const res = await logout()
+
+    // #then logout is refused and nothing about the session changed
+    expect(res.status).toBe(503)
+    expect(res.headers.get('retry-after')).not.toBeNull()
+    expect(res.headers.get('set-cookie')).toBeNull()
+    expect(harness.store.get(sessionId)).toBeDefined()
+    expect(storedStatus(harness)).toBe('active')
+    expect(hook).not.toHaveBeenCalled()
+    expect(auditLogger.records.some(r => r.kind === 'auth.logout')).toBe(false)
+  })
+
+  it('succeeds on retry after a failed attempt, with one hook and the clear cookie', async () => {
+    // #given a first attempt that failed
+    const hook = vi.fn()
+    const {harness, sessionId, logout} = await setup(hook)
+    harness.objectStore.failNext('conditionalPut')
+    await logout()
+
+    // #when the operator retries
+    const res = await logout()
+
+    // #then the retry is durable, clears the cookie, and fires the hook once
+    expect(res.status).toBe(200)
+    expect(res.headers.get('set-cookie')?.toLowerCase()).toContain('max-age=0')
+    expect(storedStatus(harness)).toBe('revoked')
+    expect(harness.store.get(sessionId)).toBeUndefined()
+    expect(hook).toHaveBeenCalledExactlyOnceWith(42)
   })
 })
 
@@ -1444,10 +1535,9 @@ describe('createInMemorySessionStore — create signature backward compat', () =
 describe('POST /operator/auth/logout — response body', () => {
   it('response body is {ok: true} when session + CSRF are valid', async () => {
     // #given — valid session and CSRF token
-    const store = createInMemorySessionStore()
+    const store = await createTestSessionStore()
     const now = 1_000_000
-    const sessionId = store.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session ID to be defined')
+    const sessionId = await mintTestSession(store, {githubUserId: 42, login: 'octocat'})
     const deps = makeStubDeps({clock: () => now + 1_000})
     const csrfToken = generateCsrfToken({sessionId, operatorId: 42, nowMs: now + 1_000, secret: TEST_CSRF_SECRET})
     const app = buildTestLogoutApp(store, deps)

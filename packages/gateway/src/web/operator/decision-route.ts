@@ -36,7 +36,7 @@ import type {PermissionReply} from '../../operator-contract/approval.js'
 import type {DenylistCache} from '../../redaction/denylist.js'
 import type {BindingsLookup} from '../../redaction/surface-gate.js'
 import type {ApprovalRejectedReason, AuditLogger} from '../audit.js'
-import type {SessionStore} from '../auth/session.js'
+import type {SessionReader} from '../auth/session.js'
 import type {OperatorLogger} from '../server.js'
 import {toOperatorDecisionState} from '../../operator-contract/approval.js'
 import {emitAudit} from '../audit.js'
@@ -51,7 +51,7 @@ import {resolveRepoAccess, resolveRepoFromRunIndex} from './route-helpers.js'
 /** Dependencies for the decision route. */
 export interface DecisionRouteDeps {
   /** Session store for the actor's display login. */
-  readonly sessionStore: Pick<SessionStore, 'get'>
+  readonly sessionStore: SessionReader
   /** Server-owned run index for runId → repo resolution. */
   readonly runIndex: Pick<RunIndex, 'lookup'>
   /** Denylist cache for pre-decision redaction check. */

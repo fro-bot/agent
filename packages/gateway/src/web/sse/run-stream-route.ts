@@ -30,7 +30,7 @@ import type {DenylistCache} from '../../redaction/denylist.js'
 import type {BindingsLookup} from '../../redaction/surface-gate.js'
 import type {AuditLogger} from '../audit.js'
 import type {OperatorAllowlist} from '../auth/allowlist.js'
-import type {SessionStore} from '../auth/session.js'
+import type {SessionReader} from '../auth/session.js'
 import type {OperatorLogger} from '../server.js'
 import type {ObservationFrame, RunObservationManager} from './manager.js'
 import {streamSSE, type SSEStreamingApi} from 'hono/streaming'
@@ -48,7 +48,7 @@ import {DEFAULT_MAX_STREAM_DURATION_MS} from './manager.js'
 /** Dependencies for the run-stream route. */
 export interface RunStreamRouteDeps {
   /** Session store for the live-session check. Identity only — sessions hold no credential. */
-  readonly sessionStore: Pick<SessionStore, 'get'>
+  readonly sessionStore: SessionReader
   /** Server-owned run index for runId → repo resolution. */
   readonly runIndex: Pick<FullRunIndex, 'lookup'>
   /**

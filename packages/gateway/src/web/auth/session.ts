@@ -29,7 +29,7 @@ import {Effect} from 'effect'
 import {emitAudit} from '../audit.js'
 import {respondForIngressRejection} from '../ingress/hono-context.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
-import {okResponse, rateLimitedResponse} from '../safe-response.js'
+import {okResponse, rateLimitedResponse, unavailableResponse} from '../safe-response.js'
 import {hashSessionId} from './session-persistence.js'
 
 // ---------------------------------------------------------------------------
@@ -206,6 +206,14 @@ export interface DurableSession extends SessionIdentity {
 }
 
 /** `cap` and `not_ready` are refusals before any write; `write_failed` is a failed durable create. */
+/**
+ * What a route needs from the session store: the identity of a live session. The clock argument is ignored
+ * by the durable store, which reads its own clock; Unit 7 drops it.
+ */
+export interface SessionReader {
+  readonly get: (sessionId: string, nowMs: number) => DurableSession | undefined
+}
+
 export type DurableCreateResult =
   {readonly outcome: 'ok'; readonly sessionId: string} | {readonly outcome: 'cap' | 'write_failed' | 'not_ready'}
 
@@ -465,6 +473,9 @@ interface DurableEntry {
   readonly issuedAt: number
   revoked: boolean
 }
+
+/** Retry-After for a logout whose durable revoke failed. */
+const LOGOUT_RETRY_AFTER_SECONDS = 5
 
 const SESSION_RESTORE_CORRELATION_ID = 'session-restore'
 const REVOCATION_CORRELATION_ID = 'session-revoke'
@@ -803,7 +814,7 @@ export function parseSessionCookie(cookieHeader: string | undefined): string | u
  */
 export function buildLogoutRoutes(
   app: Hono,
-  store: SessionStore,
+  store: Pick<DurableSessionStore, 'revoke'>,
   deps: SessionDeps,
   _browserGuardDeps: BrowserGuardDeps,
 ): void {
@@ -840,7 +851,14 @@ export function buildLogoutRoutes(
 
     const {sessionId, githubUserId} = authCtx
 
-    // Emit audit event before deleting the session.
+    // Durable first: a 200 means the revoke is stored. On a failed write the session stays valid, the
+    // cookie stays, and the operator retries.
+    const revoked = await store.revoke(sessionId)
+    if (revoked.outcome === 'persist_failed') {
+      deps.logger.warn({githubUserId}, 'session logout failed: revoke not durable; session stays valid')
+      return unavailableResponse(c, LOGOUT_RETRY_AFTER_SECONDS)
+    }
+
     emitAudit(
       {
         kind: 'auth.logout',
@@ -851,9 +869,7 @@ export function buildLogoutRoutes(
     )
     deps.logger.info({githubUserId}, 'session logout')
 
-    store.delete(sessionId)
-
-    // Always clear the cookie — idempotent logout
+    // Clear the cookie only after the revoke landed.
     const clearCookie = buildSessionCookieValue('', {clear: true})
     c.header('Set-Cookie', clearCookie)
 

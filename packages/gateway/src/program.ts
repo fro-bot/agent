@@ -11,6 +11,7 @@ import type {AnnounceServerConfig, AnnounceServerDeps} from './http/server.js'
 import type {CoordinationLogger} from './runtime-effect.js'
 import type {CloseableServer} from './shutdown.js'
 import type {OperatorAllowlist} from './web/auth/allowlist.js'
+import type {DurableSessionStore} from './web/auth/session.js'
 import type {OperatorIngressPolicy} from './web/ingress/policy.js'
 import type {IngressRejection, ResolvedClientAddress} from './web/ingress/resolve-client.js'
 import type {PushDispatcher} from './web/operator-push/dispatcher.js'
@@ -18,6 +19,7 @@ import type {PushHealthStatus} from './web/operator-push/push-health.js'
 import type {OperatorPushSubscriptionStore} from './web/operator-push/subscription-store.js'
 import type {VapidPublicKeyInfo} from './web/operator-push/vapid.js'
 import type {OperatorServerConfig, OperatorServerDeps} from './web/server.js'
+import {Buffer} from 'node:buffer'
 import {
   createS3Adapter,
   DEFAULT_HEARTBEAT_INTERVAL_MS,
@@ -61,7 +63,8 @@ import {forceReleaseStaleLockEffect} from './runtime-effect.js'
 import {DEFAULT_DRAIN_MS, installShutdownHandlers, isShuttingDown} from './shutdown.js'
 import {emitAudit} from './web/audit.js'
 import {buildGitHubOAuthDeps} from './web/auth/github.js'
-import {createInMemorySessionStore} from './web/auth/session.js'
+import {createSessionPersistence, deriveSessionRecordKey} from './web/auth/session-persistence.js'
+import {createDurableSessionStore, DURABLE_SESSION_TTL_MS} from './web/auth/session.js'
 import {extractRawIngressInput} from './web/ingress/hono-context.js'
 import {resolveClient} from './web/ingress/resolve-client.js'
 import {createDedupeCache} from './web/operator-push/dedupe-cache.js'
@@ -75,6 +78,9 @@ import {createWebQuestionOnRegistered} from './web/operator/web-question.js'
 import {createRunObservationManager} from './web/sse/manager.js'
 import {createWorkspaceClient} from './workspace-api/client.js'
 import {ensureWorkspaceClone} from './workspace-api/ensure-clone.js'
+
+/** One hourly tick scavenges the session map and sweeps stored records: retention is the TTL plus this interval. */
+const SESSION_MAINTENANCE_INTERVAL_MS = 60 * 60_000
 
 // ---------------------------------------------------------------------------
 // Pure helper — builds the coordination config from the shared S3 adapter and
@@ -208,13 +214,10 @@ export interface BuildOperatorServerInputs {
    */
   readonly operatorPushHealth?: () => PushHealthStatus
   /**
-   * Operator push session-revoke hook — opt-in, present only when push is
-   * enabled. Registered onto every session minted through the OAuth
-   * callback so a subsequent logout (or TTL expiry) deactivates that
-   * operator's push subscriptions. Fail-soft: the hook itself must never
-   * throw out of `sessionStore`'s revoke path.
+   * Durable session store, already built and loaded by the caller. The helper stays synchronous: the load
+   * happens before this call so no request can reach an unloaded store.
    */
-  readonly onSessionRevoke?: (githubUserId: number) => void
+  readonly sessionStore: DurableSessionStore
   readonly operatorWebConfig: {
     readonly bindHost: string
     readonly bindPort: number
@@ -241,8 +244,7 @@ export interface BuildOperatorServerInputs {
  * Build the OperatorServerDeps and OperatorServerConfig objects from
  * program-scoped instances.
  *
- * Constructs operator-local pieces (rate limiter, session store, OAuth deps,
- * resolveClientAddress) internally. The caller passes already-constructed program-scoped
+ * Constructs operator-local pieces (rate limiter, OAuth deps, resolveClientAddress) internally. The caller passes already-constructed program-scoped
  * instances (denylistCache, bindingsStore, runObservationManager, runIndex,
  * approvalRegistry) in.
  *
@@ -271,7 +273,7 @@ export function buildOperatorServerInputs(inputs: BuildOperatorServerInputs): {
     dispatchWorkflow,
     operatorPush,
     operatorPushHealth,
-    onSessionRevoke,
+    sessionStore,
     operatorWebConfig,
   } = inputs
 
@@ -290,9 +292,7 @@ export function buildOperatorServerInputs(inputs: BuildOperatorServerInputs): {
   // participate in the same per-socket budget as the health route.
   const operatorRateLimiter = createRateLimiter({limit: 20, windowMs: 60_000})
 
-  // Build the shared in-memory session store for the operator surface.
-  // Gateway restart is global logout — acceptable for v1.
-  const sessionStore = createInMemorySessionStore()
+  // The durable session store is built and loaded by the caller; the helper only threads it through.
   const sessionDeps = {
     logger,
     auditLogger: logger,
@@ -310,7 +310,6 @@ export function buildOperatorServerInputs(inputs: BuildOperatorServerInputs): {
     sessionStore,
     sessionDeps,
     operatorWebConfig.allowlist,
-    onSessionRevoke,
   )
 
   const deps: OperatorServerDeps = {
@@ -368,6 +367,25 @@ export function buildOperatorServerInputs(inputs: BuildOperatorServerInputs): {
   }
 
   return {deps, config}
+}
+
+/**
+ * One session maintenance tick: scavenge the map, then sweep stored records. Skips a store that is not
+ * ready, and never rejects.
+ */
+export async function runSessionMaintenance(sessionStore: DurableSessionStore, logger: GatewayLogger): Promise<void> {
+  if (sessionStore.isReady() === false) {
+    return
+  }
+  try {
+    sessionStore.scavenge()
+    await sessionStore.sweep()
+  } catch (error) {
+    logger.warn(
+      {errorClass: error instanceof Error ? error.name : 'unknown'},
+      'operator sessions: maintenance tick failed',
+    )
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -890,6 +908,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
     //     vars are set. Partial config fails closed at loadGatewayConfig() time.
     //     When absent, operatorServerHandle is undefined and shutdown skips it.
     let operatorServerHandle: CloseableServer | undefined
+    let sessionMaintenanceInterval: ReturnType<typeof setInterval> | undefined
     if (config.operatorWeb === undefined || deps.startOperatorServer === undefined) {
       logger.info({}, 'operator web endpoint disabled — no operator web config set')
     } else {
@@ -966,52 +985,33 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
         }
       }
 
-      // Build the operator server deps and config via the shared helper.
-      // The helper constructs operator-local pieces (rate limiter, session store,
-      // OAuth deps, resolveClientAddress) and wires the program-scoped instances.
-      // Using the helper here ensures production and the offline diagnostic share
-      // the same wiring path — a future edit that drops a dep from the helper
-      // will be caught by the diagnostic before it reaches production.
-      const operatorInputs = buildOperatorServerInputs({
+      // Durable operator sessions. The store sits on the shared adapter (keys are raw, not prefixed) and
+      // signs records with a key derived from the CSRF secret. The revoke hook is defined only when push is
+      // enabled (operatorPush is present iff its self-test passed above), and the same hook replays at
+      // load for revokes whose deactivation failed.
+      //
+      // Deactivation is keyed by the operator's GitHub user id, not the session — logging out of ONE
+      // browser session deactivates that operator's push subscriptions across ALL their devices. This is
+      // intentional for a shared operator console: subscriptions are identity-scoped, not session-scoped,
+      // and re-subscribing from a still-active session restores push. Fail-soft: the hook never throws.
+      const pushStoreForRevoke = operatorPush?.store
+      const sessionStore = createDurableSessionStore({
+        persistence: createSessionPersistence({
+          adapter: s3Adapter,
+          logger,
+          clock: () => Date.now(),
+          macKey: deriveSessionRecordKey(Buffer.from(config.operatorWeb.csrfSecret, 'base64url')),
+          absoluteTtlMs: DURABLE_SESSION_TTL_MS,
+        }),
+        clock: () => Date.now(),
         logger,
-        isShuttingDown,
-        denylistCache,
-        bindingsStore,
-        runObservationManager,
-        runIndex,
-        approvalRegistry,
-        questionRegistry,
-        cancelRunDeps: {
-          coordinationConfig: makeCoordinationConfig(s3Adapter, config),
-          identity: config.identity,
-          runIndex,
-          queue: channelQueue,
-          abortRegistry,
-          approvalRegistry,
-          postCancelNotice: createCancelNoticeDispatcher(client, logger),
-          runObserver: runObservationManager,
-        },
-        launchWorkDeps: runEngineDeps,
-        dispatchWorkflow,
-        operatorPush,
-        operatorPushHealth: pushHealth.getStatus,
-        // Session revoke → operator push deactivation. Only registered when
-        // push is enabled (operatorPush is present here iff the self-test
-        // above succeeded). Fail-soft: a throwing deactivateForOperator must
-        // never break session revocation itself.
-        //
-        // Deactivation is keyed by the operator's GitHub user id, not the
-        // session — logging out of ONE browser session deactivates that
-        // operator's push subscriptions across ALL their browsers/devices.
-        // This is intentional for a shared operator console: subscriptions
-        // are identity-scoped, not session-scoped (there is no
-        // session→endpoint link), and re-subscribing from a still-active
-        // session restores push.
-        onSessionRevoke:
-          operatorPush === undefined
-            ? undefined
-            : (githubUserId: number) => {
-                operatorPush.store
+        auditLogger: logger,
+        allowlist: config.operatorWeb.allowlist,
+        ...(pushStoreForRevoke === undefined
+          ? {}
+          : {
+              onSessionRevoked: (githubUserId: number) => {
+                pushStoreForRevoke
                   .deactivateForOperator({operatorId: String(githubUserId)})
                   .then(result => {
                     if (result.success === true && result.data.skipped > 0) {
@@ -1041,6 +1041,76 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
                     // must never surface as an unhandled rejection.
                   })
               },
+            }),
+      })
+
+      // Load every stored session BEFORE the server is built, so no request can reach an unloaded store.
+      // A failed self-test or load never aborts startup: the store stays not ready, login returns 503, and
+      // only a restart recovers — there is no retry timer. load() itself logs and audits a returned
+      // failure; this catch covers a throw.
+      yield* Effect.tryPromise({
+        try: async () => sessionStore.load(),
+        catch: error => (error instanceof Error ? error : new Error(String(error))),
+      }).pipe(
+        Effect.catchAll(error =>
+          Effect.sync(() => {
+            logger.error(
+              {errorClass: error.name},
+              'session restore threw; the session store is not ready until restart',
+            )
+            emitAudit(
+              {
+                kind: 'auth.session.restore',
+                correlationId: 'session-restore',
+                outcome: 'failed',
+                phase: 'load',
+                errorClass: 'threw',
+              },
+              logger,
+            )
+          }),
+        ),
+      )
+
+      // One unref'd hourly tick: scavenge the map, then sweep stored records past retention. A not-ready
+      // store is left alone, and a failing tick is logged and never fatal.
+      sessionMaintenanceInterval = setInterval(() => {
+        runSessionMaintenance(sessionStore, logger).catch(() => {
+          // runSessionMaintenance handles its own errors; this keeps the timer from ever raising.
+        })
+      }, SESSION_MAINTENANCE_INTERVAL_MS)
+      sessionMaintenanceInterval.unref()
+
+      // Build the operator server deps and config via the shared helper.
+      // The helper constructs operator-local pieces (rate limiter, session store,
+      // OAuth deps, resolveClientAddress) and wires the program-scoped instances.
+      // Using the helper here ensures production and the offline diagnostic share
+      // the same wiring path — a future edit that drops a dep from the helper
+      // will be caught by the diagnostic before it reaches production.
+      const operatorInputs = buildOperatorServerInputs({
+        logger,
+        isShuttingDown,
+        denylistCache,
+        bindingsStore,
+        runObservationManager,
+        runIndex,
+        approvalRegistry,
+        questionRegistry,
+        cancelRunDeps: {
+          coordinationConfig: makeCoordinationConfig(s3Adapter, config),
+          identity: config.identity,
+          runIndex,
+          queue: channelQueue,
+          abortRegistry,
+          approvalRegistry,
+          postCancelNotice: createCancelNoticeDispatcher(client, logger),
+          runObserver: runObservationManager,
+        },
+        launchWorkDeps: runEngineDeps,
+        dispatchWorkflow,
+        operatorPush,
+        operatorPushHealth: pushHealth.getStatus,
+        sessionStore,
         operatorWebConfig: config.operatorWeb,
       })
 
@@ -1083,6 +1153,9 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
     installShutdownHandlers(client, logger, undefined, compositeServerHandle, async () => {
       // Stop the denylist background refresh — no new refreshes after shutdown starts.
       clearInterval(denylistRefreshInterval)
+      if (sessionMaintenanceInterval !== undefined) {
+        clearInterval(sessionMaintenanceInterval)
+      }
 
       // Stop refreshing status from gate events, then shut down the run-observation manager —
       // closes all SSE subscriptions and clears timers.

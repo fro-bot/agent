@@ -32,7 +32,7 @@ import type {RateLimiter} from '../../http/rate-limit.js'
 import type {DenylistCache} from '../../redaction/denylist.js'
 import type {BindingsLookup} from '../../redaction/surface-gate.js'
 import type {AuditLogger} from '../audit.js'
-import type {SessionStore} from '../auth/session.js'
+import type {SessionReader} from '../auth/session.js'
 import type {OperatorLogger} from '../server.js'
 import {cancelRun} from '../../execute/cancel.js'
 import {createRateLimiter} from '../../http/rate-limit.js'
@@ -56,7 +56,7 @@ const CANCEL_RATE_WINDOW_MIN_MS = 60_000
 /** Dependencies for the cancel route. */
 export interface CancelRouteDeps {
   /** Session store for the actor's display login. */
-  readonly sessionStore: Pick<SessionStore, 'get'>
+  readonly sessionStore: SessionReader
   /** Server-owned run index for runId → repo resolution. */
   readonly runIndex: Pick<RunIndex, 'lookup'>
   /** Denylist cache for pre-cancel redaction check. */

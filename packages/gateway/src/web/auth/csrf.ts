@@ -27,7 +27,7 @@
 import type {Context} from 'hono'
 import type {AuditLogger, BrowserGuardRejectedReason} from '../audit.js'
 import type {OperatorAllowlist} from './allowlist.js'
-import type {SessionStore} from './session.js'
+import type {DurableSessionStore} from './session.js'
 import {Buffer} from 'node:buffer'
 import {createHmac, timingSafeEqual} from 'node:crypto'
 import {emitAudit} from '../audit.js'
@@ -85,7 +85,7 @@ export interface CsrfLogger {
 export interface BrowserGuardDeps {
   readonly logger: CsrfLogger
   readonly auditLogger: AuditLogger
-  readonly sessionStore: SessionStore
+  readonly sessionStore: Pick<DurableSessionStore, 'get'>
   readonly allowlist: OperatorAllowlist
   readonly csrfSecret: string
   readonly publicOrigin: string
@@ -418,7 +418,7 @@ export async function applyBrowserGuard(
   }
 
   const nowMs = deps.clock()
-  const session = deps.sessionStore.get(sessionId, nowMs)
+  const session = deps.sessionStore.get(sessionId)
   if (session === undefined) {
     deps.logger.warn({}, 'browser guard: invalid or expired session')
     emitAudit(
@@ -432,8 +432,6 @@ export async function applyBrowserGuard(
   const {githubUserId} = session
 
   // c) Enforce allowlist against session-bound GitHub numeric ID
-  // Touch session ONLY after allowlist passes — non-allowlisted sessions must not
-  // extend their idle TTL (they should expire naturally).
   if (deps.allowlist.isAuthorized(githubUserId) === false) {
     deps.logger.warn({githubUserId}, 'browser guard: operator not in allowlist')
     emitAudit(
@@ -443,9 +441,6 @@ export async function applyBrowserGuard(
     addVaryHeader(c)
     return {ok: false, response: c.json({error: 'forbidden'}, 403)}
   }
-
-  // Touch session to extend idle TTL — only after allowlist authorization passes.
-  deps.sessionStore.touch(sessionId, nowMs)
 
   // d) Validate Origin
   const originHeader = c.req.header('origin')

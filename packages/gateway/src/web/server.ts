@@ -40,7 +40,7 @@ import type {BindingsLookup} from '../redaction/surface-gate.js'
 import type {AuditLogger} from './audit.js'
 import type {OperatorAllowlist} from './auth/allowlist.js'
 import type {GitHubOAuthConfig, GitHubOAuthDeps} from './auth/github.js'
-import type {SessionDeps, SessionStore} from './auth/session.js'
+import type {DurableSessionStore, SessionDeps} from './auth/session.js'
 import type {OperatorIngressPolicy} from './ingress/policy.js'
 import type {PushHealthStatus} from './operator-push/push-health.js'
 import type {SubscriptionRouteSessionStore} from './operator-push/subscription-route.js'
@@ -159,10 +159,11 @@ export interface OperatorServerDeps {
    */
   readonly githubOAuth?: GitHubOAuthDeps
   /**
-   * Optional session store for the logout route.
-   * When present (alongside sessionDeps), POST /operator/auth/logout is registered.
+   * Optional durable session store. Built and loaded by program.ts before the server starts: the browser
+   * guard and every route read sessions from its in-memory map, and the OAuth callback and logout write
+   * through it. When present (alongside sessionDeps), POST /operator/auth/logout is registered.
    */
-  readonly sessionStore?: SessionStore
+  readonly sessionStore?: DurableSessionStore
   /**
    * Session deps (logger, auditLogger, clock) for the logout route.
    * Required when sessionStore is present; ignored otherwise.
@@ -407,6 +408,7 @@ function isTrustedPeer(socketAddress: string | undefined, policy: OperatorIngres
  * conditionally when their deps are present:
  *   - GitHub OAuth (start + callback): when deps.githubOAuth + config.githubOAuth are set
  *   - POST /operator/auth/logout: when sessionStore + sessionDeps + browser guard deps are set
+ *     (durable-first: 200 only after the revoke is stored, 503 and a still-valid session otherwise)
  *   - GET /operator/session/csrf: when browser guard deps are set
  *   - GET /operator/session: when browser guard deps are set
  *   - GET /operator/repos: when browser guard + sessionStore + denylistCache + listBindings are set

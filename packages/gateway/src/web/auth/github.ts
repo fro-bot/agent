@@ -55,7 +55,7 @@ import type {RateLimiter} from '../../http/rate-limit.js'
 import type {AuditLogger} from '../audit.js'
 import type {IngressRejection, ResolvedClientAddress} from '../ingress/resolve-client.js'
 import type {OperatorAllowlist} from './allowlist.js'
-import type {SessionDeps, SessionStore} from './session.js'
+import type {DurableSessionStore, SessionDeps} from './session.js'
 import {createHash, randomBytes} from 'node:crypto'
 import {Effect} from 'effect'
 import {emitAudit} from '../audit.js'
@@ -171,12 +171,12 @@ export interface GitHubOAuthDeps {
    */
   readonly rateLimiter: RateLimiter
   /**
-   * Server-side session store. When present, a successful OAuth callback mints
+   * Durable session store. When present, a successful OAuth callback mints
    * a fresh session and sets the __Host- session cookie. When absent, the
    * callback returns a coarse JSON identity response (pre-session-layer posture;
    * there is no session to land in, so no default-path redirect applies).
    */
-  readonly sessionStore?: SessionStore
+  readonly sessionStore?: DurableSessionStore
   /**
    * Session deps (logger, auditLogger, clock) for session operations.
    * Required when sessionStore is present; ignored otherwise.
@@ -189,17 +189,6 @@ export interface GitHubOAuthDeps {
    * get a session cookie. When absent, no allowlist check is performed.
    */
   readonly allowlist?: OperatorAllowlist
-  /**
-   * Operator push deactivation hook — opt-in, present only when operator push
-   * is configured. Called with the newly-minted session's `githubUserId`
-   * immediately after a session is created, so it can be closed over and
-   * invoked later from `sessionStore.onRevoke` (fired on logout / TTL
-   * expiry). Registered here — not inside the revoke hook itself — because
-   * `SessionStore.onRevoke`'s hook signature only receives the sessionId,
-   * and the entry's identity is not guaranteed readable once revoked; the
-   * identity is captured at session-creation time instead.
-   */
-  readonly onSessionRevoke?: (githubUserId: number) => void
 }
 
 /** Configuration for the GitHub OAuth PKCE + state routes. */
@@ -258,10 +247,9 @@ export function buildGitHubOAuthDeps(
   auditLogger: AuditLogger,
   resolveClientAddress: (c: Context) => Effect.Effect<ResolvedClientAddress, IngressRejection>,
   rateLimiter: RateLimiter,
-  sessionStore?: SessionStore,
+  sessionStore?: DurableSessionStore,
   sessionDeps?: SessionDeps,
   allowlist?: OperatorAllowlist,
-  onSessionRevoke?: (githubUserId: number) => void,
 ): GitHubOAuthDeps {
   return {
     logger,
@@ -276,13 +264,15 @@ export function buildGitHubOAuthDeps(
     ...(sessionStore === undefined ? {} : {sessionStore}),
     ...(sessionDeps === undefined ? {} : {sessionDeps}),
     ...(allowlist === undefined ? {} : {allowlist}),
-    ...(onSessionRevoke === undefined ? {} : {onSessionRevoke}),
   }
 }
 
 // ---------------------------------------------------------------------------
 // In-memory state store
 // ---------------------------------------------------------------------------
+
+/** Retry-After seconds for a login the store refused, by reason. `not_ready` clears only on a restart. */
+const LOGIN_RETRY_AFTER_SECONDS = {cap: 60, write_failed: 10, not_ready: 60} as const
 
 /** Global ceiling on live OAuth states across all accounting keys (~1 MB worst case at ~200 bytes each). */
 const MAX_GLOBAL_STATE_STORE_ENTRIES = 1_000
@@ -837,40 +827,36 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
         return forbiddenResponse(c)
       }
 
-      const nowMs = deps.sessionDeps.clock()
+      // The OAuth token has served its only purpose (`GET /user`) and is never passed on: the store
+      // receives identity only.
+      const created = await deps.sessionStore.create({githubUserId, login})
+      if (created.outcome !== 'ok') {
+        // Capacity, a failed durable write or a store that is not ready: no session exists, no cookie is
+        // set, and any current session is untouched. 503 rather than 400 because none of these is a bad request.
+        deps.sessionDeps.logger.warn({githubUserId, outcome: created.outcome}, 'oauth callback: session not minted')
+        return unavailableResponse(c, LOGIN_RETRY_AFTER_SECONDS[created.outcome])
+      }
+      const newSessionId = created.sessionId
 
-      // Clear any stale pre-auth session cookie before setting the new one
-      // to prevent session fixation.
-      const existingCookieHeader = c.req.header('cookie')
-      const existingSessionId = parseSessionCookie(existingCookieHeader)
+      // Retire the session behind a stale cookie, durably, to prevent session fixation. A live session of the
+      // same user is rotated (no push deactivation). A live session of another user is revoked and fires the
+      // revoke hook. An ID that is not live is revoked by hash and fires no hook.
+      const existingSessionId = parseSessionCookie(c.req.header('cookie'))
       if (existingSessionId !== undefined) {
-        deps.sessionStore.delete(existingSessionId)
+        const existing = deps.sessionStore.get(existingSessionId)
+        const rotate = existing === undefined || existing.githubUserId === githubUserId
+        const retired = await deps.sessionStore.revoke(existingSessionId, {rotate})
+        if (retired.outcome === 'persist_failed') {
+          // The old session stays valid. Discard the new one without a hook; if this write fails too, the
+          // record is an orphan nobody holds the ID for.
+          await deps.sessionStore.revoke(newSessionId, {rotate: true})
+          deps.sessionDeps.logger.warn({githubUserId}, 'oauth callback: stale session not retired — login refused')
+          return unavailableResponse(c, LOGIN_RETRY_AFTER_SECONDS.write_failed)
+        }
       }
 
-      // Pass the access token to the session store for server-side retention.
-      // The token is stored in-memory only — never in the cookie, never logged,
-      // never in any operator-facing response. The cookie value remains the opaque
-      // session ID; the token is accessible only via sessionStore.getOperatorToken().
-      const newSessionId = deps.sessionStore.create({githubUserId, login}, accessToken, nowMs)
-      if (newSessionId === undefined) {
-        // Session cap reached — return 503 with Retry-After so clients know to retry.
-        // This is a capacity issue, not a bad request; 400 would be semantically wrong.
-        deps.sessionDeps.logger.warn({githubUserId}, 'oauth callback: session cap reached')
-        return unavailableResponse(c, 60)
-      }
-
-      // Emit success audit event only after session is successfully minted.
+      // Emit success audit event only after the session is minted and the old one is retired.
       emitAudit({kind: 'auth.callback.success', correlationId, githubUserId, login}, deps.auditLogger)
-
-      // Register the operator push deactivation hook for this session, closing
-      // over githubUserId now — sessionStore.onRevoke's hook only receives the
-      // sessionId, and the entry's identity is not reliably readable once the
-      // session has been marked revoked.
-      if (deps.onSessionRevoke !== undefined) {
-        deps.sessionStore.onRevoke(newSessionId, () => {
-          deps.onSessionRevoke?.(githubUserId)
-        })
-      }
 
       // Clear stale cookie first, then set the new session cookie.
       // Hono's c.header() appends when called multiple times for Set-Cookie.

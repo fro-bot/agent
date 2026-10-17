@@ -29,6 +29,9 @@ import {ok} from '@fro-bot/runtime'
 import {Effect} from 'effect'
 import {buildOperatorServerInputs} from '../program.js'
 import {loadAllowlistFromText} from './auth/allowlist.js'
+import {createSessionPersistence, deriveSessionRecordKey} from './auth/session-persistence.js'
+import {createDurableSessionStore, DURABLE_SESSION_TTL_MS} from './auth/session.js'
+import {createTestObjectStore} from './auth/test-object-store.js'
 import {makeTrustedProxyIngressPolicy} from './ingress/policy.js'
 import {parseTrustedProxyAddress} from './ingress/trusted-proxy-address.js'
 import {buildOperatorApp} from './server.js'
@@ -75,6 +78,31 @@ function makeNoopLogger() {
     warn: (_ctx: Record<string, unknown>, _msg: string) => undefined,
     error: (_ctx: Record<string, unknown>, _msg: string) => undefined,
   }
+}
+
+/**
+ * The real durable session store over the shared in-memory object-store fake. It is never loaded: the route
+ * inventory only checks that the dependency is present, and no request is served.
+ */
+function makeStubSessionStore(
+  logger: ReturnType<typeof makeNoopLogger>,
+  csrfSecret: string,
+  allowlist: ReturnType<typeof loadAllowlistFromText>,
+) {
+  const clock = () => Date.now()
+  return createDurableSessionStore({
+    persistence: createSessionPersistence({
+      adapter: createTestObjectStore().adapter,
+      logger,
+      clock,
+      macKey: deriveSessionRecordKey(Buffer.from(csrfSecret, 'base64url')),
+      absoluteTtlMs: DURABLE_SESSION_TTL_MS,
+    }),
+    clock,
+    logger,
+    auditLogger: logger,
+    allowlist,
+  })
 }
 
 function makeStubDenylistCache() {
@@ -375,6 +403,7 @@ export async function runOperatorRouteSmoke(options?: OperatorRouteSmokeOptions)
     // passes undefined to deps.operatorPushStore/deps.operatorPushVapidKeyInfo
     // and the /operator/push/* routes are absent.
     operatorPush,
+    sessionStore: makeStubSessionStore(noopLogger, operatorWebConfig.csrfSecret, allowlist),
     operatorWebConfig,
   })
 

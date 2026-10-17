@@ -39,7 +39,7 @@ import type {QuestionDecisionErrorResponse, QuestionDecisionResponse} from '../.
 import type {DenylistCache} from '../../redaction/denylist.js'
 import type {BindingsLookup} from '../../redaction/surface-gate.js'
 import type {AuditLogger, QuestionRejectedReason} from '../audit.js'
-import type {SessionStore} from '../auth/session.js'
+import type {SessionReader} from '../auth/session.js'
 import type {OperatorLogger} from '../server.js'
 import {emitAudit} from '../audit.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
@@ -48,7 +48,7 @@ import {parseQuestionDecisionBody, resolveQuestionAnswers} from './question-choi
 import {resolveRepoAccess, resolveRepoFromRunIndex} from './route-helpers.js'
 
 export interface QuestionDecisionRouteDeps {
-  readonly sessionStore: Pick<SessionStore, 'get'>
+  readonly sessionStore: SessionReader
   readonly runIndex: Pick<RunIndex, 'lookup'>
   readonly denylistCache: DenylistCache
   readonly bindingsLookup: BindingsLookup
