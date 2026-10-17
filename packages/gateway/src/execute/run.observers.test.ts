@@ -1114,6 +1114,26 @@ describe('operatorPushDispatcher wiring', () => {
     expect(pushDispatcher.dispatchRunFailed).toHaveBeenCalledWith(expect.any(String), 'inactivity-timeout')
   })
 
+  // #given run-core fails fast on a provider rejection (#1836), reusing the session-error kind
+  // #when the FAILED transition succeeds
+  // #then exactly one run_failed push goes out, carrying only the existing kind
+  it('sends one run_failed push for a provider-rejection failure, with no new failure kind', async () => {
+    const {runMention} = await import('./run.js')
+    const {RunCoreError} = runCoreModule
+    setupHappyPath()
+    const pushDispatcher = makePushDispatcher()
+    mockRunOpenCodeCore.mockRejectedValue(
+      new RunCoreError('session-error', 'Provider failure: provider auth unavailable'),
+    )
+
+    const deps = makeDeps({operatorPushDispatcher: pushDispatcher})
+
+    await runMention(makeMessage(), makeBinding(), deps)
+
+    expect(pushDispatcher.dispatchRunFailed).toHaveBeenCalledTimes(1)
+    expect(pushDispatcher.dispatchRunFailed).toHaveBeenCalledWith(expect.any(String), 'session-error')
+  })
+
   // #given operatorPushDispatcher is undefined (push disabled)
   // #when a pending approval and a FAILED terminalization both occur
   // #then nothing throws and the run flow is unchanged — push is fully inert

@@ -32,10 +32,12 @@ import type {QuestionCoordinator} from '../approvals/question-coordinator.js'
 import type {TerminalListener} from '../approvals/request-gate.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {DrainCompletion} from './drain-completion.js'
+import type {ProviderFailure} from './provider-failure.js'
 
 import {
   createInactivityTimer,
   createLedgerReconciler,
+  createOwnershipLedger,
   createSdkLedgerReconcileAdapter,
   reconcileLedgerOnce,
 } from '@fro-bot/runtime'
@@ -43,6 +45,13 @@ import {parsePermissionReply, parsePermissionRequest} from '../approvals/coordin
 import {parseQuestionEcho, parseQuestionRequest, safeLogId} from '../approvals/question-coordinator.js'
 import {createDrainCompletion, parseSyntheticNoticePart} from './drain-completion.js'
 import {formatToolPart} from './format-part.js'
+import {
+  classifyErrorText,
+  classifyRetryStatus,
+  classifyStructuredError,
+  isAbortedError,
+  isContextOverflowError,
+} from './provider-failure.js'
 import {createReplyDeliveryTracker} from './reply-delivery.js'
 import {settleOwnedSessions} from './settle-owned-sessions.js'
 import {createTextBoundaryTracker} from './text-boundary.js'
@@ -688,17 +697,20 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // and confirmed quiescent first (`confirmRootQuiescent`), inside the same teardown budget, and an unconfirmed
   // root is quarantined exactly like an unconfirmed child. Runs that never adopted background work are never
   // `draining`, so they keep the original fast path.
-  async function throwWithBarrier(kind: RunCoreErrorKind, message: string): Promise<never> {
+  async function throwWithBarrier(kind: RunCoreErrorKind, message: string, rootLive = false): Promise<never> {
+    // `rootLive`: the caller knows the root is still executing (a provider retry mid-backoff), so it takes the same
+    // root teardown as the follow-up window, even with an empty or settled ledger — or none at all.
     const rootFollowUpOpen =
-      drainCompletion !== undefined && draining === true && drainDoneController.signal.aborted === false
-    if (ledger === undefined || (ledger.isDrainComplete() === true && rootFollowUpOpen === false)) {
+      rootLive || (drainCompletion !== undefined && draining === true && drainDoneController.signal.aborted === false)
+    const barrierLedger = ledger ?? (rootLive ? createOwnershipLedger() : undefined)
+    if (barrierLedger === undefined || (barrierLedger.isDrainComplete() === true && rootFollowUpOpen === false)) {
       throw new RunCoreError(kind, message)
     }
     const settlement = await settleOwnedSessions({
       client,
       directory,
       rootSessionId: sessionId,
-      ledger,
+      ledger: barrierLedger,
       logger,
       ...(rootFollowUpOpen ? {confirmRootQuiescent: true} : {}),
     })
@@ -710,6 +722,24 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       'run-core: owned work could not be confirmed settled before this failure — quarantining run',
     )
     throw new RunCoreError(kind, message, true)
+  }
+
+  // An abort the gateway did not cause (see the `session.error` and `message.updated` branches).
+  const ABORTED_FAILURE: ProviderFailure = {reason: 'session error', errorName: 'MessageAbortedError'}
+
+  // Fails the run on a provider rejection OpenCode will not recover from (#1836). Reuses `session-error`:
+  // a new operator failure kind would be a contract change. Only the fixed `reason` and a sanitized error
+  // name leave the classifier; the provider's own message is never logged or placed in the error.
+  // `rootLive`: only a retry status — OpenCode is mid-backoff and will keep going. Every terminal source
+  // (`session.error`, `message.updated`, overflow at idle) fires after `halt` has set the root idle
+  // (processor.ts:613-639), so the root is already stopped there.
+  async function failFromProvider(failure: ProviderFailure, source: string, rootLive = false): Promise<never> {
+    logger.error(
+      {sessionId, source, errorName: failure.errorName, reason: failure.reason},
+      'run-core: provider rejected the request — failing run',
+    )
+    clearInactivity()
+    throw await throwWithBarrier('session-error', `Provider failure: ${failure.reason}`, rootLive)
   }
 
   // ── 2. Subscribe to events — directory threaded to query (SSE-routing) ─────
@@ -779,6 +809,16 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // carry `partID` on `message.part.delta` but no part kind — correlation is
   // the only way to distinguish them from text deltas.
   const reasoningPartIds = new Set<string>()
+
+  // Sessions (root or owned child) with a `ContextOverflowError` session.error not yet recovered. With
+  // auto-compaction on (the default) OpenCode publishes it and compacts: `compaction.create`
+  // (compaction.ts:559-582) then writes that session's user message with a `compaction` part, the first event of
+  // the recovery (called from prompt.ts:1322 after processor.ts:629-631). With compaction off OpenCode halts
+  // instead (processor.ts:621-628): `session.error`, then that session's `session.idle`, with the errored
+  // `message.updated` only after. So a session's own compaction part clears its entry and, if its idle arrives
+  // first, the overflow was unrecovered and the run fails. A null session id is keyed to the root, as run-core
+  // already treats it.
+  const overflowPending = new Set<string>()
 
   // Part IDs of synthetic background-task notices. A notice is the harness talking to the parent agent,
   // never reply text: nothing carrying one of these ids may reach the sink.
@@ -949,6 +989,14 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       // Root-only freshness bookkeeping for the drain-completion gate. Observation only: it never alters
       // the routing below, so a run that adopted nothing sees no behavioural difference.
       observeRootForDrain(rawEvent, eventType, eventPayload)
+
+      if (overflowPending.size > 0 && eventType === 'message.part.updated') {
+        const part = getObjectProperty(eventPayload, 'part')
+        const partSessionId = getSessionID(eventPayload) ?? getSessionID(part)
+        if (partSessionId !== null && getStringProperty(part, 'type') === 'compaction') {
+          overflowPending.delete(partSessionId)
+        }
+      }
 
       if (eventType === 'message.part.delta') {
         // New SDK shape: streaming text delta events.
@@ -1232,6 +1280,11 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         // working. Root idle is the signal to CONSIDER finishing; whether that
         // is actually allowed is the ledger's call, below.
         const eventSessionID = getEventSessionID(rawEvent)
+        // Any session's idle with an overflow nothing compacted: OpenCode stopped it (compaction off). A child's
+        // output is lost with it, so fail rather than let the root complete.
+        if (eventSessionID !== null && overflowPending.has(eventSessionID)) {
+          throw await failFromProvider({reason: 'session error', errorName: 'ContextOverflowError'}, 'session.idle')
+        }
         if (eventSessionID === sessionId) {
           // Background-only gate: a run that never adopted a dispatch (no ledger, or an empty one) completes
           // on root idle exactly as it always has. Once ANY dispatch was adopted, a settled ledger is not
@@ -1295,10 +1348,48 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         // cannot attribute it to a specific session at all. Otherwise: ownership,
         // not root equality — a descendant's error is this run's problem too.
         if (eventSessionID === null || isOwnedSession(eventSessionID)) {
-          const errorDetail = getStringProperty(eventPayload, 'error') ?? 'unknown session error'
-          logger.error({sessionId, detail: errorDetail}, 'run-core: session.error received')
-          clearInactivity()
-          throw await throwWithBarrier('session-error', `Session error: ${errorDetail}`)
+          // The payload is a string or a structured `{name, data}` object. Both go through the closed
+          // classifier: only a fixed reason survives, never the provider's text.
+          const errorText = getStringProperty(eventPayload, 'error')
+          const structuredError = errorText === null ? getObjectProperty(eventPayload, 'error') : null
+          // A context overflow is not decided here: compaction may follow, so it only arms `overflowPending`.
+          // An abort is exempt only when the gateway caused it (the combined signal ends the loop); an abort
+          // from any other client (`POST /session/:id/abort`) is followed by an idle that would otherwise
+          // complete the run with partial output.
+          if (isContextOverflowError(structuredError)) {
+            overflowPending.add(eventSessionID ?? sessionId)
+          } else if (isAbortedError(structuredError)) {
+            if (combinedSignal.aborted === false) throw await failFromProvider(ABORTED_FAILURE, 'session.error')
+          } else {
+            const failure = errorText === null ? classifyStructuredError(structuredError) : classifyErrorText(errorText)
+            throw await failFromProvider(failure, 'session.error')
+          }
+        }
+      } else if (eventType === 'message.updated') {
+        // Root assistant message with `info.error`: OpenCode's processor sets it only when it has stopped
+        // (retries exhausted or error non-retryable), so waiting for `session.idle` or inactivity is pointless.
+        // Root only — a child's failed message is the child's problem, handled via the ledger.
+        const info = getObjectProperty(eventPayload, 'info')
+        if (
+          (getSessionID(eventPayload) ?? getSessionID(info)) === sessionId &&
+          getStringProperty(info, 'role') === 'assistant'
+        ) {
+          const messageError = getObjectProperty(info, 'error')
+          if (messageError !== null && typeof messageError === 'object') {
+            if (isAbortedError(messageError)) {
+              if (combinedSignal.aborted === false) throw await failFromProvider(ABORTED_FAILURE, 'message.updated')
+            } else {
+              throw await failFromProvider(classifyStructuredError(messageError), 'message.updated')
+            }
+          }
+        }
+      } else if (eventType === 'session.status') {
+        // A retry that cannot succeed (provider auth missing, model unsupported) would otherwise sit through
+        // the whole retry/backoff budget. Transient retries (429/5xx/overload) classify to null and keep waiting.
+        // Root only: a child's retry never fails the parent through this path.
+        if (getEventSessionID(rawEvent) === sessionId) {
+          const retryFailure = classifyRetryStatus(getObjectProperty(eventPayload, 'status'))
+          if (retryFailure !== null) throw await failFromProvider(retryFailure, 'session.status', true)
         }
       } else {
         // Unrecognized event type — log at debug so a lost-event/routing gap (events arriving
