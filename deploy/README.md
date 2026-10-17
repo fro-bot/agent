@@ -100,6 +100,14 @@ touch deploy/secrets/workspace-opencode-auth
 touch deploy/secrets/gateway-trigger-role-id
 # echo -n 'YOUR_ROLE_ID' > deploy/secrets/gateway-trigger-role-id
 
+# Discord user IDs allowed to run /add-project, one per line (17-20 digit snowflakes;
+# blank lines and # comments are ignored). A binding is what authorizes access to a
+# repository on the operator web surface, so only listed users may create one. They
+# still need guild-level ManageChannels. An EMPTY file makes /add-project refuse
+# everyone, and the gateway logs a startup warning.
+touch deploy/secrets/gateway-binder-allowlist
+# printf '%s\n' 'YOUR_DISCORD_USER_ID' > deploy/secrets/gateway-binder-allowlist
+
 # Optional — canonical Fro Bot persona for the @-mention loop. When set, the
 # persona text is prepended to the Discord agent prompt so responses carry Fro
 # Bot's voice; if unset, the loop falls back to built-in Discord guidance
@@ -238,6 +246,7 @@ The workspace container's OpenCode process — and every tool it spawns — now 
 | `deploy/secrets/workspace-opencode-url` | Base URL of the workspace OpenCode proxy (default: `http://workspace:9200`). Override only when the workspace container is not on the same Compose network. | OpenCode attach; existing deployments must `touch` this on upgrade |
 | `deploy/secrets/workspace-opencode-auth` | OpenCode provider credentials as an API-key `auth.json` blob (e.g. `{"anthropic":{"type":"api","key":"sk-..."}}`). Required for the `@fro-bot` mention loop; leave empty for clone-only deployments. | Mention-loop auth; existing deployments must `touch` this on upgrade |
 | `deploy/secrets/gateway-trigger-role-id` | Discord role ID that grants trigger authorization. If unset, falls back to guild-level `ManageChannels`. | Mention-loop trigger gate; existing deployments must `touch` this on upgrade |
+| `deploy/secrets/gateway-binder-allowlist` | Discord user IDs (one per line) allowed to run `/add-project`. Empty refuses everyone. | Binding-creation gate; existing deployments must create this file **and list their binders** before upgrading, or `/add-project` refuses everyone |
 | `deploy/secrets/github-app-id` | GitHub App ID (required for repository access) | GitHub App auth; existing deployments must create this file on upgrade |
 | `deploy/secrets/github-app-private-key` | GitHub App private key PEM (required for repository access) | GitHub App auth; existing deployments must create this file on upgrade |
 

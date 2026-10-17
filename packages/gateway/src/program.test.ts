@@ -324,6 +324,7 @@ function makeFakeConfig(overrides: Partial<GatewayConfig> = {}): GatewayConfig {
     workspaceOpencodeUrl: 'http://workspace:9200',
     workspaceOpencodeToken: 'test-opencode-token',
     triggerRoleId: null,
+    binderAllowlist: new Set(['111111111111111111']),
     maxConcurrentRuns: 3,
     runTimeoutMs: 600_000,
     runInactivityTimeoutMs: 300_000,
@@ -495,6 +496,35 @@ async function startAndReadPushHealth(options: {
     import('./web/server.js').OperatorServerConfig,
   ]
   return serverDeps.operatorPushHealth?.()
+}
+
+/** Boots the program with the given binder list; returns captured warn lines and the command deps. */
+async function bootCapturingBinderWarning(binderAllowlist: ReadonlySet<string>): Promise<{
+  readonly warnings: string[]
+  readonly commandDeps: import('./discord/commands/fro-bot.js').FroBotDeps
+}> {
+  const {getCommandRegistry} = await import('./discord/commands/index.js')
+  const getCommandRegistryMock = vi.mocked(getCommandRegistry)
+  getCommandRegistryMock.mockClear()
+  // makeLogger writes warn-level JSON via console.warn
+  const consoleSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+  const deps = {
+    makeClient: () => makeFakeClient() as unknown as import('discord.js').Client,
+    setupReadinessFlag: vi.fn(),
+    login: vi.fn().mockResolvedValue(undefined),
+    startAnnounceServer: vi.fn(),
+    startOperatorServer: vi.fn(),
+    runProviderSelfTest: vi.fn(async () => {}),
+  }
+  try {
+    await Effect.runPromise(makeGatewayProgram(deps, makeFakeConfig({announce: undefined, binderAllowlist})))
+    const warnings = consoleSpy.mock.calls.map(args => String(args[0])).filter(line => line.includes('add-project'))
+    const commandDeps = getCommandRegistryMock.mock.calls[0]?.[0]
+    if (commandDeps === undefined) throw new Error('getCommandRegistry was not called')
+    return {warnings, commandDeps}
+  } finally {
+    consoleSpy.mockRestore()
+  }
 }
 
 describe('makeGatewayProgram', () => {
@@ -801,6 +831,32 @@ describe('makeGatewayProgram', () => {
     } finally {
       consoleSpy.mockRestore()
     }
+  })
+
+  // ── Binder allowlist wiring ──────────────────────────────────────────────
+
+  it('binder allowlist empty: logs one startup warning that /add-project is disabled and still starts', async () => {
+    // #given / #when — an empty list; the program must still resolve
+    const {warnings, commandDeps} = await bootCapturingBinderWarning(new Set())
+
+    // #then
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toContain('GATEWAY_BINDER_ALLOWLIST')
+    expect(warnings[0]).toContain('add-project is disabled')
+    expect(warnings[0]).toContain('"level":"warn"')
+    expect(commandDeps.binderAllowlist?.size).toBe(0)
+  })
+
+  it('binder allowlist configured: logs no warning and passes the list into the command deps', async () => {
+    // #given
+    const binders = new Set(['222222222222222222'])
+
+    // #when
+    const {warnings, commandDeps} = await bootCapturingBinderWarning(binders)
+
+    // #then
+    expect(warnings).toHaveLength(0)
+    expect(commandDeps.binderAllowlist).toBe(binders)
   })
 
   // ── Approval mode propagation ────────────────────────────────────────────

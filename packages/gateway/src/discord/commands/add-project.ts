@@ -49,7 +49,16 @@ export interface AddProjectDeps extends GuildCommandDeps {
    * with a user-friendly restart message instead of starting work that will be hard-killed.
    */
   readonly isShuttingDown?: () => boolean
+  /**
+   * Discord user IDs allowed to create bindings. A binding is the authorization anchor for the
+   * operator web surface, so creating one is restricted to these users. Absent or empty refuses
+   * everyone (fail-closed). The guild-level `ManageChannels` check still applies on top.
+   */
+  readonly binderAllowlist?: ReadonlySet<string>
 }
+
+// Generic on purpose: must not reveal whether a binder list is configured or empty.
+const BINDER_REFUSAL_COPY = 'You are not authorized to use this command.'
 
 // ---------------------------------------------------------------------------
 // Rate limiting (in-memory, per-user, v1)
@@ -238,6 +247,13 @@ export function buildAddProjectSpec(deps: AddProjectDeps): {
           authorized: false as const,
           copy: `fro-bot needs **Manage Channels** and **Send Messages** permissions. Re-invite the bot at: ${deps.installUrl}`,
         }
+      }
+
+      // Binder gate: only configured Discord users may create bindings. Runs before the member
+      // fetch so an unlisted user costs no REST call. Empty/absent list refuses everyone.
+      if (deps.binderAllowlist?.has(ctx.interaction.user.id) !== true) {
+        ctx.log.warn({channelId: ctx.interaction.channelId}, 'add-project: user not in binder allowlist')
+        return {authorized: false as const, copy: BINDER_REFUSAL_COPY}
       }
 
       // User authorization gate: invoking user must hold guild-level ManageChannels.

@@ -488,6 +488,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       isShuttingDown,
       queue: channelQueue,
       triggerRoleId: config.triggerRoleId,
+      binderAllowlist: config.binderAllowlist,
       gatewayLogger: logger,
       // force-release-lock deps: pre-built coordination config + Effect-wrapped primitive
       // (injected so tests can mock without real S3 calls)
@@ -496,6 +497,13 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       checkRepoQuiescence,
       forceReleaseStaleLock: forceReleaseStaleLockEffect,
       dispatchWorkflow,
+    }
+
+    if (config.binderAllowlist.size === 0) {
+      logger.warn(
+        {},
+        'GATEWAY_BINDER_ALLOWLIST is empty or unset: /fro-bot add-project is disabled and refuses every user',
+      )
     }
 
     const registry = getCommandRegistry(commandDeps)
