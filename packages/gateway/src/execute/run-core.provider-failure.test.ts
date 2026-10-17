@@ -158,6 +158,17 @@ function sessionError(error: unknown, sessionID = ROOT): object {
   return {type: 'session.error', properties: {sessionID, error}}
 }
 
+/** The root user message part `compaction.create` writes (compaction.ts:574-580). */
+function compactionPart(sessionID = ROOT): object {
+  return {
+    type: 'message.part.updated',
+    properties: {
+      sessionID,
+      part: {id: 'part-compaction', messageID: 'msg-compaction', sessionID, type: 'compaction', auto: true},
+    },
+  }
+}
+
 function expectFailed(run: Run, message: string): void {
   const outcome = run.outcome()
   expect(outcome?.ok).toBe(false)
@@ -444,18 +455,64 @@ describe('runOpenCodeCore — provider rejection fails fast (#1836)', () => {
       expect(vi.mocked(run.logger.error)).not.toHaveBeenCalled()
     })
 
-    it('keeps running through a ContextOverflowError session.error while OpenCode compacts', async () => {
+    it('completes when compaction follows a ContextOverflowError session.error (compaction on)', async () => {
       // #given
       const run = startRun()
 
-      // #when — overflow is published, then OpenCode compacts and the root finishes
+      // #when — overflow is published; the errored-looking assistant message is closed out (no error set while
+      // compacting); compaction.create writes the root compaction part; the root then goes idle
       await run.emit(sessionError({name: 'ContextOverflowError', data: {message: SECRET}}))
       expect(run.outcome()).toBeUndefined()
+      await run.emit(assistantMessage(undefined))
+      await run.emit(compactionPart())
       await run.emit({type: 'session.idle', properties: {sessionID: ROOT}})
 
       // #then
       expect(run.outcome()).toEqual({ok: true})
       expect(vi.mocked(run.logger.error)).not.toHaveBeenCalled()
+    })
+
+    it('fails at root idle when no compaction followed a ContextOverflowError (compaction off)', async () => {
+      // #given
+      const run = startRun()
+
+      // #when — upstream order with compaction off: session.error, session.idle, then message.updated
+      await run.emit(sessionError({name: 'ContextOverflowError', data: {message: SECRET}}))
+      expect(run.outcome()).toBeUndefined()
+      await run.emit({type: 'session.idle', properties: {sessionID: ROOT}})
+
+      // #then — failed with the closed reason, name and source; nothing raw logged
+      expectFailed(run, 'Provider failure: session error')
+      expect(vi.mocked(run.logger.error)).toHaveBeenCalledWith(
+        {sessionId: ROOT, source: 'session.idle', errorName: 'ContextOverflowError', reason: 'session error'},
+        expect.any(String),
+      )
+      expect(loggedText(run.logger)).not.toContain('SECRET')
+    })
+
+    it('does not let a compaction part from another session clear the overflow', async () => {
+      // #given
+      const run = startRun({owned: [CHILD]})
+
+      // #when
+      await run.emit(sessionError({name: 'ContextOverflowError', data: {message: 'x'}}))
+      await run.emit(compactionPart(CHILD))
+      await run.emit({type: 'session.idle', properties: {sessionID: ROOT}})
+
+      // #then
+      expectFailed(run, 'Provider failure: session error')
+    })
+
+    it('ignores a child ContextOverflowError', async () => {
+      // #given
+      const run = startRun({owned: [CHILD]})
+
+      // #when
+      await run.emit(sessionError({name: 'ContextOverflowError', data: {message: 'x'}}, CHILD))
+      await run.emit({type: 'session.idle', properties: {sessionID: ROOT}})
+
+      // #then — the child's overflow never arms the root
+      expect(run.outcome()).toEqual({ok: true})
     })
 
     it('still fails normally when a terminal error follows a ContextOverflowError', async () => {

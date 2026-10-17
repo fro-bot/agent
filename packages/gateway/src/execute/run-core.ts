@@ -800,6 +800,14 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // the only way to distinguish them from text deltas.
   const reasoningPartIds = new Set<string>()
 
+  // Set by a ROOT `ContextOverflowError` session.error. With auto-compaction on (the default) OpenCode publishes
+  // it and compacts: `compaction.create` (compaction.ts:559-582) then writes a root user message with a
+  // `compaction` part, the first root event of the recovery (called from prompt.ts:1322 after processor.ts:629-631).
+  // With compaction off OpenCode halts instead (processor.ts:621-628): `session.error`, then `session.idle`, with
+  // the errored `message.updated` only after. So the flag is cleared by that compaction part and, if root idle
+  // arrives first, the overflow was unrecovered and the run fails.
+  let overflowPending = false
+
   // Part IDs of synthetic background-task notices. A notice is the harness talking to the parent agent,
   // never reply text: nothing carrying one of these ids may reach the sink.
   const noticePartIds = new Set<string>()
@@ -969,6 +977,16 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       // Root-only freshness bookkeeping for the drain-completion gate. Observation only: it never alters
       // the routing below, so a run that adopted nothing sees no behavioural difference.
       observeRootForDrain(rawEvent, eventType, eventPayload)
+
+      if (overflowPending === true && eventType === 'message.part.updated') {
+        const part = getObjectProperty(eventPayload, 'part')
+        if (
+          (getSessionID(eventPayload) ?? getSessionID(part)) === sessionId &&
+          getStringProperty(part, 'type') === 'compaction'
+        ) {
+          overflowPending = false
+        }
+      }
 
       if (eventType === 'message.part.delta') {
         // New SDK shape: streaming text delta events.
@@ -1253,6 +1271,10 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         // is actually allowed is the ledger's call, below.
         const eventSessionID = getEventSessionID(rawEvent)
         if (eventSessionID === sessionId) {
+          // Idle with an overflow nothing compacted: OpenCode stopped (compaction off). Fail, don't complete.
+          if (overflowPending === true) {
+            throw await failFromProvider({reason: 'session error', errorName: 'ContextOverflowError'}, 'session.idle')
+          }
           // Background-only gate: a run that never adopted a dispatch (no ledger, or an empty one) completes
           // on root idle exactly as it always has. Once ANY dispatch was adopted, a settled ledger is not
           // enough — see the drain-completion gate below.
@@ -1319,10 +1341,12 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           // classifier: only a fixed reason survives, never the provider's text.
           const errorText = getStringProperty(eventPayload, 'error')
           const structuredError = errorText === null ? getObjectProperty(eventPayload, 'error') : null
-          // An abort is the harness or operator stopping the run; the abort signal ends the loop. Context
-          // overflow is published before OpenCode compacts and carries on (processor.ts:629-631), so it is not
-          // terminal; a real terminal halt still arrives as its own error.
-          if (isAbortedError(structuredError) === false && isContextOverflowError(structuredError) === false) {
+          // An abort is the harness or operator stopping the run; the abort signal ends the loop. A root context
+          // overflow is not decided here: compaction may follow, so it only arms `overflowPending` (see above).
+          // A child's overflow is the child's problem.
+          if (isContextOverflowError(structuredError)) {
+            if (eventSessionID === sessionId) overflowPending = true
+          } else if (isAbortedError(structuredError) === false) {
             const failure = errorText === null ? classifyStructuredError(structuredError) : classifyErrorText(errorText)
             throw await failFromProvider(failure, 'session.error')
           }
