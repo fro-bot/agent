@@ -21,7 +21,7 @@ import {
 import {toErrorMessage} from '../shared/errors.js'
 import {createLogger} from '../shared/logger.js'
 import {STATE_KEYS} from './config/state-keys.js'
-import {releaseActionLockIfHeld, withTimeout} from './phases/acquire-lock.js'
+import {LOCK_RELEASE_TIMEOUT_MS, releaseActionLockIfHeld, withTimeout} from './phases/acquire-lock.js'
 
 export interface PostOptions {
   logger?: Logger
@@ -65,9 +65,6 @@ function reconstructStoreConfigFromState(): ObjectStoreConfig | undefined {
   }
 }
 
-/** Bounds the release's remote calls (a read and a conditional delete) so a stalled store cannot hang the post step. */
-const LOCK_RELEASE_TIMEOUT_MS = 10_000
-
 /**
  * Frees the Action lock when the main step died holding it (cancelled or killed before cleanup's release). The main
  * step records its holder id on acquisition and clears it after a successful release, so no record means nothing to
@@ -78,13 +75,20 @@ async function releaseOrphanedLock(logger: Logger): Promise<void> {
   try {
     const holderId = readOptionalState(STATE_KEYS.LOCK_HOLDER_ID)
     if (holderId == null) return
+    const holderJob = readOptionalState(STATE_KEYS.LOCK_HOLDER_JOB)
 
     const storeConfig = reconstructStoreConfigFromState()
     if (storeConfig?.enabled !== true) return
 
     const repo = getGitHubRepository()
     const released = await withTimeout(
-      releaseActionLockIfHeld({storeConfig, repo, holderId, logger: createLogger({phase: 'post-lock-release'})}),
+      releaseActionLockIfHeld({
+        storeConfig,
+        repo,
+        holderId,
+        ...(holderJob === undefined ? {} : {holderJob}),
+        logger: createLogger({phase: 'post-lock-release'}),
+      }),
       LOCK_RELEASE_TIMEOUT_MS,
       `Lock release exceeded ${LOCK_RELEASE_TIMEOUT_MS}ms`,
     )

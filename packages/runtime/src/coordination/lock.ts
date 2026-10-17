@@ -36,6 +36,13 @@ export function getLockKey(config: CoordinationConfig, repo: string, scope: Lock
   return ok(key.data)
 }
 
+const HOLDER_JOB_PATTERN = /^[\w.-]+$/
+
+/** True for a value that is safe to store as a lock record's `holder_job`. */
+export function isValidHolderJob(value: string): boolean {
+  return HOLDER_JOB_PATTERN.test(value)
+}
+
 function isPreconditionFailed(error: Error): boolean {
   return /pre-?condition/.test(error.message.toLowerCase())
 }
@@ -89,7 +96,13 @@ function parseLockRecord(data: string): Result<LockRecord, Error> {
       return err(new Error('Invalid lock record payload'))
     }
 
-    return ok(parsed)
+    // `holder_job` only ever grants early takeover or a holder-matched release. A malformed value is dropped (the
+    // record then reads like a legacy one and waits for expiry) rather than rejected, which would wedge the repo.
+    const {holder_job: holderJob, ...withoutJob} = parsed
+    if (holderJob === undefined || (typeof holderJob === 'string' && isValidHolderJob(holderJob))) {
+      return ok(parsed)
+    }
+    return ok(withoutJob)
   } catch (error) {
     return err(error instanceof Error ? error : new Error(String(error)))
   }
@@ -102,6 +115,7 @@ function createLockRecord(
   runId: string,
   ttlSeconds: number,
   now: string,
+  holderJob?: string,
 ): LockRecord {
   return {
     repo,
@@ -110,6 +124,7 @@ function createLockRecord(
     acquired_at: now,
     ttl_seconds: ttlSeconds,
     run_id: runId,
+    ...(holderJob === undefined ? {} : {holder_job: holderJob}),
   }
 }
 
@@ -139,7 +154,15 @@ export async function acquireLock(
 
   logger.debug('Attempting lock acquisition', {key: key.data, repo, runId, surface})
   const createOnce = async () => {
-    const created = createLockRecord(repo, holderId, surface, runId, config.lockTtlSeconds, new Date().toISOString())
+    const created = createLockRecord(
+      repo,
+      holderId,
+      surface,
+      runId,
+      config.lockTtlSeconds,
+      new Date().toISOString(),
+      options.holderJob,
+    )
     return conditionalPut.data(key.data, JSON.stringify(created), {ifNoneMatch: '*'})
   }
   const toAcquired = (etag: unknown): Result<LockAcquisitionResult, Error> => {
@@ -231,7 +254,15 @@ export async function acquireLock(
   }
 
   // Stamped after confirmation so the new lease's TTL does not include the confirmation wait.
-  const replacement = createLockRecord(repo, holderId, surface, runId, config.lockTtlSeconds, new Date().toISOString())
+  const replacement = createLockRecord(
+    repo,
+    holderId,
+    surface,
+    runId,
+    config.lockTtlSeconds,
+    new Date().toISOString(),
+    options.holderJob,
+  )
   const takeover = await conditionalPut.data(key.data, JSON.stringify(replacement), {ifMatch: observedEtag})
   if (takeover.success === false) {
     if (isPreconditionFailed(takeover.error) === true) {
@@ -276,8 +307,10 @@ export async function releaseLock(
 export type ReleaseIfHolderOutcome = 'released' | 'no-lock' | 'not-holder' | 'conflict'
 
 /**
- * Deletes the lock only while its stored `holder_id` is `holderId`. Reads the lock, checks the holder, then deletes
- * `If-Match` on the ETag it read, so a successor that replaces the lock in between survives (`conflict`).
+ * Deletes the lock only while its stored `holder_id` is `holderId` and its `holder_job` equals `holderJob` (both
+ * absent counts as equal; a record missing a `holder_job` the caller expects does not match). Reads the lock, checks
+ * the holder, then deletes `If-Match` on the ETag it read, so a successor that replaces the lock in between survives
+ * (`conflict`).
  */
 export async function releaseLockIfHolder(
   config: CoordinationConfig,
@@ -285,6 +318,7 @@ export async function releaseLockIfHolder(
   holderId: string,
   logger: {debug: (message: string, context?: Record<string, unknown>) => void},
   scope: LockScope = 'repo',
+  holderJob?: string,
 ): Promise<Result<ReleaseIfHolderOutcome, Error>> {
   const key = getLockKey(config, repo, scope)
   if (key.success === false) {
@@ -311,8 +345,13 @@ export async function releaseLockIfHolder(
     return err(record.error)
   }
 
-  if (record.data.holder_id !== holderId) {
-    logger.debug('Lock held by another holder; not releasing', {key: key.data, repo, heldBy: record.data.holder_id})
+  if (record.data.holder_id !== holderId || record.data.holder_job !== holderJob) {
+    logger.debug('Lock held by another holder; not releasing', {
+      key: key.data,
+      repo,
+      heldBy: record.data.holder_id,
+      heldByJob: record.data.holder_job ?? null,
+    })
     return ok('not-holder')
   }
 

@@ -31,6 +31,12 @@ export interface LockRecord {
   readonly acquired_at: string
   readonly ttl_seconds: number
   readonly run_id: string
+  /**
+   * Names the job (and matrix leg) of the Action invocation that holds the lock, so sibling jobs of one run are
+   * told apart without changing `holder_id`'s format (older readers match `holder_id` strictly). Absent on records
+   * written by gateway holders and by older agent versions; readers drop a malformed value instead of rejecting.
+   */
+  readonly holder_job?: string
 }
 
 /**
@@ -86,6 +92,8 @@ export interface LockAcquisitionOptions {
    * takeover still uses the observed ETag, so a racing renewal wins.
    */
   readonly reclaimableBeforeExpiry?: (holder: LockRecord, observedAt: Date) => boolean
+  /** Written to the new lease as `holder_job` (and preserved by `renewLease` via the caller's record). */
+  readonly holderJob?: string
 }
 
 /** Logger for lock operations that emit audit events (`info`) alongside diagnostics (`debug`). */

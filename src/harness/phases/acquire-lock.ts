@@ -15,6 +15,7 @@ import {
   DEFAULT_LOCK_TTL_SECONDS,
   DEFAULT_PENDING_STALE_THRESHOLD_MS,
   DEFAULT_STALE_THRESHOLD_MS,
+  isValidHolderJob,
   releaseLock,
   releaseLockIfHolder,
   renewLease,
@@ -167,6 +168,7 @@ function createLeaseController(
   config: CoordinationConfig,
   repo: string,
   holderId: string,
+  holderJob: string | undefined,
   runId: string,
   initialEtag: string,
   logger: Logger,
@@ -190,6 +192,8 @@ function createLeaseController(
       acquired_at: new Date().toISOString(),
       ttl_seconds: config.lockTtlSeconds,
       run_id: runId,
+      // Every renewal rewrites the whole record, so the job must be carried or the first tick would erase it.
+      ...(holderJob === undefined ? {} : {holder_job: holderJob}),
     }
 
     inFlight = withTimeout(
@@ -256,48 +260,36 @@ function createLeaseController(
   }
 }
 
-/** Characters a job identity segment may carry in a holder id; `getInvocationIdentity` already sanitizes to this. */
-const HOLDER_IDENTITY_PATTERN = /^[\w.-]+$/
-
 /**
- * Builds the Action's coordination holder id: `action:{runId}:{attempt}` plus `:{job identity}` when known, so sibling
- * jobs of one run never share an id. Keep in sync with `ACTION_HOLDER_ID_PATTERN`.
+ * Builds the Action's coordination holder id, `action:{runId}:{attempt}`. The job identity deliberately stays out of
+ * it: older agent versions recognize an Action lease only by this exact shape (`ACTION_HOLDER_ID_PATTERN`) and would
+ * treat any other `holder_id` as an unreclaimable foreign lock. The job travels in `LockRecord.holder_job`.
  */
-function buildActionHolderId(runId: string, runAttempt: number, jobIdentity: string | null): string {
-  const base = `action:${runId}:${runAttempt}`
-  return jobIdentity != null && HOLDER_IDENTITY_PATTERN.test(jobIdentity) ? `${base}:${jobIdentity}` : base
+function buildActionHolderId(runId: string, runAttempt: number): string {
+  return `action:${runId}:${runAttempt}`
 }
 
-/** Accepts the legacy 3-segment form and the job-qualified 4-segment form. */
-const ACTION_HOLDER_ID_PATTERN = /^action:(\d+):(\d+)(?::([\w.-]+))?$/
+const ACTION_HOLDER_ID_PATTERN = /^action:(\d+):(\d+)$/
 
-/** True only for ids produced by `buildActionHolderId` (either form). */
+/** True only for ids produced by `buildActionHolderId`. */
 function isActionHolderId(holderId: string): boolean {
   return ACTION_HOLDER_ID_PATTERN.test(holderId)
 }
 
-interface ParsedActionHolderId {
-  readonly runId: string
-  readonly attempt: number
-  /** `null` for a legacy 3-segment id. */
-  readonly identity: string | null
-}
-
 /**
- * Splits an Action holder id, or `null` for anything that is not a well-formed
- * `action:{numeric runId}:{attempt >= 1}[:{identity}]` id. The holder id comes from S3, so callers must not trust
- * other shapes.
+ * Splits an Action holder id, or `null` for anything that is not a well-formed `action:{numeric runId}:{attempt >= 1}`
+ * id. The holder id comes from S3, so callers must not trust other shapes.
  */
-function parseActionHolderId(holderId: string): ParsedActionHolderId | null {
+function parseActionHolderId(holderId: string): {readonly runId: string; readonly attempt: number} | null {
   const match = ACTION_HOLDER_ID_PATTERN.exec(holderId)
   if (match == null) return null
-  const [, runId, attemptText, identity] = match
+  const [, runId, attemptText] = match
   const attempt = Number(attemptText)
   if (runId == null || Number.isSafeInteger(attempt) === false || attempt < 1) return null
-  return {runId, attempt, identity: identity ?? null}
+  return {runId, attempt}
 }
 
-/** Extracts the workflow run id from an Action holder id (either form); `null` for any other shape. */
+/** Extracts the workflow run id from an Action holder id; `null` for any other shape. */
 export function parseActionHolderRunId(holderId: string): string | null {
   return ACTION_HOLDER_ID_PATTERN.exec(holderId)?.[1] ?? null
 }
@@ -311,21 +303,23 @@ export const SAME_RUN_TAKEOVER_MIN_UNRENEWED_MS = 3 * DEFAULT_HEARTBEAT_INTERVAL
 interface ActionSelf {
   readonly runId: string
   readonly runAttempt: number
-  readonly jobIdentity: string | null
+  /** `undefined` when this invocation has no usable job identity. */
+  readonly holderJob: string | undefined
 }
 
 /**
  * True for a GitHub-surface Action holder that is a strictly earlier attempt of this run AND this job, and has gone
  * unrenewed for `SAME_RUN_TAKEOVER_MIN_UNRENEWED_MS`. GitHub starts a re-run only after the previous attempt
  * finished, but a re-run can also start while an orphaned process of that attempt is still winding down, and sibling
- * jobs of one run run concurrently -- hence the job identity and the staleness gate. A legacy (identity-less)
- * holder or an unreadable timestamp is never eligible: that lease is reclaimed on expiry like any other.
+ * jobs of one run run concurrently -- hence the `holder_job` match and the staleness gate. A record without
+ * `holder_job` (legacy writer) or with an unreadable timestamp is never eligible: that lease is reclaimed on expiry
+ * like any other.
  */
 function isStaleEarlierAttemptOfJob(holder: LockRecord, self: ActionSelf, observedAt: Date): boolean {
-  if (holder.surface !== 'github' || self.jobIdentity == null) return false
+  if (holder.surface !== 'github' || self.holderJob === undefined) return false
   const parsed = parseActionHolderId(holder.holder_id)
   if (parsed == null || parsed.runId !== self.runId || parsed.attempt >= self.runAttempt) return false
-  if (parsed.identity !== self.jobIdentity) return false
+  if (holder.holder_job !== self.holderJob) return false
   // `acquired_at` is rewritten on every renewal (`LeaseController.tick`, `renewLease`), so it is the last renewal time.
   const lastRenewedMs = new Date(holder.acquired_at).getTime()
   if (Number.isFinite(lastRenewedMs) === false) return false
@@ -347,27 +341,36 @@ export interface ReleaseActionLockOptions {
   readonly storeConfig: ObjectStoreConfig
   readonly repo: string
   readonly holderId: string
+  /** The `holder_job` recorded at acquisition, or `undefined` if none was. */
+  readonly holderJob?: string
   readonly logger: Logger
 }
 
 /**
- * Deletes the Action lock only while it is still held by `holderId`. Used by the post hook to free a lock whose
+ * Deletes the Action lock only while it is still held by `holderId` and `holderJob`. Used by the post hook to free a lock whose
  * main step died before cleanup's release; never touches a successor's lock.
  */
 export async function releaseActionLockIfHeld(
   options: ReleaseActionLockOptions,
 ): Promise<Result<ReleaseIfHolderOutcome, Error>> {
-  const {storeConfig, repo, holderId, logger} = options
+  const {storeConfig, repo, holderId, holderJob, logger} = options
   return releaseLockIfHolder(
     createActionCoordinationConfig(storeConfig, logger),
     repo,
     holderId,
     logger,
     ACTION_LOCK_SCOPE,
+    holderJob,
   )
 }
 
-/** Frees a lock this call just acquired; a failure only means the lease runs out on its own. Never throws. */
+/** Bounds a lock release's remote calls so a stalled store cannot hang the step that issued it. */
+export const LOCK_RELEASE_TIMEOUT_MS = 10_000
+
+/**
+ * Frees a lock this call just acquired; a failure only means the lease runs out on its own. Bounded by
+ * `LOCK_RELEASE_TIMEOUT_MS`; never throws.
+ */
 async function releaseBestEffort(
   config: CoordinationConfig,
   repo: string,
@@ -375,7 +378,11 @@ async function releaseBestEffort(
   logger: Logger,
 ): Promise<void> {
   try {
-    const released = await releaseLock(config, repo, etag, logger, ACTION_LOCK_SCOPE)
+    const released = await withTimeout(
+      releaseLock(config, repo, etag, logger, ACTION_LOCK_SCOPE),
+      LOCK_RELEASE_TIMEOUT_MS,
+      `Lock release exceeded ${LOCK_RELEASE_TIMEOUT_MS}ms`,
+    )
     if (released.success === false) {
       logger.warning('Releasing the lock after a failed holder record failed', {error: released.error.message, repo})
     }
@@ -414,7 +421,7 @@ export interface AcquireLockPhaseOptions {
   readonly repo: string
   readonly runId: string
   readonly runAttempt: number
-  /** `getInvocationIdentity()`: names this job (and matrix leg). `null`/omitted yields a legacy 3-segment holder id. */
+  /** `getInvocationIdentity()`: names this job (and matrix leg), stored as `holder_job`. `null`/omitted writes none. */
   readonly jobIdentity?: string | null
   readonly logger?: Logger
 }
@@ -443,6 +450,8 @@ export interface AcquireLockPhaseOptions {
 export async function runAcquireLock(options: AcquireLockPhaseOptions): Promise<AcquireLockResult> {
   const {storeConfig, repo, runId, runAttempt} = options
   const jobIdentity = options.jobIdentity ?? null
+  // An identity outside the stored charset is dropped (legacy record) rather than written and later rejected.
+  const holderJob = jobIdentity != null && isValidHolderJob(jobIdentity) ? jobIdentity : undefined
   const logger = options.logger ?? createLogger({phase: 'acquire-lock'})
 
   if (storeConfig.enabled === false) {
@@ -450,7 +459,7 @@ export async function runAcquireLock(options: AcquireLockPhaseOptions): Promise<
     return {outcome: 's3-disabled'}
   }
 
-  const holderId = buildActionHolderId(runId, runAttempt, jobIdentity)
+  const holderId = buildActionHolderId(runId, runAttempt)
   let config: CoordinationConfig
   let result: Awaited<ReturnType<typeof acquireLock>>
   try {
@@ -460,9 +469,10 @@ export async function runAcquireLock(options: AcquireLockPhaseOptions): Promise<
     // reclaimed before expiry. Anything else on this key is skipped.
     result = await acquireLock(config, repo, holderId, 'github', runId, logger, {
       scope: ACTION_LOCK_SCOPE,
+      ...(holderJob === undefined ? {} : {holderJob}),
       reclaimableWithoutConfirmation: holder => holder.surface === 'github' && isActionHolderId(holder.holder_id),
       reclaimableBeforeExpiry: (holder, observedAt) =>
-        isStaleEarlierAttemptOfJob(holder, {runId, runAttempt, jobIdentity}, observedAt),
+        isStaleEarlierAttemptOfJob(holder, {runId, runAttempt, holderJob}, observedAt),
     })
   } catch (error_) {
     // A thrown adapter/acquire error must reach run.ts's fail-closed `error` path, not escape as a generic crash.
@@ -480,16 +490,19 @@ export async function runAcquireLock(options: AcquireLockPhaseOptions): Promise<
     const {etag} = result.data
     logger.info('Lock acquired', {repo, holderId, etag})
     try {
-      // Lets the post hook free the lock if this process dies before cleanup releases it.
+      // Lets the post hook free the lock if this process dies before cleanup releases it. The job goes first: the
+      // holder id is the "record is set" flag the post hook keys on, so a partial write never leaves a job-less flag.
+      if (holderJob !== undefined) core.saveState(STATE_KEYS.LOCK_HOLDER_JOB, holderJob)
       core.saveState(STATE_KEYS.LOCK_HOLDER_ID, holderId)
     } catch (error_) {
-      // Without the record a killed run would keep the lock until expiry, so fail closed like an acquire error.
-      const error = error_ instanceof Error ? error_ : new Error(String(error_))
-      logger.warning('Recording the lock holder failed; releasing the lock', {error: error.message, repo, holderId})
+      // Without the record a killed run would keep the lock until expiry, so release it and fail closed.
+      const cause = error_ instanceof Error ? error_.message : String(error_)
+      const error = new Error(`Acquired the Action coordination lock but could not record its holder: ${cause}`)
+      logger.warning('Recording the lock holder failed; releasing the lock', {error: cause, repo, holderId})
       await releaseBestEffort(config, repo, etag, logger)
       return {outcome: 'error', error}
     }
-    const renewal = createLeaseController(config, repo, holderId, runId, etag, logger)
+    const renewal = createLeaseController(config, repo, holderId, holderJob, runId, etag, logger)
     return {outcome: 'acquired', lockEtag: etag, renewal}
   }
 

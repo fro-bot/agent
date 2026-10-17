@@ -211,9 +211,7 @@ export async function run(): Promise<number> {
         setUnavailableActionOutputs(Date.now() - startTime)
         skipSessionPersistence = true
         core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
-        core.setFailed(
-          `Could not acquire the Action coordination lock; refusing to run unlocked: ${lockResult.error.message}`,
-        )
+        core.setFailed(`Action coordination lock unavailable; refusing to run without it: ${lockResult.error.message}`)
         return 1
       }
       case 's3-disabled':

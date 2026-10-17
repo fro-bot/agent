@@ -29,6 +29,8 @@ export const STATE_KEYS = {
    * successful release; if still set in the post hook, the main step died while holding the lock.
    */
   LOCK_HOLDER_ID: 'lockHolderId',
+  /** `holder_job` of that lock (the job identity); absent when the run had none. Cleared together with the id. */
+  LOCK_HOLDER_JOB: 'lockHolderJob',
   /** OpenCode version detected during main action (for post-action cache path calculation) */
   OPENCODE_VERSION: 'opencodeVersion',
   S3_ENABLED: 'storeConfig.enabled',

@@ -911,6 +911,7 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
       // #then the post hook is told there is nothing left to release
       const {saveState} = await import('@actions/core')
       expect(saveState).toHaveBeenCalledWith('lockHolderId', '')
+      expect(saveState).toHaveBeenCalledWith('lockHolderJob', '')
     })
 
     it('keeps the recorded holder when the release fails', async () => {
@@ -924,7 +925,7 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
 
       // #then the record survives so the post hook can retry by holder id
       const {saveState} = await import('@actions/core')
-      expect(saveState).not.toHaveBeenCalledWith('lockHolderId', expect.anything())
+      expect(saveState).not.toHaveBeenCalledWith(expect.stringMatching(/^lockHolder/), expect.anything())
     })
 
     it('keeps the recorded holder when the release throws', async () => {
@@ -938,7 +939,7 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
 
       // #then
       const {saveState} = await import('@actions/core')
-      expect(saveState).not.toHaveBeenCalledWith('lockHolderId', expect.anything())
+      expect(saveState).not.toHaveBeenCalledWith(expect.stringMatching(/^lockHolder/), expect.anything())
     })
 
     it('does not touch the record for a run that never held a lock', async () => {
@@ -950,7 +951,7 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
 
       // #then
       const {saveState} = await import('@actions/core')
-      expect(saveState).not.toHaveBeenCalledWith('lockHolderId', expect.anything())
+      expect(saveState).not.toHaveBeenCalledWith(expect.stringMatching(/^lockHolder/), expect.anything())
     })
   })
 

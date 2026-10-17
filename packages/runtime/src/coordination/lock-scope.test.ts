@@ -319,6 +319,84 @@ describe('create/read release race', () => {
   })
 })
 
+describe('acquireLock — holderJob', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-04-24T18:15:00.000Z'))
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('writes holder_job on creation, leaving holder_id untouched', async () => {
+    // #given an empty store
+    const {config, objects} = createMemoryStore()
+
+    // #when acquiring with a job
+    await acquireLock(config, 'owner/repo', 'action:1:1', 'github', '1', createLogger(), {
+      scope: 'action',
+      holderJob: 'build',
+    })
+
+    // #then older readers still match holder_id, and the job rides along
+    const stored = JSON.parse(objects.get(ACTION_KEY)?.data ?? '{}') as LockRecord
+    expect(stored.holder_id).toMatch(/^action:\d+:\d+$/)
+    expect(stored.holder_job).toBe('build')
+  })
+
+  it('omits holder_job when none is given', async () => {
+    // #given
+    const {config, objects} = createMemoryStore()
+
+    // #when
+    await acquireLock(config, 'owner/repo', 'action:1:1', 'github', '1', createLogger(), {scope: 'action'})
+
+    // #then the record is byte-compatible with what older writers produce
+    const stored = JSON.parse(objects.get(ACTION_KEY)?.data ?? '{}') as LockRecord
+    expect(Object.keys(stored)).not.toContain('holder_job')
+  })
+
+  it('writes holder_job on a takeover too', async () => {
+    // #given an expired Action lease
+    const {config, objects} = createMemoryStore({
+      [ACTION_KEY]: lockRecord({holder_id: 'action:1:1', surface: 'github', acquired_at: '2026-04-24T17:00:00.000Z'}),
+    })
+
+    // #when a later attempt reclaims it
+    await acquireLock(config, 'owner/repo', 'action:1:2', 'github', '1', createLogger(), {
+      scope: 'action',
+      holderJob: 'build',
+      reclaimableWithoutConfirmation: holder => holder.surface === 'github',
+    })
+
+    // #then
+    expect(JSON.parse(objects.get(ACTION_KEY)?.data ?? '{}')).toMatchObject({
+      holder_id: 'action:1:2',
+      holder_job: 'build',
+    })
+  })
+
+  it('drops a malformed holder_job from the holder it reports instead of rejecting the record', async () => {
+    // #given a live lease with a corrupt holder_job
+    const {config} = createMemoryStore({
+      [ACTION_KEY]: {
+        ...lockRecord({holder_id: 'action:1:1', surface: 'github'}),
+        holder_job: ['x'],
+      } as unknown as LockRecord,
+    })
+
+    // #when another run tries to acquire
+    const result = await acquireLock(config, 'owner/repo', 'action:2:1', 'github', '2', createLogger(), {
+      scope: 'action',
+    })
+
+    // #then it is an ordinary active-holder decline, and the reported holder carries no holder_job
+    expect(result.success === true && result.data.outcome).toBe('active-holder')
+    expect(result.success === true && result.data.holder?.holder_job).toBeUndefined()
+  })
+})
+
 describe('acquireLock — reclaimableBeforeExpiry', () => {
   // The fixture clock is 18:15:00; a lease renewed at 18:13:00 has been unrenewed for 120s.
   const leaseRenewedAt = (holderId: string, renewedAt: string) =>
@@ -468,16 +546,55 @@ describe('releaseLockIfHolder', () => {
     expect(result.success).toBe(false)
   })
 
-  it('leaves a sibling job’s lock alone when holder ids differ only by job identity', async () => {
-    // #given two jobs of one run and attempt; the "test" job holds the lock
-    const {config, objects} = createMemoryStore({[ACTION_KEY]: holderRecord('action:1:1:test')})
+  it('deletes only when holder_job matches too', async () => {
+    // #given a lock held by the "build" job
+    const {config, objects} = createMemoryStore({[ACTION_KEY]: {...holderRecord('action:1:1'), holder_job: 'build'}})
 
-    // #when the "build" job's post hook releases by its own holder id
-    const result = await releaseLockIfHolder(config, 'owner/repo', 'action:1:1:build', createLogger(), 'action')
+    // #when the "build" job's post hook releases with its recorded holder and job
+    const result = await releaseLockIfHolder(config, 'owner/repo', 'action:1:1', createLogger(), 'action', 'build')
+
+    // #then
+    expect(result).toEqual(ok('released'))
+    expect(objects.has(ACTION_KEY)).toBe(false)
+  })
+
+  it.each([
+    ['a sibling job of the same run and attempt', {holder_job: 'test'}, 'build'],
+    ['a record without holder_job when one is expected', {}, 'build'],
+    ['a record with holder_job when none is expected', {holder_job: 'build'}, undefined],
+  ])('leaves the lock alone for %s', async (_label, recordOverrides, expectedJob) => {
+    // #given both jobs share holder_id `action:1:1`
+    const {config, objects} = createMemoryStore({[ACTION_KEY]: {...holderRecord('action:1:1'), ...recordOverrides}})
+
+    // #when
+    const result = await releaseLockIfHolder(config, 'owner/repo', 'action:1:1', createLogger(), 'action', expectedJob)
 
     // #then
     expect(result).toEqual(ok('not-holder'))
     expect(objects.has(ACTION_KEY)).toBe(true)
+  })
+
+  it('treats a malformed holder_job as absent', async () => {
+    // #given a record whose holder_job is outside the identity charset
+    const {config, objects} = createMemoryStore({
+      [ACTION_KEY]: {...holderRecord('action:1:1'), holder_job: 'bad job/../x'},
+    })
+
+    // #when the caller expects a job, then expects none
+    const withJob = await releaseLockIfHolder(
+      config,
+      'owner/repo',
+      'action:1:1',
+      createLogger(),
+      'action',
+      'bad job/../x',
+    )
+    const withoutJob = await releaseLockIfHolder(config, 'owner/repo', 'action:1:1', createLogger(), 'action')
+
+    // #then the bad value never matches, and the record reads like a legacy one
+    expect(withJob).toEqual(ok('not-holder'))
+    expect(withoutJob).toEqual(ok('released'))
+    expect(objects.has(ACTION_KEY)).toBe(false)
   })
 
   it('treats a NotFound on the delete as no-lock', async () => {
