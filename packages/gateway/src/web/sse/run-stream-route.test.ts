@@ -1366,6 +1366,141 @@ describe('GET /operator/runs/:runId/stream — lease: bounded repo-access read',
   })
 })
 
+const LEASE_READ_TIMEOUT_MS = 777
+
+/** Keyed one-shot fake: every timer is kept, so the max-duration timer and the lease read timer do not clobber each other. */
+function makeKeyedFakeTimeouts() {
+  const timers = new Map<number, {readonly fn: () => void; readonly ms: number; cleared: boolean; fired: boolean}>()
+  let nextId = 1
+  const find = (ms: number) => [...timers.values()].filter(timer => timer.ms === ms)
+  return {
+    setTimeout: (fn: () => void, ms: number): ReturnType<typeof globalThis.setTimeout> => {
+      const id = nextId++
+      timers.set(id, {fn, ms, cleared: false, fired: false})
+      return id as unknown as ReturnType<typeof globalThis.setTimeout>
+    },
+    clearTimeout: (handle: ReturnType<typeof globalThis.setTimeout> | undefined): void => {
+      const timer = timers.get(handle as unknown as number)
+      if (timer !== undefined) timer.cleared = true
+    },
+    /** Fires every live timer scheduled for `ms`. */
+    fire: async (ms: number): Promise<void> => {
+      for (const timer of find(ms)) {
+        if (timer.cleared === false && timer.fired === false) {
+          timer.fired = true
+          timer.fn()
+        }
+      }
+      await new Promise<void>(resolve => setTimeout(resolve, 0))
+    },
+    scheduled: (ms: number) => find(ms).length,
+    cleared: (ms: number) => find(ms).filter(timer => timer.cleared).length,
+  }
+}
+
+describe('GET /operator/runs/:runId/stream — lease: read timer through the timer seam', () => {
+  it('clears the read timer when the read wins, and never fires it', async () => {
+    // #given — the injected timer seam and a binding read that answers at once
+    const timeouts = makeKeyedFakeTimeouts()
+    const stream = await openLeasedStream({
+      setTimeout: timeouts.setTimeout,
+      clearTimeout: timeouts.clearTimeout,
+      leaseRepoAccessTimeoutMs: LEASE_READ_TIMEOUT_MS,
+    })
+    expect(timeouts.scheduled(LEASE_READ_TIMEOUT_MS)).toBe(0)
+
+    // #when — a tick runs its check
+    await stream.fakeTimer.tick()
+
+    // #then — one read timer was scheduled through the seam and cleared, and the stream is still open
+    expect(timeouts.scheduled(LEASE_READ_TIMEOUT_MS)).toBe(1)
+    expect(timeouts.cleared(LEASE_READ_TIMEOUT_MS)).toBe(1)
+    expect(stream.unsubscribeCalls()).toBe(0)
+    await timeouts.fire(LEASE_READ_TIMEOUT_MS)
+    expect(stream.unsubscribeCalls()).toBe(0)
+    await stream.res.body?.cancel()
+  })
+
+  it('ignores a read that resolves after the timeout has fired: no second close and no re-open', async () => {
+    // #given — a lease-tick read that stays pending
+    let release!: (value: {success: true; data: null} | typeof BOUND) => void
+    const pending = new Promise<{success: true; data: null} | typeof BOUND>(resolve => {
+      release = resolve
+    })
+    let reads = 0
+    const bindingsLookup: BindingsLookup = {
+      getBindingByRepo: vi.fn(async () => {
+        reads++
+        return reads === 1 ? BOUND : pending
+      }),
+    }
+    const timeouts = makeKeyedFakeTimeouts()
+    const subscribe = vi.fn((_runId: string, _callbacks: SubscriberCallbacks) => () => undefined)
+    const unsubscribeSpy = vi.fn()
+    const stream = await openLeasedStream({
+      bindingsLookup,
+      manager: makeManager({
+        subscribe: vi.fn((runId: string, callbacks: SubscriberCallbacks) => {
+          subscribe(runId, callbacks)
+          return unsubscribeSpy
+        }),
+      }),
+      setTimeout: timeouts.setTimeout,
+      clearTimeout: timeouts.clearTimeout,
+      leaseRepoAccessTimeoutMs: LEASE_READ_TIMEOUT_MS,
+    })
+
+    // #when — the tick starts, the read timer fires first, then the read answers late
+    await stream.fakeTimer.tick()
+    await timeouts.fire(LEASE_READ_TIMEOUT_MS)
+    release(BOUND)
+    await new Promise<void>(resolve => setTimeout(resolve, 0))
+    await stream.fakeTimer.tick()
+
+    // #then — the stream closed exactly once as unavailable, and nothing re-subscribed
+    expect(unsubscribeSpy).toHaveBeenCalledTimes(1)
+    expect(subscribe).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(stream.logger.warn).mock.calls.map(call => call[0])).toEqual([
+      {githubUserId: 99, gate: 'repo-unavailable'},
+    ])
+    await stream.res.body?.cancel()
+  })
+
+  it('resets the in-flight flag when a check throws', async () => {
+    // #given — a timer that keeps its callback after the stream closes, and a session read that throws on the tick
+    let intervalCallback: (() => void) | undefined
+    let sessionReads = 0
+    const sessionStore = {
+      get: vi.fn(() => {
+        sessionReads++
+        if (sessionReads === 1) throw new Error('boom')
+        return {githubUserId: 99, login: 'testuser', issuedAt: 0}
+      }),
+    }
+    const stream = await openLeasedStream({
+      sessionStore,
+      setInterval: (fn: () => void) => {
+        intervalCallback = fn
+        return 1 as unknown as ReturnType<typeof globalThis.setInterval>
+      },
+      clearInterval: () => undefined,
+    })
+    expect(sessionReads).toBe(0) // the gate does not read the session; the guard does
+
+    // #when — the first tick throws, closing the stream, then the callback is invoked again
+    intervalCallback?.()
+    await new Promise<void>(resolve => setTimeout(resolve, 0))
+    expect(stream.unsubscribeCalls()).toBe(1)
+    expect(sessionReads).toBe(1)
+    intervalCallback?.()
+    await new Promise<void>(resolve => setTimeout(resolve, 0))
+
+    // #then — the second invocation ran its check (the flag was reset), rather than returning early
+    expect(sessionReads).toBe(2)
+    await stream.res.body?.cancel()
+  })
+})
+
 describe('GET /operator/runs/:runId/stream — lease: operator removed from the allowlist mid-stream', () => {
   it('closes the stream on the next tick and emits exactly one authz.denied (not_allowlisted)', async () => {
     // #given — allowlisted at open; removed before the tick

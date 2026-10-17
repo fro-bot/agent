@@ -456,9 +456,15 @@ export function createSessionPersistence(deps: SessionPersistenceDeps): SessionP
   const scanTimeoutMs = deps.scanTimeoutMs ?? DEFAULT_SCAN_TIMEOUT_MS
   const scanMaxKeys = deps.scanMaxKeys ?? DEFAULT_SCAN_MAX_KEYS
 
-  /** Retention end: the later of login expiry and, for a revoked record, `revokedAt` plus the TTL. */
+  /**
+   * Retention end, for the sweep and the load replay window: the later of login expiry and the effective revoke
+   * time plus the TTL. A logout can only happen while the session is valid, so the effective revoke time is
+   * clamped to `issuedAt` plus the TTL. A forward clock step that wrote a far-future `revokedAt` therefore pins a
+   * record for at most twice the TTL after login.
+   */
   function isPastRetention(record: Pick<SessionRecord, 'issuedAt' | 'revokedAt'>): boolean {
-    return clock() >= Math.max(record.issuedAt, record.revokedAt ?? record.issuedAt) + absoluteTtlMs
+    const effectiveRevokedAt = Math.min(record.revokedAt ?? record.issuedAt, record.issuedAt + absoluteTtlMs)
+    return clock() >= Math.max(record.issuedAt, effectiveRevokedAt) + absoluteTtlMs
   }
 
   function isLoginExpired(issuedAt: number): boolean {
@@ -469,11 +475,12 @@ export function createSessionPersistence(deps: SessionPersistenceDeps): SessionP
     return issuedAt > clock() + futureSkewMs
   }
 
-  async function readEntry(ops: SessionObjectOps, keyHash: string): Promise<ScanEntry> {
+  async function readEntry(ops: SessionObjectOps, keyHash: string, state: DeadlineState): Promise<ScanEntry> {
     const read = async () => timedCall(async () => ops.getObject(buildSessionKey(keyHash)), operationTimeoutMs)
     let fetched = await read()
-    // One retry: a transient read failure would otherwise log the operator out at restart.
-    if (fetched.success === false && fetched.error.reason !== 'not_found') {
+    // One retry: a transient read failure would otherwise log the operator out at restart. Once the scan
+    // deadline has fired no new read may begin.
+    if (fetched.success === false && fetched.error.reason !== 'not_found' && state.cancelled === false) {
       fetched = await read()
     }
     if (fetched.success === false) {
@@ -514,7 +521,7 @@ export function createSessionPersistence(deps: SessionPersistenceDeps): SessionP
     }
     const truncated = Math.max(0, keyHashes.length - scanMaxKeys)
     const entries = await runBounded(keyHashes.slice(0, scanMaxKeys), scanConcurrency, state, async keyHash =>
-      readEntry(ops, keyHash),
+      readEntry(ops, keyHash, state),
     )
     return ok({entries, listed: listed.data.length, unrecognized, truncated})
   }

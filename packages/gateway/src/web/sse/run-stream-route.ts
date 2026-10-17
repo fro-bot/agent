@@ -224,19 +224,25 @@ async function writeFrame(stream: SSEStreamingApi, frame: ObservationFrame): Pro
 // Continuous-authz lease check
 // ---------------------------------------------------------------------------
 
+/** The route's timer seam, shared with the max-duration timer so tests drive both with one fake. */
+interface LeaseTimers {
+  readonly setTimeoutFn: NonNullable<RunStreamRouteDeps['setTimeout']>
+  readonly clearTimeoutFn: NonNullable<RunStreamRouteDeps['clearTimeout']>
+}
+
 /** `resolveRepoAccess` under a deadline. A read that never settles reads as `unavailable`, which closes the stream. */
-async function resolveRepoAccessBounded(owner: string, repo: string, deps: RunStreamRouteDeps) {
+async function resolveRepoAccessBounded(owner: string, repo: string, deps: RunStreamRouteDeps, timers: LeaseTimers) {
   const timeoutMs = deps.leaseRepoAccessTimeoutMs ?? DEFAULT_LEASE_REPO_ACCESS_TIMEOUT_MS
   let timer: ReturnType<typeof globalThis.setTimeout> | undefined
   const timedOut = new Promise<{readonly kind: 'unavailable'}>(resolve => {
-    timer = globalThis.setTimeout(() => {
+    timer = timers.setTimeoutFn(() => {
       resolve({kind: 'unavailable'})
     }, timeoutMs)
   })
   try {
     return await Promise.race([resolveRepoAccess(owner, repo, deps), timedOut])
   } finally {
-    globalThis.clearTimeout(timer)
+    timers.clearTimeoutFn(timer)
   }
 }
 
@@ -258,6 +264,7 @@ async function runLeaseCheck(
   owner: string,
   repo: string,
   deps: RunStreamRouteDeps,
+  timers: LeaseTimers,
   isCleaned: () => boolean,
   onFail: () => void,
 ): Promise<void> {
@@ -289,7 +296,7 @@ async function runLeaseCheck(
   // ── Check 3: Repo still bound AND not denylisted ─────────────────────────────────
   // One binding read. A transient `unavailable` closes the stream (fail closed); the operator
   // reconnects through the full gate stack.
-  const access = await resolveRepoAccessBounded(owner, repo, deps)
+  const access = await resolveRepoAccessBounded(owner, repo, deps, timers)
   if (isCleaned() === true) return
   if (access.kind !== 'allowed') {
     deps.logger.warn(
@@ -515,6 +522,7 @@ export function buildRunStreamRoute(app: Hono, deps: RunStreamRouteDeps): void {
               owner,
               repo,
               deps,
+              {setTimeoutFn, clearTimeoutFn},
               () => cleaned,
               () => {
                 cleanup('lease-failed')

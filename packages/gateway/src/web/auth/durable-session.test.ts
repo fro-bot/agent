@@ -820,6 +820,27 @@ describe('push replay', () => {
     expect(after.hook).not.toHaveBeenCalled()
   })
 
+  it('stops replay at issuedAt plus 2 x TTL even when revokedAt claims a time a year ahead', async () => {
+    // #given a revoked record whose revokedAt came from a clock that stepped a year forward
+    const store = createTestObjectStore()
+    const clock = {now: NOW}
+    const seed = createHarness({store, clock})
+    plantRecord(seed, 'skewed'.padEnd(43, 'a'), {status: 'revoked', revokedAt: NOW + 365 * DAY_MS})
+
+    // #when the gateway restarts just inside, and then at, issuedAt plus 2 x TTL
+    clock.now = NOW + 2 * TTL_MS - 1
+    const inside = createHarness({store, clock})
+    const loadedInside = await inside.session.load()
+    clock.now = NOW + 2 * TTL_MS
+    const at = createHarness({store, clock})
+    const loadedAt = await at.session.load()
+
+    // #then the deactivation is replayed inside the bound and not at it
+    expect(loadedInside.success && loadedInside.data.replayedUsers).toBe(1)
+    expect(loadedAt.success && loadedAt.data.replayedUsers).toBe(0)
+    expect(at.hook).not.toHaveBeenCalled()
+  })
+
   it('stamps revokedAt on a rotation and still skips it at replay', async () => {
     // #given a session rotated late in its life
     const store = createTestObjectStore()

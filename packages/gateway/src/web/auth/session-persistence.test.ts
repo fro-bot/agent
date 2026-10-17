@@ -529,6 +529,22 @@ describe('load', () => {
     expect(harness.store.callCount('getObject')).toBe(3)
   })
 
+  it('starts no new read after the scan deadline has fired, so a late failure is not retried', async () => {
+    // #given a read that fails only after the scan deadline: slow enough to outlive it
+    const harness = createHarness({scanTimeoutMs: 20, scanConcurrency: 1})
+    plant(harness, plantedHash('slow'), {issuedAt: NOW})
+    harness.store.setLatency('getObject', 80)
+    harness.store.failNext('getObject')
+
+    // #when the load hits its deadline while that first read is in flight
+    const loaded = await harness.persistence.load()
+    expect(errorOf(loaded).kind).toBe('timeout')
+    await new Promise<void>(resolve => setTimeout(resolve, 200))
+
+    // #then the failed first read was not followed by a second getObject
+    expect(harness.store.callCount('getObject')).toBe(1)
+  })
+
   it('counts a record removed between list and read as absent', async () => {
     // #given a record deleted after the list
     const harness = createHarness()
@@ -641,6 +657,33 @@ describe('revokedAt', () => {
     expect(withinWindow.success && withinWindow.data.sessions.map(s => s.status)).toEqual(['revoked'])
     expect(afterWindow.success && afterWindow.data.sessions).toEqual([])
     expect(afterWindow.success && afterWindow.data.counts.expired).toBe(1)
+  })
+
+  it('clamps a far-future revokedAt: retention ends at issuedAt plus twice the TTL', async () => {
+    // #given a record revoked at a clock value a year ahead, as after a forward clock step
+    const harness = createHarness()
+    const issuedAt = NOW
+    plant(harness, plantedHash('skew'), {issuedAt, status: 'revoked', revokedAt: NOW + 365 * DAY_MS})
+
+    // #when load and sweep run one millisecond before issuedAt plus 2 x TTL
+    harness.setNow(issuedAt + 2 * TTL_MS - 1)
+    const loadedBefore = await harness.persistence.load()
+    const sweptBefore = await harness.persistence.sweep()
+
+    // #then the record is still replayable and kept
+    expect(loadedBefore.success && loadedBefore.data.sessions.map(session => session.status)).toEqual(['revoked'])
+    expect(sweptBefore.success && sweptBefore.data).toMatchObject({deleted: 0, kept: 1})
+
+    // #when they run at issuedAt plus 2 x TTL
+    harness.setNow(issuedAt + 2 * TTL_MS)
+    const loadedAt = await harness.persistence.load()
+    const sweptAt = await harness.persistence.sweep()
+
+    // #then replay stops and the sweep deletes the record, however far ahead revokedAt claims to be
+    expect(loadedAt.success && loadedAt.data.sessions).toEqual([])
+    expect(loadedAt.success && loadedAt.data.counts.expired).toBe(1)
+    expect(sweptAt.success && sweptAt.data).toMatchObject({expired: 1, deleted: 1})
+    expect(harness.store.objects.size).toBe(0)
   })
 
   it('load still drops an active record at its login expiry', async () => {
