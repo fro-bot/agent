@@ -4,6 +4,7 @@
  * Covers:
  *   - Token generation and verification (happy path).
  *   - Session/operator binding mismatch rejection.
+ *   - The session binding is sha256(sessionId): the payload never carries the raw ID, and pre-change tokens fail.
  *   - Token expiry.
  *   - Malformed token rejection.
  *   - Timing-safe compare path (no short-circuit on mismatch).
@@ -19,6 +20,7 @@
  */
 
 import {Buffer} from 'node:buffer'
+import {createHmac} from 'node:crypto'
 import {Hono} from 'hono'
 import {describe, expect, it, vi} from 'vitest'
 import {loadAllowlistFromText} from './allowlist.js'
@@ -30,8 +32,9 @@ import {
   generateCsrfToken,
   verifyCsrfToken,
 } from './csrf.js'
+import {hashSessionId} from './session-persistence.js'
 import {SESSION_COOKIE_NAME} from './session.js'
-import {createTestSessionStore, mintTestSession} from './test-session-store.js'
+import {createTestSessionStore, createTestSessionStoreHarness, mintTestSession} from './test-session-store.js'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -173,6 +176,95 @@ describe('verifyCsrfToken — session/operator binding mismatch', () => {
 // ---------------------------------------------------------------------------
 // verifyCsrfToken — expiry
 // ---------------------------------------------------------------------------
+
+function decodePayload(token: string): Record<string, unknown> {
+  const [payloadB64] = token.split('.')
+  return JSON.parse(Buffer.from(payloadB64 ?? '', 'base64url').toString('utf8')) as Record<string, unknown>
+}
+
+describe('generateCsrfToken / verifyCsrfToken — session binding', () => {
+  it('a token minted for one session fails for another and verifies for its own', () => {
+    // #given two distinct session IDs of the production shape
+    const nowMs = 1_000_000
+    const sessionA = 'A'.repeat(43)
+    const sessionB = 'B'.repeat(43)
+    const token = generateCsrfToken({sessionId: sessionA, operatorId: 42, nowMs, secret: TEST_CSRF_SECRET})
+
+    // #when verified against each
+    const forA = verifyCsrfToken({token, sessionId: sessionA, operatorId: 42, nowMs, secret: TEST_CSRF_SECRET})
+    const forB = verifyCsrfToken({token, sessionId: sessionB, operatorId: 42, nowMs, secret: TEST_CSRF_SECRET})
+
+    // #then
+    expect(forA).toEqual({ok: true})
+    expect(forB).toEqual({ok: false, reason: 'binding_mismatch'})
+  })
+
+  it('the decoded payload carries sha256(sessionId) and no part of the raw session ID', () => {
+    // #given a session ID of the production shape (43-character base64url)
+    const sessionId = 'xK3_pQ-9mZ7vLw2Rt5YhNc8BdFgJ0aSeUi4oTnMq6Vy'
+    const token = generateCsrfToken({sessionId, operatorId: 42, nowMs: 1_000_000, secret: TEST_CSRF_SECRET})
+
+    // #when the payload is decoded
+    const payload = decodePayload(token)
+    const decoded = Buffer.from(token.split('.')[0] ?? '', 'base64url').toString('utf8')
+
+    // #then sid is the hash, and no run of the raw ID (even 8 characters) appears in the payload or token
+    expect(payload.sid).toBe(hashSessionId(sessionId))
+    expect(payload.sid).toMatch(/^[0-9a-f]{64}$/)
+    expect(Object.keys(payload).sort()).toEqual(['iv', 'oid', 'sid'])
+    for (let start = 0; start + 8 <= sessionId.length; start++) {
+      const run = sessionId.slice(start, start + 8)
+      expect(decoded).not.toContain(run)
+      expect(token).not.toContain(run)
+    }
+  })
+
+  it('rejects a token built the old way, with the raw session ID as the binding', () => {
+    // #given a token a pre-deploy gateway would have issued: HMAC-valid, sid is the raw session ID
+    const nowMs = 1_000_000
+    const sessionId = 'session-abc-123'
+    const legacyPayload = Buffer.from(
+      JSON.stringify({sid: sessionId, oid: 42, iv: Math.floor(nowMs / CSRF_TOKEN_INTERVAL_MS)}),
+    ).toString('base64url')
+    const sig = createHmac('sha256', Buffer.from(TEST_CSRF_SECRET, 'base64url'))
+      .update(legacyPayload)
+      .digest('base64url')
+
+    // #when verified after the change
+    const result = verifyCsrfToken({
+      token: `${legacyPayload}.${sig}`,
+      sessionId,
+      operatorId: 42,
+      nowMs,
+      secret: TEST_CSRF_SECRET,
+    })
+
+    // #then it fails once, on the binding; a freshly minted token for the same session passes
+    expect(result).toEqual({ok: false, reason: 'binding_mismatch'})
+    const fresh = generateCsrfToken({sessionId, operatorId: 42, nowMs, secret: TEST_CSRF_SECRET})
+    expect(verifyCsrfToken({token: fresh, sessionId, operatorId: 42, nowMs, secret: TEST_CSRF_SECRET})).toEqual({
+      ok: true,
+    })
+  })
+
+  it('a token verifies after a restart: same secret, session reloaded from the object store', async () => {
+    // #given a session created on one store and a token minted for it
+    const nowMs = Date.now()
+    const {createTestObjectStore} = await import('./test-object-store.js')
+    const objectStore = createTestObjectStore()
+    const before = await createTestSessionStoreHarness({objectStore, allowed: [42]})
+    const sessionId = await mintTestSession(before.store, {githubUserId: 42, login: 'octocat'})
+    const token = generateCsrfToken({sessionId, operatorId: 42, nowMs, secret: TEST_CSRF_SECRET})
+
+    // #when a fresh store loads the same records and verifies the same token
+    const after = await createTestSessionStoreHarness({objectStore, allowed: [42]})
+    const restored = after.store.get(sessionId)
+
+    // #then the session is back and the token still binds to it
+    expect(restored?.githubUserId).toBe(42)
+    expect(verifyCsrfToken({token, sessionId, operatorId: 42, nowMs, secret: TEST_CSRF_SECRET})).toEqual({ok: true})
+  })
+})
 
 describe('verifyCsrfToken — expiry', () => {
   it('accepts a token within the current interval', () => {

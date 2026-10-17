@@ -18,7 +18,8 @@ import type {TerminalPhase} from '@fro-bot/runtime'
  * - `operatorId`: stable GitHub numeric user ID (from the GitHub API `id` field).
  *   Prefer this over `login` for any access-control or audit decision.
  * - `login`: GitHub display login (mutable, for display only).
- * - `expiresAt`: ms-since-epoch timestamp of the sooner of absolute or idle expiry.
+ * - `expiresAt`: ms-since-epoch timestamp of the fixed session expiry: login time plus the 7-day lifetime.
+ *   Neither idle time nor any request moves it.
  * - `push`: optional coarse push-health report; omitted entirely when push is not
  *   configured. Authenticated-only by construction (this is a privileged route).
  */
