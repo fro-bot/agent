@@ -37,6 +37,12 @@ export interface LockRecord {
    * written by gateway holders and by older agent versions; readers drop a malformed value instead of rejecting.
    */
   readonly holder_job?: string
+  /**
+   * Random value minted per acquisition. Holder fields alone can repeat (two calls of one reusable workflow share run,
+   * attempt, job and matrix), so a late releaser matches on this to avoid deleting a successor's lease. Absent on
+   * records from gateway holders and older agent versions; readers drop a malformed value instead of rejecting.
+   */
+  readonly acquisition_token?: string
 }
 
 /**
@@ -94,6 +100,8 @@ export interface LockAcquisitionOptions {
   readonly reclaimableBeforeExpiry?: (holder: LockRecord, observedAt: Date) => boolean
   /** Written to the new lease as `holder_job` (and preserved by `renewLease` via the caller's record). */
   readonly holderJob?: string
+  /** Written to the new lease as `acquisition_token`. Never consulted when deciding a takeover. */
+  readonly acquisitionToken?: string
 }
 
 /** Logger for lock operations that emit audit events (`info`) alongside diagnostics (`debug`). */

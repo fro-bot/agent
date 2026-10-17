@@ -3,7 +3,13 @@ import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {err, ok} from '../../shared/types.js'
 import {STATE_KEYS} from '../config/state-keys.js'
-import {releaseActionLockIfHeld, runAcquireLock, SAME_RUN_TAKEOVER_MIN_UNRENEWED_MS} from './acquire-lock.js'
+import {
+  LOCK_RELEASE_TIMEOUT_MS,
+  releaseActionLockIfHeld,
+  runAcquireLock,
+  runWithDeadline,
+  SAME_RUN_TAKEOVER_MIN_UNRENEWED_MS,
+} from './acquire-lock.js'
 
 // Real acquireLock / renewLease / releaseLockIfHolder against an in-memory store with ETag semantics. Only the S3
 // adapter factory and the Actions state file are faked.
@@ -26,17 +32,27 @@ const STALE_MS = SAME_RUN_TAKEOVER_MIN_UNRENEWED_MS + 30_000
 
 const storeConfig: ObjectStoreConfig = {enabled: true, bucket: 'b', region: 'us-east-1', prefix: 'fro-bot-state'}
 
-function createMemoryStore(initial: LockRecord | null = null) {
+interface StoreHooks {
+  /** Replaces the read; receives the real one so a test can delay or hang it. */
+  readonly getObject?: (
+    real: () => ReturnType<Required<ObjectStoreAdapter>['getObject']>,
+    options?: {signal?: AbortSignal},
+  ) => ReturnType<Required<ObjectStoreAdapter>['getObject']>
+}
+
+function createMemoryStore(initial: LockRecord | null = null, hooks: StoreHooks = {}) {
   let current: {data: string; etag: string} | null =
     initial === null ? null : {data: JSON.stringify(initial), etag: 'etag-0'}
   let version = 0
+  const deletes: {ifMatch: string; signal?: AbortSignal}[] = []
 
+  const realGet = async () => (current === null ? err(new Error('NoSuchKey')) : ok({...current}))
   const adapter: Required<ObjectStoreAdapter> = {
     upload: async () => ok(undefined),
     download: async () => ok(undefined),
     list: async () => ok([]),
     listWithMetadata: async () => ok([]),
-    getObject: async () => (current === null ? err(new Error('NoSuchKey')) : ok({...current})),
+    getObject: async (_key, options) => (hooks.getObject === undefined ? realGet() : hooks.getObject(realGet, options)),
     conditionalPut: async (_key, data, options) => {
       if (options?.ifNoneMatch === '*' && current !== null) return err(new Error('PreconditionFailed'))
       if (options?.ifMatch !== undefined && options.ifMatch !== current?.etag) {
@@ -47,13 +63,14 @@ function createMemoryStore(initial: LockRecord | null = null) {
       return ok({etag: current.etag})
     },
     conditionalDelete: async (_key, options) => {
+      deletes.push(options)
       if (options.ifMatch !== current?.etag) return err(new Error('PreconditionFailed'))
       current = null
       return ok(undefined)
     },
   }
   storeRef.adapter = adapter
-  return {record: () => (current === null ? null : (JSON.parse(current.data) as LockRecord))}
+  return {record: () => (current === null ? null : (JSON.parse(current.data) as LockRecord)), deletes}
 }
 
 function seedRecord(overrides: Partial<LockRecord>): LockRecord {
@@ -164,6 +181,7 @@ describe('holder record round trip', () => {
       repo: 'owner/repo',
       holderId: state.get(STATE_KEYS.LOCK_HOLDER_ID) ?? '',
       ...(state.has(STATE_KEYS.LOCK_HOLDER_JOB) ? {holderJob: state.get(STATE_KEYS.LOCK_HOLDER_JOB)} : {}),
+      acquisitionToken: state.get(STATE_KEYS.LOCK_ACQUISITION_TOKEN) ?? '',
       logger: createMockLogger(),
     })
 
@@ -235,5 +253,98 @@ describe('holder record round trip', () => {
     expect(afterRenewal?.holder_id).toMatch(olderReader)
     expect(afterRenewal?.holder_job).toBe('build-m1a2b3c4d')
     expect(afterRenewal?.acquired_at).not.toBe(afterAcquire?.acquired_at)
+  })
+})
+
+describe('release hardening against the real lock', () => {
+  beforeEach(() => {
+    state.clear()
+    vi.useFakeTimers({toFake: ['Date']})
+    vi.setSystemTime(NOW)
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('a late post hook from an earlier acquisition leaves a successor with identical holder fields alone', async () => {
+    // #given two acquisitions of one reusable workflow: same run, attempt, job and matrix, so the same holder fields
+    const store = createMemoryStore()
+    await acquireAsAttempt2('build')
+    const earlier = {
+      holderId: state.get(STATE_KEYS.LOCK_HOLDER_ID) ?? '',
+      holderJob: state.get(STATE_KEYS.LOCK_HOLDER_JOB),
+      acquisitionToken: state.get(STATE_KEYS.LOCK_ACQUISITION_TOKEN),
+    }
+    // A's lease expires and its cleanup release never happened; B acquires with the same fields
+    vi.setSystemTime(new Date(NOW.getTime() + 16 * 60_000))
+    const successor = await acquireAsAttempt2('build')
+    expect(successor.outcome).toBe('acquired')
+    const successorToken = store.record()?.acquisition_token
+    expect(successorToken).toBeDefined()
+    expect(successorToken).not.toBe(earlier.acquisitionToken)
+    expect(store.record()?.holder_id).toBe(earlier.holderId)
+
+    // #when A's delayed post hook releases with A's recorded state
+    const released = await releaseActionLockIfHeld({
+      storeConfig,
+      repo: 'owner/repo',
+      holderId: earlier.holderId,
+      ...(earlier.holderJob === undefined ? {} : {holderJob: earlier.holderJob}),
+      ...(earlier.acquisitionToken === undefined ? {} : {acquisitionToken: earlier.acquisitionToken}),
+      logger: createMockLogger(),
+    })
+
+    // #then B's live lease is still there and nothing was deleted
+    expect(released).toEqual(ok('not-holder'))
+    expect(store.record()?.acquisition_token).toBe(successorToken)
+    expect(store.deletes).toHaveLength(0)
+  })
+
+  it('aborts a stalled release at the deadline, resolves promptly, and issues no late delete', async () => {
+    // #given a store whose read hangs until aborted; when aborted it still hands back the record afterwards, as a
+    // socket that was already mid-flight could
+    vi.useFakeTimers()
+    vi.setSystemTime(NOW)
+    let lateRead: (() => void) | undefined
+    const store = createMemoryStore(seedRecord({holder_id: 'action:1234:2', acquisition_token: 'token-aaaaaaaa'}), {
+      getObject: async (real, options) =>
+        new Promise(resolve => {
+          options?.signal?.addEventListener('abort', () => {
+            lateRead = () => {
+              resolve(real())
+            }
+          })
+        }),
+    })
+
+    // #when the post hook's bounded release hits its deadline
+    const running = runWithDeadline(
+      async signal =>
+        releaseActionLockIfHeld({
+          storeConfig,
+          repo: 'owner/repo',
+          holderId: 'action:1234:2',
+          holderJob: 'build',
+          acquisitionToken: 'token-aaaaaaaa',
+          signal,
+          logger: createMockLogger(),
+        }),
+      LOCK_RELEASE_TIMEOUT_MS,
+      'deadline exceeded',
+    )
+    const outcome = running.then(
+      () => 'resolved',
+      (error: Error) => error.message,
+    )
+    await vi.advanceTimersByTimeAsync(LOCK_RELEASE_TIMEOUT_MS)
+    expect(await outcome).toBe('deadline exceeded')
+
+    // #then it gave up at the deadline; the late read then completes and still cannot start a delete
+    lateRead?.()
+    await vi.advanceTimersByTimeAsync(100)
+    expect(lateRead).toBeDefined()
+    expect(store.deletes).toHaveLength(0)
+    expect(store.record()?.holder_id).toBe('action:1234:2')
   })
 })

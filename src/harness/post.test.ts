@@ -690,6 +690,7 @@ describe('post action', () => {
           cacheSaved: 'not-persisted',
           lockHolderId: 'action:12345:1',
           lockHolderJob: 'build',
+          lockAcquisitionToken: 'token-aaaaaaaa',
           ...storeState,
         })
 
@@ -699,14 +700,10 @@ describe('post action', () => {
 
         // #then
         const {releaseLockIfHolder} = await import('@fro-bot/runtime')
-        const [config, repo, holderId, , scope, holderJob] = vi.mocked(releaseLockIfHolder).mock.calls[0] ?? []
+        const [config, repo, holderId, , scope, expected] = vi.mocked(releaseLockIfHolder).mock.calls[0] ?? []
         expect(config?.storeConfig).toMatchObject({enabled: true, bucket: 'test-bucket'})
-        expect([repo, holderId, scope, holderJob]).toEqual([
-          'test-owner/test-repo',
-          'action:12345:1',
-          'action',
-          'build',
-        ])
+        expect([repo, holderId, scope]).toEqual(['test-owner/test-repo', 'action:12345:1', 'action'])
+        expect(expected).toMatchObject({holderJob: 'build', acquisitionToken: 'token-aaaaaaaa'})
       })
 
       it('releases with no holder_job when the main step recorded none', async () => {
@@ -719,7 +716,10 @@ describe('post action', () => {
 
         // #then
         const {releaseLockIfHolder} = await import('@fro-bot/runtime')
-        expect(vi.mocked(releaseLockIfHolder).mock.calls[0]?.[5]).toBeUndefined()
+        expect(vi.mocked(releaseLockIfHolder).mock.calls[0]?.[5]).toMatchObject({
+          holderJob: undefined,
+          acquisitionToken: undefined,
+        })
       })
 
       it('releases only after the cache save and the session sync finish', async () => {
@@ -882,37 +882,47 @@ describe('post action', () => {
         const {releaseLockIfHolder} = await import('@fro-bot/runtime')
         expect(releaseLockIfHolder).toHaveBeenCalledTimes(1)
         expect(vi.mocked(releaseLockIfHolder).mock.calls[0]?.[2]).toBe('action:12345:1')
-        expect(vi.mocked(releaseLockIfHolder).mock.calls[0]?.[5]).toBe('build')
+        expect(vi.mocked(releaseLockIfHolder).mock.calls[0]?.[5]).toMatchObject({holderJob: 'build'})
       })
 
-      it('gives up with a warning when the release exceeds its deadline', async () => {
-        // #given a release that never settles
+      it('aborts the in-flight release when the deadline expires and does not wait on it', async () => {
+        // #given a release whose I/O hangs until its signal aborts
         vi.useFakeTimers()
-        try {
-          await stubState({
-            shouldSaveCache: 'false',
-            lockHolderId: 'action:12345:1',
-            lockHolderJob: 'build',
-            ...storeState,
-          })
-          const {releaseLockIfHolder} = await import('@fro-bot/runtime')
-          vi.mocked(releaseLockIfHolder).mockReturnValue(new Promise(() => {}))
-          const logger = createMockLogger()
+        await stubState({
+          shouldSaveCache: 'false',
+          lockHolderId: 'action:12345:1',
+          lockHolderJob: 'build',
+          lockAcquisitionToken: 'token-aaaaaaaa',
+          ...storeState,
+        })
+        const {releaseLockIfHolder} = await import('@fro-bot/runtime')
+        let signalSeen: AbortSignal | undefined
+        let settledByAbort = false
+        vi.mocked(releaseLockIfHolder).mockImplementation(
+          async (_config, _repo, _holder, _logger, _scope, expected) =>
+            new Promise((_resolve, reject) => {
+              signalSeen = expected?.signal
+              expected?.signal?.addEventListener('abort', () => {
+                settledByAbort = true
+                reject(new Error('aborted'))
+              })
+            }),
+        )
+        const logger = createMockLogger()
 
-          // #when
-          const {runPost} = await import('./post.js')
-          const running = runPost({logger})
-          await vi.advanceTimersByTimeAsync(10_000)
-          await running
+        // #when the deadline passes
+        const {runPost} = await import('./post.js')
+        const running = runPost({logger})
+        await vi.advanceTimersByTimeAsync(10_000)
+        await running
 
-          // #then the step completes and the timeout is only a warning
-          expect(logger.warning).toHaveBeenCalledWith(
-            'Post-action lock release threw (non-fatal)',
-            expect.objectContaining({error: 'Lock release exceeded 10000ms'}),
-          )
-        } finally {
-          vi.useRealTimers()
-        }
+        // #then the step completed, the signal fired (so a stalled socket is torn down), and only a warning was logged
+        expect(signalSeen?.aborted).toBe(true)
+        expect(settledByAbort).toBe(true)
+        expect(logger.warning).toHaveBeenCalledWith(
+          'Post-action lock release threw (non-fatal)',
+          expect.objectContaining({error: 'Lock release exceeded 10000ms'}),
+        )
       })
 
       it('warns and continues when the release throws', async () => {

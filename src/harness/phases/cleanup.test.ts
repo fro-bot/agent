@@ -912,6 +912,7 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
       const {saveState} = await import('@actions/core')
       expect(saveState).toHaveBeenCalledWith('lockHolderId', '')
       expect(saveState).toHaveBeenCalledWith('lockHolderJob', '')
+      expect(saveState).toHaveBeenCalledWith('lockAcquisitionToken', '')
     })
 
     it('keeps the recorded holder when the release fails', async () => {

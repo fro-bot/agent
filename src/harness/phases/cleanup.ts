@@ -484,6 +484,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
           // Released: the post hook has nothing left to free.
           core.saveState(STATE_KEYS.LOCK_HOLDER_ID, '')
           core.saveState(STATE_KEYS.LOCK_HOLDER_JOB, '')
+          core.saveState(STATE_KEYS.LOCK_ACQUISITION_TOKEN, '')
           releaseLogger.debug('Lock released', {repo})
         }
       } catch (releaseError) {

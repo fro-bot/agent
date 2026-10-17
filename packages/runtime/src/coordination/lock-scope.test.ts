@@ -46,6 +46,14 @@ function createMemoryStore(initial: Readonly<Record<string, LockRecord>> = {}) {
     return ok({etag})
   }
 
+  /** The store's real conditional delete, usable from a test double that mutates the store first. */
+  const del = async (key: string, options: {ifMatch: string}) => {
+    const found = objects.get(key)
+    if (options.ifMatch != null && found?.etag !== options.ifMatch) return err(new Error('PreconditionFailed'))
+    objects.delete(key)
+    return ok(undefined)
+  }
+
   const adapter: Required<ObjectStoreAdapter> = {
     upload: vi.fn(async () => ok(undefined)),
     download: vi.fn(async () => ok(undefined)),
@@ -56,12 +64,7 @@ function createMemoryStore(initial: Readonly<Record<string, LockRecord>> = {}) {
       return found == null ? err(new Error('NoSuchKey')) : ok({...found})
     }),
     conditionalPut: vi.fn(put),
-    conditionalDelete: vi.fn(async (key: string, options: {ifMatch: string}) => {
-      const found = objects.get(key)
-      if (options.ifMatch != null && found?.etag !== options.ifMatch) return err(new Error('PreconditionFailed'))
-      objects.delete(key)
-      return ok(undefined)
-    }),
+    conditionalDelete: vi.fn(del),
   }
 
   const storeConfig: ObjectStoreConfig = {enabled: true, bucket: 'b', region: 'us-east-1', prefix: 'fro-bot-state'}
@@ -73,7 +76,7 @@ function createMemoryStore(initial: Readonly<Record<string, LockRecord>> = {}) {
     staleThresholdMs: 60_000,
     pendingStaleThresholdMs: 30 * 60_000,
   }
-  return {config, objects, adapter, put}
+  return {config, objects, adapter, put, del}
 }
 
 describe('lock scope', () => {
@@ -397,6 +400,123 @@ describe('acquireLock — holderJob', () => {
   })
 })
 
+describe('acquisition token', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-04-24T18:15:00.000Z'))
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('writes acquisition_token on creation and on a takeover', async () => {
+    // #given an empty store, then an expired lease
+    const created = createMemoryStore()
+    const takenOver = createMemoryStore({
+      [ACTION_KEY]: lockRecord({holder_id: 'action:1:1', surface: 'github', acquired_at: '2026-04-24T17:00:00.000Z'}),
+    })
+
+    // #when
+    await acquireLock(created.config, 'owner/repo', 'action:1:1', 'github', '1', createLogger(), {
+      scope: 'action',
+      acquisitionToken: 'token-aaaaaaaa',
+    })
+    await acquireLock(takenOver.config, 'owner/repo', 'action:1:2', 'github', '1', createLogger(), {
+      scope: 'action',
+      acquisitionToken: 'token-bbbbbbbb',
+      reclaimableWithoutConfirmation: holder => holder.surface === 'github',
+    })
+
+    // #then
+    expect(JSON.parse(created.objects.get(ACTION_KEY)?.data ?? '{}')).toMatchObject({
+      acquisition_token: 'token-aaaaaaaa',
+    })
+    expect(JSON.parse(takenOver.objects.get(ACTION_KEY)?.data ?? '{}')).toMatchObject({
+      acquisition_token: 'token-bbbbbbbb',
+    })
+  })
+
+  it('omits the field when none is given', async () => {
+    // #given
+    const {config, objects} = createMemoryStore()
+
+    // #when
+    await acquireLock(config, 'owner/repo', 'action:1:1', 'github', '1', createLogger(), {scope: 'action'})
+
+    // #then
+    const stored = JSON.parse(objects.get(ACTION_KEY)?.data ?? '{}') as LockRecord
+    expect(Object.keys(stored)).not.toContain('acquisition_token')
+  })
+
+  it('is never consulted when deciding a takeover', async () => {
+    // #given a live lease carrying a token, and a predicate that approves it
+    const {config, objects} = createMemoryStore({
+      [ACTION_KEY]: {
+        ...lockRecord({holder_id: 'action:1:1', surface: 'github'}),
+        acquisition_token: 'token-aaaaaaaa',
+      },
+    })
+
+    // #when a contender presents a different token
+    const result = await acquireLock(config, 'owner/repo', 'action:1:2', 'github', '1', createLogger(), {
+      scope: 'action',
+      acquisitionToken: 'token-bbbbbbbb',
+      reclaimableBeforeExpiry: () => true,
+    })
+
+    // #then the takeover rule alone decided
+    expect(result.success === true && result.data.outcome).toBe('acquired')
+    expect(JSON.parse(objects.get(ACTION_KEY)?.data ?? '{}')).toMatchObject({acquisition_token: 'token-bbbbbbbb'})
+  })
+
+  it('drops a malformed token from the holder it reports instead of rejecting the record', async () => {
+    // #given a live lease with a corrupt token
+    const {config} = createMemoryStore({
+      [ACTION_KEY]: {
+        ...lockRecord({holder_id: 'action:1:1', surface: 'github'}),
+        acquisition_token: {x: 1},
+      } as unknown as LockRecord,
+    })
+
+    // #when
+    const result = await acquireLock(config, 'owner/repo', 'action:2:1', 'github', '2', createLogger(), {
+      scope: 'action',
+    })
+
+    // #then
+    expect(result.success === true && result.data.outcome).toBe('active-holder')
+    expect(result.success === true && result.data.holder?.acquisition_token).toBeUndefined()
+  })
+
+  it('a late release by an earlier acquisition cannot delete a successor with identical holder fields', async () => {
+    // #given A and B share run, attempt, job and matrix, so holder_id and holder_job are identical; A's lease expired
+    const {config, objects} = createMemoryStore()
+    const sameFields = {scope: 'action' as const, holderJob: 'build'}
+    await acquireLock(config, 'owner/repo', 'action:1:1', 'github', '1', createLogger(), {
+      ...sameFields,
+      acquisitionToken: 'token-aaaaaaaa',
+    })
+    vi.setSystemTime(new Date('2026-04-24T18:31:00.000Z'))
+    const successor = await acquireLock(config, 'owner/repo', 'action:1:1', 'github', '1', createLogger(), {
+      ...sameFields,
+      acquisitionToken: 'token-bbbbbbbb',
+      reclaimableWithoutConfirmation: holder => holder.surface === 'github',
+    })
+    expect(successor.success === true && successor.data.outcome).toBe('acquired')
+
+    // #when A's delayed post hook releases with A's recorded token
+    const released = await releaseLockIfHolder(config, 'owner/repo', 'action:1:1', createLogger(), 'action', {
+      holderJob: 'build',
+      acquisitionToken: 'token-aaaaaaaa',
+    })
+
+    // #then B's live lease is untouched
+    expect(released).toEqual(ok('not-holder'))
+    expect(JSON.parse(objects.get(ACTION_KEY)?.data ?? '{}')).toMatchObject({acquisition_token: 'token-bbbbbbbb'})
+  })
+})
+
 describe('acquireLock — reclaimableBeforeExpiry', () => {
   // The fixture clock is 18:15:00; a lease renewed at 18:13:00 has been unrenewed for 120s.
   const leaseRenewedAt = (holderId: string, renewedAt: string) =>
@@ -519,17 +639,20 @@ describe('releaseLockIfHolder', () => {
   })
 
   it('reports conflict and keeps the lock when it is replaced between the read and the delete', async () => {
-    // #given a successor replaces the lock after our read
-    const {config, objects, adapter} = createMemoryStore({[ACTION_KEY]: holderRecord('action:1:1')})
-    vi.mocked(adapter.conditionalDelete).mockImplementationOnce(async key => {
+    // #given a successor replaces the lock after our read; the delete runs against the real ETag-enforcing store
+    const {config, objects, adapter, del} = createMemoryStore({[ACTION_KEY]: holderRecord('action:1:1')})
+    const observedEtag = objects.get(ACTION_KEY)?.etag
+    vi.mocked(adapter.conditionalDelete).mockImplementationOnce(async (key, options) => {
       objects.set(key, {data: JSON.stringify(holderRecord('action:1:2')), etag: 'etag-successor'})
-      return err(new Error('PreconditionFailed'))
+      return del(key, options)
     })
 
     // #when
     const result = await releaseLockIfHolder(config, 'owner/repo', 'action:1:1', createLogger(), 'action')
 
-    // #then the successor's lock survives
+    // #then the delete carried the ETag observed at read time, lost the real race, and the successor survives
+    expect(observedEtag).toBeDefined()
+    expect(vi.mocked(adapter.conditionalDelete).mock.calls[0]?.[1]).toEqual({ifMatch: observedEtag})
     expect(result).toEqual(ok('conflict'))
     expect(JSON.parse(objects.get(ACTION_KEY)?.data ?? '{}')).toMatchObject({holder_id: 'action:1:2'})
   })
@@ -551,7 +674,9 @@ describe('releaseLockIfHolder', () => {
     const {config, objects} = createMemoryStore({[ACTION_KEY]: {...holderRecord('action:1:1'), holder_job: 'build'}})
 
     // #when the "build" job's post hook releases with its recorded holder and job
-    const result = await releaseLockIfHolder(config, 'owner/repo', 'action:1:1', createLogger(), 'action', 'build')
+    const result = await releaseLockIfHolder(config, 'owner/repo', 'action:1:1', createLogger(), 'action', {
+      holderJob: 'build',
+    })
 
     // #then
     expect(result).toEqual(ok('released'))
@@ -567,7 +692,9 @@ describe('releaseLockIfHolder', () => {
     const {config, objects} = createMemoryStore({[ACTION_KEY]: {...holderRecord('action:1:1'), ...recordOverrides}})
 
     // #when
-    const result = await releaseLockIfHolder(config, 'owner/repo', 'action:1:1', createLogger(), 'action', expectedJob)
+    const result = await releaseLockIfHolder(config, 'owner/repo', 'action:1:1', createLogger(), 'action', {
+      holderJob: expectedJob,
+    })
 
     // #then
     expect(result).toEqual(ok('not-holder'))
@@ -581,14 +708,9 @@ describe('releaseLockIfHolder', () => {
     })
 
     // #when the caller expects a job, then expects none
-    const withJob = await releaseLockIfHolder(
-      config,
-      'owner/repo',
-      'action:1:1',
-      createLogger(),
-      'action',
-      'bad job/../x',
-    )
+    const withJob = await releaseLockIfHolder(config, 'owner/repo', 'action:1:1', createLogger(), 'action', {
+      holderJob: 'bad job/../x',
+    })
     const withoutJob = await releaseLockIfHolder(config, 'owner/repo', 'action:1:1', createLogger(), 'action')
 
     // #then the bad value never matches, and the record reads like a legacy one
@@ -633,5 +755,128 @@ describe('releaseLockIfHolder', () => {
     expect(result.success).toBe(false)
     expect(adapter.conditionalDelete).not.toHaveBeenCalled()
     expect(objects.has(ACTION_KEY)).toBe(true)
+  })
+
+  describe('acquisition token', () => {
+    const tokenRecord = (token?: string) => ({
+      ...holderRecord('action:1:1'),
+      holder_job: 'build',
+      ...(token === undefined ? {} : {acquisition_token: token}),
+    })
+
+    it('deletes when the stored token matches', async () => {
+      // #given
+      const {config, objects} = createMemoryStore({[ACTION_KEY]: tokenRecord('token-aaaaaaaa')})
+
+      // #when
+      const result = await releaseLockIfHolder(config, 'owner/repo', 'action:1:1', createLogger(), 'action', {
+        holderJob: 'build',
+        acquisitionToken: 'token-aaaaaaaa',
+      })
+
+      // #then
+      expect(result).toEqual(ok('released'))
+      expect(objects.has(ACTION_KEY)).toBe(false)
+    })
+
+    it.each([
+      ['a different token', 'token-bbbbbbbb'],
+      ['no token on the record', undefined],
+    ])('leaves the lock alone for %s', async (_label, stored) => {
+      // #given identical holder_id and holder_job
+      const {config, objects} = createMemoryStore({[ACTION_KEY]: tokenRecord(stored)})
+
+      // #when
+      const result = await releaseLockIfHolder(config, 'owner/repo', 'action:1:1', createLogger(), 'action', {
+        holderJob: 'build',
+        acquisitionToken: 'token-aaaaaaaa',
+      })
+
+      // #then
+      expect(result).toEqual(ok('not-holder'))
+      expect(objects.has(ACTION_KEY)).toBe(true)
+    })
+
+    it('does not compare the token when the caller supplies none', async () => {
+      // #given a record with a token and a caller that never recorded one
+      const {config} = createMemoryStore({[ACTION_KEY]: tokenRecord('token-aaaaaaaa')})
+
+      // #when
+      const result = await releaseLockIfHolder(config, 'owner/repo', 'action:1:1', createLogger(), 'action', {
+        holderJob: 'build',
+      })
+
+      // #then
+      expect(result).toEqual(ok('released'))
+    })
+
+    it('treats a malformed stored token as absent', async () => {
+      // #given
+      const {config, objects} = createMemoryStore({[ACTION_KEY]: tokenRecord('bad token/../x')})
+
+      // #when the caller expects that exact value
+      const result = await releaseLockIfHolder(config, 'owner/repo', 'action:1:1', createLogger(), 'action', {
+        holderJob: 'build',
+        acquisitionToken: 'bad token/../x',
+      })
+
+      // #then the dropped value can never match
+      expect(result).toEqual(ok('not-holder'))
+      expect(objects.has(ACTION_KEY)).toBe(true)
+    })
+  })
+
+  describe('abort', () => {
+    it('starts no delete when the deadline expires while the read is in flight', async () => {
+      // #given a read that ignores the signal and resolves after the abort
+      const {config, adapter, objects} = createMemoryStore({[ACTION_KEY]: holderRecord('action:1:1')})
+      const controller = new AbortController()
+      const realGet = vi.mocked(adapter.getObject).getMockImplementation()
+      vi.mocked(adapter.getObject).mockImplementationOnce(async (key, options) => {
+        controller.abort()
+        return realGet?.(key, options) ?? err(new Error('unreachable'))
+      })
+
+      // #when
+      const result = await releaseLockIfHolder(config, 'owner/repo', 'action:1:1', createLogger(), 'action', {
+        signal: controller.signal,
+      })
+
+      // #then
+      expect(result.success).toBe(false)
+      expect(adapter.conditionalDelete).not.toHaveBeenCalled()
+      expect(objects.has(ACTION_KEY)).toBe(true)
+    })
+
+    it('does not touch the store when already aborted', async () => {
+      // #given
+      const {config, adapter} = createMemoryStore({[ACTION_KEY]: holderRecord('action:1:1')})
+      const controller = new AbortController()
+      controller.abort()
+
+      // #when
+      const result = await releaseLockIfHolder(config, 'owner/repo', 'action:1:1', createLogger(), 'action', {
+        signal: controller.signal,
+      })
+
+      // #then
+      expect(result.success).toBe(false)
+      expect(adapter.getObject).not.toHaveBeenCalled()
+    })
+
+    it('passes the signal to both the read and the delete', async () => {
+      // #given
+      const {config, adapter} = createMemoryStore({[ACTION_KEY]: holderRecord('action:1:1')})
+      const controller = new AbortController()
+
+      // #when
+      await releaseLockIfHolder(config, 'owner/repo', 'action:1:1', createLogger(), 'action', {
+        signal: controller.signal,
+      })
+
+      // #then
+      expect(vi.mocked(adapter.getObject).mock.calls[0]?.[1]).toEqual({signal: controller.signal})
+      expect(vi.mocked(adapter.conditionalDelete).mock.calls[0]?.[1]).toMatchObject({signal: controller.signal})
+    })
   })
 })

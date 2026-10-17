@@ -21,7 +21,7 @@ import {
 import {toErrorMessage} from '../shared/errors.js'
 import {createLogger} from '../shared/logger.js'
 import {STATE_KEYS} from './config/state-keys.js'
-import {LOCK_RELEASE_TIMEOUT_MS, releaseActionLockIfHeld, withTimeout} from './phases/acquire-lock.js'
+import {LOCK_RELEASE_TIMEOUT_MS, releaseActionLockIfHeld, runWithDeadline} from './phases/acquire-lock.js'
 
 export interface PostOptions {
   logger?: Logger
@@ -67,28 +67,33 @@ function reconstructStoreConfigFromState(): ObjectStoreConfig | undefined {
 
 /**
  * Frees the Action lock when the main step died holding it (cancelled or killed before cleanup's release). The main
- * step records its holder id on acquisition and clears it after a successful release, so no record means nothing to
- * do. The delete is conditional on the stored holder, so a successor's lock is never touched. Bounded by
- * `LOCK_RELEASE_TIMEOUT_MS`; never throws.
+ * step records its holder id, job and per-acquisition token on acquisition and clears them after a successful
+ * release, so no record means nothing to do. The delete needs the stored holder, job and token to all match (then
+ * an `If-Match` on the ETag just read), so a successor's lock is never touched. At `LOCK_RELEASE_TIMEOUT_MS` the
+ * requests are aborted, not just abandoned; never throws.
  */
 async function releaseOrphanedLock(logger: Logger): Promise<void> {
   try {
     const holderId = readOptionalState(STATE_KEYS.LOCK_HOLDER_ID)
     if (holderId == null) return
     const holderJob = readOptionalState(STATE_KEYS.LOCK_HOLDER_JOB)
+    const acquisitionToken = readOptionalState(STATE_KEYS.LOCK_ACQUISITION_TOKEN)
 
     const storeConfig = reconstructStoreConfigFromState()
     if (storeConfig?.enabled !== true) return
 
     const repo = getGitHubRepository()
-    const released = await withTimeout(
-      releaseActionLockIfHeld({
-        storeConfig,
-        repo,
-        holderId,
-        ...(holderJob === undefined ? {} : {holderJob}),
-        logger: createLogger({phase: 'post-lock-release'}),
-      }),
+    const released = await runWithDeadline(
+      async signal =>
+        releaseActionLockIfHeld({
+          storeConfig,
+          repo,
+          holderId,
+          ...(holderJob === undefined ? {} : {holderJob}),
+          ...(acquisitionToken === undefined ? {} : {acquisitionToken}),
+          signal,
+          logger: createLogger({phase: 'post-lock-release'}),
+        }),
       LOCK_RELEASE_TIMEOUT_MS,
       `Lock release exceeded ${LOCK_RELEASE_TIMEOUT_MS}ms`,
     )

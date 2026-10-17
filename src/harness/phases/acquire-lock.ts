@@ -7,6 +7,7 @@ import type {
 } from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
 import type {Result} from '../../shared/types.js'
+import {randomUUID} from 'node:crypto'
 import * as core from '@actions/core'
 import {
   acquireLock,
@@ -169,6 +170,7 @@ function createLeaseController(
   repo: string,
   holderId: string,
   holderJob: string | undefined,
+  acquisitionToken: string,
   runId: string,
   initialEtag: string,
   logger: Logger,
@@ -192,8 +194,9 @@ function createLeaseController(
       acquired_at: new Date().toISOString(),
       ttl_seconds: config.lockTtlSeconds,
       run_id: runId,
-      // Every renewal rewrites the whole record, so the job must be carried or the first tick would erase it.
+      // Every renewal rewrites the whole record, so the job and token must be carried or the first tick would erase them.
       ...(holderJob === undefined ? {} : {holder_job: holderJob}),
+      acquisition_token: acquisitionToken,
     }
 
     inFlight = withTimeout(
@@ -343,29 +346,56 @@ export interface ReleaseActionLockOptions {
   readonly holderId: string
   /** The `holder_job` recorded at acquisition, or `undefined` if none was. */
   readonly holderJob?: string
+  /** The `acquisition_token` recorded at acquisition; when given, the lock must carry the same one. */
+  readonly acquisitionToken?: string
+  /** Aborts the release's requests; no delete starts after it aborts. */
+  readonly signal?: AbortSignal
   readonly logger: Logger
 }
 
 /**
- * Deletes the Action lock only while it is still held by `holderId` and `holderJob`. Used by the post hook to free a lock whose
- * main step died before cleanup's release; never touches a successor's lock.
+ * Deletes the Action lock only while it is still held by `holderId`, `holderJob` and `acquisitionToken`. Used by the
+ * post hook to free a lock whose main step died before cleanup's release; never touches a successor's lock.
  */
 export async function releaseActionLockIfHeld(
   options: ReleaseActionLockOptions,
 ): Promise<Result<ReleaseIfHolderOutcome, Error>> {
-  const {storeConfig, repo, holderId, holderJob, logger} = options
+  const {storeConfig, repo, holderId, holderJob, acquisitionToken, signal, logger} = options
   return releaseLockIfHolder(
     createActionCoordinationConfig(storeConfig, logger),
     repo,
     holderId,
     logger,
     ACTION_LOCK_SCOPE,
-    holderJob,
+    {
+      holderJob,
+      acquisitionToken,
+      signal,
+    },
   )
 }
 
 /** Bounds a lock release's remote calls so a stalled store cannot hang the step that issued it. */
 export const LOCK_RELEASE_TIMEOUT_MS = 10_000
+
+/**
+ * Runs `work` with an `AbortSignal` that fires when `timeoutMs` elapses, and rejects with `message` at that point.
+ * Unlike a bare `withTimeout`, the abort stops the in-flight requests, so a stalled socket cannot keep the process
+ * alive and a late read cannot go on to start a write.
+ */
+export async function runWithDeadline<T>(
+  work: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+  message: string,
+): Promise<T> {
+  const controller = new AbortController()
+  try {
+    return await withTimeout(work(controller.signal), timeoutMs, message)
+  } catch (error) {
+    controller.abort(error)
+    throw error
+  }
+}
 
 /**
  * Frees a lock this call just acquired; a failure only means the lease runs out on its own. Bounded by
@@ -378,8 +408,8 @@ async function releaseBestEffort(
   logger: Logger,
 ): Promise<void> {
   try {
-    const released = await withTimeout(
-      releaseLock(config, repo, etag, logger, ACTION_LOCK_SCOPE),
+    const released = await runWithDeadline(
+      async signal => releaseLock(config, repo, etag, logger, ACTION_LOCK_SCOPE, signal),
       LOCK_RELEASE_TIMEOUT_MS,
       `Lock release exceeded ${LOCK_RELEASE_TIMEOUT_MS}ms`,
     )
@@ -452,6 +482,8 @@ export async function runAcquireLock(options: AcquireLockPhaseOptions): Promise<
   const jobIdentity = options.jobIdentity ?? null
   // An identity outside the stored charset is dropped (legacy record) rather than written and later rejected.
   const holderJob = jobIdentity != null && isValidHolderJob(jobIdentity) ? jobIdentity : undefined
+  // Minted per acquisition so a late releaser can tell this lease from a successor's that shares every holder field.
+  const acquisitionToken = randomUUID()
   const logger = options.logger ?? createLogger({phase: 'acquire-lock'})
 
   if (storeConfig.enabled === false) {
@@ -470,6 +502,7 @@ export async function runAcquireLock(options: AcquireLockPhaseOptions): Promise<
     result = await acquireLock(config, repo, holderId, 'github', runId, logger, {
       scope: ACTION_LOCK_SCOPE,
       ...(holderJob === undefined ? {} : {holderJob}),
+      acquisitionToken,
       reclaimableWithoutConfirmation: holder => holder.surface === 'github' && isActionHolderId(holder.holder_id),
       reclaimableBeforeExpiry: (holder, observedAt) =>
         isStaleEarlierAttemptOfJob(holder, {runId, runAttempt, holderJob}, observedAt),
@@ -490,8 +523,10 @@ export async function runAcquireLock(options: AcquireLockPhaseOptions): Promise<
     const {etag} = result.data
     logger.info('Lock acquired', {repo, holderId, etag})
     try {
-      // Lets the post hook free the lock if this process dies before cleanup releases it. The job goes first: the
-      // holder id is the "record is set" flag the post hook keys on, so a partial write never leaves a job-less flag.
+      // Lets the post hook free the lock if this process dies before cleanup releases it. The holder id is written
+      // last: it is the "record is set" flag the post hook keys on, so a partial write never leaves it without the
+      // token (or job) the release must match.
+      core.saveState(STATE_KEYS.LOCK_ACQUISITION_TOKEN, acquisitionToken)
       if (holderJob !== undefined) core.saveState(STATE_KEYS.LOCK_HOLDER_JOB, holderJob)
       core.saveState(STATE_KEYS.LOCK_HOLDER_ID, holderId)
     } catch (error_) {
@@ -502,7 +537,7 @@ export async function runAcquireLock(options: AcquireLockPhaseOptions): Promise<
       await releaseBestEffort(config, repo, etag, logger)
       return {outcome: 'error', error}
     }
-    const renewal = createLeaseController(config, repo, holderId, holderJob, runId, etag, logger)
+    const renewal = createLeaseController(config, repo, holderId, holderJob, acquisitionToken, runId, etag, logger)
     return {outcome: 'acquired', lockEtag: etag, renewal}
   }
 

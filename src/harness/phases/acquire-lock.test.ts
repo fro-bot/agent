@@ -10,8 +10,11 @@ import {
   parseActionHolderRunId,
   releaseActionLockIfHeld,
   runAcquireLock,
+  runWithDeadline,
   SAME_RUN_TAKEOVER_MIN_UNRENEWED_MS,
 } from './acquire-lock.js'
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 const acquireLockMock = vi.hoisted(() => vi.fn())
 const createS3AdapterMock = vi.hoisted(() => vi.fn(() => ({})))
@@ -146,6 +149,7 @@ describe('runAcquireLock', () => {
         scope: 'action',
         reclaimableWithoutConfirmation: expect.any(Function),
         reclaimableBeforeExpiry: expect.any(Function),
+        acquisitionToken: expect.stringMatching(UUID),
       },
       /* eslint-enable @typescript-eslint/no-unsafe-assignment */
     )
@@ -895,7 +899,7 @@ describe('runAcquireLock holder identity', () => {
     expect(savedJobs).toEqual(expectedJob === undefined ? [] : [expectedJob])
   })
 
-  it('keeps holder_job on every lease renewal', async () => {
+  it('keeps holder_job and the acquisition token on every lease renewal', async () => {
     // #given an acquired lock whose renewal timer ticks once
     vi.useFakeTimers()
     try {
@@ -913,7 +917,11 @@ describe('runAcquireLock holder identity', () => {
       if (result.outcome === 'acquired') await result.renewal.stop()
 
       // #then the rewritten record still names the job (and keeps the legacy holder_id)
-      expect(renewLeaseMock.mock.calls[0]?.[2]).toMatchObject({holder_id: 'action:99999:3', holder_job: 'build'})
+      expect(renewLeaseMock.mock.calls[0]?.[2]).toMatchObject({
+        holder_id: 'action:99999:3',
+        holder_job: 'build',
+        acquisition_token: (acquireLockMock.mock.calls[0]?.[6] as {acquisitionToken?: string}).acquisitionToken,
+      })
     } finally {
       vi.useRealTimers()
     }
@@ -943,6 +951,7 @@ describe('runAcquireLock holder state handoff', () => {
 
     // #then
     expect(core.saveState).toHaveBeenCalledWith(STATE_KEYS.LOCK_HOLDER_ID, 'action:1234:2')
+    expect(core.saveState).toHaveBeenCalledWith(STATE_KEYS.LOCK_ACQUISITION_TOKEN, expect.stringMatching(UUID))
     expect(core.saveState).not.toHaveBeenCalledWith(STATE_KEYS.LOCK_HOLDER_JOB, expect.anything())
   })
 
@@ -974,6 +983,7 @@ describe('runAcquireLock holder state handoff', () => {
       '"etag-new"',
       expect.anything(),
       'action',
+      expect.any(AbortSignal),
     )
   })
 
@@ -1001,6 +1011,67 @@ describe('runAcquireLock holder state handoff', () => {
     })
   })
 
+  it('mints one token per acquisition, writes it to the lock and state, and writes the holder id last', async () => {
+    // #given
+    acquireLockMock.mockResolvedValue(lockOk({acquired: true, outcome: 'acquired', etag: '"etag"', holder: null}))
+
+    // #when two acquisitions run
+    const first = await runAcquireLock({
+      storeConfig: createStoreConfig(),
+      repo: 'fro-bot/agent',
+      runId: '1234',
+      runAttempt: 2,
+      jobIdentity: 'build',
+      logger: createMockLogger(),
+    })
+    if (first.outcome === 'acquired') await first.renewal.stop()
+    const second = await runAcquireLock({
+      storeConfig: createStoreConfig(),
+      repo: 'fro-bot/agent',
+      runId: '1234',
+      runAttempt: 2,
+      jobIdentity: 'build',
+      logger: createMockLogger(),
+    })
+    if (second.outcome === 'acquired') await second.renewal.stop()
+
+    // #then identical holder fields still get distinct tokens, matching what was saved
+    const tokenOf = (call: number) =>
+      (acquireLockMock.mock.calls[call]?.[6] as {acquisitionToken?: string}).acquisitionToken
+    expect(tokenOf(0)).toMatch(UUID)
+    expect(tokenOf(1)).toMatch(UUID)
+    expect(tokenOf(0)).not.toBe(tokenOf(1))
+    const saved = vi.mocked(core.saveState).mock.calls
+    expect(saved[0]).toEqual([STATE_KEYS.LOCK_ACQUISITION_TOKEN, tokenOf(0)])
+    expect(saved.slice(0, 3).map(([key]) => key)).toEqual([
+      STATE_KEYS.LOCK_ACQUISITION_TOKEN,
+      STATE_KEYS.LOCK_HOLDER_JOB,
+      STATE_KEYS.LOCK_HOLDER_ID,
+    ])
+  })
+
+  it('leaves no holder id behind when the token write fails first', async () => {
+    // #given the very first state write throws
+    acquireLockMock.mockResolvedValue(lockOk({acquired: true, outcome: 'acquired', etag: '"etag"', holder: null}))
+    releaseLockMock.mockResolvedValue(ok(undefined))
+    vi.mocked(core.saveState).mockImplementationOnce(() => {
+      throw new Error('state file unwritable')
+    })
+
+    // #when
+    const result = await runAcquireLock({
+      storeConfig: createStoreConfig(),
+      repo: 'fro-bot/agent',
+      runId: '1234',
+      runAttempt: 2,
+      logger: createMockLogger(),
+    })
+
+    // #then the holder id (the post hook's "record is set" flag) was never written
+    expect(result.outcome).toBe('error')
+    expect(core.saveState).not.toHaveBeenCalledWith(STATE_KEYS.LOCK_HOLDER_ID, expect.anything())
+  })
+
   it('bounds the best-effort release with the shared deadline', async () => {
     // #given the lock was acquired, the record write fails, and the release never settles
     vi.useFakeTimers()
@@ -1023,8 +1094,9 @@ describe('runAcquireLock holder state handoff', () => {
       await vi.advanceTimersByTimeAsync(LOCK_RELEASE_TIMEOUT_MS)
       const result = await running
 
-      // #then it still fails closed, after warning about the timed-out release
+      // #then it still fails closed, after aborting the timed-out release's requests and warning about it
       expect(result.outcome).toBe('error')
+      expect((releaseLockMock.mock.calls[0]?.[5] as AbortSignal).aborted).toBe(true)
       expect(logger.warning).toHaveBeenCalledWith(
         'Releasing the lock after a failed holder record threw',
         expect.objectContaining({error: `Lock release exceeded ${LOCK_RELEASE_TIMEOUT_MS}ms`}),
@@ -1085,7 +1157,7 @@ describe('releaseActionLockIfHeld', () => {
       'action:1234:1',
       expect.any(Object),
       'action',
-      undefined,
+      {holderJob: undefined, acquisitionToken: undefined, signal: undefined},
     )
   })
 
@@ -1109,7 +1181,81 @@ describe('releaseActionLockIfHeld', () => {
       'action:1234:1',
       expect.anything(),
       'action',
-      'build',
+      expect.objectContaining({holderJob: 'build'}),
     )
+  })
+
+  it('passes the acquisition token and abort signal through', async () => {
+    // #given
+    releaseLockIfHolderMock.mockResolvedValue(ok('released'))
+    const controller = new AbortController()
+
+    // #when
+    await releaseActionLockIfHeld({
+      storeConfig: createStoreConfig(),
+      repo: 'fro-bot/agent',
+      holderId: 'action:1234:1',
+      acquisitionToken: 'token-aaaaaaaa',
+      signal: controller.signal,
+      logger: createMockLogger(),
+    })
+
+    // #then
+    expect(releaseLockIfHolderMock.mock.calls[0]?.[5]).toEqual({
+      holderJob: undefined,
+      acquisitionToken: 'token-aaaaaaaa',
+      signal: controller.signal,
+    })
+  })
+})
+
+describe('runWithDeadline', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('aborts the signal when the deadline expires and rejects', async () => {
+    // #given work that only settles when aborted
+    vi.useFakeTimers()
+    let seen: AbortSignal | undefined
+    const running = runWithDeadline(
+      async signal =>
+        new Promise<never>((_resolve, reject) => {
+          seen = signal
+          signal.addEventListener('abort', () => reject(new Error('aborted by deadline')))
+        }),
+      1_000,
+      'deadline exceeded',
+    )
+    const outcome = running.then(
+      () => 'resolved',
+      (error: Error) => error.message,
+    )
+
+    // #when
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    // #then
+    expect(await outcome).toBe('deadline exceeded')
+    expect(seen?.aborted).toBe(true)
+  })
+
+  it('leaves the signal alone when the work finishes in time', async () => {
+    // #given
+    let seen: AbortSignal | undefined
+
+    // #when
+    const value = await runWithDeadline(
+      async signal => {
+        seen = signal
+        return 'done'
+      },
+      1_000,
+      'deadline exceeded',
+    )
+
+    // #then
+    expect(value).toBe('done')
+    expect(seen?.aborted).toBe(false)
   })
 })
