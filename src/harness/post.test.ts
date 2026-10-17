@@ -1,7 +1,7 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {toCacheSaveStateValue} from '../shared/cache-save-result.js'
 import {createMockLogger} from '../shared/test-helpers.js'
-import {ok} from '../shared/types.js'
+import {err, ok} from '../shared/types.js'
 
 vi.mock('@actions/core', () => ({
   getState: vi.fn(),
@@ -33,10 +33,32 @@ vi.mock('@fro-bot/runtime', async importOriginal => {
   return {
     ...original,
     createS3Adapter: vi.fn(),
+    releaseLockIfHolder: vi.fn(),
     syncArtifactsToStore: vi.fn(async () => ({uploaded: 0, failed: 0})),
     syncMetadataToStore: vi.fn(async () => ({success: true})),
   }
 })
+
+const storeState = {
+  'storeConfig.enabled': 'true',
+  'storeConfig.bucket': 'test-bucket',
+  'storeConfig.region': 'us-east-1',
+  'storeConfig.prefix': 'fro-bot-state',
+}
+
+async function stubState(state: Record<string, string>): Promise<void> {
+  const core = await import('@actions/core')
+  vi.mocked(core.getState).mockImplementation((key: string) => state[key] ?? '')
+  const {saveCache} = await import('../services/cache/index.js')
+  vi.mocked(saveCache).mockResolvedValue({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
+  const {createS3Adapter, releaseLockIfHolder} = await import('@fro-bot/runtime')
+  vi.mocked(createS3Adapter).mockReturnValue({
+    upload: async () => ok(undefined),
+    download: async () => ok(undefined),
+    list: async () => ok([]),
+  })
+  vi.mocked(releaseLockIfHolder).mockResolvedValue(ok('released'))
+}
 
 describe('post action', () => {
   beforeEach(() => {
@@ -649,6 +671,283 @@ describe('post action', () => {
         expect.objectContaining({cleanupSkipped: true}),
         expect.any(Object),
       )
+    })
+
+    describe('orphaned lock release', () => {
+      afterEach(async () => {
+        // Reset implementations, not just calls: a never-settling release or a throwing state read must not leak.
+        const core = await import('@actions/core')
+        vi.mocked(core.getState).mockReset()
+        const {releaseLockIfHolder} = await import('@fro-bot/runtime')
+        vi.mocked(releaseLockIfHolder).mockReset()
+        vi.useRealTimers()
+      })
+
+      it('releases by holder id on the action scope when the record is still set', async () => {
+        // #given the main step died holding the lock
+        await stubState({
+          shouldSaveCache: 'true',
+          cacheSaved: 'not-persisted',
+          lockHolderId: 'action:12345:1',
+          lockHolderJob: 'build',
+          lockAcquisitionToken: 'token-aaaaaaaa',
+          ...storeState,
+        })
+
+        // #when
+        const {runPost} = await import('./post.js')
+        await runPost({logger: createMockLogger()})
+
+        // #then
+        const {releaseLockIfHolder} = await import('@fro-bot/runtime')
+        const [config, repo, holderId, , scope, expected] = vi.mocked(releaseLockIfHolder).mock.calls[0] ?? []
+        expect(config?.storeConfig).toMatchObject({enabled: true, bucket: 'test-bucket'})
+        expect([repo, holderId, scope]).toEqual(['test-owner/test-repo', 'action:12345:1', 'action'])
+        expect(expected).toMatchObject({holderJob: 'build', acquisitionToken: 'token-aaaaaaaa'})
+      })
+
+      it('releases with no holder_job when the main step recorded none', async () => {
+        // #given a run without a job identity
+        await stubState({shouldSaveCache: 'false', lockHolderId: 'action:12345:1', ...storeState})
+
+        // #when
+        const {runPost} = await import('./post.js')
+        await runPost({logger: createMockLogger()})
+
+        // #then
+        const {releaseLockIfHolder} = await import('@fro-bot/runtime')
+        expect(vi.mocked(releaseLockIfHolder).mock.calls[0]?.[5]).toMatchObject({
+          holderJob: undefined,
+          acquisitionToken: undefined,
+        })
+      })
+
+      it('releases only after the cache save and the session sync finish', async () => {
+        // #given
+        await stubState({
+          shouldSaveCache: 'true',
+          cacheSaved: 'not-persisted',
+          lockHolderId: 'action:12345:1',
+          lockHolderJob: 'build',
+          ...storeState,
+        })
+
+        // #when
+        const {runPost} = await import('./post.js')
+        await runPost({logger: createMockLogger()})
+
+        // #then
+        const {saveCache} = await import('../services/cache/index.js')
+        const {releaseLockIfHolder, syncMetadataToStore, syncArtifactsToStore} = await import('@fro-bot/runtime')
+        const releaseOrder = vi.mocked(releaseLockIfHolder).mock.invocationCallOrder[0] ?? 0
+        expect(releaseOrder).toBeGreaterThan(vi.mocked(saveCache).mock.invocationCallOrder[0] ?? Infinity)
+        expect(releaseOrder).toBeGreaterThan(vi.mocked(syncMetadataToStore).mock.invocationCallOrder[0] ?? Infinity)
+        expect(releaseOrder).toBeGreaterThan(vi.mocked(syncArtifactsToStore).mock.invocationCallOrder[0] ?? Infinity)
+      })
+
+      it('releases even when the main step never reached the persistence phase', async () => {
+        // #given a cancel between lock acquisition and shouldSaveCache being set
+        await stubState({
+          shouldSaveCache: 'false',
+          lockHolderId: 'action:12345:1',
+          lockHolderJob: 'build',
+          ...storeState,
+        })
+
+        // #when
+        const {runPost} = await import('./post.js')
+        await runPost({logger: createMockLogger()})
+
+        // #then
+        const {saveCache} = await import('../services/cache/index.js')
+        const {releaseLockIfHolder} = await import('@fro-bot/runtime')
+        expect(saveCache).not.toHaveBeenCalled()
+        expect(releaseLockIfHolder).toHaveBeenCalledTimes(1)
+      })
+
+      it('releases after a declined-for-safety persistence skip', async () => {
+        // #given
+        await stubState({
+          shouldSaveCache: 'true',
+          cacheSaved: 'declined-for-safety',
+          lockHolderId: 'action:12345:1',
+          lockHolderJob: 'build',
+          ...storeState,
+        })
+
+        // #when
+        const {runPost} = await import('./post.js')
+        await runPost({logger: createMockLogger()})
+
+        // #then
+        const {releaseLockIfHolder} = await import('@fro-bot/runtime')
+        expect(releaseLockIfHolder).toHaveBeenCalledTimes(1)
+      })
+
+      it('does nothing when cleanup cleared the record', async () => {
+        // #given cleanup released the lock and cleared lockHolderId
+        await stubState({shouldSaveCache: 'true', cacheSaved: 'durable', ...storeState})
+
+        // #when
+        const {runPost} = await import('./post.js')
+        await runPost({logger: createMockLogger()})
+
+        // #then
+        const {releaseLockIfHolder} = await import('@fro-bot/runtime')
+        expect(releaseLockIfHolder).not.toHaveBeenCalled()
+      })
+
+      it('does nothing when no object store is configured', async () => {
+        // #given a record but no store config in state
+        await stubState({
+          shouldSaveCache: 'true',
+          cacheSaved: 'durable',
+          lockHolderId: 'action:12345:1',
+          lockHolderJob: 'build',
+        })
+
+        // #when
+        const {runPost} = await import('./post.js')
+        await runPost({logger: createMockLogger()})
+
+        // #then
+        const {releaseLockIfHolder} = await import('@fro-bot/runtime')
+        expect(releaseLockIfHolder).not.toHaveBeenCalled()
+      })
+
+      it('treats a changed holder as a no-op, not a failure', async () => {
+        // #given a successor now holds the lock
+        await stubState({
+          shouldSaveCache: 'true',
+          cacheSaved: 'durable',
+          lockHolderId: 'action:12345:1',
+          lockHolderJob: 'build',
+          ...storeState,
+        })
+        const {releaseLockIfHolder} = await import('@fro-bot/runtime')
+        vi.mocked(releaseLockIfHolder).mockResolvedValue(ok('not-holder'))
+        const logger = createMockLogger()
+
+        // #when
+        const {runPost} = await import('./post.js')
+        await expect(runPost({logger})).resolves.toBeUndefined()
+
+        // #then
+        expect(logger.warning).not.toHaveBeenCalledWith(expect.stringContaining('lock release'), expect.anything())
+      })
+
+      it('warns and continues when the release returns an error', async () => {
+        // #given
+        await stubState({
+          shouldSaveCache: 'true',
+          cacheSaved: 'durable',
+          lockHolderId: 'action:12345:1',
+          lockHolderJob: 'build',
+          ...storeState,
+        })
+        const {releaseLockIfHolder} = await import('@fro-bot/runtime')
+        vi.mocked(releaseLockIfHolder).mockResolvedValue(err(new Error('503 slow down')))
+        const logger = createMockLogger()
+
+        // #when
+        const {runPost} = await import('./post.js')
+        await expect(runPost({logger})).resolves.toBeUndefined()
+
+        // #then
+        expect(logger.warning).toHaveBeenCalledWith(
+          'Post-action lock release failed (non-fatal)',
+          expect.objectContaining({error: '503 slow down'}),
+        )
+      })
+
+      it('rethrows a persistence failure after still releasing the stored holder exactly once', async () => {
+        // #given the persistence step rejects (state read throws on its first line)
+        await stubState({lockHolderId: 'action:12345:1', lockHolderJob: 'build', ...storeState})
+        const core = await import('@actions/core')
+        vi.mocked(core.getState).mockImplementation((key: string) => {
+          if (key === 'shouldSaveCache') throw new Error('state unreadable')
+          const state: Record<string, string> = {
+            ...storeState,
+            lockHolderId: 'action:12345:1',
+            lockHolderJob: 'build',
+          }
+          return state[key] ?? ''
+        })
+
+        // #when
+        const {runPost} = await import('./post.js')
+        await expect(runPost({logger: createMockLogger()})).rejects.toThrow('state unreadable')
+
+        // #then the lock is still released, once, by the recorded holder
+        const {releaseLockIfHolder} = await import('@fro-bot/runtime')
+        expect(releaseLockIfHolder).toHaveBeenCalledTimes(1)
+        expect(vi.mocked(releaseLockIfHolder).mock.calls[0]?.[2]).toBe('action:12345:1')
+        expect(vi.mocked(releaseLockIfHolder).mock.calls[0]?.[5]).toMatchObject({holderJob: 'build'})
+      })
+
+      it('aborts the in-flight release when the deadline expires and does not wait on it', async () => {
+        // #given a release whose I/O hangs until its signal aborts
+        vi.useFakeTimers()
+        await stubState({
+          shouldSaveCache: 'false',
+          lockHolderId: 'action:12345:1',
+          lockHolderJob: 'build',
+          lockAcquisitionToken: 'token-aaaaaaaa',
+          ...storeState,
+        })
+        const {releaseLockIfHolder} = await import('@fro-bot/runtime')
+        let signalSeen: AbortSignal | undefined
+        let settledByAbort = false
+        vi.mocked(releaseLockIfHolder).mockImplementation(
+          async (_config, _repo, _holder, _logger, _scope, expected) =>
+            new Promise((_resolve, reject) => {
+              signalSeen = expected?.signal
+              expected?.signal?.addEventListener('abort', () => {
+                settledByAbort = true
+                reject(new Error('aborted'))
+              })
+            }),
+        )
+        const logger = createMockLogger()
+
+        // #when the deadline passes
+        const {runPost} = await import('./post.js')
+        const running = runPost({logger})
+        await vi.advanceTimersByTimeAsync(10_000)
+        await running
+
+        // #then the step completed, the signal fired (so a stalled socket is torn down), and only a warning was logged
+        expect(signalSeen?.aborted).toBe(true)
+        expect(settledByAbort).toBe(true)
+        expect(logger.warning).toHaveBeenCalledWith(
+          'Post-action lock release threw (non-fatal)',
+          expect.objectContaining({error: 'Lock release exceeded 10000ms'}),
+        )
+      })
+
+      it('warns and continues when the release throws', async () => {
+        // #given
+        await stubState({
+          shouldSaveCache: 'true',
+          cacheSaved: 'durable',
+          lockHolderId: 'action:12345:1',
+          lockHolderJob: 'build',
+          ...storeState,
+        })
+        const {releaseLockIfHolder} = await import('@fro-bot/runtime')
+        vi.mocked(releaseLockIfHolder).mockRejectedValue(new Error('network down'))
+        const logger = createMockLogger()
+
+        // #when
+        const {runPost} = await import('./post.js')
+        await expect(runPost({logger})).resolves.toBeUndefined()
+
+        // #then
+        expect(logger.warning).toHaveBeenCalledWith(
+          'Post-action lock release threw (non-fatal)',
+          expect.objectContaining({error: 'network down'}),
+        )
+      })
     })
   })
 })

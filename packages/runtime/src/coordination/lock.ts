@@ -36,6 +36,20 @@ export function getLockKey(config: CoordinationConfig, repo: string, scope: Lock
   return ok(key.data)
 }
 
+const HOLDER_JOB_PATTERN = /^[\w.-]+$/
+
+/** True for a value that is safe to store as a lock record's `holder_job`. */
+export function isValidHolderJob(value: string): boolean {
+  return HOLDER_JOB_PATTERN.test(value)
+}
+
+const ACQUISITION_TOKEN_PATTERN = /^[\w-]{8,64}$/
+
+/** True for a value that is safe to store as a lock record's `acquisition_token`. */
+export function isValidAcquisitionToken(value: string): boolean {
+  return ACQUISITION_TOKEN_PATTERN.test(value)
+}
+
 function isPreconditionFailed(error: Error): boolean {
   return /pre-?condition/.test(error.message.toLowerCase())
 }
@@ -89,7 +103,17 @@ function parseLockRecord(data: string): Result<LockRecord, Error> {
       return err(new Error('Invalid lock record payload'))
     }
 
-    return ok(parsed)
+    // `holder_job` and `acquisition_token` only ever grant early takeover or gate a holder-matched release. A
+    // malformed value is dropped (the record then reads like a legacy one and waits for expiry) rather than
+    // rejected, which would wedge the repo.
+    const {holder_job: holderJob, acquisition_token: token, ...base} = parsed
+    const keepJob = typeof holderJob === 'string' && isValidHolderJob(holderJob)
+    const keepToken = typeof token === 'string' && isValidAcquisitionToken(token)
+    return ok({
+      ...base,
+      ...(keepJob ? {holder_job: holderJob} : {}),
+      ...(keepToken ? {acquisition_token: token} : {}),
+    })
   } catch (error) {
     return err(error instanceof Error ? error : new Error(String(error)))
   }
@@ -102,6 +126,8 @@ function createLockRecord(
   runId: string,
   ttlSeconds: number,
   now: string,
+  holderJob?: string,
+  acquisitionToken?: string,
 ): LockRecord {
   return {
     repo,
@@ -110,6 +136,8 @@ function createLockRecord(
     acquired_at: now,
     ttl_seconds: ttlSeconds,
     run_id: runId,
+    ...(holderJob === undefined ? {} : {holder_job: holderJob}),
+    ...(acquisitionToken === undefined ? {} : {acquisition_token: acquisitionToken}),
   }
 }
 
@@ -139,7 +167,16 @@ export async function acquireLock(
 
   logger.debug('Attempting lock acquisition', {key: key.data, repo, runId, surface})
   const createOnce = async () => {
-    const created = createLockRecord(repo, holderId, surface, runId, config.lockTtlSeconds, new Date().toISOString())
+    const created = createLockRecord(
+      repo,
+      holderId,
+      surface,
+      runId,
+      config.lockTtlSeconds,
+      new Date().toISOString(),
+      options.holderJob,
+      options.acquisitionToken,
+    )
     return conditionalPut.data(key.data, JSON.stringify(created), {ifNoneMatch: '*'})
   }
   const toAcquired = (etag: unknown): Result<LockAcquisitionResult, Error> => {
@@ -184,12 +221,15 @@ export async function acquireLock(
   }
 
   const observedAt = new Date()
-  if (isStale(holder.data, observedAt) === false) {
+  const expired = isStale(holder.data, observedAt)
+  const superseded = expired === false && options.reclaimableBeforeExpiry?.(holder.data, observedAt) === true
+  if (expired === false && superseded === false) {
     return ok({acquired: false, outcome: 'active-holder', etag: null, holder: holder.data})
   }
 
   // Expired lease: a clock fact, not proof the holder stopped writing. Replace it only with corroboration
   // (or when the holder's surface is explicitly reclaimable); the ETag observed here is the only one ever used.
+  // A superseded lease is replaced immediately, under the same ETag precondition.
   const observedEtag = existing.data.etag
   const auditContext: TakeoverAuditContext = {
     operation: 'acquire',
@@ -204,7 +244,9 @@ export async function acquireLock(
 
   let source: ConfirmationSource
   let quiescence: RepoQuiescence | null = null
-  if (options.reclaimableWithoutConfirmation?.(holder.data) === true) {
+  if (superseded === true) {
+    source = 'holder-superseded'
+  } else if (options.reclaimableWithoutConfirmation?.(holder.data) === true) {
     source = 'holder-surface-reclaimable'
   } else if (options.confirmExpiredHolder === undefined) {
     source = 'no-corroborator'
@@ -226,7 +268,16 @@ export async function acquireLock(
   }
 
   // Stamped after confirmation so the new lease's TTL does not include the confirmation wait.
-  const replacement = createLockRecord(repo, holderId, surface, runId, config.lockTtlSeconds, new Date().toISOString())
+  const replacement = createLockRecord(
+    repo,
+    holderId,
+    surface,
+    runId,
+    config.lockTtlSeconds,
+    new Date().toISOString(),
+    options.holderJob,
+    options.acquisitionToken,
+  )
   const takeover = await conditionalPut.data(key.data, JSON.stringify(replacement), {ifMatch: observedEtag})
   if (takeover.success === false) {
     if (isPreconditionFailed(takeover.error) === true) {
@@ -252,6 +303,7 @@ export async function releaseLock(
   etag: string,
   logger: {debug: (message: string, context?: Record<string, unknown>) => void},
   scope: LockScope = 'repo',
+  signal?: AbortSignal,
 ): Promise<Result<void, Error>> {
   const key = getLockKey(config, repo, scope)
   if (key.success === false) {
@@ -264,7 +316,92 @@ export async function releaseLock(
   }
 
   logger.debug('Releasing lock', {key: key.data, repo})
-  return conditionalDelete.data(key.data, {ifMatch: etag})
+  return conditionalDelete.data(key.data, signal === undefined ? {ifMatch: etag} : {ifMatch: etag, signal})
+}
+
+/** Outcome of `releaseLockIfHolder`; only `released` deleted anything. */
+export type ReleaseIfHolderOutcome = 'released' | 'no-lock' | 'not-holder' | 'conflict'
+
+/** What a releaser must still see on the lock record before it may delete it. */
+export interface ReleaseIfHolderExpectation {
+  /** Compared exactly with `holder_job`; both absent counts as equal. */
+  readonly holderJob?: string
+  /** When given, must equal the record's `acquisition_token`; a record without one does not match. */
+  readonly acquisitionToken?: string
+  /** Aborts the read, the body read and the delete; no delete starts once it has aborted. */
+  readonly signal?: AbortSignal
+}
+
+/**
+ * Deletes the lock only while its stored `holder_id` is `holderId` and it still matches `expected` (see
+ * `ReleaseIfHolderExpectation`). Reads the lock, checks the holder, then deletes `If-Match` on the ETag it read, so a
+ * successor that replaces the lock in between survives (`conflict`). Holder fields can repeat across acquisitions, so
+ * callers that know their `acquisition_token` must pass it: the ETag only protects against changes after the read.
+ */
+export async function releaseLockIfHolder(
+  config: CoordinationConfig,
+  repo: string,
+  holderId: string,
+  logger: {debug: (message: string, context?: Record<string, unknown>) => void},
+  scope: LockScope = 'repo',
+  expected: ReleaseIfHolderExpectation = {},
+): Promise<Result<ReleaseIfHolderOutcome, Error>> {
+  const {holderJob, acquisitionToken, signal} = expected
+  const key = getLockKey(config, repo, scope)
+  if (key.success === false) {
+    return err(key.error)
+  }
+
+  const getObject = resolveGetObject(config)
+  if (getObject.success === false) {
+    return err(getObject.error)
+  }
+
+  const conditionalDelete = resolveConditionalDelete(config)
+  if (conditionalDelete.success === false) {
+    return err(conditionalDelete.error)
+  }
+
+  const isAborted = (): boolean => signal?.aborted === true
+  const aborted = () => err(new Error('Lock release aborted'))
+  if (isAborted()) return aborted()
+
+  const fetched = await getObject.data(key.data, signal === undefined ? undefined : {signal})
+  if (fetched.success === false) {
+    return isNotFound(fetched.error) === true ? ok('no-lock') : err(fetched.error)
+  }
+
+  const record = parseLockRecord(fetched.data.data)
+  if (record.success === false) {
+    return err(record.error)
+  }
+
+  const tokenMatches = acquisitionToken === undefined || record.data.acquisition_token === acquisitionToken
+  if (record.data.holder_id !== holderId || record.data.holder_job !== holderJob || tokenMatches === false) {
+    logger.debug('Lock held by another holder; not releasing', {
+      key: key.data,
+      repo,
+      heldBy: record.data.holder_id,
+      heldByJob: record.data.holder_job ?? null,
+    })
+    return ok('not-holder')
+  }
+
+  // A deadline that expired while the read was in flight must not let the delete start late.
+  if (isAborted()) return aborted()
+
+  logger.debug('Releasing lock held by this holder', {key: key.data, repo, holderId})
+  const deleted = await conditionalDelete.data(
+    key.data,
+    signal === undefined ? {ifMatch: fetched.data.etag} : {ifMatch: fetched.data.etag, signal},
+  )
+  if (deleted.success === true) {
+    return ok('released')
+  }
+  if (isPreconditionFailed(deleted.error) === true) {
+    return ok('conflict')
+  }
+  return isNotFound(deleted.error) === true ? ok('no-lock') : err(deleted.error)
 }
 
 export async function renewLease(

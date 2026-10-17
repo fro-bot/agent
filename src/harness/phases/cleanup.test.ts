@@ -891,6 +891,71 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
     expect(releaseLock).not.toHaveBeenCalled()
   })
 
+  describe('lock holder state handoff', () => {
+    const lockedOptions = () =>
+      baseOptions({
+        storeConfig: {enabled: true, bucket: 'b', region: 'us-east-1', prefix: 'p'},
+        lockEtag: '"etag-initial"',
+        leaseRenewal: null,
+      })
+
+    it('clears the recorded holder after a successful release', async () => {
+      // #given a held lock whose release succeeds
+      const {releaseLock} = await import('@fro-bot/runtime')
+      vi.mocked(releaseLock).mockResolvedValueOnce(ok(undefined))
+      const {runCleanup} = await import('./cleanup.js')
+
+      // #when cleanup runs
+      await runCleanup(lockedOptions())
+
+      // #then the post hook is told there is nothing left to release
+      const {saveState} = await import('@actions/core')
+      expect(saveState).toHaveBeenCalledWith('lockHolderId', '')
+      expect(saveState).toHaveBeenCalledWith('lockHolderJob', '')
+      expect(saveState).toHaveBeenCalledWith('lockAcquisitionToken', '')
+    })
+
+    it('keeps the recorded holder when the release fails', async () => {
+      // #given a release rejected by the store (stale etag)
+      const {releaseLock} = await import('@fro-bot/runtime')
+      vi.mocked(releaseLock).mockResolvedValueOnce(err(new Error('PreconditionFailed')))
+      const {runCleanup} = await import('./cleanup.js')
+
+      // #when cleanup runs
+      await runCleanup(lockedOptions())
+
+      // #then the record survives so the post hook can retry by holder id
+      const {saveState} = await import('@actions/core')
+      expect(saveState).not.toHaveBeenCalledWith(expect.stringMatching(/^lockHolder/), expect.anything())
+    })
+
+    it('keeps the recorded holder when the release throws', async () => {
+      // #given
+      const {releaseLock} = await import('@fro-bot/runtime')
+      vi.mocked(releaseLock).mockRejectedValueOnce(new Error('network down'))
+      const {runCleanup} = await import('./cleanup.js')
+
+      // #when cleanup runs
+      await runCleanup(lockedOptions())
+
+      // #then
+      const {saveState} = await import('@actions/core')
+      expect(saveState).not.toHaveBeenCalledWith(expect.stringMatching(/^lockHolder/), expect.anything())
+    })
+
+    it('does not touch the record for a run that never held a lock', async () => {
+      // #given
+      const {runCleanup} = await import('./cleanup.js')
+
+      // #when cleanup runs without a lock
+      await runCleanup(baseOptions())
+
+      // #then
+      const {saveState} = await import('@actions/core')
+      expect(saveState).not.toHaveBeenCalledWith(expect.stringMatching(/^lockHolder/), expect.anything())
+    })
+  })
+
   it('s3-disabled runs keep persisting normally when skipSessionPersistence is not set', async () => {
     // #given no coordination (S3 disabled): the run has no lock to lack
     const {saveCache} = await import('../../services/cache/index.js')

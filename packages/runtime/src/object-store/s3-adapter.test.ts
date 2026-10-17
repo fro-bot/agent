@@ -11,6 +11,7 @@ import {createS3Adapter} from './s3-adapter.js'
 
 const clientConfigs: unknown[] = []
 const sentCommands: unknown[] = []
+const sentOptions: unknown[] = []
 const sendMock = vi.fn()
 
 vi.mock('@aws-sdk/client-s3', () => {
@@ -19,8 +20,9 @@ vi.mock('@aws-sdk/client-s3', () => {
       clientConfigs.push(config)
     }
 
-    async send(command: unknown): Promise<unknown> {
+    async send(command: unknown, options?: unknown): Promise<unknown> {
       sentCommands.push(command)
+      sentOptions.push(options)
       return sendMock(command)
     }
   }
@@ -113,6 +115,7 @@ describe('createS3Adapter', () => {
   beforeEach(async () => {
     clientConfigs.length = 0
     sentCommands.length = 0
+    sentOptions.length = 0
     sendMock.mockReset()
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'object-store-'))
   })
@@ -558,6 +561,39 @@ describe('createS3Adapter', () => {
       data: '{"phase":"PENDING"}',
       etag: 'etag-456',
     })
+  })
+
+  it('passes the abort signal to the SDK for getObject and conditionalDelete, and nothing without one', async () => {
+    // #given
+    sendMock.mockResolvedValueOnce({Body: Readable.from(['{}']), ETag: 'etag-1'}).mockResolvedValue({})
+    const adapter = createS3Adapter(baseConfig, createLogger())
+    const controller = new AbortController()
+
+    // #when
+    await adapter.getObject?.('k', {signal: controller.signal})
+    await adapter.conditionalDelete?.('k', {ifMatch: 'etag-1', signal: controller.signal})
+    await adapter.conditionalDelete?.('k', {ifMatch: 'etag-1'})
+
+    // #then
+    expect(sentOptions).toEqual([{abortSignal: controller.signal}, {abortSignal: controller.signal}, undefined])
+  })
+
+  it('aborts an in-progress body read instead of hanging', async () => {
+    // #given a response whose body never ends
+    const body = new Readable({read() {}})
+    sendMock.mockResolvedValue({Body: body, ETag: 'etag-1'})
+    const adapter = createS3Adapter(baseConfig, createLogger())
+    const controller = new AbortController()
+
+    // #when the read starts and the signal then aborts
+    const pending = adapter.getObject?.('k', {signal: controller.signal})
+    await new Promise(resolve => setTimeout(resolve, 5))
+    controller.abort()
+    const result = await pending
+
+    // #then the read settles as an error and the stream is torn down
+    expect(result?.success).toBe(false)
+    expect(body.destroyed).toBe(true)
   })
 
   it('returns an error when getting a missing object', async () => {

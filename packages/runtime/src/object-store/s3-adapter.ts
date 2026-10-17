@@ -51,16 +51,40 @@ function logS3Error(logger: Logger, operation: string, error: unknown): Error {
   })
 }
 
-async function readResponseBody(body: unknown): Promise<string> {
+/** Extra `client.send` arguments carrying the abort signal; empty without one so unrelated calls are unchanged. */
+function abortOptions(signal: AbortSignal | undefined): [{abortSignal: AbortSignal}] | [] {
+  return signal === undefined ? [] : [{abortSignal: signal}]
+}
+
+/** Destroys the body stream when `signal` aborts, which makes an in-progress read reject instead of hanging. */
+function destroyOnAbort(body: Readable, signal: AbortSignal | undefined): () => void {
+  if (signal === undefined) return () => {}
+  const onAbort = (): void => {
+    body.destroy(new Error('Object store read aborted'))
+  }
+  if (signal.aborted) {
+    onAbort()
+    return () => {}
+  }
+  signal.addEventListener('abort', onAbort, {once: true})
+  return () => signal.removeEventListener('abort', onAbort)
+}
+
+async function readResponseBody(body: unknown, signal?: AbortSignal): Promise<string> {
   if (body instanceof Readable) {
     const chunks: Buffer[] = []
-    for await (const chunk of body) {
-      if (typeof chunk === 'string') {
-        chunks.push(Buffer.from(chunk))
-        continue
-      }
+    const stopWatching = destroyOnAbort(body, signal)
+    try {
+      for await (const chunk of body) {
+        if (typeof chunk === 'string') {
+          chunks.push(Buffer.from(chunk))
+          continue
+        }
 
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array))
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array))
+      }
+    } finally {
+      stopWatching()
     }
 
     return Buffer.concat(chunks).toString('utf8')
@@ -290,6 +314,7 @@ export function createS3Adapter(config: ObjectStoreConfig, logger: Logger): Obje
             IfMatch: options.ifMatch,
             Key: key,
           }),
+          ...abortOptions(options.signal),
         )
 
         logger.info('Conditionally deleted object store data', {key})
@@ -298,7 +323,7 @@ export function createS3Adapter(config: ObjectStoreConfig, logger: Logger): Obje
         return err(logS3Error(logger, 'conditionalDelete', error))
       }
     },
-    getObject: async key => {
+    getObject: async (key, options) => {
       logger.debug('Reading object store data', {key})
 
       try {
@@ -308,9 +333,10 @@ export function createS3Adapter(config: ObjectStoreConfig, logger: Logger): Obje
             ExpectedBucketOwner: config.expectedBucketOwner,
             Key: key,
           }),
+          ...abortOptions(options?.signal),
         )
 
-        const data = await readResponseBody(response.Body)
+        const data = await readResponseBody(response.Body, options?.signal)
         const etag = normalizeEtag(response.ETag, 'getObject')
         logger.info('Read object store data', {key, etag})
         return ok({data, etag})
