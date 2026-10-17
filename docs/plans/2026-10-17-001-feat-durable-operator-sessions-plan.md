@@ -301,7 +301,7 @@ The repo-access predicate, as a decision table:
 
 ## Implementation Units
 
-- [ ] **Unit 1: Session persistence module and shared object-store fake**
+- [x] **Unit 1: Session persistence module and shared object-store fake**
 
 **Goal:** One module owns the signed record shape and every object-store operation for sessions, and one fake backs every test that needs the store.
 
@@ -358,7 +358,7 @@ The repo-access predicate, as a decision table:
 
 **Verification:** Every session object-store call lives in this module. No raw ID, hash or key reaches a log line. The self-test separates a denied list from an empty prefix. Commit boundary: the new files compile and pass on their own, and no existing code changes.
 
-- [ ] **Unit 2: Restrict binding creation to configured Discord binders**
+- [x] **Unit 2: Restrict binding creation to configured Discord binders**
 
 **Goal:** Only a configured Discord user can create a binding through `/add-project`, and an empty list refuses everyone.
 
@@ -399,7 +399,7 @@ The repo-access predicate, as a decision table:
 
 **Verification:** No code path creates a binding for a user outside the configured list. Commit boundary: existing add-project tests pass with the list supplied in their fixtures.
 
-- [ ] **Unit 3: Bindings-only repo authorization for routes and lease**
+- [x] **Unit 3: Bindings-only repo authorization for routes and lease**
 
 **Goal:** All ten routes and the lease authorize through `resolveRepoAccess`, and nothing consumes the OAuth token.
 
@@ -458,7 +458,7 @@ The repo-access predicate, as a decision table:
 
 **Verification:** No route or lease path consumes an OAuth token or calls GitHub. Every denial looks identical to the caller and in the logs. Commit boundary: the whole tree type-checks and tests pass with the old session store and its token accessors still in place.
 
-- [ ] **Unit 4: Durable session store, added beside the old one**
+- [x] **Unit 4: Durable session store, added beside the old one**
 
 **Goal:** A new store creates asynchronously, signs and writes through, restores at startup, revokes durably before it acknowledges, and holds no credential.
 
@@ -519,7 +519,7 @@ The repo-access predicate, as a decision table:
 
 **Verification:** The new store satisfies the lifecycle end to end over the shared fake, and the old store is unchanged. Commit boundary: the tree type-checks, and nothing outside the new tests uses the new store yet.
 
-- [ ] **Unit 5: Cut over callers to the durable store**
+- [x] **Unit 5: Cut over callers to the durable store**
 
 **Goal:** The OAuth callback, logout, browser guard and `program.ts` use the durable store, and the gateway loads, scavenges and sweeps it.
 
@@ -578,7 +578,7 @@ The repo-access predicate, as a decision table:
 
 **Verification:** A restart keeps sessions, logout is durable before it answers, and the offline inventory fails loudly if a dependency is dropped. Commit boundary: the tree type-checks with the old factory still defined but unused by production code.
 
-- [ ] **Unit 6: CSRF session binding and fixed session expiry**
+- [x] **Unit 6: CSRF session binding and fixed session expiry**
 
 **Goal:** The CSRF token no longer exposes the session ID, and `/session` reports a fixed expiry.
 
@@ -616,7 +616,7 @@ The repo-access predicate, as a decision table:
 
 **Verification:** The CSRF token reveals nothing about the session ID, and the session response matches the documented fixed lifetime. Commit boundary: no remaining reader of the idle TTL constant except the old store.
 
-- [ ] **Unit 7: Contract: delete the old store and token API**
+- [x] **Unit 7: Contract: delete the old store and token API**
 
 **Goal:** No credential, idle TTL, touch or per-session hook symbol remains.
 
@@ -640,7 +640,7 @@ The repo-access predicate, as a decision table:
 
 **Verification:** `tsc` reports no `oauthToken`, `getOperatorToken`, `dropOperatorToken`, `touch`, `onRevoke` or `SESSION_IDLE_TTL_MS`. Commit boundary: the tree type-checks and tests pass with only the durable store present.
 
-- [ ] **Unit 8: Documentation**
+- [x] **Unit 8: Documentation**
 
 **Goal:** Every living doc describes the shipped behavior, the retention bound, the revoke-all procedure and the scoped IAM gate.
 
