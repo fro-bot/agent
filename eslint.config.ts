@@ -80,6 +80,8 @@ export default defineConfig(
           ],
           // devDependencies are legitimate in tests, test support, config, and
           // build scripts.
+          // Anchored to the repo root: the plugin matches absolute paths without
+          // minimatch's `dot` option, so a bare `**` never crosses `.worktrees/`.
           devDependencies: [
             '**/*.test.ts',
             '**/*.spec.ts',
@@ -91,7 +93,7 @@ export default defineConfig(
             'eslint.config.ts',
             'scripts/**',
             'packages/harness/scripts/**',
-          ],
+          ].map(glob => join(import.meta.dirname, glob)),
           peerDependencies: true,
         },
       ],

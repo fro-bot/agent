@@ -31,6 +31,18 @@ export interface LockRecord {
   readonly acquired_at: string
   readonly ttl_seconds: number
   readonly run_id: string
+  /**
+   * Names the job (and matrix leg) of the Action invocation that holds the lock, so sibling jobs of one run are
+   * told apart without changing `holder_id`'s format (older readers match `holder_id` strictly). Absent on records
+   * written by gateway holders and by older agent versions; readers drop a malformed value instead of rejecting.
+   */
+  readonly holder_job?: string
+  /**
+   * Random value minted per acquisition. Holder fields alone can repeat (two calls of one reusable workflow share run,
+   * attempt, job and matrix), so a late releaser matches on this to avoid deleting a successor's lease. Absent on
+   * records from gateway holders and older agent versions; readers drop a malformed value instead of rejecting.
+   */
+  readonly acquisition_token?: string
 }
 
 /**
@@ -80,6 +92,16 @@ export interface LockAcquisitionOptions {
   readonly confirmExpiredHolder?: ConfirmExpiredHolder
   /** Holders whose expired leases may be reclaimed without corroboration (e.g. the Action's own surface). */
   readonly reclaimableWithoutConfirmation?: (holder: LockRecord) => boolean
+  /**
+   * Holders whose UNEXPIRED lease may be replaced because the caller knows they can no longer write (e.g. a stale
+   * earlier attempt of the same workflow run). `observedAt` is the clock reading used for the expiry check. The
+   * takeover still uses the observed ETag, so a racing renewal wins.
+   */
+  readonly reclaimableBeforeExpiry?: (holder: LockRecord, observedAt: Date) => boolean
+  /** Written to the new lease as `holder_job` (and preserved by `renewLease` via the caller's record). */
+  readonly holderJob?: string
+  /** Written to the new lease as `acquisition_token`. Never consulted when deciding a takeover. */
+  readonly acquisitionToken?: string
 }
 
 /** Logger for lock operations that emit audit events (`info`) alongside diagnostics (`debug`). */
