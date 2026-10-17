@@ -1,6 +1,12 @@
 import {describe, expect, it} from 'vitest'
 
-import {classifyErrorText, classifyRetryStatus, classifyStructuredError, isAbortedError} from './provider-failure.js'
+import {
+  classifyErrorText,
+  classifyRetryStatus,
+  classifyStructuredError,
+  isAbortedError,
+  isContextOverflowError,
+} from './provider-failure.js'
 
 function retry(fields: Record<string, unknown>): object {
   return {type: 'retry', attempt: 1, message: '', next: 0, ...fields}
@@ -20,7 +26,7 @@ describe('classifyRetryStatus', () => {
     const status = retry({message: 'rate limit', action: {reason: 'auth_unavailable'}})
 
     // #when / #then
-    expect(classifyRetryStatus(status)).toEqual({reason: 'provider auth unavailable', errorName: 'auth_unavailable'})
+    expect(classifyRetryStatus(status)).toEqual({reason: 'provider auth unavailable', errorName: 'retry-status'})
   })
 
   it('does not treat a near-miss structured reason as auth', () => {
@@ -31,16 +37,28 @@ describe('classifyRetryStatus', () => {
     expect(classifyRetryStatus(status)).toBeNull()
   })
 
+  it.each(['model_not_found', 'model_not_supported'])(
+    'classifies the structured reason %s as model not available',
+    reason => {
+      // #given
+      const status = retry({action: {reason}})
+
+      // #when / #then
+      expect(classifyRetryStatus(status)).toEqual({reason: 'model not available', errorName: 'retry-status'})
+    },
+  )
+
   it.each([
-    ['auth_unavailable: no auth available', 'provider auth unavailable'],
-    ['no auth available for this model', 'provider auth unavailable'],
-    ["'gpt-5.5' model is not supported when using Codex", 'model not available'],
-    ['model not found', 'model not available'],
-    ['model_not_found', 'model not available'],
-    ['Model not found: openai/gpt-9. Did you mean: gpt-5?', 'model not available'],
-  ])('falls back to message text: %s', (message, reason) => {
-    // #given / #when / #then
-    expect(classifyRetryStatus(retry({message}))?.reason).toBe(reason)
+    'auth_unavailable: no auth available',
+    'no auth available for this model',
+    "'gpt-5.5' model is not supported when using Codex",
+    'model not found',
+    'model_not_found',
+    'Model not found: openai/gpt-9. Did you mean: gpt-5?',
+  ])('ignores message text on a retry status: %s', message => {
+    // #given — a retried (e.g. 503) failure whose text names auth or a model, with no structured reason
+    // #when / #then
+    expect(classifyRetryStatus(retry({message}))).toBeNull()
   })
 
   it.each([
@@ -73,7 +91,7 @@ describe('classifyRetryStatus', () => {
     const message = `${'x'.repeat(5_000)} auth_unavailable`
 
     // #when / #then
-    expect(classifyRetryStatus(retry({message}))).toBeNull()
+    expect(classifyErrorText(message).reason).toBe('session error')
   })
 
   it('never returns provider text', () => {
@@ -113,11 +131,36 @@ describe('classifyStructuredError', () => {
     expect(classifyStructuredError({}).reason).toBe('session error')
   })
 
-  it('sanitizes the error name', () => {
+  it.each([
+    'ProviderAuthError',
+    'APIError',
+    'UnknownError',
+    'MessageAbortedError',
+    'MessageOutputLengthError',
+    'ContextOverflowError',
+    'StructuredOutputError',
+    'ContentFilterError',
+  ])('logs the known OpenCode error class %s by name', name => {
     // #given / #when / #then
-    expect(classifyStructuredError({name: 'has spaces and sk-live'}).errorName).toBe('unknown')
-    expect(classifyStructuredError({name: 'a'.repeat(200)}).errorName).toBe('unknown')
-    expect(classifyStructuredError({name: 7}).errorName).toBe('unknown')
+    expect(classifyStructuredError({name}).errorName).toBe(name)
+  })
+
+  it.each(['sk-live-abc123', 'a.b-c', 'has spaces and sk-live', 'apierror', 'a'.repeat(200), 7, null])(
+    'reports any other error name as "unknown": %j',
+    name => {
+      // #given / #when / #then
+      expect(classifyStructuredError({name}).errorName).toBe('unknown')
+    },
+  )
+})
+
+describe('isContextOverflowError', () => {
+  it('matches only the overflow marker', () => {
+    // #given / #when / #then
+    expect(isContextOverflowError({name: 'ContextOverflowError'})).toBe(true)
+    expect(isContextOverflowError({name: 'APIError'})).toBe(false)
+    expect(isContextOverflowError('ContextOverflowError')).toBe(false)
+    expect(isContextOverflowError(null)).toBe(false)
   })
 })
 

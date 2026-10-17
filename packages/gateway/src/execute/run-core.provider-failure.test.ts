@@ -180,18 +180,13 @@ describe('runOpenCodeCore — provider rejection fails fast (#1836)', () => {
         'Provider failure: provider auth unavailable',
       ],
       [
-        'retry status with the auth failure in message only',
-        retryStatus({message: `auth_unavailable: no auth available (${SECRET})`}),
-        'Provider failure: provider auth unavailable',
-      ],
-      [
-        'retry status for an unsupported model, in message only',
-        retryStatus({message: `'gpt-5.5' model is not supported when using Codex with a ChatGPT account ${SECRET}`}),
+        'retry status with a structured model_not_found reason',
+        retryStatus({action: {reason: 'model_not_found', provider: 'p', title: 't', message: SECRET, label: 'l'}}),
         'Provider failure: model not available',
       ],
       [
-        'retry status with a structured model_not_found reason',
-        retryStatus({action: {reason: 'model_not_found', provider: 'p', title: 't', message: SECRET, label: 'l'}}),
+        'retry status with a structured model_not_supported reason',
+        retryStatus({action: {reason: 'model_not_supported', provider: 'p', title: 't', message: SECRET, label: 'l'}}),
         'Provider failure: model not available',
       ],
       [
@@ -227,7 +222,12 @@ describe('runOpenCodeCore — provider rejection fails fast (#1836)', () => {
       const run = startRun()
 
       // #when — every classification path carries provider-controlled text
-      await run.emit(retryStatus({message: `auth_unavailable: ${SECRET}`}))
+      await run.emit(
+        retryStatus({
+          message: `auth_unavailable: ${SECRET}`,
+          action: {reason: 'auth_unavailable', provider: 'p', title: 't', message: SECRET, label: 'l'},
+        }),
+      )
 
       // #then
       const outcome = run.outcome()
@@ -252,6 +252,21 @@ describe('runOpenCodeCore — provider rejection fails fast (#1836)', () => {
       expect(loggedText(run.logger)).not.toContain('openai')
     })
 
+    it.each(['sk-live-abc123', 'a.b-c'])(
+      'logs an identifier-shaped but unknown error name %s as "unknown"',
+      async name => {
+        // #given
+        const run = startRun()
+
+        // #when
+        await run.emit(assistantMessage({name, data: {message: 'x'}}))
+
+        // #then
+        expect(loggedText(run.logger)).toContain('"errorName":"unknown"')
+        expect(loggedText(run.logger)).not.toContain(name)
+      },
+    )
+
     it('replaces a non-identifier error name with "unknown" rather than logging it', async () => {
       // #given
       const run = startRun()
@@ -274,6 +289,9 @@ describe('runOpenCodeCore — provider rejection fails fast (#1836)', () => {
       ['5xx', retryStatus({message: 'Internal server error (500)'})],
       ['503', retryStatus({message: 'Service Unavailable 503'})],
       ['network', retryStatus({message: 'fetch failed: ECONNRESET'})],
+      // A retried 5xx whose text names auth or a model is still a retry: only the structured reason is trusted.
+      ['503 mentioning no auth available', retryStatus({message: `503 auth_unavailable: no auth available ${SECRET}`})],
+      ['503 mentioning model not found', retryStatus({message: `503 model not found: openai/gpt-9 ${SECRET}`})],
       [
         'account rate limit with an action',
         retryStatus({action: {reason: 'account_rate_limit', provider: 'p', title: 't', message: 'm', label: 'l'}}),
@@ -342,7 +360,7 @@ describe('runOpenCodeCore — provider rejection fails fast (#1836)', () => {
       const run = startRun({owned: [CHILD]})
 
       // #when
-      await run.emit(retryStatus({message: 'auth_unavailable: no auth available'}, CHILD))
+      await run.emit(retryStatus({action: {reason: 'auth_unavailable'}}, CHILD))
 
       // #then
       expect(run.outcome()).toBeUndefined()
@@ -364,7 +382,7 @@ describe('runOpenCodeCore — provider rejection fails fast (#1836)', () => {
       const run = startRun()
 
       // #when
-      await run.emit(retryStatus({message: 'auth_unavailable: no auth available'}, 'sess-stranger'))
+      await run.emit(retryStatus({action: {reason: 'auth_unavailable'}}, 'sess-stranger'))
       await run.emit(assistantMessage({name: 'ProviderAuthError', data: {message: 'x'}}, 'sess-stranger'))
 
       // #then
@@ -412,6 +430,44 @@ describe('runOpenCodeCore — provider rejection fails fast (#1836)', () => {
 
       // #then
       expectFailed(run, 'Provider failure: session error')
+    })
+
+    it('does not fail the run on a session.error carrying MessageAbortedError', async () => {
+      // #given
+      const run = startRun()
+
+      // #when — the abort signal, not this event, ends the loop
+      await run.emit(sessionError({name: 'MessageAbortedError', data: {message: 'Aborted'}}))
+
+      // #then — no RunCoreError, no provider failure logged
+      expect(run.outcome()).toBeUndefined()
+      expect(vi.mocked(run.logger.error)).not.toHaveBeenCalled()
+    })
+
+    it('keeps running through a ContextOverflowError session.error while OpenCode compacts', async () => {
+      // #given
+      const run = startRun()
+
+      // #when — overflow is published, then OpenCode compacts and the root finishes
+      await run.emit(sessionError({name: 'ContextOverflowError', data: {message: SECRET}}))
+      expect(run.outcome()).toBeUndefined()
+      await run.emit({type: 'session.idle', properties: {sessionID: ROOT}})
+
+      // #then
+      expect(run.outcome()).toEqual({ok: true})
+      expect(vi.mocked(run.logger.error)).not.toHaveBeenCalled()
+    })
+
+    it('still fails normally when a terminal error follows a ContextOverflowError', async () => {
+      // #given
+      const run = startRun()
+
+      // #when
+      await run.emit(sessionError({name: 'ContextOverflowError', data: {message: 'x'}}))
+      await run.emit(sessionError({name: 'ProviderAuthError', data: {message: 'x'}}))
+
+      // #then
+      expectFailed(run, 'Provider failure: provider auth unavailable')
     })
 
     it.each([

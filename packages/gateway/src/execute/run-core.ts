@@ -44,7 +44,13 @@ import {parsePermissionReply, parsePermissionRequest} from '../approvals/coordin
 import {parseQuestionEcho, parseQuestionRequest, safeLogId} from '../approvals/question-coordinator.js'
 import {createDrainCompletion, parseSyntheticNoticePart} from './drain-completion.js'
 import {formatToolPart} from './format-part.js'
-import {classifyErrorText, classifyRetryStatus, classifyStructuredError, isAbortedError} from './provider-failure.js'
+import {
+  classifyErrorText,
+  classifyRetryStatus,
+  classifyStructuredError,
+  isAbortedError,
+  isContextOverflowError,
+} from './provider-failure.js'
 import {createReplyDeliveryTracker} from './reply-delivery.js'
 import {settleOwnedSessions} from './settle-owned-sessions.js'
 import {createTextBoundaryTracker} from './text-boundary.js'
@@ -1312,11 +1318,14 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           // The payload is a string or a structured `{name, data}` object. Both go through the closed
           // classifier: only a fixed reason survives, never the provider's text.
           const errorText = getStringProperty(eventPayload, 'error')
-          const failure =
-            errorText === null
-              ? classifyStructuredError(getObjectProperty(eventPayload, 'error'))
-              : classifyErrorText(errorText)
-          throw await failFromProvider(failure, 'session.error')
+          const structuredError = errorText === null ? getObjectProperty(eventPayload, 'error') : null
+          // An abort is the harness or operator stopping the run; the abort signal ends the loop. Context
+          // overflow is published before OpenCode compacts and carries on (processor.ts:629-631), so it is not
+          // terminal; a real terminal halt still arrives as its own error.
+          if (isAbortedError(structuredError) === false && isContextOverflowError(structuredError) === false) {
+            const failure = errorText === null ? classifyStructuredError(structuredError) : classifyErrorText(errorText)
+            throw await failFromProvider(failure, 'session.error')
+          }
         }
       } else if (eventType === 'message.updated') {
         // Root assistant message with `info.error`: OpenCode's processor sets it only when it has stopped
