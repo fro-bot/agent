@@ -80,14 +80,8 @@ export default defineConfig(
           ],
           // devDependencies are legitimate in tests, test support, config, and
           // build scripts.
-          //
-          // Globs are anchored to the repo root as absolute patterns. The plugin
-          // matches them with minimatch against the absolute file path and no
-          // `dot` option, so a bare leading `**` never crosses a dot-directory
-          // such as `.worktrees/<name>/`, and its cwd-relative fallback only
-          // helps when eslint runs from the repo root (the workspace lint
-          // scripts run from apps/action). A literal absolute prefix matches the
-          // dot-directory segments verbatim, so these hold in any checkout path.
+          // Anchored to the repo root: the plugin matches absolute paths without
+          // minimatch's `dot` option, so a bare `**` never crosses `.worktrees/`.
           devDependencies: [
             '**/*.test.ts',
             '**/*.spec.ts',
