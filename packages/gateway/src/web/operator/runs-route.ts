@@ -21,7 +21,9 @@
  * Security invariants:
  *   - Denylisted repos are silently omitted (no oracle) and their run-states are never read.
  *   - Store errors return a coarse error; no partial list leaks.
- *   - Response carries only {runId, repo, status, createdAt, updatedAt?, failureKind?}.
+ *   - Response carries only {runId, repo, status, createdAt, updatedAt?, failureKind?, providerFailureReason?,
+ *     prompt?}: `prompt` is the web launch prompt (web runs only, within its bound), `providerFailureReason`
+ *     the closed reason on a failed `session-error` run. Both are dropped, never repaired, when malformed.
  *   - Result is capped at MAX_RUNS_PER_LISTING (no pagination machinery).
  *   - No per-repo binding read and no GitHub call.
  *   - Rate limit is operator-keyed (not socket-keyed) to bound the run-state read amplification

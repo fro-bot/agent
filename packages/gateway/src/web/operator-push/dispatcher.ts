@@ -18,7 +18,9 @@
  *
  * The dedupe key is keyed by the EVENT identity only (runId-or-approvalId +
  * kind), not per operator, so one event produces at most one nudge per
- * subscription within the window.
+ * subscription within the window. An approval event is its `approvalId`; the
+ * run ID only deep-links the payload and never joins the dedupe key or the
+ * audit correlation ID.
  *
  * Fail-soft by design: `dispatchApprovalPending` / `dispatchQuestionPending` / `dispatchRunFailed`
  * NEVER throw into the caller. Every dependency call and the whole flow is
@@ -86,7 +88,12 @@ export interface CreatePushDispatcherDeps {
 }
 
 export interface PushDispatcher {
-  dispatchApprovalPending: (approvalId: string) => Promise<void>
+  /**
+   * Nudge operators that an approval is waiting. Deduped per approval (`approvalId`), so two approvals on
+   * one run produce two nudges. `runId` is required — it deep-links the notification to the waiting run,
+   * and a missing one must be a compile error rather than a silent fallback to `/`.
+   */
+  dispatchApprovalPending: (approvalId: string, runId: string) => Promise<void>
   /**
    * Nudge operators that an agent question is waiting. Deduped per run: one nudge covers every
    * question the run asks within the dedupe window. Carries no question content by construction;
@@ -243,9 +250,9 @@ export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispat
     }
   }
 
-  async function dispatchApprovalPending(approvalId: string): Promise<void> {
+  async function dispatchApprovalPending(approvalId: string, runId: string): Promise<void> {
     try {
-      const payload = JSON.stringify(buildApprovalPayload())
+      const payload = JSON.stringify(buildApprovalPayload(runId))
       await broadcast('approval', approvalId, payload)
     } catch {
       logger.warn({approvalId}, 'operator push dispatch: approval dispatch threw — continuing')

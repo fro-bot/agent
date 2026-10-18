@@ -32,7 +32,7 @@ import type {QuestionCoordinator} from '../approvals/question-coordinator.js'
 import type {TerminalListener} from '../approvals/request-gate.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {DrainCompletion} from './drain-completion.js'
-import type {ProviderFailure} from './provider-failure.js'
+import type {ProviderFailure, ProviderFailureReason} from './provider-failure.js'
 
 import {
   createInactivityTimer,
@@ -92,16 +92,29 @@ export type RunCoreErrorKind =
  * treat a quarantined error as a signal to hold the lock, keep the heartbeat
  * renewing it, and refuse hand-off — never release or hand off resources for
  * a run whose owned work could not be confirmed settled.
+ *
+ * `providerFailureReason` is set only by `failFromProvider` (always with `kind: 'session-error'`): the
+ * closed, fixed-text reason from the provider-failure classifier. `run.ts` reads this typed property and
+ * never parses `message`. It is carried through every `throwWithBarrier` throw site, quarantined or not.
  */
 export class RunCoreError extends Error {
   readonly kind: RunCoreErrorKind
   readonly quarantined: boolean
+  readonly providerFailureReason?: ProviderFailureReason
 
-  constructor(kind: RunCoreErrorKind, internalMessage: string, quarantined = false) {
+  constructor(
+    kind: RunCoreErrorKind,
+    internalMessage: string,
+    quarantined = false,
+    providerFailureReason?: ProviderFailureReason,
+  ) {
     super(internalMessage)
     this.name = 'RunCoreError'
     this.kind = kind
     this.quarantined = quarantined
+    if (providerFailureReason !== undefined) {
+      this.providerFailureReason = providerFailureReason
+    }
   }
 }
 
@@ -697,14 +710,19 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // and confirmed quiescent first (`confirmRootQuiescent`), inside the same teardown budget, and an unconfirmed
   // root is quarantined exactly like an unconfirmed child. Runs that never adopted background work are never
   // `draining`, so they keep the original fast path.
-  async function throwWithBarrier(kind: RunCoreErrorKind, message: string, rootLive = false): Promise<never> {
+  async function throwWithBarrier(
+    kind: RunCoreErrorKind,
+    message: string,
+    options: {readonly rootLive?: boolean; readonly providerFailureReason?: ProviderFailureReason} = {},
+  ): Promise<never> {
+    const {rootLive = false, providerFailureReason} = options
     // `rootLive`: the caller knows the root is still executing (a provider retry mid-backoff), so it takes the same
     // root teardown as the follow-up window, even with an empty or settled ledger — or none at all.
     const rootFollowUpOpen =
       rootLive || (drainCompletion !== undefined && draining === true && drainDoneController.signal.aborted === false)
     const barrierLedger = ledger ?? (rootLive ? createOwnershipLedger() : undefined)
     if (barrierLedger === undefined || (barrierLedger.isDrainComplete() === true && rootFollowUpOpen === false)) {
-      throw new RunCoreError(kind, message)
+      throw new RunCoreError(kind, message, false, providerFailureReason)
     }
     const settlement = await settleOwnedSessions({
       client,
@@ -715,13 +733,13 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       ...(rootFollowUpOpen ? {confirmRootQuiescent: true} : {}),
     })
     if (settlement.settled === true) {
-      throw new RunCoreError(kind, message)
+      throw new RunCoreError(kind, message, false, providerFailureReason)
     }
     logger.error(
       {sessionId, kind, detail: settlement.reason},
       'run-core: owned work could not be confirmed settled before this failure — quarantining run',
     )
-    throw new RunCoreError(kind, message, true)
+    throw new RunCoreError(kind, message, true, providerFailureReason)
   }
 
   // An abort the gateway did not cause (see the `session.error` and `message.updated` branches).
@@ -739,7 +757,10 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       'run-core: provider rejected the request — failing run',
     )
     clearInactivity()
-    throw await throwWithBarrier('session-error', `Provider failure: ${failure.reason}`, rootLive)
+    throw await throwWithBarrier('session-error', `Provider failure: ${failure.reason}`, {
+      rootLive,
+      providerFailureReason: failure.reason,
+    })
   }
 
   // ── 2. Subscribe to events — directory threaded to query (SSE-routing) ─────

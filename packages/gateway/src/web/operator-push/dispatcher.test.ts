@@ -7,6 +7,8 @@ import {createPushDispatcher} from './dispatcher.js'
 import {createStoreError} from './subscription-store.js'
 import {shouldNotify} from './trigger-policy.js'
 
+const RUN_ID = '3f2b8c1e-9d4a-4e7b-8a61-5c0d2f9e7b34'
+
 const VAPID_CONFIG = {
   subject: 'mailto:ops@example.com',
   publicKey: 'public-key',
@@ -73,7 +75,7 @@ describe('createPushDispatcher — broadcast', () => {
       auditLogger: createAuditLogger(),
     })
 
-    await dispatcher.dispatchApprovalPending('approval-1')
+    await dispatcher.dispatchApprovalPending('approval-1', RUN_ID)
     expect(sender.sendNotification).toHaveBeenCalledTimes(2)
   })
 
@@ -96,8 +98,8 @@ describe('createPushDispatcher — broadcast', () => {
       auditLogger: createAuditLogger(),
     })
 
-    await dispatcher.dispatchApprovalPending('approval-1')
-    await dispatcher.dispatchApprovalPending('approval-1')
+    await dispatcher.dispatchApprovalPending('approval-1', RUN_ID)
+    await dispatcher.dispatchApprovalPending('approval-1', RUN_ID)
     expect(sender.sendNotification).toHaveBeenCalledTimes(1)
     // listAllActiveRecords now runs before the dedupe check on every call (so a failed list
     // never consumes the dedupe slot) — the second call still lists, but shouldSend suppresses
@@ -188,7 +190,7 @@ describe('createPushDispatcher — broadcast', () => {
       auditLogger: createAuditLogger(),
     })
 
-    await dispatcher.dispatchApprovalPending('approval-1')
+    await dispatcher.dispatchApprovalPending('approval-1', RUN_ID)
     expect(sender.sendNotification).toHaveBeenCalledTimes(2)
   })
 
@@ -214,7 +216,7 @@ describe('createPushDispatcher — broadcast', () => {
       auditLogger: createAuditLogger(),
     })
 
-    await dispatcher.dispatchApprovalPending('approval-1')
+    await dispatcher.dispatchApprovalPending('approval-1', RUN_ID)
     expect(sender.sendNotification).not.toHaveBeenCalled()
     expect(logger.warn).toHaveBeenCalled()
   })
@@ -244,10 +246,10 @@ describe('createPushDispatcher — broadcast', () => {
       auditLogger: createAuditLogger(),
     })
 
-    await dispatcher.dispatchApprovalPending('approval-1')
+    await dispatcher.dispatchApprovalPending('approval-1', RUN_ID)
     expect(sender.sendNotification).not.toHaveBeenCalled()
 
-    await dispatcher.dispatchApprovalPending('approval-1')
+    await dispatcher.dispatchApprovalPending('approval-1', RUN_ID)
     expect(sender.sendNotification).toHaveBeenCalledTimes(1)
     expect(listAllActiveRecords).toHaveBeenCalledTimes(2)
   })
@@ -271,7 +273,7 @@ describe('createPushDispatcher — broadcast', () => {
       auditLogger: createAuditLogger(),
     })
 
-    await dispatcher.dispatchApprovalPending('approval-1')
+    await dispatcher.dispatchApprovalPending('approval-1', RUN_ID)
     expect(sender.sendNotification).not.toHaveBeenCalled()
   })
 
@@ -320,7 +322,7 @@ describe('createPushDispatcher — broadcast', () => {
       auditLogger: createAuditLogger(),
     })
 
-    await expect(dispatcher.dispatchApprovalPending('approval-1')).resolves.toBeUndefined()
+    await expect(dispatcher.dispatchApprovalPending('approval-1', RUN_ID)).resolves.toBeUndefined()
     await expect(dispatcher.dispatchRunFailed('run-1')).resolves.toBeUndefined()
   })
 
@@ -400,7 +402,7 @@ describe('createPushDispatcher — push.dispatch audit event', () => {
       auditLogger,
     })
 
-    await dispatcher.dispatchApprovalPending('approval-1')
+    await dispatcher.dispatchApprovalPending('approval-1', RUN_ID)
 
     expect(auditLogger.info).toHaveBeenCalledOnce()
     const [ctx] = auditLogger.info.mock.calls[0] as [Record<string, unknown>, string]
@@ -434,8 +436,8 @@ describe('createPushDispatcher — push.dispatch audit event', () => {
       auditLogger,
     })
 
-    await dispatcher.dispatchApprovalPending('approval-1')
-    await dispatcher.dispatchApprovalPending('approval-1')
+    await dispatcher.dispatchApprovalPending('approval-1', RUN_ID)
+    await dispatcher.dispatchApprovalPending('approval-1', RUN_ID)
 
     expect(auditLogger.info).toHaveBeenCalledOnce()
   })
@@ -459,7 +461,7 @@ describe('createPushDispatcher — push.dispatch audit event', () => {
       auditLogger,
     })
 
-    await dispatcher.dispatchApprovalPending('approval-1')
+    await dispatcher.dispatchApprovalPending('approval-1', RUN_ID)
 
     expect(auditLogger.info).not.toHaveBeenCalled()
     expect(auditLogger.warn).not.toHaveBeenCalled()
@@ -486,7 +488,7 @@ describe('createPushDispatcher — push.dispatch audit event', () => {
       auditLogger,
     })
 
-    await dispatcher.dispatchApprovalPending('approval-1')
+    await dispatcher.dispatchApprovalPending('approval-1', RUN_ID)
 
     expect(sender.sendNotification).not.toHaveBeenCalled()
     expect(auditLogger.info).toHaveBeenCalledOnce()
@@ -521,7 +523,7 @@ describe('createPushDispatcher — push.dispatch audit event', () => {
       auditLogger,
     })
 
-    await dispatcher.dispatchApprovalPending('approval-1')
+    await dispatcher.dispatchApprovalPending('approval-1', RUN_ID)
 
     const serialized = JSON.stringify(auditLogger.info.mock.calls)
     expect(serialized).not.toContain('super-secret-path')
@@ -593,17 +595,17 @@ describe('createPushDispatcher — dispatchQuestionPending', () => {
 
   // #given approval and run-failed nudges
   // #when they are dispatched
-  // #then their wire routes stay /
-  it('keeps route / on approval and run-failed wire payloads', async () => {
+  // #then the approval deep-links to its run and the run-failed route stays /
+  it('deep-links the approval wire payload and keeps route / on run-failed', async () => {
     const {dispatcher, sender} = build()
 
-    await dispatcher.dispatchApprovalPending('a-1')
+    await dispatcher.dispatchApprovalPending('a-1', RUN_ID)
     await dispatcher.dispatchRunFailed('r-1')
 
     const routes = (sender.sendNotification.mock.calls as unknown as [unknown, string][]).map(
       call => (JSON.parse(call[1]) as {data: {route: string}}).data.route,
     )
-    expect(routes).toEqual(['/', '/'])
+    expect(routes).toEqual([`/operator#${RUN_ID}`, '/'])
   })
 
   // #given no subscribers
@@ -658,7 +660,7 @@ describe('createPushDispatcher — dispatchQuestionPending', () => {
   it('does not share a dedupe slot with approval or run-failed nudges for the same id', async () => {
     const {dispatcher, sender} = build()
 
-    await dispatcher.dispatchApprovalPending('x')
+    await dispatcher.dispatchApprovalPending('x', RUN_ID)
     await dispatcher.dispatchQuestionPending('x')
     await dispatcher.dispatchRunFailed('x')
 
@@ -708,7 +710,7 @@ describe('createPushDispatcher — trigger kinds match the operator contract', (
   it('emits exactly OPERATOR_PUSH_TRIGGER_KINDS as audit triggers and payload types', async () => {
     const {dispatcher, sender, auditLogger} = build()
 
-    await dispatcher.dispatchApprovalPending('a-1')
+    await dispatcher.dispatchApprovalPending('a-1', RUN_ID)
     await dispatcher.dispatchQuestionPending('q-1')
     await dispatcher.dispatchRunFailed('r-1')
 
@@ -720,5 +722,95 @@ describe('createPushDispatcher — trigger kinds match the operator contract', (
     )
     expect([...triggers].sort()).toEqual([...OPERATOR_PUSH_TRIGGER_KINDS].sort())
     expect(wireTypes).toEqual(triggers)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Approval push carries the run ID (contract 1.12.0)
+// ---------------------------------------------------------------------------
+
+function makeApprovalDispatcher(options: {windowMs?: number} = {}) {
+  const sender = createFakeSender([])
+  const auditLogger = createAuditLogger()
+  const dispatcher = createPushDispatcher({
+    store: {
+      listAllActiveRecords: vi.fn(async () => ({success: true as const, data: [makeRecord()]})),
+      markDead: vi.fn(async () => ({success: true as const, data: undefined})),
+    },
+    sender,
+    dedupeCache: createDedupeCache({windowMs: options.windowMs ?? 60_000}),
+    triggerPolicy: {shouldNotify},
+    vapidConfig: VAPID_CONFIG,
+    logger: createLogger(),
+    auditLogger,
+  })
+  return {dispatcher, sender, auditLogger}
+}
+
+function sentPayloads(sender: ReturnType<typeof createFakeSender>): {data: Record<string, unknown>}[] {
+  return (sender.sendNotification.mock.calls as unknown as unknown[][]).map(
+    call => JSON.parse(String(call[1])) as {data: Record<string, unknown>},
+  )
+}
+
+describe('createPushDispatcher — approval push deep link (1.12.0)', () => {
+  it('sends the run ID and a /operator#<runId> route', async () => {
+    // #given
+    const {dispatcher, sender} = makeApprovalDispatcher()
+
+    // #when
+    await dispatcher.dispatchApprovalPending('approval-1', RUN_ID)
+
+    // #then
+    expect(sentPayloads(sender)[0]?.data).toEqual({type: 'approval', route: `/operator#${RUN_ID}`, runId: RUN_ID})
+  })
+
+  it('falls back to route / with no runId for an inadmissible run ID', async () => {
+    // #given
+    const {dispatcher, sender} = makeApprovalDispatcher()
+
+    // #when
+    await dispatcher.dispatchApprovalPending('approval-1', '//evil#x')
+
+    // #then
+    expect(sentPayloads(sender)[0]?.data).toEqual({type: 'approval', route: '/'})
+  })
+
+  it('dedupes on the approvalId: the same approval twice is one send, even if the run ID differs', async () => {
+    // #given
+    const {dispatcher, sender} = makeApprovalDispatcher()
+
+    // #when
+    await dispatcher.dispatchApprovalPending('approval-1', RUN_ID)
+    await dispatcher.dispatchApprovalPending('approval-1', 'another-run')
+
+    // #then
+    expect(sender.sendNotification).toHaveBeenCalledTimes(1)
+  })
+
+  it('two approvals on one run are two sends (the run ID is not part of the dedupe key)', async () => {
+    // #given
+    const {dispatcher, sender} = makeApprovalDispatcher()
+
+    // #when
+    await dispatcher.dispatchApprovalPending('approval-1', RUN_ID)
+    await dispatcher.dispatchApprovalPending('approval-2', RUN_ID)
+
+    // #then
+    expect(sender.sendNotification).toHaveBeenCalledTimes(2)
+    expect(sentPayloads(sender).map(p => p.data.runId)).toEqual([RUN_ID, RUN_ID])
+  })
+
+  it('keeps the audit correlationId on the approvalId, never the run ID', async () => {
+    // #given
+    const {dispatcher, auditLogger} = makeApprovalDispatcher()
+
+    // #when
+    await dispatcher.dispatchApprovalPending('approval-1', RUN_ID)
+
+    // #then
+    const [ctx] = auditLogger.info.mock.calls[0] as [Record<string, unknown>, string]
+    expect(ctx).toMatchObject({kind: 'push.dispatch', correlationId: 'approval-1', trigger: 'approval'})
+    expect(JSON.stringify(auditLogger.info.mock.calls)).not.toContain(RUN_ID)
   })
 })

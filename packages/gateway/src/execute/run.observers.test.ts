@@ -28,6 +28,12 @@ import * as runCoreModule from './run-core.js'
 // dispatcher — all secondary side-channels driven off the same run lifecycle.
 // ---------------------------------------------------------------------------
 
+function loggedText(logger: Record<'debug' | 'info' | 'warn' | 'error', ReturnType<typeof vi.fn>>): string {
+  return [logger.debug, logger.info, logger.warn, logger.error]
+    .flatMap(fn => fn.mock.calls.map((call: unknown[]) => JSON.stringify(call)))
+    .join('\n')
+}
+
 describe('runMention', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -161,6 +167,50 @@ describe('runMention', () => {
       // #then — run completed normally
       const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
       expect(transitionPhases).toContain('COMPLETED')
+    })
+
+    describe('prompt text stays out of observer error logs', () => {
+      const SENTINEL = 'SENTINEL-PROMPT-91ac'
+
+      it('an observe rejection that quotes the run record logs the error name only', async () => {
+        // #given an observer whose rejection message quotes the record it was handed (the prompt-bearing state)
+        const {runMention} = await import('./run.js')
+        setupHappyPath()
+        const observeFn = vi
+          .fn()
+          .mockRejectedValue(new RangeError(`observe failed on {"operatorPrompt":"${SENTINEL}"}`))
+        const deps = makeDeps({runObserver: {observe: observeFn}})
+
+        // #when
+        await runMention(makeMessage(), makeBinding(), deps)
+        await Promise.resolve()
+
+        // #then the warning names the error type and nothing else
+        const logger = deps.logger as unknown as Parameters<typeof loggedText>[0]
+        expect(logger.warn).toHaveBeenCalledWith({err: 'RangeError'}, 'run: runObserver.observe failed')
+        expect(loggedText(logger)).not.toContain(SENTINEL)
+      })
+
+      it('a synchronous observe throw that quotes the run record logs the error name only', async () => {
+        // #given an observer that throws synchronously with a message quoting the record
+        const {runMention} = await import('./run.js')
+        setupHappyPath()
+        const observeFn = vi.fn().mockImplementation(() => {
+          throw new TypeError(`observe threw on {"operatorPrompt":"${SENTINEL}"}`)
+        })
+        const deps = makeDeps({runObserver: {observe: observeFn}})
+
+        // #when
+        await runMention(makeMessage(), makeBinding(), deps)
+
+        // #then
+        const logger = deps.logger as unknown as Parameters<typeof loggedText>[0]
+        expect(logger.warn).toHaveBeenCalledWith(
+          {err: 'TypeError'},
+          'run: runObserver.observe threw — continuing (best-effort)',
+        )
+        expect(loggedText(logger)).not.toContain(SENTINEL)
+      })
     })
 
     it('inert: omitting runObserver (undefined) is safe — run completes normally', async () => {
@@ -1051,9 +1101,9 @@ describe('operatorPushDispatcher wiring', () => {
 
   // #given a run with a fake operatorPushDispatcher present
   // #when the coordinator's onPending fires
-  // #then dispatchApprovalPending is called once with the requestID, and the
+  // #then dispatchApprovalPending is called once with the requestID and the run ID, and the
   //       existing approval flow (Discord render + registry) is unchanged
-  it('calls dispatchApprovalPending once on a pending approval without altering the approval flow', async () => {
+  it('calls dispatchApprovalPending once, with the approval and run IDs, without altering the approval flow', async () => {
     const {runMention} = await import('./run.js')
     setupHappyPath()
     const pushDispatcher = makePushDispatcher()
@@ -1088,7 +1138,9 @@ describe('operatorPushDispatcher wiring', () => {
     await runMention(message, makeBinding(), deps)
 
     expect(pushDispatcher.dispatchApprovalPending).toHaveBeenCalledTimes(1)
-    expect(pushDispatcher.dispatchApprovalPending).toHaveBeenCalledWith('req-push-1')
+    // The run ID travels with the approval ID so the push can deep-link to the waiting run.
+    const createdRunId = (mockRuntime.createRun.mock.calls[0]?.[3] as {run_id: string}).run_id
+    expect(pushDispatcher.dispatchApprovalPending).toHaveBeenCalledWith('req-push-1', createdRunId)
     // The existing approval transport still ran — the push dispatch is additive, not a
     // replacement. If push dispatch replaced the existing flow instead of augmenting it,
     // this assertion would fail.

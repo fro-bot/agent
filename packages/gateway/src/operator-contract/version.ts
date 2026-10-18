@@ -1,6 +1,22 @@
 // Operator API contract version — build-time pinned, never negotiated over the wire.
 //
 // Changelog (latest first):
+//   1.12.0 — three additive optional fields, plus two launch BEHAVIOR changes (a client that does not
+//            update in lockstep sees them as new status codes):
+//            (1) approval push notifications now carry `data.runId` and `route: '/operator#<runId>'`
+//            (a deep link to the waiting run; falls back to `/` for a non-conforming ID);
+//            (2) `RunSummary.prompt` — the launch prompt of runs started through `POST /operator/runs`
+//            (untrusted text; bounded by `OPERATOR_LAUNCH_PROMPT_MAX_LENGTH`, 8,000 UTF-16 code units,
+//            raise-only; absent on other surfaces);
+//            (3) `providerFailureReason` on `RunSummary` and `OperatorRunStatus` — a closed enum
+//            (`provider-auth-unavailable | model-not-available | provider-rejected-request |
+//            unclassified`) on FAILED `session-error` runs.
+//            Launch behavior changes (`POST /operator/runs`; both checks now run before repo access, so the
+//            answer is the same for every repo):
+//              - a prompt over 8,000 UTF-16 code units used to return 202 and now returns 400
+//                `{error: 'bad request', reason: 'prompt-too-long'}`;
+//              - an empty prompt on an unbound or denylisted repo used to return 404 and now returns
+//                400 `{error: 'prompt is required'}`.
 //   1.11.0 — `RunSummaryStatus` gains `waiting_for_approval` and `waiting_for_question` (additive):
 //            `GET /operator/runs` summaries overlay the same registry-derived waiting status as the
 //            SSE stream (approval before question, only on a `running` base). Question push
@@ -27,4 +43,4 @@
 // Security constraint: the version is BUILD-TIME pinned and is never supplied or
 // negotiated over the wire. Any endpoint reading a version header must reject
 // unrecognized versions fail-closed.
-export const OPERATOR_CONTRACT_VERSION = '1.11.0'
+export const OPERATOR_CONTRACT_VERSION = '1.12.0'

@@ -339,10 +339,12 @@ export type ReplySinkTarget = 'source' | 'thread'
  *   - `'empty-prompt'` — prompt was empty; rejected before any queue/cap work.
  *   - `'queue-full'`   — run was admitted (PENDING created) but the channel queue
  *                        was full; the PENDING run-state was terminalized to FAILED.
+ *   - `'prompt-too-long'` — `persistOperatorPrompt` was set and `promptText` is longer than
+ *                        `OPERATOR_LAUNCH_PROMPT_MAX_LENGTH`; rejected before any run-state is written.
  */
 export type LaunchAdmission =
   | {readonly accepted: true; readonly runId: string; readonly runPromise?: Promise<void>}
-  | {readonly accepted: false; readonly reason: 'cap' | 'empty-prompt' | 'queue-full'}
+  | {readonly accepted: false; readonly reason: 'cap' | 'empty-prompt' | 'queue-full' | 'prompt-too-long'}
 
 // ---------------------------------------------------------------------------
 // LaunchWorkRequest — transport-neutral engine input
@@ -399,6 +401,19 @@ export interface LaunchWorkRequest {
    * Derived from `message.content` (`:376-382` in `run.ts`).
    */
   readonly promptText: string
+
+  /**
+   * Opt-in: store `promptText` — exactly as submitted, before `promptBuilder` and checkout provenance are
+   * applied — on the run record (`details.operatorPrompt`) so the operator surface can show it.
+   *
+   * Only the web launch route sets this. It is deliberately NOT keyed on `surface`, so a future non-operator
+   * web caller does not start persisting prompts by accident, and Discord text is never stored.
+   *
+   * When set, `launchWork` is the persistence boundary: a prompt over `OPERATOR_LAUNCH_PROMPT_MAX_LENGTH`
+   * (UTF-16 code units) is refused with `'prompt-too-long'` and no record is written. When absent (the
+   * default), nothing changes — including for over-length prompts.
+   */
+  readonly persistOperatorPrompt?: boolean
 
   /**
    * Optional caller-supplied run ID.

@@ -2540,6 +2540,29 @@ describe('buildOperatorApp — v1.5.0 full route-registration smoke (drift guard
     expect(getSpy).not.toHaveBeenCalled()
   })
 
+  it('launch route: a body over 64 KiB answers 413 before session or run lookup (the prompt cap is a separate, lower bound)', async () => {
+    // #given — the full route set with a spy on the session lookup
+    const sessionStore = await createTestSessionStore()
+    const getSpy = vi.spyOn(sessionStore, 'get')
+    const app = buildOperatorApp(
+      makeFullPrivilegedDeps(sessionStore),
+      makeStubConfig({githubOAuth: makeStubGitHubOAuthConfig()}),
+    )
+
+    // #when — a launch whose prompt alone is far over the body limit
+    const res = await app.fetch(
+      new Request('http://localhost/operator/runs', {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        body: JSON.stringify({repo: 'acme/widget', prompt: 'a'.repeat(65 * 1024 + 1)}),
+      }),
+    )
+
+    // #then
+    expect(res.status).toBe(413)
+    expect(getSpy).not.toHaveBeenCalled()
+  })
+
   it('dep-gated negative case: without run/approval deps, privileged run/approval routes do NOT register', async () => {
     // #given — only OAuth + session/browser-guard deps (no launchWorkDeps, runIndex,
     // denylistCache, bindingsLookup, runObservationManager, approvalRegistry)

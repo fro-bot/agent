@@ -31,8 +31,10 @@
 import type {RunPhase, RunState, Surface} from '@fro-bot/runtime'
 import type {RunCoreErrorKind} from '../execute/run-core.js'
 import type {OperatorCheckoutPreparation, OperatorCheckoutProvenance} from './provenance.js'
+import type {OperatorProviderFailureReason} from './provider-failure-reason.js'
 
 import {parseOperatorCheckoutPreparation, parseOperatorCheckoutProvenance} from './provenance.js'
+import {projectProviderFailureReason, PROVIDER_FAILURE_REASON_DETAILS_KEY} from './provider-failure-reason.js'
 
 export type {
   OperatorCheckoutHead,
@@ -86,6 +88,12 @@ export interface OperatorRunStatus {
   readonly startedAt: string
   readonly stale: boolean
   readonly failureKind?: OperatorFailureKind
+  /**
+   * Why a `session-error` run failed at the provider (contract 1.12.0). A closed enum with no user or
+   * provider text. Absent unless the run is FAILED with `failureKind: 'session-error'` and the stored
+   * value is a known wire reason; absence means "no further detail", never a sentinel.
+   */
+  readonly providerFailureReason?: OperatorProviderFailureReason
   /**
    * What this run started from (the checked-out commit/branch, worktree
    * cleanliness, any in-progress operation). Present ONLY on runs that reached
@@ -187,6 +195,9 @@ export const RUN_CORE_ERROR_KIND_TO_OPERATOR_FAILURE_KIND = {
   'workspace-unavailable': 'workspace-unavailable',
 } satisfies Record<RunCoreErrorKind, OperatorFailureKind | undefined>
 
+/** Own keys of the mapping above, for prototype-safe membership checks (never index the plain object). */
+const RUN_CORE_ERROR_KINDS: ReadonlySet<string> = new Set(Object.keys(RUN_CORE_ERROR_KIND_TO_OPERATOR_FAILURE_KIND))
+
 /**
  * Maps a raw failure-kind value to the operator-safe OperatorFailureKind enum.
  *
@@ -206,11 +217,16 @@ export function toOperatorFailureKind(failureKind: unknown): OperatorFailureKind
   }
 
   if (typeof failureKind === 'string') {
+    // Membership check first: indexing a plain object would resolve `toString`, `constructor` and
+    // `__proto__` to prototype members, which would escape this gate as non-enum values.
+    if (RUN_CORE_ERROR_KINDS.has(failureKind) === false) {
+      return 'unknown'
+    }
     // Widening cast (not a suppression): `satisfies` narrows the object's key type to
     // RunCoreErrorKind, but the lookup key here is an arbitrary runtime string (untyped
     // `unknown` input) that may not be a RunCoreErrorKind member. Widen the lookup type
     // to accept any string so the index access type-checks; the `?? 'unknown'` fallback
-    // below still handles unrecognized keys safely at runtime.
+    // below handles own keys that deliberately map to `undefined`.
     const lookup = RUN_CORE_ERROR_KIND_TO_OPERATOR_FAILURE_KIND as Record<string, OperatorFailureKind | undefined>
     return lookup[failureKind] ?? 'unknown'
   }
@@ -282,6 +298,14 @@ export const toOperatorRunStatus = (
   // solely within this branch — never elsewhere.
   const failureKind = runState.phase === 'FAILED' ? toOperatorFailureKind(runState.details.failureKind) : undefined
 
+  // providerFailureReason (1.12.0): sibling of failureKind, gated on FAILED + internal failureKind
+  // 'session-error' + a known wire value. A tampered or stale value is dropped; the row is kept.
+  const providerFailureReason = projectProviderFailureReason(
+    runState.phase,
+    runState.details.failureKind,
+    runState.details[PROVIDER_FAILURE_REASON_DETAILS_KEY],
+  )
+
   // checkoutProvenance is populated for EVERY phase — it describes the run's
   // STARTING state, not an outcome, so unlike failureKind it is not gated on
   // FAILED. Parsed (never cast) from untrusted `details`; a pre-existing run
@@ -306,6 +330,7 @@ export const toOperatorRunStatus = (
     startedAt: runState.started_at,
     stale,
     ...(failureKind === undefined ? {} : {failureKind}),
+    ...(providerFailureReason === undefined ? {} : {providerFailureReason}),
     ...(checkoutProvenance === undefined ? {} : {checkoutProvenance}),
     ...(checkoutPreparation === undefined ? {} : {checkoutPreparation}),
   }

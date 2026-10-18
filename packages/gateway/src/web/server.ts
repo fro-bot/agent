@@ -872,9 +872,10 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   //   2. Operator rate limit (3/min, 10/hr, operator-keyed)
   //   3. Session identity (requester attribution)
   //   4. Body parse: {repo, prompt, idempotencyKey?}
-  //   5. resolveRepoAccess (name validation, one server-owned binding read, then denylist)
-  //   6. Empty-prompt fail-fast
-  //   7. Per-operator idempotency guard (reserve before launchWork)
+  //   5. Prompt checks, before repo access: length cap (8,000 UTF-16 code units → 400 prompt-too-long),
+  //      then empty fail-fast (→ 400 prompt is required)
+  //   6. resolveRepoAccess (name validation, one server-owned binding read, then denylist)
+  //   7. Per-operator idempotency guard (reserve before launchWork; the first launch for a key wins)
   //   8. Generate runId + reserve idempotency key
   //   9. Await launchWork admission (returns LaunchAdmission, not the full run)
   //  10. On accepted: commit idempotency + return 202 {runId}

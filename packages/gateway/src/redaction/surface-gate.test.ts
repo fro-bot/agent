@@ -552,6 +552,43 @@ describe('projectRunStatusWithKey', () => {
   })
 })
 
+describe('projectRunStatusWithKey — providerFailureReason (1.12.0)', () => {
+  it('carries the reason through the closed-status copy for a FAILED session-error run, and drops tampered ones', async () => {
+    // #given a FAILED provider failure, an out-of-gate reason, and a bogus one
+    const failed = makeRunState({
+      phase: 'FAILED',
+      details: {failureKind: 'session-error', providerFailureReason: 'model-not-available'},
+    })
+    const running = makeRunState({
+      details: {failureKind: 'session-error', providerFailureReason: 'model-not-available'},
+    })
+    const bogus = makeRunState({
+      phase: 'FAILED',
+      details: {failureKind: 'session-error', providerFailureReason: 'model not available'},
+    })
+
+    // #when projecting through the real gate
+    const [a, b, c] = await Promise.all(
+      [failed, running, bogus].map(async state =>
+        projectRunStatusWithKey(state, {
+          nowMs: BASE_NOW_MS,
+          staleThresholdMs: STALE_THRESHOLD_MS,
+          bindingsLookup: fakeBindingsLookup(makeBinding()),
+          isRepoDenied: allowAll,
+        }),
+      ),
+    )
+
+    // #then only the in-gate value is a key; the rows are kept
+    if (a?.kind !== 'projected' || b?.kind !== 'projected' || c?.kind !== 'projected') {
+      throw new Error('expected projected statuses')
+    }
+    expect(a.status.providerFailureReason).toBe('model-not-available')
+    expect(b.status).not.toHaveProperty('providerFailureReason')
+    expect(c.status).not.toHaveProperty('providerFailureReason')
+  })
+})
+
 // ---------------------------------------------------------------------------
 // lookupBindingDenyKeys — one read: deny keys AND the binding, store error kept distinct
 // ---------------------------------------------------------------------------
