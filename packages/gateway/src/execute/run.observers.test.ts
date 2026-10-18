@@ -1051,9 +1051,9 @@ describe('operatorPushDispatcher wiring', () => {
 
   // #given a run with a fake operatorPushDispatcher present
   // #when the coordinator's onPending fires
-  // #then dispatchApprovalPending is called once with the requestID, and the
+  // #then dispatchApprovalPending is called once with the requestID and the run ID, and the
   //       existing approval flow (Discord render + registry) is unchanged
-  it('calls dispatchApprovalPending once on a pending approval without altering the approval flow', async () => {
+  it('calls dispatchApprovalPending once, with the approval and run IDs, without altering the approval flow', async () => {
     const {runMention} = await import('./run.js')
     setupHappyPath()
     const pushDispatcher = makePushDispatcher()
@@ -1088,7 +1088,9 @@ describe('operatorPushDispatcher wiring', () => {
     await runMention(message, makeBinding(), deps)
 
     expect(pushDispatcher.dispatchApprovalPending).toHaveBeenCalledTimes(1)
-    expect(pushDispatcher.dispatchApprovalPending).toHaveBeenCalledWith('req-push-1')
+    // The run ID travels with the approval ID so the push can deep-link to the waiting run.
+    const createdRunId = (mockRuntime.createRun.mock.calls[0]?.[3] as {run_id: string}).run_id
+    expect(pushDispatcher.dispatchApprovalPending).toHaveBeenCalledWith('req-push-1', createdRunId)
     // The existing approval transport still ran — the push dispatch is additive, not a
     // replacement. If push dispatch replaced the existing flow instead of augmenting it,
     // this assertion would fail.

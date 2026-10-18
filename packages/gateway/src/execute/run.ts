@@ -225,7 +225,7 @@ export interface RunMentionDeps {
    * push fully inert (a no-op) when absent — push stays disabled-by-default.
    */
   readonly operatorPushDispatcher?: {
-    readonly dispatchApprovalPending: (approvalId: string) => Promise<void>
+    readonly dispatchApprovalPending: (approvalId: string, runId: string) => Promise<void>
     /** Optional so fakes that only exercise the approval and run-failed nudges stay valid. */
     readonly dispatchQuestionPending?: (runId: string) => Promise<void>
     readonly dispatchRunFailed: (runId: string, failureLabel?: OperatorFailureKind) => Promise<void>
@@ -1394,7 +1394,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           // Operator push — fire-and-forget, opt-in, and last so it can never
           // preempt the real approval transports above. No-op when push is disabled.
           // eslint-disable-next-line no-void
-          void deps.operatorPushDispatcher?.dispatchApprovalPending(req.requestID)
+          void deps.operatorPushDispatcher?.dispatchApprovalPending(req.requestID, runId)
         },
         onReplied: event => {
           // Authoritative echo from OpenCode — let the registry render + cascade.
