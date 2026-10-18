@@ -34,7 +34,7 @@ import type {OperatorCheckoutPreparation, OperatorCheckoutProvenance} from './pr
 import type {OperatorProviderFailureReason} from './provider-failure-reason.js'
 
 import {parseOperatorCheckoutPreparation, parseOperatorCheckoutProvenance} from './provenance.js'
-import {projectProviderFailureReason} from './provider-failure-reason.js'
+import {projectProviderFailureReason, PROVIDER_FAILURE_REASON_DETAILS_KEY} from './provider-failure-reason.js'
 
 export type {
   OperatorCheckoutHead,
@@ -303,7 +303,7 @@ export const toOperatorRunStatus = (
   const providerFailureReason = projectProviderFailureReason(
     runState.phase,
     runState.details.failureKind,
-    runState.details.providerFailureReason,
+    runState.details[PROVIDER_FAILURE_REASON_DETAILS_KEY],
   )
 
   // checkoutProvenance is populated for EVERY phase — it describes the run's

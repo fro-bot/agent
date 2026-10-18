@@ -19,13 +19,23 @@ import type {RunPhase} from '@fro-bot/runtime'
 import type {ProviderFailureReason} from '../execute/provider-failure.js'
 
 /**
- * The closed wire set of provider failure reasons.
+ * The closed wire set of provider failure reasons, declared once: the type, the runtime membership set and
+ * the mapping table below all derive from or are checked against this tuple.
  *
  * `unclassified` is the wire value for the internal catch-all (`session error`): a provider failure
  * with no more specific cause. Consumers must tolerate values added in later MINOR versions.
  */
-export type OperatorProviderFailureReason =
-  'provider-auth-unavailable' | 'model-not-available' | 'provider-rejected-request' | 'unclassified'
+export const OPERATOR_PROVIDER_FAILURE_REASONS = [
+  'provider-auth-unavailable',
+  'model-not-available',
+  'provider-rejected-request',
+  'unclassified',
+] as const
+
+export type OperatorProviderFailureReason = (typeof OPERATOR_PROVIDER_FAILURE_REASONS)[number]
+
+/** The `RunState.details` key the terminal FAILED write stores the wire reason under. Writers and readers share it. */
+export const PROVIDER_FAILURE_REASON_DETAILS_KEY = 'providerFailureReason' as const
 
 /**
  * Internal `ProviderFailureReason` → wire value.
@@ -40,9 +50,11 @@ export const PROVIDER_FAILURE_REASON_TO_OPERATOR = {
   'session error': 'unclassified',
 } satisfies Record<ProviderFailureReason, OperatorProviderFailureReason>
 
-const OPERATOR_PROVIDER_FAILURE_REASONS: ReadonlySet<string> = new Set<OperatorProviderFailureReason>(
-  Object.values(PROVIDER_FAILURE_REASON_TO_OPERATOR),
-)
+const OPERATOR_PROVIDER_FAILURE_REASON_SET: ReadonlySet<string> = new Set<string>(OPERATOR_PROVIDER_FAILURE_REASONS)
+
+function isOperatorProviderFailureReason(value: unknown): value is OperatorProviderFailureReason {
+  return typeof value === 'string' && OPERATOR_PROVIDER_FAILURE_REASON_SET.has(value)
+}
 
 /** Map an internal provider failure reason to its wire value. Total over the internal union. */
 export function toOperatorProviderFailureReason(reason: ProviderFailureReason): OperatorProviderFailureReason {
@@ -57,10 +69,7 @@ export function toOperatorProviderFailureReason(reason: ProviderFailureReason): 
  * There is no sentinel: absence already means "no further detail".
  */
 export function parseOperatorProviderFailureReason(value: unknown): OperatorProviderFailureReason | undefined {
-  if (typeof value !== 'string' || OPERATOR_PROVIDER_FAILURE_REASONS.has(value) === false) {
-    return undefined
-  }
-  return value as OperatorProviderFailureReason
+  return isOperatorProviderFailureReason(value) ? value : undefined
 }
 
 /**

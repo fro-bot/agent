@@ -16,6 +16,9 @@ import type {Surface} from '@fro-bot/runtime'
  */
 export const OPERATOR_LAUNCH_PROMPT_MAX_LENGTH = 8_000
 
+/** The `RunState.details` key `launchWork` stores the operator's prompt under. Writer and reader share it. */
+export const OPERATOR_PROMPT_DETAILS_KEY = 'operatorPrompt' as const
+
 /** Typed 400 reason for a launch prompt longer than {@link OPERATOR_LAUNCH_PROMPT_MAX_LENGTH}. */
 export const OPERATOR_LAUNCH_PROMPT_TOO_LONG = 'prompt-too-long'
 

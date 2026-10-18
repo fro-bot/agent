@@ -4,6 +4,7 @@ import type {OperatorProviderFailureReason} from './provider-failure-reason.js'
 import {describe, expect, it} from 'vitest'
 import {OPERATOR_LAUNCH_PROMPT_MAX_LENGTH, OPERATOR_LAUNCH_PROMPT_TOO_LONG} from './launch-prompt.js'
 import {
+  OPERATOR_PROVIDER_FAILURE_REASONS,
   parseOperatorProviderFailureReason,
   PROVIDER_FAILURE_REASON_TO_OPERATOR,
   toOperatorProviderFailureReason,
@@ -127,5 +128,30 @@ describe('barrel re-exports', () => {
     expect(barrel.PROVIDER_FAILURE_REASON_TO_OPERATOR).toBe(PROVIDER_FAILURE_REASON_TO_OPERATOR)
     expect(barrel.OPERATOR_LAUNCH_PROMPT_MAX_LENGTH).toBe(OPERATOR_LAUNCH_PROMPT_MAX_LENGTH)
     expect(barrel.OPERATOR_LAUNCH_PROMPT_TOO_LONG).toBe(OPERATOR_LAUNCH_PROMPT_TOO_LONG)
+  })
+})
+
+describe('wire tuple and internal mapping stay in step', () => {
+  it('the mapping values equal the wire tuple, compared as sets', () => {
+    // #given the single declaration of the wire values and the internal→wire table
+    const tuple = new Set<string>(OPERATOR_PROVIDER_FAILURE_REASONS)
+    const mapped = new Set<string>(Object.values(PROVIDER_FAILURE_REASON_TO_OPERATOR))
+
+    // #when compared
+    // #then every wire value is reachable from an internal reason and no mapping targets an undeclared value
+    expect(mapped).toEqual(tuple)
+    expect(tuple.size).toBe(4)
+  })
+
+  it('the parser accepts exactly the tuple', () => {
+    // #given each declared wire value and the internal spellings
+    // #when parsed
+    // #then wire values pass and nothing else does
+    for (const wire of OPERATOR_PROVIDER_FAILURE_REASONS) {
+      expect(parseOperatorProviderFailureReason(wire)).toBe(wire)
+    }
+    for (const internal of Object.keys(PROVIDER_FAILURE_REASON_TO_OPERATOR)) {
+      expect(parseOperatorProviderFailureReason(internal)).toBeUndefined()
+    }
   })
 })

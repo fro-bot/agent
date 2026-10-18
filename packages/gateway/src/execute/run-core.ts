@@ -713,9 +713,9 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   async function throwWithBarrier(
     kind: RunCoreErrorKind,
     message: string,
-    rootLive = false,
-    providerFailureReason?: ProviderFailureReason,
+    options: {readonly rootLive?: boolean; readonly providerFailureReason?: ProviderFailureReason} = {},
   ): Promise<never> {
+    const {rootLive = false, providerFailureReason} = options
     // `rootLive`: the caller knows the root is still executing (a provider retry mid-backoff), so it takes the same
     // root teardown as the follow-up window, even with an empty or settled ledger — or none at all.
     const rootFollowUpOpen =
@@ -757,7 +757,10 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       'run-core: provider rejected the request — failing run',
     )
     clearInactivity()
-    throw await throwWithBarrier('session-error', `Provider failure: ${failure.reason}`, rootLive, failure.reason)
+    throw await throwWithBarrier('session-error', `Provider failure: ${failure.reason}`, {
+      rootLive,
+      providerFailureReason: failure.reason,
+    })
   }
 
   // ── 2. Subscribe to events — directory threaded to query (SSE-routing) ─────

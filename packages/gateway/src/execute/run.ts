@@ -46,8 +46,15 @@ import {setRunReaction} from '../discord/reactions.js'
 import {buildRecoverEntryButton} from '../discord/recover-checkout-button.js'
 import {createStatusController} from '../discord/status-message.js'
 import {createDiscordStreamSink} from '../discord/streaming.js'
-import {OPERATOR_LAUNCH_PROMPT_MAX_LENGTH, OPERATOR_LAUNCH_PROMPT_TOO_LONG} from '../operator-contract/launch-prompt.js'
-import {toOperatorProviderFailureReason} from '../operator-contract/provider-failure-reason.js'
+import {
+  OPERATOR_LAUNCH_PROMPT_MAX_LENGTH,
+  OPERATOR_LAUNCH_PROMPT_TOO_LONG,
+  OPERATOR_PROMPT_DETAILS_KEY,
+} from '../operator-contract/launch-prompt.js'
+import {
+  PROVIDER_FAILURE_REASON_DETAILS_KEY,
+  toOperatorProviderFailureReason,
+} from '../operator-contract/provider-failure-reason.js'
 import {toOperatorFailureKind} from '../operator-contract/run-status.js'
 import {canonicalWorkspaceTarget} from '../workspace-api/client.js'
 import {abortRegistry} from './abort-registry.js'
@@ -561,7 +568,7 @@ export function computeApprovalDeadlineMs(remainingBudgetMs: number): number | u
  * rather than persisting a synthetic 'unknown' string — the projection
  * already renders an absent field as no failure reason.
  */
-function extractRunCoreKind(execError: unknown): string | undefined {
+function extractRunCoreKind(execError: unknown): RunCoreErrorKind | undefined {
   return execError instanceof RunCoreError ? execError.kind : undefined
 }
 
@@ -583,16 +590,29 @@ function extractProviderFailureReason(execError: unknown): OperatorProviderFailu
 }
 
 /**
+ * The `details` keys a terminal FAILED write driven by an execution error persists. A type alias, not an
+ * interface, so it stays assignable to the `Record<string, unknown>` `detailsPatch` parameter.
+ */
+// eslint-disable-next-line @typescript-eslint/consistent-type-definitions -- an interface has no implicit index signature, so it would not be assignable to `Record<string, unknown>`
+type FailureDetailsPatch = {
+  readonly failureKind: RunCoreErrorKind
+  readonly providerFailureReason?: OperatorProviderFailureReason
+}
+
+/**
  * The `details` patch for a terminal FAILED write driven by an execution error: the internal
  * `failureKind` plus, for a provider-classified `session-error`, the wire `providerFailureReason`.
  * `undefined` when the error carries neither. Only the three execution-failure terminal sites use this;
  * preparation failure, `failAdmittedRun`, recovery and maintenance never write a reason.
  */
-function failureDetailsPatch(execError: unknown): Record<string, unknown> | undefined {
+function failureDetailsPatch(execError: unknown): FailureDetailsPatch | undefined {
   const failureKind = extractRunCoreKind(execError)
   if (failureKind === undefined) return undefined
   const providerFailureReason = extractProviderFailureReason(execError)
-  return {failureKind, ...(providerFailureReason === undefined ? {} : {providerFailureReason})}
+  return {
+    failureKind,
+    ...(providerFailureReason === undefined ? {} : {[PROVIDER_FAILURE_REASON_DETAILS_KEY]: providerFailureReason}),
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2220,13 +2240,15 @@ export async function launchWork(request: LaunchWorkRequest, deps: RunMentionDep
       owner: binding.owner,
       repo: binding.repo,
       // The operator's text exactly as submitted — never the built prompt or the provenance-wrapped text.
-      ...(request.persistOperatorPrompt === true ? {operatorPrompt: request.promptText} : {}),
+      ...(request.persistOperatorPrompt === true ? {[OPERATOR_PROMPT_DETAILS_KEY]: request.promptText} : {}),
     },
   }
 
   const createResult = await createRun(coordinationConfig, identity, repo, initialRunState, coordLogger)
   if (createResult.success === false) {
-    logger.error({repo, runId, err: createResult.error.message}, 'run: createRun failed during admission')
+    // The error NAME only: the record being written carries the operator's prompt, and an adapter error
+    // can echo request text.
+    logger.error({repo, runId, err: createResult.error.name}, 'run: createRun failed during admission')
     await request.replySink.send('source', {content: 'Could not start the task — please try again.'})
     // Capacity was acquired (slotResult === 'ok') — release it since we're not proceeding.
     if (slotResult === 'ok') {
@@ -2252,7 +2274,7 @@ export async function launchWork(request: LaunchWorkRequest, deps: RunMentionDep
   } catch (admissionError: unknown) {
     // Fail-closed: terminalize the run to FAILED before propagating.
     logger.error(
-      {repo, runId, err: admissionError instanceof Error ? admissionError.message : String(admissionError)},
+      {repo, runId, err: admissionError instanceof Error ? admissionError.name : typeof admissionError},
       'run: admission block threw after createRun — terminalizing to FAILED',
     )
     await failAdmittedRun(deps, repo, runId, adoptionEtag)

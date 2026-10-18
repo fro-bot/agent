@@ -1974,6 +1974,12 @@ describe('failureKind threading (early-abort gates)', () => {
   })
 })
 
+function loggedText(logger: {[level in 'debug' | 'info' | 'warn' | 'error']: ReturnType<typeof vi.fn>}): string {
+  return [logger.debug, logger.info, logger.warn, logger.error]
+    .flatMap(fn => fn.mock.calls.map(call => JSON.stringify(call)))
+    .join('\n')
+}
+
 function createdDetails(): Record<string, unknown> {
   const call = mockRuntime.createRun.mock.calls[0] as unknown[] | undefined
   return (call?.[3] as {details: Record<string, unknown>} | undefined)?.details ?? {}
@@ -2070,5 +2076,52 @@ describe('launchWork — operator prompt persistence (contract 1.12.0)', () => {
     expect(admission.accepted).toBe(true)
     expect(mockRuntime.createRun).toHaveBeenCalledOnce()
     expect(createdDetails()).not.toHaveProperty('operatorPrompt')
+  })
+
+  const SENTINEL = 'SENTINEL-PROMPT-7d41'
+
+  it('a createRun failure whose message echoes the prompt logs the error name only', async () => {
+    // #given an adapter error that quotes the record being written (the prompt-bearing initial state)
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+    mockRuntime.createRun.mockResolvedValue({
+      success: false as const,
+      error: new TypeError(`conditional put rejected: {"operatorPrompt":"${SENTINEL} please run this"}`),
+    })
+    const deps = makeDeps()
+    const request = {...makeInMemoryRequest({promptText: `${SENTINEL} please run this`}), persistOperatorPrompt: true}
+
+    // #when
+    await expect(launchWork(request, deps)).rejects.toThrow('createRun failed')
+
+    // #then — the log carries the name, never the prompt
+    const logger = deps.logger as unknown as Parameters<typeof loggedText>[0]
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({err: 'TypeError'}),
+      'run: createRun failed during admission',
+    )
+    expect(loggedText(logger)).not.toContain(SENTINEL)
+  })
+
+  it('an admission-block failure whose message echoes the prompt logs the error name only', async () => {
+    // #given createRun succeeds, then run-index registration throws a message that quotes the prompt
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+    const register = vi.fn(() => {
+      throw new RangeError(`index rejected ${SENTINEL} please run this`)
+    })
+    const deps = makeDeps({runIndex: {register, lookup: vi.fn(), listRunsForRepo: vi.fn(), readRun: vi.fn()}})
+    const request = {...makeInMemoryRequest({promptText: `${SENTINEL} please run this`}), persistOperatorPrompt: true}
+
+    // #when
+    await expect(launchWork(request, deps)).rejects.toThrow()
+
+    // #then
+    const logger = deps.logger as unknown as Parameters<typeof loggedText>[0]
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({err: 'RangeError'}),
+      expect.stringContaining('admission block threw'),
+    )
+    expect(loggedText(logger)).not.toContain(SENTINEL)
   })
 })

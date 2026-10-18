@@ -38,8 +38,15 @@ describe('buildApprovalPayload', () => {
     })
   })
 
+  // #given run ids inside RUN_ID_PATTERN (including the 128-character limit)
+  // #when the approval payload is built
+  // #then the id is admitted: it becomes the runId and the encoded route fragment
   it.each(['run-1', 'a'.repeat(128), 'Run_ID-42'])('admits the run id %s', runId => {
+    // #given the admissible id above
+    // #when
     const payload = buildApprovalPayload(runId)
+
+    // #then
     expect(payload.data).toEqual({type: 'approval', route: `/operator#${encodeURIComponent(runId)}`, runId})
   })
 
