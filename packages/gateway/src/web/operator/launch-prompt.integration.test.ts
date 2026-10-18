@@ -499,12 +499,36 @@ describe('launch prompt — sentinel leak scan (contract 1.12.0)', () => {
     h.store.failNextPut.error = new Error('S3 500 InternalError')
 
     // #when
-    const failed = await transitionRun(h.store.config, IDENTITY, `${OWNER}/${REPO}`, runId, 'FAILED', etag, noopLogger)
+    // A capturing logger is passed on purpose: with a no-op logger the leak scan below could never fail.
+    // `transitionRun` takes a `(message, context)` logger while the harness logger is pino-style
+    // `(context, message)`, so adapt it onto the harness logger that `h.capture.text()` scans.
+    const transitionLogger = {
+      debug: (message: string, context?: Record<string, unknown>) => h.capture.logger.debug({...context}, message),
+    }
+    const logCallsBefore = vi.mocked(h.capture.logger.debug).mock.calls.length
+    const failed = await transitionRun(
+      h.store.config,
+      IDENTITY,
+      `${OWNER}/${REPO}`,
+      runId,
+      'FAILED',
+      etag,
+      transitionLogger,
+    )
 
-    // #then
+    // #then the failing path really ran and logged: `transitionRun` reads the record (which holds the prompt),
+    // logs the pending transition, then the injected write failure surfaces
     expect(failed.success).toBe(false)
-    expect(storedState(h, runId).details.operatorPrompt).toBe(prompt)
+    const transitionLogs = vi
+      .mocked(h.capture.logger.debug)
+      .mock.calls.slice(logCallsBefore)
+      .filter(call => call[1] === 'Transitioning run-state')
+    expect(transitionLogs).toHaveLength(1)
+    expect(transitionLogs[0]?.[0]).toMatchObject({repo: `${OWNER}/${REPO}`, runId, to: 'FAILED'})
+
+    // #then neither the logs nor any sink carries the prompt, and the stored record keeps it
     expect(h.capture.text()).not.toContain(SENTINEL)
+    expect(storedState(h, runId).details.operatorPrompt).toBe(prompt)
   })
 
   it('a corrupt record that begins with prompt text is skipped by listRunsForRepo without quoting it', async () => {
