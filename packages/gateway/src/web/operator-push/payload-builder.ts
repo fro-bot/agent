@@ -2,13 +2,14 @@
  * Pure builders for the operator push notification payloads (approval, question, run failed).
  *
  * Security invariant: the returned payload NEVER carries repo, prompt,
- * command, run output, endpoint, keys, tokens, cookies, CSRF token,
- * idempotency key, session id, or a raw (unmapped) failure kind. Every
- * value in the payload is a fixed i18n copy key, a member of a closed,
- * operator-safe allowlist (`OperatorFailureKind`), or the run ID of a
- * question push. The run ID is the only dynamic value: an opaque identifier
- * inside an encrypted payload, admitted only if it passes `RUN_ID_PATTERN`.
- * The copy stays fixed — never a free-form passthrough from internal state.
+ * tool name, command, approval or question content, run output, endpoint,
+ * keys, tokens, cookies, CSRF token, idempotency key, session id, or a raw
+ * (unmapped) failure kind. Every value in the payload is a fixed i18n copy
+ * key, a member of a closed, operator-safe allowlist (`OperatorFailureKind`),
+ * or the run ID of an approval or question push. The run ID is the only
+ * dynamic value: an opaque identifier inside an encrypted payload, admitted
+ * only if it passes `RUN_ID_PATTERN`. The copy stays fixed — never a
+ * free-form passthrough from internal state.
  */
 
 import type {OperatorPushTriggerKind} from '../../operator-contract/responses.js'
@@ -52,17 +53,27 @@ function isKnownSafeFailureLabel(value: string | undefined): value is OperatorFa
   return KNOWN_SAFE_FAILURE_LABELS.has(value as OperatorFailureKind)
 }
 
-/** Builds the fixed-copy payload for an approval-needed notification. */
-export function buildApprovalPayload(): PushPayload {
+/** Run IDs admitted into a push route: UUIDs and other short URL-safe identifiers (`\w` is ASCII-only here). */
+const RUN_ID_PATTERN = /^[\w-]{1,128}$/
+
+/**
+ * Builds the fixed-copy payload for an approval-needed notification. The run ID deep-links to
+ * `/operator#<runId>` only when it matches `RUN_ID_PATTERN`; anything else routes to `/` with no
+ * `runId`. The tool name, command, repo and prompt must never reach a push payload.
+ *
+ * The link opens the waiting run's card. A web-scope approval can be decided there; a Discord-scope
+ * approval registers under the thread ID, so the card shows the run waiting and the decision stays
+ * in Discord — the same deep link a question push gives today.
+ */
+export function buildApprovalPayload(runId: string): PushPayload {
   return {
     title: 'operator.approval_needed.title',
     body: 'operator.approval_needed.body',
-    data: {type: 'approval', route: '/'},
+    data: RUN_ID_PATTERN.test(runId)
+      ? {type: 'approval', route: `/operator#${encodeURIComponent(runId)}`, runId}
+      : {type: 'approval', route: '/'},
   }
 }
-
-/** Run IDs admitted into a push route: UUIDs and other short URL-safe identifiers (`\w` is ASCII-only here). */
-const RUN_ID_PATTERN = /^[\w-]{1,128}$/
 
 /**
  * Builds the fixed-copy payload for an agent-question notification. The run ID

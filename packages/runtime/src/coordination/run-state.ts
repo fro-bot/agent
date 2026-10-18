@@ -76,8 +76,10 @@ export function parseRunState(data: string): Result<RunState, Error> {
     }
 
     return ok(parsed)
-  } catch (error) {
-    return err(error instanceof Error ? error : new Error(String(error)))
+  } catch {
+    // Fixed text, never the parser's own message: V8 `JSON.parse` errors quote a source excerpt, and the
+    // record can carry operator-authored text (the launch prompt). Every caller logs `error.message`.
+    return err(new Error('Run-state payload is not valid JSON'))
   }
 }
 

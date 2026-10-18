@@ -1,4 +1,5 @@
 import type {RunState} from '@fro-bot/runtime'
+import type {OperatorProviderFailureReason} from './provider-failure-reason.js'
 import type {OperatorFailureKind, OperatorRunStatus, OperatorWebStatus} from './run-status.js'
 
 import {assert, describe, expect, expectTypeOf, it} from 'vitest'
@@ -626,6 +627,18 @@ describe('toOperatorFailureKind — allowlist mapping', () => {
     },
   )
 
+  it.each(['toString', 'constructor', '__proto__', 'hasOwnProperty', 'valueOf', 'isPrototypeOf'])(
+    "(security) prototype key '%s' maps to 'unknown' (never resolves to a prototype member)",
+    prototypeKey => {
+      // #given a string naming an Object.prototype member, which a plain-object index would resolve
+      // #when mapped
+      const result = toOperatorFailureKind(prototypeKey)
+
+      // #then it is an unrecognized string, so 'unknown' — not a function or object
+      expect(result).toBe('unknown')
+    },
+  )
+
   it("(edge) empty string '' maps to 'unknown' (not undefined — present but unrecognized)", () => {
     // #given an empty-string failure-kind value (distinct from absent/undefined)
     // #when mapped
@@ -698,5 +711,123 @@ describe('barrel re-exports', () => {
     // #when the failure-kind mapper is accessed
     // #then it is present and callable
     expect(typeof barrel.toOperatorFailureKind).toBe('function')
+  })
+})
+
+describe('OperatorRunStatus — contract 1.12.0 providerFailureReason', () => {
+  it('declares providerFailureReason as an optional wire enum and no prompt field', () => {
+    // #given the 1.12.0 status DTO
+    // #when inspected at the type level
+    // #then the reason is optional and typed to the contract; the prompt never rides the status frame
+    expectTypeOf<OperatorRunStatus['providerFailureReason']>().toEqualTypeOf<
+      OperatorProviderFailureReason | undefined
+    >()
+    expectTypeOf<OperatorRunStatus>().not.toHaveProperty('prompt')
+  })
+})
+
+describe('toOperatorRunStatus — providerFailureReason (1.12.0)', () => {
+  const failedProvider = (reason: unknown, overrides: Partial<RunState> = {}): RunState =>
+    makeRunState({
+      phase: 'FAILED',
+      details: {failureKind: 'session-error', providerFailureReason: reason},
+      ...overrides,
+    })
+
+  it.each(['provider-auth-unavailable', 'model-not-available', 'provider-rejected-request', 'unclassified'] as const)(
+    'projects the stored wire reason %s for a FAILED session-error run',
+    reason => {
+      // #given a FAILED session-error run carrying a known wire reason
+      // #when projected
+      const result = toOperatorRunStatus(failedProvider(reason), BASE_OPTS)
+
+      // #then it is on the status next to failureKind
+      assert(result !== null)
+      expect(result.providerFailureReason).toBe(reason)
+      expect(result.failureKind).toBe('session-error')
+    },
+  )
+
+  it.each([
+    [
+      'a reason on an EXECUTING run',
+      makeRunState({details: {failureKind: 'session-error', providerFailureReason: 'unclassified'}}),
+    ],
+    [
+      'a reason on a COMPLETED run',
+      makeRunState({
+        phase: 'COMPLETED',
+        details: {failureKind: 'session-error', providerFailureReason: 'unclassified'},
+      }),
+    ],
+    [
+      'a reason with failureKind unreachable',
+      makeRunState({phase: 'FAILED', details: {failureKind: 'unreachable', providerFailureReason: 'unclassified'}}),
+    ],
+    ['a reason with no failureKind', makeRunState({phase: 'FAILED', details: {providerFailureReason: 'unclassified'}})],
+    ['a bogus reason string', failedProvider('quota-exhausted')],
+    ['the internal spaced spelling', failedProvider('provider auth unavailable')],
+    ['a numeric reason', failedProvider(7)],
+    ['an object reason', failedProvider({reason: 'unclassified'})],
+    ['a prototype key', failedProvider('constructor')],
+  ])('omits the reason for %s but keeps the row', (_label, runState) => {
+    // #given a tampered or out-of-gate stored value
+    // #when projected
+    const result = toOperatorRunStatus(runState, BASE_OPTS)
+
+    // #then the row is kept and the field is not a key at all
+    assert(result !== null)
+    expect(result).not.toHaveProperty('providerFailureReason')
+  })
+
+  it('has the exact key set for FAILED with a reason, and for a non-FAILED run', () => {
+    // #given a FAILED provider failure and an executing run
+    const failed = toOperatorRunStatus(failedProvider('unclassified'), BASE_OPTS)
+    const running = toOperatorRunStatus(makeRunState(), BASE_OPTS)
+
+    // #then FAILED carries exactly the reason in addition; the running run never has it
+    assert(failed !== null && running !== null)
+    expect(Object.keys(failed).sort()).toEqual(
+      [
+        'entityRef',
+        'failureKind',
+        'phase',
+        'providerFailureReason',
+        'runId',
+        'stale',
+        'startedAt',
+        'status',
+        'surface',
+      ].sort(),
+    )
+    expect(Object.keys(running).sort()).toEqual(
+      ['entityRef', 'phase', 'runId', 'stale', 'startedAt', 'status', 'surface'].sort(),
+    )
+  })
+
+  it('projects a 1.11-shaped FAILED record (no reason) without the field', () => {
+    // #given a record written before 1.12.0
+    const legacy = makeRunState({phase: 'FAILED', details: {failureKind: 'session-error'}})
+
+    // #when projected
+    const result = toOperatorRunStatus(legacy, BASE_OPTS)
+
+    // #then failureKind survives and the reason is simply absent
+    assert(result !== null)
+    expect(result.failureKind).toBe('session-error')
+    expect(result).not.toHaveProperty('providerFailureReason')
+  })
+
+  it('never puts the prompt on the status frame', () => {
+    // #given a record carrying a launch prompt
+    const runState = failedProvider('unclassified', {
+      details: {failureKind: 'session-error', providerFailureReason: 'unclassified', operatorPrompt: 'SENTINEL-PROMPT'},
+    })
+
+    // #when projected
+    const result = toOperatorRunStatus(runState, BASE_OPTS)
+
+    // #then it is nowhere in the output
+    expect(JSON.stringify(result)).not.toContain('SENTINEL-PROMPT')
   })
 })

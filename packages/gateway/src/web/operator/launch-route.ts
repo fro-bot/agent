@@ -15,11 +15,15 @@
  *   1. Guard (browser/session/allowlist/CSRF) — installed by buildOperatorApp
  *   2. Operator rate limit (3/min, 10/hr, operator-keyed)
  *   3. Resolve session identity (display login for requester attribution)
- *   4. Parse and validate request body {repo, prompt, idempotencyKey?}
- *   5. resolveRepoAccess — name validation, ONE server-owned binding read, then the
+ *   4. Parse and validate request body {repo, prompt, idempotencyKey?}: types, owner/repo shape
+ *   5. Prompt checks, BEFORE repo access: length cap (OPERATOR_LAUNCH_PROMPT_MAX_LENGTH, UTF-16 code
+ *      units → 400 `prompt-too-long`), then empty fail-fast (→ 400 `prompt is required`). They depend on
+ *      nothing the server owns, so a bound, unbound and denylisted repo all get the same answer and the
+ *      prompt checks cannot be used to probe which repos exist.
+ *   6. resolveRepoAccess — name validation, ONE server-owned binding read, then the
  *      denylist (never trust the client); anything but `allowed` → 404
- *   6. Empty-prompt fail-fast
- *   7. Per-operator idempotency guard (${githubUserId}:${clientKey})
+ *   7. Per-operator idempotency guard (${githubUserId}:${clientKey}). A repeated key with a different
+ *      prompt echoes the FIRST run; the later prompt is discarded (first launch wins).
  *   8. Generate runId + reserve idempotency key (if present)
  *   9. Await launchWork admission (returns LaunchAdmission, not the full run)
  *  10. On accepted: commit idempotency + return 202 {runId}
@@ -33,7 +37,8 @@
  *     GitHub call is made and the operator's identity is never used against GitHub.
  *   - Per-operator idempotency: key is namespaced ${githubUserId}:${clientKey}
  *     so operator A cannot suppress operator B's launch.
- *   - No token/prompt/path/internal-id in responses or logs.
+ *   - No token/prompt/path/internal-id in responses or logs. Error logs record the error name, never
+ *     the message (a parse error can quote a prompt-bearing record).
  *   - CSRF/Origin middleware covers this POST route (write route).
  *   - Rate limit is operator-keyed (not per-repo).
  */
@@ -51,6 +56,10 @@ import type {IdempotencyGuard} from './idempotency.js'
 import {randomUUID} from 'node:crypto'
 import {launchWork} from '../../execute/run.js'
 import {createRateLimiter} from '../../http/rate-limit.js'
+import {
+  OPERATOR_LAUNCH_PROMPT_MAX_LENGTH,
+  OPERATOR_LAUNCH_PROMPT_TOO_LONG,
+} from '../../operator-contract/launch-prompt.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
 import {notFoundResponse, rateLimitedResponse} from '../safe-response.js'
 import {IDEMPOTENCY_KEY_MAX_LENGTH} from './idempotency.js'
@@ -241,7 +250,19 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
     const idempotencyKey =
       typeof idempotencyKeyField === 'string' && idempotencyKeyField.length > 0 ? idempotencyKeyField : undefined
 
-    // ── Gate 5: Repo access (bound AND not denylisted, fail-closed) ───────────
+    // ── Gate 5: Prompt checks (cap, then empty) — BEFORE repo access ─────────────
+    // Nothing here depends on server-owned state, so the answer is identical for a bound, an unbound and a
+    // denylisted repo. The cap counts UTF-16 code units (`.length`) and nothing is ever truncated.
+    if (promptField.length > OPERATOR_LAUNCH_PROMPT_MAX_LENGTH) {
+      deps.logger.warn({githubUserId, gate: OPERATOR_LAUNCH_PROMPT_TOO_LONG}, 'launch: denied — prompt too long')
+      return c.json({error: 'bad request', reason: OPERATOR_LAUNCH_PROMPT_TOO_LONG}, 400)
+    }
+    if (promptField.trim().length === 0) {
+      deps.logger.warn({githubUserId, gate: 'empty-prompt'}, 'launch: denied — empty prompt')
+      return c.json({error: 'prompt is required'}, 400)
+    }
+
+    // ── Gate 6: Repo access (bound AND not denylisted, fail-closed) ───────────
     // The server resolves the binding via getBindingByRepo (one read); client-supplied
     // binding/path/owner is ignored. A malformed name makes zero store calls. Unbound,
     // denylisted and store-unavailable repos share one 404 body; unbound and denylisted
@@ -255,12 +276,6 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
       return notFoundResponse(c)
     }
     const binding = access.binding
-
-    // ── Gate 6: Empty-prompt fail-fast ─────────────────────────────────────
-    if (promptField.trim().length === 0) {
-      deps.logger.warn({githubUserId, gate: 'empty-prompt'}, 'launch: denied — empty prompt')
-      return c.json({error: 'prompt is required'}, 400)
-    }
 
     // ── Gate 7: Per-operator idempotency guard ────────────────────────────────
     // Key is namespaced: ${githubUserId}:${clientKey} so operator A cannot
@@ -330,6 +345,8 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
 
     const request = {
       promptText: promptField,
+      // The operator's text is shown back on the run card, so launchWork stores it as submitted.
+      persistOperatorPrompt: true,
       runId,
       channelId: `web:${owner}/${repo}`,
       guildId: undefined,
@@ -369,6 +386,12 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
         return c.json({error: 'unavailable'}, 503)
       }
 
+      // The route already enforces the cap above; launchWork re-checks at the persistence boundary.
+      if (admission.reason === OPERATOR_LAUNCH_PROMPT_TOO_LONG) {
+        deps.logger.warn({githubUserId, owner, repo, gate: admission.reason}, 'launch: rejected — prompt too long')
+        return c.json({error: 'bad request', reason: OPERATOR_LAUNCH_PROMPT_TOO_LONG}, 400)
+      }
+
       // 'empty-prompt' — defensive; the route already validates empty prompt above.
       deps.logger.warn({githubUserId, owner, repo, gate: 'empty-prompt'}, 'launch: rejected — empty prompt')
       return c.json({error: 'bad request'}, 400)
@@ -379,7 +402,8 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
           runId,
           owner,
           repo,
-          err: launchError instanceof Error ? launchError.message : String(launchError),
+          // The error NAME only: a message can quote prompt-bearing record text.
+          err: launchError instanceof Error ? launchError.name : typeof launchError,
         },
         'launch: launchWork threw — rolling back idempotency',
       )

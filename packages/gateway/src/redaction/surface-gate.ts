@@ -227,6 +227,7 @@ function toClosedStatus(status: OperatorRunStatus): OperatorRunStatus {
     startedAt,
     stale,
     failureKind,
+    providerFailureReason,
     checkoutProvenance,
     checkoutPreparation,
     ...uncopied
@@ -242,6 +243,7 @@ function toClosedStatus(status: OperatorRunStatus): OperatorRunStatus {
     startedAt,
     stale,
     ...(failureKind === undefined ? {} : {failureKind}),
+    ...(providerFailureReason === undefined ? {} : {providerFailureReason}),
     ...(checkoutProvenance === undefined ? {} : {checkoutProvenance}),
     ...(checkoutPreparation === undefined ? {} : {checkoutPreparation}),
   }

@@ -8,6 +8,7 @@ import type {RequestGate} from '../approvals/request-gate.js'
 import type {RepoBinding} from '../bindings/types.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {SinkThread} from '../discord/streaming.js'
+import type {OperatorProviderFailureReason} from '../operator-contract/provider-failure-reason.js'
 import type {OperatorFailureKind} from '../operator-contract/run-status.js'
 import type {EnsureCloneFailure} from '../workspace-api/ensure-clone.js'
 import type {
@@ -45,6 +46,15 @@ import {setRunReaction} from '../discord/reactions.js'
 import {buildRecoverEntryButton} from '../discord/recover-checkout-button.js'
 import {createStatusController} from '../discord/status-message.js'
 import {createDiscordStreamSink} from '../discord/streaming.js'
+import {
+  OPERATOR_LAUNCH_PROMPT_MAX_LENGTH,
+  OPERATOR_LAUNCH_PROMPT_TOO_LONG,
+  OPERATOR_PROMPT_DETAILS_KEY,
+} from '../operator-contract/launch-prompt.js'
+import {
+  PROVIDER_FAILURE_REASON_DETAILS_KEY,
+  toOperatorProviderFailureReason,
+} from '../operator-contract/provider-failure-reason.js'
 import {toOperatorFailureKind} from '../operator-contract/run-status.js'
 import {canonicalWorkspaceTarget} from '../workspace-api/client.js'
 import {abortRegistry} from './abort-registry.js'
@@ -222,7 +232,7 @@ export interface RunMentionDeps {
    * push fully inert (a no-op) when absent — push stays disabled-by-default.
    */
   readonly operatorPushDispatcher?: {
-    readonly dispatchApprovalPending: (approvalId: string) => Promise<void>
+    readonly dispatchApprovalPending: (approvalId: string, runId: string) => Promise<void>
     /** Optional so fakes that only exercise the approval and run-failed nudges stay valid. */
     readonly dispatchQuestionPending?: (runId: string) => Promise<void>
     readonly dispatchRunFailed: (runId: string, failureLabel?: OperatorFailureKind) => Promise<void>
@@ -558,8 +568,48 @@ export function computeApprovalDeadlineMs(remainingBudgetMs: number): number | u
  * rather than persisting a synthetic 'unknown' string — the projection
  * already renders an absent field as no failure reason.
  */
-function extractRunCoreKind(execError: unknown): string | undefined {
+function extractRunCoreKind(execError: unknown): RunCoreErrorKind | undefined {
   return execError instanceof RunCoreError ? execError.kind : undefined
+}
+
+/**
+ * The provider failure reason to persist on a FAILED run-state (`details.providerFailureReason`), as the
+ * WIRE value — the internal spaced spelling never reaches the record.
+ *
+ * Reads the typed `RunCoreError.providerFailureReason` property (never the message) and returns it only for
+ * a `session-error`: the reason refines that kind and means nothing on any other. Anything else — a
+ * non-`RunCoreError`, another kind, or no reason — returns `undefined` and nothing is written.
+ */
+function extractProviderFailureReason(execError: unknown): OperatorProviderFailureReason | undefined {
+  if (execError instanceof RunCoreError && execError.kind === 'session-error') {
+    return execError.providerFailureReason === undefined
+      ? undefined
+      : toOperatorProviderFailureReason(execError.providerFailureReason)
+  }
+  return undefined
+}
+
+/**
+ * The `details` patch for a terminal FAILED write driven by an execution error: the internal
+ * `failureKind` plus, for a provider-classified `session-error`, the wire `providerFailureReason`.
+ * `undefined` when the error carries neither. Only the three execution-failure terminal sites use this;
+ * preparation failure, `failAdmittedRun`, recovery and maintenance never write a reason.
+ *
+ * The return type is an inline object literal type on purpose: an interface or a named alias would not stay
+ * assignable to the `Record<string, unknown>` `detailsPatch` parameter, and a named alias gets rewritten to an
+ * interface by `eslint --fix`.
+ */
+function failureDetailsPatch(
+  execError: unknown,
+):
+  {readonly failureKind: RunCoreErrorKind; readonly providerFailureReason?: OperatorProviderFailureReason} | undefined {
+  const failureKind = extractRunCoreKind(execError)
+  if (failureKind === undefined) return undefined
+  const providerFailureReason = extractProviderFailureReason(execError)
+  return {
+    failureKind,
+    ...(providerFailureReason === undefined ? {} : {[PROVIDER_FAILURE_REASON_DETAILS_KEY]: providerFailureReason}),
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1361,7 +1411,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           // Operator push — fire-and-forget, opt-in, and last so it can never
           // preempt the real approval transports above. No-op when push is disabled.
           // eslint-disable-next-line no-void
-          void deps.operatorPushDispatcher?.dispatchApprovalPending(req.requestID)
+          void deps.operatorPushDispatcher?.dispatchApprovalPending(req.requestID, runId)
         },
         onReplied: event => {
           // Authoritative echo from OpenCode — let the registry render + cascade.
@@ -1515,13 +1565,18 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       // racy. The registry's own controller state is ground truth (see abort-registry.ts).
       const wasCancelled = abortRegistry.isAborted(runId)
 
+      const loggedProviderFailureReason = extractProviderFailureReason(execError)
+
       logger.error(
         {
           repo,
           runId,
           kind: isCoreError ? execError.kind : 'unknown',
+          // The closed reason is operator-safe fixed text, so it may be logged for correlation.
+          ...(loggedProviderFailureReason === undefined ? {} : {providerFailureReason: loggedProviderFailureReason}),
           cancelled: wasCancelled,
-          err: execError instanceof Error ? execError.message : String(execError),
+          // The error NAME only: the message can quote prompt-bearing or provider text.
+          err: execError instanceof Error ? execError.name : typeof execError,
         },
         wasCancelled === true ? 'run: execution aborted by operator cancel' : 'run: execution failed',
       )
@@ -1541,13 +1596,13 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         statusSink.setReaction('failed')
 
         const quarantineFailureKind = extractRunCoreKind(execError)
+        // failureKind and, for a provider failure, the wire reason: built once so the 412 retry below
+        // (which reuses this patch) persists the reason exactly like the first attempt.
         const quarantineDetailsPatch: Record<string, unknown> = {
           quarantined: true,
           // Audit evidence for a later takeover decision; not consulted for any gating.
           quarantineHoldUntil: new Date(Date.now() + QUARANTINE_HOLD_WINDOW_MS).toISOString(),
-        }
-        if (quarantineFailureKind !== undefined) {
-          quarantineDetailsPatch.failureKind = quarantineFailureKind
+          ...failureDetailsPatch(execError),
         }
         const quarantineResult = await transitionRun(
           coordinationConfig,
@@ -1754,8 +1809,9 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
             // still the caught throw and is classified here for the rare CANCELLED→FAILED
             // fallback (usually an AbortError → no RunCoreError.kind → failureKind omitted).
             const fallbackFailureKind = extractRunCoreKind(execError)
+            const fallbackDetailsPatch = failureDetailsPatch(execError)
             const fallbackOptions =
-              fallbackFailureKind === undefined ? undefined : {detailsPatch: {failureKind: fallbackFailureKind}}
+              fallbackDetailsPatch === undefined ? undefined : {detailsPatch: fallbackDetailsPatch}
             const failedFallbackResult = await transitionRun(
               coordinationConfig,
               identity,
@@ -1813,8 +1869,9 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         // Transition to FAILED (best-effort), carrying the classified failure kind
         // atomically with the phase write so the operator projections can read it back.
         const inFlightFailureKind = extractRunCoreKind(execError)
+        const inFlightDetailsPatch = failureDetailsPatch(execError)
         const inFlightFailedOptions =
-          inFlightFailureKind === undefined ? undefined : {detailsPatch: {failureKind: inFlightFailureKind}}
+          inFlightDetailsPatch === undefined ? undefined : {detailsPatch: inFlightDetailsPatch}
         const failedResult = await transitionRun(
           coordinationConfig,
           identity,
@@ -2129,6 +2186,14 @@ export async function launchWork(request: LaunchWorkRequest, deps: RunMentionDep
     return {accepted: false, reason: 'empty-prompt'}
   }
 
+  // ── Persistence bound (opt-in callers only) ──────────────────────────────────
+  // This is the boundary that writes the prompt to the run record, so it enforces the contract bound itself
+  // even if a caller skipped its own check. Discord and other callers do not opt in and are unaffected.
+  // No sink is notified: the prompt is operator-authored and stays out of replies.
+  if (request.persistOperatorPrompt === true && request.promptText.length > OPERATOR_LAUNCH_PROMPT_MAX_LENGTH) {
+    return {accepted: false, reason: OPERATOR_LAUNCH_PROMPT_TOO_LONG}
+  }
+
   // ── Decide disposition FIRST (before admitting) ──────────────────────────────
   // The FIFO gate and concurrency cap determine disposition without creating any run-state.
   // Only after we know the run will be accepted do we run the admission block.
@@ -2167,19 +2232,29 @@ export async function launchWork(request: LaunchWorkRequest, deps: RunMentionDep
     started_at: now,
     last_heartbeat: now,
     holder_id: identity,
-    details: {channelId, owner: binding.owner, repo: binding.repo},
+    details: {
+      channelId,
+      owner: binding.owner,
+      repo: binding.repo,
+      // The operator's text exactly as submitted — never the built prompt or the provenance-wrapped text.
+      ...(request.persistOperatorPrompt === true ? {[OPERATOR_PROMPT_DETAILS_KEY]: request.promptText} : {}),
+    },
   }
 
   const createResult = await createRun(coordinationConfig, identity, repo, initialRunState, coordLogger)
   if (createResult.success === false) {
-    logger.error({repo, runId, err: createResult.error.message}, 'run: createRun failed during admission')
+    // The error NAME only: the record being written carries the operator's prompt, and an adapter error
+    // can echo request text.
+    logger.error({repo, runId, err: createResult.error.name}, 'run: createRun failed during admission')
     await request.replySink.send('source', {content: 'Could not start the task — please try again.'})
     // Capacity was acquired (slotResult === 'ok') — release it since we're not proceeding.
     if (slotResult === 'ok') {
       concurrency.release(channelId)
     }
     // createRun failed — no run-state to terminalize; just reject admission.
-    throw new Error(`createRun failed: ${createResult.error.message}`)
+    // The adapter message can quote the record being written (it carries the operator's prompt), so the thrown
+    // message names the error type only and no `cause` is attached.
+    throw new Error(`createRun failed: ${createResult.error.name}`)
   }
 
   const adoptionEtag = createResult.data.etag
@@ -2198,7 +2273,7 @@ export async function launchWork(request: LaunchWorkRequest, deps: RunMentionDep
   } catch (admissionError: unknown) {
     // Fail-closed: terminalize the run to FAILED before propagating.
     logger.error(
-      {repo, runId, err: admissionError instanceof Error ? admissionError.message : String(admissionError)},
+      {repo, runId, err: admissionError instanceof Error ? admissionError.name : typeof admissionError},
       'run: admission block threw after createRun — terminalizing to FAILED',
     )
     await failAdmittedRun(deps, repo, runId, adoptionEtag)
@@ -2259,6 +2334,14 @@ export async function launchWork(request: LaunchWorkRequest, deps: RunMentionDep
 // ---------------------------------------------------------------------------
 
 /**
+ * The error NAME for a log line. The observer receives the run record, which carries the operator's prompt for a
+ * web launch, so an error from it can quote that record in its message and `String(error)` would log it.
+ */
+function errorNameOf(error: unknown): string {
+  return error instanceof Error ? error.name : typeof error
+}
+
+/**
  * Notify the observation pipeline of a run-state transition.
  * Fire-and-forget: neither a sync throw nor an async rejection must abort the caller.
  */
@@ -2266,10 +2349,10 @@ function notifyObserverBestEffort(deps: RunMentionDeps, state: RunState): void {
   const logger = deps.logger
   try {
     deps.runObserver?.observe(state)?.catch((error: unknown) => {
-      logger.warn({err: String(error)}, 'run: runObserver.observe failed')
+      logger.warn({err: errorNameOf(error)}, 'run: runObserver.observe failed')
     })
   } catch (observeError: unknown) {
-    logger.warn({err: String(observeError)}, 'run: runObserver.observe threw — continuing (best-effort)')
+    logger.warn({err: errorNameOf(observeError)}, 'run: runObserver.observe threw — continuing (best-effort)')
   }
 }
 

@@ -95,10 +95,14 @@ vi.mock('./run-core.js', () => ({
   RunCoreError: class RunCoreError extends Error {
     readonly kind: string
     readonly quarantined: boolean
-    constructor(kind: string, message: string, quarantined = false) {
+    readonly providerFailureReason?: string
+    constructor(kind: string, message: string, quarantined = false, providerFailureReason?: string) {
       super(message)
       this.kind = kind
       this.quarantined = quarantined
+      if (providerFailureReason !== undefined) {
+        this.providerFailureReason = providerFailureReason
+      }
       this.name = 'RunCoreError'
     }
   },

@@ -120,8 +120,13 @@ const status =
 const result: OperatorRunStatus = {
   runId: base.runId, entityRef: base.entityRef, surface: base.surface,
   phase: base.phase, status, startedAt: base.startedAt, stale: base.stale,
+  // optional fields are keys only when present, each copied explicitly
+  ...(base.failureKind === undefined ? {} : {failureKind: base.failureKind}),
+  ...(base.providerFailureReason === undefined ? {} : {providerFailureReason: base.providerFailureReason}),
 }
 ```
+
+`providerFailureReason` is a closed wire enum, read through a gate that requires a `FAILED` run, an internal `failureKind` of `session-error` and a known value; anything else is dropped and the row is kept. The launch prompt is deliberately not a field of this DTO: it is projected only onto the run summary, so the status frame stays status-only.
 
 A status overlay (e.g. `waiting_for_approval`) must be guarded so it can only override a non-terminal status — never mask a `COMPLETED`/`FAILED` run.
 
