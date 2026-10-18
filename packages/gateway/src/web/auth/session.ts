@@ -178,6 +178,15 @@ function generateSessionId(): string {
 // Durable session store
 // ---------------------------------------------------------------------------
 
+/**
+ * Passed to the revoke hook only when load replays a revoke. A subscription activated or updated at or after
+ * `replayFenceMs` (the moment load began) belongs to a session that started after the replay, and the replay
+ * must leave it alone.
+ */
+export interface SessionRevokedContext {
+  readonly replayFenceMs: number
+}
+
 export interface DurableSessionStoreDeps {
   readonly persistence: SessionPersistence
   readonly clock: () => number
@@ -188,18 +197,22 @@ export interface DurableSessionStoreDeps {
   /**
    * Fires once per revocation with the user's ID, including for restored sessions. It does not fire for
    * rotation, TTL expiry or an ID that is not in memory. Load replays it once per user whose revoked record
-   * is stored, until `revokedAt` plus the TTL, and who has no live restored session. It must be idempotent.
+   * is stored, until `revokedAt` plus the TTL, and who has no live restored session. A replay passes a
+   * {@link SessionRevokedContext}; a live revoke passes none. It must be idempotent.
    */
-  readonly onSessionRevoked?: (githubUserId: number) => void
+  readonly onSessionRevoked?: (githubUserId: number, context?: SessionRevokedContext) => void
   /** Live-session cap. Defaults to {@link SESSION_MAX_ENTRIES}. */
   readonly maxEntries?: number
 }
+
+/** `rotated` is a same-user re-login's retire of the old session; an explicit revoke can still follow it. */
+type DurableEntryStatus = 'active' | 'rotated' | 'revoked'
 
 interface DurableEntry {
   readonly githubUserId: number
   readonly login: string
   readonly issuedAt: number
-  revoked: boolean
+  status: DurableEntryStatus
 }
 
 /** Retry-After for a logout whose durable revoke failed. */
@@ -232,7 +245,7 @@ export function createDurableSessionStore(deps: DurableSessionStoreDeps): Durabl
   function removeDead(): number {
     let removed = 0
     for (const [key, entry] of entries) {
-      if (entry.revoked || isExpired(entry)) {
+      if (entry.status !== 'active' || isExpired(entry)) {
         entries.delete(key)
         removed += 1
       }
@@ -240,9 +253,18 @@ export function createDurableSessionStore(deps: DurableSessionStoreDeps): Durabl
     return removed
   }
 
-  function fireHook(githubUserId: number): void {
+  /** The status now, not the one narrowed before an await: another revoke may have changed it meanwhile. */
+  function statusOf(entry: DurableEntry): DurableEntryStatus {
+    return entry.status
+  }
+
+  function fireHook(githubUserId: number, context?: SessionRevokedContext): void {
     try {
-      deps.onSessionRevoked?.(githubUserId)
+      if (context === undefined) {
+        deps.onSessionRevoked?.(githubUserId)
+      } else {
+        deps.onSessionRevoked?.(githubUserId, context)
+      }
     } catch {
       // A hook failure must not undo a revoke that is already durable.
       logger.warn({errorClass: 'hook_threw'}, 'session revoked hook threw')
@@ -282,14 +304,14 @@ export function createDurableSessionStore(deps: DurableSessionStoreDeps): Durabl
       githubUserId: identity.githubUserId,
       login: identity.login,
       issuedAt,
-      revoked: false,
+      status: 'active',
     })
     return {outcome: 'ok', sessionId}
   }
 
   function get(sessionId: string): DurableSession | undefined {
     const entry = entries.get(hashSessionId(sessionId))
-    if (entry === undefined || entry.revoked || isExpired(entry)) {
+    if (entry === undefined || entry.status !== 'active' || isExpired(entry)) {
       return undefined
     }
     return {githubUserId: entry.githubUserId, login: entry.login, issuedAt: entry.issuedAt}
@@ -298,11 +320,13 @@ export function createDurableSessionStore(deps: DurableSessionStoreDeps): Durabl
   async function revoke(sessionId: string, options?: DurableRevokeOptions): Promise<DurableRevokeResult> {
     const keyHash = hashSessionId(sessionId)
     const entry = entries.get(keyHash)
-    if (entry?.revoked === true) {
+    const rotate = options?.rotate === true
+    // `revoked` is final. A rotation has nothing to add to a rotated or revoked session, but an explicit revoke
+    // must still persist and fire the hook after a rotation.
+    if (entry?.status === 'revoked' || (rotate && entry?.status === 'rotated')) {
       return {outcome: 'ok'}
     }
 
-    const rotate = options?.rotate === true
     const persisted = await persistence.revoke(keyHash, rotate ? 'rotated' : 'revoked')
     if (persisted.success === false) {
       emitAudit(
@@ -321,10 +345,16 @@ export function createDurableSessionStore(deps: DurableSessionStoreDeps): Durabl
       return {outcome: 'persist_failed'}
     }
 
-    // Re-check after the await: a concurrent revoke of the same session may have fired the hook already.
-    if (entry !== undefined && entry.revoked === false) {
-      entry.revoked = true
-      if (rotate === false) {
+    // Re-check after the await: a concurrent revoke of the same session may have fired the hook already, and a
+    // rotation that lands after an explicit revoke must not downgrade it.
+    if (entry !== undefined) {
+      const latest = statusOf(entry)
+      if (rotate) {
+        if (latest === 'active') {
+          entry.status = 'rotated'
+        }
+      } else if (latest !== 'revoked') {
+        entry.status = 'revoked'
         fireHook(entry.githubUserId)
       }
     }
@@ -368,6 +398,7 @@ export function createDurableSessionStore(deps: DurableSessionStoreDeps): Durabl
 
   async function load(): Promise<Result<SessionRestoreSummary, SessionRestoreFailure>> {
     ready = false
+    const replayFenceMs = clock()
     const selfTest = await persistence.selfTest()
     if (selfTest.success === false) {
       return failRestore({phase: 'self_test', errorClass: selfTest.error.errorClass})
@@ -412,7 +443,7 @@ export function createDurableSessionStore(deps: DurableSessionStoreDeps): Durabl
         githubUserId: session.githubUserId,
         login: session.login,
         issuedAt: session.issuedAt,
-        revoked: false,
+        status: 'active',
       })
     }
     ready = true
@@ -428,7 +459,7 @@ export function createDurableSessionStore(deps: DurableSessionStoreDeps): Durabl
     let replayedUsers = 0
     for (const githubUserId of revokedUsers) {
       if (liveUsers.has(githubUserId) === false) {
-        fireHook(githubUserId)
+        fireHook(githubUserId, {replayFenceMs})
         replayedUsers += 1
       }
     }

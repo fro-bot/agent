@@ -135,8 +135,9 @@ export interface CreateSessionRecordInput {
 }
 
 /**
- * - `written`: the record was re-signed with the new status.
- * - `already`: the record was no longer active, so nothing was written.
+ * - `written`: the record was re-signed with the new status. An `active` record accepts either status; a
+ *   `rotated` record accepts `revoked`.
+ * - `already`: the record already holds that status or a final one (`revoked`), so nothing was written.
  * - `absent`: no record exists (404). The session is already gone.
  * - `invalid`: the record is unreadable or fails its MAC. Load drops it anyway, so nothing was written.
  */
@@ -188,7 +189,10 @@ export interface SweepCounts {
 export interface SessionPersistence {
   /** Create-if-absent. A second create for the same session ID fails with kind `conflict`. */
   readonly create: (input: CreateSessionRecordInput) => Promise<Result<void, SessionPersistenceError>>
-  /** CAS status change by key hash. 404 is done; 412 re-reads, up to the attempt bound. */
+  /**
+   * CAS status change by key hash. 404 is done; 412 re-reads, up to the attempt bound. `rotated` to `revoked`
+   * is allowed and refreshes `revokedAt`; `revoked` to `rotated` never is.
+   */
   readonly revoke: (
     keyHash: string,
     status: Exclude<SessionRecordStatus, 'active'>,
@@ -408,8 +412,9 @@ interface ScanEntry {
   readonly outcome: ReadOutcome
 }
 
-interface ScanOutput {
-  readonly entries: readonly ScanEntry[]
+interface KeyListing {
+  /** Key hashes to visit, at most `scanMaxKeys` of them. */
+  readonly keyHashes: readonly string[]
   readonly listed: number
   /** Keys under the prefix whose name is not a key hash. Counted as malformed by load. */
   readonly unrecognized: number
@@ -501,29 +506,34 @@ export function createSessionPersistence(deps: SessionPersistenceDeps): SessionP
     }
   }
 
-  async function scan(
+  /** Lists the session keys sorted, starting at `cursor` and wrapping, then applies the `scanMaxKeys` bound. */
+  async function listKeys(
     ops: SessionObjectOps,
-    state: DeadlineState,
-  ): Promise<Result<ScanOutput, SessionPersistenceError>> {
+    cursor?: string,
+  ): Promise<Result<KeyListing, SessionPersistenceError>> {
     const listed = await timedCall(async () => ops.list(`${SESSION_KEY_PREFIX}/`), operationTimeoutMs)
     if (listed.success === false) {
       return err(failureToError('list', listed.error))
     }
-    const keyHashes: string[] = []
+    const found: string[] = []
     let unrecognized = 0
     for (const key of listed.data) {
       const keyHash = keyHashFromKey(key)
       if (keyHash === null) {
         unrecognized += 1
       } else {
-        keyHashes.push(keyHash)
+        found.push(keyHash)
       }
     }
-    const truncated = Math.max(0, keyHashes.length - scanMaxKeys)
-    const entries = await runBounded(keyHashes.slice(0, scanMaxKeys), scanConcurrency, state, async keyHash =>
-      readEntry(ops, keyHash, state),
-    )
-    return ok({entries, listed: listed.data.length, unrecognized, truncated})
+    found.sort()
+    const start = cursor === undefined ? 0 : found.findIndex(keyHash => keyHash >= cursor)
+    const rotated = start <= 0 ? found : [...found.slice(start), ...found.slice(0, start)]
+    return ok({
+      keyHashes: rotated.slice(0, scanMaxKeys),
+      listed: listed.data.length,
+      unrecognized,
+      truncated: Math.max(0, rotated.length - scanMaxKeys),
+    })
   }
 
   /** Runs `work` under the overall deadline. On expiry the lanes stop and the call fails with kind `timeout`. */
@@ -601,7 +611,9 @@ export function createSessionPersistence(deps: SessionPersistenceDeps): SessionP
       if (current === null || verifySessionRecord(macKey, keyHash, current) === false) {
         return ok('invalid')
       }
-      if (current.status !== 'active') {
+      // `revoked` is final. A rotated record can still become `revoked`, so an explicit logout that loses a race
+      // to a same-user re-login is persisted and its caller fires the hook. `revoked` never becomes `rotated`.
+      if (current.status === 'revoked' || (current.status === 'rotated' && status === 'rotated')) {
         return ok('already')
       }
       const next = signSessionRecord(macKey, keyHash, {
@@ -645,7 +657,16 @@ export function createSessionPersistence(deps: SessionPersistenceDeps): SessionP
     if (ops.success === false) {
       return err(ops.error)
     }
-    const scanned = await withDeadline('load', async state => scan(ops.data, state))
+    const scanned = await withDeadline('load', async state => {
+      const listing = await listKeys(ops.data)
+      if (listing.success === false) {
+        return err(listing.error)
+      }
+      const entries = await runBounded(listing.data.keyHashes, scanConcurrency, state, async keyHash =>
+        readEntry(ops.data, keyHash, state),
+      )
+      return ok({entries, listing: listing.data})
+    })
     if (scanned.success === false) {
       return err(scanned.error)
     }
@@ -680,16 +701,16 @@ export function createSessionPersistence(deps: SessionPersistenceDeps): SessionP
     }
 
     const counts: LoadCounts = {
-      listed: scanned.data.listed,
+      listed: scanned.data.listing.listed,
       loaded: sessions.length,
       expired,
       unsigned,
       malformed,
-      unrecognized: scanned.data.unrecognized,
+      unrecognized: scanned.data.listing.unrecognized,
       futureDated,
       readFailed,
       absent,
-      truncated: scanned.data.truncated,
+      truncated: scanned.data.listing.truncated,
     }
     logger.info({...counts}, 'operator session load scanned stored records')
     return ok({sessions, counts})
@@ -699,92 +720,118 @@ export function createSessionPersistence(deps: SessionPersistenceDeps): SessionP
   // sweep
   // -------------------------------------------------------------------------
 
+  // Where the next sweep starts: the first key a deadline-cut sweep had not finished. In memory only; a restart
+  // begins again at the first key. Without it, live records at the head of the listing could use every sweep's
+  // whole deadline and starve the records behind them.
+  let sweepCursor: string | undefined
+
   async function sweep(): Promise<Result<SweepCounts, SessionPersistenceError>> {
     const ops = narrowAdapter(adapter)
     if (ops.success === false) {
       return err(ops.error)
     }
-    const swept = await withDeadline('sweep', async state => {
-      const scanned = await scan(ops.data, state)
-      if (scanned.success === false) {
-        return err(scanned.error)
-      }
+    const objectOps = ops.data
 
-      let kept = 0
-      let expiredFound = 0
-      let unsigned = 0
-      let malformed = 0
-      let readFailed = 0
-      let absent = 0
-      const doomed = new Map<string, string>()
-      for (const {keyHash, outcome} of scanned.data.entries) {
-        if (outcome.kind === 'absent') {
-          absent += 1
-        } else if (outcome.kind === 'failed') {
-          readFailed += 1
-        } else if (outcome.kind === 'malformed') {
-          malformed += 1
-          doomed.set(keyHash, outcome.etag)
-        } else if (outcome.macValid === false) {
-          // A record signed under another secret may still be live there, so it is deleted only once its
-          // claimed age is past the TTL. A false age claim can only keep a record, never erase a live one.
-          unsigned += 1
-          if (isLoginExpired(outcome.record.issuedAt)) {
-            doomed.set(keyHash, outcome.etag)
-          } else {
-            kept += 1
-          }
-        } else if (isPastRetention(outcome.record)) {
-          expiredFound += 1
-          doomed.set(keyHash, outcome.etag)
+    // Each record is read, classified and, when doomed, deleted by the lane that read it, with `ifMatch` on the
+    // ETag it read. Deletions therefore accrue before a deadline cuts the sweep, and a later sweep does not read
+    // what is already gone. No delete starts once the sweep is cancelled; one already in flight may finish.
+    let kept = 0
+    let expiredFound = 0
+    let unsigned = 0
+    let malformed = 0
+    let readFailed = 0
+    let absent = 0
+    let deleted = 0
+    let raced = 0
+    let deleteFailed = 0
+    let ordered: readonly string[] = []
+    const finished = new Set<string>()
+    let listing: KeyListing | undefined
+
+    async function deleteDoomed(keyHash: string, etag: string, state: DeadlineState): Promise<void> {
+      if (state.cancelled) {
+        return
+      }
+      const removed = await timedCall(
+        async () => objectOps.conditionalDelete(buildSessionKey(keyHash), {ifMatch: etag}),
+        operationTimeoutMs,
+      )
+      if (removed.success) {
+        deleted += 1
+      } else if (removed.error.reason === 'precondition_failed' || removed.error.reason === 'not_found') {
+        raced += 1
+      } else {
+        deleteFailed += 1
+      }
+    }
+
+    async function visit(keyHash: string, state: DeadlineState): Promise<void> {
+      const {outcome} = await readEntry(objectOps, keyHash, state)
+      if (outcome.kind === 'absent') {
+        absent += 1
+      } else if (outcome.kind === 'failed') {
+        readFailed += 1
+      } else if (outcome.kind === 'malformed') {
+        malformed += 1
+        await deleteDoomed(keyHash, outcome.etag, state)
+      } else if (outcome.macValid === false) {
+        // A record signed under another secret may still be live there, so it is deleted only once its
+        // claimed age is past the TTL. A false age claim can only keep a record, never erase a live one.
+        unsigned += 1
+        if (isLoginExpired(outcome.record.issuedAt)) {
+          await deleteDoomed(keyHash, outcome.etag, state)
         } else {
           kept += 1
         }
+      } else if (isPastRetention(outcome.record)) {
+        expiredFound += 1
+        await deleteDoomed(keyHash, outcome.etag, state)
+      } else {
+        kept += 1
       }
+      finished.add(keyHash)
+    }
 
-      let deleted = 0
-      let raced = 0
-      let deleteFailed = 0
-      await runBounded([...doomed.keys()], scanConcurrency, state, async keyHash => {
-        const etag = doomed.get(keyHash)
-        if (etag === undefined) {
-          return
-        }
-        const removed = await timedCall(
-          async () => ops.data.conditionalDelete(buildSessionKey(keyHash), {ifMatch: etag}),
-          operationTimeoutMs,
-        )
-        if (removed.success) {
-          deleted += 1
-        } else if (removed.error.reason === 'precondition_failed' || removed.error.reason === 'not_found') {
-          raced += 1
-        } else {
-          deleteFailed += 1
-        }
-      })
+    const swept = await withDeadline('sweep', async state => {
+      const listed = await listKeys(objectOps, sweepCursor)
+      if (listed.success === false) {
+        return err(listed.error)
+      }
+      listing = listed.data
+      ordered = listed.data.keyHashes
+      await runBounded(ordered, scanConcurrency, state, async keyHash => visit(keyHash, state))
       if (state.cancelled) {
         return err(createSessionPersistenceError('timeout', 'session sweep exceeded its deadline', 'timeout'))
       }
-      const counts: SweepCounts = {
-        listed: scanned.data.listed,
-        deleted,
-        raced,
-        deleteFailed,
-        kept,
-        expired: expiredFound,
-        unsigned,
-        malformed,
-        unrecognized: scanned.data.unrecognized,
-        readFailed,
-        absent,
-        truncated: scanned.data.truncated,
-      }
-      return ok(counts)
+      return ok(undefined)
     })
-    if (swept.success) {
-      logger.info({...swept.data}, 'operator session sweep finished')
+
+    const counts = (): SweepCounts => ({
+      listed: listing?.listed ?? 0,
+      deleted,
+      raced,
+      deleteFailed,
+      kept,
+      expired: expiredFound,
+      unsigned,
+      malformed,
+      unrecognized: listing?.unrecognized ?? 0,
+      readFailed,
+      absent,
+      truncated: listing?.truncated ?? 0,
+    })
+
+    if (swept.success === false) {
+      if (swept.error.kind === 'timeout' && ordered.length > 0) {
+        sweepCursor = ordered.find(keyHash => finished.has(keyHash) === false)
+        logger.info({...counts()}, 'operator session sweep hit its deadline; deletions so far are kept')
+      }
+      return err(swept.error)
     }
-    return swept
+    sweepCursor = undefined
+    const result = counts()
+    logger.info({...result}, 'operator session sweep finished')
+    return ok(result)
   }
 
   // -------------------------------------------------------------------------

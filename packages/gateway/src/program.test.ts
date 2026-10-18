@@ -3243,6 +3243,32 @@ describe('durable operator sessions — program wiring', () => {
     expect(pushStore.deactivateForOperator).toHaveBeenCalledExactlyOnceWith({operatorId: '42'})
   })
 
+  it('replays a stored revoke at boot with a fence so a later subscription is not deactivated', async () => {
+    // #given a first boot with push whose session for user 42 was revoked
+    const fake = await useSessionFake()
+    const first = await bootOperatorWeb({push: true, allowedUserIds: [42]})
+    const created = await first.serverDeps.sessionStore?.create({githubUserId: 42, login: 'octocat'})
+    if (created?.outcome !== 'ok') throw new Error('expected the first boot to create a session')
+    await first.serverDeps.sessionStore?.revoke(created.sessionId)
+    await settle()
+
+    // #when a second boot loads the stored revoked record
+    const before = Date.now()
+    await useSessionFake({fake})
+    await bootOperatorWeb({push: true, allowedUserIds: [42]})
+    await settle()
+    const {createOperatorPushSubscriptionStore} = await import('./web/operator-push/subscription-store.js')
+    const pushStore = vi.mocked(createOperatorPushSubscriptionStore).mock.results.at(-1)?.value as {
+      deactivateForOperator: ReturnType<typeof vi.fn>
+    }
+
+    // #then the replay carried a fence taken when the load began
+    const call = pushStore.deactivateForOperator.mock.calls[0]?.[0] as {operatorId: string; updatedBefore: number}
+    expect(call.operatorId).toBe('42')
+    expect(call.updatedBefore).toBeGreaterThanOrEqual(before)
+    expect(call.updatedBefore).toBeLessThanOrEqual(Date.now())
+  })
+
   it.each([
     {
       name: 'a self-test failure',

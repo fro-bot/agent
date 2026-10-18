@@ -580,6 +580,46 @@ function storedRecord(harness: Harness, keyHash: string): Record<string, unknown
   return JSON.parse(harness.store.objects.get(buildSessionKey(keyHash))?.data ?? '{}') as Record<string, unknown>
 }
 
+describe('rotated to revoked', () => {
+  it('upgrades a rotated record to revoked, refreshes revokedAt, then reports already', async () => {
+    // #given a record rotated at one time
+    const harness = createHarness()
+    await harness.persistence.create({sessionId: 'a', githubUserId: OPERATOR_ID, login: 'operator', issuedAt: NOW})
+    harness.setNow(NOW + 1000)
+    await harness.persistence.revoke(hashSessionId('a'), 'rotated')
+
+    // #when an explicit revoke follows later, and then again
+    harness.setNow(NOW + 9000)
+    const upgraded = await harness.persistence.revoke(hashSessionId('a'), 'revoked')
+    const again = await harness.persistence.revoke(hashSessionId('a'), 'revoked')
+
+    // #then the first writes revoked with a new revokedAt and the second writes nothing
+    expect(upgraded).toEqual(ok('written'))
+    expect(again).toEqual(ok('already'))
+    const stored: unknown = JSON.parse(harness.store.objects.get(buildSessionKey(hashSessionId('a')))?.data ?? '{}')
+    expect(stored).toMatchObject({status: 'revoked', revokedAt: NOW + 9000, issuedAt: NOW})
+  })
+
+  it('never turns a revoked record into rotated, and a second rotation writes nothing', async () => {
+    // #given a revoked record and a rotated record
+    const harness = createHarness()
+    plant(harness, plantedHash('r'), {issuedAt: NOW, status: 'revoked', revokedAt: NOW})
+    plant(harness, plantedHash('t'), {issuedAt: NOW, status: 'rotated', revokedAt: NOW})
+    const before = new Map(harness.store.objects)
+    harness.store.resetCalls()
+
+    // #when each is rotated
+    const onRevoked = await harness.persistence.revoke(plantedHash('r'), 'rotated')
+    const onRotated = await harness.persistence.revoke(plantedHash('t'), 'rotated')
+
+    // #then both report already and nothing is written
+    expect(onRevoked).toEqual(ok('already'))
+    expect(onRotated).toEqual(ok('already'))
+    expect(harness.store.callCount('conditionalPut')).toBe(0)
+    expect(harness.store.objects).toEqual(before)
+  })
+})
+
 describe('revokedAt', () => {
   it('stamps the revoke time on a revoke and on a rotation, and not on an active record', async () => {
     // #given an active session, then a revoke and a rotation at a later time
@@ -764,6 +804,73 @@ describe('sweep', () => {
     expect(swept.success && swept.data).toMatchObject({malformed: 2, unrecognized: 1, deleted: 2, kept: 0})
     expect([...harness.store.objects.keys()]).toEqual([`${SESSION_KEY_PREFIX}/not-a-hash.json`])
     expect(harness.store.callCount('conditionalDelete')).toBe(2)
+  })
+
+  it('makes progress under a deadline: each cut sweep deletes what it reached, until none remain', async () => {
+    // #given six expired records, slow reads, and a deadline that fits about two records
+    const harness = createHarness({scanConcurrency: 1, scanTimeoutMs: 70})
+    for (const label of ['a', 'b', 'c', 'd', 'e', 'f']) {
+      plant(harness, plantedHash(label), {issuedAt: NOW - TTL_MS - 1})
+    }
+    harness.store.setLatency('getObject', 25)
+
+    // #when sweeping repeatedly
+    const remaining: number[] = [harness.store.objects.size]
+    const failures: string[] = []
+    for (let sweep = 0; sweep < 6 && harness.store.objects.size > 0; sweep++) {
+      const swept = await harness.persistence.sweep()
+      // let abandoned lanes drain before the next sweep
+      await new Promise<void>(resolve => setTimeout(resolve, 80))
+      remaining.push(harness.store.objects.size)
+      failures.push(swept.success ? 'ok' : swept.error.kind)
+    }
+    expect(failures.every(outcome => outcome === 'ok' || outcome === 'timeout')).toBe(true)
+
+    // #then the set shrinks with every sweep and ends empty
+    for (let index = 1; index < remaining.length; index++) {
+      expect(remaining[index]).toBeLessThan(remaining[index - 1] ?? 0)
+    }
+    expect(remaining.at(-1)).toBe(0)
+    expect(remaining.length).toBeGreaterThan(2)
+  })
+
+  it('starts no delete once the sweep is cancelled', async () => {
+    // #given expired records, slow reads and a short deadline
+    const harness = createHarness({scanConcurrency: 1, scanTimeoutMs: 30})
+    for (const label of ['a', 'b', 'c', 'd']) {
+      plant(harness, plantedHash(label), {issuedAt: NOW - TTL_MS - 1})
+    }
+    harness.store.setLatency('getObject', 25)
+
+    // #when the sweep is cut by its deadline
+    const swept = await harness.persistence.sweep()
+    expect(errorOf(swept).kind).toBe('timeout')
+    const deletesAtCancel = harness.store.callCount('conditionalDelete')
+    await new Promise<void>(resolve => setTimeout(resolve, 200))
+
+    // #then abandoned lanes started no further delete
+    expect(harness.store.callCount('conditionalDelete')).toBe(deletesAtCancel)
+  })
+
+  it('resumes after the first unfinished key, so live records at the head cannot starve the rest', async () => {
+    // #given live records that sort before expired ones, and a deadline that fits about two reads
+    const harness = createHarness({scanConcurrency: 1, scanTimeoutMs: 70})
+    const live = ['0', '1', '2', '3'].map(label => plantedHash(`live-${label}`))
+    const expired = ['0', '1'].map(label => plantedHash(`dead-${label}`))
+    for (const hash of live) plant(harness, hash, {issuedAt: NOW})
+    for (const hash of expired) plant(harness, hash, {issuedAt: NOW - TTL_MS - 1})
+    harness.store.setLatency('getObject', 25)
+
+    // #when sweeping until the expired records are gone
+    for (let sweep = 0; sweep < 8; sweep++) {
+      await harness.persistence.sweep()
+      await new Promise<void>(resolve => setTimeout(resolve, 80))
+      if (expired.every(hash => harness.store.objects.has(buildSessionKey(hash)) === false)) break
+    }
+
+    // #then every expired record went and every live one stayed
+    expect(expired.every(hash => harness.store.objects.has(buildSessionKey(hash)) === false)).toBe(true)
+    expect(live.every(hash => harness.store.objects.has(buildSessionKey(hash)))).toBe(true)
   })
 
   it('keeps a young unsigned record and counts it', async () => {

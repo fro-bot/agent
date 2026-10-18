@@ -237,6 +237,12 @@ export interface OperatorPushSubscriptionStore {
    */
   deactivateForOperator: (args: {
     readonly operatorId: string
+    /**
+     * Fence for a startup replay: a record whose `updatedAt` is at or after this time was subscribed or
+     * refreshed after the replay began, so it is left active. Every subscribe stamps `updatedAt`, and the fence
+     * is checked on each re-read of the CAS loop, so a newer write is never undone.
+     */
+    readonly updatedBefore?: number
   }) => Promise<Result<{readonly updated: number; readonly skipped: number}, StoreError>>
   /**
    * Privacy delete: tombstones then physically removes every record owned by
@@ -707,6 +713,7 @@ export function createOperatorPushSubscriptionStore(
 
   async function deactivateForOperator(args: {
     readonly operatorId: string
+    readonly updatedBefore?: number
   }): Promise<Result<{readonly updated: number; readonly skipped: number}, StoreError>> {
     const cas = requireCasCapable()
     if (cas.success === false) {
@@ -744,6 +751,10 @@ export function createOperatorPushSubscriptionStore(
         const record = parsed.data
         if (record.operatorId !== args.operatorId || record.active === false) {
           settled = true
+          break
+        }
+        if (args.updatedBefore !== undefined && record.updatedAt >= args.updatedBefore) {
+          settled = true // subscribed after the replay began
           break
         }
 

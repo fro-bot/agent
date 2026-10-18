@@ -11,7 +11,7 @@ import type {AnnounceServerConfig, AnnounceServerDeps} from './http/server.js'
 import type {CoordinationLogger} from './runtime-effect.js'
 import type {CloseableServer} from './shutdown.js'
 import type {OperatorAllowlist} from './web/auth/allowlist.js'
-import type {DurableSessionStore} from './web/auth/session.js'
+import type {DurableSessionStore, SessionRevokedContext} from './web/auth/session.js'
 import type {OperatorIngressPolicy} from './web/ingress/policy.js'
 import type {IngressRejection, ResolvedClientAddress} from './web/ingress/resolve-client.js'
 import type {PushDispatcher} from './web/operator-push/dispatcher.js'
@@ -1013,9 +1013,12 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
         ...(pushStoreForRevoke === undefined
           ? {}
           : {
-              onSessionRevoked: (githubUserId: number) => {
+              onSessionRevoked: (githubUserId: number, context?: SessionRevokedContext) => {
                 pushStoreForRevoke
-                  .deactivateForOperator({operatorId: String(githubUserId)})
+                  .deactivateForOperator({
+                    operatorId: String(githubUserId),
+                    ...(context === undefined ? {} : {updatedBefore: context.replayFenceMs}),
+                  })
                   .then(result => {
                     if (result.success === true && result.data.skipped > 0) {
                       logger.warn(

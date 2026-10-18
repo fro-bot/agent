@@ -10,7 +10,7 @@
 import type {AuditLogger} from '../audit.js'
 import type {OperatorAllowlist} from './allowlist.js'
 import type {SessionRecordStatus} from './session-persistence.js'
-import type {DurableSessionStore} from './session.js'
+import type {DurableSessionStore, SessionRevokedContext} from './session.js'
 import type {TestObjectStore} from './test-object-store.js'
 
 import {Buffer} from 'node:buffer'
@@ -43,7 +43,7 @@ interface Harness {
   readonly session: DurableSessionStore
   readonly store: TestObjectStore
   readonly clock: Clock
-  readonly hook: ReturnType<typeof vi.fn<(githubUserId: number) => void>>
+  readonly hook: ReturnType<typeof vi.fn<(githubUserId: number, context?: SessionRevokedContext) => void>>
   readonly logs: {readonly level: string; readonly context: Record<string, unknown>; readonly message: string}[]
   readonly audits: {readonly level: string; readonly context: Record<string, unknown>; readonly message: string}[]
 }
@@ -51,7 +51,7 @@ interface Harness {
 interface HarnessOptions {
   readonly store?: TestObjectStore
   readonly clock?: Clock
-  readonly hook?: (githubUserId: number) => void
+  readonly hook?: (githubUserId: number, context?: SessionRevokedContext) => void
   readonly allowed?: readonly number[]
   readonly maxEntries?: number
   readonly casMaxAttempts?: number
@@ -62,7 +62,7 @@ interface HarnessOptions {
 function createHarness(options: HarnessOptions = {}): Harness {
   const store = options.store ?? createTestObjectStore()
   const clock = options.clock ?? {now: NOW}
-  const hook = vi.fn<(githubUserId: number) => void>(options.hook)
+  const hook = vi.fn<(githubUserId: number, context?: SessionRevokedContext) => void>(options.hook)
   const logs: Harness['logs'] = []
   const audits: Harness['audits'] = []
   const record =
@@ -341,6 +341,72 @@ describe('revoke', () => {
     expect(harness.session.get(sessionId)).toBeUndefined()
     expect(harness.hook).toHaveBeenCalledTimes(1)
     expect(harness.hook).toHaveBeenCalledWith(OPERATOR_ID)
+  })
+
+  it('lets an explicit logout win after a rotation: persists revoked, fires the hook once, then stays quiet', async () => {
+    // #given a session that a same-user re-login has already rotated
+    const harness = await createReadyHarness()
+    const sessionId = await createSession(harness)
+    await harness.session.revoke(sessionId, {rotate: true})
+    const key = buildSessionKey(hashSessionId(sessionId))
+    expect(JSON.parse(harness.store.objects.get(key)?.data ?? '{}')).toMatchObject({status: 'rotated'})
+    expect(harness.hook).not.toHaveBeenCalled()
+    harness.clock.now = NOW + 1000
+
+    // #when the overlapping logout arrives, and then a second logout
+    const logout = await harness.session.revoke(sessionId)
+    const repeat = await harness.session.revoke(sessionId)
+
+    // #then revoked is persisted with a fresh revokedAt and the hook fired exactly once
+    expect(logout).toEqual({outcome: 'ok'})
+    expect(repeat).toEqual({outcome: 'ok'})
+    expect(JSON.parse(harness.store.objects.get(key)?.data ?? '{}')).toMatchObject({
+      status: 'revoked',
+      revokedAt: NOW + 1000,
+    })
+    expect(harness.hook.mock.calls).toEqual([[OPERATOR_ID]])
+  })
+
+  it('persists revoked and fires once when a rotation and a logout overlap, whichever commits first', async () => {
+    // #given a session and slow object-store calls so the two revokes interleave
+    const harness = await createReadyHarness()
+    const sessionId = await createSession(harness)
+    harness.store.setLatency('getObject', 5)
+
+    // #when a rotation and a logout run together
+    const [rotation, logout] = await Promise.all([
+      harness.session.revoke(sessionId, {rotate: true}),
+      harness.session.revoke(sessionId),
+    ])
+
+    // #then both succeed, the stored status is revoked, and the hook fired once
+    expect(rotation).toEqual({outcome: 'ok'})
+    expect(logout).toEqual({outcome: 'ok'})
+    const stored: unknown = JSON.parse(
+      harness.store.objects.get(buildSessionKey(hashSessionId(sessionId)))?.data ?? '{}',
+    )
+    expect(stored).toMatchObject({status: 'revoked'})
+    expect(harness.hook).toHaveBeenCalledTimes(1)
+    expect(harness.session.get(sessionId)).toBeUndefined()
+  })
+
+  it('does not let a rotation that lands after a logout downgrade it', async () => {
+    // #given a revoked session
+    const harness = await createReadyHarness()
+    const sessionId = await createSession(harness)
+    await harness.session.revoke(sessionId)
+    const key = buildSessionKey(hashSessionId(sessionId))
+    const before = harness.store.objects.get(key)?.data
+    harness.store.resetCalls()
+
+    // #when a rotation arrives for it
+    const rotation = await harness.session.revoke(sessionId, {rotate: true})
+
+    // #then nothing is written and the record is still revoked
+    expect(rotation).toEqual({outcome: 'ok'})
+    expect(harness.store.callCount('conditionalPut')).toBe(0)
+    expect(harness.store.objects.get(key)?.data).toBe(before)
+    expect(harness.hook).toHaveBeenCalledTimes(1)
   })
 
   it('keeps the session valid and fires nothing when the durable write fails', async () => {
@@ -807,7 +873,7 @@ describe('push replay', () => {
 
     // #then the deactivation is replayed even though the login lifetime has ended
     expect(loadedWithin.success && loadedWithin.data.replayedUsers).toBe(1)
-    expect(within.hook.mock.calls).toEqual([[OPERATOR_ID]])
+    expect(within.hook.mock.calls).toEqual([[OPERATOR_ID, {replayFenceMs: NOW + 7 * DAY_MS + 1000}]])
     expect(within.session.get(sessionId)).toBeUndefined()
 
     // #when the gateway restarts after revokedAt plus 7 days
@@ -839,6 +905,67 @@ describe('push replay', () => {
     expect(loadedInside.success && loadedInside.data.replayedUsers).toBe(1)
     expect(loadedAt.success && loadedAt.data.replayedUsers).toBe(0)
     expect(at.hook).not.toHaveBeenCalled()
+  })
+
+  it('does not deactivate a subscription refreshed while a startup replay was stalled', async () => {
+    // #given an operator with two subscriptions whose logout deactivation failed, leaving both active
+    const store = createTestObjectStore()
+    const clock = {now: NOW}
+    const pushStore = createOperatorPushSubscriptionStore({
+      adapter: store.adapter,
+      logger: {debug: () => {}, warn: () => {}},
+      clock: () => clock.now,
+    })
+    // the production hook: live revokes pass no fence, a replay passes the fence it was given
+    const hook = (githubUserId: number, context?: SessionRevokedContext): void => {
+      pushStore
+        .deactivateForOperator({
+          operatorId: String(githubUserId),
+          ...(context === undefined ? {} : {updatedBefore: context.replayFenceMs}),
+        })
+        .catch(() => undefined)
+    }
+    const subscribe = async (endpoint: string) =>
+      pushStore.subscribe({operatorId: String(OPERATOR_ID), endpoint, p256dh: 'p256dh', auth: 'auth', keyVersion: 'v1'})
+    const refreshed = 'https://push.example.test/endpoint-refreshed'
+    const stale = 'https://push.example.test/endpoint-stale'
+    const a = await createReadyHarness({store, clock, hook})
+    const sessionId = await createSession(a)
+    await subscribe(refreshed)
+    await subscribe(stale)
+    store.failNext('conditionalPut', {match: key => key.startsWith('operator-push/')})
+    await a.session.revoke(sessionId)
+    await settle()
+
+    // #when the gateway restarts and the replay stalls before its first read of the refreshed record
+    clock.now = NOW + 60_000
+    const refreshedKey = [...store.objects.entries()].find(([key, value]) => {
+      return key.startsWith('operator-push/subscriptions/') && value.data.includes('endpoint-refreshed')
+    })?.[0]
+    let releaseReplay!: () => void
+    const stalled = new Promise<void>(resolve => {
+      releaseReplay = resolve
+    })
+    store.onBefore('getObject', async key => {
+      if (key === refreshedKey) {
+        store.onBefore('getObject', undefined)
+        await stalled
+      }
+    })
+    const b = createHarness({store, clock, hook})
+    await b.session.load()
+    await settle()
+
+    // #and the operator signs in again and resubscribes that device while the replay is stalled
+    clock.now = NOW + 61_000
+    await subscribe(refreshed)
+    releaseReplay()
+    await settle()
+    await new Promise<void>(resolve => setTimeout(resolve, 20))
+
+    // #then the replay deactivated the old record and left the refreshed one active
+    const active = await pushStore.getActiveRecordsForOperator({operatorId: String(OPERATOR_ID)})
+    expect(active.success && active.data.map(record => record.endpoint)).toEqual([refreshed])
   })
 
   it('stamps revokedAt on a rotation and still skips it at replay', async () => {
@@ -884,7 +1011,7 @@ describe('push replay', () => {
     await harness.session.load()
 
     // #then only the user without a live session is replayed
-    expect(harness.hook.mock.calls).toEqual([[OTHER_ID]])
+    expect(harness.hook.mock.calls).toEqual([[OTHER_ID, {replayFenceMs: NOW}]])
   })
 
   it('runs once per user when several revoked records exist', async () => {
@@ -914,7 +1041,7 @@ describe('push replay', () => {
     await harness.session.load()
 
     // #then only the user whose record was revoked at load is replayed
-    expect(harness.hook.mock.calls).toEqual([[OTHER_ID]])
+    expect(harness.hook.mock.calls).toEqual([[OTHER_ID, {replayFenceMs: NOW}]])
   })
 
   it('does not replay a user whose load-time revoke could not be written', async () => {
