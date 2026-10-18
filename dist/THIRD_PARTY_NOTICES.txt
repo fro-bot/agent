@@ -324,7 +324,7 @@ Apache-2.0
    limitations under the License.
 
 
-@aws-sdk/client-s3@3.1151.0
+@aws-sdk/client-s3@3.1152.0
 Apache-2.0
                                 Apache License
                            Version 2.0, January 2004
@@ -4668,7 +4668,7 @@ Apache-2.0
    limitations under the License.
 
 
-@hono/node-server@2.1.4
+@hono/node-server@2.1.5
 MIT
 MIT License
 
@@ -12582,7 +12582,7 @@ WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 OTHER DEALINGS IN THE SOFTWARE.
 
-zod@4.6.6
+zod@4.6.7
 MIT
 MIT License
 

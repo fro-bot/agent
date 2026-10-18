@@ -481,6 +481,40 @@ describe('fro-bot workflow — owner-wide App token routing', () => {
     expect(applyPatSteps[0]?.env?.GH_TOKEN).toBe(`\${{ secrets.FRO_BOT_PAT }}`)
   })
 
+  it('gates candidate download and assembly on the generate job candidate-exists output', () => {
+    // #given the raw generate and apply jobs
+    const generate = rawJob(WORKFLOW_PATH, 'fro-bot')
+    const apply = rawJob(WORKFLOW_PATH, 'apply-release-notes')
+    const generateSteps = stepsFor(WORKFLOW_PATH, 'fro-bot')
+    const applySteps = stepsFor(WORKFLOW_PATH, 'apply-release-notes')
+    const detect = stepById(generateSteps, 'candidate')
+    const upload = generateSteps.find(step => step.name === 'Upload release-notes candidate')
+    const runIndex = generateSteps.findIndex(step => step.uses === './')
+    const applyStep = (name: string) => applySteps.find(step => step.name === name)
+    const exists = "needs.fro-bot.outputs.candidate-exists == 'true'"
+
+    // #then the generate job exposes the candidate-exists output from a step after the agent run
+    expect((generate.outputs as Record<string, unknown>)['candidate-exists']).toBe(
+      `\${{ steps.candidate.outputs.exists }}`,
+    )
+    expect(generateSteps.indexOf(detect)).toBeGreaterThan(runIndex)
+    expect(String(detect.run)).toContain('exists=true')
+    expect(String(detect.run)).toContain('exists=false')
+    expect(String(upload?.if)).toContain("steps.candidate.outputs.exists == 'true'")
+
+    // #then download and assemble run only when the output is the string 'true'
+    expect(apply.needs).toBe('fro-bot')
+    expect(String(applyStep('Download release-notes candidate')?.if)).toContain(exists)
+    expect(applyStep('Download release-notes candidate')?.['continue-on-error']).toBe(true)
+    expect(String(applyStep('Assemble and apply release notes')?.if)).toContain(exists)
+
+    // #then the missing-candidate case emits one notice and no error annotation
+    const skip = applyStep('Skip release-notes narration (no candidate)')
+    expect(String(skip?.if)).toContain("needs.fro-bot.outputs.candidate-exists != 'true'")
+    expect(String(skip?.run)).toContain('::notice::')
+    expect(String(skip?.run)).not.toContain('::error')
+  })
+
   it('keeps confirmed manual output-mode callers explicit in the checked-in expression', () => {
     // #given the actual Fro Bot action call and representative manual trigger contexts
     const job = loadFroBotJob()
