@@ -289,7 +289,7 @@ flowchart LR
 
 ## Implementation Units
 
-- [ ] **Unit 1: Contract additions and the 1.12.0 version bump**
+- [x] **Unit 1: Contract additions and the 1.12.0 version bump**
 
 **Goal:** Define the wire surface. This means the reason enum and its mapping, the optional DTO fields, the prompt bound and the `prompt-too-long` reason. Bump every pin to 1.12.0. Nothing populates the new fields yet, so this unit stays type-clean.
 
@@ -322,7 +322,7 @@ flowchart LR
 
 **Verification:** Gateway `tsc` passes. `toClosedStatus` compiles with the new field destructured.
 
-- [ ] **Unit 2: Provider failure reason end to end**
+- [x] **Unit 2: Provider failure reason end to end**
 
 **Goal:** Carry the typed reason from `failFromProvider`, persist it in the terminal FAILED write, and project it onto both DTOs.
 
@@ -360,7 +360,7 @@ flowchart LR
 
 **Verification:** A provider failure shows its reason on `GET /operator/runs` and on the SSE status frame. Every non-provider failure shows no reason.
 
-- [ ] **Unit 3: Launch prompt persisted and projected**
+- [x] **Unit 3: Launch prompt persisted and projected**
 
 **Goal:** Cap and store the operator launch prompt, then return it on `RunSummary`.
 
@@ -400,7 +400,7 @@ flowchart LR
 
 **Verification:** The prompt shows on the run card data after a gateway restart, and it appears nowhere else.
 
-- [ ] **Unit 4: Run ID on approval pushes**
+- [x] **Unit 4: Run ID on approval pushes**
 
 **Goal:** Give approval pushes the same run ID and deep-link shape as question pushes.
 
@@ -432,7 +432,7 @@ flowchart LR
 
 **Verification:** Tapping an approval push opens the waiting run's card. For a web-scope run, the approval can be decided there.
 
-- [ ] **Unit 5: Docs and the dashboard handoff**
+- [x] **Unit 5: Docs and the dashboard handoff**
 
 **Goal:** Describe the 1.12.0 surface everywhere it is documented, and write the pairing handoff.
 
