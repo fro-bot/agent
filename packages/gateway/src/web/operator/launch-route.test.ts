@@ -22,6 +22,7 @@ import type {LaunchRouteBindingsLookup, LaunchRouteDeps} from './launch-route.js
 import {Hono} from 'hono'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {launchWork} from '../../execute/run.js'
+import {OPERATOR_LAUNCH_PROMPT_MAX_LENGTH} from '../../operator-contract/launch-prompt.js'
 import {setOperatorRouteGuard} from '../operator-route.js'
 import {createIdempotencyGuard, IDEMPOTENCY_KEY_MAX_LENGTH} from './idempotency.js'
 import {buildLaunchRoute} from './launch-route.js'
@@ -1260,5 +1261,204 @@ describe('POST /operator/runs — replySink wired to runObservationManager', () 
     // #when — append and flush do not throw (graceful no-op)
     expect(() => sink.append('some text')).not.toThrow()
     await expect(sink.flush()).resolves.toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Contract 1.12.0 — launch prompt bound, gate order, persistence opt-in
+// ---------------------------------------------------------------------------
+
+describe('POST /operator/runs — prompt bound (contract 1.12.0)', () => {
+  it('accepts a prompt of exactly 8,000 UTF-16 code units', async () => {
+    // #given
+    const app = buildApp(makeDeps())
+
+    // #when
+    const response = await postRuns(app, {repo: 'acme/widget', prompt: 'a'.repeat(OPERATOR_LAUNCH_PROMPT_MAX_LENGTH)})
+
+    // #then
+    expect(response.status).toBe(202)
+    expect(mockLaunchWork).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    ['8,001 ASCII characters', 'a'.repeat(OPERATOR_LAUNCH_PROMPT_MAX_LENGTH + 1)],
+    ['4,001 emoji (8,002 UTF-16 units)', '😀'.repeat(4001)],
+  ])('rejects %s with 400 prompt-too-long and never launches', async (_label, prompt) => {
+    // #given
+    const app = buildApp(makeDeps())
+
+    // #when
+    const response = await postRuns(app, {repo: 'acme/widget', prompt})
+
+    // #then
+    expect(response.status).toBe(400)
+    expect(await response.json()).toEqual({error: 'bad request', reason: 'prompt-too-long'})
+    expect(mockLaunchWork).not.toHaveBeenCalled()
+  })
+
+  it('still accepts 4,000 emoji (exactly 8,000 units): the bound is code units, not code points', async () => {
+    // #given
+    const app = buildApp(makeDeps())
+
+    // #when
+    const response = await postRuns(app, {repo: 'acme/widget', prompt: '😀'.repeat(4000)})
+
+    // #then
+    expect(response.status).toBe(202)
+  })
+
+  it('rejects a whitespace-only prompt with the unchanged prompt-is-required body', async () => {
+    // #given
+    const app = buildApp(makeDeps())
+
+    // #when
+    const response = await postRuns(app, {repo: 'acme/widget', prompt: ' \n\t '})
+
+    // #then
+    expect(response.status).toBe(400)
+    expect(await response.json()).toEqual({error: 'prompt is required'})
+  })
+
+  it('pins current behavior: a zero-width-only prompt is accepted and handed over exactly as sent', async () => {
+    // #given — U+200B is not removed by String.prototype.trim
+    const app = buildApp(makeDeps())
+
+    // #when
+    const response = await postRuns(app, {repo: 'acme/widget', prompt: '\u200B\u200B'})
+
+    // #then
+    expect(response.status).toBe(202)
+    expect(mockLaunchWork.mock.calls[0]?.[0].promptText).toBe('\u200B\u200B')
+  })
+})
+
+describe('POST /operator/runs — prompt checks run before repo access (contract 1.12.0)', () => {
+  const variants = [
+    [
+      'a bound repo',
+      () => ({bindingsLookup: makeBindingsLookup(makeBinding()), denylistCache: makeDenylistCache(false)}),
+    ],
+    ['an unbound repo', () => ({bindingsLookup: makeBindingsLookup(null), denylistCache: makeDenylistCache(false)})],
+    [
+      'a denylisted repo',
+      () => ({bindingsLookup: makeBindingsLookup(makeBinding()), denylistCache: makeDenylistCache(true)}),
+    ],
+  ] as const
+
+  it.each(variants)(
+    'an oversize prompt gets the same 400 for %s, with no access check',
+    async (_label, makeOverrides) => {
+      // #given
+      const deps = makeDeps(makeOverrides())
+      const app = buildApp(deps)
+
+      // #when
+      const response = await postRuns(app, {
+        repo: 'acme/widget',
+        prompt: 'a'.repeat(OPERATOR_LAUNCH_PROMPT_MAX_LENGTH + 1),
+      })
+
+      // #then — identical answer, and neither the binding store nor the denylist was consulted
+      expect(response.status).toBe(400)
+      expect(await response.json()).toEqual({error: 'bad request', reason: 'prompt-too-long'})
+      expect(deps.bindingsLookup.getBindingByRepo).not.toHaveBeenCalled()
+      expect(deps.denylistCache.getDenylistState).not.toHaveBeenCalled()
+      expect(deps.denylistCache.isRepoDenied).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each(variants)('an empty prompt gets the same 400 for %s, with no access check', async (_label, makeOverrides) => {
+    // #given
+    const deps = makeDeps(makeOverrides())
+    const app = buildApp(deps)
+
+    // #when
+    const response = await postRuns(app, {repo: 'acme/widget', prompt: '   '})
+
+    // #then
+    expect(response.status).toBe(400)
+    expect(await response.json()).toEqual({error: 'prompt is required'})
+    expect(deps.bindingsLookup.getBindingByRepo).not.toHaveBeenCalled()
+    expect(deps.denylistCache.isRepoDenied).not.toHaveBeenCalled()
+  })
+
+  it('a valid prompt on an unbound or denylisted repo is still the generic 404 (access still gates)', async () => {
+    // #given
+    const unbound = buildApp(makeDeps({bindingsLookup: makeBindingsLookup(null)}))
+    const denied = buildApp(makeDeps({denylistCache: makeDenylistCache(true)}))
+
+    // #when
+    const a = await postRuns(unbound, {repo: 'acme/widget', prompt: 'do it'})
+    const b = await postRuns(denied, {repo: 'acme/widget', prompt: 'do it'})
+
+    // #then
+    expect(a.status).toBe(404)
+    expect(b.status).toBe(404)
+  })
+})
+
+describe('POST /operator/runs — persistence opt-in and admission mapping (contract 1.12.0)', () => {
+  it('opts in to persistence and hands launchWork the prompt exactly as submitted (not the built prompt)', async () => {
+    // #given — leading/trailing whitespace must survive
+    const submitted = '  fix the flaky test\n'
+    const app = buildApp(makeDeps())
+
+    // #when
+    await postRuns(app, {repo: 'acme/widget', prompt: submitted})
+
+    // #then
+    const request = mockLaunchWork.mock.calls[0]?.[0] as LaunchWorkRequest
+    expect(request.persistOperatorPrompt).toBe(true)
+    expect(request.promptText).toBe(submitted)
+    expect(request.promptText).not.toContain('Repository:')
+  })
+
+  it("maps the launchWork 'prompt-too-long' admission reason to the same 400 body", async () => {
+    // #given — the persistence boundary refuses what the route let through
+    mockLaunchWork.mockResolvedValueOnce({accepted: false, reason: 'prompt-too-long'})
+    const app = buildApp(makeDeps())
+
+    // #when
+    const response = await postRuns(app, {repo: 'acme/widget', prompt: 'do it'})
+
+    // #then — not the generic 'bad request' / empty-prompt label
+    expect(response.status).toBe(400)
+    expect(await response.json()).toEqual({error: 'bad request', reason: 'prompt-too-long'})
+  })
+
+  it('a repeated idempotency key with a different prompt echoes the first run and launches once', async () => {
+    // #given
+    const app = buildApp(makeDeps())
+
+    // #when
+    const first = await postRuns(app, {repo: 'acme/widget', prompt: 'first prompt', idempotencyKey: 'k1'})
+    const second = await postRuns(app, {repo: 'acme/widget', prompt: 'a different prompt', idempotencyKey: 'k1'})
+
+    // #then — first launch wins; the later prompt is discarded
+    const firstBody = (await first.json()) as {runId: string}
+    const secondBody = (await second.json()) as {runId: string}
+    expect(secondBody.runId).toBe(firstBody.runId)
+    expect(mockLaunchWork).toHaveBeenCalledOnce()
+    expect(mockLaunchWork.mock.calls[0]?.[0].promptText).toBe('first prompt')
+  })
+
+  it('logs the error NAME, never the message, when launchWork throws', async () => {
+    // #given — a message that quotes prompt-bearing text
+    mockLaunchWork.mockRejectedValueOnce(new SyntaxError('Unexpected token in "SENTINEL-PROMPT-TEXT"'))
+    const deps = makeDeps()
+    const app = buildApp(deps)
+
+    // #when
+    const response = await postRuns(app, {repo: 'acme/widget', prompt: 'SENTINEL-PROMPT-TEXT'})
+
+    // #then
+    expect(response.status).toBe(500)
+    expect(vi.mocked(deps.logger.error).mock.calls[0]?.[0]).toMatchObject({err: 'SyntaxError'})
+    const logged = [deps.logger.debug, deps.logger.info, deps.logger.warn, deps.logger.error]
+      .flatMap(fn => vi.mocked(fn).mock.calls)
+      .map(call => JSON.stringify(call))
+      .join('\n')
+    expect(logged).not.toContain('SENTINEL-PROMPT-TEXT')
   })
 })

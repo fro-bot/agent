@@ -12,9 +12,10 @@
  */
 
 import type {RunState} from '@fro-bot/runtime'
-import type {OperatorWebStatus, RunSummary, RunSummaryStatus} from './index.js'
+import type {OperatorProviderFailureReason, OperatorWebStatus, RunSummary, RunSummaryStatus} from './index.js'
 
-import {assert, describe, expect, it} from 'vitest'
+import {assert, describe, expect, expectTypeOf, it} from 'vitest'
+import {OPERATOR_LAUNCH_PROMPT_MAX_LENGTH} from './launch-prompt.js'
 import {toRunSummary} from './run-summary.js'
 
 // ---------------------------------------------------------------------------
@@ -439,5 +440,163 @@ describe('RunSummaryStatus', () => {
       expect(status).not.toBe('waiting_for_approval')
       expect(status).not.toBe('waiting_for_question')
     }
+  })
+})
+
+describe('RunSummary — contract 1.12.0 optional fields', () => {
+  it('declares prompt and providerFailureReason as optional, typed fields', () => {
+    // #given the 1.12.0 additions to the summary DTO
+    // #when inspected at the type level
+    // #then both are optional and typed to the contract (the projector does not populate them yet)
+    expectTypeOf<RunSummary['prompt']>().toEqualTypeOf<string | undefined>()
+    expectTypeOf<RunSummary['providerFailureReason']>().toEqualTypeOf<OperatorProviderFailureReason | undefined>()
+    expectTypeOf<Pick<RunSummary, 'runId' | 'repo' | 'status' | 'createdAt'>>().toEqualTypeOf<{
+      readonly runId: string
+      readonly repo: string
+      readonly status: RunSummaryStatus
+      readonly createdAt: string
+    }>()
+  })
+})
+
+describe('toRunSummary — providerFailureReason (1.12.0)', () => {
+  const failedProvider = (reason: unknown): RunState =>
+    makeRunState({phase: 'FAILED', details: {failureKind: 'session-error', providerFailureReason: reason}})
+
+  it.each(['provider-auth-unavailable', 'model-not-available', 'provider-rejected-request', 'unclassified'] as const)(
+    'projects the stored wire reason %s for a FAILED session-error run',
+    reason => {
+      // #given / #when
+      const result = toRunSummary(failedProvider(reason), BINDING_A)
+
+      // #then
+      assert(result !== null)
+      expect(result.providerFailureReason).toBe(reason)
+      expect(result.failureKind).toBe('session-error')
+    },
+  )
+
+  it.each([
+    [
+      'a reason on an EXECUTING run',
+      makeRunState({details: {failureKind: 'session-error', providerFailureReason: 'unclassified'}}),
+    ],
+    [
+      'a reason with failureKind unreachable',
+      makeRunState({phase: 'FAILED', details: {failureKind: 'unreachable', providerFailureReason: 'unclassified'}}),
+    ],
+    ['a bogus reason string', failedProvider('quota-exhausted')],
+    ['the internal spaced spelling', failedProvider('model not available')],
+    ['a numeric reason', failedProvider(7)],
+    ['a prototype key', failedProvider('__proto__')],
+  ])('omits the reason for %s but keeps the row', (_label, runState) => {
+    // #given a tampered or out-of-gate stored value
+    // #when projected
+    const result = toRunSummary(runState, BINDING_A)
+
+    // #then the row is kept and the field is not a key at all
+    assert(result !== null)
+    expect(result).not.toHaveProperty('providerFailureReason')
+  })
+
+  it('has the exact key set for FAILED with a reason, and for a non-FAILED run', () => {
+    // #given
+    const failed = toRunSummary(failedProvider('unclassified'), BINDING_A)
+    const running = toRunSummary(makeRunState(), BINDING_A)
+
+    // #then the summary does not carry a prompt yet, and only FAILED carries the reason
+    assert(failed !== null && running !== null)
+    expect(Object.keys(failed).sort()).toEqual(
+      ['createdAt', 'failureKind', 'providerFailureReason', 'repo', 'runId', 'status', 'updatedAt'].sort(),
+    )
+    expect(Object.keys(running).sort()).toEqual(['createdAt', 'repo', 'runId', 'status', 'updatedAt'].sort())
+  })
+
+  it('projects a 1.11-shaped FAILED record (no reason) without the field', () => {
+    // #given a record written before 1.12.0
+    const legacy = makeRunState({phase: 'FAILED', details: {failureKind: 'session-error'}})
+
+    // #when / #then
+    const result = toRunSummary(legacy, BINDING_A)
+    assert(result !== null)
+    expect(result.failureKind).toBe('session-error')
+    expect(result).not.toHaveProperty('providerFailureReason')
+  })
+})
+
+describe('toRunSummary — prompt (1.12.0)', () => {
+  const webRun = (operatorPrompt: unknown, overrides: Partial<RunState> = {}): RunState =>
+    makeRunState({surface: 'web', details: {operatorPrompt}, ...overrides})
+
+  it('projects the stored prompt exactly as stored on a web run', () => {
+    // #given a web run whose prompt has meaningful whitespace and unicode
+    const prompt = '  fix the flaky test\n\n😀 and `code` <b>not html</b>\n'
+
+    // #when
+    const result = toRunSummary(webRun(prompt), BINDING_A)
+
+    // #then — byte-for-byte, no trim or normalisation
+    assert(result !== null)
+    expect(result.prompt).toBe(prompt)
+  })
+
+  it('projects a prompt of exactly the bound, and omits one a single unit over (never sliced)', () => {
+    // #given
+    const atBound = 'a'.repeat(OPERATOR_LAUNCH_PROMPT_MAX_LENGTH)
+    const overBound = 'a'.repeat(OPERATOR_LAUNCH_PROMPT_MAX_LENGTH + 1)
+
+    // #when
+    const a = toRunSummary(webRun(atBound), BINDING_A)
+    const b = toRunSummary(webRun(overBound), BINDING_A)
+
+    // #then — the over-bound row is kept, with no prompt key and no truncated copy
+    assert(a !== null && b !== null)
+    expect(a.prompt).toBe(atBound)
+    expect(b).not.toHaveProperty('prompt')
+    expect(JSON.stringify(b)).not.toContain('aaaa')
+  })
+
+  it.each([
+    ['a numeric prompt', webRun(42)],
+    ['an object prompt', webRun({text: 'x'})],
+    ['an array prompt', webRun(['x'])],
+    ['null', webRun(null)],
+    ['an empty string', webRun('')],
+    ['a prompt on a discord run', makeRunState({surface: 'discord', details: {operatorPrompt: 'smuggled'}})],
+    ['a prompt on a github run', makeRunState({surface: 'github', details: {operatorPrompt: 'smuggled'}})],
+  ])('omits %s but keeps the row', (_label, runState) => {
+    // #given a tampered or out-of-gate stored value
+    // #when
+    const result = toRunSummary(runState, BINDING_A)
+
+    // #then
+    assert(result !== null)
+    expect(result).not.toHaveProperty('prompt')
+    expect(result.runId).toBe(runState.run_id)
+  })
+
+  it('a 1.11-shaped web record (no stored prompt) projects without the field', () => {
+    // #given a record written before 1.12.0
+    const legacy = makeRunState({surface: 'web', details: {channelId: 'web:acme/widget'}})
+
+    // #when / #then
+    const result = toRunSummary(legacy, BINDING_A)
+    assert(result !== null)
+    expect(result).not.toHaveProperty('prompt')
+  })
+
+  it('a record carrying unknown future keys projects exactly the declared keys (no spread of details)', () => {
+    // #given a 1.12 record plus keys this projector has never heard of
+    const runState = makeRunState({
+      surface: 'web',
+      details: {operatorPrompt: 'hello', futureKey: 'x', channelId: 'c', owner: 'o', repo: 'r'},
+    })
+
+    // #when
+    const result = toRunSummary(runState, BINDING_A)
+
+    // #then
+    assert(result !== null)
+    expect(Object.keys(result).sort()).toEqual(['createdAt', 'prompt', 'repo', 'runId', 'status', 'updatedAt'].sort())
   })
 })

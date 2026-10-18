@@ -44,7 +44,7 @@ Several patterns below were load-bearing safety properties, not conveniences: wi
 
 `launchWork` awaits the **entire run** on the immediate-slot path. An HTTP route that awaited it would hold the connection open for the whole run budget (minutes). Instead the route owns the `runId`, registers it, fires `launchWork` **without** `await`, logs the returned promise's rejection, and returns `202 {runId}` immediately. The operator then observes the run over the SSE stream.
 
-The snippet below is the fire-and-return tail only. In the real route the run id is generated and the run registered **after** the pre-launch gates, so the full order is: resolve binding (server-owned) → denylist → authz → generate runId + register → fire. Don't register before the repo is resolved and authorized.
+The snippet below is the fire-and-return tail only. In the real route the run id is generated and the run registered **after** the pre-launch gates, so the full order is: validate the body → check the prompt (at most 8,000 UTF-16 code units, else `400 {error: 'bad request', reason: 'prompt-too-long'}`; then non-empty, else `400 {error: 'prompt is required'}`) → resolve binding (server-owned) → denylist → authz → generate runId + register → fire. The prompt checks run before repo access because they read no server-owned state, so a bound, unbound and denylisted repo all get the same answer and the checks cannot probe which repos exist. Don't register before the repo is resolved and authorized.
 
 ```ts
 const request = {
@@ -87,7 +87,7 @@ const authzResult = await checkRepoAuthz(githubUserId, owner, repo, token, deps.
 if (authzResult.authorized === false) return notFoundResponse(c)
 ```
 
-This is the same discipline as the SSE route, applied to a write surface. The distinction: a write route may return a differentiated `4xx/5xx` for *post-acceptance* failures (a bad body, an over-cap rate limit), but the *pre-launch* gates must collapse to a single generic rejection to avoid a pre-launch oracle.
+This is the same discipline as the SSE route, applied to a write surface. The distinction: a write route may return a differentiated `4xx/5xx` for failures that depend on nothing server-owned or that come *after* acceptance (a bad body, an oversize or empty prompt, an over-cap rate limit), but the *pre-launch* gates must collapse to a single generic rejection to avoid a pre-launch oracle.
 
 ### 3. Auto-deny approval transport to avoid a lock-deadlock
 

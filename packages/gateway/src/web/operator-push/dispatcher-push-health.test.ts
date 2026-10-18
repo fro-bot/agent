@@ -7,6 +7,8 @@ import {createPushHealthTracker} from './push-health.js'
 import {createStoreError} from './subscription-store.js'
 import {shouldNotify} from './trigger-policy.js'
 
+const RUN_ID = 'run-health-1'
+
 const VAPID_CONFIG = {
   subject: 'mailto:ops@example.com',
   publicKey: 'public-key',
@@ -294,7 +296,7 @@ describe('createPushDispatcher — push health: broadcasts that establish nothin
     })
 
     // #when
-    await dispatcher.dispatchApprovalPending('approval-1')
+    await dispatcher.dispatchApprovalPending('approval-1', RUN_ID)
 
     // #then
     expect(tracker.getStatus()).toBe('ready')

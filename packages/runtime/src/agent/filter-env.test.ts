@@ -122,6 +122,49 @@ describe('filterAgentEnv', () => {
     }
   })
 
+  it('drops NODE_OPTIONS, which would inject --require/--import code into the server and every tool child', () => {
+    // #given NODE_OPTIONS sitting next to allowed keys
+    const env = {
+      NODE_OPTIONS: '--require /tmp/hostile-preload.js --import /tmp/hostile.mjs',
+      NODE_EXTRA_CA_CERTS: '/etc/ssl/certs/ca.pem',
+      OPENCODE_CONFIG_CONTENT: '{}',
+      PATH: '/usr/bin',
+    }
+
+    // #when
+    const result = filterAgentEnv(env)
+
+    // #then only NODE_OPTIONS is withheld
+    expect(result).toEqual({
+      NODE_EXTRA_CA_CERTS: '/etc/ssl/certs/ca.pem',
+      OPENCODE_CONFIG_CONTENT: '{}',
+      PATH: '/usr/bin',
+    })
+    expect(result).not.toHaveProperty('NODE_OPTIONS')
+  })
+
+  it('retains NODE_EXTRA_CA_CERTS (load-bearing: CA trust for custom endpoints and TLS-intercepting proxies)', () => {
+    // #given
+    const env = {NODE_EXTRA_CA_CERTS: '/etc/ssl/certs/corp-ca.pem', PATH: '/usr/bin'}
+
+    // #when
+    const result = filterAgentEnv(env)
+
+    // #then
+    expect(result).toEqual(env)
+  })
+
+  it('does not admit arbitrary NODE_* keys (no broad NODE_ prefix)', () => {
+    // #given
+    const env = {NODE_FOO: 'bar', NODE_PATH: '/tmp/hostile-modules', NODE_ENV: 'production', PATH: '/usr/bin'}
+
+    // #when
+    const result = filterAgentEnv(env)
+
+    // #then
+    expect(result).toEqual({PATH: '/usr/bin'})
+  })
+
   it('retains GH_CONFIG_DIR (load-bearing: off-env gh auth relies on this reaching the child)', () => {
     // #given
     const env = {GH_CONFIG_DIR: '/tmp/gh-config-xyz', PATH: '/usr/bin'}

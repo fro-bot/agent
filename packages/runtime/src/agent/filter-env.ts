@@ -56,9 +56,13 @@ const EXACT_ALLOW_KEYS: ReadonlySet<string> = new Set([
   'GIT_SSL_CAINFO',
   'SSL_CERT_FILE',
   'SSL_CERT_DIR',
+  // Extra CA bundle for Node/Bun TLS (custom endpoints, TLS-intercepting proxies). Exact name only:
+  // there is deliberately no broad NODE_ prefix, because NODE_OPTIONS (--require/--import) would
+  // give an operator-set value code execution in the server child and every tool child.
+  'NODE_EXTRA_CA_CERTS',
 ])
 
-const ALLOW_PREFIXES: readonly string[] = ['OPENCODE_', 'RUNNER_', 'XDG_', 'LC_', 'NODE_']
+const ALLOW_PREFIXES: readonly string[] = ['OPENCODE_', 'RUNNER_', 'XDG_', 'LC_']
 
 const DENY_SUFFIXES: readonly string[] = [
   '_TOKEN',
@@ -76,7 +80,9 @@ const DENY_SUFFIXES: readonly string[] = [
 // OPENCODE_PURE sits under the allowed OPENCODE_ prefix but makes the server skip every external plugin
 // (packages/opencode/src/plugin/index.ts:181), which would silently drop the task-reuse guard and the
 // Systematic plugin from a CI run. An operator's value must never reach the agent server.
-const DENY_EXACT_KEYS: ReadonlySet<string> = new Set(['GITHUB_TOKEN', 'GH_TOKEN', 'OPENCODE_PURE'])
+// NODE_OPTIONS can inject code into every Node/Bun child (--require/--import); it is not allowlisted, and
+// is denied by name as a backstop so a future prefix change cannot re-admit it.
+const DENY_EXACT_KEYS: ReadonlySet<string> = new Set(['GITHUB_TOKEN', 'GH_TOKEN', 'OPENCODE_PURE', 'NODE_OPTIONS'])
 
 const DENY_PREFIXES: readonly string[] = ['AWS_', 'INPUT_']
 

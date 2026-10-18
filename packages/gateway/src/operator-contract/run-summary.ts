@@ -18,8 +18,11 @@
  */
 
 import type {RunState} from '@fro-bot/runtime'
+import type {OperatorProviderFailureReason} from './provider-failure-reason.js'
 import type {OperatorFailureKind} from './run-status.js'
 
+import {OPERATOR_PROMPT_DETAILS_KEY, projectOperatorLaunchPrompt} from './launch-prompt.js'
+import {projectProviderFailureReason, PROVIDER_FAILURE_REASON_DETAILS_KEY} from './provider-failure-reason.js'
 import {PHASE_TO_WEB_STATUS, toOperatorFailureKind} from './run-status.js'
 
 /**
@@ -54,6 +57,15 @@ export interface RunSummary {
   readonly createdAt: string
   readonly updatedAt?: string
   readonly failureKind?: OperatorFailureKind
+  /** Why a `session-error` run failed at the provider (contract 1.12.0). Closed enum; see `OperatorRunStatus`. */
+  readonly providerFailureReason?: OperatorProviderFailureReason
+  /**
+   * The operator's launch prompt, as submitted (contract 1.12.0). Present only on runs launched through
+   * `POST /operator/runs`; absent on runs from any other surface and on records that predate 1.12.0.
+   * UNTRUSTED text: consumers must render it inertly. Bounded by `OPERATOR_LAUNCH_PROMPT_MAX_LENGTH`
+   * (UTF-16 code units); never truncated. Carried on the summary only, never on `OperatorRunStatus`.
+   */
+  readonly prompt?: string
 }
 
 /**
@@ -137,6 +149,18 @@ export function toRunSummary(
   // solely within this branch — never elsewhere.
   const failureKind = runState.phase === 'FAILED' ? toOperatorFailureKind(runState.details.failureKind) : undefined
 
+  // providerFailureReason (1.12.0): same three gates as the status projection (FAILED, internal
+  // failureKind 'session-error', known wire value); otherwise omitted and the row is kept.
+  const providerFailureReason = projectProviderFailureReason(
+    runState.phase,
+    runState.details.failureKind,
+    runState.details[PROVIDER_FAILURE_REASON_DETAILS_KEY],
+  )
+
+  // prompt (1.12.0): only a trustworthy stored value on a web run (non-empty string within the bound).
+  // Anything else is omitted and the row is kept; the value is never truncated.
+  const prompt = projectOperatorLaunchPrompt(runState.surface, runState.details[OPERATOR_PROMPT_DETAILS_KEY])
+
   // Build the closed DTO — copy only declared safe fields, never spread runState.
   // repo comes from the binding (the authorization anchor), not entity_ref.
   const summary: RunSummary = {
@@ -146,6 +170,8 @@ export function toRunSummary(
     createdAt: runState.started_at,
     ...(hasValidHeartbeat ? {updatedAt: runState.last_heartbeat} : {}),
     ...(failureKind === undefined ? {} : {failureKind}),
+    ...(providerFailureReason === undefined ? {} : {providerFailureReason}),
+    ...(prompt === undefined ? {} : {prompt}),
   }
 
   return summary
