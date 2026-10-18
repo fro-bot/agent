@@ -1042,3 +1042,43 @@ describe('isRunStale', () => {
     expect(isRunStale(config, state, NOW)).toBe(expected)
   })
 })
+
+describe('parseRunState — malformed JSON never echoes record content', () => {
+  it('returns a fixed message for a truncated prompt-bearing record', () => {
+    // #given a record cut off after operator-authored text (V8 quotes a source excerpt in JSON.parse errors)
+    const full = JSON.stringify({
+      run_id: 'run-1',
+      surface: 'web',
+      details: {operatorPrompt: 'SENTINEL-PROMPT-TEXT with some more words'},
+    })
+    const truncated = full.slice(0, full.indexOf('more words') + 4)
+
+    // #when
+    const result = parseRunState(truncated)
+
+    // #then — a failure whose message names no part of the payload
+    expect(result.success).toBe(false)
+    const message = result.success === false ? result.error.message : ''
+    expect(message).not.toContain('SENTINEL')
+    expect(message).not.toContain('words')
+    expect(message).toBe('Run-state payload is not valid JSON')
+  })
+
+  it('returns the same fixed message when the payload starts with non-JSON text (V8 quotes this prefix)', () => {
+    // #given a corrupt object whose body begins with operator-authored text
+    // #when
+    const result = parseRunState('SENTINEL-PROMPT-TEXT is not json at all')
+
+    // #then — Node reports `Unexpected token 'S', "SENTINEL-PR"... is not valid JSON` for this input
+    const message = result.success === false ? result.error.message : ''
+    expect(message).not.toContain('SENTINEL')
+    expect(message).toBe('Run-state payload is not valid JSON')
+  })
+
+  it('still reports a structurally invalid payload with its own fixed message', () => {
+    // #given valid JSON of the wrong shape
+    // #when / #then
+    const result = parseRunState('{"details":{"operatorPrompt":"SENTINEL"}}')
+    expect(result.success === false ? result.error.message : '').toBe('Invalid run-state payload')
+  })
+})

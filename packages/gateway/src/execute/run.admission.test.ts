@@ -23,6 +23,7 @@ import {
   setupHappyPath,
   type runtimeModule,
 } from './test-helpers.js'
+import {OPERATOR_LAUNCH_PROMPT_MAX_LENGTH} from '../operator-contract/launch-prompt.js'
 import * as attachModule from './opencode-attach.js'
 import * as promptModule from './prompt.js'
 import {getInFlightRuns} from './run.js'
@@ -1970,5 +1971,104 @@ describe('failureKind threading (early-abort gates)', () => {
     const failedCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'FAILED')
     const failedOptions = failedCall?.[7] as {detailsPatch?: {failureKind?: unknown}}
     expect(failedOptions?.detailsPatch?.failureKind).toBeUndefined()
+  })
+})
+
+function createdDetails(): Record<string, unknown> {
+  const call = mockRuntime.createRun.mock.calls[0] as unknown[] | undefined
+  return (call?.[3] as {details: Record<string, unknown>} | undefined)?.details ?? {}
+}
+
+describe('launchWork — operator prompt persistence (contract 1.12.0)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('with the opt-in, stores the prompt exactly as submitted, not the built or provenance-wrapped text', async () => {
+    // #given — a web-style request with a prompt builder that adds framing, and surrounding whitespace
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+    const submitted = '  fix the flaky test\n'
+    const request = {
+      ...makeInMemoryRequest({promptText: submitted}),
+      surface: 'web' as const,
+      persistOperatorPrompt: true,
+      promptBuilder: (args: {readonly messageText: string; readonly owner: string; readonly repo: string}) =>
+        `Repository: ${args.owner}/${args.repo}\n\n${args.messageText}`,
+    }
+
+    // #when
+    await awaitLaunchWorkRun(launchWork, request, makeDeps())
+
+    // #then
+    expect(createdDetails().operatorPrompt).toBe(submitted)
+    expect(JSON.stringify(createdDetails())).not.toContain('Repository: ')
+  })
+
+  it('without the opt-in (Discord and any other caller) stores no prompt at all', async () => {
+    // #given
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+
+    // #when
+    await awaitLaunchWorkRun(launchWork, makeInMemoryRequest({promptText: 'do the thing'}), makeDeps())
+
+    // #then — the key is absent, not undefined
+    expect(createdDetails()).not.toHaveProperty('operatorPrompt')
+  })
+
+  it('an over-bound prompt with the opt-in is refused with prompt-too-long and no record is written', async () => {
+    // #given
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+    const deps = makeDeps()
+    const request = {
+      ...makeInMemoryRequest({promptText: 'a'.repeat(OPERATOR_LAUNCH_PROMPT_MAX_LENGTH + 1)}),
+      persistOperatorPrompt: true,
+    }
+
+    // #when
+    const admission = await launchWork(request, deps)
+
+    // #then — refused before any slot, record, lock or reply
+    expect(admission).toEqual({accepted: false, reason: 'prompt-too-long'})
+    expect(mockRuntime.createRun).not.toHaveBeenCalled()
+    expect(deps.concurrency.tryAcquire).not.toHaveBeenCalled()
+    expect(request._replySink._sends).toEqual([])
+  })
+
+  it('exactly the bound is admitted and stored whole (never sliced)', async () => {
+    // #given
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+    const prompt = 'a'.repeat(OPERATOR_LAUNCH_PROMPT_MAX_LENGTH)
+
+    // #when
+    await awaitLaunchWorkRun(
+      launchWork,
+      {...makeInMemoryRequest({promptText: prompt}), persistOperatorPrompt: true},
+      makeDeps(),
+    )
+
+    // #then
+    expect(createdDetails().operatorPrompt).toBe(prompt)
+  })
+
+  it('an over-bound Discord prompt (no opt-in) is admitted unchanged', async () => {
+    // #given
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+
+    // #when
+    const admission = await awaitLaunchWorkRun(
+      launchWork,
+      makeInMemoryRequest({promptText: 'a'.repeat(OPERATOR_LAUNCH_PROMPT_MAX_LENGTH + 500)}),
+      makeDeps(),
+    )
+
+    // #then
+    expect(admission.accepted).toBe(true)
+    expect(mockRuntime.createRun).toHaveBeenCalledOnce()
+    expect(createdDetails()).not.toHaveProperty('operatorPrompt')
   })
 })

@@ -15,6 +15,7 @@ import type {RunState} from '@fro-bot/runtime'
 import type {OperatorProviderFailureReason, OperatorWebStatus, RunSummary, RunSummaryStatus} from './index.js'
 
 import {assert, describe, expect, expectTypeOf, it} from 'vitest'
+import {OPERATOR_LAUNCH_PROMPT_MAX_LENGTH} from './launch-prompt.js'
 import {toRunSummary} from './run-summary.js'
 
 // ---------------------------------------------------------------------------
@@ -520,5 +521,82 @@ describe('toRunSummary — providerFailureReason (1.12.0)', () => {
     assert(result !== null)
     expect(result.failureKind).toBe('session-error')
     expect(result).not.toHaveProperty('providerFailureReason')
+  })
+})
+
+describe('toRunSummary — prompt (1.12.0)', () => {
+  const webRun = (operatorPrompt: unknown, overrides: Partial<RunState> = {}): RunState =>
+    makeRunState({surface: 'web', details: {operatorPrompt}, ...overrides})
+
+  it('projects the stored prompt exactly as stored on a web run', () => {
+    // #given a web run whose prompt has meaningful whitespace and unicode
+    const prompt = '  fix the flaky test\n\n😀 and `code` <b>not html</b>\n'
+
+    // #when
+    const result = toRunSummary(webRun(prompt), BINDING_A)
+
+    // #then — byte-for-byte, no trim or normalisation
+    assert(result !== null)
+    expect(result.prompt).toBe(prompt)
+  })
+
+  it('projects a prompt of exactly the bound, and omits one a single unit over (never sliced)', () => {
+    // #given
+    const atBound = 'a'.repeat(OPERATOR_LAUNCH_PROMPT_MAX_LENGTH)
+    const overBound = 'a'.repeat(OPERATOR_LAUNCH_PROMPT_MAX_LENGTH + 1)
+
+    // #when
+    const a = toRunSummary(webRun(atBound), BINDING_A)
+    const b = toRunSummary(webRun(overBound), BINDING_A)
+
+    // #then — the over-bound row is kept, with no prompt key and no truncated copy
+    assert(a !== null && b !== null)
+    expect(a.prompt).toBe(atBound)
+    expect(b).not.toHaveProperty('prompt')
+    expect(JSON.stringify(b)).not.toContain('aaaa')
+  })
+
+  it.each([
+    ['a numeric prompt', webRun(42)],
+    ['an object prompt', webRun({text: 'x'})],
+    ['an array prompt', webRun(['x'])],
+    ['null', webRun(null)],
+    ['an empty string', webRun('')],
+    ['a prompt on a discord run', makeRunState({surface: 'discord', details: {operatorPrompt: 'smuggled'}})],
+    ['a prompt on a github run', makeRunState({surface: 'github', details: {operatorPrompt: 'smuggled'}})],
+  ])('omits %s but keeps the row', (_label, runState) => {
+    // #given a tampered or out-of-gate stored value
+    // #when
+    const result = toRunSummary(runState, BINDING_A)
+
+    // #then
+    assert(result !== null)
+    expect(result).not.toHaveProperty('prompt')
+    expect(result.runId).toBe(runState.run_id)
+  })
+
+  it('a 1.11-shaped web record (no stored prompt) projects without the field', () => {
+    // #given a record written before 1.12.0
+    const legacy = makeRunState({surface: 'web', details: {channelId: 'web:acme/widget'}})
+
+    // #when / #then
+    const result = toRunSummary(legacy, BINDING_A)
+    assert(result !== null)
+    expect(result).not.toHaveProperty('prompt')
+  })
+
+  it('a record carrying unknown future keys projects exactly the declared keys (no spread of details)', () => {
+    // #given a 1.12 record plus keys this projector has never heard of
+    const runState = makeRunState({
+      surface: 'web',
+      details: {operatorPrompt: 'hello', futureKey: 'x', channelId: 'c', owner: 'o', repo: 'r'},
+    })
+
+    // #when
+    const result = toRunSummary(runState, BINDING_A)
+
+    // #then
+    assert(result !== null)
+    expect(Object.keys(result).sort()).toEqual(['createdAt', 'prompt', 'repo', 'runId', 'status', 'updatedAt'].sort())
   })
 })

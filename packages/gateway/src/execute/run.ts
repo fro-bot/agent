@@ -46,6 +46,7 @@ import {setRunReaction} from '../discord/reactions.js'
 import {buildRecoverEntryButton} from '../discord/recover-checkout-button.js'
 import {createStatusController} from '../discord/status-message.js'
 import {createDiscordStreamSink} from '../discord/streaming.js'
+import {OPERATOR_LAUNCH_PROMPT_MAX_LENGTH, OPERATOR_LAUNCH_PROMPT_TOO_LONG} from '../operator-contract/launch-prompt.js'
 import {toOperatorProviderFailureReason} from '../operator-contract/provider-failure-reason.js'
 import {toOperatorFailureKind} from '../operator-contract/run-status.js'
 import {canonicalWorkspaceTarget} from '../workspace-api/client.js'
@@ -2168,6 +2169,14 @@ export async function launchWork(request: LaunchWorkRequest, deps: RunMentionDep
     return {accepted: false, reason: 'empty-prompt'}
   }
 
+  // ── Persistence bound (opt-in callers only) ──────────────────────────────────
+  // This is the boundary that writes the prompt to the run record, so it enforces the contract bound itself
+  // even if a caller skipped its own check. Discord and other callers do not opt in and are unaffected.
+  // No sink is notified: the prompt is operator-authored and stays out of replies.
+  if (request.persistOperatorPrompt === true && request.promptText.length > OPERATOR_LAUNCH_PROMPT_MAX_LENGTH) {
+    return {accepted: false, reason: OPERATOR_LAUNCH_PROMPT_TOO_LONG}
+  }
+
   // ── Decide disposition FIRST (before admitting) ──────────────────────────────
   // The FIFO gate and concurrency cap determine disposition without creating any run-state.
   // Only after we know the run will be accepted do we run the admission block.
@@ -2206,7 +2215,13 @@ export async function launchWork(request: LaunchWorkRequest, deps: RunMentionDep
     started_at: now,
     last_heartbeat: now,
     holder_id: identity,
-    details: {channelId, owner: binding.owner, repo: binding.repo},
+    details: {
+      channelId,
+      owner: binding.owner,
+      repo: binding.repo,
+      // The operator's text exactly as submitted — never the built prompt or the provenance-wrapped text.
+      ...(request.persistOperatorPrompt === true ? {operatorPrompt: request.promptText} : {}),
+    },
   }
 
   const createResult = await createRun(coordinationConfig, identity, repo, initialRunState, coordLogger)
