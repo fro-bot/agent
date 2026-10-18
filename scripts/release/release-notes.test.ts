@@ -759,6 +759,25 @@ describe('buildNarrationPrompt', () => {
     expect(prompt).toMatch(/at most 5 diffs/i)
   })
 
+  it('treats the per-PR file-path bound as truncation and stops only on the PR count', () => {
+    // #given / #when
+    const prompt = buildNarrationPrompt(opts)
+    const bounds = prompt.slice(prompt.indexOf('4. Bounds'), prompt.indexOf('## Select and organize'))
+    const stopRule = bounds.slice(bounds.indexOf('5. '))
+
+    // #then the file-path cap is a truncation, not a stop condition
+    expect(bounds).toMatch(/read at most 50 file paths per pr, preferring non-generated ones/i)
+    expect(bounds).toMatch(/truncate the list and carry on/i)
+    expect(bounds).toMatch(/skip generated bundles, lockfiles, snapshots, vendored output/i)
+
+    // #then only exceeding the candidate-PR count stops narration
+    expect(stopRule).toMatch(/only a candidate-pr count above 25 stops narration/i)
+    expect(stopRule).toMatch(/manual narration is required/i)
+    expect(stopRule).toMatch(/reading limits, not stop conditions/i)
+    expect(stopRule).not.toMatch(/exceeds these bounds/i)
+    expect(stopRule).not.toMatch(/file paths/i)
+  })
+
   it('includes the candidate output filename', () => {
     // #given / #when
     const prompt = buildNarrationPrompt(opts)
