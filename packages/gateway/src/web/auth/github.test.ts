@@ -240,7 +240,7 @@ describe('GET /operator/auth/github/start — happy path', () => {
       'https://operator.example.com/operator/auth/github/callback',
     )
     // Exact scope assertion
-    expect(redirectUrl.searchParams.get('scope')).toBe('read:user')
+    expect(redirectUrl.searchParams.has('scope')).toBe(false)
   })
 
   it('stores state server-side with codeVerifier, issuedAt, consumed=false', async () => {

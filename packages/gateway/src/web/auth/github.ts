@@ -584,7 +584,8 @@ export function buildGitHubOAuthRoutes(app: Hono, deps: GitHubOAuthDeps, config:
     authUrl.searchParams.set('state', stateValue)
     authUrl.searchParams.set('code_challenge', codeChallenge)
     authUrl.searchParams.set('code_challenge_method', 'S256')
-    authUrl.searchParams.set('scope', 'read:user')
+    // No `scope` parameter: the callback reads only the public `id`/`login` from GET /user, which a
+    // no-scope token already returns. Do not send an empty `scope=` either.
 
     return c.redirect(authUrl.toString(), 302)
   })
