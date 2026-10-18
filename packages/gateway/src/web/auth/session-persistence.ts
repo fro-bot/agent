@@ -419,6 +419,8 @@ interface KeyListing {
   /** Keys under the prefix whose name is not a key hash. Counted as malformed by load. */
   readonly unrecognized: number
   readonly truncated: number
+  /** The first key left out by the `scanMaxKeys` bound, where the next sweep continues. Absent when none was. */
+  readonly nextCursor?: string
 }
 
 interface DeadlineState {
@@ -528,11 +530,15 @@ export function createSessionPersistence(deps: SessionPersistenceDeps): SessionP
     found.sort()
     const start = cursor === undefined ? 0 : found.findIndex(keyHash => keyHash >= cursor)
     const rotated = start <= 0 ? found : [...found.slice(start), ...found.slice(0, start)]
+    // `rotated` starts at the cursor and wraps through the keys before it, so the key at `scanMaxKeys` is the next
+    // unscanned one and a run of sweeps covers every key once per cycle.
+    const nextCursor = rotated[scanMaxKeys]
     return ok({
       keyHashes: rotated.slice(0, scanMaxKeys),
       listed: listed.data.length,
       unrecognized,
       truncated: Math.max(0, rotated.length - scanMaxKeys),
+      ...(nextCursor === undefined ? {} : {nextCursor}),
     })
   }
 
@@ -720,9 +726,10 @@ export function createSessionPersistence(deps: SessionPersistenceDeps): SessionP
   // sweep
   // -------------------------------------------------------------------------
 
-  // Where the next sweep starts: the first key a deadline-cut sweep had not finished. In memory only; a restart
-  // begins again at the first key. Without it, live records at the head of the listing could use every sweep's
-  // whole deadline and starve the records behind them.
+  // Where the next sweep starts: the first key a sweep did not reach, because its deadline cut it or the
+  // `scanMaxKeys` bound did. The listing wraps, so the keys before it come round on later sweeps. A sweep that
+  // reaches the end of the listing clears it. In memory only; a restart begins at the first key. Without it,
+  // live records at the head of the listing would use every sweep and starve the records behind them.
   let sweepCursor: string | undefined
 
   async function sweep(): Promise<Result<SweepCounts, SessionPersistenceError>> {
@@ -828,7 +835,8 @@ export function createSessionPersistence(deps: SessionPersistenceDeps): SessionP
       }
       return err(swept.error)
     }
-    sweepCursor = undefined
+    // A sweep that reached the end of the listing starts the next one over; one cut by the key limit continues.
+    sweepCursor = listing?.nextCursor
     const result = counts()
     logger.info({...result}, 'operator session sweep finished')
     return ok(result)

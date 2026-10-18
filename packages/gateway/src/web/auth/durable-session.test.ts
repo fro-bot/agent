@@ -968,6 +968,52 @@ describe('push replay', () => {
     expect(active.success && active.data.map(record => record.endpoint)).toEqual([refreshed])
   })
 
+  it('keeps a subscription refreshed between the replay read and its write: the CAS retry honors the fence', async () => {
+    // #given an operator with a subscription whose logout deactivation failed, leaving it active
+    const store = createTestObjectStore()
+    const clock = {now: NOW}
+    const pushStore = createOperatorPushSubscriptionStore({
+      adapter: store.adapter,
+      logger: {debug: () => {}, warn: () => {}},
+      clock: () => clock.now,
+    })
+    const hook = (githubUserId: number, context?: SessionRevokedContext): void => {
+      pushStore
+        .deactivateForOperator({
+          operatorId: String(githubUserId),
+          ...(context === undefined ? {} : {updatedBefore: context.replayFenceMs}),
+        })
+        .catch(() => undefined)
+    }
+    const endpoint = 'https://push.example.test/endpoint-raced'
+    const subscribe = async () =>
+      pushStore.subscribe({operatorId: String(OPERATOR_ID), endpoint, p256dh: 'p256dh', auth: 'auth', keyVersion: 'v1'})
+    const a = await createReadyHarness({store, clock, hook})
+    const sessionId = await createSession(a)
+    await subscribe()
+    store.failNext('conditionalPut', {match: key => key.startsWith('operator-push/')})
+    await a.session.revoke(sessionId)
+    await settle()
+
+    // #when the replay has read the old record and, just before its write, the operator resubscribes
+    clock.now = NOW + 60_000
+    store.onBefore('conditionalPut', async key => {
+      if (key.startsWith('operator-push/subscriptions/')) {
+        store.onBefore('conditionalPut', undefined)
+        clock.now = NOW + 61_000
+        await subscribe()
+      }
+    })
+    const b = createHarness({store, clock, hook})
+    await b.session.load()
+    await settle()
+    await new Promise<void>(resolve => setTimeout(resolve, 20))
+
+    // #then the replay's write lost its CAS, its retry saw the refreshed record, and the subscription stays active
+    const active = await pushStore.getActiveRecordsForOperator({operatorId: String(OPERATOR_ID)})
+    expect(active.success && active.data.map(record => record.endpoint)).toEqual([endpoint])
+  })
+
   it('stamps revokedAt on a rotation and still skips it at replay', async () => {
     // #given a session rotated late in its life
     const store = createTestObjectStore()

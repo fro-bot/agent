@@ -834,6 +834,68 @@ describe('sweep', () => {
     expect(remaining.length).toBeGreaterThan(2)
   })
 
+  it('continues past a key-limited batch on successful sweeps, so retained records cannot hide expired ones', async () => {
+    // #given nine records sorted by key: the first three retained, the last six expired, and a three-key limit
+    const harness = createHarness({scanMaxKeys: 3})
+    const hashes = Array.from({length: 9}, (_, index) => plantedHash(`k${index}`)).sort()
+    const retained = hashes.slice(0, 3)
+    const expired = hashes.slice(3)
+    for (const hash of retained) plant(harness, hash, {issuedAt: NOW})
+    for (const hash of expired) plant(harness, hash, {issuedAt: NOW - TTL_MS - 1})
+
+    // #when sweeping, every sweep succeeding
+    const outcomes: boolean[] = []
+    const truncated: number[] = []
+    for (let sweep = 0; sweep < 3; sweep++) {
+      const swept = await harness.persistence.sweep()
+      outcomes.push(swept.success)
+      truncated.push(swept.success ? swept.data.truncated : -1)
+    }
+
+    // #then three sweeps are enough to delete every expired record, and the retained ones stay
+    expect(outcomes).toEqual([true, true, true])
+    expect(truncated[0]).toBeGreaterThan(0)
+    expect(expired.some(hash => harness.store.objects.has(buildSessionKey(hash)))).toBe(false)
+    expect(retained.every(hash => harness.store.objects.has(buildSessionKey(hash)))).toBe(true)
+  })
+
+  it('wraps the continuation, so records before the cursor are reached in the same sweep', async () => {
+    // #given six records and a four-key limit: the first two will expire early, the other four stay live
+    const harness = createHarness({scanMaxKeys: 4})
+    const hashes = Array.from({length: 6}, (_, index) => plantedHash(`w${index}`)).sort()
+    const early = hashes.slice(0, 2)
+    for (const hash of early) plant(harness, hash, {issuedAt: NOW - 3 * DAY_MS})
+    for (const hash of hashes.slice(2)) plant(harness, hash, {issuedAt: NOW})
+    const first = await harness.persistence.sweep()
+    expect(first.success && first.data).toMatchObject({truncated: 2, deleted: 0})
+
+    // #when the early records expire and the next sweep continues from the fifth key
+    harness.setNow(NOW + 5 * DAY_MS)
+    const second = await harness.persistence.sweep()
+
+    // #then the sweep wrapped past the end of the listing and deleted them
+    expect(second.success && second.data).toMatchObject({deleted: 2, truncated: 2})
+    expect(early.some(hash => harness.store.objects.has(buildSessionKey(hash)))).toBe(false)
+    expect(harness.store.objects.size).toBe(4)
+  })
+
+  it('keeps visiting every key when the cursor key is deleted by someone else', async () => {
+    // #given a key-limited sweep that left its cursor on the third key, and that key then removed
+    const harness = createHarness({scanMaxKeys: 2})
+    const hashes = Array.from({length: 6}, (_, index) => plantedHash(`d${index}`)).sort()
+    for (const hash of hashes) plant(harness, hash, {issuedAt: NOW})
+    const first = await harness.persistence.sweep()
+    expect(first.success && first.data.truncated).toBe(4)
+    harness.store.remove(buildSessionKey(hashes[2] ?? ''))
+    harness.setNow(NOW + TTL_MS + 1)
+
+    // #when sweeps continue
+    for (let sweep = 0; sweep < 3 && harness.store.objects.size > 0; sweep++) await harness.persistence.sweep()
+
+    // #then no key was skipped
+    expect(harness.store.objects.size).toBe(0)
+  })
+
   it('starts no delete once the sweep is cancelled', async () => {
     // #given expired records, slow reads and a short deadline
     const harness = createHarness({scanConcurrency: 1, scanTimeoutMs: 30})
