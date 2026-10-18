@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-10-11"
-updated-by: "18890129"
+last-updated: "2026-10-18"
+updated-by: "1dcd6a296d36057a6680ca347bf01a6987d78ec9"
 sources:
   - src/services/cache/cache-key.ts
   - src/shared/cache-save-result.ts
@@ -107,6 +107,8 @@ The implementation lives in `packages/runtime/src/object-store/` and consists of
 - **`validation.ts`** — Endpoint validation (HTTPS enforcement, SSRF protection against link-local/loopback/private IPs, metadata service blocking for `169.254.169.254` and `fd00:ec2::254`), prefix validation, key component sanitization, and download path traversal checks.
 
 - **`types.ts`** — Defines the `ObjectStoreAdapter` interface and typed error factories (`ValidationError`, `PathTraversalError`, `ObjectStoreOperationError`). The interface keeps the core upload/download/list operations required and exposes the conditional (ETag-guarded) and recency-aware operations — `conditionalPut`, `conditionalDelete`, `getObject`, and `listWithMetadata` — as optional, so backends that do not need them are not forced to implement them. `conditionalPut` also accepts an optional `tagging` string: the coordination layer (see [[Execution Lifecycle]]) tags its run-state objects so a bucket lifecycle policy can expire them on its own schedule. Tagging is applied only on real AWS S3 (`config.endpoint == null`); custom S3-compatible endpoints skip it, since their tagging support varies. Session database objects themselves are not tagged — the tag path is specific to the short-lived coordination records, not the durable session backup.
+
+The coordination read and delete operations also accept an optional abort signal. The S3 adapter passes it to the SDK request and, for a streamed `getObject` response, destroys the body stream when the signal aborts. Cancellation therefore covers both waiting for headers and consuming the body, and returns an error result rather than a successful partial read. This lets the post-action lock-release deadline bound real I/O, not merely stop awaiting a request that continues in the background ([[Execution Lifecycle]]).
 
 ### How It Integrates
 

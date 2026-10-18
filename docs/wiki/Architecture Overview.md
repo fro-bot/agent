@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-10-11"
-updated-by: "18890129"
+last-updated: "2026-10-18"
+updated-by: "1dcd6a296d36057a6680ca347bf01a6987d78ec9"
 sources:
   - src/main.ts
   - src/post.ts
@@ -20,6 +20,10 @@ sources:
   - packages/runtime/src/index.ts
   - packages/runtime/src/coordination/types.ts
   - packages/harness/src/cli.ts
+  - packages/harness/src/opencode.ts
+  - packages/harness/src/run-passthrough.ts
+  - packages/harness/src/resolve-binary.ts
+  - packages/harness/src/exec-binary.ts
   - packages/harness/src/integrate.ts
   - packages/gateway/src/main.ts
   - packages/gateway/src/execute/run.ts
@@ -108,7 +112,7 @@ Both entry points are thin wrappers. `main.ts` delegates to `harness/run.ts`; `p
 
 The CLI is a drop-in replacement — all arguments pass through to the patched OpenCode binary. Own subcommands (`info`, `patches`, `doctor`) report provenance (upstream tag, integration refs, build SHA) and health. The `integrate` merge step (`integrate.ts`) runs the OpenCode merge agent in CI over prompt-injectable upstream PR content, so both of its GitHub credentials are short-lived and minted just-in-time rather than drawn from durable secrets. The merge agent's own auth is minted from an OIDC broker (`scripts/harness/mint-broker-credential.ts`), and the credential used to `git push` the merge result is a scoped GitHub App installation token — single-repo, `contents: write`-only, roughly one-hour TTL — minted inline by a trusted no-post step (`scripts/harness/mint-app-token.ts`) that validates the returned token's scope all-or-nothing and fails closed on any mismatch. Neither mint has a durable-credential fallback, and the App private key is mapped only to the mint step's environment, never to job-level env or disk. As further defense-in-depth, the harness masks the `github-token` value and scrubs the raw `INPUT_GITHUB-TOKEN` copy from the merge child's environment so the OpenCode subprocess never inherits it.
 
-The package ships as `@fro.bot/harness` (the main resolver) plus four per-platform packages (`@fro.bot/harness-linux-x64`, `-linux-arm64`, `-darwin-x64`, `-darwin-arm64`), each containing only its native binary. The main package's `postinstall` resolver picks the host platform's binary, verifies it, and symlinks it; `OPENCODE_PATH` and a bare `opencode` on `PATH` are honored as fallbacks for local or unbuilt use. Per-platform `optionalDependencies` are injected at publish time and are not listed in the workspace `package.json`.
+The package ships as `@fro.bot/harness` (the main resolver) plus four per-platform packages (`@fro.bot/harness-linux-x64`, `-linux-arm64`, `-darwin-x64`, `-darwin-arm64`), each containing only its native binary. Its two commands have different roles: `harness` reserves provenance and maintenance subcommands, while `opencode` passes every argument directly to the native binary. Both passthrough paths share `run-passthrough.ts`, which resolves without a version-probe subprocess, forwards signals, and propagates the child's exit. Resolution selects an explicit native `OPENCODE_PATH`, then the platform package, and searches `PATH` only with `HARNESS_ALLOW_PATH_FALLBACK=1`; realpath and inode checks reject the shims themselves to prevent recursion. The advisory `postinstall` check is not required for command execution. Per-platform `optionalDependencies` are injected at publish time and are not listed in the workspace `package.json`. [[Setup and Configuration]] explains how Action setup separately verifies the requested version.
 
 The dedicated integration workflow (`.github/workflows/harness-integrate.yaml`) mints the App push token **before** running the merge agent. Its private key is supplied only to that pre-agent step, so no later step reintroduces it after agent-influenced code has run. The masked token output reaches trusted finalization, not the agent's environment. A 40-minute cap on the agent step leaves headroom within the token's roughly one-hour lifetime; a push after expiry fails closed rather than minting again in the modified workspace.
 
@@ -332,7 +336,7 @@ harness-release.yaml (workflow_dispatch OR push: harness-v* tag)
   │     → emit: base_version, rendered_prompt, has_refs
   │
   ├─→ integrate job (skipped when has_refs == 'false')
-  │     uses: .github/workflows/fro-bot.yaml (Fro Bot agent, secrets: inherit)
+  │     uses: .github/workflows/harness-integrate.yaml (explicit secrets, short-lived credentials)
   │     agent:
   │       clone anomalyco/opencode → create integration branch at base tag
   │       → merge configured refs (harness.config.json carry-policy allowlist)
