@@ -28,6 +28,8 @@ tags:
 
 # Web operator launch surface: fire-and-return, server-owned resolution, denylist-before-authz on a write route
 
+> **Superseded in part.** The token-based authorization in this doc is replaced. Sessions no longer hold a GitHub OAuth token, so `checkRepoAuthz` and the per-repo GitHub authz fan-out no longer exist. Every route that names a repository, reads and writes alike, uses one bindings-only predicate, `resolveRepoAccess`: the repository is bound and not denylisted. A write route no longer tracks the operator's GitHub rights, and dispatch and launch act on GitHub as the Fro Bot GitHub App installation. See [Allowlist and repository access](../../wiki/Operator%20Web%20Control%20Surface.md#allowlist-and-repository-access-webauthallowlistts-weboperatorroute-helpersts). The fire-and-return, idempotency, no-oracle, enumeration-order and approval-transport guidance below still applies.
+
 ## Context
 
 The gateway operator web surface gained the ability to **launch** work from the browser: `GET /operator/repos` lists the repos an operator may launch in, and `POST /operator/runs` starts a run in one — through the same transport-neutral `launchWork` engine the Discord mention loop uses (`packages/gateway/src/execute/run.ts`). The engine was already transport-neutral: `LaunchWorkRequest` (`packages/gateway/src/execute/launch-types.ts`) is a pure data structure the Discord adapter (`runMention`) populates. The launch surface added three additive, optional engine seams (`runId?`, `promptBuilder?`, `createApprovalOnPending?`) so a new HTTP transport could drive the engine without the engine learning about HTTP.
@@ -70,6 +72,8 @@ try {
 Run admission was later moved into `launchWork` itself, so a queued run and a run that fails before execution both produce an observable `RunState` from the moment they are accepted (the route awaits admission, then commits idempotency). A `202`'d `runId` is therefore observable over SSE for every accepted disposition, not just the immediate-run happy path.
 
 ### 2. Server-owned repo resolution on a write route
+
+> Superseded in part: the `checkRepoAuthz` step in the snippet below is gone. After the binding is found and the denylist passes, `resolveRepoAccess` returns allowed; there is no GitHub call.
 
 The client names a repo as an `owner/repo` string; the server resolves it via `getBindingByRepo` and ignores any client-supplied binding, path, or owner tuple. The denylist check runs **before** authorization (a denylisted repo never triggers a GitHub call), and every pre-launch denial returns the same coarse shape — so an attacker cannot tell "does not exist" from "exists but denylisted" from "exists but you lack access."
 
@@ -123,6 +127,8 @@ const onPending = request.createApprovalOnPending === undefined
 The `?? default` (or `=== undefined ? default : ...`) selection is the single point where the other transport's behavior is preserved. Skipping the empty-string guard is exactly how an "additive" change silently regresses.
 
 ### 5. Scoped enumeration: denylist-filter, dedup, hard cap, per-repo authz, closed DTO
+
+> Superseded in part: there is no per-repo authz step or GitHub fan-out. The listing filters the bindings it already holds (denylist, dedup, cap) and makes one `listBindings` read, so the operator-keyed rate limit no longer guards an OAuth budget.
 
 A repo list must not let an allowed operator enumerate unrelated repositories, and duplicate channel bindings must not crowd distinct repos out of the cap. The working set is built in strict order: `listBindings` → `filterDeniedRecords` (denylist-first, before any authz call) → dedup by `owner/repo` → hard cap → per-repo `checkRepoAuthz`, keeping only repos the operator actually accesses. Denied/unauthorized repos are silently omitted (not differentiated). The projection is closed by construction — it copies only the display-safe fields, never spreads the binding — so a future internal binding field cannot leak.
 

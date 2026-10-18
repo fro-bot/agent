@@ -936,6 +936,26 @@ describe('createOperatorPushSubscriptionStore — deactivateForOperator', () => 
     expect(listed.data.every(m => m.inactiveReason === 'session-revoked')).toBe(true)
   })
 
+  it('leaves a record updated at or after the updatedBefore fence active and deactivates older ones', async () => {
+    // #given one subscription made before a fence and one refreshed at the fence
+    let now = 1_000
+    const store = makeStore(createCasFakeAdapter(), () => now)
+    const base = {operatorId: 'operator-a', p256dh: 'p', auth: 'a', keyVersion: '1'}
+    await store.subscribe({...base, endpoint: 'https://push.example.com/ep-fence-old'})
+    now = 5_000
+    await store.subscribe({...base, endpoint: 'https://push.example.com/ep-fence-new'})
+
+    // #when a replay deactivates with the fence at the newer subscription's time
+    now = 6_000
+    const result = await store.deactivateForOperator({operatorId: 'operator-a', updatedBefore: 5_000})
+
+    // #then only the older record is deactivated
+    expect(result.success && result.data).toEqual({updated: 1, skipped: 0})
+    const active = await store.getActiveRecordsForOperator({operatorId: 'operator-a'})
+    if (active.success === false) throw new Error('unreachable')
+    expect(active.data.map(record => record.endpoint)).toEqual(['https://push.example.com/ep-fence-new'])
+  })
+
   it("is operator-scoped: does not affect another operator's records", async () => {
     // #given operator A and operator B each with an active subscription
     const store = makeStore(createCasFakeAdapter())

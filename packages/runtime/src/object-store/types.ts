@@ -18,8 +18,16 @@ export interface ObjectStoreAdapter {
       tagging?: string
     },
   ) => Promise<Result<{etag: string}, Error>>
-  readonly conditionalDelete?: (key: string, options: {ifMatch: string}) => Promise<Result<void, Error>>
-  readonly getObject?: (key: string) => Promise<Result<{data: string; etag: string}, Error>>
+  /** `signal` aborts the in-flight request; an aborted call resolves to `err`. */
+  readonly conditionalDelete?: (
+    key: string,
+    options: {ifMatch: string; signal?: AbortSignal},
+  ) => Promise<Result<void, Error>>
+  /** `signal` aborts the request and the body read; an aborted call resolves to `err`. */
+  readonly getObject?: (
+    key: string,
+    options?: {signal?: AbortSignal},
+  ) => Promise<Result<{data: string; etag: string}, Error>>
   /** Returns keys with their S3 LastModified timestamps for recency-bounded scans. */
   readonly listWithMetadata?: (
     prefix: string,

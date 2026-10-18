@@ -32,10 +32,10 @@
  * (c) fail-closed: a redacted entry with no usable deny key, or an unreadable
  *     denylist, MUST DENY — never return an unfiltered union. When in doubt, omit.
  *
- * (d) composes alongside checkRepoAuthz (packages/gateway/src/web/auth/repo-authz.ts),
- *     NOT instead of: checkRepoAuthz proves the operator MAY see a repo; redaction
- *     proves the repo IS NOT hidden by policy. BOTH must pass before repo data is
- *     surfaced. The two gates cannot silently diverge.
+ * (d) composes alongside resolveRepoAccess (packages/gateway/src/web/operator/route-helpers.ts),
+ *     NOT instead of: the binding check proves the repo is one the operator surface
+ *     serves; redaction proves the repo IS NOT hidden by policy. BOTH must pass before
+ *     repo data is surfaced. The two gates cannot silently diverge.
  *
  * Scope: this obligation applies to OperatorRunStatus projections (the entity_ref
  * leak path) as well as to direct repo-data queries. An OperatorRunStatus record
@@ -49,8 +49,8 @@ export const REDACTION_OBLIGATION: string =
   'derive numeric database_id for stable matching; exact-string matching on node_id alone is insufficient. ' +
   '(c) fail-closed — a redacted entry with no usable deny key, or an unreadable denylist, MUST DENY; ' +
   'never return an unfiltered union. ' +
-  '(d) composes alongside checkRepoAuthz (web/auth/repo-authz.ts), NOT instead of: ' +
-  'checkRepoAuthz proves the operator MAY see a repo; redaction proves the repo IS NOT hidden by policy; ' +
+  '(d) composes alongside resolveRepoAccess (web/operator/route-helpers.ts), NOT instead of: ' +
+  'the binding check proves the repo is one the operator surface serves; redaction proves the repo IS NOT hidden by policy; ' +
   'BOTH must pass. The two gates cannot silently diverge. ' +
   'Cross-reference: fro-bot/dashboard docs/solutions/security-issues/cross-source-redaction-denylist-before-query-2026-06-15.md'
 

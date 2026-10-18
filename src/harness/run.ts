@@ -17,7 +17,7 @@ import * as core from '@actions/core'
 import {applyTerminalReaction} from '../features/agent/index.js'
 import {createMetricsCollector, writeInvocationOutcomeSummary} from '../features/observability/index.js'
 import {createReviewDeliveryReceiptOperations} from '../services/github/review-delivery-receipt.js'
-import {getGitHubRunAttempt, getGitHubWorkspace} from '../shared/env.js'
+import {getGitHubRunAttempt, getGitHubWorkspace, getInvocationIdentity} from '../shared/env.js'
 import {createLogger} from '../shared/logger.js'
 import {setActionOutputs, setInvocationOutcomeOutput} from './config/outputs.js'
 import {STATE_KEYS} from './config/state-keys.js'
@@ -177,6 +177,7 @@ export async function run(): Promise<number> {
       repo,
       runId,
       runAttempt: getGitHubRunAttempt(),
+      jobIdentity: getInvocationIdentity(),
     })
     switch (lockResult.outcome) {
       case 'acquired':
@@ -210,9 +211,7 @@ export async function run(): Promise<number> {
         setUnavailableActionOutputs(Date.now() - startTime)
         skipSessionPersistence = true
         core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
-        core.setFailed(
-          `Could not acquire the Action coordination lock; refusing to run unlocked: ${lockResult.error.message}`,
-        )
+        core.setFailed(`Action coordination lock unavailable; refusing to run without it: ${lockResult.error.message}`)
         return 1
       }
       case 's3-disabled':

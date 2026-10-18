@@ -20,7 +20,6 @@ import type {RunState} from '@fro-bot/runtime'
 import type {ServerType} from '@hono/node-server'
 
 import type {GitHubOAuthConfig, GitHubOAuthDeps} from './auth/github.js'
-import type {RepoAuthzCache} from './auth/repo-authz.js'
 import type {SessionDeps} from './auth/session.js'
 import type {ResolvedClientAddress} from './ingress/resolve-client.js'
 import type {OperatorServerConfig, OperatorServerDeps} from './server.js'
@@ -34,7 +33,8 @@ import {OPERATOR_CONTRACT_VERSION} from '../operator-contract/index.js'
 import {loadAllowlistFromText} from './auth/allowlist.js'
 import {generateCsrfToken} from './auth/csrf.js'
 import {createInMemoryStateStore} from './auth/github.js'
-import {createInMemorySessionStore, SESSION_COOKIE_NAME} from './auth/session.js'
+import {SESSION_COOKIE_NAME} from './auth/session.js'
+import {createTestSessionStore, mintTestSession} from './auth/test-session-store.js'
 import {makeDirectIngressPolicy, makeTrustedProxyIngressPolicy} from './ingress/policy.js'
 import {unsafeResolvedClientAddressForTest} from './ingress/resolve-client.js'
 import {parseTrustedProxyAddress} from './ingress/trusted-proxy-address.js'
@@ -325,10 +325,10 @@ describe('GET /operator/health — push health stays off the public surface', ()
     }
   })
 
-  it('does not change the route inventory when a push health reader is supplied', () => {
+  it('does not change the route inventory when a push health reader is supplied', async () => {
     // #given the same full browser-guard deps with and without a push health reader
+    const sessionStore = await createTestSessionStore()
     const inventory = (operatorPushHealth?: OperatorServerDeps['operatorPushHealth']): RouteEntry[] => {
-      const sessionStore = createInMemorySessionStore()
       const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
       const app = buildOperatorApp(
         makeStubDeps({
@@ -1003,7 +1003,7 @@ describe('GET /operator/health — derived accounting keys (#1652)', () => {
 describe('POST /operator/auth/logout — anonymous traffic cannot spend the shared bucket (#1652)', () => {
   it('an unauthenticated logout is rejected by the guard before the shared limiter is consulted', async () => {
     // #given — logout wired with a recording shared limiter, no session presented
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
     const rateLimiter = {allow: vi.fn(() => true)}
     const {port, close} = await startRealOperatorServer(
@@ -1035,10 +1035,9 @@ describe('POST /operator/auth/logout — anonymous traffic cannot spend the shar
 
   it('an authenticated logout spends the shared bucket on the derived accounting key', async () => {
     // #given
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
     const csrfToken = generateCsrfToken({sessionId, operatorId: 42, nowMs: now + 1000, secret: csrfSecret})
     const rateLimiter = {allow: vi.fn(() => true)}
@@ -1076,13 +1075,17 @@ describe('POST /operator/auth/logout — anonymous traffic cannot spend the shar
   it('authenticated logouts from one /64 share a bucket; an adjacent /64 is independent', async () => {
     // #given — direct policy (the socket IS the client), a limit-1 shared bucket, and three
     // authenticated operators, each with their own session + CSRF token
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
     const {logger, auditLogger, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
     const allowlist = loadAllowlistFromText('41\n42\n43\n', logger)
-    const operators = [41, 42, 43].map(githubUserId => {
-      const sessionId = sessionStore.create({githubUserId, login: `op${githubUserId}`}, '', now)
-      if (sessionId === undefined) throw new Error('expected session to be created')
+    const operatorSessions = await Promise.all(
+      [41, 42, 43].map(async githubUserId => ({
+        githubUserId,
+        sessionId: await mintTestSession(sessionStore, {githubUserId, login: `op${githubUserId}`}),
+      })),
+    )
+    const operators = operatorSessions.map(({githubUserId, sessionId}) => {
       const csrfToken = generateCsrfToken({
         sessionId,
         operatorId: githubUserId,
@@ -1355,9 +1358,9 @@ function makeStubSessionDeps(overrides?: Partial<SessionDeps>): SessionDeps {
 }
 
 describe('buildOperatorApp — logout route registration', () => {
-  it('registers POST /operator/auth/logout when sessionStore, sessionDeps, and browser guard deps are provided', () => {
+  it('registers POST /operator/auth/logout when sessionStore, sessionDeps, and browser guard deps are provided', async () => {
     // #given — all required deps for logout (sessionStore + sessionDeps + browser guard deps)
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const sessionDeps = makeStubSessionDeps()
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
     const app = buildOperatorApp(
@@ -1401,9 +1404,9 @@ describe('buildOperatorApp — logout route registration', () => {
     expect(routes).not.toContainEqual({method: 'POST', path: '/operator/auth/logout'})
   })
 
-  it('throws a programming error when sessionStore/sessionDeps are present but browser guard deps are absent', () => {
+  it('throws a programming error when sessionStore/sessionDeps are present but browser guard deps are absent', async () => {
     // #given — sessionStore + sessionDeps without allowlist/csrfSecret/auditLogger
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const sessionDeps = makeStubSessionDeps()
 
     // #when / #then — must throw: public mutating logout is a CSRF footgun
@@ -1412,9 +1415,9 @@ describe('buildOperatorApp — logout route registration', () => {
     )
   })
 
-  it('logout route is classified as privileged (requires session + CSRF)', () => {
+  it('logout route is classified as privileged (requires session + CSRF)', async () => {
     // #given — all required deps for logout
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const sessionDeps = makeStubSessionDeps()
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
     const app = buildOperatorApp(
@@ -1429,10 +1432,9 @@ describe('buildOperatorApp — logout route registration', () => {
 
   it('logout route returns 200 and clears the session cookie when session + CSRF are valid', async () => {
     // #given — all required deps for logout
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
@@ -1465,7 +1467,7 @@ describe('buildOperatorApp — logout route registration', () => {
       expect(res.status).toBe(200)
 
       // #and — session is invalidated
-      expect(sessionStore.get(sessionId, now + 2000)).toBeUndefined()
+      expect(sessionStore.get(sessionId)).toBeUndefined()
 
       // #and — clear-cookie header is set
       const setCookie = res.headers.get('set-cookie') ?? ''
@@ -1479,10 +1481,9 @@ describe('buildOperatorApp — logout route registration', () => {
   it('logout route returns 429 when rate limiter rejects (after guard passes)', async () => {
     // #given — valid session + CSRF, but rate limiter always blocks
     // Rate limit check runs inside the handler after the guard passes.
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
@@ -1520,10 +1521,9 @@ describe('buildOperatorApp — logout route registration', () => {
 
   it('logout route clears cookie and invalidates session when rate limiter allows', async () => {
     // #given — rate limiter allows; valid session + CSRF
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
@@ -1554,7 +1554,7 @@ describe('buildOperatorApp — logout route registration', () => {
 
       // #then — allowed; session cleared
       expect(res.status).toBe(200)
-      expect(sessionStore.get(sessionId, now + 2000)).toBeUndefined()
+      expect(sessionStore.get(sessionId)).toBeUndefined()
       const setCookie = res.headers.get('set-cookie') ?? ''
       expect(setCookie.toLowerCase()).toContain('max-age=0')
     } finally {
@@ -1569,7 +1569,7 @@ describe('buildOperatorApp — logout route registration', () => {
 
 const TEST_CSRF_SECRET = Buffer.from('test-csrf-secret-32-bytes-long!!', 'utf8').toString('base64url')
 
-function makeStubBrowserGuardDeps(sessionStore: ReturnType<typeof createInMemorySessionStore>) {
+function makeStubBrowserGuardDeps(sessionStore: Awaited<ReturnType<typeof createTestSessionStore>>) {
   const logger = makeLogger()
   const auditLogger = {info: vi.fn(), warn: vi.fn()}
   const allowlist = loadAllowlistFromText('42\n', logger)
@@ -1583,9 +1583,9 @@ function makeStubBrowserGuardDeps(sessionStore: ReturnType<typeof createInMemory
 }
 
 describe('buildOperatorApp — CSRF endpoint registration', () => {
-  it('registers GET /operator/session/csrf when allowlist, csrfSecret, auditLogger, and sessionStore are provided', () => {
+  it('registers GET /operator/session/csrf when allowlist, csrfSecret, auditLogger, and sessionStore are provided', async () => {
     // #given
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
     const app = buildOperatorApp(
       makeStubDeps({sessionStore, sessionDeps: makeStubSessionDeps(), allowlist, csrfSecret, auditLogger, logger}),
@@ -1632,10 +1632,9 @@ describe('buildOperatorApp — CSRF endpoint registration', () => {
 describe('GET /operator/session/csrf — happy path', () => {
   it('returns 200 with csrfToken when session is valid and operator is allowlisted', async () => {
     // #given
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
     const app = buildOperatorApp(
@@ -1669,7 +1668,7 @@ describe('GET /operator/session/csrf — happy path', () => {
 
   it('returns 401 when no session cookie is present', async () => {
     // #given
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
     const app = buildOperatorApp(
       makeStubDeps({
@@ -1696,10 +1695,9 @@ describe('GET /operator/session/csrf — happy path', () => {
 
   it('returns 403 when operator is not in allowlist', async () => {
     // #given — session for user 99 who is NOT in the allowlist (allowlist has 42)
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 99, login: 'notallowed'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 99, login: 'notallowed'})
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
     const app = buildOperatorApp(
@@ -1730,10 +1728,9 @@ describe('GET /operator/session/csrf — happy path', () => {
 
   it('returns 400 when Origin does not match publicOrigin', async () => {
     // #given
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
     const app = buildOperatorApp(
@@ -1764,10 +1761,9 @@ describe('GET /operator/session/csrf — happy path', () => {
 
   it('returns 400 when non-cookie credential scheme is present', async () => {
     // #given
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
     const app = buildOperatorApp(
@@ -1805,7 +1801,7 @@ describe('GET /operator/session/csrf — happy path', () => {
 describe('registerOperatorRoute — auto-guard applies browser guard to privileged routes', () => {
   it('a privileged route registered via registerOperatorRoute rejects unauthenticated requests with 401', async () => {
     // #given — build app with browser guard deps and a privileged route
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
     const app = buildOperatorApp(
       makeStubDeps({
@@ -1832,10 +1828,9 @@ describe('registerOperatorRoute — auto-guard applies browser guard to privileg
 
   it('a privileged route registered via registerOperatorRoute rejects non-allowlisted operators with 403', async () => {
     // #given — session for user 99 who is NOT in the allowlist (allowlist has 42)
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 99, login: 'notallowed'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 99, login: 'notallowed'})
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
     const app = buildOperatorApp(
@@ -1872,7 +1867,7 @@ describe('registerOperatorRoute — auto-guard applies browser guard to privileg
 describe('POST /operator/auth/logout — browser guard protection', () => {
   it('rejects logout without session cookie with 401 when browser guard is enabled', async () => {
     // #given — app with browser guard deps
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
     const app = buildOperatorApp(
       makeStubDeps({
@@ -1900,10 +1895,9 @@ describe('POST /operator/auth/logout — browser guard protection', () => {
 
   it('rejects logout without CSRF token with 400 when browser guard is enabled', async () => {
     // #given — valid session but no CSRF token
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
     const app = buildOperatorApp(
@@ -1936,10 +1930,9 @@ describe('POST /operator/auth/logout — browser guard protection', () => {
 
   it('allows logout with valid session and CSRF token when browser guard is enabled', async () => {
     // #given — valid session and valid CSRF token
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
     const {generateCsrfToken: genToken} = await import('./auth/csrf.js')
@@ -1972,7 +1965,7 @@ describe('POST /operator/auth/logout — browser guard protection', () => {
       // #then — success
       expect(res.status).toBe(200)
       // #and — session is invalidated
-      expect(sessionStore.get(sessionId, now + 2000)).toBeUndefined()
+      expect(sessionStore.get(sessionId)).toBeUndefined()
     } finally {
       await close()
     }
@@ -2008,10 +2001,9 @@ describe('buildOperatorApp — OAuth callback is cross-site public', () => {
 describe('server integration — forwarded-header rejection before CSRF', () => {
   it('rejects with 400 on bad forwarded headers before reaching CSRF check', async () => {
     // #given — server with browser guard enabled
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
     const app = buildOperatorApp(
@@ -2048,9 +2040,9 @@ describe('server integration — forwarded-header rejection before CSRF', () => 
 // ---------------------------------------------------------------------------
 
 describe('buildOperatorApp — partial browser guard deps throws at construction time (Fix 4)', () => {
-  it('throws when allowlist is provided but csrfSecret is absent', () => {
+  it('throws when allowlist is provided but csrfSecret is absent', async () => {
     // #given — allowlist present but csrfSecret and auditLogger absent
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const {allowlist} = makeStubBrowserGuardDeps(sessionStore)
 
     // #when / #then — partial deps must throw at construction time
@@ -2062,9 +2054,9 @@ describe('buildOperatorApp — partial browser guard deps throws at construction
     ).toThrow(/partial browser guard deps/)
   })
 
-  it('throws when csrfSecret is provided but allowlist is absent', () => {
+  it('throws when csrfSecret is provided but allowlist is absent', async () => {
     // #given — csrfSecret present but allowlist and auditLogger absent
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const {csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
 
     // #when / #then
@@ -2076,9 +2068,9 @@ describe('buildOperatorApp — partial browser guard deps throws at construction
     ).toThrow(/partial browser guard deps/)
   })
 
-  it('throws when auditLogger is provided but allowlist and csrfSecret are absent', () => {
+  it('throws when auditLogger is provided but allowlist and csrfSecret are absent', async () => {
     // #given — auditLogger present but allowlist and csrfSecret absent
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const {auditLogger} = makeStubBrowserGuardDeps(sessionStore)
 
     // #when / #then
@@ -2096,9 +2088,9 @@ describe('buildOperatorApp — partial browser guard deps throws at construction
     expect(() => buildOperatorApp(makeStubDeps(), makeStubConfig())).not.toThrow()
   })
 
-  it('does NOT throw when all four browser guard deps are present (guard enabled)', () => {
+  it('does NOT throw when all four browser guard deps are present (guard enabled)', async () => {
     // #given — all four browser guard deps present
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
 
     // #when / #then — all present is valid (guard enabled)
@@ -2118,10 +2110,9 @@ describe('buildOperatorApp — partial browser guard deps throws at construction
 describe('GET /operator/session/csrf — Cache-Control and Vary headers (Fix 7)', () => {
   it('returns Cache-Control: no-store, private on successful CSRF token response', async () => {
     // #given — valid session and allowlisted operator
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
     const app = buildOperatorApp(
@@ -2155,10 +2146,9 @@ describe('GET /operator/session/csrf — Cache-Control and Vary headers (Fix 7)'
 
   it('returns Vary header on successful CSRF token response', async () => {
     // #given — valid session and allowlisted operator
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
     const app = buildOperatorApp(
@@ -2191,10 +2181,9 @@ describe('GET /operator/session/csrf — Cache-Control and Vary headers (Fix 7)'
 
   it('returns Vary header on rejection response (origin mismatch)', async () => {
     // #given — valid session but wrong Origin
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
     const app = buildOperatorApp(
@@ -2390,7 +2379,7 @@ function makeStubOperatorPushVapidKeyInfo(): NonNullable<OperatorServerDeps['ope
 }
 
 /** Build a full-deps OperatorServerDeps with all privileged routes enabled. */
-function makeFullPrivilegedDeps(sessionStore: ReturnType<typeof createInMemorySessionStore>): OperatorServerDeps {
+function makeFullPrivilegedDeps(sessionStore: Awaited<ReturnType<typeof createTestSessionStore>>): OperatorServerDeps {
   const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
   return makeStubDeps({
     logger,
@@ -2431,10 +2420,10 @@ function extractRoutes(app: import('hono').Hono): {method: string; path: string}
     })
 }
 
-describe('buildOperatorApp — v1.5.0 full route-registration smoke (drift guard)', () => {
-  it('registers exactly the expected v1.5.0 operator route set when all privileged deps are present', () => {
+describe('buildOperatorApp — v1.5.0 full route-registration smoke (drift guard)', async () => {
+  it('registers exactly the expected v1.5.0 operator route set when all privileged deps are present', async () => {
     // #given — all privileged deps present
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const app = buildOperatorApp(
       makeFullPrivilegedDeps(sessionStore),
       makeStubConfig({githubOAuth: makeStubGitHubOAuthConfig()}),
@@ -2454,9 +2443,9 @@ describe('buildOperatorApp — v1.5.0 full route-registration smoke (drift guard
     expect(routes).toHaveLength(expectedV15Routes.size)
   })
 
-  it('dep-gated negative case: without the question registry the question routes and the run listing are absent', () => {
+  it('dep-gated negative case: without the question registry the question routes and the run listing are absent', async () => {
     // #given — every privileged dep except the question registry
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const app = buildOperatorApp(
       {...makeFullPrivilegedDeps(sessionStore), questionRegistry: undefined},
       makeStubConfig({githubOAuth: makeStubGitHubOAuthConfig()}),
@@ -2474,9 +2463,9 @@ describe('buildOperatorApp — v1.5.0 full route-registration smoke (drift guard
     ])
   })
 
-  it('dep-gated negative case: without the approval registry the approval routes and the run listing are absent', () => {
+  it('dep-gated negative case: without the approval registry the approval routes and the run listing are absent', async () => {
     // #given — every privileged dep except the approval registry
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const app = buildOperatorApp(
       {...makeFullPrivilegedDeps(sessionStore), approvalRegistry: undefined},
       makeStubConfig({githubOAuth: makeStubGitHubOAuthConfig()}),
@@ -2491,11 +2480,44 @@ describe('buildOperatorApp — v1.5.0 full route-registration smoke (drift guard
     expect(missing).toContain('GET:/operator/runs/:runId/approvals')
   })
 
+  it.each(['denylistCache', 'bindingsLookup', 'runObservationManager', 'runIndex'] as const)(
+    'dep-gated negative case: without %s the run-stream route is unmounted and nothing else is',
+    async omitted => {
+      // #given — every privileged dep except one of the stream route's own dependencies
+      const sessionStore = await createTestSessionStore()
+      const app = buildOperatorApp(
+        {...makeFullPrivilegedDeps(sessionStore), [omitted]: undefined},
+        makeStubConfig({githubOAuth: makeStubGitHubOAuthConfig()}),
+      )
+
+      // #when
+      const routeSet = new Set(extractRoutes(app).map(r => `${r.method}:${r.path}`))
+
+      // #then — the stream route is among the missing routes (the omission is visible, not silent)
+      const missing = EXPECTED_OPERATOR_ROUTES.map(r => `${r.method}:${r.path}`).filter(key => !routeSet.has(key))
+      expect(missing).toContain('GET:/operator/runs/:runId/stream')
+    },
+  )
+
+  it.each(['allowlist', 'auditLogger'] as const)(
+    'omitting %s (a run-stream lease dependency) fails construction and names it instead of unmounting silently',
+    async omitted => {
+      // #given — the stream route needs the allowlist and audit logger for its lease re-checks;
+      // both belong to the all-or-nothing browser guard
+      const sessionStore = await createTestSessionStore()
+      const deps = {...makeFullPrivilegedDeps(sessionStore), [omitted]: undefined}
+
+      // #when / #then
+      expect(() => buildOperatorApp(deps, makeStubConfig({githubOAuth: makeStubGitHubOAuthConfig()}))).toThrow(
+        new RegExp(`Missing: ${omitted}`),
+      )
+    },
+  )
+
   it('question decision route: a body over 64 KiB is rejected before session or run lookup', async () => {
     // #given — the full route set with spies on the session and run-index lookups
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const getSpy = vi.spyOn(sessionStore, 'get')
-    const getTokenSpy = vi.spyOn(sessionStore, 'getOperatorToken')
     const lookup = vi.fn(async () => undefined)
     const base = makeFullPrivilegedDeps(sessionStore)
     const app = buildOperatorApp(
@@ -2516,13 +2538,12 @@ describe('buildOperatorApp — v1.5.0 full route-registration smoke (drift guard
     expect(res.status).toBe(413)
     expect(lookup).not.toHaveBeenCalled()
     expect(getSpy).not.toHaveBeenCalled()
-    expect(getTokenSpy).not.toHaveBeenCalled()
   })
 
-  it('dep-gated negative case: without run/approval deps, privileged run/approval routes do NOT register', () => {
+  it('dep-gated negative case: without run/approval deps, privileged run/approval routes do NOT register', async () => {
     // #given — only OAuth + session/browser-guard deps (no launchWorkDeps, runIndex,
     // denylistCache, bindingsLookup, runObservationManager, approvalRegistry)
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
     const app = buildOperatorApp(
       makeStubDeps({
@@ -2623,24 +2644,14 @@ describe('buildOperatorApp — run stream resolves an evicted terminal run from 
     }
   }
 
-  const authorizedRepoAuthzCache = (): RepoAuthzCache => ({
-    get: () => ({authorized: true as const, expiresAt: Number.MAX_SAFE_INTEGER}),
-    set: () => undefined,
-    getInFlight: () => undefined,
-    setInFlight: () => undefined,
-    deleteInFlight: () => undefined,
-    tokenIdentityFor: () => 'stub-token-id',
-  })
-
   it(
     'emits ready, reset, terminal status then closes and releases the slot via the real server wiring',
     {timeout: 10_000},
     async () => {
       // #given the real operator app with an authorized operator session on a non-denied repo
-      const sessionStore = createInMemorySessionStore()
+      const sessionStore = await createTestSessionStore()
       const now = Date.now()
-      const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, 'operator-oauth-token', now)
-      if (sessionId === undefined) throw new Error('expected session to be created')
+      const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
       const guard = makeStubBrowserGuardDeps(sessionStore)
 
       // #given a persisted terminal RunState for RUN_ID (and a still-running one for LIVE_RUN_ID)
@@ -2689,7 +2700,6 @@ describe('buildOperatorApp — run stream resolves an evicted terminal run from 
           },
           runObservationManager: manager,
           runIndex,
-          repoAuthzCache: authorizedRepoAuthzCache(),
           rateLimiter: {allow: () => true},
         }),
         makeStubConfig({publicOrigin: 'https://operator.example.com'}),
@@ -2745,10 +2755,9 @@ describe('buildOperatorApp — run stream resolves an evicted terminal run from 
 // ---------------------------------------------------------------------------
 
 async function fetchSession(operatorPushHealth?: OperatorServerDeps['operatorPushHealth']) {
-  const sessionStore = createInMemorySessionStore()
+  const sessionStore = await createTestSessionStore()
   const now = Date.now()
-  const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-  if (sessionId === undefined) throw new Error('expected session to be created')
+  const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
   const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
   const app = buildOperatorApp(
@@ -2807,7 +2816,7 @@ describe('GET /operator/session — push health through buildOperatorApp', () =>
 
   it('does not expose push health to an unauthenticated caller', async () => {
     // #given a reader that would report degraded
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const {logger, auditLogger, allowlist, csrfSecret} = makeStubBrowserGuardDeps(sessionStore)
     const app = buildOperatorApp(
       makeStubDeps({

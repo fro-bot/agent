@@ -25,6 +25,8 @@ tags:
 
 # Authenticated SSE run-observation: no-oracle gating, redaction-before-authz, fail-closed teardown
 
+> **Superseded in part.** The token-based authorization in this doc is replaced. Sessions no longer hold a GitHub OAuth token, so `getOperatorToken` and `checkRepoAuthz` no longer exist, and the GitHub-backed authz cache and its ~6-minute revocation window are gone. Repository access is now one bindings-only predicate, `resolveRepoAccess`: the repository is bound and not denylisted. A revoked session closes a live stream at the next lease tick. See [Allowlist and repository access](../../wiki/Operator%20Web%20Control%20Surface.md#allowlist-and-repository-access-webauthallowlistts-weboperatorroute-helpersts). The no-oracle, redaction, server-owned resolution, teardown and stream-cap guidance below still applies.
+
 ## Context
 
 The gateway's operator web surface needed a way for an authenticated, allowlisted operator to watch a run's status live in the browser. It shipped as an inert SSE core plus an authenticated route (`packages/gateway/src/web/sse/`): a projection of internal run-state into an operator-safe status, a bounded non-blocking pub/sub manager, and `GET /operator/runs/:runId/stream`.
@@ -36,6 +38,8 @@ This is the first transport built on the transport-neutral execution/approval se
 ## Guidance
 
 ### 1. No-oracle for streaming auth
+
+> Superseded in part: the `getOperatorToken` step in the snippet below no longer exists. The gate sequence is session, run lookup, then `resolveRepoAccess`.
 
 Success is observable **only** as the `text/event-stream` response. Every denial — missing token, unknown run, malformed repo, denylisted repo, unauthorized — returns the identical generic `404`. Critically, a gate that **throws** must degrade to the same `404`, because an unhandled throw becomes a `500` that is distinguishable from the `404` and re-opens the oracle.
 
@@ -60,6 +64,8 @@ This prevents *content-* and *ACL-based* oracles (different response shapes by f
 This is the SSE analogue of the HTTP "identical 401 for every auth failure" rule in [signed-webhook-ingress-hardening](signed-webhook-ingress-hardening-2026-05-29.md). The failure surfaces differ (HTTP `401` vs SSE `stream-vs-404`) but the oracle-prevention discipline is the same.
 
 ### 2. Redaction before authz
+
+> Superseded in part: there is no GitHub authz call to order against. The denylist is consulted only after a binding is found, inside `resolveRepoAccess`, and a denylisted repo makes no GitHub call.
 
 Resolve deny-keys and check the denylist **before** any GitHub/token-backed authz call, so a denylisted repo never triggers a GitHub request or uses the operator's token.
 
@@ -156,6 +162,8 @@ const cleanup = (reason: string): void => {
 This shares the dual-finally resource-release discipline of [atomic-serial-channel-queue-handoff](atomic-serial-channel-queue-handoff-2026-06-09.md).
 
 ### 8. Continuous-authz lease
+
+> Superseded in part: the lease now re-verifies the session, the allowlist, and repo access (binding and denylist). It no longer re-checks a token or a GitHub authz result, so the revocation window described below is gone.
 
 Re-verify session, token, denylist, and repo authz on an interval. After **every** `await`, re-check a generation guard (`isCleaned()`) so a check that resolves *after* the connection tore down is a no-op. Clear the lease timer before unsubscribing. The revocation window is bounded by the authz cache TTL (~5m + jitter) plus the lease interval (~5.5m worst case) and is **documented and accepted** because the streamed data is status-only.
 

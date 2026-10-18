@@ -159,6 +159,30 @@ vi.mock('./web/operator-push/push-health-adapter.js', async importOriginal => {
   return {...actual, observePushAdapterHealth: vi.fn(actual.observePushAdapterHealth)}
 })
 
+// Session persistence is rebuilt over the in-memory object-store fake so operator-web boots never touch S3.
+// Each program run gets a fresh fake, exposed through sessionStoreFake for assertions and failure injection.
+const sessionStoreFake = vi.hoisted(() => ({
+  current: undefined as undefined | import('./web/auth/test-object-store.js').TestObjectStore,
+}))
+vi.mock('./web/auth/session-persistence.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('./web/auth/session-persistence.js')>()
+  const {createTestObjectStore} = await import('./web/auth/test-object-store.js')
+  return {
+    ...actual,
+    createSessionPersistence: vi.fn((deps: Parameters<typeof actual.createSessionPersistence>[0]) => {
+      const fake = createTestObjectStore()
+      sessionStoreFake.current = fake
+      return actual.createSessionPersistence({...deps, adapter: fake.adapter})
+    }),
+  }
+})
+
+// Pass-through spy so tests can reach the drain callback, with a short drain deadline so it settles at once.
+vi.mock('./shutdown.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('./shutdown.js')>()
+  return {...actual, DEFAULT_DRAIN_MS: 1, installShutdownHandlers: vi.fn(actual.installShutdownHandlers)}
+})
+
 const {makeDiscordClientFromConfig, makeGatewayProgram, makeLogger} = await import('./program.js')
 const {createDiscordClient} = await import('./discord/client.js')
 const {getCommandRegistry} = await import('./discord/commands/index.js')
@@ -324,6 +348,7 @@ function makeFakeConfig(overrides: Partial<GatewayConfig> = {}): GatewayConfig {
     workspaceOpencodeUrl: 'http://workspace:9200',
     workspaceOpencodeToken: 'test-opencode-token',
     triggerRoleId: null,
+    binderAllowlist: new Set(['111111111111111111']),
     maxConcurrentRuns: 3,
     runTimeoutMs: 600_000,
     runInactivityTimeoutMs: 300_000,
@@ -388,6 +413,63 @@ function makeFakeClient() {
 /** Fake server handle returned by startAnnounceServer stub. */
 function makeFakeServerHandle() {
   return {close: vi.fn()}
+}
+
+type ServerDeps = import('./web/server.js').OperatorServerDeps
+
+/** Lets queued microtasks and zero-delay timers run. */
+async function settle(): Promise<void> {
+  await new Promise<void>(resolve => {
+    setTimeout(resolve, 0)
+  })
+}
+
+/** Creates a session for `githubUserId` on the program's own store, then revokes it, firing the store-level hook. */
+async function revokeSessionFor(serverDeps: ServerDeps, githubUserId: number): Promise<void> {
+  const store = serverDeps.sessionStore
+  if (store === undefined) throw new Error('expected the operator server to receive a session store')
+  const created = await store.create({githubUserId, login: 'revoke-test'})
+  if (created.outcome !== 'ok') throw new Error(`expected the session to be created, got ${created.outcome}`)
+  await store.revoke(created.sessionId)
+  await settle()
+}
+
+/** Boots the program with operator web configured and returns what the operator server received. */
+async function bootOperatorWeb(
+  options: {readonly push?: boolean; readonly startOrder?: string[]; readonly allowedUserIds?: readonly number[]} = {},
+) {
+  if (options.push === true) {
+    selfTestCasMock.mockResolvedValueOnce({success: true, data: undefined})
+  }
+  const config = makeFakeConfig({
+    announce: undefined,
+    operatorWeb: makeOperatorWebConfig(
+      options.allowedUserIds === undefined
+        ? {}
+        : {
+            allowlist: {
+              isAuthorized: id => options.allowedUserIds?.includes(id) === true,
+              size: options.allowedUserIds.length,
+            },
+          },
+    ),
+    ...(options.push === true ? {operatorPush: makeOperatorPushConfig()} : {}),
+  })
+  const startOperatorServer = vi.fn(() => {
+    options.startOrder?.push('server:start')
+    return makeFakeServerHandle()
+  })
+  const deps = {
+    makeClient: () => makeFakeClient() as unknown as import('discord.js').Client,
+    setupReadinessFlag: vi.fn(),
+    login: vi.fn().mockResolvedValue(undefined),
+    startAnnounceServer: vi.fn(),
+    startOperatorServer,
+    runProviderSelfTest: vi.fn(async () => {}),
+  }
+  await Effect.runPromise(makeGatewayProgram(deps, config))
+  const [serverDeps] = startOperatorServer.mock.calls[0] as unknown as [ServerDeps]
+  return {serverDeps, startOperatorServer}
 }
 
 /**
@@ -495,6 +577,35 @@ async function startAndReadPushHealth(options: {
     import('./web/server.js').OperatorServerConfig,
   ]
   return serverDeps.operatorPushHealth?.()
+}
+
+/** Boots the program with the given binder list; returns captured warn lines and the command deps. */
+async function bootCapturingBinderWarning(binderAllowlist: ReadonlySet<string>): Promise<{
+  readonly warnings: string[]
+  readonly commandDeps: import('./discord/commands/fro-bot.js').FroBotDeps
+}> {
+  const {getCommandRegistry} = await import('./discord/commands/index.js')
+  const getCommandRegistryMock = vi.mocked(getCommandRegistry)
+  getCommandRegistryMock.mockClear()
+  // makeLogger writes warn-level JSON via console.warn
+  const consoleSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+  const deps = {
+    makeClient: () => makeFakeClient() as unknown as import('discord.js').Client,
+    setupReadinessFlag: vi.fn(),
+    login: vi.fn().mockResolvedValue(undefined),
+    startAnnounceServer: vi.fn(),
+    startOperatorServer: vi.fn(),
+    runProviderSelfTest: vi.fn(async () => {}),
+  }
+  try {
+    await Effect.runPromise(makeGatewayProgram(deps, makeFakeConfig({announce: undefined, binderAllowlist})))
+    const warnings = consoleSpy.mock.calls.map(args => String(args[0])).filter(line => line.includes('add-project'))
+    const commandDeps = getCommandRegistryMock.mock.calls[0]?.[0]
+    if (commandDeps === undefined) throw new Error('getCommandRegistry was not called')
+    return {warnings, commandDeps}
+  } finally {
+    consoleSpy.mockRestore()
+  }
 }
 
 describe('makeGatewayProgram', () => {
@@ -801,6 +912,32 @@ describe('makeGatewayProgram', () => {
     } finally {
       consoleSpy.mockRestore()
     }
+  })
+
+  // ── Binder allowlist wiring ──────────────────────────────────────────────
+
+  it('binder allowlist empty: logs one startup warning that /add-project is disabled and still starts', async () => {
+    // #given / #when — an empty list; the program must still resolve
+    const {warnings, commandDeps} = await bootCapturingBinderWarning(new Set())
+
+    // #then
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toContain('GATEWAY_BINDER_ALLOWLIST')
+    expect(warnings[0]).toContain('add-project is disabled')
+    expect(warnings[0]).toContain('"level":"warn"')
+    expect(commandDeps.binderAllowlist?.size).toBe(0)
+  })
+
+  it('binder allowlist configured: logs no warning and passes the list into the command deps', async () => {
+    // #given
+    const binders = new Set(['222222222222222222'])
+
+    // #when
+    const {warnings, commandDeps} = await bootCapturingBinderWarning(binders)
+
+    // #then
+    expect(warnings).toHaveLength(0)
+    expect(commandDeps.binderAllowlist).toBe(binders)
   })
 
   // ── Approval mode propagation ────────────────────────────────────────────
@@ -1738,9 +1875,15 @@ describe('button interaction handler (approval flow)', () => {
     expect(typeof serverDeps.launchWorkDeps?.operatorPushDispatcher?.dispatchApprovalPending).toBe('function')
     expect(typeof serverDeps.launchWorkDeps?.operatorPushDispatcher?.dispatchRunFailed).toBe('function')
 
-    // #and — the session-revoke deactivation hook was registered on the GitHub OAuth deps
-    expect(serverDeps.githubOAuth?.onSessionRevoke).toBeDefined()
-    expect(typeof serverDeps.githubOAuth?.onSessionRevoke).toBe('function')
+    // #and — the session-revoke deactivation hook is the store's, not a per-session OAuth hook: revoking a
+    // session deactivates that operator's push subscriptions
+    const {createOperatorPushSubscriptionStore} = await import('./web/operator-push/subscription-store.js')
+    const pushStore = vi.mocked(createOperatorPushSubscriptionStore).mock.results.at(-1)?.value as {
+      deactivateForOperator: ReturnType<typeof vi.fn>
+    }
+    pushStore.deactivateForOperator.mockResolvedValueOnce({success: true, data: {updated: 1, skipped: 0}})
+    await revokeSessionFor(serverDeps, 4242)
+    expect(pushStore.deactivateForOperator).toHaveBeenLastCalledWith({operatorId: '4242'})
   })
 
   it('session-revoke hook: deactivation with skipped subscriptions logs a warn, does not throw', async () => {
@@ -1779,9 +1922,7 @@ describe('button interaction handler (approval flow)', () => {
     deactivateForOperatorMock.mockResolvedValueOnce({success: true, data: {updated: 0, skipped: 2}})
 
     // #when — the revoke hook fires with a deactivation result carrying skipped records
-    expect(() => serverDeps.githubOAuth?.onSessionRevoke?.(12345)).not.toThrow()
-    await Promise.resolve()
-    await Promise.resolve()
+    await revokeSessionFor(serverDeps, 12345)
 
     // #then — a warn is logged, no throw escapes the hook
     const warnedSkipped = consoleWarnSpy.mock.calls.some(([line]) => String(line).includes('CAS exhausted'))
@@ -1831,9 +1972,7 @@ describe('button interaction handler (approval flow)', () => {
     deactivateForOperatorMock.mockResolvedValueOnce({success: true, data: {updated: 1, skipped: 0}})
 
     // #when — the revoke hook fires with a real deactivation (updated > 0)
-    expect(() => serverDeps.githubOAuth?.onSessionRevoke?.(12345)).not.toThrow()
-    await Promise.resolve()
-    await Promise.resolve()
+    await revokeSessionFor(serverDeps, 12345)
 
     // #then — a push.subscription.deactivated audit record with reason
     // session_revoked was logged
@@ -1881,9 +2020,7 @@ describe('button interaction handler (approval flow)', () => {
     deactivateForOperatorMock.mockResolvedValueOnce({success: false, error: new Error('write failed')})
 
     // #when — the revoke hook fires with a failed deactivation Result
-    expect(() => serverDeps.githubOAuth?.onSessionRevoke?.(12345)).not.toThrow()
-    await Promise.resolve()
-    await Promise.resolve()
+    await revokeSessionFor(serverDeps, 12345)
 
     // #then — a warn is logged, no throw escapes the hook
     const warnedFailed = consoleWarnSpy.mock.calls.some(([line]) =>
@@ -1927,7 +2064,9 @@ describe('button interaction handler (approval flow)', () => {
       import('./web/server.js').OperatorServerConfig,
     ]
     expect(serverDeps.launchWorkDeps?.operatorPushDispatcher).toBeUndefined()
-    expect(serverDeps.githubOAuth?.onSessionRevoke).toBeUndefined()
+    // #and — revocation still works with no hook, and no push store was wired to deactivate
+    expect(serverDeps.operatorPushStore).toBeUndefined()
+    await expect(revokeSessionFor(serverDeps, 12345)).resolves.toBeUndefined()
   })
 
   it('composite close closes both announce and operator handles', async () => {
@@ -2956,5 +3095,364 @@ describe('waiting status wiring', () => {
 
     // #then the terminal notification did not reach the manager
     expect(refreshScope).toHaveBeenCalledOnce()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Durable operator sessions — program wiring
+// ---------------------------------------------------------------------------
+
+const SESSION_MAINTENANCE_MS = 60 * 60_000
+
+type SessionPersistenceShape = ReturnType<typeof import('./web/auth/session-persistence.js').createSessionPersistence>
+
+/**
+ * Makes the next program boot build its session persistence over `fake` (a fresh fake by default), letting
+ * the test wrap or fail pieces of the real persistence first.
+ */
+async function useSessionFake(
+  options: {
+    readonly fake?: import('./web/auth/test-object-store.js').TestObjectStore
+    readonly configure?: (fake: import('./web/auth/test-object-store.js').TestObjectStore) => void
+    readonly wrap?: (real: SessionPersistenceShape) => SessionPersistenceShape
+  } = {},
+): Promise<import('./web/auth/test-object-store.js').TestObjectStore> {
+  const {createSessionPersistence} = await import('./web/auth/session-persistence.js')
+  const actual = await vi.importActual<typeof import('./web/auth/session-persistence.js')>(
+    './web/auth/session-persistence.js',
+  )
+  const {createTestObjectStore} = await import('./web/auth/test-object-store.js')
+  const fake = options.fake ?? createTestObjectStore()
+  options.configure?.(fake)
+  vi.mocked(createSessionPersistence).mockImplementationOnce(deps => {
+    sessionStoreFake.current = fake
+    const real = actual.createSessionPersistence({...deps, adapter: fake.adapter})
+    return options.wrap === undefined ? real : options.wrap(real)
+  })
+  return fake
+}
+
+async function bootAndFindTimer() {
+  const intervalSpy = vi.spyOn(globalThis, 'setInterval')
+  const booted = await bootOperatorWeb()
+  const index = intervalSpy.mock.calls.findIndex(([, ms]) => ms === SESSION_MAINTENANCE_MS)
+  const call = intervalSpy.mock.calls[index]
+  const handle = intervalSpy.mock.results[index]?.value as ReturnType<typeof setInterval> | undefined
+  if (call === undefined || handle === undefined) throw new Error('expected one hourly session timer')
+  return {
+    ...booted,
+    tick: call[0],
+    handle,
+    matches: intervalSpy.mock.calls.filter(([, ms]) => ms === SESSION_MAINTENANCE_MS),
+  }
+}
+
+function makeStore(overrides: Partial<import('./web/auth/session.js').DurableSessionStore> = {}) {
+  return {
+    create: vi.fn(),
+    get: vi.fn(),
+    revoke: vi.fn(),
+    load: vi.fn(),
+    scavenge: vi.fn(() => 0),
+    sweep: vi.fn(async () => ({success: true as const, data: {} as never})),
+    size: vi.fn(() => 0),
+    isReady: vi.fn(() => true),
+    ...overrides,
+  } satisfies import('./web/auth/session.js').DurableSessionStore
+}
+
+describe('durable operator sessions — program wiring', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('loads every stored session before the operator server starts', async () => {
+    // #given a persistence whose load is observable and slow
+    const order: string[] = []
+    await useSessionFake({
+      configure: fake => fake.setLatency('list', 10),
+      wrap: real => ({
+        ...real,
+        load: async () => {
+          order.push('load:start')
+          const loaded = await real.load()
+          order.push('load:end')
+          return loaded
+        },
+      }),
+    })
+
+    // #when the program boots with operator web configured
+    await bootOperatorWeb({startOrder: order})
+
+    // #then the load finished before the server was started
+    expect(order).toEqual(['load:start', 'load:end', 'server:start'])
+  })
+
+  it('hands the server a ready store that creates sessions durably', async () => {
+    // #given a boot over a working object store
+    const fake = await useSessionFake()
+
+    // #when
+    const {serverDeps} = await bootOperatorWeb()
+
+    // #then the store is loaded, and a created session is written under the session prefix
+    const store = serverDeps.sessionStore
+    expect(store?.isReady()).toBe(true)
+    const created = await store?.create({githubUserId: 42, login: 'octocat'})
+    expect(created?.outcome).toBe('ok')
+    expect([...fake.objects.keys()].filter(key => key.startsWith('operator-web/sessions/'))).toHaveLength(1)
+  })
+
+  it('restores a session after a restart over the same object store', async () => {
+    // #given a first boot that issued a session
+    const fake = await useSessionFake()
+    const first = await bootOperatorWeb({allowedUserIds: [42]})
+    const created = await first.serverDeps.sessionStore?.create({githubUserId: 42, login: 'octocat'})
+    if (created?.outcome !== 'ok') throw new Error('expected the first boot to create a session')
+
+    // #when a second boot loads from the same object store
+    await useSessionFake({fake})
+    const second = await bootOperatorWeb({allowedUserIds: [42]})
+
+    // #then the second boot's store accepts the issued ID
+    expect(second.serverDeps.sessionStore?.get(created.sessionId)).toMatchObject({githubUserId: 42})
+  })
+
+  it("revoking a restored session deactivates that operator's push subscriptions through the store hook", async () => {
+    // #given a first boot that issued a session for user 42, with push enabled
+    const fake = await useSessionFake()
+    const first = await bootOperatorWeb({push: true, allowedUserIds: [42]})
+    const created = await first.serverDeps.sessionStore?.create({githubUserId: 42, login: 'octocat'})
+    if (created?.outcome !== 'ok') throw new Error('expected the first boot to create a session')
+
+    // #when a second boot restores it and the restored session is revoked
+    await useSessionFake({fake})
+    const second = await bootOperatorWeb({push: true, allowedUserIds: [42]})
+    const {createOperatorPushSubscriptionStore} = await import('./web/operator-push/subscription-store.js')
+    const pushStore = vi.mocked(createOperatorPushSubscriptionStore).mock.results.at(-1)?.value as {
+      deactivateForOperator: ReturnType<typeof vi.fn>
+    }
+    pushStore.deactivateForOperator.mockResolvedValue({success: true, data: {updated: 1, skipped: 0}})
+    pushStore.deactivateForOperator.mockClear()
+    const revoked = await second.serverDeps.sessionStore?.revoke(created.sessionId)
+    await settle()
+
+    // #then the store-level hook deactivated push for that user
+    expect(revoked).toEqual({outcome: 'ok'})
+    expect(pushStore.deactivateForOperator).toHaveBeenCalledExactlyOnceWith({operatorId: '42'})
+  })
+
+  it('replays a stored revoke at boot with a fence so a later subscription is not deactivated', async () => {
+    // #given a first boot with push whose session for user 42 was revoked
+    const fake = await useSessionFake()
+    const first = await bootOperatorWeb({push: true, allowedUserIds: [42]})
+    const created = await first.serverDeps.sessionStore?.create({githubUserId: 42, login: 'octocat'})
+    if (created?.outcome !== 'ok') throw new Error('expected the first boot to create a session')
+    await first.serverDeps.sessionStore?.revoke(created.sessionId)
+    await settle()
+
+    // #when a second boot loads the stored revoked record
+    const before = Date.now()
+    await useSessionFake({fake})
+    await bootOperatorWeb({push: true, allowedUserIds: [42]})
+    await settle()
+    const {createOperatorPushSubscriptionStore} = await import('./web/operator-push/subscription-store.js')
+    const pushStore = vi.mocked(createOperatorPushSubscriptionStore).mock.results.at(-1)?.value as {
+      deactivateForOperator: ReturnType<typeof vi.fn>
+    }
+
+    // #then the replay carried a fence taken when the load began
+    const call = pushStore.deactivateForOperator.mock.calls[0]?.[0] as {operatorId: string; updatedBefore: number}
+    expect(call.operatorId).toBe('42')
+    expect(call.updatedBefore).toBeGreaterThanOrEqual(before)
+    expect(call.updatedBefore).toBeLessThanOrEqual(Date.now())
+  })
+
+  it.each([
+    {
+      name: 'a self-test failure',
+      arrange: async () =>
+        useSessionFake({
+          configure: fake => {
+            fake.failNext('conditionalPut', {match: key => key.startsWith('operator-web/_self-test/')})
+          },
+        }),
+      logged: 'session restore failed',
+    },
+    {
+      name: 'a load that throws',
+      arrange: async () =>
+        useSessionFake({
+          wrap: real => ({
+            ...real,
+            selfTest: async () => {
+              throw new Error('adapter exploded')
+            },
+          }),
+        }),
+      logged: 'session restore threw',
+    },
+  ])('$name still starts the operator server, with a store that refuses logins', async ({arrange, logged}) => {
+    // #given a boot whose restore fails
+    await arrange()
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    // #when
+    const {serverDeps, startOperatorServer} = await bootOperatorWeb()
+
+    // #then the server started, the store is not ready, login is refused, and the failure was logged
+    expect(startOperatorServer).toHaveBeenCalledOnce()
+    expect(serverDeps.sessionStore?.isReady()).toBe(false)
+    expect((await serverDeps.sessionStore?.create({githubUserId: 42, login: 'octocat'}))?.outcome).toBe('not_ready')
+    expect(errorSpy.mock.calls.some(([line]) => String(line).includes(logged))).toBe(true)
+  })
+
+  it('creates no session store and no timer when operator web is disabled', async () => {
+    // #given a program with no operator web config
+    const {createSessionPersistence} = await import('./web/auth/session-persistence.js')
+    vi.mocked(createSessionPersistence).mockClear()
+    const intervalSpy = vi.spyOn(globalThis, 'setInterval')
+    const deps = {
+      makeClient: () => makeFakeClient() as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer: vi.fn(),
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    // #when
+    await Effect.runPromise(makeGatewayProgram(deps, makeFakeConfig({announce: undefined, operatorWeb: undefined})))
+
+    // #then
+    expect(vi.mocked(createSessionPersistence)).not.toHaveBeenCalled()
+    expect(intervalSpy.mock.calls.some(([, ms]) => ms === SESSION_MAINTENANCE_MS)).toBe(false)
+  })
+
+  describe('hourly maintenance timer', () => {
+    it("is a single unref'd timer", async () => {
+      // #given / #when
+      await useSessionFake()
+      const {handle, matches} = await bootAndFindTimer()
+
+      // #then
+      expect(matches).toHaveLength(1)
+      expect(handle.hasRef()).toBe(false)
+    })
+
+    it('each tick scavenges the map and sweeps stored records', async () => {
+      // #given a booted store, an expired record in the bucket, and a revoked session still in memory
+      const fake = await useSessionFake()
+      const {serverDeps, tick} = await bootAndFindTimer()
+      const store = serverDeps.sessionStore
+      const created = await store?.create({githubUserId: 42, login: 'octocat'})
+      if (created?.outcome !== 'ok') throw new Error('expected a session')
+      await store?.revoke(created.sessionId)
+      const {hashSessionId, buildSessionKey, signSessionRecord, deriveSessionRecordKey} = await vi.importActual<
+        typeof import('./web/auth/session-persistence.js')
+      >('./web/auth/session-persistence.js')
+      const {Buffer} = await import('node:buffer')
+      const macKey = deriveSessionRecordKey(Buffer.from(makeOperatorWebConfig().csrfSecret, 'base64url'))
+      const expiredKey = buildSessionKey(hashSessionId('expired-session'))
+      fake.seed(
+        expiredKey,
+        JSON.stringify(
+          signSessionRecord(macKey, hashSessionId('expired-session'), {
+            githubUserId: 42,
+            login: 'octocat',
+            issuedAt: Date.now() - 8 * 24 * 60 * 60 * 1000,
+            status: 'active',
+          }),
+        ),
+      )
+      expect(store?.size()).toBe(1)
+
+      // #when the timer fires
+      tick()
+      await settle()
+
+      // #then the revoked entry left memory and the expired record left the bucket
+      expect(store?.size()).toBe(0)
+      expect(fake.objects.has(expiredKey)).toBe(false)
+    })
+
+    it('does nothing for a store that is not ready', async () => {
+      // #given a boot whose restore failed
+      const fake = await useSessionFake({
+        configure: f => {
+          f.failNext('conditionalPut', {match: key => key.startsWith('operator-web/_self-test/')})
+        },
+      })
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      const {tick} = await bootAndFindTimer()
+      fake.resetCalls()
+
+      // #when the timer fires
+      tick()
+      await settle()
+
+      // #then the bucket was not touched
+      expect(fake.calls).toHaveLength(0)
+    })
+
+    it('is cleared when the shutdown drain runs', async () => {
+      // #given a booted program and its drain callback
+      await useSessionFake()
+      const {handle} = await bootAndFindTimer()
+      const {installShutdownHandlers} = await import('./shutdown.js')
+      const drain = vi.mocked(installShutdownHandlers).mock.calls.at(-1)?.[4]
+      if (drain === undefined) throw new Error('expected the program to pass a drain callback')
+      const clearSpy = vi.spyOn(globalThis, 'clearInterval')
+
+      // #when shutdown drains
+      await drain().catch(() => {})
+
+      // #then the session timer was cleared
+      expect(clearSpy).toHaveBeenCalledWith(handle)
+    })
+  })
+
+  describe('runSessionMaintenance', () => {
+    it('scavenges then sweeps a ready store', async () => {
+      // #given
+      const {runSessionMaintenance} = await import('./program.js')
+      const store = makeStore()
+
+      // #when
+      await runSessionMaintenance(store, stubLogger)
+
+      // #then
+      expect(store.scavenge).toHaveBeenCalledOnce()
+      expect(store.sweep).toHaveBeenCalledOnce()
+    })
+
+    it('skips a store that is not ready', async () => {
+      // #given
+      const {runSessionMaintenance} = await import('./program.js')
+      const store = makeStore({isReady: vi.fn(() => false)})
+
+      // #when
+      await runSessionMaintenance(store, stubLogger)
+
+      // #then
+      expect(store.scavenge).not.toHaveBeenCalled()
+      expect(store.sweep).not.toHaveBeenCalled()
+    })
+
+    it('logs a throwing tick and resolves', async () => {
+      // #given a sweep that throws
+      const {runSessionMaintenance} = await import('./program.js')
+      const warn = vi.fn()
+      const store = makeStore({
+        sweep: vi.fn(async () => {
+          throw new Error('sweep exploded')
+        }),
+      })
+
+      // #when / #then it does not reject, and the failure is logged by class only
+      await expect(runSessionMaintenance(store, {...stubLogger, warn})).resolves.toBeUndefined()
+      expect(warn).toHaveBeenCalledWith({errorClass: 'Error'}, expect.stringContaining('maintenance tick failed'))
+    })
   })
 })

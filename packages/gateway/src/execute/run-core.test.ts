@@ -2482,7 +2482,7 @@ describe('runOpenCodeCore', () => {
       expect((err as RunCoreError).kind).toBe('session-error')
     })
 
-    it('session.error with null sessionID carries the error detail in the message', async () => {
+    it('session.error with null sessionID carries a fixed reason, not the upstream text', async () => {
       // #given — global session.error with a specific error message
       const globalErrorEvent = {
         type: 'session.error',
@@ -2496,9 +2496,10 @@ describe('runOpenCodeCore', () => {
       // #when
       const err = await runOpenCodeCore(params).catch((error: unknown) => error)
 
-      // #then — error message contains the detail from the event
+      // #then — the message is the fixed reason; the upstream text is not echoed (#1836)
       expect(err).toBeInstanceOf(RunCoreError)
-      expect((err as RunCoreError).message).toContain('quota exceeded globally')
+      expect((err as RunCoreError).message).toBe('Provider failure: session error')
+      expect((err as RunCoreError).message).not.toContain('quota exceeded globally')
     })
 
     it('session.error from a different (non-null) sessionID is ignored', async () => {
@@ -4042,7 +4043,7 @@ describe('runOpenCodeCore', () => {
       // #then — SAME kind and message as the original causal failure — quarantine is
       // additional evidence, never a replacement explanation.
       expect((thrown as RunCoreError).kind).toBe('session-error')
-      expect((thrown as RunCoreError).message).toContain('LLM quota exceeded')
+      expect((thrown as RunCoreError).message).toBe('Provider failure: session error')
       expect((thrown as RunCoreError).quarantined).toBe(true)
       expect(ownershipLedger.snapshot().find(entry => entry.sessionId === CHILD)?.state).toBe('unknown')
     })

@@ -1,12 +1,28 @@
 import type {LockAcquisitionResult, LockRecord, ObjectStoreConfig} from '@fro-bot/runtime'
+import * as core from '@actions/core'
+import {DEFAULT_HEARTBEAT_INTERVAL_MS} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {err, ok} from '../../shared/types.js'
-import {parseActionHolderRunId, runAcquireLock} from './acquire-lock.js'
+import {STATE_KEYS} from '../config/state-keys.js'
+import {
+  LOCK_RELEASE_TIMEOUT_MS,
+  parseActionHolderRunId,
+  releaseActionLockIfHeld,
+  runAcquireLock,
+  runWithDeadline,
+  SAME_RUN_TAKEOVER_MIN_UNRENEWED_MS,
+} from './acquire-lock.js'
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 const acquireLockMock = vi.hoisted(() => vi.fn())
 const createS3AdapterMock = vi.hoisted(() => vi.fn(() => ({})))
 const renewLeaseMock = vi.hoisted(() => vi.fn())
+const releaseLockIfHolderMock = vi.hoisted(() => vi.fn())
+const releaseLockMock = vi.hoisted(() => vi.fn())
+
+vi.mock('@actions/core', () => ({saveState: vi.fn()}))
 
 vi.mock('@fro-bot/runtime', async () => {
   const actual = await vi.importActual<typeof import('@fro-bot/runtime')>('@fro-bot/runtime')
@@ -15,6 +31,8 @@ vi.mock('@fro-bot/runtime', async () => {
     acquireLock: acquireLockMock,
     createS3Adapter: createS3AdapterMock,
     renewLease: renewLeaseMock,
+    releaseLockIfHolder: releaseLockIfHolderMock,
+    releaseLock: releaseLockMock,
   }
 })
 
@@ -126,8 +144,14 @@ describe('runAcquireLock', () => {
       'github',
       '99999',
       expect.any(Object),
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- vitest asymmetric matcher typing
-      {scope: 'action', reclaimableWithoutConfirmation: expect.any(Function)},
+      /* eslint-disable @typescript-eslint/no-unsafe-assignment -- vitest asymmetric matcher typing */
+      {
+        scope: 'action',
+        reclaimableWithoutConfirmation: expect.any(Function),
+        reclaimableBeforeExpiry: expect.any(Function),
+        acquisitionToken: expect.stringMatching(UUID),
+      },
+      /* eslint-enable @typescript-eslint/no-unsafe-assignment */
     )
   })
 
@@ -152,6 +176,7 @@ describe('runAcquireLock', () => {
     // #then — Action leases reclaimable; every gateway surface is not; no corroborator supplied
     const actionHolder = {surface: 'github', holder_id: 'action:1234:1'} as const
     expect(options.reclaimableWithoutConfirmation(createLockRecord(actionHolder))).toBe(true)
+    expect(options.reclaimableWithoutConfirmation(createLockRecord({...actionHolder, holder_job: 'build'}))).toBe(true)
     expect(options.reclaimableWithoutConfirmation(createLockRecord({...actionHolder, surface: 'discord'}))).toBe(false)
     expect(options.reclaimableWithoutConfirmation(createLockRecord({...actionHolder, surface: 'web'}))).toBe(false)
     expect(options.confirmExpiredHolder).toBeUndefined()
@@ -164,6 +189,7 @@ describe('runAcquireLock', () => {
     'action::1',
     'action:abc:1',
     'action:1:2:3',
+    'action:1:2:build',
     'discord-gateway',
   ])('does not treat a github-surface holder with non-Action id %j as reclaimable', async holderId => {
     // #given
@@ -699,10 +725,537 @@ describe('parseActionHolderRunId', () => {
     ['action:1234', null],
     ['gateway:instance-1:run-99', null],
     ['action:1:2:3', null],
+    ['action:1:2:build', null],
   ])('maps %j to %j', (holderId, expected) => {
     // #given a holder id read from S3 (untrusted)
     // #when parsed
     // #then only well-formed Action ids with a numeric run id yield a run id
     expect(parseActionHolderRunId(holderId)).toBe(expected)
+  })
+})
+
+type TakeoverPredicate = (holder: LockRecord, observedAt: Date) => boolean
+
+async function predicateFor(runId: string, runAttempt: number, jobIdentity: string | null): Promise<TakeoverPredicate> {
+  const result = await runAcquireLock({
+    storeConfig: createStoreConfig(),
+    repo: 'fro-bot/agent',
+    runId,
+    runAttempt,
+    jobIdentity,
+    logger: createMockLogger(),
+  })
+  if (result.outcome === 'acquired') await result.renewal.stop()
+  const options = acquireLockMock.mock.calls[0]?.[6] as {reclaimableBeforeExpiry: TakeoverPredicate}
+  return options.reclaimableBeforeExpiry
+}
+
+describe('runAcquireLock same-run takeover predicate', () => {
+  const now = new Date('2026-04-25T12:10:00.000Z')
+  const unrenewedFor = (ms: number) => new Date(now.getTime() - ms).toISOString()
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    renewLeaseMock.mockResolvedValue(ok({etag: '"etag-renewed"'}))
+    acquireLockMock.mockResolvedValue(lockOk({acquired: true, outcome: 'acquired', etag: '"etag"', holder: null}))
+  })
+
+  it('pins the staleness threshold to three heartbeat intervals', () => {
+    // #given the heartbeat interval the lease timer actually uses
+    // #then the takeover threshold derives from it instead of a hard-coded number
+    expect(SAME_RUN_TAKEOVER_MIN_UNRENEWED_MS).toBe(3 * DEFAULT_HEARTBEAT_INTERVAL_MS)
+  })
+
+  const STALE = 120_000
+  it.each([
+    ['a stale earlier attempt of the same run and job', 'action:1234:1', 'build', 'github', STALE, true],
+    ['the immediately preceding attempt, stale', 'action:1234:2', 'build', 'github', STALE, true],
+    ['exactly at the staleness boundary', 'action:1234:1', 'build', 'github', SAME_RUN_TAKEOVER_MIN_UNRENEWED_MS, true],
+    [
+      '1ms inside the staleness boundary',
+      'action:1234:1',
+      'build',
+      'github',
+      SAME_RUN_TAKEOVER_MIN_UNRENEWED_MS - 1,
+      false,
+    ],
+    ['an earlier attempt renewed recently', 'action:1234:1', 'build', 'github', 30_000, false],
+    ['a lease stamped in the future', 'action:1234:1', 'build', 'github', -60_000, false],
+    ['a legacy record without holder_job', 'action:1234:1', undefined, 'github', STALE, false],
+    ['a sibling job in the same run', 'action:1234:1', 'test', 'github', STALE, false],
+    ['a matrix leg when this invocation is the plain job', 'action:1234:1', 'build-m1a2b3c4d', 'github', STALE, false],
+    ['the same attempt', 'action:1234:3', 'build', 'github', STALE, false],
+    ['a later attempt', 'action:1234:4', 'build', 'github', STALE, false],
+    ['a different run', 'action:9999:1', 'build', 'github', STALE, false],
+    ['an unparseable holder', 'action:1234:abc', 'build', 'github', STALE, false],
+    ['a job-qualified holder_id (not the Action shape)', 'action:1234:1:build', 'build', 'github', STALE, false],
+    ['a zero attempt', 'action:1234:0', 'build', 'github', STALE, false],
+    ['a gateway holder id', 'gateway:instance-1:run-99', 'build', 'github', STALE, false],
+    ['an Action-shaped id on a non-github surface', 'action:1234:1', 'build', 'discord', STALE, false],
+  ] as const)('%s → %s', async (_label, holderId, holderJob, surface, unrenewedMs, expected) => {
+    // #given the current invocation is attempt 3 of run 1234, job "build"
+    const reclaimable = await predicateFor('1234', 3, 'build')
+
+    // #when the predicate sees the existing holder
+    const result = reclaimable(
+      createLockRecord({
+        holder_id: holderId,
+        surface,
+        acquired_at: unrenewedFor(unrenewedMs),
+        ...(holderJob === undefined ? {} : {holder_job: holderJob}),
+      }),
+      now,
+    )
+
+    // #then only a stale, strictly earlier attempt of the same run and job on the github surface is reclaimable
+    expect(result).toBe(expected)
+  })
+
+  it('takes over a stale earlier attempt of the same matrix leg', async () => {
+    // #given this invocation is the "build-m1a2b3c4d" matrix leg
+    const reclaimable = await predicateFor('1234', 3, 'build-m1a2b3c4d')
+
+    // #when it sees the same leg's earlier attempt, unrenewed for two minutes
+    const result = reclaimable(
+      createLockRecord({
+        holder_id: 'action:1234:1',
+        holder_job: 'build-m1a2b3c4d',
+        surface: 'github',
+        acquired_at: unrenewedFor(STALE),
+      }),
+      now,
+    )
+
+    // #then
+    expect(result).toBe(true)
+  })
+
+  it('does not take over when the last-renewed timestamp is unreadable', async () => {
+    // #given a holder whose timestamp cannot be parsed
+    const reclaimable = await predicateFor('1234', 3, 'build')
+
+    // #when
+    const result = reclaimable(
+      createLockRecord({holder_id: 'action:1234:1', holder_job: 'build', surface: 'github', acquired_at: 'not-a-date'}),
+      now,
+    )
+
+    // #then it falls back to normal expiry
+    expect(result).toBe(false)
+  })
+
+  it('never takes over early when this invocation has no job identity', async () => {
+    // #given an invocation without an identity
+    const reclaimable = await predicateFor('1234', 3, null)
+
+    // #when it sees an otherwise eligible holder
+    const result = reclaimable(
+      createLockRecord({
+        holder_id: 'action:1234:1',
+        holder_job: 'build',
+        surface: 'github',
+        acquired_at: unrenewedFor(STALE),
+      }),
+      now,
+    )
+
+    // #then
+    expect(result).toBe(false)
+  })
+})
+
+describe('runAcquireLock holder identity', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    renewLeaseMock.mockResolvedValue(ok({etag: '"etag-renewed"'}))
+    acquireLockMock.mockResolvedValue(lockOk({acquired: true, outcome: 'acquired', etag: '"etag"', holder: null}))
+  })
+
+  it.each([
+    ['a job identity', 'build', 'build'],
+    ['a matrix-leg identity', 'build-m1a2b3c4d', 'build-m1a2b3c4d'],
+    ['no identity', null, undefined],
+    ['an identity with unsafe characters', 'a:b c', undefined],
+  ])('keeps the legacy holder id and carries the job separately with %s', async (_label, jobIdentity, expectedJob) => {
+    // #when
+    const result = await runAcquireLock({
+      storeConfig: createStoreConfig(),
+      repo: 'fro-bot/agent',
+      runId: '99999',
+      runAttempt: 3,
+      jobIdentity,
+      logger: createMockLogger(),
+    })
+    if (result.outcome === 'acquired') await result.renewal.stop()
+
+    // #then holder_id keeps the shape older readers match, and the job rides in holder_job
+    expect(acquireLockMock.mock.calls[0]?.[2]).toBe('action:99999:3')
+    expect((acquireLockMock.mock.calls[0]?.[6] as {holderJob?: string}).holderJob).toBe(expectedJob)
+    expect(core.saveState).toHaveBeenCalledWith(STATE_KEYS.LOCK_HOLDER_ID, 'action:99999:3')
+    const savedJobs = vi
+      .mocked(core.saveState)
+      .mock.calls.filter(([key]) => key === STATE_KEYS.LOCK_HOLDER_JOB)
+      .map(([, value]) => value as string)
+    expect(savedJobs).toEqual(expectedJob === undefined ? [] : [expectedJob])
+  })
+
+  it('keeps holder_job and the acquisition token on every lease renewal', async () => {
+    // #given an acquired lock whose renewal timer ticks once
+    vi.useFakeTimers()
+    try {
+      const result = await runAcquireLock({
+        storeConfig: createStoreConfig(),
+        repo: 'fro-bot/agent',
+        runId: '99999',
+        runAttempt: 3,
+        jobIdentity: 'build',
+        logger: createMockLogger(),
+      })
+
+      // #when
+      await vi.advanceTimersByTimeAsync(DEFAULT_HEARTBEAT_INTERVAL_MS)
+      if (result.outcome === 'acquired') await result.renewal.stop()
+
+      // #then the rewritten record still names the job (and keeps the legacy holder_id)
+      expect(renewLeaseMock.mock.calls[0]?.[2]).toMatchObject({
+        holder_id: 'action:99999:3',
+        holder_job: 'build',
+        acquisition_token: (acquireLockMock.mock.calls[0]?.[6] as {acquisitionToken?: string}).acquisitionToken,
+      })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe('runAcquireLock holder state handoff', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    releaseLockMock.mockReset()
+    renewLeaseMock.mockResolvedValue(ok({etag: '"etag-renewed"'}))
+  })
+
+  it('records the holder id for the post hook once the lock is acquired', async () => {
+    // #given
+    acquireLockMock.mockResolvedValue(lockOk({acquired: true, outcome: 'acquired', etag: '"etag"', holder: null}))
+
+    // #when
+    const result = await runAcquireLock({
+      storeConfig: createStoreConfig(),
+      repo: 'fro-bot/agent',
+      runId: '1234',
+      runAttempt: 2,
+      logger: createMockLogger(),
+    })
+    if (result.outcome === 'acquired') await result.renewal.stop()
+
+    // #then
+    expect(core.saveState).toHaveBeenCalledWith(STATE_KEYS.LOCK_HOLDER_ID, 'action:1234:2')
+    expect(core.saveState).toHaveBeenCalledWith(STATE_KEYS.LOCK_ACQUISITION_TOKEN, expect.stringMatching(UUID))
+    expect(core.saveState).not.toHaveBeenCalledWith(STATE_KEYS.LOCK_HOLDER_JOB, expect.anything())
+  })
+
+  it('releases the lock and fails closed when recording the holder id throws', async () => {
+    // #given the lock was acquired but the state write fails
+    acquireLockMock.mockResolvedValue(lockOk({acquired: true, outcome: 'acquired', etag: '"etag-new"', holder: null}))
+    releaseLockMock.mockResolvedValue(ok(undefined))
+    vi.mocked(core.saveState).mockImplementationOnce(() => {
+      throw new Error('state file unwritable')
+    })
+
+    // #when
+    const result = await runAcquireLock({
+      storeConfig: createStoreConfig(),
+      repo: 'fro-bot/agent',
+      runId: '1234',
+      runAttempt: 2,
+      logger: createMockLogger(),
+    })
+
+    // #then the run does not proceed holding an unrecorded lock, and the fresh etag is released on the Action scope
+    expect(result).toEqual({
+      outcome: 'error',
+      error: new Error('Acquired the Action coordination lock but could not record its holder: state file unwritable'),
+    })
+    expect(releaseLockMock).toHaveBeenCalledWith(
+      expect.objectContaining({lockTtlSeconds: 900}),
+      'fro-bot/agent',
+      '"etag-new"',
+      expect.anything(),
+      'action',
+      expect.any(AbortSignal),
+    )
+  })
+
+  it('still fails closed when the best-effort release also fails', async () => {
+    // #given
+    acquireLockMock.mockResolvedValue(lockOk({acquired: true, outcome: 'acquired', etag: '"etag-new"', holder: null}))
+    releaseLockMock.mockRejectedValue(new Error('network down'))
+    vi.mocked(core.saveState).mockImplementationOnce(() => {
+      throw new Error('state file unwritable')
+    })
+
+    // #when
+    const result = await runAcquireLock({
+      storeConfig: createStoreConfig(),
+      repo: 'fro-bot/agent',
+      runId: '1234',
+      runAttempt: 2,
+      logger: createMockLogger(),
+    })
+
+    // #then the original failure is reported, not the release failure
+    expect(result).toEqual({
+      outcome: 'error',
+      error: new Error('Acquired the Action coordination lock but could not record its holder: state file unwritable'),
+    })
+  })
+
+  it('mints one token per acquisition, writes it to the lock and state, and writes the holder id last', async () => {
+    // #given
+    acquireLockMock.mockResolvedValue(lockOk({acquired: true, outcome: 'acquired', etag: '"etag"', holder: null}))
+
+    // #when two acquisitions run
+    const first = await runAcquireLock({
+      storeConfig: createStoreConfig(),
+      repo: 'fro-bot/agent',
+      runId: '1234',
+      runAttempt: 2,
+      jobIdentity: 'build',
+      logger: createMockLogger(),
+    })
+    if (first.outcome === 'acquired') await first.renewal.stop()
+    const second = await runAcquireLock({
+      storeConfig: createStoreConfig(),
+      repo: 'fro-bot/agent',
+      runId: '1234',
+      runAttempt: 2,
+      jobIdentity: 'build',
+      logger: createMockLogger(),
+    })
+    if (second.outcome === 'acquired') await second.renewal.stop()
+
+    // #then identical holder fields still get distinct tokens, matching what was saved
+    const tokenOf = (call: number) =>
+      (acquireLockMock.mock.calls[call]?.[6] as {acquisitionToken?: string}).acquisitionToken
+    expect(tokenOf(0)).toMatch(UUID)
+    expect(tokenOf(1)).toMatch(UUID)
+    expect(tokenOf(0)).not.toBe(tokenOf(1))
+    const saved = vi.mocked(core.saveState).mock.calls
+    expect(saved[0]).toEqual([STATE_KEYS.LOCK_ACQUISITION_TOKEN, tokenOf(0)])
+    expect(saved.slice(0, 3).map(([key]) => key)).toEqual([
+      STATE_KEYS.LOCK_ACQUISITION_TOKEN,
+      STATE_KEYS.LOCK_HOLDER_JOB,
+      STATE_KEYS.LOCK_HOLDER_ID,
+    ])
+  })
+
+  it('leaves no holder id behind when the token write fails first', async () => {
+    // #given the very first state write throws
+    acquireLockMock.mockResolvedValue(lockOk({acquired: true, outcome: 'acquired', etag: '"etag"', holder: null}))
+    releaseLockMock.mockResolvedValue(ok(undefined))
+    vi.mocked(core.saveState).mockImplementationOnce(() => {
+      throw new Error('state file unwritable')
+    })
+
+    // #when
+    const result = await runAcquireLock({
+      storeConfig: createStoreConfig(),
+      repo: 'fro-bot/agent',
+      runId: '1234',
+      runAttempt: 2,
+      logger: createMockLogger(),
+    })
+
+    // #then the holder id (the post hook's "record is set" flag) was never written
+    expect(result.outcome).toBe('error')
+    expect(core.saveState).not.toHaveBeenCalledWith(STATE_KEYS.LOCK_HOLDER_ID, expect.anything())
+  })
+
+  it('bounds the best-effort release with the shared deadline', async () => {
+    // #given the lock was acquired, the record write fails, and the release never settles
+    vi.useFakeTimers()
+    try {
+      acquireLockMock.mockResolvedValue(lockOk({acquired: true, outcome: 'acquired', etag: '"etag-new"', holder: null}))
+      releaseLockMock.mockReturnValue(new Promise(() => {}))
+      vi.mocked(core.saveState).mockImplementationOnce(() => {
+        throw new Error('state file unwritable')
+      })
+      const logger = createMockLogger()
+
+      // #when
+      const running = runAcquireLock({
+        storeConfig: createStoreConfig(),
+        repo: 'fro-bot/agent',
+        runId: '1234',
+        runAttempt: 2,
+        logger,
+      })
+      await vi.advanceTimersByTimeAsync(LOCK_RELEASE_TIMEOUT_MS)
+      const result = await running
+
+      // #then it still fails closed, after aborting the timed-out release's requests and warning about it
+      expect(result.outcome).toBe('error')
+      expect((releaseLockMock.mock.calls[0]?.[5] as AbortSignal).aborted).toBe(true)
+      expect(logger.warning).toHaveBeenCalledWith(
+        'Releasing the lock after a failed holder record threw',
+        expect.objectContaining({error: `Lock release exceeded ${LOCK_RELEASE_TIMEOUT_MS}ms`}),
+      )
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it.each([
+    [
+      'held by another',
+      lockOk({acquired: false, outcome: 'active-holder', etag: null, holder: createLockRecord()}),
+      createStoreConfig(),
+    ],
+    ['an acquisition error', lockErr(new Error('boom')), createStoreConfig()],
+    ['S3 disabled', lockErr(new Error('unused')), createStoreConfig({enabled: false})],
+  ])('records nothing when %s', async (_label, acquireResult, storeConfig) => {
+    // #given
+    acquireLockMock.mockResolvedValue(acquireResult)
+
+    // #when
+    await runAcquireLock({
+      storeConfig,
+      repo: 'fro-bot/agent',
+      runId: '1234',
+      runAttempt: 2,
+      logger: createMockLogger(),
+    })
+
+    // #then
+    expect(core.saveState).not.toHaveBeenCalled()
+  })
+})
+
+describe('releaseActionLockIfHeld', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('releases on the Action scope by holder id', async () => {
+    // #given
+    releaseLockIfHolderMock.mockResolvedValue(ok('released'))
+
+    // #when
+    const result = await releaseActionLockIfHeld({
+      storeConfig: createStoreConfig(),
+      repo: 'fro-bot/agent',
+      holderId: 'action:1234:1',
+      logger: createMockLogger(),
+    })
+
+    // #then
+    expect(result).toEqual(ok('released'))
+    expect(releaseLockIfHolderMock).toHaveBeenCalledWith(
+      expect.objectContaining({lockTtlSeconds: 900}),
+      'fro-bot/agent',
+      'action:1234:1',
+      expect.any(Object),
+      'action',
+      {holderJob: undefined, acquisitionToken: undefined, signal: undefined},
+    )
+  })
+
+  it('passes the recorded holder_job so only this job’s lease matches', async () => {
+    // #given
+    releaseLockIfHolderMock.mockResolvedValue(ok('released'))
+
+    // #when
+    await releaseActionLockIfHeld({
+      storeConfig: createStoreConfig(),
+      repo: 'fro-bot/agent',
+      holderId: 'action:1234:1',
+      holderJob: 'build',
+      logger: createMockLogger(),
+    })
+
+    // #then
+    expect(releaseLockIfHolderMock).toHaveBeenCalledWith(
+      expect.anything(),
+      'fro-bot/agent',
+      'action:1234:1',
+      expect.anything(),
+      'action',
+      expect.objectContaining({holderJob: 'build'}),
+    )
+  })
+
+  it('passes the acquisition token and abort signal through', async () => {
+    // #given
+    releaseLockIfHolderMock.mockResolvedValue(ok('released'))
+    const controller = new AbortController()
+
+    // #when
+    await releaseActionLockIfHeld({
+      storeConfig: createStoreConfig(),
+      repo: 'fro-bot/agent',
+      holderId: 'action:1234:1',
+      acquisitionToken: 'token-aaaaaaaa',
+      signal: controller.signal,
+      logger: createMockLogger(),
+    })
+
+    // #then
+    expect(releaseLockIfHolderMock.mock.calls[0]?.[5]).toEqual({
+      holderJob: undefined,
+      acquisitionToken: 'token-aaaaaaaa',
+      signal: controller.signal,
+    })
+  })
+})
+
+describe('runWithDeadline', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('aborts the signal when the deadline expires and rejects', async () => {
+    // #given work that only settles when aborted
+    vi.useFakeTimers()
+    let seen: AbortSignal | undefined
+    const running = runWithDeadline(
+      async signal =>
+        new Promise<never>((_resolve, reject) => {
+          seen = signal
+          signal.addEventListener('abort', () => reject(new Error('aborted by deadline')))
+        }),
+      1_000,
+      'deadline exceeded',
+    )
+    const outcome = running.then(
+      () => 'resolved',
+      (error: Error) => error.message,
+    )
+
+    // #when
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    // #then
+    expect(await outcome).toBe('deadline exceeded')
+    expect(seen?.aborted).toBe(true)
+  })
+
+  it('leaves the signal alone when the work finishes in time', async () => {
+    // #given
+    let seen: AbortSignal | undefined
+
+    // #when
+    const value = await runWithDeadline(
+      async signal => {
+        seen = signal
+        return 'done'
+      },
+      1_000,
+      'deadline exceeded',
+    )
+
+    // #then
+    expect(value).toBe('done')
+    expect(seen?.aborted).toBe(false)
   })
 })

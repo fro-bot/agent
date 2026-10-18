@@ -2,17 +2,20 @@
  * CSRF token module for the operator web surface.
  *
  * Implements signed, session-bound CSRF tokens using HMAC-SHA256.
- * Tokens are bound to session ID, operator ID, and a 15-minute interval.
+ * Tokens are bound to a SHA-256 hash of the session ID, the operator ID, and a 15-minute interval.
  * A 30-second grace window allows the previous interval's token to remain valid
  * during rotation.
  *
  * Security invariants:
  *   - Tokens are signed with a separate CSRF signing key (never reuse session secret).
- *   - Tokens are bound to session ID + operator ID + interval.
+ *   - Tokens are bound to sha256(session ID) + operator ID + interval. The payload is only base64url
+ *     encoded, so it carries the hash and never the session ID: a token read from a log, a screenshot
+ *     or a proxy cannot reveal the cookie value.
  *   - Verification uses timing-safe comparison (timingSafeEqual).
  *   - Tokens are never logged, never in query/body, never in cookies.
  *   - Token format: base64url(payload).base64url(hmac)
- *   - Payload: JSON {sid, oid, iv} where iv = Math.floor(nowMs / INTERVAL_MS)
+ *   - Payload: JSON {sid, oid, iv} where sid = sha256(session ID) as hex and
+ *     iv = Math.floor(nowMs / INTERVAL_MS)
  *
  * Browser-origin guard middleware:
  *   - Rejects non-cookie credential schemes (Authorization, Proxy-Authorization, X-API-Key).
@@ -27,10 +30,11 @@
 import type {Context} from 'hono'
 import type {AuditLogger, BrowserGuardRejectedReason} from '../audit.js'
 import type {OperatorAllowlist} from './allowlist.js'
-import type {SessionStore} from './session.js'
+import type {DurableSessionStore} from './session.js'
 import {Buffer} from 'node:buffer'
 import {createHmac, timingSafeEqual} from 'node:crypto'
 import {emitAudit} from '../audit.js'
+import {hashSessionId} from './session-persistence.js'
 import {parseSessionCookie} from './session.js'
 
 // ---------------------------------------------------------------------------
@@ -85,7 +89,7 @@ export interface CsrfLogger {
 export interface BrowserGuardDeps {
   readonly logger: CsrfLogger
   readonly auditLogger: AuditLogger
-  readonly sessionStore: SessionStore
+  readonly sessionStore: Pick<DurableSessionStore, 'get'>
   readonly allowlist: OperatorAllowlist
   readonly csrfSecret: string
   readonly publicOrigin: string
@@ -97,13 +101,19 @@ export interface BrowserGuardDeps {
 // ---------------------------------------------------------------------------
 
 interface CsrfPayload {
+  /** sha256 of the session ID, hex. Never the session ID itself. */
   readonly sid: string
   readonly oid: number
   readonly iv: number
 }
 
+/** The session binding carried in a token. The one place a session ID becomes a payload value. */
+function sessionBinding(sessionId: string): string {
+  return hashSessionId(sessionId)
+}
+
 function buildPayload(sessionId: string, operatorId: number, intervalIndex: number): string {
-  const payload: CsrfPayload = {sid: sessionId, oid: operatorId, iv: intervalIndex}
+  const payload: CsrfPayload = {sid: sessionBinding(sessionId), oid: operatorId, iv: intervalIndex}
   return Buffer.from(JSON.stringify(payload)).toString('base64url')
 }
 
@@ -124,7 +134,7 @@ function intervalIndex(nowMs: number): number {
  * Generate a signed CSRF token bound to the given session and operator.
  *
  * Token format: base64url(payload).base64url(hmac)
- * Payload: JSON {sid, oid, iv} where iv = Math.floor(nowMs / INTERVAL_MS)
+ * Payload: JSON {sid, oid, iv} where sid = sha256(sessionId) and iv = Math.floor(nowMs / INTERVAL_MS)
  *
  * The token is deterministic within a 15-minute interval for the same inputs.
  */
@@ -197,7 +207,7 @@ export function verifyCsrfToken(params: VerifyCsrfTokenParams): VerifyCsrfTokenR
   const parsed: CsrfPayload = {sid: raw.sid, oid: raw.oid, iv: raw.iv}
 
   // Check session and operator binding
-  if (parsed.sid !== sessionId || parsed.oid !== operatorId) {
+  if (parsed.sid !== sessionBinding(sessionId) || parsed.oid !== operatorId) {
     return {ok: false, reason: 'binding_mismatch'}
   }
 
@@ -418,7 +428,7 @@ export async function applyBrowserGuard(
   }
 
   const nowMs = deps.clock()
-  const session = deps.sessionStore.get(sessionId, nowMs)
+  const session = deps.sessionStore.get(sessionId)
   if (session === undefined) {
     deps.logger.warn({}, 'browser guard: invalid or expired session')
     emitAudit(
@@ -432,8 +442,6 @@ export async function applyBrowserGuard(
   const {githubUserId} = session
 
   // c) Enforce allowlist against session-bound GitHub numeric ID
-  // Touch session ONLY after allowlist passes — non-allowlisted sessions must not
-  // extend their idle TTL (they should expire naturally).
   if (deps.allowlist.isAuthorized(githubUserId) === false) {
     deps.logger.warn({githubUserId}, 'browser guard: operator not in allowlist')
     emitAudit(
@@ -443,9 +451,6 @@ export async function applyBrowserGuard(
     addVaryHeader(c)
     return {ok: false, response: c.json({error: 'forbidden'}, 403)}
   }
-
-  // Touch session to extend idle TTL — only after allowlist authorization passes.
-  deps.sessionStore.touch(sessionId, nowMs)
 
   // d) Validate Origin
   const originHeader = c.req.header('origin')
