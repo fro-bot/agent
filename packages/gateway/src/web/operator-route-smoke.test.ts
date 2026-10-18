@@ -19,6 +19,7 @@ import {describe, expect, it, vi} from 'vitest'
 import {buildOperatorServerInputs} from '../program.js'
 import {loadAllowlistFromText} from './auth/allowlist.js'
 import {SESSION_COOKIE_NAME} from './auth/session.js'
+import {buildTestSessionStoreHarness, createTestSessionStore, mintTestSession} from './auth/test-session-store.js'
 import {makeTrustedProxyIngressPolicy} from './ingress/policy.js'
 import {parseTrustedProxyAddress} from './ingress/trusted-proxy-address.js'
 import {EXPECTED_OPERATOR_ROUTES, runOperatorRouteSmoke} from './operator-route-smoke.js'
@@ -153,6 +154,7 @@ describe('buildOperatorServerInputs — parity with production wiring', () => {
       questionRegistry,
       launchWorkDeps: makeStubLaunchWorkDeps(),
       dispatchWorkflow: makeStubDispatchWorkflow(),
+      sessionStore: buildTestSessionStoreHarness().store,
       operatorWebConfig,
     })
 
@@ -190,6 +192,7 @@ describe('buildOperatorServerInputs — parity with production wiring', () => {
 
   it('mounts GET /operator/runs and returns 200 with production-shaped deps', async () => {
     // #given — the production deps path with both registries present and a live session
+    const sessionStore = await createTestSessionStore()
     const {deps, config} = buildOperatorServerInputs({
       logger: makeStubLogger(),
       isShuttingDown: () => false,
@@ -201,11 +204,11 @@ describe('buildOperatorServerInputs — parity with production wiring', () => {
       questionRegistry: makeStubQuestionRegistry(),
       launchWorkDeps: makeStubLaunchWorkDeps(),
       dispatchWorkflow: makeStubDispatchWorkflow(),
+      sessionStore,
       operatorWebConfig: makeStubOperatorWebConfig(),
     })
     const app = buildOperatorApp(deps, config)
-    const sessionId = deps.sessionStore?.create({githubUserId: 42, login: 'octocat'}, '', Date.now())
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     // #when — the allowlisted operator lists runs
     const res = await app.fetch(
@@ -234,6 +237,7 @@ describe('buildOperatorServerInputs — parity with production wiring', () => {
         questionRegistry: registry === 'questionRegistry' ? undefined : makeStubQuestionRegistry(),
         launchWorkDeps: makeStubLaunchWorkDeps(),
         dispatchWorkflow: makeStubDispatchWorkflow(),
+        sessionStore: buildTestSessionStoreHarness().store,
         operatorWebConfig: makeStubOperatorWebConfig(),
       })
 
@@ -290,6 +294,7 @@ describe('buildOperatorServerInputs — parity with production wiring', () => {
           keyVersion: '1',
         },
       },
+      sessionStore: buildTestSessionStoreHarness().store,
       operatorWebConfig,
     })
 
@@ -330,6 +335,7 @@ describe('buildOperatorServerInputs — parity with production wiring', () => {
       approvalRegistry,
       launchWorkDeps: makeStubLaunchWorkDeps(),
       dispatchWorkflow: makeStubDispatchWorkflow(),
+      sessionStore: buildTestSessionStoreHarness().store,
       operatorWebConfig,
     })
 
@@ -367,6 +373,7 @@ describe('buildOperatorServerInputs — parity with production wiring', () => {
       approvalRegistry,
       launchWorkDeps: makeStubLaunchWorkDeps(),
       dispatchWorkflow: makeStubDispatchWorkflow(),
+      sessionStore: buildTestSessionStoreHarness().store,
       operatorWebConfig,
     })
 

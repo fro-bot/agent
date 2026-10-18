@@ -178,8 +178,13 @@ function makeGatewayLogger() {
   }
 }
 
+// Every ID minted by uniqueUserId() is registered here, so default fixtures treat their users as
+// configured binders. Tests for the binder gate use uniqueOutsiderId() or override the list.
+const allowedBinders = new Set<string>()
+
 function makeDeps(overrides?: Partial<AddProjectDeps>): AddProjectDeps {
   return {
+    binderAllowlist: allowedBinders,
     bindingsStore: makeBindingsStore(),
     appClient: makeAppClient(),
     workspaceClient: makeWorkspaceClient(),
@@ -188,6 +193,12 @@ function makeDeps(overrides?: Partial<AddProjectDeps>): AddProjectDeps {
     gatewayLogger: makeGatewayLogger(),
     ...overrides,
   }
+}
+
+function guildWithFetch(fetch: ReturnType<typeof vi.fn>): Guild {
+  const guild = makeGuild('bot-user-id', true, [])
+  ;(guild.members as unknown as {fetch: ReturnType<typeof vi.fn>}).fetch = fetch
+  return guild
 }
 
 async function run(interaction: ChatInputCommandInteraction, deps: AddProjectDeps): Promise<void> {
@@ -200,8 +211,16 @@ async function run(interaction: ChatInputCommandInteraction, deps: AddProjectDep
 
 // The rate limiter is module-level state. We reset it by using unique user IDs per test.
 let userIdCounter = 0
+function nextSnowflake(): string {
+  return String(100_000_000_000_000_000n + BigInt(++userIdCounter))
+}
 function uniqueUserId(): string {
-  return `user-${++userIdCounter}`
+  const id = nextSnowflake()
+  allowedBinders.add(id)
+  return id
+}
+function uniqueOutsiderId(): string {
+  return nextSnowflake()
 }
 
 // ---------------------------------------------------------------------------
@@ -873,6 +892,149 @@ describe('executeAddProject', () => {
   // -------------------------------------------------------------------------
   // Invoking-user authorization gate
   // -------------------------------------------------------------------------
+
+  describe('PRE_FLIGHT: binder allowlist', () => {
+    const BINDER_REFUSAL = 'You are not authorized to use this command.'
+
+    it('refuses a user not on the list with the generic copy, without fetching the member or cloning', async () => {
+      // #given — an outsider who would otherwise pass ManageChannels
+      const userId = uniqueOutsiderId()
+      const clone = vi.fn()
+      const fetch = vi.fn().mockResolvedValue({permissions: {has: vi.fn().mockReturnValue(true)}})
+      const {interaction, editReply} = makeInteraction({userId, guild: guildWithFetch(fetch)})
+      const deps = makeDeps({workspaceClient: makeWorkspaceClient({clone})})
+
+      // #when
+      await run(interaction, deps)
+
+      // #then
+      expect(lastEditReplyContent(editReply)).toBe(BINDER_REFUSAL)
+      expect(fetch).not.toHaveBeenCalled()
+      expect(clone).not.toHaveBeenCalled()
+    })
+
+    it('refuses via the ephemeral deferred reply and creates no binding', async () => {
+      // #given
+      const userId = uniqueOutsiderId()
+      const createBinding = vi.fn()
+      const {interaction, deferReply} = makeInteraction({userId})
+      const deps = makeDeps({bindingsStore: makeBindingsStore({createBinding})})
+
+      // #when
+      await run(interaction, deps)
+
+      // #then
+      expect(deferReply).toHaveBeenCalledWith({ephemeral: true})
+      expect(createBinding).not.toHaveBeenCalled()
+    })
+
+    it('refuses every user with the same copy when the list is empty', async () => {
+      // #given — even a user with ManageChannels is refused
+      const userId = uniqueUserId()
+      const fetch = vi.fn().mockResolvedValue({permissions: {has: vi.fn().mockReturnValue(true)}})
+      const {interaction, editReply} = makeInteraction({userId, guild: guildWithFetch(fetch)})
+      const deps = makeDeps({binderAllowlist: new Set()})
+
+      // #when
+      await run(interaction, deps)
+
+      // #then — same copy as the not-listed case, so the refusal does not reveal an empty list
+      expect(lastEditReplyContent(editReply)).toBe(BINDER_REFUSAL)
+      expect(fetch).not.toHaveBeenCalled()
+    })
+
+    it('refuses every user when the list is absent from deps', async () => {
+      // #given
+      const userId = uniqueUserId()
+      const {interaction, editReply} = makeInteraction({userId})
+      const deps = makeDeps({binderAllowlist: undefined})
+
+      // #when
+      await run(interaction, deps)
+
+      // #then
+      expect(lastEditReplyContent(editReply)).toBe(BINDER_REFUSAL)
+    })
+
+    it('matches IDs beyond the safe-integer range by exact string', async () => {
+      // #given — two snowflakes that collide when parsed as doubles
+      const listed = '18446744073709551615'
+      const lookalike = '18446744073709551614'
+      const {PermissionFlagsBits} = await import('discord.js')
+      const member = {
+        permissions: {has: vi.fn().mockImplementation((flag: bigint) => flag === PermissionFlagsBits.ManageChannels)},
+      }
+      const deps = makeDeps({binderAllowlist: new Set([listed])})
+
+      // #when
+      const listedRun = makeInteraction({
+        userId: listed,
+        guild: guildWithFetch(vi.fn().mockResolvedValue(member)),
+      })
+      await run(listedRun.interaction, deps)
+      const lookalikeRun = makeInteraction({userId: lookalike})
+      await run(lookalikeRun.interaction, deps)
+
+      // #then
+      expect(lastEditReplyContent(listedRun.editReply)).not.toBe(BINDER_REFUSAL)
+      expect(lastEditReplyContent(lookalikeRun.editReply)).toBe(BINDER_REFUSAL)
+    })
+
+    it('does not reveal the list size or contents in the refusal', async () => {
+      // #given
+      const userId = uniqueOutsiderId()
+      const {interaction, editReply} = makeInteraction({userId})
+      const deps = makeDeps({binderAllowlist: new Set(['999999999999999999'])})
+
+      // #when
+      await run(interaction, deps)
+
+      // #then
+      const reply = lastEditReplyContent(editReply)
+      expect(reply).not.toContain('999999999999999999')
+      expect(reply.toLowerCase()).not.toContain('allowlist')
+      expect(reply.toLowerCase()).not.toContain('binder')
+    })
+
+    it('lets a listed user without ManageChannels through to the existing ManageChannels refusal', async () => {
+      // #given
+      const userId = uniqueUserId()
+      const clone = vi.fn()
+      const fetch = vi.fn().mockResolvedValue({permissions: {has: vi.fn().mockReturnValue(false)}})
+      const {interaction, editReply} = makeInteraction({userId, guild: guildWithFetch(fetch)})
+      const deps = makeDeps({workspaceClient: makeWorkspaceClient({clone})})
+
+      // #when
+      await run(interaction, deps)
+
+      // #then
+      expect(lastEditReplyContent(editReply)).toContain('Manage Channels')
+      expect(fetch).toHaveBeenCalledOnce()
+      expect(clone).not.toHaveBeenCalled()
+    })
+
+    it('lets a listed user with ManageChannels reach READY and create the binding', async () => {
+      // #given
+      const userId = uniqueUserId()
+      const {PermissionFlagsBits} = await import('discord.js')
+      const member = {
+        permissions: {has: vi.fn().mockImplementation((flag: bigint) => flag === PermissionFlagsBits.ManageChannels)},
+      }
+      const {channel} = makeTextChannel('testrepo')
+      const guild = makeGuild('bot-user-id', true, [], channel)
+      ;(guild.members as unknown as {fetch: ReturnType<typeof vi.fn>}).fetch = vi.fn().mockResolvedValue(member)
+      const createBinding = vi.fn().mockResolvedValue(ok({primaryEtag: 'e1', indexEtag: 'e2'}))
+      const {interaction, editReply} = makeInteraction({userId, guild})
+      const deps = makeDeps({bindingsStore: makeBindingsStore({createBinding})})
+
+      // #when
+      await run(interaction, deps)
+
+      // #then
+      expect(lastEditReplyContent(editReply)).toContain('Ready')
+      expect(createBinding).toHaveBeenCalledOnce()
+    })
+  })
 
   describe('PRE_FLIGHT: user authorization', () => {
     it('rejects user without guild-level ManageChannels and does not proceed to clone', async () => {

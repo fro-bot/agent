@@ -7,22 +7,21 @@
  *
  * Gate ordering (mirrors decision-route.ts exactly):
  *   1. Guard (browser/session/allowlist/CSRF) — installed by buildOperatorApp
- *   2. Resolve session + OAuth token by sessionId
- *   3. Resolve runId → repo via RunIndex (server-owned; never client-supplied)
- *   4. Split owner/repo from the resolved location
- *   5. Resolve binding deny-keys; prime denylist; check isRepoDenied
- *   6. checkRepoWriteAuthz (WRITE-level — not read; insufficient_permission → denial)
- *   7. Operator-keyed rate limit (AFTER authz — unauthorized requests don't consume budget)
- *   8. Build CancelActorContext from the operator auth context (server-side only)
- *   9. cancelRun(params, deps)
- *  10. Emit run.cancel.* audit record
- *  11. Map CancelOutcome → JSON response
+ *   2. Resolve runId → repo via RunIndex (server-owned; never client-supplied)
+ *   3. Split owner/repo from the resolved location
+ *   4. resolveRepoAccess (bound AND not denylisted, one binding read) — the same
+ *      predicate the read routes use; anything but `allowed` → notFoundResponse
+ *   5. Operator-keyed rate limit (AFTER authz — unauthorized requests don't consume budget)
+ *   6. Build CancelActorContext from the operator auth context (server-side only)
+ *   7. cancelRun(params, deps)
+ *   8. Emit run.cancel.* audit record
+ *   9. Map CancelOutcome → JSON response
  *
  * Security invariants:
  *   - The repo is resolved server-side via resolveRepoFromRunIndex — NEVER from the client.
- *   - Every denial at gates 2–6 returns the identical no-oracle notFoundResponse.
+ *   - Every denial at gates 2–4 returns the identical no-oracle notFoundResponse.
  *   - A gate throw degrades to the same no-oracle denial, not a distinguishable 500.
- *   - Read-only operators (insufficient_permission) are denied at gate 6.
+ *   - A repo-level denial (unbound, denylisted, store unavailable) emits no audit event.
  *   - CSRF/Origin middleware covers this POST route (write route).
  */
 
@@ -33,16 +32,14 @@ import type {RateLimiter} from '../../http/rate-limit.js'
 import type {DenylistCache} from '../../redaction/denylist.js'
 import type {BindingsLookup} from '../../redaction/surface-gate.js'
 import type {AuditLogger} from '../audit.js'
-import type {RepoAuthzDeps} from '../auth/repo-authz.js'
-import type {SessionStore} from '../auth/session.js'
+import type {DurableSessionStore} from '../auth/session.js'
 import type {OperatorLogger} from '../server.js'
 import {cancelRun} from '../../execute/cancel.js'
 import {createRateLimiter} from '../../http/rate-limit.js'
 import {emitAudit} from '../audit.js'
-import {checkRepoWriteAuthz} from '../auth/repo-authz.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
 import {notFoundResponse, rateLimitedResponse, unavailableResponse} from '../safe-response.js'
-import {checkDenylist, resolveRepoFromRunIndex} from './route-helpers.js'
+import {resolveRepoAccess, resolveRepoFromRunIndex} from './route-helpers.js'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -58,16 +55,14 @@ const CANCEL_RATE_WINDOW_MIN_MS = 60_000
 
 /** Dependencies for the cancel route. */
 export interface CancelRouteDeps {
-  /** Session store for token retrieval. */
-  readonly sessionStore: Pick<SessionStore, 'getOperatorToken' | 'get'>
+  /** Session store for the actor's display login. */
+  readonly sessionStore: Pick<DurableSessionStore, 'get'>
   /** Server-owned run index for runId → repo resolution. */
   readonly runIndex: Pick<RunIndex, 'lookup'>
   /** Denylist cache for pre-cancel redaction check. */
   readonly denylistCache: DenylistCache
   /** Bindings lookup for deny-key resolution. */
   readonly bindingsLookup: BindingsLookup
-  /** Repo authorization dependencies (write-level). */
-  readonly repoAuthzDeps: RepoAuthzDeps
   /** Cancel-run engine dependencies (queue, abort registry, approvals, etc.). */
   readonly cancelRunDeps: CancelRunDeps
   /** Audit logger for security events. */
@@ -105,8 +100,6 @@ export function buildCancelRoute(app: Hono, deps: CancelRouteDeps): void {
     createRateLimiter({limit: CANCEL_RATE_LIMIT_PER_MIN, windowMs: CANCEL_RATE_WINDOW_MIN_MS, clock: deps.now})
 
   registerOperatorRoute(app, 'POST', '/operator/runs/:runId/cancel', async c => {
-    const nowMs = deps.now()
-
     // ── Gate 1: Read authenticated context set by the guard ──────────────────
     // In production the guard always sets this; undefined is unreachable.
     // Return not-found as a safe fallback (no oracle — same shape as all denials).
@@ -118,26 +111,13 @@ export function buildCancelRoute(app: Hono, deps: CancelRouteDeps): void {
 
     const {githubUserId, sessionId} = authCtx
 
-    // ── Gates 2–6: Pre-acceptance authorization gates ─────────────────────────
+    // ── Gates 2–4: Pre-acceptance authorization gates ────────────────────────────
     // Wrapped in try/catch so any unexpected throw returns the uniform not-found
     // shape rather than propagating to Hono as a 500 (no-oracle property).
     let runId: string
-    let owner: string
-    let repo: string
 
     try {
-      // ── Gate 2: Resolve OAuth token ──────────────────────────────────────
-      const token = deps.sessionStore.getOperatorToken(sessionId, nowMs)
-      if (token === undefined) {
-        deps.logger.warn({githubUserId, gate: 'no-token'}, 'cancel: denied')
-        emitAudit(
-          {kind: 'run.cancel.rejected', correlationId: `cancel:${githubUserId}`, githubUserId, reason: 'not_found'},
-          deps.auditLogger,
-        )
-        return notFoundResponse(c)
-      }
-
-      // ── Gates 3–4: Resolve runId → {owner, repo} (server-owned) ────────────
+      // ── Gates 2–3: Resolve runId → {owner, repo} (server-owned) ────────────
       // The repo is NEVER taken from the client. RunIndex.lookup is the sole authority.
       runId = c.req.param('runId') ?? ''
       const resolved = await resolveRepoFromRunIndex(runId, deps.runIndex)
@@ -154,37 +134,16 @@ export function buildCancelRoute(app: Hono, deps: CancelRouteDeps): void {
         )
         return notFoundResponse(c)
       }
-      owner = resolved.owner
-      repo = resolved.repo
+      const {owner, repo} = resolved
 
-      // ── Gate 5: Redaction check (denylist before authz, fail-closed) ─────
-      const isDenied = await checkDenylist(owner, repo, deps.bindingsLookup, deps.denylistCache)
-      if (isDenied === true) {
-        deps.logger.warn({githubUserId, runId, gate: 'denylisted'}, 'cancel: denied')
-        emitAudit(
-          {
-            kind: 'run.cancel.rejected',
-            correlationId: `cancel:${githubUserId}:${runId}`,
-            githubUserId,
-            reason: 'not_found',
-          },
-          deps.auditLogger,
-        )
-        return notFoundResponse(c)
-      }
-
-      // ── Gate 6: Write-level repo authorization ───────────────────────────
-      const authzResult = await checkRepoWriteAuthz(githubUserId, owner, repo, token, deps.repoAuthzDeps)
-      if (authzResult.authorized === false) {
-        deps.logger.warn({githubUserId, runId, gate: 'write-authz-denied'}, 'cancel: denied')
-        emitAudit(
-          {
-            kind: 'run.cancel.rejected',
-            correlationId: `cancel:${githubUserId}:${runId}`,
-            githubUserId,
-            reason: 'authz_denied',
-          },
-          deps.auditLogger,
+      // ── Gate 4: Repo access (bound AND not denylisted, fail-closed) ───────
+      // Same predicate as the read routes. Unbound and denylisted share one denial
+      // label; repo-level denials emit no audit event.
+      const access = await resolveRepoAccess(owner, repo, deps)
+      if (access.kind !== 'allowed') {
+        deps.logger.warn(
+          {githubUserId, gate: access.kind === 'denied' ? 'repo-denied' : 'repo-unavailable'},
+          'cancel: denied',
         )
         return notFoundResponse(c)
       }
@@ -197,7 +156,7 @@ export function buildCancelRoute(app: Hono, deps: CancelRouteDeps): void {
       return notFoundResponse(c)
     }
 
-    // ── Gate 7: Operator rate limit — AFTER authz so unauthorized requests
+    // ── Gate 5: Operator rate limit — AFTER authz so unauthorized requests
     // don't consume budget. Operator-keyed, not socket-keyed. ─────────────────
     const operatorKey = String(githubUserId)
     if (rateLimiter.allow(operatorKey) === false) {
@@ -205,12 +164,12 @@ export function buildCancelRoute(app: Hono, deps: CancelRouteDeps): void {
       return rateLimitedResponse(c)
     }
 
-    // ── Gates 8–11: Post-authz settlement gates ───────────────────────────────
+    // ── Gates 6–9: Post-authz settlement gates ─────────────────────────────────────
     // Wrapped in try/catch so any unexpected throw returns the uniform not-found
     // shape rather than propagating to Hono as a distinguishable 500.
     try {
-      // ── Gate 8: Build CancelActorContext from the operator auth context ────
-      const sessionEntry = deps.sessionStore.get(sessionId, nowMs)
+      // ── Gate 6: Build CancelActorContext from the operator auth context ────
+      const sessionEntry = deps.sessionStore.get(sessionId)
       if (sessionEntry === undefined) {
         deps.logger.warn({githubUserId, runId, gate: 'no-session'}, 'cancel: denied — session missing')
         emitAudit(
@@ -231,10 +190,10 @@ export function buildCancelRoute(app: Hono, deps: CancelRouteDeps): void {
         sessionCorrelationId: sessionId,
       }
 
-      // ── Gate 9: Cancel through the transport-neutral orchestrator ───────────
+      // ── Gate 7: Cancel through the transport-neutral orchestrator ───────────
       const outcome: CancelOutcome = await cancelRun({runId, actor, logger: deps.logger}, deps.cancelRunDeps)
 
-      // ── Gates 10–11: Map outcome → audit + JSON response ─────────────────────
+      // ── Gates 8–9: Map outcome → audit + JSON response ─────────────────────────
       switch (outcome.outcome) {
         case 'cancelled': {
           emitAudit(

@@ -3,7 +3,7 @@
  *
  * Covers:
  *   - Happy path: valid session → 200 with operatorId, login, expiresAt.
- *   - Expiry math: min(absolute, idle) — both idle-bound and absolute-bound cases.
+ *   - Expiry: fixed at issuedAt + the durable lifetime, whatever the clock reads and however often the session is used.
  *   - Error path: store.get returns undefined (expired/revoked/missing) → coarse 401.
  *   - Error path: getOperatorAuthContext undefined (guard not installed) → 401.
  *   - Headers: Cache-Control: no-store, private and Vary header set on 200.
@@ -14,7 +14,7 @@
 
 import type {PushHealthStatus} from '../operator-push/push-health.js'
 import type {BrowserGuardDeps} from './csrf.js'
-import type {SessionEntry, SessionStore} from './session.js'
+import type {DurableSession} from './session.js'
 
 import {Hono} from 'hono'
 import {describe, expect, it, vi} from 'vitest'
@@ -22,12 +22,8 @@ import {setOperatorRouteGuard} from '../operator-route.js'
 import {loadAllowlistFromText} from './allowlist.js'
 import {applyBrowserGuard} from './csrf.js'
 import {buildSessionInfoRoute} from './session-info-route.js'
-import {
-  createInMemorySessionStore,
-  SESSION_ABSOLUTE_TTL_MS,
-  SESSION_COOKIE_NAME,
-  SESSION_IDLE_TTL_MS,
-} from './session.js'
+import {DURABLE_SESSION_TTL_MS, SESSION_COOKIE_NAME} from './session.js'
+import {createTestSessionStore, mintTestSession} from './test-session-store.js'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -42,18 +38,8 @@ function makeLogger() {
   }
 }
 
-function makeStubSessionStore(entry?: Readonly<Omit<SessionEntry, 'oauthToken'>>): SessionStore {
-  return {
-    create: vi.fn(() => 'stub-session-id'),
-    get: vi.fn((_sessionId: string, _nowMs: number) => entry),
-    touch: vi.fn(),
-    delete: vi.fn(),
-    onRevoke: vi.fn(),
-    scavenge: vi.fn(),
-    size: vi.fn(() => 0),
-    getOperatorToken: vi.fn(() => undefined),
-    dropOperatorToken: vi.fn(),
-  }
+function makeStubSessionStore(entry?: DurableSession): BrowserGuardDeps['sessionStore'] {
+  return {get: vi.fn((_sessionId: string) => entry)}
 }
 
 function makeStubBrowserGuardDeps(overrides?: Partial<BrowserGuardDeps>): BrowserGuardDeps {
@@ -109,14 +95,11 @@ describe('buildSessionInfoRoute — happy path', () => {
     // #given
     const nowMs = 1_000_000
     const issuedAt = nowMs - 1000
-    const lastAccessedAt = nowMs - 500
 
-    const entry: SessionEntry = {
+    const entry: DurableSession = {
       githubUserId: 42,
       login: 'octocat',
       issuedAt,
-      lastAccessedAt,
-      revoked: false,
     }
 
     const sessionStore = makeStubSessionStore(entry)
@@ -136,84 +119,45 @@ describe('buildSessionInfoRoute — happy path', () => {
     expect(body.operatorId).toBe(42)
     expect(body.login).toBe('octocat')
 
-    // expiresAt = min(issuedAt + ABSOLUTE_TTL, lastAccessedAt + IDLE_TTL)
-    const absoluteExpiry = issuedAt + SESSION_ABSOLUTE_TTL_MS
-    const idleExpiry = lastAccessedAt + SESSION_IDLE_TTL_MS
-    expect(body.expiresAt).toBe(Math.min(absoluteExpiry, idleExpiry))
+    // expiresAt = issuedAt + the durable lifetime
+    expect(body.expiresAt).toBe(issuedAt + DURABLE_SESSION_TTL_MS)
   })
 })
 
 // ---------------------------------------------------------------------------
-// Expiry math — idle-bound vs absolute-bound
+// Expiry — fixed from login
 // ---------------------------------------------------------------------------
 
-describe('buildSessionInfoRoute — expiry math', () => {
-  it('uses idle expiry when idle TTL bounds sooner than absolute TTL', async () => {
-    // #given — session was just issued but last accessed long ago (idle expires first)
-    const nowMs = 1_000_000
-    // issuedAt is recent → absolute expiry is far in the future
-    const issuedAt = nowMs - 1000 // absolute expires at nowMs - 1000 + 8h (far future)
-    // lastAccessedAt is old → idle expires soon
-    const lastAccessedAt = nowMs - SESSION_IDLE_TTL_MS + 60_000 // idle expires in 60s
-
-    const entry: SessionEntry = {
-      githubUserId: 99,
-      login: 'idle-user',
-      issuedAt,
-      lastAccessedAt,
-      revoked: false,
-    }
-
-    const sessionStore = makeStubSessionStore(entry)
-    const deps = makeStubBrowserGuardDeps({sessionStore, clock: () => nowMs})
-    const app = buildTestApp(deps)
-
-    // #when
-    const req = new Request('http://localhost/operator/session', {method: 'GET'})
-    const res = await app.fetch(req)
-
-    // #then
-    expect(res.status).toBe(200)
-    const body = (await res.json()) as {expiresAt: number}
-    const absoluteExpiry = issuedAt + SESSION_ABSOLUTE_TTL_MS
-    const idleExpiry = lastAccessedAt + SESSION_IDLE_TTL_MS
-    // idle expires sooner
-    expect(idleExpiry).toBeLessThan(absoluteExpiry)
-    expect(body.expiresAt).toBe(idleExpiry)
+async function fetchExpiresAt(issuedAt: number, nowMs: number): Promise<number> {
+  const deps = makeStubBrowserGuardDeps({
+    sessionStore: makeStubSessionStore({githubUserId: 42, login: 'octocat', issuedAt}),
+    clock: () => nowMs,
   })
+  const app = buildTestApp(deps, {githubUserId: 42})
+  const res = await app.fetch(new Request('http://localhost/operator/session', {method: 'GET'}))
+  expect(res.status).toBe(200)
+  return ((await res.json()) as {expiresAt: number}).expiresAt
+}
 
-  it('uses absolute expiry when absolute TTL bounds sooner than idle TTL', async () => {
-    // #given — session is near its absolute limit but was recently accessed
-    const nowMs = 1_000_000
-    // issuedAt is old → absolute expires soon
-    const issuedAt = nowMs - SESSION_ABSOLUTE_TTL_MS + 60_000 // absolute expires in 60s
-    // lastAccessedAt is recent → idle expires far in the future
-    const lastAccessedAt = nowMs - 1000 // idle expires at nowMs - 1000 + 30min (far future)
+describe('buildSessionInfoRoute — fixed expiry', () => {
+  it('equals issuedAt plus 7 days whatever the clock reads', async () => {
+    // #given a session issued at a fixed time
+    const issuedAt = 10_000_000
 
-    const entry: SessionEntry = {
-      githubUserId: 77,
-      login: 'absolute-user',
-      issuedAt,
-      lastAccessedAt,
-      revoked: false,
-    }
+    // #when the route runs at the start, mid-life and near the end of the lifetime
+    const expiries = await Promise.all(
+      [issuedAt, issuedAt + 3 * 24 * 60 * 60 * 1000, issuedAt + DURABLE_SESSION_TTL_MS - 1].map(async nowMs =>
+        fetchExpiresAt(issuedAt, nowMs),
+      ),
+    )
 
-    const sessionStore = makeStubSessionStore(entry)
-    const deps = makeStubBrowserGuardDeps({sessionStore, clock: () => nowMs})
-    const app = buildTestApp(deps)
-
-    // #when
-    const req = new Request('http://localhost/operator/session', {method: 'GET'})
-    const res = await app.fetch(req)
-
-    // #then
-    expect(res.status).toBe(200)
-    const body = (await res.json()) as {expiresAt: number}
-    const absoluteExpiry = issuedAt + SESSION_ABSOLUTE_TTL_MS
-    const idleExpiry = lastAccessedAt + SESSION_IDLE_TTL_MS
-    // absolute expires sooner
-    expect(absoluteExpiry).toBeLessThan(idleExpiry)
-    expect(body.expiresAt).toBe(absoluteExpiry)
+    // #then every reading is the same fixed expiry
+    expect(DURABLE_SESSION_TTL_MS).toBe(7 * 24 * 60 * 60 * 1000)
+    expect(expiries).toEqual([
+      issuedAt + DURABLE_SESSION_TTL_MS,
+      issuedAt + DURABLE_SESSION_TTL_MS,
+      issuedAt + DURABLE_SESSION_TTL_MS,
+    ])
   })
 })
 
@@ -289,12 +233,10 @@ describe('buildSessionInfoRoute — response headers', () => {
   it('sets Cache-Control: no-store, private on a 200 response', async () => {
     // #given
     const nowMs = 2_000_000
-    const entry: SessionEntry = {
+    const entry: DurableSession = {
       githubUserId: 1,
       login: 'headeruser',
       issuedAt: nowMs - 1000,
-      lastAccessedAt: nowMs - 500,
-      revoked: false,
     }
     const sessionStore = makeStubSessionStore(entry)
     const deps = makeStubBrowserGuardDeps({sessionStore, clock: () => nowMs})
@@ -312,12 +254,10 @@ describe('buildSessionInfoRoute — response headers', () => {
   it('sets Vary: Origin, Sec-Fetch-Site, Sec-Fetch-Mode, Sec-Fetch-Dest on a 200 response', async () => {
     // #given
     const nowMs = 2_000_000
-    const entry: SessionEntry = {
+    const entry: DurableSession = {
       githubUserId: 1,
       login: 'varyuser',
       issuedAt: nowMs - 1000,
-      lastAccessedAt: nowMs - 500,
-      revoked: false,
     }
     const sessionStore = makeStubSessionStore(entry)
     const deps = makeStubBrowserGuardDeps({sessionStore, clock: () => nowMs})
@@ -334,30 +274,16 @@ describe('buildSessionInfoRoute — response headers', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Integration — real session store + real browser guard (touch→recompute path)
+// Integration — real durable session store + real browser guard
 // ---------------------------------------------------------------------------
 
-describe('buildSessionInfoRoute — integration: real guard touch updates expiresAt', () => {
-  it('expiresAt reflects the idle window refreshed by the guard touch, not the pre-request lastAccessedAt', async () => {
-    // #given — real in-memory session store and a controlled clock
-    //
-    // Timeline:
-    //   issuedAt  = nowMs - 1_000  (session is 1 second old)
-    //   nowMs     = the moment the request arrives (guard runs touch at this time)
-    //
-    // We choose issuedAt such that the absolute expiry (issuedAt + 8h) is far in
-    // the future, so the idle bound (nowMs + 30min) is always the sooner one.
-    // This lets us assert expiresAt === nowMs + SESSION_IDLE_TTL_MS precisely.
-    const nowMs = 5_000_000
-    const issuedAt = nowMs - 1_000 // absolute expires at nowMs - 1000 + 8h (far future)
-
-    const sessionStore = createInMemorySessionStore()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', issuedAt)
-    if (sessionId === undefined) throw new Error('expected session to be created')
-
-    // Advance the store's internal lastAccessedAt to issuedAt (create sets it to issuedAt).
-    // The guard will call touch(sessionId, nowMs) which sets lastAccessedAt = nowMs.
-    // The handler then reads lastAccessedAt = nowMs → idleExpiry = nowMs + SESSION_IDLE_TTL_MS.
+describe('buildSessionInfoRoute — integration: real guard and durable store', () => {
+  it('expiresAt stays at issuedAt + 7 days however often the session is used', async () => {
+    // #given — a real durable session issued at a controlled time
+    const issuedAt = 5_000_000
+    const clock = {now: issuedAt}
+    const sessionStore = await createTestSessionStore({clock: () => clock.now})
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
     const browserGuardDeps: BrowserGuardDeps = {
@@ -367,11 +293,10 @@ describe('buildSessionInfoRoute — integration: real guard touch updates expire
       allowlist: loadAllowlistFromText('42\n', logger),
       csrfSecret: 'stub-csrf-secret-base64url-32bytes-ok',
       publicOrigin: 'https://operator.example.com',
-      // Fixed clock: guard and handler both see nowMs — touch sets lastAccessedAt = nowMs
-      clock: () => nowMs,
+      clock: () => clock.now,
     }
 
-    // Build a real Hono app with the REAL browser guard installed exactly as server.ts does
+    // Real Hono app with the REAL browser guard installed exactly as server.ts does
     const app = new Hono()
     const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
     setOperatorRouteGuard(app, async (c, method, _path) => {
@@ -380,33 +305,32 @@ describe('buildSessionInfoRoute — integration: real guard touch updates expire
     })
     buildSessionInfoRoute(app, browserGuardDeps)
 
-    // #when — GET /operator/session with a valid session cookie and matching Origin
-    // (GET is a safe method: no CSRF token required; Origin must match publicOrigin)
-    const req = new Request('https://operator.example.com/operator/session', {
-      method: 'GET',
-      headers: {
-        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
-        origin: 'https://operator.example.com',
-      },
-    })
-    const res = await app.fetch(req)
+    const request = async (): Promise<Response> =>
+      app.fetch(
+        new Request('https://operator.example.com/operator/session', {
+          method: 'GET',
+          headers: {cookie: `${SESSION_COOKIE_NAME}=${sessionId}`, origin: 'https://operator.example.com'},
+        }),
+      )
 
-    // #then — 200 and expiresAt === nowMs + SESSION_IDLE_TTL_MS
-    // This proves the guard's touch(sessionId, nowMs) updated lastAccessedAt to nowMs
-    // and the handler recomputed idleExpiry from the refreshed value — the production contract.
-    expect(res.status).toBe(200)
-    const body = (await res.json()) as {operatorId: number; login: string; expiresAt: number}
-    expect(body.operatorId).toBe(42)
-    expect(body.login).toBe('octocat')
+    // #when — the session is used at login, on day 3 and on day 6
+    const readings: number[] = []
+    for (const offsetDays of [0, 3, 6]) {
+      clock.now = issuedAt + offsetDays * 24 * 60 * 60 * 1000
+      const res = await request()
+      expect(res.status).toBe(200)
+      const body = (await res.json()) as {operatorId: number; login: string; expiresAt: number}
+      expect(body.operatorId).toBe(42)
+      expect(body.login).toBe('octocat')
+      readings.push(body.expiresAt)
+    }
 
-    // Verify idle bound is sooner than absolute bound (precondition for the assertion)
-    const absoluteExpiry = issuedAt + SESSION_ABSOLUTE_TTL_MS
-    const expectedIdleExpiry = nowMs + SESSION_IDLE_TTL_MS
-    expect(expectedIdleExpiry).toBeLessThan(absoluteExpiry)
-
-    // The key assertion: expiresAt reflects the guard-refreshed lastAccessedAt (= nowMs),
-    // not the original issuedAt-based lastAccessedAt that was set at session creation.
-    expect(body.expiresAt).toBe(expectedIdleExpiry)
+    // #then — no request moved the expiry
+    expect(readings).toEqual([
+      issuedAt + DURABLE_SESSION_TTL_MS,
+      issuedAt + DURABLE_SESSION_TTL_MS,
+      issuedAt + DURABLE_SESSION_TTL_MS,
+    ])
   })
 })
 
@@ -416,12 +340,10 @@ describe('buildSessionInfoRoute — integration: real guard touch updates expire
 
 describe('buildSessionInfoRoute — push health', () => {
   const nowMs = 1_000_000
-  const entry: SessionEntry = {
+  const entry: DurableSession = {
     githubUserId: 42,
     login: 'octocat',
     issuedAt: nowMs - 1000,
-    lastAccessedAt: nowMs - 500,
-    revoked: false,
   }
 
   async function fetchSession(getPushHealth?: () => PushHealthStatus): Promise<Record<string, unknown>> {

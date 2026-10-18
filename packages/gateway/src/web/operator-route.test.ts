@@ -509,12 +509,12 @@ describe('buildOperatorApp — health route is explicitly public', () => {
   // once here, scoped to this describe, with a generous hook timeout — the
   // module load is setup cost, not the behavior under test.
   let buildOperatorApp: typeof import('./server.js').buildOperatorApp
-  let createInMemorySessionStore: typeof import('./auth/session.js').createInMemorySessionStore
+  let buildTestSessionStoreHarness: typeof import('./auth/test-session-store.js').buildTestSessionStoreHarness
 
   beforeAll(async () => {
     // #given — import the real buildOperatorApp to verify the health route classification
     ;({buildOperatorApp} = await import('./server.js'))
-    ;({createInMemorySessionStore} = await import('./auth/session.js'))
+    ;({buildTestSessionStoreHarness} = await import('./auth/test-session-store.js'))
   }, 30_000)
 
   it('health route is registered as a public route, not a privileged route', () => {
@@ -540,7 +540,7 @@ describe('buildOperatorApp — health route is explicitly public', () => {
   it('assertAllPrivilegedRoutesWrapped passes for the real buildOperatorApp', () => {
     // #given — include the dispatch route's optional dependencies so the real
     // production registration path mounts it before the wrapping assertion.
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = buildTestSessionStoreHarness().store
     const logger = {debug: () => undefined, info: () => undefined, warn: () => undefined, error: () => undefined}
     const app = buildOperatorApp(
       {

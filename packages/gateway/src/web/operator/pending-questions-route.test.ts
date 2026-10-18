@@ -1,13 +1,13 @@
 /**
  * Tests for GET /operator/runs/:runId/questions.
  *
- * Real HTTP route, real question registry and request gate. Read-level authz;
- * denylist before authz; no-oracle denials; bounded DTOs.
+ * Real HTTP route, real question registry and request gate. Bindings-only repo access
+ * (bound AND not denylisted); no-oracle denials; bounded DTOs.
  */
 
 import type {PendingQuestionsResponse} from '../../operator-contract/question-frame.js'
 import type {PendingQuestionsRouteDeps} from './pending-questions-route.js'
-import {describe, expect, it} from 'vitest'
+import {describe, expect, it, vi} from 'vitest'
 import {QUESTION_TEXT_MAX_LENGTH} from '../../approvals/question-detail.js'
 import {buildPendingQuestionsRoute, PENDING_QUESTIONS_MAX_RESULTS} from './pending-questions-route.js'
 import {
@@ -19,11 +19,8 @@ import {
   makeLogger,
   makeRegistry,
   makeRunIndex,
-  makeSessionStore,
   pickQuestion,
-  readOnlyAuthz,
   RUN_ID,
-  writeAuthz,
 } from './test-helpers.js'
 
 function makeDeps(
@@ -31,11 +28,9 @@ function makeDeps(
   overrides?: Partial<PendingQuestionsRouteDeps>,
 ): PendingQuestionsRouteDeps {
   return {
-    sessionStore: makeSessionStore(),
     runIndex: makeRunIndex(),
     denylistCache: makeDenylistCache(),
     bindingsLookup: makeBindingsLookup(),
-    repoAuthzDeps: readOnlyAuthz(),
     registry,
     logger: makeLogger(),
     now: () => 0,
@@ -143,34 +138,78 @@ describe('GET pending questions', () => {
     expect(res.headers.get('Cache-Control')).toBe('no-store, private')
   })
 
-  it('denylisted repo → 404 before any authz call', async () => {
+  it('denylisted repo → 404 and the question registry is never read', async () => {
     // #given a denylisted repo
     const registry = makeRegistry()
     register(registry, 'que_1')
-    const repoAuthzDeps = readOnlyAuthz()
+    const describeSpy = vi.spyOn(registry, 'describePendingForRun')
 
     // #when
-    const res = await list(makeDeps(registry, {denylistCache: makeDenylistCache(true), repoAuthzDeps}))
+    const res = await list(makeDeps(registry, {denylistCache: makeDenylistCache(true)}))
 
     // #then
     expect(res.status).toBe(404)
     expect(await res.json()).toEqual({error: 'not-found'})
-    expect(repoAuthzDeps.fetch).not.toHaveBeenCalled()
+    expect(describeSpy).not.toHaveBeenCalled()
   })
 
-  it('unknown run and no-read-access are the same 404', async () => {
-    // #given a run index miss, and an operator with no repo permissions at all
+  it('unknown run, unbound repo, unavailable store and malformed name are the same 404', async () => {
+    // #given each denial path, against a registry that has a pending request
     const registry = makeRegistry()
-    const miss = await list(makeDeps(registry, {runIndex: makeRunIndex('miss')}))
-    const noAccess = await list(
-      makeDeps(registry, {repoAuthzDeps: {...writeAuthz(), fetch: async () => new Response('{}', {status: 404})}}),
-    )
+    register(registry, 'que_1')
+    const bindingsLookup = makeBindingsLookup()
+    const denials = [
+      await list(makeDeps(registry, {runIndex: makeRunIndex('miss')})),
+      await list(makeDeps(registry, {bindingsLookup: makeBindingsLookup({success: true, data: null})})),
+      await list(makeDeps(registry, {bindingsLookup: makeBindingsLookup({success: false, error: new Error('down')})})),
+      await list(
+        makeDeps(registry, {
+          bindingsLookup: {
+            getBindingByRepo: vi.fn(async () => {
+              throw new Error('boom')
+            }),
+          },
+        }),
+      ),
+      await list(makeDeps(registry, {runIndex: makeRunIndex({repo: 'acme/..', surface: 'web'}), bindingsLookup})),
+    ]
 
-    // #then
-    for (const res of [miss, noAccess]) {
+    // #then every denial is the identical uniform 404, and the malformed name made zero binding reads
+    for (const res of denials) {
       expect(res.status).toBe(404)
       expect(await res.json()).toEqual({error: 'not-found'})
     }
+    expect(bindingsLookup.getBindingByRepo).not.toHaveBeenCalled()
+  })
+
+  it('a bound, non-denylisted repo reads the binding exactly once', async () => {
+    // #given
+    const registry = makeRegistry()
+    register(registry, 'que_1')
+    const bindingsLookup = makeBindingsLookup()
+
+    // #when
+    const res = await list(makeDeps(registry, {bindingsLookup}))
+
+    // #then
+    expect(res.status).toBe(200)
+    expect(bindingsLookup.getBindingByRepo).toHaveBeenCalledExactlyOnceWith('acme', 'widget')
+  })
+
+  it('logs one denial label for unbound and denylisted repos, with no owner/repo/runId', async () => {
+    // #given
+    const registry = makeRegistry()
+    const logger = makeLogger()
+
+    // #when
+    await list(makeDeps(registry, {logger, bindingsLookup: makeBindingsLookup({success: true, data: null})}))
+    await list(makeDeps(registry, {logger, denylistCache: makeDenylistCache(true)}))
+
+    // #then
+    expect(logger.warn.mock.calls.map(call => call[0] as unknown)).toEqual([
+      {githubUserId: 1001, gate: 'repo-denied'},
+      {githubUserId: 1001, gate: 'repo-denied'},
+    ])
   })
 
   it('rate limits an operator that enumerates too fast, after authz', async () => {

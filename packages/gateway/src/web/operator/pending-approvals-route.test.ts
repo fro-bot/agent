@@ -6,7 +6,7 @@
  * — not a registry-only call.
  *
  * Load-bearing tests:
- *   1. HAPPY PATH: read-authorized operator with open request → 200 with bounded DTO.
+ *   1. HAPPY PATH: operator with open request on a bound repo → 200 with bounded DTO.
  *   2. HAPPY PATH: authorized operator with NO open requests → 200 empty list.
  *   3. NO-ORACLE DENIAL: every gate failure returns the identical notFoundResponse shape.
  *   4. RATE LIMIT: exceeding per-operator cap → 429.
@@ -18,7 +18,6 @@
 import type {PendingApprovalDTO} from '../../approvals/registry.js'
 import type {RunLocation} from '../../execute/run-index.js'
 import type {RepoKey} from '../../redaction/denylist.js'
-import type {RepoAuthzDeps} from '../auth/repo-authz.js'
 import type {PendingApprovalsRouteDeps} from './pending-approvals-route.js'
 import {Hono} from 'hono'
 import {describe, expect, it, vi} from 'vitest'
@@ -28,15 +27,6 @@ import {buildPendingApprovalsRoute, PENDING_APPROVALS_MAX_RESULTS} from './pendi
 // ---------------------------------------------------------------------------
 // Stub factories
 // ---------------------------------------------------------------------------
-
-function makeSessionStore(overrides?: {
-  getOperatorToken?: (sessionId: string, nowMs: number) => string | undefined
-}): PendingApprovalsRouteDeps['sessionStore'] {
-  return {
-    getOperatorToken: vi.fn((_sessionId: string, _nowMs: number) => 'oauth-token-stub'),
-    ...overrides,
-  }
-}
 
 function makeRunIndex(location?: RunLocation): PendingApprovalsRouteDeps['runIndex'] {
   return {
@@ -51,61 +41,24 @@ function makeDenylistCache(denied = false): PendingApprovalsRouteDeps['denylistC
   }
 }
 
-function makeBindingsLookup(): PendingApprovalsRouteDeps['bindingsLookup'] {
-  return {
-    getBindingByRepo: vi.fn(async (_owner: string, _repo: string) => ({
-      success: true as const,
-      data: {
-        owner: 'acme',
-        repo: 'widget',
-        channelId: 'ch-123',
-        channelName: 'widget-dev',
-        workspacePath: '/workspace/acme/widget',
-        createdAt: '2026-01-01T00:00:00Z',
-        createdByDiscordId: 'discord-user-1',
-        databaseId: 42,
-        nodeId: 'R_node_42',
-      },
-    })),
-  }
+const WIDGET_BINDING = {
+  owner: 'acme',
+  repo: 'widget',
+  channelId: 'ch-123',
+  channelName: 'widget-dev',
+  workspacePath: '/workspace/acme/widget',
+  createdAt: '2026-01-01T00:00:00Z',
+  createdByDiscordId: 'discord-user-1',
+  databaseId: 42,
+  nodeId: 'R_node_42',
 }
 
-function makeReadRepoAuthzDeps(): RepoAuthzDeps {
-  return {
-    allowlist: {isAuthorized: vi.fn(() => true), size: 1},
-    fetch: vi.fn(
-      async () =>
-        new Response(JSON.stringify({id: 1}), {
-          status: 200,
-          headers: {'content-type': 'application/json'},
-        }),
-    ),
-    clock: () => 0,
-    random: () => 0.5,
-    auditLogger: {info: vi.fn(), warn: vi.fn()},
-    logger: {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
-    cache: {
-      get: vi.fn(() => undefined),
-      set: vi.fn(),
-      getInFlight: vi.fn(() => undefined),
-      setInFlight: vi.fn(),
-      deleteInFlight: vi.fn(),
-      tokenIdentityFor: vi.fn(() => 'stub-token-identity'),
-    },
-  }
-}
-
-function makeUnauthorizedRepoAuthzDeps(): RepoAuthzDeps {
-  return {
-    ...makeReadRepoAuthzDeps(),
-    fetch: vi.fn(
-      async () =>
-        new Response(JSON.stringify({message: 'Not Found'}), {
-          status: 404,
-          headers: {'content-type': 'application/json'},
-        }),
-    ),
-  }
+function makeBindingsLookup(
+  result:
+    | {readonly success: true; readonly data: typeof WIDGET_BINDING | null}
+    | {readonly success: false; readonly error: Error} = {success: true, data: WIDGET_BINDING},
+) {
+  return {getBindingByRepo: vi.fn(async (_owner: string, _repo: string) => result)}
 }
 
 function makeRegistry(approvals: readonly PendingApprovalDTO[] = []): PendingApprovalsRouteDeps['registry'] {
@@ -116,11 +69,9 @@ function makeRegistry(approvals: readonly PendingApprovalDTO[] = []): PendingApp
 
 function makeDeps(overrides?: Partial<PendingApprovalsRouteDeps>): PendingApprovalsRouteDeps {
   return {
-    sessionStore: makeSessionStore(),
     runIndex: makeRunIndex(),
     denylistCache: makeDenylistCache(),
     bindingsLookup: makeBindingsLookup(),
-    repoAuthzDeps: makeReadRepoAuthzDeps(),
     registry: makeRegistry(),
     logger: {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
     now: () => 0,
@@ -242,19 +193,6 @@ describe('GET pending-approvals — HAPPY PATH with no open requests', () => {
 // ---------------------------------------------------------------------------
 
 describe('GET pending-approvals — NO-ORACLE DENIAL (load-bearing)', () => {
-  it('missing OAuth token → 404 no-oracle denial', async () => {
-    const deps = makeDeps({
-      sessionStore: makeSessionStore({getOperatorToken: () => undefined}),
-    })
-    const app = buildApp(deps)
-
-    const response = await getApprovals(app, 'run-abc')
-
-    expect(response.status).toBe(404)
-    const body = (await response.json()) as {error: string}
-    expect(body.error).toBe('not-found')
-  })
-
   it('runIndex miss → 404 no-oracle denial', async () => {
     const deps = makeDeps({runIndex: {lookup: vi.fn(async () => undefined)}})
     const app = buildApp(deps)
@@ -266,47 +204,86 @@ describe('GET pending-approvals — NO-ORACLE DENIAL (load-bearing)', () => {
     expect(body.error).toBe('not-found')
   })
 
-  it('denylisted repo → 404 no-oracle denial (before GitHub authz call)', async () => {
-    const repoAuthzDeps = makeReadRepoAuthzDeps()
-    const deps = makeDeps({
-      denylistCache: makeDenylistCache(true),
-      repoAuthzDeps,
+  it('denylisted repo → 404 no-oracle denial', async () => {
+    const registry = makeRegistry()
+    const deps = makeDeps({denylistCache: makeDenylistCache(true), registry})
+    const app = buildApp(deps)
+
+    const response = await getApprovals(app, 'run-abc')
+
+    expect(response.status).toBe(404)
+    const body = (await response.json()) as {error: string}
+    expect(body.error).toBe('not-found')
+    expect(vi.mocked(registry.describePendingForScope)).not.toHaveBeenCalled()
+  })
+
+  it('unbound repo → 404 no-oracle denial', async () => {
+    const deps = makeDeps({bindingsLookup: makeBindingsLookup({success: true, data: null})})
+    const app = buildApp(deps)
+
+    const response = await getApprovals(app, 'run-abc')
+
+    expect(response.status).toBe(404)
+    expect(await response.json()).toEqual({error: 'not-found'})
+  })
+
+  it('binding store error or throw → 404 no-oracle denial', async () => {
+    const failing = makeDeps({bindingsLookup: makeBindingsLookup({success: false, error: new Error('s3 down')})})
+    const throwing = makeDeps({
+      bindingsLookup: {
+        getBindingByRepo: vi.fn(async () => {
+          throw new Error('boom')
+        }),
+      },
     })
+
+    for (const deps of [failing, throwing]) {
+      const response = await getApprovals(buildApp(deps), 'run-abc')
+      expect(response.status).toBe(404)
+      expect(await response.json()).toEqual({error: 'not-found'})
+    }
+  })
+
+  it('malformed owner/repo from the run index → 404 with zero binding reads', async () => {
+    const bindingsLookup = makeBindingsLookup()
+    const deps = makeDeps({runIndex: makeRunIndex({repo: 'acme/a b', surface: 'web'}), bindingsLookup})
     const app = buildApp(deps)
 
     const response = await getApprovals(app, 'run-abc')
 
     expect(response.status).toBe(404)
-    const body = (await response.json()) as {error: string}
-    expect(body.error).toBe('not-found')
-    expect(vi.mocked(repoAuthzDeps.fetch)).not.toHaveBeenCalled()
+    expect(bindingsLookup.getBindingByRepo).not.toHaveBeenCalled()
   })
 
-  it('unauthorized operator (GitHub denied) → 404 no-oracle denial', async () => {
-    const deps = makeDeps({repoAuthzDeps: makeUnauthorizedRepoAuthzDeps()})
-    const app = buildApp(deps)
+  it('every repo-level denial response is byte-identical to a runIndex miss (no-oracle)', async () => {
+    const miss = await getApprovals(buildApp(makeDeps({runIndex: {lookup: vi.fn(async () => undefined)}})), 'run-abc')
+    const missText = await miss.text()
+    const variants = [
+      makeDeps({bindingsLookup: makeBindingsLookup({success: true, data: null})}),
+      makeDeps({bindingsLookup: makeBindingsLookup({success: false, error: new Error('s3 down')})}),
+      makeDeps({runIndex: makeRunIndex({repo: 'acme/..', surface: 'web'})}),
+    ]
 
-    const response = await getApprovals(app, 'run-abc')
-
-    expect(response.status).toBe(404)
-    const body = (await response.json()) as {error: string}
-    expect(body.error).toBe('not-found')
+    for (const deps of variants) {
+      const response = await getApprovals(buildApp(deps), 'run-abc')
+      expect(response.status).toBe(miss.status)
+      expect(await response.text()).toBe(missText)
+    }
   })
 
-  it('unauthorized operator response is byte-identical to a runIndex miss (no-oracle)', async () => {
-    const unauthorizedDeps = makeDeps({repoAuthzDeps: makeUnauthorizedRepoAuthzDeps()})
-    const missDeps = makeDeps({runIndex: {lookup: vi.fn(async () => undefined)}})
+  it('logs one denial label for unbound and denylisted repos, with no owner/repo/runId', async () => {
+    const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
 
-    const unauthorizedApp = buildApp(unauthorizedDeps)
-    const missApp = buildApp(missDeps)
+    await getApprovals(
+      buildApp(makeDeps({logger, bindingsLookup: makeBindingsLookup({success: true, data: null})})),
+      'run-abc',
+    )
+    await getApprovals(buildApp(makeDeps({logger, denylistCache: makeDenylistCache(true)})), 'run-abc')
 
-    const unauthorizedResponse = await getApprovals(unauthorizedApp, 'run-abc')
-    const missResponse = await getApprovals(missApp, 'run-abc')
-
-    expect(unauthorizedResponse.status).toBe(missResponse.status)
-    const unauthorizedBody = (await unauthorizedResponse.json()) as {error: string}
-    const missBody = (await missResponse.json()) as {error: string}
-    expect(unauthorizedBody.error).toBe(missBody.error)
+    expect(logger.warn.mock.calls.map(call => call[0] as unknown)).toEqual([
+      {githubUserId: 1001, gate: 'repo-denied'},
+      {githubUserId: 1001, gate: 'repo-denied'},
+    ])
   })
 
   it('denylisted repo response is byte-identical to a runIndex miss (no-oracle)', async () => {
@@ -463,14 +440,15 @@ describe('GET pending-approvals — GATE THROW degrades to no-oracle denial', ()
     expect(body.error).toBe('not-found')
   })
 
-  it('checkRepoAuthz throwing → 404 no-oracle denial (not 500)', async () => {
-    const throwingAuthzDeps: RepoAuthzDeps = {
-      ...makeReadRepoAuthzDeps(),
-      fetch: vi.fn(async () => {
-        throw new Error('network error')
-      }),
-    }
-    const deps = makeDeps({repoAuthzDeps: throwingAuthzDeps})
+  it('isRepoDenied throwing → 404 no-oracle denial (not 500)', async () => {
+    const deps = makeDeps({
+      denylistCache: {
+        getDenylistState: vi.fn(async () => undefined),
+        isRepoDenied: vi.fn(() => {
+          throw new Error('predicate error')
+        }),
+      },
+    })
     const app = buildApp(deps)
 
     const response = await getApprovals(app, 'run-abc')

@@ -1235,52 +1235,6 @@ describe('emitAudit — approval.decision with once/always/reject', () => {
 })
 
 // ---------------------------------------------------------------------------
-// authz.denied — insufficient_permission reason
-// ---------------------------------------------------------------------------
-
-describe('emitAudit — authz.denied with insufficient_permission', () => {
-  it('emits a structured warn record with reason:"insufficient_permission"', () => {
-    // #given
-    const logger = makeLogger()
-    const event: AuditEvent = {
-      kind: 'authz.denied',
-      correlationId: 'corr-insuf',
-      githubUserId: 42,
-      reason: 'insufficient_permission',
-    }
-
-    // #when
-    emitAudit(event, logger)
-
-    // #then
-    expect(logger.warn).toHaveBeenCalledOnce()
-    expect(logger.info).not.toHaveBeenCalled()
-    expect(firstCallCtx(logger.warn)).toMatchObject({
-      kind: 'authz.denied',
-      reason: 'insufficient_permission',
-    })
-  })
-
-  it('reason enum "insufficient_permission" survives redaction', () => {
-    // #given
-    const logger = makeLogger()
-    const event: AuditEvent = {
-      kind: 'authz.denied',
-      correlationId: PLANTED_TOKEN,
-      githubUserId: 42,
-      reason: 'insufficient_permission',
-    }
-
-    // #when
-    emitAudit(event, logger)
-
-    // #then
-    assertNoSensitiveValues(logger)
-    expect(serializeAllCalls(logger)).toContain('insufficient_permission')
-  })
-})
-
-// ---------------------------------------------------------------------------
 // push.subscribed / push.unsubscribed
 // ---------------------------------------------------------------------------
 
@@ -1567,5 +1521,122 @@ describe('emitAudit — question.rejected', () => {
     expect(logger.warn).toHaveBeenCalledOnce()
     expect(logger.info).not.toHaveBeenCalled()
     expect(firstCallMsg(logger.warn)).toBe('audit: question.rejected')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// auth.revocation.persist_failed
+// ---------------------------------------------------------------------------
+
+describe('emitAudit — auth.revocation.persist_failed', () => {
+  it('logs at warn with the retry count and error class only', () => {
+    // #given
+    const logger = makeLogger()
+    const event: AuditEvent = {
+      kind: 'auth.revocation.persist_failed',
+      correlationId: 'session-revoke',
+      retries: 4,
+      errorClass: 'http_503',
+    }
+
+    // #when
+    emitAudit(event, logger)
+
+    // #then
+    expect(logger.warn).toHaveBeenCalledOnce()
+    expect(logger.info).not.toHaveBeenCalled()
+    expect(firstCallMsg(logger.warn)).toBe('audit: auth.revocation.persist_failed')
+    expect(firstCallCtx(logger.warn)).toEqual(event)
+  })
+
+  it('redacts sensitive values planted in correlationId and errorClass', () => {
+    for (const planted of [PLANTED_COOKIE, PLANTED_TOKEN, PLANTED_BEARER, PLANTED_SECRET, PLANTED_INTERNAL_URL]) {
+      // #given
+      const logger = makeLogger()
+
+      // #when
+      emitAudit(
+        {kind: 'auth.revocation.persist_failed', correlationId: planted, retries: 0, errorClass: planted},
+        logger,
+      )
+
+      // #then
+      assertNoSensitiveValues(logger)
+      expect(firstCallCtx(logger.warn).errorClass).toBe('[redacted]')
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// auth.session.restore
+// ---------------------------------------------------------------------------
+
+describe('emitAudit — auth.session.restore', () => {
+  const counts = {
+    loaded: 1,
+    expired: 2,
+    revoked: 3,
+    notAllowlisted: 4,
+    unsigned: 5,
+    futureDated: 6,
+    overCap: 7,
+    readFailed: 8,
+  }
+
+  it('logs a ready restore at info with counts', () => {
+    // #given
+    const logger = makeLogger()
+    const event: AuditEvent = {kind: 'auth.session.restore', correlationId: 'session-restore', outcome: 'ready', counts}
+
+    // #when
+    emitAudit(event, logger)
+
+    // #then
+    expect(logger.info).toHaveBeenCalledOnce()
+    expect(logger.warn).not.toHaveBeenCalled()
+    expect(firstCallMsg(logger.info)).toBe('audit: auth.session.restore')
+    expect(firstCallCtx(logger.info)).toEqual(event)
+  })
+
+  it.each(['self_test', 'load'] as const)('logs a failed %s restore at warn with the error class', phase => {
+    // #given
+    const logger = makeLogger()
+    const event: AuditEvent = {
+      kind: 'auth.session.restore',
+      correlationId: 'session-restore',
+      outcome: 'failed',
+      phase,
+      errorClass: 'http_403',
+    }
+
+    // #when
+    emitAudit(event, logger)
+
+    // #then
+    expect(logger.warn).toHaveBeenCalledOnce()
+    expect(logger.info).not.toHaveBeenCalled()
+    expect(firstCallCtx(logger.warn)).toEqual(event)
+  })
+
+  it('redacts sensitive values planted in the failed event errorClass', () => {
+    for (const planted of [PLANTED_COOKIE, PLANTED_TOKEN, PLANTED_BEARER, PLANTED_SECRET, PLANTED_INTERNAL_URL]) {
+      // #given
+      const logger = makeLogger()
+
+      // #when
+      emitAudit(
+        {
+          kind: 'auth.session.restore',
+          correlationId: planted,
+          outcome: 'failed',
+          phase: 'load',
+          errorClass: planted,
+        },
+        logger,
+      )
+
+      // #then
+      assertNoSensitiveValues(logger)
+    }
   })
 })

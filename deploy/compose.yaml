@@ -37,6 +37,9 @@ services:
       WORKSPACE_OPENCODE_URL_FILE: /run/secrets/workspace_opencode_url
       # Optional — Discord role ID that gates mention authorization
       GATEWAY_TRIGGER_ROLE_ID_FILE: /run/secrets/gateway_trigger_role_id
+      # Discord user IDs (one per line) allowed to run /add-project and create bindings.
+      # Empty file = /add-project refuses everyone (fail-closed).
+      GATEWAY_BINDER_ALLOWLIST_FILE: /run/secrets/gateway_binder_allowlist
       # Optional — announce/presence endpoint (opt-in). BOTH must be set together
       # to enable the HMAC-verified POST /v1/announce presence webhook, or NEITHER
       # (the endpoint stays disabled). Uncomment both lines AND both bind-mounts below.
@@ -179,6 +182,15 @@ services:
       - type: bind
         source: ./secrets/gateway-trigger-role-id
         target: /run/secrets/gateway_trigger_role_id
+        read_only: true
+        bind:
+          create_host_path: false
+      # Discord user IDs (one per line) allowed to run /add-project. A binding authorizes
+      # operator-surface access to its repo, so only listed users may create one.
+      # An empty file disables /add-project for everyone.
+      - type: bind
+        source: ./secrets/gateway-binder-allowlist
+        target: /run/secrets/gateway_binder_allowlist
         read_only: true
         bind:
           create_host_path: false

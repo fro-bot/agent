@@ -26,6 +26,7 @@ import {describe, expect, it, vi} from 'vitest'
 import {
   bindingToRepoKey,
   filterDeniedRecords,
+  lookupBindingDenyKeys,
   projectRunStatus,
   projectRunStatusWithKey,
   resolveRunRepoKey,
@@ -548,6 +549,56 @@ describe('projectRunStatusWithKey', () => {
       checkoutProvenance: provenance,
       checkoutPreparation: preparation,
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// lookupBindingDenyKeys — one read: deny keys AND the binding, store error kept distinct
+// ---------------------------------------------------------------------------
+
+describe('lookupBindingDenyKeys', () => {
+  it('returns the binding and its deny keys from a single read', async () => {
+    // #given a bound repo
+    const binding = makeBinding({databaseId: 42, nodeId: 'R_node_42'})
+    const getBindingByRepo = vi.fn(async () => ({success: true as const, data: binding}))
+
+    // #when
+    const result = await lookupBindingDenyKeys('acme', 'widget', {getBindingByRepo})
+
+    // #then — the caller gets the very binding it read, and exactly one store call was made
+    expect(result).toEqual({kind: 'resolved', repoKey: {databaseId: 42, nodeId: 'R_node_42'}, binding})
+    expect(getBindingByRepo).toHaveBeenCalledExactlyOnceWith('acme', 'widget')
+  })
+
+  it('reports a missing binding as resolved with a null/null key and a null binding', async () => {
+    const result = await lookupBindingDenyKeys('acme', 'widget', {
+      getBindingByRepo: async () => ({success: true as const, data: null}),
+    })
+    expect(result).toEqual({kind: 'resolved', repoKey: {databaseId: null, nodeId: null}, binding: null})
+  })
+
+  it('reports a binding with no deny keys as resolved with a null/null key (fail-closed at the denylist)', async () => {
+    const binding = makeBinding({databaseId: undefined, nodeId: undefined})
+    const result = await lookupBindingDenyKeys('acme', 'widget', {
+      getBindingByRepo: async () => ({success: true as const, data: binding}),
+    })
+    expect(result).toEqual({kind: 'resolved', repoKey: {databaseId: null, nodeId: null}, binding})
+  })
+
+  it('reports a store error result as unavailable, distinct from a missing binding', async () => {
+    const result = await lookupBindingDenyKeys('acme', 'widget', {
+      getBindingByRepo: async () => ({success: false as const, error: new Error('s3 down')}),
+    })
+    expect(result).toEqual({kind: 'unavailable'})
+  })
+
+  it('reports a throwing store as unavailable and never throws', async () => {
+    const result = await lookupBindingDenyKeys('acme', 'widget', {
+      getBindingByRepo: async () => {
+        throw new Error('boom')
+      },
+    })
+    expect(result).toEqual({kind: 'unavailable'})
   })
 })
 

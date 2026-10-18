@@ -4,6 +4,7 @@
  * Covers:
  *   - Token generation and verification (happy path).
  *   - Session/operator binding mismatch rejection.
+ *   - The session binding is sha256(sessionId): the payload never carries the raw ID, and pre-change tokens fail.
  *   - Token expiry.
  *   - Malformed token rejection.
  *   - Timing-safe compare path (no short-circuit on mismatch).
@@ -19,6 +20,7 @@
  */
 
 import {Buffer} from 'node:buffer'
+import {createHmac} from 'node:crypto'
 import {Hono} from 'hono'
 import {describe, expect, it, vi} from 'vitest'
 import {loadAllowlistFromText} from './allowlist.js'
@@ -30,7 +32,9 @@ import {
   generateCsrfToken,
   verifyCsrfToken,
 } from './csrf.js'
-import {createInMemorySessionStore, SESSION_COOKIE_NAME} from './session.js'
+import {hashSessionId} from './session-persistence.js'
+import {SESSION_COOKIE_NAME} from './session.js'
+import {createTestSessionStore, createTestSessionStoreHarness, mintTestSession} from './test-session-store.js'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -172,6 +176,95 @@ describe('verifyCsrfToken — session/operator binding mismatch', () => {
 // ---------------------------------------------------------------------------
 // verifyCsrfToken — expiry
 // ---------------------------------------------------------------------------
+
+function decodePayload(token: string): Record<string, unknown> {
+  const [payloadB64] = token.split('.')
+  return JSON.parse(Buffer.from(payloadB64 ?? '', 'base64url').toString('utf8')) as Record<string, unknown>
+}
+
+describe('generateCsrfToken / verifyCsrfToken — session binding', () => {
+  it('a token minted for one session fails for another and verifies for its own', () => {
+    // #given two distinct session IDs of the production shape
+    const nowMs = 1_000_000
+    const sessionA = 'A'.repeat(43)
+    const sessionB = 'B'.repeat(43)
+    const token = generateCsrfToken({sessionId: sessionA, operatorId: 42, nowMs, secret: TEST_CSRF_SECRET})
+
+    // #when verified against each
+    const forA = verifyCsrfToken({token, sessionId: sessionA, operatorId: 42, nowMs, secret: TEST_CSRF_SECRET})
+    const forB = verifyCsrfToken({token, sessionId: sessionB, operatorId: 42, nowMs, secret: TEST_CSRF_SECRET})
+
+    // #then
+    expect(forA).toEqual({ok: true})
+    expect(forB).toEqual({ok: false, reason: 'binding_mismatch'})
+  })
+
+  it('the decoded payload carries sha256(sessionId) and no part of the raw session ID', () => {
+    // #given a session ID of the production shape (43-character base64url)
+    const sessionId = 'xK3_pQ-9mZ7vLw2Rt5YhNc8BdFgJ0aSeUi4oTnMq6Vy'
+    const token = generateCsrfToken({sessionId, operatorId: 42, nowMs: 1_000_000, secret: TEST_CSRF_SECRET})
+
+    // #when the payload is decoded
+    const payload = decodePayload(token)
+    const decoded = Buffer.from(token.split('.')[0] ?? '', 'base64url').toString('utf8')
+
+    // #then sid is the hash, and no run of the raw ID (even 8 characters) appears in the payload or token
+    expect(payload.sid).toBe(hashSessionId(sessionId))
+    expect(payload.sid).toMatch(/^[0-9a-f]{64}$/)
+    expect(Object.keys(payload).sort()).toEqual(['iv', 'oid', 'sid'])
+    for (let start = 0; start + 8 <= sessionId.length; start++) {
+      const run = sessionId.slice(start, start + 8)
+      expect(decoded).not.toContain(run)
+      expect(token).not.toContain(run)
+    }
+  })
+
+  it('rejects a token built the old way, with the raw session ID as the binding', () => {
+    // #given a token a pre-deploy gateway would have issued: HMAC-valid, sid is the raw session ID
+    const nowMs = 1_000_000
+    const sessionId = 'session-abc-123'
+    const legacyPayload = Buffer.from(
+      JSON.stringify({sid: sessionId, oid: 42, iv: Math.floor(nowMs / CSRF_TOKEN_INTERVAL_MS)}),
+    ).toString('base64url')
+    const sig = createHmac('sha256', Buffer.from(TEST_CSRF_SECRET, 'base64url'))
+      .update(legacyPayload)
+      .digest('base64url')
+
+    // #when verified after the change
+    const result = verifyCsrfToken({
+      token: `${legacyPayload}.${sig}`,
+      sessionId,
+      operatorId: 42,
+      nowMs,
+      secret: TEST_CSRF_SECRET,
+    })
+
+    // #then it fails once, on the binding; a freshly minted token for the same session passes
+    expect(result).toEqual({ok: false, reason: 'binding_mismatch'})
+    const fresh = generateCsrfToken({sessionId, operatorId: 42, nowMs, secret: TEST_CSRF_SECRET})
+    expect(verifyCsrfToken({token: fresh, sessionId, operatorId: 42, nowMs, secret: TEST_CSRF_SECRET})).toEqual({
+      ok: true,
+    })
+  })
+
+  it('a token verifies after a restart: same secret, session reloaded from the object store', async () => {
+    // #given a session created on one store and a token minted for it
+    const nowMs = Date.now()
+    const {createTestObjectStore} = await import('./test-object-store.js')
+    const objectStore = createTestObjectStore()
+    const before = await createTestSessionStoreHarness({objectStore, allowed: [42]})
+    const sessionId = await mintTestSession(before.store, {githubUserId: 42, login: 'octocat'})
+    const token = generateCsrfToken({sessionId, operatorId: 42, nowMs, secret: TEST_CSRF_SECRET})
+
+    // #when a fresh store loads the same records and verifies the same token
+    const after = await createTestSessionStoreHarness({objectStore, allowed: [42]})
+    const restored = after.store.get(sessionId)
+
+    // #then the session is back and the token still binds to it
+    expect(restored?.githubUserId).toBe(42)
+    expect(verifyCsrfToken({token, sessionId, operatorId: 42, nowMs, secret: TEST_CSRF_SECRET})).toEqual({ok: true})
+  })
+})
 
 describe('verifyCsrfToken — expiry', () => {
   it('accepts a token within the current interval', () => {
@@ -364,7 +457,7 @@ describe('CSRF token constants', () => {
 // applyBrowserGuard — absent Origin on mutating requests
 // ---------------------------------------------------------------------------
 
-function makeBrowserGuardDeps(sessionStore: ReturnType<typeof createInMemorySessionStore>) {
+function makeBrowserGuardDeps(sessionStore: Awaited<ReturnType<typeof createTestSessionStore>>) {
   const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
   const auditLogger = {info: vi.fn(), warn: vi.fn()}
   const allowlist = loadAllowlistFromText('42\n', logger)
@@ -382,10 +475,9 @@ function makeBrowserGuardDeps(sessionStore: ReturnType<typeof createInMemorySess
 describe('applyBrowserGuard — absent Origin on mutating requests', () => {
   it('rejects POST with no Origin and no Fetch Metadata headers', async () => {
     // #given — valid session, no Origin, no Sec-Fetch-* headers
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     const deps = {...makeBrowserGuardDeps(sessionStore), clock: () => now + 1000}
     const csrfToken = generateCsrfToken({sessionId, operatorId: 42, nowMs: now + 1000, secret: TEST_CSRF_SECRET})
@@ -414,10 +506,9 @@ describe('applyBrowserGuard — absent Origin on mutating requests', () => {
 
   it('allows GET with no Origin (safe method — no mutation risk)', async () => {
     // #given — valid session, no Origin, GET method
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     const deps = {...makeBrowserGuardDeps(sessionStore), clock: () => now + 1000}
 
@@ -444,10 +535,9 @@ describe('applyBrowserGuard — absent Origin on mutating requests', () => {
 
   it('allows POST with Sec-Fetch-Site: same-origin and no Origin (Fetch Metadata fallback)', async () => {
     // #given — valid session, no Origin but Sec-Fetch-Site: same-origin
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     const deps = {...makeBrowserGuardDeps(sessionStore), clock: () => now + 1000}
     const csrfToken = generateCsrfToken({sessionId, operatorId: 42, nowMs: now + 1000, secret: TEST_CSRF_SECRET})
@@ -477,10 +567,9 @@ describe('applyBrowserGuard — absent Origin on mutating requests', () => {
 
   it('allows mutating request with no Origin, Sec-Fetch-Site: same-origin, no Sec-Fetch-Mode, valid CSRF/session/allowlist', async () => {
     // #given — valid session + allowlist, no Origin, Sec-Fetch-Site: same-origin, Sec-Fetch-Mode absent
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     const deps = {...makeBrowserGuardDeps(sessionStore), clock: () => now + 1000}
     const csrfToken = generateCsrfToken({sessionId, operatorId: 42, nowMs: now + 1000, secret: TEST_CSRF_SECRET})
@@ -518,10 +607,9 @@ describe('applyBrowserGuard — absent Origin on mutating requests', () => {
 describe('applyBrowserGuard — typed audit events', () => {
   it('emits browser.guard.rejected with reason non_cookie_credential for Authorization header', async () => {
     // #given — valid session but Authorization header present
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     const auditLogger = {info: vi.fn(), warn: vi.fn()}
     const deps = {
@@ -559,10 +647,9 @@ describe('applyBrowserGuard — typed audit events', () => {
 
   it('emits browser.guard.rejected with reason origin_mismatch for wrong Origin', async () => {
     // #given — valid session, valid allowlist, wrong Origin
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     const auditLogger = {info: vi.fn(), warn: vi.fn()}
     const deps = {
@@ -597,10 +684,9 @@ describe('applyBrowserGuard — typed audit events', () => {
 
   it('emits browser.guard.rejected with reason csrf_missing for missing CSRF token', async () => {
     // #given — valid session, valid allowlist, correct Origin, no CSRF token
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     const auditLogger = {info: vi.fn(), warn: vi.fn()}
     const deps = {
@@ -636,10 +722,9 @@ describe('applyBrowserGuard — typed audit events', () => {
 
   it('emits browser.guard.rejected with reason csrf_invalid for invalid CSRF token', async () => {
     // #given — valid session, valid allowlist, correct Origin, invalid CSRF token
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     const auditLogger = {info: vi.fn(), warn: vi.fn()}
     const deps = {
@@ -675,18 +760,15 @@ describe('applyBrowserGuard — typed audit events', () => {
 })
 
 // ---------------------------------------------------------------------------
-// applyBrowserGuard — touch only after allowlist passes (Fix 3)
+// applyBrowserGuard — allowlist, and a read-only session lookup
 // ---------------------------------------------------------------------------
 
-describe('applyBrowserGuard — touch not called for non-allowlisted session (Fix 3)', () => {
-  it('does not call touch when operator is not in allowlist', async () => {
+describe('applyBrowserGuard — session lookup is read-only', () => {
+  it('rejects a session whose operator is not in the allowlist', async () => {
     // #given — session for user 99 who is NOT in the allowlist (allowlist has 42)
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 99, login: 'notallowed'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
-
-    const touchSpy = vi.spyOn(sessionStore, 'touch')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 99, login: 'notallowed'})
     const deps = {...makeBrowserGuardDeps(sessionStore), clock: () => now + 1000}
 
     const app = new Hono()
@@ -708,20 +790,13 @@ describe('applyBrowserGuard — touch not called for non-allowlisted session (Fi
 
     // #then — rejected 403
     expect(res.status).toBe(403)
-
-    // #and — touch was NOT called (idle TTL must not be extended for non-allowlisted sessions)
-    expect(touchSpy).not.toHaveBeenCalled()
   })
 
-  it('calls touch when operator IS in allowlist', async () => {
-    // #given — session for user 42 who IS in the allowlist
-    const sessionStore = createInMemorySessionStore()
+  it('admits an allowlisted session using only `get` on the store', async () => {
+    // #given — a store that exposes nothing but `get`, so any touch or write would throw
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
-
-    const touchSpy = vi.spyOn(sessionStore, 'touch')
-    const deps = {...makeBrowserGuardDeps(sessionStore), clock: () => now + 1000}
+    const get = vi.fn((_sessionId: string) => ({githubUserId: 42, login: 'octocat', issuedAt: now}))
+    const deps = {...makeBrowserGuardDeps(await createTestSessionStore()), sessionStore: {get}, clock: () => now + 1000}
 
     const app = new Hono()
     app.get('/test', async c => {
@@ -730,21 +805,44 @@ describe('applyBrowserGuard — touch not called for non-allowlisted session (Fi
       return c.json({ok: true})
     })
 
-    // #when — GET with valid session and allowlisted user
+    // #when — GET with a cookie for that session
     const req = new Request('http://operator.example.com/test', {
       method: 'GET',
       headers: {
-        cookie: `${SESSION_COOKIE_NAME}=${sessionId}`,
+        cookie: `${SESSION_COOKIE_NAME}=some-session-id`,
         origin: 'https://operator.example.com',
       },
     })
     const res = await app.fetch(req)
 
-    // #then — allowed
+    // #then — allowed, with exactly one lookup by the cookie's ID
     expect(res.status).toBe(200)
+    expect(get).toHaveBeenCalledExactlyOnceWith('some-session-id')
+  })
 
-    // #and — touch WAS called (idle TTL extended for allowlisted sessions)
-    expect(touchSpy).toHaveBeenCalledOnce()
+  it('rejects an unknown session ID without any store write', async () => {
+    // #given — a ready store that never issued the cookie's ID
+    const sessionStore = await createTestSessionStore()
+    const deps = makeBrowserGuardDeps(sessionStore)
+
+    const app = new Hono()
+    app.get('/test', async c => {
+      const result = await applyBrowserGuard(c, deps, false, false)
+      if (result.ok === false) return result.response
+      return c.json({ok: true})
+    })
+
+    // #when
+    const res = await app.fetch(
+      new Request('http://operator.example.com/test', {
+        method: 'GET',
+        headers: {cookie: `${SESSION_COOKIE_NAME}=${'u'.repeat(43)}`, origin: 'https://operator.example.com'},
+      }),
+    )
+
+    // #then
+    expect(res.status).toBe(401)
+    expect(sessionStore.size()).toBe(0)
   })
 })
 
@@ -755,10 +853,9 @@ describe('applyBrowserGuard — touch not called for non-allowlisted session (Fi
 describe('applyBrowserGuard — not_allowlisted audit includes githubUserId (Fix 6)', () => {
   it('browser.guard.rejected audit event includes githubUserId when reason is not_allowlisted', async () => {
     // #given — session for user 99 who is NOT in the allowlist
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 99, login: 'notallowed'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 99, login: 'notallowed'})
 
     const auditLogger = {info: vi.fn(), warn: vi.fn()}
     const deps = {...makeBrowserGuardDeps(sessionStore), auditLogger, clock: () => now + 1000}
@@ -799,10 +896,9 @@ describe('applyBrowserGuard — not_allowlisted audit includes githubUserId (Fix
 describe('applyBrowserGuard — Fetch Metadata rejection branches (Fix 8)', () => {
   it('rejects Origin: null (opaque origin)', async () => {
     // #given — valid session, Origin: null
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     const deps = {...makeBrowserGuardDeps(sessionStore), clock: () => now + 1000}
     const app = new Hono()
@@ -828,10 +924,9 @@ describe('applyBrowserGuard — Fetch Metadata rejection branches (Fix 8)', () =
 
   it('rejects Sec-Fetch-Site: cross-site', async () => {
     // #given — valid session, Sec-Fetch-Site: cross-site
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     const deps = {...makeBrowserGuardDeps(sessionStore), clock: () => now + 1000}
     const app = new Hono()
@@ -858,10 +953,9 @@ describe('applyBrowserGuard — Fetch Metadata rejection branches (Fix 8)', () =
 
   it('rejects Sec-Fetch-Site: same-site (not same-origin)', async () => {
     // #given — valid session, Sec-Fetch-Site: same-site
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     const deps = {...makeBrowserGuardDeps(sessionStore), clock: () => now + 1000}
     const app = new Hono()
@@ -888,10 +982,9 @@ describe('applyBrowserGuard — Fetch Metadata rejection branches (Fix 8)', () =
 
   it('rejects Sec-Fetch-Mode: navigate on mutating request', async () => {
     // #given — valid session, Sec-Fetch-Mode: navigate on POST
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     const deps = {...makeBrowserGuardDeps(sessionStore), clock: () => now + 1000}
     const csrfToken = generateCsrfToken({sessionId, operatorId: 42, nowMs: now + 1000, secret: TEST_CSRF_SECRET})
@@ -921,10 +1014,9 @@ describe('applyBrowserGuard — Fetch Metadata rejection branches (Fix 8)', () =
 
   it('rejects Sec-Fetch-Mode: no-cors on mutating request', async () => {
     // #given — valid session, Sec-Fetch-Mode: no-cors on POST
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     const deps = {...makeBrowserGuardDeps(sessionStore), clock: () => now + 1000}
     const csrfToken = generateCsrfToken({sessionId, operatorId: 42, nowMs: now + 1000, secret: TEST_CSRF_SECRET})
@@ -954,10 +1046,9 @@ describe('applyBrowserGuard — Fetch Metadata rejection branches (Fix 8)', () =
 
   it('rejects Sec-Fetch-Dest: object', async () => {
     // #given — valid session, Sec-Fetch-Dest: object
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     const deps = {...makeBrowserGuardDeps(sessionStore), clock: () => now + 1000}
     const app = new Hono()
@@ -984,10 +1075,9 @@ describe('applyBrowserGuard — Fetch Metadata rejection branches (Fix 8)', () =
 
   it('rejects Sec-Fetch-Dest: embed', async () => {
     // #given — valid session, Sec-Fetch-Dest: embed
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     const deps = {...makeBrowserGuardDeps(sessionStore), clock: () => now + 1000}
     const app = new Hono()
@@ -1014,10 +1104,9 @@ describe('applyBrowserGuard — Fetch Metadata rejection branches (Fix 8)', () =
 
   it('adds Vary header on rejection responses', async () => {
     // #given — valid session, wrong Origin (will be rejected)
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
-    const sessionId = sessionStore.create({githubUserId: 42, login: 'octocat'}, '', now)
-    if (sessionId === undefined) throw new Error('expected session to be created')
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
 
     const deps = {...makeBrowserGuardDeps(sessionStore), clock: () => now + 1000}
     const app = new Hono()

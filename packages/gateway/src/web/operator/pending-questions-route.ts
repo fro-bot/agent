@@ -8,20 +8,19 @@
  * Gate ordering mirrors `pending-approvals-route.ts` (all must pass before any
  * data is returned):
  *   1. Guard (browser/session/allowlist) — installed by buildOperatorApp
- *   2. Resolve session + OAuth token by sessionId
- *   3. RunIndex.lookup(runId) → server-owned repo; miss → notFoundResponse
- *   4. Split owner/repo
- *   5. Denylist check (redaction BEFORE authz); denied → notFoundResponse
- *   6. checkRepoAuthz (READ-level)
- *   7. Per-operator rate limit
- *   8. Return the run's open requests as bounded DTOs, hard-capped
+ *   2. RunIndex.lookup(runId) → server-owned repo; miss → notFoundResponse
+ *   3. Split owner/repo
+ *   4. resolveRepoAccess (bound AND not denylisted, one binding read); anything
+ *      but `allowed` → notFoundResponse
+ *   5. Per-operator rate limit
+ *   6. Return the run's open requests as bounded DTOs, hard-capped
  *
  * Requests are found by the asking run's id, not by surface scope, so a
  * Discord-launched run's questions are listed the same as a web-launched run's.
  *
  * Security invariants:
  *   - The run id is resolved server-side; the repo is never taken from the client.
- *   - Every denial at gates 2–6 returns the identical no-oracle notFoundResponse,
+ *   - Every denial at gates 2–4 returns the identical no-oracle notFoundResponse,
  *     and a gate throw degrades to the same denial.
  *   - Every question and option string in the response is untrusted plain text,
  *     bounded and control-stripped; consumers render it inertly.
@@ -34,15 +33,12 @@ import type {RateLimiter} from '../../http/rate-limit.js'
 import type {PendingQuestionsResponse} from '../../operator-contract/question-frame.js'
 import type {DenylistCache} from '../../redaction/denylist.js'
 import type {BindingsLookup} from '../../redaction/surface-gate.js'
-import type {RepoAuthzDeps} from '../auth/repo-authz.js'
-import type {SessionStore} from '../auth/session.js'
 import type {OperatorLogger} from '../server.js'
 import {toQuestionRequestDetail} from '../../approvals/question-detail.js'
 import {createRateLimiter} from '../../http/rate-limit.js'
-import {checkRepoAuthz} from '../auth/repo-authz.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
 import {notFoundResponse, rateLimitedResponse} from '../safe-response.js'
-import {checkDenylist, resolveRepoFromRunIndex} from './route-helpers.js'
+import {resolveRepoAccess, resolveRepoFromRunIndex} from './route-helpers.js'
 
 /** Hard cap on the number of pending question requests returned per call. */
 export const PENDING_QUESTIONS_MAX_RESULTS = 50
@@ -52,12 +48,9 @@ const PENDING_QUESTIONS_RATE_LIMIT = 30
 const PENDING_QUESTIONS_RATE_WINDOW_MS = 60_000
 
 export interface PendingQuestionsRouteDeps {
-  readonly sessionStore: Pick<SessionStore, 'getOperatorToken'>
   readonly runIndex: Pick<RunIndex, 'lookup'>
   readonly denylistCache: DenylistCache
   readonly bindingsLookup: BindingsLookup
-  /** Repo authorization dependencies (read-level). */
-  readonly repoAuthzDeps: RepoAuthzDeps
   /** Question registry — the sole source of pending request detail. */
   readonly registry: Pick<QuestionRegistry, 'describePendingForRun'>
   readonly logger: OperatorLogger
@@ -82,26 +75,18 @@ export function buildPendingQuestionsRoute(app: Hono, deps: PendingQuestionsRout
     })
 
   registerOperatorRoute(app, 'GET', '/operator/runs/:runId/questions', async c => {
-    const nowMs = deps.now()
-
     const authCtx = getOperatorAuthContext(c)
     if (authCtx === undefined) {
       deps.logger.warn({gate: 'no-auth-ctx'}, 'pending-questions: denied')
       return notFoundResponse(c)
     }
 
-    const {githubUserId, sessionId} = authCtx
+    const {githubUserId} = authCtx
 
-    // Any throw at gates 2–6 returns the uniform not-found shape, never a distinguishable 500.
+    // Any throw at gates 2–4 returns the uniform not-found shape, never a distinguishable 500.
     let runId: string
 
     try {
-      const resolvedToken = deps.sessionStore.getOperatorToken(sessionId, nowMs)
-      if (resolvedToken === undefined) {
-        deps.logger.warn({githubUserId, gate: 'no-token'}, 'pending-questions: denied')
-        return notFoundResponse(c)
-      }
-
       runId = c.req.param('runId') ?? ''
       const resolved = await resolveRepoFromRunIndex(runId, deps.runIndex)
       if (resolved === null) {
@@ -110,16 +95,14 @@ export function buildPendingQuestionsRoute(app: Hono, deps: PendingQuestionsRout
       }
       const {owner, repo} = resolved
 
-      // Redaction BEFORE authz so a denylisted repo never triggers a GitHub call.
-      const isDenied = await checkDenylist(owner, repo, deps.bindingsLookup, deps.denylistCache)
-      if (isDenied === true) {
-        deps.logger.warn({githubUserId, runId, gate: 'denylisted'}, 'pending-questions: denied')
-        return notFoundResponse(c)
-      }
-
-      const authzResult = await checkRepoAuthz(githubUserId, owner, repo, resolvedToken, deps.repoAuthzDeps)
-      if (authzResult.authorized === false) {
-        deps.logger.warn({githubUserId, runId, gate: 'read-authz-denied'}, 'pending-questions: denied')
+      // One binding read. Unbound and denylisted share one denial label so the log is
+      // not an existence oracle; repo-level denials emit no audit event.
+      const access = await resolveRepoAccess(owner, repo, deps)
+      if (access.kind !== 'allowed') {
+        deps.logger.warn(
+          {githubUserId, gate: access.kind === 'denied' ? 'repo-denied' : 'repo-unavailable'},
+          'pending-questions: denied',
+        )
         return notFoundResponse(c)
       }
     } catch (error: unknown) {

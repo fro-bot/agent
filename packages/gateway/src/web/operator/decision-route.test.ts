@@ -6,7 +6,7 @@
  * — not a registry-only call. This is the documented bootstrap-wiring failure mode.
  *
  * Load-bearing tests:
- *   1. WRITE-AUTHZ GATE: write-authorized operator settles; read-only is denied.
+ *   1. REPO-ACCESS GATE: a bound, non-denylisted repo settles; unbound / unavailable / malformed is denied.
  *   2. SCOPE BINDING: handleDecision is called with approvalScopeId == run.run_id (server-side).
  *   3. NO-ORACLE DENIAL: every gate failure returns the identical notFoundResponse shape.
  *   4. IDEMPOTENCY: already-settled requestID → no second settlement.
@@ -17,7 +17,6 @@ import type {ApprovalRegistry, DecisionOutcome} from '../../approvals/registry.j
 import type {RunLocation} from '../../execute/run-index.js'
 import type {RepoKey} from '../../redaction/denylist.js'
 import type {AuditLogger} from '../audit.js'
-import type {RepoAuthzDeps} from '../auth/repo-authz.js'
 import type {DecisionRouteDeps} from './decision-route.js'
 import {Hono} from 'hono'
 import {describe, expect, it, vi} from 'vitest'
@@ -28,29 +27,12 @@ import {buildDecisionRoute} from './decision-route.js'
 // Stub factories
 // ---------------------------------------------------------------------------
 
-function makeSessionStore(overrides?: {
-  getOperatorToken?: (sessionId: string, nowMs: number) => string | undefined
-  get?: (
-    sessionId: string,
-    nowMs: number,
-  ) =>
-    | {
-        readonly githubUserId: number
-        readonly login: string
-        readonly issuedAt: number
-        readonly lastAccessedAt: number
-        readonly revoked: boolean
-      }
-    | undefined
-}): DecisionRouteDeps['sessionStore'] {
+function makeSessionStore(overrides?: Partial<DecisionRouteDeps['sessionStore']>): DecisionRouteDeps['sessionStore'] {
   return {
-    getOperatorToken: vi.fn((_sessionId: string, _nowMs: number) => 'oauth-token-stub'),
-    get: vi.fn((_sessionId: string, _nowMs: number) => ({
+    get: vi.fn((_sessionId: string) => ({
       githubUserId: 1001,
       login: 'alice',
       issuedAt: 0,
-      lastAccessedAt: 0,
-      revoked: false,
     })),
     ...overrides,
   }
@@ -69,69 +51,24 @@ function makeDenylistCache(denied = false): DecisionRouteDeps['denylistCache'] {
   }
 }
 
-function makeBindingsLookup(): DecisionRouteDeps['bindingsLookup'] {
-  return {
-    getBindingByRepo: vi.fn(async (_owner: string, _repo: string) => ({
-      success: true as const,
-      data: {
-        owner: 'acme',
-        repo: 'widget',
-        channelId: 'ch-123',
-        channelName: 'widget-dev',
-        workspacePath: '/workspace/acme/widget',
-        createdAt: '2026-01-01T00:00:00Z',
-        createdByDiscordId: 'discord-user-1',
-        databaseId: 42,
-        nodeId: 'R_node_42',
-      },
-    })),
-  }
+const WIDGET_BINDING = {
+  owner: 'acme',
+  repo: 'widget',
+  channelId: 'ch-123',
+  channelName: 'widget-dev',
+  workspacePath: '/workspace/acme/widget',
+  createdAt: '2026-01-01T00:00:00Z',
+  createdByDiscordId: 'discord-user-1',
+  databaseId: 42,
+  nodeId: 'R_node_42',
 }
 
-/**
- * Build a RepoAuthzDeps stub that returns write-level authorization.
- * The fetch mock returns a GitHub-shaped body with permissions.push=true.
- */
-function makeWriteRepoAuthzDeps(): RepoAuthzDeps {
-  return {
-    allowlist: {isAuthorized: vi.fn(() => true), size: 1},
-    fetch: vi.fn(
-      async () =>
-        new Response(JSON.stringify({permissions: {push: true, admin: false}}), {
-          status: 200,
-          headers: {'content-type': 'application/json'},
-        }),
-    ),
-    clock: () => 0,
-    random: () => 0.5,
-    auditLogger: {info: vi.fn(), warn: vi.fn()},
-    logger: {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
-    cache: {
-      get: vi.fn(() => undefined),
-      set: vi.fn(),
-      getInFlight: vi.fn(() => undefined),
-      setInFlight: vi.fn(),
-      deleteInFlight: vi.fn(),
-      tokenIdentityFor: vi.fn(() => 'stub-token-identity'),
-    },
-  }
-}
-
-/**
- * Build a RepoAuthzDeps stub that returns read-only (insufficient_permission).
- * The fetch mock returns a GitHub-shaped body with only pull=true.
- */
-function makeReadOnlyRepoAuthzDeps(): RepoAuthzDeps {
-  return {
-    ...makeWriteRepoAuthzDeps(),
-    fetch: vi.fn(
-      async () =>
-        new Response(JSON.stringify({permissions: {pull: true, push: false, admin: false}}), {
-          status: 200,
-          headers: {'content-type': 'application/json'},
-        }),
-    ),
-  }
+function makeBindingsLookup(
+  result:
+    | {readonly success: true; readonly data: typeof WIDGET_BINDING | null}
+    | {readonly success: false; readonly error: Error} = {success: true, data: WIDGET_BINDING},
+) {
+  return {getBindingByRepo: vi.fn(async (_owner: string, _repo: string) => result)}
 }
 
 function makeRegistry(outcome: DecisionOutcome = 'ok'): Pick<ApprovalRegistry, 'handleDecision'> {
@@ -153,11 +90,9 @@ function makeDeps(overrides?: Partial<DecisionRouteDeps>): DecisionRouteDeps {
     runIndex: makeRunIndex(),
     denylistCache: makeDenylistCache(),
     bindingsLookup: makeBindingsLookup(),
-    repoAuthzDeps: makeWriteRepoAuthzDeps(),
     registry: makeRegistry(),
     auditLogger: makeAuditLogger(),
     logger: {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
-    now: () => 0,
     ...overrides,
   }
 }
@@ -203,11 +138,11 @@ async function postDecision(
 }
 
 // ---------------------------------------------------------------------------
-// LOAD-BEARING TEST 1: WRITE-AUTHZ GATE
+// LOAD-BEARING TEST 1: REPO-ACCESS GATE (bindings-only; no GitHub call)
 // ---------------------------------------------------------------------------
 
-describe('POST decision — WRITE-AUTHZ GATE (load-bearing)', () => {
-  it('write-authorized operator (push=true) → 200 with state:claimed', async () => {
+describe('POST decision — REPO-ACCESS GATE (load-bearing)', () => {
+  it('bound, non-denylisted repo → 200 with state:claimed; no token accessor in the session deps', async () => {
     const deps = makeDeps({registry: makeRegistry('ok')})
     const app = buildApp(deps)
 
@@ -216,56 +151,101 @@ describe('POST decision — WRITE-AUTHZ GATE (load-bearing)', () => {
     expect(response.status).toBe(200)
     const body = (await response.json()) as {state: string}
     expect(body.state).toBe('claimed')
+    expect(Object.keys(deps.sessionStore)).toEqual(['get'])
   })
 
-  it('admin-authorized operator (admin=true) → 200 with state:claimed', async () => {
-    const adminAuthzDeps: RepoAuthzDeps = {
-      ...makeWriteRepoAuthzDeps(),
-      fetch: vi.fn(
-        async () =>
-          new Response(JSON.stringify({permissions: {push: false, admin: true}}), {
-            status: 200,
-            headers: {'content-type': 'application/json'},
-          }),
-      ),
-    }
-    const deps = makeDeps({repoAuthzDeps: adminAuthzDeps, registry: makeRegistry('ok')})
-    const app = buildApp(deps)
+  it('reads the binding exactly once for the settlement', async () => {
+    const bindingsLookup = makeBindingsLookup()
+    const deps = makeDeps({bindingsLookup})
 
-    const response = await postDecision(app, 'run-abc', 'req-123')
+    await postDecision(buildApp(deps), 'run-abc', 'req-123')
 
-    expect(response.status).toBe(200)
-    const body = (await response.json()) as {state: string}
-    expect(body.state).toBe('claimed')
+    expect(bindingsLookup.getBindingByRepo).toHaveBeenCalledTimes(1)
+    expect(bindingsLookup.getBindingByRepo).toHaveBeenCalledWith('acme', 'widget')
   })
 
-  it('read-only operator (insufficient_permission) → 404 no-oracle denial, NO settlement', async () => {
+  it('unbound repo → 404 no-oracle denial, NO settlement', async () => {
     const registry = makeRegistry('ok')
-    const deps = makeDeps({repoAuthzDeps: makeReadOnlyRepoAuthzDeps(), registry})
-    const app = buildApp(deps)
+    const deps = makeDeps({bindingsLookup: makeBindingsLookup({success: true, data: null}), registry})
 
-    const response = await postDecision(app, 'run-abc', 'req-123')
+    const response = await postDecision(buildApp(deps), 'run-abc', 'req-123')
 
     expect(response.status).toBe(404)
-    const body = (await response.json()) as {error: string}
-    expect(body.error).toBe('not-found')
+    expect(await response.json()).toEqual({error: 'not-found'})
     expect(vi.mocked(registry.handleDecision)).not.toHaveBeenCalled()
   })
 
-  it('read-only denial is indistinguishable from a runIndex miss (same shape)', async () => {
-    const readOnlyDeps = makeDeps({repoAuthzDeps: makeReadOnlyRepoAuthzDeps()})
-    const missDeps = makeDeps({runIndex: {lookup: vi.fn(async () => undefined)}})
+  it('binding store error or throw → 404 no-oracle denial, NO settlement', async () => {
+    const registry = makeRegistry('ok')
+    const failing = makeDeps({
+      bindingsLookup: makeBindingsLookup({success: false, error: new Error('s3 down')}),
+      registry,
+    })
+    const throwing = makeDeps({
+      bindingsLookup: {
+        getBindingByRepo: vi.fn(async () => {
+          throw new Error('boom')
+        }),
+      },
+      registry,
+    })
 
-    const readOnlyApp = buildApp(readOnlyDeps)
-    const missApp = buildApp(missDeps)
+    for (const deps of [failing, throwing]) {
+      const response = await postDecision(buildApp(deps), 'run-abc', 'req-123')
+      expect(response.status).toBe(404)
+      expect(await response.json()).toEqual({error: 'not-found'})
+    }
+    expect(vi.mocked(registry.handleDecision)).not.toHaveBeenCalled()
+  })
 
-    const readOnlyResponse = await postDecision(readOnlyApp, 'run-abc', 'req-123')
-    const missResponse = await postDecision(missApp, 'run-abc', 'req-123')
+  it('malformed owner/repo from the run index → 404 with zero binding reads', async () => {
+    const registry = makeRegistry('ok')
+    const bindingsLookup = makeBindingsLookup()
+    const deps = makeDeps({runIndex: makeRunIndex({repo: 'acme/a b', surface: 'web'}), bindingsLookup, registry})
 
-    expect(readOnlyResponse.status).toBe(missResponse.status)
-    const readOnlyBody = (await readOnlyResponse.json()) as {error: string}
-    const missBody = (await missResponse.json()) as {error: string}
-    expect(readOnlyBody.error).toBe(missBody.error)
+    const response = await postDecision(buildApp(deps), 'run-abc', 'req-123')
+
+    expect(response.status).toBe(404)
+    expect(bindingsLookup.getBindingByRepo).not.toHaveBeenCalled()
+    expect(vi.mocked(registry.handleDecision)).not.toHaveBeenCalled()
+  })
+
+  it('every repo-level denial is byte-identical to a runIndex miss', async () => {
+    const miss = await postDecision(
+      buildApp(makeDeps({runIndex: {lookup: vi.fn(async () => undefined)}})),
+      'run-abc',
+      'r',
+    )
+    const missText = await miss.text()
+    const variants = [
+      makeDeps({denylistCache: makeDenylistCache(true)}),
+      makeDeps({bindingsLookup: makeBindingsLookup({success: true, data: null})}),
+      makeDeps({bindingsLookup: makeBindingsLookup({success: false, error: new Error('s3 down')})}),
+      makeDeps({runIndex: makeRunIndex({repo: 'acme/..', surface: 'web'})}),
+    ]
+
+    for (const deps of variants) {
+      const response = await postDecision(buildApp(deps), 'run-abc', 'r')
+      expect(response.status).toBe(miss.status)
+      expect(await response.text()).toBe(missText)
+    }
+  })
+
+  it('repo-level denial emits no audit event; logs share one label and carry no owner/repo/runId', async () => {
+    const auditLogger = makeAuditLogger()
+    const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const denied = makeDeps({auditLogger, logger, denylistCache: makeDenylistCache(true)})
+    const unbound = makeDeps({auditLogger, logger, bindingsLookup: makeBindingsLookup({success: true, data: null})})
+
+    await postDecision(buildApp(denied), 'run-abc', 'req-123')
+    await postDecision(buildApp(unbound), 'run-abc', 'req-123')
+
+    expect(auditLogger.info).not.toHaveBeenCalled()
+    expect(auditLogger.warn).not.toHaveBeenCalled()
+    expect(logger.warn.mock.calls.map(call => call[0] as unknown)).toEqual([
+      {githubUserId: 1001, gate: 'repo-denied'},
+      {githubUserId: 1001, gate: 'repo-denied'},
+    ])
   })
 })
 
@@ -373,12 +353,9 @@ describe('POST decision — NO-ORACLE DENIAL (load-bearing)', () => {
     expect(body.error).toBe('not-found')
   })
 
-  it('denylisted repo → 404 not-found BEFORE any GitHub authz call', async () => {
-    const repoAuthzDeps = makeWriteRepoAuthzDeps()
-    const deps = makeDeps({
-      denylistCache: makeDenylistCache(true),
-      repoAuthzDeps,
-    })
+  it('denylisted repo → 404 not-found with no settlement', async () => {
+    const registry = makeRegistry('ok')
+    const deps = makeDeps({denylistCache: makeDenylistCache(true), registry})
     const app = buildApp(deps)
 
     const response = await postDecision(app, 'run-abc', 'req-123')
@@ -386,7 +363,7 @@ describe('POST decision — NO-ORACLE DENIAL (load-bearing)', () => {
     expect(response.status).toBe(404)
     const body = (await response.json()) as {error: string}
     expect(body.error).toBe('not-found')
-    expect(vi.mocked(repoAuthzDeps.fetch)).not.toHaveBeenCalled()
+    expect(vi.mocked(registry.handleDecision)).not.toHaveBeenCalled()
   })
 
   it('denylisted repo denial is indistinguishable from runIndex miss (same shape)', async () => {
@@ -433,28 +410,14 @@ describe('POST decision — NO-ORACLE DENIAL (load-bearing)', () => {
     expect(body.error).toBe('not-found')
   })
 
-  it('gate throw (authz throws) → 404 not-found, not a 500', async () => {
-    const throwingAuthzDeps: RepoAuthzDeps = {
-      ...makeWriteRepoAuthzDeps(),
-      fetch: vi.fn(async () => {
-        throw new Error('network failure')
-      }),
-    }
-    const deps = makeDeps({repoAuthzDeps: throwingAuthzDeps})
-    const app = buildApp(deps)
-
-    const response = await postDecision(app, 'run-abc', 'req-123')
-
-    expect(response.status).toBe(404)
-    const body = (await response.json()) as {error: string}
-    expect(body.error).toBe('not-found')
-  })
-
-  it('missing token → 404 not-found (no oracle)', async () => {
+  it('gate throw (denylist throws) → 404 not-found, not a 500', async () => {
     const deps = makeDeps({
-      sessionStore: makeSessionStore({
-        getOperatorToken: vi.fn(() => undefined),
-      }),
+      denylistCache: {
+        getDenylistState: vi.fn(async () => {
+          throw new Error('denylist unavailable')
+        }),
+        isRepoDenied: vi.fn(() => false),
+      },
     })
     const app = buildApp(deps)
 
@@ -652,22 +615,15 @@ describe('POST decision — byte-identical denial assertions', () => {
     expect(guardFailText).toBe(missText)
   })
 
-  it('missing token denial is byte-identical to runIndex miss denial', async () => {
-    const missingTokenDeps = makeDeps({
-      sessionStore: makeSessionStore({getOperatorToken: vi.fn(() => undefined)}),
-    })
+  it('missing session denial is byte-identical to runIndex miss denial', async () => {
+    const noSessionDeps = makeDeps({sessionStore: makeSessionStore({get: vi.fn(() => undefined)})})
     const missDeps = makeDeps({runIndex: {lookup: vi.fn(async () => undefined)}})
 
-    const missingTokenApp = buildApp(missingTokenDeps)
-    const missApp = buildApp(missDeps)
+    const noSessionResponse = await postDecision(buildApp(noSessionDeps), 'run-abc', 'req-123')
+    const missResponse = await postDecision(buildApp(missDeps), 'run-abc', 'req-123')
 
-    const missingTokenResponse = await postDecision(missingTokenApp, 'run-abc', 'req-123')
-    const missResponse = await postDecision(missApp, 'run-abc', 'req-123')
-
-    expect(missingTokenResponse.status).toBe(missResponse.status)
-    const missingTokenText = await missingTokenResponse.text()
-    const missText = await missResponse.text()
-    expect(missingTokenText).toBe(missText)
+    expect(noSessionResponse.status).toBe(missResponse.status)
+    expect(await noSessionResponse.text()).toBe(await missResponse.text())
   })
 })
 
@@ -775,23 +731,20 @@ describe('POST decision — audit', () => {
 // ---------------------------------------------------------------------------
 
 describe('POST decision — integration (real route wiring)', () => {
-  it('dispatches through real auth guard and denylist middleware (not registry-only)', async () => {
-    // This test verifies the route is wired through the real guard + denylist,
-    // not just calling handleDecision directly. The guard is a pass-through here,
-    // but the denylist check runs before authz.
-    const repoAuthzDeps = makeWriteRepoAuthzDeps()
+  it('dispatches through the real repo-access gate (not registry-only)', async () => {
+    const bindingsLookup = makeBindingsLookup()
+    const denylistCache = makeDenylistCache()
     const registry = makeRegistry('ok')
-    const deps = makeDeps({repoAuthzDeps, registry})
+    const deps = makeDeps({bindingsLookup, denylistCache, registry})
     const app = buildApp(deps)
 
     const response = await postDecision(app, 'run-abc', 'req-123')
 
     expect(response.status).toBe(200)
-    // Verify the GitHub write-authz fetch was called (real authz path, not bypassed)
-    expect(vi.mocked(repoAuthzDeps.fetch)).toHaveBeenCalledWith(
-      expect.stringContaining('api.github.com/repos/acme/widget'),
-      expect.any(Object),
-    )
+    // The binding was read and the denylist primed and consulted with the binding's keys.
+    expect(bindingsLookup.getBindingByRepo).toHaveBeenCalledWith('acme', 'widget')
+    expect(denylistCache.getDenylistState).toHaveBeenCalledTimes(1)
+    expect(denylistCache.isRepoDenied).toHaveBeenCalledWith({databaseId: 42, nodeId: 'R_node_42'})
     // Verify handleDecision was called with the correct scope
     expect(vi.mocked(registry.handleDecision)).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -802,19 +755,15 @@ describe('POST decision — integration (real route wiring)', () => {
     )
   })
 
-  it('denylist check runs BEFORE GitHub authz call (no oracle for denied repos)', async () => {
-    const repoAuthzDeps = makeWriteRepoAuthzDeps()
-    const deps = makeDeps({
-      denylistCache: makeDenylistCache(true),
-      repoAuthzDeps,
-    })
+  it('a denied repo never reaches the registry', async () => {
+    const registry = makeRegistry('ok')
+    const deps = makeDeps({denylistCache: makeDenylistCache(true), registry})
     const app = buildApp(deps)
 
     const response = await postDecision(app, 'run-abc', 'req-123')
 
     expect(response.status).toBe(404)
-    // GitHub fetch must NOT have been called — denylist check runs first
-    expect(vi.mocked(repoAuthzDeps.fetch)).not.toHaveBeenCalled()
+    expect(vi.mocked(registry.handleDecision)).not.toHaveBeenCalled()
   })
 
   it('handleDecision is the ONLY settlement path (no direct registry bypass)', async () => {

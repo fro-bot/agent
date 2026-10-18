@@ -1,16 +1,16 @@
 /**
  * Shared gate helpers for operator routes.
  *
- * Extracts the duplicated owner/repo-split logic and denylist gate that appear
- * identically in decision-route.ts, pending-approvals-route.ts, and
- * run-stream-route.ts. Each route retains its own try/catch and maps the null
- * return to its own notFoundResponse — the no-oracle behavior is unchanged.
+ * Extracts the duplicated owner/repo-split logic and the repo-access predicate
+ * that appear in every run-scoped route. Each route retains its own try/catch and
+ * maps a null or non-`allowed` result to its own notFoundResponse — the no-oracle
+ * behavior is unchanged.
  */
 
 import type {RunIndex} from '../../execute/run-index.js'
 import type {DenylistCache} from '../../redaction/denylist.js'
-import type {BindingsLookup} from '../../redaction/surface-gate.js'
-import {resolveBindingDenyKeys} from '../../redaction/surface-gate.js'
+import type {BindingDenyKeySource, BindingsLookup} from '../../redaction/surface-gate.js'
+import {lookupBindingDenyKeys} from '../../redaction/surface-gate.js'
 
 // ---------------------------------------------------------------------------
 // resolveRepoFromRunIndex
@@ -48,25 +48,91 @@ export async function resolveRepoFromRunIndex(
 }
 
 // ---------------------------------------------------------------------------
-// checkDenylist
+// Owner/repo name validation
 // ---------------------------------------------------------------------------
 
 /**
- * Resolve deny-keys and check whether the repo is denylisted.
+ * GitHub owner/repo name validation.
  *
- * Returns `true` when the repo is denied (caller should return notFoundResponse).
- * Returns `false` when the repo is allowed.
- *
- * Runs the denylist check BEFORE any GitHub authz call so a denylisted repo
- * never triggers a GitHub API request.
+ * GitHub owner names: alphanumeric and hyphens, 1–39 chars, no leading/trailing hyphen.
+ * GitHub repo names: alphanumeric, hyphens, underscores, dots; 1–100 chars.
+ * Intentionally strict to reject path traversal, null bytes, and injection attempts,
+ * and so a malformed name never reaches the object store.
+ * Single-segment names `.` and `..` are explicitly rejected as path traversal.
  */
-export async function checkDenylist(
+const OWNER_RE = /^[a-z\d](?:[a-z\d-]{0,37}[a-z\d])?$/i
+const REPO_RE = /^[\w.-]{1,100}$/
+
+function isValidOwner(owner: string): boolean {
+  return OWNER_RE.test(owner)
+}
+
+function isValidRepo(repo: string): boolean {
+  if (repo === '.' || repo === '..') return false
+  if (repo.includes('\u0000')) return false
+  return REPO_RE.test(repo)
+}
+
+// ---------------------------------------------------------------------------
+// resolveRepoAccess
+// ---------------------------------------------------------------------------
+
+/**
+ * Outcome of the repo-access predicate.
+ * - `allowed`: the repo is bound and not denylisted. Carries the binding the caller already read.
+ * - `denied`: malformed name, no binding, or a denylisted/unprimed/keyless repo. Callers cannot (and must not)
+ *   tell these apart.
+ * - `unavailable`: the binding store or the denylist could not answer. Fail closed — nothing is surfaced.
+ */
+export type RepoAccess<B extends BindingDenyKeySource> =
+  {readonly kind: 'allowed'; readonly binding: B} | {readonly kind: 'denied'} | {readonly kind: 'unavailable'}
+
+/** Dependencies of {@link resolveRepoAccess}. */
+export interface RepoAccessDeps<B extends BindingDenyKeySource> {
+  readonly bindingsLookup: BindingsLookup<B>
+  readonly denylistCache: Pick<DenylistCache, 'getDenylistState' | 'isRepoDenied'>
+}
+
+/**
+ * The single repo-access predicate for the operator web surface. Reads and writes use the same rule.
+ *
+ * The caller's allowlist check is separate: the browser guard enforces it per request, and the
+ * run-stream lease re-checks it on every tick.
+ *
+ * Order, fail-closed throughout:
+ *   1. Validate the names — a malformed name is `denied` with zero object-store calls.
+ *   2. Read the binding ONCE. A store error or throw is `unavailable`; a missing binding is `denied`.
+ *   3. Prime the denylist, then consult it with the binding's deny keys. A denylisted, unprimed, or
+ *      keyless repo is `denied`.
+ *
+ * The denylist is consulted only after a binding is found, so it never sees a repo that is not bound.
+ * Never throws: any unexpected throw is `unavailable`.
+ */
+export async function resolveRepoAccess<B extends BindingDenyKeySource>(
   owner: string,
   repo: string,
-  bindingsLookup: BindingsLookup,
-  denylistCache: DenylistCache,
-): Promise<boolean> {
-  const denyKeys = await resolveBindingDenyKeys(owner, repo, bindingsLookup)
-  await denylistCache.getDenylistState()
-  return denylistCache.isRepoDenied(denyKeys) === true
+  deps: RepoAccessDeps<B>,
+): Promise<RepoAccess<B>> {
+  if (isValidOwner(owner) === false || isValidRepo(repo) === false) {
+    return {kind: 'denied'}
+  }
+
+  try {
+    const lookup = await lookupBindingDenyKeys(owner, repo, deps.bindingsLookup)
+    if (lookup.kind === 'unavailable') {
+      return {kind: 'unavailable'}
+    }
+    if (lookup.binding === null) {
+      return {kind: 'denied'}
+    }
+
+    await deps.denylistCache.getDenylistState()
+    if (deps.denylistCache.isRepoDenied(lookup.repoKey) === true) {
+      return {kind: 'denied'}
+    }
+
+    return {kind: 'allowed', binding: lookup.binding}
+  } catch {
+    return {kind: 'unavailable'}
+  }
 }

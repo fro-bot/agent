@@ -8,23 +8,21 @@
  *
  * Gate ordering (all must pass before any data is returned):
  *   1. Guard (browser/session/allowlist) — installed by buildOperatorApp
- *   2. Resolve session + OAuth token by sessionId
- *   3. RunIndex.lookup(runId) → server-owned repo; miss → notFoundResponse
- *   4. Split owner/repo (strip stray '#')
- *   5. Denylist check (redaction BEFORE authz); denied → notFoundResponse
- *   6. checkRepoAuthz (READ-level — sufficient for observing/reconnecting)
- *   7. Per-operator rate limit (keyed on operator identity)
- *   8. Return registry.describePendingForScope(runId) as a bounded DTO list
+ *   2. RunIndex.lookup(runId) → server-owned repo; miss → notFoundResponse
+ *   3. Split owner/repo (strip stray '#')
+ *   4. resolveRepoAccess (bound AND not denylisted, one binding read); anything
+ *      but `allowed` → notFoundResponse
+ *   5. Per-operator rate limit (keyed on operator identity)
+ *   6. Return registry.describePendingForScope(runId) as a bounded DTO list
  *      (hard-capped at PENDING_APPROVALS_MAX_RESULTS entries)
  *
  * Security invariants:
  *   - approvalScopeId is run.run_id resolved server-side — NEVER from the client.
- *   - Every denial at gates 2–6 returns the identical no-oracle notFoundResponse.
+ *   - Every denial at gates 2–4 returns the identical no-oracle notFoundResponse.
  *   - A gate throw degrades to the same no-oracle denial, not a distinguishable 500.
  *   - An authorized operator with NO open requests returns 200 {approvals: []} —
  *     this is NOT an oracle because they are already authorized for that run.
- *   - Read-level authz is sufficient here; write-level is required only for the
- *     decision POST route.
+ *   - Reads and writes share one repo-access predicate; no GitHub call is made.
  *   - Results are hard-capped at PENDING_APPROVALS_MAX_RESULTS (defensive).
  *   - Per-operator rate limit prevents enumeration abuse.
  */
@@ -35,14 +33,11 @@ import type {RunIndex} from '../../execute/run-index.js'
 import type {RateLimiter} from '../../http/rate-limit.js'
 import type {DenylistCache} from '../../redaction/denylist.js'
 import type {BindingsLookup} from '../../redaction/surface-gate.js'
-import type {RepoAuthzDeps} from '../auth/repo-authz.js'
-import type {SessionStore} from '../auth/session.js'
 import type {OperatorLogger} from '../server.js'
 import {createRateLimiter} from '../../http/rate-limit.js'
-import {checkRepoAuthz} from '../auth/repo-authz.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
 import {notFoundResponse, rateLimitedResponse} from '../safe-response.js'
-import {checkDenylist, resolveRepoFromRunIndex} from './route-helpers.js'
+import {resolveRepoAccess, resolveRepoFromRunIndex} from './route-helpers.js'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -65,16 +60,12 @@ const PENDING_APPROVALS_RATE_WINDOW_MS = 60_000
 
 /** Dependencies for the pending-approvals route. */
 export interface PendingApprovalsRouteDeps {
-  /** Session store for token retrieval. */
-  readonly sessionStore: Pick<SessionStore, 'getOperatorToken'>
   /** Server-owned run index for runId → repo resolution. */
   readonly runIndex: Pick<RunIndex, 'lookup'>
   /** Denylist cache for pre-read redaction check. */
   readonly denylistCache: DenylistCache
   /** Bindings lookup for deny-key resolution. */
   readonly bindingsLookup: BindingsLookup
-  /** Repo authorization dependencies (read-level). */
-  readonly repoAuthzDeps: RepoAuthzDeps
   /** Approval registry — the sole source of pending request detail. */
   readonly registry: Pick<ApprovalRegistry, 'describePendingForScope'>
   /** Structured logger. */
@@ -121,8 +112,6 @@ export function buildPendingApprovalsRoute(app: Hono, deps: PendingApprovalsRout
     })
 
   registerOperatorRoute(app, 'GET', '/operator/runs/:runId/approvals', async c => {
-    const nowMs = deps.now()
-
     // ── Gate 1: Read authenticated context set by the guard ──────────────────
     // In production the guard always sets this; undefined is unreachable.
     // Return not-found as a safe fallback (no oracle — same shape as all denials).
@@ -132,23 +121,16 @@ export function buildPendingApprovalsRoute(app: Hono, deps: PendingApprovalsRout
       return notFoundResponse(c)
     }
 
-    const {githubUserId, sessionId} = authCtx
+    const {githubUserId} = authCtx
 
-    // ── Gates 2–6: Pre-read authorization gates ──────────────────────────────
+    // ── Gates 2–4: Pre-read authorization gates ──────────────────────────────
     // Wrapped in try/catch so any unexpected throw returns the uniform not-found
     // shape rather than propagating to Hono as a 500 (which would be distinguishable
     // from the 404 and break the no-oracle property).
     let runId: string
 
     try {
-      // ── Gate 2: Resolve OAuth token ──────────────────────────────────────
-      const resolvedToken = deps.sessionStore.getOperatorToken(sessionId, nowMs)
-      if (resolvedToken === undefined) {
-        deps.logger.warn({githubUserId, gate: 'no-token'}, 'pending-approvals: denied')
-        return notFoundResponse(c)
-      }
-
-      // ── Gates 3–4: Resolve runId → {owner, repo} (server-owned) ────────────
+      // ── Gates 2–3: Resolve runId → {owner, repo} (server-owned) ────────────
       // The repo is NEVER taken from the client. RunIndex.lookup is the sole authority.
       // resolveRepoFromRunIndex handles the lookup + owner/repo split in one call.
       runId = c.req.param('runId') ?? ''
@@ -159,21 +141,15 @@ export function buildPendingApprovalsRoute(app: Hono, deps: PendingApprovalsRout
       }
       const {owner, repo} = resolved
 
-      // ── Gate 5: Redaction check (denylist before authz, fail-closed) ─────
-      // This runs BEFORE checkRepoAuthz so a denylisted repo never triggers
-      // a GitHub call.
-      const isDenied = await checkDenylist(owner, repo, deps.bindingsLookup, deps.denylistCache)
-      if (isDenied === true) {
-        deps.logger.warn({githubUserId, runId, gate: 'denylisted'}, 'pending-approvals: denied')
-        return notFoundResponse(c)
-      }
-
-      // ── Gate 6: Read-level repo authorization ────────────────────────────
-      // READ (not write) — observing/reconnecting needs only read access.
-      // The decision POST route uses write-level authz; this GET uses read-level.
-      const authzResult = await checkRepoAuthz(githubUserId, owner, repo, resolvedToken, deps.repoAuthzDeps)
-      if (authzResult.authorized === false) {
-        deps.logger.warn({githubUserId, runId, gate: 'read-authz-denied'}, 'pending-approvals: denied')
+      // ── Gate 4: Repo access (bound AND not denylisted, fail-closed) ───────
+      // One binding read. Unbound and denylisted share one denial label so the
+      // log is not an existence oracle; repo-level denials emit no audit event.
+      const access = await resolveRepoAccess(owner, repo, deps)
+      if (access.kind !== 'allowed') {
+        deps.logger.warn(
+          {githubUserId, gate: access.kind === 'denied' ? 'repo-denied' : 'repo-unavailable'},
+          'pending-approvals: denied',
+        )
         return notFoundResponse(c)
       }
     } catch (error: unknown) {
@@ -184,17 +160,17 @@ export function buildPendingApprovalsRoute(app: Hono, deps: PendingApprovalsRout
       return notFoundResponse(c)
     }
 
-    // ── Gate 7: Per-operator rate limit ──────────────────────────────────────
+    // ── Gate 5: Per-operator rate limit ──────────────────────────────────────
     // Keyed on string(githubUserId) so the limit is per-operator, not per-run.
     // Rate limit is applied AFTER authz gates so only authorized operators consume
-    // the budget (unauthorized requests are denied at gate 6 before reaching here).
+    // the budget (unauthorized requests are denied at gate 4 before reaching here).
     const operatorKey = String(githubUserId)
     if (limiter.allow(operatorKey) === false) {
       deps.logger.warn({githubUserId, runId, gate: 'rate-limited'}, 'pending-approvals: rate limited')
       return rateLimitedResponse(c)
     }
 
-    // ── Gate 8: Return bounded pending approval DTOs ─────────────────────────
+    // ── Gate 6: Return bounded pending approval DTOs ─────────────────────────
     // describePendingForScope returns only open/claimed entries for this runId.
     // Hard-cap the result to PENDING_APPROVALS_MAX_RESULTS (defensive).
     // An empty list is a valid authorized response — not an oracle.
