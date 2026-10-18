@@ -242,7 +242,7 @@ The gateway has one operator. This work adds no per-recipient authorization and 
 
 ### Deferred to Implementation
 
-- **Live check of `GET /user` without a scope.** Confirm the response still carries `id` and `login` for a scope-less token. Remove `scope=read:user` only if it does. If not, keep the scope and record why.
+- [x] **Live check of `GET /user` without a scope.** Confirm the response still carries `id` and `login` for a scope-less token. Remove `scope=read:user` only if it does. If not, keep the scope and record why. *Done: GitHub docs confirm a no-scope token receives the public user response (`id`, `login`); `scope=read:user` was removed from the authorize URL.*
 - **Numbers.** Load concurrency and timeout, sweep read bound, CAS retry count and per-attempt timeout, the `Retry-After` seconds for each 503, and the future-date skew allowance (minutes).
 - **Names.** The new store factory and interface, the record field names, the audit event kinds and whether the restore event needs a per-outcome log level, and the hook-suppressing rotate option.
 - **List-route caps.** Decide whether `MAX_REPOS_PER_LISTING` and `MAX_REPOS_AUTHZ_FANOUT` still earn their place as response or read bounds.
@@ -541,7 +541,7 @@ The repo-access predicate, as a decision table:
 
 - The callback uses the token for `GET /user` and drops it. `create` receives identity only. The order after identity is verified is allowlist check, async create, then durable-first rotation of the stale cookie's session. Same user rotates without the hook. A different user revokes and fires it. A stale ID absent from the map is revoked by hash.
 - `cap`, `write_failed` and `not_ready` return 503 with `Retry-After` and set no cookie. A failed rotation discards the new session without a hook, returns 503 and leaves the old session valid.
-- `scope=read:user` leaves the authorize URL once the live check in Deferred to Implementation passes.
+- [x] `scope=read:user` leaves the authorize URL once the live check in Deferred to Implementation passes. *Done.*
 - Remove `onSessionRevoke` from `GitHubOAuthDeps` and from the `buildGitHubOAuthDeps` parameters.
 - The logout route awaits `revoke`. On success it emits `auth.logout`, clears the cookie and returns 200. On failure it returns 503 with `Retry-After`, leaves the cookie, and the session stays valid.
 - The guard's store type becomes the structural `get`, and the touch step and its comment are removed. The allowlist check stays where it is.
