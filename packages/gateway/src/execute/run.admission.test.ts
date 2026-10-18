@@ -2092,7 +2092,13 @@ describe('launchWork — operator prompt persistence (contract 1.12.0)', () => {
     const request = {...makeInMemoryRequest({promptText: `${SENTINEL} please run this`}), persistOperatorPrompt: true}
 
     // #when
-    await expect(launchWork(request, deps)).rejects.toThrow('createRun failed')
+    const thrown = await launchWork(request, deps).catch((error: unknown) => error)
+
+    // #then — the thrown error names the type, carries no adapter message and no cause
+    expect(thrown).toBeInstanceOf(Error)
+    expect((thrown as Error).message).toBe('createRun failed: TypeError')
+    expect((thrown as Error).message).not.toContain(SENTINEL)
+    expect((thrown as Error).cause).toBeUndefined()
 
     // #then — the log carries the name, never the prompt
     const logger = deps.logger as unknown as Parameters<typeof loggedText>[0]

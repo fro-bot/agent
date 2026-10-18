@@ -348,6 +348,21 @@ describe('runOpenCodeCore — provider rejection fails fast (#1836)', () => {
       expect((run.outcome() as {error: RunCoreError}).error.quarantined).toBe(false)
     })
 
+    it('passes rootLive through the barrier options: a retry status always tears the live root down first', async () => {
+      // #given — a retry status is the one failure source where OpenCode is still running the root. If
+      // `failFromProvider` stopped passing `rootLive` into `throwWithBarrier`, the barrier would see no live
+      // work (no ledger, no drain) and return immediately.
+      const run = startRun()
+
+      // #when
+      await run.emit(authRetry)
+
+      // #then — the root was aborted exactly once, and only then did the run fail
+      expect(run.abort).toHaveBeenCalledTimes(1)
+      expect(run.abort).toHaveBeenCalledWith(expect.objectContaining({path: {id: ROOT}}))
+      expectFailed(run, 'Provider failure: provider auth unavailable')
+    })
+
     it('quarantines the run when the root stays live after the abort', async () => {
       // #given — the directory's live set keeps reporting the root
       const run = startRun({live: {[ROOT]: {type: 'retry'}}})

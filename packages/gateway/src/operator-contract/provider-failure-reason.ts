@@ -19,8 +19,9 @@ import type {RunPhase} from '@fro-bot/runtime'
 import type {ProviderFailureReason} from '../execute/provider-failure.js'
 
 /**
- * The closed wire set of provider failure reasons, declared once: the type, the runtime membership set and
- * the mapping table below all derive from or are checked against this tuple.
+ * The closed wire set of provider failure reasons, declared once. The type and the runtime membership set derive
+ * from this tuple. The compiler checks that every value in the mapping table below is a tuple member; a runtime
+ * test checks that every tuple member is mapped.
  *
  * `unclassified` is the wire value for the internal catch-all (`session error`): a provider failure
  * with no more specific cause. Consumers must tolerate values added in later MINOR versions.

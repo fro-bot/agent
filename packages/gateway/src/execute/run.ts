@@ -590,22 +590,19 @@ function extractProviderFailureReason(execError: unknown): OperatorProviderFailu
 }
 
 /**
- * The `details` keys a terminal FAILED write driven by an execution error persists. A type alias, not an
- * interface, so it stays assignable to the `Record<string, unknown>` `detailsPatch` parameter.
- */
-// eslint-disable-next-line @typescript-eslint/consistent-type-definitions -- an interface has no implicit index signature, so it would not be assignable to `Record<string, unknown>`
-type FailureDetailsPatch = {
-  readonly failureKind: RunCoreErrorKind
-  readonly providerFailureReason?: OperatorProviderFailureReason
-}
-
-/**
  * The `details` patch for a terminal FAILED write driven by an execution error: the internal
  * `failureKind` plus, for a provider-classified `session-error`, the wire `providerFailureReason`.
  * `undefined` when the error carries neither. Only the three execution-failure terminal sites use this;
  * preparation failure, `failAdmittedRun`, recovery and maintenance never write a reason.
+ *
+ * The return type is an inline object literal type on purpose: an interface or a named alias would not stay
+ * assignable to the `Record<string, unknown>` `detailsPatch` parameter, and a named alias gets rewritten to an
+ * interface by `eslint --fix`.
  */
-function failureDetailsPatch(execError: unknown): FailureDetailsPatch | undefined {
+function failureDetailsPatch(
+  execError: unknown,
+):
+  {readonly failureKind: RunCoreErrorKind; readonly providerFailureReason?: OperatorProviderFailureReason} | undefined {
   const failureKind = extractRunCoreKind(execError)
   if (failureKind === undefined) return undefined
   const providerFailureReason = extractProviderFailureReason(execError)
@@ -2255,7 +2252,9 @@ export async function launchWork(request: LaunchWorkRequest, deps: RunMentionDep
       concurrency.release(channelId)
     }
     // createRun failed — no run-state to terminalize; just reject admission.
-    throw new Error(`createRun failed: ${createResult.error.message}`)
+    // The adapter message can quote the record being written (it carries the operator's prompt), so the thrown
+    // message names the error type only and no `cause` is attached.
+    throw new Error(`createRun failed: ${createResult.error.name}`)
   }
 
   const adoptionEtag = createResult.data.etag
@@ -2335,6 +2334,14 @@ export async function launchWork(request: LaunchWorkRequest, deps: RunMentionDep
 // ---------------------------------------------------------------------------
 
 /**
+ * The error NAME for a log line. The observer receives the run record, which carries the operator's prompt for a
+ * web launch, so an error from it can quote that record in its message and `String(error)` would log it.
+ */
+function errorNameOf(error: unknown): string {
+  return error instanceof Error ? error.name : typeof error
+}
+
+/**
  * Notify the observation pipeline of a run-state transition.
  * Fire-and-forget: neither a sync throw nor an async rejection must abort the caller.
  */
@@ -2342,10 +2349,10 @@ function notifyObserverBestEffort(deps: RunMentionDeps, state: RunState): void {
   const logger = deps.logger
   try {
     deps.runObserver?.observe(state)?.catch((error: unknown) => {
-      logger.warn({err: String(error)}, 'run: runObserver.observe failed')
+      logger.warn({err: errorNameOf(error)}, 'run: runObserver.observe failed')
     })
   } catch (observeError: unknown) {
-    logger.warn({err: String(observeError)}, 'run: runObserver.observe threw — continuing (best-effort)')
+    logger.warn({err: errorNameOf(observeError)}, 'run: runObserver.observe threw — continuing (best-effort)')
   }
 }
 

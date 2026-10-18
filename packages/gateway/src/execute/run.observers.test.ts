@@ -28,6 +28,12 @@ import * as runCoreModule from './run-core.js'
 // dispatcher — all secondary side-channels driven off the same run lifecycle.
 // ---------------------------------------------------------------------------
 
+function loggedText(logger: Record<'debug' | 'info' | 'warn' | 'error', ReturnType<typeof vi.fn>>): string {
+  return [logger.debug, logger.info, logger.warn, logger.error]
+    .flatMap(fn => fn.mock.calls.map((call: unknown[]) => JSON.stringify(call)))
+    .join('\n')
+}
+
 describe('runMention', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -161,6 +167,50 @@ describe('runMention', () => {
       // #then — run completed normally
       const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
       expect(transitionPhases).toContain('COMPLETED')
+    })
+
+    describe('prompt text stays out of observer error logs', () => {
+      const SENTINEL = 'SENTINEL-PROMPT-91ac'
+
+      it('an observe rejection that quotes the run record logs the error name only', async () => {
+        // #given an observer whose rejection message quotes the record it was handed (the prompt-bearing state)
+        const {runMention} = await import('./run.js')
+        setupHappyPath()
+        const observeFn = vi
+          .fn()
+          .mockRejectedValue(new RangeError(`observe failed on {"operatorPrompt":"${SENTINEL}"}`))
+        const deps = makeDeps({runObserver: {observe: observeFn}})
+
+        // #when
+        await runMention(makeMessage(), makeBinding(), deps)
+        await Promise.resolve()
+
+        // #then the warning names the error type and nothing else
+        const logger = deps.logger as unknown as Parameters<typeof loggedText>[0]
+        expect(logger.warn).toHaveBeenCalledWith({err: 'RangeError'}, 'run: runObserver.observe failed')
+        expect(loggedText(logger)).not.toContain(SENTINEL)
+      })
+
+      it('a synchronous observe throw that quotes the run record logs the error name only', async () => {
+        // #given an observer that throws synchronously with a message quoting the record
+        const {runMention} = await import('./run.js')
+        setupHappyPath()
+        const observeFn = vi.fn().mockImplementation(() => {
+          throw new TypeError(`observe threw on {"operatorPrompt":"${SENTINEL}"}`)
+        })
+        const deps = makeDeps({runObserver: {observe: observeFn}})
+
+        // #when
+        await runMention(makeMessage(), makeBinding(), deps)
+
+        // #then
+        const logger = deps.logger as unknown as Parameters<typeof loggedText>[0]
+        expect(logger.warn).toHaveBeenCalledWith(
+          {err: 'TypeError'},
+          'run: runObserver.observe threw — continuing (best-effort)',
+        )
+        expect(loggedText(logger)).not.toContain(SENTINEL)
+      })
     })
 
     it('inert: omitting runObserver (undefined) is safe — run completes normally', async () => {
