@@ -306,6 +306,11 @@ jobs:
       )
     name: Fro Bot
     runs-on: ubuntu-latest
+    outputs:
+      # 'true' only when a release-notes run left a non-empty release-notes-candidate.md
+      # (set by the "Detect release-notes candidate" step). Job outputs are strings; the
+      # apply job compares against 'true'. Empty when the detect step never ran.
+      candidate-exists: ${{ steps.candidate.outputs.exists }}
     # Backstop only: the action's own `timeout:` below is the deadline that matters,
     # because it is the one that can still drain owned background work, cancel what
     # will not settle, write a job summary, and publish a response. This cap must stay
@@ -548,16 +553,30 @@ jobs:
           # this step only closes the pre-action (job-level) gap.
           timeout: ${{ github.event.inputs.correlation-id != '' && steps.budget.outputs.narration-timeout-ms || steps.budget.outputs.timeout-ms }}
 
+      - name: Detect release-notes candidate
+        id: candidate
+        # Same gate as the upload below. The agent may legitimately produce nothing
+        # (over the candidate-PR limit, quality bar unmet); record whether the file exists
+        # so the upload and the apply job can skip quietly instead of surfacing an
+        # artifact-not-found error for an expected fail-soft case.
+        if: ${{ github.event.inputs.release-tag != '' && github.event.inputs.correlation-id != '' }}
+        run: |
+          if [ -s release-notes-candidate.md ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Upload release-notes candidate
         # Only release-notes runs (both release-tag and correlation-id set) produce a
         # candidate; output-mode working-dir writes it to release-notes-candidate.md at
         # the workspace root. The artifact name needs correlation-id, so a half-specified
         # manual dispatch (release-tag without correlation-id, or vice versa) produces a
         # read-only generate run with no candidate upload — fail-soft.
-        # if-no-files-found: warn — the agent may legitimately produce nothing (over
-        # bounds, quality bar unmet), which is fail-soft by design: the apply job below
-        # then finds no artifact and skips without touching the release.
-        if: ${{ github.event.inputs.release-tag != '' && github.event.inputs.correlation-id != '' }}
+        # Also gated on the detect step: when the agent produced nothing (over the
+        # candidate-PR limit, quality bar unmet) there is nothing to upload, and the apply
+        # job below skips without touching the release.
+        if: ${{ github.event.inputs.release-tag != '' && github.event.inputs.correlation-id != '' && steps.candidate.outputs.exists == 'true' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-notes-candidate-${{ github.event.inputs.correlation-id }}
@@ -590,11 +609,18 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Skip release-notes narration (no candidate)
+        # Expected fail-soft case: the generate job produced no candidate (over the
+        # candidate-PR limit, quality bar unmet). Say so once, as a notice, instead of
+        # letting the download step log an artifact-not-found error.
+        if: ${{ needs.fro-bot.outputs.candidate-exists != 'true' }}
+        run: echo "::notice::Release-notes narration skipped - the generate job produced no candidate. The release body is unchanged."
+
       - name: Download release-notes candidate
-        # The artifact is absent when the generate job produced nothing (over bounds,
-        # quality bar unmet) or upload was skipped. continue-on-error lets the run
-        # proceed to the apply script, whose readCandidate() treats a missing file
-        # as fail-soft (warn + exit 0) rather than failing the step here.
+        # Runs only when the generate job reported a candidate. continue-on-error stays so
+        # a transient download failure proceeds to the apply script, whose readCandidate()
+        # treats a missing file as fail-soft (warn + exit 0) rather than failing the step.
+        if: ${{ needs.fro-bot.outputs.candidate-exists == 'true' }}
         continue-on-error: true
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -602,6 +628,7 @@ jobs:
           path: .
 
       - name: Assemble and apply release notes
+        if: ${{ needs.fro-bot.outputs.candidate-exists == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.FRO_BOT_PAT }}
           # Dispatch inputs never reach the shell via template expansion — env only.
