@@ -4,29 +4,27 @@
  *
  * Answers or skips a pending agent-question request through the shared request
  * gate. The write-gated settlement path for questions on the web operator
- * surface; it serves every run, Discord-launched or web-launched, because web
- * operators with write access to the run's repository may answer any run's
- * question.
+ * surface; it serves every run, Discord-launched or web-launched, because the
+ * bound repo's operator may answer any run's question.
  *
  * Gate ordering (all must pass before the gate is called):
  *   0. Body size limit (64 KiB) — global middleware in buildOperatorApp, ahead
  *      of every route and so ahead of the guard and any lookup
  *   1. Guard (browser/session/allowlist/CSRF) — installed by buildOperatorApp
- *   2. Resolve session + OAuth token by sessionId
- *   3. Resolve runId → repo via RunIndex (server-owned; never client-supplied)
- *   4. Split owner/repo
- *   5. Denylist check (BEFORE any authz call)
- *   6. checkRepoWriteAuthz (WRITE-level)
- *   7. Parse + shape-check the body ({decision:'answer', answers} | {decision:'skip'})
- *   8. Build the web operator actor server-side from the session
- *   9. Map option indices to the raw labels, then registry.decide
- *  10. Emit the question.decision / question.rejected audit record
- *  11. Map the gate outcome → JSON response
+ *   2. Resolve runId → repo via RunIndex (server-owned; never client-supplied)
+ *   3. Split owner/repo
+ *   4. resolveRepoAccess (bound AND not denylisted, one binding read) — the same
+ *      predicate the read routes use; anything but `allowed` → notFoundResponse
+ *   5. Parse + shape-check the body ({decision:'answer', answers} | {decision:'skip'})
+ *   6. Build the web operator actor server-side from the session
+ *   7. Map option indices to the raw labels, then registry.decide
+ *   8. Emit the question.decision / question.rejected audit record
+ *   9. Map the gate outcome → JSON response
  *
  * Security invariants:
  *   - The run is resolved server-side and passed to the gate, which refuses a
  *     request id that belongs to another run (same answer as an unknown id).
- *   - Every denial at gates 2–6 returns the identical no-oracle notFoundResponse;
+ *   - Every denial at gates 2–4 returns the identical no-oracle notFoundResponse;
  *     a gate throw degrades to the same denial.
  *   - Audit events and logs carry ids and reason codes only — never question
  *     or answer text, and never the request body.
@@ -41,28 +39,23 @@ import type {QuestionDecisionErrorResponse, QuestionDecisionResponse} from '../.
 import type {DenylistCache} from '../../redaction/denylist.js'
 import type {BindingsLookup} from '../../redaction/surface-gate.js'
 import type {AuditLogger, QuestionRejectedReason} from '../audit.js'
-import type {RepoAuthzDeps} from '../auth/repo-authz.js'
-import type {SessionStore} from '../auth/session.js'
+import type {DurableSessionStore} from '../auth/session.js'
 import type {OperatorLogger} from '../server.js'
 import {emitAudit} from '../audit.js'
-import {checkRepoWriteAuthz} from '../auth/repo-authz.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
 import {notFoundResponse} from '../safe-response.js'
 import {parseQuestionDecisionBody, resolveQuestionAnswers} from './question-choices.js'
-import {checkDenylist, resolveRepoFromRunIndex} from './route-helpers.js'
+import {resolveRepoAccess, resolveRepoFromRunIndex} from './route-helpers.js'
 
 export interface QuestionDecisionRouteDeps {
-  readonly sessionStore: Pick<SessionStore, 'getOperatorToken' | 'get'>
+  readonly sessionStore: Pick<DurableSessionStore, 'get'>
   readonly runIndex: Pick<RunIndex, 'lookup'>
   readonly denylistCache: DenylistCache
   readonly bindingsLookup: BindingsLookup
-  /** Repo authorization dependencies (write-level). */
-  readonly repoAuthzDeps: RepoAuthzDeps
   /** Question registry — the sole settlement path. */
   readonly registry: Pick<QuestionRegistry, 'decide' | 'describePendingForRun' | 'isClaimed'>
   readonly auditLogger: AuditLogger
   readonly logger: OperatorLogger
-  readonly now: () => number
 }
 
 const BAD_REQUEST: QuestionDecisionErrorResponse = {error: 'bad request', reason: 'malformed', questionIndex: null}
@@ -91,8 +84,6 @@ function rejectedReason(outcome: Exclude<QuestionDecisionOutcome, {readonly kind
  */
 export function buildQuestionDecisionRoute(app: Hono, deps: QuestionDecisionRouteDeps): void {
   registerOperatorRoute(app, 'POST', '/operator/runs/:runId/questions/:requestId/decision', async c => {
-    const nowMs = deps.now()
-
     const authCtx = getOperatorAuthContext(c)
     if (authCtx === undefined) {
       deps.logger.warn({gate: 'no-auth-ctx'}, 'question-decision: denied')
@@ -101,18 +92,10 @@ export function buildQuestionDecisionRoute(app: Hono, deps: QuestionDecisionRout
 
     const {githubUserId, sessionId} = authCtx
 
-    // Gates 2–6. Any throw returns the uniform not-found shape, never a distinguishable 500.
-    let token: string
+    // Gates 2–4. Any throw returns the uniform not-found shape, never a distinguishable 500.
     let runId: string
 
     try {
-      const resolvedToken = deps.sessionStore.getOperatorToken(sessionId, nowMs)
-      if (resolvedToken === undefined) {
-        deps.logger.warn({githubUserId, gate: 'no-token'}, 'question-decision: denied')
-        return notFoundResponse(c)
-      }
-      token = resolvedToken
-
       runId = c.req.param('runId') ?? ''
       const resolved = await resolveRepoFromRunIndex(runId, deps.runIndex)
       if (resolved === null) {
@@ -121,17 +104,14 @@ export function buildQuestionDecisionRoute(app: Hono, deps: QuestionDecisionRout
       }
       const {owner, repo} = resolved
 
-      // Redaction BEFORE authz so a denylisted repo never triggers a GitHub call.
-      const isDenied = await checkDenylist(owner, repo, deps.bindingsLookup, deps.denylistCache)
-      if (isDenied === true) {
-        deps.logger.warn({githubUserId, runId, gate: 'denylisted'}, 'question-decision: denied')
-        return notFoundResponse(c)
-      }
-
-      // WRITE (not read): a read-only operator is denied here.
-      const authzResult = await checkRepoWriteAuthz(githubUserId, owner, repo, token, deps.repoAuthzDeps)
-      if (authzResult.authorized === false) {
-        deps.logger.warn({githubUserId, runId, gate: 'write-authz-denied'}, 'question-decision: denied')
+      // One binding read. Unbound and denylisted share one denial label so the log is
+      // not an existence oracle; repo-level denials emit no audit event.
+      const access = await resolveRepoAccess(owner, repo, deps)
+      if (access.kind !== 'allowed') {
+        deps.logger.warn(
+          {githubUserId, gate: access.kind === 'denied' ? 'repo-denied' : 'repo-unavailable'},
+          'question-decision: denied',
+        )
         return notFoundResponse(c)
       }
     } catch (error: unknown) {
@@ -142,7 +122,7 @@ export function buildQuestionDecisionRoute(app: Hono, deps: QuestionDecisionRout
       return notFoundResponse(c)
     }
 
-    // Gate 7: body shape. A client error (400), logged without the body.
+    // Gate 5: body shape. A client error (400), logged without the body.
     let body: unknown
     try {
       body = await c.req.json()
@@ -156,9 +136,9 @@ export function buildQuestionDecisionRoute(app: Hono, deps: QuestionDecisionRout
       return c.json(BAD_REQUEST, 400)
     }
 
-    // Gates 8–11: post-authz. A throw here is denied with the same shape as an authz denial.
+    // Gates 6–9: post-authz. A throw here is denied with the same shape as an authz denial.
     try {
-      const sessionEntry = deps.sessionStore.get(sessionId, nowMs)
+      const sessionEntry = deps.sessionStore.get(sessionId)
       if (sessionEntry === undefined) {
         deps.logger.warn({githubUserId, runId, gate: 'no-session'}, 'question-decision: denied — session missing')
         return notFoundResponse(c)

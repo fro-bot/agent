@@ -5,8 +5,8 @@
  * request gate (see test-helpers.ts).
  *
  * Load-bearing:
- *   1. WRITE AUTHZ + NO ORACLE: read-only, denylisted, and unknown runs get the identical 404.
- *   2. DENYLIST BEFORE AUTHZ: a denylisted repo never reaches the GitHub permission fetch.
+ *   1. REPO ACCESS + NO ORACLE: unbound, denylisted, unavailable, malformed and unknown runs get the identical 404.
+ *   2. BINDINGS ONLY: the predicate is one binding read plus the denylist; no GitHub call is made.
  *   3. INDEX MAPPING: option indices map to the RAW labels in the reply to OpenCode.
  *   4. CROSS-SURFACE: a web operator may answer a Discord-scoped run's question.
  *   5. CROSS-RUN: a request id from another run is "already settled", with no side effects.
@@ -30,10 +30,8 @@ import {
   makeRunIndex,
   makeSessionStore,
   pickQuestion,
-  readOnlyAuthz,
   RUN_ID,
   SECRET,
-  writeAuthz,
 } from './test-helpers.js'
 
 function makeDeps(
@@ -47,11 +45,9 @@ function makeDeps(
     runIndex: makeRunIndex(),
     denylistCache: makeDenylistCache(),
     bindingsLookup: makeBindingsLookup(),
-    repoAuthzDeps: writeAuthz(),
     registry,
     auditLogger,
     logger,
-    now: () => 0,
     ...overrides,
   } satisfies QuestionDecisionRouteDeps
 }
@@ -209,15 +205,16 @@ describe('POST question decision — skip', () => {
 })
 
 describe('POST question decision — gates and no-oracle denials', () => {
-  it('read-only operator → 404 no-oracle, gate untouched', async () => {
-    // #given a read-only operator and a pending question
+  it('unbound repo → 404 no-oracle, gate untouched', async () => {
+    // #given an unbound repo and a pending question
     const registry = makeRegistry()
     const effects = makeEffects()
     register(registry, effects)
     const decide = vi.spyOn(registry, 'decide')
+    const bindingsLookup = makeBindingsLookup({success: true, data: null})
 
     // #when
-    const res = await post(app(makeDeps(registry, {repoAuthzDeps: readOnlyAuthz()})), 'que_1', {decision: 'skip'})
+    const res = await post(app(makeDeps(registry, {bindingsLookup})), 'que_1', {decision: 'skip'})
 
     // #then
     expect(res.status).toBe(404)
@@ -226,39 +223,88 @@ describe('POST question decision — gates and no-oracle denials', () => {
     expect(effects.replyQuestion).not.toHaveBeenCalled()
   })
 
-  it('denylisted repo → identical 404 BEFORE any authz call', async () => {
-    // #given a denylisted repo and an authz fetch spy
+  it('denylisted repo → identical 404 and the gate is never reached', async () => {
+    // #given a denylisted repo
     const registry = makeRegistry()
     const effects = makeEffects()
     register(registry, effects)
-    const repoAuthzDeps = writeAuthz()
-    const deps = makeDeps(registry, {denylistCache: makeDenylistCache(true), repoAuthzDeps})
+    const decide = vi.spyOn(registry, 'decide')
+    const deps = makeDeps(registry, {denylistCache: makeDenylistCache(true)})
 
     // #when
     const res = await post(app(deps), 'que_1', {decision: 'skip'})
 
-    // #then the same denial, and GitHub was never asked
+    // #then the same denial, and nothing was settled
     expect(res.status).toBe(404)
     expect(await res.json()).toEqual(NO_ORACLE)
-    expect(repoAuthzDeps.fetch).not.toHaveBeenCalled()
+    expect(decide).not.toHaveBeenCalled()
     expect(effects.replyQuestion).not.toHaveBeenCalled()
   })
 
-  it('denial shapes are identical for read-only, denylisted, and unknown-run', async () => {
-    // #given three denial causes
+  it('malformed owner/repo from the run index → identical 404 with zero binding reads', async () => {
+    // #given a run index entry whose repo is a path-traversal name
     const registry = makeRegistry()
     register(registry, makeEffects())
-    const readOnly = await post(app(makeDeps(registry, {repoAuthzDeps: readOnlyAuthz()})), 'que_1', {decision: 'skip'})
+    const bindingsLookup = makeBindingsLookup()
+    const deps = makeDeps(registry, {runIndex: makeRunIndex({repo: 'acme/..', surface: 'web'}), bindingsLookup})
+
+    // #when
+    const res = await post(app(deps), 'que_1', {decision: 'skip'})
+
+    // #then
+    expect(res.status).toBe(404)
+    expect(await res.json()).toEqual(NO_ORACLE)
+    expect(bindingsLookup.getBindingByRepo).not.toHaveBeenCalled()
+  })
+
+  it('denial shapes are identical for unbound, denylisted, unavailable, and unknown-run', async () => {
+    // #given the denial causes
+    const registry = makeRegistry()
+    register(registry, makeEffects())
+    const unbound = await post(
+      app(makeDeps(registry, {bindingsLookup: makeBindingsLookup({success: true, data: null})})),
+      'que_1',
+      {decision: 'skip'},
+    )
+    const unavailable = await post(
+      app(makeDeps(registry, {bindingsLookup: makeBindingsLookup({success: false, error: new Error('down')})})),
+      'que_1',
+      {decision: 'skip'},
+    )
     const denied = await post(app(makeDeps(registry, {denylistCache: makeDenylistCache(true)})), 'que_1', {
       decision: 'skip',
     })
     const miss = await post(app(makeDeps(registry, {runIndex: makeRunIndex('miss')})), 'que_1', {decision: 'skip'})
 
     // #then the same status and body
-    for (const res of [readOnly, denied, miss]) {
+    for (const res of [unbound, unavailable, denied, miss]) {
       expect(res.status).toBe(404)
       expect(await res.json()).toEqual(NO_ORACLE)
     }
+  })
+
+  it('repo-level denial emits no audit event; the log label is shared and carries no owner/repo/runId', async () => {
+    // #given
+    const registry = makeRegistry()
+    register(registry, makeEffects())
+    const unboundDeps = makeDeps(registry, {bindingsLookup: makeBindingsLookup({success: true, data: null})})
+    const deniedDeps = {
+      ...makeDeps(registry, {denylistCache: makeDenylistCache(true)}),
+      logger: unboundDeps.logger,
+    }
+
+    // #when
+    await post(app(unboundDeps), 'que_1', {decision: 'skip'})
+    await post(app(deniedDeps), 'que_1', {decision: 'skip'})
+
+    // #then
+    expect(unboundDeps.auditLogger.info).not.toHaveBeenCalled()
+    expect(unboundDeps.auditLogger.warn).not.toHaveBeenCalled()
+    expect(deniedDeps.auditLogger.warn).not.toHaveBeenCalled()
+    expect(unboundDeps.logger.warn.mock.calls.map(call => call[0] as unknown)).toEqual([
+      {githubUserId: 1001, gate: 'repo-denied'},
+      {githubUserId: 1001, gate: 'repo-denied'},
+    ])
   })
 
   it('a gate that throws degrades to the same 404', async () => {
@@ -281,11 +327,11 @@ describe('POST question decision — gates and no-oracle denials', () => {
   })
 
   it('a session that vanishes after authz → the same 404, no reply or reject', async () => {
-    // #given a session store whose token resolves but whose session entry is gone
+    // #given a session store whose session entry is gone
     const registry = makeRegistry()
     const effects = makeEffects()
     register(registry, effects)
-    const sessionStore = {...makeSessionStore(), get: vi.fn((_sessionId: string, _nowMs: number) => undefined)}
+    const sessionStore = {...makeSessionStore(), get: vi.fn((_sessionId: string) => undefined)}
     const deps = makeDeps(registry, {sessionStore})
 
     // #when
@@ -621,13 +667,17 @@ describe('POST question decision — settlement states', () => {
     })
     await vi.waitFor(() => expect(effects.replyQuestion).toHaveBeenCalledOnce())
 
-    // #when a read-only operator answers
-    const res = await post(app(makeDeps(registry, {repoAuthzDeps: readOnlyAuthz()})), 'que_1', {
-      decision: 'answer',
-      answers: [{options: [0]}],
-    })
+    // #when an operator answers on an unbound repo
+    const res = await post(
+      app(makeDeps(registry, {bindingsLookup: makeBindingsLookup({success: true, data: null})})),
+      'que_1',
+      {
+        decision: 'answer',
+        answers: [{options: [0]}],
+      },
+    )
 
-    // #then authz refuses first: the claim state is never revealed
+    // #then repo access refuses first: the claim state is never revealed
     expect(res.status).toBe(404)
     expect(await res.json()).toEqual(NO_ORACLE)
 

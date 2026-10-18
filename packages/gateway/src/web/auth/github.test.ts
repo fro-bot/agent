@@ -32,7 +32,8 @@ import type {RateLimiter} from '../../http/rate-limit.js'
 import type {AuditLogger} from '../audit.js'
 import type {RawIngressInput, ResolvedClientAddress} from '../ingress/resolve-client.js'
 import type {GitHubOAuthConfig, GitHubOAuthDeps, OAuthStateStore} from './github.js'
-import type {SessionDeps, SessionStore} from './session.js'
+import type {DurableSessionStore, SessionDeps} from './session.js'
+import type {TestSessionStoreHarness} from './test-session-store.js'
 import {createHash} from 'node:crypto'
 import {createServer} from 'node:http'
 import {serve} from '@hono/node-server'
@@ -45,7 +46,14 @@ import {resolveClient, unsafeResolvedClientAddressForTest} from '../ingress/reso
 import {parseTrustedProxyAddress} from '../ingress/trusted-proxy-address.js'
 import {assertAllPrivilegedRoutesWrapped, isPublicRoute, registerPublicRoute} from '../operator-route.js'
 import {buildGitHubOAuthRoutes, createInMemoryStateStore, validateReturnPath} from './github.js'
-import {createInMemorySessionStore, SESSION_COOKIE_NAME} from './session.js'
+import {buildSessionKey, hashSessionId, signSessionRecord} from './session-persistence.js'
+import {SESSION_COOKIE_MAX_AGE_SECONDS, SESSION_COOKIE_NAME} from './session.js'
+import {
+  createTestSessionStore,
+  createTestSessionStoreHarness,
+  mintTestSession,
+  TEST_SESSION_MAC_KEY,
+} from './test-session-store.js'
 
 /**
  * Build a stub ResolvedClientAddress for test resolveClientAddress stubs. The branded
@@ -2659,7 +2667,7 @@ function makeStubSessionDeps(overrides?: Partial<SessionDeps>): SessionDeps {
 function buildTestAppWithSession(
   deps: GitHubOAuthDeps,
   config: GitHubOAuthConfig,
-  sessionStore: SessionStore,
+  sessionStore: DurableSessionStore,
   sessionDeps: SessionDeps,
 ): Hono {
   const app = new Hono()
@@ -2669,11 +2677,68 @@ function buildTestAppWithSession(
   return app
 }
 
+interface CallbackFixtureOptions {
+  readonly userId?: number
+  readonly login?: string
+  readonly accessToken?: string
+  /** Defaults to a fresh loaded store over its own object-store fake. */
+  readonly harness?: TestSessionStoreHarness
+  /** Session ID sent as the stale cookie. */
+  readonly cookieSessionId?: string
+  readonly logger?: ReturnType<typeof makeLogger>
+}
+
+/** Runs one successful-identity callback against the real durable store. */
+async function runCallback(options: CallbackFixtureOptions = {}) {
+  const harness = options.harness ?? (await createTestSessionStoreHarness())
+  const stateStore = createInMemoryStateStore()
+  const now = Date.now()
+  stateStore.set('valid-state-value', {
+    codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
+    issuedAt: now,
+    consumed: false,
+  })
+  const auditLogger = makeAuditLogger()
+  const fetch = makeSuccessFetch({
+    userId: options.userId ?? 42,
+    login: options.login ?? 'octocat',
+    ...(options.accessToken === undefined ? {} : {accessToken: options.accessToken}),
+  })
+  const logger = options.logger ?? makeLogger()
+  const deps = makeStubDeps({stateStore, clock: () => now + 1000, fetch, auditLogger, logger})
+  const sessionDeps = makeStubSessionDeps({clock: () => now + 1000, logger})
+  const app = buildTestAppWithSession(deps, makeStubConfig(), harness.store, sessionDeps)
+  const res = await app.fetch(
+    new Request(
+      'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
+      options.cookieSessionId === undefined
+        ? undefined
+        : {headers: {cookie: `${SESSION_COOKIE_NAME}=${options.cookieSessionId}`}},
+    ),
+  )
+  return {res, harness, fetch, auditLogger}
+}
+
+/** The session ID the callback set, from its non-clearing session cookie. */
+function mintedSessionId(res: Response): string {
+  const header = res.headers
+    .getSetCookie()
+    .find(h => h.startsWith(`${SESSION_COOKIE_NAME}=`) && h.toLowerCase().includes('max-age=0') === false)
+  const value = header?.split(';')[0]
+  if (value === undefined) throw new Error('expected a minted session cookie')
+  return value.slice(SESSION_COOKIE_NAME.length + 1)
+}
+
+function storedStatus(harness: TestSessionStoreHarness, sessionId: string): string | undefined {
+  const stored = harness.objectStore.objects.get(buildSessionKey(hashSessionId(sessionId)))
+  return stored === undefined ? undefined : (JSON.parse(stored.data) as {status?: string}).status
+}
+
 describe('GET /operator/auth/github/callback — session minting', () => {
   it('mints a fresh session on successful callback and sets __Host- session cookie', async () => {
     // #given
     const stateStore = createInMemoryStateStore()
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
     stateStore.set('valid-state-value', {
       codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
@@ -2711,7 +2776,7 @@ describe('GET /operator/auth/github/callback — session minting', () => {
   it('session cookie has HttpOnly, Secure, SameSite=Lax, Path=/ attributes', async () => {
     // #given
     const stateStore = createInMemoryStateStore()
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
     stateStore.set('valid-state-value', {
       codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
@@ -2747,7 +2812,7 @@ describe('GET /operator/auth/github/callback — session minting', () => {
   it('session cookie does not have Max-Age=0 (not a clear cookie)', async () => {
     // #given
     const stateStore = createInMemoryStateStore()
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
     stateStore.set('valid-state-value', {
       codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
@@ -2776,14 +2841,24 @@ describe('GET /operator/auth/github/callback — session minting', () => {
     expect(sessionCookie.toLowerCase()).not.toContain('max-age=0')
   })
 
+  it('session cookie carries Max-Age=604800 and no token', async () => {
+    // #given a successful callback
+    const {res} = await runCallback({accessToken: 'ghs_COOKIE_CHECK'})
+
+    // #then the set cookie lives the durable lifetime
+    expect(SESSION_COOKIE_MAX_AGE_SECONDS).toBe(604_800)
+    const sessionCookie = res.headers.getSetCookie().find(h => h.startsWith(`${SESSION_COOKIE_NAME}=`)) ?? ''
+    expect(sessionCookie).toContain('Max-Age=604800')
+    expect(sessionCookie).not.toContain('ghs_COOKIE_CHECK')
+  })
+
   it('clears stale pre-auth session cookie before setting the new session cookie', async () => {
     // #given — a stale session already exists in the store
     const stateStore = createInMemoryStateStore()
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
 
-    const staleSessionId = sessionStore.create({githubUserId: 99, login: 'stale'}, '', now)
-    if (staleSessionId === undefined) throw new Error('expected stale session to be created')
+    const staleSessionId = await mintTestSession(sessionStore, {githubUserId: 99, login: 'stale'})
 
     stateStore.set('valid-state-value', {
       codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
@@ -2811,7 +2886,7 @@ describe('GET /operator/auth/github/callback — session minting', () => {
     expect(res.status).toBe(302) // no return_to captured → redirect to default landing path
 
     // #and — stale session is revoked server-side
-    expect(sessionStore.get(staleSessionId, now + 2000)).toBeUndefined()
+    expect(sessionStore.get(staleSessionId)).toBeUndefined()
 
     // #and — a clear-cookie header is emitted for the stale session
     const setCookieHeaders = res.headers.getSetCookie()
@@ -2830,7 +2905,7 @@ describe('GET /operator/auth/github/callback — session minting', () => {
   it('session cookie value is the minted session ID (retrievable from store)', async () => {
     // #given
     const stateStore = createInMemoryStateStore()
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
     stateStore.set('valid-state-value', {
       codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
@@ -2866,7 +2941,7 @@ describe('GET /operator/auth/github/callback — session minting', () => {
     const sessionId = cookieValue.slice(SESSION_COOKIE_NAME.length + 1)
 
     // #and — the session ID is valid in the store
-    const entry = sessionStore.get(sessionId, now + 2000)
+    const entry = sessionStore.get(sessionId)
     expect(entry).toBeDefined()
     expect(entry?.githubUserId).toBe(42)
     expect(entry?.login).toBe('octocat')
@@ -2907,50 +2982,132 @@ describe('GET /operator/auth/github/callback — session minting', () => {
     expect(sessionCookie).toBeUndefined()
   })
 
-  it('returns 503 (service unavailable) when session cap is exhausted after scavenge', async () => {
-    // #given — session store at cap with all live sessions (no expired/revoked to scavenge)
-    const stateStore = createInMemoryStateStore()
-    const now = Date.now()
-    stateStore.set('valid-state-value', {
-      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
-      issuedAt: now,
-      consumed: false,
-    })
+  it.each([
+    ['cap', '60'],
+    ['write_failed', '10'],
+    ['not_ready', '60'],
+  ] as const)(
+    'a %s refusal returns 503 with Retry-After, sets no cookie, and leaves the current session valid',
+    async (outcome, retryAfter) => {
+      // #given a store in the refusing condition, holding a current session where one can exist
+      const harness = await createTestSessionStoreHarness({
+        ...(outcome === 'cap' ? {maxEntries: 1} : {}),
+        ...(outcome === 'not_ready' ? {skipLoad: true} : {}),
+      })
+      const currentId = outcome === 'not_ready' ? undefined : await mintTestSession(harness.store)
+      if (outcome === 'write_failed') {
+        harness.objectStore.failNext('conditionalPut')
+      }
 
-    // Create a session store stub that always returns undefined from create()
-    const fullSessionStore: SessionStore = {
-      create: () => undefined,
-      get: () => undefined,
-      touch: () => undefined,
-      delete: () => undefined,
-      onRevoke: () => undefined,
-      scavenge: () => undefined,
-      size: () => 10_000,
-      getOperatorToken: () => undefined,
-      dropOperatorToken: () => undefined,
-    }
+      // #when the callback runs, carrying the current session's cookie
+      const {res, auditLogger} = await runCallback({
+        harness,
+        ...(currentId === undefined ? {} : {cookieSessionId: currentId}),
+      })
 
-    const deps = makeStubDeps({
-      stateStore,
-      clock: () => now + 1000,
-      fetch: makeSuccessFetch({userId: 42, login: 'octocat'}),
-    })
-    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
-    const config = makeStubConfig()
-    const app = buildTestAppWithSession(deps, config, fullSessionStore, sessionDeps)
+      // #then login is refused with a retry hint, and nothing changed
+      expect(res.status).toBe(503)
+      expect(res.headers.get('retry-after')).toBe(retryAfter)
+      expect(res.headers.getSetCookie()).toEqual([])
+      expect(auditLogger.records.some(r => r.kind === 'auth.callback.success')).toBe(false)
+      const currentLive = currentId === undefined ? undefined : harness.store.get(currentId) !== undefined
+      const currentStatus = currentId === undefined ? undefined : storedStatus(harness, currentId)
+      expect([currentLive, currentStatus]).toEqual(currentId === undefined ? [undefined, undefined] : [true, 'active'])
+    },
+  )
 
-    // #when
-    const req = new Request(
-      'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
+  it('rotates the stale session of the same user without firing the hook', async () => {
+    // #given a live session for user 42 and a store-level hook
+    const hook = vi.fn()
+    const harness = await createTestSessionStoreHarness({onSessionRevoked: hook})
+    const staleId = await mintTestSession(harness.store, {githubUserId: 42, login: 'octocat'})
+
+    // #when user 42 logs in again with the stale cookie
+    const {res} = await runCallback({harness, cookieSessionId: staleId, userId: 42})
+
+    // #then the old session is rotated (stored as rotated) with no hook, and a new one is live
+    expect(res.status).toBe(302)
+    expect(harness.store.get(staleId)).toBeUndefined()
+    expect(storedStatus(harness, staleId)).toBe('rotated')
+    expect(hook).not.toHaveBeenCalled()
+    const newId = mintedSessionId(res)
+    expect(newId).not.toBe(staleId)
+    expect(harness.store.get(newId)?.githubUserId).toBe(42)
+  })
+
+  it('revokes the stale session of a different user and fires the hook once for that user', async () => {
+    // #given a live session for user 99
+    const hook = vi.fn()
+    const harness = await createTestSessionStoreHarness({onSessionRevoked: hook})
+    const staleId = await mintTestSession(harness.store, {githubUserId: 99, login: 'stale'})
+
+    // #when user 42 logs in with that cookie
+    const {res} = await runCallback({harness, cookieSessionId: staleId, userId: 42})
+
+    // #then the old session is revoked durably and the hook fired for user 99
+    expect(res.status).toBe(302)
+    expect(storedStatus(harness, staleId)).toBe('revoked')
+    expect(hook).toHaveBeenCalledExactlyOnceWith(99)
+  })
+
+  it('revokes a stale ID the map does not know by hash, fires no hook, and still logs in', async () => {
+    // #given a stored active record whose ID is not in memory (and an ID with no record at all)
+    const hook = vi.fn()
+    const harness = await createTestSessionStoreHarness({onSessionRevoked: hook})
+    const unknownId = 'k'.repeat(43)
+    harness.objectStore.seed(
+      buildSessionKey(hashSessionId(unknownId)),
+      JSON.stringify(
+        signSessionRecord(TEST_SESSION_MAC_KEY, hashSessionId(unknownId), {
+          githubUserId: 99,
+          login: 'ghost',
+          issuedAt: Date.now(),
+          status: 'active',
+        }),
+      ),
     )
-    const res = await app.fetch(req)
 
-    // #then — 503 Service Unavailable (capacity issue, not a bad request)
+    // #when logins arrive carrying each stale cookie
+    const withRecord = await runCallback({harness, cookieSessionId: unknownId})
+    const withoutRecord = await runCallback({harness, cookieSessionId: 'z'.repeat(43)})
+
+    // #then both succeed, the stored record is retired without a hook
+    expect(withRecord.res.status).toBe(302)
+    expect(withoutRecord.res.status).toBe(302)
+    expect(storedStatus(harness, unknownId)).toBe('rotated')
+    expect(hook).not.toHaveBeenCalled()
+  })
+
+  it('refuses login with 503, discards the new session without a hook, and keeps the old one when rotation fails', async () => {
+    // #given a live session whose revoke write will fail, while the create of the new session succeeds
+    const hook = vi.fn()
+    const harness = await createTestSessionStoreHarness({onSessionRevoked: hook})
+    const staleId = await mintTestSession(harness.store, {githubUserId: 42, login: 'octocat'})
+    const staleKey = buildSessionKey(hashSessionId(staleId))
+    harness.objectStore.failNext('conditionalPut', {match: key => key === staleKey})
+
+    // #when the same user logs in with the stale cookie
+    const {res, auditLogger} = await runCallback({harness, cookieSessionId: staleId, userId: 42})
+
+    // #then login is refused, no cookie is set, the old session stays valid, and no hook fired
     expect(res.status).toBe(503)
+    expect(res.headers.get('retry-after')).not.toBeNull()
+    expect(res.headers.getSetCookie()).toEqual([])
+    expect(harness.store.get(staleId)).toBeDefined()
+    expect(storedStatus(harness, staleId)).toBe('active')
+    expect(hook).not.toHaveBeenCalled()
+    expect(auditLogger.records.some(r => r.kind === 'auth.callback.success')).toBe(false)
+
+    // #and the discarded new session was written off as rotated, not left active
+    const others = [...harness.objectStore.objects.entries()].filter(([key]) => key !== staleKey)
+    expect(others).toHaveLength(1)
+    expect((JSON.parse(others[0]?.[1].data ?? '{}') as {status?: string}).status).toBe('rotated')
   })
 
-  it('503 response on session cap exhaustion includes Retry-After header', async () => {
-    // #given — session store that always returns undefined from create()
+  it('a failed GET /user returns 400 and writes nothing', async () => {
+    // #given a user fetch that fails
+    const harness = await createTestSessionStoreHarness()
+    harness.objectStore.resetCalls()
     const stateStore = createInMemoryStateStore()
     const now = Date.now()
     stateStore.set('valid-state-value', {
@@ -2958,416 +3115,144 @@ describe('GET /operator/auth/github/callback — session minting', () => {
       issuedAt: now,
       consumed: false,
     })
-
-    const fullSessionStore: SessionStore = {
-      create: () => undefined,
-      get: () => undefined,
-      touch: () => undefined,
-      delete: () => undefined,
-      onRevoke: () => undefined,
-      scavenge: () => undefined,
-      size: () => 10_000,
-      getOperatorToken: () => undefined,
-      dropOperatorToken: () => undefined,
-    }
-
-    const deps = makeStubDeps({
-      stateStore,
-      clock: () => now + 1000,
-      fetch: makeSuccessFetch({userId: 42, login: 'octocat'}),
+    const failingFetch: GitHubOAuthDeps['fetch'] = vi.fn(async (url: string | URL | Request) => {
+      const urlStr = typeof url === 'string' ? url : url instanceof URL ? url.toString() : url.url
+      if (urlStr.includes('login/oauth/access_token')) {
+        return new Response(JSON.stringify({access_token: 'ghs_TOKEN', token_type: 'bearer'}), {status: 200})
+      }
+      return new Response('boom', {status: 500})
     })
-    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
-    const config = makeStubConfig()
-    const app = buildTestAppWithSession(deps, config, fullSessionStore, sessionDeps)
+    const deps = makeStubDeps({stateStore, clock: () => now + 1000, fetch: failingFetch})
+    const app = buildTestAppWithSession(
+      deps,
+      makeStubConfig(),
+      harness.store,
+      makeStubSessionDeps({clock: () => now + 1000}),
+    )
 
     // #when
-    const req = new Request(
-      'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
+    const res = await app.fetch(
+      new Request(
+        'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
+      ),
     )
-    const res = await app.fetch(req)
 
-    // #then — Retry-After header is present
-    expect(res.headers.get('retry-after')).toBe('60')
-  })
-
-  it('does NOT emit auth.callback.success when session cap is exhausted (503 path)', async () => {
-    // #given — session store that always returns undefined from create()
-    const stateStore = createInMemoryStateStore()
-    const now = Date.now()
-    stateStore.set('valid-state-value', {
-      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
-      issuedAt: now,
-      consumed: false,
-    })
-
-    const fullSessionStore: SessionStore = {
-      create: () => undefined,
-      get: () => undefined,
-      touch: () => undefined,
-      delete: () => undefined,
-      onRevoke: () => undefined,
-      scavenge: () => undefined,
-      size: () => 10_000,
-      getOperatorToken: () => undefined,
-      dropOperatorToken: () => undefined,
-    }
-
-    const auditLogger = makeAuditLogger()
-    const deps = makeStubDeps({
-      stateStore,
-      clock: () => now + 1000,
-      fetch: makeSuccessFetch({userId: 42, login: 'octocat'}),
-      auditLogger,
-    })
-    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
-    const config = makeStubConfig()
-    const app = buildTestAppWithSession(deps, config, fullSessionStore, sessionDeps)
-
-    // #when
-    const req = new Request(
-      'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
-    )
-    const res = await app.fetch(req)
-
-    // #then — 503 (capacity issue)
-    expect(res.status).toBe(503)
-
-    // #and — auth.callback.success must NOT have been emitted
-    const successEvent = auditLogger.records.find(r => r.kind === 'auth.callback.success')
-    expect(successEvent).toBeUndefined()
-  })
-
-  it('stale-session revocation hook fires during OAuth callback replacement', async () => {
-    // #given — a stale session with a revocation hook registered
-    const stateStore = createInMemoryStateStore()
-    const sessionStore = createInMemorySessionStore()
-    const now = Date.now()
-
-    const staleSessionId = sessionStore.create({githubUserId: 99, login: 'stale'}, '', now)
-    if (staleSessionId === undefined) throw new Error('expected stale session to be created')
-
-    // Register a revocation hook on the stale session
-    const revocationHook = vi.fn()
-    sessionStore.onRevoke(staleSessionId, revocationHook)
-
-    stateStore.set('valid-state-value', {
-      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
-      issuedAt: now,
-      consumed: false,
-    })
-
-    const deps = makeStubDeps({
-      stateStore,
-      clock: () => now + 1000,
-      fetch: makeSuccessFetch({userId: 42, login: 'octocat'}),
-    })
-    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
-    const config = makeStubConfig()
-    const app = buildTestAppWithSession(deps, config, sessionStore, sessionDeps)
-
-    // #when — callback with stale session cookie in request
-    const req = new Request(
-      'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
-      {headers: {cookie: `${SESSION_COOKIE_NAME}=${staleSessionId}`}},
-    )
-    await app.fetch(req)
-
-    // #then — revocation hook was called (stale session was deleted)
-    expect(revocationHook).toHaveBeenCalledExactlyOnceWith(staleSessionId)
+    // #then
+    expect(res.status).toBe(400)
+    expect(harness.objectStore.callCount('conditionalPut')).toBe(0)
+    expect(harness.store.size()).toBe(0)
   })
 })
 
 // ---------------------------------------------------------------------------
-// OAuth callback — onSessionRevoke wiring (operator push deactivation)
+// OAuth callback — store-level revoke hook (operator push deactivation)
 // ---------------------------------------------------------------------------
 
-describe('GET /operator/auth/github/callback — onSessionRevoke wiring', () => {
-  it('registers onSessionRevoke closed over githubUserId, fired on later session revocation', async () => {
-    // #given — deps carry onSessionRevoke; a session is minted via a successful callback
-    const stateStore = createInMemoryStateStore()
-    const sessionStore = createInMemorySessionStore()
-    const now = Date.now()
-    stateStore.set('valid-state-value', {
-      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
-      issuedAt: now,
-      consumed: false,
-    })
+describe('GET /operator/auth/github/callback — store-level revoke hook', () => {
+  it('fires the store hook with the user ID when a minted session is later revoked', async () => {
+    // #given a session minted through a successful callback
+    const hook = vi.fn()
+    const harness = await createTestSessionStoreHarness({onSessionRevoked: hook})
+    const {res} = await runCallback({harness, userId: 4242, login: 'pushuser'})
+    const sessionId = mintedSessionId(res)
+    expect(hook).not.toHaveBeenCalled()
 
-    const onSessionRevoke = vi.fn()
-    const deps = makeStubDeps({
-      stateStore,
-      clock: () => now + 1000,
-      fetch: makeSuccessFetch({userId: 4242, login: 'pushuser'}),
-      onSessionRevoke,
-    })
-    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
-    const config = makeStubConfig()
-    const app = buildTestAppWithSession(deps, config, sessionStore, sessionDeps)
+    // #when the session is revoked (logout)
+    const revoked = await harness.store.revoke(sessionId)
 
-    // #when — the callback mints a session, then the session is later revoked (logout)
-    const req = new Request(
-      'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
-    )
-    const res = await app.fetch(req)
-    const setCookie = res.headers.get('set-cookie') ?? ''
-    const match = /__Host-session=([^;]+)/.exec(setCookie)
-    const sessionId = match?.[1]
-    if (sessionId === undefined) throw new Error('expected a minted session cookie')
-
-    expect(onSessionRevoke).not.toHaveBeenCalled()
-    sessionStore.delete(sessionId)
-
-    // #then — the hook fired with the githubUserId captured at session-creation time
-    expect(onSessionRevoke).toHaveBeenCalledExactlyOnceWith(4242)
+    // #then the hook fired with the user ID captured at creation
+    expect(revoked).toEqual({outcome: 'ok'})
+    expect(hook).toHaveBeenCalledExactlyOnceWith(4242)
   })
 
-  it('does not break session revocation when onSessionRevoke throws', async () => {
-    // #given — onSessionRevoke is wired to a throwing callback
-    const stateStore = createInMemoryStateStore()
-    const sessionStore = createInMemorySessionStore()
-    const now = Date.now()
-    stateStore.set('valid-state-value', {
-      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
-      issuedAt: now,
-      consumed: false,
-    })
-
-    const throwingOnSessionRevoke = vi.fn(() => {
+  it('does not break revocation when the hook throws', async () => {
+    // #given a throwing hook
+    const hook = vi.fn(() => {
       throw new Error('deactivateForOperator boom')
     })
-    const deps = makeStubDeps({
-      stateStore,
-      clock: () => now + 1000,
-      fetch: makeSuccessFetch({userId: 55, login: 'boomuser'}),
-      onSessionRevoke: throwingOnSessionRevoke,
-    })
-    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
-    const config = makeStubConfig()
-    const app = buildTestAppWithSession(deps, config, sessionStore, sessionDeps)
+    const harness = await createTestSessionStoreHarness({onSessionRevoked: hook})
+    const {res} = await runCallback({harness, userId: 55, login: 'boomuser'})
+    const sessionId = mintedSessionId(res)
 
-    const req = new Request(
-      'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
-    )
-    const res = await app.fetch(req)
-    const setCookie = res.headers.get('set-cookie') ?? ''
-    const match = /__Host-session=([^;]+)/.exec(setCookie)
-    const sessionId = match?.[1]
-    if (sessionId === undefined) throw new Error('expected a minted session cookie')
+    // #when the session is revoked
+    const revoked = await harness.store.revoke(sessionId)
 
-    // #then — delete() does not throw despite the hook throwing (session.ts swallows hook errors)
-    expect(() => sessionStore.delete(sessionId)).not.toThrow()
-    expect(throwingOnSessionRevoke).toHaveBeenCalledExactlyOnceWith(55)
+    // #then the revoke stands
+    expect(revoked).toEqual({outcome: 'ok'})
+    expect(harness.store.get(sessionId)).toBeUndefined()
+    expect(hook).toHaveBeenCalledExactlyOnceWith(55)
   })
 })
 
 // ---------------------------------------------------------------------------
-// OAuth callback — OAuth token retention in session
+// OAuth callback — the OAuth token is used for GET /user only
 // ---------------------------------------------------------------------------
 
-describe('GET /operator/auth/github/callback — OAuth token retention', () => {
-  it('getOperatorToken returns the access token after a successful OAuth callback', async () => {
-    // #given
-    const stateStore = createInMemoryStateStore()
-    const sessionStore = createInMemorySessionStore()
-    const now = Date.now()
-    const accessToken = 'ghs_RETAINED_TOKEN'
-    stateStore.set('valid-state-value', {
-      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
-      issuedAt: now,
-      consumed: false,
-    })
+describe('GET /operator/auth/github/callback — OAuth token handling', () => {
+  it('sends the token only on GET /user, passes the store identity only, and persists no token', async () => {
+    // #given a store whose create is observed
+    const accessToken = 'ghs_USER_FETCH_ONLY'
+    const harness = await createTestSessionStoreHarness()
+    const createSpy = vi.spyOn(harness.store, 'create')
 
-    const deps = makeStubDeps({
-      stateStore,
-      clock: () => now + 1000,
-      fetch: makeSuccessFetch({userId: 42, login: 'octocat', accessToken}),
-    })
-    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
-    const config = makeStubConfig()
-    const app = buildTestAppWithSession(deps, config, sessionStore, sessionDeps)
+    // #when the callback succeeds
+    const {res, fetch} = await runCallback({harness, accessToken})
+    expect(res.status).toBe(302)
 
-    // #when
-    const req = new Request(
-      'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
-    )
-    const res = await app.fetch(req)
-    expect(res.status).toBe(302) // no return_to captured → redirect to default landing path
+    // #then the token appears in exactly one request: the GET /user authorization header
+    const calls = vi.mocked(fetch).mock.calls
+    const carrying = calls.filter(([, init]) => JSON.stringify(init?.headers ?? {}).includes(accessToken))
+    expect(carrying).toHaveLength(1)
+    const [carryingUrl] = carrying[0] ?? []
+    expect(String(carryingUrl)).toBe('https://api.github.com/user')
 
-    // #then — extract session ID from cookie and verify token is retained
-    const setCookieHeaders = res.headers.getSetCookie()
-    const sessionCookieHeader = setCookieHeaders.find(
-      h => h.startsWith(`${SESSION_COOKIE_NAME}=`) && !h.toLowerCase().includes('max-age=0'),
-    )
-    if (sessionCookieHeader === undefined) throw new Error('expected session cookie to be set')
-    const cookieValue = sessionCookieHeader.split(';')[0]
-    if (cookieValue === undefined) throw new Error('expected cookie value')
-    const sessionId = cookieValue.slice(SESSION_COOKIE_NAME.length + 1)
-
-    // #and — getOperatorToken returns the access token
-    expect(sessionStore.getOperatorToken(sessionId, now + 2000)).toBe(accessToken)
+    // #and the store received identity only, and nothing persisted holds the token
+    expect(createSpy).toHaveBeenCalledExactlyOnceWith({githubUserId: 42, login: 'octocat'})
+    for (const stored of harness.objectStore.objects.values()) {
+      expect(stored.data).not.toContain(accessToken)
+    }
   })
 
   it('access token is NOT present in the session cookie value', async () => {
-    // #given — security: token must never appear in the cookie
-    const stateStore = createInMemoryStateStore()
-    const sessionStore = createInMemorySessionStore()
-    const now = Date.now()
+    // #given
     const accessToken = 'ghs_NEVER_IN_COOKIE'
-    stateStore.set('valid-state-value', {
-      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
-      issuedAt: now,
-      consumed: false,
-    })
-
-    const deps = makeStubDeps({
-      stateStore,
-      clock: () => now + 1000,
-      fetch: makeSuccessFetch({userId: 42, login: 'octocat', accessToken}),
-    })
-    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
-    const config = makeStubConfig()
-    const app = buildTestAppWithSession(deps, config, sessionStore, sessionDeps)
 
     // #when
-    const req = new Request(
-      'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
-    )
-    const res = await app.fetch(req)
+    const {res} = await runCallback({accessToken})
 
-    // #then — token is NOT in any Set-Cookie header
-    const setCookieHeaders = res.headers.getSetCookie()
-    for (const header of setCookieHeaders) {
+    // #then token is NOT in any Set-Cookie header
+    for (const header of res.headers.getSetCookie()) {
       expect(header).not.toContain(accessToken)
     }
   })
 
   it('access token is NOT present in the response body', async () => {
-    // #given — security: token must never appear in any operator-facing response
-    const stateStore = createInMemoryStateStore()
-    const sessionStore = createInMemorySessionStore()
-    const now = Date.now()
+    // #given
     const accessToken = 'ghs_NEVER_IN_BODY'
-    stateStore.set('valid-state-value', {
-      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
-      issuedAt: now,
-      consumed: false,
-    })
-
-    const deps = makeStubDeps({
-      stateStore,
-      clock: () => now + 1000,
-      fetch: makeSuccessFetch({userId: 42, login: 'octocat', accessToken}),
-    })
-    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
-    const config = makeStubConfig()
-    const app = buildTestAppWithSession(deps, config, sessionStore, sessionDeps)
 
     // #when
-    const req = new Request(
-      'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
-    )
-    const res = await app.fetch(req)
-    const body = await res.text()
+    const {res} = await runCallback({accessToken})
 
-    // #then — token is NOT in the response body
-    expect(body).not.toContain(accessToken)
+    // #then
+    expect(await res.text()).not.toContain(accessToken)
   })
 
-  it('access token is NOT present in any log message during the callback (no-oracle)', async () => {
+  it('access token is NOT present in any log message or context during the callback (no-oracle)', async () => {
     // #given — capture all logger calls
-    const logMessages: string[] = []
-    const capturingLogger = {
-      debug: vi.fn((_ctx: Record<string, unknown>, msg: string) => {
-        logMessages.push(msg)
-      }),
-      info: vi.fn((_ctx: Record<string, unknown>, msg: string) => {
-        logMessages.push(msg)
-      }),
-      warn: vi.fn((_ctx: Record<string, unknown>, msg: string) => {
-        logMessages.push(msg)
-      }),
-      error: vi.fn((_ctx: Record<string, unknown>, msg: string) => {
-        logMessages.push(msg)
-      }),
-    }
-
-    const stateStore = createInMemoryStateStore()
-    const sessionStore = createInMemorySessionStore()
-    const now = Date.now()
+    const logger = makeLogger()
     const accessToken = 'ghs_NEVERLOG_TOKEN'
-    stateStore.set('valid-state-value', {
-      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
-      issuedAt: now,
-      consumed: false,
-    })
-
-    const deps = makeStubDeps({
-      stateStore,
-      clock: () => now + 1000,
-      fetch: makeSuccessFetch({userId: 42, login: 'octocat', accessToken}),
-      logger: capturingLogger,
-    })
-    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000, logger: capturingLogger})
-    const config = makeStubConfig()
-    const app = buildTestAppWithSession(deps, config, sessionStore, sessionDeps)
 
     // #when
-    const req = new Request(
-      'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
-    )
-    await app.fetch(req)
+    await runCallback({accessToken, logger})
 
-    // #then — token never appears in any log message
-    for (const msg of logMessages) {
-      expect(msg).not.toContain(accessToken)
-    }
-  })
-
-  it('getOperatorToken returns undefined after logout (token dropped with session)', async () => {
-    // #given — complete a successful OAuth callback
-    const stateStore = createInMemoryStateStore()
-    const sessionStore = createInMemorySessionStore()
-    const now = Date.now()
-    const accessToken = 'ghs_LOGOUT_TOKEN'
-    stateStore.set('valid-state-value', {
-      codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
-      issuedAt: now,
-      consumed: false,
-    })
-
-    const deps = makeStubDeps({
-      stateStore,
-      clock: () => now + 1000,
-      fetch: makeSuccessFetch({userId: 42, login: 'octocat', accessToken}),
-    })
-    const sessionDeps = makeStubSessionDeps({clock: () => now + 1000})
-    const config = makeStubConfig()
-    const app = buildTestAppWithSession(deps, config, sessionStore, sessionDeps)
-
-    const req = new Request(
-      'https://operator.example.com/operator/auth/github/callback?code=github-code-abc&state=valid-state-value',
-    )
-    const res = await app.fetch(req)
-    expect(res.status).toBe(302) // no return_to captured → redirect to default landing path
-
-    // Extract session ID
-    const setCookieHeaders = res.headers.getSetCookie()
-    const sessionCookieHeader = setCookieHeaders.find(
-      h => h.startsWith(`${SESSION_COOKIE_NAME}=`) && !h.toLowerCase().includes('max-age=0'),
-    )
-    if (sessionCookieHeader === undefined) throw new Error('expected session cookie to be set')
-    const cookieValue = sessionCookieHeader.split(';')[0]
-    if (cookieValue === undefined) throw new Error('expected cookie value')
-    const sessionId = cookieValue.slice(SESSION_COOKIE_NAME.length + 1)
-
-    // Verify token is retained
-    expect(sessionStore.getOperatorToken(sessionId, now + 2000)).toBe(accessToken)
-
-    // #when — logout (revoke the session)
-    sessionStore.delete(sessionId)
-
-    // #then — token is gone
-    expect(sessionStore.getOperatorToken(sessionId, now + 3000)).toBeUndefined()
+    // #then token never appears in any log message or context
+    const emitted = JSON.stringify([
+      ...logger.debug.mock.calls,
+      ...logger.info.mock.calls,
+      ...logger.warn.mock.calls,
+      ...logger.error.mock.calls,
+    ])
+    expect(emitted).not.toContain(accessToken)
   })
 })
 
@@ -3379,7 +3264,7 @@ describe('GET /operator/auth/github/callback — return_to redirect after sessio
   it('redirects to allowlisted return_to path (302) with Set-Cookie on session-minted success', async () => {
     // #given — state has a redirectTarget that is in the allowlist
     const stateStore = createInMemoryStateStore()
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
     stateStore.set('valid-state-value', {
       codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
@@ -3419,7 +3304,7 @@ describe('GET /operator/auth/github/callback — return_to redirect after sessio
   it('redirects (302) to the default landing path when state has no redirectTarget (no return_to)', async () => {
     // #given — state has no redirectTarget (e.g. /operator/auth/github/start opened directly)
     const stateStore = createInMemoryStateStore()
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
     stateStore.set('valid-state-value', {
       codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
@@ -3456,7 +3341,7 @@ describe('GET /operator/auth/github/callback — return_to redirect after sessio
   it('a captured return_to wins over the default landing path', async () => {
     // #given — captured target is the SECOND allowed path, so it differs from the default (first entry)
     const stateStore = createInMemoryStateStore()
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
     stateStore.set('valid-state-value', {
       codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
@@ -3495,7 +3380,7 @@ describe('GET /operator/auth/github/callback — return_to redirect after sessio
     async (_label, allowedReturnPaths) => {
       // #given — the FIRST allowedReturnPaths entry (the default) is unsafe, even though it is "in the list"
       const stateStore = createInMemoryStateStore()
-      const sessionStore = createInMemorySessionStore()
+      const sessionStore = await createTestSessionStore()
       const now = Date.now()
       stateStore.set('valid-state-value', {
         codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
@@ -3530,7 +3415,7 @@ describe('GET /operator/auth/github/callback — return_to redirect after sessio
   it('falls back to identity JSON (no redirect) when allowedReturnPaths is empty', async () => {
     // #given — nothing to validate a default against
     const stateStore = createInMemoryStateStore()
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
     stateStore.set('valid-state-value', {
       codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
@@ -3562,7 +3447,7 @@ describe('GET /operator/auth/github/callback — return_to redirect after sessio
 
   it('end-to-end: /start with no return_to then /callback lands on the default path', async () => {
     // #given — real start handler mints the state (no return_to), real callback consumes it
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const deps = makeStubDeps({fetch: makeSuccessFetch({userId: 42, login: 'octocat'})})
     const sessionDeps = makeStubSessionDeps()
     const app = buildTestAppWithSession(deps, makeStubConfig(), sessionStore, sessionDeps)
@@ -3581,7 +3466,7 @@ describe('GET /operator/auth/github/callback — return_to redirect after sessio
   it('redirects to the default landing path when redirectTarget is NOT in allowedReturnPaths (security: no unvalidated redirect)', async () => {
     // #given — state has a redirectTarget that is NOT in the allowlist
     const stateStore = createInMemoryStateStore()
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
     stateStore.set('valid-state-value', {
       codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
@@ -3616,7 +3501,7 @@ describe('GET /operator/auth/github/callback — return_to redirect after sessio
   it('redirects to the default landing path when redirectTarget is an absolute URL (cross-origin attempt)', async () => {
     // #given — state has an absolute URL as redirectTarget (should be rejected by validateReturnPath)
     const stateStore = createInMemoryStateStore()
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
     stateStore.set('valid-state-value', {
       codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
@@ -3687,7 +3572,7 @@ describe('GET /operator/auth/github/callback — return_to redirect after sessio
 function buildTestAppWithSessionAndAllowlist(
   deps: GitHubOAuthDeps,
   config: GitHubOAuthConfig,
-  sessionStore: SessionStore,
+  sessionStore: DurableSessionStore,
   sessionDeps: SessionDeps,
   allowlist: import('./allowlist.js').OperatorAllowlist,
 ): Hono {
@@ -3702,7 +3587,9 @@ describe('GET /operator/auth/github/callback — allowlist check before session 
   it('returns 403 and does not mint a session when user is not in allowlist', async () => {
     // #given — allowlist only contains user 99, callback returns user 42
     const stateStore = createInMemoryStateStore()
-    const sessionStore = createInMemorySessionStore()
+    const harness = await createTestSessionStoreHarness()
+    const sessionStore = harness.store
+    harness.objectStore.resetCalls()
     const now = Date.now()
     stateStore.set('valid-state-value', {
       codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
@@ -3733,14 +3620,15 @@ describe('GET /operator/auth/github/callback — allowlist check before session 
     // #then — 403 Forbidden (not allowlisted)
     expect(res.status).toBe(403)
 
-    // #and — no session was created
+    // #and — no session was created and nothing was written
     expect(sessionStore.size()).toBe(0)
+    expect(harness.objectStore.callCount('conditionalPut')).toBe(0)
   })
 
   it('does not set a session cookie when user is not in allowlist', async () => {
     // #given — allowlist only contains user 99, callback returns user 42
     const stateStore = createInMemoryStateStore()
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
     stateStore.set('valid-state-value', {
       codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
@@ -3777,7 +3665,7 @@ describe('GET /operator/auth/github/callback — allowlist check before session 
   it('emits auth.callback.failure with reason not_allowlisted when user is not in allowlist', async () => {
     // #given — allowlist only contains user 99, callback returns user 42
     const stateStore = createInMemoryStateStore()
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
     stateStore.set('valid-state-value', {
       codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
@@ -3816,7 +3704,7 @@ describe('GET /operator/auth/github/callback — allowlist check before session 
   it('allows session creation when user IS in allowlist', async () => {
     // #given — allowlist contains user 42, callback returns user 42
     const stateStore = createInMemoryStateStore()
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
     stateStore.set('valid-state-value', {
       codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
@@ -3948,7 +3836,7 @@ describe('GET /operator/auth/github/callback — backslash open-redirect hardeni
   it('falls back to identity JSON (no Location) when the first allowed default is a backslash path', async () => {
     // #given — the default (first entry) is /\evil.example/landing, no return_to captured
     const stateStore = createInMemoryStateStore()
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
     stateStore.set('valid-state-value', {
       codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',
@@ -3982,7 +3870,7 @@ describe('GET /operator/auth/github/callback — backslash open-redirect hardeni
   it('rejects an explicit allowlisted backslash return_to and lands on the default /operator', async () => {
     // #given — captured redirectTarget is the (allowlisted) backslash path; default is /operator
     const stateStore = createInMemoryStateStore()
-    const sessionStore = createInMemorySessionStore()
+    const sessionStore = await createTestSessionStore()
     const now = Date.now()
     stateStore.set('valid-state-value', {
       codeVerifier: 'test-verifier-32-bytes-long-enough-for-pkce',

@@ -40,11 +40,9 @@ import type {BindingsLookup} from '../redaction/surface-gate.js'
 import type {AuditLogger} from './audit.js'
 import type {OperatorAllowlist} from './auth/allowlist.js'
 import type {GitHubOAuthConfig, GitHubOAuthDeps} from './auth/github.js'
-import type {RepoAuthzCache} from './auth/repo-authz.js'
-import type {SessionDeps, SessionStore} from './auth/session.js'
+import type {DurableSessionStore, SessionDeps} from './auth/session.js'
 import type {OperatorIngressPolicy} from './ingress/policy.js'
 import type {PushHealthStatus} from './operator-push/push-health.js'
-import type {SubscriptionRouteSessionStore} from './operator-push/subscription-route.js'
 import type {OperatorPushSubscriptionStore} from './operator-push/subscription-store.js'
 import type {VapidPublicKeyInfo} from './operator-push/vapid.js'
 import type {IdempotencyGuard} from './operator/idempotency.js'
@@ -58,7 +56,6 @@ import {OPERATOR_CONTRACT_VERSION} from '../operator-contract/index.js'
 import {buildCsrfRoute} from './auth/csrf-route.js'
 import {applyBrowserGuard} from './auth/csrf.js'
 import {buildGitHubOAuthRoutes} from './auth/github.js'
-import {createRepoAuthzCache} from './auth/repo-authz.js'
 import {buildSessionInfoRoute} from './auth/session-info-route.js'
 import {buildLogoutRoutes} from './auth/session.js'
 import {canonicalAddressToString, parseCanonicalAddress} from './ingress/canonical-address.js'
@@ -161,10 +158,11 @@ export interface OperatorServerDeps {
    */
   readonly githubOAuth?: GitHubOAuthDeps
   /**
-   * Optional session store for the logout route.
-   * When present (alongside sessionDeps), POST /operator/auth/logout is registered.
+   * Optional durable session store. Built and loaded by program.ts before the server starts: the browser
+   * guard and every route read sessions from its in-memory map, and the OAuth callback and logout write
+   * through it. When present (alongside sessionDeps), POST /operator/auth/logout is registered.
    */
-  readonly sessionStore?: SessionStore
+  readonly sessionStore?: DurableSessionStore
   /**
    * Session deps (logger, auditLogger, clock) for the logout route.
    * Required when sessionStore is present; ignored otherwise.
@@ -214,13 +212,6 @@ export interface OperatorServerDeps {
    * that don't exercise the run-stream route.
    */
   readonly runIndex?: Pick<RunIndex, 'lookup' | 'register' | 'listRunsForRepo'> & Partial<Pick<RunIndex, 'readRun'>>
-  /**
-   * Shared repo-authz cache for the run-stream route's checkRepoAuthz calls.
-   * When absent, a fresh in-memory cache is created per buildOperatorApp call.
-   * Pass a shared instance in production so positive/negative results are reused
-   * across requests and the GitHub API is not called redundantly.
-   */
-  readonly repoAuthzCache?: RepoAuthzCache
   /**
    * Binding store list function for the repos route.
    * When present (alongside the browser guard and denylistCache), GET /operator/repos
@@ -416,6 +407,7 @@ function isTrustedPeer(socketAddress: string | undefined, policy: OperatorIngres
  * conditionally when their deps are present:
  *   - GitHub OAuth (start + callback): when deps.githubOAuth + config.githubOAuth are set
  *   - POST /operator/auth/logout: when sessionStore + sessionDeps + browser guard deps are set
+ *     (durable-first: 200 only after the revoke is stored, 503 and a still-valid session otherwise)
  *   - GET /operator/session/csrf: when browser guard deps are set
  *   - GET /operator/session: when browser guard deps are set
  *   - GET /operator/repos: when browser guard + sessionStore + denylistCache + listBindings are set
@@ -765,16 +757,15 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   //
   // Gate ordering (all must pass before any byte is written):
   //   1. Guard (browser/session/allowlist/CSRF) — installed above
-  //   2. Session token resolution
-  //   3. RunIndex.lookup (server-owned repo resolution)
-  //   4. Denylist check (pre-subscribe redaction, fail-closed)
-  //   5. checkRepoAuthz (allowlist + GitHub repo access)
-  //   6. Per-operator stream slot acquisition
-  //   7. SSE stream open → first snapshot/reset frame
+  //   2. RunIndex.lookup (server-owned repo resolution)
+  //   3. resolveRepoAccess (bound AND not denylisted, one binding read; fail-closed)
+  //   4. Per-operator stream slot acquisition
+  //   5. SSE stream open → first snapshot/reset frame
   //
-  // Every failure at steps 2–5 returns the identical generic not-found shape.
-  // There is NO authorized non-stream response — a distinguishable success would
-  // be a run-resolved/authorized oracle.
+  // Every failure at steps 2–3 returns the identical generic not-found shape. There is NO
+  // authorized non-stream response — a distinguishable success would be a run-resolved/authorized
+  // oracle. The live stream's lease re-checks session, allowlist and repo access every tick, so it
+  // takes the allowlist and audit logger too (omitting either leaves the route unmounted).
   if (
     browserGuardDeps !== undefined &&
     deps.sessionStore !== undefined &&
@@ -785,25 +776,16 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
     deps.allowlist !== undefined &&
     deps.auditLogger !== undefined
   ) {
-    const clock = deps.sessionDeps?.clock ?? (() => Date.now())
     buildRunStreamRoute(app, {
       sessionStore: deps.sessionStore,
       runIndex: deps.runIndex,
       ...(deps.runIndex.readRun === undefined ? {} : {readRunState: deps.runIndex.readRun.bind(deps.runIndex)}),
       denylistCache: deps.denylistCache,
       bindingsLookup: deps.bindingsLookup,
-      repoAuthzDeps: {
-        allowlist: deps.allowlist,
-        fetch: globalThis.fetch,
-        clock,
-        random: Math.random.bind(Math),
-        auditLogger: deps.auditLogger,
-        logger: deps.logger,
-        cache: deps.repoAuthzCache ?? createRepoAuthzCache(),
-      },
+      allowlist: deps.allowlist,
+      auditLogger: deps.auditLogger,
       manager: deps.runObservationManager,
       logger: deps.logger,
-      now: clock,
     })
   }
 
@@ -812,15 +794,13 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   // Registered only when the full browser guard is present AND listBindings,
   // denylistCache, and sessionStore are provided.
   // Route: GET /operator/repos — privileged (requires session + allowlist).
-  // Returns the set of bound repos the operator is authorized to launch work in.
+  // Returns the set of bound, non-denylisted repos the operator can launch work in.
   //
   // Gate ordering:
   //   1. Guard (browser/session/allowlist) — installed above
-  //   2. Session token resolution
-  //   3. listBindings() — enumerate all bound repos
-  //   4. filterDeniedRecords() — drop denylisted repos BEFORE any authz call
-  //   5. checkRepoAuthz() per surviving binding — keep only authorized repos
-  //   6. Cap at MAX_REPOS_PER_LISTING; map to RepoSummary[]; return 200
+  //   2. listBindings() — enumerate all bound repos
+  //   3. filterDeniedRecords() — drop denylisted repos
+  //   4. Cap at MAX_REPOS_PER_LISTING; map to RepoSummary[]; return 200
   if (
     browserGuardDeps !== undefined &&
     deps.sessionStore !== undefined &&
@@ -831,18 +811,8 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   ) {
     const clock = deps.sessionDeps?.clock ?? (() => Date.now())
     buildReposRoute(app, {
-      sessionStore: deps.sessionStore,
       listBindings: deps.listBindings,
       isRepoDenied: deps.denylistCache.isRepoDenied.bind(deps.denylistCache),
-      repoAuthzDeps: {
-        allowlist: deps.allowlist,
-        fetch: globalThis.fetch,
-        clock,
-        random: Math.random.bind(Math),
-        auditLogger: deps.auditLogger,
-        logger: deps.logger,
-        cache: deps.repoAuthzCache ?? createRepoAuthzCache(),
-      },
       logger: deps.logger,
       now: clock,
     })
@@ -855,20 +825,18 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   // are provided (the registries feed the waiting overlay).
   // Route: GET /operator/runs — privileged (requires session + allowlist).
   // Returns a bounded, repo-scoped, newest-first list of run summaries for all
-  // repositories the operator is authorized to access.
+  // bound, non-denylisted repositories.
   //
   // Gate ordering:
   //   1. Guard (browser/session/allowlist) — installed above
   //   2. Operator rate limit (20/min, operator-keyed) — before binding enumeration
-  //   3. Session token resolution
-  //   4. listBindings() — enumerate all bound repos
-  //   5. filterDeniedRecords() — drop denylisted repos BEFORE any authz call
-  //   6. checkRepoAuthz() per surviving binding — keep only authorized repos
-  //   7. listRunsForRepo() per authorized binding — enumerate run-states
-  //   8. toRunSummary() projection — drop null (entity_ref mismatch) + warn
-  //   9. overlayWaitingStatus() against the registries, after listRunsForRepo resolves
-  //  10. Flatten; sort newest-first by createdAt; cap at MAX_RUNS_PER_LISTING
-  //  11. Cache-Control: no-store, private; return 200 {runs: RunSummary[]}
+  //   3. listBindings() — enumerate all bound repos
+  //   4. filterDeniedRecords() — drop denylisted repos BEFORE any run-state read
+  //   5. listRunsForRepo() per surviving binding — enumerate run-states
+  //   6. toRunSummary() projection — drop null (entity_ref mismatch) + warn
+  //   7. overlayWaitingStatus() against the registries, after listRunsForRepo resolves
+  //   8. Flatten; sort newest-first by createdAt; cap at MAX_RUNS_PER_LISTING
+  //   9. Cache-Control: no-store, private; return 200 {runs: RunSummary[]}
   if (
     browserGuardDeps !== undefined &&
     deps.sessionStore !== undefined &&
@@ -882,18 +850,8 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   ) {
     const clock = deps.sessionDeps?.clock ?? (() => Date.now())
     buildRunsRoute(app, {
-      sessionStore: deps.sessionStore,
       listBindings: deps.listBindings,
       isRepoDenied: deps.denylistCache.isRepoDenied.bind(deps.denylistCache),
-      repoAuthzDeps: {
-        allowlist: deps.allowlist,
-        fetch: globalThis.fetch,
-        clock,
-        random: Math.random.bind(Math),
-        auditLogger: deps.auditLogger,
-        logger: deps.logger,
-        cache: deps.repoAuthzCache ?? createRepoAuthzCache(),
-      },
       listRunsForRepo: deps.runIndex.listRunsForRepo.bind(deps.runIndex),
       approvalRegistry: deps.approvalRegistry,
       questionRegistry: deps.questionRegistry,
@@ -912,16 +870,14 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   // Gate ordering:
   //   1. Guard (browser/session/allowlist/CSRF) — installed above (POST → requireCsrf=true)
   //   2. Operator rate limit (3/min, 10/hr, operator-keyed)
-  //   3. Session token resolution
+  //   3. Session identity (requester attribution)
   //   4. Body parse: {repo, prompt, idempotencyKey?}
-  //   5. Server-owned binding resolution via getBindingByRepo
-  //   6. Denylist check (before authz, no oracle)
-  //   7. checkRepoAuthz (allowlist + GitHub repo access)
-  //   8. Empty-prompt fail-fast
-  //   9. Per-operator idempotency guard (reserve before launchWork)
-  //  10. Generate runId + reserve idempotency key
-  //  11. Await launchWork admission (returns LaunchAdmission, not the full run)
-  //  12. On accepted: commit idempotency + return 202 {runId}
+  //   5. resolveRepoAccess (name validation, one server-owned binding read, then denylist)
+  //   6. Empty-prompt fail-fast
+  //   7. Per-operator idempotency guard (reserve before launchWork)
+  //   8. Generate runId + reserve idempotency key
+  //   9. Await launchWork admission (returns LaunchAdmission, not the full run)
+  //  10. On accepted: commit idempotency + return 202 {runId}
   //      On rejected/throw: rollback idempotency + return coarse error
   // launchWork owns run-index registration (via deps.launchWorkDeps.runIndex).
   if (
@@ -937,16 +893,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
     buildLaunchRoute(app, {
       sessionStore: deps.sessionStore,
       bindingsLookup: {getBindingByRepo: deps.getBindingByRepo},
-      isRepoDenied: deps.denylistCache.isRepoDenied.bind(deps.denylistCache),
-      repoAuthzDeps: {
-        allowlist: deps.allowlist,
-        fetch: globalThis.fetch,
-        clock,
-        random: Math.random.bind(Math),
-        auditLogger: deps.auditLogger,
-        logger: deps.logger,
-        cache: deps.repoAuthzCache ?? createRepoAuthzCache(),
-      },
+      denylistCache: deps.denylistCache,
       idempotencyGuard: deps.idempotencyGuard ?? createIdempotencyGuard({now: clock}),
       launchWorkDeps: deps.launchWorkDeps,
       logger: deps.logger,
@@ -965,8 +912,8 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   // dependencies are available. The route reuses the existing transport-neutral
   // DispatchWorkflow; it does not duplicate GitHub logic.
   // Route: POST /operator/dispatch — privileged (requires session + allowlist + CSRF).
-  // Gate ordering: guard → operator rate limit → session token → body parse →
-  // binding → denylist → write authz → dispatch.
+  // Gate ordering: guard → operator rate limit → session identity → body parse →
+  // resolveRepoAccess (binding + denylist) → dispatch.
   if (
     browserGuardDeps !== undefined &&
     deps.sessionStore !== undefined &&
@@ -980,16 +927,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
     buildDispatchRoute(app, {
       sessionStore: deps.sessionStore,
       bindingsLookup: {getBindingByRepo: deps.getBindingByRepo},
-      isRepoDenied: deps.denylistCache.isRepoDenied.bind(deps.denylistCache),
-      repoAuthzDeps: {
-        allowlist: deps.allowlist,
-        fetch: globalThis.fetch,
-        clock,
-        random: Math.random.bind(Math),
-        auditLogger: deps.auditLogger,
-        logger: deps.logger,
-        cache: deps.repoAuthzCache ?? createRepoAuthzCache(),
-      },
+      denylistCache: deps.denylistCache,
       dispatchWorkflow: deps.dispatchWorkflow,
       idempotencyGuard: deps.dispatchIdempotencyGuard ?? createIdempotencyGuard({now: clock}),
       auditLogger: deps.auditLogger,
@@ -1003,22 +941,19 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   // Registered only when the full browser guard is present AND the approval
   // registry, runIndex, denylistCache, bindingsLookup, and auditLogger are provided.
   // Route: POST /operator/runs/:runId/approvals/:requestId/decision — privileged
-  //   (requires session + allowlist + CSRF; write-level repo authz).
+  //   (requires session + allowlist + CSRF; same bindings-only repo-access predicate as the reads).
   //
   // Gate ordering:
   //   1. Guard (browser/session/allowlist/CSRF) — installed above (POST → requireCsrf=true)
-  //   2. Session token resolution
-  //   3. RunIndex.lookup (server-owned runId → repo resolution)
-  //   4. Split owner/repo
-  //   5. Denylist check (before authz, no oracle)
-  //   6. checkRepoWriteAuthz (WRITE-level — not read)
-  //   7. Parse + validate decision from body ({decision: 'once'|'always'|'reject'})
-  //   8. Build WebOperatorActor from session
-  //   9. registry.handleDecision({requestID, approvalScopeId: runId, decision, actor})
-  //  10. Emit ApprovalDecisionEvent audit record
-  //  11. Map DecisionOutcome via toOperatorDecisionState → JSON {state}
+  //   2. resolveRepoFromRunIndex (server-owned runId → repo lookup + owner/repo split)
+  //   3. resolveRepoAccess (bound AND not denylisted, one binding read)
+  //   4. Parse + validate decision from body ({decision: 'once'|'always'|'reject'})
+  //   5. Build WebOperatorActor from session
+  //   6. registry.handleDecision({requestID, approvalScopeId: runId, decision, actor})
+  //   7. Emit ApprovalDecisionEvent audit record
+  //   8. Map DecisionOutcome via toOperatorDecisionState → JSON {state}
   //
-  // Every failure at gates 2–6 returns the identical no-oracle notFoundResponse.
+  // Every failure at gates 2–3 returns the identical no-oracle notFoundResponse.
   // A gate throw degrades to the same denial, not a distinguishable 500.
   // No continuous-authz lease — a decision is a single HTTP request.
   if (
@@ -1031,25 +966,14 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
     deps.allowlist !== undefined &&
     deps.auditLogger !== undefined
   ) {
-    const clock = deps.sessionDeps?.clock ?? (() => Date.now())
     buildDecisionRoute(app, {
       sessionStore: deps.sessionStore,
       runIndex: deps.runIndex,
       denylistCache: deps.denylistCache,
       bindingsLookup: deps.bindingsLookup,
-      repoAuthzDeps: {
-        allowlist: deps.allowlist,
-        fetch: globalThis.fetch,
-        clock,
-        random: Math.random.bind(Math),
-        auditLogger: deps.auditLogger,
-        logger: deps.logger,
-        cache: deps.repoAuthzCache ?? createRepoAuthzCache(),
-      },
       registry: deps.approvalRegistry,
       auditLogger: deps.auditLogger,
       logger: deps.logger,
-      now: clock,
     })
   }
 
@@ -1058,22 +982,19 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   // Registered only when the full browser guard is present AND the cancel-run
   // engine deps, runIndex, denylistCache, bindingsLookup, and auditLogger are
   // provided. Route: POST /operator/runs/:runId/cancel — privileged
-  //   (requires session + allowlist + CSRF; write-level repo authz).
+  //   (requires session + allowlist + CSRF; same bindings-only repo-access predicate as the reads).
   //
   // Gate ordering (mirrors the decision route):
   //   1. Guard (browser/session/allowlist/CSRF) — installed above (POST → requireCsrf=true)
-  //   2. Session token resolution
-  //   3. RunIndex.lookup (server-owned runId → repo resolution)
-  //   4. Split owner/repo
-  //   5. Denylist check (before authz, no oracle)
-  //   6. checkRepoWriteAuthz (WRITE-level — not read)
-  //   7. Operator-keyed rate limit (AFTER authz)
-  //   8. Build CancelActorContext from session
-  //   9. cancelRun(params, deps) — transport-neutral orchestrator
-  //  10. Emit run.cancel.* audit record
-  //  11. Map CancelOutcome → JSON response
+  //   2. resolveRepoFromRunIndex (server-owned runId → repo lookup + owner/repo split)
+  //   3. resolveRepoAccess (bound AND not denylisted, one binding read)
+  //   4. Operator-keyed rate limit (AFTER authz)
+  //   5. Build CancelActorContext from session
+  //   6. cancelRun(params, deps) — transport-neutral orchestrator
+  //   7. Emit run.cancel.* audit record
+  //   8. Map CancelOutcome → JSON response
   //
-  // Every failure at gates 2–6 returns the identical no-oracle notFoundResponse.
+  // Every failure at gates 2–3 returns the identical no-oracle notFoundResponse.
   // A gate throw degrades to the same denial, not a distinguishable 500.
   if (
     browserGuardDeps !== undefined &&
@@ -1092,15 +1013,6 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
       runIndex: deps.runIndex,
       denylistCache: deps.denylistCache,
       bindingsLookup: deps.bindingsLookup,
-      repoAuthzDeps: {
-        allowlist: deps.allowlist,
-        fetch: globalThis.fetch,
-        clock,
-        random: Math.random.bind(Math),
-        auditLogger: deps.auditLogger,
-        logger: deps.logger,
-        cache: deps.repoAuthzCache ?? createRepoAuthzCache(),
-      },
       cancelRunDeps: deps.cancelRunDeps,
       auditLogger: deps.auditLogger,
       logger: deps.logger,
@@ -1113,19 +1025,16 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   // Registered only when the full browser guard is present AND the approval
   // registry, runIndex, denylistCache, and bindingsLookup are provided.
   // Route: GET /operator/runs/:runId/approvals — privileged (requires session + allowlist).
-  //   Read-level repo authz (observing/reconnecting needs only read access).
+  //   Same bindings-only repo-access predicate as every other operator route.
   //
   // Gate ordering:
   //   1. Guard (browser/session/allowlist) — installed above (GET → requireCsrf=false)
-  //   2. Session token resolution
-  //   3. RunIndex.lookup (server-owned runId → repo resolution)
-  //   4. Split owner/repo
-  //   5. Denylist check (before authz, no oracle)
-  //   6. checkRepoAuthz (READ-level — not write)
-  //   7. Per-operator rate limit (operator-keyed)
-  //   8. registry.describePendingForScope(runId) → bounded DTO list (hard-capped)
+  //   2. resolveRepoFromRunIndex (server-owned runId → repo lookup + owner/repo split)
+  //   3. resolveRepoAccess (bound AND not denylisted, one binding read)
+  //   4. Per-operator rate limit (operator-keyed)
+  //   5. registry.describePendingForScope(runId) → bounded DTO list (hard-capped)
   //
-  // Every failure at gates 2–6 returns the identical no-oracle notFoundResponse.
+  // Every failure at gates 2–3 returns the identical no-oracle notFoundResponse.
   // A gate throw degrades to the same denial, not a distinguishable 500.
   // An authorized operator with no open requests returns 200 {approvals: []}.
   if (
@@ -1140,19 +1049,9 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   ) {
     const clock = deps.sessionDeps?.clock ?? (() => Date.now())
     buildPendingApprovalsRoute(app, {
-      sessionStore: deps.sessionStore,
       runIndex: deps.runIndex,
       denylistCache: deps.denylistCache,
       bindingsLookup: deps.bindingsLookup,
-      repoAuthzDeps: {
-        allowlist: deps.allowlist,
-        fetch: globalThis.fetch,
-        clock,
-        random: Math.random.bind(Math),
-        auditLogger: deps.auditLogger,
-        logger: deps.logger,
-        cache: deps.repoAuthzCache ?? createRepoAuthzCache(),
-      },
       registry: deps.approvalRegistry,
       logger: deps.logger,
       now: clock,
@@ -1168,8 +1067,8 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   //        repo authz, CSRF; body {decision:'answer', answers:[{options?, text?}]} | {decision:'skip'}.
   //   GET  /operator/runs/:runId/questions — privileged, read-level repo authz.
   //
-  // Gate ordering matches the approval routes: guard, session token, run lookup,
-  // denylist (before any authz call), authz, then body validation and the gate.
+  // Gate ordering matches the approval routes: guard, run lookup, repo access
+  // (binding + denylist), then body validation and the gate.
   // The 64 KiB body limit is the global middleware above, ahead of both routes.
   // Every failure before body validation returns the identical no-oracle
   // notFoundResponse. Web operators may answer any run's question, including a
@@ -1186,32 +1085,19 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
     deps.auditLogger !== undefined
   ) {
     const clock = deps.sessionDeps?.clock ?? (() => Date.now())
-    const repoAuthzDeps = {
-      allowlist: deps.allowlist,
-      fetch: globalThis.fetch,
-      clock,
-      random: Math.random.bind(Math),
-      auditLogger: deps.auditLogger,
-      logger: deps.logger,
-      cache: deps.repoAuthzCache ?? createRepoAuthzCache(),
-    }
     buildQuestionDecisionRoute(app, {
       sessionStore: deps.sessionStore,
       runIndex: deps.runIndex,
       denylistCache: deps.denylistCache,
       bindingsLookup: deps.bindingsLookup,
-      repoAuthzDeps,
       registry: deps.questionRegistry,
       auditLogger: deps.auditLogger,
       logger: deps.logger,
-      now: clock,
     })
     buildPendingQuestionsRoute(app, {
-      sessionStore: deps.sessionStore,
       runIndex: deps.runIndex,
       denylistCache: deps.denylistCache,
       bindingsLookup: deps.bindingsLookup,
-      repoAuthzDeps,
       registry: deps.questionRegistry,
       logger: deps.logger,
       now: clock,
@@ -1246,7 +1132,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
     deps.auditLogger !== undefined
   ) {
     const clock = deps.sessionDeps?.clock ?? (() => Date.now())
-    const sessionStoreForPush: SubscriptionRouteSessionStore = deps.sessionStore
+    const sessionStoreForPush: Pick<DurableSessionStore, 'get'> = deps.sessionStore
     buildVapidPublicKeyRoute(app, {
       vapidPublicKeyInfo: deps.operatorPushVapidKeyInfo,
       logger: deps.logger,

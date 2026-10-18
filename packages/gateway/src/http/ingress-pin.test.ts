@@ -52,7 +52,7 @@ import {Effect} from 'effect'
 import {describe, expect, it, vi} from 'vitest'
 import {loadAllowlistFromText} from '../web/auth/allowlist.js'
 import {createInMemoryStateStore} from '../web/auth/github.js'
-import {createInMemorySessionStore} from '../web/auth/session.js'
+import {buildTestSessionStoreHarness} from '../web/auth/test-session-store.js'
 import {makeDirectIngressPolicy} from '../web/ingress/policy.js'
 import {unsafeResolvedClientAddressForTest} from '../web/ingress/resolve-client.js'
 import {buildOperatorApp} from '../web/server.js'
@@ -216,7 +216,7 @@ function makeBrowserGuardStubDeps(): OperatorServerDeps {
   return {
     ...makeOperatorStubDeps(),
     githubOAuth: makeOAuthStubDeps(),
-    sessionStore: createInMemorySessionStore(),
+    sessionStore: buildTestSessionStoreHarness().store,
     sessionDeps: {
       logger,
       auditLogger: {info: vi.fn(), warn: vi.fn()},

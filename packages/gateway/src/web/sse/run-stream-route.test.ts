@@ -6,7 +6,8 @@
  *   - No stream is opened unless all gates pass.
  *   - Success is observable ONLY as text/event-stream + first frame.
  *   - The resolved repo comes exclusively from runIndex.lookup — never from the client.
- *   - Denylist check runs before checkRepoAuthz (no authz call on denied repos).
+ *   - Repo access is the single bindings-only predicate (bound AND not denylisted); no GitHub call is made.
+ *   - The lease re-checks session, allowlist and repo access, and its logs carry no owner/repo/run id.
  *
  * BDD comments: #given / #when / #then.
  */
@@ -15,8 +16,8 @@ import type {RunState} from '@fro-bot/runtime'
 import type {OperatorRunStatus} from '../../operator-contract/index.js'
 import type {DenylistCache, RepoKey} from '../../redaction/denylist.js'
 import type {BindingsLookup} from '../../redaction/surface-gate.js'
-import type {RepoAuthzCache, RepoAuthzDeps} from '../auth/repo-authz.js'
-import type {SessionStore} from '../auth/session.js'
+import type {AuditLogger} from '../audit.js'
+import type {OperatorAllowlist} from '../auth/allowlist.js'
 import type {ObservationFrame, RunObservationManager, SubscriberCallbacks} from './manager.js'
 import type {RunStreamRouteDeps} from './run-stream-route.js'
 
@@ -86,23 +87,21 @@ const STUB_SESSION = {
   githubUserId: 99,
   login: 'testuser',
   issuedAt: 0,
-  lastAccessedAt: 0,
-  revoked: false,
 } as const
 
-function makeSessionStore(overrides?: Partial<SessionStore>): SessionStore {
+function makeSessionStore(overrides?: Partial<RunStreamRouteDeps['sessionStore']>): RunStreamRouteDeps['sessionStore'] {
   return {
-    create: vi.fn(() => 'session-id'),
     get: vi.fn(() => STUB_SESSION),
-    touch: vi.fn(),
-    delete: vi.fn(),
-    onRevoke: vi.fn(),
-    scavenge: vi.fn(),
-    size: vi.fn(() => 0),
-    getOperatorToken: vi.fn(() => 'stub-oauth-token'),
-    dropOperatorToken: vi.fn(),
     ...overrides,
   }
+}
+
+function makeAllowlist(allowed = true): OperatorAllowlist {
+  return {isAuthorized: vi.fn(() => allowed), size: 1}
+}
+
+function makeAuditLogger(): AuditLogger {
+  return {info: vi.fn(), warn: vi.fn()}
 }
 
 function makeRunIndex(repo?: string): RunStreamRouteDeps['runIndex'] {
@@ -125,32 +124,14 @@ function makeBindingsLookup(databaseId?: number, nodeId?: string): BindingsLooku
   }
 }
 
-function makeRepoAuthzCache(authorized: boolean): RepoAuthzCache {
-  return {
-    get: vi.fn(() =>
-      authorized
-        ? {authorized: true as const, expiresAt: Number.MAX_SAFE_INTEGER}
-        : {authorized: false as const, reason: 'github_denied' as const, expiresAt: Number.MAX_SAFE_INTEGER},
-    ),
-    set: vi.fn(),
-    getInFlight: vi.fn(() => undefined),
-    setInFlight: vi.fn(),
-    deleteInFlight: vi.fn(),
-    tokenIdentityFor: vi.fn(() => 'stub-token-id'),
-  }
+/** A bindings lookup whose answer the test can change between the gate and a lease tick. */
+function makeMutableBindingsLookup(
+  read: () => Awaited<ReturnType<BindingsLookup['getBindingByRepo']>>,
+): BindingsLookup {
+  return {getBindingByRepo: vi.fn(async () => read())}
 }
 
-function makeRepoAuthzDeps(authorized = true): RepoAuthzDeps {
-  return {
-    allowlist: {isAuthorized: vi.fn(() => true), size: 1},
-    fetch: vi.fn(async () => new Response('{}', {status: authorized ? 200 : 403})),
-    clock: () => 0,
-    random: () => 0,
-    auditLogger: {info: vi.fn(), warn: vi.fn()},
-    logger: {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
-    cache: makeRepoAuthzCache(authorized),
-  }
-}
+const BOUND = {success: true as const, data: {databaseId: 42, nodeId: 'node-id-1'}}
 
 function makeManager(overrides?: Partial<RunObservationManager>): RunObservationManager {
   return {
@@ -171,10 +152,10 @@ function makeDeps(overrides?: Partial<RunStreamRouteDeps>): RunStreamRouteDeps {
     runIndex: makeRunIndex('acme/widget'),
     denylistCache: makeDenylistCache(false),
     bindingsLookup: makeBindingsLookup(42, 'node-id-1'),
-    repoAuthzDeps: makeRepoAuthzDeps(true),
+    allowlist: makeAllowlist(true),
+    auditLogger: makeAuditLogger(),
     manager: makeManager(),
     logger: makeLogger(),
-    now: () => 0,
     ...overrides,
   }
 }
@@ -226,42 +207,24 @@ async function fetchStream(app: Hono, runId: string): Promise<Response> {
 }
 
 // ---------------------------------------------------------------------------
-// Security: missing token → not-found, no stream
+// No credential: the route depends on the session store's identity read only
 // ---------------------------------------------------------------------------
 
-describe('GET /operator/runs/:runId/stream — missing token', () => {
-  it('returns not-found when getOperatorToken returns undefined, regardless of runId', async () => {
-    // #given — session store returns no token
-    const sessionStore = makeSessionStore({getOperatorToken: vi.fn(() => undefined)})
-    const runIndex = makeRunIndex('acme/widget')
+describe('GET /operator/runs/:runId/stream — no OAuth token dependency', () => {
+  it('opens a stream with a session store that exposes only get()', async () => {
+    // #given — the session store has no token accessor at all
+    const sessionStore = makeSessionStore()
+    expect(Object.keys(sessionStore)).toEqual(['get'])
     const manager = makeManager()
-    const deps = makeDeps({sessionStore, runIndex, manager})
-    const app = buildTestApp(deps)
-
-    // #when — request with a valid runId but no token
-    const res = await fetchStream(app, 'run-abc-123')
-    const body = await res.json()
-
-    // #then — generic not-found, no stream opened
-    expect(res.status).toBe(404)
-    expect(body).toEqual({error: 'not-found'})
-    expect(manager.subscribe).not.toHaveBeenCalled()
-  })
-
-  it('returns the same not-found shape when runId does not exist and token is missing', async () => {
-    // #given — no token, no run
-    const sessionStore = makeSessionStore({getOperatorToken: vi.fn(() => undefined)})
-    const runIndex = makeRunIndex(undefined)
-    const deps = makeDeps({sessionStore, runIndex})
-    const app = buildTestApp(deps)
+    const app = buildTestApp(makeDeps({sessionStore, manager}))
 
     // #when
-    const res = await fetchStream(app, 'nonexistent-run')
-    const body = await res.json()
+    const res = await fetchStream(app, 'run-abc')
 
-    // #then — identical shape regardless of run existence
-    expect(res.status).toBe(404)
-    expect(body).toEqual({error: 'not-found'})
+    // #then — the stream opens; no token or GitHub call was needed
+    expect(res.status).toBe(200)
+    expect(manager.subscribe).toHaveBeenCalledOnce()
+    await res.body?.cancel()
   })
 })
 
@@ -274,9 +237,8 @@ describe('GET /operator/runs/:runId/stream — unknown runId', () => {
     // #given — run does not exist
     const runIndex = makeRunIndex(undefined)
     const denylistCache = makeDenylistCache(false)
-    const repoAuthzDeps = makeRepoAuthzDeps(true)
     const manager = makeManager()
-    const deps = makeDeps({runIndex, denylistCache, repoAuthzDeps, manager})
+    const deps = makeDeps({runIndex, denylistCache, manager})
     const app = buildTestApp(deps)
 
     // #when
@@ -290,19 +252,18 @@ describe('GET /operator/runs/:runId/stream — unknown runId', () => {
     expect(manager.subscribe).not.toHaveBeenCalled()
   })
 
-  it('does not call checkRepoAuthz after a run lookup miss', async () => {
-    // #given — run does not exist; authz fetch should never be called
+  it('makes no binding read after a run lookup miss', async () => {
+    // #given — run does not exist; the binding store must never be asked
     const runIndex = makeRunIndex(undefined)
-    const fetchFn = vi.fn() as typeof globalThis.fetch
-    const repoAuthzDeps: RepoAuthzDeps = {...makeRepoAuthzDeps(true), fetch: fetchFn}
-    const deps = makeDeps({runIndex, repoAuthzDeps})
+    const bindingsLookup = makeBindingsLookup(42, 'node-id-1')
+    const deps = makeDeps({runIndex, bindingsLookup})
     const app = buildTestApp(deps)
 
     // #when
     await fetchStream(app, 'unknown-run-id')
 
-    // #then — no GitHub API call was made
-    expect(fetchFn).not.toHaveBeenCalled()
+    // #then
+    expect(bindingsLookup.getBindingByRepo).not.toHaveBeenCalled()
   })
 })
 
@@ -436,27 +397,24 @@ describe('GET /operator/runs/:runId/stream — 429 over-cap: no SSE frame emitte
 })
 
 // ---------------------------------------------------------------------------
-// Security: denylisted repo → not-found, checkRepoAuthz NOT reached
+// Security: denylisted repo → not-found
 // ---------------------------------------------------------------------------
 
 describe('GET /operator/runs/:runId/stream — denylisted repo', () => {
-  it('returns not-found when repo is denied, without calling checkRepoAuthz', async () => {
+  it('returns not-found when repo is denied, with no stream', async () => {
     // #given — repo is on the denylist
     const denylistCache = makeDenylistCache(true)
-    const authzFetch = vi.fn() as typeof globalThis.fetch
-    const repoAuthzDeps: RepoAuthzDeps = {...makeRepoAuthzDeps(true), fetch: authzFetch}
     const manager = makeManager()
-    const deps = makeDeps({denylistCache, repoAuthzDeps, manager})
+    const deps = makeDeps({denylistCache, manager})
     const app = buildTestApp(deps)
 
     // #when
     const res = await fetchStream(app, 'run-abc')
     const body = await res.json()
 
-    // #then — not-found, no authz call, no stream
+    // #then — not-found, no stream
     expect(res.status).toBe(404)
     expect(body).toEqual({error: 'not-found'})
-    expect(authzFetch).not.toHaveBeenCalled()
     expect(manager.subscribe).not.toHaveBeenCalled()
   })
 
@@ -484,25 +442,63 @@ describe('GET /operator/runs/:runId/stream — denylisted repo', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Security: checkRepoAuthz denies → not-found, byte-identical to other denials
+// Security: unbound / unavailable / malformed → not-found, byte-identical to other denials
 // ---------------------------------------------------------------------------
 
-describe('GET /operator/runs/:runId/stream — checkRepoAuthz denies', () => {
-  it('returns not-found when checkRepoAuthz denies, same shape as unknown/denied', async () => {
-    // #given — authz cache returns denied
-    const repoAuthzDeps = makeRepoAuthzDeps(false)
-    const manager = makeManager()
-    const deps = makeDeps({repoAuthzDeps, manager})
-    const app = buildTestApp(deps)
+describe('GET /operator/runs/:runId/stream — repo access denied', () => {
+  it('returns the same not-found shape for unbound, unavailable, throwing and malformed repos', async () => {
+    // #given — each non-allowed outcome of the repo-access predicate, plus a path-traversal repo name
+    const unbound = makeMutableBindingsLookup(() => ({success: true as const, data: null}))
+    const unavailable = makeMutableBindingsLookup(() => ({success: false as const, error: new Error('s3 down')}))
+    const throwing: BindingsLookup = {
+      getBindingByRepo: vi.fn(async () => {
+        throw new Error('boom')
+      }),
+    }
+    const malformedLookup = makeBindingsLookup(42, 'node-id-1')
+    const variants: RunStreamRouteDeps[] = [
+      makeDeps({bindingsLookup: unbound}),
+      makeDeps({bindingsLookup: unavailable}),
+      makeDeps({bindingsLookup: throwing}),
+      makeDeps({runIndex: makeRunIndex('acme/..'), bindingsLookup: malformedLookup}),
+    ]
+
+    for (const deps of variants) {
+      // #when
+      const res = await fetchStream(buildTestApp(deps), 'run-abc')
+
+      // #then — identical 404 body, no stream
+      expect(res.status).toBe(404)
+      expect(await res.json()).toEqual({error: 'not-found'})
+      expect(deps.manager.subscribe).not.toHaveBeenCalled()
+    }
+
+    // #and — a malformed name made zero binding reads
+    expect(malformedLookup.getBindingByRepo).not.toHaveBeenCalled()
+  })
+
+  it('emits no audit event for a repo-level denial, and logs one label for unbound and denylisted', async () => {
+    // #given
+    const auditLogger = makeAuditLogger()
+    const logger = makeLogger()
+    const unbound = makeDeps({
+      auditLogger,
+      logger,
+      bindingsLookup: makeMutableBindingsLookup(() => ({success: true as const, data: null})),
+    })
+    const denied = makeDeps({auditLogger, logger, denylistCache: makeDenylistCache(true)})
 
     // #when
-    const res = await fetchStream(app, 'run-abc')
-    const body = await res.json()
+    await fetchStream(buildTestApp(unbound), 'run-abc')
+    await fetchStream(buildTestApp(denied), 'run-abc')
 
-    // #then — identical shape to all other denials
-    expect(res.status).toBe(404)
-    expect(body).toEqual({error: 'not-found'})
-    expect(manager.subscribe).not.toHaveBeenCalled()
+    // #then
+    expect(auditLogger.info).not.toHaveBeenCalled()
+    expect(auditLogger.warn).not.toHaveBeenCalled()
+    expect(vi.mocked(logger.warn).mock.calls.map(call => call[0])).toEqual([
+      {githubUserId: 99, gate: 'repo-denied'},
+      {githubUserId: 99, gate: 'repo-denied'},
+    ])
   })
 })
 
@@ -1208,104 +1204,373 @@ describe('GET /operator/runs/:runId/stream — heartbeat', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Continuous-authz lease: repo access revoked mid-stream
+// Continuous-authz lease: binding removed / store unavailable / operator off the allowlist
 // ---------------------------------------------------------------------------
 
-describe('GET /operator/runs/:runId/stream — lease: repo access revoked mid-stream', () => {
-  it('closes the stream on the next tick when checkRepoAuthz starts returning authorized:false', async () => {
-    // #given — stream opens with authz passing; after first tick authz is revoked
-    let authzAuthorized = true
-    const repoAuthzDeps: RepoAuthzDeps = {
-      ...makeRepoAuthzDeps(true),
-      cache: {
-        get: vi.fn(() =>
-          authzAuthorized
-            ? {authorized: true as const, expiresAt: Number.MAX_SAFE_INTEGER}
-            : {authorized: false as const, reason: 'github_denied' as const, expiresAt: Number.MAX_SAFE_INTEGER},
-        ),
-        set: vi.fn(),
-        getInFlight: vi.fn(() => undefined),
-        setInFlight: vi.fn(),
-        deleteInFlight: vi.fn(),
-        tokenIdentityFor: vi.fn(() => 'stub-token-id'),
-      },
-    }
+/** Open a stream with a fake lease timer and return what the lease tests need to assert on. */
+async function openLeasedStream(overrides: Partial<RunStreamRouteDeps>) {
+  let unsubscribeCalls = 0
+  const manager = makeManager({
+    subscribe: vi.fn((_runId: string, _callbacks: SubscriberCallbacks) => {
+      return () => {
+        unsubscribeCalls++
+      }
+    }),
+  })
+  const fakeTimer = makeFakeTimer()
+  const logger = makeLogger()
+  const auditLogger = makeAuditLogger()
+  const deps = makeDepsWithFakeTimer(fakeTimer, {manager, logger, auditLogger, maxStreamsPerOperator: 1, ...overrides})
+  const app = buildTestApp(deps)
+  const res = await fetchStream(app, 'run-abc')
+  expect(res.status).toBe(200)
+  return {app, res, fakeTimer, logger, auditLogger, unsubscribeCalls: () => unsubscribeCalls}
+}
 
-    let unsubscribeCalls = 0
-    const manager = makeManager({
-      subscribe: vi.fn((_runId: string, _callbacks: SubscriberCallbacks) => {
-        return () => {
-          unsubscribeCalls++
-        }
-      }),
-    })
+describe('GET /operator/runs/:runId/stream — lease: binding removed mid-stream', () => {
+  it('closes the stream on the next tick when the binding disappears, and frees the slot', async () => {
+    // #given — stream opens bound; the binding is removed before the tick
+    let result: Awaited<ReturnType<BindingsLookup['getBindingByRepo']>> = BOUND
+    const stream = await openLeasedStream({bindingsLookup: makeMutableBindingsLookup(() => result)})
 
-    const fakeTimer = makeFakeTimer()
-    const deps = makeDepsWithFakeTimer(fakeTimer, {repoAuthzDeps, manager, maxStreamsPerOperator: 1})
-    const app = buildTestApp(deps)
+    // #when
+    result = {success: true, data: null}
+    await stream.fakeTimer.tick()
 
-    // #when — stream opens (authz passes)
-    const res = await fetchStream(app, 'run-abc')
-    expect(res.status).toBe(200)
+    // #then — connection closed, no audit event for a repo-level denial
+    expect(stream.unsubscribeCalls()).toBe(1)
+    expect(stream.auditLogger.warn).not.toHaveBeenCalled()
+    expect(stream.auditLogger.info).not.toHaveBeenCalled()
 
-    // Revoke access, then fire a lease tick
-    authzAuthorized = false
-    await fakeTimer.tick()
-
-    // #then — cleanup ran: unsubscribe called once (connection closed)
-    expect(unsubscribeCalls).toBe(1)
-
-    // Restore authz and verify the slot was released (new stream succeeds)
-    authzAuthorized = true
-    const res2 = await fetchStream(app, 'run-def')
+    // #and — the slot was released (a new stream succeeds once the binding is back)
+    result = BOUND
+    const res2 = await fetchStream(stream.app, 'run-def')
     expect(res2.status).toBe(200)
     await res2.body?.cancel()
-    await res.body?.cancel()
+    await stream.res.body?.cancel()
   })
 
-  it('does not call dropOperatorToken when checkRepoAuthz returns github_denied', async () => {
-    // #given — gate passes (authorized); lease tick sees github_denied
-    // The cache returns authorized on the first call (gate), denied on subsequent calls (lease)
-    let callCount = 0
-    const repoAuthzDeps: RepoAuthzDeps = {
-      ...makeRepoAuthzDeps(true),
-      cache: {
-        get: vi.fn(() => {
-          callCount++
-          if (callCount === 1) {
-            return {authorized: true as const, expiresAt: Number.MAX_SAFE_INTEGER}
-          }
-          return {authorized: false as const, reason: 'github_denied' as const, expiresAt: Number.MAX_SAFE_INTEGER}
+  it('closes the stream when a lease-tick binding read errors (transient unavailable fails closed)', async () => {
+    // #given
+    let result: Awaited<ReturnType<BindingsLookup['getBindingByRepo']>> = BOUND
+    const stream = await openLeasedStream({bindingsLookup: makeMutableBindingsLookup(() => result)})
+
+    // #when — the binding read fails on the tick
+    result = {success: false, error: new Error('s3 down')}
+    await stream.fakeTimer.tick()
+
+    // #then
+    expect(stream.unsubscribeCalls()).toBe(1)
+    expect(vi.mocked(stream.logger.warn).mock.calls.map(call => call[0])).toEqual([
+      {githubUserId: 99, gate: 'repo-unavailable'},
+    ])
+    await stream.res.body?.cancel()
+  })
+
+  it('closes the stream when a lease-tick binding read throws', async () => {
+    // #given
+    let throwNow = false
+    const stream = await openLeasedStream({
+      bindingsLookup: {
+        getBindingByRepo: vi.fn(async () => {
+          if (throwNow) throw new Error('boom')
+          return BOUND
         }),
-        set: vi.fn(),
-        getInFlight: vi.fn(() => undefined),
-        setInFlight: vi.fn(),
-        deleteInFlight: vi.fn(),
-        tokenIdentityFor: vi.fn(() => 'stub-token-id'),
       },
-    }
-
-    const dropOperatorToken = vi.fn()
-    const sessionStore = makeSessionStore({dropOperatorToken})
-
-    const manager = makeManager({
-      subscribe: vi.fn((_runId: string, _callbacks: SubscriberCallbacks) => () => undefined),
     })
 
-    const fakeTimer = makeFakeTimer()
-    const deps = makeDepsWithFakeTimer(fakeTimer, {repoAuthzDeps, sessionStore, manager})
-    const app = buildTestApp(deps)
+    // #when
+    throwNow = true
+    await stream.fakeTimer.tick()
 
-    const res = await fetchStream(app, 'run-abc')
-    expect(res.status).toBe(200)
+    // #then
+    expect(stream.unsubscribeCalls()).toBe(1)
+    await stream.res.body?.cancel()
+  })
 
-    // #when — lease tick fires with github_denied
-    await fakeTimer.tick()
+  it('reads the binding exactly once per tick', async () => {
+    // #given
+    const bindingsLookup = makeMutableBindingsLookup(() => BOUND)
+    const stream = await openLeasedStream({bindingsLookup})
+    expect(bindingsLookup.getBindingByRepo).toHaveBeenCalledTimes(1) // the gate
 
-    // #then — dropOperatorToken was NOT called (cannot distinguish revoked token from denied repo)
-    expect(dropOperatorToken).not.toHaveBeenCalled()
+    // #when
+    await stream.fakeTimer.tick()
 
-    await res.body?.cancel()
+    // #then
+    expect(bindingsLookup.getBindingByRepo).toHaveBeenCalledTimes(2)
+    expect(stream.unsubscribeCalls()).toBe(0)
+    await stream.res.body?.cancel()
+  })
+})
+
+describe('GET /operator/runs/:runId/stream — lease: bounded repo-access read', () => {
+  it('closes the stream when a lease-tick binding read never settles within the timeout', async () => {
+    // #given — the gate read succeeds, then every later binding read hangs
+    let reads = 0
+    const bindingsLookup: BindingsLookup = {
+      getBindingByRepo: vi.fn(async () => {
+        reads++
+        if (reads === 1) return BOUND
+        return new Promise<never>(() => undefined)
+      }),
+    }
+    const stream = await openLeasedStream({bindingsLookup, leaseRepoAccessTimeoutMs: 20})
+
+    // #when — a tick starts a read that never answers
+    await stream.fakeTimer.tick()
+    expect(stream.unsubscribeCalls()).toBe(0)
+    await new Promise<void>(resolve => setTimeout(resolve, 60))
+
+    // #then — the timeout counts as unavailable and closes the stream
+    expect(stream.unsubscribeCalls()).toBe(1)
+    expect(vi.mocked(stream.logger.warn).mock.calls.map(call => call[0])).toEqual([
+      {githubUserId: 99, gate: 'repo-unavailable'},
+    ])
+    await stream.res.body?.cancel()
+  })
+
+  it('does not start a second check while the previous one is still in flight', async () => {
+    // #given — a lease-tick read that stays pending until the test releases it
+    let release!: (value: typeof BOUND) => void
+    const pending = new Promise<typeof BOUND>(resolve => {
+      release = resolve
+    })
+    let reads = 0
+    const bindingsLookup: BindingsLookup = {
+      getBindingByRepo: vi.fn(async () => {
+        reads++
+        return reads === 2 ? pending : BOUND
+      }),
+    }
+    const stream = await openLeasedStream({bindingsLookup, leaseRepoAccessTimeoutMs: 60_000})
+    expect(reads).toBe(1) // the gate
+
+    // #when — three ticks fire while the first check is pending
+    await stream.fakeTimer.tick()
+    await stream.fakeTimer.tick()
+    await stream.fakeTimer.tick()
+
+    // #then — only the first tick read the binding
+    expect(reads).toBe(2)
+
+    // #when — the pending read answers and a later tick fires
+    release(BOUND)
+    await new Promise<void>(resolve => setTimeout(resolve, 0))
+    await stream.fakeTimer.tick()
+
+    // #then — checks resume, and the stream is still open
+    expect(reads).toBe(3)
+    expect(stream.unsubscribeCalls()).toBe(0)
+    await stream.res.body?.cancel()
+  })
+})
+
+const LEASE_READ_TIMEOUT_MS = 777
+
+/** Keyed one-shot fake: every timer is kept, so the max-duration timer and the lease read timer do not clobber each other. */
+function makeKeyedFakeTimeouts() {
+  const timers = new Map<number, {readonly fn: () => void; readonly ms: number; cleared: boolean; fired: boolean}>()
+  let nextId = 1
+  const find = (ms: number) => [...timers.values()].filter(timer => timer.ms === ms)
+  return {
+    setTimeout: (fn: () => void, ms: number): ReturnType<typeof globalThis.setTimeout> => {
+      const id = nextId++
+      timers.set(id, {fn, ms, cleared: false, fired: false})
+      return id as unknown as ReturnType<typeof globalThis.setTimeout>
+    },
+    clearTimeout: (handle: ReturnType<typeof globalThis.setTimeout> | undefined): void => {
+      const timer = timers.get(handle as unknown as number)
+      if (timer !== undefined) timer.cleared = true
+    },
+    /** Fires every live timer scheduled for `ms`. */
+    fire: async (ms: number): Promise<void> => {
+      for (const timer of find(ms)) {
+        if (timer.cleared === false && timer.fired === false) {
+          timer.fired = true
+          timer.fn()
+        }
+      }
+      await new Promise<void>(resolve => setTimeout(resolve, 0))
+    },
+    scheduled: (ms: number) => find(ms).length,
+    cleared: (ms: number) => find(ms).filter(timer => timer.cleared).length,
+  }
+}
+
+describe('GET /operator/runs/:runId/stream — lease: read timer through the timer seam', () => {
+  it('clears the read timer when the read wins, and never fires it', async () => {
+    // #given — the injected timer seam and a binding read that answers at once
+    const timeouts = makeKeyedFakeTimeouts()
+    const stream = await openLeasedStream({
+      setTimeout: timeouts.setTimeout,
+      clearTimeout: timeouts.clearTimeout,
+      leaseRepoAccessTimeoutMs: LEASE_READ_TIMEOUT_MS,
+    })
+    expect(timeouts.scheduled(LEASE_READ_TIMEOUT_MS)).toBe(0)
+
+    // #when — a tick runs its check
+    await stream.fakeTimer.tick()
+
+    // #then — one read timer was scheduled through the seam and cleared, and the stream is still open
+    expect(timeouts.scheduled(LEASE_READ_TIMEOUT_MS)).toBe(1)
+    expect(timeouts.cleared(LEASE_READ_TIMEOUT_MS)).toBe(1)
+    expect(stream.unsubscribeCalls()).toBe(0)
+    await timeouts.fire(LEASE_READ_TIMEOUT_MS)
+    expect(stream.unsubscribeCalls()).toBe(0)
+    await stream.res.body?.cancel()
+  })
+
+  it('ignores a read that resolves after the timeout has fired: no second close and no re-open', async () => {
+    // #given — a lease-tick read that stays pending
+    let release!: (value: {success: true; data: null} | typeof BOUND) => void
+    const pending = new Promise<{success: true; data: null} | typeof BOUND>(resolve => {
+      release = resolve
+    })
+    let reads = 0
+    const bindingsLookup: BindingsLookup = {
+      getBindingByRepo: vi.fn(async () => {
+        reads++
+        return reads === 1 ? BOUND : pending
+      }),
+    }
+    const timeouts = makeKeyedFakeTimeouts()
+    const subscribe = vi.fn((_runId: string, _callbacks: SubscriberCallbacks) => () => undefined)
+    const unsubscribeSpy = vi.fn()
+    const stream = await openLeasedStream({
+      bindingsLookup,
+      manager: makeManager({
+        subscribe: vi.fn((runId: string, callbacks: SubscriberCallbacks) => {
+          subscribe(runId, callbacks)
+          return unsubscribeSpy
+        }),
+      }),
+      setTimeout: timeouts.setTimeout,
+      clearTimeout: timeouts.clearTimeout,
+      leaseRepoAccessTimeoutMs: LEASE_READ_TIMEOUT_MS,
+    })
+
+    // #when — the tick starts, the read timer fires first, then the read answers late
+    await stream.fakeTimer.tick()
+    await timeouts.fire(LEASE_READ_TIMEOUT_MS)
+    release(BOUND)
+    await new Promise<void>(resolve => setTimeout(resolve, 0))
+    await stream.fakeTimer.tick()
+
+    // #then — the stream closed exactly once as unavailable, and nothing re-subscribed
+    expect(unsubscribeSpy).toHaveBeenCalledTimes(1)
+    expect(subscribe).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(stream.logger.warn).mock.calls.map(call => call[0])).toEqual([
+      {githubUserId: 99, gate: 'repo-unavailable'},
+    ])
+    await stream.res.body?.cancel()
+  })
+
+  it('resets the in-flight flag when a check throws', async () => {
+    // #given — a timer that keeps its callback after the stream closes, and a session read that throws on the tick
+    let intervalCallback: (() => void) | undefined
+    let sessionReads = 0
+    const sessionStore = {
+      get: vi.fn(() => {
+        sessionReads++
+        if (sessionReads === 1) throw new Error('boom')
+        return {githubUserId: 99, login: 'testuser', issuedAt: 0}
+      }),
+    }
+    const stream = await openLeasedStream({
+      sessionStore,
+      setInterval: (fn: () => void) => {
+        intervalCallback = fn
+        return 1 as unknown as ReturnType<typeof globalThis.setInterval>
+      },
+      clearInterval: () => undefined,
+    })
+    expect(sessionReads).toBe(0) // the gate does not read the session; the guard does
+
+    // #when — the first tick throws, closing the stream, then the callback is invoked again
+    intervalCallback?.()
+    await new Promise<void>(resolve => setTimeout(resolve, 0))
+    expect(stream.unsubscribeCalls()).toBe(1)
+    expect(sessionReads).toBe(1)
+    intervalCallback?.()
+    await new Promise<void>(resolve => setTimeout(resolve, 0))
+
+    // #then — the second invocation ran its check (the flag was reset), rather than returning early
+    expect(sessionReads).toBe(2)
+    await stream.res.body?.cancel()
+  })
+})
+
+describe('GET /operator/runs/:runId/stream — lease: operator removed from the allowlist mid-stream', () => {
+  it('closes the stream on the next tick and emits exactly one authz.denied (not_allowlisted)', async () => {
+    // #given — allowlisted at open; removed before the tick
+    let allowed = true
+    const allowlist: OperatorAllowlist = {isAuthorized: vi.fn(() => allowed), size: 1}
+    const stream = await openLeasedStream({allowlist})
+
+    // #when
+    allowed = false
+    await stream.fakeTimer.tick()
+
+    // #then — closed, and exactly one operator-level audit event with the surviving reason
+    expect(stream.unsubscribeCalls()).toBe(1)
+    const authzEvents = vi
+      .mocked(stream.auditLogger.warn)
+      .mock.calls.filter(call => (call[0] as {kind?: string}).kind === 'authz.denied')
+    expect(authzEvents).toHaveLength(1)
+    expect(authzEvents[0]?.[0]).toMatchObject({kind: 'authz.denied', githubUserId: 99, reason: 'not_allowlisted'})
+    expect(vi.mocked(stream.logger.warn).mock.calls.map(call => call[0])).toEqual([
+      {githubUserId: 99, gate: 'allowlist'},
+    ])
+    await stream.res.body?.cancel()
+  })
+
+  it('does not consult the binding store once the operator is off the allowlist', async () => {
+    // #given
+    let allowed = true
+    const bindingsLookup = makeMutableBindingsLookup(() => BOUND)
+    const stream = await openLeasedStream({allowlist: {isAuthorized: vi.fn(() => allowed), size: 1}, bindingsLookup})
+    vi.mocked(bindingsLookup.getBindingByRepo).mockClear()
+
+    // #when
+    allowed = false
+    await stream.fakeTimer.tick()
+
+    // #then
+    expect(bindingsLookup.getBindingByRepo).not.toHaveBeenCalled()
+    await stream.res.body?.cancel()
+  })
+})
+
+describe('GET /operator/runs/:runId/stream — lease: log contexts leak no identity', () => {
+  it('no lease denial log or audit event carries an owner, repo or run id', async () => {
+    // #given — three separate streams, each closed by a different lease check
+    // (the route handler itself reads neither the session nor the allowlist — the guard does — so the
+    // first lease tick is the first read of each)
+    let denied = false
+    const closers: Partial<RunStreamRouteDeps>[] = [
+      {sessionStore: makeSessionStore({get: vi.fn(() => (denied ? undefined : STUB_SESSION))})},
+      {allowlist: {isAuthorized: vi.fn(() => denied === false), size: 1}},
+      {denylistCache: {getDenylistState: vi.fn(async () => undefined), isRepoDenied: vi.fn(() => denied)}},
+    ]
+
+    for (const overrides of closers) {
+      const stream = await openLeasedStream(overrides)
+      denied = true
+      await stream.fakeTimer.tick()
+      expect(stream.unsubscribeCalls()).toBe(1)
+
+      // #then — only the operator id and a gate label are logged for the denial
+      const serialized = JSON.stringify([
+        vi.mocked(stream.logger.warn).mock.calls,
+        vi.mocked(stream.auditLogger.warn).mock.calls,
+      ])
+      expect(serialized).not.toContain('acme')
+      expect(serialized).not.toContain('widget')
+      expect(serialized).not.toContain('run-abc')
+      await stream.res.body?.cancel()
+      denied = false
+    }
   })
 })
 
@@ -1355,48 +1620,10 @@ describe('GET /operator/runs/:runId/stream — lease: repo denylisted mid-stream
 })
 
 // ---------------------------------------------------------------------------
-// Continuous-authz lease: token dropped / session expired mid-stream
+// Continuous-authz lease: session expired / revoked mid-stream
 // ---------------------------------------------------------------------------
 
-describe('GET /operator/runs/:runId/stream — lease: token/session loss mid-stream', () => {
-  it('closes the stream on the next tick when getOperatorToken returns undefined', async () => {
-    // #given — token is present at open time; dropped before the lease tick
-    let tokenPresent = true
-    const sessionStore = makeSessionStore({
-      getOperatorToken: vi.fn(() => (tokenPresent ? 'stub-oauth-token' : undefined)),
-    })
-
-    let unsubscribeCalls = 0
-    const manager = makeManager({
-      subscribe: vi.fn((_runId: string, _callbacks: SubscriberCallbacks) => {
-        return () => {
-          unsubscribeCalls++
-        }
-      }),
-    })
-
-    const fakeTimer = makeFakeTimer()
-    const deps = makeDepsWithFakeTimer(fakeTimer, {sessionStore, manager, maxStreamsPerOperator: 1})
-    const app = buildTestApp(deps)
-
-    const res = await fetchStream(app, 'run-abc')
-    expect(res.status).toBe(200)
-
-    // Drop the token, then fire a lease tick
-    tokenPresent = false
-    await fakeTimer.tick()
-
-    // #then — cleanup ran: unsubscribe called once (connection closed)
-    expect(unsubscribeCalls).toBe(1)
-
-    // Restore token and verify the slot was released (new stream succeeds)
-    tokenPresent = true
-    const res2 = await fetchStream(app, 'run-def')
-    expect(res2.status).toBe(200)
-    await res2.body?.cancel()
-    await res.body?.cancel()
-  })
-
+describe('GET /operator/runs/:runId/stream — lease: session loss mid-stream', () => {
   it('closes the stream on the next tick when session.get returns undefined', async () => {
     // #given — session is valid at open time; expires before the lease tick
     let sessionValid = true
@@ -1440,38 +1667,20 @@ describe('GET /operator/runs/:runId/stream — lease: token/session loss mid-str
 // ---------------------------------------------------------------------------
 
 describe('GET /operator/runs/:runId/stream — lease: generation guard', () => {
-  it('a lease tick whose checkRepoAuthz resolves after teardown does nothing (no double cleanup)', async () => {
-    // #given — a slow checkRepoAuthz that we can resolve manually after teardown
-    let resolveAuthz!: (result: {authorized: false; reason: 'github_denied'}) => void
-    const slowAuthzPromise = new Promise<{authorized: false; reason: 'github_denied'}>(resolve => {
-      resolveAuthz = resolve
+  it('a lease tick whose binding read resolves after teardown does nothing (no double cleanup)', async () => {
+    // #given — a slow binding read that we can resolve manually after teardown
+    let resolveBinding!: (result: {success: true; data: null}) => void
+    const slowBinding = new Promise<{success: true; data: null}>(resolve => {
+      resolveBinding = resolve
     })
 
-    // First call (gate): returns authorized immediately via cache
-    // Subsequent calls (lease tick): returns the slow promise
+    // First call (gate): bound immediately. Subsequent calls (lease tick): the slow promise.
     let callCount = 0
-    const repoAuthzDeps: RepoAuthzDeps = {
-      ...makeRepoAuthzDeps(true),
-      cache: {
-        get: vi.fn(() => {
-          callCount++
-          if (callCount === 1) {
-            // Gate call: authorized
-            return {authorized: true as const, expiresAt: Number.MAX_SAFE_INTEGER}
-          }
-          // Lease tick call: cache miss → will go to fetch (which we control via slowAuthzPromise)
-          return undefined
-        }),
-        set: vi.fn(),
-        getInFlight: vi.fn(() => undefined),
-        setInFlight: vi.fn(),
-        deleteInFlight: vi.fn(),
-        tokenIdentityFor: vi.fn(() => 'stub-token-id'),
-      },
-      fetch: vi.fn(async () => {
-        // Block until we manually resolve
-        const result = await slowAuthzPromise
-        return new Response('{}', {status: result.authorized === false ? 403 : 200})
+    const bindingsLookup: BindingsLookup = {
+      getBindingByRepo: vi.fn(async () => {
+        callCount++
+        if (callCount === 1) return BOUND
+        return slowBinding
       }),
     }
 
@@ -1487,26 +1696,23 @@ describe('GET /operator/runs/:runId/stream — lease: generation guard', () => {
     })
 
     const fakeTimer = makeFakeTimer()
-    const deps = makeDepsWithFakeTimer(fakeTimer, {repoAuthzDeps, manager, maxStreamsPerOperator: 1})
+    const deps = makeDepsWithFakeTimer(fakeTimer, {bindingsLookup, manager, maxStreamsPerOperator: 1})
     const app = buildTestApp(deps)
 
     const res = await fetchStream(app, 'run-abc')
     expect(res.status).toBe(200)
     expect(capturedCallbacks).toBeDefined()
 
-    // Start a lease tick — checkRepoAuthz is now in-flight (blocked on slowAuthzPromise)
-    // We do NOT await tick() yet — it's pending
+    // Start a lease tick — the binding read is now in flight (blocked on slowBinding).
     const tickPromise = fakeTimer.tick()
 
     // Tear down the connection via manager onClose BEFORE the tick resolves
     capturedCallbacks?.onClose('terminal')
     await res.body?.cancel()
-
-    // #then — unsubscribe called once (from onClose teardown)
     expect(unsubscribeCalls).toBe(1)
 
-    // Now resolve the slow authz check (returns denied)
-    resolveAuthz({authorized: false, reason: 'github_denied'})
+    // Now resolve the slow read (binding gone, which would otherwise close the stream)
+    resolveBinding({success: true, data: null})
     await tickPromise
 
     // #then — unsubscribe still called exactly once (generation guard prevented double cleanup)
@@ -1547,19 +1753,11 @@ describe('GET /operator/runs/:runId/stream — lease: timer cleared on teardown'
   it('does not fire further ticks after cleanup (advancing timer is a no-op)', async () => {
     // #given — stream opens; we track how many times the lease check runs after teardown
     let leaseCheckCount = 0
-    const repoAuthzDeps: RepoAuthzDeps = {
-      ...makeRepoAuthzDeps(true),
-      cache: {
-        get: vi.fn(() => {
-          leaseCheckCount++
-          return {authorized: true as const, expiresAt: Number.MAX_SAFE_INTEGER}
-        }),
-        set: vi.fn(),
-        getInFlight: vi.fn(() => undefined),
-        setInFlight: vi.fn(),
-        deleteInFlight: vi.fn(),
-        tokenIdentityFor: vi.fn(() => 'stub-token-id'),
-      },
+    const bindingsLookup: BindingsLookup = {
+      getBindingByRepo: vi.fn(async () => {
+        leaseCheckCount++
+        return BOUND
+      }),
     }
 
     let capturedCallbacks: SubscriberCallbacks | undefined
@@ -1571,7 +1769,7 @@ describe('GET /operator/runs/:runId/stream — lease: timer cleared on teardown'
     })
 
     const fakeTimer = makeFakeTimer()
-    const deps = makeDepsWithFakeTimer(fakeTimer, {repoAuthzDeps, manager})
+    const deps = makeDepsWithFakeTimer(fakeTimer, {bindingsLookup, manager})
     const app = buildTestApp(deps)
 
     const res = await fetchStream(app, 'run-abc')
@@ -1902,15 +2100,15 @@ describe('GET /operator/runs/:runId/stream — socket.setTimeout throw resilienc
 // ---------------------------------------------------------------------------
 
 describe('GET /operator/runs/:runId/stream — gate throws → 404', () => {
-  it('returns 404 when getOperatorToken throws (no 500, no stream)', async () => {
-    // #given — session store throws on getOperatorToken
-    const sessionStore = makeSessionStore({
-      getOperatorToken: vi.fn(() => {
+  it('returns 404 when the binding lookup throws (no 500, no stream)', async () => {
+    // #given — binding store throws
+    const bindingsLookup: BindingsLookup = {
+      getBindingByRepo: vi.fn(async () => {
         throw new Error('store unavailable')
       }),
-    })
+    }
     const manager = makeManager()
-    const deps = makeDeps({sessionStore, manager})
+    const deps = makeDeps({bindingsLookup, manager})
     const app = buildTestApp(deps)
 
     // #when
@@ -1972,57 +2170,30 @@ describe('GET /operator/runs/:runId/stream — gate throws → 404', () => {
 // ---------------------------------------------------------------------------
 
 describe('GET /operator/runs/:runId/stream — lease: unexpected throw closes stream', () => {
-  it('closes the stream when checkRepoAuthz throws inside a lease tick', async () => {
-    // #given — gate passes (cache hit); lease tick's checkRepoAuthz throws unexpectedly
-    // The cache returns authorized on the first call (gate), then undefined (cache miss)
-    // on subsequent calls so the lease tick goes to fetch — which throws.
-    let cacheCallCount = 0
-    const repoAuthzDeps: RepoAuthzDeps = {
-      ...makeRepoAuthzDeps(true),
-      cache: {
-        get: vi.fn(() => {
-          cacheCallCount++
-          if (cacheCallCount === 1) {
-            // Gate call: authorized (cache hit)
-            return {authorized: true as const, expiresAt: Number.MAX_SAFE_INTEGER}
-          }
-          // Lease tick: cache miss → goes to fetch
-          return undefined
-        }),
-        set: vi.fn(),
-        getInFlight: vi.fn(() => undefined),
-        setInFlight: vi.fn(),
-        deleteInFlight: vi.fn(),
-        tokenIdentityFor: vi.fn(() => 'stub-token-id'),
-      },
-      fetch: vi.fn(async () => {
-        throw new Error('network error')
-      }),
-    }
-
-    let unsubscribeCalls = 0
-    const manager = makeManager({
-      subscribe: vi.fn((_runId: string, _callbacks: SubscriberCallbacks) => {
-        return () => {
-          unsubscribeCalls++
-        }
+  it('closes the stream when the lease check throws unexpectedly inside a tick', async () => {
+    // #given — the gate passes; the session read throws on the lease tick
+    let throwNow = false
+    const sessionStore = makeSessionStore({
+      get: vi.fn(() => {
+        if (throwNow) throw new Error('session store exploded')
+        return STUB_SESSION
       }),
     })
+    const stream = await openLeasedStream({sessionStore})
 
-    const fakeTimer = makeFakeTimer()
-    const deps = makeDepsWithFakeTimer(fakeTimer, {repoAuthzDeps, manager, maxStreamsPerOperator: 1})
-    const app = buildTestApp(deps)
+    // #when — fire a lease tick where the check throws
+    throwNow = true
+    await stream.fakeTimer.tick()
 
-    const res = await fetchStream(app, 'run-abc')
-    expect(res.status).toBe(200)
+    // #then — stream was closed (fail-closed on unexpected lease error), and the log carries no run id
+    expect(stream.unsubscribeCalls()).toBe(1)
+    const leaseErrorCtx = vi
+      .mocked(stream.logger.warn)
+      .mock.calls.find(call => call[1] === 'run-stream: lease check threw — closing stream')?.[0]
+    expect(leaseErrorCtx).toBeDefined()
+    expect(Object.keys(leaseErrorCtx ?? {}).toSorted()).toEqual(['error', 'githubUserId'])
 
-    // #when — fire a lease tick where checkRepoAuthz throws
-    await fakeTimer.tick()
-
-    // #then — stream was closed (fail-closed on unexpected lease error)
-    expect(unsubscribeCalls).toBe(1)
-
-    await res.body?.cancel()
+    await stream.res.body?.cancel()
   })
 })
 
@@ -2715,7 +2886,7 @@ describe('GET /operator/runs/:runId/stream — durable cache-miss resolution (#1
     }
   })
 
-  it('never reads persisted state for a denylisted or unauthorized repo', async () => {
+  it('never reads persisted state for a denylisted or unbound repo', async () => {
     // #given a terminal persisted run
     const readRunState = vi.fn(async () => makeRunState('COMPLETED'))
 
@@ -2725,9 +2896,13 @@ describe('GET /operator/runs/:runId/stream — durable cache-miss resolution (#1
     )
     const denied = await fetchStream(deniedApp, 'run-001')
 
-    // #when the repo is not authorized for the operator
+    // #when the repo is not bound
     const unauthorizedApp = buildTestApp(
-      makeDeps({readRunState, repoAuthzDeps: makeRepoAuthzDeps(false), manager: makeRealManager()}),
+      makeDeps({
+        readRunState,
+        bindingsLookup: makeMutableBindingsLookup(() => ({success: true as const, data: null})),
+        manager: makeRealManager(),
+      }),
     )
     const unauthorized = await fetchStream(unauthorizedApp, 'run-001')
 

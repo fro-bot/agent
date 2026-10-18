@@ -10,6 +10,8 @@ origin: docs/plans/2026-06-15-002-feat-gateway-web-operator-control-surface-plan
 
 # Authenticated SSE run-stream route (Unit 4b)
 
+> **Superseded in part.** The token-based authorization in this plan (OAuth-token resolution by session, `checkRepoAuthz`, and the token lease re-check) is superseded by [2026-10-17-001-feat-durable-operator-sessions-plan.md](2026-10-17-001-feat-durable-operator-sessions-plan.md). Sessions no longer hold a token, and repository access is the bindings-only predicate.
+
 ## Overview
 
 Expose the inert run-observation core (Unit 4a) through a single authenticated, repo-scoped, fail-closed SSE route: `GET /operator/runs/:runId/stream`. An operator with repository access streams a run's redacted, status-only updates; everyone else gets an indistinguishable generic not-found. This is the security-critical unit — authorization and redaction happen **before any byte is written**, the resolved repository is **never** taken from the client, and access lost mid-stream terminates the connection.

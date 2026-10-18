@@ -4,9 +4,8 @@ import type {RepoBinding} from '../../bindings/types.js'
 import type {DispatchOutcome, DispatchWorkflow} from '../../github/dispatch.js'
 import type {RepoKey} from '../../redaction/denylist.js'
 import type {AuditLogger} from '../audit.js'
-import type {RepoAuthzDeps} from '../auth/repo-authz.js'
 import type {DispatchRouteDeps} from './dispatch-route.js'
-import type {LaunchRouteBindingsLookup, LaunchRouteSessionStore} from './launch-route.js'
+import type {LaunchRouteBindingsLookup} from './launch-route.js'
 import {Hono} from 'hono'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {setOperatorRouteGuard} from '../operator-route.js'
@@ -28,10 +27,9 @@ function makeBinding(overrides?: Partial<RepoBinding>): RepoBinding {
   }
 }
 
-function makeSessionStore(overrides?: Partial<LaunchRouteSessionStore>): LaunchRouteSessionStore {
+function makeSessionStore(overrides?: Partial<DispatchRouteDeps['sessionStore']>): DispatchRouteDeps['sessionStore'] {
   return {
-    getOperatorToken: vi.fn(() => 'oauth-token'),
-    get: vi.fn(() => ({githubUserId: 1001, login: 'alice'})),
+    get: vi.fn(() => ({githubUserId: 1001, login: 'alice', issuedAt: 0})),
     ...overrides,
   }
 }
@@ -42,23 +40,10 @@ function makeBindingsLookup(binding: RepoBinding | null = makeBinding()): Launch
   }
 }
 
-function makeRepoAuthzDeps(overrides?: Partial<RepoAuthzDeps>): RepoAuthzDeps {
+function makeDenylistCache(denied = false): DispatchRouteDeps['denylistCache'] {
   return {
-    allowlist: {isAuthorized: vi.fn(() => true), size: 1},
-    fetch: vi.fn(async () => new Response('{"permissions":{"admin":true}}', {status: 200})),
-    clock: () => 0,
-    random: () => 0.5,
-    auditLogger: {info: vi.fn(), warn: vi.fn()},
-    logger: {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
-    cache: {
-      get: vi.fn(() => undefined),
-      set: vi.fn(),
-      getInFlight: vi.fn(() => undefined),
-      setInFlight: vi.fn(),
-      deleteInFlight: vi.fn(),
-      tokenIdentityFor: vi.fn(() => 'opaque-token-id'),
-    },
-    ...overrides,
+    getDenylistState: vi.fn(async () => undefined),
+    isRepoDenied: vi.fn((_key: RepoKey) => denied),
   }
 }
 
@@ -70,8 +55,7 @@ function makeDeps(overrides?: Partial<DispatchRouteDeps>): DispatchRouteDeps {
   return {
     sessionStore: makeSessionStore(),
     bindingsLookup: makeBindingsLookup(),
-    isRepoDenied: vi.fn((_key: RepoKey) => false),
-    repoAuthzDeps: makeRepoAuthzDeps(),
+    denylistCache: makeDenylistCache(),
     dispatchWorkflow: vi.fn(async () => ({outcome: 'accepted' as const, owner: 'acme', repo: 'widget'})),
     idempotencyGuard: createIdempotencyGuard(),
     auditLogger: makeAuditLogger(),
@@ -230,7 +214,7 @@ describe('POST /operator/dispatch — gate ordering and errors', () => {
 
     // #then
     expect(response.status).toBe(403)
-    expect(sessionStore.getOperatorToken).not.toHaveBeenCalled()
+    expect(sessionStore.get).not.toHaveBeenCalled()
     expect(bindingsLookup.getBindingByRepo).not.toHaveBeenCalled()
     expect(dispatchWorkflow).not.toHaveBeenCalled()
   })
@@ -248,36 +232,97 @@ describe('POST /operator/dispatch — gate ordering and errors', () => {
     expect(response.status).toBe(404)
   })
 
-  it('returns 404 for a denylisted binding, without authz or dispatch', async () => {
+  it('returns 404 for a denylisted binding, without dispatching or auditing', async () => {
     // #given
-    const isRepoDenied = vi.fn(() => true)
-    const repoAuthzDeps = makeRepoAuthzDeps()
+    const denylistCache = makeDenylistCache(true)
     const dispatchWorkflow: DispatchWorkflow = vi.fn()
     const auditLogger = makeAuditLogger()
-    const deps = makeDeps({isRepoDenied, repoAuthzDeps, dispatchWorkflow, auditLogger})
+    const deps = makeDeps({denylistCache, dispatchWorkflow, auditLogger})
     const app = buildApp(deps)
 
     // #when
     const response = await postDispatch(app, {repo: 'acme/widget', task: 'do work'})
 
-    // #then — denylist is checked before the authz GitHub fetch and dispatcher
+    // #then — the denylist is consulted with the binding's keys; no dispatch, no audit event
     expect(response.status).toBe(404)
-    expect(isRepoDenied).toHaveBeenCalledOnce()
-    expect(repoAuthzDeps.fetch).not.toHaveBeenCalled()
+    expect(await response.json()).toEqual({error: 'not-found'})
+    expect(denylistCache.isRepoDenied).toHaveBeenCalledExactlyOnceWith({databaseId: 42, nodeId: 'R_node_42'})
     expect(dispatchWorkflow).not.toHaveBeenCalled()
     expect(auditLogger.info).not.toHaveBeenCalled()
     expect(auditLogger.warn).not.toHaveBeenCalled()
-    expect(vi.mocked(repoAuthzDeps.auditLogger.info)).not.toHaveBeenCalled()
-    expect(vi.mocked(repoAuthzDeps.auditLogger.warn)).not.toHaveBeenCalled()
   })
 
-  it('returns 404 for a write-authz denial without dispatching', async () => {
-    // #given — the operator can read the repo but lacks write permission
-    const repoAuthzDeps = makeRepoAuthzDeps({
-      fetch: vi.fn(async () => new Response('{"permissions":{}}', {status: 200})),
-    })
+  it('uses the same bindings-only predicate for a write: a bound repo dispatches with one binding read', async () => {
+    // #given
+    const bindingsLookup = makeBindingsLookup()
+    const dispatchWorkflow: DispatchWorkflow = vi.fn(async () => ({
+      outcome: 'accepted' as const,
+      owner: 'acme',
+      repo: 'widget',
+    }))
+    const deps = makeDeps({bindingsLookup, dispatchWorkflow})
+    const app = buildApp(deps)
+
+    // #when
+    const response = await postDispatch(app, {repo: 'acme/widget', task: 'do work'})
+
+    // #then — no write-level GitHub probe and no token accessor: one read, one dispatch
+    expect(response.status).toBe(200)
+    expect(bindingsLookup.getBindingByRepo).toHaveBeenCalledExactlyOnceWith('acme', 'widget')
+    expect(dispatchWorkflow).toHaveBeenCalledOnce()
+    expect(Object.keys(deps.sessionStore)).toEqual(['get'])
+  })
+
+  it('log context shares one denial label for unbound and denylisted repos and carries no owner/repo', async () => {
+    // #given
+    const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const unbound = makeDeps({logger, bindingsLookup: makeBindingsLookup(null)})
+    const denied = makeDeps({logger, denylistCache: makeDenylistCache(true)})
+
+    // #when
+    await postDispatch(buildApp(unbound), {repo: 'acme/widget', task: 'do work'})
+    await postDispatch(buildApp(denied), {repo: 'acme/widget', task: 'do work'})
+
+    // #then
+    expect(logger.warn.mock.calls.map(call => call[0] as unknown)).toEqual([
+      {githubUserId: 1001, gate: 'repo-denied'},
+      {githubUserId: 1001, gate: 'repo-denied'},
+    ])
+  })
+
+  it.each([
+    'acme/..',
+    'acme/.',
+    'acme/a\u0000b',
+    `acme/${'r'.repeat(101)}`,
+    `${'o'.repeat(40)}/widget`,
+    '-acme/widget',
+  ])('returns 404 with zero binding reads for the malformed name %j', async repoName => {
+    // #given
+    const bindingsLookup = makeBindingsLookup()
     const dispatchWorkflow: DispatchWorkflow = vi.fn()
-    const deps = makeDeps({repoAuthzDeps, dispatchWorkflow})
+    const deps = makeDeps({bindingsLookup, dispatchWorkflow})
+    const app = buildApp(deps)
+
+    // #when
+    const response = await postDispatch(app, {repo: repoName, task: 'do work'})
+
+    // #then
+    expect(response.status).toBe(404)
+    expect(await response.json()).toEqual({error: 'not-found'})
+    expect(bindingsLookup.getBindingByRepo).not.toHaveBeenCalled()
+    expect(dispatchWorkflow).not.toHaveBeenCalled()
+  })
+
+  it('returns the uniform 404 when the binding lookup throws', async () => {
+    // #given
+    const bindingsLookup: LaunchRouteBindingsLookup = {
+      getBindingByRepo: vi.fn(async () => {
+        throw new Error('boom')
+      }),
+    }
+    const dispatchWorkflow: DispatchWorkflow = vi.fn()
+    const deps = makeDeps({bindingsLookup, dispatchWorkflow})
     const app = buildApp(deps)
 
     // #when
@@ -285,6 +330,7 @@ describe('POST /operator/dispatch — gate ordering and errors', () => {
 
     // #then
     expect(response.status).toBe(404)
+    expect(await response.json()).toEqual({error: 'not-found'})
     expect(dispatchWorkflow).not.toHaveBeenCalled()
   })
 
@@ -475,9 +521,9 @@ describe('POST /operator/dispatch — gate ordering and errors', () => {
     expect(dispatchWorkflow).toHaveBeenCalledTimes(2)
   })
 
-  it('returns 404 when the session token is unavailable', async () => {
+  it('returns 404 when the session is unavailable', async () => {
     // #given
-    const sessionStore = makeSessionStore({getOperatorToken: vi.fn(() => undefined)})
+    const sessionStore = makeSessionStore({get: vi.fn(() => undefined)})
     const deps = makeDeps({sessionStore})
     const app = buildApp(deps)
 
@@ -499,7 +545,7 @@ describe('POST /operator/dispatch — gate ordering and errors', () => {
 
     // #then
     expect(response.status).toBe(429)
-    expect(sessionStore.getOperatorToken).not.toHaveBeenCalled()
+    expect(sessionStore.get).not.toHaveBeenCalled()
   })
 
   it('returns 429 when the per-hour operator limit is exceeded', async () => {

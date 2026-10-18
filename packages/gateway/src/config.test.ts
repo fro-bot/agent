@@ -64,6 +64,8 @@ beforeEach(() => {
     'WORKSPACE_OPENCODE_TOKEN',
     'WORKSPACE_OPENCODE_TOKEN_FILE',
     'GATEWAY_TRIGGER_ROLE_ID',
+    'GATEWAY_BINDER_ALLOWLIST',
+    'GATEWAY_BINDER_ALLOWLIST_FILE',
     'GATEWAY_MAX_CONCURRENT_RUNS',
     'GATEWAY_RUN_TIMEOUT_MS',
     'GATEWAY_RUN_INACTIVITY_TIMEOUT_MS',
@@ -1266,6 +1268,138 @@ describe('loadGatewayConfig — webhook secret, presence channel, http port', ()
 
     // #then
     expect(config.triggerRoleId).toBe('1234567890')
+  })
+
+  describe('binderAllowlist', () => {
+    it('defaults to an empty set when GATEWAY_BINDER_ALLOWLIST is unset', () => {
+      // #given
+      setRequiredEnv()
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.binderAllowlist.size).toBe(0)
+    })
+
+    it('treats an empty or whitespace-only value as an empty set', () => {
+      // #given
+      setRequiredEnv()
+      process.env.GATEWAY_BINDER_ALLOWLIST = '  \n \n'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.binderAllowlist.size).toBe(0)
+    })
+
+    it('treats an empty _FILE as an empty set', () => {
+      // #given
+      setRequiredEnv()
+      const listFile = join(tmpDir, 'binder-allowlist')
+      writeFileSync(listFile, '', {mode: 0o600})
+      process.env.GATEWAY_BINDER_ALLOWLIST_FILE = listFile
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.binderAllowlist.size).toBe(0)
+    })
+
+    it('parses a newline-separated list of snowflakes from the env value', () => {
+      // #given
+      setRequiredEnv()
+      process.env.GATEWAY_BINDER_ALLOWLIST = '111111111111111111\n222222222222222222'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect([...config.binderAllowlist].sort()).toEqual(['111111111111111111', '222222222222222222'])
+    })
+
+    it('parses a newline-separated list of snowflakes from the _FILE variant', () => {
+      // #given
+      setRequiredEnv()
+      const listFile = join(tmpDir, 'binder-allowlist')
+      writeFileSync(listFile, '111111111111111111\n222222222222222222\n', {mode: 0o600})
+      process.env.GATEWAY_BINDER_ALLOWLIST_FILE = listFile
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect([...config.binderAllowlist].sort()).toEqual(['111111111111111111', '222222222222222222'])
+    })
+
+    it('prefers the _FILE variant over the env value', () => {
+      // #given
+      setRequiredEnv()
+      const listFile = join(tmpDir, 'binder-allowlist')
+      writeFileSync(listFile, '333333333333333333\n', {mode: 0o600})
+      process.env.GATEWAY_BINDER_ALLOWLIST_FILE = listFile
+      process.env.GATEWAY_BINDER_ALLOWLIST = '111111111111111111'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect([...config.binderAllowlist]).toEqual(['333333333333333333'])
+    })
+
+    it('ignores duplicates, blank lines, comments, CRLF and surrounding whitespace', () => {
+      // #given
+      setRequiredEnv()
+      process.env.GATEWAY_BINDER_ALLOWLIST =
+        '# binders\r\n  111111111111111111  \r\n\r\n111111111111111111\n\t222222222222222222\n'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect([...config.binderAllowlist].sort()).toEqual(['111111111111111111', '222222222222222222'])
+    })
+
+    it('keeps the exact digits of snowflakes beyond the safe-integer range', () => {
+      // #given — 18446744073709551615 is the max uint64, far above Number.MAX_SAFE_INTEGER
+      setRequiredEnv()
+      process.env.GATEWAY_BINDER_ALLOWLIST = '18446744073709551615\n123456789012345678'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.binderAllowlist.has('18446744073709551615')).toBe(true)
+      expect(config.binderAllowlist.has('123456789012345678')).toBe(true)
+      expect(config.binderAllowlist.has(String(Number('18446744073709551615')))).toBe(false)
+    })
+
+    it.each([
+      ['non-numeric', 'not-a-snowflake-value'],
+      ['too short', '12345'],
+      ['too long', '123456789012345678901'],
+      ['signed', '-11111111111111111'],
+      ['decimal', '1111111111111111.5'],
+    ])('fails config load for a %s entry, naming the variable but not the value', (_label, entry) => {
+      // #given
+      setRequiredEnv()
+      process.env.GATEWAY_BINDER_ALLOWLIST = `111111111111111111\n${entry}`
+
+      // #when
+      let message = ''
+      try {
+        loadGatewayConfig()
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error)
+      }
+
+      // #then
+      expect(message).toContain('GATEWAY_BINDER_ALLOWLIST')
+      expect(message).toContain('line 2')
+      expect(message).not.toContain(entry)
+    })
   })
 
   it('defaults maxConcurrentRuns to 3 when GATEWAY_MAX_CONCURRENT_RUNS is unset', () => {

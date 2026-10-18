@@ -2,33 +2,30 @@
  * Authenticated run-listing route: GET /operator/runs
  *
  * Returns a bounded, repo-scoped, newest-first list of run summaries for all
- * repositories an authenticated operator is authorized to access. Mirrors the
- * security posture of GET /operator/repos exactly.
+ * bound, non-denylisted repositories. Mirrors the security posture of
+ * GET /operator/repos exactly: the same bindings-only repo-access rule, applied to
+ * the bindings this listing already holds instead of re-reading each one.
  *
  * Gate ordering (all must pass before any run data is returned):
  *   1. Guard (browser/session/allowlist) — installed by buildOperatorApp
  *   2. Operator rate limit (20/min, operator-keyed) — before binding enumeration
- *   3. Resolve OAuth token via session store
- *   4. listBindings() — enumerate all bound repos
- *   5. filterDeniedRecords() — drop denylisted repos BEFORE any authz call
- *   6. Dedup by owner/repo, then cap before the authz fan-out
- *   7. checkRepoAuthz() per surviving binding — keep only authorized repos
- *   8. listRunsForRepo() per authorized binding — enumerate run-states
- *   9. toRunSummary() projection — drop null (entity_ref mismatch) + warn
- *  10. overlayWaitingStatus() — registries read after listRunsForRepo resolves
- *  11. Flatten; sort newest-first by createdAt; cap at MAX_RUNS_PER_LISTING
- *  12. Cache-Control: no-store, private; return 200 {runs: RunSummary[]}
+ *   3. listBindings() — enumerate all bound repos
+ *   4. filterDeniedRecords() — drop denylisted repos BEFORE any run-state read
+ *   5. Dedup by owner/repo, then cap before the run-state scan
+ *   6. listRunsForRepo() per surviving binding — enumerate run-states
+ *   7. toRunSummary() projection — drop null (entity_ref mismatch) + warn
+ *   8. overlayWaitingStatus() — registries read after listRunsForRepo resolves
+ *   9. Flatten; sort newest-first by createdAt; cap at MAX_RUNS_PER_LISTING
+ *  10. Cache-Control: no-store, private; return 200 {runs: RunSummary[]}
  *
  * Security invariants:
- *   - Denylisted repos are dropped before checkRepoAuthz is called (no oracle).
- *   - Unauthorized repos are silently omitted (no oracle).
- *   - Denied/unauthorized repos' run-states are never read (authz fan-out bounds GitHub calls).
+ *   - Denylisted repos are silently omitted (no oracle) and their run-states are never read.
  *   - Store errors return a coarse error; no partial list leaks.
  *   - Response carries only {runId, repo, status, createdAt, updatedAt?, failureKind?}.
  *   - Result is capped at MAX_RUNS_PER_LISTING (no pagination machinery).
- *   - Token is never logged.
- *   - Rate limit is operator-keyed (not socket-keyed) to prevent OAuth-budget
- *     self-DoS from the per-repo authz fan-out (up to 100 GitHub calls per request).
+ *   - No per-repo binding read and no GitHub call.
+ *   - Rate limit is operator-keyed (not socket-keyed) to bound the run-state read amplification
+ *     (up to MAX_REPOS_SCANNED repo scans per request).
  */
 
 import type {RunState} from '@fro-bot/runtime'
@@ -39,12 +36,10 @@ import type {RepoBinding} from '../../bindings/types.js'
 import type {RateLimiter} from '../../http/rate-limit.js'
 import type {RunSummary} from '../../operator-contract/run-summary.js'
 import type {RepoKey} from '../../redaction/denylist.js'
-import type {RepoAuthzDeps} from '../auth/repo-authz.js'
 import type {OperatorLogger} from '../server.js'
 import {createRateLimiter} from '../../http/rate-limit.js'
 import {toRunSummary} from '../../operator-contract/run-summary.js'
 import {bindingToRepoKey, filterDeniedRecords} from '../../redaction/surface-gate.js'
-import {checkRepoAuthz} from '../auth/repo-authz.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
 import {rateLimitedResponse} from '../safe-response.js'
 import {overlayWaitingStatus, scopeIdFor} from '../sse/projection.js'
@@ -62,19 +57,19 @@ import {overlayWaitingStatus, scopeIdFor} from '../sse/projection.js'
 export const MAX_RUNS_PER_LISTING = 100
 
 /**
- * Authz fan-out cap: maximum number of bindings that proceed to checkRepoAuthz.
+ * Scan cap: maximum number of bindings whose run-states are read per request.
  *
- * Bindings beyond this are silently truncated (first MAX_REPOS_AUTHZ_FANOUT
+ * Bindings beyond this are silently truncated (first MAX_REPOS_SCANNED
  * distinct owner/repo pairs after denylist filtering).
  */
-const MAX_REPOS_AUTHZ_FANOUT = 100
+const MAX_REPOS_SCANNED = 100
 
 /**
  * Per-operator rate limit for the runs listing route: 20 requests per minute.
  *
- * Each request fans out to up to MAX_REPOS_AUTHZ_FANOUT checkRepoAuthz GitHub
- * calls, then per-repo run-state reads. Without a rate limit, a single operator
- * could exhaust the OAuth token budget via rapid repeated listing.
+ * Each request fans out to up to MAX_REPOS_SCANNED per-repo run-state reads. Without
+ * a rate limit, a single operator could drive unbounded object-store read volume
+ * via rapid repeated listing.
  */
 const RUNS_RATE_LIMIT_PER_MIN = 20
 const RUNS_RATE_WINDOW_MIN_MS = 60_000
@@ -82,14 +77,6 @@ const RUNS_RATE_WINDOW_MIN_MS = 60_000
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
-
-/**
- * Minimal session store interface required by the runs route.
- * Accepts the full SessionStore from session.ts (structural subtype).
- */
-export interface RunsRouteSessionStore {
-  readonly getOperatorToken: (sessionId: string, nowMs: number) => string | undefined
-}
 
 /**
  * Minimal bindings store interface required by the runs route.
@@ -101,17 +88,13 @@ export type RunsListBindingsFn = () => Promise<
 
 /** Dependencies for the runs route. */
 export interface RunsRouteDeps {
-  /** Session store for OAuth token retrieval. */
-  readonly sessionStore: RunsRouteSessionStore
   /** Binding store list function. */
   readonly listBindings: RunsListBindingsFn
   /**
    * Denylist predicate — returns true when a repo's deny keys are on the denylist.
-   * Must be called synchronously for each binding BEFORE any authz check.
+   * Called synchronously for each binding BEFORE any run-state read.
    */
   readonly isRepoDenied: (repoKey: RepoKey) => boolean
-  /** Repo authorization dependencies for checkRepoAuthz. */
-  readonly repoAuthzDeps: RepoAuthzDeps
   /** Structured logger. */
   readonly logger: OperatorLogger
   /** Injectable clock. */
@@ -164,8 +147,6 @@ export function buildRunsRoute(app: Hono, deps: RunsRouteDeps): void {
     createRateLimiter({limit: RUNS_RATE_LIMIT_PER_MIN, windowMs: RUNS_RATE_WINDOW_MIN_MS, clock: deps.now})
 
   registerOperatorRoute(app, 'GET', '/operator/runs', async c => {
-    const nowMs = deps.now()
-
     // ── Gate 1: Read authenticated context set by the guard ──────────────────
     // In production the guard always sets this; undefined is unreachable.
     // Return 401 as a safe fallback (guard not installed — programming error path).
@@ -175,27 +156,18 @@ export function buildRunsRoute(app: Hono, deps: RunsRouteDeps): void {
       return c.json({error: 'unauthorized'}, 401)
     }
 
-    const {githubUserId, sessionId} = authCtx
+    const {githubUserId} = authCtx
 
-    // ── Gate 2: Operator rate limit (operator-keyed) ─────────────────────────
+    // ── Gate 2: Operator rate limit (operator-keyed) ─────────────────────────────
     // Checked AFTER auth context (so it's operator-keyed) and BEFORE the binding
-    // enumeration/authz fan-out (so it bounds the GitHub API call budget).
+    // enumeration/run-state scan (so it bounds the object-store read budget).
     const operatorKey = String(githubUserId)
     if (perMinLimiter.allow(operatorKey) === false) {
       deps.logger.warn({githubUserId, gate: 'rate-limited'}, 'runs: rate limited')
       return rateLimitedResponse(c)
     }
 
-    // ── Gate 3: Resolve OAuth token ──────────────────────────────────────────
-    // A missing token means the session is dropped/expired/revoked.
-    // Return a coarse error — no oracle (same shape as store errors).
-    const token = deps.sessionStore.getOperatorToken(sessionId, nowMs)
-    if (token === undefined) {
-      deps.logger.warn({githubUserId, gate: 'no-token'}, 'runs: denied — token missing')
-      return c.json({error: 'unauthorized'}, 401)
-    }
-
-    // ── Gate 4: List all bound repos ─────────────────────────────────────────
+    // ── Gate 3: List all bound repos ──────────────────────────────────────
     // A store error returns a coarse error — no partial list leaks.
     let bindings: RepoBinding[]
     try {
@@ -210,9 +182,8 @@ export function buildRunsRoute(app: Hono, deps: RunsRouteDeps): void {
       return c.json({error: 'unavailable'}, 503)
     }
 
-    // ── Gate 5: Denylist filter — BEFORE any authz call ──────────────────────
-    // Denylisted repos must never reach checkRepoAuthz (no oracle, no GitHub call).
-    // Their run-states are never read — tighter than "scan all then filter."
+    // ── Gate 4: Denylist filter — BEFORE any run-state read ─────────────────────
+    // Denylisted repos' run-states are never read — tighter than "scan all then filter."
     const allowed = filterDeniedRecords(bindings, bindingToRepoKey, deps.isRepoDenied)
 
     // Dedup by owner/repo BEFORE the cap — duplicate channelId bindings for the same
@@ -227,31 +198,11 @@ export function buildRunsRoute(app: Hono, deps: RunsRouteDeps): void {
       return true
     })
 
-    // Cap AFTER dedup to bound GitHub API calls; excess distinct repos are silently truncated.
-    const capped = dedupedAllowed.slice(0, MAX_REPOS_AUTHZ_FANOUT)
+    // Cap AFTER dedup to bound the run-state scan; excess distinct repos are silently truncated.
+    const capped = dedupedAllowed.slice(0, MAX_REPOS_SCANNED)
 
-    // ── Gate 7: Per-repo authz — keep only repos the operator can access ──────
-    // checkRepoAuthz is called per binding. A denial silently omits the repo.
-    // Per-repo authz failures are NOT errors — they are silent omissions (no oracle).
-    const authorized: RepoBinding[] = []
-    for (const binding of capped) {
-      try {
-        const authzResult = await checkRepoAuthz(githubUserId, binding.owner, binding.repo, token, deps.repoAuthzDeps)
-        if (authzResult.authorized === true) {
-          authorized.push(binding)
-        }
-        // Unauthorized: silently omit — no log, no error (no oracle).
-      } catch {
-        // Unexpected authz error: silently omit this repo (fail closed, no oracle).
-        deps.logger.warn(
-          {githubUserId, owner: binding.owner, repo: binding.repo},
-          'runs: checkRepoAuthz threw — omitting repo',
-        )
-      }
-    }
-
-    // ── Enumerate runs for each authorized binding ────────────────────────────
-    // Run-states are read ONLY for authorized, non-denied repos. A per-repo scan
+    // ── Enumerate runs for each surviving binding ──────────────────────────────
+    // Run-states are read ONLY for non-denied repos. A per-repo scan
     // error is isolated (skip that repo, continue) — never a 500.
     //
     // Dedup by owner/repo before scanning: bindings are keyed by channelId, so two
@@ -270,7 +221,7 @@ export function buildRunsRoute(app: Hono, deps: RunsRouteDeps): void {
     const allSummaries: RunSummary[] = []
     const scannedRepos = new Set<string>()
 
-    for (const binding of authorized) {
+    for (const binding of capped) {
       const repo = `${binding.owner}/${binding.repo}`
       if (scannedRepos.has(repo)) {
         continue
@@ -289,7 +240,7 @@ export function buildRunsRoute(app: Hono, deps: RunsRouteDeps): void {
       // toRunSummary returns null when entity_ref owner/repo does not match the
       // binding (corruption/rename guard). Drop nulls and warn-log.
       // The waiting overlay reads the registries here, after listRunsForRepo has
-      // resolved and only for repos that passed the denylist and authz gates.
+      // resolved and only for repos that passed the denylist gate.
       for (const runState of runs) {
         const summary = toRunSummary(runState, binding)
         if (summary === null) {

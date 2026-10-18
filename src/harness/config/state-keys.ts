@@ -24,6 +24,15 @@ export const STATE_KEYS = {
    * `cleanupSkipped: true` placeholder and clobbering the rich payload.
    */
   CLEANUP_METADATA_WRITTEN: 'cleanupMetadataWritten',
+  /**
+   * Holder id of the Action coordination lock this run acquired. Set right after acquisition and cleared after a
+   * successful release; if still set in the post hook, the main step died while holding the lock.
+   */
+  LOCK_HOLDER_ID: 'lockHolderId',
+  /** `holder_job` of that lock (the job identity); absent when the run had none. Cleared together with the id. */
+  LOCK_HOLDER_JOB: 'lockHolderJob',
+  /** `acquisition_token` of that lock; the post hook releases only while the record still carries it. */
+  LOCK_ACQUISITION_TOKEN: 'lockAcquisitionToken',
   /** OpenCode version detected during main action (for post-action cache path calculation) */
   OPENCODE_VERSION: 'opencodeVersion',
   S3_ENABLED: 'storeConfig.enabled',

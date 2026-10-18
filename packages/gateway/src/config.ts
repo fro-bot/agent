@@ -98,6 +98,11 @@ export interface GatewayConfig {
    * `null` if unset — falls back to guild-level `ManageChannels`.
    */
   readonly triggerRoleId: string | null
+  /**
+   * Discord user IDs (snowflake strings) allowed to create bindings via `/add-project`.
+   * Empty when unset — `/add-project` then refuses everyone (fail-closed).
+   */
+  readonly binderAllowlist: ReadonlySet<string>
   /** Maximum number of simultaneous active runs across all channels. */
   readonly maxConcurrentRuns: number
   /** Maximum wall-clock milliseconds a single run may take before being aborted. */
@@ -484,6 +489,34 @@ export function readOptionalSecret(name: string): string | null {
   return null
 }
 
+// Discord snowflakes are 64-bit: up to 20 digits, beyond Number.MAX_SAFE_INTEGER. Keep them as strings.
+const DISCORD_SNOWFLAKE_RE = /^\d{17,20}$/
+
+/**
+ * Parse `GATEWAY_BINDER_ALLOWLIST` text into a set of Discord user ID strings.
+ *
+ * One ID per line; blank lines and `#` comments are ignored. `null` (unset/empty) yields an
+ * empty set, which makes `/add-project` refuse everyone. A malformed entry throws; the error
+ * names the variable and the line number, never the entry value.
+ */
+export function parseBinderAllowlist(text: string | null): ReadonlySet<string> {
+  const ids = new Set<string>()
+  if (text === null) return ids
+
+  const lines = text.split(/\r?\n/)
+  for (const [index, rawLine] of lines.entries()) {
+    const line = rawLine.trim()
+    if (line === '' || line.startsWith('#')) continue
+    if (DISCORD_SNOWFLAKE_RE.test(line) === false) {
+      throw new Error(
+        `Invalid GATEWAY_BINDER_ALLOWLIST: line ${index + 1} is not a Discord user ID (17-20 digits). Fix GATEWAY_BINDER_ALLOWLIST or GATEWAY_BINDER_ALLOWLIST_FILE.`,
+      )
+    }
+    ids.add(line)
+  }
+  return ids
+}
+
 /**
  * Load and validate the gateway configuration from environment variables and secrets.
  *
@@ -606,6 +639,7 @@ export function loadGatewayConfig(): GatewayConfig {
   const workspaceOpencodeUrl = readOptionalSecret('WORKSPACE_OPENCODE_URL') ?? 'http://workspace:9200'
   const workspaceOpencodeToken = readSecret('WORKSPACE_OPENCODE_TOKEN')
   const triggerRoleId = readOptionalSecret('GATEWAY_TRIGGER_ROLE_ID')
+  const binderAllowlist = parseBinderAllowlist(readOptionalMultilineSecret('GATEWAY_BINDER_ALLOWLIST'))
 
   const rawMaxConcurrent = readOptionalSecret('GATEWAY_MAX_CONCURRENT_RUNS') ?? '3'
   if (/^[1-9]\d*$/.test(rawMaxConcurrent) === false) {
@@ -1169,6 +1203,7 @@ export function loadGatewayConfig(): GatewayConfig {
     workspaceOpencodeUrl,
     workspaceOpencodeToken,
     triggerRoleId,
+    binderAllowlist,
     maxConcurrentRuns,
     runTimeoutMs,
     runInactivityTimeoutMs,

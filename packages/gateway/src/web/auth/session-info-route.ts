@@ -26,7 +26,7 @@ import type {OperatorSessionInfo} from '../../operator-contract/responses.js'
 import type {PushHealthStatus} from '../operator-push/push-health.js'
 import type {BrowserGuardDeps} from './csrf.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
-import {SESSION_ABSOLUTE_TTL_MS, SESSION_IDLE_TTL_MS} from './session.js'
+import {DURABLE_SESSION_TTL_MS} from './session.js'
 
 /**
  * Register the GET /operator/session route on the given Hono app.
@@ -42,7 +42,7 @@ import {SESSION_ABSOLUTE_TTL_MS, SESSION_IDLE_TTL_MS} from './session.js'
  * Response body: { operatorId: number, login: string, expiresAt: number }
  *   - operatorId: stable GitHub numeric user ID
  *   - login: GitHub display login (mutable, for display only)
- *   - expiresAt: ms-since-epoch timestamp of the sooner of absolute or idle expiry
+ *   - expiresAt: ms-since-epoch timestamp of the fixed expiry (issuedAt + the durable session lifetime)
  *   - push (optional): `{status}` coarse push health, present only when `getPushHealth`
  *     is supplied and push is configured. Reading it is a pure in-memory derivation.
  */
@@ -59,21 +59,18 @@ export function buildSessionInfoRoute(app: Hono, deps: BrowserGuardDeps, getPush
     }
 
     const {sessionId} = authCtx
-    const nowMs = deps.clock()
 
     // Look up the session entry to get identity and timestamps.
     // The guard already validated the session, but a race (revocation/expiry between
     // guard and handler) can produce undefined here. Treat it as a coarse 401 —
     // same body as the guard-not-installed fallback to avoid distinguishing detail.
-    const entry = deps.sessionStore.get(sessionId, nowMs)
+    const entry = deps.sessionStore.get(sessionId)
     if (entry === undefined) {
       return c.json({error: 'unauthorized'}, 401)
     }
 
-    // Compute the effective expiry: the sooner of absolute TTL and idle TTL.
-    const absoluteExpiry = entry.issuedAt + SESSION_ABSOLUTE_TTL_MS
-    const idleExpiry = entry.lastAccessedAt + SESSION_IDLE_TTL_MS
-    const expiresAt = Math.min(absoluteExpiry, idleExpiry)
+    // A session lives a fixed lifetime from login: no idle window, and no request extends it.
+    const expiresAt = entry.issuedAt + DURABLE_SESSION_TTL_MS
 
     // Prevent caching of session info — it is session-bound and must not be
     // served from any cache (browser, CDN, or proxy).
