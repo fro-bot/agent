@@ -811,3 +811,91 @@ describe('runOpenCodeCore — provider rejection fails fast (#1836)', () => {
     })
   })
 })
+
+function errorOf(run: Run): RunCoreError {
+  const outcome = run.outcome()
+  expect(outcome?.ok).toBe(false)
+  return (outcome as {error: RunCoreError}).error
+}
+
+describe('runOpenCodeCore — typed providerFailureReason on RunCoreError (contract 1.12.0)', () => {
+  const authRetry = retryStatus({
+    action: {reason: 'auth_unavailable', provider: 'p', title: 't', message: 'm', label: 'l'},
+  })
+
+  it.each([
+    [
+      'a ProviderAuthError',
+      assistantMessage({name: 'ProviderAuthError', data: {message: 'x'}}),
+      'provider auth unavailable',
+    ],
+    [
+      'an unsupported-model APIError',
+      assistantMessage({name: 'APIError', data: {message: 'model is not supported', isRetryable: false}}),
+      'model not available',
+    ],
+    [
+      'a rejected-request APIError',
+      assistantMessage({name: 'APIError', data: {message: 'bad', statusCode: 400, isRetryable: false}}),
+      'model provider rejected the request',
+    ],
+    ['a payload with no error', {type: 'session.error', properties: {sessionID: ROOT}}, 'session error'],
+  ] as const)(
+    'carries the internal reason for %s as a typed property (barrier fast path)',
+    async (_label, event, reason) => {
+      // #given
+      const run = startRun()
+
+      // #when
+      await run.emit(event)
+
+      // #then — the typed property, not just the message, names the reason
+      const error = errorOf(run)
+      expect(error.kind).toBe('session-error')
+      expect(error.quarantined).toBe(false)
+      expect(error.providerFailureReason).toBe(reason)
+    },
+  )
+
+  it('carries the reason on the settled-after-abort throw site (a retry status stops the live root first)', async () => {
+    // #given — a retry mid-backoff takes the settlement path, not the fast path
+    const run = startRun({ownershipLedger: createOwnershipLedger()})
+
+    // #when
+    await run.emit(authRetry)
+
+    // #then
+    const error = errorOf(run)
+    expect(run.abort).toHaveBeenCalledTimes(1)
+    expect(error.quarantined).toBe(false)
+    expect(error.providerFailureReason).toBe('provider auth unavailable')
+  })
+
+  it('carries the reason on the QUARANTINED throw site', async () => {
+    // #given — the root stays live after the abort, so the barrier quarantines
+    const run = startRun({live: {[ROOT]: {type: 'retry'}}})
+
+    // #when
+    await run.emit(authRetry)
+    await vi.advanceTimersByTimeAsync(20_000)
+
+    // #then
+    const error = errorOf(run)
+    expect(error.quarantined).toBe(true)
+    expect(error.providerFailureReason).toBe('provider auth unavailable')
+  })
+
+  it('leaves the property absent on a non-provider failure', async () => {
+    // #given — a transient retry, then silence for the whole window
+    const run = startRun()
+
+    // #when
+    await run.emit(retryStatus({message: 'Too Many Requests'}))
+    await vi.advanceTimersByTimeAsync(WINDOW + PROMPT_SECONDS)
+
+    // #then
+    const error = errorOf(run)
+    expect(error.kind).toBe('inactivity-timeout')
+    expect(error.providerFailureReason).toBeUndefined()
+  })
+})

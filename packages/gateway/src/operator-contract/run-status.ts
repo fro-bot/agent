@@ -34,6 +34,7 @@ import type {OperatorCheckoutPreparation, OperatorCheckoutProvenance} from './pr
 import type {OperatorProviderFailureReason} from './provider-failure-reason.js'
 
 import {parseOperatorCheckoutPreparation, parseOperatorCheckoutProvenance} from './provenance.js'
+import {projectProviderFailureReason} from './provider-failure-reason.js'
 
 export type {
   OperatorCheckoutHead,
@@ -297,6 +298,14 @@ export const toOperatorRunStatus = (
   // solely within this branch — never elsewhere.
   const failureKind = runState.phase === 'FAILED' ? toOperatorFailureKind(runState.details.failureKind) : undefined
 
+  // providerFailureReason (1.12.0): sibling of failureKind, gated on FAILED + internal failureKind
+  // 'session-error' + a known wire value. A tampered or stale value is dropped; the row is kept.
+  const providerFailureReason = projectProviderFailureReason(
+    runState.phase,
+    runState.details.failureKind,
+    runState.details.providerFailureReason,
+  )
+
   // checkoutProvenance is populated for EVERY phase — it describes the run's
   // STARTING state, not an outcome, so unlike failureKind it is not gated on
   // FAILED. Parsed (never cast) from untrusted `details`; a pre-existing run
@@ -321,6 +330,7 @@ export const toOperatorRunStatus = (
     startedAt: runState.started_at,
     stale,
     ...(failureKind === undefined ? {} : {failureKind}),
+    ...(providerFailureReason === undefined ? {} : {providerFailureReason}),
     ...(checkoutProvenance === undefined ? {} : {checkoutProvenance}),
     ...(checkoutPreparation === undefined ? {} : {checkoutPreparation}),
   }

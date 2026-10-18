@@ -21,6 +21,7 @@ import type {RunState} from '@fro-bot/runtime'
 import type {OperatorProviderFailureReason} from './provider-failure-reason.js'
 import type {OperatorFailureKind} from './run-status.js'
 
+import {projectProviderFailureReason} from './provider-failure-reason.js'
 import {PHASE_TO_WEB_STATUS, toOperatorFailureKind} from './run-status.js'
 
 /**
@@ -147,6 +148,14 @@ export function toRunSummary(
   // solely within this branch — never elsewhere.
   const failureKind = runState.phase === 'FAILED' ? toOperatorFailureKind(runState.details.failureKind) : undefined
 
+  // providerFailureReason (1.12.0): same three gates as the status projection (FAILED, internal
+  // failureKind 'session-error', known wire value); otherwise omitted and the row is kept.
+  const providerFailureReason = projectProviderFailureReason(
+    runState.phase,
+    runState.details.failureKind,
+    runState.details.providerFailureReason,
+  )
+
   // Build the closed DTO — copy only declared safe fields, never spread runState.
   // repo comes from the binding (the authorization anchor), not entity_ref.
   const summary: RunSummary = {
@@ -156,6 +165,7 @@ export function toRunSummary(
     createdAt: runState.started_at,
     ...(hasValidHeartbeat ? {updatedAt: runState.last_heartbeat} : {}),
     ...(failureKind === undefined ? {} : {failureKind}),
+    ...(providerFailureReason === undefined ? {} : {providerFailureReason}),
   }
 
   return summary

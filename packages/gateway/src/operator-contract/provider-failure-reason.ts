@@ -15,6 +15,7 @@
  * `__proto__` resolve to prototype members.
  */
 
+import type {RunPhase} from '@fro-bot/runtime'
 import type {ProviderFailureReason} from '../execute/provider-failure.js'
 
 /**
@@ -60,4 +61,25 @@ export function parseOperatorProviderFailureReason(value: unknown): OperatorProv
     return undefined
   }
   return value as OperatorProviderFailureReason
+}
+
+/**
+ * The projection gate for a stored reason: the value reaches an operator DTO only when ALL three hold.
+ *
+ * 1. the run is `FAILED` (a reason on any other phase is tampered or stale),
+ * 2. the INTERNAL stored `failureKind` is exactly `'session-error'` (the only kind a reason refines), and
+ * 3. the stored value parses as a known wire reason.
+ *
+ * Otherwise `undefined`: the field is omitted and the row is kept. Takes the individual candidate values,
+ * never a details object, so it cannot read any other key.
+ */
+export function projectProviderFailureReason(
+  phase: RunPhase,
+  storedFailureKind: unknown,
+  storedReason: unknown,
+): OperatorProviderFailureReason | undefined {
+  if (phase !== 'FAILED' || storedFailureKind !== 'session-error') {
+    return undefined
+  }
+  return parseOperatorProviderFailureReason(storedReason)
 }

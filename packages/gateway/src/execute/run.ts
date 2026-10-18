@@ -8,6 +8,7 @@ import type {RequestGate} from '../approvals/request-gate.js'
 import type {RepoBinding} from '../bindings/types.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {SinkThread} from '../discord/streaming.js'
+import type {OperatorProviderFailureReason} from '../operator-contract/provider-failure-reason.js'
 import type {OperatorFailureKind} from '../operator-contract/run-status.js'
 import type {EnsureCloneFailure} from '../workspace-api/ensure-clone.js'
 import type {
@@ -45,6 +46,7 @@ import {setRunReaction} from '../discord/reactions.js'
 import {buildRecoverEntryButton} from '../discord/recover-checkout-button.js'
 import {createStatusController} from '../discord/status-message.js'
 import {createDiscordStreamSink} from '../discord/streaming.js'
+import {toOperatorProviderFailureReason} from '../operator-contract/provider-failure-reason.js'
 import {toOperatorFailureKind} from '../operator-contract/run-status.js'
 import {canonicalWorkspaceTarget} from '../workspace-api/client.js'
 import {abortRegistry} from './abort-registry.js'
@@ -560,6 +562,36 @@ export function computeApprovalDeadlineMs(remainingBudgetMs: number): number | u
  */
 function extractRunCoreKind(execError: unknown): string | undefined {
   return execError instanceof RunCoreError ? execError.kind : undefined
+}
+
+/**
+ * The provider failure reason to persist on a FAILED run-state (`details.providerFailureReason`), as the
+ * WIRE value — the internal spaced spelling never reaches the record.
+ *
+ * Reads the typed `RunCoreError.providerFailureReason` property (never the message) and returns it only for
+ * a `session-error`: the reason refines that kind and means nothing on any other. Anything else — a
+ * non-`RunCoreError`, another kind, or no reason — returns `undefined` and nothing is written.
+ */
+function extractProviderFailureReason(execError: unknown): OperatorProviderFailureReason | undefined {
+  if (execError instanceof RunCoreError && execError.kind === 'session-error') {
+    return execError.providerFailureReason === undefined
+      ? undefined
+      : toOperatorProviderFailureReason(execError.providerFailureReason)
+  }
+  return undefined
+}
+
+/**
+ * The `details` patch for a terminal FAILED write driven by an execution error: the internal
+ * `failureKind` plus, for a provider-classified `session-error`, the wire `providerFailureReason`.
+ * `undefined` when the error carries neither. Only the three execution-failure terminal sites use this;
+ * preparation failure, `failAdmittedRun`, recovery and maintenance never write a reason.
+ */
+function failureDetailsPatch(execError: unknown): Record<string, unknown> | undefined {
+  const failureKind = extractRunCoreKind(execError)
+  if (failureKind === undefined) return undefined
+  const providerFailureReason = extractProviderFailureReason(execError)
+  return {failureKind, ...(providerFailureReason === undefined ? {} : {providerFailureReason})}
 }
 
 // ---------------------------------------------------------------------------
@@ -1515,13 +1547,18 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       // racy. The registry's own controller state is ground truth (see abort-registry.ts).
       const wasCancelled = abortRegistry.isAborted(runId)
 
+      const loggedProviderFailureReason = extractProviderFailureReason(execError)
+
       logger.error(
         {
           repo,
           runId,
           kind: isCoreError ? execError.kind : 'unknown',
+          // The closed reason is operator-safe fixed text, so it may be logged for correlation.
+          ...(loggedProviderFailureReason === undefined ? {} : {providerFailureReason: loggedProviderFailureReason}),
           cancelled: wasCancelled,
-          err: execError instanceof Error ? execError.message : String(execError),
+          // The error NAME only: the message can quote prompt-bearing or provider text.
+          err: execError instanceof Error ? execError.name : typeof execError,
         },
         wasCancelled === true ? 'run: execution aborted by operator cancel' : 'run: execution failed',
       )
@@ -1541,13 +1578,13 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         statusSink.setReaction('failed')
 
         const quarantineFailureKind = extractRunCoreKind(execError)
+        // failureKind and, for a provider failure, the wire reason: built once so the 412 retry below
+        // (which reuses this patch) persists the reason exactly like the first attempt.
         const quarantineDetailsPatch: Record<string, unknown> = {
           quarantined: true,
           // Audit evidence for a later takeover decision; not consulted for any gating.
           quarantineHoldUntil: new Date(Date.now() + QUARANTINE_HOLD_WINDOW_MS).toISOString(),
-        }
-        if (quarantineFailureKind !== undefined) {
-          quarantineDetailsPatch.failureKind = quarantineFailureKind
+          ...failureDetailsPatch(execError),
         }
         const quarantineResult = await transitionRun(
           coordinationConfig,
@@ -1754,8 +1791,9 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
             // still the caught throw and is classified here for the rare CANCELLED→FAILED
             // fallback (usually an AbortError → no RunCoreError.kind → failureKind omitted).
             const fallbackFailureKind = extractRunCoreKind(execError)
+            const fallbackDetailsPatch = failureDetailsPatch(execError)
             const fallbackOptions =
-              fallbackFailureKind === undefined ? undefined : {detailsPatch: {failureKind: fallbackFailureKind}}
+              fallbackDetailsPatch === undefined ? undefined : {detailsPatch: fallbackDetailsPatch}
             const failedFallbackResult = await transitionRun(
               coordinationConfig,
               identity,
@@ -1813,8 +1851,9 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         // Transition to FAILED (best-effort), carrying the classified failure kind
         // atomically with the phase write so the operator projections can read it back.
         const inFlightFailureKind = extractRunCoreKind(execError)
+        const inFlightDetailsPatch = failureDetailsPatch(execError)
         const inFlightFailedOptions =
-          inFlightFailureKind === undefined ? undefined : {detailsPatch: {failureKind: inFlightFailureKind}}
+          inFlightDetailsPatch === undefined ? undefined : {detailsPatch: inFlightDetailsPatch}
         const failedResult = await transitionRun(
           coordinationConfig,
           identity,

@@ -3075,6 +3075,64 @@ describe('status frame — checkout fields through the real projection', () => {
   })
 })
 
+describe('status frame — providerFailureReason through the real projection', () => {
+  const failedProviderRun = (): RunState =>
+    makeRunState({
+      phase: 'FAILED',
+      details: {failureKind: 'session-error', providerFailureReason: 'provider-auth-unavailable'},
+    })
+  const realProjectBase: RunObservationManagerDeps['projectBase'] = async state =>
+    projectRunStatusWithKey(state, {
+      nowMs: 1_000_000,
+      staleThresholdMs: 60_000,
+      bindingsLookup: {getBindingByRepo: async () => ({success: true, data: {databaseId: 1, nodeId: 'R_1'}})},
+      isRepoDenied: () => false,
+    })
+
+  it('a cold-restart durable frame deep-equals the live terminal frame, including the reason', async () => {
+    // #given a live manager that observes a provider failure and delivers the terminal frame
+    const live = makeManager(async () => null, {projectBase: realProjectBase})
+    const liveSub = collectFrames(live.manager, 'run-001')
+    await live.manager.observe(failedProviderRun())
+    await drain()
+    const liveFrame = liveSub.frames.find(f => f.type === 'status')
+
+    // #when a freshly started manager (no cache, no replay) resolves the same run from persisted state
+    const cold = makeManager(async () => null, {projectBase: realProjectBase})
+    const durable = subscribeWithDurable(cold.manager, async () => failedProviderRun())
+    await drain()
+    const durableFrame = durable.frames.find(f => f.type === 'status')
+
+    // #then both carry the reason and are deeply equal
+    expect(liveFrame).toMatchObject({type: 'status', data: {providerFailureReason: 'provider-auth-unavailable'}})
+    expect(durableFrame).toEqual(liveFrame)
+    expect(durable.closes).toEqual(['terminal'])
+
+    live.manager.shutdown()
+    cold.manager.shutdown()
+  })
+
+  it('a tampered stored reason is omitted from the durable frame while the frame is still delivered', async () => {
+    // #given a persisted FAILED run whose reason was tampered with
+    const cold = makeManager(async () => null, {projectBase: realProjectBase})
+    const tampered = makeRunState({
+      phase: 'FAILED',
+      details: {failureKind: 'session-error', providerFailureReason: 'provider auth unavailable'},
+    })
+
+    // #when resolved durably
+    const durable = subscribeWithDurable(cold.manager, async () => tampered)
+    await drain()
+
+    // #then the frame is delivered with no reason key
+    const frame = durable.frames.find(f => f.type === 'status')
+    expect(frame).toMatchObject({type: 'status', data: {status: 'failed', failureKind: 'session-error'}})
+    expect((frame as {data: object}).data).not.toHaveProperty('providerFailureReason')
+
+    cold.manager.shutdown()
+  })
+})
+
 // ---------------------------------------------------------------------------
 // Cleanup: ensure no real timers leak between tests
 // ---------------------------------------------------------------------------

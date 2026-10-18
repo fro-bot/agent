@@ -457,3 +457,68 @@ describe('RunSummary — contract 1.12.0 optional fields', () => {
     }>()
   })
 })
+
+describe('toRunSummary — providerFailureReason (1.12.0)', () => {
+  const failedProvider = (reason: unknown): RunState =>
+    makeRunState({phase: 'FAILED', details: {failureKind: 'session-error', providerFailureReason: reason}})
+
+  it.each(['provider-auth-unavailable', 'model-not-available', 'provider-rejected-request', 'unclassified'] as const)(
+    'projects the stored wire reason %s for a FAILED session-error run',
+    reason => {
+      // #given / #when
+      const result = toRunSummary(failedProvider(reason), BINDING_A)
+
+      // #then
+      assert(result !== null)
+      expect(result.providerFailureReason).toBe(reason)
+      expect(result.failureKind).toBe('session-error')
+    },
+  )
+
+  it.each([
+    [
+      'a reason on an EXECUTING run',
+      makeRunState({details: {failureKind: 'session-error', providerFailureReason: 'unclassified'}}),
+    ],
+    [
+      'a reason with failureKind unreachable',
+      makeRunState({phase: 'FAILED', details: {failureKind: 'unreachable', providerFailureReason: 'unclassified'}}),
+    ],
+    ['a bogus reason string', failedProvider('quota-exhausted')],
+    ['the internal spaced spelling', failedProvider('model not available')],
+    ['a numeric reason', failedProvider(7)],
+    ['a prototype key', failedProvider('__proto__')],
+  ])('omits the reason for %s but keeps the row', (_label, runState) => {
+    // #given a tampered or out-of-gate stored value
+    // #when projected
+    const result = toRunSummary(runState, BINDING_A)
+
+    // #then the row is kept and the field is not a key at all
+    assert(result !== null)
+    expect(result).not.toHaveProperty('providerFailureReason')
+  })
+
+  it('has the exact key set for FAILED with a reason, and for a non-FAILED run', () => {
+    // #given
+    const failed = toRunSummary(failedProvider('unclassified'), BINDING_A)
+    const running = toRunSummary(makeRunState(), BINDING_A)
+
+    // #then the summary does not carry a prompt yet, and only FAILED carries the reason
+    assert(failed !== null && running !== null)
+    expect(Object.keys(failed).sort()).toEqual(
+      ['createdAt', 'failureKind', 'providerFailureReason', 'repo', 'runId', 'status', 'updatedAt'].sort(),
+    )
+    expect(Object.keys(running).sort()).toEqual(['createdAt', 'repo', 'runId', 'status', 'updatedAt'].sort())
+  })
+
+  it('projects a 1.11-shaped FAILED record (no reason) without the field', () => {
+    // #given a record written before 1.12.0
+    const legacy = makeRunState({phase: 'FAILED', details: {failureKind: 'session-error'}})
+
+    // #when / #then
+    const result = toRunSummary(legacy, BINDING_A)
+    assert(result !== null)
+    expect(result.failureKind).toBe('session-error')
+    expect(result).not.toHaveProperty('providerFailureReason')
+  })
+})
