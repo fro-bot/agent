@@ -18,6 +18,7 @@
  */
 
 import type {RunState} from '@fro-bot/runtime'
+import type {OperatorProviderFailureReason} from './provider-failure-reason.js'
 import type {OperatorFailureKind} from './run-status.js'
 
 import {PHASE_TO_WEB_STATUS, toOperatorFailureKind} from './run-status.js'
@@ -54,6 +55,15 @@ export interface RunSummary {
   readonly createdAt: string
   readonly updatedAt?: string
   readonly failureKind?: OperatorFailureKind
+  /** Why a `session-error` run failed at the provider (contract 1.12.0). Closed enum; see `OperatorRunStatus`. */
+  readonly providerFailureReason?: OperatorProviderFailureReason
+  /**
+   * The operator's launch prompt, as submitted (contract 1.12.0). Present only on runs launched through
+   * `POST /operator/runs`; absent on runs from any other surface and on records that predate 1.12.0.
+   * UNTRUSTED text: consumers must render it inertly. Bounded by `OPERATOR_LAUNCH_PROMPT_MAX_LENGTH`
+   * (UTF-16 code units); never truncated. Carried on the summary only, never on `OperatorRunStatus`.
+   */
+  readonly prompt?: string
 }
 
 /**

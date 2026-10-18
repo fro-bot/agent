@@ -1,4 +1,5 @@
 import type {RunState} from '@fro-bot/runtime'
+import type {OperatorProviderFailureReason} from './provider-failure-reason.js'
 import type {OperatorFailureKind, OperatorRunStatus, OperatorWebStatus} from './run-status.js'
 
 import {assert, describe, expect, expectTypeOf, it} from 'vitest'
@@ -626,6 +627,18 @@ describe('toOperatorFailureKind — allowlist mapping', () => {
     },
   )
 
+  it.each(['toString', 'constructor', '__proto__', 'hasOwnProperty', 'valueOf', 'isPrototypeOf'])(
+    "(security) prototype key '%s' maps to 'unknown' (never resolves to a prototype member)",
+    prototypeKey => {
+      // #given a string naming an Object.prototype member, which a plain-object index would resolve
+      // #when mapped
+      const result = toOperatorFailureKind(prototypeKey)
+
+      // #then it is an unrecognized string, so 'unknown' — not a function or object
+      expect(result).toBe('unknown')
+    },
+  )
+
   it("(edge) empty string '' maps to 'unknown' (not undefined — present but unrecognized)", () => {
     // #given an empty-string failure-kind value (distinct from absent/undefined)
     // #when mapped
@@ -698,5 +711,17 @@ describe('barrel re-exports', () => {
     // #when the failure-kind mapper is accessed
     // #then it is present and callable
     expect(typeof barrel.toOperatorFailureKind).toBe('function')
+  })
+})
+
+describe('OperatorRunStatus — contract 1.12.0 providerFailureReason', () => {
+  it('declares providerFailureReason as an optional wire enum and no prompt field', () => {
+    // #given the 1.12.0 status DTO
+    // #when inspected at the type level
+    // #then the reason is optional and typed to the contract; the prompt never rides the status frame
+    expectTypeOf<OperatorRunStatus['providerFailureReason']>().toEqualTypeOf<
+      OperatorProviderFailureReason | undefined
+    >()
+    expectTypeOf<OperatorRunStatus>().not.toHaveProperty('prompt')
   })
 })

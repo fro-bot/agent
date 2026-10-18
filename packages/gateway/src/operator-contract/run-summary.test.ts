@@ -12,9 +12,9 @@
  */
 
 import type {RunState} from '@fro-bot/runtime'
-import type {OperatorWebStatus, RunSummary, RunSummaryStatus} from './index.js'
+import type {OperatorProviderFailureReason, OperatorWebStatus, RunSummary, RunSummaryStatus} from './index.js'
 
-import {assert, describe, expect, it} from 'vitest'
+import {assert, describe, expect, expectTypeOf, it} from 'vitest'
 import {toRunSummary} from './run-summary.js'
 
 // ---------------------------------------------------------------------------
@@ -439,5 +439,21 @@ describe('RunSummaryStatus', () => {
       expect(status).not.toBe('waiting_for_approval')
       expect(status).not.toBe('waiting_for_question')
     }
+  })
+})
+
+describe('RunSummary — contract 1.12.0 optional fields', () => {
+  it('declares prompt and providerFailureReason as optional, typed fields', () => {
+    // #given the 1.12.0 additions to the summary DTO
+    // #when inspected at the type level
+    // #then both are optional and typed to the contract (the projector does not populate them yet)
+    expectTypeOf<RunSummary['prompt']>().toEqualTypeOf<string | undefined>()
+    expectTypeOf<RunSummary['providerFailureReason']>().toEqualTypeOf<OperatorProviderFailureReason | undefined>()
+    expectTypeOf<Pick<RunSummary, 'runId' | 'repo' | 'status' | 'createdAt'>>().toEqualTypeOf<{
+      readonly runId: string
+      readonly repo: string
+      readonly status: RunSummaryStatus
+      readonly createdAt: string
+    }>()
   })
 })

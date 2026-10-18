@@ -19,6 +19,8 @@ export type {ApprovalFrameData, ApprovalRequestDetail} from './approval-frame.js
 export type {DecisionInput, OperatorDecisionState, PermissionReply} from './approval.js'
 export {toOperatorDecisionState} from './approval.js'
 export type {OperatorIdentity} from './identity.js'
+export {OPERATOR_LAUNCH_PROMPT_MAX_LENGTH, OPERATOR_LAUNCH_PROMPT_TOO_LONG} from './launch-prompt.js'
+export type {OperatorLaunchPromptRejectionReason} from './launch-prompt.js'
 export type {OperatorOutputFrame} from './output.js'
 export {
   parseOperatorCancelResponse,
@@ -45,6 +47,12 @@ export type {
   OperatorWorktreeState,
 } from './provenance.js'
 export {parseOperatorCheckoutPreparation, parseOperatorCheckoutProvenance} from './provenance.js'
+export type {OperatorProviderFailureReason} from './provider-failure-reason.js'
+export {
+  parseOperatorProviderFailureReason,
+  PROVIDER_FAILURE_REASON_TO_OPERATOR,
+  toOperatorProviderFailureReason,
+} from './provider-failure-reason.js'
 export type {
   PendingQuestionDTO,
   PendingQuestionsResponse,
