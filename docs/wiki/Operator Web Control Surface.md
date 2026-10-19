@@ -1,10 +1,11 @@
 ---
 type: subsystem
-last-updated: "2026-10-17"
-updated-by: "18890129"
+last-updated: "2026-10-18"
+updated-by: "1dcd6a296d36057a6680ca347bf01a6987d78ec9"
 sources:
   - packages/gateway/src/execute/run.ts
   - packages/gateway/src/execute/run-core.ts
+  - packages/gateway/src/execute/provider-failure.ts
   - packages/gateway/src/execute/provenance.ts
   - packages/gateway/src/execute/preparation-reply.ts
   - packages/gateway/src/execute/recovery.ts
@@ -66,6 +67,8 @@ sources:
   - packages/gateway/src/operator-contract/run-status.ts
   - packages/gateway/src/operator-contract/provenance.ts
   - packages/gateway/src/operator-contract/run-summary.ts
+  - packages/gateway/src/operator-contract/launch-prompt.ts
+  - packages/gateway/src/operator-contract/provider-failure-reason.ts
   - packages/gateway/src/execute/cancel.ts
   - packages/gateway/src/execute/abort-registry.ts
   - packages/gateway/src/workspace-api/client.ts
@@ -286,7 +289,7 @@ The surface exposes four authenticated operator routes (`web/operator-push/`):
 - `POST /operator/push/subscriptions/unsubscribe` — remove a subscription.
 - `GET /operator/push/subscriptions` — list the operator's own subscription metadata (never the endpoint or keys — see `toSubscriptionMetadata` in `subscription-store.ts`).
 
-**Broadcast model.** The operator dashboard is a shared surface, not a per-operator one — approvals are run-scoped, not operator-scoped, and there is no dashboard-operator identity available at the run-failed or approval-pending seams. Every opted-in operator with an active subscription is nudged, regardless of who launched the run. The notification payload is fixed and repo-neutral ("something needs attention, open the dashboard" plus an allowlisted failure label) so a broadcast never leaks run, repo, or prompt content — Discord and the SSE stream remain the authoritative, detailed channels; push is a fail-soft nudge on top.
+**Broadcast model.** The operator dashboard is a shared surface, not a per-operator one — approvals are run-scoped, not operator-scoped, and there is no dashboard-operator identity available at the run-failed or approval-pending seams. Every opted-in operator with an active subscription is nudged, regardless of who launched the run. The notification prose is fixed and repo-neutral ("something needs attention, open the dashboard" plus an allowlisted failure label); approval and question payloads additionally carry a validated run id for navigation. Repository names, prompt text, questions, and tool details stay out of push payloads. Discord and the SSE stream remain the authoritative, detailed channels; push is a fail-soft nudge on top.
 
 **Question notification.** The `question` trigger sends fixed copy only: the title and body are the keys `operator.question_pending.title` and `operator.question_pending.body`, with `data: {type: 'question', runId, route: '/operator#<runId>'}`. The route deep-links the dashboard to the asking run. When the run id does not match `^[\w-]{1,128}$`, the payload omits `runId` and the route falls back to `/`. The builder takes only the run id, so question text, options, repo, and prompt cannot reach the payload. It is sent for any run, Discord-launched or web-launched, once the question is registered.
 

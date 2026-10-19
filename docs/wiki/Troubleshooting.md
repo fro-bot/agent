@@ -1,7 +1,7 @@
 ---
 type: convention
-last-updated: "2026-10-11"
-updated-by: "18890129"
+last-updated: "2026-10-18"
+updated-by: "1dcd6a296d36057a6680ca347bf01a6987d78ec9"
 sources:
   - action.yaml
   - src/harness/phases/routing.ts
@@ -108,6 +108,8 @@ If the run fails during setup rather than during agent execution:
 - **`Unsupported platform: <platform>/<arch>`** — the action supports Linux and macOS on x64 or arm64 only. This is now rejected by name before any download is attempted. Windows runners are not supported, and neither is an architecture outside that matrix; the harness build the action defaults to publishes assets for those four combinations and no others. See [[Setup and Configuration]].
 - **`EACCES` when spawning OpenCode** — historically caused by handing a consumer the install _directory_ where an executable path was required. If this recurs, the auto-setup log line records both the directory and the resolved binary path, which is enough to tell which one was exported as `OPENCODE_PATH`.
 - **`Skipping tools cache save because Systematic plugin install did not complete`** — setup continues without the plugin rather than failing the run, so this is a warning, not a fatal error. Two hints accompany it. If the parent environment carries `NPM_CONFIG_*` variables, the warning names them and notes that the install child deliberately does not inherit them; that scrub is intentional and should not be worked around by allowlisting those keys. If the failure was a spawn error, the warning carries a path diagnosis stating what was actually found at the binary path — absent, a dangling symlink, a directory, or present-but-not-executable — along with the tail of the child's stderr.
+
+Stock fallback and pinned-harness failure have different meanings. The current stock `FALLBACK_VERSION` in `src/services/setup/opencode.ts` is `1.19.0`; it covers failed `latest` resolution and eligible stock-install retries. An explicitly requested harness build never silently falls back to that stock release after a download or checksum failure. [[Setup and Configuration]] explains the version identity and verification boundaries.
 
 ## Model Resolution Failures
 
