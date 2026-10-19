@@ -160,8 +160,8 @@ export interface PermissionCoordinatorDeps {
 }
 
 // ---------------------------------------------------------------------------
-// Defensive accessors (payloads are untrusted server JSON): `getStringProperty` and `getObjectProperty` come from
-// `@fro-bot/runtime`; the string-array reader is the only one local to this module.
+// Payloads are untrusted server JSON: read them through own-property accessors (`getStringProperty`,
+// `getObjectProperty` from `@fro-bot/runtime`). The string-array reader below is local to this module.
 // ---------------------------------------------------------------------------
 
 function getStringArray(value: unknown, property: string): string[] {

@@ -3,7 +3,7 @@
  *
  * Every reader goes through the property descriptor, so inherited properties miss and getters never run.
  * The typed readers check the value's `typeof` and accept `''`: streamed text depends on an empty string being a
- * real value. Rung 1's `firstString` in `error-format/provider-failure.ts` rejects `''` on purpose, for
+ * real value. The `firstString` helper in `error-format/provider-failure.ts` rejects `''` on purpose, for
  * classification — do not merge the two.
  */
 

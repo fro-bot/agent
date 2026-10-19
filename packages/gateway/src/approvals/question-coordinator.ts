@@ -105,8 +105,8 @@ export interface QuestionCoordinatorDeps {
 }
 
 // ---------------------------------------------------------------------------
-// Defensive accessors (payloads are untrusted server JSON; own properties only) — shared with the
-// event loop: `ownValue` and `getStringProperty` from `@fro-bot/runtime`.
+// Payloads are untrusted server JSON: read them through own-property accessors (`ownValue`, `getStringProperty`
+// from `@fro-bot/runtime`).
 // ---------------------------------------------------------------------------
 
 /**

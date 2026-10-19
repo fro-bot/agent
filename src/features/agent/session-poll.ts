@@ -409,8 +409,9 @@ interface MessageCompletionCandidate {
  * Locates the latest new (post-baseline) assistant message and validates it against the
  * qualified-tuple predicate: new relative to the attempt baseline; answers the latest known root
  * user message with no newer unanswered one (the pending-parent barrier); `time.completed`
- * present; `finish` present and not `tool-calls`/`unknown`; no non-provider-executed tool call left
- * pending/running (a continuation the upstream prompt loop would still run another iteration for);
+ * present; `finish` present and not `tool-calls`/`unknown`; no blocking tool part (any tool part blocks,
+ * pending, running or completed, unless it is provider-executed or an orphaned interrupted tool -- see
+ * `hasBlockingToolPart`; the upstream prompt loop would run another iteration for it);
  * and no renewed root activity since the request was issued (revision check; a stale response never
  * mutates turn state, but its assistant error is still classified -- failure evidence is not
  * revision-scoped). Confirms the same

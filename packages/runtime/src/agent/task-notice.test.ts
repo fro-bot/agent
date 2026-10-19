@@ -1,14 +1,6 @@
 import {describe, expect, it} from 'vitest'
 
-import {parseSyntheticNoticePart, parseTaskNotice, TASK_NOTICE_PATTERN} from './task-notice.js'
-
-describe('TASK_NOTICE_PATTERN', () => {
-  it('keeps the exact literal both surfaces used before consolidation', () => {
-    // #given / #when / #then
-    expect(TASK_NOTICE_PATTERN.source).toBe('<task id="([^"]+)" state="(completed|error)">')
-    expect(TASK_NOTICE_PATTERN.flags).toBe('')
-  })
-})
+import {parseSyntheticNoticePart, parseTaskNotice} from './task-notice.js'
 
 describe('parseTaskNotice', () => {
   it('parses a completed notice', () => {

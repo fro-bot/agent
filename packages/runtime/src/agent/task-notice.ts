@@ -1,7 +1,13 @@
 import {getBooleanProperty, getStringProperty} from './payload-accessors.js'
 
-/** `<task id="{childSessionId}" state="completed|error">` — see `renderOutput` in upstream `tool/task.ts`. */
-export const TASK_NOTICE_PATTERN = /<task id="([^"]+)" state="(completed|error)">/
+/**
+ * Upstream's `task` tool injects a synthetic text prompt into the PARENT session when a background dispatch
+ * finishes (see `inject()` / `renderOutput()` in upstream `tool/task.ts`), rendered as
+ * `<task id="{childSessionId}" state="completed|error">...`. That tag is the only observable signal that a
+ * background execution settled; no structured field carries it. The pattern matches the opening tag only, and the
+ * running state is never injected this way.
+ */
+const TASK_NOTICE_PATTERN = /<task id="([^"]+)" state="(completed|error)">/
 
 export interface TaskNotice {
   readonly childSessionId: string

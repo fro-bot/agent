@@ -73,6 +73,14 @@ describe('getEventPayload', () => {
     expect(getEventPayload({data})).toBe(data)
   })
 
+  it('returns a non-null primitive properties value as-is, without falling back to data', () => {
+    // #given
+    const event = {properties: 'x', data: {from: 'data'}}
+
+    // #when / #then
+    expect(getEventPayload(event)).toBe('x')
+  })
+
   it('returns null when neither is present or the event is not an object', () => {
     // #given / #when / #then
     expect(getEventPayload({})).toBeNull()
