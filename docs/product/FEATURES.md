@@ -1203,7 +1203,7 @@ Clear documentation of required secrets and variables.
 
 **Acceptance Criteria:**
 - [ ] Document required: `GITHUB_TOKEN`, `OPENCODE_AUTH_JSON`
-- [ ] Document optional S3: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `S3_BUCKET`, `AWS_REGION`
+- [ ] Document optional S3: Action inputs `s3-bucket` and `aws-region` with `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` in the job env; gateway `S3_BUCKET`, `S3_REGION` (falls back to `AWS_REGION`) with the same credential pair
 - [ ] Only placeholders in examples (no real secrets)
 - [ ] Security best practices documented
 

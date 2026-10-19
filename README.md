@@ -189,7 +189,7 @@ A few inputs most workflows touch:
 | `s3-prefix` | No | `fro-bot-state` | Prefix for all S3 keys |
 | `s3-expected-bucket-owner` | No | — | AWS account ID of the expected bucket owner |
 | `s3-allow-insecure-endpoint` | No | `false` | Allow HTTP endpoints and loopback/private-network addresses (local MinIO dev only); metadata endpoints (169.254.169.254, 169.254.170.2, 100.100.100.200, fd00:ec2::254, `metadata.google.internal`) stay blocked |
-| `s3-sse-kms-key-id` | No | — | Customer-managed KMS key ID for SSE-KMS |
+| `s3-sse-kms-key-id` | No | — | Customer-managed KMS key ID for SSE-KMS. Requires the effective mode to be `aws:kms`: on a custom endpoint the default is `AES256`, so also set `s3-sse-encryption: aws:kms` |
 | `s3-sse-encryption` | No | Endpoint-dependent | `aws:kms` (AWS S3) or `AES256` (custom endpoints) |
 | `agent` | No | — | Agent to use (a primary agent, not a subagent). Defaults to OpenCode's built-in `build` agent |
 | `enable-omo` | No | `false` | Enable Oh My OpenAgent for extended provider and agent support |

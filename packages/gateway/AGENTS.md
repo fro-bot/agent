@@ -37,22 +37,27 @@ node dist/main.mjs backfill-deny-keys --help
 
 **Maintenance window:** Run the `--apply` pass during a maintenance window or when no binding mutations are in flight. The backfill only targets legacy keyless bindings (those without a `databaseId`), which normal gateway operation will not concurrently modify. However, the write is an unconditional overwrite (no etag/CAS) using the binding snapshot from `listBindings()`. If the gateway concurrently mutates the same binding between the list and the write (e.g. an `add-project` flow), the backfill will silently revert that change. Scheduling the `--apply` pass when the gateway is idle eliminates this window.
 
-**Required env** (same as the gateway daemon):
+**Required env** (same as the gateway daemon; the S3 settings come from `loadObjectStoreSettings` in `config.ts`, shared with the daemon, and each also accepts a `_FILE` form):
 
 | Variable | `_FILE` variant | Notes |
 | --- | --- | --- |
 | `GITHUB_APP_ID` | `GITHUB_APP_ID_FILE` | GitHub App numeric ID |
 | `GITHUB_APP_PRIVATE_KEY` | `GITHUB_APP_PRIVATE_KEY_FILE` | PEM private key |
 | `S3_BUCKET` | `S3_BUCKET_FILE` | Object-store bucket name |
-| `AWS_REGION` | `AWS_REGION_FILE` | AWS region |
+| `S3_REGION` | `S3_REGION_FILE` | Object-store region. Falls back to `AWS_REGION` (`AWS_REGION_FILE`) when unset |
 | `AWS_ACCESS_KEY_ID` | `AWS_ACCESS_KEY_ID_FILE` | AWS credentials |
 | `AWS_SECRET_ACCESS_KEY` | `AWS_SECRET_ACCESS_KEY_FILE` | AWS credentials |
 
-**Optional env:**
+**Optional env** (an invalid S3 value exits 1 with an error that names the variable and never prints its value):
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `S3_PREFIX` | `fro-bot-state` | Object-store key prefix |
+| `S3_PREFIX` | `fro-bot-state` | Object-store key prefix. An empty value means the default; an invalid prefix exits 1 |
+| `S3_ENDPOINT` | AWS S3 | Custom endpoint. Validated: `https` unless `S3_ALLOW_INSECURE_ENDPOINT=true`; metadata addresses always rejected |
+| `S3_SSE` | `aws:kms` on AWS, `AES256` on a custom endpoint | `aws:kms` or `AES256` |
+| `S3_SSE_KMS_KEY_ID` | — | Requires the effective mode to be `aws:kms` |
+| `S3_EXPECTED_BUCKET_OWNER` | — | Expected bucket owner account ID |
+| `S3_ALLOW_INSECURE_ENDPOINT` | `false` | Only the exact value `true` allows an `http` or private-address endpoint |
 | `GATEWAY_IDENTITY` | `discord-gateway` | Namespace for bindings in the store |
 
 **Exit codes:**

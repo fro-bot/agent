@@ -56,7 +56,7 @@ inputs:
     required: false
     default: 'false'
   s3-sse-kms-key-id:
-    description: KMS key ID for SSE-KMS encryption. When set, uses customer-managed key instead of AWS-managed default.
+    description: KMS key ID for SSE-KMS encryption. Requires s3-sse-encryption to resolve to aws:kms (set it to aws:kms on custom endpoints, where the default is AES256).
     required: false
   s3-sse-encryption:
     description: "Server-side encryption: 'aws:kms' or 'AES256'. Default: aws:kms for AWS S3, AES256 for custom endpoints."
