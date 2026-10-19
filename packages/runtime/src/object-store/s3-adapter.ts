@@ -136,7 +136,7 @@ function createClient(config: ObjectStoreConfig): S3Client {
   })
 }
 
-function getEffectiveEncryption(config: ObjectStoreConfig): 'AES256' | 'aws:kms' {
+export function getEffectiveEncryption(config: ObjectStoreConfig): 'AES256' | 'aws:kms' {
   if (config.sseEncryption != null) {
     return config.sseEncryption
   }
