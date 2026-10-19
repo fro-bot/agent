@@ -889,3 +889,76 @@ describe('retrySignalFromStatus', () => {
     })
   })
 })
+
+function timed(message: string) {
+  const startedAt = performance.now()
+  const result = classifyProviderFailure({source: 'terminal-payload', message})
+  return {result, elapsedMs: performance.now() - startedAt}
+}
+
+describe('classifyProviderFailure — text matching stays linear on long messages', () => {
+  // Generous so a slow CI runner does not flake: the quadratic pattern took seconds at this size, a linear
+  // check takes a few milliseconds.
+  const BUDGET_MS = 200
+  const PREFIX = 'Usage limit reached. '
+  const SUFFIX = 'Enable usage from your available balance'
+  const repeated = PREFIX.repeat(Math.ceil(400_000 / PREFIX.length))
+
+  it('does not match, and does not rescan, a ~400KB line of repeated usage-limit prefixes with no suffix', () => {
+    // #given one line of repeated prefixes: each used to rescan to the end of the line
+    // #when
+    const {result, elapsedMs} = timed(repeated)
+
+    // #then
+    expect(result).toMatchObject({kind: 'unclassified', evidence: 'none', stop: false})
+    expect(elapsedMs).toBeLessThan(BUDGET_MS)
+  })
+
+  it('matches a real suffix that comes after many repeated prefixes on a ~400KB line', () => {
+    // #given
+    // #when
+    const {result, elapsedMs} = timed(repeated + SUFFIX)
+
+    // #then
+    expect(result).toMatchObject({kind: 'quota', evidence: 'text', stop: true})
+    expect(elapsedMs).toBeLessThan(BUDGET_MS)
+  })
+
+  it('does not match when the suffix only appears before every prefix', () => {
+    // #given the suffix first, then ~400KB of prefixes: the old pattern rescanned from each one
+    // #when
+    const {result, elapsedMs} = timed(`${SUFFIX} ${repeated}`)
+
+    // #then
+    expect(result.kind).toBe('unclassified')
+    expect(elapsedMs).toBeLessThan(BUDGET_MS)
+  })
+
+  it('stays fast on many short lines, and finds a match on the last one', () => {
+    // #given 20,000 lines with a prefix but no suffix, then one complete line
+    const lines = `${`${PREFIX}and nothing else\n`.repeat(20_000)}${PREFIX}${SUFFIX}`
+
+    // #when
+    const {result, elapsedMs} = timed(lines)
+
+    // #then
+    expect(result).toMatchObject({kind: 'quota', evidence: 'text', stop: true})
+    expect(elapsedMs).toBeLessThan(BUDGET_MS)
+  })
+
+  it('stays fast on a ~400KB "Model not found:" lookalike with no model id', () => {
+    // #given the other full-message matcher, on its own worst-ish shapes
+    const messages = [
+      'Model not found: '.repeat(25_000),
+      `Model not found: ${'a/'.repeat(200_000)}`,
+      `Model not found: ${'a'.repeat(400_000)}`,
+      `Model not found: a/${'.a'.repeat(200_000)}`,
+    ]
+
+    // #when / #then
+    for (const message of messages) {
+      const {elapsedMs} = timed(message)
+      expect(elapsedMs).toBeLessThan(BUDGET_MS)
+    }
+  })
+})
