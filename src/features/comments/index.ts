@@ -1,5 +1,4 @@
 export {
-  createAgentError,
   createErrorInfo,
   createLLMFetchError,
   createLLMTimeoutError,

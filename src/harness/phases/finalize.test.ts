@@ -8,7 +8,12 @@ import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {CacheRestorePhaseResult} from './cache-restore.js'
 import type {ExecutePhaseResult} from './execute.js'
 import type {RoutingPhaseResult} from './routing.js'
-import {classifyModelNotFoundError, createProviderAuthError} from '@fro-bot/runtime'
+import {
+  classifyModelNotFoundError,
+  classifyProviderFailure,
+  createAgentError,
+  createProviderAuthError,
+} from '@fro-bot/runtime'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {formatErrorComment} from '../../features/comments/index.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
@@ -1687,6 +1692,46 @@ describe('runFinalize quota_exceeded llmError handling', () => {
     expect(text).not.toContain(ATTACKER_DETAILS)
     expect(text).not.toContain('secret-token-xyz')
   }
+
+  it('a usage-limit message that used to label as a generic agent error now exits 1 instead of 0', async () => {
+    // #given the same poll assistant error with usage-limit wording and a comment target. Before the shared
+    // classifier the poll path labelled it a generic agent error (exit 0 with a comment); it is now quota.
+    const bootstrap = createBootstrap({delivery: 'none', responseFilePath: null})
+    const routing = createRouting()
+    const metrics = createMetrics()
+    const message = 'Usage limit reached. Enable usage from your available balance'
+    const before = createAgentError('name=APIError')
+    const after = classifyProviderFailure({source: 'terminal-payload', name: 'APIError', message}).errorInfo
+
+    // #when finalize runs with each label
+    const exitBefore = await runFinalize(
+      bootstrap,
+      routing,
+      cacheRestore,
+      createExecution({success: false, exitCode: 0, llmError: before}),
+      metrics,
+      Date.now(),
+      createMockLogger(),
+    )
+    vi.clearAllMocks()
+    mocks.postComment.mockResolvedValue({commentId: 1, created: true, updated: false, url: 'https://example.com/1'})
+    const exitAfter = await runFinalize(
+      bootstrap,
+      routing,
+      cacheRestore,
+      createExecution({success: false, exitCode: 0, llmError: after}),
+      metrics,
+      Date.now(),
+      createMockLogger(),
+    )
+
+    // #then the label change flips the exit code, and the quota path fails the job
+    expect(before.type).toBe('configuration')
+    expect(after.type).toBe('quota_exceeded')
+    expect(exitBefore).toBe(0)
+    expect(exitAfter).toBe(1)
+    expect(mocks.setFailed).toHaveBeenCalledTimes(1)
+  })
 
   it('posts a rebuilt quota_exceeded comment to the exact issue target for model-gh delivery', async () => {
     // #given model-gh delivery, an issue target, and a quota_exceeded llmError

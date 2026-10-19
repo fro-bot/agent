@@ -1414,6 +1414,216 @@ describe('processEventStream — structured failure capture on the activity trac
   })
 })
 
+function newTracker(): ActivityTracker {
+  return {
+    firstMeaningfulEventReceived: false,
+    currentTurnTerminalSignalReceived: false,
+    sessionIdle: false,
+    sessionError: null,
+  }
+}
+
+function terminalPayloadEvent(error: unknown): Event {
+  return {type: 'session.error', properties: {sessionID: ROOT_SESSION_ID, error}} as unknown as Event
+}
+
+describe('processEventStream — shared provider-failure stop rule', () => {
+  it.each(['model_not_found', 'model_not_supported'])(
+    'a %s retry status stops the run as a terminal model-not-found error',
+    async reason => {
+      // #given a root retry status whose structured reason says the model can never be served
+      const activityTracker = newTracker()
+      const event = {
+        type: 'session.status',
+        properties: {sessionID: ROOT_SESSION_ID, status: {type: 'retry', action: {reason}, message: 'retrying'}},
+      } as unknown as Event
+
+      // #when processed
+      const result = await processEventStream(
+        createMockEventStream([event]),
+        ROOT_SESSION_ID,
+        new AbortController().signal,
+        createMockLogger(),
+        activityTracker,
+      )
+
+      // #then it is a terminal, structured failure (the Action used to keep waiting here)
+      expect(result.llmError?.type).toBe('model_not_found')
+      expect(activityTracker.terminalProviderError?.type).toBe('model_not_found')
+      expect(activityTracker.classificationPath).toBe('structured')
+    },
+  )
+
+  it('an account_rate_limit retry status still stops the run and keeps its reset time', async () => {
+    // #given a quota retry carrying a finite `next`
+    const activityTracker = newTracker()
+    const next = Date.parse('2026-07-16T12:00:00Z')
+    const event = {
+      type: 'session.status',
+      properties: {
+        sessionID: ROOT_SESSION_ID,
+        status: {type: 'retry', action: {reason: 'account_rate_limit'}, message: 'quota', next},
+      },
+    } as unknown as Event
+
+    // #when processed
+    const result = await processEventStream(
+      createMockEventStream([event]),
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then
+    expect(activityTracker.terminalProviderError?.type).toBe('quota_exceeded')
+    expect(result.llmError?.resetTime).toEqual(new Date(next))
+  })
+
+  it('keeps waiting on a transient retry status', async () => {
+    // #given a retry whose text names a rate limit but carries no structured stop reason
+    const activityTracker = newTracker()
+    const event = {
+      type: 'session.status',
+      properties: {sessionID: ROOT_SESSION_ID, status: {type: 'retry', message: '429 Too Many Requests'}},
+    } as unknown as Event
+
+    // #when processed
+    const result = await processEventStream(
+      createMockEventStream([event]),
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then nothing is classified
+    expect(result.llmError).toBeNull()
+    expect(activityTracker.terminalProviderError).toBeUndefined()
+  })
+
+  it('auth wording on a terminal payload labels the failure without stopping the run early', async () => {
+    // #given an UnknownError whose message only hints at an auth failure (no ProviderAuthError marker)
+    const activityTracker = newTracker()
+
+    // #when processed
+    const result = await processEventStream(
+      createMockEventStream([terminalPayloadEvent({name: 'UnknownError', data: {message: 'no auth available'}})]),
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then the label is auth, but it is recorded as a generic failure: no terminal settlement
+    expect(result.llmError?.type).toBe('provider_auth_error')
+    expect(activityTracker.terminalProviderError).toBeUndefined()
+    expect(activityTracker.genericError?.type).toBe('provider_auth_error')
+    expect(activityTracker.classificationPath).toBe('fallback')
+  })
+
+  it('"model is not supported" on a terminal payload labels the failure without stopping the run early', async () => {
+    // #given
+    const activityTracker = newTracker()
+
+    // #when processed
+    const result = await processEventStream(
+      createMockEventStream([terminalPayloadEvent({name: 'APIError', data: {message: 'model is not supported'}})]),
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then
+    expect(result.llmError?.type).toBe('model_not_found')
+    expect(activityTracker.terminalProviderError).toBeUndefined()
+    expect(activityTracker.genericError?.type).toBe('model_not_found')
+  })
+
+  it('a label-only hint does not outrank a later terminal failure', async () => {
+    // #given a hint recorded first, then a structured auth failure
+    const activityTracker = newTracker()
+
+    // #when
+    const result = await processEventStream(
+      createMockEventStream([
+        terminalPayloadEvent({name: 'UnknownError', data: {message: 'model is not supported'}}),
+        terminalPayloadEvent({name: 'ProviderAuthError', data: {providerID: 'x', message: 'rejected'}}),
+      ]),
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then the terminal failure wins and the earlier generic record is cleared
+    expect(result.llmError?.type).toBe('provider_auth_error')
+    expect(activityTracker.terminalProviderError?.type).toBe('provider_auth_error')
+    expect(activityTracker.genericError).toBeUndefined()
+  })
+
+  it('an unclassified session.error is recorded as generic so the loop keeps waiting', async () => {
+    // #given a payload with no provider evidence
+    const activityTracker = newTracker()
+
+    // #when
+    const result = await processEventStream(
+      createMockEventStream([terminalPayloadEvent({name: 'UnknownError', data: {message: 'something odd'}})]),
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then
+    expect(result.llmError?.type).toBe('configuration')
+    expect(activityTracker.terminalProviderError).toBeUndefined()
+    expect(activityTracker.genericError?.type).toBe('configuration')
+  })
+
+  it('context overflow stays terminal so the overflow-recovery gate still sees context_overflow', async () => {
+    // #given
+    const activityTracker = newTracker()
+
+    // #when
+    const result = await processEventStream(
+      createMockEventStream([contextOverflowErrorEvent(ROOT_SESSION_ID)]),
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then the shared rule reports stop:false for overflow; the Action still settles it as terminal
+    expect(result.llmError?.type).toBe('context_overflow')
+    expect(activityTracker.terminalProviderError?.type).toBe('context_overflow')
+  })
+
+  it('usage-limit text on a session.error stops the run as quota', async () => {
+    // #given
+    const activityTracker = newTracker()
+
+    // #when
+    const result = await processEventStream(
+      createMockEventStream([
+        terminalPayloadEvent({
+          name: 'APIError',
+          data: {message: 'Usage limit reached. Enable usage from your available balance'},
+        }),
+      ]),
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then
+    expect(result.llmError?.type).toBe('quota_exceeded')
+    expect(activityTracker.terminalProviderError?.type).toBe('quota_exceeded')
+  })
+})
+
 describe('processEventStream — ownership check widens descendant events, no-ledger path unchanged', () => {
   it('message.part.delta: without a ledger a descendant delta never reaches output, with a ledger it does', async () => {
     // #given the same delta event on the CHILD session, run twice: no ledger, then with the child adopted.
