@@ -1,4 +1,5 @@
 export * from './agent/error-format/format.js'
+export * from './agent/error-format/provider-failure.js'
 export * from './agent/error-format/types.js'
 export * from './agent/index.js'
 export * from './coordination/index.js'
