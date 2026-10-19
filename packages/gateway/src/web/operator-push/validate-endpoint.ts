@@ -14,7 +14,7 @@
  * DNS rebinding, where a hostname resolves to a public IP at validation
  * time and to a private or metadata IP at fetch/dispatch time. The push
  * dispatch path (`push-sender.ts`) additionally validates the RESOLVED IP
- * at connect time via `isBlockedResolvedAddress` from `ip-classification.ts`
+ * at connect time via `isBlockedResolvedAddress` from `@fro-bot/runtime` (`net/ip-classification.ts`)
  * to close that gap; this module only stops literal-address bypasses.
  *
  * IPv6 posture: IPv6 literals are rejected wholesale — push service
@@ -26,10 +26,10 @@
  * thrown reason or a log line — only the coarse rejection class name.
  */
 
-import type {EndpointRejectionReason} from './ip-classification.js'
-import {classifyIpv4, classifyIpv6} from './ip-classification.js'
+import type {EndpointRejectionReason} from '@fro-bot/runtime'
+import {classifyIpv4, classifyIpv6} from '@fro-bot/runtime'
 
-export type {EndpointRejectionReason} from './ip-classification.js'
+export type {EndpointRejectionReason} from '@fro-bot/runtime'
 
 export interface EndpointValidationResult {
   readonly ok: boolean

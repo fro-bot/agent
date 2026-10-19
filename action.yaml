@@ -52,7 +52,7 @@ inputs:
     description: AWS account ID of the expected bucket owner. When set, protects against bucket-name squatting.
     required: false
   s3-allow-insecure-endpoint:
-    description: 'Allow HTTP (non-HTTPS) S3 endpoints. Only for local MinIO dev. Default: false.'
+    description: 'Allow HTTP (non-HTTPS) S3 endpoints and loopback/private-network addresses. Only for local MinIO dev; cloud metadata addresses stay blocked. Default: false.'
     required: false
     default: 'false'
   s3-sse-kms-key-id:

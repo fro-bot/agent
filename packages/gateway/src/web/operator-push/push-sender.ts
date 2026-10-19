@@ -23,8 +23,8 @@ import type {LookupFunction} from 'node:net'
 import type {PushSubscription, RequestOptions} from 'web-push'
 import dns from 'node:dns'
 import https from 'node:https'
+import {isBlockedResolvedAddress} from '@fro-bot/runtime'
 import webpush, {WebPushError} from 'web-push'
-import {isBlockedResolvedAddress} from './ip-classification.js'
 
 /** Maps the string-form family Node's typings allow to the numeric form `dns.lookup` requires. */
 function toNumericFamily(family: LookupOptions['family']): number | undefined {

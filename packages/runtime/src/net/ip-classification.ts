@@ -1,15 +1,22 @@
 /**
- * Pure IP-address classification shared by the two SSRF defenses on the
- * operator push endpoint path:
+ * Pure IP-address classification shared across surfaces:
  *
- *   - `validate-endpoint.ts`: parse-time literal-address guard, classifying
- *     the hostname AS WRITTEN in a subscription endpoint URL.
- *   - `push-sender.ts`: connect-time guard, classifying the RESOLVED address
- *     immediately before the TLS socket connects — this is what actually
- *     closes the DNS-rebinding gap the parse-time guard cannot.
+ *   - The gateway's operator push endpoint path, which has two SSRF defenses:
+ *     `validate-endpoint.ts` (parse-time literal-address guard, classifying the
+ *     hostname AS WRITTEN in a subscription endpoint URL) and `push-sender.ts`
+ *     (connect-time guard, classifying the RESOLVED address immediately before
+ *     the TLS socket connects — this is what actually closes the DNS-rebinding
+ *     gap the parse-time guard cannot). Both use `classifyIpv4`, `classifyIpv6`,
+ *     and `isBlockedResolvedAddress`, so the two layers can never silently
+ *     drift apart on what counts as "internal".
+ *   - The object-store endpoint validator (`object-store/validation.ts`), which
+ *     uses `classifyReservedIpv4` / `classifyReservedIpv6` below.
  *
- * Both call into the same classification logic here so the two layers can
- * never silently drift apart on what counts as "internal".
+ * `classifyIpv4` / `classifyIpv6` / `isBlockedResolvedAddress` define the push
+ * path's posture and must not change without a matching change there. The
+ * `classifyReserved*` functions are a separate, wider layer for callers that
+ * need to tell metadata apart from other reserved space and to accept public
+ * IPv6 literals.
  */
 
 /** Coarse, closed set of reasons an endpoint URL or resolved address was rejected. No free-form text. */
@@ -169,4 +176,81 @@ export function isBlockedResolvedAddress(address: string, family: number): boole
 
   // Unknown address family — fail closed.
   return true
+}
+
+/**
+ * What a reserved-address check found:
+ *   - `metadata`: a cloud instance metadata service address. Never a legitimate target.
+ *   - `internal`: loopback, private/ULA, link-local, unspecified, CGNAT, site-local, or documentation space.
+ */
+export type ReservedAddressClass = 'metadata' | 'internal'
+
+function parseIpv4Octets(address: string): readonly number[] | null {
+  const match = IPV4_PATTERN.exec(address)
+  if (match === null) return null
+  const octets = [match[1] ?? '', match[2] ?? '', match[3] ?? '', match[4] ?? ''].map(part => Number.parseInt(part, 10))
+  if (octets.some(o => Number.isNaN(o) || o > 255)) return null
+  return octets
+}
+
+function classifyReservedIpv4Octets(octets: readonly number[]): ReservedAddressClass | null {
+  const [a, b, c, d] = octets
+  if (a === 169 && b === 254 && c === 169 && d === 254) return 'metadata'
+  if (classifyIpv4Octets(octets) !== null) return 'internal'
+  // 100.64.0.0/10 shared address space (CGNAT, RFC 6598).
+  if (a === 100 && b !== undefined && b >= 64 && b <= 127) return 'internal'
+  // RFC 5737 documentation ranges: 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24.
+  if (a === 192 && b === 0 && c === 2) return 'internal'
+  if (a === 198 && b === 51 && c === 100) return 'internal'
+  if (a === 203 && b === 0 && c === 113) return 'internal'
+  return null
+}
+
+/**
+ * Classify a dotted-quad IPv4 address. Returns `null` for public addresses and for text that is not a dotted quad.
+ * Unlike `classifyIpv4`, it also flags CGNAT and documentation ranges and singles out the metadata address.
+ */
+export function classifyReservedIpv4(address: string): ReservedAddressClass | null {
+  const octets = parseIpv4Octets(address)
+  if (octets === null) return null
+  return classifyReservedIpv4Octets(octets)
+}
+
+/**
+ * Classify a bare IPv6 address (no brackets) in canonical WHATWG form, as `new URL(...).hostname` serializes it once
+ * the brackets are removed. Returns `null` for public addresses.
+ *
+ * Unlike `classifyIpv6`, which rejects every literal for the push path, this returns `null` for public IPv6 and for
+ * IPv4-mapped public IPv4, and singles out `fd00:ec2::254` (AWS IPv6 metadata) and mapped IPv4 metadata. An
+ * undecodable `::ffff:` tail fails closed as `internal`.
+ */
+export function classifyReservedIpv6(address: string): ReservedAddressClass | null {
+  const lower = address.toLowerCase()
+
+  const mappedPrefix = '::ffff:'
+  if (lower.startsWith(mappedPrefix)) {
+    const suffix = lower.slice(mappedPrefix.length)
+    let octets: readonly number[] | null = null
+    if (suffix.includes('.')) {
+      octets = parseIpv4Octets(suffix)
+    } else {
+      const hexMatch = IPV6_MAPPED_HEX_TAIL_PATTERN.exec(suffix)
+      if (hexMatch !== null) {
+        const group0 = Number.parseInt(hexMatch[1] ?? '', 16)
+        const group1 = Number.parseInt(hexMatch[2] ?? '', 16)
+        octets = [(group0 >> 8) & 0xff, group0 & 0xff, (group1 >> 8) & 0xff, group1 & 0xff]
+      }
+    }
+    return octets === null ? 'internal' : classifyReservedIpv4Octets(octets)
+  }
+
+  if (lower === 'fd00:ec2::254') return 'metadata'
+
+  // classifyIpv6 is total: 'ipv6-literal' means "not a known internal form", which for this caller means public.
+  if (classifyIpv6(lower) !== 'ipv6-literal') return 'internal'
+
+  // 2001:db8::/32 documentation prefix (RFC 3849).
+  if (lower.startsWith('2001:db8:')) return 'internal'
+
+  return null
 }

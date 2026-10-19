@@ -6,7 +6,7 @@
  * ingress module's public surface; import only from within
  * `packages/gateway/src/web/ingress/`.
  *
- * Deliberately NOT `web/operator-push/ip-classification.ts`. That module
+ * Deliberately NOT `@fro-bot/runtime`'s `net/ip-classification.ts`. That module
  * classifies DESTINATION reachability (internal vs public network) for SSRF
  * defense on outbound push requests. This module establishes CANONICAL
  * IDENTITY for trust-boundary / equality comparison on INBOUND client

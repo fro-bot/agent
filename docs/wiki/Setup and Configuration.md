@@ -254,7 +254,7 @@ The action accepts over 20 inputs defined in `action.yaml`, grouped into core, a
 - `enable-omo-slim` enables OMO Slim (default: `false`), mutually exclusive with `enable-omo`. When `true`, OMO Slim installs with the chosen `omo-slim-preset` (`openai` or `opencode-go`, default `openai`) and pins `orchestrator` as the default agent.
 - `model` overrides the LLM model in `provider/model` format.
 - `timeout` controls the execution timeout (default: 30 minutes, 0 for no limit).
-- `s3-backup` / `s3-bucket` / `aws-region` / `s3-endpoint` / `s3-prefix` / `s3-expected-bucket-owner` / `s3-allow-insecure-endpoint` / `s3-sse-encryption` / `s3-sse-kms-key-id` enable and configure the durable S3-compatible object store (see [[Session Persistence]]). Input validation rejects SSRF-vulnerable endpoints (metadata services, private IPs) and enforces HTTPS unless explicitly overridden.
+- `s3-backup` / `s3-bucket` / `aws-region` / `s3-endpoint` / `s3-prefix` / `s3-expected-bucket-owner` / `s3-allow-insecure-endpoint` / `s3-sse-encryption` / `s3-sse-kms-key-id` enable and configure the durable S3-compatible object store (see [[Session Persistence]]). Input validation always rejects cloud metadata endpoints, and rejects loopback, private, link-local, unspecified, CGNAT, and documentation addresses unless `s3-allow-insecure-endpoint` is `true`. It enforces HTTPS unless that flag is set. Hostnames are not resolved at validation time.
 - `session-retention` controls how many sessions to keep before pruning (default: 50).
 - `dedup-window` configures the deduplication window in milliseconds (default: 10 minutes).
 
