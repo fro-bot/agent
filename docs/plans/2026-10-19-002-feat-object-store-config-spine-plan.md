@@ -78,7 +78,7 @@ The three readers disagree on names, defaults and validation:
   "verdict": "extend",
   "scope": "packages/runtime/src/object-store, packages/runtime/src/shared, src/harness/config, packages/gateway/src/config.ts, packages/gateway/src/bindings",
   "freshness": {
-    "vcs_reference": "801fc2553"
+    "vcs_reference": "515424ac0"
   },
   "budget": {
     "max_search_passes": 3,
