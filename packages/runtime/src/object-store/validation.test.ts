@@ -202,6 +202,10 @@ describe('validateEndpoint', () => {
       }
     })
 
+    it('accepts the translated form of a public address in strict mode', () => {
+      expect(validateEndpoint('https://[::ffff:0:808:808]', false).success).toBe(true)
+    })
+
     it('rejects the translated form of an internal address by default and accepts it when insecure', () => {
       expect(validateEndpoint('https://[::ffff:0:7f00:1]', false).success).toBe(false)
       expect(validateEndpoint('https://[::ffff:0:7f00:1]', true).success).toBe(true)
@@ -247,6 +251,14 @@ describe('validateEndpoint', () => {
           expect(validateEndpoint(endpoint, allowInsecure).success).toBe(false)
         }
       }
+    })
+  })
+
+  // Documented limits (see the wiki's "Known limits"): these are accepted today. If a change starts rejecting
+  // them, update the docs and this test together.
+  describe('documented limits', () => {
+    it.each(['https://metadata/', 'https://198.18.0.1/'])('accepts %s in strict mode', endpoint => {
+      expect(validateEndpoint(endpoint, false).success).toBe(true)
     })
   })
 
