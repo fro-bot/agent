@@ -18,8 +18,7 @@
  * - the root idle evidence is current-generation (no root activity or new root user message since);
  * - REST shows the root is not live;
  * - REST `session.messages` shows the LATEST root user message answered by a qualified terminal assistant
- *   reply (small local copy of the Action's predicate in `src/features/agent/session-poll.ts` — no
- *   cross-layer import);
+ *   reply (the blocking-tool rule is the shared `hasBlockingToolPart` from `@fro-bot/runtime`);
  * - the revision captured before those requests still equals the current one.
  *
  * No notice and no cancel evidence never admits: the run's hard deadline reports it incomplete.
@@ -27,9 +26,18 @@
  * of observed notices, and one validation in flight.
  */
 
-import type {LedgerReconcileAdapter, OpenCodeServerHandle, OwnershipLedger} from '@fro-bot/runtime'
+import type {LedgerReconcileAdapter, OpenCodeServerHandle, OwnershipLedger, TaskNotice} from '@fro-bot/runtime'
 import type {GatewayLogger} from '../discord/client.js'
 import type {ReplyTextPart} from './reply-delivery.js'
+
+import {
+  getBooleanProperty,
+  getNumberProperty,
+  getObjectProperty,
+  getStringProperty,
+  hasBlockingToolPart,
+  parseSyntheticNoticePart,
+} from '@fro-bot/runtime'
 
 /** Cadence of re-validation while draining. A rejected pass is re-run no faster than this. */
 export const DRAIN_VALIDATION_INTERVAL_MS = 1_000
@@ -42,54 +50,6 @@ export const DRAIN_REQUEST_TIMEOUT_MS = 5_000
  * written onto `info.error.name` of an interrupted assistant message.
  */
 const ABORTED_ERROR_NAME = 'MessageAbortedError'
-
-/** `<task id="{childSessionId}" state="completed|error">` — see `renderOutput` in upstream `tool/task.ts`. */
-const TASK_NOTICE_PATTERN = /<task id="([^"]+)" state="(completed|error)">/
-
-export interface TaskNotice {
-  readonly childSessionId: string
-  readonly state: 'completed' | 'error'
-}
-
-/** Parse the opening tag of an injected background-task notice. The `running` state is never injected. */
-export function parseTaskNotice(text: string): TaskNotice | null {
-  const match = TASK_NOTICE_PATTERN.exec(text)
-  const childSessionId = match?.[1]
-  const state = match?.[2]
-  if (childSessionId === undefined || (state !== 'completed' && state !== 'error')) return null
-  return {childSessionId, state}
-}
-
-function getStringProperty(value: unknown, property: string): string | null {
-  if (value == null || typeof value !== 'object') return null
-  const descriptor = Object.getOwnPropertyDescriptor(value, property)
-  return typeof descriptor?.value === 'string' ? descriptor.value : null
-}
-
-function getObjectProperty(value: unknown, property: string): unknown {
-  if (value == null || typeof value !== 'object') return null
-  return Object.getOwnPropertyDescriptor(value, property)?.value ?? null
-}
-
-function getBooleanProperty(value: unknown, property: string): boolean | null {
-  if (value == null || typeof value !== 'object') return null
-  const descriptor = Object.getOwnPropertyDescriptor(value, property)
-  return typeof descriptor?.value === 'boolean' ? descriptor.value : null
-}
-
-function getNumberProperty(value: unknown, property: string): number | null {
-  if (value == null || typeof value !== 'object') return null
-  const descriptor = Object.getOwnPropertyDescriptor(value, property)
-  return typeof descriptor?.value === 'number' ? descriptor.value : null
-}
-
-/** A notice parsed out of a persisted/streamed message part, or null when the part is not one. */
-export function parseSyntheticNoticePart(part: unknown): TaskNotice | null {
-  if (getStringProperty(part, 'type') !== 'text') return null
-  if (getBooleanProperty(part, 'synthetic') !== true) return null
-  const text = getStringProperty(part, 'text')
-  return text === null ? null : parseTaskNotice(text)
-}
 
 type BoundedResult<T> = {readonly ok: true; readonly value: T} | {readonly ok: false}
 
@@ -146,14 +106,12 @@ function readMessages(data: unknown): RestMessageFacts | null {
 }
 
 /**
- * Whether an assistant message is a qualified terminal reply to `parentId`. Local copy of the Action's
- * predicate (`detectMessageActivity` in `src/features/agent/session-poll.ts`):
- * - answers the parent, carries no error, and has `time.completed`;
+ * Whether an assistant message is a qualified terminal reply to `parentId`:
+ * - it answers the parent, carries no error, and has `time.completed`;
  * - `finish` is set and is neither `tool-calls` nor `unknown` (`time.completed` alone is not a success
  *   certificate — upstream sets it during cleanup of failed and intermediate steps too);
- * - no tool part blocks it. Any non-provider-executed tool part means the model has not yet received the
- *   result and will produce another turn — except an orphaned interrupted tool (`state.status === 'error'`
- *   with `state.metadata.interrupted === true`), which is abandoned, not pending.
+ * - no tool part blocks it (`hasBlockingToolPart`: a pending tool means the model has not yet received the
+ *   result and will produce another turn).
  */
 function isQualifiedTerminalReply(
   assistant: {readonly info: unknown; readonly parts: unknown},
@@ -165,16 +123,7 @@ function isQualifiedTerminalReply(
   if (getNumberProperty(getObjectProperty(info, 'time'), 'completed') === null) return false
   const finish = getStringProperty(info, 'finish')
   if (finish === null || finish === 'tool-calls' || finish === 'unknown') return false
-  if (Array.isArray(parts)) {
-    const hasBlockingTool = (parts as readonly unknown[]).some(part => {
-      if (getStringProperty(part, 'type') !== 'tool') return false
-      if (getBooleanProperty(getObjectProperty(part, 'metadata'), 'providerExecuted') === true) return false
-      const state = getObjectProperty(part, 'state')
-      const interrupted = getBooleanProperty(getObjectProperty(state, 'metadata'), 'interrupted')
-      return !(getStringProperty(state, 'status') === 'error' && interrupted === true)
-    })
-    if (hasBlockingTool) return false
-  }
+  if (hasBlockingToolPart(parts)) return false
   return true
 }
 
