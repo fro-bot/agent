@@ -3,7 +3,20 @@ import type {Event} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
 import type {TokenUsage} from '../../shared/types.js'
 import type {ExecutionDeadline} from './retry.js'
-import {classifyProviderFailure, retrySignalFromStatus, terminalSignalFromPayload} from '@fro-bot/runtime'
+import {
+  classifyProviderFailure,
+  getBooleanProperty,
+  getEventKind,
+  getEventPayload,
+  getEventSessionID,
+  getNumberProperty,
+  getObjectProperty,
+  getSessionID,
+  getStringProperty,
+  parseTaskNotice,
+  retrySignalFromStatus,
+  terminalSignalFromPayload,
+} from '@fro-bot/runtime'
 import {extractCommitShas, extractGithubUrls} from '../../services/github/urls.js'
 import {outputTextContent, outputToolExecution} from '../../shared/console.js'
 
@@ -439,40 +452,6 @@ export function detectArtifacts(
   }
 }
 
-function getSessionID(value: unknown): string | null {
-  if (value == null || typeof value !== 'object') return null
-
-  const descriptor = Object.getOwnPropertyDescriptor(value, 'sessionID')
-  return typeof descriptor?.value === 'string' ? descriptor.value : null
-}
-
-function getStringProperty(value: unknown, property: string): string | null {
-  if (value == null || typeof value !== 'object') return null
-
-  const descriptor = Object.getOwnPropertyDescriptor(value, property)
-  return typeof descriptor?.value === 'string' ? descriptor.value : null
-}
-
-function getNumberProperty(value: unknown, property: string): number | null {
-  if (value == null || typeof value !== 'object') return null
-
-  const descriptor = Object.getOwnPropertyDescriptor(value, property)
-  return typeof descriptor?.value === 'number' ? descriptor.value : null
-}
-
-function getBooleanProperty(value: unknown, property: string): boolean | null {
-  if (value == null || typeof value !== 'object') return null
-
-  const descriptor = Object.getOwnPropertyDescriptor(value, property)
-  return typeof descriptor?.value === 'boolean' ? descriptor.value : null
-}
-
-function getObjectProperty(value: unknown, property: string): unknown {
-  if (value == null || typeof value !== 'object') return null
-
-  return Object.getOwnPropertyDescriptor(value, property)?.value ?? null
-}
-
 /**
  * Folds a per-message usage ledger into the run's token and cost totals.
  *
@@ -578,21 +557,6 @@ export function normalizeSessionError(sessionError: unknown): string {
   return fields.length > 0 ? fields.join('; ') : GENERIC_SESSION_ERROR
 }
 
-function getEventSessionID(event: Event): string | null {
-  return getSessionID(getObjectProperty(event, 'properties')) ?? getSessionID(getObjectProperty(event, 'data'))
-}
-
-function getEventKind(event: Event): string | null {
-  const eventType = getStringProperty(event, 'type')
-  if (eventType !== 'sync') return eventType
-
-  return getStringProperty(event, 'name')?.replace(/\.\d+$/, '') ?? eventType
-}
-
-function getEventPayload(event: Event): unknown {
-  return getObjectProperty(event, 'properties') ?? getObjectProperty(event, 'data')
-}
-
 function isStreamActivityEvent(eventType: string | null): boolean {
   return eventType === 'message.part.delta' || eventType?.startsWith('session.next.') === true
 }
@@ -619,34 +583,6 @@ function isOwnedSession(
   if (eventSessionID === sessionId) return true
   if (ledger === undefined) return false
   return ledger.isTracked(eventSessionID)
-}
-
-/** A parsed `<task id="..." state="completed|error">` marker from an injected background-task completion turn. */
-interface InjectedTaskCompletion {
-  readonly childSessionId: string
-  readonly state: 'completed' | 'error'
-}
-
-/**
- * Upstream's `task` tool injects a synthetic text prompt into the PARENT
- * session when a background dispatch finishes (see `tool/task.ts`'s
- * `inject()` / `renderOutput()`), rendered as
- * `<task id="{childSessionId}" state="completed|error">...`. This is the
- * only observable signal on the wire that a background execution settled —
- * there is no structured field carrying it. Matches the opening tag only;
- * the running state is never injected this way (only completed/error are).
- */
-const INJECTED_TASK_COMPLETION_PATTERN = /<task id="([^"]+)" state="(completed|error)">/
-
-function parseInjectedTaskCompletion(text: string): InjectedTaskCompletion | null {
-  const match = INJECTED_TASK_COMPLETION_PATTERN.exec(text)
-  if (match == null) return null
-
-  const childSessionId = match[1]
-  const state = match[2]
-  if (childSessionId == null || (state !== 'completed' && state !== 'error')) return null
-
-  return {childSessionId, state}
 }
 
 interface ToolCallInfo {
@@ -914,7 +850,7 @@ export async function processEventStream(
           // whether or not the child was adopted, so the barrier is registered before settling a tracked child.
           const completion =
             eventSessionID === sessionId && text != null && getBooleanProperty(part, 'synthetic') === true
-              ? parseInjectedTaskCompletion(text)
+              ? parseTaskNotice(text)
               : null
           if (completion === null) {
             if (text != null) lastText = text
