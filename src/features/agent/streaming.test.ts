@@ -1675,6 +1675,45 @@ describe('processEventStream — shared provider-failure stop rule', () => {
     },
   )
 
+  it.each([
+    {
+      label: 'auth wording with HTTP 429',
+      error: {name: 'APIError', data: {statusCode: 429, message: 'no auth available'}},
+      type: 'provider_auth_error',
+    },
+    {
+      label: 'model wording with HTTP 429',
+      error: {name: 'APIError', data: {statusCode: 429, message: 'model is not supported'}},
+      type: 'model_not_found',
+    },
+    {
+      label: 'auth wording in a fetch failure string',
+      error: 'fetch failed: no auth available',
+      type: 'provider_auth_error',
+    },
+    {
+      label: 'model wording in a fetch failure string',
+      error: 'fetch failed: model is not supported',
+      type: 'model_not_found',
+    },
+  ])('a hint keeps the generic retryability of the payload: $label', async ({error, type}) => {
+    // #given payloads the generic ladder treats as retryable (429, fetch failure) that also carry hint wording
+    const activityTracker = newTracker()
+
+    // #when
+    const result = await processEventStream(
+      createMockEventStream([terminalPayloadEvent(error)]),
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then labelled by the hint, still retryable, still not terminal
+    expect(result.llmError).toMatchObject({type, retryable: true})
+    expect(activityTracker.terminalProviderError).toBeUndefined()
+  })
+
   it('usage-limit text past 2048 characters still stops the run as quota', async () => {
     // #given a provider error that echoes a long body before its usage-limit phrase
     const activityTracker = newTracker()

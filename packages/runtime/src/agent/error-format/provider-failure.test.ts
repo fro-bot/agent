@@ -688,6 +688,57 @@ describe('classifyProviderFailure — hints keep retryability', () => {
     expect(result.errorInfo.retryable).toBe(false)
   })
 
+  describe('a hint never changes retryability compared with the same payload without the hint', () => {
+    const HINTS = [
+      {label: 'auth wording', wording: 'no auth available', type: 'provider_auth_error'},
+      {label: 'model wording', wording: 'model is not supported', type: 'model_not_found'},
+    ] as const
+    const CONTROL_WORDING = 'something odd happened'
+
+    // `detail` is the caller's bounded diagnostic; for a plain string payload it is the string itself, which is
+    // what the generic ladder's fetch-error check reads.
+    const PAYLOADS = [
+      {label: 'HTTP 429 with no isRetryable', build: (text: string) => ({status: 429, message: text}), retryable: true},
+      {
+        label: 'HTTP 429 with isRetryable false',
+        build: (text: string) => ({status: 429, isRetryable: false, message: text}),
+        retryable: true,
+      },
+      {
+        label: 'isRetryable false',
+        build: (text: string) => ({isRetryable: false, message: text, detail: 'x'}),
+        retryable: false,
+      },
+      {
+        label: 'isRetryable true',
+        build: (text: string) => ({isRetryable: true, message: text, detail: 'x'}),
+        retryable: true,
+      },
+      {label: 'no retry signal at all', build: (text: string) => ({message: text, detail: 'x'}), retryable: false},
+      {
+        label: 'a plain-string fetch failure',
+        build: (text: string) => ({message: `fetch failed: ${text}`, detail: `fetch failed: ${text}`}),
+        retryable: true,
+      },
+    ]
+
+    it.each(HINTS.flatMap(hint => PAYLOADS.map(payload => ({hint, payload}))))(
+      '$hint.label with $payload.label',
+      ({hint, payload}) => {
+        // #given the same payload, once with the hint wording and once with neutral wording
+        const hinted = classifyProviderFailure({source: 'terminal-payload', ...payload.build(hint.wording)})
+        const control = classifyProviderFailure({source: 'terminal-payload', ...payload.build(CONTROL_WORDING)})
+
+        // #then the hint labels the failure without stopping it, and retryability is exactly the control's
+        expect(control.evidence).toBe('none')
+        expect(hinted).toMatchObject({evidence: 'hint', stop: false, classificationPath: 'fallback'})
+        expect(hinted.errorInfo.type).toBe(hint.type)
+        expect(hinted.errorInfo.retryable).toBe(control.errorInfo.retryable)
+        expect(hinted.errorInfo.retryable).toBe(payload.retryable)
+      },
+    )
+  })
+
   it('does not make a structured stop retryable', () => {
     // #given a structured auth failure that also claims isRetryable
     const result = classifyProviderFailure({source: 'terminal-payload', name: 'ProviderAuthError', isRetryable: true})

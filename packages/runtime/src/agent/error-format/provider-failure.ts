@@ -136,11 +136,14 @@ function createModelUnavailableError(): ErrorInfo {
 }
 
 /**
- * A hint labels a failure it cannot confirm, so it must not take away a retry the provider offered: when the
- * payload says `isRetryable`, the label stays retryable and retry admission is preserved.
+ * A hint labels a failure it cannot confirm, so it never changes retryability in either direction: the label is
+ * retryable exactly when the generic ladder would call this payload retryable without the hint (an explicit
+ * `isRetryable`, an HTTP 429, or a fetch/network error). Retry admission is therefore the same as if the wording
+ * were absent.
  */
 function labelHint(label: ErrorInfo, signal: TerminalPayloadSignal): ErrorInfo {
-  return signal.isRetryable === true ? {...label, retryable: true} : label
+  const retryable = classifyGeneric(signal).errorInfo.retryable
+  return retryable === label.retryable ? label : {...label, retryable}
 }
 
 function result(

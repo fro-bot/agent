@@ -4144,6 +4144,23 @@ describe('pollForSessionCompletionObservation — shared provider-failure stop r
     expect(reduced.outcome).toBe('turn_failed_retryable')
   })
 
+  it.each([
+    {label: 'auth wording', message: 'no auth available', type: 'provider_auth_error'},
+    {label: 'model wording', message: 'model is not supported', type: 'model_not_found'},
+  ])('a $label hint on an HTTP 429 assistant error reduces to turn_failed_retryable', async ({message, type}) => {
+    // #given a 429 (retryable in the generic ladder, with no isRetryable) that also hints at auth or a model
+    vi.useFakeTimers()
+    const client = assistantErrorClient({name: 'APIError', data: {statusCode: 429, message}})
+
+    // #when
+    const observation = await pollOnce(client, qualifiedPredicateBaseActivityTracker())
+    const reduced = reduceAttemptOutcome(observation, null, {accepted: true})
+
+    // #then the hint changes the label, not the retry admission
+    expect(observation.failures[0]?.llmError).toMatchObject({type, retryable: true})
+    expect(reduced.outcome).toBe('turn_failed_retryable')
+  })
+
   it('a non-retryable hint reduces to turn_failed_terminal', async () => {
     // #given the same wording without isRetryable
     vi.useFakeTimers()
