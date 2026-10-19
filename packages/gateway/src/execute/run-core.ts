@@ -15,10 +15,6 @@
  * AND `promptAsync` must all carry the workspace repo `directory` in their query
  * params. Omitting `directory` from any of the three splits the SSE listener from
  * the publisher — tool events never arrive.
- *
- * Event-stream semantics mirror `src/features/agent/streaming.ts` exactly.
- * Cannot import from that module (backwards-dependency ban); accessors are
- * replicated locally.
  */
 
 import type {
@@ -39,11 +35,19 @@ import {
   createLedgerReconciler,
   createOwnershipLedger,
   createSdkLedgerReconcileAdapter,
+  getBooleanProperty,
+  getEventKind,
+  getEventPayload,
+  getEventSessionID,
+  getObjectProperty,
+  getSessionID,
+  getStringProperty,
+  parseSyntheticNoticePart,
   reconcileLedgerOnce,
 } from '@fro-bot/runtime'
 import {parsePermissionReply, parsePermissionRequest} from '../approvals/coordinator.js'
 import {parseQuestionEcho, parseQuestionRequest, safeLogId} from '../approvals/question-coordinator.js'
-import {createDrainCompletion, parseSyntheticNoticePart} from './drain-completion.js'
+import {createDrainCompletion} from './drain-completion.js'
 import {formatToolPart} from './format-part.js'
 import {
   failureFromErrorObject,
@@ -261,27 +265,6 @@ export interface RunCoreParams {
   }) => void
 }
 
-// ---------------------------------------------------------------------------
-// Local typed accessor helpers (mirrors streaming.ts — no import allowed)
-// ---------------------------------------------------------------------------
-
-function getStringProperty(value: unknown, property: string): string | null {
-  if (value == null || typeof value !== 'object') return null
-  const descriptor = Object.getOwnPropertyDescriptor(value, property)
-  return typeof descriptor?.value === 'string' ? descriptor.value : null
-}
-
-function getObjectProperty(value: unknown, property: string): unknown {
-  if (value == null || typeof value !== 'object') return null
-  return Object.getOwnPropertyDescriptor(value, property)?.value ?? null
-}
-
-function getBooleanProperty(value: unknown, property: string): boolean | null {
-  if (value == null || typeof value !== 'object') return null
-  const descriptor = Object.getOwnPropertyDescriptor(value, property)
-  return typeof descriptor?.value === 'boolean' ? descriptor.value : null
-}
-
 /**
  * Adapt the gateway's `(context, message)` logger to the runtime's
  * `(message, context)` `Logger` shape the ledger-reconciliation primitives
@@ -392,40 +375,6 @@ export function wrapLedgerWithHooks(
     snapshot: () => ledger.snapshot(),
     isTracked: sessionId => ledger.isTracked(sessionId),
   }
-}
-
-function getSessionID(value: unknown): string | null {
-  return getStringProperty(value, 'sessionID')
-}
-
-/**
- * Extract the event kind from a raw server event.
- * Mirrors `getEventKind` in streaming.ts:
- * - Non-sync events: return `event.type` as-is.
- * - Sync events: return `event.name` with trailing `.N` index stripped.
- */
-function getEventKind(event: unknown): string | null {
-  const eventType = getStringProperty(event, 'type')
-  if (eventType !== 'sync') return eventType
-  return getStringProperty(event, 'name')?.replace(/\.\d+$/, '') ?? eventType
-}
-
-/**
- * Extract the canonical payload from a raw server event.
- * Mirrors `getEventPayload` in streaming.ts: prefers `properties`, falls back
- * to `data` (sync events carry their payload in `data`).
- */
-function getEventPayload(event: unknown): unknown {
-  return getObjectProperty(event, 'properties') ?? getObjectProperty(event, 'data')
-}
-
-/**
- * Extract the session ID from a raw server event.
- * Mirrors `getEventSessionID` in streaming.ts: checks `properties.sessionID`
- * then `data.sessionID`.
- */
-function getEventSessionID(event: unknown): string | null {
-  return getSessionID(getObjectProperty(event, 'properties')) ?? getSessionID(getObjectProperty(event, 'data'))
 }
 
 // ---------------------------------------------------------------------------

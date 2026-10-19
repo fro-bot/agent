@@ -10,7 +10,15 @@ import type {Logger} from '../../shared/logger.js'
 import type {AttemptObservation, FailureObservation} from './attempt-outcome.js'
 import type {ExecutionDeadline} from './retry.js'
 import type {ActivityTracker} from './streaming.js'
-import {createOwnershipLedger, createSdkLedgerReconcileAdapter, reconcileLedgerOnce} from '@fro-bot/runtime'
+import {
+  createOwnershipLedger,
+  createSdkLedgerReconcileAdapter,
+  getNumberProperty,
+  getObjectProperty,
+  getStringProperty,
+  hasBlockingToolPart,
+  reconcileLedgerOnce,
+} from '@fro-bot/runtime'
 import {DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {
@@ -201,29 +209,6 @@ export function toPollResult(observation: AttemptObservation): PollResult {
  */
 export function ledgerBlocksCompletion(ledger?: OwnershipLedger): boolean {
   return ledger !== undefined && ledger.isDrainComplete() === false
-}
-
-function getStringProperty(value: unknown, property: string): string | null {
-  if (value == null || typeof value !== 'object') return null
-  const descriptor = Object.getOwnPropertyDescriptor(value, property)
-  return typeof descriptor?.value === 'string' ? descriptor.value : null
-}
-
-function getNumberProperty(value: unknown, property: string): number | null {
-  if (value == null || typeof value !== 'object') return null
-  const descriptor = Object.getOwnPropertyDescriptor(value, property)
-  return typeof descriptor?.value === 'number' ? descriptor.value : null
-}
-
-function getBooleanProperty(value: unknown, property: string): boolean | null {
-  if (value == null || typeof value !== 'object') return null
-  const descriptor = Object.getOwnPropertyDescriptor(value, property)
-  return typeof descriptor?.value === 'boolean' ? descriptor.value : null
-}
-
-function getObjectProperty(value: unknown, property: string): unknown {
-  if (value == null || typeof value !== 'object') return null
-  return Object.getOwnPropertyDescriptor(value, property)?.value ?? null
 }
 
 export async function waitForAbortableDelay(delayMs: number, signal?: AbortSignal): Promise<void> {
@@ -424,8 +409,9 @@ interface MessageCompletionCandidate {
  * Locates the latest new (post-baseline) assistant message and validates it against the
  * qualified-tuple predicate: new relative to the attempt baseline; answers the latest known root
  * user message with no newer unanswered one (the pending-parent barrier); `time.completed`
- * present; `finish` present and not `tool-calls`/`unknown`; no non-provider-executed tool call left
- * pending/running (a continuation the upstream prompt loop would still run another iteration for);
+ * present; `finish` present and not `tool-calls`/`unknown`; no blocking tool part (any tool part blocks,
+ * pending, running or completed, unless it is provider-executed or an orphaned interrupted tool -- see
+ * `hasBlockingToolPart`; the upstream prompt loop would run another iteration for it);
  * and no renewed root activity since the request was issued (revision check; a stale response never
  * mutates turn state, but its assistant error is still classified -- failure evidence is not
  * revision-scoped). Confirms the same
@@ -633,31 +619,11 @@ async function detectMessageActivity(
 
   // Upstream (packages/opencode/src/session/prompt.ts) does not filter tool parts on status at
   // all: ANY tool part -- pending, running, or completed -- requires another prompt-loop
-  // iteration unless it is provider-executed (the model never needs the result back) or an
-  // orphaned interrupted tool (cleanup() marks abandoned tool_use blocks 'error' with
-  // metadata.interrupted === true after retries/aborts; those are not pending work). A
-  // *completed*, non-provider-executed tool part still blocks completion -- the model has not
-  // yet received the result and will produce another turn. `providerExecuted` is read from
-  // `part.metadata`; the orphan condition reads `part.state.status` and
-  // `part.state.metadata.interrupted` -- two different metadata locations. The orphan check is
-  // the permissive branch, so it uses the strictest reading: a missing/malformed `state` or
-  // `metadata`, or `interrupted` present but not strictly `true`, must not qualify as an orphan.
-  const parts = getObjectProperty(latestAssistantMessage, 'parts')
-  if (Array.isArray(parts)) {
-    const hasBlockingTool = parts.some((part: unknown) => {
-      if (getStringProperty(part, 'type') !== 'tool') return false
-      const providerExecuted = getBooleanProperty(getObjectProperty(part, 'metadata'), 'providerExecuted')
-      if (providerExecuted === true) return false
-      const state = getObjectProperty(part, 'state')
-      const status = getStringProperty(state, 'status')
-      const interrupted = getBooleanProperty(getObjectProperty(state, 'metadata'), 'interrupted')
-      const isOrphanedInterruptedTool = status === 'error' && interrupted === true
-      return !isOrphanedInterruptedTool
-    })
-    if (hasBlockingTool) {
-      activityTracker.completedAssistantMessageId = undefined
-      return null
-    }
+  // iteration unless it is provider-executed or an orphaned interrupted tool. The rule lives in
+  // `hasBlockingToolPart` (runtime `agent/message-facts.ts`), shared with the gateway.
+  if (hasBlockingToolPart(getObjectProperty(latestAssistantMessage, 'parts'))) {
+    activityTracker.completedAssistantMessageId = undefined
+    return null
   }
 
   // Retained after the stale rejection above: the revision can still advance within this call, when

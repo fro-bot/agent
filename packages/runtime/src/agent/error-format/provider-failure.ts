@@ -1,6 +1,7 @@
 import type {ClassificationPath} from '../types.js'
 import type {ErrorInfo} from './types.js'
 
+import {ownValue} from '../payload-accessors.js'
 import {
   classifyContextOverflowError,
   classifyModelNotFoundError,
@@ -240,11 +241,6 @@ function classifyTerminalPayload(signal: TerminalPayloadSignal): ProviderFailure
 
   const generic = classifyGeneric(signal)
   return result('unclassified', 'none', false, generic.errorInfo, generic.classificationPath)
-}
-
-function ownValue(value: unknown, property: string): unknown {
-  if (value === null || typeof value !== 'object') return undefined
-  return Object.getOwnPropertyDescriptor(value, property)?.value
 }
 
 /** First candidate of the wanted type: a value of the wrong type never hides a valid fallback. */
