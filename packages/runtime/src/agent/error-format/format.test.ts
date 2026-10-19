@@ -758,6 +758,45 @@ describe('agent/error-format/format', () => {
       ).toBe('quota_exceeded')
     })
 
+    describe('usage-limit wording matches line by line, exactly like the single-line pattern it replaced', () => {
+      // The oracle is the original single regex. It is quadratic on adversarial input, so it only runs here on
+      // short strings, to pin that the linear per-line check means the same thing.
+      const ORIGINAL = /usage limit reached\..*enable usage from your available balance/i
+      const PREFIX = 'Usage limit reached.'
+      const SUFFIX = 'enable usage from your available balance'
+
+      it.each([
+        ['prefix then suffix on one line', `${PREFIX} It resets soon - ${SUFFIX}`],
+        ['suffix immediately after the prefix', `${PREFIX}${SUFFIX}`],
+        ['suffix with no separator before it', `${PREFIX} ${SUFFIX} trailing`],
+        ['mixed case', 'USAGE LIMIT REACHED. ENABLE USAGE FROM YOUR AVAILABLE BALANCE'],
+        ['a second prefix after the first on one line', `${PREFIX} again ${PREFIX} ${SUFFIX}`],
+        ['a complete line after an incomplete one', `${PREFIX} nope\n${PREFIX} ${SUFFIX}`],
+        ['suffix before the prefix', `${SUFFIX} ${PREFIX}`],
+        ['prefix and suffix on separate lines (LF)', `${PREFIX}\n${SUFFIX}`],
+        ['prefix and suffix on separate lines (CR)', `${PREFIX}\r${SUFFIX}`],
+        ['prefix and suffix on separate lines (CRLF)', `${PREFIX}\r\n${SUFFIX}`],
+        ['prefix and suffix on separate lines (U+2028)', `${PREFIX}\u2028${SUFFIX}`],
+        ['prefix and suffix on separate lines (U+2029)', `${PREFIX}\u2029${SUFFIX}`],
+        ['prefix without its full stop', `Usage limit reached ${SUFFIX}`],
+        ['only the prefix', PREFIX],
+        ['only the suffix', SUFFIX],
+        ['near-miss wording', 'Usage limit reached. enable usage from your balance'],
+      ])('agrees with the original pattern: %s', (_label, message) => {
+        // #given / #when
+        const matched = classifyQuotaError({kind: 'session-error', message}) !== null
+
+        // #then
+        expect(matched).toBe(ORIGINAL.test(message))
+      })
+
+      it('still keeps the same-line requirement (a regression guard for the sample above)', () => {
+        // #given / #when / #then
+        expect(classifyQuotaError({kind: 'session-error', message: `${PREFIX}\n${SUFFIX}`})).toBeNull()
+        expect(classifyQuotaError({kind: 'session-error', message: `${PREFIX} ${SUFFIX}`})?.type).toBe('quota_exceeded')
+      })
+    })
+
     it('does not classify ordinary HTTP 429 without account_rate_limit as quota_exceeded', () => {
       expect(classifyQuotaError({kind: 'session-error', status: 429})).toBeNull()
     })

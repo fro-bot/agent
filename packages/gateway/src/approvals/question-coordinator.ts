@@ -31,6 +31,7 @@ import type {
   QuestionSideEffects,
 } from './question-registry.js'
 
+import {getStringProperty, ownValue} from '@fro-bot/runtime'
 import {MAX_OPTIONS_PER_QUESTION, MAX_QUESTIONS_PER_REQUEST} from './question-detail.js'
 import {emptyAnswers} from './question-registry.js'
 
@@ -104,18 +105,9 @@ export interface QuestionCoordinatorDeps {
 }
 
 // ---------------------------------------------------------------------------
-// Defensive accessors (payloads are untrusted server JSON; own properties only)
+// Payloads are untrusted server JSON: read them through own-property accessors (`ownValue`, `getStringProperty`
+// from `@fro-bot/runtime`).
 // ---------------------------------------------------------------------------
-
-function getOwn(value: unknown, property: string): unknown {
-  if (value == null || typeof value !== 'object') return undefined
-  return Object.getOwnPropertyDescriptor(value, property)?.value
-}
-
-function getString(value: unknown, property: string): string | null {
-  const raw = getOwn(value, property)
-  return typeof raw === 'string' ? raw : null
-}
 
 /**
  * An id safe to put in a log line: a short token of id characters. Anything else
@@ -131,15 +123,15 @@ export function safeLogId(value: string | null): string | null {
 // ---------------------------------------------------------------------------
 
 function parseOption(raw: unknown): QuestionOption | null {
-  const label = getString(raw, 'label')
+  const label = getStringProperty(raw, 'label')
   if (label === null) return null
-  return {label, description: getString(raw, 'description') ?? ''}
+  return {label, description: getStringProperty(raw, 'description') ?? ''}
 }
 
 function parseQuestion(raw: unknown): QuestionParseResult<QuestionInfo> {
-  const question = getString(raw, 'question')
+  const question = getStringProperty(raw, 'question')
   if (question === null) return {kind: 'malformed', reason: 'invalid-question'}
-  const rawOptions = getOwn(raw, 'options')
+  const rawOptions = ownValue(raw, 'options')
   if (!Array.isArray(rawOptions)) return {kind: 'malformed', reason: 'invalid-question'}
   if (rawOptions.length > MAX_OPTIONS_PER_QUESTION) return {kind: 'malformed', reason: 'oversize'}
   const options: QuestionOption[] = []
@@ -152,22 +144,22 @@ function parseQuestion(raw: unknown): QuestionParseResult<QuestionInfo> {
     kind: 'ok',
     value: {
       question,
-      header: getString(raw, 'header') ?? '',
+      header: getStringProperty(raw, 'header') ?? '',
       options,
       // Normalized once here: `multiple` is opt-in; a custom answer is allowed unless explicitly `false`.
-      multiple: getOwn(raw, 'multiple') === true,
-      custom: getOwn(raw, 'custom') !== false,
+      multiple: ownValue(raw, 'multiple') === true,
+      custom: ownValue(raw, 'custom') !== false,
     },
   }
 }
 
 /** Parse a `question.asked` `properties` payload. */
 export function parseQuestionRequest(payload: unknown): QuestionParseResult<QuestionAskedRequest> {
-  const requestID = getString(payload, 'id')
+  const requestID = getStringProperty(payload, 'id')
   if (requestID === null) return {kind: 'malformed', reason: 'missing-request-id'}
-  const sessionID = getString(payload, 'sessionID')
+  const sessionID = getStringProperty(payload, 'sessionID')
   if (sessionID === null) return {kind: 'malformed', reason: 'missing-session-id'}
-  const rawQuestions = getOwn(payload, 'questions')
+  const rawQuestions = ownValue(payload, 'questions')
   if (!Array.isArray(rawQuestions)) return {kind: 'malformed', reason: 'invalid-questions'}
   if (rawQuestions.length > MAX_QUESTIONS_PER_REQUEST) return {kind: 'malformed', reason: 'oversize'}
   const questions: QuestionInfo[] = []
@@ -195,14 +187,17 @@ export function parseQuestionEcho(
   eventType: 'question.replied' | 'question.rejected',
   payload: unknown,
 ): QuestionParseResult<QuestionEcho> {
-  const requestID = getString(payload, 'requestID')
+  const requestID = getStringProperty(payload, 'requestID')
   if (requestID === null) return {kind: 'malformed', reason: 'missing-request-id'}
-  const sessionID = getString(payload, 'sessionID')
+  const sessionID = getStringProperty(payload, 'sessionID')
   if (sessionID === null) return {kind: 'malformed', reason: 'missing-session-id'}
   if (eventType === 'question.rejected') {
     return {kind: 'ok', value: {kind: 'rejected', requestID, sessionID}}
   }
-  return {kind: 'ok', value: {kind: 'replied', requestID, sessionID, answers: parseAnswers(getOwn(payload, 'answers'))}}
+  return {
+    kind: 'ok',
+    value: {kind: 'replied', requestID, sessionID, answers: parseAnswers(ownValue(payload, 'answers'))},
+  }
 }
 
 // ---------------------------------------------------------------------------

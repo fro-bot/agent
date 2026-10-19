@@ -1,6 +1,12 @@
 // Operator API contract version — build-time pinned, never negotiated over the wire.
 //
 // Changelog (latest first):
+//   1.13.0 — a new `providerFailureReason` value, `provider-quota-exceeded` (additive): a provider that
+//            refused the run for exhausted quota or billing now reports it instead of `unclassified`.
+//            The enum is closed per version and may grow in later MINOR versions: consumers must treat a
+//            reason they do not recognise as absent detail, never reject the row. The gateway and the
+//            dashboard deploy as a pair (the dashboard's contract pin must be 1.13.0 and it must accept
+//            the new value).
 //   1.12.0 — three additive optional fields, plus two launch BEHAVIOR changes (a client that does not
 //            update in lockstep sees them as new status codes):
 //            (1) approval push notifications now carry `data.runId` and `route: '/operator#<runId>'`
@@ -43,4 +49,4 @@
 // Security constraint: the version is BUILD-TIME pinned and is never supplied or
 // negotiated over the wire. Any endpoint reading a version header must reject
 // unrecognized versions fail-closed.
-export const OPERATOR_CONTRACT_VERSION = '1.12.0'
+export const OPERATOR_CONTRACT_VERSION = '1.13.0'

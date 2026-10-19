@@ -34,10 +34,10 @@ const detail: QuestionRequestDetail = {
 }
 
 describe('question contract surface (since 1.9.0)', () => {
-  it('is carried by the current contract version 1.12.0', () => {
+  it('is carried by the current contract version 1.13.0', () => {
     // #given the barrel version
     // #when / #then
-    expect(OPERATOR_CONTRACT_VERSION).toBe('1.12.0')
+    expect(OPERATOR_CONTRACT_VERSION).toBe('1.13.0')
   })
 
   it('discriminates open and settle frames on `settled`', () => {

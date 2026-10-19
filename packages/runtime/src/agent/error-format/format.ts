@@ -285,11 +285,26 @@ export function classifyContextOverflowError(input: ContextOverflowErrorInput): 
 const QUOTA_FALLBACK_CODES = new Set(['insufficient_quota', 'usage_not_included'])
 
 /** Tightly bounded text patterns that indicate quota exhaustion; must not match ordinary rate-limit/fetch/auth text. */
-const QUOTA_FALLBACK_MESSAGE_PATTERNS = [
-  /usage limit reached\..*enable usage from your available balance/i,
-  /exhausted (your|the) credits/i,
-  /top up your available balance/i,
-] as const
+const QUOTA_FALLBACK_MESSAGE_PATTERNS = [/exhausted (your|the) credits/i, /top up your available balance/i] as const
+
+// The usage-limit wording is two phrases on one line. As a single `/usage limit reached\..*enable usage…/i` it is
+// quadratic on a long line of repeated prefixes with no suffix (each prefix rescans to the end of the line), and
+// this runs on whole provider messages. Matching the phrases separately within each line is linear and means the
+// same thing: `.` never crossed a line terminator, and the first prefix has the most room for the suffix.
+const USAGE_LIMIT_PREFIX_PATTERN = /usage limit reached\./i
+const USAGE_LIMIT_SUFFIX_PATTERN = /enable usage from your available balance/i
+const LINE_TERMINATOR_PATTERN = /[\n\r\u2028\u2029]/
+
+function matchesUsageLimitWording(message: string): boolean {
+  return message.split(LINE_TERMINATOR_PATTERN).some(line => {
+    const prefix = USAGE_LIMIT_PREFIX_PATTERN.exec(line)
+    return prefix !== null && USAGE_LIMIT_SUFFIX_PATTERN.test(line.slice(prefix.index + prefix[0].length))
+  })
+}
+
+function matchesQuotaMessage(message: string): boolean {
+  return matchesUsageLimitWording(message) || QUOTA_FALLBACK_MESSAGE_PATTERNS.some(pattern => pattern.test(message))
+}
 
 /**
  * Classify a normalized error signal as `quota_exceeded`, or `null` when it
@@ -315,9 +330,8 @@ export function classifyQuotaError(input: QuotaErrorInput): ErrorInfo | null {
   }
 
   const message = input.message
-  if (typeof message === 'string' && message.length > 0) {
-    const matches = QUOTA_FALLBACK_MESSAGE_PATTERNS.some(pattern => pattern.test(message))
-    if (matches) return createQuotaExceededError()
+  if (typeof message === 'string' && message.length > 0 && matchesQuotaMessage(message)) {
+    return createQuotaExceededError()
   }
 
   return null
