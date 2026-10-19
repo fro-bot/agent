@@ -48,8 +48,26 @@ vi.mock('./backfill-deny-keys.js', () => ({
 // Helpers
 // ---------------------------------------------------------------------------
 
+// Every name the object-store loader reads, plus each `_FILE` form. Cleared before every test so ambient values never
+// leak in, and restored afterwards.
+const OBJECT_STORE_ENV_NAMES = [
+  'S3_BUCKET',
+  'S3_REGION',
+  'AWS_REGION',
+  'S3_ENDPOINT',
+  'S3_PREFIX',
+  'S3_SSE',
+  'S3_ALLOW_INSECURE_ENDPOINT',
+  'S3_EXPECTED_BUCKET_OWNER',
+  'S3_SSE_KMS_KEY_ID',
+].flatMap(name => [name, `${name}_FILE`])
+
 function setRequiredEnv(): Record<string, string | undefined> {
   const saved: Record<string, string | undefined> = {}
+  for (const key of OBJECT_STORE_ENV_NAMES) {
+    saved[key] = process.env[key]
+    delete process.env[key]
+  }
   const vars: Record<string, string> = {
     GITHUB_APP_ID: 'test-app-id',
     GITHUB_APP_PRIVATE_KEY: '-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----',
@@ -300,6 +318,140 @@ describe('runDenyKeyBackfill', () => {
   // -------------------------------------------------------------------------
   // No dynamic import of @fro-bot/runtime
   // -------------------------------------------------------------------------
+
+  // -------------------------------------------------------------------------
+  // Shared object-store settings (S3_REGION, endpoint, SSE)
+  // -------------------------------------------------------------------------
+
+  function lastStoreConfig(): Record<string, unknown> {
+    const call = mockCreateS3Adapter.mock.calls[0] as [Record<string, unknown>, unknown] | undefined
+    return call?.[0] ?? {}
+  }
+
+  it('honours S3_REGION when AWS_REGION is unset', async () => {
+    // #given — only S3_REGION carries the region
+    const {ok} = await import('@fro-bot/runtime')
+    mockBackfill.mockResolvedValue(ok({total: 0, updated: 0, skipped: 0, failed: 0}))
+    delete process.env.AWS_REGION
+    process.env.S3_REGION = 'eu-west-2'
+
+    // #when
+    const {runDenyKeyBackfill} = await import('./backfill-runner.js')
+    const exitCode = await runDenyKeyBackfill({dryRun: false})
+
+    // #then
+    expect(exitCode).toBe(0)
+    expect(lastStoreConfig().region).toBe('eu-west-2')
+  })
+
+  it('prefers S3_REGION over AWS_REGION when both are set', async () => {
+    // #given — AWS_REGION=us-east-1 comes from the fixture
+    const {ok} = await import('@fro-bot/runtime')
+    mockBackfill.mockResolvedValue(ok({total: 0, updated: 0, skipped: 0, failed: 0}))
+    process.env.S3_REGION = 'eu-west-2'
+
+    // #when
+    const {runDenyKeyBackfill} = await import('./backfill-runner.js')
+    await runDenyKeyBackfill({dryRun: false})
+
+    // #then
+    expect(lastStoreConfig().region).toBe('eu-west-2')
+  })
+
+  it('still works with the AWS_REGION-only fixture and keeps the credentials on the store config', async () => {
+    // #given — the pre-existing fixture: AWS_REGION and the two credential vars
+    const {ok} = await import('@fro-bot/runtime')
+    mockBackfill.mockResolvedValue(ok({total: 0, updated: 0, skipped: 0, failed: 0}))
+
+    // #when
+    const {runDenyKeyBackfill} = await import('./backfill-runner.js')
+    const exitCode = await runDenyKeyBackfill({dryRun: false})
+
+    // #then
+    expect(exitCode).toBe(0)
+    expect(lastStoreConfig()).toMatchObject({
+      enabled: true,
+      bucket: 'test-bucket',
+      region: 'us-east-1',
+      prefix: 'fro-bot-state',
+      credentials: {accessKeyId: 'test-key-id', secretAccessKey: 'test-secret'},
+    })
+  })
+
+  it('passes S3_ENDPOINT, S3_SSE and the insecure opt-in through to the store config', async () => {
+    // #given
+    const {ok} = await import('@fro-bot/runtime')
+    mockBackfill.mockResolvedValue(ok({total: 0, updated: 0, skipped: 0, failed: 0}))
+    process.env.S3_ENDPOINT = 'http://minio:9000'
+    process.env.S3_ALLOW_INSECURE_ENDPOINT = 'true'
+    process.env.S3_SSE = 'AES256'
+    process.env.S3_PREFIX = 'custom-state'
+
+    // #when
+    const {runDenyKeyBackfill} = await import('./backfill-runner.js')
+    const exitCode = await runDenyKeyBackfill({dryRun: false})
+
+    // #then
+    expect(exitCode).toBe(0)
+    expect(lastStoreConfig()).toMatchObject({
+      endpoint: 'http://minio:9000',
+      allowInsecureEndpoint: true,
+      sseEncryption: 'AES256',
+      prefix: 'custom-state',
+    })
+  })
+
+  it('falls back to the default prefix when S3_PREFIX is an empty string', async () => {
+    // #given
+    const {ok} = await import('@fro-bot/runtime')
+    mockBackfill.mockResolvedValue(ok({total: 0, updated: 0, skipped: 0, failed: 0}))
+    process.env.S3_PREFIX = ''
+
+    // #when
+    const {runDenyKeyBackfill} = await import('./backfill-runner.js')
+    await runDenyKeyBackfill({dryRun: false})
+
+    // #then
+    expect(lastStoreConfig().prefix).toBe('fro-bot-state')
+  })
+
+  it('invalid endpoint → exits 1 with a logged error naming S3_ENDPOINT, before any adapter or App client', async () => {
+    // #given — http endpoint without the opt-in
+    process.env.S3_ENDPOINT = 'http://minio:9000'
+    const error = vi.fn()
+    const logger = {debug: vi.fn(), info: vi.fn(), warning: vi.fn(), error}
+
+    // #when
+    const {runDenyKeyBackfill} = await import('./backfill-runner.js')
+    const exitCode = await runDenyKeyBackfill({dryRun: false, logger})
+
+    // #then
+    expect(exitCode).toBe(1)
+    expect(error).toHaveBeenCalledTimes(1)
+    const [, context] = error.mock.calls[0] as [string, {error: string}]
+    expect(context.error).toMatch(/^S3_ENDPOINT: /)
+    expect(mockCreateS3Adapter).not.toHaveBeenCalled()
+    expect(mockCreateAppClient).not.toHaveBeenCalled()
+    expect(mockBackfill).not.toHaveBeenCalled()
+  })
+
+  it('neither S3_REGION nor AWS_REGION set → exits 1 and the logged error names every candidate', async () => {
+    // #given
+    delete process.env.AWS_REGION
+    const error = vi.fn()
+    const logger = {debug: vi.fn(), info: vi.fn(), warning: vi.fn(), error}
+
+    // #when
+    const {runDenyKeyBackfill} = await import('./backfill-runner.js')
+    const exitCode = await runDenyKeyBackfill({dryRun: false, logger})
+
+    // #then
+    expect(exitCode).toBe(1)
+    const [, context] = error.mock.calls[0] as [string, {error: string}]
+    expect(context.error).toContain('S3_REGION')
+    expect(context.error).toContain('AWS_REGION')
+    expect(mockBackfill).not.toHaveBeenCalled()
+  })
 
   it('createS3Adapter is called via static import (not dynamic) — no dynamic import branch', async () => {
     // #given — backfill succeeds

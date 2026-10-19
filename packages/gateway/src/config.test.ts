@@ -32,9 +32,20 @@ beforeEach(() => {
     'S3_BUCKET_FILE',
     'S3_REGION',
     'S3_REGION_FILE',
+    'AWS_REGION',
+    'AWS_REGION_FILE',
     'S3_ENDPOINT',
+    'S3_ENDPOINT_FILE',
     'S3_PREFIX',
+    'S3_PREFIX_FILE',
     'S3_SSE',
+    'S3_SSE_FILE',
+    'S3_ALLOW_INSECURE_ENDPOINT',
+    'S3_ALLOW_INSECURE_ENDPOINT_FILE',
+    'S3_EXPECTED_BUCKET_OWNER',
+    'S3_EXPECTED_BUCKET_OWNER_FILE',
+    'S3_SSE_KMS_KEY_ID',
+    'S3_SSE_KMS_KEY_ID_FILE',
     'GATEWAY_IDENTITY',
     'LOG_LEVEL',
     'TOKEN',
@@ -593,6 +604,295 @@ describe('loadGatewayConfig', () => {
 
     // #then
     expect(config.objectStore.endpoint).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Object-store settings (loadObjectStoreSettings via loadGatewayConfig)
+// ---------------------------------------------------------------------------
+
+function writeValueFile(name: string, contents: string): string {
+  const file = join(tmpDir, name)
+  writeFileSync(file, contents, {mode: 0o600})
+  return file
+}
+
+describe('loadGatewayConfig — object-store settings', () => {
+  describe('region (AE4)', () => {
+    it('resolves the region from AWS_REGION when S3_REGION is unset', () => {
+      // #given only AWS_REGION is set
+      setRequiredEnv()
+      delete process.env.S3_REGION
+      process.env.AWS_REGION = 'eu-west-2'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.region).toBe('eu-west-2')
+    })
+
+    it('prefers S3_REGION over AWS_REGION when both are set', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_REGION = 'us-east-1'
+      process.env.AWS_REGION = 'eu-west-2'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.region).toBe('us-east-1')
+    })
+
+    it('reads the region from S3_REGION_FILE', () => {
+      // #given
+      setRequiredEnv()
+      delete process.env.S3_REGION
+      process.env.S3_REGION_FILE = writeValueFile('s3-region', 'ap-southeast-2\n')
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.region).toBe('ap-southeast-2')
+    })
+
+    it('names every region candidate when neither S3_REGION nor AWS_REGION is set', () => {
+      // #given
+      setRequiredEnv()
+      delete process.env.S3_REGION
+
+      // #when / #then
+      let message = ''
+      try {
+        loadGatewayConfig()
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error)
+      }
+      expect(message).toContain('S3_REGION')
+      expect(message).toContain('S3_REGION_FILE')
+      expect(message).toContain('AWS_REGION')
+      expect(message).toContain('AWS_REGION_FILE')
+    })
+  })
+
+  describe('endpoint (AE5)', () => {
+    it('fails startup for an http endpoint without S3_ALLOW_INSECURE_ENDPOINT', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_ENDPOINT = 'http://minio:9000'
+
+      // #when / #then
+      expect(() => loadGatewayConfig()).toThrow(/^S3_ENDPOINT: .*https/)
+    })
+
+    it('loads an http endpoint when S3_ALLOW_INSECURE_ENDPOINT=true', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_ENDPOINT = 'http://minio:9000'
+      process.env.S3_ALLOW_INSECURE_ENDPOINT = 'true'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.endpoint).toBe('http://minio:9000')
+      expect(config.objectStore.allowInsecureEndpoint).toBe(true)
+    })
+
+    it('reads S3_ALLOW_INSECURE_ENDPOINT from its _FILE form', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_ENDPOINT = 'http://minio:9000'
+      process.env.S3_ALLOW_INSECURE_ENDPOINT_FILE = writeValueFile('s3-insecure', 'true\n')
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.allowInsecureEndpoint).toBe(true)
+    })
+
+    it('treats any value other than exactly "true" as the flag being off', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_ENDPOINT = 'http://minio:9000'
+      process.env.S3_ALLOW_INSECURE_ENDPOINT = 'TRUE'
+
+      // #when / #then
+      expect(() => loadGatewayConfig()).toThrow(/^S3_ENDPOINT: /)
+    })
+
+    it('rejects a cloud-metadata endpoint even with S3_ALLOW_INSECURE_ENDPOINT=true', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_ENDPOINT = 'http://169.254.169.254'
+      process.env.S3_ALLOW_INSECURE_ENDPOINT = 'true'
+
+      // #when / #then
+      expect(() => loadGatewayConfig()).toThrow('cloud instance metadata services')
+    })
+
+    it('defaults allowInsecureEndpoint to false', () => {
+      // #given
+      setRequiredEnv()
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.allowInsecureEndpoint).toBe(false)
+    })
+  })
+
+  describe('prefix and SSE mode', () => {
+    it('fails startup for a prefix that fails the prefix rule, naming S3_PREFIX', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_PREFIX = '../x'
+
+      // #when / #then
+      expect(() => loadGatewayConfig()).toThrow(/^S3_PREFIX: /)
+    })
+
+    it('reads a custom prefix from S3_PREFIX_FILE', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_PREFIX_FILE = writeValueFile('s3-prefix', 'custom-state\n')
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.prefix).toBe('custom-state')
+    })
+
+    it('rejects S3_SSE=aes256 (wrong casing) and names S3_SSE', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_SSE = 'aes256'
+
+      // #when / #then
+      expect(() => loadGatewayConfig()).toThrow(/^S3_SSE: /)
+    })
+
+    it('accepts S3_SSE=AES256', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_SSE = 'AES256'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.sseEncryption).toBe('AES256')
+    })
+
+    it('accepts S3_SSE=aws:kms', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_SSE = 'aws:kms'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.sseEncryption).toBe('aws:kms')
+    })
+  })
+
+  describe('expected bucket owner and KMS key', () => {
+    it('passes S3_EXPECTED_BUCKET_OWNER and S3_SSE_KMS_KEY_ID from env into objectStore', () => {
+      // #given a KMS key on AWS (derived mode is aws:kms)
+      setRequiredEnv()
+      process.env.S3_EXPECTED_BUCKET_OWNER = '123456789012'
+      process.env.S3_SSE_KMS_KEY_ID = 'alias/fro-bot'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.expectedBucketOwner).toBe('123456789012')
+      expect(config.objectStore.sseKmsKeyId).toBe('alias/fro-bot')
+    })
+
+    it('passes S3_EXPECTED_BUCKET_OWNER and S3_SSE_KMS_KEY_ID from their _FILE forms', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_EXPECTED_BUCKET_OWNER_FILE = writeValueFile('s3-owner', '123456789012\n')
+      process.env.S3_SSE_KMS_KEY_ID_FILE = writeValueFile('s3-kms', 'alias/from-file\n')
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.expectedBucketOwner).toBe('123456789012')
+      expect(config.objectStore.sseKmsKeyId).toBe('alias/from-file')
+    })
+
+    it('omits the new optional settings when unset', () => {
+      // #given
+      setRequiredEnv()
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore).not.toHaveProperty('expectedBucketOwner')
+      expect(config.objectStore).not.toHaveProperty('sseKmsKeyId')
+      expect(config.objectStore).not.toHaveProperty('sseEncryption')
+    })
+
+    it('rejects a KMS key with a custom endpoint and no S3_SSE, naming S3_SSE_KMS_KEY_ID', () => {
+      // #given a custom endpoint derives AES256, so the key would be silently dropped
+      setRequiredEnv()
+      process.env.S3_ENDPOINT = 'http://minio:9000'
+      process.env.S3_ALLOW_INSECURE_ENDPOINT = 'true'
+      process.env.S3_SSE_KMS_KEY_ID = 'alias/fro-bot'
+
+      // #when / #then
+      expect(() => loadGatewayConfig()).toThrow(/^S3_SSE_KMS_KEY_ID: /)
+    })
+  })
+
+  describe('error text', () => {
+    it('does not echo the rejected value', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_PREFIX = '../secret-looking-value'
+
+      // #when
+      let message: string | undefined
+      try {
+        loadGatewayConfig()
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error)
+      }
+
+      // #then it fails, and the message names the source but never the value
+      expect(message).toMatch(/^S3_PREFIX: /)
+      expect(message).not.toContain('secret-looking-value')
+    })
+  })
+
+  describe('CI gateway smoke env', () => {
+    it('loads with only S3_BUCKET and S3_REGION set for the object store', () => {
+      // #given the smoke job sets S3_BUCKET and S3_REGION and nothing else for the store
+      setRequiredEnv()
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore).toEqual({
+        enabled: true,
+        bucket: 'test-bucket',
+        region: 'us-east-1',
+        prefix: 'fro-bot-state',
+        allowInsecureEndpoint: false,
+      })
+    })
   })
 })
 

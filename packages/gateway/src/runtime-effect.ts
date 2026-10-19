@@ -46,11 +46,16 @@ export type {
   LockAcquisitionResult,
   LockRecord,
   ObjectStoreConfig,
+  ObjectStoreSettingsInput,
+  ObjectStoreSettingsOptions,
   RepoQuiescence,
+  Sourced,
 } from '@fro-bot/runtime'
 // Re-exported so non-run.ts callers (e.g. discord/ maintenance-run helpers) never import
 // @fro-bot/runtime directly for heartbeat lifecycle glue — this file stays the single seam.
 export {createHeartbeatController} from '@fro-bot/runtime'
+// Re-exported so config.ts maps env and `_FILE` sources onto the shared object-store parser.
+export {parseObjectStoreSettings} from '@fro-bot/runtime'
 export type {HeartbeatController, HeartbeatStopResult} from '@fro-bot/runtime'
 
 // ---------------------------------------------------------------------------

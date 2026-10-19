@@ -11,6 +11,7 @@ import process from 'node:process'
 
 import {GatewayIntentBits} from 'discord.js'
 import {Effect, Either} from 'effect'
+import {parseObjectStoreSettings} from './runtime-effect.js'
 import {parseAllowlistText} from './web/auth/allowlist.js'
 import {validateReturnPath} from './web/auth/github.js'
 import {makeTrustedProxyIngressPolicy} from './web/ingress/policy.js'
@@ -29,7 +30,6 @@ import {
 } from './web/operator-push/config-keys.js'
 import {assertValidVapidKeyMaterial} from './web/operator-push/vapid.js'
 
-const DEFAULT_S3_PREFIX = 'fro-bot-state'
 const DEFAULT_GATEWAY_IDENTITY = 'discord-gateway'
 const DEFAULT_LOG_LEVEL = 'info' as const
 const VALID_LOG_LEVELS = ['debug', 'info', 'warn', 'error'] as const
@@ -489,6 +489,41 @@ export function readOptionalSecret(name: string): string | null {
   return null
 }
 
+/**
+ * Read the object-store settings from env and `_FILE` values and parse them with the shared runtime parser.
+ *
+ * One mapping for every gateway path (server and backfill). Credentials are not part of the result; each caller adds
+ * its own. `S3_BUCKET` is read with `readSecret` so its missing-value text stays unchanged; every other setting is
+ * optional. Throws with the parser's message (source name and rule, never the value) when a setting is invalid.
+ */
+export function loadObjectStoreSettings(): ObjectStoreConfig {
+  const s3Bucket = readSecret('S3_BUCKET')
+
+  const result = parseObjectStoreSettings(
+    {
+      enabled: true,
+      bucket: {value: s3Bucket, source: 'S3_BUCKET'},
+      region: [
+        {value: readOptionalSecret('S3_REGION'), source: 'S3_REGION (or S3_REGION_FILE)'},
+        {value: readOptionalSecret('AWS_REGION'), source: 'AWS_REGION (or AWS_REGION_FILE)'},
+      ],
+      endpoint: {value: readOptionalSecret('S3_ENDPOINT'), source: 'S3_ENDPOINT'},
+      allowInsecureEndpoint: readOptionalSecret('S3_ALLOW_INSECURE_ENDPOINT') === 'true',
+      prefix: {value: readOptionalSecret('S3_PREFIX'), source: 'S3_PREFIX'},
+      sseEncryption: {value: readOptionalSecret('S3_SSE'), source: 'S3_SSE'},
+      sseKmsKeyId: {value: readOptionalSecret('S3_SSE_KMS_KEY_ID'), source: 'S3_SSE_KMS_KEY_ID'},
+      expectedBucketOwner: {value: readOptionalSecret('S3_EXPECTED_BUCKET_OWNER'), source: 'S3_EXPECTED_BUCKET_OWNER'},
+    },
+    {region: 'required'},
+  )
+
+  if (result.success === false) {
+    throw new Error(result.error.message)
+  }
+
+  return result.data
+}
+
 // Discord snowflakes are 64-bit: up to 20 digits, beyond Number.MAX_SAFE_INTEGER. Keep them as strings.
 const DISCORD_SNOWFLAKE_RE = /^\d{17,20}$/
 
@@ -527,11 +562,7 @@ export function loadGatewayConfig(): GatewayConfig {
   const discordApplicationId = readSecret('DISCORD_APPLICATION_ID')
   const discordGuildId = readOptionalSecret('DISCORD_GUILD_ID')
 
-  const s3Bucket = readSecret('S3_BUCKET')
-  const s3Region = readSecret('S3_REGION')
-  const s3Endpoint = readOptionalSecret('S3_ENDPOINT') ?? undefined
-  const s3Prefix = readOptionalSecret('S3_PREFIX') ?? DEFAULT_S3_PREFIX
-  const s3Sse = readOptionalSecret('S3_SSE') ?? undefined
+  const objectStoreSettings = loadObjectStoreSettings()
 
   const identity = readOptionalSecret('GATEWAY_IDENTITY') ?? DEFAULT_GATEWAY_IDENTITY
 
@@ -620,12 +651,7 @@ export function loadGatewayConfig(): GatewayConfig {
   }
 
   const objectStore: ObjectStoreConfig = {
-    enabled: true,
-    bucket: s3Bucket,
-    region: s3Region,
-    prefix: s3Prefix,
-    ...(s3Endpoint === undefined ? {} : {endpoint: s3Endpoint}),
-    ...(s3Sse === undefined ? {} : {sseEncryption: s3Sse as ObjectStoreConfig['sseEncryption']}),
+    ...objectStoreSettings,
     ...(credentials === undefined ? {} : {credentials}),
   }
 
