@@ -27,6 +27,7 @@ export type {
 export type {ErrorInfo, ErrorType} from './error-format/types.js'
 
 export {ERROR_TYPES} from './error-format/types.js'
+export {getEventKind, getEventPayload, getEventSessionID, getSessionID} from './event-shape.js'
 export {filterAgentEnv} from './filter-env.js'
 export {createInactivityTimer} from './inactivity-timer.js'
 export type {InactivityTimer} from './inactivity-timer.js'
@@ -43,9 +44,17 @@ export type {
   LedgerReconciler,
   ReconcileLedgerOptions,
 } from './ledger-reconcile.js'
+export {hasBlockingToolPart} from './message-facts.js'
 export {resolveOutputMode} from './output-mode.js'
 export {createOwnershipLedger} from './ownership-ledger.js'
 export type {OwnershipEntryState, OwnershipLedger, OwnershipLedgerEntry} from './ownership-ledger.js'
+export {
+  getBooleanProperty,
+  getNumberProperty,
+  getObjectProperty,
+  getStringProperty,
+  ownValue,
+} from './payload-accessors.js'
 export {
   buildCurrentThreadContextSection,
   buildHarnessRulesSection,
@@ -84,6 +93,8 @@ export type {OpenCodeServerHandle, ShutdownResult} from './server.js'
 export {createSessionTools, info, list, read, search} from './session-tools.js'
 export type {SessionToolDefinition, SessionTools} from './session-tools.js'
 export type {SetupAdapter} from './setup-adapter.js'
+export {parseSyntheticNoticePart, parseTaskNotice} from './task-notice.js'
+export type {TaskNotice} from './task-notice.js'
 export type {
   AcknowledgmentState,
   AgentContext,
