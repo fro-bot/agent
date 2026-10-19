@@ -104,7 +104,7 @@ Seven files define the same own-property accessors, 26 definitions in all. The f
 
 ## Implementation Units
 
-- [ ] **Unit 1: Runtime helper modules**
+- [x] **Unit 1: Runtime helper modules**
 
 **Goal:** Pure helpers in runtime, each pinned by a test.
 
@@ -130,7 +130,7 @@ Seven files define the same own-property accessors, 26 definitions in all. The f
 
 **Verification:** The runtime tests pass. Rung 1's `provider-failure` tests still pass.
 
-- [ ] **Unit 2: Action uses the shared helpers**
+- [x] **Unit 2: Action uses the shared helpers**
 
 **Goal:** `streaming.ts`, `session-poll.ts` and `retry.ts` import from runtime. Their copies are deleted.
 
@@ -155,7 +155,7 @@ Seven files define the same own-property accessors, 26 definitions in all. The f
 
 **Verification:** The suites pass without edits, and `dist/` is rebuilt and clean.
 
-- [ ] **Unit 3: Gateway uses the shared helpers**
+- [x] **Unit 3: Gateway uses the shared helpers**
 
 **Goal:** `run-core.ts`, `drain-completion.ts` and the two approvals coordinators import from runtime. Their copies and the mirror comments are deleted.
 
@@ -178,7 +178,7 @@ Seven files define the same own-property accessors, 26 definitions in all. The f
 
 **Verification:** The gateway suite passes without edits.
 
-- [ ] **Unit 4: Requirements doc**
+- [x] **Unit 4: Requirements doc**
 
 **Goal:** Record rung 1 as delivered, and record that rung 2 needed no drift guard.
 

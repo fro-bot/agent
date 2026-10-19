@@ -27,7 +27,7 @@ The concerns fall into two groups (full inventory: [2026-10-18-action-gateway-co
 
 | Concern | Kind | Disposition |
 | --- | --- | --- |
-| Provider-failure classification | Duplicated behavior | Ladder, rung 1 |
+| Provider-failure classification | Duplicated behavior | Ladder, rung 1 (delivered in #1869) |
 | Payload accessors, task-notice parser, small helpers | Duplicated behavior | Ladder, pure leaves |
 | Bounded abort and settle (teardown) | Duplicated behavior, stateful | Separately planned rung |
 | Lock lease renewal and takeover | Duplicated behavior, stateful | Separately planned rung, after a takeover-policy decision |
@@ -62,7 +62,7 @@ Session persistence is the largest Action-side concern. It is deferred because t
 
 **Drift guards**
 
-- R9. Until it moves, the task-notice pattern and the payload accessors are pinned by a test that fails when the copies disagree.
+- R9. A rung that leaves a concern copied across surfaces adds a test that fails when the copies disagree. A rung that removes every copy in one PR needs no guard.
 - R10. Delete each drift guard in the PR that consolidates its concern.
 
 **Config spine (S3 and object store)**
@@ -88,7 +88,7 @@ Session persistence is the largest Action-side concern. It is deferred because t
 
 - AE1. **Covers R5, R6.** Given a gateway run whose provider reports `account_rate_limit` on a `session.status` retry, after rung 1 the run fails fast with `provider-quota-exceeded` instead of waiting out OpenCode's retry budget. The PR says this is a gateway behavior change.
 - AE2. **Covers R5.** Given a terminal payload whose message text matches only an auth hint, the shared function labels the failure as auth and does not stop the run on that evidence.
-- AE3. **Covers R9, R10.** Given the task-notice pattern is still copied, editing one copy fails the drift test. The PR that moves the parser to runtime deletes that test.
+- AE3. **Covers R9, R10.** Given a concern that stays copied after a rung, editing one copy fails its drift test, and the PR that consolidates it deletes that test. The payload accessors and task-notice parser moved to runtime in one PR, so they never needed one.
 - AE4. **Covers R12, R13.** Given a gateway deployment that sets only `AWS_REGION`, the gateway resolves the region from it. Given one that sets `S3_REGION`, that value wins.
 - AE5. **Covers R14.** Given a gateway configured with an `http://` endpoint and no opt-in, startup fails with a configuration error. With `S3_ALLOW_INSECURE_ENDPOINT` set, it starts.
 
@@ -98,7 +98,7 @@ Session persistence is the largest Action-side concern. It is deferred because t
 
 - Each consolidated concern is fixed once and both surfaces get the fix.
 - Each PR on the ladder removes more lines from `src/` and `packages/gateway/src` than it adds to runtime, not counting tests.
-- The "mirrors exactly" comment in `run-core.ts` is gone, replaced by shared imports and the R9 drift test.
+- The "mirrors exactly" comment in `run-core.ts` is gone, replaced by shared imports.
 - S3 and object-store settings are defined once, and the docs match the code.
 - A planner can start rung 1 or config block 1 from this doc without inventing scope.
 
