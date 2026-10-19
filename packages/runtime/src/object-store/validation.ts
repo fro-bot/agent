@@ -1,7 +1,8 @@
+import type {ReservedAddressClass} from '../net/ip-classification.js'
 import type {Result} from '../shared/types.js'
 import * as net from 'node:net'
 import * as path from 'node:path'
-
+import {classifyReservedIpv4, classifyReservedIpv6} from '../net/ip-classification.js'
 import {err, ok} from '../shared/types.js'
 import {
   createPathTraversalError,
@@ -30,69 +31,38 @@ function stripControlChars(value: string): string {
     .join('')
 }
 
-function isPrivateIpv4(hostname: string): boolean {
-  const octets = hostname.split('.').map(segment => Number.parseInt(segment, 10))
-
-  if (octets.length !== 4 || octets.some(Number.isNaN)) {
-    return false
-  }
-
-  const first = octets[0]
-  const second = octets[1]
-
-  if (first == null || second == null) {
-    return false
-  }
-
-  if (first === 10 || first === 127 || (first === 169 && second === 254) || (first === 192 && second === 168)) {
-    return true
-  }
-
-  return first === 172 && second >= 16 && second <= 31
+/**
+ * WHATWG `URL.hostname` keeps the brackets on an IPv6 literal (`[::1]`), and `net.isIP` returns 0 for a bracketed
+ * string, so the brackets must come off before the address is recognized or classified.
+ */
+function stripIpv6Brackets(hostname: string): string {
+  return hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1) : hostname
 }
 
-function isPrivateIpv6(hostname: string): boolean {
-  const normalized = hostname.toLowerCase()
+function classifyHostname(hostname: string): ReservedAddressClass | null {
+  // A trailing dot is a valid FQDN root marker that still resolves (`%2e` decodes to it through WHATWG), so drop one
+  // before any name or address check. The IP and name comparisons below never carry it.
+  const unbracketed = stripIpv6Brackets(hostname.toLowerCase())
+  const normalized = unbracketed.endsWith('.') ? unbracketed.slice(0, -1) : unbracketed
 
-  return (
-    normalized === '::1' ||
-    normalized.startsWith('fe8') ||
-    normalized.startsWith('fe9') ||
-    normalized.startsWith('fea') ||
-    normalized.startsWith('feb')
-  )
-}
-
-function hasDisallowedAddress(hostname: string): boolean {
-  if (hostname === 'localhost') {
-    return true
+  if (normalized === 'metadata.google.internal') {
+    return 'metadata'
   }
 
-  const addressType = net.isIP(hostname)
-  if (addressType === 4) {
-    return isPrivateIpv4(hostname)
-  }
-
-  if (addressType === 6) {
-    return isPrivateIpv6(hostname)
-  }
-
-  return false
-}
-
-function hasMetadataServiceAddress(hostname: string): boolean {
-  const normalized = hostname.toLowerCase()
-
-  if (normalized === '169.254.169.254' || normalized === 'metadata.google.internal') {
-    return true
+  if (normalized === 'localhost' || normalized.endsWith('.localhost')) {
+    return 'internal'
   }
 
   const addressType = net.isIP(normalized)
-  if (addressType === 6) {
-    return normalized === 'fd00:ec2::254'
+  if (addressType === 4) {
+    return classifyReservedIpv4(normalized)
   }
 
-  return false
+  if (addressType === 6) {
+    return classifyReservedIpv6(normalized)
+  }
+
+  return null
 }
 
 export function validateEndpoint(endpoint: string, allowInsecureEndpoint: boolean): Result<URL, ValidationError> {
@@ -108,14 +78,16 @@ export function validateEndpoint(endpoint: string, allowInsecureEndpoint: boolea
     return err(createValidationError('s3 endpoint must use https unless insecure endpoints are explicitly allowed'))
   }
 
-  if (hasMetadataServiceAddress(parsedEndpoint.hostname)) {
+  const addressClass = classifyHostname(parsedEndpoint.hostname)
+
+  if (addressClass === 'metadata') {
     // Cloud instance metadata service addresses must be blocked even when insecure endpoints
     // are allowed — a leaked IAM role or SSRF via metadata service compromises the entire
     // runner environment regardless of whether the endpoint is otherwise "trusted".
     return err(createValidationError('s3 endpoint must not target cloud instance metadata services'))
   }
 
-  if (allowInsecureEndpoint === false && hasDisallowedAddress(parsedEndpoint.hostname)) {
+  if (allowInsecureEndpoint === false && addressClass === 'internal') {
     return err(createValidationError('s3 endpoint must not target loopback, link-local, or private network addresses'))
   }
 
