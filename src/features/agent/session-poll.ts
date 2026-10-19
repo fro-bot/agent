@@ -1,4 +1,4 @@
-import type {ClassificationPath, ErrorInfo, OwnershipEntryState, OwnershipLedger, SessionClient} from '@fro-bot/runtime'
+import type {ErrorInfo, OwnershipEntryState, OwnershipLedger, SessionClient} from '@fro-bot/runtime'
 import type {createOpencode} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
 /**
@@ -11,29 +11,25 @@ import type {AttemptObservation, FailureObservation} from './attempt-outcome.js'
 import type {ExecutionDeadline} from './retry.js'
 import type {ActivityTracker} from './streaming.js'
 import {
-  classifyContextOverflowError,
-  classifyModelNotFoundError,
-  classifyProviderAuthError,
-  classifyQuotaError,
-  createAgentError,
-  createErrorInfo,
-  createLLMFetchError,
   createOwnershipLedger,
-  createRetryableApiError,
   createSdkLedgerReconcileAdapter,
-  isLlmFetchError,
+  getNumberProperty,
+  getObjectProperty,
+  getStringProperty,
+  hasBlockingToolPart,
   reconcileLedgerOnce,
 } from '@fro-bot/runtime'
 import {DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {
-  classifyRetryStatusError,
+  classifyRetryStatusSignal,
+  classifyTerminalPayloadError,
   clearRootRevalidationRequirement,
   getObservedFailure,
   hasFreshIdleCandidate,
   invalidateRootFreshness,
   mergeActivityError,
-  normalizeSessionError,
+  observeClassification,
   registerPendingRootUserMessage,
   requireRootRevalidation,
   resolvePendingRootUserMessage,
@@ -215,29 +211,6 @@ export function ledgerBlocksCompletion(ledger?: OwnershipLedger): boolean {
   return ledger !== undefined && ledger.isDrainComplete() === false
 }
 
-function getStringProperty(value: unknown, property: string): string | null {
-  if (value == null || typeof value !== 'object') return null
-  const descriptor = Object.getOwnPropertyDescriptor(value, property)
-  return typeof descriptor?.value === 'string' ? descriptor.value : null
-}
-
-function getNumberProperty(value: unknown, property: string): number | null {
-  if (value == null || typeof value !== 'object') return null
-  const descriptor = Object.getOwnPropertyDescriptor(value, property)
-  return typeof descriptor?.value === 'number' ? descriptor.value : null
-}
-
-function getBooleanProperty(value: unknown, property: string): boolean | null {
-  if (value == null || typeof value !== 'object') return null
-  const descriptor = Object.getOwnPropertyDescriptor(value, property)
-  return typeof descriptor?.value === 'boolean' ? descriptor.value : null
-}
-
-function getObjectProperty(value: unknown, property: string): unknown {
-  if (value == null || typeof value !== 'object') return null
-  return Object.getOwnPropertyDescriptor(value, property)?.value ?? null
-}
-
 export async function waitForAbortableDelay(delayMs: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted === true) return Promise.resolve()
 
@@ -409,56 +382,6 @@ function createExecuteLedgerReconciler(options: {
   }
 }
 
-/**
- * Classifies an assistant message's own `error` field through the same bounded provider/generic
- * precedence the SSE `session.error` branch uses (`streaming.ts`'s `mergeActivityError` callers) --
- * an assistant carrying an error is failure evidence, never a clean completion candidate, and must
- * not be dropped into a generic timeout. Deliberately self-contained rather than reusing that
- * branch inline: the SSE branch also owns `continue`-based deadline handling scoped to its own
- * event loop, which does not translate to this poll-driven call site. A shared extraction of just
- * the classification precedence (not the loop control) is a reasonable follow-up.
- */
-function classifyAssistantMessageError(
-  messageError: unknown,
-  model: string | null,
-): {readonly error: ErrorInfo; readonly classificationPath: ClassificationPath} {
-  const errorData = getObjectProperty(messageError, 'data')
-  const status =
-    getNumberProperty(messageError, 'status') ??
-    getNumberProperty(messageError, 'statusCode') ??
-    getNumberProperty(errorData, 'status') ??
-    getNumberProperty(errorData, 'statusCode')
-  const code = getStringProperty(messageError, 'code') ?? getStringProperty(errorData, 'code')
-  const name = getStringProperty(messageError, 'name') ?? getStringProperty(errorData, 'name')
-
-  const terminalError =
-    classifyProviderAuthError({kind: 'session-error', name}) ??
-    classifyContextOverflowError({kind: 'session-error', name}) ??
-    classifyQuotaError({kind: 'session-error', status: status ?? undefined, code: code ?? undefined})
-  if (terminalError != null) return {error: terminalError, classificationPath: 'structured'}
-
-  const modelNotFoundError = classifyModelNotFoundError({
-    kind: 'session-error',
-    message: getStringProperty(messageError, 'message') ?? getStringProperty(errorData, 'message') ?? undefined,
-  })
-  if (modelNotFoundError != null) return {error: modelNotFoundError, classificationPath: 'fallback'}
-
-  const errorStr = normalizeSessionError(messageError)
-  if (isLlmFetchError(errorStr))
-    return {error: createLLMFetchError(errorStr, model ?? undefined), classificationPath: 'fallback'}
-  if (status === 429) return {error: createErrorInfo('rate_limit', errorStr, true), classificationPath: 'name'}
-
-  const isRetryable = getBooleanProperty(messageError, 'isRetryable') ?? getBooleanProperty(errorData, 'isRetryable')
-  if (isRetryable === true)
-    return {error: createRetryableApiError(errorStr, model ?? undefined), classificationPath: 'structured'}
-  if (isRetryable === false) return {error: createAgentError(errorStr), classificationPath: 'structured'}
-
-  return {
-    error: createAgentError(errorStr),
-    classificationPath: name != null || status != null || code != null ? 'name' : 'unclassified',
-  }
-}
-
 /** A qualified, not-yet-admitted completion candidate -- see `detectMessageActivity`'s doc comment. */
 interface MessageCompletionCandidate {
   readonly messageId: string
@@ -486,8 +409,9 @@ interface MessageCompletionCandidate {
  * Locates the latest new (post-baseline) assistant message and validates it against the
  * qualified-tuple predicate: new relative to the attempt baseline; answers the latest known root
  * user message with no newer unanswered one (the pending-parent barrier); `time.completed`
- * present; `finish` present and not `tool-calls`/`unknown`; no non-provider-executed tool call left
- * pending/running (a continuation the upstream prompt loop would still run another iteration for);
+ * present; `finish` present and not `tool-calls`/`unknown`; no blocking tool part (any tool part blocks,
+ * pending, running or completed, unless it is provider-executed or an orphaned interrupted tool -- see
+ * `hasBlockingToolPart`; the upstream prompt loop would run another iteration for it);
  * and no renewed root activity since the request was issued (revision check; a stale response never
  * mutates turn state, but its assistant error is still classified -- failure evidence is not
  * revision-scoped). Confirms the same
@@ -605,20 +529,20 @@ async function detectMessageActivity(
     activityTracker.firstMeaningfulEventReceived = true
     activityTracker.completedAssistantMessageId = undefined
     const model = getStringProperty(latestAssistantMessageInfo, 'modelID')
-    const classified = classifyAssistantMessageError(messageError, model)
+    const {classification} = classifyTerminalPayloadError(messageError, model)
+    const candidate = observeClassification(classification)
     logger.error('Completed assistant message carries an error — classified as failure evidence', {
       sessionId,
       messageId: latestAssistantMessageId,
-      type: classified.error.type,
+      type: candidate.error.type,
     })
-    const existing = getObservedFailure(activityTracker)?.error ?? null
     const merged = mergeActivityError(
-      existing,
-      classified.error,
+      getObservedFailure(activityTracker),
+      candidate,
       activityTracker,
-      classified.error.message,
-      classified.classificationPath,
-    )
+      candidate.error.message,
+      classification.classificationPath,
+    ).error
     const failure: FailureObservation = {
       source: 'session',
       message: merged.message,
@@ -695,31 +619,11 @@ async function detectMessageActivity(
 
   // Upstream (packages/opencode/src/session/prompt.ts) does not filter tool parts on status at
   // all: ANY tool part -- pending, running, or completed -- requires another prompt-loop
-  // iteration unless it is provider-executed (the model never needs the result back) or an
-  // orphaned interrupted tool (cleanup() marks abandoned tool_use blocks 'error' with
-  // metadata.interrupted === true after retries/aborts; those are not pending work). A
-  // *completed*, non-provider-executed tool part still blocks completion -- the model has not
-  // yet received the result and will produce another turn. `providerExecuted` is read from
-  // `part.metadata`; the orphan condition reads `part.state.status` and
-  // `part.state.metadata.interrupted` -- two different metadata locations. The orphan check is
-  // the permissive branch, so it uses the strictest reading: a missing/malformed `state` or
-  // `metadata`, or `interrupted` present but not strictly `true`, must not qualify as an orphan.
-  const parts = getObjectProperty(latestAssistantMessage, 'parts')
-  if (Array.isArray(parts)) {
-    const hasBlockingTool = parts.some((part: unknown) => {
-      if (getStringProperty(part, 'type') !== 'tool') return false
-      const providerExecuted = getBooleanProperty(getObjectProperty(part, 'metadata'), 'providerExecuted')
-      if (providerExecuted === true) return false
-      const state = getObjectProperty(part, 'state')
-      const status = getStringProperty(state, 'status')
-      const interrupted = getBooleanProperty(getObjectProperty(state, 'metadata'), 'interrupted')
-      const isOrphanedInterruptedTool = status === 'error' && interrupted === true
-      return !isOrphanedInterruptedTool
-    })
-    if (hasBlockingTool) {
-      activityTracker.completedAssistantMessageId = undefined
-      return null
-    }
+  // iteration unless it is provider-executed or an orphaned interrupted tool. The rule lives in
+  // `hasBlockingToolPart` (runtime `agent/message-facts.ts`), shared with the gateway.
+  if (hasBlockingToolPart(getObjectProperty(latestAssistantMessage, 'parts'))) {
+    activityTracker.completedAssistantMessageId = undefined
+    return null
   }
 
   // Retained after the stale rejection above: the revision can still advance within this call, when
@@ -1067,8 +971,9 @@ export async function pollForSessionCompletionObservation(
         // invalidate any prior completion evidence even when classification returns null.
         if (activityTracker?.rootFreshness != null) invalidateRootFreshness(activityTracker.rootFreshness)
         // Poll-only terminal provider signals fail fast instead of waiting out the full timeout.
-        const terminalError = classifyRetryStatusError(sessionStatus)
-        if (terminalError != null) {
+        const retryFailure = classifyRetryStatusSignal(sessionStatus)
+        if (retryFailure != null) {
+          const terminalError = observeClassification(retryFailure)
           if (deadline?.isExpired() === true && activityTracker?.terminalProviderError == null)
             return deadlineObservation(activityTracker)
           logger.error('Session status retry classified as terminal provider error via poll', {
@@ -1076,9 +981,9 @@ export async function pollForSessionCompletionObservation(
             type: sessionStatus.type,
           })
           if (activityTracker != null) {
-            mergeActivityError(null, terminalError, activityTracker)
+            mergeActivityError(null, terminalError, activityTracker, undefined, retryFailure.classificationPath)
           }
-          return providerFailureObservation(activityTracker?.terminalProviderError ?? terminalError)
+          return providerFailureObservation(activityTracker?.terminalProviderError ?? terminalError.error)
         }
         logger.debug('Session status', {sessionId, type: sessionStatus.type})
       } else {

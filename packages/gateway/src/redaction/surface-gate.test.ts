@@ -587,6 +587,37 @@ describe('projectRunStatusWithKey — providerFailureReason (1.12.0)', () => {
     expect(b.status).not.toHaveProperty('providerFailureReason')
     expect(c.status).not.toHaveProperty('providerFailureReason')
   })
+
+  it('carries provider-quota-exceeded (1.13.0) and drops its internal spelling', async () => {
+    // #given a FAILED provider failure stored with the new wire value, and one stored with the internal spelling
+    const wire = makeRunState({
+      phase: 'FAILED',
+      details: {failureKind: 'session-error', providerFailureReason: 'provider-quota-exceeded'},
+    })
+    const internal = makeRunState({
+      phase: 'FAILED',
+      details: {failureKind: 'session-error', providerFailureReason: 'provider quota exceeded'},
+    })
+
+    // #when projecting through the real gate
+    const [a, b] = await Promise.all(
+      [wire, internal].map(async state =>
+        projectRunStatusWithKey(state, {
+          nowMs: BASE_NOW_MS,
+          staleThresholdMs: STALE_THRESHOLD_MS,
+          bindingsLookup: fakeBindingsLookup(makeBinding()),
+          isRepoDenied: allowAll,
+        }),
+      ),
+    )
+
+    // #then the wire value is a key; the internal spelling is omitted and the row is kept
+    if (a?.kind !== 'projected' || b?.kind !== 'projected') {
+      throw new Error('expected projected statuses')
+    }
+    expect(a.status.providerFailureReason).toBe('provider-quota-exceeded')
+    expect(b.status).not.toHaveProperty('providerFailureReason')
+  })
 })
 
 // ---------------------------------------------------------------------------

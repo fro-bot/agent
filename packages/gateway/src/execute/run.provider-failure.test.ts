@@ -38,6 +38,7 @@ const {RunCoreError} = realRunCore
 const REASON_CASES = [
   ['provider auth unavailable', 'provider-auth-unavailable'],
   ['model not available', 'model-not-available'],
+  ['provider quota exceeded', 'provider-quota-exceeded'],
   ['model provider rejected the request', 'provider-rejected-request'],
   ['session error', 'unclassified'],
 ] as const satisfies readonly (readonly [ProviderFailureReason, string])[]

@@ -3949,3 +3949,254 @@ describe('stale session.messages() responses never mutate the pending parent (#1
     await observation.settled
   })
 })
+
+function retryClient(action: Record<string, unknown> | undefined, extra: Record<string, unknown> = {}) {
+  const status = {type: 'retry', attempt: 1, message: 'retrying', ...(action == null ? {} : {action}), ...extra}
+  return {session: {status: vi.fn().mockResolvedValue({data: {ses_123: status}})}}
+}
+
+function assistantErrorClient(error: unknown) {
+  return {
+    session: {
+      messages: vi.fn().mockResolvedValue({
+        data: [{info: {id: 'msg_new', role: 'assistant', time: {completed: 2}, finish: 'error', error}}],
+      }),
+      status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'idle'}}}),
+    },
+  }
+}
+
+describe('pollForSessionCompletionObservation — shared provider-failure stop rule', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  async function pollOnce(
+    client: {session: Record<string, unknown>},
+    activityTracker: ActivityTracker,
+  ): Promise<AttemptObservation> {
+    const observationPromise = pollForSessionCompletionObservation(
+      client as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      new AbortController().signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+    await vi.advanceTimersByTimeAsync(1_000)
+    return observationPromise
+  }
+
+  it.each(['model_not_found', 'model_not_supported'])(
+    'a %s retry status settles as a terminal model-not-found failure',
+    async reason => {
+      // #given a poll-only retry status whose structured reason says the model can never be served
+      vi.useFakeTimers()
+      const activityTracker = qualifiedPredicateBaseActivityTracker()
+      activityTracker.firstMeaningfulEventReceived = true
+
+      // #when
+      const observation = await pollOnce(retryClient({reason}), activityTracker)
+
+      // #then (the Action used to keep waiting here)
+      expect(observation.settlement.kind).toBe('failure-observed')
+      expect(observation.failures[0]?.llmError?.type).toBe('model_not_found')
+      expect(activityTracker.terminalProviderError?.type).toBe('model_not_found')
+      expect(activityTracker.classificationPath).toBe('structured')
+    },
+  )
+
+  it('an account_rate_limit retry status still stops and keeps its reset time', async () => {
+    // #given
+    vi.useFakeTimers()
+    const activityTracker = qualifiedPredicateBaseActivityTracker()
+    activityTracker.firstMeaningfulEventReceived = true
+    const next = Date.parse('2026-07-16T12:00:00Z')
+
+    // #when
+    const observation = await pollOnce(retryClient({reason: 'account_rate_limit'}, {next}), activityTracker)
+
+    // #then
+    expect(observation.settlement.kind).toBe('failure-observed')
+    expect(observation.failures[0]?.llmError?.type).toBe('quota_exceeded')
+    expect(observation.failures[0]?.llmError?.resetTime).toEqual(new Date(next))
+    expect(activityTracker.classificationPath).toBe('structured')
+  })
+
+  it('a transient retry status does not settle', async () => {
+    // #given a retry carrying only text
+    vi.useFakeTimers()
+    const activityTracker = qualifiedPredicateBaseActivityTracker()
+    activityTracker.firstMeaningfulEventReceived = true
+    const client = retryClient(undefined, {message: '429 Too Many Requests'})
+    const controller = new AbortController()
+    const observationPromise = pollForSessionCompletionObservation(
+      client as unknown as MockClient,
+      'ses_123',
+      '/workspace',
+      controller.signal,
+      mockLogger,
+      30_000,
+      activityTracker,
+    )
+
+    // #when a few poll cycles pass
+    await vi.advanceTimersByTimeAsync(2_000)
+
+    // #then nothing was classified, so the poll is still waiting
+    expect(activityTracker.terminalProviderError).toBeUndefined()
+    expect(client.session.status).toHaveBeenCalled()
+    controller.abort()
+    await vi.advanceTimersByTimeAsync(1_000)
+    await observationPromise
+  })
+
+  it('usage-limit text on an assistant error becomes a terminal quota error', async () => {
+    // #given an assistant message error with usage-limit wording and no structured marker
+    // (the poll path used to ignore message text, so this was a generic agent error)
+    vi.useFakeTimers()
+    const activityTracker = qualifiedPredicateBaseActivityTracker()
+    const client = assistantErrorClient({
+      name: 'APIError',
+      data: {message: 'Usage limit reached. Enable usage from your available balance'},
+    })
+
+    // #when
+    const observation = await pollOnce(client, activityTracker)
+
+    // #then
+    expect(observation.settlement.kind).toBe('failure-observed')
+    expect(observation.failures[0]?.llmError?.type).toBe('quota_exceeded')
+    expect(activityTracker.terminalProviderError?.type).toBe('quota_exceeded')
+  })
+
+  it('auth wording on an assistant error labels the failure without recording a terminal one', async () => {
+    // #given
+    vi.useFakeTimers()
+    const activityTracker = qualifiedPredicateBaseActivityTracker()
+    const client = assistantErrorClient({name: 'UnknownError', data: {message: 'no auth available'}})
+
+    // #when
+    const observation = await pollOnce(client, activityTracker)
+
+    // #then labelled, but only as a generic record
+    expect(observation.failures[0]?.llmError?.type).toBe('provider_auth_error')
+    expect(activityTracker.terminalProviderError).toBeUndefined()
+    expect(activityTracker.genericError?.type).toBe('provider_auth_error')
+  })
+
+  it('"model is not supported" on an assistant error labels the failure without recording a terminal one', async () => {
+    // #given
+    vi.useFakeTimers()
+    const activityTracker = qualifiedPredicateBaseActivityTracker()
+    const client = assistantErrorClient({name: 'APIError', data: {message: 'model is not supported'}})
+
+    // #when
+    const observation = await pollOnce(client, activityTracker)
+
+    // #then
+    expect(observation.failures[0]?.llmError?.type).toBe('model_not_found')
+    expect(activityTracker.terminalProviderError).toBeUndefined()
+    expect(activityTracker.genericError?.type).toBe('model_not_found')
+  })
+
+  it('a MessageAbortedError assistant error is a non-terminal generic label, but still settles immediately', async () => {
+    // #given
+    vi.useFakeTimers()
+    const activityTracker = qualifiedPredicateBaseActivityTracker()
+
+    // #when
+    const observation = await pollOnce(
+      assistantErrorClient({name: 'MessageAbortedError', data: {message: 'aborted'}}),
+      activityTracker,
+    )
+
+    // #then the loop behavior is unchanged (a poll-observed assistant error settles at once), but the shared
+    // rule's `aborted` kind is not a provider stop: no terminal record, generic label
+    expect(observation.settlement.kind).toBe('failure-observed')
+    expect(observation.failures[0]?.llmError?.type).toBe('configuration')
+    expect(activityTracker.terminalProviderError).toBeUndefined()
+    expect(activityTracker.genericError?.type).toBe('configuration')
+  })
+
+  it.each([
+    {label: 'auth wording', message: 'no auth available', type: 'provider_auth_error'},
+    {label: 'model wording', message: 'model is not supported', type: 'model_not_found'},
+  ])('a $label hint on a retryable assistant error reduces to turn_failed_retryable', async ({message, type}) => {
+    // #given a retryable provider error whose text also hints at auth or an unsupported model
+    vi.useFakeTimers()
+    const activityTracker = qualifiedPredicateBaseActivityTracker()
+    const client = assistantErrorClient({name: 'APIError', data: {message, isRetryable: true}})
+
+    // #when
+    const observation = await pollOnce(client, activityTracker)
+    const reduced = reduceAttemptOutcome(observation, null, {accepted: true})
+
+    // #then retry admission is preserved: the hint labels the failure without making it terminal
+    expect(observation.failures[0]?.llmError).toMatchObject({type, retryable: true})
+    expect(reduced.outcome).toBe('turn_failed_retryable')
+  })
+
+  it.each([
+    {label: 'auth wording', message: 'no auth available', type: 'provider_auth_error'},
+    {label: 'model wording', message: 'model is not supported', type: 'model_not_found'},
+  ])('a $label hint on an HTTP 429 assistant error reduces to turn_failed_retryable', async ({message, type}) => {
+    // #given a 429 (retryable in the generic ladder, with no isRetryable) that also hints at auth or a model
+    vi.useFakeTimers()
+    const client = assistantErrorClient({name: 'APIError', data: {statusCode: 429, message}})
+
+    // #when
+    const observation = await pollOnce(client, qualifiedPredicateBaseActivityTracker())
+    const reduced = reduceAttemptOutcome(observation, null, {accepted: true})
+
+    // #then the hint changes the label, not the retry admission
+    expect(observation.failures[0]?.llmError).toMatchObject({type, retryable: true})
+    expect(reduced.outcome).toBe('turn_failed_retryable')
+  })
+
+  it('a non-retryable hint reduces to turn_failed_terminal', async () => {
+    // #given the same wording without isRetryable
+    vi.useFakeTimers()
+    const client = assistantErrorClient({name: 'APIError', data: {message: 'no auth available'}})
+
+    // #when
+    const observation = await pollOnce(client, qualifiedPredicateBaseActivityTracker())
+    const reduced = reduceAttemptOutcome(observation, null, {accepted: true})
+
+    // #then
+    expect(reduced.outcome).toBe('turn_failed_terminal')
+  })
+
+  it('usage-limit text past 2048 characters on an assistant error still becomes a terminal quota error', async () => {
+    // #given
+    vi.useFakeTimers()
+    const activityTracker = qualifiedPredicateBaseActivityTracker()
+    const message = `${'x'.repeat(3_000)} Usage limit reached. Enable usage from your available balance`
+
+    // #when
+    await pollOnce(assistantErrorClient({name: 'APIError', data: {message}}), activityTracker)
+
+    // #then
+    expect(activityTracker.terminalProviderError?.type).toBe('quota_exceeded')
+  })
+
+  it('a ContextOverflowError assistant error stays terminal so overflow recovery still fires', async () => {
+    // #given
+    vi.useFakeTimers()
+    const activityTracker = qualifiedPredicateBaseActivityTracker()
+
+    // #when
+    const observation = await pollOnce(assistantErrorClient({name: 'ContextOverflowError'}), activityTracker)
+
+    // #then
+    expect(observation.failures[0]?.llmError?.type).toBe('context_overflow')
+    expect(activityTracker.terminalProviderError?.type).toBe('context_overflow')
+  })
+})
