@@ -72,19 +72,19 @@ export function classifyProviderAuthError(input: ProviderAuthErrorInput): ErrorI
 
 Everything else remains generic or retryable unless another explicit classifier owns it. The resulting `provider_auth_error` contains fixed text only; it retains no provider identifier, message, status, code, URL, or route hint.
 
+Both the Action and the gateway reach this classifier through `classifyProviderFailure` in `packages/runtime/src/agent/error-format/provider-failure.ts`, which also decides whether a result stops the run. Auth wording in a message (`auth_unavailable`, `no auth available`) is a `hint` there: it labels the failure but never stops the run, so message text stays out of the structured-evidence rule.
+
 ### Merge auth and quota into one sticky terminal state
 
-`mergeActivityError` in `src/features/agent/streaming.ts` generalizes the earlier quota path. A generic observation may upgrade to a terminal provider error, but the first terminal provider error freezes the state:
+`mergeActivityError` in `src/features/agent/streaming.ts` generalizes the earlier quota path. A generic observation may upgrade to a terminal provider error, but the first terminal provider error freezes the state. Terminal-ness comes from the shared classifier's stop decision (plus context overflow, which the Action settles as terminal so overflow recovery still fires), carried on each observation as `terminal`:
 
 ```ts
 const existingTerminal = activityTracker?.terminalProviderError
-if (existingTerminal != null) return existingTerminal
+if (existingTerminal != null) return {error: existingTerminal, terminal: true}
 
-const candidateIsTerminal = isTerminalProviderError(candidate)
-const existingIsTerminal = existing != null && isTerminalProviderError(existing)
 let merged = existing ?? candidate
-if (existingIsTerminal) merged = existing
-else if (candidateIsTerminal) merged = candidate
+if (existing?.terminal === true) merged = existing
+else if (candidate.terminal) merged = candidate
 ```
 
 Both `processEventStream` and `pollForSessionCompletion` feed this state. The retry path checks it before retrying or accepting a successful V2 wait result, so a poll-only auth failure and an SSE auth failure converge on the same outcome.

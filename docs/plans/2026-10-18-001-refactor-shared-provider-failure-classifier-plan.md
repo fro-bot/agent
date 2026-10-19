@@ -174,7 +174,7 @@ These go in the PR description and the release notes.
 
 ## Implementation Units
 
-- [ ] **Unit 1: Runtime classifier and stop rule**
+- [x] **Unit 1: Runtime classifier and stop rule**
 
 **Goal:** One function that returns kind, evidence, stop, and the Action's error label.
 
@@ -208,7 +208,7 @@ These go in the PR description and the release notes.
 
 **Verification:** The runtime tests encode the rule table, including the rule that a quota retry stops. The gateway's and the Action's classification policy cases are ported here. The gateway's case for "quota keeps waiting" becomes "quota stops".
 
-- [ ] **Unit 2: Operator contract 1.13.0**
+- [x] **Unit 2: Operator contract 1.13.0**
 
 **Goal:** The internal reason `provider quota exceeded` maps to the wire value `provider-quota-exceeded`, and every pin reads 1.13.0.
 
@@ -232,7 +232,7 @@ These go in the PR description and the release notes.
 
 **Verification:** The pins match across code, tests, and docs, and the contract tests pass.
 
-- [ ] **Unit 3: Gateway calls the shared function**
+- [x] **Unit 3: Gateway calls the shared function**
 
 **Goal:** The gateway's classification copy is deleted, and `run-core` acts on the shared stop decision.
 
@@ -265,7 +265,7 @@ These go in the PR description and the release notes.
 
 **Verification:** The gateway suite passes. The behavior changes match the table above.
 
-- [ ] **Unit 4: Action calls the shared function**
+- [x] **Unit 4: Action calls the shared function**
 
 **Goal:** The Action's SSE and poll copies are deleted, and both act on the shared stop decision.
 
@@ -299,7 +299,7 @@ These go in the PR description and the release notes.
 
 **Verification:** The Action suite passes and `dist/` is clean. The behavior changes match the table above.
 
-- [ ] **Unit 5: Guard and docs**
+- [x] **Unit 5: Guard and docs**
 
 **Goal:** Lock the runtime boundary, and update the docs that cite the moved code.
 
