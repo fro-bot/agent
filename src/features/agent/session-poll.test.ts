@@ -4009,6 +4009,7 @@ describe('pollForSessionCompletionObservation — shared provider-failure stop r
       expect(observation.settlement.kind).toBe('failure-observed')
       expect(observation.failures[0]?.llmError?.type).toBe('model_not_found')
       expect(activityTracker.terminalProviderError?.type).toBe('model_not_found')
+      expect(activityTracker.classificationPath).toBe('structured')
     },
   )
 
@@ -4026,6 +4027,7 @@ describe('pollForSessionCompletionObservation — shared provider-failure stop r
     expect(observation.settlement.kind).toBe('failure-observed')
     expect(observation.failures[0]?.llmError?.type).toBe('quota_exceeded')
     expect(observation.failures[0]?.llmError?.resetTime).toEqual(new Date(next))
+    expect(activityTracker.classificationPath).toBe('structured')
   })
 
   it('a transient retry status does not settle', async () => {
@@ -4103,6 +4105,69 @@ describe('pollForSessionCompletionObservation — shared provider-failure stop r
     expect(observation.failures[0]?.llmError?.type).toBe('model_not_found')
     expect(activityTracker.terminalProviderError).toBeUndefined()
     expect(activityTracker.genericError?.type).toBe('model_not_found')
+  })
+
+  it('a MessageAbortedError assistant error is a non-terminal generic label, but still settles immediately', async () => {
+    // #given
+    vi.useFakeTimers()
+    const activityTracker = qualifiedPredicateBaseActivityTracker()
+
+    // #when
+    const observation = await pollOnce(
+      assistantErrorClient({name: 'MessageAbortedError', data: {message: 'aborted'}}),
+      activityTracker,
+    )
+
+    // #then the loop behavior is unchanged (a poll-observed assistant error settles at once), but the shared
+    // rule's `aborted` kind is not a provider stop: no terminal record, generic label
+    expect(observation.settlement.kind).toBe('failure-observed')
+    expect(observation.failures[0]?.llmError?.type).toBe('configuration')
+    expect(activityTracker.terminalProviderError).toBeUndefined()
+    expect(activityTracker.genericError?.type).toBe('configuration')
+  })
+
+  it.each([
+    {label: 'auth wording', message: 'no auth available', type: 'provider_auth_error'},
+    {label: 'model wording', message: 'model is not supported', type: 'model_not_found'},
+  ])('a $label hint on a retryable assistant error reduces to turn_failed_retryable', async ({message, type}) => {
+    // #given a retryable provider error whose text also hints at auth or an unsupported model
+    vi.useFakeTimers()
+    const activityTracker = qualifiedPredicateBaseActivityTracker()
+    const client = assistantErrorClient({name: 'APIError', data: {message, isRetryable: true}})
+
+    // #when
+    const observation = await pollOnce(client, activityTracker)
+    const reduced = reduceAttemptOutcome(observation, null, {accepted: true})
+
+    // #then retry admission is preserved: the hint labels the failure without making it terminal
+    expect(observation.failures[0]?.llmError).toMatchObject({type, retryable: true})
+    expect(reduced.outcome).toBe('turn_failed_retryable')
+  })
+
+  it('a non-retryable hint reduces to turn_failed_terminal', async () => {
+    // #given the same wording without isRetryable
+    vi.useFakeTimers()
+    const client = assistantErrorClient({name: 'APIError', data: {message: 'no auth available'}})
+
+    // #when
+    const observation = await pollOnce(client, qualifiedPredicateBaseActivityTracker())
+    const reduced = reduceAttemptOutcome(observation, null, {accepted: true})
+
+    // #then
+    expect(reduced.outcome).toBe('turn_failed_terminal')
+  })
+
+  it('usage-limit text past 2048 characters on an assistant error still becomes a terminal quota error', async () => {
+    // #given
+    vi.useFakeTimers()
+    const activityTracker = qualifiedPredicateBaseActivityTracker()
+    const message = `${'x'.repeat(3_000)} Usage limit reached. Enable usage from your available balance`
+
+    // #when
+    await pollOnce(assistantErrorClient({name: 'APIError', data: {message}}), activityTracker)
+
+    // #then
+    expect(activityTracker.terminalProviderError?.type).toBe('quota_exceeded')
   })
 
   it('a ContextOverflowError assistant error stays terminal so overflow recovery still fires', async () => {

@@ -11,7 +11,11 @@ export {
   isLlmFetchError,
 } from './error-format/format.js'
 
-export {classifyProviderFailure} from './error-format/provider-failure.js'
+export {
+  classifyProviderFailure,
+  retrySignalFromStatus,
+  terminalSignalFromPayload,
+} from './error-format/provider-failure.js'
 export type {
   ProviderFailureClassification,
   ProviderFailureEvidence,

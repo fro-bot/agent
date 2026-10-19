@@ -171,6 +171,10 @@ These go in the PR description and the release notes.
 | Action | `model_not_found` / `model_not_supported` retry | waits | stops with a model-not-found error |
 | Action | poll assistant error with usage-limit text | generic error, exit 0 when a comment target exists | quota error, exit 1 |
 | Action | terminal payload with auth wording or "model is not supported" | generic agent error, exit 0 when a comment target exists | provider-auth or model-not-found label, exit 1; timing unchanged |
+| Gateway | assistant message error (`message.updated`) with 402, `insufficient_quota`, or usage-limit text | fails as `provider-rejected-request` (`APIError`) or `unclassified` | fails with `provider-quota-exceeded` |
+| Action | model retry on a descendant session | ignored | marks that ledger entry unknown; the root failure is unaffected |
+| Action | poll-observed assistant error with auth wording or "model is not supported" | settles at once with a generic agent error | still settles at once, now with the provider-auth or model-not-found label; recorded as a generic failure, not a terminal one |
+| Both | error payload whose top-level and `data` fields disagree | each surface read its own field first | both read `data.*` first (`name` top level first), skipping wrong-typed values, via `terminalSignalFromPayload` |
 
 ## Implementation Units
 

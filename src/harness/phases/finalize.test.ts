@@ -8,12 +8,7 @@ import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {CacheRestorePhaseResult} from './cache-restore.js'
 import type {ExecutePhaseResult} from './execute.js'
 import type {RoutingPhaseResult} from './routing.js'
-import {
-  classifyModelNotFoundError,
-  classifyProviderFailure,
-  createAgentError,
-  createProviderAuthError,
-} from '@fro-bot/runtime'
+import {classifyProviderFailure, createProviderAuthError} from '@fro-bot/runtime'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {formatErrorComment} from '../../features/comments/index.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
@@ -1361,11 +1356,11 @@ describe('runFinalize non-file-convention delivery', () => {
     const routing = createRouting({
       agentContext: {...createRouting().agentContext, issueNumber: 0},
     })
-    const llmError = classifyModelNotFoundError({
-      kind: 'session-error',
+    const llmError = classifyProviderFailure({
+      source: 'terminal-payload',
       message: 'Model not found: anthropic/claude-sonnet-5-5. Did you mean: claude-sonnet-4-5?',
-    })
-    if (llmError == null) throw new Error('fixture must classify as model_not_found')
+    }).errorInfo
+    expect(llmError.type).toBe('model_not_found')
     const execution = createExecution({success: false, exitCode: 0, llmError})
     const logger = createMockLogger()
 
@@ -1693,43 +1688,30 @@ describe('runFinalize quota_exceeded llmError handling', () => {
     expect(text).not.toContain('secret-token-xyz')
   }
 
-  it('a usage-limit message that used to label as a generic agent error now exits 1 instead of 0', async () => {
-    // #given the same poll assistant error with usage-limit wording and a comment target. Before the shared
-    // classifier the poll path labelled it a generic agent error (exit 0 with a comment); it is now quota.
+  it('exits 1 for a quota label produced by the shared classifier, even with a comment target', async () => {
+    // #given an assistant error with usage-limit wording classified by the shared rule, and a comment target
     const bootstrap = createBootstrap({delivery: 'none', responseFilePath: null})
     const routing = createRouting()
-    const metrics = createMetrics()
-    const message = 'Usage limit reached. Enable usage from your available balance'
-    const before = createAgentError('name=APIError')
-    const after = classifyProviderFailure({source: 'terminal-payload', name: 'APIError', message}).errorInfo
+    const llmError = classifyProviderFailure({
+      source: 'terminal-payload',
+      name: 'APIError',
+      message: 'Usage limit reached. Enable usage from your available balance',
+    }).errorInfo
+    expect(llmError.type).toBe('quota_exceeded')
 
-    // #when finalize runs with each label
-    const exitBefore = await runFinalize(
+    // #when finalize runs
+    const exitCode = await runFinalize(
       bootstrap,
       routing,
       cacheRestore,
-      createExecution({success: false, exitCode: 0, llmError: before}),
-      metrics,
-      Date.now(),
-      createMockLogger(),
-    )
-    vi.clearAllMocks()
-    mocks.postComment.mockResolvedValue({commentId: 1, created: true, updated: false, url: 'https://example.com/1'})
-    const exitAfter = await runFinalize(
-      bootstrap,
-      routing,
-      cacheRestore,
-      createExecution({success: false, exitCode: 0, llmError: after}),
-      metrics,
+      createExecution({success: false, exitCode: 0, llmError}),
+      createMetrics(),
       Date.now(),
       createMockLogger(),
     )
 
-    // #then the label change flips the exit code, and the quota path fails the job
-    expect(before.type).toBe('configuration')
-    expect(after.type).toBe('quota_exceeded')
-    expect(exitBefore).toBe(0)
-    expect(exitAfter).toBe(1)
+    // #then the quota path fails the job (a generic recoverable error with a target exits 0)
+    expect(exitCode).toBe(1)
     expect(mocks.setFailed).toHaveBeenCalledTimes(1)
   })
 

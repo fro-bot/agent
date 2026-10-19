@@ -21,10 +21,10 @@ import {
   hasFreshIdleCandidate,
   invalidateRootFreshness,
   mergeActivityError,
+  observeClassification,
   registerPendingRootUserMessage,
   requireRootRevalidation,
   resolvePendingRootUserMessage,
-  toObservedRetryError,
 } from './streaming.js'
 
 const POLL_INTERVAL_MS = 500
@@ -543,21 +543,19 @@ async function detectMessageActivity(
     activityTracker.firstMeaningfulEventReceived = true
     activityTracker.completedAssistantMessageId = undefined
     const model = getStringProperty(latestAssistantMessageInfo, 'modelID')
-    const classified = classifyTerminalPayloadError(messageError, model)
+    const {classification} = classifyTerminalPayloadError(messageError, model)
+    const candidate = observeClassification(classification)
     logger.error('Completed assistant message carries an error — classified as failure evidence', {
       sessionId,
       messageId: latestAssistantMessageId,
-      type: classified.error.type,
+      type: candidate.error.type,
     })
-    const observed = getObservedFailure(activityTracker)
-    const existing =
-      observed == null ? null : {error: observed.error, terminal: activityTracker.terminalProviderError != null}
     const merged = mergeActivityError(
-      existing,
-      classified,
+      getObservedFailure(activityTracker),
+      candidate,
       activityTracker,
-      classified.error.message,
-      classified.classificationPath,
+      candidate.error.message,
+      classification.classificationPath,
     ).error
     const failure: FailureObservation = {
       source: 'session',
@@ -1009,7 +1007,7 @@ export async function pollForSessionCompletionObservation(
         // Poll-only terminal provider signals fail fast instead of waiting out the full timeout.
         const retryFailure = classifyRetryStatusSignal(sessionStatus)
         if (retryFailure != null) {
-          const terminalError = toObservedRetryError(retryFailure)
+          const terminalError = observeClassification(retryFailure)
           if (deadline?.isExpired() === true && activityTracker?.terminalProviderError == null)
             return deadlineObservation(activityTracker)
           logger.error('Session status retry classified as terminal provider error via poll', {
@@ -1017,7 +1015,7 @@ export async function pollForSessionCompletionObservation(
             type: sessionStatus.type,
           })
           if (activityTracker != null) {
-            mergeActivityError(null, terminalError, activityTracker)
+            mergeActivityError(null, terminalError, activityTracker, undefined, retryFailure.classificationPath)
           }
           return providerFailureObservation(activityTracker?.terminalProviderError ?? terminalError.error)
         }

@@ -1600,6 +1600,100 @@ describe('processEventStream — shared provider-failure stop rule', () => {
     expect(activityTracker.terminalProviderError?.type).toBe('context_overflow')
   })
 
+  it('a MessageAbortedError session.error is recorded as a non-terminal generic label', async () => {
+    // #given an abort marker: the shared rule reports `aborted` and leaves the response to the surface
+    const activityTracker = newTracker()
+
+    // #when
+    const result = await processEventStream(
+      createMockEventStream([terminalPayloadEvent({name: 'MessageAbortedError', data: {message: 'aborted'}})]),
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then the Action keeps its generic handling: no terminal settlement, a generic agent error
+    expect(result.llmError?.type).toBe('configuration')
+    expect(activityTracker.terminalProviderError).toBeUndefined()
+    expect(activityTracker.genericError?.type).toBe('configuration')
+    expect(activityTracker.classificationPath).toBe('name')
+  })
+
+  it('a descendant model retry marks the ledger entry unknown and never touches the root failure', async () => {
+    // #given an adopted child whose retry status says its model can never be served
+    const ledger = createOwnershipLedger()
+    ledger.adopt(CHILD_SESSION_ID, 'do the thing')
+    const activityTracker = newTracker()
+    const event = {
+      type: 'session.status',
+      properties: {
+        sessionID: CHILD_SESSION_ID,
+        status: {type: 'retry', action: {reason: 'model_not_found'}, message: 'retrying'},
+      },
+    } as unknown as Event
+
+    // #when
+    const result = await processEventStream(
+      createMockEventStream([event]),
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+      undefined,
+      undefined,
+      ledger,
+    )
+
+    // #then the descendant is real information (unknown), not the root's failure
+    expect(ledger.snapshot()).toContainEqual({sessionId: CHILD_SESSION_ID, label: 'do the thing', state: 'unknown'})
+    expect(result.llmError).toBeNull()
+    expect(activityTracker.terminalProviderError).toBeUndefined()
+  })
+
+  it.each([
+    {label: 'auth wording', message: 'no auth available', type: 'provider_auth_error'},
+    {label: 'model wording', message: 'model is not supported', type: 'model_not_found'},
+  ])(
+    'a $label hint on a retryable payload stays retryable so retry admission is preserved',
+    async ({message, type}) => {
+      // #given a retryable provider error whose text also hints at auth or an unsupported model
+      const activityTracker = newTracker()
+
+      // #when
+      const result = await processEventStream(
+        createMockEventStream([terminalPayloadEvent({name: 'APIError', data: {message, isRetryable: true}})]),
+        ROOT_SESSION_ID,
+        new AbortController().signal,
+        createMockLogger(),
+        activityTracker,
+      )
+
+      // #then labelled by the hint, still retryable, still not terminal
+      expect(result.llmError).toMatchObject({type, retryable: true})
+      expect(activityTracker.terminalProviderError).toBeUndefined()
+    },
+  )
+
+  it('usage-limit text past 2048 characters still stops the run as quota', async () => {
+    // #given a provider error that echoes a long body before its usage-limit phrase
+    const activityTracker = newTracker()
+    const message = `${'x'.repeat(3_000)} Usage limit reached. Enable usage from your available balance`
+
+    // #when
+    const result = await processEventStream(
+      createMockEventStream([terminalPayloadEvent({name: 'APIError', data: {message}})]),
+      ROOT_SESSION_ID,
+      new AbortController().signal,
+      createMockLogger(),
+      activityTracker,
+    )
+
+    // #then
+    expect(result.llmError?.type).toBe('quota_exceeded')
+    expect(activityTracker.terminalProviderError?.type).toBe('quota_exceeded')
+  })
+
   it('usage-limit text on a session.error stops the run as quota', async () => {
     // #given
     const activityTracker = newTracker()

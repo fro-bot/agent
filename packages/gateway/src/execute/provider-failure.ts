@@ -2,9 +2,10 @@
  * Provider-failure labelling for the gateway event loop (#1836).
  *
  * The classification itself, and the decision to stop on a retry status, live in the shared
- * `classifyProviderFailure` (`@fro-bot/runtime`), which the Action uses too. This module does the two things that
- * are gateway-only: it extracts a normalized signal from an OpenCode payload and maps the shared `kind` onto the
- * closed operator-safe `ProviderFailureReason`, and it keeps the error-name allowlist for logs.
+ * `classifyProviderFailure` (`@fro-bot/runtime`), which the Action uses too, and so is the extraction of a typed
+ * signal from an OpenCode payload (`terminalSignalFromPayload`). This module does the two things that are
+ * gateway-only: it maps the shared `kind` onto the closed operator-safe `ProviderFailureReason`, and it keeps the
+ * error-name allowlist for logs.
  *
  * Security: classification reads upstream fields but NEVER returns them. Every result carries a closed,
  * fixed `reason` plus a sanitized error name; provider messages and response bodies stay in this module.
@@ -24,9 +25,9 @@
  * waits for the terminal error instead of risking a false failure on a recoverable outage.
  */
 
-import type {ProviderFailureClassification, ProviderFailureSignal} from '@fro-bot/runtime'
+import type {ProviderFailureClassification} from '@fro-bot/runtime'
 
-import {classifyProviderFailure} from '@fro-bot/runtime'
+import {classifyProviderFailure, retrySignalFromStatus, terminalSignalFromPayload} from '@fro-bot/runtime'
 
 /** Closed set of operator-safe failure reasons. Nothing provider-controlled can become one. */
 export type ProviderFailureReason =
@@ -65,17 +66,7 @@ export interface ProviderFailure {
   readonly errorName: ProviderFailureErrorName
 }
 
-function getOwnProperty(value: unknown, property: string): unknown {
-  if (value == null || typeof value !== 'object') return undefined
-  return Object.getOwnPropertyDescriptor(value, property)?.value
-}
-
-function getStringProperty(value: unknown, property: string): string | null {
-  const found = getOwnProperty(value, property)
-  return typeof found === 'string' ? found : null
-}
-
-function knownErrorName(name: string | null): ProviderFailureErrorName {
+function knownErrorName(name: string | undefined): ProviderFailureErrorName {
   return KNOWN_ERROR_NAMES.find(known => known === name) ?? 'unknown'
 }
 
@@ -86,7 +77,10 @@ function knownErrorName(name: string | null): ProviderFailureErrorName {
  * `unclassified` keeps one gateway-side refinement: an `APIError` with no other evidence is still "the provider
  * rejected the request", which is more useful to an operator than `session error`.
  */
-function toReason(classification: ProviderFailureClassification, payloadName: string | null): ProviderFailureReason {
+function toReason(
+  classification: ProviderFailureClassification,
+  payloadName: string | undefined,
+): ProviderFailureReason {
   switch (classification.kind) {
     case 'auth':
       return 'provider auth unavailable'
@@ -113,13 +107,12 @@ function toReason(classification: ProviderFailureClassification, payloadName: st
  * evidence the retry is hopeless.
  */
 export function failureFromRetryStatus(status: unknown): ProviderFailure | null {
-  if (getStringProperty(status, 'type') !== 'retry') return null
+  const signal = retrySignalFromStatus(status)
+  if (signal === null) return null
 
-  const reason = getStringProperty(getOwnProperty(status, 'action'), 'reason')
-  const signal: ProviderFailureSignal = {source: 'retry-status', ...(reason === null ? {} : {reason})}
   const classification = classifyProviderFailure(signal)
   if (classification === null || classification.stop === false) return null
-  return {reason: toReason(classification, null), errorName: 'retry-status'}
+  return {reason: toReason(classification, undefined), errorName: 'retry-status'}
 }
 
 /**
@@ -127,8 +120,8 @@ export function failureFromRetryStatus(status: unknown): ProviderFailure | null 
  * a fixed reason. Every terminal error fails the run; the label is all this decides.
  */
 export function failureFromErrorText(text: string): ProviderFailure {
-  const classification = classifyProviderFailure({source: 'terminal-payload', message: text})
-  return {reason: toReason(classification, null), errorName: 'error-text'}
+  const classification = classifyProviderFailure(terminalSignalFromPayload(text))
+  return {reason: toReason(classification, undefined), errorName: 'error-text'}
 }
 
 /**
@@ -136,21 +129,9 @@ export function failureFromErrorText(text: string): ProviderFailure {
  * `info.error` or a `session.error` payload. Total: an unrecognized error still yields a fixed reason.
  */
 export function failureFromErrorObject(error: unknown): ProviderFailure {
-  const name = getStringProperty(error, 'name')
-  const data = getOwnProperty(error, 'data')
-  const classification = classifyProviderFailure({
-    source: 'terminal-payload',
-    name,
-    status:
-      getOwnProperty(error, 'status') ??
-      getOwnProperty(error, 'statusCode') ??
-      getOwnProperty(data, 'status') ??
-      getOwnProperty(data, 'statusCode'),
-    code: getOwnProperty(error, 'code') ?? getOwnProperty(data, 'code'),
-    message: getOwnProperty(data, 'message') ?? getOwnProperty(error, 'message'),
-    isRetryable: getOwnProperty(error, 'isRetryable') ?? getOwnProperty(data, 'isRetryable'),
-  })
-  return {reason: toReason(classification, name), errorName: knownErrorName(name)}
+  const signal = terminalSignalFromPayload(error)
+  const classification = classifyProviderFailure(signal)
+  return {reason: toReason(classification, signal.name), errorName: knownErrorName(signal.name)}
 }
 
 /**
@@ -158,7 +139,7 @@ export function failureFromErrorObject(error: unknown): ProviderFailure {
  * provider rejection, so the assistant-message path must not report it as one.
  */
 export function isAbortedError(error: unknown): boolean {
-  return getStringProperty(error, 'name') === 'MessageAbortedError'
+  return terminalSignalFromPayload(error).name === 'MessageAbortedError'
 }
 
 /**
@@ -166,5 +147,5 @@ export function isAbortedError(error: unknown): boolean {
  * `session.error` for it and then compacts and continues, so it is not a terminal failure.
  */
 export function isContextOverflowError(error: unknown): boolean {
-  return getStringProperty(error, 'name') === 'ContextOverflowError'
+  return terminalSignalFromPayload(error).name === 'ContextOverflowError'
 }

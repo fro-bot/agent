@@ -1,9 +1,20 @@
 import {describe, expect, it} from 'vitest'
 
-import {classifyProviderFailure} from './provider-failure.js'
+import {classifyProviderFailure, retrySignalFromStatus, terminalSignalFromPayload} from './provider-failure.js'
 
-function retry(reason: unknown, resetAt?: Date | number) {
+function retry(reason: string | undefined, resetAt?: Date | number) {
   return {source: 'retry-status', reason, resetAt} as const
+}
+
+/** Classify a raw `session.status` payload the way both surfaces do: extract, then classify. */
+function classifyStatus(status: unknown) {
+  const signal = retrySignalFromStatus(status)
+  return signal === null ? null : classifyProviderFailure(signal)
+}
+
+/** Classify a raw OpenCode error payload the way both surfaces do: extract, then classify. */
+function classifyPayload(payload: unknown, options?: {detail?: string; model?: string}) {
+  return classifyProviderFailure(terminalSignalFromPayload(payload, options))
 }
 
 describe('classifyProviderFailure — retry status', () => {
@@ -48,33 +59,41 @@ describe('classifyProviderFailure — retry status', () => {
     'model_not_found_later',
     'ACCOUNT_RATE_LIMIT',
     '',
-    undefined,
-    null,
-    42,
   ])('returns null for a retry with reason %j so the caller keeps waiting', reason => {
     // #given / #when / #then
     expect(classifyProviderFailure(retry(reason))).toBeNull()
   })
 
+  it.each([undefined, null, 42, {reason: 'auth_unavailable'}, ['auth_unavailable']])(
+    'returns null for a retry status whose action.reason is %j',
+    reason => {
+      // #given a status whose reason is missing or not a string
+      const status = {type: 'retry', action: {reason}}
+
+      // #when / #then
+      expect(classifyStatus(status)).toBeNull()
+    },
+  )
+
   it('ignores a retry that carries only text', () => {
     // #given — retried failures whose text names auth, a model, or quota are not evidence the retry is hopeless
-    const signals = [
-      {source: 'retry-status', message: 'auth_unavailable: no auth available'},
-      {source: 'retry-status', message: 'Model not found: openai/gpt-9. Did you mean: gpt-5?'},
-      {source: 'retry-status', message: 'Usage limit reached. Enable usage from your available balance'},
-      {source: 'retry-status', message: 'Service Unavailable (503)'},
-    ] as const
+    const messages = [
+      'auth_unavailable: no auth available',
+      'Model not found: openai/gpt-9. Did you mean: gpt-5?',
+      'Usage limit reached. Enable usage from your available balance',
+      'Service Unavailable (503)',
+    ]
 
     // #when / #then
-    for (const signal of signals) expect(classifyProviderFailure(signal)).toBeNull()
+    for (const message of messages) expect(classifyStatus({type: 'retry', message})).toBeNull()
   })
 
   it('never carries provider text in the result', () => {
     // #given
-    const signal = {source: 'retry-status', reason: 'auth_unavailable', message: 'sk-live-SECRET'} as const
+    const status = {type: 'retry', action: {reason: 'auth_unavailable'}, message: 'sk-live-SECRET'}
 
     // #when
-    const result = classifyProviderFailure(signal)
+    const result = classifyStatus(status)
 
     // #then
     expect(JSON.stringify(result)).not.toContain('SECRET')
@@ -252,15 +271,26 @@ describe('classifyProviderFailure — terminal payload, text', () => {
     }
   })
 
-  it('only inspects a bounded prefix of a long message', () => {
-    // #given — the marker sits past the 2048-character bound
+  it('matches usage-limit text past the hint cap: the stop patterns read the whole message', () => {
+    // #given — a provider error that echoes a long body before its usage-limit phrase
     const message = `${'x'.repeat(5_000)} Usage limit reached. Enable usage from your available balance`
 
     // #when
     const result = classifyProviderFailure({source: 'terminal-payload', message})
 
     // #then
-    expect(result).toMatchObject({kind: 'unclassified', evidence: 'none', stop: false})
+    expect(result).toMatchObject({kind: 'quota', evidence: 'text', stop: true})
+  })
+
+  it('matches a "Model not found:" line past the hint cap', () => {
+    // #given
+    const message = `${'x'.repeat(5_000)}\nModel not found: openai/gpt-9. Did you mean: gpt-5?`
+
+    // #when
+    const result = classifyProviderFailure({source: 'terminal-payload', message})
+
+    // #then
+    expect(result).toMatchObject({kind: 'model-not-found', evidence: 'text', stop: true})
   })
 })
 
@@ -397,7 +427,7 @@ describe('classifyProviderFailure — terminal payload, generic ladder', () => {
   it('labels isRetryable: false and non-boolean as a non-retryable agent error', () => {
     // #given / #when
     const explicitFalse = classifyProviderFailure({source: 'terminal-payload', isRetryable: false, detail: 'x'})
-    const nonBoolean = classifyProviderFailure({source: 'terminal-payload', isRetryable: 'yes', detail: 'x'})
+    const nonBoolean = classifyPayload({isRetryable: 'yes'}, {detail: 'x'})
 
     // #then
     for (const result of [explicitFalse, nonBoolean]) {
@@ -515,10 +545,10 @@ describe('classifyProviderFailure — precedence', () => {
 describe('classifyProviderFailure — ported gateway policy cases', () => {
   it('classifies the structured auth retry reason ahead of any text', () => {
     // #given — the message says rate limit, the structured marker says auth
-    const signal = {source: 'retry-status', reason: 'auth_unavailable', message: 'rate limit'} as const
+    const status = {type: 'retry', action: {reason: 'auth_unavailable'}, message: 'rate limit'}
 
     // #when / #then
-    expect(classifyProviderFailure(signal)).toMatchObject({kind: 'auth', evidence: 'structured', stop: true})
+    expect(classifyStatus(status)).toMatchObject({kind: 'auth', evidence: 'structured', stop: true})
   })
 
   it('does not treat a near-miss structured reason as auth', () => {
@@ -540,18 +570,18 @@ describe('classifyProviderFailure — ported gateway policy cases', () => {
     '',
   ])('keeps waiting on a transient retry message: %j', message => {
     // #given — the caller has only text, so no structured reason reaches the classifier
-    const signal = {source: 'retry-status', message} as const
+    const status = {type: 'retry', message}
 
     // #when / #then
-    expect(classifyProviderFailure(signal)).toBeNull()
+    expect(classifyStatus(status)).toBeNull()
   })
 
   it('stops on a retry that carries an account rate limit action (was: keeps waiting)', () => {
     // #given
-    const signal = {source: 'retry-status', reason: 'account_rate_limit', message: 'Go limit reached'} as const
+    const status = {type: 'retry', action: {reason: 'account_rate_limit'}, message: 'Go limit reached'}
 
     // #when / #then
-    expect(classifyProviderFailure(signal)).toMatchObject({kind: 'quota', evidence: 'structured', stop: true})
+    expect(classifyStatus(status)).toMatchObject({kind: 'quota', evidence: 'structured', stop: true})
   })
 
   it('classifies a model rejection carried only in message data as a model hint', () => {
@@ -590,5 +620,272 @@ describe('classifyProviderFailure — ported gateway policy cases', () => {
     // #then
     expect(result.kind).toBe(kind)
     expect(result.evidence).toBe(evidence)
+  })
+})
+
+describe('classifyProviderFailure — classificationPath', () => {
+  it.each(['auth_unavailable', 'account_rate_limit', 'model_not_found', 'model_not_supported'])(
+    'reports structured for a %s retry status',
+    reason => {
+      // #given / #when / #then
+      expect(classifyProviderFailure(retry(reason))?.classificationPath).toBe('structured')
+    },
+  )
+
+  it.each([
+    {label: 'ProviderAuthError', signal: {name: 'ProviderAuthError'}, expected: 'structured'},
+    {label: 'ContextOverflowError', signal: {name: 'ContextOverflowError'}, expected: 'structured'},
+    {label: 'status 402', signal: {status: 402}, expected: 'structured'},
+    {label: 'quota code', signal: {code: 'insufficient_quota'}, expected: 'structured'},
+    {
+      label: 'usage-limit text (recorded as structured since the Action first matched it)',
+      signal: {message: 'You have exhausted your credits'},
+      expected: 'structured',
+    },
+    {label: '"Model not found:" text', signal: {message: 'Model not found: openai/gpt-9.'}, expected: 'fallback'},
+    {label: 'auth hint', signal: {message: 'no auth available'}, expected: 'fallback'},
+    {label: 'model hint', signal: {message: 'model is not supported'}, expected: 'fallback'},
+    {label: 'fetch failure label', signal: {detail: 'fetch failed'}, expected: 'fallback'},
+    {label: '429 label', signal: {status: 429, detail: 'status=429'}, expected: 'name'},
+    {label: 'isRetryable true', signal: {isRetryable: true, detail: 'x'}, expected: 'structured'},
+    {label: 'isRetryable false', signal: {isRetryable: false, detail: 'x'}, expected: 'structured'},
+    {label: 'a name only', signal: {name: 'UnknownError', detail: 'x'}, expected: 'name'},
+    {label: 'a status only', signal: {status: 500, detail: 'x'}, expected: 'name'},
+    {label: 'a code only', signal: {code: 'weird', detail: 'x'}, expected: 'name'},
+    {label: 'nothing', signal: {detail: 'x'}, expected: 'unclassified'},
+    {label: 'MessageAbortedError (generic ladder)', signal: {name: 'MessageAbortedError'}, expected: 'name'},
+  ] as const)('reports $expected for $label', ({signal, expected}) => {
+    // #given / #when
+    const result = classifyProviderFailure({source: 'terminal-payload', ...signal})
+
+    // #then
+    expect(result.classificationPath).toBe(expected)
+  })
+})
+
+describe('classifyProviderFailure — hints keep retryability', () => {
+  it.each([
+    {label: 'auth wording', message: 'no auth available', type: 'provider_auth_error'},
+    {label: 'model wording', message: 'model is not supported', type: 'model_not_found'},
+  ])('keeps a $label hint retryable when the payload says isRetryable', ({message, type}) => {
+    // #given
+    const result = classifyProviderFailure({source: 'terminal-payload', message, isRetryable: true})
+
+    // #then — labelled, still not a stop, and retry admission is preserved
+    expect(result).toMatchObject({evidence: 'hint', stop: false})
+    expect(result.errorInfo).toMatchObject({type, retryable: true})
+  })
+
+  it.each([
+    {message: 'no auth available', isRetryable: false},
+    {message: 'no auth available', isRetryable: undefined},
+    {message: 'model is not supported', isRetryable: false},
+  ])('leaves a hint non-retryable otherwise: $message / $isRetryable', ({message, isRetryable}) => {
+    // #given / #when
+    const result = classifyProviderFailure({source: 'terminal-payload', message, isRetryable})
+
+    // #then
+    expect(result.errorInfo.retryable).toBe(false)
+  })
+
+  it('does not make a structured stop retryable', () => {
+    // #given a structured auth failure that also claims isRetryable
+    const result = classifyProviderFailure({source: 'terminal-payload', name: 'ProviderAuthError', isRetryable: true})
+
+    // #then
+    expect(result).toMatchObject({kind: 'auth', stop: true})
+    expect(result.errorInfo.retryable).toBe(false)
+  })
+})
+
+describe('terminalSignalFromPayload', () => {
+  it('reads a message that exists only at the top level', () => {
+    // #given / #when / #then
+    expect(terminalSignalFromPayload({name: 'UnknownError', message: 'top'}).message).toBe('top')
+  })
+
+  it('reads a message that exists only in data (the OpenCode wire shape)', () => {
+    // #given / #when / #then
+    expect(terminalSignalFromPayload({name: 'APIError', data: {message: 'inner'}}).message).toBe('inner')
+  })
+
+  it('prefers data.message when both are present and different', () => {
+    // #given — OpenCode declares every provider field on `data`; the top level is only a wrapper fallback
+    const signal = terminalSignalFromPayload({message: 'top', data: {message: 'inner'}})
+
+    // #then
+    expect(signal.message).toBe('inner')
+  })
+
+  it.each([42, null, {nested: true}, ['x'], ''])(
+    'falls back to the top-level message when data.message is %j',
+    dataMessage => {
+      // #given a non-string (or empty) data.message that must not shadow a valid fallback
+      const signal = terminalSignalFromPayload({message: 'top', data: {message: dataMessage}})
+
+      // #then
+      expect(signal.message).toBe('top')
+    },
+  )
+
+  it('reads the name from data when the top level has none, and prefers the top level when both exist', () => {
+    // #given / #when / #then
+    expect(terminalSignalFromPayload({data: {name: 'ProviderAuthError'}}).name).toBe('ProviderAuthError')
+    expect(terminalSignalFromPayload({name: 'APIError', data: {name: 'ProviderAuthError'}}).name).toBe('APIError')
+    expect(terminalSignalFromPayload({name: 7, data: {name: 'APIError'}}).name).toBe('APIError')
+  })
+
+  it('ignores a string status and falls through to a numeric statusCode', () => {
+    // #given
+    const signal = terminalSignalFromPayload({status: '402', data: {status: 'bad', statusCode: 402}})
+
+    // #then
+    expect(signal.status).toBe(402)
+  })
+
+  it('leaves status undefined when only strings are present', () => {
+    // #given / #when / #then
+    expect(terminalSignalFromPayload({status: '402', data: {statusCode: '402'}}).status).toBeUndefined()
+  })
+
+  it('reads status, then statusCode, from data before the top level', () => {
+    // #given / #when / #then
+    expect(terminalSignalFromPayload({status: 500, data: {statusCode: 402}}).status).toBe(402)
+    expect(terminalSignalFromPayload({status: 500, statusCode: 402}).status).toBe(500)
+    expect(terminalSignalFromPayload({statusCode: 402}).status).toBe(402)
+  })
+
+  it('reads code and isRetryable with the same data-first precedence and type narrowing', () => {
+    // #given / #when
+    const signal = terminalSignalFromPayload({code: 'top_code', isRetryable: true, data: {code: 5, isRetryable: 'no'}})
+
+    // #then — the wrong-typed data values do not hide the valid top-level ones
+    expect(signal.code).toBe('top_code')
+    expect(signal.isRetryable).toBe(true)
+    expect(terminalSignalFromPayload({data: {isRetryable: false}, isRetryable: true}).isRetryable).toBe(false)
+  })
+
+  it('treats a plain string payload as the message', () => {
+    // #given / #when
+    const signal = terminalSignalFromPayload('fetch failed: network error')
+
+    // #then
+    expect(signal.message).toBe('fetch failed: network error')
+    expect(signal.name).toBeUndefined()
+  })
+
+  it.each([null, undefined, 7, true, []])('returns an empty signal for the payload %j', payload => {
+    // #given / #when
+    const signal = terminalSignalFromPayload(payload)
+
+    // #then
+    expect(signal).toEqual({
+      source: 'terminal-payload',
+      name: undefined,
+      status: undefined,
+      code: undefined,
+      message: undefined,
+      isRetryable: undefined,
+      detail: undefined,
+      model: undefined,
+    })
+  })
+
+  it('ignores inherited properties', () => {
+    // #given a payload whose fields live on the prototype
+    const payload = Object.create({name: 'ProviderAuthError', message: 'inherited'}) as unknown
+
+    // #when
+    const signal = terminalSignalFromPayload(payload)
+
+    // #then
+    expect(signal.name).toBeUndefined()
+    expect(signal.message).toBeUndefined()
+  })
+
+  it('passes detail and model through for the generic label', () => {
+    // #given / #when
+    const signal = terminalSignalFromPayload({}, {detail: 'name=X', model: 'a/b'})
+
+    // #then
+    expect(signal).toMatchObject({detail: 'name=X', model: 'a/b'})
+  })
+
+  it.each([
+    {
+      label: 'message only at the top level',
+      payload: {name: 'UnknownError', message: 'Usage limit reached. Enable usage from your available balance'},
+      kind: 'quota',
+      stop: true,
+    },
+    {
+      label: 'message only in data',
+      payload: {name: 'UnknownError', data: {message: 'Usage limit reached. Enable usage from your available balance'}},
+      kind: 'quota',
+      stop: true,
+    },
+    {
+      label: 'both present and different (data wins)',
+      payload: {message: 'Usage limit reached. Enable usage from your available balance', data: {message: 'boom'}},
+      kind: 'unclassified',
+      stop: false,
+    },
+    {
+      label: 'a non-string data.message (top level still read)',
+      payload: {message: 'Model not found: openai/gpt-9.', data: {message: {nested: true}}},
+      kind: 'model-not-found',
+      stop: true,
+    },
+    {
+      label: 'name only in data',
+      payload: {data: {name: 'ProviderAuthError'}},
+      kind: 'auth',
+      stop: true,
+    },
+    {
+      label: 'a string status with a numeric data.statusCode',
+      payload: {status: '500', data: {statusCode: 402}},
+      kind: 'quota',
+      stop: true,
+    },
+    {
+      label: 'a string status alone',
+      payload: {status: '402'},
+      kind: 'unclassified',
+      stop: false,
+    },
+  ])('extracts $label so the rule sees one input per payload', ({payload, kind, stop}) => {
+    // #given / #when
+    const result = classifyPayload(payload)
+
+    // #then
+    expect(result.kind).toBe(kind)
+    expect(result.stop).toBe(stop)
+  })
+})
+
+describe('retrySignalFromStatus', () => {
+  it('returns null for a status that is not a retry', () => {
+    // #given / #when / #then
+    for (const status of [{type: 'busy'}, {type: 'idle'}, null, undefined, 'retry', {}]) {
+      expect(retrySignalFromStatus(status)).toBeNull()
+    }
+  })
+
+  it('reads the structured action.reason and the numeric next, never the message', () => {
+    // #given
+    const status = {type: 'retry', message: 'auth_unavailable', action: {reason: 'account_rate_limit'}, next: 5}
+
+    // #when / #then
+    expect(retrySignalFromStatus(status)).toEqual({source: 'retry-status', reason: 'account_rate_limit', resetAt: 5})
+  })
+
+  it('drops a non-numeric next and an empty reason', () => {
+    // #given / #when / #then
+    expect(retrySignalFromStatus({type: 'retry', action: {reason: ''}, next: '5'})).toEqual({
+      source: 'retry-status',
+      reason: undefined,
+      resetAt: undefined,
+    })
   })
 })

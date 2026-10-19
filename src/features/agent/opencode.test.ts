@@ -7329,6 +7329,49 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     }
   })
 
+  it.each([
+    {label: 'auth wording', message: 'no auth available', type: 'provider_auth_error'},
+    {label: 'model wording', message: 'model is not supported', type: 'model_not_found'},
+  ])('ends turn_failed_retryable for a retryable payload carrying $label as a hint', async ({message, type}) => {
+    // #given a provider error that says isRetryable and also hints at auth or an unsupported model: the hint
+    // labels it but must not take away the retry the provider offered
+    vi.useFakeTimers()
+    try {
+      const {runPromptAttempt} = await import('./retry.js')
+      const mockClient = {
+        session: {
+          status: vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}}),
+        },
+      }
+      const eventStream = createMockEventStream([
+        {
+          type: 'session.error',
+          properties: {sessionID: 'ses_123', error: {name: 'APIError', data: {message, isRetryable: true}}},
+        } as unknown as Event,
+      ])
+
+      // #when
+      const resultPromise = runPromptAttempt(
+        mockClient as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+        'ses_123',
+        '/workspace',
+        30_000,
+        mockLogger,
+        eventStream.stream,
+        undefined,
+      )
+      await vi.advanceTimersByTimeAsync(2_000)
+      const result = await resultPromise
+
+      // #then
+      expect(result.llmError).toMatchObject({type, retryable: true})
+      expect(result.outcome).toBe('turn_failed_retryable')
+      expect(result.shouldRetry).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('does not set shouldRetry when llmError is null and the poll failed', async () => {
     // #given — no session.error at all; poll fails via plain timeout with no llmError classified
     const {runPromptAttempt} = await import('./retry.js')

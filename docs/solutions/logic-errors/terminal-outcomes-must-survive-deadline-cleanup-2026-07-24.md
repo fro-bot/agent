@@ -64,7 +64,7 @@ if (code != null) fields.push(`code=${code}`)
 return fields.length > 0 ? fields.join("; ") : "Unknown session error"
 ```
 
-Object `message` text remains available only to the structured quota classifier. It is deliberately excluded from the safe summary and fetch-retry classification. String and thrown fetch errors still follow their existing retry path.
+Object `message` text feeds only the shared `classifyProviderFailure` (`packages/runtime/src/agent/error-format/provider-failure.ts`): the quota and `Model not found:` patterns, which stop the run, and the looser auth and model hint patterns, which only label it. It is deliberately excluded from the safe summary and fetch-retry classification. String and thrown fetch errors still follow their existing retry path.
 
 ### Preserve the primary failure when the response file is absent
 
