@@ -193,10 +193,29 @@ function parseIpv4Octets(address: string): readonly number[] | null {
   return octets
 }
 
+/** Group that follows `::ffff:` in the RFC 2765 IPv4-translated form (`::ffff:0:a.b.c.d`). */
+const TRANSLATED_TAG = '0:'
+
+/** Decode an IPv4 address written as a dotted quad or as two hex groups (WHATWG's serialization). */
+function decodeIpv4Tail(tail: string): readonly number[] | null {
+  if (tail.includes('.')) return parseIpv4Octets(tail)
+  const hexMatch = IPV6_MAPPED_HEX_TAIL_PATTERN.exec(tail)
+  if (hexMatch === null) return null
+  const group0 = Number.parseInt(hexMatch[1] ?? '', 16)
+  const group1 = Number.parseInt(hexMatch[2] ?? '', 16)
+  return [(group0 >> 8) & 0xff, group0 & 0xff, (group1 >> 8) & 0xff, group1 & 0xff]
+}
+
+/** Cloud instance metadata services: AWS (IMDS and ECS task metadata) and Alibaba. */
+const IPV4_METADATA_ADDRESSES = new Set(['169.254.169.254', '169.254.170.2', '100.100.100.200'])
+
 function classifyReservedIpv4Octets(octets: readonly number[]): ReservedAddressClass | null {
-  const [a, b, c, d] = octets
-  if (a === 169 && b === 254 && c === 169 && d === 254) return 'metadata'
+  const [a, b, c] = octets
+  // Metadata is checked first so link-local and CGNAT space cannot claim these addresses as merely "internal".
+  if (IPV4_METADATA_ADDRESSES.has(octets.join('.'))) return 'metadata'
   if (classifyIpv4Octets(octets) !== null) return 'internal'
+  // 0.0.0.0/8 "this network" (RFC 1122), not only the single unspecified address.
+  if (a === 0) return 'internal'
   // 100.64.0.0/10 shared address space (CGNAT, RFC 6598).
   if (a === 100 && b !== undefined && b >= 64 && b <= 127) return 'internal'
   // RFC 5737 documentation ranges: 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24.
@@ -221,8 +240,9 @@ export function classifyReservedIpv4(address: string): ReservedAddressClass | nu
  * the brackets are removed. Returns `null` for public addresses.
  *
  * Unlike `classifyIpv6`, which rejects every literal for the push path, this returns `null` for public IPv6 and for
- * IPv4-mapped public IPv4, and singles out `fd00:ec2::254` (AWS IPv6 metadata) and mapped IPv4 metadata. An
- * undecodable `::ffff:` tail fails closed as `internal`.
+ * IPv4-mapped (`::ffff:a.b.c.d`) or IPv4-translated (`::ffff:0:a.b.c.d`) public IPv4, and singles out
+ * `fd00:ec2::254` (AWS IPv6 metadata) and wrapped IPv4 metadata. An undecodable `::ffff:` tail fails closed as
+ * `internal`.
  */
 export function classifyReservedIpv6(address: string): ReservedAddressClass | null {
   const lower = address.toLowerCase()
@@ -230,17 +250,11 @@ export function classifyReservedIpv6(address: string): ReservedAddressClass | nu
   const mappedPrefix = '::ffff:'
   if (lower.startsWith(mappedPrefix)) {
     const suffix = lower.slice(mappedPrefix.length)
-    let octets: readonly number[] | null = null
-    if (suffix.includes('.')) {
-      octets = parseIpv4Octets(suffix)
-    } else {
-      const hexMatch = IPV6_MAPPED_HEX_TAIL_PATTERN.exec(suffix)
-      if (hexMatch !== null) {
-        const group0 = Number.parseInt(hexMatch[1] ?? '', 16)
-        const group1 = Number.parseInt(hexMatch[2] ?? '', 16)
-        octets = [(group0 >> 8) & 0xff, group0 & 0xff, (group1 >> 8) & 0xff, group1 & 0xff]
-      }
-    }
+    // IPv4-mapped is ::ffff:<ipv4>; the RFC 2765 IPv4-translated form is ::ffff:0:<ipv4>. The two differ in group
+    // count (the tail is two groups or a dotted quad versus 0: plus that), so they never overlap.
+    const octets =
+      decodeIpv4Tail(suffix) ??
+      (suffix.startsWith(TRANSLATED_TAG) ? decodeIpv4Tail(suffix.slice(TRANSLATED_TAG.length)) : null)
     return octets === null ? 'internal' : classifyReservedIpv4Octets(octets)
   }
 

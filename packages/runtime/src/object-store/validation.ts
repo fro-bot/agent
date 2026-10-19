@@ -40,13 +40,16 @@ function stripIpv6Brackets(hostname: string): string {
 }
 
 function classifyHostname(hostname: string): ReservedAddressClass | null {
-  const normalized = stripIpv6Brackets(hostname.toLowerCase())
+  // A trailing dot is a valid FQDN root marker that still resolves (`%2e` decodes to it through WHATWG), so drop one
+  // before any name or address check. The IP and name comparisons below never carry it.
+  const unbracketed = stripIpv6Brackets(hostname.toLowerCase())
+  const normalized = unbracketed.endsWith('.') ? unbracketed.slice(0, -1) : unbracketed
 
   if (normalized === 'metadata.google.internal') {
     return 'metadata'
   }
 
-  if (normalized === 'localhost') {
+  if (normalized === 'localhost' || normalized.endsWith('.localhost')) {
     return 'internal'
   }
 

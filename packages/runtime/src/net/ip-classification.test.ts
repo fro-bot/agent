@@ -154,6 +154,41 @@ describe('classifyReservedIpv4', () => {
     expect(classifyReservedIpv4(address)).toBeNull()
   })
 
+  // #given the AWS ECS task metadata and Alibaba metadata addresses
+  // #then both are metadata, ahead of the link-local and CGNAT checks that would otherwise claim them
+  it.each(['169.254.170.2', '100.100.100.200'])('classifies %s as metadata', address => {
+    expect(classifyReservedIpv4(address)).toBe('metadata')
+  })
+
+  // #given addresses next to the metadata addresses
+  // #then they stay in their ordinary class
+  it('keeps neighbours of the extra metadata addresses internal', () => {
+    expect(classifyReservedIpv4('169.254.170.3')).toBe('internal')
+    expect(classifyReservedIpv4('100.100.100.201')).toBe('internal')
+  })
+
+  // #given any address in 0.0.0.0/8
+  // #then it is internal, not only 0.0.0.0
+  it.each(['0.0.0.0', '0.1.2.3', '0.255.255.255'])('classifies this-network %s as internal', address => {
+    expect(classifyReservedIpv4(address)).toBe('internal')
+  })
+
+  // #given the CGNAT and 172.16.0.0/12 boundaries
+  // #then the first and last member are internal and the addresses just outside are not
+  it.each(['100.64.0.0', '100.127.255.255', '172.16.0.0', '172.31.255.255'])(
+    'classifies boundary %s as internal',
+    address => {
+      expect(classifyReservedIpv4(address)).toBe('internal')
+    },
+  )
+
+  it.each(['100.63.255.255', '100.128.0.0', '172.15.255.255', '172.32.0.0'])(
+    'does not classify boundary neighbour %s as reserved',
+    address => {
+      expect(classifyReservedIpv4(address)).toBeNull()
+    },
+  )
+
   // #given text that is not a dotted-quad
   // #then it is not classified
   it('returns null for non-IPv4 text', () => {
@@ -177,6 +212,38 @@ describe('classifyReservedIpv6', () => {
   // #given loopback, unspecified, link-local, ULA, and site-local IPv6
   // #then each is internal
   it.each(['::1', '::', 'fe80::1', 'fc00::1', 'fd12:3456::1', 'fec0::1'])('classifies %s as internal', address => {
+    expect(classifyReservedIpv6(address)).toBe('internal')
+  })
+
+  // #given the RFC 2765 IPv4-translated form ::ffff:0:a.b.c.d wrapping a metadata address, in hex and dotted spelling
+  // #then it is metadata
+  it.each(['::ffff:0:a9fe:a9fe', '::ffff:0:169.254.169.254', '::ffff:0:a9fe:aa02', '::ffff:0:6464:64c8'])(
+    'classifies translated metadata %s as metadata',
+    address => {
+      expect(classifyReservedIpv6(address)).toBe('metadata')
+    },
+  )
+
+  // #given the translated form wrapping internal and public IPv4
+  // #then it follows the wrapped address
+  it('classifies translated internal and public addresses by the wrapped IPv4', () => {
+    expect(classifyReservedIpv6('::ffff:0:7f00:1')).toBe('internal')
+    expect(classifyReservedIpv6('::ffff:0:10.0.0.1')).toBe('internal')
+    expect(classifyReservedIpv6('::ffff:0:808:808')).toBeNull()
+  })
+
+  // #given the extra metadata addresses in IPv4-mapped form
+  // #then they are metadata
+  it.each(['::ffff:169.254.170.2', '::ffff:a9fe:aa02', '::ffff:100.100.100.200', '::ffff:6464:64c8'])(
+    'classifies mapped metadata %s as metadata',
+    address => {
+      expect(classifyReservedIpv6(address)).toBe('metadata')
+    },
+  )
+
+  // #given a translated prefix with an undecodable tail
+  // #then it fails closed
+  it.each(['::ffff:0:zz', '::ffff:0:1:2:3'])('fails closed on undecodable translated tail %s', address => {
     expect(classifyReservedIpv6(address)).toBe('internal')
   })
 
