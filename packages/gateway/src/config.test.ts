@@ -199,6 +199,33 @@ describe('readSecret', () => {
     // #then falls through to env var
     expect(result).toBe('fallback-env-value')
   })
+
+  it.each([
+    ['an empty', ''],
+    ['a whitespace-only', '  \n  \n'],
+  ])('falls through to the env var when TOKEN_FILE points to %s file', (_label, contents) => {
+    // #given an empty bind-mounted file and a real value in the env var
+    const secretFile = join(tmpDir, 'token-empty-file.txt')
+    writeFileSync(secretFile, contents)
+    process.env.TOKEN_FILE = secretFile
+    process.env.TOKEN = 'from-env'
+
+    // #when
+    const result = readSecret('TOKEN')
+
+    // #then the empty file counts as unset, so the env var is used and the secret is not reported missing
+    expect(result).toBe('from-env')
+  })
+
+  it('reports the secret as missing when TOKEN_FILE is empty and TOKEN is unset', () => {
+    // #given an empty file and no env var
+    const secretFile = join(tmpDir, 'token-empty-only.txt')
+    writeFileSync(secretFile, '')
+    process.env.TOKEN_FILE = secretFile
+
+    // #when / #then
+    expect(() => readSecret('TOKEN')).toThrow('Missing required secret: TOKEN')
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -229,7 +256,7 @@ describe('readOptionalSecret', () => {
     expect(result).toBe('optional-value')
   })
 
-  it('returns null when MISSING_FILE points to an empty file', () => {
+  it('returns null when MISSING_FILE points to an empty file and the env var is unset', () => {
     // #given an empty file — e.g. `touch deploy/secrets/discord-guild-id` for global registration
     const secretFile = join(tmpDir, 'empty.txt')
     writeFileSync(secretFile, '')
@@ -242,7 +269,7 @@ describe('readOptionalSecret', () => {
     expect(result).toBeNull()
   })
 
-  it('returns null when MISSING_FILE points to a whitespace-only file', () => {
+  it('returns null when MISSING_FILE points to a whitespace-only file and the env var is unset', () => {
     // #given a file containing only whitespace/newlines
     const secretFile = join(tmpDir, 'whitespace.txt')
     writeFileSync(secretFile, '  \n  \n')
@@ -253,6 +280,34 @@ describe('readOptionalSecret', () => {
 
     // #then whitespace-only is treated as "not set"
     expect(result).toBeNull()
+  })
+
+  it.each([
+    ['an empty', ''],
+    ['a whitespace-only', '  \n  \n'],
+  ])('falls through to the env var when MISSING_FILE points to %s file', (_label, contents) => {
+    // #given an empty bind-mounted file and a real value in the env var
+    const secretFile = join(tmpDir, 'empty-with-env.txt')
+    writeFileSync(secretFile, contents)
+    process.env.MISSING_FILE = secretFile
+    process.env.MISSING = 'from-env'
+
+    // #when
+    const result = readOptionalSecret('MISSING')
+
+    // #then the empty file counts as unset, so the env var is not shadowed
+    expect(result).toBe('from-env')
+  })
+
+  it('prefers a non-empty file over the env var', () => {
+    // #given a file with a value and a different env value
+    const secretFile = join(tmpDir, 'optional-both.txt')
+    writeFileSync(secretFile, 'from-file\n')
+    process.env.MISSING_FILE = secretFile
+    process.env.MISSING = 'from-env'
+
+    // #when / #then
+    expect(readOptionalSecret('MISSING')).toBe('from-file')
   })
 
   it('returns null when env var is set to an empty string', () => {
@@ -658,26 +713,95 @@ describe('loadGatewayConfig — object-store settings', () => {
       expect(config.objectStore.region).toBe('ap-southeast-2')
     })
 
-    it('names every region candidate when neither S3_REGION nor AWS_REGION is set', () => {
+    it('reads the AWS_REGION fallback from AWS_REGION_FILE', () => {
+      // #given S3_REGION is unset and the fallback arrives through a file
+      setRequiredEnv()
+      delete process.env.S3_REGION
+      process.env.AWS_REGION_FILE = writeValueFile('aws-region', 'sa-east-1\n')
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.region).toBe('sa-east-1')
+    })
+
+    it('names both region candidates when neither S3_REGION nor AWS_REGION is set', () => {
       // #given
       setRequiredEnv()
       delete process.env.S3_REGION
 
       // #when / #then
-      let message = ''
-      try {
-        loadGatewayConfig()
-      } catch (error) {
-        message = error instanceof Error ? error.message : String(error)
-      }
-      expect(message).toContain('S3_REGION')
-      expect(message).toContain('S3_REGION_FILE')
-      expect(message).toContain('AWS_REGION')
-      expect(message).toContain('AWS_REGION_FILE')
+      expect(() => loadGatewayConfig()).toThrow(new Error('S3_REGION or AWS_REGION is required'))
+    })
+
+    it('uses S3_REGION from env when S3_REGION_FILE is empty, not the AWS_REGION fallback', () => {
+      // #given an empty bind-mounted S3_REGION_FILE, a real S3_REGION and a different AWS_REGION
+      setRequiredEnv()
+      process.env.S3_REGION_FILE = writeValueFile('s3-region-empty', '')
+      process.env.S3_REGION = 'us-east-1'
+      process.env.AWS_REGION = 'eu-west-2'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then the empty file does not shadow S3_REGION
+      expect(config.objectStore.region).toBe('us-east-1')
+    })
+
+    it('trims a padded S3_REGION', () => {
+      // #given a region with surrounding whitespace
+      setRequiredEnv()
+      process.env.S3_REGION = '  us-east-1  '
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.region).toBe('us-east-1')
+    })
+  })
+
+  describe('trimming', () => {
+    it('trims a padded S3_BUCKET', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_BUCKET = ' test-bucket '
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.bucket).toBe('test-bucket')
+    })
+
+    it('trims a padded S3_ENDPOINT before validating it', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_ENDPOINT = '  https://my-minio.example.com  '
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.endpoint).toBe('https://my-minio.example.com')
     })
   })
 
   describe('endpoint (AE5)', () => {
+    it('keeps S3_ENDPOINT from env when S3_ENDPOINT_FILE is empty', () => {
+      // #given an empty bind-mounted S3_ENDPOINT_FILE (the compose default) and an endpoint in env
+      setRequiredEnv()
+      process.env.S3_ENDPOINT_FILE = writeValueFile('s3-endpoint-empty', '')
+      process.env.S3_ENDPOINT = 'https://my-minio.example.com'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then the empty file does not drop the endpoint
+      expect(config.objectStore.endpoint).toBe('https://my-minio.example.com')
+    })
+
     it('fails startup for an http endpoint without S3_ALLOW_INSECURE_ENDPOINT', () => {
       // #given
       setRequiredEnv()
@@ -816,6 +940,27 @@ describe('loadGatewayConfig — object-store settings', () => {
       expect(config.objectStore.expectedBucketOwner).toBe('123456789012')
       expect(config.objectStore.sseKmsKeyId).toBe('alias/fro-bot')
     })
+
+    it.each(['12345', 'abcdefghijkl', '1234567890123'])(
+      'rejects a malformed S3_EXPECTED_BUCKET_OWNER (%s), naming the variable and not the value',
+      owner => {
+        // #given
+        setRequiredEnv()
+        process.env.S3_EXPECTED_BUCKET_OWNER = owner
+
+        // #when
+        let message = ''
+        try {
+          loadGatewayConfig()
+        } catch (error) {
+          message = error instanceof Error ? error.message : String(error)
+        }
+
+        // #then
+        expect(message).toMatch(/^S3_EXPECTED_BUCKET_OWNER: /)
+        expect(message).not.toContain(owner)
+      },
+    )
 
     it('passes S3_EXPECTED_BUCKET_OWNER and S3_SSE_KMS_KEY_ID from their _FILE forms', () => {
       // #given
@@ -2893,9 +3038,11 @@ describe('loadGatewayConfig — CSRF secret and operator allowlist', () => {
   })
 
   it('error path: GATEWAY_OPERATOR_ALLOWLIST file is empty → throws (fail closed)', () => {
-    // #given — allowlist file exists but is empty
+    // #given — allowlist file exists but is empty, and the env var is unset (an empty file counts as unset, so a
+    // value in env would be used instead)
     setRequiredEnv()
     setOperatorWebEnv()
+    delete process.env.GATEWAY_OPERATOR_ALLOWLIST
     process.env.GATEWAY_OPERATOR_CSRF_SECRET = 'dGVzdC1jc3JmLXNlY3JldC0zMi1ieXRlcy1sb25nISE'
     const allowlistFile = join(tmpDir, 'allowlist-empty.txt')
     writeFileSync(allowlistFile, '', {mode: 0o600})

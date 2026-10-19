@@ -13,6 +13,10 @@
 
 import type {ObjectStoreAdapter} from '@fro-bot/runtime'
 
+import {mkdtempSync, rmSync, writeFileSync} from 'node:fs'
+import {tmpdir} from 'node:os'
+import {join} from 'node:path'
+
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 // ---------------------------------------------------------------------------
@@ -48,9 +52,9 @@ vi.mock('./backfill-deny-keys.js', () => ({
 // Helpers
 // ---------------------------------------------------------------------------
 
-// Every name the object-store loader reads, plus each `_FILE` form. Cleared before every test so ambient values never
-// leak in, and restored afterwards.
-const OBJECT_STORE_ENV_NAMES = [
+// Every name the runner reads (the object-store loader's names and the required credentials), plus each `_FILE` form.
+// Cleared before every test so ambient values never leak in, and restored afterwards.
+const SCRUBBED_ENV_NAMES = [
   'S3_BUCKET',
   'S3_REGION',
   'AWS_REGION',
@@ -60,11 +64,16 @@ const OBJECT_STORE_ENV_NAMES = [
   'S3_ALLOW_INSECURE_ENDPOINT',
   'S3_EXPECTED_BUCKET_OWNER',
   'S3_SSE_KMS_KEY_ID',
+  'GITHUB_APP_ID',
+  'GITHUB_APP_PRIVATE_KEY',
+  'AWS_ACCESS_KEY_ID',
+  'AWS_SECRET_ACCESS_KEY',
+  'GATEWAY_IDENTITY',
 ].flatMap(name => [name, `${name}_FILE`])
 
 function setRequiredEnv(): Record<string, string | undefined> {
   const saved: Record<string, string | undefined> = {}
-  for (const key of OBJECT_STORE_ENV_NAMES) {
+  for (const key of SCRUBBED_ENV_NAMES) {
     saved[key] = process.env[key]
     delete process.env[key]
   }
@@ -77,7 +86,6 @@ function setRequiredEnv(): Record<string, string | undefined> {
     AWS_SECRET_ACCESS_KEY: 'test-secret',
   }
   for (const [key, value] of Object.entries(vars)) {
-    saved[key] = process.env[key]
     process.env[key] = value
   }
   return saved
@@ -91,6 +99,11 @@ function restoreEnv(saved: Record<string, string | undefined>): void {
       process.env[key] = value
     }
   }
+}
+
+function makeSpyLogger() {
+  const error = vi.fn()
+  return {error, logger: {debug: vi.fn(), info: vi.fn(), warning: vi.fn(), error}}
 }
 
 function makeMockAdapter() {
@@ -126,9 +139,17 @@ function makeMockBindingsStore() {
 
 describe('runDenyKeyBackfill', () => {
   let savedEnv: Record<string, string | undefined>
+  let tmpDir: string
+
+  function writeValueFile(name: string, contents: string): string {
+    const file = join(tmpDir, name)
+    writeFileSync(file, contents, {mode: 0o600})
+    return file
+  }
 
   beforeEach(() => {
     vi.clearAllMocks()
+    tmpDir = mkdtempSync(join(tmpdir(), 'backfill-runner-test-'))
     savedEnv = setRequiredEnv()
 
     // Set up default mock return values
@@ -143,6 +164,7 @@ describe('runDenyKeyBackfill', () => {
 
   afterEach(() => {
     restoreEnv(savedEnv)
+    rmSync(tmpDir, {recursive: true, force: true})
   })
 
   // -------------------------------------------------------------------------
@@ -438,8 +460,7 @@ describe('runDenyKeyBackfill', () => {
   it('neither S3_REGION nor AWS_REGION set → exits 1 and the logged error names every candidate', async () => {
     // #given
     delete process.env.AWS_REGION
-    const error = vi.fn()
-    const logger = {debug: vi.fn(), info: vi.fn(), warning: vi.fn(), error}
+    const {error, logger} = makeSpyLogger()
 
     // #when
     const {runDenyKeyBackfill} = await import('./backfill-runner.js')
@@ -448,9 +469,188 @@ describe('runDenyKeyBackfill', () => {
     // #then
     expect(exitCode).toBe(1)
     const [, context] = error.mock.calls[0] as [string, {error: string}]
-    expect(context.error).toContain('S3_REGION')
-    expect(context.error).toContain('AWS_REGION')
+    expect(context.error).toBe('S3_REGION or AWS_REGION is required')
     expect(mockBackfill).not.toHaveBeenCalled()
+  })
+
+  it('uses S3_REGION from env when S3_REGION_FILE is empty, not AWS_REGION', async () => {
+    // #given an empty bind-mounted S3_REGION_FILE, a real S3_REGION and a different AWS_REGION
+    const {ok} = await import('@fro-bot/runtime')
+    mockBackfill.mockResolvedValue(ok({total: 0, updated: 0, skipped: 0, failed: 0}))
+    process.env.S3_REGION_FILE = writeValueFile('s3-region-empty', '')
+    process.env.S3_REGION = 'eu-west-2'
+    process.env.AWS_REGION = 'us-east-1'
+
+    // #when
+    const {runDenyKeyBackfill} = await import('./backfill-runner.js')
+    const exitCode = await runDenyKeyBackfill({dryRun: false})
+
+    // #then
+    expect(exitCode).toBe(0)
+    expect(lastStoreConfig().region).toBe('eu-west-2')
+  })
+
+  it('keeps S3_ENDPOINT from env when S3_ENDPOINT_FILE is empty', async () => {
+    // #given the compose default: an empty endpoint file, with the endpoint set in env
+    const {ok} = await import('@fro-bot/runtime')
+    mockBackfill.mockResolvedValue(ok({total: 0, updated: 0, skipped: 0, failed: 0}))
+    process.env.S3_ENDPOINT_FILE = writeValueFile('s3-endpoint-empty', '')
+    process.env.S3_ENDPOINT = 'https://my-minio.example.com'
+
+    // #when
+    const {runDenyKeyBackfill} = await import('./backfill-runner.js')
+    const exitCode = await runDenyKeyBackfill({dryRun: false})
+
+    // #then
+    expect(exitCode).toBe(0)
+    expect(lastStoreConfig().endpoint).toBe('https://my-minio.example.com')
+  })
+
+  it('trims a padded S3_BUCKET and S3_REGION', async () => {
+    // #given
+    const {ok} = await import('@fro-bot/runtime')
+    mockBackfill.mockResolvedValue(ok({total: 0, updated: 0, skipped: 0, failed: 0}))
+    process.env.S3_BUCKET = ' test-bucket '
+    process.env.S3_REGION = ' eu-west-2 '
+
+    // #when
+    const {runDenyKeyBackfill} = await import('./backfill-runner.js')
+    await runDenyKeyBackfill({dryRun: false})
+
+    // #then
+    expect(lastStoreConfig()).toMatchObject({bucket: 'test-bucket', region: 'eu-west-2'})
+  })
+
+  it('rejects a KMS key with a custom endpoint and no S3_SSE → exits 1 naming S3_SSE_KMS_KEY_ID', async () => {
+    // #given a custom endpoint derives AES256, so the key would be silently dropped
+    process.env.S3_ENDPOINT = 'https://my-minio.example.com'
+    process.env.S3_SSE_KMS_KEY_ID = 'alias/fro-bot'
+    const {error, logger} = makeSpyLogger()
+
+    // #when
+    const {runDenyKeyBackfill} = await import('./backfill-runner.js')
+    const exitCode = await runDenyKeyBackfill({dryRun: false, logger})
+
+    // #then
+    expect(exitCode).toBe(1)
+    const [, context] = error.mock.calls[0] as [string, {error: string}]
+    expect(context.error).toMatch(/^S3_SSE_KMS_KEY_ID: /)
+    expect(mockCreateS3Adapter).not.toHaveBeenCalled()
+  })
+
+  it('accepts a KMS key with a custom endpoint when S3_SSE=aws:kms', async () => {
+    // #given
+    const {ok} = await import('@fro-bot/runtime')
+    mockBackfill.mockResolvedValue(ok({total: 0, updated: 0, skipped: 0, failed: 0}))
+    process.env.S3_ENDPOINT = 'https://my-minio.example.com'
+    process.env.S3_SSE = 'aws:kms'
+    process.env.S3_SSE_KMS_KEY_ID = 'alias/fro-bot'
+    process.env.S3_EXPECTED_BUCKET_OWNER = '123456789012'
+
+    // #when
+    const {runDenyKeyBackfill} = await import('./backfill-runner.js')
+    const exitCode = await runDenyKeyBackfill({dryRun: false})
+
+    // #then
+    expect(exitCode).toBe(0)
+    expect(lastStoreConfig()).toMatchObject({
+      sseEncryption: 'aws:kms',
+      sseKmsKeyId: 'alias/fro-bot',
+      expectedBucketOwner: '123456789012',
+    })
+  })
+
+  it('rejects a metadata endpoint even with S3_ALLOW_INSECURE_ENDPOINT=true → exits 1', async () => {
+    // #given
+    process.env.S3_ENDPOINT = 'http://169.254.169.254'
+    process.env.S3_ALLOW_INSECURE_ENDPOINT = 'true'
+    const {error, logger} = makeSpyLogger()
+
+    // #when
+    const {runDenyKeyBackfill} = await import('./backfill-runner.js')
+    const exitCode = await runDenyKeyBackfill({dryRun: false, logger})
+
+    // #then
+    expect(exitCode).toBe(1)
+    const [, context] = error.mock.calls[0] as [string, {error: string}]
+    expect(context.error).toContain('cloud instance metadata services')
+  })
+
+  it('rejects a malformed S3_EXPECTED_BUCKET_OWNER → exits 1 naming the variable, not the value', async () => {
+    // #given
+    process.env.S3_EXPECTED_BUCKET_OWNER = 'not-an-account'
+    const {error, logger} = makeSpyLogger()
+
+    // #when
+    const {runDenyKeyBackfill} = await import('./backfill-runner.js')
+    const exitCode = await runDenyKeyBackfill({dryRun: false, logger})
+
+    // #then
+    expect(exitCode).toBe(1)
+    const [, context] = error.mock.calls[0] as [string, {error: string}]
+    expect(context.error).toMatch(/^S3_EXPECTED_BUCKET_OWNER: /)
+    expect(context.error).not.toContain('not-an-account')
+  })
+
+  // -------------------------------------------------------------------------
+  // Required reads share the gateway rule: an empty `_FILE` counts as unset
+  // -------------------------------------------------------------------------
+
+  it.each(['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'GITHUB_APP_ID', 'GITHUB_APP_PRIVATE_KEY'])(
+    'empty %s_FILE with the env var unset → exits 1 and logs the variable name',
+    async name => {
+      // #given an empty bind-mounted file and no env value
+      delete process.env[name]
+      process.env[`${name}_FILE`] = writeValueFile(`${name}-empty`, '')
+      const {error, logger} = makeSpyLogger()
+
+      // #when
+      const {runDenyKeyBackfill} = await import('./backfill-runner.js')
+      const exitCode = await runDenyKeyBackfill({dryRun: false, logger})
+
+      // #then the empty file is not passed through as ''
+      expect(exitCode).toBe(1)
+      const [, context] = error.mock.calls[0] as [string, {error: string}]
+      expect(context.error).toContain(name)
+      expect(mockCreateS3Adapter).not.toHaveBeenCalled()
+      expect(mockCreateAppClient).not.toHaveBeenCalled()
+    },
+  )
+
+  it('empty AWS_ACCESS_KEY_ID_FILE with the env var set → uses the env value', async () => {
+    // #given
+    const {ok} = await import('@fro-bot/runtime')
+    mockBackfill.mockResolvedValue(ok({total: 0, updated: 0, skipped: 0, failed: 0}))
+    process.env.AWS_ACCESS_KEY_ID_FILE = writeValueFile('aws-key-empty', '')
+
+    // #when
+    const {runDenyKeyBackfill} = await import('./backfill-runner.js')
+    const exitCode = await runDenyKeyBackfill({dryRun: false})
+
+    // #then
+    expect(exitCode).toBe(0)
+    expect(lastStoreConfig()).toMatchObject({credentials: {accessKeyId: 'test-key-id', secretAccessKey: 'test-secret'}})
+  })
+
+  it('reads credentials and the GitHub App ID from non-empty _FILE values', async () => {
+    // #given
+    const {ok} = await import('@fro-bot/runtime')
+    mockBackfill.mockResolvedValue(ok({total: 0, updated: 0, skipped: 0, failed: 0}))
+    delete process.env.AWS_ACCESS_KEY_ID
+    delete process.env.AWS_SECRET_ACCESS_KEY
+    delete process.env.GITHUB_APP_ID
+    process.env.AWS_ACCESS_KEY_ID_FILE = writeValueFile('aws-key', 'file-key-id\n')
+    process.env.AWS_SECRET_ACCESS_KEY_FILE = writeValueFile('aws-secret', 'file-secret\n')
+    process.env.GITHUB_APP_ID_FILE = writeValueFile('app-id', '424242\n')
+
+    // #when
+    const {runDenyKeyBackfill} = await import('./backfill-runner.js')
+    const exitCode = await runDenyKeyBackfill({dryRun: false})
+
+    // #then
+    expect(exitCode).toBe(0)
+    expect(lastStoreConfig()).toMatchObject({credentials: {accessKeyId: 'file-key-id', secretAccessKey: 'file-secret'}})
+    expect((mockCreateAppClient.mock.calls[0] as [{appId: string}])[0].appId).toBe('424242')
   })
 
   it('createS3Adapter is called via static import (not dynamic) — no dynamic import branch', async () => {
@@ -659,5 +859,35 @@ describe('makeWriteBinding', () => {
     expect(key).toContain('/discord-gateway/')
     expect(key).not.toContain('/coordination/')
     expect(key).toContain('/bindings/repo.json')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// USAGE text
+// ---------------------------------------------------------------------------
+
+describe('USAGE', () => {
+  it('lists the required variables and points at the deploy guide for the optional S3 settings', async () => {
+    // #given / #when
+    const {USAGE} = await import('./backfill-runner.js')
+
+    // #then the required variables are listed
+    for (const name of [
+      'GITHUB_APP_ID',
+      'GITHUB_APP_PRIVATE_KEY',
+      'S3_BUCKET',
+      'S3_REGION',
+      'AWS_ACCESS_KEY_ID',
+      'AWS_SECRET_ACCESS_KEY',
+      'GATEWAY_IDENTITY',
+    ]) {
+      expect(USAGE).toContain(name)
+    }
+
+    // #and the optional S3 settings live in one place, the deploy guide
+    expect(USAGE).toContain('deploy/README.md')
+    expect(USAGE).toContain('Object-store settings')
+    expect(USAGE).not.toContain('S3_ALLOW_INSECURE_ENDPOINT')
+    expect(USAGE).not.toContain('S3_SSE_KMS_KEY_ID')
   })
 })

@@ -1,11 +1,11 @@
 import type {ObjectStoreConfig} from '../shared/types.js'
-import type {ObjectStoreSettingsInput, Sourced} from './settings.js'
+import type {ObjectStoreSettingsInput, SettingSource} from './settings.js'
 import {describe, expect, it} from 'vitest'
 
 import {DEFAULT_S3_PREFIX} from '../shared/constants.js'
 import {parseObjectStoreSettings} from './settings.js'
 
-function sourced(source: string, value: string | null = null): Sourced {
+function sourced(source: string, value: string | null = null): SettingSource {
   return {value, source}
 }
 
@@ -91,6 +91,69 @@ describe('parseObjectStoreSettings', () => {
       expect(Object.keys(config)).not.toContain('expectedBucketOwner')
     })
 
+    it('trims padded bucket, region, endpoint, prefix and KMS key values', () => {
+      // #given values padded with whitespace, as they arrive from raw env
+      const input = makeInput({
+        bucket: sourced('S3_BUCKET', '  my-bucket\n'),
+        region: [sourced('S3_REGION', ' us-east-1 ')],
+        endpoint: sourced('S3_ENDPOINT', ' https://s3.example.com '),
+        prefix: sourced('S3_PREFIX', ' custom-prefix '),
+        sseEncryption: sourced('S3_SSE', ' aws:kms '),
+        sseKmsKeyId: sourced('S3_SSE_KMS_KEY_ID', ' kms-key-123 '),
+        expectedBucketOwner: sourced('S3_EXPECTED_BUCKET_OWNER', ' 123456789012 '),
+      })
+
+      // #when the settings are parsed
+      const config = expectConfig(parseObjectStoreSettings(input, {region: 'required'}))
+
+      // #then the output carries the trimmed values
+      expect(config).toStrictEqual({
+        enabled: true,
+        bucket: 'my-bucket',
+        region: 'us-east-1',
+        prefix: 'custom-prefix',
+        endpoint: 'https://s3.example.com',
+        expectedBucketOwner: '123456789012',
+        allowInsecureEndpoint: false,
+        sseEncryption: 'aws:kms',
+        sseKmsKeyId: 'kms-key-123',
+      })
+    })
+
+    it('treats a whitespace-only value as unset', () => {
+      // #given whitespace-only values for every optional field and a whitespace-only first region candidate
+      const input = makeInput({
+        region: [sourced('S3_REGION', '   '), sourced('AWS_REGION', 'eu-west-1')],
+        endpoint: sourced('s3-endpoint', '  '),
+        prefix: sourced('s3-prefix', ' \t '),
+        sseEncryption: sourced('s3-sse-encryption', '  '),
+        sseKmsKeyId: sourced('s3-sse-kms-key-id', '  '),
+        expectedBucketOwner: sourced('s3-expected-bucket-owner', '  '),
+      })
+
+      // #when the settings are parsed
+      const config = expectConfig(parseObjectStoreSettings(input, {region: 'required'}))
+
+      // #then they behave as if they were null
+      expect(config.region).toBe('eu-west-1')
+      expect(config.prefix).toBe(DEFAULT_S3_PREFIX)
+      expect(config).not.toHaveProperty('endpoint')
+      expect(config).not.toHaveProperty('sseEncryption')
+      expect(config).not.toHaveProperty('sseKmsKeyId')
+      expect(config).not.toHaveProperty('expectedBucketOwner')
+    })
+
+    it('fails on a whitespace-only bucket', () => {
+      // #given an enabled store whose bucket is only whitespace
+      const input = makeInput({bucket: sourced('S3_BUCKET', '   ')})
+
+      // #when the settings are parsed
+      const message = expectFailure(parseObjectStoreSettings(input, {region: 'required'}))
+
+      // #then it counts as missing
+      expect(message).toBe('S3_BUCKET is required')
+    })
+
     it('treats an empty string as unset', () => {
       // #given optional fields set to empty strings
       const input = makeInput({
@@ -153,15 +216,35 @@ describe('parseObjectStoreSettings', () => {
 
     it('fails under required when enabled and names every candidate source', () => {
       // #given no region candidate is set and region is required
-      const input = makeInput({region: [sourced('S3_REGION (or S3_REGION_FILE)'), sourced('AWS_REGION')]})
+      const input = makeInput({region: [sourced('S3_REGION'), sourced('AWS_REGION')]})
 
       // #when the settings are parsed
       const message = expectFailure(parseObjectStoreSettings(input, {region: 'required'}))
 
-      // #then the message names both sources
-      expect(message).toContain('S3_REGION (or S3_REGION_FILE)')
-      expect(message).toContain('AWS_REGION')
-      expect(message).toContain('is required')
+      // #then the message names both sources, joined with 'or'
+      expect(message).toBe('S3_REGION or AWS_REGION is required')
+    })
+
+    it('joins three candidate sources with commas and a final or', () => {
+      // #given three empty candidates and region is required
+      const input = makeInput({region: [sourced('A_REGION'), sourced('B_REGION'), sourced('C_REGION')]})
+
+      // #when the settings are parsed
+      const message = expectFailure(parseObjectStoreSettings(input, {region: 'required'}))
+
+      // #then the message reads as a list
+      expect(message).toBe('A_REGION, B_REGION or C_REGION is required')
+    })
+
+    it('names a single candidate source on its own', () => {
+      // #given one empty candidate and region is required
+      const input = makeInput({region: [sourced('aws-region')]})
+
+      // #when the settings are parsed
+      const message = expectFailure(parseObjectStoreSettings(input, {region: 'required'}))
+
+      // #then the message names it
+      expect(message).toBe('aws-region is required')
     })
 
     it('passes under required when the store is disabled', () => {
@@ -324,6 +407,46 @@ describe('parseObjectStoreSettings', () => {
       // #then the key is kept and the mode stays absent
       expect(config.sseKmsKeyId).toBe('kms-key-123')
       expect(config).not.toHaveProperty('sseEncryption')
+    })
+  })
+
+  describe('expected bucket owner', () => {
+    it('accepts a 12-digit account ID', () => {
+      // #given a well-formed owner
+      const input = makeInput({expectedBucketOwner: sourced('S3_EXPECTED_BUCKET_OWNER', '123456789012')})
+
+      // #when the settings are parsed
+      const config = expectConfig(parseObjectStoreSettings(input, {region: 'required'}))
+
+      // #then it is kept
+      expect(config.expectedBucketOwner).toBe('123456789012')
+    })
+
+    it.each(['12345678901', '1234567890123', 'abcdefghijkl', '1234-5678-9012', '12345678901a'])(
+      'rejects %s and names the source',
+      owner => {
+        // #given a malformed owner
+        const input = makeInput({expectedBucketOwner: sourced('S3_EXPECTED_BUCKET_OWNER', owner)})
+
+        // #when the settings are parsed
+        const message = expectFailure(parseObjectStoreSettings(input, {region: 'required'}))
+
+        // #then the message starts with the source, states the rule and never echoes the value
+        expect(message.startsWith('S3_EXPECTED_BUCKET_OWNER: ')).toBe(true)
+        expect(message).toContain('12-digit')
+        expect(message).not.toContain(owner)
+      },
+    )
+
+    it('passes a malformed owner through unchecked when the store is disabled', () => {
+      // #given a disabled store
+      const input = makeInput({enabled: false, expectedBucketOwner: sourced('s3-expected-bucket-owner', 'nope')})
+
+      // #when the settings are parsed
+      const config = expectConfig(parseObjectStoreSettings(input, {region: 'required'}))
+
+      // #then the enabled-only rules do not run
+      expect(config.expectedBucketOwner).toBe('nope')
     })
   })
 

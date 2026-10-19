@@ -56,7 +56,7 @@ node dist/main.mjs backfill-deny-keys --help
 | `S3_ENDPOINT` | AWS S3 | Custom endpoint. Validated: `https` unless `S3_ALLOW_INSECURE_ENDPOINT=true`; metadata addresses always rejected |
 | `S3_SSE` | `aws:kms` on AWS, `AES256` on a custom endpoint | `aws:kms` or `AES256` |
 | `S3_SSE_KMS_KEY_ID` | — | Requires the effective mode to be `aws:kms` |
-| `S3_EXPECTED_BUCKET_OWNER` | — | Expected bucket owner account ID |
+| `S3_EXPECTED_BUCKET_OWNER` | — | Expected bucket owner: a 12-digit AWS account ID |
 | `S3_ALLOW_INSECURE_ENDPOINT` | `false` | Only the exact value `true` allows an `http` or private-address endpoint |
 | `GATEWAY_IDENTITY` | `discord-gateway` | Namespace for bindings in the store |
 

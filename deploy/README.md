@@ -146,12 +146,12 @@ The gateway reads these through one shared parser, the same one the Action uses.
 | --- | --- | --- |
 | `S3_BUCKET` | — | Required |
 | `S3_REGION` | — | Required. Falls back to `AWS_REGION` when unset. Use `auto` for R2 and MinIO |
-| `S3_ENDPOINT` | AWS S3 | Must be `https://`. Loopback, link-local and private-network addresses are rejected. Cloud metadata addresses are always rejected |
+| `S3_ENDPOINT` | AWS S3 | `https://` unless `S3_ALLOW_INSECURE_ENDPOINT=true`. Loopback, link-local and private-network addresses need the flag. Cloud metadata addresses are always rejected |
 | `S3_ALLOW_INSECURE_ENDPOINT` | off | Only the exact value `true` turns it on. It allows an `http://` or private-address endpoint (local MinIO). It never allows a metadata address |
 | `S3_PREFIX` | `fro-bot-state` | Must pass the key-prefix rule (no traversal, no absolute path, no control characters) |
 | `S3_SSE` | `aws:kms` on AWS S3, `AES256` on a custom endpoint | `aws:kms` or `AES256`, case-sensitive |
 | `S3_SSE_KMS_KEY_ID` | — | Requires the effective mode to be `aws:kms`. On a custom endpoint, set `S3_SSE=aws:kms` too, or a key alone is rejected |
-| `S3_EXPECTED_BUCKET_OWNER` | — | AWS account ID the bucket must belong to |
+| `S3_EXPECTED_BUCKET_OWNER` | — | The 12-digit AWS account ID the bucket must belong to |
 
 The compose file mounts secrets only for the bucket, region and endpoint. Set the others as `environment:` entries on the `gateway` service in `compose.override.yaml`, or point a `*_FILE` variable at a file you mount yourself. Don't add new secret mounts to `compose.yaml` for them.
 
@@ -236,11 +236,21 @@ Run the full `touch` block from [Create secrets](#2-create-secrets) on every upg
 The gateway now rejects a bad object-store setting at startup. Before it starts a deployment on this version, check:
 
 - **`S3_ENDPOINT`.** An `http://`, loopback, link-local or private-address endpoint now needs `S3_ALLOW_INSECURE_ENDPOINT=true`. Use that only for local MinIO. A cloud metadata address is rejected even with the flag. An empty endpoint file is fine.
-- **Encryption mode.** With no `S3_SSE`, the gateway writes with `aws:kms` on AWS S3 and `AES256` on a custom endpoint. If the production bucket accepts only SSE-S3, set `S3_SSE=AES256`.
+- **Encryption mode.** Confirm what the production bucket accepts. With no `S3_SSE`, AWS S3 gets `aws:kms` and a custom endpoint gets `AES256`. If an AWS bucket accepts only SSE-S3, set `S3_SSE=AES256`.
 - **Region.** `S3_REGION` is the canonical name, with `AWS_REGION` as a fallback. R2 and MinIO deployments set `S3_REGION=auto`.
-- **Prefix and mode values.** An `S3_PREFIX` that fails the prefix rule, or an `S3_SSE` other than `aws:kms` or `AES256`, stops startup.
+- **Other values.** An `S3_PREFIX` that fails the prefix rule, an `S3_SSE` other than `aws:kms` or `AES256`, or an `S3_EXPECTED_BUCKET_OWNER` that is not 12 digits stops startup.
+- **Empty `_FILE`.** An empty or whitespace-only `*_FILE` counts as unset, so the same-named env var is used. This holds for every gateway secret, not only the S3 settings.
 
-The `backfill-deny-keys` command reads the same settings. It now honours `S3_ENDPOINT`, `S3_SSE`, `S3_SSE_KMS_KEY_ID`, `S3_EXPECTED_BUCKET_OWNER` and `S3_ALLOW_INSECURE_ENDPOINT`, where before it ignored them and went to AWS. It reads `S3_REGION` before `AWS_REGION`, and an empty `S3_PREFIX` means the default. Before you run it with `--apply`, confirm that `S3_REGION` and `AWS_REGION` match, or unset `AWS_REGION`. Confirm that the endpoint it now uses is the one you mean to write to.
+The `backfill-deny-keys` command reads the same settings:
+
+- It uses `S3_ENDPOINT`, `S3_SSE`, `S3_SSE_KMS_KEY_ID`, `S3_EXPECTED_BUCKET_OWNER` and `S3_ALLOW_INSECURE_ENDPOINT`. It ignored them before and went to AWS.
+- It reads `S3_REGION` before `AWS_REGION`. Before you run `--apply`, confirm that the two match, or unset `AWS_REGION`.
+- With `S3_ENDPOINT` set and no `S3_SSE`, it derives `AES256`. It wrote `aws:kms` to AWS before. Set `S3_SSE` if the bucket needs the other mode.
+- An empty `S3_PREFIX` means `fro-bot-state`. It was the bucket root before, so deny keys written by an earlier run with an empty prefix sit at the root and are not read.
+- Stop or quiesce the gateway before `--apply`. The write is an unconditional overwrite.
+- Confirm that the endpoint it now uses is the one you mean to write to.
+
+The Action reports a missing or unknown S3 setting with the input name first, for example `s3-bucket is required` and `s3-sse-encryption: must be either 'aws:kms' or 'AES256'`.
 
 ### Workspace uid isolation (one-time checkout ownership migration)
 

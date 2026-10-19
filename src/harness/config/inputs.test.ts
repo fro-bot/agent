@@ -688,7 +688,7 @@ describe('parseActionInputs', () => {
       const result = parseActionInputs()
 
       expect(result.success).toBe(false)
-      expect(!result.success && result.error.message).toContain('s3-bucket')
+      expect(!result.success && result.error.message).toBe('s3-bucket is required')
       expect(!result.success && result.error.message).not.toContain('   ')
       expect(!result.success && result.error.message).not.toContain('true')
     })
@@ -782,8 +782,7 @@ describe('parseActionInputs', () => {
       const result = parseActionInputs()
 
       expect(result.success).toBe(false)
-      expect(!result.success && result.error.message.startsWith('s3-sse-encryption')).toBe(true)
-      expect(!result.success && result.error.message).toContain("'aws:kms' or 'AES256'")
+      expect(!result.success && result.error.message).toBe("s3-sse-encryption: must be either 'aws:kms' or 'AES256'")
     })
 
     it('rejects s3-sse-kms-key-id with s3-sse-encryption AES256 and names the key input', () => {

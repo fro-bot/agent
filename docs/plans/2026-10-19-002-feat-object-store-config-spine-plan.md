@@ -138,7 +138,7 @@ The three readers disagree on names, defaults and validation:
   }
   ```
 
-  Values arrive trimmed, and an empty string counts as unset. Each surface parses its booleans with its own syntax. The output never carries credentials, and the gateway adds those afterwards.
+  The parser trims every value, and a value that is empty after trimming counts as unset. Each surface parses its booleans with its own syntax. The output never carries credentials, and the gateway adds those afterwards.
 
 - **Rules.**
   - Bucket: required when enabled.
@@ -147,17 +147,18 @@ The three readers disagree on names, defaults and validation:
   - Prefix: `validatePrefix` when enabled, with the default applied when unset.
   - SSE mode: `aws:kms` or `AES256` whenever set.
   - KMS key: when enabled and set, the effective mode from `getEffectiveEncryption` must be `aws:kms`. Today the adapter silently drops the key otherwise.
-  - Expected owner: trimmed only, with no other rule.
+  - Expected owner: when enabled and set, must be a 12-digit AWS account ID (`/^\d{12}$/`).
 
-- **Error text.** Messages read `<source>: <rule message>` and never include the value. The rule messages from `validateEndpoint` and `validatePrefix` are unchanged, so the pinned substrings survive. The bucket rule message is `is required`. The region message names the candidate sources and their `_FILE` forms where the surface has them.
+- **Error text.** Messages read `<source>: <rule message>` and never include the value. The rule messages from `validateEndpoint` and `validatePrefix` are unchanged, so the pinned substrings survive. The bucket rule message is `is required`. The region message names every candidate source, joined with commas and a final `or` (`S3_REGION or AWS_REGION is required`). Sources are plain setting names; the surface decides whether they also accept `_FILE`.
 - **Disabled store.** When `enabled` is false, the parser returns the trimmed values without the bucket, region, endpoint, prefix or KMS-key checks. The prefix is the trimmed value, or the default when it is empty, as in `inputs.ts` today.
 - **One gateway mapping.** `config.ts` exports `loadObjectStoreSettings()`, and `loadGatewayConfig` and backfill both call it.
   - `S3_BUCKET` is read with `readSecret` before the parser, so its missing-value error keeps the current `Missing required secret: S3_BUCKET (...)` text. Every other setting, including both region candidates, is read with `readOptionalSecret`.
   - An `err` result is thrown with the parser's message.
   - The parser is re-exported through `runtime-effect.ts`, following the gateway rule that runtime values enter through that adapter.
-  - Backfill imports `loadObjectStoreSettings` from `../config.js`, deletes its own S3 reads (`backfill-runner.ts` 257-259 and the store fields at 282-288), and keeps its credential reads.
+  - `loadObjectStoreSettings` lives in `packages/gateway/src/object-store-config.ts` and the env and `_FILE` readers in `packages/gateway/src/secrets.ts`. `config.ts` re-exports the readers. Importing `config.ts` from backfill is avoided so the runner does not load the whole gateway config module.
+  - Backfill imports `loadObjectStoreSettings` and the readers from those modules and deletes its own S3 reads. It reads `GITHUB_APP_ID`, `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` with `readSecret` and `GITHUB_APP_PRIVATE_KEY` with `readMultilineSecret`, so an empty `_FILE` counts as unset on every read.
 - **Gateway names and booleans.** The new settings are `S3_ALLOW_INSECURE_ENDPOINT`, `S3_EXPECTED_BUCKET_OWNER` and `S3_SSE_KMS_KEY_ID`. Each also accepts a `_FILE` form through `readOptionalSecret`. `S3_ALLOW_INSECURE_ENDPOINT` is true only for the exact value `true`, matching `config.ts:1108`.
-- **Error behaviour per surface is unchanged.** The Action fails the step with `Invalid inputs: …`. The gateway server throws from `loadGatewayConfig`. Backfill logs the message and exits 1.
+- **Error behaviour per surface.** The Action fails the step with `Invalid inputs: …`. The gateway server throws from `loadGatewayConfig`. Backfill logs the message and exits 1. How each surface reports an error doesn't change; the Action's error text does (see System-Wide Impact).
 - **Rebuild `dist/`** in every unit that touches runtime or `src/`, because runtime is bundled into the Action.
 
 ## Open Questions
@@ -236,8 +237,10 @@ The three readers disagree on names, defaults and validation:
 **Files:**
 
 - Modify: `packages/gateway/src/runtime-effect.ts` (re-export the parser)
-- Modify: `packages/gateway/src/config.ts` (add `loadObjectStoreSettings`, delete the local `DEFAULT_S3_PREFIX` and the SSE cast)
-- Modify: `packages/gateway/src/bindings/backfill-runner.ts` (call `loadObjectStoreSettings`, update the USAGE text, delete its S3 reads and the prefix literal)
+- Create: `packages/gateway/src/secrets.ts` (the env and `_FILE` readers, moved from `config.ts`; an empty file falls through to the env var)
+- Create: `packages/gateway/src/object-store-config.ts` (`loadObjectStoreSettings`)
+- Modify: `packages/gateway/src/config.ts` (call `loadObjectStoreSettings`, re-export the readers, delete the local `DEFAULT_S3_PREFIX` and the SSE cast)
+- Modify: `packages/gateway/src/bindings/backfill-runner.ts` (call `loadObjectStoreSettings`, read credentials through `readSecret`, update the USAGE text, delete its S3 reads and the prefix literal)
 - Test: `packages/gateway/src/config.test.ts`, `packages/gateway/src/bindings/backfill-runner.test.ts`
 
 **Approach:** Backfill catches the thrown error, logs its message and returns 1, matching its missing-var path. Both test files clear every name the loader reads, and each name's `_FILE` form, before each test: `S3_BUCKET`, `S3_REGION`, `AWS_REGION`, `S3_ENDPOINT`, `S3_PREFIX`, `S3_SSE`, `S3_ALLOW_INSECURE_ENDPOINT`, `S3_EXPECTED_BUCKET_OWNER` and `S3_SSE_KMS_KEY_ID`.
@@ -297,8 +300,15 @@ The three readers disagree on names, defaults and validation:
 | Backfill with `S3_REGION` and `AWS_REGION` both set | `AWS_REGION` | `S3_REGION` |
 | Backfill with `S3_PREFIX=''` | empty prefix | default prefix |
 | Backfill `_FILE` forms for the S3 settings | only `S3_BUCKET` and `AWS_REGION` | all of them, empty file means unset |
+| Backfill with `S3_ENDPOINT` set and no `S3_SSE` | `aws:kms` against AWS (endpoint ignored) | derives `AES256` for the custom endpoint |
+| Backfill with an empty `S3_PREFIX` | wrote and read the bucket root, so deny keys from an earlier empty-prefix run sit there | uses `fro-bot-state`; keys at the bucket root are not read |
+| Backfill `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `GITHUB_APP_ID` with an empty `_FILE` | the empty string was used | the empty file counts as unset: the env var is used, or the run exits 1 naming the variable |
+| Any gateway secret with an empty or whitespace-only `*_FILE` and a same-named env var | the empty file hid the env var (null) | the env var is used |
+| `S3_EXPECTED_BUCKET_OWNER` that is not a 12-digit account ID | passed startup, failed S3 calls | startup error |
+| Padded `S3_BUCKET`, `S3_REGION`, `S3_ENDPOINT` | used as given | trimmed |
+| Backfill `--apply` while the gateway runs | unconditional overwrite, no guard | same; stop or quiesce the gateway first |
 
-- **Action:** the inputs it accepts and rejects don't change, with one exception: a KMS key without an effective `aws:kms` mode is now an error instead of being silently dropped. Every S3 error now starts with the input name, and the pinned substrings still appear.
+- **Action:** the inputs it accepts and rejects don't change, with two exceptions: a KMS key without an effective `aws:kms` mode is now an error instead of being silently dropped, and an `s3-expected-bucket-owner` that is not a 12-digit account ID is now an error. Every S3 error text now starts with the input name, and the pinned substrings still appear. The missing-bucket error is now `s3-bucket is required`, and an unknown SSE mode is `s3-sse-encryption: must be either 'aws:kms' or 'AES256'`.
 - **Startup failure.** A bad S3 value now stops the gateway at startup, where before it degraded persistence at write time. This is intended: the persistence it degraded was silent.
 - **Unchanged invariants:** the SSE default rule, `forcePathStyle` for custom endpoints, the Action's input names and state keys, the Action's empty-region path, and credential handling on every path.
 

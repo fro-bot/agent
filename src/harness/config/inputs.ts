@@ -280,7 +280,7 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
       },
       {region: 'optional'},
     )
-    if (!storeConfigResult.success) {
+    if (storeConfigResult.success === false) {
       throw storeConfigResult.error
     }
 

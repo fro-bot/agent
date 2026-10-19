@@ -49,7 +49,7 @@ export type {
   ObjectStoreSettingsInput,
   ObjectStoreSettingsOptions,
   RepoQuiescence,
-  Sourced,
+  SettingSource,
 } from '@fro-bot/runtime'
 // Re-exported so non-run.ts callers (e.g. discord/ maintenance-run helpers) never import
 // @fro-bot/runtime directly for heartbeat lifecycle glue — this file stays the single seam.

@@ -14,6 +14,7 @@ import {
 } from '@aws-sdk/client-s3'
 
 import {err, ok} from '../shared/types.js'
+import {getEffectiveEncryption} from './encryption.js'
 import {createObjectStoreOperationError, type ObjectStoreAdapter, type ObjectStoreConfig} from './types.js'
 
 function sanitizeS3ErrorMessage(message: string): string {
@@ -134,18 +135,6 @@ function createClient(config: ObjectStoreConfig): S3Client {
     region,
     ...(config.credentials == null ? {} : {credentials: config.credentials}),
   })
-}
-
-export function getEffectiveEncryption(config: ObjectStoreConfig): 'AES256' | 'aws:kms' {
-  if (config.sseEncryption != null) {
-    return config.sseEncryption
-  }
-
-  if (config.endpoint != null) {
-    return 'AES256'
-  }
-
-  return 'aws:kms'
 }
 
 export function createS3Adapter(config: ObjectStoreConfig, logger: Logger): ObjectStoreAdapter {

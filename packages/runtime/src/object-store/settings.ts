@@ -1,34 +1,37 @@
 import type {ObjectStoreConfig, Result} from '../shared/types.js'
 import {DEFAULT_S3_PREFIX} from '../shared/constants.js'
 import {err, ok} from '../shared/types.js'
-import {getEffectiveEncryption} from './s3-adapter.js'
+import {getEffectiveEncryption} from './encryption.js'
 import {createValidationError} from './types.js'
 import {validateEndpoint, validatePrefix} from './validation.js'
+
+const AWS_ACCOUNT_ID_PATTERN = /^\d{12}$/
 
 /**
  * A setting value plus the name of the source the operator set it through (an Action input name, an env var, ...).
  * The source is the only part that ever appears in an error message; the value never does.
  */
-export interface Sourced {
+export interface SettingSource {
   readonly value: string | null
   readonly source: string
 }
 
 /**
- * Plain, already-trimmed object-store settings. Each surface (Action inputs, gateway env and `_FILE` values) reads its
- * own sources and maps them onto this shape. An empty string counts as unset. This module does no IO.
+ * Plain object-store settings. Each surface (Action inputs, gateway env and `_FILE` values) reads its own sources and
+ * maps them onto this shape. Values need not be trimmed: the parser trims each one, and a value that is empty after
+ * trimming counts as unset. This module does no IO.
  */
 export interface ObjectStoreSettingsInput {
   readonly enabled: boolean
-  readonly bucket: Sourced
-  /** Candidates in order; the first non-empty one wins. */
-  readonly region: readonly Sourced[]
-  readonly endpoint: Sourced
+  readonly bucket: SettingSource
+  /** Candidates in order; the first non-empty one wins. At least one is required so an error can name a source. */
+  readonly region: readonly [SettingSource, ...SettingSource[]]
+  readonly endpoint: SettingSource
   readonly allowInsecureEndpoint: boolean
-  readonly prefix: Sourced
-  readonly sseEncryption: Sourced
-  readonly sseKmsKeyId: Sourced
-  readonly expectedBucketOwner: Sourced
+  readonly prefix: SettingSource
+  readonly sseEncryption: SettingSource
+  readonly sseKmsKeyId: SettingSource
+  readonly expectedBucketOwner: SettingSource
 }
 
 export interface ObjectStoreSettingsOptions {
@@ -36,28 +39,29 @@ export interface ObjectStoreSettingsOptions {
   readonly region: 'required' | 'optional'
 }
 
-function present(sourced: Sourced): string | undefined {
-  return sourced.value != null && sourced.value.length > 0 ? sourced.value : undefined
+function present(setting: SettingSource): string | undefined {
+  const trimmed = setting.value?.trim()
+  return trimmed != null && trimmed.length > 0 ? trimmed : undefined
 }
 
 function fail(source: string, message: string): Result<never, Error> {
   return err(createValidationError(`${source}: ${message}`))
 }
 
-function joinSources(sources: readonly string[]): string {
-  if (sources.length === 0) {
-    return 'region'
+/** `a`, `a or b`, `a, b or c`. */
+function joinSources(sources: readonly [SettingSource, ...SettingSource[]]): string {
+  const [first, ...others] = sources
+  const last = others.pop()
+
+  if (last === undefined) {
+    return first.source
   }
 
-  if (sources.length === 1) {
-    return sources[0] as string
-  }
-
-  return `${sources.slice(0, -1).join(', ')} or ${sources.at(-1) as string}`
+  return `${[first, ...others].map(candidate => candidate.source).join(', ')} or ${last.source}`
 }
 
-function parseSseEncryption(sourced: Sourced): Result<ObjectStoreConfig['sseEncryption'], Error> {
-  const value = present(sourced)
+function parseSseEncryption(setting: SettingSource): Result<ObjectStoreConfig['sseEncryption'], Error> {
+  const value = present(setting)
 
   if (value === undefined) {
     return ok(undefined)
@@ -67,7 +71,7 @@ function parseSseEncryption(sourced: Sourced): Result<ObjectStoreConfig['sseEncr
     return ok(value)
   }
 
-  return fail(sourced.source, "must be either 'aws:kms' or 'AES256'")
+  return fail(setting.source, "must be either 'aws:kms' or 'AES256'")
 }
 
 /**
@@ -81,7 +85,7 @@ export function parseObjectStoreSettings(
   options: ObjectStoreSettingsOptions,
 ): Result<ObjectStoreConfig, Error> {
   const sseResult = parseSseEncryption(input.sseEncryption)
-  if (!sseResult.success) {
+  if (sseResult.success === false) {
     return sseResult
   }
   const sseEncryption = sseResult.data
@@ -99,21 +103,25 @@ export function parseObjectStoreSettings(
     }
 
     if (region === undefined && options.region === 'required') {
-      return err(createValidationError(`${joinSources(input.region.map(candidate => candidate.source))} is required`))
+      return err(createValidationError(`${joinSources(input.region)} is required`))
     }
 
     if (endpoint !== undefined) {
       const endpointResult = validateEndpoint(endpoint, input.allowInsecureEndpoint)
-      if (!endpointResult.success) {
+      if (endpointResult.success === false) {
         return fail(input.endpoint.source, endpointResult.error.message)
       }
     }
 
     const prefixResult = validatePrefix(prefix)
-    if (!prefixResult.success) {
+    if (prefixResult.success === false) {
       return fail(input.prefix.source, prefixResult.error.message)
     }
     prefix = prefixResult.data
+
+    if (expectedBucketOwner !== undefined && AWS_ACCOUNT_ID_PATTERN.test(expectedBucketOwner) === false) {
+      return fail(input.expectedBucketOwner.source, 'must be a 12-digit AWS account ID')
+    }
   }
 
   const config: ObjectStoreConfig = {

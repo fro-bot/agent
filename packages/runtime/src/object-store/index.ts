@@ -5,7 +5,7 @@ export {
   parseObjectStoreSettings,
   type ObjectStoreSettingsInput,
   type ObjectStoreSettingsOptions,
-  type Sourced,
+  type SettingSource,
 } from './settings.js'
 export * from './types.js'
 export * from './validation.js'
