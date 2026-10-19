@@ -26,7 +26,11 @@ import {classifyModelNotFoundError, classifyProviderAuthError} from '@fro-bot/ru
 
 /** Closed set of operator-safe failure reasons. Nothing provider-controlled can become one. */
 export type ProviderFailureReason =
-  'provider auth unavailable' | 'model not available' | 'model provider rejected the request' | 'session error'
+  | 'provider auth unavailable'
+  | 'model not available'
+  | 'provider quota exceeded'
+  | 'model provider rejected the request'
+  | 'session error'
 
 /**
  * OpenCode error class names this classifier recognizes (v1.19.0): `packages/core/src/v1/session.ts`
