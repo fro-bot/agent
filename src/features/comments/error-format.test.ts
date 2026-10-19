@@ -1,6 +1,5 @@
 import {describe, expect, it} from 'vitest'
 import {
-  createAgentError,
   createErrorInfo,
   createLLMFetchError,
   createLLMTimeoutError,
@@ -15,8 +14,7 @@ import {
  * canonical `@fro-bot/runtime` error-format module (see
  * `packages/runtime/src/agent/error-format/format.test.ts` for the full
  * behavioral test suite). This file only proves the re-export surface
- * still resolves and behaves identically to the deleted local
- * implementation for existing callers.
+ * still resolves.
  */
 describe('comments/error-format (re-export smoke)', () => {
   it('re-exports createRateLimitError producing a retryable rate_limit ErrorInfo', () => {
@@ -72,31 +70,5 @@ describe('comments/error-format (re-export smoke)', () => {
     // #then it is detected as an agent-not-found error
     expect(isAgentNotFoundError('agent not found')).toBe(true)
     expect(isAgentNotFoundError('fetch failed')).toBe(false)
-  })
-
-  describe('createAgentError (local compatibility wrapper)', () => {
-    it('creates non-retryable agent error with enable-omo suggestion when agent is provided', () => {
-      // #when creating an agent error with an agent name
-      const error = createAgentError('agent not found', 'sisyphus')
-
-      // #then it should be correctly structured with the historical oMo guidance
-      expect(error.type).toBe('configuration')
-      expect(error.retryable).toBe(false)
-      expect(error.message).toContain('agent not found')
-      expect(error.details).toContain('sisyphus')
-      expect(error.suggestedAction).toContain('enable-omo: true')
-    })
-
-    it('creates error without agent when not provided', () => {
-      // #when creating an agent error without agent name
-      const error = createAgentError('unknown agent error')
-
-      // #then it should work without agent details or oMo guidance
-      expect(error.type).toBe('configuration')
-      expect(error.message).toContain('unknown agent error')
-      expect(error.details).toBeUndefined()
-      expect(error.suggestedAction).toBe('Verify the agent name is correct.')
-      expect(error.suggestedAction).not.toContain('enable-omo')
-    })
   })
 })

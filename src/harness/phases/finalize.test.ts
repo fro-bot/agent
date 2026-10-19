@@ -8,7 +8,7 @@ import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {CacheRestorePhaseResult} from './cache-restore.js'
 import type {ExecutePhaseResult} from './execute.js'
 import type {RoutingPhaseResult} from './routing.js'
-import {classifyModelNotFoundError, createProviderAuthError} from '@fro-bot/runtime'
+import {classifyProviderFailure, createProviderAuthError} from '@fro-bot/runtime'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {formatErrorComment} from '../../features/comments/index.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
@@ -1356,11 +1356,11 @@ describe('runFinalize non-file-convention delivery', () => {
     const routing = createRouting({
       agentContext: {...createRouting().agentContext, issueNumber: 0},
     })
-    const llmError = classifyModelNotFoundError({
-      kind: 'session-error',
+    const llmError = classifyProviderFailure({
+      source: 'terminal-payload',
       message: 'Model not found: anthropic/claude-sonnet-5-5. Did you mean: claude-sonnet-4-5?',
-    })
-    if (llmError == null) throw new Error('fixture must classify as model_not_found')
+    }).errorInfo
+    expect(llmError.type).toBe('model_not_found')
     const execution = createExecution({success: false, exitCode: 0, llmError})
     const logger = createMockLogger()
 
@@ -1687,6 +1687,33 @@ describe('runFinalize quota_exceeded llmError handling', () => {
     expect(text).not.toContain(ATTACKER_DETAILS)
     expect(text).not.toContain('secret-token-xyz')
   }
+
+  it('exits 1 for a quota label produced by the shared classifier, even with a comment target', async () => {
+    // #given an assistant error with usage-limit wording classified by the shared rule, and a comment target
+    const bootstrap = createBootstrap({delivery: 'none', responseFilePath: null})
+    const routing = createRouting()
+    const llmError = classifyProviderFailure({
+      source: 'terminal-payload',
+      name: 'APIError',
+      message: 'Usage limit reached. Enable usage from your available balance',
+    }).errorInfo
+    expect(llmError.type).toBe('quota_exceeded')
+
+    // #when finalize runs
+    const exitCode = await runFinalize(
+      bootstrap,
+      routing,
+      cacheRestore,
+      createExecution({success: false, exitCode: 0, llmError}),
+      createMetrics(),
+      Date.now(),
+      createMockLogger(),
+    )
+
+    // #then the quota path fails the job (a generic recoverable error with a target exits 0)
+    expect(exitCode).toBe(1)
+    expect(mocks.setFailed).toHaveBeenCalledTimes(1)
+  })
 
   it('posts a rebuilt quota_exceeded comment to the exact issue target for model-gh delivery', async () => {
     // #given model-gh delivery, an issue target, and a quota_exceeded llmError

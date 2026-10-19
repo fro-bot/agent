@@ -227,6 +227,11 @@ describe('runOpenCodeCore — provider rejection fails fast (#1836)', () => {
         'Provider failure: model not available',
       ],
       [
+        'retry status with a structured account_rate_limit reason',
+        retryStatus({action: {reason: 'account_rate_limit', provider: 'p', title: 't', message: SECRET, label: 'l'}}),
+        'Provider failure: provider quota exceeded',
+      ],
+      [
         'assistant message.updated carrying ProviderAuthError',
         assistantMessage({name: 'ProviderAuthError', data: {providerID: 'openai', message: SECRET}}),
         'Provider failure: provider auth unavailable',
@@ -450,10 +455,6 @@ describe('runOpenCodeCore — provider rejection fails fast (#1836)', () => {
       // A retried 5xx whose text names auth or a model is still a retry: only the structured reason is trusted.
       ['503 mentioning no auth available', retryStatus({message: `503 auth_unavailable: no auth available ${SECRET}`})],
       ['503 mentioning model not found', retryStatus({message: `503 model not found: openai/gpt-9 ${SECRET}`})],
-      [
-        'account rate limit with an action',
-        retryStatus({action: {reason: 'account_rate_limit', provider: 'p', title: 't', message: 'm', label: 'l'}}),
-      ],
     ]
 
     it.each(transient)('%s does not fail the run, which then completes normally', async (_label, event) => {
@@ -912,5 +913,122 @@ describe('runOpenCodeCore — typed providerFailureReason on RunCoreError (contr
     const error = errorOf(run)
     expect(error.kind).toBe('inactivity-timeout')
     expect(error.providerFailureReason).toBeUndefined()
+  })
+})
+
+describe('runOpenCodeCore — provider quota stops the run (shared classifier)', () => {
+  const quotaRetry = retryStatus({
+    action: {reason: 'account_rate_limit', provider: 'p', title: 't', message: SECRET, label: 'l'},
+  })
+
+  it('a quota retry stops the run, aborts the live root first, and carries the quota reason', async () => {
+    // #given — OpenCode is mid-retry on an account rate limit, so the root is live
+    const run = startRun({ownershipLedger: createOwnershipLedger()})
+
+    // #when
+    await run.emit(quotaRetry)
+
+    // #then — it no longer waits out the retry budget: the root is torn down and the run fails with the quota reason
+    expect(run.abort).toHaveBeenCalledTimes(1)
+    expect(run.abort).toHaveBeenCalledWith(expect.objectContaining({path: {id: ROOT}}))
+    const error = errorOf(run)
+    expect(error.kind).toBe('session-error')
+    expect(error.message).toBe('Provider failure: provider quota exceeded')
+    expect(error.quarantined).toBe(false)
+    expect(error.providerFailureReason).toBe('provider quota exceeded')
+  })
+
+  it('fails long before the inactivity window instead of waiting', async () => {
+    // #given
+    const run = startRun()
+
+    // #when — one retry status, no time passing
+    await run.emit(quotaRetry)
+
+    // #then
+    expect(errorOf(run).providerFailureReason).toBe('provider quota exceeded')
+  })
+
+  it('quarantines the run when the root is still live after a quota retry, keeping the reason', async () => {
+    // #given — the directory's live set keeps reporting the root after the abort
+    const run = startRun({live: {[ROOT]: {type: 'retry'}}})
+
+    // #when — the bounded teardown budget runs out
+    await run.emit(quotaRetry)
+    await vi.advanceTimersByTimeAsync(20_000)
+
+    // #then — same reason, with quarantine as extra evidence
+    const error = errorOf(run)
+    expect(error.kind).toBe('session-error')
+    expect(error.message).toBe('Provider failure: provider quota exceeded')
+    expect(error.quarantined).toBe(true)
+    expect(error.providerFailureReason).toBe('provider quota exceeded')
+  })
+
+  it.each([
+    ['a 402 status', {name: 'APIError', data: {message: SECRET, statusCode: 402, isRetryable: false}}],
+    ['the insufficient_quota code', {name: 'APIError', data: {message: SECRET, code: 'insufficient_quota'}}],
+    ['the usage_not_included code', {name: 'APIError', code: 'usage_not_included', data: {message: SECRET}}],
+    [
+      'usage-limit text',
+      {name: 'APIError', data: {message: `Usage limit reached. Enable usage from your available balance ${SECRET}`}},
+    ],
+  ])('a session.error with %s is labelled quota, not "session error"', async (_label, error) => {
+    // #given
+    const run = startRun()
+
+    // #when
+    await run.emit(sessionError(error))
+
+    // #then — it fails the run as it always did; only the label changes
+    expectFailed(run, 'Provider failure: provider quota exceeded')
+    expect(errorOf(run).providerFailureReason).toBe('provider quota exceeded')
+  })
+
+  it('an assistant message with a structured quota error is labelled quota', async () => {
+    // #given
+    const run = startRun()
+
+    // #when
+    await run.emit(assistantMessage({name: 'APIError', data: {message: SECRET, statusCode: 402}}))
+
+    // #then
+    expect(errorOf(run).providerFailureReason).toBe('provider quota exceeded')
+  })
+
+  it('a plain 429 is not quota: it stays a rejected request, never the quota label', async () => {
+    // #given
+    const run = startRun()
+
+    // #when
+    await run.emit(sessionError({name: 'APIError', data: {message: 'Too Many Requests', statusCode: 429}}))
+
+    // #then
+    expect(errorOf(run).providerFailureReason).toBe('model provider rejected the request')
+  })
+
+  it('logs only the allowlisted error name and the reason for a quota failure', async () => {
+    // #given
+    const run = startRun()
+
+    // #when
+    await run.emit(sessionError({name: 'APIError', data: {message: `Usage limit reached ${SECRET}`, statusCode: 402}}))
+
+    // #then
+    expect(loggedText(run.logger)).not.toContain('SECRET')
+    expect(loggedText(run.logger)).toContain('"errorName":"APIError"')
+    expect(loggedText(run.logger)).toContain('"reason":"provider quota exceeded"')
+  })
+
+  it('a transient retry still keeps waiting', async () => {
+    // #given
+    const run = startRun()
+
+    // #when — a plain 429 retry with no structured quota action
+    await run.emit(retryStatus({message: 'Too Many Requests'}))
+    await vi.advanceTimersByTimeAsync(WINDOW / 2)
+
+    // #then
+    expect(run.outcome()).toBeUndefined()
   })
 })

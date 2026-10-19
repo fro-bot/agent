@@ -37,8 +37,8 @@ BOT_COMMENT_MARKER // HTML comment for identification
 - **Idempotent updates**: `postComment` with `updateExisting` replaces latest bot comment.
 - **Visual Severity Mapping**: ErrorType maps to emojis (⚠️ `rate_limit`, ⏳ `llm_timeout`, ❌ others).
 - **Single canonical error-format source**: `ErrorInfo`/`ErrorType`/`createErrorInfo`/`formatErrorComment`/error
-  factories are owned by `packages/runtime/src/agent/error-format/`. `error-format.ts` re-exports that surface except
-  for the legacy comments-module `createAgentError` compatibility wrapper; `types.ts` only re-exports runtime types.
+  factories are owned by `packages/runtime/src/agent/error-format/`. `error-format.ts` re-exports that surface;
+  `types.ts` only re-exports runtime types.
 
 ## DATA FLOW
 

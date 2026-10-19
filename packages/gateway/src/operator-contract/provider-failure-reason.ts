@@ -1,5 +1,5 @@
 /**
- * Operator-facing provider failure reason (contract 1.12.0).
+ * Operator-facing provider failure reason (contract 1.12.0; `provider-quota-exceeded` added in 1.13.0).
  *
  * A closed, kebab-case wire enum carried as a sibling of `failureKind` on `RunSummary` and
  * `OperatorRunStatus`. It says WHY a `session-error` run failed at the provider, which `failureKind`
@@ -29,6 +29,7 @@ import type {ProviderFailureReason} from '../execute/provider-failure.js'
 export const OPERATOR_PROVIDER_FAILURE_REASONS = [
   'provider-auth-unavailable',
   'model-not-available',
+  'provider-quota-exceeded',
   'provider-rejected-request',
   'unclassified',
 ] as const
@@ -47,6 +48,7 @@ export const PROVIDER_FAILURE_REASON_DETAILS_KEY = 'providerFailureReason' as co
 export const PROVIDER_FAILURE_REASON_TO_OPERATOR = {
   'provider auth unavailable': 'provider-auth-unavailable',
   'model not available': 'model-not-available',
+  'provider quota exceeded': 'provider-quota-exceeded',
   'model provider rejected the request': 'provider-rejected-request',
   'session error': 'unclassified',
 } satisfies Record<ProviderFailureReason, OperatorProviderFailureReason>

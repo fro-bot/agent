@@ -46,9 +46,9 @@ import {parseQuestionEcho, parseQuestionRequest, safeLogId} from '../approvals/q
 import {createDrainCompletion, parseSyntheticNoticePart} from './drain-completion.js'
 import {formatToolPart} from './format-part.js'
 import {
-  classifyErrorText,
-  classifyRetryStatus,
-  classifyStructuredError,
+  failureFromErrorObject,
+  failureFromErrorText,
+  failureFromRetryStatus,
   isAbortedError,
   isContextOverflowError,
 } from './provider-failure.js'
@@ -1369,8 +1369,9 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         // cannot attribute it to a specific session at all. Otherwise: ownership,
         // not root equality — a descendant's error is this run's problem too.
         if (eventSessionID === null || isOwnedSession(eventSessionID)) {
-          // The payload is a string or a structured `{name, data}` object. Both go through the closed
-          // classifier: only a fixed reason survives, never the provider's text.
+          // The payload is a string or a structured `{name, data}` object. Both go through the shared
+          // classifier: only a fixed reason survives, never the provider's text. Every terminal error fails the
+          // run; the shared kind only picks the label.
           const errorText = getStringProperty(eventPayload, 'error')
           const structuredError = errorText === null ? getObjectProperty(eventPayload, 'error') : null
           // A context overflow is not decided here: compaction may follow, so it only arms `overflowPending`.
@@ -1382,7 +1383,8 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           } else if (isAbortedError(structuredError)) {
             if (combinedSignal.aborted === false) throw await failFromProvider(ABORTED_FAILURE, 'session.error')
           } else {
-            const failure = errorText === null ? classifyStructuredError(structuredError) : classifyErrorText(errorText)
+            const failure =
+              errorText === null ? failureFromErrorObject(structuredError) : failureFromErrorText(errorText)
             throw await failFromProvider(failure, 'session.error')
           }
         }
@@ -1400,16 +1402,17 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
             if (isAbortedError(messageError)) {
               if (combinedSignal.aborted === false) throw await failFromProvider(ABORTED_FAILURE, 'message.updated')
             } else {
-              throw await failFromProvider(classifyStructuredError(messageError), 'message.updated')
+              throw await failFromProvider(failureFromErrorObject(messageError), 'message.updated')
             }
           }
         }
       } else if (eventType === 'session.status') {
-        // A retry that cannot succeed (provider auth missing, model unsupported) would otherwise sit through
-        // the whole retry/backoff budget. Transient retries (429/5xx/overload) classify to null and keep waiting.
+        // A retry that cannot succeed (provider auth missing, an account rate limit, model unsupported) would
+        // otherwise sit through the whole retry/backoff budget. `failureFromRetryStatus` returns a failure only
+        // when the shared classifier says `stop`; transient retries (429/5xx/overload) return null and keep waiting.
         // Root only: a child's retry never fails the parent through this path.
         if (getEventSessionID(rawEvent) === sessionId) {
-          const retryFailure = classifyRetryStatus(getObjectProperty(eventPayload, 'status'))
+          const retryFailure = failureFromRetryStatus(getObjectProperty(eventPayload, 'status'))
           if (retryFailure !== null) throw await failFromProvider(retryFailure, 'session.status', true)
         }
       } else {

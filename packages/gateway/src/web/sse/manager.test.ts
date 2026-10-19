@@ -3076,10 +3076,10 @@ describe('status frame — checkout fields through the real projection', () => {
 })
 
 describe('status frame — providerFailureReason through the real projection', () => {
-  const failedProviderRun = (): RunState =>
+  const failedProviderRun = (reason = 'provider-auth-unavailable'): RunState =>
     makeRunState({
       phase: 'FAILED',
-      details: {failureKind: 'session-error', providerFailureReason: 'provider-auth-unavailable'},
+      details: {failureKind: 'session-error', providerFailureReason: reason},
     })
   const realProjectBase: RunObservationManagerDeps['projectBase'] = async state =>
     projectRunStatusWithKey(state, {
@@ -3089,28 +3089,31 @@ describe('status frame — providerFailureReason through the real projection', (
       isRepoDenied: () => false,
     })
 
-  it('a cold-restart durable frame deep-equals the live terminal frame, including the reason', async () => {
-    // #given a live manager that observes a provider failure and delivers the terminal frame
-    const live = makeManager(async () => null, {projectBase: realProjectBase})
-    const liveSub = collectFrames(live.manager, 'run-001')
-    await live.manager.observe(failedProviderRun())
-    await drain()
-    const liveFrame = liveSub.frames.find(f => f.type === 'status')
+  it.each(['provider-auth-unavailable', 'provider-quota-exceeded'])(
+    'a cold-restart durable frame deep-equals the live terminal frame, including the reason %s',
+    async reason => {
+      // #given a live manager that observes a provider failure and delivers the terminal frame
+      const live = makeManager(async () => null, {projectBase: realProjectBase})
+      const liveSub = collectFrames(live.manager, 'run-001')
+      await live.manager.observe(failedProviderRun(reason))
+      await drain()
+      const liveFrame = liveSub.frames.find(f => f.type === 'status')
 
-    // #when a freshly started manager (no cache, no replay) resolves the same run from persisted state
-    const cold = makeManager(async () => null, {projectBase: realProjectBase})
-    const durable = subscribeWithDurable(cold.manager, async () => failedProviderRun())
-    await drain()
-    const durableFrame = durable.frames.find(f => f.type === 'status')
+      // #when a freshly started manager (no cache, no replay) resolves the same run from persisted state
+      const cold = makeManager(async () => null, {projectBase: realProjectBase})
+      const durable = subscribeWithDurable(cold.manager, async () => failedProviderRun(reason))
+      await drain()
+      const durableFrame = durable.frames.find(f => f.type === 'status')
 
-    // #then both carry the reason and are deeply equal
-    expect(liveFrame).toMatchObject({type: 'status', data: {providerFailureReason: 'provider-auth-unavailable'}})
-    expect(durableFrame).toEqual(liveFrame)
-    expect(durable.closes).toEqual(['terminal'])
+      // #then both carry the reason and are deeply equal
+      expect(liveFrame).toMatchObject({type: 'status', data: {providerFailureReason: reason}})
+      expect(durableFrame).toEqual(liveFrame)
+      expect(durable.closes).toEqual(['terminal'])
 
-    live.manager.shutdown()
-    cold.manager.shutdown()
-  })
+      live.manager.shutdown()
+      cold.manager.shutdown()
+    },
+  )
 
   it('a tampered stored reason is omitted from the durable frame while the frame is still delivered', async () => {
     // #given a persisted FAILED run whose reason was tampered with

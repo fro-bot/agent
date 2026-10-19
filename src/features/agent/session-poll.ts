@@ -1,4 +1,4 @@
-import type {ClassificationPath, ErrorInfo, OwnershipEntryState, OwnershipLedger, SessionClient} from '@fro-bot/runtime'
+import type {ErrorInfo, OwnershipEntryState, OwnershipLedger, SessionClient} from '@fro-bot/runtime'
 import type {createOpencode} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
 /**
@@ -10,30 +10,18 @@ import type {Logger} from '../../shared/logger.js'
 import type {AttemptObservation, FailureObservation} from './attempt-outcome.js'
 import type {ExecutionDeadline} from './retry.js'
 import type {ActivityTracker} from './streaming.js'
-import {
-  classifyContextOverflowError,
-  classifyModelNotFoundError,
-  classifyProviderAuthError,
-  classifyQuotaError,
-  createAgentError,
-  createErrorInfo,
-  createLLMFetchError,
-  createOwnershipLedger,
-  createRetryableApiError,
-  createSdkLedgerReconcileAdapter,
-  isLlmFetchError,
-  reconcileLedgerOnce,
-} from '@fro-bot/runtime'
+import {createOwnershipLedger, createSdkLedgerReconcileAdapter, reconcileLedgerOnce} from '@fro-bot/runtime'
 import {DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {
-  classifyRetryStatusError,
+  classifyRetryStatusSignal,
+  classifyTerminalPayloadError,
   clearRootRevalidationRequirement,
   getObservedFailure,
   hasFreshIdleCandidate,
   invalidateRootFreshness,
   mergeActivityError,
-  normalizeSessionError,
+  observeClassification,
   registerPendingRootUserMessage,
   requireRootRevalidation,
   resolvePendingRootUserMessage,
@@ -409,56 +397,6 @@ function createExecuteLedgerReconciler(options: {
   }
 }
 
-/**
- * Classifies an assistant message's own `error` field through the same bounded provider/generic
- * precedence the SSE `session.error` branch uses (`streaming.ts`'s `mergeActivityError` callers) --
- * an assistant carrying an error is failure evidence, never a clean completion candidate, and must
- * not be dropped into a generic timeout. Deliberately self-contained rather than reusing that
- * branch inline: the SSE branch also owns `continue`-based deadline handling scoped to its own
- * event loop, which does not translate to this poll-driven call site. A shared extraction of just
- * the classification precedence (not the loop control) is a reasonable follow-up.
- */
-function classifyAssistantMessageError(
-  messageError: unknown,
-  model: string | null,
-): {readonly error: ErrorInfo; readonly classificationPath: ClassificationPath} {
-  const errorData = getObjectProperty(messageError, 'data')
-  const status =
-    getNumberProperty(messageError, 'status') ??
-    getNumberProperty(messageError, 'statusCode') ??
-    getNumberProperty(errorData, 'status') ??
-    getNumberProperty(errorData, 'statusCode')
-  const code = getStringProperty(messageError, 'code') ?? getStringProperty(errorData, 'code')
-  const name = getStringProperty(messageError, 'name') ?? getStringProperty(errorData, 'name')
-
-  const terminalError =
-    classifyProviderAuthError({kind: 'session-error', name}) ??
-    classifyContextOverflowError({kind: 'session-error', name}) ??
-    classifyQuotaError({kind: 'session-error', status: status ?? undefined, code: code ?? undefined})
-  if (terminalError != null) return {error: terminalError, classificationPath: 'structured'}
-
-  const modelNotFoundError = classifyModelNotFoundError({
-    kind: 'session-error',
-    message: getStringProperty(messageError, 'message') ?? getStringProperty(errorData, 'message') ?? undefined,
-  })
-  if (modelNotFoundError != null) return {error: modelNotFoundError, classificationPath: 'fallback'}
-
-  const errorStr = normalizeSessionError(messageError)
-  if (isLlmFetchError(errorStr))
-    return {error: createLLMFetchError(errorStr, model ?? undefined), classificationPath: 'fallback'}
-  if (status === 429) return {error: createErrorInfo('rate_limit', errorStr, true), classificationPath: 'name'}
-
-  const isRetryable = getBooleanProperty(messageError, 'isRetryable') ?? getBooleanProperty(errorData, 'isRetryable')
-  if (isRetryable === true)
-    return {error: createRetryableApiError(errorStr, model ?? undefined), classificationPath: 'structured'}
-  if (isRetryable === false) return {error: createAgentError(errorStr), classificationPath: 'structured'}
-
-  return {
-    error: createAgentError(errorStr),
-    classificationPath: name != null || status != null || code != null ? 'name' : 'unclassified',
-  }
-}
-
 /** A qualified, not-yet-admitted completion candidate -- see `detectMessageActivity`'s doc comment. */
 interface MessageCompletionCandidate {
   readonly messageId: string
@@ -605,20 +543,20 @@ async function detectMessageActivity(
     activityTracker.firstMeaningfulEventReceived = true
     activityTracker.completedAssistantMessageId = undefined
     const model = getStringProperty(latestAssistantMessageInfo, 'modelID')
-    const classified = classifyAssistantMessageError(messageError, model)
+    const {classification} = classifyTerminalPayloadError(messageError, model)
+    const candidate = observeClassification(classification)
     logger.error('Completed assistant message carries an error — classified as failure evidence', {
       sessionId,
       messageId: latestAssistantMessageId,
-      type: classified.error.type,
+      type: candidate.error.type,
     })
-    const existing = getObservedFailure(activityTracker)?.error ?? null
     const merged = mergeActivityError(
-      existing,
-      classified.error,
+      getObservedFailure(activityTracker),
+      candidate,
       activityTracker,
-      classified.error.message,
-      classified.classificationPath,
-    )
+      candidate.error.message,
+      classification.classificationPath,
+    ).error
     const failure: FailureObservation = {
       source: 'session',
       message: merged.message,
@@ -1067,8 +1005,9 @@ export async function pollForSessionCompletionObservation(
         // invalidate any prior completion evidence even when classification returns null.
         if (activityTracker?.rootFreshness != null) invalidateRootFreshness(activityTracker.rootFreshness)
         // Poll-only terminal provider signals fail fast instead of waiting out the full timeout.
-        const terminalError = classifyRetryStatusError(sessionStatus)
-        if (terminalError != null) {
+        const retryFailure = classifyRetryStatusSignal(sessionStatus)
+        if (retryFailure != null) {
+          const terminalError = observeClassification(retryFailure)
           if (deadline?.isExpired() === true && activityTracker?.terminalProviderError == null)
             return deadlineObservation(activityTracker)
           logger.error('Session status retry classified as terminal provider error via poll', {
@@ -1076,9 +1015,9 @@ export async function pollForSessionCompletionObservation(
             type: sessionStatus.type,
           })
           if (activityTracker != null) {
-            mergeActivityError(null, terminalError, activityTracker)
+            mergeActivityError(null, terminalError, activityTracker, undefined, retryFailure.classificationPath)
           }
-          return providerFailureObservation(activityTracker?.terminalProviderError ?? terminalError)
+          return providerFailureObservation(activityTracker?.terminalProviderError ?? terminalError.error)
         }
         logger.debug('Session status', {sessionId, type: sessionStatus.type})
       } else {

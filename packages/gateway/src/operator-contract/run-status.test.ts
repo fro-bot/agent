@@ -734,19 +734,22 @@ describe('toOperatorRunStatus — providerFailureReason (1.12.0)', () => {
       ...overrides,
     })
 
-  it.each(['provider-auth-unavailable', 'model-not-available', 'provider-rejected-request', 'unclassified'] as const)(
-    'projects the stored wire reason %s for a FAILED session-error run',
-    reason => {
-      // #given a FAILED session-error run carrying a known wire reason
-      // #when projected
-      const result = toOperatorRunStatus(failedProvider(reason), BASE_OPTS)
+  it.each([
+    'provider-auth-unavailable',
+    'model-not-available',
+    'provider-quota-exceeded',
+    'provider-rejected-request',
+    'unclassified',
+  ] as const)('projects the stored wire reason %s for a FAILED session-error run', reason => {
+    // #given a FAILED session-error run carrying a known wire reason
+    // #when projected
+    const result = toOperatorRunStatus(failedProvider(reason), BASE_OPTS)
 
-      // #then it is on the status next to failureKind
-      assert(result !== null)
-      expect(result.providerFailureReason).toBe(reason)
-      expect(result.failureKind).toBe('session-error')
-    },
-  )
+    // #then it is on the status next to failureKind
+    assert(result !== null)
+    expect(result.providerFailureReason).toBe(reason)
+    expect(result.failureKind).toBe('session-error')
+  })
 
   it.each([
     [

@@ -463,18 +463,21 @@ describe('toRunSummary — providerFailureReason (1.12.0)', () => {
   const failedProvider = (reason: unknown): RunState =>
     makeRunState({phase: 'FAILED', details: {failureKind: 'session-error', providerFailureReason: reason}})
 
-  it.each(['provider-auth-unavailable', 'model-not-available', 'provider-rejected-request', 'unclassified'] as const)(
-    'projects the stored wire reason %s for a FAILED session-error run',
-    reason => {
-      // #given / #when
-      const result = toRunSummary(failedProvider(reason), BINDING_A)
+  it.each([
+    'provider-auth-unavailable',
+    'model-not-available',
+    'provider-quota-exceeded',
+    'provider-rejected-request',
+    'unclassified',
+  ] as const)('projects the stored wire reason %s for a FAILED session-error run', reason => {
+    // #given / #when
+    const result = toRunSummary(failedProvider(reason), BINDING_A)
 
-      // #then
-      assert(result !== null)
-      expect(result.providerFailureReason).toBe(reason)
-      expect(result.failureKind).toBe('session-error')
-    },
-  )
+    // #then
+    assert(result !== null)
+    expect(result.providerFailureReason).toBe(reason)
+    expect(result.failureKind).toBe('session-error')
+  })
 
   it.each([
     [

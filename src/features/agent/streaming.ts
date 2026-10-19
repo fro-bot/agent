@@ -1,19 +1,9 @@
-import type {ClassificationPath, ErrorInfo, OwnershipLedger} from '@fro-bot/runtime'
+import type {ClassificationPath, ErrorInfo, OwnershipLedger, ProviderFailureClassification} from '@fro-bot/runtime'
 import type {Event} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
 import type {TokenUsage} from '../../shared/types.js'
 import type {ExecutionDeadline} from './retry.js'
-import {
-  classifyContextOverflowError,
-  classifyModelNotFoundError,
-  classifyProviderAuthError,
-  classifyQuotaError,
-  createAgentError,
-  createErrorInfo,
-  createLLMFetchError,
-  createRetryableApiError,
-  isLlmFetchError,
-} from '@fro-bot/runtime'
+import {classifyProviderFailure, retrySignalFromStatus, terminalSignalFromPayload} from '@fro-bot/runtime'
 import {extractCommitShas, extractGithubUrls} from '../../services/github/urls.js'
 import {outputTextContent, outputToolExecution} from '../../shared/console.js'
 
@@ -279,35 +269,46 @@ export function clearRootRevalidationRequirement(tracker: RootFreshnessTracker):
   tracker.restConfirmationRequired = false
 }
 
-/** Shared provider-terminal classification for `session.status`/`retry`, used by both SSE and REST poll paths. */
-export function classifyRetryStatusError(status: unknown): ErrorInfo | null {
-  if (getStringProperty(status, 'type') !== 'retry') return null
-
-  const action = getObjectProperty(status, 'action')
-  const reason = getStringProperty(action, 'reason')
-  if (reason == null) return null
-
-  const nextRaw = getNumberProperty(status, 'next')
-  const candidateResetAt = nextRaw != null && Number.isFinite(nextRaw) ? new Date(nextRaw) : undefined
-  const resetAt = candidateResetAt != null && !Number.isNaN(candidateResetAt.getTime()) ? candidateResetAt : undefined
-
-  return (
-    classifyProviderAuthError({kind: 'retry-status', reason}) ??
-    classifyQuotaError({kind: 'retry-status', reason, resetAt})
-  )
+/**
+ * Classify a `session.status`/`retry` payload through the shared rule, for both the SSE and REST poll paths.
+ * Returns `null` for anything that is not a retry, or a retry that can still recover.
+ */
+export function classifyRetryStatusSignal(status: unknown): ProviderFailureClassification | null {
+  const signal = retrySignalFromStatus(status)
+  return signal === null ? null : classifyProviderFailure(signal)
 }
 
 /**
- * Errors that cannot recover within a run settle on first observation (no poll grace cycles, no retry).
- * `model_not_found` belongs here: a wrong model id or unreachable catalog is identical on every attempt.
+ * Classify a terminal error payload (`session.error` or an assistant message's `error`) through the shared rule.
+ * `terminalSignalFromPayload` is the one extractor both surfaces use. Message text feeds the quota and model
+ * patterns (which stop the run) and the auth and model hint patterns (which only label it). `detail` is the
+ * bounded `normalizeSessionError` diagnostic that the generic label carries, never the raw payload.
  */
-function isTerminalProviderError(error: ErrorInfo): boolean {
-  return (
-    error.type === 'context_overflow' ||
-    error.type === 'quota_exceeded' ||
-    error.type === 'provider_auth_error' ||
-    error.type === 'model_not_found'
+export function classifyTerminalPayloadError(
+  payload: unknown,
+  model: string | null,
+): {readonly classification: ProviderFailureClassification; readonly detail: string} {
+  const detail = normalizeSessionError(payload)
+  const classification = classifyProviderFailure(
+    terminalSignalFromPayload(payload, {detail, model: model ?? undefined}),
   )
+  return {classification, detail}
+}
+
+/**
+ * A recorded failure plus the Action's settlement decision. `terminal` failures settle on first observation (no
+ * poll grace cycles, no retry): the shared rule's `stop`, plus `context-overflow`, which the Action treats as
+ * terminal so `recoverFromContextOverflow` (gated on `llmError.type === 'context_overflow'`) still fires. A
+ * label-only result (hint evidence, or no evidence) is not terminal and waits.
+ */
+export interface ObservedActivityError {
+  readonly error: ErrorInfo
+  readonly terminal: boolean
+}
+
+/** The one place the Action turns a shared classification into a settlement decision. */
+export function observeClassification(classification: ProviderFailureClassification): ObservedActivityError {
+  return {error: classification.errorInfo, terminal: classification.stop || classification.kind === 'context-overflow'}
 }
 
 /** True when a thrown stream error reflects a shutdown we asked for, not one the transport handed us. */
@@ -317,24 +318,22 @@ function isIntentionalShutdown(error: unknown, signal: AbortSignal): boolean {
 
 /** Merge generic and terminal observations while freezing the first terminal provider signal. */
 export function mergeActivityError(
-  existing: ErrorInfo | null,
-  candidate: ErrorInfo,
+  existing: ObservedActivityError | null,
+  candidate: ObservedActivityError,
   activityTracker?: ActivityTracker,
   genericSessionError?: string,
   classificationPath?: ClassificationPath,
-): ErrorInfo {
+): ObservedActivityError {
   const existingTerminal = activityTracker?.terminalProviderError
-  if (existingTerminal != null) return existingTerminal
+  if (existingTerminal != null) return {error: existingTerminal, terminal: true}
 
-  const candidateIsTerminal = isTerminalProviderError(candidate)
-  const existingIsTerminal = existing != null && isTerminalProviderError(existing)
   let merged = existing ?? candidate
-  if (existingIsTerminal) merged = existing
-  else if (candidateIsTerminal) merged = candidate
+  if (existing?.terminal === true) merged = existing
+  else if (candidate.terminal) merged = candidate
 
-  if (activityTracker != null && isTerminalProviderError(merged)) {
-    activityTracker.terminalProviderError = merged
-    activityTracker.sessionError = merged.message
+  if (activityTracker != null && merged.terminal) {
+    activityTracker.terminalProviderError = merged.error
+    activityTracker.sessionError = merged.error.message
     if (classificationPath != null) activityTracker.classificationPath = classificationPath
     // A terminal signal is authoritative from here on -- clear any earlier generic record
     // rather than leaving its (possibly sensitive) content reachable off the tracker.
@@ -347,7 +346,7 @@ export function mergeActivityError(
     // `merged === candidate` is guaranteed here: `existing` can only be non-null once
     // `sessionError` has already been set by a prior call (both are written together below
     // and by the terminal branch above), so `sessionError == null` implies `existing == null`.
-    activityTracker.genericError = merged
+    activityTracker.genericError = merged.error
     if (classificationPath != null) activityTracker.classificationPath = classificationPath
   }
 
@@ -361,12 +360,18 @@ export function mergeActivityError(
  * been observed yet. Callers should use this instead of reading `terminalProviderError` /
  * `genericError` directly and re-deriving the precedence themselves.
  */
-export function getObservedFailure(
-  activityTracker: ActivityTracker,
-): {readonly error: ErrorInfo; readonly classificationPath: ClassificationPath | undefined} | null {
+export function getObservedFailure(activityTracker: ActivityTracker): {
+  readonly error: ErrorInfo
+  readonly terminal: boolean
+  readonly classificationPath: ClassificationPath | undefined
+} | null {
   const error = activityTracker.terminalProviderError ?? activityTracker.genericError
   if (error == null) return null
-  return {error, classificationPath: activityTracker.classificationPath}
+  return {
+    error,
+    terminal: activityTracker.terminalProviderError != null,
+    classificationPath: activityTracker.classificationPath,
+  }
 }
 
 export function logServerEvent(event: Event, logger: Logger): void {
@@ -683,7 +688,10 @@ export async function processEventStream(
   const commitsCreated: string[] = []
   const commentsPostedUrls: string[] = []
   let commentsPosted = 0
-  let llmError: ErrorInfo | null = null
+  let llmFailure: ObservedActivityError | null = null
+  // Read through a function: `llmFailure` is only assigned inside `consumeStream`, so a direct read here would
+  // be narrowed to `null` by control-flow analysis.
+  const getRecordedLlmError = (): ErrorInfo | null => llmFailure?.error ?? null
   let classificationPath: ClassificationPath | undefined
   // V2 sync tool lifecycle: correlate called→success by callID
   const pendingToolCalls = new Map<string, ToolCallInfo>()
@@ -1026,8 +1034,9 @@ export async function processEventStream(
           ) {
             invalidateRootFreshness(activityTracker.rootFreshness)
           }
-          const terminalError = classifyRetryStatusError(status)
-          if (terminalError != null) {
+          const retryFailure = classifyRetryStatusSignal(status)
+          if (retryFailure != null) {
+            const terminalError = observeClassification(retryFailure)
             // Root-scoped, mirroring `session.error` below for the same reason: a
             // descendant's retry status is real information -- classified above for
             // bounded diagnostics (logged just below), and its ledger entry marked
@@ -1038,7 +1047,7 @@ export async function processEventStream(
             if (statusEventSessionID !== sessionId) {
               logger.error('Session status retry classified as terminal provider error on a descendant session', {
                 sessionId,
-                type: terminalError.type,
+                type: terminalError.error.type,
               })
               ownershipLedger?.markUnknown(statusEventSessionID)
               continue
@@ -1047,10 +1056,10 @@ export async function processEventStream(
             if (deadline?.isExpired() === true && activityTracker?.terminalProviderError == null) continue
             logger.error('Session status retry classified as terminal provider error', {
               sessionId,
-              type: terminalError.type,
+              type: terminalError.error.type,
             })
-            classificationPath = 'structured'
-            llmError = mergeActivityError(llmError, terminalError, activityTracker, undefined, classificationPath)
+            classificationPath = retryFailure.classificationPath
+            llmFailure = mergeActivityError(llmFailure, terminalError, activityTracker, undefined, classificationPath)
           }
         }
       } else if (eventType === 'session.error') {
@@ -1089,81 +1098,33 @@ export async function processEventStream(
             continue
           }
 
-          // Allowlisted structured fields only — never echo the raw session error object/URL.
-          const errorData = getObjectProperty(sessionError, 'data')
-          const status =
-            getNumberProperty(sessionError, 'status') ??
-            getNumberProperty(sessionError, 'statusCode') ??
-            getNumberProperty(errorData, 'status') ??
-            getNumberProperty(errorData, 'statusCode')
-          const code = getStringProperty(sessionError, 'code') ?? getStringProperty(errorData, 'code')
-          const name = getStringProperty(sessionError, 'name') ?? getStringProperty(errorData, 'name')
-          // Intentional tradeoff: object message text is classification-only for quota and excluded from safe
-          // fetch-retry classification, so object {message: 'fetch failed'} remains non-retryable; string/thrown
-          // fetch errors remain retryable.
-          const structuredMessage =
-            getStringProperty(sessionError, 'message') ?? getStringProperty(errorData, 'message')
-          const plainMessage = typeof sessionError === 'string' ? sessionError : undefined
-          const message = structuredMessage ?? plainMessage
+          // Allowlisted structured fields only — never echo the raw session error object/URL. The shared
+          // classifier owns the stop rule; this loop only decides what a terminal or label-only result means
+          // for settlement.
+          const {classification, detail} = classifyTerminalPayloadError(sessionError, model)
+          const observed = observeClassification(classification)
 
-          const terminalError =
-            classifyProviderAuthError({
-              kind: 'session-error',
-              name,
-            }) ??
-            classifyContextOverflowError({
-              kind: 'session-error',
-              name,
-            }) ??
-            classifyQuotaError({
-              kind: 'session-error',
-              status: status ?? undefined,
-              code: code ?? undefined,
-              message: message ?? undefined,
-            })
-
-          if (terminalError != null) {
+          if (observed.terminal) {
             if (deadline?.isExpired() === true && activityTracker?.terminalProviderError == null) continue
-            logger.error('Session error classified as terminal provider error', {sessionId, type: terminalError.type})
-            classificationPath = 'structured'
-            llmError = mergeActivityError(llmError, terminalError, activityTracker, undefined, classificationPath)
-          } else if (llmError == null || isTerminalProviderError(llmError) === false) {
-            // OpenCode reports an unresolvable model as a bare `UnknownError`; the allowlisted model id and
-            // suggestions only exist in its message, so surface them instead of the name-only diagnostic.
-            const modelNotFoundError = classifyModelNotFoundError({kind: 'session-error', message})
-            const errorStr = modelNotFoundError?.message ?? normalizeSessionError(sessionError)
-            let genericError: ErrorInfo
-            let genericClassificationPath: ClassificationPath
-            if (modelNotFoundError != null) {
+            if (classification.kind === 'model-not-found') {
+              // The allowlisted model id and suggestions are the useful diagnostic; the error type adds nothing.
               logger.error('Session error classified as model not found', {
                 sessionId,
-                error: modelNotFoundError.message,
+                error: observed.error.message,
               })
-              genericError = modelNotFoundError
-              genericClassificationPath = 'fallback'
-            } else if (isLlmFetchError(errorStr)) {
-              genericError = createLLMFetchError(errorStr, model ?? undefined)
-              genericClassificationPath = 'fallback'
-            } else if (status === 429) {
-              // Ordinary 429 without account_rate_limit stays retryable rate_limit.
-              genericError = createErrorInfo('rate_limit', errorStr, true)
-              genericClassificationPath = 'name'
             } else {
-              const isRetryable =
-                getBooleanProperty(sessionError, 'isRetryable') ?? getBooleanProperty(errorData, 'isRetryable')
-              if (isRetryable === true) {
-                genericError = createRetryableApiError(errorStr, model ?? undefined)
-                genericClassificationPath = 'structured'
-              } else if (isRetryable === false) {
-                genericError = createAgentError(errorStr)
-                genericClassificationPath = 'structured'
-              } else {
-                genericError = createAgentError(errorStr)
-                genericClassificationPath = name != null || status != null || code != null ? 'name' : 'unclassified'
-              }
+              logger.error('Session error classified as terminal provider error', {
+                sessionId,
+                type: observed.error.type,
+              })
             }
-            if (classificationPath == null) classificationPath = genericClassificationPath
-            llmError = mergeActivityError(llmError, genericError, activityTracker, errorStr, classificationPath)
+            classificationPath = classification.classificationPath
+            llmFailure = mergeActivityError(llmFailure, observed, activityTracker, undefined, classificationPath)
+          } else if (llmFailure?.terminal !== true) {
+            // Label-only result (hint evidence, or no evidence): recorded as a generic failure and left to
+            // the grace cycles, never settled early.
+            if (classificationPath == null) classificationPath = classification.classificationPath
+            llmFailure = mergeActivityError(llmFailure, observed, activityTracker, detail, classificationPath)
           }
         }
       } else if (eventType === 'session.idle' && getSessionID(eventPayload) === sessionId) {
@@ -1275,7 +1236,7 @@ export async function processEventStream(
     commitsCreated,
     commentsPostedUrls,
     commentsPosted,
-    llmError,
+    llmError: getRecordedLlmError(),
     classificationPath,
     ...(discontinuity == null ? {} : {discontinuity}),
   }

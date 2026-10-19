@@ -3217,7 +3217,7 @@ describe('operatorPush config', () => {
     expect(thrown?.message).not.toContain(FAKE_VAPID_PRIVATE_KEY)
   })
 
-  it('regression: OPERATOR_CONTRACT_VERSION was unchanged by adding push config/DTOs (stayed 1.6.0); a later additive field (checkoutProvenance) bumped it to 1.7.0, and a further additive field (checkoutPreparation) plus a new RemoteFreshness variant bumped it to 1.8.0, and the question frame/status surface (waiting_for_question) bumped it to 1.9.0, and exporting the push trigger kinds bumped it to 1.10.0, and the run-summary waiting statuses plus the question push deep link bumped it to 1.11.0, and the approval push run ID, launch prompt and provider failure reason bumped it to 1.12.0 (MINOR, per version.ts policy)', async () => {
+  it('regression: OPERATOR_CONTRACT_VERSION was unchanged by adding push config/DTOs (stayed 1.6.0); a later additive field (checkoutProvenance) bumped it to 1.7.0, and a further additive field (checkoutPreparation) plus a new RemoteFreshness variant bumped it to 1.8.0, and the question frame/status surface (waiting_for_question) bumped it to 1.9.0, and exporting the push trigger kinds bumped it to 1.10.0, and the run-summary waiting statuses plus the question push deep link bumped it to 1.11.0, and the approval push run ID, launch prompt and provider failure reason bumped it to 1.12.0, and the provider-quota-exceeded reason bumped it to 1.13.0 (MINOR, per version.ts policy)', async () => {
     // #given — push DTOs were added to the operator-contract barrel without bumping the
     // version constant (the dashboard SSE drift gate matches this value exactly). Two later
     // additive changes (OperatorRunStatus.checkoutProvenance, then
@@ -3227,10 +3227,11 @@ describe('operatorPush config', () => {
     // status then bumped it to 1.9.0 the same way, and exporting OPERATOR_PUSH_TRIGGER_KINDS /
     // OperatorPushTriggerKind to 1.10.0. The waiting_for_approval / waiting_for_question run-summary statuses
     // and the question push deep link then bumped it to 1.11.0. The approval push run ID,
-    // RunSummary.prompt and providerFailureReason then bumped it to 1.12.0.
+    // RunSummary.prompt and providerFailureReason then bumped it to 1.12.0. The provider-quota-exceeded
+    // reason then bumped it to 1.13.0.
     const {OPERATOR_CONTRACT_VERSION} = await import('./operator-contract/index.js')
 
     // #when / #then
-    expect(OPERATOR_CONTRACT_VERSION).toBe('1.12.0')
+    expect(OPERATOR_CONTRACT_VERSION).toBe('1.13.0')
   })
 })
