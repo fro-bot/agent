@@ -5,7 +5,7 @@ topic: action-gateway-consolidation-inventory
 
 # Action vs gateway: consolidation inventory
 
-Snapshot of main at `7267362c6`. Read-only research. No repo files were edited, and no tests or builds were run.
+Snapshot of main at `7267362c6`. Read-only research. No repo files were edited, and no tests or builds were run. Later changes appear only as short `Update:` notes; the findings themselves are unchanged.
 
 Scope notes:
 
@@ -43,6 +43,8 @@ Scope notes:
 | 14 | GitHub App auth and API client | `src/services/github/client.ts:73-75` (dynamic `createAppAuth`), `api.ts` (422), `context.ts` (258). | `packages/gateway/src/github/app-client.ts:231,275` (`createAppAuth`), `dispatch.ts` (225), `errors.ts` (47). | None. `@octokit/auth-app` in both. | Action uses the runner token and an app token in some paths. Gateway mints installation tokens per repo [partially verified]. | `7ab02e218` (#1388, short-lived tokens for autonomous runs). Side [unverified]. | ~150 overlapping |
 | 15 | Small duplicates, "anything else" | Six `getStringProperty`-family copies: `streaming.ts:444-469`, `session-poll.ts:218-239`, `retry.ts:136-151`. Two GitHub comment writers: `comments/writer.ts` and `response-post.ts:413-459`. `createAgentError` redeclared in `src/features/comments/error-format.ts:16` (runtime at `format.ts:180`). Raw permission-reply call at `execution.ts:71`. Action wrapper `createExecuteLedgerReconciler` over runtime reconciler (`session-poll.ts:308-410`). | Six `getXProperty` copies: `run-core.ts:268-283`, `provider-failure.ts:73-82`, `drain-completion.ts:63-84`. Raw permission reply at `execute/run.ts:1349`. `wrapLedgerWithHooks` (`run-core.ts:317-395`). `abortSession` (`settle-owned-sessions.ts:117-140`) duplicates Action `abortRemoteSession`. | Runtime has no payload-accessor module. | Identical `TASK_NOTICE_PATTERN` on both sides (`streaming.ts:634`, `drain-completion.ts:47`). | Gateway-only `1752` and `1771`; Action-only `1715`. | ~150 |
 
+Update: the accessor copies and the task-notice pattern in row 15 were removed in #1872. Small duplicates this table does not list (entity-ref parser, sleep, gateway logger adapter, SHA validator, byte formatter) were removed in the small-helpers rung (#NNNN).
+
 ---
 
 ## Top 5 consolidation candidates (ranked by bug-skew risk × duplicated LOC × ease)
@@ -54,6 +56,8 @@ Bug-skew risk is high. The gateway lacks the Action's quota fail-fast and contex
 ### 2. Event-stream leaves: payload accessors, task-notice parser, REST message facts
 
 The gateway's `run-core.ts:14-21` says it mirrors `streaming.ts` "exactly" but can only do so by copying, because of the layering rule. The copies have already diverged in both directions (#1715 and #1752). The leaves are pure functions with no state: six accessor families (about 90 LOC), the identical `TASK_NOTICE_PATTERN` plus `parseTaskNotice`, and REST message readers (`retry.ts:190-268` vs `drain-completion.ts:108-146`). Extracting them to `packages/runtime/src/agent/` (for example `payload.ts` and `task-notice.ts`) takes about 150–200 LOC out of two surfaces and turns the "mirror" comment into a shared import. Do not try to share the stream loop itself yet. Its policy differs (poll versus SSE, auto-deny versus approvals).
+
+Update: delivered in #1872.
 
 ### 3. Teardown and ownership-drain ladder
 
@@ -129,6 +133,8 @@ Replicated pieces:
 - Classification of `session.error`, `message.updated`, and `session.status` (`run-core.ts:1365-1413`) against the Action's `streaming.ts:1029` and `:282-311`.
 - Ledger wrapping: `run-core.ts:317-395` (`wrapLedgerWithHooks`).
 - Abort handling: `ABORTED_FAILURE` (`run-core.ts:746`), `isAbortedError`.
+
+Update: the accessor copies and `TASK_NOTICE_PATTERN` were removed in #1872, and the "exactly" comment is gone. Provider classification moved to runtime in #1869.
 
 Why it matters:
 

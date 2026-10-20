@@ -29,12 +29,13 @@ The concerns fall into two groups (full inventory: [2026-10-18-action-gateway-co
 | --- | --- | --- |
 | Provider-failure classification | Duplicated behavior | Ladder, rung 1 (delivered in #1869) |
 | Payload accessors, task-notice parser | Duplicated behavior | Ladder, rung 2 (delivered in #1872) |
+| Entity-ref parser, sleep, run-timeout default, gateway logger adapter, SHA validator, byte formatter | Small duplicates | Ladder, small-helpers rung (delivered in #NNNN) |
 | Bounded abort and settle (teardown) | Duplicated behavior, stateful | Separately planned rung |
 | Lock lease renewal and takeover | Duplicated behavior, stateful | Separately planned rung, after a takeover-policy decision |
-| S3 and object-store config | Duplicated parsing and validation | Config spine, block 1 (one object-store settings parser in runtime) |
+| S3 and object-store config | Duplicated parsing and validation | Config spine, block 1 (delivered in #1883; one object-store settings parser in runtime) |
 | Event-stream loop | Duplicated behavior | Later, after leaves and seams prove out |
 | Timeouts and inactivity | Partly shared (runtime timer unused by the Action) | Later, with the event-stream loop |
-| GitHub App token minting, log redaction wrappers | Small duplicates | Ladder, low priority |
+| GitHub App token minting, log redaction wrappers | Small duplicates | Ladder, low priority. Not small-helper merges (see R7) |
 | Server lifecycle | Three spawn models by design | Out. workspace-agent is its own trust boundary |
 | Env scrub | Action vs workspace-agent only | Out. The `NODE_OPTIONS` fix ships separately |
 | Session persistence and continuity | Action-only. The gateway has none | Later phase (#1712, #1778) |
@@ -57,7 +58,7 @@ Session persistence is the largest Action-side concern. It is deferred because t
 - R4. Policy tests for a shared concern live once, in runtime. Each surface tests only how it maps the shared result.
 - R5. Rung 1 is provider-failure classification. One shared function decides both the failure kind and whether the run stops. Confirmed structured signals and the established text patterns stop a run. Looser text hints only label it.
 - R6. Rung 1 gives the gateway quota fail-fast on the `session.status` retry path. Quota is reported as a new operator reason, `provider-quota-exceeded`, which ships in the next operator-contract MINOR together with the paired dashboard release.
-- R7. Pure-leaf rungs follow rung 1 in this order unless planning finds a better one: payload accessors and the task-notice parser, then small duplicated helpers (GitHub App token minting, redaction wrappers).
+- R7. Pure-leaf rungs follow rung 1 in this order unless planning finds a better one: payload accessors and the task-notice parser, then the remaining small duplicated helpers (delivered in the small-helpers rung). GitHub App token minting and the redaction wrappers are not small-helper merges. Token minting stays separate because the Action and the gateway use different credential models. The redaction wrappers live in `evals/` and the harness package, not in Action or gateway code.
 - R8. Bounded abort and settle, and lock lease renewal, are stateful. Each needs its own plan, and its own tests for takeover and quarantine paths. Lease renewal also needs a takeover-policy decision first, because the Action reclaims an expired holder without corroboration and the gateway requires `ConfirmExpiredHolder`.
 
 **Drift guards**
@@ -98,7 +99,7 @@ Session persistence is the largest Action-side concern. It is deferred because t
 
 - Each consolidated concern is fixed once and both surfaces get the fix.
 - Each PR on the ladder removes more lines from `src/` and `packages/gateway/src` than it adds to runtime, not counting tests.
-- The "mirrors exactly" comment in `run-core.ts` is gone, replaced by shared imports.
+- The "mirrors exactly" comment in `run-core.ts` is gone, replaced by shared imports. Done in #1872.
 - S3 and object-store settings are defined once, and the docs match the code.
 - A planner can start rung 1 or config block 1 from this doc without inventing scope.
 
@@ -112,6 +113,8 @@ Session persistence is the largest Action-side concern. It is deferred because t
 - Session continuity for the gateway and safe concurrent session publication (#1712) are a later phase, as a shared runtime capability. #1778 closes into that phase.
 - The `NODE_OPTIONS` env-scrub fix ships separately.
 - The Action's and gateway's GitHub credential models are not merged.
+- Inline error-message extraction (about 86 sites) moves onto runtime `toErrorMessage` separately: [fro-bot/agent#1885](https://github.com/fro-bot/agent/issues/1885).
+- One owner/repo parsing contract across the surfaces is separate work: [fro-bot/agent#1886](https://github.com/fro-bot/agent/issues/1886). The entity-ref parser keeps its own `owner/repo#n` contract.
 
 ---
 
@@ -151,4 +154,4 @@ Session persistence is the largest Action-side concern. It is deferred because t
 - Provider classification: `packages/runtime/src/agent/error-format/format.ts`, `packages/gateway/src/execute/provider-failure.ts`, `packages/gateway/src/operator-contract/provider-failure-reason.ts`.
 - S3 config: `action.yaml`, `src/harness/config/inputs.ts`, `packages/gateway/src/config.ts`, `packages/gateway/src/bindings/backfill-runner.ts`, `packages/runtime/src/object-store/validation.ts`, `packages/gateway/AGENTS.md`.
 - Drift-guard precedent: `scripts/checkout-types-drift-guard.test.ts`.
-- Related issues: #1712, #1778.
+- Related issues: #1712, #1778, #1885, #1886.
