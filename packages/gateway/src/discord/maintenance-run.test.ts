@@ -222,9 +222,12 @@ describe('acquireMaintenanceRun', () => {
     expect(mockReleaseLockEffect).toHaveBeenCalledWith(CONFIG, 'acme/widget', 'lock-etag-2', expect.anything())
   })
 
-  it('release: a heartbeat.stop failure still transitions and releases, using the original etags', async () => {
-    // #given — heartbeat.stop fails
-    mockHeartbeat.stop.mockResolvedValue({success: false, error: new Error('stop failed')})
+  it('release: a heartbeat.stop failure still transitions and releases, using the renewed lock etag it reports', async () => {
+    // #given — the last tick renewed the lock and then failed the RunState write: stop fails but reports the fresh lock etag
+    mockHeartbeat.stop.mockResolvedValue({
+      success: false,
+      error: Object.assign(new Error('stop failed'), {lockEtag: 'lock-etag-renewed', tickPending: false}),
+    })
     const result = await Effect.runPromise(
       acquireMaintenanceRun({
         coordinationConfig: CONFIG,
@@ -251,6 +254,6 @@ describe('acquireMaintenanceRun', () => {
       expect.anything(),
       undefined,
     )
-    expect(mockReleaseLockEffect).toHaveBeenCalledWith(CONFIG, 'acme/widget', 'lock-etag-1', expect.anything())
+    expect(mockReleaseLockEffect).toHaveBeenCalledWith(CONFIG, 'acme/widget', 'lock-etag-renewed', expect.anything())
   })
 })

@@ -114,6 +114,10 @@ export function acquireMaintenanceRun(opts: {
             runEtag = stopResult.right.data.runEtag
             finalLockEtag = stopResult.right.data.lockEtag
           } else {
+            // A failed stop still reports the freshest confirmed lock ETag; only the RunState ETag stays last-known.
+            if (stopResult._tag === 'Right' && stopResult.right.success === false) {
+              finalLockEtag = stopResult.right.error.lockEtag
+            }
             logger.warn({repo, runId}, 'maintenance-run: heartbeat stop failed; using last known etags')
           }
         }

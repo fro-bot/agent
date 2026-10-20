@@ -312,6 +312,8 @@ describe('checkout provenance', () => {
 
     // #and — clean exit: lock released, no agent session started, no reply sent
     expect(mockRuntime.releaseLock).toHaveBeenCalled()
+    // #and — the release uses the lock ETag heartbeat.stop() confirmed, not the acquisition ETag
+    expect(mockRuntime.releaseLock.mock.calls[0]?.[2]).toBe('lock-etag-after-heartbeat')
     expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
     expect(request._replySink._sends).toHaveLength(0)
   })

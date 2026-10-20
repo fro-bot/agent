@@ -457,6 +457,8 @@ describe('heartbeat controller', () => {
     expect(result.success).toBe(false)
     if (result.success === true) throw new Error('expected a failure')
     expect(result.error.tickPending).toBe(true)
+    // The lock ETag is the last CONFIRMED one: the hung renewal may or may not have moved it.
+    expect(result.error.lockEtag).toBe('lock-etag-1')
     expect(controller.isRunning).toBe(false)
   })
 
@@ -487,6 +489,83 @@ describe('heartbeat controller', () => {
     // #then
     expect(result.success).toBe(true)
     expect(result.success === true ? result.data.lockEtag : null).toBe('lock-etag-next')
+  })
+
+  it('returns the renewed lock ETag from stop() when the run-state write fails after a successful renewal', async () => {
+    // #given the lock renews to a fresh ETag, then the run-state write fails
+    const conditionalPut = vi
+      .fn<Required<ObjectStoreAdapter>['conditionalPut']>()
+      .mockResolvedValueOnce(err(new Error('run-state write failed')))
+    const controller = createHeartbeatController(
+      createCoordinationConfig(createStoreAdapter({conditionalPut})),
+      'coordination',
+      'owner/repo',
+      'run-1',
+      'lock-etag-1',
+      createLogger(),
+    )
+    controller.start()
+    await vi.advanceTimersByTimeAsync(30_000)
+
+    // #when
+    const result = await controller.stop()
+
+    // #then the error still surfaces, but carries the freshest confirmed lock ETag
+    expect(result.success).toBe(false)
+    if (result.success === true) throw new Error('expected a failure')
+    expect(result.error.message).toBe('run-state write failed')
+    expect(result.error.tickPending).toBe(false)
+    expect(result.error.lockEtag).toBe('lock-etag-next')
+  })
+
+  it('returns the acquisition lock ETag from a failed stop when no renewal ever succeeded', async () => {
+    // #given the lock renewal itself fails
+    renewLeaseMock.mockReset()
+    renewLeaseMock.mockResolvedValue(err(new Error('lock renewal failed')))
+    const controller = createHeartbeatController(
+      createCoordinationConfig(createStoreAdapter()),
+      'coordination',
+      'owner/repo',
+      'run-1',
+      'lock-etag-1',
+      createLogger(),
+    )
+    controller.start()
+    await vi.advanceTimersByTimeAsync(30_000)
+
+    // #when
+    const result = await controller.stop()
+
+    // #then
+    expect(result.success).toBe(false)
+    if (result.success === true) throw new Error('expected a failure')
+    expect(result.error.lockEtag).toBe('lock-etag-1')
+  })
+
+  it('returns the renewed lock ETag when stop() fails to fetch the snapshot after a successful renewal', async () => {
+    // #given one good tick, then the snapshot read on stop fails
+    const getObject = vi
+      .fn<Required<ObjectStoreAdapter>['getObject']>()
+      .mockResolvedValueOnce(ok({data: JSON.stringify(createRunState()), etag: 'etag-current'}))
+      .mockResolvedValueOnce(err(new Error('S3 unavailable on stop')))
+    const controller = createHeartbeatController(
+      createCoordinationConfig(createStoreAdapter({getObject})),
+      'coordination',
+      'owner/repo',
+      'run-1',
+      'lock-etag-1',
+      createLogger(),
+    )
+    controller.start()
+    await vi.advanceTimersByTimeAsync(30_000)
+
+    // #when
+    const result = await controller.stop()
+
+    // #then
+    expect(result.success).toBe(false)
+    if (result.success === true) throw new Error('expected a failure')
+    expect(result.error.lockEtag).toBe('lock-etag-next')
   })
 
   it('returns an error when stop fails to fetch the authoritative snapshot', async () => {

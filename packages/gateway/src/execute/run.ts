@@ -1053,9 +1053,12 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           runEtag = stopResult.data.runEtag
           lockEtag = stopResult.data.lockEtag
         } else {
+          // A failed stop still reports the freshest lock ETag a renewal confirmed (tick failure) or the
+          // last confirmed one (tick still pending); only the RunState ETag stays at its last known value.
+          lockEtag = stopResult.error.lockEtag
           logger.warn(
-            {repo, runId, err: stopResult.error.message},
-            'run: heartbeat stop failed during preparation termination; using last known etags',
+            {repo, runId, err: stopResult.error.message, tickPending: stopResult.error.tickPending},
+            'run: heartbeat stop failed during preparation termination; using last known run etag',
           )
         }
       }
@@ -1252,10 +1255,12 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           // abort-registry entry to delete here — the outer finally's unconditional
           // delete() is still a safe no-op for this runId.
           if (heartbeatStopped === false) {
-            await heartbeat.stop().catch(() => {
-              /* best-effort */
-            })
+            // Best-effort, but keep the freshest confirmed lock ETag: the outer finally releases with it.
+            const stopped = await heartbeat.stop().catch(() => null)
             heartbeatStopped = true
+            if (stopped !== null) {
+              lockEtag = stopped.success === true ? stopped.data.lockEtag : stopped.error.lockEtag
+            }
           }
           return
         }
@@ -1488,7 +1493,11 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         runEtag = stopResult.data.runEtag
         lockEtag = stopResult.data.lockEtag
       } else {
-        logger.warn({repo, runId, err: stopResult.error.message}, 'run: heartbeat stop failed; using last known etags')
+        lockEtag = stopResult.error.lockEtag
+        logger.warn(
+          {repo, runId, err: stopResult.error.message, tickPending: stopResult.error.tickPending},
+          'run: heartbeat stop failed; using last known etags',
+        )
       }
 
       const completedResult = await transitionRun(
@@ -1732,8 +1741,9 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
             runEtag = stopResult.data.runEtag
             lockEtag = stopResult.data.lockEtag
           } else {
+            lockEtag = stopResult.error.lockEtag
             logger.warn(
-              {repo, runId, err: stopResult.error.message},
+              {repo, runId, err: stopResult.error.message, tickPending: stopResult.error.tickPending},
               'run: heartbeat stop failed on cancel path; using last known etags',
             )
           }
@@ -1849,8 +1859,9 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
             runEtag = stopResult.data.runEtag
             lockEtag = stopResult.data.lockEtag
           } else {
+            lockEtag = stopResult.error.lockEtag
             logger.warn(
-              {repo, runId, err: stopResult.error.message},
+              {repo, runId, err: stopResult.error.message, tickPending: stopResult.error.tickPending},
               'run: heartbeat stop failed; using last known etags',
             )
           }
@@ -1964,9 +1975,10 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       // SKIPPED when quarantined: the lease must keep renewing so the reservation cannot
       // silently lapse via TTL expiry while owned background work is still unconfirmed.
       if (quarantined === false && heartbeatStopped === false) {
-        await heartbeat.stop().catch(() => {
-          /* best-effort */
-        })
+        const stopped = await heartbeat.stop().catch(() => null)
+        if (stopped !== null) {
+          lockEtag = stopped.success === true ? stopped.data.lockEtag : stopped.error.lockEtag
+        }
       }
 
       // Dispose status controller — guaranteed cleanup of typing interval and debounce timer.

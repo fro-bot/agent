@@ -870,6 +870,45 @@ describe('runMention', () => {
       expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
     })
 
+    it('on failure path: releases the lock with the renewed ETag that a failed heartbeat.stop() still reports', async () => {
+      // #given — the last tick renewed the lock (fresh ETag) and then failed the RunState write, so stop() fails
+      // but carries the confirmed lock ETag
+      const {runMention} = await import('./run.js')
+      const stopError = Object.assign(new Error('run-state write failed'), {
+        lockEtag: 'lock-etag-renewed',
+        tickPending: false,
+      })
+      setupHappyPath({stop: vi.fn().mockResolvedValue({success: false, error: stopError})})
+      const {RunCoreError} = runCoreModule
+      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+      const deps = makeDeps()
+
+      // #when
+      await expect(runMention(makeMessage(makeThread()), makeBinding(), deps)).resolves.toBeUndefined()
+
+      // #then — the conditional release uses the renewed ETag, not the acquisition ETag
+      expect(mockRuntime.releaseLock).toHaveBeenCalledOnce()
+      expect(mockRuntime.releaseLock.mock.calls[0]?.[2]).toBe('lock-etag-renewed')
+    })
+
+    it('on success path: releases the lock with the renewed ETag that a failed heartbeat.stop() still reports', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      const stopError = Object.assign(new Error('run-state write failed'), {
+        lockEtag: 'lock-etag-renewed',
+        tickPending: false,
+      })
+      setupHappyPath({stop: vi.fn().mockResolvedValue({success: false, error: stopError})})
+      const deps = makeDeps()
+
+      // #when
+      await expect(runMention(makeMessage(), makeBinding(), deps)).resolves.toBeUndefined()
+
+      // #then
+      expect(mockRuntime.releaseLock).toHaveBeenCalledOnce()
+      expect(mockRuntime.releaseLock.mock.calls[0]?.[2]).toBe('lock-etag-renewed')
+    })
+
     it('on success path: heartbeat.stop() failure logs warning and continues to COMPLETED', async () => {
       // #given
       const {runMention} = await import('./run.js')

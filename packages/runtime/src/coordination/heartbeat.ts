@@ -28,14 +28,16 @@ export interface HeartbeatStopResult {
  */
 export interface HeartbeatStopError extends Error {
   /**
+   * The freshest lock ETag a renewal confirmed (the acquisition ETag if none did). Tracked apart from the RunState
+   * ETag: a tick can renew the lock and then fail the RunState write, and release must still use the renewed ETag.
+   * With `tickPending` it may already be stale; a conditional release then fails safely and the lease lapses via TTL.
+   */
+  readonly lockEtag: string
+  /**
    * True when the grace period elapsed while a tick was still in flight. That tick may yet renew the lock or
    * write the RunState, so neither ETag the caller holds can be trusted to be current.
    */
   readonly tickPending: boolean
-}
-
-function toStopError(error: Error, tickPending: boolean): HeartbeatStopError {
-  return Object.assign(new Error(error.message, {cause: error}), {tickPending})
 }
 
 export interface HeartbeatController {
@@ -52,7 +54,9 @@ export interface HeartbeatController {
    * ETags may be stale, so it must settle best-effort (a conditional write or release that loses the race fails
    * safely).
    *
-   * If a heartbeat tick failed since the last successful tick, returns the tick error.
+   * If a heartbeat tick failed since the last successful tick, returns the tick error. Every failure carries
+   * `lockEtag`, the freshest lock ETag a renewal confirmed, so a RunState write that failed after a successful
+   * renewal does not strand the caller on the acquisition ETag.
    * Otherwise returns the freshest snapshot fetched after in-flight ticks complete.
    */
   readonly stop: () => Promise<Result<HeartbeatStopResult, HeartbeatStopError>>
@@ -81,6 +85,9 @@ export function createHeartbeatController(
   let inFlight: Promise<void> | null = null
   let tickError: Error | null = null
   let currentLockEtag = lockEtag
+
+  const toStopError = (error: Error, tickPending: boolean): HeartbeatStopError =>
+    Object.assign(new Error(error.message, {cause: error}), {lockEtag: currentLockEtag, tickPending})
 
   const runKey = getRunKey(config, identity, repo, runId)
   if (runKey.success === false) {
