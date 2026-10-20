@@ -24,6 +24,10 @@ import {
 // reports `no-checkout`).
 // ---------------------------------------------------------------------------
 
+function executingEtags(): unknown[] {
+  return mockRuntime.transitionRun.mock.calls.filter((c: unknown[]) => c[4] === 'EXECUTING').map(c => c[5])
+}
+
 describe('checkout provenance', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -316,6 +320,214 @@ describe('checkout provenance', () => {
     expect(mockRuntime.releaseLock.mock.calls[0]?.[2]).toBe('lock-etag-after-heartbeat')
     expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
     expect(request._replySink._sends).toHaveLength(0)
+  })
+
+  describe('EXECUTING transition after a heartbeat tick advanced the run-state ETag', () => {
+    const RUN_ID = 'tick-race-run-id'
+
+    // The heartbeat starts right after ACK with the ACK ETag; every tick rewrites the RunState. Preparation
+    // (/update, ensureClone, /update) that outlasts one interval therefore reaches EXECUTING with a stale ETag.
+    function configStoring(phase: 'ACKNOWLEDGED' | 'EXECUTING' | 'COMPLETED' | 'FAILED', etag: string) {
+      return {
+        storeAdapter: {
+          upload: vi.fn(),
+          download: vi.fn(),
+          list: vi.fn(),
+          getObject: vi.fn(async () => ({
+            success: true as const,
+            data: {data: JSON.stringify(buildMockRunState({phase, run_id: RUN_ID})), etag},
+          })),
+        },
+        storeConfig: {enabled: true, bucket: 'test', region: 'us-east-1', prefix: 'state'},
+        lockTtlSeconds: 900,
+        heartbeatIntervalMs: 30_000,
+        staleThresholdMs: 60_000,
+        pendingStaleThresholdMs: 30 * 60_000,
+      } as unknown as CoordinationConfig
+    }
+
+    function arrange(options: {readonly executingResults: readonly ('stale' | 'ok')[]}) {
+      setupHappyPath()
+      const results = [...options.executingResults]
+      mockRuntime.transitionRun.mockImplementation(async (...args: unknown[]) => {
+        if (args[4] === 'ACKNOWLEDGED') {
+          return {
+            success: true as const,
+            data: {etag: 'ack-etag', state: buildMockRunState({phase: 'ACKNOWLEDGED', run_id: RUN_ID})},
+          }
+        }
+        if (args[4] === 'EXECUTING') {
+          const next = results.shift() ?? 'stale'
+          return next === 'ok'
+            ? {
+                success: true as const,
+                data: {etag: 'executing-etag', state: buildMockRunState({phase: 'EXECUTING', run_id: RUN_ID})},
+              }
+            : {success: false as const, error: new Error('412 precondition failed')}
+        }
+        return {
+          success: true as const,
+          data: {etag: 'terminal-etag', state: buildMockRunState({phase: args[4] as 'FAILED', run_id: RUN_ID})},
+        }
+      })
+      const request = makeInMemoryRequest()
+      ;(request as {runId?: string}).runId = RUN_ID
+      return request
+    }
+
+    it('re-reads ACKNOWLEDGED and retries EXECUTING once with the stored ETag, carrying the same provenance', async () => {
+      // #given the first EXECUTING write loses to a tick; the stored record is still ACKNOWLEDGED under a newer ETag
+      const {launchWork} = await import('./run.js')
+      const request = arrange({executingResults: ['stale', 'ok']})
+      const deps = makeDeps({coordinationConfig: configStoring('ACKNOWLEDGED', 'etag-after-tick')})
+
+      // #when
+      await awaitLaunchWorkRun(launchWork, request, deps)
+
+      // #then the run proceeds into the agent session instead of failing
+      expect(executingEtags()).toEqual(['ack-etag', 'etag-after-tick'])
+      expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+      const phases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4])
+      expect(phases).not.toContain('FAILED')
+      expect(phases).toContain('COMPLETED')
+
+      // #and the retry carries the same detailsPatch, so provenance is intact
+      const [first, retry] = mockRuntime.transitionRun.mock.calls.filter((c: unknown[]) => c[4] === 'EXECUTING')
+      expect(retry?.[7]?.detailsPatch?.checkoutProvenance).toBeDefined()
+      expect(retry?.[7]).toEqual(first?.[7])
+    })
+
+    it('with the real heartbeat: preparation longer than one interval still reaches EXECUTING and completes', async () => {
+      // #given the REAL heartbeat controller and transitionRun over an ETag-enforcing in-memory store, and a
+      // preparation (/update) that takes longer than one heartbeat interval, so a tick rewrites the RunState
+      vi.useFakeTimers()
+      try {
+        const {launchWork} = await import('./run.js')
+        const actual = await vi.importActual<typeof import('@fro-bot/runtime')>('@fro-bot/runtime')
+        setupHappyPath()
+        mockRuntime.transitionRun.mockImplementation(actual.transitionRun)
+        mockRuntime.createHeartbeatController.mockImplementation(actual.createHeartbeatController)
+        mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
+
+        const objects = {
+          run: {
+            data: JSON.stringify(buildMockRunState({phase: 'PENDING', run_id: RUN_ID})),
+            etag: 'run-etag-v1',
+          },
+          lock: {data: '{}', etag: 'lock-etag-v1'},
+        }
+        let version = 0
+        const slot = (key: string) => (key.includes('/locks/') ? objects.lock : objects.run)
+        const coordinationConfig = {
+          storeAdapter: {
+            upload: vi.fn(),
+            download: vi.fn(),
+            list: vi.fn(),
+            getObject: vi.fn(async (key: string) => ({success: true as const, data: {...slot(key)}})),
+            conditionalPut: vi.fn(async (key: string, data: string, options: {readonly ifMatch?: string}) => {
+              const target = slot(key)
+              if (options.ifMatch !== undefined && options.ifMatch !== target.etag) {
+                return {success: false as const, error: new Error('412 precondition failed')}
+              }
+              version += 1
+              target.data = data
+              target.etag = `etag-${version}`
+              return {success: true as const, data: {etag: target.etag}}
+            }),
+          },
+          storeConfig: {enabled: true, bucket: 'test', region: 'us-east-1', prefix: 'state'},
+          lockTtlSeconds: 900,
+          heartbeatIntervalMs: 30_000,
+          staleThresholdMs: 60_000,
+          pendingStaleThresholdMs: 30 * 60_000,
+        } as unknown as CoordinationConfig
+
+        const readyUpdate = makeUpdateFn('ready')
+        const slowUpdate = vi.fn(async (...args: unknown[]) => {
+          await new Promise<void>(resolve => setTimeout(resolve, 31_000))
+          return (readyUpdate as (...a: unknown[]) => Promise<unknown>)(...args)
+        })
+        const request = makeInMemoryRequest()
+        ;(request as {runId?: string}).runId = RUN_ID
+        const deps = makeDeps({coordinationConfig, update: slowUpdate as never})
+
+        // #when the run starts and the fake clock runs through the preparation
+        const progress = {finished: false}
+        const done = awaitLaunchWorkRun(launchWork, request, deps).then(() => {
+          progress.finished = true
+        })
+        for (let i = 0; i < 300 && progress.finished === false; i += 1) {
+          await vi.advanceTimersByTimeAsync(1_000)
+        }
+        await done
+
+        // #then EXECUTING first lost to the tick, then landed on retry, and the run completed with provenance intact
+        const executing = mockRuntime.transitionRun.mock.calls.filter((c: unknown[]) => c[4] === 'EXECUTING')
+        expect(executing).toHaveLength(2)
+        expect(executing[1]?.[5]).not.toBe(executing[0]?.[5])
+        expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+        const stored = JSON.parse(objects.run.data) as {phase: string; details: Record<string, unknown>}
+        expect(stored.phase).toBe('COMPLETED')
+        expect(stored.details.checkoutProvenance).toBeDefined()
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('exits cleanly without a retry when the stored run was cancelled', async () => {
+      // #given
+      const {launchWork} = await import('./run.js')
+      const request = arrange({executingResults: ['stale']})
+      const cancelled = configStoring('ACKNOWLEDGED', 'etag-after-cancel')
+      vi.mocked(
+        cancelled.storeAdapter.getObject as NonNullable<typeof cancelled.storeAdapter.getObject>,
+      ).mockResolvedValue({
+        success: true as const,
+        data: {
+          data: JSON.stringify(buildMockRunState({phase: 'CANCELLED', run_id: RUN_ID})),
+          etag: 'etag-after-cancel',
+        },
+      })
+
+      // #when
+      await awaitLaunchWorkRun(launchWork, request, makeDeps({coordinationConfig: cancelled}))
+
+      // #then
+      expect(executingEtags()).toEqual(['ack-etag'])
+      expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+      expect(mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4])).not.toContain('FAILED')
+    })
+
+    it.each(['EXECUTING', 'COMPLETED', 'FAILED'] as const)(
+      'still fails without a retry when the stored phase is %s',
+      async phase => {
+        // #given
+        const {launchWork} = await import('./run.js')
+        const request = arrange({executingResults: ['stale', 'ok']})
+        const deps = makeDeps({coordinationConfig: configStoring(phase, 'etag-stored')})
+
+        // #when
+        await awaitLaunchWorkRun(launchWork, request, deps)
+
+        // #then the failure is not masked: no retry, no agent session
+        expect(executingEtags()).toEqual(['ack-etag'])
+        expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+      },
+    )
+
+    it('fails after a single retry when the retry loses too', async () => {
+      // #given
+      const {launchWork} = await import('./run.js')
+      const request = arrange({executingResults: ['stale', 'stale', 'ok']})
+      const deps = makeDeps({coordinationConfig: configStoring('ACKNOWLEDGED', 'etag-after-tick')})
+
+      // #when
+      await awaitLaunchWorkRun(launchWork, request, deps)
+
+      // #then exactly one retry
+      expect(executingEtags()).toEqual(['ack-etag', 'etag-after-tick'])
+      expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    })
   })
 
   it('/update is called under the lock; ensureClone runs only after a no-checkout result, then /update is retried', async () => {

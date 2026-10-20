@@ -464,7 +464,8 @@ async function readCurrentRunPhase(
 /**
  * Re-read the run-state's current phase AND etag together.
  *
- * Used by the CANCELLED→FAILED fallback path: when the CANCELLED
+ * Used by the ACKNOWLEDGED→EXECUTING transition (one read tells a lost cancel race
+ * from a stale ETag) and by the CANCELLED→FAILED fallback path: when the CANCELLED
  * `transitionRun` call fails (commonly a 412 on a stale etag), the fallback
  * FAILED write must not reuse that same stale etag — it is guaranteed to
  * 412 again. This re-read gets a fresh etag for the fallback attempt, and
@@ -479,7 +480,7 @@ async function readCurrentRunStateWithEtag(
   deps: RunMentionDeps,
   repo: string,
   runId: string,
-): Promise<{readonly phase: RunState['phase']; readonly etag: string} | null> {
+): Promise<{readonly phase: RunState['phase']; readonly etag: string; readonly runId: string} | null> {
   const {coordinationConfig, identity, logger} = deps
   try {
     const keyResult = getRunKey(coordinationConfig, identity, repo, runId)
@@ -505,7 +506,7 @@ async function readCurrentRunStateWithEtag(
       logger.warn({repo, runId, err: parsed.error.message}, 'run: readCurrentRunStateWithEtag — parseRunState failed')
       return null
     }
-    return {phase: parsed.data.phase, etag: fetched.data.etag}
+    return {phase: parsed.data.phase, etag: fetched.data.etag, runId: parsed.data.run_id}
   } catch (error) {
     logger.warn(
       {repo, runId, err: error instanceof Error ? error.message : String(error)},
@@ -1255,7 +1256,8 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       // reusing the existing detailsPatch mechanism rather than a separate write. This
       // is what the run began from, not a claim about the whole run: later checkout
       // mutations by the agent are never reflected back onto this field.
-      const execResult = await transitionRun(
+      const executingOptions = {detailsPatch: {checkoutProvenance: provenance}}
+      let execResult = await transitionRun(
         coordinationConfig,
         identity,
         repo,
@@ -1263,15 +1265,15 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         'EXECUTING',
         runEtag,
         coordLogger,
-        {detailsPatch: {checkoutProvenance: provenance}},
+        executingOptions,
       )
       if (execResult.success === false) {
         // ── Graceful loser: cancel-wins-adoption race (ACKNOWLEDGED → EXECUTING) ──────
         // Same rendezvous as the ACK case above: an operator cancel may have committed
         // ACKNOWLEDGED → CANCELLED before this transition. Re-read before treating the
         // etag mismatch as a genuine failure.
-        const currentPhase = await readCurrentRunPhase(deps, repo, runId)
-        if (currentPhase === 'CANCELLED') {
+        const stored = await readCurrentRunStateWithEtag(deps, repo, runId)
+        if (stored?.phase === 'CANCELLED') {
           logger.info({repo, runId}, 'run: EXECUTING lost the adoption race to an operator cancel — exiting cleanly')
           // No provenance is persisted on this exit, deliberately. Provenance is saved
           // atomically with THIS transition (detailsPatch above), and it never landed —
@@ -1291,7 +1293,32 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           }
           return
         }
-        throw new Error(`transitionRun EXECUTING failed: ${execResult.error.message}`)
+
+        // ── Stale ETag: the heartbeat's own tick won the write ─────────────────────────
+        // The heartbeat starts right after ACK with the ACK etag, and every tick rewrites the run
+        // state under a new etag. Preparation that outlasts one interval therefore reaches this
+        // transition holding a stale etag even though nothing is wrong. The same read that ruled out
+        // a cancel shows the run is still this run's ACKNOWLEDGED record: retry once with its etag
+        // and the same detailsPatch. Any other stored phase is a genuine failure and is not retried.
+        if (stored !== null && stored.runId === runId && stored.phase === 'ACKNOWLEDGED') {
+          logger.info(
+            {repo, runId},
+            'run: EXECUTING lost to a heartbeat write during preparation — retrying once with the stored etag',
+          )
+          execResult = await transitionRun(
+            coordinationConfig,
+            identity,
+            repo,
+            runId,
+            'EXECUTING',
+            stored.etag,
+            coordLogger,
+            executingOptions,
+          )
+        }
+        if (execResult.success === false) {
+          throw new Error(`transitionRun EXECUTING failed: ${execResult.error.message}`)
+        }
       }
       runEtag = execResult.data.etag
 
