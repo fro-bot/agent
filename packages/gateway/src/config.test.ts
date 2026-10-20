@@ -747,6 +747,72 @@ describe('loadGatewayConfig — object-store settings', () => {
       expect(config.objectStore.region).toBe('us-east-1')
     })
 
+    it('does not read the AWS_REGION fallback when S3_REGION is set: a malformed AWS_REGION is ignored', () => {
+      // #given a valid S3_REGION and an AWS_REGION with an embedded line break
+      setRequiredEnv()
+      process.env.S3_REGION = 'us-east-1'
+      process.env.AWS_REGION = 'us-\neast-2'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then the unused fallback cannot abort startup
+      expect(config.objectStore.region).toBe('us-east-1')
+    })
+
+    it('does not read the AWS_REGION fallback when S3_REGION is set: a symlinked AWS_REGION_FILE is ignored', () => {
+      // #given a valid S3_REGION and an AWS_REGION_FILE that is a symlink
+      setRequiredEnv()
+      process.env.S3_REGION = 'us-east-1'
+      const target = writeValueFile('aws-region-target', 'eu-west-2')
+      const link = join(tmpDir, 'aws-region-link')
+      symlinkSync(target, link)
+      process.env.AWS_REGION_FILE = link
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.region).toBe('us-east-1')
+    })
+
+    it('still rejects a malformed AWS_REGION when S3_REGION is unset', () => {
+      // #given the fallback is needed and it has an embedded line break
+      setRequiredEnv()
+      delete process.env.S3_REGION
+      process.env.AWS_REGION = 'us-\neast-2'
+
+      // #when / #then
+      expect(() => loadGatewayConfig()).toThrow(/AWS_REGION contains embedded line-breaking/)
+    })
+
+    it('still rejects a symlinked AWS_REGION_FILE when S3_REGION is unset', () => {
+      // #given
+      setRequiredEnv()
+      delete process.env.S3_REGION
+      const target = writeValueFile('aws-region-target-2', 'eu-west-2')
+      const link = join(tmpDir, 'aws-region-link-2')
+      symlinkSync(target, link)
+      process.env.AWS_REGION_FILE = link
+
+      // #when / #then
+      expect(() => loadGatewayConfig()).toThrow(/symlink|not a regular file/i)
+    })
+
+    it('reads the AWS_REGION fallback when S3_REGION_FILE is blank and S3_REGION is unset', () => {
+      // #given a blank S3_REGION_FILE counts as unset, so the fallback is needed
+      setRequiredEnv()
+      delete process.env.S3_REGION
+      process.env.S3_REGION_FILE = writeValueFile('s3-region-blank-2', '\n')
+      process.env.AWS_REGION = 'eu-west-2'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.region).toBe('eu-west-2')
+    })
+
     it('trims a padded S3_REGION', () => {
       // #given a region with surrounding whitespace
       setRequiredEnv()

@@ -13,7 +13,7 @@
 
 import type {ObjectStoreAdapter} from '@fro-bot/runtime'
 
-import {mkdtempSync, rmSync, writeFileSync} from 'node:fs'
+import {mkdtempSync, rmSync, symlinkSync, writeFileSync} from 'node:fs'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 
@@ -488,6 +488,41 @@ describe('runDenyKeyBackfill', () => {
     // #then
     expect(exitCode).toBe(0)
     expect(lastStoreConfig().region).toBe('eu-west-2')
+  })
+
+  it('does not read AWS_REGION when S3_REGION is set: a malformed AWS_REGION and a symlinked AWS_REGION_FILE are ignored', async () => {
+    // #given a valid S3_REGION, an AWS_REGION with an embedded line break and an AWS_REGION_FILE symlink
+    const {ok} = await import('@fro-bot/runtime')
+    mockBackfill.mockResolvedValue(ok({total: 0, updated: 0, skipped: 0, failed: 0}))
+    process.env.S3_REGION = 'eu-west-2'
+    process.env.AWS_REGION = 'us-\neast-1'
+    const target = writeValueFile('aws-region-target', 'us-east-1')
+    const link = join(tmpDir, 'aws-region-link')
+    symlinkSync(target, link)
+    process.env.AWS_REGION_FILE = link
+
+    // #when
+    const {runDenyKeyBackfill} = await import('./backfill-runner.js')
+    const exitCode = await runDenyKeyBackfill({dryRun: false})
+
+    // #then the unused fallback cannot abort the run
+    expect(exitCode).toBe(0)
+    expect(lastStoreConfig().region).toBe('eu-west-2')
+  })
+
+  it('still rejects a malformed AWS_REGION when S3_REGION is unset → exits 1', async () => {
+    // #given the fallback is needed and has an embedded line break
+    process.env.AWS_REGION = 'us-\neast-1'
+    const {error, logger} = makeSpyLogger()
+
+    // #when
+    const {runDenyKeyBackfill} = await import('./backfill-runner.js')
+    const exitCode = await runDenyKeyBackfill({dryRun: false, logger})
+
+    // #then
+    expect(exitCode).toBe(1)
+    const [, context] = error.mock.calls[0] as [string, {error: string}]
+    expect(context.error).toContain('AWS_REGION')
   })
 
   it('keeps S3_ENDPOINT from env when S3_ENDPOINT_FILE is empty', async () => {

@@ -29,6 +29,18 @@ function fromEnv(name: string): SettingSource {
 }
 
 /**
+ * The region candidates in order. `AWS_REGION` (and `AWS_REGION_FILE`) is read only when `S3_REGION` is unset or
+ * blank, so an unused fallback that is malformed or unreadable cannot abort startup. An unread fallback is still
+ * listed (with no value) so the "required" message names both candidates.
+ */
+function readRegionCandidates(): readonly [SettingSource, ...SettingSource[]] {
+  const primary = fromEnv('S3_REGION')
+  const primaryIsSet = primary.value !== null && primary.value.trim() !== ''
+
+  return [primary, primaryIsSet ? {value: null, source: 'AWS_REGION'} : fromEnv('AWS_REGION')]
+}
+
+/**
  * Read the object-store settings from env and `_FILE` values and parse them with the shared runtime parser.
  *
  * One mapping for every gateway path (server and backfill). Credentials are not part of the result; each caller adds
@@ -47,7 +59,7 @@ export function loadObjectStoreSettings(): ObjectStoreConfig {
     {
       enabled: true,
       bucket: {value: bucket, source: 'S3_BUCKET'},
-      region: [fromEnv('S3_REGION'), fromEnv('AWS_REGION')],
+      region: readRegionCandidates(),
       endpoint: fromEnv('S3_ENDPOINT'),
       allowInsecureEndpoint: readSetting('S3_ALLOW_INSECURE_ENDPOINT') === 'true',
       prefix: fromEnv('S3_PREFIX'),
