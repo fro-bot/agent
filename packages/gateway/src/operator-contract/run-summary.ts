@@ -21,6 +21,8 @@ import type {RunState} from '@fro-bot/runtime'
 import type {OperatorProviderFailureReason} from './provider-failure-reason.js'
 import type {OperatorFailureKind} from './run-status.js'
 
+import {parseEntityRefRepo} from '@fro-bot/runtime'
+
 import {OPERATOR_PROMPT_DETAILS_KEY, projectOperatorLaunchPrompt} from './launch-prompt.js'
 import {projectProviderFailureReason, PROVIDER_FAILURE_REASON_DETAILS_KEY} from './provider-failure-reason.js'
 import {PHASE_TO_WEB_STATUS, toOperatorFailureKind} from './run-status.js'
@@ -74,24 +76,8 @@ export interface RunSummary {
  * Returns null when the entity_ref does not contain a slash (malformed or empty).
  * Strips the '#fragment' before splitting so the repo segment is clean.
  */
-function extractEntityRefRepo(entityRef: string): {owner: string; repo: string} | null {
-  // Strip the '#fragment' (run number) first
-  const hashIdx = entityRef.indexOf('#')
-  const repoPath = hashIdx === -1 ? entityRef : entityRef.slice(0, hashIdx)
-
-  const slashIdx = repoPath.indexOf('/')
-  if (slashIdx === -1) {
-    return null
-  }
-
-  const owner = repoPath.slice(0, slashIdx)
-  const repo = repoPath.slice(slashIdx + 1)
-
-  if (owner.length === 0 || repo.length === 0) {
-    return null
-  }
-
-  return {owner, repo}
+function extractEntityRefRepo(entityRef: string): {readonly owner: string; readonly repo: string} | null {
+  return parseEntityRefRepo(entityRef)
 }
 
 /**

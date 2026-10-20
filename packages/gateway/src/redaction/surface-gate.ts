@@ -40,6 +40,9 @@
 import type {RunState} from '@fro-bot/runtime'
 import type {OperatorRunStatus, RunStatusRepoKey} from '../operator-contract/index.js'
 import type {RepoKey} from './denylist.js'
+
+import {parseEntityRefRepo} from '@fro-bot/runtime'
+
 import {toOperatorRunStatus} from '../operator-contract/index.js'
 
 // ---------------------------------------------------------------------------
@@ -139,22 +142,9 @@ export async function lookupBindingDenyKeys<B extends BindingDenyKeySource>(
  * Returns null if the entity_ref does not match the expected format.
  * Internal — not exported; callers use resolveRunRepoKey.
  */
-function parseEntityRef(entityRef: string): {owner: string; repo: string} | null {
+function parseEntityRef(entityRef: string): {readonly owner: string; readonly repo: string} | null {
   // entity_ref format: 'owner/repo#runNumber'
-  const hashIdx = entityRef.indexOf('#')
-  const repoPath = hashIdx === -1 ? entityRef : entityRef.slice(0, hashIdx)
-  const slashIdx = repoPath.indexOf('/')
-  if (slashIdx === -1) {
-    return null
-  }
-
-  const owner = repoPath.slice(0, slashIdx)
-  const repo = repoPath.slice(slashIdx + 1)
-  if (owner.length === 0 || repo.length === 0) {
-    return null
-  }
-
-  return {owner, repo}
+  return parseEntityRefRepo(entityRef)
 }
 
 async function lookupRunDenyKeys(runState: RunState, bindingsLookup: BindingsLookup): Promise<DenyKeyLookup> {
