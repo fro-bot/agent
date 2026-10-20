@@ -7,6 +7,12 @@ import {requireConditionalPut, requireGetObject, resolveGetObject} from './adapt
 import {renewLease} from './lock.js'
 import {parseRunState, RUN_STATE_TAG} from './run-state.js'
 
+/**
+ * How long `stop()` waits for an in-flight tick before giving up. Mirrors the Action's lock-renewal
+ * `STOP_GRACE_PERIOD_MS` (`src/harness/phases/acquire-lock.ts`).
+ */
+export const HEARTBEAT_STOP_GRACE_MS = 5_000
+
 export interface HeartbeatStopResult {
   /** Current ETag of the run-state object after the final heartbeat tick. */
   readonly runEtag: string
@@ -14,6 +20,22 @@ export interface HeartbeatStopResult {
   readonly runState: RunState
   /** Current ETag of the lock record after the most recent lease renewal. */
   readonly lockEtag: string
+}
+
+/**
+ * The failure side of `stop()`. Still an `Error` (so `.message` consumers keep working), plus the facts a caller
+ * needs to settle conservatively.
+ */
+export interface HeartbeatStopError extends Error {
+  /**
+   * True when the grace period elapsed while a tick was still in flight. That tick may yet renew the lock or
+   * write the RunState, so neither ETag the caller holds can be trusted to be current.
+   */
+  readonly tickPending: boolean
+}
+
+function toStopError(error: Error, tickPending: boolean): HeartbeatStopError {
+  return Object.assign(new Error(error.message, {cause: error}), {tickPending})
 }
 
 export interface HeartbeatController {
@@ -25,10 +47,15 @@ export interface HeartbeatController {
    * owns the run lifecycle and uses the returned `runEtag` to transition the run to
    * `COMPLETED`, `FAILED`, or `CANCELLED` after handling any post-shutdown work.
    *
+   * Waits at most `HEARTBEAT_STOP_GRACE_MS` for an in-flight tick. If it is still pending then, returns a
+   * `tickPending` error without reading a snapshot: the tick keeps running in the background and the caller's
+   * ETags may be stale, so it must settle best-effort (a conditional write or release that loses the race fails
+   * safely).
+   *
    * If a heartbeat tick failed since the last successful tick, returns the tick error.
    * Otherwise returns the freshest snapshot fetched after in-flight ticks complete.
    */
-  readonly stop: () => Promise<Result<HeartbeatStopResult, Error>>
+  readonly stop: () => Promise<Result<HeartbeatStopResult, HeartbeatStopError>>
   readonly isRunning: boolean
 }
 
@@ -123,6 +150,19 @@ export function createHeartbeatController(
       })
   }
 
+  /** Resolves `true` when `pending` settled, `false` when the grace period elapsed first. `pending` never rejects. */
+  const settledWithinGrace = async (pending: Promise<void>): Promise<boolean> => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const elapsed = new Promise<false>(resolve => {
+      timer = setTimeout(() => resolve(false), HEARTBEAT_STOP_GRACE_MS)
+    })
+    try {
+      return await Promise.race([pending.then((): true => true), elapsed])
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
   return {
     start: () => {
       if (running === true) {
@@ -133,7 +173,7 @@ export function createHeartbeatController(
       running = true
       intervalHandle = setInterval(runTick, config.heartbeatIntervalMs)
     },
-    stop: async (): Promise<Result<HeartbeatStopResult, Error>> => {
+    stop: async (): Promise<Result<HeartbeatStopResult, HeartbeatStopError>> => {
       logger.debug('Stopping heartbeat controller', {repo, runId})
       running = false
       if (intervalHandle != null) {
@@ -141,25 +181,31 @@ export function createHeartbeatController(
         intervalHandle = null
       }
 
-      await inFlight
+      const pending = inFlight
+      if (pending != null && (await settledWithinGrace(pending)) === false) {
+        logger.debug('Heartbeat tick still in flight after the stop grace period', {repo, runId})
+        return err(
+          toStopError(new Error(`Heartbeat tick did not settle within ${HEARTBEAT_STOP_GRACE_MS}ms of stop`), true),
+        )
+      }
 
       if (tickError != null) {
-        return err(tickError)
+        return err(toStopError(tickError, false))
       }
 
       const getObject = resolveGetObject(config)
       if (getObject.success === false) {
-        return err(getObject.error)
+        return err(toStopError(getObject.error, false))
       }
 
       const current = await getObject.data(runKey.data)
       if (current.success === false) {
-        return err(current.error)
+        return err(toStopError(current.error, false))
       }
 
       const parsedCurrent = parseRunState(current.data.data)
       if (parsedCurrent.success === false) {
-        return err(parsedCurrent.error)
+        return err(toStopError(parsedCurrent.error, false))
       }
 
       return ok({

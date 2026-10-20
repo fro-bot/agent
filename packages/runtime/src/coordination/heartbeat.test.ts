@@ -5,7 +5,7 @@ import type {CoordinationConfig, RunState} from './types.js'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {err, ok} from '../shared/types.js'
-import {createHeartbeatController} from './heartbeat.js'
+import {createHeartbeatController, HEARTBEAT_STOP_GRACE_MS} from './heartbeat.js'
 
 const {renewLeaseMock} = vi.hoisted(() => ({
   renewLeaseMock: vi.fn(),
@@ -423,6 +423,70 @@ describe('heartbeat controller', () => {
     // Only the first tick made a write; the overlapping second tick was skipped, and stop()
     // performs no terminal write — exactly one conditionalPut call.
     expect(conditionalPut).toHaveBeenCalledTimes(1)
+  })
+
+  it('bounds stop() when an in-flight tick never settles and flags the outcome as uncertain', async () => {
+    // #given a tick whose lock renewal never resolves
+    renewLeaseMock.mockReset()
+    renewLeaseMock.mockReturnValue(new Promise(() => {}))
+    const controller = createHeartbeatController(
+      createCoordinationConfig(createStoreAdapter()),
+      'coordination',
+      'owner/repo',
+      'run-1',
+      'lock-etag-1',
+      createLogger(),
+    )
+    controller.start()
+    await vi.advanceTimersByTimeAsync(30_000)
+
+    // #when stop() is called and the grace period elapses
+    let settled = false
+    const stopPromise = controller.stop().then(result => {
+      settled = true
+      return result
+    })
+    await vi.advanceTimersByTimeAsync(HEARTBEAT_STOP_GRACE_MS - 1)
+    const settledBeforeDeadline = settled
+    await vi.advanceTimersByTimeAsync(1)
+
+    // #then stop() waited the full grace, then resolved with an explicit uncertain failure
+    expect(settledBeforeDeadline).toBe(false)
+    expect(settled).toBe(true)
+    const result = await stopPromise
+    expect(result.success).toBe(false)
+    if (result.success === true) throw new Error('expected a failure')
+    expect(result.error.tickPending).toBe(true)
+    expect(controller.isRunning).toBe(false)
+  })
+
+  it('does not report the stop as uncertain when the tick settles within the grace period', async () => {
+    // #given a tick that settles slowly but inside the grace period
+    const conditionalPut = vi.fn<Required<ObjectStoreAdapter>['conditionalPut']>(
+      async () =>
+        new Promise(resolve => {
+          setTimeout(() => resolve(ok({etag: 'etag-heartbeat'})), 2_000)
+        }),
+    )
+    const controller = createHeartbeatController(
+      createCoordinationConfig(createStoreAdapter({conditionalPut})),
+      'coordination',
+      'owner/repo',
+      'run-1',
+      'lock-etag-1',
+      createLogger(),
+    )
+    controller.start()
+    await vi.advanceTimersByTimeAsync(30_000)
+
+    // #when
+    const stopPromise = controller.stop()
+    await vi.advanceTimersByTimeAsync(2_000)
+    const result = await stopPromise
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(result.success === true ? result.data.lockEtag : null).toBe('lock-etag-next')
   })
 
   it('returns an error when stop fails to fetch the authoritative snapshot', async () => {

@@ -419,5 +419,65 @@ describe('termination barrier — quarantine (Unit 8)', () => {
       const releaseFn = sharedConcurrency.release as ReturnType<typeof vi.fn>
       expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
     })
+
+    it('still releases the slot, and never deletes the lock, when heartbeat.stop reports a tick that never settled', async () => {
+      // #given — the quarantine window elapses while a heartbeat tick is hung: stop() gives up after its
+      // grace period and returns a `tickPending` failure instead of an authoritative snapshot.
+      vi.useFakeTimers()
+      const {runMention, QUARANTINE_HOLD_WINDOW_MS} = await import('./run.js')
+      const {RunCoreError} = runCoreModule
+      const executingState = buildMockRunState({phase: 'EXECUTING'})
+      const getObjectMock = vi.fn().mockResolvedValue({
+        success: true as const,
+        data: {data: JSON.stringify(executingState), etag: 'fresh-etag'},
+      })
+      const coordinationConfig = {
+        storeAdapter: {upload: vi.fn(), download: vi.fn(), list: vi.fn(), getObject: getObjectMock},
+        storeConfig: {enabled: true, bucket: 'test', region: 'us-east-1', prefix: 'state'},
+        lockTtlSeconds: 900,
+        heartbeatIntervalMs: 30_000,
+        staleThresholdMs: 60_000,
+        pendingStaleThresholdMs: 30 * 60_000,
+      } as unknown as CoordinationConfig
+
+      mockRuntime.acquireLock.mockResolvedValue({
+        success: true as const,
+        data: {acquired: true as const, outcome: 'acquired' as const, etag: 'lock-etag-v1', holder: null},
+      })
+      mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
+      mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
+      mockRuntime.transitionRun.mockImplementation(async (..._args: unknown[]) => {
+        const phase = _args[4] as string
+        if (phase === 'FAILED') {
+          return {success: true as const, data: {etag: 'failed-etag', state: executingState}}
+        }
+        return {success: true as const, data: {etag: 'admit-etag', state: executingState}}
+      })
+      const stopFn = vi.fn().mockResolvedValue({
+        success: false,
+        error: Object.assign(new Error('Heartbeat tick did not settle within 5000ms of stop'), {tickPending: true}),
+      })
+      mockRuntime.createHeartbeatController.mockReturnValue({start: vi.fn(), stop: stopFn, isRunning: false})
+      vi.mocked(attachModule.attachOpencode).mockReturnValue({
+        server: {url: 'http://workspace:9200'},
+        session: {create: vi.fn(), prompt: vi.fn()},
+      } as unknown as ReturnType<typeof attachModule.attachOpencode>)
+      vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
+      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('session-error', 'quota exceeded', true))
+
+      const sharedConcurrency = makeDefaultConcurrency()
+      const queue = makeDefaultQueue()
+      const deps = makeDeps({coordinationConfig, concurrency: sharedConcurrency, queue})
+
+      // #when
+      await expect(runMention(makeMessage(), makeBinding(), deps)).resolves.toBeUndefined()
+      await vi.advanceTimersByTimeAsync(QUARANTINE_HOLD_WINDOW_MS + 1_000)
+
+      // #then — the slot release is not gated on a clean stop, and the lock is left to expire
+      expect(stopFn).toHaveBeenCalledOnce()
+      const releaseFn = sharedConcurrency.release as ReturnType<typeof vi.fn>
+      expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
+      expect(mockRuntime.releaseLock).not.toHaveBeenCalled()
+    })
   })
 })
