@@ -1257,6 +1257,28 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       // is what the run began from, not a claim about the whole run: later checkout
       // mutations by the agent are never reflected back onto this field.
       const executingOptions = {detailsPatch: {checkoutProvenance: provenance}}
+
+      // The clean exit for an EXECUTING write that lost to an operator cancel: the caller returns after it.
+      // No provenance is persisted on this exit, deliberately. Provenance is saved
+      // atomically with THIS transition (detailsPatch above), and it never landed —
+      // the operator's cancel committed first, so the agent never started. Provenance
+      // records what a run STARTED FROM; a run that never started has no starting
+      // state, and writing one anyway would record a start that didn't happen.
+      // Registration happens only after EXECUTING succeeds (below), so there is no
+      // abort-registry entry to delete here — the outer finally's unconditional
+      // delete() is still a safe no-op for this runId.
+      async function exitAfterLostCancelRace(): Promise<void> {
+        logger.info({repo, runId}, 'run: EXECUTING lost the adoption race to an operator cancel — exiting cleanly')
+        if (heartbeatStopped === false) {
+          // Best-effort, but keep the freshest confirmed lock ETag: the outer finally releases with it.
+          const stopped = await heartbeat.stop().catch(() => null)
+          heartbeatStopped = true
+          if (stopped !== null) {
+            lockEtag = stopped.success === true ? stopped.data.lockEtag : stopped.error.lockEtag
+          }
+        }
+      }
+
       let execResult = await transitionRun(
         coordinationConfig,
         identity,
@@ -1274,23 +1296,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         // etag mismatch as a genuine failure.
         const stored = await readCurrentRunStateWithEtag(deps, repo, runId)
         if (stored?.phase === 'CANCELLED') {
-          logger.info({repo, runId}, 'run: EXECUTING lost the adoption race to an operator cancel — exiting cleanly')
-          // No provenance is persisted on this exit, deliberately. Provenance is saved
-          // atomically with THIS transition (detailsPatch above), and it never landed —
-          // the operator's cancel committed first, so the agent never started. Provenance
-          // records what a run STARTED FROM; a run that never started has no starting
-          // state, and writing one anyway would record a start that didn't happen.
-          // Registration happens only after EXECUTING succeeds (below), so there is no
-          // abort-registry entry to delete here — the outer finally's unconditional
-          // delete() is still a safe no-op for this runId.
-          if (heartbeatStopped === false) {
-            // Best-effort, but keep the freshest confirmed lock ETag: the outer finally releases with it.
-            const stopped = await heartbeat.stop().catch(() => null)
-            heartbeatStopped = true
-            if (stopped !== null) {
-              lockEtag = stopped.success === true ? stopped.data.lockEtag : stopped.error.lockEtag
-            }
-          }
+          await exitAfterLostCancelRace()
           return
         }
 
@@ -1315,6 +1321,16 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
             coordLogger,
             executingOptions,
           )
+
+          // An operator cancel can commit between the read above and this write. That is the same lost
+          // race as the first check, not a failure: read once more (no third write) before giving up.
+          if (execResult.success === false) {
+            const afterRetry = await readCurrentRunStateWithEtag(deps, repo, runId)
+            if (afterRetry?.phase === 'CANCELLED') {
+              await exitAfterLostCancelRace()
+              return
+            }
+          }
         }
         if (execResult.success === false) {
           throw new Error(`transitionRun EXECUTING failed: ${execResult.error.message}`)

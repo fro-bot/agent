@@ -346,6 +346,22 @@ describe('checkout provenance', () => {
       } as unknown as CoordinationConfig
     }
 
+    // Successive reads of the run record: the last entry repeats once the list is exhausted.
+    function configReading(reads: readonly {readonly phase: 'ACKNOWLEDGED' | 'CANCELLED'; readonly etag: string}[]) {
+      const config = configStoring('ACKNOWLEDGED', 'unused')
+      const getObject = vi.mocked(config.storeAdapter.getObject as NonNullable<typeof config.storeAdapter.getObject>)
+      let index = 0
+      getObject.mockImplementation(async () => {
+        const read = reads[Math.min(index, reads.length - 1)]
+        index += 1
+        return {
+          success: true as const,
+          data: {data: JSON.stringify(buildMockRunState({phase: read?.phase, run_id: RUN_ID})), etag: read?.etag ?? ''},
+        }
+      })
+      return {config, getObject}
+    }
+
     function arrange(options: {readonly executingResults: readonly ('stale' | 'ok')[]}) {
       setupHappyPath()
       const results = [...options.executingResults]
@@ -527,6 +543,55 @@ describe('checkout provenance', () => {
       // #then exactly one retry
       expect(executingEtags()).toEqual(['ack-etag', 'etag-after-tick'])
       expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    })
+
+    it('exits cleanly when an operator cancel commits between the re-read and the retry', async () => {
+      // #given the first read shows ACKNOWLEDGED, then the cancel lands, so the retry 412s and a second read shows CANCELLED
+      const {launchWork} = await import('./run.js')
+      const request = arrange({executingResults: ['stale', 'stale']})
+      const {config, getObject} = configReading([
+        {phase: 'ACKNOWLEDGED', etag: 'etag-after-tick'},
+        {phase: 'CANCELLED', etag: 'etag-after-cancel'},
+      ])
+
+      // #when
+      await awaitLaunchWorkRun(launchWork, request, makeDeps({coordinationConfig: config}))
+
+      // #then one retry, two reads, no third write, and no agent session
+      expect(executingEtags()).toEqual(['ack-etag', 'etag-after-tick'])
+      expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+
+      // #and the cancelled run is not reported as a failure anywhere
+      expect(mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4])).not.toContain('FAILED')
+      expect(request._statusSink._reactions).not.toContain('failed')
+      expect(request._statusSink._resolvedFailures).toEqual([])
+      expect(request._replySink._sends).toHaveLength(0)
+
+      // #and the lock is released
+      expect(mockRuntime.releaseLock).toHaveBeenCalledOnce()
+      expect(getObject).toHaveBeenCalledTimes(2)
+    })
+
+    it('still fails, releasing the lock, when a tick lands between the re-read and the retry', async () => {
+      // #given both reads show ACKNOWLEDGED (a tick moved the ETag again), so the retry 412s
+      const {launchWork} = await import('./run.js')
+      const request = arrange({executingResults: ['stale', 'stale', 'ok']})
+      const {config, getObject} = configReading([
+        {phase: 'ACKNOWLEDGED', etag: 'etag-after-tick'},
+        {phase: 'ACKNOWLEDGED', etag: 'etag-after-second-tick'},
+      ])
+
+      // #when
+      await awaitLaunchWorkRun(launchWork, request, makeDeps({coordinationConfig: config}))
+
+      // #then one retry only: no third EXECUTING write, and the agent never starts
+      expect(executingEtags()).toEqual(['ack-etag', 'etag-after-tick'])
+      expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+
+      // #and the run fails as it did before, and the lock is released
+      expect(mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4])).toContain('FAILED')
+      expect(mockRuntime.releaseLock).toHaveBeenCalledOnce()
+      expect(getObject).toHaveBeenCalledTimes(2)
     })
   })
 
