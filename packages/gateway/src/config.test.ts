@@ -96,6 +96,7 @@ beforeEach(() => {
     'GATEWAY_OPERATOR_OAUTH_STATE_TTL_MS',
     'GATEWAY_OPERATOR_OAUTH_MAX_OUTSTANDING_ATTEMPTS',
     'GATEWAY_OPERATOR_GITHUB_CLIENT_ID_FILE',
+    'GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET_FILE',
     'GATEWAY_OPERATOR_CSRF_SECRET',
     'GATEWAY_OPERATOR_CSRF_SECRET_FILE',
     'GATEWAY_OPERATOR_ALLOWLIST',
@@ -203,18 +204,15 @@ describe('readSecret', () => {
   it.each([
     ['an empty', ''],
     ['a whitespace-only', '  \n  \n'],
-  ])('falls through to the env var when TOKEN_FILE points to %s file', (_label, contents) => {
-    // #given an empty bind-mounted file and a real value in the env var
+  ])('reports the secret as missing when TOKEN_FILE points to %s file, even if TOKEN is set', (_label, contents) => {
+    // #given a blank bind-mounted file and a stale value in the env var
     const secretFile = join(tmpDir, 'token-empty-file.txt')
     writeFileSync(secretFile, contents)
     process.env.TOKEN_FILE = secretFile
-    process.env.TOKEN = 'from-env'
+    process.env.TOKEN = 'stale-env-value'
 
-    // #when
-    const result = readSecret('TOKEN')
-
-    // #then the empty file counts as unset, so the env var is used and the secret is not reported missing
-    expect(result).toBe('from-env')
+    // #when / #then the blank file is an explicit opt-out: env is not consulted
+    expect(() => readSecret('TOKEN')).toThrow('Missing required secret: TOKEN')
   })
 
   it('reports the secret as missing when TOKEN_FILE is empty and TOKEN is unset', () => {
@@ -256,7 +254,7 @@ describe('readOptionalSecret', () => {
     expect(result).toBe('optional-value')
   })
 
-  it('returns null when MISSING_FILE points to an empty file and the env var is unset', () => {
+  it('returns null when MISSING_FILE points to an empty file', () => {
     // #given an empty file — e.g. `touch deploy/secrets/discord-guild-id` for global registration
     const secretFile = join(tmpDir, 'empty.txt')
     writeFileSync(secretFile, '')
@@ -269,7 +267,7 @@ describe('readOptionalSecret', () => {
     expect(result).toBeNull()
   })
 
-  it('returns null when MISSING_FILE points to a whitespace-only file and the env var is unset', () => {
+  it('returns null when MISSING_FILE points to a whitespace-only file', () => {
     // #given a file containing only whitespace/newlines
     const secretFile = join(tmpDir, 'whitespace.txt')
     writeFileSync(secretFile, '  \n  \n')
@@ -285,18 +283,18 @@ describe('readOptionalSecret', () => {
   it.each([
     ['an empty', ''],
     ['a whitespace-only', '  \n  \n'],
-  ])('falls through to the env var when MISSING_FILE points to %s file', (_label, contents) => {
-    // #given an empty bind-mounted file and a real value in the env var
+  ])('returns null when MISSING_FILE points to %s file, even if MISSING is set', (_label, contents) => {
+    // #given a blank bind-mounted file and a stale value in the env var
     const secretFile = join(tmpDir, 'empty-with-env.txt')
     writeFileSync(secretFile, contents)
     process.env.MISSING_FILE = secretFile
-    process.env.MISSING = 'from-env'
+    process.env.MISSING = 'stale-env-value'
 
     // #when
     const result = readOptionalSecret('MISSING')
 
-    // #then the empty file counts as unset, so the env var is not shadowed
-    expect(result).toBe('from-env')
+    // #then the blank file is an explicit opt-out: env is not consulted
+    expect(result).toBeNull()
   })
 
   it('prefers a non-empty file over the env var', () => {
@@ -732,7 +730,7 @@ describe('loadGatewayConfig — object-store settings', () => {
       delete process.env.S3_REGION
 
       // #when / #then
-      expect(() => loadGatewayConfig()).toThrow(new Error('S3_REGION or AWS_REGION is required'))
+      expect(() => loadGatewayConfig()).toThrow(/^S3_REGION or AWS_REGION is required$/)
     })
 
     it('uses S3_REGION from env when S3_REGION_FILE is empty, not the AWS_REGION fallback', () => {
@@ -759,6 +757,83 @@ describe('loadGatewayConfig — object-store settings', () => {
 
       // #then
       expect(config.objectStore.region).toBe('us-east-1')
+    })
+  })
+
+  describe('blank _FILE defers to env (object-store settings only)', () => {
+    it('uses S3_BUCKET from env when S3_BUCKET_FILE is empty', () => {
+      // #given an empty bind-mounted S3_BUCKET_FILE and a bucket in env
+      setRequiredEnv()
+      process.env.S3_BUCKET_FILE = writeValueFile('s3-bucket-empty', '')
+      process.env.S3_BUCKET = 'env-bucket'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then the blank file does not hide the bucket
+      expect(config.objectStore.bucket).toBe('env-bucket')
+    })
+
+    it('reports the bucket as missing when S3_BUCKET_FILE is empty and S3_BUCKET is unset', () => {
+      // #given
+      setRequiredEnv()
+      delete process.env.S3_BUCKET
+      process.env.S3_BUCKET_FILE = writeValueFile('s3-bucket-empty-only', '  \n')
+
+      // #when / #then the missing-value text is unchanged
+      expect(() => loadGatewayConfig()).toThrow(
+        'Missing required secret: S3_BUCKET (set S3_BUCKET env var or S3_BUCKET_FILE pointing to a file)',
+      )
+    })
+
+    it('prefers a non-blank S3_BUCKET_FILE over the S3_BUCKET env var', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_BUCKET_FILE = writeValueFile('s3-bucket-file', 'file-bucket\n')
+      process.env.S3_BUCKET = 'env-bucket'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.bucket).toBe('file-bucket')
+    })
+
+    it('uses the env var when the S3_ENDPOINT_FILE path does not exist', () => {
+      // #given a missing file path, as readOptionalSecret treats it
+      setRequiredEnv()
+      process.env.S3_ENDPOINT_FILE = join(tmpDir, 'does-not-exist')
+      process.env.S3_ENDPOINT = 'https://my-minio.example.com'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.endpoint).toBe('https://my-minio.example.com')
+    })
+
+    it('uses the default prefix when S3_PREFIX is whitespace-only', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_PREFIX = '   '
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.prefix).toBe('fro-bot-state')
+    })
+
+    it('still rejects a symlinked S3_ENDPOINT_FILE', () => {
+      // #given a symlink where a secret file is expected
+      setRequiredEnv()
+      const target = writeValueFile('real-endpoint', 'https://my-minio.example.com')
+      const link = join(tmpDir, 'endpoint-link')
+      symlinkSync(target, link)
+      process.env.S3_ENDPOINT_FILE = link
+
+      // #when / #then symlink handling is the same as for every other secret
+      expect(() => loadGatewayConfig()).toThrow(/symlink|not a regular file/i)
     })
   })
 
@@ -3038,11 +3113,9 @@ describe('loadGatewayConfig — CSRF secret and operator allowlist', () => {
   })
 
   it('error path: GATEWAY_OPERATOR_ALLOWLIST file is empty → throws (fail closed)', () => {
-    // #given — allowlist file exists but is empty, and the env var is unset (an empty file counts as unset, so a
-    // value in env would be used instead)
+    // #given — allowlist file exists but is empty
     setRequiredEnv()
     setOperatorWebEnv()
-    delete process.env.GATEWAY_OPERATOR_ALLOWLIST
     process.env.GATEWAY_OPERATOR_CSRF_SECRET = 'dGVzdC1jc3JmLXNlY3JldC0zMi1ieXRlcy1sb25nISE'
     const allowlistFile = join(tmpDir, 'allowlist-empty.txt')
     writeFileSync(allowlistFile, '', {mode: 0o600})
@@ -3680,5 +3753,97 @@ describe('operatorPush config', () => {
 
     // #when / #then
     expect(OPERATOR_CONTRACT_VERSION).toBe('1.13.0')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Blank `_FILE` is an explicit opt-out for security-relevant secrets: a stale env var of the same name must never
+// bring the value back. Only the object-store settings defer to env (see the object-store block above).
+// ---------------------------------------------------------------------------
+
+describe('loadGatewayConfig — blank _FILE never falls through to env for security secrets', () => {
+  it('gATEWAY_OPERATOR_ALLOWLIST: blank file + env set → startup throws (fail closed)', () => {
+    // #given the operator surface is enabled, the allowlist file is blank and a stale env allowlist is set
+    setRequiredEnv()
+    setOperatorWebEnv()
+    process.env.GATEWAY_OPERATOR_ALLOWLIST = '42\n99'
+    process.env.GATEWAY_OPERATOR_ALLOWLIST_FILE = writeValueFile('operator-allowlist-blank', '\n')
+
+    // #when / #then the stale env value does not come back
+    expect(() => loadGatewayConfig()).toThrow(/allowlist/i)
+  })
+
+  it('gATEWAY_BINDER_ALLOWLIST: blank file + env set → the allowlist is empty (refuses everyone)', () => {
+    // #given a blank binder allowlist file and a stale env allowlist
+    setRequiredEnv()
+    process.env.GATEWAY_BINDER_ALLOWLIST = '123456789012345678'
+    process.env.GATEWAY_BINDER_ALLOWLIST_FILE = writeValueFile('binder-allowlist-blank', '')
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then the stale env entry is not granted binder rights
+    expect(config.binderAllowlist.size).toBe(0)
+  })
+
+  it('gATEWAY_WEBHOOK_SECRET: blank file + env set → the secret is treated as absent', () => {
+    // #given a blank webhook secret file, a stale env secret, and a presence channel (both-or-neither rule)
+    setRequiredEnv()
+    process.env.GATEWAY_WEBHOOK_SECRET = 'stale-webhook-secret'
+    process.env.GATEWAY_WEBHOOK_SECRET_FILE = writeValueFile('webhook-secret-blank', '')
+
+    // #when / #then the endpoint is not half-enabled with the stale secret
+    expect(() => loadGatewayConfig()).toThrow('Both GATEWAY_WEBHOOK_SECRET and GATEWAY_PRESENCE_CHANNEL_ID')
+  })
+
+  it('gATEWAY_WEBHOOK_SECRET: blank file + env set, no presence channel → announce stays disabled', () => {
+    // #given
+    setRequiredEnv()
+    delete process.env.GATEWAY_PRESENCE_CHANNEL_ID
+    process.env.GATEWAY_WEBHOOK_SECRET = 'stale-webhook-secret'
+    process.env.GATEWAY_WEBHOOK_SECRET_FILE = writeValueFile('webhook-secret-blank-2', '')
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.announce).toBeUndefined()
+  })
+
+  it('gATEWAY_OPERATOR_CSRF_SECRET: blank file + env set → startup throws (missing secret)', () => {
+    // #given the operator surface is enabled with a blank CSRF secret file and a stale env secret
+    setRequiredEnv()
+    setOperatorWebEnv()
+    process.env.GATEWAY_OPERATOR_CSRF_SECRET = 'dGVzdC1jc3JmLXNlY3JldC0zMi1ieXRlcy1sb25nISE'
+    process.env.GATEWAY_OPERATOR_CSRF_SECRET_FILE = writeValueFile('csrf-secret-blank', '\n')
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow('Missing required secret: GATEWAY_OPERATOR_CSRF_SECRET')
+  })
+
+  it('gATEWAY_OPERATOR_GITHUB_CLIENT_SECRET: blank file + env set → startup throws (missing secret)', () => {
+    // #given the operator surface is enabled with a blank OAuth client secret file and a stale env secret
+    setRequiredEnv()
+    setOperatorWebEnv()
+    process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET = 'stale-oauth-client-secret'
+    process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET_FILE = writeValueFile('oauth-client-secret-blank', '')
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow('Missing required secret: GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET')
+  })
+
+  it('aWS_ACCESS_KEY_ID: blank file + env set → no static credentials (SDK default chain)', () => {
+    // #given a blank key-id file with a stale env key pair
+    setRequiredEnv()
+    process.env.AWS_ACCESS_KEY_ID = 'stale-key-id'
+    process.env.AWS_SECRET_ACCESS_KEY = 'stale-secret'
+    process.env.AWS_ACCESS_KEY_ID_FILE = writeValueFile('aws-key-blank', '')
+    process.env.AWS_SECRET_ACCESS_KEY_FILE = writeValueFile('aws-secret-blank', '')
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.objectStore.credentials).toBeUndefined()
   })
 })

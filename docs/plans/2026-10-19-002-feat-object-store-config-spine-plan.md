@@ -35,7 +35,7 @@ The three readers disagree on names, defaults and validation:
 
 ## Requirements Trace
 
-- R1. One runtime parser defines the object-store settings: bucket, region, endpoint, insecure-endpoint opt-in, prefix, SSE mode, SSE KMS key ID and expected bucket owner. Each setting has one default and one validation rule. The one exception is region: the calling surface decides whether it is required (R3). The endpoint check is runtime's `validateEndpoint`. The SSE default stays the derived rule in `s3-adapter.ts` (origin R11).
+- R1. One runtime parser defines the object-store settings: bucket, region, endpoint, insecure-endpoint opt-in, prefix, SSE mode, SSE KMS key ID and expected bucket owner. Each setting has one default and one validation rule. The one exception is region: the calling surface decides whether it is required (R3). The endpoint check is runtime's `validateEndpoint`. The SSE default stays the derived rule in `getEffectiveEncryption` (`encryption.ts`, origin R11).
 - R2. Each surface maps its own sources onto the parser. No surface keeps its own defaults or validation for these settings. Credentials stay per surface (origin R12).
 - R3. Region candidates are tried in order, and the first non-empty one wins. The gateway passes `S3_REGION` then `AWS_REGION` and requires a result. The Action passes `aws-region` and allows an empty result for R2 and MinIO. Backfill reads region the same way the gateway server does (origin R13, AE4).
 - R4. The gateway validates its endpoint and accepts `S3_ALLOW_INSECURE_ENDPOINT`. The flag lifts the https and private-address checks, never the cloud-metadata check, matching the Action's flag (origin R14, AE5).
@@ -56,7 +56,7 @@ The three readers disagree on names, defaults and validation:
 ## Context & Research
 
 - Research with file:line references for every read site, a divergence table, the list of behaviour changes and the tests that pin current behaviour: produced for this plan (local, untracked) and summarized here.
-- Runtime already shares `ObjectStoreConfig` (`packages/runtime/src/shared/types.ts`), `validateEndpoint` and `validatePrefix` (`packages/runtime/src/object-store/validation.ts`), the SSE default (`getEffectiveEncryption` in `s3-adapter.ts`) and `DEFAULT_S3_PREFIX`. The Action calls both validators at startup. `buildObjectStoreKey` (`key-builder.ts`) calls `validatePrefix` on every write on every surface.
+- Runtime already shares `ObjectStoreConfig` (`packages/runtime/src/shared/types.ts`), `validateEndpoint` and `validatePrefix` (`packages/runtime/src/object-store/validation.ts`), the SSE default (`getEffectiveEncryption` in `encryption.ts`) and `DEFAULT_S3_PREFIX`. The Action calls both validators at startup. `buildObjectStoreKey` (`key-builder.ts`) calls `validatePrefix` on every write on every surface.
 - Runtime must not import `@actions/*` (`scripts/runtime-no-actions-import-guard.test.ts`). It returns `Result` from `@bfra.me/es`, not Effect.
 - Action tests in `src/harness/config/inputs.test.ts`:
   - The pinned error substrings are `s3-bucket`, `https`, `cloud instance metadata services`, `loopback, link-local, or private network addresses` and `prefix`.
@@ -67,7 +67,7 @@ The three readers disagree on names, defaults and validation:
   - `config.test.ts` 24-50 scrubs a fixed env list that lacks `AWS_REGION` and several `_FILE` variants.
   - `backfill-runner.test.ts` 51-76 scrubs no S3 names.
 - `config.ts` reads the S3 settings after the Discord settings and before the GitHub App settings. It imports runtime types through `./runtime-effect.js`.
-- Backfill's `readEnv` treats an empty `_FILE` as an empty value. The gateway's `readOptionalSecret` treats an empty file as unset and falls back to the env var.
+- Backfill's `readEnv` treats an empty `_FILE` as an empty value. The gateway's `readOptionalSecret` treats an empty file as unset and does not consult the env var, so an emptied secret file is an explicit opt-out.
 - The gateway service joins `gateway-net`, which has direct egress by design (`deploy/compose.yaml` network comments). mitmproxy confines the workspace, not the gateway.
 
 ## Prior-Art Survey
@@ -97,7 +97,7 @@ The three readers disagree on names, defaults and validation:
       "disposition": "reuse"
     },
     {
-      "path_or_symbol": "packages/runtime/src/object-store/s3-adapter.ts getEffectiveEncryption",
+      "path_or_symbol": "packages/runtime/src/object-store/encryption.ts getEffectiveEncryption",
       "description": "Derived SSE mode rule; the parser uses it for the KMS-key check",
       "disposition": "reuse"
     },
@@ -121,20 +121,20 @@ The three readers disagree on names, defaults and validation:
 - **Parser contract.** `parseObjectStoreSettings(input, {region: 'required' | 'optional'})` lives in `packages/runtime/src/object-store/settings.ts` and returns `Result<ObjectStoreConfig, Error>`. The input is:
 
   ```ts
-  interface Sourced {
+  interface SettingSource {
     readonly value: string | null
     readonly source: string
   }
   interface ObjectStoreSettingsInput {
     readonly enabled: boolean
-    readonly bucket: Sourced
-    readonly region: readonly Sourced[] // candidates, first non-empty wins
-    readonly endpoint: Sourced
+    readonly bucket: SettingSource
+    readonly region: readonly [SettingSource, ...SettingSource[]] // candidates, first non-empty wins
+    readonly endpoint: SettingSource
     readonly allowInsecureEndpoint: boolean
-    readonly prefix: Sourced
-    readonly sseEncryption: Sourced
-    readonly sseKmsKeyId: Sourced
-    readonly expectedBucketOwner: Sourced
+    readonly prefix: SettingSource
+    readonly sseEncryption: SettingSource
+    readonly sseKmsKeyId: SettingSource
+    readonly expectedBucketOwner: SettingSource
   }
   ```
 
@@ -237,8 +237,8 @@ The three readers disagree on names, defaults and validation:
 **Files:**
 
 - Modify: `packages/gateway/src/runtime-effect.ts` (re-export the parser)
-- Create: `packages/gateway/src/secrets.ts` (the env and `_FILE` readers, moved from `config.ts`; an empty file falls through to the env var)
-- Create: `packages/gateway/src/object-store-config.ts` (`loadObjectStoreSettings`)
+- Create: `packages/gateway/src/secrets.ts` (the env and `_FILE` readers, moved from `config.ts` with their behaviour unchanged: a blank file means unset and env is not consulted; plus `isSecretFileBlank` and `readEnvSecret` for the object-store loader)
+- Create: `packages/gateway/src/object-store-config.ts` (`loadObjectStoreSettings`; for the S3 settings only, a blank `_FILE` defers to the env var; throws `ObjectStoreConfigError`, which startup logs as `gateway config invalid`)
 - Modify: `packages/gateway/src/config.ts` (call `loadObjectStoreSettings`, re-export the readers, delete the local `DEFAULT_S3_PREFIX` and the SSE cast)
 - Modify: `packages/gateway/src/bindings/backfill-runner.ts` (call `loadObjectStoreSettings`, read credentials through `readSecret`, update the USAGE text, delete its S3 reads and the prefix literal)
 - Test: `packages/gateway/src/config.test.ts`, `packages/gateway/src/bindings/backfill-runner.test.ts`
@@ -302,8 +302,11 @@ The three readers disagree on names, defaults and validation:
 | Backfill `_FILE` forms for the S3 settings | only `S3_BUCKET` and `AWS_REGION` | all of them, empty file means unset |
 | Backfill with `S3_ENDPOINT` set and no `S3_SSE` | `aws:kms` against AWS (endpoint ignored) | derives `AES256` for the custom endpoint |
 | Backfill with an empty `S3_PREFIX` | wrote and read the bucket root, so deny keys from an earlier empty-prefix run sit there | uses `fro-bot-state`; keys at the bucket root are not read |
-| Backfill `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `GITHUB_APP_ID` with an empty `_FILE` | the empty string was used | the empty file counts as unset: the env var is used, or the run exits 1 naming the variable |
-| Any gateway secret with an empty or whitespace-only `*_FILE` and a same-named env var | the empty file hid the env var (null) | the env var is used |
+| Backfill `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY` with an empty `_FILE` | the empty string was used | the run exits 1 naming the variable; env is not consulted, as in the server |
+| Backfill `*_FILE` reads | followed symlinks and any size, trimmed both ends | reject symlinks and files over 4 KB, trim trailing whitespace only, like the server |
+| Backfill with a whitespace-only `S3_PREFIX` | whitespace prefix | `fro-bot-state` |
+| Startup failure from a bad object-store setting | logs `gateway startup failed` with no detail | logs `gateway config invalid` with the value-free message; other startup failures keep the detail-free message |
+| An S3 setting (including `S3_BUCKET` and both region candidates) with an empty or whitespace-only `*_FILE` and a same-named env var | the empty file hid the env var (null) | the env var is used. This is S3-only: every other gateway secret keeps treating a blank file as unset without consulting env, so a stale env value cannot bring back an emptied allowlist, webhook, CSRF or OAuth secret |
 | `S3_EXPECTED_BUCKET_OWNER` that is not a 12-digit account ID | passed startup, failed S3 calls | startup error |
 | Padded `S3_BUCKET`, `S3_REGION`, `S3_ENDPOINT` | used as given | trimmed |
 | Backfill `--apply` while the gateway runs | unconditional overwrite, no guard | same; stop or quiesce the gateway first |

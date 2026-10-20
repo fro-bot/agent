@@ -140,7 +140,7 @@ chmod 0600 deploy/secrets/*
 
 ### Object-store settings
 
-The gateway reads these through one shared parser, the same one the Action uses. Each setting accepts a `_FILE` form. An empty value counts as unset. Startup fails with the setting's name and the rule it broke, and the error never prints the value.
+The gateway reads these through one shared parser, the same one the Action uses. Each setting accepts a `_FILE` form. An empty value counts as unset, and a blank `_FILE` (empty or whitespace-only) defers to the same-named env var. A non-blank file wins over env. Startup fails with the setting's name and the rule it broke, and the error never prints the value.
 
 | Variable | Default | Rule |
 | --- | --- | --- |
@@ -229,7 +229,7 @@ The compose stack bind-mounts each secret file individually with `create_host_pa
 
 The `workspace-repos` named volume is created automatically by Docker Compose on the first `up` after this change — no manual step is required. Existing repo checkouts in the container's ephemeral filesystem are not migrated; the workspace will re-clone them on the next mention.
 
-Run the full `touch` block from [Create secrets](#2-create-secrets) on every upgrade. It is idempotent: `touch` on an existing file is a no-op, but a missing file gets created empty. Empty files mean "secret not set", which is the same as the file being absent — the gateway treats both as opt-out.
+Run the full `touch` block from [Create secrets](#2-create-secrets) on every upgrade. It is idempotent: `touch` on an existing file is a no-op, but a missing file gets created empty. Empty files mean "secret not set", which is the same as the file being absent — the gateway treats both as opt-out, and does not fall back to a same-named env var. The object-store settings above are the one exception: a blank `_FILE` there defers to the env var.
 
 ### Object-store settings validation (rollout)
 
@@ -239,14 +239,15 @@ The gateway now rejects a bad object-store setting at startup. Before it starts 
 - **Encryption mode.** Confirm what the production bucket accepts. With no `S3_SSE`, AWS S3 gets `aws:kms` and a custom endpoint gets `AES256`. If an AWS bucket accepts only SSE-S3, set `S3_SSE=AES256`.
 - **Region.** `S3_REGION` is the canonical name, with `AWS_REGION` as a fallback. R2 and MinIO deployments set `S3_REGION=auto`.
 - **Other values.** An `S3_PREFIX` that fails the prefix rule, an `S3_SSE` other than `aws:kms` or `AES256`, or an `S3_EXPECTED_BUCKET_OWNER` that is not 12 digits stops startup.
-- **Empty `_FILE`.** An empty or whitespace-only `*_FILE` counts as unset, so the same-named env var is used. This holds for every gateway secret, not only the S3 settings.
+- **Blank `_FILE`.** For the S3 settings, including `S3_BUCKET` and both region candidates, an empty or whitespace-only `*_FILE` counts as unset and the same-named env var is used. Every other gateway secret keeps the opt-out rule: a blank file means unset, and the env var is not consulted.
 
 The `backfill-deny-keys` command reads the same settings:
 
 - It uses `S3_ENDPOINT`, `S3_SSE`, `S3_SSE_KMS_KEY_ID`, `S3_EXPECTED_BUCKET_OWNER` and `S3_ALLOW_INSECURE_ENDPOINT`. It ignored them before and went to AWS.
 - It reads `S3_REGION` before `AWS_REGION`. Before you run `--apply`, confirm that the two match, or unset `AWS_REGION`.
 - With `S3_ENDPOINT` set and no `S3_SSE`, it derives `AES256`. It wrote `aws:kms` to AWS before. Set `S3_SSE` if the bucket needs the other mode.
-- An empty `S3_PREFIX` means `fro-bot-state`. It was the bucket root before, so deny keys written by an earlier run with an empty prefix sit at the root and are not read.
+- An empty or whitespace-only `S3_PREFIX` means `fro-bot-state`. It was the bucket root before, so deny keys written by an earlier run with an empty prefix sit at the root and are not read.
+- Its `*_FILE` reads match the server's: symlinks and files over 4 KB are rejected, and only trailing whitespace is trimmed. A blank credential file is a missing credential, and the run exits 1 naming the variable.
 - Stop or quiesce the gateway before `--apply`. The write is an unconditional overwrite.
 - Confirm that the endpoint it now uses is the one you mean to write to.
 

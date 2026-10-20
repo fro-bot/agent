@@ -1,8 +1,13 @@
 /**
  * Env and `_FILE` secret readers shared by the gateway config and the backfill runner.
  *
- * Precedence for a name `X`: a non-empty file at `X_FILE` wins, then the `X` env var. An empty or whitespace-only
- * file counts as unset and falls through to the env var; a missing file does too.
+ * Precedence for a name `X`: a `X_FILE` that points at a readable file decides the value. A blank file (empty or
+ * whitespace-only) is an explicit opt-out: the reader returns null (or reports a missing secret) and does not
+ * consult the `X` env var, so a stale env value can never bring back a secret an operator emptied. A `X_FILE` path
+ * that does not exist falls through to the `X` env var.
+ *
+ * The object-store settings are the one exception; they defer a blank file to env through `isSecretFileBlank` and
+ * `readEnvSecret` (see `object-store-config.ts`).
  */
 
 import {closeSync, constants, fstatSync, openSync, readFileSync} from 'node:fs'
@@ -88,18 +93,24 @@ function describeStatKind(stat: import('node:fs').Stats): string {
   return 'unknown non-file'
 }
 
+/** The error text for a required secret that is unset, or whose `_FILE` is blank. */
+export function missingSecretMessage(name: string): string {
+  return `Missing required secret: ${name} (set ${name} env var or ${name}_FILE pointing to a file)`
+}
+
 /**
  * Read a required secret by name.
  *
  * Precedence:
- * 1. If `${name}_FILE` env var is set AND that file exists → read file contents, trim trailing whitespace
- * 2. Else if `process.env[name]` is set → return it
+ * 1. If `${name}_FILE` is set AND that file exists → its trailing-trimmed contents. A blank file is a missing secret;
+ *    the env var is not consulted.
+ * 2. Else if `process.env[name]` is non-blank → return it
  * 3. Else throw with a clear message
  */
 export function readSecret(name: string): string {
   const value = readOptionalSecret(name)
   if (value === null) {
-    throw new Error(`Missing required secret: ${name} (set ${name} env var or ${name}_FILE pointing to a file)`)
+    throw new Error(missingSecretMessage(name))
   }
   return value
 }
@@ -113,7 +124,7 @@ export function readSecret(name: string): string {
 export function readMultilineSecret(name: string): string {
   const value = readOptionalMultilineSecret(name)
   if (value === null) {
-    throw new Error(`Missing required secret: ${name} (set ${name} env var or ${name}_FILE pointing to a file)`)
+    throw new Error(missingSecretMessage(name))
   }
   return value
 }
@@ -136,9 +147,10 @@ export function readOptionalMultilineSecret(name: string): string | null {
         throw error
       }
     }
-    // An empty or whitespace-only file counts as unset, so it falls through to the env var below.
-    if (contents !== undefined && contents.trim() !== '') {
-      return contents.trimEnd()
+    if (contents !== undefined) {
+      const trimmed = contents.trimEnd()
+      if (trimmed.trim() === '') return null
+      return trimmed
     }
   }
 
@@ -168,12 +180,13 @@ export function readOptionalSecret(name: string): string | null {
         throw error
       }
     }
-    // Treat whitespace-only or empty files as "not set" (e.g. empty bind-mounted optional secrets). They fall
-    // through to the env var below, so an empty `touch`ed file never shadows a value set in the environment.
-    if (contents !== undefined && contents.trim() !== '') {
+    if (contents !== undefined) {
       // Strip only trailing whitespace (newline/spaces from echo) so leading whitespace
       // in valid secrets is preserved — matching the env-var path which uses raw process.env[name].
+      // Treat whitespace-only or empty files as "not set" (e.g. empty bind-mounted optional secrets). The env var
+      // is not consulted: an emptied file is an explicit opt-out.
       const trailingTrimmed = contents.trimEnd()
+      if (trailingTrimmed.trim() === '') return null
       if (/[\r\n\u0085\u2028\u2029]/.test(trailingTrimmed)) {
         throw new Error(
           `Secret value at ${filePath} contains embedded line-breaking characters — likely a copy-paste with line-wrapping. Remove the line break and rewrite the file as a single line.`,
@@ -183,6 +196,14 @@ export function readOptionalSecret(name: string): string | null {
     }
   }
 
+  return readEnvSecret(name)
+}
+
+/**
+ * Read a single-line value from the `name` env var only, ignoring any `${name}_FILE`. Returns null when it is unset or
+ * blank, and rejects embedded line breaks.
+ */
+export function readEnvSecret(name: string): string | null {
   const value = process.env[name]
   if (value !== undefined && value.trim() !== '') {
     if (/[\r\n\u0085\u2028\u2029]/.test(value)) {
@@ -194,4 +215,25 @@ export function readOptionalSecret(name: string): string | null {
   }
 
   return null
+}
+
+/**
+ * Whether `${name}_FILE` points at an existing file that is empty or whitespace-only. Uses the same hardened file read
+ * as the secret readers (symlinks, non-regular files and oversize files throw). Returns false when no file is
+ * configured or the path does not exist.
+ */
+export function isSecretFileBlank(name: string): boolean {
+  const filePath = process.env[`${name}_FILE`]
+  if (filePath === undefined) {
+    return false
+  }
+
+  try {
+    return readSecretFile(filePath).trim() === ''
+  } catch (error) {
+    if (error instanceof SecretFileNotFoundError) {
+      return false
+    }
+    throw error
+  }
 }

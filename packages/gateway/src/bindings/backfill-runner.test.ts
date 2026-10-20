@@ -617,11 +617,31 @@ describe('runDenyKeyBackfill', () => {
     },
   )
 
-  it('empty AWS_ACCESS_KEY_ID_FILE with the env var set → uses the env value', async () => {
-    // #given
+  it.each(['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'GITHUB_APP_ID'])(
+    'empty %s_FILE with the env var SET → exits 1 (a blank file is an opt-out; env is not consulted)',
+    async name => {
+      // #given a blank bind-mounted file and a stale value in env
+      process.env[`${name}_FILE`] = writeValueFile(`${name}-blank`, '\n')
+      const {error, logger} = makeSpyLogger()
+
+      // #when
+      const {runDenyKeyBackfill} = await import('./backfill-runner.js')
+      const exitCode = await runDenyKeyBackfill({dryRun: false, logger})
+
+      // #then
+      expect(exitCode).toBe(1)
+      const [, context] = error.mock.calls[0] as [string, {error: string}]
+      expect(context.error).toContain(name)
+      expect(mockCreateS3Adapter).not.toHaveBeenCalled()
+    },
+  )
+
+  it('uses S3_BUCKET from env when S3_BUCKET_FILE is empty', async () => {
+    // #given the object-store settings defer a blank file to env
     const {ok} = await import('@fro-bot/runtime')
     mockBackfill.mockResolvedValue(ok({total: 0, updated: 0, skipped: 0, failed: 0}))
-    process.env.AWS_ACCESS_KEY_ID_FILE = writeValueFile('aws-key-empty', '')
+    process.env.S3_BUCKET_FILE = writeValueFile('s3-bucket-blank', '')
+    process.env.S3_BUCKET = 'env-bucket'
 
     // #when
     const {runDenyKeyBackfill} = await import('./backfill-runner.js')
@@ -629,7 +649,42 @@ describe('runDenyKeyBackfill', () => {
 
     // #then
     expect(exitCode).toBe(0)
-    expect(lastStoreConfig()).toMatchObject({credentials: {accessKeyId: 'test-key-id', secretAccessKey: 'test-secret'}})
+    expect(lastStoreConfig().bucket).toBe('env-bucket')
+  })
+
+  it.each([
+    ['empty GATEWAY_IDENTITY', {GATEWAY_IDENTITY: ''}],
+    ['whitespace-only GATEWAY_IDENTITY', {GATEWAY_IDENTITY: '   '}],
+    ['blank GATEWAY_IDENTITY_FILE', {GATEWAY_IDENTITY_FILE: 'BLANK_FILE'}],
+  ])('%s falls back to discord-gateway', async (_label, env) => {
+    // #given
+    const {ok} = await import('@fro-bot/runtime')
+    mockBackfill.mockResolvedValue(ok({total: 0, updated: 0, skipped: 0, failed: 0}))
+    for (const [key, value] of Object.entries(env)) {
+      process.env[key] = value === 'BLANK_FILE' ? writeValueFile('identity-blank', '') : value
+    }
+
+    // #when
+    const {runDenyKeyBackfill} = await import('./backfill-runner.js')
+    const exitCode = await runDenyKeyBackfill({dryRun: false})
+
+    // #then
+    expect(exitCode).toBe(0)
+    expect((mockCreateBindingsStore.mock.calls[0] as [{identity: string}])[0].identity).toBe('discord-gateway')
+  })
+
+  it('uses the default prefix when S3_PREFIX is whitespace-only', async () => {
+    // #given
+    const {ok} = await import('@fro-bot/runtime')
+    mockBackfill.mockResolvedValue(ok({total: 0, updated: 0, skipped: 0, failed: 0}))
+    process.env.S3_PREFIX = '   '
+
+    // #when
+    const {runDenyKeyBackfill} = await import('./backfill-runner.js')
+    await runDenyKeyBackfill({dryRun: false})
+
+    // #then
+    expect(lastStoreConfig().prefix).toBe('fro-bot-state')
   })
 
   it('reads credentials and the GitHub App ID from non-empty _FILE values', async () => {
