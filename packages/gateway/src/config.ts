@@ -7,6 +7,7 @@ import type {VapidKeyMaterial, VapidPublicKeyInfo} from './web/operator-push/vap
 import {Buffer} from 'node:buffer'
 import {isIP} from 'node:net'
 
+import {DEFAULT_TIMEOUT_MS} from '@fro-bot/runtime'
 import {GatewayIntentBits} from 'discord.js'
 import {Effect, Either} from 'effect'
 import {loadObjectStoreSettings} from './object-store-config.js'
@@ -458,7 +459,7 @@ export function loadGatewayConfig(): GatewayConfig {
     throw new Error(`Invalid GATEWAY_MAX_CONCURRENT_RUNS value: "${rawMaxConcurrent}" (must be a positive integer)`)
   }
 
-  const rawRunTimeout = readOptionalSecret('GATEWAY_RUN_TIMEOUT_MS') ?? '1800000'
+  const rawRunTimeout = readOptionalSecret('GATEWAY_RUN_TIMEOUT_MS') ?? String(DEFAULT_TIMEOUT_MS)
   if (/^[1-9]\d*$/.test(rawRunTimeout) === false) {
     throw new Error(`Invalid GATEWAY_RUN_TIMEOUT_MS value: "${rawRunTimeout}" (must be a positive integer)`)
   }

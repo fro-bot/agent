@@ -7,6 +7,7 @@ import type {EnsureOpenCodeResult} from './types.js'
 import net from 'node:net'
 import process from 'node:process'
 import {createOpencode} from '@opencode-ai/sdk'
+import {sleep} from '../shared/async.js'
 import {
   DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS,
   DEFAULT_SERVER_READINESS_TIMEOUT_MS,
@@ -17,12 +18,6 @@ import {
 import {toErrorMessage} from '../shared/errors.js'
 import {err, ok} from '../shared/types.js'
 import {withScrubbedEnv} from './with-scrubbed-env.js'
-
-async function delay(ms: number): Promise<void> {
-  return new Promise(resolve => {
-    setTimeout(resolve, ms)
-  })
-}
 
 // The subset of net.Socket that isPortOpen depends on. Narrowed to an interface (rather
 // than importing net.Socket directly into the signature) so tests can inject a fake that
@@ -144,7 +139,7 @@ export async function waitForServerQuiescence(
     if (!stillOpen) {
       return {quiesced: true}
     }
-    await delay(pollIntervalMs)
+    await sleep(pollIntervalMs)
   } while (Date.now() < deadline)
 
   return {quiesced: false}
