@@ -268,7 +268,7 @@ describe('parseActionInputs', () => {
         's3-prefix': 'custom-prefix',
         's3-expected-bucket-owner': '123456789012',
         's3-allow-insecure-endpoint': 'true',
-        's3-sse-encryption': 'AES256',
+        's3-sse-encryption': 'aws:kms',
         's3-sse-kms-key-id': 'kms-key-123',
       })
 
@@ -283,9 +283,22 @@ describe('parseActionInputs', () => {
         endpoint: 'https://account.r2.cloudflarestorage.com',
         expectedBucketOwner: '123456789012',
         allowInsecureEndpoint: true,
-        sseEncryption: 'AES256',
+        sseEncryption: 'aws:kms',
         sseKmsKeyId: 'kms-key-123',
       })
+    })
+
+    it('parses an enabled store with an empty aws-region into region ""', () => {
+      mockInputs({
+        's3-backup': 'true',
+        's3-bucket': 'my-bucket',
+        'aws-region': '',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.storeConfig.region).toBe('')
     })
 
     it('applies the default prefix when s3-prefix is not provided', () => {
@@ -675,7 +688,7 @@ describe('parseActionInputs', () => {
       const result = parseActionInputs()
 
       expect(result.success).toBe(false)
-      expect(!result.success && result.error.message).toContain('s3-bucket')
+      expect(!result.success && result.error.message).toBe('s3-bucket is required')
       expect(!result.success && result.error.message).not.toContain('   ')
       expect(!result.success && result.error.message).not.toContain('true')
     })
@@ -744,6 +757,62 @@ describe('parseActionInputs', () => {
 
       expect(result.success).toBe(false)
       expect(!result.success && result.error.message).toContain('prefix')
+      expect(!result.success && result.error.message.startsWith('s3-prefix')).toBe(true)
+    })
+
+    it('starts an endpoint error with the s3-endpoint input name', () => {
+      mockInputs({
+        's3-backup': 'true',
+        's3-bucket': 'my-bucket',
+        's3-endpoint': 'http://internal',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.message.startsWith('s3-endpoint')).toBe(true)
+    })
+
+    it('rejects an unknown s3-sse-encryption value and names the input', () => {
+      mockInputs({
+        's3-backup': 'false',
+        's3-sse-encryption': 'aes256',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.message).toBe("s3-sse-encryption: must be either 'aws:kms' or 'AES256'")
+    })
+
+    it('rejects s3-sse-kms-key-id with s3-sse-encryption AES256 and names the key input', () => {
+      mockInputs({
+        's3-backup': 'true',
+        's3-bucket': 'my-bucket',
+        's3-sse-encryption': 'AES256',
+        's3-sse-kms-key-id': 'kms-key-123',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.message).toContain('s3-sse-kms-key-id')
+      expect(!result.success && result.error.message).not.toContain('kms-key-123')
+    })
+
+    it('rejects s3-sse-kms-key-id with a custom endpoint and no s3-sse-encryption', () => {
+      mockInputs({
+        's3-backup': 'true',
+        's3-bucket': 'my-bucket',
+        's3-endpoint': 'https://account.r2.cloudflarestorage.com',
+        's3-sse-kms-key-id': 'kms-key-123',
+      })
+
+      const result = parseActionInputs()
+
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.message).toContain('s3-sse-kms-key-id')
+      expect(!result.success && result.error.message).not.toContain('kms-key-123')
     })
   })
 

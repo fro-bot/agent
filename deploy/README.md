@@ -12,15 +12,15 @@ Docker Compose v2 stack for the fro-bot gateway. Runs three services:
 
 - Docker 24+ with Compose v2 (`docker compose version`)
 - Access to a Discord application (bot token + application ID)
-- An S3-compatible object store (bucket, region, optional endpoint)
+- An S3-compatible object store (bucket, region, optional endpoint). The gateway checks these settings at startup; see [Object-store settings](#object-store-settings).
 
 ## Testing-Only Configuration (Discord Plumbing)
 
-If you're just verifying the gateway connects to Discord and responds to slash commands and mentions, you do not need a working S3 bucket. The gateway daemon validates S3 credentials at startup but does not write to S3 in v1.
+If you're just verifying the gateway connects to Discord and responds to slash commands and mentions, you do not need a working S3 bucket. The gateway daemon validates its object-store settings at startup but does not write to S3 in v1.
 
 For testing-only:
 
-- Put any plausible-looking values in `deploy/secrets/s3-bucket` and `deploy/secrets/s3-region` (e.g. `test-bucket` and `us-east-1`). Validation only checks they're non-empty.
+- Put any plausible-looking values in `deploy/secrets/s3-bucket` and `deploy/secrets/s3-region` (e.g. `test-bucket` and `us-east-1`). Startup requires both to be non-empty. If you also set an endpoint, prefix or encryption mode, those must pass their rules too (see [Object-store settings](#object-store-settings)).
 - Leave `OBJECT_STORE_HOSTS` unset in `deploy/.env`. The default fail-closed behaviour blocks all S3 traffic — fine for testing, since no S3 calls are made.
 - Use a real bucket and `OBJECT_STORE_HOSTS` value once you exercise the workspace executor (repo clone via `/fro-bot add-project` and the OpenCode mention loop), which reaches S3-backed state and external hosts.
 
@@ -44,7 +44,7 @@ mkdir -p deploy/secrets
 echo -n 'YOUR_DISCORD_BOT_TOKEN'      > deploy/secrets/discord-token
 echo -n 'YOUR_DISCORD_APP_ID'         > deploy/secrets/discord-application-id
 echo -n 'your-s3-bucket-name'         > deploy/secrets/s3-bucket
-echo -n 'us-east-1'                   > deploy/secrets/s3-region
+echo -n 'us-east-1'                   > deploy/secrets/s3-region  # use 'auto' for R2 and MinIO
 # Optional — leave empty for standard AWS S3; set for R2 or other S3-compatible stores.
 touch deploy/secrets/s3-endpoint
 # echo -n 'https://your-endpoint.r2.dev' > deploy/secrets/s3-endpoint
@@ -138,6 +138,32 @@ chmod 0600 deploy/secrets/*
 
 `deploy/secrets/` is gitignored — never commit secret files.
 
+### Object-store settings
+
+The gateway reads these through one shared parser, the same one the Action uses. Each setting accepts a `_FILE` form. An empty value counts as unset, and a blank `_FILE` (empty or whitespace-only) defers to the same-named env var. A non-blank file wins over env. Startup fails with the setting's name and the rule it broke, and the error never prints the value.
+
+| Variable | Default | Rule |
+| --- | --- | --- |
+| `S3_BUCKET` | — | Required |
+| `S3_REGION` | — | Required. Falls back to `AWS_REGION` when unset. Use `auto` for R2 and MinIO |
+| `S3_ENDPOINT` | AWS S3 | `https://` unless `S3_ALLOW_INSECURE_ENDPOINT=true`. Loopback, link-local and private-network addresses need the flag. Cloud metadata addresses are always rejected |
+| `S3_ALLOW_INSECURE_ENDPOINT` | off | Only the exact value `true` turns it on. It allows an `http://` or private-address endpoint (local MinIO). It never allows a metadata address |
+| `S3_PREFIX` | `fro-bot-state` | Must pass the key-prefix rule (no traversal, no absolute path, no control characters) |
+| `S3_SSE` | `aws:kms` on AWS S3, `AES256` on a custom endpoint | `aws:kms` or `AES256`, case-sensitive |
+| `S3_SSE_KMS_KEY_ID` | — | Requires the effective mode to be `aws:kms`. On a custom endpoint, set `S3_SSE=aws:kms` too, or a key alone is rejected |
+| `S3_EXPECTED_BUCKET_OWNER` | — | The 12-digit AWS account ID the bucket must belong to |
+
+The compose file mounts secrets only for the bucket, region and endpoint. Set the others as `environment:` entries on the `gateway` service in `compose.override.yaml`, or point a `*_FILE` variable at a file you mount yourself. Don't add new secret mounts to `compose.yaml` for them.
+
+```yaml
+services:
+  gateway:
+    environment:
+      S3_PREFIX: fro-bot-state
+      S3_SSE: AES256
+      S3_EXPECTED_BUCKET_OWNER: "123456789012"
+```
+
 ### 3. Bootstrap the mitmproxy CA
 
 Run once to generate the mitmproxy CA and place it in the shared Docker volume:
@@ -203,7 +229,31 @@ The compose stack bind-mounts each secret file individually with `create_host_pa
 
 The `workspace-repos` named volume is created automatically by Docker Compose on the first `up` after this change — no manual step is required. Existing repo checkouts in the container's ephemeral filesystem are not migrated; the workspace will re-clone them on the next mention.
 
-Run the full `touch` block from [Create secrets](#2-create-secrets) on every upgrade. It is idempotent: `touch` on an existing file is a no-op, but a missing file gets created empty. Empty files mean "secret not set", which is the same as the file being absent — the gateway treats both as opt-out.
+Run the full `touch` block from [Create secrets](#2-create-secrets) on every upgrade. It is idempotent: `touch` on an existing file is a no-op, but a missing file gets created empty. A blank secret file (empty or whitespace-only) means "secret not set", and it is an opt-out: the gateway never falls back to a same-named env var. A `_FILE` path that does not exist is different: the gateway falls back to the same-named env var. The object-store settings above are the one exception to the first rule: a blank `_FILE` there defers to the env var.
+
+### Object-store settings validation (rollout)
+
+The gateway now rejects a bad object-store setting at startup. Before it starts a deployment on this version, check:
+
+- **`S3_ENDPOINT`.** An `http://`, loopback, link-local or private-address endpoint now needs `S3_ALLOW_INSECURE_ENDPOINT=true`. Use that only for local MinIO. A cloud metadata address is rejected even with the flag. An empty endpoint file is fine.
+- **Encryption mode.** Confirm what the production bucket accepts. With no `S3_SSE`, AWS S3 gets `aws:kms` and a custom endpoint gets `AES256`. If an AWS bucket accepts only SSE-S3, set `S3_SSE=AES256`.
+- **Region.** `S3_REGION` is the canonical name, with `AWS_REGION` as a fallback. R2 and MinIO deployments set `S3_REGION=auto`.
+- **`S3_ALLOW_INSECURE_ENDPOINT`.** It follows the object-store rule: a blank `_FILE` defers to the env var. To turn it off, clear both.
+- **Static AWS keys.** To retire a static key, remove both the file and any `AWS_*` env vars. A blank AWS key file means no static credentials, so the AWS SDK default provider chain applies; that chain still reads `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` from the process env, and instance or role credentials.
+- **Other values.** An `S3_PREFIX` that fails the prefix rule, an `S3_SSE` other than `aws:kms` or `AES256`, or an `S3_EXPECTED_BUCKET_OWNER` that is not 12 digits stops startup.
+- **Blank `_FILE`.** For the S3 settings, including `S3_BUCKET` and both region candidates, an empty or whitespace-only `*_FILE` counts as unset and the same-named env var is used. Every other gateway secret keeps the opt-out rule: a blank file means unset, and the env var is not consulted.
+
+The `backfill-deny-keys` command reads the same settings:
+
+- It uses `S3_ENDPOINT`, `S3_SSE`, `S3_SSE_KMS_KEY_ID`, `S3_EXPECTED_BUCKET_OWNER` and `S3_ALLOW_INSECURE_ENDPOINT`. It ignored them before and went to AWS.
+- It reads `S3_REGION` before `AWS_REGION`. Before you run `--apply`, confirm that the two match, or unset `AWS_REGION`.
+- With `S3_ENDPOINT` set and no `S3_SSE`, it derives `AES256`. It wrote `aws:kms` to AWS before. Set `S3_SSE` if the bucket needs the other mode.
+- An empty or whitespace-only `S3_PREFIX` means `fro-bot-state`. It was the bucket root before, so deny keys written by an earlier run with an empty prefix sit at the root and are not read.
+- Its `*_FILE` reads match the server's: symlinks and files over 4 KB are rejected, and only trailing whitespace is trimmed. A blank credential file is a missing credential, and the run exits 1 naming the variable.
+- Stop or quiesce the gateway before `--apply`. The write is an unconditional overwrite.
+- Confirm that the endpoint it now uses is the one you mean to write to.
+
+The Action reports a missing or unknown S3 setting with the input name first, for example `s3-bucket is required` and `s3-sse-encryption: must be either 'aws:kms' or 'AES256'`.
 
 ### Workspace uid isolation (one-time checkout ownership migration)
 

@@ -32,9 +32,20 @@ beforeEach(() => {
     'S3_BUCKET_FILE',
     'S3_REGION',
     'S3_REGION_FILE',
+    'AWS_REGION',
+    'AWS_REGION_FILE',
     'S3_ENDPOINT',
+    'S3_ENDPOINT_FILE',
     'S3_PREFIX',
+    'S3_PREFIX_FILE',
     'S3_SSE',
+    'S3_SSE_FILE',
+    'S3_ALLOW_INSECURE_ENDPOINT',
+    'S3_ALLOW_INSECURE_ENDPOINT_FILE',
+    'S3_EXPECTED_BUCKET_OWNER',
+    'S3_EXPECTED_BUCKET_OWNER_FILE',
+    'S3_SSE_KMS_KEY_ID',
+    'S3_SSE_KMS_KEY_ID_FILE',
     'GATEWAY_IDENTITY',
     'LOG_LEVEL',
     'TOKEN',
@@ -85,6 +96,7 @@ beforeEach(() => {
     'GATEWAY_OPERATOR_OAUTH_STATE_TTL_MS',
     'GATEWAY_OPERATOR_OAUTH_MAX_OUTSTANDING_ATTEMPTS',
     'GATEWAY_OPERATOR_GITHUB_CLIENT_ID_FILE',
+    'GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET_FILE',
     'GATEWAY_OPERATOR_CSRF_SECRET',
     'GATEWAY_OPERATOR_CSRF_SECRET_FILE',
     'GATEWAY_OPERATOR_ALLOWLIST',
@@ -188,6 +200,30 @@ describe('readSecret', () => {
     // #then falls through to env var
     expect(result).toBe('fallback-env-value')
   })
+
+  it.each([
+    ['an empty', ''],
+    ['a whitespace-only', '  \n  \n'],
+  ])('reports the secret as missing when TOKEN_FILE points to %s file, even if TOKEN is set', (_label, contents) => {
+    // #given a blank bind-mounted file and a stale value in the env var
+    const secretFile = join(tmpDir, 'token-empty-file.txt')
+    writeFileSync(secretFile, contents)
+    process.env.TOKEN_FILE = secretFile
+    process.env.TOKEN = 'stale-env-value'
+
+    // #when / #then the blank file is an explicit opt-out: env is not consulted
+    expect(() => readSecret('TOKEN')).toThrow('Missing required secret: TOKEN')
+  })
+
+  it('reports the secret as missing when TOKEN_FILE is empty and TOKEN is unset', () => {
+    // #given an empty file and no env var
+    const secretFile = join(tmpDir, 'token-empty-only.txt')
+    writeFileSync(secretFile, '')
+    process.env.TOKEN_FILE = secretFile
+
+    // #when / #then
+    expect(() => readSecret('TOKEN')).toThrow('Missing required secret: TOKEN')
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -242,6 +278,34 @@ describe('readOptionalSecret', () => {
 
     // #then whitespace-only is treated as "not set"
     expect(result).toBeNull()
+  })
+
+  it.each([
+    ['an empty', ''],
+    ['a whitespace-only', '  \n  \n'],
+  ])('returns null when MISSING_FILE points to %s file, even if MISSING is set', (_label, contents) => {
+    // #given a blank bind-mounted file and a stale value in the env var
+    const secretFile = join(tmpDir, 'empty-with-env.txt')
+    writeFileSync(secretFile, contents)
+    process.env.MISSING_FILE = secretFile
+    process.env.MISSING = 'stale-env-value'
+
+    // #when
+    const result = readOptionalSecret('MISSING')
+
+    // #then the blank file is an explicit opt-out: env is not consulted
+    expect(result).toBeNull()
+  })
+
+  it('prefers a non-empty file over the env var', () => {
+    // #given a file with a value and a different env value
+    const secretFile = join(tmpDir, 'optional-both.txt')
+    writeFileSync(secretFile, 'from-file\n')
+    process.env.MISSING_FILE = secretFile
+    process.env.MISSING = 'from-env'
+
+    // #when / #then
+    expect(readOptionalSecret('MISSING')).toBe('from-file')
   })
 
   it('returns null when env var is set to an empty string', () => {
@@ -593,6 +657,528 @@ describe('loadGatewayConfig', () => {
 
     // #then
     expect(config.objectStore.endpoint).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Object-store settings (loadObjectStoreSettings via loadGatewayConfig)
+// ---------------------------------------------------------------------------
+
+function writeValueFile(name: string, contents: string): string {
+  const file = join(tmpDir, name)
+  writeFileSync(file, contents, {mode: 0o600})
+  return file
+}
+
+describe('loadGatewayConfig — object-store settings', () => {
+  describe('region (AE4)', () => {
+    it('resolves the region from AWS_REGION when S3_REGION is unset', () => {
+      // #given only AWS_REGION is set
+      setRequiredEnv()
+      delete process.env.S3_REGION
+      process.env.AWS_REGION = 'eu-west-2'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.region).toBe('eu-west-2')
+    })
+
+    it('prefers S3_REGION over AWS_REGION when both are set', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_REGION = 'us-east-1'
+      process.env.AWS_REGION = 'eu-west-2'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.region).toBe('us-east-1')
+    })
+
+    it('reads the region from S3_REGION_FILE', () => {
+      // #given
+      setRequiredEnv()
+      delete process.env.S3_REGION
+      process.env.S3_REGION_FILE = writeValueFile('s3-region', 'ap-southeast-2\n')
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.region).toBe('ap-southeast-2')
+    })
+
+    it('reads the AWS_REGION fallback from AWS_REGION_FILE', () => {
+      // #given S3_REGION is unset and the fallback arrives through a file
+      setRequiredEnv()
+      delete process.env.S3_REGION
+      process.env.AWS_REGION_FILE = writeValueFile('aws-region', 'sa-east-1\n')
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.region).toBe('sa-east-1')
+    })
+
+    it('names both region candidates when neither S3_REGION nor AWS_REGION is set', () => {
+      // #given
+      setRequiredEnv()
+      delete process.env.S3_REGION
+
+      // #when / #then
+      expect(() => loadGatewayConfig()).toThrow(/^S3_REGION or AWS_REGION is required$/)
+    })
+
+    it('uses S3_REGION from env when S3_REGION_FILE is empty, not the AWS_REGION fallback', () => {
+      // #given an empty bind-mounted S3_REGION_FILE, a real S3_REGION and a different AWS_REGION
+      setRequiredEnv()
+      process.env.S3_REGION_FILE = writeValueFile('s3-region-empty', '')
+      process.env.S3_REGION = 'us-east-1'
+      process.env.AWS_REGION = 'eu-west-2'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then the empty file does not shadow S3_REGION
+      expect(config.objectStore.region).toBe('us-east-1')
+    })
+
+    it('does not read the AWS_REGION fallback when S3_REGION is set: a malformed AWS_REGION is ignored', () => {
+      // #given a valid S3_REGION and an AWS_REGION with an embedded line break
+      setRequiredEnv()
+      process.env.S3_REGION = 'us-east-1'
+      process.env.AWS_REGION = 'us-\neast-2'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then the unused fallback cannot abort startup
+      expect(config.objectStore.region).toBe('us-east-1')
+    })
+
+    it('does not read the AWS_REGION fallback when S3_REGION is set: a symlinked AWS_REGION_FILE is ignored', () => {
+      // #given a valid S3_REGION and an AWS_REGION_FILE that is a symlink
+      setRequiredEnv()
+      process.env.S3_REGION = 'us-east-1'
+      const target = writeValueFile('aws-region-target', 'eu-west-2')
+      const link = join(tmpDir, 'aws-region-link')
+      symlinkSync(target, link)
+      process.env.AWS_REGION_FILE = link
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.region).toBe('us-east-1')
+    })
+
+    it('still rejects a malformed AWS_REGION when S3_REGION is unset', () => {
+      // #given the fallback is needed and it has an embedded line break
+      setRequiredEnv()
+      delete process.env.S3_REGION
+      process.env.AWS_REGION = 'us-\neast-2'
+
+      // #when / #then
+      expect(() => loadGatewayConfig()).toThrow(/AWS_REGION contains embedded line-breaking/)
+    })
+
+    it('still rejects a symlinked AWS_REGION_FILE when S3_REGION is unset', () => {
+      // #given
+      setRequiredEnv()
+      delete process.env.S3_REGION
+      const target = writeValueFile('aws-region-target-2', 'eu-west-2')
+      const link = join(tmpDir, 'aws-region-link-2')
+      symlinkSync(target, link)
+      process.env.AWS_REGION_FILE = link
+
+      // #when / #then
+      expect(() => loadGatewayConfig()).toThrow(/symlink|not a regular file/i)
+    })
+
+    it('reads the AWS_REGION fallback when S3_REGION_FILE is blank and S3_REGION is unset', () => {
+      // #given a blank S3_REGION_FILE counts as unset, so the fallback is needed
+      setRequiredEnv()
+      delete process.env.S3_REGION
+      process.env.S3_REGION_FILE = writeValueFile('s3-region-blank-2', '\n')
+      process.env.AWS_REGION = 'eu-west-2'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.region).toBe('eu-west-2')
+    })
+
+    it('trims a padded S3_REGION', () => {
+      // #given a region with surrounding whitespace
+      setRequiredEnv()
+      process.env.S3_REGION = '  us-east-1  '
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.region).toBe('us-east-1')
+    })
+  })
+
+  describe('blank _FILE defers to env (object-store settings only)', () => {
+    it('uses S3_BUCKET from env when S3_BUCKET_FILE is empty', () => {
+      // #given an empty bind-mounted S3_BUCKET_FILE and a bucket in env
+      setRequiredEnv()
+      process.env.S3_BUCKET_FILE = writeValueFile('s3-bucket-empty', '')
+      process.env.S3_BUCKET = 'env-bucket'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then the blank file does not hide the bucket
+      expect(config.objectStore.bucket).toBe('env-bucket')
+    })
+
+    it('reports the bucket as missing when S3_BUCKET_FILE is empty and S3_BUCKET is unset', () => {
+      // #given
+      setRequiredEnv()
+      delete process.env.S3_BUCKET
+      process.env.S3_BUCKET_FILE = writeValueFile('s3-bucket-empty-only', '  \n')
+
+      // #when / #then the missing-value text is unchanged
+      expect(() => loadGatewayConfig()).toThrow(
+        'Missing required secret: S3_BUCKET (set S3_BUCKET env var or S3_BUCKET_FILE pointing to a file)',
+      )
+    })
+
+    it('prefers a non-blank S3_BUCKET_FILE over the S3_BUCKET env var', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_BUCKET_FILE = writeValueFile('s3-bucket-file', 'file-bucket\n')
+      process.env.S3_BUCKET = 'env-bucket'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.bucket).toBe('file-bucket')
+    })
+
+    it('uses the env var when the S3_ENDPOINT_FILE path does not exist', () => {
+      // #given a missing file path, as readOptionalSecret treats it
+      setRequiredEnv()
+      process.env.S3_ENDPOINT_FILE = join(tmpDir, 'does-not-exist')
+      process.env.S3_ENDPOINT = 'https://my-minio.example.com'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.endpoint).toBe('https://my-minio.example.com')
+    })
+
+    it('uses the default prefix when S3_PREFIX is whitespace-only', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_PREFIX = '   '
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.prefix).toBe('fro-bot-state')
+    })
+
+    it('still rejects a symlinked S3_ENDPOINT_FILE', () => {
+      // #given a symlink where a secret file is expected
+      setRequiredEnv()
+      const target = writeValueFile('real-endpoint', 'https://my-minio.example.com')
+      const link = join(tmpDir, 'endpoint-link')
+      symlinkSync(target, link)
+      process.env.S3_ENDPOINT_FILE = link
+
+      // #when / #then symlink handling is the same as for every other secret
+      expect(() => loadGatewayConfig()).toThrow(/symlink|not a regular file/i)
+    })
+  })
+
+  describe('trimming', () => {
+    it('trims a padded S3_BUCKET', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_BUCKET = ' test-bucket '
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.bucket).toBe('test-bucket')
+    })
+
+    it('trims a padded S3_ENDPOINT before validating it', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_ENDPOINT = '  https://my-minio.example.com  '
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.endpoint).toBe('https://my-minio.example.com')
+    })
+  })
+
+  describe('endpoint (AE5)', () => {
+    it('keeps S3_ENDPOINT from env when S3_ENDPOINT_FILE is empty', () => {
+      // #given an empty bind-mounted S3_ENDPOINT_FILE (the compose default) and an endpoint in env
+      setRequiredEnv()
+      process.env.S3_ENDPOINT_FILE = writeValueFile('s3-endpoint-empty', '')
+      process.env.S3_ENDPOINT = 'https://my-minio.example.com'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then the empty file does not drop the endpoint
+      expect(config.objectStore.endpoint).toBe('https://my-minio.example.com')
+    })
+
+    it('fails startup for an http endpoint without S3_ALLOW_INSECURE_ENDPOINT', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_ENDPOINT = 'http://minio:9000'
+
+      // #when / #then
+      expect(() => loadGatewayConfig()).toThrow(/^S3_ENDPOINT: .*https/)
+    })
+
+    it('loads an http endpoint when S3_ALLOW_INSECURE_ENDPOINT=true', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_ENDPOINT = 'http://minio:9000'
+      process.env.S3_ALLOW_INSECURE_ENDPOINT = 'true'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.endpoint).toBe('http://minio:9000')
+      expect(config.objectStore.allowInsecureEndpoint).toBe(true)
+    })
+
+    it('reads S3_ALLOW_INSECURE_ENDPOINT from its _FILE form', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_ENDPOINT = 'http://minio:9000'
+      process.env.S3_ALLOW_INSECURE_ENDPOINT_FILE = writeValueFile('s3-insecure', 'true\n')
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.allowInsecureEndpoint).toBe(true)
+    })
+
+    it('treats any value other than exactly "true" as the flag being off', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_ENDPOINT = 'http://minio:9000'
+      process.env.S3_ALLOW_INSECURE_ENDPOINT = 'TRUE'
+
+      // #when / #then
+      expect(() => loadGatewayConfig()).toThrow(/^S3_ENDPOINT: /)
+    })
+
+    it('rejects a cloud-metadata endpoint even with S3_ALLOW_INSECURE_ENDPOINT=true', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_ENDPOINT = 'http://169.254.169.254'
+      process.env.S3_ALLOW_INSECURE_ENDPOINT = 'true'
+
+      // #when / #then
+      expect(() => loadGatewayConfig()).toThrow('cloud instance metadata services')
+    })
+
+    it('defaults allowInsecureEndpoint to false', () => {
+      // #given
+      setRequiredEnv()
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.allowInsecureEndpoint).toBe(false)
+    })
+  })
+
+  describe('prefix and SSE mode', () => {
+    it('fails startup for a prefix that fails the prefix rule, naming S3_PREFIX', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_PREFIX = '../x'
+
+      // #when / #then
+      expect(() => loadGatewayConfig()).toThrow(/^S3_PREFIX: /)
+    })
+
+    it('reads a custom prefix from S3_PREFIX_FILE', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_PREFIX_FILE = writeValueFile('s3-prefix', 'custom-state\n')
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.prefix).toBe('custom-state')
+    })
+
+    it('rejects S3_SSE=aes256 (wrong casing) and names S3_SSE', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_SSE = 'aes256'
+
+      // #when / #then
+      expect(() => loadGatewayConfig()).toThrow(/^S3_SSE: /)
+    })
+
+    it('accepts S3_SSE=AES256', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_SSE = 'AES256'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.sseEncryption).toBe('AES256')
+    })
+
+    it('accepts S3_SSE=aws:kms', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_SSE = 'aws:kms'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.sseEncryption).toBe('aws:kms')
+    })
+  })
+
+  describe('expected bucket owner and KMS key', () => {
+    it('passes S3_EXPECTED_BUCKET_OWNER and S3_SSE_KMS_KEY_ID from env into objectStore', () => {
+      // #given a KMS key on AWS (derived mode is aws:kms)
+      setRequiredEnv()
+      process.env.S3_EXPECTED_BUCKET_OWNER = '123456789012'
+      process.env.S3_SSE_KMS_KEY_ID = 'alias/fro-bot'
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.expectedBucketOwner).toBe('123456789012')
+      expect(config.objectStore.sseKmsKeyId).toBe('alias/fro-bot')
+    })
+
+    it.each(['12345', 'abcdefghijkl', '1234567890123'])(
+      'rejects a malformed S3_EXPECTED_BUCKET_OWNER (%s), naming the variable and not the value',
+      owner => {
+        // #given
+        setRequiredEnv()
+        process.env.S3_EXPECTED_BUCKET_OWNER = owner
+
+        // #when
+        let message = ''
+        try {
+          loadGatewayConfig()
+        } catch (error) {
+          message = error instanceof Error ? error.message : String(error)
+        }
+
+        // #then
+        expect(message).toMatch(/^S3_EXPECTED_BUCKET_OWNER: /)
+        expect(message).not.toContain(owner)
+      },
+    )
+
+    it('passes S3_EXPECTED_BUCKET_OWNER and S3_SSE_KMS_KEY_ID from their _FILE forms', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_EXPECTED_BUCKET_OWNER_FILE = writeValueFile('s3-owner', '123456789012\n')
+      process.env.S3_SSE_KMS_KEY_ID_FILE = writeValueFile('s3-kms', 'alias/from-file\n')
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore.expectedBucketOwner).toBe('123456789012')
+      expect(config.objectStore.sseKmsKeyId).toBe('alias/from-file')
+    })
+
+    it('omits the new optional settings when unset', () => {
+      // #given
+      setRequiredEnv()
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore).not.toHaveProperty('expectedBucketOwner')
+      expect(config.objectStore).not.toHaveProperty('sseKmsKeyId')
+      expect(config.objectStore).not.toHaveProperty('sseEncryption')
+    })
+
+    it('rejects a KMS key with a custom endpoint and no S3_SSE, naming S3_SSE_KMS_KEY_ID', () => {
+      // #given a custom endpoint derives AES256, so the key would be silently dropped
+      setRequiredEnv()
+      process.env.S3_ENDPOINT = 'http://minio:9000'
+      process.env.S3_ALLOW_INSECURE_ENDPOINT = 'true'
+      process.env.S3_SSE_KMS_KEY_ID = 'alias/fro-bot'
+
+      // #when / #then
+      expect(() => loadGatewayConfig()).toThrow(/^S3_SSE_KMS_KEY_ID: /)
+    })
+  })
+
+  describe('error text', () => {
+    it('does not echo the rejected value', () => {
+      // #given
+      setRequiredEnv()
+      process.env.S3_PREFIX = '../secret-looking-value'
+
+      // #when
+      let message: string | undefined
+      try {
+        loadGatewayConfig()
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error)
+      }
+
+      // #then it fails, and the message names the source but never the value
+      expect(message).toMatch(/^S3_PREFIX: /)
+      expect(message).not.toContain('secret-looking-value')
+    })
+  })
+
+  describe('CI gateway smoke env', () => {
+    it('loads with only S3_BUCKET and S3_REGION set for the object store', () => {
+      // #given the smoke job sets S3_BUCKET and S3_REGION and nothing else for the store
+      setRequiredEnv()
+
+      // #when
+      const config = loadGatewayConfig()
+
+      // #then
+      expect(config.objectStore).toEqual({
+        enabled: true,
+        bucket: 'test-bucket',
+        region: 'us-east-1',
+        prefix: 'fro-bot-state',
+        allowInsecureEndpoint: false,
+      })
+    })
   })
 })
 
@@ -3233,5 +3819,97 @@ describe('operatorPush config', () => {
 
     // #when / #then
     expect(OPERATOR_CONTRACT_VERSION).toBe('1.13.0')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Blank `_FILE` is an explicit opt-out for security-relevant secrets: a stale env var of the same name must never
+// bring the value back. Only the object-store settings defer to env (see the object-store block above).
+// ---------------------------------------------------------------------------
+
+describe('loadGatewayConfig — blank _FILE never falls through to env for security secrets', () => {
+  it('gATEWAY_OPERATOR_ALLOWLIST: blank file + env set → startup throws (fail closed)', () => {
+    // #given the operator surface is enabled, the allowlist file is blank and a stale env allowlist is set
+    setRequiredEnv()
+    setOperatorWebEnv()
+    process.env.GATEWAY_OPERATOR_ALLOWLIST = '42\n99'
+    process.env.GATEWAY_OPERATOR_ALLOWLIST_FILE = writeValueFile('operator-allowlist-blank', '\n')
+
+    // #when / #then the stale env value does not come back
+    expect(() => loadGatewayConfig()).toThrow(/allowlist/i)
+  })
+
+  it('gATEWAY_BINDER_ALLOWLIST: blank file + env set → the allowlist is empty (refuses everyone)', () => {
+    // #given a blank binder allowlist file and a stale env allowlist
+    setRequiredEnv()
+    process.env.GATEWAY_BINDER_ALLOWLIST = '123456789012345678'
+    process.env.GATEWAY_BINDER_ALLOWLIST_FILE = writeValueFile('binder-allowlist-blank', '')
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then the stale env entry is not granted binder rights
+    expect(config.binderAllowlist.size).toBe(0)
+  })
+
+  it('gATEWAY_WEBHOOK_SECRET: blank file + env set → the secret is treated as absent', () => {
+    // #given a blank webhook secret file, a stale env secret, and a presence channel (both-or-neither rule)
+    setRequiredEnv()
+    process.env.GATEWAY_WEBHOOK_SECRET = 'stale-webhook-secret'
+    process.env.GATEWAY_WEBHOOK_SECRET_FILE = writeValueFile('webhook-secret-blank', '')
+
+    // #when / #then the endpoint is not half-enabled with the stale secret
+    expect(() => loadGatewayConfig()).toThrow('Both GATEWAY_WEBHOOK_SECRET and GATEWAY_PRESENCE_CHANNEL_ID')
+  })
+
+  it('gATEWAY_WEBHOOK_SECRET: blank file + env set, no presence channel → announce stays disabled', () => {
+    // #given
+    setRequiredEnv()
+    delete process.env.GATEWAY_PRESENCE_CHANNEL_ID
+    process.env.GATEWAY_WEBHOOK_SECRET = 'stale-webhook-secret'
+    process.env.GATEWAY_WEBHOOK_SECRET_FILE = writeValueFile('webhook-secret-blank-2', '')
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.announce).toBeUndefined()
+  })
+
+  it('gATEWAY_OPERATOR_CSRF_SECRET: blank file + env set → startup throws (missing secret)', () => {
+    // #given the operator surface is enabled with a blank CSRF secret file and a stale env secret
+    setRequiredEnv()
+    setOperatorWebEnv()
+    process.env.GATEWAY_OPERATOR_CSRF_SECRET = 'dGVzdC1jc3JmLXNlY3JldC0zMi1ieXRlcy1sb25nISE'
+    process.env.GATEWAY_OPERATOR_CSRF_SECRET_FILE = writeValueFile('csrf-secret-blank', '\n')
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow('Missing required secret: GATEWAY_OPERATOR_CSRF_SECRET')
+  })
+
+  it('gATEWAY_OPERATOR_GITHUB_CLIENT_SECRET: blank file + env set → startup throws (missing secret)', () => {
+    // #given the operator surface is enabled with a blank OAuth client secret file and a stale env secret
+    setRequiredEnv()
+    setOperatorWebEnv()
+    process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET = 'stale-oauth-client-secret'
+    process.env.GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET_FILE = writeValueFile('oauth-client-secret-blank', '')
+
+    // #when / #then
+    expect(() => loadGatewayConfig()).toThrow('Missing required secret: GATEWAY_OPERATOR_GITHUB_CLIENT_SECRET')
+  })
+
+  it('aWS_ACCESS_KEY_ID: blank file + env set → no static credentials (SDK default chain)', () => {
+    // #given a blank key-id file with a stale env key pair
+    setRequiredEnv()
+    process.env.AWS_ACCESS_KEY_ID = 'stale-key-id'
+    process.env.AWS_SECRET_ACCESS_KEY = 'stale-secret'
+    process.env.AWS_ACCESS_KEY_ID_FILE = writeValueFile('aws-key-blank', '')
+    process.env.AWS_SECRET_ACCESS_KEY_FILE = writeValueFile('aws-secret-blank', '')
+
+    // #when
+    const config = loadGatewayConfig()
+
+    // #then
+    expect(config.objectStore.credentials).toBeUndefined()
   })
 })

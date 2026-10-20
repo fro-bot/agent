@@ -28,10 +28,10 @@ The concerns fall into two groups (full inventory: [2026-10-18-action-gateway-co
 | Concern | Kind | Disposition |
 | --- | --- | --- |
 | Provider-failure classification | Duplicated behavior | Ladder, rung 1 (delivered in #1869) |
-| Payload accessors, task-notice parser, small helpers | Duplicated behavior | Ladder, pure leaves |
+| Payload accessors, task-notice parser | Duplicated behavior | Ladder, rung 2 (delivered in #1872) |
 | Bounded abort and settle (teardown) | Duplicated behavior, stateful | Separately planned rung |
 | Lock lease renewal and takeover | Duplicated behavior, stateful | Separately planned rung, after a takeover-policy decision |
-| S3 and object-store config | Duplicated parsing and validation | Config spine, block 1 |
+| S3 and object-store config | Duplicated parsing and validation | Config spine, block 1 (one object-store settings parser in runtime) |
 | Event-stream loop | Duplicated behavior | Later, after leaves and seams prove out |
 | Timeouts and inactivity | Partly shared (runtime timer unused by the Action) | Later, with the event-stream loop |
 | GitHub App token minting, log redaction wrappers | Small duplicates | Ladder, low priority |

@@ -1,10 +1,11 @@
 import process from 'node:process'
 
-import {Effect} from 'effect'
+import {Cause, Effect, Runtime} from 'effect'
 
 import {parseBackfillArgs, runDenyKeyBackfill, USAGE} from './bindings/backfill-runner.js'
 import {loadGatewayConfig} from './config.js'
 import {createAnnounceServer} from './http/server.js'
+import {ObjectStoreConfigError} from './object-store-config.js'
 import {makeDiscordClientFromConfig, makeGatewayProgram, makeLogger} from './program.js'
 import {setupReadinessFlag} from './readiness.js'
 import {validateProviderSemanticsEffect} from './runtime-effect.js'
@@ -98,6 +99,24 @@ export function parseOperatorRouteSmokeArgs(
   return {mode: 'run'}
 }
 
+/**
+ * Find an object-store settings error in a startup failure. `Effect.runPromise` rejects with a `FiberFailure` that
+ * wraps the failure `Cause`, so unwrap it. Only this error type is value-free by construction; other config failures
+ * (for example `Invalid LOG_LEVEL value: "..."`) can echo what the operator typed, so they are not logged.
+ */
+function findObjectStoreConfigError(error: unknown): ObjectStoreConfigError | undefined {
+  if (error instanceof ObjectStoreConfigError) {
+    return error
+  }
+
+  if (Runtime.isFiberFailure(error)) {
+    const failure = Cause.squash(error[Runtime.FiberFailureCauseId])
+    return failure instanceof ObjectStoreConfigError ? failure : undefined
+  }
+
+  return undefined
+}
+
 export async function dispatchArgv(): Promise<void> {
   const subcommand = process.argv[2]
 
@@ -131,10 +150,16 @@ export async function dispatchArgv(): Promise<void> {
   } else {
     // No subcommand (or unrecognized subcommand) — start the gateway program.
     // Config may not have loaded, so instantiate the logger at a fixed 'error'
-    // level here rather than reading the configured level.
-    await Effect.runPromise(program).catch(() => {
+    // level here rather than reading the configured level. Failures carry no detail
+    // unless they are an object-store settings error, whose message never holds a value.
+    await Effect.runPromise(program).catch((error: unknown) => {
       const startupLogger = makeLogger('error')
-      startupLogger.error({}, 'gateway startup failed')
+      const configError = findObjectStoreConfigError(error)
+      if (configError === undefined) {
+        startupLogger.error({}, 'gateway startup failed')
+      } else {
+        startupLogger.error({error: configError.message}, 'gateway config invalid')
+      }
       process.exit(1)
     })
   }
