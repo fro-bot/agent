@@ -627,6 +627,22 @@ describe('releaseLockIfHolder', () => {
     expect(objects.has(ACTION_KEY)).toBe(true)
   })
 
+  it('fails closed without deleting a holder-matching record whose expiry is not a finite number', async () => {
+    // #given the caller's own record, but its acquired_at is unparseable: it is rejected like any malformed record
+    const {config, objects, adapter} = createMemoryStore({
+      [ACTION_KEY]: lockRecord({holder_id: 'action:1:1', surface: 'github', acquired_at: 'not-a-date'}),
+    })
+
+    // #when
+    const result = await releaseLockIfHolder(config, 'owner/repo', 'action:1:1', createLogger(), 'action')
+
+    // #then
+    expect(result.success).toBe(false)
+    expect(result.success === false ? result.error.message : '').toBe('Invalid lock record payload')
+    expect(adapter.conditionalDelete).not.toHaveBeenCalled()
+    expect(objects.has(ACTION_KEY)).toBe(true)
+  })
+
   it('reports no-lock when the lock is already gone', async () => {
     // #given
     const {config} = createMemoryStore()

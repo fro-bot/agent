@@ -16,8 +16,10 @@ import type {CoordinationConfig, RunState} from '@fro-bot/runtime'
 import type {RepoQuiescenceChecker} from '../execute/repo-quiescence.js'
 import type {GatewayLogger} from './client.js'
 
+import {err, ok} from '@fro-bot/runtime'
 import {Effect} from 'effect'
 import {toRuntimeLogger} from '../execute/runtime-logger.js'
+import {transitionRetryingStaleEtag} from '../execute/stale-etag-transition.js'
 import {
   acquireLockEffect,
   createHeartbeatController,
@@ -97,13 +99,24 @@ export function acquireMaintenanceRun(opts: {
     }
     let runEtag = createResult.right.etag
 
-    const heartbeat = createHeartbeatController(coordinationConfig, identity, repo, runId, lockEtag, coordLogger)
+    const heartbeat = createHeartbeatController(
+      coordinationConfig,
+      identity,
+      repo,
+      runId,
+      lockEtag,
+      runEtag,
+      coordLogger,
+    )
     heartbeat.start()
     let stopped = false
 
     const release = (finalPhase: 'COMPLETED' | 'FAILED', detailsPatch?: Record<string, unknown>): Effect.Effect<void> =>
       Effect.gen(function* () {
         let finalLockEtag = lockEtag
+        // A failed stop leaves `runEtag` possibly stale (every tick rewrites the RunState), so the terminal
+        // transition re-reads once and retries once on failure. A clean stop returns an authoritative ETag.
+        let stopFailed = false
         if (stopped === false) {
           stopped = true
           const stopResult = yield* Effect.tryPromise({
@@ -114,25 +127,45 @@ export function acquireMaintenanceRun(opts: {
             runEtag = stopResult.right.data.runEtag
             finalLockEtag = stopResult.right.data.lockEtag
           } else {
-            // A failed stop still reports the freshest confirmed lock ETag; only the RunState ETag stays last-known.
+            stopFailed = true
+            // A failed stop still reports the freshest ETags its successful writes produced.
             if (stopResult._tag === 'Right' && stopResult.right.success === false) {
               finalLockEtag = stopResult.right.error.lockEtag
+              runEtag = stopResult.right.error.runEtag
             }
-            logger.warn({repo, runId}, 'maintenance-run: heartbeat stop failed; using last known etags')
+            logger.warn({repo, runId}, 'maintenance-run: heartbeat stop failed; using the etags it last confirmed')
           }
         }
-        const transitionResult = yield* transitionRunEffect(
-          coordinationConfig,
-          identity,
-          repo,
-          runId,
-          finalPhase,
-          runEtag,
-          coordLogger,
-          detailsPatch === undefined ? undefined : {detailsPatch},
-        ).pipe(Effect.either)
-        if (transitionResult._tag === 'Left') {
-          logger.warn({repo, runId, err: transitionResult.left.message}, 'maintenance-run: terminal transition failed')
+        const attempt = async (etag: string) => {
+          const attempted = await Effect.runPromise(
+            transitionRunEffect(
+              coordinationConfig,
+              identity,
+              repo,
+              runId,
+              finalPhase,
+              etag,
+              coordLogger,
+              detailsPatch === undefined ? undefined : {detailsPatch},
+            ).pipe(Effect.either),
+          )
+          return attempted._tag === 'Right' ? ok(attempted.right) : err(attempted.left)
+        }
+        const transitionResult = yield* Effect.promise(async () =>
+          stopFailed
+            ? transitionRetryingStaleEtag({
+                config: coordinationConfig,
+                identity,
+                repo,
+                runId,
+                etag: runEtag,
+                logger,
+                attempt,
+              })
+            : attempt(runEtag),
+        )
+        if (transitionResult.success === false) {
+          logger.warn({repo, runId, err: transitionResult.error.message}, 'maintenance-run: terminal transition failed')
         }
         yield* releaseLockEffect(coordinationConfig, repo, finalLockEtag, coordLogger).pipe(
           Effect.tapError(error =>

@@ -76,6 +76,7 @@ import {
 import {createQuestionEffects} from './question-client.js'
 import {RunCoreError, runOpenCodeCore} from './run-core.js'
 import {toRuntimeLogger} from './runtime-logger.js'
+import {transitionRetryingStaleEtag} from './stale-etag-transition.js'
 
 // ---------------------------------------------------------------------------
 // Public interfaces
@@ -652,7 +653,13 @@ interface ScheduleQuarantineReleaseOpts {
  * This schedules the deferred other half. After `QUARANTINE_HOLD_WINDOW_MS`:
  *  1. Stops the heartbeat (best-effort) — the lease stops renewing and the
  *     run-state heartbeat goes stale, letting the lease expire so a corroborated
- *     takeover or `force-release-lock` becomes possible.
+ *     takeover or `force-release-lock` becomes possible. `stop()` waits at most
+ *     `HEARTBEAT_STOP_GRACE_MS` for an in-flight tick, and ticks that have not
+ *     yet started their lock renewal or RunState write skip that I/O. A request
+ *     already in flight when `stop()` began can still land: a late renewal
+ *     restarts the lease TTL, so the lease can outlive this window by up to one
+ *     TTL. That window is residual — closing it needs the object-store adapter
+ *     to abort in-flight requests.
  *  2. Releases the concurrency slot — via the same atomic hand-off-or-release
  *     logic the ordinary completion path uses, so a queued task is never made
  *     to wait out this window behind a run that already finished failing.
@@ -962,10 +969,34 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     // Push the ACKNOWLEDGED state to the observation pipeline (best-effort, fire-and-forget).
     notifyObserverBestEffort(deps, ackResult.data.state)
 
-    const heartbeat = createHeartbeatController(coordinationConfig, identity, repo, runId, lockEtag, coordLogger)
+    const heartbeat = createHeartbeatController(
+      coordinationConfig,
+      identity,
+      repo,
+      runId,
+      lockEtag,
+      runEtag,
+      coordLogger,
+    )
     heartbeat.start()
 
     let heartbeatStopped = false
+    // Set when a heartbeat stop fails. Every tick rewrites the RunState, so the ETag the terminal transition then
+    // uses may be stale (after a `tickPending` stop one more write may still land): the transition re-reads once
+    // and retries once on failure (`transitionRetryingStaleEtag`). A clean stop returns an authoritative ETag, so
+    // those transitions keep their single attempt.
+    let heartbeatStopFailed = false
+    const transitionTerminal = async (
+      phase: RunState['phase'],
+      etag: string,
+      options?: Parameters<typeof transitionRun>[7],
+    ) => {
+      const attempt = async (attemptEtag: string) =>
+        transitionRun(coordinationConfig, identity, repo, runId, phase, attemptEtag, coordLogger, options)
+      return heartbeatStopFailed
+        ? transitionRetryingStaleEtag({config: coordinationConfig, identity, repo, runId, etag, logger, attempt})
+        : attempt(etag)
+    }
 
     // ── Ownership ledger — tracks background subagents this run dispatches ──
     //
@@ -1053,24 +1084,20 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           runEtag = stopResult.data.runEtag
           lockEtag = stopResult.data.lockEtag
         } else {
-          // A failed stop still reports the freshest lock ETag a renewal confirmed (tick failure) or the
-          // last confirmed one (tick still pending); only the RunState ETag stays at its last known value.
+          // A failed stop still reports the freshest lock and RunState ETags the heartbeat confirmed.
           lockEtag = stopResult.error.lockEtag
+          runEtag = stopResult.error.runEtag
+          heartbeatStopFailed = true
           logger.warn(
             {repo, runId, err: stopResult.error.message, tickPending: stopResult.error.tickPending},
-            'run: heartbeat stop failed during preparation termination; using last known run etag',
+            'run: heartbeat stop failed during preparation termination; using the ETags it last confirmed',
           )
         }
       }
 
-      const failedResult = await transitionRun(
-        coordinationConfig,
-        identity,
-        repo,
-        runId,
+      const failedResult = await transitionTerminal(
         'FAILED',
         runEtag,
-        coordLogger,
         checkoutPreparation === undefined ? undefined : {detailsPatch: {checkoutPreparation}},
       )
       if (failedResult.success === false) {
@@ -1494,21 +1521,15 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         lockEtag = stopResult.data.lockEtag
       } else {
         lockEtag = stopResult.error.lockEtag
+        runEtag = stopResult.error.runEtag
+        heartbeatStopFailed = true
         logger.warn(
           {repo, runId, err: stopResult.error.message, tickPending: stopResult.error.tickPending},
           'run: heartbeat stop failed; using last known etags',
         )
       }
 
-      const completedResult = await transitionRun(
-        coordinationConfig,
-        identity,
-        repo,
-        runId,
-        'COMPLETED',
-        runEtag,
-        coordLogger,
-      )
+      const completedResult = await transitionTerminal('COMPLETED', runEtag)
       // Capture the COMPLETED state now so we can notify AFTER the final-answer flush.
       // The notify is deferred to guarantee the web sink's flush() → final output frame
       // is pushed before observe(terminalState) fans the terminal status frame (which
@@ -1742,6 +1763,8 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
             lockEtag = stopResult.data.lockEtag
           } else {
             lockEtag = stopResult.error.lockEtag
+            runEtag = stopResult.error.runEtag
+            heartbeatStopFailed = true
             logger.warn(
               {repo, runId, err: stopResult.error.message, tickPending: stopResult.error.tickPending},
               'run: heartbeat stop failed on cancel path; using last known etags',
@@ -1768,16 +1791,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         const cancelledByMetadata = abortRegistry.getMetadata(runId)
         const cancelledOptions =
           cancelledByMetadata === undefined ? undefined : {detailsPatch: {cancelledBy: cancelledByMetadata}}
-        const cancelledResult = await transitionRun(
-          coordinationConfig,
-          identity,
-          repo,
-          runId,
-          'CANCELLED',
-          runEtag,
-          coordLogger,
-          cancelledOptions,
-        )
+        const cancelledResult = await transitionTerminal('CANCELLED', runEtag, cancelledOptions)
         if (cancelledResult.success === false) {
           logger.error({repo, runId, err: cancelledResult.error.message}, 'run: transitionRun CANCELLED failed')
 
@@ -1860,6 +1874,8 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
             lockEtag = stopResult.data.lockEtag
           } else {
             lockEtag = stopResult.error.lockEtag
+            runEtag = stopResult.error.runEtag
+            heartbeatStopFailed = true
             logger.warn(
               {repo, runId, err: stopResult.error.message, tickPending: stopResult.error.tickPending},
               'run: heartbeat stop failed; using last known etags',
@@ -1873,16 +1889,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         const inFlightDetailsPatch = failureDetailsPatch(execError)
         const inFlightFailedOptions =
           inFlightDetailsPatch === undefined ? undefined : {detailsPatch: inFlightDetailsPatch}
-        const failedResult = await transitionRun(
-          coordinationConfig,
-          identity,
-          repo,
-          runId,
-          'FAILED',
-          runEtag,
-          coordLogger,
-          inFlightFailedOptions,
-        )
+        const failedResult = await transitionTerminal('FAILED', runEtag, inFlightFailedOptions)
         // Capture the FAILED state now so we can notify AFTER the partial-output flush.
         // The notify is deferred to guarantee the web sink's flush() → final output frame
         // is pushed before observe(terminalState) fans the terminal status frame (which

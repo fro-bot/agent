@@ -34,6 +34,12 @@ export interface HeartbeatStopError extends Error {
    */
   readonly lockEtag: string
   /**
+   * The ETag of the controller's last successful RunState write (the ETag it was constructed with if none
+   * succeeded). Every tick rewrites the RunState, so a terminal transition that uses an older ETag loses its
+   * conditional write; with `tickPending`, one late write may still land and make this stale too.
+   */
+  readonly runEtag: string
+  /**
    * True when the grace period elapsed while a tick was still in flight. That tick may yet renew the lock or
    * write the RunState, so neither ETag the caller holds can be trusted to be current.
    */
@@ -54,9 +60,15 @@ export interface HeartbeatController {
    * ETags may be stale, so it must settle best-effort (a conditional write or release that loses the race fails
    * safely).
    *
+   * `stop()` first marks the controller stopping, so a tick that has not yet started its lock renewal or its
+   * RunState write skips that I/O. A request already in flight when `stop()` began can still land: a late renewal
+   * restarts the lease TTL and a late RunState write changes the run ETag. That window is residual; closing it needs
+   * the object-store adapter to abort in-flight requests.
+   *
    * If a heartbeat tick failed since the last successful tick, returns the tick error. Every failure carries
    * `lockEtag`, the freshest lock ETag a renewal confirmed, so a RunState write that failed after a successful
-   * renewal does not strand the caller on the acquisition ETag.
+   * renewal does not strand the caller on the acquisition ETag, and `runEtag`, the ETag of the last successful
+   * RunState write.
    * Otherwise returns the freshest snapshot fetched after in-flight ticks complete.
    */
   readonly stop: () => Promise<Result<HeartbeatStopResult, HeartbeatStopError>>
@@ -78,23 +90,33 @@ export function createHeartbeatController(
   repo: string,
   runId: string,
   lockEtag: string,
+  runEtag: string,
   logger: {debug: (message: string, context?: Record<string, unknown>) => void},
 ): HeartbeatController {
   let intervalHandle: ReturnType<typeof setInterval> | null = null
   let running = false
   let inFlight: Promise<void> | null = null
   let tickError: Error | null = null
+  let stopping = false
   let currentLockEtag = lockEtag
+  // Tracked apart from the lock ETag: the lock and the RunState are separate objects and a tick can advance one
+  // without the other.
+  let currentRunEtag = runEtag
 
   const toStopError = (error: Error, tickPending: boolean): HeartbeatStopError =>
-    Object.assign(new Error(error.message, {cause: error}), {lockEtag: currentLockEtag, tickPending})
+    Object.assign(new Error(error.message, {cause: error}), {
+      lockEtag: currentLockEtag,
+      runEtag: currentRunEtag,
+      tickPending,
+    })
 
   const runKey = getRunKey(config, identity, repo, runId)
   if (runKey.success === false) {
     throw runKey.error
   }
 
-  const writeHeartbeat = async (): Promise<void> => {
+  /** Resolves `true` when the tick ran to completion, `false` when it skipped its I/O because `stop()` had begun. */
+  const writeHeartbeat = async (): Promise<boolean> => {
     const current = await requireGetObject(config)(runKey.data)
     if (current.success === false) {
       throw current.error
@@ -111,6 +133,13 @@ export function createHeartbeatController(
     // timestamp stays stale so findStaleRuns correctly flags this run. The reverse
     // order (heartbeat first, lease second) causes split-brain: run looks fresh but
     // lock TTL expires, allowing another gateway to steal the lock.
+    //
+    // A tick that outlives `stop()` must not start new I/O: a late renewal would restart the lease TTL after the
+    // caller has already tried to release it.
+    if (stopping) {
+      return false
+    }
+
     const renewed = await renewLease(
       config,
       repo,
@@ -131,6 +160,10 @@ export function createHeartbeatController(
 
     currentLockEtag = renewed.data.etag
 
+    if (stopping) {
+      return false
+    }
+
     const written = await requireConditionalPut(config)(runKey.data, JSON.stringify(nextState), {
       ifMatch: current.data.etag,
       tagging: RUN_STATE_TAG,
@@ -138,6 +171,9 @@ export function createHeartbeatController(
     if (written.success === false) {
       throw written.error
     }
+
+    currentRunEtag = written.data.etag
+    return true
   }
 
   const runTick = (): void => {
@@ -146,8 +182,11 @@ export function createHeartbeatController(
     }
 
     inFlight = writeHeartbeat()
-      .then(() => {
-        tickError = null
+      .then(completed => {
+        // A tick that skipped its I/O proves nothing about the earlier failure it would otherwise clear.
+        if (completed) {
+          tickError = null
+        }
       })
       .catch(error => {
         tickError = error instanceof Error ? error : new Error(String(error))
@@ -178,11 +217,13 @@ export function createHeartbeatController(
 
       logger.debug('Starting heartbeat controller', {repo, runId})
       running = true
+      stopping = false
       intervalHandle = setInterval(runTick, config.heartbeatIntervalMs)
     },
     stop: async (): Promise<Result<HeartbeatStopResult, HeartbeatStopError>> => {
       logger.debug('Stopping heartbeat controller', {repo, runId})
       running = false
+      stopping = true
       if (intervalHandle != null) {
         clearInterval(intervalHandle)
         intervalHandle = null
