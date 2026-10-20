@@ -4,6 +4,7 @@ import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
 import * as core from '@actions/core'
 import {addLabelsToIssue, ensureLabelExists, removeLabelFromIssueWithOutcome} from '../../services/github/api.js'
+import {sleep} from '../../shared/async.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {htmlCode, htmlLink, htmlParagraph, htmlStrong, htmlText} from '../../shared/summary-html.js'
 import {parseActionHolderRunId} from './acquire-lock.js'
@@ -36,13 +37,6 @@ const DEFAULT_RESTORE_BACKOFF_MS: readonly number[] = [250, 750]
  * removed for the re-stamp and every attempt to put it back failed, so the persistent blocked signal is gone.
  */
 type BlockedLabelResult = 'applied' | 'failed' | 'lost'
-
-async function sleep(ms: number): Promise<void> {
-  if (ms <= 0) return
-  await new Promise<void>(resolve => {
-    setTimeout(resolve, ms)
-  })
-}
 
 /** Issue/PR number the blocked label applies to, or `null` for repository-level, discussion, and manual triggers. */
 function resolveLabelTarget(context: TriggerContext): number | null {
@@ -126,7 +120,8 @@ async function applyBlockedLabel(
     if (removal !== 'removed') return 'failed'
 
     for (const delayMs of backoffMs) {
-      await sleep(delayMs)
+      // Runtime sleep throws on negative input: skip the wait, not the retry, for zero or negative entries.
+      if (delayMs > 0) await sleep(delayMs)
       if (await addLabelsToIssue(client, repoString, issueNumber, [BLOCKED_LABEL], logger)) return 'applied'
     }
     logger.error('Blocked label could not be restored after the re-stamp removed it', {

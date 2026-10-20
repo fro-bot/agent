@@ -12,7 +12,7 @@
  * coordination fields holder_id, thread_id, and details are excluded by construction —
  * they do not appear in the type and cannot appear in the projection output.
  *
- * Security (R5/R6 cross-obligation, metadata/repos.yaml redaction obligation): entity_ref is 'owner/repo#123'.
+ * Security (R5/R6 cross-obligation, metadata/repos.yaml redaction obligation): entity_ref is the bare 'owner/repo'.
  * Exposing it for a repo redacted in metadata/repos.yaml reintroduces the repo-redaction cross-obligation leak.
  * The pre-query redaction gate does NOT retroactively scrub an already-stored run's status,
  * so toOperatorRunStatus requires a caller-supplied repoKey + isRepoDenylisted predicate and returns null

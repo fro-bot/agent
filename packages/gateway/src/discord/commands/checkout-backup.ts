@@ -22,6 +22,7 @@ import {formatBranchForReply} from '../../execute/provenance.js'
 import {editInteractionAsync} from '../io.js'
 import {hasManageChannels} from '../manage-channels-check.js'
 import {createNonceRegistry, type NonceBinding} from '../recover-confirm-nonce.js'
+import {formatBinaryBytes} from './format-binary-bytes.js'
 import {INTERNAL_ERROR_COPY, makeGuildCommand} from './guild-command.js'
 import {NOT_ACTIVE_REPLY} from './recover-checkout.js'
 
@@ -43,23 +44,13 @@ export function getBackupDeleteNonceRegistryForTesting(): typeof deleteNonceRegi
   return deleteNonceRegistry
 }
 
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`
-  const units = ['KiB', 'MiB', 'GiB', 'TiB']
-  let value = bytes / 1024
-  let unitIndex = 0
-  while (value >= 1024 && unitIndex < units.length - 1) {
-    value /= 1024
-    unitIndex += 1
-  }
-  return `${value.toFixed(1)} ${units[unitIndex]}`
-}
-
 /** Plan's exact list-row text: `<id> · <date> · <size> · from branch <branch> at <short-sha>`. */
 function formatListRow(entry: BackupEntry): string {
   const branch = entry.originalBranch === undefined ? 'unknown' : formatBranchForReply(entry.originalBranch)
   const sha = entry.originalHeadSha === undefined ? 'unknown' : entry.originalHeadSha.slice(0, 7)
-  const size = entry.sizeComplete ? formatBytes(entry.sizeBytes) : `at least ${formatBytes(entry.sizeBytes)}`
+  const size = entry.sizeComplete
+    ? formatBinaryBytes(entry.sizeBytes)
+    : `at least ${formatBinaryBytes(entry.sizeBytes)}`
   return `\`${entry.id}\` · ${entry.createdAt} · ${size} · from branch \`${branch}\` at \`${sha}\``
 }
 
@@ -160,7 +151,9 @@ async function runDeleteRequest(
     return
   }
 
-  const size = entry.sizeComplete ? formatBytes(entry.sizeBytes) : `at least ${formatBytes(entry.sizeBytes)}`
+  const size = entry.sizeComplete
+    ? formatBinaryBytes(entry.sizeBytes)
+    : `at least ${formatBinaryBytes(entry.sizeBytes)}`
   const content = `Delete backup \`${id}\` from ${entry.createdAt}, ${size}? This can't be undone.`
   const firstEdit = await editInteractionAsync(
     interaction,

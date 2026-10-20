@@ -373,10 +373,8 @@ export function createRunIndex(deps: RunIndexDeps): RunIndex {
 
       const match = runs.find(r => r.run_id === runId)
       if (match !== undefined) {
-        // Strip the '#runNumber' fragment from entity_ref before storing in RunLocation.
-        // entity_ref is 'owner/repo#N'; RunLocation.repo must be 'owner/repo' only.
-        // Pre-existing bug (CORR-001): without this strip, the '#N' fragment leaks
-        // into the accelerator cache's repo field and any downstream consumer of lookup().
+        // The gateway writes entity_ref as the bare 'owner/repo'. The strip only guards legacy or malformed
+        // records with a '#...' suffix, so it never leaks into RunLocation.repo or the accelerator cache.
         const entityRefRepo = match.entity_ref.split('#')[0] ?? match.entity_ref
         const location: RunLocation = {repo: entityRefRepo, surface: match.surface}
         // Re-cache into the accelerator so subsequent lookups are fast.

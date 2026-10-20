@@ -17,6 +17,7 @@ import type {RepoQuiescenceChecker} from '../execute/repo-quiescence.js'
 import type {GatewayLogger} from './client.js'
 
 import {Effect} from 'effect'
+import {toRuntimeLogger} from '../execute/runtime-logger.js'
 import {
   acquireLockEffect,
   createHeartbeatController,
@@ -24,14 +25,6 @@ import {
   releaseLockEffect,
   transitionRunEffect,
 } from '../runtime-effect.js'
-
-/** Narrow logger adapter for runtime coordination calls \u2014 mirrors `execute/run.ts`'s `toCoordLogger`. */
-function toCoordLogger(logger: GatewayLogger): {
-  debug: (message: string, context?: Record<string, unknown>) => void
-  info: (message: string, context?: Record<string, unknown>) => void
-} {
-  return {debug: (msg, ctx) => logger.debug(ctx ?? {}, msg), info: (msg, ctx) => logger.info(ctx ?? {}, msg)}
-}
 
 export interface MaintenanceRunHandle {
   readonly runId: string
@@ -64,7 +57,7 @@ export function acquireMaintenanceRun(opts: {
   readonly checkRepoQuiescence: RepoQuiescenceChecker
 }): Effect.Effect<AcquireMaintenanceRunResult> {
   const {coordinationConfig, identity, repo, kind, logger, checkRepoQuiescence} = opts
-  const coordLogger = toCoordLogger(logger)
+  const coordLogger = toRuntimeLogger(logger)
   const runId = crypto.randomUUID()
 
   return Effect.gen(function* () {

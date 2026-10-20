@@ -58,10 +58,11 @@
  * hand-off lives entirely in `run.ts`.
  */
 
-import type {OwnershipLedger, Logger as RuntimeLogger, SessionClient} from '@fro-bot/runtime'
+import type {OwnershipLedger, SessionClient} from '@fro-bot/runtime'
 import type {GatewayLogger} from '../discord/client.js'
 
 import {createSdkLedgerReconcileAdapter, reconcileLedgerOnce} from '@fro-bot/runtime'
+import {toRuntimeLogger} from './runtime-logger.js'
 
 /**
  * Upper bound, in milliseconds, on the whole settle attempt (abort round +
@@ -97,16 +98,6 @@ export interface SettleOwnedSessionsParams {
 }
 
 export type SettleOwnedSessionsResult = {readonly settled: true} | {readonly settled: false; readonly reason: string}
-
-/** Adapt the gateway's `(context, message)` logger to the runtime's `(message, context)` shape. */
-function toRuntimeLogger(logger: GatewayLogger): RuntimeLogger {
-  return {
-    debug: (msg, ctx) => logger.debug(ctx ?? {}, msg),
-    info: (msg, ctx) => logger.info(ctx ?? {}, msg),
-    warning: (msg, ctx) => logger.warn(ctx ?? {}, msg),
-    error: (msg, ctx) => logger.error(ctx ?? {}, msg),
-  }
-}
 
 /**
  * Cancel a single session. Best-effort: checks BOTH the SDK error envelope

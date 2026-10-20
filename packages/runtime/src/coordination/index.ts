@@ -1,3 +1,4 @@
+export {parseEntityRefRepo} from './entity-ref.js'
 export * from './heartbeat.js'
 export * from './lock.js'
 export * from './run-state.js'

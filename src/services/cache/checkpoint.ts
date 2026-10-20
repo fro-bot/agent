@@ -1,6 +1,7 @@
 import type {Logger} from '../../shared/logger.js'
 import * as fs from 'node:fs/promises'
 import {DatabaseSync} from 'node:sqlite'
+import {sleep} from '../../shared/async.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {isRetryableError, isStructuralCorruptionError} from './sqlite-errors.js'
 
@@ -69,12 +70,6 @@ async function fileSize(filePath: string): Promise<number | null> {
   } catch {
     return null
   }
-}
-
-async function delay(ms: number): Promise<void> {
-  return new Promise(resolve => {
-    setTimeout(resolve, ms)
-  })
 }
 
 /**
@@ -167,7 +162,7 @@ export async function checkpointDatabase(options: CheckpointOptions): Promise<Ch
         break
       }
       logger.debug('SQLite checkpoint busy, retrying', {attempt, maxAttempts, reason: lastReason})
-      await delay(retryDelayMs)
+      await sleep(retryDelayMs)
       continue
     }
 
@@ -186,7 +181,7 @@ export async function checkpointDatabase(options: CheckpointOptions): Promise<Ch
       maxAttempts,
       walSizeAfter,
     })
-    await delay(retryDelayMs)
+    await sleep(retryDelayMs)
   }
 
   return {status: 'failed', reason: lastReason, structural: lastStructural}

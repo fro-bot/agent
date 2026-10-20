@@ -49,14 +49,14 @@ inputs:
     required: false
     default: fro-bot-state
   s3-expected-bucket-owner:
-    description: AWS account ID of the expected bucket owner. When set, protects against bucket-name squatting.
+    description: 12-digit AWS account ID of the expected bucket owner. When set, protects against bucket-name squatting.
     required: false
   s3-allow-insecure-endpoint:
     description: 'Allow HTTP (non-HTTPS) S3 endpoints and loopback/private-network addresses. Only for local MinIO dev. The metadata endpoints 169.254.169.254, 169.254.170.2, 100.100.100.200, fd00:ec2::254 (including their IPv4-mapped and translated forms) and metadata.google.internal stay blocked. Default: false.'
     required: false
     default: 'false'
   s3-sse-kms-key-id:
-    description: KMS key ID for SSE-KMS encryption. When set, uses customer-managed key instead of AWS-managed default.
+    description: KMS key ID for SSE-KMS encryption. Requires s3-sse-encryption to resolve to aws:kms (set it to aws:kms on custom endpoints, where the default is AES256).
     required: false
   s3-sse-encryption:
     description: "Server-side encryption: 'aws:kms' or 'AES256'. Default: aws:kms for AWS S3, AES256 for custom endpoints."
