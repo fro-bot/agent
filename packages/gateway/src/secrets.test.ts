@@ -1,4 +1,4 @@
-import {mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync} from 'node:fs'
+import {chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync} from 'node:fs'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 
@@ -145,6 +145,29 @@ describe('isSecretFileBlank', () => {
     expect(isSecretFileBlank('SECRET_UNDER_TEST')).toBe(false)
     process.env.SECRET_UNDER_TEST_FILE = join(tmpDir, 'does-not-exist')
     expect(isSecretFileBlank('SECRET_UNDER_TEST')).toBe(false)
+  })
+
+  it('rethrows an ENOTDIR error instead of treating the file as absent', () => {
+    // #given a path that goes through a regular file, so open() fails with ENOTDIR
+    const notADir = writeSecretFile('plain-file', 'x')
+    process.env.SECRET_UNDER_TEST_FILE = join(notADir, 'child')
+
+    // #when / #then
+    expect(() => isSecretFileBlank('SECRET_UNDER_TEST')).toThrow(/ENOTDIR/)
+  })
+
+  it.skipIf(process.getuid?.() === 0)('rethrows an EACCES error instead of treating the file as absent', () => {
+    // #given an unreadable file
+    const file = writeSecretFile('unreadable', 'x')
+    chmodSync(file, 0o000)
+    process.env.SECRET_UNDER_TEST_FILE = file
+
+    try {
+      // #when / #then
+      expect(() => isSecretFileBlank('SECRET_UNDER_TEST')).toThrow(/EACCES/)
+    } finally {
+      chmodSync(file, 0o600)
+    }
   })
 
   it('still rejects a symlink', () => {

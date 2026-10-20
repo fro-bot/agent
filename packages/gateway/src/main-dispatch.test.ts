@@ -19,6 +19,10 @@
  * BDD comments: #given / #when / #then.
  */
 
+import {mkdtempSync, rmSync, symlinkSync, writeFileSync} from 'node:fs'
+import {tmpdir} from 'node:os'
+import {join} from 'node:path'
+
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 // ---------------------------------------------------------------------------
@@ -631,6 +635,48 @@ describe('main-dispatch.ts argv dispatch', () => {
     } finally {
       restore()
       process.env = savedEnv
+    }
+  })
+
+  it('a real loadGatewayConfig failure from a symlinked S3_ENDPOINT_FILE logs the generic message and no path', async () => {
+    // #given — the real loader and program run; the endpoint file is a symlink, a file-read failure and not a rule
+    // failure, so its message (which names the path) must not be logged
+    const {loadGatewayConfig} = await vi.importActual<typeof import('./config.js')>('./config.js')
+    const {Effect: ActualEffect} = await vi.importActual<typeof import('effect')>('effect')
+    const dir = mkdtempSync(join(tmpdir(), 'main-dispatch-symlink-'))
+    const target = join(dir, 'real-endpoint')
+    const link = join(dir, 'path-marker-link')
+    writeFileSync(target, 'https://s3.example.com')
+    symlinkSync(target, link)
+    mockLoadGatewayConfig.mockImplementation(loadGatewayConfig)
+    mockEffectRunPromise.mockImplementationOnce(async (program: Parameters<typeof ActualEffect.runPromise>[0]) =>
+      ActualEffect.runPromise(program),
+    )
+    const savedEnv = {...process.env}
+    Object.assign(process.env, {
+      DISCORD_TOKEN: 'test-token',
+      DISCORD_APPLICATION_ID: 'test-app-id',
+      S3_BUCKET: 'test-bucket',
+      S3_REGION: 'us-east-1',
+      S3_ENDPOINT_FILE: link,
+    })
+    const {restore} = withArgv(['node', 'main.js'])
+
+    try {
+      // #when
+      const {dispatchArgv} = await import('./main-dispatch.js')
+      await dispatchArgv()
+
+      // #then — generic message only, with no detail and no path
+      expect(consoleErrorSpy).toHaveBeenCalledExactlyOnceWith(
+        JSON.stringify({level: 'error', msg: 'gateway startup failed'}),
+      )
+      expect(consoleErrorSpy.mock.calls.flat().join(' ')).not.toContain('path-marker-link')
+      expect(exitSpy).toHaveBeenCalledExactlyOnceWith(1)
+    } finally {
+      restore()
+      process.env = savedEnv
+      rmSync(dir, {recursive: true, force: true})
     }
   })
 

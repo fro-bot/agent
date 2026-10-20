@@ -229,7 +229,7 @@ The compose stack bind-mounts each secret file individually with `create_host_pa
 
 The `workspace-repos` named volume is created automatically by Docker Compose on the first `up` after this change — no manual step is required. Existing repo checkouts in the container's ephemeral filesystem are not migrated; the workspace will re-clone them on the next mention.
 
-Run the full `touch` block from [Create secrets](#2-create-secrets) on every upgrade. It is idempotent: `touch` on an existing file is a no-op, but a missing file gets created empty. Empty files mean "secret not set", which is the same as the file being absent — the gateway treats both as opt-out, and does not fall back to a same-named env var. The object-store settings above are the one exception: a blank `_FILE` there defers to the env var.
+Run the full `touch` block from [Create secrets](#2-create-secrets) on every upgrade. It is idempotent: `touch` on an existing file is a no-op, but a missing file gets created empty. A blank secret file (empty or whitespace-only) means "secret not set", and it is an opt-out: the gateway never falls back to a same-named env var. A `_FILE` path that does not exist is different: the gateway falls back to the same-named env var. The object-store settings above are the one exception to the first rule: a blank `_FILE` there defers to the env var.
 
 ### Object-store settings validation (rollout)
 
@@ -238,6 +238,8 @@ The gateway now rejects a bad object-store setting at startup. Before it starts 
 - **`S3_ENDPOINT`.** An `http://`, loopback, link-local or private-address endpoint now needs `S3_ALLOW_INSECURE_ENDPOINT=true`. Use that only for local MinIO. A cloud metadata address is rejected even with the flag. An empty endpoint file is fine.
 - **Encryption mode.** Confirm what the production bucket accepts. With no `S3_SSE`, AWS S3 gets `aws:kms` and a custom endpoint gets `AES256`. If an AWS bucket accepts only SSE-S3, set `S3_SSE=AES256`.
 - **Region.** `S3_REGION` is the canonical name, with `AWS_REGION` as a fallback. R2 and MinIO deployments set `S3_REGION=auto`.
+- **`S3_ALLOW_INSECURE_ENDPOINT`.** It follows the object-store rule: a blank `_FILE` defers to the env var. To turn it off, clear both.
+- **Static AWS keys.** To retire a static key, remove both the file and any `AWS_*` env vars. A blank AWS key file means no static credentials, so the AWS SDK default provider chain applies; that chain still reads `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` from the process env, and instance or role credentials.
 - **Other values.** An `S3_PREFIX` that fails the prefix rule, an `S3_SSE` other than `aws:kms` or `AES256`, or an `S3_EXPECTED_BUCKET_OWNER` that is not 12 digits stops startup.
 - **Blank `_FILE`.** For the S3 settings, including `S3_BUCKET` and both region candidates, an empty or whitespace-only `*_FILE` counts as unset and the same-named env var is used. Every other gateway secret keeps the opt-out rule: a blank file means unset, and the env var is not consulted.
 

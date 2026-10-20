@@ -37,7 +37,7 @@ node dist/main.mjs backfill-deny-keys --help
 
 **Maintenance window:** Run the `--apply` pass during a maintenance window or when no binding mutations are in flight. The backfill only targets legacy keyless bindings (those without a `databaseId`), which normal gateway operation will not concurrently modify. However, the write is an unconditional overwrite (no etag/CAS) using the binding snapshot from `listBindings()`. If the gateway concurrently mutates the same binding between the list and the write (e.g. an `add-project` flow), the backfill will silently revert that change. Scheduling the `--apply` pass when the gateway is idle eliminates this window.
 
-**Required env** (same as the gateway daemon; the S3 settings come from `loadObjectStoreSettings` in `object-store-config.ts`, shared with the daemon, and each also accepts a `_FILE` form; a blank S3 `_FILE` defers to the env var, while the credentials and every other secret treat a blank file as unset):
+**Required env** (same as the gateway daemon; the S3 settings come from `loadObjectStoreSettings` in `object-store-config.ts`, shared with the daemon, and each also accepts a `_FILE` form; a blank S3 `_FILE` defers to the env var. Every other secret treats a blank file as unset and does not consult env. For the AWS key pair, the daemon then has no static credentials and the AWS SDK default provider chain applies (it still reads `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` from the process env, and instance or role credentials); backfill reports a blank credential file as missing and exits 1):
 
 | Variable | `_FILE` variant | Notes |
 | --- | --- | --- |

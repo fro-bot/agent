@@ -4,8 +4,8 @@ import {parseObjectStoreSettings} from './runtime-effect.js'
 import {isSecretFileBlank, missingSecretMessage, readEnvSecret, readOptionalSecret} from './secrets.js'
 
 /**
- * An invalid or missing object-store setting. Its message names the setting and the rule it broke and never contains a
- * value (the parser's no-echo rule, and secret-file errors that name only a path), so startup may log it.
+ * A missing or invalid object-store setting. Its message names the setting and the rule it broke and never contains a
+ * value (the parser's no-echo rule), so startup may log it.
  */
 export class ObjectStoreConfigError extends Error {
   constructor(message: string) {
@@ -33,38 +33,34 @@ function fromEnv(name: string): SettingSource {
  *
  * One mapping for every gateway path (server and backfill). Credentials are not part of the result; each caller adds
  * its own. `S3_BUCKET` is required and keeps the `Missing required secret: S3_BUCKET (...)` text. Throws an
- * `ObjectStoreConfigError` (source name and rule, never the value) when a setting is invalid.
+ * `ObjectStoreConfigError` (source name and rule, never the value) when a setting is missing or invalid. Errors from
+ * reading a `_FILE` (symlink, not a regular file, too large, unreadable) propagate as they are: they name a file path,
+ * so startup does not log them.
  */
 export function loadObjectStoreSettings(): ObjectStoreConfig {
-  try {
-    const bucket = readSetting('S3_BUCKET')
-    if (bucket === null) {
-      throw new Error(missingSecretMessage('S3_BUCKET'))
-    }
-
-    const result = parseObjectStoreSettings(
-      {
-        enabled: true,
-        bucket: {value: bucket, source: 'S3_BUCKET'},
-        region: [fromEnv('S3_REGION'), fromEnv('AWS_REGION')],
-        endpoint: fromEnv('S3_ENDPOINT'),
-        allowInsecureEndpoint: readSetting('S3_ALLOW_INSECURE_ENDPOINT') === 'true',
-        prefix: fromEnv('S3_PREFIX'),
-        sseEncryption: fromEnv('S3_SSE'),
-        sseKmsKeyId: fromEnv('S3_SSE_KMS_KEY_ID'),
-        expectedBucketOwner: fromEnv('S3_EXPECTED_BUCKET_OWNER'),
-      },
-      {region: 'required'},
-    )
-
-    if (result.success === false) {
-      throw new Error(result.error.message)
-    }
-
-    return result.data
-  } catch (error) {
-    throw error instanceof ObjectStoreConfigError
-      ? error
-      : new ObjectStoreConfigError(error instanceof Error ? error.message : String(error))
+  const bucket = readSetting('S3_BUCKET')
+  if (bucket === null) {
+    throw new ObjectStoreConfigError(missingSecretMessage('S3_BUCKET'))
   }
+
+  const result = parseObjectStoreSettings(
+    {
+      enabled: true,
+      bucket: {value: bucket, source: 'S3_BUCKET'},
+      region: [fromEnv('S3_REGION'), fromEnv('AWS_REGION')],
+      endpoint: fromEnv('S3_ENDPOINT'),
+      allowInsecureEndpoint: readSetting('S3_ALLOW_INSECURE_ENDPOINT') === 'true',
+      prefix: fromEnv('S3_PREFIX'),
+      sseEncryption: fromEnv('S3_SSE'),
+      sseKmsKeyId: fromEnv('S3_SSE_KMS_KEY_ID'),
+      expectedBucketOwner: fromEnv('S3_EXPECTED_BUCKET_OWNER'),
+    },
+    {region: 'required'},
+  )
+
+  if (result.success === false) {
+    throw new ObjectStoreConfigError(result.error.message)
+  }
+
+  return result.data
 }
