@@ -174,7 +174,7 @@ ARG SYSTEMATIC_VERSION=3.24.0
 #                    `--init`/`init: true` (validate-stack.sh rejects it).
 RUN apk add --no-cache \
       git=2.54.0-r0 \
-      ca-certificates=20260909-r0 \
+      ca-certificates=20261020-r0 \
       libgcc=15.2.0-r5 \
       libstdc++=15.2.0-r5 \
       ripgrep=15.1.0-r0 \

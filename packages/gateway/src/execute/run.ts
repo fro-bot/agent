@@ -75,6 +75,7 @@ import {
 } from './provenance.js'
 import {createQuestionEffects} from './question-client.js'
 import {RunCoreError, runOpenCodeCore} from './run-core.js'
+import {toRuntimeLogger} from './runtime-logger.js'
 
 // ---------------------------------------------------------------------------
 // Public interfaces
@@ -410,17 +411,6 @@ function classifyEnsureCloneFailure(failure: EnsureCloneFailure): RunCoreErrorKi
     return 'workspace-unavailable'
   }
   return 'unreachable'
-}
-
-/** Narrow logger adapter for runtime coordination functions. */
-export function toCoordLogger(logger: GatewayLogger): {
-  debug: (message: string, context?: Record<string, unknown>) => void
-  info: (message: string, context?: Record<string, unknown>) => void
-} {
-  return {
-    debug: (msg, ctx) => logger.debug(ctx ?? {}, msg),
-    info: (msg, ctx) => logger.info(ctx ?? {}, msg),
-  }
 }
 
 /**
@@ -783,7 +773,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
   const repo = `${binding.owner}/${binding.repo}`
   // runId and adoptionEtag are set by launchWork during admission.
   const runId = task.runId
-  const coordLogger = toCoordLogger(logger)
+  const coordLogger = toRuntimeLogger(logger)
 
   // ── Budget origin — single source of truth for hard abort and approval deadline ──
   // Captured once at run entry so both the AbortSignal.timeout and the approval
@@ -2169,7 +2159,7 @@ export async function launchWork(request: LaunchWorkRequest, deps: RunMentionDep
   const channelId = request.channelId
   const binding = request.binding
   const repo = `${binding.owner}/${binding.repo}`
-  const coordLogger = toCoordLogger(logger)
+  const coordLogger = toRuntimeLogger(logger)
 
   // ── Empty-prompt front-door guard ────────────────────────────────────────────
   // Fail fast before any queue/concurrency/lock/run-state work.
@@ -2383,7 +2373,7 @@ async function failAdmittedRun(
   failureKind?: string,
 ): Promise<void> {
   const {coordinationConfig, identity, logger} = deps
-  const coordLogger = toCoordLogger(logger)
+  const coordLogger = toRuntimeLogger(logger)
   const failResult = await transitionRun(
     coordinationConfig,
     identity,

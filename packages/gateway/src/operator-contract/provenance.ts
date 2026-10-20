@@ -17,6 +17,8 @@
  * rewrite of every consumer.
  */
 
+import {isValidSha} from '../workspace-api/sha.js'
+
 // ---------------------------------------------------------------------------
 // DTO
 // ---------------------------------------------------------------------------
@@ -95,14 +97,9 @@ export type OperatorCheckoutProvenance =
 // ---------------------------------------------------------------------------
 
 const CHECKOUT_OPERATIONS = new Set<string>(['none', 'merge', 'rebase', 'am', 'cherry-pick', 'revert', 'bisect'])
-const SHA_RE = /^[0-9a-f]{40}$/
 
 function isCheckoutOperation(value: unknown): value is OperatorCheckoutOperation {
   return typeof value === 'string' && CHECKOUT_OPERATIONS.has(value)
-}
-
-function isValidSha(value: unknown): value is string {
-  return typeof value === 'string' && SHA_RE.test(value)
 }
 
 function isNonNegativeInteger(value: unknown): value is number {

@@ -17,6 +17,7 @@ import {editInteractionAsync} from '../io.js'
 import {acquireMaintenanceRun} from '../maintenance-run.js'
 import {hasManageChannels} from '../manage-channels-check.js'
 import {createNonceRegistry, type NonceBinding} from '../recover-confirm-nonce.js'
+import {formatBinaryBytes} from './format-binary-bytes.js'
 import {INTERNAL_ERROR_COPY, makeGuildCommand} from './guild-command.js'
 
 export type RecoverCheckoutDeps = FroBotDeps
@@ -40,18 +41,6 @@ export function getRecoverNonceRegistryForTesting(): typeof nonceRegistry {
   return nonceRegistry
 }
 
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`
-  const units = ['KiB', 'MiB', 'GiB', 'TiB']
-  let value = bytes / 1024
-  let unitIndex = 0
-  while (value >= 1024 && unitIndex < units.length - 1) {
-    value /= 1024
-    unitIndex += 1
-  }
-  return `${value.toFixed(1)} ${units[unitIndex]}`
-}
-
 function shortSha(sha: string): string {
   return sha.slice(0, 7)
 }
@@ -64,12 +53,12 @@ function formatRetention(usage: {
   readonly maxBytes: number
 }): string {
   const sizeNote = usage.hasUnknownSize ? '+' : ''
-  return `retention: ${usage.generationCount}/${usage.maxGenerations} generations, ${formatBytes(usage.totalBytes)}${sizeNote}/${formatBytes(usage.maxBytes)}`
+  return `retention: ${usage.generationCount}/${usage.maxGenerations} generations, ${formatBinaryBytes(usage.totalBytes)}${sizeNote}/${formatBinaryBytes(usage.maxBytes)}`
 }
 
 function formatSize(estimatedSizeBytes: number, entryCount: number, sizeMeasurementComplete: boolean): string {
   const prefix = sizeMeasurementComplete ? '~' : 'at least '
-  return `${prefix}${formatBytes(estimatedSizeBytes)} across ${entryCount} files`
+  return `${prefix}${formatBinaryBytes(estimatedSizeBytes)} across ${entryCount} files`
 }
 
 /**
@@ -171,7 +160,7 @@ function renderOutcome(repoSlug: string, result: import('../../workspace-api/typ
       case 'checkout-changed':
         return `The checkout changed since the preview was shown. Run \`/fro-bot recover-checkout\` again to see the current state.`
       case 'quota-exceeded':
-        return `Recovery is at its retention limit (${result.usage.maxGenerations} generations or ${formatBytes(result.usage.maxBytes)}) for \`${repoSlug}\`. Delete an old backup with \`/fro-bot checkout-backup delete <id>\` first.`
+        return `Recovery is at its retention limit (${result.usage.maxGenerations} generations or ${formatBinaryBytes(result.usage.maxBytes)}) for \`${repoSlug}\`. Delete an old backup with \`/fro-bot checkout-backup delete <id>\` first.`
       case 'insufficient-disk-space':
         return `There isn't enough free disk space to recover \`${repoSlug}\` right now.`
     }

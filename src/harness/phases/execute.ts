@@ -33,6 +33,7 @@ import {
 } from '@fro-bot/runtime'
 import {executeOpenCode, resolveOutputMode} from '../../features/agent/index.js'
 import {inspectResponseFile, resolveResponseSurface} from '../../features/agent/response-file.js'
+import {sleep} from '../../shared/async.js'
 import {getGitHubWorkspace} from '../../shared/env.js'
 import {createLogger} from '../../shared/logger.js'
 import {STATE_KEYS} from '../config/state-keys.js'
@@ -563,10 +564,6 @@ export function computeDrainDeadlineMs(
   teardownReserveMs: number = DEFAULT_DRAIN_TEARDOWN_RESERVE_MS,
 ): number {
   return Math.max(0, totalTimeoutMs - teardownReserveMs - executionDurationMs)
-}
-
-async function sleep(ms: number): Promise<void> {
-  await new Promise<void>(resolve => setTimeout(resolve, ms))
 }
 
 async function cancelOutstanding(options: {

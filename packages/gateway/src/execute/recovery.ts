@@ -32,6 +32,7 @@ import type {GatewayLogger} from '../discord/client.js'
 import type {SinkThread} from '../discord/streaming.js'
 import type {RepoQuiescenceChecker} from './repo-quiescence.js'
 import {findStaleRuns, getRunKey, isRunStale, parseRunState, transitionRun} from '@fro-bot/runtime'
+import {toRuntimeLogger} from './runtime-logger.js'
 
 // ---------------------------------------------------------------------------
 // Public interface
@@ -63,13 +64,6 @@ export interface RecoverStaleRunsDeps {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
-
-/** Narrow logger adapter for runtime coordination functions. */
-function toCoordLogger(logger: GatewayLogger): {debug: (message: string, context?: Record<string, unknown>) => void} {
-  return {
-    debug: (msg, ctx) => logger.debug(ctx ?? {}, msg),
-  }
-}
 
 /**
  * Read the run record fresh, returning its parsed state and the etag of THAT read.
@@ -115,7 +109,7 @@ async function readFreshRun(
  */
 export async function recoverStaleRuns(deps: RecoverStaleRunsDeps): Promise<void> {
   const {coordinationConfig, identity, bindingsStore, resolveThread, checkRepoQuiescence, logger} = deps
-  const coordLogger = toCoordLogger(logger)
+  const coordLogger = toRuntimeLogger(logger)
 
   // Enumerate all repos that have bindings
   const bindingsResult = await bindingsStore.listBindings()

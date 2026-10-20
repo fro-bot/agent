@@ -24,12 +24,11 @@
 import type {Logger, ObjectStoreAdapter, ObjectStoreConfig, Result} from '@fro-bot/runtime'
 import type {RepoBinding} from './types.js'
 
-import {readFileSync} from 'node:fs'
-import process from 'node:process'
-
 import {buildObjectStoreKey, createS3Adapter, err, ok} from '@fro-bot/runtime'
 
 import {createAppClient} from '../github/app-client.js'
+import {loadObjectStoreSettings} from '../object-store-config.js'
+import {readMultilineSecret, readOptionalSecret, readSecret} from '../secrets.js'
 import {backfillActiveBindingDenyKeys} from './backfill-deny-keys.js'
 import {createBindingsStore} from './store.js'
 
@@ -51,17 +50,19 @@ Options:
               Omit this flag to preview without writing (safe default).
   --help, -h  Print this usage message and exit.
 
-Required env vars (with optional _FILE variants for secrets):
+Required env vars (each also accepts a _FILE variant):
   GITHUB_APP_ID              GitHub App numeric ID
-  GITHUB_APP_PRIVATE_KEY     PEM private key (or GITHUB_APP_PRIVATE_KEY_FILE)
+  GITHUB_APP_PRIVATE_KEY     PEM private key
   S3_BUCKET                  Object-store bucket name
-  AWS_REGION                 AWS region
+  S3_REGION                  Object-store region (falls back to AWS_REGION)
   AWS_ACCESS_KEY_ID          AWS credentials
-  AWS_SECRET_ACCESS_KEY      AWS credentials (or AWS_SECRET_ACCESS_KEY_FILE)
+  AWS_SECRET_ACCESS_KEY      AWS credentials
 
 Optional env vars:
-  S3_PREFIX          Object-store key prefix (default: fro-bot-state)
   GATEWAY_IDENTITY   Namespace for bindings in the store (default: discord-gateway)
+
+The optional S3 settings (endpoint, prefix, encryption, bucket owner) are the same as the
+gateway's. See "Object-store settings" in deploy/README.md.
 
 Exit codes:
   0  Clean run — all bindings updated or already-keyed (skipped)
@@ -115,27 +116,6 @@ export interface RunDenyKeyBackfillOptions {
    * JSON to stderr (safe for piping stdout).
    */
   readonly logger?: Logger
-}
-
-// ---------------------------------------------------------------------------
-// Env helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Read a required env var, with optional _FILE variant support.
- * Throws with a clear message if the var is missing or empty.
- */
-function readEnv(name: string): string {
-  const fileVar = process.env[`${name}_FILE`]
-  if (fileVar !== undefined && fileVar.length > 0) {
-    // Synchronous read — this is a startup-time config read, not a hot path.
-    return readFileSync(fileVar, 'utf8').trim()
-  }
-  const val = process.env[name]
-  if (val === undefined || val.length === 0) {
-    throw new Error(`Missing required env var: ${name}`)
-  }
-  return val
 }
 
 // ---------------------------------------------------------------------------
@@ -244,25 +224,30 @@ export async function runDenyKeyBackfill(options: RunDenyKeyBackfillOptions): Pr
   // 1. Read config from env
   let appId: string
   let privateKey: string
-  let s3Bucket: string
-  let s3Prefix: string
-  let s3Region: string
+  let objectStoreSettings: ObjectStoreConfig
   let awsAccessKeyId: string
   let awsSecretAccessKey: string
   let identity: string
 
   try {
-    appId = readEnv('GITHUB_APP_ID')
-    privateKey = readEnv('GITHUB_APP_PRIVATE_KEY')
-    s3Bucket = readEnv('S3_BUCKET')
-    s3Prefix = process.env.S3_PREFIX ?? 'fro-bot-state'
-    s3Region = readEnv('AWS_REGION')
-    awsAccessKeyId = readEnv('AWS_ACCESS_KEY_ID')
-    awsSecretAccessKey = readEnv('AWS_SECRET_ACCESS_KEY')
-    identity = process.env.GATEWAY_IDENTITY ?? 'discord-gateway'
+    appId = readSecret('GITHUB_APP_ID')
+    privateKey = readMultilineSecret('GITHUB_APP_PRIVATE_KEY')
+    awsAccessKeyId = readSecret('AWS_ACCESS_KEY_ID')
+    awsSecretAccessKey = readSecret('AWS_SECRET_ACCESS_KEY')
+    identity = readOptionalSecret('GATEWAY_IDENTITY') ?? 'discord-gateway'
   } catch (configError) {
     logger.error('backfill-runner: missing required env var', {
       error: configError instanceof Error ? configError.message : String(configError),
+    })
+    return 1
+  }
+
+  // Object-store settings share one mapping with the gateway server (region, endpoint, prefix, SSE, validation).
+  try {
+    objectStoreSettings = loadObjectStoreSettings()
+  } catch (settingsError) {
+    logger.error('backfill-runner: invalid object-store settings', {
+      error: settingsError instanceof Error ? settingsError.message : String(settingsError),
     })
     return 1
   }
@@ -280,10 +265,7 @@ export async function runDenyKeyBackfill(options: RunDenyKeyBackfillOptions): Pr
   // 3. Build the S3 adapter via the static import — 2 args: (config, logger).
   //    The logger is required; passing undefined causes logger.debug() to crash.
   const storeConfig: ObjectStoreConfig = {
-    enabled: true,
-    bucket: s3Bucket,
-    region: s3Region,
-    prefix: s3Prefix,
+    ...objectStoreSettings,
     credentials: {accessKeyId: awsAccessKeyId, secretAccessKey: awsSecretAccessKey},
   }
 

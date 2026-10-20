@@ -10,12 +10,18 @@
  * - `operator-route-smoke --help` / `-h` → usage printed, exit 0, diagnostic NOT called
  * - `operator-route-smoke --bogus` (unknown flag) → error + usage, exit 1, diagnostic NOT called
  * - No subcommand → gateway program path is taken (runner not called)
+ * - Startup failure → `gateway startup failed` with no detail, except an object-store settings error, which logs
+ *   `gateway config invalid` with the (value-free) message
  * - Unknown subcommand → falls through to gateway program (runner not called)
  * - No import-time side effects (gateway program does not start on import)
  * - parseBackfillArgs pure helper covers all branches without process.exit
  *
  * BDD comments: #given / #when / #then.
  */
+
+import {mkdtempSync, rmSync, symlinkSync, writeFileSync} from 'node:fs'
+import {tmpdir} from 'node:os'
+import {join} from 'node:path'
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
@@ -54,8 +60,10 @@ vi.mock('effect', async importOriginal => {
 // Mock config and program so the Effect program construction doesn't fail
 // ---------------------------------------------------------------------------
 
+const mockLoadGatewayConfig = vi.fn()
+
 vi.mock('./config.js', () => ({
-  loadGatewayConfig: vi.fn().mockReturnValue({}),
+  loadGatewayConfig: mockLoadGatewayConfig,
 }))
 
 vi.mock('./program.js', () => ({
@@ -78,9 +86,13 @@ vi.mock('./readiness.js', () => ({
   setupReadinessFlag: vi.fn(),
 }))
 
-vi.mock('./runtime-effect.js', () => ({
-  validateProviderSemanticsEffect: vi.fn(),
-}))
+vi.mock('./runtime-effect.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('./runtime-effect.js')>()
+  return {
+    ...actual,
+    validateProviderSemanticsEffect: vi.fn(),
+  }
+})
 
 vi.mock('./web/server.js', () => ({
   createOperatorServer: vi.fn(),
@@ -138,7 +150,8 @@ describe('main-dispatch.ts argv dispatch', () => {
     stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
     consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
 
-    // Default: gateway program resolves cleanly
+    // Default: config loads (as an empty object; the program itself is mocked) and the gateway program resolves
+    mockLoadGatewayConfig.mockReturnValue({})
     mockEffectRunPromise.mockResolvedValue(undefined)
     // Default: diagnostic returns success
     mockRunOperatorRouteSmoke.mockResolvedValue(0)
@@ -515,6 +528,155 @@ describe('main-dispatch.ts argv dispatch', () => {
       expect(exitSpy).toHaveBeenCalledExactlyOnceWith(1)
     } finally {
       restore()
+    }
+  })
+
+  it('startup failure from an object-store settings error logs gateway config invalid with the message', async () => {
+    // #given — the gateway Effect fails with an ObjectStoreConfigError, wrapped in a FiberFailure as the real
+    // Effect.runPromise does
+    const {ObjectStoreConfigError} = await import('./object-store-config.js')
+    const {Effect: ActualEffect} = await vi.importActual<typeof import('effect')>('effect')
+    const {restore} = withArgv(['node', 'main.js'])
+    mockEffectRunPromise.mockImplementationOnce(async () =>
+      ActualEffect.runPromise(ActualEffect.fail(new ObjectStoreConfigError('S3_ENDPOINT: must use https'))),
+    )
+
+    try {
+      // #when
+      const {dispatchArgv} = await import('./main-dispatch.js')
+      await dispatchArgv()
+
+      // #then — the value-free message is logged under the fixed config message
+      expect(consoleErrorSpy).toHaveBeenCalledExactlyOnceWith(
+        JSON.stringify({level: 'error', error: 'S3_ENDPOINT: must use https', msg: 'gateway config invalid'}),
+      )
+      expect(exitSpy).toHaveBeenCalledExactlyOnceWith(1)
+    } finally {
+      restore()
+    }
+  })
+
+  it('startup failure that is an unwrapped ObjectStoreConfigError also logs gateway config invalid', async () => {
+    // #given
+    const {ObjectStoreConfigError} = await import('./object-store-config.js')
+    const {restore} = withArgv(['node', 'main.js'])
+    mockEffectRunPromise.mockRejectedValueOnce(new ObjectStoreConfigError('S3_PREFIX: bad prefix'))
+
+    try {
+      // #when
+      const {dispatchArgv} = await import('./main-dispatch.js')
+      await dispatchArgv()
+
+      // #then
+      expect(consoleErrorSpy).toHaveBeenCalledExactlyOnceWith(
+        JSON.stringify({level: 'error', error: 'S3_PREFIX: bad prefix', msg: 'gateway config invalid'}),
+      )
+    } finally {
+      restore()
+    }
+  })
+
+  it('a non-object-store failure inside a FiberFailure keeps the detail-free message', async () => {
+    // #given — a different config failure (value-echoing messages exist elsewhere in loadGatewayConfig)
+    const fabricated = 'FABRICATED_LOG_LEVEL_VALUE_DO_NOT_LOG'
+    const {Effect: ActualEffect} = await vi.importActual<typeof import('effect')>('effect')
+    const {restore} = withArgv(['node', 'main.js'])
+    mockEffectRunPromise.mockImplementationOnce(async () =>
+      ActualEffect.runPromise(ActualEffect.fail(new Error(`Invalid LOG_LEVEL value: "${fabricated}"`))),
+    )
+
+    try {
+      // #when
+      const {dispatchArgv} = await import('./main-dispatch.js')
+      await dispatchArgv()
+
+      // #then
+      expect(consoleErrorSpy).toHaveBeenCalledExactlyOnceWith(
+        JSON.stringify({level: 'error', msg: 'gateway startup failed'}),
+      )
+      expect(consoleErrorSpy.mock.calls.flat().join(' ')).not.toContain(fabricated)
+    } finally {
+      restore()
+    }
+  })
+
+  it('a real loadGatewayConfig failure from a bad S3_ENDPOINT logs gateway config invalid, never the value', async () => {
+    // #given — the real loader and the real program run: S3 settings with an http endpoint and no opt-in
+    const {loadGatewayConfig} = await vi.importActual<typeof import('./config.js')>('./config.js')
+    const {Effect: ActualEffect} = await vi.importActual<typeof import('effect')>('effect')
+    mockLoadGatewayConfig.mockImplementation(loadGatewayConfig)
+    mockEffectRunPromise.mockImplementationOnce(async (program: Parameters<typeof ActualEffect.runPromise>[0]) =>
+      ActualEffect.runPromise(program),
+    )
+    const savedEnv = {...process.env}
+    Object.assign(process.env, {
+      DISCORD_TOKEN: 'test-token',
+      DISCORD_APPLICATION_ID: 'test-app-id',
+      S3_BUCKET: 'test-bucket',
+      S3_REGION: 'us-east-1',
+      S3_ENDPOINT: 'http://secret-host-marker.internal:9000',
+    })
+    for (const key of ['S3_ENDPOINT_FILE', 'S3_ALLOW_INSECURE_ENDPOINT', 'S3_ALLOW_INSECURE_ENDPOINT_FILE']) {
+      delete process.env[key]
+    }
+    const {restore} = withArgv(['node', 'main.js'])
+
+    try {
+      // #when
+      const {dispatchArgv} = await import('./main-dispatch.js')
+      await dispatchArgv()
+
+      // #then
+      const logged = consoleErrorSpy.mock.calls.flat().join(' ')
+      expect(logged).toContain('"msg":"gateway config invalid"')
+      expect(logged).toContain('S3_ENDPOINT: ')
+      expect(logged).not.toContain('secret-host-marker')
+      expect(exitSpy).toHaveBeenCalledExactlyOnceWith(1)
+    } finally {
+      restore()
+      process.env = savedEnv
+    }
+  })
+
+  it('a real loadGatewayConfig failure from a symlinked S3_ENDPOINT_FILE logs the generic message and no path', async () => {
+    // #given — the real loader and program run; the endpoint file is a symlink, a file-read failure and not a rule
+    // failure, so its message (which names the path) must not be logged
+    const {loadGatewayConfig} = await vi.importActual<typeof import('./config.js')>('./config.js')
+    const {Effect: ActualEffect} = await vi.importActual<typeof import('effect')>('effect')
+    const dir = mkdtempSync(join(tmpdir(), 'main-dispatch-symlink-'))
+    const target = join(dir, 'real-endpoint')
+    const link = join(dir, 'path-marker-link')
+    writeFileSync(target, 'https://s3.example.com')
+    symlinkSync(target, link)
+    mockLoadGatewayConfig.mockImplementation(loadGatewayConfig)
+    mockEffectRunPromise.mockImplementationOnce(async (program: Parameters<typeof ActualEffect.runPromise>[0]) =>
+      ActualEffect.runPromise(program),
+    )
+    const savedEnv = {...process.env}
+    Object.assign(process.env, {
+      DISCORD_TOKEN: 'test-token',
+      DISCORD_APPLICATION_ID: 'test-app-id',
+      S3_BUCKET: 'test-bucket',
+      S3_REGION: 'us-east-1',
+      S3_ENDPOINT_FILE: link,
+    })
+    const {restore} = withArgv(['node', 'main.js'])
+
+    try {
+      // #when
+      const {dispatchArgv} = await import('./main-dispatch.js')
+      await dispatchArgv()
+
+      // #then — generic message only, with no detail and no path
+      expect(consoleErrorSpy).toHaveBeenCalledExactlyOnceWith(
+        JSON.stringify({level: 'error', msg: 'gateway startup failed'}),
+      )
+      expect(consoleErrorSpy.mock.calls.flat().join(' ')).not.toContain('path-marker-link')
+      expect(exitSpy).toHaveBeenCalledExactlyOnceWith(1)
+    } finally {
+      restore()
+      process.env = savedEnv
+      rmSync(dir, {recursive: true, force: true})
     }
   })
 
