@@ -1,7 +1,7 @@
 import type {CoordinationConfig, Result, RunState} from '@fro-bot/runtime'
 import type {GatewayLogger} from '../discord/client.js'
 
-import {getRunKey, parseRunState} from '@fro-bot/runtime'
+import {getRunKey, HEARTBEAT_STOP_GRACE_MS, parseRunState} from '@fro-bot/runtime'
 
 export interface StaleEtagTransitionOptions<T> {
   readonly config: CoordinationConfig
@@ -18,8 +18,10 @@ export interface StaleEtagTransitionOptions<T> {
 const TERMINAL_PHASES: ReadonlySet<RunState['phase']> = new Set(['COMPLETED', 'FAILED', 'CANCELLED'])
 
 /**
- * Reads the run's stored record, or `null` when it cannot be read or parsed. Never throws. Every `null` is logged at
- * debug with its reason, so a retry that was silently disabled is visible.
+ * Reads the run's stored record, or `null` when it cannot be read or parsed within `HEARTBEAT_STOP_GRACE_MS` (the
+ * budget `stop()` itself gets: this read follows a failed stop and gates lock release and slot cleanup, so it must not
+ * stall). Never throws. Every `null` is logged at debug with its reason, so a retry that was silently disabled is
+ * visible.
  */
 async function readStoredRun(
   options: Pick<StaleEtagTransitionOptions<unknown>, 'config' | 'identity' | 'repo' | 'runId' | 'logger'>,
@@ -30,6 +32,7 @@ async function readStoredRun(
     return null
   }
 
+  let timer: ReturnType<typeof setTimeout> | undefined
   try {
     const key = getRunKey(config, identity, repo, runId)
     if (key.success === false) {
@@ -39,7 +42,14 @@ async function readStoredRun(
     if (getObject == null) {
       return skip('store adapter has no getObject')
     }
-    const fetched = await getObject(key.data)
+    const budget = new Promise<'elapsed'>(resolve => {
+      timer = setTimeout(() => resolve('elapsed'), HEARTBEAT_STOP_GRACE_MS)
+    })
+    // The race handles a late rejection of the abandoned read, so it cannot surface as an unhandled rejection.
+    const fetched = await Promise.race([getObject(key.data), budget])
+    if (fetched === 'elapsed') {
+      return skip(`read did not settle within ${HEARTBEAT_STOP_GRACE_MS}ms`)
+    }
     if (fetched.success === false) {
       return skip(fetched.error.message)
     }
@@ -47,6 +57,8 @@ async function readStoredRun(
     return parsed.success === false ? skip(parsed.error.message) : {state: parsed.data, etag: fetched.data.etag}
   } catch (error) {
     return skip(error instanceof Error ? error.message : String(error))
+  } finally {
+    clearTimeout(timer)
   }
 }
 

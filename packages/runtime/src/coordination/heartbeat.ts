@@ -8,8 +8,8 @@ import {renewLease} from './lock.js'
 import {parseRunState, RUN_STATE_TAG} from './run-state.js'
 
 /**
- * How long `stop()` waits for an in-flight tick before giving up. Mirrors the Action's lock-renewal
- * `STOP_GRACE_PERIOD_MS` (`src/harness/phases/acquire-lock.ts`).
+ * The total time `stop()` spends waiting on an in-flight tick and then reading the final snapshot before it gives up.
+ * Mirrors the Action's lock-renewal `STOP_GRACE_PERIOD_MS` (`src/harness/phases/acquire-lock.ts`).
  */
 export const HEARTBEAT_STOP_GRACE_MS = 5_000
 
@@ -58,10 +58,12 @@ export interface HeartbeatController {
    * owns the run lifecycle and uses the returned `runEtag` to transition the run to
    * `COMPLETED`, `FAILED`, or `CANCELLED` after handling any post-shutdown work.
    *
-   * Waits at most `HEARTBEAT_STOP_GRACE_MS` for an in-flight tick. If it is still pending then, returns a
-   * `tickPending` error without reading a snapshot: the tick keeps running in the background and the caller's
-   * ETags may be stale, so it must settle best-effort (a conditional write or release that loses the race fails
-   * safely).
+   * One `HEARTBEAT_STOP_GRACE_MS` budget covers the whole call: the wait on an in-flight tick and the snapshot read
+   * share it, so `stop()` resolves within about one grace period. If a tick is still pending when it elapses,
+   * returns a `tickPending` error without reading a snapshot: the tick keeps running in the background and the
+   * caller's ETags may be stale, so it must settle best-effort (a conditional write or release that loses the race
+   * fails safely). If the snapshot read is still pending, returns an error with `tickPending` false and the ETags
+   * confirmed so far.
    *
    * `stop()` first marks the controller stopping, so a tick that has not yet started its lock renewal or its
    * RunState write skips that I/O. A request already in flight when `stop()` began can still land: a late renewal
@@ -202,19 +204,6 @@ export function createHeartbeatController(
       })
   }
 
-  /** Resolves `true` when `pending` settled, `false` when the grace period elapsed first. `pending` never rejects. */
-  const settledWithinGrace = async (pending: Promise<void>): Promise<boolean> => {
-    let timer: ReturnType<typeof setTimeout> | undefined
-    const elapsed = new Promise<false>(resolve => {
-      timer = setTimeout(() => resolve(false), HEARTBEAT_STOP_GRACE_MS)
-    })
-    try {
-      return await Promise.race([pending.then((): true => true), elapsed])
-    } finally {
-      clearTimeout(timer)
-    }
-  }
-
   return {
     start: () => {
       if (running === true) {
@@ -239,26 +228,44 @@ export function createHeartbeatController(
         intervalHandle = null
       }
 
-      const pending = inFlight
-      if (pending != null && (await settledWithinGrace(pending)) === false) {
-        logger.debug('Heartbeat tick still in flight after the stop grace period', {repo, runId})
-        return err(
-          toStopError(new Error(`Heartbeat tick did not settle within ${HEARTBEAT_STOP_GRACE_MS}ms of stop`), true),
-        )
-      }
+      // One budget for the whole call: the tick wait and the snapshot read share a single grace timer armed here,
+      // so `stop()` resolves within about `HEARTBEAT_STOP_GRACE_MS` in total. Every step races it, and it is cleared
+      // on every exit path. A raced promise that settles late is already handled by the race, so it cannot surface
+      // as an unhandled rejection.
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const budget = new Promise<'elapsed'>(resolve => {
+        timer = setTimeout(() => resolve('elapsed'), HEARTBEAT_STOP_GRACE_MS)
+      })
 
-      if (tickError != null) {
-        return err(toStopError(tickError, false))
-      }
-
-      // `stop()` never rejects: an adapter that throws or rejects must still hand the caller the ETags it needs.
       try {
+        const pending = inFlight
+        if (pending != null && (await Promise.race([pending, budget])) === 'elapsed') {
+          logger.debug('Heartbeat tick still in flight after the stop grace period', {repo, runId})
+          return err(
+            toStopError(new Error(`Heartbeat tick did not settle within ${HEARTBEAT_STOP_GRACE_MS}ms of stop`), true),
+          )
+        }
+
+        if (tickError != null) {
+          return err(toStopError(tickError, false))
+        }
+
+        // `stop()` never rejects: an adapter that throws or rejects must still hand the caller the ETags it needs.
         const getObject = resolveGetObject(config)
         if (getObject.success === false) {
           return err(toStopError(getObject.error, false))
         }
 
-        const current = await getObject.data(runKey.data)
+        const current = await Promise.race([getObject.data(runKey.data), budget])
+        if (current === 'elapsed') {
+          logger.debug('Heartbeat snapshot read still in flight after the stop grace period', {repo, runId})
+          return err(
+            toStopError(
+              new Error(`Heartbeat snapshot read did not settle within ${HEARTBEAT_STOP_GRACE_MS}ms of stop`),
+              false,
+            ),
+          )
+        }
         if (current.success === false) {
           return err(toStopError(current.error, false))
         }
@@ -275,6 +282,8 @@ export function createHeartbeatController(
         })
       } catch (error) {
         return err(toStopError(error instanceof Error ? error : new Error(String(error)), false))
+      } finally {
+        clearTimeout(timer)
       }
     },
     get isRunning() {

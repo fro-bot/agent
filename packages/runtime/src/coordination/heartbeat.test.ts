@@ -77,6 +77,30 @@ function createCoordinationConfig(storeAdapter: Required<ObjectStoreAdapter>): C
   }
 }
 
+function hangingSnapshotAfter(goodReads: number) {
+  const getObject = vi.fn<Required<ObjectStoreAdapter>['getObject']>()
+  for (let i = 0; i < goodReads; i += 1) {
+    getObject.mockResolvedValueOnce(ok({data: JSON.stringify(createRunState()), etag: 'etag-current'}))
+  }
+  getObject.mockImplementation(async () => new Promise(() => {}))
+  return getObject
+}
+
+function build(
+  getObject: ReturnType<typeof hangingSnapshotAfter>,
+  conditionalPut?: Parameters<typeof createStoreAdapter>[0],
+) {
+  return createHeartbeatController(
+    createCoordinationConfig(createStoreAdapter({getObject, ...conditionalPut})),
+    'coordination',
+    'owner/repo',
+    'run-1',
+    'lock-etag-1',
+    'run-etag-0',
+    createLogger(),
+  )
+}
+
 describe('heartbeat controller', () => {
   beforeEach(() => {
     vi.useFakeTimers()
@@ -896,6 +920,92 @@ describe('heartbeat controller', () => {
     expect(vi.getTimerCount()).toBe(0)
     expect(renewLeaseMock).not.toHaveBeenCalled()
     expect(conditionalPut).not.toHaveBeenCalled()
+  })
+
+  describe('a snapshot read that never settles', () => {
+    it('bounds stop() to the grace period when no tick is active, carrying the ETags it holds', async () => {
+      // #given no tick has run, and the snapshot read never settles
+      const controller = build(hangingSnapshotAfter(0))
+      controller.start()
+
+      // #when
+      let settled = false
+      const stopPromise = controller.stop().then(result => {
+        settled = true
+        return result
+      })
+      await vi.advanceTimersByTimeAsync(HEARTBEAT_STOP_GRACE_MS - 1)
+      const settledBeforeBudget = settled
+      await vi.advanceTimersByTimeAsync(1)
+
+      // #then stop() resolved exactly at the budget with an explicit, non-pending failure
+      expect(settledBeforeBudget).toBe(false)
+      expect(settled).toBe(true)
+      const result = await stopPromise
+      expect(result.success).toBe(false)
+      if (result.success === true) throw new Error('expected a failure')
+      expect(result.error.message).toContain('snapshot')
+      expect(result.error.tickPending).toBe(false)
+      expect(result.error.lockEtag).toBe('lock-etag-1')
+      expect(result.error.runEtag).toBe('run-etag-0')
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it('bounds stop() after a tick settled, carrying the ETags that tick confirmed', async () => {
+      // #given one good tick (lock renewed, run state written), then the snapshot read never settles
+      const controller = build(hangingSnapshotAfter(1))
+      controller.start()
+      await vi.advanceTimersByTimeAsync(30_000)
+
+      // #when
+      const stopPromise = controller.stop()
+      await vi.advanceTimersByTimeAsync(HEARTBEAT_STOP_GRACE_MS)
+      const result = await stopPromise
+
+      // #then
+      expect(result.success).toBe(false)
+      if (result.success === true) throw new Error('expected a failure')
+      expect(result.error.tickPending).toBe(false)
+      expect(result.error.lockEtag).toBe('lock-etag-next')
+      expect(result.error.runEtag).toBe('etag-next')
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it('shares one grace budget with the tick wait: a slow tick leaves the snapshot only the remainder', async () => {
+      // #given a tick that settles 2s into stop(), followed by a snapshot read that never settles
+      let finishWrite: (() => void) | null = null
+      const conditionalPut = vi.fn<Required<ObjectStoreAdapter>['conditionalPut']>(
+        async () =>
+          new Promise(resolve => {
+            finishWrite = () => resolve(ok({etag: 'etag-heartbeat'}))
+          }),
+      )
+      const controller = build(hangingSnapshotAfter(1), {conditionalPut})
+      controller.start()
+      await vi.advanceTimersByTimeAsync(30_000)
+
+      // #when
+      let settled = false
+      const stopPromise = controller.stop().then(result => {
+        settled = true
+        return result
+      })
+      await vi.advanceTimersByTimeAsync(2_000)
+      ;(finishWrite as (() => void) | null)?.()
+      await vi.advanceTimersByTimeAsync(HEARTBEAT_STOP_GRACE_MS - 2_000 - 1)
+      const settledBeforeBudget = settled
+      await vi.advanceTimersByTimeAsync(1)
+
+      // #then stop() resolved within ONE grace period of its call, not two
+      expect(settledBeforeBudget).toBe(false)
+      expect(settled).toBe(true)
+      const result = await stopPromise
+      expect(result.success).toBe(false)
+      if (result.success === true) throw new Error('expected a failure')
+      expect(result.error.tickPending).toBe(false)
+      expect(result.error.runEtag).toBe('etag-heartbeat')
+      expect(vi.getTimerCount()).toBe(0)
+    })
   })
 
   it('returns an error when stop fails to fetch the authoritative snapshot', async () => {

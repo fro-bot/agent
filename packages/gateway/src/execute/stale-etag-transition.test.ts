@@ -1,7 +1,7 @@
 import type {CoordinationConfig, Result, RunState} from '@fro-bot/runtime'
 
-import {err, ok} from '@fro-bot/runtime'
-import {describe, expect, it, vi} from 'vitest'
+import {err, HEARTBEAT_STOP_GRACE_MS, ok} from '@fro-bot/runtime'
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {transitionRetryingStaleEtag} from './stale-etag-transition.js'
 
@@ -249,6 +249,74 @@ describe('transitionRetryingStaleEtag', () => {
       expect.objectContaining({runId: RUN_ID, reason: expect.stringContaining(expected) as unknown}),
       expect.stringContaining('retry disabled'),
     )
+  })
+
+  describe('a stored-run read that never settles', () => {
+    beforeEach(() => {
+      vi.useFakeTimers()
+    })
+
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    it('returns the original failure after the budget, without a retry, and leaves no timer behind', async () => {
+      // #given a store read that never settles after the first write failed
+      const attempt = vi.fn(async (_etag: string) => PRECONDITION())
+      const getObject: GetObject = vi.fn(async () => new Promise<never>(() => {}))
+      const logger = createLogger()
+
+      // #when
+      let settled = false
+      const pending = transitionRetryingStaleEtag({
+        config: configWith(getObject),
+        identity: IDENTITY,
+        repo: REPO,
+        runId: RUN_ID,
+        etag: 'etag-stale',
+        logger,
+        attempt,
+      }).then(result => {
+        settled = true
+        return result
+      })
+      await vi.advanceTimersByTimeAsync(HEARTBEAT_STOP_GRACE_MS - 1)
+      const settledBeforeBudget = settled
+      await vi.advanceTimersByTimeAsync(1)
+      const result = await pending
+
+      // #then the helper gave up exactly at the budget and returned the original failure
+      expect(settledBeforeBudget).toBe(false)
+      expect(result.success === false ? result.error.message : '').toBe('412 precondition failed')
+      expect(attempt).toHaveBeenCalledTimes(1)
+      expect(logger.debug).toHaveBeenCalledWith(
+        expect.objectContaining({runId: RUN_ID, reason: expect.stringContaining('did not settle') as unknown}),
+        expect.stringContaining('retry disabled'),
+      )
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it('clears the budget timer when the read settles in time', async () => {
+      // #given
+      const attempt = vi.fn<(etag: string) => Promise<Result<{etag: string}, Error>>>(async etag =>
+        etag === 'etag-fresh' ? ok({etag: 'etag-done'}) : PRECONDITION(),
+      )
+
+      // #when
+      const result = await transitionRetryingStaleEtag({
+        config: configWith(storedAs(runState(), 'etag-fresh')),
+        identity: IDENTITY,
+        repo: REPO,
+        runId: RUN_ID,
+        etag: 'etag-stale',
+        logger: createLogger(),
+        attempt,
+      })
+
+      // #then
+      expect(result.success).toBe(true)
+      expect(vi.getTimerCount()).toBe(0)
+    })
   })
 
   it('returns the failure of the single retry without a third attempt', async () => {

@@ -654,8 +654,9 @@ interface ScheduleQuarantineReleaseOpts {
  * This schedules the deferred other half. After `QUARANTINE_HOLD_WINDOW_MS`:
  *  1. Stops the heartbeat (best-effort) — the lease stops renewing and the
  *     run-state heartbeat goes stale, letting the lease expire so a corroborated
- *     takeover or `force-release-lock` becomes possible. `stop()` waits at most
- *     `HEARTBEAT_STOP_GRACE_MS` for an in-flight tick, and ticks that have not
+ *     takeover or `force-release-lock` becomes possible. `stop()` resolves within
+ *     one `HEARTBEAT_STOP_GRACE_MS` budget for the in-flight tick and the final
+ *     snapshot read together, and ticks that have not
  *     yet started their lock renewal or RunState write skip that I/O. A request
  *     already in flight when `stop()` began can still land: a late renewal
  *     restarts the lease TTL, so the lease can outlive this window by up to one
