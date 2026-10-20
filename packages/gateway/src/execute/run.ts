@@ -76,6 +76,7 @@ import {
 import {createQuestionEffects} from './question-client.js'
 import {RunCoreError, runOpenCodeCore} from './run-core.js'
 import {toRuntimeLogger} from './runtime-logger.js'
+import {transitionRetryingStaleEtag} from './stale-etag-transition.js'
 
 // ---------------------------------------------------------------------------
 // Public interfaces
@@ -463,7 +464,8 @@ async function readCurrentRunPhase(
 /**
  * Re-read the run-state's current phase AND etag together.
  *
- * Used by the CANCELLED→FAILED fallback path: when the CANCELLED
+ * Used by the ACKNOWLEDGED→EXECUTING transition (one read tells a lost cancel race
+ * from a stale ETag) and by the CANCELLED→FAILED fallback path: when the CANCELLED
  * `transitionRun` call fails (commonly a 412 on a stale etag), the fallback
  * FAILED write must not reuse that same stale etag — it is guaranteed to
  * 412 again. This re-read gets a fresh etag for the fallback attempt, and
@@ -478,7 +480,7 @@ async function readCurrentRunStateWithEtag(
   deps: RunMentionDeps,
   repo: string,
   runId: string,
-): Promise<{readonly phase: RunState['phase']; readonly etag: string} | null> {
+): Promise<{readonly phase: RunState['phase']; readonly etag: string; readonly runId: string} | null> {
   const {coordinationConfig, identity, logger} = deps
   try {
     const keyResult = getRunKey(coordinationConfig, identity, repo, runId)
@@ -504,7 +506,7 @@ async function readCurrentRunStateWithEtag(
       logger.warn({repo, runId, err: parsed.error.message}, 'run: readCurrentRunStateWithEtag — parseRunState failed')
       return null
     }
-    return {phase: parsed.data.phase, etag: fetched.data.etag}
+    return {phase: parsed.data.phase, etag: fetched.data.etag, runId: parsed.data.run_id}
   } catch (error) {
     logger.warn(
       {repo, runId, err: error instanceof Error ? error.message : String(error)},
@@ -652,7 +654,14 @@ interface ScheduleQuarantineReleaseOpts {
  * This schedules the deferred other half. After `QUARANTINE_HOLD_WINDOW_MS`:
  *  1. Stops the heartbeat (best-effort) — the lease stops renewing and the
  *     run-state heartbeat goes stale, letting the lease expire so a corroborated
- *     takeover or `force-release-lock` becomes possible.
+ *     takeover or `force-release-lock` becomes possible. `stop()` resolves within
+ *     one `HEARTBEAT_STOP_GRACE_MS` budget for the in-flight tick and the final
+ *     snapshot read together, and ticks that have not
+ *     yet started their lock renewal or RunState write skip that I/O. A request
+ *     already in flight when `stop()` began can still land: a late renewal
+ *     restarts the lease TTL, so the lease can outlive this window by up to one
+ *     TTL. That window is residual — closing it needs the object-store adapter
+ *     to abort in-flight requests.
  *  2. Releases the concurrency slot — via the same atomic hand-off-or-release
  *     logic the ordinary completion path uses, so a queued task is never made
  *     to wait out this window behind a run that already finished failing.
@@ -962,10 +971,34 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     // Push the ACKNOWLEDGED state to the observation pipeline (best-effort, fire-and-forget).
     notifyObserverBestEffort(deps, ackResult.data.state)
 
-    const heartbeat = createHeartbeatController(coordinationConfig, identity, repo, runId, lockEtag, coordLogger)
+    const heartbeat = createHeartbeatController(
+      coordinationConfig,
+      identity,
+      repo,
+      runId,
+      lockEtag,
+      runEtag,
+      coordLogger,
+    )
     heartbeat.start()
 
     let heartbeatStopped = false
+    // Set when a heartbeat stop fails. Every tick rewrites the RunState, so the ETag the terminal transition then
+    // uses may be stale (after a `tickPending` stop one more write may still land): the transition re-reads once
+    // and retries once on failure (`transitionRetryingStaleEtag`). A clean stop returns an authoritative ETag, so
+    // those transitions keep their single attempt.
+    let heartbeatStopFailed = false
+    const transitionTerminal = async (
+      phase: RunState['phase'],
+      etag: string,
+      options?: Parameters<typeof transitionRun>[7],
+    ) => {
+      const attempt = async (attemptEtag: string) =>
+        transitionRun(coordinationConfig, identity, repo, runId, phase, attemptEtag, coordLogger, options)
+      return heartbeatStopFailed === true
+        ? transitionRetryingStaleEtag({config: coordinationConfig, identity, repo, runId, etag, logger, attempt})
+        : attempt(etag)
+    }
 
     // ── Ownership ledger — tracks background subagents this run dispatches ──
     //
@@ -1053,21 +1086,20 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           runEtag = stopResult.data.runEtag
           lockEtag = stopResult.data.lockEtag
         } else {
+          // A failed stop still reports the freshest lock and RunState ETags the heartbeat confirmed.
+          lockEtag = stopResult.error.lockEtag
+          runEtag = stopResult.error.runEtag
+          heartbeatStopFailed = true
           logger.warn(
-            {repo, runId, err: stopResult.error.message},
-            'run: heartbeat stop failed during preparation termination; using last known etags',
+            {repo, runId, err: stopResult.error.message, tickPending: stopResult.error.tickPending},
+            'run: heartbeat stop failed during preparation termination; using the ETags it last confirmed',
           )
         }
       }
 
-      const failedResult = await transitionRun(
-        coordinationConfig,
-        identity,
-        repo,
-        runId,
+      const failedResult = await transitionTerminal(
         'FAILED',
         runEtag,
-        coordLogger,
         checkoutPreparation === undefined ? undefined : {detailsPatch: {checkoutPreparation}},
       )
       if (failedResult.success === false) {
@@ -1225,7 +1257,30 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       // reusing the existing detailsPatch mechanism rather than a separate write. This
       // is what the run began from, not a claim about the whole run: later checkout
       // mutations by the agent are never reflected back onto this field.
-      const execResult = await transitionRun(
+      const executingOptions = {detailsPatch: {checkoutProvenance: provenance}}
+
+      // The clean exit for an EXECUTING write that lost to an operator cancel: the caller returns after it.
+      // No provenance is persisted on this exit, deliberately. Provenance is saved
+      // atomically with THIS transition (detailsPatch above), and it never landed —
+      // the operator's cancel committed first, so the agent never started. Provenance
+      // records what a run STARTED FROM; a run that never started has no starting
+      // state, and writing one anyway would record a start that didn't happen.
+      // Registration happens only after EXECUTING succeeds (below), so there is no
+      // abort-registry entry to delete here — the outer finally's unconditional
+      // delete() is still a safe no-op for this runId.
+      async function exitAfterLostCancelRace(): Promise<void> {
+        logger.info({repo, runId}, 'run: EXECUTING lost the adoption race to an operator cancel — exiting cleanly')
+        if (heartbeatStopped === false) {
+          // Best-effort, but keep the freshest confirmed lock ETag: the outer finally releases with it.
+          const stopped = await heartbeat.stop().catch(() => null)
+          heartbeatStopped = true
+          if (stopped !== null) {
+            lockEtag = stopped.success === true ? stopped.data.lockEtag : stopped.error.lockEtag
+          }
+        }
+      }
+
+      let execResult = await transitionRun(
         coordinationConfig,
         identity,
         repo,
@@ -1233,33 +1288,54 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         'EXECUTING',
         runEtag,
         coordLogger,
-        {detailsPatch: {checkoutProvenance: provenance}},
+        executingOptions,
       )
       if (execResult.success === false) {
         // ── Graceful loser: cancel-wins-adoption race (ACKNOWLEDGED → EXECUTING) ──────
         // Same rendezvous as the ACK case above: an operator cancel may have committed
         // ACKNOWLEDGED → CANCELLED before this transition. Re-read before treating the
         // etag mismatch as a genuine failure.
-        const currentPhase = await readCurrentRunPhase(deps, repo, runId)
-        if (currentPhase === 'CANCELLED') {
-          logger.info({repo, runId}, 'run: EXECUTING lost the adoption race to an operator cancel — exiting cleanly')
-          // No provenance is persisted on this exit, deliberately. Provenance is saved
-          // atomically with THIS transition (detailsPatch above), and it never landed —
-          // the operator's cancel committed first, so the agent never started. Provenance
-          // records what a run STARTED FROM; a run that never started has no starting
-          // state, and writing one anyway would record a start that didn't happen.
-          // Registration happens only after EXECUTING succeeds (below), so there is no
-          // abort-registry entry to delete here — the outer finally's unconditional
-          // delete() is still a safe no-op for this runId.
-          if (heartbeatStopped === false) {
-            await heartbeat.stop().catch(() => {
-              /* best-effort */
-            })
-            heartbeatStopped = true
-          }
+        const stored = await readCurrentRunStateWithEtag(deps, repo, runId)
+        if (stored?.phase === 'CANCELLED') {
+          await exitAfterLostCancelRace()
           return
         }
-        throw new Error(`transitionRun EXECUTING failed: ${execResult.error.message}`)
+
+        // ── Stale ETag: the heartbeat's own tick won the write ─────────────────────────
+        // The heartbeat starts right after ACK with the ACK etag, and every tick rewrites the run
+        // state under a new etag. Preparation that outlasts one interval therefore reaches this
+        // transition holding a stale etag even though nothing is wrong. The same read that ruled out
+        // a cancel shows the run is still this run's ACKNOWLEDGED record: retry once with its etag
+        // and the same detailsPatch. Any other stored phase is a genuine failure and is not retried.
+        if (stored !== null && stored.runId === runId && stored.phase === 'ACKNOWLEDGED') {
+          logger.info(
+            {repo, runId},
+            'run: EXECUTING lost to a heartbeat write during preparation — retrying once with the stored etag',
+          )
+          execResult = await transitionRun(
+            coordinationConfig,
+            identity,
+            repo,
+            runId,
+            'EXECUTING',
+            stored.etag,
+            coordLogger,
+            executingOptions,
+          )
+
+          // An operator cancel can commit between the read above and this write. That is the same lost
+          // race as the first check, not a failure: read once more (no third write) before giving up.
+          if (execResult.success === false) {
+            const afterRetry = await readCurrentRunStateWithEtag(deps, repo, runId)
+            if (afterRetry?.phase === 'CANCELLED') {
+              await exitAfterLostCancelRace()
+              return
+            }
+          }
+        }
+        if (execResult.success === false) {
+          throw new Error(`transitionRun EXECUTING failed: ${execResult.error.message}`)
+        }
       }
       runEtag = execResult.data.etag
 
@@ -1488,18 +1564,16 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         runEtag = stopResult.data.runEtag
         lockEtag = stopResult.data.lockEtag
       } else {
-        logger.warn({repo, runId, err: stopResult.error.message}, 'run: heartbeat stop failed; using last known etags')
+        lockEtag = stopResult.error.lockEtag
+        runEtag = stopResult.error.runEtag
+        heartbeatStopFailed = true
+        logger.warn(
+          {repo, runId, err: stopResult.error.message, tickPending: stopResult.error.tickPending},
+          'run: heartbeat stop failed; using last known etags',
+        )
       }
 
-      const completedResult = await transitionRun(
-        coordinationConfig,
-        identity,
-        repo,
-        runId,
-        'COMPLETED',
-        runEtag,
-        coordLogger,
-      )
+      const completedResult = await transitionTerminal('COMPLETED', runEtag)
       // Capture the COMPLETED state now so we can notify AFTER the final-answer flush.
       // The notify is deferred to guarantee the web sink's flush() → final output frame
       // is pushed before observe(terminalState) fans the terminal status frame (which
@@ -1732,8 +1806,11 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
             runEtag = stopResult.data.runEtag
             lockEtag = stopResult.data.lockEtag
           } else {
+            lockEtag = stopResult.error.lockEtag
+            runEtag = stopResult.error.runEtag
+            heartbeatStopFailed = true
             logger.warn(
-              {repo, runId, err: stopResult.error.message},
+              {repo, runId, err: stopResult.error.message, tickPending: stopResult.error.tickPending},
               'run: heartbeat stop failed on cancel path; using last known etags',
             )
           }
@@ -1758,16 +1835,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         const cancelledByMetadata = abortRegistry.getMetadata(runId)
         const cancelledOptions =
           cancelledByMetadata === undefined ? undefined : {detailsPatch: {cancelledBy: cancelledByMetadata}}
-        const cancelledResult = await transitionRun(
-          coordinationConfig,
-          identity,
-          repo,
-          runId,
-          'CANCELLED',
-          runEtag,
-          coordLogger,
-          cancelledOptions,
-        )
+        const cancelledResult = await transitionTerminal('CANCELLED', runEtag, cancelledOptions)
         if (cancelledResult.success === false) {
           logger.error({repo, runId, err: cancelledResult.error.message}, 'run: transitionRun CANCELLED failed')
 
@@ -1849,8 +1917,11 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
             runEtag = stopResult.data.runEtag
             lockEtag = stopResult.data.lockEtag
           } else {
+            lockEtag = stopResult.error.lockEtag
+            runEtag = stopResult.error.runEtag
+            heartbeatStopFailed = true
             logger.warn(
-              {repo, runId, err: stopResult.error.message},
+              {repo, runId, err: stopResult.error.message, tickPending: stopResult.error.tickPending},
               'run: heartbeat stop failed; using last known etags',
             )
           }
@@ -1862,16 +1933,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         const inFlightDetailsPatch = failureDetailsPatch(execError)
         const inFlightFailedOptions =
           inFlightDetailsPatch === undefined ? undefined : {detailsPatch: inFlightDetailsPatch}
-        const failedResult = await transitionRun(
-          coordinationConfig,
-          identity,
-          repo,
-          runId,
-          'FAILED',
-          runEtag,
-          coordLogger,
-          inFlightFailedOptions,
-        )
+        const failedResult = await transitionTerminal('FAILED', runEtag, inFlightFailedOptions)
         // Capture the FAILED state now so we can notify AFTER the partial-output flush.
         // The notify is deferred to guarantee the web sink's flush() → final output frame
         // is pushed before observe(terminalState) fans the terminal status frame (which
@@ -1964,9 +2026,10 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       // SKIPPED when quarantined: the lease must keep renewing so the reservation cannot
       // silently lapse via TTL expiry while owned background work is still unconfirmed.
       if (quarantined === false && heartbeatStopped === false) {
-        await heartbeat.stop().catch(() => {
-          /* best-effort */
-        })
+        const stopped = await heartbeat.stop().catch(() => null)
+        if (stopped !== null) {
+          lockEtag = stopped.success === true ? stopped.data.lockEtag : stopped.error.lockEtag
+        }
       }
 
       // Dispose status controller — guaranteed cleanup of typing interval and debounce timer.
