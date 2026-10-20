@@ -27,7 +27,7 @@ The concerns fall into two groups (full inventory: [2026-10-18-action-gateway-co
 
 | Concern | Kind | Disposition |
 | --- | --- | --- |
-| Provider-failure classification | Duplicated behavior | Ladder, rung 1 |
+| Provider-failure classification | Duplicated behavior | Ladder, rung 1 (delivered in #1869) |
 | Payload accessors, task-notice parser, small helpers | Duplicated behavior | Ladder, pure leaves |
 | Bounded abort and settle (teardown) | Duplicated behavior, stateful | Separately planned rung |
 | Lock lease renewal and takeover | Duplicated behavior, stateful | Separately planned rung, after a takeover-policy decision |
@@ -55,14 +55,14 @@ Session persistence is the largest Action-side concern. It is deferred because t
 - R2. Each consolidation PR deletes the copies it replaces. A PR that relocates code without deleting the originals does not count.
 - R3. If a shared implementation changes behavior on one surface, the PR description says so and a test pins the change.
 - R4. Policy tests for a shared concern live once, in runtime. Each surface tests only how it maps the shared result.
-- R5. Rung 1 is provider-failure classification. The shared classifier lets structured signals decide fail-fast. Message text may only select the reason label on terminal payloads. Fail-fast timing does not change on either surface.
+- R5. Rung 1 is provider-failure classification. One shared function decides both the failure kind and whether the run stops. Confirmed structured signals and the established text patterns stop a run. Looser text hints only label it.
 - R6. Rung 1 gives the gateway quota fail-fast on the `session.status` retry path. Quota is reported as a new operator reason, `provider-quota-exceeded`, which ships in the next operator-contract MINOR together with the paired dashboard release.
 - R7. Pure-leaf rungs follow rung 1 in this order unless planning finds a better one: payload accessors and the task-notice parser, then small duplicated helpers (GitHub App token minting, redaction wrappers).
 - R8. Bounded abort and settle, and lock lease renewal, are stateful. Each needs its own plan, and its own tests for takeover and quarantine paths. Lease renewal also needs a takeover-policy decision first, because the Action reclaims an expired holder without corroboration and the gateway requires `ConfirmExpiredHolder`.
 
 **Drift guards**
 
-- R9. Until it moves, the task-notice pattern and the payload accessors are pinned by a test that fails when the copies disagree.
+- R9. A rung that leaves a concern copied across surfaces adds a test that fails when the copies disagree. A rung that removes every copy in one PR needs no guard.
 - R10. Delete each drift guard in the PR that consolidates its concern.
 
 **Config spine (S3 and object store)**
@@ -87,8 +87,8 @@ Session persistence is the largest Action-side concern. It is deferred because t
 ## Acceptance Examples
 
 - AE1. **Covers R5, R6.** Given a gateway run whose provider reports `account_rate_limit` on a `session.status` retry, after rung 1 the run fails fast with `provider-quota-exceeded` instead of waiting out OpenCode's retry budget. The PR says this is a gateway behavior change.
-- AE2. **Covers R5.** Given a terminal payload whose message text matches an auth pattern, both surfaces fail the run at the same moment they do today. Only the reason label comes from the text match.
-- AE3. **Covers R9, R10.** Given the task-notice pattern is still copied, editing one copy fails the drift test. The PR that moves the parser to runtime deletes that test.
+- AE2. **Covers R5.** Given a terminal payload whose message text matches only an auth hint, the shared function labels the failure as auth and does not stop the run on that evidence.
+- AE3. **Covers R9, R10.** Given a concern that stays copied after a rung, editing one copy fails its drift test, and the PR that consolidates it deletes that test. The payload accessors and task-notice parser moved to runtime in one PR, so they never needed one.
 - AE4. **Covers R12, R13.** Given a gateway deployment that sets only `AWS_REGION`, the gateway resolves the region from it. Given one that sets `S3_REGION`, that value wins.
 - AE5. **Covers R14.** Given a gateway configured with an `http://` endpoint and no opt-in, startup fails with a configuration error. With `S3_ALLOW_INSECURE_ENDPOINT` set, it starts.
 
@@ -98,7 +98,7 @@ Session persistence is the largest Action-side concern. It is deferred because t
 
 - Each consolidated concern is fixed once and both surfaces get the fix.
 - Each PR on the ladder removes more lines from `src/` and `packages/gateway/src` than it adds to runtime, not counting tests.
-- The "mirrors exactly" comment in `run-core.ts` is gone, replaced by shared imports and the R9 drift test.
+- The "mirrors exactly" comment in `run-core.ts` is gone, replaced by shared imports.
 - S3 and object-store settings are defined once, and the docs match the code.
 - A planner can start rung 1 or config block 1 from this doc without inventing scope.
 
@@ -120,7 +120,7 @@ Session persistence is the largest Action-side concern. It is deferred because t
 - Pure leaves before stateful work. Leaves fix skew at low risk. Teardown and lock lifecycle are correctness-critical and need their own plans.
 - Rung 1 is provider classification. It has the clearest one-sided gap, and its classifiers already live in runtime.
 - Gateway quota fail-fast is approved. The Action already fails fast on quota, and the gateway waiting out the retry budget is the drift this work removes.
-- Structured signals decide when a run fails fast. Message text only labels the failure. This keeps runtime's rule that message text is not auth evidence, without changing timing on either surface.
+- Structured signals and two established text patterns (usage-limit wording, `Model not found:`) decide when a run stops. Looser text only labels the failure, which keeps runtime's rule that message text is not auth evidence.
 - `S3_REGION` stays canonical with an `AWS_REGION` fallback, so existing deployments keep working.
 - Runtime stays lean. New shared code returns plain values or `Result`, never Effect, and never imports `@actions/*`.
 

@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-10-11"
-updated-by: "18890129"
+last-updated: "2026-10-18"
+updated-by: "1dcd6a296d36057a6680ca347bf01a6987d78ec9"
 sources:
   - packages/runtime/src/agent/ownership-ledger.ts
   - packages/runtime/src/agent/ledger-reconcile.ts
@@ -22,6 +22,7 @@ sources:
   - src/features/observability/job-summary.ts
   - src/services/setup/ci-config.ts
   - packages/gateway/src/execute/run-core.ts
+  - packages/gateway/src/execute/provider-failure.ts
   - packages/gateway/src/execute/run.ts
   - packages/gateway/src/execute/settle-owned-sessions.ts
   - packages/gateway/src/execute/recovery.ts
@@ -164,6 +165,8 @@ If the deadline expires while draining, the run fails with a distinct internal `
 A quarantined failure makes the run manager skip the heartbeat stop, the lock release, and the slot handoff. The run transitions to failed with the quarantine flag recorded, and a bounded hold window (about twenty times the settlement bound) elapses before the heartbeat stops and the concurrency slot is released. It deliberately does _not_ release the lock: lock takeover and force-release both require an expired lease plus a clear workspace status check, which is exactly why the hold must be bounded rather than indefinite.
 
 **Restart reconciliation.** Ownership is persisted continuously onto run state during the run — the root session id and the not-yet-settled child ids — through a new runtime primitive that shallow-merges into a run's details without touching its phase. (The ordinary transition helper refuses a same-phase write, so mid-execution ownership changes previously had no way to persist.) That primitive re-reads the record fresh on every call rather than threading a caller-held etag, because a caller-tracked etag goes stale the moment the heartbeat's own read-modify-write commits; a lost race is non-fatal, since the next adopt or settle retries with fresher data.
+
+Provider rejection also passes through this termination boundary. `packages/gateway/src/execute/provider-failure.ts` identifies terminal root failures and hopeless structured retry reasons, and `run-core.ts` confirms root quiescence when failure arrives while the root may still be running. An empty or already-settled child ledger therefore cannot release a live root merely because the provider failure was detected early. The fixed provider reason survives quarantine and reaches the failed run record; [[Operator Web Control Surface]] describes its safe projection.
 
 On startup, recovery (`packages/gateway/src/execute/recovery.ts`) checks the repository's directory-scoped OpenCode status through `repo-quiescence.ts`, rather than trusting persisted ownership. A `busy` or `unknown` workspace leaves the stale run and lock untouched. Only a `clear` result permits a fresh run-state read, another staleness check, and a conditional transition to `FAILED`; a heartbeat or competing write prevents that transition. Recovery never deletes locks. A leftover lease expires and the next acquisition performs its own corroboration. Persisted ownership remains diagnostic, since missing or malformed claims cannot prove that a writer stopped, and a gateway restart is not a workspace restart.
 

@@ -30,6 +30,8 @@
 import type {GatewayLogger} from '../discord/client.js'
 import type {PermissionReply} from '../operator-contract/approval.js'
 
+import {getObjectProperty, getStringProperty} from '@fro-bot/runtime'
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -158,19 +160,9 @@ export interface PermissionCoordinatorDeps {
 }
 
 // ---------------------------------------------------------------------------
-// Defensive accessors (payloads are untrusted server JSON)
+// Payloads are untrusted server JSON: read them through own-property accessors (`getStringProperty`,
+// `getObjectProperty` from `@fro-bot/runtime`). The string-array reader below is local to this module.
 // ---------------------------------------------------------------------------
-
-function getString(value: unknown, property: string): string | null {
-  if (value == null || typeof value !== 'object') return null
-  const descriptor = Object.getOwnPropertyDescriptor(value, property)
-  return typeof descriptor?.value === 'string' ? descriptor.value : null
-}
-
-function getObject(value: unknown, property: string): unknown {
-  if (value == null || typeof value !== 'object') return null
-  return Object.getOwnPropertyDescriptor(value, property)?.value ?? null
-}
 
 function getStringArray(value: unknown, property: string): string[] {
   if (value == null || typeof value !== 'object') return []
@@ -193,8 +185,8 @@ function asReply(value: unknown): PermissionReply | null {
  * Never throws; falls back through metadata → first pattern → bare category.
  */
 function deriveTitle(permission: string, patterns: readonly string[], metadata: unknown): string {
-  const filepath = getString(metadata, 'filepath')
-  const command = getString(metadata, 'command')
+  const filepath = getStringProperty(metadata, 'filepath')
+  const command = getStringProperty(metadata, 'command')
   const firstPattern = patterns[0] ?? null
   if (permission === 'external_directory') {
     return `Access outside workspace: ${filepath ?? firstPattern ?? '(unspecified path)'}`
@@ -208,16 +200,16 @@ function deriveTitle(permission: string, patterns: readonly string[], metadata: 
 
 /** Parse a `permission.asked` `properties` payload. Returns null if unusable. */
 export function parsePermissionRequest(payload: unknown): PermissionRequest | null {
-  const requestID = getString(payload, 'id')
-  const sessionID = getString(payload, 'sessionID')
+  const requestID = getStringProperty(payload, 'id')
+  const sessionID = getStringProperty(payload, 'sessionID')
   if (requestID == null || sessionID == null) return null
-  const permission = getString(payload, 'permission') ?? 'unknown'
+  const permission = getStringProperty(payload, 'permission') ?? 'unknown'
   const patterns = getStringArray(payload, 'patterns')
-  const metadata = getObject(payload, 'metadata')
+  const metadata = getObjectProperty(payload, 'metadata')
   // Extract raw command/filepath via the prototype-safe accessor so prototype-
   // polluted metadata objects cannot inject values through the prototype chain.
-  const rawCommand = getString(metadata, 'command')
-  const rawFilepath = getString(metadata, 'filepath')
+  const rawCommand = getStringProperty(metadata, 'command')
+  const rawFilepath = getStringProperty(metadata, 'filepath')
   return {
     requestID,
     sessionID,
@@ -233,9 +225,9 @@ export function parsePermissionRequest(payload: unknown): PermissionRequest | nu
 
 /** Parse a `permission.replied` `properties` payload. Returns null if unusable. */
 export function parsePermissionReply(payload: unknown): PermissionReplyEvent | null {
-  const requestID = getString(payload, 'requestID')
-  const sessionID = getString(payload, 'sessionID')
-  const reply = asReply(getObject(payload, 'reply') ?? getString(payload, 'reply'))
+  const requestID = getStringProperty(payload, 'requestID')
+  const sessionID = getStringProperty(payload, 'sessionID')
+  const reply = asReply(getObjectProperty(payload, 'reply') ?? getStringProperty(payload, 'reply'))
   if (requestID == null || sessionID == null || reply == null) return null
   return {requestID, sessionID, reply}
 }

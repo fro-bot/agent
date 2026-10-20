@@ -1,8 +1,11 @@
 /**
- * Provider-failure classification for the gateway event loop (#1836).
+ * Provider-failure labelling for the gateway event loop (#1836).
  *
- * Decides whether an OpenCode event means the model provider has rejected the run in a way no retry
- * will fix, so the run can fail promptly instead of idling until the inactivity window.
+ * The classification itself, and the decision to stop on a retry status, live in the shared
+ * `classifyProviderFailure` (`@fro-bot/runtime`), which the Action uses too, and so is the extraction of a typed
+ * signal from an OpenCode payload (`terminalSignalFromPayload`). This module does the two things that are
+ * gateway-only: it maps the shared `kind` onto the closed operator-safe `ProviderFailureReason`, and it keeps the
+ * error-name allowlist for logs.
  *
  * Security: classification reads upstream fields but NEVER returns them. Every result carries a closed,
  * fixed `reason` plus a sanitized error name; provider messages and response bodies stay in this module.
@@ -22,11 +25,17 @@
  * waits for the terminal error instead of risking a false failure on a recoverable outage.
  */
 
-import {classifyModelNotFoundError, classifyProviderAuthError} from '@fro-bot/runtime'
+import type {ProviderFailureClassification} from '@fro-bot/runtime'
+
+import {classifyProviderFailure, retrySignalFromStatus, terminalSignalFromPayload} from '@fro-bot/runtime'
 
 /** Closed set of operator-safe failure reasons. Nothing provider-controlled can become one. */
 export type ProviderFailureReason =
-  'provider auth unavailable' | 'model not available' | 'model provider rejected the request' | 'session error'
+  | 'provider auth unavailable'
+  | 'model not available'
+  | 'provider quota exceeded'
+  | 'model provider rejected the request'
+  | 'session error'
 
 /**
  * OpenCode error class names this classifier recognizes (v1.19.0): `packages/core/src/v1/session.ts`
@@ -57,76 +66,72 @@ export interface ProviderFailure {
   readonly errorName: ProviderFailureErrorName
 }
 
-/** Retry `action.reason` values that mean the model can never be served, matched exactly. */
-const MODEL_UNAVAILABLE_RETRY_REASONS = new Set(['model_not_found', 'model_not_supported'])
-
-/**
- * Message fallbacks for terminal error payloads that carry no structured marker.
- * Deliberately narrow: a 429, 5xx, "overloaded" or network message must never match.
- */
-const AUTH_MESSAGE_PATTERNS = [/\bauth_unavailable\b/i, /\bno auth available\b/i] as const
-const MODEL_MESSAGE_PATTERNS = [/\bmodel_not_found\b/i, /\bmodel (?:is )?not (?:supported|found)\b/i] as const
-
-/** Upper bound on text inspected, so a hostile payload cannot make matching expensive. */
-const MAX_INSPECTED_MESSAGE_LENGTH = 2048
-
-function getStringProperty(value: unknown, property: string): string | null {
-  if (value == null || typeof value !== 'object') return null
-  const descriptor = Object.getOwnPropertyDescriptor(value, property)
-  return typeof descriptor?.value === 'string' ? descriptor.value : null
-}
-
-function getObjectProperty(value: unknown, property: string): unknown {
-  if (value == null || typeof value !== 'object') return null
-  return Object.getOwnPropertyDescriptor(value, property)?.value ?? null
-}
-
-function knownErrorName(name: string | null): ProviderFailureErrorName {
+function knownErrorName(name: string | undefined): ProviderFailureErrorName {
   return KNOWN_ERROR_NAMES.find(known => known === name) ?? 'unknown'
 }
 
-function matchesAny(patterns: readonly RegExp[], text: string): boolean {
-  const inspected = text.slice(0, MAX_INSPECTED_MESSAGE_LENGTH)
-  return patterns.some(pattern => pattern.test(inspected))
-}
-
-/** Message-text fallback for terminal error payloads. Never applied to retry statuses. */
-function classifyMessage(message: string | null): ProviderFailureReason | null {
-  if (message === null) return null
-  if (matchesAny(AUTH_MESSAGE_PATTERNS, message)) return 'provider auth unavailable'
-  if (matchesAny(MODEL_MESSAGE_PATTERNS, message)) return 'model not available'
-  if (
-    classifyModelNotFoundError({kind: 'session-error', message: message.slice(0, MAX_INSPECTED_MESSAGE_LENGTH)}) !==
-    null
-  ) {
-    return 'model not available'
+/**
+ * Shared `kind` → internal reason. Evidence strength does not matter here: a `hint` result (looser wording) labels
+ * the failure the same as a structured one; only the shared stop decision cares how strong the evidence was.
+ *
+ * `unclassified` keeps one gateway-side refinement: an `APIError` with no other evidence is still "the provider
+ * rejected the request", which is more useful to an operator than `session error`.
+ */
+function toReason(
+  classification: ProviderFailureClassification,
+  payloadName: string | undefined,
+): ProviderFailureReason {
+  switch (classification.kind) {
+    case 'auth':
+      return 'provider auth unavailable'
+    case 'quota':
+      return 'provider quota exceeded'
+    case 'model-not-found':
+      return 'model not available'
+    case 'unclassified':
+      return payloadName === 'APIError' ? 'model provider rejected the request' : 'session error'
+    // Overflow and abort are surface policy, handled by `run-core` before a failure is built; if one reaches
+    // here it is not a provider rejection, so it gets the generic label.
+    case 'context-overflow':
+    case 'aborted':
+      return 'session error'
   }
-  return null
 }
 
 /**
- * Classify a `session.status` payload value from its structured `action.reason` only. Returns a failure
- * only for a retry that can never succeed (provider auth unavailable, model unsupported/not found); every
- * other retry, whatever its `message` says, returns `null` so the run keeps waiting.
+ * Classify a `session.status` payload. Returns a failure only when the shared function says the retry can never
+ * succeed (`stop`): provider auth unavailable, an account rate limit (quota), or a model that cannot be served.
+ * Every other retry, whatever its `message` says, returns `null` so the run keeps waiting.
+ *
+ * The retry `message` is deliberately not passed: it is the text of a retried (often 5xx) failure and is not
+ * evidence the retry is hopeless.
  */
-export function classifyRetryStatus(status: unknown): ProviderFailure | null {
-  if (getStringProperty(status, 'type') !== 'retry') return null
+export function failureFromRetryStatus(status: unknown): ProviderFailure | null {
+  const signal = retrySignalFromStatus(status)
+  if (signal === null) return null
 
-  const reason = getStringProperty(getObjectProperty(status, 'action'), 'reason')
-  if (reason === null) return null
-  if (classifyProviderAuthError({kind: 'retry-status', reason}) !== null) {
-    return {reason: 'provider auth unavailable', errorName: 'retry-status'}
-  }
-  if (MODEL_UNAVAILABLE_RETRY_REASONS.has(reason)) return {reason: 'model not available', errorName: 'retry-status'}
-  return null
+  const classification = classifyProviderFailure(signal)
+  if (classification === null || classification.stop === false) return null
+  return {reason: toReason(classification, undefined), errorName: 'retry-status'}
 }
 
 /**
- * Classify a plain-string `session.error` payload. The text is matched, never returned: an arbitrary
- * string yields the fixed `session error` reason.
+ * Label a plain-string `session.error` payload. The text is matched, never returned: an arbitrary string yields
+ * a fixed reason. Every terminal error fails the run; the label is all this decides.
  */
-export function classifyErrorText(text: string): ProviderFailure {
-  return {reason: classifyMessage(text) ?? 'session error', errorName: 'error-text'}
+export function failureFromErrorText(text: string): ProviderFailure {
+  const classification = classifyProviderFailure(terminalSignalFromPayload(text))
+  return {reason: toReason(classification, undefined), errorName: 'error-text'}
+}
+
+/**
+ * Label a structured OpenCode error object (`{name, data: {message, statusCode, ...}}`), as found on an assistant
+ * `info.error` or a `session.error` payload. Total: an unrecognized error still yields a fixed reason.
+ */
+export function failureFromErrorObject(error: unknown): ProviderFailure {
+  const signal = terminalSignalFromPayload(error)
+  const classification = classifyProviderFailure(signal)
+  return {reason: toReason(classification, signal.name), errorName: knownErrorName(signal.name)}
 }
 
 /**
@@ -134,7 +139,7 @@ export function classifyErrorText(text: string): ProviderFailure {
  * provider rejection, so the assistant-message path must not report it as one.
  */
 export function isAbortedError(error: unknown): boolean {
-  return getStringProperty(error, 'name') === 'MessageAbortedError'
+  return terminalSignalFromPayload(error).name === 'MessageAbortedError'
 }
 
 /**
@@ -142,25 +147,5 @@ export function isAbortedError(error: unknown): boolean {
  * `session.error` for it and then compacts and continues, so it is not a terminal failure.
  */
 export function isContextOverflowError(error: unknown): boolean {
-  return getStringProperty(error, 'name') === 'ContextOverflowError'
-}
-
-/**
- * Classify a structured OpenCode error object (`{name, data: {message, ...}}`), as found on an assistant
- * `info.error` or a `session.error` payload. Total: an unrecognized error still yields a fixed reason.
- */
-export function classifyStructuredError(error: unknown): ProviderFailure {
-  const name = getStringProperty(error, 'name')
-  const errorName = knownErrorName(name)
-
-  if (classifyProviderAuthError({kind: 'session-error', name}) !== null) {
-    return {reason: 'provider auth unavailable', errorName}
-  }
-
-  const message = getStringProperty(getObjectProperty(error, 'data'), 'message') ?? getStringProperty(error, 'message')
-  const fromMessage = classifyMessage(message)
-  if (fromMessage !== null) return {reason: fromMessage, errorName}
-
-  if (name === 'APIError') return {reason: 'model provider rejected the request', errorName}
-  return {reason: 'session error', errorName}
+  return terminalSignalFromPayload(error).name === 'ContextOverflowError'
 }

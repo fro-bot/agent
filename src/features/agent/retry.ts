@@ -5,6 +5,7 @@ import type {Logger} from '../../shared/logger.js'
 import type {AttemptObservation, FailureObservation, TurnEvidence} from './attempt-outcome.js'
 import type {AttemptResult} from './prompt-sender.js'
 import type {ActivityTracker, EventStreamResult, PermissionAskedResponder} from './streaming.js'
+import {getNumberProperty, getObjectProperty, getStringProperty} from '@fro-bot/runtime'
 import {toErrorMessage} from '../../shared/errors.js'
 import {reduceAttemptOutcome} from './attempt-outcome.js'
 import {
@@ -131,23 +132,6 @@ function getMessageID(value: unknown): string | null {
   if (value == null || typeof value !== 'object') return null
   const descriptor = Object.getOwnPropertyDescriptor(value, 'id')
   return typeof descriptor?.value === 'string' ? descriptor.value : null
-}
-
-function getStringProperty(value: unknown, property: string): string | null {
-  if (value == null || typeof value !== 'object') return null
-  const descriptor = Object.getOwnPropertyDescriptor(value, property)
-  return typeof descriptor?.value === 'string' ? descriptor.value : null
-}
-
-function getNumberProperty(value: unknown, property: string): number | null {
-  if (value == null || typeof value !== 'object') return null
-  const descriptor = Object.getOwnPropertyDescriptor(value, property)
-  return typeof descriptor?.value === 'number' ? descriptor.value : null
-}
-
-function getObjectProperty(value: unknown, property: string): unknown {
-  if (value == null || typeof value !== 'object') return null
-  return Object.getOwnPropertyDescriptor(value, property)?.value ?? null
 }
 
 const BASELINE_MESSAGES_TIMEOUT_MS = 5_000

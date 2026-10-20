@@ -13,6 +13,7 @@ import {
 const INTERNAL_TO_WIRE = [
   ['provider auth unavailable', 'provider-auth-unavailable'],
   ['model not available', 'model-not-available'],
+  ['provider quota exceeded', 'provider-quota-exceeded'],
   ['model provider rejected the request', 'provider-rejected-request'],
   ['session error', 'unclassified'],
 ] as const satisfies readonly (readonly [ProviderFailureReason, OperatorProviderFailureReason])[]
@@ -140,7 +141,7 @@ describe('wire tuple and internal mapping stay in step', () => {
     // #when compared
     // #then every wire value is reachable from an internal reason and no mapping targets an undeclared value
     expect(mapped).toEqual(tuple)
-    expect(tuple.size).toBe(4)
+    expect(tuple.size).toBe(5)
   })
 
   it('the parser accepts exactly the tuple', () => {

@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-10-11"
-updated-by: "18890129"
+last-updated: "2026-10-18"
+updated-by: "1dcd6a296d36057a6680ca347bf01a6987d78ec9"
 sources:
   - src/harness/config/state-keys.ts
   - src/harness/config/outputs.ts
@@ -214,7 +214,7 @@ The irreversible consumers are gated more narrowly than the outcome itself. Brok
 
 ## Post-Action Hook
 
-`post.ts` runs after the main step completes — even if the main step was cancelled or failed. It exists because GitHub Actions may kill the main step's `finally` block after a brief grace period, which could interrupt the cache save. The post-action hook provides a second, durable opportunity to persist state. It reads state written by cleanup to decide what still needs doing.
+`post.ts` runs after the main step completes — even if the main step was cancelled or failed. It exists because GitHub Actions may kill the main step's `finally` block after a brief grace period, which could interrupt the cache save. The post-action hook provides a second, durable opportunity to persist state. It reads state written by cleanup to decide what still needs doing. Its outer `finally` also attempts the bounded, ownership-checked Action lock release described under Acquire Lock, even when persistence was skipped or failed. Cache-save eligibility and lock recovery are separate decisions: declining a save does not suppress release of a lease this invocation still owns.
 
 ### The Cleanup-to-Post Handoff
 
