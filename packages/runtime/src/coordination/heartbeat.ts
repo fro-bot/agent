@@ -47,9 +47,12 @@ export interface HeartbeatStopError extends Error {
 }
 
 export interface HeartbeatController {
+  /** Starts the tick interval. A no-op after `stop()` has run: a stopped controller is final, a restart needs a new one. */
   readonly start: () => void
   /**
    * Quiesce the heartbeat timer and return an authoritative snapshot of the run state.
+   *
+   * Never rejects: every failure, including an adapter that throws, comes back as a `HeartbeatStopError`.
    *
    * `stop()` is liveness-only: it does not perform a terminal `transitionRun`. The caller
    * owns the run lifecycle and uses the returned `runEtag` to transition the run to
@@ -98,6 +101,9 @@ export function createHeartbeatController(
   let inFlight: Promise<void> | null = null
   let tickError: Error | null = null
   let stopping = false
+  // A function, not a bare read: `stopping` flips during the awaits in `writeHeartbeat`, which control-flow narrowing
+  // cannot see.
+  const isStopping = (): boolean => stopping
   let currentLockEtag = lockEtag
   // Tracked apart from the lock ETag: the lock and the RunState are separate objects and a tick can advance one
   // without the other.
@@ -136,7 +142,7 @@ export function createHeartbeatController(
     //
     // A tick that outlives `stop()` must not start new I/O: a late renewal would restart the lease TTL after the
     // caller has already tried to release it.
-    if (stopping) {
+    if (isStopping() === true) {
       return false
     }
 
@@ -160,7 +166,7 @@ export function createHeartbeatController(
 
     currentLockEtag = renewed.data.etag
 
-    if (stopping) {
+    if (isStopping() === true) {
       return false
     }
 
@@ -184,7 +190,7 @@ export function createHeartbeatController(
     inFlight = writeHeartbeat()
       .then(completed => {
         // A tick that skipped its I/O proves nothing about the earlier failure it would otherwise clear.
-        if (completed) {
+        if (completed === true) {
           tickError = null
         }
       })
@@ -214,10 +220,14 @@ export function createHeartbeatController(
       if (running === true) {
         return
       }
+      // One-way: a restart would un-skip a tick that outlived `stop()`. A restart needs a new controller.
+      if (stopping === true) {
+        logger.debug('Ignoring start of a stopped heartbeat controller', {repo, runId})
+        return
+      }
 
       logger.debug('Starting heartbeat controller', {repo, runId})
       running = true
-      stopping = false
       intervalHandle = setInterval(runTick, config.heartbeatIntervalMs)
     },
     stop: async (): Promise<Result<HeartbeatStopResult, HeartbeatStopError>> => {
@@ -241,26 +251,31 @@ export function createHeartbeatController(
         return err(toStopError(tickError, false))
       }
 
-      const getObject = resolveGetObject(config)
-      if (getObject.success === false) {
-        return err(toStopError(getObject.error, false))
-      }
+      // `stop()` never rejects: an adapter that throws or rejects must still hand the caller the ETags it needs.
+      try {
+        const getObject = resolveGetObject(config)
+        if (getObject.success === false) {
+          return err(toStopError(getObject.error, false))
+        }
 
-      const current = await getObject.data(runKey.data)
-      if (current.success === false) {
-        return err(toStopError(current.error, false))
-      }
+        const current = await getObject.data(runKey.data)
+        if (current.success === false) {
+          return err(toStopError(current.error, false))
+        }
 
-      const parsedCurrent = parseRunState(current.data.data)
-      if (parsedCurrent.success === false) {
-        return err(toStopError(parsedCurrent.error, false))
-      }
+        const parsedCurrent = parseRunState(current.data.data)
+        if (parsedCurrent.success === false) {
+          return err(toStopError(parsedCurrent.error, false))
+        }
 
-      return ok({
-        runEtag: current.data.etag,
-        runState: parsedCurrent.data,
-        lockEtag: currentLockEtag,
-      })
+        return ok({
+          runEtag: current.data.etag,
+          runState: parsedCurrent.data,
+          lockEtag: currentLockEtag,
+        })
+      } catch (error) {
+        return err(toStopError(error instanceof Error ? error : new Error(String(error)), false))
+      }
     },
     get isRunning() {
       return running

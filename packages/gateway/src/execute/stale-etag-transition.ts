@@ -17,27 +17,36 @@ export interface StaleEtagTransitionOptions<T> {
 
 const TERMINAL_PHASES: ReadonlySet<RunState['phase']> = new Set(['COMPLETED', 'FAILED', 'CANCELLED'])
 
-/** Reads the run's stored record, or `null` when it cannot be read or parsed. Never throws. */
+/**
+ * Reads the run's stored record, or `null` when it cannot be read or parsed. Never throws. Every `null` is logged at
+ * debug with its reason, so a retry that was silently disabled is visible.
+ */
 async function readStoredRun(
-  config: CoordinationConfig,
-  identity: string,
-  repo: string,
-  runId: string,
+  options: Pick<StaleEtagTransitionOptions<unknown>, 'config' | 'identity' | 'repo' | 'runId' | 'logger'>,
 ): Promise<{readonly state: RunState; readonly etag: string} | null> {
+  const {config, identity, repo, runId, logger} = options
+  const skip = (reason: string): null => {
+    logger.debug({repo, runId, reason}, 'run: stale-ETag retry disabled — stored run-state is unreadable')
+    return null
+  }
+
   try {
     const key = getRunKey(config, identity, repo, runId)
+    if (key.success === false) {
+      return skip(key.error.message)
+    }
     const getObject = config.storeAdapter?.getObject
-    if (key.success === false || getObject == null) {
-      return null
+    if (getObject == null) {
+      return skip('store adapter has no getObject')
     }
     const fetched = await getObject(key.data)
     if (fetched.success === false) {
-      return null
+      return skip(fetched.error.message)
     }
     const parsed = parseRunState(fetched.data.data)
-    return parsed.success === false ? null : {state: parsed.data, etag: fetched.data.etag}
-  } catch {
-    return null
+    return parsed.success === false ? skip(parsed.error.message) : {state: parsed.data, etag: fetched.data.etag}
+  } catch (error) {
+    return skip(error instanceof Error ? error.message : String(error))
   }
 }
 
@@ -57,14 +66,14 @@ async function readStoredRun(
 export async function transitionRetryingStaleEtag<T>(
   options: StaleEtagTransitionOptions<T>,
 ): Promise<Result<T, Error>> {
-  const {config, identity, repo, runId, etag, logger, attempt} = options
+  const {repo, runId, etag, logger, attempt} = options
 
   const first = await attempt(etag)
   if (first.success === true) {
     return first
   }
 
-  const stored = await readStoredRun(config, identity, repo, runId)
+  const stored = await readStoredRun(options)
   if (stored === null) {
     return first
   }

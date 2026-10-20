@@ -152,7 +152,7 @@ export function acquireMaintenanceRun(opts: {
           return attempted._tag === 'Right' ? ok(attempted.right) : err(attempted.left)
         }
         const transitionResult = yield* Effect.promise(async () =>
-          stopFailed
+          stopFailed === true
             ? transitionRetryingStaleEtag({
                 config: coordinationConfig,
                 identity,

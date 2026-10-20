@@ -993,7 +993,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     ) => {
       const attempt = async (attemptEtag: string) =>
         transitionRun(coordinationConfig, identity, repo, runId, phase, attemptEtag, coordLogger, options)
-      return heartbeatStopFailed
+      return heartbeatStopFailed === true
         ? transitionRetryingStaleEtag({config: coordinationConfig, identity, repo, runId, etag, logger, attempt})
         : attempt(etag)
     }
