@@ -71,16 +71,6 @@ export interface RunSummary {
 }
 
 /**
- * Extract the owner/repo from an entity_ref string ('owner/repo#runNumber').
- *
- * Returns null when the entity_ref does not contain a slash (malformed or empty).
- * Strips the '#fragment' before splitting so the repo segment is clean.
- */
-function extractEntityRefRepo(entityRef: string): {readonly owner: string; readonly repo: string} | null {
-  return parseEntityRefRepo(entityRef)
-}
-
-/**
  * Pure builder: project a RunState to a RunSummary, scoped to a binding.
  *
  * Maps lifecycle phase only; waiting overlays are the caller's concern.
@@ -107,7 +97,7 @@ export function toRunSummary(
   // Consistency guard: verify entity_ref owner/repo matches the binding.
   // The binding is the authorization anchor; a mismatch indicates storage
   // corruption or a repo rename. Omit the run rather than misattribute it.
-  const entityRefRepo = extractEntityRefRepo(runState.entity_ref)
+  const entityRefRepo = parseEntityRefRepo(runState.entity_ref)
   if (entityRefRepo === null) {
     return null
   }

@@ -18,7 +18,7 @@ Three kinds of copies are still live.
 
 - **Cross-surface.**
   - Five local sleep or delay copies sit beside an unused runtime `sleep`. Four of them move; the `acquire-lock` copy stays local.
-  - The gateway hard-codes `'1800000'` while runtime exports `DEFAULT_TIMEOUT_MS`.
+  - The gateway run-timeout default (`1800000`) has the same value as runtime `DEFAULT_TIMEOUT_MS`. The two are different policies, so the literal is not a duplicate worth sharing (see Key Technical Decisions).
 - **The entity-ref repo parser.** It has three identical gateway copies: `route-helpers.ts`, `surface-gate.ts` and `run-summary.ts`. This parser feeds the repo-access gate, so drift between the copies is an authorization risk. Runtime already owns the `entity_ref` format.
 - **Gateway-internal copies.**
   - Five logger-adapter wrappers.
@@ -28,9 +28,9 @@ Three kinds of copies are still live.
 
 ## Requirements Trace
 
-- **R1.** One runtime `parseEntityRefRepo` for `owner/repo#n` entity refs. The three gateway copies delegate to it with identical results.
+- **R1.** One runtime `parseEntityRefRepo` for `owner/repo` entity refs. `route-helpers.ts` calls it, and the `surface-gate.ts` and `run-summary.ts` copies are deleted and call it directly, with identical results.
 - **R2.** The four sleep/delay copies use runtime `sleep`. Zero-delay and non-negative behaviour at each call site is unchanged. The `acquire-lock.ts` copy stays local because it calls `unref`.
-- **R3.** Gateway config uses runtime `DEFAULT_TIMEOUT_MS` for the run-timeout default.
+- **R3.** The gateway run-timeout default stays per surface on purpose. Gateway config keeps a local `DEFAULT_RUN_TIMEOUT_MS` (1800000, the gateway's whole-run ceiling) and does not use runtime `DEFAULT_TIMEOUT_MS`, the Action's agent timeout default. The value does not change.
 - **R4.** The gateway has one logger adapter, one SHA validator and one binary-bytes formatter. The copies are deleted.
 - **R5.** The stale comments are fixed: `reply-delivery.ts:13`, `run-core.ts:268-274`, `maintenance-run.ts:28` and `route-helpers.ts:4`.
 - **R6.** The requirements doc marks config block 1 (#1883) and this rung as delivered. Rung 2 is already marked. It amends R7 and the "Ladder, low priority" row, marks the "mirrors exactly" success criterion done, records the two follow-ups as #1885 and #1886, and annotates the stale inventory rows (row 15, Callout B, Top-5 #2).
@@ -93,8 +93,9 @@ Research: `/tmp/plan-rung4/repo.md`.
     },
     {
       "path_or_symbol": "packages/runtime/src/shared/constants.ts DEFAULT_TIMEOUT_MS",
-      "description": "Runtime default run timeout (1800000)",
-      "disposition": "reuse"
+      "description": "Runtime default agent timeout (1800000)",
+      "disposition": "insufficient",
+      "insufficiency_reason": "The gateway run timeout is a separate policy (whole-run ceiling) that only matches this value today; it keeps its own constant"
     },
     {
       "path_or_symbol": "packages/runtime/src/coordination/types.ts entity_ref",
@@ -119,12 +120,13 @@ Research: `/tmp/plan-rung4/repo.md`.
 
 ## Key Technical Decisions
 
-- **The entity-ref parser lives in runtime.** It goes in `packages/runtime/src/coordination/entity-ref.ts` as `parseEntityRefRepo(entityRef: string): {readonly owner: string; readonly repo: string} | null`, exported by name from `coordination/index.ts`. Runtime owns the field, and the parser gates repo access, so one definition guards it against drift. `resolveRepoFromRunIndex` stays in the gateway and only its body changes; it parses `RunIndex` `location.repo`, which has the same `owner/repo#n` shape. This is an exception to origin R1's "both surfaces switch in the same PR": the Action has no entity-ref consumer, so only the gateway switches.
+- **The entity-ref parser lives in runtime.** It goes in `packages/runtime/src/coordination/entity-ref.ts` as `parseEntityRefRepo(entityRef: string): {readonly owner: string; readonly repo: string} | null`, exported by name from `coordination/index.ts`. Runtime owns the field, and the parser gates repo access, so one definition guards it against drift. `resolveRepoFromRunIndex` stays in the gateway and only its body changes; it parses `RunIndex` `location.repo`, which holds the bare `owner/repo` the gateway writes into `entity_ref`; the parser's `#` strip only guards legacy or malformed records. This is an exception to origin R1's "both surfaces switch in the same PR": the Action has no entity-ref consumer, so only the gateway switches.
 - **Sleep guards move to the call sites that need them.** Runtime `sleep` throws on negative, `NaN` or infinite input. Today `coordination-decline`'s guard lives inside its local helper. The move adds `if (delayMs > 0) await sleep(delayMs)` inside the `applyBlockedLabel` backoff loop. It skips the await and does not `return`, so restore retries still run. `restoreBackoffMs` is a public option, so this guard also keeps a caller-supplied negative entry from throwing. The other three callers pass known finite, non-negative values (read during review): `server.ts` `pollIntervalMs` defaults to 100, `checkpoint.ts` `retryDelayMs` to 200 with no `src` override, and `execute.ts` clamps a value derived from `DEFAULT_DRAIN_POLL_INTERVAL_MS` (250). They need no extra guard.
+- **The run-timeout default stays per surface.** Gateway config keeps a local `DEFAULT_RUN_TIMEOUT_MS = 1_800_000`, the gateway's whole-run ceiling. Runtime `DEFAULT_TIMEOUT_MS` is the Action's agent timeout default. The values match today, but they are different policies that may diverge, so the literal is not a duplicate worth sharing.
 - **The `acquire-lock` delay stays local.** It calls `unref` on its timer on purpose. A one-line comment says so. An `{unref}` option on runtime `sleep` would be new API and is not needed here.
 - **The gateway helpers stay in the gateway.**
   - **Logger adapter:** `execute/runtime-logger.ts` exports `toRuntimeLogger`, the four-method adapter from `run-core.ts:275`. It depends on `GatewayLogger`, so it cannot live in runtime. Its result is structurally assignable to the 1- and 2-method shapes. `toCoordLogger` stays as an exported alias only if a call-site type needs the narrower name.
-  - **SHA validator:** `workspace-api/sha.ts` exports `SHA_RE` and `isValidSha`.
+  - **SHA validator:** `workspace-api/sha.ts` exports `isValidSha`; `SHA_RE` stays module-private.
   - **Bytes formatter:** the merged helper is `formatBinaryBytes`. The new name keeps it from being confused with runtime `formatBytes`.
 - **Imports.** Gateway files import runtime values directly from `@fro-bot/runtime`, as `execute/settle-owned-sessions.ts` does. Action files use runtime `sleep` through the existing `src/shared/async.ts` re-export.
 - **`dist/` is rebuilt per commit.** Runtime is bundled into the Action, so the orchestrator rebuilds `dist/` after every unit that touches runtime or `src/`. Unit 1 should leave `dist/` unchanged, and Unit 2 changes it.
@@ -151,7 +153,7 @@ Research: `/tmp/plan-rung4/repo.md`.
 - Modify: `packages/runtime/src/coordination/index.ts`, `packages/gateway/src/web/operator/route-helpers.ts`, `packages/gateway/src/redaction/surface-gate.ts`, `packages/gateway/src/operator-contract/run-summary.ts`
 - Check: `dist/` after rebuild (expected unchanged)
 
-**Approach:** Copy the current semantics exactly: strip everything from the first `#`, then split on the first `/`. The three gateway functions keep their names and signatures and delegate. Fix the `route-helpers.ts` header so it no longer claims the logic is deduplicated there.
+**Approach:** Copy the current semantics exactly: strip everything from the first `#`, then split on the first `/`. `route-helpers.ts` `resolveRepoFromRunIndex` keeps its name and signature and calls the runtime parser. The `surface-gate.ts` and `run-summary.ts` wrapper functions are deleted, and their single call sites call it directly. Fix the `route-helpers.ts` header so it no longer claims the logic is deduplicated there.
 
 **Test scenarios** (new runtime test):
 
@@ -171,7 +173,7 @@ Research: `/tmp/plan-rung4/repo.md`.
 
 - [ ] **Unit 2: Sleep family and default timeout**
 
-**Goal:** Runtime `sleep` replaces the four local copies, and gateway config uses `DEFAULT_TIMEOUT_MS`.
+**Goal:** Runtime `sleep` replaces the four local copies. Gateway config names its run-timeout default as a local constant.
 
 **Requirements:** R2, R3, R7
 
@@ -187,7 +189,7 @@ Research: `/tmp/plan-rung4/repo.md`.
 - Delete each local `delay`/`sleep` and import runtime `sleep`. Inside runtime, import from `../shared/async.js`.
 - `coordination-decline`: in the backoff loop, `if (delayMs > 0) await sleep(delayMs)`. Do not add a `return`.
 - `acquire-lock`: keep the local `unref` delay and add a one-line comment saying why.
-- Gateway config: replace the `'1800000'` default with `String(DEFAULT_TIMEOUT_MS)`, using `import {DEFAULT_TIMEOUT_MS} from '@fro-bot/runtime'`.
+- Gateway config: replace the `'1800000'` literal with a local `DEFAULT_RUN_TIMEOUT_MS = 1_800_000` and use `String(DEFAULT_RUN_TIMEOUT_MS)` as the fallback. Do not import runtime `DEFAULT_TIMEOUT_MS`.
 
 **Test scenarios:** No new tests. The existing Action harness, cache and runtime server suites cover these callers and must pass unchanged. `coordination-decline-restamp.test.ts` already exercises `restoreBackoffMs: [0, 0]` and expects the retry to succeed, which pins the zero-delay path.
 

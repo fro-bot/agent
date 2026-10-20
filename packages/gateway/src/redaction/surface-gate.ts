@@ -136,19 +136,8 @@ export async function lookupBindingDenyKeys<B extends BindingDenyKeySource>(
 // resolveRunRepoKey — resolve a run's entity_ref to its binding deny keys
 // ---------------------------------------------------------------------------
 
-/**
- * Parse the owner/repo from a run's entity_ref ('owner/repo#runNumber').
- *
- * Returns null if the entity_ref does not match the expected format.
- * Internal — not exported; callers use resolveRunRepoKey.
- */
-function parseEntityRef(entityRef: string): {readonly owner: string; readonly repo: string} | null {
-  // entity_ref format: 'owner/repo#runNumber'
-  return parseEntityRefRepo(entityRef)
-}
-
 async function lookupRunDenyKeys(runState: RunState, bindingsLookup: BindingsLookup): Promise<DenyKeyLookup> {
-  const parsed = parseEntityRef(runState.entity_ref)
+  const parsed = parseEntityRefRepo(runState.entity_ref)
   if (parsed === null) {
     return {kind: 'resolved', repoKey: NULL_KEY, binding: null}
   }

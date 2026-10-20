@@ -1,7 +1,9 @@
 /**
- * Extract the owner/repo from an `entity_ref` string (`owner/repo#runNumber`).
+ * Extract the owner/repo from an `entity_ref` string.
  *
- * Strips everything from the first `#`, then splits on the first `/`. Returns
+ * The gateway writes `entity_ref` as the bare `owner/repo` (`execute/run.ts` and `discord/maintenance-run.ts`).
+ * The strip of everything from the first `#` only guards legacy or malformed records that carry a `#...` suffix.
+ * After the strip, the parser splits on the first `/`. Returns
  * `null` when there is no slash or when owner or repo is empty. Extra path
  * segments stay in `repo` (`a/b/c` → `{owner: 'a', repo: 'b/c'}`).
  *

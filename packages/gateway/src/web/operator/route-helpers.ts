@@ -30,8 +30,8 @@ import {lookupBindingDenyKeys} from '../../redaction/surface-gate.js'
  * The caller maps null to its own notFoundResponse inside its own try/catch
  * so the no-oracle behavior is preserved per-route.
  *
- * Strips any trailing `#...` suffix from the repo path before splitting so
- * future entity_ref formats with a fragment do not bleed into the repo name.
+ * `parseEntityRefRepo` strips any trailing `#...` suffix, which only guards legacy or
+ * malformed records: `RunLocation.repo` is already the bare `owner/repo`.
  */
 export async function resolveRepoFromRunIndex(
   runId: string,

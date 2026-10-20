@@ -7,7 +7,6 @@ import type {VapidKeyMaterial, VapidPublicKeyInfo} from './web/operator-push/vap
 import {Buffer} from 'node:buffer'
 import {isIP} from 'node:net'
 
-import {DEFAULT_TIMEOUT_MS} from '@fro-bot/runtime'
 import {GatewayIntentBits} from 'discord.js'
 import {Effect, Either} from 'effect'
 import {loadObjectStoreSettings} from './object-store-config.js'
@@ -34,6 +33,9 @@ import {assertValidVapidKeyMaterial} from './web/operator-push/vapid.js'
 export {readMultilineSecret, readOptionalMultilineSecret, readOptionalSecret, readSecret}
 
 const DEFAULT_GATEWAY_IDENTITY = 'discord-gateway'
+// The gateway's whole-run ceiling. Deliberately separate from the Action's agent timeout default (runtime
+// `DEFAULT_TIMEOUT_MS`): the two share a value today, but they are different policies and may diverge.
+const DEFAULT_RUN_TIMEOUT_MS = 1_800_000
 const DEFAULT_LOG_LEVEL = 'info' as const
 const VALID_LOG_LEVELS = ['debug', 'info', 'warn', 'error'] as const
 
@@ -459,7 +461,7 @@ export function loadGatewayConfig(): GatewayConfig {
     throw new Error(`Invalid GATEWAY_MAX_CONCURRENT_RUNS value: "${rawMaxConcurrent}" (must be a positive integer)`)
   }
 
-  const rawRunTimeout = readOptionalSecret('GATEWAY_RUN_TIMEOUT_MS') ?? String(DEFAULT_TIMEOUT_MS)
+  const rawRunTimeout = readOptionalSecret('GATEWAY_RUN_TIMEOUT_MS') ?? String(DEFAULT_RUN_TIMEOUT_MS)
   if (/^[1-9]\d*$/.test(rawRunTimeout) === false) {
     throw new Error(`Invalid GATEWAY_RUN_TIMEOUT_MS value: "${rawRunTimeout}" (must be a positive integer)`)
   }
