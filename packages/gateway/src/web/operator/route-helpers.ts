@@ -1,15 +1,19 @@
 /**
  * Shared gate helpers for operator routes.
  *
- * Extracts the duplicated owner/repo-split logic and the repo-access predicate
- * that appear in every run-scoped route. Each route retains its own try/catch and
- * maps a null or non-`allowed` result to its own notFoundResponse — the no-oracle
- * behavior is unchanged.
+ * Holds the run-to-repo resolution and the repo-access predicate shared by the
+ * run-scoped routes. The entity-ref parsing itself lives in `@fro-bot/runtime`
+ * (`parseEntityRefRepo`). Each route retains its own try/catch and maps a null or
+ * non-`allowed` result to its own notFoundResponse — the no-oracle behavior is
+ * unchanged.
  */
 
 import type {RunIndex} from '../../execute/run-index.js'
 import type {DenylistCache} from '../../redaction/denylist.js'
 import type {BindingDenyKeySource, BindingsLookup} from '../../redaction/surface-gate.js'
+
+import {parseEntityRefRepo} from '@fro-bot/runtime'
+
 import {lookupBindingDenyKeys} from '../../redaction/surface-gate.js'
 
 // ---------------------------------------------------------------------------
@@ -26,8 +30,8 @@ import {lookupBindingDenyKeys} from '../../redaction/surface-gate.js'
  * The caller maps null to its own notFoundResponse inside its own try/catch
  * so the no-oracle behavior is preserved per-route.
  *
- * Strips any trailing `#...` suffix from the repo path before splitting so
- * future entity_ref formats with a fragment do not bleed into the repo name.
+ * `parseEntityRefRepo` strips any trailing `#...` suffix, which only guards legacy or
+ * malformed records: `RunLocation.repo` is already the bare `owner/repo`.
  */
 export async function resolveRepoFromRunIndex(
   runId: string,
@@ -36,15 +40,7 @@ export async function resolveRepoFromRunIndex(
   const location = await runIndex.lookup(runId)
   if (location === undefined) return null
 
-  const repoPath = location.repo.split('#')[0] ?? location.repo
-  const slashIdx = repoPath.indexOf('/')
-  if (slashIdx === -1) return null
-
-  const owner = repoPath.slice(0, slashIdx)
-  const repo = repoPath.slice(slashIdx + 1)
-  if (owner.length === 0 || repo.length === 0) return null
-
-  return {owner, repo}
+  return parseEntityRefRepo(location.repo)
 }
 
 // ---------------------------------------------------------------------------

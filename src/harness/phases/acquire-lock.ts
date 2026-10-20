@@ -140,6 +140,7 @@ const RENEWAL_TIMEOUT_MS = 10_000
  */
 const STOP_GRACE_PERIOD_MS = 5_000
 
+// Local on purpose (not runtime `sleep`): `unref` stops a pending timer from keeping the process alive.
 async function delay(ms: number): Promise<void> {
   return new Promise(resolve => {
     const handle = setTimeout(resolve, ms)

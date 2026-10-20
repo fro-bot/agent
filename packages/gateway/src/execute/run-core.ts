@@ -17,12 +17,7 @@
  * the publisher — tool events never arrive.
  */
 
-import type {
-  OpenCodeServerHandle,
-  OwnershipEntryState,
-  OwnershipLedger,
-  Logger as RuntimeLogger,
-} from '@fro-bot/runtime'
+import type {OpenCodeServerHandle, OwnershipEntryState, OwnershipLedger} from '@fro-bot/runtime'
 import type {PermissionCoordinator} from '../approvals/coordinator.js'
 import type {QuestionCoordinator} from '../approvals/question-coordinator.js'
 import type {TerminalListener} from '../approvals/request-gate.js'
@@ -57,6 +52,7 @@ import {
   isContextOverflowError,
 } from './provider-failure.js'
 import {createReplyDeliveryTracker} from './reply-delivery.js'
+import {toRuntimeLogger} from './runtime-logger.js'
 import {settleOwnedSessions} from './settle-owned-sessions.js'
 import {createTextBoundaryTracker} from './text-boundary.js'
 
@@ -263,22 +259,6 @@ export interface RunCoreParams {
     readonly rootSessionId: string
     readonly ownedSessionIds: readonly string[]
   }) => void
-}
-
-/**
- * Adapt the gateway's `(context, message)` logger to the runtime's
- * `(message, context)` `Logger` shape the ledger-reconciliation primitives
- * expect. Mirrors `toLedgerReconcileLogger` in `execute/recovery.ts` —
- * duplicated locally rather than imported to avoid a cross-module coupling
- * for four one-line functions.
- */
-function toRuntimeLogger(logger: GatewayLogger): RuntimeLogger {
-  return {
-    debug: (msg, ctx) => logger.debug(ctx ?? {}, msg),
-    info: (msg, ctx) => logger.info(ctx ?? {}, msg),
-    warning: (msg, ctx) => logger.warn(ctx ?? {}, msg),
-    error: (msg, ctx) => logger.error(ctx ?? {}, msg),
-  }
 }
 
 /** Snapshot of every tracked entry's state, keyed by session id — the comparison basis for detecting a genuine mutation. */

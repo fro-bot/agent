@@ -46,6 +46,7 @@ import type {
 } from './types.js'
 
 import {err, ok} from '@fro-bot/runtime'
+import {isValidSha} from './sha.js'
 
 export interface WorkspaceClientOptions {
   readonly baseUrl: string
@@ -734,12 +735,6 @@ function isCloneErrorCode(value: string): value is CloneErrorCode {
 // /inspect response parsing — rejects status/body contradictions, unknown `kind`
 // values, invalid SHAs, and malformed timestamps rather than trusting the wire.
 // ---------------------------------------------------------------------------
-
-const SHA_RE = /^[0-9a-f]{40}$/
-
-function isValidSha(value: unknown): value is string {
-  return typeof value === 'string' && SHA_RE.test(value)
-}
 
 const CHECKOUT_OPERATIONS = new Set<string>(['none', 'merge', 'rebase', 'am', 'cherry-pick', 'revert', 'bisect'])
 

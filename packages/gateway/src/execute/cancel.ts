@@ -36,7 +36,7 @@ import type {RunIndex} from './run-index.js'
 import type {RunTask} from './run.js'
 
 import {getRunKey, parseRunState, transitionRun} from '@fro-bot/runtime'
-import {toCoordLogger} from './run.js'
+import {toRuntimeLogger} from './runtime-logger.js'
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -248,7 +248,7 @@ async function attemptRendezvousCancel(
   logger: GatewayLogger,
 ): Promise<CancelOutcome> {
   const {coordinationConfig, identity} = deps
-  const coordLogger = toCoordLogger(logger)
+  const coordLogger = toRuntimeLogger(logger)
 
   let read = await readRunState(deps, repo, runId, logger)
   if (read === undefined) {
@@ -319,7 +319,7 @@ export async function cancelRun(params: CancelRunParams, deps: CancelRunDeps): P
   if (channelId !== '') {
     const removed = deps.queue.removeBy(channelId, task => task.runId === runId)
     if (removed !== undefined) {
-      const coordLogger = toCoordLogger(logger)
+      const coordLogger = toRuntimeLogger(logger)
       const cancelledBy = makeCancelledBy(actor, deps.now)
       const transitionResult = await transitionRun(
         deps.coordinationConfig,
