@@ -29,7 +29,7 @@ The concerns fall into two groups (full inventory: [2026-10-18-action-gateway-co
 | --- | --- | --- |
 | Provider-failure classification | Duplicated behavior | Ladder, rung 1 (delivered in #1869) |
 | Payload accessors, task-notice parser | Duplicated behavior | Ladder, rung 2 (delivered in #1872) |
-| Entity-ref parser, sleep, gateway logger adapter, SHA validator, byte formatter | Small duplicates | Ladder, small-helpers rung (delivered in #NNNN). The run-timeout default stays per surface on purpose |
+| Entity-ref parser, sleep, gateway logger adapter, SHA validator, byte formatter | Small duplicates | Ladder, small-helpers rung (delivered in #1888). The run-timeout default stays per surface on purpose |
 | Bounded abort and settle (teardown) | Duplicated behavior, stateful | Separately planned rung |
 | Lock lease renewal and takeover | Duplicated behavior, stateful | Separately planned rung, after a takeover-policy decision |
 | S3 and object-store config | Duplicated parsing and validation | Config spine, block 1 (delivered in #1883; one object-store settings parser in runtime) |
