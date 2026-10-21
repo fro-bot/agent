@@ -202,7 +202,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 
 ### PR-A: loop plus Action (behaviour-neutral)
 
-- [ ] **Unit 1: Golden-trace characterization**
+- [x] **Unit 1: Golden-trace characterization**
 
 **Goal:** Record today's adapter calls and their ordering for both surfaces, so every later unit can prove neutrality.
 
@@ -240,7 +240,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 
 **Verification:** Passes on unchanged code.
 
-- [ ] **Unit 2: Optional abort signal on `conditionalPut` and `renewLease`**
+- [x] **Unit 2: Optional abort signal on `conditionalPut` and `renewLease`**
 
 **Goal:** Requests can be aborted. No caller passes a signal yet.
 
@@ -263,7 +263,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 
 **Verification:** Runtime tests pass. Golden traces are identical.
 
-- [ ] **Unit 3: Runtime lease loop**
+- [x] **Unit 3: Runtime lease loop**
 
 **Goal:** `createLeaseLoop` with contract tests. Not used in production yet.
 
@@ -294,7 +294,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 
 **Verification:** New tests pass. `check-types` passes.
 
-- [ ] **Unit 4: Action on the loop**
+- [x] **Unit 4: Action on the loop**
 
 **Goal:** The Action's renewal uses `createLeaseLoop`. Behaviour is unchanged.
 
