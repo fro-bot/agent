@@ -1282,6 +1282,30 @@ describe('heartbeat controller', () => {
       expect(snapshotSignal?.aborted).toBe(false)
     })
 
+    it('never rejects from stop() when the logger throws', async () => {
+      // #given a logger whose debug sink is down
+      const logger = createLogger()
+      vi.mocked(logger.debug).mockImplementation(() => {
+        throw new Error('log sink down')
+      })
+      const controller = createHeartbeatController(
+        createCoordinationConfig(createStoreAdapter()),
+        'coordination',
+        'owner/repo',
+        'run-1',
+        'lock-etag-1',
+        'run-etag-0',
+        logger,
+      )
+
+      // #when
+      const stopped = await controller.stop()
+
+      // #then stop still ran to completion
+      expect(stopped.success).toBe(true)
+      expect(controller.isRunning).toBe(false)
+    })
+
     it('keeps the underlying error as the cause of a failed stop', async () => {
       // #given a renewal that fails
       const failure = new Error('lock renewal failed')

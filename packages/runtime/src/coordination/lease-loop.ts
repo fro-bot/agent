@@ -40,7 +40,11 @@ export interface LeaseLoopOptions<F = void> {
   readonly tickTimeoutMs: number
   /** One budget for the whole of `stop()`: the wait on the in-flight attempt plus `finalize`. */
   readonly stopBudgetMs: number
-  /** Unref every loop timer so none keeps the process alive. */
+  /**
+   * Unref every loop timer so none keeps the process alive. With `false` the timers stay referenced, with one
+   * exception: when `stop()` gives up on a pending attempt, the loop unrefs that attempt's tick timer either way. It
+   * still fires and records the timeout while the process lives, but it never holds shutdown open.
+   */
   readonly unref: boolean
   /** Create one `AbortController` per attempt, aborted at the tick timeout or when the stop budget runs out. */
   readonly abortOnDeadline: boolean

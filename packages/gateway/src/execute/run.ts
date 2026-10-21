@@ -660,8 +660,9 @@ interface ScheduleQuarantineReleaseOpts {
  *     yet started their lock renewal or RunState write skip that I/O. A request
  *     already in flight when `stop()` began can still land: a late renewal
  *     restarts the lease TTL, so the lease can outlive this window by up to one
- *     TTL. That window is residual — closing it needs the object-store adapter
- *     to abort in-flight requests.
+ *     TTL. Requests are aborted at their tick timeout or when the stop budget
+ *     runs out, which narrows that window but cannot close it: a PUT can still
+ *     commit server-side before the abort reaches it.
  *  2. Releases the concurrency slot — via the same atomic hand-off-or-release
  *     logic the ordinary completion path uses, so a queued task is never made
  *     to wait out this window behind a run that already finished failing.

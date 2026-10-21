@@ -52,7 +52,9 @@ export interface HeartbeatStopError extends Error {
   /**
    * The ETag of the controller's last successful RunState write (the ETag it was constructed with if none
    * succeeded). Every tick rewrites the RunState, so a terminal transition that uses an older ETag loses its
-   * conditional write; with `tickPending`, one late write may still land and make this stale too.
+   * conditional write. Treat the `runEtag` of ANY `stop()` error as possibly stale, not only when `tickPending`: a write
+   * that timed out or was aborted may have committed, and a write that lands after `stop()` returned (before its tick
+   * timeout) is applied too.
    */
   readonly runEtag: string
   /**
@@ -82,7 +84,8 @@ export interface HeartbeatController {
    * confirmed so far.
    *
    * `stop()` first marks the controller stopping, so a tick that has not yet started its lock renewal or its
-   * RunState write skips that I/O, and no RunState read starts after `stop()`. `stop()` does not supersede a tick: a
+   * RunState write skips that I/O, so no tick starts a RunState read or write after `stop()` begins (the snapshot read
+   * below, bounded by the same budget, is the only RunState read it makes). `stop()` does not supersede a tick: a
    * request already in flight when it began can still land, and a result that arrives before that tick's own timeout
    * is applied (a late renewal restarts the lease TTL, a late RunState write changes the run ETag). Requests are
    * aborted when the tick timeout or this budget runs out, never when `stop()` begins; that narrows the window but
@@ -175,7 +178,9 @@ export function createHeartbeatController(
     intervalMs: config.heartbeatIntervalMs,
     tickTimeoutMs: HEARTBEAT_TICK_TIMEOUT_MS,
     stopBudgetMs: HEARTBEAT_STOP_GRACE_MS,
-    // A daemon: nothing here may be left to keep the process alive, and nothing needs to be told to let go of it.
+    // The timers stay referenced on purpose: this runs in a long-lived daemon, and an unref'd interval could let a
+    // misconfigured process exit with a run still marked EXECUTING. The one exception is the timer of an attempt that
+    // `stop()` gave up on, which the loop unrefs itself so it never holds shutdown open.
     unref: false,
     abortOnDeadline: true,
     // Without a token there is no way to tell this acquisition's record from a successor's, so nothing is adopted.
@@ -253,8 +258,13 @@ export function createHeartbeatController(
       loop.start()
     },
     stop: async (): Promise<Result<HeartbeatStopResult, HeartbeatStopError>> => {
-      logger.debug('Stopping heartbeat controller', {repo, runId})
       stopRequested = true
+      // `stop()` never rejects, whatever the logger does.
+      try {
+        logger.debug('Stopping heartbeat controller', {repo, runId})
+      } catch {
+        // Nowhere left to report a logger that cannot log.
+      }
       const stopped = await loop.stop()
       if (stopped.success === false) {
         const {cause, lockEtag: failedLockEtag, tickPending} = stopped.error
