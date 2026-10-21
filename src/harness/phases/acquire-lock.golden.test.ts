@@ -130,7 +130,7 @@ async function startRenewal(options: {readonly putScript?: PutScript; readonly j
         ...(putOptions.ifMatch === undefined ? {} : {ifMatch: putOptions.ifMatch}),
         ...(putOptions.ifNoneMatch === undefined ? {} : {ifNoneMatch: putOptions.ifNoneMatch}),
         ...(putOptions.tagging === undefined ? {} : {tagging: putOptions.tagging}),
-        signal: false,
+        signal: putOptions.signal !== undefined,
       })
       puts += 1
       const n = puts

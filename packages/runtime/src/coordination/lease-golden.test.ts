@@ -129,7 +129,7 @@ function createHarness(script: Script = {}) {
         ...(options.ifMatch === undefined ? {} : {ifMatch: options.ifMatch}),
         ...(options.ifNoneMatch === undefined ? {} : {ifNoneMatch: options.ifNoneMatch}),
         ...(options.tagging === undefined ? {} : {tagging: options.tagging}),
-        signal: false,
+        signal: options.signal !== undefined,
       })
       const call = nextCall('conditionalPut', key)
       const fallback: Fallback<{etag: string}> = async () => {

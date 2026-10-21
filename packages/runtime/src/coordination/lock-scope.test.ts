@@ -225,6 +225,80 @@ describe('lock scope', () => {
     expect(objects.has(REPO_KEY)).toBe(false)
     expect(config.storeAdapter.conditionalPut).toHaveBeenCalledWith(REPO_KEY, expect.any(String), expect.anything())
   })
+
+  it('renewLease sends exactly {ifMatch} when no signal is given', async () => {
+    // #given an acquired lock
+    const {config, adapter} = createMemoryStore()
+    const logger = createLogger()
+    const acquired = await acquireLock(config, 'owner/repo', 'gateway-1', 'discord', 'run-1', logger)
+    if (acquired.success === false || acquired.data.acquired === false) throw new Error('expected acquisition')
+    vi.mocked(adapter.conditionalPut).mockClear()
+
+    // #when renewing with and without an explicit scope, and with an explicit undefined signal
+    await renewLease(config, 'owner/repo', lockRecord(), acquired.data.etag, logger)
+    await renewLease(config, 'owner/repo', lockRecord(), acquired.data.etag, logger, 'repo', undefined)
+
+    // #then the option object is exactly what it was before signals existed, with no `signal` key at all
+    const optionObjects = vi.mocked(adapter.conditionalPut).mock.calls.map(call => call[2])
+    expect(optionObjects).toStrictEqual([{ifMatch: acquired.data.etag}, {ifMatch: acquired.data.etag}])
+  })
+
+  it('renewLease forwards the signal to conditionalPut on the requested scope', async () => {
+    // #given an acquired Action lock
+    const {config, adapter} = createMemoryStore()
+    const logger = createLogger()
+    const acquired = await acquireLock(config, 'owner/repo', 'action:1:1', 'github', '1', logger, {scope: 'action'})
+    if (acquired.success === false || acquired.data.acquired === false) throw new Error('expected acquisition')
+    const controller = new AbortController()
+    vi.mocked(adapter.conditionalPut).mockClear()
+
+    // #when renewing with a signal
+    const renewed = await renewLease(
+      config,
+      'owner/repo',
+      lockRecord({holder_id: 'action:1:1', surface: 'github'}),
+      acquired.data.etag,
+      logger,
+      'action',
+      controller.signal,
+    )
+
+    // #then the signal reaches the adapter next to the ETag condition
+    expect(renewed.success).toBe(true)
+    expect(adapter.conditionalPut).toHaveBeenCalledTimes(1)
+    expect(adapter.conditionalPut).toHaveBeenCalledWith(ACTION_KEY, expect.any(String), {
+      ifMatch: acquired.data.etag,
+      signal: controller.signal,
+    })
+  })
+
+  it('renewLease resolves to err when the adapter reports the aborted request', async () => {
+    // #given an adapter whose PUT fails once the signal has aborted
+    const {config, adapter} = createMemoryStore()
+    const logger = createLogger()
+    const acquired = await acquireLock(config, 'owner/repo', 'gateway-1', 'discord', 'run-1', logger)
+    if (acquired.success === false || acquired.data.acquired === false) throw new Error('expected acquisition')
+    const controller = new AbortController()
+    controller.abort()
+    vi.mocked(adapter.conditionalPut).mockImplementationOnce(async (_key, _data, options) =>
+      options.signal?.aborted === true ? err(new Error('Request aborted')) : ok({etag: 'unexpected'}),
+    )
+
+    // #when
+    const renewed = await renewLease(
+      config,
+      'owner/repo',
+      lockRecord(),
+      acquired.data.etag,
+      logger,
+      'repo',
+      controller.signal,
+    )
+
+    // #then
+    expect(renewed.success).toBe(false)
+    expect(renewed.success === false ? renewed.error.message : '').toBe('Request aborted')
+  })
 })
 
 describe('create/read release race', () => {

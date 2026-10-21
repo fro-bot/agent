@@ -494,6 +494,38 @@ describe('createS3Adapter', () => {
     expect(result.success === false ? result.error : undefined).toBeInstanceOf(Error)
   })
 
+  it('passes the abort signal to the SDK for conditionalPut, and nothing without one', async () => {
+    // #given
+    sendMock.mockResolvedValue({ETag: 'etag-123'})
+    const adapter = createS3Adapter(baseConfig, createLogger())
+    const controller = new AbortController()
+
+    // #when a signal is given, and when none is
+    await adapter.conditionalPut?.('k', '{}', {ifMatch: 'etag-1', signal: controller.signal})
+    await adapter.conditionalPut?.('k', '{}', {ifMatch: 'etag-1'})
+
+    // #then only the first call carries `abortSignal`, and the signal is never part of the command input
+    expect(sentOptions).toEqual([{abortSignal: controller.signal}, undefined])
+    expect(getCommandInput(0)).not.toHaveProperty('signal')
+    expect(getCommandInput(0)).not.toHaveProperty('abortSignal')
+  })
+
+  it('maps an aborted conditionalPut to an error', async () => {
+    // #given the SDK rejects the aborted request
+    sendMock.mockRejectedValue(Object.assign(new Error('Request aborted'), {name: 'AbortError'}))
+    const adapter = createS3Adapter(baseConfig, createLogger())
+    const controller = new AbortController()
+    controller.abort()
+
+    // #when
+    const result = await adapter.conditionalPut?.('k', '{}', {ifMatch: 'etag-1', signal: controller.signal})
+
+    // #then it settles as an error rather than rejecting
+    expect(result?.success).toBe(false)
+    expect(result?.success === false ? result.error : undefined).toBeInstanceOf(Error)
+    expect(sentOptions).toEqual([{abortSignal: controller.signal}])
+  })
+
   it('conditionally deletes an object when the etag matches', async () => {
     // #given
     sendMock.mockResolvedValue({})
