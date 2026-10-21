@@ -306,6 +306,7 @@ describe('launch prompt — real-store round trip (contract 1.12.0)', () => {
       `${OWNER}/${REPO}`,
       runId,
       lockEtag,
+      'run-etag-0',
       noopLogger,
     )
     heartbeat.start()

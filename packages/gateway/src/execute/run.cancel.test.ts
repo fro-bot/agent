@@ -196,6 +196,55 @@ describe('operator cancel — abort-registry integration', () => {
     abortRegistry.delete(HB_FAIL_CANCEL_RUN_ID)
   })
 
+  it('heartbeat.stop() failure on the cancel path — CANCELLED uses the run ETag and the lock release uses the lock ETag the failure reports', async () => {
+    // #given — stop() fails but reports the ETags its last successful writes produced
+    const {launchWork} = await import('./run.js')
+    const RUN_ID = 'hb-etag-cancel-run-id'
+    const cancelledState = buildMockRunState({phase: 'CANCELLED', run_id: RUN_ID})
+    mockRuntime.acquireLock.mockResolvedValue({
+      success: true as const,
+      data: {acquired: true as const, outcome: 'acquired' as const, etag: 'lock-etag-v1', holder: null},
+    })
+    mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
+    mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
+    mockRuntime.transitionRun.mockResolvedValue({
+      success: true as const,
+      data: {etag: 'cancelled-etag', state: cancelledState},
+    })
+    mockRuntime.createHeartbeatController.mockReturnValue({
+      start: vi.fn(),
+      stop: vi.fn().mockResolvedValue({
+        success: false,
+        error: Object.assign(new Error('heartbeat stop failed'), {
+          lockEtag: 'lock-etag-renewed',
+          runEtag: 'run-etag-fresh',
+          tickPending: true,
+        }),
+      }),
+      isRunning: false,
+    })
+    vi.mocked(attachModule.attachOpencode).mockReturnValue({
+      server: {url: 'http://workspace:9200'},
+      session: {create: vi.fn(), prompt: vi.fn()},
+    } as unknown as ReturnType<typeof attachModule.attachOpencode>)
+    vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
+    mockRunOpenCodeCoreAbortedBy(() => {
+      abortRegistry.abort(RUN_ID, 'operator cancel')
+    })
+    const request = makeInMemoryRequest()
+    ;(request as {runId?: string}).runId = RUN_ID
+
+    // #when
+    await awaitLaunchWorkRun(launchWork, request, makeDeps())
+
+    // #then
+    const cancelled = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'CANCELLED')
+    expect(cancelled?.[5]).toBe('run-etag-fresh')
+    expect(mockRuntime.releaseLock.mock.calls[0]?.[2]).toBe('lock-etag-renewed')
+
+    abortRegistry.delete(RUN_ID)
+  })
+
   it('cancelled transition failure falls back to FAILED terminalization — run does not remain EXECUTING', async () => {
     // #given — the CANCELLED transitionRun call fails; a re-read shows the run still
     // EXECUTING with a fresh etag; the FAILED fallback uses that fresh etag and succeeds

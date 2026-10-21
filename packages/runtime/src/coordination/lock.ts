@@ -74,9 +74,13 @@ function isNotFound(error: Error): boolean {
   return /nosuchkey|not found|does not exist/i.test(error.message)
 }
 
+/** Lease expiry in epoch ms. Not finite when `acquired_at` is unparseable or the TTL overflows. */
+function leaseExpiryMs(acquiredAt: string, ttlSeconds: number): number {
+  return new Date(acquiredAt).getTime() + ttlSeconds * 1000
+}
+
 function isStale(lockRecord: LockRecord, now: Date): boolean {
-  const acquiredAt = new Date(lockRecord.acquired_at).getTime()
-  return acquiredAt + lockRecord.ttl_seconds * 1000 <= now.getTime()
+  return leaseExpiryMs(lockRecord.acquired_at, lockRecord.ttl_seconds) <= now.getTime()
 }
 
 function hasValidLockRecordShape(value: unknown): value is LockRecord {
@@ -92,6 +96,9 @@ function hasValidLockRecordShape(value: unknown): value is LockRecord {
     typeof candidate.acquired_at === 'string' &&
     typeof candidate.ttl_seconds === 'number' &&
     Number.isFinite(candidate.ttl_seconds) &&
+    // A non-finite expiry compares false against every `now`, so the lease would read active forever and no takeover
+    // policy would ever run. Reject it like any other malformed record (fail closed) instead.
+    Number.isFinite(leaseExpiryMs(candidate.acquired_at, candidate.ttl_seconds)) &&
     typeof candidate.run_id === 'string'
   )
 }
