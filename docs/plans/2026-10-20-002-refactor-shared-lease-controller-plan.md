@@ -165,7 +165,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 - **Timers.**
   - **`unref` coverage:** `unref` applies to every loop timer (interval, tick timeout and stop budget). The Action sets it; the gateway, a daemon, does not.
   - **Clearing:** the loop clears its timers on every exit. Today the Action's grace `delay` lingers for up to 5 s, unref'd. Clearing it can't be seen from outside, so the golden traces assert adapter calls and their ordering, not leftover timers.
-  - **Exception:** the in-flight attempt's own tick timeout stays armed after `stop()` gives up on a pending tick. It has to: the Action pins that an abandoned tick still times out and records its failure. It is unref'd on the Action. On the gateway, which does not unref, it would hold shutdown for up to the 10 s tick timeout; whether to keep that is a PR-B decision.
+  - **Exception:** the in-flight attempt's own tick timeout stays armed after `stop()` gives up on a pending tick. It has to: the Action pins that an abandoned tick still times out and records its failure. When `stop()` gives up on a pending attempt, the loop unrefs that attempt's tick timer: it still fires while the process lives, but it never holds the gateway's shutdown (PR-B).
 - **Action composition.**
   - **Tick body:** renews the constant identity record, which carries `holder_job` and `acquisition_token`.
   - **Settings:** `unref: true`, tick timeout `RENEWAL_TIMEOUT_MS` (10 s), stop budget `HEARTBEAT_STOP_GRACE_MS` (5 s), and `abortOnDeadline: false` in PR-A, `true` in PR-B.
@@ -176,6 +176,9 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
   - **Wrapper:** `createHeartbeatController` becomes a thin layer. Each tick: if stopping, return; read RunState; `renewLock(recordFrom(state))`; if renewed and still current, write RunState; then update its own `runEtag` only if `isCurrent()`.
   - **Result mapping:** it maps the loop's result back to `HeartbeatStopResult` / `HeartbeatStopError`, carrying `runEtag` from the layer.
   - **Settings:** `unref: false`, a 10 s tick timeout and `abortOnDeadline: true`.
+  - **Error text:** stop errors use the loop's text (`Lease tick did not settle…`, `Lease finalize did not settle…`); no caller branches on it. The stop-path debug lines go away, as on the Action.
+  - **Skipped tick:** stop beginning after the RunState read makes `renewLock` return `'skipped'`; the tick changes nothing, as today.
+  - **Renew-then-skip:** a tick that confirms a renewal and then skips its RunState write because stop began clears an earlier tick's failure, so `stop()` reads a fresh snapshot and returns ok. Today the earlier error persists and the caller gets a stale `runEtag`. This is a named improvement.
 - **Adoption (PR-C).**
   - **Trigger:** runs inside the tick body after `renewLock` throws (no confirmed renewal), bounded by the same tick timeout and stop budget.
   - **Gating:** skipped if stopping or superseded.
@@ -324,7 +327,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 
 **Requirements:** R2, R4, R5, R6
 
-**Files:** `packages/runtime/src/coordination/heartbeat.ts`, `heartbeat.test.ts`, the golden traces, `src/harness/phases/acquire-lock.ts` (`abortOnDeadline: true`), `packages/gateway/src/execute/stale-etag-transition.ts` (signal on its recovery read), `dist/`
+**Files:** `packages/runtime/src/coordination/heartbeat.ts`, `heartbeat.test.ts`, `lease-loop.ts` and `lease-loop.test.ts` (unref an abandoned attempt's timer at stop), the golden traces, `src/harness/phases/acquire-lock.ts` (`abortOnDeadline: true`, signal forwarded to `renewLease`), `packages/gateway/src/execute/stale-etag-transition.ts` (signal on its recovery read), `dist/`
 
 **Approach:**
 
@@ -332,7 +335,8 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 - **`finalize`:** reads the snapshot.
 - **Result mapping:** map the result back to the heartbeat types.
 - **Settings:** a 10 s tick timeout, `unref: false`, `abortOnDeadline: true`.
-- **Action:** turn on `abortOnDeadline`.
+- **Action:** turn on `abortOnDeadline` and forward the signal as `renewLease`'s trailing argument.
+- **Loop:** when `stop()` gives up on a pending attempt, unref that attempt's tick timer.
 - **Deletions:** delete the gateway's duplicate mechanics and the duplicate grace constant.
 - **Rebuild:** rebuild `dist/`.
 
@@ -343,9 +347,13 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 - A late renewal result or late RunState write after a timeout is not applied.
 - The RunState read does not start after stop.
 - The abort signal reaches the RunState read and write, the snapshot, and the Action renewal.
+- After `stop()` gives up on a pending attempt, that attempt's tick timer is unref'd and still records its timeout.
+- Stop beginning after the RunState read skips the tick and keeps an earlier error.
+- A tick that renews and then skips its write because stop began clears an earlier write failure; `stop()` returns ok with the fresh snapshot.
 - **Existing `heartbeat.test.ts` guarantees still pass.** The known adjustments, each listed in the PR:
   - `:365-371`, the five-argument `renewLease` check, gains the explicit scope and signal;
-  - `:154-158`, exact `conditionalPut` options, gains the signal.
+  - `:154-158`, exact `conditionalPut` options, gains the signal;
+  - Action `renewLease` argument assertions gain the signal.
 
 **Verification:**
 
@@ -353,7 +361,9 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
   - gateway tick timeout;
   - abort on both surfaces;
   - read-after-stop;
-  - late results from timed-out gateway ticks.
+  - late results from timed-out gateway ticks;
+  - stop error text (`Heartbeat …` to `Lease …`);
+  - renew-then-skip returns ok.
 - **These pass:**
   - `run.quarantine*.test.ts`
   - `run.lifecycle.test.ts`
