@@ -36,6 +36,57 @@ beforeEach(() => {
   mockReleaseLockEffect.mockReturnValue(Effect.succeed(undefined))
 })
 
+function failedStop() {
+  mockHeartbeat.stop.mockResolvedValue({
+    success: false,
+    error: Object.assign(new Error('Heartbeat tick did not settle within 5000ms of stop'), {
+      lockEtag: 'lock-etag-renewed',
+      runEtag: 'run-etag-stale',
+      tickPending: true,
+    }),
+  })
+}
+
+function configStoring(phase: 'EXECUTING' | 'COMPLETED', runId: () => string) {
+  return {
+    storeAdapter: {
+      getObject: vi.fn(async () => ({
+        success: true as const,
+        data: {
+          data: JSON.stringify({
+            run_id: runId(),
+            surface: 'discord',
+            thread_id: '',
+            entity_ref: 'acme/widget',
+            phase,
+            started_at: '2026-04-24T18:00:00.000Z',
+            last_heartbeat: '2026-04-24T18:00:00.000Z',
+            holder_id: 'gw',
+            details: {},
+          }),
+          etag: 'run-etag-stored',
+        },
+      })),
+    },
+    storeConfig: {enabled: true, bucket: 'test', region: 'us-east-1', prefix: 'state'},
+  } as unknown as CoordinationConfig
+}
+
+async function acquire(config: CoordinationConfig) {
+  const result = await Effect.runPromise(
+    acquireMaintenanceRun({
+      coordinationConfig: config,
+      identity: 'gw',
+      repo: 'acme/widget',
+      kind: 'recover-checkout',
+      logger: LOGGER,
+      checkRepoQuiescence: CHECK,
+    }),
+  )
+  if (result.outcome !== 'acquired') throw new Error('expected acquired')
+  return result.handle
+}
+
 describe('acquireMaintenanceRun', () => {
   it('acquired: locks, creates the run, starts the heartbeat', async () => {
     // #given — default mocks: lock acquired
@@ -222,9 +273,17 @@ describe('acquireMaintenanceRun', () => {
     expect(mockReleaseLockEffect).toHaveBeenCalledWith(CONFIG, 'acme/widget', 'lock-etag-2', expect.anything())
   })
 
-  it('release: a heartbeat.stop failure still transitions and releases, using the original etags', async () => {
-    // #given — heartbeat.stop fails
-    mockHeartbeat.stop.mockResolvedValue({success: false, error: new Error('stop failed')})
+  it('release: a heartbeat.stop failure still transitions and releases, using the etags it reports', async () => {
+    // #given — the last tick renewed the lock and then failed the RunState write: stop fails but reports the
+    // freshest lock and run etags its successful writes produced
+    mockHeartbeat.stop.mockResolvedValue({
+      success: false,
+      error: Object.assign(new Error('stop failed'), {
+        lockEtag: 'lock-etag-renewed',
+        runEtag: 'run-etag-renewed',
+        tickPending: false,
+      }),
+    })
     const result = await Effect.runPromise(
       acquireMaintenanceRun({
         coordinationConfig: CONFIG,
@@ -247,10 +306,52 @@ describe('acquireMaintenanceRun', () => {
       'acme/widget',
       result.handle.runId,
       'FAILED',
-      'run-etag-1',
+      'run-etag-renewed',
       expect.anything(),
       undefined,
     )
-    expect(mockReleaseLockEffect).toHaveBeenCalledWith(CONFIG, 'acme/widget', 'lock-etag-1', expect.anything())
+    expect(mockReleaseLockEffect).toHaveBeenCalledWith(CONFIG, 'acme/widget', 'lock-etag-renewed', expect.anything())
+  })
+
+  describe('release after a heartbeat.stop failure whose reported run etag is stale', () => {
+    it('re-reads once and retries once with the stored etag when the stored run is still live', async () => {
+      // #given a late tick write landed after stop gave up, so the first terminal write 412s
+      failedStop()
+      mockTransitionRunEffect
+        .mockReturnValueOnce(Effect.fail(new Error('412 precondition failed')))
+        .mockReturnValueOnce(Effect.succeed({etag: 'run-etag-done', state: {}}))
+      let runId = ''
+      const handle = await acquire(configStoring('EXECUTING', () => runId))
+      runId = handle.runId
+
+      // #when
+      await Effect.runPromise(handle.release('COMPLETED'))
+
+      // #then
+      const etags = mockTransitionRunEffect.mock.calls.map((call: unknown[]) => call[5])
+      expect(etags).toEqual(['run-etag-stale', 'run-etag-stored'])
+      expect(mockReleaseLockEffect).toHaveBeenCalledWith(
+        expect.anything(),
+        'acme/widget',
+        'lock-etag-renewed',
+        expect.anything(),
+      )
+    })
+
+    it('does not retry when the stored run is already terminal, and still releases the lock', async () => {
+      // #given
+      failedStop()
+      mockTransitionRunEffect.mockReturnValue(Effect.fail(new Error('412 precondition failed')))
+      let runId = ''
+      const handle = await acquire(configStoring('COMPLETED', () => runId))
+      runId = handle.runId
+
+      // #when
+      await Effect.runPromise(handle.release('COMPLETED'))
+
+      // #then
+      expect(mockTransitionRunEffect).toHaveBeenCalledTimes(1)
+      expect(mockReleaseLockEffect).toHaveBeenCalledOnce()
+    })
   })
 })

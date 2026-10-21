@@ -1,3 +1,4 @@
+import type {CoordinationConfig} from '@fro-bot/runtime'
 import type * as streamingModule from '../discord/streaming.js'
 import type {LaunchWorkRequest} from './launch-types.js'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
@@ -36,6 +37,17 @@ import {formatTimeoutDuration} from './run.js'
 // timeout-duration formatting, the runId seam, empty-prompt fail-fast, the
 // launchWork in-memory sink tests, and the threadFactory failure/timeout paths.
 // ---------------------------------------------------------------------------
+
+function failedStop(overrides: {readonly tickPending: boolean}) {
+  return vi.fn().mockResolvedValue({
+    success: false,
+    error: Object.assign(new Error('heartbeat stop failed'), {
+      lockEtag: 'lock-etag-renewed',
+      runEtag: 'run-etag-fresh',
+      tickPending: overrides.tickPending,
+    }),
+  })
+}
 
 describe('runMention', () => {
   beforeEach(() => {
@@ -868,6 +880,181 @@ describe('runMention', () => {
       // #and — concurrency slot released
       const releaseFn = deps.concurrency.release as ReturnType<typeof vi.fn>
       expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
+    })
+
+    it('on failure path: releases the lock with the renewed ETag that a failed heartbeat.stop() still reports', async () => {
+      // #given — the last tick renewed the lock (fresh ETag) and then failed the RunState write, so stop() fails
+      // but carries the confirmed lock ETag
+      const {runMention} = await import('./run.js')
+      const stopError = Object.assign(new Error('run-state write failed'), {
+        lockEtag: 'lock-etag-renewed',
+        runEtag: 'run-etag-fresh',
+        tickPending: false,
+      })
+      setupHappyPath({stop: vi.fn().mockResolvedValue({success: false, error: stopError})})
+      const {RunCoreError} = runCoreModule
+      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+      const deps = makeDeps()
+
+      // #when
+      await expect(runMention(makeMessage(makeThread()), makeBinding(), deps)).resolves.toBeUndefined()
+
+      // #then — the conditional release uses the renewed ETag, not the acquisition ETag
+      expect(mockRuntime.releaseLock).toHaveBeenCalledOnce()
+      expect(mockRuntime.releaseLock.mock.calls[0]?.[2]).toBe('lock-etag-renewed')
+    })
+
+    it('on success path: releases the lock with the renewed ETag that a failed heartbeat.stop() still reports', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      const stopError = Object.assign(new Error('run-state write failed'), {
+        lockEtag: 'lock-etag-renewed',
+        runEtag: 'run-etag-fresh',
+        tickPending: false,
+      })
+      setupHappyPath({stop: vi.fn().mockResolvedValue({success: false, error: stopError})})
+      const deps = makeDeps()
+
+      // #when
+      await expect(runMention(makeMessage(), makeBinding(), deps)).resolves.toBeUndefined()
+
+      // #then
+      expect(mockRuntime.releaseLock).toHaveBeenCalledOnce()
+      expect(mockRuntime.releaseLock.mock.calls[0]?.[2]).toBe('lock-etag-renewed')
+    })
+
+    // ── Terminal transition after a failed stop ───────────────────────────────
+    // Every heartbeat tick rewrites the RunState, so the ETag the run holds from before the heartbeat started
+    // 412s. A failed stop reports the ETag of the last successful write; `tickPending` means one more may land.
+
+    function configStoring(phase: 'EXECUTING' | 'COMPLETED', etag: string) {
+      return {
+        storeAdapter: {
+          upload: vi.fn(),
+          download: vi.fn(),
+          list: vi.fn(),
+          // The run id is generated per run; take it from the transition the run just attempted.
+          getObject: vi.fn(async () => ({
+            success: true as const,
+            data: {
+              data: JSON.stringify(
+                buildMockRunState({phase, run_id: String(mockRuntime.transitionRun.mock.calls.at(-1)?.[3])}),
+              ),
+              etag,
+            },
+          })),
+        },
+        storeConfig: {enabled: true, bucket: 'test', region: 'us-east-1', prefix: 'state'},
+        lockTtlSeconds: 900,
+        heartbeatIntervalMs: 30_000,
+        staleThresholdMs: 60_000,
+        pendingStaleThresholdMs: 30 * 60_000,
+      } as unknown as CoordinationConfig
+    }
+
+    it.each([
+      ['a tick error', false],
+      ['a tick that never settled', true],
+    ] as const)(
+      'on success path: COMPLETED uses the run ETag reported by a stop failure from %s',
+      async (_label, tickPending) => {
+        // #given
+        const {runMention} = await import('./run.js')
+        setupHappyPath({stop: failedStop({tickPending})})
+
+        // #when
+        await runMention(makeMessage(), makeBinding(), makeDeps())
+
+        // #then
+        const completed = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'COMPLETED')
+        expect(completed?.[5]).toBe('run-etag-fresh')
+      },
+    )
+
+    it('on failure path: FAILED uses the run ETag reported by a stop failure', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      setupHappyPath({stop: failedStop({tickPending: true})})
+      const {RunCoreError} = runCoreModule
+      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+
+      // #when
+      await runMention(makeMessage(makeThread()), makeBinding(), makeDeps())
+
+      // #then
+      const failed = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'FAILED')
+      expect(failed?.[5]).toBe('run-etag-fresh')
+    })
+
+    it('after a stop failure, a 412 on COMPLETED re-reads once and retries once with the stored ETag', async () => {
+      // #given a late tick write landed after stop() gave up: the reported ETag is stale, the record is still EXECUTING
+      const {runMention} = await import('./run.js')
+      setupHappyPath({stop: failedStop({tickPending: true})})
+      mockRuntime.transitionRun.mockImplementation(async (...args: unknown[]) => {
+        const [phase, etag] = [args[4], args[5]]
+        if (phase === 'COMPLETED' && etag !== 'etag-stored') {
+          return {success: false as const, error: new Error('412 precondition failed')}
+        }
+        return {
+          success: true as const,
+          data: {etag: 'etag-after', state: buildMockRunState({phase: phase as 'COMPLETED'})},
+        }
+      })
+      const deps = makeDeps({coordinationConfig: configStoring('EXECUTING', 'etag-stored')})
+
+      // #when
+      await runMention(makeMessage(), makeBinding(), deps)
+
+      // #then
+      const completedEtags = mockRuntime.transitionRun.mock.calls
+        .filter((c: unknown[]) => c[4] === 'COMPLETED')
+        .map((c: unknown[]) => c[5])
+      expect(completedEtags).toEqual(['run-etag-fresh', 'etag-stored'])
+    })
+
+    it('after a stop failure, a 412 on COMPLETED does not retry when the stored run is already terminal', async () => {
+      // #given another writer already terminalized the run
+      const {runMention} = await import('./run.js')
+      setupHappyPath({stop: failedStop({tickPending: true})})
+      mockRuntime.transitionRun.mockImplementation(async (...args: unknown[]) => {
+        if (args[4] === 'COMPLETED') {
+          return {success: false as const, error: new Error('412 precondition failed')}
+        }
+        return {success: true as const, data: {etag: 'etag-after', state: buildMockRunState()}}
+      })
+      const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+      const deps = makeDeps({coordinationConfig: configStoring('COMPLETED', 'etag-stored'), logger})
+
+      // #when
+      await runMention(makeMessage(), makeBinding(), deps)
+
+      // #then the failure is logged as before and the transition is not retried
+      const completedCalls = mockRuntime.transitionRun.mock.calls.filter((c: unknown[]) => c[4] === 'COMPLETED')
+      expect(completedCalls).toHaveLength(1)
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.objectContaining({err: '412 precondition failed'}),
+        'run: transitionRun COMPLETED failed',
+      )
+    })
+
+    it('without a stop failure, a failed COMPLETED transition is not retried', async () => {
+      // #given a clean stop: the existing non-fatal handling is unchanged
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+      mockRuntime.transitionRun.mockImplementation(async (...args: unknown[]) => {
+        if (args[4] === 'COMPLETED') {
+          return {success: false as const, error: new Error('412 precondition failed')}
+        }
+        return {success: true as const, data: {etag: 'etag-after', state: buildMockRunState()}}
+      })
+      const deps = makeDeps({coordinationConfig: configStoring('EXECUTING', 'etag-stored')})
+
+      // #when
+      await runMention(makeMessage(), makeBinding(), deps)
+
+      // #then
+      const completedCalls = mockRuntime.transitionRun.mock.calls.filter((c: unknown[]) => c[4] === 'COMPLETED')
+      expect(completedCalls).toHaveLength(1)
     })
 
     it('on success path: heartbeat.stop() failure logs warning and continues to COMPLETED', async () => {

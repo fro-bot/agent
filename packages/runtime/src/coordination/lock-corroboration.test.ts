@@ -397,6 +397,96 @@ describe('acquireLock — reclaimableWithoutConfirmation', () => {
   })
 })
 
+// A record whose expiry is not a finite number (unparseable `acquired_at`, or a TTL so large the expiry overflows)
+// used to compute `NaN`/`Infinity`, so it read `active-holder` forever and no takeover policy ever ran. It is now
+// rejected as a malformed record -- the same fail-closed path as any other unreadable lock payload -- so neither
+// surface can take it over, and neither takeover policy (direct reclaim / corroboration) is consulted.
+describe('acquireLock — non-finite lease expiry', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-04-24T18:15:00.000Z'))
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  const malformedLeases = [
+    ['an unparseable acquired_at', {acquired_at: 'not-a-date'}],
+    ['an empty acquired_at', {acquired_at: ''}],
+    ['a TTL whose expiry overflows', {ttl_seconds: 1e306}],
+  ] as const
+
+  it.each(malformedLeases)(
+    'action-style direct reclaim rejects %s as malformed and never takes the lock over',
+    async (_label, overrides) => {
+      // #given — a github-surface holder the Action would reclaim without confirmation if it were merely expired
+      const store = createMemoryStore(lockRecord({surface: 'github', holder_id: 'action:1:1', ...overrides}))
+      const reclaimableWithoutConfirmation = vi.fn(() => true)
+      const reclaimableBeforeExpiry = vi.fn(() => true)
+
+      // #when
+      const result = await acquireLock(
+        configFor(store.adapter),
+        'owner/repo',
+        'action:2:1',
+        'github',
+        'run-2',
+        createLogger(),
+        {reclaimableWithoutConfirmation, reclaimableBeforeExpiry},
+      )
+
+      // #then — a loud malformed-record error, not a silent `active-holder`; the stored lease is untouched
+      expect(result.success).toBe(false)
+      expect(result.success === false ? result.error.message : '').toBe('Invalid lock record payload')
+      expect(reclaimableWithoutConfirmation).not.toHaveBeenCalled()
+      expect(reclaimableBeforeExpiry).not.toHaveBeenCalled()
+      expect(store.current()?.run_id).toBe('run-old')
+    },
+  )
+
+  it.each(malformedLeases)(
+    'gateway corroborated path rejects %s as malformed without consulting the checker or taking over',
+    async (_label, overrides) => {
+      // #given — a checker that would report the workspace clear
+      const store = createMemoryStore(lockRecord(overrides))
+      const confirm = vi.fn<ConfirmExpiredHolder>(async () => clear())
+
+      // #when
+      const result = await acquireLock(
+        configFor(store.adapter),
+        'owner/repo',
+        'g2',
+        'discord',
+        'run-2',
+        createLogger(),
+        {confirmExpiredHolder: confirm},
+      )
+
+      // #then — never taken over, with or without corroboration
+      expect(result.success).toBe(false)
+      expect(result.success === false ? result.error.message : '').toBe('Invalid lock record payload')
+      expect(confirm).not.toHaveBeenCalled()
+      expect(store.current()?.run_id).toBe('run-old')
+    },
+  )
+
+  it('still treats a well-formed expired lease as a corroborated takeover candidate', async () => {
+    // #given — guard: the stricter parse must not turn ordinary expiry into an error
+    const store = createMemoryStore(lockRecord({acquired_at: '2026-04-24T17:30:00.000Z'}))
+    const confirm = vi.fn<ConfirmExpiredHolder>(async () => clear())
+
+    // #when
+    const result = await acquireLock(configFor(store.adapter), 'owner/repo', 'g2', 'discord', 'run-2', createLogger(), {
+      confirmExpiredHolder: confirm,
+    })
+
+    // #then
+    expect(result.success === true ? result.data.outcome : null).toBe('acquired')
+    expect(confirm).toHaveBeenCalledOnce()
+  })
+})
+
 describe('acquireLock — audit events', () => {
   beforeEach(() => {
     vi.useFakeTimers()

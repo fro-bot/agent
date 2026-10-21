@@ -801,6 +801,26 @@ describe('forceReleaseStaleLock', () => {
     expect(conditionalDelete).not.toHaveBeenCalled()
   })
 
+  it('returns error and does NOT delete or consult the checker when the lock expiry is not a finite number', async () => {
+    // #given — an unparseable acquired_at used to compute a NaN expiry, which read as `live-holder` forever
+    const getObject = vi
+      .fn<Required<ObjectStoreAdapter>['getObject']>()
+      .mockResolvedValueOnce(
+        ok({data: JSON.stringify(createLockRecord({acquired_at: 'not-a-date'})), etag: 'etag-lock'}),
+      )
+    const conditionalDelete = vi.fn<Required<ObjectStoreAdapter>['conditionalDelete']>(async () => ok(undefined))
+    const config = createCoordinationConfig(createStoreAdapter({getObject, conditionalDelete}))
+    const confirm = vi.fn(clearConfirmation)
+
+    // #when
+    const result = await forceReleaseStaleLock(config, 'owner/repo', createLogger(), {confirmExpiredHolder: confirm})
+
+    // #then — same fail-closed outcome as any other malformed record
+    expect(result.success === true ? result.data.outcome : null).toBe('error')
+    expect(confirm).not.toHaveBeenCalled()
+    expect(conditionalDelete).not.toHaveBeenCalled()
+  })
+
   it('releases and audits an explicit unknown when the run-state record is malformed', async () => {
     // #given — lock is stale, run-state has invalid shape (diagnostic only)
     const staleLock = createLockRecord({acquired_at: '2026-04-24T18:00:00.000Z', run_id: 'run-1'})
