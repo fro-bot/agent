@@ -393,7 +393,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 
 ### PR-C (folded into PR-B): ownership-checked ETag adoption
 
-- [ ] **Unit 7: Gateway `acquisition_token`**
+- [x] **Unit 7: Gateway `acquisition_token`**
 
 **Goal:** Gateway lock records carry a per-acquisition token.
 
@@ -410,7 +410,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 - Corroborated takeover of a token-bearing record is unchanged.
 - Existing callers without the parameter still compile and behave the same.
 
-- [ ] **Unit 8: Adoption after a failed renewal**
+- [x] **Unit 8: Adoption after a failed renewal**
 
 **Goal:** Recover a renewal that committed but returned an error.
 
@@ -453,7 +453,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 
 **Verification:** The matrix passes on both surfaces. The integration test is extended. `dist/` is rebuilt. `settle()` stays bounded by the 10 s tick timeout.
 
-- [ ] **Unit 9: Docs for adoption**
+- [x] **Unit 9: Docs for adoption**
 
 **Goal:** Document the adoption rule.
 
