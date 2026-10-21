@@ -3,8 +3,9 @@
  *
  * These traces record what the controller does TODAY, against the real runtime (`renewLease` and all) over a recording
  * in-memory adapter. They exist so the shared lease-loop extraction can prove it changed nothing it did not mean to.
- * Where the current behaviour is a known gap that a later unit changes on purpose (no per-tick timeout, late results
- * applied, no abort signal), the test says so; that unit updates the trace deliberately.
+ * Where the current behaviour is a known gap that a later unit changes on purpose (no per-tick timeout, no abort
+ * signal), the test says so; that unit updates the trace deliberately. A result that lands after `stop()` returned stays
+ * applied: `stop()` does not supersede a tick, only a tick timeout does.
  *
  * Deliberately NOT recorded: leftover or lingering timers. The extraction clears timers the current code leaves behind,
  * and that cannot be seen from outside.
@@ -371,7 +372,7 @@ describe('gateway heartbeat golden traces', () => {
     await vi.advanceTimersByTimeAsync(0)
     const again = await stop()
 
-    // #then it was applied to the lock ETag (gap: a later unit drops late results) but wrote no RunState
+    // #then it was applied to the lock ETag (`stop()` does not supersede a tick; only a tick timeout will, in PR-B) but wrote no RunState
     expect(trace.slice(4)).toEqual([
       {t: 35_000, op: 'mark', name: 'stop:begin'},
       {t: 35_000, op: 'getObject', key: RUN_KEY, signal: false},
@@ -413,7 +414,7 @@ describe('gateway heartbeat golden traces', () => {
     await vi.advanceTimersByTimeAsync(0)
     const again = await stop()
 
-    // #then the late write's ETag was applied (gap: a later unit drops late results)
+    // #then the late write's ETag was applied (`stop()` does not supersede a tick; only a tick timeout will, in PR-B)
     expect(again.success).toBe(false)
     if (again.success === true) throw new Error('expected a failed stop')
     expect(again.error).toMatchObject({lockEtag: 'lock-etag-1', runEtag: 'run-etag-late', tickPending: false})

@@ -536,7 +536,7 @@ describe('Action lease renewal golden traces', () => {
     lateRenewal.resolve(ok({etag: '"etag-late"'}))
     await vi.advanceTimersByTimeAsync(0)
 
-    // #then the new ETag is adopted even though stop already returned (gap: a later unit drops post-stop results)
+    // #then the new ETag is adopted even though stop already returned (intended: `stop()` does not supersede a tick; only the tick timeout does)
     expect(renewal.currentEtag()).toBe('"etag-late"')
     expect(renewal.hasFailed()).toBe(false)
     expect(renewal.continuityUnverified?.()).toBe(true)
