@@ -418,6 +418,7 @@ export async function renewLease(
   etag: string,
   logger: {debug: (message: string, context?: Record<string, unknown>) => void},
   scope: LockScope = 'repo',
+  signal?: AbortSignal,
 ): Promise<Result<{etag: string}, Error>> {
   const key = getLockKey(config, repo, scope)
   if (key.success === false) {
@@ -431,7 +432,12 @@ export async function renewLease(
 
   const nextRecord: LockRecord = {...lockRecord, acquired_at: new Date().toISOString()}
   logger.debug('Renewing lock lease', {key: key.data, repo})
-  return conditionalPut.data(key.data, JSON.stringify(nextRecord), {ifMatch: etag})
+  // Without a signal the option object is exactly `{ifMatch}`, so existing exact-argument assertions are unchanged.
+  return conditionalPut.data(
+    key.data,
+    JSON.stringify(nextRecord),
+    signal === undefined ? {ifMatch: etag} : {ifMatch: etag, signal},
+  )
 }
 
 export async function forceReleaseLock(
