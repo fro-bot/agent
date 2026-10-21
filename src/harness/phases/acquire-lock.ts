@@ -11,11 +11,13 @@ import {randomUUID} from 'node:crypto'
 import * as core from '@actions/core'
 import {
   acquireLock,
+  createLeaseLoop,
   createS3Adapter,
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   DEFAULT_LOCK_TTL_SECONDS,
   DEFAULT_PENDING_STALE_THRESHOLD_MS,
   DEFAULT_STALE_THRESHOLD_MS,
+  HEARTBEAT_STOP_GRACE_MS,
   isValidHolderJob,
   releaseLock,
   releaseLockIfHolder,
@@ -51,7 +53,7 @@ export interface LeaseController {
   /**
    * `true` when the MOST RECENT renewal tick failed -- not latched across the whole
    * lease lifetime. A later successful renewal resets this back to `false` (see the
-   * `tick()` implementation and `acquire-lock.test.ts`'s "hasFailed() reflects the
+   * lease loop's tick and `acquire-lock.test.ts`'s "hasFailed() reflects the
    * most recent tick, not history" case): a conditional write succeeding against the
    * current ETag is fresh evidence the lock is still held, so there is nothing left
    * for a stale failure to warn about. A failed renewal still fails closed in the
@@ -113,7 +115,7 @@ export interface LeaseController {
    */
   readonly currentEtag: () => string
   /**
-   * Stop the renewal timer and wait, up to `STOP_GRACE_PERIOD_MS`, for any in-flight tick to
+   * Stop the renewal timer and wait, up to `HEARTBEAT_STOP_GRACE_MS`, for any in-flight tick to
    * settle, so `hasFailed()` and `currentEtag()` reflect the final state before the caller acts
    * on them. A renewal that is still in flight past the grace period is left to finish on its
    * own (bounded by `RENEWAL_TIMEOUT_MS`) and `stop()` returns anyway -- cleanup's budget takes
@@ -128,25 +130,10 @@ export interface LeaseController {
 /**
  * Bounds a single lease renewal call -- a remote conditional write with no timeout of its
  * own. Well under `DEFAULT_HEARTBEAT_INTERVAL_MS` (30s) so a stalled call settles (as a
- * failure) before the next tick is due, instead of silently skipping ticks forever: `tick()`
- * refuses to overlap while `inFlight` is unsettled.
+ * failure) before the next tick is due, instead of silently skipping ticks forever: the lease loop
+ * refuses to overlap ticks while one is in flight.
  */
 const RENEWAL_TIMEOUT_MS = 10_000
-
-/**
- * How long `stop()` waits for an in-flight renewal before giving up and returning anyway.
- * Short relative to cleanup's overall budget -- it exists to let a normal (sub-second) tick
- * settle so `currentEtag()` is fresh, not to guarantee freshness unconditionally.
- */
-const STOP_GRACE_PERIOD_MS = 5_000
-
-// Local on purpose (not runtime `sleep`): `unref` stops a pending timer from keeping the process alive.
-async function delay(ms: number): Promise<void> {
-  return new Promise(resolve => {
-    const handle = setTimeout(resolve, ms)
-    handle.unref?.()
-  })
-}
 
 /** Rejects with `message` if `promise` has not settled within `timeoutMs`; the underlying work is left to finish. */
 export async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
@@ -166,6 +153,11 @@ export async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, mes
   })
 }
 
+/**
+ * The Action's view over the shared runtime lease loop. The loop owns scheduling, the per-renewal timeout, the overlap
+ * guard, the stop budget and the failure state; this supplies the Action's renewal (`renewLease` on its own lock scope)
+ * and the record it rewrites on every tick.
+ */
 function createLeaseController(
   config: CoordinationConfig,
   repo: string,
@@ -176,90 +168,46 @@ function createLeaseController(
   initialEtag: string,
   logger: Logger,
 ): LeaseController {
-  let currentEtag = initialEtag
-  let failed = false
-  // Latches true the first time this invocation cannot vouch for uninterrupted lock coverage;
-  // never reset by a later success. See `LeaseController.continuityUnverified`'s doc for why a
-  // failed tick means "continuity not verified", not "lease lost", and why `stop()` returning
-  // with a tick unresolved sets this too.
-  let continuityUnverified = false
-  let inFlight: Promise<void> | null = null
-
-  const tick = (): void => {
-    if (inFlight != null) return
-
-    const lockRecord: LockRecord = {
-      repo,
-      holder_id: holderId,
-      surface: 'github',
-      acquired_at: new Date().toISOString(),
-      ttl_seconds: config.lockTtlSeconds,
-      run_id: runId,
-      // Every renewal rewrites the whole record, so the job and token must be carried or the first tick would erase them.
-      ...(holderJob === undefined ? {} : {holder_job: holderJob}),
-      acquisition_token: acquisitionToken,
-    }
-
-    inFlight = withTimeout(
-      renewLease(config, repo, lockRecord, currentEtag, logger, ACTION_LOCK_SCOPE),
-      RENEWAL_TIMEOUT_MS,
-      `Lease renewal exceeded ${RENEWAL_TIMEOUT_MS}ms`,
-    )
-      .then(renewed => {
-        if (renewed.success === false) {
-          failed = true
-          continuityUnverified = true
-          logger.warning('Coordination lease renewal failed', {repo, holderId, error: renewed.error.message})
-          return
-        }
-        failed = false
-        currentEtag = renewed.data.etag
-      })
-      .catch((error: unknown) => {
-        failed = true
-        continuityUnverified = true
-        logger.warning('Coordination lease renewal threw', {
-          repo,
-          holderId,
-          error: error instanceof Error ? error.message : String(error),
-        })
-      })
-      .finally(() => {
-        inFlight = null
-      })
-  }
-
-  const intervalHandle = setInterval(tick, DEFAULT_HEARTBEAT_INTERVAL_MS)
-  // Never let this timer hold the Action's process open on its own -- the run always
-  // reaches runCleanup's finally block, which calls stop() regardless of outcome, but
-  // unref is a defensive backstop against a future early-exit path that forgets to.
-  intervalHandle.unref()
+  const loop = createLeaseLoop({
+    // `renewLease` is called through the `@fro-bot/runtime` import, so the package-boundary test seam still applies.
+    renew: async (record, etag) => renewLease(config, repo, record, etag, logger, ACTION_LOCK_SCOPE),
+    initialEtag,
+    intervalMs: DEFAULT_HEARTBEAT_INTERVAL_MS,
+    tickTimeoutMs: RENEWAL_TIMEOUT_MS,
+    stopBudgetMs: HEARTBEAT_STOP_GRACE_MS,
+    // Never let these timers hold the Action's process open on their own -- the run always reaches runCleanup's
+    // finally block, which calls stop() regardless of outcome, but unref is a defensive backstop against a future
+    // early-exit path that forgets to.
+    unref: true,
+    abortOnDeadline: false,
+    tick: async ctx => {
+      const lockRecord: LockRecord = {
+        repo,
+        holder_id: holderId,
+        surface: 'github',
+        acquired_at: new Date().toISOString(),
+        ttl_seconds: config.lockTtlSeconds,
+        run_id: runId,
+        // Every renewal rewrites the whole record, so the job and token must be carried or the first tick would erase them.
+        ...(holderJob === undefined ? {} : {holder_job: holderJob}),
+        acquisition_token: acquisitionToken,
+      }
+      await ctx.renewLock(lockRecord)
+    },
+    logger,
+    logContext: {repo, holderId},
+  })
+  loop.start()
 
   return {
-    hasFailed: () => failed,
-    continuityUnverified: () => continuityUnverified,
-    currentEtag: () => currentEtag,
-    settle: async (): Promise<void> => {
-      // Unlike `stop()`, this never clears `intervalHandle` -- renewal keeps ticking on its
-      // normal schedule after this resolves. `pending` already settles within its own
-      // `RENEWAL_TIMEOUT_MS` (via `withTimeout` in `tick()`'s `.then`/`.catch`/`.finally`
-      // chain) and never rejects, so there is nothing further to bound here.
-      const pending = inFlight
-      if (pending == null) return
-      await pending
-    },
+    hasFailed: loop.hasFailed,
+    continuityUnverified: loop.continuityUnverified,
+    currentEtag: loop.currentEtag,
+    settle: loop.settle,
     stop: async (): Promise<void> => {
-      clearInterval(intervalHandle)
-      const pending = inFlight
-      if (pending == null) return
-      // A tick still in flight past the grace period is left to finish on its own (bounded by
-      // RENEWAL_TIMEOUT_MS); stop() does not wait for it further.
-      await Promise.race([pending, delay(STOP_GRACE_PERIOD_MS)])
-      // `pending`'s own `.finally()` nulls `inFlight` once it settles -- if `inFlight` still
-      // points at the same promise, the grace period elapsed first and we genuinely don't know
-      // whether that tick succeeded or failed. That is coverage uncertainty, not confirmed
-      // health, regardless of what `failed` last said.
-      if (inFlight === pending) continuityUnverified = true
+      // The loop reports why it stopped (a failed last tick, a tick still pending); the Action's cleanup reads
+      // `hasFailed()`/`continuityUnverified()`/`currentEtag()` instead, so the result is not needed here.
+      await loop.stop()
     },
   }
 }
@@ -324,7 +272,7 @@ function isStaleEarlierAttemptOfJob(holder: LockRecord, self: ActionSelf, observ
   const parsed = parseActionHolderId(holder.holder_id)
   if (parsed == null || parsed.runId !== self.runId || parsed.attempt >= self.runAttempt) return false
   if (holder.holder_job !== self.holderJob) return false
-  // `acquired_at` is rewritten on every renewal (`LeaseController.tick`, `renewLease`), so it is the last renewal time.
+  // `acquired_at` is rewritten on every renewal (the lease loop's tick, `renewLease`), so it is the last renewal time.
   const lastRenewedMs = new Date(holder.acquired_at).getTime()
   if (Number.isFinite(lastRenewedMs) === false) return false
   return observedAt.getTime() - lastRenewedMs >= SAME_RUN_TAKEOVER_MIN_UNRENEWED_MS
