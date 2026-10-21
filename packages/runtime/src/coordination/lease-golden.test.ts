@@ -1,11 +1,10 @@
 /**
  * Golden-trace characterization of the gateway heartbeat's lease renewal (`createHeartbeatController`).
  *
- * These traces record what the controller does TODAY, against the real runtime (`renewLease` and all) over a recording
- * in-memory adapter. They exist so the shared lease-loop extraction can prove it changed nothing it did not mean to.
- * Where the current behaviour is a known gap that a later unit changes on purpose (no per-tick timeout, no abort
- * signal), the test says so; that unit updates the trace deliberately. A result that lands after `stop()` returned stays
- * applied: `stop()` does not supersede a tick, only a tick timeout does.
+ * These traces record what the controller does over the shared lease loop, against the real runtime (`renewLease` and
+ * all) over a recording in-memory adapter: which adapter calls it makes, in what order, at what spacing, and with or
+ * without an abort signal. Each tick is bounded at 10 s and every request carries the tick's signal. A result that
+ * lands after `stop()` returned stays applied: `stop()` does not supersede a tick, only a tick timeout does.
  *
  * Deliberately NOT recorded: leftover or lingering timers. The extraction clears timers the current code leaves behind,
  * and that cannot be seen from outside.
@@ -200,14 +199,14 @@ describe('gateway heartbeat golden traces', () => {
 
     // #then
     expect(trace).toEqual([
-      {t: 30_000, op: 'getObject', key: RUN_KEY, signal: false},
-      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: 'lock-etag-0', signal: false},
-      {t: 30_000, op: 'conditionalPut', key: RUN_KEY, ifMatch: 'run-etag-0', tagging: RUN_STATE_TAGGING, signal: false},
-      {t: 60_000, op: 'getObject', key: RUN_KEY, signal: false},
-      {t: 60_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: 'lock-etag-1', signal: false},
-      {t: 60_000, op: 'conditionalPut', key: RUN_KEY, ifMatch: 'run-etag-1', tagging: RUN_STATE_TAGGING, signal: false},
+      {t: 30_000, op: 'getObject', key: RUN_KEY, signal: true},
+      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: 'lock-etag-0', signal: true},
+      {t: 30_000, op: 'conditionalPut', key: RUN_KEY, ifMatch: 'run-etag-0', tagging: RUN_STATE_TAGGING, signal: true},
+      {t: 60_000, op: 'getObject', key: RUN_KEY, signal: true},
+      {t: 60_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: 'lock-etag-1', signal: true},
+      {t: 60_000, op: 'conditionalPut', key: RUN_KEY, ifMatch: 'run-etag-1', tagging: RUN_STATE_TAGGING, signal: true},
       {t: 60_000, op: 'mark', name: 'stop:begin'},
-      {t: 60_000, op: 'getObject', key: RUN_KEY, signal: false},
+      {t: 60_000, op: 'getObject', key: RUN_KEY, signal: true},
       {t: 60_000, op: 'mark', name: 'stop:resolved'},
     ])
     expect(result.success).toBe(true)
@@ -229,8 +228,8 @@ describe('gateway heartbeat golden traces', () => {
 
     // #then no RunState write, and no snapshot read after the failed tick
     expect(trace).toEqual([
-      {t: 30_000, op: 'getObject', key: RUN_KEY, signal: false},
-      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: 'lock-etag-0', signal: false},
+      {t: 30_000, op: 'getObject', key: RUN_KEY, signal: true},
+      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: 'lock-etag-0', signal: true},
       {t: 30_000, op: 'mark', name: 'stop:begin'},
       {t: 30_000, op: 'mark', name: 'stop:resolved'},
     ])
@@ -254,9 +253,9 @@ describe('gateway heartbeat golden traces', () => {
 
     // #then the write was attempted; the error carries the renewed lock ETag and the untouched RunState ETag
     expect(trace).toEqual([
-      {t: 30_000, op: 'getObject', key: RUN_KEY, signal: false},
-      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: 'lock-etag-0', signal: false},
-      {t: 30_000, op: 'conditionalPut', key: RUN_KEY, ifMatch: 'run-etag-0', tagging: RUN_STATE_TAGGING, signal: false},
+      {t: 30_000, op: 'getObject', key: RUN_KEY, signal: true},
+      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: 'lock-etag-0', signal: true},
+      {t: 30_000, op: 'conditionalPut', key: RUN_KEY, ifMatch: 'run-etag-0', tagging: RUN_STATE_TAGGING, signal: true},
       {t: 30_000, op: 'mark', name: 'stop:begin'},
       {t: 30_000, op: 'mark', name: 'stop:resolved'},
     ])
@@ -280,13 +279,13 @@ describe('gateway heartbeat golden traces', () => {
 
     // #then the second tick renews against the original ETag and stop returns a snapshot
     expect(trace).toEqual([
-      {t: 30_000, op: 'getObject', key: RUN_KEY, signal: false},
-      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: 'lock-etag-0', signal: false},
-      {t: 60_000, op: 'getObject', key: RUN_KEY, signal: false},
-      {t: 60_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: 'lock-etag-0', signal: false},
-      {t: 60_000, op: 'conditionalPut', key: RUN_KEY, ifMatch: 'run-etag-0', tagging: RUN_STATE_TAGGING, signal: false},
+      {t: 30_000, op: 'getObject', key: RUN_KEY, signal: true},
+      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: 'lock-etag-0', signal: true},
+      {t: 60_000, op: 'getObject', key: RUN_KEY, signal: true},
+      {t: 60_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: 'lock-etag-0', signal: true},
+      {t: 60_000, op: 'conditionalPut', key: RUN_KEY, ifMatch: 'run-etag-0', tagging: RUN_STATE_TAGGING, signal: true},
       {t: 60_000, op: 'mark', name: 'stop:begin'},
-      {t: 60_000, op: 'getObject', key: RUN_KEY, signal: false},
+      {t: 60_000, op: 'getObject', key: RUN_KEY, signal: true},
       {t: 60_000, op: 'mark', name: 'stop:resolved'},
     ])
     expect(result.success).toBe(true)
@@ -312,9 +311,9 @@ describe('gateway heartbeat golden traces', () => {
 
     // #then tick 2 renewed nothing, so the first tick's error is still what stop reports; no snapshot is read
     expect(trace).toEqual([
-      {t: 30_000, op: 'getObject', key: RUN_KEY, signal: false},
-      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: 'lock-etag-0', signal: false},
-      {t: 60_000, op: 'getObject', key: RUN_KEY, signal: false},
+      {t: 30_000, op: 'getObject', key: RUN_KEY, signal: true},
+      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: 'lock-etag-0', signal: true},
+      {t: 60_000, op: 'getObject', key: RUN_KEY, signal: true},
       {t: 60_000, op: 'mark', name: 'stop:begin'},
       {t: 61_000, op: 'mark', name: 'stop:resolved'},
     ])
@@ -324,21 +323,95 @@ describe('gateway heartbeat golden traces', () => {
     expect(result.error).toMatchObject({lockEtag: 'lock-etag-0', tickPending: false})
   })
 
-  it('has no per-tick timeout: a hung renewal makes every later tick skip silently', async () => {
-    // #given the first renewal never settles
+  it('bounds a hung renewal at the 10 s tick timeout: every interval starts a new tick against the unchanged ETag', async () => {
+    // #given every lock renewal never settles
     const {trace, controller} = createHarness({
       conditionalPut: async (call, fallback) => (call.key === LOCK_KEY ? hang() : fallback()),
     })
     controller.start()
 
-    // #when ten intervals elapse
-    await vi.advanceTimersByTimeAsync(INTERVAL_MS * 10)
+    // #when three intervals elapse
+    await vi.advanceTimersByTimeAsync(INTERVAL_MS * 3)
 
-    // #then only the first tick ever touched the adapter. (Gap: a later unit bounds ticks at 10 s.)
+    // #then each tick timed out at +10 s, so the next interval started a fresh one (before the lease loop, the first
+    // hung tick kept every later tick from starting)
     expect(trace).toEqual([
-      {t: 30_000, op: 'getObject', key: RUN_KEY, signal: false},
-      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: 'lock-etag-0', signal: false},
+      {t: 30_000, op: 'getObject', key: RUN_KEY, signal: true},
+      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: 'lock-etag-0', signal: true},
+      {t: 60_000, op: 'getObject', key: RUN_KEY, signal: true},
+      {t: 60_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: 'lock-etag-0', signal: true},
+      {t: 90_000, op: 'getObject', key: RUN_KEY, signal: true},
+      {t: 90_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: 'lock-etag-0', signal: true},
     ])
+  })
+
+  it('does not apply a renewal or a RunState write that lands after its tick timed out', async () => {
+    // #given tick 1's renewal and tick 2's RunState write are held open past the tick timeout
+    const renewal = deferred<Result<{etag: string}, Error>>()
+    const write = deferred<Result<{etag: string}, Error>>()
+    const {trace, controller, stop} = createHarness({
+      conditionalPut: async (call, fallback) => {
+        if (call.key === LOCK_KEY && call.n === 1) return renewal.promise
+        if (call.key === RUN_KEY) return write.promise
+        return fallback()
+      },
+    })
+    controller.start()
+    await vi.advanceTimersByTimeAsync(INTERVAL_MS + 10_000)
+    renewal.resolve(ok({etag: 'lock-etag-late'}))
+    await vi.advanceTimersByTimeAsync(INTERVAL_MS - 10_000 + 10_000)
+    write.resolve(ok({etag: 'run-etag-late'}))
+    await vi.advanceTimersByTimeAsync(0)
+
+    // #when
+    const result = await stop()
+
+    // #then neither late result moved an ETag; tick 2 renewed against tick 1's unchanged ETag and its lock ETag stands
+    expect(trace.filter(entry => entry.op !== 'mark')).toEqual([
+      {t: 30_000, op: 'getObject', key: RUN_KEY, signal: true},
+      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: 'lock-etag-0', signal: true},
+      {t: 60_000, op: 'getObject', key: RUN_KEY, signal: true},
+      {t: 60_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: 'lock-etag-0', signal: true},
+      {t: 60_000, op: 'conditionalPut', key: RUN_KEY, ifMatch: 'run-etag-0', tagging: RUN_STATE_TAGGING, signal: true},
+    ])
+    expect(result.success).toBe(false)
+    if (result.success === true) throw new Error('expected a failed stop')
+    expect(result.error).toMatchObject({lockEtag: 'lock-etag-2', runEtag: 'run-etag-0', tickPending: false})
+  })
+
+  it('a tick that renews and then skips its write because stop began clears an earlier write failure', async () => {
+    // #given tick 1's RunState write fails; tick 2's renewal is held open when stop begins
+    const renewal = deferred<Result<{etag: string}, Error>>()
+    const {trace, controller, stop} = createHarness({
+      conditionalPut: async (call, fallback) => {
+        if (call.key === RUN_KEY) return err(new Error('run state write failed'))
+        return call.n === 2 ? renewal.promise : fallback()
+      },
+    })
+    controller.start()
+    await vi.advanceTimersByTimeAsync(INTERVAL_MS * 2)
+
+    // #when stop begins while the renewal is in flight, and it then lands
+    const stopped = stop()
+    renewal.resolve(ok({etag: 'lock-etag-slow'}))
+    const result = await stopped
+
+    // #then no second write; stop read a fresh snapshot (before the lease loop, the earlier error persisted)
+    expect(trace).toEqual([
+      {t: 30_000, op: 'getObject', key: RUN_KEY, signal: true},
+      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: 'lock-etag-0', signal: true},
+      {t: 30_000, op: 'conditionalPut', key: RUN_KEY, ifMatch: 'run-etag-0', tagging: RUN_STATE_TAGGING, signal: true},
+      {t: 60_000, op: 'getObject', key: RUN_KEY, signal: true},
+      {t: 60_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: 'lock-etag-1', signal: true},
+      {t: 60_000, op: 'mark', name: 'stop:begin'},
+      {t: 60_000, op: 'getObject', key: RUN_KEY, signal: true},
+      {t: 60_000, op: 'mark', name: 'stop:resolved'},
+    ])
+    expect(result.success).toBe(true)
+    expect(result.success === true ? result.data : null).toMatchObject({
+      runEtag: 'run-etag-0',
+      lockEtag: 'lock-etag-slow',
+    })
   })
 
   it('stop with a renewal pending returns tickPending after the grace period, without a snapshot; a late renewal is applied', async () => {
@@ -357,14 +430,14 @@ describe('gateway heartbeat golden traces', () => {
 
     // #then stop gave up after exactly the grace period
     expect(trace).toEqual([
-      {t: 30_000, op: 'getObject', key: RUN_KEY, signal: false},
-      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: 'lock-etag-0', signal: false},
+      {t: 30_000, op: 'getObject', key: RUN_KEY, signal: true},
+      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: 'lock-etag-0', signal: true},
       {t: 30_000, op: 'mark', name: 'stop:begin'},
       {t: 35_000, op: 'mark', name: 'stop:resolved'},
     ])
     expect(result.success).toBe(false)
     if (result.success === true) throw new Error('expected a failed stop')
-    expect(result.error.message).toBe('Heartbeat tick did not settle within 5000ms of stop')
+    expect(result.error.message).toBe('Lease tick did not settle within 5000ms of stop')
     expect(result.error).toMatchObject({lockEtag: 'lock-etag-0', runEtag: 'run-etag-0', tickPending: true})
 
     // #when the abandoned renewal lands after stop returned
@@ -372,10 +445,10 @@ describe('gateway heartbeat golden traces', () => {
     await vi.advanceTimersByTimeAsync(0)
     const again = await stop()
 
-    // #then it was applied to the lock ETag (`stop()` does not supersede a tick; only a tick timeout will, in PR-B) but wrote no RunState
+    // #then it was applied to the lock ETag (`stop()` does not supersede a tick; only a tick timeout does) but wrote no RunState
     expect(trace.slice(4)).toEqual([
       {t: 35_000, op: 'mark', name: 'stop:begin'},
-      {t: 35_000, op: 'getObject', key: RUN_KEY, signal: false},
+      {t: 35_000, op: 'getObject', key: RUN_KEY, signal: true},
       {t: 35_000, op: 'mark', name: 'stop:resolved'},
     ])
     expect(again.success).toBe(true)
@@ -399,9 +472,9 @@ describe('gateway heartbeat golden traces', () => {
 
     // #then
     expect(trace).toEqual([
-      {t: 30_000, op: 'getObject', key: RUN_KEY, signal: false},
-      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: 'lock-etag-0', signal: false},
-      {t: 30_000, op: 'conditionalPut', key: RUN_KEY, ifMatch: 'run-etag-0', tagging: RUN_STATE_TAGGING, signal: false},
+      {t: 30_000, op: 'getObject', key: RUN_KEY, signal: true},
+      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: 'lock-etag-0', signal: true},
+      {t: 30_000, op: 'conditionalPut', key: RUN_KEY, ifMatch: 'run-etag-0', tagging: RUN_STATE_TAGGING, signal: true},
       {t: 30_000, op: 'mark', name: 'stop:begin'},
       {t: 35_000, op: 'mark', name: 'stop:resolved'},
     ])
@@ -414,7 +487,7 @@ describe('gateway heartbeat golden traces', () => {
     await vi.advanceTimersByTimeAsync(0)
     const again = await stop()
 
-    // #then the late write's ETag was applied (`stop()` does not supersede a tick; only a tick timeout will, in PR-B)
+    // #then the late write's ETag was applied (`stop()` does not supersede a tick; only a tick timeout does)
     expect(again.success).toBe(false)
     if (again.success === true) throw new Error('expected a failed stop')
     expect(again.error).toMatchObject({lockEtag: 'lock-etag-1', runEtag: 'run-etag-late', tickPending: false})
@@ -432,12 +505,12 @@ describe('gateway heartbeat golden traces', () => {
     // #then
     expect(trace).toEqual([
       {t: 0, op: 'mark', name: 'stop:begin'},
-      {t: 0, op: 'getObject', key: RUN_KEY, signal: false},
+      {t: 0, op: 'getObject', key: RUN_KEY, signal: true},
       {t: 5_000, op: 'mark', name: 'stop:resolved'},
     ])
     expect(result.success).toBe(false)
     if (result.success === true) throw new Error('expected a failed stop')
-    expect(result.error.message).toBe('Heartbeat snapshot read did not settle within 5000ms of stop')
+    expect(result.error.message).toBe('Lease finalize did not settle within 5000ms of stop')
     expect(result.error).toMatchObject({lockEtag: 'lock-etag-0', runEtag: 'run-etag-0', tickPending: false})
   })
 
@@ -460,15 +533,15 @@ describe('gateway heartbeat golden traces', () => {
 
     // #then stop resolved 5 s after it began (not 7 s), with the slow renewal's ETag, and the tick wrote no RunState
     expect(trace).toEqual([
-      {t: 30_000, op: 'getObject', key: RUN_KEY, signal: false},
-      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: 'lock-etag-0', signal: false},
+      {t: 30_000, op: 'getObject', key: RUN_KEY, signal: true},
+      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: 'lock-etag-0', signal: true},
       {t: 30_000, op: 'mark', name: 'stop:begin'},
-      {t: 32_000, op: 'getObject', key: RUN_KEY, signal: false},
+      {t: 32_000, op: 'getObject', key: RUN_KEY, signal: true},
       {t: 35_000, op: 'mark', name: 'stop:resolved'},
     ])
     expect(result.success).toBe(false)
     if (result.success === true) throw new Error('expected a failed stop')
-    expect(result.error.message).toBe('Heartbeat snapshot read did not settle within 5000ms of stop')
+    expect(result.error.message).toBe('Lease finalize did not settle within 5000ms of stop')
     expect(result.error).toMatchObject({lockEtag: 'lock-etag-slow', tickPending: false})
   })
 
@@ -483,13 +556,13 @@ describe('gateway heartbeat golden traces', () => {
 
     // #then it stayed stopped and touched nothing beyond stop's own snapshot read
     expect(controller.isRunning).toBe(false)
-    expect(logger.debug).toHaveBeenCalledWith('Ignoring start of a stopped heartbeat controller', {
+    expect(logger.debug).toHaveBeenCalledWith('Ignoring start of a stopped lease loop', {
       repo: 'owner/repo',
       runId: 'run-1',
     })
     expect(trace).toEqual([
       {t: 0, op: 'mark', name: 'stop:begin'},
-      {t: 0, op: 'getObject', key: RUN_KEY, signal: false},
+      {t: 0, op: 'getObject', key: RUN_KEY, signal: true},
       {t: 0, op: 'mark', name: 'stop:resolved'},
     ])
   })

@@ -103,6 +103,18 @@ function throwingLogger() {
   }
 }
 
+/** Records every `setTimeout` handle in creation order, so a test can look at one timer's ref state. */
+function trackTimeoutHandles() {
+  const handles: {hasRef: () => boolean}[] = []
+  const realSetTimeout = globalThis.setTimeout
+  vi.spyOn(globalThis, 'setTimeout').mockImplementation((...args: Parameters<typeof setTimeout>) => {
+    const handle = realSetTimeout(...args)
+    handles.push(handle)
+    return handle
+  })
+  return handles
+}
+
 function stopFailure<T>(result: Result<T, LeaseLoopStopError>): LeaseLoopStopError {
   if (result.success) throw new Error('expected stop() to fail')
   return result.error
@@ -1546,6 +1558,56 @@ describe('createLeaseLoop', () => {
       expect(loop.continuityUnverified()).toBe(false)
       expect(logger.warning).not.toHaveBeenCalled()
       expect(result).toEqual(ok({lockEtag: 'etag-3', final: 'snapshot'}))
+    })
+  })
+
+  describe('an attempt abandoned at stop', () => {
+    it('unrefs its tick timer when stop gives up on it, and the timer still records the timeout', async () => {
+      // #given a hung renewal on a loop that does not unref its own timers (the gateway)
+      const handles = trackTimeoutHandles()
+      const {loop, logger} = setup({script: async () => hang(), overrides: {unref: false}})
+      loop.start()
+      await vi.advanceTimersByTimeAsync(INTERVAL_MS)
+      const tickTimer = handles[0]
+      expect(tickTimer?.hasRef()).toBe(true)
+
+      // #when stop gives up on it
+      const stopped = loop.stop()
+      await vi.advanceTimersByTimeAsync(STOP_BUDGET_MS)
+      await stopped
+
+      // #then it no longer holds the process open...
+      expect(tickTimer?.hasRef()).toBe(false)
+      expect(logger.warning).not.toHaveBeenCalled()
+
+      // #when the process lives long enough
+      await vi.advanceTimersByTimeAsync(TICK_TIMEOUT_MS - STOP_BUDGET_MS)
+
+      // #then ...but it still fires and records the failure
+      expect(loop.hasFailed()).toBe(true)
+      expect(logger.warning).toHaveBeenCalledWith('Coordination lease renewal threw', {
+        ...CONTEXT,
+        error: 'Lease renewal exceeded 10000ms',
+      })
+    })
+
+    it('leaves the tick timer of an attempt that stop waited for alone', async () => {
+      // #given a renewal that settles inside the budget
+      const handles = trackTimeoutHandles()
+      const slow = deferred<Result<{readonly etag: string}, Error>>()
+      const {loop} = setup({script: async () => slow.promise, overrides: {unref: false}})
+      loop.start()
+      await vi.advanceTimersByTimeAsync(INTERVAL_MS)
+
+      // #when
+      const stopped = loop.stop()
+      await vi.advanceTimersByTimeAsync(1_000)
+      slow.resolve(ok({etag: 'etag-slow'}))
+      await stopped
+
+      // #then nothing was abandoned, and the settled attempt's timer is gone
+      expect(handles[0]?.hasRef()).toBe(true)
+      expect(vi.getTimerCount()).toBe(0)
     })
   })
 })

@@ -143,7 +143,6 @@ async function startRenewal(options: {readonly putScript?: PutScript; readonly j
   const actual = await vi.importActual<typeof import('@fro-bot/runtime')>('@fro-bot/runtime')
   renewLeaseMock.mockImplementation(async (...args: Parameters<typeof actual.renewLease>) => {
     const [, repo, record, etag, , scope] = args
-    // Read by index: `renewLease` has no signal parameter yet, and this trace must stay valid once it gains one.
     const signal: unknown = (args as readonly unknown[])[6]
     trace.push({
       t: now(),
@@ -239,20 +238,20 @@ describe('Action lease renewal golden traces', () => {
         repo: REPO,
         ifMatch: '"etag-0"',
         scope: 'action',
-        signal: false,
+        signal: true,
         record: lockRecordAt(30_000, token),
       },
-      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: '"etag-0"', signal: false},
+      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: '"etag-0"', signal: true},
       {
         t: 60_000,
         op: 'renewLease',
         repo: REPO,
         ifMatch: '"etag-1"',
         scope: 'action',
-        signal: false,
+        signal: true,
         record: lockRecordAt(60_000, token),
       },
-      {t: 60_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: '"etag-1"', signal: false},
+      {t: 60_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: '"etag-1"', signal: true},
       {t: 60_000, op: 'mark', name: 'stop:begin'},
       {t: 60_000, op: 'mark', name: 'stop:resolved'},
       {t: 60_000, op: 'mark', name: 'release'},
@@ -278,7 +277,7 @@ describe('Action lease renewal golden traces', () => {
       repo: REPO,
       ifMatch: '"etag-0"',
       scope: 'action',
-      signal: false,
+      signal: true,
       record: lockRecordAt(30_000, token, {}),
     })
     expect(trace[0]?.record).not.toHaveProperty('holder_job')
@@ -315,20 +314,20 @@ describe('Action lease renewal golden traces', () => {
         repo: REPO,
         ifMatch: '"etag-0"',
         scope: 'action',
-        signal: false,
+        signal: true,
         record: lockRecordAt(30_000, token),
       },
-      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: '"etag-0"', signal: false},
+      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: '"etag-0"', signal: true},
       {
         t: 60_000,
         op: 'renewLease',
         repo: REPO,
         ifMatch: '"etag-0"',
         scope: 'action',
-        signal: false,
+        signal: true,
         record: lockRecordAt(60_000, token),
       },
-      {t: 60_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: '"etag-0"', signal: false},
+      {t: 60_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: '"etag-0"', signal: true},
       {t: 60_000, op: 'mark', name: 'stop:begin'},
       {t: 60_000, op: 'mark', name: 'stop:resolved'},
     ])
@@ -357,10 +356,10 @@ describe('Action lease renewal golden traces', () => {
         repo: REPO,
         ifMatch: '"etag-0"',
         scope: 'action',
-        signal: false,
+        signal: true,
         record: lockRecordAt(30_000, token),
       },
-      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: '"etag-0"', signal: false},
+      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: '"etag-0"', signal: true},
     ])
     expect(renewal.hasFailed()).toBe(true)
     expect(renewal.continuityUnverified?.()).toBe(true)
@@ -409,20 +408,20 @@ describe('Action lease renewal golden traces', () => {
         repo: REPO,
         ifMatch: '"etag-0"',
         scope: 'action',
-        signal: false,
+        signal: true,
         record: lockRecordAt(30_000, token),
       },
-      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: '"etag-0"', signal: false},
+      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: '"etag-0"', signal: true},
       {
         t: 60_000,
         op: 'renewLease',
         repo: REPO,
         ifMatch: '"etag-0"',
         scope: 'action',
-        signal: false,
+        signal: true,
         record: lockRecordAt(60_000, token),
       },
-      {t: 60_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: '"etag-0"', signal: false},
+      {t: 60_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: '"etag-0"', signal: true},
     ])
     expect(renewal.currentEtag()).toBe('"etag-2"')
     expect(renewal.hasFailed()).toBe(false)
@@ -487,10 +486,10 @@ describe('Action lease renewal golden traces', () => {
         repo: REPO,
         ifMatch: '"etag-0"',
         scope: 'action',
-        signal: false,
+        signal: true,
         record: lockRecordAt(30_000, token),
       },
-      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: '"etag-0"', signal: false},
+      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: '"etag-0"', signal: true},
       {t: 30_000, op: 'mark', name: 'stop:begin'},
       {t: 35_000, op: 'mark', name: 'stop:resolved'},
     ])
@@ -590,10 +589,10 @@ describe('Action lease renewal golden traces', () => {
         repo: REPO,
         ifMatch: '"etag-0"',
         scope: 'action',
-        signal: false,
+        signal: true,
         record: lockRecordAt(30_000, token),
       },
-      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: '"etag-0"', signal: false},
+      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: '"etag-0"', signal: true},
       {t: 30_000, op: 'mark', name: 'settle:begin'},
       {t: 32_000, op: 'mark', name: 'settle:resolved'},
       {
@@ -602,10 +601,10 @@ describe('Action lease renewal golden traces', () => {
         repo: REPO,
         ifMatch: '"etag-slow"',
         scope: 'action',
-        signal: false,
+        signal: true,
         record: lockRecordAt(60_000, token),
       },
-      {t: 60_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: '"etag-slow"', signal: false},
+      {t: 60_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: '"etag-slow"', signal: true},
     ])
     expect(renewal.currentEtag()).toBe('"etag-2"')
   })
@@ -644,10 +643,10 @@ describe('Action lease renewal golden traces', () => {
         repo: REPO,
         ifMatch: '"etag-0"',
         scope: 'action',
-        signal: false,
+        signal: true,
         record: lockRecordAt(30_000, token),
       },
-      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: '"etag-0"', signal: false},
+      {t: 30_000, op: 'conditionalPut', key: LOCK_KEY, ifMatch: '"etag-0"', signal: true},
       {t: 30_000, op: 'mark', name: 'settle:begin'},
       {t: 40_000, op: 'mark', name: 'settle:resolved'},
     ])
@@ -715,5 +714,42 @@ describe('Action lease renewal golden traces', () => {
       holderId: HOLDER_ID,
       error: 'Lease renewal exceeded 10000ms',
     })
+  })
+
+  it('aborts the renewal request at the 10 s tick timeout, not before', async () => {
+    // #given the first renewal never settles
+    const {renewal} = await startRenewal({putScript: async (n, fallback) => (n === 1 ? hang() : fallback())})
+    await vi.advanceTimersByTimeAsync(DEFAULT_HEARTBEAT_INTERVAL_MS + RENEWAL_TIMEOUT_MS - 1)
+    const signal = renewLeaseMock.mock.calls[0]?.[6] as AbortSignal
+    expect(signal).toBeInstanceOf(AbortSignal)
+    expect(signal.aborted).toBe(false)
+
+    // #when the timeout elapses
+    await vi.advanceTimersByTimeAsync(1)
+
+    // #then the request is cancelled rather than abandoned
+    expect(signal.aborted).toBe(true)
+    expect(renewal.hasFailed()).toBe(true)
+  })
+
+  it('aborts a pending renewal when the stop grace period runs out, and not when stop begins', async () => {
+    // #given the first renewal never settles
+    const {stop} = await startRenewal({putScript: async (n, fallback) => (n === 1 ? hang() : fallback())})
+    await vi.advanceTimersByTimeAsync(DEFAULT_HEARTBEAT_INTERVAL_MS)
+    const signal = renewLeaseMock.mock.calls[0]?.[6] as AbortSignal
+
+    // #when stop begins
+    const stopped = stop()
+    await vi.advanceTimersByTimeAsync(STOP_GRACE_MS - 1)
+
+    // #then the request is still live
+    expect(signal.aborted).toBe(false)
+
+    // #when the grace period runs out
+    await vi.advanceTimersByTimeAsync(1)
+    await stopped
+
+    // #then
+    expect(signal.aborted).toBe(true)
   })
 })

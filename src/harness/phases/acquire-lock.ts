@@ -177,7 +177,7 @@ function createLeaseController(
 ): LeaseController {
   const loop = createLeaseLoop({
     // `renewLease` is called through the `@fro-bot/runtime` import, so the package-boundary test seam still applies.
-    renew: async (record, etag) => renewLease(config, repo, record, etag, logger, ACTION_LOCK_SCOPE),
+    renew: async (record, etag, signal) => renewLease(config, repo, record, etag, logger, ACTION_LOCK_SCOPE, signal),
     initialEtag,
     intervalMs: DEFAULT_HEARTBEAT_INTERVAL_MS,
     tickTimeoutMs: RENEWAL_TIMEOUT_MS,
@@ -186,7 +186,7 @@ function createLeaseController(
     // finally block, which calls stop() regardless of outcome, but unref is a defensive backstop against a future
     // early-exit path that forgets to.
     unref: true,
-    abortOnDeadline: false,
+    abortOnDeadline: true,
     tick: async ctx => {
       const lockRecord: LockRecord = {
         repo,

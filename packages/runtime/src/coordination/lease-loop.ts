@@ -313,6 +313,9 @@ export function createLeaseLoop<F = void>(options: LeaseLoopOptions<F>): LeaseLo
           if (winner === BUDGET_ELAPSED && pending.concluded === false) {
             // An unresolved tick is itself a gap in coverage, not a pass.
             continuityUnverified = true
+            // The attempt's own timeout stays armed so it still records its failure, but it must not hold the process
+            // (or a daemon's shutdown) open for the rest of the tick timeout.
+            pending.timer?.unref()
             pending.controller?.abort(new Error('Lease stop budget elapsed'))
             return err(toStopError(new Error(`Lease tick did not settle within ${stopBudgetMs}ms of stop`), true))
           }

@@ -439,7 +439,9 @@ describe('termination barrier — quarantine (Unit 8)', () => {
         },
         storeConfig: {enabled: true, bucket: 'test', region: 'us-east-1', prefix: 'state'},
         lockTtlSeconds: 900,
-        heartbeatIntervalMs: 30_000,
+        // A tick now times out 10 s after it starts, so a hung tick only blocks stop() if it started shortly before the
+        // window ends: the interval is chosen so its tick starts 3 s before the window does.
+        heartbeatIntervalMs: QUARANTINE_HOLD_WINDOW_MS - 3_000,
         staleThresholdMs: 60_000,
         pendingStaleThresholdMs: 30 * 60_000,
       } as unknown as CoordinationConfig
