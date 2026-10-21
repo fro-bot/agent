@@ -18,7 +18,6 @@ The Action and the gateway each renew their S3 coordination lock with their own 
 Both run a renewal loop, track the latest lock ETag, guard against overlapping ticks, bound `stop()` with a 5 s grace period, and record failures. They also differ in ways nobody chose:
 
 - the gateway has no per-tick timeout;
-- the gateway applies late results;
 - only the Action unrefs its timers;
 - only the Action logs failed renewals.
 
@@ -60,7 +59,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 - **R3.** PR-A is behaviour-neutral for the Action. The proof is golden adapter-call traces recorded before extraction, plus the existing suites passing with no edits.
 - **R4.** The gateway heartbeat keeps its public name and shape (`createHeartbeatController`, `HeartbeatController`, `HeartbeatStopError`). The only change is one additive optional parameter in PR-C. RunState composition stays in the gateway layer.
 - **R5.** In PR-B, every tick on both surfaces is bounded by a 10 s timeout. In-flight requests are aborted when the tick timeout or the stop budget runs out, not when `stop()` begins.
-- **R6.** A result from a superseded attempt (one that timed out, or one that returns after `stop()` has returned) is never applied to loop state or to the gateway's run ETag.
+- **R6.** A result from a superseded attempt (one whose tick timeout fired) is never applied to loop state or to the gateway's run ETag. `stop()` does not supersede an in-flight attempt: a result that lands after `stop()` returned but before the tick timeout still applies, as it does on the Action today. A late confirmed renewal is still our own ETag, so a release that reads `currentEtag()` afterwards succeeds. A late failure after stop is harmless, because `tickPending` has already latched continuity.
 - **R7.** After a failed renewal, the loop re-reads the lock once, within the tick's bounds, and adopts the stored ETag if the record is ours:
   - Action: `holder_id`, `holder_job` and `acquisition_token` match.
   - Gateway: `holder_id`, `run_id` and this acquisition's `acquisition_token` match.
@@ -156,7 +155,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 - **Failure state.**
   - **Generations:** each tick attempt carries a generation number.
   - **`hasFailed`** is true after a tick ends without a confirmed renewal, and false after one ends with a confirmed renewal.
-  - **Skipped ticks:** a tick that skips its I/O, or a superseded attempt, changes neither `hasFailed` nor the stored last error.
+  - **Skipped ticks:** a tick that skips its I/O, or a superseded (timed-out) attempt, changes neither `hasFailed` nor the stored last error.
   - **`continuityUnverified` latches** when a tick ends without a confirmed renewal: a renewal failure, a body failure before the renewal, a timeout before the renewal confirms, or `tickPending` at stop. A body failure or timeout _after_ a confirmed renewal doesn't latch. The Action has no I/O after its renewal, so this matches its behaviour exactly.
 - **Stop.**
   - `stop()` sets stopping first. `start()` after `stop()` is a no-op.
@@ -282,7 +281,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
   - returns `'skipped'` when stopping or superseded;
   - throws on an unconfirmed renewal, so the body's later I/O doesn't run (mirrors `:221`).
 - **ETag freshness:** every failure carries the freshest confirmed lock ETag.
-- **Late results:** a late result from a timed-out or post-stop attempt changes neither the lock ETag nor anything the body gates on `isCurrent()`.
+- **Late results:** a late result from a timed-out attempt changes neither the lock ETag nor anything the body gates on `isCurrent()`. A result that lands after `stop()` returned but before the tick timeout still applies (matches the Action golden trace).
 - **Abort:**
   - with `abortOnDeadline: false`, no signal is created or passed;
   - with it on, abort fires at the tick timeout and at budget expiry, not at `stop()` begin.
@@ -312,7 +311,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 - Action golden traces are identical.
 - `acquire-lock*.test.ts`, `cleanup*.test.ts`, `post.test.ts`, `run.test.ts` and `outcome.test.ts` pass with no edits to existing test files.
 
-### PR-B: gateway on the loop (tick timeout, abort, late results)
+### PR-B: gateway on the loop (tick timeout, abort)
 
 - [ ] **Unit 5: Gateway heartbeat as a RunState layer; abort on for both surfaces**
 
@@ -353,7 +352,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
   - gateway tick timeout;
   - abort on both surfaces;
   - read-after-stop;
-  - late results.
+  - late results from timed-out gateway ticks.
 - **These pass:**
   - `run.quarantine*.test.ts`
   - `run.lifecycle.test.ts`
@@ -429,7 +428,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 - **412 against a successor's record:** no adoption.
 - **Read fails or times out:** no adoption, and the latch is set.
 - **Stop arrives during the adoption read:** no adoption once the budget runs out.
-- **Adoption read resolves after stop returned, or after supersession:** not applied.
+- **Adoption read resolves after its tick timed out:** not applied.
 - **A late commit after adoption:** the next tick 412s, recovery converges, and otherwise the lease lapses by TTL.
 - **Same `holder_id` but a different token or `run_id`:** never adopted.
 - **Absent `holder_job` on both sides:** matches.
@@ -451,7 +450,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 | Surface | PR-A | PR-B | PR-C |
 | --- | --- | --- | --- |
 | Action | None (traces identical) | A timed-out or budget-expired renewal is aborted instead of abandoned | A renewal that committed but returned an error no longer leaves the lock until the TTL |
-| Gateway | None | A hung tick times out at 10 s and is logged; late results are ignored; in-flight I/O is aborted at the deadline; the RunState read doesn't start after stop | Adoption as above; lock records gain `acquisition_token` |
+| Gateway | None | A hung tick times out at 10 s and is logged; late results from a timed-out tick are ignored; in-flight I/O is aborted at the deadline; the RunState read doesn't start after stop | Adoption as above; lock records gain `acquisition_token` |
 | `dist/` | Rebuilt | Rebuilt (the Action's `abortOnDeadline`) | Rebuilt |
 | Object-store adapter | `conditionalPut` accepts an optional `signal` | — | Exported lock read |
 
