@@ -1,5 +1,5 @@
 import type {Result} from '../shared/types.js'
-import type {LeaseLoopOptions, LeaseLoopStopError, LeaseRenew} from './lease-loop.js'
+import type {LeaseLoopOptions, LeaseLoopStopError, LeaseRenew, LeaseTickContext} from './lease-loop.js'
 import type {LockRecord} from './types.js'
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
@@ -1339,6 +1339,113 @@ describe('createLeaseLoop', () => {
       expect(loop.hasFailed()).toBe(true)
       expect(loop.continuityUnverified()).toBe(true)
       expect(logger.warning).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  describe('a body that catches a renewal failure', () => {
+    /** Renews, swallows the failure, and returns normally: the loop must still see that the renewal failed. */
+    const swallowing = async (ctx: LeaseTickContext): Promise<void> => {
+      try {
+        await ctx.renewLock(RECORD)
+      } catch {
+        // Swallowed on purpose.
+      }
+    }
+
+    it('still fails the tick when the swallowed renewal returned err', async () => {
+      // #given
+      const finalize = vi.fn(async () => 'snapshot')
+      const {loop, logger} = setup({
+        script: async () => err(new Error('renewal rejected')),
+        overrides: {tick: swallowing, finalize},
+      })
+      loop.start()
+
+      // #when
+      await vi.advanceTimersByTimeAsync(INTERVAL_MS)
+      const failure = stopFailure(await loop.stop())
+
+      // #then
+      expect(loop.hasFailed()).toBe(true)
+      expect(loop.continuityUnverified()).toBe(true)
+      expect(failure.message).toBe('renewal rejected')
+      expect(finalize).not.toHaveBeenCalled()
+      expect(logger.warning).toHaveBeenCalledTimes(1)
+      expect(logger.warning).toHaveBeenCalledWith('Coordination lease renewal failed', {
+        ...CONTEXT,
+        error: 'renewal rejected',
+      })
+    })
+
+    it.each([
+      ['an Error', new Error('socket hang up'), 'socket hang up'],
+      ['a non-Error', NON_ERROR, 'not an error'],
+    ])('still fails the tick when the swallowed renewal rejected with %s', async (_label, rejection, message) => {
+      // #given
+      const finalize = vi.fn(async () => 'snapshot')
+      const {loop, logger} = setup({
+        script: async () => Promise.reject(rejection),
+        overrides: {tick: swallowing, finalize},
+      })
+      loop.start()
+
+      // #when
+      await vi.advanceTimersByTimeAsync(INTERVAL_MS)
+      const failure = stopFailure(await loop.stop())
+
+      // #then
+      expect(loop.hasFailed()).toBe(true)
+      expect(loop.continuityUnverified()).toBe(true)
+      expect(failure.message).toBe(message)
+      expect(finalize).not.toHaveBeenCalled()
+      expect(logger.warning).toHaveBeenCalledTimes(1)
+      expect(logger.warning).toHaveBeenCalledWith('Coordination lease renewal threw', {...CONTEXT, error: message})
+    })
+
+    it('comes out healthy when a retry in the same tick confirms a renewal, and the latch stays unset', async () => {
+      // #given the first renewal fails and the body retries once
+      const finalize = vi.fn(async () => 'snapshot')
+      const {loop, logger, renew} = setup({
+        script: async n => (n === 1 ? err(new Error('renewal rejected')) : ok({etag: `etag-${n}`})),
+        overrides: {
+          finalize,
+          tick: async ctx => {
+            await swallowing(ctx)
+            await ctx.renewLock(RECORD)
+          },
+        },
+      })
+      loop.start()
+
+      // #when
+      await vi.advanceTimersByTimeAsync(INTERVAL_MS)
+      const result = await loop.stop()
+
+      // #then the attempt ended with a confirmed renewal: nothing is failed, nothing is logged, and finalize ran
+      expect(renew).toHaveBeenCalledTimes(2)
+      expect(loop.hasFailed()).toBe(false)
+      expect(loop.continuityUnverified()).toBe(false)
+      expect(loop.currentEtag()).toBe('etag-2')
+      expect(logger.warning).not.toHaveBeenCalled()
+      expect(finalize).toHaveBeenCalledTimes(1)
+      expect(result).toEqual(ok({lockEtag: 'etag-2', final: 'snapshot'}))
+    })
+
+    it('records nothing for a superseded attempt that swallows its own late failure', async () => {
+      // #given a renewal that outlives the tick timeout, then fails
+      const late = deferred<Result<{readonly etag: string}, Error>>()
+      const {loop, logger} = setup({script: async () => late.promise, overrides: {tick: swallowing}})
+      loop.start()
+      await vi.advanceTimersByTimeAsync(INTERVAL_MS + TICK_TIMEOUT_MS)
+      expect(logger.warning).toHaveBeenCalledTimes(1)
+
+      // #when the abandoned renewal fails and the body swallows it
+      late.resolve(err(new Error('late rejection')))
+      await vi.advanceTimersByTimeAsync(0)
+
+      // #then only the timeout's failure stands
+      expect(logger.warning).toHaveBeenCalledTimes(1)
+      expect(stopFailure(await loop.stop()).message).toBe('Lease renewal exceeded 10000ms')
     })
   })
 })
