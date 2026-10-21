@@ -83,8 +83,10 @@ function createRunState(): RunState {
   }
 }
 
-function createHarness(script: Script = {}) {
+function createHarness(script: Script = {}, acquisitionToken?: string) {
   const trace: TraceEntry[] = []
+  /** The body of every lock PUT, in order. */
+  const lockBodies: string[] = []
   const counts = new Map<string, number>()
   // The RunState object's current ETag: reads return it, a successful default write advances it.
   let storedRunEtag = 'run-etag-0'
@@ -121,7 +123,8 @@ function createHarness(script: Script = {}) {
         ok({data: JSON.stringify(createRunState()), etag: storedRunEtag})
       return script.getObject === undefined ? fallback() : script.getObject(call, fallback)
     }),
-    conditionalPut: vi.fn<NonNullable<ObjectStoreAdapter['conditionalPut']>>(async (key, _data, options) => {
+    conditionalPut: vi.fn<NonNullable<ObjectStoreAdapter['conditionalPut']>>(async (key, data, options) => {
+      if (key === LOCK_KEY) lockBodies.push(data)
       trace.push({
         t: now(),
         op: 'conditionalPut',
@@ -164,6 +167,7 @@ function createHarness(script: Script = {}) {
     'lock-etag-0',
     'run-etag-0',
     logger,
+    ...(acquisitionToken === undefined ? [] : [acquisitionToken]),
   )
 
   /** Calls `stop()` and marks when it began and when it resolved. */
@@ -175,7 +179,7 @@ function createHarness(script: Script = {}) {
     })
   }
 
-  return {trace, controller, logger, stop, mark}
+  return {trace, lockBodies, controller, logger, stop, mark}
 }
 
 describe('gateway heartbeat golden traces', () => {
@@ -321,6 +325,39 @@ describe('gateway heartbeat golden traces', () => {
     if (result.success === true) throw new Error('expected a failed stop')
     expect(result.error.message).toBe('first renewal failed')
     expect(result.error).toMatchObject({lockEtag: 'lock-etag-0', tickPending: false})
+  })
+
+  it('keeps the acquisition token in the stored lock record across renewals', async () => {
+    // #given a heartbeat constructed with a token
+    const {lockBodies, controller, stop} = createHarness({}, 'token-0001-abcd')
+    controller.start()
+
+    // #when two ticks elapse
+    await vi.advanceTimersByTimeAsync(INTERVAL_MS * 2)
+    await stop()
+
+    // #then every stored lock record carries it, next to the unchanged holder fields
+    expect(lockBodies).toHaveLength(2)
+    for (const body of lockBodies) {
+      expect(JSON.parse(body)).toMatchObject({
+        holder_id: 'gateway-1',
+        run_id: 'run-1',
+        surface: 'discord',
+        acquisition_token: 'token-0001-abcd',
+      })
+    }
+  })
+
+  it('stores no token field when the heartbeat was built without one', async () => {
+    // #given
+    const {lockBodies, controller} = createHarness()
+    controller.start()
+
+    // #when
+    await vi.advanceTimersByTimeAsync(INTERVAL_MS)
+
+    // #then
+    expect(Object.keys(JSON.parse(lockBodies[0] ?? '{}') as object)).not.toContain('acquisition_token')
   })
 
   it('bounds a hung renewal at the 10 s tick timeout: every interval starts a new tick against the unchanged ETag', async () => {

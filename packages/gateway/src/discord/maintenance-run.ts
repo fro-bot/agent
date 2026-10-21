@@ -63,8 +63,11 @@ export function acquireMaintenanceRun(opts: {
   const runId = crypto.randomUUID()
 
   return Effect.gen(function* () {
+    // Minted per acquisition: the holder fields repeat across this gateway's runs, so renewal adoption matches on it.
+    const acquisitionToken = crypto.randomUUID()
     const lockResult = yield* acquireLockEffect(coordinationConfig, repo, identity, 'discord', runId, coordLogger, {
       confirmExpiredHolder: checkRepoQuiescence,
+      acquisitionToken,
     }).pipe(Effect.either)
     if (lockResult._tag === 'Left') {
       return {outcome: 'error' as const, message: lockResult.left.message}
@@ -107,6 +110,7 @@ export function acquireMaintenanceRun(opts: {
       lockEtag,
       runEtag,
       coordLogger,
+      acquisitionToken,
     )
     heartbeat.start()
     let stopped = false

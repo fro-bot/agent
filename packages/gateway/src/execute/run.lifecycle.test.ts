@@ -99,6 +99,34 @@ describe('runMention', () => {
       expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
     })
 
+    it('mints one acquisition token per run and gives it to both the lock and the heartbeat', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+      mockCreateDiscordStreamSink.mockReturnValue({
+        append: vi.fn(),
+        flush: vi.fn().mockResolvedValue(undefined),
+        buffered: vi.fn().mockReturnValue(''),
+        markVisibleOutputSent: vi.fn(),
+        markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
+        hasVisibleOutput: vi.fn().mockReturnValue(false),
+      })
+
+      // #when two runs go through
+      await runMention(makeMessage(), makeBinding(), makeDeps())
+      await runMention(makeMessage(), makeBinding(), makeDeps())
+
+      // #then each run's heartbeat gets the token its lock was acquired with, and the two runs' tokens differ
+      const acquired = mockRuntime.acquireLock.mock.calls.map(
+        (call: unknown[]) => (call[6] as {acquisitionToken?: string}).acquisitionToken,
+      )
+      const heartbeats = mockRuntime.createHeartbeatController.mock.calls.map((call: unknown[]) => call[7])
+      expect(acquired).toHaveLength(2)
+      expect(acquired[0]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
+      expect(heartbeats).toEqual(acquired)
+      expect(acquired[1]).not.toBe(acquired[0])
+    })
+
     it('starts and stops heartbeat around execution', async () => {
       // #given
       const {runMention} = await import('./run.js')

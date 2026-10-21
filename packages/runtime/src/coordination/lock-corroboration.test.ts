@@ -156,6 +156,39 @@ describe('acquireLock — corroborated expired takeover', () => {
     expect(confirm).toHaveBeenCalledOnce()
   })
 
+  it('takes over an expired token-bearing record exactly as before, and writes the successor its own token', async () => {
+    // #given an expired gateway record that carries a per-acquisition token
+    const store = createMemoryStore(lockRecord({acquisition_token: 'old-token-0001'}))
+    const confirm = vi.fn<ConfirmExpiredHolder>(async () => clear())
+
+    // #when a successor acquires with its own token
+    const result = await acquireLock(configFor(store.adapter), 'owner/repo', 'g2', 'discord', 'run-2', createLogger(), {
+      confirmExpiredHolder: confirm,
+      acquisitionToken: 'new-token-0002',
+    })
+
+    // #then the token changes nothing about the policy: same corroboration, same ETag precondition
+    expect(result.success === true ? result.data.outcome : null).toBe('acquired')
+    expect(confirm).toHaveBeenCalledOnce()
+    expect(store.puts.at(-1)?.options).toEqual({ifMatch: 'etag-0'})
+    expect(store.current()).toMatchObject({run_id: 'run-2', acquisition_token: 'new-token-0002'})
+  })
+
+  it('still blocks a token-bearing expired record when the checker reports busy', async () => {
+    // #given
+    const store = createMemoryStore(lockRecord({acquisition_token: 'old-token-0001'}))
+
+    // #when
+    const result = await acquireLock(configFor(store.adapter), 'owner/repo', 'g2', 'discord', 'run-2', createLogger(), {
+      confirmExpiredHolder: async () => busy(['s1']),
+      acquisitionToken: 'new-token-0002',
+    })
+
+    // #then
+    expect(result.success === true ? result.data.outcome : null).toBe('expired-holder')
+    expect(store.current()?.acquisition_token).toBe('old-token-0001')
+  })
+
   it('stamps the replacement acquired_at after confirmation completes', async () => {
     // #given — confirmation takes 3s
     const store = createMemoryStore(lockRecord())

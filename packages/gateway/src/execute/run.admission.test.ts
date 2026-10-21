@@ -1564,7 +1564,12 @@ describe('early-abort gates terminalize to FAILED', () => {
     await awaitLaunchWorkRun(launchWork, request, deps)
 
     // #then — checker passed through as the corroborator
-    expect(mockRuntime.acquireLock.mock.calls[0]?.[6]).toEqual({confirmExpiredHolder: checkRepoQuiescence})
+    expect(mockRuntime.acquireLock.mock.calls[0]?.[6]).toEqual({
+      confirmExpiredHolder: checkRepoQuiescence,
+      acquisitionToken: expect.stringMatching(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+      ) as string,
+    })
     // #and — distinct reply, holder not leaked, run terminalized, no execution
     const sends = request._replySink._sends
     expect(sends.some(s => s.content.includes('may still be running'))).toBe(true)

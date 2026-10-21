@@ -114,6 +114,8 @@ export function createHeartbeatController(
   lockEtag: string,
   runEtag: string,
   logger: HeartbeatLogger,
+  /** The per-acquisition token `acquireLock` wrote; every renewal record keeps it. Omit for a lock acquired without one. */
+  acquisitionToken?: string,
 ): HeartbeatController {
   const runKey = getRunKey(config, identity, repo, runId)
   if (runKey.success === false) {
@@ -175,6 +177,7 @@ export function createHeartbeatController(
         acquired_at: nextState.last_heartbeat,
         ttl_seconds: config.lockTtlSeconds,
         run_id: nextState.run_id,
+        ...(acquisitionToken === undefined ? {} : {acquisition_token: acquisitionToken}),
       })
       // Stop began, or this attempt timed out, before the write: a late write would change the run ETag after the
       // caller has already tried to settle it.

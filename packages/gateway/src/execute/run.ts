@@ -893,8 +893,11 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
     // ── Acquire repo lock ─────────────────────────────────────────────────────────────────────────
 
+    // Minted per acquisition: the holder fields repeat across this gateway's runs, so renewal adoption matches on it.
+    const acquisitionToken = crypto.randomUUID()
     const lockResult = await acquireLock(coordinationConfig, repo, identity, request.surface, runId, coordLogger, {
       confirmExpiredHolder: deps.checkRepoQuiescence,
+      acquisitionToken,
     })
 
     if (lockResult.success === false) {
@@ -979,6 +982,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       lockEtag,
       runEtag,
       coordLogger,
+      acquisitionToken,
     )
     heartbeat.start()
 

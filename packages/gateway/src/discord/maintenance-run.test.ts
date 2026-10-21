@@ -157,7 +157,33 @@ describe('acquireMaintenanceRun', () => {
     )
 
     // #then
-    expect(mockAcquireLockEffect.mock.calls[0]?.[6]).toEqual({confirmExpiredHolder: CHECK})
+    expect(mockAcquireLockEffect.mock.calls[0]?.[6]).toEqual({
+      confirmExpiredHolder: CHECK,
+      acquisitionToken: expect.stringMatching(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+      ) as string,
+    })
+  })
+
+  it('gives the heartbeat the token the lock was acquired with', async () => {
+    // #given — default mocks
+
+    // #when
+    await Effect.runPromise(
+      acquireMaintenanceRun({
+        coordinationConfig: CONFIG,
+        identity: 'gw',
+        repo: 'acme/widget',
+        kind: 'recover-checkout',
+        logger: LOGGER,
+        checkRepoQuiescence: CHECK,
+      }),
+    )
+
+    // #then
+    const acquireOptions = mockAcquireLockEffect.mock.calls[0]?.[6] as {acquisitionToken: string}
+    const {createHeartbeatController} = await import('../runtime-effect.js')
+    expect(vi.mocked(createHeartbeatController).mock.calls[0]?.[7]).toBe(acquireOptions.acquisitionToken)
   })
 
   it.each([

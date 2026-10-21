@@ -121,6 +121,20 @@ function deferred<T>(): Deferred<T> {
   return {promise, resolve}
 }
 
+function buildWithToken(acquisitionToken?: string) {
+  const adapter = createStoreAdapter()
+  return createHeartbeatController(
+    createCoordinationConfig(adapter),
+    'coordination',
+    'owner/repo',
+    'run-1',
+    'lock-etag-1',
+    'run-etag-0',
+    createLogger(),
+    ...(acquisitionToken === undefined ? [] : [acquisitionToken]),
+  )
+}
+
 function buildWithLogger(adapterOverrides: Parameters<typeof createStoreAdapter>[0] = {}) {
   const logger = createLogger()
   const adapter = createStoreAdapter(adapterOverrides)
@@ -1312,6 +1326,35 @@ describe('heartbeat controller', () => {
         runState: createRunState(),
         lockEtag: 'lock-etag-3',
       })
+    })
+  })
+
+  describe('acquisition token', () => {
+    it('carries the token on every renewal record', async () => {
+      // #given
+      const controller = buildWithToken('token-0001-abcd')
+      controller.start()
+
+      // #when two ticks elapse
+      await vi.advanceTimersByTimeAsync(60_000)
+
+      // #then
+      expect(renewLeaseMock).toHaveBeenCalledTimes(2)
+      for (const call of renewLeaseMock.mock.calls) {
+        expect(call[2]).toMatchObject({holder_id: 'gateway-1', run_id: 'run-1', acquisition_token: 'token-0001-abcd'})
+      }
+    })
+
+    it('writes no token field when none was given, so the record is unchanged for existing callers', async () => {
+      // #given
+      const controller = buildWithToken()
+      controller.start()
+
+      // #when
+      await vi.advanceTimersByTimeAsync(30_000)
+
+      // #then
+      expect(Object.keys(renewLeaseMock.mock.calls[0]?.[2] as object)).not.toContain('acquisition_token')
     })
   })
 })
