@@ -55,7 +55,7 @@ export interface HeartbeatStopError extends Error {
   readonly runEtag: string
   /**
    * True when the grace period elapsed while a tick was still in flight. That tick may yet renew the lock or
-   * write the RunState, so neither ETag the caller holds can be trusted to be current.
+   * write the RunState (until its own tick timeout), so neither ETag the caller holds can be trusted to be current.
    */
   readonly tickPending: boolean
 }
@@ -74,16 +74,18 @@ export interface HeartbeatController {
    *
    * One `HEARTBEAT_STOP_GRACE_MS` budget covers the whole call: the wait on an in-flight tick and the snapshot read
    * share it, so `stop()` resolves within about one grace period. If a tick is still pending when it elapses,
-   * returns a `tickPending` error without reading a snapshot: the tick keeps running in the background and the
-   * caller's ETags may be stale, so it must settle best-effort (a conditional write or release that loses the race
+   * returns a `tickPending` error without reading a snapshot: its request is aborted at that point, but the tick
+   * stays live until its own tick timeout and the caller's ETags may be stale, so it must settle best-effort (a conditional write or release that loses the race
    * fails safely). If the snapshot read is still pending, returns an error with `tickPending` false and the ETags
    * confirmed so far.
    *
    * `stop()` first marks the controller stopping, so a tick that has not yet started its lock renewal or its
-   * RunState write skips that I/O. A request already in flight when `stop()` began can still land: a late renewal
-   * restarts the lease TTL and a late RunState write changes the run ETag. Requests are aborted when the tick timeout
-   * or this budget runs out (not when `stop()` begins), which narrows that window but cannot close it: an aborted PUT
-   * can still commit server-side.
+   * RunState write skips that I/O, and no RunState read starts after `stop()`. `stop()` does not supersede a tick: a
+   * request already in flight when it began can still land, and a result that arrives before that tick's own timeout
+   * is applied (a late renewal restarts the lease TTL, a late RunState write changes the run ETag). Requests are
+   * aborted when the tick timeout or this budget runs out, never when `stop()` begins; that narrows the window but
+   * cannot close it, because a PUT aborted on the client can still commit server-side. A result that arrives after
+   * its tick timed out is ignored.
    *
    * If a heartbeat tick failed since the last successful tick, returns the tick error. Every failure carries
    * `lockEtag`, the freshest lock ETag a renewal confirmed, so a RunState write that failed after a successful

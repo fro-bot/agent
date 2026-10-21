@@ -317,7 +317,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 
 ### PR-B: gateway on the loop (tick timeout, abort)
 
-- [ ] **Unit 5: Gateway heartbeat as a RunState layer; abort on for both surfaces**
+- [x] **Unit 5: Gateway heartbeat as a RunState layer; abort on for both surfaces**
 
 **Goal:**
 
@@ -376,7 +376,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 - **`dist/`:** confirm whether `dist/` changes.
 - **PR note:** an aborted PUT that committed server-side leaves a stale ETag until PR-C's adoption lands. Release 412s and the lease lapses by TTL, as it does today.
 
-- [ ] **Unit 6: Docs for the shared loop**
+- [x] **Unit 6: Docs for the shared loop**
 
 **Goal:** Docs describe the shared loop and the gateway tick timeout.
 
