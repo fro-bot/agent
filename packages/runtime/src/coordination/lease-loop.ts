@@ -48,6 +48,20 @@ export interface LeaseLoopOptions<F = void> {
   readonly tick: (ctx: LeaseTickContext) => Promise<void>
   /** Runs inside the stop budget once the last tick has settled without failing. Reject to report a failure. */
   readonly finalize?: (signal?: AbortSignal) => Promise<F>
+  /**
+   * Recovers a renewal whose outcome was lost: S3 may have committed it even though the call failed, was aborted or
+   * outlived the tick timeout, which leaves the loop holding a dead ETag (every later renewal would fail its
+   * `If-Match`). Reads the stored lock and resolves with its ETag when the record is OURS, else `null`; the surface
+   * owns what "ours" means (holder, run and acquisition token), so a successor's record is never adopted. Never needs
+   * to reject: a rejection counts as `null`.
+   *
+   * The loop calls it (a) inside the tick, after a renewal fails, while the attempt is current and stop has not
+   * begun, so the tick timeout and its signal bound the read; and (b) once from `stop()` when the last tick ended
+   * with an unconfirmed renewal, within what is left of the stop budget. It adopts the ETag only when it differs
+   * from the one held. In a tick, adoption clears the failure (`hasFailed()` is false) and leaves
+   * `continuityUnverified()` latched; at stop the error is still returned, now carrying the adopted `lockEtag`.
+   */
+  readonly adopt?: (signal?: AbortSignal) => Promise<{readonly etag: string} | null>
   readonly logger: Pick<Logger, 'debug' | 'info' | 'warning'>
   /** Fields added to every log line, e.g. `{repo, holderId}`. */
   readonly logContext?: Readonly<Record<string, unknown>>
@@ -107,7 +121,9 @@ interface Attempt {
    * may catch the failure and return normally, and the attempt must still end as failed unless a later renewal
    * confirms. `message` is the log line for it: `err` result and thrown renewal are logged differently.
    */
-  renewalFailure: {readonly error: Error; readonly message: string} | null
+  renewalFailure: {readonly error: Error; readonly message: string; adopted: boolean} | null
+  /** True once `renew` was called: the lock may have been rewritten whatever the call reported. */
+  renewalSent: boolean
   timer: ReturnType<typeof setTimeout> | undefined
 }
 
@@ -128,13 +144,17 @@ function toError(value: unknown): Error {
  * Surfaces inject how they renew (`renew`) and what else a tick does (`tick`, `finalize`); takeover policy stays theirs.
  */
 export function createLeaseLoop<F = void>(options: LeaseLoopOptions<F>): LeaseLoop<F> {
-  const {renew, intervalMs, tickTimeoutMs, stopBudgetMs, unref, abortOnDeadline, tick, finalize, logger} = options
+  const {renew, intervalMs, tickTimeoutMs, stopBudgetMs, unref, abortOnDeadline, tick, finalize, adopt, logger} =
+    options
   const logContext = options.logContext ?? {}
 
   let lockEtag = options.initialEtag
   // The latest finished attempt's failure, or null. One field, so "failed without an error" cannot be represented.
   let failure: Error | null = null
   let continuityUnverified = false
+  // True after an attempt ended with a renewal that was sent but never confirmed: the stored ETag may differ from the
+  // one held. Cleared by a confirmed renewal or an adoption.
+  let lockEtagUncertain = false
   let running = false
   let stopping = false
   let intervalHandle: ReturnType<typeof setInterval> | null = null
@@ -152,18 +172,57 @@ export function createLeaseLoop<F = void>(options: LeaseLoopOptions<F>): LeaseLo
     failure = error
     // A failure after a confirmed renewal says nothing against lock coverage.
     if (attempt.renewalConfirmed === false) continuityUnverified = true
+    // A renewal that was sent and never confirmed may still have committed.
+    if (attempt.renewalSent && attempt.renewalConfirmed === false) lockEtagUncertain = true
   }
 
   /**
    * Logging must never decide whether an attempt ends: a throwing logger would otherwise leave the in-flight slot taken
-   * forever, or escape a timer callback or a promise handler. Called only after the attempt is concluded.
+   * forever, or escape a timer callback, a promise handler or `stop()`. Called only after the attempt is concluded.
    */
-  const logFailure = (message: string, error: Error): void => {
+  const logSafely = (level: 'debug' | 'info' | 'warning', message: string, context: Record<string, unknown>): void => {
     try {
-      logger.warning(message, {...logContext, error: error.message})
+      logger[level](message, {...logContext, ...context})
     } catch {
       // Nowhere left to report a logger that cannot log.
     }
+  }
+  const logFailure = (message: string, error: Error): void => {
+    logSafely('warning', message, {error: error.message})
+  }
+
+  /** Runs the surface's adoption read. Never rejects: a failed read adopts nothing. */
+  const readStoredLock = async (signal: AbortSignal | undefined): Promise<{readonly etag: string} | null> => {
+    if (adopt === undefined) return null
+    try {
+      return await adopt(signal)
+    } catch (error) {
+      logSafely('debug', 'Lease adoption read failed', {error: toError(error).message})
+      return null
+    }
+  }
+
+  /** Takes a stored ETag that is ours and differs from the one held. */
+  const takeStoredEtag = (stored: {readonly etag: string} | null): boolean => {
+    if (stored === null || stored.etag === lockEtag) return false
+    lockEtag = stored.etag
+    lockEtagUncertain = false
+    logSafely('info', 'Coordination lease ETag adopted after a renewal outcome was lost', {etag: stored.etag})
+    return true
+  }
+
+  /** Ends an attempt that failed: an adopted lost renewal clears the failure, anything else records and logs it. */
+  const endFailed = (attempt: Attempt, error: Error, message: string, conclude: () => void): void => {
+    const lost = attempt.renewalFailure
+    if (lost !== null && lost.adopted && lost.error === error) {
+      failure = null
+      if (attempt.renewalConfirmed === false) continuityUnverified = true
+      conclude()
+      return
+    }
+    recordFailure(attempt, error)
+    conclude()
+    logFailure(message, error)
   }
 
   const runAttempt = (): void => {
@@ -181,6 +240,7 @@ export function createLeaseLoop<F = void>(options: LeaseLoopOptions<F>): LeaseLo
       concluded: false,
       renewalConfirmed: false,
       renewalFailure: null,
+      renewalSent: false,
       timer: undefined,
     }
     inFlight = attempt
@@ -217,18 +277,33 @@ export function createLeaseLoop<F = void>(options: LeaseLoopOptions<F>): LeaseLo
         // Nothing may start once stop has begun or the attempt was abandoned: a late renewal would restart the TTL.
         if (stopping || attempt.superseded) return 'skipped'
 
+        // Adopts the stored ETag when the lost renewal turns out to be ours, before the failure reaches the body. Only
+        // while this attempt is current and stop has not begun: the stop path does its own read.
+        const adoptLostRenewal = async (): Promise<void> => {
+          const lost = attempt.renewalFailure
+          if (adopt === undefined || lost === null || stopping || attempt.superseded) return
+          const stored = await readStoredLock(controller?.signal)
+          // A read that resolves after the tick timed out is dropped, like any other late result.
+          if (attempt.superseded === false && takeStoredEtag(stored)) lost.adopted = true
+        }
+
         let renewed: LeaseRenewal
+        attempt.renewalSent = true
         try {
           renewed =
             controller === undefined ? await renew(record, lockEtag) : await renew(record, lockEtag, controller.signal)
         } catch (error) {
           const cause = toError(error)
-          if (attempt.superseded === false) attempt.renewalFailure = {error: cause, message: RENEWAL_THREW}
+          if (attempt.superseded === false) {
+            attempt.renewalFailure = {error: cause, message: RENEWAL_THREW, adopted: false}
+            await adoptLostRenewal()
+          }
           throw cause
         }
         if (renewed.success === false) {
           if (attempt.superseded === false) {
-            attempt.renewalFailure = {error: renewed.error, message: RENEWAL_FAILED}
+            attempt.renewalFailure = {error: renewed.error, message: RENEWAL_FAILED, adopted: false}
+            await adoptLostRenewal()
           }
           throw renewed.error
         }
@@ -236,6 +311,7 @@ export function createLeaseLoop<F = void>(options: LeaseLoopOptions<F>): LeaseLo
         if (attempt.superseded) return 'skipped'
 
         lockEtag = renewed.data.etag
+        lockEtagUncertain = false
         attempt.renewalConfirmed = true
         // A confirmed renewal supersedes an earlier failure the body caught: the tick's last outcome is what counts.
         attempt.renewalFailure = null
@@ -251,9 +327,7 @@ export function createLeaseLoop<F = void>(options: LeaseLoopOptions<F>): LeaseLo
         // A later confirmed renewal clears it (see `renewLock`). `recordFailure` latches only if none confirmed this tick.
         const renewalFailure = attempt.renewalFailure
         if (renewalFailure !== null) {
-          recordFailure(attempt, renewalFailure.error)
-          conclude()
-          logFailure(renewalFailure.message, renewalFailure.error)
+          endFailed(attempt, renewalFailure.error, renewalFailure.message, conclude)
           return
         }
         // Only a confirmed renewal is evidence the lock is held; a tick that skipped its I/O proves nothing.
@@ -269,9 +343,7 @@ export function createLeaseLoop<F = void>(options: LeaseLoopOptions<F>): LeaseLo
             : attempt.renewalConfirmed
               ? TICK_FAILED_AFTER_RENEWAL
               : RENEWAL_THREW
-        recordFailure(attempt, cause)
-        conclude()
-        logFailure(message, cause)
+        endFailed(attempt, cause, message, conclude)
       },
     )
   }
@@ -321,7 +393,19 @@ export function createLeaseLoop<F = void>(options: LeaseLoopOptions<F>): LeaseLo
           }
         }
 
-        if (failure != null) return err(toStopError(failure, false))
+        if (failure != null) {
+          // The last tick ended with a renewal that may have committed: look for it before reporting the ETag.
+          if (lockEtagUncertain) {
+            const readController = abortOnDeadline ? new AbortController() : undefined
+            const read = await Promise.race([readStoredLock(readController?.signal), budget])
+            if (read === BUDGET_ELAPSED) {
+              readController?.abort(new Error('Lease stop budget elapsed'))
+            } else {
+              takeStoredEtag(read)
+            }
+          }
+          return err(toStopError(failure, false))
+        }
         if (finalize === undefined) return ok({lockEtag, final: undefined})
 
         const finalizeController = abortOnDeadline ? new AbortController() : undefined

@@ -1,5 +1,6 @@
 import type {
   CoordinationConfig,
+  LockOwnership,
   LockRecord,
   LockScope,
   ObjectStoreConfig,
@@ -12,6 +13,7 @@ import * as core from '@actions/core'
 import {
   acquireLock,
   createLeaseLoop,
+  createLockAdopter,
   createS3Adapter,
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   DEFAULT_LOCK_TTL_SECONDS,
@@ -161,6 +163,21 @@ export async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, mes
 }
 
 /**
+ * Whether a stored Action lock record is the one this acquisition wrote. The holder fields repeat across acquisitions
+ * (two calls of one reusable workflow share run, attempt, job and matrix), so the per-acquisition token must match
+ * too; a record without one (an older build's) is never ours. `holder_job` matches when absent on both sides.
+ */
+function actionOwnsRecord(holderId: string, holderJob: string | undefined, acquisitionToken: string) {
+  return (stored: LockRecord): LockOwnership => {
+    if (stored.holder_id !== holderId) return {owned: false, reason: 'holder-mismatch'}
+    if (stored.holder_job !== holderJob) return {owned: false, reason: 'job-mismatch'}
+    if (stored.acquisition_token === undefined) return {owned: false, reason: 'no-token'}
+    if (stored.acquisition_token !== acquisitionToken) return {owned: false, reason: 'token-mismatch'}
+    return {owned: true}
+  }
+}
+
+/**
  * The Action's view over the shared runtime lease loop. The loop owns scheduling, the per-renewal timeout, the overlap
  * guard, the stop budget and the failure state; this supplies the Action's renewal (`renewLease` on its own lock scope)
  * and the record it rewrites on every tick.
@@ -187,6 +204,14 @@ function createLeaseController(
     // early-exit path that forgets to.
     unref: true,
     abortOnDeadline: true,
+    adopt: createLockAdopter({
+      config,
+      repo,
+      scope: ACTION_LOCK_SCOPE,
+      owns: actionOwnsRecord(holderId, holderJob, acquisitionToken),
+      logger,
+      logContext: {repo, holderId},
+    }),
     tick: async ctx => {
       const lockRecord: LockRecord = {
         repo,

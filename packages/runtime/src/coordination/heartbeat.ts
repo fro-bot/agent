@@ -1,11 +1,13 @@
 import type {Logger} from '../shared/logger.js'
 import type {Result} from '../shared/types.js'
-import type {CoordinationConfig, RunState} from './types.js'
+import type {LockOwnership} from './lock-adoption.js'
+import type {CoordinationConfig, LockRecord, RunState} from './types.js'
 
 import {buildObjectStoreKey} from '../object-store/key-builder.js'
 import {err, ok} from '../shared/types.js'
 import {requireConditionalPut, requireGetObject, resolveGetObject} from './adapter-guards.js'
 import {createLeaseLoop} from './lease-loop.js'
+import {createLockAdopter} from './lock-adoption.js'
 import {renewLease} from './lock.js'
 import {parseRunState, RUN_STATE_TAG} from './run-state.js'
 
@@ -106,6 +108,23 @@ function getRunKey(config: CoordinationConfig, identity: string, repo: string, r
   return ok(key.data)
 }
 
+/**
+ * Whether a stored gateway lock record is the one this acquisition wrote. The gateway's holder id is its identity and
+ * repeats across runs, so the run and the per-acquisition token must match too; a record without a token (an older
+ * build's) is never ours.
+ */
+function gatewayOwnsRecord(holderId: () => string | undefined, runId: string, acquisitionToken: string) {
+  return (stored: LockRecord): LockOwnership => {
+    const expectedHolder = holderId()
+    if (expectedHolder === undefined) return {owned: false, reason: 'no-renewal-sent'}
+    if (stored.holder_id !== expectedHolder) return {owned: false, reason: 'holder-mismatch'}
+    if (stored.run_id !== runId) return {owned: false, reason: 'run-mismatch'}
+    if (stored.acquisition_token === undefined) return {owned: false, reason: 'no-token'}
+    if (stored.acquisition_token !== acquisitionToken) return {owned: false, reason: 'token-mismatch'}
+    return {owned: true}
+  }
+}
+
 export function createHeartbeatController(
   config: CoordinationConfig,
   identity: string,
@@ -126,6 +145,8 @@ export function createHeartbeatController(
   // can advance one without the other.
   let currentRunEtag = runEtag
   let stopRequested = false
+  // The holder the last renewal record named, which is what an adopted record must carry: the RunState owns it.
+  let renewalHolderId: string | undefined
 
   const loopLogger: Pick<Logger, 'debug' | 'info' | 'warning'> = {
     debug: (message, context) => logger.debug(message, context),
@@ -157,6 +178,18 @@ export function createHeartbeatController(
     // A daemon: nothing here may be left to keep the process alive, and nothing needs to be told to let go of it.
     unref: false,
     abortOnDeadline: true,
+    // Without a token there is no way to tell this acquisition's record from a successor's, so nothing is adopted.
+    ...(acquisitionToken === undefined
+      ? {}
+      : {
+          adopt: createLockAdopter({
+            config,
+            repo,
+            owns: gatewayOwnsRecord(() => renewalHolderId, runId, acquisitionToken),
+            logger: loopLogger,
+            logContext: {repo, runId},
+          }),
+        }),
     logger: loopLogger,
     logContext: {repo, runId},
     tick: async ctx => {
@@ -165,6 +198,7 @@ export function createHeartbeatController(
 
       const current = await readRunState(ctx.signal)
       const nextState: RunState = {...current.state, last_heartbeat: new Date().toISOString()}
+      renewalHolderId = nextState.holder_id
 
       // Renew the lock lease BEFORE writing the heartbeat. If renewal fails, the heartbeat timestamp stays stale so
       // findStaleRuns correctly flags this run. The reverse order (heartbeat first, lease second) causes split-brain:

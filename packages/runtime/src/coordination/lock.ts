@@ -493,12 +493,17 @@ export interface ForceReleaseStaleLockOptions {
   readonly confirmExpiredHolder?: ConfirmExpiredHolder
 }
 
-/** Reads the current lock record and its ETag. `ok(null)` means the lock does not exist. */
-async function readLockRecord(
+/**
+ * Reads the current lock record and its ETag. `ok(null)` means the lock does not exist. `signal` aborts the read; an
+ * aborted read resolves to `err`.
+ */
+export async function readLock(
   config: CoordinationConfig,
   repo: string,
+  scope: LockScope = 'repo',
+  signal?: AbortSignal,
 ): Promise<Result<{readonly record: LockRecord; readonly etag: string} | null, Error>> {
-  const key = getLockKey(config, repo)
+  const key = getLockKey(config, repo, scope)
   if (key.success === false) {
     return err(key.error)
   }
@@ -508,7 +513,8 @@ async function readLockRecord(
     return err(getObject.error)
   }
 
-  const fetched = await getObject.data(key.data)
+  // Without a signal the call keeps its original single-argument shape.
+  const fetched = await (signal === undefined ? getObject.data(key.data) : getObject.data(key.data, {signal}))
   if (fetched.success === false) {
     if (isNotFound(fetched.error) === true) {
       return ok(null)
@@ -543,7 +549,7 @@ export async function forceReleaseStaleLock(
 ): Promise<Result<ForceReleaseStaleLockResult, Error>> {
   const now = new Date()
 
-  const lockRead = await readLockRecord(config, repo)
+  const lockRead = await readLock(config, repo)
   if (lockRead.success === false) {
     logger.debug('forceReleaseStaleLock: failed to read lock record', {error: lockRead.error.message, repo})
     return ok({

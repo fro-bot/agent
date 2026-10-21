@@ -1167,6 +1167,53 @@ describe('heartbeat controller', () => {
       expect(adapter.conditionalPut).not.toHaveBeenCalled()
     })
 
+    it('recovers after the drop: the next tick adopts the stored ETag and the tick after renews against it', async () => {
+      // #given tick 1's renewal committed server-side (ETag lock-etag-committed) but timed out, so tick 2's renewal 412s
+      renewLeaseMock.mockReset()
+      renewLeaseMock
+        .mockImplementationOnce(async () => hang<Renewal>())
+        .mockResolvedValueOnce(err(new Error('412 precondition failed')))
+        .mockResolvedValue(ok({etag: 'lock-etag-after'}))
+      const lockRecord = {
+        repo: 'owner/repo',
+        holder_id: 'gateway-1',
+        surface: 'discord',
+        acquired_at: '2026-04-24T18:15:30.000Z',
+        ttl_seconds: 900,
+        run_id: 'run-1',
+        acquisition_token: 'token-0001-abcd',
+      }
+      const getObject = vi.fn<Required<ObjectStoreAdapter>['getObject']>(async key =>
+        key.endsWith('/locks/repo.json')
+          ? ok({data: JSON.stringify(lockRecord), etag: 'lock-etag-committed'})
+          : ok({data: JSON.stringify(createRunState()), etag: 'etag-current'}),
+      )
+      const controller = createHeartbeatController(
+        createCoordinationConfig(createStoreAdapter({getObject})),
+        'coordination',
+        'owner/repo',
+        'run-1',
+        'lock-etag-1',
+        'run-etag-0',
+        createLogger(),
+        'token-0001-abcd',
+      )
+      controller.start()
+
+      // #when tick 1 times out, tick 2 hits the dead ETag, and tick 3 runs
+      await vi.advanceTimersByTimeAsync(30_000 * 3)
+
+      // #then the renewals went out against the original ETag twice, then the adopted one
+      expect(renewLeaseMock.mock.calls.map(call => call[3] as string)).toEqual([
+        'lock-etag-1',
+        'lock-etag-1',
+        'lock-etag-committed',
+      ])
+      const stopped = await controller.stop()
+      expect(stopped.success).toBe(true)
+      expect(stopped.success ? stopped.data.lockEtag : '').toBe('lock-etag-after')
+    })
+
     it('does not apply a RunState write that lands after its tick timed out', async () => {
       // #given
       const late = deferred<PutResult>()
