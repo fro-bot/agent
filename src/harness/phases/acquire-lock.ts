@@ -17,7 +17,6 @@ import {
   DEFAULT_LOCK_TTL_SECONDS,
   DEFAULT_PENDING_STALE_THRESHOLD_MS,
   DEFAULT_STALE_THRESHOLD_MS,
-  HEARTBEAT_STOP_GRACE_MS,
   isValidHolderJob,
   releaseLock,
   releaseLockIfHolder,
@@ -115,7 +114,7 @@ export interface LeaseController {
    */
   readonly currentEtag: () => string
   /**
-   * Stop the renewal timer and wait, up to `HEARTBEAT_STOP_GRACE_MS`, for any in-flight tick to
+   * Stop the renewal timer and wait, up to `STOP_GRACE_PERIOD_MS`, for any in-flight tick to
    * settle, so `hasFailed()` and `currentEtag()` reflect the final state before the caller acts
    * on them. A renewal that is still in flight past the grace period is left to finish on its
    * own (bounded by `RENEWAL_TIMEOUT_MS`) and `stop()` returns anyway -- cleanup's budget takes
@@ -134,6 +133,14 @@ export interface LeaseController {
  * refuses to overlap ticks while one is in flight.
  */
 const RENEWAL_TIMEOUT_MS = 10_000
+
+/**
+ * How long `stop()` waits for an in-flight renewal before giving up and returning anyway.
+ * Short relative to cleanup's overall budget -- it exists to let a normal (sub-second) tick
+ * settle so `currentEtag()` is fresh, not to guarantee freshness unconditionally. Deliberately its own constant, not
+ * the gateway heartbeat's: the two surfaces' budgets must be able to diverge.
+ */
+const STOP_GRACE_PERIOD_MS = 5_000
 
 /** Rejects with `message` if `promise` has not settled within `timeoutMs`; the underlying work is left to finish. */
 export async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
@@ -174,7 +181,7 @@ function createLeaseController(
     initialEtag,
     intervalMs: DEFAULT_HEARTBEAT_INTERVAL_MS,
     tickTimeoutMs: RENEWAL_TIMEOUT_MS,
-    stopBudgetMs: HEARTBEAT_STOP_GRACE_MS,
+    stopBudgetMs: STOP_GRACE_PERIOD_MS,
     // Never let these timers hold the Action's process open on their own -- the run always reaches runCleanup's
     // finally block, which calls stop() regardless of outcome, but unref is a defensive backstop against a future
     // early-exit path that forgets to.

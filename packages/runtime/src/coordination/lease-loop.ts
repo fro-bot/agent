@@ -75,7 +75,15 @@ export interface LeaseLoop<F = void> {
   readonly currentEtag: () => string
   /** True while the latest attempt that finished (or timed out) ended without a confirmed renewal or in a failure. */
   readonly hasFailed: () => boolean
-  /** Latches the first time an attempt ends without a confirmed renewal, or `stop()` leaves one pending. Never clears. */
+  /**
+   * Latches, and never clears, the first time lock coverage cannot be vouched for:
+   * - a renewal ended in `err` or a throw;
+   * - the body failed before the renewal was confirmed;
+   * - the tick timeout fired before the renewal was confirmed;
+   * - an attempt was still pending when `stop()`'s budget ran out.
+   * A failure or timeout after a confirmed renewal does not latch. A tick that skips its renewal (stopping or
+   * superseded) neither latches nor fails.
+   */
   readonly continuityUnverified: () => boolean
   readonly isRunning: boolean
 }
@@ -131,12 +139,23 @@ export function createLeaseLoop<F = void>(options: LeaseLoopOptions<F>): LeaseLo
   const toStopError = (cause: Error, tickPending: boolean): LeaseLoopStopError =>
     Object.assign(new Error(cause.message, {cause}), {lockEtag, tickPending})
 
-  /** Records how an attempt that was not superseded ended badly. */
-  const recordFailure = (attempt: Attempt, error: Error, message: string): void => {
+  /** Records how an attempt that was not superseded ended badly. State only: logging comes after the attempt ends. */
+  const recordFailure = (attempt: Attempt, error: Error): void => {
     failure = error
     // A failure after a confirmed renewal says nothing against lock coverage.
     if (attempt.renewalConfirmed === false) continuityUnverified = true
-    logger.warning(message, {...logContext, error: error.message})
+  }
+
+  /**
+   * Logging must never decide whether an attempt ends: a throwing logger would otherwise leave the in-flight slot taken
+   * forever, or escape a timer callback or a promise handler. Called only after the attempt is concluded.
+   */
+  const logFailure = (message: string, error: Error): void => {
+    try {
+      logger.warning(message, {...logContext, error: error.message})
+    } catch {
+      // Nowhere left to report a logger that cannot log.
+    }
   }
 
   const runAttempt = (): void => {
@@ -170,13 +189,15 @@ export function createLeaseLoop<F = void>(options: LeaseLoopOptions<F>): LeaseLo
     attempt.timer = setTimeout(() => {
       if (attempt.concluded) return
       attempt.superseded = true
-      const message = attempt.renewalConfirmed
-        ? `Lease tick exceeded ${tickTimeoutMs}ms`
-        : `Lease renewal exceeded ${tickTimeoutMs}ms`
-      const error = new Error(message)
-      recordFailure(attempt, error, attempt.renewalConfirmed ? TICK_FAILED_AFTER_RENEWAL : RENEWAL_THREW)
+      // Everything the log reads is captured before the attempt ends.
+      const confirmed = attempt.renewalConfirmed
+      const error = new Error(
+        confirmed ? `Lease tick exceeded ${tickTimeoutMs}ms` : `Lease renewal exceeded ${tickTimeoutMs}ms`,
+      )
+      recordFailure(attempt, error)
       controller?.abort(error)
       conclude()
+      logFailure(confirmed ? TICK_FAILED_AFTER_RENEWAL : RENEWAL_THREW, error)
     }, tickTimeoutMs)
     unrefTimer(attempt.timer)
 
@@ -220,8 +241,9 @@ export function createLeaseLoop<F = void>(options: LeaseLoopOptions<F>): LeaseLo
             : attempt.renewalConfirmed
               ? TICK_FAILED_AFTER_RENEWAL
               : RENEWAL_THREW
-        recordFailure(attempt, cause, message)
+        recordFailure(attempt, cause)
         conclude()
+        logFailure(message, cause)
       },
     )
   }
@@ -261,7 +283,6 @@ export function createLeaseLoop<F = void>(options: LeaseLoopOptions<F>): LeaseLo
           const winner = await Promise.race([pending.settled, budget])
           // The attempt may have concluded in the same turn the budget fired; only a still-open one is pending.
           if (winner === BUDGET_ELAPSED && pending.concluded === false) {
-            logger.debug('Lease tick still in flight after the stop budget', logContext)
             // An unresolved tick is itself a gap in coverage, not a pass.
             continuityUnverified = true
             pending.controller?.abort(new Error('Lease stop budget elapsed'))
@@ -278,7 +299,6 @@ export function createLeaseLoop<F = void>(options: LeaseLoopOptions<F>): LeaseLo
         const run = finalizeController === undefined ? finalize() : finalize(finalizeController.signal)
         const outcome = await Promise.race([run, budget])
         if (outcome === BUDGET_ELAPSED) {
-          logger.debug('Lease finalize still in flight after the stop budget', logContext)
           finalizeController?.abort(new Error('Lease stop budget elapsed'))
           return err(toStopError(new Error(`Lease finalize did not settle within ${stopBudgetMs}ms of stop`), false))
         }

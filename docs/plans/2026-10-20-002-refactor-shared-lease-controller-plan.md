@@ -159,12 +159,13 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
   - **`continuityUnverified` latches** when a tick ends without a confirmed renewal: a renewal failure, a body failure before the renewal, a timeout before the renewal confirms, or `tickPending` at stop. A body failure or timeout _after_ a confirmed renewal doesn't latch. The Action has no I/O after its renewal, so this matches its behaviour exactly.
 - **Stop.**
   - `stop()` sets stopping first. `start()` after `stop()` is a no-op.
-  - One timer covers the whole budget: wait for the in-flight tick, then run `finalize` with whatever is left, and clear the timer on every exit.
+  - One timer covers the whole budget: wait for the in-flight tick, then run `finalize` with whatever is left, and clear the budget timer on every exit.
   - **Never rejects.**
   - **Failure:** it returns `err` carrying the freshest confirmed lock ETag, `tickPending` and the last tick error when the in-flight tick is still pending, the last tick ended without a confirmed renewal, or `finalize` failed or ran out of budget.
 - **Timers.**
   - **`unref` coverage:** `unref` applies to every loop timer (interval, tick timeout and stop budget). The Action sets it; the gateway, a daemon, does not.
   - **Clearing:** the loop clears its timers on every exit. Today the Action's grace `delay` lingers for up to 5 s, unref'd. Clearing it can't be seen from outside, so the golden traces assert adapter calls and their ordering, not leftover timers.
+  - **Exception:** the in-flight attempt's own tick timeout stays armed after `stop()` gives up on a pending tick. It has to: the Action pins that an abandoned tick still times out and records its failure. It is unref'd on the Action. On the gateway, which does not unref, it would hold shutdown for up to the 10 s tick timeout; whether to keep that is a PR-B decision.
 - **Action composition.**
   - **Tick body:** renews the constant identity record, which carries `holder_job` and `acquisition_token`.
   - **Settings:** `unref: true`, tick timeout `RENEWAL_TIMEOUT_MS` (10 s), stop budget `HEARTBEAT_STOP_GRACE_MS` (5 s), and `abortOnDeadline: false` in PR-A, `true` in PR-B.
@@ -271,7 +272,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 
 **Test scenarios** (each one revert-checked):
 
-- **Stop budget:** one shared budget. The tick plus `finalize` resolve within about 5 s total, and every timer is cleared.
+- **Stop budget:** one shared budget. The tick plus `finalize` resolve within about 5 s total, and every loop timer is cleared, except the tick timeout of an attempt that `stop()` gave up on (see Timers).
 - **Never rejects:** `stop()` never rejects. A thrown error from `renew`, the body or `finalize` comes back as `err`.
 - **Stop errors:**
   - `stop()` returns the last tick's failure when no confirmed renewal followed it (mirrors `heartbeat.test.ts:374`).

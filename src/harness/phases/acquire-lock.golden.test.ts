@@ -654,4 +654,66 @@ describe('Action lease renewal golden traces', () => {
     expect(renewal.hasFailed()).toBe(true)
     expect(renewal.continuityUnverified?.()).toBe(true)
   })
+
+  it('stop with a tick pending: a renewal err that lands after stop returned but before the timeout IS applied (today)', async () => {
+    // #given stop returned with the first renewal still in flight
+    const lateRenewal = deferred<Awaited<PutResult>>()
+    const {renewal, logger, stop} = await startRenewal({
+      putScript: async (n, fallback) => (n === 1 ? lateRenewal.promise : fallback()),
+    })
+    await vi.advanceTimersByTimeAsync(DEFAULT_HEARTBEAT_INTERVAL_MS)
+    const stopped = stop()
+    await vi.advanceTimersByTimeAsync(STOP_GRACE_MS)
+    await stopped
+    expect(renewal.hasFailed()).toBe(false)
+    expect(logger.warning).not.toHaveBeenCalled()
+
+    // #when it fails at 36 s, inside its 10 s timeout
+    await vi.advanceTimersByTimeAsync(1_000)
+    lateRenewal.resolve(err(new Error('late renewal rejected')))
+    await vi.advanceTimersByTimeAsync(0)
+
+    // #then the failure lands on the controller even though stop already returned
+    expect(renewal.hasFailed()).toBe(true)
+    expect(renewal.continuityUnverified?.()).toBe(true)
+    expect(renewal.currentEtag()).toBe('"etag-0"')
+    expect(logger.warning).toHaveBeenCalledTimes(1)
+    expect(logger.warning).toHaveBeenCalledWith('Coordination lease renewal failed', {
+      repo: REPO,
+      holderId: HOLDER_ID,
+      error: 'late renewal rejected',
+    })
+
+    // #when its timeout would have elapsed
+    await vi.advanceTimersByTimeAsync(RENEWAL_TIMEOUT_MS)
+
+    // #then the settled attempt does not fail a second time
+    expect(logger.warning).toHaveBeenCalledTimes(1)
+  })
+
+  it('a renewal err that lands after the timeout changes nothing: no state, no log, no ETag', async () => {
+    // #given the first renewal timed out
+    const lateRenewal = deferred<Awaited<PutResult>>()
+    const {renewal, logger} = await startRenewal({
+      putScript: async (n, fallback) => (n === 1 ? lateRenewal.promise : fallback()),
+    })
+    await vi.advanceTimersByTimeAsync(DEFAULT_HEARTBEAT_INTERVAL_MS + RENEWAL_TIMEOUT_MS)
+    expect(renewal.hasFailed()).toBe(true)
+    expect(logger.warning).toHaveBeenCalledTimes(1)
+
+    // #when the abandoned renewal then fails
+    lateRenewal.resolve(err(new Error('late renewal rejected')))
+    await vi.advanceTimersByTimeAsync(0)
+
+    // #then nothing moved
+    expect(renewal.hasFailed()).toBe(true)
+    expect(renewal.continuityUnverified?.()).toBe(true)
+    expect(renewal.currentEtag()).toBe('"etag-0"')
+    expect(logger.warning).toHaveBeenCalledTimes(1)
+    expect(logger.warning).toHaveBeenCalledWith('Coordination lease renewal threw', {
+      repo: REPO,
+      holderId: HOLDER_ID,
+      error: 'Lease renewal exceeded 10000ms',
+    })
+  })
 })

@@ -75,6 +75,34 @@ function setup(
   return {loop, renew, logger}
 }
 
+/** Collects process-level unhandled rejections for the duration of one test. */
+function trackUnhandledRejections() {
+  const seen: unknown[] = []
+  const listener = (reason: unknown): void => {
+    seen.push(reason)
+  }
+  process.on('unhandledRejection', listener)
+  return {
+    seen,
+    // Unhandled rejections surface on a real event-loop turn, which fake timers would hide.
+    settle: async () => {
+      vi.useRealTimers()
+      await new Promise(resolve => setTimeout(resolve, 5))
+      process.off('unhandledRejection', listener)
+    },
+  }
+}
+
+function throwingLogger() {
+  return {
+    debug: vi.fn(),
+    info: vi.fn(),
+    warning: vi.fn(() => {
+      throw new Error('log sink down')
+    }),
+  }
+}
+
 function stopFailure<T>(result: Result<T, LeaseLoopStopError>): LeaseLoopStopError {
   if (result.success) throw new Error('expected stop() to fail')
   return result.error
@@ -1158,6 +1186,159 @@ describe('createLeaseLoop', () => {
       // #then
       expect(created).toHaveLength(3)
       expect(unrefs.filter(spy => spy.mock.calls.length > 0)).toHaveLength(expectedUnrefs)
+    })
+  })
+
+  describe('stop logging', () => {
+    it('logs nothing when the budget runs out on a pending tick', async () => {
+      // #given a hung renewal
+      const {loop, logger} = setup({script: async () => hang()})
+      loop.start()
+      await vi.advanceTimersByTimeAsync(INTERVAL_MS)
+
+      // #when stop gives up on it
+      const stopped = loop.stop()
+      await vi.advanceTimersByTimeAsync(STOP_BUDGET_MS)
+      await stopped
+
+      // #then the surface's log output is exactly what its own code wrote
+      expect(logger.debug).not.toHaveBeenCalled()
+      expect(logger.info).not.toHaveBeenCalled()
+      expect(logger.warning).not.toHaveBeenCalled()
+    })
+
+    it('logs nothing when the budget runs out on finalize', async () => {
+      // #given
+      const {loop, logger} = setup({overrides: {finalize: async () => hang<string>()}})
+
+      // #when
+      const stopped = loop.stop()
+      await vi.advanceTimersByTimeAsync(STOP_BUDGET_MS)
+      await stopped
+
+      // #then
+      expect(logger.debug).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('a throwing logger', () => {
+    it('does not wedge the loop when a failed renewal cannot be logged', async () => {
+      // #given the first renewal is rejected and the logger throws on every warning
+      const tracker = trackUnhandledRejections()
+      const {loop, renew} = setup({
+        script: async n => (n === 1 ? err(new Error('renewal rejected')) : ok({etag: `etag-${n}`})),
+        overrides: {logger: throwingLogger()},
+      })
+      loop.start()
+
+      // #when the failing tick runs, then the next interval arrives
+      await vi.advanceTimersByTimeAsync(INTERVAL_MS)
+      await loop.settle()
+      expect(loop.hasFailed()).toBe(true)
+      await vi.advanceTimersByTimeAsync(INTERVAL_MS)
+
+      // #then a new tick ran and confirmed a renewal
+      expect(renew).toHaveBeenCalledTimes(2)
+      expect(loop.hasFailed()).toBe(false)
+      expect(loop.currentEtag()).toBe('etag-2')
+      await tracker.settle()
+      expect(tracker.seen).toEqual([])
+    })
+
+    it('does not wedge the loop when a body failure cannot be logged', async () => {
+      // #given the body throws on its first tick and the logger throws on every warning
+      const tracker = trackUnhandledRejections()
+      let ticks = 0
+      const {loop, renew} = setup({
+        overrides: {
+          logger: throwingLogger(),
+          tick: async ctx => {
+            ticks += 1
+            if (ticks === 1) throw new Error('read failed')
+            await ctx.renewLock(RECORD)
+          },
+        },
+      })
+      loop.start()
+
+      // #when
+      await vi.advanceTimersByTimeAsync(INTERVAL_MS * 2)
+
+      // #then the second tick ran
+      expect(renew).toHaveBeenCalledTimes(1)
+      expect(loop.hasFailed()).toBe(false)
+      expect(loop.continuityUnverified()).toBe(true)
+      await tracker.settle()
+      expect(tracker.seen).toEqual([])
+    })
+
+    it('does not wedge the loop, or throw out of the timer, when a tick timeout cannot be logged', async () => {
+      // #given the first renewal hangs and the logger throws on every warning
+      const tracker = trackUnhandledRejections()
+      const {loop, renew} = setup({
+        script: async n => (n === 1 ? hang() : ok({etag: `etag-${n}`})),
+        overrides: {logger: throwingLogger()},
+      })
+      loop.start()
+
+      // #when the timeout fires (an exception escaping the timer callback would reject this advance)
+      await vi.advanceTimersByTimeAsync(INTERVAL_MS + TICK_TIMEOUT_MS)
+
+      // #then the attempt was concluded despite the logger: settle resolves and the slot is free
+      await loop.settle()
+      expect(loop.hasFailed()).toBe(true)
+      expect(loop.continuityUnverified()).toBe(true)
+      await vi.advanceTimersByTimeAsync(INTERVAL_MS)
+      expect(renew).toHaveBeenCalledTimes(2)
+      expect(loop.currentEtag()).toBe('etag-2')
+      await tracker.settle()
+      expect(tracker.seen).toEqual([])
+    })
+  })
+
+  describe('a body that settles in the same timer advance as its timeout', () => {
+    it('concludes normally when the body settles first, and the timeout is a no-op', async () => {
+      // #given a renewal released by a timer created before the tick starts, so at the timeout's instant it fires first
+      const release = deferred<Result<{readonly etag: string}, Error>>()
+      setTimeout(() => {
+        release.resolve(ok({etag: 'etag-same-turn'}))
+      }, INTERVAL_MS + TICK_TIMEOUT_MS)
+      const {loop, logger} = setup({script: async () => release.promise})
+      loop.start()
+
+      // #when one advance covers both the release and the timeout
+      await vi.advanceTimersByTimeAsync(INTERVAL_MS + TICK_TIMEOUT_MS)
+
+      // #then the body concluded the attempt: no failure, no warning, no latch, ETag applied
+      expect(loop.currentEtag()).toBe('etag-same-turn')
+      expect(loop.hasFailed()).toBe(false)
+      expect(loop.continuityUnverified()).toBe(false)
+      expect(logger.warning).not.toHaveBeenCalled()
+      expect(vi.getTimerCount()).toBe(1)
+    })
+
+    it('times out when the timeout fires first, and the result that follows in the same advance is dropped', async () => {
+      // #given a renewal released by a timer created after the tick starts, so at the timeout's instant it fires second
+      const release = deferred<Result<{readonly etag: string}, Error>>()
+      const {loop, logger, renew} = setup({
+        script: async () => {
+          setTimeout(() => {
+            release.resolve(ok({etag: 'etag-same-turn'}))
+          }, TICK_TIMEOUT_MS)
+          return release.promise
+        },
+      })
+      loop.start()
+
+      // #when one advance covers both
+      await vi.advanceTimersByTimeAsync(INTERVAL_MS + TICK_TIMEOUT_MS)
+
+      // #then the timeout won
+      expect(renew).toHaveBeenCalledTimes(1)
+      expect(loop.currentEtag()).toBe('etag-0')
+      expect(loop.hasFailed()).toBe(true)
+      expect(loop.continuityUnverified()).toBe(true)
+      expect(logger.warning).toHaveBeenCalledTimes(1)
     })
   })
 })
