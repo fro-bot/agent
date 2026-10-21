@@ -1448,4 +1448,104 @@ describe('createLeaseLoop', () => {
       expect(stopFailure(await loop.stop()).message).toBe('Lease renewal exceeded 10000ms')
     })
   })
+
+  describe('a body that catches a renewal failure after a confirmed renewal', () => {
+    const swallowing = async (ctx: LeaseTickContext): Promise<void> => {
+      try {
+        await ctx.renewLock(RECORD)
+      } catch {
+        // Swallowed on purpose.
+      }
+    }
+
+    it('ends the tick failed when the last renewal returned err, without latching continuity', async () => {
+      // #given the first renewal confirms and the second returns err
+      const finalize = vi.fn(async () => 'snapshot')
+      const {loop, logger} = setup({
+        script: async n => (n === 1 ? ok({etag: 'etag-1'}) : err(new Error('second rejected'))),
+        overrides: {
+          finalize,
+          tick: async ctx => {
+            await ctx.renewLock(RECORD)
+            await swallowing(ctx)
+          },
+        },
+      })
+      loop.start()
+
+      // #when
+      await vi.advanceTimersByTimeAsync(INTERVAL_MS)
+      const failure = stopFailure(await loop.stop())
+
+      // #then a renewal already confirmed this tick, so coverage is not in doubt
+      expect(loop.hasFailed()).toBe(true)
+      expect(loop.continuityUnverified()).toBe(false)
+      expect(loop.currentEtag()).toBe('etag-1')
+      expect(failure.message).toBe('second rejected')
+      expect(finalize).not.toHaveBeenCalled()
+      expect(logger.warning).toHaveBeenCalledTimes(1)
+      expect(logger.warning).toHaveBeenCalledWith('Coordination lease renewal failed', {
+        ...CONTEXT,
+        error: 'second rejected',
+      })
+    })
+
+    it('ends the tick failed when the last renewal threw, without latching continuity', async () => {
+      // #given the first renewal confirms and the second rejects
+      const finalize = vi.fn(async () => 'snapshot')
+      const {loop, logger} = setup({
+        script: async n => (n === 1 ? ok({etag: 'etag-1'}) : Promise.reject(new Error('second threw'))),
+        overrides: {
+          finalize,
+          tick: async ctx => {
+            await ctx.renewLock(RECORD)
+            await swallowing(ctx)
+          },
+        },
+      })
+      loop.start()
+
+      // #when
+      await vi.advanceTimersByTimeAsync(INTERVAL_MS)
+      const failure = stopFailure(await loop.stop())
+
+      // #then
+      expect(loop.hasFailed()).toBe(true)
+      expect(loop.continuityUnverified()).toBe(false)
+      expect(failure.message).toBe('second threw')
+      expect(finalize).not.toHaveBeenCalled()
+      expect(logger.warning).toHaveBeenCalledTimes(1)
+      expect(logger.warning).toHaveBeenCalledWith('Coordination lease renewal threw', {
+        ...CONTEXT,
+        error: 'second threw',
+      })
+    })
+
+    it('comes out healthy when a third renewal confirms after the caught failure', async () => {
+      // #given success, caught failure, success
+      const finalize = vi.fn(async () => 'snapshot')
+      const {loop, logger} = setup({
+        script: async n => (n === 2 ? err(new Error('middle rejected')) : ok({etag: `etag-${n}`})),
+        overrides: {
+          finalize,
+          tick: async ctx => {
+            await ctx.renewLock(RECORD)
+            await swallowing(ctx)
+            await ctx.renewLock(RECORD)
+          },
+        },
+      })
+      loop.start()
+
+      // #when
+      await vi.advanceTimersByTimeAsync(INTERVAL_MS)
+      const result = await loop.stop()
+
+      // #then
+      expect(loop.hasFailed()).toBe(false)
+      expect(loop.continuityUnverified()).toBe(false)
+      expect(logger.warning).not.toHaveBeenCalled()
+      expect(result).toEqual(ok({lockEtag: 'etag-3', final: 'snapshot'}))
+    })
+  })
 })

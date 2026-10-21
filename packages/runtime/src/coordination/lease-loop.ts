@@ -24,8 +24,9 @@ export interface LeaseTickContext {
    *   timed out while it was in flight (the result is dropped).
    * - `'renewed'`: confirmed; the new ETag is recorded before this resolves.
    * - throws: the renewal was not confirmed (`err` or a throw), so the body's later I/O does not run. The loop
-   *   remembers the failure, so a body that catches it and returns still ends the tick as failed, unless a later
-   *   `renewLock` in the same tick confirms a renewal.
+   *   remembers the failure, so a body that catches it and returns still counts. The tick ends failed if its LAST
+   *   renewal outcome was a failure, even after an earlier confirmed renewal in the same tick; a later confirmed
+   *   renewal clears it.
    */
   readonly renewLock: (record: LockRecord) => Promise<'renewed' | 'skipped'>
 }
@@ -81,10 +82,10 @@ export interface LeaseLoop<F = void> {
    * Latches, and never clears, the first time lock coverage cannot be vouched for:
    * - a renewal ended in `err` or a throw;
    * - the body failed before the renewal was confirmed;
-   * - the body caught a renewal failure and returned without a later confirmed renewal;
+   * - the body caught a renewal failure and returned, and no renewal confirmed earlier in that tick;
    * - the tick timeout fired before the renewal was confirmed;
    * - an attempt was still pending when `stop()`'s budget ran out.
-   * A failure or timeout after a confirmed renewal does not latch. A tick that skips its renewal (stopping or
+   * A failure or timeout after a confirmed renewal in the same tick does not latch (it still sets `hasFailed`). A tick that skips its renewal (stopping or
    * superseded) neither latches nor fails.
    */
   readonly continuityUnverified: () => boolean
@@ -236,6 +237,8 @@ export function createLeaseLoop<F = void>(options: LeaseLoopOptions<F>): LeaseLo
 
         lockEtag = renewed.data.etag
         attempt.renewalConfirmed = true
+        // A confirmed renewal supersedes an earlier failure the body caught: the tick's last outcome is what counts.
+        attempt.renewalFailure = null
         return 'renewed'
       },
     }
@@ -244,14 +247,8 @@ export function createLeaseLoop<F = void>(options: LeaseLoopOptions<F>): LeaseLo
     ;(async () => tick(ctx))().then(
       () => {
         if (attempt.concluded) return
-        // Only a confirmed renewal is evidence the lock is held, and a later confirmed one in the same attempt wins over
-        // an earlier failure the body caught.
-        if (attempt.renewalConfirmed) {
-          failure = null
-          conclude()
-          return
-        }
-        // The body caught a renewal failure and returned: the attempt still ended without a confirmed renewal.
+        // The tick ends failed when its LAST renewal outcome was a failure, even one the body caught and returned past.
+        // A later confirmed renewal clears it (see `renewLock`). `recordFailure` latches only if none confirmed this tick.
         const renewalFailure = attempt.renewalFailure
         if (renewalFailure !== null) {
           recordFailure(attempt, renewalFailure.error)
@@ -259,7 +256,8 @@ export function createLeaseLoop<F = void>(options: LeaseLoopOptions<F>): LeaseLo
           logFailure(renewalFailure.message, renewalFailure.error)
           return
         }
-        // A tick that skipped its I/O proves nothing.
+        // Only a confirmed renewal is evidence the lock is held; a tick that skipped its I/O proves nothing.
+        if (attempt.renewalConfirmed) failure = null
         conclude()
       },
       (error: unknown) => {
