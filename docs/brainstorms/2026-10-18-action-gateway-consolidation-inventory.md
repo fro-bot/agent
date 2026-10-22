@@ -63,9 +63,13 @@ Update: delivered in #1872.
 
 The Action's `runDrain` and `cancelOutstanding` (`execute.ts:572-709`) and the gateway's `settleOwnedSessions` (`settle-owned-sessions.ts:161-307`) run the same ladder: reconcile, poll, cancel, mark unknown, confirm. A missed ledger semantic here becomes quarantine or "ownership-declined," so bug-skew risk is medium-high. The two abort functions are near duplicates: the Action's `abortRemoteSession` races its own timeout, and the gateway's `abortSession` relies on a caller-supplied signal. Extract `abortSessionBounded` and the confirm-settled step to runtime. Keep the root-quiescence policy per surface, since only the gateway needs it. Ease is medium because the ledger and reconciler are already shared.
 
+Update: #1906 and #1907 delivered this as behavior fixes. They add a root abort on early gateway stops, bound and guard every reconcile pass and abort on both surfaces, and mark entries unknown on timeout. The line ranges above have moved. The extraction was dropped: the two ladders differ in order, wait phase and timeout effect, and the three shareable primitives would add more runtime code than they remove. The gateway's `abortSession` builds its own teardown signal; it does not rely on a caller-supplied one.
+
 ### 4. Lock lease renewal and takeover
 
 The Action's `LeaseController` (`acquire-lock.ts`, design note `:466-478`) and runtime `heartbeat.ts` each run a renewal loop. The lease-expiry path is correctness-critical, and #1852 already touched the shared lock code. The Action deliberately avoids `RunState`, so the lock-only renewal loop is the right extraction point: a `createLeaseController` in runtime that the gateway's heartbeat composes. That is about 150–200 LOC. Ease is medium. Both sides need tests for takeover (the Action's same-run takeover after about 3 heartbeat intervals, and the gateway's corroboration path), so this change needs a plan and not just a move.
+
+Update: renewal was delivered in #1899 (runtime `createLeaseLoop`, Action) and #1902 (gateway heartbeat on the loop). Takeover policy stays per surface.
 
 ### 5. Env scrub and child env policy
 
