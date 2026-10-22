@@ -35,6 +35,7 @@ import {
   parseRunState,
   patchRunDetails,
   releaseLock,
+  releaseLockIfHolder,
   transitionRun,
 } from '@fro-bot/runtime'
 
@@ -58,6 +59,7 @@ import {
 import {toOperatorFailureKind} from '../operator-contract/run-status.js'
 import {canonicalWorkspaceTarget} from '../workspace-api/client.js'
 import {abortRegistry} from './abort-registry.js'
+import {releaseLockOrByOwnership} from './lock-release.js'
 import {attachOpencode} from './opencode-attach.js'
 import {
   CLIENT_TIMEOUT_REPLY,
@@ -660,8 +662,9 @@ interface ScheduleQuarantineReleaseOpts {
  *     yet started their lock renewal or RunState write skip that I/O. A request
  *     already in flight when `stop()` began can still land: a late renewal
  *     restarts the lease TTL, so the lease can outlive this window by up to one
- *     TTL. That window is residual — closing it needs the object-store adapter
- *     to abort in-flight requests.
+ *     TTL. Requests are aborted at their tick timeout or when the stop budget
+ *     runs out, which narrows that window but cannot close it: a PUT can still
+ *     commit server-side before the abort reaches it.
  *  2. Releases the concurrency slot — via the same atomic hand-off-or-release
  *     logic the ordinary completion path uses, so a queued task is never made
  *     to wait out this window behind a run that already finished failing.
@@ -802,6 +805,9 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
   // and can mutate the shared per-repo checkout and must never run while unlocked.
   let preAckCompleted = false
   let lockEtag: string | null = null
+  // Minted per acquisition: the holder fields repeat across this gateway's runs, so renewal adoption and the
+  // ownership release match on it. Declared here, not at acquisition, because the outer finally releases with it.
+  const acquisitionToken = crypto.randomUUID()
   // ── Quarantine — set only when `runOpenCodeCore` throws a `RunCoreError` with
   // `quarantined: true`: its termination barrier could NOT confirm that this run's
   // owned background sessions actually stopped. Declared at this (outer-try-spanning)
@@ -895,6 +901,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
     const lockResult = await acquireLock(coordinationConfig, repo, identity, request.surface, runId, coordLogger, {
       confirmExpiredHolder: deps.checkRepoQuiescence,
+      acquisitionToken,
     })
 
     if (lockResult.success === false) {
@@ -979,6 +986,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       lockEtag,
       runEtag,
       coordLogger,
+      acquisitionToken,
     )
     heartbeat.start()
 
@@ -2046,7 +2054,22 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       if (quarantined === true) {
         logger.warn({repo, runId}, 'run: quarantined — lock retained, heartbeat left running')
       } else {
-        const releaseResult = await releaseLock(coordinationConfig, repo, lockEtag, coordLogger)
+        const heldEtag = lockEtag
+        // A renewal the heartbeat lost track of may have moved the lock's ETag past the one held; the ownership
+        // fallback then deletes our own record and leaves a successor's alone.
+        const releaseResult = await releaseLockOrByOwnership({
+          releaseByEtag: async () => releaseLock(coordinationConfig, repo, heldEtag, coordLogger),
+          releaseIfHolder: async (token, signal) =>
+            releaseLockIfHolder(coordinationConfig, repo, identity, coordLogger, 'repo', {
+              acquisitionToken: token,
+              runId,
+              signal,
+            }),
+          acquisitionToken,
+          logger,
+          context: {repo, runId},
+          label: 'run',
+        })
         if (releaseResult.success === false) {
           logger.warn({repo, runId, err: releaseResult.error.message}, 'run: releaseLock failed')
         }

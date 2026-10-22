@@ -17,8 +17,8 @@
  * 1. Fast-paths when the ledger has no unsettled work at all — a run that
  *    never dispatched background work, or whose owned children already
  *    settled, pays no cost and sends no extra request.
- * 2. Stops the root session from producing more work (best-effort — the root
- *    has usually already failed by the time this runs).
+ * 2. Stops the root session from producing more work. The abort is a request;
+ *    unless `confirmRootQuiescent` is set, nothing here proves the root stopped.
  * 3. Cancels every unsettled owned child individually, using a FRESH
  *    teardown signal — `run-core`'s own `combinedSignal` is already aborted
  *    by the time a failure reaches here and cannot carry a new cancellation
@@ -45,12 +45,13 @@
  * `ledger.isDrainComplete()` to decide whether the causal error escapes
  * plain or `quarantined`.
  *
- * Follow-up window (`confirmRootQuiescent`): a run that adopted background work stays alive after its
- * children settle, because upstream then injects a follow-up turn on the ROOT and the root may be writing to
- * the checkout again. A failure in that window (cancel, deadline) cannot take the settled-ledger fast path:
- * the root is aborted, then confirmed quiescent — absent from the directory-scoped live set — by bounded
- * polling inside the same teardown budget. A root that cannot be confirmed quiescent in time is reported
- * `settled: false`, which `throwWithBarrier` turns into the existing quarantine.
+ * Root that may still be running (`confirmRootQuiescent`): a run that stops while the prompt it sent may still
+ * be executing (deadline, inactivity, a dropped stream, an operator cancel, a follow-up turn injected after
+ * background work settled, a provider retry) cannot take the settled-ledger fast path, because `promptAsync`
+ * keeps running server-side until `session.abort`. The root is aborted, then confirmed quiescent — absent from
+ * the directory-scoped live set — by bounded polling inside the same teardown budget. A root that cannot be
+ * confirmed quiescent in time is reported `settled: false`, which `throwWithBarrier` turns into the existing
+ * quarantine.
  *
  * This module deliberately does NOT decide what `run.ts` does with a
  * quarantine outcome — it only reports whether settlement was confirmed. The
@@ -88,9 +89,9 @@ export interface SettleOwnedSessionsParams {
   /** Overrides `DEFAULT_SETTLE_TIMEOUT_MS` — for tests only. */
   readonly timeoutMs?: number
   /**
-   * The root may be executing an injected follow-up turn (the run is in the drain's follow-up window and was not
-   * admitted). Disables the settled-ledger fast path and adds root quiescence to what must be confirmed. Omitted
-   * for every other failure path, which therefore behaves exactly as before.
+   * The root may still be executing (the run stopped before the root reached idle, or is in the drain's follow-up
+   * window and was not admitted). Disables the settled-ledger fast path and adds root quiescence to what must be
+   * confirmed. Omitted when the root has already halted.
    */
   readonly confirmRootQuiescent?: boolean
   /** Overrides `ROOT_QUIESCENCE_POLL_INTERVAL_MS` — for tests only. */
@@ -177,7 +178,7 @@ export async function settleOwnedSessions(params: SettleOwnedSessionsParams): Pr
   logger.warn(
     {rootSessionId, unsettled: unsettled.map(entry => entry.sessionId), confirmRootQuiescent},
     confirmRootQuiescent
-      ? 'settle-owned-sessions: run failed while the root may be running a follow-up turn — aborting the root and confirming it stopped before releasing resources'
+      ? 'settle-owned-sessions: run failed while the root may still be running — aborting the root and confirming it stopped before releasing resources'
       : 'settle-owned-sessions: run failed with owned work still outstanding — cancelling before releasing resources',
   )
   let finished = false
@@ -198,8 +199,7 @@ export async function settleOwnedSessions(params: SettleOwnedSessionsParams): Pr
         // request; this one is scoped solely to this settle attempt.
         const teardownSignal = AbortSignal.timeout(timeoutMs)
 
-        // Stop the root from producing more work. Best-effort safety net — the root has
-        // usually already failed (that is why this barrier is running at all).
+        // Stop the root from producing more work. Confirmed below only when `confirmRootQuiescent`.
         await abortSession(client, rootSessionId, directory, teardownSignal, logger, 'root')
 
         await Promise.allSettled(
@@ -211,12 +211,24 @@ export async function settleOwnedSessions(params: SettleOwnedSessionsParams): Pr
         // Confirm — an abort call succeeding is a delivery receipt, not proof the child
         // actually stopped. Reuse the same reconciliation primitive the drain loop uses.
         const adapter = createSdkLedgerReconcileAdapter(client, directory)
+        // Once the bound has passed this attempt is abandoned: whatever it still has in flight must not
+        // change the ledger the caller has already read the decision from.
+        const attemptLedger: OwnershipLedger = {
+          ...ledger,
+          settle: sessionId => {
+            if (!isFinished()) ledger.settle(sessionId)
+          },
+          markUnknown: sessionId => {
+            if (!isFinished()) ledger.markUnknown(sessionId)
+          },
+        }
         if (unsettled.length > 0) {
           const reconcileResult = await reconcileLedgerOnce({
-            ledger,
+            ledger: attemptLedger,
             adapter,
             parentSessionId: rootSessionId,
             logger: toRuntimeLogger(logger),
+            signal: teardownSignal,
           })
           if (reconcileResult.success === false) {
             logger.warn(
@@ -255,9 +267,9 @@ export async function settleOwnedSessions(params: SettleOwnedSessionsParams): Pr
         // child actually stopped. Explicitly downgrade every remaining entry to `unknown`
         // (idempotent for one already `unknown`) rather than leaving it `outstanding`,
         // which would misrepresent "we gave up waiting" as "we never tried".
-        const stillUnresolved = ledger.snapshot().filter(entry => entry.state !== 'settled')
+        const stillUnresolved = attemptLedger.snapshot().filter(entry => entry.state !== 'settled')
         for (const entry of stillUnresolved) {
-          ledger.markUnknown(entry.sessionId)
+          attemptLedger.markUnknown(entry.sessionId)
         }
         const stillUnresolvedIds = stillUnresolved.map(entry => entry.sessionId)
         logger.error(
@@ -288,8 +300,14 @@ export async function settleOwnedSessions(params: SettleOwnedSessionsParams): Pr
     },
     () => {
       finished = true
+      // Nothing was confirmed in time, so every unsettled entry is downgraded exactly as when the attempt ends
+      // unconfirmed. Marking happens after `finished` is set, so the abandoned attempt cannot undo it.
+      const abandonedEntries = ledger.snapshot().filter(entry => entry.state !== 'settled')
+      for (const entry of abandonedEntries) {
+        ledger.markUnknown(entry.sessionId)
+      }
       logger.error(
-        {rootSessionId, timeoutMs},
+        {rootSessionId, timeoutMs, abandonedIds: abandonedEntries.map(entry => entry.sessionId)},
         'settle-owned-sessions: settle attempt exceeded its bound — quarantining rather than hanging',
       )
       return {settled: false, reason: `settle attempt exceeded its ${timeoutMs}ms bound`}

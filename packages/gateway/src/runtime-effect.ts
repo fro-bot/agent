@@ -12,10 +12,11 @@ import type {
   LockAcquisitionOptions,
   LockAcquisitionResult,
   LockLogger,
-  LockRecord,
   Logger,
   ObjectStoreAdapter,
   ObjectStoreConfig,
+  ReleaseIfHolderExpectation,
+  ReleaseIfHolderOutcome,
   RunPhase,
   RunState,
   Surface,
@@ -29,7 +30,7 @@ import {
   forceReleaseLock,
   forceReleaseStaleLock,
   releaseLock,
-  renewLease,
+  releaseLockIfHolder,
   syncArtifactsToStore,
   syncMetadataToStore,
   syncSessionsFromStore,
@@ -98,15 +99,15 @@ export const releaseLockEffect = (
     catch: error => (error instanceof Error ? error : new Error(String(error))),
   }).pipe(Effect.flatMap(result => (result.success === true ? Effect.succeed(result.data) : Effect.fail(result.error))))
 
-export const renewLeaseEffect = (
+export const releaseLockIfHolderEffect = (
   config: CoordinationConfig,
   repo: string,
-  lockRecord: LockRecord,
-  etag: string,
+  holderId: string,
   logger: CoordinationLogger,
-): Effect.Effect<{etag: string}, Error> =>
+  expected: ReleaseIfHolderExpectation,
+): Effect.Effect<ReleaseIfHolderOutcome, Error> =>
   Effect.tryPromise({
-    try: async () => renewLease(config, repo, lockRecord, etag, logger),
+    try: async () => releaseLockIfHolder(config, repo, holderId, logger, 'repo', expected),
     catch: error => (error instanceof Error ? error : new Error(String(error))),
   }).pipe(Effect.flatMap(result => (result.success === true ? Effect.succeed(result.data) : Effect.fail(result.error))))
 

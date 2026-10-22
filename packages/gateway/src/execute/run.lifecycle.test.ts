@@ -27,6 +27,7 @@ import {
   setupHappyPath,
 } from './test-helpers.js'
 import * as reactionsModule from '../discord/reactions.js'
+import {OWNERSHIP_RELEASE_BUDGET_MS} from './lock-release.js'
 import * as runCoreModule from './run-core.js'
 import {formatTimeoutDuration} from './run.js'
 /* eslint-enable perfectionist/sort-imports */
@@ -97,6 +98,34 @@ describe('runMention', () => {
       // #and — concurrency slot released
       const releaseFn = deps.concurrency.release as ReturnType<typeof vi.fn>
       expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
+    })
+
+    it('mints one acquisition token per run and gives it to both the lock and the heartbeat', async () => {
+      // #given
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+      mockCreateDiscordStreamSink.mockReturnValue({
+        append: vi.fn(),
+        flush: vi.fn().mockResolvedValue(undefined),
+        buffered: vi.fn().mockReturnValue(''),
+        markVisibleOutputSent: vi.fn(),
+        markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
+        hasVisibleOutput: vi.fn().mockReturnValue(false),
+      })
+
+      // #when two runs go through
+      await runMention(makeMessage(), makeBinding(), makeDeps())
+      await runMention(makeMessage(), makeBinding(), makeDeps())
+
+      // #then each run's heartbeat gets the token its lock was acquired with, and the two runs' tokens differ
+      const acquired = mockRuntime.acquireLock.mock.calls.map(
+        (call: unknown[]) => (call[6] as {acquisitionToken?: string}).acquisitionToken,
+      )
+      const heartbeats = mockRuntime.createHeartbeatController.mock.calls.map((call: unknown[]) => call[7])
+      expect(acquired).toHaveLength(2)
+      expect(acquired[0]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
+      expect(heartbeats).toEqual(acquired)
+      expect(acquired[1]).not.toBe(acquired[0])
     })
 
     it('starts and stops heartbeat around execution', async () => {
@@ -921,6 +950,141 @@ describe('runMention', () => {
       // #then
       expect(mockRuntime.releaseLock).toHaveBeenCalledOnce()
       expect(mockRuntime.releaseLock.mock.calls[0]?.[2]).toBe('lock-etag-renewed')
+    })
+
+    it('releases with the ETag an adoption found when stop() reports a tick still pending', async () => {
+      // #given stop() gave up on a pending tick, but its adoption read had already found the stored lock ETag
+      const {runMention} = await import('./run.js')
+      const stopError = Object.assign(new Error('Lease tick did not settle within 5000ms of stop'), {
+        lockEtag: 'lock-etag-adopted',
+        runEtag: 'run-etag-stale',
+        tickPending: true,
+      })
+      setupHappyPath({stop: vi.fn().mockResolvedValue({success: false, error: stopError})})
+
+      // #when
+      await runMention(makeMessage(), makeBinding(), makeDeps())
+
+      // #then
+      expect(mockRuntime.releaseLock.mock.calls[0]?.[2]).toBe('lock-etag-adopted')
+    })
+
+    describe('release by ownership when the lock ETag is stale', () => {
+      const precondition = () => ({success: false as const, error: new Error('PreconditionFailed')})
+
+      it('retries once through the ownership check with this acquisition’s token, holder and run', async () => {
+        // #given the ETag release loses its condition
+        const {runMention} = await import('./run.js')
+        setupHappyPath()
+        mockRuntime.releaseLock.mockResolvedValue(precondition())
+        const deps = makeDeps()
+
+        // #when
+        await runMention(makeMessage(), makeBinding(), deps)
+
+        // #then
+        const acquired = (mockRuntime.acquireLock.mock.calls[0]?.[6] as {acquisitionToken: string}).acquisitionToken
+        const runId = String(mockRuntime.acquireLock.mock.calls[0]?.[4])
+        expect(mockRuntime.releaseLock).toHaveBeenCalledOnce()
+        expect(mockRuntime.releaseLockIfHolder).toHaveBeenCalledOnce()
+        const call = mockRuntime.releaseLockIfHolder.mock.calls[0]
+        expect(call?.[1]).toBe('acme/widget')
+        expect(call?.[2]).toBe('discord-gateway')
+        expect(call?.[4]).toBe('repo')
+        expect(call?.[5]).toEqual({acquisitionToken: acquired, runId, signal: expect.any(AbortSignal) as AbortSignal})
+        // #and the recovery is not a failure
+        expect(deps.logger.warn).not.toHaveBeenCalledWith(expect.anything(), 'run: releaseLock failed')
+      })
+
+      it.each(['not-holder', 'no-lock', 'conflict'] as const)(
+        'does not warn when the ownership check reports %s',
+        async outcome => {
+          // #given a successor's record, an already released lock, or a record replaced mid-release
+          const {runMention} = await import('./run.js')
+          setupHappyPath()
+          mockRuntime.releaseLock.mockResolvedValue(precondition())
+          mockRuntime.releaseLockIfHolder.mockResolvedValue({success: true as const, data: outcome})
+          const deps = makeDeps()
+
+          // #when
+          await runMention(makeMessage(), makeBinding(), deps)
+
+          // #then
+          expect(mockRuntime.releaseLockIfHolder).toHaveBeenCalledOnce()
+          expect(deps.logger.warn).not.toHaveBeenCalledWith(expect.anything(), 'run: releaseLock failed')
+        },
+      )
+
+      it('warns, as before, when the ownership check itself fails', async () => {
+        // #given
+        const {runMention} = await import('./run.js')
+        setupHappyPath()
+        mockRuntime.releaseLock.mockResolvedValue(precondition())
+        mockRuntime.releaseLockIfHolder.mockResolvedValue({success: false as const, error: new Error('503 slow down')})
+        const deps = makeDeps()
+
+        // #when
+        await runMention(makeMessage(), makeBinding(), deps)
+
+        // #then
+        expect(deps.logger.warn).toHaveBeenCalledWith(
+          expect.objectContaining({err: '503 slow down'}),
+          'run: releaseLock failed',
+        )
+      })
+
+      it('still reaches the slot hand-off when the ownership release stalls, and aborts it at the budget', async () => {
+        // #given the ETag release loses its condition and the ownership release never answers
+        vi.useFakeTimers()
+        try {
+          const {runMention} = await import('./run.js')
+          setupHappyPath()
+          mockRuntime.releaseLock.mockResolvedValue(precondition())
+          mockRuntime.releaseLockIfHolder.mockImplementation(async () => new Promise(() => {}))
+          const deps = makeDeps()
+          let finished = false
+
+          // #when
+          const running = runMention(makeMessage(), makeBinding(), deps).then(() => {
+            finished = true
+          })
+          await vi.advanceTimersByTimeAsync(OWNERSHIP_RELEASE_BUDGET_MS - 1)
+          expect(finished).toBe(false)
+          const signal = (mockRuntime.releaseLockIfHolder.mock.calls[0]?.[5] as {signal: AbortSignal}).signal
+          expect(signal.aborted).toBe(false)
+          await vi.advanceTimersByTimeAsync(1)
+          await running
+
+          // #then the run completed, its slot was released, and the stalled call was told to stop
+          expect(signal.aborted).toBe(true)
+          const releaseFn = deps.concurrency.release as ReturnType<typeof vi.fn>
+          expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
+          expect(deps.logger.warn).toHaveBeenCalledWith(
+            expect.objectContaining({err: expect.stringContaining('ownership release did not finish') as string}),
+            'run: releaseLock failed',
+          )
+        } finally {
+          vi.useRealTimers()
+        }
+      })
+
+      it('does not retry a release that failed for another reason', async () => {
+        // #given
+        const {runMention} = await import('./run.js')
+        setupHappyPath()
+        mockRuntime.releaseLock.mockResolvedValue({success: false as const, error: new Error('503 slow down')})
+        const deps = makeDeps()
+
+        // #when
+        await runMention(makeMessage(), makeBinding(), deps)
+
+        // #then
+        expect(mockRuntime.releaseLockIfHolder).not.toHaveBeenCalled()
+        expect(deps.logger.warn).toHaveBeenCalledWith(
+          expect.objectContaining({err: '503 slow down'}),
+          'run: releaseLock failed',
+        )
+      })
     })
 
     // ── Terminal transition after a failed stop ───────────────────────────────

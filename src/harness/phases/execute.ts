@@ -35,6 +35,7 @@ import {executeOpenCode, resolveOutputMode} from '../../features/agent/index.js'
 import {inspectResponseFile, resolveResponseSurface} from '../../features/agent/response-file.js'
 import {sleep} from '../../shared/async.js'
 import {getGitHubWorkspace} from '../../shared/env.js'
+import {toErrorMessage} from '../../shared/errors.js'
 import {createLogger} from '../../shared/logger.js'
 import {STATE_KEYS} from '../config/state-keys.js'
 import {buildSessionSearchQuery} from './session-prep.js'
@@ -208,8 +209,11 @@ async function recoverFromContextOverflow(options: ContextOverflowRecoveryOption
     metrics.addSessionUsed(session.sessionId)
   }
 
-  const remainingMs = bootstrap.inputs.timeoutMs - (Date.now() - executionStartTime)
-  if (remainingMs <= 0)
+  // A timeout of 0 means no Action deadline, so there is no remainder to run out and the recovery attempt gets
+  // the same "no deadline" setting.
+  const hasDeadline = bootstrap.inputs.timeoutMs > 0
+  const remainingMs = hasDeadline ? bootstrap.inputs.timeoutMs - (Date.now() - executionStartTime) : 0
+  if (hasDeadline && remainingMs <= 0)
     return {
       ...overflowedResult,
       recoveryBoundaryUnresolved: overflowedResult.recoveryBoundaryUnresolved || recoveryBoundaryUnresolved,
@@ -534,7 +538,7 @@ export interface RunDrainOptions {
   readonly parentSessionId: string | null
   /** Directory the session runs in (`getGitHubWorkspace()`, as in `executeOpenCode`); reconciliation is scoped to it. */
   readonly directory: string
-  /** Remaining budget for drain, already excluding the teardown reserve. */
+  /** Remaining budget for drain, already excluding the teardown reserve. `Number.POSITIVE_INFINITY` means no deadline. */
   readonly deadlineMs: number
   readonly logger: Logger
   /** Interval between periodic reconciliation passes. Defaults to `createLedgerReconciler`'s own default. */
@@ -546,7 +550,17 @@ export interface RunDrainOptions {
 /** Reserve of the invocation's total timeout set aside for teardown after drain returns. */
 export const DEFAULT_DRAIN_TEARDOWN_RESERVE_MS = 30_000
 const DEFAULT_DRAIN_POLL_INTERVAL_MS = 250
-const DRAIN_ABORT_TIMEOUT_MS = 5_000
+/** Bound on each upstream call the drain makes: a reconcile pass or a child abort. */
+const DRAIN_CALL_TIMEOUT_MS = 5_000
+
+/**
+ * With no drain deadline, how many consecutive reconcile passes may observe no tracked session running before
+ * drain stops waiting. Work a pass observes running (a tracked session that is a live direct child of the parent)
+ * is waited for without a time cap, whatever its ledger state. Unreachable work cannot be waited on: a dead server
+ * fails every pass, and an entry that is not a direct child of the parent is never seen as a live child. Only
+ * meaningful when the deadline is infinite; a finite deadline always waits for it.
+ */
+export const UNOBSERVABLE_PASSES_BEFORE_DRAIN_EXIT = 3
 
 const NO_DRAIN_OUTCOME: DrainOutcome = {expired: false, cancelledCount: 0, settledCount: 0, unknownCount: 0}
 
@@ -557,13 +571,90 @@ const NO_DRAIN_OUTCOME: DrainOutcome = {expired: false, cancelledCount: 0, settl
  * sync dominating at up to 10.2s) and is deliberately overridable -- it
  * predates drain existing and is provisional until re-measured from the
  * drain tail (see plan "Deferred to Separate Tasks").
+ *
+ * A total timeout of 0 means the Action sets no deadline, so drain has none
+ * either: the budget is `Number.POSITIVE_INFINITY` (the convention
+ * `createExecutionDeadline().remainingMs()` uses) and the wait loop polls at
+ * its normal cadence until the owned work settles. Only the workflow's
+ * `timeout-minutes` or GitHub's own limit can stop it.
  */
 export function computeDrainDeadlineMs(
   totalTimeoutMs: number,
   executionDurationMs: number,
   teardownReserveMs: number = DEFAULT_DRAIN_TEARDOWN_RESERVE_MS,
 ): number {
+  if (totalTimeoutMs <= 0) return Number.POSITIVE_INFINITY
   return Math.max(0, totalTimeoutMs - teardownReserveMs - executionDurationMs)
+}
+
+type BoundedCall<T> = {readonly timedOut: false; readonly value: T} | {readonly timedOut: true}
+
+/**
+ * Runs one upstream call under `DRAIN_CALL_TIMEOUT_MS`. The race bounds this await; the signal handed to `call`
+ * is aborted at the bound so a client that honors it stops the request. A call that ignores the signal is
+ * abandoned, not awaited further, and its late result is the caller's to ignore.
+ */
+async function boundedCall<T>(call: (signal: AbortSignal) => Promise<T>): Promise<BoundedCall<T>> {
+  const controller = new AbortController()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<{readonly timedOut: true}>(resolve => {
+    timer = setTimeout(() => {
+      controller.abort()
+      resolve({timedOut: true})
+    }, DRAIN_CALL_TIMEOUT_MS)
+  })
+  try {
+    return await Promise.race([
+      (async () => call(controller.signal))().then((value): BoundedCall<T> => ({timedOut: false, value})),
+      timeout,
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
+/**
+ * One reconcile pass under `DRAIN_CALL_TIMEOUT_MS`. A pass that does not finish in time fails like any other
+ * failed pass: outstanding entries become `unknown`. Once the bound has passed, the abandoned pass can no longer
+ * change the ledger, so a late answer cannot overturn the decision the drain already made. `isClosed` marks a
+ * drain that has already decided (its wait loop ended): from then on the pass is inert whenever it answers.
+ *
+ * Resolves `true` only when the pass finished and saw a tracked session running (a live direct child of the
+ * parent). A pass that failed or timed out observed nothing, so it resolves `false`.
+ */
+async function reconcileBounded(
+  options: ReconcileLedgerOptions,
+  isClosed: () => boolean = () => false,
+): Promise<boolean> {
+  const {ledger, logger} = options
+  let abandoned = false
+  const inert = (): boolean => abandoned || isClosed()
+  const guardedLedger: OwnershipLedger = {
+    ...ledger,
+    settle: sessionId => {
+      if (!inert()) ledger.settle(sessionId)
+    },
+    markUnknown: sessionId => {
+      if (!inert()) ledger.markUnknown(sessionId)
+    },
+  }
+
+  const result = await boundedCall(async signal => reconcileLedgerOnce({...options, ledger: guardedLedger, signal}))
+  if (result.timedOut === false) {
+    return result.value.success && result.value.data.liveTrackedSessionIds.size > 0
+  }
+
+  abandoned = true
+  if (isClosed()) return false
+  const outstanding = ledger.snapshot().filter(entry => entry.state === 'outstanding')
+  for (const entry of outstanding) ledger.markUnknown(entry.sessionId)
+  logger.warning('Ledger reconciliation timed out; marking outstanding entries unknown rather than settling them', {
+    source: 'reconcileBounded',
+    parentSessionId: options.parentSessionId,
+    unknownCount: outstanding.length,
+    timeoutMs: DRAIN_CALL_TIMEOUT_MS,
+  })
+  return false
 }
 
 async function cancelOutstanding(options: {
@@ -581,7 +672,7 @@ async function cancelOutstanding(options: {
   // the ledger already tracks -- it cannot discover an untracked child, since
   // nothing upstream distinguishes a background child session from a foreground
   // one.
-  await reconcileLedgerOnce(reconcileOptions)
+  await reconcileBounded(reconcileOptions)
 
   // Cancel everything not confirmed settled -- outstanding AND unknown. An
   // `unknown` entry (a dropped event, or every reconciliation attempt so far
@@ -597,9 +688,19 @@ async function cancelOutstanding(options: {
     unsettledEntries.map(async entry => {
       if (typeof client.session.abort !== 'function') return
       try {
-        // A fresh signal: the execution deadline that just expired must not also
-        // cancel the cancellation request itself.
-        await client.session.abort({path: {id: entry.sessionId}, signal: AbortSignal.timeout(DRAIN_ABORT_TIMEOUT_MS)})
+        // A fresh signal per call: the execution deadline that just expired must not also cancel the
+        // cancellation request itself, and a hung call must neither stall the drain nor outlive its bound.
+        const result = await boundedCall(async signal => client.session.abort({path: {id: entry.sessionId}, signal}))
+        // The SDK resolves a failed request with the failure in `error` instead of throwing.
+        const envelopeError = result.timedOut
+          ? undefined
+          : (result.value as {readonly error?: unknown} | undefined)?.error
+        if (result.timedOut || envelopeError != null) {
+          logger.warning('Failed to abort owned session during drain-deadline cancellation', {
+            sessionId: entry.sessionId,
+            error: result.timedOut ? `abort timed out after ${DRAIN_CALL_TIMEOUT_MS}ms` : toErrorMessage(envelopeError),
+          })
+        }
       } catch (error) {
         logger.warning('Failed to abort owned session during drain-deadline cancellation', {
           sessionId: entry.sessionId,
@@ -612,7 +713,7 @@ async function cancelOutstanding(options: {
   // A cancellation request is not proof the child stopped -- only a positive
   // liveness check confirms it. Run one more reconciliation pass so a session
   // that already went idle is settled (confirmed) rather than left unknown.
-  await reconcileLedgerOnce(reconcileOptions)
+  await reconcileBounded(reconcileOptions)
 
   const settledCount = unsettledEntries.filter(cancelled => {
     const current = ledger.snapshot().find(candidate => candidate.sessionId === cancelled.sessionId)
@@ -684,19 +785,43 @@ export async function runDrain(options: RunDrainOptions): Promise<DrainOutcome> 
   // discriminant does exist on the persisted tool part, which nothing here
   // reads today -- see that module doc for the verified shape and for what a
   // reader of it would additionally have to get right.
-  await reconcileLedgerOnce(reconcileOptions)
+  let consecutiveUnobservablePasses = 0
+  let waitEnded = false
+  // One bounded, guarded pass. A pass that did not observe any tracked session running (it failed, timed out, or
+  // saw no tracked entry as a live direct child) while work is still unsettled extends the streak; a pass that saw
+  // one running resets it, whatever state the ledger holds for it: a transient failure leaves a running child
+  // `unknown`, and the ledger never moves it back. Passes after the wait loop has ended count for nothing and,
+  // being inert, change nothing.
+  const reconcilePass = async (): Promise<void> => {
+    const observedRunning = await reconcileBounded(reconcileOptions, () => waitEnded)
+    if (waitEnded) return
+    const workRemains = ledger.snapshot().some(entry => entry.state !== 'settled')
+    consecutiveUnobservablePasses = workRemains && observedRunning === false ? consecutiveUnobservablePasses + 1 : 0
+  }
+  const hasDeadline = Number.isFinite(deadlineMs)
+  const unobservable = (): boolean =>
+    hasDeadline === false && consecutiveUnobservablePasses >= UNOBSERVABLE_PASSES_BEFORE_DRAIN_EXIT
+
+  await reconcilePass()
 
   if (ledger.isDrainComplete()) return {...NO_DRAIN_OUTCOME, unknownCount: ledger.unknown()}
 
   if (deadlineMs > 0) {
-    const reconciler = createLedgerReconciler({...reconcileOptions, intervalMs: reconcileIntervalMs})
+    // Each periodic tick is a bounded, guarded pass like every other drain pass. Once the wait loop has ended the
+    // drain has decided, so a pass still in flight can no longer change the ledger.
+    const reconciler = createLedgerReconciler({
+      ...reconcileOptions,
+      intervalMs: reconcileIntervalMs,
+      runPass: reconcilePass,
+    })
     const deadlineAt = Date.now() + deadlineMs
     try {
-      while (ledger.isDrainComplete() === false && Date.now() < deadlineAt) {
+      while (ledger.isDrainComplete() === false && Date.now() < deadlineAt && unobservable() === false) {
         await sleep(Math.max(0, Math.min(pollIntervalMs, deadlineAt - Date.now())))
       }
     } finally {
       reconciler.dispose()
+      waitEnded = true
     }
   }
 

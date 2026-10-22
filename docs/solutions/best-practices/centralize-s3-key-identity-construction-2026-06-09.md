@@ -36,14 +36,16 @@ modules each built keys inline. When a new operation — `forceReleaseStaleLock`
 `readRunStateByRunId` — was added, it rebuilt the run-state key inline using the **wrong**
 identity segment (`'coordination'` instead of the run-owner identity).
 
-The result was a **silent safety-degradation**: `forceReleaseStaleLock` is supposed to be
-two-signal "dead-run-verified" (release a lock only when the lease has expired **and** the
-run-state heartbeat is stale/absent). But the heartbeat read targeted
+The result was a **silent evidence loss**: `forceReleaseStaleLock` deletes a lock only when
+the lease has expired **and** the repo's workspace reports `clear`, and it reads the old
+holder's run-state (the heartbeat's last write) for the takeover audit. That read targeted
 `…/coordination/owner/repo/runs/{id}.json` while the record actually lives at
-`…/discord-gateway/owner/repo/runs/{id}.json` → every read was `NoSuchKey` → "absent →
-dead" → the guard collapsed to lease-only. No crash, no failing test — the tests mocked
-`getObject` positionally without asserting the key. It was caught in review, not by the
-suite.
+`…/discord-gateway/owner/repo/runs/{id}.json` → every read was `NoSuchKey` → "absent", so the
+audit reported every holder as having no heartbeat, however alive it was. When the same read
+was one of the release guard's two signals ("lease expired **and** run-state heartbeat
+stale/absent"), "absent → dead" collapsed that guard to lease-only. No crash, no failing
+test — the tests mocked `getObject` positionally without asserting the key. It was caught in
+review, not by the suite.
 
 ## Guidance
 

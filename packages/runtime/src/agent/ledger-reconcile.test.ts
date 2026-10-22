@@ -32,6 +32,17 @@ function makeAdapter(overrides: Partial<LedgerReconcileAdapter> = {}): LedgerRec
   }
 }
 
+/** Runs one pass over a ledger set up by `setup`; `live` is the observed live tracked ids, or null if the pass failed. */
+async function observe(
+  setup: (ledger: ReturnType<typeof createOwnershipLedger>) => void,
+  adapter: LedgerReconcileAdapter,
+): Promise<{live: string[] | null; ledger: ReturnType<typeof createOwnershipLedger>}> {
+  const ledger = createOwnershipLedger()
+  setup(ledger)
+  const result = await reconcileLedgerOnce({ledger, adapter, parentSessionId: PARENT_SESSION_ID, logger: makeLogger()})
+  return {live: result.success ? [...result.data.liveTrackedSessionIds] : null, ledger}
+}
+
 describe('createSdkLedgerReconcileAdapter', () => {
   const WORKSPACE = '/workspace/repos/owner/repo'
 
@@ -382,6 +393,147 @@ describe('reconcileLedgerOnce', () => {
       {sessionId: 'dropped-settlement-child', label: 'background task', state: 'settled'},
     ])
   })
+
+  describe('observation', () => {
+    it('reports a tracked direct child that is live', async () => {
+      // #given / #when
+      const {live, ledger} = await observe(
+        l => l.adopt('child-1', 'task'),
+        makeAdapter({
+          children: async () => ok([{id: 'child-1'}]),
+          liveSessionIds: async () => ok(new Set(['child-1'])),
+        }),
+      )
+
+      // #then
+      expect(live).toEqual(['child-1'])
+      expect(ledger.outstanding()).toBe(1)
+    })
+
+    it('reports a live direct child that is already unknown, without moving it back to outstanding', async () => {
+      // #given an entry downgraded earlier, whose session is still running
+      // #when
+      const {live, ledger} = await observe(
+        l => {
+          l.adopt('child-1', 'task')
+          l.markUnknown('child-1')
+        },
+        makeAdapter({
+          children: async () => ok([{id: 'child-1'}]),
+          liveSessionIds: async () => ok(new Set(['child-1'])),
+        }),
+      )
+
+      // #then it was observed running, and ledger semantics are unchanged
+      expect(live).toEqual(['child-1'])
+      expect(ledger.snapshot()).toEqual([{sessionId: 'child-1', label: 'task', state: 'unknown'}])
+    })
+
+    it('reports nothing for a child that is not live', async () => {
+      // #given / #when
+      const {live} = await observe(
+        l => l.adopt('child-1', 'task'),
+        makeAdapter({children: async () => ok([{id: 'child-1'}]), liveSessionIds: async () => ok(new Set<string>())}),
+      )
+
+      // #then
+      expect(live).toEqual([])
+    })
+
+    it('reports nothing for a live session that is not a direct child', async () => {
+      // #given / #when
+      const {live} = await observe(
+        l => l.adopt('child-1', 'task'),
+        makeAdapter({children: async () => ok([]), liveSessionIds: async () => ok(new Set(['child-1']))}),
+      )
+
+      // #then
+      expect(live).toEqual([])
+    })
+
+    it('reports nothing for an empty ledger, and gives no observation on a failed pass', async () => {
+      // #given / #when
+      const empty = await observe(() => {}, makeAdapter())
+      const failed = await observe(
+        l => l.adopt('child-1', 'task'),
+        makeAdapter({children: async () => err(new Error('down'))}),
+      )
+
+      // #then
+      expect(empty.live).toEqual([])
+      expect(failed.live).toBeNull()
+    })
+  })
+
+  describe('request signal', () => {
+    it('passes the signal to both upstream lookups when one is given', async () => {
+      // #given
+      const ledger = createOwnershipLedger()
+      ledger.adopt('child-1', 'background task')
+      const children = vi.fn(async () => ok([{id: 'child-1'}]))
+      const liveSessionIds = vi.fn(async () => ok(new Set<string>()))
+      const signal = new AbortController().signal
+
+      // #when
+      await reconcileLedgerOnce({
+        ledger,
+        adapter: makeAdapter({children, liveSessionIds}),
+        parentSessionId: PARENT_SESSION_ID,
+        logger: makeLogger(),
+        signal,
+      })
+
+      // #then
+      expect(children).toHaveBeenCalledWith(PARENT_SESSION_ID, signal)
+      expect(liveSessionIds).toHaveBeenCalledWith(signal)
+    })
+
+    it('calls the adapter with exactly the original arguments when no signal is given', async () => {
+      // #given
+      const ledger = createOwnershipLedger()
+      ledger.adopt('child-1', 'background task')
+      const children = vi.fn(async () => ok([{id: 'child-1'}]))
+      const liveSessionIds = vi.fn(async () => ok(new Set<string>()))
+
+      // #when
+      await reconcileLedgerOnce({
+        ledger,
+        adapter: makeAdapter({children, liveSessionIds}),
+        parentSessionId: PARENT_SESSION_ID,
+        logger: makeLogger(),
+      })
+
+      // #then — no trailing `undefined` argument
+      expect(children.mock.calls[0]).toEqual([PARENT_SESSION_ID])
+      expect(liveSessionIds.mock.calls[0]).toEqual([])
+    })
+
+    it('marks outstanding entries unknown when an aborted lookup fails', async () => {
+      // #given — an adapter that rejects through the Result channel once the signal fires
+      const ledger = createOwnershipLedger()
+      ledger.adopt('child-1', 'background task')
+      const controller = new AbortController()
+      const adapter = makeAdapter({
+        children: async (_parent, signal) => {
+          controller.abort()
+          return signal?.aborted === true ? err(new Error('aborted')) : ok([{id: 'child-1'}])
+        },
+      })
+
+      // #when
+      const result = await reconcileLedgerOnce({
+        ledger,
+        adapter,
+        parentSessionId: PARENT_SESSION_ID,
+        logger: makeLogger(),
+        signal: controller.signal,
+      })
+
+      // #then — the same outcome as any failed pass
+      expect(result.success).toBe(false)
+      expect(ledger.snapshot()).toEqual([{sessionId: 'child-1', label: 'background task', state: 'unknown'}])
+    })
+  })
 })
 
 describe('createLedgerReconciler', () => {
@@ -415,6 +567,66 @@ describe('createLedgerReconciler', () => {
     // #then
     expect(ledger.outstanding()).toBe(0)
     expect(ledger.snapshot()).toEqual([{sessionId: 'child-1', label: 'reviewer-subagent', state: 'settled'}])
+    reconciler.dispose()
+  })
+
+  it('runs the injected pass on each tick instead of the default one', async () => {
+    // #given an injected pass, and an adapter that must stay untouched
+    const ledger = createOwnershipLedger()
+    ledger.adopt('child-1', 'reviewer-subagent')
+    const children = vi.fn(async () => ok([{id: 'child-1'}]))
+    const runPass = vi.fn(async () => {})
+    const reconciler = createLedgerReconciler({
+      ledger,
+      adapter: makeAdapter({children}),
+      parentSessionId: PARENT_SESSION_ID,
+      logger: makeLogger(),
+      intervalMs: 1000,
+      runPass,
+    })
+
+    // #when three ticks elapse
+    await vi.advanceTimersByTimeAsync(3000)
+
+    // #then the injected pass ran each time and the default one never did
+    expect(runPass).toHaveBeenCalledTimes(3)
+    expect(children).not.toHaveBeenCalled()
+    reconciler.dispose()
+  })
+
+  it('keeps ticking after an injected pass rejects, and still skips a tick while one is in flight', async () => {
+    // #given a pass that rejects once, then hangs until released
+    const ledger = createOwnershipLedger()
+    ledger.adopt('child-1', 'reviewer-subagent')
+    const release: (() => void)[] = []
+    let calls = 0
+    const runPass = vi.fn(async () => {
+      calls += 1
+      if (calls === 1) throw new Error('pass blew up')
+      if (calls === 2)
+        await new Promise<void>(resolve => {
+          release.push(resolve)
+        })
+    })
+    const reconciler = createLedgerReconciler({
+      ledger,
+      adapter: makeAdapter(),
+      parentSessionId: PARENT_SESSION_ID,
+      logger: makeLogger(),
+      intervalMs: 1000,
+      runPass,
+    })
+
+    // #when the first tick rejects, the second hangs, and two more ticks pass
+    await vi.advanceTimersByTimeAsync(4000)
+
+    // #then the rejection did not stall later ticks, and the hung pass blocked the ticks behind it
+    expect(runPass).toHaveBeenCalledTimes(2)
+
+    // #and once released, ticking resumes
+    release[0]?.()
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(runPass).toHaveBeenCalledTimes(3)
     reconciler.dispose()
   })
 

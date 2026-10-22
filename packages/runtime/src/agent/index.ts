@@ -43,6 +43,7 @@ export type {
   LedgerReconcileChild,
   LedgerReconciler,
   ReconcileLedgerOptions,
+  ReconcileObservation,
 } from './ledger-reconcile.js'
 export {hasBlockingToolPart} from './message-facts.js'
 export {resolveOutputMode} from './output-mode.js'

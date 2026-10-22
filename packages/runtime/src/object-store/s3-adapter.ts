@@ -264,7 +264,11 @@ export function createS3Adapter(config: ObjectStoreConfig, logger: Logger): Obje
       }
     },
     conditionalPut: async (key, data, options) => {
-      logger.debug('Conditionally uploading object store data', {key, options})
+      // The signal is not loggable data; log the conditions only.
+      logger.debug('Conditionally uploading object store data', {
+        key,
+        options: {ifMatch: options.ifMatch, ifNoneMatch: options.ifNoneMatch, tagging: options.tagging},
+      })
 
       try {
         const response = await client.send(
@@ -283,6 +287,7 @@ export function createS3Adapter(config: ObjectStoreConfig, logger: Logger): Obje
               ? {Tagging: options.tagging}
               : {}),
           }),
+          ...abortOptions(options.signal),
         )
 
         const etag = normalizeEtag(response.ETag, 'conditionalPut')
