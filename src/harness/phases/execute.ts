@@ -209,8 +209,11 @@ async function recoverFromContextOverflow(options: ContextOverflowRecoveryOption
     metrics.addSessionUsed(session.sessionId)
   }
 
-  const remainingMs = bootstrap.inputs.timeoutMs - (Date.now() - executionStartTime)
-  if (remainingMs <= 0)
+  // A timeout of 0 means no Action deadline, so there is no remainder to run out and the recovery attempt gets
+  // the same "no deadline" setting.
+  const hasDeadline = bootstrap.inputs.timeoutMs > 0
+  const remainingMs = hasDeadline ? bootstrap.inputs.timeoutMs - (Date.now() - executionStartTime) : 0
+  if (hasDeadline && remainingMs <= 0)
     return {
       ...overflowedResult,
       recoveryBoundaryUnresolved: overflowedResult.recoveryBoundaryUnresolved || recoveryBoundaryUnresolved,

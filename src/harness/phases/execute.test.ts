@@ -379,6 +379,44 @@ describe('runExecute overflow recovery', () => {
     })
   })
 
+  it('still recovers from an overflow when the timeout is 0, and keeps the recovery attempt unbounded', async () => {
+    // #given the `timeout` input is 0 (no Action deadline) and the first execution overflows
+    const recoveredResult = createAgentResult({
+      success: true,
+      exitCode: 0,
+      error: null,
+      sessionId: 'recovered-session',
+      commentsPosted: 1,
+      llmError: null,
+    })
+    vi.mocked(executeOpenCode).mockResolvedValueOnce(createAgentResult()).mockResolvedValueOnce(recoveredResult)
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValueOnce(1_000).mockReturnValueOnce(5_000).mockReturnValue(5_000)
+
+    // #when the execute phase runs, with time having passed since it started
+    let result: Awaited<ReturnType<typeof runExecute>>
+    try {
+      result = await runExecute(
+        createBootstrap(0),
+        createRouting(),
+        createCacheRestore(),
+        createSessionPrep(),
+        createMetrics(),
+        0,
+      )
+    } finally {
+      nowSpy.mockRestore()
+    }
+
+    // #then recovery ran, and its execution config still means "no deadline" (0), not a finite remainder
+    expect(vi.mocked(executeOpenCode)).toHaveBeenCalledTimes(2)
+    expect(vi.mocked(executeOpenCode).mock.calls[1]?.[2]?.timeoutMs).toBe(0)
+    expect(result).toMatchObject({
+      success: true,
+      sessionId: 'recovered-session',
+      overflowRecovery: {recovered: true, archivedSessionId: 'overflowed-session', archiveSucceeded: true},
+    })
+  })
+
   it('archives the second overflow and does not start a third attempt', async () => {
     // #given both the original and fresh sessions overflow without delivering a response
     const secondOverflowResult = createAgentResult({sessionId: 'recovery-overflowed-session'})
