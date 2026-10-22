@@ -38,12 +38,12 @@ import {
   getSessionID,
   getStringProperty,
   parseSyntheticNoticePart,
-  reconcileLedgerOnce,
 } from '@fro-bot/runtime'
 import {parsePermissionReply, parsePermissionRequest} from '../approvals/coordinator.js'
 import {parseQuestionEcho, parseQuestionRequest, safeLogId} from '../approvals/question-coordinator.js'
 import {createDrainCompletion} from './drain-completion.js'
 import {formatToolPart} from './format-part.js'
+import {reconcileLivePass} from './live-reconcile.js'
 import {
   failureFromErrorObject,
   failureFromErrorText,
@@ -600,14 +600,20 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
 
   const reconcileAdapter = ledger === undefined ? undefined : createSdkLedgerReconcileAdapter(client, directory)
   const runtimeLogger = ledger === undefined ? undefined : toRuntimeLogger(logger)
-  const reconciler =
+  // Live-path reconcile passes (the periodic tick and the one-shot on root idle) are bounded and write through a
+  // guarded ledger. Once the run starts tearing down (`throwWithBarrier`) or leaves the event loop, settle owns the
+  // ledger and a pass still in flight must not change it.
+  let liveReconcileClosed = false
+  const liveReconcileOptions =
     ledger === undefined || reconcileAdapter === undefined || runtimeLogger === undefined
       ? undefined
+      : {ledger, adapter: reconcileAdapter, parentSessionId: sessionId, logger: runtimeLogger}
+  const reconciler =
+    liveReconcileOptions === undefined
+      ? undefined
       : createLedgerReconciler({
-          ledger,
-          adapter: reconcileAdapter,
-          parentSessionId: sessionId,
-          logger: runtimeLogger,
+          ...liveReconcileOptions,
+          runPass: async () => reconcileLivePass(liveReconcileOptions, () => liveReconcileClosed),
         })
 
   if (ledger !== undefined && reconcileAdapter !== undefined) {
@@ -658,6 +664,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     } = {},
   ): Promise<never> {
     const {rootMayBeRunning = false, providerFailureReason, cause} = options
+    liveReconcileClosed = true
     const rootFollowUpOpen =
       rootMayBeRunning ||
       (drainCompletion !== undefined && draining === true && drainDoneController.signal.aborted === false)
@@ -1299,16 +1306,9 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           // without waiting for the reconciler's interval. Fire-and-forget: its
           // mutations (via the wrapped ledger) trigger persistence and a validation
           // request on their own once they land.
-          if (ledgerSettled === false && reconcileAdapter !== undefined && runtimeLogger !== undefined) {
+          if (ledgerSettled === false && liveReconcileOptions !== undefined) {
             // eslint-disable-next-line no-void
-            void reconcileLedgerOnce({
-              ledger,
-              adapter: reconcileAdapter,
-              parentSessionId: sessionId,
-              logger: runtimeLogger,
-            }).catch(() => {
-              // reconcileLedgerOnce never rejects; this satisfies no-floating-promises.
-            })
+            void reconcileLivePass(liveReconcileOptions, () => liveReconcileClosed)
           }
 
           // Validate against REST now that this generation has idle evidence. Coalesced: at most one in flight.
@@ -1390,6 +1390,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     // The explicit clearInactivity() calls on the session.idle and session.error paths are
     // kept as defensive double-clears — pause()/dispose() on an already-cleared timer is a no-op.
     inactivityTimer.dispose()
+    liveReconcileClosed = true
     reconciler?.dispose()
     // No validation result may admit success once the loop has exited, and its retry timer must not leak.
     drainCompletion?.dispose()
