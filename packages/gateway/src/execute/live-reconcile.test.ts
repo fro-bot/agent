@@ -5,7 +5,7 @@
 
 import type {LedgerReconcileAdapter, Logger} from '@fro-bot/runtime'
 
-import {ok} from '@bfra.me/es/result'
+import {err, ok} from '@bfra.me/es/result'
 import {createOwnershipLedger} from '@fro-bot/runtime'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
@@ -24,6 +24,16 @@ function makeAdapter(overrides: Partial<LedgerReconcileAdapter> = {}): LedgerRec
     liveSessionIds: async () => ok(new Set<string>()),
     ...overrides,
   }
+}
+
+/** An outstanding entry behind a ledger whose `markUnknown` is observable, like the hook-wrapped one that persists ownership. */
+function observableLedger() {
+  const inner = createOwnershipLedger()
+  inner.adopt('child-1', 'task')
+  const markUnknown = vi.fn((sessionId: string) => {
+    inner.markUnknown(sessionId)
+  })
+  return {ledger: {...inner, markUnknown}, markUnknown, snapshot: () => inner.snapshot()}
 }
 
 afterEach(() => {
@@ -133,5 +143,54 @@ describe('reconcileLivePass', () => {
       expect.objectContaining({durationMs: 1_000, outcome: 'timed-out'}),
     )
     expect(hungLogger.warning).toHaveBeenCalledTimes(1)
+  })
+  describe('a pass that is still in flight when the run closes', () => {
+    it('does not mark the entry unknown when its lookup fails after the close', async () => {
+      // #given an outstanding entry and a children() call still in flight
+      let closed = false
+      const {ledger, markUnknown, snapshot} = observableLedger()
+      let fail: () => void = () => {}
+      const adapter = makeAdapter({
+        children: async () =>
+          new Promise(resolve => {
+            fail = () => resolve(err(new Error('server down')))
+          }),
+      })
+      const pass = reconcileLivePass({ledger, adapter, parentSessionId: PARENT, logger: makeLogger()}, () => closed)
+
+      // #when the run moves on to teardown, and then the lookup fails
+      closed = true
+      fail()
+      await pass
+
+      // #then the failed pass's downgrade was ignored: no mark, no ownership-change side effect
+      expect(markUnknown).not.toHaveBeenCalled()
+      expect(snapshot()).toEqual([{sessionId: 'child-1', label: 'task', state: 'outstanding'}])
+    })
+
+    it('does not mark the entry unknown, or claim it did, when the bound expires after the close', async () => {
+      // #given an outstanding entry and a children() call that never answers
+      vi.useFakeTimers()
+      let closed = false
+      const {ledger, markUnknown, snapshot} = observableLedger()
+      const logger = makeLogger()
+      const adapter = makeAdapter({
+        children: async () =>
+          new Promise<never>(() => {
+            /* never resolves */
+          }),
+      })
+      const pass = reconcileLivePass({ledger, adapter, parentSessionId: PARENT, logger}, () => closed)
+
+      // #when the run moves on to teardown, and then the bound expires
+      closed = true
+      await vi.advanceTimersByTimeAsync(LIVE_RECONCILE_TIMEOUT_MS)
+      await pass
+
+      // #then teardown's settle still owns the entry: no mark, and no warning saying one was made
+      expect(markUnknown).not.toHaveBeenCalled()
+      expect(snapshot()).toEqual([{sessionId: 'child-1', label: 'task', state: 'outstanding'}])
+      expect(logger.warning).not.toHaveBeenCalled()
+    })
   })
 })
