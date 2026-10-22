@@ -1071,6 +1071,17 @@ function createFakeSessionClient(overrides: {
   } as unknown as SessionClient
 }
 
+async function drainWithAbortResult(abortResult: unknown, logger: Logger): Promise<void> {
+  const ledger = createOwnershipLedger()
+  ledger.adopt('ses_child', 'background task')
+  const client = createFakeSessionClient({
+    children: async () => ({data: [{id: 'ses_child'}]}),
+    status: async () => ({data: {ses_child: {}}}),
+    abort: async () => abortResult as {data?: unknown; error?: unknown},
+  })
+  await runDrain({ledger, client, parentSessionId: 'ses_root', directory: '/workspace', deadlineMs: 0, logger})
+}
+
 /** A call that never answers, whatever its signal does. */
 async function hang(): Promise<never> {
   return new Promise<never>(() => {
@@ -1439,6 +1450,35 @@ describe('runDrain', () => {
       } finally {
         vi.useRealTimers()
       }
+    })
+  })
+
+  describe('the child abort result', () => {
+    it('logs a warning when the SDK resolves the abort with an error envelope', async () => {
+      // #given an abort the SDK resolved with the failure in the envelope instead of throwing
+      // #when drain cancels the child
+      await drainWithAbortResult({data: undefined, error: 'session not found'}, logger)
+
+      // #then it is logged like any other failed abort
+      expect(logger.warning).toHaveBeenCalledWith(
+        'Failed to abort owned session during drain-deadline cancellation',
+        expect.objectContaining({
+          sessionId: 'ses_child',
+          error: expect.stringContaining('session not found') as string,
+        }),
+      )
+    })
+
+    it('logs no abort failure when the abort succeeds', async () => {
+      // #given a successful abort
+      // #when drain cancels the child
+      await drainWithAbortResult({data: true}, logger)
+
+      // #then
+      expect(logger.warning).not.toHaveBeenCalledWith(
+        'Failed to abort owned session during drain-deadline cancellation',
+        expect.anything(),
+      )
     })
   })
 

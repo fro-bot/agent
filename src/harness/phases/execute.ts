@@ -35,6 +35,7 @@ import {executeOpenCode, resolveOutputMode} from '../../features/agent/index.js'
 import {inspectResponseFile, resolveResponseSurface} from '../../features/agent/response-file.js'
 import {sleep} from '../../shared/async.js'
 import {getGitHubWorkspace} from '../../shared/env.js'
+import {toErrorMessage} from '../../shared/errors.js'
 import {createLogger} from '../../shared/logger.js'
 import {STATE_KEYS} from '../config/state-keys.js'
 import {buildSessionSearchQuery} from './session-prep.js'
@@ -666,10 +667,14 @@ async function cancelOutstanding(options: {
         // A fresh signal per call: the execution deadline that just expired must not also cancel the
         // cancellation request itself, and a hung call must neither stall the drain nor outlive its bound.
         const result = await boundedCall(async signal => client.session.abort({path: {id: entry.sessionId}, signal}))
-        if (result.timedOut) {
+        // The SDK resolves a failed request with the failure in `error` instead of throwing.
+        const envelopeError = result.timedOut
+          ? undefined
+          : (result.value as {readonly error?: unknown} | undefined)?.error
+        if (result.timedOut || envelopeError != null) {
           logger.warning('Failed to abort owned session during drain-deadline cancellation', {
             sessionId: entry.sessionId,
-            error: `abort timed out after ${DRAIN_CALL_TIMEOUT_MS}ms`,
+            error: result.timedOut ? `abort timed out after ${DRAIN_CALL_TIMEOUT_MS}ms` : toErrorMessage(envelopeError),
           })
         }
       } catch (error) {
