@@ -4256,8 +4256,12 @@ describe('runOpenCodeCore', () => {
       await vi.advanceTimersByTimeAsync(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS)
 
       // #then — both upstream calls carried the run's directory, so CHILD is not settled early
-      expect(sessionChildren).toHaveBeenCalledWith({path: {id: 'sess-123'}, query: {directory}})
-      expect(sessionStatus).toHaveBeenCalledWith({query: {directory}})
+      expect(sessionChildren).toHaveBeenCalledWith({
+        path: {id: 'sess-123'},
+        query: {directory},
+        signal: expect.any(AbortSignal) as AbortSignal,
+      })
+      expect(sessionStatus).toHaveBeenCalledWith({query: {directory}, signal: expect.any(AbortSignal) as AbortSignal})
       expect(ownershipLedger.snapshot().find(e => e.sessionId === CHILD)?.state).toBe('outstanding')
 
       // Cleanup: CHILD genuinely stops; the next pass settles it and root idle completes the run.
