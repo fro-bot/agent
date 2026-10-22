@@ -362,3 +362,67 @@ describe('root abort on a stop that may leave the root running', () => {
     expect(run.status).not.toHaveBeenCalled()
   })
 })
+
+/** A `promptAsync` whose request the run signal cancels: the signal fires, then the request rejects. */
+function abortedDuringPrompt(controller: AbortController): () => never {
+  return () => {
+    controller.abort()
+    throw new DOMException('This operation was aborted', 'AbortError')
+  }
+}
+
+describe('promptAsync throwing', () => {
+  it('aborts and confirms the root when the request was cancelled by the run signal', async () => {
+    // #given the signal fires while promptAsync is in flight: the server may already have started the prompt
+    const controller = new AbortController()
+    const run = startRun({controller, onPrompt: abortedDuringPrompt(controller)})
+
+    // #when
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    // #then the stop is a timeout, not an unreachable server, and the root was aborted and checked
+    const error = failure(run)
+    expect(error.kind).toBe('timeout')
+    expect(error.quarantined).toBe(false)
+    expect(run.abort).toHaveBeenCalledTimes(1)
+    expect(run.abort).toHaveBeenCalledWith(expect.objectContaining({path: {id: ROOT}, query: {directory: DIRECTORY}}))
+    expect(run.status).toHaveBeenCalled()
+  })
+
+  it('quarantines when the root stays live after a cancelled promptAsync', async () => {
+    // #given
+    const controller = new AbortController()
+    const run = startRun({
+      controller,
+      onPrompt: abortedDuringPrompt(controller),
+      statuses: [{[ROOT]: {type: 'busy'}}],
+    })
+
+    // #when
+    await vi.advanceTimersByTimeAsync(PAST_SETTLE_BOUND_MS)
+
+    // #then
+    const error = failure(run)
+    expect(error.kind).toBe('timeout')
+    expect(error.quarantined).toBe(true)
+  })
+
+  it('keeps the unreachable fast path when the signal did not fire', async () => {
+    // #given a network failure with the run signal untouched
+    const run = startRun({
+      onPrompt: () => {
+        throw new TypeError('fetch failed')
+      },
+    })
+
+    // #when
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    // #then no abort and no liveness lookup: the prompt never reached the server
+    const error = failure(run)
+    expect(error.kind).toBe('unreachable')
+    expect(error.quarantined).toBe(false)
+    expect(run.abort).not.toHaveBeenCalled()
+    expect(run.status).not.toHaveBeenCalled()
+  })
+})

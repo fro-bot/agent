@@ -742,6 +742,15 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   } catch (error) {
     if (error instanceof RunCoreError) throw error
     const message = error instanceof Error ? error.message : String(error)
+    if (combinedSignal.aborted) {
+      // The run's own signal cancelled the request. Cancelling the request does not prove the server never
+      // started the prompt, so this is a stop where the root may be running, not an unreachable server.
+      clearInactivity()
+      logger.warn({sessionId, detail: message}, 'run-core: signal aborted while sending the prompt')
+      throw await throwWithBarrier('timeout', 'Run timed out: signal aborted while sending the prompt', {
+        rootMayBeRunning: true,
+      })
+    }
     logger.error({sessionId, detail: message}, 'run-core: promptAsync threw (server unreachable?)')
     throw await throwWithBarrier('unreachable', `PromptAsync threw: ${message}`)
   }
