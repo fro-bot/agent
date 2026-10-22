@@ -12,12 +12,13 @@
  * refusal, failure, cancel, expiry) so the lock is never left held.
  */
 
-import type {CoordinationConfig, RunState} from '@fro-bot/runtime'
+import type {CoordinationConfig, Result, RunState} from '@fro-bot/runtime'
 import type {RepoQuiescenceChecker} from '../execute/repo-quiescence.js'
 import type {GatewayLogger} from './client.js'
 
 import {err, ok} from '@fro-bot/runtime'
 import {Effect} from 'effect'
+import {releaseLockOrByOwnership} from '../execute/lock-release.js'
 import {toRuntimeLogger} from '../execute/runtime-logger.js'
 import {transitionRetryingStaleEtag} from '../execute/stale-etag-transition.js'
 import {
@@ -25,8 +26,15 @@ import {
   createHeartbeatController,
   createRunEffect,
   releaseLockEffect,
+  releaseLockIfHolderEffect,
   transitionRunEffect,
 } from '../runtime-effect.js'
+
+/** Runs a runtime-effect call to a `Result`, so the shared release helper sees both kinds of release alike. */
+async function toResult<A>(effect: Effect.Effect<A, Error>): Promise<Result<A, Error>> {
+  const settled = await Effect.runPromise(effect.pipe(Effect.either))
+  return settled._tag === 'Right' ? ok(settled.right) : err(settled.left)
+}
 
 export interface MaintenanceRunHandle {
   readonly runId: string
@@ -171,12 +179,28 @@ export function acquireMaintenanceRun(opts: {
         if (transitionResult.success === false) {
           logger.warn({repo, runId, err: transitionResult.error.message}, 'maintenance-run: terminal transition failed')
         }
-        yield* releaseLockEffect(coordinationConfig, repo, finalLockEtag, coordLogger).pipe(
-          Effect.tapError(error =>
-            Effect.sync(() => logger.warn({repo, runId, err: error.message}, 'maintenance-run: releaseLock failed')),
-          ),
-          Effect.either,
+        // A renewal the heartbeat lost track of may have moved the lock's ETag past the one held; the ownership
+        // fallback then deletes our own record and leaves a successor's alone.
+        const released = yield* Effect.promise(async () =>
+          releaseLockOrByOwnership({
+            releaseByEtag: async () =>
+              toResult(releaseLockEffect(coordinationConfig, repo, finalLockEtag, coordLogger)),
+            releaseIfHolder: async token =>
+              toResult(
+                releaseLockIfHolderEffect(coordinationConfig, repo, identity, coordLogger, {
+                  acquisitionToken: token,
+                  runId,
+                }),
+              ),
+            acquisitionToken,
+            logger,
+            context: {repo, runId},
+            label: 'maintenance-run',
+          }),
         )
+        if (released.success === false) {
+          logger.warn({repo, runId, err: released.error.message}, 'maintenance-run: releaseLock failed')
+        }
       })
 
     return {outcome: 'acquired' as const, handle: {runId, release}}

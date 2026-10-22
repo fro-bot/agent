@@ -35,6 +35,7 @@ import {
   parseRunState,
   patchRunDetails,
   releaseLock,
+  releaseLockIfHolder,
   transitionRun,
 } from '@fro-bot/runtime'
 
@@ -58,6 +59,7 @@ import {
 import {toOperatorFailureKind} from '../operator-contract/run-status.js'
 import {canonicalWorkspaceTarget} from '../workspace-api/client.js'
 import {abortRegistry} from './abort-registry.js'
+import {releaseLockOrByOwnership} from './lock-release.js'
 import {attachOpencode} from './opencode-attach.js'
 import {
   CLIENT_TIMEOUT_REPLY,
@@ -803,6 +805,9 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
   // and can mutate the shared per-repo checkout and must never run while unlocked.
   let preAckCompleted = false
   let lockEtag: string | null = null
+  // Minted per acquisition: the holder fields repeat across this gateway's runs, so renewal adoption and the
+  // ownership release match on it. Declared here, not at acquisition, because the outer finally releases with it.
+  const acquisitionToken = crypto.randomUUID()
   // ── Quarantine — set only when `runOpenCodeCore` throws a `RunCoreError` with
   // `quarantined: true`: its termination barrier could NOT confirm that this run's
   // owned background sessions actually stopped. Declared at this (outer-try-spanning)
@@ -894,8 +899,6 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
     // ── Acquire repo lock ─────────────────────────────────────────────────────────────────────────
 
-    // Minted per acquisition: the holder fields repeat across this gateway's runs, so renewal adoption matches on it.
-    const acquisitionToken = crypto.randomUUID()
     const lockResult = await acquireLock(coordinationConfig, repo, identity, request.surface, runId, coordLogger, {
       confirmExpiredHolder: deps.checkRepoQuiescence,
       acquisitionToken,
@@ -2051,7 +2054,21 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       if (quarantined === true) {
         logger.warn({repo, runId}, 'run: quarantined — lock retained, heartbeat left running')
       } else {
-        const releaseResult = await releaseLock(coordinationConfig, repo, lockEtag, coordLogger)
+        const heldEtag = lockEtag
+        // A renewal the heartbeat lost track of may have moved the lock's ETag past the one held; the ownership
+        // fallback then deletes our own record and leaves a successor's alone.
+        const releaseResult = await releaseLockOrByOwnership({
+          releaseByEtag: async () => releaseLock(coordinationConfig, repo, heldEtag, coordLogger),
+          releaseIfHolder: async token =>
+            releaseLockIfHolder(coordinationConfig, repo, identity, coordLogger, 'repo', {
+              acquisitionToken: token,
+              runId,
+            }),
+          acquisitionToken,
+          logger,
+          context: {repo, runId},
+          label: 'run',
+        })
         if (releaseResult.success === false) {
           logger.warn({repo, runId, err: releaseResult.error.message}, 'run: releaseLock failed')
         }

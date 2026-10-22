@@ -18,7 +18,7 @@ import {
   findStaleRuns,
   forceReleaseLock,
   releaseLock,
-  renewLease,
+  releaseLockIfHolder,
   syncArtifactsToStore,
   syncMetadataToStore,
   syncSessionsFromStore,
@@ -35,7 +35,7 @@ import {
   findStaleRunsEffect,
   forceReleaseLockEffect,
   releaseLockEffect,
-  renewLeaseEffect,
+  releaseLockIfHolderEffect,
   syncArtifactsToStoreEffect,
   syncMetadataToStoreEffect,
   syncSessionsFromStoreEffect,
@@ -52,7 +52,7 @@ vi.mock('@fro-bot/runtime', () => ({
   findStaleRuns: vi.fn(),
   forceReleaseLock: vi.fn(),
   releaseLock: vi.fn(),
-  renewLease: vi.fn(),
+  releaseLockIfHolder: vi.fn(),
   syncArtifactsToStore: vi.fn(),
   syncMetadataToStore: vi.fn(),
   syncSessionsFromStore: vi.fn(),
@@ -190,42 +190,41 @@ describe('releaseLockEffect', () => {
 })
 
 // ---------------------------------------------------------------------------
-// renewLeaseEffect
+// releaseLockIfHolderEffect
 // ---------------------------------------------------------------------------
 
-describe('renewLeaseEffect', () => {
+describe('releaseLockIfHolderEffect', () => {
   beforeEach(() => vi.resetAllMocks())
 
-  const lockRecord = {
-    repo: 'repo',
-    holder_id: 'holder',
-    surface: 'discord' as const,
-    acquired_at: new Date().toISOString(),
-    ttl_seconds: 60,
-    run_id: 'run-1',
-  }
+  const expected = {acquisitionToken: 'token-0001-abcd', runId: 'run-1'}
 
-  it('resolves to {etag} on success', async () => {
-    vi.mocked(renewLease).mockResolvedValue(ok({etag: 'new-etag'}))
+  it('resolves to the outcome and hands the holder, scope and expectation through', async () => {
+    vi.mocked(releaseLockIfHolder).mockResolvedValue(ok('not-holder'))
 
-    const exit = await Effect.runPromiseExit(renewLeaseEffect(config, 'repo', lockRecord, 'old-etag', coordLogger))
+    const exit = await Effect.runPromiseExit(
+      releaseLockIfHolderEffect(config, 'repo', 'gateway-1', coordLogger, expected),
+    )
 
-    expect(exit).toMatchObject({_tag: 'Success', value: {etag: 'new-etag'}})
+    expect(exit).toMatchObject({_tag: 'Success', value: 'not-holder'})
+    expect(releaseLockIfHolder).toHaveBeenCalledWith(config, 'repo', 'gateway-1', coordLogger, 'repo', expected)
   })
 
   it('fails with error when Result is failure', async () => {
-    vi.mocked(renewLease).mockResolvedValue(err(new Error('precondition failed')))
+    vi.mocked(releaseLockIfHolder).mockResolvedValue(err(new Error('503 slow down')))
 
     await assertEffectFailsWith(
-      renewLeaseEffect(config, 'repo', lockRecord, 'old-etag', coordLogger),
-      'precondition failed',
+      releaseLockIfHolderEffect(config, 'repo', 'gateway-1', coordLogger, expected),
+      '503 slow down',
     )
   })
 
   it('fails when underlying function throws', async () => {
-    vi.mocked(renewLease).mockRejectedValue('string error')
+    vi.mocked(releaseLockIfHolder).mockRejectedValue('string error')
 
-    await assertEffectFailsWith(renewLeaseEffect(config, 'repo', lockRecord, 'old-etag', coordLogger), 'string error')
+    await assertEffectFailsWith(
+      releaseLockIfHolderEffect(config, 'repo', 'gateway-1', coordLogger, expected),
+      'string error',
+    )
   })
 })
 

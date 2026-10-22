@@ -72,7 +72,7 @@ export interface LeaseLoopOptions<F = void> {
 }
 
 export interface LeaseLoopStopped<F> {
-  /** The freshest lock ETag a renewal confirmed (the acquisition ETag if none did). */
+  /** The freshest lock ETag a renewal confirmed or adoption found (the acquisition ETag if neither did). */
   readonly lockEtag: string
   /** What `finalize` returned. `undefined` only when no `finalize` was given. */
   readonly final: F | undefined
@@ -80,7 +80,7 @@ export interface LeaseLoopStopped<F> {
 
 /** The failure side of `stop()`. Still an `Error`, plus the facts a caller needs to settle conservatively. */
 export interface LeaseLoopStopError extends Error {
-  /** The freshest lock ETag a renewal confirmed. With `tickPending` it may already be stale. */
+  /** The freshest lock ETag a renewal confirmed or adoption found. With `tickPending` it may already be stale. */
   readonly lockEtag: string
   /** True when the budget ran out while an attempt was still in flight; that attempt may yet renew the lock. */
   readonly tickPending: boolean
@@ -94,7 +94,11 @@ export interface LeaseLoop<F = void> {
   /** Waits for the attempt in flight, if any, without stopping the loop. Bounded by the tick timeout. */
   readonly settle: () => Promise<void>
   readonly currentEtag: () => string
-  /** True while the latest attempt that finished (or timed out) ended without a confirmed renewal or in a failure. */
+  /**
+   * True while the latest attempt that finished (or timed out) ended without a confirmed renewal or in a failure. An
+   * adopted committed renewal counts as renewal health: the tick that adopted it does not set this. The gap is still
+   * recorded in `continuityUnverified()`, which a caller that needs fail-closed coverage must read instead.
+   */
   readonly hasFailed: () => boolean
   /**
    * Latches, and never clears, the first time lock coverage cannot be vouched for:
@@ -103,8 +107,9 @@ export interface LeaseLoop<F = void> {
    * - the body caught a renewal failure and returned, and no renewal confirmed earlier in that tick;
    * - the tick timeout fired before the renewal was confirmed;
    * - an attempt was still pending when `stop()`'s budget ran out.
-   * A failure or timeout after a confirmed renewal in the same tick does not latch (it still sets `hasFailed`). A tick that skips its renewal (stopping or
-   * superseded) neither latches nor fails.
+   * An adopted renewal still latches: adoption restores the ETag, not the coverage that was in doubt. A failure or
+   * timeout after a confirmed renewal in the same tick does not latch (it still sets `hasFailed`). A tick that skips
+   * its renewal (stopping or superseded) neither latches nor fails.
    */
   readonly continuityUnverified: () => boolean
   readonly isRunning: boolean
@@ -288,7 +293,10 @@ export function createLeaseLoop<F = void>(options: LeaseLoopOptions<F>): LeaseLo
           if (adopt === undefined || lost === null || stopping || attempt.superseded) return
           const stored = await readStoredLock(controller?.signal)
           // A read that resolves after the tick timed out is dropped, like any other late result.
-          if (attempt.superseded === false && takeStoredEtag(stored)) lost.adopted = true
+          if (attempt.superseded || stored === null || stored.etag === lockEtag) return
+          // The failure was real even though it is about to be recovered: report it first, then the recovery.
+          logFailure(lost.message, lost.error)
+          if (takeStoredEtag(stored)) lost.adopted = true
         }
 
         let renewed: LeaseRenewal

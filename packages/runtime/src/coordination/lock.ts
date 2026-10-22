@@ -50,7 +50,8 @@ export function isValidAcquisitionToken(value: string): boolean {
   return ACQUISITION_TOKEN_PATTERN.test(value)
 }
 
-function isPreconditionFailed(error: Error): boolean {
+/** True for the object store's conditional-write failure (`If-Match` / `If-None-Match` did not hold, HTTP 412). */
+export function isPreconditionFailed(error: Error): boolean {
   return /pre-?condition/.test(error.message.toLowerCase())
 }
 
@@ -335,6 +336,8 @@ export interface ReleaseIfHolderExpectation {
   readonly holderJob?: string
   /** When given, must equal the record's `acquisition_token`; a record without one does not match. */
   readonly acquisitionToken?: string
+  /** When given, must equal the record's `run_id`. */
+  readonly runId?: string
   /** Aborts the read, the body read and the delete; no delete starts once it has aborted. */
   readonly signal?: AbortSignal
 }
@@ -353,7 +356,7 @@ export async function releaseLockIfHolder(
   scope: LockScope = 'repo',
   expected: ReleaseIfHolderExpectation = {},
 ): Promise<Result<ReleaseIfHolderOutcome, Error>> {
-  const {holderJob, acquisitionToken, signal} = expected
+  const {holderJob, acquisitionToken, runId, signal} = expected
   const key = getLockKey(config, repo, scope)
   if (key.success === false) {
     return err(key.error)
@@ -384,7 +387,13 @@ export async function releaseLockIfHolder(
   }
 
   const tokenMatches = acquisitionToken === undefined || record.data.acquisition_token === acquisitionToken
-  if (record.data.holder_id !== holderId || record.data.holder_job !== holderJob || tokenMatches === false) {
+  const runMatches = runId === undefined || record.data.run_id === runId
+  if (
+    record.data.holder_id !== holderId ||
+    record.data.holder_job !== holderJob ||
+    tokenMatches === false ||
+    runMatches === false
+  ) {
     logger.debug('Lock held by another holder; not releasing', {
       key: key.data,
       repo,

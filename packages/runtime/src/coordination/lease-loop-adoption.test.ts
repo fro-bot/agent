@@ -133,12 +133,84 @@ describe('lease loop adoption', () => {
       expect(loop.currentEtag()).toBe('etag-committed')
       expect(loop.hasFailed()).toBe(false)
       expect(loop.continuityUnverified()).toBe(true)
-      expect(logger.warning).not.toHaveBeenCalled()
       expect(logger.info).toHaveBeenCalledTimes(1)
       expect(logger.info).toHaveBeenCalledWith('Coordination lease ETag adopted after a renewal outcome was lost', {
         ...CONTEXT,
         etag: 'etag-committed',
       })
+    })
+
+    it('logs the renewal failure at warning first, then the adoption at info, once each', async () => {
+      // #given a renewal that came back as an error and a read that finds our committed record
+      const {loop, logger} = setup({
+        script: async () => err(new Error('412 precondition failed')),
+        adopt: async () => ({etag: 'etag-committed'}),
+      })
+      loop.start()
+
+      // #when
+      await vi.advanceTimersByTimeAsync(INTERVAL_MS)
+
+      // #then the failure is reported with today's message, and only then the recovery
+      expect(logger.warning).toHaveBeenCalledTimes(1)
+      expect(logger.warning).toHaveBeenCalledWith('Coordination lease renewal failed', {
+        ...CONTEXT,
+        error: '412 precondition failed',
+      })
+      expect(logger.info).toHaveBeenCalledTimes(1)
+      expect(logger.warning.mock.invocationCallOrder[0]).toBeLessThan(logger.info.mock.invocationCallOrder[0] ?? 0)
+    })
+
+    it('logs a thrown renewal as "threw", before the adoption', async () => {
+      // #given
+      const {loop, logger} = setup({
+        script: async () => Promise.reject(new Error('socket hang up')),
+        adopt: async () => ({etag: 'etag-committed'}),
+      })
+      loop.start()
+
+      // #when
+      await vi.advanceTimersByTimeAsync(INTERVAL_MS)
+
+      // #then
+      expect(logger.warning).toHaveBeenCalledTimes(1)
+      expect(logger.warning).toHaveBeenCalledWith('Coordination lease renewal threw', {
+        ...CONTEXT,
+        error: 'socket hang up',
+      })
+      expect(logger.warning.mock.invocationCallOrder[0]).toBeLessThan(logger.info.mock.invocationCallOrder[0] ?? 0)
+    })
+
+    it('keeps the single warning of a failure that adoption did not recover, with no info line', async () => {
+      // #given a read that finds nothing of ours
+      const {loop, logger} = setup({script: async () => err(new Error('412')), adopt: async () => null})
+      loop.start()
+
+      // #when
+      await vi.advanceTimersByTimeAsync(INTERVAL_MS)
+
+      // #then
+      expect(logger.warning).toHaveBeenCalledTimes(1)
+      expect(logger.info).not.toHaveBeenCalled()
+    })
+
+    it('treats an adopted renewal as renewal health, and keeps the gap in continuityUnverified for good', async () => {
+      // #given an adopted tick, followed by a healthy one
+      const {loop} = setup({
+        script: async n => (n === 1 ? err(new Error('412')) : ok({etag: `etag-${n}`})),
+        adopt: async () => ({etag: 'etag-committed'}),
+      })
+      loop.start()
+
+      // #when
+      await vi.advanceTimersByTimeAsync(INTERVAL_MS)
+      const afterAdoption = {failed: loop.hasFailed(), unverified: loop.continuityUnverified()}
+      await vi.advanceTimersByTimeAsync(INTERVAL_MS)
+
+      // #then hasFailed() never reports the adopted tick; only continuityUnverified() records the gap, and it stays
+      expect(afterAdoption).toEqual({failed: false, unverified: true})
+      expect(loop.hasFailed()).toBe(false)
+      expect(loop.continuityUnverified()).toBe(true)
     })
 
     it('hands the adoption read the attempt signal, and none when abortOnDeadline is off', async () => {
@@ -373,7 +445,7 @@ describe('lease loop adoption', () => {
       expect(loop.currentEtag()).toBe('etag-committed')
       expect(loop.hasFailed()).toBe(false)
       expect(loop.continuityUnverified()).toBe(true)
-      expect(logger.warning).not.toHaveBeenCalled()
+      expect(logger.warning).toHaveBeenCalledTimes(1)
     })
 
     it('still fails the tick when the body throws something else after an adopted failure', async () => {

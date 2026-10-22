@@ -44,7 +44,7 @@ export interface HeartbeatStopResult {
  */
 export interface HeartbeatStopError extends Error {
   /**
-   * The freshest lock ETag a renewal confirmed (the acquisition ETag if none did). Tracked apart from the RunState
+   * The freshest lock ETag a renewal confirmed or adoption found (the acquisition ETag if neither did). Tracked apart from the RunState
    * ETag: a tick can renew the lock and then fail the RunState write, and release must still use the renewed ETag.
    * With `tickPending` it may already be stale; a conditional release then fails safely and the lease lapses via TTL.
    */
@@ -93,7 +93,7 @@ export interface HeartbeatController {
    * its tick timed out is ignored.
    *
    * If a heartbeat tick failed since the last successful tick, returns the tick error. Every failure carries
-   * `lockEtag`, the freshest lock ETag a renewal confirmed, so a RunState write that failed after a successful
+   * `lockEtag`, the freshest lock ETag a renewal confirmed or adoption found, so a RunState write that failed after a successful
    * renewal does not strand the caller on the acquisition ETag, and `runEtag`, the ETag of the last successful
    * RunState write.
    * Otherwise returns the freshest snapshot fetched after in-flight ticks complete.

@@ -62,6 +62,10 @@ export interface LeaseController {
    * this the same as an unconfirmed writer -- but that protection does not survive
    * a subsequent confirmed success.
    *
+   * An adopted committed renewal (a renewal S3 committed but the caller never saw succeed, recovered by
+   * reading the stored lock) counts as renewal health: the tick that adopted it does not set this. The gap
+   * is still recorded in `continuityUnverified()`, which a caller that needs fail-closed coverage must read.
+   *
    * This reflects present renewal health only. For whether uninterrupted coverage was
    * ever in doubt during this invocation, see `continuityUnverified()` below -- the two
    * answer different questions and a caller that needs the latched one must not

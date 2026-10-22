@@ -222,7 +222,8 @@ describe('gateway heartbeat lock ETag adoption', () => {
     const stopped = await controller.stop()
 
     // #then no warning was logged, and the ETag stop reports is the stored one
-    expect(log.warning).not.toHaveBeenCalled()
+    expect(log.warning).toHaveBeenCalledTimes(1)
+    expect(log.warning).toHaveBeenCalledWith('Coordination lease renewal failed', expect.anything())
     expect(stopped.success).toBe(true)
     expect(stopped.success ? stopped.data.lockEtag : '').toBe(store.lock()?.etag)
   })

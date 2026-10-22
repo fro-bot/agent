@@ -7,6 +7,7 @@ const mockAcquireLockEffect = vi.fn()
 const mockCreateRunEffect = vi.fn()
 const mockTransitionRunEffect = vi.fn()
 const mockReleaseLockEffect = vi.fn()
+const mockReleaseLockIfHolderEffect = vi.fn()
 
 vi.mock('../runtime-effect.js', () => ({
   createHeartbeatController: vi.fn(() => mockHeartbeat),
@@ -14,6 +15,7 @@ vi.mock('../runtime-effect.js', () => ({
   createRunEffect: (...args: unknown[]): unknown => mockCreateRunEffect(...args) as unknown,
   transitionRunEffect: (...args: unknown[]): unknown => mockTransitionRunEffect(...args) as unknown,
   releaseLockEffect: (...args: unknown[]): unknown => mockReleaseLockEffect(...args) as unknown,
+  releaseLockIfHolderEffect: (...args: unknown[]): unknown => mockReleaseLockIfHolderEffect(...args) as unknown,
 }))
 
 const {acquireMaintenanceRun} = await import('./maintenance-run.js')
@@ -34,6 +36,7 @@ beforeEach(() => {
   mockCreateRunEffect.mockReturnValue(Effect.succeed({etag: 'run-etag-1'}))
   mockTransitionRunEffect.mockReturnValue(Effect.succeed({etag: 'run-etag-3', state: {}}))
   mockReleaseLockEffect.mockReturnValue(Effect.succeed(undefined))
+  mockReleaseLockIfHolderEffect.mockReturnValue(Effect.succeed('released'))
 })
 
 function failedStop() {
@@ -378,6 +381,87 @@ describe('acquireMaintenanceRun', () => {
       // #then
       expect(mockTransitionRunEffect).toHaveBeenCalledTimes(1)
       expect(mockReleaseLockEffect).toHaveBeenCalledOnce()
+    })
+  })
+
+  describe('release by ownership when the lock ETag is stale', () => {
+    const stale = () => Effect.fail(new Error('PreconditionFailed'))
+
+    it('retries once through the ownership check with this acquisition’s token, holder and run', async () => {
+      // #given a late renewal moved the lock's ETag past the one stop reported
+      failedStop()
+      mockReleaseLockEffect.mockReturnValue(stale())
+      let runId = ''
+      const handle = await acquire(configStoring('EXECUTING', () => runId))
+      runId = handle.runId
+
+      // #when
+      await Effect.runPromise(handle.release('COMPLETED'))
+
+      // #then
+      const acquired = (mockAcquireLockEffect.mock.calls[0]?.[6] as {acquisitionToken: string}).acquisitionToken
+      expect(mockReleaseLockEffect).toHaveBeenCalledOnce()
+      expect(mockReleaseLockIfHolderEffect).toHaveBeenCalledOnce()
+      const call = mockReleaseLockIfHolderEffect.mock.calls[0] as unknown[]
+      expect(call[1]).toBe('acme/widget')
+      expect(call[2]).toBe('gw')
+      expect(call[4]).toEqual({acquisitionToken: acquired, runId})
+      expect(LOGGER.warn).not.toHaveBeenCalledWith(expect.anything(), 'maintenance-run: releaseLock failed')
+    })
+
+    it.each(['not-holder', 'no-lock', 'conflict'] as const)(
+      'does not warn when the check reports %s',
+      async outcome => {
+        // #given
+        mockReleaseLockEffect.mockReturnValue(stale())
+        mockReleaseLockIfHolderEffect.mockReturnValue(Effect.succeed(outcome))
+        let runId = ''
+        const handle = await acquire(configStoring('EXECUTING', () => runId))
+        runId = handle.runId
+
+        // #when
+        await Effect.runPromise(handle.release('COMPLETED'))
+
+        // #then
+        expect(mockReleaseLockIfHolderEffect).toHaveBeenCalledOnce()
+        expect(LOGGER.warn).not.toHaveBeenCalledWith(expect.anything(), 'maintenance-run: releaseLock failed')
+      },
+    )
+
+    it('warns, as before, when the check itself fails', async () => {
+      // #given
+      mockReleaseLockEffect.mockReturnValue(stale())
+      mockReleaseLockIfHolderEffect.mockReturnValue(Effect.fail(new Error('503 slow down')))
+      let runId = ''
+      const handle = await acquire(configStoring('EXECUTING', () => runId))
+      runId = handle.runId
+
+      // #when
+      await Effect.runPromise(handle.release('COMPLETED'))
+
+      // #then
+      expect(LOGGER.warn).toHaveBeenCalledWith(
+        expect.objectContaining({err: '503 slow down'}),
+        'maintenance-run: releaseLock failed',
+      )
+    })
+
+    it('does not retry a release that failed for another reason', async () => {
+      // #given
+      mockReleaseLockEffect.mockReturnValue(Effect.fail(new Error('503 slow down')))
+      let runId = ''
+      const handle = await acquire(configStoring('EXECUTING', () => runId))
+      runId = handle.runId
+
+      // #when
+      await Effect.runPromise(handle.release('COMPLETED'))
+
+      // #then
+      expect(mockReleaseLockIfHolderEffect).not.toHaveBeenCalled()
+      expect(LOGGER.warn).toHaveBeenCalledWith(
+        expect.objectContaining({err: '503 slow down'}),
+        'maintenance-run: releaseLock failed',
+      )
     })
   })
 })
