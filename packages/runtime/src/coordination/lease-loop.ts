@@ -61,7 +61,7 @@ export interface LeaseLoopOptions<F = void> {
    *
    * The loop calls it (a) inside the tick, after a renewal fails, while the attempt is current and stop has not
    * begun, so the tick timeout and its signal bound the read; and (b) once from `stop()` when the last tick ended
-   * with an unconfirmed renewal, within what is left of the stop budget. It adopts the ETag only when it differs
+   * with its latest renewal sent but never confirmed, within what is left of the stop budget. It adopts the ETag only when it differs
    * from the one held. In a tick, adoption clears the failure (`hasFailed()` is false) and leaves
    * `continuityUnverified()` latched; at stop the error is still returned, now carrying the adopted `lockEtag`.
    */
@@ -131,8 +131,6 @@ interface Attempt {
    * confirms. `message` is the log line for it: `err` result and thrown renewal are logged differently.
    */
   renewalFailure: {readonly error: Error; readonly message: string; adopted: boolean} | null
-  /** True once `renew` was called: the lock may have been rewritten whatever the call reported. */
-  renewalSent: boolean
   timer: ReturnType<typeof setTimeout> | undefined
 }
 
@@ -161,8 +159,9 @@ export function createLeaseLoop<F = void>(options: LeaseLoopOptions<F>): LeaseLo
   // The latest finished attempt's failure, or null. One field, so "failed without an error" cannot be represented.
   let failure: Error | null = null
   let continuityUnverified = false
-  // True after an attempt ended with a renewal that was sent but never confirmed: the stored ETag may differ from the
-  // one held. Cleared by a confirmed renewal or an adoption.
+  // True while the LATEST renewal that was sent has not been confirmed (it timed out, was aborted, failed or threw): it
+  // may still have committed, so the stored ETag may differ from the one held. Tracked per renewal, not per tick: a tick
+  // can confirm one renewal and lose the next. Cleared by a later confirmed renewal or an adoption.
   let lockEtagUncertain = false
   let running = false
   let stopping = false
@@ -181,8 +180,6 @@ export function createLeaseLoop<F = void>(options: LeaseLoopOptions<F>): LeaseLo
     failure = error
     // A failure after a confirmed renewal says nothing against lock coverage.
     if (attempt.renewalConfirmed === false) continuityUnverified = true
-    // A renewal that was sent and never confirmed may still have committed.
-    if (attempt.renewalSent && attempt.renewalConfirmed === false) lockEtagUncertain = true
   }
 
   /**
@@ -249,7 +246,6 @@ export function createLeaseLoop<F = void>(options: LeaseLoopOptions<F>): LeaseLo
       concluded: false,
       renewalConfirmed: false,
       renewalFailure: null,
-      renewalSent: false,
       timer: undefined,
     }
     inFlight = attempt
@@ -300,7 +296,7 @@ export function createLeaseLoop<F = void>(options: LeaseLoopOptions<F>): LeaseLo
         }
 
         let renewed: LeaseRenewal
-        attempt.renewalSent = true
+        lockEtagUncertain = true
         try {
           renewed =
             controller === undefined ? await renew(record, lockEtag) : await renew(record, lockEtag, controller.signal)

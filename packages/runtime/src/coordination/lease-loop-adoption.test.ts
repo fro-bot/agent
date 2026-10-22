@@ -673,6 +673,66 @@ describe('lease loop adoption', () => {
       expect(failure.lockEtag).toBe('etag-3')
     })
 
+    it('adopts the second renewal of a tick when the first confirmed and the second committed but timed out', async () => {
+      // #given a tick that renews twice: the first confirms, the second commits server-side and never answers
+      const {loop, adopt} = setup({
+        script: async n => (n === 1 ? ok({etag: 'etag-first'}) : hang()),
+        adopt: async () => ({etag: 'etag-second'}),
+        overrides: {
+          tick: async ctx => {
+            await ctx.renewLock(RECORD)
+            await ctx.renewLock(RECORD)
+          },
+        },
+      })
+      loop.start()
+      await vi.advanceTimersByTimeAsync(INTERVAL_MS + TICK_TIMEOUT_MS)
+      expect(loop.hasFailed()).toBe(true)
+      expect(loop.currentEtag()).toBe('etag-first')
+      expect(adopt).not.toHaveBeenCalled()
+
+      // #when
+      const failure = stopFailure(await loop.stop())
+
+      // #then the stop path looked, even though the tick had already confirmed a renewal
+      expect(adopt).toHaveBeenCalledTimes(1)
+      expect(failure.lockEtag).toBe('etag-second')
+      expect(loop.currentEtag()).toBe('etag-second')
+      // #and the per-tick coverage rules are untouched: a confirmed renewal in the tick means no latch
+      expect(loop.continuityUnverified()).toBe(false)
+    })
+
+    it('reads at stop after a caught second failure, and leaves the ETag alone when the stored one is the one held', async () => {
+      // #given the first renewal confirms, the second fails and the body catches it; nothing was stored
+      const {loop, adopt} = setup({
+        script: async n => (n === 1 ? ok({etag: 'etag-first'}) : err(new Error('503'))),
+        adopt: async () => ({etag: 'etag-first'}),
+        overrides: {
+          tick: async ctx => {
+            await ctx.renewLock(RECORD)
+            try {
+              await ctx.renewLock(RECORD)
+            } catch {
+              // Swallowed on purpose.
+            }
+          },
+        },
+      })
+      loop.start()
+      await vi.advanceTimersByTimeAsync(INTERVAL_MS)
+      expect(adopt).toHaveBeenCalledTimes(1)
+
+      // #when
+      const failure = stopFailure(await loop.stop())
+
+      // #then the stop path read once more, found nothing new, and changed nothing
+      expect(adopt).toHaveBeenCalledTimes(2)
+      expect(failure.lockEtag).toBe('etag-first')
+      expect(loop.currentEtag()).toBe('etag-first')
+      expect(loop.hasFailed()).toBe(true)
+      expect(loop.continuityUnverified()).toBe(false)
+    })
+
     it('does not read when the tick failed before any renewal was sent', async () => {
       // #given
       const {loop, adopt} = setup({

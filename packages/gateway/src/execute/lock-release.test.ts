@@ -18,7 +18,7 @@ import {
 } from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
-import {releaseLockOrByOwnership} from './lock-release.js'
+import {OWNERSHIP_RELEASE_BUDGET_MS, releaseLockOrByOwnership} from './lock-release.js'
 
 const REPO = 'owner/repo'
 const RUN_ID = 'run-1'
@@ -45,7 +45,9 @@ describe('releaseLockOrByOwnership', () => {
   }) {
     const logger = createLogger()
     const releaseByEtag = vi.fn(async () => options.byEtag ?? ok(undefined))
-    const releaseIfHolder = vi.fn(async (_token: string) => options.byOwnership ?? ok('released' as const))
+    const releaseIfHolder = vi.fn(
+      async (_token: string, _signal: AbortSignal) => options.byOwnership ?? ok('released' as const),
+    )
     const result = releaseLockOrByOwnership({
       releaseByEtag,
       releaseIfHolder,
@@ -73,7 +75,7 @@ describe('releaseLockOrByOwnership', () => {
 
     // #then
     expect(await result).toEqual(ok(undefined))
-    expect(releaseIfHolder).toHaveBeenCalledExactlyOnceWith(TOKEN)
+    expect(releaseIfHolder).toHaveBeenCalledExactlyOnceWith(TOKEN, expect.any(AbortSignal))
   })
 
   it('does not fall back for a failure that is not a stale ETag, and returns that failure', async () => {
@@ -125,6 +127,122 @@ describe('releaseLockOrByOwnership', () => {
   })
 })
 
+describe('releaseLockOrByOwnership deadline', () => {
+  const stale = () => err(new Error('PreconditionFailed'))
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  function start(
+    releaseIfHolder: (token: string, signal: AbortSignal) => Promise<Result<ReleaseIfHolderOutcome, Error>>,
+  ) {
+    const logger = createLogger()
+    const result = releaseLockOrByOwnership({
+      releaseByEtag: async () => stale(),
+      releaseIfHolder,
+      acquisitionToken: TOKEN,
+      logger,
+      context: {repo: REPO, runId: RUN_ID},
+      label: 'run',
+    })
+    return {result, logger}
+  }
+
+  it('gives up at the budget when the ownership release never finishes: aborts it, warns, returns an error', async () => {
+    // #given an adapter that ignores cancellation
+    let seen: AbortSignal | undefined
+    const started = start(async (_token, signal) => {
+      seen = signal
+      return new Promise(() => {})
+    })
+    const {logger} = started
+    let settled = false
+    const result = started.result.then(value => {
+      settled = true
+      return value
+    })
+
+    // #when just short of the budget, then at it
+    await vi.advanceTimersByTimeAsync(OWNERSHIP_RELEASE_BUDGET_MS - 1)
+    expect(settled).toBe(false)
+    expect(seen?.aborted).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    const outcome = await result
+
+    // #then
+    expect(seen?.aborted).toBe(true)
+    expect(outcome.success).toBe(false)
+    expect(outcome.success === false ? outcome.error.message : '').toBe(
+      `run: ownership release did not finish within ${OWNERSHIP_RELEASE_BUDGET_MS}ms — lock left to its TTL`,
+    )
+    expect(logger.warn).toHaveBeenCalledExactlyOnceWith(
+      {repo: REPO, runId: RUN_ID},
+      `run: ownership release did not finish within ${OWNERSHIP_RELEASE_BUDGET_MS}ms — lock left to its TTL`,
+    )
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('uses the heartbeat stop grace period as its budget', () => {
+    expect(OWNERSHIP_RELEASE_BUDGET_MS).toBe(HEARTBEAT_STOP_GRACE_MS)
+  })
+
+  it('does not unhandled-reject when the abandoned release fails after the deadline', async () => {
+    // #given
+    const late = Promise.withResolvers<Result<ReleaseIfHolderOutcome, Error>>()
+    const seen: unknown[] = []
+    const onUnhandled = (reason: unknown): void => {
+      seen.push(reason)
+    }
+    process.on('unhandledRejection', onUnhandled)
+    const {result} = start(async () => late.promise)
+    await vi.advanceTimersByTimeAsync(OWNERSHIP_RELEASE_BUDGET_MS)
+    await result
+
+    // #when the abandoned call rejects
+    late.reject(new Error('socket closed'))
+    vi.useRealTimers()
+    await new Promise(resolve => setTimeout(resolve, 5))
+    process.off('unhandledRejection', onUnhandled)
+
+    // #then
+    expect(seen).toEqual([])
+  })
+
+  it('turns a rejected ownership release into an error and clears its timer', async () => {
+    // #given
+    const {result} = start(async () => Promise.reject(new Error('boom')))
+
+    // #when
+    const outcome = await result
+
+    // #then
+    expect(outcome.success === false ? outcome.error.message : '').toBe('boom')
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('finishing inside the budget logs nothing at warn and leaves no timer behind', async () => {
+    // #given
+    const {result, logger} = start(async () => {
+      await new Promise(resolve => setTimeout(resolve, 1_000))
+      return ok('released' as const)
+    })
+
+    // #when
+    await vi.advanceTimersByTimeAsync(1_000)
+    const outcome = await result
+
+    // #then
+    expect(outcome).toEqual(ok(undefined))
+    expect(logger.warn).not.toHaveBeenCalled()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+})
+
 // ---------------------------------------------------------------------------
 // End to end: the real heartbeat, the real lock code, an in-memory store with S3's ETag semantics
 // ---------------------------------------------------------------------------
@@ -166,10 +284,22 @@ function runState(): RunState {
 /** Replaces a lock write; `real` performs the compare-and-swap at once. `n` counts lock writes. */
 type PutHook = (real: () => PutResult, n: number) => Promise<PutResult>
 
-function createStore(putHook?: PutHook) {
+interface StoreHooks {
+  /** Replaces a delete; `real` performs the compare-and-delete at once. `n` counts deletes. */
+  readonly onDelete?: (real: () => Result<void, Error>, n: number) => Promise<Result<void, Error>>
+  /** Replaces a read of the lock; `real` returns what the store holds now. `n` counts lock reads. */
+  readonly onLockRead?: (
+    real: () => Result<{data: string; etag: string}, Error>,
+    n: number,
+  ) => Promise<Result<{data: string; etag: string}, Error>>
+}
+
+function createStore(putHook?: PutHook, hooks: StoreHooks = {}) {
   const objects = new Map<string, {data: string; etag: string}>()
   let version = 0
   let lockWrites = 0
+  let deletes = 0
+  let lockReads = 0
   const set = (key: string, data: string): string => {
     version += 1
     const etag = `etag-${version}`
@@ -185,13 +315,22 @@ function createStore(putHook?: PutHook) {
     list: vi.fn(async () => ok([])),
     listWithMetadata: vi.fn(async () => ok([])),
     conditionalDelete: vi.fn<NonNullable<ObjectStoreAdapter['conditionalDelete']>>(async (key, options) => {
-      if (objects.get(key)?.etag !== options.ifMatch) return err(new Error('PreconditionFailed'))
-      objects.delete(key)
-      return ok(undefined)
+      deletes += 1
+      const real = (): Result<void, Error> => {
+        if (objects.get(key)?.etag !== options.ifMatch) return err(new Error('PreconditionFailed'))
+        objects.delete(key)
+        return ok(undefined)
+      }
+      return hooks.onDelete === undefined ? real() : hooks.onDelete(real, deletes)
     }),
     getObject: vi.fn<NonNullable<ObjectStoreAdapter['getObject']>>(async key => {
-      const found = objects.get(key)
-      return found === undefined ? err(new Error('NoSuchKey')) : ok({...found})
+      const real = (): Result<{data: string; etag: string}, Error> => {
+        const found = objects.get(key)
+        return found === undefined ? err(new Error('NoSuchKey')) : ok({...found})
+      }
+      if (key !== LOCK_KEY || hooks.onLockRead === undefined) return real()
+      lockReads += 1
+      return hooks.onLockRead(real, lockReads)
     }),
     conditionalPut: vi.fn<NonNullable<ObjectStoreAdapter['conditionalPut']>>(async (key, data, options) => {
       if (key === LOCK_KEY) lockWrites += 1
@@ -221,6 +360,7 @@ function createStore(putHook?: PutHook) {
       return found === undefined ? null : (JSON.parse(found.data) as LockRecord)
     },
     replaceLock: (record: LockRecord) => set(LOCK_KEY, JSON.stringify(record)),
+    deleteCount: () => deletes,
     deleteLock: () => objects.delete(LOCK_KEY),
   }
 }
@@ -247,8 +387,12 @@ async function releaseAfterStop(store: ReturnType<typeof createStore>, etag: str
   const coordLogger = {debug: vi.fn()}
   const result = await releaseLockOrByOwnership({
     releaseByEtag: async () => releaseLock(store.config, REPO, etag, coordLogger),
-    releaseIfHolder: async token =>
-      releaseLockIfHolder(store.config, REPO, HOLDER, coordLogger, 'repo', {acquisitionToken: token, runId: RUN_ID}),
+    releaseIfHolder: async (token, signal) =>
+      releaseLockIfHolder(store.config, REPO, HOLDER, coordLogger, 'repo', {
+        acquisitionToken: token,
+        runId: RUN_ID,
+        signal,
+      }),
     acquisitionToken: TOKEN,
     logger,
     context: {repo: REPO, runId: RUN_ID},
@@ -411,5 +555,88 @@ describe('releasing by ownership after a heartbeat stop, against the real lock',
     expect(result).toEqual(ok(undefined))
     expect(store.lock()).toEqual(successor)
     expect(logger.warn).not.toHaveBeenCalled()
+  })
+})
+
+describe('a stalled ownership release against the real lock', () => {
+  const STALE_ETAG = 'etag-stale'
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-04-24T18:15:00.000Z'))
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('is bounded when the read stalls, aborts the read, and never issues the delete', async () => {
+    // #given a store whose lock read hangs and ignores its abort signal; the first read is the fallback's
+    const store = createStore(undefined, {onLockRead: async () => new Promise(() => {})})
+    let settled = false
+
+    // #when
+    const released = releaseAfterStop(store, STALE_ETAG).then(value => {
+      settled = true
+      return value
+    })
+    await vi.advanceTimersByTimeAsync(OWNERSHIP_RELEASE_BUDGET_MS - 1)
+    expect(settled).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    const {result, logger} = await released
+
+    // #then the release gave up with an error, and only the stale ETag delete ever reached the store
+    expect(result.success).toBe(false)
+    expect(logger.warn).toHaveBeenCalledOnce()
+    expect(store.deleteCount()).toBe(1)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('is bounded when the delete stalls, and aborts it', async () => {
+    // #given the stale delete 412s as it should, and the ownership delete then hangs
+    let seen: unknown
+    const store = createStore(undefined, {
+      onDelete: async (real, n) => {
+        if (n === 1) return real()
+        seen = 'started'
+        return new Promise(() => {})
+      },
+    })
+    let settled = false
+
+    // #when
+    const released = releaseAfterStop(store, STALE_ETAG).then(value => {
+      settled = true
+      return value
+    })
+    await vi.advanceTimersByTimeAsync(OWNERSHIP_RELEASE_BUDGET_MS - 1)
+    expect(seen).toBe('started')
+    expect(settled).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    const {result, logger} = await released
+
+    // #then
+    expect(result.success).toBe(false)
+    expect(logger.warn).toHaveBeenCalledOnce()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('issues no delete when the read only resolves after the deadline', async () => {
+    // #given a read that answers late with a record that is ours
+    const late = Promise.withResolvers<Result<{data: string; etag: string}, Error>>()
+    const store = createStore(undefined, {onLockRead: async () => late.promise})
+    const released = releaseAfterStop(store, STALE_ETAG)
+    await vi.advanceTimersByTimeAsync(OWNERSHIP_RELEASE_BUDGET_MS)
+    const {result} = await released
+    expect(result.success).toBe(false)
+
+    // #when the abandoned read finally lands
+    const found = store.lock()
+    late.resolve(ok({data: found?.data ?? '', etag: found?.etag ?? ''}))
+    await vi.advanceTimersByTimeAsync(0)
+
+    // #then it must not go on to delete the lock
+    expect(store.deleteCount()).toBe(1)
+    expect(store.lock()).not.toBeNull()
   })
 })

@@ -1,6 +1,7 @@
 import type {CoordinationConfig} from '@fro-bot/runtime'
 import {Effect} from 'effect'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
+import {OWNERSHIP_RELEASE_BUDGET_MS} from '../execute/lock-release.js'
 
 const mockHeartbeat = {start: vi.fn(), stop: vi.fn(), isRunning: false}
 const mockAcquireLockEffect = vi.fn()
@@ -405,7 +406,7 @@ describe('acquireMaintenanceRun', () => {
       const call = mockReleaseLockIfHolderEffect.mock.calls[0] as unknown[]
       expect(call[1]).toBe('acme/widget')
       expect(call[2]).toBe('gw')
-      expect(call[4]).toEqual({acquisitionToken: acquired, runId})
+      expect(call[4]).toEqual({acquisitionToken: acquired, runId, signal: expect.any(AbortSignal) as AbortSignal})
       expect(LOGGER.warn).not.toHaveBeenCalledWith(expect.anything(), 'maintenance-run: releaseLock failed')
     })
 
@@ -444,6 +445,39 @@ describe('acquireMaintenanceRun', () => {
         expect.objectContaining({err: '503 slow down'}),
         'maintenance-run: releaseLock failed',
       )
+    })
+
+    it('still resolves the release when the ownership check stalls, and aborts it at the budget', async () => {
+      // #given
+      vi.useFakeTimers()
+      try {
+        mockReleaseLockEffect.mockReturnValue(stale())
+        mockReleaseLockIfHolderEffect.mockReturnValue(Effect.never)
+        let runId = ''
+        const handle = await acquire(configStoring('EXECUTING', () => runId))
+        runId = handle.runId
+        let resolved = false
+
+        // #when
+        const releasing = Effect.runPromise(handle.release('COMPLETED')).then(() => {
+          resolved = true
+        })
+        await vi.advanceTimersByTimeAsync(OWNERSHIP_RELEASE_BUDGET_MS - 1)
+        expect(resolved).toBe(false)
+        const signal = ((mockReleaseLockIfHolderEffect.mock.calls[0] as unknown[])[4] as {signal: AbortSignal}).signal
+        expect(signal.aborted).toBe(false)
+        await vi.advanceTimersByTimeAsync(1)
+        await releasing
+
+        // #then
+        expect(signal.aborted).toBe(true)
+        expect(LOGGER.warn).toHaveBeenCalledWith(
+          expect.objectContaining({err: expect.stringContaining('ownership release did not finish') as string}),
+          'maintenance-run: releaseLock failed',
+        )
+      } finally {
+        vi.useRealTimers()
+      }
     })
 
     it('does not retry a release that failed for another reason', async () => {

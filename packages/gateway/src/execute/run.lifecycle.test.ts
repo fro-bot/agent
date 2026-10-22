@@ -27,6 +27,7 @@ import {
   setupHappyPath,
 } from './test-helpers.js'
 import * as reactionsModule from '../discord/reactions.js'
+import {OWNERSHIP_RELEASE_BUDGET_MS} from './lock-release.js'
 import * as runCoreModule from './run-core.js'
 import {formatTimeoutDuration} from './run.js'
 /* eslint-enable perfectionist/sort-imports */
@@ -990,7 +991,7 @@ describe('runMention', () => {
         expect(call?.[1]).toBe('acme/widget')
         expect(call?.[2]).toBe('discord-gateway')
         expect(call?.[4]).toBe('repo')
-        expect(call?.[5]).toEqual({acquisitionToken: acquired, runId})
+        expect(call?.[5]).toEqual({acquisitionToken: acquired, runId, signal: expect.any(AbortSignal) as AbortSignal})
         // #and the recovery is not a failure
         expect(deps.logger.warn).not.toHaveBeenCalledWith(expect.anything(), 'run: releaseLock failed')
       })
@@ -1030,6 +1031,41 @@ describe('runMention', () => {
           expect.objectContaining({err: '503 slow down'}),
           'run: releaseLock failed',
         )
+      })
+
+      it('still reaches the slot hand-off when the ownership release stalls, and aborts it at the budget', async () => {
+        // #given the ETag release loses its condition and the ownership release never answers
+        vi.useFakeTimers()
+        try {
+          const {runMention} = await import('./run.js')
+          setupHappyPath()
+          mockRuntime.releaseLock.mockResolvedValue(precondition())
+          mockRuntime.releaseLockIfHolder.mockImplementation(async () => new Promise(() => {}))
+          const deps = makeDeps()
+          let finished = false
+
+          // #when
+          const running = runMention(makeMessage(), makeBinding(), deps).then(() => {
+            finished = true
+          })
+          await vi.advanceTimersByTimeAsync(OWNERSHIP_RELEASE_BUDGET_MS - 1)
+          expect(finished).toBe(false)
+          const signal = (mockRuntime.releaseLockIfHolder.mock.calls[0]?.[5] as {signal: AbortSignal}).signal
+          expect(signal.aborted).toBe(false)
+          await vi.advanceTimersByTimeAsync(1)
+          await running
+
+          // #then the run completed, its slot was released, and the stalled call was told to stop
+          expect(signal.aborted).toBe(true)
+          const releaseFn = deps.concurrency.release as ReturnType<typeof vi.fn>
+          expect(releaseFn).toHaveBeenCalledWith(CHANNEL_ID)
+          expect(deps.logger.warn).toHaveBeenCalledWith(
+            expect.objectContaining({err: expect.stringContaining('ownership release did not finish') as string}),
+            'run: releaseLock failed',
+          )
+        } finally {
+          vi.useRealTimers()
+        }
       })
 
       it('does not retry a release that failed for another reason', async () => {

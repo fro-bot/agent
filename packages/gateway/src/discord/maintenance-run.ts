@@ -185,11 +185,12 @@ export function acquireMaintenanceRun(opts: {
           releaseLockOrByOwnership({
             releaseByEtag: async () =>
               toResult(releaseLockEffect(coordinationConfig, repo, finalLockEtag, coordLogger)),
-            releaseIfHolder: async token =>
+            releaseIfHolder: async (token, signal) =>
               toResult(
                 releaseLockIfHolderEffect(coordinationConfig, repo, identity, coordLogger, {
                   acquisitionToken: token,
                   runId,
+                  signal,
                 }),
               ),
             acquisitionToken,

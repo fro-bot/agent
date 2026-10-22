@@ -2059,10 +2059,11 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         // fallback then deletes our own record and leaves a successor's alone.
         const releaseResult = await releaseLockOrByOwnership({
           releaseByEtag: async () => releaseLock(coordinationConfig, repo, heldEtag, coordLogger),
-          releaseIfHolder: async token =>
+          releaseIfHolder: async (token, signal) =>
             releaseLockIfHolder(coordinationConfig, repo, identity, coordLogger, 'repo', {
               acquisitionToken: token,
               runId,
+              signal,
             }),
           acquisitionToken,
           logger,
