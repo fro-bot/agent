@@ -211,12 +211,24 @@ export async function settleOwnedSessions(params: SettleOwnedSessionsParams): Pr
         // Confirm — an abort call succeeding is a delivery receipt, not proof the child
         // actually stopped. Reuse the same reconciliation primitive the drain loop uses.
         const adapter = createSdkLedgerReconcileAdapter(client, directory)
+        // Once the bound has passed this attempt is abandoned: whatever it still has in flight must not
+        // change the ledger the caller has already read the decision from.
+        const attemptLedger: OwnershipLedger = {
+          ...ledger,
+          settle: sessionId => {
+            if (!isFinished()) ledger.settle(sessionId)
+          },
+          markUnknown: sessionId => {
+            if (!isFinished()) ledger.markUnknown(sessionId)
+          },
+        }
         if (unsettled.length > 0) {
           const reconcileResult = await reconcileLedgerOnce({
-            ledger,
+            ledger: attemptLedger,
             adapter,
             parentSessionId: rootSessionId,
             logger: toRuntimeLogger(logger),
+            signal: teardownSignal,
           })
           if (reconcileResult.success === false) {
             logger.warn(
@@ -255,9 +267,9 @@ export async function settleOwnedSessions(params: SettleOwnedSessionsParams): Pr
         // child actually stopped. Explicitly downgrade every remaining entry to `unknown`
         // (idempotent for one already `unknown`) rather than leaving it `outstanding`,
         // which would misrepresent "we gave up waiting" as "we never tried".
-        const stillUnresolved = ledger.snapshot().filter(entry => entry.state !== 'settled')
+        const stillUnresolved = attemptLedger.snapshot().filter(entry => entry.state !== 'settled')
         for (const entry of stillUnresolved) {
-          ledger.markUnknown(entry.sessionId)
+          attemptLedger.markUnknown(entry.sessionId)
         }
         const stillUnresolvedIds = stillUnresolved.map(entry => entry.sessionId)
         logger.error(
@@ -288,8 +300,14 @@ export async function settleOwnedSessions(params: SettleOwnedSessionsParams): Pr
     },
     () => {
       finished = true
+      // Nothing was confirmed in time, so every unsettled entry is downgraded exactly as when the attempt ends
+      // unconfirmed. Marking happens after `finished` is set, so the abandoned attempt cannot undo it.
+      const abandonedEntries = ledger.snapshot().filter(entry => entry.state !== 'settled')
+      for (const entry of abandonedEntries) {
+        ledger.markUnknown(entry.sessionId)
+      }
       logger.error(
-        {rootSessionId, timeoutMs},
+        {rootSessionId, timeoutMs, abandonedIds: abandonedEntries.map(entry => entry.sessionId)},
         'settle-owned-sessions: settle attempt exceeded its bound — quarantining rather than hanging',
       )
       return {settled: false, reason: `settle attempt exceeded its ${timeoutMs}ms bound`}

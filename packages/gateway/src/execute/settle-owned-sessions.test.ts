@@ -122,8 +122,12 @@ describe('settleOwnedSessions', () => {
       const result = await settleOwnedSessions({client, directory, rootSessionId: ROOT, ledger, logger: makeLogger()})
 
       // #then — both reconciliation calls carried the directory, so the live child is not settled
-      expect(childrenSpy).toHaveBeenCalledWith({path: {id: ROOT}, query: {directory}})
-      expect(statusSpy).toHaveBeenCalledWith({query: {directory}})
+      expect(childrenSpy).toHaveBeenCalledWith({
+        path: {id: ROOT},
+        query: {directory},
+        signal: expect.any(AbortSignal) as AbortSignal,
+      })
+      expect(statusSpy).toHaveBeenCalledWith({query: {directory}, signal: expect.any(AbortSignal) as AbortSignal})
       expect(result.settled).toBe(false)
       expect(ledger.snapshot().find(entry => entry.sessionId === CHILD)?.state).toBe('unknown')
     })
@@ -427,6 +431,113 @@ describe('settleOwnedSessions', () => {
       // #then
       expect(result.settled).toBe(false)
       expect(elapsedMs).toBeLessThan(1_000)
+
+      // #and the entry the confirmation never answered for is unknown, not left outstanding
+      expect(ledger.snapshot()).toEqual([{sessionId: CHILD, label: 'background task', state: 'unknown'}])
+    })
+  })
+
+  describe('settle timeout — what is left in the ledger', () => {
+    it('marks every unsettled tracked entry unknown when the bound runs out, and leaves a settled one alone', async () => {
+      // #given — one outstanding, one already unknown, one settled; the abort never answers
+      const ledger = createOwnershipLedger()
+      ledger.adopt('sess-a', 'outstanding task')
+      ledger.adopt('sess-b', 'unknown task')
+      ledger.markUnknown('sess-b')
+      ledger.adopt('sess-c', 'settled task')
+      ledger.settle('sess-c')
+      const client = makeClient({
+        abort: async () =>
+          new Promise(() => {
+            /* never resolves */
+          }),
+      })
+
+      // #when
+      const result = await settleOwnedSessions({
+        client,
+        directory: '/workspace/repo',
+        rootSessionId: ROOT,
+        ledger,
+        logger: makeLogger(),
+        timeoutMs: 50,
+      })
+
+      // #then — quarantine, and the ledger says honestly that nothing was confirmed
+      expect(result.settled).toBe(false)
+      expect(ledger.snapshot()).toEqual([
+        {sessionId: 'sess-a', label: 'outstanding task', state: 'unknown'},
+        {sessionId: 'sess-b', label: 'unknown task', state: 'unknown'},
+        {sessionId: 'sess-c', label: 'settled task', state: 'settled'},
+      ])
+      expect(ledger.isDrainComplete()).toBe(false)
+    })
+
+    it('does not let a confirmation that answers after the bound settle an entry', async () => {
+      // #given — the confirmation answers late, and says the child is a child of the root and no longer live
+      const ledger = createOwnershipLedger()
+      ledger.adopt(CHILD, 'background task')
+      const lateAnswers: (() => void)[] = []
+      const client = makeClient({
+        abort: async () => ({data: {}, error: null}),
+        children: async () =>
+          new Promise(resolve => {
+            lateAnswers.push(() => resolve({data: [{id: CHILD}], error: null}))
+          }),
+        status: async () => ({data: {}, error: null}),
+      })
+
+      const result = await settleOwnedSessions({
+        client,
+        directory: '/workspace/repo',
+        rootSessionId: ROOT,
+        ledger,
+        logger: makeLogger(),
+        timeoutMs: 50,
+      })
+      expect(result.settled).toBe(false)
+
+      // #when — the abandoned confirmation finally answers
+      for (const answer of lateAnswers) answer()
+      await new Promise<void>(resolve => {
+        setTimeout(resolve, 20)
+      })
+
+      // #then — the decision already made stands
+      expect(ledger.snapshot()).toEqual([{sessionId: CHILD, label: 'background task', state: 'unknown'}])
+    })
+
+    it('hands the confirmation the same teardown signal the aborts use', async () => {
+      // #given
+      const ledger = createOwnershipLedger()
+      ledger.adopt(CHILD, 'background task')
+      const abortSignals: AbortSignal[] = []
+      const childrenSignals: AbortSignal[] = []
+      const client = makeClient({
+        abort: async args => {
+          abortSignals.push((args as {signal: AbortSignal}).signal)
+          return {data: {}, error: null}
+        },
+        children: async args => {
+          childrenSignals.push((args as {signal: AbortSignal}).signal)
+          return {data: [{id: CHILD}], error: null}
+        },
+        status: async () => ({data: {}, error: null}),
+      })
+
+      // #when
+      await settleOwnedSessions({
+        client,
+        directory: '/workspace/repo',
+        rootSessionId: ROOT,
+        ledger,
+        logger: makeLogger(),
+      })
+
+      // #then — one signal for the whole attempt, so the bound that ends the attempt also ends the request
+      expect(childrenSignals).toHaveLength(1)
+      expect(childrenSignals[0]).toBeInstanceOf(AbortSignal)
+      expect(abortSignals.every(signal => signal === childrenSignals[0])).toBe(true)
     })
   })
 })
