@@ -169,6 +169,24 @@ export interface ReconcileLedgerOptions {
   readonly adapter: LedgerReconcileAdapter
   readonly parentSessionId: string
   readonly logger: Logger
+  /**
+   * Aborts the upstream lookups of this pass. Passed to the adapter only when defined, so a caller with no
+   * signal sends exactly the arguments it always did. An aborted lookup fails the pass like any other failure.
+   */
+  readonly signal?: AbortSignal
+}
+
+/**
+ * What a successful pass saw, separate from what it did to the ledger. Callers that only care about ledger state
+ * ignore it; a pass that fails returns an error and has no observation.
+ */
+export interface ReconcileObservation {
+  /**
+   * Unsettled entries (`outstanding` or `unknown`) whose session this pass saw as a live direct child of the
+   * parent. An `unknown` entry stays `unknown` in the ledger when it is seen running; this is the only place that
+   * shows it was.
+   */
+  readonly liveTrackedSessionIds: ReadonlySet<string>
 }
 
 /**
@@ -184,14 +202,20 @@ export interface ReconcileLedgerOptions {
  * Makes no upstream calls when the ledger has no entries at all — see
  * "Empty-ledger short circuit" in the module doc.
  */
-export async function reconcileLedgerOnce(options: ReconcileLedgerOptions): Promise<Result<void, Error>> {
-  const {ledger, adapter, parentSessionId, logger} = options
+export async function reconcileLedgerOnce(
+  options: ReconcileLedgerOptions,
+): Promise<Result<ReconcileObservation, Error>> {
+  const {ledger, adapter, parentSessionId, logger, signal} = options
 
   if (ledger.snapshot().length === 0) {
-    return ok(undefined)
+    return ok({liveTrackedSessionIds: new Set<string>()})
   }
 
-  const [childrenResult, liveResult] = await Promise.all([adapter.children(parentSessionId), adapter.liveSessionIds()])
+  const signalArgs: [AbortSignal] | [] = signal === undefined ? [] : [signal]
+  const [childrenResult, liveResult] = await Promise.all([
+    adapter.children(parentSessionId, ...signalArgs),
+    adapter.liveSessionIds(...signalArgs),
+  ])
 
   if (childrenResult.success === false || liveResult.success === false) {
     const error = childrenResult.success === false ? childrenResult.error : (liveResult as {error: Error}).error
@@ -214,6 +238,7 @@ export async function reconcileLedgerOnce(options: ReconcileLedgerOptions): Prom
 
   const settled: string[] = []
   const downgradedToUnknown: string[] = []
+  const liveTrackedSessionIds = new Set<string>()
   for (const entry of ledger.snapshot()) {
     if (entry.state !== 'outstanding' && entry.state !== 'unknown') continue
 
@@ -228,7 +253,10 @@ export async function reconcileLedgerOnce(options: ReconcileLedgerOptions): Prom
       continue
     }
 
-    if (liveSessionIds.has(entry.sessionId) === true) continue
+    if (liveSessionIds.has(entry.sessionId) === true) {
+      liveTrackedSessionIds.add(entry.sessionId)
+      continue
+    }
     ledger.settle(entry.sessionId)
     settled.push(entry.sessionId)
   }
@@ -242,7 +270,7 @@ export async function reconcileLedgerOnce(options: ReconcileLedgerOptions): Prom
     })
   }
 
-  return ok(undefined)
+  return ok({liveTrackedSessionIds})
 }
 
 export interface LedgerReconciler {
@@ -253,6 +281,12 @@ export interface LedgerReconciler {
 export interface CreateLedgerReconcilerOptions extends ReconcileLedgerOptions {
   /** Interval between interval-triggered passes. Defaults to `DEFAULT_LEDGER_RECONCILE_INTERVAL_MS`. */
   readonly intervalMs?: number
+  /**
+   * Runs on each tick in place of `reconcileLedgerOnce(options)`, for a caller that bounds or guards its own
+   * passes. Its returned promise holds the in-flight guard, so it should settle on its own; a rejection is
+   * swallowed like any other pass failure and does not stop later ticks.
+   */
+  readonly runPass?: () => Promise<unknown>
 }
 
 /**
@@ -274,7 +308,7 @@ export interface CreateLedgerReconcilerOptions extends ReconcileLedgerOptions {
  * barring overlap" timing callers and tests already rely on.
  */
 export function createLedgerReconciler(options: CreateLedgerReconcilerOptions): LedgerReconciler {
-  const {intervalMs = DEFAULT_LEDGER_RECONCILE_INTERVAL_MS, ...reconcileOptions} = options
+  const {intervalMs = DEFAULT_LEDGER_RECONCILE_INTERVAL_MS, runPass, ...reconcileOptions} = options
 
   let disposed = false
   let inFlight = false
@@ -282,10 +316,12 @@ export function createLedgerReconciler(options: CreateLedgerReconcilerOptions): 
     if (disposed) return
     if (inFlight) return // a previous pass is still running — skip this tick rather than stack.
     inFlight = true
-    reconcileLedgerOnce(reconcileOptions)
+    const pass = runPass === undefined ? reconcileLedgerOnce(reconcileOptions) : (async () => runPass())()
+    pass
       .catch(() => {
         // reconcileLedgerOnce never rejects (all upstream failures are captured as `err`
-        // results and logged internally); this catch exists only to satisfy no-floating-promises.
+        // results and logged internally); an injected pass may. This catch keeps a rejection from
+        // escaping and satisfies no-floating-promises.
       })
       .finally(() => {
         inFlight = false
