@@ -353,9 +353,9 @@ describe('runOpenCodeCore — provider rejection fails fast (#1836)', () => {
       expect((run.outcome() as {error: RunCoreError}).error.quarantined).toBe(false)
     })
 
-    it('passes rootLive through the barrier options: a retry status always tears the live root down first', async () => {
+    it('passes rootMayBeRunning through the barrier options: a retry status always tears the live root down first', async () => {
       // #given — a retry status is the one failure source where OpenCode is still running the root. If
-      // `failFromProvider` stopped passing `rootLive` into `throwWithBarrier`, the barrier would see no live
+      // `failFromProvider` stopped passing `rootMayBeRunning` into `throwWithBarrier`, the barrier would see no live
       // work (no ledger, no drain) and return immediately.
       const run = startRun()
 

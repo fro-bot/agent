@@ -31,6 +31,7 @@ vi.mock('@fro-bot/runtime', async importOriginal => {
     ...actual,
     acquireLock: vi.fn(),
     releaseLock: vi.fn(),
+    releaseLockIfHolder: vi.fn(),
     createRun: vi.fn(),
     transitionRun: vi.fn(),
     createHeartbeatController: vi.fn(),
@@ -563,6 +564,7 @@ export function setupHappyPath(heartbeatOverrides?: {
     data: {acquired: true as const, outcome: 'acquired' as const, etag: 'lock-etag-v1', holder: null},
   })
   mockRuntime.releaseLock.mockResolvedValue({success: true as const, data: undefined})
+  mockRuntime.releaseLockIfHolder.mockResolvedValue({success: true as const, data: 'released' as const})
   mockRuntime.createRun.mockResolvedValue({success: true as const, data: {etag: 'run-etag-v1'}})
   mockRuntime.transitionRun.mockResolvedValue({
     success: true as const,

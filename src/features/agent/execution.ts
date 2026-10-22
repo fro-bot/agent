@@ -113,7 +113,16 @@ async function abortRemoteSession(
         reject(new Error(`Session abort timed out after ${SESSION_ABORT_TIMEOUT_MS}ms`))
       }, SESSION_ABORT_TIMEOUT_MS)
     })
-    await Promise.race([abortRequest, timeout])
+    const response = await Promise.race([abortRequest, timeout])
+    // The SDK resolves a failed request with the failure in `error` instead of throwing, so a resolved call
+    // alone does not mean the abort was accepted.
+    const envelopeError = (response as {readonly error?: unknown} | undefined)?.error
+    if (envelopeError != null) {
+      logger.warning('OpenCode session abort returned an error; continuing teardown', {
+        sessionId,
+        error: toErrorMessage(envelopeError),
+      })
+    }
   } catch (error) {
     if (abortTimedOut) {
       logger.warning('OpenCode session abort exceeded teardown budget; continuing teardown', {sessionId})

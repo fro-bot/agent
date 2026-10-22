@@ -50,7 +50,8 @@ export function isValidAcquisitionToken(value: string): boolean {
   return ACQUISITION_TOKEN_PATTERN.test(value)
 }
 
-function isPreconditionFailed(error: Error): boolean {
+/** True for the object store's conditional-write failure (`If-Match` / `If-None-Match` did not hold, HTTP 412). */
+export function isPreconditionFailed(error: Error): boolean {
   return /pre-?condition/.test(error.message.toLowerCase())
 }
 
@@ -335,6 +336,8 @@ export interface ReleaseIfHolderExpectation {
   readonly holderJob?: string
   /** When given, must equal the record's `acquisition_token`; a record without one does not match. */
   readonly acquisitionToken?: string
+  /** When given, must equal the record's `run_id`. */
+  readonly runId?: string
   /** Aborts the read, the body read and the delete; no delete starts once it has aborted. */
   readonly signal?: AbortSignal
 }
@@ -353,7 +356,7 @@ export async function releaseLockIfHolder(
   scope: LockScope = 'repo',
   expected: ReleaseIfHolderExpectation = {},
 ): Promise<Result<ReleaseIfHolderOutcome, Error>> {
-  const {holderJob, acquisitionToken, signal} = expected
+  const {holderJob, acquisitionToken, runId, signal} = expected
   const key = getLockKey(config, repo, scope)
   if (key.success === false) {
     return err(key.error)
@@ -384,7 +387,13 @@ export async function releaseLockIfHolder(
   }
 
   const tokenMatches = acquisitionToken === undefined || record.data.acquisition_token === acquisitionToken
-  if (record.data.holder_id !== holderId || record.data.holder_job !== holderJob || tokenMatches === false) {
+  const runMatches = runId === undefined || record.data.run_id === runId
+  if (
+    record.data.holder_id !== holderId ||
+    record.data.holder_job !== holderJob ||
+    tokenMatches === false ||
+    runMatches === false
+  ) {
     logger.debug('Lock held by another holder; not releasing', {
       key: key.data,
       repo,
@@ -418,6 +427,7 @@ export async function renewLease(
   etag: string,
   logger: {debug: (message: string, context?: Record<string, unknown>) => void},
   scope: LockScope = 'repo',
+  signal?: AbortSignal,
 ): Promise<Result<{etag: string}, Error>> {
   const key = getLockKey(config, repo, scope)
   if (key.success === false) {
@@ -431,7 +441,12 @@ export async function renewLease(
 
   const nextRecord: LockRecord = {...lockRecord, acquired_at: new Date().toISOString()}
   logger.debug('Renewing lock lease', {key: key.data, repo})
-  return conditionalPut.data(key.data, JSON.stringify(nextRecord), {ifMatch: etag})
+  // Without a signal the option object is exactly `{ifMatch}`, so existing exact-argument assertions are unchanged.
+  return conditionalPut.data(
+    key.data,
+    JSON.stringify(nextRecord),
+    signal === undefined ? {ifMatch: etag} : {ifMatch: etag, signal},
+  )
 }
 
 export async function forceReleaseLock(
@@ -487,12 +502,17 @@ export interface ForceReleaseStaleLockOptions {
   readonly confirmExpiredHolder?: ConfirmExpiredHolder
 }
 
-/** Reads the current lock record and its ETag. `ok(null)` means the lock does not exist. */
-async function readLockRecord(
+/**
+ * Reads the current lock record and its ETag. `ok(null)` means the lock does not exist. `signal` aborts the read; an
+ * aborted read resolves to `err`.
+ */
+export async function readLock(
   config: CoordinationConfig,
   repo: string,
+  scope: LockScope = 'repo',
+  signal?: AbortSignal,
 ): Promise<Result<{readonly record: LockRecord; readonly etag: string} | null, Error>> {
-  const key = getLockKey(config, repo)
+  const key = getLockKey(config, repo, scope)
   if (key.success === false) {
     return err(key.error)
   }
@@ -502,7 +522,8 @@ async function readLockRecord(
     return err(getObject.error)
   }
 
-  const fetched = await getObject.data(key.data)
+  // Without a signal the call keeps its original single-argument shape.
+  const fetched = await (signal === undefined ? getObject.data(key.data) : getObject.data(key.data, {signal}))
   if (fetched.success === false) {
     if (isNotFound(fetched.error) === true) {
       return ok(null)
@@ -537,7 +558,7 @@ export async function forceReleaseStaleLock(
 ): Promise<Result<ForceReleaseStaleLockResult, Error>> {
   const now = new Date()
 
-  const lockRead = await readLockRecord(config, repo)
+  const lockRead = await readLock(config, repo)
   if (lockRead.success === false) {
     logger.debug('forceReleaseStaleLock: failed to read lock record', {error: lockRead.error.message, repo})
     return ok({

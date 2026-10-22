@@ -1499,14 +1499,14 @@ describe('runOpenCodeCore — drain completion for background work', () => {
     })
   })
 
-  describe('17. runs that never adopted background work are unchanged on cancel and deadline', () => {
+  describe('17. runs that never adopted background work keep their classification on cancel and deadline', () => {
     it.each([
       ['no ledger', 'deadline', {noLedger: true}],
       ['no ledger', 'cancel', {noLedger: true}],
       ['an empty ledger', 'deadline', {}],
       ['an empty ledger', 'cancel', {}],
     ])(
-      '%s, %s: no root abort, no liveness or messages lookups, original classification',
+      '%s, %s: the root is aborted and confirmed quiescent, no children or messages lookups, original classification',
       async (_label, how, options) => {
         // #given a run with nothing adopted, mid-execution
         const run = startRun({deadlineMs: 10_000, ...options})
@@ -1520,14 +1520,16 @@ describe('runOpenCodeCore — drain completion for background work', () => {
         }
         await run.done
 
-        // #then the pre-existing classification, unquarantined, and the SDK was touched exactly as before
+        // #then the pre-existing classification, unquarantined; the root — which may still be running — was
+        // aborted and checked, and nothing else was looked up
         expectKind(run.outcome(), 'timeout')
         expect((run.outcome() as {error: RunCoreError}).error.quarantined).toBe(false)
         expect(run.client.session.create).toHaveBeenCalledTimes(1)
         expect(run.client.session.promptAsync).toHaveBeenCalledTimes(1)
         expect(run.client.event.subscribe).toHaveBeenCalledTimes(1)
-        expect(run.client.session.abort).not.toHaveBeenCalled()
-        expect(run.client.session.status).not.toHaveBeenCalled()
+        expect(run.client.session.abort).toHaveBeenCalledTimes(1)
+        expect(run.client.session.abort).toHaveBeenCalledWith(expect.objectContaining({path: {id: ROOT}}))
+        expect(run.client.session.status).toHaveBeenCalled()
         expect(run.client.session.children).not.toHaveBeenCalled()
         expect(run.client.session.messages).not.toHaveBeenCalled()
       },

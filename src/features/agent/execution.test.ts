@@ -459,6 +459,30 @@ function createStuckMockClient(promptOutcome: {error: string} | {data: {parts: {
   }
 }
 
+async function runExpiredWithAbortResult(abortResult: unknown, mockLogger: Logger): Promise<Logger> {
+  vi.useFakeTimers()
+  const client = createStuckMockClient({data: {parts: [{type: 'text', text: 'ok'}]}})
+  client.session.abort = vi.fn().mockResolvedValue(abortResult)
+  vi.mocked(createOpencode).mockResolvedValue({
+    client: client as unknown as Awaited<ReturnType<typeof createOpencode>>['client'],
+    server: {url: 'http://127.0.0.1:4096', close: vi.fn()},
+  })
+  const ledger = createOwnershipLedger()
+  ledger.adopt('ses_child', 'background task')
+
+  const resultPromise = executeOpenCode(
+    createMockPromptOptions(),
+    mockLogger,
+    {agent: null, model: null, timeoutMs: 1_000, omoProviders: createDisabledProviders()},
+    undefined,
+    ledger,
+  )
+  await vi.advanceTimersByTimeAsync(4_000)
+  await resultPromise
+  expect(client.session.abort).toHaveBeenCalledOnce()
+  return mockLogger
+}
+
 describe('executeOpenCode — deadline teardown consults the shared deadline directly (round 3 regression)', () => {
   let mockLogger: Logger
 
@@ -554,6 +578,32 @@ describe('executeOpenCode — deadline teardown consults the shared deadline dir
 
     // #and teardown still aborts the remote session
     expect(client.session.abort).toHaveBeenCalledOnce()
+  })
+
+  describe('the root abort result', () => {
+    it('logs a warning when the SDK resolves the abort with an error envelope', async () => {
+      // #given an abort the SDK resolved with the failure in the envelope instead of throwing
+      // #when the deadline expires and teardown aborts the root
+      const logger = await runExpiredWithAbortResult({data: undefined, error: 'session not found'}, mockLogger)
+
+      // #then the failed abort is visible at warning level, with the session and the error text
+      expect(logger.warning).toHaveBeenCalledWith(
+        'OpenCode session abort returned an error; continuing teardown',
+        expect.objectContaining({sessionId: 'ses_root', error: expect.stringContaining('session not found') as string}),
+      )
+    })
+
+    it('logs nothing about the abort when it succeeds', async () => {
+      // #given a successful abort, whatever shape its envelope has
+      // #when the deadline expires and teardown aborts the root
+      const logger = await runExpiredWithAbortResult({data: true}, mockLogger)
+
+      // #then there is no abort-failure line at any level
+      const abortLines = [...vi.mocked(logger.warning).mock.calls, ...vi.mocked(logger.debug).mock.calls].filter(
+        ([message]) => typeof message === 'string' && message.includes('abort'),
+      )
+      expect(abortLines).toEqual([])
+    })
   })
 })
 

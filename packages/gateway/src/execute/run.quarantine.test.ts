@@ -429,17 +429,20 @@ describe('termination barrier — quarantine (Unit 8)', () => {
       const {createHeartbeatController: realCreateHeartbeatController, HEARTBEAT_STOP_GRACE_MS} =
         await vi.importActual<typeof import('@fro-bot/runtime')>('@fro-bot/runtime')
       const executingState = buildMockRunState({phase: 'EXECUTING'})
+      const getObject = vi.fn(async () => new Promise<never>(() => {}))
       const coordinationConfig = {
         storeAdapter: {
           upload: vi.fn(),
           download: vi.fn(),
           list: vi.fn(),
-          getObject: vi.fn(async () => new Promise<never>(() => {})),
+          getObject,
           conditionalPut: vi.fn(),
         },
         storeConfig: {enabled: true, bucket: 'test', region: 'us-east-1', prefix: 'state'},
         lockTtlSeconds: 900,
-        heartbeatIntervalMs: 30_000,
+        // A tick now times out 10 s after it starts, so a hung tick only blocks stop() if it started shortly before the
+        // window ends: the interval is chosen so its tick starts 3 s before the window does.
+        heartbeatIntervalMs: QUARANTINE_HOLD_WINDOW_MS - 3_000,
         staleThresholdMs: 60_000,
         pendingStaleThresholdMs: 30 * 60_000,
       } as unknown as CoordinationConfig
@@ -468,7 +471,14 @@ describe('termination barrier — quarantine (Unit 8)', () => {
 
       // #when — the window elapses: stop() starts waiting on the hung tick
       await runMention(makeMessage(), makeBinding(), deps)
-      await vi.advanceTimersByTimeAsync(QUARANTINE_HOLD_WINDOW_MS)
+      await vi.advanceTimersByTimeAsync(QUARANTINE_HOLD_WINDOW_MS - 1_000)
+
+      // #then — exactly one heartbeat tick reached the store and is hung there, so the interval choice above is what is
+      // observed: a shorter interval would have started (and timed out) earlier ticks
+      expect(getObject).toHaveBeenCalledOnce()
+
+      // #when — the window ends
+      await vi.advanceTimersByTimeAsync(1_000)
 
       // #then — the slot is still held while stop() waits inside its grace period
       expect(releaseFn).not.toHaveBeenCalled()

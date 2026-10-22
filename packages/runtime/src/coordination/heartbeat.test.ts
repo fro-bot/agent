@@ -1,5 +1,6 @@
 import type {ObjectStoreAdapter, ObjectStoreConfig} from '../object-store/types.js'
 import type {Logger} from '../shared/logger.js'
+import type {Result} from '../shared/types.js'
 import type {CoordinationConfig, RunState} from './types.js'
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
@@ -101,6 +102,54 @@ function build(
   )
 }
 
+type Renewal = Result<{etag: string}, Error>
+type PutResult = Awaited<ReturnType<Required<ObjectStoreAdapter>['conditionalPut']>>
+type GetResult = Awaited<ReturnType<Required<ObjectStoreAdapter>['getObject']>>
+
+interface Deferred<T> {
+  readonly promise: Promise<T>
+  readonly resolve: (value: T) => void
+}
+
+const hang = async <T>(): Promise<T> => new Promise<T>(() => {})
+
+function deferred<T>(): Deferred<T> {
+  let resolve: (value: T) => void = () => {}
+  const promise = new Promise<T>(res => {
+    resolve = res
+  })
+  return {promise, resolve}
+}
+
+function buildWithToken(acquisitionToken?: string) {
+  const adapter = createStoreAdapter()
+  return createHeartbeatController(
+    createCoordinationConfig(adapter),
+    'coordination',
+    'owner/repo',
+    'run-1',
+    'lock-etag-1',
+    'run-etag-0',
+    createLogger(),
+    ...(acquisitionToken === undefined ? [] : [acquisitionToken]),
+  )
+}
+
+function buildWithLogger(adapterOverrides: Parameters<typeof createStoreAdapter>[0] = {}) {
+  const logger = createLogger()
+  const adapter = createStoreAdapter(adapterOverrides)
+  const controller = createHeartbeatController(
+    createCoordinationConfig(adapter),
+    'coordination',
+    'owner/repo',
+    'run-1',
+    'lock-etag-1',
+    'run-etag-0',
+    logger,
+  )
+  return {controller, logger, adapter}
+}
+
 describe('heartbeat controller', () => {
   beforeEach(() => {
     vi.useFakeTimers()
@@ -154,7 +203,7 @@ describe('heartbeat controller', () => {
     expect(conditionalPut).toHaveBeenCalledWith(
       'fro-bot-state/coordination/owner/repo/runs/run-1.json',
       JSON.stringify(createRunState({last_heartbeat: '2026-04-24T18:15:30.000Z'})),
-      {ifMatch: 'etag-current', tagging: 'object-type=run-state'},
+      {ifMatch: 'etag-current', tagging: 'object-type=run-state', signal: expect.any(AbortSignal) as AbortSignal},
     )
   })
 
@@ -368,6 +417,8 @@ describe('heartbeat controller', () => {
       expect.objectContaining({run_id: 'run-1'}),
       'lock-etag-1',
       expect.any(Object),
+      'repo',
+      expect.any(AbortSignal),
     )
   })
 
@@ -434,8 +485,9 @@ describe('heartbeat controller', () => {
           }),
       )
       .mockResolvedValueOnce(ok({etag: 'etag-recovered'}))
+    // A 5 s interval, so the next tick is due inside the 10 s tick timeout (a hung tick now times out at 10 s).
     const controller = createHeartbeatController(
-      createCoordinationConfig(createStoreAdapter({conditionalPut})),
+      {...createCoordinationConfig(createStoreAdapter({conditionalPut})), heartbeatIntervalMs: 5_000},
       'coordination',
       'owner/repo',
       'run-1',
@@ -446,8 +498,8 @@ describe('heartbeat controller', () => {
     controller.start()
 
     // #when
-    const firstTick = vi.advanceTimersByTimeAsync(30_000)
-    await vi.advanceTimersByTimeAsync(30_000)
+    const firstTick = vi.advanceTimersByTimeAsync(5_000)
+    await vi.advanceTimersByTimeAsync(5_000)
     const resolvePendingWrite = pendingWrite.resolve
     if (resolvePendingWrite != null) {
       resolvePendingWrite({success: true, data: {etag: 'etag-heartbeat'}})
@@ -725,9 +777,10 @@ describe('heartbeat controller', () => {
     ;(finishWrite as (() => void) | null)?.()
     const result = await stopPromise
 
-    // #then no timer is left behind: the interval is cleared and so is the grace timer
-    expect(baseline).toBe(1)
-    expect(duringStop).toBe(1)
+    // #then no timer is left behind: the interval is cleared and so are the grace timer and the tick timeout
+    // (a tick in flight holds its tick timeout beside the interval, so the count is 2 where it used to be 1)
+    expect(baseline).toBe(2)
+    expect(duringStop).toBe(2)
     expect(result.success).toBe(true)
     expect(vi.getTimerCount()).toBe(0)
   })
@@ -944,7 +997,7 @@ describe('heartbeat controller', () => {
       const result = await stopPromise
       expect(result.success).toBe(false)
       if (result.success === true) throw new Error('expected a failure')
-      expect(result.error.message).toContain('snapshot')
+      expect(result.error.message).toBe('Lease finalize did not settle within 5000ms of stop')
       expect(result.error.tickPending).toBe(false)
       expect(result.error.lockEtag).toBe('lock-etag-1')
       expect(result.error.runEtag).toBe('run-etag-0')
@@ -1030,5 +1083,349 @@ describe('heartbeat controller', () => {
     // #then
     expect(result.success).toBe(false)
     expect(result.success === false ? result.error.message : '').toBe('S3 unavailable on stop')
+  })
+
+  describe('tick timeout and abort', () => {
+    const TICK_TIMEOUT_MS = 10_000
+
+    it('times out a hung renewal at 10 s, logs a warning, aborts its signal, and runs the next tick', async () => {
+      // #given the first renewal never settles
+      renewLeaseMock.mockReset()
+      renewLeaseMock.mockImplementationOnce(async () => hang<Renewal>()).mockResolvedValue(ok({etag: 'lock-etag-2'}))
+      const {controller, logger} = buildWithLogger()
+      controller.start()
+
+      // #when the tick starts and the tick timeout elapses
+      await vi.advanceTimersByTimeAsync(30_000 + TICK_TIMEOUT_MS - 1)
+      expect(logger.warning).not.toHaveBeenCalled()
+      const signal = renewLeaseMock.mock.calls[0]?.[6] as AbortSignal
+      expect(signal.aborted).toBe(false)
+      await vi.advanceTimersByTimeAsync(1)
+
+      // #then
+      expect(logger.warning).toHaveBeenCalledWith('Coordination lease renewal threw', {
+        repo: 'owner/repo',
+        runId: 'run-1',
+        error: 'Lease renewal exceeded 10000ms',
+      })
+      expect(signal.aborted).toBe(true)
+
+      // #when the next interval arrives
+      await vi.advanceTimersByTimeAsync(30_000 - TICK_TIMEOUT_MS)
+
+      // #then the next tick ran against the original lock ETag
+      expect(renewLeaseMock).toHaveBeenCalledTimes(2)
+      expect(renewLeaseMock.mock.calls[1]?.[3]).toBe('lock-etag-1')
+    })
+
+    it('times out a hung RunState write without losing the confirmed lock ETag', async () => {
+      // #given the renewal confirms and the RunState write never settles
+      const conditionalPut = vi
+        .fn<Required<ObjectStoreAdapter>['conditionalPut']>()
+        .mockImplementationOnce(async () => hang<PutResult>())
+        .mockResolvedValue(ok({etag: 'etag-next'}))
+      const {controller, logger} = buildWithLogger({conditionalPut})
+      controller.start()
+
+      // #when
+      await vi.advanceTimersByTimeAsync(30_000 + TICK_TIMEOUT_MS)
+      const result = await controller.stop()
+
+      // #then the timeout is a failure after a confirmed renewal: the renewed ETag stands, with a warning that says so
+      expect(logger.warning).toHaveBeenCalledWith('Coordination lease tick failed after renewal', {
+        repo: 'owner/repo',
+        runId: 'run-1',
+        error: 'Lease tick exceeded 10000ms',
+      })
+      expect(result.success).toBe(false)
+      if (result.success === true) throw new Error('expected a failure')
+      expect(result.error.message).toBe('Lease tick exceeded 10000ms')
+      expect(result.error.lockEtag).toBe('lock-etag-next')
+      expect(result.error.runEtag).toBe('run-etag-0')
+      expect(result.error.tickPending).toBe(false)
+    })
+
+    it('does not apply a renewal that lands after its tick timed out', async () => {
+      // #given
+      const late = deferred<Renewal>()
+      renewLeaseMock.mockReset()
+      renewLeaseMock.mockImplementationOnce(async () => late.promise)
+      const {controller, adapter} = buildWithLogger()
+      controller.start()
+      await vi.advanceTimersByTimeAsync(30_000 + TICK_TIMEOUT_MS)
+
+      // #when the abandoned renewal succeeds
+      late.resolve(ok({etag: 'lock-etag-late'}))
+      await vi.advanceTimersByTimeAsync(0)
+      const result = await controller.stop()
+
+      // #then neither the lock ETag nor the RunState was touched
+      expect(result.success).toBe(false)
+      if (result.success === true) throw new Error('expected a failure')
+      expect(result.error.lockEtag).toBe('lock-etag-1')
+      expect(result.error.runEtag).toBe('run-etag-0')
+      expect(adapter.conditionalPut).not.toHaveBeenCalled()
+    })
+
+    it('recovers after the drop: the next tick adopts the stored ETag and the tick after renews against it', async () => {
+      // #given tick 1's renewal committed server-side (ETag lock-etag-committed) but timed out, so tick 2's renewal 412s
+      renewLeaseMock.mockReset()
+      renewLeaseMock
+        .mockImplementationOnce(async () => hang<Renewal>())
+        .mockResolvedValueOnce(err(new Error('412 precondition failed')))
+        .mockResolvedValue(ok({etag: 'lock-etag-after'}))
+      const lockRecord = {
+        repo: 'owner/repo',
+        holder_id: 'gateway-1',
+        surface: 'discord',
+        acquired_at: '2026-04-24T18:15:30.000Z',
+        ttl_seconds: 900,
+        run_id: 'run-1',
+        acquisition_token: 'token-0001-abcd',
+      }
+      const getObject = vi.fn<Required<ObjectStoreAdapter>['getObject']>(async key =>
+        key.endsWith('/locks/repo.json')
+          ? ok({data: JSON.stringify(lockRecord), etag: 'lock-etag-committed'})
+          : ok({data: JSON.stringify(createRunState()), etag: 'etag-current'}),
+      )
+      const controller = createHeartbeatController(
+        createCoordinationConfig(createStoreAdapter({getObject})),
+        'coordination',
+        'owner/repo',
+        'run-1',
+        'lock-etag-1',
+        'run-etag-0',
+        createLogger(),
+        'token-0001-abcd',
+      )
+      controller.start()
+
+      // #when tick 1 times out, tick 2 hits the dead ETag, and tick 3 runs
+      await vi.advanceTimersByTimeAsync(30_000 * 3)
+
+      // #then the renewals went out against the original ETag twice, then the adopted one
+      expect(renewLeaseMock.mock.calls.map(call => call[3] as string)).toEqual([
+        'lock-etag-1',
+        'lock-etag-1',
+        'lock-etag-committed',
+      ])
+      const stopped = await controller.stop()
+      expect(stopped.success).toBe(true)
+      expect(stopped.success ? stopped.data.lockEtag : '').toBe('lock-etag-after')
+    })
+
+    it('does not apply a RunState write that lands after its tick timed out', async () => {
+      // #given
+      const late = deferred<PutResult>()
+      const conditionalPut = vi
+        .fn<Required<ObjectStoreAdapter>['conditionalPut']>()
+        .mockImplementationOnce(async () => late.promise)
+      const {controller} = buildWithLogger({conditionalPut})
+      controller.start()
+      await vi.advanceTimersByTimeAsync(30_000 + TICK_TIMEOUT_MS)
+
+      // #when the abandoned write succeeds
+      late.resolve(ok({etag: 'run-etag-late'}))
+      await vi.advanceTimersByTimeAsync(0)
+      const result = await controller.stop()
+
+      // #then the run ETag the caller will transition with is still the last one a current tick wrote
+      expect(result.success).toBe(false)
+      if (result.success === true) throw new Error('expected a failure')
+      expect(result.error.runEtag).toBe('run-etag-0')
+      expect(result.error.lockEtag).toBe('lock-etag-next')
+    })
+
+    it('starts no RunState read once stop has begun', async () => {
+      // #given a tick parked on its renewal when stop gives up on it
+      const hung = deferred<Renewal>()
+      renewLeaseMock.mockReset()
+      renewLeaseMock.mockImplementationOnce(async () => hung.promise)
+      const {controller, adapter} = buildWithLogger()
+      controller.start()
+      await vi.advanceTimersByTimeAsync(30_000)
+      const stopped = controller.stop()
+      await vi.advanceTimersByTimeAsync(HEARTBEAT_STOP_GRACE_MS)
+      await stopped
+      vi.mocked(adapter.getObject).mockClear()
+
+      // #when time passes and the abandoned renewal finally lands
+      await vi.advanceTimersByTimeAsync(90_000)
+      hung.resolve(ok({etag: 'lock-etag-late'}))
+      await vi.advanceTimersByTimeAsync(0)
+
+      // #then no read, and no write, started
+      expect(adapter.getObject).not.toHaveBeenCalled()
+      expect(adapter.conditionalPut).not.toHaveBeenCalled()
+    })
+
+    it('hands one live signal to the read, the renewal and the write, and aborts none of them at stop', async () => {
+      // #given
+      const {controller, adapter} = buildWithLogger()
+      controller.start()
+
+      // #when one tick runs, then stop reads the snapshot
+      await vi.advanceTimersByTimeAsync(30_000)
+      const stopped = await controller.stop()
+
+      // #then
+      expect(stopped.success).toBe(true)
+      const readSignal = vi.mocked(adapter.getObject).mock.calls[0]?.[1]?.signal
+      const renewSignal = renewLeaseMock.mock.calls[0]?.[6] as AbortSignal
+      const writeSignal = vi.mocked(adapter.conditionalPut).mock.calls[0]?.[2].signal
+      const snapshotSignal = vi.mocked(adapter.getObject).mock.calls[1]?.[1]?.signal
+      expect(readSignal).toBeInstanceOf(AbortSignal)
+      expect(renewSignal).toBe(readSignal)
+      expect(writeSignal).toBe(readSignal)
+      expect(readSignal?.aborted).toBe(false)
+      expect(snapshotSignal).toBeInstanceOf(AbortSignal)
+      expect(snapshotSignal?.aborted).toBe(false)
+    })
+
+    it('never rejects from stop() when the logger throws', async () => {
+      // #given a logger whose debug sink is down
+      const logger = createLogger()
+      vi.mocked(logger.debug).mockImplementation(() => {
+        throw new Error('log sink down')
+      })
+      const controller = createHeartbeatController(
+        createCoordinationConfig(createStoreAdapter()),
+        'coordination',
+        'owner/repo',
+        'run-1',
+        'lock-etag-1',
+        'run-etag-0',
+        logger,
+      )
+
+      // #when
+      const stopped = await controller.stop()
+
+      // #then stop still ran to completion
+      expect(stopped.success).toBe(true)
+      expect(controller.isRunning).toBe(false)
+    })
+
+    it('keeps the underlying error as the cause of a failed stop', async () => {
+      // #given a renewal that fails
+      const failure = new Error('lock renewal failed')
+      renewLeaseMock.mockReset()
+      renewLeaseMock.mockResolvedValue(err(failure))
+      const {controller} = buildWithLogger()
+      controller.start()
+      await vi.advanceTimersByTimeAsync(30_000)
+
+      // #when
+      const result = await controller.stop()
+
+      // #then
+      expect(result.success).toBe(false)
+      if (result.success === true) throw new Error('expected a failure')
+      expect(result.error.message).toBe('lock renewal failed')
+      expect(result.error.cause).toBe(failure)
+    })
+
+    it('aborts the snapshot read when the stop budget runs out', async () => {
+      // #given a snapshot read that never settles
+      const getObject = hangingSnapshotAfter(0)
+      const {controller} = buildWithLogger({getObject})
+
+      // #when
+      const stopped = controller.stop()
+      await vi.advanceTimersByTimeAsync(HEARTBEAT_STOP_GRACE_MS - 1)
+      const signal = getObject.mock.calls[0]?.[1]?.signal
+      expect(signal?.aborted).toBe(false)
+      await vi.advanceTimersByTimeAsync(1)
+      await stopped
+
+      // #then
+      expect(signal?.aborted).toBe(true)
+    })
+
+    it('skips the tick when stop begins after the RunState read, and keeps an earlier error', async () => {
+      // #given tick 1 fails its renewal; tick 2 is parked on its read when stop begins
+      const read = deferred<GetResult>()
+      renewLeaseMock.mockReset()
+      renewLeaseMock.mockResolvedValue(err(new Error('first renewal failed')))
+      const getObject = vi
+        .fn<Required<ObjectStoreAdapter>['getObject']>()
+        .mockResolvedValueOnce(ok({data: JSON.stringify(createRunState()), etag: 'etag-current'}))
+        .mockImplementationOnce(async () => read.promise)
+      const {controller, adapter} = buildWithLogger({getObject})
+      controller.start()
+      await vi.advanceTimersByTimeAsync(60_000)
+
+      // #when stop begins, then the read lands
+      const stopped = controller.stop()
+      read.resolve(ok({data: JSON.stringify(createRunState()), etag: 'etag-current'}))
+      const result = await stopped
+
+      // #then tick 2 renewed nothing and wrote nothing, so the first error stands
+      expect(renewLeaseMock).toHaveBeenCalledTimes(1)
+      expect(adapter.conditionalPut).not.toHaveBeenCalled()
+      expect(result.success).toBe(false)
+      expect(result.success === false ? result.error.message : '').toBe('first renewal failed')
+    })
+
+    it('clears an earlier write failure when a tick renews and then skips its write because stop began', async () => {
+      // #given tick 1's RunState write fails; tick 2 renews after stop has begun
+      const renewal = deferred<Renewal>()
+      renewLeaseMock.mockReset()
+      renewLeaseMock
+        .mockResolvedValueOnce(ok({etag: 'lock-etag-2'}))
+        .mockImplementationOnce(async () => renewal.promise)
+      const conditionalPut = vi
+        .fn<Required<ObjectStoreAdapter>['conditionalPut']>()
+        .mockResolvedValueOnce(err(new Error('run state write failed')))
+      const getObject = vi
+        .fn<Required<ObjectStoreAdapter>['getObject']>()
+        .mockResolvedValue(ok({data: JSON.stringify(createRunState()), etag: 'etag-fresh'}))
+      const {controller} = buildWithLogger({conditionalPut, getObject})
+      controller.start()
+      await vi.advanceTimersByTimeAsync(60_000)
+
+      // #when stop begins while tick 2's renewal is in flight, and it lands
+      const stopped = controller.stop()
+      renewal.resolve(ok({etag: 'lock-etag-3'}))
+      const result = await stopped
+
+      // #then tick 2 confirmed a renewal, so the earlier failure is cleared and stop hands back a fresh snapshot
+      expect(conditionalPut).toHaveBeenCalledTimes(1)
+      expect(result.success).toBe(true)
+      expect(result.success === true ? result.data : null).toEqual({
+        runEtag: 'etag-fresh',
+        runState: createRunState(),
+        lockEtag: 'lock-etag-3',
+      })
+    })
+  })
+
+  describe('acquisition token', () => {
+    it('carries the token on every renewal record', async () => {
+      // #given
+      const controller = buildWithToken('token-0001-abcd')
+      controller.start()
+
+      // #when two ticks elapse
+      await vi.advanceTimersByTimeAsync(60_000)
+
+      // #then
+      expect(renewLeaseMock).toHaveBeenCalledTimes(2)
+      for (const call of renewLeaseMock.mock.calls) {
+        expect(call[2]).toMatchObject({holder_id: 'gateway-1', run_id: 'run-1', acquisition_token: 'token-0001-abcd'})
+      }
+    })
+
+    it('writes no token field when none was given, so the record is unchanged for existing callers', async () => {
+      // #given
+      const controller = buildWithToken()
+      controller.start()
+
+      // #when
+      await vi.advanceTimersByTimeAsync(30_000)
+
+      // #then
+      expect(Object.keys(renewLeaseMock.mock.calls[0]?.[2] as object)).not.toContain('acquisition_token')
+    })
   })
 })

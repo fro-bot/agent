@@ -8,6 +8,10 @@ export interface ObjectStoreAdapter {
   readonly upload: (key: string, localPath: string) => Promise<Result<void, Error>>
   readonly download: (key: string, localPath: string) => Promise<Result<void, Error>>
   readonly list: (prefix: string) => Promise<Result<string[], Error>>
+  /**
+   * `signal` aborts the in-flight request; an aborted call resolves to `err`. Aborting narrows the window but cannot
+   * close it: a PUT already on the wire can still commit server-side and surface here as an error.
+   */
   readonly conditionalPut?: (
     key: string,
     data: string,
@@ -16,6 +20,7 @@ export interface ObjectStoreAdapter {
       ifMatch?: string
       /** URL-encoded `key=value` query string passed to S3 PutObject Tagging. */
       tagging?: string
+      signal?: AbortSignal
     },
   ) => Promise<Result<{etag: string}, Error>>
   /** `signal` aborts the in-flight request; an aborted call resolves to `err`. */

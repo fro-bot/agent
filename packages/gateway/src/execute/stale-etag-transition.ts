@@ -42,11 +42,16 @@ async function readStoredRun(
     if (getObject == null) {
       return skip('store adapter has no getObject')
     }
+    // Aborts the read when the budget runs out, so a stalled request is cancelled instead of left to hold a socket.
+    const controller = new AbortController()
     const budget = new Promise<'elapsed'>(resolve => {
-      timer = setTimeout(() => resolve('elapsed'), HEARTBEAT_STOP_GRACE_MS)
+      timer = setTimeout(() => {
+        resolve('elapsed')
+        controller.abort(new Error(`read did not settle within ${HEARTBEAT_STOP_GRACE_MS}ms`))
+      }, HEARTBEAT_STOP_GRACE_MS)
     })
-    // The race handles a late rejection of the abandoned read, so it cannot surface as an unhandled rejection.
-    const fetched = await Promise.race([getObject(key.data), budget])
+    // The race handles a late rejection of the aborted read, so it cannot surface as an unhandled rejection.
+    const fetched = await Promise.race([getObject(key.data, {signal: controller.signal}), budget])
     if (fetched === 'elapsed') {
       return skip(`read did not settle within ${HEARTBEAT_STOP_GRACE_MS}ms`)
     }

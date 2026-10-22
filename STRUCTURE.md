@@ -48,7 +48,7 @@ fro-bot/agent/
 │           ├── session/        # Session storage, search, prune, writeback
 │           ├── object-store/   # S3-compatible canonical persistence
 │           ├── agent/          # Shared agent execution primitives
-│           └── coordination/   # Heartbeat, lock, run-state
+│           └── coordination/   # Lease loop, heartbeat, lock, run-state
 │
 ├── deploy/                     # Docker Compose stack, Dockerfiles, mitmproxy egress topology
 │   ├── scripts/                # Plain Node ESM (.mjs) deploy helpers; node --test runner
