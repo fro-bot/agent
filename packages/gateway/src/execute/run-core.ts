@@ -175,6 +175,12 @@ export interface RunCoreParams {
   /** Injected logger. Internal details only — never leak session internals to Discord. */
   readonly logger: GatewayLogger
   /**
+   * The gateway run this core is executing. Stamped on the termination barrier's log lines (its own
+   * quarantine error and every `settle-owned-sessions` line) so an abort can be joined to its run.
+   * Absent for callers without a run id; the core's other log lines keep correlating by `sessionId`.
+   */
+  readonly runId?: string
+  /**
    * Gateway approval mode. Currently only `approval-required` is supported.
    * `autonomous-low-risk` is deferred (unsafe due to OpenCode last-match-wins evaluation).
    * When present, must be `approval-required`; when absent, defaults to `approval-required`.
@@ -415,6 +421,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     sink,
     signal,
     logger,
+    runId,
     coordinator,
     questions,
     onHumanWaitTerminal,
@@ -683,13 +690,14 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       rootSessionId: sessionId,
       ledger: barrierLedger,
       logger,
+      ...(runId === undefined ? {} : {runId}),
       ...(rootFollowUpOpen ? {confirmRootQuiescent: true} : {}),
     })
     if (settlement.settled === true) {
       throw new RunCoreError(kind, message, false, providerFailureReason, cause)
     }
     logger.error(
-      {sessionId, kind, detail: settlement.reason},
+      {...(runId === undefined ? {} : {runId}), sessionId, kind, detail: settlement.reason},
       'run-core: owned work could not be confirmed settled before this failure — quarantining run',
     )
     throw new RunCoreError(kind, message, true, providerFailureReason, cause)

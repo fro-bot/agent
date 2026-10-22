@@ -1562,6 +1562,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           sink: replySink,
           signal: effectiveSignal,
           logger,
+          runId,
           coordinator,
           questions: questionCoordinator,
           onHumanWaitTerminal: deps.requestGate?.onTerminal,
