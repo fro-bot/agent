@@ -13,7 +13,7 @@ import {
   getObjectProperty,
   getSessionID,
   getStringProperty,
-  parseTaskNotice,
+  parseSyntheticNoticePart,
   retrySignalFromStatus,
   terminalSignalFromPayload,
 } from '@fro-bot/runtime'
@@ -859,10 +859,7 @@ export async function processEventStream(
           // Upstream injects a background-task completion as a whole synthetic text part (no `time`) on a
           // root user message; assistant text never sets `synthetic`. The injected turn is pending root work
           // whether or not the child was adopted, so the barrier is registered before settling a tracked child.
-          const completion =
-            eventSessionID === sessionId && text != null && getBooleanProperty(part, 'synthetic') === true
-              ? parseTaskNotice(text)
-              : null
+          const completion = eventSessionID === sessionId ? parseSyntheticNoticePart(part) : null
           if (completion === null) {
             if (text != null) lastText = text
             const endTime = getNumberProperty(getObjectProperty(part, 'time'), 'end')
