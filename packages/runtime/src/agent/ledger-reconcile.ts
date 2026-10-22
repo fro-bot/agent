@@ -169,6 +169,11 @@ export interface ReconcileLedgerOptions {
   readonly adapter: LedgerReconcileAdapter
   readonly parentSessionId: string
   readonly logger: Logger
+  /**
+   * Aborts the upstream lookups of this pass. Passed to the adapter only when defined, so a caller with no
+   * signal sends exactly the arguments it always did. An aborted lookup fails the pass like any other failure.
+   */
+  readonly signal?: AbortSignal
 }
 
 /**
@@ -185,13 +190,17 @@ export interface ReconcileLedgerOptions {
  * "Empty-ledger short circuit" in the module doc.
  */
 export async function reconcileLedgerOnce(options: ReconcileLedgerOptions): Promise<Result<void, Error>> {
-  const {ledger, adapter, parentSessionId, logger} = options
+  const {ledger, adapter, parentSessionId, logger, signal} = options
 
   if (ledger.snapshot().length === 0) {
     return ok(undefined)
   }
 
-  const [childrenResult, liveResult] = await Promise.all([adapter.children(parentSessionId), adapter.liveSessionIds()])
+  const signalArgs: [AbortSignal] | [] = signal === undefined ? [] : [signal]
+  const [childrenResult, liveResult] = await Promise.all([
+    adapter.children(parentSessionId, ...signalArgs),
+    adapter.liveSessionIds(...signalArgs),
+  ])
 
   if (childrenResult.success === false || liveResult.success === false) {
     const error = childrenResult.success === false ? childrenResult.error : (liveResult as {error: Error}).error

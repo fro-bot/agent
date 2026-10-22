@@ -382,6 +382,76 @@ describe('reconcileLedgerOnce', () => {
       {sessionId: 'dropped-settlement-child', label: 'background task', state: 'settled'},
     ])
   })
+
+  describe('request signal', () => {
+    it('passes the signal to both upstream lookups when one is given', async () => {
+      // #given
+      const ledger = createOwnershipLedger()
+      ledger.adopt('child-1', 'background task')
+      const children = vi.fn(async () => ok([{id: 'child-1'}]))
+      const liveSessionIds = vi.fn(async () => ok(new Set<string>()))
+      const signal = new AbortController().signal
+
+      // #when
+      await reconcileLedgerOnce({
+        ledger,
+        adapter: makeAdapter({children, liveSessionIds}),
+        parentSessionId: PARENT_SESSION_ID,
+        logger: makeLogger(),
+        signal,
+      })
+
+      // #then
+      expect(children).toHaveBeenCalledWith(PARENT_SESSION_ID, signal)
+      expect(liveSessionIds).toHaveBeenCalledWith(signal)
+    })
+
+    it('calls the adapter with exactly the original arguments when no signal is given', async () => {
+      // #given
+      const ledger = createOwnershipLedger()
+      ledger.adopt('child-1', 'background task')
+      const children = vi.fn(async () => ok([{id: 'child-1'}]))
+      const liveSessionIds = vi.fn(async () => ok(new Set<string>()))
+
+      // #when
+      await reconcileLedgerOnce({
+        ledger,
+        adapter: makeAdapter({children, liveSessionIds}),
+        parentSessionId: PARENT_SESSION_ID,
+        logger: makeLogger(),
+      })
+
+      // #then — no trailing `undefined` argument
+      expect(children.mock.calls[0]).toEqual([PARENT_SESSION_ID])
+      expect(liveSessionIds.mock.calls[0]).toEqual([])
+    })
+
+    it('marks outstanding entries unknown when an aborted lookup fails', async () => {
+      // #given — an adapter that rejects through the Result channel once the signal fires
+      const ledger = createOwnershipLedger()
+      ledger.adopt('child-1', 'background task')
+      const controller = new AbortController()
+      const adapter = makeAdapter({
+        children: async (_parent, signal) => {
+          controller.abort()
+          return signal?.aborted === true ? err(new Error('aborted')) : ok([{id: 'child-1'}])
+        },
+      })
+
+      // #when
+      const result = await reconcileLedgerOnce({
+        ledger,
+        adapter,
+        parentSessionId: PARENT_SESSION_ID,
+        logger: makeLogger(),
+        signal: controller.signal,
+      })
+
+      // #then — the same outcome as any failed pass
+      expect(result.success).toBe(false)
+      expect(ledger.snapshot()).toEqual([{sessionId: 'child-1', label: 'background task', state: 'unknown'}])
+    })
+  })
 })
 
 describe('createLedgerReconciler', () => {
