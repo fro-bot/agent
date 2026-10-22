@@ -77,10 +77,10 @@ There is exactly one adoption path on each surface, and it is an _observation_, 
 Once adopted, a descendant's text deltas, tool events, and token accounting flow through the same handlers as the root's. Three event kinds stay deliberately root-scoped:
 
 - **`session.idle`** — a descendant going idle says nothing about the root's turn.
-- **`session.error`** — a descendant error must not end the root's turn or trigger context-overflow recovery. The descendant's ledger entry is marked `unknown` instead.
+- **`session.error`** — on both surfaces, a descendant's terminal error (or an abort by another client) must not end the root's turn or trigger context-overflow recovery. The descendant's ledger entry is marked `unknown` instead and the run continues; the root learns the child's outcome from its task-completion notice, and the drain settles the entry once reconciliation sees it stop or cancels it at the deadline. Only a root error, or one that names no session, fails the run. A descendant's context overflow is handled the same way (the entry is marked `unknown`, the run continues); only the root's overflow is tracked by the gateway's overflow check, which fails the run if the root goes idle with an overflow nothing compacted.
 - **Root freshness mutations** — the completion-evidence machinery described below is about the root session's generations, so it ignores descendant activity entirely.
 
-Settlement also arrives through the stream. When a background dispatch finishes, upstream injects a synthetic turn into the _parent_ session rendered as `<task id="…" state="completed|error">`. The stream handler parses that marker and settles the entry — for `error` as well as `completed`, because the marker is upstream's own authoritative "this execution is done" signal, whereas a raw `session.error` is not.
+Settlement also arrives through the stream. When a background dispatch finishes, upstream injects a synthetic turn into the _parent_ session rendered as `<task id="…" state="completed|error">`. The Action's stream handler parses that marker and settles the entry — for `error` as well as `completed`, because the marker is upstream's own authoritative "this execution is done" signal, whereas a raw `session.error` is not. The gateway's stream handler records the notice for its drain-completion gate and settles the entry through reconciliation, which sees the child stop.
 
 ### Reconciliation: recovering dropped settlements
 
