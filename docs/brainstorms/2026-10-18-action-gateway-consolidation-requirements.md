@@ -7,7 +7,7 @@ topic: action-gateway-consolidation
 
 ## Summary
 
-Duplicated Action and gateway behavior moves into `packages/runtime` one concern per PR. Pure leaves go first. Stateful concerns each get their own plan. Leaves that are still copied are pinned by drift tests until they move. Both surfaces map their S3 and object-store settings onto one typed schema. The end state is a single runtime run entry point with per-surface policy hooks.
+Duplicated Action and gateway behavior moves into `packages/runtime` one concern per PR. Pure leaves go first. Stateful concerns each get their own plan. Leaves that are still copied are pinned by drift tests until they move. Both surfaces map their S3 and object-store settings onto one typed schema. The end state is shared runtime primitives under per-surface event loops (R16). An earlier goal of a single runtime run entry point was dropped once the two loops proved to be different designs.
 
 ---
 
@@ -33,13 +33,13 @@ The concerns fall into two groups (full inventory: [2026-10-18-action-gateway-co
 | Bounded abort and settle (teardown) | Duplicated behavior, stateful | Rung delivered as behavior fixes in #1906 and #1907, which give both surfaces the same bounds, guards and unknown-on-timeout. There is no runtime extraction. The two ladders are different algorithms, and sharing their primitives would add more lines than it removes |
 | Lock lease renewal and takeover | Duplicated behavior, stateful | Rung delivered in #1899 and #1902. Both surfaces use one runtime lease loop, and takeover policy stays per surface |
 | S3 and object-store config | Duplicated parsing and validation | Config spine, block 1 (delivered in #1883; one object-store settings parser in runtime) |
-| Event-stream loop | Duplicated behavior | Later, after leaves and seams prove out |
-| Timeouts and inactivity | Partly shared (runtime timer unused by the Action) | Later, with the event-stream loop |
+| Event-stream loop | Duplicated behavior | Closed without extraction. The Action loop only observes, and completion is decided by REST polling. The gateway loop decides completion through its drain gate. Sharing the remaining pieces would add about 11 net lines. The behavior differences were fixed in #1912 |
+| Timeouts and inactivity | Partly shared (runtime timer unused by the Action) | Closed. The runtime timer is a shared primitive. The Action has no inactivity window by design, because CI runs have long silent tool calls |
 | GitHub App token minting, log redaction wrappers | Small duplicates | Ladder, low priority. Not small-helper merges (see R7) |
 | Server lifecycle | Three spawn models by design | Out. workspace-agent is its own trust boundary |
 | Env scrub | Action vs workspace-agent only | Out. The `NODE_OPTIONS` fix ships separately |
 | Session persistence and continuity | Action-only. The gateway has none | Later phase (#1712, #1778) |
-| Run outcomes and records | Different by design | Out until the run entry point exists |
+| Run outcomes and records | Different by design | Out. Each surface keeps its own (R16) |
 | Prompt building | Concept overlap only | Out |
 | Reply posting | Different delivery models by design | Out |
 | Permissions and questions | Different policy by design (auto-deny vs approvals) | Out. Becomes a policy hook |
@@ -74,9 +74,9 @@ Session persistence is the largest Action-side concern. It is deferred because t
 - R14. The gateway gains the Action's endpoint validation, with an `S3_ALLOW_INSECURE_ENDPOINT` opt-in. This is a gateway behavior change. Check the production endpoint before rollout.
 - R15. Other config blocks join the schema only when a second consumer needs them.
 
-**Run entry point (north star)**
+**End state**
 
-- R16. A design note defines the end state. Runtime owns the event loop, error classification, teardown, and lock lifecycle. Each surface owns trigger parsing, prompt context, its delivery sink, its permission policy, and its config sources. The north star is reached when both surfaces call one runtime run entry point and pass those policies as hooks.
+- R16. A design note defines the end state. Runtime owns the shared primitives: error classification, payload accessors, the task-notice parser, the timer, the ownership ledger and reconciler, and the lease loop. Each surface owns its event loop with its settle and delivery policy, plus trigger parsing, prompt context, its delivery sink, its permission policy, and its config sources. The two event loops are different designs (an observer with REST completion on the Action, a drain gate on the gateway), so there is no single runtime run entry point.
 - R17. Each consolidation PR names which part of that end state it advances.
 
 **Guardrails**
@@ -107,7 +107,7 @@ Session persistence is the largest Action-side concern. It is deferred because t
 
 ## Scope Boundaries
 
-- The event-stream loops stay separate. Unifying them is the step toward the run entry point after the leaves and seams prove out.
+- The event-stream loops stay separate. That is the end state, not a deferred step (see R16).
 - Delivery models do not change. The Action keeps one comment or review per run (ARCH invariant 5). The gateway keeps streaming replies.
 - workspace-agent's spawn, supervisor, and env policy stay as they are.
 - Session continuity for the gateway and safe concurrent session publication (#1712) are a later phase, as a shared runtime capability. #1778 closes into that phase.
