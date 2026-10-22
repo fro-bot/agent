@@ -633,23 +633,27 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // SAME kind and message re-throw with `quarantined: true` (never a different kind —
   // quarantine is additional evidence, not a replacement explanation).
   //
+  // Root still running: the prompt runs in server scope (`promptAsync`), so closing the stream or giving up on
+  // the run does not stop it — only `session.abort` does. A stop where the root may still be executing
+  // (`rootMayBeRunning`: the wall-clock or inactivity deadline, a stream that ended, a signal after the prompt
+  // was sent, an operator cancel, a provider retry mid-backoff) must therefore abort the root and confirm it
+  // quiescent before the run releases its lock and slot, even with an empty or absent ledger. An unconfirmed
+  // root is quarantined exactly like an unconfirmed child. A failure where the root has already halted (a
+  // terminal provider error, a rejected prompt) and a clean completion keep the fast path.
+  //
   // Follow-up window: a run that adopted background work keeps draining after its children settle, because
   // upstream then injects a follow-up turn on the ROOT, which may be writing to the checkout again. A failure
-  // there (cancel, deadline, a dropped stream) must not take the settled-ledger fast path: the root is aborted
-  // and confirmed quiescent first (`confirmRootQuiescent`), inside the same teardown budget, and an unconfirmed
-  // root is quarantined exactly like an unconfirmed child. Runs that never adopted background work are never
-  // `draining`, so they keep the original fast path.
+  // there (cancel, deadline, a dropped stream) takes the same root teardown.
   async function throwWithBarrier(
     kind: RunCoreErrorKind,
     message: string,
-    options: {readonly rootLive?: boolean; readonly providerFailureReason?: ProviderFailureReason} = {},
+    options: {readonly rootMayBeRunning?: boolean; readonly providerFailureReason?: ProviderFailureReason} = {},
   ): Promise<never> {
-    const {rootLive = false, providerFailureReason} = options
-    // `rootLive`: the caller knows the root is still executing (a provider retry mid-backoff), so it takes the same
-    // root teardown as the follow-up window, even with an empty or settled ledger — or none at all.
+    const {rootMayBeRunning = false, providerFailureReason} = options
     const rootFollowUpOpen =
-      rootLive || (drainCompletion !== undefined && draining === true && drainDoneController.signal.aborted === false)
-    const barrierLedger = ledger ?? (rootLive ? createOwnershipLedger() : undefined)
+      rootMayBeRunning ||
+      (drainCompletion !== undefined && draining === true && drainDoneController.signal.aborted === false)
+    const barrierLedger = ledger ?? (rootMayBeRunning ? createOwnershipLedger() : undefined)
     if (barrierLedger === undefined || (barrierLedger.isDrainComplete() === true && rootFollowUpOpen === false)) {
       throw new RunCoreError(kind, message, false, providerFailureReason)
     }
@@ -677,17 +681,17 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // Fails the run on a provider rejection OpenCode will not recover from (#1836). Reuses `session-error`:
   // a new operator failure kind would be a contract change. Only the fixed `reason` and a sanitized error
   // name leave the classifier; the provider's own message is never logged or placed in the error.
-  // `rootLive`: only a retry status — OpenCode is mid-backoff and will keep going. Every terminal source
+  // `rootMayBeRunning`: only a retry status — OpenCode is mid-backoff and will keep going. Every terminal source
   // (`session.error`, `message.updated`, overflow at idle) fires after `halt` has set the root idle
   // (processor.ts:613-639), so the root is already stopped there.
-  async function failFromProvider(failure: ProviderFailure, source: string, rootLive = false): Promise<never> {
+  async function failFromProvider(failure: ProviderFailure, source: string, rootMayBeRunning = false): Promise<never> {
     logger.error(
       {sessionId, source, errorName: failure.errorName, reason: failure.reason},
       'run-core: provider rejected the request — failing run',
     )
     clearInactivity()
     throw await throwWithBarrier('session-error', `Provider failure: ${failure.reason}`, {
-      rootLive,
+      rootMayBeRunning,
       providerFailureReason: failure.reason,
     })
   }
@@ -746,7 +750,9 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   if (combinedSignal.aborted) {
     clearInactivity()
     logger.warn({sessionId}, 'run-core: signal aborted after prompt send')
-    throw await throwWithBarrier('timeout', 'Run timed out: signal aborted after prompt send')
+    throw await throwWithBarrier('timeout', 'Run timed out: signal aborted after prompt send', {
+      rootMayBeRunning: true,
+    })
   }
 
   // ── 4. Consume event stream ────────────────────────────────────────────────
@@ -1407,10 +1413,14 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         {sessionId, totalEvents, activityEvents, lastEventType},
         'run-core: stream ended due to inactivity timeout',
       )
-      throw await throwWithBarrier('inactivity-timeout', 'Run timed out: no activity within the inactivity window')
+      throw await throwWithBarrier('inactivity-timeout', 'Run timed out: no activity within the inactivity window', {
+        rootMayBeRunning: true,
+      })
     }
     logger.warn({sessionId, totalEvents, activityEvents, lastEventType}, 'run-core: stream ended due to timeout signal')
-    throw await throwWithBarrier('timeout', 'Run timed out: event stream aborted by timeout signal')
+    throw await throwWithBarrier('timeout', 'Run timed out: event stream aborted by timeout signal', {
+      rootMayBeRunning: true,
+    })
   }
 
   // Stream closed without session.idle and not aborted by us → OpenCode
@@ -1419,7 +1429,9 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     {sessionId, totalEvents, activityEvents, lastEventType},
     'run-core: event stream closed before session.idle',
   )
-  throw await throwWithBarrier('stream-ended', 'Event stream closed before session.idle was received')
+  throw await throwWithBarrier('stream-ended', 'Event stream closed before session.idle was received', {
+    rootMayBeRunning: true,
+  })
 }
 
 // ---------------------------------------------------------------------------
