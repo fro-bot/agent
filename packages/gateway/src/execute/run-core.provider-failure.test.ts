@@ -692,18 +692,28 @@ describe('runOpenCodeCore — provider rejection fails fast (#1836)', () => {
       expect(loggedText(run.logger)).not.toContain('SECRET')
     })
 
-    it('lets an owned child recover through its own compaction (compaction on)', async () => {
-      // #given
-      const run = startRun({owned: [CHILD]})
+    it('with compaction on, a child overflow marks the child unknown and a root overflow needs the root compaction part', async () => {
+      // #given an adopted child
+      const ownershipLedger = createOwnershipLedger()
+      ownershipLedger.adopt(CHILD, 'background task')
+      const run = startRun({owned: [CHILD], ownershipLedger})
 
-      // #when
+      // #when the child overflows and compacts, and goes idle
       await run.emit(sessionError({name: 'ContextOverflowError', data: {message: 'x'}}, CHILD))
       await run.emit(compactionPart(CHILD))
       await run.emit({type: 'session.idle', properties: {sessionID: CHILD}})
+
+      // #then the child is unconfirmed (compaction does not settle it) and the run was not failed
+      expect(run.outcome()).toBeUndefined()
+      expect(ownershipLedger.snapshot()).toEqual([{sessionId: CHILD, label: 'background task', state: 'unknown'}])
+
+      // #when the ROOT overflows, its own compaction part arrives, and the root goes idle
+      await run.emit(sessionError({name: 'ContextOverflowError', data: {message: 'x'}}, ROOT))
+      await run.emit(compactionPart(ROOT))
       await run.emit({type: 'session.idle', properties: {sessionID: ROOT}})
 
-      // #then
-      expect(run.outcome()).toEqual({ok: true})
+      // #then the root recovered through its own compaction: the run is not failed by that overflow
+      expect(run.outcome()).not.toEqual(expect.objectContaining({ok: false}))
     })
 
     it('re-arms on a second overflow after a compaction', async () => {

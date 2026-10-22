@@ -47,49 +47,60 @@ function makeCoordinator(): PermissionCoordinator {
   }
 }
 
-const taskNotice = {
-  type: 'message.part.updated',
-  properties: {
-    sessionID: ROOT,
-    part: {
-      id: 'part-notice-1',
-      messageID: 'msg-notice-1',
+type NoticeState = 'completed' | 'error'
+
+/** The synthetic user turn upstream injects into the parent when a background child ends. */
+function noticeFor(state: NoticeState): object {
+  return {
+    type: 'message.part.updated',
+    properties: {
       sessionID: ROOT,
-      type: 'text',
-      synthetic: true,
-      text: `<task id="${CHILD}" state="completed">\n<summary>Background task completed</summary>\n</task>`,
+      part: {
+        id: 'part-notice-1',
+        messageID: 'msg-notice-1',
+        sessionID: ROOT,
+        type: 'text',
+        synthetic: true,
+        text: `<task id="${CHILD}" state="${state}">\n<summary>Background task ${state}</summary>\n</task>`,
+      },
     },
-  },
+  }
 }
-const completedFollowUp = [
-  {info: {id: 'msg-prompt', role: 'user', sessionID: ROOT}, parts: [{type: 'text', text: 'prompt'}]},
-  {
-    info: {
-      id: 'msg-reply-1',
-      role: 'assistant',
-      sessionID: ROOT,
-      parentID: 'msg-prompt',
-      time: {completed: 1},
-      finish: 'stop',
+
+/** REST `session.messages` for the root: the prompt answered, then the injected notice answered. */
+function followUpFor(state: NoticeState): readonly object[] {
+  return [
+    {info: {id: 'msg-prompt', role: 'user', sessionID: ROOT}, parts: [{type: 'text', text: 'prompt'}]},
+    {
+      info: {
+        id: 'msg-reply-1',
+        role: 'assistant',
+        sessionID: ROOT,
+        parentID: 'msg-prompt',
+        time: {completed: 1},
+        finish: 'stop',
+      },
+      parts: [],
     },
-    parts: [],
-  },
-  {
-    info: {id: 'msg-notice-1', role: 'user', sessionID: ROOT},
-    parts: [{id: 'part-notice-1', type: 'text', synthetic: true, text: `<task id="${CHILD}" state="completed">`}],
-  },
-  {
-    info: {
-      id: 'msg-reply-2',
-      role: 'assistant',
-      sessionID: ROOT,
-      parentID: 'msg-notice-1',
-      time: {completed: 2},
-      finish: 'stop',
+    {
+      info: {id: 'msg-notice-1', role: 'user', sessionID: ROOT},
+      parts: [{id: 'part-notice-1', type: 'text', synthetic: true, text: `<task id="${CHILD}" state="${state}">`}],
     },
-    parts: [],
-  },
-]
+    {
+      info: {
+        id: 'msg-reply-2',
+        role: 'assistant',
+        sessionID: ROOT,
+        parentID: 'msg-notice-1',
+        time: {completed: 2},
+        finish: 'stop',
+      },
+      parts: [],
+    },
+  ]
+}
+
+const taskNotice = noticeFor('completed')
 
 interface Run {
   readonly ledger: ReturnType<typeof createOwnershipLedger>
@@ -101,7 +112,7 @@ interface Run {
 }
 
 /** `status()` reports nothing live, so a reconcile pass settles any tracked direct child. */
-function startRun(): Run {
+function startRun(rootMessages: readonly object[] = followUpFor('completed')): Run {
   vi.useFakeTimers()
   const queue: object[] = []
   let wake: (() => void) | null = null
@@ -121,7 +132,7 @@ function startRun(): Run {
     session: {
       create: vi.fn().mockResolvedValue({data: {id: ROOT}, error: null}),
       messages: vi.fn(async (args: {path: {id: string}}) => ({
-        data: args.path.id === ROOT ? completedFollowUp : [],
+        data: args.path.id === ROOT ? rootMessages : [],
         error: null,
       })),
       promptAsync: vi.fn().mockResolvedValue({data: {}, error: null}),
@@ -204,8 +215,8 @@ function childState(run: Run): OwnershipEntryState | undefined {
   return run.ledger.snapshot().find(entry => entry.sessionId === CHILD)?.state
 }
 
-async function adopted(): Promise<Run> {
-  const run = startRun()
+async function adopted(rootMessages?: readonly object[]): Promise<Run> {
+  const run = startRun(rootMessages)
   run.emit(adoptChild)
   await vi.advanceTimersByTimeAsync(100)
   return run
@@ -245,6 +256,48 @@ describe('a session.error on a session the run owns', () => {
 
     // #then the run completes instead of failing on the child's error
     expect(run.outcome()).toBe('resolved')
+  })
+
+  it('completes the run when an errored child is followed by its error notice: the root reply carries the outcome', async () => {
+    // #given a child that fails terminally and whose end the root is told about with state="error"
+    const run = await adopted(followUpFor('error'))
+    run.emit(sessionError(authError, CHILD))
+    await vi.advanceTimersByTimeAsync(100)
+    expect(childState(run)).toBe('unknown')
+
+    // #when reconciliation settles the child, the error notice reaches the root, and the root answers it
+    run.emit(rootIdle)
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(childState(run)).toBe('settled')
+    run.emit(noticeFor('error'))
+    run.emit(rootIdle)
+    await vi.advanceTimersByTimeAsync(10_000)
+
+    // #then the child's failure is not a run failure: the run completes with the child settled
+    expect(run.outcome()).toBe('resolved')
+    expect(childState(run)).toBe('settled')
+  })
+
+  it('holds the run until its deadline and fails it as drain-timeout when the child notice never arrives', async () => {
+    // #given an errored child that reconciliation settles, and a notice upstream never delivers: neither the stream
+    // nor the persisted messages ever show it
+    const run = await adopted(followUpFor('completed').slice(0, 2))
+    run.emit(sessionError(authError, CHILD))
+    run.emit(rootIdle)
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(childState(run)).toBe('settled')
+
+    // #when a long time passes with no notice, the run still waits
+    await vi.advanceTimersByTimeAsync(120_000)
+    expect(run.outcome()).toBe('pending')
+
+    // #and the run's own deadline expires
+    run.controller.abort()
+    await vi.advanceTimersByTimeAsync(20_000)
+
+    // #then it fails as a drain timeout: settled ledger alone is not completion
+    expect(run.outcome()).toBe('rejected')
+    expect((run.error() as RunCoreError).kind).toBe('drain-timeout')
   })
 
   it('marks an owned child unknown when another client aborts it', async () => {
