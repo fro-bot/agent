@@ -540,4 +540,34 @@ describe('settleOwnedSessions', () => {
       expect(abortSignals.every(signal => signal === childrenSignals[0])).toBe(true)
     })
   })
+  describe('confirming a root that was prompted', () => {
+    it('confirms and releases on absence after an abort sent right after promptAsync returned', async () => {
+      // #given a root aborted immediately after the 204: on OpenCode 1.19.0 the abort wins even before any busy
+      // status exists (live probe: the session never goes busy, nothing runs, and the assistant turn is created
+      // and completed with MessageAbortedError), so the live set never shows the root
+      const ledger = createOwnershipLedger()
+      const client = makeClient({status: async () => ({data: {}, error: null})})
+
+      // #when
+      const result = await settleOwnedSessions({
+        client,
+        directory: '/workspace/repo',
+        rootSessionId: ROOT,
+        ledger,
+        logger: makeLogger(),
+        confirmRootQuiescent: true,
+        rootPollIntervalMs: 5,
+      })
+
+      // #then absence after the abort is the confirmation: one abort, no extra evidence required
+      expect(result).toEqual({settled: true})
+      const session = client.session as unknown as {
+        readonly abort: ReturnType<typeof vi.fn>
+        readonly status: ReturnType<typeof vi.fn>
+      }
+      expect(session.abort).toHaveBeenCalledTimes(1)
+      expect(session.abort).toHaveBeenCalledWith(expect.objectContaining({path: {id: ROOT}}))
+      expect(session.status).toHaveBeenCalledTimes(1)
+    })
+  })
 })
