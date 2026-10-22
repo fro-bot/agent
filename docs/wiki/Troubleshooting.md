@@ -25,6 +25,10 @@ sources:
   - src/features/delegated/brokered-push.ts
   - src/features/delegated/brokered-push-validation.ts
   - packages/gateway/src/web/operator-route.ts
+  - packages/gateway/src/execute/run.ts
+  - packages/gateway/src/execute/settle-owned-sessions.ts
+  - apps/workspace-agent/src/server.ts
+  - apps/workspace-agent/src/opencode-proxy.ts
   - docs/solutions/test-failures/gateway-operator-route-health-timeout-flake-2026-07-30.md
 summary: "Common failure symptoms and their causes across action execution, persistence, setup, and gateway runs"
 ---
@@ -155,6 +159,15 @@ The coordination lock normally disappears when a run finishes. If a repo stays b
 - A tick that was still pending when the 5 s stop budget ran out leaves no budget to look for a committed renewal, so the ETag stop reports may be stale. The gateway's release then retries once by ownership (`run: lock released by ownership after a stale ETag`, info): it reads the lock and deletes it only if the holder, run and `acquisition_token` are this run's. A `lock now belongs to another acquisition` line means a successor holds the lock and it was left alone. The retry is bounded at 5 s: if the store stalls, `ownership release did not finish within 5000ms — lock left to its TTL` is logged (warning), then `releaseLock failed`, and the lock lapses by TTL. Only a failure of the retry logs `releaseLock failed`.
 
 To clear a stuck gateway lock sooner, use `/fro-bot force-release-lock`; it deletes the lock only when the lease has expired and the repo's workspace reports `clear`.
+
+## A Gateway Run Was Refused or Cancelled
+
+When a gateway run ends before the agent starts, or a cancel does not seem to stop the agent, the logs carry the reason without any repository content. Join the lines on `runId` (gateway) and `sessionId` (workspace).
+
+- **`run: checkout preparation refused`** / **`run: checkout preparation failed`** (gateway, warning) fires once when `/update` refuses or fails the checkout. It carries `repo`, `runId`, and the closed `reason` (`dirty`, `ahead`, `diverged`, `detached`, `maintenance-hold`, `fetch-timeout`, and so on). A `dirty` refusal adds `changedPathCount`, capped at 20 by the workspace sample; a failure adds `mutationStarted` and `permanent`. Path, config-key, submodule and branch names are never logged; the capped names are in the run's persisted `checkoutPreparation` record.
+- **`workspace-agent: update refused`** / **`workspace-agent: update failed`** (workspace, warning) is the same decision seen from the workspace, with `owner`, `repo`, `reason`, `durationMs`, and `changedPathCount` for `dirty`. If the gateway line is present and this one is not, the request never completed in the workspace.
+- **`opencode-proxy: session abort forwarded`** (workspace, info) is the only workspace-side trace of an operator cancel, since the gateway aborts through the proxy. It carries `sessionId`, the `status` the gateway saw, and `durationMs`. `session delete`, `instance dispose` and `global dispose` requests are logged the same way. Request bodies, headers and the query string are never logged.
+- **`settle-owned-sessions: ...`** and **`run-core: owned work could not be confirmed settled`** (gateway) carry `runId` as well as `rootSessionId`, so an abort that did not confirm, and the quarantine that follows, join to their run. Match the `rootSessionId` to the `sessionId` on the workspace's abort line to see whether the abort request reached OpenCode.
 
 ## Known Gateway Test Flake
 

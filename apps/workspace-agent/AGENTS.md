@@ -108,6 +108,15 @@ Confirms a previously previewed recovery: quarantines the existing checkout (if 
 
 List or delete quarantine generations for a repository. `owner`/`repo` are path params, validated with the same sanitizers every other route uses; `:id` is validated as a simple path segment (no `..`, no path separator, not empty) before `deleteBackup` runs its own internal check — neither layer alone is trusted. No export and no bulk delete.
 
+## Logging
+
+One process logger (built in `main.ts`, writing to container stderr) is shared by startup reconciliation, the OpenCode supervisor, the 9200 proxy and, through `ServerDeps.logger`, the control routes. It is handed to `executeUpdate`, so `update.ts`'s own log lines emit instead of defaulting to a silent no-op.
+
+- **`workspace-agent: update refused`** / **`workspace-agent: update failed`** (warning, `server.ts`): one line per refused or failed `/update`, with `owner`, `repo`, the closed `reason` and `durationMs`; `dirty` adds `changedPathCount`, `failed` adds `mutationStarted` and `permanent`. `ready` and `no-checkout` are silent.
+- **`opencode-proxy: session abort forwarded`** (info, `opencode-proxy.ts`): a proxied `POST /session/:id/abort` is the workspace-side trace of an operator cancel. Fields: `sessionId`, the `status` the caller saw (including a 502/504 the proxy produced), `durationMs`. `session delete`, `instance dispose` and `global dispose` use the same shape. Logged after the bearer check, when the response closes.
+
+Never log names or contents that come from the agent-writable checkout (changed paths, config keys, submodule or branch names), request bodies, headers, the query string (it carries the workspace directory), or any token. Counts and closed reasons only.
+
 ## Package layout
 
 ```
