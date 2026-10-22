@@ -1800,6 +1800,26 @@ describe('processEventStream — reasoning deltas stay out of the response text'
     expect(flushed).toEqual(['the answer'])
   })
 
+  it('excludes object-shaped deltas of a reasoning part, and keeps object-shaped deltas of a text part', async () => {
+    // #given deltas shaped {type: 'text', text} instead of a plain string, on a reasoning part and on a text part
+    const objectDelta = (text: string, partID: string): Event =>
+      ({
+        type: 'message.part.delta',
+        properties: {sessionID: ROOT_SESSION_ID, partID, delta: {type: 'text', text}},
+      }) as unknown as Event
+    const events = [
+      reasoningPart('prt_reasoning'),
+      objectDelta('secret thinking', 'prt_reasoning'),
+      objectDelta('the answer', 'prt_text'),
+    ]
+
+    // #when
+    const flushed = await flushedText(events)
+
+    // #then the reasoning text is excluded whatever the delta's shape
+    expect(flushed).toEqual(['the answer'])
+  })
+
   it('keeps accumulating deltas of parts that are not reasoning', async () => {
     // #given
     const events = [delta('one ', 'prt_text'), delta('two', 'prt_text'), delta(' three', undefined)]
