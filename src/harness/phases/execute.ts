@@ -554,11 +554,11 @@ const DEFAULT_DRAIN_POLL_INTERVAL_MS = 250
 const DRAIN_CALL_TIMEOUT_MS = 5_000
 
 /**
- * With no drain deadline, how many consecutive reconcile passes may leave every unsettled entry `unknown`
- * (none observed running) before drain stops waiting. Work observed running, meaning at least one `outstanding`
- * entry, is waited for without a time cap. Unreachable work cannot be waited on: a dead server fails every pass,
- * and an entry that is not a direct child of the parent is downgraded on every pass. Only meaningful when the
- * deadline is infinite; a finite deadline always waits for it.
+ * With no drain deadline, how many consecutive reconcile passes may observe no tracked session running before
+ * drain stops waiting. Work a pass observes running (a tracked session that is a live direct child of the parent)
+ * is waited for without a time cap, whatever its ledger state. Unreachable work cannot be waited on: a dead server
+ * fails every pass, and an entry that is not a direct child of the parent is never seen as a live child. Only
+ * meaningful when the deadline is infinite; a finite deadline always waits for it.
  */
 export const UNOBSERVABLE_PASSES_BEFORE_DRAIN_EXIT = 3
 
@@ -618,8 +618,14 @@ async function boundedCall<T>(call: (signal: AbortSignal) => Promise<T>): Promis
  * failed pass: outstanding entries become `unknown`. Once the bound has passed, the abandoned pass can no longer
  * change the ledger, so a late answer cannot overturn the decision the drain already made. `isClosed` marks a
  * drain that has already decided (its wait loop ended): from then on the pass is inert whenever it answers.
+ *
+ * Resolves `true` only when the pass finished and saw a tracked session running (a live direct child of the
+ * parent). A pass that failed or timed out observed nothing, so it resolves `false`.
  */
-async function reconcileBounded(options: ReconcileLedgerOptions, isClosed: () => boolean = () => false): Promise<void> {
+async function reconcileBounded(
+  options: ReconcileLedgerOptions,
+  isClosed: () => boolean = () => false,
+): Promise<boolean> {
   const {ledger, logger} = options
   let abandoned = false
   const inert = (): boolean => abandoned || isClosed()
@@ -634,10 +640,12 @@ async function reconcileBounded(options: ReconcileLedgerOptions, isClosed: () =>
   }
 
   const result = await boundedCall(async signal => reconcileLedgerOnce({...options, ledger: guardedLedger, signal}))
-  if (result.timedOut === false) return
+  if (result.timedOut === false) {
+    return result.value.success && result.value.data.liveTrackedSessionIds.size > 0
+  }
 
   abandoned = true
-  if (isClosed()) return
+  if (isClosed()) return false
   const outstanding = ledger.snapshot().filter(entry => entry.state === 'outstanding')
   for (const entry of outstanding) ledger.markUnknown(entry.sessionId)
   logger.warning('Ledger reconciliation timed out; marking outstanding entries unknown rather than settling them', {
@@ -646,6 +654,7 @@ async function reconcileBounded(options: ReconcileLedgerOptions, isClosed: () =>
     unknownCount: outstanding.length,
     timeoutMs: DRAIN_CALL_TIMEOUT_MS,
   })
+  return false
 }
 
 async function cancelOutstanding(options: {
@@ -778,15 +787,16 @@ export async function runDrain(options: RunDrainOptions): Promise<DrainOutcome> 
   // reader of it would additionally have to get right.
   let consecutiveUnobservablePasses = 0
   let waitEnded = false
-  // One bounded, guarded pass. After a pass, every unsettled entry still being `unknown` (none observed running)
-  // extends the streak; anything else resets it. Passes after the wait loop has ended count for nothing and, being
-  // inert, change nothing.
+  // One bounded, guarded pass. A pass that did not observe any tracked session running (it failed, timed out, or
+  // saw no tracked entry as a live direct child) while work is still unsettled extends the streak; a pass that saw
+  // one running resets it, whatever state the ledger holds for it: a transient failure leaves a running child
+  // `unknown`, and the ledger never moves it back. Passes after the wait loop has ended count for nothing and,
+  // being inert, change nothing.
   const reconcilePass = async (): Promise<void> => {
-    await reconcileBounded(reconcileOptions, () => waitEnded)
+    const observedRunning = await reconcileBounded(reconcileOptions, () => waitEnded)
     if (waitEnded) return
-    const unsettled = ledger.snapshot().filter(entry => entry.state !== 'settled')
-    const allUnknown = unsettled.length > 0 && unsettled.every(entry => entry.state === 'unknown')
-    consecutiveUnobservablePasses = allUnknown ? consecutiveUnobservablePasses + 1 : 0
+    const workRemains = ledger.snapshot().some(entry => entry.state !== 'settled')
+    consecutiveUnobservablePasses = workRemains && observedRunning === false ? consecutiveUnobservablePasses + 1 : 0
   }
   const hasDeadline = Number.isFinite(deadlineMs)
   const unobservable = (): boolean =>

@@ -1607,6 +1607,63 @@ describe('runDrain', () => {
         }
       })
 
+      describe('a child that is still running after a transient failure', () => {
+        // One failed or timed-out pass leaves the child `unknown`, and the ledger never moves it back. Later passes
+        // still see it running, so drain keeps waiting for it however many passes have gone by.
+        it.each(['children failed', 'status failed', 'pass timed out'] as const)(
+          'keeps waiting past 3 passes and settles it when it finishes (%s)',
+          async blip => {
+            // #given the child went unknown on the first pass
+            vi.useFakeTimers()
+            try {
+              const ledger = createOwnershipLedger()
+              ledger.adopt('ses_child', 'background task')
+              let childrenCalls = 0
+              let statusCalls = 0
+              let childDone = false
+              const abort = vi.fn(async () => ({data: {}}))
+              const client = {
+                session: {
+                  children: async () => {
+                    childrenCalls += 1
+                    if (childrenCalls === 1 && blip === 'children failed') throw new Error('blip')
+                    if (childrenCalls === 1 && blip === 'pass timed out') return hang()
+                    return {data: [{id: 'ses_child'}]}
+                  },
+                  status: async () => {
+                    statusCalls += 1
+                    if (statusCalls === 1 && blip === 'status failed') throw new Error('blip')
+                    return {data: childDone ? {} : {ses_child: {}}}
+                  },
+                  abort,
+                },
+              } as unknown as SessionClient
+              const drain = startDrain(ledger, client, Number.POSITIVE_INFINITY)
+              await vi.advanceTimersByTimeAsync(10_000)
+              expect(ledger.snapshot()).toEqual([{sessionId: 'ses_child', label: 'background task', state: 'unknown'}])
+
+              // #when many more passes observe it running
+              await vi.advanceTimersByTimeAsync(30 * INTERVAL_MS)
+
+              // #then drain is still waiting and has not cancelled it
+              expect(drain.outcome()).toBeUndefined()
+              expect(abort).not.toHaveBeenCalled()
+
+              // #when the child finishes
+              childDone = true
+              await vi.advanceTimersByTimeAsync(3 * INTERVAL_MS)
+
+              // #then it settles, and drain completes without ever cancelling
+              expect(drain.outcome()).toEqual({expired: false, cancelledCount: 0, settledCount: 0, unknownCount: 0})
+              expect(abort).not.toHaveBeenCalled()
+              expect(ledger.snapshot()).toEqual([{sessionId: 'ses_child', label: 'background task', state: 'settled'}])
+            } finally {
+              vi.useRealTimers()
+            }
+          },
+        )
+      })
+
       it('keeps waiting until the deadline when the deadline is finite, whatever the unknown streak', async () => {
         // #given the same unreachable server, with a finite deadline
         vi.useFakeTimers()

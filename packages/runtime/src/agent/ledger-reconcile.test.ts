@@ -32,6 +32,17 @@ function makeAdapter(overrides: Partial<LedgerReconcileAdapter> = {}): LedgerRec
   }
 }
 
+/** Runs one pass over a ledger set up by `setup`; `live` is the observed live tracked ids, or null if the pass failed. */
+async function observe(
+  setup: (ledger: ReturnType<typeof createOwnershipLedger>) => void,
+  adapter: LedgerReconcileAdapter,
+): Promise<{live: string[] | null; ledger: ReturnType<typeof createOwnershipLedger>}> {
+  const ledger = createOwnershipLedger()
+  setup(ledger)
+  const result = await reconcileLedgerOnce({ledger, adapter, parentSessionId: PARENT_SESSION_ID, logger: makeLogger()})
+  return {live: result.success ? [...result.data.liveTrackedSessionIds] : null, ledger}
+}
+
 describe('createSdkLedgerReconcileAdapter', () => {
   const WORKSPACE = '/workspace/repos/owner/repo'
 
@@ -381,6 +392,77 @@ describe('reconcileLedgerOnce', () => {
     expect(ledger.snapshot()).toEqual([
       {sessionId: 'dropped-settlement-child', label: 'background task', state: 'settled'},
     ])
+  })
+
+  describe('observation', () => {
+    it('reports a tracked direct child that is live', async () => {
+      // #given / #when
+      const {live, ledger} = await observe(
+        l => l.adopt('child-1', 'task'),
+        makeAdapter({
+          children: async () => ok([{id: 'child-1'}]),
+          liveSessionIds: async () => ok(new Set(['child-1'])),
+        }),
+      )
+
+      // #then
+      expect(live).toEqual(['child-1'])
+      expect(ledger.outstanding()).toBe(1)
+    })
+
+    it('reports a live direct child that is already unknown, without moving it back to outstanding', async () => {
+      // #given an entry downgraded earlier, whose session is still running
+      // #when
+      const {live, ledger} = await observe(
+        l => {
+          l.adopt('child-1', 'task')
+          l.markUnknown('child-1')
+        },
+        makeAdapter({
+          children: async () => ok([{id: 'child-1'}]),
+          liveSessionIds: async () => ok(new Set(['child-1'])),
+        }),
+      )
+
+      // #then it was observed running, and ledger semantics are unchanged
+      expect(live).toEqual(['child-1'])
+      expect(ledger.snapshot()).toEqual([{sessionId: 'child-1', label: 'task', state: 'unknown'}])
+    })
+
+    it('reports nothing for a child that is not live', async () => {
+      // #given / #when
+      const {live} = await observe(
+        l => l.adopt('child-1', 'task'),
+        makeAdapter({children: async () => ok([{id: 'child-1'}]), liveSessionIds: async () => ok(new Set<string>())}),
+      )
+
+      // #then
+      expect(live).toEqual([])
+    })
+
+    it('reports nothing for a live session that is not a direct child', async () => {
+      // #given / #when
+      const {live} = await observe(
+        l => l.adopt('child-1', 'task'),
+        makeAdapter({children: async () => ok([]), liveSessionIds: async () => ok(new Set(['child-1']))}),
+      )
+
+      // #then
+      expect(live).toEqual([])
+    })
+
+    it('reports nothing for an empty ledger, and gives no observation on a failed pass', async () => {
+      // #given / #when
+      const empty = await observe(() => {}, makeAdapter())
+      const failed = await observe(
+        l => l.adopt('child-1', 'task'),
+        makeAdapter({children: async () => err(new Error('down'))}),
+      )
+
+      // #then
+      expect(empty.live).toEqual([])
+      expect(failed.live).toBeNull()
+    })
   })
 
   describe('request signal', () => {

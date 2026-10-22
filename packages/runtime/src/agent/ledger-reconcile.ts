@@ -177,6 +177,19 @@ export interface ReconcileLedgerOptions {
 }
 
 /**
+ * What a successful pass saw, separate from what it did to the ledger. Callers that only care about ledger state
+ * ignore it; a pass that fails returns an error and has no observation.
+ */
+export interface ReconcileObservation {
+  /**
+   * Unsettled entries (`outstanding` or `unknown`) whose session this pass saw as a live direct child of the
+   * parent. An `unknown` entry stays `unknown` in the ledger when it is seen running; this is the only place that
+   * shows it was.
+   */
+  readonly liveTrackedSessionIds: ReadonlySet<string>
+}
+
+/**
  * Run one reconciliation pass: settle tracked entries that are no longer
  * live, downgrade tracked entries this parent can no longer vouch for to
  * `unknown`, and — on failure — mark outstanding entries unknown. Never
@@ -189,11 +202,13 @@ export interface ReconcileLedgerOptions {
  * Makes no upstream calls when the ledger has no entries at all — see
  * "Empty-ledger short circuit" in the module doc.
  */
-export async function reconcileLedgerOnce(options: ReconcileLedgerOptions): Promise<Result<void, Error>> {
+export async function reconcileLedgerOnce(
+  options: ReconcileLedgerOptions,
+): Promise<Result<ReconcileObservation, Error>> {
   const {ledger, adapter, parentSessionId, logger, signal} = options
 
   if (ledger.snapshot().length === 0) {
-    return ok(undefined)
+    return ok({liveTrackedSessionIds: new Set<string>()})
   }
 
   const signalArgs: [AbortSignal] | [] = signal === undefined ? [] : [signal]
@@ -223,6 +238,7 @@ export async function reconcileLedgerOnce(options: ReconcileLedgerOptions): Prom
 
   const settled: string[] = []
   const downgradedToUnknown: string[] = []
+  const liveTrackedSessionIds = new Set<string>()
   for (const entry of ledger.snapshot()) {
     if (entry.state !== 'outstanding' && entry.state !== 'unknown') continue
 
@@ -237,7 +253,10 @@ export async function reconcileLedgerOnce(options: ReconcileLedgerOptions): Prom
       continue
     }
 
-    if (liveSessionIds.has(entry.sessionId) === true) continue
+    if (liveSessionIds.has(entry.sessionId) === true) {
+      liveTrackedSessionIds.add(entry.sessionId)
+      continue
+    }
     ledger.settle(entry.sessionId)
     settled.push(entry.sessionId)
   }
@@ -251,7 +270,7 @@ export async function reconcileLedgerOnce(options: ReconcileLedgerOptions): Prom
     })
   }
 
-  return ok(undefined)
+  return ok({liveTrackedSessionIds})
 }
 
 export interface LedgerReconciler {
