@@ -10,7 +10,13 @@ import {createOwnershipLedger} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {executeOpenCode} from '../../features/agent/index.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
-import {computeDrainDeadlineMs, DEFAULT_DRAIN_TEARDOWN_RESERVE_MS, runDrain, runExecute} from './execute.js'
+import {
+  computeDrainDeadlineMs,
+  DEFAULT_DRAIN_TEARDOWN_RESERVE_MS,
+  runDrain,
+  runExecute,
+  UNOBSERVABLE_PASSES_BEFORE_DRAIN_EXIT,
+} from './execute.js'
 
 const mocks = vi.hoisted(() => ({
   archiveSession: vi.fn(),
@@ -1413,6 +1419,186 @@ describe('runDrain', () => {
       } finally {
         vi.useRealTimers()
       }
+    })
+
+    describe('entries that can never be confirmed', () => {
+      const INTERVAL_MS = 1_000
+
+      function startDrain(
+        ledger: ReturnType<typeof createOwnershipLedger>,
+        client: SessionClient,
+        deadlineMs: number,
+      ): {readonly outcome: () => Awaited<ReturnType<typeof runDrain>> | undefined; readonly done: Promise<void>} {
+        let outcome: Awaited<ReturnType<typeof runDrain>> | undefined
+        const done = runDrain({
+          ledger,
+          client,
+          parentSessionId: 'ses_root',
+          directory: '/workspace',
+          deadlineMs,
+          logger,
+          reconcileIntervalMs: INTERVAL_MS,
+          pollIntervalMs: 50,
+        }).then(result => {
+          outcome = result
+        })
+        return {outcome: () => outcome, done}
+      }
+
+      it('names the number of passes an entry may stay unobservable', () => {
+        expect(UNOBSERVABLE_PASSES_BEFORE_DRAIN_EXIT).toBe(3)
+      })
+
+      it('stops waiting after 3 unknown passes when every reconcile call fails, and reports unresolved ownership', async () => {
+        // #given a server that cannot be reached: every pass fails, so every entry is unknown
+        vi.useFakeTimers()
+        try {
+          const ledger = createOwnershipLedger()
+          ledger.adopt('ses_child', 'background task')
+          const abort = vi.fn(async () => {
+            throw new Error('server down')
+          })
+          const client = {
+            session: {
+              children: async () => {
+                throw new Error('server down')
+              },
+              status: async () => {
+                throw new Error('server down')
+              },
+              abort,
+            },
+          } as unknown as SessionClient
+          const drain = startDrain(ledger, client, Number.POSITIVE_INFINITY)
+
+          // #when the first pass and one periodic tick have run: two unknown passes, so still waiting
+          await vi.advanceTimersByTimeAsync(INTERVAL_MS + 100)
+          expect(drain.outcome()).toBeUndefined()
+
+          // #and the third pass arrives
+          await vi.advanceTimersByTimeAsync(INTERVAL_MS + 100)
+
+          // #then drain gave up waiting, went to cancellation, and says the ownership is unresolved
+          expect(drain.outcome()).toMatchObject({expired: true, cancelledCount: 1, settledCount: 0, unknownCount: 1})
+          expect(abort).toHaveBeenCalledTimes(1)
+          expect(ledger.snapshot()).toEqual([{sessionId: 'ses_child', label: 'background task', state: 'unknown'}])
+        } finally {
+          vi.useRealTimers()
+        }
+      })
+
+      it('stops waiting after 3 passes for an entry that is not a direct child and stays unknown', async () => {
+        // #given an adopted session the parent never lists as its child
+        vi.useFakeTimers()
+        try {
+          const ledger = createOwnershipLedger()
+          ledger.adopt('ses_grandchild', 'background task')
+          const client = createFakeSessionClient({
+            children: async () => ({data: []}),
+            status: async () => ({data: {ses_grandchild: {}}}),
+          })
+          const drain = startDrain(ledger, client, Number.POSITIVE_INFINITY)
+
+          // #when
+          await vi.advanceTimersByTimeAsync(2 * INTERVAL_MS - 500)
+          const waitingAtTwo = drain.outcome()
+          await vi.advanceTimersByTimeAsync(1_000)
+
+          // #then
+          expect(waitingAtTwo).toBeUndefined()
+          expect(drain.outcome()).toMatchObject({expired: true, unknownCount: 1})
+        } finally {
+          vi.useRealTimers()
+        }
+      })
+
+      it('does not exit early when the entry is unknown for 2 passes and a later pass settles it', async () => {
+        // #given the first two passes fail, then the server answers and the child is gone
+        vi.useFakeTimers()
+        try {
+          const ledger = createOwnershipLedger()
+          ledger.adopt('ses_child', 'background task')
+          let childrenCalls = 0
+          const abort = vi.fn(async () => ({data: {}}))
+          const client = {
+            session: {
+              children: async () => {
+                childrenCalls += 1
+                if (childrenCalls <= 2) throw new Error('server down')
+                return {data: [{id: 'ses_child'}]}
+              },
+              status: async () => ({data: {}}),
+              abort,
+            },
+          } as unknown as SessionClient
+          const drain = startDrain(ledger, client, Number.POSITIVE_INFINITY)
+
+          // #when the third pass runs
+          await vi.advanceTimersByTimeAsync(3 * INTERVAL_MS)
+
+          // #then the count was reset by the successful pass: drain completed, nothing was cancelled
+          expect(drain.outcome()).toEqual({expired: false, cancelledCount: 0, settledCount: 0, unknownCount: 0})
+          expect(abort).not.toHaveBeenCalled()
+          expect(ledger.snapshot()).toEqual([{sessionId: 'ses_child', label: 'background task', state: 'settled'}])
+        } finally {
+          vi.useRealTimers()
+        }
+      })
+
+      it('keeps waiting while any entry is still outstanding, even if another is unknown', async () => {
+        // #given one live child under the parent and one session the parent never lists
+        vi.useFakeTimers()
+        try {
+          const ledger = createOwnershipLedger()
+          ledger.adopt('ses_live', 'live task')
+          ledger.adopt('ses_stray', 'stray task')
+          const client = createFakeSessionClient({
+            children: async () => ({data: [{id: 'ses_live'}]}),
+            status: async () => ({data: {ses_live: {}}}),
+          })
+          const drain = startDrain(ledger, client, Number.POSITIVE_INFINITY)
+
+          // #when many passes run
+          await vi.advanceTimersByTimeAsync(20 * INTERVAL_MS)
+
+          // #then the observed-running entry keeps drain waiting; there is no time cap on live work
+          expect(drain.outcome()).toBeUndefined()
+          expect(ledger.snapshot().find(entry => entry.sessionId === 'ses_live')?.state).toBe('outstanding')
+        } finally {
+          vi.useRealTimers()
+        }
+      })
+
+      it('keeps waiting until the deadline when the deadline is finite, whatever the unknown streak', async () => {
+        // #given the same unreachable server, with a finite deadline
+        vi.useFakeTimers()
+        try {
+          const ledger = createOwnershipLedger()
+          ledger.adopt('ses_child', 'background task')
+          const client = {
+            session: {
+              children: async () => {
+                throw new Error('server down')
+              },
+              status: async () => {
+                throw new Error('server down')
+              },
+              abort: async () => ({data: {}}),
+            },
+          } as unknown as SessionClient
+          const drain = startDrain(ledger, client, 10_000)
+
+          // #when far more than 3 passes have run, but the deadline has not
+          await vi.advanceTimersByTimeAsync(8_000)
+          expect(drain.outcome()).toBeUndefined()
+
+          // #then it still ends at the deadline, as before
+          await vi.advanceTimersByTimeAsync(5_000)
+          expect(drain.outcome()).toMatchObject({expired: true, unknownCount: 1})
+        } finally {
+          vi.useRealTimers()
+        }
+      })
     })
 
     it('sleeps one poll interval at a time, never zero', async () => {

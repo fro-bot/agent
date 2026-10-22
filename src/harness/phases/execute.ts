@@ -550,6 +550,15 @@ const DEFAULT_DRAIN_POLL_INTERVAL_MS = 250
 /** Bound on each upstream call the drain makes: a reconcile pass or a child abort. */
 const DRAIN_CALL_TIMEOUT_MS = 5_000
 
+/**
+ * With no drain deadline, how many consecutive reconcile passes may leave every unsettled entry `unknown`
+ * (none observed running) before drain stops waiting. Work observed running, meaning at least one `outstanding`
+ * entry, is waited for without a time cap. Unreachable work cannot be waited on: a dead server fails every pass,
+ * and an entry that is not a direct child of the parent is downgraded on every pass. Only meaningful when the
+ * deadline is infinite; a finite deadline always waits for it.
+ */
+export const UNOBSERVABLE_PASSES_BEFORE_DRAIN_EXIT = 3
+
 const NO_DRAIN_OUTCOME: DrainOutcome = {expired: false, cancelledCount: 0, settledCount: 0, unknownCount: 0}
 
 /**
@@ -764,22 +773,37 @@ export async function runDrain(options: RunDrainOptions): Promise<DrainOutcome> 
   // discriminant does exist on the persisted tool part, which nothing here
   // reads today -- see that module doc for the verified shape and for what a
   // reader of it would additionally have to get right.
-  await reconcileBounded(reconcileOptions)
+  let consecutiveUnobservablePasses = 0
+  let waitEnded = false
+  // One bounded, guarded pass. After a pass, every unsettled entry still being `unknown` (none observed running)
+  // extends the streak; anything else resets it. Passes after the wait loop has ended count for nothing and, being
+  // inert, change nothing.
+  const reconcilePass = async (): Promise<void> => {
+    await reconcileBounded(reconcileOptions, () => waitEnded)
+    if (waitEnded) return
+    const unsettled = ledger.snapshot().filter(entry => entry.state !== 'settled')
+    const allUnknown = unsettled.length > 0 && unsettled.every(entry => entry.state === 'unknown')
+    consecutiveUnobservablePasses = allUnknown ? consecutiveUnobservablePasses + 1 : 0
+  }
+  const hasDeadline = Number.isFinite(deadlineMs)
+  const unobservable = (): boolean =>
+    hasDeadline === false && consecutiveUnobservablePasses >= UNOBSERVABLE_PASSES_BEFORE_DRAIN_EXIT
+
+  await reconcilePass()
 
   if (ledger.isDrainComplete()) return {...NO_DRAIN_OUTCOME, unknownCount: ledger.unknown()}
 
   if (deadlineMs > 0) {
     // Each periodic tick is a bounded, guarded pass like every other drain pass. Once the wait loop has ended the
     // drain has decided, so a pass still in flight can no longer change the ledger.
-    let waitEnded = false
     const reconciler = createLedgerReconciler({
       ...reconcileOptions,
       intervalMs: reconcileIntervalMs,
-      runPass: async () => reconcileBounded(reconcileOptions, () => waitEnded),
+      runPass: reconcilePass,
     })
     const deadlineAt = Date.now() + deadlineMs
     try {
-      while (ledger.isDrainComplete() === false && Date.now() < deadlineAt) {
+      while (ledger.isDrainComplete() === false && Date.now() < deadlineAt && unobservable() === false) {
         await sleep(Math.max(0, Math.min(pollIntervalMs, deadlineAt - Date.now())))
       }
     } finally {
