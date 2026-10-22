@@ -30,8 +30,8 @@ The concerns fall into two groups (full inventory: [2026-10-18-action-gateway-co
 | Provider-failure classification | Duplicated behavior | Ladder, rung 1 (delivered in #1869) |
 | Payload accessors, task-notice parser | Duplicated behavior | Ladder, rung 2 (delivered in #1872) |
 | Entity-ref parser, sleep, gateway logger adapter, SHA validator, byte formatter | Small duplicates | Ladder, small-helpers rung (delivered in #1888). The run-timeout default stays per surface on purpose |
-| Bounded abort and settle (teardown) | Duplicated behavior, stateful | Separately planned rung |
-| Lock lease renewal and takeover | Duplicated behavior, stateful | Separately planned rung, after a takeover-policy decision |
+| Bounded abort and settle (teardown) | Duplicated behavior, stateful | Rung delivered as behavior fixes in #1906 and #1907, which give both surfaces the same bounds, guards and unknown-on-timeout. There is no runtime extraction. The two ladders are different algorithms, and sharing their primitives would add more lines than it removes |
+| Lock lease renewal and takeover | Duplicated behavior, stateful | Rung delivered in #1899 and #1902. Both surfaces use one runtime lease loop, and takeover policy stays per surface |
 | S3 and object-store config | Duplicated parsing and validation | Config spine, block 1 (delivered in #1883; one object-store settings parser in runtime) |
 | Event-stream loop | Duplicated behavior | Later, after leaves and seams prove out |
 | Timeouts and inactivity | Partly shared (runtime timer unused by the Action) | Later, with the event-stream loop |
@@ -143,7 +143,7 @@ Session persistence is the largest Action-side concern. It is deferred because t
 
 - [Affects R11, R12][Technical] Where does the schema live in runtime, and how does each surface report errors with the right source name (input name vs env name)?
 - [Affects R16][Technical] Does the design note live in ARCHITECTURE.md, as a cross-cutting summary with a wiki page, or as a standalone design doc?
-- [Affects R8][User decision, when that rung is planned] Which takeover policy wins for an expired lock holder?
+- [Affects R8] Resolved: each surface keeps its own takeover policy. The Action reclaims an expired holder directly, and the gateway corroborates through `ConfirmExpiredHolder`. Renewal is shared (#1899, #1902).
 
 ---
 
