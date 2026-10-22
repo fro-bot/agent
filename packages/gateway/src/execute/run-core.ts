@@ -96,6 +96,9 @@ export type RunCoreErrorKind =
  * `providerFailureReason` is set only by `failFromProvider` (always with `kind: 'session-error'`): the
  * closed, fixed-text reason from the provider-failure classifier. `run.ts` reads this typed property and
  * never parses `message`. It is carried through every `throwWithBarrier` throw site, quarantined or not.
+ *
+ * `cause` is the underlying error when the failure wraps one (an event stream that rejected, an unexpected
+ * throw in the event loop). Like `message`, it is for internal logging only.
  */
 export class RunCoreError extends Error {
   readonly kind: RunCoreErrorKind
@@ -107,8 +110,9 @@ export class RunCoreError extends Error {
     internalMessage: string,
     quarantined = false,
     providerFailureReason?: ProviderFailureReason,
+    cause?: unknown,
   ) {
-    super(internalMessage)
+    super(internalMessage, cause === undefined ? undefined : {cause})
     this.name = 'RunCoreError'
     this.kind = kind
     this.quarantined = quarantined
@@ -647,15 +651,19 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   async function throwWithBarrier(
     kind: RunCoreErrorKind,
     message: string,
-    options: {readonly rootMayBeRunning?: boolean; readonly providerFailureReason?: ProviderFailureReason} = {},
+    options: {
+      readonly rootMayBeRunning?: boolean
+      readonly providerFailureReason?: ProviderFailureReason
+      readonly cause?: unknown
+    } = {},
   ): Promise<never> {
-    const {rootMayBeRunning = false, providerFailureReason} = options
+    const {rootMayBeRunning = false, providerFailureReason, cause} = options
     const rootFollowUpOpen =
       rootMayBeRunning ||
       (drainCompletion !== undefined && draining === true && drainDoneController.signal.aborted === false)
     const barrierLedger = ledger ?? (rootMayBeRunning ? createOwnershipLedger() : undefined)
     if (barrierLedger === undefined || (barrierLedger.isDrainComplete() === true && rootFollowUpOpen === false)) {
-      throw new RunCoreError(kind, message, false, providerFailureReason)
+      throw new RunCoreError(kind, message, false, providerFailureReason, cause)
     }
     const settlement = await settleOwnedSessions({
       client,
@@ -666,13 +674,13 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       ...(rootFollowUpOpen ? {confirmRootQuiescent: true} : {}),
     })
     if (settlement.settled === true) {
-      throw new RunCoreError(kind, message, false, providerFailureReason)
+      throw new RunCoreError(kind, message, false, providerFailureReason, cause)
     }
     logger.error(
       {sessionId, kind, detail: settlement.reason},
       'run-core: owned work could not be confirmed settled before this failure — quarantining run',
     )
-    throw new RunCoreError(kind, message, true, providerFailureReason)
+    throw new RunCoreError(kind, message, true, providerFailureReason, cause)
   }
 
   // An abort the gateway did not cause (see the `session.error` and `message.updated` branches).
@@ -1365,6 +1373,18 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         logger.debug({eventType, sessionId}, 'run-core: unrecognized event type')
       }
     }
+  } catch (error) {
+    // A rejected stream or an unexpected throw in the loop body is not a RunCoreError. It must not escape
+    // `runOpenCodeCore` raw: `run.ts` would treat it as an unquarantined failure and release the lock and slot
+    // while the root, whose prompt keeps running server-side, may still be writing the checkout.
+    if (error instanceof RunCoreError) throw error
+    const message = error instanceof Error ? error.message : String(error)
+    clearInactivity()
+    logger.error({sessionId, detail: message}, 'run-core: event loop failed unexpectedly')
+    throw await throwWithBarrier('stream-ended', `Event stream failed: ${message}`, {
+      rootMayBeRunning: true,
+      cause: error,
+    })
   } finally {
     // Ensure the inactivity timer is always disposed on loop exit (normal, break, or throw).
     // The explicit clearInactivity() calls on the session.idle and session.error paths are

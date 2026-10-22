@@ -28,9 +28,9 @@ function makeLogger(): GatewayLogger {
   return {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
 }
 
-function makeSink(): DiscordStreamSink {
+function makeSink(append: () => void = () => {}): DiscordStreamSink {
   return {
-    append: vi.fn(),
+    append: vi.fn(append),
     flush: vi.fn().mockResolvedValue({kind: 'sent', charCount: 0}),
     buffered: () => '',
     markVisibleOutputSent: vi.fn(),
@@ -64,12 +64,16 @@ interface StartOptions {
   /** `session.status` reply per call (the last entry repeats). Defaults to nothing live. */
   readonly statuses?: readonly Readonly<Record<string, object>>[]
   readonly abort?: () => Promise<unknown>
+  /** Called by every `sink.append`; throwing from it makes the event loop body throw. */
+  readonly onAppend?: () => void
 }
 
 interface Run {
   readonly done: Promise<void>
   readonly outcome: () => Outcome | undefined
   readonly close: () => void
+  /** Makes the open event stream reject with `error` on its next pull. */
+  readonly failStream: (error: unknown) => void
   readonly emit: (event: object) => void
   readonly abort: ReturnType<typeof vi.fn>
   readonly status: ReturnType<typeof vi.fn>
@@ -79,10 +83,12 @@ function startRun(options: StartOptions = {}): Run {
   vi.useFakeTimers()
   const queue: object[] = []
   let closed = false
+  let streamFailure: {readonly error: unknown} | null = null
   let wake: (() => void) | null = null
 
   async function* stream(): AsyncGenerator<object> {
     while (true) {
+      if (streamFailure !== null) throw streamFailure.error
       const next = queue.shift()
       if (next !== undefined) {
         yield next
@@ -128,7 +134,7 @@ function startRun(options: StartOptions = {}): Run {
     handle,
     directory: DIRECTORY,
     promptText: 'Fix the bug please',
-    sink: makeSink(),
+    sink: makeSink(options.onAppend),
     signal: (options.controller ?? new AbortController()).signal,
     logger: makeLogger(),
     coordinator: makeCoordinator(),
@@ -156,6 +162,10 @@ function startRun(options: StartOptions = {}): Run {
     outcome: () => settled,
     close: () => {
       closed = true
+      wakeStream()
+    },
+    failStream: error => {
+      streamFailure = {error}
       wakeStream()
     },
     emit: event => {
@@ -424,5 +434,86 @@ describe('promptAsync throwing', () => {
     expect(error.quarantined).toBe(false)
     expect(run.abort).not.toHaveBeenCalled()
     expect(run.status).not.toHaveBeenCalled()
+  })
+})
+
+describe('an error from the event loop that is not a RunCoreError', () => {
+  const rootText = {
+    type: 'message.part.delta',
+    properties: {sessionID: ROOT, delta: {type: 'text', text: 'hello'}, field: 'text'},
+  }
+
+  it('aborts and confirms the root when the event stream rejects mid-run', async () => {
+    // #given a stream that dies with a transport error after the run started
+    const run = startRun()
+    await vi.advanceTimersByTimeAsync(100)
+
+    // #when
+    run.failStream(new TypeError('terminated'))
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    // #then the original error is classified as a dropped stream, not leaked raw, and the root was stopped first
+    const error = failure(run)
+    expect(error.kind).toBe('stream-ended')
+    expect(error.quarantined).toBe(false)
+    expect(error.cause).toBeInstanceOf(TypeError)
+    expect(run.abort).toHaveBeenCalledTimes(1)
+    expect(run.abort).toHaveBeenCalledWith(expect.objectContaining({path: {id: ROOT}, query: {directory: DIRECTORY}}))
+    expect(run.status).toHaveBeenCalled()
+  })
+
+  it('quarantines when the root stays live after the stream rejected', async () => {
+    // #given
+    const run = startRun({statuses: [{[ROOT]: {type: 'busy'}}]})
+    await vi.advanceTimersByTimeAsync(100)
+
+    // #when
+    run.failStream(new Error('socket hang up'))
+    await vi.advanceTimersByTimeAsync(PAST_SETTLE_BOUND_MS)
+
+    // #then
+    const error = failure(run)
+    expect(error.kind).toBe('stream-ended')
+    expect(error.quarantined).toBe(true)
+  })
+
+  it('handles an unexpected throw in the loop body the same way', async () => {
+    // #given an event whose handling throws (here the reply sink)
+    const run = startRun({
+      onAppend: () => {
+        throw new Error('sink exploded')
+      },
+    })
+    await vi.advanceTimersByTimeAsync(100)
+
+    // #when
+    run.emit(rootText)
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    // #then
+    const error = failure(run)
+    expect(error.kind).toBe('stream-ended')
+    expect(error.message).toContain('sink exploded')
+    expect(error.cause).toBeInstanceOf(Error)
+    expect(run.abort).toHaveBeenCalledTimes(1)
+  })
+
+  it('lets a RunCoreError pass through unchanged, without a second barrier', async () => {
+    // #given a terminal provider error: a RunCoreError thrown inside the loop, after which the root is already halted
+    const run = startRun()
+    await vi.advanceTimersByTimeAsync(100)
+
+    // #when
+    run.emit({
+      type: 'session.error',
+      properties: {sessionID: ROOT, error: {name: 'ProviderAuthError', data: {providerID: 'p', message: 'x'}}},
+    })
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    // #then
+    const error = failure(run)
+    expect(error.kind).toBe('session-error')
+    expect(error.quarantined).toBe(false)
+    expect(run.abort).not.toHaveBeenCalled()
   })
 })
