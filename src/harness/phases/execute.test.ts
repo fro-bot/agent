@@ -1453,6 +1453,113 @@ describe('runDrain', () => {
     })
   })
 
+  describe('the periodic reconcile pass', () => {
+    it('does not stall later ticks when one pass hangs, and settles the child on a later tick', async () => {
+      // #given the second children lookup (the first periodic pass) hangs and ignores its signal
+      vi.useFakeTimers()
+      try {
+        const ledger = createOwnershipLedger()
+        ledger.adopt('ses_child', 'background task')
+        const signals: AbortSignal[] = []
+        let childrenCalls = 0
+        let childGone = false
+        const children = vi.fn(async (args: {signal?: AbortSignal}) => {
+          childrenCalls += 1
+          if (childrenCalls === 2) {
+            if (args.signal !== undefined) signals.push(args.signal)
+            return hang()
+          }
+          return {data: [{id: 'ses_child'}]}
+        })
+        const abort = vi.fn(async () => ({data: {}}))
+        const client = {
+          session: {children, status: async () => ({data: childGone ? {} : {ses_child: {}}}), abort},
+        } as unknown as SessionClient
+
+        // #when drain waits; the child goes idle while the hung pass is still running
+        let outcome: Awaited<ReturnType<typeof runDrain>> | undefined
+        const outcomePromise = runDrain({
+          ledger,
+          client,
+          parentSessionId: 'ses_root',
+          directory: '/workspace',
+          deadlineMs: 60_000,
+          logger,
+          reconcileIntervalMs: 1_000,
+          pollIntervalMs: 50,
+        }).then(result => {
+          outcome = result
+        })
+        await vi.advanceTimersByTimeAsync(2_000)
+        childGone = true
+        await vi.advanceTimersByTimeAsync(10_000)
+        await outcomePromise
+
+        // #then the hung pass was bounded and aborted, a later tick ran, and drain finished without cancelling
+        expect(signals).toHaveLength(1)
+        expect(signals[0]?.aborted).toBe(true)
+        expect(outcome).toEqual({expired: false, cancelledCount: 0, settledCount: 0, unknownCount: 0})
+        expect(abort).not.toHaveBeenCalled()
+        expect(ledger.snapshot()).toEqual([{sessionId: 'ses_child', label: 'background task', state: 'settled'}])
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('does not let a periodic pass that answers after drain returned change the ledger or the outcome', async () => {
+      // #given a periodic pass still in flight when the deadline expires; its own answer says "child, not live"
+      vi.useFakeTimers()
+      try {
+        const ledger = createOwnershipLedger()
+        ledger.adopt('ses_child', 'background task')
+        let childrenCalls = 0
+        let statusCalls = 0
+        const lateAnswers: (() => void)[] = []
+        const children = vi.fn(async () => {
+          childrenCalls += 1
+          if (childrenCalls === 2) {
+            return new Promise<{data: {id: string}[]}>(resolve => {
+              lateAnswers.push(() => resolve({data: [{id: 'ses_child'}]}))
+            })
+          }
+          return {data: [{id: 'ses_child'}]}
+        })
+        // the periodic pass (second status call) sees the child idle; every other pass sees it live
+        const status = vi.fn(async () => {
+          statusCalls += 1
+          return {data: statusCalls === 2 ? {} : {ses_child: {}}}
+        })
+        const client = {session: {children, status, abort: async () => ({data: {}})}} as unknown as SessionClient
+
+        // #when the deadline passes while that pass is outstanding, and drain returns
+        const outcomePromise = runDrain({
+          ledger,
+          client,
+          parentSessionId: 'ses_root',
+          directory: '/workspace',
+          deadlineMs: 1_500,
+          logger,
+          reconcileIntervalMs: 1_000,
+          pollIntervalMs: 50,
+        })
+        await vi.advanceTimersByTimeAsync(2_000)
+        const outcome = await outcomePromise
+        expect(outcome).toMatchObject({expired: true, cancelledCount: 1, settledCount: 0, unknownCount: 1})
+        expect(lateAnswers).toHaveLength(1)
+
+        // #and the abandoned pass then answers
+        for (const answer of lateAnswers) answer()
+        await vi.advanceTimersByTimeAsync(10)
+
+        // #then the decision stands: the entry stays unknown, so persistence stays unsafe
+        expect(ledger.snapshot()).toEqual([{sessionId: 'ses_child', label: 'background task', state: 'unknown'}])
+        expect(ledger.isPersistenceSafe()).toBe(false)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+  })
+
   describe('the child abort result', () => {
     it('logs a warning when the SDK resolves the abort with an error envelope', async () => {
       // #given an abort the SDK resolved with the failure in the envelope instead of throwing

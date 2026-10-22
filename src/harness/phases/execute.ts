@@ -604,18 +604,20 @@ async function boundedCall<T>(call: (signal: AbortSignal) => Promise<T>): Promis
 /**
  * One reconcile pass under `DRAIN_CALL_TIMEOUT_MS`. A pass that does not finish in time fails like any other
  * failed pass: outstanding entries become `unknown`. Once the bound has passed, the abandoned pass can no longer
- * change the ledger, so a late answer cannot overturn the decision the drain already made.
+ * change the ledger, so a late answer cannot overturn the decision the drain already made. `isClosed` marks a
+ * drain that has already decided (its wait loop ended): from then on the pass is inert whenever it answers.
  */
-async function reconcileBounded(options: ReconcileLedgerOptions): Promise<void> {
+async function reconcileBounded(options: ReconcileLedgerOptions, isClosed: () => boolean = () => false): Promise<void> {
   const {ledger, logger} = options
   let abandoned = false
+  const inert = (): boolean => abandoned || isClosed()
   const guardedLedger: OwnershipLedger = {
     ...ledger,
     settle: sessionId => {
-      if (!abandoned) ledger.settle(sessionId)
+      if (!inert()) ledger.settle(sessionId)
     },
     markUnknown: sessionId => {
-      if (!abandoned) ledger.markUnknown(sessionId)
+      if (!inert()) ledger.markUnknown(sessionId)
     },
   }
 
@@ -623,6 +625,7 @@ async function reconcileBounded(options: ReconcileLedgerOptions): Promise<void> 
   if (result.timedOut === false) return
 
   abandoned = true
+  if (isClosed()) return
   const outstanding = ledger.snapshot().filter(entry => entry.state === 'outstanding')
   for (const entry of outstanding) ledger.markUnknown(entry.sessionId)
   logger.warning('Ledger reconciliation timed out; marking outstanding entries unknown rather than settling them', {
@@ -766,7 +769,14 @@ export async function runDrain(options: RunDrainOptions): Promise<DrainOutcome> 
   if (ledger.isDrainComplete()) return {...NO_DRAIN_OUTCOME, unknownCount: ledger.unknown()}
 
   if (deadlineMs > 0) {
-    const reconciler = createLedgerReconciler({...reconcileOptions, intervalMs: reconcileIntervalMs})
+    // Each periodic tick is a bounded, guarded pass like every other drain pass. Once the wait loop has ended the
+    // drain has decided, so a pass still in flight can no longer change the ledger.
+    let waitEnded = false
+    const reconciler = createLedgerReconciler({
+      ...reconcileOptions,
+      intervalMs: reconcileIntervalMs,
+      runPass: async () => reconcileBounded(reconcileOptions, () => waitEnded),
+    })
     const deadlineAt = Date.now() + deadlineMs
     try {
       while (ledger.isDrainComplete() === false && Date.now() < deadlineAt) {
@@ -774,6 +784,7 @@ export async function runDrain(options: RunDrainOptions): Promise<DrainOutcome> 
       }
     } finally {
       reconciler.dispose()
+      waitEnded = true
     }
   }
 

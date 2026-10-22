@@ -262,6 +262,12 @@ export interface LedgerReconciler {
 export interface CreateLedgerReconcilerOptions extends ReconcileLedgerOptions {
   /** Interval between interval-triggered passes. Defaults to `DEFAULT_LEDGER_RECONCILE_INTERVAL_MS`. */
   readonly intervalMs?: number
+  /**
+   * Runs on each tick in place of `reconcileLedgerOnce(options)`, for a caller that bounds or guards its own
+   * passes. Its returned promise holds the in-flight guard, so it should settle on its own; a rejection is
+   * swallowed like any other pass failure and does not stop later ticks.
+   */
+  readonly runPass?: () => Promise<unknown>
 }
 
 /**
@@ -283,7 +289,7 @@ export interface CreateLedgerReconcilerOptions extends ReconcileLedgerOptions {
  * barring overlap" timing callers and tests already rely on.
  */
 export function createLedgerReconciler(options: CreateLedgerReconcilerOptions): LedgerReconciler {
-  const {intervalMs = DEFAULT_LEDGER_RECONCILE_INTERVAL_MS, ...reconcileOptions} = options
+  const {intervalMs = DEFAULT_LEDGER_RECONCILE_INTERVAL_MS, runPass, ...reconcileOptions} = options
 
   let disposed = false
   let inFlight = false
@@ -291,10 +297,12 @@ export function createLedgerReconciler(options: CreateLedgerReconcilerOptions): 
     if (disposed) return
     if (inFlight) return // a previous pass is still running — skip this tick rather than stack.
     inFlight = true
-    reconcileLedgerOnce(reconcileOptions)
+    const pass = runPass === undefined ? reconcileLedgerOnce(reconcileOptions) : (async () => runPass())()
+    pass
       .catch(() => {
         // reconcileLedgerOnce never rejects (all upstream failures are captured as `err`
-        // results and logged internally); this catch exists only to satisfy no-floating-promises.
+        // results and logged internally); an injected pass may. This catch keeps a rejection from
+        // escaping and satisfies no-floating-promises.
       })
       .finally(() => {
         inFlight = false
