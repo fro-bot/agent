@@ -57,7 +57,7 @@ Bug-skew risk is high. The gateway lacks the Action's quota fail-fast and contex
 
 The gateway's `run-core.ts:14-21` says it mirrors `streaming.ts` "exactly" but can only do so by copying, because of the layering rule. The copies have already diverged in both directions (#1715 and #1752). The leaves are pure functions with no state: six accessor families (about 90 LOC), the identical `TASK_NOTICE_PATTERN` plus `parseTaskNotice`, and REST message readers (`retry.ts:190-268` vs `drain-completion.ts:108-146`). Extracting them to `packages/runtime/src/agent/` (for example `payload.ts` and `task-notice.ts`) takes about 150–200 LOC out of two surfaces and turns the "mirror" comment into a shared import. Do not try to share the stream loop itself yet. Its policy differs (poll versus SSE, auto-deny versus approvals).
 
-Update: delivered in #1872.
+Update: delivered in #1872. The stream loop itself was closed without extraction. The two loops are different designs: the Action's observes and decides completion by REST poll, and the gateway's decides through its drain gate. #1912 fixed the remaining divergences: reasoning deltas in the Action log, and child errors failing gateway runs.
 
 ### 3. Teardown and ownership-drain ladder
 
