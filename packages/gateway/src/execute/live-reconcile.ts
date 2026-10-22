@@ -38,10 +38,10 @@ export async function reconcileLivePass(
   const guardedLedger: OwnershipLedger = {
     ...ledger,
     settle: sessionId => {
-      if (!inert()) ledger.settle(sessionId)
+      if (inert() === false) ledger.settle(sessionId)
     },
     markUnknown: sessionId => {
-      if (!inert()) ledger.markUnknown(sessionId)
+      if (inert() === false) ledger.markUnknown(sessionId)
     },
   }
 
