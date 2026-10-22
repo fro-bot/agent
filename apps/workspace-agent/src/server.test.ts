@@ -1698,15 +1698,33 @@ describe('POST /update — diagnostics logging (#1889)', () => {
     })
   })
 
-  it('logs nothing for a ready or no-checkout outcome', async () => {
+  it.each([
+    ['no-checkout', {kind: 'no-checkout'}],
+    [
+      'ready (fast-forward)',
+      {
+        kind: 'ready',
+        change: 'fast-forward',
+        branch: 'main',
+        sha: 'b'.repeat(40),
+        fromSha: 'a'.repeat(40),
+        checkedAt: '2026-10-22T00:00:00.000Z',
+      },
+    ],
+    [
+      'ready (unchanged)',
+      {kind: 'ready', change: 'unchanged', branch: 'main', sha: 'a'.repeat(40), checkedAt: '2026-10-22T00:00:00.000Z'},
+    ],
+  ] satisfies readonly (readonly [string, UpdateResult])[])('logs nothing for a %s outcome', async (_label, result) => {
     // #given
     const logger = makeLogger()
-    const app = appWithoutAuth({updateExecutor: makeUpdateExecutor({kind: 'no-checkout'}), logger})
+    const app = appWithoutAuth({updateExecutor: makeUpdateExecutor(result), logger})
 
     // #when
-    await postUpdate(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
+    const res = await postUpdate(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
 
-    // #then
+    // #then the normal paths stay silent at every level
+    expect(res.status).toBe(result.kind === 'no-checkout' ? 404 : 200)
     expect(logger.info).not.toHaveBeenCalled()
     expect(logger.warn).not.toHaveBeenCalled()
     expect(logger.error).not.toHaveBeenCalled()

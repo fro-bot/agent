@@ -835,6 +835,50 @@ function teardownCalls(calls: readonly LoggedCall[]): readonly LoggedCall[] {
   return calls.filter(call => call.msg.startsWith('opencode-proxy: session abort'))
 }
 
+/**
+ * An upstream that accepts a request and never answers it until `release()`. `requestSeen` resolves
+ * once a request has arrived, so a test can act while the proxy is mid-forward.
+ */
+async function startHangingUpstream(): Promise<{
+  readonly url: string
+  readonly requestSeen: Promise<void>
+  readonly release: () => void
+  readonly close: () => Promise<void>
+}> {
+  const held: http.ServerResponse[] = []
+  let markSeen: () => void = () => {}
+  const requestSeen = new Promise<void>(resolve => {
+    markSeen = resolve
+  })
+  const stub = http.createServer((_req, res) => {
+    held.push(res)
+    markSeen()
+  })
+  await new Promise<void>((resolve, reject) => {
+    stub.once('error', reject)
+    stub.listen(0, '127.0.0.1', resolve)
+  })
+  const addr = stub.address() as AddressInfo
+  const release = (): void => {
+    for (const res of held.splice(0)) {
+      res.writeHead(200, {'Content-Length': '0', Connection: 'close'})
+      res.end()
+    }
+  }
+  return {
+    url: `http://127.0.0.1:${addr.port}`,
+    requestSeen,
+    release,
+    close: async () => {
+      release()
+      await new Promise<void>(resolve => {
+        stub.close(() => resolve())
+        stub.closeAllConnections()
+      })
+    },
+  }
+}
+
 describe('opencode-proxy — session teardown logging', () => {
   const AUTH = {Authorization: `Bearer ${TEST_TOKEN}`}
   let upstream: Awaited<ReturnType<typeof startUpstreamStub>> | undefined
@@ -902,6 +946,67 @@ describe('opencode-proxy — session teardown logging', () => {
     expect(res.statusCode).toBe(502)
     await vi.waitFor(() => expect(teardownCalls(calls)).toHaveLength(1))
     expect(teardownCalls(calls)[0]?.meta).toMatchObject({sessionId: 'ses_down', status: 502})
+  })
+
+  it('logs the 504 the proxy itself synthesizes when the upstream stops answering', async () => {
+    // #given an upstream that accepts the abort and never responds, and a short inactivity window
+    const hanging = await startHangingUpstream()
+    const {logger, calls} = makeCapturingLogger()
+    const proxy = createOpencodeProxy({token: TEST_TOKEN, upstreamUrl: hanging.url, logger, timeoutMs: 100})
+    await proxy.listen(0, '127.0.0.1')
+    const addr = proxy.server.address() as AddressInfo
+    closeProxy = async () => {
+      await proxy.close()
+      await hanging.close()
+    }
+
+    // #when
+    const res = await httpSend('POST', `http://127.0.0.1:${addr.port}/session/ses_stuck/abort`, AUTH)
+
+    // #then the caller got the proxy's own 504, and that is the status in the log, not the upstream's
+    expect(res.statusCode).toBe(504)
+    await vi.waitFor(() => expect(teardownCalls(calls)).toHaveLength(1))
+    expect(teardownCalls(calls)[0]?.meta).toEqual({
+      sessionId: 'ses_stuck',
+      status: 504,
+      durationMs: expect.any(Number) as number,
+    })
+    expect(teardownCalls(calls)[0]?.meta?.durationMs as number).toBeGreaterThanOrEqual(90)
+  })
+
+  it('logs once, with no status, when the caller disconnects before any header is sent', async () => {
+    // #given an upstream that is still holding the abort when the caller gives up
+    const hanging = await startHangingUpstream()
+    const {logger, calls} = makeCapturingLogger()
+    const proxy = createOpencodeProxy({token: TEST_TOKEN, upstreamUrl: hanging.url, logger})
+    await proxy.listen(0, '127.0.0.1')
+    const addr = proxy.server.address() as AddressInfo
+    closeProxy = async () => {
+      await proxy.close()
+      await hanging.close()
+    }
+    const clientReq = http.request({
+      hostname: '127.0.0.1',
+      port: addr.port,
+      path: '/session/ses_left/abort',
+      method: 'POST',
+      headers: {...AUTH, connection: 'close'},
+    })
+    clientReq.on('error', () => {})
+    clientReq.end()
+    await hanging.requestSeen
+
+    // #when the caller disconnects mid-forward, and the upstream then answers after the fact
+    clientReq.destroy()
+    await vi.waitFor(() => expect(teardownCalls(calls)).toHaveLength(1))
+    hanging.release()
+    await letLogsSettle()
+
+    // #then exactly one line: session id and duration, and no status field at all
+    expect(teardownCalls(calls)).toHaveLength(1)
+    const meta = teardownCalls(calls)[0]?.meta
+    expect(meta).toEqual({sessionId: 'ses_left', durationMs: expect.any(Number) as number})
+    expect(Object.keys(meta ?? {})).not.toContain('status')
   })
 
   it('never logs the bearer token, the Authorization header, the request body, or the query string', async () => {
