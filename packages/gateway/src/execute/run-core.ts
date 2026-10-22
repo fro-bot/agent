@@ -1321,22 +1321,33 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         }
       } else if (eventType === 'session.error') {
         const eventSessionID = getEventSessionID(rawEvent)
-        // A null session id means the payload didn't carry one (rare) — treated as
-        // ours defensively, matching the prior root-scoped behaviour, since we
-        // cannot attribute it to a specific session at all. Otherwise: ownership,
-        // not root equality — a descendant's error is this run's problem too.
+        // A null session id means the payload didn't carry one (rare) — treated as ours defensively, matching the
+        // prior root-scoped behaviour, since we cannot attribute it to a specific session at all. Otherwise:
+        // ownership, not root equality, decides whether the event is ours at all.
         if (eventSessionID === null || isOwnedSession(eventSessionID)) {
           // The payload is a string or a structured `{name, data}` object. Both go through the shared
-          // classifier: only a fixed reason survives, never the provider's text. Every terminal error fails the
-          // run; the shared kind only picks the label.
+          // classifier: only a fixed reason survives, never the provider's text.
           const errorText = getStringProperty(eventPayload, 'error')
           const structuredError = errorText === null ? getObjectProperty(eventPayload, 'error') : null
+          // An owned child, as opposed to the root or an error that names no session.
+          const childSessionId = eventSessionID !== null && eventSessionID !== sessionId ? eventSessionID : null
           // A context overflow is not decided here: compaction may follow, so it only arms `overflowPending`.
           // An abort is exempt only when the gateway caused it (the combined signal ends the loop); an abort
           // from any other client (`POST /session/:id/abort`) is followed by an idle that would otherwise
           // complete the run with partial output.
           if (isContextOverflowError(structuredError)) {
             overflowPending.add(eventSessionID ?? sessionId)
+          } else if (childSessionId !== null) {
+            // A child's terminal error (or an abort by another client) does not end the root's turn. It is
+            // evidence something went wrong, not proof the child stopped writing, so the entry is marked
+            // `unknown` — never `settled` — and the root learns the child's outcome from its task-completion
+            // notice. The drain settles the entry once reconciliation sees it stop, or cancels it at the
+            // deadline. Marking goes through the hook-wrapped ledger, so persistence and validation fire.
+            ledger?.markUnknown(childSessionId)
+            logger.warn(
+              {sessionId, childSessionId},
+              'run-core: owned child reported a terminal session error — marked unknown, run continues',
+            )
           } else if (isAbortedError(structuredError)) {
             if (combinedSignal.aborted === false) throw await failFromProvider(ABORTED_FAILURE, 'session.error')
           } else {
