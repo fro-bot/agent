@@ -8,6 +8,7 @@
 import type {BackupsDeps} from './backups.js'
 import type {CloneHandlerDeps, CloneHandlerResult} from './clone.js'
 import type {InspectHandlerDeps, InspectHandlerResult} from './inspect.js'
+import type {Logger} from './opencode-server.js'
 import type {ExecuteRecoveryDeps, PreviewRecoveryDeps} from './recover.js'
 import type {
   BackupsValidationFailure,
@@ -108,6 +109,42 @@ function statusForUpdateResult(result: UpdateResult): 200 | 404 | 409 | 502 | 50
   if (result.kind === 'refused') return 409
   if (result.reason === 'fetch-timeout') return 504
   return result.permanent ? 502 : 503
+}
+
+/**
+ * One warning per refused or failed `/update` (ready and no-checkout are the normal paths and stay
+ * silent), so "why did the workspace refuse this checkout?" is answerable from workspace logs.
+ * Logs the closed `reason` plus, for `dirty`, the COUNT of changed paths. Never the names: paths,
+ * config keys, submodules and branches all come from the agent-writable checkout.
+ */
+function logUpdateOutcome(
+  logger: Logger | undefined,
+  owner: string,
+  repo: string,
+  result: UpdateResult,
+  durationMs: number,
+): void {
+  if (logger === undefined) return
+  if (result.kind === 'refused') {
+    logger.warn('workspace-agent: update refused', {
+      owner,
+      repo,
+      reason: result.reason,
+      ...(result.reason === 'dirty' ? {changedPathCount: result.changedPaths.length} : {}),
+      durationMs,
+    })
+    return
+  }
+  if (result.kind === 'failed') {
+    logger.warn('workspace-agent: update failed', {
+      owner,
+      repo,
+      reason: result.reason,
+      mutationStarted: result.mutationStarted,
+      permanent: result.permanent,
+      durationMs,
+    })
+  }
 }
 
 /**
@@ -213,6 +250,13 @@ export interface ProxyListeningRef {
 }
 
 export interface ServerDeps {
+  /**
+   * Process logger. Handed to `executeUpdate` so its own operational log lines emit (it defaults to
+   * a silent no-op otherwise), and used for the one outcome line each refused/failed `/update`
+   * writes. Optional only so route tests need not supply one; `main.ts` always does. Never given a
+   * path, config-key, submodule or branch name, token, or file content.
+   */
+  readonly logger?: Logger
   /** Injected clone executor for testability. */
   readonly cloneExecutor?: CloneExecutorFn
   /** Injected inspect executor for testability. */
@@ -281,6 +325,7 @@ export function createApp(deps: ServerDeps): Hono {
     listBackupsExecutor = listBackups,
     deleteBackupExecutor = deleteBackup,
     updateNetworkConfig,
+    logger,
     opencodeStatus,
     proxyListening,
     auth,
@@ -518,7 +563,9 @@ export function createApp(deps: ServerDeps): Hono {
 
     const request: UpdateRequest = {owner, repo, token: raw.token}
 
+    const startedAtMs = Date.now()
     const result = await updateExecutor(request, {
+      logger,
       // The gateway's HTTP call has its own deadline; when the CLIENT disconnects (or its own
       // request times out), this propagates that as an abort — honored through the fetch phase,
       // ignored once the apply phase begins (executeUpdate's own documented contract).
@@ -526,6 +573,7 @@ export function createApp(deps: ServerDeps): Hono {
       caBundlePath: updateNetworkConfig?.caBundlePath,
       proxy: updateNetworkConfig?.proxy,
     })
+    logUpdateOutcome(logger, owner, repo, result, Date.now() - startedAtMs)
     return c.json(result, statusForUpdateResult(result))
   })
 

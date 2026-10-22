@@ -1,3 +1,4 @@
+import type {Mock} from 'vitest'
 import type {CloneHandlerResult} from './clone.js'
 import type {InspectHandlerResult} from './inspect.js'
 import type {
@@ -21,7 +22,6 @@ import type {
 import type {UpdateHandlerDeps} from './update.js'
 
 import {Buffer} from 'node:buffer'
-
 import {describe, expect, it, vi} from 'vitest'
 import {createApp} from './server.js'
 
@@ -1574,6 +1574,157 @@ describe('POST /update — signal plumbing', () => {
     // #then
     expect(capturedCaBundlePath).toBe('/etc/ssl/ca.pem')
     expect(capturedProxy).toEqual({https: 'http://proxy:3128'})
+  })
+})
+
+type LogFn = (msg: string, meta?: Record<string, unknown>) => void
+
+function makeLogger(): {
+  readonly info: Mock<LogFn>
+  readonly warn: Mock<LogFn>
+  readonly error: Mock<LogFn>
+} {
+  return {info: vi.fn<LogFn>(), warn: vi.fn<LogFn>(), error: vi.fn<LogFn>()}
+}
+
+function everyLoggedArgument(logger: ReturnType<typeof makeLogger>): string {
+  return JSON.stringify([...logger.info.mock.calls, ...logger.warn.mock.calls, ...logger.error.mock.calls])
+}
+
+describe('POST /update — diagnostics logging (#1889)', () => {
+  it('hands the server logger to the update executor so its own log lines emit', async () => {
+    // #given an executor that logs through whatever logger it is given (as executeUpdate does)
+    const logger = makeLogger()
+    const updateExecutor = vi.fn(async (_request: UpdateRequest, deps?: UpdateHandlerDeps) => {
+      deps?.logger?.warn('update: executor-side line', {owner: 'fro-bot'})
+      return {kind: 'no-checkout'} satisfies UpdateResult
+    }) as UpdateExecutorFn & ReturnType<typeof vi.fn>
+    const app = appWithoutAuth({updateExecutor, logger})
+
+    // #when
+    await postUpdate(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
+
+    // #then
+    expect(logger.warn).toHaveBeenCalledWith('update: executor-side line', {owner: 'fro-bot'})
+  })
+
+  it('logs a dirty refusal with the owner, repo, reason and path count, and no path names', async () => {
+    // #given
+    const logger = makeLogger()
+    const changedPaths = ['secrets/prod.env', 'FILE_SUMMARIES.md']
+    const updateExecutor = makeUpdateExecutor({kind: 'refused', reason: 'dirty', changedPaths})
+    const app = appWithoutAuth({updateExecutor, logger})
+
+    // #when
+    await postUpdate(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
+
+    // #then
+    expect(logger.warn).toHaveBeenCalledWith('workspace-agent: update refused', {
+      owner: 'fro-bot',
+      repo: 'agent',
+      reason: 'dirty',
+      changedPathCount: 2,
+      durationMs: expect.any(Number) as number,
+    })
+    const logged = everyLoggedArgument(logger)
+    for (const path of changedPaths) {
+      expect(logged).not.toContain(path)
+    }
+  })
+
+  it('logs a refusal that carries no path detail without a path count', async () => {
+    // #given
+    const logger = makeLogger()
+    const updateExecutor = makeUpdateExecutor({kind: 'refused', reason: 'needs-recovery'})
+    const app = appWithoutAuth({updateExecutor, logger})
+
+    // #when
+    await postUpdate(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
+
+    // #then
+    expect(logger.warn).toHaveBeenCalledWith('workspace-agent: update refused', {
+      owner: 'fro-bot',
+      repo: 'agent',
+      reason: 'needs-recovery',
+      durationMs: expect.any(Number) as number,
+    })
+  })
+
+  it('never logs the names of config keys, submodules or branches a refusal carries', async () => {
+    // #given refusals whose detail fields come from the agent-writable checkout
+    const logger = makeLogger()
+    const results: UpdateResult[] = [
+      {kind: 'refused', reason: 'unsupported-config', disallowedKeys: ['core.sshCommand']},
+      {kind: 'refused', reason: 'submodule-initialized', submodules: ['vendor/private-lib']},
+      {kind: 'refused', reason: 'non-default-branch', branch: 'wip/customer-acme'},
+    ]
+
+    // #when
+    for (const result of results) {
+      const app = appWithoutAuth({updateExecutor: makeUpdateExecutor(result), logger})
+      await postUpdate(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
+    }
+
+    // #then
+    const logged = everyLoggedArgument(logger)
+    expect(logged).not.toContain('core.sshCommand')
+    expect(logged).not.toContain('vendor/private-lib')
+    expect(logged).not.toContain('wip/customer-acme')
+    expect(logger.warn).toHaveBeenCalledTimes(3)
+  })
+
+  it('logs a failed update with its reason, mutation state and permanence', async () => {
+    // #given
+    const logger = makeLogger()
+    const updateExecutor = makeUpdateExecutor({
+      kind: 'failed',
+      reason: 'termination-unconfirmed',
+      mutationStarted: 'possibly',
+      permanent: false,
+    })
+    const app = appWithoutAuth({updateExecutor, logger})
+
+    // #when
+    await postUpdate(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
+
+    // #then
+    expect(logger.warn).toHaveBeenCalledWith('workspace-agent: update failed', {
+      owner: 'fro-bot',
+      repo: 'agent',
+      reason: 'termination-unconfirmed',
+      mutationStarted: 'possibly',
+      permanent: false,
+      durationMs: expect.any(Number) as number,
+    })
+  })
+
+  it('logs nothing for a ready or no-checkout outcome', async () => {
+    // #given
+    const logger = makeLogger()
+    const app = appWithoutAuth({updateExecutor: makeUpdateExecutor({kind: 'no-checkout'}), logger})
+
+    // #when
+    await postUpdate(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
+
+    // #then
+    expect(logger.info).not.toHaveBeenCalled()
+    expect(logger.warn).not.toHaveBeenCalled()
+    expect(logger.error).not.toHaveBeenCalled()
+  })
+
+  it('does not log the request token', async () => {
+    // #given
+    const logger = makeLogger()
+    const app = appWithoutAuth({
+      updateExecutor: makeUpdateExecutor({kind: 'refused', reason: 'dirty', changedPaths: ['a.txt']}),
+      logger,
+    })
+
+    // #when
+    await postUpdate(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN})
+
+    // #then
+    expect(everyLoggedArgument(logger)).not.toContain(VALID_TOKEN)
   })
 })
 
