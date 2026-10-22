@@ -610,6 +610,11 @@ export async function processEventStream(
   ownershipLedger?: OwnershipLedger,
 ): Promise<EventStreamResult> {
   let lastText = ''
+  // Part ids of reasoning parts, from `message.part.updated`. A reasoning delta is a `message.part.delta` with
+  // `field: 'text'` like response text and carries no part kind of its own, so correlating its `partID` is the only
+  // way to keep it out of `lastText`. A delta that arrives before its part is registered is not recognizable and is
+  // appended, as in the gateway.
+  const reasoningPartIds = new Set<string>()
   // Per-message usage ledger, latest report wins per assistant message id. Upstream reports `tokens`
   // and `cost` on each assistant message for THAT message only (processor.ts `step-finish`:
   // `assistantMessage.tokens = usage.tokens`, `assistantMessage.cost += usage.cost`), a new assistant
@@ -745,10 +750,13 @@ export async function processEventStream(
           if (eventSessionID === sessionId && activityTracker?.rootFreshness != null) {
             invalidateRootFreshness(activityTracker.rootFreshness)
           }
+          const deltaPartId = getStringProperty(eventPayload, 'partID')
           const delta = getObjectProperty(eventPayload, 'delta')
           const deltaType = getStringProperty(delta, 'type')
           const deltaText = getStringProperty(delta, 'text')
-          if (deltaType === 'text' && deltaText != null) {
+          if (deltaPartId !== null && reasoningPartIds.has(deltaPartId)) {
+            // Reasoning text is not response text.
+          } else if (deltaType === 'text' && deltaText != null) {
             lastText += deltaText
           } else if (typeof delta === 'string' && getStringProperty(eventPayload, 'field') === 'text') {
             lastText += delta
@@ -843,7 +851,10 @@ export async function processEventStream(
         }
 
         const partType = getStringProperty(part, 'type')
-        if (partType === 'text') {
+        if (partType === 'reasoning') {
+          const reasoningId = getStringProperty(part, 'id')
+          if (reasoningId !== null) reasoningPartIds.add(reasoningId)
+        } else if (partType === 'text') {
           const text = getStringProperty(part, 'text')
           // Upstream injects a background-task completion as a whole synthetic text part (no `time`) on a
           // root user message; assistant text never sets `synthetic`. The injected turn is pending root work
