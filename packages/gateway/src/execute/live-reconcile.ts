@@ -18,9 +18,14 @@
 import type {OwnershipLedger, ReconcileLedgerOptions} from '@fro-bot/runtime'
 
 import {reconcileLedgerOnce} from '@fro-bot/runtime'
+import {DEFAULT_SETTLE_TIMEOUT_MS} from './settle-owned-sessions.js'
 
-/** Bound on one live-path reconcile pass, in milliseconds. */
-export const LIVE_RECONCILE_TIMEOUT_MS = 5_000
+/**
+ * Bound on one live-path reconcile pass, in milliseconds. The same budget teardown's settle gives its confirmation
+ * pass: a server that is slow but still answers must not be turned into a pass that always times out, because a
+ * child left `unknown` by every pass is never admitted by the drain.
+ */
+export const LIVE_RECONCILE_TIMEOUT_MS = DEFAULT_SETTLE_TIMEOUT_MS
 
 /**
  * Runs one reconcile pass under `LIVE_RECONCILE_TIMEOUT_MS`. Never rejects. `isClosed` reports that the run no
@@ -32,6 +37,8 @@ export async function reconcileLivePass(
   timeoutMs: number = LIVE_RECONCILE_TIMEOUT_MS,
 ): Promise<void> {
   const {ledger, logger, parentSessionId} = options
+  if (isClosed()) return
+  const startedAt = Date.now()
   const controller = new AbortController()
   let abandoned = false
   const inert = (): boolean => abandoned || isClosed()
@@ -48,6 +55,8 @@ export async function reconcileLivePass(
   let timer: ReturnType<typeof setTimeout> | undefined
   const timedOut = new Promise<'timed-out'>(resolve => {
     timer = setTimeout(() => {
+      // Abandoned first: an abort-triggered answer must find the guard already closed.
+      abandoned = true
       controller.abort()
       resolve('timed-out')
     }, timeoutMs)
@@ -59,9 +68,14 @@ export async function reconcileLivePass(
       ),
       timedOut,
     ])
+    logger.debug('Ledger reconciliation pass finished', {
+      source: 'reconcileLivePass',
+      parentSessionId,
+      durationMs: Date.now() - startedAt,
+      outcome,
+    })
     if (outcome === 'finished') return
 
-    abandoned = true
     if (isClosed()) return
     const outstanding = ledger.snapshot().filter(entry => entry.state === 'outstanding')
     for (const entry of outstanding) ledger.markUnknown(entry.sessionId)

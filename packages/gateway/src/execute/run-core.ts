@@ -665,6 +665,11 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   ): Promise<never> {
     const {rootMayBeRunning = false, providerFailureReason, cause} = options
     liveReconcileClosed = true
+    // Nothing after this point reads from either handle: the barrier always ends in a throw, and its decision
+    // reads `drainCompletion` only for existence. Disposing here also covers exits before the event loop, whose
+    // `finally` never runs, and stops a validation from admitting success while teardown is in progress.
+    reconciler?.dispose()
+    drainCompletion?.dispose()
     const rootFollowUpOpen =
       rootMayBeRunning ||
       (drainCompletion !== undefined && draining === true && drainDoneController.signal.aborted === false)
