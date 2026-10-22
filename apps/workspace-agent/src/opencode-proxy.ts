@@ -19,6 +19,13 @@
  * fully exempt — the timer is cancelled when SSE is detected so long-lived event
  * streams are never cut off. The interval is configurable via the `timeoutMs`
  * option (or `WORKSPACE_PROXY_TIMEOUT_MS` env var) with a 30s default.
+ *
+ * TEARDOWN LOGGING:
+ * The gateway cancels a run by calling `POST /session/:id/abort` through this proxy; there is no
+ * other workspace-side abort endpoint. Each forwarded teardown request (session abort, session
+ * delete, instance/global dispose) is logged once at info level when its response closes: the
+ * session id where the path carries one, the status the caller saw, and the duration. Never the
+ * request body, any header, or the query string (which carries the workspace directory).
  */
 
 import type {Logger} from './opencode-server.js'
@@ -57,6 +64,48 @@ function readProxyTimeoutMs(): number {
     return PROXY_TIMEOUT_DEFAULT_MS
   }
   return parsed
+}
+
+/** A session id is a plain identifier; anything else in that path segment is not logged. */
+const SESSION_ID_PATTERN = /^[\w-]{1,128}$/
+
+interface TeardownRequest {
+  readonly message: string
+  readonly sessionId?: string
+}
+
+/**
+ * Recognizes the OpenCode requests that tear down a session or an instance. Matches on method and
+ * path only (the query string is dropped), and returns a fixed message so nothing request-derived
+ * but a validated session id reaches the log.
+ */
+function classifyTeardown(method: string | undefined, rawUrl: string | undefined): TeardownRequest | undefined {
+  if (method === undefined || rawUrl === undefined) return undefined
+  let pathname: string
+  try {
+    pathname = new URL(rawUrl, 'http://proxy.invalid').pathname
+  } catch {
+    return undefined
+  }
+  const segments = pathname.split('/')
+  // ['', 'session', ':id', 'abort'] | ['', 'session', ':id'] | ['', 'instance', 'dispose'] | ['', 'global', 'dispose']
+  if (segments[0] !== '' || segments.length < 3 || segments.length > 4) return undefined
+
+  const [, head, second, third] = segments
+  if (head === 'session' && second !== undefined && SESSION_ID_PATTERN.test(second)) {
+    if (method === 'POST' && segments.length === 4 && third === 'abort') {
+      return {message: 'opencode-proxy: session abort forwarded', sessionId: second}
+    }
+    if (method === 'DELETE' && segments.length === 3) {
+      return {message: 'opencode-proxy: session delete forwarded', sessionId: second}
+    }
+    return undefined
+  }
+  if (method === 'POST' && segments.length === 3 && second === 'dispose') {
+    if (head === 'instance') return {message: 'opencode-proxy: instance dispose forwarded'}
+    if (head === 'global') return {message: 'opencode-proxy: global dispose forwarded'}
+  }
+  return undefined
 }
 
 export interface OpencodeProxyOptions {
@@ -121,6 +170,22 @@ export function createOpencodeProxy(options: OpencodeProxyOptions): OpencodeProx
       })
       res.end(UNAUTHORIZED_BODY)
       return
+    }
+
+    // --- Teardown logging ---
+    // After auth, so an unauthorized caller can never produce a "forwarded" line. Logged when the
+    // response closes, so the status is the one the caller actually saw (a 502/504 the proxy
+    // synthesized included). `status` is omitted if the caller went away before any header was sent.
+    const teardown = classifyTeardown(req.method, req.url)
+    if (teardown !== undefined) {
+      const startedAtMs = Date.now()
+      res.once('close', () => {
+        logger.info(teardown.message, {
+          ...(teardown.sessionId === undefined ? {} : {sessionId: teardown.sessionId}),
+          ...(res.headersSent ? {status: res.statusCode} : {}),
+          durationMs: Date.now() - startedAtMs,
+        })
+      })
     }
 
     // --- Forward ---
