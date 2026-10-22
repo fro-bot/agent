@@ -30,18 +30,6 @@ export interface LockReleaseOptions {
 }
 
 /**
- * Releases the coordination lock by ETag and, when that ETag turns out to be stale, by ownership.
- *
- * A renewal the heartbeat lost track of (it timed out, or its response never arrived) can still commit, which moves the
- * lock's ETag past the one the heartbeat reports. The ETag release then fails its condition although the record is ours.
- * Retrying once through the ownership check deletes it with the ETag the store has now, and never touches a successor's
- * record: a different holder, run or token is left in place.
- *
- * The ownership release gets `OWNERSHIP_RELEASE_BUDGET_MS`. Every outcome of it is an expected one and maps to success;
- * only a failure of the ownership release itself (including running out of budget) comes back as an error, for the
- * caller to warn about as it always has.
- */
-/**
  * Runs the ownership release against the budget. At the deadline the callee's signal is aborted and the call is
  * abandoned, so an adapter that ignores cancellation still cannot block; the timer is cleared on every exit.
  */
@@ -78,6 +66,18 @@ async function withBudget(
   }
 }
 
+/**
+ * Releases the coordination lock by ETag and, when that ETag turns out to be stale, by ownership.
+ *
+ * A renewal the heartbeat lost track of (it timed out, or its response never arrived) can still commit, which moves the
+ * lock's ETag past the one the heartbeat reports. The ETag release then fails its condition although the record is ours.
+ * Retrying once through the ownership check deletes it with the ETag the store has now, and never touches a successor's
+ * record: a different holder, run or token is left in place.
+ *
+ * The ownership release gets `OWNERSHIP_RELEASE_BUDGET_MS`. Every outcome of it is an expected one and maps to success;
+ * only a failure of the ownership release itself (including running out of budget) comes back as an error, for the
+ * caller to warn about as it always has.
+ */
 export async function releaseLockOrByOwnership(options: LockReleaseOptions): Promise<Result<void, Error>> {
   const {releaseByEtag, releaseIfHolder, acquisitionToken, logger, context, label} = options
   const released = await releaseByEtag()
