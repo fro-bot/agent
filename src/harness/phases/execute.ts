@@ -534,7 +534,7 @@ export interface RunDrainOptions {
   readonly parentSessionId: string | null
   /** Directory the session runs in (`getGitHubWorkspace()`, as in `executeOpenCode`); reconciliation is scoped to it. */
   readonly directory: string
-  /** Remaining budget for drain, already excluding the teardown reserve. */
+  /** Remaining budget for drain, already excluding the teardown reserve. `Number.POSITIVE_INFINITY` means no deadline. */
   readonly deadlineMs: number
   readonly logger: Logger
   /** Interval between periodic reconciliation passes. Defaults to `createLedgerReconciler`'s own default. */
@@ -558,12 +558,19 @@ const NO_DRAIN_OUTCOME: DrainOutcome = {expired: false, cancelledCount: 0, settl
  * sync dominating at up to 10.2s) and is deliberately overridable -- it
  * predates drain existing and is provisional until re-measured from the
  * drain tail (see plan "Deferred to Separate Tasks").
+ *
+ * A total timeout of 0 means the Action sets no deadline, so drain has none
+ * either: the budget is `Number.POSITIVE_INFINITY` (the convention
+ * `createExecutionDeadline().remainingMs()` uses) and the wait loop polls at
+ * its normal cadence until the owned work settles. Only the workflow's
+ * `timeout-minutes` or GitHub's own limit can stop it.
  */
 export function computeDrainDeadlineMs(
   totalTimeoutMs: number,
   executionDurationMs: number,
   teardownReserveMs: number = DEFAULT_DRAIN_TEARDOWN_RESERVE_MS,
 ): number {
+  if (totalTimeoutMs <= 0) return Number.POSITIVE_INFINITY
   return Math.max(0, totalTimeoutMs - teardownReserveMs - executionDurationMs)
 }
 
