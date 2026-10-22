@@ -675,21 +675,20 @@ describe('runOpenCodeCore — provider rejection fails fast (#1836)', () => {
       expectFailed(run, 'Provider failure: session error')
     })
 
-    it('fails the run when an owned child overflows and goes idle uncompacted (compaction off)', async () => {
-      // #given
-      const run = startRun({owned: [CHILD]})
+    it('marks an owned child unknown when it overflows and goes idle uncompacted (compaction off), and the run goes on', async () => {
+      // #given an adopted child
+      const ownershipLedger = createOwnershipLedger()
+      ownershipLedger.adopt(CHILD, 'background task')
+      const run = startRun({owned: [CHILD], ownershipLedger})
 
-      // #when — the child's output is lost; the root has not gone idle
+      // #when the child overflows and goes idle; the root has not gone idle
       await run.emit(sessionError({name: 'ContextOverflowError', data: {message: SECRET}}, CHILD))
-      expect(run.outcome()).toBeUndefined()
       await run.emit({type: 'session.idle', properties: {sessionID: CHILD}})
 
-      // #then
-      expectFailed(run, 'Provider failure: session error')
-      expect(vi.mocked(run.logger.error)).toHaveBeenCalledWith(
-        {sessionId: ROOT, source: 'session.idle', errorName: 'ContextOverflowError', reason: 'session error'},
-        expect.any(String),
-      )
+      // #then the child is unconfirmed, the run was not failed, and nothing raw was logged
+      expect(run.outcome()).toBeUndefined()
+      expect(ownershipLedger.snapshot()).toEqual([{sessionId: CHILD, label: 'background task', state: 'unknown'}])
+      expect(vi.mocked(run.logger.error)).not.toHaveBeenCalled()
       expect(loggedText(run.logger)).not.toContain('SECRET')
     })
 

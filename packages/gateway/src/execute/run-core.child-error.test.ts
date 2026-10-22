@@ -304,16 +304,57 @@ describe('a session.error on a session the run owns', () => {
     await cancel(run)
   })
 
-  it('keeps the overflow handling for a child: an unrecovered overflow still fails the run when the child goes idle', async () => {
+  it('marks an owned child unknown on a context overflow too, and lets the run finish once drain settles it', async () => {
+    // #given an adopted background child
+    const run = await adopted()
+
+    // #when the child overflows its context, nothing compacts it, and it goes idle
+    run.emit(sessionError({name: 'ContextOverflowError', data: {message: 'x'}}, CHILD))
+    await vi.advanceTimersByTimeAsync(100)
+    run.emit({type: 'session.idle', properties: {sessionID: CHILD}})
+    await vi.advanceTimersByTimeAsync(100)
+
+    // #then it is treated like any other child error: unconfirmed, claim persisted, run continues
+    expect(run.outcome()).toBe('pending')
+    expect(childState(run)).toBe('unknown')
+    expect(run.onOwnershipChange).toHaveBeenLastCalledWith({rootSessionId: ROOT, ownedSessionIds: [CHILD]})
+
+    // #when the root goes idle, reconciliation finds the child gone, and the completion turn arrives
+    run.emit(rootIdle)
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(childState(run)).toBe('settled')
+    run.emit(taskNotice)
+    run.emit(rootIdle)
+    await vi.advanceTimersByTimeAsync(10_000)
+
+    // #then the run completes: the child's idle did not fail it
+    expect(run.outcome()).toBe('resolved')
+  })
+
+  it('still fails the run when the ROOT overflows and nothing compacts it', async () => {
     // #given
     const run = await adopted()
 
-    // #when the child overflows its context; nothing compacts it, and it goes idle
-    run.emit(sessionError({name: 'ContextOverflowError', data: {message: 'x'}}, CHILD))
+    // #when the root overflows and goes idle uncompacted
+    run.emit(sessionError({name: 'ContextOverflowError', data: {message: 'x'}}, ROOT))
     await vi.advanceTimersByTimeAsync(100)
     expect(run.outcome()).toBe('pending')
-    expect(childState(run)).toBe('outstanding')
-    run.emit({type: 'session.idle', properties: {sessionID: CHILD}})
+    run.emit(rootIdle)
+    await vi.advanceTimersByTimeAsync(100)
+
+    // #then
+    expect(run.outcome()).toBe('rejected')
+    expect((run.error() as RunCoreError).kind).toBe('session-error')
+  })
+
+  it('treats an overflow that names no session as the root', async () => {
+    // #given
+    const run = await adopted()
+
+    // #when
+    run.emit(sessionError({name: 'ContextOverflowError', data: {message: 'x'}}))
+    await vi.advanceTimersByTimeAsync(100)
+    run.emit(rootIdle)
     await vi.advanceTimersByTimeAsync(100)
 
     // #then

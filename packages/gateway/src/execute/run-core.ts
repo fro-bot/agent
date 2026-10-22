@@ -795,12 +795,13 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // the only way to distinguish them from text deltas.
   const reasoningPartIds = new Set<string>()
 
-  // Sessions (root or owned child) with a `ContextOverflowError` session.error not yet recovered. With
+  // The root session, once it has a `ContextOverflowError` session.error not yet recovered (an owned child's overflow
+  // is marked `unknown` in the ledger instead, never armed here). With
   // auto-compaction on (the default) OpenCode publishes it and compacts: `compaction.create`
   // (compaction.ts:559-582) then writes that session's user message with a `compaction` part, the first event of
   // the recovery (called from prompt.ts:1322 after processor.ts:629-631). With compaction off OpenCode halts
   // instead (processor.ts:621-628): `session.error`, then that session's `session.idle`, with the errored
-  // `message.updated` only after. So a session's own compaction part clears its entry and, if its idle arrives
+  // `message.updated` only after. So the root's own compaction part clears its entry and, if its idle arrives
   // first, the overflow was unrecovered and the run fails. A null session id is keyed to the root, as run-core
   // already treats it.
   const overflowPending = new Set<string>()
@@ -1265,8 +1266,8 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         // working. Root idle is the signal to CONSIDER finishing; whether that
         // is actually allowed is the ledger's call, below.
         const eventSessionID = getEventSessionID(rawEvent)
-        // Any session's idle with an overflow nothing compacted: OpenCode stopped it (compaction off). A child's
-        // output is lost with it, so fail rather than let the root complete.
+        // The root's idle with an overflow nothing compacted: OpenCode stopped it (compaction off), so fail rather
+        // than complete on partial output.
         if (eventSessionID !== null && overflowPending.has(eventSessionID)) {
           throw await failFromProvider({reason: 'session error', errorName: 'ContextOverflowError'}, 'session.idle')
         }
@@ -1331,23 +1332,24 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           const structuredError = errorText === null ? getObjectProperty(eventPayload, 'error') : null
           // An owned child, as opposed to the root or an error that names no session.
           const childSessionId = eventSessionID !== null && eventSessionID !== sessionId ? eventSessionID : null
-          // A context overflow is not decided here: compaction may follow, so it only arms `overflowPending`.
-          // An abort is exempt only when the gateway caused it (the combined signal ends the loop); an abort
-          // from any other client (`POST /session/:id/abort`) is followed by an idle that would otherwise
-          // complete the run with partial output.
-          if (isContextOverflowError(structuredError)) {
-            overflowPending.add(eventSessionID ?? sessionId)
-          } else if (childSessionId !== null) {
-            // A child's terminal error (or an abort by another client) does not end the root's turn. It is
-            // evidence something went wrong, not proof the child stopped writing, so the entry is marked
-            // `unknown` — never `settled` — and the root learns the child's outcome from its task-completion
-            // notice. The drain settles the entry once reconciliation sees it stop, or cancels it at the
-            // deadline. Marking goes through the hook-wrapped ledger, so persistence and validation fire.
+          // A child's error, overflow included, does not end the root's turn. It is evidence something went wrong,
+          // not proof the child stopped writing, so the entry is marked `unknown` — never `settled` — and the root
+          // learns the child's outcome from its task-completion notice. The drain settles the entry once
+          // reconciliation sees it stop, or cancels it at the deadline. Marking goes through the hook-wrapped
+          // ledger, so persistence and validation fire.
+          //
+          // The root's context overflow is not decided here: compaction may follow, so it only arms
+          // `overflowPending`. An abort is exempt only when the gateway caused it (the combined signal ends the
+          // loop); an abort from any other client (`POST /session/:id/abort`) is followed by an idle that would
+          // otherwise complete the run with partial output.
+          if (childSessionId !== null) {
             ledger?.markUnknown(childSessionId)
             logger.warn(
               {sessionId, childSessionId},
               'run-core: owned child reported a terminal session error — marked unknown, run continues',
             )
+          } else if (isContextOverflowError(structuredError)) {
+            overflowPending.add(sessionId)
           } else if (isAbortedError(structuredError)) {
             if (combinedSignal.aborted === false) throw await failFromProvider(ABORTED_FAILURE, 'session.error')
           } else {
