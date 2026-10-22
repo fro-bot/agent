@@ -145,6 +145,17 @@ When an authorized `@fro-bot` PR comment produces workspace edits but no commit 
 
 Since the failure paths above are hard to tell apart from a reason string alone, the brokered-push outcome now carries a closed `failureClass` discriminant — `validation`, `reconstruction`, `moved-head`, `identity`, `permission`, `commit`, `timeout`, or `unknown` — and validation rejections additionally list the offending paths. That is the field to read in the logs when diagnosing a suppressed push; the human-readable reason strings are unchanged and no caller branches on their text.
 
+## Lock Held After a Run Ended
+
+The coordination lock normally disappears when a run finishes. If a repo stays blocked, look at the lease-renewal log lines for the run (gateway logs or the Action step log):
+
+- **`Coordination lease ETag adopted after a renewal outcome was lost`** (info) means a renewal reached S3 but the response was lost, and the next failed tick or the stop recovered by taking the stored ETag. Nothing is wrong; the release used the adopted ETag.
+- **`Coordination lease renewal failed`** / **`threw`** (warning) is logged for every failed renewal, with an adoption line after it only when the failure was recovered. With no adoption line, the renewal did not commit: the stored record is still this run's at the ETag the loop holds, and if renewals keep failing the lease lapses by its TTL (15 minutes by default). `Lock record not adopted` at debug is the line that says a different record was found, and why: another holder or run, a different acquisition token, or no token.
+- A record without an `acquisition_token` was written by an older gateway build and is never adopted; it falls back to its TTL. This lasts only while old and new builds overlap during a deploy.
+- A tick that was still pending when the 5 s stop budget ran out leaves no budget to look for a committed renewal, so the ETag stop reports may be stale. The gateway's release then retries once by ownership (`run: lock released by ownership after a stale ETag`, info): it reads the lock and deletes it only if the holder, run and `acquisition_token` are this run's. A `lock now belongs to another acquisition` line means a successor holds the lock and it was left alone. The retry is bounded at 5 s: if the store stalls, `ownership release did not finish within 5000ms — lock left to its TTL` is logged (warning), then `releaseLock failed`, and the lock lapses by TTL. Only a failure of the retry logs `releaseLock failed`.
+
+To clear a stuck gateway lock sooner, use `/fro-bot force-release-lock`; it deletes the lock only when the lease has expired and the repo's workspace reports `clear`.
+
 ## Known Gateway Test Flake
 
 A lone timeout in `packages/gateway/src/web/operator-route.test.ts` during a full `bun run test` is a known, non-blocking flake, not a regression. The suite only exercises static route-classification guards with no timing-sensitive logic; under peak parallel load its tasks can be starved past the default 5-second budget. Confirm the flake by checking that the failure is a **timeout** (not an assertion), that it is the only failure in an otherwise-green run, and that the file passes in isolation:

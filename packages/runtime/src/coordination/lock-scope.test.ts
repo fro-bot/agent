@@ -4,7 +4,7 @@ import type {CoordinationConfig, LockRecord} from './types.js'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {err, ok} from '../shared/types.js'
-import {acquireLock, getLockKey, releaseLock, releaseLockIfHolder, renewLease} from './lock.js'
+import {acquireLock, getLockKey, isPreconditionFailed, releaseLock, releaseLockIfHolder, renewLease} from './lock.js'
 
 const REPO_KEY = 'fro-bot-state/coordination/owner/repo/locks/repo.json'
 const ACTION_KEY = 'fro-bot-state/coordination/owner/repo/locks/action.json'
@@ -717,6 +717,45 @@ describe('releaseLockIfHolder', () => {
     expect(objects.has(ACTION_KEY)).toBe(true)
   })
 
+  it('deletes only while run_id also matches when the caller names one', async () => {
+    // #given the same holder and token on two different runs
+    const same = createMemoryStore({
+      [ACTION_KEY]: {...holderRecord('action:1:1'), acquisition_token: 'token-0001-abcd'},
+    })
+    const other = createMemoryStore({
+      [ACTION_KEY]: {...holderRecord('action:1:1'), acquisition_token: 'token-0001-abcd'},
+    })
+
+    // #when
+    const kept = await releaseLockIfHolder(other.config, 'owner/repo', 'action:1:1', createLogger(), 'action', {
+      acquisitionToken: 'token-0001-abcd',
+      runId: 'run-other',
+    })
+    const released = await releaseLockIfHolder(same.config, 'owner/repo', 'action:1:1', createLogger(), 'action', {
+      acquisitionToken: 'token-0001-abcd',
+      runId: 'run-1',
+    })
+
+    // #then
+    expect(kept).toEqual(ok('not-holder'))
+    expect(other.objects.has(ACTION_KEY)).toBe(true)
+    expect(other.adapter.conditionalDelete).not.toHaveBeenCalled()
+    expect(released).toEqual(ok('released'))
+    expect(same.objects.has(ACTION_KEY)).toBe(false)
+  })
+
+  it('ignores run_id when the caller names none', async () => {
+    // #given
+    const {config, objects} = createMemoryStore({[ACTION_KEY]: holderRecord('action:1:1')})
+
+    // #when
+    const result = await releaseLockIfHolder(config, 'owner/repo', 'action:1:1', createLogger(), 'action', {})
+
+    // #then
+    expect(result).toEqual(ok('released'))
+    expect(objects.has(ACTION_KEY)).toBe(false)
+  })
+
   it('reports no-lock when the lock is already gone', async () => {
     // #given
     const {config} = createMemoryStore()
@@ -968,5 +1007,17 @@ describe('releaseLockIfHolder', () => {
       expect(vi.mocked(adapter.getObject).mock.calls[0]?.[1]).toEqual({signal: controller.signal})
       expect(vi.mocked(adapter.conditionalDelete).mock.calls[0]?.[1]).toMatchObject({signal: controller.signal})
     })
+  })
+})
+
+describe('isPreconditionFailed', () => {
+  it.each([
+    ['PreconditionFailed', true],
+    ['precondition failed', true],
+    ['Pre-condition failed', true],
+    ['503 slow down', false],
+    ['NoSuchKey', false],
+  ])('classifies %s as %s', (message, expected) => {
+    expect(isPreconditionFailed(new Error(message))).toBe(expected)
   })
 })

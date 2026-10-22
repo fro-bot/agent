@@ -1,17 +1,33 @@
+import type {Logger} from '../shared/logger.js'
 import type {Result} from '../shared/types.js'
-import type {CoordinationConfig, RunState} from './types.js'
+import type {LockOwnership} from './lock-adoption.js'
+import type {CoordinationConfig, LockRecord, RunState} from './types.js'
 
 import {buildObjectStoreKey} from '../object-store/key-builder.js'
 import {err, ok} from '../shared/types.js'
 import {requireConditionalPut, requireGetObject, resolveGetObject} from './adapter-guards.js'
+import {createLeaseLoop} from './lease-loop.js'
+import {createLockAdopter} from './lock-adoption.js'
 import {renewLease} from './lock.js'
 import {parseRunState, RUN_STATE_TAG} from './run-state.js'
 
 /**
  * The total time `stop()` spends waiting on an in-flight tick and then reading the final snapshot before it gives up.
- * Mirrors the Action's lock-renewal `STOP_GRACE_PERIOD_MS` (`src/harness/phases/acquire-lock.ts`).
+ * Also the budget of the gateway's stale-ETag recovery read (`stale-etag-transition.ts`), which follows a failed stop.
  */
 export const HEARTBEAT_STOP_GRACE_MS = 5_000
+
+/**
+ * Bounds one heartbeat tick (RunState read, lock renewal, RunState write). The same bound the Action puts on its
+ * renewal, and well under `DEFAULT_HEARTBEAT_INTERVAL_MS` so a hung request fails before the next tick is due.
+ */
+const HEARTBEAT_TICK_TIMEOUT_MS = 10_000
+
+/**
+ * What the controller logs through. `info` and `warning` are optional so a caller that only has a `debug` sink still
+ * works: the missing levels fall back to `debug`. Production callers pass the full runtime `Logger`.
+ */
+export type HeartbeatLogger = Pick<Logger, 'debug'> & Partial<Pick<Logger, 'info' | 'warning'>>
 
 export interface HeartbeatStopResult {
   /** Current ETag of the run-state object after the final heartbeat tick. */
@@ -28,7 +44,7 @@ export interface HeartbeatStopResult {
  */
 export interface HeartbeatStopError extends Error {
   /**
-   * The freshest lock ETag a renewal confirmed (the acquisition ETag if none did). Tracked apart from the RunState
+   * The freshest lock ETag a renewal confirmed or adoption found (the acquisition ETag if neither did). Tracked apart from the RunState
    * ETag: a tick can renew the lock and then fail the RunState write, and release must still use the renewed ETag.
    * With `tickPending` it may already be stale; a conditional release then fails safely and the lease lapses via TTL.
    */
@@ -36,12 +52,14 @@ export interface HeartbeatStopError extends Error {
   /**
    * The ETag of the controller's last successful RunState write (the ETag it was constructed with if none
    * succeeded). Every tick rewrites the RunState, so a terminal transition that uses an older ETag loses its
-   * conditional write; with `tickPending`, one late write may still land and make this stale too.
+   * conditional write. Treat the `runEtag` of ANY `stop()` error as possibly stale, not only when `tickPending`: a write
+   * that timed out or was aborted may have committed, and a write that lands after `stop()` returned (before its tick
+   * timeout) is applied too.
    */
   readonly runEtag: string
   /**
    * True when the grace period elapsed while a tick was still in flight. That tick may yet renew the lock or
-   * write the RunState, so neither ETag the caller holds can be trusted to be current.
+   * write the RunState (until its own tick timeout), so neither ETag the caller holds can be trusted to be current.
    */
   readonly tickPending: boolean
 }
@@ -60,18 +78,22 @@ export interface HeartbeatController {
    *
    * One `HEARTBEAT_STOP_GRACE_MS` budget covers the whole call: the wait on an in-flight tick and the snapshot read
    * share it, so `stop()` resolves within about one grace period. If a tick is still pending when it elapses,
-   * returns a `tickPending` error without reading a snapshot: the tick keeps running in the background and the
-   * caller's ETags may be stale, so it must settle best-effort (a conditional write or release that loses the race
+   * returns a `tickPending` error without reading a snapshot: its request is aborted at that point, but the tick
+   * stays live until its own tick timeout and the caller's ETags may be stale, so it must settle best-effort (a conditional write or release that loses the race
    * fails safely). If the snapshot read is still pending, returns an error with `tickPending` false and the ETags
    * confirmed so far.
    *
    * `stop()` first marks the controller stopping, so a tick that has not yet started its lock renewal or its
-   * RunState write skips that I/O. A request already in flight when `stop()` began can still land: a late renewal
-   * restarts the lease TTL and a late RunState write changes the run ETag. That window is residual; closing it needs
-   * the object-store adapter to abort in-flight requests.
+   * RunState write skips that I/O, so no tick starts a RunState read or write after `stop()` begins (the snapshot read
+   * below, bounded by the same budget, is the only RunState read it makes). `stop()` does not supersede a tick: a
+   * request already in flight when it began can still land, and a result that arrives before that tick's own timeout
+   * is applied (a late renewal restarts the lease TTL, a late RunState write changes the run ETag). Requests are
+   * aborted when the tick timeout or this budget runs out, never when `stop()` begins; that narrows the window but
+   * cannot close it, because a PUT aborted on the client can still commit server-side. A result that arrives after
+   * its tick timed out is ignored.
    *
    * If a heartbeat tick failed since the last successful tick, returns the tick error. Every failure carries
-   * `lockEtag`, the freshest lock ETag a renewal confirmed, so a RunState write that failed after a successful
+   * `lockEtag`, the freshest lock ETag a renewal confirmed or adoption found, so a RunState write that failed after a successful
    * renewal does not strand the caller on the acquisition ETag, and `runEtag`, the ETag of the last successful
    * RunState write.
    * Otherwise returns the freshest snapshot fetched after in-flight ticks complete.
@@ -89,6 +111,23 @@ function getRunKey(config: CoordinationConfig, identity: string, repo: string, r
   return ok(key.data)
 }
 
+/**
+ * Whether a stored gateway lock record is the one this acquisition wrote. The gateway's holder id is its identity and
+ * repeats across runs, so the run and the per-acquisition token must match too; a record without a token (an older
+ * build's) is never ours.
+ */
+function gatewayOwnsRecord(holderId: () => string | undefined, runId: string, acquisitionToken: string) {
+  return (stored: LockRecord): LockOwnership => {
+    const expectedHolder = holderId()
+    if (expectedHolder === undefined) return {owned: false, reason: 'no-renewal-sent'}
+    if (stored.holder_id !== expectedHolder) return {owned: false, reason: 'holder-mismatch'}
+    if (stored.run_id !== runId) return {owned: false, reason: 'run-mismatch'}
+    if (stored.acquisition_token === undefined) return {owned: false, reason: 'no-token'}
+    if (stored.acquisition_token !== acquisitionToken) return {owned: false, reason: 'token-mismatch'}
+    return {owned: true}
+  }
+}
+
 export function createHeartbeatController(
   config: CoordinationConfig,
   identity: string,
@@ -96,198 +135,162 @@ export function createHeartbeatController(
   runId: string,
   lockEtag: string,
   runEtag: string,
-  logger: {debug: (message: string, context?: Record<string, unknown>) => void},
+  logger: HeartbeatLogger,
+  /** The per-acquisition token `acquireLock` wrote; every renewal record keeps it. Omit for a lock acquired without one. */
+  acquisitionToken?: string,
 ): HeartbeatController {
-  let intervalHandle: ReturnType<typeof setInterval> | null = null
-  let running = false
-  let inFlight: Promise<void> | null = null
-  let tickError: Error | null = null
-  let stopping = false
-  // A function, not a bare read: `stopping` flips during the awaits in `writeHeartbeat`, which control-flow narrowing
-  // cannot see.
-  const isStopping = (): boolean => stopping
-  let currentLockEtag = lockEtag
-  // Tracked apart from the lock ETag: the lock and the RunState are separate objects and a tick can advance one
-  // without the other.
-  let currentRunEtag = runEtag
-
-  const toStopError = (error: Error, tickPending: boolean): HeartbeatStopError =>
-    Object.assign(new Error(error.message, {cause: error}), {
-      lockEtag: currentLockEtag,
-      runEtag: currentRunEtag,
-      tickPending,
-    })
-
   const runKey = getRunKey(config, identity, repo, runId)
   if (runKey.success === false) {
     throw runKey.error
   }
 
-  /** Resolves `true` when the tick ran to completion, `false` when it skipped its I/O because `stop()` had begun. */
-  const writeHeartbeat = async (): Promise<boolean> => {
-    const current = await requireGetObject(config)(runKey.data)
+  // Tracked apart from the lock ETag, which the loop owns: the lock and the RunState are separate objects and a tick
+  // can advance one without the other.
+  let currentRunEtag = runEtag
+  let stopRequested = false
+  // The holder the last renewal record named, which is what an adopted record must carry: the RunState owns it.
+  let renewalHolderId: string | undefined
+
+  const loopLogger: Pick<Logger, 'debug' | 'info' | 'warning'> = {
+    debug: (message, context) => logger.debug(message, context),
+    info: (message, context) => (logger.info ?? logger.debug)(message, context),
+    warning: (message, context) => (logger.warning ?? logger.debug)(message, context),
+  }
+
+  const readRunState = async (
+    signal: AbortSignal | undefined,
+  ): Promise<{readonly state: RunState; readonly etag: string}> => {
+    const getObject = requireGetObject(config)
+    const current = await getObject(runKey.data, signal === undefined ? undefined : {signal})
     if (current.success === false) {
       throw current.error
     }
-
-    const parsedCurrent = parseRunState(current.data.data)
-    if (parsedCurrent.success === false) {
-      throw parsedCurrent.error
+    const parsed = parseRunState(current.data.data)
+    if (parsed.success === false) {
+      throw parsed.error
     }
+    return {state: parsed.data, etag: current.data.etag}
+  }
 
-    const nextState: RunState = {...parsedCurrent.data, last_heartbeat: new Date().toISOString()}
+  const loop = createLeaseLoop({
+    renew: async (record, etag, signal) => renewLease(config, repo, record, etag, logger, 'repo', signal),
+    initialEtag: lockEtag,
+    intervalMs: config.heartbeatIntervalMs,
+    tickTimeoutMs: HEARTBEAT_TICK_TIMEOUT_MS,
+    stopBudgetMs: HEARTBEAT_STOP_GRACE_MS,
+    // The timers stay referenced on purpose: this runs in a long-lived daemon, and an unref'd interval could let a
+    // misconfigured process exit with a run still marked EXECUTING. The one exception is the timer of an attempt that
+    // `stop()` gave up on, which the loop unrefs itself so it never holds shutdown open.
+    unref: false,
+    abortOnDeadline: true,
+    // Without a token there is no way to tell this acquisition's record from a successor's, so nothing is adopted.
+    ...(acquisitionToken === undefined
+      ? {}
+      : {
+          adopt: createLockAdopter({
+            config,
+            repo,
+            owns: gatewayOwnsRecord(() => renewalHolderId, runId, acquisitionToken),
+            logger: loopLogger,
+            logContext: {repo, runId},
+          }),
+        }),
+    logger: loopLogger,
+    logContext: {repo, runId},
+    tick: async ctx => {
+      // A tick must not start new I/O once stop has begun.
+      if (ctx.isStopping()) return
 
-    // Renew lock lease BEFORE writing heartbeat — if renewal fails, the heartbeat
-    // timestamp stays stale so findStaleRuns correctly flags this run. The reverse
-    // order (heartbeat first, lease second) causes split-brain: run looks fresh but
-    // lock TTL expires, allowing another gateway to steal the lock.
-    //
-    // A tick that outlives `stop()` must not start new I/O: a late renewal would restart the lease TTL after the
-    // caller has already tried to release it.
-    if (isStopping() === true) {
-      return false
-    }
+      const current = await readRunState(ctx.signal)
+      const nextState: RunState = {...current.state, last_heartbeat: new Date().toISOString()}
+      renewalHolderId = nextState.holder_id
 
-    const renewed = await renewLease(
-      config,
-      repo,
-      {
+      // Renew the lock lease BEFORE writing the heartbeat. If renewal fails, the heartbeat timestamp stays stale so
+      // findStaleRuns correctly flags this run. The reverse order (heartbeat first, lease second) causes split-brain:
+      // the run looks fresh but the lock TTL expires, allowing another gateway to steal the lock. `renewLock` throws
+      // on an unconfirmed renewal, which skips the write.
+      const renewed = await ctx.renewLock({
         repo,
         holder_id: nextState.holder_id,
         surface: nextState.surface,
         acquired_at: nextState.last_heartbeat,
         ttl_seconds: config.lockTtlSeconds,
         run_id: nextState.run_id,
-      },
-      currentLockEtag,
-      logger,
-    )
-    if (renewed.success === false) {
-      throw renewed.error
-    }
-
-    currentLockEtag = renewed.data.etag
-
-    if (isStopping() === true) {
-      return false
-    }
-
-    const written = await requireConditionalPut(config)(runKey.data, JSON.stringify(nextState), {
-      ifMatch: current.data.etag,
-      tagging: RUN_STATE_TAG,
-    })
-    if (written.success === false) {
-      throw written.error
-    }
-
-    currentRunEtag = written.data.etag
-    return true
-  }
-
-  const runTick = (): void => {
-    if (inFlight != null) {
-      return
-    }
-
-    inFlight = writeHeartbeat()
-      .then(completed => {
-        // A tick that skipped its I/O proves nothing about the earlier failure it would otherwise clear.
-        if (completed === true) {
-          tickError = null
-        }
+        ...(acquisitionToken === undefined ? {} : {acquisition_token: acquisitionToken}),
       })
-      .catch(error => {
-        tickError = error instanceof Error ? error : new Error(String(error))
+      // Stop began, or this attempt timed out, before the write: a late write would change the run ETag after the
+      // caller has already tried to settle it.
+      if (renewed === 'skipped' || ctx.isStopping() || !ctx.isCurrent()) return
+
+      const written = await requireConditionalPut(config)(runKey.data, JSON.stringify(nextState), {
+        ifMatch: current.etag,
+        tagging: RUN_STATE_TAG,
+        ...(ctx.signal === undefined ? {} : {signal: ctx.signal}),
       })
-      .finally(() => {
-        inFlight = null
-      })
-  }
+      if (written.success === false) {
+        throw written.error
+      }
+      // A write that returns after its tick timed out must not move the ETag the caller will transition with.
+      if (ctx.isCurrent()) currentRunEtag = written.data.etag
+    },
+    finalize: async signal => {
+      const getObject = resolveGetObject(config)
+      if (getObject.success === false) {
+        throw getObject.error
+      }
+      const current = await getObject.data(runKey.data, signal === undefined ? undefined : {signal})
+      if (current.success === false) {
+        throw current.error
+      }
+      const parsed = parseRunState(current.data.data)
+      if (parsed.success === false) {
+        throw parsed.error
+      }
+      return {runEtag: current.data.etag, runState: parsed.data}
+    },
+  })
 
   return {
     start: () => {
-      if (running === true) {
-        return
+      if (loop.isRunning === false && stopRequested === false) {
+        logger.debug('Starting heartbeat controller', {repo, runId})
       }
-      // One-way: a restart would un-skip a tick that outlived `stop()`. A restart needs a new controller.
-      if (stopping === true) {
-        logger.debug('Ignoring start of a stopped heartbeat controller', {repo, runId})
-        return
-      }
-
-      logger.debug('Starting heartbeat controller', {repo, runId})
-      running = true
-      intervalHandle = setInterval(runTick, config.heartbeatIntervalMs)
+      loop.start()
     },
     stop: async (): Promise<Result<HeartbeatStopResult, HeartbeatStopError>> => {
-      logger.debug('Stopping heartbeat controller', {repo, runId})
-      running = false
-      stopping = true
-      if (intervalHandle != null) {
-        clearInterval(intervalHandle)
-        intervalHandle = null
-      }
-
-      // One budget for the whole call: the tick wait and the snapshot read share a single grace timer armed here,
-      // so `stop()` resolves within about `HEARTBEAT_STOP_GRACE_MS` in total. Every step races it, and it is cleared
-      // on every exit path. A raced promise that settles late is already handled by the race, so it cannot surface
-      // as an unhandled rejection.
-      let timer: ReturnType<typeof setTimeout> | undefined
-      const budget = new Promise<'elapsed'>(resolve => {
-        timer = setTimeout(() => resolve('elapsed'), HEARTBEAT_STOP_GRACE_MS)
-      })
-
+      stopRequested = true
+      // `stop()` never rejects, whatever the logger does.
       try {
-        const pending = inFlight
-        if (pending != null && (await Promise.race([pending, budget])) === 'elapsed') {
-          logger.debug('Heartbeat tick still in flight after the stop grace period', {repo, runId})
-          return err(
-            toStopError(new Error(`Heartbeat tick did not settle within ${HEARTBEAT_STOP_GRACE_MS}ms of stop`), true),
-          )
-        }
-
-        if (tickError != null) {
-          return err(toStopError(tickError, false))
-        }
-
-        // `stop()` never rejects: an adapter that throws or rejects must still hand the caller the ETags it needs.
-        const getObject = resolveGetObject(config)
-        if (getObject.success === false) {
-          return err(toStopError(getObject.error, false))
-        }
-
-        const current = await Promise.race([getObject.data(runKey.data), budget])
-        if (current === 'elapsed') {
-          logger.debug('Heartbeat snapshot read still in flight after the stop grace period', {repo, runId})
-          return err(
-            toStopError(
-              new Error(`Heartbeat snapshot read did not settle within ${HEARTBEAT_STOP_GRACE_MS}ms of stop`),
-              false,
-            ),
-          )
-        }
-        if (current.success === false) {
-          return err(toStopError(current.error, false))
-        }
-
-        const parsedCurrent = parseRunState(current.data.data)
-        if (parsedCurrent.success === false) {
-          return err(toStopError(parsedCurrent.error, false))
-        }
-
-        return ok({
-          runEtag: current.data.etag,
-          runState: parsedCurrent.data,
-          lockEtag: currentLockEtag,
-        })
-      } catch (error) {
-        return err(toStopError(error instanceof Error ? error : new Error(String(error)), false))
-      } finally {
-        clearTimeout(timer)
+        logger.debug('Stopping heartbeat controller', {repo, runId})
+      } catch {
+        // Nowhere left to report a logger that cannot log.
       }
+      const stopped = await loop.stop()
+      if (stopped.success === false) {
+        const {cause, lockEtag: failedLockEtag, tickPending} = stopped.error
+        return err(
+          Object.assign(new Error(stopped.error.message, {cause}), {
+            lockEtag: failedLockEtag,
+            runEtag: currentRunEtag,
+            tickPending,
+          }),
+        )
+      }
+      const snapshot = stopped.data.final
+      // `finalize` is always given, so a success always carries its snapshot.
+      if (snapshot === undefined) {
+        return err(
+          Object.assign(new Error('Heartbeat stop produced no snapshot'), {
+            lockEtag: stopped.data.lockEtag,
+            runEtag: currentRunEtag,
+            tickPending: false,
+          }),
+        )
+      }
+      return ok({runEtag: snapshot.runEtag, runState: snapshot.runState, lockEtag: stopped.data.lockEtag})
     },
     get isRunning() {
-      return running
+      return loop.isRunning
     },
   }
 }

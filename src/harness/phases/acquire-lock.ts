@@ -1,5 +1,6 @@
 import type {
   CoordinationConfig,
+  LockOwnership,
   LockRecord,
   LockScope,
   ObjectStoreConfig,
@@ -12,6 +13,7 @@ import * as core from '@actions/core'
 import {
   acquireLock,
   createLeaseLoop,
+  createLockAdopter,
   createS3Adapter,
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   DEFAULT_LOCK_TTL_SECONDS,
@@ -59,6 +61,10 @@ export interface LeaseController {
    * moment -- a caller about to persist state right after a failed tick must treat
    * this the same as an unconfirmed writer -- but that protection does not survive
    * a subsequent confirmed success.
+   *
+   * An adopted committed renewal (a renewal S3 committed but the caller never saw succeed, recovered by
+   * reading the stored lock) counts as renewal health: the tick that adopted it does not set this. The gap
+   * is still recorded in `continuityUnverified()`, which a caller that needs fail-closed coverage must read.
    *
    * This reflects present renewal health only. For whether uninterrupted coverage was
    * ever in doubt during this invocation, see `continuityUnverified()` below -- the two
@@ -161,6 +167,21 @@ export async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, mes
 }
 
 /**
+ * Whether a stored Action lock record is the one this acquisition wrote. The holder fields repeat across acquisitions
+ * (two calls of one reusable workflow share run, attempt, job and matrix), so the per-acquisition token must match
+ * too; a record without one (an older build's) is never ours. `holder_job` matches when absent on both sides.
+ */
+function actionOwnsRecord(holderId: string, holderJob: string | undefined, acquisitionToken: string) {
+  return (stored: LockRecord): LockOwnership => {
+    if (stored.holder_id !== holderId) return {owned: false, reason: 'holder-mismatch'}
+    if (stored.holder_job !== holderJob) return {owned: false, reason: 'job-mismatch'}
+    if (stored.acquisition_token === undefined) return {owned: false, reason: 'no-token'}
+    if (stored.acquisition_token !== acquisitionToken) return {owned: false, reason: 'token-mismatch'}
+    return {owned: true}
+  }
+}
+
+/**
  * The Action's view over the shared runtime lease loop. The loop owns scheduling, the per-renewal timeout, the overlap
  * guard, the stop budget and the failure state; this supplies the Action's renewal (`renewLease` on its own lock scope)
  * and the record it rewrites on every tick.
@@ -177,7 +198,7 @@ function createLeaseController(
 ): LeaseController {
   const loop = createLeaseLoop({
     // `renewLease` is called through the `@fro-bot/runtime` import, so the package-boundary test seam still applies.
-    renew: async (record, etag) => renewLease(config, repo, record, etag, logger, ACTION_LOCK_SCOPE),
+    renew: async (record, etag, signal) => renewLease(config, repo, record, etag, logger, ACTION_LOCK_SCOPE, signal),
     initialEtag,
     intervalMs: DEFAULT_HEARTBEAT_INTERVAL_MS,
     tickTimeoutMs: RENEWAL_TIMEOUT_MS,
@@ -186,7 +207,15 @@ function createLeaseController(
     // finally block, which calls stop() regardless of outcome, but unref is a defensive backstop against a future
     // early-exit path that forgets to.
     unref: true,
-    abortOnDeadline: false,
+    abortOnDeadline: true,
+    adopt: createLockAdopter({
+      config,
+      repo,
+      scope: ACTION_LOCK_SCOPE,
+      owns: actionOwnsRecord(holderId, holderJob, acquisitionToken),
+      logger,
+      logContext: {repo, holderId},
+    }),
     tick: async ctx => {
       const lockRecord: LockRecord = {
         repo,

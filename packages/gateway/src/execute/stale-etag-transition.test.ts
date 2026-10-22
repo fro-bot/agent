@@ -97,7 +97,7 @@ describe('transitionRetryingStaleEtag', () => {
 
     // #then
     expect(result).toEqual(ok({etag: 'etag-done'}))
-    expect(getObject).toHaveBeenCalledExactlyOnceWith(RUN_KEY)
+    expect(getObject).toHaveBeenCalledExactlyOnceWith(RUN_KEY, {signal: expect.any(AbortSignal) as AbortSignal})
     expect(attempt.mock.calls.map(call => call[0])).toEqual(['etag-stale', 'etag-fresh'])
     expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({runId: RUN_ID}), expect.stringContaining('retry'))
   })
@@ -294,6 +294,33 @@ describe('transitionRetryingStaleEtag', () => {
         expect.stringContaining('retry disabled'),
       )
       expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it('cancels the recovery read when the budget runs out, rather than abandoning it', async () => {
+      // #given a store read that never settles after the first write failed
+      const getObject = vi.fn<(key: string, options?: {signal?: AbortSignal}) => Promise<never>>(
+        async () => new Promise<never>(() => {}),
+      )
+
+      // #when
+      const pending = transitionRetryingStaleEtag({
+        config: configWith(getObject),
+        identity: IDENTITY,
+        repo: REPO,
+        runId: RUN_ID,
+        etag: 'etag-stale',
+        logger: createLogger(),
+        attempt: vi.fn(async (_etag: string) => PRECONDITION()),
+      })
+      await vi.advanceTimersByTimeAsync(HEARTBEAT_STOP_GRACE_MS - 1)
+      const signal = getObject.mock.calls[0]?.[1]?.signal
+      expect(signal).toBeInstanceOf(AbortSignal)
+      expect(signal?.aborted).toBe(false)
+      await vi.advanceTimersByTimeAsync(1)
+      await pending
+
+      // #then
+      expect(signal?.aborted).toBe(true)
     })
 
     it('clears the budget timer when the read settles in time', async () => {

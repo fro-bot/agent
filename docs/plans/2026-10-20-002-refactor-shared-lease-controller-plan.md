@@ -25,7 +25,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 
 - **PR-A** is behaviour-neutral: the loop, with the Action moved onto it.
 - **PR-B** moves the gateway onto the loop. It adds a 10 s tick timeout and abort-on-deadline, which also turns on for the Action.
-- **PR-C** adds ownership-checked ETag adoption after a failed renewal, on both surfaces.
+- **PR-C** (folded into PR-B) adds ownership-checked ETag adoption after a failed renewal, on both surfaces. A tick timeout drops a renewal that may have committed, so the gateway timeout must ship with its recovery.
 
 ## Problem Frame
 
@@ -57,7 +57,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
   - `stop()` reports a failed last tick;
   - a skipped tick changes nothing.
 - **R3.** PR-A is behaviour-neutral for the Action. The proof is golden adapter-call traces recorded before extraction, plus the existing suites passing with no edits.
-- **R4.** The gateway heartbeat keeps its public name and shape (`createHeartbeatController`, `HeartbeatController`, `HeartbeatStopError`). The only change is one additive optional parameter in PR-C. RunState composition stays in the gateway layer.
+- **R4.** The gateway heartbeat keeps its public name and shape (`createHeartbeatController`, `HeartbeatController`, `HeartbeatStopError`). The only change is one additive optional parameter (the acquisition token). RunState composition stays in the gateway layer.
 - **R5.** In PR-B, every tick on both surfaces is bounded by a 10 s timeout. In-flight requests are aborted when the tick timeout or the stop budget runs out, not when `stop()` begins.
 - **R6.** A result from a superseded attempt (one whose tick timeout fired) is never applied to loop state or to the gateway's run ETag. `stop()` does not supersede an in-flight attempt: a result that lands after `stop()` returned but before the tick timeout still applies, as it does on the Action today. A late confirmed renewal is still our own ETag, so a release that reads `currentEtag()` afterwards succeeds. A late failure after stop is harmless, because `tickPending` has already latched continuity.
 - **R7.** After a failed renewal, the loop re-reads the lock once, within the tick's bounds, and adopts the stored ETag if the record is ours:
@@ -165,7 +165,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 - **Timers.**
   - **`unref` coverage:** `unref` applies to every loop timer (interval, tick timeout and stop budget). The Action sets it; the gateway, a daemon, does not.
   - **Clearing:** the loop clears its timers on every exit. Today the Action's grace `delay` lingers for up to 5 s, unref'd. Clearing it can't be seen from outside, so the golden traces assert adapter calls and their ordering, not leftover timers.
-  - **Exception:** the in-flight attempt's own tick timeout stays armed after `stop()` gives up on a pending tick. It has to: the Action pins that an abandoned tick still times out and records its failure. It is unref'd on the Action. On the gateway, which does not unref, it would hold shutdown for up to the 10 s tick timeout; whether to keep that is a PR-B decision.
+  - **Exception:** the in-flight attempt's own tick timeout stays armed after `stop()` gives up on a pending tick. It has to: the Action pins that an abandoned tick still times out and records its failure. When `stop()` gives up on a pending attempt, the loop unrefs that attempt's tick timer: it still fires while the process lives, but it never holds the gateway's shutdown (PR-B).
 - **Action composition.**
   - **Tick body:** renews the constant identity record, which carries `holder_job` and `acquisition_token`.
   - **Settings:** `unref: true`, tick timeout `RENEWAL_TIMEOUT_MS` (10 s), stop budget `HEARTBEAT_STOP_GRACE_MS` (5 s), and `abortOnDeadline: false` in PR-A, `true` in PR-B.
@@ -176,13 +176,16 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
   - **Wrapper:** `createHeartbeatController` becomes a thin layer. Each tick: if stopping, return; read RunState; `renewLock(recordFrom(state))`; if renewed and still current, write RunState; then update its own `runEtag` only if `isCurrent()`.
   - **Result mapping:** it maps the loop's result back to `HeartbeatStopResult` / `HeartbeatStopError`, carrying `runEtag` from the layer.
   - **Settings:** `unref: false`, a 10 s tick timeout and `abortOnDeadline: true`.
-- **Adoption (PR-C).**
+  - **Error text:** stop errors use the loop's text (`Lease tick did not settle…`, `Lease finalize did not settle…`); no caller branches on it. The stop-path debug lines go away, as on the Action.
+  - **Skipped tick:** stop beginning after the RunState read makes `renewLock` return `'skipped'`; the tick changes nothing, as today.
+  - **Renew-then-skip:** a tick that confirms a renewal and then skips its RunState write because stop began clears an earlier tick's failure, so `stop()` reads a fresh snapshot and returns ok. Today the earlier error persists and the caller gets a stale `runEtag`. This is a named improvement.
+- **Adoption (folded into PR-B).**
   - **Trigger:** runs inside the tick body after `renewLock` throws (no confirmed renewal), bounded by the same tick timeout and stop budget.
   - **Gating:** skipped if stopping or superseded.
   - **Read:** uses a lock read that `lock.ts` exports, with the tick's signal when there is one.
   - **Adopt:** takes the stored ETag when the surface's `ownsRecord(stored)` is true and the ETag differs from ours. Clears `hasFailed`, keeps `continuityUnverified` latched, and logs at info.
   - **Absent fields:** `ownsRecord` treats a field that is absent on both sides (such as an optional Action `holder_job`) as a match.
-- **Gateway `acquisition_token` (PR-C).**
+- **Gateway `acquisition_token` (folded into PR-B).**
   - **Generation:** a fresh UUID per acquisition, passed to `acquireLock`.
   - **Carrier:** an optional trailing parameter on `createHeartbeatController` (additive), threaded through `run.ts` and `maintenance-run.ts`. The heartbeat's renewal record includes it.
   - **Rollout:** an older gateway build renews records without the token. Adoption then fails closed for those records (no adoption, the lease falls back to its TTL), and the loop logs it. The gateway is one daemon, so this lasts only for the duration of a deploy.
@@ -199,7 +202,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 
 ### PR-A: loop plus Action (behaviour-neutral)
 
-- [ ] **Unit 1: Golden-trace characterization**
+- [x] **Unit 1: Golden-trace characterization**
 
 **Goal:** Record today's adapter calls and their ordering for both surfaces, so every later unit can prove neutrality.
 
@@ -237,7 +240,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 
 **Verification:** Passes on unchanged code.
 
-- [ ] **Unit 2: Optional abort signal on `conditionalPut` and `renewLease`**
+- [x] **Unit 2: Optional abort signal on `conditionalPut` and `renewLease`**
 
 **Goal:** Requests can be aborted. No caller passes a signal yet.
 
@@ -260,7 +263,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 
 **Verification:** Runtime tests pass. Golden traces are identical.
 
-- [ ] **Unit 3: Runtime lease loop**
+- [x] **Unit 3: Runtime lease loop**
 
 **Goal:** `createLeaseLoop` with contract tests. Not used in production yet.
 
@@ -291,7 +294,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 
 **Verification:** New tests pass. `check-types` passes.
 
-- [ ] **Unit 4: Action on the loop**
+- [x] **Unit 4: Action on the loop**
 
 **Goal:** The Action's renewal uses `createLeaseLoop`. Behaviour is unchanged.
 
@@ -314,7 +317,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 
 ### PR-B: gateway on the loop (tick timeout, abort)
 
-- [ ] **Unit 5: Gateway heartbeat as a RunState layer; abort on for both surfaces**
+- [x] **Unit 5: Gateway heartbeat as a RunState layer; abort on for both surfaces**
 
 **Goal:**
 
@@ -324,7 +327,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 
 **Requirements:** R2, R4, R5, R6
 
-**Files:** `packages/runtime/src/coordination/heartbeat.ts`, `heartbeat.test.ts`, the golden traces, `src/harness/phases/acquire-lock.ts` (`abortOnDeadline: true`), `packages/gateway/src/execute/stale-etag-transition.ts` (signal on its recovery read), `dist/`
+**Files:** `packages/runtime/src/coordination/heartbeat.ts`, `heartbeat.test.ts`, `lease-loop.ts` and `lease-loop.test.ts` (unref an abandoned attempt's timer at stop), the golden traces, `src/harness/phases/acquire-lock.ts` (`abortOnDeadline: true`, signal forwarded to `renewLease`), `packages/gateway/src/execute/stale-etag-transition.ts` (signal on its recovery read), `dist/`
 
 **Approach:**
 
@@ -332,7 +335,8 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 - **`finalize`:** reads the snapshot.
 - **Result mapping:** map the result back to the heartbeat types.
 - **Settings:** a 10 s tick timeout, `unref: false`, `abortOnDeadline: true`.
-- **Action:** turn on `abortOnDeadline`.
+- **Action:** turn on `abortOnDeadline` and forward the signal as `renewLease`'s trailing argument.
+- **Loop:** when `stop()` gives up on a pending attempt, unref that attempt's tick timer.
 - **Deletions:** delete the gateway's duplicate mechanics and the duplicate grace constant.
 - **Rebuild:** rebuild `dist/`.
 
@@ -343,9 +347,13 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 - A late renewal result or late RunState write after a timeout is not applied.
 - The RunState read does not start after stop.
 - The abort signal reaches the RunState read and write, the snapshot, and the Action renewal.
+- After `stop()` gives up on a pending attempt, that attempt's tick timer is unref'd and still records its timeout.
+- Stop beginning after the RunState read skips the tick and keeps an earlier error.
+- A tick that renews and then skips its write because stop began clears an earlier write failure; `stop()` returns ok with the fresh snapshot.
 - **Existing `heartbeat.test.ts` guarantees still pass.** The known adjustments, each listed in the PR:
   - `:365-371`, the five-argument `renewLease` check, gains the explicit scope and signal;
-  - `:154-158`, exact `conditionalPut` options, gains the signal.
+  - `:154-158`, exact `conditionalPut` options, gains the signal;
+  - Action `renewLease` argument assertions gain the signal.
 
 **Verification:**
 
@@ -353,7 +361,9 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
   - gateway tick timeout;
   - abort on both surfaces;
   - read-after-stop;
-  - late results from timed-out gateway ticks.
+  - late results from timed-out gateway ticks;
+  - stop error text (`Heartbeat …` to `Lease …`);
+  - renew-then-skip returns ok.
 - **These pass:**
   - `run.quarantine*.test.ts`
   - `run.lifecycle.test.ts`
@@ -364,9 +374,9 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
   - Action suites
 - **Mocks:** `test-helpers.ts` mocks still compile.
 - **`dist/`:** confirm whether `dist/` changes.
-- **PR note:** an aborted PUT that committed server-side leaves a stale ETag until PR-C's adoption lands. Release 412s and the lease lapses by TTL, as it does today.
+- **PR note:** a renewal dropped by the tick timeout or an abort may have committed server-side. Without adoption the loop would keep a dead ETag for the rest of the run: every later renewal 412s and release lingers to TTL. Units 7-8 ship in the same PR to recover it.
 
-- [ ] **Unit 6: Docs for the shared loop**
+- [x] **Unit 6: Docs for the shared loop**
 
 **Goal:** Docs describe the shared loop and the gateway tick timeout.
 
@@ -381,9 +391,9 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 
 **Verification:** Prettier and the link check pass. The wording describes current state only.
 
-### PR-C: ownership-checked ETag adoption
+### PR-C (folded into PR-B): ownership-checked ETag adoption
 
-- [ ] **Unit 7: Gateway `acquisition_token`**
+- [x] **Unit 7: Gateway `acquisition_token`**
 
 **Goal:** Gateway lock records carry a per-acquisition token.
 
@@ -400,7 +410,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 - Corroborated takeover of a token-bearing record is unchanged.
 - Existing callers without the parameter still compile and behave the same.
 
-- [ ] **Unit 8: Adoption after a failed renewal**
+- [x] **Unit 8: Adoption after a failed renewal**
 
 **Goal:** Recover a renewal that committed but returned an error.
 
@@ -421,6 +431,8 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 - **Gate:** skip if stopping or superseded.
 - **Read:** read the lock with the tick's signal, under the tick timeout and stop budget.
 - **Adopt:** when `ownsRecord(stored)` is true and the ETag differs, adopt it. Clear `hasFailed`, keep the latch, and log at info.
+- **Stop path:** when `stop()` ends on a tick failure or a pending tick, run one adoption read within the remaining stop budget (with its signal), so the returned `lockEtag` is the stored one when the record is ours. A failed or timed-out read changes nothing.
+- **Ownership:** gateway matches `holder_id`, `run_id` and `acquisition_token`; the Action matches `holder_id`, `holder_job` (absent on both sides matches) and `acquisition_token`.
 
 **Test scenarios** (the adoption matrix):
 
@@ -435,10 +447,13 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 - **Absent `holder_job` on both sides:** matches.
 - **Record renewed by an old build without the token:** not adopted, and logged.
 - **Release after adoption:** succeeds.
+- **Renewal committed, then dropped by the tick timeout:** the next tick's renewal 412s, adoption takes the stored ETag, and the following tick renews.
+- **Stop after a dropped committed renewal:** the stop-path read adopts, and release succeeds.
+- **Stop-path read fails, times out, or finds another holder:** `lockEtag` unchanged, and `stop()` still resolves within the budget.
 
 **Verification:** The matrix passes on both surfaces. The integration test is extended. `dist/` is rebuilt. `settle()` stays bounded by the 10 s tick timeout.
 
-- [ ] **Unit 9: Docs for adoption**
+- [x] **Unit 9: Docs for adoption**
 
 **Goal:** Document the adoption rule.
 
@@ -448,7 +463,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 
 ## System-Wide Impact
 
-| Surface | PR-A | PR-B | PR-C |
+| Surface | PR-A | PR-B | PR-B (adoption) |
 | --- | --- | --- | --- |
 | Action | None (traces identical) | A timed-out or budget-expired renewal is aborted instead of abandoned | A renewal that committed but returned an error no longer leaves the lock until the TTL |
 | Gateway | None | A hung tick times out at 10 s and is logged; late results from a timed-out tick are ignored; in-flight I/O is aborted at the deadline; the RunState read doesn't start after stop | Adoption as above; lock records gain `acquisition_token` |
@@ -462,7 +477,7 @@ This rung moves the mechanics into one runtime lease loop. Each surface keeps it
 | Extraction subtly changes Action timing | Golden traces before extraction, existing suites unchanged, abort off for the Action in PR-A, revert-checks |
 | The test mock of `renewLease` is bypassed | The surface injects its `renew` function |
 | Exact-argument assertions break when a signal is added | Pass the signal only when it is defined; list the `:365-371` and `:154-158` adjustments in PR-B |
-| An aborted PUT still commits server-side | Abort only narrows the window. PR-C adoption recovers the committed-but-errored state, and the release CAS keeps it safe until then |
+| An aborted PUT still commits server-side | Abort only narrows the window. Adoption, in the same PR as the timeout, recovers the committed-but-errored state at the next tick and at stop; the release CAS keeps it safe |
 | Adoption takes over a successor's record | `ownsRecord` requires the per-acquisition token on both surfaces |
 | A 10 s gateway tick timeout trips on slow but healthy S3 | It is the same bound the Action runs with. The failure is logged and the next tick retries. Check gateway renewal latency before PR-B ships |
 
