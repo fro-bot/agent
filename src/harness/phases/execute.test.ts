@@ -1664,6 +1664,49 @@ describe('runDrain', () => {
         )
       })
 
+      it('resets the unobservable streak on a pass that observes the child running', async () => {
+        // #given passes 1-2 observe nothing (children fails), pass 3 sees the child live, passes 4-5 observe nothing
+        // again, and on pass 6 the child has finished. Counted without a reset, passes 1-2 and 4-5 would make 3 or
+        // more unobservable passes in a row and drain would give up before pass 6.
+        vi.useFakeTimers()
+        try {
+          const ledger = createOwnershipLedger()
+          ledger.adopt('ses_child', 'background task')
+          let pass = 0
+          const abort = vi.fn(async () => ({data: {}}))
+          const client = {
+            session: {
+              children: async () => {
+                pass += 1
+                if (pass !== 3 && pass !== 6) throw new Error('blip')
+                return {data: [{id: 'ses_child'}]}
+              },
+              status: async () => ({data: pass === 3 ? {ses_child: {}} : {}}),
+              abort,
+            },
+          } as unknown as SessionClient
+          const drain = startDrain(ledger, client, Number.POSITIVE_INFINITY)
+
+          // #when passes 1-5 have run (pass 1 at start, then one per interval)
+          await vi.advanceTimersByTimeAsync(4 * INTERVAL_MS + 500)
+
+          // #then drain is still waiting and has not cancelled
+          expect(pass).toBe(5)
+          expect(drain.outcome()).toBeUndefined()
+          expect(abort).not.toHaveBeenCalled()
+
+          // #when pass 6 sees the child gone
+          await vi.advanceTimersByTimeAsync(INTERVAL_MS)
+
+          // #then it settles; drain completes with no cancellation and no unresolved ownership
+          expect(drain.outcome()).toEqual({expired: false, cancelledCount: 0, settledCount: 0, unknownCount: 0})
+          expect(abort).not.toHaveBeenCalled()
+          expect(ledger.snapshot()).toEqual([{sessionId: 'ses_child', label: 'background task', state: 'settled'}])
+        } finally {
+          vi.useRealTimers()
+        }
+      })
+
       it('keeps waiting until the deadline when the deadline is finite, whatever the unknown streak', async () => {
         // #given the same unreachable server, with a finite deadline
         vi.useFakeTimers()
