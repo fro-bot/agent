@@ -525,20 +525,28 @@ export function createWorkspaceClient(options: WorkspaceClientOptions): Workspac
     request: PreviewRecoveryRequest,
   ): Promise<Result<PreviewRecoveryResult, PreviewRecoveryWorkspaceError>> {
     const body = JSON.stringify(request)
+
+    // Same `setTimeout`-driven abort `update()` uses (not `AbortSignal.timeout`), so the ceiling is
+    // fake-timer-testable and a caller can reason about its overall budget in tests.
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), previewRecoveryTimeoutMs)
+
     let response: Response
     try {
       response = await fetch(`${baseUrl}/recover/preview`, {
         method: 'POST',
         headers: {'Content-Type': 'application/json', Authorization: `Bearer ${token}`},
         body,
-        signal: AbortSignal.timeout(previewRecoveryTimeoutMs),
+        signal: controller.signal,
       })
     } catch (fetchError) {
+      clearTimeout(timer)
       if (fetchError instanceof Error && (fetchError.name === 'TimeoutError' || fetchError.name === 'AbortError')) {
         return err({kind: 'timeout'})
       }
       return err({kind: 'network-error'})
     }
+    clearTimeout(timer)
 
     const httpStatus = response.status
     if (!isPreviewRecoveryResultStatus(httpStatus)) {
@@ -564,20 +572,28 @@ export function createWorkspaceClient(options: WorkspaceClientOptions): Workspac
   ): Promise<Result<ExecuteRecoveryResult, ExecuteRecoveryWorkspaceError>> {
     // SECURITY: body is never logged — it carries the IAT, same discipline as clone()/update().
     const body = JSON.stringify(request)
+
+    // A timeout here aborts the request, which the workspace honors up to the quarantine rename
+    // (apps/workspace-agent recover.ts) — the same `setTimeout`-driven form `update()` uses.
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), recoverTimeoutMs)
+
     let response: Response
     try {
       response = await fetch(`${baseUrl}/recover`, {
         method: 'POST',
         headers: {'Content-Type': 'application/json', Authorization: `Bearer ${token}`},
         body,
-        signal: AbortSignal.timeout(recoverTimeoutMs),
+        signal: controller.signal,
       })
     } catch (fetchError) {
+      clearTimeout(timer)
       if (fetchError instanceof Error && (fetchError.name === 'TimeoutError' || fetchError.name === 'AbortError')) {
         return err({kind: 'timeout'})
       }
       return err({kind: 'network-error'})
     }
+    clearTimeout(timer)
 
     const httpStatus = response.status
     if (!isExecuteRecoveryResultStatus(httpStatus)) {
@@ -1107,6 +1123,9 @@ function isExecuteRecoveryResult(value: unknown, status: number): value is Execu
 // GET/DELETE /backups response parsing
 // ---------------------------------------------------------------------------
 
+/** Mirrors the gateway run id format (`crypto.randomUUID()`), matching the workspace's own check. */
+const RUN_ID_PATTERN = /^[\w-]{1,128}$/
+
 function isBackupEntry(value: unknown): value is BackupEntry {
   if (typeof value !== 'object' || value === null) return false
   const v = value as Record<string, unknown>
@@ -1117,6 +1136,8 @@ function isBackupEntry(value: unknown): value is BackupEntry {
   if (typeof v.sizeComplete !== 'boolean') return false
   if (v.originalHeadSha !== undefined && !isValidSha(v.originalHeadSha)) return false
   if (v.originalBranch !== undefined && typeof v.originalBranch !== 'string') return false
+  // Rendered into a Discord message, so an unsafe shape is rejected rather than trusted.
+  if (v.runId !== undefined && (typeof v.runId !== 'string' || !RUN_ID_PATTERN.test(v.runId))) return false
   return true
 }
 

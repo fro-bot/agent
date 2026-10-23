@@ -1730,6 +1730,73 @@ describe('WorkspaceClient.previewRecovery', () => {
   })
 })
 
+describe('WorkspaceClient.previewRecovery — deadline', () => {
+  it('aborts at the 45s ceiling under fake timers, not before', async () => {
+    // #given
+    vi.useFakeTimers()
+    const client = makeClient()
+    vi.stubGlobal('fetch', mockHangingFetch())
+
+    // #when
+    const resultPromise = client.previewRecovery(makePreviewRecoveryRequest())
+    let settled = false
+    resultPromise.then(
+      () => {
+        settled = true
+      },
+      () => {
+        settled = true
+      },
+    )
+    await vi.advanceTimersByTimeAsync(44_999)
+    const settledEarly = settled
+    await vi.advanceTimersByTimeAsync(1)
+    const result = await resultPromise
+
+    // #then
+    expect(settledEarly).toBe(false)
+    expect(result).toEqual(err({kind: 'timeout'}))
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+
+  it('honours a configured previewRecoveryTimeoutMs', async () => {
+    // #given
+    vi.useFakeTimers()
+    const client = createWorkspaceClient({
+      baseUrl: 'http://workspace:9100',
+      token: TEST_TOKEN,
+      previewRecoveryTimeoutMs: 2_000,
+    })
+    vi.stubGlobal('fetch', mockHangingFetch())
+
+    // #when
+    const resultPromise = client.previewRecovery(makePreviewRecoveryRequest())
+    await vi.advanceTimersByTimeAsync(2_000)
+    const result = await resultPromise
+
+    // #then
+    expect(result).toEqual(err({kind: 'timeout'}))
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+
+  it('clears its timer once the response arrives, so no abort fires later', async () => {
+    // #given
+    vi.useFakeTimers()
+    const client = makeClient()
+    vi.stubGlobal('fetch', mockFetch({ok: false, status: 404, json: async () => ({kind: 'no-checkout'})}))
+
+    // #when
+    await client.previewRecovery(makePreviewRecoveryRequest())
+
+    // #then
+    expect(vi.getTimerCount()).toBe(0)
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+})
+
 // ---------------------------------------------------------------------------
 // recover tests
 // ---------------------------------------------------------------------------
@@ -1807,6 +1874,101 @@ describe('WorkspaceClient.recover', () => {
   })
 })
 
+describe('WorkspaceClient.recover — run attribution and deadline', () => {
+  const RUN_ID = '3f2b8c1e-5d4a-4b7e-9a10-6c2d8e4f1a23'
+
+  it('sends the optional runId in the request body', async () => {
+    // #given
+    const client = makeClient()
+    const fetchMock = mockFetch({ok: false, status: 404, json: async () => ({kind: 'no-checkout'})})
+    vi.stubGlobal('fetch', fetchMock)
+
+    // #when
+    await client.recover(makeExecuteRecoveryRequest({runId: RUN_ID}))
+
+    // #then
+    const init = fetchMock.mock.calls[0]?.[1] as {body: string}
+    expect(JSON.parse(init.body)).toMatchObject({runId: RUN_ID})
+    vi.unstubAllGlobals()
+  })
+
+  it('sends no runId key when the request carries none', async () => {
+    // #given
+    const client = makeClient()
+    const fetchMock = mockFetch({ok: false, status: 404, json: async () => ({kind: 'no-checkout'})})
+    vi.stubGlobal('fetch', fetchMock)
+
+    // #when
+    await client.recover(makeExecuteRecoveryRequest())
+
+    // #then
+    const init = fetchMock.mock.calls[0]?.[1] as {body: string}
+    expect(JSON.parse(init.body)).not.toHaveProperty('runId')
+    vi.unstubAllGlobals()
+  })
+
+  it('aborts at the 5 minute ceiling under fake timers, not before', async () => {
+    // #given
+    vi.useFakeTimers()
+    const client = makeClient()
+    vi.stubGlobal('fetch', mockHangingFetch())
+
+    // #when
+    const resultPromise = client.recover(makeExecuteRecoveryRequest())
+    let settled = false
+    resultPromise.then(
+      () => {
+        settled = true
+      },
+      () => {
+        settled = true
+      },
+    )
+    await vi.advanceTimersByTimeAsync(299_999)
+    const settledEarly = settled
+    await vi.advanceTimersByTimeAsync(1)
+    const result = await resultPromise
+
+    // #then
+    expect(settledEarly).toBe(false)
+    expect(result).toEqual(err({kind: 'timeout'}))
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+
+  it('honours a configured recoverTimeoutMs', async () => {
+    // #given
+    vi.useFakeTimers()
+    const client = createWorkspaceClient({baseUrl: 'http://workspace:9100', token: TEST_TOKEN, recoverTimeoutMs: 3_000})
+    vi.stubGlobal('fetch', mockHangingFetch())
+
+    // #when
+    const resultPromise = client.recover(makeExecuteRecoveryRequest())
+    await vi.advanceTimersByTimeAsync(3_000)
+    const result = await resultPromise
+
+    // #then
+    expect(result).toEqual(err({kind: 'timeout'}))
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+
+  it('clears its timer once the response arrives, so no abort fires later', async () => {
+    // #given
+    vi.useFakeTimers()
+    const client = makeClient()
+    vi.stubGlobal('fetch', mockFetch({ok: false, status: 404, json: async () => ({kind: 'no-checkout'})}))
+
+    // #when
+    await client.recover(makeExecuteRecoveryRequest())
+
+    // #then
+    expect(vi.getTimerCount()).toBe(0)
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+})
+
 // ---------------------------------------------------------------------------
 // listBackups tests
 // ---------------------------------------------------------------------------
@@ -1830,6 +1992,44 @@ describe('WorkspaceClient.listBackups', () => {
         'http://workspace:9100/backups/testowner/testrepo',
         expect.objectContaining({method: 'GET', headers: {Authorization: `Bearer ${TEST_TOKEN}`}}),
       )
+      vi.unstubAllGlobals()
+    })
+  })
+
+  describe('run attribution', () => {
+    const entry = {
+      id: 'gen-1',
+      metadataOk: true,
+      createdAt: '2026-10-22T00:00:00.000Z',
+      sizeBytes: 10,
+      sizeComplete: true,
+    }
+
+    it('passes a backup entry carrying a runId through', async () => {
+      const client = makeClient()
+      const body = {kind: 'ok', backups: [{...entry, runId: '3f2b8c1e-5d4a-4b7e-9a10-6c2d8e4f1a23'}], totalBytes: 10}
+      vi.stubGlobal('fetch', mockFetch({ok: true, status: 200, json: async () => body}))
+      expect(await client.listBackups('testowner', 'testrepo')).toEqual(ok(body))
+      vi.unstubAllGlobals()
+    })
+
+    it('still accepts a backup entry with no runId (metadata written before attribution)', async () => {
+      const client = makeClient()
+      const body = {kind: 'ok', backups: [entry], totalBytes: 10}
+      vi.stubGlobal('fetch', mockFetch({ok: true, status: 200, json: async () => body}))
+      expect(await client.listBackups('testowner', 'testrepo')).toEqual(ok(body))
+      vi.unstubAllGlobals()
+    })
+
+    it.each([
+      ['a non-string', 42],
+      ['an empty string', ''],
+      ['an unsafe string', '`](http://evil)\n'],
+    ])('rejects %s runId as a parse-error rather than rendering it', async (_label, runId) => {
+      const client = makeClient()
+      const body = {kind: 'ok', backups: [{...entry, runId}], totalBytes: 10}
+      vi.stubGlobal('fetch', mockFetch({ok: true, status: 200, json: async () => body}))
+      expect(await client.listBackups('testowner', 'testrepo')).toEqual(err({kind: 'parse-error'}))
       vi.unstubAllGlobals()
     })
   })
