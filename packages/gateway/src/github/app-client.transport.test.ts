@@ -38,6 +38,9 @@ interface FakeGitHub {
   readonly installationBehaviour: {current: Behaviour}
   readonly tokenBehaviour: {current: Behaviour}
   readonly permissions: {current: Record<string, string>}
+  /** When true, the NEXT discovery request is held until `releaseHeldDiscovery` is called (or its signal aborts). */
+  readonly holdNextDiscovery: {current: boolean}
+  readonly releaseHeldDiscovery: {current: (() => void) | undefined}
 }
 
 function json(body: unknown): Response {
@@ -63,6 +66,8 @@ function installFakeGitHub(): FakeGitHub {
     installationBehaviour: {current: 'respond'},
     tokenBehaviour: {current: 'respond'},
     permissions: {current: {contents: 'read'}},
+    holdNextDiscovery: {current: false},
+    releaseHeldDiscovery: {current: undefined},
   }
   vi.stubGlobal('fetch', async (input: string | URL | Request, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
@@ -85,6 +90,18 @@ function installFakeGitHub(): FakeGitHub {
       })
     }
     if (url.endsWith('/installation')) {
+      if (state.holdNextDiscovery.current) {
+        state.holdNextDiscovery.current = false
+        return new Promise<Response>((resolve, reject) => {
+          const signal = init?.signal
+          signal?.addEventListener('abort', () => {
+            reject(signal.reason)
+          })
+          state.releaseHeldDiscovery.current = () => {
+            resolve(json({id: 99, permissions: state.permissions.current}))
+          }
+        })
+      }
       if (state.installationBehaviour.current === 'hang') return hang(init?.signal)
       return json({id: 99, permissions: state.permissions.current})
     }
@@ -187,21 +204,29 @@ describe('authForRepo at the transport boundary', () => {
   })
 
   it('a warm discovery cache still bounds the token POST', async () => {
-    // #given a first call populates the discovery cache
+    // #given a first call populates the discovery cache (and has sent the first token POST)
     const client = makeClient()
     expect((await client.authForRepo('foo', 'bar')).success).toBe(true)
     expect(discoveries(github)).toHaveLength(1)
+    expect(tokenPosts(github)).toHaveLength(1)
 
-    // #when the second call's token request hangs
+    // #when the second call's token request hangs: wait for ITS POST (the second one) to reach fetch
     github.tokenBehaviour.current = 'hang'
     const deadline = controllableDeadlines()
     const pending = client.authForRepo('foo', 'bar')
-    await untilSeen(1, () => tokenPosts(github))
+    await untilSeen(2, () => tokenPosts(github))
+
+    // #then the second POST carries a live signal, and no new discovery ran
+    const secondPost = tokenPosts(github)[1]
+    expect(secondPost?.signal?.aborted).toBe(false)
+    expect(discoveries(github)).toHaveLength(1)
+
+    // #when its deadline fires
     deadline.fire()
     const result = await settleWithin(pending)
 
-    // #then no new discovery ran, and the mint was aborted at the deadline
-    expect(discoveries(github)).toHaveLength(1)
+    // #then that POST was cancelled and the call ended as a timeout
+    expect(secondPost?.signal?.aborted).toBe(true)
     expect(result).not.toBe('pending')
     if (result === 'pending') return
     expect(result.success === false && result.error instanceof AuthTimeoutError).toBe(true)
@@ -265,6 +290,9 @@ describe('authForRepo at the transport boundary', () => {
     deadline.fire()
     await settleWithin(first)
     expect(tokenPosts(github)).toHaveLength(1)
+    // the caller is released at its deadline; the library clears its pending entry a few ticks later,
+    // once the aborted request has rejected
+    await tick()
 
     // #when the retry runs against a healthy transport
     github.tokenBehaviour.current = 'respond'
@@ -309,6 +337,87 @@ describe('authForRepo at the transport boundary', () => {
     const later = await settleWithin(makeClient().authForRepo('foo', 'bar'))
     expect(tokenPosts(github)).toHaveLength(before + 1)
     expect(later === 'pending' ? undefined : later.success).toBe(true)
+  })
+})
+
+describe("a caller that joins another caller's mint is bounded by its OWN deadline", () => {
+  let github: FakeGitHub
+
+  beforeEach(() => {
+    github = installFakeGitHub()
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+  })
+
+  it('the earlier-deadline caller joins a POST owned by the later-deadline caller, and settles at its own deadline', async () => {
+    // #given A (earlier deadline) is held in a slow discovery
+    github.holdNextDiscovery.current = true
+    const deadline = controllableDeadlines()
+    const callerA = makeClient().authForRepo('foo', 'bar')
+    await untilSeen(1, () => discoveries(github))
+
+    // #and B (later deadline) discovers at once and owns the token POST, which hangs
+    github.tokenBehaviour.current = 'hang'
+    const callerB = makeClient().authForRepo('foo', 'bar')
+    await untilSeen(1, () => tokenPosts(github))
+    expect(deadline.controllers).toHaveLength(2)
+
+    // #and A finishes discovery and joins B's request instead of sending its own
+    github.releaseHeldDiscovery.current?.()
+    await tick()
+    await tick()
+    expect(tokenPosts(github)).toHaveLength(1)
+    const ownerPost = tokenPosts(github)[0]
+
+    // #when only A's deadline fires
+    deadline.fire(0)
+    const resultA = await settleWithin(callerA, 500)
+
+    // #then A settles as a timeout at its OWN deadline, while B's request is still pending and live
+    expect(resultA).not.toBe('pending')
+    if (resultA === 'pending') return
+    expect(resultA.success === false && resultA.error instanceof AuthTimeoutError).toBe(true)
+    expect(ownerPost?.signal?.aborted).toBe(false)
+    expect(await settleWithin(callerB, 100)).toBe('pending')
+
+    // #when B's own deadline fires
+    deadline.fire(1)
+    const resultB = await settleWithin(callerB)
+
+    // #then the owner settles at its own deadline and its POST is cancelled
+    expect(ownerPost?.signal?.aborted).toBe(true)
+    expect(resultB).not.toBe('pending')
+    if (resultB === 'pending') return
+    expect(resultB.success === false && resultB.error instanceof AuthTimeoutError).toBe(true)
+  })
+
+  it('an already-expired deadline settles at once, and a late result is not an unhandled rejection', async () => {
+    // #given the deadline has passed before the call starts
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown) => {
+      unhandled.push(reason)
+    }
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      github.tokenBehaviour.current = 'hang'
+      const deadline = controllableDeadlines()
+      deadline.spy.mockImplementation(() => AbortSignal.abort(new DOMException('already', 'TimeoutError')))
+
+      // #when
+      const result = await settleWithin(makeClient().authForRepo('foo', 'bar'), 500)
+      await tick()
+
+      // #then
+      expect(result).not.toBe('pending')
+      if (result === 'pending') return
+      expect(result.success === false && result.error instanceof AuthTimeoutError).toBe(true)
+      expect(unhandled).toEqual([])
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
   })
 })
 

@@ -38,10 +38,12 @@ function describeThrown(thrown: unknown): string {
 }
 
 /**
- * Backstop for a mint that ignores its deadline. `authForRepo` now aborts its own requests at
- * `INSTALLATION_TOKEN_MINT_TIMEOUT_MS` and returns an `AuthTimeoutError` Result, so a stalled GitHub
- * call ends at the source. This race still bounds anything that does not honour a signal (a test
- * adapter, future code), so the repo lock never depends on every mint being well behaved.
+ * Backstop for a mint that ignores its deadline. `authForRepo` aborts its own requests at
+ * `INSTALLATION_TOKEN_MINT_TIMEOUT_MS` and also releases each caller at that caller's own deadline,
+ * even when it joined another caller's coalesced request, so it returns an `AuthTimeoutError` Result at
+ * the bound whatever the transport does. This race is therefore redundant for `authForRepo` callers; it
+ * remains so the repo lock never depends on every mint being well behaved (a test adapter, a future
+ * mint that honours no signal).
  *
  * A mint that fails keeps its failure (a `401` stays permanent). A mint that does not answer in time,
  * or throws (even synchronously), is a transient `network-error`: nothing says the installation is

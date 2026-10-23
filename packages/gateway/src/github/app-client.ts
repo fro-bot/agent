@@ -218,6 +218,47 @@ export interface AppClientOptions {
 // ---------------------------------------------------------------------------
 
 /**
+ * Bounds one caller's wait by that caller's OWN deadline, separately from the shared transport.
+ *
+ * Cancelling the transport is not enough: `@octokit/auth-app` coalesces in-flight installation-token
+ * requests across callers whatever their signals, so a caller whose discovery finished late can join a
+ * request owned by a caller with a later deadline, and its own signal cannot cancel that wait. This race
+ * settles the caller with an `AuthTimeoutError` Result the moment its signal fires (at once if it already
+ * has), whatever the shared request is doing. The transport cancellation is kept: the signal still aborts
+ * the requests this caller owns.
+ *
+ * The abort listener is removed when the work settles first, and a rejection of work that loses the race
+ * is swallowed here, so a late failure is never unhandled.
+ */
+async function settleByDeadline<T, E extends Error>(
+  work: Promise<Result<T, E>>,
+  signal: AbortSignal,
+): Promise<Result<T, E | AuthTimeoutError>> {
+  return new Promise(resolve => {
+    const onAbort = (): void => {
+      resolve(err(new AuthTimeoutError()))
+    }
+    if (signal.aborted) {
+      onAbort()
+    } else {
+      signal.addEventListener('abort', onAbort, {once: true})
+    }
+    work
+      .then(
+        result => {
+          resolve(result)
+        },
+        (error: unknown) => {
+          resolve(err(new AuthError(safeErrorMessage(error))))
+        },
+      )
+      .finally(() => {
+        signal.removeEventListener('abort', onAbort)
+      })
+  })
+}
+
+/**
  * Whether a failed request ended because the call's deadline expired. The signal being aborted is the
  * direct evidence. A mint can also end with another caller's expiry: `@octokit/auth-app` shares one
  * in-flight token request between concurrent callers with the same options, so a caller that joined
@@ -347,19 +388,24 @@ export function createAppClient(options: AppClientOptions): AppClient {
     // One deadline for the whole call, shared by discovery and the mint, so the requests are aborted
     // when it expires. An abort comes back as an `AuthTimeoutError` Result, never a throw.
     const deadline = AbortSignal.timeout(INSTALLATION_TOKEN_MINT_TIMEOUT_MS)
-    const installationResult = await discoverInstallation(owner, repo, deadline)
-    if (installationResult.success === false) return installationResult
-    return mintToken(owner, repo, installationResult.data, {contents: 'read'}, deadline)
+    return settleByDeadline(
+      (async () => {
+        const installationResult = await discoverInstallation(owner, repo, deadline)
+        if (installationResult.success === false) return installationResult
+        return mintToken(owner, repo, installationResult.data, {contents: 'read'}, deadline)
+      })(),
+      deadline,
+    )
   }
 
   async function authForWorkflowDispatch(
     owner: string,
     repo: string,
   ): Promise<Result<AppClientAuthResult, AppNotInstalledError | InsufficientPermissionsError | AuthError>> {
-    const installationResult = await discoverInstallation(
-      owner,
-      repo,
-      AbortSignal.timeout(WORKFLOW_DISPATCH_AUTH_TIMEOUT_MS),
+    const discoveryDeadline = AbortSignal.timeout(WORKFLOW_DISPATCH_AUTH_TIMEOUT_MS)
+    const installationResult = await settleByDeadline(
+      discoverInstallation(owner, repo, discoveryDeadline),
+      discoveryDeadline,
     )
     if (installationResult.success === false) return installationResult
 
@@ -375,12 +421,10 @@ export function createAppClient(options: AppClientOptions): AppClient {
       return err(permissionResult)
     }
 
-    return mintToken(
-      owner,
-      repo,
-      installationResult.data,
-      {actions: 'write'},
-      AbortSignal.timeout(WORKFLOW_DISPATCH_AUTH_TIMEOUT_MS),
+    const mintDeadline = AbortSignal.timeout(WORKFLOW_DISPATCH_AUTH_TIMEOUT_MS)
+    return settleByDeadline(
+      mintToken(owner, repo, installationResult.data, {actions: 'write'}, mintDeadline),
+      mintDeadline,
     )
   }
 
