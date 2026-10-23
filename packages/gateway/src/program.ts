@@ -19,6 +19,7 @@ import type {PushHealthStatus} from './web/operator-push/push-health.js'
 import type {OperatorPushSubscriptionStore} from './web/operator-push/subscription-store.js'
 import type {VapidPublicKeyInfo} from './web/operator-push/vapid.js'
 import type {OperatorServerConfig, OperatorServerDeps} from './web/server.js'
+import type {WorkspaceClientOptions} from './workspace-api/client.js'
 import {Buffer} from 'node:buffer'
 import {
   createS3Adapter,
@@ -47,13 +48,15 @@ import {handleQuestionInteraction} from './discord/question-interactions.js'
 import {parseQuestionCustomId} from './discord/questions.js'
 import {handleRecoverEntryButtonClick, parseRecoverEntryCustomId} from './discord/recover-checkout-button.js'
 import {abortRegistry} from './execute/abort-registry.js'
+import {totalRecoveryBudgetMs} from './execute/checkout-recovery.js'
 import {createConcurrencyRegistry} from './execute/concurrency.js'
 import {createChannelQueue, DEFAULT_MAX_QUEUE_DEPTH} from './execute/queue.js'
 import {recoverStaleRuns} from './execute/recovery.js'
 import {createRepoQuiescenceChecker} from './execute/repo-quiescence.js'
 import {createRunIndex} from './execute/run-index.js'
 import {getInFlightRuns} from './execute/run.js'
-import {AppNotInstalledError, createAppClient, InsufficientPermissionsError} from './github/app-client.js'
+import {createWorkspaceCalls} from './execute/workspace-calls.js'
+import {createAppClient} from './github/app-client.js'
 import {createWorkflowDispatcher} from './github/dispatch.js'
 import {createRateLimiter} from './http/rate-limit.js'
 import {createDenylistCache} from './redaction/denylist.js'
@@ -488,10 +491,15 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       logger: addProjectLogger,
     })
     const dispatchWorkflow = createWorkflowDispatcher({appClient, logger})
-    const workspaceClient = createWorkspaceClient({
+    const workspaceClientOptions: WorkspaceClientOptions = {
       baseUrl: config.workspaceAgentUrl,
       token: config.workspaceOpencodeToken,
-    })
+    }
+    const workspaceClient = createWorkspaceClient(workspaceClientOptions)
+
+    // The workspace calls that need an installation token (`update`, `recover`), with every mint bounded
+    // (execute/workspace-calls.ts).
+    const workspaceCalls = createWorkspaceCalls({appClient, workspaceClient, logger})
 
     // One workspace quiescence checker shared by acquisition, maintenance, recovery and operator release.
     const checkRepoQuiescence = createRepoQuiescenceChecker({
@@ -815,20 +823,15 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           },
         }),
       // Prepare the checkout via /update under the repo lock (see run.ts). A permanent
-      // installation failure maps to 401 (no retry); any other token-mint failure is retryable.
-      update: async (owner: string, repo: string, options: {readonly remainingBudgetMs: number}) => {
-        const authResult = await appClient.authForRepo(owner, repo)
-        if (authResult.success === false) {
-          if (
-            authResult.error instanceof AppNotInstalledError ||
-            authResult.error instanceof InsufficientPermissionsError
-          ) {
-            return err({kind: 'http-error' as const, status: 401})
-          }
-          return err({kind: 'network-error' as const})
-        }
-        return workspaceClient.update({owner, repo, token: authResult.data.token}, options)
-      },
+      // installation failure maps to 401 (no retry); any other token-mint failure, including a mint
+      // that does not answer within its bound, is retryable (execute/update-workspace.ts).
+      update: workspaceCalls.update,
+      // Automatic recovery of a dirty checkout (see execute/checkout-recovery.ts), run under the same
+      // repo lock. Preview mints no token; recover mints one (execute/recovery-workspace.ts).
+      previewRecovery: workspaceCalls.previewRecovery,
+      recover: workspaceCalls.recover,
+      listBackups: async (owner: string, repo: string) => workspaceClient.listBackups(owner, repo),
+      recoveryBudgetMs: totalRecoveryBudgetMs(workspaceClientOptions),
       // Shutdown gate: suppress handoff to next queued task once SIGTERM fires.
       // The in-memory queue is lossy by design; dropping pending tasks on graceful
       // shutdown matches that contract and is consistent with the messageCreate

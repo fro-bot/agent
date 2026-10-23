@@ -15,9 +15,15 @@ import type {CloneSuccess, CloneWorkspaceError} from './types.js'
 import {err, ok} from '@fro-bot/runtime'
 import {describe, expect, it, vi} from 'vitest'
 
-import {AppNotInstalledError, AuthError, InsufficientPermissionsError} from '../github/app-client.js'
+import {
+  AppNotInstalledError,
+  AuthError,
+  AuthTimeoutError,
+  INSTALLATION_TOKEN_MINT_TIMEOUT_MS,
+  InsufficientPermissionsError,
+} from '../github/app-client.js'
 import {workspaceRepoPath} from './client.js'
-import {ensureWorkspaceClone} from './ensure-clone.js'
+import {DEFAULT_ENSURE_CLONE_AUTH_TIMEOUT_MS, ensureWorkspaceClone} from './ensure-clone.js'
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -273,6 +279,28 @@ describe('ensureWorkspaceClone', () => {
       // #then
       const failure = assertFailure(result)
       expect(failure).toMatchObject({kind: 'auth-failure', reason: 'insufficient-permissions'})
+    })
+
+    it('an AuthTimeoutError from the source deadline keeps the reason "timeout" the clone path always reported for a stall', async () => {
+      // #given authForRepo now aborts its own requests at the deadline and returns this typed AuthError
+      const appClient = makeAppClient(err(new AuthTimeoutError()))
+
+      // #when
+      const result = await ensureWorkspaceClone({
+        owner: 'testowner',
+        repo: 'testrepo',
+        appClient,
+        workspaceClient: makeWorkspaceClient(),
+        logger: makeLogger(),
+      })
+
+      // #then
+      expect(assertFailure(result)).toMatchObject({kind: 'auth-failure', reason: 'timeout'})
+    })
+
+    it('its default auth timeout is the 30 s source deadline, pinned to the literal', () => {
+      expect(INSTALLATION_TOKEN_MINT_TIMEOUT_MS).toBe(30_000)
+      expect(DEFAULT_ENSURE_CLONE_AUTH_TIMEOUT_MS).toBe(30_000)
     })
 
     it('no positive evidence — a plain AuthError (e.g. discovery 5xx/network/rate-limit) stays reason "auth-error" (transient default)', async () => {

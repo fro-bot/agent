@@ -66,6 +66,8 @@ interface StartOptions {
   readonly abort?: () => Promise<unknown>
   /** Called by every `sink.append`; throwing from it makes the event loop body throw. */
   readonly onAppend?: () => void
+  /** The gateway run id threaded into `runOpenCodeCore`; omitted by default. */
+  readonly runId?: string
 }
 
 interface Run {
@@ -77,6 +79,7 @@ interface Run {
   readonly emit: (event: object) => void
   readonly abort: ReturnType<typeof vi.fn>
   readonly status: ReturnType<typeof vi.fn>
+  readonly logger: GatewayLogger
 }
 
 function startRun(options: StartOptions = {}): Run {
@@ -129,6 +132,7 @@ function startRun(options: StartOptions = {}): Run {
     shutdown: vi.fn(),
   } as unknown as OpenCodeServerHandle
 
+  const logger = makeLogger()
   let settled: Outcome | undefined
   const done = runOpenCodeCore({
     handle,
@@ -136,8 +140,9 @@ function startRun(options: StartOptions = {}): Run {
     promptText: 'Fix the bug please',
     sink: makeSink(options.onAppend),
     signal: (options.controller ?? new AbortController()).signal,
-    logger: makeLogger(),
+    logger,
     coordinator: makeCoordinator(),
+    ...(options.runId === undefined ? {} : {runId: options.runId}),
     ...(options.ownershipLedger === undefined ? {} : {ownershipLedger: options.ownershipLedger}),
     ...(options.inactivityTimeoutMs === undefined ? {} : {inactivityTimeoutMs: options.inactivityTimeoutMs}),
   }).then(
@@ -174,6 +179,7 @@ function startRun(options: StartOptions = {}): Run {
     },
     abort: client.session.abort,
     status: client.session.status,
+    logger,
   }
 }
 
@@ -515,5 +521,62 @@ describe('an error from the event loop that is not a RunCoreError', () => {
     expect(error.kind).toBe('session-error')
     expect(error.quarantined).toBe(false)
     expect(run.abort).not.toHaveBeenCalled()
+  })
+})
+
+/** Context of every barrier-owned log line: the settle logs plus the barrier's own quarantine line. */
+function barrierContexts(run: Run): readonly Record<string, unknown>[] {
+  const levels = ['info', 'warn', 'error'] as const
+  return levels.flatMap(level =>
+    (run.logger[level] as unknown as ReturnType<typeof vi.fn>).mock.calls
+      .filter(call => {
+        const message = call[1] as string
+        return message.startsWith('settle-owned-sessions:') || message.startsWith('run-core: owned work could not')
+      })
+      .map(call => call[0] as Record<string, unknown>),
+  )
+}
+
+describe('run id on the termination barrier logs', () => {
+  const RUN_ID = 'run-1889-core'
+
+  it('threads the run id into the settle logs when a stopped root is confirmed quiescent', async () => {
+    // #given an operator cancel: the root may still be running, so the barrier aborts and confirms it
+    const controller = new AbortController()
+    const run = startRun({controller, runId: RUN_ID})
+    await vi.advanceTimersByTimeAsync(100)
+    controller.abort('operator cancel')
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    // #then the barrier's opening and closing log lines both name the run
+    expect(failure(run).quarantined).toBe(false)
+    const contexts = barrierContexts(run)
+    expect(contexts.length).toBeGreaterThanOrEqual(2)
+    for (const context of contexts) {
+      expect(context.runId).toBe(RUN_ID)
+    }
+  })
+
+  it('threads the run id into the quarantine logs when the root cannot be confirmed stopped', async () => {
+    // #given a root that stays live after the abort
+    const controller = new AbortController()
+    const run = startRun({controller, runId: RUN_ID, statuses: [{[ROOT]: {type: 'busy'}}]})
+    await vi.advanceTimersByTimeAsync(100)
+    controller.abort('operator cancel')
+    await vi.advanceTimersByTimeAsync(PAST_SETTLE_BOUND_MS)
+
+    // #then the unconfirmed-settlement error and the run-core quarantine error both name the run
+    expect(failure(run).quarantined).toBe(true)
+    const errorContexts = (run.logger.error as unknown as ReturnType<typeof vi.fn>).mock.calls
+      .filter(call => {
+        const message = call[1] as string
+        return message.startsWith('settle-owned-sessions:') || message.startsWith('run-core: owned work could not')
+      })
+      .map(call => call[0] as Record<string, unknown>)
+    expect(errorContexts.length).toBeGreaterThanOrEqual(2)
+    for (const context of errorContexts) {
+      expect(context.runId).toBe(RUN_ID)
+    }
+    expect(barrierContexts(run).every(context => context.runId === RUN_ID)).toBe(true)
   })
 })

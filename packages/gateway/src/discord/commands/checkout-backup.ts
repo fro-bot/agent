@@ -44,14 +44,15 @@ export function getBackupDeleteNonceRegistryForTesting(): typeof deleteNonceRegi
   return deleteNonceRegistry
 }
 
-/** Plan's exact list-row text: `<id> · <date> · <size> · from branch <branch> at <short-sha>`. */
+/** Plan's exact list-row text: `<id> · <date> · <size> · from branch <branch> at <short-sha>`, plus ` · run <runId>` when the backup is attributed to a run. */
 function formatListRow(entry: BackupEntry): string {
   const branch = entry.originalBranch === undefined ? 'unknown' : formatBranchForReply(entry.originalBranch)
   const sha = entry.originalHeadSha === undefined ? 'unknown' : entry.originalHeadSha.slice(0, 7)
   const size = entry.sizeComplete
     ? formatBinaryBytes(entry.sizeBytes)
     : `at least ${formatBinaryBytes(entry.sizeBytes)}`
-  return `\`${entry.id}\` · ${entry.createdAt} · ${size} · from branch \`${branch}\` at \`${sha}\``
+  const run = entry.runId === undefined ? '' : ` · run \`${entry.runId}\``
+  return `\`${entry.id}\` · ${entry.createdAt} · ${size} · from branch \`${branch}\` at \`${sha}\`${run}`
 }
 
 function parseDeleteConfirmCustomId(customId: string): {action: 'confirm' | 'cancel'; nonce: string} | null {

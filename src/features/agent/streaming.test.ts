@@ -1757,6 +1757,103 @@ describe('processEventStream — shared provider-failure stop rule', () => {
   })
 })
 
+async function flushedText(events: readonly Event[], ledger?: ReturnType<typeof createOwnershipLedger>) {
+  consoleMocks.outputTextContent.mockClear()
+  await processEventStream(
+    createMockEventStream(events),
+    ROOT_SESSION_ID,
+    new AbortController().signal,
+    createMockLogger(),
+    undefined,
+    undefined,
+    undefined,
+    ledger,
+  )
+  return consoleMocks.outputTextContent.mock.calls.map(call => call[0] as string)
+}
+
+describe('processEventStream — reasoning deltas stay out of the response text', () => {
+  const reasoningPart = (id: string, sessionID = ROOT_SESSION_ID): Event =>
+    ({
+      type: 'message.part.updated',
+      properties: {sessionID, part: {id, type: 'reasoning', sessionID, text: ''}},
+    }) as unknown as Event
+  const delta = (text: string, partID: string | undefined, sessionID = ROOT_SESSION_ID): Event =>
+    ({
+      type: 'message.part.delta',
+      properties: {sessionID, ...(partID === undefined ? {} : {partID}), delta: text, field: 'text'},
+    }) as unknown as Event
+
+  it('excludes the deltas of a part registered as reasoning, and keeps response text', async () => {
+    // #given a reasoning part, its deltas, then a response part's deltas, with no final text part
+    const events = [
+      reasoningPart('prt_reasoning'),
+      delta('secret thinking ', 'prt_reasoning'),
+      delta('more thinking', 'prt_reasoning'),
+      delta('the answer', 'prt_text'),
+    ]
+
+    // #when
+    const flushed = await flushedText(events)
+
+    // #then only the response text reaches the log
+    expect(flushed).toEqual(['the answer'])
+  })
+
+  it('excludes object-shaped deltas of a reasoning part, and keeps object-shaped deltas of a text part', async () => {
+    // #given deltas shaped {type: 'text', text} instead of a plain string, on a reasoning part and on a text part
+    const objectDelta = (text: string, partID: string): Event =>
+      ({
+        type: 'message.part.delta',
+        properties: {sessionID: ROOT_SESSION_ID, partID, delta: {type: 'text', text}},
+      }) as unknown as Event
+    const events = [
+      reasoningPart('prt_reasoning'),
+      objectDelta('secret thinking', 'prt_reasoning'),
+      objectDelta('the answer', 'prt_text'),
+    ]
+
+    // #when
+    const flushed = await flushedText(events)
+
+    // #then the reasoning text is excluded whatever the delta's shape
+    expect(flushed).toEqual(['the answer'])
+  })
+
+  it('keeps accumulating deltas of parts that are not reasoning', async () => {
+    // #given
+    const events = [delta('one ', 'prt_text'), delta('two', 'prt_text'), delta(' three', undefined)]
+
+    // #when / #then
+    expect(await flushedText(events)).toEqual(['one two three'])
+  })
+
+  it('appends a delta that arrives before its reasoning part is known, as the gateway does', async () => {
+    // #given the delta precedes the message.part.updated that identifies its part
+    const events = [delta('early ', 'prt_reasoning'), reasoningPart('prt_reasoning'), delta('late', 'prt_reasoning')]
+
+    // #when
+    const flushed = await flushedText(events)
+
+    // #then only the part of the stream after registration is suppressed
+    expect(flushed).toEqual(['early '])
+  })
+
+  it('suppresses an owned child reasoning part the same way', async () => {
+    // #given an adopted child with a reasoning part
+    const ledger = createOwnershipLedger()
+    ledger.adopt(CHILD_SESSION_ID, 'task')
+    const events = [
+      reasoningPart('prt_child_reasoning', CHILD_SESSION_ID),
+      delta('child thinking', 'prt_child_reasoning', CHILD_SESSION_ID),
+      delta('child answer', 'prt_child_text', CHILD_SESSION_ID),
+    ]
+
+    // #when / #then
+    expect(await flushedText(events, ledger)).toEqual(['child answer'])
+  })
+})
+
 describe('processEventStream — ownership check widens descendant events, no-ledger path unchanged', () => {
   it('message.part.delta: without a ledger a descendant delta never reaches output, with a ledger it does', async () => {
     // #given the same delta event on the CHILD session, run twice: no ledger, then with the child adopted.

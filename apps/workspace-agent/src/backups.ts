@@ -78,6 +78,18 @@ function isQuarantineSource(value: unknown): value is QuarantineSource {
   return typeof value === 'string' && (QUARANTINE_SOURCES as readonly string[]).includes(value)
 }
 
+/**
+ * Shape of a gateway run id. The gateway mints run ids with `crypto.randomUUID()` and keeps its own
+ * private `^[\w-]{1,128}$` pattern (packages/gateway/src/web/operator-push/payload-builder.ts); this
+ * workspace-local copy mirrors that format on purpose, since the two live in separate containers.
+ * Strict enough that a run id is always safe to join into a log line or render in a Discord message.
+ */
+const RUN_ID_PATTERN = /^[\w-]{1,128}$/
+
+export function isValidRunId(value: unknown): value is string {
+  return typeof value === 'string' && RUN_ID_PATTERN.test(value)
+}
+
 /** Root-owned metadata ALWAYS dropped alongside a preserved checkout at quarantine time — written by recover.ts, defined and strictly parsed here. */
 export interface QuarantineMetadata {
   readonly recoveryId: string
@@ -93,6 +105,8 @@ export interface QuarantineMetadata {
   readonly originalHeadSha?: string
   /** Branch the ORIGINAL checkout was on. Absent if it was detached, OR unsafe to read. */
   readonly originalBranch?: string
+  /** The gateway run that triggered this recovery. Absent for manual recoveries and for metadata written before attribution existed. */
+  readonly runId?: string
   readonly source: QuarantineSource
 }
 
@@ -151,6 +165,9 @@ function parseQuarantineMetadata(value: unknown): QuarantineMetadata | null {
     source: v.source,
     ...(v.originalHeadSha === undefined ? {} : {originalHeadSha: v.originalHeadSha}),
     ...(v.originalBranch === undefined ? {} : {originalBranch: v.originalBranch}),
+    // Attribution is advisory: an absent or unsafe-shaped value is dropped, never a reason to treat
+    // the generation as malformed (that would fail the quota check closed over a display field).
+    ...(isValidRunId(v.runId) ? {runId: v.runId} : {}),
   }
 }
 
@@ -344,6 +361,7 @@ export async function listBackups(owner: string, repo: string, deps: BackupsDeps
         sizeComplete: true,
         originalHeadSha: read.metadata.originalHeadSha,
         originalBranch: read.metadata.originalBranch,
+        ...(read.metadata.runId === undefined ? {} : {runId: read.metadata.runId}),
       })
       totalBytes += read.metadata.sizeBytes
       continue
@@ -379,6 +397,7 @@ export async function listBackups(owner: string, repo: string, deps: BackupsDeps
       sizeComplete: measuredOk,
       originalHeadSha: read.ok ? read.metadata.originalHeadSha : undefined,
       originalBranch: read.ok ? read.metadata.originalBranch : undefined,
+      ...(read.ok && read.metadata.runId !== undefined ? {runId: read.metadata.runId} : {}),
     })
   }
 

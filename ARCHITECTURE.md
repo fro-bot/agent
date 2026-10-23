@@ -181,6 +181,7 @@ Discord messageCreate event
               ├─→ checkout preparation (under the repo lock, before EXECUTING)
               │     POST /update (clone only on `no-checkout`) → CheckoutProvenance persisted
               │     with EXECUTING; refused/failed ends the run with a CheckoutPreparation reply
+              │     (a `dirty` refusal first tries one automatic recovery, then updates again)
               ├─→ run-state lifecycle: PENDING → ACKNOWLEDGED → EXECUTING
               ├─→ execute/run-core.ts
               │     buildDiscordPrompt → OpenCode (workspace:9200, bearer auth)

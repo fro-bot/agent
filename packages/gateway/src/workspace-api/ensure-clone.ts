@@ -21,6 +21,8 @@ import type {CloneErrorCode, CloneWorkspaceError} from './types.js'
 import {err, ok} from '@fro-bot/runtime'
 import {
   AppNotInstalledError as AppNotInstalledErrorClass,
+  AuthTimeoutError as AuthTimeoutErrorClass,
+  INSTALLATION_TOKEN_MINT_TIMEOUT_MS,
   InsufficientPermissionsError as InsufficientPermissionsErrorClass,
 } from '../github/app-client.js'
 import {workspaceRepoPath} from './client.js'
@@ -73,7 +75,10 @@ export type EnsureCloneFailure =
  */
 function classifyAuthFailure(
   error: AppNotInstalledError | InsufficientPermissionsError | AuthError,
-): 'not-installed' | 'insufficient-permissions' | 'auth-error' {
+): 'timeout' | 'not-installed' | 'insufficient-permissions' | 'auth-error' {
+  if (error instanceof AuthTimeoutErrorClass) {
+    return 'timeout'
+  }
   if (error instanceof AppNotInstalledErrorClass) {
     return 'not-installed'
   }
@@ -97,8 +102,11 @@ export type WorkspaceFailure =
   | {readonly kind: 'workspace-failure'; readonly workspaceKind: 'parse-error'}
   | {readonly kind: 'workspace-failure'; readonly workspaceKind: 'response-mismatch'}
 
-/** Default timeout for the GitHub App auth call in milliseconds (30 seconds). */
-export const DEFAULT_ENSURE_CLONE_AUTH_TIMEOUT_MS = 30_000
+/**
+ * Default timeout for the GitHub App auth call in milliseconds (30 seconds): the same deadline
+ * `authForRepo` applies to its own requests, so this race is a backstop that rarely wins.
+ */
+export const DEFAULT_ENSURE_CLONE_AUTH_TIMEOUT_MS = INSTALLATION_TOKEN_MINT_TIMEOUT_MS
 
 export interface EnsureCloneDeps {
   readonly owner: string

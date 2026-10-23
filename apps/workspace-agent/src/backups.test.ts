@@ -138,6 +138,67 @@ describe('listBackups', () => {
   })
 })
 
+describe('listBackups — run attribution', () => {
+  const RUN_ID = '3f2b8c1e-5d4a-4b7e-9a10-6c2d8e4f1a23'
+
+  it('carries the run id from metadata.json into the listed entry', async () => {
+    // #given a generation whose metadata records the run that triggered it
+    await writeGeneration('gen-1', makeMetadata({runId: RUN_ID}))
+    // #when
+    const result = await listBackups('acme', 'widgets', {reposRoot})
+    // #then
+    expect(result.kind === 'ok' ? result.backups : []).toEqual([expect.objectContaining({id: 'gen-1', runId: RUN_ID})])
+  })
+
+  it('parses metadata written before run attribution existed, and still counts it toward the quota total', async () => {
+    // #given old-shape metadata (no runId) next to attributed metadata
+    await writeGeneration('gen-old', makeMetadata({recoveryId: 'gen-old', sizeBytes: 1000}))
+    await writeGeneration('gen-new', makeMetadata({recoveryId: 'gen-new', sizeBytes: 2000, runId: RUN_ID}))
+    // #when
+    const result = await listBackups('acme', 'widgets', {reposRoot})
+    // #then both parse as ok metadata and both contribute to totalBytes
+    if (result.kind !== 'ok') throw new Error('unreachable')
+    const old = result.backups.find(backup => backup.id === 'gen-old')
+    expect(old?.metadataOk).toBe(true)
+    expect(old).not.toHaveProperty('runId')
+    expect(result.totalBytes).toBe(3000)
+  })
+
+  it('keeps the run id on a generation whose size had to be re-measured (incomplete at write time)', async () => {
+    // #given metadata written with sizeComplete:false, which routes listing through the fallback walk
+    await writeGeneration(
+      'gen-remeasured',
+      makeMetadata({recoveryId: 'gen-remeasured', sizeComplete: false, runId: RUN_ID}),
+    )
+    // #when
+    const result = await listBackups('acme', 'widgets', {
+      reposRoot,
+      uid: undefined,
+      gid: undefined,
+      walkRunner: async () => ({kind: 'ok', totalBytes: 7, entryCount: 1, complete: true}),
+    })
+    // #then
+    if (result.kind !== 'ok') throw new Error('unreachable')
+    expect(result.backups[0]).toMatchObject({id: 'gen-remeasured', sizeBytes: 7, sizeComplete: true, runId: RUN_ID})
+  })
+
+  it('drops a malformed runId but keeps the generation ok and counted (never fails the quota check closed)', async () => {
+    // #given metadata whose runId has an unsafe shape (e.g. image skew or tampering)
+    const dir = await writeGeneration('gen-bad-run', undefined)
+    await writeFile(
+      join(dir, QUARANTINE_METADATA_FILE_NAME),
+      JSON.stringify({...makeMetadata({recoveryId: 'gen-bad-run'}), runId: '`](http://evil)\n'}),
+    )
+    // #when
+    const result = await listBackups('acme', 'widgets', {reposRoot})
+    // #then
+    if (result.kind !== 'ok') throw new Error('unreachable')
+    expect(result.backups[0]?.metadataOk).toBe(true)
+    expect(result.backups[0]).not.toHaveProperty('runId')
+    expect(result.totalBytes).toBe(1024)
+  })
+})
+
 describe('listBackups — malformed and non-generation entries', () => {
   it('fails closed when metadata is replaced by a symlink after lstat', async () => {
     // #given — lstat sees a regular file, then the mocked boundary swaps in a symlink

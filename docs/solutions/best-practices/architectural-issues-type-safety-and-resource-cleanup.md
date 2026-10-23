@@ -1,6 +1,7 @@
 ---
 title: "OpenCode SDK Session Backend: Architectural Issues in Type Safety and Resource Cleanup"
 date: 2026-02-16
+last_updated: 2026-10-22
 category: best-practices
 module: runtime
 problem_type: best_practice
@@ -180,44 +181,32 @@ const pruneResult = await pruneSessions(pruneBackend, DEFAULT_PRUNING_CONFIG, pr
 
 **Why it works:** By accepting `SessionBackend` as a parameter, `pruneSessions()` now respects the actual storage medium (JSON or SQLite). The function routes deletions to the correct backend: SDK sessions delete via API client, JSON sessions delete via filesystem. The fallback ensures graceful degradation if no backend was established.
 
-### Fix #2: Guaranteed Server Shutdown via Nested Finally Block
+### Fix #2: Shut the Server Down Before the Cache Save, in Its Own Try/Catch
 
-**Move server shutdown to nested finally block:**
+PR #198 moved shutdown into a `finally` block. The current shape is in `runCleanup` at `src/harness/phases/cleanup.ts:262-277`. Shutdown runs before the cache save. It waits, with a bound and on a best-effort basis, for the server to exit. If the exit is not confirmed, persistence is declined, so the SQLite checkpoint inside `saveCache` cannot race a writer that is still alive. Shutdown has its own try/catch:
 
 ```typescript
-// Before
-try {
-  // ... all processing ...
-  const pruneResult = await pruneSessions(backend, config, logger)
-  const cacheSaved = await saveCache({...})
-
-  if (serverHandle != null) {
-    serverHandle.shutdown()
-  }
-} catch (cleanupError) {
-  bootstrapLogger.warning('Cleanup failed (non-fatal)', {...})
-}
-
-// After
-try {
-  // ... all processing ...
-  const pruneResult = await pruneSessions(backend, config, logger)
-  const cacheSaved = await saveCache({...})
-} catch (cleanupError) {
-  bootstrapLogger.warning('Cleanup failed (non-fatal)', {...})
-} finally {
-  // Guaranteed shutdown of SDK server regardless of cleanup success
-  if (serverHandle != null) {
-    try {
-      serverHandle.shutdown()
-    } catch (shutdownError) {
-      bootstrapLogger.warning('Server shutdown failed (non-fatal)', {...})
+if (serverHandle != null) {
+  try {
+    const shutdownResult = await serverHandle.shutdown()
+    quiescenceConfirmed = shutdownResult.quiesced
+    if (!shutdownResult.quiesced) {
+      bootstrapLogger.warning('OpenCode server did not confirm shutdown within the quiescence window; ...')
     }
+  } catch (shutdownError) {
+    quiescenceConfirmed = false
+    bootstrapLogger.warning('Server shutdown failed (non-fatal)', {...})
   }
 }
+// ... then the cache save, which declines when quiescenceConfirmed is false
 ```
 
-**Why it works:** The `finally` block executes unconditionally—before exiting the try-catch, after either success or catch. Nesting another try-catch around `shutdown()` prevents shutdown failures from masking the original cleanup error. This ensures: (1) shutdown always runs, (2) shutdown errors don't suppress prior exceptions, (3) resource leaks are eliminated.
+**Why it works:**
+
+- A failed cache save can no longer skip shutdown, because shutdown has already run.
+- A shutdown failure cannot abort cleanup, because it is caught and logged.
+- A server that never confirmed it stopped writing counts as an unconfirmed writer, so persistence declines.
+- The `finally` at the end of `runCleanup` always stops lease renewal and always attempts to release the lock.
 
 ### Fix #3: Deterministic Latest Session Selection
 
@@ -323,7 +312,7 @@ All fixes verified with:
 
 ### Error Handling
 
-- **Use try-finally for cleanup, never try-catch**: Cleanup code (shutdown, deletion, file closure) must run regardless of errors. Structure as:
+- **Make cleanup unconditional**: Cleanup code (shutdown, deletion, file closure) must run regardless of errors. Do this with `finally`, or by giving the step its own try/catch so that no earlier failure can skip it. Server shutdown above works the second way, because it has to run before the cache save. The `finally` form looks like:
 
   ```typescript
   let resource1, resource2
@@ -364,7 +353,7 @@ All fixes verified with:
 
 - [ ] **Parameter usage**: All function parameters are used. No parameters accepted then ignored in favor of module-level variables or implicit defaults.
 - [ ] **No hardcoded values in function bodies**: If a function accepts a parameter controlling behavior (type, mode, target), it's not hardcoded.
-- [ ] **Cleanup structure**: Cleanup code uses `finally` blocks or explicit cleanup functions, never nested in error handlers.
+- [ ] **Cleanup structure**: Every cleanup step runs on every path: either in a `finally`, or in its own try/catch so that no earlier failure can skip it.
 - [ ] **Error propagation**: Errors from cleanup are handled separately from main operation errors. Cleanup failures don't mask earlier errors.
 - [ ] **Type safety**: No `as any`, `as SomeType` without explanation. Types flow naturally from data to operations.
 - [ ] **SDK/external behavior documented**: If relying on library ordering or behavior, document the assumption. Add a test that verifies the assumption.
@@ -391,8 +380,7 @@ All fixes verified with:
 
 ## See Also
 
-- `src/lib/session/backend.ts` — Session backend discriminated union
-- `src/lib/session/prune.ts` — Session retention and cleanup logic
-- `src/lib/session/storage.ts` — OpenCode storage access utilities
-- `src/main.ts` — Main orchestration entry point with cleanup lifecycle
-- `src/lib/agent/opencode.ts` — SDK execution with server lifecycle management
+- `packages/runtime/src/session/backend.ts`: session backend discriminated union
+- `packages/runtime/src/session/prune.ts`: session retention and cleanup logic
+- `packages/runtime/src/session/storage.ts`: OpenCode storage access utilities
+- `src/harness/phases/cleanup.ts`: cleanup phase, covering server shutdown, cache save and lock release

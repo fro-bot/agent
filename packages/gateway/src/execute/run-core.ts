@@ -38,12 +38,12 @@ import {
   getSessionID,
   getStringProperty,
   parseSyntheticNoticePart,
-  reconcileLedgerOnce,
 } from '@fro-bot/runtime'
 import {parsePermissionReply, parsePermissionRequest} from '../approvals/coordinator.js'
 import {parseQuestionEcho, parseQuestionRequest, safeLogId} from '../approvals/question-coordinator.js'
 import {createDrainCompletion} from './drain-completion.js'
 import {formatToolPart} from './format-part.js'
+import {reconcileLivePass} from './live-reconcile.js'
 import {
   failureFromErrorObject,
   failureFromErrorText,
@@ -174,6 +174,12 @@ export interface RunCoreParams {
   readonly signal: AbortSignal
   /** Injected logger. Internal details only — never leak session internals to Discord. */
   readonly logger: GatewayLogger
+  /**
+   * The gateway run this core is executing. Stamped on the termination barrier's log lines (its own
+   * quarantine error and every `settle-owned-sessions` line) so an abort can be joined to its run.
+   * Absent for callers without a run id; the core's other log lines keep correlating by `sessionId`.
+   */
+  readonly runId?: string
   /**
    * Gateway approval mode. Currently only `approval-required` is supported.
    * `autonomous-low-risk` is deferred (unsafe due to OpenCode last-match-wins evaluation).
@@ -415,6 +421,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     sink,
     signal,
     logger,
+    runId,
     coordinator,
     questions,
     onHumanWaitTerminal,
@@ -600,14 +607,20 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
 
   const reconcileAdapter = ledger === undefined ? undefined : createSdkLedgerReconcileAdapter(client, directory)
   const runtimeLogger = ledger === undefined ? undefined : toRuntimeLogger(logger)
-  const reconciler =
+  // Live-path reconcile passes (the periodic tick and the one-shot on root idle) are bounded and write through a
+  // guarded ledger. Once the run starts tearing down (`throwWithBarrier`) or leaves the event loop, settle owns the
+  // ledger and a pass still in flight must not change it.
+  let liveReconcileClosed = false
+  const liveReconcileOptions =
     ledger === undefined || reconcileAdapter === undefined || runtimeLogger === undefined
       ? undefined
+      : {ledger, adapter: reconcileAdapter, parentSessionId: sessionId, logger: runtimeLogger}
+  const reconciler =
+    liveReconcileOptions === undefined
+      ? undefined
       : createLedgerReconciler({
-          ledger,
-          adapter: reconcileAdapter,
-          parentSessionId: sessionId,
-          logger: runtimeLogger,
+          ...liveReconcileOptions,
+          runPass: async () => reconcileLivePass(liveReconcileOptions, () => liveReconcileClosed),
         })
 
   if (ledger !== undefined && reconcileAdapter !== undefined) {
@@ -658,6 +671,12 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     } = {},
   ): Promise<never> {
     const {rootMayBeRunning = false, providerFailureReason, cause} = options
+    liveReconcileClosed = true
+    // Nothing after this point reads from either handle: the barrier always ends in a throw, and its decision
+    // reads `drainCompletion` only for existence. Disposing here also covers exits before the event loop, whose
+    // `finally` never runs, and stops a validation from admitting success while teardown is in progress.
+    reconciler?.dispose()
+    drainCompletion?.dispose()
     const rootFollowUpOpen =
       rootMayBeRunning ||
       (drainCompletion !== undefined && draining === true && drainDoneController.signal.aborted === false)
@@ -671,13 +690,14 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       rootSessionId: sessionId,
       ledger: barrierLedger,
       logger,
+      ...(runId === undefined ? {} : {runId}),
       ...(rootFollowUpOpen ? {confirmRootQuiescent: true} : {}),
     })
     if (settlement.settled === true) {
       throw new RunCoreError(kind, message, false, providerFailureReason, cause)
     }
     logger.error(
-      {sessionId, kind, detail: settlement.reason},
+      {...(runId === undefined ? {} : {runId}), sessionId, kind, detail: settlement.reason},
       'run-core: owned work could not be confirmed settled before this failure — quarantining run',
     )
     throw new RunCoreError(kind, message, true, providerFailureReason, cause)
@@ -783,12 +803,13 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // the only way to distinguish them from text deltas.
   const reasoningPartIds = new Set<string>()
 
-  // Sessions (root or owned child) with a `ContextOverflowError` session.error not yet recovered. With
+  // The root session, once it has a `ContextOverflowError` session.error not yet recovered (an owned child's overflow
+  // is marked `unknown` in the ledger instead, never armed here). With
   // auto-compaction on (the default) OpenCode publishes it and compacts: `compaction.create`
   // (compaction.ts:559-582) then writes that session's user message with a `compaction` part, the first event of
   // the recovery (called from prompt.ts:1322 after processor.ts:629-631). With compaction off OpenCode halts
   // instead (processor.ts:621-628): `session.error`, then that session's `session.idle`, with the errored
-  // `message.updated` only after. So a session's own compaction part clears its entry and, if its idle arrives
+  // `message.updated` only after. So the root's own compaction part clears its entry and, if its idle arrives
   // first, the overflow was unrecovered and the run fails. A null session id is keyed to the root, as run-core
   // already treats it.
   const overflowPending = new Set<string>()
@@ -1253,8 +1274,8 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         // working. Root idle is the signal to CONSIDER finishing; whether that
         // is actually allowed is the ledger's call, below.
         const eventSessionID = getEventSessionID(rawEvent)
-        // Any session's idle with an overflow nothing compacted: OpenCode stopped it (compaction off). A child's
-        // output is lost with it, so fail rather than let the root complete.
+        // The root's idle with an overflow nothing compacted: OpenCode stopped it (compaction off), so fail rather
+        // than complete on partial output.
         if (eventSessionID !== null && overflowPending.has(eventSessionID)) {
           throw await failFromProvider({reason: 'session error', errorName: 'ContextOverflowError'}, 'session.idle')
         }
@@ -1299,16 +1320,9 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           // without waiting for the reconciler's interval. Fire-and-forget: its
           // mutations (via the wrapped ledger) trigger persistence and a validation
           // request on their own once they land.
-          if (ledgerSettled === false && reconcileAdapter !== undefined && runtimeLogger !== undefined) {
+          if (ledgerSettled === false && liveReconcileOptions !== undefined) {
             // eslint-disable-next-line no-void
-            void reconcileLedgerOnce({
-              ledger,
-              adapter: reconcileAdapter,
-              parentSessionId: sessionId,
-              logger: runtimeLogger,
-            }).catch(() => {
-              // reconcileLedgerOnce never rejects; this satisfies no-floating-promises.
-            })
+            void reconcileLivePass(liveReconcileOptions, () => liveReconcileClosed)
           }
 
           // Validate against REST now that this generation has idle evidence. Coalesced: at most one in flight.
@@ -1316,22 +1330,34 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         }
       } else if (eventType === 'session.error') {
         const eventSessionID = getEventSessionID(rawEvent)
-        // A null session id means the payload didn't carry one (rare) — treated as
-        // ours defensively, matching the prior root-scoped behaviour, since we
-        // cannot attribute it to a specific session at all. Otherwise: ownership,
-        // not root equality — a descendant's error is this run's problem too.
+        // A null session id means the payload didn't carry one (rare) — treated as ours defensively, matching the
+        // prior root-scoped behaviour, since we cannot attribute it to a specific session at all. Otherwise:
+        // ownership, not root equality, decides whether the event is ours at all.
         if (eventSessionID === null || isOwnedSession(eventSessionID)) {
           // The payload is a string or a structured `{name, data}` object. Both go through the shared
-          // classifier: only a fixed reason survives, never the provider's text. Every terminal error fails the
-          // run; the shared kind only picks the label.
+          // classifier: only a fixed reason survives, never the provider's text.
           const errorText = getStringProperty(eventPayload, 'error')
           const structuredError = errorText === null ? getObjectProperty(eventPayload, 'error') : null
-          // A context overflow is not decided here: compaction may follow, so it only arms `overflowPending`.
-          // An abort is exempt only when the gateway caused it (the combined signal ends the loop); an abort
-          // from any other client (`POST /session/:id/abort`) is followed by an idle that would otherwise
-          // complete the run with partial output.
-          if (isContextOverflowError(structuredError)) {
-            overflowPending.add(eventSessionID ?? sessionId)
+          // An owned child, as opposed to the root or an error that names no session.
+          const childSessionId = eventSessionID !== null && eventSessionID !== sessionId ? eventSessionID : null
+          // A child's error, overflow included, does not end the root's turn. It is evidence something went wrong,
+          // not proof the child stopped writing, so the entry is marked `unknown` — never `settled` — and the root
+          // learns the child's outcome from its task-completion notice. The drain settles the entry once
+          // reconciliation sees it stop, or cancels it at the deadline. Marking goes through the hook-wrapped
+          // ledger, so persistence and validation fire.
+          //
+          // The root's context overflow is not decided here: compaction may follow, so it only arms
+          // `overflowPending`. An abort is exempt only when the gateway caused it (the combined signal ends the
+          // loop); an abort from any other client (`POST /session/:id/abort`) is followed by an idle that would
+          // otherwise complete the run with partial output.
+          if (childSessionId !== null) {
+            ledger?.markUnknown(childSessionId)
+            logger.warn(
+              {sessionId, childSessionId},
+              'run-core: owned child reported a terminal session error — marked unknown, run continues',
+            )
+          } else if (isContextOverflowError(structuredError)) {
+            overflowPending.add(sessionId)
           } else if (isAbortedError(structuredError)) {
             if (combinedSignal.aborted === false) throw await failFromProvider(ABORTED_FAILURE, 'session.error')
           } else {
@@ -1390,6 +1416,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     // The explicit clearInactivity() calls on the session.idle and session.error paths are
     // kept as defensive double-clears — pause()/dispose() on an already-cleared timer is a no-op.
     inactivityTimer.dispose()
+    liveReconcileClosed = true
     reconciler?.dispose()
     // No validation result may admit success once the loop has exited, and its retry timer must not leak.
     drainCompletion?.dispose()
