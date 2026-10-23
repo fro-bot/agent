@@ -48,11 +48,13 @@ export type PreviewRecoveryFn = (
  */
 export interface RecoverTokenUnavailable {
   readonly kind: 'token-unavailable'
+  /** Why: `timeout`, `threw`, or an error class name. Diagnostics only; never an error message. */
+  readonly cause: string
 }
 
 /**
  * `RunMentionDeps.recover`: mints the installation token itself (bounded by
- * `RECOVERY_TOKEN_MINT_TIMEOUT_MS`) and sends `runId` for attribution.
+ * `INSTALLATION_TOKEN_MINT_TIMEOUT_MS`) and sends `runId` for attribution.
  */
 export type RecoverFn = (
   owner: string,
@@ -127,7 +129,11 @@ export type BackupLookup =
 export type CheckoutRecoveryOutcome =
   | {readonly kind: 'recovered'; readonly backupId: string}
   | {readonly kind: 'declined'; readonly reason: 'quota-exceeded'; readonly usage: RetentionUsage}
-  | {readonly kind: 'declined'; readonly reason: Exclude<RecoveryDeclineReason, 'quota-exceeded'>}
+  | {readonly kind: 'declined'; readonly reason: 'token-unavailable'; readonly cause: string}
+  | {
+      readonly kind: 'declined'
+      readonly reason: Exclude<RecoveryDeclineReason, 'quota-exceeded' | 'token-unavailable'>
+    }
   | {readonly kind: 'ambiguous'; readonly reason: RecoveryAmbiguousReason}
 
 type PreviewDecision =
@@ -185,7 +191,7 @@ function classifyRecover(
 ): CheckoutRecoveryOutcome {
   if (result.success === false && result.error.kind === 'token-unavailable') {
     // The mint failed or timed out BEFORE `/recover` was sent: the workspace was never asked to do anything.
-    return {kind: 'declined', reason: 'token-unavailable'}
+    return {kind: 'declined', reason: 'token-unavailable', cause: result.error.cause}
   }
   // The request may have reached the workspace before the transport failed, so none of these prove
   // that nothing moved.
@@ -217,7 +223,10 @@ function logOutcome(logger: GatewayLogger, request: AutoRecoverRequest, outcome:
   if (outcome.kind === 'recovered') {
     logger.warn({...base, backupId: outcome.backupId}, 'run: dirty checkout recovered automatically')
   } else if (outcome.kind === 'declined') {
-    logger.warn({...base, reason: outcome.reason}, 'run: automatic checkout recovery declined')
+    logger.warn(
+      {...base, reason: outcome.reason, ...(outcome.reason === 'token-unavailable' ? {cause: outcome.cause} : {})},
+      'run: automatic checkout recovery declined',
+    )
   }
 }
 

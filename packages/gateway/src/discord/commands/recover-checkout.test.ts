@@ -5,6 +5,7 @@ import type {FroBotDeps} from './fro-bot.js'
 
 import {Effect} from 'effect'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import {INSTALLATION_TOKEN_MINT_TIMEOUT_MS} from '../../execute/workspace-token.js'
 
 const mockAcquireMaintenanceRun = vi.fn()
 vi.mock('../maintenance-run.js', () => ({
@@ -18,6 +19,7 @@ const {
   getRecoverNonceRegistryForTesting,
 } = await import('./recover-checkout.js')
 const {dispatchCommand, getCommandRegistry} = await import('./index.js')
+const {INTERNAL_ERROR_COPY} = await import('./guild-command.js')
 
 function makeGuild(hasManageChannels = true): Guild {
   const member = {permissions: {has: vi.fn().mockReturnValue(hasManageChannels)}}
@@ -570,7 +572,8 @@ describe('/fro-bot recover-checkout — confirm/cancel buttons', () => {
     const {interaction} = makeButtonInteraction(customId, {guild})
     await handleRecoverConfirmOrCancelClick(interaction as never, deps)
 
-    expect(handle.release).toHaveBeenCalledWith('FAILED', expect.objectContaining({outcome: 'confirm-error'}))
+    // a thrown mint is now handled by the bounded mint, so it takes the same path as a failed one
+    expect(handle.release).toHaveBeenCalledWith('FAILED', expect.objectContaining({outcome: 'auth-failed'}))
     expect(deps.workspaceClient.recover).not.toHaveBeenCalled()
   })
 
@@ -585,5 +588,221 @@ describe('/fro-bot recover-checkout — confirm/cancel buttons', () => {
     await handleRecoverConfirmOrCancelClick(interaction as never, deps)
 
     expect(handle.release).toHaveBeenCalledWith('FAILED', expect.objectContaining({outcome: 'confirm-error'}))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The confirm-click installation-token mint is bounded: the claimed maintenance run holds the repo lock
+// while it waits, and `authForRepo` has no deadline of its own.
+// ---------------------------------------------------------------------------
+
+async function armConfirm(authForRepo: ReturnType<typeof vi.fn>) {
+  const guild = makeGuild(true)
+  const handle = makeReleaseHandle()
+  const deps = makeConfirmableDeps()
+  const customId = await postConfirmablePreview(deps, guild, handle)
+  vi.mocked(deps.appClient.authForRepo).mockImplementation(authForRepo as never)
+  const click = makeButtonInteraction(customId, {guild})
+  return {deps, handle, click}
+}
+
+function copySends(editReply: ReturnType<typeof vi.fn>): number {
+  return editReply.mock.calls.filter(call => (call[0] as {content?: string}).content === INTERNAL_ERROR_COPY).length
+}
+
+describe('/fro-bot recover-checkout confirm: the token mint is bounded', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  const MINT_FAILED_LOG = 'recover-checkout: token mint failed at confirm'
+
+  it('a mint that never settles ends at the ceiling (not before): FAILED/auth-failed, copy sent once, recover never called', async () => {
+    // #given a GitHub call that hangs forever, while the claimed run holds the lock
+    const {deps, handle, click} = await armConfirm(vi.fn().mockReturnValue(new Promise(() => {})))
+    vi.useFakeTimers()
+
+    // #when
+    let finished = false
+    const done = handleRecoverConfirmOrCancelClick(click.interaction as never, deps).then(() => {
+      finished = true
+    })
+    await vi.advanceTimersByTimeAsync(INSTALLATION_TOKEN_MINT_TIMEOUT_MS - 1)
+    const finishedEarly = finished
+    const releasedEarly = vi.mocked(handle.release).mock.calls.length
+    await vi.advanceTimersByTimeAsync(1)
+    await done
+
+    // #then
+    expect(finishedEarly).toBe(false)
+    expect(releasedEarly).toBe(0)
+    expect(handle.release).toHaveBeenCalledExactlyOnceWith('FAILED', expect.objectContaining({outcome: 'auth-failed'}))
+    expect(copySends(click.editReply)).toBe(1)
+    expect(deps.workspaceClient.recover).not.toHaveBeenCalled()
+  })
+
+  it('logs the failure with a meaningful err of "timeout" and no token or fingerprint', async () => {
+    // #given
+    const {deps, click} = await armConfirm(vi.fn().mockReturnValue(new Promise(() => {})))
+    vi.useFakeTimers()
+
+    // #when
+    const done = handleRecoverConfirmOrCancelClick(click.interaction as never, deps)
+    await vi.advanceTimersByTimeAsync(INSTALLATION_TOKEN_MINT_TIMEOUT_MS)
+    await done
+
+    // #then
+    const logged = vi.mocked(deps.gatewayLogger.error).mock.calls.filter(call => call[1] === MINT_FAILED_LOG)
+    expect(logged).toHaveLength(1)
+    expect(logged[0]?.[0]).toEqual({repoSlug: 'acme/widget', err: 'timeout'})
+    expect(JSON.stringify(logged)).not.toContain('fp-1')
+  })
+
+  it('a mint that succeeds only AFTER the ceiling does not call recover', async () => {
+    // #given
+    let resolveMint: (value: unknown) => void = () => {}
+    const {deps, handle, click} = await armConfirm(
+      vi.fn().mockReturnValue(
+        new Promise(resolve => {
+          resolveMint = resolve
+        }),
+      ),
+    )
+    vi.useFakeTimers()
+
+    // #when the ceiling expires, then the late token arrives
+    const done = handleRecoverConfirmOrCancelClick(click.interaction as never, deps)
+    await vi.advanceTimersByTimeAsync(INSTALLATION_TOKEN_MINT_TIMEOUT_MS)
+    await done
+    resolveMint({success: true, data: {token: 'ghs_late'}})
+    await vi.advanceTimersByTimeAsync(5_000)
+
+    // #then
+    expect(deps.workspaceClient.recover).not.toHaveBeenCalled()
+    expect(handle.release).toHaveBeenCalledExactlyOnceWith('FAILED', expect.objectContaining({outcome: 'auth-failed'}))
+    expect(copySends(click.editReply)).toBe(1)
+  })
+
+  it('a mint that rejects after the ceiling changes nothing', async () => {
+    // #given
+    let rejectMint: (reason: Error) => void = () => {}
+    const {deps, click} = await armConfirm(
+      vi.fn().mockReturnValue(
+        new Promise((_resolve, reject) => {
+          rejectMint = reject
+        }),
+      ),
+    )
+    vi.useFakeTimers()
+    // #when
+    const done = handleRecoverConfirmOrCancelClick(click.interaction as never, deps)
+    await vi.advanceTimersByTimeAsync(INSTALLATION_TOKEN_MINT_TIMEOUT_MS)
+    await done
+    rejectMint(new Error('late boom'))
+    await vi.advanceTimersByTimeAsync(5_000)
+    await Promise.resolve()
+
+    // #then the rejection arrived after the result was settled, so it changes nothing
+    const logged = vi.mocked(deps.gatewayLogger.error).mock.calls.filter(call => call[1] === MINT_FAILED_LOG)
+    expect(logged).toHaveLength(1)
+    expect(logged[0]?.[0]).toEqual({repoSlug: 'acme/widget', err: 'timeout'})
+    expect(deps.workspaceClient.recover).not.toHaveBeenCalled()
+  })
+
+  it('a thrown mint takes the same path, logged with its error class, and recover is not called', async () => {
+    // #given
+    const {deps, handle, click} = await armConfirm(vi.fn().mockRejectedValue(new Error('token service unavailable')))
+
+    // #when
+    await handleRecoverConfirmOrCancelClick(click.interaction as never, deps)
+
+    // #then
+    expect(handle.release).toHaveBeenCalledExactlyOnceWith('FAILED', expect.objectContaining({outcome: 'auth-failed'}))
+    expect(copySends(click.editReply)).toBe(1)
+    expect(deps.workspaceClient.recover).not.toHaveBeenCalled()
+    const logged = vi.mocked(deps.gatewayLogger.error).mock.calls.filter(call => call[1] === MINT_FAILED_LOG)
+    expect(logged[0]?.[0]).toEqual({repoSlug: 'acme/widget', err: 'Error'})
+    expect(JSON.stringify(logged)).not.toContain('token service unavailable')
+  })
+
+  it('a failed mint takes the same path and logs the error class, never its message', async () => {
+    // #given
+    class AppNotInstalledError extends Error {}
+    const {deps, handle, click} = await armConfirm(
+      vi.fn().mockResolvedValue({success: false, error: new AppNotInstalledError('secret detail')}),
+    )
+
+    // #when
+    await handleRecoverConfirmOrCancelClick(click.interaction as never, deps)
+
+    // #then
+    expect(handle.release).toHaveBeenCalledExactlyOnceWith('FAILED', expect.objectContaining({outcome: 'auth-failed'}))
+    expect(copySends(click.editReply)).toBe(1)
+    expect(deps.workspaceClient.recover).not.toHaveBeenCalled()
+    const logged = vi.mocked(deps.gatewayLogger.error).mock.calls.filter(call => call[1] === MINT_FAILED_LOG)
+    expect(logged[0]?.[0]).toEqual({repoSlug: 'acme/widget', err: 'AppNotInstalledError'})
+    expect(JSON.stringify(logged)).not.toContain('secret detail')
+  })
+
+  it('a mint that fails only AFTER the ceiling cannot change the logged cause: it stays "timeout"', async () => {
+    // #given the label comes from the returned failure, not from state a late mint could still write
+    class LateFailure extends Error {}
+    let resolveMint: (value: unknown) => void = () => {}
+    const {deps, click} = await armConfirm(
+      vi.fn().mockReturnValue(
+        new Promise(resolve => {
+          resolveMint = resolve
+        }),
+      ),
+    )
+    vi.useFakeTimers()
+
+    // #when
+    const done = handleRecoverConfirmOrCancelClick(click.interaction as never, deps)
+    await vi.advanceTimersByTimeAsync(INSTALLATION_TOKEN_MINT_TIMEOUT_MS)
+    await done
+    resolveMint({success: false, error: new LateFailure('late')})
+    await vi.advanceTimersByTimeAsync(5_000)
+
+    // #then
+    const logged = vi.mocked(deps.gatewayLogger.error).mock.calls.filter(call => call[1] === MINT_FAILED_LOG)
+    expect(logged).toHaveLength(1)
+    expect(logged[0]?.[0]).toEqual({repoSlug: 'acme/widget', err: 'timeout'})
+  })
+
+  it('a source-deadline expiry (AuthTimeoutError) is logged under its own class name', async () => {
+    // #given
+    const {AuthTimeoutError} = await import('../../github/app-client.js')
+    const {deps, click} = await armConfirm(vi.fn().mockResolvedValue({success: false, error: new AuthTimeoutError()}))
+
+    // #when
+    await handleRecoverConfirmOrCancelClick(click.interaction as never, deps)
+
+    // #then
+    const logged = vi.mocked(deps.gatewayLogger.error).mock.calls.find(call => call[1] === MINT_FAILED_LOG)
+    expect(logged?.[0]).toEqual({repoSlug: 'acme/widget', err: 'AuthTimeoutError'})
+  })
+
+  it('a mint that answers in time still reaches recover with that token', async () => {
+    // #given
+    const {deps, handle, click} = await armConfirm(
+      vi.fn().mockResolvedValue({success: true, data: {token: 'ghs_in_time'}}),
+    )
+    vi.mocked(deps.workspaceClient.recover).mockResolvedValue({
+      success: true,
+      data: {kind: 'ok', recoveryId: 'gen-1', sha: 'b'.repeat(40), branch: 'main'},
+    })
+
+    // #when
+    await handleRecoverConfirmOrCancelClick(click.interaction as never, deps)
+
+    // #then
+    expect(deps.workspaceClient.recover).toHaveBeenCalledExactlyOnceWith({
+      owner: 'acme',
+      repo: 'widget',
+      token: 'ghs_in_time',
+      fingerprint: 'fp-1',
+    })
+    expect(handle.release).toHaveBeenCalledWith('COMPLETED', expect.objectContaining({outcome: 'ok'}))
   })
 })
