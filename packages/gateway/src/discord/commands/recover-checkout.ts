@@ -174,6 +174,8 @@ function renderOutcome(repoSlug: string, result: import('../../workspace-api/typ
       return `I couldn't reach the repository's remote to build the fresh checkout for \`${repoSlug}\`. Try again shortly.`
     case 'build-failed':
       return `Building the fresh checkout for \`${repoSlug}\` failed. The original checkout is untouched - try again shortly.`
+    case 'rollback-failed':
+      return `The recovery for \`${repoSlug}\` stopped before it changed the checkout, but its cleanup didn't finish. The workspace finishes the cleanup when it next restarts; until then this repository can't run.`
     case 'quarantine-failed':
       return `Preserving the original checkout for \`${repoSlug}\` didn't finish. The workspace tries to finish it when it next restarts; until then this repository can't run.`
     case 'install-failed':

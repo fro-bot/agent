@@ -49,8 +49,10 @@ import {handleQuestionInteraction} from './discord/question-interactions.js'
 import {parseQuestionCustomId} from './discord/questions.js'
 import {handleRecoverEntryButtonClick, parseRecoverEntryCustomId} from './discord/recover-checkout-button.js'
 import {abortRegistry} from './execute/abort-registry.js'
+import {totalRecoveryBudgetMs} from './execute/checkout-recovery.js'
 import {createConcurrencyRegistry} from './execute/concurrency.js'
 import {createChannelQueue, DEFAULT_MAX_QUEUE_DEPTH} from './execute/queue.js'
+import {createRecoveryWorkspaceCalls} from './execute/recovery-workspace.js'
 import {recoverStaleRuns} from './execute/recovery.js'
 import {createRepoQuiescenceChecker} from './execute/repo-quiescence.js'
 import {createRunIndex} from './execute/run-index.js'
@@ -78,7 +80,7 @@ import {createOperatorPushSubscriptionStore} from './web/operator-push/subscript
 import {shouldNotify} from './web/operator-push/trigger-policy.js'
 import {createWebQuestionOnRegistered} from './web/operator/web-question.js'
 import {createRunObservationManager} from './web/sse/manager.js'
-import {createWorkspaceClient, totalRecoveryCeilingMs} from './workspace-api/client.js'
+import {createWorkspaceClient} from './workspace-api/client.js'
 import {ensureWorkspaceClone} from './workspace-api/ensure-clone.js'
 
 /** One hourly tick scavenges the session map and sweeps stored records: retention is the TTL plus this interval. */
@@ -517,6 +519,11 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       return ok(authResult.data.token)
     }
 
+    const recoveryWorkspaceCalls = createRecoveryWorkspaceCalls({
+      workspaceClient,
+      mintToken: mintWorkspaceToken,
+    })
+
     // One workspace quiescence checker shared by acquisition, maintenance, recovery and operator release.
     const checkRepoQuiescence = createRepoQuiescenceChecker({
       workspaceOpencodeUrl: config.workspaceOpencodeUrl,
@@ -845,19 +852,12 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
         if (token.success === false) return token
         return workspaceClient.update({owner, repo, token: token.data}, options)
       },
-      // Automatic recovery of a dirty checkout (see execute/checkout-recovery.ts): same token minting
-      // and error mapping as `update`, run under the same repo lock.
-      previewRecovery: async (owner: string, repo: string) => {
-        const token = await mintWorkspaceToken(owner, repo)
-        if (token.success === false) return token
-        return workspaceClient.previewRecovery({owner, repo})
-      },
-      recover: async (owner: string, repo: string, options: {readonly fingerprint: string; readonly runId: string}) => {
-        const token = await mintWorkspaceToken(owner, repo)
-        if (token.success === false) return token
-        return workspaceClient.recover({owner, repo, token: token.data, ...options})
-      },
-      recoveryBudgetMs: totalRecoveryCeilingMs(workspaceClientOptions),
+      // Automatic recovery of a dirty checkout (see execute/checkout-recovery.ts), run under the same
+      // repo lock. Preview mints no token; recover mints one (execute/recovery-workspace.ts).
+      previewRecovery: recoveryWorkspaceCalls.previewRecovery,
+      recover: recoveryWorkspaceCalls.recover,
+      listBackups: async (owner: string, repo: string) => workspaceClient.listBackups(owner, repo),
+      recoveryBudgetMs: totalRecoveryBudgetMs(workspaceClientOptions),
       // Shutdown gate: suppress handoff to next queued task once SIGTERM fires.
       // The in-memory queue is lossy by design; dropping pending tasks on graceful
       // shutdown matches that contract and is consistent with the messageCreate

@@ -154,7 +154,8 @@ function makeLaunchWorkDeps(): RunMentionDeps {
     })),
     previewRecovery: vi.fn(),
     recover: vi.fn(),
-    recoveryBudgetMs: 445_000,
+    listBackups: vi.fn(),
+    recoveryBudgetMs: 514_000,
     runIndex: {
       register: vi.fn(),
       lookup: vi.fn(async () => undefined),

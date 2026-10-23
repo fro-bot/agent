@@ -13,7 +13,7 @@ import * as coordinatorModule from '../approvals/coordinator.js'
 import * as discordApprovalsModule from '../discord/approvals.js'
 import * as statusMessageModule from '../discord/status-message.js'
 import * as streamingModule from '../discord/streaming.js'
-import {totalRecoveryCeilingMs} from '../workspace-api/client.js'
+import {totalRecoveryBudgetMs} from './checkout-recovery.js'
 import * as attachModule from './opencode-attach.js'
 import * as promptModule from './prompt.js'
 import * as runCoreModule from './run-core.js'
@@ -575,6 +575,11 @@ export function makePreviewRecoveryFn() {
 
 export const DEFAULT_BACKUP_ID = 'backup-gen-1'
 
+/** `RunMentionDeps.listBackups` mock; defaults to an empty (ok) listing, i.e. no backup matches the run. */
+export function makeListBackupsFn() {
+  return vi.fn().mockResolvedValue({success: true as const, data: {kind: 'ok' as const, backups: [], totalBytes: 0}})
+}
+
 /** `RunMentionDeps.recover` mock; defaults to a successful recovery that preserved `DEFAULT_BACKUP_ID`. */
 export function makeRecoverFn() {
   return vi.fn().mockResolvedValue({
@@ -605,7 +610,8 @@ export function makeDeps(overrides: Partial<RunMentionDeps> = {}): RunMentionDep
     update: overrides.update ?? makeUpdateFn('ready'),
     previewRecovery: overrides.previewRecovery ?? makePreviewRecoveryFn(),
     recover: overrides.recover ?? makeRecoverFn(),
-    recoveryBudgetMs: overrides.recoveryBudgetMs ?? totalRecoveryCeilingMs(),
+    listBackups: overrides.listBackups ?? makeListBackupsFn(),
+    recoveryBudgetMs: overrides.recoveryBudgetMs ?? totalRecoveryBudgetMs(),
     ...overrides,
   }
 }

@@ -132,6 +132,8 @@ export interface ExecuteRecoveryDeps {
   readonly disposeInstance?: InstanceDisposer
   /** Receives the one warning a failed dispose produces (owner, repo, reason; never a path). */
   readonly logger?: RecoveryLogger
+  /** Removes the staging tree during a pre-quarantine rollback. Defaults to a recursive forced `rm`; injected so a test can make it fail. */
+  readonly removeStaging?: (path: string) => Promise<void>
 }
 
 /** The slice of the process logger recovery needs; structurally satisfied by `opencode-server.ts`'s `Logger`. */
@@ -1141,6 +1143,7 @@ interface RecoveryMutationContext {
   readonly signal: AbortSignal | undefined
   readonly disposeInstance: InstanceDisposer | undefined
   readonly logger: RecoveryLogger | undefined
+  readonly removeStaging: (path: string) => Promise<void>
 }
 
 /**
@@ -1294,12 +1297,16 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
   // Same rollback a confirmed pre-quarantine failure performs: remove staging, then restore any
   // superseded update journal (or drop the `building` journal). If staging removal itself fails, the
   // journal stays exactly as this recovery left it, for startup reconciliation to resolve.
-  const rollbackAbortedBuild = async (): Promise<void> => {
+  // Resolves to the result the caller must return: `confirmed` is the pre-quarantine failure it
+  // would have returned anyway; `rollback-failed` when the rollback could not be confirmed, because
+  // a `building` journal (and possibly staging) then remains and the outcome is not a clean decline.
+  const rollbackPreQuarantine = async (confirmed: ExecuteRecoveryResult): Promise<ExecuteRecoveryResult> => {
     try {
-      await rm(stagingPath, {recursive: true, force: true})
+      await ctx.removeStaging(stagingPath)
       await rollbackBuildJournal(journalsDir, owner, repo, supersededUpdate)
+      return confirmed
     } catch {
-      // journal stays in place
+      return {kind: 'failed', reason: 'rollback-failed'}
     }
   }
   let target: {readonly branch: string; readonly sha: string}
@@ -1373,20 +1380,11 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
       // merely deleted) when this recovery took over an interrupted update — F3: the evidence, and
       // the /update needs-recovery barrier it enforces, must survive. If staging removal itself
       // fails, the journal MUST stay exactly as this recovery left it — never touched.
-      try {
-        await rm(stagingPath, {recursive: true, force: true})
-        await rollbackBuildJournal(journalsDir, owner, repo, supersededUpdate)
-      } catch {
-        // journal stays in place
-      }
-      return {kind: 'failed', reason: 'build-failed'}
+      return await rollbackPreQuarantine({kind: 'failed', reason: 'build-failed'})
     }
     if (built.kind !== 'ok') return {kind: 'failed', reason: 'build-failed'}
     // Boundary 4 — after the staging build: roll back exactly like a confirmed build failure.
-    if (isAborted()) {
-      await rollbackAbortedBuild()
-      return abortedResult
-    }
+    if (isAborted()) return await rollbackPreQuarantine(abortedResult)
   } finally {
     await rm(askpassDir, {recursive: true, force: true}).catch(() => {})
   }
@@ -1403,22 +1401,13 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
   if (handoff.ok !== true) {
     // (E7/F3) Handoff failure is always CONFIRMED (filesystem-only lstat/lchown, no subprocess) —
     // clean up (and restore any superseded update journal) the same way a confirmed build failure does.
-    try {
-      await rm(stagingPath, {recursive: true, force: true})
-      await rollbackBuildJournal(journalsDir, owner, repo, supersededUpdate)
-    } catch {
-      // journal stays in place
-    }
-    return {kind: 'failed', reason: 'build-failed'}
+    return rollbackPreQuarantine({kind: 'failed', reason: 'build-failed'})
   }
 
   // Boundary 5 — after the ownership handoff, the LAST honoured abort. Once the `quarantining`
   // journal is written below, the recovery runs to completion whatever the client does: an abort
   // between the original's rename and the fresh checkout's install would strand the repository.
-  if (isAborted()) {
-    await rollbackAbortedBuild()
-    return abortedResult
-  }
+  if (isAborted()) return rollbackPreQuarantine(abortedResult)
 
   await writeJournal(journalsDir, {
     kind: 'recovery',
@@ -1547,6 +1536,7 @@ export async function executeRecovery(
     signal,
     disposeInstance,
     logger,
+    removeStaging = async (path: string) => rm(path, {recursive: true, force: true}),
   } = deps
   const {timeoutMs = DEFAULT_LOCAL_TIMEOUT_MS, uid = AGENT_UID, gid = AGENT_GID} = options
   const {owner, repo} = request
@@ -1601,6 +1591,7 @@ export async function executeRecovery(
           signal,
           disposeInstance,
           logger,
+          removeStaging,
         }),
       (): ExecuteRecoveryResult => ({kind: 'failed', reason: 'termination-unconfirmed'}),
     )

@@ -7,10 +7,11 @@ import type {
   UpdateRequest,
 } from './types.js'
 
+import {readFile} from 'node:fs/promises'
 import {err, ok} from '@fro-bot/runtime'
-import {describe, expect, it, vi} from 'vitest'
+import {afterEach, describe, expect, it, vi} from 'vitest'
 
-import {createWorkspaceClient, totalRecoveryCeilingMs} from './client.js'
+import {createWorkspaceClient, totalRecoveryCeilingMs, WORKSPACE_INSTANCE_DISPOSE_CEILING_MS} from './client.js'
 
 // ---------------------------------------------------------------------------
 // readyz tests
@@ -1855,6 +1856,19 @@ describe('WorkspaceClient.recover', () => {
       vi.unstubAllGlobals()
     })
 
+    it('accepts the rollback-failed failure reason on 503 (and rejects an unknown one)', async () => {
+      const client = makeClient()
+      const body = {kind: 'failed', reason: 'rollback-failed'}
+      vi.stubGlobal('fetch', mockFetch({ok: false, status: 503, json: async () => body}))
+      expect(await client.recover(makeExecuteRecoveryRequest())).toEqual(ok(body))
+      vi.stubGlobal(
+        'fetch',
+        mockFetch({ok: false, status: 503, json: async () => ({kind: 'failed', reason: 'made-up'})}),
+      )
+      expect(await client.recover(makeExecuteRecoveryRequest())).toEqual(err({kind: 'parse-error'}))
+      vi.unstubAllGlobals()
+    })
+
     it('401 → http-error', async () => {
       const client = makeClient()
       vi.stubGlobal(
@@ -2143,23 +2157,155 @@ describe('WorkspaceClient.deleteBackup', () => {
 })
 
 describe('totalRecoveryCeilingMs', () => {
-  it('sums the preview, recover and update ceilings the client actually applies by default', () => {
-    // #given the documented defaults: preview 45s, recover 300s, update 100s
+  it('sums every workspace call a recovery makes at the ceilings the client applies by default', () => {
+    // #given preview 45s, recover 300s, update 100s, the backup lookup 60s, and the 5s dispose inside recover
     // #when / #then
-    expect(totalRecoveryCeilingMs()).toBe(45_000 + 300_000 + 100_000)
+    expect(totalRecoveryCeilingMs()).toBe(45_000 + 300_000 + 100_000 + 60_000 + 5_000)
   })
 
   it('uses the configured ceilings, not the defaults, when the client was built with overrides', () => {
     // #given
-    const options = {previewRecoveryTimeoutMs: 1_000, recoverTimeoutMs: 20_000, updateTimeoutMs: 3_000}
+    const options = {
+      previewRecoveryTimeoutMs: 1_000,
+      recoverTimeoutMs: 20_000,
+      updateTimeoutMs: 3_000,
+      listBackupsTimeoutMs: 4_000,
+    }
 
-    // #when / #then
-    expect(totalRecoveryCeilingMs(options)).toBe(24_000)
+    // #when / #then only the dispose ceiling (fixed on the workspace side) stays at its constant
+    expect(totalRecoveryCeilingMs(options)).toBe(28_000 + WORKSPACE_INSTANCE_DISPOSE_CEILING_MS)
   })
 
   it('falls back to the default for each ceiling that is not configured', () => {
     // #given only recover is overridden
     // #when / #then
-    expect(totalRecoveryCeilingMs({recoverTimeoutMs: 10_000})).toBe(45_000 + 10_000 + 100_000)
+    expect(totalRecoveryCeilingMs({recoverTimeoutMs: 10_000})).toBe(45_000 + 10_000 + 100_000 + 60_000 + 5_000)
   })
+
+  it("mirrors the workspace's own dispose timeout (separate container, so the constant is copied, not imported)", async () => {
+    // #given the workspace source of truth
+    const source = await readFile(
+      new URL('../../../../apps/workspace-agent/src/opencode-instance.ts', import.meta.url),
+      'utf8',
+    )
+    const declared = /DEFAULT_INSTANCE_DISPOSE_TIMEOUT_MS\s*=\s*([\d_]+)/.exec(source)?.[1]
+
+    // #when / #then a change over there must change the budget here
+    expect(Number(declared?.replaceAll('_', ''))).toBe(WORKSPACE_INSTANCE_DISPOSE_CEILING_MS)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Bounded body read: the deadline covers fetch AND the JSON read
+// ---------------------------------------------------------------------------
+
+/**
+ * Headers arrive (a 200), but the body never does. `json()` settles only when the request's own
+ * signal aborts, exactly as a real streamed body read would.
+ */
+function mockStalledBodyFetch(status = 200): ReturnType<typeof vi.fn> {
+  return vi.fn().mockImplementation(async (_url: string, init: {signal: AbortSignal}) => ({
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () =>
+      new Promise((_resolve, reject) => {
+        init.signal.addEventListener('abort', () => {
+          reject(Object.assign(new Error('The operation was aborted'), {name: 'AbortError'}))
+        })
+      }),
+  }))
+}
+
+describe('WorkspaceClient — a stalled response body is bounded by the call ceiling', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+
+  const CALLS = [
+    [
+      'previewRecovery',
+      45_000,
+      async (c: ReturnType<typeof makeClient>) => c.previewRecovery(makePreviewRecoveryRequest()),
+    ],
+    ['recover', 300_000, async (c: ReturnType<typeof makeClient>) => c.recover(makeExecuteRecoveryRequest())],
+    ['update', 100_000, async (c: ReturnType<typeof makeClient>) => c.update(makeUpdateRequest())],
+  ] as const
+
+  it.each(CALLS)(
+    '%s: headers then a body that never settles returns timeout at the ceiling, not before',
+    async (_name, ceilingMs, call) => {
+      // #given
+      vi.useFakeTimers()
+      vi.stubGlobal('fetch', mockStalledBodyFetch())
+      const client = makeClient()
+
+      // #when
+      const resultPromise = call(client)
+      let settled = false
+      resultPromise.then(
+        () => {
+          settled = true
+        },
+        () => {
+          settled = true
+        },
+      )
+      await vi.advanceTimersByTimeAsync(ceilingMs - 1)
+      const settledEarly = settled
+      await vi.advanceTimersByTimeAsync(1)
+
+      // #then a body-read abort is a timeout, never a parse-error
+      expect(settledEarly).toBe(false)
+      expect(await resultPromise).toEqual(err({kind: 'timeout'}))
+    },
+  )
+
+  it.each(CALLS)(
+    '%s: a body read that errors for another reason is still a parse-error',
+    async (_name, _ceilingMs, call) => {
+      // #given
+      vi.stubGlobal(
+        'fetch',
+        mockFetch({
+          ok: true,
+          status: 200,
+          json: async () => {
+            throw new SyntaxError('bad json')
+          },
+        }),
+      )
+
+      // #when / #then
+      expect(await call(makeClient())).toEqual(err({kind: 'parse-error'}))
+    },
+  )
+
+  it.each(CALLS)('%s: leaves no timer armed after the body is parsed', async (_name, _ceilingMs, call) => {
+    // #given
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', mockFetch({ok: true, status: 200, json: async () => ({unexpected: 'shape'})}))
+
+    // #when
+    await call(makeClient())
+
+    // #then
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it.each(CALLS)(
+    '%s: a non-accepted status returns http-error without reading the body, and clears its timer',
+    async (_name, _ceilingMs, call) => {
+      // #given a 500 whose body would stall forever
+      vi.useFakeTimers()
+      vi.stubGlobal('fetch', mockStalledBodyFetch(500))
+
+      // #when
+      const result = await call(makeClient())
+
+      // #then
+      expect(result).toEqual(err({kind: 'http-error', status: 500}))
+      expect(vi.getTimerCount()).toBe(0)
+    },
+  )
 })

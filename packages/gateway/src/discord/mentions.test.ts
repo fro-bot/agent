@@ -175,7 +175,8 @@ function makeRunMentionDeps(): MentionDeps['run'] {
     }),
     previewRecovery: vi.fn(),
     recover: vi.fn(),
-    recoveryBudgetMs: 445_000,
+    listBackups: vi.fn(),
+    recoveryBudgetMs: 514_000,
   }
 }
 

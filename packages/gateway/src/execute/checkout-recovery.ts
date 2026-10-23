@@ -25,11 +25,16 @@ import type {GatewayLogger} from '../discord/client.js'
 import type {
   ExecuteRecoveryResult,
   ExecuteRecoveryWorkspaceError,
+  ListBackupsResult,
+  ListBackupsWorkspaceError,
   PreviewRecoveryResult,
   PreviewRecoveryWorkspaceError,
   RetentionUsage,
 } from '../workspace-api/types.js'
 import type {RepoQuiescenceChecker} from './repo-quiescence.js'
+
+import {totalRecoveryCeilingMs} from '../workspace-api/client.js'
+import {REPO_QUIESCENCE_TIMEOUT_MS} from './repo-quiescence.js'
 
 /** `RunMentionDeps.previewRecovery`: mints the installation token itself, like `update`. */
 export type PreviewRecoveryFn = (
@@ -44,10 +49,17 @@ export type RecoverFn = (
   options: {readonly fingerprint: string; readonly runId: string},
 ) => Promise<Result<ExecuteRecoveryResult, ExecuteRecoveryWorkspaceError>>
 
+/** `RunMentionDeps.listBackups`: bounded by the workspace client's own `listBackupsTimeoutMs`. */
+export type ListBackupsFn = (
+  owner: string,
+  repo: string,
+) => Promise<Result<ListBackupsResult, ListBackupsWorkspaceError>>
+
 export interface CheckoutRecoveryDeps {
   readonly checkRepoQuiescence: RepoQuiescenceChecker
   readonly previewRecovery: PreviewRecoveryFn
   readonly recover: RecoverFn
+  readonly listBackups: ListBackupsFn
   readonly logger: GatewayLogger
 }
 
@@ -60,7 +72,7 @@ export interface AutoRecoverRequest {
   readonly runId: string
   /** What is left of the run's wall-clock budget right now. */
   readonly remainingBudgetMs: number
-  /** Worst-case cost of preview + recover + the follow-up update (`totalRecoveryCeilingMs`). */
+  /** Worst-case cost of the whole attempt (`totalRecoveryBudgetMs`). */
   readonly requiredBudgetMs: number
 }
 
@@ -84,6 +96,7 @@ export type RecoveryDeclineReason =
 /** Something may have moved, or the result is unknown. */
 export type RecoveryAmbiguousReason =
   | 'timeout'
+  | 'rollback-failed'
   | 'transport-error'
   | 'unexpected-result'
   | 'quarantine-failed'
@@ -91,11 +104,34 @@ export type RecoveryAmbiguousReason =
   | 'verification-failed'
   | 'termination-unconfirmed'
 
+/**
+ * What the run's own backup lookup found after an ambiguous outcome. `found`: the workspace did
+ * complete the swap (the backup is attributed to this run id). `not-found`: no backup carries this
+ * run id. `failed`: the lookup itself could not answer. Only `found` lets the reply name an id.
+ */
+export type BackupLookup =
+  {readonly kind: 'found'; readonly backupId: string} | {readonly kind: 'not-found'} | {readonly kind: 'failed'}
+
 export type CheckoutRecoveryOutcome =
   | {readonly kind: 'recovered'; readonly backupId: string}
   | {readonly kind: 'declined'; readonly reason: 'quota-exceeded'; readonly usage: RetentionUsage}
   | {readonly kind: 'declined'; readonly reason: Exclude<RecoveryDeclineReason, 'quota-exceeded'>}
+  | {readonly kind: 'ambiguous'; readonly reason: RecoveryAmbiguousReason; readonly backup: BackupLookup}
+
+/** What `classifyRecover` returns: an ambiguous outcome has not been looked up yet. */
+type ClassifiedOutcome =
+  | Exclude<CheckoutRecoveryOutcome, {readonly kind: 'ambiguous'}>
   | {readonly kind: 'ambiguous'; readonly reason: RecoveryAmbiguousReason}
+
+/**
+ * Worst-case wall-clock cost of one whole automatic-recovery attempt: the quiescence check, then every
+ * workspace call (`totalRecoveryCeilingMs`: preview, recover with its dispose, the backup lookup, the
+ * follow-up `update`), each at the ceiling the client is configured with. A run with less budget left
+ * than this must not start one it could not finish.
+ */
+export function totalRecoveryBudgetMs(options: Parameters<typeof totalRecoveryCeilingMs>[0] = {}): number {
+  return REPO_QUIESCENCE_TIMEOUT_MS + totalRecoveryCeilingMs(options)
+}
 
 type PreviewDecision =
   | {readonly kind: 'proceed'; readonly fingerprint: string}
@@ -125,7 +161,7 @@ function classifyPreview(result: Result<PreviewRecoveryResult, PreviewRecoveryWo
 
 function classifyRecoverFailure(
   reason: Extract<ExecuteRecoveryResult, {readonly kind: 'failed'}>['reason'],
-): CheckoutRecoveryOutcome {
+): ClassifiedOutcome {
   switch (reason) {
     // Returned before any journal, staging or rename exists.
     case 'inspection-failed':
@@ -134,6 +170,10 @@ function classifyRecoverFailure(
     // Pre-quarantine: staging is removed and the journal rolled back; the checkout was never touched.
     case 'build-failed':
       return {kind: 'declined', reason}
+    // The rollback of a pre-quarantine failure could not be confirmed: a `building` journal (and
+    // possibly staging) is left behind. The original is untouched, but this is not a clean decline;
+    // the follow-up `update` reports `needs-recovery` for it.
+    case 'rollback-failed':
     // From the `quarantining` journal onward the original may already be renamed away.
     case 'quarantine-failed':
     case 'install-failed':
@@ -143,9 +183,7 @@ function classifyRecoverFailure(
   }
 }
 
-function classifyRecover(
-  result: Result<ExecuteRecoveryResult, ExecuteRecoveryWorkspaceError>,
-): CheckoutRecoveryOutcome {
+function classifyRecover(result: Result<ExecuteRecoveryResult, ExecuteRecoveryWorkspaceError>): ClassifiedOutcome {
   // The request may have reached the workspace before the transport failed, so none of these prove
   // that nothing moved.
   if (result.success === false) {
@@ -171,12 +209,45 @@ function classifyRecover(
 
 function logOutcome(logger: GatewayLogger, request: AutoRecoverRequest, outcome: CheckoutRecoveryOutcome): void {
   const base = {repo: request.repoSlug, runId: request.runId, outcome: outcome.kind}
-  logger.warn(
-    outcome.kind === 'recovered' ? {...base, backupId: outcome.backupId} : {...base, reason: outcome.reason},
-    outcome.kind === 'recovered'
-      ? 'run: dirty checkout recovered automatically'
-      : `run: automatic checkout recovery ${outcome.kind}`,
-  )
+  switch (outcome.kind) {
+    case 'recovered':
+      logger.warn({...base, backupId: outcome.backupId}, 'run: dirty checkout recovered automatically')
+      return
+    case 'declined':
+      logger.warn({...base, reason: outcome.reason}, 'run: automatic checkout recovery declined')
+      return
+    case 'ambiguous':
+      // The backup lookup rides on this one line: `found` adds the id, never a path.
+      logger.warn(
+        {
+          ...base,
+          reason: outcome.reason,
+          lookup: outcome.backup.kind,
+          ...(outcome.backup.kind === 'found' ? {backupId: outcome.backup.backupId} : {}),
+        },
+        'run: automatic checkout recovery ambiguous',
+      )
+  }
+}
+
+/**
+ * Finds this run's backup after an ambiguous outcome. The recover request may have completed the swap
+ * even though the caller never saw the answer, so the backup is looked up by the run id the workspace
+ * recorded in its metadata. The lookup is bounded by the workspace client's own listBackups timeout;
+ * any failure is `failed`, never an error, and a lookup can never turn an outcome into a decline.
+ */
+async function lookUpOwnBackup(deps: CheckoutRecoveryDeps, request: AutoRecoverRequest): Promise<BackupLookup> {
+  try {
+    const listed = await deps.listBackups(request.owner, request.repo)
+    if (listed.success === false || listed.data.kind !== 'ok') return {kind: 'failed'}
+    const mine = listed.data.backups
+      .filter(entry => entry.runId === request.runId)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    const newest = mine[0]
+    return newest === undefined ? {kind: 'not-found'} : {kind: 'found', backupId: newest.id}
+  } catch {
+    return {kind: 'failed'}
+  }
 }
 
 /**
@@ -197,7 +268,8 @@ export async function tryAutoRecoverDirtyCheckout(
   }
 
   // Preparation is not wired to the operator cancel signal (deferred), so this signal never aborts;
-  // the checker applies its own 4s timeout. A throwing checker is `unknown`: fail closed.
+  // the checker applies its own timeout (`REPO_QUIESCENCE_TIMEOUT_MS`). A throwing checker is
+  // `unknown`: fail closed.
   let quiescence: Awaited<ReturnType<RepoQuiescenceChecker>> | undefined
   try {
     quiescence = await deps.checkRepoQuiescence({repo: request.repoSlug, signal: new AbortController().signal})
@@ -216,13 +288,14 @@ export async function tryAutoRecoverDirtyCheckout(
   if (preview.kind === 'declined') return finish({kind: 'declined', reason: preview.reason})
 
   // From here on the workspace may have acted, so a throw is ambiguous, not a decline.
-  let outcome: CheckoutRecoveryOutcome
+  let classified: ClassifiedOutcome
   try {
-    outcome = classifyRecover(
+    classified = classifyRecover(
       await deps.recover(request.owner, request.repo, {fingerprint: preview.fingerprint, runId: request.runId}),
     )
   } catch {
-    outcome = {kind: 'ambiguous', reason: 'transport-error'}
+    classified = {kind: 'ambiguous', reason: 'transport-error'}
   }
-  return finish(outcome)
+  if (classified.kind !== 'ambiguous') return finish(classified)
+  return finish({...classified, backup: await lookUpOwnBackup(deps, request)})
 }

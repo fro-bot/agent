@@ -40,22 +40,46 @@ import {
 } from './update-fixtures/helpers.js'
 import {executeUpdate} from './update.js'
 
-// Pass-through wrapper around the real ownership handoff so a test can fire an abort at the
-// exact boundary just after the handoff, the last point `executeRecovery` honours a client abort.
-const handoffHook = vi.hoisted(() => ({after: undefined as (() => void) | undefined}))
+// Pass-through wrappers around the real ownership handoff and the real journal store, so a test can
+// fire an abort just after the handoff (the last boundary `executeRecovery` honours a client abort),
+// force the handoff to fail, or make a rollback's journal write/remove throw.
+const handoffHook = vi.hoisted(() => ({
+  after: undefined as (() => void) | undefined,
+  failWith: undefined as {readonly ok: false; readonly reason: 'deadline-exceeded'; readonly path: string} | undefined,
+}))
+const journalHook = vi.hoisted(() => ({failRemove: false, failWriteOfKind: undefined as string | undefined}))
 type HandoffModule = typeof import('./handoff.js')
+type JournalModule = typeof import('./journal.js')
 
 vi.mock('./handoff.js', async importOriginal => {
   const actual = await importOriginal<HandoffModule>()
   return {
     ...actual,
     handOffToAgent: async (...args: Parameters<HandoffModule['handOffToAgent']>) => {
-      const result = await actual.handOffToAgent(...args)
+      const result = handoffHook.failWith ?? (await actual.handOffToAgent(...args))
       handoffHook.after?.()
       return result
     },
   }
 })
+
+vi.mock('./journal.js', async importOriginal => {
+  const actual = await importOriginal<JournalModule>()
+  return {
+    ...actual,
+    removeJournal: async (...args: Parameters<JournalModule['removeJournal']>) => {
+      if (journalHook.failRemove) throw new Error('journal remove failed')
+      return actual.removeJournal(...args)
+    },
+    writeJournal: async (...args: Parameters<JournalModule['writeJournal']>) => {
+      if (journalHook.failWriteOfKind !== undefined && args[1].kind === journalHook.failWriteOfKind) {
+        throw new Error('journal write failed')
+      }
+      return actual.writeJournal(...args)
+    },
+  }
+})
+
 // Every describe in this file drives real git (staging clones, pack import, quarantine, size walks).
 // File-level so no describe is left on vitest's 5s default under load.
 vi.setConfig({testTimeout: REAL_GIT_TEST_TIMEOUT_MS})
@@ -70,6 +94,9 @@ let checkoutHome: string
 
 beforeEach(async () => {
   handoffHook.after = undefined
+  handoffHook.failWith = undefined
+  journalHook.failRemove = false
+  journalHook.failWriteOfKind = undefined
   reposRoot = await makeTempDir('recover-test-repos-')
   checkoutHome = await makeTempDir('recover-test-checkout-home-')
   resetRepoLocksForTesting()
@@ -2613,4 +2640,217 @@ describe('executeRecovery \u2014 OpenCode instance dispose is never sent for a r
       }
     },
   )
+})
+
+// ---------------------------------------------------------------------------
+// A pre-quarantine rollback that is not confirmed is `rollback-failed`, never `build-failed`
+//
+// `build-failed` promises "staging removed, journal rolled back, original untouched". When the
+// rollback itself throws, a `building` journal and possibly staging stay behind, and the caller
+// must not treat that as a clean decline.
+// ---------------------------------------------------------------------------
+
+const ROLLBACK_FAILED_RESULT = {kind: 'failed', reason: 'rollback-failed'} as const
+
+const WRITER_FAILED_PACK_STREAM: NonNullable<ExecuteRecoveryDeps['packStreamRunner']> = async () =>
+  ({
+    kind: 'failed',
+    reason: 'writer-failed',
+    writer: {exitCode: 1, signal: null},
+    reader: {exitCode: null, signal: null},
+  }) as const
+
+async function expectBuildingJournalLeftBehind(): Promise<void> {
+  const read = await readJournal(join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME), OWNER, REPO)
+  expect(read.ok).toBe(true)
+  expect(read.ok === true ? read.journal : undefined).toMatchObject({kind: 'recovery', phase: 'building'})
+}
+
+describe.skipIf(!OPENSSL_AVAILABLE)('executeRecovery \u2014 an unconfirmed rollback is rollback-failed', () => {
+  const FAILURES = [
+    [
+      'the build failed and staging removal throws',
+      {packStreamRunner: WRITER_FAILED_PACK_STREAM, removeStaging: async () => Promise.reject(new Error('rm failed'))},
+      () => {},
+    ],
+    [
+      'the build failed and the journal remove throws',
+      {packStreamRunner: WRITER_FAILED_PACK_STREAM},
+      () => {
+        journalHook.failRemove = true
+      },
+    ],
+    [
+      'the handoff failed and staging removal throws',
+      {removeStaging: async () => Promise.reject(new Error('rm failed'))},
+      () => {
+        handoffHook.failWith = {ok: false, reason: 'deadline-exceeded', path: '/x'}
+      },
+    ],
+    [
+      'the handoff failed and the journal remove throws',
+      {},
+      () => {
+        handoffHook.failWith = {ok: false, reason: 'deadline-exceeded', path: '/x'}
+        journalHook.failRemove = true
+      },
+    ],
+    [
+      'a client abort rolled back and staging removal throws',
+      {removeStaging: async () => Promise.reject(new Error('rm failed'))},
+      () => {
+        // aborts right after the handoff, the last honoured boundary (wired per test below)
+      },
+    ],
+  ] as const
+
+  it.each(FAILURES)(
+    '%s: result is rollback-failed, the building journal stays, the original is untouched, nothing is disposed',
+    async (label, extraDeps, arrange) => {
+      // #given
+      const {fingerprint, manifest} = await setupDirtyCheckout()
+      const fixture = await setupNetworkFixture()
+      try {
+        const disposeInstance = vi.fn(async () => ({kind: 'disposed'}) as const)
+        const controller = new AbortController()
+        arrange()
+        if (label.startsWith('a client abort')) handoffHook.after = () => controller.abort()
+
+        // #when
+        const result = await executeRecovery(
+          {...recoverReq(fixture), fingerprint},
+          recoveryDeps(fixture, {...extraDeps, disposeInstance, signal: controller.signal}),
+        )
+
+        // #then it is explicitly NOT the clean-decline reason
+        expect(result).toEqual(ROLLBACK_FAILED_RESULT)
+        expect(disposeInstance).not.toHaveBeenCalled()
+        await expectBuildingJournalLeftBehind()
+        expect(await buildContentManifest(destPathFor())).toEqual(manifest)
+      } finally {
+        await fixture.close()
+      }
+    },
+  )
+
+  it('a client abort right after the staging build (boundary 4) with a failing rollback is rollback-failed too', async () => {
+    // #given the abort lands as the pack import finishes, before the ownership handoff
+    const {fingerprint, manifest} = await setupDirtyCheckout()
+    const fixture = await setupNetworkFixture()
+    try {
+      const controller = new AbortController()
+      const packStreamRunner: NonNullable<ExecuteRecoveryDeps['packStreamRunner']> = async options => {
+        const outcome = await runPackStream(options)
+        controller.abort()
+        return outcome
+      }
+
+      // #when
+      const result = await executeRecovery(
+        {...recoverReq(fixture), fingerprint},
+        recoveryDeps(fixture, {
+          packStreamRunner,
+          signal: controller.signal,
+          removeStaging: async () => Promise.reject(new Error('rm failed')),
+        }),
+      )
+
+      // #then
+      expect(result).toEqual(ROLLBACK_FAILED_RESULT)
+      await expectBuildingJournalLeftBehind()
+      expect(await buildContentManifest(destPathFor())).toEqual(manifest)
+    } finally {
+      await fixture.close()
+    }
+  })
+
+  it('a superseded update journal that cannot be restored is rollback-failed, and the building journal stays', async () => {
+    // #given an interrupted update this recovery would take over, and a rollback that cannot rewrite it
+    await setupCleanCheckout()
+    const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
+    await writeJournal(journalsDir, {
+      kind: 'update',
+      owner: OWNER,
+      repo: REPO,
+      phase: 'applying',
+      fromSha: '0'.repeat(40),
+      toSha: '1'.repeat(40),
+      startedAt: new Date().toISOString(),
+    })
+    const preview = await previewRecovery(req(), deps())
+    if (preview.kind !== 'recoverable-update') throw new Error('unreachable')
+    const fixture = await setupNetworkFixture()
+    try {
+      journalHook.failWriteOfKind = 'update'
+
+      // #when
+      const result = await executeRecovery(
+        {...recoverReq(fixture), fingerprint: preview.update.fingerprint},
+        recoveryDeps(fixture, {packStreamRunner: WRITER_FAILED_PACK_STREAM}),
+      )
+
+      // #then
+      expect(result).toEqual(ROLLBACK_FAILED_RESULT)
+      await expectBuildingJournalLeftBehind()
+    } finally {
+      await fixture.close()
+    }
+  })
+
+  it('a confirmed rollback is still build-failed (the clean decline), and leaves no journal', async () => {
+    // #given
+    const {fingerprint, manifest} = await setupDirtyCheckout()
+    const fixture = await setupNetworkFixture()
+    try {
+      // #when
+      const result = await executeRecovery(
+        {...recoverReq(fixture), fingerprint},
+        recoveryDeps(fixture, {packStreamRunner: WRITER_FAILED_PACK_STREAM}),
+      )
+
+      // #then
+      expect(result).toEqual({kind: 'failed', reason: 'build-failed'})
+      await expectNothingMoved(manifest)
+    } finally {
+      await fixture.close()
+    }
+  })
+
+  it('the next /update after an unconfirmed rollback refuses needs-recovery, and a preview refuses journal-in-progress', async () => {
+    // #given a rollback-failed recovery
+    const {fingerprint} = await setupDirtyCheckout()
+    const fixture = await setupNetworkFixture()
+    try {
+      const result = await executeRecovery(
+        {...recoverReq(fixture), fingerprint},
+        recoveryDeps(fixture, {
+          packStreamRunner: WRITER_FAILED_PACK_STREAM,
+          removeStaging: async () => Promise.reject(new Error('rm failed')),
+        }),
+      )
+      expect(result).toEqual(ROLLBACK_FAILED_RESULT)
+
+      // #when / #then the workspace reports what a caller observes in that state
+      const host = new URL(fixture.remoteBaseUrl).host
+      const update = await executeUpdate(
+        {owner: OWNER, repo: REPO, token: fixture.token},
+        {
+          reposRoot,
+          options: {uid: process.getuid?.(), gid: process.getgid?.(), timeoutMs: 10_000},
+          remoteBaseUrl: fixture.remoteBaseUrl,
+          caBundlePath: fixture.caBundlePath,
+          askpassWriter: async d => writeLoopbackAskpassHelper(d, host),
+          serviceHome: checkoutHome,
+        },
+      )
+      expect(update).toEqual({kind: 'refused', reason: 'needs-recovery'})
+      expect(await previewRecovery(req(), deps())).toEqual({
+        kind: 'refused',
+        reason: 'journal-in-progress',
+        phase: 'building',
+      })
+    } finally {
+      await fixture.close()
+    }
+  })
 })

@@ -20,7 +20,7 @@ import type {
   UpdateWorkspaceError,
   WorkspaceError,
 } from '../workspace-api/types.js'
-import type {PreviewRecoveryFn, RecoverFn} from './checkout-recovery.js'
+import type {ListBackupsFn, PreviewRecoveryFn, RecoverFn} from './checkout-recovery.js'
 import type {ConcurrencyRegistry} from './concurrency.js'
 import type {LaunchAdmission, LaunchWorkRequest, PostReplyFactory, ReplySink, StatusSink} from './launch-types.js'
 import type {CheckoutPreparation, CheckoutProvenance} from './provenance.js'
@@ -73,7 +73,7 @@ import {
   formatRecoveryBlockedReply,
   RECOVER_SUFFIX,
   RECOVERY_ATTEMPTED_NOTE,
-  withRecoveredNote,
+  withRecoveryNote,
 } from './preparation-reply.js'
 import {buildDiscordPrompt, EmptyPromptError} from './prompt.js'
 import {
@@ -241,6 +241,11 @@ export interface RunMentionDeps {
    * caller as `previewRecovery`.
    */
   readonly recover: RecoverFn
+  /**
+   * Lists the repo's preserved checkouts. After an ambiguous recovery outcome the run looks up its own
+   * backup (matched by run id) so a reply can name it. Bounded by the workspace client's own timeout.
+   */
+  readonly listBackups: ListBackupsFn
   /**
    * Run budget, in milliseconds, an automatic recovery needs left before it may start: the preview,
    * recover and follow-up `update` ceilings of the configured workspace client
@@ -799,7 +804,17 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     persona,
     logger,
   } = deps
-  const {approvalRegistry, approvalMode, ensureClone, readyz, update, previewRecovery, recover, recoveryBudgetMs} = deps
+  const {
+    approvalRegistry,
+    approvalMode,
+    ensureClone,
+    readyz,
+    update,
+    previewRecovery,
+    recover,
+    listBackups,
+    recoveryBudgetMs,
+  } = deps
 
   // ── All mutable state that the outer finally needs is declared here so the
   // finally block can always reference channelId regardless of where execution
@@ -1258,8 +1273,11 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       //
       // Preparation is not wired to the operator cancel signal (registered only after EXECUTING), so
       // this window - up to the preview + recover + update ceilings - cannot be cancelled. Deferred.
-      let recoveredBackupId: string | undefined
-      let recoveryAttempted = false
+      // One line telling the operator what happened to the previous checkout, set only once a recovery
+      // was attempted and not declined: the confirmed (or looked-up) backup id, else the attempted note.
+      // It rides on EVERY reply path below - refusal, follow-up timeout, thrown error, substituted
+      // checkout and a continued run's provenance line - exactly once.
+      let recoveryNote: string | undefined
       if (
         updateResult.success === true &&
         updateResult.data.kind === 'refused' &&
@@ -1267,7 +1285,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       ) {
         const dirtyRefusal = updateResult.data
         const recoveryOutcome = await tryAutoRecoverDirtyCheckout(
-          {checkRepoQuiescence: deps.checkRepoQuiescence, previewRecovery, recover, logger},
+          {checkRepoQuiescence: deps.checkRepoQuiescence, previewRecovery, recover, listBackups, logger},
           {
             owner: workspaceTarget.owner,
             repo: workspaceTarget.repo,
@@ -1292,17 +1310,22 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           )
         }
         if (recoveryOutcome.kind !== 'declined') {
-          recoveryAttempted = true
-          recoveredBackupId = recoveryOutcome.kind === 'recovered' ? recoveryOutcome.backupId : undefined
+          const backupId =
+            recoveryOutcome.kind === 'recovered'
+              ? recoveryOutcome.backupId
+              : recoveryOutcome.backup.kind === 'found'
+                ? recoveryOutcome.backup.backupId
+                : undefined
+          recoveryNote = backupId === undefined ? RECOVERY_ATTEMPTED_NOTE : formatRecoveredNote(backupId)
           updateResult = await update(workspaceTarget.owner, workspaceTarget.repo, {
             remainingBudgetMs: remainingUpdateBudgetMs(),
           })
-          // Any failure from here on that is not a refusal reply (a thrown RunCoreError) still names the backup.
-          if (recoveredBackupId !== undefined) provenanceLine = formatRecoveredNote(recoveredBackupId)
+          // Any failure from here on that is not a refusal reply (a thrown RunCoreError) still carries the note.
+          provenanceLine = recoveryNote
         }
       }
       const withBackupNote = (replyText: string): string =>
-        recoveredBackupId === undefined ? replyText : withRecoveredNote(replyText, recoveredBackupId)
+        recoveryNote === undefined ? replyText : withRecoveryNote(replyText, recoveryNote)
 
       if (updateResult.success === false) {
         // A client-side timeout means neither side knows what happened — distinct "state unknown"
@@ -1335,7 +1358,10 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           {channelId, owner: binding.owner, repo: binding.repo},
           'run: checkout-substituted — tree is not the expected repository, aborting',
         )
-        provenanceLine = formatSubstitutedCheckoutLine(repo)
+        provenanceLine =
+          recoveryNote === undefined
+            ? formatSubstitutedCheckoutLine(repo)
+            : `${formatSubstitutedCheckoutLine(repo)}\n${recoveryNote}`
         throw new RunCoreError('checkout-substituted', 'update refused: checkout-substituted')
       }
 
@@ -1369,11 +1395,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       provenanceLine = formatProvenanceLine(repo, provenance)
       // A run that continues on a recovered checkout says so in the same deterministic line, so the
       // note reaches every final reply exactly once through the provenance delivery helpers above.
-      if (recoveredBackupId !== undefined) {
-        provenanceLine = `${provenanceLine}\n${formatRecoveredNote(recoveredBackupId)}`
-      } else if (recoveryAttempted) {
-        provenanceLine = `${provenanceLine}\n${RECOVERY_ATTEMPTED_NOTE}`
-      }
+      if (recoveryNote !== undefined) provenanceLine = `${provenanceLine}\n${recoveryNote}`
 
       // Persist the STARTING provenance atomically with the EXECUTING phase write —
       // reusing the existing detailsPatch mechanism rather than a separate write. This

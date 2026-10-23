@@ -10,6 +10,7 @@ import {
   makeDeps,
   makeEnsureCloneFn,
   makeInMemoryRequest,
+  makeListBackupsFn,
   makeMessage,
   makePreviewRecoveryFn,
   makeQuiescenceFn,
@@ -22,9 +23,10 @@ import {
   setupHappyPath,
 } from './test-helpers.js'
 import {abortRegistry} from './abort-registry.js'
-import type {PreviewRecoveryFn, RecoverFn} from './checkout-recovery.js'
+import {totalRecoveryBudgetMs} from './checkout-recovery.js'
+import type {ListBackupsFn, PreviewRecoveryFn, RecoverFn} from './checkout-recovery.js'
 import {parseRecoverEntryCustomId} from '../discord/recover-checkout-button.js'
-import {CLIENT_TIMEOUT_REPLY, RECOVER_SUFFIX} from './preparation-reply.js'
+import {CLIENT_TIMEOUT_REPLY, RECOVER_SUFFIX, RECOVERY_ATTEMPTED_NOTE} from './preparation-reply.js'
 /* eslint-enable perfectionist/sort-imports */
 
 // ---------------------------------------------------------------------------
@@ -571,6 +573,7 @@ interface RecoveryRunOptions {
   readonly quiescence?: 'clear' | 'busy' | 'unknown'
   readonly preview?: ReturnType<typeof vi.fn>
   readonly recover?: ReturnType<typeof vi.fn>
+  readonly listBackups?: ReturnType<typeof vi.fn>
   readonly surface?: 'discord' | 'web'
   readonly runTimeoutMs?: number
 }
@@ -582,17 +585,19 @@ async function launchRecoveryRun(options: RecoveryRunOptions) {
   const checkRepoQuiescence = makeQuiescenceFn(options.quiescence ?? 'clear')
   const previewRecovery = options.preview ?? makePreviewRecoveryFn()
   const recover = options.recover ?? makeRecoverFn()
+  const listBackups = options.listBackups ?? makeListBackupsFn()
   const request = {...makeInMemoryRequest(), surface: options.surface ?? ('discord' as const)}
   const deps = makeDeps({
     update,
     checkRepoQuiescence,
     previewRecovery: previewRecovery as unknown as PreviewRecoveryFn,
     recover: recover as unknown as RecoverFn,
+    listBackups: listBackups as unknown as ListBackupsFn,
     ...(options.runTimeoutMs === undefined ? {} : {runTimeoutMs: options.runTimeoutMs}),
   })
   const admission = await awaitLaunchWorkRun(launchWork, request, deps)
   const runId = admission.accepted === true ? admission.runId : ''
-  return {request, deps, runId, update, checkRepoQuiescence, previewRecovery, recover}
+  return {request, deps, runId, update, checkRepoQuiescence, previewRecovery, recover, listBackups}
 }
 
 function transitionPhases(): string[] {
@@ -730,10 +735,10 @@ describe('checkout preparation: automatic recovery is gated', () => {
     vi.clearAllMocks()
   })
 
-  it("keeps today's refusal, calling nothing, when the remaining budget is below the required ceiling sum", async () => {
-    // #given a run budget (400s) under preview 45s + recover 300s + update 100s
+  it("keeps today's refusal, calling nothing, when the run budget is one below the required sum (514s by default)", async () => {
+    // #given a run budget one millisecond under quiescence + preview + recover + dispose + lookup + update
     // #when
-    const run = await launchRecoveryRun({updates: [DIRTY], runTimeoutMs: 400_000})
+    const run = await launchRecoveryRun({updates: [DIRTY], runTimeoutMs: totalRecoveryBudgetMs() - 1})
 
     // #then
     expect(run.checkRepoQuiescence).not.toHaveBeenCalled()
@@ -911,6 +916,7 @@ const AMBIGUOUS_RECOVERS: readonly (readonly [string, unknown])[] = [
   ['an http error', {success: false, error: {kind: 'http-error', status: 500}}],
   ['a parse error', {success: false, error: {kind: 'parse-error'}}],
   ['no-checkout', {success: true, data: {kind: 'no-checkout'}}],
+  ['rollback-failed', {success: true, data: {kind: 'failed', reason: 'rollback-failed'}}],
   ['quarantine-failed', {success: true, data: {kind: 'failed', reason: 'quarantine-failed'}}],
   ['install-failed', {success: true, data: {kind: 'failed', reason: 'install-failed'}}],
   ['verification-failed', {success: true, data: {kind: 'failed', reason: 'verification-failed'}}],
@@ -937,7 +943,9 @@ describe('checkout preparation: a recover outcome where something may have moved
       const reply = refusalReply(run.request)
       expect(reply.content).toContain('A previous update to this checkout was interrupted and needs recovery')
       expect(reply.content).not.toContain(DIRTY_CLAUSE)
-      expect(reply.content).not.toContain('backup')
+      // no backup matched this run, so the reply carries the attempted note (once) and no id
+      expect(occurrences(reply.content, RECOVERY_ATTEMPTED_NOTE)).toBe(1)
+      expect(reply.content).not.toContain(DEFAULT_BACKUP_ID)
       expect(reply.components).toHaveLength(1)
       expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
     },
@@ -974,7 +982,8 @@ describe('checkout preparation: a recover outcome where something may have moved
     expect(recover).toHaveBeenCalledOnce()
     const reply = refusalReply(run.request)
     expect(reply.content).toContain(DIRTY_CLAUSE)
-    expect(reply.content).not.toContain('backup')
+    expect(occurrences(reply.content, RECOVERY_ATTEMPTED_NOTE)).toBe(1)
+    expect(reply.content).not.toContain(DEFAULT_BACKUP_ID)
   })
 })
 
@@ -1123,5 +1132,320 @@ describe('checkout preparation: the session directory after a recovery', () => {
     expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
     const coreArgs = mockRunOpenCodeCore.mock.calls[0]?.[0] as {directory?: string} | undefined
     expect(coreArgs?.directory).toBe(`/workspace/repos/${OWNER}/${REPO}`)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// After an ambiguous recovery outcome the run looks up its OWN backup by run id. A found id is named on
+// every reply path exactly like a `recovered` one; a missing or unanswerable lookup falls back to the
+// attempted note on every one of those paths.
+// ---------------------------------------------------------------------------
+
+const BACKUP_ID = 'gen-found-1'
+const TIMEOUT_RECOVER = {success: false, error: {kind: 'timeout'}}
+
+/** A recover mock that answers `result` and remembers the run id it was given. */
+function makeRunIdCapturingRecover(result: unknown) {
+  const captured: {runId?: string} = {}
+  const recover = vi.fn().mockImplementation(async (_owner: string, _repo: string, opts: {runId: string}) => {
+    captured.runId = opts.runId
+    return result
+  })
+  return {recover, captured}
+}
+
+/** A listBackups mock whose single entry is attributed to whichever run id `recover` was given. */
+function makeAttributedListing(captured: {runId?: string}, id = BACKUP_ID) {
+  return vi.fn().mockImplementation(async () => ({
+    success: true as const,
+    data: {
+      kind: 'ok' as const,
+      totalBytes: 1,
+      backups: [
+        {
+          id,
+          metadataOk: true,
+          createdAt: '2026-01-01T00:00:00.000Z',
+          sizeBytes: 1,
+          sizeComplete: true,
+          originalHeadSha: undefined,
+          originalBranch: undefined,
+          runId: captured.runId,
+        },
+        {
+          id: 'gen-someone-else',
+          metadataOk: true,
+          createdAt: '2026-01-02T00:00:00.000Z',
+          sizeBytes: 1,
+          sizeComplete: true,
+          originalHeadSha: undefined,
+          originalBranch: undefined,
+          runId: 'another-run',
+        },
+      ],
+    },
+  }))
+}
+
+/** The failure text the status sink was asked to resolve a thrown error to. */
+function failureText(run: Awaited<ReturnType<typeof launchRecoveryRun>>): string {
+  const resolveToFailure = run.request._statusSink.resolveToFailure as unknown as ReturnType<typeof vi.fn>
+  expect(resolveToFailure).toHaveBeenCalledOnce()
+  return resolveToFailure.mock.calls[0]?.[0] as string
+}
+
+describe('checkout preparation: an ambiguous recovery whose backup the lookup finds', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('looks the backup up by this run, and a ready update continues naming the id exactly once (no attempted note)', async () => {
+    // #given the recover answer was lost, but the workspace had completed the swap
+    const {recover, captured} = makeRunIdCapturingRecover(TIMEOUT_RECOVER)
+    const listBackups = makeAttributedListing(captured)
+
+    // #when
+    const run = await launchRecoveryRun({updates: [DIRTY, readyResult()], recover, listBackups})
+
+    // #then
+    expect(listBackups).toHaveBeenCalledExactlyOnceWith(OWNER, REPO)
+    expect(run.update).toHaveBeenCalledTimes(2)
+    const answer = finalAnswer(run.request)
+    expect(occurrences(answer, BACKUP_ID)).toBe(1)
+    expect(answer).not.toContain('gen-someone-else')
+    expect(answer).not.toContain(RECOVERY_ATTEMPTED_NOTE)
+    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+  })
+
+  it('names the id on a refusal from the second update, and keeps the Recover button', async () => {
+    // #given
+    const {recover, captured} = makeRunIdCapturingRecover(TIMEOUT_RECOVER)
+
+    // #when
+    const run = await launchRecoveryRun({
+      updates: [DIRTY, NEEDS_RECOVERY],
+      recover,
+      listBackups: makeAttributedListing(captured),
+    })
+
+    // #then
+    const reply = refusalReply(run.request)
+    expect(occurrences(reply.content, BACKUP_ID)).toBe(1)
+    expect(reply.content).not.toContain(RECOVERY_ATTEMPTED_NOTE)
+    expect(reply.components).toHaveLength(1)
+  })
+
+  it('names the id when the follow-up update times out', async () => {
+    // #given
+    const {recover, captured} = makeRunIdCapturingRecover(TIMEOUT_RECOVER)
+
+    // #when
+    const run = await launchRecoveryRun({
+      updates: [DIRTY, {success: false, error: {kind: 'timeout'}}],
+      recover,
+      listBackups: makeAttributedListing(captured),
+    })
+
+    // #then
+    const reply = refusalReply(run.request)
+    expect(reply.content).toContain(CLIENT_TIMEOUT_REPLY)
+    expect(occurrences(reply.content, BACKUP_ID)).toBe(1)
+  })
+
+  it('names the id in the failure when the follow-up update throws (transport error)', async () => {
+    // #given
+    const {recover, captured} = makeRunIdCapturingRecover(TIMEOUT_RECOVER)
+
+    // #when
+    const run = await launchRecoveryRun({
+      updates: [DIRTY, {success: false, error: {kind: 'network-error'}}],
+      recover,
+      listBackups: makeAttributedListing(captured),
+    })
+
+    // #then
+    expect(occurrences(failureText(run), BACKUP_ID)).toBe(1)
+    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+  })
+
+  it('names the id when the follow-up update is checkout-substituted', async () => {
+    // #given
+    const {recover, captured} = makeRunIdCapturingRecover(TIMEOUT_RECOVER)
+
+    // #when
+    const run = await launchRecoveryRun({
+      updates: [DIRTY, {success: true, data: {kind: 'refused', reason: 'checkout-substituted'}}],
+      recover,
+      listBackups: makeAttributedListing(captured),
+    })
+
+    // #then
+    expect(occurrences(failureText(run), BACKUP_ID)).toBe(1)
+  })
+
+  it('does not look anything up after a confirmed recovery', async () => {
+    // #given / #when
+    const run = await launchRecoveryRun({updates: [DIRTY, readyResult()]})
+
+    // #then the confirmed id is used directly
+    expect(run.listBackups).not.toHaveBeenCalled()
+  })
+
+  it('does not look anything up after a decline', async () => {
+    // #given / #when
+    const run = await launchRecoveryRun({updates: [DIRTY], quiescence: 'busy'})
+
+    // #then
+    expect(run.listBackups).not.toHaveBeenCalled()
+  })
+})
+
+const UNANSWERED_LOOKUPS: readonly (readonly [string, () => ReturnType<typeof vi.fn>])[] = [
+  ['finds no backup for this run', () => makeListBackupsFn()],
+  [
+    "finds only another run's backup",
+    () =>
+      vi.fn().mockResolvedValue({
+        success: true,
+        data: {
+          kind: 'ok',
+          totalBytes: 1,
+          backups: [
+            {
+              id: 'gen-other',
+              metadataOk: true,
+              createdAt: '2026-01-01T00:00:00.000Z',
+              sizeBytes: 1,
+              sizeComplete: true,
+              originalHeadSha: undefined,
+              originalBranch: undefined,
+              runId: 'another-run',
+            },
+          ],
+        },
+      }),
+  ],
+  ['fails with a timeout', () => vi.fn().mockResolvedValue({success: false, error: {kind: 'timeout'}})],
+  ['reports a workspace-side failure', () => vi.fn().mockResolvedValue({success: true, data: {kind: 'failed'}})],
+  ['throws', () => vi.fn().mockRejectedValue(new Error('boom'))],
+]
+
+describe('checkout preparation: an ambiguous recovery whose backup is not found or cannot be looked up', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it.each(UNANSWERED_LOOKUPS)(
+    'when the lookup %s, a ready update continues with the attempted note once and no id',
+    async (_label, makeListing) => {
+      // #given / #when
+      const run = await launchRecoveryRun({
+        updates: [DIRTY, readyResult()],
+        recover: vi.fn().mockResolvedValue(TIMEOUT_RECOVER),
+        listBackups: makeListing(),
+      })
+
+      // #then
+      const answer = finalAnswer(run.request)
+      expect(occurrences(answer, RECOVERY_ATTEMPTED_NOTE)).toBe(1)
+      expect(answer).not.toContain(BACKUP_ID)
+      expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+    },
+  )
+
+  it.each(UNANSWERED_LOOKUPS)(
+    'when the lookup %s, a refusal carries the attempted note once',
+    async (_label, makeListing) => {
+      // #given / #when
+      const run = await launchRecoveryRun({
+        updates: [DIRTY, NEEDS_RECOVERY],
+        recover: vi.fn().mockResolvedValue(TIMEOUT_RECOVER),
+        listBackups: makeListing(),
+      })
+
+      // #then
+      const reply = refusalReply(run.request)
+      expect(occurrences(reply.content, RECOVERY_ATTEMPTED_NOTE)).toBe(1)
+      expect(reply.components).toHaveLength(1)
+    },
+  )
+
+  it.each(UNANSWERED_LOOKUPS)(
+    'when the lookup %s, a follow-up timeout carries the attempted note once',
+    async (_label, makeListing) => {
+      // #given / #when
+      const run = await launchRecoveryRun({
+        updates: [DIRTY, {success: false, error: {kind: 'timeout'}}],
+        recover: vi.fn().mockResolvedValue(TIMEOUT_RECOVER),
+        listBackups: makeListing(),
+      })
+
+      // #then
+      const reply = refusalReply(run.request)
+      expect(reply.content).toContain(CLIENT_TIMEOUT_REPLY)
+      expect(occurrences(reply.content, RECOVERY_ATTEMPTED_NOTE)).toBe(1)
+    },
+  )
+
+  it.each(UNANSWERED_LOOKUPS)(
+    'when the lookup %s, a thrown follow-up error carries the attempted note once',
+    async (_label, makeListing) => {
+      // #given / #when
+      const run = await launchRecoveryRun({
+        updates: [DIRTY, {success: false, error: {kind: 'network-error'}}],
+        recover: vi.fn().mockResolvedValue(TIMEOUT_RECOVER),
+        listBackups: makeListing(),
+      })
+
+      // #then
+      expect(occurrences(failureText(run), RECOVERY_ATTEMPTED_NOTE)).toBe(1)
+    },
+  )
+
+  it.each(UNANSWERED_LOOKUPS)(
+    'when the lookup %s, checkout-substituted carries the attempted note once',
+    async (_label, makeListing) => {
+      // #given / #when
+      const run = await launchRecoveryRun({
+        updates: [DIRTY, {success: true, data: {kind: 'refused', reason: 'checkout-substituted'}}],
+        recover: vi.fn().mockResolvedValue(TIMEOUT_RECOVER),
+        listBackups: makeListing(),
+      })
+
+      // #then
+      expect(occurrences(failureText(run), RECOVERY_ATTEMPTED_NOTE)).toBe(1)
+    },
+  )
+})
+
+describe('checkout preparation: a recovered checkout that the follow-up update reports as substituted', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('keeps the backup note: the failure names the backup id exactly once, beside the substituted line', async () => {
+    // #given the workspace confirmed the swap, then the fresh tree is not the expected repository
+    // #when
+    const run = await launchRecoveryRun({
+      updates: [DIRTY, {success: true, data: {kind: 'refused', reason: 'checkout-substituted'}}],
+    })
+
+    // #then
+    const text = failureText(run)
+    expect(occurrences(text, DEFAULT_BACKUP_ID)).toBe(1)
+    expect(text).toContain(`${OWNER}/${REPO}`)
+    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+  })
+
+  it('a substituted checkout with no recovery involved carries no recovery note', async () => {
+    // #given / #when
+    const run = await launchRecoveryRun({
+      updates: [{success: true, data: {kind: 'refused', reason: 'checkout-substituted'}}],
+    })
+
+    // #then
+    const text = failureText(run)
+    expect(text).not.toContain(DEFAULT_BACKUP_ID)
+    expect(text).not.toContain(RECOVERY_ATTEMPTED_NOTE)
   })
 })

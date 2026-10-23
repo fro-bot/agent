@@ -401,6 +401,29 @@ describe('/fro-bot recover-checkout — confirm/cancel buttons', () => {
     expect(handle.release).toHaveBeenCalledWith('COMPLETED', expect.objectContaining({outcome: 'ok'}))
   })
 
+  it('rollback-failed: says the cleanup did not finish and the workspace must restart, not "try again"', async () => {
+    // #given the recovery stopped before moving anything, but its rollback left a journal behind
+    const guild = makeGuild(true)
+    const handle = makeReleaseHandle()
+    const deps = makeConfirmableDeps()
+    const customId = await postConfirmablePreview(deps, guild, handle)
+    vi.mocked(deps.workspaceClient.recover).mockResolvedValue({
+      success: true,
+      data: {kind: 'failed', reason: 'rollback-failed'},
+    })
+
+    // #when
+    const {interaction, editReply} = makeButtonInteraction(customId, {guild})
+    await handleRecoverConfirmOrCancelClick(interaction as never, deps)
+
+    // #then the next recover would be refused as in progress, so the reply must not invite one
+    const content = (editReply.mock.calls.at(-1)?.[0] as {content: string}).content
+    expect(content).toContain("cleanup didn't finish")
+    expect(content).toContain('restarts')
+    expect(content).not.toContain('try again')
+    expect(content).not.toContain('Run `/fro-bot recover-checkout` again')
+  })
+
   it('does not release a second time when final status rendering throws after terminal release', async () => {
     const guild = makeGuild(true)
     const handle = makeReleaseHandle()

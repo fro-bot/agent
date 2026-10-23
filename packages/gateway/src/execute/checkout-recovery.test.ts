@@ -8,7 +8,9 @@ import type {AutoRecoverRequest, CheckoutRecoveryOutcome} from './checkout-recov
 
 import {err, ok} from '@fro-bot/runtime'
 import {describe, expect, it, vi} from 'vitest'
-import {tryAutoRecoverDirtyCheckout} from './checkout-recovery.js'
+import {totalRecoveryCeilingMs} from '../workspace-api/client.js'
+import {totalRecoveryBudgetMs, tryAutoRecoverDirtyCheckout} from './checkout-recovery.js'
+import {REPO_QUIESCENCE_TIMEOUT_MS} from './repo-quiescence.js'
 import {
   DEFAULT_BACKUP_ID,
   DEFAULT_PREVIEW_FINGERPRINT,
@@ -22,7 +24,7 @@ const REQUEST: AutoRecoverRequest = {
   repoSlug: 'acme/widget',
   runId: 'run-1',
   remainingBudgetMs: 600_000,
-  requiredBudgetMs: 445_000,
+  requiredBudgetMs: totalRecoveryBudgetMs(),
 }
 
 const USAGE = {generationCount: 5, hasUnknownSize: false, totalBytes: 1000, maxGenerations: 5, maxBytes: 4096}
@@ -40,22 +42,26 @@ function makeDeps(
     readonly quiescence?: ReturnType<typeof makeQuiescenceFn>
     readonly preview?: ReturnType<typeof vi.fn>
     readonly recover?: ReturnType<typeof vi.fn>
+    readonly listBackups?: ReturnType<typeof vi.fn>
   } = {},
 ) {
   const checkRepoQuiescence = overrides.quiescence ?? makeQuiescenceFn('clear')
   const previewRecovery = overrides.preview ?? vi.fn().mockResolvedValue(ok(makeRecoveryPreviewData()))
   const recover = overrides.recover ?? vi.fn().mockResolvedValue(ok(recoverOk()))
+  const listBackups = overrides.listBackups ?? vi.fn().mockResolvedValue(ok({kind: 'ok', backups: [], totalBytes: 0}))
   const logger = makeLogger()
   return {
     deps: {
       checkRepoQuiescence: checkRepoQuiescence as never,
       previewRecovery: previewRecovery as never,
       recover: recover as never,
+      listBackups: listBackups as never,
       logger,
     },
     checkRepoQuiescence,
     previewRecovery,
     recover,
+    listBackups,
     logger,
   }
 }
@@ -118,23 +124,56 @@ describe('tryAutoRecoverDirtyCheckout: the happy sequence', () => {
 })
 
 describe('tryAutoRecoverDirtyCheckout: budget gate', () => {
-  it('declines, calling nothing, when the remaining budget is below the required sum', async () => {
-    // #given / #when
-    const {outcome, h} = await run({}, {...REQUEST, remainingBudgetMs: 444_999})
+  it('declines, calling nothing, when the remaining budget is one below the required sum', async () => {
+    // #given
+    const required = totalRecoveryBudgetMs()
+
+    // #when
+    const {outcome, h} = await run({}, {...REQUEST, requiredBudgetMs: required, remainingBudgetMs: required - 1})
 
     // #then
     expect(outcome).toEqual({kind: 'declined', reason: 'budget-insufficient'})
     expect(h.checkRepoQuiescence).not.toHaveBeenCalled()
     expect(h.previewRecovery).not.toHaveBeenCalled()
     expect(h.recover).not.toHaveBeenCalled()
+    expect(h.listBackups).not.toHaveBeenCalled()
   })
 
   it('starts when the remaining budget exactly equals the required sum', async () => {
-    // #given / #when
-    const {outcome} = await run({}, {...REQUEST, remainingBudgetMs: 445_000})
+    // #given
+    const required = totalRecoveryBudgetMs()
+
+    // #when
+    const {outcome} = await run({}, {...REQUEST, requiredBudgetMs: required, remainingBudgetMs: required})
 
     // #then
     expect(outcome.kind).toBe('recovered')
+  })
+})
+
+describe('totalRecoveryBudgetMs', () => {
+  it('is the quiescence check plus every workspace call the recovery makes (default sum 514s)', () => {
+    // #given the default ceilings: 4s quiescence + 45s preview + 300s recover + 5s dispose + 60s lookup + 100s update
+    // #when / #then
+    expect(totalRecoveryBudgetMs()).toBe(4_000 + 45_000 + 300_000 + 5_000 + 60_000 + 100_000)
+    expect(totalRecoveryBudgetMs()).toBe(514_000)
+  })
+
+  it("derives the quiescence term from the checker's own exported timeout, not a literal", () => {
+    expect(totalRecoveryBudgetMs()).toBe(REPO_QUIESCENCE_TIMEOUT_MS + totalRecoveryCeilingMs())
+  })
+
+  it('follows the ceilings the client was configured with', () => {
+    // #given
+    const options = {
+      previewRecoveryTimeoutMs: 1_000,
+      recoverTimeoutMs: 2_000,
+      updateTimeoutMs: 3_000,
+      listBackupsTimeoutMs: 4_000,
+    }
+
+    // #when / #then
+    expect(totalRecoveryBudgetMs(options)).toBe(REPO_QUIESCENCE_TIMEOUT_MS + 10_000 + 5_000)
   })
 })
 
@@ -246,6 +285,7 @@ const RECOVER_FAILURE_CLASS = {
   'inspection-failed': 'declined',
   'fetch-failed': 'declined',
   'build-failed': 'declined',
+  'rollback-failed': 'ambiguous',
   'quarantine-failed': 'ambiguous',
   'install-failed': 'ambiguous',
   'verification-failed': 'ambiguous',
@@ -294,6 +334,7 @@ describe('tryAutoRecoverDirtyCheckout: recover outcomes that moved nothing (decl
 describe('tryAutoRecoverDirtyCheckout: recover outcomes where something may have moved (ambiguous)', () => {
   it.each([
     ['no-checkout (unexpected from /recover)', ok({kind: 'no-checkout'}), 'unexpected-result'],
+    ['failed rollback-failed', ok({kind: 'failed', reason: 'rollback-failed'}), 'rollback-failed'],
     ['failed quarantine-failed', ok({kind: 'failed', reason: 'quarantine-failed'}), 'quarantine-failed'],
     ['failed install-failed', ok({kind: 'failed', reason: 'install-failed'}), 'install-failed'],
     ['failed verification-failed', ok({kind: 'failed', reason: 'verification-failed'}), 'verification-failed'],
@@ -311,7 +352,7 @@ describe('tryAutoRecoverDirtyCheckout: recover outcomes where something may have
     const {outcome, h} = await run({recover: vi.fn().mockResolvedValue(result)})
 
     // #then
-    expect(outcome).toEqual({kind: 'ambiguous', reason})
+    expect(outcome).toEqual({kind: 'ambiguous', reason, backup: {kind: 'not-found'}})
     expect(h.recover).toHaveBeenCalledOnce()
   })
 
@@ -320,7 +361,7 @@ describe('tryAutoRecoverDirtyCheckout: recover outcomes where something may have
     const {outcome} = await run({recover: vi.fn().mockRejectedValue(new Error('socket hang up'))})
 
     // #then
-    expect(outcome).toEqual({kind: 'ambiguous', reason: 'transport-error'})
+    expect(outcome).toEqual({kind: 'ambiguous', reason: 'transport-error', backup: {kind: 'not-found'}})
   })
 
   it('classifies every ExecuteRecoveryFailureReason exactly as the table says', async () => {
@@ -366,7 +407,107 @@ describe('tryAutoRecoverDirtyCheckout: logging', () => {
         runId: 'run-1',
         outcome: outcomeKind,
         reason,
+        ...(outcomeKind === 'ambiguous' ? {lookup: 'not-found'} : {}),
       })
     },
   )
+})
+
+// After an ambiguous outcome the recovery may or may not have completed, so the run looks its own backup
+// up by run id: a found id is named like a `recovered` one, anything else falls back to the attempted note.
+describe('tryAutoRecoverDirtyCheckout: backup lookup after an ambiguous outcome', () => {
+  const TIMEOUT = {recover: vi.fn().mockResolvedValue(err({kind: 'timeout'}))}
+
+  function backup(id: string, runId: string | undefined, createdAt = '2026-01-01T00:00:00.000Z') {
+    return {
+      id,
+      metadataOk: true,
+      createdAt,
+      sizeBytes: 1,
+      sizeComplete: true,
+      originalHeadSha: undefined,
+      originalBranch: undefined,
+      ...(runId === undefined ? {} : {runId}),
+    }
+  }
+
+  function listing(...backups: ReturnType<typeof backup>[]) {
+    return vi.fn().mockResolvedValue(ok({kind: 'ok', backups, totalBytes: 1}))
+  }
+
+  it('names the backup whose runId is this run, and asks for the canonical owner and repo', async () => {
+    // #given
+    const listBackups = listing(
+      backup('gen-other', 'run-2'),
+      backup('gen-mine', 'run-1'),
+      backup('gen-manual', undefined),
+    )
+
+    // #when
+    const {outcome, h} = await run({...TIMEOUT, listBackups})
+
+    // #then
+    expect(outcome).toEqual({kind: 'ambiguous', reason: 'timeout', backup: {kind: 'found', backupId: 'gen-mine'}})
+    expect(h.listBackups).toHaveBeenCalledExactlyOnceWith('acme', 'widget')
+  })
+
+  it('picks the newest when more than one backup carries this run id', async () => {
+    // #given
+    const listBackups = listing(
+      backup('gen-old', 'run-1', '2026-01-01T00:00:00.000Z'),
+      backup('gen-new', 'run-1', '2026-01-02T00:00:00.000Z'),
+    )
+
+    // #when
+    const {outcome} = await run({...TIMEOUT, listBackups})
+
+    // #then
+    expect(outcome).toMatchObject({backup: {kind: 'found', backupId: 'gen-new'}})
+  })
+
+  it.each([
+    ['no backups at all', listing()],
+    ['only backups of other runs and manual ones', listing(backup('a', 'run-2'), backup('b', undefined))],
+  ])('%s is not-found', async (_label, listBackups) => {
+    const {outcome} = await run({...TIMEOUT, listBackups})
+    expect(outcome).toMatchObject({kind: 'ambiguous', backup: {kind: 'not-found'}})
+  })
+
+  it.each([
+    ['a workspace-side failure', vi.fn().mockResolvedValue(ok({kind: 'failed'}))],
+    ['a timeout', vi.fn().mockResolvedValue(err({kind: 'timeout'}))],
+    ['a network error', vi.fn().mockResolvedValue(err({kind: 'network-error'}))],
+    ['a parse error', vi.fn().mockResolvedValue(err({kind: 'parse-error'}))],
+    ['a throw', vi.fn().mockRejectedValue(new Error('boom'))],
+  ])('%s is a failed lookup, never an error', async (_label, listBackups) => {
+    const {outcome} = await run({...TIMEOUT, listBackups})
+    expect(outcome).toMatchObject({kind: 'ambiguous', backup: {kind: 'failed'}})
+  })
+
+  it.each([
+    ['recovered', {}],
+    ['declined', {quiescence: makeQuiescenceFn('busy')}],
+  ])('a %s outcome never looks anything up', async (_label, overrides) => {
+    const {h} = await run(overrides)
+    expect(h.listBackups).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['found', listing(backup('gen-mine', 'run-1')), {lookup: 'found', backupId: 'gen-mine'}],
+    ['not-found', listing(), {lookup: 'not-found'}],
+    ['failed', vi.fn().mockResolvedValue(err({kind: 'timeout'})), {lookup: 'failed'}],
+  ])('logs the %s lookup in the one ambiguous warning, with no path', async (_label, listBackups, fields) => {
+    // #given / #when
+    const {h} = await run({...TIMEOUT, listBackups})
+
+    // #then
+    expect(h.logger.warn).toHaveBeenCalledOnce()
+    expect(h.logger.warn.mock.calls[0]?.[0]).toEqual({
+      repo: 'acme/widget',
+      runId: 'run-1',
+      outcome: 'ambiguous',
+      reason: 'timeout',
+      ...fields,
+    })
+  })
 })

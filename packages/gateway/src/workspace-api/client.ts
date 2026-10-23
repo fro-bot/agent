@@ -43,6 +43,7 @@ import type {
   UpdateResult,
   UpdateWorkspaceError,
   WorkspaceError,
+  WorkspaceTransportError,
 } from './types.js'
 
 import {err, ok} from '@fro-bot/runtime'
@@ -222,19 +223,39 @@ const DEFAULT_LIST_BACKUPS_TIMEOUT_MS = 60_000 // 60 seconds
 const DEFAULT_DELETE_BACKUP_TIMEOUT_MS = 30_000 // 30 seconds
 
 /**
- * Worst-case wall-clock cost of one automatic dirty-checkout recovery: preview, then recover, then the
- * follow-up `update`, each at its configured ceiling (the options the client was built with, else the
- * defaults above). A caller with less run budget than this must not start a recovery it cannot finish.
+ * The workspace's own timeout for the best-effort OpenCode instance dispose it runs inside every
+ * successful `/recover` (`DEFAULT_INSTANCE_DISPOSE_TIMEOUT_MS` in apps/workspace-agent
+ * `opencode-instance.ts`). Copied, not imported, because the workspace is a separate container; a
+ * test reads the workspace source and fails when the two drift.
+ */
+export const WORKSPACE_INSTANCE_DISPOSE_CEILING_MS = 5_000
+
+/**
+ * Worst-case wall-clock cost of the workspace calls one automatic dirty-checkout recovery makes:
+ * preview, recover (including the dispose that runs inside it), the lookup of this run's backup after
+ * an ambiguous outcome, and the follow-up `update`, each at its configured ceiling (the options the
+ * client was built with, else the defaults above). The caller adds the quiescence check; see
+ * `totalRecoveryBudgetMs` in execute/checkout-recovery.ts.
  */
 export function totalRecoveryCeilingMs(
-  options: Pick<WorkspaceClientOptions, 'updateTimeoutMs' | 'previewRecoveryTimeoutMs' | 'recoverTimeoutMs'> = {},
+  options: Pick<
+    WorkspaceClientOptions,
+    'updateTimeoutMs' | 'previewRecoveryTimeoutMs' | 'recoverTimeoutMs' | 'listBackupsTimeoutMs'
+  > = {},
 ): number {
   const {
     updateTimeoutMs = DEFAULT_UPDATE_TIMEOUT_MS,
     previewRecoveryTimeoutMs = DEFAULT_PREVIEW_RECOVERY_TIMEOUT_MS,
     recoverTimeoutMs = DEFAULT_RECOVER_TIMEOUT_MS,
+    listBackupsTimeoutMs = DEFAULT_LIST_BACKUPS_TIMEOUT_MS,
   } = options
-  return previewRecoveryTimeoutMs + recoverTimeoutMs + updateTimeoutMs
+  return (
+    previewRecoveryTimeoutMs +
+    recoverTimeoutMs +
+    WORKSPACE_INSTANCE_DISPOSE_CEILING_MS +
+    listBackupsTimeoutMs +
+    updateTimeoutMs
+  )
 }
 
 // Mirrors WORKSPACE_REPOS_ROOT in apps/workspace-agent/src/clone.ts (separate
@@ -284,6 +305,10 @@ export function canonicalWorkspaceDirectory(owner: string, repo: string): string
   return canonicalWorkspaceTarget(owner, repo)?.directory ?? null
 }
 
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError')
+}
+
 /**
  * Create a workspace-agent HTTP client.
  *
@@ -303,6 +328,49 @@ export function createWorkspaceClient(options: WorkspaceClientOptions): Workspac
     listBackupsTimeoutMs = DEFAULT_LIST_BACKUPS_TIMEOUT_MS,
     deleteBackupTimeoutMs = DEFAULT_DELETE_BACKUP_TIMEOUT_MS,
   } = options
+
+  /**
+   * POST a JSON body and read the JSON answer, with ONE deadline covering the whole exchange:
+   * the request, the status check and the body read. The deadline is a plain `setTimeout`-driven
+   * abort (not `AbortSignal.timeout`, which is not reliably fake-timer-controlled — see
+   * execute/run-core.ts), and it stays armed until the body is parsed: headers can arrive and the
+   * body still stall, and a run holding the repo lock must not hang on that. An abort at either
+   * point is `timeout`. A status the caller does not accept returns `http-error` without reading
+   * the body. Never logs the request or response body.
+   */
+  async function postJsonWithin(params: {
+    readonly url: string
+    readonly body: string
+    readonly timeoutMs: number
+    readonly isAcceptedStatus: (status: number) => boolean
+  }): Promise<Result<{readonly status: number; readonly parsed: unknown}, WorkspaceTransportError>> {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), params.timeoutMs)
+    try {
+      let response: Response
+      try {
+        response = await fetch(params.url, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json', Authorization: `Bearer ${token}`},
+          body: params.body,
+          signal: controller.signal,
+        })
+      } catch (fetchError) {
+        return err(isAbortError(fetchError) ? {kind: 'timeout'} : {kind: 'network-error'})
+      }
+
+      const status = response.status
+      if (!params.isAcceptedStatus(status)) return err({kind: 'http-error', status})
+
+      try {
+        return ok({status, parsed: await response.json()})
+      } catch (readError) {
+        return err(isAbortError(readError) ? {kind: 'timeout'} : {kind: 'parse-error'})
+      }
+    } finally {
+      clearTimeout(timer)
+    }
+  }
 
   async function readyz(): Promise<Result<ReadyzResponse, WorkspaceError>> {
     let response: Response
@@ -495,46 +563,15 @@ export function createWorkspaceClient(options: WorkspaceClientOptions): Workspac
     const body = JSON.stringify(request)
     const effectiveMs = Math.min(updateTimeoutMs, updateOptions?.remainingBudgetMs ?? updateTimeoutMs)
 
-    // A plain `setTimeout`-driven abort (not `AbortSignal.timeout`) so the effective ceiling is
-    // fake-timer-testable — see execute/run-core.ts's own deadline pattern for why native
-    // AbortSignal.timeout scheduling is not reliably fake-timer-controlled.
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), effectiveMs)
-
-    let response: Response
-    try {
-      response = await fetch(`${baseUrl}/update`, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json', Authorization: `Bearer ${token}`},
-        body,
-        signal: controller.signal,
-      })
-    } catch (fetchError) {
-      clearTimeout(timer)
-      if (fetchError instanceof Error && (fetchError.name === 'AbortError' || fetchError.name === 'TimeoutError')) {
-        return err({kind: 'timeout'})
-      }
-      return err({kind: 'network-error'})
-    }
-    clearTimeout(timer)
-
-    const httpStatus = response.status
-    if (!isUpdateResultStatus(httpStatus)) {
-      return err({kind: 'http-error', status: httpStatus})
-    }
-
-    let parsed: unknown
-    try {
-      parsed = await response.json()
-    } catch {
-      return err({kind: 'parse-error'})
-    }
-
-    if (!isUpdateResult(parsed, httpStatus)) {
-      return err({kind: 'parse-error'})
-    }
-
-    return ok(parsed)
+    const fetched = await postJsonWithin({
+      url: `${baseUrl}/update`,
+      body,
+      timeoutMs: effectiveMs,
+      isAcceptedStatus: isUpdateResultStatus,
+    })
+    if (fetched.success === false) return fetched
+    if (!isUpdateResult(fetched.data.parsed, fetched.data.status)) return err({kind: 'parse-error'})
+    return ok(fetched.data.parsed)
   }
 
   async function previewRecovery(
@@ -542,45 +579,15 @@ export function createWorkspaceClient(options: WorkspaceClientOptions): Workspac
   ): Promise<Result<PreviewRecoveryResult, PreviewRecoveryWorkspaceError>> {
     const body = JSON.stringify(request)
 
-    // Same `setTimeout`-driven abort `update()` uses (not `AbortSignal.timeout`), so the ceiling is
-    // fake-timer-testable and a caller can reason about its overall budget in tests.
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), previewRecoveryTimeoutMs)
-
-    let response: Response
-    try {
-      response = await fetch(`${baseUrl}/recover/preview`, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json', Authorization: `Bearer ${token}`},
-        body,
-        signal: controller.signal,
-      })
-    } catch (fetchError) {
-      clearTimeout(timer)
-      if (fetchError instanceof Error && (fetchError.name === 'TimeoutError' || fetchError.name === 'AbortError')) {
-        return err({kind: 'timeout'})
-      }
-      return err({kind: 'network-error'})
-    }
-    clearTimeout(timer)
-
-    const httpStatus = response.status
-    if (!isPreviewRecoveryResultStatus(httpStatus)) {
-      return err({kind: 'http-error', status: httpStatus})
-    }
-
-    let parsed: unknown
-    try {
-      parsed = await response.json()
-    } catch {
-      return err({kind: 'parse-error'})
-    }
-
-    if (!isPreviewRecoveryResult(parsed, httpStatus)) {
-      return err({kind: 'parse-error'})
-    }
-
-    return ok(parsed)
+    const fetched = await postJsonWithin({
+      url: `${baseUrl}/recover/preview`,
+      body,
+      timeoutMs: previewRecoveryTimeoutMs,
+      isAcceptedStatus: isPreviewRecoveryResultStatus,
+    })
+    if (fetched.success === false) return fetched
+    if (!isPreviewRecoveryResult(fetched.data.parsed, fetched.data.status)) return err({kind: 'parse-error'})
+    return ok(fetched.data.parsed)
   }
 
   async function recover(
@@ -590,44 +597,16 @@ export function createWorkspaceClient(options: WorkspaceClientOptions): Workspac
     const body = JSON.stringify(request)
 
     // A timeout here aborts the request, which the workspace honors up to the quarantine rename
-    // (apps/workspace-agent recover.ts) — the same `setTimeout`-driven form `update()` uses.
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), recoverTimeoutMs)
-
-    let response: Response
-    try {
-      response = await fetch(`${baseUrl}/recover`, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json', Authorization: `Bearer ${token}`},
-        body,
-        signal: controller.signal,
-      })
-    } catch (fetchError) {
-      clearTimeout(timer)
-      if (fetchError instanceof Error && (fetchError.name === 'TimeoutError' || fetchError.name === 'AbortError')) {
-        return err({kind: 'timeout'})
-      }
-      return err({kind: 'network-error'})
-    }
-    clearTimeout(timer)
-
-    const httpStatus = response.status
-    if (!isExecuteRecoveryResultStatus(httpStatus)) {
-      return err({kind: 'http-error', status: httpStatus})
-    }
-
-    let parsed: unknown
-    try {
-      parsed = await response.json()
-    } catch {
-      return err({kind: 'parse-error'})
-    }
-
-    if (!isExecuteRecoveryResult(parsed, httpStatus)) {
-      return err({kind: 'parse-error'})
-    }
-
-    return ok(parsed)
+    // (apps/workspace-agent recover.ts).
+    const fetched = await postJsonWithin({
+      url: `${baseUrl}/recover`,
+      body,
+      timeoutMs: recoverTimeoutMs,
+      isAcceptedStatus: isExecuteRecoveryResultStatus,
+    })
+    if (fetched.success === false) return fetched
+    if (!isExecuteRecoveryResult(fetched.data.parsed, fetched.data.status)) return err({kind: 'parse-error'})
+    return ok(fetched.data.parsed)
   }
 
   async function listBackups(
@@ -1103,6 +1082,7 @@ const EXECUTE_RECOVERY_FAILURE_REASONS = new Set<string>([
   'inspection-failed',
   'fetch-failed',
   'build-failed',
+  'rollback-failed',
   'quarantine-failed',
   'install-failed',
   'verification-failed',

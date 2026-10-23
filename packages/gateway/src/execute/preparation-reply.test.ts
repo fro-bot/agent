@@ -12,7 +12,7 @@ import {
   RECOVER_SUFFIX,
   RECOVERY_ATTEMPTED_NOTE,
   TERMINATION_UNCONFIRMED_REPLY,
-  withRecoveredNote,
+  withRecoveryNote,
 } from './preparation-reply.js'
 
 type NonSubstitutedRefused = Exclude<UpdateRefused, {readonly reason: 'checkout-substituted'}>
@@ -217,17 +217,22 @@ describe('automatic recovery replies', () => {
     expect(note).not.toContain('\n')
   })
 
-  it('the attempted-but-unconfirmed note names no backup id and is one line', () => {
+  it('the attempted-but-unconfirmed note names no backup id, is one line, and claims nothing about the checkout', () => {
     expect(RECOVERY_ATTEMPTED_NOTE).toContain('`/fro-bot checkout-backup list`')
     expect(RECOVERY_ATTEMPTED_NOTE).not.toContain('\n')
+    // it leads refusals too, so it must not say the checkout is clean or fresh
+    expect(RECOVERY_ATTEMPTED_NOTE).not.toContain('now clean')
   })
 
-  it('withRecoveredNote puts the note first, so a trailing recover suffix (and its button) survives', () => {
-    const reply = withRecoveredNote(
+  it.each([
+    ['a recovered note', formatRecoveredNote('gen-42')],
+    ['the attempted note', RECOVERY_ATTEMPTED_NOTE],
+  ])('withRecoveryNote puts %s first, so a trailing recover suffix (and its button) survives', (_label, note) => {
+    const reply = withRecoveryNote(
       formatPreparationRefusedReply({kind: 'refused', reason: 'dirty', changedPaths: []}),
-      'gen-42',
+      note,
     )
-    expect(reply.startsWith(formatRecoveredNote('gen-42'))).toBe(true)
+    expect(reply.startsWith(note)).toBe(true)
     expect(reply.endsWith(RECOVER_SUFFIX)).toBe(true)
   })
 })

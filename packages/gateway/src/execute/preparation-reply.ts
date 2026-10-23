@@ -150,14 +150,20 @@ export function formatRecoveredNote(backupId: string): string {
   return `The previous checkout had uncommitted changes, so I preserved it as backup \`${backupId}\` and installed a fresh one (list backups with \`/fro-bot checkout-backup list\`).`
 }
 
-/** Used when a recovery was attempted but its outcome is only known from the follow-up `update`, so no backup id is known. */
+/**
+ * Used when a recovery was attempted but no backup could be matched to this run (the lookup found
+ * none or could not answer), so no id is known. It claims nothing about the checkout's current state,
+ * because it also leads refusals and failures: the reply it prefixes says what the follow-up
+ * `update` observed.
+ */
 export const RECOVERY_ATTEMPTED_NOTE =
-  'The previous checkout had uncommitted changes, so I tried to preserve it and install a fresh one; the checkout is now clean (see `/fro-bot checkout-backup list` for the preserved copy).'
+  'The previous checkout had uncommitted changes, so I tried to preserve it and install a fresh one; `/fro-bot checkout-backup list` shows whether a backup of it exists.'
 
 /**
- * Prefixes a refusal/failure reply with the recovered note. The note goes FIRST so a reply that ends
- * with `RECOVER_SUFFIX` still does, and `terminatePreparationEarly` still attaches the Recover button.
+ * Prefixes a refusal/failure reply with a recovery note (`formatRecoveredNote(id)` or
+ * `RECOVERY_ATTEMPTED_NOTE`). The note goes FIRST so a reply that ends with `RECOVER_SUFFIX` still
+ * does, and `terminatePreparationEarly` still attaches the Recover button.
  */
-export function withRecoveredNote(replyText: string, backupId: string): string {
-  return `${formatRecoveredNote(backupId)}\n\n${replyText}`
+export function withRecoveryNote(replyText: string, note: string): string {
+  return `${note}\n\n${replyText}`
 }

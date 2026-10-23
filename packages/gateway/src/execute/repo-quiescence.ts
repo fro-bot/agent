@@ -15,7 +15,8 @@ import {canonicalWorkspaceDirectory} from '../workspace-api/client.js'
 import {attachOpencode} from './opencode-attach.js'
 
 const SOURCE = 'opencode-session-status'
-const STATUS_REQUEST_TIMEOUT_MS = 4_000
+/** Ceiling on the OpenCode `session.status` request one quiescence check makes. Part of the automatic-recovery budget. */
+export const REPO_QUIESCENCE_TIMEOUT_MS = 4_000
 const MAX_LOGGED_SESSION_IDS = 32
 
 export interface RepoQuiescenceContext {
@@ -121,7 +122,7 @@ export function createRepoQuiescenceChecker(options: RepoQuiescenceCheckerOption
     const timer = setTimeout(() => {
       timedOut = true
       controller.abort()
-    }, STATUS_REQUEST_TIMEOUT_MS)
+    }, REPO_QUIESCENCE_TIMEOUT_MS)
 
     // Raced against the abort so a client that ignores the signal still cannot stall the caller.
     const aborted = new Promise<'aborted'>(resolve => {
