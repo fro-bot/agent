@@ -76,7 +76,7 @@ Research notes are in `/tmp/dirty-checkout/repo.md`, which is local and untracke
   "verdict": "reuse",
   "scope": "apps/workspace-agent/src, packages/gateway/src/execute, packages/gateway/src/workspace-api, packages/gateway/src/discord/commands",
   "freshness": {
-    "vcs_reference": "8eba5985f"
+    "vcs_reference": "08e1dee89"
   },
   "budget": {
     "max_search_passes": 3,
