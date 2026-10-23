@@ -7,8 +7,9 @@
  * `RunCoreError('checkout-substituted', ...)` path, which has its own reply text.
  */
 
-import type {UpdateFailed, UpdateRefused} from '../workspace-api/types.js'
+import type {RetentionUsage, UpdateFailed, UpdateRefused} from '../workspace-api/types.js'
 
+import {formatBinaryBytes} from '../discord/commands/format-binary-bytes.js'
 import {formatBranchForReply} from './provenance.js'
 
 /** Appended to every refusal/apply-interrupted reply except `maintenance-hold`. */
@@ -30,11 +31,14 @@ export const MAINTENANCE_HOLD_REPLY =
 /** The checkout has local commits beyond the default branch's tip with no divergence - nothing for a fast-forward to move to. */
 const AHEAD_REPLY = "The checkout is ahead of the repository's default branch, so there's nothing to fast-forward."
 
+/** The clause a `dirty` refusal opens with; shared by the refusal table below and the automatic-recovery replies. */
+const DIRTY_REPLY = "The checkout has uncommitted or untracked changes, so I can't update it safely."
+
 const REFUSAL_REPLY_TEXT: Record<
   Exclude<UpdateRefused['reason'], 'checkout-substituted' | 'maintenance-hold'>,
   string
 > = {
-  dirty: "The checkout has uncommitted or untracked changes, so I can't update it safely.",
+  dirty: DIRTY_REPLY,
   detached: "The checkout isn't on a branch, so I can't update it safely.",
   'non-default-branch': '', // built per-instance below - needs the branch name
   diverged: "The checkout has local commits the remote doesn't have, so a fast-forward isn't possible.",
@@ -103,4 +107,105 @@ export function formatPreparationFailedReply(result: UpdateFailed): string {
     case 'termination-unconfirmed':
       return TERMINATION_UNCONFIRMED_REPLY
   }
+}
+
+// ---------------------------------------------------------------------------
+// Automatic recovery of a dirty checkout (checkout-recovery.ts). The quota/disk wording is shared
+// with the manual `/fro-bot recover-checkout` flow, so the two can never drift apart.
+// ---------------------------------------------------------------------------
+
+/** Recovery would exceed the retention cap; names the cleanup command. */
+export function formatQuotaExceededReply(
+  repoSlug: string,
+  usage: Pick<RetentionUsage, 'maxGenerations' | 'maxBytes'>,
+): string {
+  return `Recovery is at its retention limit (${usage.maxGenerations} generations or ${formatBinaryBytes(usage.maxBytes)}) for \`${repoSlug}\`. Delete an old backup with \`/fro-bot checkout-backup delete <id>\` first.`
+}
+
+/** There is not enough free disk to build the replacement checkout. */
+export function formatInsufficientDiskReply(repoSlug: string): string {
+  return `There isn't enough free disk space to recover \`${repoSlug}\` right now.`
+}
+
+/**
+ * The reply for a dirty refusal whose automatic recovery was refused for a cause the operator can
+ * fix: the dirty clause, then the cause and its cleanup. Deliberately NO `RECOVER_SUFFIX` - a manual
+ * recovery would be refused for the same reason - so no Recover button is attached either.
+ */
+export function formatRecoveryBlockedReply(
+  blocked:
+    | {readonly reason: 'quota-exceeded'; readonly usage: Pick<RetentionUsage, 'maxGenerations' | 'maxBytes'>}
+    | {readonly reason: 'insufficient-disk-space'},
+  repoSlug: string,
+): string {
+  const cause =
+    blocked.reason === 'quota-exceeded'
+      ? formatQuotaExceededReply(repoSlug, blocked.usage)
+      : formatInsufficientDiskReply(repoSlug)
+  return `${DIRTY_REPLY}\n\n${cause}`
+}
+
+/**
+ * One line for a run whose previous checkout is known to be preserved AND whose follow-up `update`
+ * reported a ready checkout: the swap completed, so the note claims the install.
+ */
+export function formatRecoveredNote(backupId: string): string {
+  return `The previous checkout had uncommitted changes, so I preserved it as backup \`${backupId}\` and installed a fresh one (list backups with \`/fro-bot checkout-backup list\`).`
+}
+
+/**
+ * One line for a run whose previous checkout is known to be preserved but whose follow-up `update`
+ * did NOT report a ready checkout (a refusal, a failure, a timeout, a transport error or a
+ * substituted tree). A backup's metadata is written when the quarantine finishes, before the fresh
+ * checkout is installed, so a known backup says nothing about an install: the note claims none and
+ * points at the status that follows it.
+ */
+export function formatPreservedNote(backupId: string): string {
+  return `The previous checkout had uncommitted changes, so I preserved it as backup \`${backupId}\` (list backups with \`/fro-bot checkout-backup list\`); the state of the checkout is below.`
+}
+
+/**
+ * Used when an automatic recovery ran but no backup could be matched to this run (the lookup found
+ * none or could not answer). It claims neither a backup nor an install: the run only knows it
+ * attempted a recovery, and it also leads refusals and failures, where the reply it prefixes says
+ * what the follow-up `update` observed.
+ */
+export const RECOVERY_ATTEMPTED_NOTE =
+  'The previous checkout had uncommitted changes, so I attempted an automatic recovery; it may have been preserved as a backup, and `/fro-bot checkout-backup list` shows whether one exists.'
+
+/**
+ * The one note a run carries, chosen from what is known AFTER the follow-up `update`: the install is
+ * claimed only for a known backup with a ready checkout, a known backup alone is just preserved, and
+ * with no known backup the note is neutral whatever the checkout looks like.
+ */
+export function pickRecoveryNote(observed: {
+  readonly backupId: string | undefined
+  readonly checkoutReady: boolean
+}): string {
+  if (observed.backupId === undefined) return RECOVERY_ATTEMPTED_NOTE
+  return observed.checkoutReady ? formatRecoveredNote(observed.backupId) : formatPreservedNote(observed.backupId)
+}
+
+/**
+ * The reply when a recovery stopped before moving anything but its own cleanup could not be confirmed
+ * (`rollback-failed`): the checkout is unchanged, a leftover journal is retried by the workspace on
+ * restart, and an admin must clear one that persists. Deliberately NO `RECOVER_SUFFIX` and no button:
+ * a manual recovery is refused while that journal exists. The automatic flow and `recover-checkout`
+ * share the wording.
+ */
+export function formatRollbackFailedReply(
+  context: {readonly flow: 'automatic'} | {readonly flow: 'manual'; readonly repoSlug: string},
+): string {
+  const what =
+    context.flow === 'automatic' ? 'an automatic recovery attempt' : `the recovery for \`${context.repoSlug}\``
+  return `I couldn't clean up after ${what}; the checkout itself wasn't changed. The workspace retries the cleanup when it restarts; if this persists, an admin needs to clear it.`
+}
+
+/**
+ * Prefixes a refusal/failure reply with a recovery note (`formatRecoveredNote(id)` or
+ * `RECOVERY_ATTEMPTED_NOTE`). The note goes FIRST so a reply that ends with `RECOVER_SUFFIX` still
+ * does, and `terminatePreparationEarly` still attaches the Recover button.
+ */
+export function withRecoveryNote(replyText: string, note: string): string {
+  return `${note}\n\n${replyText}`
 }

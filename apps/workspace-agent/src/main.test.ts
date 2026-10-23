@@ -8,6 +8,7 @@
  */
 
 import type {CreateAppFn, ExitFn, ServeFn} from './main.js'
+import type {CreateInstanceDisposerOptions, InstanceDisposer} from './opencode-instance.js'
 import type {OpencodeProxyHandle, OpencodeProxyOptions} from './opencode-proxy.js'
 import type {RunSupervisedOpencodeOptions} from './opencode-server.js'
 import type {ProxyListeningRef, ServerDeps} from './server.js'
@@ -1030,5 +1031,46 @@ describe('startWorkspaceAgent — updateNetworkConfig wiring (A1)', () => {
 
     // #then
     expect(captured.value?.updateNetworkConfig).toEqual({})
+  })
+})
+
+describe('startWorkspaceAgent \u2014 OpenCode instance disposer wiring', () => {
+  it('builds the disposer against the local OpenCode loopback upstream and hands it to createApp', async () => {
+    // #given
+    const callLog: string[] = []
+    const captured: {value?: ServerDeps} = {}
+    const supervisorOptions: {value?: RunSupervisedOpencodeOptions} = {}
+    const disposer: InstanceDisposer = async () => ({kind: 'disposed'})
+    const createInstanceDisposerFn = vi.fn((_options: CreateInstanceDisposerOptions) => disposer)
+
+    // #when
+    await startWorkspaceAgent({
+      env: {WORKSPACE_OPENCODE_TOKEN: 'tok'},
+      serveFn: makeFakeServeFn(callLog),
+      runSupervisedOpencodeFn: makeFakeSupervisorFn(callLog, supervisorOptions),
+      createOpencodeProxyFn: makeFakeProxyFactory(callLog),
+      readSecretFn: (_name: string) => 'fake-token',
+      reconcileUpdateJournalsFn: async () => {},
+      reconcileRecoveryJournalsFn: async () => {},
+      createAppFn: makeCapturingCreateAppFn(captured),
+      createInstanceDisposerFn,
+    })
+
+    // #then the disposer targets the same loopback port the supervisor starts OpenCode on
+    expect(captured.value?.instanceDisposer).toBe(disposer)
+    expect(createInstanceDisposerFn).toHaveBeenCalledOnce()
+    const options = createInstanceDisposerFn.mock.calls[0]?.[0]
+    expect(options?.upstreamUrl).toBe(`http://127.0.0.1:${supervisorOptions.value?.port}`)
+
+    // #then it only fires while the supervisor reports OpenCode ready
+    const statusRef = supervisorOptions.value?.statusRef
+    expect(statusRef).toBeDefined()
+    if (statusRef === undefined) throw new Error('unreachable')
+    for (const status of ['starting', 'down', 'degraded'] as const) {
+      statusRef.status = status
+      expect({status, running: options?.isRunning?.()}).toEqual({status, running: false})
+    }
+    statusRef.status = 'ready'
+    expect(options?.isRunning?.()).toBe(true)
   })
 })

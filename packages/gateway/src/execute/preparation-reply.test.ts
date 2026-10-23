@@ -2,11 +2,20 @@ import type {UpdateFailed, UpdateRefused} from '../workspace-api/types.js'
 import {describe, expect, it} from 'vitest'
 import {
   CLIENT_TIMEOUT_REPLY,
+  formatInsufficientDiskReply,
   formatPreparationFailedReply,
   formatPreparationRefusedReply,
+  formatPreservedNote,
+  formatQuotaExceededReply,
+  formatRecoveredNote,
+  formatRecoveryBlockedReply,
+  formatRollbackFailedReply,
   MAINTENANCE_HOLD_REPLY,
+  pickRecoveryNote,
   RECOVER_SUFFIX,
+  RECOVERY_ATTEMPTED_NOTE,
   TERMINATION_UNCONFIRMED_REPLY,
+  withRecoveryNote,
 } from './preparation-reply.js'
 
 type NonSubstitutedRefused = Exclude<UpdateRefused, {readonly reason: 'checkout-substituted'}>
@@ -167,6 +176,114 @@ describe('CLIENT_TIMEOUT_REPLY', () => {
   it('is the plan\'s exact "state unknown" wording', () => {
     expect(CLIENT_TIMEOUT_REPLY).toBe(
       "The update didn't finish within its time budget, and I can't tell whether the checkout changed. The next run will check its state before doing anything.",
+    )
+  })
+})
+
+describe('automatic recovery replies', () => {
+  const usage = {maxGenerations: 5, maxBytes: 10 * 1024 * 1024 * 1024}
+
+  it("quota text is the manual recover-checkout flow's exact wording", () => {
+    expect(formatQuotaExceededReply('acme/widget', usage)).toBe(
+      'Recovery is at its retention limit (5 generations or 10.0 GiB) for `acme/widget`. Delete an old backup with `/fro-bot checkout-backup delete <id>` first.',
+    )
+  })
+
+  it("disk text is the manual recover-checkout flow's exact wording", () => {
+    expect(formatInsufficientDiskReply('acme/widget')).toBe(
+      "There isn't enough free disk space to recover `acme/widget` right now.",
+    )
+  })
+
+  it.each([
+    ['quota-exceeded', formatQuotaExceededReply('acme/widget', usage)],
+    ['insufficient-disk-space', formatInsufficientDiskReply('acme/widget')],
+  ] as const)(
+    'a blocked %s reply leads with the dirty clause, names the cause, and has no recover suffix',
+    (cause, causeText) => {
+      const reply =
+        cause === 'quota-exceeded'
+          ? formatRecoveryBlockedReply({reason: 'quota-exceeded', usage}, 'acme/widget')
+          : formatRecoveryBlockedReply({reason: 'insufficient-disk-space'}, 'acme/widget')
+      expect(reply).toBe(
+        `The checkout has uncommitted or untracked changes, so I can't update it safely.\n\n${causeText}`,
+      )
+      expect(reply).not.toContain(RECOVER_SUFFIX)
+      expect(reply).not.toContain('Nothing was discarded')
+    },
+  )
+
+  it('the recovered note names the backup id and how to list it, in one line', () => {
+    const note = formatRecoveredNote('gen-42')
+    expect(note).toContain('`gen-42`')
+    expect(note).toContain('`/fro-bot checkout-backup list`')
+    expect(note).not.toContain('\n')
+  })
+
+  it('the attempted-but-unconfirmed note names no backup id, is one line, and claims nothing about the checkout', () => {
+    expect(RECOVERY_ATTEMPTED_NOTE).toContain('`/fro-bot checkout-backup list`')
+    expect(RECOVERY_ATTEMPTED_NOTE).not.toContain('\n')
+    // it leads refusals too, so it must not say the checkout is clean or fresh
+    expect(RECOVERY_ATTEMPTED_NOTE).not.toContain('now clean')
+  })
+
+  it.each([
+    ['a recovered note', formatRecoveredNote('gen-42')],
+    ['the attempted note', RECOVERY_ATTEMPTED_NOTE],
+  ])('withRecoveryNote puts %s first, so a trailing recover suffix (and its button) survives', (_label, note) => {
+    const reply = withRecoveryNote(
+      formatPreparationRefusedReply({kind: 'refused', reason: 'dirty', changedPaths: []}),
+      note,
+    )
+    expect(reply.startsWith(note)).toBe(true)
+    expect(reply.endsWith(RECOVER_SUFFIX)).toBe(true)
+  })
+})
+
+describe('the recovery note matches what was observed', () => {
+  it('the recovered note claims both the backup and the install', () => {
+    expect(formatRecoveredNote('gen-42')).toContain('preserved it as backup `gen-42` and installed a fresh one')
+  })
+
+  it('the preserved note names the backup, claims no install, and points at the status below', () => {
+    const note = formatPreservedNote('gen-42')
+    expect(note).toContain('`gen-42`')
+    expect(note).toContain('`/fro-bot checkout-backup list`')
+    expect(note).not.toMatch(/install/i)
+    expect(note).toContain('below')
+    expect(note).not.toContain('\n')
+  })
+
+  it('the neutral note claims neither a backup nor an install', () => {
+    expect(RECOVERY_ATTEMPTED_NOTE).toContain('may have been')
+    expect(RECOVERY_ATTEMPTED_NOTE).toContain('`/fro-bot checkout-backup list`')
+    expect(RECOVERY_ATTEMPTED_NOTE).not.toMatch(/install/i)
+    expect(RECOVERY_ATTEMPTED_NOTE).not.toMatch(/\bI (tried to )?preserved?\b/)
+    expect(RECOVERY_ATTEMPTED_NOTE).not.toContain('tried to')
+  })
+
+  it.each([
+    ['a known id and a ready checkout', 'gen-42', true, formatRecoveredNote('gen-42')],
+    ['a known id and a checkout that is not ready', 'gen-42', false, formatPreservedNote('gen-42')],
+    ['no id and a ready checkout', undefined, true, RECOVERY_ATTEMPTED_NOTE],
+    ['no id and a checkout that is not ready', undefined, false, RECOVERY_ATTEMPTED_NOTE],
+  ])('pickRecoveryNote with %s', (_label, backupId, checkoutReady, expected) => {
+    expect(pickRecoveryNote({backupId, checkoutReady})).toBe(expected)
+  })
+})
+
+describe('formatRollbackFailedReply', () => {
+  it('the automatic wording says the checkout was not changed, the cleanup retries on restart, and an admin clears a persistent one', () => {
+    const reply = formatRollbackFailedReply({flow: 'automatic'})
+    expect(reply).toBe(
+      "I couldn't clean up after an automatic recovery attempt; the checkout itself wasn't changed. The workspace retries the cleanup when it restarts; if this persists, an admin needs to clear it.",
+    )
+    expect(reply).not.toContain(RECOVER_SUFFIX)
+  })
+
+  it('the manual wording names the repo and says the same', () => {
+    expect(formatRollbackFailedReply({flow: 'manual', repoSlug: 'acme/widget'})).toBe(
+      "I couldn't clean up after the recovery for `acme/widget`; the checkout itself wasn't changed. The workspace retries the cleanup when it restarts; if this persists, an admin needs to clear it.",
     )
   })
 })

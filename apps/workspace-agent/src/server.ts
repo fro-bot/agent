@@ -8,6 +8,7 @@
 import type {BackupsDeps} from './backups.js'
 import type {CloneHandlerDeps, CloneHandlerResult} from './clone.js'
 import type {InspectHandlerDeps, InspectHandlerResult} from './inspect.js'
+import type {InstanceDisposer} from './opencode-instance.js'
 import type {Logger} from './opencode-server.js'
 import type {ExecuteRecoveryDeps, PreviewRecoveryDeps} from './recover.js'
 import type {
@@ -36,7 +37,7 @@ import {Buffer} from 'node:buffer'
 import {timingSafeEqual} from 'node:crypto'
 
 import {Hono} from 'hono'
-import {deleteBackup, listBackups} from './backups.js'
+import {deleteBackup, isValidRunId, listBackups} from './backups.js'
 import {executeClone, scrubCredentials} from './clone.js'
 import {inspectCheckout} from './inspect.js'
 import {executeRecovery, previewRecovery} from './recover.js'
@@ -284,6 +285,12 @@ export interface ServerDeps {
     readonly caBundlePath?: string
     readonly proxy?: {readonly https: string; readonly noProxy?: string}
   }
+  /**
+   * Disposes OpenCode's cached instance for a directory, run best-effort after every successful
+   * `/recover` (the manual flow and the automatic one both land here). Built once in `main.ts`
+   * against the loopback OpenCode upstream. When absent, `/recover` simply skips it.
+   */
+  readonly instanceDisposer?: InstanceDisposer
   /** OpenCode server readiness reference. When absent, opencode field is omitted from /healthz. */
   readonly opencodeStatus?: OpencodeStatusRef
   /**
@@ -326,6 +333,7 @@ export function createApp(deps: ServerDeps): Hono {
     deleteBackupExecutor = deleteBackup,
     updateNetworkConfig,
     logger,
+    instanceDisposer,
     opencodeStatus,
     proxyListening,
     auth,
@@ -630,8 +638,8 @@ export function createApp(deps: ServerDeps): Hono {
   // (if any) and installs a fresh one at the remote's current default branch tip. Body validation
   // mirrors /update (owner, repo, installation token) plus the fingerprint the operator saw from
   // /recover/preview. `executeRecoveryExecutor` returns the bare `ExecuteRecoveryResult` union
-  // directly — see `statusForExecuteRecoveryResult`. `ExecuteRecoveryDeps` carries no abort-signal
-  // field yet, so there is nothing to pass through from `c.req.raw.signal` here.
+  // directly — see `statusForExecuteRecoveryResult`. The request signal is handed to
+  // `executeRecovery`, which honors a client abort only up to the quarantine rename.
   app.post('/recover', async c => {
     const contentLengthHeader = c.req.header('content-length')
     if (contentLengthHeader === undefined || contentLengthHeader === null) {
@@ -681,9 +689,29 @@ export function createApp(deps: ServerDeps): Hono {
       return c.json(err, 400)
     }
 
-    const request: ExecuteRecoveryRequest = {owner, repo, token: raw.token, fingerprint: raw.fingerprint}
+    // Optional attribution. Absent is fine (manual recovery); any present value must match the run id
+    // format or nothing moves — it ends up in on-disk metadata and in operator-visible listings.
+    if (raw.runId !== undefined && !isValidRunId(raw.runId)) {
+      const err: ExecuteRecoveryValidationFailure = {ok: false, error: 'invalid-run-id'}
+      return c.json(err, 400)
+    }
 
-    const result = await executeRecoveryExecutor(request)
+    const request: ExecuteRecoveryRequest = {
+      owner,
+      repo,
+      token: raw.token,
+      fingerprint: raw.fingerprint,
+      ...(raw.runId === undefined ? {} : {runId: raw.runId}),
+    }
+
+    // The gateway's HTTP call has its own deadline; when the CLIENT disconnects (or its own request
+    // times out), this propagates as an abort — honored by executeRecovery up to the quarantine
+    // rename, ignored from there on (executeRecovery's own documented contract).
+    const result = await executeRecoveryExecutor(request, {
+      signal: c.req.raw.signal,
+      disposeInstance: instanceDisposer,
+      logger,
+    })
     return c.json(result, statusForExecuteRecoveryResult(result))
   })
 

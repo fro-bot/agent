@@ -147,6 +147,38 @@ describe('/fro-bot checkout-backup list', () => {
     expect(call.content).toContain('·')
     expect(call.content).toContain('from branch `main` at `aaaaaaa`')
   })
+
+  it('shows the run id on the row of a backup attributed to a run, and only that row', async () => {
+    const deps = makeDeps()
+    const base = {
+      metadataOk: true,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      sizeBytes: 100,
+      sizeComplete: true,
+      originalHeadSha: 'a'.repeat(40),
+      originalBranch: 'main',
+    }
+    vi.mocked(deps.workspaceClient.listBackups).mockResolvedValue({
+      success: true,
+      data: {
+        kind: 'ok',
+        totalBytes: 200,
+        backups: [
+          {...base, id: 'gen-old'},
+          {...base, id: 'gen-new', runId: '3f2b8c1e-5d4a-4b7e-9a10-6c2d8e4f1a23'},
+        ],
+      },
+    })
+    const {interaction, editReply} = makeSlashInteraction(makeGuild(true), 'list')
+    await Effect.runPromise(createCheckoutBackupCommand(deps)(interaction as never))
+    const call = editReply.mock.calls.at(-1)?.[0] as {content: string}
+    const rows = call.content.split('\n')
+    expect(rows).toHaveLength(2)
+    expect(rows[0]).toContain('`gen-old`')
+    expect(rows[0]).not.toContain('run')
+    expect(rows[1]).toContain('`gen-new`')
+    expect(rows[1]).toContain('run `3f2b8c1e-5d4a-4b7e-9a10-6c2d8e4f1a23`')
+  })
 })
 
 describe('/fro-bot checkout-backup delete', () => {

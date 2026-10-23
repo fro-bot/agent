@@ -13,6 +13,7 @@
 
 import type {AddressInfo} from 'node:net'
 import type {ServerType} from '@hono/node-server'
+import type {CreateInstanceDisposerOptions, InstanceDisposer} from './opencode-instance.js'
 import type {OpencodeProxyHandle, OpencodeProxyOptions} from './opencode-proxy.js'
 import type {RunSupervisedOpencodeOptions} from './opencode-server.js'
 import type {ReconcileRecoveryJournalsOnStartupDeps} from './recover.js'
@@ -26,6 +27,7 @@ import {serve} from '@hono/node-server'
 
 import {asyncCleanupAllAskpassDirs} from './clone.js'
 import {readReadyTimeoutMs, readSecret, readUpdateNetworkConfig} from './config.js'
+import {createInstanceDisposer} from './opencode-instance.js'
 import {createOpencodeProxy} from './opencode-proxy.js'
 import {runSupervisedOpencode} from './opencode-server.js'
 import {reconcileRecoveryJournalsOnStartup} from './recover.js'
@@ -37,6 +39,8 @@ const HOST = '0.0.0.0'
 const DRAIN_MS = 25_000
 const OPENCODE_PORT = 54321
 const OPENCODE_HOSTNAME = '127.0.0.1'
+/** Loopback URL of the OpenCode server: the :9200 proxy's upstream, and where instance disposal is sent. */
+const OPENCODE_UPSTREAM_URL = `http://${OPENCODE_HOSTNAME}:${OPENCODE_PORT}`
 const PROXY_PORT = 9200
 const WORKSPACE_REPOS_ROOT = '/workspace/repos'
 
@@ -89,6 +93,9 @@ export type ReconcileUpdateJournalsFn = (deps: ReconcileUpdateJournalsOnStartupD
 
 /** Startup recovery-journal reconciliation function. Simplified signature matching `reconcileRecoveryJournalsOnStartup`. */
 export type ReconcileRecoveryJournalsFn = (deps: ReconcileRecoveryJournalsOnStartupDeps) => Promise<void>
+
+/** Factory for the best-effort OpenCode instance disposer. */
+export type CreateInstanceDisposerFn = (options: CreateInstanceDisposerOptions) => InstanceDisposer
 
 /** Hono app factory function. Simplified signature matching `createApp`. */
 export type CreateAppFn = (deps: ServerDeps) => ReturnType<typeof createApp>
@@ -150,6 +157,11 @@ export interface WorkspaceAgentDeps {
    * derived once from env — without needing to drive a real HTTP request through the bound app.
    */
   readonly createAppFn?: CreateAppFn
+  /**
+   * Instance-disposer factory. Defaults to the real `createInstanceDisposer`. Injected so a test can
+   * assert which upstream and readiness predicate startup wires, without a real OpenCode.
+   */
+  readonly createInstanceDisposerFn?: CreateInstanceDisposerFn
 }
 
 /**
@@ -223,6 +235,7 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
     reconcileUpdateJournalsFn = reconcileUpdateJournalsOnStartup,
     reconcileRecoveryJournalsFn = reconcileRecoveryJournalsOnStartup,
     createAppFn = createApp,
+    createInstanceDisposerFn = createInstanceDisposer,
   } = deps
 
   // Supervisor writes all status transitions here; /healthz and /readyz read it.
@@ -299,6 +312,12 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
     auth: {kind: 'bearer', token},
     updateNetworkConfig,
     logger: opencodeLogger,
+    // After a successful recovery, drop OpenCode's cached instance for the replaced checkout. Only
+    // while the supervisor reports it ready: before that (or while it is down) there is no instance.
+    instanceDisposer: createInstanceDisposerFn({
+      upstreamUrl: OPENCODE_UPSTREAM_URL,
+      isRunning: () => opencodeStatus.status === 'ready',
+    }),
   })
 
   // Bind :9100 and WAIT for the first of three outcomes before doing anything else that could
@@ -364,7 +383,7 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
     // Reuses the `token` read once, above, before any server bind — see that comment.
     proxy = createOpencodeProxyFn({
       token,
-      upstreamUrl: `http://${OPENCODE_HOSTNAME}:${OPENCODE_PORT}`,
+      upstreamUrl: OPENCODE_UPSTREAM_URL,
       logger: opencodeLogger,
     })
   } catch (error) {
