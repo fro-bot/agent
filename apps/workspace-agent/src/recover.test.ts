@@ -2291,3 +2291,326 @@ describe('executeRecovery \u2014 an abort past the last boundary is ignored and 
     }
   })
 })
+
+// ---------------------------------------------------------------------------
+// OpenCode instance dispose after a successful recovery (#1889)
+//
+// OpenCode caches an instance per directory (file index included) and keeps serving the OLD tree
+// after the checkout is replaced in place. A successful recovery therefore asks the local OpenCode
+// to dispose that directory's instance - best effort, never failing the recovery.
+// ---------------------------------------------------------------------------
+
+function makeWarnLogger() {
+  const warn = vi.fn()
+  return {logger: {info: vi.fn(), warn, error: vi.fn()}, warn}
+}
+
+describe('executeRecovery \u2014 OpenCode instance dispose', () => {
+  it.skipIf(!OPENSSL_AVAILABLE)(
+    'a successful recovery disposes the replaced checkout directory exactly once, after the swap is verified',
+    async () => {
+      // #given
+      const {fingerprint} = await setupDirtyCheckout()
+      const fixture = await setupNetworkFixture()
+      try {
+        const seen: {directory: string; head: string; journalGone: boolean}[] = []
+        const disposeInstance = vi.fn(async (directory: string) => {
+          // observed at call time: the fresh checkout is installed and verified, and no journal remains
+          seen.push({
+            directory,
+            head: gitSync(directory, ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim(),
+            journalGone: !(await readJournal(join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME), OWNER, REPO))
+              .ok,
+          })
+          return {kind: 'disposed'} as const
+        })
+        const {logger, warn} = makeWarnLogger()
+
+        // #when
+        const result = await executeRecovery(
+          {...recoverReq(fixture), fingerprint},
+          recoveryDeps(fixture, {disposeInstance, logger}),
+        )
+
+        // #then
+        expect(result.kind).toBe('ok')
+        expect(disposeInstance).toHaveBeenCalledOnce()
+        expect(seen).toEqual([{directory: destPathFor(), head: fixture.headSha, journalGone: true}])
+        expect(warn).not.toHaveBeenCalled()
+      } finally {
+        await fixture.close()
+      }
+    },
+  )
+
+  it.skipIf(!OPENSSL_AVAILABLE)('disposes after a fresh install with no prior checkout, too', async () => {
+    // #given no checkout at all
+    const fixture = await setupNetworkFixture()
+    try {
+      const disposeInstance = vi.fn(async () => ({kind: 'disposed'}) as const)
+
+      // #when
+      const result = await executeRecovery(
+        {...recoverReq(fixture), fingerprint: ''},
+        recoveryDeps(fixture, {disposeInstance}),
+      )
+
+      // #then
+      expect(result.kind).toBe('ok')
+      expect(disposeInstance).toHaveBeenCalledExactlyOnceWith(destPathFor())
+    } finally {
+      await fixture.close()
+    }
+  })
+
+  it.skipIf(!OPENSSL_AVAILABLE)('stays silent when OpenCode is not running (skipped)', async () => {
+    // #given
+    const {fingerprint} = await setupDirtyCheckout()
+    const fixture = await setupNetworkFixture()
+    try {
+      const disposeInstance = vi.fn(async () => ({kind: 'skipped'}) as const)
+      const {logger, warn} = makeWarnLogger()
+
+      // #when
+      const result = await executeRecovery(
+        {...recoverReq(fixture), fingerprint},
+        recoveryDeps(fixture, {disposeInstance, logger}),
+      )
+
+      // #then
+      expect(result.kind).toBe('ok')
+      expect(warn).not.toHaveBeenCalled()
+    } finally {
+      await fixture.close()
+    }
+  })
+
+  it.skipIf(!OPENSSL_AVAILABLE)('recovers fine when no disposer is configured', async () => {
+    // #given
+    const {fingerprint} = await setupDirtyCheckout()
+    const fixture = await setupNetworkFixture()
+    try {
+      // #when / #then
+      const result = await executeRecovery({...recoverReq(fixture), fingerprint}, recoveryDeps(fixture))
+      expect(result.kind).toBe('ok')
+    } finally {
+      await fixture.close()
+    }
+  })
+
+  const DISPOSE_FAILURES = [
+    ['a timeout', async () => ({kind: 'failed', reason: 'timeout'}) as const, {reason: 'timeout'}],
+    ['a connection error', async () => ({kind: 'failed', reason: 'network-error'}) as const, {reason: 'network-error'}],
+    [
+      'a non-2xx answer',
+      async () => ({kind: 'failed', reason: 'http-error', status: 503}) as const,
+      {reason: 'http-error', status: 503},
+    ],
+    [
+      'a throwing disposer',
+      async (): Promise<never> => {
+        throw new Error(`boom at ${'/secret/path'}`)
+      },
+      {reason: 'threw'},
+    ],
+  ] as const
+
+  describe.skipIf(!OPENSSL_AVAILABLE)('a failing disposer', () => {
+    it.each(DISPOSE_FAILURES)(
+      '%s leaves the recovery ok and logs exactly one warning with no path',
+      async (_label, disposeInstance, expectedMeta) => {
+        // #given
+        const {fingerprint} = await setupDirtyCheckout()
+        const fixture = await setupNetworkFixture()
+        try {
+          const {logger, warn} = makeWarnLogger()
+
+          // #when
+          const result = await executeRecovery(
+            {...recoverReq(fixture), fingerprint},
+            recoveryDeps(fixture, {disposeInstance, logger}),
+          )
+
+          // #then the recovery itself is untouched: ok, fresh checkout installed, no journal
+          expect(result.kind).toBe('ok')
+          expect(gitSync(destPathFor(), ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim()).toBe(
+            fixture.headSha,
+          )
+          expect((await readJournal(join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME), OWNER, REPO)).ok).toBe(
+            false,
+          )
+          // #then one warning: owner, repo and the failure kind - never a directory, even a thrown message's
+          expect(warn).toHaveBeenCalledOnce()
+          expect(warn.mock.calls[0]?.[1]).toEqual({owner: OWNER, repo: REPO, ...expectedMeta})
+          const logged = JSON.stringify(warn.mock.calls)
+          expect(logged).not.toContain(reposRoot)
+          expect(logged).not.toContain('/secret/path')
+        } finally {
+          await fixture.close()
+        }
+      },
+    )
+  })
+
+  it.skipIf(!OPENSSL_AVAILABLE)('a throwing disposer without a logger still leaves the recovery ok', async () => {
+    // #given
+    const {fingerprint} = await setupDirtyCheckout()
+    const fixture = await setupNetworkFixture()
+    try {
+      const disposeInstance = async (): Promise<never> => {
+        throw new Error('boom')
+      }
+
+      // #when / #then
+      const result = await executeRecovery(
+        {...recoverReq(fixture), fingerprint},
+        recoveryDeps(fixture, {disposeInstance}),
+      )
+      expect(result.kind).toBe('ok')
+    } finally {
+      await fixture.close()
+    }
+  })
+})
+
+describe('executeRecovery \u2014 OpenCode instance dispose is never sent for a recovery that did not complete', () => {
+  it.skipIf(!OPENSSL_AVAILABLE)('a refused recovery (insufficient-disk-space) does not dispose', async () => {
+    // #given
+    const {fingerprint} = await setupDirtyCheckout()
+    const fixture = await setupNetworkFixture()
+    try {
+      const disposeInstance = vi.fn(async () => ({kind: 'disposed'}) as const)
+
+      // #when
+      const result = await executeRecovery(
+        {...recoverReq(fixture), fingerprint},
+        recoveryDeps(fixture, {disposeInstance, statfsFn: async () => ({bavail: 1, bsize: 1})}),
+      )
+
+      // #then
+      expect(result).toEqual({kind: 'refused', reason: 'insufficient-disk-space'})
+      expect(disposeInstance).not.toHaveBeenCalled()
+    } finally {
+      await fixture.close()
+    }
+  })
+
+  it.skipIf(!OPENSSL_AVAILABLE)('a checkout-changed refusal does not dispose', async () => {
+    // #given a fingerprint that no longer matches
+    await setupDirtyCheckout()
+    const fixture = await setupNetworkFixture()
+    try {
+      const disposeInstance = vi.fn(async () => ({kind: 'disposed'}) as const)
+
+      // #when
+      const result = await executeRecovery(
+        {...recoverReq(fixture), fingerprint: 'stale-fingerprint'},
+        recoveryDeps(fixture, {disposeInstance}),
+      )
+
+      // #then
+      expect(result).toEqual({kind: 'refused', reason: 'checkout-changed'})
+      expect(disposeInstance).not.toHaveBeenCalled()
+    } finally {
+      await fixture.close()
+    }
+  })
+
+  it.skipIf(!OPENSSL_AVAILABLE)('an unreachable remote (fetch-failed) does not dispose', async () => {
+    // #given
+    const {fingerprint} = await setupDirtyCheckout()
+    const fixture = await setupNetworkFixture()
+    try {
+      const disposeInstance = vi.fn(async () => ({kind: 'disposed'}) as const)
+
+      // #when
+      const result = await executeRecovery(
+        {...recoverReq(fixture), fingerprint},
+        recoveryDeps(fixture, {disposeInstance, remoteBaseUrl: 'https://127.0.0.1:1'}),
+      )
+
+      // #then
+      expect(result).toEqual({kind: 'failed', reason: 'fetch-failed'})
+      expect(disposeInstance).not.toHaveBeenCalled()
+    } finally {
+      await fixture.close()
+    }
+  })
+
+  it.skipIf(!OPENSSL_AVAILABLE)('a failed staging build (build-failed) does not dispose', async () => {
+    // #given
+    const {fingerprint} = await setupDirtyCheckout()
+    const fixture = await setupNetworkFixture()
+    try {
+      const disposeInstance = vi.fn(async () => ({kind: 'disposed'}) as const)
+      const packStreamRunner = async () =>
+        ({
+          kind: 'failed',
+          reason: 'writer-failed',
+          writer: {exitCode: 1, signal: null},
+          reader: {exitCode: null, signal: null},
+        }) as const
+
+      // #when
+      const result = await executeRecovery(
+        {...recoverReq(fixture), fingerprint},
+        recoveryDeps(fixture, {disposeInstance, packStreamRunner}),
+      )
+
+      // #then
+      expect(result).toEqual({kind: 'failed', reason: 'build-failed'})
+      expect(disposeInstance).not.toHaveBeenCalled()
+    } finally {
+      await fixture.close()
+    }
+  })
+
+  it.skipIf(!OPENSSL_AVAILABLE)('a client abort before quarantine does not dispose', async () => {
+    // #given
+    const {fingerprint} = await setupDirtyCheckout()
+    const fixture = await setupNetworkFixture()
+    try {
+      const disposeInstance = vi.fn(async () => ({kind: 'disposed'}) as const)
+      const controller = new AbortController()
+      handoffHook.after = () => controller.abort()
+
+      // #when
+      const result = await executeRecovery(
+        {...recoverReq(fixture), fingerprint},
+        recoveryDeps(fixture, {disposeInstance, signal: controller.signal}),
+      )
+
+      // #then
+      expect(result).toEqual(ABORTED_RESULT)
+      expect(disposeInstance).not.toHaveBeenCalled()
+    } finally {
+      await fixture.close()
+    }
+  })
+
+  it.skipIf(!OPENSSL_AVAILABLE)(
+    'a failed post-install verification (verification-failed) does not dispose',
+    async () => {
+      // #given the post-install HEAD check fails, after the rename
+      const {fingerprint} = await setupDirtyCheckout()
+      const fixture = await setupNetworkFixture()
+      try {
+        const disposeInstance = vi.fn(async () => ({kind: 'disposed'}) as const)
+        const gitRunner: GitRunnerFn = async (args, options) =>
+          args.includes('HEAD^{commit}') ? {kind: 'failed', code: 1, stdout: '', stderr: 'nope'} : runGit(args, options)
+
+        // #when
+        const result = await executeRecovery(
+          {...recoverReq(fixture), fingerprint},
+          recoveryDeps(fixture, {disposeInstance, gitRunner}),
+        )
+
+        // #then
+        expect(result).toEqual({kind: 'failed', reason: 'verification-failed'})
+        expect(disposeInstance).not.toHaveBeenCalled()
+      } finally {
+        await fixture.close()
+      }
+    },
+  )
+})

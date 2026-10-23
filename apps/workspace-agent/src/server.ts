@@ -8,6 +8,7 @@
 import type {BackupsDeps} from './backups.js'
 import type {CloneHandlerDeps, CloneHandlerResult} from './clone.js'
 import type {InspectHandlerDeps, InspectHandlerResult} from './inspect.js'
+import type {InstanceDisposer} from './opencode-instance.js'
 import type {Logger} from './opencode-server.js'
 import type {ExecuteRecoveryDeps, PreviewRecoveryDeps} from './recover.js'
 import type {
@@ -284,6 +285,12 @@ export interface ServerDeps {
     readonly caBundlePath?: string
     readonly proxy?: {readonly https: string; readonly noProxy?: string}
   }
+  /**
+   * Disposes OpenCode's cached instance for a directory, run best-effort after every successful
+   * `/recover` (the manual flow and the automatic one both land here). Built once in `main.ts`
+   * against the loopback OpenCode upstream. When absent, `/recover` simply skips it.
+   */
+  readonly instanceDisposer?: InstanceDisposer
   /** OpenCode server readiness reference. When absent, opencode field is omitted from /healthz. */
   readonly opencodeStatus?: OpencodeStatusRef
   /**
@@ -326,6 +333,7 @@ export function createApp(deps: ServerDeps): Hono {
     deleteBackupExecutor = deleteBackup,
     updateNetworkConfig,
     logger,
+    instanceDisposer,
     opencodeStatus,
     proxyListening,
     auth,
@@ -699,7 +707,11 @@ export function createApp(deps: ServerDeps): Hono {
     // The gateway's HTTP call has its own deadline; when the CLIENT disconnects (or its own request
     // times out), this propagates as an abort — honored by executeRecovery up to the quarantine
     // rename, ignored from there on (executeRecovery's own documented contract).
-    const result = await executeRecoveryExecutor(request, {signal: c.req.raw.signal})
+    const result = await executeRecoveryExecutor(request, {
+      signal: c.req.raw.signal,
+      disposeInstance: instanceDisposer,
+      logger,
+    })
     return c.json(result, statusForExecuteRecoveryResult(result))
   })
 

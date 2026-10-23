@@ -19,6 +19,7 @@ import type {CheckoutLayoutRunner} from './checkout-profile.js'
 import type {GitProfile, GitRunnerFn} from './git-safety.js'
 import type {PackStreamOptions} from './git-stream.js'
 import type {JournalListEntry, RecoveryJournal, RecoveryJournalPhase, UpdateJournal} from './journal.js'
+import type {InstanceDisposer} from './opencode-instance.js'
 import type {
   DirtyCounts,
   ExecuteRecoveryRequest,
@@ -123,6 +124,19 @@ export interface ExecuteRecoveryDeps {
    * ignored from the `quarantining` journal write onward, where stopping halfway is worse than finishing.
    */
   readonly signal?: AbortSignal
+  /**
+   * Best-effort hook run after a recovery has fully succeeded (installed, verified, journal removed):
+   * disposes OpenCode's cached instance for the replaced checkout directory, which would otherwise
+   * keep serving the old tree. Its outcome never changes the recovery result. Absent: no-op.
+   */
+  readonly disposeInstance?: InstanceDisposer
+  /** Receives the one warning a failed dispose produces (owner, repo, reason; never a path). */
+  readonly logger?: RecoveryLogger
+}
+
+/** The slice of the process logger recovery needs; structurally satisfied by `opencode-server.ts`'s `Logger`. */
+export interface RecoveryLogger {
+  readonly warn: (message: string, meta?: Record<string, unknown>) => void
 }
 
 /** Minimal free-space shape this module needs — avoids `fs.promises.statfs`'s bigint-overload union. */
@@ -1125,6 +1139,33 @@ interface RecoveryMutationContext {
   readonly recoveryId: string
   readonly runId: string | undefined
   readonly signal: AbortSignal | undefined
+  readonly disposeInstance: InstanceDisposer | undefined
+  readonly logger: RecoveryLogger | undefined
+}
+
+/**
+ * Asks OpenCode to drop its cached instance for the directory a recovery just replaced. Runs only
+ * after a verified success, inside the repo lock, bounded by the disposer's own short timeout. A
+ * failure of ANY kind (including a throwing disposer) is one warning and nothing else: the recovery
+ * already succeeded and the checkout is correct on disk. The warning carries owner, repo and the
+ * failure kind or HTTP status - never the directory.
+ */
+async function disposeInstanceBestEffort(ctx: RecoveryMutationContext): Promise<void> {
+  const {disposeInstance, logger, owner, repo, checkoutPath} = ctx
+  if (disposeInstance === undefined) return
+  try {
+    const outcome = await disposeInstance(checkoutPath)
+    if (outcome.kind === 'failed') {
+      logger?.warn('workspace-agent: OpenCode instance dispose failed after recovery', {
+        owner,
+        repo,
+        reason: outcome.reason,
+        ...(outcome.status === undefined ? {} : {status: outcome.status}),
+      })
+    }
+  } catch {
+    logger?.warn('workspace-agent: OpenCode instance dispose failed after recovery', {owner, repo, reason: 'threw'})
+  }
 }
 
 /**
@@ -1459,6 +1500,7 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
   if (verified !== 'ok') return {kind: 'failed', reason: 'verification-failed'}
 
   await removeJournal(journalsDir, owner, repo)
+  await disposeInstanceBestEffort(ctx)
   return {kind: 'ok', recoveryId, sha: target.sha, branch: target.branch}
 }
 
@@ -1503,6 +1545,8 @@ export async function executeRecovery(
     statfsFn = defaultStatfs,
     recoveryIdFn = randomUUID,
     signal,
+    disposeInstance,
+    logger,
   } = deps
   const {timeoutMs = DEFAULT_LOCAL_TIMEOUT_MS, uid = AGENT_UID, gid = AGENT_GID} = options
   const {owner, repo} = request
@@ -1555,6 +1599,8 @@ export async function executeRecovery(
           recoveryId: recoveryIdFn(),
           runId: request.runId,
           signal,
+          disposeInstance,
+          logger,
         }),
       (): ExecuteRecoveryResult => ({kind: 'failed', reason: 'termination-unconfirmed'}),
     )

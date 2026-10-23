@@ -2095,6 +2095,43 @@ describe('POST /recover — run attribution and signal plumbing', () => {
   })
 })
 
+describe('POST /recover \u2014 OpenCode instance disposer plumbing', () => {
+  it('hands the configured disposer and the process logger to the recovery executor', async () => {
+    // #given
+    let captured: ExecuteRecoveryDeps | undefined
+    const executeRecoveryExecutor = vi.fn(async (_request: ExecuteRecoveryRequest, deps?: ExecuteRecoveryDeps) => {
+      captured = deps
+      return {kind: 'no-checkout'} satisfies ExecuteRecoveryResult
+    }) as ExecuteRecoveryExecutorFn & ReturnType<typeof vi.fn>
+    const instanceDisposer = vi.fn(async () => ({kind: 'disposed'}) as const)
+    const logger = {info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const app = appWithoutAuth({executeRecoveryExecutor, instanceDisposer, logger})
+
+    // #when
+    await postRecover(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN, fingerprint: 'abc'})
+
+    // #then
+    expect(captured?.disposeInstance).toBe(instanceDisposer)
+    expect(captured?.logger).toBe(logger)
+  })
+
+  it('passes no disposer when none is configured (route tests, legacy wiring)', async () => {
+    // #given
+    let captured: ExecuteRecoveryDeps | undefined
+    const executeRecoveryExecutor = vi.fn(async (_request: ExecuteRecoveryRequest, deps?: ExecuteRecoveryDeps) => {
+      captured = deps
+      return {kind: 'no-checkout'} satisfies ExecuteRecoveryResult
+    }) as ExecuteRecoveryExecutorFn & ReturnType<typeof vi.fn>
+    const app = appWithoutAuth({executeRecoveryExecutor})
+
+    // #when
+    await postRecover(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN, fingerprint: 'abc'})
+
+    // #then
+    expect(captured?.disposeInstance).toBeUndefined()
+  })
+})
+
 describe('GET /backups/:owner/:repo — validation and status mapping', () => {
   it('returns 400 invalid-owner for traversal attempt', async () => {
     const app = appWithoutAuth()
