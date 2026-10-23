@@ -2,13 +2,13 @@ import type {MintWorkspaceToken} from './workspace-token.js'
 
 import {err, ok} from '@fro-bot/runtime'
 import {afterEach, describe, expect, it, vi} from 'vitest'
-import {DEFAULT_ENSURE_CLONE_AUTH_TIMEOUT_MS} from '../workspace-api/ensure-clone.js'
 import {INSTALLATION_TOKEN_MINT_TIMEOUT_MS, mintBounded} from './workspace-token.js'
 
 type MintResult = Awaited<ReturnType<MintWorkspaceToken>>
 
-const NETWORK_ERROR = err({kind: 'network-error' as const})
-const NOT_INSTALLED = err({kind: 'http-error' as const, status: 401 as const})
+const NETWORK_ERROR = err({kind: 'network-error' as const, cause: 'AuthError'})
+const NOT_INSTALLED = err({kind: 'http-error' as const, status: 401 as const, cause: 'AppNotInstalledError'})
+const TIMED_OUT = err({kind: 'network-error' as const, cause: 'timeout'})
 
 async function never(): ReturnType<MintWorkspaceToken> {
   return new Promise(() => {})
@@ -32,8 +32,8 @@ describe('mintBounded', () => {
   })
 
   it.each([
-    ['a permanent installation failure keeps its 401', NOT_INSTALLED],
-    ['a retryable mint failure keeps its network-error', NETWORK_ERROR],
+    ['a permanent installation failure keeps its 401 and its cause', NOT_INSTALLED],
+    ['a retryable mint failure keeps its network-error and its cause', NETWORK_ERROR],
   ])('%s', async (_label, failure) => {
     expect(await mintBounded(vi.fn().mockResolvedValue(failure), 'acme', 'widget', 1_000)).toEqual(failure)
   })
@@ -54,14 +54,41 @@ describe('mintBounded', () => {
 
     // #then a timeout is transient: it is never reported as the permanent 401
     expect(settledEarly).toBe(false)
-    expect(await pending).toEqual(NETWORK_ERROR)
+    expect(await pending).toEqual(TIMED_OUT)
     await tracked
   })
 
-  it('a mint that throws is handled as a transient network-error', async () => {
-    expect(await mintBounded(vi.fn().mockRejectedValue(new Error('boom')), 'acme', 'widget', 1_000)).toEqual(
-      NETWORK_ERROR,
+  it('a mint that throws is a transient network-error whose cause is the error class, never its message', async () => {
+    // #when / #then
+    const result = await mintBounded(
+      vi.fn().mockRejectedValue(new TypeError('secret detail in the message')),
+      'acme',
+      'widget',
+      1_000,
     )
+    expect(result).toEqual(err({kind: 'network-error', cause: 'TypeError'}))
+    expect(JSON.stringify(result)).not.toContain('secret detail')
+  })
+
+  it('a thrown value that is not an Error has the cause "threw"', async () => {
+    expect(await mintBounded(vi.fn().mockRejectedValue('just a string'), 'acme', 'widget', 1_000)).toEqual(
+      err({kind: 'network-error', cause: 'threw'}),
+    )
+  })
+
+  it('a mint that throws SYNCHRONOUSLY (a non-async mint) is handled the same way and leaves no timer behind', async () => {
+    // #given
+    vi.useFakeTimers()
+    const mint = vi.fn().mockImplementation(() => {
+      throw new RangeError('sync boom')
+    })
+
+    // #when
+    const result = await mintBounded(mint, 'acme', 'widget', 1_000)
+
+    // #then
+    expect(result).toEqual(err({kind: 'network-error', cause: 'RangeError'}))
+    expect(vi.getTimerCount()).toBe(0)
   })
 
   it('a mint that answers after the ceiling cannot change the result', async () => {
@@ -82,10 +109,10 @@ describe('mintBounded', () => {
     await vi.advanceTimersByTimeAsync(1_000)
 
     // #then
-    expect(result).toEqual(NETWORK_ERROR)
+    expect(result).toEqual(TIMED_OUT)
   })
 
-  it('a mint that rejects after the ceiling raises no unhandled rejection', async () => {
+  it('a mint that rejects after the ceiling changes nothing', async () => {
     // #given
     vi.useFakeTimers()
     let rejectMint: (reason: Error) => void = () => {}
@@ -94,23 +121,16 @@ describe('mintBounded', () => {
         rejectMint = reject
       }),
     )
-    const unhandled = vi.fn()
-    process.on('unhandledRejection', unhandled)
+    // #when
+    const pending = mintBounded(mint, 'acme', 'widget', 50)
+    await vi.advanceTimersByTimeAsync(50)
+    const result = await pending
+    rejectMint(new Error('late boom'))
+    await vi.advanceTimersByTimeAsync(1_000)
+    await Promise.resolve()
 
-    try {
-      // #when
-      const pending = mintBounded(mint, 'acme', 'widget', 50)
-      await vi.advanceTimersByTimeAsync(50)
-      await pending
-      rejectMint(new Error('late boom'))
-      await vi.advanceTimersByTimeAsync(1_000)
-      await Promise.resolve()
-
-      // #then
-      expect(unhandled).not.toHaveBeenCalled()
-    } finally {
-      process.off('unhandledRejection', unhandled)
-    }
+    // #then the rejection arrived after the result was settled, so it changes nothing
+    expect(result).toEqual(TIMED_OUT)
   })
 
   it('clears its timer once the mint answers', async () => {
@@ -121,8 +141,7 @@ describe('mintBounded', () => {
 })
 
 describe('INSTALLATION_TOKEN_MINT_TIMEOUT_MS', () => {
-  it('is the 30 s the same authForRepo call already gets when a clone is ensured: one number, not two', () => {
-    expect(INSTALLATION_TOKEN_MINT_TIMEOUT_MS).toBe(DEFAULT_ENSURE_CLONE_AUTH_TIMEOUT_MS)
+  it('is 30 s, pinned to the literal rather than to the alias it was copied from', () => {
     expect(INSTALLATION_TOKEN_MINT_TIMEOUT_MS).toBe(30_000)
   })
 })

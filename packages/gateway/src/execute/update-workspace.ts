@@ -10,6 +10,7 @@
  */
 
 import type {Result} from '@fro-bot/runtime'
+import type {GatewayLogger} from '../discord/client.js'
 import type {WorkspaceClient} from '../workspace-api/client.js'
 import type {UpdateResult, UpdateWorkspaceError} from '../workspace-api/types.js'
 import type {MintFailure, MintWorkspaceToken} from './workspace-token.js'
@@ -25,13 +26,27 @@ export type UpdateWorkspaceCall = (
 export function createUpdateWorkspaceCall(deps: {
   readonly workspaceClient: Pick<WorkspaceClient, 'update'>
   readonly mintToken: MintWorkspaceToken
+  readonly logger: Pick<GatewayLogger, 'warn'>
   /** Test seam; defaults to `INSTALLATION_TOKEN_MINT_TIMEOUT_MS`. */
   readonly mintTimeoutMs?: number
 }): UpdateWorkspaceCall {
-  const {workspaceClient, mintToken, mintTimeoutMs = INSTALLATION_TOKEN_MINT_TIMEOUT_MS} = deps
+  const {workspaceClient, mintToken, logger, mintTimeoutMs = INSTALLATION_TOKEN_MINT_TIMEOUT_MS} = deps
   return async (owner, repo, options) => {
     const token = await mintBounded(mintToken, owner, repo, mintTimeoutMs)
-    if (token.success === false) return token
+    if (token.success === false) {
+      // One warning per mint failure, so a thrown or stalled mint is not silent: owner, repo, why, and the
+      // status of a permanent failure. Never the token or the error message.
+      logger.warn(
+        {
+          owner,
+          repo,
+          cause: token.error.cause,
+          ...(token.error.kind === 'http-error' ? {status: token.error.status} : {}),
+        },
+        'run: installation token mint failed before update',
+      )
+      return token
+    }
     return workspaceClient.update({owner, repo, token: token.data}, options)
   }
 }

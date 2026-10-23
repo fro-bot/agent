@@ -25,6 +25,7 @@ function makeCallsWithMint(mintResult: MintResult) {
   return makeCalls(vi.fn().mockResolvedValue(mintResult))
 }
 
+const NETWORK = (cause: string) => err({kind: 'network-error' as const, cause})
 const RECOVER_OPTIONS = {fingerprint: 'fp-1', runId: 'run-1'}
 
 describe('createRecoveryWorkspaceCalls', () => {
@@ -43,7 +44,7 @@ describe('createRecoveryWorkspaceCalls', () => {
 
   it('previewRecovery still works when a token mint would have failed (a GitHub outage is not a preview failure)', async () => {
     // #given
-    const {calls, workspaceClient} = makeCallsWithMint(err({kind: 'network-error'}))
+    const {calls, workspaceClient} = makeCallsWithMint(NETWORK('AuthError'))
 
     // #when
     const result = await calls.previewRecovery('acme', 'widget')
@@ -78,9 +79,13 @@ describe('createRecoveryWorkspaceCalls: the token mint is bounded', () => {
   })
 
   it.each([
-    ['a permanent installation failure', err({kind: 'http-error' as const, status: 401 as const})],
-    ['a retryable mint failure', err({kind: 'network-error' as const})],
-  ])('%s returns token-unavailable and never sends /recover', async (_label, failure) => {
+    [
+      'a permanent installation failure',
+      err({kind: 'http-error' as const, status: 401 as const, cause: 'AppNotInstalledError'}),
+      'AppNotInstalledError',
+    ],
+    ['a retryable mint failure', NETWORK('AuthError'), 'AuthError'],
+  ])('%s returns token-unavailable carrying its cause and never sends /recover', async (_label, failure, cause) => {
     // #given
     const {calls, workspaceClient} = makeCallsWithMint(failure)
 
@@ -88,7 +93,7 @@ describe('createRecoveryWorkspaceCalls: the token mint is bounded', () => {
     const result = await calls.recover('acme', 'widget', RECOVER_OPTIONS)
 
     // #then nothing was sent, so the caller must be able to tell it apart from a transport error
-    expect(result).toEqual(err({kind: 'token-unavailable'}))
+    expect(result).toEqual(err({kind: 'token-unavailable', cause}))
     expect(workspaceClient.recover).not.toHaveBeenCalled()
   })
 
@@ -109,7 +114,7 @@ describe('createRecoveryWorkspaceCalls: the token mint is bounded', () => {
 
     // #then
     expect(settledEarly).toBe(false)
-    expect(await pending).toEqual(err({kind: 'token-unavailable'}))
+    expect(await pending).toEqual(err({kind: 'token-unavailable', cause: 'timeout'}))
     await tracked
     expect(workspaceClient.recover).not.toHaveBeenCalled()
   })
@@ -124,7 +129,7 @@ describe('createRecoveryWorkspaceCalls: the token mint is bounded', () => {
     await vi.advanceTimersByTimeAsync(20)
 
     // #then the reviewer's probe: a 20 ms ceiling must settle by 20 ms, not stay pending
-    expect(await pending).toEqual(err({kind: 'token-unavailable'}))
+    expect(await pending).toEqual(err({kind: 'token-unavailable', cause: 'timeout'}))
     expect(workspaceClient.recover).not.toHaveBeenCalled()
   })
 
@@ -147,11 +152,11 @@ describe('createRecoveryWorkspaceCalls: the token mint is bounded', () => {
     await vi.advanceTimersByTimeAsync(1_000)
 
     // #then
-    expect(result).toEqual(err({kind: 'token-unavailable'}))
+    expect(result).toEqual(err({kind: 'token-unavailable', cause: 'timeout'}))
     expect(workspaceClient.recover).not.toHaveBeenCalled()
   })
 
-  it('a mint that rejects after the ceiling raises no unhandled rejection', async () => {
+  it('a mint that rejects after the ceiling changes nothing', async () => {
     // #given
     vi.useFakeTimers()
     let rejectMint: (reason: Error) => void = () => {}
@@ -161,23 +166,16 @@ describe('createRecoveryWorkspaceCalls: the token mint is bounded', () => {
       }),
     )
     const {calls} = makeCalls(mintToken, 50)
-    const unhandled = vi.fn()
-    process.on('unhandledRejection', unhandled)
+    // #when
+    const pending = calls.recover('acme', 'widget', RECOVER_OPTIONS)
+    await vi.advanceTimersByTimeAsync(50)
+    const result = await pending
+    rejectMint(new Error('late boom'))
+    await vi.advanceTimersByTimeAsync(1_000)
+    await Promise.resolve()
 
-    try {
-      // #when
-      const pending = calls.recover('acme', 'widget', RECOVER_OPTIONS)
-      await vi.advanceTimersByTimeAsync(50)
-      await pending
-      rejectMint(new Error('late boom'))
-      await vi.advanceTimersByTimeAsync(1_000)
-      await Promise.resolve()
-
-      // #then
-      expect(unhandled).not.toHaveBeenCalled()
-    } finally {
-      process.off('unhandledRejection', unhandled)
-    }
+    // #then the rejection arrived after the result was settled, so it changes nothing
+    expect(result).toEqual(err({kind: 'token-unavailable', cause: 'timeout'}))
   })
 
   it('a mint that throws returns token-unavailable and never sends /recover', async () => {
@@ -188,7 +186,7 @@ describe('createRecoveryWorkspaceCalls: the token mint is bounded', () => {
     const result = await calls.recover('acme', 'widget', RECOVER_OPTIONS)
 
     // #then
-    expect(result).toEqual(err({kind: 'token-unavailable'}))
+    expect(result).toEqual(err({kind: 'token-unavailable', cause: 'Error'}))
     expect(workspaceClient.recover).not.toHaveBeenCalled()
   })
 
@@ -204,12 +202,7 @@ describe('createRecoveryWorkspaceCalls: the token mint is bounded', () => {
     expect(vi.getTimerCount()).toBe(0)
   })
 
-  it('the ceiling is the 30 s the same authForRepo call is already given when ensuring a clone', async () => {
-    // #given the existing bound for this exact call
-    const {DEFAULT_ENSURE_CLONE_AUTH_TIMEOUT_MS} = await import('../workspace-api/ensure-clone.js')
-
-    // #when / #then one number, not two
-    expect(INSTALLATION_TOKEN_MINT_TIMEOUT_MS).toBe(DEFAULT_ENSURE_CLONE_AUTH_TIMEOUT_MS)
+  it('the default ceiling is the 30 s source deadline, pinned to the literal', () => {
     expect(INSTALLATION_TOKEN_MINT_TIMEOUT_MS).toBe(30_000)
   })
 })

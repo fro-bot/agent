@@ -36,7 +36,8 @@ export function createRecoveryWorkspaceCalls(deps: {
     recover: async (owner, repo, options) => {
       const token = await mintBounded(mintToken, owner, repo, mintTimeoutMs)
       // Whatever the cause (a failure, a throw or a timeout), no `/recover` was sent: nothing moved.
-      if (token.success === false) return err({kind: 'token-unavailable' as const})
+      // The cause rides along for the decline log.
+      if (token.success === false) return err({kind: 'token-unavailable' as const, cause: token.error.cause})
       return workspaceClient.recover({owner, repo, token: token.data, ...options})
     },
   }

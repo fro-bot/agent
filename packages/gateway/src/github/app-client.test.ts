@@ -1,9 +1,11 @@
-import {beforeEach, describe, expect, it, vi} from 'vitest'
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {
   AppNotInstalledError,
   AuthError,
+  AuthTimeoutError,
   createAppClient,
+  INSTALLATION_TOKEN_MINT_TIMEOUT_MS,
   InsufficientPermissionsError,
   RepoNotFoundError,
 } from './app-client.js'
@@ -87,6 +89,12 @@ function getInstallationCalls(): InstallationAuthCallArg[] {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+function makeDeadlineSpy() {
+  const controller = new AbortController()
+  const spy = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(controller.signal)
+  return {controller, spy}
+}
 
 describe('createAppClient', () => {
   beforeEach(() => {
@@ -534,6 +542,131 @@ describe('createAppClient', () => {
     // #then — both succeed
     expect(a.success).toBe(true)
     expect(b.success).toBe(true)
+  })
+
+  describe('authForRepo deadline', () => {
+    afterEach(() => {
+      vi.restoreAllMocks()
+    })
+
+    it('the deadline is 30 s, pinned to the literal', () => {
+      expect(INSTALLATION_TOKEN_MINT_TIMEOUT_MS).toBe(30_000)
+    })
+
+    it('creates ONE deadline signal of that length and shares it between discovery and the token mint', async () => {
+      // #given
+      const {spy, controller} = makeDeadlineSpy()
+      const seen: (AbortSignal | undefined)[] = []
+      mockRequest.mockImplementation(async (_route: string, options: InstallationAuthCallArg) => {
+        seen.push(options.request?.signal)
+        return INSTALLATION_RESPONSE
+      })
+      mockAuth.mockImplementation(async (options: InstallationAuthCallArg) => {
+        if (options.type === 'installation') seen.push(options.request?.signal)
+        return {token: options.type === 'app' ? 'jwt-token-value' : 'installation-token-value'}
+      })
+      const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+
+      // #when
+      const result = await client.authForRepo('foo', 'bar')
+
+      // #then
+      expect(result.success).toBe(true)
+      expect(spy).toHaveBeenCalledExactlyOnceWith(INSTALLATION_TOKEN_MINT_TIMEOUT_MS)
+      expect(seen).toEqual([controller.signal, controller.signal])
+    })
+
+    it('an abort during discovery comes back as an AuthTimeoutError Result, never a throw', async () => {
+      // #given the discovery request is aborted by the deadline
+      const {controller} = makeDeadlineSpy()
+      mockRequest.mockImplementation(async () => {
+        controller.abort(new Error('deadline'))
+        throw new Error('aborted: socket detail the caller must not see')
+      })
+      const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+
+      // #when
+      const result = await client.authForRepo('foo', 'bar')
+
+      // #then
+      expect(result.success).toBe(false)
+      if (result.success) return
+      expect(result.error).toBeInstanceOf(AuthTimeoutError)
+      expect(result.error).toBeInstanceOf(AuthError)
+      expect(result.error.message).toBe('GitHub App authentication timed out')
+    })
+
+    it('an aborted discovery writes no cache entry: the next call discovers again', async () => {
+      // #given
+      const {controller} = makeDeadlineSpy()
+      mockRequest.mockImplementationOnce(async () => {
+        controller.abort(new Error('deadline'))
+        throw new Error('aborted')
+      })
+      const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+      await client.authForRepo('foo', 'bar')
+      vi.restoreAllMocks()
+      mockRequest.mockResolvedValue(INSTALLATION_RESPONSE)
+
+      // #when
+      const second = await client.authForRepo('foo', 'bar')
+
+      // #then discovery ran a second time, so nothing was cached by the aborted one
+      expect(second.success).toBe(true)
+      expect(mockRequest).toHaveBeenCalledTimes(2)
+    })
+
+    it('an abort during the token mint comes back as an AuthTimeoutError Result and evicts the cached installation', async () => {
+      // #given discovery succeeds, then the mint is aborted by the deadline
+      const {controller} = makeDeadlineSpy()
+      mockAuth.mockImplementation(async (options: InstallationAuthCallArg) => {
+        if (options.type === 'app') return {token: 'jwt-token-value'}
+        controller.abort(new Error('deadline'))
+        throw new Error('aborted')
+      })
+      const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+
+      // #when
+      const result = await client.authForRepo('foo', 'bar')
+
+      // #then
+      expect(result.success).toBe(false)
+      if (result.success) return
+      expect(result.error).toBeInstanceOf(AuthTimeoutError)
+    })
+
+    it('a failure that is NOT an abort stays a plain AuthError, not a timeout', async () => {
+      // #given
+      mockRequest.mockRejectedValue(new Error('boom'))
+      const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+
+      // #when
+      const result = await client.authForRepo('foo', 'bar')
+
+      // #then
+      expect(result.success).toBe(false)
+      if (result.success) return
+      expect(result.error).toBeInstanceOf(AuthError)
+      expect(result.error).not.toBeInstanceOf(AuthTimeoutError)
+    })
+
+    it('a warm cache hit still passes the deadline to the mint', async () => {
+      // #given
+      const {controller} = makeDeadlineSpy()
+      const seen: (AbortSignal | undefined)[] = []
+      mockAuth.mockImplementation(async (options: InstallationAuthCallArg) => {
+        if (options.type === 'installation') seen.push(options.request?.signal)
+        return {token: options.type === 'app' ? 'jwt-token-value' : 'installation-token-value'}
+      })
+      const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+      await client.authForRepo('foo', 'bar')
+
+      // #when
+      await client.authForRepo('foo', 'bar')
+
+      // #then
+      expect(seen).toEqual([controller.signal, controller.signal])
+    })
   })
 
   it('cache invalidation: after invalidateCache, next authForRepo re-discovers installation', async () => {

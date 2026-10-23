@@ -33,6 +33,15 @@ export const REPO_IDENTITY_REQUEST_TIMEOUT_MS = 10_000
 /** Maximum duration for each network operation in workflow-dispatch App auth. */
 export const WORKFLOW_DISPATCH_AUTH_TIMEOUT_MS = 5_000
 
+/**
+ * Deadline for one whole `authForRepo` call: installation discovery and the token mint share it, and
+ * the Octokit requests are aborted when it expires. Without it a stalled GitHub call has no end, and
+ * every caller (checkout preparation under the repo lock, the manual recover confirm, the clone path,
+ * the denylist reader, add-project, the backfill) would wait on it. This module is the lowest shared
+ * place for the constant: `execute/` and `workspace-api/` both import from here, never the reverse.
+ */
+export const INSTALLATION_TOKEN_MINT_TIMEOUT_MS = 30_000
+
 // ---------------------------------------------------------------------------
 // Error types
 // ---------------------------------------------------------------------------
@@ -81,6 +90,18 @@ export class AuthError extends Error {
   constructor(message: string) {
     super(message)
     this.name = 'AuthError'
+  }
+}
+
+/**
+ * An `AuthError` whose cause is the call's own deadline expiring. A subtype, so every caller that
+ * handles `AuthError` handles it unchanged; callers that want to tell a stall from other failures can
+ * test for it. The message is fixed: nothing from the aborted request is carried over.
+ */
+export class AuthTimeoutError extends AuthError {
+  constructor() {
+    super('GitHub App authentication timed out')
+    this.name = 'AuthTimeoutError'
   }
 }
 
@@ -242,6 +263,7 @@ export function createAppClient(options: AppClientOptions): AppClient {
           permissions: response.data.permissions ?? {},
         }
       } catch (discoveryError) {
+        if (requestSignal?.aborted === true) return err(new AuthTimeoutError())
         if (isOctokitNotFound(discoveryError)) {
           return err(new AppNotInstalledError(owner, repo, installUrl))
         }
@@ -260,6 +282,7 @@ export function createAppClient(options: AppClientOptions): AppClient {
       })
       return ok(installationData)
     } catch (error) {
+      if (requestSignal?.aborted === true) return err(new AuthTimeoutError())
       return err(new AuthError(safeErrorMessage(error)))
     }
   }
@@ -285,6 +308,7 @@ export function createAppClient(options: AppClientOptions): AppClient {
     } catch (mintError) {
       // A mint failure means the cached installation may no longer be usable.
       installationCache.delete(cacheKey(owner, repo))
+      if (requestSignal?.aborted === true) return err(new AuthTimeoutError())
       return err(new AuthError(safeErrorMessage(mintError)))
     }
   }
@@ -293,9 +317,12 @@ export function createAppClient(options: AppClientOptions): AppClient {
     owner: string,
     repo: string,
   ): Promise<Result<AppClientAuthResult, AppNotInstalledError | InsufficientPermissionsError | AuthError>> {
-    const installationResult = await discoverInstallation(owner, repo)
+    // One deadline for the whole call, shared by discovery and the mint, so the requests are aborted
+    // when it expires. An abort comes back as an `AuthTimeoutError` Result, never a throw.
+    const deadline = AbortSignal.timeout(INSTALLATION_TOKEN_MINT_TIMEOUT_MS)
+    const installationResult = await discoverInstallation(owner, repo, deadline)
     if (installationResult.success === false) return installationResult
-    return mintToken(owner, repo, installationResult.data, {contents: 'read'})
+    return mintToken(owner, repo, installationResult.data, {contents: 'read'}, deadline)
   }
 
   async function authForWorkflowDispatch(

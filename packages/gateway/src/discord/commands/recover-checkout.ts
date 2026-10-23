@@ -489,27 +489,20 @@ export async function handleRecoverConfirmOrCancelClick(
       return
     }
 
-    // The claimed maintenance run holds the repo lock while the token is minted, and `authForRepo` has
-    // no deadline of its own, so the mint is bounded (`mintBounded`). `mintBounded` collapses every
-    // failure to one kind, so this adapter records why the mint produced no token: the error class for
-    // a failed mint (never its message), `threw` for a throw, and nothing for a timeout.
-    let mintFailureReason: string | undefined
+    // The claimed maintenance run holds the repo lock while the token is minted. `authForRepo` aborts its
+    // own requests at its deadline, and `mintBounded` backstops a mint that ignores it. The failure the
+    // bound returns carries the cause (the error class, never its message, or `timeout`), so the log
+    // below reads it from the result and not from state a late mint could still write.
     const mintToken: MintWorkspaceToken = async (owner, repo) => {
-      try {
-        const authResult = await deps.appClient.authForRepo(owner, repo)
-        if (authResult.success === false) {
-          mintFailureReason = authResult.error.constructor.name
-          return err({kind: 'network-error' as const})
-        }
-        return ok(authResult.data.token)
-      } catch {
-        mintFailureReason = 'threw'
-        return err({kind: 'network-error' as const})
+      const authResult = await deps.appClient.authForRepo(owner, repo)
+      if (authResult.success === false) {
+        return err({kind: 'network-error' as const, cause: authResult.error.constructor.name})
       }
+      return ok(authResult.data.token)
     }
     const minted = await mintBounded(mintToken, payload.owner, payload.repo, INSTALLATION_TOKEN_MINT_TIMEOUT_MS)
     if (minted.success === false) {
-      log.error({repoSlug, err: mintFailureReason ?? 'timeout'}, 'recover-checkout: token mint failed at confirm')
+      log.error({repoSlug, err: minted.error.cause}, 'recover-checkout: token mint failed at confirm')
       await releaseClaimedRun('FAILED', 'auth-failed')
       await editInteractionAsync(interaction, {content: INTERNAL_ERROR_COPY, components: []}, log)
       return

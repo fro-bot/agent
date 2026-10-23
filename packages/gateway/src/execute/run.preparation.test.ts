@@ -746,8 +746,8 @@ describe('checkout preparation: automatic recovery is gated', () => {
     vi.clearAllMocks()
   })
 
-  it("keeps today's refusal, calling nothing, when the run budget is one below the required sum (544s by default)", async () => {
-    // #given a run budget one millisecond under quiescence + token mint + preview + recover + dispose + lookup + update
+  it("keeps today's refusal, calling nothing, when the run budget is one below the required sum (574s by default)", async () => {
+    // #given a run budget one millisecond under quiescence + two token mints + preview + recover + dispose + lookup + update
     // #when
     const run = await launchRecoveryRun({updates: [DIRTY], runTimeoutMs: totalRecoveryBudgetMs() - 1})
 
@@ -1848,6 +1848,7 @@ describe('checkout preparation: a stalled installation-token mint before the fir
     const update = createUpdateWorkspaceCall({
       workspaceClient: {update: workspaceUpdate},
       mintToken: vi.fn().mockReturnValue(new Promise(() => {})),
+      logger: {warn: vi.fn()},
       mintTimeoutMs: MINT_CEILING_MS,
     })
     return {update: vi.fn().mockImplementation(update), workspaceUpdate}

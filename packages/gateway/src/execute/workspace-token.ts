@@ -11,29 +11,43 @@
 import type {Result} from '@fro-bot/runtime'
 
 import {err} from '@fro-bot/runtime'
-import {DEFAULT_ENSURE_CLONE_AUTH_TIMEOUT_MS} from '../workspace-api/ensure-clone.js'
+import {INSTALLATION_TOKEN_MINT_TIMEOUT_MS} from '../github/app-client.js'
 
-/** Why a mint produced no token: `401` is a permanent installation failure, `network-error` is retryable. */
-export type MintFailure = {readonly kind: 'http-error'; readonly status: 401} | {readonly kind: 'network-error'}
+// The ceiling lives in `github/app-client.ts`, the lowest module that needs it: `authForRepo` applies it
+// as a deadline to its own requests. It is re-exported here for the callers in this package.
+export {INSTALLATION_TOKEN_MINT_TIMEOUT_MS}
+
+/**
+ * Why a mint produced no token, and what kind of failure it is. `http-error` 401 is a permanent
+ * installation failure, `network-error` is retryable; the kinds are what `run.ts` maps. `cause` is for
+ * diagnostics only: `timeout` (the backstop below fired), `threw` (a non-Error was thrown), or an error
+ * class name. It is never an error message, which can carry tokens or internal detail.
+ */
+export type MintFailure = ({readonly kind: 'http-error'; readonly status: 401} | {readonly kind: 'network-error'}) & {
+  readonly cause: string
+}
 
 /** Mints an installation token for one repo. */
 export type MintWorkspaceToken = (owner: string, repo: string) => Promise<Result<string, MintFailure>>
 
-/**
- * Ceiling on one GitHub App installation-token mint (`appClient.authForRepo`). It is the bound the very
- * same call already has when a clone is ensured (`DEFAULT_ENSURE_CLONE_AUTH_TIMEOUT_MS`): one number
- * for one operation, shared by `/update`, `/recover` and the clone path.
- */
-export const INSTALLATION_TOKEN_MINT_TIMEOUT_MS = DEFAULT_ENSURE_CLONE_AUTH_TIMEOUT_MS
+type MintOutcome = Awaited<ReturnType<MintWorkspaceToken>> | {readonly thrown: string} | 'timeout'
 
-type MintOutcome = Awaited<ReturnType<MintWorkspaceToken>> | 'timeout' | 'threw'
+/** The class name of a thrown value, or `threw` when it is not an Error. Never its message. */
+function describeThrown(thrown: unknown): string {
+  return thrown instanceof Error && thrown.constructor.name !== '' ? thrown.constructor.name : 'threw'
+}
 
 /**
- * Races the mint against `timeoutMs`. A mint that fails keeps its failure (a `401` stays permanent). A
- * mint that does not answer in time, or throws, is a transient `network-error`: nothing says the
- * installation is gone, and a retry may succeed. A mint that loses the race keeps running unobserved;
- * it can neither start a workspace request (callers are sequential and have already returned) nor
- * surface an unhandled rejection (its outcome is swallowed here).
+ * Backstop for a mint that ignores its deadline. `authForRepo` now aborts its own requests at
+ * `INSTALLATION_TOKEN_MINT_TIMEOUT_MS` and returns an `AuthTimeoutError` Result, so a stalled GitHub
+ * call ends at the source. This race still bounds anything that does not honour a signal (a test
+ * adapter, future code), so the repo lock never depends on every mint being well behaved.
+ *
+ * A mint that fails keeps its failure (a `401` stays permanent). A mint that does not answer in time,
+ * or throws (even synchronously), is a transient `network-error`: nothing says the installation is
+ * gone, and a retry may succeed. A mint that loses the race keeps running unobserved; it can neither
+ * start a workspace request (callers are sequential and have already returned) nor surface an
+ * unhandled rejection (its outcome is swallowed here).
  */
 export async function mintBounded(
   mintToken: MintWorkspaceToken,
@@ -45,12 +59,18 @@ export async function mintBounded(
   const timeout = new Promise<'timeout'>(resolve => {
     timer = setTimeout(() => resolve('timeout'), timeoutMs)
   })
-  const minted = mintToken(owner, repo).catch((): 'threw' => 'threw')
+  // The async wrapper turns a synchronous throw from a non-async `mintToken` into a rejection, so it is
+  // caught here and the timer is cleared below like any other outcome.
+  const minted = (async () => mintToken(owner, repo))().catch((error: unknown): MintOutcome => ({
+    thrown: describeThrown(error),
+  }))
   let outcome: MintOutcome
   try {
     outcome = await Promise.race([minted, timeout])
   } finally {
     clearTimeout(timer)
   }
-  return outcome === 'timeout' || outcome === 'threw' ? err({kind: 'network-error' as const}) : outcome
+  if (outcome === 'timeout') return err({kind: 'network-error' as const, cause: 'timeout'})
+  if ('thrown' in outcome) return err({kind: 'network-error' as const, cause: outcome.thrown})
+  return outcome
 }

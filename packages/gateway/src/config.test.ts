@@ -3568,13 +3568,13 @@ describe('loadGatewayConfig: GATEWAY_RUN_TIMEOUT_MS vs the automatic-recovery bu
     expect(entry.msg).toContain('can never run')
   })
 
-  it('the threshold includes the token-mint ceiling: 544s with the default time limits', () => {
+  it('the threshold includes both token mints: 574s with the default time limits', () => {
     // #given the sum is pinned independently of the helper, so a dropped term cannot slip through
-    expect(RECOVERY_FLOOR_MS).toBe(544_000)
+    expect(RECOVERY_FLOOR_MS).toBe(574_000)
 
-    // #when a run timeout between the old 514s sum and the new one
+    // #when a run timeout one under the sum
     setRequiredEnv()
-    process.env.GATEWAY_RUN_TIMEOUT_MS = '543999'
+    process.env.GATEWAY_RUN_TIMEOUT_MS = '573999'
     process.env.GATEWAY_RUN_INACTIVITY_TIMEOUT_MS = '1000'
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
     loadGatewayConfig()
@@ -3582,8 +3582,8 @@ describe('loadGatewayConfig: GATEWAY_RUN_TIMEOUT_MS vs the automatic-recovery bu
     // #then it warns, with both numbers
     const warns = recoveryFloorWarns(warnSpy)
     expect(warns).toHaveLength(1)
-    expect(warns[0]).toContain('543999')
-    expect(warns[0]).toContain('544000')
+    expect(warns[0]).toContain('573999')
+    expect(warns[0]).toContain('574000')
   })
 
   it.each([

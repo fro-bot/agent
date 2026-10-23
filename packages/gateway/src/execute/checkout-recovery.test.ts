@@ -153,21 +153,39 @@ describe('tryAutoRecoverDirtyCheckout: budget gate', () => {
 })
 
 describe('totalRecoveryBudgetMs', () => {
-  it('is the quiescence check, the token mint and every workspace call (default sum 544s)', () => {
-    // #given the default ceilings: 4s quiescence + 30s mint + 45s preview + 300s recover + 5s dispose
-    // + 60s backup lookup + 100s update
+  it('is the quiescence check, TWO token mints and every workspace call (default sum 574s)', () => {
+    // #given the default ceilings: 4s quiescence + 30s mint for /recover + 30s mint for the follow-up
+    // /update + 45s preview + 300s recover + 5s dispose + 60s backup lookup + 100s update
     // #when / #then
-    expect(totalRecoveryBudgetMs()).toBe(4_000 + 30_000 + 45_000 + 300_000 + 5_000 + 60_000 + 100_000)
-    expect(totalRecoveryBudgetMs()).toBe(544_000)
+    expect(totalRecoveryBudgetMs()).toBe(4_000 + 30_000 + 30_000 + 45_000 + 300_000 + 5_000 + 60_000 + 100_000)
+    expect(totalRecoveryBudgetMs()).toBe(574_000)
   })
 
-  it('derives the quiescence and mint terms from their exported constants, not literals', () => {
-    expect(totalRecoveryBudgetMs()).toBe(
+  it('counts the mint twice: recovery mints for /recover and again for the follow-up /update', () => {
+    // #given a budget with every other term removed
+    const zero = {
+      previewRecoveryTimeoutMs: 0,
+      recoverTimeoutMs: 0,
+      updateTimeoutMs: 0,
+      listBackupsTimeoutMs: 0,
+    }
+
+    // #when / #then what is left is the quiescence check, the instance dispose and exactly two mints
+    expect(totalRecoveryBudgetMs(zero)).toBe(
+      REPO_QUIESCENCE_TIMEOUT_MS + 5_000 + 2 * INSTALLATION_TOKEN_MINT_TIMEOUT_MS,
+    )
+    expect(totalRecoveryBudgetMs()).toBeGreaterThan(
       REPO_QUIESCENCE_TIMEOUT_MS + INSTALLATION_TOKEN_MINT_TIMEOUT_MS + totalRecoveryCeilingMs(),
     )
   })
 
-  it('follows the ceilings the client was configured with, keeping the mint term fixed', () => {
+  it('derives the quiescence and mint terms from their exported constants, not literals', () => {
+    expect(totalRecoveryBudgetMs()).toBe(
+      REPO_QUIESCENCE_TIMEOUT_MS + 2 * INSTALLATION_TOKEN_MINT_TIMEOUT_MS + totalRecoveryCeilingMs(),
+    )
+  })
+
+  it('follows the ceilings the client was configured with, keeping the mint terms fixed', () => {
     // #given
     const options = {
       previewRecoveryTimeoutMs: 1_000,
@@ -178,7 +196,7 @@ describe('totalRecoveryBudgetMs', () => {
 
     // #when / #then
     expect(totalRecoveryBudgetMs(options)).toBe(
-      REPO_QUIESCENCE_TIMEOUT_MS + INSTALLATION_TOKEN_MINT_TIMEOUT_MS + 10_000 + 5_000,
+      REPO_QUIESCENCE_TIMEOUT_MS + 2 * INSTALLATION_TOKEN_MINT_TIMEOUT_MS + 10_000 + 5_000,
     )
   })
 })
@@ -340,19 +358,19 @@ describe('tryAutoRecoverDirtyCheckout: recover outcomes that moved nothing (decl
 describe('tryAutoRecoverDirtyCheckout: a recover that never sent a request (token unavailable)', () => {
   it('declines, because the mint failed or timed out before /recover was sent and nothing moved', async () => {
     // #given
-    const recover = vi.fn().mockResolvedValue(err({kind: 'token-unavailable'}))
+    const recover = vi.fn().mockResolvedValue(err({kind: 'token-unavailable', cause: 'timeout'}))
 
     // #when
     const {outcome, h} = await run({recover})
 
     // #then it is a decline - NOT ambiguous - so the original dirty refusal stands and no lookup runs
-    expect(outcome).toEqual({kind: 'declined', reason: 'token-unavailable'})
+    expect(outcome).toEqual({kind: 'declined', reason: 'token-unavailable', cause: 'timeout'})
     expect(h.recover).toHaveBeenCalledOnce()
     expect(h.listBackups).not.toHaveBeenCalled()
   })
 
-  it('logs one declined warning carrying the reason', async () => {
-    const recover = vi.fn().mockResolvedValue(err({kind: 'token-unavailable'}))
+  it('logs one declined warning carrying the reason and the cause of the mint failure', async () => {
+    const recover = vi.fn().mockResolvedValue(err({kind: 'token-unavailable', cause: 'AuthTimeoutError'}))
     const {h} = await run({recover})
     expect(h.logger.warn).toHaveBeenCalledOnce()
     expect(h.logger.warn.mock.calls[0]?.[0]).toEqual({
@@ -360,7 +378,13 @@ describe('tryAutoRecoverDirtyCheckout: a recover that never sent a request (toke
       runId: 'run-1',
       outcome: 'declined',
       reason: 'token-unavailable',
+      cause: 'AuthTimeoutError',
     })
+  })
+
+  it('logs no cause on any other decline', async () => {
+    const {h} = await run({quiescence: makeQuiescenceFn('busy')})
+    expect(h.logger.warn.mock.calls[0]?.[0]).not.toHaveProperty('cause')
   })
 })
 

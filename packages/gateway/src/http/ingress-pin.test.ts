@@ -315,7 +315,7 @@ function makeBrowserGuardStubDeps(): OperatorServerDeps {
       previewRecovery: vi.fn(),
       recover: vi.fn(),
       listBackups: vi.fn(),
-      recoveryBudgetMs: 544_000,
+      recoveryBudgetMs: 574_000,
     },
     dispatchWorkflow: vi.fn(async (owner: string, repo: string) => ({outcome: 'accepted' as const, owner, repo})),
     // Provide cancelRunDeps so the cancel route is registered in the pinned inventory.
