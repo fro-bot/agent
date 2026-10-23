@@ -9,6 +9,7 @@ import {isIP} from 'node:net'
 
 import {GatewayIntentBits} from 'discord.js'
 import {Effect, Either} from 'effect'
+import {totalRecoveryBudgetMs} from './execute/recovery-budget.js'
 import {loadObjectStoreSettings} from './object-store-config.js'
 import {readMultilineSecret, readOptionalMultilineSecret, readOptionalSecret, readSecret} from './secrets.js'
 import {parseAllowlistText} from './web/auth/allowlist.js'
@@ -494,6 +495,19 @@ export function loadGatewayConfig(): GatewayConfig {
       JSON.stringify({
         level: 'warn',
         msg: `GATEWAY_RUN_INACTIVITY_TIMEOUT_MS (${runInactivityTimeoutMs}ms) is >= GATEWAY_RUN_TIMEOUT_MS (${runTimeoutMs}ms) — the inactivity timer can never fire because the hard ceiling fires first. Set GATEWAY_RUN_INACTIVITY_TIMEOUT_MS to a value less than GATEWAY_RUN_TIMEOUT_MS.`,
+      }),
+    )
+  }
+
+  // Soft warning: automatic recovery of a dirty checkout needs the quiescence check plus every workspace
+  // call at its ceiling (execute/recovery-budget.ts) left in the run's budget. A shorter hard ceiling
+  // is valid, but the feature can then never run, and a dirty checkout is refused as before.
+  const recoveryBudgetMs = totalRecoveryBudgetMs()
+  if (runTimeoutMs < recoveryBudgetMs) {
+    console.warn(
+      JSON.stringify({
+        level: 'warn',
+        msg: `GATEWAY_RUN_TIMEOUT_MS (${runTimeoutMs}ms) is below the ${recoveryBudgetMs}ms that automatic checkout recovery needs, so automatic checkout recovery can never run and a dirty checkout is refused as before. Set GATEWAY_RUN_TIMEOUT_MS to at least ${recoveryBudgetMs} to enable it.`,
       }),
     )
   }

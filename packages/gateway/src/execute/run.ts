@@ -62,17 +62,17 @@ import {
 import {toOperatorFailureKind} from '../operator-contract/run-status.js'
 import {canonicalWorkspaceTarget} from '../workspace-api/client.js'
 import {abortRegistry} from './abort-registry.js'
-import {tryAutoRecoverDirtyCheckout} from './checkout-recovery.js'
+import {settleAmbiguousRecovery, tryAutoRecoverDirtyCheckout} from './checkout-recovery.js'
 import {releaseLockOrByOwnership} from './lock-release.js'
 import {attachOpencode} from './opencode-attach.js'
 import {
   CLIENT_TIMEOUT_REPLY,
   formatPreparationFailedReply,
   formatPreparationRefusedReply,
-  formatRecoveredNote,
   formatRecoveryBlockedReply,
+  formatRollbackFailedReply,
+  pickRecoveryNote,
   RECOVER_SUFFIX,
-  RECOVERY_ATTEMPTED_NOTE,
   withRecoveryNote,
 } from './preparation-reply.js'
 import {buildDiscordPrompt, EmptyPromptError} from './prompt.js'
@@ -1278,22 +1278,24 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       // It rides on EVERY reply path below - refusal, follow-up timeout, thrown error, substituted
       // checkout and a continued run's provenance line - exactly once.
       let recoveryNote: string | undefined
+      let rollbackFailed = false
       if (
         updateResult.success === true &&
         updateResult.data.kind === 'refused' &&
         updateResult.data.reason === 'dirty'
       ) {
         const dirtyRefusal = updateResult.data
+        const recoveryContext = {
+          owner: workspaceTarget.owner,
+          repo: workspaceTarget.repo,
+          repoSlug: repo,
+          runId,
+          remainingBudgetMs: remainingUpdateBudgetMs(),
+          requiredBudgetMs: recoveryBudgetMs,
+        }
         const recoveryOutcome = await tryAutoRecoverDirtyCheckout(
           {checkRepoQuiescence: deps.checkRepoQuiescence, previewRecovery, recover, listBackups, logger},
-          {
-            owner: workspaceTarget.owner,
-            repo: workspaceTarget.repo,
-            repoSlug: repo,
-            runId,
-            remainingBudgetMs: remainingUpdateBudgetMs(),
-            requiredBudgetMs: recoveryBudgetMs,
-          },
+          recoveryContext,
         )
         if (recoveryOutcome.kind === 'declined' && recoveryOutcome.reason === 'quota-exceeded') {
           logPreparationOutcome(dirtyRefusal)
@@ -1310,22 +1312,37 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           )
         }
         if (recoveryOutcome.kind !== 'declined') {
-          const backupId =
-            recoveryOutcome.kind === 'recovered'
-              ? recoveryOutcome.backupId
-              : recoveryOutcome.backup.kind === 'found'
-                ? recoveryOutcome.backup.backupId
-                : undefined
-          recoveryNote = backupId === undefined ? RECOVERY_ATTEMPTED_NOTE : formatRecoveredNote(backupId)
+          const confirmedBackupId = recoveryOutcome.kind === 'recovered' ? recoveryOutcome.backupId : undefined
+          // Provisional note: if the follow-up update itself were to throw, the failure still carries it.
+          provenanceLine = pickRecoveryNote({backupId: confirmedBackupId, checkoutReady: false})
           updateResult = await update(workspaceTarget.owner, workspaceTarget.repo, {
             remainingBudgetMs: remainingUpdateBudgetMs(),
           })
+          // The follow-up update queues behind the workspace's per-repo mutex, so any swap that was still
+          // renaming has finished by now: only then is it safe to look this run's backup up.
+          let backupId = confirmedBackupId
+          if (recoveryOutcome.kind === 'ambiguous') {
+            const lookup = await settleAmbiguousRecovery({listBackups, logger}, recoveryContext, recoveryOutcome.reason)
+            if (lookup.kind === 'found') backupId = lookup.backupId
+            rollbackFailed = recoveryOutcome.reason === 'rollback-failed'
+          }
+          // `rollback-failed` stopped before any quarantine, so no backup can belong to it.
+          if (rollbackFailed) backupId = undefined
+          // The wording follows what the follow-up update observed: the install is claimed only for a
+          // known backup AND a ready checkout (a backup's metadata is written before the install).
+          const checkoutReady = updateResult.success === true && updateResult.data.kind === 'ready'
+          recoveryNote = pickRecoveryNote({backupId, checkoutReady})
           // Any failure from here on that is not a refusal reply (a thrown RunCoreError) still carries the note.
           provenanceLine = recoveryNote
         }
       }
-      const withBackupNote = (replyText: string): string =>
-        recoveryNote === undefined ? replyText : withRecoveryNote(replyText, recoveryNote)
+      const withBackupNote = (replyText: string): string => {
+        // A cleanup that could not be confirmed replaces the observed refusal's text: neither the
+        // Recover suffix nor its button apply, because a manual recovery is refused while the leftover
+        // journal exists. The refusal itself is still persisted as the run's checkoutPreparation.
+        if (rollbackFailed) return formatRollbackFailedReply({flow: 'automatic'})
+        return recoveryNote === undefined ? replyText : withRecoveryNote(replyText, recoveryNote)
+      }
 
       if (updateResult.success === false) {
         // A client-side timeout means neither side knows what happened — distinct "state unknown"

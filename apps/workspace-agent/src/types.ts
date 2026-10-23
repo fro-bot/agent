@@ -427,10 +427,11 @@ export type ExecuteRecoveryFailureReason =
   | 'build-failed'
   /**
    * A pre-quarantine failure (build, handoff or client abort) whose rollback - staging removal and
-   * restoring or removing the `building` journal - could not be confirmed. Unlike `build-failed`,
-   * a `building` journal (and possibly staging) is left behind: the next `/update` refuses
-   * `needs-recovery` and a preview refuses `journal-in-progress` until the workspace restarts and
-   * reconciles it. The original checkout itself is untouched.
+   * restoring or removing the `building` journal - could not be confirmed. Unlike `build-failed`, a
+   * `building` journal (and possibly staging) is left behind: the next `/update` refuses
+   * `needs-recovery` and a preview refuses `journal-in-progress` until startup reconciliation
+   * retries the cleanup when the workspace restarts. If that retry fails too, the journal stays and
+   * an admin must clear it. The original checkout itself is untouched.
    */
   | 'rollback-failed'
   | 'quarantine-failed'

@@ -401,7 +401,7 @@ describe('/fro-bot recover-checkout — confirm/cancel buttons', () => {
     expect(handle.release).toHaveBeenCalledWith('COMPLETED', expect.objectContaining({outcome: 'ok'}))
   })
 
-  it('rollback-failed: says the cleanup did not finish and the workspace must restart, not "try again"', async () => {
+  it('rollback-failed: says the cleanup is pending and retried on restart, and an admin clears it if it persists', async () => {
     // #given the recovery stopped before moving anything, but its rollback left a journal behind
     const guild = makeGuild(true)
     const handle = makeReleaseHandle()
@@ -418,8 +418,9 @@ describe('/fro-bot recover-checkout — confirm/cancel buttons', () => {
 
     // #then the next recover would be refused as in progress, so the reply must not invite one
     const content = (editReply.mock.calls.at(-1)?.[0] as {content: string}).content
-    expect(content).toContain("cleanup didn't finish")
-    expect(content).toContain('restarts')
+    expect(content).toBe(
+      "I couldn't clean up after the recovery for `acme/widget`; the checkout itself wasn't changed. The workspace retries the cleanup when it restarts; if this persists, an admin needs to clear it.",
+    )
     expect(content).not.toContain('try again')
     expect(content).not.toContain('Run `/fro-bot recover-checkout` again')
   })

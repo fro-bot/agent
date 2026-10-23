@@ -9,7 +9,7 @@ import type {AutoRecoverRequest, CheckoutRecoveryOutcome} from './checkout-recov
 import {err, ok} from '@fro-bot/runtime'
 import {describe, expect, it, vi} from 'vitest'
 import {totalRecoveryCeilingMs} from '../workspace-api/client.js'
-import {totalRecoveryBudgetMs, tryAutoRecoverDirtyCheckout} from './checkout-recovery.js'
+import {settleAmbiguousRecovery, totalRecoveryBudgetMs, tryAutoRecoverDirtyCheckout} from './checkout-recovery.js'
 import {REPO_QUIESCENCE_TIMEOUT_MS} from './repo-quiescence.js'
 import {
   DEFAULT_BACKUP_ID,
@@ -352,8 +352,10 @@ describe('tryAutoRecoverDirtyCheckout: recover outcomes where something may have
     const {outcome, h} = await run({recover: vi.fn().mockResolvedValue(result)})
 
     // #then
-    expect(outcome).toEqual({kind: 'ambiguous', reason, backup: {kind: 'not-found'}})
+    // the backup lookup happens later, after the follow-up update (see settleAmbiguousRecovery)
+    expect(outcome).toEqual({kind: 'ambiguous', reason})
     expect(h.recover).toHaveBeenCalledOnce()
+    expect(h.listBackups).not.toHaveBeenCalled()
   })
 
   it('a throwing recover is ambiguous: the request may have reached the workspace', async () => {
@@ -361,7 +363,7 @@ describe('tryAutoRecoverDirtyCheckout: recover outcomes where something may have
     const {outcome} = await run({recover: vi.fn().mockRejectedValue(new Error('socket hang up'))})
 
     // #then
-    expect(outcome).toEqual({kind: 'ambiguous', reason: 'transport-error', backup: {kind: 'not-found'}})
+    expect(outcome).toEqual({kind: 'ambiguous', reason: 'transport-error'})
   })
 
   it('classifies every ExecuteRecoveryFailureReason exactly as the table says', async () => {
@@ -391,10 +393,7 @@ describe('tryAutoRecoverDirtyCheckout: logging', () => {
     })
   })
 
-  it.each([
-    ['declined', {quiescence: makeQuiescenceFn('busy')}, 'workspace-busy'],
-    ['ambiguous', {recover: vi.fn().mockResolvedValue(err({kind: 'timeout'}))}, 'timeout'],
-  ] as const)(
+  it.each([['declined', {quiescence: makeQuiescenceFn('busy')}, 'workspace-busy']] as const)(
     'logs a %s outcome at warn with the reason and nothing path-like',
     async (outcomeKind, overrides, reason) => {
       // #given / #when
@@ -407,17 +406,15 @@ describe('tryAutoRecoverDirtyCheckout: logging', () => {
         runId: 'run-1',
         outcome: outcomeKind,
         reason,
-        ...(outcomeKind === 'ambiguous' ? {lookup: 'not-found'} : {}),
       })
     },
   )
 })
 
-// After an ambiguous outcome the recovery may or may not have completed, so the run looks its own backup
-// up by run id: a found id is named like a `recovered` one, anything else falls back to the attempted note.
-describe('tryAutoRecoverDirtyCheckout: backup lookup after an ambiguous outcome', () => {
-  const TIMEOUT = {recover: vi.fn().mockResolvedValue(err({kind: 'timeout'}))}
-
+// After an ambiguous outcome the recovery may or may not have completed, so once the follow-up `update`
+// has returned (it waits behind the workspace's mutex, so any swap has finished) the run looks its own
+// backup up by run id. `settleAmbiguousRecovery` does the lookup and writes the one ambiguous warning.
+describe('settleAmbiguousRecovery: the backup lookup after an ambiguous outcome', () => {
   function backup(id: string, runId: string | undefined, createdAt = '2026-01-01T00:00:00.000Z') {
     return {
       id,
@@ -435,6 +432,12 @@ describe('tryAutoRecoverDirtyCheckout: backup lookup after an ambiguous outcome'
     return vi.fn().mockResolvedValue(ok({kind: 'ok', backups, totalBytes: 1}))
   }
 
+  async function settle(listBackups: ReturnType<typeof vi.fn>, reason: 'timeout' | 'rollback-failed' = 'timeout') {
+    const h = makeDeps({listBackups})
+    const backupLookup = await settleAmbiguousRecovery(h.deps, REQUEST, reason)
+    return {backupLookup, h}
+  }
+
   it('names the backup whose runId is this run, and asks for the canonical owner and repo', async () => {
     // #given
     const listBackups = listing(
@@ -444,10 +447,10 @@ describe('tryAutoRecoverDirtyCheckout: backup lookup after an ambiguous outcome'
     )
 
     // #when
-    const {outcome, h} = await run({...TIMEOUT, listBackups})
+    const {backupLookup, h} = await settle(listBackups)
 
     // #then
-    expect(outcome).toEqual({kind: 'ambiguous', reason: 'timeout', backup: {kind: 'found', backupId: 'gen-mine'}})
+    expect(backupLookup).toEqual({kind: 'found', backupId: 'gen-mine'})
     expect(h.listBackups).toHaveBeenCalledExactlyOnceWith('acme', 'widget')
   })
 
@@ -458,19 +461,15 @@ describe('tryAutoRecoverDirtyCheckout: backup lookup after an ambiguous outcome'
       backup('gen-new', 'run-1', '2026-01-02T00:00:00.000Z'),
     )
 
-    // #when
-    const {outcome} = await run({...TIMEOUT, listBackups})
-
-    // #then
-    expect(outcome).toMatchObject({backup: {kind: 'found', backupId: 'gen-new'}})
+    // #when / #then
+    expect((await settle(listBackups)).backupLookup).toEqual({kind: 'found', backupId: 'gen-new'})
   })
 
   it.each([
     ['no backups at all', listing()],
     ['only backups of other runs and manual ones', listing(backup('a', 'run-2'), backup('b', undefined))],
   ])('%s is not-found', async (_label, listBackups) => {
-    const {outcome} = await run({...TIMEOUT, listBackups})
-    expect(outcome).toMatchObject({kind: 'ambiguous', backup: {kind: 'not-found'}})
+    expect((await settle(listBackups)).backupLookup).toEqual({kind: 'not-found'})
   })
 
   it.each([
@@ -480,16 +479,7 @@ describe('tryAutoRecoverDirtyCheckout: backup lookup after an ambiguous outcome'
     ['a parse error', vi.fn().mockResolvedValue(err({kind: 'parse-error'}))],
     ['a throw', vi.fn().mockRejectedValue(new Error('boom'))],
   ])('%s is a failed lookup, never an error', async (_label, listBackups) => {
-    const {outcome} = await run({...TIMEOUT, listBackups})
-    expect(outcome).toMatchObject({kind: 'ambiguous', backup: {kind: 'failed'}})
-  })
-
-  it.each([
-    ['recovered', {}],
-    ['declined', {quiescence: makeQuiescenceFn('busy')}],
-  ])('a %s outcome never looks anything up', async (_label, overrides) => {
-    const {h} = await run(overrides)
-    expect(h.listBackups).not.toHaveBeenCalled()
+    expect((await settle(listBackups)).backupLookup).toEqual({kind: 'failed'})
   })
 
   it.each([
@@ -498,7 +488,7 @@ describe('tryAutoRecoverDirtyCheckout: backup lookup after an ambiguous outcome'
     ['failed', vi.fn().mockResolvedValue(err({kind: 'timeout'})), {lookup: 'failed'}],
   ])('logs the %s lookup in the one ambiguous warning, with no path', async (_label, listBackups, fields) => {
     // #given / #when
-    const {h} = await run({...TIMEOUT, listBackups})
+    const {h} = await settle(listBackups)
 
     // #then
     expect(h.logger.warn).toHaveBeenCalledOnce()
@@ -509,5 +499,25 @@ describe('tryAutoRecoverDirtyCheckout: backup lookup after an ambiguous outcome'
       reason: 'timeout',
       ...fields,
     })
+    expect(h.logger.warn.mock.calls[0]?.[1]).toBe('run: automatic checkout recovery ambiguous')
+  })
+
+  it('looks up a rollback-failed outcome too (the lookup is uniform)', async () => {
+    const {backupLookup, h} = await settle(listing(), 'rollback-failed')
+    expect(backupLookup).toEqual({kind: 'not-found'})
+    expect(h.logger.warn.mock.calls[0]?.[0]).toMatchObject({reason: 'rollback-failed', lookup: 'not-found'})
+  })
+})
+
+describe('tryAutoRecoverDirtyCheckout: no backup lookup of its own', () => {
+  it.each([
+    ['recovered', {}, 1],
+    ['declined', {quiescence: makeQuiescenceFn('busy')}, 1],
+    // an ambiguous outcome is logged later, by settleAmbiguousRecovery, with the lookup result
+    ['ambiguous', {recover: vi.fn().mockResolvedValue(err({kind: 'timeout'}))}, 0],
+  ])('a %s outcome never looks anything up (warnings written: %#)', async (_label, overrides, warnings) => {
+    const {h} = await run(overrides)
+    expect(h.listBackups).not.toHaveBeenCalled()
+    expect(h.logger.warn).toHaveBeenCalledTimes(warnings)
   })
 })

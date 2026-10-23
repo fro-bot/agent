@@ -12,7 +12,11 @@ import type {FroBotDeps} from './fro-bot.js'
 import type {AuthDecision, GuildCommandCtx} from './guild-command.js'
 import {ActionRowBuilder, ButtonBuilder, ButtonStyle} from 'discord.js'
 import {Effect} from 'effect'
-import {formatInsufficientDiskReply, formatQuotaExceededReply} from '../../execute/preparation-reply.js'
+import {
+  formatInsufficientDiskReply,
+  formatQuotaExceededReply,
+  formatRollbackFailedReply,
+} from '../../execute/preparation-reply.js'
 import {formatBranchForReply} from '../../execute/provenance.js'
 import {editInteractionAsync} from '../io.js'
 import {acquireMaintenanceRun} from '../maintenance-run.js'
@@ -175,7 +179,7 @@ function renderOutcome(repoSlug: string, result: import('../../workspace-api/typ
     case 'build-failed':
       return `Building the fresh checkout for \`${repoSlug}\` failed. The original checkout is untouched - try again shortly.`
     case 'rollback-failed':
-      return `The recovery for \`${repoSlug}\` stopped before it changed the checkout, but its cleanup didn't finish. The workspace finishes the cleanup when it next restarts; until then this repository can't run.`
+      return formatRollbackFailedReply({flow: 'manual', repoSlug})
     case 'quarantine-failed':
       return `Preserving the original checkout for \`${repoSlug}\` didn't finish. The workspace tries to finish it when it next restarts; until then this repository can't run.`
     case 'install-failed':

@@ -145,19 +145,61 @@ export function formatRecoveryBlockedReply(
   return `${DIRTY_REPLY}\n\n${cause}`
 }
 
-/** One line for the final answer (or a refusal) of a run whose checkout was automatically recovered. */
+/**
+ * One line for a run whose previous checkout is known to be preserved AND whose follow-up `update`
+ * reported a ready checkout: the swap completed, so the note claims the install.
+ */
 export function formatRecoveredNote(backupId: string): string {
   return `The previous checkout had uncommitted changes, so I preserved it as backup \`${backupId}\` and installed a fresh one (list backups with \`/fro-bot checkout-backup list\`).`
 }
 
 /**
- * Used when a recovery was attempted but no backup could be matched to this run (the lookup found
- * none or could not answer), so no id is known. It claims nothing about the checkout's current state,
- * because it also leads refusals and failures: the reply it prefixes says what the follow-up
- * `update` observed.
+ * One line for a run whose previous checkout is known to be preserved but whose follow-up `update`
+ * did NOT report a ready checkout (a refusal, a failure, a timeout, a transport error or a
+ * substituted tree). A backup's metadata is written when the quarantine finishes, before the fresh
+ * checkout is installed, so a known backup says nothing about an install: the note claims none and
+ * points at the status that follows it.
+ */
+export function formatPreservedNote(backupId: string): string {
+  return `The previous checkout had uncommitted changes, so I preserved it as backup \`${backupId}\` (list backups with \`/fro-bot checkout-backup list\`); the state of the checkout is below.`
+}
+
+/**
+ * Used when an automatic recovery ran but no backup could be matched to this run (the lookup found
+ * none or could not answer). It claims neither a backup nor an install: the run only knows it
+ * attempted a recovery, and it also leads refusals and failures, where the reply it prefixes says
+ * what the follow-up `update` observed.
  */
 export const RECOVERY_ATTEMPTED_NOTE =
-  'The previous checkout had uncommitted changes, so I tried to preserve it and install a fresh one; `/fro-bot checkout-backup list` shows whether a backup of it exists.'
+  'The previous checkout had uncommitted changes, so I attempted an automatic recovery; it may have been preserved as a backup, and `/fro-bot checkout-backup list` shows whether one exists.'
+
+/**
+ * The one note a run carries, chosen from what is known AFTER the follow-up `update`: the install is
+ * claimed only for a known backup with a ready checkout, a known backup alone is just preserved, and
+ * with no known backup the note is neutral whatever the checkout looks like.
+ */
+export function pickRecoveryNote(observed: {
+  readonly backupId: string | undefined
+  readonly checkoutReady: boolean
+}): string {
+  if (observed.backupId === undefined) return RECOVERY_ATTEMPTED_NOTE
+  return observed.checkoutReady ? formatRecoveredNote(observed.backupId) : formatPreservedNote(observed.backupId)
+}
+
+/**
+ * The reply when a recovery stopped before moving anything but its own cleanup could not be confirmed
+ * (`rollback-failed`): the checkout is unchanged, a leftover journal is retried by the workspace on
+ * restart, and an admin must clear one that persists. Deliberately NO `RECOVER_SUFFIX` and no button:
+ * a manual recovery is refused while that journal exists. The automatic flow and `recover-checkout`
+ * share the wording.
+ */
+export function formatRollbackFailedReply(
+  context: {readonly flow: 'automatic'} | {readonly flow: 'manual'; readonly repoSlug: string},
+): string {
+  const what =
+    context.flow === 'automatic' ? 'an automatic recovery attempt' : `the recovery for \`${context.repoSlug}\``
+  return `I couldn't clean up after ${what}; the checkout itself wasn't changed. The workspace retries the cleanup when it restarts; if this persists, an admin needs to clear it.`
+}
 
 /**
  * Prefixes a refusal/failure reply with a recovery note (`formatRecoveredNote(id)` or

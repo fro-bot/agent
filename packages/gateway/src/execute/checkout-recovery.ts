@@ -33,8 +33,8 @@ import type {
 } from '../workspace-api/types.js'
 import type {RepoQuiescenceChecker} from './repo-quiescence.js'
 
-import {totalRecoveryCeilingMs} from '../workspace-api/client.js'
-import {REPO_QUIESCENCE_TIMEOUT_MS} from './repo-quiescence.js'
+// Re-exported: the pure budget sum lives in recovery-budget.ts so config.ts can use it without this module's graph.
+export {totalRecoveryBudgetMs} from './recovery-budget.js'
 
 /** `RunMentionDeps.previewRecovery`: mints the installation token itself, like `update`. */
 export type PreviewRecoveryFn = (
@@ -105,9 +105,9 @@ export type RecoveryAmbiguousReason =
   | 'termination-unconfirmed'
 
 /**
- * What the run's own backup lookup found after an ambiguous outcome. `found`: the workspace did
- * complete the swap (the backup is attributed to this run id). `not-found`: no backup carries this
- * run id. `failed`: the lookup itself could not answer. Only `found` lets the reply name an id.
+ * What the run's own backup lookup found after an ambiguous outcome (`settleAmbiguousRecovery`).
+ * `found`: a backup is attributed to this run id. `not-found`: none carries this run id. `failed`:
+ * the lookup itself could not answer. Only `found` lets a reply name an id.
  */
 export type BackupLookup =
   {readonly kind: 'found'; readonly backupId: string} | {readonly kind: 'not-found'} | {readonly kind: 'failed'}
@@ -116,22 +116,7 @@ export type CheckoutRecoveryOutcome =
   | {readonly kind: 'recovered'; readonly backupId: string}
   | {readonly kind: 'declined'; readonly reason: 'quota-exceeded'; readonly usage: RetentionUsage}
   | {readonly kind: 'declined'; readonly reason: Exclude<RecoveryDeclineReason, 'quota-exceeded'>}
-  | {readonly kind: 'ambiguous'; readonly reason: RecoveryAmbiguousReason; readonly backup: BackupLookup}
-
-/** What `classifyRecover` returns: an ambiguous outcome has not been looked up yet. */
-type ClassifiedOutcome =
-  | Exclude<CheckoutRecoveryOutcome, {readonly kind: 'ambiguous'}>
   | {readonly kind: 'ambiguous'; readonly reason: RecoveryAmbiguousReason}
-
-/**
- * Worst-case wall-clock cost of one whole automatic-recovery attempt: the quiescence check, then every
- * workspace call (`totalRecoveryCeilingMs`: preview, recover with its dispose, the backup lookup, the
- * follow-up `update`), each at the ceiling the client is configured with. A run with less budget left
- * than this must not start one it could not finish.
- */
-export function totalRecoveryBudgetMs(options: Parameters<typeof totalRecoveryCeilingMs>[0] = {}): number {
-  return REPO_QUIESCENCE_TIMEOUT_MS + totalRecoveryCeilingMs(options)
-}
 
 type PreviewDecision =
   | {readonly kind: 'proceed'; readonly fingerprint: string}
@@ -161,7 +146,7 @@ function classifyPreview(result: Result<PreviewRecoveryResult, PreviewRecoveryWo
 
 function classifyRecoverFailure(
   reason: Extract<ExecuteRecoveryResult, {readonly kind: 'failed'}>['reason'],
-): ClassifiedOutcome {
+): CheckoutRecoveryOutcome {
   switch (reason) {
     // Returned before any journal, staging or rename exists.
     case 'inspection-failed':
@@ -183,7 +168,9 @@ function classifyRecoverFailure(
   }
 }
 
-function classifyRecover(result: Result<ExecuteRecoveryResult, ExecuteRecoveryWorkspaceError>): ClassifiedOutcome {
+function classifyRecover(
+  result: Result<ExecuteRecoveryResult, ExecuteRecoveryWorkspaceError>,
+): CheckoutRecoveryOutcome {
   // The request may have reached the workspace before the transport failed, so none of these prove
   // that nothing moved.
   if (result.success === false) {
@@ -209,34 +196,51 @@ function classifyRecover(result: Result<ExecuteRecoveryResult, ExecuteRecoveryWo
 
 function logOutcome(logger: GatewayLogger, request: AutoRecoverRequest, outcome: CheckoutRecoveryOutcome): void {
   const base = {repo: request.repoSlug, runId: request.runId, outcome: outcome.kind}
-  switch (outcome.kind) {
-    case 'recovered':
-      logger.warn({...base, backupId: outcome.backupId}, 'run: dirty checkout recovered automatically')
-      return
-    case 'declined':
-      logger.warn({...base, reason: outcome.reason}, 'run: automatic checkout recovery declined')
-      return
-    case 'ambiguous':
-      // The backup lookup rides on this one line: `found` adds the id, never a path.
-      logger.warn(
-        {
-          ...base,
-          reason: outcome.reason,
-          lookup: outcome.backup.kind,
-          ...(outcome.backup.kind === 'found' ? {backupId: outcome.backup.backupId} : {}),
-        },
-        'run: automatic checkout recovery ambiguous',
-      )
+  // An ambiguous outcome is logged by `settleAmbiguousRecovery`, once the backup lookup (which rides on
+  // that one line) is done.
+  if (outcome.kind === 'recovered') {
+    logger.warn({...base, backupId: outcome.backupId}, 'run: dirty checkout recovered automatically')
+  } else if (outcome.kind === 'declined') {
+    logger.warn({...base, reason: outcome.reason}, 'run: automatic checkout recovery declined')
   }
 }
 
 /**
- * Finds this run's backup after an ambiguous outcome. The recover request may have completed the swap
- * even though the caller never saw the answer, so the backup is looked up by the run id the workspace
- * recorded in its metadata. The lookup is bounded by the workspace client's own listBackups timeout;
- * any failure is `failed`, never an error, and a lookup can never turn an outcome into a decline.
+ * Finds this run's backup and writes the one warning an ambiguous outcome gets. Call it AFTER the
+ * follow-up `update` has returned: the recover request may have completed the swap even though the
+ * caller never saw the answer, and `listBackups` takes no repo lock, so a lookup made while the swap
+ * is still renaming can wrongly come back empty. The follow-up `update` queues behind the workspace's
+ * per-repo mutex, so once it has answered the swap is over and the backup is visible.
+ *
+ * The backup is matched by the run id the workspace recorded in its metadata (and listed for this
+ * owner/repo only), so another run's backup can never be named. The lookup is bounded by the workspace
+ * client's own `listBackupsTimeoutMs`; any failure is `failed`, never an error, and the result only
+ * ever adds a backup id to a reply - it cannot turn an outcome into a decline.
  */
-async function lookUpOwnBackup(deps: CheckoutRecoveryDeps, request: AutoRecoverRequest): Promise<BackupLookup> {
+export async function settleAmbiguousRecovery(
+  deps: Pick<CheckoutRecoveryDeps, 'listBackups' | 'logger'>,
+  request: AutoRecoverRequest,
+  reason: RecoveryAmbiguousReason,
+): Promise<BackupLookup> {
+  const lookup = await lookUpOwnBackup(deps, request)
+  deps.logger.warn(
+    {
+      repo: request.repoSlug,
+      runId: request.runId,
+      outcome: 'ambiguous',
+      reason,
+      lookup: lookup.kind,
+      ...(lookup.kind === 'found' ? {backupId: lookup.backupId} : {}),
+    },
+    'run: automatic checkout recovery ambiguous',
+  )
+  return lookup
+}
+
+async function lookUpOwnBackup(
+  deps: Pick<CheckoutRecoveryDeps, 'listBackups'>,
+  request: AutoRecoverRequest,
+): Promise<BackupLookup> {
   try {
     const listed = await deps.listBackups(request.owner, request.repo)
     if (listed.success === false || listed.data.kind !== 'ok') return {kind: 'failed'}
@@ -288,7 +292,7 @@ export async function tryAutoRecoverDirtyCheckout(
   if (preview.kind === 'declined') return finish({kind: 'declined', reason: preview.reason})
 
   // From here on the workspace may have acted, so a throw is ambiguous, not a decline.
-  let classified: ClassifiedOutcome
+  let classified: CheckoutRecoveryOutcome
   try {
     classified = classifyRecover(
       await deps.recover(request.owner, request.repo, {fingerprint: preview.fingerprint, runId: request.runId}),
@@ -296,6 +300,5 @@ export async function tryAutoRecoverDirtyCheckout(
   } catch {
     classified = {kind: 'ambiguous', reason: 'transport-error'}
   }
-  if (classified.kind !== 'ambiguous') return finish(classified)
-  return finish({...classified, backup: await lookUpOwnBackup(deps, request)})
+  return finish(classified)
 }

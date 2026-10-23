@@ -5,10 +5,13 @@ import {
   formatInsufficientDiskReply,
   formatPreparationFailedReply,
   formatPreparationRefusedReply,
+  formatPreservedNote,
   formatQuotaExceededReply,
   formatRecoveredNote,
   formatRecoveryBlockedReply,
+  formatRollbackFailedReply,
   MAINTENANCE_HOLD_REPLY,
+  pickRecoveryNote,
   RECOVER_SUFFIX,
   RECOVERY_ATTEMPTED_NOTE,
   TERMINATION_UNCONFIRMED_REPLY,
@@ -234,5 +237,53 @@ describe('automatic recovery replies', () => {
     )
     expect(reply.startsWith(note)).toBe(true)
     expect(reply.endsWith(RECOVER_SUFFIX)).toBe(true)
+  })
+})
+
+describe('the recovery note matches what was observed', () => {
+  it('the recovered note claims both the backup and the install', () => {
+    expect(formatRecoveredNote('gen-42')).toContain('preserved it as backup `gen-42` and installed a fresh one')
+  })
+
+  it('the preserved note names the backup, claims no install, and points at the status below', () => {
+    const note = formatPreservedNote('gen-42')
+    expect(note).toContain('`gen-42`')
+    expect(note).toContain('`/fro-bot checkout-backup list`')
+    expect(note).not.toMatch(/install/i)
+    expect(note).toContain('below')
+    expect(note).not.toContain('\n')
+  })
+
+  it('the neutral note claims neither a backup nor an install', () => {
+    expect(RECOVERY_ATTEMPTED_NOTE).toContain('may have been')
+    expect(RECOVERY_ATTEMPTED_NOTE).toContain('`/fro-bot checkout-backup list`')
+    expect(RECOVERY_ATTEMPTED_NOTE).not.toMatch(/install/i)
+    expect(RECOVERY_ATTEMPTED_NOTE).not.toMatch(/\bI (tried to )?preserved?\b/)
+    expect(RECOVERY_ATTEMPTED_NOTE).not.toContain('tried to')
+  })
+
+  it.each([
+    ['a known id and a ready checkout', 'gen-42', true, formatRecoveredNote('gen-42')],
+    ['a known id and a checkout that is not ready', 'gen-42', false, formatPreservedNote('gen-42')],
+    ['no id and a ready checkout', undefined, true, RECOVERY_ATTEMPTED_NOTE],
+    ['no id and a checkout that is not ready', undefined, false, RECOVERY_ATTEMPTED_NOTE],
+  ])('pickRecoveryNote with %s', (_label, backupId, checkoutReady, expected) => {
+    expect(pickRecoveryNote({backupId, checkoutReady})).toBe(expected)
+  })
+})
+
+describe('formatRollbackFailedReply', () => {
+  it('the automatic wording says the checkout was not changed, the cleanup retries on restart, and an admin clears a persistent one', () => {
+    const reply = formatRollbackFailedReply({flow: 'automatic'})
+    expect(reply).toBe(
+      "I couldn't clean up after an automatic recovery attempt; the checkout itself wasn't changed. The workspace retries the cleanup when it restarts; if this persists, an admin needs to clear it.",
+    )
+    expect(reply).not.toContain(RECOVER_SUFFIX)
+  })
+
+  it('the manual wording names the repo and says the same', () => {
+    expect(formatRollbackFailedReply({flow: 'manual', repoSlug: 'acme/widget'})).toBe(
+      "I couldn't clean up after the recovery for `acme/widget`; the checkout itself wasn't changed. The workspace retries the cleanup when it restarts; if this persists, an admin needs to clear it.",
+    )
   })
 })

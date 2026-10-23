@@ -9,6 +9,7 @@ import {GatewayIntentBits} from 'discord.js'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {loadGatewayConfig, readOptionalSecret, readSecret} from './config.js'
+import {totalRecoveryBudgetMs} from './execute/recovery-budget.js'
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -3487,9 +3488,10 @@ describe('loadGatewayConfig — GATEWAY_RUN_INACTIVITY_TIMEOUT_MS', () => {
 
     // #then — warning emitted, config still valid
     expect(config?.runInactivityTimeoutMs).toBe(60_000)
-    expect(warnSpy).toHaveBeenCalledOnce()
-    const warnArg = warnSpy.mock.calls[0]?.[0] as string
-    expect(warnArg).toContain('inactivity timer can never fire')
+    const inactivityWarns = warnSpy.mock.calls.filter(
+      call => typeof call[0] === 'string' && call[0].includes('inactivity timer can never fire'),
+    )
+    expect(inactivityWarns).toHaveLength(1)
 
     warnSpy.mockRestore()
   })
@@ -3505,7 +3507,10 @@ describe('loadGatewayConfig — GATEWAY_RUN_INACTIVITY_TIMEOUT_MS', () => {
     expect(() => loadGatewayConfig()).not.toThrow()
 
     // #then — warning emitted
-    expect(warnSpy).toHaveBeenCalledOnce()
+    const inactivityWarns = warnSpy.mock.calls.filter(
+      call => typeof call[0] === 'string' && call[0].includes('inactivity timer can never fire'),
+    )
+    expect(inactivityWarns).toHaveLength(1)
     warnSpy.mockRestore()
   })
 
@@ -3526,6 +3531,70 @@ describe('loadGatewayConfig — GATEWAY_RUN_INACTIVITY_TIMEOUT_MS', () => {
     expect(inactivityWarns).toHaveLength(0)
 
     warnSpy.mockRestore()
+  })
+})
+
+function recoveryFloorWarns(warnSpy: {mock: {calls: unknown[][]}}): string[] {
+  return warnSpy.mock.calls
+    .map(call => call[0])
+    .filter((arg): arg is string => typeof arg === 'string' && arg.includes('automatic checkout recovery'))
+}
+
+describe('loadGatewayConfig: GATEWAY_RUN_TIMEOUT_MS vs the automatic-recovery budget', () => {
+  const RECOVERY_FLOOR_MS = totalRecoveryBudgetMs()
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('warns once, at load, when the run timeout is one below the recovery budget, naming both values and the setting', () => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_RUN_TIMEOUT_MS = String(RECOVERY_FLOOR_MS - 1)
+    process.env.GATEWAY_RUN_INACTIVITY_TIMEOUT_MS = '1000'
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    // #when — must not throw: the config is valid, the feature is just unreachable
+    expect(() => loadGatewayConfig()).not.toThrow()
+
+    // #then
+    const warns = recoveryFloorWarns(warnSpy)
+    expect(warns).toHaveLength(1)
+    const entry = JSON.parse(warns[0] ?? '{}') as {level?: string; msg?: string}
+    expect(entry.level).toBe('warn')
+    expect(entry.msg).toContain('GATEWAY_RUN_TIMEOUT_MS')
+    expect(entry.msg).toContain(String(RECOVERY_FLOOR_MS - 1))
+    expect(entry.msg).toContain(String(RECOVERY_FLOOR_MS))
+    expect(entry.msg).toContain('can never run')
+  })
+
+  it.each([
+    ['exactly at the recovery budget', RECOVERY_FLOOR_MS],
+    ['above the recovery budget', RECOVERY_FLOOR_MS + 1],
+  ])('does not warn when the run timeout is %s', (_label, runTimeoutMs) => {
+    // #given
+    setRequiredEnv()
+    process.env.GATEWAY_RUN_TIMEOUT_MS = String(runTimeoutMs)
+    process.env.GATEWAY_RUN_INACTIVITY_TIMEOUT_MS = '1000'
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    // #when
+    loadGatewayConfig()
+
+    // #then
+    expect(recoveryFloorWarns(warnSpy)).toHaveLength(0)
+  })
+
+  it('does not warn for the default run timeout', () => {
+    // #given
+    setRequiredEnv()
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    // #when
+    loadGatewayConfig()
+
+    // #then
+    expect(recoveryFloorWarns(warnSpy)).toHaveLength(0)
   })
 })
 

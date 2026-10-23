@@ -13,10 +13,12 @@ import type {RepoQuiescence} from '../runtime-effect.js'
 
 import {canonicalWorkspaceDirectory} from '../workspace-api/client.js'
 import {attachOpencode} from './opencode-attach.js'
+import {REPO_QUIESCENCE_TIMEOUT_MS} from './recovery-budget.js'
+
+// Re-exported so the checker's own timeout stays discoverable here; the constant lives in recovery-budget.ts.
+export {REPO_QUIESCENCE_TIMEOUT_MS}
 
 const SOURCE = 'opencode-session-status'
-/** Ceiling on the OpenCode `session.status` request one quiescence check makes. Part of the automatic-recovery budget. */
-export const REPO_QUIESCENCE_TIMEOUT_MS = 4_000
 const MAX_LOGGED_SESSION_IDS = 32
 
 export interface RepoQuiescenceContext {

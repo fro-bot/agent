@@ -1,3 +1,5 @@
+import type {RunMentionDeps} from './run.js'
+
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 /* eslint-disable perfectionist/sort-imports -- ./test-helpers.js must import before any real module
    it mocks, to register vi.mock() side effects before those modules are evaluated */
@@ -26,7 +28,12 @@ import {abortRegistry} from './abort-registry.js'
 import {totalRecoveryBudgetMs} from './checkout-recovery.js'
 import type {ListBackupsFn, PreviewRecoveryFn, RecoverFn} from './checkout-recovery.js'
 import {parseRecoverEntryCustomId} from '../discord/recover-checkout-button.js'
-import {CLIENT_TIMEOUT_REPLY, RECOVER_SUFFIX, RECOVERY_ATTEMPTED_NOTE} from './preparation-reply.js'
+import {
+  CLIENT_TIMEOUT_REPLY,
+  formatRollbackFailedReply,
+  RECOVER_SUFFIX,
+  RECOVERY_ATTEMPTED_NOTE,
+} from './preparation-reply.js'
 /* eslint-enable perfectionist/sort-imports */
 
 // ---------------------------------------------------------------------------
@@ -570,6 +577,8 @@ function updateSequence(results: readonly unknown[]) {
 
 interface RecoveryRunOptions {
   readonly updates: readonly unknown[]
+  /** A caller-built `update` mock (e.g. one that counts calls); replaces `updates`. */
+  readonly update?: ReturnType<typeof vi.fn>
   readonly quiescence?: 'clear' | 'busy' | 'unknown'
   readonly preview?: ReturnType<typeof vi.fn>
   readonly recover?: ReturnType<typeof vi.fn>
@@ -581,14 +590,14 @@ interface RecoveryRunOptions {
 async function launchRecoveryRun(options: RecoveryRunOptions) {
   const {launchWork} = await import('./run.js')
   setupHappyPath()
-  const update = updateSequence(options.updates)
+  const update = options.update ?? updateSequence(options.updates)
   const checkRepoQuiescence = makeQuiescenceFn(options.quiescence ?? 'clear')
   const previewRecovery = options.preview ?? makePreviewRecoveryFn()
   const recover = options.recover ?? makeRecoverFn()
   const listBackups = options.listBackups ?? makeListBackupsFn()
   const request = {...makeInMemoryRequest(), surface: options.surface ?? ('discord' as const)}
   const deps = makeDeps({
-    update,
+    update: update as unknown as RunMentionDeps['update'],
     checkRepoQuiescence,
     previewRecovery: previewRecovery as unknown as PreviewRecoveryFn,
     recover: recover as unknown as RecoverFn,
@@ -916,7 +925,6 @@ const AMBIGUOUS_RECOVERS: readonly (readonly [string, unknown])[] = [
   ['an http error', {success: false, error: {kind: 'http-error', status: 500}}],
   ['a parse error', {success: false, error: {kind: 'parse-error'}}],
   ['no-checkout', {success: true, data: {kind: 'no-checkout'}}],
-  ['rollback-failed', {success: true, data: {kind: 'failed', reason: 'rollback-failed'}}],
   ['quarantine-failed', {success: true, data: {kind: 'failed', reason: 'quarantine-failed'}}],
   ['install-failed', {success: true, data: {kind: 'failed', reason: 'install-failed'}}],
   ['verification-failed', {success: true, data: {kind: 'failed', reason: 'verification-failed'}}],
@@ -1187,6 +1195,16 @@ function makeAttributedListing(captured: {runId?: string}, id = BACKUP_ID) {
   }))
 }
 
+/** The recovery note a reply leads with: its first paragraph (the refusal text that follows may say "install" itself). */
+function leadingNote(text: string): string {
+  return text.split('\n\n')[0] ?? ''
+}
+
+/** The provenance/recovery line a failure text ends with: its last paragraph. */
+function trailingNote(text: string): string {
+  return text.split('\n\n').at(-1) ?? ''
+}
+
 /** The failure text the status sink was asked to resolve a thrown error to. */
 function failureText(run: Awaited<ReturnType<typeof launchRecoveryRun>>): string {
   const resolveToFailure = run.request._statusSink.resolveToFailure as unknown as ReturnType<typeof vi.fn>
@@ -1232,6 +1250,8 @@ describe('checkout preparation: an ambiguous recovery whose backup the lookup fi
     const reply = refusalReply(run.request)
     expect(occurrences(reply.content, BACKUP_ID)).toBe(1)
     expect(reply.content).not.toContain(RECOVERY_ATTEMPTED_NOTE)
+    // the swap's install is unconfirmed (the follow-up update says needs-recovery), so no install claim
+    expect(leadingNote(reply.content)).not.toMatch(/install/i)
     expect(reply.components).toHaveLength(1)
   })
 
@@ -1447,5 +1467,296 @@ describe('checkout preparation: a recovered checkout that the follow-up update r
     const text = failureText(run)
     expect(text).not.toContain(DEFAULT_BACKUP_ID)
     expect(text).not.toContain(RECOVERY_ATTEMPTED_NOTE)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The lookup runs AFTER the follow-up update, and the note follows what that update observed.
+// ---------------------------------------------------------------------------
+
+const INSTALLED = 'and installed a fresh one'
+
+describe('checkout preparation: the backup lookup runs after the follow-up update', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('finds a backup that only exists once the swap has finished, because the lookup waits for the follow-up update', async () => {
+    // #given a swap that is still renaming while recover answers: the lock-free listing cannot see
+    // the backup until the follow-up update (which queues behind the workspace mutex) has returned
+    const state = {recovered: false, updateCalls: 0, runId: ''}
+    const recover = vi.fn().mockImplementation(async (_o: string, _r: string, opts: {runId: string}) => {
+      state.runId = opts.runId
+      state.recovered = true
+      return TIMEOUT_RECOVER
+    })
+    const update = updateSequence([DIRTY, readyResult()])
+    const countingUpdate = vi.fn().mockImplementation(async (...args: unknown[]) => {
+      state.updateCalls += 1
+      return (update as (...a: unknown[]) => Promise<unknown>)(...args)
+    })
+    const listBackups = vi.fn().mockImplementation(async () => {
+      const visible = state.recovered && state.updateCalls >= 2
+      return {
+        success: true as const,
+        data: {
+          kind: 'ok' as const,
+          totalBytes: 1,
+          backups: visible
+            ? [
+                {
+                  id: BACKUP_ID,
+                  metadataOk: true,
+                  createdAt: '2026-01-01T00:00:00.000Z',
+                  sizeBytes: 1,
+                  sizeComplete: true,
+                  originalHeadSha: undefined,
+                  originalBranch: undefined,
+                  runId: state.runId,
+                },
+              ]
+            : [],
+        },
+      }
+    })
+
+    // #when
+    const run = await launchRecoveryRun({updates: [], update: countingUpdate, recover, listBackups})
+
+    // #then the id is named, so the lookup ran after the second update; and it ran exactly once
+    expect(listBackups).toHaveBeenCalledOnce()
+    const answer = finalAnswer(run.request)
+    expect(occurrences(answer, BACKUP_ID)).toBe(1)
+    expect(answer).not.toContain(RECOVERY_ATTEMPTED_NOTE)
+  })
+
+  it('makes no lookup before the follow-up update is called', async () => {
+    // #given
+    const order: string[] = []
+    const update = updateSequence([DIRTY, readyResult()])
+    const orderedUpdate = vi.fn().mockImplementation(async (...args: unknown[]) => {
+      order.push('update')
+      return (update as (...a: unknown[]) => Promise<unknown>)(...args)
+    })
+    const listBackups = vi.fn().mockImplementation(async () => {
+      order.push('listBackups')
+      return {success: true as const, data: {kind: 'ok' as const, backups: [], totalBytes: 0}}
+    })
+
+    // #when
+    await launchRecoveryRun({
+      updates: [],
+      update: orderedUpdate,
+      recover: vi.fn().mockResolvedValue(TIMEOUT_RECOVER),
+      listBackups,
+    })
+
+    // #then
+    expect(order).toEqual(['update', 'update', 'listBackups'])
+  })
+})
+
+describe('checkout preparation: the recovery note matches the observed checkout', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  const FOUND = () => {
+    const {recover, captured} = makeRunIdCapturingRecover(TIMEOUT_RECOVER)
+    return {recover, listBackups: makeAttributedListing(captured)}
+  }
+
+  it('a known backup and a ready checkout claim the backup AND the install', async () => {
+    const run = await launchRecoveryRun({updates: [DIRTY, readyResult()], ...FOUND()})
+    const answer = finalAnswer(run.request)
+    expect(answer).toContain(`preserved it as backup \`${BACKUP_ID}\``)
+    expect(answer).toContain(INSTALLED)
+  })
+
+  it('a known backup and a fast-forwarded ready checkout claim the install too', async () => {
+    const run = await launchRecoveryRun({updates: [DIRTY, readyResult('fast-forward')], ...FOUND()})
+    expect(finalAnswer(run.request)).toContain(INSTALLED)
+  })
+
+  it.each([
+    ['needs-recovery', NEEDS_RECOVERY],
+    ['still dirty', DIRTY],
+    [
+      'a failed fetch',
+      {success: true, data: {kind: 'failed', reason: 'fetch-timeout', mutationStarted: false, permanent: false}},
+    ],
+  ])('a known backup and %s claim the backup but NOT an install', async (_label, followUp) => {
+    const run = await launchRecoveryRun({updates: [DIRTY, followUp], ...FOUND()})
+    const reply = refusalReply(run.request)
+    expect(reply.content).toContain(`preserved it as backup \`${BACKUP_ID}\``)
+    expect(leadingNote(reply.content)).not.toMatch(/install/i)
+    expect(reply.content).toContain('the state of the checkout is below')
+  })
+
+  it('a known backup and a follow-up timeout claim the backup but NOT an install', async () => {
+    const run = await launchRecoveryRun({updates: [DIRTY, {success: false, error: {kind: 'timeout'}}], ...FOUND()})
+    const reply = refusalReply(run.request)
+    expect(reply.content).toContain(BACKUP_ID)
+    expect(leadingNote(reply.content)).not.toMatch(/install/i)
+  })
+
+  it('a known backup and a thrown follow-up error claim the backup but NOT an install', async () => {
+    const run = await launchRecoveryRun({
+      updates: [DIRTY, {success: false, error: {kind: 'network-error'}}],
+      ...FOUND(),
+    })
+    const text = failureText(run)
+    expect(text).toContain(BACKUP_ID)
+    expect(trailingNote(text)).not.toMatch(/install/i)
+  })
+
+  it('a known backup and a substituted checkout claim the backup but NOT an install', async () => {
+    const run = await launchRecoveryRun({
+      updates: [DIRTY, {success: true, data: {kind: 'refused', reason: 'checkout-substituted'}}],
+      ...FOUND(),
+    })
+    const text = failureText(run)
+    expect(text).toContain(BACKUP_ID)
+    expect(trailingNote(text)).not.toMatch(/install/i)
+  })
+
+  it('a CONFIRMED recovery followed by a refusal also claims no install (the follow-up decides)', async () => {
+    const run = await launchRecoveryRun({updates: [DIRTY, NEEDS_RECOVERY]})
+    const reply = refusalReply(run.request)
+    expect(reply.content).toContain(DEFAULT_BACKUP_ID)
+    expect(leadingNote(reply.content)).not.toMatch(/install/i)
+  })
+
+  it('a CONFIRMED recovery followed by a ready checkout claims the install', async () => {
+    const run = await launchRecoveryRun({updates: [DIRTY, readyResult()]})
+    expect(finalAnswer(run.request)).toContain(INSTALLED)
+  })
+
+  it.each(UNANSWERED_LOOKUPS)(
+    'when the lookup %s, the neutral note claims neither a backup nor an install, ready or not',
+    async (_label, makeListing) => {
+      // ready
+      const ready = await launchRecoveryRun({
+        updates: [DIRTY, readyResult()],
+        recover: vi.fn().mockResolvedValue(TIMEOUT_RECOVER),
+        listBackups: makeListing(),
+      })
+      const answer = finalAnswer(ready.request)
+      expect(answer).toContain(RECOVERY_ATTEMPTED_NOTE)
+      expect(answer).not.toContain(INSTALLED)
+      expect(answer).not.toContain('preserved it as backup')
+    },
+  )
+})
+
+describe('checkout preparation: a follow-up update that rejects after a recovery', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('still fails the run with the recovery note, so the operator can find the backup', async () => {
+    // #given the second update rejects outright (not a Result)
+    const update = vi.fn().mockResolvedValueOnce(DIRTY).mockRejectedValueOnce(new Error('socket exploded'))
+
+    // #when
+    const run = await launchRecoveryRun({updates: [], update})
+
+    // #then the confirmed backup is still named, once, with no install claim
+    const text = failureText(run)
+    expect(occurrences(text, DEFAULT_BACKUP_ID)).toBe(1)
+    expect(trailingNote(text)).not.toMatch(/install/i)
+    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+  })
+})
+
+describe('checkout preparation: rollback-failed on the automatic path', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  const ROLLBACK = {success: true, data: {kind: 'failed', reason: 'rollback-failed'}}
+  const ROLLBACK_TEXT = formatRollbackFailedReply({flow: 'automatic'})
+
+  it.each([
+    ['needs-recovery', NEEDS_RECOVERY],
+    ['still dirty', DIRTY],
+    [
+      'a failed fetch',
+      {success: true, data: {kind: 'failed', reason: 'fetch-timeout', mutationStarted: false, permanent: false}},
+    ],
+    ['a follow-up timeout', {success: false, error: {kind: 'timeout'}}],
+  ])(
+    'followed by %s: replies with the cleanup text exactly once, no suffix, no button, no recovery note',
+    async (_label, followUp) => {
+      // #given
+      const run = await launchRecoveryRun({
+        updates: [DIRTY, followUp],
+        recover: vi.fn().mockResolvedValue(ROLLBACK),
+      })
+
+      // #then the follow-up update still ran first
+      expect(run.update).toHaveBeenCalledTimes(2)
+      const reply = refusalReply(run.request)
+      expect(occurrences(reply.content, ROLLBACK_TEXT)).toBe(1)
+      expect(reply.content).toBe(ROLLBACK_TEXT)
+      expect(reply.content).not.toContain(RECOVER_SUFFIX)
+      expect(reply.components).toBeUndefined()
+      expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    },
+  )
+
+  it("persists the follow-up update's own refusal record, not a fabricated one", async () => {
+    // #given / #when
+    await launchRecoveryRun({updates: [DIRTY, NEEDS_RECOVERY], recover: vi.fn().mockResolvedValue(ROLLBACK)})
+
+    // #then
+    const failedCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'FAILED')
+    const options = failedCall?.[7] as {detailsPatch?: {checkoutPreparation?: unknown}}
+    expect(options?.detailsPatch?.checkoutPreparation).toEqual({outcome: 'refused', reason: 'needs-recovery'})
+  })
+
+  it('an unexpectedly ready follow-up update continues the run normally with the neutral note', async () => {
+    // #given the cleanup somehow cleared
+    const run = await launchRecoveryRun({updates: [DIRTY, readyResult()], recover: vi.fn().mockResolvedValue(ROLLBACK)})
+
+    // #then
+    expect(transitionPhases()).toContain('EXECUTING')
+    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+    const answer = finalAnswer(run.request)
+    expect(occurrences(answer, RECOVERY_ATTEMPTED_NOTE)).toBe(1)
+    expect(answer).not.toContain(ROLLBACK_TEXT)
+  })
+
+  it('ignores a backup the lookup claims for a rollback-failed run (none can exist before the quarantine) and stays neutral', async () => {
+    // #given a lookup that, contrary to the workspace's guarantee, returns an entry for this run
+    const {recover, captured} = makeRunIdCapturingRecover(ROLLBACK)
+
+    // #when
+    const run = await launchRecoveryRun({
+      updates: [DIRTY, readyResult()],
+      recover,
+      listBackups: makeAttributedListing(captured),
+    })
+
+    // #then
+    const answer = finalAnswer(run.request)
+    expect(answer).toContain(RECOVERY_ATTEMPTED_NOTE)
+    expect(answer).not.toContain(BACKUP_ID)
+  })
+
+  it('a thrown follow-up error keeps the neutral note rather than the cleanup text', async () => {
+    const run = await launchRecoveryRun({
+      updates: [DIRTY, {success: false, error: {kind: 'network-error'}}],
+      recover: vi.fn().mockResolvedValue(ROLLBACK),
+    })
+    expect(occurrences(failureText(run), RECOVERY_ATTEMPTED_NOTE)).toBe(1)
+  })
+
+  it('a substituted checkout keeps its own failure, with the neutral note', async () => {
+    const run = await launchRecoveryRun({
+      updates: [DIRTY, {success: true, data: {kind: 'refused', reason: 'checkout-substituted'}}],
+      recover: vi.fn().mockResolvedValue(ROLLBACK),
+    })
+    expect(occurrences(failureText(run), RECOVERY_ATTEMPTED_NOTE)).toBe(1)
   })
 })
