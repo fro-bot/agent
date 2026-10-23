@@ -28,6 +28,7 @@ A naive `git pull` inside the checkout is wrong twice over. It discards or confl
 - R5. No credential-bearing git process ever reads configuration from, or runs with a working directory in, an agent-owned checkout.
 - R6. An interrupted mutation is never reported as "nothing changed". Restart reconciliation resolves or blocks every journal phase.
 - R7. `/fro-bot recover-checkout`, or the Recover button on a refusal reply, preserves the entire checkout and installs a fresh default-branch checkout, gated on a fresh guild-level `ManageChannels` check at invocation (slash command or button click) and again at confirmation, with a 60-second one-shot confirmation.
+  - Superseded in part by [`2026-10-22-001-fix-auto-recover-dirty-checkout-plan.md`](2026-10-22-001-fix-auto-recover-dirty-checkout-plan.md): for a `dirty` refusal, recovery also runs automatically, without the human gate, when the run holds the lock, has budget for it, and OpenCode reports the workspace quiet.
 - R8. Recovery works even when git cannot safely inspect the checkout.
 - R9. Retention is capped at 5 generations and 10 GiB per repository, with no automatic eviction. At the cap, recovery refuses before moving anything.
 - R10. `/fro-bot checkout-backup list` and a confirmed `delete` of one backup by ID. No export.

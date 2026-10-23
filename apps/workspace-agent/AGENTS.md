@@ -104,6 +104,10 @@ Read-only, stateless preview of what `/recover` would see. Request body mirrors 
 
 Confirms a previously previewed recovery: quarantines the existing checkout (if any) by `rename`, then installs a fresh default-branch checkout built entirely as root before handoff. Request body mirrors `/update` plus `fingerprint` from the preview; `/recover` recomputes the fingerprint under the repo mutex and refuses with `checkout-changed` if it differs from what the caller saw. Returns the bare `ExecuteRecoveryResult` union.
 
+- **`runId` (optional):** the gateway run that triggered the recovery. It must match `^[\w-]{1,128}$` (the format of the gateway's run ids); anything else gets a fixed 400 `invalid-run-id` and nothing moves. It is recorded in the backup's `metadata.json`, and `GET /backups` reports it. Metadata without it, from a manual recovery or an older backup, still parses and counts toward the quota.
+- **Client abort:** the request signal is honoured until the `quarantining` journal is written. It is checked at entry, after the quota and disk preflight, through the fetch (it also kills the in-flight git), after the staging build, and after the ownership handoff. An abort at any of those points rolls back like a confirmed pre-quarantine failure: staging is removed, a superseded update journal is restored, the original checkout is untouched, no backup exists, and the result is `failed` / `build-failed`. After that point the recovery runs to completion and ignores the abort.
+- **Instance dispose:** after the fresh checkout is installed and verified and the journal is removed, the workspace sends a best-effort `POST /instance/dispose?directory=<checkout path>` to the loopback OpenCode (`opencode-instance.ts`, 5 s timeout, no body). OpenCode caches one instance per directory, file index included, and would otherwise keep listing the old tree to the next session. The call is skipped when the supervisor does not report OpenCode ready, and a failure never changes the result.
+
 ### GET /backups/:owner/:repo, DELETE /backups/:owner/:repo/:id
 
 List or delete quarantine generations for a repository. `owner`/`repo` are path params, validated with the same sanitizers every other route uses; `:id` is validated as a simple path segment (no `..`, no path separator, not empty) before `deleteBackup` runs its own internal check — neither layer alone is trusted. No export and no bulk delete.
@@ -113,6 +117,7 @@ List or delete quarantine generations for a repository. `owner`/`repo` are path 
 One process logger (built in `main.ts`, writing to container stderr) is shared by startup reconciliation, the OpenCode supervisor, the 9200 proxy and, through `ServerDeps.logger`, the control routes. It is handed to `executeUpdate`, so `update.ts`'s own log lines emit instead of defaulting to a silent no-op.
 
 - **`workspace-agent: update refused`** / **`workspace-agent: update failed`** (warning, `server.ts`): one line per refused or failed `/update`, with `owner`, `repo`, the closed `reason` and `durationMs`; `dirty` adds `changedPathCount`, `failed` adds `mutationStarted` and `permanent`. `ready` and `no-checkout` are silent.
+- **`workspace-agent: OpenCode instance dispose failed after recovery`** (warning, `recover.ts`): one line when the best-effort dispose after a successful `/recover` times out, cannot connect, gets a non-2xx answer or throws. Fields: `owner`, `repo`, `reason` (`timeout`, `network-error`, `http-error` or `threw`) and `status` for `http-error`. The recovery result is `ok` regardless.
 - **`opencode-proxy: session abort forwarded`** (info, `opencode-proxy.ts`): a proxied `POST /session/:id/abort` is the workspace-side trace of an operator cancel. Fields: `sessionId`, the `status` the caller saw (including a 502/504 the proxy produced), `durationMs`. `session delete`, `instance dispose` and `global dispose` use the same shape. Logged after the bearer check, when the response closes.
 
 Never log names or contents that come from the agent-writable checkout (changed paths, config keys, submodule or branch names), request bodies, headers, the query string (it carries the workspace directory), or any token. Counts and closed reasons only.
@@ -128,7 +133,8 @@ src/
 ├── clone.test.ts       Clone handler unit tests (mocked execFile)
 ├── update.ts           /update: admission, remote observation, bare-repo fetch, pack-stream import, journaled fast-forward
 ├── recover.ts          /recover/preview and /recover: fingerprint preview, quarantine-and-replace mutation
-├── backups.ts          /backups list/delete; the quarantine-generation metadata schema
+├── backups.ts          /backups list/delete; the quarantine-generation metadata schema (including the optional run id)
+├── opencode-instance.ts Best-effort POST /instance/dispose to the loopback OpenCode, run after a successful /recover
 ├── checkout-profile.ts Config inventory, layout, and temp-index cleanliness admission checks shared by update/recover
 ├── git-safety.ts       Sealed, credential-free git invocation profiles for git against an EXISTING checkout
 ├── git-stream.ts       pack-objects | index-pack streaming primitive (runPackStream)

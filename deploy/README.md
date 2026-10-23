@@ -594,15 +594,19 @@ Before every gateway run (Discord mention or web launch), the workspace brings t
 
 ### What a refusal means
 
-A refusal (dirty tree, detached HEAD, non-default branch, diverged history, unsupported git config or layout, a path obstruction, an initialized submodule, or a checkout mid-operation) stops the run before it starts. **Nothing is discarded.** The reply names `/fro-bot recover-checkout` and, on Discord, carries a one-click Recover button. A fetch or authentication failure fails the run closed too, classified permanent only on positive evidence (App access revoked) — a transient failure invites a retry on the next mention.
+A refusal (dirty tree, detached HEAD, non-default branch, diverged history, unsupported git config or layout, a path obstruction, an initialized submodule, or a checkout mid-operation) stops the run before it starts. **Nothing is discarded.** The reply names `/fro-bot recover-checkout` and, on Discord, carries a one-click Recover button. A dirty tree is the exception: the run first recovers it automatically (see Automatic recovery below), and the refusal reply applies only when that recovery declines or cannot run. A fetch or authentication failure fails the run closed too, classified permanent only on positive evidence (App access revoked) — a transient failure invites a retry on the next mention.
 
 ### Recovery
 
 `/fro-bot recover-checkout`, or the Recover button on a refusal reply, previews the recovery, then — on confirmation within 60 seconds — preserves the entire checkout by same-volume rename into a quarantine backup and installs a fresh default-branch checkout. Both entry points require a fresh guild-level `ManageChannels` check, re-verified again at confirmation.
 
+### Automatic recovery
+
+When a run is refused because the checkout is dirty, the gateway still holds the repo lock, the run has enough budget left for a preview, a recovery and a second update, and OpenCode reports the repository quiet, the gateway runs one preserve-and-replace recovery without the confirmation prompt, then updates again. The run continues on the fresh checkout, and its answer names the backup that holds the previous one. If recovery declines because nothing could move, the dirty refusal above is sent. If the retention cap or free disk space is the cause, the reply says so and names `/fro-bot checkout-backup delete <id>`, with no Recover button. If something may have moved, the reply comes from the state the second update observes. Each incident preserves the whole checkout, so it counts against the retention cap below. A process detached from OpenCode is invisible to the quiet check, and a cancel during this preparation takes effect only after it ends, which can take up to about the sum of the three time limits (445 seconds by default). After a successful recovery the workspace asks OpenCode to drop its cached view of the directory, so the next session does not list files from the old checkout.
+
 ### Backups
 
-`/fro-bot checkout-backup list` shows every preserved generation for the channel's bound repo (id, date, size, source branch/SHA). `/fro-bot checkout-backup delete <id>` removes one generation after a confirmation prompt — there is no export and no bulk delete.
+`/fro-bot checkout-backup list` shows every preserved generation for the channel's bound repo (id, date, size, source branch/SHA, and the id of the run that triggered it when the recovery was automatic). `/fro-bot checkout-backup delete <id>` removes one generation after a confirmation prompt — there is no export and no bulk delete.
 
 ### Retention
 

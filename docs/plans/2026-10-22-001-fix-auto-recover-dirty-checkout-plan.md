@@ -156,7 +156,7 @@ flowchart TD
 
 ## Implementation Units
 
-- [ ] **Unit 1: Recovery API — run attribution, request abort, client budget form**
+- [x] **Unit 1: Recovery API — run attribution, request abort, client budget form**
 
 **Goal:** `/recover` accepts an optional `runId`, records it, lists it, and stops on a client abort before the quarantine rename. The gateway client's preview and recover use the fake-timer-controllable timeout form.
 
@@ -190,7 +190,7 @@ flowchart TD
 
 **Verification:** Old and new metadata both count. A pre-quarantine abort leaves the checkout exactly as it was.
 
-- [ ] **Unit 2: Auto-recovery on a dirty refusal**
+- [x] **Unit 2: Auto-recovery on a dirty refusal**
 
 **Goal:** The gateway preparation branch recovers a `dirty` checkout once, then continues or replies from the observed state.
 
@@ -240,7 +240,7 @@ flowchart TD
 
 **Verification:** The #1889 sequence completes in one launch. Every non-happy path replies from what was observed.
 
-- [ ] **Unit 3: Docs**
+- [x] **Unit 3: Docs**
 
 **Goal:** Describe auto-recovery and record the amendment to R7 of `2026-09-24-001`.
 
