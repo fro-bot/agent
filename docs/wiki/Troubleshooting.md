@@ -33,8 +33,8 @@ sources:
   - apps/workspace-agent/src/opencode-instance.ts
   - apps/workspace-agent/src/opencode-proxy.ts
   - docs/solutions/test-failures/gateway-operator-route-health-timeout-flake-2026-07-30.md
-summary: "Common failure symptoms and their causes across action execution, persistence, setup, and gateway runs"
   - src/harness/post.ts
+summary: "Common failure symptoms and their causes across action execution, persistence, setup, and gateway runs"
 ---
 
 # Troubleshooting

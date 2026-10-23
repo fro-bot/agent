@@ -29,10 +29,10 @@ sources:
   - RFCs/RFC-002-Cache-Infrastructure.md
   - RFCs/RFC-019-S3-Storage-Backend.md
   - ARCHITECTURE.md
-summary: "How agent memory survives across CI runs via cache, SDK sessions, S3 object store, and pruning"
   - src/harness/post.ts
   - src/services/cache/types.ts
   - src/harness/phases/cleanup.ts
+summary: "How agent memory survives across CI runs via cache, SDK sessions, S3 object store, and pruning"
 ---
 
 # Session Persistence

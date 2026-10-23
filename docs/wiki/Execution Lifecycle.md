@@ -56,8 +56,8 @@ sources:
   - RFCs/RFC-017-Post-Action-Cache-Hook.md
   - RFCs/RFC-019-S3-Storage-Backend.md
   - ARCHITECTURE.md
-summary: "Phase-by-phase walkthrough of a single action run, from bootstrap through drain, review reconciliation, brokered push, and the final invocation outcome"
   - src/services/cache/types.ts
+summary: "Phase-by-phase walkthrough of a single action run, from bootstrap through drain, review reconciliation, brokered push, and the final invocation outcome"
 ---
 
 # Execution Lifecycle
