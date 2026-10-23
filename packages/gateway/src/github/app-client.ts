@@ -218,6 +218,24 @@ export interface AppClientOptions {
 // ---------------------------------------------------------------------------
 
 /**
+ * Whether a failed request ended because the call's deadline expired. The signal being aborted is the
+ * direct evidence. A mint can also end with another caller's expiry: `@octokit/auth-app` shares one
+ * in-flight token request between concurrent callers with the same options, so a caller that joined
+ * another's request rejects with that request's abort (a `TimeoutError`/`AbortError`, possibly wrapped
+ * as a request error's `cause`) while its own signal has not fired yet.
+ */
+function isDeadlineExpiry(error: unknown, signal: AbortSignal | undefined): boolean {
+  if (signal === undefined) return false
+  if (signal.aborted) return true
+  let current: unknown = error
+  for (let depth = 0; depth < 3 && current instanceof Error; depth += 1) {
+    if (current.name === 'TimeoutError' || current.name === 'AbortError') return true
+    current = current.cause
+  }
+  return false
+}
+
+/**
  * Create a GitHub App client that authenticates against repositories using
  * installation tokens.
  *
@@ -263,7 +281,7 @@ export function createAppClient(options: AppClientOptions): AppClient {
           permissions: response.data.permissions ?? {},
         }
       } catch (discoveryError) {
-        if (requestSignal?.aborted === true) return err(new AuthTimeoutError())
+        if (isDeadlineExpiry(discoveryError, requestSignal)) return err(new AuthTimeoutError())
         if (isOctokitNotFound(discoveryError)) {
           return err(new AppNotInstalledError(owner, repo, installUrl))
         }
@@ -282,7 +300,7 @@ export function createAppClient(options: AppClientOptions): AppClient {
       })
       return ok(installationData)
     } catch (error) {
-      if (requestSignal?.aborted === true) return err(new AuthTimeoutError())
+      if (isDeadlineExpiry(error, requestSignal)) return err(new AuthTimeoutError())
       return err(new AuthError(safeErrorMessage(error)))
     }
   }
@@ -295,20 +313,29 @@ export function createAppClient(options: AppClientOptions): AppClient {
     requestSignal?: AbortSignal,
   ): Promise<Result<AppClientAuthResult, AuthError>> {
     try {
-      const installAuth = createAppAuth({appId, privateKey, installationId: installation.id})
-      const requestOptions = requestSignal === undefined ? {} : {request: {signal: requestSignal}}
+      // The deadline goes on the REQUEST IMPLEMENTATION handed to `createAppAuth`, not on the
+      // invocation: for the installation-token POST, `@octokit/auth-app` uses `state.request` and
+      // ignores a per-invocation `request` option, so a signal passed there never reaches the transport.
+      // `Octokit` is already a direct dependency; its `request` carries `.defaults`.
+      const installAuth = createAppAuth({
+        appId,
+        privateKey,
+        installationId: installation.id,
+        ...(requestSignal === undefined
+          ? {}
+          : {request: new Octokit().request.defaults({request: {signal: requestSignal}})}),
+      })
       const {token} = await installAuth({
         type: 'installation',
         repositoryNames: [repo],
         permissions,
-        ...requestOptions,
       })
       const octokit = new Octokit({auth: token})
       return ok({octokit, installationId: installation.id, token})
     } catch (mintError) {
       // A mint failure means the cached installation may no longer be usable.
       installationCache.delete(cacheKey(owner, repo))
-      if (requestSignal?.aborted === true) return err(new AuthTimeoutError())
+      if (isDeadlineExpiry(mintError, requestSignal)) return err(new AuthTimeoutError())
       return err(new AuthError(safeErrorMessage(mintError)))
     }
   }

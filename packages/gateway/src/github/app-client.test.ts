@@ -10,12 +10,15 @@ import {
   RepoNotFoundError,
 } from './app-client.js'
 
-const {mockAuth, mockCreateAppAuth, mockRequest, MockOctokit} = vi.hoisted(() => {
+const {mockAuth, mockCreateAppAuth, mockRequest, mockDefaults, MockOctokit} = vi.hoisted(() => {
   const mockAuth = vi.fn()
   const mockCreateAppAuth = vi.fn(() => mockAuth)
-  const mockRequest = vi.fn()
+  // `new Octokit().request.defaults({request: {signal}})` is how the mint hands its deadline to the
+  // request implementation given to createAppAuth; the stand-in it returns just carries that signal.
+  const mockDefaults = vi.fn()
+  const mockRequest = Object.assign(vi.fn(), {defaults: mockDefaults})
   const MockOctokit = vi.fn()
-  return {mockAuth, mockCreateAppAuth, mockRequest, MockOctokit}
+  return {mockAuth, mockCreateAppAuth, mockRequest, mockDefaults, MockOctokit}
 })
 
 vi.mock('@octokit/auth-app', () => ({
@@ -80,6 +83,14 @@ function makeAbortedTimeout(): {readonly signal: AbortSignal; readonly restore: 
   return {signal: controller.signal, restore: () => timeoutSpy.mockRestore()}
 }
 
+/** The signal each installation-token mint's request implementation was given, in call order. */
+function mintRequestSignals(): (AbortSignal | undefined)[] {
+  return (mockCreateAppAuth.mock.calls as unknown as [{installationId?: number; request?: {signal?: AbortSignal}}][])
+    .map(args => args[0])
+    .filter(options => options.installationId !== undefined)
+    .map(options => options.request?.signal)
+}
+
 function getInstallationCalls(): InstallationAuthCallArg[] {
   return mockAuth.mock.calls
     .filter(args => (args[0] as {type: string}).type === 'installation')
@@ -107,6 +118,9 @@ describe('createAppClient', () => {
     MockOctokit.mockImplementation(function () {
       return {request: mockRequest}
     })
+    mockDefaults.mockImplementation((options?: {request?: {signal?: AbortSignal}}) => ({
+      signal: options?.request?.signal,
+    }))
 
     // Default: JWT auth returns a token, installation auth returns a token
     mockAuth.mockImplementation(async ({type}: {type: string}) => {
@@ -363,7 +377,7 @@ describe('createAppClient', () => {
       mockRequest.mockResolvedValue({data: {id: 99, permissions: {contents: 'read', actions: 'write'}}})
       mockAuth.mockImplementation(async (options: InstallationAuthCallArg) => {
         if (options.type === 'app') return {token: 'jwt-token-value'}
-        receivedSignal = options.request?.signal
+        receivedSignal = mintRequestSignals().at(-1)
         throw timeout.signal.reason
       })
       const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY, installUrl: INSTALL_URL})
@@ -556,24 +570,22 @@ describe('createAppClient', () => {
     it('creates ONE deadline signal of that length and shares it between discovery and the token mint', async () => {
       // #given
       const {spy, controller} = makeDeadlineSpy()
-      const seen: (AbortSignal | undefined)[] = []
+      const discoverySignals: (AbortSignal | undefined)[] = []
       mockRequest.mockImplementation(async (_route: string, options: InstallationAuthCallArg) => {
-        seen.push(options.request?.signal)
+        discoverySignals.push(options.request?.signal)
         return INSTALLATION_RESPONSE
-      })
-      mockAuth.mockImplementation(async (options: InstallationAuthCallArg) => {
-        if (options.type === 'installation') seen.push(options.request?.signal)
-        return {token: options.type === 'app' ? 'jwt-token-value' : 'installation-token-value'}
       })
       const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
 
       // #when
       const result = await client.authForRepo('foo', 'bar')
 
-      // #then
+      // #then discovery gets it per request, the mint through its request implementation
       expect(result.success).toBe(true)
       expect(spy).toHaveBeenCalledExactlyOnceWith(INSTALLATION_TOKEN_MINT_TIMEOUT_MS)
-      expect(seen).toEqual([controller.signal, controller.signal])
+      expect(discoverySignals).toEqual([controller.signal])
+      expect(mintRequestSignals()).toEqual([controller.signal])
+      expect(mockDefaults).toHaveBeenCalledExactlyOnceWith({request: {signal: controller.signal}})
     })
 
     it('an abort during discovery comes back as an AuthTimeoutError Result, never a throw', async () => {
@@ -653,11 +665,6 @@ describe('createAppClient', () => {
     it('a warm cache hit still passes the deadline to the mint', async () => {
       // #given
       const {controller} = makeDeadlineSpy()
-      const seen: (AbortSignal | undefined)[] = []
-      mockAuth.mockImplementation(async (options: InstallationAuthCallArg) => {
-        if (options.type === 'installation') seen.push(options.request?.signal)
-        return {token: options.type === 'app' ? 'jwt-token-value' : 'installation-token-value'}
-      })
       const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
       await client.authForRepo('foo', 'bar')
 
@@ -665,7 +672,21 @@ describe('createAppClient', () => {
       await client.authForRepo('foo', 'bar')
 
       // #then
-      expect(seen).toEqual([controller.signal, controller.signal])
+      expect(mintRequestSignals()).toEqual([controller.signal, controller.signal])
+    })
+
+    it('never puts the signal on the installation invocation, which auth-app ignores for the token POST', async () => {
+      // #given
+      makeDeadlineSpy()
+      const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+
+      // #when
+      await client.authForRepo('foo', 'bar')
+
+      // #then
+      for (const call of getInstallationCalls()) {
+        expect(call).not.toHaveProperty('request')
+      }
     })
   })
 
@@ -701,6 +722,9 @@ describe('createAppClient.getRepoIdentity', () => {
     MockOctokit.mockImplementation(function () {
       return {request: mockRequest}
     })
+    mockDefaults.mockImplementation((options?: {request?: {signal?: AbortSignal}}) => ({
+      signal: options?.request?.signal,
+    }))
 
     mockAuth.mockImplementation(async ({type}: {type: string}) => {
       if (type === 'app') return {token: 'jwt-token-value'}
