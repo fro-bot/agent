@@ -11,7 +11,7 @@
 import type {AddressInfo} from 'node:net'
 import {Buffer} from 'node:buffer'
 import http from 'node:http'
-import {afterEach, beforeEach, describe, expect, it} from 'vitest'
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {createOpencodeProxy} from './opencode-proxy.js'
 
@@ -762,5 +762,340 @@ describe('opencode-proxy — inactivity timeout', () => {
 
     await close()
     await upstream.close()
+  })
+})
+
+// ── Teardown logging (#1889) ─────────────────────────────────────────────────
+
+interface LoggedCall {
+  readonly level: 'info' | 'warn' | 'error'
+  readonly msg: string
+  readonly meta: Record<string, unknown> | undefined
+}
+
+function makeCapturingLogger(): {
+  readonly logger: {
+    readonly info: (msg: string, meta?: Record<string, unknown>) => void
+    readonly warn: (msg: string, meta?: Record<string, unknown>) => void
+    readonly error: (msg: string, meta?: Record<string, unknown>) => void
+  }
+  readonly calls: LoggedCall[]
+} {
+  const calls: LoggedCall[] = []
+  return {
+    calls,
+    logger: {
+      info: (msg, meta) => calls.push({level: 'info', msg, meta}),
+      warn: (msg, meta) => calls.push({level: 'warn', msg, meta}),
+      error: (msg, meta) => calls.push({level: 'error', msg, meta}),
+    },
+  }
+}
+
+/** Make a raw http.request with any method and optional body. Always Connection: close. */
+async function httpSend(
+  method: string,
+  url: string,
+  reqHeaders: Record<string, string> = {},
+  body?: string,
+): Promise<StubResponse> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url)
+    const headers: Record<string, string> = {...reqHeaders, connection: 'close'}
+    if (body !== undefined) headers['content-length'] = String(Buffer.byteLength(body))
+    const req = http.request(
+      {hostname: parsed.hostname, port: parsed.port, path: parsed.pathname + parsed.search, method, headers},
+      res => {
+        const chunks: Buffer[] = []
+        res.on('data', (chunk: Buffer) => chunks.push(chunk))
+        res.on('end', () =>
+          resolve({
+            statusCode: res.statusCode ?? 0,
+            headers: res.headers,
+            body: Buffer.concat(chunks).toString('utf8'),
+          }),
+        )
+        res.on('error', reject)
+      },
+    )
+    req.on('error', reject)
+    if (body !== undefined) req.write(body)
+    req.end()
+  })
+}
+
+/** Negative assertions need the server-side `close` events to have had a chance to fire. */
+async function letLogsSettle(): Promise<void> {
+  await new Promise<void>(resolve => {
+    setTimeout(resolve, 50)
+  })
+}
+
+function teardownCalls(calls: readonly LoggedCall[]): readonly LoggedCall[] {
+  return calls.filter(call => call.msg.startsWith('opencode-proxy: session abort'))
+}
+
+/**
+ * An upstream that accepts a request and never answers it until `release()`. `requestSeen` resolves
+ * once a request has arrived, so a test can act while the proxy is mid-forward.
+ */
+async function startHangingUpstream(): Promise<{
+  readonly url: string
+  readonly requestSeen: Promise<void>
+  readonly release: () => void
+  readonly close: () => Promise<void>
+}> {
+  const held: http.ServerResponse[] = []
+  let markSeen: () => void = () => {}
+  const requestSeen = new Promise<void>(resolve => {
+    markSeen = resolve
+  })
+  const stub = http.createServer((_req, res) => {
+    held.push(res)
+    markSeen()
+  })
+  await new Promise<void>((resolve, reject) => {
+    stub.once('error', reject)
+    stub.listen(0, '127.0.0.1', resolve)
+  })
+  const addr = stub.address() as AddressInfo
+  const release = (): void => {
+    for (const res of held.splice(0)) {
+      res.writeHead(200, {'Content-Length': '0', Connection: 'close'})
+      res.end()
+    }
+  }
+  return {
+    url: `http://127.0.0.1:${addr.port}`,
+    requestSeen,
+    release,
+    close: async () => {
+      release()
+      await new Promise<void>(resolve => {
+        stub.close(() => resolve())
+        stub.closeAllConnections()
+      })
+    },
+  }
+}
+
+describe('opencode-proxy — session teardown logging', () => {
+  const AUTH = {Authorization: `Bearer ${TEST_TOKEN}`}
+  let upstream: Awaited<ReturnType<typeof startUpstreamStub>> | undefined
+  let closeProxy: (() => Promise<void>) | undefined
+
+  afterEach(async () => {
+    await closeProxy?.()
+    await upstream?.close()
+    closeProxy = undefined
+    upstream = undefined
+  })
+
+  async function startLoggedProxy(upstreamUrl: string): Promise<{url: string; calls: LoggedCall[]}> {
+    const {logger, calls} = makeCapturingLogger()
+    const proxy = createOpencodeProxy({token: TEST_TOKEN, upstreamUrl, logger})
+    await proxy.listen(0, '127.0.0.1')
+    const addr = proxy.server.address() as AddressInfo
+    closeProxy = async () => proxy.close()
+    return {url: `http://127.0.0.1:${addr.port}`, calls}
+  }
+
+  it('logs a proxied abort at info with the session id, upstream status and duration', async () => {
+    // #given
+    upstream = await startUpstreamStub({responseStatus: 200, responseBody: 'true'})
+    const {url, calls} = await startLoggedProxy(upstream.url)
+
+    // #when
+    const res = await httpSend('POST', `${url}/session/ses_abc123/abort?directory=/workspace/repos/acme/widget`, AUTH)
+
+    // #then
+    expect(res.statusCode).toBe(200)
+    await vi.waitFor(() => expect(teardownCalls(calls)).toHaveLength(1))
+    const [entry] = teardownCalls(calls)
+    expect(entry?.level).toBe('info')
+    expect(entry?.msg).toBe('opencode-proxy: session abort forwarded')
+    expect(entry?.meta).toEqual({
+      sessionId: 'ses_abc123',
+      status: 200,
+      durationMs: expect.any(Number) as number,
+    })
+    expect(entry?.meta?.durationMs as number).toBeGreaterThanOrEqual(0)
+  })
+
+  it('logs the upstream status when OpenCode rejects the abort', async () => {
+    // #given
+    upstream = await startUpstreamStub({responseStatus: 404, responseBody: 'not found'})
+    const {url, calls} = await startLoggedProxy(upstream.url)
+
+    // #when
+    await httpSend('POST', `${url}/session/ses_gone/abort`, AUTH)
+
+    // #then
+    await vi.waitFor(() => expect(teardownCalls(calls)).toHaveLength(1))
+    expect(teardownCalls(calls)[0]?.meta).toMatchObject({sessionId: 'ses_gone', status: 404})
+  })
+
+  it('logs the 502 the caller saw when the upstream is unreachable', async () => {
+    // #given — nothing listens upstream
+    const {url, calls} = await startLoggedProxy('http://127.0.0.1:1')
+
+    // #when
+    const res = await httpSend('POST', `${url}/session/ses_down/abort`, AUTH)
+
+    // #then
+    expect(res.statusCode).toBe(502)
+    await vi.waitFor(() => expect(teardownCalls(calls)).toHaveLength(1))
+    expect(teardownCalls(calls)[0]?.meta).toMatchObject({sessionId: 'ses_down', status: 502})
+  })
+
+  it('logs the 504 the proxy itself synthesizes when the upstream stops answering', async () => {
+    // #given an upstream that accepts the abort and never responds, and a short inactivity window
+    const hanging = await startHangingUpstream()
+    const {logger, calls} = makeCapturingLogger()
+    const proxy = createOpencodeProxy({token: TEST_TOKEN, upstreamUrl: hanging.url, logger, timeoutMs: 100})
+    await proxy.listen(0, '127.0.0.1')
+    const addr = proxy.server.address() as AddressInfo
+    closeProxy = async () => {
+      await proxy.close()
+      await hanging.close()
+    }
+
+    // #when
+    const res = await httpSend('POST', `http://127.0.0.1:${addr.port}/session/ses_stuck/abort`, AUTH)
+
+    // #then the caller got the proxy's own 504, and that is the status in the log, not the upstream's
+    expect(res.statusCode).toBe(504)
+    await vi.waitFor(() => expect(teardownCalls(calls)).toHaveLength(1))
+    expect(teardownCalls(calls)[0]?.meta).toEqual({
+      sessionId: 'ses_stuck',
+      status: 504,
+      durationMs: expect.any(Number) as number,
+    })
+    expect(teardownCalls(calls)[0]?.meta?.durationMs as number).toBeGreaterThanOrEqual(90)
+  })
+
+  it('logs once, with no status, when the caller disconnects before any header is sent', async () => {
+    // #given an upstream that is still holding the abort when the caller gives up
+    const hanging = await startHangingUpstream()
+    const {logger, calls} = makeCapturingLogger()
+    const proxy = createOpencodeProxy({token: TEST_TOKEN, upstreamUrl: hanging.url, logger})
+    await proxy.listen(0, '127.0.0.1')
+    const addr = proxy.server.address() as AddressInfo
+    closeProxy = async () => {
+      await proxy.close()
+      await hanging.close()
+    }
+    const clientReq = http.request({
+      hostname: '127.0.0.1',
+      port: addr.port,
+      path: '/session/ses_left/abort',
+      method: 'POST',
+      headers: {...AUTH, connection: 'close'},
+    })
+    clientReq.on('error', () => {})
+    clientReq.end()
+    await hanging.requestSeen
+
+    // #when the caller disconnects mid-forward, and the upstream then answers after the fact
+    clientReq.destroy()
+    await vi.waitFor(() => expect(teardownCalls(calls)).toHaveLength(1))
+    hanging.release()
+    await letLogsSettle()
+
+    // #then exactly one line: session id and duration, and no status field at all
+    expect(teardownCalls(calls)).toHaveLength(1)
+    const meta = teardownCalls(calls)[0]?.meta
+    expect(meta).toEqual({sessionId: 'ses_left', durationMs: expect.any(Number) as number})
+    expect(Object.keys(meta ?? {})).not.toContain('status')
+  })
+
+  it('never logs the bearer token, the Authorization header, the request body, or the query string', async () => {
+    // #given
+    upstream = await startUpstreamStub({responseStatus: 200, responseBody: 'true'})
+    const {url, calls} = await startLoggedProxy(upstream.url)
+
+    // #when
+    await httpSend(
+      'POST',
+      `${url}/session/ses_abc123/abort?directory=/workspace/repos/acme/widget`,
+      {...AUTH, 'content-type': 'application/json'},
+      '{"reason":"super-secret-body-content"}',
+    )
+
+    // #then
+    await vi.waitFor(() => expect(teardownCalls(calls)).toHaveLength(1))
+    const logged = JSON.stringify(calls)
+    expect(logged).not.toContain(TEST_TOKEN)
+    expect(logged.toLowerCase()).not.toContain('authorization')
+    expect(logged.toLowerCase()).not.toContain('bearer')
+    expect(logged).not.toContain('super-secret-body-content')
+    expect(logged).not.toContain('/workspace/repos')
+  })
+
+  it('does not log unauthorized aborts as forwarded teardown, and still keeps the token out of logs', async () => {
+    // #given
+    upstream = await startUpstreamStub({responseStatus: 200})
+    const {url, calls} = await startLoggedProxy(upstream.url)
+
+    // #when
+    const res = await httpSend('POST', `${url}/session/ses_abc123/abort`, {Authorization: 'Bearer wrong-token'})
+
+    // #then
+    expect(res.statusCode).toBe(401)
+    await letLogsSettle()
+    expect(teardownCalls(calls)).toHaveLength(0)
+    expect(JSON.stringify(calls)).not.toContain('wrong-token')
+  })
+
+  it('does not log ordinary session traffic or a GET on the abort path', async () => {
+    // #given
+    upstream = await startUpstreamStub({responseStatus: 200})
+    const {url, calls} = await startLoggedProxy(upstream.url)
+
+    // #when
+    await httpSend('GET', `${url}/session/ses_abc123/message`, AUTH)
+    await httpSend('GET', `${url}/session/ses_abc123/abort`, AUTH)
+    await httpSend('POST', `${url}/session/ses_abc123/prompt_async`, AUTH, '{}')
+    await httpSend('GET', `${url}/session/status`, AUTH)
+
+    // #then
+    await letLogsSettle()
+    expect(calls.filter(call => call.level === 'info' && call.msg.includes('forwarded'))).toHaveLength(0)
+  })
+
+  it('logs other teardown calls the same way: session delete and instance/global dispose', async () => {
+    // #given
+    upstream = await startUpstreamStub({responseStatus: 200, responseBody: 'true'})
+    const {url, calls} = await startLoggedProxy(upstream.url)
+
+    // #when
+    await httpSend('DELETE', `${url}/session/ses_del1`, AUTH)
+    await httpSend('POST', `${url}/instance/dispose?directory=/workspace/repos/acme/widget`, AUTH)
+    await httpSend('POST', `${url}/global/dispose`, AUTH)
+
+    // #then
+    const forwarded = (): readonly LoggedCall[] => calls.filter(call => call.msg.endsWith('forwarded'))
+    await vi.waitFor(() => expect(forwarded()).toHaveLength(3))
+    const byMessage = Object.fromEntries(forwarded().map(call => [call.msg, call]))
+    expect(byMessage['opencode-proxy: session delete forwarded']?.meta).toMatchObject({
+      sessionId: 'ses_del1',
+      status: 200,
+    })
+    expect(byMessage['opencode-proxy: instance dispose forwarded']?.meta).toMatchObject({status: 200})
+    expect(byMessage['opencode-proxy: global dispose forwarded']?.meta).toMatchObject({status: 200})
+    expect(JSON.stringify(calls)).not.toContain('/workspace/repos')
+  })
+
+  it('ignores a session id segment that is not a plain identifier', async () => {
+    // #given
+    upstream = await startUpstreamStub({responseStatus: 200})
+    const {url, calls} = await startLoggedProxy(upstream.url)
+
+    // #when
+    await httpSend('POST', `${url}/session/ses%0d%0aforged/abort`, AUTH)
+
+    // #then
+    await letLogsSettle()
+    expect(calls.filter(call => call.msg.endsWith('forwarded'))).toHaveLength(0)
   })
 })

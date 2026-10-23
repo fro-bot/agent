@@ -925,6 +925,37 @@ describe('startWorkspaceAgent — recovery-journal reconciliation (slice 5c)', (
   })
 })
 
+describe('startWorkspaceAgent — control-API logger wiring (#1889)', () => {
+  it('passes the process logger into createApp so /update log lines are not swallowed', async () => {
+    // #given
+    const callLog: string[] = []
+    const captured: {value?: ServerDeps} = {}
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    try {
+      // #when
+      await startWorkspaceAgent({
+        env: {WORKSPACE_OPENCODE_TOKEN: 'tok'},
+        serveFn: makeFakeServeFn(callLog),
+        runSupervisedOpencodeFn: makeFakeSupervisorFn(callLog, {}),
+        createOpencodeProxyFn: makeFakeProxyFactory(callLog),
+        readSecretFn: (_name: string) => 'fake-token',
+        reconcileUpdateJournalsFn: async () => {},
+        reconcileRecoveryJournalsFn: async () => {},
+        createAppFn: makeCapturingCreateAppFn(captured),
+      })
+
+      // #then the logger is present and writes through to the container's stderr stream
+      expect(captured.value?.logger).toBeDefined()
+      warnSpy.mockClear()
+      captured.value?.logger?.warn('workspace-agent: probe', {owner: 'fro-bot'})
+      expect(warnSpy).toHaveBeenCalledWith('workspace-agent: probe', {owner: 'fro-bot'})
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+})
+
 describe('startWorkspaceAgent — updateNetworkConfig wiring (A1)', () => {
   it('passes proxy config derived from HTTPS_PROXY/NO_PROXY into createApp', async () => {
     // #given

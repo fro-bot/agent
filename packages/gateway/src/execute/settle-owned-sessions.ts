@@ -86,6 +86,12 @@ export interface SettleOwnedSessionsParams {
   /** The run's ownership ledger. Mutated in place (`markUnknown`/`settle` via reconciliation). */
   readonly ledger: OwnershipLedger
   readonly logger: GatewayLogger
+  /**
+   * The gateway run this settle attempt belongs to. Stamped on every log line this barrier emits,
+   * including the ledger-reconciliation lines it triggers, so an abort or a quarantine can be joined
+   * to its run. Omitted for callers that have no run; the field is then absent, not `undefined`.
+   */
+  readonly runId?: string
   /** Overrides `DEFAULT_SETTLE_TIMEOUT_MS` — for tests only. */
   readonly timeoutMs?: number
   /**
@@ -99,6 +105,20 @@ export interface SettleOwnedSessionsParams {
 }
 
 export type SettleOwnedSessionsResult = {readonly settled: true} | {readonly settled: false; readonly reason: string}
+
+/**
+ * A logger that merges `{runId}` into every context. Returns `logger` itself when there is no run id,
+ * so a caller without one sees exactly the log shape it always did.
+ */
+function withRunId(logger: GatewayLogger, runId: string | undefined): GatewayLogger {
+  if (runId === undefined) return logger
+  return {
+    debug: (context, message) => logger.debug({runId, ...context}, message),
+    info: (context, message) => logger.info({runId, ...context}, message),
+    warn: (context, message) => logger.warn({runId, ...context}, message),
+    error: (context, message) => logger.error({runId, ...context}, message),
+  }
+}
 
 /**
  * Cancel a single session. Best-effort: checks BOTH the SDK error envelope
@@ -164,11 +184,11 @@ export async function settleOwnedSessions(params: SettleOwnedSessionsParams): Pr
     directory,
     rootSessionId,
     ledger,
-    logger,
     timeoutMs = DEFAULT_SETTLE_TIMEOUT_MS,
     confirmRootQuiescent = false,
     rootPollIntervalMs = ROOT_QUIESCENCE_POLL_INTERVAL_MS,
   } = params
+  const logger = withRunId(params.logger, params.runId)
 
   if (ledger.isDrainComplete() === true && confirmRootQuiescent === false) {
     return {settled: true}

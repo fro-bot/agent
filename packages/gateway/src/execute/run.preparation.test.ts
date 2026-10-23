@@ -165,6 +165,115 @@ describe('checkout preparation: client timeout', () => {
   })
 })
 
+/** Every call on every level of the injected logger, serialized for leak assertions. */
+function allLogCalls(logger: ReturnType<typeof makeDeps>['logger']): string {
+  const levels = [logger.debug, logger.info, logger.warn, logger.error] as unknown as ReturnType<typeof vi.fn>[]
+  return JSON.stringify(levels.flatMap(level => level.mock.calls))
+}
+
+describe('checkout preparation: refusal diagnostics (#1889)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('a dirty refusal logs one warning with the run id, repo, reason and path count, and no path names', async () => {
+    // #given a dirty refusal whose paths could leak repo contents
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+    const changedPaths = ['secrets/prod.env', 'FILE_SUMMARIES.md', 'src/internal/customer-export.csv']
+    const update = vi.fn().mockResolvedValue({success: true, data: {kind: 'refused', reason: 'dirty', changedPaths}})
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({update})
+
+    // #when
+    const admission = await awaitLaunchWorkRun(launchWork, request, deps)
+
+    // #then exactly one refusal warning, with the correlation fields
+    expect(admission.accepted).toBe(true)
+    const runId = admission.accepted === true ? admission.runId : undefined
+    const refusalCalls = (deps.logger.warn as ReturnType<typeof vi.fn>).mock.calls.filter(
+      (call: unknown[]) => call[1] === 'run: checkout preparation refused',
+    )
+    expect(refusalCalls).toHaveLength(1)
+    expect(refusalCalls[0]?.[0]).toEqual({
+      repo: `${OWNER}/${REPO}`,
+      runId,
+      reason: 'dirty',
+      changedPathCount: 3,
+    })
+
+    // #then no path name reaches any log call, in any field or level
+    const logged = allLogCalls(deps.logger)
+    for (const path of changedPaths) {
+      expect(logged).not.toContain(path)
+    }
+    expect(logged).not.toContain('changedPaths')
+  })
+
+  it('a refusal with no path detail logs the reason without a path count', async () => {
+    // #given
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+    const update = vi.fn().mockResolvedValue({success: true, data: {kind: 'refused', reason: 'ahead'}})
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({update})
+
+    // #when
+    const admission = await awaitLaunchWorkRun(launchWork, request, deps)
+
+    // #then
+    const runId = admission.accepted === true ? admission.runId : undefined
+    expect(deps.logger.warn).toHaveBeenCalledWith(
+      {repo: `${OWNER}/${REPO}`, runId, reason: 'ahead'},
+      'run: checkout preparation refused',
+    )
+  })
+
+  it('a failed preparation logs the reason, whether mutation started and whether it is permanent', async () => {
+    // #given
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+    const update = vi.fn().mockResolvedValue({
+      success: true,
+      data: {kind: 'failed', reason: 'termination-unconfirmed', mutationStarted: 'possibly', permanent: false},
+    })
+    const request = makeInMemoryRequest()
+    const deps = makeDeps({update})
+
+    // #when
+    const admission = await awaitLaunchWorkRun(launchWork, request, deps)
+
+    // #then
+    const runId = admission.accepted === true ? admission.runId : undefined
+    expect(deps.logger.warn).toHaveBeenCalledWith(
+      {
+        repo: `${OWNER}/${REPO}`,
+        runId,
+        reason: 'termination-unconfirmed',
+        mutationStarted: 'possibly',
+        permanent: false,
+      },
+      'run: checkout preparation failed',
+    )
+  })
+
+  it('a ready preparation logs no refusal or failure', async () => {
+    // #given
+    const {launchWork} = await import('./run.js')
+    setupHappyPath()
+    const request = makeInMemoryRequest()
+    const deps = makeDeps()
+
+    // #when
+    await awaitLaunchWorkRun(launchWork, request, deps)
+
+    // #then
+    const messages = (deps.logger.warn as ReturnType<typeof vi.fn>).mock.calls.map((call: unknown[]) => call[1])
+    expect(messages).not.toContain('run: checkout preparation refused')
+    expect(messages).not.toContain('run: checkout preparation failed')
+  })
+})
+
 describe('checkout preparation: the Recover button (Discord only)', () => {
   beforeEach(() => {
     vi.clearAllMocks()

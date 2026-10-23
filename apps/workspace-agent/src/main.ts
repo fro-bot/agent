@@ -298,6 +298,7 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
     proxyListening: proxyListeningRef,
     auth: {kind: 'bearer', token},
     updateNetworkConfig,
+    logger: opencodeLogger,
   })
 
   // Bind :9100 and WAIT for the first of three outcomes before doing anything else that could

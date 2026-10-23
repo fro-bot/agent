@@ -14,6 +14,8 @@ import type {EnsureCloneFailure} from '../workspace-api/ensure-clone.js'
 import type {
   CloneErrorCode,
   ReadyzResponse,
+  UpdateFailed,
+  UpdateRefused,
   UpdateResult,
   UpdateWorkspaceError,
   WorkspaceError,
@@ -1137,6 +1139,29 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         })
     }
 
+    // One warning per refused/failed preparation, so "why was this run refused?" is answerable from
+    // gateway logs alone. Reasons and counts only — never a path, config key, submodule or branch
+    // name: those come from an agent-writable checkout (see `capDetailArray` in provenance.ts) and
+    // the full, capped detail already lives in the persisted `checkoutPreparation` record.
+    function logPreparationOutcome(result: UpdateRefused | UpdateFailed): void {
+      if (result.kind === 'failed') {
+        logger.warn(
+          {repo, runId, reason: result.reason, mutationStarted: result.mutationStarted, permanent: result.permanent},
+          'run: checkout preparation failed',
+        )
+        return
+      }
+      logger.warn(
+        {
+          repo,
+          runId,
+          reason: result.reason,
+          ...(result.reason === 'dirty' ? {changedPathCount: result.changedPaths.length} : {}),
+        },
+        'run: checkout preparation refused',
+      )
+    }
+
     try {
       // ── Checkout preparation: bring the checkout up to date via /update (Unit 7) ─────────────
       // Replaces the old unconditional ensureClone → inspect sequence. Runs here — after the repo
@@ -1236,6 +1261,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       if (preparationResult.kind === 'refused' || preparationResult.kind === 'failed') {
         // Every other refusal/failure terminalizes to FAILED with a CheckoutPreparation record and
         // the matching reply — never an OpenCode session, never a prompt.
+        logPreparationOutcome(preparationResult)
         const replyText =
           preparationResult.kind === 'refused'
             ? formatPreparationRefusedReply(preparationResult)
@@ -1536,6 +1562,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           sink: replySink,
           signal: effectiveSignal,
           logger,
+          runId,
           coordinator,
           questions: questionCoordinator,
           onHumanWaitTerminal: deps.requestGate?.onTerminal,
