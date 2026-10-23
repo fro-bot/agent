@@ -10,7 +10,7 @@ import type {
 import {err, ok} from '@fro-bot/runtime'
 import {describe, expect, it, vi} from 'vitest'
 
-import {createWorkspaceClient} from './client.js'
+import {createWorkspaceClient, totalRecoveryCeilingMs} from './client.js'
 
 // ---------------------------------------------------------------------------
 // readyz tests
@@ -2139,5 +2139,27 @@ describe('WorkspaceClient.deleteBackup', () => {
       expect(await client.deleteBackup('testowner', 'testrepo', 'gen-1')).toEqual(err({kind: 'parse-error'}))
       vi.unstubAllGlobals()
     })
+  })
+})
+
+describe('totalRecoveryCeilingMs', () => {
+  it('sums the preview, recover and update ceilings the client actually applies by default', () => {
+    // #given the documented defaults: preview 45s, recover 300s, update 100s
+    // #when / #then
+    expect(totalRecoveryCeilingMs()).toBe(45_000 + 300_000 + 100_000)
+  })
+
+  it('uses the configured ceilings, not the defaults, when the client was built with overrides', () => {
+    // #given
+    const options = {previewRecoveryTimeoutMs: 1_000, recoverTimeoutMs: 20_000, updateTimeoutMs: 3_000}
+
+    // #when / #then
+    expect(totalRecoveryCeilingMs(options)).toBe(24_000)
+  })
+
+  it('falls back to the default for each ceiling that is not configured', () => {
+    // #given only recover is overridden
+    // #when / #then
+    expect(totalRecoveryCeilingMs({recoverTimeoutMs: 10_000})).toBe(45_000 + 10_000 + 100_000)
   })
 })

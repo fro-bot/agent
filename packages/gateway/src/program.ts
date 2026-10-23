@@ -1,4 +1,4 @@
-import type {CoordinationConfig, ObjectStoreAdapter} from '@fro-bot/runtime'
+import type {CoordinationConfig, ObjectStoreAdapter, Result} from '@fro-bot/runtime'
 import type {Client, GatewayIntentBits, Message} from 'discord.js'
 import type {Context} from 'hono'
 import type {RepoBinding} from './bindings/types.js'
@@ -19,6 +19,7 @@ import type {PushHealthStatus} from './web/operator-push/push-health.js'
 import type {OperatorPushSubscriptionStore} from './web/operator-push/subscription-store.js'
 import type {VapidPublicKeyInfo} from './web/operator-push/vapid.js'
 import type {OperatorServerConfig, OperatorServerDeps} from './web/server.js'
+import type {WorkspaceClientOptions} from './workspace-api/client.js'
 import {Buffer} from 'node:buffer'
 import {
   createS3Adapter,
@@ -27,6 +28,7 @@ import {
   DEFAULT_PENDING_STALE_THRESHOLD_MS,
   DEFAULT_STALE_THRESHOLD_MS,
   err,
+  ok,
   redactSensitiveFields,
 } from '@fro-bot/runtime'
 import {Effect} from 'effect'
@@ -76,7 +78,7 @@ import {createOperatorPushSubscriptionStore} from './web/operator-push/subscript
 import {shouldNotify} from './web/operator-push/trigger-policy.js'
 import {createWebQuestionOnRegistered} from './web/operator/web-question.js'
 import {createRunObservationManager} from './web/sse/manager.js'
-import {createWorkspaceClient} from './workspace-api/client.js'
+import {createWorkspaceClient, totalRecoveryCeilingMs} from './workspace-api/client.js'
 import {ensureWorkspaceClone} from './workspace-api/ensure-clone.js'
 
 /** One hourly tick scavenges the session map and sweeps stored records: retention is the TTL plus this interval. */
@@ -488,10 +490,32 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       logger: addProjectLogger,
     })
     const dispatchWorkflow = createWorkflowDispatcher({appClient, logger})
-    const workspaceClient = createWorkspaceClient({
+    const workspaceClientOptions: WorkspaceClientOptions = {
       baseUrl: config.workspaceAgentUrl,
       token: config.workspaceOpencodeToken,
-    })
+    }
+    const workspaceClient = createWorkspaceClient(workspaceClientOptions)
+
+    // Installation token for a workspace control call that needs one (`update`, `recover`). A permanent
+    // installation failure maps to 401 (no retry); any other token-mint failure is retryable.
+    const mintWorkspaceToken = async (
+      owner: string,
+      repo: string,
+    ): Promise<
+      Result<string, {readonly kind: 'http-error'; readonly status: 401} | {readonly kind: 'network-error'}>
+    > => {
+      const authResult = await appClient.authForRepo(owner, repo)
+      if (authResult.success === false) {
+        if (
+          authResult.error instanceof AppNotInstalledError ||
+          authResult.error instanceof InsufficientPermissionsError
+        ) {
+          return err({kind: 'http-error' as const, status: 401 as const})
+        }
+        return err({kind: 'network-error' as const})
+      }
+      return ok(authResult.data.token)
+    }
 
     // One workspace quiescence checker shared by acquisition, maintenance, recovery and operator release.
     const checkRepoQuiescence = createRepoQuiescenceChecker({
@@ -817,18 +841,23 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       // Prepare the checkout via /update under the repo lock (see run.ts). A permanent
       // installation failure maps to 401 (no retry); any other token-mint failure is retryable.
       update: async (owner: string, repo: string, options: {readonly remainingBudgetMs: number}) => {
-        const authResult = await appClient.authForRepo(owner, repo)
-        if (authResult.success === false) {
-          if (
-            authResult.error instanceof AppNotInstalledError ||
-            authResult.error instanceof InsufficientPermissionsError
-          ) {
-            return err({kind: 'http-error' as const, status: 401})
-          }
-          return err({kind: 'network-error' as const})
-        }
-        return workspaceClient.update({owner, repo, token: authResult.data.token}, options)
+        const token = await mintWorkspaceToken(owner, repo)
+        if (token.success === false) return token
+        return workspaceClient.update({owner, repo, token: token.data}, options)
       },
+      // Automatic recovery of a dirty checkout (see execute/checkout-recovery.ts): same token minting
+      // and error mapping as `update`, run under the same repo lock.
+      previewRecovery: async (owner: string, repo: string) => {
+        const token = await mintWorkspaceToken(owner, repo)
+        if (token.success === false) return token
+        return workspaceClient.previewRecovery({owner, repo})
+      },
+      recover: async (owner: string, repo: string, options: {readonly fingerprint: string; readonly runId: string}) => {
+        const token = await mintWorkspaceToken(owner, repo)
+        if (token.success === false) return token
+        return workspaceClient.recover({owner, repo, token: token.data, ...options})
+      },
+      recoveryBudgetMs: totalRecoveryCeilingMs(workspaceClientOptions),
       // Shutdown gate: suppress handoff to next queued task once SIGTERM fires.
       // The in-memory queue is lossy by design; dropping pending tasks on graceful
       // shutdown matches that contract and is consistent with the messageCreate

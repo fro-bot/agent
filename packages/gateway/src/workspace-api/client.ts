@@ -221,6 +221,22 @@ const DEFAULT_LIST_BACKUPS_TIMEOUT_MS = 60_000 // 60 seconds
 /** Ceiling for DELETE /backups/:id — a single recursive directory removal; generously above inspect's 25s. */
 const DEFAULT_DELETE_BACKUP_TIMEOUT_MS = 30_000 // 30 seconds
 
+/**
+ * Worst-case wall-clock cost of one automatic dirty-checkout recovery: preview, then recover, then the
+ * follow-up `update`, each at its configured ceiling (the options the client was built with, else the
+ * defaults above). A caller with less run budget than this must not start a recovery it cannot finish.
+ */
+export function totalRecoveryCeilingMs(
+  options: Pick<WorkspaceClientOptions, 'updateTimeoutMs' | 'previewRecoveryTimeoutMs' | 'recoverTimeoutMs'> = {},
+): number {
+  const {
+    updateTimeoutMs = DEFAULT_UPDATE_TIMEOUT_MS,
+    previewRecoveryTimeoutMs = DEFAULT_PREVIEW_RECOVERY_TIMEOUT_MS,
+    recoverTimeoutMs = DEFAULT_RECOVER_TIMEOUT_MS,
+  } = options
+  return previewRecoveryTimeoutMs + recoverTimeoutMs + updateTimeoutMs
+}
+
 // Mirrors WORKSPACE_REPOS_ROOT in apps/workspace-agent/src/clone.ts (separate
 // package/container boundary, so not imported). Module-private: callers use
 // workspaceRepoPath() rather than composing the root themselves.

@@ -13,6 +13,7 @@ import * as coordinatorModule from '../approvals/coordinator.js'
 import * as discordApprovalsModule from '../discord/approvals.js'
 import * as statusMessageModule from '../discord/status-message.js'
 import * as streamingModule from '../discord/streaming.js'
+import {totalRecoveryCeilingMs} from '../workspace-api/client.js'
 import * as attachModule from './opencode-attach.js'
 import * as promptModule from './prompt.js'
 import * as runCoreModule from './run-core.js'
@@ -510,11 +511,83 @@ export function makeUpdateFn(
   return vi.fn().mockResolvedValue({success: false as const, error: {kind: 'timeout' as const}})
 }
 
+/**
+ * Mock for `RunMentionDeps.checkRepoQuiescence`. The default is `unknown` (fail-closed), so a test that
+ * does not opt in to automatic dirty-checkout recovery keeps today's refusal behaviour.
+ */
+export function makeQuiescenceFn(kind: 'clear' | 'busy' | 'unknown' = 'unknown') {
+  if (kind === 'clear') {
+    return vi.fn().mockResolvedValue({
+      kind: 'clear' as const,
+      source: 'opencode-session-status' as const,
+      directory: '/workspace/repos/acme/widget',
+      checkedAt: '2026-01-01T00:00:00.000Z',
+    })
+  }
+  if (kind === 'busy') {
+    return vi.fn().mockResolvedValue({
+      kind: 'busy' as const,
+      source: 'opencode-session-status' as const,
+      directory: '/workspace/repos/acme/widget',
+      checkedAt: '2026-01-01T00:00:00.000Z',
+      sessionIds: ['ses_1'],
+    })
+  }
+  return vi.fn().mockResolvedValue({
+    kind: 'unknown' as const,
+    source: 'unavailable' as const,
+    directory: null,
+    reason: 'test-default',
+  })
+}
+
+/** A complete, safe preview with a fixed fingerprint — the default `RunMentionDeps.previewRecovery` result. */
+export const DEFAULT_PREVIEW_FINGERPRINT = 'fp-preview-1'
+
+export function makeRecoveryPreviewData(overrides: {readonly sizeMeasurementComplete?: boolean} = {}) {
+  return {
+    kind: 'ok' as const,
+    preview: {
+      inspectionSafe: true as const,
+      headSha: 'a'.repeat(40),
+      branch: 'main',
+      dirty: {staged: 0, unstaged: 0, untracked: 1, conflicted: 0},
+      operationInProgress: 'none' as const,
+      ignoredCount: 0,
+      estimatedSizeBytes: 1024,
+      entryCount: 4,
+      sizeMeasurementComplete: overrides.sizeMeasurementComplete ?? true,
+      retention: {
+        generationCount: 0,
+        hasUnknownSize: false,
+        totalBytes: 0,
+        maxGenerations: 5,
+        maxBytes: 10_737_418_240,
+      },
+      fingerprint: DEFAULT_PREVIEW_FINGERPRINT,
+    },
+  }
+}
+
+export function makePreviewRecoveryFn() {
+  return vi.fn().mockResolvedValue({success: true as const, data: makeRecoveryPreviewData()})
+}
+
+export const DEFAULT_BACKUP_ID = 'backup-gen-1'
+
+/** `RunMentionDeps.recover` mock; defaults to a successful recovery that preserved `DEFAULT_BACKUP_ID`. */
+export function makeRecoverFn() {
+  return vi.fn().mockResolvedValue({
+    success: true as const,
+    data: {kind: 'ok' as const, recoveryId: DEFAULT_BACKUP_ID, sha: 'b'.repeat(40), branch: 'main'},
+  })
+}
+
 export function makeDeps(overrides: Partial<RunMentionDeps> = {}): RunMentionDeps {
   return {
     coordinationConfig: {} as CoordinationConfig,
     identity: 'discord-gateway',
-    checkRepoQuiescence: overrides.checkRepoQuiescence ?? vi.fn(),
+    checkRepoQuiescence: overrides.checkRepoQuiescence ?? makeQuiescenceFn('unknown'),
     concurrency: overrides.concurrency ?? makeDefaultConcurrency(),
     queue: overrides.queue ?? makeDefaultQueue(),
     attachUrl: 'http://workspace:9200',
@@ -530,6 +603,9 @@ export function makeDeps(overrides: Partial<RunMentionDeps> = {}): RunMentionDep
     ensureClone: overrides.ensureClone ?? makeEnsureCloneFn('success'),
     readyz: overrides.readyz ?? makeReadyzFn('ready'),
     update: overrides.update ?? makeUpdateFn('ready'),
+    previewRecovery: overrides.previewRecovery ?? makePreviewRecoveryFn(),
+    recover: overrides.recover ?? makeRecoverFn(),
+    recoveryBudgetMs: overrides.recoveryBudgetMs ?? totalRecoveryCeilingMs(),
     ...overrides,
   }
 }

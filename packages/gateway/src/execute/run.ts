@@ -20,6 +20,7 @@ import type {
   UpdateWorkspaceError,
   WorkspaceError,
 } from '../workspace-api/types.js'
+import type {PreviewRecoveryFn, RecoverFn} from './checkout-recovery.js'
 import type {ConcurrencyRegistry} from './concurrency.js'
 import type {LaunchAdmission, LaunchWorkRequest, PostReplyFactory, ReplySink, StatusSink} from './launch-types.js'
 import type {CheckoutPreparation, CheckoutProvenance} from './provenance.js'
@@ -61,13 +62,18 @@ import {
 import {toOperatorFailureKind} from '../operator-contract/run-status.js'
 import {canonicalWorkspaceTarget} from '../workspace-api/client.js'
 import {abortRegistry} from './abort-registry.js'
+import {tryAutoRecoverDirtyCheckout} from './checkout-recovery.js'
 import {releaseLockOrByOwnership} from './lock-release.js'
 import {attachOpencode} from './opencode-attach.js'
 import {
   CLIENT_TIMEOUT_REPLY,
   formatPreparationFailedReply,
   formatPreparationRefusedReply,
+  formatRecoveredNote,
+  formatRecoveryBlockedReply,
   RECOVER_SUFFIX,
+  RECOVERY_ATTEMPTED_NOTE,
+  withRecoveredNote,
 } from './preparation-reply.js'
 import {buildDiscordPrompt, EmptyPromptError} from './prompt.js'
 import {
@@ -223,6 +229,24 @@ export interface RunMentionDeps {
     repo: string,
     options: {readonly remainingBudgetMs: number},
   ) => Promise<Result<UpdateResult, UpdateWorkspaceError>>
+  /**
+   * Read-only preview of a preserve-and-replace recovery of the shared checkout. Mints the
+   * installation token itself, like `update`. Used only by automatic recovery of a `dirty` checkout
+   * (`checkout-recovery.ts`), under the repo lock, after `checkRepoQuiescence` returns `clear`.
+   */
+  readonly previewRecovery: PreviewRecoveryFn
+  /**
+   * Preserve-and-replace the shared checkout (the previous one becomes a backup). Mints the token
+   * itself and sends `runId`, which the workspace records in the backup's metadata. Same single
+   * caller as `previewRecovery`.
+   */
+  readonly recover: RecoverFn
+  /**
+   * Run budget, in milliseconds, an automatic recovery needs left before it may start: the preview,
+   * recover and follow-up `update` ceilings of the configured workspace client
+   * (`totalRecoveryCeilingMs`). With less than this left the run keeps today's refusal.
+   */
+  readonly recoveryBudgetMs: number
   /**
    * Workspace readiness check. Called after ensure-clone, before execution.
    * Injected so tests can stub it without a live workspace.
@@ -775,7 +799,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     persona,
     logger,
   } = deps
-  const {approvalRegistry, approvalMode, ensureClone, readyz, update} = deps
+  const {approvalRegistry, approvalMode, ensureClone, readyz, update, previewRecovery, recover, recoveryBudgetMs} = deps
 
   // ── All mutable state that the outer finally needs is declared here so the
   // finally block can always reference channelId regardless of where execution
@@ -1223,11 +1247,68 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         })
       }
 
+      // ── Automatic recovery of a dirty checkout (#1889) ───────────────────────────────────────
+      // A run can leave uncommitted files in the shared checkout, and every later launch would be
+      // refused as `dirty` until an operator intervened. Under the lock this run already holds, and
+      // only when OpenCode is quiet, preserve-and-replace the checkout ONCE, then re-observe with
+      // `update`. Every outcome that is not a decline ends in that second `update`, and the reply
+      // comes from what it reports - never from the stale dirty refusal, which would claim "Nothing
+      // was discarded" about a checkout whose state we no longer know. A decline (nothing moved)
+      // keeps today's refusal, except quota/disk, which name their cause. See checkout-recovery.ts.
+      //
+      // Preparation is not wired to the operator cancel signal (registered only after EXECUTING), so
+      // this window - up to the preview + recover + update ceilings - cannot be cancelled. Deferred.
+      let recoveredBackupId: string | undefined
+      let recoveryAttempted = false
+      if (
+        updateResult.success === true &&
+        updateResult.data.kind === 'refused' &&
+        updateResult.data.reason === 'dirty'
+      ) {
+        const dirtyRefusal = updateResult.data
+        const recoveryOutcome = await tryAutoRecoverDirtyCheckout(
+          {checkRepoQuiescence: deps.checkRepoQuiescence, previewRecovery, recover, logger},
+          {
+            owner: workspaceTarget.owner,
+            repo: workspaceTarget.repo,
+            repoSlug: repo,
+            runId,
+            remainingBudgetMs: remainingUpdateBudgetMs(),
+            requiredBudgetMs: recoveryBudgetMs,
+          },
+        )
+        if (recoveryOutcome.kind === 'declined' && recoveryOutcome.reason === 'quota-exceeded') {
+          logPreparationOutcome(dirtyRefusal)
+          return await terminatePreparationEarly(
+            formatRecoveryBlockedReply({reason: 'quota-exceeded', usage: recoveryOutcome.usage}, repo),
+            toCheckoutPreparation(dirtyRefusal),
+          )
+        }
+        if (recoveryOutcome.kind === 'declined' && recoveryOutcome.reason === 'insufficient-disk-space') {
+          logPreparationOutcome(dirtyRefusal)
+          return await terminatePreparationEarly(
+            formatRecoveryBlockedReply({reason: 'insufficient-disk-space'}, repo),
+            toCheckoutPreparation(dirtyRefusal),
+          )
+        }
+        if (recoveryOutcome.kind !== 'declined') {
+          recoveryAttempted = true
+          recoveredBackupId = recoveryOutcome.kind === 'recovered' ? recoveryOutcome.backupId : undefined
+          updateResult = await update(workspaceTarget.owner, workspaceTarget.repo, {
+            remainingBudgetMs: remainingUpdateBudgetMs(),
+          })
+          // Any failure from here on that is not a refusal reply (a thrown RunCoreError) still names the backup.
+          if (recoveredBackupId !== undefined) provenanceLine = formatRecoveredNote(recoveredBackupId)
+        }
+      }
+      const withBackupNote = (replyText: string): string =>
+        recoveredBackupId === undefined ? replyText : withRecoveredNote(replyText, recoveredBackupId)
+
       if (updateResult.success === false) {
         // A client-side timeout means neither side knows what happened — distinct "state unknown"
         // reply, no `checkoutPreparation` (there is no workspace response to build one from).
         if (updateResult.error.kind === 'timeout') {
-          return await terminatePreparationEarly(CLIENT_TIMEOUT_REPLY, undefined)
+          return await terminatePreparationEarly(withBackupNote(CLIENT_TIMEOUT_REPLY), undefined)
         }
         // Every other transport error reuses the existing clone-error classification conventions:
         // a rejected control-API bearer (401) is operator-side (`workspace-unavailable`);
@@ -1266,7 +1347,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           preparationResult.kind === 'refused'
             ? formatPreparationRefusedReply(preparationResult)
             : formatPreparationFailedReply(preparationResult)
-        return await terminatePreparationEarly(replyText, toCheckoutPreparation(preparationResult))
+        return await terminatePreparationEarly(withBackupNote(replyText), toCheckoutPreparation(preparationResult))
       }
 
       // preparationResult.kind === 'ready' — synthesize the observation from UpdateReady rather
@@ -1286,6 +1367,13 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         remote: toRemoteFreshnessFromUpdateReady(preparationResult),
       }
       provenanceLine = formatProvenanceLine(repo, provenance)
+      // A run that continues on a recovered checkout says so in the same deterministic line, so the
+      // note reaches every final reply exactly once through the provenance delivery helpers above.
+      if (recoveredBackupId !== undefined) {
+        provenanceLine = `${provenanceLine}\n${formatRecoveredNote(recoveredBackupId)}`
+      } else if (recoveryAttempted) {
+        provenanceLine = `${provenanceLine}\n${RECOVERY_ATTEMPTED_NOTE}`
+      }
 
       // Persist the STARTING provenance atomically with the EXECUTING phase write —
       // reusing the existing detailsPatch mechanism rather than a separate write. This

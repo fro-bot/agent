@@ -2,11 +2,17 @@ import type {UpdateFailed, UpdateRefused} from '../workspace-api/types.js'
 import {describe, expect, it} from 'vitest'
 import {
   CLIENT_TIMEOUT_REPLY,
+  formatInsufficientDiskReply,
   formatPreparationFailedReply,
   formatPreparationRefusedReply,
+  formatQuotaExceededReply,
+  formatRecoveredNote,
+  formatRecoveryBlockedReply,
   MAINTENANCE_HOLD_REPLY,
   RECOVER_SUFFIX,
+  RECOVERY_ATTEMPTED_NOTE,
   TERMINATION_UNCONFIRMED_REPLY,
+  withRecoveredNote,
 } from './preparation-reply.js'
 
 type NonSubstitutedRefused = Exclude<UpdateRefused, {readonly reason: 'checkout-substituted'}>
@@ -168,5 +174,60 @@ describe('CLIENT_TIMEOUT_REPLY', () => {
     expect(CLIENT_TIMEOUT_REPLY).toBe(
       "The update didn't finish within its time budget, and I can't tell whether the checkout changed. The next run will check its state before doing anything.",
     )
+  })
+})
+
+describe('automatic recovery replies', () => {
+  const usage = {maxGenerations: 5, maxBytes: 10 * 1024 * 1024 * 1024}
+
+  it("quota text is the manual recover-checkout flow's exact wording", () => {
+    expect(formatQuotaExceededReply('acme/widget', usage)).toBe(
+      'Recovery is at its retention limit (5 generations or 10.0 GiB) for `acme/widget`. Delete an old backup with `/fro-bot checkout-backup delete <id>` first.',
+    )
+  })
+
+  it("disk text is the manual recover-checkout flow's exact wording", () => {
+    expect(formatInsufficientDiskReply('acme/widget')).toBe(
+      "There isn't enough free disk space to recover `acme/widget` right now.",
+    )
+  })
+
+  it.each([
+    ['quota-exceeded', formatQuotaExceededReply('acme/widget', usage)],
+    ['insufficient-disk-space', formatInsufficientDiskReply('acme/widget')],
+  ] as const)(
+    'a blocked %s reply leads with the dirty clause, names the cause, and has no recover suffix',
+    (cause, causeText) => {
+      const reply =
+        cause === 'quota-exceeded'
+          ? formatRecoveryBlockedReply({reason: 'quota-exceeded', usage}, 'acme/widget')
+          : formatRecoveryBlockedReply({reason: 'insufficient-disk-space'}, 'acme/widget')
+      expect(reply).toBe(
+        `The checkout has uncommitted or untracked changes, so I can't update it safely.\n\n${causeText}`,
+      )
+      expect(reply).not.toContain(RECOVER_SUFFIX)
+      expect(reply).not.toContain('Nothing was discarded')
+    },
+  )
+
+  it('the recovered note names the backup id and how to list it, in one line', () => {
+    const note = formatRecoveredNote('gen-42')
+    expect(note).toContain('`gen-42`')
+    expect(note).toContain('`/fro-bot checkout-backup list`')
+    expect(note).not.toContain('\n')
+  })
+
+  it('the attempted-but-unconfirmed note names no backup id and is one line', () => {
+    expect(RECOVERY_ATTEMPTED_NOTE).toContain('`/fro-bot checkout-backup list`')
+    expect(RECOVERY_ATTEMPTED_NOTE).not.toContain('\n')
+  })
+
+  it('withRecoveredNote puts the note first, so a trailing recover suffix (and its button) survives', () => {
+    const reply = withRecoveredNote(
+      formatPreparationRefusedReply({kind: 'refused', reason: 'dirty', changedPaths: []}),
+      'gen-42',
+    )
+    expect(reply.startsWith(formatRecoveredNote('gen-42'))).toBe(true)
+    expect(reply.endsWith(RECOVER_SUFFIX)).toBe(true)
   })
 })

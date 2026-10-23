@@ -7,8 +7,9 @@
  * `RunCoreError('checkout-substituted', ...)` path, which has its own reply text.
  */
 
-import type {UpdateFailed, UpdateRefused} from '../workspace-api/types.js'
+import type {RetentionUsage, UpdateFailed, UpdateRefused} from '../workspace-api/types.js'
 
+import {formatBinaryBytes} from '../discord/commands/format-binary-bytes.js'
 import {formatBranchForReply} from './provenance.js'
 
 /** Appended to every refusal/apply-interrupted reply except `maintenance-hold`. */
@@ -30,11 +31,14 @@ export const MAINTENANCE_HOLD_REPLY =
 /** The checkout has local commits beyond the default branch's tip with no divergence - nothing for a fast-forward to move to. */
 const AHEAD_REPLY = "The checkout is ahead of the repository's default branch, so there's nothing to fast-forward."
 
+/** The clause a `dirty` refusal opens with; shared by the refusal table below and the automatic-recovery replies. */
+const DIRTY_REPLY = "The checkout has uncommitted or untracked changes, so I can't update it safely."
+
 const REFUSAL_REPLY_TEXT: Record<
   Exclude<UpdateRefused['reason'], 'checkout-substituted' | 'maintenance-hold'>,
   string
 > = {
-  dirty: "The checkout has uncommitted or untracked changes, so I can't update it safely.",
+  dirty: DIRTY_REPLY,
   detached: "The checkout isn't on a branch, so I can't update it safely.",
   'non-default-branch': '', // built per-instance below - needs the branch name
   diverged: "The checkout has local commits the remote doesn't have, so a fast-forward isn't possible.",
@@ -103,4 +107,57 @@ export function formatPreparationFailedReply(result: UpdateFailed): string {
     case 'termination-unconfirmed':
       return TERMINATION_UNCONFIRMED_REPLY
   }
+}
+
+// ---------------------------------------------------------------------------
+// Automatic recovery of a dirty checkout (checkout-recovery.ts). The quota/disk wording is shared
+// with the manual `/fro-bot recover-checkout` flow, so the two can never drift apart.
+// ---------------------------------------------------------------------------
+
+/** Recovery would exceed the retention cap; names the cleanup command. */
+export function formatQuotaExceededReply(
+  repoSlug: string,
+  usage: Pick<RetentionUsage, 'maxGenerations' | 'maxBytes'>,
+): string {
+  return `Recovery is at its retention limit (${usage.maxGenerations} generations or ${formatBinaryBytes(usage.maxBytes)}) for \`${repoSlug}\`. Delete an old backup with \`/fro-bot checkout-backup delete <id>\` first.`
+}
+
+/** There is not enough free disk to build the replacement checkout. */
+export function formatInsufficientDiskReply(repoSlug: string): string {
+  return `There isn't enough free disk space to recover \`${repoSlug}\` right now.`
+}
+
+/**
+ * The reply for a dirty refusal whose automatic recovery was refused for a cause the operator can
+ * fix: the dirty clause, then the cause and its cleanup. Deliberately NO `RECOVER_SUFFIX` - a manual
+ * recovery would be refused for the same reason - so no Recover button is attached either.
+ */
+export function formatRecoveryBlockedReply(
+  blocked:
+    | {readonly reason: 'quota-exceeded'; readonly usage: Pick<RetentionUsage, 'maxGenerations' | 'maxBytes'>}
+    | {readonly reason: 'insufficient-disk-space'},
+  repoSlug: string,
+): string {
+  const cause =
+    blocked.reason === 'quota-exceeded'
+      ? formatQuotaExceededReply(repoSlug, blocked.usage)
+      : formatInsufficientDiskReply(repoSlug)
+  return `${DIRTY_REPLY}\n\n${cause}`
+}
+
+/** One line for the final answer (or a refusal) of a run whose checkout was automatically recovered. */
+export function formatRecoveredNote(backupId: string): string {
+  return `The previous checkout had uncommitted changes, so I preserved it as backup \`${backupId}\` and installed a fresh one (list backups with \`/fro-bot checkout-backup list\`).`
+}
+
+/** Used when a recovery was attempted but its outcome is only known from the follow-up `update`, so no backup id is known. */
+export const RECOVERY_ATTEMPTED_NOTE =
+  'The previous checkout had uncommitted changes, so I tried to preserve it and install a fresh one; the checkout is now clean (see `/fro-bot checkout-backup list` for the preserved copy).'
+
+/**
+ * Prefixes a refusal/failure reply with the recovered note. The note goes FIRST so a reply that ends
+ * with `RECOVER_SUFFIX` still does, and `terminatePreparationEarly` still attaches the Recover button.
+ */
+export function withRecoveredNote(replyText: string, backupId: string): string {
+  return `${formatRecoveredNote(backupId)}\n\n${replyText}`
 }
