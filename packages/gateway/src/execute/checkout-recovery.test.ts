@@ -10,13 +10,14 @@ import {err, ok} from '@fro-bot/runtime'
 import {describe, expect, it, vi} from 'vitest'
 import {totalRecoveryCeilingMs} from '../workspace-api/client.js'
 import {settleAmbiguousRecovery, totalRecoveryBudgetMs, tryAutoRecoverDirtyCheckout} from './checkout-recovery.js'
-import {RECOVERY_TOKEN_MINT_TIMEOUT_MS, REPO_QUIESCENCE_TIMEOUT_MS} from './recovery-budget.js'
+import {REPO_QUIESCENCE_TIMEOUT_MS} from './recovery-budget.js'
 import {
   DEFAULT_BACKUP_ID,
   DEFAULT_PREVIEW_FINGERPRINT,
   makeQuiescenceFn,
   makeRecoveryPreviewData,
 } from './test-helpers.js'
+import {INSTALLATION_TOKEN_MINT_TIMEOUT_MS} from './workspace-token.js'
 
 const REQUEST: AutoRecoverRequest = {
   owner: 'acme',
@@ -162,7 +163,7 @@ describe('totalRecoveryBudgetMs', () => {
 
   it('derives the quiescence and mint terms from their exported constants, not literals', () => {
     expect(totalRecoveryBudgetMs()).toBe(
-      REPO_QUIESCENCE_TIMEOUT_MS + RECOVERY_TOKEN_MINT_TIMEOUT_MS + totalRecoveryCeilingMs(),
+      REPO_QUIESCENCE_TIMEOUT_MS + INSTALLATION_TOKEN_MINT_TIMEOUT_MS + totalRecoveryCeilingMs(),
     )
   })
 
@@ -177,7 +178,7 @@ describe('totalRecoveryBudgetMs', () => {
 
     // #when / #then
     expect(totalRecoveryBudgetMs(options)).toBe(
-      REPO_QUIESCENCE_TIMEOUT_MS + RECOVERY_TOKEN_MINT_TIMEOUT_MS + 10_000 + 5_000,
+      REPO_QUIESCENCE_TIMEOUT_MS + INSTALLATION_TOKEN_MINT_TIMEOUT_MS + 10_000 + 5_000,
     )
   })
 })

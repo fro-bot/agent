@@ -27,6 +27,7 @@ import {
 import {abortRegistry} from './abort-registry.js'
 import {totalRecoveryBudgetMs} from './checkout-recovery.js'
 import {createRecoveryWorkspaceCalls} from './recovery-workspace.js'
+import {createUpdateWorkspaceCall} from './update-workspace.js'
 import type {ListBackupsFn, PreviewRecoveryFn, RecoverFn} from './checkout-recovery.js'
 import {parseRecoverEntryCustomId} from '../discord/recover-checkout-button.js'
 import {
@@ -1828,5 +1829,74 @@ describe('checkout preparation: a stalled installation-token mint during recover
     const failedCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'FAILED')
     const options = failedCall?.[7] as {detailsPatch?: {checkoutPreparation?: unknown}}
     expect(options?.detailsPatch?.checkoutPreparation).toMatchObject({outcome: 'refused', reason: 'dirty'})
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The first update's token mint is bounded: a stalled GitHub call must not hold the lock indefinitely.
+// ---------------------------------------------------------------------------
+
+describe('checkout preparation: a stalled installation-token mint before the first update', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  const MINT_CEILING_MS = 40
+
+  function stalledMintUpdate() {
+    const workspaceUpdate = vi.fn().mockResolvedValue({success: true, data: {kind: 'no-checkout'}})
+    const update = createUpdateWorkspaceCall({
+      workspaceClient: {update: workspaceUpdate},
+      mintToken: vi.fn().mockReturnValue(new Promise(() => {})),
+      mintTimeoutMs: MINT_CEILING_MS,
+    })
+    return {update: vi.fn().mockImplementation(update), workspaceUpdate}
+  }
+
+  it('ends in the same outcome as any other retryable mint failure, within the bound, without sending /update', async () => {
+    // #given a stalled mint, and the run a plain retryable mint failure produces as the baseline
+    const {update, workspaceUpdate} = stalledMintUpdate()
+    const baseline = await launchRecoveryRun({
+      updates: [{success: false, error: {kind: 'network-error'}}],
+    })
+    const expected = failureText(baseline)
+    vi.clearAllMocks()
+    const started = Date.now()
+
+    // #when
+    const run = await launchRecoveryRun({updates: [], update})
+
+    // #then
+    expect(Date.now() - started).toBeLessThan(5_000)
+    expect(workspaceUpdate).not.toHaveBeenCalled()
+    expect(failureText(run)).toBe(expected)
+    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+  })
+
+  it('is not the state-unknown "update timed out" reply: no update request was ever sent', async () => {
+    // #given
+    const {update} = stalledMintUpdate()
+
+    // #when
+    const run = await launchRecoveryRun({updates: [], update})
+
+    // #then
+    expect(failureText(run)).not.toContain(CLIENT_TIMEOUT_REPLY)
+    expect(run.request._replySink._sends.map((send: {content: string}) => send.content).join('\n')).not.toContain(
+      CLIENT_TIMEOUT_REPLY,
+    )
+  })
+
+  it('releases the repo lock and fails the run, as for any other mint failure', async () => {
+    // #given
+    const {update} = stalledMintUpdate()
+
+    // #when
+    await launchRecoveryRun({updates: [], update})
+
+    // #then
+    expect(mockRuntime.releaseLock).toHaveBeenCalledOnce()
+    expect(transitionPhases()).toContain('FAILED')
+    expect(transitionPhases()).not.toContain('EXECUTING')
   })
 })

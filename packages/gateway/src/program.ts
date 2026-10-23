@@ -1,4 +1,4 @@
-import type {CoordinationConfig, ObjectStoreAdapter, Result} from '@fro-bot/runtime'
+import type {CoordinationConfig, ObjectStoreAdapter} from '@fro-bot/runtime'
 import type {Client, GatewayIntentBits, Message} from 'discord.js'
 import type {Context} from 'hono'
 import type {RepoBinding} from './bindings/types.js'
@@ -6,6 +6,7 @@ import type {GatewayConfig} from './config.js'
 import type {GatewayLogger} from './discord/client.js'
 import type {SinkThread} from './discord/streaming.js'
 import type {RunTask} from './execute/run.js'
+import type {MintWorkspaceToken} from './execute/workspace-token.js'
 import type {DispatchWorkflow} from './github/dispatch.js'
 import type {AnnounceServerConfig, AnnounceServerDeps} from './http/server.js'
 import type {CoordinationLogger} from './runtime-effect.js'
@@ -57,6 +58,7 @@ import {recoverStaleRuns} from './execute/recovery.js'
 import {createRepoQuiescenceChecker} from './execute/repo-quiescence.js'
 import {createRunIndex} from './execute/run-index.js'
 import {getInFlightRuns} from './execute/run.js'
+import {createUpdateWorkspaceCall} from './execute/update-workspace.js'
 import {AppNotInstalledError, createAppClient, InsufficientPermissionsError} from './github/app-client.js'
 import {createWorkflowDispatcher} from './github/dispatch.js'
 import {createRateLimiter} from './http/rate-limit.js'
@@ -499,13 +501,9 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
     const workspaceClient = createWorkspaceClient(workspaceClientOptions)
 
     // Installation token for a workspace control call that needs one (`update`, `recover`). A permanent
-    // installation failure maps to 401 (no retry); any other token-mint failure is retryable.
-    const mintWorkspaceToken = async (
-      owner: string,
-      repo: string,
-    ): Promise<
-      Result<string, {readonly kind: 'http-error'; readonly status: 401} | {readonly kind: 'network-error'}>
-    > => {
+    // installation failure maps to 401 (no retry); any other token-mint failure is retryable. Both callers
+    // bound it (`execute/workspace-token.ts`): `authForRepo` has no deadline of its own.
+    const mintWorkspaceToken: MintWorkspaceToken = async (owner, repo) => {
       const authResult = await appClient.authForRepo(owner, repo)
       if (authResult.success === false) {
         if (
@@ -519,6 +517,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       return ok(authResult.data.token)
     }
 
+    const updateWorkspaceCall = createUpdateWorkspaceCall({workspaceClient, mintToken: mintWorkspaceToken})
     const recoveryWorkspaceCalls = createRecoveryWorkspaceCalls({
       workspaceClient,
       mintToken: mintWorkspaceToken,
@@ -846,12 +845,9 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           },
         }),
       // Prepare the checkout via /update under the repo lock (see run.ts). A permanent
-      // installation failure maps to 401 (no retry); any other token-mint failure is retryable.
-      update: async (owner: string, repo: string, options: {readonly remainingBudgetMs: number}) => {
-        const token = await mintWorkspaceToken(owner, repo)
-        if (token.success === false) return token
-        return workspaceClient.update({owner, repo, token: token.data}, options)
-      },
+      // installation failure maps to 401 (no retry); any other token-mint failure, including a mint
+      // that does not answer within its bound, is retryable (execute/update-workspace.ts).
+      update: updateWorkspaceCall,
       // Automatic recovery of a dirty checkout (see execute/checkout-recovery.ts), run under the same
       // repo lock. Preview mints no token; recover mints one (execute/recovery-workspace.ts).
       previewRecovery: recoveryWorkspaceCalls.previewRecovery,

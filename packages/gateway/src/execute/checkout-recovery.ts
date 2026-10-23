@@ -52,7 +52,7 @@ export interface RecoverTokenUnavailable {
 
 /**
  * `RunMentionDeps.recover`: mints the installation token itself (bounded by
- * `RECOVERY_TOKEN_MINT_TIMEOUT_MS`) and sends `runId` for attribution.
+ * `INSTALLATION_TOKEN_MINT_TIMEOUT_MS`) and sends `runId` for attribution.
  */
 export type RecoverFn = (
   owner: string,

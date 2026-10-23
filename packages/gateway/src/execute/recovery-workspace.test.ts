@@ -1,9 +1,10 @@
-import type {MintWorkspaceToken, RecoveryWorkspaceCalls} from './recovery-workspace.js'
+import type {RecoveryWorkspaceCalls} from './recovery-workspace.js'
+import type {MintWorkspaceToken} from './workspace-token.js'
 
 import {err, ok} from '@fro-bot/runtime'
 import {afterEach, describe, expect, it, vi} from 'vitest'
-import {RECOVERY_TOKEN_MINT_TIMEOUT_MS} from './recovery-budget.js'
 import {createRecoveryWorkspaceCalls} from './recovery-workspace.js'
+import {INSTALLATION_TOKEN_MINT_TIMEOUT_MS} from './workspace-token.js'
 
 type MintResult = Awaited<ReturnType<MintWorkspaceToken>>
 
@@ -102,7 +103,7 @@ describe('createRecoveryWorkspaceCalls: the token mint is bounded', () => {
     const tracked = pending.then(() => {
       settled = true
     })
-    await vi.advanceTimersByTimeAsync(RECOVERY_TOKEN_MINT_TIMEOUT_MS - 1)
+    await vi.advanceTimersByTimeAsync(INSTALLATION_TOKEN_MINT_TIMEOUT_MS - 1)
     const settledEarly = settled
     await vi.advanceTimersByTimeAsync(1)
 
@@ -208,7 +209,7 @@ describe('createRecoveryWorkspaceCalls: the token mint is bounded', () => {
     const {DEFAULT_ENSURE_CLONE_AUTH_TIMEOUT_MS} = await import('../workspace-api/ensure-clone.js')
 
     // #when / #then one number, not two
-    expect(RECOVERY_TOKEN_MINT_TIMEOUT_MS).toBe(DEFAULT_ENSURE_CLONE_AUTH_TIMEOUT_MS)
-    expect(RECOVERY_TOKEN_MINT_TIMEOUT_MS).toBe(30_000)
+    expect(INSTALLATION_TOKEN_MINT_TIMEOUT_MS).toBe(DEFAULT_ENSURE_CLONE_AUTH_TIMEOUT_MS)
+    expect(INSTALLATION_TOKEN_MINT_TIMEOUT_MS).toBe(30_000)
   })
 })
