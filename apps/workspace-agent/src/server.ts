@@ -8,6 +8,8 @@
 import type {BackupsDeps} from './backups.js'
 import type {CloneHandlerDeps, CloneHandlerResult} from './clone.js'
 import type {InspectHandlerDeps, InspectHandlerResult} from './inspect.js'
+import type {InstanceDisposer} from './opencode-instance.js'
+import type {Logger} from './opencode-server.js'
 import type {ExecuteRecoveryDeps, PreviewRecoveryDeps} from './recover.js'
 import type {
   BackupsValidationFailure,
@@ -35,7 +37,7 @@ import {Buffer} from 'node:buffer'
 import {timingSafeEqual} from 'node:crypto'
 
 import {Hono} from 'hono'
-import {deleteBackup, listBackups} from './backups.js'
+import {deleteBackup, isValidRunId, listBackups} from './backups.js'
 import {executeClone, scrubCredentials} from './clone.js'
 import {inspectCheckout} from './inspect.js'
 import {executeRecovery, previewRecovery} from './recover.js'
@@ -108,6 +110,42 @@ function statusForUpdateResult(result: UpdateResult): 200 | 404 | 409 | 502 | 50
   if (result.kind === 'refused') return 409
   if (result.reason === 'fetch-timeout') return 504
   return result.permanent ? 502 : 503
+}
+
+/**
+ * One warning per refused or failed `/update` (ready and no-checkout are the normal paths and stay
+ * silent), so "why did the workspace refuse this checkout?" is answerable from workspace logs.
+ * Logs the closed `reason` plus, for `dirty`, the COUNT of changed paths. Never the names: paths,
+ * config keys, submodules and branches all come from the agent-writable checkout.
+ */
+function logUpdateOutcome(
+  logger: Logger | undefined,
+  owner: string,
+  repo: string,
+  result: UpdateResult,
+  durationMs: number,
+): void {
+  if (logger === undefined) return
+  if (result.kind === 'refused') {
+    logger.warn('workspace-agent: update refused', {
+      owner,
+      repo,
+      reason: result.reason,
+      ...(result.reason === 'dirty' ? {changedPathCount: result.changedPaths.length} : {}),
+      durationMs,
+    })
+    return
+  }
+  if (result.kind === 'failed') {
+    logger.warn('workspace-agent: update failed', {
+      owner,
+      repo,
+      reason: result.reason,
+      mutationStarted: result.mutationStarted,
+      permanent: result.permanent,
+      durationMs,
+    })
+  }
 }
 
 /**
@@ -213,6 +251,13 @@ export interface ProxyListeningRef {
 }
 
 export interface ServerDeps {
+  /**
+   * Process logger. Handed to `executeUpdate` so its own operational log lines emit (it defaults to
+   * a silent no-op otherwise), and used for the one outcome line each refused/failed `/update`
+   * writes. Optional only so route tests need not supply one; `main.ts` always does. Never given a
+   * path, config-key, submodule or branch name, token, or file content.
+   */
+  readonly logger?: Logger
   /** Injected clone executor for testability. */
   readonly cloneExecutor?: CloneExecutorFn
   /** Injected inspect executor for testability. */
@@ -240,6 +285,12 @@ export interface ServerDeps {
     readonly caBundlePath?: string
     readonly proxy?: {readonly https: string; readonly noProxy?: string}
   }
+  /**
+   * Disposes OpenCode's cached instance for a directory, run best-effort after every successful
+   * `/recover` (the manual flow and the automatic one both land here). Built once in `main.ts`
+   * against the loopback OpenCode upstream. When absent, `/recover` simply skips it.
+   */
+  readonly instanceDisposer?: InstanceDisposer
   /** OpenCode server readiness reference. When absent, opencode field is omitted from /healthz. */
   readonly opencodeStatus?: OpencodeStatusRef
   /**
@@ -281,6 +332,8 @@ export function createApp(deps: ServerDeps): Hono {
     listBackupsExecutor = listBackups,
     deleteBackupExecutor = deleteBackup,
     updateNetworkConfig,
+    logger,
+    instanceDisposer,
     opencodeStatus,
     proxyListening,
     auth,
@@ -518,7 +571,9 @@ export function createApp(deps: ServerDeps): Hono {
 
     const request: UpdateRequest = {owner, repo, token: raw.token}
 
+    const startedAtMs = Date.now()
     const result = await updateExecutor(request, {
+      logger,
       // The gateway's HTTP call has its own deadline; when the CLIENT disconnects (or its own
       // request times out), this propagates that as an abort — honored through the fetch phase,
       // ignored once the apply phase begins (executeUpdate's own documented contract).
@@ -526,6 +581,7 @@ export function createApp(deps: ServerDeps): Hono {
       caBundlePath: updateNetworkConfig?.caBundlePath,
       proxy: updateNetworkConfig?.proxy,
     })
+    logUpdateOutcome(logger, owner, repo, result, Date.now() - startedAtMs)
     return c.json(result, statusForUpdateResult(result))
   })
 
@@ -582,8 +638,8 @@ export function createApp(deps: ServerDeps): Hono {
   // (if any) and installs a fresh one at the remote's current default branch tip. Body validation
   // mirrors /update (owner, repo, installation token) plus the fingerprint the operator saw from
   // /recover/preview. `executeRecoveryExecutor` returns the bare `ExecuteRecoveryResult` union
-  // directly — see `statusForExecuteRecoveryResult`. `ExecuteRecoveryDeps` carries no abort-signal
-  // field yet, so there is nothing to pass through from `c.req.raw.signal` here.
+  // directly — see `statusForExecuteRecoveryResult`. The request signal is handed to
+  // `executeRecovery`, which honors a client abort only up to the quarantine rename.
   app.post('/recover', async c => {
     const contentLengthHeader = c.req.header('content-length')
     if (contentLengthHeader === undefined || contentLengthHeader === null) {
@@ -633,9 +689,29 @@ export function createApp(deps: ServerDeps): Hono {
       return c.json(err, 400)
     }
 
-    const request: ExecuteRecoveryRequest = {owner, repo, token: raw.token, fingerprint: raw.fingerprint}
+    // Optional attribution. Absent is fine (manual recovery); any present value must match the run id
+    // format or nothing moves — it ends up in on-disk metadata and in operator-visible listings.
+    if (raw.runId !== undefined && !isValidRunId(raw.runId)) {
+      const err: ExecuteRecoveryValidationFailure = {ok: false, error: 'invalid-run-id'}
+      return c.json(err, 400)
+    }
 
-    const result = await executeRecoveryExecutor(request)
+    const request: ExecuteRecoveryRequest = {
+      owner,
+      repo,
+      token: raw.token,
+      fingerprint: raw.fingerprint,
+      ...(raw.runId === undefined ? {} : {runId: raw.runId}),
+    }
+
+    // The gateway's HTTP call has its own deadline; when the CLIENT disconnects (or its own request
+    // times out), this propagates as an abort — honored by executeRecovery up to the quarantine
+    // rename, ignored from there on (executeRecovery's own documented contract).
+    const result = await executeRecoveryExecutor(request, {
+      signal: c.req.raw.signal,
+      disposeInstance: instanceDisposer,
+      logger,
+    })
     return c.json(result, statusForExecuteRecoveryResult(result))
   })
 

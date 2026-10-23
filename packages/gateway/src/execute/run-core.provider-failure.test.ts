@@ -77,6 +77,10 @@ interface StartOptions {
   /** Live-session map `session.status` reports; defaults to nothing live. */
   readonly live?: Readonly<Record<string, object>>
   readonly abort?: () => Promise<unknown>
+  /** Direct children `session.children` reports for the root; defaults to none. */
+  readonly children?: readonly string[]
+  /** The root's persisted messages, read on every `session.messages` call; defaults to none. */
+  readonly rootMessages?: () => readonly object[]
 }
 
 function startRun(options: StartOptions = {}): Run {
@@ -100,9 +104,12 @@ function startRun(options: StartOptions = {}): Run {
   const client = {
     session: {
       create: vi.fn().mockResolvedValue({data: {id: ROOT}, error: null}),
-      messages: vi.fn().mockResolvedValue({data: [], error: null}),
+      messages: vi.fn(async (args: {path: {id: string}}) => ({
+        data: args.path.id === ROOT ? (options.rootMessages?.() ?? []) : [],
+        error: null,
+      })),
       promptAsync: vi.fn().mockResolvedValue({data: {}, error: null}),
-      children: vi.fn().mockResolvedValue({data: [], error: null}),
+      children: vi.fn().mockResolvedValue({data: (options.children ?? []).map(id => ({id})), error: null}),
       status: vi.fn().mockResolvedValue({data: options.live ?? {}, error: null}),
       abort: vi.fn(options.abort ?? (async () => ({data: {}, error: null}))),
     },
@@ -675,35 +682,109 @@ describe('runOpenCodeCore — provider rejection fails fast (#1836)', () => {
       expectFailed(run, 'Provider failure: session error')
     })
 
-    it('fails the run when an owned child overflows and goes idle uncompacted (compaction off)', async () => {
-      // #given
-      const run = startRun({owned: [CHILD]})
+    it('marks an owned child unknown when it overflows and goes idle uncompacted (compaction off), and the run goes on', async () => {
+      // #given an adopted child
+      const ownershipLedger = createOwnershipLedger()
+      ownershipLedger.adopt(CHILD, 'background task')
+      const run = startRun({owned: [CHILD], ownershipLedger})
 
-      // #when — the child's output is lost; the root has not gone idle
+      // #when the child overflows and goes idle; the root has not gone idle
       await run.emit(sessionError({name: 'ContextOverflowError', data: {message: SECRET}}, CHILD))
-      expect(run.outcome()).toBeUndefined()
       await run.emit({type: 'session.idle', properties: {sessionID: CHILD}})
 
-      // #then
-      expectFailed(run, 'Provider failure: session error')
-      expect(vi.mocked(run.logger.error)).toHaveBeenCalledWith(
-        {sessionId: ROOT, source: 'session.idle', errorName: 'ContextOverflowError', reason: 'session error'},
-        expect.any(String),
-      )
+      // #then the child is unconfirmed, the run was not failed, and nothing raw was logged
+      expect(run.outcome()).toBeUndefined()
+      expect(ownershipLedger.snapshot()).toEqual([{sessionId: CHILD, label: 'background task', state: 'unknown'}])
+      expect(vi.mocked(run.logger.error)).not.toHaveBeenCalled()
       expect(loggedText(run.logger)).not.toContain('SECRET')
     })
 
-    it('lets an owned child recover through its own compaction (compaction on)', async () => {
-      // #given
-      const run = startRun({owned: [CHILD]})
+    it('with compaction on, a child overflow marks the child unknown and the run is not failed', async () => {
+      // #given an adopted child
+      const ownershipLedger = createOwnershipLedger()
+      ownershipLedger.adopt(CHILD, 'background task')
+      const run = startRun({owned: [CHILD], ownershipLedger})
 
-      // #when
+      // #when the child overflows and compacts, and goes idle
       await run.emit(sessionError({name: 'ContextOverflowError', data: {message: 'x'}}, CHILD))
       await run.emit(compactionPart(CHILD))
       await run.emit({type: 'session.idle', properties: {sessionID: CHILD}})
-      await run.emit({type: 'session.idle', properties: {sessionID: ROOT}})
 
-      // #then
+      // #then the child is unconfirmed (compaction does not settle it) and the run was not failed
+      expect(run.outcome()).toBeUndefined()
+      expect(ownershipLedger.snapshot()).toEqual([{sessionId: CHILD, label: 'background task', state: 'unknown'}])
+    })
+
+    it('with compaction on, a root overflow recovers through its own compaction part, and the run completes once the child notice arrives', async () => {
+      // #given an adopted child that is a direct child of the root and has already finished
+      const ownershipLedger = createOwnershipLedger()
+      ownershipLedger.adopt(CHILD, 'background task')
+      const prompted = [
+        {info: {id: 'msg-prompt', role: 'user', sessionID: ROOT}, parts: [{type: 'text', text: 'prompt'}]},
+        {
+          info: {
+            id: 'msg-reply-1',
+            role: 'assistant',
+            sessionID: ROOT,
+            parentID: 'msg-prompt',
+            time: {completed: 1},
+            finish: 'stop',
+          },
+          parts: [],
+        },
+      ]
+      const answeredNotice = [
+        ...prompted,
+        {
+          info: {id: 'msg-notice-1', role: 'user', sessionID: ROOT},
+          parts: [{id: 'part-notice-1', type: 'text', synthetic: true, text: `<task id="${CHILD}" state="completed">`}],
+        },
+        {
+          info: {
+            id: 'msg-reply-2',
+            role: 'assistant',
+            sessionID: ROOT,
+            parentID: 'msg-notice-1',
+            time: {completed: 2},
+            finish: 'stop',
+          },
+          parts: [],
+        },
+      ]
+      let persisted: readonly object[] = prompted
+      const run = startRun({owned: [CHILD], ownershipLedger, children: [CHILD], rootMessages: () => persisted})
+
+      // #when the ROOT overflows, its own compaction part arrives, and the root goes idle
+      await run.emit(sessionError({name: 'ContextOverflowError', data: {message: 'x'}}, ROOT))
+      await run.emit(compactionPart(ROOT))
+      await run.emit({type: 'session.idle', properties: {sessionID: ROOT}})
+      await vi.advanceTimersByTimeAsync(2_000)
+
+      // #then the overflow did not fail the run (compaction cleared it); the ledger is settled by reconciliation,
+      // but the run is still waiting for the child's completion notice
+      expect(ownershipLedger.snapshot()).toEqual([{sessionId: CHILD, label: 'background task', state: 'settled'}])
+      expect(run.outcome()).toBeUndefined()
+
+      // #when the notice arrives, the root answers it, and the root goes idle again
+      persisted = answeredNotice
+      await run.emit({
+        type: 'message.part.updated',
+        properties: {
+          sessionID: ROOT,
+          part: {
+            id: 'part-notice-1',
+            messageID: 'msg-notice-1',
+            sessionID: ROOT,
+            type: 'text',
+            synthetic: true,
+            text: `<task id="${CHILD}" state="completed">\n<summary>done</summary>\n</task>`,
+          },
+        },
+      })
+      await run.emit({type: 'session.idle', properties: {sessionID: ROOT}})
+      await vi.advanceTimersByTimeAsync(5_000)
+
+      // #then the run completes successfully
       expect(run.outcome()).toEqual({ok: true})
     })
 

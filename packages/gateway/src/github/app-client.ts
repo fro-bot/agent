@@ -33,6 +33,15 @@ export const REPO_IDENTITY_REQUEST_TIMEOUT_MS = 10_000
 /** Maximum duration for each network operation in workflow-dispatch App auth. */
 export const WORKFLOW_DISPATCH_AUTH_TIMEOUT_MS = 5_000
 
+/**
+ * Deadline for one whole `authForRepo` call: installation discovery and the token mint share it, and
+ * the Octokit requests are aborted when it expires. Without it a stalled GitHub call has no end, and
+ * every caller (checkout preparation under the repo lock, the manual recover confirm, the clone path,
+ * the denylist reader, add-project, the backfill) would wait on it. This module is the lowest shared
+ * place for the constant: `execute/` and `workspace-api/` both import from here, never the reverse.
+ */
+export const INSTALLATION_TOKEN_MINT_TIMEOUT_MS = 30_000
+
 // ---------------------------------------------------------------------------
 // Error types
 // ---------------------------------------------------------------------------
@@ -81,6 +90,18 @@ export class AuthError extends Error {
   constructor(message: string) {
     super(message)
     this.name = 'AuthError'
+  }
+}
+
+/**
+ * An `AuthError` whose cause is the call's own deadline expiring. A subtype, so every caller that
+ * handles `AuthError` handles it unchanged; callers that want to tell a stall from other failures can
+ * test for it. The message is fixed: nothing from the aborted request is carried over.
+ */
+export class AuthTimeoutError extends AuthError {
+  constructor() {
+    super('GitHub App authentication timed out')
+    this.name = 'AuthTimeoutError'
   }
 }
 
@@ -197,6 +218,65 @@ export interface AppClientOptions {
 // ---------------------------------------------------------------------------
 
 /**
+ * Bounds one caller's wait by that caller's OWN deadline, separately from the shared transport.
+ *
+ * Cancelling the transport is not enough: `@octokit/auth-app` coalesces in-flight installation-token
+ * requests across callers whatever their signals, so a caller whose discovery finished late can join a
+ * request owned by a caller with a later deadline, and its own signal cannot cancel that wait. This race
+ * settles the caller with an `AuthTimeoutError` Result the moment its signal fires (at once if it already
+ * has), whatever the shared request is doing. The transport cancellation is kept: the signal still aborts
+ * the requests this caller owns.
+ *
+ * The abort listener is removed when the work settles first, and a rejection of work that loses the race
+ * is swallowed here, so a late failure is never unhandled.
+ */
+async function settleByDeadline<T, E extends Error>(
+  work: Promise<Result<T, E>>,
+  signal: AbortSignal,
+): Promise<Result<T, E | AuthTimeoutError>> {
+  return new Promise(resolve => {
+    const onAbort = (): void => {
+      resolve(err(new AuthTimeoutError()))
+    }
+    if (signal.aborted) {
+      onAbort()
+    } else {
+      signal.addEventListener('abort', onAbort, {once: true})
+    }
+    work
+      .then(
+        result => {
+          resolve(result)
+        },
+        (error: unknown) => {
+          resolve(err(new AuthError(safeErrorMessage(error))))
+        },
+      )
+      .finally(() => {
+        signal.removeEventListener('abort', onAbort)
+      })
+  })
+}
+
+/**
+ * Whether a failed request ended because the call's deadline expired. The signal being aborted is the
+ * direct evidence. A mint can also end with another caller's expiry: `@octokit/auth-app` shares one
+ * in-flight token request between concurrent callers with the same options, so a caller that joined
+ * another's request rejects with that request's abort (a `TimeoutError`/`AbortError`, possibly wrapped
+ * as a request error's `cause`) while its own signal has not fired yet.
+ */
+function isDeadlineExpiry(error: unknown, signal: AbortSignal | undefined): boolean {
+  if (signal === undefined) return false
+  if (signal.aborted) return true
+  let current: unknown = error
+  for (let depth = 0; depth < 3 && current instanceof Error; depth += 1) {
+    if (current.name === 'TimeoutError' || current.name === 'AbortError') return true
+    current = current.cause
+  }
+  return false
+}
+
+/**
  * Create a GitHub App client that authenticates against repositories using
  * installation tokens.
  *
@@ -242,6 +322,7 @@ export function createAppClient(options: AppClientOptions): AppClient {
           permissions: response.data.permissions ?? {},
         }
       } catch (discoveryError) {
+        if (isDeadlineExpiry(discoveryError, requestSignal)) return err(new AuthTimeoutError())
         if (isOctokitNotFound(discoveryError)) {
           return err(new AppNotInstalledError(owner, repo, installUrl))
         }
@@ -260,6 +341,7 @@ export function createAppClient(options: AppClientOptions): AppClient {
       })
       return ok(installationData)
     } catch (error) {
+      if (isDeadlineExpiry(error, requestSignal)) return err(new AuthTimeoutError())
       return err(new AuthError(safeErrorMessage(error)))
     }
   }
@@ -272,19 +354,29 @@ export function createAppClient(options: AppClientOptions): AppClient {
     requestSignal?: AbortSignal,
   ): Promise<Result<AppClientAuthResult, AuthError>> {
     try {
-      const installAuth = createAppAuth({appId, privateKey, installationId: installation.id})
-      const requestOptions = requestSignal === undefined ? {} : {request: {signal: requestSignal}}
+      // The deadline goes on the REQUEST IMPLEMENTATION handed to `createAppAuth`, not on the
+      // invocation: for the installation-token POST, `@octokit/auth-app` uses `state.request` and
+      // ignores a per-invocation `request` option, so a signal passed there never reaches the transport.
+      // `Octokit` is already a direct dependency; its `request` carries `.defaults`.
+      const installAuth = createAppAuth({
+        appId,
+        privateKey,
+        installationId: installation.id,
+        ...(requestSignal === undefined
+          ? {}
+          : {request: new Octokit().request.defaults({request: {signal: requestSignal}})}),
+      })
       const {token} = await installAuth({
         type: 'installation',
         repositoryNames: [repo],
         permissions,
-        ...requestOptions,
       })
       const octokit = new Octokit({auth: token})
       return ok({octokit, installationId: installation.id, token})
     } catch (mintError) {
       // A mint failure means the cached installation may no longer be usable.
       installationCache.delete(cacheKey(owner, repo))
+      if (isDeadlineExpiry(mintError, requestSignal)) return err(new AuthTimeoutError())
       return err(new AuthError(safeErrorMessage(mintError)))
     }
   }
@@ -293,19 +385,27 @@ export function createAppClient(options: AppClientOptions): AppClient {
     owner: string,
     repo: string,
   ): Promise<Result<AppClientAuthResult, AppNotInstalledError | InsufficientPermissionsError | AuthError>> {
-    const installationResult = await discoverInstallation(owner, repo)
-    if (installationResult.success === false) return installationResult
-    return mintToken(owner, repo, installationResult.data, {contents: 'read'})
+    // One deadline for the whole call, shared by discovery and the mint, so the requests are aborted
+    // when it expires. An abort comes back as an `AuthTimeoutError` Result, never a throw.
+    const deadline = AbortSignal.timeout(INSTALLATION_TOKEN_MINT_TIMEOUT_MS)
+    return settleByDeadline(
+      (async () => {
+        const installationResult = await discoverInstallation(owner, repo, deadline)
+        if (installationResult.success === false) return installationResult
+        return mintToken(owner, repo, installationResult.data, {contents: 'read'}, deadline)
+      })(),
+      deadline,
+    )
   }
 
   async function authForWorkflowDispatch(
     owner: string,
     repo: string,
   ): Promise<Result<AppClientAuthResult, AppNotInstalledError | InsufficientPermissionsError | AuthError>> {
-    const installationResult = await discoverInstallation(
-      owner,
-      repo,
-      AbortSignal.timeout(WORKFLOW_DISPATCH_AUTH_TIMEOUT_MS),
+    const discoveryDeadline = AbortSignal.timeout(WORKFLOW_DISPATCH_AUTH_TIMEOUT_MS)
+    const installationResult = await settleByDeadline(
+      discoverInstallation(owner, repo, discoveryDeadline),
+      discoveryDeadline,
     )
     if (installationResult.success === false) return installationResult
 
@@ -321,12 +421,10 @@ export function createAppClient(options: AppClientOptions): AppClient {
       return err(permissionResult)
     }
 
-    return mintToken(
-      owner,
-      repo,
-      installationResult.data,
-      {actions: 'write'},
-      AbortSignal.timeout(WORKFLOW_DISPATCH_AUTH_TIMEOUT_MS),
+    const mintDeadline = AbortSignal.timeout(WORKFLOW_DISPATCH_AUTH_TIMEOUT_MS)
+    return settleByDeadline(
+      mintToken(owner, repo, installationResult.data, {actions: 'write'}, mintDeadline),
+      mintDeadline,
     )
   }
 

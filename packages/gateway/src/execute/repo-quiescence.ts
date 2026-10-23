@@ -13,9 +13,12 @@ import type {RepoQuiescence} from '../runtime-effect.js'
 
 import {canonicalWorkspaceDirectory} from '../workspace-api/client.js'
 import {attachOpencode} from './opencode-attach.js'
+import {REPO_QUIESCENCE_TIMEOUT_MS} from './recovery-budget.js'
+
+// Re-exported so the checker's own timeout stays discoverable here; the constant lives in recovery-budget.ts.
+export {REPO_QUIESCENCE_TIMEOUT_MS}
 
 const SOURCE = 'opencode-session-status'
-const STATUS_REQUEST_TIMEOUT_MS = 4_000
 const MAX_LOGGED_SESSION_IDS = 32
 
 export interface RepoQuiescenceContext {
@@ -121,7 +124,7 @@ export function createRepoQuiescenceChecker(options: RepoQuiescenceCheckerOption
     const timer = setTimeout(() => {
       timedOut = true
       controller.abort()
-    }, STATUS_REQUEST_TIMEOUT_MS)
+    }, REPO_QUIESCENCE_TIMEOUT_MS)
 
     // Raced against the abort so a client that ignores the signal still cannot stall the caller.
     const aborted = new Promise<'aborted'>(resolve => {

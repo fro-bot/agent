@@ -413,12 +413,27 @@ export interface ExecuteRecoveryRequest {
   readonly token: string
   /** The fingerprint the operator saw from `previewRecovery`; recomputed and compared under the mutex. */
   readonly fingerprint: string
+  /**
+   * The gateway run that triggered this recovery, recorded in the generation's metadata so
+   * `checkout-backup list` can attribute it. Optional: a manual recovery has none. Validated
+   * against `isValidRunId` (backups.ts) at the HTTP layer; a malformed value is a 400.
+   */
+  readonly runId?: string
 }
 
 export type ExecuteRecoveryFailureReason =
   | 'inspection-failed'
   | 'fetch-failed'
   | 'build-failed'
+  /**
+   * A pre-quarantine failure (build, handoff or client abort) whose rollback - staging removal and
+   * restoring or removing the `building` journal - could not be confirmed. Unlike `build-failed`, a
+   * `building` journal (and possibly staging) is left behind: the next `/update` refuses
+   * `needs-recovery` and a preview refuses `journal-in-progress` until startup reconciliation
+   * retries the cleanup when the workspace restarts. If that retry fails too, the journal stays and
+   * an admin must clear it. The original checkout itself is untouched.
+   */
+  | 'rollback-failed'
   | 'quarantine-failed'
   | 'install-failed'
   | 'verification-failed'
@@ -453,6 +468,7 @@ export interface ExecuteRecoveryValidationFailure {
     | 'invalid-repo'
     | 'invalid-token-shape'
     | 'invalid-fingerprint'
+    | 'invalid-run-id'
 }
 
 /** GET/DELETE /backups/... validation failure — owner/repo path-segment problems caught BEFORE `listBackups`/`deleteBackup` is ever called. An invalid `id` reuses `DeleteBackupResult`'s own `{kind: 'refused', reason: 'invalid-id'}` shape instead of a second, redundant type. */
@@ -471,6 +487,8 @@ export interface BackupEntry {
   readonly sizeComplete: boolean
   readonly originalHeadSha: string | undefined
   readonly originalBranch: string | undefined
+  /** The gateway run that triggered the recovery. Absent for manual recoveries and for metadata written before attribution existed. */
+  readonly runId?: string
 }
 
 /** GET /backups/:owner/:repo response. */

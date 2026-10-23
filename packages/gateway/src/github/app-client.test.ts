@@ -1,19 +1,24 @@
-import {beforeEach, describe, expect, it, vi} from 'vitest'
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {
   AppNotInstalledError,
   AuthError,
+  AuthTimeoutError,
   createAppClient,
+  INSTALLATION_TOKEN_MINT_TIMEOUT_MS,
   InsufficientPermissionsError,
   RepoNotFoundError,
 } from './app-client.js'
 
-const {mockAuth, mockCreateAppAuth, mockRequest, MockOctokit} = vi.hoisted(() => {
+const {mockAuth, mockCreateAppAuth, mockRequest, mockDefaults, MockOctokit} = vi.hoisted(() => {
   const mockAuth = vi.fn()
   const mockCreateAppAuth = vi.fn(() => mockAuth)
-  const mockRequest = vi.fn()
+  // `new Octokit().request.defaults({request: {signal}})` is how the mint hands its deadline to the
+  // request implementation given to createAppAuth; the stand-in it returns just carries that signal.
+  const mockDefaults = vi.fn()
+  const mockRequest = Object.assign(vi.fn(), {defaults: mockDefaults})
   const MockOctokit = vi.fn()
-  return {mockAuth, mockCreateAppAuth, mockRequest, MockOctokit}
+  return {mockAuth, mockCreateAppAuth, mockRequest, mockDefaults, MockOctokit}
 })
 
 vi.mock('@octokit/auth-app', () => ({
@@ -78,6 +83,14 @@ function makeAbortedTimeout(): {readonly signal: AbortSignal; readonly restore: 
   return {signal: controller.signal, restore: () => timeoutSpy.mockRestore()}
 }
 
+/** The signal each installation-token mint's request implementation was given, in call order. */
+function mintRequestSignals(): (AbortSignal | undefined)[] {
+  return (mockCreateAppAuth.mock.calls as unknown as [{installationId?: number; request?: {signal?: AbortSignal}}][])
+    .map(args => args[0])
+    .filter(options => options.installationId !== undefined)
+    .map(options => options.request?.signal)
+}
+
 function getInstallationCalls(): InstallationAuthCallArg[] {
   return mockAuth.mock.calls
     .filter(args => (args[0] as {type: string}).type === 'installation')
@@ -87,6 +100,12 @@ function getInstallationCalls(): InstallationAuthCallArg[] {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+function makeDeadlineSpy() {
+  const controller = new AbortController()
+  const spy = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(controller.signal)
+  return {controller, spy}
+}
 
 describe('createAppClient', () => {
   beforeEach(() => {
@@ -99,6 +118,9 @@ describe('createAppClient', () => {
     MockOctokit.mockImplementation(function () {
       return {request: mockRequest}
     })
+    mockDefaults.mockImplementation((options?: {request?: {signal?: AbortSignal}}) => ({
+      signal: options?.request?.signal,
+    }))
 
     // Default: JWT auth returns a token, installation auth returns a token
     mockAuth.mockImplementation(async ({type}: {type: string}) => {
@@ -114,6 +136,10 @@ describe('createAppClient', () => {
   // -------------------------------------------------------------------------
   // Happy paths
   // -------------------------------------------------------------------------
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
 
   it('happy path: valid creds + installed App returns {octokit, installationId, token}', async () => {
     // #given
@@ -340,8 +366,8 @@ describe('createAppClient', () => {
       // #when
       const result = await client.authForWorkflowDispatch('myorg', 'myrepo')
 
-      // #then
-      expect(receivedSignal).toBe(timeout.signal)
+      // #then the caller is released at once; the request it started still received the signal
+      await vi.waitFor(() => expect(receivedSignal).toBe(timeout.signal))
       expect(result.success).toBe(false)
       if (result.success === true) return
       expect(result.error).toBeInstanceOf(AuthError)
@@ -349,14 +375,17 @@ describe('createAppClient', () => {
     })
 
     it('bounds installation token minting with an abort signal', async () => {
-      // #given — discovery succeeds but installation-token minting is aborted
-      const timeout = makeAbortedTimeout()
+      // #given — discovery succeeds, then the mint is aborted by its own deadline
+      const controller = new AbortController()
+      const timeoutSpy = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(controller.signal)
       let receivedSignal: AbortSignal | undefined
       mockRequest.mockResolvedValue({data: {id: 99, permissions: {contents: 'read', actions: 'write'}}})
       mockAuth.mockImplementation(async (options: InstallationAuthCallArg) => {
         if (options.type === 'app') return {token: 'jwt-token-value'}
-        receivedSignal = options.request?.signal
-        throw timeout.signal.reason
+        receivedSignal = mintRequestSignals().at(-1)
+        const reason = new Error('workflow dispatch timeout')
+        controller.abort(reason)
+        throw reason
       })
       const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY, installUrl: INSTALL_URL})
 
@@ -364,11 +393,11 @@ describe('createAppClient', () => {
       const result = await client.authForWorkflowDispatch('myorg', 'myrepo')
 
       // #then
-      expect(receivedSignal).toBe(timeout.signal)
+      expect(receivedSignal).toBe(controller.signal)
       expect(result.success).toBe(false)
       if (result.success === true) return
-      expect(result.error).toBeInstanceOf(AuthError)
-      timeout.restore()
+      expect(result.error).toBeInstanceOf(AuthTimeoutError)
+      timeoutSpy.mockRestore()
     })
 
     it('returns a repository-scoped dispatch client when Actions: write is granted', async () => {
@@ -536,6 +565,230 @@ describe('createAppClient', () => {
     expect(b.success).toBe(true)
   })
 
+  describe('authForRepo deadline', () => {
+    afterEach(() => {
+      vi.restoreAllMocks()
+    })
+
+    it('the deadline is 30 s, pinned to the literal', () => {
+      expect(INSTALLATION_TOKEN_MINT_TIMEOUT_MS).toBe(30_000)
+    })
+
+    it('creates ONE deadline signal of that length and shares it between discovery and the token mint', async () => {
+      // #given
+      const {spy, controller} = makeDeadlineSpy()
+      const discoverySignals: (AbortSignal | undefined)[] = []
+      mockRequest.mockImplementation(async (_route: string, options: InstallationAuthCallArg) => {
+        discoverySignals.push(options.request?.signal)
+        return INSTALLATION_RESPONSE
+      })
+      const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+
+      // #when
+      const result = await client.authForRepo('foo', 'bar')
+
+      // #then discovery gets it per request, the mint through its request implementation
+      expect(result.success).toBe(true)
+      expect(spy).toHaveBeenCalledExactlyOnceWith(INSTALLATION_TOKEN_MINT_TIMEOUT_MS)
+      expect(discoverySignals).toEqual([controller.signal])
+      expect(mintRequestSignals()).toEqual([controller.signal])
+      expect(mockDefaults).toHaveBeenCalledExactlyOnceWith({request: {signal: controller.signal}})
+    })
+
+    it('an abort during discovery comes back as an AuthTimeoutError Result, never a throw', async () => {
+      // #given the discovery request is aborted by the deadline
+      const {controller} = makeDeadlineSpy()
+      mockRequest.mockImplementation(async () => {
+        controller.abort(new Error('deadline'))
+        throw new Error('aborted: socket detail the caller must not see')
+      })
+      const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+
+      // #when
+      const result = await client.authForRepo('foo', 'bar')
+
+      // #then
+      expect(result.success).toBe(false)
+      if (result.success) return
+      expect(result.error).toBeInstanceOf(AuthTimeoutError)
+      expect(result.error).toBeInstanceOf(AuthError)
+      expect(result.error.message).toBe('GitHub App authentication timed out')
+    })
+
+    it('an aborted discovery writes no cache entry: the next call discovers again', async () => {
+      // #given
+      const {controller} = makeDeadlineSpy()
+      mockRequest.mockImplementationOnce(async () => {
+        controller.abort(new Error('deadline'))
+        throw new Error('aborted')
+      })
+      const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+      await client.authForRepo('foo', 'bar')
+      vi.restoreAllMocks()
+      mockRequest.mockResolvedValue(INSTALLATION_RESPONSE)
+
+      // #when
+      const second = await client.authForRepo('foo', 'bar')
+
+      // #then discovery ran a second time, so nothing was cached by the aborted one
+      expect(second.success).toBe(true)
+      expect(mockRequest).toHaveBeenCalledTimes(2)
+    })
+
+    it('an abort during the token mint comes back as an AuthTimeoutError Result and evicts the cached installation', async () => {
+      // #given discovery succeeds, then the mint is aborted by the deadline
+      const {controller} = makeDeadlineSpy()
+      mockAuth.mockImplementation(async (options: InstallationAuthCallArg) => {
+        if (options.type === 'app') return {token: 'jwt-token-value'}
+        controller.abort(new Error('deadline'))
+        throw new Error('aborted')
+      })
+      const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+
+      // #when
+      const result = await client.authForRepo('foo', 'bar')
+
+      // #then
+      expect(result.success).toBe(false)
+      if (result.success) return
+      expect(result.error).toBeInstanceOf(AuthTimeoutError)
+    })
+
+    it('a failure that is NOT an abort stays a plain AuthError, not a timeout', async () => {
+      // #given
+      mockRequest.mockRejectedValue(new Error('boom'))
+      const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+
+      // #when
+      const result = await client.authForRepo('foo', 'bar')
+
+      // #then
+      expect(result.success).toBe(false)
+      if (result.success) return
+      expect(result.error).toBeInstanceOf(AuthError)
+      expect(result.error).not.toBeInstanceOf(AuthTimeoutError)
+    })
+
+    it('a warm cache hit still passes the deadline to the mint', async () => {
+      // #given
+      const {controller} = makeDeadlineSpy()
+      const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+      await client.authForRepo('foo', 'bar')
+
+      // #when
+      await client.authForRepo('foo', 'bar')
+
+      // #then
+      expect(mintRequestSignals()).toEqual([controller.signal, controller.signal])
+    })
+
+    it('releases a caller whose own deadline fires even though the shared mint never settles, and leaves no listener behind when it settles first', async () => {
+      // #given a mint that never answers (as when it joined another caller's request) and a fireable deadline
+      const {controller} = makeDeadlineSpy()
+      mockAuth.mockImplementation(async (options: InstallationAuthCallArg) => {
+        if (options.type === 'app') return {token: 'jwt-token-value'}
+        return new Promise(() => {})
+      })
+      const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+      const pending = client.authForRepo('foo', 'bar')
+      let settled = false
+      pending
+        .then(() => {
+          settled = true
+        })
+        .catch(() => {})
+      await vi.waitFor(() => expect(mockCreateAppAuth.mock.calls.length).toBeGreaterThan(1))
+      expect(settled).toBe(false)
+
+      // #when its own deadline fires
+      controller.abort(new Error('deadline'))
+      const result = await pending
+
+      // #then
+      expect(result.success === false && result.error instanceof AuthTimeoutError).toBe(true)
+    })
+
+    it('removes its abort listener once the work settles first', async () => {
+      // #given
+      const {controller} = makeDeadlineSpy()
+      const added = vi.spyOn(controller.signal, 'addEventListener')
+      const removed = vi.spyOn(controller.signal, 'removeEventListener')
+      const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+
+      // #when
+      const result = await client.authForRepo('foo', 'bar')
+
+      // #then
+      expect(result.success).toBe(true)
+      const abortListeners = added.mock.calls.filter(call => call[0] === 'abort')
+      expect(abortListeners.length).toBeGreaterThan(0)
+      await vi.waitFor(() => {
+        expect(removed.mock.calls.filter(call => call[0] === 'abort')).toHaveLength(abortListeners.length)
+      })
+    })
+
+    it('a caller whose deadline has already passed is released at once, whatever the requests do', async () => {
+      // #given the deadline expired before the call, and discovery never answers
+      vi.spyOn(AbortSignal, 'timeout').mockReturnValue(AbortSignal.abort(new Error('already expired')))
+      mockRequest.mockReturnValue(new Promise(() => {}))
+      const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+
+      // #when / #then it settles without waiting for anything
+      const result = await Promise.race([
+        client.authForRepo('foo', 'bar'),
+        new Promise<'pending'>(resolve => setTimeout(() => resolve('pending'), 500)),
+      ])
+      expect(result).not.toBe('pending')
+      if (result === 'pending') return
+      expect(result.success === false && result.error instanceof AuthTimeoutError).toBe(true)
+    })
+
+    it('authForWorkflowDispatch releases a caller at its own mint deadline even if the shared mint never settles', async () => {
+      // #given discovery succeeds, then the mint never settles (as when it joined another caller's request)
+      const controllers: AbortController[] = []
+      vi.spyOn(AbortSignal, 'timeout').mockImplementation(() => {
+        const controller = new AbortController()
+        controllers.push(controller)
+        return controller.signal
+      })
+      mockRequest.mockResolvedValue({data: {id: 99, permissions: {contents: 'read', actions: 'write'}}})
+      mockAuth.mockImplementation(async (options: InstallationAuthCallArg) => {
+        if (options.type === 'app') return {token: 'jwt-token-value'}
+        return new Promise(() => {})
+      })
+      const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+      const pending = client.authForWorkflowDispatch('foo', 'bar')
+      await vi.waitFor(() => expect(controllers).toHaveLength(2)) // discovery's deadline, then the mint's
+      await vi.waitFor(() => expect(mintRequestSignals()).toHaveLength(1))
+
+      // #when only the mint's deadline fires
+      controllers[1]?.abort(new Error('deadline'))
+      const result = await Promise.race([
+        pending,
+        new Promise<'pending'>(resolve => setTimeout(() => resolve('pending'), 500)),
+      ])
+
+      // #then
+      expect(result).not.toBe('pending')
+      if (result === 'pending') return
+      expect(result.success === false && result.error instanceof AuthTimeoutError).toBe(true)
+    })
+
+    it('never puts the signal on the installation invocation, which auth-app ignores for the token POST', async () => {
+      // #given
+      makeDeadlineSpy()
+      const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
+
+      // #when
+      await client.authForRepo('foo', 'bar')
+
+      // #then
+      for (const call of getInstallationCalls()) {
+        expect(call).not.toHaveProperty('request')
+      }
+    })
+  })
+
   it('cache invalidation: after invalidateCache, next authForRepo re-discovers installation', async () => {
     // #given
     const client = createAppClient({appId: APP_ID, privateKey: PRIVATE_KEY})
@@ -568,6 +821,9 @@ describe('createAppClient.getRepoIdentity', () => {
     MockOctokit.mockImplementation(function () {
       return {request: mockRequest}
     })
+    mockDefaults.mockImplementation((options?: {request?: {signal?: AbortSignal}}) => ({
+      signal: options?.request?.signal,
+    }))
 
     mockAuth.mockImplementation(async ({type}: {type: string}) => {
       if (type === 'app') return {token: 'jwt-token-value'}

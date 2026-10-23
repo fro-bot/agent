@@ -571,3 +571,178 @@ describe('settleOwnedSessions', () => {
     })
   })
 })
+
+/** Every logger call as `[level, context, message]`, across all levels. */
+function loggedCalls(logger: GatewayLogger): readonly (readonly [string, Record<string, unknown>, string])[] {
+  const levels = ['debug', 'info', 'warn', 'error'] as const
+  return levels.flatMap(level =>
+    (logger[level] as unknown as ReturnType<typeof vi.fn>).mock.calls.map(
+      call => [level, call[0] as Record<string, unknown>, call[1] as string] as const,
+    ),
+  )
+}
+
+describe('settleOwnedSessions: run correlation in logs', () => {
+  const RUN_ID = 'run-1889-correlation'
+
+  it('stamps the run id on the start and success logs of a settled run', async () => {
+    // #given an outstanding child that the confirmation round finds settled
+    const ledger = createOwnershipLedger()
+    ledger.adopt(CHILD, 'background task')
+    const client = makeClient({
+      children: async () => ({data: [{id: CHILD}], error: null}),
+      status: async () => ({data: {}, error: null}),
+    })
+    const logger = makeLogger()
+
+    // #when
+    const result = await settleOwnedSessions({
+      client,
+      directory: '/workspace/repo',
+      rootSessionId: ROOT,
+      ledger,
+      logger,
+      runId: RUN_ID,
+    })
+
+    // #then the opening warning, the closing info line and the reconciliation lines in between all carry the run id
+    expect(result).toEqual({settled: true})
+    const calls = loggedCalls(logger)
+    const messages = calls.map(([, , message]) => message)
+    expect(messages).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining('run failed with owned work still outstanding'),
+        'settle-owned-sessions: owned work confirmed settled',
+      ]),
+    )
+    expect(calls.length).toBeGreaterThan(2)
+    for (const [, context] of calls) {
+      expect(context.runId).toBe(RUN_ID)
+    }
+  })
+
+  it('stamps the run id on abort-error, abort-throw and unconfirmed-settlement logs', async () => {
+    // #given an envelope error on the root abort, a throw on the child abort, and a child that stays live
+    const ledger = createOwnershipLedger()
+    ledger.adopt(CHILD, 'background task')
+    const client = makeClient({
+      abort: async (args: unknown) => {
+        if ((args as {path: {id: string}}).path.id === ROOT) return {data: null, error: 'session not found'}
+        throw new Error('ECONNRESET')
+      },
+      children: async () => ({data: [{id: CHILD}], error: null}),
+      status: async () => ({data: {[CHILD]: {}}, error: null}),
+    })
+    const logger = makeLogger()
+
+    // #when
+    const result = await settleOwnedSessions({
+      client,
+      directory: '/workspace/repo',
+      rootSessionId: ROOT,
+      ledger,
+      logger,
+      runId: RUN_ID,
+    })
+
+    // #then every emitted line, whatever its level, is attributable to the run
+    expect(result.settled).toBe(false)
+    const calls = loggedCalls(logger)
+    const messages = calls.map(([, , message]) => message)
+    expect(messages).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining('error envelope'),
+        expect.stringContaining('session.abort threw'),
+        expect.stringContaining('could not be confirmed settled'),
+      ]),
+    )
+    for (const [, context] of calls) {
+      expect(context.runId).toBe(RUN_ID)
+    }
+  })
+
+  it('stamps the run id on the bound-exceeded log', async () => {
+    // #given an abort that never answers
+    const ledger = createOwnershipLedger()
+    ledger.adopt(CHILD, 'background task')
+    const client = makeClient({abort: async () => new Promise(() => {})})
+    const logger = makeLogger()
+
+    // #when
+    const result = await settleOwnedSessions({
+      client,
+      directory: '/workspace/repo',
+      rootSessionId: ROOT,
+      ledger,
+      logger,
+      runId: RUN_ID,
+      timeoutMs: 50,
+    })
+
+    // #then
+    expect(result.settled).toBe(false)
+    const calls = loggedCalls(logger)
+    expect(calls.map(([, , message]) => message)).toContain(
+      'settle-owned-sessions: settle attempt exceeded its bound — quarantining rather than hanging',
+    )
+    for (const [, context] of calls) {
+      expect(context.runId).toBe(RUN_ID)
+    }
+  })
+
+  it('stamps the run id on the unexpected-error log', async () => {
+    // #given a ledger whose snapshot throws once the settle attempt is underway
+    let snapshotCalls = 0
+    const entries = [{sessionId: CHILD, label: 'background task', state: 'outstanding' as const}]
+    const throwingLedger: OwnershipLedger = {
+      adopt: () => {},
+      settle: () => {},
+      markUnknown: () => {},
+      outstanding: () => 1,
+      unknown: () => 0,
+      isDrainComplete: () => false,
+      isPersistenceSafe: () => false,
+      isTracked: () => true,
+      snapshot: () => {
+        snapshotCalls += 1
+        if (snapshotCalls > 1) throw new Error('boom')
+        return entries
+      },
+    }
+    const logger = makeLogger()
+
+    // #when
+    await settleOwnedSessions({
+      client: makeClient(),
+      directory: '/workspace/repo',
+      rootSessionId: ROOT,
+      ledger: throwingLedger,
+      logger,
+      runId: RUN_ID,
+    })
+
+    // #then
+    for (const [, context] of loggedCalls(logger)) {
+      expect(context.runId).toBe(RUN_ID)
+    }
+  })
+
+  it('leaves the log context unchanged when no run id is supplied', async () => {
+    // #given
+    const ledger = createOwnershipLedger()
+    ledger.adopt(CHILD, 'background task')
+    const client = makeClient({
+      children: async () => ({data: [{id: CHILD}], error: null}),
+      status: async () => ({data: {}, error: null}),
+    })
+    const logger = makeLogger()
+
+    // #when
+    await settleOwnedSessions({client, directory: '/workspace/repo', rootSessionId: ROOT, ledger, logger})
+
+    // #then no `runId` key appears at all
+    for (const [, context] of loggedCalls(logger)) {
+      expect(Object.keys(context)).not.toContain('runId')
+    }
+  })
+})

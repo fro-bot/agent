@@ -194,8 +194,10 @@ export interface UpdateHandlerDeps {
    * currently only: a fetch subprocess's termination could not be confirmed, so a
    * `refs/fro-bot/fetch/*` ref (or several, across a retry) is deliberately LEFT in the protected
    * bare store rather than risk deleting one a leaked process may still be writing (B1). Defaults
-   * to a no-op; the repository is already under a maintenance hold in this case regardless of
-   * whether anything is logged.
+   * to a no-op when omitted; production `/update` always passes the process logger (server.ts), so
+   * this line reaches container stderr. The repository is already under a maintenance hold in this
+   * case regardless of whether anything is logged. Log only counts and reasons here, never names
+   * or contents from the checkout; the `refs` logged are the fixed `refs/fro-bot/fetch/*` names.
    */
   readonly logger?: {readonly warn: (msg: string, meta?: Record<string, unknown>) => void}
 }
