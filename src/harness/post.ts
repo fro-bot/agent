@@ -250,7 +250,13 @@ async function persistRunState(logger: Logger): Promise<void> {
       // The post hook cannot set `cache-save-result`: GitHub Actions `runs.post:` steps run
       // after every other step in the job, so no downstream step could ever read it even if
       // the write succeeded. The job summary is the only surface available here.
-      await writeCacheSaveResultSummary(saveResult, 'post-retry', logger, undefined, storePublishWithheld)
+      await writeCacheSaveResultSummary(
+        saveResult,
+        'post-retry',
+        logger,
+        undefined,
+        storePublishWithheld ? 'lease-released' : undefined,
+      )
 
       // "No cache content to save" is reserved for skipped-empty. Every other outcome gets
       // its own line naming it, so a checkpoint decline is distinguishable from a

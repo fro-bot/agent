@@ -35,5 +35,5 @@ OpenCode state persistence via GitHub Actions cache with corruption detection an
 
 - **Fatal Restore**: A cache miss is a warning, not an error.
 - **Blocking Save**: S3 upload should be best-effort in the main step.
-- **Unleased Publish**: Never call `saveCache` with `objectStorePublish` omitted or `'publish'` from a caller that does not hold the coordination lease; the upload is an unconditional last-writer-wins write.
+- **Unleased Publish**: Never call `saveCache` with `objectStorePublish` omitted or `'publish'` from a caller that does not hold the coordination lease; the upload is an unconditional last-writer-wins write. `runCleanup` publishes only when the run acquired the Action lock (a lock ETag or a lease renewal); a run that returned before `runAcquireLock` (a dedup or routing skip) writes the Actions cache only.
 - **Credential Logging**: Never log S3 access keys or session tokens.

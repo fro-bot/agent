@@ -129,7 +129,8 @@ describe('cleanup + post integration: the object-store boundary is touched at mo
       // exists to observe.
       repo: '',
       runId: '',
-      lockEtag: null,
+      // A run that acquired the Action lock: only such a run may publish the session to the object store.
+      lockEtag: 'etag-1',
     })
   }
 

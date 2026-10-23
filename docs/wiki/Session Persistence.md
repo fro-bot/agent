@@ -32,6 +32,7 @@ sources:
 summary: "How agent memory survives across CI runs via cache, SDK sessions, S3 object store, and pruning"
   - src/harness/post.ts
   - src/services/cache/types.ts
+  - src/harness/phases/cleanup.ts
 ---
 
 # Session Persistence
@@ -68,7 +69,7 @@ On restore, the cache module performs several safety checks:
 - **Version check** — Reads a `.version` file and compares against the expected `STORAGE_VERSION` constant. On mismatch, starts fresh to avoid format incompatibilities.
 - **Credential cleanup** — Deletes any `auth.json` that might have been accidentally included in a previous cache save. Credentials are ephemeral and should never persist.
 
-The Actions cache is saved up to twice: once during the cleanup phase of the main step, and again in the post-action hook (`post.ts`) when the first save did not persist. The post-action hook exists because GitHub Actions may kill the main step's `finally` block, and losing cache would mean losing all session history. The object store is written only by the main step, while the run holds the coordination lease: the store keeps one shared `sessions/opencode.db` per repo, written with an unconditional upload, and the post-action hook runs after the lease is released, so its retry passes `objectStorePublish: 'withhold'` to `saveCache` and writes the Actions cache alone.
+The Actions cache is saved up to twice: once during the cleanup phase of the main step, and again in the post-action hook (`post.ts`) when the first save did not persist. The post-action hook exists because GitHub Actions may kill the main step's `finally` block, and losing cache would mean losing all session history. The object store keeps one shared `sessions/opencode.db` per repo, written with an unconditional upload, so only a run that holds the coordination lease may write it. The main step publishes when it acquired the lock (cleanup holds a lock ETag or a lease renewal). A dedup-skipped or routing-skipped run returns before the lock is taken and writes the Actions cache alone; its job summary reads `Object Store Publish: withheld (no lease acquired)`. The post-action hook runs after the lease is released, so its retry passes `objectStorePublish: 'withhold'` to `saveCache` and writes the Actions cache alone.
 
 ### Trigger-specific cache write availability
 
