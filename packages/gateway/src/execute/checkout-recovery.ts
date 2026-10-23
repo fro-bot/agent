@@ -42,12 +42,23 @@ export type PreviewRecoveryFn = (
   repo: string,
 ) => Promise<Result<PreviewRecoveryResult, PreviewRecoveryWorkspaceError>>
 
-/** `RunMentionDeps.recover`: mints the installation token itself and sends `runId` for attribution. */
+/**
+ * The installation token could not be minted in time, so `/recover` was never sent. Distinct from every
+ * workspace transport error: those mean a request may have reached the workspace, this means none did.
+ */
+export interface RecoverTokenUnavailable {
+  readonly kind: 'token-unavailable'
+}
+
+/**
+ * `RunMentionDeps.recover`: mints the installation token itself (bounded by
+ * `RECOVERY_TOKEN_MINT_TIMEOUT_MS`) and sends `runId` for attribution.
+ */
 export type RecoverFn = (
   owner: string,
   repo: string,
   options: {readonly fingerprint: string; readonly runId: string},
-) => Promise<Result<ExecuteRecoveryResult, ExecuteRecoveryWorkspaceError>>
+) => Promise<Result<ExecuteRecoveryResult, ExecuteRecoveryWorkspaceError | RecoverTokenUnavailable>>
 
 /** `RunMentionDeps.listBackups`: bounded by the workspace client's own `listBackupsTimeoutMs`. */
 export type ListBackupsFn = (
@@ -79,6 +90,7 @@ export interface AutoRecoverRequest {
 /** Nothing moved: we never asked, or the workspace guarantees the checkout is as it was. */
 export type RecoveryDeclineReason =
   | 'budget-insufficient'
+  | 'token-unavailable'
   | 'workspace-busy'
   | 'workspace-unknown'
   | 'preview-unavailable'
@@ -169,8 +181,12 @@ function classifyRecoverFailure(
 }
 
 function classifyRecover(
-  result: Result<ExecuteRecoveryResult, ExecuteRecoveryWorkspaceError>,
+  result: Result<ExecuteRecoveryResult, ExecuteRecoveryWorkspaceError | RecoverTokenUnavailable>,
 ): CheckoutRecoveryOutcome {
+  if (result.success === false && result.error.kind === 'token-unavailable') {
+    // The mint failed or timed out BEFORE `/recover` was sent: the workspace was never asked to do anything.
+    return {kind: 'declined', reason: 'token-unavailable'}
+  }
   // The request may have reached the workspace before the transport failed, so none of these prove
   // that nothing moved.
   if (result.success === false) {

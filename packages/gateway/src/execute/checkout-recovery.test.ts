@@ -10,7 +10,7 @@ import {err, ok} from '@fro-bot/runtime'
 import {describe, expect, it, vi} from 'vitest'
 import {totalRecoveryCeilingMs} from '../workspace-api/client.js'
 import {settleAmbiguousRecovery, totalRecoveryBudgetMs, tryAutoRecoverDirtyCheckout} from './checkout-recovery.js'
-import {REPO_QUIESCENCE_TIMEOUT_MS} from './repo-quiescence.js'
+import {RECOVERY_TOKEN_MINT_TIMEOUT_MS, REPO_QUIESCENCE_TIMEOUT_MS} from './recovery-budget.js'
 import {
   DEFAULT_BACKUP_ID,
   DEFAULT_PREVIEW_FINGERPRINT,
@@ -152,18 +152,21 @@ describe('tryAutoRecoverDirtyCheckout: budget gate', () => {
 })
 
 describe('totalRecoveryBudgetMs', () => {
-  it('is the quiescence check plus every workspace call the recovery makes (default sum 514s)', () => {
-    // #given the default ceilings: 4s quiescence + 45s preview + 300s recover + 5s dispose + 60s lookup + 100s update
+  it('is the quiescence check, the token mint and every workspace call (default sum 544s)', () => {
+    // #given the default ceilings: 4s quiescence + 30s mint + 45s preview + 300s recover + 5s dispose
+    // + 60s backup lookup + 100s update
     // #when / #then
-    expect(totalRecoveryBudgetMs()).toBe(4_000 + 45_000 + 300_000 + 5_000 + 60_000 + 100_000)
-    expect(totalRecoveryBudgetMs()).toBe(514_000)
+    expect(totalRecoveryBudgetMs()).toBe(4_000 + 30_000 + 45_000 + 300_000 + 5_000 + 60_000 + 100_000)
+    expect(totalRecoveryBudgetMs()).toBe(544_000)
   })
 
-  it("derives the quiescence term from the checker's own exported timeout, not a literal", () => {
-    expect(totalRecoveryBudgetMs()).toBe(REPO_QUIESCENCE_TIMEOUT_MS + totalRecoveryCeilingMs())
+  it('derives the quiescence and mint terms from their exported constants, not literals', () => {
+    expect(totalRecoveryBudgetMs()).toBe(
+      REPO_QUIESCENCE_TIMEOUT_MS + RECOVERY_TOKEN_MINT_TIMEOUT_MS + totalRecoveryCeilingMs(),
+    )
   })
 
-  it('follows the ceilings the client was configured with', () => {
+  it('follows the ceilings the client was configured with, keeping the mint term fixed', () => {
     // #given
     const options = {
       previewRecoveryTimeoutMs: 1_000,
@@ -173,7 +176,9 @@ describe('totalRecoveryBudgetMs', () => {
     }
 
     // #when / #then
-    expect(totalRecoveryBudgetMs(options)).toBe(REPO_QUIESCENCE_TIMEOUT_MS + 10_000 + 5_000)
+    expect(totalRecoveryBudgetMs(options)).toBe(
+      REPO_QUIESCENCE_TIMEOUT_MS + RECOVERY_TOKEN_MINT_TIMEOUT_MS + 10_000 + 5_000,
+    )
   })
 })
 
@@ -328,6 +333,33 @@ describe('tryAutoRecoverDirtyCheckout: recover outcomes that moved nothing (decl
 
     // #then
     expect(outcome).toEqual({kind: 'declined', reason: 'quota-exceeded', usage: USAGE})
+  })
+})
+
+describe('tryAutoRecoverDirtyCheckout: a recover that never sent a request (token unavailable)', () => {
+  it('declines, because the mint failed or timed out before /recover was sent and nothing moved', async () => {
+    // #given
+    const recover = vi.fn().mockResolvedValue(err({kind: 'token-unavailable'}))
+
+    // #when
+    const {outcome, h} = await run({recover})
+
+    // #then it is a decline - NOT ambiguous - so the original dirty refusal stands and no lookup runs
+    expect(outcome).toEqual({kind: 'declined', reason: 'token-unavailable'})
+    expect(h.recover).toHaveBeenCalledOnce()
+    expect(h.listBackups).not.toHaveBeenCalled()
+  })
+
+  it('logs one declined warning carrying the reason', async () => {
+    const recover = vi.fn().mockResolvedValue(err({kind: 'token-unavailable'}))
+    const {h} = await run({recover})
+    expect(h.logger.warn).toHaveBeenCalledOnce()
+    expect(h.logger.warn.mock.calls[0]?.[0]).toEqual({
+      repo: 'acme/widget',
+      runId: 'run-1',
+      outcome: 'declined',
+      reason: 'token-unavailable',
+    })
   })
 })
 

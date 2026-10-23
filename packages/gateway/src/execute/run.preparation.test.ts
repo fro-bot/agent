@@ -26,6 +26,7 @@ import {
 } from './test-helpers.js'
 import {abortRegistry} from './abort-registry.js'
 import {totalRecoveryBudgetMs} from './checkout-recovery.js'
+import {createRecoveryWorkspaceCalls} from './recovery-workspace.js'
 import type {ListBackupsFn, PreviewRecoveryFn, RecoverFn} from './checkout-recovery.js'
 import {parseRecoverEntryCustomId} from '../discord/recover-checkout-button.js'
 import {
@@ -744,8 +745,8 @@ describe('checkout preparation: automatic recovery is gated', () => {
     vi.clearAllMocks()
   })
 
-  it("keeps today's refusal, calling nothing, when the run budget is one below the required sum (514s by default)", async () => {
-    // #given a run budget one millisecond under quiescence + preview + recover + dispose + lookup + update
+  it("keeps today's refusal, calling nothing, when the run budget is one below the required sum (544s by default)", async () => {
+    // #given a run budget one millisecond under quiescence + token mint + preview + recover + dispose + lookup + update
     // #when
     const run = await launchRecoveryRun({updates: [DIRTY], runTimeoutMs: totalRecoveryBudgetMs() - 1})
 
@@ -1758,5 +1759,74 @@ describe('checkout preparation: rollback-failed on the automatic path', () => {
       recover: vi.fn().mockResolvedValue(ROLLBACK),
     })
     expect(occurrences(failureText(run), RECOVERY_ATTEMPTED_NOTE)).toBe(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The recovery token mint is bounded: a stalled GitHub call must not hold the lock past the bound.
+// ---------------------------------------------------------------------------
+
+describe('checkout preparation: a stalled installation-token mint during recovery', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  const MINT_CEILING_MS = 40
+
+  function stalledMintRecover() {
+    const workspaceRecover = vi.fn().mockResolvedValue({success: true, data: {kind: 'no-checkout'}})
+    const calls = createRecoveryWorkspaceCalls({
+      workspaceClient: {previewRecovery: vi.fn(), recover: workspaceRecover},
+      mintToken: vi.fn().mockReturnValue(new Promise(() => {})),
+      mintTimeoutMs: MINT_CEILING_MS,
+    })
+    return {recover: vi.fn().mockImplementation(calls.recover), workspaceRecover}
+  }
+
+  it('ends in the usual dirty refusal within the bound, without ever sending /recover', async () => {
+    // #given a mint that never answers
+    const {recover, workspaceRecover} = stalledMintRecover()
+    const started = Date.now()
+
+    // #when
+    const run = await launchRecoveryRun({updates: [DIRTY], recover})
+
+    // #then today's refusal, with its Recover button, and no recovery note at all
+    expect(Date.now() - started).toBeLessThan(5_000)
+    expect(workspaceRecover).not.toHaveBeenCalled()
+    expect(run.update).toHaveBeenCalledTimes(1)
+    expect(run.listBackups).not.toHaveBeenCalled()
+    const reply = refusalReply(run.request)
+    expect(reply.content).toContain(DIRTY_CLAUSE)
+    expect(reply.content).not.toContain(RECOVERY_ATTEMPTED_NOTE)
+    expect(reply.content).not.toContain(DEFAULT_BACKUP_ID)
+    expect(reply.components).toHaveLength(1)
+    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+  })
+
+  it('releases the repo lock exactly as any other refusal does', async () => {
+    // #given
+    const {recover} = stalledMintRecover()
+
+    // #when
+    await launchRecoveryRun({updates: [DIRTY], recover})
+
+    // #then
+    expect(mockRuntime.releaseLock).toHaveBeenCalledOnce()
+    expect(transitionPhases()).toContain('FAILED')
+    expect(transitionPhases()).not.toContain('EXECUTING')
+  })
+
+  it('persists the original dirty refusal as the checkoutPreparation record', async () => {
+    // #given
+    const {recover} = stalledMintRecover()
+
+    // #when
+    await launchRecoveryRun({updates: [DIRTY], recover})
+
+    // #then
+    const failedCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'FAILED')
+    const options = failedCall?.[7] as {detailsPatch?: {checkoutPreparation?: unknown}}
+    expect(options?.detailsPatch?.checkoutPreparation).toMatchObject({outcome: 'refused', reason: 'dirty'})
   })
 })
