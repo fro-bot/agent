@@ -17,6 +17,7 @@ import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {runAgentWalk} from './agent-walk.js'
 import {listBackups} from './backups.js'
 import {runGit} from './git-safety.js'
+import {runPackStream} from './git-stream.js'
 import {AGENT_GID, AGENT_UID, JOURNAL_DIR_NAME, WORKSPACE_STATE_DIR_NAME} from './identity.js'
 import {readJournal, writeJournal} from './journal.js'
 import {executeRecovery, previewRecovery, reconcileRecoveryJournalsOnStartup} from './recover.js'
@@ -39,6 +40,22 @@ import {
 } from './update-fixtures/helpers.js'
 import {executeUpdate} from './update.js'
 
+// Pass-through wrapper around the real ownership handoff so a test can fire an abort at the
+// exact boundary just after the handoff, the last point `executeRecovery` honours a client abort.
+const handoffHook = vi.hoisted(() => ({after: undefined as (() => void) | undefined}))
+type HandoffModule = typeof import('./handoff.js')
+
+vi.mock('./handoff.js', async importOriginal => {
+  const actual = await importOriginal<HandoffModule>()
+  return {
+    ...actual,
+    handOffToAgent: async (...args: Parameters<HandoffModule['handOffToAgent']>) => {
+      const result = await actual.handOffToAgent(...args)
+      handoffHook.after?.()
+      return result
+    },
+  }
+})
 // Every describe in this file drives real git (staging clones, pack import, quarantine, size walks).
 // File-level so no describe is left on vitest's 5s default under load.
 vi.setConfig({testTimeout: REAL_GIT_TEST_TIMEOUT_MS})
@@ -52,6 +69,7 @@ let reposRoot: string
 let checkoutHome: string
 
 beforeEach(async () => {
+  handoffHook.after = undefined
   reposRoot = await makeTempDir('recover-test-repos-')
   checkoutHome = await makeTempDir('recover-test-checkout-home-')
   resetRepoLocksForTesting()
@@ -1814,4 +1832,462 @@ describe('executeRecovery — E2: recovers an interrupted UPDATE journal', () =>
       expect(result).toEqual({kind: 'refused', reason: 'journal-in-progress', phase: 'quarantining'})
     },
   )
+})
+
+// ---------------------------------------------------------------------------
+// Run attribution and client abort (auto-recover Unit 1)
+// ---------------------------------------------------------------------------
+
+const ATTRIBUTION_RUN_ID = '3f2b8c1e-5d4a-4b7e-9a10-6c2d8e4f1a23'
+
+/** A dirty checkout (one untracked leftover) plus the fingerprint a preview reports for it. */
+async function setupDirtyCheckout(): Promise<{
+  readonly fingerprint: string
+  readonly manifest: readonly ManifestEntry[]
+}> {
+  await setupCleanCheckout()
+  await writeFile(join(destPathFor(), 'leftover.txt'), 'left behind by a run\n')
+  const preview = await previewRecovery(req(), deps())
+  if (preview.kind !== 'ok') throw new Error('unreachable')
+  return {fingerprint: preview.preview.fingerprint, manifest: await buildContentManifest(destPathFor())}
+}
+
+/** Everything a pre-quarantine abort must leave exactly as it found it. */
+async function expectNothingMoved(manifest: readonly ManifestEntry[]): Promise<void> {
+  expect(await buildContentManifest(destPathFor())).toEqual(manifest)
+  const stagingDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, 'staging')
+  const leftoverStaging = existsSync(stagingDir)
+    ? (await readdir(stagingDir)).filter(n => n.startsWith('recover-'))
+    : []
+  expect(leftoverStaging).toEqual([])
+  expect(existsSync(join(reposRoot, WORKSPACE_STATE_DIR_NAME, 'quarantine', `${OWNER}__${REPO}`))).toBe(false)
+  const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
+  expect((await readJournal(journalsDir, OWNER, REPO)).ok).toBe(false)
+}
+
+const ABORTED_RESULT = {kind: 'failed', reason: 'build-failed'} as const
+
+describe('executeRecovery \u2014 run attribution', () => {
+  it.skipIf(!OPENSSL_AVAILABLE)(
+    'records the triggering run id in metadata.json, and listBackups reports it',
+    async () => {
+      // #given
+      const {fingerprint} = await setupDirtyCheckout()
+      const fixture = await setupNetworkFixture()
+      try {
+        // #when
+        const result = await executeRecovery(
+          {...recoverReq(fixture), fingerprint, runId: ATTRIBUTION_RUN_ID},
+          recoveryDeps(fixture),
+        )
+
+        // #then
+        if (result.kind !== 'ok') throw new Error(`unreachable: ${JSON.stringify(result)}`)
+        const metadataPath = join(
+          reposRoot,
+          WORKSPACE_STATE_DIR_NAME,
+          'quarantine',
+          `${OWNER}__${REPO}`,
+          result.recoveryId,
+          'metadata.json',
+        )
+        const metadata = JSON.parse(await readFile(metadataPath, 'utf8')) as {runId?: string; source: string}
+        expect(metadata.runId).toBe(ATTRIBUTION_RUN_ID)
+        expect(metadata.source).toBe('recovery')
+        const listed = await listBackups(OWNER, REPO, {reposRoot, uid: process.getuid?.(), gid: process.getgid?.()})
+        expect(listed.kind === 'ok' ? listed.backups : []).toEqual([
+          expect.objectContaining({id: result.recoveryId, runId: ATTRIBUTION_RUN_ID}),
+        ])
+      } finally {
+        await fixture.close()
+      }
+    },
+  )
+
+  it.skipIf(!OPENSSL_AVAILABLE)('writes no runId key when the request carries none (manual recovery)', async () => {
+    // #given
+    const {fingerprint} = await setupDirtyCheckout()
+    const fixture = await setupNetworkFixture()
+    try {
+      // #when
+      const result = await executeRecovery({...recoverReq(fixture), fingerprint}, recoveryDeps(fixture))
+
+      // #then
+      if (result.kind !== 'ok') throw new Error(`unreachable: ${JSON.stringify(result)}`)
+      const metadataPath = join(
+        reposRoot,
+        WORKSPACE_STATE_DIR_NAME,
+        'quarantine',
+        `${OWNER}__${REPO}`,
+        result.recoveryId,
+        'metadata.json',
+      )
+      expect(JSON.parse(await readFile(metadataPath, 'utf8'))).not.toHaveProperty('runId')
+    } finally {
+      await fixture.close()
+    }
+  })
+
+  it.skipIf(!OPENSSL_AVAILABLE)('records the run id on an interrupted-update takeover generation too', async () => {
+    // #given an interrupted update journal, which recovery takes over
+    await setupCleanCheckout()
+    const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
+    await writeJournal(journalsDir, {
+      kind: 'update',
+      owner: OWNER,
+      repo: REPO,
+      phase: 'applying',
+      fromSha: '0'.repeat(40),
+      toSha: '1'.repeat(40),
+      startedAt: new Date().toISOString(),
+    })
+    const preview = await previewRecovery(req(), deps())
+    if (preview.kind !== 'recoverable-update') throw new Error('unreachable')
+    const fixture = await setupNetworkFixture()
+    try {
+      // #when
+      const result = await executeRecovery(
+        {...recoverReq(fixture), fingerprint: preview.update.fingerprint, runId: ATTRIBUTION_RUN_ID},
+        recoveryDeps(fixture),
+      )
+
+      // #then
+      if (result.kind !== 'ok') throw new Error(`unreachable: ${JSON.stringify(result)}`)
+      const listed = await listBackups(OWNER, REPO, {reposRoot, uid: process.getuid?.(), gid: process.getgid?.()})
+      expect(listed.kind === 'ok' ? listed.backups : []).toEqual([
+        expect.objectContaining({id: result.recoveryId, runId: ATTRIBUTION_RUN_ID}),
+      ])
+    } finally {
+      await fixture.close()
+    }
+  })
+})
+
+describe('executeRecovery \u2014 client abort before quarantine rolls back', () => {
+  it.skipIf(!OPENSSL_AVAILABLE)('an already-aborted signal stops at entry, before any git or walk runs', async () => {
+    // #given
+    const {fingerprint, manifest} = await setupDirtyCheckout()
+    const fixture = await setupNetworkFixture()
+    try {
+      const {runner, calls} = makeGitRunnerSpy()
+      let walkCalls = 0
+      const walkRunner: AgentWalkRunner = async options => {
+        walkCalls += 1
+        return runAgentWalk(options)
+      }
+      const controller = new AbortController()
+      controller.abort()
+
+      // #when
+      const result = await executeRecovery(
+        {...recoverReq(fixture), fingerprint},
+        recoveryDeps(fixture, {gitRunner: runner, walkRunner, signal: controller.signal}),
+      )
+
+      // #then
+      expect(result).toEqual(ABORTED_RESULT)
+      expect(calls).toEqual([])
+      expect(walkCalls).toBe(0)
+      await expectNothingMoved(manifest)
+    } finally {
+      await fixture.close()
+    }
+  })
+
+  it.skipIf(!OPENSSL_AVAILABLE)('an abort during the preflight stops before the fetch store is touched', async () => {
+    // #given the abort fires from inside the free-space check, the last step of the preflight
+    const {fingerprint, manifest} = await setupDirtyCheckout()
+    const fixture = await setupNetworkFixture()
+    try {
+      const controller = new AbortController()
+      const callsAfterAbort: (readonly string[])[] = []
+      const gitRunner: GitRunnerFn = async (args, options) => {
+        if (controller.signal.aborted) callsAfterAbort.push(args)
+        return runGit(args, options)
+      }
+      const statfsFn = async () => {
+        controller.abort()
+        return {bavail: 1_000_000_000, bsize: 4096}
+      }
+
+      // #when
+      const result = await executeRecovery(
+        {...recoverReq(fixture), fingerprint},
+        recoveryDeps(fixture, {gitRunner, statfsFn, signal: controller.signal}),
+      )
+
+      // #then
+      expect(result).toEqual(ABORTED_RESULT)
+      expect(callsAfterAbort).toEqual([])
+      await expectNothingMoved(manifest)
+    } finally {
+      await fixture.close()
+    }
+  })
+
+  it.skipIf(!OPENSSL_AVAILABLE)(
+    'an abort during the fetch kills the in-flight git and leaves everything intact',
+    async () => {
+      // #given the abort fires as the first network call starts
+      const {fingerprint, manifest} = await setupDirtyCheckout()
+      const fixture = await setupNetworkFixture()
+      try {
+        const controller = new AbortController()
+        const seenSignals: (AbortSignal | undefined)[] = []
+        const gitRunner: GitRunnerFn = async (args, options) => {
+          if (args.includes('ls-remote')) {
+            seenSignals.push(options.signal)
+            controller.abort()
+          }
+          return runGit(args, options)
+        }
+
+        // #when
+        const result = await executeRecovery(
+          {...recoverReq(fixture), fingerprint},
+          recoveryDeps(fixture, {gitRunner, signal: controller.signal}),
+        )
+
+        // #then the signal reached the network git call, and nothing durable was created
+        expect(seenSignals).toEqual([controller.signal])
+        expect(result).toEqual(ABORTED_RESULT)
+        await expectNothingMoved(manifest)
+      } finally {
+        await fixture.close()
+      }
+    },
+  )
+
+  it.skipIf(!OPENSSL_AVAILABLE)('an abort landing after the fetch completed stops before staging begins', async () => {
+    // #given the final re-observe (the 2nd ls-remote) succeeds, then the abort fires
+    const {fingerprint, manifest} = await setupDirtyCheckout()
+    const fixture = await setupNetworkFixture()
+    try {
+      const controller = new AbortController()
+      let lsRemoteCalls = 0
+      const initCalls: (readonly string[])[] = []
+      const gitRunner: GitRunnerFn = async (args, options) => {
+        // the bare fetch store is `init --bare`; the staging checkout is a plain `init`
+        if (args.includes('init') && !args.includes('--bare')) initCalls.push(args)
+        const outcome = await runGit(args, options)
+        if (args.includes('ls-remote')) {
+          lsRemoteCalls += 1
+          if (lsRemoteCalls === 2) controller.abort()
+        }
+        return outcome
+      }
+
+      // #when
+      const result = await executeRecovery(
+        {...recoverReq(fixture), fingerprint},
+        recoveryDeps(fixture, {gitRunner, signal: controller.signal}),
+      )
+
+      // #then no staging checkout was ever initialised, and no journal was written
+      expect(lsRemoteCalls).toBe(2)
+      expect(result).toEqual(ABORTED_RESULT)
+      expect(initCalls).toEqual([])
+      await expectNothingMoved(manifest)
+    } finally {
+      await fixture.close()
+    }
+  })
+
+  it.skipIf(!OPENSSL_AVAILABLE)(
+    'an abort during install-staging removes staging and the building journal',
+    async () => {
+      // #given the abort fires as the pack import (the staging build) starts
+      const {fingerprint, manifest} = await setupDirtyCheckout()
+      const fixture = await setupNetworkFixture()
+      try {
+        const controller = new AbortController()
+        const packStreamRunner: NonNullable<ExecuteRecoveryDeps['packStreamRunner']> = async options => {
+          controller.abort()
+          return runPackStream(options)
+        }
+        let handoffs = 0
+        handoffHook.after = () => {
+          handoffs += 1
+        }
+
+        // #when
+        const result = await executeRecovery(
+          {...recoverReq(fixture), fingerprint},
+          recoveryDeps(fixture, {packStreamRunner, signal: controller.signal}),
+        )
+
+        // #then the abort is honoured right after the build (no handoff ran), staging and the journal
+        // are gone, and the original is byte-identical
+        expect(result).toEqual(ABORTED_RESULT)
+        expect(handoffs).toBe(0)
+        await expectNothingMoved(manifest)
+      } finally {
+        await fixture.close()
+      }
+    },
+  )
+
+  it.skipIf(!OPENSSL_AVAILABLE)(
+    'an abort right after the handoff is the last honoured one and still rolls back',
+    async () => {
+      // #given the abort fires the moment the staged tree has been handed to the agent identity
+      const {fingerprint, manifest} = await setupDirtyCheckout()
+      const fixture = await setupNetworkFixture()
+      try {
+        const controller = new AbortController()
+        handoffHook.after = () => controller.abort()
+
+        // #when
+        const result = await executeRecovery(
+          {...recoverReq(fixture), fingerprint},
+          recoveryDeps(fixture, {signal: controller.signal}),
+        )
+
+        // #then
+        expect(result).toEqual(ABORTED_RESULT)
+        await expectNothingMoved(manifest)
+      } finally {
+        await fixture.close()
+      }
+    },
+  )
+
+  it.skipIf(!OPENSSL_AVAILABLE)(
+    'an abort restores a superseded update journal, like any pre-quarantine failure',
+    async () => {
+      // #given an interrupted update that this recovery would take over, aborted mid-build
+      await setupCleanCheckout()
+      const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
+      const updateJournal = {
+        kind: 'update' as const,
+        owner: OWNER,
+        repo: REPO,
+        phase: 'applying' as const,
+        fromSha: '0'.repeat(40),
+        toSha: '1'.repeat(40),
+        startedAt: new Date().toISOString(),
+      }
+      await writeJournal(journalsDir, updateJournal)
+      const preview = await previewRecovery(req(), deps())
+      if (preview.kind !== 'recoverable-update') throw new Error('unreachable')
+      const fixture = await setupNetworkFixture()
+      try {
+        const controller = new AbortController()
+        handoffHook.after = () => controller.abort()
+
+        // #when
+        const result = await executeRecovery(
+          {...recoverReq(fixture), fingerprint: preview.update.fingerprint},
+          recoveryDeps(fixture, {signal: controller.signal}),
+        )
+
+        // #then the update journal (and its needs-recovery barrier) survives untouched
+        expect(result).toEqual(ABORTED_RESULT)
+        expect(await readJournal(journalsDir, OWNER, REPO)).toEqual({ok: true, journal: updateJournal})
+      } finally {
+        await fixture.close()
+      }
+    },
+  )
+})
+
+describe('executeRecovery \u2014 an abort past the last boundary is ignored and the recovery completes', () => {
+  it.skipIf(!OPENSSL_AVAILABLE)(
+    'an abort during the pre-rename measurement still quarantines and installs',
+    async () => {
+      // #given the abort fires from the walk quarantine runs right before the rename
+      const {fingerprint} = await setupDirtyCheckout()
+      const fixture = await setupNetworkFixture()
+      try {
+        const controller = new AbortController()
+        let walkCalls = 0
+        const walkRunner: AgentWalkRunner = async options => {
+          walkCalls += 1
+          // 1st walk = confirm-time preview re-derivation; 2nd = quarantine's own pre-rename walk
+          if (walkCalls === 2) controller.abort()
+          return runAgentWalk(options)
+        }
+
+        // #when
+        const result = await executeRecovery(
+          {...recoverReq(fixture), fingerprint},
+          recoveryDeps(fixture, {walkRunner, signal: controller.signal}),
+        )
+
+        // #then
+        expect(walkCalls).toBeGreaterThanOrEqual(2)
+        expect(result.kind).toBe('ok')
+        if (result.kind !== 'ok') throw new Error('unreachable')
+        expect(existsSync(destPathFor())).toBe(true)
+        expect(gitSync(destPathFor(), ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim()).toBe(fixture.headSha)
+      } finally {
+        await fixture.close()
+      }
+    },
+  )
+
+  it.skipIf(!OPENSSL_AVAILABLE)(
+    'an abort between the last boundary and the quarantine rename does not stop the recovery',
+    async () => {
+      // #given the abort fires on the first clock read after the handoff: the `quarantining` journal's
+      // timestamp, i.e. after the last honoured boundary and before the rename
+      const {fingerprint} = await setupDirtyCheckout()
+      const fixture = await setupNetworkFixture()
+      try {
+        const controller = new AbortController()
+        let handedOff = false
+        handoffHook.after = () => {
+          handedOff = true
+        }
+        const now = () => {
+          if (handedOff) controller.abort()
+          return new Date()
+        }
+
+        // #when
+        const result = await executeRecovery(
+          {...recoverReq(fixture), fingerprint},
+          recoveryDeps(fixture, {now, signal: controller.signal}),
+        )
+
+        // #then
+        expect(controller.signal.aborted).toBe(true)
+        expect(result.kind).toBe('ok')
+        expect(gitSync(destPathFor(), ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim()).toBe(fixture.headSha)
+      } finally {
+        await fixture.close()
+      }
+    },
+  )
+
+  it.skipIf(!OPENSSL_AVAILABLE)('an abort after the quarantine rename does not stop the recovery', async () => {
+    // #given the abort fires on the first post-install verification git call, i.e. after the rename
+    const {fingerprint} = await setupDirtyCheckout()
+    const fixture = await setupNetworkFixture()
+    try {
+      const controller = new AbortController()
+      const gitRunner: GitRunnerFn = async (args, options) => {
+        if (args.includes('HEAD^{commit}')) controller.abort()
+        return runGit(args, options)
+      }
+
+      // #when
+      const result = await executeRecovery(
+        {...recoverReq(fixture), fingerprint},
+        recoveryDeps(fixture, {gitRunner, signal: controller.signal}),
+      )
+
+      // #then the generation is preserved, the fresh checkout is installed and verified, no journal remains
+      expect(controller.signal.aborted).toBe(true)
+      expect(result.kind).toBe('ok')
+      if (result.kind !== 'ok') throw new Error('unreachable')
+      const envelope = join(reposRoot, WORKSPACE_STATE_DIR_NAME, 'quarantine', `${OWNER}__${REPO}`, result.recoveryId)
+      expect(await readFile(join(envelope, 'checkout', 'leftover.txt'), 'utf8')).toBe('left behind by a run\n')
+      expect(gitSync(destPathFor(), ['rev-parse', 'HEAD'], isolatedGitEnv(checkoutHome)).trim()).toBe(fixture.headSha)
+      const journalsDir = join(reposRoot, WORKSPACE_STATE_DIR_NAME, JOURNAL_DIR_NAME)
+      expect((await readJournal(journalsDir, OWNER, REPO)).ok).toBe(false)
+    } finally {
+      await fixture.close()
+    }
+  })
 })

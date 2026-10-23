@@ -1,6 +1,7 @@
 import type {Mock} from 'vitest'
 import type {CloneHandlerResult} from './clone.js'
 import type {InspectHandlerResult} from './inspect.js'
+import type {ExecuteRecoveryDeps} from './recover.js'
 import type {
   CloneExecutorFn,
   DeleteBackupExecutorFn,
@@ -13,6 +14,7 @@ import type {
 } from './server.js'
 import type {
   DeleteBackupResult,
+  ExecuteRecoveryRequest,
   ExecuteRecoveryResult,
   ListBackupsResult,
   PreviewRecoveryResult,
@@ -1976,6 +1978,120 @@ describe('POST /recover — result → status mapping', () => {
     const app = appWithoutAuth({executeRecoveryExecutor: makeExecuteRecoveryExecutor(result)})
     const res = await postRecover(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN, fingerprint: 'abc'})
     expect(res.status).toBe(503)
+  })
+})
+
+describe('POST /recover — run attribution and signal plumbing', () => {
+  const RUN_ID = '3f2b8c1e-5d4a-4b7e-9a10-6c2d8e4f1a23'
+
+  it('passes a valid runId through on the request handed to the executor', async () => {
+    // #given
+    const executeRecoveryExecutor = makeExecuteRecoveryExecutor({kind: 'no-checkout'})
+    const app = appWithoutAuth({executeRecoveryExecutor})
+
+    // #when
+    const res = await postRecover(app, {
+      owner: 'fro-bot',
+      repo: 'agent',
+      token: VALID_TOKEN,
+      fingerprint: 'abc',
+      runId: RUN_ID,
+    })
+
+    // #then
+    expect(res.status).toBe(404)
+    expect(executeRecoveryExecutor).toHaveBeenCalledTimes(1)
+    expect(executeRecoveryExecutor.mock.calls[0]?.[0]).toEqual({
+      owner: 'fro-bot',
+      repo: 'agent',
+      token: VALID_TOKEN,
+      fingerprint: 'abc',
+      runId: RUN_ID,
+    })
+  })
+
+  it('omits runId from the executor request when the body carries none', async () => {
+    // #given
+    const executeRecoveryExecutor = makeExecuteRecoveryExecutor({kind: 'no-checkout'})
+    const app = appWithoutAuth({executeRecoveryExecutor})
+
+    // #when
+    await postRecover(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN, fingerprint: 'abc'})
+
+    // #then
+    expect(executeRecoveryExecutor.mock.calls[0]?.[0]).not.toHaveProperty('runId')
+  })
+
+  it.each([
+    ['an empty string', ''],
+    ['a path-traversal string', '../../etc/passwd'],
+    ['a string with whitespace', 'run id'],
+    ['a markdown/control injection', '`x`\n'],
+    ['a string over 128 chars', 'a'.repeat(129)],
+    ['a number', 42],
+    ['null', null],
+    ['an object', {id: RUN_ID}],
+  ])('rejects %s as a runId with a fixed 400 and never invokes the executor', async (_label, runId) => {
+    // #given
+    const executeRecoveryExecutor = makeExecuteRecoveryExecutor({kind: 'no-checkout'})
+    const app = appWithoutAuth({executeRecoveryExecutor})
+
+    // #when
+    const res = await postRecover(app, {
+      owner: 'fro-bot',
+      repo: 'agent',
+      token: VALID_TOKEN,
+      fingerprint: 'abc',
+      runId,
+    })
+
+    // #then
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({ok: false, error: 'invalid-run-id'})
+    expect(executeRecoveryExecutor).not.toHaveBeenCalled()
+  })
+
+  it('passes c.req.raw.signal through to the recovery executor deps', async () => {
+    // #given
+    let capturedSignal: AbortSignal | undefined
+    const executeRecoveryExecutor = vi.fn(async (_request: ExecuteRecoveryRequest, deps?: ExecuteRecoveryDeps) => {
+      capturedSignal = deps?.signal
+      return {kind: 'no-checkout'} satisfies ExecuteRecoveryResult
+    }) as ExecuteRecoveryExecutorFn & ReturnType<typeof vi.fn>
+    const app = appWithoutAuth({executeRecoveryExecutor})
+
+    // #when
+    await postRecover(app, {owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN, fingerprint: 'abc'})
+
+    // #then
+    expect(capturedSignal).toBeInstanceOf(AbortSignal)
+  })
+
+  it('an already-aborted client request reaches the recovery executor with an aborted signal', async () => {
+    // #given
+    let capturedSignal: AbortSignal | undefined
+    const executeRecoveryExecutor = vi.fn(async (_request: ExecuteRecoveryRequest, deps?: ExecuteRecoveryDeps) => {
+      capturedSignal = deps?.signal
+      return {kind: 'no-checkout'} satisfies ExecuteRecoveryResult
+    }) as ExecuteRecoveryExecutorFn & ReturnType<typeof vi.fn>
+    const app = appWithoutAuth({executeRecoveryExecutor})
+    const controller = new AbortController()
+    controller.abort()
+
+    // #when
+    const bodyStr = JSON.stringify({owner: 'fro-bot', repo: 'agent', token: VALID_TOKEN, fingerprint: 'abc'})
+    await app.request('/recover', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': String(new TextEncoder().encode(bodyStr).length),
+      },
+      body: bodyStr,
+      signal: controller.signal,
+    })
+
+    // #then
+    expect(capturedSignal?.aborted).toBe(true)
   })
 })
 

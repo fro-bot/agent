@@ -117,6 +117,12 @@ export interface ExecuteRecoveryDeps {
   readonly statfsFn?: RecoveryStatfsFn
   readonly mkdtempFn?: (prefix: string) => Promise<string>
   readonly recoveryIdFn?: () => string
+  /**
+   * Client abort signal. Honored at every phase boundary up to the quarantine rename (entry, after the
+   * quota/disk preflight, through the fetch, after the staging build, after the ownership handoff);
+   * ignored from the `quarantining` journal write onward, where stopping halfway is worse than finishing.
+   */
+  readonly signal?: AbortSignal
 }
 
 /** Minimal free-space shape this module needs — avoids `fs.promises.statfs`'s bigint-overload union. */
@@ -515,6 +521,7 @@ type FetchRecoveryTargetOutcome =
   | {readonly kind: 'ok'; readonly branch: string; readonly sha: string}
   | {readonly kind: 'failed'; readonly reason: RemoteFailureReason}
   | {readonly kind: 'timeout'}
+  | {readonly kind: 'aborted'}
   | {readonly kind: 'unconfirmed'}
 
 /**
@@ -529,17 +536,23 @@ async function fetchRecoveryTarget(params: {
   readonly remoteUrl: string
   readonly gitRunner: GitRunnerFn
   readonly deadline: Deadline
+  readonly signal: AbortSignal | undefined
 }): Promise<FetchRecoveryTargetOutcome> {
-  const {profile, remoteUrl, gitRunner, deadline} = params
+  const {profile, remoteUrl, gitRunner, deadline, signal} = params
+  // A function, not a repeated `signal?.aborted` read: TS would narrow the property across the awaits below.
+  const isAborted = (): boolean => signal?.aborted === true
+  if (isAborted()) return {kind: 'aborted'}
   if (deadline.expired()) return {kind: 'timeout'}
-  const first = await observeRemoteDefaultBranch(profile, remoteUrl, gitRunner, deadline.remainingMs(), undefined)
+  const first = await observeRemoteDefaultBranch(profile, remoteUrl, gitRunner, deadline.remainingMs(), signal)
   if (first.kind === 'unconfirmed') return {kind: 'unconfirmed'}
-  if (first.kind === 'timeout' || first.kind === 'aborted') return {kind: 'timeout'}
+  if (first.kind === 'aborted') return {kind: 'aborted'}
+  if (first.kind === 'timeout') return {kind: 'timeout'}
   if (first.kind === 'failed') return {kind: 'failed', reason: first.reason}
 
   const branch = first.observation.branch
   let previousSha = first.observation.sha
   for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (isAborted()) return {kind: 'aborted'}
     if (deadline.expired()) return {kind: 'timeout'}
     const fetched = await fetchIntoRef(
       profile,
@@ -547,22 +560,18 @@ async function fetchRecoveryTarget(params: {
       `+${branch}:refs/heads/${branch}`,
       gitRunner,
       deadline.remainingMs(),
-      undefined,
+      signal,
     )
     if (fetched.kind === 'unconfirmed') return {kind: 'unconfirmed'}
-    if (fetched.kind === 'timeout' || fetched.kind === 'aborted') return {kind: 'timeout'}
+    if (fetched.kind === 'aborted') return {kind: 'aborted'}
+    if (fetched.kind === 'timeout') return {kind: 'timeout'}
     if (fetched.kind === 'failed') return {kind: 'failed', reason: fetched.reason}
 
     if (deadline.expired()) return {kind: 'timeout'}
-    const reobserved = await observeRemoteDefaultBranch(
-      profile,
-      remoteUrl,
-      gitRunner,
-      deadline.remainingMs(),
-      undefined,
-    )
+    const reobserved = await observeRemoteDefaultBranch(profile, remoteUrl, gitRunner, deadline.remainingMs(), signal)
     if (reobserved.kind === 'unconfirmed') return {kind: 'unconfirmed'}
-    if (reobserved.kind === 'timeout' || reobserved.kind === 'aborted') return {kind: 'timeout'}
+    if (reobserved.kind === 'aborted') return {kind: 'aborted'}
+    if (reobserved.kind === 'timeout') return {kind: 'timeout'}
     if (reobserved.kind === 'failed') return {kind: 'failed', reason: reobserved.reason}
     if (reobserved.observation.sha === previousSha) return {kind: 'ok', branch, sha: reobserved.observation.sha}
     previousSha = reobserved.observation.sha
@@ -669,6 +678,7 @@ async function quarantineExistingCheckout(params: {
   readonly source: QuarantineSource
   readonly originalHeadSha: string | undefined
   readonly originalBranch: string | undefined
+  readonly runId: string | undefined
   readonly now: () => Date
   readonly walkRunner: AgentWalkRunner
   readonly sealedWalkRunner: SealedWalkRunner
@@ -677,7 +687,7 @@ async function quarantineExistingCheckout(params: {
   readonly uid: number | undefined
   readonly gid: number | undefined
 }): Promise<'ok' | 'failed' | 'termination-unconfirmed'> {
-  const {reposRoot, owner, repo, recoveryId, checkoutPath, source, originalHeadSha, originalBranch, now} = params
+  const {reposRoot, owner, repo, recoveryId, checkoutPath, source, originalHeadSha, originalBranch, runId, now} = params
   const {walkRunner, sealedWalkRunner, walkMaxEntries, walkDeadlineMs, uid, gid} = params
   const envelopePath = envelopePathFor(reposRoot, owner, repo, recoveryId)
   const envelopeCheckoutPath = join(envelopePath, QUARANTINE_CHECKOUT_DIR_NAME)
@@ -744,6 +754,7 @@ async function quarantineExistingCheckout(params: {
     source,
     ...(originalHeadSha === undefined ? {} : {originalHeadSha}),
     ...(originalBranch === undefined ? {} : {originalBranch}),
+    ...(runId === undefined ? {} : {runId}),
   }
   return writeQuarantineMetadata(envelopePath, fullMetadata)
 }
@@ -873,6 +884,8 @@ async function reconcileOneRecoveryJournal(params: {
         source: 'reconciliation',
         originalHeadSha: undefined,
         originalBranch: undefined,
+        // The recovery journal carries no run id, so a crash-reconciled generation is unattributed.
+        runId: undefined,
         now,
         walkRunner,
         sealedWalkRunner,
@@ -1110,6 +1123,8 @@ interface RecoveryMutationContext {
   readonly diskHeadroomMultiplier: number
   readonly statfsFn: RecoveryStatfsFn
   readonly recoveryId: string
+  readonly runId: string | undefined
+  readonly signal: AbortSignal | undefined
 }
 
 /**
@@ -1120,7 +1135,16 @@ interface RecoveryMutationContext {
  */
 async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<ExecuteRecoveryResult> {
   const {owner, repo, token, fingerprint, reposRoot, journalsDir, checkoutPath, tracker, recoveryId} = ctx
-  const {timeoutMs, uid, gid, now, walkDeadlineMs, walkMaxEntries, monotonicNow} = ctx
+  const {timeoutMs, uid, gid, now, walkDeadlineMs, walkMaxEntries, monotonicNow, signal} = ctx
+  // A client abort is reported as the existing pre-quarantine `build-failed` (its gateway rendering,
+  // "the original checkout is untouched", is exactly right) rather than a new wire reason: the caller
+  // that aborted has already gone, so nothing reads this, and a new reason would widen the
+  // gateway/workspace contract for no reader.
+  const abortedResult: ExecuteRecoveryResult = {kind: 'failed', reason: 'build-failed'}
+  const isAborted = (): boolean => signal?.aborted === true
+
+  // Boundary 1 — entry: nothing has run or moved yet.
+  if (isAborted()) return abortedResult
   const gitRunner = tracker.gitRunner
   const packStreamRunner = tracker.packStreamRunner
   const walkRunner = tracker.walkRunner
@@ -1201,6 +1225,9 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
   })
   if (preflight.kind !== 'ok') return preflight
 
+  // Boundary 2 — after the quota/disk preflight, before the fetch store, any journal read or write.
+  if (isAborted()) return abortedResult
+
   // (F3) Re-reads the journal (still under this call's repo lock — unchanged since the preview
   // above) to capture the FULL original update journal this recovery is about to supersede, so it
   // can be RESTORED (never merely deleted) if this recovery fails or crashes before quarantine.
@@ -1223,6 +1250,17 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
 
   const askpassDir = await mkdtemp(join(tmpdir(), 'workspace-agent-recover-askpass-'))
   const stagingPath = stagingPathFor(reposRoot, recoveryId)
+  // Same rollback a confirmed pre-quarantine failure performs: remove staging, then restore any
+  // superseded update journal (or drop the `building` journal). If staging removal itself fails, the
+  // journal stays exactly as this recovery left it, for startup reconciliation to resolve.
+  const rollbackAbortedBuild = async (): Promise<void> => {
+    try {
+      await rm(stagingPath, {recursive: true, force: true})
+      await rollbackBuildJournal(journalsDir, owner, repo, supersededUpdate)
+    } catch {
+      // journal stays in place
+    }
+  }
   let target: {readonly branch: string; readonly sha: string}
   try {
     const askpassPath = await ctx.askpassWriter(askpassDir)
@@ -1238,9 +1276,14 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
     const remoteUrl = `${ctx.remoteBaseUrl}/${owner}/${repo}.git`
     const deadline = createDeadline(ctx.networkBudgetMs, monotonicNow)
     tracker.setDeadline(deadline)
-    const fetched = await fetchRecoveryTarget({profile, remoteUrl, gitRunner, deadline})
+    // Boundary 3 — the fetch: `signal` reaches every network git call (an in-flight ls-remote/fetch
+    // is killed), and the outcome is re-checked here in case the abort landed after the last call
+    // completed. No journal or staging exists yet; the bare fetch store is root-owned and self-healing.
+    const fetched = await fetchRecoveryTarget({profile, remoteUrl, gitRunner, deadline, signal})
     tracker.setDeadline(undefined)
+    if (fetched.kind === 'aborted') return abortedResult
     if (fetched.kind !== 'ok') return {kind: 'failed', reason: 'fetch-failed'}
+    if (isAborted()) return abortedResult
     target = fetched
 
     // (E2) ATOMIC HAND-OVER: journal.ts keeps exactly one journal file per repository
@@ -1298,6 +1341,11 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
       return {kind: 'failed', reason: 'build-failed'}
     }
     if (built.kind !== 'ok') return {kind: 'failed', reason: 'build-failed'}
+    // Boundary 4 — after the staging build: roll back exactly like a confirmed build failure.
+    if (isAborted()) {
+      await rollbackAbortedBuild()
+      return abortedResult
+    }
   } finally {
     await rm(askpassDir, {recursive: true, force: true}).catch(() => {})
   }
@@ -1321,6 +1369,14 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
       // journal stays in place
     }
     return {kind: 'failed', reason: 'build-failed'}
+  }
+
+  // Boundary 5 — after the ownership handoff, the LAST honoured abort. Once the `quarantining`
+  // journal is written below, the recovery runs to completion whatever the client does: an abort
+  // between the original's rename and the fresh checkout's install would strand the repository.
+  if (isAborted()) {
+    await rollbackAbortedBuild()
+    return abortedResult
   }
 
   await writeJournal(journalsDir, {
@@ -1347,6 +1403,7 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
       source: preview.kind === 'ok' ? 'recovery' : 'interrupted-update',
       originalHeadSha: preview.kind === 'ok' && preview.preview.inspectionSafe ? preview.preview.headSha : undefined,
       originalBranch: preview.kind === 'ok' && preview.preview.inspectionSafe ? preview.preview.branch : undefined,
+      runId: ctx.runId,
       now,
       walkRunner,
       sealedWalkRunner,
@@ -1414,6 +1471,11 @@ async function runRecoveryMutation(ctx: RecoveryMutationContext): Promise<Execut
  * place, exactly like update.ts's `executeUpdate`. The hold check runs in a `finally` so it fires
  * even if a later step throws, not only on an ordinary return (review round: "a return-only choke
  * point misses exceptions").
+ *
+ * `deps.signal` (the client's abort) is honored at five phase boundaries up to the quarantine rename
+ * — entry, after the quota/disk preflight, through the fetch, after the staging build, and after
+ * the ownership handoff — each rolling back exactly like a confirmed pre-quarantine failure. It is
+ * ignored from the `quarantining` journal write onward.
  */
 export async function executeRecovery(
   request: ExecuteRecoveryRequest,
@@ -1440,6 +1502,7 @@ export async function executeRecovery(
     diskHeadroomMultiplier = DEFAULT_DISK_HEADROOM_MULTIPLIER,
     statfsFn = defaultStatfs,
     recoveryIdFn = randomUUID,
+    signal,
   } = deps
   const {timeoutMs = DEFAULT_LOCAL_TIMEOUT_MS, uid = AGENT_UID, gid = AGENT_GID} = options
   const {owner, repo} = request
@@ -1490,6 +1553,8 @@ export async function executeRecovery(
           diskHeadroomMultiplier,
           statfsFn,
           recoveryId: recoveryIdFn(),
+          runId: request.runId,
+          signal,
         }),
       (): ExecuteRecoveryResult => ({kind: 'failed', reason: 'termination-unconfirmed'}),
     )
