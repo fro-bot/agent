@@ -123,6 +123,13 @@ function cacheSaveResultRemediation(
 }
 
 /**
+ * Why the post-action retry does not publish to the object store: the main step releases the coordination
+ * lease before this step runs, and the shared session object is written with an unconditional upload.
+ */
+export const STORE_PUBLISH_WITHHELD_NOTE =
+  'The object store was not written by the post-action retry: the main step already released the coordination lease, and publishing the session without it could overwrite a newer session from a later run. Only the Actions cache was retried.'
+
+/**
  * Writes a standalone job-summary row reporting whether session state persisted this run.
  * Deliberately separate from `writeJobSummary`: the outcome is only known once `saveCache`
  * runs in `cleanup.ts`, which executes after `runFinalizeWithResult` (the caller of
@@ -142,6 +149,7 @@ export async function writeCacheSaveResultSummary(
   phase: 'main' | 'post-retry' | 'post-skip-safety',
   logger: Logger,
   declineReason?: string,
+  storePublishWithheld = false,
 ): Promise<void> {
   try {
     const value = toCacheSaveStateValue(result)
@@ -157,6 +165,10 @@ export async function writeCacheSaveResultSummary(
         {data: 'Value', header: true},
       ],
       ['Cache Save Result', formatCacheSaveResult(value)],
+      // Only the post-action retry withholds the publish: the main step released the coordination lease, and
+      // an unleased upload of the shared session object could overwrite a newer one. Reported next to the
+      // cache result so a reader sees what the retry did NOT do.
+      ...(storePublishWithheld ? [['Object Store Publish', 'withheld (lease released)']] : []),
     ])
 
     const remediation = cacheSaveResultRemediation(result, phase)
@@ -171,6 +183,10 @@ export async function writeCacheSaveResultSummary(
     // shape. A reader must be able to tell WHY without reading logs, so this is not a
     // second channel -- it augments the same 'Session Persistence' row this function
     // always writes.
+    if (storePublishWithheld) {
+      core.summary.addRaw(`${htmlParagraph(STORE_PUBLISH_WITHHELD_NOTE)}\n`)
+    }
+
     if (declineReason != null && result.outcome === 'ownership-declined') {
       core.summary.addRaw(`${htmlParagraph(`${htmlStrong('Reason:')} ${htmlText(declineReason)}`)}\n`)
     }

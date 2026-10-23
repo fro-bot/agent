@@ -110,8 +110,9 @@ async function releaseOrphanedLock(logger: Logger): Promise<void> {
 export async function runPost(options: PostOptions = {}): Promise<void> {
   const logger = options.logger ?? createLogger({phase: 'post'})
 
-  // The lock is not renewed in this process and may already have expired, so holding it does not protect the
-  // persistence below. The release only frees a lock this run still owns, and runs after that work finishes or throws.
+  // The lock is not renewed in this process and may already have expired, so holding it does not protect any
+  // write below, which is why the persistence retry never publishes the session to the object store (only the
+  // Actions cache). The release only frees a lock this run still owns, and runs after that work finishes or throws.
   try {
     await persistRunState(logger)
   } finally {
@@ -152,8 +153,9 @@ async function persistRunState(logger: Logger): Promise<void> {
     //   justified by that database durability, NOT by an inference that retrying the cache
     //   write would fail again -- that futility argument is exactly the inference this
     //   plan's Key Technical Decisions reject (see cache-save-result.ts's CacheSaveOutcome
-    //   doc on cache-rejected). Repeating the save here would only repeat the store upload,
-    //   adding no durability.
+    //   doc on cache-rejected). The retry below never publishes to the object store, so
+    //   repeating the save here would only re-attempt the Actions cache write, which the
+    //   store already makes redundant for the database.
     // skipped: SKIP_CACHE=true -- a deliberate no-op; retrying would just repeat it.
     const skipReason =
       cacheSaved === 'durable'
@@ -228,6 +230,19 @@ async function persistRunState(logger: Logger): Promise<void> {
         projectIdPath,
         opencodeVersion,
         ...(storeConfig == null ? {} : {storeConfig}),
+        // The main step releases the coordination lease before this step runs (and a run that never held
+        // one has none), so this retry holds no lease. The object store keeps ONE shared session object per
+        // repo, written with an unconditional upload, so publishing from here could roll back a newer
+        // session a successor run already published. Only the Actions cache is retried.
+        objectStorePublish: 'withhold',
+      } as const
+
+      // Said before the save, so it is on record even when the cache write throws.
+      const storePublishWithheld = storeConfig?.enabled === true
+      if (storePublishWithheld) {
+        logger.info(
+          'Post-action withheld the object-store session publish: the main step has released the coordination lease, so only the Actions cache is retried',
+        )
       }
 
       const saveResult = await saveCache(cacheSaveOptions)
@@ -235,7 +250,7 @@ async function persistRunState(logger: Logger): Promise<void> {
       // The post hook cannot set `cache-save-result`: GitHub Actions `runs.post:` steps run
       // after every other step in the job, so no downstream step could ever read it even if
       // the write succeeded. The job summary is the only surface available here.
-      await writeCacheSaveResultSummary(saveResult, 'post-retry', logger)
+      await writeCacheSaveResultSummary(saveResult, 'post-retry', logger, undefined, storePublishWithheld)
 
       // "No cache content to save" is reserved for skipped-empty. Every other outcome gets
       // its own line naming it, so a checkpoint decline is distinguishable from a

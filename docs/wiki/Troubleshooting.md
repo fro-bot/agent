@@ -34,6 +34,7 @@ sources:
   - apps/workspace-agent/src/opencode-proxy.ts
   - docs/solutions/test-failures/gateway-operator-route-health-timeout-flake-2026-07-30.md
 summary: "Common failure symptoms and their causes across action execution, persistence, setup, and gateway runs"
+  - src/harness/post.ts
 ---
 
 # Troubleshooting
@@ -98,7 +99,7 @@ If sessions are not persisting between runs:
 4. Verify `skip-cache` is not set to `true`.
 5. Review run logs for cache-corruption warnings — a corrupted restore falls back to S3 when configured.
 
-Before guessing, read what the run actually reported. The `cache-save-result` output and the job summary name the persistence outcome directly: `durable` (the Actions cache write landed), `store-only` (the object store landed but the cache write did not), `skipped` (`skip-cache` was set), `declined-for-safety` (the save was refused before either backend was attempted), or `not-persisted` (nothing durable happened). A `store-only` result on a mention trigger is the expected, healthy shape once `s3-backup` is enabled — not a failure. A `not-persisted` result is the one worth investigating, and the job summary distinguishes its causes: a rejected write, a declined SQLite checkpoint, or no cacheable content found.
+Before guessing, read what the run actually reported. The `cache-save-result` output and the job summary name the persistence outcome directly: `durable` (the Actions cache write landed), `store-only` (the object store landed but the cache write did not), `skipped` (`skip-cache` was set), `declined-for-safety` (the save was refused before either backend was attempted), or `not-persisted` (nothing durable happened). A `store-only` result on a mention trigger is the expected, healthy shape once `s3-backup` is enabled — not a failure. A `not-persisted` result is the one worth investigating, and the job summary distinguishes its causes: a rejected write, a declined SQLite checkpoint, or no cacheable content found. The post-action retry writes the Actions cache only. With `s3-backup` enabled, its job-summary row also reads `Object Store Publish: withheld (lease released)` and the log carries `Post-action withheld the object-store session publish`: the main step already released the coordination lease, so the retry does not upload the session to the object store. A run whose main step did not reach the object store therefore leaves the store at the previous run's session.
 
 A `declined-for-safety` result is a different investigation than `not-persisted`, and re-running the job will not clear it on its own. It means cleanup could not confirm no other writer was still touching session state — unresolved background-subagent work, an OpenCode server shutdown that never confirmed the writer had stopped, or a failed coordination lease renewal — and the post-action hook deliberately does not retry it: it runs with less information than the step that declined, so it honors the refusal rather than guessing. A recurring `declined-for-safety` result points at one of those three causes, not at cache configuration.
 

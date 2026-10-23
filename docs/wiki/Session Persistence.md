@@ -30,6 +30,8 @@ sources:
   - RFCs/RFC-019-S3-Storage-Backend.md
   - ARCHITECTURE.md
 summary: "How agent memory survives across CI runs via cache, SDK sessions, S3 object store, and pruning"
+  - src/harness/post.ts
+  - src/services/cache/types.ts
 ---
 
 # Session Persistence
@@ -66,7 +68,7 @@ On restore, the cache module performs several safety checks:
 - **Version check** — Reads a `.version` file and compares against the expected `STORAGE_VERSION` constant. On mismatch, starts fresh to avoid format incompatibilities.
 - **Credential cleanup** — Deletes any `auth.json` that might have been accidentally included in a previous cache save. Credentials are ephemeral and should never persist.
 
-Cache saves happen twice: once during the cleanup phase of the main step, and again in the post-action hook (`post.ts`). The post-action hook exists because GitHub Actions may kill the main step's `finally` block, and losing cache would mean losing all session history.
+The Actions cache is saved up to twice: once during the cleanup phase of the main step, and again in the post-action hook (`post.ts`) when the first save did not persist. The post-action hook exists because GitHub Actions may kill the main step's `finally` block, and losing cache would mean losing all session history. The object store is written only by the main step, while the run holds the coordination lease: the store keeps one shared `sessions/opencode.db` per repo, written with an unconditional upload, and the post-action hook runs after the lease is released, so its retry passes `objectStorePublish: 'withhold'` to `saveCache` and writes the Actions cache alone.
 
 ### Trigger-specific cache write availability
 
@@ -76,7 +78,7 @@ This mapping from event to cache scope is attributed to a platform policy change
 
 The result is that a run can restore prior state successfully while its cache write is rejected. Mention-driven runs therefore read session state but may be unable to write their new state. This is a GitHub platform constraint, not a Fro Bot configuration bug. `s3-backup` defaults to `false`; enabling it with a configured bucket makes the object store the durable path for session state, and restore consults it before the Actions cache. Object-store sync is best-effort and non-fatal, so continuity depends on the upload succeeding. If the upload fails, the run still falls through to the Actions cache write, which may also be denied.
 
-`@actions/cache` hides both write denials and reservation collisions behind a `-1` sentinel instead of throwing, so the save path cannot distinguish those causes at that boundary. The cache write is therefore reported as not persisted rather than as a confident diagnosis. The post-action hook remains the retry path when the main-step save did not persist. What "did not persist" means precisely is the subject of the next section.
+`@actions/cache` hides both write denials and reservation collisions behind a `-1` sentinel instead of throwing, so the save path cannot distinguish those causes at that boundary. The cache write is therefore reported as not persisted rather than as a confident diagnosis. The post-action hook remains the Actions-cache retry path when the main-step save did not persist; it does not retry the object-store upload. What "did not persist" means precisely is the subject of the next section.
 
 ### What a Save Reports
 

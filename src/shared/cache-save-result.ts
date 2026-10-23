@@ -72,8 +72,9 @@ export interface CacheSaveResult {
  *   and unnecessary — skip.
  * - `store-only`: the cache write was rejected or errored, but the object store already
  *   persisted the same state. Skip is justified by **durability already achieved through
- *   the other backend**, not by predicting a cache retry would fail — repeating the save
- *   here would only repeat the store upload, not add durability. See the branch in
+ *   the other backend**, not by predicting a cache retry would fail — the post hook's
+ *   retry never publishes to the store, so repeating the save would only re-attempt the
+ *   cache write the store already makes redundant for the database. See the branch in
  *   `post.ts` for why this is not the futility inference the plan's Key Technical
  *   Decisions reject.
  * - `skipped`: `SKIP_CACHE=true`. A deliberate configuration opt-out; retry would just

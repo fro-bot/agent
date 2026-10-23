@@ -26,7 +26,7 @@ OpenCode state persistence via GitHub Actions cache with corruption detection an
 
 - **Corruption Detection**: Validates `storage-read.ts` compatibility after restore.
 - **S3 Backup**: Optional write-through to S3 for long-term persistence (RFC-019).
-- **Post-Action Hook**: `saveCache` is typically called from `src/harness/post.ts` (RFC-017).
+- **Post-Action Hook**: `saveCache` is typically called from `src/harness/post.ts` (RFC-017). The hook holds no coordination lease, so it passes `objectStorePublish: 'withhold'` and the retry writes the Actions cache only; the object store keeps one shared session object per repo, written by the main step while it holds the lease.
 - **Branch Isolation**: Cache keys are scoped by branch to prevent state leakage.
 - **Job Isolation**: The save key carries the job (`GITHUB_JOB` + matrix-leg hash) after `{runId}-{runAttempt}`, so sibling jobs of one run never collide. Keep the identity a suffix — restore prefixes must keep matching old entries without it.
 - **Collision != Success**: An "already exists" throw from `saveCache` is `cache-rejected` (not-persisted, retried by the post hook), never `persisted`.
@@ -34,5 +34,6 @@ OpenCode state persistence via GitHub Actions cache with corruption detection an
 ## ANTI-PATTERNS
 
 - **Fatal Restore**: A cache miss is a warning, not an error.
-- **Blocking Save**: S3 upload should be best-effort in the post-action hook.
+- **Blocking Save**: S3 upload should be best-effort in the main step.
+- **Unleased Publish**: Never call `saveCache` with `objectStorePublish` omitted or `'publish'` from a caller that does not hold the coordination lease; the upload is an unconditional last-writer-wins write.
 - **Credential Logging**: Never log S3 access keys or session tokens.
