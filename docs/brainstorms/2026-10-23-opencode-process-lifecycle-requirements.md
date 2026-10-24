@@ -42,6 +42,10 @@ On 2026-10-23, OpenCode died mid-run and the run stayed `running` until the oper
 - R8. Reconciling a record never releases a lock or workspace reservation.
 - R9. A failed terminal-state write is retried a few times over a short period. If it still fails, R7 reconciles the record.
 
+**Seeing why a run has not finished**
+
+- R10. While a run waits for its completion gate, the operator can see why the gate has not admitted completion yet. Examples include a background child whose notice has not arrived, or a root that is still live.
+
 ---
 
 ## Acceptance Examples
@@ -50,6 +54,7 @@ On 2026-10-23, OpenCode died mid-run and the run stayed `running` until the oper
 - AE2. **Covers R1, R4.** A run's OpenCode stays alive but stops sending events and heartbeats. The run fails through the barrier.
 - AE3. **Covers R5.** A run waits on an approval when its workspace restarts. The run fails, and the approval prompt shows that the run ended.
 - AE4. **Covers R6, R7, R9.** A run completes, but its terminal-state write and the short retries all fail. The reply has already posted. The record reaches a terminal state within 5 minutes, and its note does not contradict the reply.
+- AE5. **Covers R10.** A run's root has answered, but one background child is still running. The operator status shows the run as running and waiting on a background child's notice. Once the child settles, the wait reason clears.
 
 ---
 

@@ -35,6 +35,7 @@ See origin: `docs/brainstorms/2026-10-23-opencode-process-lifecycle-requirements
 - R7. An executing record with no live owner reaches a terminal state within 5 minutes. Queued runs are untouched.
 - R8. Reconciliation never releases a lock or reservation.
 - R9. Terminal writes retry briefly, then hand off to R7.
+- R10. While a run waits on its completion gate, the operator sees why it has not finished.
 
 ## Scope Boundaries
 
@@ -47,7 +48,8 @@ The following are out of scope:
 - `degraded` recovery;
 - the inactivity and wall-clock defaults;
 - the GitHub Action;
-- a new operator failure kind. Every new failure uses `stream-ended`, so the operator contract is unchanged.
+- a new operator failure kind. Every new failure uses `stream-ended`.
+- surfacing the wait reason in Discord or the dashboard UI. R10 covers the operator API only. The dashboard consumes it in its own repo.
 
 ### Deferred to Separate Tasks
 
@@ -79,6 +81,8 @@ The following are out of scope:
 - **Recovery:** `packages/gateway/src/execute/recovery.ts` (`recoverStaleRuns`, `recoverOneRun`).
   - It is called from `packages/gateway/src/program.ts` at startup.
   - The interval pattern to follow is `sessionMaintenanceInterval` in the same file.
+- **Completion gate:** `packages/gateway/src/execute/drain-completion.ts`. `reject(reason)` logs one code per declined attempt, for example `root-live`, `notice-not-observed`, `ledger-not-drained` and `idle-evidence-stale`. Today these appear only at debug level.
+- **Status overlays:** `packages/gateway/src/web/sse/projection.ts` overlays `waiting_for_approval` and `waiting_for_question` on a `running` run from in-memory registries. `packages/gateway/src/operator-contract/run-status.ts` and `run-summary.ts` hold the wire types. `packages/gateway/src/operator-contract/version.ts` keeps the contract history.
 - **Stale predicate:** `packages/runtime/src/coordination/run-state.ts` (`isRunStale`, `findStaleRuns`). An EXECUTING run is stale after a 60s heartbeat gap.
 
 ### Institutional Learnings
@@ -228,6 +232,11 @@ The following are out of scope:
   - The sweep reads EXECUTING records only. It skips runs in `abortRegistry` and in-flight maintenance runs, and skips the quiescence gate. Swept records keep recovery's existing failure details. It never touches locks.
   - It runs on an unref'd 60s interval with its first tick one interval after start. A new pass does not start while one is running, and each pass is bounded. The interval is cleared at shutdown.
 - **Time bound.** About 30s of detection, plus a barrier of up to 15s, plus a heartbeat stop of up to 5s, plus the bounded write retries, gives about a minute.
+- **The wait reason is an in-memory overlay, not a stored field.**
+  - The completion gate records its latest rejection code and when it was first seen in a per-run in-process map. The map clears on admission and on run exit.
+  - The operator run status gains an optional `waitReason`, taken from an allowlist of codes and never from raw text. It appears only on a `running` run that is draining, and the approval and question overlays take precedence.
+  - Keeping it in memory avoids an object-store write per declined attempt.
+  - The change is additive, so the operator contract gets a minor version bump.
 - **Single gateway replica assumed.** Heartbeat staleness and the in-process owned set are the guards.
 
 ## Open Questions
@@ -242,6 +251,7 @@ The following are out of scope:
 - Which existing path settles pending gates on cancel or timeout.
 - The per-pass sweep bound, and whether `findStaleRuns` needs a read cap. Measure object counts first.
 - How maintenance runs expose their in-flight run ids to the sweep (a shared set or registration).
+- Whether the operator status groups the raw gate codes into fewer wire values. For example, `root-live` and `root-liveness-unavailable` could both read as "agent still working".
 
 ## Implementation Units
 
@@ -365,10 +375,43 @@ The following are out of scope:
 
 **Verification:** Recovery and program suites pass. Startup recovery tests are unchanged.
 
+- [ ] **Unit 5: Operator-visible completion-gate wait reason**
+
+**Goal:** While a run drains, the operator status says why the completion gate has not admitted it yet.
+
+**Requirements:** R10
+
+**Dependencies:** None
+
+**Files:**
+
+- Modify: `packages/gateway/src/execute/drain-completion.ts`, `packages/gateway/src/execute/run-core.ts`, `packages/gateway/src/web/sse/projection.ts`, `packages/gateway/src/operator-contract/run-status.ts`, `packages/gateway/src/operator-contract/version.ts`, `packages/gateway/AGENTS.md`, `docs/wiki/Operator Web Control Surface.md`
+- Test: `packages/gateway/src/execute/drain-completion.test.ts`, `packages/gateway/src/web/sse/projection.test.ts`, `packages/gateway/src/operator-contract/run-status.test.ts`, `packages/gateway/src/operator-contract/version.test.ts`, `packages/gateway/src/web/sse/manager.test.ts`
+
+**Approach:**
+
+- `reject()` reports its code through an injected callback. run-core records it per run in an in-process map and clears it on admission and in the loop `finally`.
+- The projection adds `waitReason` to a `running` status only when an entry exists and no approval or question overlay applies. The value is allowlisted.
+- Live SSE status frames update when the reason changes. Repeats of the same code send nothing.
+- The contract version and history get an additive entry, and the pinned version tests are updated.
+
+**Patterns to follow:** The `waiting_for_question` overlay (contract 1.9.0/1.11.0) and its registry predicates in `projection.ts`.
+
+**Test scenarios:**
+
+- Happy path: a draining run with an unfenced child projects `waitReason: notice-not-observed`. Once admitted, the field is gone.
+- Edge case: when a pending approval and a wait reason coexist, the approval overlay wins and no `waitReason` is shown.
+- Edge case: the same reason repeating produces no new SSE frame. A changed reason produces one.
+- Edge case: an unknown code never reaches the wire.
+- Edge case: a terminal run carries no `waitReason`.
+
+**Verification:** Contract and projection suites pass with the bumped version. Revert-checks fail the new tests.
+
 ## System-Wide Impact
 
 - **Interaction graph:** the proxy; the run-core stream loop; the barrier; `run.ts` terminal paths and replies; the approval and question gates; recovery; the program lifecycle.
-- **Error propagation:** new failures surface as `stream-ended`. The operator contract is unchanged.
+- **Error propagation:** new failures surface as `stream-ended`.
+- **API surface parity:** the operator contract gains an optional `waitReason` (additive minor bump). The dashboard adopts it separately.
 - **State lifecycle risks:** a terminal-write retry and the sweep can race. The ETag compare-and-swap resolves it.
 - **Unchanged invariants:** lock takeover; quarantine semantics; the 5- and 30-minute defaults; startup recovery; the `/readyz` shape.
 
@@ -386,6 +429,7 @@ The following are out of scope:
 1. **PR A:** Unit 1 (workspace-agent only).
 2. **PR B:** Unit 2.
 3. **PR C:** Units 3 and 4. They do not depend on PR B.
+4. **PR D:** Unit 5. Independent of the others.
 
 Docs ship inside each unit. Only one PR is in the merge path at a time.
 

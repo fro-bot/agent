@@ -57,7 +57,7 @@ Past learnings that bear on this:
 
 **Downsides:** Binding runs to a process incarnation adds state. The SSE fix alone may cover most cases. The periodic pass has to keep the quiescence safeguards in place before it releases any reservation.
 
-**Confidence:** 80% **Complexity:** Medium **Status:** Explored
+**Confidence:** 80% **Complexity:** Medium **Status:** Explored. See `docs/plans/2026-10-23-001-fix-run-ends-with-opencode-stream-plan.md`. The plan detects stream loss and silence instead of binding each run to a process incarnation.
 
 ### 2. Recycle OpenCode at verified idle boundaries
 
