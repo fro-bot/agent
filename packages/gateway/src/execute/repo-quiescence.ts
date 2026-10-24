@@ -11,6 +11,7 @@
 import type {GatewayLogger} from '../discord/client.js'
 import type {RepoQuiescence} from '../runtime-effect.js'
 
+import {parseRepoSlug} from '@fro-bot/runtime'
 import {canonicalWorkspaceDirectory} from '../workspace-api/client.js'
 import {attachOpencode} from './opencode-attach.js'
 import {REPO_QUIESCENCE_TIMEOUT_MS} from './recovery-budget.js'
@@ -66,13 +67,13 @@ type ParsedStatuses =
 
 /**
  * Resolves `owner/repo` to the canonical workspace directory (shared with the run's session directory), or
- * `null` for anything not exactly that shape. `session.status` returns `{}` for any directory without
+ * `null` for anything that is not a valid slug (`parseRepoSlug`) or not a canonical workspace name. `session.status` returns `{}` for any directory without
  * sessions, so `clear` is only meaningful because this is the directory the run's sessions are created under.
  */
 function resolveRepoDirectory(repo: string): string | null {
-  const parts = repo.split('/')
-  if (parts.length !== 2) return null
-  return canonicalWorkspaceDirectory(parts[0] ?? '', parts[1] ?? '')
+  const parsed = parseRepoSlug(repo)
+  if (parsed.success === false) return null
+  return canonicalWorkspaceDirectory(parsed.data.owner, parsed.data.repo)
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

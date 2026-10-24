@@ -290,29 +290,68 @@ describe('POST /operator/dispatch — gate ordering and errors', () => {
     ])
   })
 
+  it.each(['acme/..', 'acme/.', `acme/${'r'.repeat(101)}`, `${'o'.repeat(40)}/widget`, '-acme/widget'])(
+    'returns 404 with zero binding reads for the malformed name %j',
+    async repoName => {
+      // #given
+      const bindingsLookup = makeBindingsLookup()
+      const dispatchWorkflow: DispatchWorkflow = vi.fn()
+      const deps = makeDeps({bindingsLookup, dispatchWorkflow})
+      const app = buildApp(deps)
+
+      // #when
+      const response = await postDispatch(app, {repo: repoName, task: 'do work'})
+
+      // #then
+      expect(response.status).toBe(404)
+      expect(await response.json()).toEqual({error: 'not-found'})
+      expect(bindingsLookup.getBindingByRepo).not.toHaveBeenCalled()
+      expect(dispatchWorkflow).not.toHaveBeenCalled()
+    },
+  )
+
   it.each([
-    'acme/..',
-    'acme/.',
+    'acme/a/b',
+    'acme/widget/',
+    'acme/widget#1',
+    'acme/widget?x=1',
+    String.raw`acme\widget`,
+    'acme/a b',
     'acme/a\u0000b',
-    `acme/${'r'.repeat(101)}`,
-    `${'o'.repeat(40)}/widget`,
-    '-acme/widget',
-  ])('returns 404 with zero binding reads for the malformed name %j', async repoName => {
-    // #given
+    'acme/a\u0007b',
+    '/widget',
+    'acme/',
+    'noslash',
+  ])('returns 400 with zero binding reads for the malformed shape %j', async repoField => {
+    // #given (NUL and other control characters used to pass the parse and answer 404)
     const bindingsLookup = makeBindingsLookup()
     const dispatchWorkflow: DispatchWorkflow = vi.fn()
-    const deps = makeDeps({bindingsLookup, dispatchWorkflow})
-    const app = buildApp(deps)
+    const app = buildApp(makeDeps({bindingsLookup, dispatchWorkflow}))
 
     // #when
-    const response = await postDispatch(app, {repo: repoName, task: 'do work'})
+    const response = await postDispatch(app, {repo: repoField, task: 'do work'})
 
     // #then
-    expect(response.status).toBe(404)
-    expect(await response.json()).toEqual({error: 'not-found'})
+    expect(response.status).toBe(400)
     expect(bindingsLookup.getBindingByRepo).not.toHaveBeenCalled()
     expect(dispatchWorkflow).not.toHaveBeenCalled()
   })
+
+  it.each([' acme/widget', 'acme/widget ', '  acme/widget\n'])(
+    'accepts the padded repo field %j, exactly as launch does',
+    async repoField => {
+      // #given
+      const bindingsLookup = makeBindingsLookup()
+      const app = buildApp(makeDeps({bindingsLookup}))
+
+      // #when
+      const response = await postDispatch(app, {repo: repoField, task: 'do work'})
+
+      // #then
+      expect(response.status).toBe(200)
+      expect(bindingsLookup.getBindingByRepo).toHaveBeenCalledExactlyOnceWith('acme', 'widget')
+    },
+  )
 
   it('returns the uniform 404 when the binding lookup throws', async () => {
     // #given

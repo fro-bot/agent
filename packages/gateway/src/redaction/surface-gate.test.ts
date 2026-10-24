@@ -445,6 +445,34 @@ describe('projectRunStatusWithKey', () => {
     expect(getBindingByRepo).not.toHaveBeenCalled()
   })
 
+  it.each(['acme/widget/x', 'acme/widget/x#1', 'acme/widget/'])(
+    'treats the extra-segment entity_ref %j as unparseable: denied, with no binding read (D4)',
+    async entityRef => {
+      // #given a corrupted run record whose entity_ref has more than owner/repo. It used to be read as repo
+      // `widget/x` and sent to the store, whose key builder rejected it, which surfaced as `unavailable`.
+      const getBindingByRepo = vi.fn()
+
+      // #when projecting
+      const result = await projectRunStatusWithKey(
+        makeRunState({entity_ref: entityRef}),
+        opts({getBindingByRepo}, denyMissingKey),
+      )
+
+      // #then it fails closed at the parse, like any other unparseable ref
+      expect(result).toEqual({kind: 'denied'})
+      expect(getBindingByRepo).not.toHaveBeenCalled()
+    },
+  )
+
+  it('resolves the deny key of an extra-segment entity_ref to null/null without a binding read', async () => {
+    const getBindingByRepo = vi.fn()
+
+    const result = await resolveRunRepoKey(makeRunState({entity_ref: 'acme/widget/x'}), {getBindingByRepo})
+
+    expect(result).toEqual({databaseId: null, nodeId: null})
+    expect(getBindingByRepo).not.toHaveBeenCalled()
+  })
+
   it('is unavailable — not denied — when the binding store errors or throws, and never consults the denylist', async () => {
     // #given a denylist spy and two failing stores
     const isRepoDenied = vi.fn(() => true)

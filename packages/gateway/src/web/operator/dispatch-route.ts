@@ -32,6 +32,7 @@ import type {OperatorLogger} from '../server.js'
 import type {IdempotencyGuard} from './idempotency.js'
 import type {LaunchRouteBindingsLookup} from './launch-route.js'
 import {createHash, randomUUID} from 'node:crypto'
+import {parseRepoSlug} from '@fro-bot/runtime'
 import {createRateLimiter} from '../../http/rate-limit.js'
 import {emitAudit} from '../audit.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
@@ -89,17 +90,6 @@ function fingerprintDispatchRequest(owner: string, repo: string, task: string): 
     .digest('hex')
 }
 
-function parseRepo(repoField: string): {readonly owner: string; readonly repo: string} | undefined {
-  const repoValue = repoField.trim()
-  const slashIdx = repoValue.indexOf('/')
-  if (slashIdx <= 0 || slashIdx === repoValue.length - 1 || repoValue.includes('/', slashIdx + 1)) return undefined
-
-  const owner = repoValue.slice(0, slashIdx)
-  const repo = repoValue.slice(slashIdx + 1)
-  if (owner.trim().length === 0 || repo.trim().length === 0 || /\s/.test(owner) || /\s/.test(repo)) return undefined
-  return {owner, repo}
-}
-
 /** Register POST /operator/dispatch on the given Hono app. */
 export function buildDispatchRoute(app: Hono, deps: DispatchRouteDeps): void {
   const perMinLimiter =
@@ -150,12 +140,12 @@ export function buildDispatchRoute(app: Hono, deps: DispatchRouteDeps): void {
       return c.json({error: 'bad request'}, 400)
     }
 
-    const parsedRepo = parseRepo(repoField)
-    if (parsedRepo === undefined) {
+    const parsedRepo = parseRepoSlug(repoField)
+    if (parsedRepo.success === false) {
       deps.logger.warn({githubUserId, gate: 'bad-body'}, 'dispatch: denied — repo field must be owner/repo format')
       return c.json({error: 'bad request'}, 400)
     }
-    const {owner, repo} = parsedRepo
+    const {owner, repo} = parsedRepo.data
     const idempotencyKeyField = bodyObj.idempotencyKey
     if (typeof idempotencyKeyField === 'string' && idempotencyKeyField.length > IDEMPOTENCY_KEY_MAX_LENGTH) {
       deps.logger.warn({githubUserId, gate: 'bad-body'}, 'dispatch: denied — idempotency key is too long')

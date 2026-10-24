@@ -54,6 +54,7 @@ import type {OperatorLogger} from '../server.js'
 import type {RunObservationManager} from '../sse/manager.js'
 import type {IdempotencyGuard} from './idempotency.js'
 import {randomUUID} from 'node:crypto'
+import {parseRepoSlug} from '@fro-bot/runtime'
 import {launchWork} from '../../execute/run.js'
 import {createRateLimiter} from '../../http/rate-limit.js'
 import {
@@ -238,14 +239,14 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
       return c.json({error: 'bad request'}, 400)
     }
 
-    // Parse owner/repo from the repo field (format: 'owner/repo').
-    const slashIdx = repoField.indexOf('/')
-    if (slashIdx === -1 || slashIdx === 0 || slashIdx === repoField.length - 1) {
+    // Parse owner/repo from the repo field with the shared slug contract (trimmed, one `/`, no whitespace, `#`,
+    // `?`, `\` or control characters). The GitHub name rules are applied next, by `resolveRepoAccess`.
+    const parsedRepo = parseRepoSlug(repoField)
+    if (parsedRepo.success === false) {
       deps.logger.warn({githubUserId, gate: 'bad-body'}, 'launch: denied — repo field must be owner/repo format')
       return c.json({error: 'bad request'}, 400)
     }
-    const owner = repoField.slice(0, slashIdx)
-    const repo = repoField.slice(slashIdx + 1)
+    const {owner, repo} = parsedRepo.data
 
     const idempotencyKey =
       typeof idempotencyKeyField === 'string' && idempotencyKeyField.length > 0 ? idempotencyKeyField : undefined

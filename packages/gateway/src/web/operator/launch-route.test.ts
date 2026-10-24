@@ -513,31 +513,82 @@ describe('POST /operator/runs — binding store unavailable', () => {
 })
 
 describe('POST /operator/runs — malformed owner/repo', () => {
+  it.each(['acme/..', 'acme/.', `acme/${'r'.repeat(101)}`, `${'o'.repeat(40)}/widget`, '-acme/widget', 'acme-/widget'])(
+    'returns 404 with ZERO binding reads for %j',
+    async repoName => {
+      // #given
+      const bindingsLookup = makeBindingsLookup()
+      const denylistCache = makeDenylistCache()
+      const app = buildApp(makeDeps({bindingsLookup, denylistCache}))
+
+      // #when
+      const response = await postRuns(app, {repo: repoName, prompt: 'do something'})
+
+      // #then — denied before the object store or the denylist is touched
+      expect(response.status).toBe(404)
+      expect(await response.json()).toEqual({error: 'not-found'})
+      expect(bindingsLookup.getBindingByRepo).not.toHaveBeenCalled()
+      expect(denylistCache.getDenylistState).not.toHaveBeenCalled()
+      expect(mockLaunchWork).not.toHaveBeenCalled()
+    },
+  )
+})
+
+describe('POST /operator/runs — repo field shape (one slug contract shared with dispatch)', () => {
   it.each([
-    'acme/..',
-    'acme/.',
     'acme/a/b',
-    'acme/a\u0000b',
+    'acme/widget/x',
+    'acme/widget/',
+    'acme//widget',
+    'acme/widget#1',
+    'acme/widget?x=1',
+    String.raw`acme\widget`,
     'acme/a b',
-    `acme/${'r'.repeat(101)}`,
-    `${'o'.repeat(40)}/widget`,
-    '-acme/widget',
-    'acme-/widget',
-  ])('returns 404 with ZERO binding reads for %j', async repoName => {
-    // #given
+    'ac me/widget',
+    'acme/a\u0000b',
+    'acme/a\u0007b',
+    '/widget',
+    'acme/',
+  ])('returns 400 (not 404) with ZERO binding reads for the malformed shape %j', async repoField => {
+    // #given a repo field that is not an owner/repo slug. Launch used to pass most of these through to the name
+    // rules and answer 404; dispatch answered 400 for the same input.
     const bindingsLookup = makeBindingsLookup()
     const denylistCache = makeDenylistCache()
     const app = buildApp(makeDeps({bindingsLookup, denylistCache}))
 
     // #when
-    const response = await postRuns(app, {repo: repoName, prompt: 'do something'})
+    const response = await postRuns(app, {repo: repoField, prompt: 'do something'})
 
-    // #then — denied before the object store or the denylist is touched
-    expect(response.status).toBe(404)
-    expect(await response.json()).toEqual({error: 'not-found'})
+    // #then
+    expect(response.status).toBe(400)
     expect(bindingsLookup.getBindingByRepo).not.toHaveBeenCalled()
     expect(denylistCache.getDenylistState).not.toHaveBeenCalled()
     expect(mockLaunchWork).not.toHaveBeenCalled()
+  })
+
+  it.each([' acme/widget', 'acme/widget ', '  acme/widget\n', '\tacme/widget\t'])(
+    'accepts the padded repo field %j and looks up the trimmed owner/repo (D2: was a 404)',
+    async repoField => {
+      // #given
+      const bindingsLookup = makeBindingsLookup()
+      const app = buildApp(makeDeps({bindingsLookup}))
+
+      // #when
+      const response = await postRuns(app, {repo: repoField, prompt: 'do something'})
+
+      // #then
+      expect(response.status).toBe(202)
+      expect(bindingsLookup.getBindingByRepo).toHaveBeenCalledExactlyOnceWith('acme', 'widget')
+    },
+  )
+
+  it('keeps one 400 body for every shape rejection', async () => {
+    const app = buildApp(makeDeps())
+
+    const noSlash = await postRuns(app, {repo: 'noslash', prompt: 'do something'})
+    const extra = await postRuns(app, {repo: 'acme/widget/x', prompt: 'do something'})
+
+    expect(await extra.json()).toEqual(await noSlash.json())
   })
 })
 
