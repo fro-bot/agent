@@ -1063,6 +1063,42 @@ describe('runOpenCodeCore', () => {
       await expect(runOpenCodeCore(params)).rejects.toMatchObject({kind: 'unreachable'})
     })
 
+    it('puts the message of a JSON error envelope in the session.create failure, not [object Object]', async () => {
+      // #given
+      const handle = makeHandle({
+        sessionCreate: async () =>
+          Promise.resolve({
+            data: null,
+            error: {name: 'NotFoundError', data: {message: 'Session not found: ses_envelope'}},
+          }),
+      })
+      const params = {...buildParams(handle), coordinator: makeCoordinator()}
+
+      // #when
+      const err = await runOpenCodeCore(params).catch((error: unknown) => error)
+
+      // #then
+      expect(err).toBeInstanceOf(RunCoreError)
+      expect((err as RunCoreError).kind).toBe('unreachable')
+      expect((err as RunCoreError).message).toBe('Session create failed: Session not found: ses_envelope')
+    })
+
+    it('puts the message of a JSON error envelope in the promptAsync failure, not [object Object]', async () => {
+      // #given
+      const handle = makeHandle({
+        promptAsync: async () =>
+          Promise.resolve({data: null, error: {name: 'BadRequest', data: {message: 'bad body'}}}),
+      })
+      const params = {...buildParams(handle), coordinator: makeCoordinator()}
+
+      // #when
+      const err = await runOpenCodeCore(params).catch((error: unknown) => error)
+
+      // #then
+      expect(err).toBeInstanceOf(RunCoreError)
+      expect((err as RunCoreError).message).toBe('PromptAsync error: bad body')
+    })
+
     it('throws RunCoreError with kind "unreachable" when promptAsync throws', async () => {
       // #given
       const handle = makeHandle({

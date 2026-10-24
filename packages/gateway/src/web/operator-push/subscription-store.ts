@@ -72,7 +72,7 @@
 import type {ObjectStoreAdapter, ObjectStoreOperationError, Result} from '@fro-bot/runtime'
 
 import {createHash, randomUUID} from 'node:crypto'
-import {err, ok} from '@fro-bot/runtime'
+import {err, ok, toErrorMessage} from '@fro-bot/runtime'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -369,7 +369,7 @@ function parseSubscriptionRecord(data: string): Result<SubscriptionRecord, Store
     }
     return ok(parsed)
   } catch (error) {
-    return err(createStoreError(error instanceof Error ? error.message : String(error)))
+    return err(createStoreError(toErrorMessage(error)))
   }
 }
 

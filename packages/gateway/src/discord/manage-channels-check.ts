@@ -11,14 +11,12 @@
 import type {Guild} from 'discord.js'
 import type {GatewayLogger} from './client.js'
 
+import {toErrorMessage} from '@fro-bot/runtime'
 import {PermissionFlagsBits} from 'discord.js'
 
 export async function hasManageChannels(guild: Guild, userId: string, log: GatewayLogger): Promise<boolean> {
   const member = await guild.members.fetch(userId).catch((error: unknown) => {
-    log.warn(
-      {err: error instanceof Error ? error.message : String(error)},
-      'manage-channels-check: member permission resolution failed - denying',
-    )
+    log.warn({err: toErrorMessage(error)}, 'manage-channels-check: member permission resolution failed - denying')
     return null
   })
   return member !== null && member.permissions.has(PermissionFlagsBits.ManageChannels)

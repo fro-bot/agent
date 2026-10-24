@@ -19,6 +19,7 @@ import {
   validateAttachments,
 } from '../../features/attachments/index.js'
 import {getGitHubWorkspace, getInvocationIdentity} from '../../shared/env.js'
+import {toErrorMessage} from '../../shared/errors.js'
 import {createLogger} from '../../shared/logger.js'
 import {normalizeWorkspacePath} from '../../shared/paths.js'
 
@@ -67,7 +68,7 @@ export const eagerSessionPrepStrategy: SessionPrepStrategy = async ({
     recentSessions = await listSessions(client, workspacePath, {limit: 10}, logger)
   } catch (error: unknown) {
     logger.warning('Recent session lookup failed; proceeding with empty context', {
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
   }
 
@@ -76,7 +77,7 @@ export const eagerSessionPrepStrategy: SessionPrepStrategy = async ({
     priorWorkContext = await searchSessions(searchQuery, client, workspacePath, {limit: 5}, logger)
   } catch (error: unknown) {
     logger.warning('Prior-work session search failed; proceeding with empty context', {
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
   }
 
@@ -137,7 +138,7 @@ export async function runSessionPrep(
     })
   } catch (error: unknown) {
     sessionLogger.warning('Session presearch strategy failed; proceeding with empty context', {
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
   }
 

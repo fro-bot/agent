@@ -18,7 +18,7 @@ import type {AppClient, AppNotInstalledError, AuthError, InsufficientPermissions
 import type {WorkspaceClient} from './client.js'
 import type {CloneErrorCode, CloneWorkspaceError} from './types.js'
 
-import {err, ok} from '@fro-bot/runtime'
+import {err, ok, toErrorMessage} from '@fro-bot/runtime'
 import {
   AppNotInstalledError as AppNotInstalledErrorClass,
   AuthTimeoutError as AuthTimeoutErrorClass,
@@ -259,7 +259,7 @@ export async function ensureWorkspaceClone(deps: EnsureCloneDeps): Promise<Resul
     logger.error('ensure-clone: unexpected error', {
       owner,
       repo,
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
     // SECURITY: raw message is never included in the returned error.
     return err({kind: 'unexpected-error'})

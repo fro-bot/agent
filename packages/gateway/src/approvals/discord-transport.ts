@@ -38,6 +38,7 @@ import type {PostReplyFactory, ReplySink} from '../execute/launch-types.js'
 import type {PermissionReply, PermissionRequest, SettlementReason} from './coordinator.js'
 import type {ApprovalActor, ApprovalRegistry} from './registry.js'
 
+import {toErrorMessage} from '@fro-bot/runtime'
 import {DiscordAPIError, RESTJSONErrorCodes} from 'discord.js'
 
 import {buildApprovalButtons, buildApprovalEmbed, buildSettledEmbed} from '../discord/approvals.js'
@@ -177,7 +178,7 @@ export function createDiscordApprovalOnPending(
 
     const code = error instanceof DiscordAPIError ? error.code : undefined
     logger.error(
-      {requestID, code, err: error instanceof Error ? error.message : String(error)},
+      {requestID, code, err: toErrorMessage(error)},
       'discord-transport: approval notification undeliverable (terminal Discord error) — auto-rejecting on the server',
     )
 
@@ -186,7 +187,7 @@ export function createDiscordApprovalOnPending(
       .applySettlement({requestID, decision: 'reject', reason: 'disposed'})
       .catch((settleError: unknown) => {
         logger.error(
-          {requestID, err: settleError instanceof Error ? settleError.message : String(settleError)},
+          {requestID, err: toErrorMessage(settleError)},
           'discord-transport: applySettlement threw while auto-rejecting an undeliverable approval',
         )
       })
@@ -261,7 +262,7 @@ export function createDiscordApprovalOnPending(
         // onPending must not throw (coordinator wraps it defensively).
         settleWaitingStatus(false)
         logger.warn(
-          {requestID, err: error instanceof Error ? error.message : String(error)},
+          {requestID, err: toErrorMessage(error)},
           'discord-transport: waiting-for-approval send rejected unexpectedly',
         )
       })
@@ -339,7 +340,7 @@ export function createDiscordApprovalOnPending(
         // Log a warning but do not rethrow — onPending must not throw.
         settleEmbed(false)
         logger.warn(
-          {requestID, err: error instanceof Error ? error.message : String(error)},
+          {requestID, err: toErrorMessage(error)},
           'discord-transport: approval embed send rejected unexpectedly',
         )
         approvalRegistry.markMessagePostFailed(requestID)

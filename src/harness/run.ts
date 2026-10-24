@@ -18,6 +18,7 @@ import {applyTerminalReaction} from '../features/agent/index.js'
 import {createMetricsCollector, writeInvocationOutcomeSummary} from '../features/observability/index.js'
 import {createReviewDeliveryReceiptOperations} from '../services/github/review-delivery-receipt.js'
 import {getGitHubRunAttempt, getGitHubWorkspace, getInvocationIdentity} from '../shared/env.js'
+import {toErrorMessage} from '../shared/errors.js'
 import {createLogger} from '../shared/logger.js'
 import {setActionOutputs, setInvocationOutcomeOutput} from './config/outputs.js'
 import {STATE_KEYS} from './config/state-keys.js'
@@ -330,7 +331,7 @@ export async function run(): Promise<number> {
     exitCode = 1
     const duration = Date.now() - startTime
     const errorName = error instanceof Error ? error.name : 'UnknownError'
-    const errorMessage = error instanceof Error ? error.message : String(error)
+    const errorMessage = toErrorMessage(error)
 
     metrics.recordError(errorName, errorMessage, false)
     metrics.end()
