@@ -89,11 +89,9 @@ export async function resolveRepoAccess<B extends BindingDenyKeySource>(
   }
 
   try {
-    // Bindings are only ever written lowercase (add-project canonicalises before it stores), and GitHub treats
-    // owner and repo names case-insensitively, so the lookup key is the lowercase form. This is the only place
-    // the request's case is folded: nothing is changed in the store or in any key builder, and callers carry the
-    // returned binding's stored owner/repo, never the request's.
-    const lookup = await lookupBindingDenyKeys(owner.toLowerCase(), repo.toLowerCase(), deps.bindingsLookup)
+    // `lookupBindingDenyKeys` reads the lowercase key (bindings are only written lowercase), so the request's case
+    // never reaches the store, and callers carry the returned binding's stored owner/repo, never the request's.
+    const lookup = await lookupBindingDenyKeys(owner, repo, deps.bindingsLookup)
     if (lookup.kind === 'unavailable') {
       return {kind: 'unavailable'}
     }

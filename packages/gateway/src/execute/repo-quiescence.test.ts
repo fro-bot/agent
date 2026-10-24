@@ -172,6 +172,13 @@ describe('createRepoQuiescenceChecker', () => {
     'acme/widget?x=1',
     String.raw`acme\widget`,
     'acme/wid\u0000get',
+    '\u212Aey/widget',
+    'acme/\u212Aey',
+    '\u0130stanbul/widget',
+    'acme/wid\u200Bget',
+    'acme/a..b',
+    '-acme/widget',
+    'acme_/widget',
   ])('returns unknown without calling the client for invalid repo %j', async repo => {
     // #given
     const status = vi.fn<StatusFn>(async () => okResult({}))

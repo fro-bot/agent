@@ -31,16 +31,24 @@ export interface RepoSlug {
 }
 
 // Whitespace (any Unicode space), the characters that start a fragment, query or Windows path, and control
-// characters (`\p{Cc}`: C0, DEL, C1). `/` is handled by the separator count, not here.
+// characters (`\p{Cc}`: C0, DEL, C1). `/` is handled by the separator count, not here. Checked on the trimmed
+// value: surrounding whitespace is padding, not part of the slug.
 const FORBIDDEN_CHARACTER = /[\s#?\\\p{Cc}]/u
+
+// Invisible format characters (`\p{Cf}`: zero-width space and joiner, byte-order mark, bidi overrides, soft
+// hyphen). They render as nothing, so `acme\u200B/widget` reads as `acme/widget` and is not it. Checked on the RAW
+// input, before the trim: U+FEFF is also JavaScript whitespace, and `trim()` would otherwise drop it at either end.
+const FORMAT_CHARACTER = /\p{Cf}/u
 
 /**
  * Parse an untrusted `owner/repo` string.
  *
  * Trims the input, then requires exactly one `/` with a non-empty owner and a non-empty repo, and rejects
- * whitespace, `#`, `?`, `\` and control characters anywhere. Does not change case. Never throws.
+ * whitespace, `#`, `?`, `\`, control characters and invisible format characters anywhere. Does not change case.
+ * Never throws.
  */
 export function parseRepoSlug(input: string): Result<RepoSlug, RepoSlugError> {
+  if (FORMAT_CHARACTER.test(input)) return err('forbidden-character')
   const value = input.trim()
   if (value.length === 0) return err('empty')
   if (FORBIDDEN_CHARACTER.test(value)) return err('forbidden-character')
@@ -71,10 +79,11 @@ export function isValidGitHubOwner(owner: string): boolean {
 }
 
 /**
- * Whether `repo` is a GitHub repository name. Rejects the single-segment names `.` and `..` (path
- * traversal); the character class already excludes NUL. A `.git` suffix and `..` inside a name are accepted.
+ * Whether `repo` is a GitHub repository name. Rejects `.` and any name containing `..` (path traversal, and the object
+ * store's key builder and the workspace agent reject it too, so accepting it here only moved the failure later);
+ * the character class already excludes NUL. A `.git` suffix and a single `.` inside a name are accepted.
  */
 export function isValidGitHubRepoName(repo: string): boolean {
-  if (repo === '.' || repo === '..') return false
+  if (repo === '.' || repo.includes('..')) return false
   return GITHUB_REPO_NAME.test(repo)
 }

@@ -83,6 +83,12 @@ describe('parseEntityRefRepo', () => {
     },
   )
 
+  it.each(['\u200B', '\u200D', '\uFEFF'])('returns null for an invisible format character (%j)', char => {
+    expect(parseEntityRefRepo(`owner${char}/repo`)).toBeNull()
+    expect(parseEntityRefRepo(`owner/re${char}po#3`)).toBeNull()
+    expect(parseEntityRefRepo(`${char}owner/repo`)).toBeNull()
+  })
+
   it('trims surrounding whitespace, as the slug contract does', () => {
     expect(parseEntityRefRepo(' owner/repo#2 ')).toEqual({owner: 'owner', repo: 'repo'})
   })

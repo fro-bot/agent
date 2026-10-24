@@ -106,6 +106,56 @@ const allowAll: (key: RepoKey) => boolean = () => false
 // resolveRunRepoKey
 // ---------------------------------------------------------------------------
 
+describe('lookupBindingDenyKeys — case (D1)', () => {
+  it.each([
+    ['Acme', 'Widget'],
+    ['ACME', 'WIDGET'],
+    ['acme', 'widget'],
+  ])('reads the lowercase key for %s/%s, the only key bindings are stored under', async (owner, repo) => {
+    // #given
+    const lookup = fakeBindingsLookup(makeBinding())
+
+    // #when
+    const result = await lookupBindingDenyKeys(owner, repo, lookup)
+
+    // #then
+    expect(lookup.getBindingByRepo).toHaveBeenCalledExactlyOnceWith('acme', 'widget')
+    expect(result).toMatchObject({kind: 'resolved', binding: {owner: 'acme', repo: 'widget'}})
+  })
+
+  it('the run-status projection follows the same rule: a mixed-case entity_ref resolves the lowercase binding', async () => {
+    // #given a legacy run record whose entity_ref kept the repo's GitHub spelling
+    const binding = makeBinding({databaseId: 42, nodeId: 'R_node_42'})
+    const lookup = fakeBindingsLookup(binding)
+
+    // #when
+    const key = await resolveRunRepoKey(makeRunState({entity_ref: 'Acme/Widget#1'}), lookup)
+
+    // #then it finds the binding instead of failing closed on a spelling difference
+    expect(lookup.getBindingByRepo).toHaveBeenCalledExactlyOnceWith('acme', 'widget')
+    expect(key).toEqual({databaseId: 42, nodeId: 'R_node_42'})
+  })
+})
+
+describe('the access gate and the run-status projection resolve a mixed-case repo alike', () => {
+  it('finds the same binding, by the same lowercase key, for one mixed-case spelling', async () => {
+    // #given one store and a legacy run whose entity_ref carries the GitHub spelling
+    const binding = makeBinding({databaseId: 42, nodeId: 'R_node_42'})
+    const gateLookup = fakeBindingsLookup(binding)
+    const projectionLookup = fakeBindingsLookup(binding)
+
+    // #when the access-gate primitive and the run-status resolver each read it
+    const gate = await lookupBindingDenyKeys('Acme', 'Widget', gateLookup)
+    const projection = await resolveRunRepoKey(makeRunState({entity_ref: 'Acme/Widget#1'}), projectionLookup)
+
+    // #then both read the same key and reach the same deny key
+    expect(vi.mocked(gateLookup.getBindingByRepo).mock.calls).toEqual(
+      vi.mocked(projectionLookup.getBindingByRepo).mock.calls,
+    )
+    expect(gate).toMatchObject({kind: 'resolved', repoKey: projection})
+  })
+})
+
 describe('resolveRunRepoKey', () => {
   it('preserves nodeId when databaseId is null', () => {
     // #given — an identity whose numeric id is not representable exactly

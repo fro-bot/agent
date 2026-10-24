@@ -36,6 +36,21 @@ describe('parseRepoSlug: accepted shapes', () => {
     // #given a trailing-hyphen owner and a consecutive-dot repo: shape is fine, the name rules are separate
     expect(parseRepoSlug('bad-/a..b')).toEqual({success: true, data: {owner: 'bad-', repo: 'a..b'}})
   })
+
+  it.each([
+    ['U+200B zero-width space', '\u200B'],
+    ['U+200D zero-width joiner', '\u200D'],
+    ['U+FEFF byte-order mark', '\uFEFF'],
+    ['U+202E right-to-left override', '\u202E'],
+    ['U+00AD soft hyphen', '\u00AD'],
+  ])('rejects the invisible format character %s anywhere in the value', (_label, char) => {
+    // #given a slug that LOOKS valid but carries a character no reader can see
+    // #then each position is rejected, including both ends where trim() would not remove it
+    expect(failure(`acme${char}/widget`)).toBe('forbidden-character')
+    expect(failure(`acme/wid${char}get`)).toBe('forbidden-character')
+    expect(failure(`${char}acme/widget`)).toBe('forbidden-character')
+    expect(failure(`acme/widget${char}`)).toBe('forbidden-character')
+  })
 })
 
 describe('parseRepoSlug: rejections', () => {
@@ -113,17 +128,30 @@ describe('GitHub name rules', () => {
     },
   )
 
-  it.each(['a', 'widget', 'my.repo', 'my_repo', 'my-repo', 'widget.git', '.github', 'a..b', 'a'.repeat(100), 'Widget'])(
+  it.each(['a', 'widget', 'my.repo', 'my_repo', 'my-repo', 'widget.git', '.github', 'a'.repeat(100), 'Widget'])(
     'accepts the repo %j',
     repo => {
       expect(isValidGitHubRepoName(repo)).toBe(true)
     },
   )
 
-  it.each(['', '.', '..', 'a'.repeat(101), 'a/b', 'a b', 'a#b', 'a?b', 'é', 'a\u0000', String.raw`a\b`])(
-    'rejects the repo %j',
-    repo => {
-      expect(isValidGitHubRepoName(repo)).toBe(false)
-    },
-  )
+  it.each([
+    '',
+    '.',
+    '..',
+    'a..b',
+    '...',
+    'a...',
+    '..a',
+    'a'.repeat(101),
+    'a/b',
+    'a b',
+    'a#b',
+    'a?b',
+    'é',
+    'a\u0000',
+    String.raw`a\b`,
+  ])('rejects the repo %j', repo => {
+    expect(isValidGitHubRepoName(repo)).toBe(false)
+  })
 })

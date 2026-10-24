@@ -11,7 +11,7 @@
 import type {GatewayLogger} from '../discord/client.js'
 import type {RepoQuiescence} from '../runtime-effect.js'
 
-import {parseRepoSlug} from '@fro-bot/runtime'
+import {isValidGitHubOwner, isValidGitHubRepoName, parseRepoSlug} from '@fro-bot/runtime'
 import {canonicalWorkspaceDirectory} from '../workspace-api/client.js'
 import {attachOpencode} from './opencode-attach.js'
 import {REPO_QUIESCENCE_TIMEOUT_MS} from './recovery-budget.js'
@@ -73,6 +73,10 @@ type ParsedStatuses =
 function resolveRepoDirectory(repo: string): string | null {
   const parsed = parseRepoSlug(repo)
   if (parsed.success === false) return null
+  // Validate the RAW names before the workspace helper lowercases them: Unicode case folding maps some non-ASCII
+  // characters onto ASCII ones (the Kelvin sign U+212A lowercases to `k`), which would turn a name that is not a
+  // GitHub name into a valid-looking directory.
+  if (isValidGitHubOwner(parsed.data.owner) === false || isValidGitHubRepoName(parsed.data.repo) === false) return null
   return canonicalWorkspaceDirectory(parsed.data.owner, parsed.data.repo)
 }
 
