@@ -6,7 +6,7 @@ import type {AttemptObservation, FailureObservation, TurnEvidence} from './attem
 import type {AttemptResult} from './prompt-sender.js'
 import type {ActivityTracker, EventStreamResult, PermissionAskedResponder} from './streaming.js'
 import {getNumberProperty, getObjectProperty, getStringProperty} from '@fro-bot/runtime'
-import {toErrorMessage} from '../../shared/errors.js'
+import {formatSdkError, toErrorMessage} from '../../shared/errors.js'
 import {reduceAttemptOutcome} from './attempt-outcome.js'
 import {
   ledgerBlocksCompletion,
@@ -332,7 +332,7 @@ async function startV2SessionWait(
     if (response.error != null) {
       logger.debug('v2.session.wait() returned error, relying on poll watchdog', {
         sessionId,
-        error: String(response.error),
+        error: formatSdkError(response.error),
       })
       return {kind: 'fallback-to-poll'}
     }

@@ -30,6 +30,7 @@ import {
   createLedgerReconciler,
   createOwnershipLedger,
   createSdkLedgerReconcileAdapter,
+  formatSdkError,
   getBooleanProperty,
   getEventKind,
   getEventPayload,
@@ -512,7 +513,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       signal: combinedSignal,
     })
     if (sessionResponse.error != null) {
-      const errMsg = String(sessionResponse.error)
+      const errMsg = formatSdkError(sessionResponse.error)
       if (isAuthError(sessionResponse)) {
         logger.error({detail: 'session.create 401'}, 'run-core: workspace proxy rejected bearer token')
         throw new RunCoreError('auth', `Session create rejected: ${errMsg}`)
@@ -755,7 +756,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       signal: combinedSignal,
     })
     if (promptResponse.error != null) {
-      const errMsg = String(promptResponse.error)
+      const errMsg = formatSdkError(promptResponse.error)
       if (isAuthError(promptResponse)) {
         logger.error({sessionId, detail: 'promptAsync 401'}, 'run-core: workspace proxy rejected bearer token')
         throw await throwWithBarrier('auth', `PromptAsync rejected: ${errMsg}`)

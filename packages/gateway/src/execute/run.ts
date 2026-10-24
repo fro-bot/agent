@@ -34,6 +34,7 @@ import {
   createHeartbeatController,
   createOwnershipLedger,
   createRun,
+  formatSdkError,
   getRunKey,
   parseRunState,
   patchRunDetails,
@@ -1564,7 +1565,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           })
           const envelope = res as {error?: unknown} | undefined
           if (envelope?.error != null) {
-            return {ok: false as const, error: String(envelope.error)}
+            return {ok: false as const, error: formatSdkError(envelope.error)}
           }
           return {ok: true as const}
         } catch (error) {

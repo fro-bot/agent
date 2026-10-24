@@ -714,6 +714,34 @@ describe('bootstrapOpenCodeServer', () => {
       expect(loggedFields?.readinessMs).toBeLessThanOrEqual(loggedFields?.elapsedMs ?? -1)
     })
 
+    it('logs the message of a JSON error envelope from the probe, not [object Object]', async () => {
+      // #given a probe answered with the SDK's plain-object error for a JSON error body
+      const logger = createMockLogger()
+      const mockClient = createMockClient(async () => ({
+        data: undefined,
+        error: {name: 'NotFoundError', data: {message: 'Directory not found'}},
+      }))
+      vi.mocked(createOpencode).mockImplementation(async options => {
+        const port = (options as {port?: number}).port
+        return {
+          client: mockClient as never,
+          server: {url: `http://127.0.0.1:${String(port)}`, close: vi.fn()},
+        }
+      })
+
+      // #when
+      const result = await bootstrapOpenCodeServer(new AbortController().signal, logger, WORKSPACE_PATH)
+
+      // #then
+      expect(result.success).toBe(true)
+      expect(logger.debug).toHaveBeenCalledWith(
+        'OpenCode readiness probe answered with an error body (server is ready)',
+        {
+          error: 'Directory not found',
+        },
+      )
+    })
+
     it('fails with a named instance-bootstrap error and closes the server when the readiness timeout genuinely elapses', async () => {
       // #given a probe that outlasts its own composed signal's timeout -- classified by
       // signal state (timeoutSignal.aborted), not by the shape of whatever it rejects with,

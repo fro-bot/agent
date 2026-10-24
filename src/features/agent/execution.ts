@@ -25,7 +25,7 @@ import {
   getOpenCodeLogPath,
   isOpenCodePromptArtifactEnabled,
 } from '../../shared/env.js'
-import {toErrorMessage} from '../../shared/errors.js'
+import {formatSdkError, toErrorMessage} from '../../shared/errors.js'
 import {buildContinuationPrompt, sendPromptToSession} from './prompt-sender.js'
 import {buildAgentPrompt} from './prompt.js'
 import {materializeReferenceFiles} from './reference-files.js'
@@ -82,7 +82,7 @@ async function replyToPermissionAsk(
       })
       const response = await Promise.race([reply, timeout])
       if (response.error != null) {
-        throw new Error(`Permission reply rejected by server: ${String(response.error)}`)
+        throw new Error(`Permission reply rejected by server: ${formatSdkError(response.error)}`)
       }
       return
     } catch (error) {
@@ -232,7 +232,7 @@ export async function executeOpenCode(
       )
       if (sessionResponse.data == null || sessionResponse.error != null)
         throw new Error(
-          `Failed to create session: ${sessionResponse.error == null ? 'No data returned' : String(sessionResponse.error)}`,
+          `Failed to create session: ${sessionResponse.error == null ? 'No data returned' : formatSdkError(sessionResponse.error)}`,
         )
       sessionId = sessionResponse.data.id
       logger.info('Created new OpenCode session', {sessionId, sessionTitle: config?.sessionTitle ?? null})

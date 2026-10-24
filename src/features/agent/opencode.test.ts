@@ -465,6 +465,25 @@ describe('executeOpenCode', () => {
     expect(result.success).toBe(true)
   })
 
+  it('reports the message of a JSON error envelope from session.create, not [object Object]', async () => {
+    // #given the SDK client's error for a JSON HTTP error body is a plain object
+    const mockClient = createMockClient({promptResponse: {parts: [{type: 'text', text: 'Response'}]}})
+    vi.mocked(mockClient.session.create).mockResolvedValue({
+      data: undefined,
+      error: {name: 'BadRequest', data: {message: 'invalid session options'}},
+    })
+    const mockOpencode = createMockOpencode({client: mockClient})
+    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+    // #when
+    const result = await executeOpenCode(createMockPromptOptions(), mockLogger)
+
+    // #then
+    expect(result.success).toBe(false)
+    expect(result.error).toContain('Failed to create session: invalid session options')
+    expect(result.error).not.toContain('[object Object]')
+  })
+
   it('creates session and sends prompt', async () => {
     // #given
     const mockClient = createMockClient({
@@ -667,6 +686,48 @@ describe('executeOpenCode', () => {
       // already accepted before that -- teardown must not abort an already-completed session.
       expect(result).toMatchObject({success: true, exitCode: 0})
       expect(mockClient.session.messages).toHaveBeenCalledOnce()
+      expect(mockClient.session.update).not.toHaveBeenCalled()
+      expect(mockClient.session.abort).not.toHaveBeenCalled()
+    } finally {
+      await vi.advanceTimersByTimeAsync(4_000)
+      if (resultPromise != null) await resultPromise
+      vi.useRealTimers()
+    }
+  })
+
+  it('reports the message of a JSON error envelope from promptAsync, not [object Object]', async () => {
+    // #given — prompt submission returns a retryable terminal failure before SSE cleanup hangs
+    vi.useFakeTimers()
+    let resultPromise: ReturnType<typeof executeOpenCode> | undefined
+    try {
+      const mockClient = createMockClient({promptResponse: {parts: [{type: 'text', text: 'Response'}]}})
+      vi.mocked(mockClient.session.promptAsync).mockResolvedValue({
+        error: {name: 'BadRequest', data: {message: 'bad prompt body'}},
+      })
+      vi.mocked(mockClient.event.subscribe).mockResolvedValue({
+        stream: createPromptStartedHangingEventStream(mockClient.session.promptAsync, []),
+      })
+      const mockOpencode = createMockOpencode({client: mockClient})
+      vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
+
+      // #when
+      resultPromise = executeOpenCode(createMockPromptOptions(), mockLogger, {
+        agent: null,
+        model: null,
+        timeoutMs: 1_000,
+        omoProviders: createDisabledProviders(),
+        sessionTitle: 'envelope failure',
+      })
+      await vi.advanceTimersByTimeAsync(10_000)
+      const result = await resultPromise
+
+      // #then — primary failure survives cleanup and cannot open a continuation attempt. The shared
+      // deadline did expire during cleanup, but the failure was already accepted (not deferred past
+      // an ownership-ledger gate) before that happened -- teardown must not abort the session over it.
+      expect(result).toMatchObject({success: false, exitCode: 1})
+      expect(result.error).toContain('bad prompt body')
+      expect(result.error).not.toContain('[object Object]')
+      expect(mockClient.session.promptAsync).toHaveBeenCalledOnce()
       expect(mockClient.session.update).not.toHaveBeenCalled()
       expect(mockClient.session.abort).not.toHaveBeenCalled()
     } finally {

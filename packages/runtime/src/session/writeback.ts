@@ -2,7 +2,7 @@ import type {RunSummary} from '../shared/types.js'
 import type {SessionClient} from './backend.js'
 import type {Logger} from './types.js'
 
-import {toErrorMessage} from '../shared/errors.js'
+import {formatSdkError, toErrorMessage} from '../shared/errors.js'
 
 /**
  * Format run summary for session storage.
@@ -71,7 +71,7 @@ export async function writeSessionSummary(
     })
 
     if (result.error != null) {
-      logger.warning('SDK prompt writeback failed', {sessionId, error: String(result.error)})
+      logger.warning('SDK prompt writeback failed', {sessionId, error: formatSdkError(result.error)})
       return
     }
 
