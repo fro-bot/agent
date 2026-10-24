@@ -384,6 +384,15 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
             ? 'the coordination lease could not verify uninterrupted coverage, so this run can no longer be certain another Action run has not taken over and is writing the same session state'
             : null
 
+    // The object store keeps ONE shared session object per repo, written with an unconditional upload, and
+    // every gate above reads "safe" for a run that never took the lock (no ledger, no server handle, no lease
+    // to lose) -- the dedup skip and the routing skip both return before `runAcquireLock` and still reach this
+    // phase. So the publish needs POSITIVE evidence that this run acquired the Action lock: only
+    // `runAcquireLock`'s `acquired` outcome sets a lock ETag or a lease renewal. Anything else writes the
+    // Actions cache only.
+    const holdsLease = lockEtag != null || leaseRenewal != null
+    const storePublishWithheld = storeConfig.enabled === true && holdsLease === false
+
     let cacheSaveResult: CacheSaveResult
     if (declineReason == null) {
       cacheSaveResult = await saveCache({
@@ -395,6 +404,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
         projectIdPath: finalProjectIdPath,
         opencodeVersion: detectedOpencodeVersion,
         storeConfig,
+        objectStorePublish: holdsLease ? 'publish' : 'withhold',
       })
     } else {
       cacheLogger.warning('Declining cache save: persistence safety could not be confirmed', {reason: declineReason})
@@ -423,7 +433,13 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
     // time this outcome is known. `declineReason` (undefined on every other outcome) is
     // what makes a declined persistence a visible, explained outcome rather than a silent
     // skip indistinguishable from a routine 'checkpoint-declined' or 'skipped-empty' row.
-    await writeCacheSaveResultSummary(cacheSaveResult, 'main', cacheLogger, declineReason ?? undefined)
+    await writeCacheSaveResultSummary(
+      cacheSaveResult,
+      'main',
+      cacheLogger,
+      declineReason ?? undefined,
+      declineReason == null && storePublishWithheld ? 'lease-not-acquired' : undefined,
+    )
 
     if (isOpenCodePromptArtifactEnabled()) {
       const artifactLogger = createLogger({phase: 'artifact-upload'})
