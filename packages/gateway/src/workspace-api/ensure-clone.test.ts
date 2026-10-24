@@ -22,8 +22,15 @@ import {
   INSTALLATION_TOKEN_MINT_TIMEOUT_MS,
   InsufficientPermissionsError,
 } from '../github/app-client.js'
+import {
+  controllableDeadlines,
+  createRealAppClient,
+  installStalledGitHub,
+  settleWithin,
+  untilRequests,
+} from '../github/test-helpers.js'
 import {workspaceRepoPath} from './client.js'
-import {DEFAULT_ENSURE_CLONE_AUTH_TIMEOUT_MS, ensureWorkspaceClone} from './ensure-clone.js'
+import {ensureWorkspaceClone} from './ensure-clone.js'
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -96,6 +103,22 @@ function assertFailure<T, E>(result: Result<T, E>): E {
 // ---------------------------------------------------------------------------
 // Happy path tests
 // ---------------------------------------------------------------------------
+
+// The REAL `authForRepo` over a stalled `fetch`: the bound is the one `authForRepo` enforces itself.
+function makeStalledClone(options?: {readonly ignoreSignal?: boolean}) {
+  const github = installStalledGitHub(options)
+  const deadline = controllableDeadlines()
+  const workspaceClient = makeWorkspaceClient()
+  const logger = makeLogger()
+  const run = ensureWorkspaceClone({
+    owner: 'testowner',
+    repo: 'testrepo',
+    appClient: createRealAppClient(),
+    workspaceClient,
+    logger,
+  })
+  return {github, deadline, workspaceClient, logger, run}
+}
 
 describe('ensureWorkspaceClone', () => {
   describe('happy path: auth succeeds and clone succeeds', () => {
@@ -296,11 +319,6 @@ describe('ensureWorkspaceClone', () => {
 
       // #then
       expect(assertFailure(result)).toMatchObject({kind: 'auth-failure', reason: 'timeout'})
-    })
-
-    it('its default auth timeout is the 30 s source deadline, pinned to the literal', () => {
-      expect(INSTALLATION_TOKEN_MINT_TIMEOUT_MS).toBe(30_000)
-      expect(DEFAULT_ENSURE_CLONE_AUTH_TIMEOUT_MS).toBe(30_000)
     })
 
     it('no positive evidence — a plain AuthError (e.g. discovery 5xx/network/rate-limit) stays reason "auth-error" (transient default)', async () => {
@@ -516,61 +534,49 @@ describe('ensureWorkspaceClone', () => {
   // ---------------------------------------------------------------------------
 
   describe('error path: auth timeout', () => {
-    it('returns auth-failure with reason timeout when authForRepo never resolves and timeoutMs elapses', async () => {
-      // #given — authForRepo hangs forever; inject a very short timeout
-      const owner = 'testowner'
-      const repo = 'testrepo'
-      const appClient: AppClient = {
-        authForRepo: vi.fn().mockReturnValue(new Promise<never>(() => {})), // never resolves
-        authForWorkflowDispatch: vi.fn(),
-        getRepoIdentity: vi.fn().mockResolvedValue(ok({databaseId: 1, nodeId: 'node-1'})),
-        invalidateCache: vi.fn(),
-      }
-      const workspaceClient = makeWorkspaceClient()
-      const logger = makeLogger()
+    it('returns auth-failure with reason timeout when GitHub never answers and the mint deadline fires', async () => {
+      // #given GitHub never answers
+      const {github, deadline, workspaceClient, logger, run} = makeStalledClone()
+      await untilRequests(github, 1)
 
-      // #when — use a 10ms timeout so the test completes quickly
-      const result = await ensureWorkspaceClone({owner, repo, appClient, workspaceClient, logger, timeoutMs: 10})
+      // #then it is still waiting before the deadline, and the deadline is the 30 s source ceiling
+      expect(deadline.spy).toHaveBeenCalledExactlyOnceWith(INSTALLATION_TOKEN_MINT_TIMEOUT_MS)
+      expect(await settleWithin(run, 50)).toBe('pending')
 
-      // #then — must return auth-failure with reason timeout (not hang forever)
-      const failure = assertFailure(result)
-      expect(failure).toMatchObject({kind: 'auth-failure', reason: 'timeout'})
-      // clone must NOT have been called (auth never completed)
+      // #when the deadline fires
+      deadline.fire()
+      const result = await settleWithin(run)
+
+      // #then it is the same auth-failure the clone path has always reported for a stall, nothing was cloned,
+      // and the warning names the class and the reason, never a message
+      expect(result).not.toBe('pending')
+      if (result === 'pending') return
+      expect(assertFailure(result)).toEqual({kind: 'auth-failure', reason: 'timeout'})
       expect(workspaceClient.clone).not.toHaveBeenCalled()
+      expect(logger.warn).toHaveBeenCalledExactlyOnceWith('ensure-clone: app auth failed', {
+        owner: 'testowner',
+        repo: 'testrepo',
+        errorKind: 'AuthTimeoutError',
+        reason: 'timeout',
+      })
     })
 
-    it('does NOT time out when authForRepo resolves before timeoutMs', async () => {
-      // #given — authForRepo resolves quickly; timeout is generous
-      const owner = 'testowner'
-      const repo = 'testrepo'
-      const appClient = makeAppClient()
-      const workspaceClient = makeWorkspaceClient(
-        ok({ok: true, path: workspaceRepoPath(owner, repo), commit: 'abc123'}),
-      )
-      const logger = makeLogger()
+    it('a transport that ignores the abort and answers only after the deadline never clones', async () => {
+      // #given requests that do not honour their signal
+      const {github, deadline, workspaceClient, run} = makeStalledClone({ignoreSignal: true})
+      await untilRequests(github, 1)
 
-      // #when — 5000ms timeout; auth resolves immediately
-      const result = await ensureWorkspaceClone({owner, repo, appClient, workspaceClient, logger, timeoutMs: 5000})
+      // #when the deadline fires, then GitHub finally answers
+      deadline.fire()
+      const result = await settleWithin(run)
+      github.answerLate()
+      await new Promise(resolve => setTimeout(resolve, 50))
 
-      // #then — succeeds normally
-      expect(result).toEqual(ok(workspaceRepoPath(owner, repo)))
-    })
-
-    it('uses default timeout when timeoutMs is not provided (does not hang)', async () => {
-      // #given — authForRepo resolves quickly; no explicit timeout
-      const owner = 'testowner'
-      const repo = 'testrepo'
-      const appClient = makeAppClient()
-      const workspaceClient = makeWorkspaceClient(
-        ok({ok: true, path: workspaceRepoPath(owner, repo), commit: 'abc123'}),
-      )
-      const logger = makeLogger()
-
-      // #when — no timeoutMs; should use default and succeed
-      const result = await ensureWorkspaceClone({owner, repo, appClient, workspaceClient, logger})
-
-      // #then — succeeds normally (default timeout is large enough for a fast mock)
-      expect(result).toEqual(ok(workspaceRepoPath(owner, repo)))
+      // #then the call ended at the deadline and the late token was never used
+      expect(result).not.toBe('pending')
+      if (result === 'pending') return
+      expect(assertFailure(result)).toEqual({kind: 'auth-failure', reason: 'timeout'})
+      expect(workspaceClient.clone).not.toHaveBeenCalled()
     })
   })
 

@@ -6,12 +6,10 @@
  */
 
 import type {ButtonInteraction} from 'discord.js'
-import type {MintWorkspaceToken} from '../../execute/workspace-token.js'
 import type {GatewayLogger} from '../client.js'
 import type {MaintenanceRunHandle} from '../maintenance-run.js'
 import type {FroBotDeps} from './fro-bot.js'
 import type {AuthDecision, GuildCommandCtx} from './guild-command.js'
-import {err, ok} from '@fro-bot/runtime'
 import {ActionRowBuilder, ButtonBuilder, ButtonStyle} from 'discord.js'
 import {Effect} from 'effect'
 import {
@@ -20,7 +18,7 @@ import {
   formatRollbackFailedReply,
 } from '../../execute/preparation-reply.js'
 import {formatBranchForReply} from '../../execute/provenance.js'
-import {INSTALLATION_TOKEN_MINT_TIMEOUT_MS, mintBounded} from '../../execute/workspace-token.js'
+import {createInstallationTokenMint} from '../../execute/workspace-token.js'
 import {editInteractionAsync} from '../io.js'
 import {acquireMaintenanceRun} from '../maintenance-run.js'
 import {hasManageChannels} from '../manage-channels-check.js'
@@ -489,18 +487,10 @@ export async function handleRecoverConfirmOrCancelClick(
       return
     }
 
-    // The claimed maintenance run holds the repo lock while the token is minted. `authForRepo` aborts its
-    // own requests at its deadline, and `mintBounded` backstops a mint that ignores it. The failure the
-    // bound returns carries the cause (the error class, never its message, or `timeout`), so the log
-    // below reads it from the result and not from state a late mint could still write.
-    const mintToken: MintWorkspaceToken = async (owner, repo) => {
-      const authResult = await deps.appClient.authForRepo(owner, repo)
-      if (authResult.success === false) {
-        return err({kind: 'network-error' as const, cause: authResult.error.constructor.name})
-      }
-      return ok(authResult.data.token)
-    }
-    const minted = await mintBounded(mintToken, payload.owner, payload.repo, INSTALLATION_TOKEN_MINT_TIMEOUT_MS)
+    // The claimed maintenance run holds the repo lock while the token is minted. `authForRepo` bounds itself
+    // (it aborts its own requests at its deadline and returns an `AuthTimeoutError`). The failure carries the
+    // cause (the error class, never its message, or `timeout`), so the log below reads it from the result.
+    const minted = await createInstallationTokenMint(deps.appClient)(payload.owner, payload.repo)
     if (minted.success === false) {
       log.error({repoSlug, err: minted.error.cause}, 'recover-checkout: token mint failed at confirm')
       await releaseClaimedRun('FAILED', 'auth-failed')

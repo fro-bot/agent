@@ -5,7 +5,14 @@ import type {FroBotDeps} from './fro-bot.js'
 
 import {Effect} from 'effect'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import {INSTALLATION_TOKEN_MINT_TIMEOUT_MS} from '../../execute/workspace-token.js'
+import {INSTALLATION_TOKEN_MINT_TIMEOUT_MS} from '../../github/app-client.js'
+import {
+  controllableDeadlines,
+  createRealAppClient,
+  installStalledGitHub,
+  settleWithin,
+  untilRequests,
+} from '../../github/test-helpers.js'
 
 const mockAcquireMaintenanceRun = vi.fn()
 vi.mock('../maintenance-run.js', () => ({
@@ -592,8 +599,9 @@ describe('/fro-bot recover-checkout — confirm/cancel buttons', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The confirm-click installation-token mint is bounded: the claimed maintenance run holds the repo lock
-// while it waits, and `authForRepo` has no deadline of its own.
+// The confirm-click installation-token mint can never hold the claimed run: `authForRepo` bounds itself, so a
+// stalled GitHub ends the click at its deadline. These tests use the REAL `authForRepo` over a stalled
+// `fetch`; the mock-`authForRepo` tests below cover the other mint outcomes.
 // ---------------------------------------------------------------------------
 
 async function armConfirm(authForRepo: ReturnType<typeof vi.fn>) {
@@ -606,107 +614,71 @@ async function armConfirm(authForRepo: ReturnType<typeof vi.fn>) {
   return {deps, handle, click}
 }
 
+/** Like `armConfirm`, but the click mints through the real app client over a stalled GitHub. */
+async function armConfirmWithRealMint(options?: {readonly ignoreSignal?: boolean}) {
+  const guild = makeGuild(true)
+  const handle = makeReleaseHandle()
+  const confirmable = makeConfirmableDeps()
+  const customId = await postConfirmablePreview(confirmable, guild, handle)
+  // This file runs on fake timers; the real `authForRepo` and its deadline race need real ones.
+  vi.useRealTimers()
+  const github = installStalledGitHub(options)
+  const deadline = controllableDeadlines()
+  const deps = {...confirmable, appClient: createRealAppClient()}
+  const click = makeButtonInteraction(customId, {guild})
+  return {deps, handle, click, github, deadline}
+}
+
 function copySends(editReply: ReturnType<typeof vi.fn>): number {
   return editReply.mock.calls.filter(call => (call[0] as {content?: string}).content === INTERNAL_ERROR_COPY).length
 }
 
-describe('/fro-bot recover-checkout confirm: the token mint is bounded', () => {
-  afterEach(() => {
-    vi.useRealTimers()
-  })
-
+describe('/fro-bot recover-checkout confirm: the token mint', () => {
   const MINT_FAILED_LOG = 'recover-checkout: token mint failed at confirm'
 
-  it('a mint that never settles ends at the ceiling (not before): FAILED/auth-failed, copy sent once, recover never called', async () => {
-    // #given a GitHub call that hangs forever, while the claimed run holds the lock
-    const {deps, handle, click} = await armConfirm(vi.fn().mockReturnValue(new Promise(() => {})))
-    vi.useFakeTimers()
+  it('a stalled GitHub ends the click at the mint deadline: FAILED/auth-failed, copy sent once, recover never called, err "timeout"', async () => {
+    // #given the claimed run holds the lock while GitHub never answers
+    const {deps, handle, click, github, deadline} = await armConfirmWithRealMint()
 
     // #when
     let finished = false
     const done = handleRecoverConfirmOrCancelClick(click.interaction as never, deps).then(() => {
       finished = true
     })
-    await vi.advanceTimersByTimeAsync(INSTALLATION_TOKEN_MINT_TIMEOUT_MS - 1)
-    const finishedEarly = finished
-    const releasedEarly = vi.mocked(handle.release).mock.calls.length
-    await vi.advanceTimersByTimeAsync(1)
+    await untilRequests(github, 1)
+    expect(deadline.spy).toHaveBeenCalledExactlyOnceWith(INSTALLATION_TOKEN_MINT_TIMEOUT_MS)
+    expect(await settleWithin(done, 50)).toBe('pending')
+    expect(finished).toBe(false)
+    expect(handle.release).not.toHaveBeenCalled()
+    deadline.fire()
     await done
 
     // #then
-    expect(finishedEarly).toBe(false)
-    expect(releasedEarly).toBe(0)
     expect(handle.release).toHaveBeenCalledExactlyOnceWith('FAILED', expect.objectContaining({outcome: 'auth-failed'}))
     expect(copySends(click.editReply)).toBe(1)
     expect(deps.workspaceClient.recover).not.toHaveBeenCalled()
-  })
-
-  it('logs the failure with a meaningful err of "timeout" and no token or fingerprint', async () => {
-    // #given
-    const {deps, click} = await armConfirm(vi.fn().mockReturnValue(new Promise(() => {})))
-    vi.useFakeTimers()
-
-    // #when
-    const done = handleRecoverConfirmOrCancelClick(click.interaction as never, deps)
-    await vi.advanceTimersByTimeAsync(INSTALLATION_TOKEN_MINT_TIMEOUT_MS)
-    await done
-
-    // #then
     const logged = vi.mocked(deps.gatewayLogger.error).mock.calls.filter(call => call[1] === MINT_FAILED_LOG)
     expect(logged).toHaveLength(1)
     expect(logged[0]?.[0]).toEqual({repoSlug: 'acme/widget', err: 'timeout'})
     expect(JSON.stringify(logged)).not.toContain('fp-1')
   })
 
-  it('a mint that succeeds only AFTER the ceiling does not call recover', async () => {
+  it('a transport that ignores the abort and answers only after the deadline does not call recover', async () => {
     // #given
-    let resolveMint: (value: unknown) => void = () => {}
-    const {deps, handle, click} = await armConfirm(
-      vi.fn().mockReturnValue(
-        new Promise(resolve => {
-          resolveMint = resolve
-        }),
-      ),
-    )
-    vi.useFakeTimers()
+    const {deps, handle, click, github, deadline} = await armConfirmWithRealMint({ignoreSignal: true})
 
-    // #when the ceiling expires, then the late token arrives
+    // #when the deadline expires, then GitHub finally answers
     const done = handleRecoverConfirmOrCancelClick(click.interaction as never, deps)
-    await vi.advanceTimersByTimeAsync(INSTALLATION_TOKEN_MINT_TIMEOUT_MS)
+    await untilRequests(github, 1)
+    deadline.fire()
     await done
-    resolveMint({success: true, data: {token: 'ghs_late'}})
-    await vi.advanceTimersByTimeAsync(5_000)
+    github.answerLate()
+    await new Promise(resolve => setTimeout(resolve, 50))
 
     // #then
     expect(deps.workspaceClient.recover).not.toHaveBeenCalled()
     expect(handle.release).toHaveBeenCalledExactlyOnceWith('FAILED', expect.objectContaining({outcome: 'auth-failed'}))
     expect(copySends(click.editReply)).toBe(1)
-  })
-
-  it('a mint that rejects after the ceiling changes nothing', async () => {
-    // #given
-    let rejectMint: (reason: Error) => void = () => {}
-    const {deps, click} = await armConfirm(
-      vi.fn().mockReturnValue(
-        new Promise((_resolve, reject) => {
-          rejectMint = reject
-        }),
-      ),
-    )
-    vi.useFakeTimers()
-    // #when
-    const done = handleRecoverConfirmOrCancelClick(click.interaction as never, deps)
-    await vi.advanceTimersByTimeAsync(INSTALLATION_TOKEN_MINT_TIMEOUT_MS)
-    await done
-    rejectMint(new Error('late boom'))
-    await vi.advanceTimersByTimeAsync(5_000)
-    await Promise.resolve()
-
-    // #then the rejection arrived after the result was settled, so it changes nothing
-    const logged = vi.mocked(deps.gatewayLogger.error).mock.calls.filter(call => call[1] === MINT_FAILED_LOG)
-    expect(logged).toHaveLength(1)
-    expect(logged[0]?.[0]).toEqual({repoSlug: 'acme/widget', err: 'timeout'})
-    expect(deps.workspaceClient.recover).not.toHaveBeenCalled()
   })
 
   it('a thrown mint takes the same path, logged with its error class, and recover is not called', async () => {
@@ -744,33 +716,7 @@ describe('/fro-bot recover-checkout confirm: the token mint is bounded', () => {
     expect(JSON.stringify(logged)).not.toContain('secret detail')
   })
 
-  it('a mint that fails only AFTER the ceiling cannot change the logged cause: it stays "timeout"', async () => {
-    // #given the label comes from the returned failure, not from state a late mint could still write
-    class LateFailure extends Error {}
-    let resolveMint: (value: unknown) => void = () => {}
-    const {deps, click} = await armConfirm(
-      vi.fn().mockReturnValue(
-        new Promise(resolve => {
-          resolveMint = resolve
-        }),
-      ),
-    )
-    vi.useFakeTimers()
-
-    // #when
-    const done = handleRecoverConfirmOrCancelClick(click.interaction as never, deps)
-    await vi.advanceTimersByTimeAsync(INSTALLATION_TOKEN_MINT_TIMEOUT_MS)
-    await done
-    resolveMint({success: false, error: new LateFailure('late')})
-    await vi.advanceTimersByTimeAsync(5_000)
-
-    // #then
-    const logged = vi.mocked(deps.gatewayLogger.error).mock.calls.filter(call => call[1] === MINT_FAILED_LOG)
-    expect(logged).toHaveLength(1)
-    expect(logged[0]?.[0]).toEqual({repoSlug: 'acme/widget', err: 'timeout'})
-  })
-
-  it('a source-deadline expiry (AuthTimeoutError) is logged under its own class name', async () => {
+  it('a source-deadline expiry (AuthTimeoutError) is logged with the cause "timeout"', async () => {
     // #given
     const {AuthTimeoutError} = await import('../../github/app-client.js')
     const {deps, click} = await armConfirm(vi.fn().mockResolvedValue({success: false, error: new AuthTimeoutError()}))
@@ -780,7 +726,7 @@ describe('/fro-bot recover-checkout confirm: the token mint is bounded', () => {
 
     // #then
     const logged = vi.mocked(deps.gatewayLogger.error).mock.calls.find(call => call[1] === MINT_FAILED_LOG)
-    expect(logged?.[0]).toEqual({repoSlug: 'acme/widget', err: 'AuthTimeoutError'})
+    expect(logged?.[0]).toEqual({repoSlug: 'acme/widget', err: 'timeout'})
   })
 
   it('a mint that answers in time still reaches recover with that token', async () => {
