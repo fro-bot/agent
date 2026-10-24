@@ -24,7 +24,7 @@ import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {launchWork} from '../../execute/run.js'
 import {OPERATOR_LAUNCH_PROMPT_MAX_LENGTH} from '../../operator-contract/launch-prompt.js'
 import {setOperatorRouteGuard} from '../operator-route.js'
-import {createIdempotencyGuard, IDEMPOTENCY_KEY_MAX_LENGTH} from './idempotency.js'
+import {createIdempotencyGuard, IDEMPOTENCY_KEY_MAX_LENGTH, IDEMPOTENCY_TTL_MS} from './idempotency.js'
 import {buildLaunchRoute} from './launch-route.js'
 
 // vi.mock is hoisted by Vitest before imports — mock launchWork so route tests
@@ -1057,6 +1057,58 @@ describe('POST /operator/runs — an idempotency key is bound to one request', (
     expect(a2.status).toBe(202)
     expect(((await a2.json()) as {runId: string}).runId).toBe(((await a1.json()) as {runId: string}).runId)
     expect(mockLaunchWork).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps the key bound for the full TTL after a delayed admission is accepted, then frees it', async () => {
+    // #given one clock shared by the route and the guard, and a launch whose admission is held open
+    let nowMs = 0
+    const guard = createIdempotencyGuard({now: () => nowMs})
+    const app = buildApp(makeDeps({idempotencyGuard: guard, now: () => nowMs}))
+    let release: (admission: LaunchAdmission) => void = () => {}
+    let launchedRunId = ''
+    mockLaunchWork.mockImplementationOnce(
+      async (request: LaunchWorkRequest) =>
+        new Promise<LaunchAdmission>(resolve => {
+          launchedRunId = request.runId ?? ''
+          release = resolve
+        }),
+    )
+    const firstPending = postRuns(app, {repo: 'acme/widget', prompt: 'first task', idempotencyKey: 'k'})
+    await vi.waitFor(() => expect(mockLaunchWork).toHaveBeenCalledTimes(1))
+
+    // #when admission is accepted just before the original reservation would have expired.
+    // The reservation (guard and fingerprint alike) expires at TTL; acceptance refreshes both to the acceptance
+    // time + TTL.
+    nowMs = IDEMPOTENCY_TTL_MS - 1000
+    release({accepted: true, runId: launchedRunId})
+    const first = await firstPending
+    expect(first.status).toBe(202)
+    const committedExpiry = nowMs + IDEMPOTENCY_TTL_MS
+
+    // #then past the ORIGINAL expiry but before the committed one, the key is still bound to its request:
+    // a different prompt is a conflict and launches nothing, an identical retry replays
+    nowMs = IDEMPOTENCY_TTL_MS + 1000
+    const conflicting = await postRuns(app, {repo: 'acme/widget', prompt: 'second task', idempotencyKey: 'k'})
+    expect(conflicting.status).toBe(400)
+    expect(await conflicting.json()).toEqual({error: 'idempotency key reuse with different request'})
+    const replay = await postRuns(app, {repo: 'acme/widget', prompt: 'first task', idempotencyKey: 'k'})
+    expect(replay.status).toBe(202)
+    expect(((await replay.json()) as {runId: string}).runId).toBe(launchedRunId)
+    expect(mockLaunchWork).toHaveBeenCalledTimes(1)
+
+    // #then one millisecond before the committed expiry it is still bound
+    nowMs = committedExpiry - 1
+    const lastMoment = await postRuns(app, {repo: 'acme/widget', prompt: 'second task', idempotencyKey: 'k'})
+    expect(lastMoment.status).toBe(400)
+    expect(mockLaunchWork).toHaveBeenCalledTimes(1)
+
+    // #then at the committed expiry the guard's own entry has expired too (both lifetimes end together), so the
+    // same key with a different request is a new launch
+    nowMs = committedExpiry
+    const afterExpiry = await postRuns(app, {repo: 'acme/widget', prompt: 'second task', idempotencyKey: 'k'})
+    expect(afterExpiry.status).toBe(202)
+    expect(mockLaunchWork).toHaveBeenCalledTimes(2)
+    expect(mockLaunchWork.mock.calls[1]?.[0].promptText).toBe('second task')
   })
 
   it('keeps echoing the reserved runId when the guard holds an entry the route has no fingerprint for', async () => {
