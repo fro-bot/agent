@@ -17,6 +17,7 @@ import type {WorkspaceClient} from '../../workspace-api/client.js'
 import type {GatewayLogger} from '../client.js'
 import type {AuthDecision, GuildCommandCtx, GuildCommandDeps, PreDeferCtx, PreDeferSignal} from './guild-command.js'
 
+import {isValidGitHubOwner, isValidGitHubRepoName, parseRepoSlug} from '@fro-bot/runtime'
 import {PermissionFlagsBits} from 'discord.js'
 import {Effect} from 'effect'
 
@@ -105,17 +106,24 @@ function checkRateLimit(userId: string): {allowed: boolean; retryAfterMs: number
 
 const GITHUB_URL_RE = /^https:\/\/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?$/
 
-// TODO(future): tighten slug validation. GitHub's actual rules:
-// - owner: 1-39 chars, alphanumeric + hyphen, no leading/trailing/consecutive hyphens
-// - repo: 1-100 chars, alphanumeric + hyphen + underscore + period, similar rules
-// Current regex accepts any non-slash sequence; relies on GitHub App auth to reject invalid
-// slugs, which surfaces as "App not installed" — a misleading error for typos.
+/**
+ * Extract the owner and repo from a `https://github.com/owner/repo[.git]` URL, or `null` when the URL has another
+ * shape or the pair is not a real GitHub slug. The regex only locates the two segments; the pair is then held to
+ * the shared contract (`parseRepoSlug`: no whitespace, `#`, `?`, `\` or control characters) and to the GitHub
+ * name rules (ASCII, owner 1-39 characters without a leading or trailing hyphen, repo 1-100 characters), so a typo
+ * is rejected here instead of surfacing later as a misleading "App not installed". Case is preserved; the caller
+ * lowercases for storage.
+ */
 function parseGitHubUrl(url: string): {owner: string; repo: string} | null {
   const match = GITHUB_URL_RE.exec(url)
   if (match === null) return null
   const [, ownerRaw, repoRaw] = match
   if (ownerRaw === undefined || repoRaw === undefined) return null
-  return {owner: ownerRaw, repo: repoRaw}
+
+  const slug = parseRepoSlug(`${ownerRaw}/${repoRaw}`)
+  if (slug.success === false) return null
+  if (isValidGitHubOwner(slug.data.owner) === false || isValidGitHubRepoName(slug.data.repo) === false) return null
+  return slug.data
 }
 
 // ---------------------------------------------------------------------------
