@@ -34,7 +34,7 @@ import type {
 } from 'discord.js'
 
 import type {GatewayLogger} from './client.js'
-import {err, ok} from '@fro-bot/runtime'
+import {err, ok, toErrorMessage} from '@fro-bot/runtime'
 import {Effect} from 'effect'
 
 // ---------------------------------------------------------------------------
@@ -179,15 +179,6 @@ type InteractionEditOptions = InteractionEditReplyOptions & {readonly allowedMen
 const SAFE_MENTIONS: AllowedMentions = Object.freeze({parse: Object.freeze([] as MessageMentionTypes[])})
 
 // ---------------------------------------------------------------------------
-// Internal: sanitize error for logging (never log raw content/payload)
-// ---------------------------------------------------------------------------
-
-function sanitizeError(error: unknown): string {
-  if (error instanceof Error) return error.message
-  return String(error)
-}
-
-// ---------------------------------------------------------------------------
 // Message/Thread family — plain async, returns Promise<Result>
 // ---------------------------------------------------------------------------
 
@@ -221,7 +212,7 @@ export async function sendMessage<T = unknown>(
     // The single `as T` cast is the documented narrowing point for this IO-wrapper idiom.
     return ok(result as T)
   } catch (error: unknown) {
-    const sanitized = sanitizeError(error)
+    const sanitized = toErrorMessage(error)
     logger.warn(
       {
         op: 'sendMessage',
@@ -257,7 +248,7 @@ export async function editMessage(
     const result = await message.edit(editOptions)
     return ok(result)
   } catch (error: unknown) {
-    const sanitized = sanitizeError(error)
+    const sanitized = toErrorMessage(error)
     logger.warn(
       {
         op: 'editMessage',
@@ -298,7 +289,7 @@ export function replyInteraction(
       const result = await interaction.reply(replyOptions)
       return ok(result)
     } catch (error: unknown) {
-      const sanitized = sanitizeError(error)
+      const sanitized = toErrorMessage(error)
       logger.warn(
         {
           op: 'replyInteraction',
@@ -337,7 +328,7 @@ export function editInteraction(
       const result = await interaction.editReply(editOptions)
       return ok(result)
     } catch (error: unknown) {
-      const sanitized = sanitizeError(error)
+      const sanitized = toErrorMessage(error)
       logger.warn(
         {
           op: 'editInteraction',

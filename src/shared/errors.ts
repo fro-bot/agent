@@ -1,1 +1,1 @@
-export {toError, toErrorMessage} from '@fro-bot/runtime'
+export {formatSdkError, toError, toErrorMessage} from '@fro-bot/runtime'

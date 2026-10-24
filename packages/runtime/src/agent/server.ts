@@ -15,7 +15,7 @@ import {
   DEFAULT_SHUTDOWN_QUIESCE_TIMEOUT_MS,
   NON_INTERACTIVE_OPENCODE_CLIENT,
 } from '../shared/constants.js'
-import {toErrorMessage} from '../shared/errors.js'
+import {formatSdkError, toErrorMessage} from '../shared/errors.js'
 import {err, ok} from '../shared/types.js'
 import {withScrubbedEnv} from './with-scrubbed-env.js'
 
@@ -226,7 +226,7 @@ async function attemptReadinessProbe(
     // instance bootstrap completed.
     if (probe.error != null) {
       logger.debug('OpenCode readiness probe answered with an error body (server is ready)', {
-        error: String(probe.error),
+        error: formatSdkError(probe.error),
       })
     }
     return {kind: 'ready'}

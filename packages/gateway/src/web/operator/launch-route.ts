@@ -53,7 +53,8 @@ import type {DurableSessionStore} from '../auth/session.js'
 import type {OperatorLogger} from '../server.js'
 import type {RunObservationManager} from '../sse/manager.js'
 import type {IdempotencyGuard} from './idempotency.js'
-import {randomUUID} from 'node:crypto'
+import {createHash, randomUUID} from 'node:crypto'
+import {parseRepoSlug} from '@fro-bot/runtime'
 import {launchWork} from '../../execute/run.js'
 import {createRateLimiter} from '../../http/rate-limit.js'
 import {
@@ -62,7 +63,7 @@ import {
 } from '../../operator-contract/launch-prompt.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
 import {notFoundResponse, rateLimitedResponse} from '../safe-response.js'
-import {IDEMPOTENCY_KEY_MAX_LENGTH} from './idempotency.js'
+import {IDEMPOTENCY_KEY_MAX_LENGTH, IDEMPOTENCY_MAX_ENTRIES, IDEMPOTENCY_TTL_MS} from './idempotency.js'
 import {resolveRepoAccess} from './route-helpers.js'
 import {createWebApprovalOnPending} from './web-approval.js'
 import {createWebReplySink, createWebStatusSink} from './web-sinks.js'
@@ -155,6 +156,34 @@ function buildWebPrompt(args: {readonly messageText: string; readonly owner: str
 // Route builder
 // ---------------------------------------------------------------------------
 
+/** The request an idempotency key is bound to, held beside the guard's runId marker for the same lifetime. */
+interface LaunchFingerprint {
+  readonly fingerprint: string
+  readonly expiresAt: number
+}
+
+/**
+ * What defines a launch: the repo as the stored binding spells it (so `Acme/Widget` and `acme/widget` are one repo)
+ * and the prompt exactly as submitted (the run stores it as submitted, so a whitespace difference is a different
+ * prompt). The key itself and the operator are already part of the map key.
+ */
+function fingerprintLaunchRequest(owner: string, repo: string, prompt: string): string {
+  return createHash('sha256')
+    .update(JSON.stringify([owner, repo, prompt]), 'utf8')
+    .digest('hex')
+}
+
+function pruneLaunchFingerprints(fingerprints: Map<string, LaunchFingerprint>, nowMs: number): void {
+  for (const [key, entry] of fingerprints) {
+    if (nowMs >= entry.expiresAt) fingerprints.delete(key)
+  }
+  while (fingerprints.size > IDEMPOTENCY_MAX_ENTRIES) {
+    const oldestKey = fingerprints.keys().next().value
+    if (oldestKey === undefined) return
+    fingerprints.delete(oldestKey)
+  }
+}
+
 /**
  * Register POST /operator/runs on the given Hono app.
  *
@@ -174,6 +203,11 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
   const perHrLimiter =
     deps.perHrRateLimiter ??
     createRateLimiter({limit: LAUNCH_RATE_LIMIT_PER_HR, windowMs: LAUNCH_RATE_WINDOW_HR_MS, clock: deps.now})
+
+  // The guard stores only a runId per key. The request each key was first used for is held here, like dispatch
+  // holds its fingerprints, so a reused key with a different request is a conflict and not an echo of a run that
+  // never ran that request.
+  const launchFingerprints = new Map<string, LaunchFingerprint>()
 
   registerOperatorRoute(app, 'POST', '/operator/runs', async c => {
     // ── Gate 1: Read authenticated context set by the guard ──────────────────
@@ -238,14 +272,14 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
       return c.json({error: 'bad request'}, 400)
     }
 
-    // Parse owner/repo from the repo field (format: 'owner/repo').
-    const slashIdx = repoField.indexOf('/')
-    if (slashIdx === -1 || slashIdx === 0 || slashIdx === repoField.length - 1) {
+    // Parse owner/repo from the repo field with the shared slug contract (trimmed, one `/`, no whitespace, `#`,
+    // `?`, `\` or control characters). The GitHub name rules are applied next, by `resolveRepoAccess`.
+    const parsedRepo = parseRepoSlug(repoField)
+    if (parsedRepo.success === false) {
       deps.logger.warn({githubUserId, gate: 'bad-body'}, 'launch: denied — repo field must be owner/repo format')
       return c.json({error: 'bad request'}, 400)
     }
-    const owner = repoField.slice(0, slashIdx)
-    const repo = repoField.slice(slashIdx + 1)
+    const {owner, repo} = parsedRepo.data
 
     const idempotencyKey =
       typeof idempotencyKeyField === 'string' && idempotencyKeyField.length > 0 ? idempotencyKeyField : undefined
@@ -276,6 +310,9 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
       return notFoundResponse(c)
     }
     const binding = access.binding
+    // From here on the repo is identified by the stored binding's case, never by the request's: the request may
+    // have spelled it differently (`Acme/Widget`), and the case must not leak into a channel id or a log field.
+    const {owner: boundOwner, repo: boundRepo} = binding
 
     // ── Gate 7: Per-operator idempotency guard ────────────────────────────────
     // Key is namespaced: ${githubUserId}:${clientKey} so operator A cannot
@@ -283,10 +320,19 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
     // check() returns the runId for BOTH reserved AND committed live entries —
     // a concurrent duplicate arriving while the first is reserved-not-committed
     // echoes the reserved runId and does NOT launch twice.
-    if (idempotencyKey !== undefined) {
+    const fingerprintKey = idempotencyKey === undefined ? undefined : `${githubUserId}:${idempotencyKey}`
+    const fingerprint = fingerprintLaunchRequest(boundOwner, boundRepo, promptField)
+    if (idempotencyKey !== undefined && fingerprintKey !== undefined) {
       const priorRunId = deps.idempotencyGuard.check(githubUserId, idempotencyKey)
       if (priorRunId !== undefined) {
-        // Duplicate within window — echo the prior runId, no double-launch.
+        const prior = launchFingerprints.get(fingerprintKey)
+        if (prior !== undefined && deps.now() < prior.expiresAt && prior.fingerprint !== fingerprint) {
+          // Same key, different request: not a retry. Same status and body as dispatch.
+          deps.logger.warn({githubUserId, gate: 'idempotency-conflict'}, 'launch: idempotency key reuse conflict')
+          return c.json({error: 'idempotency key reuse with different request'}, 400)
+        }
+        // Duplicate within window — echo the prior runId, no double-launch. A live entry this route holds no
+        // fingerprint for (evicted, or written by something else) keeps the echo.
         deps.logger.info({githubUserId, gate: 'idempotent'}, 'launch: idempotent — echoing prior runId')
         return c.json({runId: priorRunId}, 202)
       }
@@ -299,8 +345,10 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
     // window echoes this runId and does NOT launch twice.
     const runId = randomUUID()
 
-    if (idempotencyKey !== undefined) {
+    if (idempotencyKey !== undefined && fingerprintKey !== undefined) {
       deps.idempotencyGuard.reserve(githubUserId, idempotencyKey, runId)
+      launchFingerprints.set(fingerprintKey, {fingerprint, expiresAt: deps.now() + IDEMPOTENCY_TTL_MS})
+      pruneLaunchFingerprints(launchFingerprints, deps.now())
     }
 
     // ── Gate 9: Await launchWork admission ───────────────────────────────────
@@ -348,7 +396,7 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
       // The operator's text is shown back on the run card, so launchWork stores it as submitted.
       persistOperatorPrompt: true,
       runId,
-      channelId: `web:${owner}/${repo}`,
+      channelId: `web:${boundOwner}/${boundRepo}`,
       guildId: undefined,
       surface: 'web' as const,
       binding,
@@ -373,35 +421,47 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
         // Commit the idempotency entry now that admission succeeded.
         if (idempotencyKey !== undefined) {
           deps.idempotencyGuard.commit(githubUserId, idempotencyKey)
+          if (fingerprintKey !== undefined) {
+            launchFingerprints.set(fingerprintKey, {fingerprint, expiresAt: deps.now() + IDEMPOTENCY_TTL_MS})
+          }
         }
         committed = true
-        deps.logger.info({githubUserId, runId: admission.runId, owner, repo}, 'launch: accepted')
+        deps.logger.info({githubUserId, runId: admission.runId, owner: boundOwner, repo: boundRepo}, 'launch: accepted')
         return c.json({runId: admission.runId}, 202)
       }
 
       // Admission rejected — map reason to a coarse HTTP error.
       // rollback happens in finally.
       if (admission.reason === 'cap' || admission.reason === 'queue-full') {
-        deps.logger.warn({githubUserId, owner, repo, gate: admission.reason}, 'launch: rejected — at capacity')
+        deps.logger.warn(
+          {githubUserId, owner: boundOwner, repo: boundRepo, gate: admission.reason},
+          'launch: rejected — at capacity',
+        )
         return c.json({error: 'unavailable'}, 503)
       }
 
       // The route already enforces the cap above; launchWork re-checks at the persistence boundary.
       if (admission.reason === OPERATOR_LAUNCH_PROMPT_TOO_LONG) {
-        deps.logger.warn({githubUserId, owner, repo, gate: admission.reason}, 'launch: rejected — prompt too long')
+        deps.logger.warn(
+          {githubUserId, owner: boundOwner, repo: boundRepo, gate: admission.reason},
+          'launch: rejected — prompt too long',
+        )
         return c.json({error: 'bad request', reason: OPERATOR_LAUNCH_PROMPT_TOO_LONG}, 400)
       }
 
       // 'empty-prompt' — defensive; the route already validates empty prompt above.
-      deps.logger.warn({githubUserId, owner, repo, gate: 'empty-prompt'}, 'launch: rejected — empty prompt')
+      deps.logger.warn(
+        {githubUserId, owner: boundOwner, repo: boundRepo, gate: 'empty-prompt'},
+        'launch: rejected — empty prompt',
+      )
       return c.json({error: 'bad request'}, 400)
     } catch (launchError: unknown) {
       deps.logger.error(
         {
           githubUserId,
           runId,
-          owner,
-          repo,
+          owner: boundOwner,
+          repo: boundRepo,
           // The error NAME only: a message can quote prompt-bearing record text.
           err: launchError instanceof Error ? launchError.name : typeof launchError,
         },

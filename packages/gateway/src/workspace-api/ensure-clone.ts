@@ -18,11 +18,10 @@ import type {AppClient, AppNotInstalledError, AuthError, InsufficientPermissions
 import type {WorkspaceClient} from './client.js'
 import type {CloneErrorCode, CloneWorkspaceError} from './types.js'
 
-import {err, ok} from '@fro-bot/runtime'
+import {err, ok, toErrorMessage} from '@fro-bot/runtime'
 import {
   AppNotInstalledError as AppNotInstalledErrorClass,
   AuthTimeoutError as AuthTimeoutErrorClass,
-  INSTALLATION_TOKEN_MINT_TIMEOUT_MS,
   InsufficientPermissionsError as InsufficientPermissionsErrorClass,
 } from '../github/app-client.js'
 import {workspaceRepoPath} from './client.js'
@@ -102,12 +101,6 @@ export type WorkspaceFailure =
   | {readonly kind: 'workspace-failure'; readonly workspaceKind: 'parse-error'}
   | {readonly kind: 'workspace-failure'; readonly workspaceKind: 'response-mismatch'}
 
-/**
- * Default timeout for the GitHub App auth call in milliseconds (30 seconds): the same deadline
- * `authForRepo` applies to its own requests, so this race is a backstop that rarely wins.
- */
-export const DEFAULT_ENSURE_CLONE_AUTH_TIMEOUT_MS = INSTALLATION_TOKEN_MINT_TIMEOUT_MS
-
 export interface EnsureCloneDeps {
   readonly owner: string
   readonly repo: string
@@ -118,12 +111,6 @@ export interface EnsureCloneDeps {
     readonly warn: (msg: string, meta?: Record<string, unknown>) => void
     readonly error: (msg: string, meta?: Record<string, unknown>) => void
   }
-  /**
-   * Timeout in milliseconds for the GitHub App auth call.
-   * Defaults to DEFAULT_ENSURE_CLONE_AUTH_TIMEOUT_MS (30s).
-   * Inject a small value in tests to avoid hanging.
-   */
-  readonly timeoutMs?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -183,37 +170,13 @@ function toWorkspaceFailure(error: CloneWorkspaceError): WorkspaceFailure {
  * Discord reply handlers MUST use only `error.kind` for user-facing messages.
  */
 export async function ensureWorkspaceClone(deps: EnsureCloneDeps): Promise<Result<string, EnsureCloneFailure>> {
-  const {owner, repo, appClient, workspaceClient, logger, timeoutMs = DEFAULT_ENSURE_CLONE_AUTH_TIMEOUT_MS} = deps
+  const {owner, repo, appClient, workspaceClient, logger} = deps
 
   try {
-    // Stage 1: Mint a repo-scoped installation token with a bounded timeout.
-    // Without a timeout, a hung GitHub API call would block the mention handler indefinitely.
-    // Use a sentinel class so we can distinguish a timeout from a real thrown error.
-    class AuthTimeoutError extends Error {
-      constructor() {
-        super('auth-timeout')
-        this.name = 'AuthTimeoutError'
-      }
-    }
-    const authPromise = appClient.authForRepo(owner, repo)
-    let timeoutHandle: ReturnType<typeof setTimeout> | undefined
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      timeoutHandle = setTimeout(() => reject(new AuthTimeoutError()), timeoutMs)
-    })
-    let authResult: Awaited<ReturnType<typeof appClient.authForRepo>>
-    try {
-      authResult = await Promise.race([authPromise, timeoutPromise])
-    } catch (raceError: unknown) {
-      if (raceError instanceof AuthTimeoutError) {
-        // Timeout — treat as auth-failure with reason 'timeout'.
-        logger.warn('ensure-clone: app auth timed out', {owner, repo, timeoutMs})
-        return err({kind: 'auth-failure', reason: 'timeout'})
-      }
-      // Real thrown error — re-throw so the outer catch handles it as unexpected-error.
-      throw raceError
-    } finally {
-      clearTimeout(timeoutHandle)
-    }
+    // Stage 1: Mint a repo-scoped installation token. `authForRepo` bounds itself (it aborts its own requests
+    // at `INSTALLATION_TOKEN_MINT_TIMEOUT_MS` and returns an `AuthTimeoutError` Result), so a hung GitHub call
+    // cannot block the mention handler; `classifyAuthFailure` reports that expiry as the reason `timeout`.
+    const authResult = await appClient.authForRepo(owner, repo)
     if (authResult.success === false) {
       const reason = classifyAuthFailure(authResult.error)
       logger.warn('ensure-clone: app auth failed', {
@@ -259,7 +222,7 @@ export async function ensureWorkspaceClone(deps: EnsureCloneDeps): Promise<Resul
     logger.error('ensure-clone: unexpected error', {
       owner,
       repo,
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
     // SECURITY: raw message is never included in the returned error.
     return err({kind: 'unexpected-error'})

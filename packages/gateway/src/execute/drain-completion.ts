@@ -37,6 +37,7 @@ import {
   getStringProperty,
   hasBlockingToolPart,
   parseSyntheticNoticePart,
+  toErrorMessage,
 } from '@fro-bot/runtime'
 
 /** Cadence of re-validation while draining. A rejected pass is re-run no faster than this. */
@@ -417,7 +418,7 @@ export function createDrainCompletion(options: DrainCompletionOptions): DrainCom
     rerunRequested = false
     validate()
       .catch((error: unknown) => {
-        reject('validation-threw', {detail: error instanceof Error ? error.message : String(error)})
+        reject('validation-threw', {detail: toErrorMessage(error)})
       })
       .finally(() => {
         inFlight = false

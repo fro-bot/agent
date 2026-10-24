@@ -4,6 +4,7 @@ import type {SessionClient} from './backend.js'
 import type {SessionInfo} from './types.js'
 import {createHash} from 'node:crypto'
 import * as path from 'node:path'
+import {toErrorMessage} from '../shared/errors.js'
 import {listSessionsForProject} from './storage.js'
 
 export interface LogicalSessionKey {
@@ -175,7 +176,7 @@ export async function resolveSessionForLogicalKey(
 
     return {status: 'found', session: matchedSession}
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error)
+    const message = toErrorMessage(error)
     return {status: 'error', error: message}
   }
 }

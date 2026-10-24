@@ -24,6 +24,7 @@ import {
   releaseLockIfHolder,
   renewLease,
 } from '@fro-bot/runtime'
+import {toErrorMessage} from '../../shared/errors.js'
 import {createLogger} from '../../shared/logger.js'
 import {STATE_KEYS} from '../config/state-keys.js'
 
@@ -403,7 +404,7 @@ async function releaseBestEffort(
     }
   } catch (error) {
     logger.warning('Releasing the lock after a failed holder record threw', {
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
       repo,
     })
   }
@@ -516,7 +517,7 @@ export async function runAcquireLock(options: AcquireLockPhaseOptions): Promise<
       core.saveState(STATE_KEYS.LOCK_HOLDER_ID, holderId)
     } catch (error_) {
       // Without the record a killed run would keep the lock until expiry, so release it and fail closed.
-      const cause = error_ instanceof Error ? error_.message : String(error_)
+      const cause = toErrorMessage(error_)
       const error = new Error(`Acquired the Action coordination lock but could not record its holder: ${cause}`)
       logger.warning('Recording the lock holder failed; releasing the lock', {error: cause, repo, holderId})
       await releaseBestEffort(config, repo, etag, logger)

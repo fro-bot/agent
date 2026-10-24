@@ -22,6 +22,7 @@ import * as path from 'node:path'
 import process from 'node:process'
 import {parseResponseFile, RESPONSE_FILE_VERDICT_REJECTION_REASONS, RESPONSE_SURFACE_POLICIES} from '@fro-bot/runtime'
 import {BOT_COMMENT_MARKER, type CommentTarget, type Octokit} from '../../services/github/types.js'
+import {toErrorMessage} from '../../shared/errors.js'
 import {readThread} from '../comments/reader.js'
 import {postComment} from '../comments/writer.js'
 import {checkForkOrSelfGuard, submitReviewWithHeadGuard} from '../reviews/review-guards.js'
@@ -133,7 +134,7 @@ function responsePathForLog(filePath: string): string {
 }
 
 function readErrorDetail(error: unknown, responseFilePathCandidates: readonly string[]): string {
-  const detail = error instanceof Error ? error.message : String(error)
+  const detail = toErrorMessage(error)
   return responseFilePathCandidates.reduce(
     (sanitized, candidate) => sanitized.replaceAll(candidate, responsePathForLog(candidate)),
     detail,
@@ -166,7 +167,7 @@ async function inspectDirectory(
       directoryEntries,
     }
   } catch (error) {
-    const inspectionDetail = error instanceof Error ? error.message : String(error)
+    const inspectionDetail = toErrorMessage(error)
     return errorCode(error) === 'ENOENT'
       ? {
           directoryStatus: 'missing',
@@ -643,7 +644,7 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
 
     return {delivered: true, kind: 'review'}
   } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error)
+    const detail = toErrorMessage(error)
     logger.error('Response-post: submitReview failed', {error: detail})
     return failure('post-failed', detail)
   }

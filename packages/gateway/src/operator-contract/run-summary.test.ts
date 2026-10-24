@@ -306,6 +306,24 @@ describe('toRunSummary — entity_ref consistency guard', () => {
     expect(result).toBeNull()
   })
 
+  it('treats a different spelling of the same repo as a match: GitHub names are case-insensitive', () => {
+    // #given a legacy entity_ref that kept the repo's GitHub spelling, against the lowercase stored binding
+    const runState = makeRunState({entity_ref: 'OwnerA/RepoA#5'})
+    const binding = {owner: 'ownera', repo: 'repoa'}
+
+    // #when projected
+    const result = toRunSummary(runState, binding)
+
+    // #then it is the same repo, and the summary still carries the binding's stored spelling
+    assert(result !== null, 'expected a non-null summary')
+    expect(result.repo).toBe('ownera/repoa')
+  })
+
+  it('still returns null for a different repo whatever the case', () => {
+    expect(toRunSummary(makeRunState({entity_ref: 'OWNERB/repoA#5'}), {owner: 'ownera', repo: 'repoa'})).toBeNull()
+    expect(toRunSummary(makeRunState({entity_ref: 'ownerA/REPOB#5'}), {owner: 'ownera', repo: 'repoa'})).toBeNull()
+  })
+
   it('returns non-null when entity_ref owner/repo matches the binding', () => {
     // #given a run whose entity_ref matches the binding
     const runState = makeRunState({entity_ref: 'ownerA/repoA#5'})

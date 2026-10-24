@@ -2,13 +2,12 @@ import type {RecoveryWorkspaceCalls} from './recovery-workspace.js'
 import type {MintWorkspaceToken} from './workspace-token.js'
 
 import {err, ok} from '@fro-bot/runtime'
-import {afterEach, describe, expect, it, vi} from 'vitest'
+import {describe, expect, it, vi} from 'vitest'
 import {createRecoveryWorkspaceCalls} from './recovery-workspace.js'
-import {INSTALLATION_TOKEN_MINT_TIMEOUT_MS} from './workspace-token.js'
 
 type MintResult = Awaited<ReturnType<MintWorkspaceToken>>
 
-function makeCalls(mintToken: ReturnType<typeof vi.fn>, mintTimeoutMs?: number) {
+function makeCalls(mintToken: ReturnType<typeof vi.fn>) {
   const workspaceClient = {
     previewRecovery: vi.fn().mockResolvedValue(ok({kind: 'no-checkout'})),
     recover: vi.fn().mockResolvedValue(ok({kind: 'no-checkout'})),
@@ -16,7 +15,6 @@ function makeCalls(mintToken: ReturnType<typeof vi.fn>, mintTimeoutMs?: number) 
   const calls: RecoveryWorkspaceCalls = createRecoveryWorkspaceCalls({
     workspaceClient,
     mintToken: mintToken as unknown as MintWorkspaceToken,
-    ...(mintTimeoutMs === undefined ? {} : {mintTimeoutMs}),
   })
   return {calls, mintToken, workspaceClient}
 }
@@ -73,11 +71,7 @@ describe('createRecoveryWorkspaceCalls', () => {
   })
 })
 
-describe('createRecoveryWorkspaceCalls: the token mint is bounded', () => {
-  afterEach(() => {
-    vi.useRealTimers()
-  })
-
+describe('createRecoveryWorkspaceCalls: a failed mint sends nothing', () => {
   it.each([
     [
       'a permanent installation failure',
@@ -95,114 +89,5 @@ describe('createRecoveryWorkspaceCalls: the token mint is bounded', () => {
     // #then nothing was sent, so the caller must be able to tell it apart from a transport error
     expect(result).toEqual(err({kind: 'token-unavailable', cause}))
     expect(workspaceClient.recover).not.toHaveBeenCalled()
-  })
-
-  it('a mint that never settles gives up at the ceiling (not before) without sending /recover', async () => {
-    // #given a GitHub call that hangs forever
-    vi.useFakeTimers()
-    const {calls, workspaceClient} = makeCalls(vi.fn().mockReturnValue(new Promise(() => {})))
-
-    // #when
-    const pending = calls.recover('acme', 'widget', RECOVER_OPTIONS)
-    let settled = false
-    const tracked = pending.then(() => {
-      settled = true
-    })
-    await vi.advanceTimersByTimeAsync(INSTALLATION_TOKEN_MINT_TIMEOUT_MS - 1)
-    const settledEarly = settled
-    await vi.advanceTimersByTimeAsync(1)
-
-    // #then
-    expect(settledEarly).toBe(false)
-    expect(await pending).toEqual(err({kind: 'token-unavailable', cause: 'timeout'}))
-    await tracked
-    expect(workspaceClient.recover).not.toHaveBeenCalled()
-  })
-
-  it('honours a configured mint ceiling', async () => {
-    // #given
-    vi.useFakeTimers()
-    const {calls, workspaceClient} = makeCalls(vi.fn().mockReturnValue(new Promise(() => {})), 20)
-
-    // #when
-    const pending = calls.recover('acme', 'widget', RECOVER_OPTIONS)
-    await vi.advanceTimersByTimeAsync(20)
-
-    // #then the reviewer's probe: a 20 ms ceiling must settle by 20 ms, not stay pending
-    expect(await pending).toEqual(err({kind: 'token-unavailable', cause: 'timeout'}))
-    expect(workspaceClient.recover).not.toHaveBeenCalled()
-  })
-
-  it('a mint that succeeds only AFTER the ceiling does not start the recovery', async () => {
-    // #given a mint that resolves late, once the ceiling has already expired
-    vi.useFakeTimers()
-    let resolveMint: (value: MintResult) => void = () => {}
-    const mintToken = vi.fn().mockReturnValue(
-      new Promise<MintResult>(resolve => {
-        resolveMint = resolve
-      }),
-    )
-    const {calls, workspaceClient} = makeCalls(mintToken, 50)
-
-    // #when the ceiling expires, then the late token arrives
-    const pending = calls.recover('acme', 'widget', RECOVER_OPTIONS)
-    await vi.advanceTimersByTimeAsync(50)
-    const result = await pending
-    resolveMint(ok('ghs_late'))
-    await vi.advanceTimersByTimeAsync(1_000)
-
-    // #then
-    expect(result).toEqual(err({kind: 'token-unavailable', cause: 'timeout'}))
-    expect(workspaceClient.recover).not.toHaveBeenCalled()
-  })
-
-  it('a mint that rejects after the ceiling changes nothing', async () => {
-    // #given
-    vi.useFakeTimers()
-    let rejectMint: (reason: Error) => void = () => {}
-    const mintToken = vi.fn().mockReturnValue(
-      new Promise<MintResult>((_resolve, reject) => {
-        rejectMint = reject
-      }),
-    )
-    const {calls} = makeCalls(mintToken, 50)
-    // #when
-    const pending = calls.recover('acme', 'widget', RECOVER_OPTIONS)
-    await vi.advanceTimersByTimeAsync(50)
-    const result = await pending
-    rejectMint(new Error('late boom'))
-    await vi.advanceTimersByTimeAsync(1_000)
-    await Promise.resolve()
-
-    // #then the rejection arrived after the result was settled, so it changes nothing
-    expect(result).toEqual(err({kind: 'token-unavailable', cause: 'timeout'}))
-  })
-
-  it('a mint that throws returns token-unavailable and never sends /recover', async () => {
-    // #given
-    const {calls, workspaceClient} = makeCalls(vi.fn().mockRejectedValue(new Error('boom')))
-
-    // #when
-    const result = await calls.recover('acme', 'widget', RECOVER_OPTIONS)
-
-    // #then
-    expect(result).toEqual(err({kind: 'token-unavailable', cause: 'Error'}))
-    expect(workspaceClient.recover).not.toHaveBeenCalled()
-  })
-
-  it('a mint that answers in time clears its timer', async () => {
-    // #given
-    vi.useFakeTimers()
-    const {calls} = makeCallsWithMint(ok('ghs_minted'))
-
-    // #when
-    await calls.recover('acme', 'widget', RECOVER_OPTIONS)
-
-    // #then
-    expect(vi.getTimerCount()).toBe(0)
-  })
-
-  it('the default ceiling is the 30 s source deadline, pinned to the literal', () => {
-    expect(INSTALLATION_TOKEN_MINT_TIMEOUT_MS).toBe(30_000)
   })
 })

@@ -39,7 +39,7 @@ import type {CoordinationConfig, RunState, Surface} from '@fro-bot/runtime'
 
 import type {BindingsStore} from '../bindings/store.js'
 import type {GatewayLogger} from '../discord/client.js'
-import {getRunKey, getRunPrefix, parseRunState} from '@fro-bot/runtime'
+import {getRunKey, getRunPrefix, parseRunState, toErrorMessage} from '@fro-bot/runtime'
 
 // ---------------------------------------------------------------------------
 // Public interface
@@ -338,7 +338,7 @@ export function createRunIndex(deps: RunIndexDeps): RunIndex {
       bindingsResult = await bindingsStore.listBindings()
     } catch (error: unknown) {
       logger.warn(
-        {err: error instanceof Error ? error.message : String(error)},
+        {err: toErrorMessage(error)},
         'run-index: listBindings threw unexpectedly — cannot resolve via fallback',
       )
       return undefined
@@ -364,10 +364,7 @@ export function createRunIndex(deps: RunIndexDeps): RunIndex {
       try {
         runs = await findRunsForRepo(repo)
       } catch (error: unknown) {
-        logger.warn(
-          {repo, err: error instanceof Error ? error.message : String(error)},
-          'run-index: findRunsForRepo threw — skipping repo',
-        )
+        logger.warn({repo, err: toErrorMessage(error)}, 'run-index: findRunsForRepo threw — skipping repo')
         continue
       }
 
@@ -451,7 +448,7 @@ export function createRunIndex(deps: RunIndexDeps): RunIndex {
         return runs.find(r => r.run_id === runId)
       } catch (error: unknown) {
         logger.warn(
-          {repo, runId, err: error instanceof Error ? error.message : String(error)},
+          {repo, runId, err: toErrorMessage(error)},
           'run-index: findRunsForRepo threw in readRun — returning undefined',
         )
         return undefined
@@ -484,10 +481,7 @@ export function createRunIndex(deps: RunIndexDeps): RunIndex {
       // Defense in depth: never hand back a state for a different run than the one asked for.
       return parsed.data.run_id === runId ? parsed.data : undefined
     } catch (error: unknown) {
-      logger.warn(
-        {repo, runId, err: error instanceof Error ? error.message : String(error)},
-        'run-index: readRun threw — returning undefined',
-      )
+      logger.warn({repo, runId, err: toErrorMessage(error)}, 'run-index: readRun threw — returning undefined')
       return undefined
     }
   }

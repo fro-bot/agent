@@ -30,7 +30,7 @@
 import type {GatewayLogger} from '../discord/client.js'
 import type {PermissionReply} from '../operator-contract/approval.js'
 
-import {getObjectProperty, getStringProperty} from '@fro-bot/runtime'
+import {getObjectProperty, getStringProperty, toErrorMessage} from '@fro-bot/runtime'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -258,7 +258,7 @@ export function createPermissionCoordinator(deps: PermissionCoordinatorDeps): Pe
       onPending(request)
     } catch (error) {
       logger.error(
-        {requestID: request.requestID, detail: error instanceof Error ? error.message : String(error)},
+        {requestID: request.requestID, detail: toErrorMessage(error)},
         'approvals: onPending callback threw (ignored)',
       )
     }
@@ -271,7 +271,7 @@ export function createPermissionCoordinator(deps: PermissionCoordinatorDeps): Pe
         onReplied(event)
       } catch (error) {
         logger.error(
-          {requestID: event.requestID, detail: error instanceof Error ? error.message : String(error)},
+          {requestID: event.requestID, detail: toErrorMessage(error)},
           'approvals: onReplied callback threw (ignored)',
         )
       }
@@ -282,7 +282,7 @@ export function createPermissionCoordinator(deps: PermissionCoordinatorDeps): Pe
         onSettled(event.requestID, event.reply, 'replied')
       } catch (error) {
         logger.error(
-          {requestID: event.requestID, detail: error instanceof Error ? error.message : String(error)},
+          {requestID: event.requestID, detail: toErrorMessage(error)},
           'approvals: onSettled callback threw (ignored)',
         )
       }
@@ -294,10 +294,7 @@ export function createPermissionCoordinator(deps: PermissionCoordinatorDeps): Pe
     try {
       onDispose([...ownedSessionIDs])
     } catch (error) {
-      logger.error(
-        {detail: error instanceof Error ? error.message : String(error)},
-        'approvals: onDispose callback threw (ignored)',
-      )
+      logger.error({detail: toErrorMessage(error)}, 'approvals: onDispose callback threw (ignored)')
     }
   }
 

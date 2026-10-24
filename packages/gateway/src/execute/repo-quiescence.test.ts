@@ -159,20 +159,49 @@ describe('createRepoQuiescenceChecker', () => {
     expect(logged.sessionIds).toHaveLength(32)
   })
 
-  it.each(['acme', 'a/b/c', '', '../widget', 'acme/..', 'acme/wid get', '/acme/widget', 'acme/widget/'])(
-    'returns unknown without calling the client for invalid repo %j',
-    async repo => {
-      // #given
-      const status = vi.fn<StatusFn>(async () => okResult({}))
+  it.each([
+    'acme',
+    'a/b/c',
+    '',
+    '../widget',
+    'acme/..',
+    'acme/wid get',
+    '/acme/widget',
+    'acme/widget/',
+    'acme/widget#1',
+    'acme/widget?x=1',
+    String.raw`acme\widget`,
+    'acme/wid\u0000get',
+    '\u212Aey/widget',
+    'acme/\u212Aey',
+    '\u0130stanbul/widget',
+    'acme/wid\u200Bget',
+    'acme/a..b',
+    '-acme/widget',
+    'acme_/widget',
+  ])('returns unknown without calling the client for invalid repo %j', async repo => {
+    // #given
+    const status = vi.fn<StatusFn>(async () => okResult({}))
 
-      // #when
-      const result = await checkerFor(status)({repo, signal: signal()})
+    // #when
+    const result = await checkerFor(status)({repo, signal: signal()})
 
-      // #then
-      expect(result).toEqual({kind: 'unknown', source: 'unavailable', directory: null, reason: 'invalid-repo'})
-      expect(status).not.toHaveBeenCalled()
-    },
-  )
+    // #then
+    expect(result).toEqual({kind: 'unknown', source: 'unavailable', directory: null, reason: 'invalid-repo'})
+    expect(status).not.toHaveBeenCalled()
+  })
+
+  it('resolves a padded repo through the slug contract to the same canonical directory', async () => {
+    // #given the slug parser trims, as it does everywhere else
+    const status = vi.fn<StatusFn>(async () => okResult({}))
+
+    // #when
+    const result = await checkerFor(status)({repo: '  Acme/Widget ', signal: signal()})
+
+    // #then
+    expect(result).toMatchObject({kind: 'clear', directory: '/workspace/repos/acme/widget'})
+    expect(status).toHaveBeenCalledOnce()
+  })
 
   describe('every failure mode is unknown', () => {
     const cases: readonly (readonly [string, StatusFn])[] = [

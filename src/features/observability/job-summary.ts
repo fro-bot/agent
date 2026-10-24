@@ -123,6 +123,28 @@ function cacheSaveResultRemediation(
 }
 
 /**
+ * Why a save withheld the object-store publish. Closed set, pinned by the `Record` types below:
+ * - `lease-released`: the post-action retry. The main step already released the coordination lease.
+ * - `lease-not-acquired`: the main step's cleanup, for a run that returned before acquiring the lock (a dedup
+ *   or routing skip).
+ * In both, the shared session object is written with an unconditional upload, so publishing without the
+ * lease could overwrite a newer session from a later or concurrent run.
+ */
+export type StorePublishWithheldReason = 'lease-released' | 'lease-not-acquired'
+
+const STORE_PUBLISH_WITHHELD_LABELS = {
+  'lease-released': 'lease released',
+  'lease-not-acquired': 'no lease acquired',
+} as const satisfies Record<StorePublishWithheldReason, string>
+
+const STORE_PUBLISH_WITHHELD_NOTES = {
+  'lease-released':
+    'The object store was not written by the post-action retry: the main step already released the coordination lease, and publishing the session without it could overwrite a newer session from a later run. Only the Actions cache was retried.',
+  'lease-not-acquired':
+    'The object store was not written: this run never acquired the coordination lease, and publishing the session without it could overwrite a newer session from a concurrent run. Only the Actions cache was written.',
+} as const satisfies Record<StorePublishWithheldReason, string>
+
+/**
  * Writes a standalone job-summary row reporting whether session state persisted this run.
  * Deliberately separate from `writeJobSummary`: the outcome is only known once `saveCache`
  * runs in `cleanup.ts`, which executes after `runFinalizeWithResult` (the caller of
@@ -142,6 +164,7 @@ export async function writeCacheSaveResultSummary(
   phase: 'main' | 'post-retry' | 'post-skip-safety',
   logger: Logger,
   declineReason?: string,
+  storePublishWithheld?: StorePublishWithheldReason,
 ): Promise<void> {
   try {
     const value = toCacheSaveStateValue(result)
@@ -157,6 +180,12 @@ export async function writeCacheSaveResultSummary(
         {data: 'Value', header: true},
       ],
       ['Cache Save Result', formatCacheSaveResult(value)],
+      // Only the post-action retry withholds the publish: the main step released the coordination lease, and
+      // an unleased upload of the shared session object could overwrite a newer one. Reported next to the
+      // cache result so a reader sees what the retry did NOT do.
+      ...(storePublishWithheld === undefined
+        ? []
+        : [['Object Store Publish', `withheld (${STORE_PUBLISH_WITHHELD_LABELS[storePublishWithheld]})`]]),
     ])
 
     const remediation = cacheSaveResultRemediation(result, phase)
@@ -171,6 +200,10 @@ export async function writeCacheSaveResultSummary(
     // shape. A reader must be able to tell WHY without reading logs, so this is not a
     // second channel -- it augments the same 'Session Persistence' row this function
     // always writes.
+    if (storePublishWithheld !== undefined) {
+      core.summary.addRaw(`${htmlParagraph(STORE_PUBLISH_WITHHELD_NOTES[storePublishWithheld])}\n`)
+    }
+
     if (declineReason != null && result.outcome === 'ownership-declined') {
       core.summary.addRaw(`${htmlParagraph(`${htmlStrong('Reason:')} ${htmlText(declineReason)}`)}\n`)
     }

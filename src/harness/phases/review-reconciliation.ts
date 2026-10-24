@@ -12,6 +12,7 @@ import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
 import {checkForkOrSelfGuard, submitReviewWithHeadGuard} from '../../features/reviews/review-guards.js'
 import {decideReconciliation, parseVerdict} from '../../features/reviews/review-reconciliation.js'
+import {toErrorMessage} from '../../shared/errors.js'
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -284,7 +285,7 @@ export async function runReviewReconciliation(
     logger.info('Review reconciliation: APPROVE submitted successfully', {prNumber})
     return {reconciled: true, reason: 'approved'}
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
+    const message = toErrorMessage(error)
     logger.warning('Review reconciliation: error during phase, no-oping', {
       prNumber,
       error: message,

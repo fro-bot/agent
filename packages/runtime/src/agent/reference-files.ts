@@ -4,6 +4,7 @@ import type {ReferenceFile} from './types.js'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import {pathToFileURL} from 'node:url'
+import {toErrorMessage} from '../shared/errors.js'
 
 export type WriteReferenceFile = (filePath: string, content: string) => Promise<void>
 
@@ -28,7 +29,7 @@ export async function materializeReferenceFiles(
       })
     } catch (error) {
       logger.warning('Failed to materialize reference file', {
-        error: error instanceof Error ? error.message : String(error),
+        error: toErrorMessage(error),
         filename: referenceFile.filename,
         path: filePath,
       })
