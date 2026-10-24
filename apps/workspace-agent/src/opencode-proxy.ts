@@ -225,6 +225,8 @@ export function createOpencodeProxy(options: OpencodeProxyOptions): OpencodeProx
     let inactivityTimer: ReturnType<typeof setTimeout> | undefined
     let settled = false
     const reqRef: {current: http.ClientRequest | undefined} = {current: undefined}
+    // SSE intent: the request's Accept until response headers arrive, then the response's Content-Type.
+    let responseIsSSE: boolean | undefined
 
     const armTimer = (): void => {
       clearTimeout(inactivityTimer)
@@ -302,6 +304,16 @@ export function createOpencodeProxy(options: OpencodeProxyOptions): OpencodeProx
         })
       }
 
+      // `pipe` ends `res` only when the upstream ends; an upstream that dies mid-response would leave the caller waiting forever.
+      upstreamRes.on('error', () => {
+        res.destroy()
+      })
+      upstreamRes.on('close', () => {
+        if (upstreamRes.complete === false) res.destroy()
+      })
+
+      responseIsSSE = isSSE
+
       res.writeHead(upstreamRes.statusCode ?? 502, upstreamRes.headers)
       // Pipe without buffering — SSE streams through correctly
       upstreamRes.pipe(res, {end: true})
@@ -311,6 +323,12 @@ export function createOpencodeProxy(options: OpencodeProxyOptions): OpencodeProx
     // http.request() returns, so reqRef.current is set before any timer fires.
     reqRef.current = upstreamReq
     armTimer()
+
+    // An SSE stream has no end and no inactivity timer, so a departed caller must release the upstream `/event` request.
+    res.once('close', () => {
+      const isSSE = responseIsSSE ?? (req.headers.accept ?? '').includes('text/event-stream')
+      if (isSSE === true && res.writableFinished === false) upstreamReq.destroy()
+    })
 
     upstreamReq.on('error', (err: Error) => {
       // Mark settled (symmetric with the upstreamRes handlers) so a timer firing

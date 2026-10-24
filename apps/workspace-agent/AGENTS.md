@@ -122,6 +122,8 @@ One process logger (built in `main.ts`, writing to container stderr) is shared b
 
 Never log names or contents that come from the agent-writable checkout (changed paths, config keys, submodule or branch names), request bodies, headers, the query string (it carries the workspace directory), or any token. Counts and closed reasons only.
 
+**OpenCode proxy teardown** (`opencode-proxy.ts`): the proxy closes a proxied response in both directions. When the upstream response errors or closes without completing, the downstream response is destroyed, for SSE and non-SSE alike, so a caller never waits on a body that cannot finish; a response that completed is untouched. When an SSE client disconnects before its response finished, the upstream request is destroyed, so the `/event` connection to OpenCode does not outlive its reader. A non-SSE client disconnect does not destroy the upstream request: that response runs to its own end or to the inactivity timeout. Neither path logs anything of its own.
+
 ## Package layout
 
 ```
