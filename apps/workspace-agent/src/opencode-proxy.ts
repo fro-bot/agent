@@ -302,6 +302,21 @@ export function createOpencodeProxy(options: OpencodeProxyOptions): OpencodeProx
         })
       }
 
+      // `pipe` ends `res` only when the upstream ends; an upstream that dies mid-response would leave the caller waiting forever.
+      upstreamRes.on('error', () => {
+        res.destroy()
+      })
+      upstreamRes.on('close', () => {
+        if (upstreamRes.complete === false) res.destroy()
+      })
+
+      // An SSE stream has no end and no inactivity timer, so a departed caller must release the upstream `/event` request.
+      if (isSSE === true) {
+        res.once('close', () => {
+          if (res.writableFinished === false) upstreamReq.destroy()
+        })
+      }
+
       res.writeHead(upstreamRes.statusCode ?? 502, upstreamRes.headers)
       // Pipe without buffering — SSE streams through correctly
       upstreamRes.pipe(res, {end: true})
