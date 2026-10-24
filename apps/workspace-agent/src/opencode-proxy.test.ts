@@ -1149,23 +1149,16 @@ describe('opencode-proxy — closes both directions', () => {
 
   interface Downstream {
     readonly req: http.ClientRequest
-    readonly response: Promise<http.IncomingMessage>
     /** Resolves when the response is gone, and says whether it had completed. */
     readonly closed: Promise<{readonly complete: boolean; readonly received: string}>
     readonly firstChunk: Promise<string>
   }
 
-  function getThroughProxy(proxyUrl: string, path: string): Downstream {
+  function getThroughProxy(proxyUrl: string, path: string, extraHeaders: Record<string, string> = {}): Downstream {
     const received: string[] = []
     let resolveFirst: (chunk: string) => void = () => {}
     const firstChunk = new Promise<string>(resolve => {
       resolveFirst = resolve
-    })
-    let resolveResponse: (res: http.IncomingMessage) => void = () => {}
-    let rejectResponse: (error: Error) => void = () => {}
-    const response = new Promise<http.IncomingMessage>((resolve, reject) => {
-      resolveResponse = resolve
-      rejectResponse = reject
     })
     let resolveClosed: (value: {complete: boolean; received: string}) => void = () => {}
     const closed = new Promise<{complete: boolean; received: string}>(resolve => {
@@ -1179,10 +1172,9 @@ describe('opencode-proxy — closes both directions', () => {
         path,
         method: 'GET',
         agent: false,
-        headers: {authorization: `Bearer ${TEST_TOKEN}`, connection: 'close'},
+        headers: {authorization: `Bearer ${TEST_TOKEN}`, connection: 'close', ...extraHeaders},
       },
       res => {
-        resolveResponse(res)
         res.on('data', (chunk: Buffer) => {
           const text = chunk.toString('utf8')
           received.push(text)
@@ -1194,12 +1186,11 @@ describe('opencode-proxy — closes both directions', () => {
         })
       },
     )
-    req.on('error', (error: Error) => {
-      rejectResponse(error)
+    req.on('error', () => {
       resolveClosed({complete: false, received: received.join('')})
     })
     req.end()
-    return {req, response, closed, firstChunk}
+    return {req, closed, firstChunk}
   }
 
   it('closes the downstream SSE response when the upstream socket dies after headers and one chunk', async () => {
@@ -1295,6 +1286,74 @@ describe('opencode-proxy — closes both directions', () => {
 
     // #then the proxy ends its upstream request instead of holding the stream open
     await expect(within(upstreamClosed, BOUND_MS, 'the upstream /event connection to close')).resolves.toBeUndefined()
+  })
+
+  it('closes the upstream /event request when an SSE client disconnects before the upstream sends headers', async () => {
+    // #given an upstream that has accepted the SSE request but not yet answered, and reports when its connection closes
+    let resolveAccepted: () => void = () => {}
+    const accepted = new Promise<void>(resolve => {
+      resolveAccepted = resolve
+    })
+    let resolveUpstreamClosed: () => void = () => {}
+    const upstreamClosed = new Promise<void>(resolve => {
+      resolveUpstreamClosed = resolve
+    })
+    const upstreamUrl = await startRawUpstream((req, res) => {
+      req.on('close', resolveUpstreamClosed)
+      res.on('close', resolveUpstreamClosed)
+      resolveAccepted()
+      // Headers arrive only after the client has long gone.
+      setTimeout(() => {
+        if (res.destroyed === false) {
+          res.writeHead(200, {'Content-Type': 'text/event-stream'})
+          res.write('data: late\n\n')
+        }
+      }, 400)
+    })
+    const proxyUrl = await startProxyFor(upstreamUrl)
+    const downstream = getThroughProxy(proxyUrl, '/event', {accept: 'text/event-stream'})
+    await within(accepted, BOUND_MS, 'the upstream to accept the request')
+
+    // #when the client goes away before any header was sent
+    downstream.req.destroy()
+
+    // #then the proxy ends the upstream request without waiting for headers it would then have to cancel
+    await expect(
+      within(upstreamClosed, 250, 'the upstream /event connection to close before its late headers'),
+    ).resolves.toBeUndefined()
+  })
+
+  it('leaves the upstream request alone when a non-SSE client disconnects before the upstream sends headers', async () => {
+    // #given a slow non-SSE call (like promptAsync) the upstream has accepted but not answered
+    let resolveAccepted: () => void = () => {}
+    const accepted = new Promise<void>(resolve => {
+      resolveAccepted = resolve
+    })
+    let resolveUpstreamClosed: () => void = () => {}
+    const upstreamClosed = new Promise<void>(resolve => {
+      resolveUpstreamClosed = resolve
+    })
+    let upstreamRes: http.ServerResponse | undefined
+    const upstreamUrl = await startRawUpstream((req, res) => {
+      upstreamRes = res
+      req.on('close', resolveUpstreamClosed)
+      res.on('close', resolveUpstreamClosed)
+      resolveAccepted()
+    })
+    const proxyUrl = await startProxyFor(upstreamUrl)
+    const downstream = getThroughProxy(proxyUrl, '/session/ses_1/prompt_async', {accept: 'application/json'})
+    await within(accepted, BOUND_MS, 'the upstream to accept the request')
+
+    // #when the client goes away before any header was sent
+    downstream.req.destroy()
+    const outcome = await Promise.race([
+      upstreamClosed.then(() => 'upstream-closed' as const),
+      new Promise<'still-open'>(resolve => setTimeout(() => resolve('still-open'), 300)),
+    ])
+
+    // #then the proxy did not abandon the call on the client's behalf
+    expect(outcome).toBe('still-open')
+    upstreamRes?.destroy()
   })
 
   it('leaves the upstream request alone when a non-SSE client disconnects mid-response', async () => {
