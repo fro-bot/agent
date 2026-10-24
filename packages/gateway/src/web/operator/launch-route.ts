@@ -277,6 +277,9 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
       return notFoundResponse(c)
     }
     const binding = access.binding
+    // From here on the repo is identified by the stored binding's case, never by the request's: the request may
+    // have spelled it differently (`Acme/Widget`), and the case must not leak into a channel id or a log field.
+    const {owner: boundOwner, repo: boundRepo} = binding
 
     // ── Gate 7: Per-operator idempotency guard ────────────────────────────────
     // Key is namespaced: ${githubUserId}:${clientKey} so operator A cannot
@@ -349,7 +352,7 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
       // The operator's text is shown back on the run card, so launchWork stores it as submitted.
       persistOperatorPrompt: true,
       runId,
-      channelId: `web:${owner}/${repo}`,
+      channelId: `web:${boundOwner}/${boundRepo}`,
       guildId: undefined,
       surface: 'web' as const,
       binding,
@@ -376,33 +379,42 @@ export function buildLaunchRoute(app: Hono, deps: LaunchRouteDeps): void {
           deps.idempotencyGuard.commit(githubUserId, idempotencyKey)
         }
         committed = true
-        deps.logger.info({githubUserId, runId: admission.runId, owner, repo}, 'launch: accepted')
+        deps.logger.info({githubUserId, runId: admission.runId, owner: boundOwner, repo: boundRepo}, 'launch: accepted')
         return c.json({runId: admission.runId}, 202)
       }
 
       // Admission rejected — map reason to a coarse HTTP error.
       // rollback happens in finally.
       if (admission.reason === 'cap' || admission.reason === 'queue-full') {
-        deps.logger.warn({githubUserId, owner, repo, gate: admission.reason}, 'launch: rejected — at capacity')
+        deps.logger.warn(
+          {githubUserId, owner: boundOwner, repo: boundRepo, gate: admission.reason},
+          'launch: rejected — at capacity',
+        )
         return c.json({error: 'unavailable'}, 503)
       }
 
       // The route already enforces the cap above; launchWork re-checks at the persistence boundary.
       if (admission.reason === OPERATOR_LAUNCH_PROMPT_TOO_LONG) {
-        deps.logger.warn({githubUserId, owner, repo, gate: admission.reason}, 'launch: rejected — prompt too long')
+        deps.logger.warn(
+          {githubUserId, owner: boundOwner, repo: boundRepo, gate: admission.reason},
+          'launch: rejected — prompt too long',
+        )
         return c.json({error: 'bad request', reason: OPERATOR_LAUNCH_PROMPT_TOO_LONG}, 400)
       }
 
       // 'empty-prompt' — defensive; the route already validates empty prompt above.
-      deps.logger.warn({githubUserId, owner, repo, gate: 'empty-prompt'}, 'launch: rejected — empty prompt')
+      deps.logger.warn(
+        {githubUserId, owner: boundOwner, repo: boundRepo, gate: 'empty-prompt'},
+        'launch: rejected — empty prompt',
+      )
       return c.json({error: 'bad request'}, 400)
     } catch (launchError: unknown) {
       deps.logger.error(
         {
           githubUserId,
           runId,
-          owner,
-          repo,
+          owner: boundOwner,
+          repo: boundRepo,
           // The error NAME only: a message can quote prompt-bearing record text.
           err: launchError instanceof Error ? launchError.name : typeof launchError,
         },

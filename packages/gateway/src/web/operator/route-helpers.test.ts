@@ -91,6 +91,43 @@ describe('resolveRepoAccess — allowed', () => {
   })
 })
 
+describe('resolveRepoAccess — case (D1)', () => {
+  it.each([
+    ['Acme', 'Widget'],
+    ['ACME', 'WIDGET'],
+    ['acme', 'Widget'],
+    ['Acme', 'widget'],
+  ])(
+    'finds the binding stored as acme/widget for the request %s/%s, reading the lowercase key',
+    async (owner, repo) => {
+      // #given a binding stored under the lowercase key, as add-project always writes it
+      const {deps, getBindingByRepo} = makeDeps()
+
+      // #when a client sends the slug in another case
+      const access = await resolveRepoAccess(owner, repo, deps)
+
+      // #then the lookup is by the canonical (lowercase) key, once, and returns the stored binding as it is
+      expect(access).toEqual({kind: 'allowed', binding: BINDING})
+      expect(getBindingByRepo).toHaveBeenCalledExactlyOnceWith('acme', 'widget')
+    },
+  )
+
+  it('still validates the names as sent: a malformed mixed-case name makes zero store calls', async () => {
+    const {deps, getBindingByRepo} = makeDeps()
+
+    const access = await resolveRepoAccess('-Acme', 'Widget', deps)
+
+    expect(access).toEqual({kind: 'denied'})
+    expect(getBindingByRepo).not.toHaveBeenCalled()
+  })
+
+  it('denies a mixed-case request for an unbound repo exactly like a lowercase one', async () => {
+    const {deps} = makeDeps({success: true, data: null})
+
+    expect(await resolveRepoAccess('Acme', 'Widget', deps)).toEqual({kind: 'denied'})
+  })
+})
+
 describe('resolveRepoAccess — denied', () => {
   it('denies an unbound repo', async () => {
     const {deps, getDenylistState} = makeDeps({success: true, data: null})

@@ -165,9 +165,14 @@ export function buildDispatchRoute(app: Hono, deps: DispatchRouteDeps): void {
       return notFoundResponse(c)
     }
 
+    // From here on the repo is identified by the stored binding's case, never by the request's: the request may
+    // have spelled it differently (`Acme/Widget`), and the case must not reach the idempotency fingerprint, the
+    // GitHub call, the audit record or the reply.
+    const {owner: boundOwner, repo: boundRepo} = access.binding
+
     if (idempotencyKey !== undefined) {
       const idempotencyMapKey = `${githubUserId}:${idempotencyKey}`
-      const fingerprint = fingerprintDispatchRequest(owner, repo, taskField.trim())
+      const fingerprint = fingerprintDispatchRequest(boundOwner, boundRepo, taskField.trim())
       const priorMarker = deps.idempotencyGuard.check(githubUserId, idempotencyKey)
       if (priorMarker !== undefined) {
         const completed = completedDispatches.get(idempotencyMapKey)
@@ -201,7 +206,7 @@ export function buildDispatchRoute(app: Hono, deps: DispatchRouteDeps): void {
       deps.idempotencyGuard.reserve(githubUserId, idempotencyKey, randomUUID())
       let committed = false
       try {
-        const dispatchPromise = deps.dispatchWorkflow(owner, repo, taskField)
+        const dispatchPromise = deps.dispatchWorkflow(boundOwner, boundRepo, taskField)
         inFlightDispatches.set(idempotencyMapKey, {fingerprint, promise: dispatchPromise})
         const outcome = await dispatchPromise
         if (outcome.outcome === 'accepted') {
@@ -214,7 +219,7 @@ export function buildDispatchRoute(app: Hono, deps: DispatchRouteDeps): void {
           })
           pruneCompletedDispatches(completedDispatches, deps.now())
         }
-        emitDispatchAudit(deps.auditLogger, outcome, githubUserId, owner, repo)
+        emitDispatchAudit(deps.auditLogger, outcome, githubUserId, boundOwner, boundRepo)
         return c.json({outcome}, 200)
       } catch {
         return c.json({error: 'internal error'}, 500)
@@ -225,8 +230,8 @@ export function buildDispatchRoute(app: Hono, deps: DispatchRouteDeps): void {
     }
 
     try {
-      const outcome = await deps.dispatchWorkflow(owner, repo, taskField)
-      emitDispatchAudit(deps.auditLogger, outcome, githubUserId, owner, repo)
+      const outcome = await deps.dispatchWorkflow(boundOwner, boundRepo, taskField)
+      emitDispatchAudit(deps.auditLogger, outcome, githubUserId, boundOwner, boundRepo)
       return c.json({outcome}, 200)
     } catch {
       return c.json({error: 'internal error'}, 500)

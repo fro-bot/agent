@@ -72,7 +72,7 @@ export interface RepoAccessDeps<B extends BindingDenyKeySource> {
  * Order, fail-closed throughout:
  *   1. Validate the names (the GitHub name rules in `@fro-bot/runtime`) — a malformed name is `denied` with zero
  *      object-store calls.
- *   2. Read the binding ONCE. A store error or throw is `unavailable`; a missing binding is `denied`.
+ *   2. Read the binding ONCE, by the lowercase key, so `Acme/Widget` finds a binding stored as `acme/widget`. A store error or throw is `unavailable`; a missing binding is `denied`.
  *   3. Prime the denylist, then consult it with the binding's deny keys. A denylisted, unprimed, or
  *      keyless repo is `denied`.
  *
@@ -89,7 +89,11 @@ export async function resolveRepoAccess<B extends BindingDenyKeySource>(
   }
 
   try {
-    const lookup = await lookupBindingDenyKeys(owner, repo, deps.bindingsLookup)
+    // Bindings are only ever written lowercase (add-project canonicalises before it stores), and GitHub treats
+    // owner and repo names case-insensitively, so the lookup key is the lowercase form. This is the only place
+    // the request's case is folded: nothing is changed in the store or in any key builder, and callers carry the
+    // returned binding's stored owner/repo, never the request's.
+    const lookup = await lookupBindingDenyKeys(owner.toLowerCase(), repo.toLowerCase(), deps.bindingsLookup)
     if (lookup.kind === 'unavailable') {
       return {kind: 'unavailable'}
     }

@@ -592,6 +592,50 @@ describe('POST /operator/runs — repo field shape (one slug contract shared wit
   })
 })
 
+describe('POST /operator/runs — case-insensitive repo lookup (D1)', () => {
+  it('launches for a mixed-case request, looking up the lowercase key and carrying only the stored case downstream', async () => {
+    // #given a binding stored as acme/widget and a client that sends Acme/Widget
+    const bindingsLookup = makeBindingsLookup()
+    const deps = makeDeps({bindingsLookup})
+    const app = buildApp(deps)
+    let captured: LaunchWorkRequest | undefined
+    mockLaunchWork.mockImplementationOnce(async (request: LaunchWorkRequest) => {
+      captured = request
+      return {accepted: true, runId: request.runId ?? 'mock-run-id'}
+    })
+
+    // #when
+    const response = await postRuns(app, {repo: 'Acme/Widget', prompt: 'do something'})
+
+    // #then the binding is found by the lowercase key ...
+    expect(response.status).toBe(202)
+    expect(bindingsLookup.getBindingByRepo).toHaveBeenCalledExactlyOnceWith('acme', 'widget')
+    // ... and nothing downstream sees the request's case: the channel id and the binding use the stored one
+    expect(captured?.channelId).toBe('web:acme/widget')
+    expect(captured?.binding).toMatchObject({owner: 'acme', repo: 'widget'})
+    const logged = JSON.stringify(vi.mocked(deps.logger.info).mock.calls)
+    expect(logged).toContain('"owner":"acme"')
+    expect(logged).not.toContain('Acme')
+  })
+
+  it('uses the same channel id for the same repo whatever case the request used', async () => {
+    // #given two requests for one repo
+    const ids: string[] = []
+    mockLaunchWork.mockImplementation(async (request: LaunchWorkRequest) => {
+      ids.push(request.channelId)
+      return {accepted: true, runId: request.runId ?? 'mock-run-id'}
+    })
+    const app = buildApp(makeDeps())
+
+    // #when
+    await postRuns(app, {repo: 'acme/widget', prompt: 'one'})
+    await postRuns(app, {repo: 'ACME/WIDGET', prompt: 'two'})
+
+    // #then
+    expect(ids).toEqual(['web:acme/widget', 'web:acme/widget'])
+  })
+})
+
 describe('POST /operator/runs — denylisted repo', () => {
   it('returns 404 when repo is denylisted, consulting the denylist with the binding keys', async () => {
     // #given — repo is denylisted
