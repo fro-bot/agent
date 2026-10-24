@@ -12,7 +12,7 @@ import type {RunIndex} from '../../execute/run-index.js'
 import type {DenylistCache} from '../../redaction/denylist.js'
 import type {BindingDenyKeySource, BindingsLookup} from '../../redaction/surface-gate.js'
 
-import {parseEntityRefRepo} from '@fro-bot/runtime'
+import {isValidGitHubOwner, isValidGitHubRepoName, parseEntityRefRepo} from '@fro-bot/runtime'
 
 import {lookupBindingDenyKeys} from '../../redaction/surface-gate.js'
 
@@ -44,32 +44,6 @@ export async function resolveRepoFromRunIndex(
 }
 
 // ---------------------------------------------------------------------------
-// Owner/repo name validation
-// ---------------------------------------------------------------------------
-
-/**
- * GitHub owner/repo name validation.
- *
- * GitHub owner names: alphanumeric and hyphens, 1–39 chars, no leading/trailing hyphen.
- * GitHub repo names: alphanumeric, hyphens, underscores, dots; 1–100 chars.
- * Intentionally strict to reject path traversal, null bytes, and injection attempts,
- * and so a malformed name never reaches the object store.
- * Single-segment names `.` and `..` are explicitly rejected as path traversal.
- */
-const OWNER_RE = /^[a-z\d](?:[a-z\d-]{0,37}[a-z\d])?$/i
-const REPO_RE = /^[\w.-]{1,100}$/
-
-function isValidOwner(owner: string): boolean {
-  return OWNER_RE.test(owner)
-}
-
-function isValidRepo(repo: string): boolean {
-  if (repo === '.' || repo === '..') return false
-  if (repo.includes('\u0000')) return false
-  return REPO_RE.test(repo)
-}
-
-// ---------------------------------------------------------------------------
 // resolveRepoAccess
 // ---------------------------------------------------------------------------
 
@@ -96,8 +70,9 @@ export interface RepoAccessDeps<B extends BindingDenyKeySource> {
  * run-stream lease re-checks it on every tick.
  *
  * Order, fail-closed throughout:
- *   1. Validate the names — a malformed name is `denied` with zero object-store calls.
- *   2. Read the binding ONCE. A store error or throw is `unavailable`; a missing binding is `denied`.
+ *   1. Validate the names (the GitHub name rules in `@fro-bot/runtime`) — a malformed name is `denied` with zero
+ *      object-store calls.
+ *   2. Read the binding ONCE, by the lowercase key, so `Acme/Widget` finds a binding stored as `acme/widget`. A store error or throw is `unavailable`; a missing binding is `denied`.
  *   3. Prime the denylist, then consult it with the binding's deny keys. A denylisted, unprimed, or
  *      keyless repo is `denied`.
  *
@@ -109,11 +84,13 @@ export async function resolveRepoAccess<B extends BindingDenyKeySource>(
   repo: string,
   deps: RepoAccessDeps<B>,
 ): Promise<RepoAccess<B>> {
-  if (isValidOwner(owner) === false || isValidRepo(repo) === false) {
+  if (isValidGitHubOwner(owner) === false || isValidGitHubRepoName(repo) === false) {
     return {kind: 'denied'}
   }
 
   try {
+    // `lookupBindingDenyKeys` reads the lowercase key (bindings are only written lowercase), so the request's case
+    // never reaches the store, and callers carry the returned binding's stored owner/repo, never the request's.
     const lookup = await lookupBindingDenyKeys(owner, repo, deps.bindingsLookup)
     if (lookup.kind === 'unavailable') {
       return {kind: 'unavailable'}
