@@ -34,11 +34,13 @@ import {
   createHeartbeatController,
   createOwnershipLedger,
   createRun,
+  formatSdkError,
   getRunKey,
   parseRunState,
   patchRunDetails,
   releaseLock,
   releaseLockIfHolder,
+  toErrorMessage,
   transitionRun,
 } from '@fro-bot/runtime'
 
@@ -486,10 +488,7 @@ async function readCurrentRunPhase(
     }
     return parsed.data.phase
   } catch (error) {
-    logger.warn(
-      {repo, runId, err: error instanceof Error ? error.message : String(error)},
-      'run: readCurrentRunPhase threw — treating as not-CANCELLED',
-    )
+    logger.warn({repo, runId, err: toErrorMessage(error)}, 'run: readCurrentRunPhase threw — treating as not-CANCELLED')
     return null
   }
 }
@@ -541,10 +540,7 @@ async function readCurrentRunStateWithEtag(
     }
     return {phase: parsed.data.phase, etag: fetched.data.etag, runId: parsed.data.run_id}
   } catch (error) {
-    logger.warn(
-      {repo, runId, err: error instanceof Error ? error.message : String(error)},
-      'run: readCurrentRunStateWithEtag threw',
-    )
+    logger.warn({repo, runId, err: toErrorMessage(error)}, 'run: readCurrentRunStateWithEtag threw')
     return null
   }
 }
@@ -716,10 +712,7 @@ function scheduleQuarantineRelease(opts: ScheduleQuarantineReleaseOpts): void {
       )
 
       const stopResult = await heartbeat.stop().catch((error: unknown) => {
-        logger.warn(
-          {repo, runId, err: error instanceof Error ? error.message : String(error)},
-          'run: heartbeat.stop threw at quarantine-window expiry',
-        )
+        logger.warn({repo, runId, err: toErrorMessage(error)}, 'run: heartbeat.stop threw at quarantine-window expiry')
         return null
       })
       if (stopResult !== null && stopResult.success === false) {
@@ -734,7 +727,7 @@ function scheduleQuarantineRelease(opts: ScheduleQuarantineReleaseOpts): void {
           concurrency.release(channelId)
         } catch (releaseError: unknown) {
           logger.warn(
-            {channelId, err: releaseError instanceof Error ? releaseError.message : String(releaseError)},
+            {channelId, err: toErrorMessage(releaseError)},
             'run: concurrency.release threw at quarantine-window expiry during shutdown — slot may leak',
           )
         }
@@ -747,17 +740,14 @@ function scheduleQuarantineRelease(opts: ScheduleQuarantineReleaseOpts): void {
           concurrency.release(channelId)
         } catch (releaseError: unknown) {
           logger.warn(
-            {channelId, err: releaseError instanceof Error ? releaseError.message : String(releaseError)},
+            {channelId, err: toErrorMessage(releaseError)},
             'run: concurrency.release threw at quarantine-window expiry — slot may leak',
           )
         }
       } else {
         // eslint-disable-next-line no-void
         void executeWorkOnHeldSlot(nextTask).catch((error: unknown) => {
-          logger.error(
-            {channelId, err: error instanceof Error ? error.message : String(error)},
-            'run: quarantine-window hand-off startRun failed',
-          )
+          logger.error({channelId, err: toErrorMessage(error)}, 'run: quarantine-window hand-off startRun failed')
         })
       }
     })()
@@ -920,7 +910,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         // abandoned: the created thread/sinks are orphaned, but the user sees a clean failure
         // and can retry. This is the safe outcome for a slow-but-not-dead Discord API call.
         logger.error(
-          {channelId, repo, err: threadError instanceof Error ? threadError.message : String(threadError)},
+          {channelId, repo, err: toErrorMessage(threadError)},
           'run: threadFactory threw or timed out — aborting',
         )
         // Gate 2 (throw/timeout) failure: terminalize the admitted run to FAILED before replying.
@@ -1086,10 +1076,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       }
       // eslint-disable-next-line no-void
       void write().catch((error: unknown) => {
-        logger.warn(
-          {repo, runId, err: error instanceof Error ? error.message : String(error)},
-          'run: patchRunDetails threw while persisting ownership',
-        )
+        logger.warn({repo, runId, err: toErrorMessage(error)}, 'run: patchRunDetails threw while persisting ownership')
       })
     }
 
@@ -1171,10 +1158,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       await request.replySink
         .send('thread', components === undefined ? {content: replyText} : {content: replyText, components})
         .catch((error: unknown) => {
-          logger.warn(
-            {repo, runId, err: error instanceof Error ? error.message : String(error)},
-            'run: failed to send preparation-termination reply',
-          )
+          logger.warn({repo, runId, err: toErrorMessage(error)}, 'run: failed to send preparation-termination reply')
         })
     }
 
@@ -1581,11 +1565,11 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           })
           const envelope = res as {error?: unknown} | undefined
           if (envelope?.error != null) {
-            return {ok: false as const, error: String(envelope.error)}
+            return {ok: false as const, error: formatSdkError(envelope.error)}
           }
           return {ok: true as const}
         } catch (error) {
-          return {ok: false as const, error: error instanceof Error ? error.message : String(error)}
+          return {ok: false as const, error: toErrorMessage(error)}
         }
       }
 
@@ -2237,7 +2221,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     // Once preAckCompleted is true (ACK succeeded), the existing EXECUTING catch owns FAILED.
     if (preAckCompleted === false) {
       logger.error(
-        {repo, runId, err: gateError instanceof Error ? gateError.message : String(gateError)},
+        {repo, runId, err: toErrorMessage(gateError)},
         'run: pre-ACK gate threw — terminalizing admitted run to FAILED',
       )
       await failAdmittedRun(deps, repo, runId, task.adoptionEtag)
@@ -2299,7 +2283,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         concurrency.release(channelId)
       } catch (releaseError: unknown) {
         logger.warn(
-          {channelId, err: releaseError instanceof Error ? releaseError.message : String(releaseError)},
+          {channelId, err: toErrorMessage(releaseError)},
           'run: concurrency.release threw during shutdown — slot may leak',
         )
       }
@@ -2310,19 +2294,13 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         try {
           concurrency.release(channelId)
         } catch (releaseError: unknown) {
-          logger.warn(
-            {channelId, err: releaseError instanceof Error ? releaseError.message : String(releaseError)},
-            'run: concurrency.release threw — slot may leak',
-          )
+          logger.warn({channelId, err: toErrorMessage(releaseError)}, 'run: concurrency.release threw — slot may leak')
         }
       } else {
         // Slot ownership transfers to the next run — do NOT call concurrency.release.
         // eslint-disable-next-line no-void
         void executeWorkOnHeldSlot(nextTask).catch((error: unknown) => {
-          logger.error(
-            {channelId, err: error instanceof Error ? error.message : String(error)},
-            'run: handoff startRun failed',
-          )
+          logger.error({channelId, err: toErrorMessage(error)}, 'run: handoff startRun failed')
         })
       }
     }
@@ -2527,10 +2505,7 @@ export async function launchWork(request: LaunchWorkRequest, deps: RunMentionDep
     // to await the full run (e.g. the Discord adapter for backward compatibility) can
     // do so without polling the in-flight set. The web launch route ignores it.
     const runPromise = executeWorkOnHeldSlot(task).catch((error: unknown) => {
-      logger.error(
-        {repo, runId, err: error instanceof Error ? error.message : String(error)},
-        'run: immediate executeWorkOnHeldSlot failed',
-      )
+      logger.error({repo, runId, err: toErrorMessage(error)}, 'run: immediate executeWorkOnHeldSlot failed')
     })
     inFlightRuns.add(runPromise)
     // eslint-disable-next-line no-void

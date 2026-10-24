@@ -2,6 +2,7 @@ import type {AgentContext, ResponseSurface, TriggerContext} from '@fro-bot/runti
 import type {Logger} from '../../shared/logger.js'
 import * as fs from 'node:fs/promises'
 import {parseResponseFile} from '@fro-bot/runtime'
+import {toErrorMessage} from '../../shared/errors.js'
 import {isAuthorizedAssociation} from '../triggers/author-utils.js'
 import {ALLOWED_ASSOCIATIONS} from '../triggers/types.js'
 
@@ -56,7 +57,7 @@ export async function inspectResponseFile(
     if (isMissingFileError(error)) return 'absent'
     logger.warning('Response-file status is unknown; declining recovery', {
       responseFilePath,
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
     return 'unknown'
   }

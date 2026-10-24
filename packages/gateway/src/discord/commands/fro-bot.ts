@@ -23,6 +23,7 @@ import type {GatewayLogger} from '../client.js'
 import type {AddProjectDeps} from './add-project.js'
 import type {SlashCommand} from './index.js'
 
+import {toErrorMessage} from '@fro-bot/runtime'
 import {PermissionFlagsBits, SlashCommandBuilder} from 'discord.js'
 import {Effect} from 'effect'
 
@@ -197,7 +198,7 @@ export function createFroBotCommand(deps: FroBotDeps): SlashCommand {
             ctx.log.warn(
               {
                 channelId: ctx.interaction.channelId,
-                err: error instanceof Error ? error.message : String(error),
+                err: toErrorMessage(error),
               },
               'force-release-lock: member permission resolution failed — denying',
             )

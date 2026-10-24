@@ -141,6 +141,26 @@ describe('writeSessionSummary', () => {
     expect(mockLogger.info).not.toHaveBeenCalled()
   })
 
+  it('logs the message of a JSON error envelope, not [object Object]', async () => {
+    // #given
+    const summary = createMockRunSummary()
+    const client = createMockSdkClient({
+      promptResponse: {
+        data: undefined,
+        error: {name: 'NotFoundError', data: {message: 'Session not found: ses_envelope'}},
+      },
+    })
+
+    // #when
+    await writeSessionSummary('ses_test', summary, client as unknown as SessionClient, mockLogger)
+
+    // #then
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK prompt writeback failed', {
+      sessionId: 'ses_test',
+      error: 'Session not found: ses_envelope',
+    })
+  })
+
   it('logs warning and returns when SDK prompt throws', async () => {
     // #given
     const summary = createMockRunSummary()

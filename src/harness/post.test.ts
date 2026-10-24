@@ -673,6 +673,135 @@ describe('post action', () => {
       )
     })
 
+    describe('the retry never publishes the session to the object store', () => {
+      const LEASE_STATES: readonly (readonly [string, Record<string, string>])[] = [
+        ['the main step released the lease (holder state cleared)', {}],
+        [
+          'the holder state is still recorded (the main step never released)',
+          {lockHolderId: 'action:12345:1', lockHolderJob: 'build', lockAcquisitionToken: 'token-aaaaaaaa'},
+        ],
+        ['the holder state is garbled', {lockHolderId: '\u0000not-a-holder', lockAcquisitionToken: ''}],
+      ]
+
+      it.each(LEASE_STATES)('asks saveCache to withhold the store publish when %s', async (_label, lockState) => {
+        // #given a declined save the post hook retries, with the object store enabled
+        await stubState({shouldSaveCache: 'true', cacheSaved: 'not-persisted', ...storeState, ...lockState})
+
+        // #when
+        const {runPost} = await import('./post.js')
+        await runPost({logger: createMockLogger()})
+
+        // #then the retry still runs, but it may only write the Actions cache
+        const {saveCache} = await import('../services/cache/index.js')
+        expect(saveCache).toHaveBeenCalledTimes(1)
+        expect(vi.mocked(saveCache).mock.calls[0]?.[0]).toMatchObject({objectStorePublish: 'withhold'})
+      })
+
+      it('withholds the publish when the retry runs with no object store configured, and says nothing about a store', async () => {
+        // #given no object store (storeConfig absent): behavior is unchanged
+        await stubState({shouldSaveCache: 'true', cacheSaved: 'not-persisted'})
+        const logger = createMockLogger()
+
+        // #when
+        const {runPost} = await import('./post.js')
+        await runPost({logger})
+
+        // #then the Actions cache retry happens, and nothing claims a store publish was skipped
+        const {saveCache} = await import('../services/cache/index.js')
+        expect(saveCache).toHaveBeenCalledTimes(1)
+        expect(vi.mocked(saveCache).mock.calls[0]?.[0]).not.toHaveProperty('storeConfig')
+        const core = await import('@actions/core')
+        expect(
+          vi
+            .mocked(logger.info)
+            .mock.calls.map(call => String(call[0]))
+            .join('\n'),
+        ).not.toContain('object-store')
+        expect(
+          vi
+            .mocked(core.summary.addRaw)
+            .mock.calls.map(call => String(call[0]))
+            .join('\n'),
+        ).not.toContain('object store')
+      })
+
+      it('logs that the store publish was withheld and why, when an object store is configured', async () => {
+        // #given
+        await stubState({shouldSaveCache: 'true', cacheSaved: 'not-persisted', ...storeState})
+        const logger = createMockLogger()
+
+        // #when
+        const {runPost} = await import('./post.js')
+        await runPost({logger})
+
+        // #then
+        expect(logger.info).toHaveBeenCalledWith(
+          'Post-action withheld the object-store session publish: the main step has released the coordination lease, so only the Actions cache is retried',
+        )
+      })
+
+      it('says so even when the cache write itself throws', async () => {
+        // #given
+        await stubState({shouldSaveCache: 'true', cacheSaved: 'not-persisted', ...storeState})
+        const {saveCache} = await import('../services/cache/index.js')
+        vi.mocked(saveCache).mockRejectedValue(new Error('cache down'))
+        const logger = createMockLogger()
+
+        // #when
+        const {runPost} = await import('./post.js')
+        await runPost({logger})
+
+        // #then
+        expect(logger.info).toHaveBeenCalledWith(expect.stringContaining('withheld the object-store session publish'))
+      })
+
+      it('says in the job summary that the store publish was withheld, next to the cache retry result', async () => {
+        // #given a retry whose cache write is rejected
+        await stubState({shouldSaveCache: 'true', cacheSaved: 'not-persisted', ...storeState})
+        const {saveCache} = await import('../services/cache/index.js')
+        vi.mocked(saveCache).mockResolvedValue({
+          cachePersisted: false,
+          storePersisted: false,
+          outcome: 'cache-rejected',
+        })
+
+        // #when
+        const {runPost} = await import('./post.js')
+        await runPost({logger: createMockLogger()})
+
+        // #then the row reports the retry's own result AND that the store publish did not happen
+        const core = await import('@actions/core')
+        const rows = vi.mocked(core.summary.addTable).mock.calls.flatMap(call => call[0] as unknown[])
+        expect(rows).toContainEqual(['Cache Save Result', expect.stringContaining('not persisted')])
+        expect(rows).toContainEqual(['Object Store Publish', expect.stringContaining('withheld')])
+        const text = vi
+          .mocked(core.summary.addRaw)
+          .mock.calls.map(call => String(call[0]))
+          .join('\n')
+        expect(text).toContain('lease')
+      })
+
+      it('does not claim a withheld publish when the store is enabled but nothing was retried', async () => {
+        // #given the main step already persisted the cache: the retry branch is skipped entirely
+        await stubState({shouldSaveCache: 'true', cacheSaved: 'durable', ...storeState})
+        const logger = createMockLogger()
+
+        // #when
+        const {runPost} = await import('./post.js')
+        await runPost({logger})
+
+        // #then
+        const {saveCache} = await import('../services/cache/index.js')
+        expect(saveCache).not.toHaveBeenCalled()
+        expect(
+          vi
+            .mocked(logger.info)
+            .mock.calls.map(call => String(call[0]))
+            .join('\n'),
+        ).not.toContain('withheld')
+      })
+    })
+
     describe('orphaned lock release', () => {
       afterEach(async () => {
         // Reset implementations, not just calls: a never-settling release or a throwing state read must not leak.

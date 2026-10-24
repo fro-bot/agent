@@ -4,8 +4,8 @@
  * without importing the OpenCode attach stack that `repo-quiescence.ts` pulls in.
  */
 
+import {INSTALLATION_TOKEN_MINT_TIMEOUT_MS} from '../github/app-client.js'
 import {totalRecoveryCeilingMs} from '../workspace-api/client.js'
-import {INSTALLATION_TOKEN_MINT_TIMEOUT_MS} from './workspace-token.js'
 
 /** Ceiling on the OpenCode `session.status` request one repo-quiescence check makes. */
 export const REPO_QUIESCENCE_TIMEOUT_MS = 4_000

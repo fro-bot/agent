@@ -2,6 +2,7 @@ import type {Logger} from '../../shared/logger.js'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import {DefaultArtifactClient} from '@actions/artifact'
+import {toErrorMessage} from '../../shared/errors.js'
 
 /**
  * Artifact name: `opencode-logs-{runId}-{runAttempt}[-{invocationIdentity}]`. Artifact names must be
@@ -59,7 +60,7 @@ export async function uploadLogArtifact(options: ArtifactUploadOptions): Promise
     return true
   } catch (error) {
     logger.warning('Artifact upload failed (non-fatal)', {
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
       name: artifactName,
     })
     return false

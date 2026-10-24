@@ -21,13 +21,17 @@ const mocks = vi.hoisted(() => ({
   normalizeWorkspacePath: vi.fn(),
 }))
 
-vi.mock('@fro-bot/runtime', () => ({
-  buildLogicalKey: mocks.buildLogicalKey,
-  buildSessionTitle: mocks.buildSessionTitle,
-  listSessions: mocks.listSessions,
-  resolveSessionForLogicalKey: mocks.resolveSessionForLogicalKey,
-  searchSessions: mocks.searchSessions,
-}))
+vi.mock('@fro-bot/runtime', async importOriginal => {
+  const original: typeof import('@fro-bot/runtime') = await importOriginal()
+  return {
+    ...original,
+    buildLogicalKey: mocks.buildLogicalKey,
+    buildSessionTitle: mocks.buildSessionTitle,
+    listSessions: mocks.listSessions,
+    resolveSessionForLogicalKey: mocks.resolveSessionForLogicalKey,
+    searchSessions: mocks.searchSessions,
+  }
+})
 
 vi.mock('../../features/attachments/index.js', () => ({
   buildAttachmentResult: vi.fn(),

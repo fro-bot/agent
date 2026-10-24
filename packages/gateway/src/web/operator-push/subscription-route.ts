@@ -41,6 +41,7 @@ import type {AuditLogger} from '../audit.js'
 import type {DurableSessionStore} from '../auth/session.js'
 import type {OperatorLogger} from '../server.js'
 import type {OperatorPushSubscriptionStore, SubscriptionMetadata} from './subscription-store.js'
+import {toErrorMessage} from '@fro-bot/runtime'
 import {createRateLimiter} from '../../http/rate-limit.js'
 import {parseOperatorPushSubscribeRequest, parseOperatorPushUnsubscribeRequest} from '../../operator-contract/index.js'
 import {emitAudit} from '../audit.js'
@@ -240,10 +241,7 @@ export function buildSubscriptionRoutes(app: Hono, deps: SubscriptionRouteDeps):
       )
       return c.json(toResponseMetadata(result.data), 200)
     } catch (error: unknown) {
-      deps.logger.warn(
-        {githubUserId, err: error instanceof Error ? error.message : String(error)},
-        'push-subscribe: store call threw — denying',
-      )
+      deps.logger.warn({githubUserId, err: toErrorMessage(error)}, 'push-subscribe: store call threw — denying')
       return notFoundResponse(c)
     }
   })
@@ -299,10 +297,7 @@ export function buildSubscriptionRoutes(app: Hono, deps: SubscriptionRouteDeps):
       )
       return c.json({ok: true}, 200)
     } catch (error: unknown) {
-      deps.logger.warn(
-        {githubUserId, err: error instanceof Error ? error.message : String(error)},
-        'push-unsubscribe: store call threw — denying',
-      )
+      deps.logger.warn({githubUserId, err: toErrorMessage(error)}, 'push-unsubscribe: store call threw — denying')
       return notFoundResponse(c)
     }
   })
@@ -331,7 +326,7 @@ export function buildSubscriptionRoutes(app: Hono, deps: SubscriptionRouteDeps):
       return c.json(response, 200)
     } catch (error: unknown) {
       deps.logger.warn(
-        {githubUserId, err: error instanceof Error ? error.message : String(error)},
+        {githubUserId, err: toErrorMessage(error)},
         'push-subscriptions-list: store call threw — denying',
       )
       return notFoundResponse(c)

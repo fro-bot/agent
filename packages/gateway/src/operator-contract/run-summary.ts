@@ -101,7 +101,12 @@ export function toRunSummary(
   if (entityRefRepo === null) {
     return null
   }
-  if (entityRefRepo.owner !== binding.owner || entityRefRepo.repo !== binding.repo) {
+  // Compared case-insensitively, the same rule the binding lookup uses (GitHub names are case-insensitive, bindings
+  // are stored lowercase), so a legacy entity_ref that kept the repo's GitHub spelling is still the same repo.
+  if (
+    entityRefRepo.owner.toLowerCase() !== binding.owner.toLowerCase() ||
+    entityRefRepo.repo.toLowerCase() !== binding.repo.toLowerCase()
+  ) {
     return null
   }
 

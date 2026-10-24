@@ -1,7 +1,7 @@
 import type {CoordinationConfig, Result, RunState} from '@fro-bot/runtime'
 import type {GatewayLogger} from '../discord/client.js'
 
-import {getRunKey, HEARTBEAT_STOP_GRACE_MS, parseRunState} from '@fro-bot/runtime'
+import {getRunKey, HEARTBEAT_STOP_GRACE_MS, parseRunState, toErrorMessage} from '@fro-bot/runtime'
 
 export interface StaleEtagTransitionOptions<T> {
   readonly config: CoordinationConfig
@@ -61,7 +61,7 @@ async function readStoredRun(
     const parsed = parseRunState(fetched.data.data)
     return parsed.success === false ? skip(parsed.error.message) : {state: parsed.data, etag: fetched.data.etag}
   } catch (error) {
-    return skip(error instanceof Error ? error.message : String(error))
+    return skip(toErrorMessage(error))
   } finally {
     clearTimeout(timer)
   }

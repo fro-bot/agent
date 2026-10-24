@@ -1,7 +1,7 @@
 import type {AppClient} from '../github/app-client.js'
 
 import {err, ok} from '@fro-bot/runtime'
-import {afterEach, describe, expect, it, vi} from 'vitest'
+import {describe, expect, it, vi} from 'vitest'
 import {
   AppNotInstalledError,
   AuthError,
@@ -9,6 +9,13 @@ import {
   INSTALLATION_TOKEN_MINT_TIMEOUT_MS,
   InsufficientPermissionsError,
 } from '../github/app-client.js'
+import {
+  controllableDeadlines,
+  createRealAppClient,
+  installStalledGitHub,
+  settleWithin,
+  untilRequests,
+} from '../github/test-helpers.js'
 import {createWorkspaceCalls} from './workspace-calls.js'
 
 const INSTALL_URL = 'https://github.com/apps/fro-bot-agent/installations/new'
@@ -34,87 +41,82 @@ function makeCalls(authForRepo: ReturnType<typeof vi.fn>) {
   return {calls, workspaceClient, logger, authForRepo}
 }
 
-const NEVER = () => vi.fn().mockReturnValue(new Promise(() => {}))
+function makeStalled(options?: {readonly ignoreSignal?: boolean}) {
+  const github = installStalledGitHub(options)
+  const deadline = controllableDeadlines()
+  return {github, deadline, ...makeCalls(vi.fn(createRealAppClient().authForRepo))}
+}
 
-describe('createWorkspaceCalls: a stalled authForRepo can never hold a workspace call', () => {
-  afterEach(() => {
-    vi.useRealTimers()
-  })
-
-  it('update settles at the mint bound, as a retryable failure, and never calls the workspace', async () => {
+// The REAL `authForRepo` over a stubbed `fetch`: the bound under test is the one `authForRepo` itself enforces,
+// not a wrapper around it.
+describe('createWorkspaceCalls: a stalled GitHub can never hold a workspace call', () => {
+  it('update settles when the mint deadline fires, as a retryable failure, and never calls the workspace', async () => {
     // #given GitHub never answers the mint
-    vi.useFakeTimers()
-    const {calls, workspaceClient} = makeCalls(NEVER())
+    const {github, deadline, calls, workspaceClient} = makeStalled()
 
     // #when
     const pending = calls.update('acme', 'widget', UPDATE_OPTIONS)
-    let settled = false
-    const tracked = pending.then(() => {
-      settled = true
-    })
-    await vi.advanceTimersByTimeAsync(INSTALLATION_TOKEN_MINT_TIMEOUT_MS - 1)
-    const settledEarly = settled
-    await vi.advanceTimersByTimeAsync(1)
+    await untilRequests(github, 1)
+
+    // #then it is still waiting while the deadline has not fired, and the deadline is the 30 s ceiling
+    expect(deadline.spy).toHaveBeenCalledExactlyOnceWith(INSTALLATION_TOKEN_MINT_TIMEOUT_MS)
+    expect(await settleWithin(pending, 50)).toBe('pending')
+
+    // #when the deadline fires
+    deadline.fire()
+    const result = await settleWithin(pending)
 
     // #then
-    expect(settledEarly).toBe(false)
-    expect(await pending).toEqual(err({kind: 'network-error', cause: 'timeout'}))
-    await tracked
+    expect(result).toEqual(err({kind: 'network-error', cause: 'timeout'}))
     expect(workspaceClient.update).not.toHaveBeenCalled()
   })
 
-  it('recover settles at the mint bound as token-unavailable and never calls the workspace', async () => {
+  it('recover settles when the mint deadline fires as token-unavailable and never calls the workspace', async () => {
     // #given
-    vi.useFakeTimers()
-    const {calls, workspaceClient} = makeCalls(NEVER())
+    const {github, deadline, calls, workspaceClient} = makeStalled()
 
     // #when
     const pending = calls.recover('acme', 'widget', RECOVER_OPTIONS)
-    await vi.advanceTimersByTimeAsync(INSTALLATION_TOKEN_MINT_TIMEOUT_MS)
+    await untilRequests(github, 1)
+    expect(await settleWithin(pending, 50)).toBe('pending')
+    deadline.fire()
 
     // #then
-    expect(await pending).toEqual(err({kind: 'token-unavailable', cause: 'timeout'}))
+    expect(await settleWithin(pending)).toEqual(err({kind: 'token-unavailable', cause: 'timeout'}))
     expect(workspaceClient.recover).not.toHaveBeenCalled()
   })
 
-  it('a mint that succeeds only after the bound sends neither /update nor /recover', async () => {
-    // #given
-    vi.useFakeTimers()
-    let resolveAuth: (value: unknown) => void = () => {}
-    const authForRepo = vi.fn().mockImplementation(
-      async () =>
-        new Promise(resolve => {
-          resolveAuth = resolve
-        }),
-    )
-    const {calls, workspaceClient} = makeCalls(authForRepo)
+  it('a transport that ignores the abort and answers only after the deadline sends neither /update nor /recover', async () => {
+    // #given requests that do not honour their signal and are answered after both deadlines have fired
+    const {github, deadline, calls, workspaceClient} = makeStalled({ignoreSignal: true})
 
-    // #when both calls expire, then the late tokens arrive
+    // #when both calls hit their deadline, then GitHub finally answers
     const update = calls.update('acme', 'widget', UPDATE_OPTIONS)
-    await vi.advanceTimersByTimeAsync(INSTALLATION_TOKEN_MINT_TIMEOUT_MS)
-    await update
-    resolveAuth(ok({token: 'ghs_late'}))
+    await untilRequests(github, 1)
+    deadline.fire(0)
+    expect(await settleWithin(update)).toEqual(err({kind: 'network-error', cause: 'timeout'}))
     const recover = calls.recover('acme', 'widget', RECOVER_OPTIONS)
-    await vi.advanceTimersByTimeAsync(INSTALLATION_TOKEN_MINT_TIMEOUT_MS)
-    await recover
-    resolveAuth(ok({token: 'ghs_late'}))
-    await vi.advanceTimersByTimeAsync(5_000)
+    await vi.waitFor(() => expect(deadline.controllers).toHaveLength(2))
+    deadline.fire(1)
+    expect(await settleWithin(recover)).toEqual(err({kind: 'token-unavailable', cause: 'timeout'}))
+    github.answerLate()
+    await new Promise(resolve => setTimeout(resolve, 50))
 
-    // #then
+    // #then the late tokens were never used
     expect(workspaceClient.update).not.toHaveBeenCalled()
     expect(workspaceClient.recover).not.toHaveBeenCalled()
   })
 
-  it('previewRecovery never mints, so a stalled authForRepo cannot affect it', async () => {
+  it('previewRecovery never mints, so a stalled GitHub cannot affect it', async () => {
     // #given
-    const {calls, workspaceClient, authForRepo} = makeCalls(NEVER())
+    const {github, calls, workspaceClient} = makeStalled()
 
     // #when
     const result = await calls.previewRecovery('acme', 'widget')
 
     // #then
     expect(result).toEqual(ok({kind: 'no-checkout'}))
-    expect(authForRepo).not.toHaveBeenCalled()
+    expect(github.seen).toHaveLength(0)
     expect(workspaceClient.previewRecovery).toHaveBeenCalledExactlyOnceWith({owner: 'acme', repo: 'widget'})
   })
 })
@@ -137,24 +139,29 @@ describe('createWorkspaceCalls: authForRepo results map to the failures run.ts a
 
   it.each([
     ['AuthError', new AuthError('GitHub API returned 503: secret detail')],
-    ['AuthTimeoutError', new AuthTimeoutError()],
-  ])('%s is the retryable network-error, with the class as cause and never the message', async (cause, error) => {
-    // #given
-    const {calls, logger} = makeCalls(vi.fn().mockResolvedValue(err(error)))
+    // The mint's own deadline is reported as "timeout" (the cause the diagnostics have always used for a stall).
+    ['timeout', new AuthTimeoutError()],
+  ])(
+    '%s is the retryable network-error, with the class (or "timeout") as cause and never the message',
+    async (cause, error) => {
+      // #given
+      const {calls, logger} = makeCalls(vi.fn().mockResolvedValue(err(error)))
 
-    // #when
-    const result = await calls.update('acme', 'widget', UPDATE_OPTIONS)
+      // #when
+      const result = await calls.update('acme', 'widget', UPDATE_OPTIONS)
 
-    // #then
-    expect(result).toEqual(err({kind: 'network-error', cause}))
-    expect(JSON.stringify(logger.warn.mock.calls)).not.toContain('secret detail')
-  })
+      // #then
+      expect(result).toEqual(err({kind: 'network-error', cause}))
+      expect(JSON.stringify(logger.warn.mock.calls)).not.toContain('secret detail')
+    },
+  )
 
-  it('a thrown authForRepo is the retryable network-error with the class as cause', async () => {
-    const {calls} = makeCalls(vi.fn().mockRejectedValue(new TypeError('fetch failed')))
+  it('a thrown authForRepo is the retryable network-error with the class as cause, never the message', async () => {
+    const {calls, logger} = makeCalls(vi.fn().mockRejectedValue(new TypeError('ghs_secret_in_message')))
     expect(await calls.update('acme', 'widget', UPDATE_OPTIONS)).toEqual(
       err({kind: 'network-error', cause: 'TypeError'}),
     )
+    expect(JSON.stringify(logger.warn.mock.calls)).not.toContain('ghs_secret_in_message')
   })
 
   it('a minted token reaches /update and /recover', async () => {

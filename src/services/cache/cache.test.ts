@@ -1198,6 +1198,98 @@ describe('saveCache', () => {
     db.close()
   })
 
+  it('withholds the object-store publish and still writes the Actions cache when objectStorePublish is "withhold"', async () => {
+    // #given an enabled object store and a real database that WOULD be uploaded, but a caller that must
+    // not publish to it (it holds no lease)
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
+    const db = new DatabaseSync(path.join(path.dirname(storagePath), 'opencode.db'))
+    db.exec('CREATE TABLE sessions(id INTEGER PRIMARY KEY, data TEXT)')
+    db.exec("INSERT INTO sessions (data) VALUES ('session-1')")
+    db.close()
+    const upload = vi.fn<ObjectStoreAdapter['upload']>(async () => ok(undefined))
+    const saveCacheSpy = vi.fn(async () => 1)
+    const logger = {debug: vi.fn(), info: vi.fn(), warning: vi.fn(), error: vi.fn()}
+
+    // #when
+    const result = await saveCache({
+      components: testComponents,
+      runId: 98765,
+      logger,
+      storagePath,
+      authPath,
+      cacheAdapter: {restoreCache: async () => undefined, saveCache: saveCacheSpy},
+      storeConfig: testStoreConfig,
+      storeAdapter: createMockStoreAdapter({upload}),
+      objectStorePublish: 'withhold',
+    })
+
+    // #then nothing reaches the shared object, and the cache write is unaffected
+    expect(upload).not.toHaveBeenCalled()
+    expect(saveCacheSpy).toHaveBeenCalledTimes(1)
+    expect(result).toEqual({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
+    expect(logger.info).toHaveBeenCalledWith(
+      'Object store session publish withheld: this caller does not hold the lease',
+    )
+  })
+
+  it('reports a withheld publish with a rejected cache write as not persisted, never store-only', async () => {
+    // #given the cache write is rejected and the store publish is withheld, with a database present
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
+    const db = new DatabaseSync(path.join(path.dirname(storagePath), 'opencode.db'))
+    db.exec('CREATE TABLE sessions(id INTEGER PRIMARY KEY, data TEXT)')
+    db.exec("INSERT INTO sessions (data) VALUES ('session-1')")
+    db.close()
+    const upload = vi.fn<ObjectStoreAdapter['upload']>(async () => ok(undefined))
+
+    // #when
+    const result = await saveCache({
+      components: testComponents,
+      runId: 98765,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      cacheAdapter: {restoreCache: async () => undefined, saveCache: async () => -1},
+      storeConfig: testStoreConfig,
+      storeAdapter: createMockStoreAdapter({upload}),
+      objectStorePublish: 'withhold',
+    })
+
+    // #then
+    expect(upload).not.toHaveBeenCalled()
+    expect(result).toEqual({cachePersisted: false, storePersisted: false, outcome: 'cache-rejected'})
+    expect(toCacheSaveStateValue(result)).toBe('not-persisted')
+  })
+
+  it('publishes by default and when objectStorePublish is "publish" (the main step holds the lease)', async () => {
+    // #given a real main session database, which is what the object-store sync uploads
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
+    const db = new DatabaseSync(path.join(path.dirname(storagePath), 'opencode.db'))
+    db.exec('CREATE TABLE sessions(id INTEGER PRIMARY KEY, data TEXT)')
+    db.exec("INSERT INTO sessions (data) VALUES ('session-1')")
+    db.close()
+    const upload = vi.fn<ObjectStoreAdapter['upload']>(async () => ok(undefined))
+
+    // #when / #then both spellings publish
+    for (const objectStorePublish of [undefined, 'publish' as const]) {
+      upload.mockClear()
+      await saveCache({
+        components: testComponents,
+        runId: 98765,
+        logger: createTestLogger(),
+        storagePath,
+        authPath,
+        cacheAdapter: {restoreCache: async () => undefined, saveCache: async () => 1},
+        storeConfig: testStoreConfig,
+        storeAdapter: createMockStoreAdapter({upload}),
+        ...(objectStorePublish === undefined ? {} : {objectStorePublish}),
+      })
+      expect(upload).toHaveBeenCalled()
+    }
+  })
+
   it('writes to cache only when object store is not configured', async () => {
     await fs.mkdir(storagePath, {recursive: true})
     await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')

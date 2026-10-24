@@ -10,6 +10,7 @@
 
 import type {Client} from 'discord.js'
 import type {GatewayLogger} from './client.js'
+import {toErrorMessage} from '@fro-bot/runtime'
 import {sendMessage} from './io.js'
 
 /** Fixed cancellation notice text posted to a run's origin thread. */
@@ -50,10 +51,7 @@ export function createCancelNoticeDispatcher(
       }
     } catch (error: unknown) {
       // sendMessage/io.ts never throws, but channels.fetch can — belt-and-suspenders.
-      logger.warn(
-        {runId, threadId, err: error instanceof Error ? error.message : String(error)},
-        'cancelRun: cancellation notice threw — continuing',
-      )
+      logger.warn({runId, threadId, err: toErrorMessage(error)}, 'cancelRun: cancellation notice threw — continuing')
     }
   }
 }

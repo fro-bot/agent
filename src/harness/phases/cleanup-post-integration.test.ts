@@ -129,7 +129,8 @@ describe('cleanup + post integration: the object-store boundary is touched at mo
       // exists to observe.
       repo: '',
       runId: '',
-      lockEtag: null,
+      // A run that acquired the Action lock: only such a run may publish the session to the object store.
+      lockEtag: 'etag-1',
     })
   }
 
@@ -191,7 +192,7 @@ describe('cleanup + post integration: the object-store boundary is touched at mo
     )
   })
 
-  it('negative control: neither backend persists at cleanup time, so CACHE_SAVED is not-persisted and the post hook retries through a second full upload', async () => {
+  it('negative control: neither backend persists at cleanup time, so CACHE_SAVED is not-persisted and the post hook retries the Actions cache only, never the object store', async () => {
     // #given both backends fail during cleanup: the Actions cache write returns its -1
     // sentinel, and the object-store upload itself fails (not merely disabled)
     const {saveCache: actionsCacheSaveCache} = await import('@actions/cache')
@@ -205,34 +206,25 @@ describe('cleanup + post integration: the object-store boundary is touched at mo
     // the state that must trigger a post-hook retry
     expect(mocks.stateStore.get('cacheSaved')).toBe('not-persisted')
     expect(storeAdapter.upload).toHaveBeenCalledTimes(1)
+    expect(actionsCacheSaveCache).toHaveBeenCalledTimes(1)
 
-    // #given the retry this time succeeds on both backends -- and the post hook can
+    // #given the retry's Actions cache write this time succeeds -- and the post hook can
     // reconstruct storeConfig from state, mirroring what the main step's bootstrap phase
     // (not exercised by this suite) normally writes via core.saveState
     vi.mocked(actionsCacheSaveCache).mockResolvedValueOnce(67890)
-    vi.mocked(storeAdapter.upload).mockResolvedValueOnce(ok(undefined))
     mocks.stateStore.set('storeConfig.enabled', 'true')
     mocks.stateStore.set('storeConfig.bucket', 'bucket')
     mocks.stateStore.set('storeConfig.prefix', 'fro-bot-state')
 
-    // #then immediately before the post hook runs, the boundary is still untouched a
-    // second time -- the retry below is what causes the second upload, not something
-    // runCleanup already did
-    expect(storeAdapter.upload).toHaveBeenCalledTimes(1)
-
-    // #when the post hook runs later
+    // #when the post hook runs later (the main step released the lease; the post hook holds none)
     const logger = await runPostPhase()
 
-    // #then the post hook actually retried the save -- a full second run reaches the
-    // object-store boundary again, unlike the durable/store-only cases above where the
-    // boundary is touched exactly once total
-    expect(storeAdapter.upload).toHaveBeenCalledTimes(2)
+    // #then the post hook retried the Actions cache write, and the object-store boundary was
+    // NOT touched again: an unleased upload of the shared session object could overwrite a
+    // newer session from a later run
+    expect(actionsCacheSaveCache).toHaveBeenCalledTimes(2)
+    expect(storeAdapter.upload).toHaveBeenCalledTimes(1)
     expect(logger.info).toHaveBeenCalledWith('Post-action cache saved', expect.any(Object))
-
-    // #then the second upload is attributable to the post hook's retry of the *same*
-    // session database -- same key and local path as cleanup's own upload -- not some
-    // unrelated upload the post phase happened to trigger
-    const uploadMock = vi.mocked(storeAdapter.upload)
-    expect(uploadMock.mock.calls[1]).toEqual(uploadMock.mock.calls[0])
+    expect(logger.info).toHaveBeenCalledWith(expect.stringContaining('withheld the object-store session publish'))
   })
 })

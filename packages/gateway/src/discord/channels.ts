@@ -10,7 +10,7 @@
 import type {Result} from '@fro-bot/runtime'
 import type {Guild, TextChannel} from 'discord.js'
 
-import {err, ok} from '@fro-bot/runtime'
+import {err, ok, toErrorMessage} from '@fro-bot/runtime'
 import {ChannelType} from 'discord.js'
 
 export type ChannelError =
@@ -98,7 +98,7 @@ async function tryCreate(guild: Guild, name: string): Promise<TryCreateResult> {
     })
     return {kind: 'ok', channel: created}
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
+    const message = toErrorMessage(error)
 
     // Check numeric error code first (more reliable than regex on message text).
     const code = error !== null && typeof error === 'object' && 'code' in error ? error.code : undefined

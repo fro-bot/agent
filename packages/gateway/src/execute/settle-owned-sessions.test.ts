@@ -249,6 +249,30 @@ describe('settleOwnedSessions', () => {
       )
     })
 
+    it('logs the message of a JSON error envelope, not [object Object]', async () => {
+      // #given the SDK client's error for a JSON HTTP error body is a plain object
+      const ledger = createOwnershipLedger()
+      ledger.adopt(CHILD, 'background task')
+      const client = makeClient({
+        abort: vi.fn().mockResolvedValue({
+          data: null,
+          error: {name: 'NotFoundError', data: {message: 'Session not found: ses_envelope'}},
+        }),
+        children: async () => ({data: [{id: CHILD}], error: null}),
+        status: async () => ({data: {[CHILD]: {}}, error: null}),
+      })
+      const logger = makeLogger()
+
+      // #when
+      await settleOwnedSessions({client, directory: '/workspace/repo', rootSessionId: ROOT, ledger, logger})
+
+      // #then
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({detail: 'Session not found: ses_envelope'}),
+        expect.stringContaining('error envelope'),
+      )
+    })
+
     it('abort throws (transport failure) — caught, logged, and settlement stays unresolved rather than propagating', async () => {
       const ledger = createOwnershipLedger()
       ledger.adopt(CHILD, 'background task')

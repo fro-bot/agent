@@ -26,10 +26,10 @@ import {
 } from './test-helpers.js'
 import {abortRegistry} from './abort-registry.js'
 import {totalRecoveryBudgetMs} from './checkout-recovery.js'
-import {createRecoveryWorkspaceCalls} from './recovery-workspace.js'
-import {createUpdateWorkspaceCall} from './update-workspace.js'
+import {createWorkspaceCalls} from './workspace-calls.js'
 import type {ListBackupsFn, PreviewRecoveryFn, RecoverFn} from './checkout-recovery.js'
 import {parseRecoverEntryCustomId} from '../discord/recover-checkout-button.js'
+import {controllableDeadlines, createRealAppClient, installStalledGitHub} from '../github/test-helpers.js'
 import {
   CLIENT_TIMEOUT_REPLY,
   formatRollbackFailedReply,
@@ -1772,14 +1772,17 @@ describe('checkout preparation: a stalled installation-token mint during recover
     vi.clearAllMocks()
   })
 
+  // The REAL `authForRepo` over a stalled GitHub, whose deadline fires 40 ms after the mint starts.
   const MINT_CEILING_MS = 40
 
   function stalledMintRecover() {
+    installStalledGitHub()
+    controllableDeadlines({fireAfterMs: MINT_CEILING_MS})
     const workspaceRecover = vi.fn().mockResolvedValue({success: true, data: {kind: 'no-checkout'}})
-    const calls = createRecoveryWorkspaceCalls({
-      workspaceClient: {previewRecovery: vi.fn(), recover: workspaceRecover},
-      mintToken: vi.fn().mockReturnValue(new Promise(() => {})),
-      mintTimeoutMs: MINT_CEILING_MS,
+    const calls = createWorkspaceCalls({
+      appClient: createRealAppClient(),
+      workspaceClient: {update: vi.fn(), previewRecovery: vi.fn(), recover: workspaceRecover},
+      logger: {warn: vi.fn()},
     })
     return {recover: vi.fn().mockImplementation(calls.recover), workspaceRecover}
   }
@@ -1841,17 +1844,19 @@ describe('checkout preparation: a stalled installation-token mint before the fir
     vi.clearAllMocks()
   })
 
+  // The REAL `authForRepo` over a stalled GitHub, whose deadline fires 40 ms after the mint starts.
   const MINT_CEILING_MS = 40
 
   function stalledMintUpdate() {
+    installStalledGitHub()
+    controllableDeadlines({fireAfterMs: MINT_CEILING_MS})
     const workspaceUpdate = vi.fn().mockResolvedValue({success: true, data: {kind: 'no-checkout'}})
-    const update = createUpdateWorkspaceCall({
-      workspaceClient: {update: workspaceUpdate},
-      mintToken: vi.fn().mockReturnValue(new Promise(() => {})),
+    const calls = createWorkspaceCalls({
+      appClient: createRealAppClient(),
+      workspaceClient: {update: workspaceUpdate, previewRecovery: vi.fn(), recover: vi.fn()},
       logger: {warn: vi.fn()},
-      mintTimeoutMs: MINT_CEILING_MS,
     })
-    return {update: vi.fn().mockImplementation(update), workspaceUpdate}
+    return {update: vi.fn().mockImplementation(calls.update), workspaceUpdate}
   }
 
   it('ends in the same outcome as any other retryable mint failure, within the bound, without sending /update', async () => {

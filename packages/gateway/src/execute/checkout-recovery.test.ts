@@ -8,6 +8,7 @@ import type {AutoRecoverRequest, CheckoutRecoveryOutcome} from './checkout-recov
 
 import {err, ok} from '@fro-bot/runtime'
 import {describe, expect, it, vi} from 'vitest'
+import {INSTALLATION_TOKEN_MINT_TIMEOUT_MS} from '../github/app-client.js'
 import {totalRecoveryCeilingMs} from '../workspace-api/client.js'
 import {settleAmbiguousRecovery, totalRecoveryBudgetMs, tryAutoRecoverDirtyCheckout} from './checkout-recovery.js'
 import {REPO_QUIESCENCE_TIMEOUT_MS} from './recovery-budget.js'
@@ -17,7 +18,6 @@ import {
   makeQuiescenceFn,
   makeRecoveryPreviewData,
 } from './test-helpers.js'
-import {INSTALLATION_TOKEN_MINT_TIMEOUT_MS} from './workspace-token.js'
 
 const REQUEST: AutoRecoverRequest = {
   owner: 'acme',
