@@ -38,6 +38,7 @@ import {
   getSessionID,
   getStringProperty,
   parseSyntheticNoticePart,
+  toErrorMessage,
 } from '@fro-bot/runtime'
 import {parsePermissionReply, parsePermissionRequest} from '../approvals/coordinator.js'
 import {parseQuestionEcho, parseQuestionRequest, safeLogId} from '../approvals/question-coordinator.js'
@@ -529,7 +530,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     logger.info({sessionId}, 'run-core: session created')
   } catch (error) {
     if (error instanceof RunCoreError) throw error
-    const message = error instanceof Error ? error.message : String(error)
+    const message = toErrorMessage(error)
     logger.error({detail: message}, 'run-core: session create threw (server unreachable?)')
     throw new RunCoreError('unreachable', `Session create threw: ${message}`)
   }
@@ -733,7 +734,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     eventStream = eventsResult.stream as AsyncIterable<unknown>
     logger.info({sessionId, directory}, 'run-core: event stream subscribed')
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
+    const message = toErrorMessage(error)
     logger.error({sessionId, detail: message}, 'run-core: event.subscribe threw')
     throw await throwWithBarrier('unreachable', `Event subscribe threw: ${message}`)
   }
@@ -769,7 +770,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     resetInactivity()
   } catch (error) {
     if (error instanceof RunCoreError) throw error
-    const message = error instanceof Error ? error.message : String(error)
+    const message = toErrorMessage(error)
     if (combinedSignal.aborted) {
       // The run's own signal cancelled the request. Cancelling the request does not prove the server never
       // started the prompt, so this is a stop where the root may be running, not an unreachable server.
@@ -1404,7 +1405,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     // `runOpenCodeCore` raw: `run.ts` would treat it as an unquarantined failure and release the lock and slot
     // while the root, whose prompt keeps running server-side, may still be writing the checkout.
     if (error instanceof RunCoreError) throw error
-    const message = error instanceof Error ? error.message : String(error)
+    const message = toErrorMessage(error)
     clearInactivity()
     logger.error({sessionId, detail: message}, 'run-core: event loop failed unexpectedly')
     throw await throwWithBarrier('stream-ended', `Event stream failed: ${message}`, {

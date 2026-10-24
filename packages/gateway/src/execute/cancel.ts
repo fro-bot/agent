@@ -35,7 +35,7 @@ import type {ChannelQueue} from './queue.js'
 import type {RunIndex} from './run-index.js'
 import type {RunTask} from './run.js'
 
-import {getRunKey, parseRunState, transitionRun} from '@fro-bot/runtime'
+import {getRunKey, parseRunState, toErrorMessage, transitionRun} from '@fro-bot/runtime'
 import {toRuntimeLogger} from './runtime-logger.js'
 
 // ---------------------------------------------------------------------------
@@ -215,7 +215,7 @@ async function settlePendingApprovals(
         {
           runId: runState.run_id,
           requestID: entry.requestID,
-          err: error instanceof Error ? error.message : String(error),
+          err: toErrorMessage(error),
         },
         'cancelRun: approval settle threw — continuing with remaining entries',
       )

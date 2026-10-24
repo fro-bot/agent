@@ -1,5 +1,6 @@
 import type {Logger} from '../shared/logger.js'
 import type {SessionClient} from './backend.js'
+import {toErrorMessage} from '../shared/errors.js'
 
 export interface SessionTitleDeadline {
   readonly signal: AbortSignal
@@ -53,7 +54,7 @@ export async function reassertSessionTitle(
     logger.warning('Best-effort session title re-assertion failed', {
       sessionId,
       sessionTitle: title,
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
   }
 }

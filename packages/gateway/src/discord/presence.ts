@@ -13,7 +13,7 @@
 import type {Result} from '@fro-bot/runtime'
 import type {Client} from 'discord.js'
 
-import {err, ok} from '@fro-bot/runtime'
+import {err, ok, toErrorMessage} from '@fro-bot/runtime'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -71,7 +71,7 @@ export async function postPresenceEmbed(
     try {
       channel = await client.channels.fetch(channelId)
     } catch (fetchError) {
-      const message = fetchError instanceof Error ? fetchError.message : String(fetchError)
+      const message = toErrorMessage(fetchError)
       return err({kind: 'send-failed', message})
     }
 
@@ -93,7 +93,7 @@ export async function postPresenceEmbed(
         allowedMentions: {parse: []},
       })
     } catch (sendError) {
-      const message = sendError instanceof Error ? sendError.message : String(sendError)
+      const message = toErrorMessage(sendError)
       return err({kind: 'send-failed', message})
     }
 

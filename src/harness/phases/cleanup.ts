@@ -41,6 +41,7 @@ import {
   getOpenCodeStoragePath,
   isOpenCodePromptArtifactEnabled,
 } from '../../shared/env.js'
+import {toErrorMessage} from '../../shared/errors.js'
 import {createLogger} from '../../shared/logger.js'
 import {normalizeWorkspacePath} from '../../shared/paths.js'
 import {setCacheSaveResultOutput} from '../config/outputs.js'
@@ -168,7 +169,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
         await cleanupTempFiles(attachmentResult.tempFiles, attachmentCleanupLogger)
       } catch (attachmentError) {
         attachmentCleanupLogger.warning('Attachment temp-file cleanup failed (non-fatal); shutdown still proceeds', {
-          error: attachmentError instanceof Error ? attachmentError.message : String(attachmentError),
+          error: toErrorMessage(attachmentError),
         })
       }
     }
@@ -194,7 +195,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
         await fs.rm(attachmentDir, {recursive: true, force: true})
       } catch (attachmentDirError) {
         attachmentDirCleanupLogger.warning('Attachment directory cleanup failed (non-fatal); shutdown still proceeds', {
-          error: attachmentDirError instanceof Error ? attachmentDirError.message : String(attachmentDirError),
+          error: toErrorMessage(attachmentDirError),
         })
       }
     }
@@ -209,7 +210,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
         await removeWorkingLabel(githubClient, reactionCtx, cleanupLogger)
       } catch (labelError) {
         cleanupLogger.warning('Working-label removal failed (non-fatal); shutdown still proceeds', {
-          error: labelError instanceof Error ? labelError.message : String(labelError),
+          error: toErrorMessage(labelError),
         })
       }
     }
@@ -237,7 +238,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
         }
       } catch (pruneError) {
         pruneLogger.warning('Session pruning failed (non-fatal); shutdown still proceeds', {
-          error: pruneError instanceof Error ? pruneError.message : String(pruneError),
+          error: toErrorMessage(pruneError),
         })
       }
     }
@@ -271,7 +272,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
       } catch (shutdownError) {
         quiescenceConfirmed = false
         bootstrapLogger.warning('Server shutdown failed (non-fatal)', {
-          error: shutdownError instanceof Error ? shutdownError.message : String(shutdownError),
+          error: toErrorMessage(shutdownError),
         })
       }
     }
@@ -330,7 +331,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
         }
       } catch (error) {
         objectStoreLogger.warning('Object store artifact or metadata sync failed (non-fatal)', {
-          error: error instanceof Error ? error.message : String(error),
+          error: toErrorMessage(error),
         })
       }
     }
@@ -424,7 +425,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
       setCacheSaveResultOutput(cacheSaveStateValue)
     } catch (outputError) {
       cacheLogger.warning('Failed to set cache-save-result output (non-fatal)', {
-        error: outputError instanceof Error ? outputError.message : String(outputError),
+        error: toErrorMessage(outputError),
       })
     }
 
@@ -456,7 +457,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
     }
   } catch (cleanupError) {
     bootstrapLogger.warning('Cleanup failed (non-fatal)', {
-      error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+      error: toErrorMessage(cleanupError),
     })
   } finally {
     // Stop lease renewal BEFORE releasing the lock -- renewal must keep ticking through
@@ -505,7 +506,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
         }
       } catch (releaseError) {
         releaseLogger.warning('Lock release threw (non-fatal)', {
-          error: releaseError instanceof Error ? releaseError.message : String(releaseError),
+          error: toErrorMessage(releaseError),
           repo,
         })
       }

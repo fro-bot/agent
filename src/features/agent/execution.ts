@@ -86,7 +86,7 @@ async function replyToPermissionAsk(
       }
       return
     } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error)
+      lastError = toErrorMessage(error)
     } finally {
       if (timeoutId != null) clearTimeout(timeoutId)
     }
@@ -255,7 +255,7 @@ export async function executeOpenCode(
         logger.info('Prompt artifact written', {hash, path: artifactPath})
       } catch (error) {
         logger.warning('Failed to write prompt artifact', {
-          error: error instanceof Error ? error.message : String(error),
+          error: toErrorMessage(error),
           path: artifactPath,
         })
       }

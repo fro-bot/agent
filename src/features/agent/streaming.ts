@@ -19,6 +19,7 @@ import {
 } from '@fro-bot/runtime'
 import {extractCommitShas, extractGithubUrls} from '../../services/github/urls.js'
 import {outputTextContent, outputToolExecution} from '../../shared/console.js'
+import {toErrorMessage} from '../../shared/errors.js'
 
 /**
  * Usage reported by ONE assistant message. OpenCode reports `tokens` and `cost` per message (each
@@ -721,7 +722,7 @@ export async function processEventStream(
           void onPermissionAsked(request).catch(error => {
             logger.warning('Failed to reject OpenCode permission request', {
               ...context,
-              error: error instanceof Error ? error.message : String(error),
+              error: toErrorMessage(error),
             })
           })
         }
@@ -1164,7 +1165,7 @@ export async function processEventStream(
       // transport failure, it's the expected shape of a requested shutdown. Say nothing
       // about the turn: no diagnostic, no ledger churn, no fabricated failure.
     } else {
-      const message = error instanceof Error ? error.message : String(error)
+      const message = toErrorMessage(error)
       recordDiscontinuity(message)
     }
   }

@@ -704,7 +704,7 @@ async function cancelOutstanding(options: {
       } catch (error) {
         logger.warning('Failed to abort owned session during drain-deadline cancellation', {
           sessionId: entry.sessionId,
-          error: error instanceof Error ? error.message : String(error),
+          error: toErrorMessage(error),
         })
       }
     }),

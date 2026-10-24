@@ -31,7 +31,7 @@ import type {BindingsStore} from '../bindings/store.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {SinkThread} from '../discord/streaming.js'
 import type {RepoQuiescenceChecker} from './repo-quiescence.js'
-import {findStaleRuns, getRunKey, isRunStale, parseRunState, transitionRun} from '@fro-bot/runtime'
+import {findStaleRuns, getRunKey, isRunStale, parseRunState, toErrorMessage, transitionRun} from '@fro-bot/runtime'
 import {toRuntimeLogger} from './runtime-logger.js'
 
 // ---------------------------------------------------------------------------
@@ -157,7 +157,7 @@ export async function recoverStaleRuns(deps: RecoverStaleRunsDeps): Promise<void
       // Fail-soft per the module docstring: an unexpected throw from either helper
       // must not abort recovery for the remaining repos.
       logger.warn(
-        {repo, err: error instanceof Error ? error.message : String(error)},
+        {repo, err: toErrorMessage(error)},
         'recovery: unexpected error recovering repo — continuing to next repo',
       )
     }
@@ -268,7 +268,7 @@ async function recoverOneRun(opts: RecoverOneRunOpts): Promise<void> {
     }
   } catch (error: unknown) {
     logger.warn(
-      {runId: run.run_id, threadId: run.thread_id, err: error instanceof Error ? error.message : String(error)},
+      {runId: run.run_id, threadId: run.thread_id, err: toErrorMessage(error)},
       'recovery: failed to post thread note — continuing',
     )
   }

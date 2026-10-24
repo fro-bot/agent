@@ -17,7 +17,7 @@ import type {WorkspaceClient} from '../../workspace-api/client.js'
 import type {GatewayLogger} from '../client.js'
 import type {AuthDecision, GuildCommandCtx, GuildCommandDeps, PreDeferCtx, PreDeferSignal} from './guild-command.js'
 
-import {isValidGitHubOwner, isValidGitHubRepoName, parseRepoSlug} from '@fro-bot/runtime'
+import {isValidGitHubOwner, isValidGitHubRepoName, parseRepoSlug, toErrorMessage} from '@fro-bot/runtime'
 import {PermissionFlagsBits} from 'discord.js'
 import {Effect} from 'effect'
 
@@ -186,7 +186,7 @@ async function userIsAuthorized(guild: Guild, userId: string, logger: AddProject
   } catch (error) {
     // Fail closed: if we cannot resolve the member's guild permissions, deny.
     logger.warn('add-project: member permission resolution failed', {
-      error: error instanceof Error ? error.message : String(error),
+      error: toErrorMessage(error),
     })
     return false
   }
