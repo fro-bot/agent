@@ -1,7 +1,7 @@
 /**
  * The `/update` call checkout preparation makes (`run.ts`), wired from the workspace client. Extracted
- * from `program.ts` so the token discipline is unit-testable: the installation-token mint is bounded
- * (`mintBounded`), and `/update` is only sent with a token that arrived in time.
+ * from `program.ts` so the token discipline is unit-testable: `/update` is only sent with a token the mint
+ * returned, and the mint (`authForRepo`) bounds itself.
  *
  * A mint failure is returned exactly as `run.ts` already maps it: `401` (permanent installation
  * failure) to `workspace-unavailable`, anything else to `unreachable`. A mint that times out or throws
@@ -15,8 +15,6 @@ import type {WorkspaceClient} from '../workspace-api/client.js'
 import type {UpdateResult, UpdateWorkspaceError} from '../workspace-api/types.js'
 import type {MintFailure, MintWorkspaceToken} from './workspace-token.js'
 
-import {INSTALLATION_TOKEN_MINT_TIMEOUT_MS, mintBounded} from './workspace-token.js'
-
 export type UpdateWorkspaceCall = (
   owner: string,
   repo: string,
@@ -27,12 +25,10 @@ export function createUpdateWorkspaceCall(deps: {
   readonly workspaceClient: Pick<WorkspaceClient, 'update'>
   readonly mintToken: MintWorkspaceToken
   readonly logger: Pick<GatewayLogger, 'warn'>
-  /** Test seam; defaults to `INSTALLATION_TOKEN_MINT_TIMEOUT_MS`. */
-  readonly mintTimeoutMs?: number
 }): UpdateWorkspaceCall {
-  const {workspaceClient, mintToken, logger, mintTimeoutMs = INSTALLATION_TOKEN_MINT_TIMEOUT_MS} = deps
+  const {workspaceClient, mintToken, logger} = deps
   return async (owner, repo, options) => {
-    const token = await mintBounded(mintToken, owner, repo, mintTimeoutMs)
+    const token = await mintToken(owner, repo)
     if (token.success === false) {
       // One warning per mint failure, so a thrown or stalled mint is not silent: owner, repo, why, and the
       // status of a permanent failure. Never the token or the error message.

@@ -24,6 +24,7 @@ import type {Guild, Message} from 'discord.js'
 import type {BindingsStore} from '../bindings/store.js'
 import type {RunMentionDeps} from '../execute/run.js'
 import type {GatewayLogger} from './client.js'
+import {toErrorMessage} from '@fro-bot/runtime'
 import {PermissionFlagsBits} from 'discord.js'
 import {Effect} from 'effect'
 import {runMention} from '../execute/run.js'
@@ -80,10 +81,7 @@ export async function userIsAuthorized(
     return member.permissions.has(PermissionFlagsBits.ManageChannels)
   } catch (error) {
     // Fail closed: if we cannot resolve member permissions, deny.
-    logger.warn(
-      {err: error instanceof Error ? error.message : String(error)},
-      'mention: member permission resolution failed — denying',
-    )
+    logger.warn({err: toErrorMessage(error)}, 'mention: member permission resolution failed — denying')
     return false
   }
 }

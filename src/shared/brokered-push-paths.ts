@@ -1,3 +1,4 @@
+import {toErrorMessage} from './errors.js'
 /**
  * Protected brokered-push surfaces are stored without a trailing slash. Extra
  * prefixes use the same canonical form: trailing slashes are accepted as
@@ -157,7 +158,7 @@ export function parseBrokeredPushExtraPaths(input: string): readonly string[] {
       }
       prefixes.add(normalized)
     } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error)
+      const reason = toErrorMessage(error)
       throw new Error(`Invalid brokered-push-extra-paths entry "${entry}": ${reason}`)
     }
   }

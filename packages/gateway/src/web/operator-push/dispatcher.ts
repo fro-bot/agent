@@ -46,6 +46,7 @@ import type {PushHealthTracker} from './push-health.js'
 import type {PushSender} from './push-sender.js'
 import type {OperatorPushSubscriptionStore, SubscriptionRecord} from './subscription-store.js'
 import type {TriggerDecision} from './trigger-policy.js'
+import {toErrorMessage} from '@fro-bot/runtime'
 import {emitAudit} from '../audit.js'
 import {buildApprovalPayload, buildFailedRunPayload, buildQuestionPayload} from './payload-builder.js'
 
@@ -167,7 +168,7 @@ export function createPushDispatcher(deps: CreatePushDispatcherDeps): PushDispat
         // One failing record must never abort dispatch to the rest.
         failed += 1
         logger.warn(
-          {kind, err: error instanceof Error ? error.message : String(error)},
+          {kind, err: toErrorMessage(error)},
           'operator push dispatch: one subscription failed — continuing with the rest',
         )
       }

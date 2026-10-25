@@ -24,7 +24,7 @@ import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {launchWork} from '../../execute/run.js'
 import {OPERATOR_LAUNCH_PROMPT_MAX_LENGTH} from '../../operator-contract/launch-prompt.js'
 import {setOperatorRouteGuard} from '../operator-route.js'
-import {createIdempotencyGuard, IDEMPOTENCY_KEY_MAX_LENGTH} from './idempotency.js'
+import {createIdempotencyGuard, IDEMPOTENCY_KEY_MAX_LENGTH, IDEMPOTENCY_TTL_MS} from './idempotency.js'
 import {buildLaunchRoute} from './launch-route.js'
 
 // vi.mock is hoisted by Vitest before imports — mock launchWork so route tests
@@ -513,31 +513,126 @@ describe('POST /operator/runs — binding store unavailable', () => {
 })
 
 describe('POST /operator/runs — malformed owner/repo', () => {
+  it.each(['acme/..', 'acme/.', `acme/${'r'.repeat(101)}`, `${'o'.repeat(40)}/widget`, '-acme/widget', 'acme-/widget'])(
+    'returns 404 with ZERO binding reads for %j',
+    async repoName => {
+      // #given
+      const bindingsLookup = makeBindingsLookup()
+      const denylistCache = makeDenylistCache()
+      const app = buildApp(makeDeps({bindingsLookup, denylistCache}))
+
+      // #when
+      const response = await postRuns(app, {repo: repoName, prompt: 'do something'})
+
+      // #then — denied before the object store or the denylist is touched
+      expect(response.status).toBe(404)
+      expect(await response.json()).toEqual({error: 'not-found'})
+      expect(bindingsLookup.getBindingByRepo).not.toHaveBeenCalled()
+      expect(denylistCache.getDenylistState).not.toHaveBeenCalled()
+      expect(mockLaunchWork).not.toHaveBeenCalled()
+    },
+  )
+})
+
+describe('POST /operator/runs — repo field shape (one slug contract shared with dispatch)', () => {
   it.each([
-    'acme/..',
-    'acme/.',
     'acme/a/b',
-    'acme/a\u0000b',
+    'acme/widget/x',
+    'acme/widget/',
+    'acme//widget',
+    'acme/widget#1',
+    'acme/widget?x=1',
+    String.raw`acme\widget`,
     'acme/a b',
-    `acme/${'r'.repeat(101)}`,
-    `${'o'.repeat(40)}/widget`,
-    '-acme/widget',
-    'acme-/widget',
-  ])('returns 404 with ZERO binding reads for %j', async repoName => {
-    // #given
+    'ac me/widget',
+    'acme/a\u0000b',
+    'acme/a\u0007b',
+    '/widget',
+    'acme/',
+  ])('returns 400 (not 404) with ZERO binding reads for the malformed shape %j', async repoField => {
+    // #given a repo field that is not an owner/repo slug. Launch used to pass most of these through to the name
+    // rules and answer 404; dispatch answered 400 for the same input.
     const bindingsLookup = makeBindingsLookup()
     const denylistCache = makeDenylistCache()
     const app = buildApp(makeDeps({bindingsLookup, denylistCache}))
 
     // #when
-    const response = await postRuns(app, {repo: repoName, prompt: 'do something'})
+    const response = await postRuns(app, {repo: repoField, prompt: 'do something'})
 
-    // #then — denied before the object store or the denylist is touched
-    expect(response.status).toBe(404)
-    expect(await response.json()).toEqual({error: 'not-found'})
+    // #then
+    expect(response.status).toBe(400)
     expect(bindingsLookup.getBindingByRepo).not.toHaveBeenCalled()
     expect(denylistCache.getDenylistState).not.toHaveBeenCalled()
     expect(mockLaunchWork).not.toHaveBeenCalled()
+  })
+
+  it.each([' acme/widget', 'acme/widget ', '  acme/widget\n', '\tacme/widget\t'])(
+    'accepts the padded repo field %j and looks up the trimmed owner/repo (D2: was a 404)',
+    async repoField => {
+      // #given
+      const bindingsLookup = makeBindingsLookup()
+      const app = buildApp(makeDeps({bindingsLookup}))
+
+      // #when
+      const response = await postRuns(app, {repo: repoField, prompt: 'do something'})
+
+      // #then
+      expect(response.status).toBe(202)
+      expect(bindingsLookup.getBindingByRepo).toHaveBeenCalledExactlyOnceWith('acme', 'widget')
+    },
+  )
+
+  it('keeps one 400 body for every shape rejection', async () => {
+    const app = buildApp(makeDeps())
+
+    const noSlash = await postRuns(app, {repo: 'noslash', prompt: 'do something'})
+    const extra = await postRuns(app, {repo: 'acme/widget/x', prompt: 'do something'})
+
+    expect(await extra.json()).toEqual(await noSlash.json())
+  })
+})
+
+describe('POST /operator/runs — case-insensitive repo lookup (D1)', () => {
+  it('launches for a mixed-case request, looking up the lowercase key and carrying only the stored case downstream', async () => {
+    // #given a binding stored as acme/widget and a client that sends Acme/Widget
+    const bindingsLookup = makeBindingsLookup()
+    const deps = makeDeps({bindingsLookup})
+    const app = buildApp(deps)
+    let captured: LaunchWorkRequest | undefined
+    mockLaunchWork.mockImplementationOnce(async (request: LaunchWorkRequest) => {
+      captured = request
+      return {accepted: true, runId: request.runId ?? 'mock-run-id'}
+    })
+
+    // #when
+    const response = await postRuns(app, {repo: 'Acme/Widget', prompt: 'do something'})
+
+    // #then the binding is found by the lowercase key ...
+    expect(response.status).toBe(202)
+    expect(bindingsLookup.getBindingByRepo).toHaveBeenCalledExactlyOnceWith('acme', 'widget')
+    // ... and nothing downstream sees the request's case: the channel id and the binding use the stored one
+    expect(captured?.channelId).toBe('web:acme/widget')
+    expect(captured?.binding).toMatchObject({owner: 'acme', repo: 'widget'})
+    const logged = JSON.stringify(vi.mocked(deps.logger.info).mock.calls)
+    expect(logged).toContain('"owner":"acme"')
+    expect(logged).not.toContain('Acme')
+  })
+
+  it('uses the same channel id for the same repo whatever case the request used', async () => {
+    // #given two requests for one repo
+    const ids: string[] = []
+    mockLaunchWork.mockImplementation(async (request: LaunchWorkRequest) => {
+      ids.push(request.channelId)
+      return {accepted: true, runId: request.runId ?? 'mock-run-id'}
+    })
+    const app = buildApp(makeDeps())
+
+    // #when
+    await postRuns(app, {repo: 'acme/widget', prompt: 'one'})
+    await postRuns(app, {repo: 'ACME/WIDGET', prompt: 'two'})
+
+    // #then
+    expect(ids).toEqual(['web:acme/widget', 'web:acme/widget'])
   })
 })
 
@@ -815,6 +910,222 @@ describe('POST /operator/runs — bad request bodies', () => {
 // ---------------------------------------------------------------------------
 // Two-phase idempotency: reserve → commit / rollback
 // ---------------------------------------------------------------------------
+
+describe('POST /operator/runs — an idempotency key is bound to one request', () => {
+  const CONFLICT = {error: 'idempotency key reuse with different request'}
+
+  it('replays an identical retried launch: one launchWork call, the same runId', async () => {
+    // #given
+    const app = buildApp(makeDeps())
+
+    // #when the same request is sent twice under one key
+    const first = await postRuns(app, {repo: 'acme/widget', prompt: 'do something', idempotencyKey: 'k'})
+    const second = await postRuns(app, {repo: 'acme/widget', prompt: 'do something', idempotencyKey: 'k'})
+
+    // #then
+    expect(second.status).toBe(202)
+    expect(((await second.json()) as {runId: string}).runId).toBe(((await first.json()) as {runId: string}).runId)
+    expect(mockLaunchWork).toHaveBeenCalledTimes(1)
+  })
+
+  it("answers 400 with dispatch's conflict body for the same key and a different repo, launching nothing more", async () => {
+    // #given two bound repos
+    const bindingsLookup: LaunchRouteBindingsLookup = {
+      getBindingByRepo: vi.fn(async (owner: string, repo: string) => ({
+        success: true as const,
+        data: makeBinding({owner, repo}),
+      })),
+    }
+    const app = buildApp(makeDeps({bindingsLookup}))
+    await postRuns(app, {repo: 'acme/widget', prompt: 'do something', idempotencyKey: 'k'})
+
+    // #when the key is reused for another repo
+    const response = await postRuns(app, {repo: 'acme/other', prompt: 'do something', idempotencyKey: 'k'})
+
+    // #then the earlier run is not echoed against a repo it never ran in
+    expect(response.status).toBe(400)
+    expect(await response.json()).toEqual(CONFLICT)
+    expect(mockLaunchWork).toHaveBeenCalledTimes(1)
+  })
+
+  it('answers 400 for the same key and a different prompt', async () => {
+    // #given
+    const app = buildApp(makeDeps())
+    await postRuns(app, {repo: 'acme/widget', prompt: 'first task', idempotencyKey: 'k'})
+
+    // #when
+    const response = await postRuns(app, {repo: 'acme/widget', prompt: 'second task', idempotencyKey: 'k'})
+
+    // #then
+    expect(response.status).toBe(400)
+    expect(await response.json()).toEqual(CONFLICT)
+    expect(mockLaunchWork).toHaveBeenCalledTimes(1)
+  })
+
+  it('replays when the repo differs only in case: it is the same bound repo', async () => {
+    // #given
+    const app = buildApp(makeDeps())
+    const first = await postRuns(app, {repo: 'acme/widget', prompt: 'do something', idempotencyKey: 'k'})
+
+    // #when
+    const second = await postRuns(app, {repo: 'ACME/Widget', prompt: 'do something', idempotencyKey: 'k'})
+
+    // #then
+    expect(second.status).toBe(202)
+    expect(((await second.json()) as {runId: string}).runId).toBe(((await first.json()) as {runId: string}).runId)
+    expect(mockLaunchWork).toHaveBeenCalledTimes(1)
+  })
+
+  it('replays when only the padding of the repo field differs', async () => {
+    const app = buildApp(makeDeps())
+    await postRuns(app, {repo: 'acme/widget', prompt: 'do something', idempotencyKey: 'k'})
+
+    const second = await postRuns(app, {repo: ' acme/widget ', prompt: 'do something', idempotencyKey: 'k'})
+
+    expect(second.status).toBe(202)
+    expect(mockLaunchWork).toHaveBeenCalledTimes(1)
+  })
+
+  it('a concurrent different request while the first is still reserved gets the conflict', async () => {
+    // #given a launch held in admission
+    let release: (admission: LaunchAdmission) => void = () => {}
+    mockLaunchWork.mockImplementationOnce(
+      async () =>
+        new Promise<LaunchAdmission>(resolve => {
+          release = resolve
+        }),
+    )
+    const app = buildApp(makeDeps())
+    const firstPending = postRuns(app, {repo: 'acme/widget', prompt: 'first task', idempotencyKey: 'k'})
+    await vi.waitFor(() => expect(mockLaunchWork).toHaveBeenCalledTimes(1))
+
+    // #when a different request arrives under the same key
+    const second = await postRuns(app, {repo: 'acme/widget', prompt: 'second task', idempotencyKey: 'k'})
+
+    // #then
+    expect(second.status).toBe(400)
+    expect(await second.json()).toEqual(CONFLICT)
+    release({accepted: true, runId: 'r1'})
+    expect((await firstPending).status).toBe(202)
+  })
+
+  it('a rejected launch frees the key for a different request', async () => {
+    // #given the first admission is rejected, which rolls the reservation back
+    mockLaunchWork.mockResolvedValueOnce({accepted: false, reason: 'cap'})
+    const app = buildApp(makeDeps())
+    const rejected = await postRuns(app, {repo: 'acme/widget', prompt: 'first task', idempotencyKey: 'k'})
+    expect(rejected.status).toBe(503)
+
+    // #when the same key comes with a different prompt
+    const retry = await postRuns(app, {repo: 'acme/widget', prompt: 'second task', idempotencyKey: 'k'})
+
+    // #then it is a new launch, not a conflict
+    expect(retry.status).toBe(202)
+    expect(mockLaunchWork).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not bind the key across operators: another operator may reuse it for anything', async () => {
+    const deps = makeDeps()
+    const appA = buildAppWithGuardResult({ok: true, githubUserId: 1, sessionId: 'sess-a'}, deps)
+    const appB = buildAppWithGuardResult({ok: true, githubUserId: 2, sessionId: 'sess-b'}, deps)
+    await postRuns(appA, {repo: 'acme/widget', prompt: 'task A', idempotencyKey: 'x'})
+
+    const response = await postRuns(appB, {repo: 'acme/widget', prompt: 'task B', idempotencyKey: 'x'})
+
+    expect(response.status).toBe(202)
+  })
+
+  it("one operator's use of a key never changes what another operator's same key is bound to", async () => {
+    // #given ONE route serving two operators (the production shape), switched per request
+    let current = {githubUserId: 1, sessionId: 'sess-a'}
+    const app = new Hono()
+    setOperatorRouteGuard(app, async () => ({ok: true as const, ...current}))
+    buildLaunchRoute(app, makeDeps())
+    const as = (githubUserId: number, sessionId: string) => {
+      current = {githubUserId, sessionId}
+    }
+    as(1, 'sess-a')
+    const a1 = await postRuns(app, {repo: 'acme/widget', prompt: 'task A', idempotencyKey: 'x'})
+    as(2, 'sess-b')
+    await postRuns(app, {repo: 'acme/widget', prompt: 'task B', idempotencyKey: 'x'})
+
+    // #when A retries its own request
+    as(1, 'sess-a')
+    const a2 = await postRuns(app, {repo: 'acme/widget', prompt: 'task A', idempotencyKey: 'x'})
+
+    // #then it is a replay of A's run, not a conflict with B's request
+    expect(a2.status).toBe(202)
+    expect(((await a2.json()) as {runId: string}).runId).toBe(((await a1.json()) as {runId: string}).runId)
+    expect(mockLaunchWork).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps the key bound for the full TTL after a delayed admission is accepted, then frees it', async () => {
+    // #given one clock shared by the route and the guard, and a launch whose admission is held open
+    let nowMs = 0
+    const guard = createIdempotencyGuard({now: () => nowMs})
+    const app = buildApp(makeDeps({idempotencyGuard: guard, now: () => nowMs}))
+    let release: (admission: LaunchAdmission) => void = () => {}
+    let launchedRunId = ''
+    mockLaunchWork.mockImplementationOnce(
+      async (request: LaunchWorkRequest) =>
+        new Promise<LaunchAdmission>(resolve => {
+          launchedRunId = request.runId ?? ''
+          release = resolve
+        }),
+    )
+    const firstPending = postRuns(app, {repo: 'acme/widget', prompt: 'first task', idempotencyKey: 'k'})
+    await vi.waitFor(() => expect(mockLaunchWork).toHaveBeenCalledTimes(1))
+
+    // #when admission is accepted just before the original reservation would have expired.
+    // The reservation (guard and fingerprint alike) expires at TTL; acceptance refreshes both to the acceptance
+    // time + TTL.
+    nowMs = IDEMPOTENCY_TTL_MS - 1000
+    release({accepted: true, runId: launchedRunId})
+    const first = await firstPending
+    expect(first.status).toBe(202)
+    const committedExpiry = nowMs + IDEMPOTENCY_TTL_MS
+
+    // #then past the ORIGINAL expiry but before the committed one, the key is still bound to its request:
+    // a different prompt is a conflict and launches nothing, an identical retry replays
+    nowMs = IDEMPOTENCY_TTL_MS + 1000
+    const conflicting = await postRuns(app, {repo: 'acme/widget', prompt: 'second task', idempotencyKey: 'k'})
+    expect(conflicting.status).toBe(400)
+    expect(await conflicting.json()).toEqual({error: 'idempotency key reuse with different request'})
+    const replay = await postRuns(app, {repo: 'acme/widget', prompt: 'first task', idempotencyKey: 'k'})
+    expect(replay.status).toBe(202)
+    expect(((await replay.json()) as {runId: string}).runId).toBe(launchedRunId)
+    expect(mockLaunchWork).toHaveBeenCalledTimes(1)
+
+    // #then one millisecond before the committed expiry it is still bound
+    nowMs = committedExpiry - 1
+    const lastMoment = await postRuns(app, {repo: 'acme/widget', prompt: 'second task', idempotencyKey: 'k'})
+    expect(lastMoment.status).toBe(400)
+    expect(mockLaunchWork).toHaveBeenCalledTimes(1)
+
+    // #then at the committed expiry the guard's own entry has expired too (both lifetimes end together), so the
+    // same key with a different request is a new launch
+    nowMs = committedExpiry
+    const afterExpiry = await postRuns(app, {repo: 'acme/widget', prompt: 'second task', idempotencyKey: 'k'})
+    expect(afterExpiry.status).toBe(202)
+    expect(mockLaunchWork).toHaveBeenCalledTimes(2)
+    expect(mockLaunchWork.mock.calls[1]?.[0].promptText).toBe('second task')
+  })
+
+  it('keeps echoing the reserved runId when the guard holds an entry the route has no fingerprint for', async () => {
+    // #given a live entry written by something other than this route's lifecycle (eviction, an injected guard)
+    const guard = createIdempotencyGuard()
+    guard.reserve(1001, 'orphan', 'run-orphan')
+    const app = buildApp(makeDeps({idempotencyGuard: guard}))
+
+    // #when
+    const response = await postRuns(app, {repo: 'acme/widget', prompt: 'anything', idempotencyKey: 'orphan'})
+
+    // #then the legacy behaviour holds: echo, no launch
+    expect(response.status).toBe(202)
+    expect(((await response.json()) as {runId: string}).runId).toBe('run-orphan')
+    expect(mockLaunchWork).not.toHaveBeenCalled()
+  })
+})
 
 describe('POST /operator/runs — two-phase idempotency', () => {
   it('happy path: accepted admission → idempotency committed, 202 {runId}', async () => {
@@ -1431,7 +1742,7 @@ describe('POST /operator/runs — persistence opt-in and admission mapping (cont
     expect(await response.json()).toEqual({error: 'bad request', reason: 'prompt-too-long'})
   })
 
-  it('a repeated idempotency key with a different prompt echoes the first run and launches once', async () => {
+  it('a repeated idempotency key with a different prompt is a conflict and launches once', async () => {
     // #given
     const app = buildApp(makeDeps())
 
@@ -1439,10 +1750,10 @@ describe('POST /operator/runs — persistence opt-in and admission mapping (cont
     const first = await postRuns(app, {repo: 'acme/widget', prompt: 'first prompt', idempotencyKey: 'k1'})
     const second = await postRuns(app, {repo: 'acme/widget', prompt: 'a different prompt', idempotencyKey: 'k1'})
 
-    // #then — first launch wins; the later prompt is discarded
-    const firstBody = (await first.json()) as {runId: string}
-    const secondBody = (await second.json()) as {runId: string}
-    expect(secondBody.runId).toBe(firstBody.runId)
+    // #then — first launch wins; the later prompt is rejected, not silently discarded behind an echoed runId
+    expect(first.status).toBe(202)
+    expect(second.status).toBe(400)
+    expect(await second.json()).toEqual({error: 'idempotency key reuse with different request'})
     expect(mockLaunchWork).toHaveBeenCalledOnce()
     expect(mockLaunchWork.mock.calls[0]?.[0].promptText).toBe('first prompt')
   })

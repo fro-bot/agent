@@ -24,7 +24,7 @@
 import type {Logger, ObjectStoreAdapter, ObjectStoreConfig, Result} from '@fro-bot/runtime'
 import type {RepoBinding} from './types.js'
 
-import {buildObjectStoreKey, createS3Adapter, err, ok} from '@fro-bot/runtime'
+import {buildObjectStoreKey, createS3Adapter, err, ok, toErrorMessage} from '@fro-bot/runtime'
 
 import {createAppClient} from '../github/app-client.js'
 import {loadObjectStoreSettings} from '../object-store-config.js'
@@ -237,7 +237,7 @@ export async function runDenyKeyBackfill(options: RunDenyKeyBackfillOptions): Pr
     identity = readOptionalSecret('GATEWAY_IDENTITY') ?? 'discord-gateway'
   } catch (configError) {
     logger.error('backfill-runner: missing required env var', {
-      error: configError instanceof Error ? configError.message : String(configError),
+      error: toErrorMessage(configError),
     })
     return 1
   }
@@ -247,7 +247,7 @@ export async function runDenyKeyBackfill(options: RunDenyKeyBackfillOptions): Pr
     objectStoreSettings = loadObjectStoreSettings()
   } catch (settingsError) {
     logger.error('backfill-runner: invalid object-store settings', {
-      error: settingsError instanceof Error ? settingsError.message : String(settingsError),
+      error: toErrorMessage(settingsError),
     })
     return 1
   }
@@ -274,7 +274,7 @@ export async function runDenyKeyBackfill(options: RunDenyKeyBackfillOptions): Pr
     adapter = createS3Adapter(storeConfig, logger)
   } catch (adapterError) {
     logger.error('backfill-runner: failed to build S3 adapter', {
-      error: adapterError instanceof Error ? adapterError.message : String(adapterError),
+      error: toErrorMessage(adapterError),
     })
     return 1
   }

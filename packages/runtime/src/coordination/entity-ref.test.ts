@@ -67,13 +67,34 @@ describe('parseEntityRefRepo', () => {
     expect(parseEntityRefRepo('owner#a/b')).toBeNull()
   })
 
-  it('splits on the first slash only', () => {
+  it('returns null when there are extra path segments (D4: was {owner: a, repo: b/c})', () => {
     // #given an entity ref with extra path segments
     // #when parsed
-    const result = parseEntityRefRepo('a/b/c')
+    // #then it is not an owner/repo, so it is rejected instead of leaking `b/c` into the repo name
+    expect(parseEntityRefRepo('a/b/c')).toBeNull()
+    expect(parseEntityRefRepo('a/b/c#4')).toBeNull()
+    expect(parseEntityRefRepo('owner/repo/')).toBeNull()
+  })
 
-    // #then the remainder stays in repo (current behavior, pinned)
-    expect(result).toEqual({owner: 'a', repo: 'b/c'})
+  it.each(['owner/re po', 'ow ner/repo', 'owner/repo?x=1', String.raw`ow\ner/repo`, 'owner/re\u0000po'])(
+    'returns null for the forbidden character in %j',
+    entityRef => {
+      expect(parseEntityRefRepo(entityRef)).toBeNull()
+    },
+  )
+
+  it.each(['\u200B', '\u200D', '\uFEFF'])('returns null for an invisible format character (%j)', char => {
+    expect(parseEntityRefRepo(`owner${char}/repo`)).toBeNull()
+    expect(parseEntityRefRepo(`owner/re${char}po#3`)).toBeNull()
+    expect(parseEntityRefRepo(`${char}owner/repo`)).toBeNull()
+  })
+
+  it('trims surrounding whitespace, as the slug contract does', () => {
+    expect(parseEntityRefRepo(' owner/repo#2 ')).toEqual({owner: 'owner', repo: 'repo'})
+  })
+
+  it('does not change case', () => {
+    expect(parseEntityRefRepo('Owner/Repo#1')).toEqual({owner: 'Owner', repo: 'Repo'})
   })
 
   it('returns null for an empty string', () => {

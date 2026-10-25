@@ -106,6 +106,11 @@ const UNAVAILABLE = {kind: 'unavailable'} as const
 /**
  * One binding read that answers both "what are the deny keys" and "what is the binding".
  *
+ * The read key is the lowercase `owner`/`repo`: bindings are only ever stored lowercase (add-project canonicalises
+ * before it writes) and GitHub names are case-insensitive, so every caller (the operator access predicate and the
+ * run-status projection alike) resolves a repo the same way whatever spelling it was given. The case is folded
+ * here and nowhere else; no key builder or store changes.
+ *
  * A store error or throw is `unavailable`, kept distinct from a missing binding
  * (`resolved` with a null/null key and a null binding). Never throws.
  */
@@ -116,7 +121,7 @@ export async function lookupBindingDenyKeys<B extends BindingDenyKeySource>(
 ): Promise<DenyKeyLookup<B>> {
   let result: Awaited<ReturnType<BindingsLookup<B>['getBindingByRepo']>>
   try {
-    result = await bindingsLookup.getBindingByRepo(owner, repo)
+    result = await bindingsLookup.getBindingByRepo(owner.toLowerCase(), repo.toLowerCase())
   } catch {
     return UNAVAILABLE
   }

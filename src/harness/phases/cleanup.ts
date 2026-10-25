@@ -41,6 +41,7 @@ import {
   getOpenCodeStoragePath,
   isOpenCodePromptArtifactEnabled,
 } from '../../shared/env.js'
+import {toErrorMessage} from '../../shared/errors.js'
 import {createLogger} from '../../shared/logger.js'
 import {normalizeWorkspacePath} from '../../shared/paths.js'
 import {setCacheSaveResultOutput} from '../config/outputs.js'
@@ -168,7 +169,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
         await cleanupTempFiles(attachmentResult.tempFiles, attachmentCleanupLogger)
       } catch (attachmentError) {
         attachmentCleanupLogger.warning('Attachment temp-file cleanup failed (non-fatal); shutdown still proceeds', {
-          error: attachmentError instanceof Error ? attachmentError.message : String(attachmentError),
+          error: toErrorMessage(attachmentError),
         })
       }
     }
@@ -194,7 +195,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
         await fs.rm(attachmentDir, {recursive: true, force: true})
       } catch (attachmentDirError) {
         attachmentDirCleanupLogger.warning('Attachment directory cleanup failed (non-fatal); shutdown still proceeds', {
-          error: attachmentDirError instanceof Error ? attachmentDirError.message : String(attachmentDirError),
+          error: toErrorMessage(attachmentDirError),
         })
       }
     }
@@ -209,7 +210,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
         await removeWorkingLabel(githubClient, reactionCtx, cleanupLogger)
       } catch (labelError) {
         cleanupLogger.warning('Working-label removal failed (non-fatal); shutdown still proceeds', {
-          error: labelError instanceof Error ? labelError.message : String(labelError),
+          error: toErrorMessage(labelError),
         })
       }
     }
@@ -237,7 +238,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
         }
       } catch (pruneError) {
         pruneLogger.warning('Session pruning failed (non-fatal); shutdown still proceeds', {
-          error: pruneError instanceof Error ? pruneError.message : String(pruneError),
+          error: toErrorMessage(pruneError),
         })
       }
     }
@@ -271,7 +272,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
       } catch (shutdownError) {
         quiescenceConfirmed = false
         bootstrapLogger.warning('Server shutdown failed (non-fatal)', {
-          error: shutdownError instanceof Error ? shutdownError.message : String(shutdownError),
+          error: toErrorMessage(shutdownError),
         })
       }
     }
@@ -330,7 +331,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
         }
       } catch (error) {
         objectStoreLogger.warning('Object store artifact or metadata sync failed (non-fatal)', {
-          error: error instanceof Error ? error.message : String(error),
+          error: toErrorMessage(error),
         })
       }
     }
@@ -384,6 +385,15 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
             ? 'the coordination lease could not verify uninterrupted coverage, so this run can no longer be certain another Action run has not taken over and is writing the same session state'
             : null
 
+    // The object store keeps ONE shared session object per repo, written with an unconditional upload, and
+    // every gate above reads "safe" for a run that never took the lock (no ledger, no server handle, no lease
+    // to lose) -- the dedup skip and the routing skip both return before `runAcquireLock` and still reach this
+    // phase. So the publish needs POSITIVE evidence that this run acquired the Action lock: only
+    // `runAcquireLock`'s `acquired` outcome sets a lock ETag or a lease renewal. Anything else writes the
+    // Actions cache only.
+    const holdsLease = lockEtag != null || leaseRenewal != null
+    const storePublishWithheld = storeConfig.enabled === true && holdsLease === false
+
     let cacheSaveResult: CacheSaveResult
     if (declineReason == null) {
       cacheSaveResult = await saveCache({
@@ -395,6 +405,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
         projectIdPath: finalProjectIdPath,
         opencodeVersion: detectedOpencodeVersion,
         storeConfig,
+        objectStorePublish: holdsLease ? 'publish' : 'withhold',
       })
     } else {
       cacheLogger.warning('Declining cache save: persistence safety could not be confirmed', {reason: declineReason})
@@ -414,7 +425,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
       setCacheSaveResultOutput(cacheSaveStateValue)
     } catch (outputError) {
       cacheLogger.warning('Failed to set cache-save-result output (non-fatal)', {
-        error: outputError instanceof Error ? outputError.message : String(outputError),
+        error: toErrorMessage(outputError),
       })
     }
 
@@ -423,7 +434,13 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
     // time this outcome is known. `declineReason` (undefined on every other outcome) is
     // what makes a declined persistence a visible, explained outcome rather than a silent
     // skip indistinguishable from a routine 'checkpoint-declined' or 'skipped-empty' row.
-    await writeCacheSaveResultSummary(cacheSaveResult, 'main', cacheLogger, declineReason ?? undefined)
+    await writeCacheSaveResultSummary(
+      cacheSaveResult,
+      'main',
+      cacheLogger,
+      declineReason ?? undefined,
+      declineReason == null && storePublishWithheld ? 'lease-not-acquired' : undefined,
+    )
 
     if (isOpenCodePromptArtifactEnabled()) {
       const artifactLogger = createLogger({phase: 'artifact-upload'})
@@ -440,7 +457,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
     }
   } catch (cleanupError) {
     bootstrapLogger.warning('Cleanup failed (non-fatal)', {
-      error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+      error: toErrorMessage(cleanupError),
     })
   } finally {
     // Stop lease renewal BEFORE releasing the lock -- renewal must keep ticking through
@@ -489,7 +506,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
         }
       } catch (releaseError) {
         releaseLogger.warning('Lock release threw (non-fatal)', {
-          error: releaseError instanceof Error ? releaseError.message : String(releaseError),
+          error: toErrorMessage(releaseError),
           repo,
         })
       }

@@ -28,6 +28,7 @@ import type {ApprovalActor} from '../../approvals/registry.js'
 import type {ApprovalTransportContext, LaunchWorkRequest} from '../../execute/launch-types.js'
 import type {ApprovalFrameData} from '../../operator-contract/approval-frame.js'
 import type {OperatorLogger} from '../server.js'
+import {toErrorMessage} from '@fro-bot/runtime'
 import {boundApprovalDetail} from '../../approvals/approval-detail.js'
 
 // ---------------------------------------------------------------------------
@@ -115,7 +116,7 @@ export function createWebApprovalOnPending(
               {
                 runId: ctx.runId,
                 requestID,
-                err: error instanceof Error ? error.message : String(error),
+                err: toErrorMessage(error),
               },
               'web-approval: renderFn settle-frame threw (fail-soft; settlement already applied)',
             )
@@ -148,7 +149,7 @@ export function createWebApprovalOnPending(
             runId: ctx.runId,
             repo: ctx.repo,
             requestID,
-            err: error instanceof Error ? error.message : String(error),
+            err: toErrorMessage(error),
           },
           'web-approval: observeApproval threw (fail-soft; registry entry registered, deadline will settle)',
         )

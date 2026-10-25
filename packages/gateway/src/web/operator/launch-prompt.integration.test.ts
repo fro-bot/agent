@@ -413,16 +413,16 @@ describe('launch prompt — real-store round trip (contract 1.12.0)', () => {
     expect(h.listRunsForRepoSpy).not.toHaveBeenCalled()
   })
 
-  it('a repeated idempotency key with a different prompt keeps the first prompt on the record', async () => {
+  it('a repeated idempotency key with a different prompt is rejected and keeps the first prompt on the record', async () => {
     // #given
     const h = makeHarness()
     const first = (await (await launch(h, {prompt: 'FIRST prompt', idempotencyKey: 'k-1'})).json()) as {runId: string}
 
     // #when
-    const second = (await (await launch(h, {prompt: 'SECOND prompt', idempotencyKey: 'k-1'})).json()) as {runId: string}
+    const secondResponse = await launch(h, {prompt: 'SECOND prompt', idempotencyKey: 'k-1'})
 
-    // #then — the same run, a single record, and it holds the first prompt
-    expect(second.runId).toBe(first.runId)
+    // #then — a conflict, a single record, and it holds the first prompt
+    expect(secondResponse.status).toBe(400)
     expect(h.store.objects.size).toBe(1)
     expect(storedState(h, first.runId).details.operatorPrompt).toBe('FIRST prompt')
   })

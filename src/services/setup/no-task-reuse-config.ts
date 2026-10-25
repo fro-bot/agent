@@ -4,6 +4,7 @@ import {homedir} from 'node:os'
 import * as path from 'node:path'
 import process from 'node:process'
 import {pathToFileURL} from 'node:url'
+import {toErrorMessage} from '../../shared/errors.js'
 
 // A subdirectory OpenCode does not scan. It auto-loads `<configDir>/{plugin,plugins}/*.{ts,js}`
 // (packages/opencode/src/config/plugin.ts:18-30), so keeping the guard out of those directories means
@@ -74,9 +75,9 @@ export async function writeNoTaskReuseFile(
     return filePath
   } catch (error) {
     throw new Error(
-      `Could not install the task-reuse guard plugin from ${assetUrl.toString()} to ${filePath}: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
+      `Could not install the task-reuse guard plugin from ${assetUrl.toString()} to ${filePath}: ${toErrorMessage(
+        error,
+      )}`,
       {cause: error},
     )
   }

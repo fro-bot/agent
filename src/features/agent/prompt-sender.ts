@@ -6,6 +6,7 @@ import type {EventStreamResult, PermissionAskedResponder} from './streaming.js'
 import type {ErrorInfo, ExecutionConfig} from './types.js'
 import {createLLMFetchError, isLlmFetchError} from '@fro-bot/runtime'
 import {DEFAULT_MODEL, DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
+import {formatSdkError} from '../../shared/errors.js'
 import {runPromptAttempt, shouldRetryFromOutcome, type ExecutionDeadline, type PromptStartResult} from './retry.js'
 
 export type AttemptOutcome =
@@ -114,7 +115,7 @@ export async function sendPromptToSession(
         signal: deadline?.signal,
       })
       if (response.error == null) return null
-      return createSubmissionFailure(String(response.error), response.error)
+      return createSubmissionFailure(formatSdkError(response.error), response.error)
     }
 
     const runAttempt = async () =>
