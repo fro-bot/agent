@@ -1,13 +1,17 @@
 ---
 type: subsystem
-last-updated: "2026-10-18"
-updated-by: "1dcd6a296d36057a6680ca347bf01a6987d78ec9"
+last-updated: "2026-10-25"
+updated-by: "fe7f6bda"
 sources:
   - packages/gateway/src/execute/run.ts
   - packages/gateway/src/execute/run-core.ts
   - packages/gateway/src/execute/provider-failure.ts
   - packages/gateway/src/execute/provenance.ts
   - packages/gateway/src/execute/preparation-reply.ts
+  - packages/gateway/src/execute/checkout-recovery.ts
+  - packages/gateway/src/execute/recovery-budget.ts
+  - packages/gateway/src/github/app-client.ts
+  - packages/runtime/src/repo/slug.ts
   - packages/gateway/src/execute/recovery.ts
   - packages/gateway/src/web/server.ts
   - packages/gateway/src/web/ingress/resolve-client.ts
@@ -165,6 +169,8 @@ Authentication proves who an operator is; authorization decides what they may to
 
 Repository access is one predicate, `resolveRepoAccess`, used by every route that names a repository, for reads and writes alike: the repository must be bound **and** not denylisted. It reads the binding once on the server, then consults the denylist with the binding's deny keys. A malformed name is denied with no store call. A missing binding is denied. A store error is `unavailable`. Anything but allowed returns the same not-found response. No GitHub call is made, and the operator's GitHub rights are not consulted. A write route therefore does not track what the operator can do on GitHub: access follows the binding. The GitHub-side action on dispatch and launch runs as the Fro Bot GitHub App installation, not as the operator.
 
+Launch and dispatch share `parseRepoSlug` (`packages/runtime/src/repo/slug.ts`) for the submitted `owner/repo` shape: surrounding padding is trimmed, exactly one slash is allowed, and whitespace, query/fragment syntax, backslashes, control characters, and invisible format characters are rejected. Malformed shape returns `400`; the subsequent access predicate applies GitHub name rules before storage access. Binding lookup uses the lowercase key, then the routes use the binding's stored spelling for channel identity, GitHub calls, fingerprints, audit records, and logs. Case-only request differences therefore identify the same repository without changing its authority.
+
 Because the binding is the grant, only the configured Discord binders can create one. `/add-project` refuses anyone not listed in `GATEWAY_BINDER_ALLOWLIST_FILE` (Discord user IDs, one per line), on top of the guild-level `ManageChannels` check. An empty list refuses everyone and logs a startup warning. The installation scope of the Fro Bot GitHub App bounds which repositories a binder can bind.
 
 ### CSRF and the browser guard (`web/auth/csrf.ts`)
@@ -175,9 +181,13 @@ The browser guard validates Fetch Metadata headers and an HMAC-signed CSRF token
 
 ### Checkout preparation and recovery
 
-Gateway runs prepare the persistent checkout before the `EXECUTING` transition, under the shared repository lock (`execute/run.ts`, `workspace-api/client.ts`). Preparation asks the workspace-agent to update first; only a `no-checkout` result leads to a fresh clone and another update. A ready result includes remote default-branch evidence and a starting checkout observation. The engine records this as checkout provenance on the run and adds a deterministic line to its human reply, rather than trusting model-generated claims about what commit it saw. An ineligible tree — dirty, detached, on another branch, diverged, or obstructed — ends the run before execution; an uncertain network or apply result is recorded as a failure, not silently treated as a clean checkout. See [[Architecture Overview]] for the workspace-side mutation boundary.
+Gateway runs prepare the persistent checkout before the `EXECUTING` transition, under the shared repository lock (`execute/run.ts`, `workspace-api/client.ts`). Preparation asks the workspace-agent to update first; only a `no-checkout` result leads to a fresh clone and another update. A ready result includes remote default-branch evidence and a starting checkout observation. The engine records this as checkout provenance on the run and adds a deterministic line to its human reply, rather than trusting model-generated claims about what commit it saw. A dirty tree may enter automatic recovery as described below; other ineligible trees — detached, on another branch, diverged, or obstructed — end the run before execution. An uncertain network or apply result is recorded as a failure, not silently treated as a clean checkout. See [[Architecture Overview]] for the workspace-side mutation boundary.
 
 The gateway's Discord recovery command and its Recover button preview a preserve-and-replace operation before confirmation. The workspace-agent checks that the checkout still matches the preview fingerprint, moves the existing tree into a quarantine backup, and publishes a fresh default-branch checkout. Per-repository mutexes and persisted journals prevent another mutation from racing the operation or treating an interrupted update as a clean starting state (`apps/workspace-agent/src/recover.ts`, `apps/workspace-agent/src/update.ts`). If a subprocess cannot be confirmed stopped, the workspace holds that repository against further mutation until restart. The gateway's run lock and the workspace mutex protect different boundaries: gateway-run execution per repository and local checkout operations, respectively.
+
+For a `dirty` refusal, preparation can perform that preservation automatically once per run (`execute/checkout-recovery.ts`). It requires the repository lock, a `clear` workspace-status check, a complete preview, and enough remaining budget for the whole attempt: 574 seconds with default call ceilings, including two token mints. A confirmed recovery names its backup and proceeds through another update. A definite decline keeps the original refusal; retention or disk-space declines instead explain the cleanup needed. An ambiguous result always runs update again before looking up a backup attributed to this run, so the reply describes the observed checkout rather than claiming a swap succeeded. Backup existence alone proves preservation, not installation of a replacement.
+
+Recovery preserves the whole checkout against the five-generation/10 GiB retention cap and never evicts backups automatically. The workspace best-effort disposes OpenCode's cached instance after a successful swap. Preparation is not wired to the operator cancel signal: cancellation is effective after the `EXECUTING` registration described below, so a request during checkout preparation cannot immediately interrupt these bounded calls. [[Troubleshooting]] lists their diagnostic outcomes.
 
 ### Browser launch
 

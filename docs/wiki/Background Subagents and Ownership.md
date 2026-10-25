@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-10-18"
-updated-by: "1dcd6a296d36057a6680ca347bf01a6987d78ec9"
+last-updated: "2026-10-25"
+updated-by: "fe7f6bda"
 sources:
   - packages/runtime/src/agent/ownership-ledger.ts
   - packages/runtime/src/agent/ledger-reconcile.ts
@@ -25,6 +25,8 @@ sources:
   - packages/gateway/src/execute/provider-failure.ts
   - packages/gateway/src/execute/run.ts
   - packages/gateway/src/execute/settle-owned-sessions.ts
+  - packages/gateway/src/execute/live-reconcile.ts
+  - packages/runtime/src/coordination/lease-loop.ts
   - packages/gateway/src/execute/recovery.ts
   - packages/gateway/src/execute/repo-quiescence.ts
   - src/features/agent/server-adapter.ts
@@ -105,9 +107,11 @@ The known consequence is that a dispatch whose _adoption_ event was never observ
 
 `runDrain` (`src/harness/phases/execute.ts`) runs after Execute returns and strictly _before_ review reconciliation, finalize, and cleanup. Its placement is the point: a drain folded into cleanup would publish a response describing work that is still changing underneath it.
 
-The sequence is straightforward once the invariants are clear. Drain reconciles once unconditionally — even with zero entries outstanding, because that is the only way to learn a tracked entry's settlement event was dropped. If the ledger is drained, it returns. Otherwise it arms a periodic reconciler and polls until the ledger drains or the deadline expires. On expiry it reconciles once more (so the cancellation set reflects the present), aborts every entry that is not confirmed settled — `unknown` as well as `outstanding`, since an unconfirmable entry is the one most likely still running — then reconciles again to confirm. Anything still unsettled is explicitly marked `unknown`.
+The sequence is straightforward once the invariants are clear. Drain reconciles once unconditionally; reconciliation itself makes no remote calls for an empty ledger. If the ledger is drained, it returns. Otherwise it arms a periodic reconciler and polls until the ledger drains or the deadline expires. On expiry it reconciles once more (so the cancellation set reflects the present), aborts every entry that is not confirmed settled — `unknown` as well as `outstanding`, since an unconfirmable entry is the one most likely still running — then reconciles again to confirm. Anything still unsettled is explicitly marked `unknown`.
 
 Two timing details matter. The abort calls use a **fresh** timeout signal: the just-expired execution deadline must not also cancel the cancellation. And the drain budget is carved out of the same wall-clock budget as execution — total timeout, minus a teardown reserve, minus the time execution already spent — so one deadline covers execution and drain together rather than letting drain extend a run indefinitely.
+
+Disabling the execution timeout also disables that drain deadline. In this mode, three consecutive reconciliation passes that observe no tracked child running while the ledger remains unresolved end the wait and enter cancellation. A child observed running still keeps it open, even if an earlier failed pass marked that entry `unknown`. Each drain pass and abort has its own five-second bound and cancellation signal, and abandoned passes lose mutation authority, so a hung request cannot defer cleanup indefinitely or settle an entry after teardown moved on.
 
 Context-overflow recovery drains with a zero deadline against the overflowed session's ledger _before_ archiving it, so the archived session's children are cancelled before the recovery session starts writing the same checkout. The recovery session then gets a fresh ledger, which is a dispatch-accounting reset rather than a claim that the replaced session left nothing unresolved — the unresolved state is carried forward separately.
 

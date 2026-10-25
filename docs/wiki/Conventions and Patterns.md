@@ -1,7 +1,7 @@
 ---
 type: convention
-last-updated: "2026-10-18"
-updated-by: "1dcd6a296d36057a6680ca347bf01a6987d78ec9"
+last-updated: "2026-10-25"
+updated-by: "fe7f6bda"
 sources:
   - AGENTS.md
   - src/harness/outcome.ts
@@ -13,6 +13,10 @@ sources:
   - scripts/module-taxonomy.test.ts
   - scripts/harness-tag-derivation.test.ts
   - packages/runtime/src/shared/logger.ts
+  - packages/runtime/src/shared/errors.ts
+  - packages/runtime/src/coordination/entity-ref.ts
+  - packages/runtime/src/repo/slug.ts
+  - packages/gateway/src/execute/runtime-logger.ts
   - packages/runtime/src/shared/types.ts
   - src/shared/logger.ts
   - src/shared/types.ts
@@ -57,6 +61,10 @@ export function restoreCache(options: CacheOptions, logger: Logger): Promise<Cac
 ```
 
 This injection pattern makes testing straightforward: tests pass a mock logger and can assert on log output without touching global state.
+
+Error rendering has a shared boundary too. `toErrorMessage` in `packages/runtime/src/shared/errors.ts` safely describes caught values, returning `[unprintable error]` if coercion itself fails. `formatSdkError` handles SDK response envelopes separately: it prefers their nested message, then message/name/type fields, and finally JSON, with a 500-character ceiling. These are diagnostic helpers, not classifiers or sanitizers; structured evidence and the injected logger's redaction still carry those responsibilities.
+
+Small compatibility adapters remain beside their consumers. For example, `packages/gateway/src/execute/runtime-logger.ts` bridges gateway logging to runtime callbacks, while repository parsing and entity-reference interpretation live in shared runtime modules. This keeps transport-specific adaptation local without multiplying definitions of the same data contract.
 
 ## Strict Boolean Expressions
 
