@@ -1,6 +1,6 @@
 import type {ObjectStoreAdapter, ObjectStoreConfig, ObjectStoreOperationError, Result} from '@fro-bot/runtime'
 
-import {buildObjectStoreKey, err, ok, sanitizeKeyComponent} from '@fro-bot/runtime'
+import {buildObjectStoreKey, err, ok, sanitizeKeyComponent, toErrorMessage} from '@fro-bot/runtime'
 
 import {
   createBindingExistsError,
@@ -119,7 +119,7 @@ function parseRepoBinding(data: string): Result<RepoBinding, ValidationError> {
 
     return ok(parsed)
   } catch (error) {
-    return err(createValidationError(error instanceof Error ? error.message : String(error)))
+    return err(createValidationError(toErrorMessage(error)))
   }
 }
 
@@ -132,7 +132,7 @@ function parseChannelIndex(data: string): Result<{owner: string; repo: string}, 
 
     return ok(parsed)
   } catch (error) {
-    return err(createValidationError(error instanceof Error ? error.message : String(error)))
+    return err(createValidationError(toErrorMessage(error)))
   }
 }
 

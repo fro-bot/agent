@@ -91,8 +91,10 @@ async function hasCacheableContent(storagePath: string, cachePaths: readonly str
  *
  * A decline here rarely costs a run its session work: `runCleanup` sets `CACHE_SAVED` to
  * `not-persisted` on decline (via `toCacheSaveStateValue`), so `runPost` (post.ts) retries
- * the save later — by which point the main step has ended and the OpenCode child has
- * almost certainly exited, making the retry's checkpoint succeed.
+ * the Actions cache save later — by which point the main step has ended and the OpenCode
+ * child has almost certainly exited, making the retry's checkpoint succeed. The retry never
+ * publishes to the object store (`objectStorePublish: 'withhold'`): the main step released
+ * the coordination lease, so only the Actions cache is retried.
  */
 async function writeCheckpointDeclineSummary(reason: string, logger: Logger): Promise<void> {
   try {
@@ -178,7 +180,12 @@ export async function saveCache(options: SaveCacheOptions): Promise<CacheSaveRes
 
     await writeStorageVersion(storagePath)
 
-    if (options.storeConfig?.enabled === true) {
+    // `withhold` is for a caller that holds no coordination lease (the post hook): the session object is
+    // shared by every run of the repo and the upload is an unconditional last-writer-wins PutObject, so
+    // publishing without the lease can roll back a newer session a successor run already published.
+    if (options.storeConfig?.enabled === true && options.objectStorePublish === 'withhold') {
+      logger.info('Object store session publish withheld: this caller does not hold the lease')
+    } else if (options.storeConfig?.enabled === true) {
       try {
         const adapter = options.storeAdapter ?? createS3Adapter(options.storeConfig, logger)
         const syncResult = await syncSessionsToStore(

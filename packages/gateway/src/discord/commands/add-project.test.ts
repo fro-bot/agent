@@ -386,6 +386,81 @@ describe('executeAddProject', () => {
     })
   })
 
+  describe('PRE_FLIGHT: repository slug rules (D11)', () => {
+    it.each([
+      ['a query string', 'https://github.com/owner/repo?x=1'],
+      ['a fragment', 'https://github.com/owner/repo#readme'],
+      ['a space in the repo', 'https://github.com/owner/re po'],
+      ['a space in the owner', 'https://github.com/ow ner/repo'],
+      ['a unicode repo name', 'https://github.com/owner/r\u00E9po'],
+      ['a unicode owner', 'https://github.com/\u00F6wner/repo'],
+      ['a control character', 'https://github.com/owner/re\u0007po'],
+      ['a backslash', String.raw`https://github.com/owner/re\po`],
+      ['a dot-only repo', 'https://github.com/owner/..'],
+      ['a repo with consecutive dots', 'https://github.com/owner/a..b'],
+      ['a repo ending in consecutive dots', 'https://github.com/owner/repo..'],
+      ['a zero-width space', 'https://github.com/owner/re\u200Bpo'],
+      ['a leading-hyphen owner', 'https://github.com/-owner/repo'],
+      ['a trailing-hyphen owner', 'https://github.com/owner-/repo'],
+      ['an owner over 39 characters', `https://github.com/${'o'.repeat(40)}/repo`],
+      ['a repo over 100 characters', `https://github.com/owner/${'r'.repeat(101)}`],
+      ['an owner with an underscore', 'https://github.com/own_er/repo'],
+    ])('rejects a URL with %s at PRE_FLIGHT, before any store or GitHub call', async (_label, url) => {
+      // #given
+      const userId = uniqueUserId()
+      const {interaction, editReply} = makeInteraction({url, userId})
+      const getBindingByRepo = vi.fn().mockResolvedValue(ok(null))
+      const authForRepo = vi.fn()
+      const deps = makeDeps({
+        bindingsStore: makeBindingsStore({getBindingByRepo}),
+        appClient: makeAppClient({authForRepo}),
+      })
+
+      // #when
+      await run(interaction, deps)
+
+      // #then it is turned away at parse time with the same short reply as any other bad URL
+      expect(lastEditReplyContent(editReply)).toContain('Invalid GitHub URL')
+      expect(getBindingByRepo).not.toHaveBeenCalled()
+      expect(authForRepo).not.toHaveBeenCalled()
+    })
+
+    it.each([
+      'https://github.com/owner/repo',
+      'https://github.com/owner/repo.git',
+      'https://github.com/my-org/my.repo_name',
+      'https://github.com/owner/.github',
+      'https://github.com/o/r',
+    ])('still accepts the valid URL %s', async url => {
+      // #given
+      const userId = uniqueUserId()
+      const {interaction, editReply} = makeInteraction({url, userId})
+      const getBindingByRepo = vi.fn().mockResolvedValue(ok(null))
+      const deps = makeDeps({bindingsStore: makeBindingsStore({getBindingByRepo})})
+
+      // #when
+      await run(interaction, deps)
+
+      // #then it got past the parse: the store lookup ran
+      expect(getBindingByRepo).toHaveBeenCalled()
+      expect(lastEditReplyContent(editReply)).not.toContain('Invalid GitHub URL')
+    })
+
+    it('still lowercases the validated slug for storage', async () => {
+      // #given
+      const userId = uniqueUserId()
+      const {interaction} = makeInteraction({url: 'https://github.com/Acme/Widget.git', userId})
+      const getBindingByRepo = vi.fn().mockResolvedValue(ok(null))
+      const deps = makeDeps({bindingsStore: makeBindingsStore({getBindingByRepo})})
+
+      // #when
+      await run(interaction, deps)
+
+      // #then
+      expect(getBindingByRepo).toHaveBeenCalledWith('acme', 'widget')
+    })
+  })
+
   describe('PRE_FLIGHT: hostile channel name', () => {
     it('rejects channel names with zero-width characters', async () => {
       // #given

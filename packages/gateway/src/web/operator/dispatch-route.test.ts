@@ -290,29 +290,108 @@ describe('POST /operator/dispatch — gate ordering and errors', () => {
     ])
   })
 
+  it.each(['acme/..', 'acme/.', `acme/${'r'.repeat(101)}`, `${'o'.repeat(40)}/widget`, '-acme/widget'])(
+    'returns 404 with zero binding reads for the malformed name %j',
+    async repoName => {
+      // #given
+      const bindingsLookup = makeBindingsLookup()
+      const dispatchWorkflow: DispatchWorkflow = vi.fn()
+      const deps = makeDeps({bindingsLookup, dispatchWorkflow})
+      const app = buildApp(deps)
+
+      // #when
+      const response = await postDispatch(app, {repo: repoName, task: 'do work'})
+
+      // #then
+      expect(response.status).toBe(404)
+      expect(await response.json()).toEqual({error: 'not-found'})
+      expect(bindingsLookup.getBindingByRepo).not.toHaveBeenCalled()
+      expect(dispatchWorkflow).not.toHaveBeenCalled()
+    },
+  )
+
   it.each([
-    'acme/..',
-    'acme/.',
+    'acme/a/b',
+    'acme/widget/',
+    'acme/widget#1',
+    'acme/widget?x=1',
+    String.raw`acme\widget`,
+    'acme/a b',
     'acme/a\u0000b',
-    `acme/${'r'.repeat(101)}`,
-    `${'o'.repeat(40)}/widget`,
-    '-acme/widget',
-  ])('returns 404 with zero binding reads for the malformed name %j', async repoName => {
-    // #given
+    'acme/a\u0007b',
+    '/widget',
+    'acme/',
+    'noslash',
+  ])('returns 400 with zero binding reads for the malformed shape %j', async repoField => {
+    // #given (NUL and other control characters used to pass the parse and answer 404)
     const bindingsLookup = makeBindingsLookup()
     const dispatchWorkflow: DispatchWorkflow = vi.fn()
-    const deps = makeDeps({bindingsLookup, dispatchWorkflow})
-    const app = buildApp(deps)
+    const app = buildApp(makeDeps({bindingsLookup, dispatchWorkflow}))
 
     // #when
-    const response = await postDispatch(app, {repo: repoName, task: 'do work'})
+    const response = await postDispatch(app, {repo: repoField, task: 'do work'})
 
     // #then
-    expect(response.status).toBe(404)
-    expect(await response.json()).toEqual({error: 'not-found'})
+    expect(response.status).toBe(400)
     expect(bindingsLookup.getBindingByRepo).not.toHaveBeenCalled()
     expect(dispatchWorkflow).not.toHaveBeenCalled()
   })
+
+  it('dispatches for a mixed-case request, looking up the lowercase key and using the stored case downstream (D1)', async () => {
+    // #given a binding stored as acme/widget and a client that sends Acme/Widget
+    const bindingsLookup = makeBindingsLookup()
+    const dispatchWorkflow: DispatchWorkflow = vi.fn(async () => ({
+      outcome: 'accepted' as const,
+      owner: 'acme',
+      repo: 'widget',
+    }))
+    const auditLogger = makeAuditLogger()
+    const app = buildApp(makeDeps({bindingsLookup, dispatchWorkflow, auditLogger}))
+
+    // #when
+    const response = await postDispatch(app, {repo: 'Acme/Widget', task: 'do work'})
+
+    // #then
+    expect(response.status).toBe(200)
+    expect(bindingsLookup.getBindingByRepo).toHaveBeenCalledExactlyOnceWith('acme', 'widget')
+    expect(dispatchWorkflow).toHaveBeenCalledExactlyOnceWith('acme', 'widget', 'do work')
+    expect(JSON.stringify(vi.mocked(auditLogger.info).mock.calls)).not.toContain('Acme')
+  })
+
+  it('treats the same task for the same repo as one request whatever case the repo was sent in', async () => {
+    // #given two requests with one idempotency key, differing only in the repo's case
+    const dispatchWorkflow: DispatchWorkflow = vi.fn(async () => ({
+      outcome: 'accepted' as const,
+      owner: 'acme',
+      repo: 'widget',
+    }))
+    const app = buildApp(makeDeps({dispatchWorkflow}))
+
+    // #when
+    const first = await postDispatch(app, {repo: 'acme/widget', task: 'do work', idempotencyKey: 'k1'})
+    const second = await postDispatch(app, {repo: 'ACME/Widget', task: 'do work', idempotencyKey: 'k1'})
+
+    // #then the second is the replay of the first, not a conflicting fingerprint
+    expect(first.status).toBe(200)
+    expect(second.status).toBe(200)
+    expect(dispatchWorkflow).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([' acme/widget', 'acme/widget ', '  acme/widget\n'])(
+    'accepts the padded repo field %j, exactly as launch does',
+    async repoField => {
+      // #given
+      const bindingsLookup = makeBindingsLookup()
+      const app = buildApp(makeDeps({bindingsLookup}))
+
+      // #when
+      const response = await postDispatch(app, {repo: repoField, task: 'do work'})
+
+      // #then
+      expect(response.status).toBe(200)
+      expect(bindingsLookup.getBindingByRepo).toHaveBeenCalledExactlyOnceWith('acme', 'widget')
+    },
+  )
 
   it('returns the uniform 404 when the binding lookup throws', async () => {
     // #given
@@ -385,7 +464,15 @@ describe('POST /operator/dispatch — gate ordering and errors', () => {
       repo: 'widget',
     }))
     const auditLogger = makeAuditLogger()
-    const deps = makeDeps({dispatchWorkflow, auditLogger})
+    // A real binding lookup returns the binding of the repo it was asked for; the idempotency fingerprint is
+    // built from that stored binding, so the stub must echo the requested repo.
+    const bindingsLookup: LaunchRouteBindingsLookup = {
+      getBindingByRepo: vi.fn(async (owner: string, repo: string) => ({
+        success: true as const,
+        data: makeBinding({owner, repo}),
+      })),
+    }
+    const deps = makeDeps({bindingsLookup, dispatchWorkflow, auditLogger})
     const app = buildApp(deps)
 
     // #when

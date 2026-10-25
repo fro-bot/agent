@@ -98,6 +98,24 @@ describe('archiveSession', () => {
     })
   })
 
+  it('logs the message of a JSON error envelope, not [object Object]', async () => {
+    // #given the SDK client's error for a JSON HTTP error body is a plain object
+    mockUpdate.mockResolvedValue({
+      data: undefined,
+      error: {name: 'NotFoundError', data: {message: 'Session not found: ses_envelope'}},
+    })
+
+    // #when
+    const archived = await archiveSession(BASE_URL, 'ses_archive', mockLogger)
+
+    // #then
+    expect(archived).toBe(false)
+    expect(mockLogger.warning).toHaveBeenCalledWith('SDK session archive failed', {
+      sessionId: 'ses_archive',
+      error: 'Session not found: ses_envelope',
+    })
+  })
+
   it('logs a warning and returns false when the SDK returns an archive error', async () => {
     // #given
     mockUpdate.mockResolvedValue({data: undefined, error: 'server error'})

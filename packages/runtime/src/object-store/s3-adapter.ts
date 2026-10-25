@@ -12,7 +12,7 @@ import {
   PutObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3'
-
+import {toErrorMessage} from '../shared/errors.js'
 import {err, ok} from '../shared/types.js'
 import {getEffectiveEncryption} from './encryption.js'
 import {createObjectStoreOperationError, type ObjectStoreAdapter, type ObjectStoreConfig} from './types.js'
@@ -36,7 +36,7 @@ function logS3Error(logger: Logger, operation: string, error: unknown): Error {
     'httpStatusCode' in error.$metadata
       ? Number(error.$metadata.httpStatusCode)
       : undefined
-  const message = sanitizeS3ErrorMessage(error instanceof Error ? error.message : String(error))
+  const message = sanitizeS3ErrorMessage(toErrorMessage(error))
 
   logger.warning(`Object store ${operation} failed`, {
     errorCode,

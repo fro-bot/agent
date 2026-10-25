@@ -62,7 +62,7 @@
 import type {OwnershipLedger, SessionClient} from '@fro-bot/runtime'
 import type {GatewayLogger} from '../discord/client.js'
 
-import {createSdkLedgerReconcileAdapter, reconcileLedgerOnce} from '@fro-bot/runtime'
+import {createSdkLedgerReconcileAdapter, formatSdkError, reconcileLedgerOnce, toErrorMessage} from '@fro-bot/runtime'
 import {toRuntimeLogger} from './runtime-logger.js'
 
 /**
@@ -139,15 +139,12 @@ async function abortSession(
     const envelope = response as {readonly error?: unknown} | undefined
     if (envelope?.error != null) {
       logger.warn(
-        {sessionId, role, detail: String(envelope.error)},
+        {sessionId, role, detail: formatSdkError(envelope.error)},
         'settle-owned-sessions: session.abort returned an error envelope',
       )
     }
   } catch (error) {
-    logger.warn(
-      {sessionId, role, detail: error instanceof Error ? error.message : String(error)},
-      'settle-owned-sessions: session.abort threw',
-    )
+    logger.warn({sessionId, role, detail: toErrorMessage(error)}, 'settle-owned-sessions: session.abort threw')
   }
 }
 
@@ -308,7 +305,7 @@ export async function settleOwnedSessions(params: SettleOwnedSessionsParams): Pr
         }
         return {settled: false, reason: `owned sessions not confirmed settled: ${stillUnresolvedIds.join(', ')}`}
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error)
+        const message = toErrorMessage(error)
         logger.error(
           {rootSessionId, detail: message},
           'settle-owned-sessions: unexpected error during settle attempt — quarantining rather than letting it escape',
