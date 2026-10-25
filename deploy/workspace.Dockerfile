@@ -178,7 +178,7 @@ RUN apk add --no-cache \
       libgcc=15.2.0-r5 \
       libstdc++=15.2.0-r5 \
       ripgrep=15.1.0-r0 \
-      curl=8.22.0-r0 \
+      curl=8.23.0-r0 \
       setpriv=2.42.3-r1 \
       tini=0.19.0-r3 \
     && /sbin/tini --version
