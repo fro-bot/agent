@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-10-18"
-updated-by: "1dcd6a296d36057a6680ca347bf01a6987d78ec9"
+last-updated: "2026-10-25"
+updated-by: "fe7f6bda"
 sources:
   - src/harness/config/outputs.ts
   - packages/runtime/src/agent/attachment-dir.ts
@@ -35,6 +35,10 @@ sources:
   - scripts/harness/duplicate-harness-release-tags.ts
   - .github/workflows/harness-release.yaml
   - packages/runtime/src/shared/constants.ts
+  - packages/runtime/src/object-store/settings.ts
+  - packages/runtime/src/object-store/encryption.ts
+  - packages/gateway/src/object-store-config.ts
+  - packages/gateway/src/secrets.ts
   - src/shared/constants.ts
   - src/harness/config/inputs.ts
   - src/features/delegated/brokered-push-validation.ts
@@ -110,6 +114,8 @@ Default versions are defined in `packages/runtime/src/shared/constants.ts` (shar
 | Systematic   | `DEFAULT_SYSTEMATIC_VERSION` | OpenCode plugin for structured workflows         |
 
 These can be overridden per-run via action inputs (`opencode-version`, `omo-version`, `omo-slim-version`, `systematic-version`). Stock tool pins are updated via Renovate-managed PRs; the OpenCode harness default is advanced by the harness release sync PR after a harness build exists.
+
+The bundled Systematic default is currently `3.26.0`. Its pin participates in the tools-cache key, so advancing it triggers a fresh plugin installation even when the OpenCode binary itself is already cached.
 
 The OMO Slim default is currently `2.2.25`, on the stable release line tracked in `packages/runtime/src/shared/constants.ts`. That pin is separate from the compatibility gate in `src/services/setup/ci-config.ts`: its verified-version list currently contains only `1.1.1`. When Slim mode is enabled, `src/services/setup/setup.ts` rejects an unverified version before installing Bun or the plugin, and configuration assembly independently checks the same list before selecting `orchestrator`. Thus enabling Slim with the current default fails setup; the version bump alone does not certify orchestrator registration. The default OpenCode-only mode does not enter this gate. This distinction helps explain setup failures discussed in [[Troubleshooting]].
 
@@ -267,6 +273,14 @@ The action accepts over 20 inputs defined in `action.yaml`, grouped into core, a
 | `invocation-outcome` | The run's final verified outcome (`succeeded`, `incomplete`, `failed`, `skipped`). `incomplete` means a useful result may exist but this invocation could not certify completion, so no dedup marker was written and no success reaction was posted (see [[Execution Lifecycle]]). Main step only |
 
 See the full outputs table in the repository [README](../../README.md#outputs).
+
+## Shared Object-Store Settings
+
+The Action maps its `s3-*` inputs into `parseObjectStoreSettings` (`packages/runtime/src/object-store/settings.ts`), the same pure parser the gateway and binding backfill use. Values are trimmed, blank values count as unset, prefixes are normalized, and validation errors name the setting source rather than echoing its value. Enabled stores require a bucket; the Action leaves region optional for SDK resolution, while gateway configuration requires a region and accepts `AWS_REGION` as a fallback to `S3_REGION`.
+
+Expected bucket owners must contain exactly 12 decimal digits. A KMS key is accepted only when effective encryption is `aws:kms`; AWS endpoints default to that mode, while custom endpoints default to `AES256`. An invalid explicit SSE mode is rejected even when the store is disabled. Endpoint and metadata-address restrictions remain those described under Action Inputs and [[Session Persistence]].
+
+The gateway reads environment and `_FILE` settings before calling the parser (`packages/gateway/src/object-store-config.ts`, `secrets.ts`). A blank S3 setting file falls back to the corresponding environment variable; this is specific to S3 settings, not the general secret convention. Credentials are read separately and never enter the shared settings parser.
 
 ## Implementation Reference
 

@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-10-18"
-updated-by: "1dcd6a296d36057a6680ca347bf01a6987d78ec9"
+last-updated: "2026-10-25"
+updated-by: "fe7f6bda"
 sources:
   - docs/wiki/Architecture Overview.md
   - docs/wiki/Background Subagents and Ownership.md
@@ -53,6 +53,8 @@ An Obsidian-powered project wiki maintained by Fro Bot. This vault provides huma
 | [Troubleshooting](Troubleshooting.md) | convention | Common failure symptoms and their causes across action execution, persistence, setup, and gateway runs |
 
 ## About This Wiki
+
+Current coverage includes lease-scoped session publication, bounded drain and token minting, automatic dirty-checkout recovery, shared settings and repository parsing, and workspace proxy teardown.
 
 - **Audience:** Human developers — contributors, reviewers, and maintainers
 - **Content:** Descriptive documentation (how the system works, why decisions were made)
