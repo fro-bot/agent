@@ -980,6 +980,11 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     // resolution (projection.ts scopeIdFor) and recovery thread-notes (recovery.ts resolveThread).
     // The thread_id was set at createRun time to an empty string (pre-thread); once threadFactory
     // resolves a live thread id above, fold it into this same conditional write.
+    // Owned BEFORE the write is issued: a task queued past the pending threshold carries an old heartbeat, and the
+    // ACK can be visible in the store while its response is still pending. From here to the true end of the run (the
+    // outer finally, which every exit below reaches, or the quarantine hold's deferred stop) the stranded-run sweep
+    // must treat the record as owned.
+    markRunLive(runId)
     const ackResult = await transitionRun(
       coordinationConfig,
       identity,
@@ -1012,9 +1017,6 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
     // ACK succeeded — mark pre-ACK section complete so the dual-finally catch does not run.
     preAckCompleted = true
-    // From here to the true end of the run (the outer finally, or the quarantine hold's deferred stop) the stranded-run
-    // sweep must treat this record as owned, however stale its heartbeat looks.
-    markRunLive(runId)
 
     let runEtag = ackResult.data.etag
 

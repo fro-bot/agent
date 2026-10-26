@@ -733,6 +733,29 @@ describe('recoverStaleRuns — options for the periodic sweep', () => {
     expect(mockTransitionRun.mock.calls[0]?.[3]).toBe('run-stale')
   })
 
+  it('scans the bindings from the start offset and wraps around; without an offset, in listing order', async () => {
+    // #given
+    const bindings = [
+      {owner: OWNER, repo: 'a'},
+      {owner: OWNER, repo: 'b'},
+      {owner: OWNER, repo: 'c'},
+    ]
+    const scanned = (): string[] => mockFindStaleRuns.mock.calls.map(call => String(call[2]))
+    const {deps} = makeDeps({bindingsStore: makeBindingsStore(bindings)})
+
+    // #when / #then
+    await recoverStaleRuns(deps)
+    expect(scanned()).toEqual(['acme/a', 'acme/b', 'acme/c'])
+
+    mockFindStaleRuns.mockClear()
+    await recoverStaleRuns(deps, {startOffset: 1})
+    expect(scanned()).toEqual(['acme/b', 'acme/c', 'acme/a'])
+
+    mockFindStaleRuns.mockClear()
+    await recoverStaleRuns(deps, {startOffset: 5})
+    expect(scanned()).toEqual(['acme/c', 'acme/a', 'acme/b'])
+  })
+
   it('stops between runs once the pass signal aborts', async () => {
     // #given
     mockFindStaleRuns.mockResolvedValue({

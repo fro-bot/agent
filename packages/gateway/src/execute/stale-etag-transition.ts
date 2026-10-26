@@ -1,7 +1,7 @@
 import type {CoordinationConfig, Result, RunState} from '@fro-bot/runtime'
 import type {GatewayLogger} from '../discord/client.js'
 
-import {err, getRunKey, HEARTBEAT_STOP_GRACE_MS, parseRunState, toErrorMessage} from '@fro-bot/runtime'
+import {err, getRunKey, HEARTBEAT_STOP_GRACE_MS, ok, parseRunState, toErrorMessage} from '@fro-bot/runtime'
 
 export interface StaleEtagTransitionOptions<T> {
   readonly config: CoordinationConfig
@@ -26,6 +26,14 @@ export interface StaleEtagTransitionOptions<T> {
    * abandoned (it may still land, which the next re-read then finds as a terminal record). Default: unbounded.
    */
   readonly attemptTimeoutMs?: number
+  /**
+   * What to return when the re-read finds THIS run's record already terminal. A write that was abandoned at its bound
+   * can still commit; the record then holds the outcome the caller wanted (or another terminal one), so the caller
+   * should treat it as written, using the stored state and the phase it actually has. The stored record is never
+   * overwritten. Without this callback the original failure is returned, as before. A record that belongs to another
+   * run is always a failure.
+   */
+  readonly adoptTerminal?: (stored: {readonly state: RunState; readonly etag: string}) => T
 }
 
 /**
@@ -36,6 +44,10 @@ export const TERMINAL_WRITE_RETRY = {
   attempts: 3,
   delaysMs: [500, 1_000],
   attemptTimeoutMs: 5_000,
+  adoptTerminal: (stored: {readonly state: RunState; readonly etag: string}) => ({
+    etag: stored.etag,
+    state: stored.state,
+  }),
 } as const
 
 const TERMINAL_PHASES: ReadonlySet<RunState['phase']> = new Set(['COMPLETED', 'FAILED', 'CANCELLED'])
@@ -124,8 +136,9 @@ async function sleep(ms: number): Promise<void> {
  * transiently. When a write fails:
  *
  *  1. wait the configured delay, then re-read the stored RunState;
- *  2. if the read fails, or the record is for another run, or its phase is already terminal, return the last
- *     failure: there is nothing safe to retry, and a terminal record is never overwritten;
+ *  2. if the read fails, or the record is for another run, return the last failure; if this run's record is already
+ *     terminal, return `adoptTerminal(stored)` when given (the abandoned write evidently committed), else the last
+ *     failure. Nothing is safe to retry, and a terminal record is never overwritten;
  *  3. otherwise (this run, still PENDING / ACKNOWLEDGED / EXECUTING) retry the write with the stored ETag.
  *
  * Bounded: at most `attempts` writes (default 2) and one read before each retry, each write optionally bounded by
@@ -150,6 +163,17 @@ export async function transitionRetryingStaleEtag<T>(
     const stored = await readStoredRun(options)
     if (stored === null) {
       return last
+    }
+    if (
+      stored.state.run_id === runId &&
+      TERMINAL_PHASES.has(stored.state.phase) &&
+      options.adoptTerminal !== undefined
+    ) {
+      logger.info(
+        {repo, runId, phase: stored.state.phase, err: last.error.message},
+        'run: terminal transition failed but the stored run is already terminal — adopting the stored record',
+      )
+      return ok(options.adoptTerminal({state: stored.state, etag: stored.etag}))
     }
     if (stored.state.run_id !== runId || TERMINAL_PHASES.has(stored.state.phase)) {
       logger.warn(

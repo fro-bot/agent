@@ -116,4 +116,70 @@ describe('the stranded-run sweep over a slow store', () => {
     expect(list.mock.calls.length).toBeGreaterThanOrEqual(2)
     sweep.stop()
   })
+
+  it('a repo that always overruns the bound does not starve the repos after it: the next pass starts elsewhere', async () => {
+    // #given repo "slow" never answers its listing (and ignores any signal); repo "fast" holds one stale EXECUTING run
+    const stale = {
+      run_id: 'run-fast',
+      surface: 'discord',
+      thread_id: 'thread-1',
+      entity_ref: 'acme/fast',
+      phase: 'EXECUTING',
+      started_at: '2026-04-24T18:00:00.000Z',
+      last_heartbeat: '2026-04-24T18:00:00.000Z',
+      holder_id: 'gw',
+      details: {},
+    }
+    const written: string[] = []
+    const config = makeConfig({
+      list: vi.fn(async (prefix: string) =>
+        prefix.includes('/slow/') ? new Promise<never>(() => {}) : {success: true, data: [`${prefix}run-fast.json`]},
+      ),
+      getObject: vi.fn(async () => ({success: true, data: {data: JSON.stringify(stale), etag: 'etag-1'}})),
+      conditionalPut: vi.fn(async (key: string) => {
+        written.push(key)
+        return {success: true, data: {etag: 'etag-2'}}
+      }),
+    })
+    const logger = makeLogger()
+    const sweep = createStrandedRunSweep({
+      pass: makePass(config, ['slow', 'fast'], logger),
+      logger,
+      intervalMs: 100_000,
+    })
+    sweep.start()
+
+    // #when the first pass (which starts at "slow") is abandoned at its bound and the following tick starts another
+    await vi.advanceTimersByTimeAsync(100_000 + STRANDED_RUN_SWEEP_PASS_BOUND_MS + 100_000)
+
+    // #then the second pass started at "fast", and repaired its record
+    expect(written).toHaveLength(1)
+    expect(written[0]).toContain('/fast/')
+    sweep.stop()
+  })
+
+  it('rotates the starting repo by one on every pass, so each repo leads in turn', async () => {
+    // #given three repos and a store that answers instantly
+    const listedFirst: string[] = []
+    let firstOfPass = true
+    const config = makeConfig({
+      list: vi.fn(async (prefix: string) => {
+        if (firstOfPass) listedFirst.push(prefix)
+        firstOfPass = false
+        return {success: true, data: []}
+      }),
+      getObject: vi.fn(),
+    })
+    const logger = makeLogger()
+    const pass = makePass(config, ['a', 'b', 'c'], logger)
+
+    // #when four passes run back to back
+    for (let i = 0; i < 4; i += 1) {
+      firstOfPass = true
+      await pass(new AbortController().signal)
+    }
+
+    // #then the lead repo advanced a, b, c, a
+    expect(listedFirst.map(prefix => /\/([abc])\/runs\/$/.exec(prefix)?.[1])).toEqual(['a', 'b', 'c', 'a'])
+  })
 })

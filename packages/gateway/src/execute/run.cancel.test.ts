@@ -530,10 +530,10 @@ describe('operator cancel — abort-registry integration', () => {
       const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
       expect(transitionPhases).not.toContain('FAILED')
 
-      // #and — a log records the concurrent terminalization with the observed phase
+      // #and — the write helper adopted the stored terminal record and logged the observed phase
       expect(logger.info).toHaveBeenCalledWith(
         expect.objectContaining({runId: TERMINAL_RUN_ID, phase: terminalPhase}),
-        expect.stringContaining('already terminalized'),
+        expect.stringContaining('already terminal'),
       )
 
       abortRegistry.delete(TERMINAL_RUN_ID)

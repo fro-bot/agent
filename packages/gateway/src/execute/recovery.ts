@@ -66,6 +66,11 @@ export interface RecoverStaleRunsOptions {
   readonly note?: string
   /** Aborting ends the pass between repos and between runs, and cuts the scan of a repo short between records. */
   readonly signal?: AbortSignal
+  /**
+   * Start the pass at this binding (modulo the number of bindings) and wrap around, so a pass that never gets past a
+   * slow repo does not keep starving the repos after it. Default 0 (bindings in listing order).
+   */
+  readonly startOffset?: number
   /** Read only run records modified at or after this time (see `FindStaleRunsOptions.modifiedSince`). Default: all. */
   readonly modifiedSince?: Date
   /**
@@ -158,7 +163,11 @@ export async function recoverStaleRuns(
     return
   }
 
-  const bindings = bindingsResult.data
+  const listed = bindingsResult.data
+  const bindings =
+    options.startOffset === undefined || listed.length === 0
+      ? listed
+      : [...listed.slice(options.startOffset % listed.length), ...listed.slice(0, options.startOffset % listed.length)]
   if (bindings.length === 0) {
     logger.info({}, 'recovery: no bindings found — stale-run sweep is a no-op')
     return

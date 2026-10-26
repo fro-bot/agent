@@ -563,3 +563,115 @@ describe('transitionRetryingStaleEtag — more attempts, a delay, a per-attempt 
     expect(attempt.mock.calls.map(call => call[0])).toEqual(['etag-stale', 'etag-fresh'])
   })
 })
+
+describe('transitionRetryingStaleEtag — a write that committed after its bound', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  const adoptTerminal = (stored: {readonly state: RunState; readonly etag: string}) => ({
+    etag: stored.etag,
+    state: stored.state,
+  })
+
+  it('adopts the stored terminal record of this run as the outcome, with its own phase, and writes nothing over it', async () => {
+    // #given the first write stalls past its bound and commits meanwhile, as a different terminal phase
+    const stored = runState({phase: 'CANCELLED', details: {marker: 'authoritative'}})
+    const attempt = vi.fn(async (_etag: string) => new Promise<never>(() => {}))
+    const logger = createLogger()
+
+    // #when
+    const pending = transitionRetryingStaleEtag({
+      config: configWith(storedAs(stored, 'etag-committed')),
+      identity: IDENTITY,
+      repo: REPO,
+      runId: RUN_ID,
+      etag: 'etag-stale',
+      logger,
+      attempt,
+      attempts: 3,
+      delaysMs: [500, 1_000],
+      attemptTimeoutMs: 5_000,
+      adoptTerminal,
+    })
+    await vi.advanceTimersByTimeAsync(10_000)
+    const result = await pending
+
+    // #then the stored record is the outcome, and the stalled write was the only one
+    expect(result).toEqual(ok({etag: 'etag-committed', state: stored}))
+    expect(attempt).toHaveBeenCalledTimes(1)
+    expect(logger.warn).not.toHaveBeenCalled()
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.objectContaining({runId: RUN_ID, phase: 'CANCELLED'}),
+      expect.stringContaining('already terminal'),
+    )
+  })
+
+  it('still fails when the terminal record belongs to another run, even with adoption available', async () => {
+    // #given
+    const attempt = vi.fn(async (_etag: string) => PRECONDITION())
+
+    // #when
+    const result = await transitionRetryingStaleEtag({
+      config: configWith(storedAs(runState({run_id: 'someone-else', phase: 'FAILED'}), 'etag-other')),
+      identity: IDENTITY,
+      repo: REPO,
+      runId: RUN_ID,
+      etag: 'etag-stale',
+      logger: createLogger(),
+      attempt,
+      adoptTerminal,
+    })
+
+    // #then
+    expect(result.success).toBe(false)
+    expect(attempt).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps retrying, and does not adopt, while the stored record is this run and still live', async () => {
+    // #given
+    const attempt = vi
+      .fn<(etag: string) => Promise<Result<{etag: string}, Error>>>()
+      .mockResolvedValueOnce(PRECONDITION())
+      .mockResolvedValueOnce(ok({etag: 'etag-done'}))
+
+    // #when
+    const result = await transitionRetryingStaleEtag({
+      config: configWith(storedAs(runState({phase: 'EXECUTING'}), 'etag-fresh')),
+      identity: IDENTITY,
+      repo: REPO,
+      runId: RUN_ID,
+      etag: 'etag-stale',
+      logger: createLogger(),
+      attempt,
+      adoptTerminal: stored => ({etag: stored.etag}),
+    })
+
+    // #then
+    expect(result).toEqual(ok({etag: 'etag-done'}))
+    expect(attempt).toHaveBeenCalledTimes(2)
+  })
+
+  it('without an adoption callback, a terminal record still returns the failure (the default is unchanged)', async () => {
+    // #given
+    const attempt = vi.fn(async (_etag: string) => PRECONDITION())
+
+    // #when
+    const result = await transitionRetryingStaleEtag({
+      config: configWith(storedAs(runState({phase: 'COMPLETED'}), 'etag-done')),
+      identity: IDENTITY,
+      repo: REPO,
+      runId: RUN_ID,
+      etag: 'etag-stale',
+      logger: createLogger(),
+      attempt,
+    })
+
+    // #then
+    expect(result.success).toBe(false)
+  })
+})

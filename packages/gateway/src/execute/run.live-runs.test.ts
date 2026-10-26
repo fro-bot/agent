@@ -101,6 +101,59 @@ describe('the live-run set', () => {
     expect(admission.accepted === true ? isRunLive(admission.runId) : true).toBe(false)
   })
 
+  it('owns a run while its ACK write is still in flight, so a sweep cannot fail it, and the run goes on to execute', async () => {
+    // #given an aged queued task whose ACKNOWLEDGED write has committed server-side but whose response is withheld
+    setupHappyPath()
+    let answerAck: () => void = () => {}
+    let ownedWhileAckPending: boolean | undefined
+    mockRuntime.transitionRun.mockImplementation(async (...args: unknown[]) => {
+      if (args[4] === 'ACKNOWLEDGED') {
+        ownedWhileAckPending = isRunOwnedByThisProcess(String(args[3]))
+        return new Promise<{success: true; data: {etag: string; state: ReturnType<typeof buildMockRunState>}}>(
+          resolve => {
+            answerAck = () => {
+              resolve({success: true, data: {etag: 'etag-ack', state: buildMockRunState({phase: 'ACKNOWLEDGED'})}})
+            }
+          },
+        )
+      }
+      return {
+        success: true as const,
+        data: {etag: 'etag-after', state: buildMockRunState({phase: args[4] as 'FAILED'})},
+      }
+    })
+    const {launchWork} = await import('./run.js')
+
+    // #when the ACK response arrives late
+    const admission = await launchWork(makeInMemoryRequest(), makeDeps())
+    await vi.advanceTimersByTimeAsync(100)
+    answerAck()
+    await vi.advanceTimersByTimeAsync(60_000)
+    if (admission.accepted === true) await admission.runPromise
+
+    // #then the run was already owned while the ACK was pending, and it executed
+    expect(ownedWhileAckPending).toBe(true)
+    expect(mockRunOpenCodeCore).toHaveBeenCalled()
+  })
+
+  it('leaves a run that failed to ACK not live, so the sweep can repair its record', async () => {
+    // #given the ACKNOWLEDGED write fails
+    setupHappyPath()
+    failEveryWriteOf('ACKNOWLEDGED')
+    const {launchWork} = await import('./run.js')
+
+    // #when
+    const done = awaitLaunchWorkRun(launchWork, makeInMemoryRequest(), makeDeps({coordinationConfig: storedRecord()}))
+    await vi.advanceTimersByTimeAsync(60_000)
+    const admission = await done
+
+    // #then
+    const runId = admission.accepted === true ? admission.runId : ''
+    expect(runId).not.toBe('')
+    expect(isRunLive(runId)).toBe(false)
+    expect(isRunOwnedByThisProcess(runId)).toBe(false)
+  })
+
   it('drops a run whose preparation was refused and whose FAILED write failed every attempt, leaving the record ACKNOWLEDGED', async () => {
     // #given
     setupHappyPath()

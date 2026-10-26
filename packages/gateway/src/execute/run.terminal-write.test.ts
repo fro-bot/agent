@@ -291,4 +291,57 @@ describe('terminal RunState writes retry', () => {
       expect.stringContaining('transitionRun FAILED (quarantine) failed'),
     )
   })
+
+  it('a COMPLETED write that stalls past its bound but commits: subscribers get the stored terminal record, with its own phase', async () => {
+    // #given the COMPLETED write hangs, and by the time the retry re-reads, the stored record is terminal (FAILED),
+    // as if the abandoned write, or another writer, had committed it meanwhile
+    setupHappyPath()
+    mockRuntime.transitionRun.mockImplementation(async (...args: unknown[]) => {
+      if (args[4] === 'COMPLETED') return new Promise<never>(() => {})
+      return {
+        success: true as const,
+        data: {etag: 'etag-after', state: buildMockRunState({phase: args[4] as 'FAILED'})},
+      }
+    })
+    const observe = vi.fn(async (_state: unknown) => {})
+    const logger = makeLogger()
+    const base = configStoring('EXECUTING')
+    const coordinationConfig = {
+      ...base,
+      storeAdapter: {
+        ...base.storeAdapter,
+        getObject: vi.fn(async () => ({
+          success: true as const,
+          data: {
+            data: JSON.stringify(
+              buildMockRunState({
+                phase: 'FAILED',
+                run_id: String(mockRuntime.transitionRun.mock.calls.at(-1)?.[3]),
+                details: {marker: 'authoritative'},
+              }),
+            ),
+            etag: 'etag-committed',
+          },
+        })),
+      },
+    } as unknown as CoordinationConfig
+    const deps = makeDeps({coordinationConfig, logger, runObserver: {observe}})
+
+    // #when
+    await runToEnd(makeInMemoryRequest(), deps)
+
+    // #then no second COMPLETED write was made over the stored record
+    expect(writesOf('COMPLETED')).toHaveLength(1)
+
+    // #and the observer got the STORED state and its actual phase, not the phase this run tried to write
+    const terminalFrames = observe.mock.calls
+      .map(call => call[0] as {phase: string; details?: Record<string, unknown>})
+      .filter(state => state.phase === 'FAILED')
+    expect(terminalFrames).toHaveLength(1)
+    expect(terminalFrames[0]?.details).toEqual({marker: 'authoritative'})
+    expect(observe.mock.calls.some(call => (call[0] as {phase: string}).phase === 'COMPLETED')).toBe(false)
+
+    // #and it is not reported as a lost write
+    expect(logger.error).not.toHaveBeenCalledWith(expect.anything(), 'run: transitionRun COMPLETED failed')
+  })
 })

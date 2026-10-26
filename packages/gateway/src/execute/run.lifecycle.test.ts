@@ -1176,7 +1176,7 @@ describe('runMention', () => {
       expect(completedEtags).toEqual(['run-etag-fresh', 'etag-stored'])
     })
 
-    it('after a stop failure, a 412 on COMPLETED does not retry when the stored run is already terminal', async () => {
+    it('after a stop failure, a 412 on COMPLETED does not retry and adopts the stored run when it is already terminal', async () => {
       // #given another writer already terminalized the run
       const {runMention} = await import('./run.js')
       setupHappyPath({stop: failedStop({tickPending: true})})
@@ -1192,13 +1192,15 @@ describe('runMention', () => {
       // #when
       await runMention(makeMessage(), makeBinding(), deps)
 
-      // #then the failure is logged as before and the transition is not retried
+      // #then the transition is not retried over the terminal record, which is adopted rather than reported as a lost
+      // write (so its observers still get the terminal frame)
       const completedCalls = mockRuntime.transitionRun.mock.calls.filter((c: unknown[]) => c[4] === 'COMPLETED')
       expect(completedCalls).toHaveLength(1)
-      expect(logger.error).toHaveBeenCalledWith(
-        expect.objectContaining({err: '412 precondition failed'}),
-        'run: transitionRun COMPLETED failed',
+      expect(logger.info).toHaveBeenCalledWith(
+        expect.objectContaining({phase: 'COMPLETED', err: '412 precondition failed'}),
+        expect.stringContaining('already terminal'),
       )
+      expect(logger.error).not.toHaveBeenCalledWith(expect.anything(), 'run: transitionRun COMPLETED failed')
     })
 
     it('without a stop failure, a failed COMPLETED transition is retried too, and is non-fatal once every attempt fails', async () => {

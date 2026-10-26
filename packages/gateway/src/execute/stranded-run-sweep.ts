@@ -64,8 +64,11 @@ export interface StrandedRunPassDeps {
  * on a fresh read's ETag, so a heartbeat landing after the read makes it lose and the run is skipped.
  */
 export function createStrandedRunPass(deps: StrandedRunPassDeps): (signal: AbortSignal) => Promise<void> {
+  // Each pass starts one binding further on, so a repo that keeps a pass from ever finishing cannot starve the rest.
+  let startOffset = 0
   return async signal =>
     recoverStaleRuns(deps.recoverDeps, {
+      startOffset: startOffset++,
       phases: new Set<RunState['phase']>(['EXECUTING', 'ACKNOWLEDGED']),
       isOwned: deps.isOwned,
       requireQuiescence: false,
