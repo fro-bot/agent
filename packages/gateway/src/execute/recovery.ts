@@ -21,6 +21,11 @@
  * Startup recovery NEVER deletes the coordination lock. A lease left behind lapses by
  * TTL and is replaced by the next acquisition, which re-runs the same workspace check.
  *
+ * The same function backs the periodic stranded-run sweep (`stranded-run-sweep.ts`), through
+ * `RecoverStaleRunsOptions`: only EXECUTING records, skipping runs this process still owns,
+ * skipping the workspace gate (a record write releases nothing, so a busy workspace must not
+ * keep a dead run looking alive), and a neutral note. With no options it is startup recovery.
+ *
  * Any per-run error is logged and the sweep continues — one corrupted record
  * must not block recovery for the rest.
  */
@@ -40,6 +45,28 @@ import {toRuntimeLogger} from './runtime-logger.js'
 
 /** Upper bound for the per-run workspace check; the checker enforces its own, shorter, deadline too. */
 const WORKSPACE_CHECK_DEADLINE_MS = 5_000
+
+/** What a stranded run's thread is told at startup: the previous process is gone. */
+const STARTUP_NOTE = 'The previous task was interrupted when the service restarted. Please re-send your request.'
+
+/**
+ * How one pass differs from startup recovery. Every field defaults to startup recovery's behaviour.
+ */
+export interface RecoverStaleRunsOptions {
+  /** Only runs in these phases are recovered. Default: every phase `isRunStale` covers. */
+  readonly phases?: ReadonlySet<RunState['phase']>
+  /** Runs this process still owns are skipped, checked again immediately before the write. Default: none owned. */
+  readonly isOwned?: (runId: string) => boolean
+  /**
+   * Consult the repo's workspace status before each write. Default `true`. The write only changes a stale record,
+   * so a pass that must not be blocked by a busy workspace passes `false`; no lock is touched either way.
+   */
+  readonly requireQuiescence?: boolean
+  /** The note posted to the run's thread after the record is written. */
+  readonly note?: string
+  /** Aborting ends the pass between repos and between runs. */
+  readonly signal?: AbortSignal
+}
 
 export interface RecoverStaleRunsDeps {
   /** Coordination config (provides store adapter, store config, stale threshold). */
@@ -107,8 +134,14 @@ async function readFreshRun(
  * Should be called once after the Discord client login completes and before
  * the gateway begins handling new mentions.
  */
-export async function recoverStaleRuns(deps: RecoverStaleRunsDeps): Promise<void> {
+export async function recoverStaleRuns(
+  deps: RecoverStaleRunsDeps,
+  options: RecoverStaleRunsOptions = {},
+): Promise<void> {
   const {coordinationConfig, identity, bindingsStore, resolveThread, checkRepoQuiescence, logger} = deps
+  const {signal} = options
+  // A function, not a property read: the signal can abort across any await, which narrowing would hide.
+  const aborted = (): boolean => signal?.aborted === true
   const coordLogger = toRuntimeLogger(logger)
 
   // Enumerate all repos that have bindings
@@ -127,6 +160,10 @@ export async function recoverStaleRuns(deps: RecoverStaleRunsDeps): Promise<void
   logger.info({repoCount: bindings.length}, 'recovery: scanning repos for stale runs')
 
   for (const binding of bindings) {
+    if (aborted()) {
+      logger.warn({}, 'recovery: pass aborted — stopping before the remaining repos')
+      return
+    }
     const repo = `${binding.owner}/${binding.repo}`
 
     try {
@@ -136,11 +173,16 @@ export async function recoverStaleRuns(deps: RecoverStaleRunsDeps): Promise<void
         continue
       }
 
-      const staleRuns = staleResult.data
+      const staleRuns =
+        options.phases === undefined ? staleResult.data : staleResult.data.filter(run => options.phases?.has(run.phase))
       if (staleRuns.length > 0) {
         logger.info({repo, count: staleRuns.length}, 'recovery: found stale runs')
 
         for (const run of staleRuns) {
+          if (aborted()) {
+            logger.warn({repo}, 'recovery: pass aborted — stopping before the remaining runs')
+            return
+          }
           await recoverOneRun({
             run,
             repo,
@@ -150,6 +192,7 @@ export async function recoverStaleRuns(deps: RecoverStaleRunsDeps): Promise<void
             checkRepoQuiescence,
             coordLogger,
             logger,
+            options,
           })
         }
       }
@@ -179,38 +222,51 @@ interface RecoverOneRunOpts {
   readonly checkRepoQuiescence: RepoQuiescenceChecker
   readonly coordLogger: {debug: (message: string, context?: Record<string, unknown>) => void}
   readonly logger: GatewayLogger
+  readonly options: RecoverStaleRunsOptions
 }
 
 async function recoverOneRun(opts: RecoverOneRunOpts): Promise<void> {
-  const {run, repo, coordinationConfig, identity, resolveThread, checkRepoQuiescence, coordLogger, logger} = opts
+  const {run, repo, coordinationConfig, identity, resolveThread, checkRepoQuiescence, coordLogger, logger, options} =
+    opts
+  const {phases, isOwned, requireQuiescence = true, note = STARTUP_NOTE} = options
+  // A function, not a value: ownership can change across the awaits below, which narrowing on a result would hide.
+  const owned = (): boolean => isOwned?.(run.run_id) === true
+
+  // A run this process is still executing can look stale (a stalled heartbeat tick) without being stranded.
+  if (owned()) {
+    logger.info({runId: run.run_id, repo, phase: run.phase}, 'recovery: run is owned by this process — skipping')
+    return
+  }
 
   logger.info({runId: run.run_id, repo, threadId: run.thread_id}, 'recovery: recovering stale run')
 
   // ── 1. Workspace check — gates every terminalization ────────────────────
-  let quiescence: Awaited<ReturnType<RepoQuiescenceChecker>>
-  try {
-    quiescence = await checkRepoQuiescence({repo, signal: AbortSignal.timeout(WORKSPACE_CHECK_DEADLINE_MS)})
-  } catch (error: unknown) {
-    logger.warn(
-      {runId: run.run_id, repo, phase: run.phase, err: error instanceof Error ? error.name : typeof error},
-      'recovery: blocked — workspace check threw; run and lock left unchanged',
-    )
-    return
-  }
+  if (requireQuiescence) {
+    let quiescence: Awaited<ReturnType<RepoQuiescenceChecker>>
+    try {
+      quiescence = await checkRepoQuiescence({repo, signal: AbortSignal.timeout(WORKSPACE_CHECK_DEADLINE_MS)})
+    } catch (error: unknown) {
+      logger.warn(
+        {runId: run.run_id, repo, phase: run.phase, err: error instanceof Error ? error.name : typeof error},
+        'recovery: blocked — workspace check threw; run and lock left unchanged',
+      )
+      return
+    }
 
-  if (quiescence.kind !== 'clear') {
-    logger.warn(
-      {
-        runId: run.run_id,
-        repo,
-        phase: run.phase,
-        workspace: quiescence.kind,
-        reason: quiescence.kind === 'unknown' ? quiescence.reason : undefined,
-        busyCount: quiescence.kind === 'busy' ? quiescence.sessionIds.length : undefined,
-      },
-      'recovery: blocked — workspace not confirmed clear; run and lock left unchanged',
-    )
-    return
+    if (quiescence.kind !== 'clear') {
+      logger.warn(
+        {
+          runId: run.run_id,
+          repo,
+          phase: run.phase,
+          workspace: quiescence.kind,
+          reason: quiescence.kind === 'unknown' ? quiescence.reason : undefined,
+          busyCount: quiescence.kind === 'busy' ? quiescence.sessionIds.length : undefined,
+        },
+        'recovery: blocked — workspace not confirmed clear; run and lock left unchanged',
+      )
+      return
+    }
   }
 
   // ── 2. Transition run state to FAILED (ETag-conditional; never overwrites newer state) ──
@@ -227,6 +283,13 @@ async function recoverOneRun(opts: RecoverOneRunOpts): Promise<void> {
   // predicate on a fresh record and condition the write on that read's etag — never one fetched without looking.
   const fresh = await readFreshRun(coordinationConfig, runKeyResult.data, logger)
   if (fresh === null) return
+  if (phases !== undefined && phases.has(fresh.state.phase) === false) {
+    logger.info(
+      {runId: run.run_id, repo, phase: fresh.state.phase},
+      'recovery: run left the phases this pass recovers — leaving it untouched',
+    )
+    return
+  }
   if (isRunStale(coordinationConfig, fresh.state) === false) {
     logger.info(
       {runId: run.run_id, repo, phase: fresh.state.phase, lastHeartbeat: fresh.state.last_heartbeat},
@@ -235,6 +298,12 @@ async function recoverOneRun(opts: RecoverOneRunOpts): Promise<void> {
     return
   }
   const runEtag = fresh.etag
+
+  // Re-checked right before the write: the owner check at the top ran before a workspace check and a store read.
+  if (owned()) {
+    logger.info({runId: run.run_id, repo}, 'recovery: run became owned by this process — skipping')
+    return
+  }
 
   const transitionResult = await transitionRun(
     coordinationConfig,
@@ -261,7 +330,7 @@ async function recoverOneRun(opts: RecoverOneRunOpts): Promise<void> {
       logger.info({runId: run.run_id, threadId: run.thread_id}, 'recovery: thread not resolved — skipping note')
     } else {
       await thread.send({
-        content: 'The previous task was interrupted when the service restarted. Please re-send your request.',
+        content: note,
         allowedMentions: {parse: []},
       })
       logger.info({runId: run.run_id, threadId: run.thread_id}, 'recovery: interruption note posted')

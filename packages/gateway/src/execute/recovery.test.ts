@@ -430,3 +430,244 @@ describe('recoverStaleRuns', () => {
     })
   })
 })
+
+describe('recoverStaleRuns — options for the periodic sweep', () => {
+  const SWEEP_NOTE = "This run's status was reconciled: it is no longer running."
+
+  it('with no options, behaves as startup recovery: every stale phase, the owner check absent, the quiescence gate on', async () => {
+    // #given
+    mockFindStaleRuns.mockResolvedValue({success: true, data: [makeStaleRun()]})
+    const thread = makeThread()
+    const {deps, checker} = makeDeps({resolveThread: vi.fn().mockResolvedValue(thread)})
+
+    // #when
+    await recoverStaleRuns(deps)
+
+    // #then
+    expect(checker).toHaveBeenCalledOnce()
+    expect(mockTransitionRun).toHaveBeenCalledOnce()
+    expect(thread.send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        content: 'The previous task was interrupted when the service restarted. Please re-send your request.',
+      }),
+    )
+  })
+
+  it('terminalizes a stale unowned EXECUTING run and posts the given note', async () => {
+    // #given
+    mockFindStaleRuns.mockResolvedValue({success: true, data: [makeStaleRun()]})
+    const thread = makeThread()
+    const {deps, conditionalDelete} = makeDeps({resolveThread: vi.fn().mockResolvedValue(thread)})
+
+    // #when
+    await recoverStaleRuns(deps, {
+      phases: new Set<RunPhase>(['EXECUTING']),
+      isOwned: () => false,
+      requireQuiescence: false,
+      note: SWEEP_NOTE,
+    })
+
+    // #then
+    expect(mockTransitionRun).toHaveBeenCalledWith(
+      expect.anything(),
+      'discord-gateway',
+      REPO_SLUG,
+      RUN_ID,
+      'FAILED',
+      RUN_ETAG,
+      expect.anything(),
+    )
+    expect(thread.send).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({content: SWEEP_NOTE}))
+    expectNoLockDeletion(conditionalDelete)
+  })
+
+  it('leaves a stale PENDING or ACKNOWLEDGED run untouched when only EXECUTING is asked for', async () => {
+    // #given
+    mockFindStaleRuns.mockResolvedValue({
+      success: true,
+      data: [makeStaleRun({phase: 'PENDING'}), makeStaleRun({phase: 'ACKNOWLEDGED', run_id: 'run-ack'})],
+    })
+    const {deps} = makeDeps()
+
+    // #when
+    await recoverStaleRuns(deps, {phases: new Set<RunPhase>(['EXECUTING']), requireQuiescence: false})
+
+    // #then
+    expect(mockTransitionRun).not.toHaveBeenCalled()
+  })
+
+  it('skips a run this process owns, and still recovers the others', async () => {
+    // #given two stale runs, one of which the gateway is still executing
+    mockFindStaleRuns.mockResolvedValue({
+      success: true,
+      data: [makeStaleRun({run_id: 'run-owned'}), makeStaleRun()],
+    })
+    const isOwned = vi.fn((runId: string) => runId === 'run-owned')
+    const {deps} = makeDeps()
+
+    // #when
+    await recoverStaleRuns(deps, {isOwned, requireQuiescence: false})
+
+    // #then
+    expect(isOwned).toHaveBeenCalledWith('run-owned')
+    expect(mockTransitionRun).toHaveBeenCalledOnce()
+    expect(mockTransitionRun.mock.calls[0]?.[3]).toBe(RUN_ID)
+  })
+
+  it('does not write when ownership appears between the read and the write', async () => {
+    // #given the run becomes owned only after the first check
+    mockFindStaleRuns.mockResolvedValue({success: true, data: [makeStaleRun()]})
+    let calls = 0
+    const isOwned = vi.fn(() => {
+      calls += 1
+      return calls > 1
+    })
+    const {deps} = makeDeps()
+
+    // #when
+    await recoverStaleRuns(deps, {isOwned, requireQuiescence: false})
+
+    // #then
+    expect(mockTransitionRun).not.toHaveBeenCalled()
+  })
+
+  it('does not let a busy or unknown workspace block the record write, and releases no lock', async () => {
+    // #given a workspace that is busy (the run is dead, but OpenCode is working for someone)
+    mockFindStaleRuns.mockResolvedValue({success: true, data: [makeStaleRun()]})
+    const checker: Checker = vi.fn().mockResolvedValue(BUSY)
+    const {deps, conditionalDelete} = makeDeps({}, checker)
+
+    // #when
+    await recoverStaleRuns(deps, {requireQuiescence: false})
+
+    // #then the gate was never consulted and the record was written, and no lock was touched
+    expect(checker).not.toHaveBeenCalled()
+    expect(mockTransitionRun).toHaveBeenCalledOnce()
+    expectNoLockDeletion(conditionalDelete)
+  })
+
+  it('still honours the quiescence gate by default: a busy workspace blocks the write', async () => {
+    // #given
+    mockFindStaleRuns.mockResolvedValue({success: true, data: [makeStaleRun()]})
+    const {deps} = makeDeps({}, vi.fn().mockResolvedValue(BUSY))
+
+    // #when
+    await recoverStaleRuns(deps, {isOwned: () => false})
+
+    // #then
+    expect(mockTransitionRun).not.toHaveBeenCalled()
+  })
+
+  it('does not write when a heartbeat landed between the read and the write: the fresh record is no longer stale', async () => {
+    // #given the fresh read shows a heartbeat from a moment ago
+    mockFindStaleRuns.mockResolvedValue({success: true, data: [makeStaleRun()]})
+    const {config} = makeCoordinationConfig()
+    vi.mocked(config.storeAdapter.getObject as NonNullable<typeof config.storeAdapter.getObject>).mockResolvedValue({
+      success: true,
+      data: {
+        data: JSON.stringify({...makeStaleRun(), last_heartbeat: new Date().toISOString()}),
+        etag: 'etag-after-heartbeat',
+      },
+    })
+    const thread = makeThread()
+    const {deps} = makeDeps({coordinationConfig: config, resolveThread: vi.fn().mockResolvedValue(thread)})
+
+    // #when
+    await recoverStaleRuns(deps, {requireQuiescence: false, note: SWEEP_NOTE})
+
+    // #then
+    expect(mockTransitionRun).not.toHaveBeenCalled()
+    expect(thread.send).not.toHaveBeenCalled()
+  })
+
+  it('skips the run and posts nothing when a heartbeat wins the compare-and-swap after the fresh read', async () => {
+    // #given the conditional write loses its ETag
+    mockFindStaleRuns.mockResolvedValue({success: true, data: [makeStaleRun()]})
+    mockTransitionRun.mockResolvedValue({success: false, error: new Error('412 precondition failed')})
+    const thread = makeThread()
+    const {deps} = makeDeps({resolveThread: vi.fn().mockResolvedValue(thread)})
+
+    // #when
+    await recoverStaleRuns(deps, {requireQuiescence: false, note: SWEEP_NOTE})
+
+    // #then
+    expect(mockTransitionRun).toHaveBeenCalledOnce()
+    expect(thread.send).not.toHaveBeenCalled()
+  })
+
+  it('does not start the next repo once the pass signal aborts', async () => {
+    // #given two bound repos, the first of which has a stale run whose thread lookup aborts the pass
+    mockFindStaleRuns.mockResolvedValue({success: true, data: [makeStaleRun()]})
+    const controller = new AbortController()
+    const {deps} = makeDeps({
+      bindingsStore: makeBindingsStore([
+        {owner: OWNER, repo: REPO},
+        {owner: OWNER, repo: 'second'},
+      ]),
+      resolveThread: vi.fn(async () => {
+        controller.abort()
+        return null
+      }),
+    })
+
+    // #when
+    await recoverStaleRuns(deps, {requireQuiescence: false, signal: controller.signal})
+
+    // #then only the first repo was scanned
+    expect(mockFindStaleRuns).toHaveBeenCalledTimes(1)
+  })
+
+  it('leaves a run alone when its fresh record has left the phases the pass recovers', async () => {
+    // #given the list said EXECUTING, but by the fresh read the run is a long-stale PENDING one
+    mockFindStaleRuns.mockResolvedValue({success: true, data: [makeStaleRun()]})
+    const {config} = makeCoordinationConfig()
+    vi.mocked(config.storeAdapter.getObject as NonNullable<typeof config.storeAdapter.getObject>).mockResolvedValue({
+      success: true,
+      data: {
+        data: JSON.stringify({
+          ...makeStaleRun({phase: 'PENDING'}),
+          last_heartbeat: new Date(Date.now() - 40 * 60_000).toISOString(),
+        }),
+        etag: RUN_ETAG,
+      },
+    })
+    const {deps} = makeDeps({coordinationConfig: config})
+
+    // #when
+    await recoverStaleRuns(deps, {phases: new Set<RunPhase>(['EXECUTING']), requireQuiescence: false})
+
+    // #then
+    expect(mockTransitionRun).not.toHaveBeenCalled()
+  })
+
+  it('stops between runs once the pass signal aborts', async () => {
+    // #given
+    mockFindStaleRuns.mockResolvedValue({
+      success: true,
+      data: [makeStaleRun(), makeStaleRun({run_id: 'run-second'})],
+    })
+    mockGetRunKey.mockImplementation((_config, _identity, _repo, runId) => ({
+      success: true,
+      data: `state/identity/acme/widget/runs/${runId}.json`,
+    }))
+    const {config} = makeCoordinationConfig()
+    vi.mocked(config.storeAdapter.getObject as NonNullable<typeof config.storeAdapter.getObject>).mockResolvedValue({
+      success: true,
+      data: {data: JSON.stringify(makeStaleRun()), etag: RUN_ETAG},
+    })
+    const controller = new AbortController()
+    const {deps} = makeDeps({
+      coordinationConfig: config,
+      resolveThread: vi.fn(async () => {
+        controller.abort()
+        return null
+      }),
+    })
+
+    // #when
+    await recoverStaleRuns(deps, {requireQuiescence: false, signal: controller.signal})
+
+    // #then the first run finished, the second was not started
+    expect(mockTransitionRun).toHaveBeenCalledOnce()
+  })
+})

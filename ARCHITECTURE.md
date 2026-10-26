@@ -79,7 +79,7 @@ Symbols verified against the live source tree. Where a symbol has moved to `pack
 | `createQuestionCoordinator` | Function | `packages/gateway/src/approvals/question-coordinator.ts` | Per-run `question.*` event seam |
 | `createDiscordQuestionOnRegistered` | Function | `packages/gateway/src/approvals/discord-question-transport.ts` | Discord question transport |
 | `buildPendingQuestionsRoute` / `buildQuestionDecisionRoute` | Function | `packages/gateway/src/web/operator/{pending-questions-route,question-decision-route}.ts` | Question list and answer/skip routes |
-| `recoverStaleRuns` | Function | `packages/gateway/src/execute/recovery.ts` | Startup stale-run sweep |
+| `recoverStaleRuns` | Function | `packages/gateway/src/execute/recovery.ts` | Stale-run sweeps |
 | `classifyInspectResult` | Function | `packages/gateway/src/execute/provenance.ts` | `inspect()` → failure or `CheckoutProvenance` |
 | `parseOperatorCheckoutProvenance` | Function | `packages/gateway/src/operator-contract/provenance.ts` | Persisted provenance → operator DTO |
 | `inspectCheckout` | Function | `apps/workspace-agent/src/inspect.ts` | `POST /inspect` read-only checkout report |

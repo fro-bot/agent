@@ -57,6 +57,19 @@ export type AcquireMaintenanceRunResult =
  * Acquire the repo lock and create a heartbeating maintenance run record. Never waits for a held
  * lock \u2014 `lock-held` is returned immediately so the caller can refuse with a named reason.
  */
+/**
+ * Run ids of maintenance runs whose heartbeat is live in this process. A maintenance run heartbeats its record like any
+ * run but is not in the abort registry, so the stranded-run sweep asks this set before it treats a stale-looking
+ * EXECUTING record as orphaned. An id is added once the record exists and removed when the release finishes, whatever
+ * its writes returned.
+ */
+const inFlightMaintenanceRunIds = new Set<string>()
+
+/** Whether a maintenance run with this id is heartbeating in this process. */
+export function isMaintenanceRunInFlight(runId: string): boolean {
+  return inFlightMaintenanceRunIds.has(runId)
+}
+
 export function acquireMaintenanceRun(opts: {
   readonly coordinationConfig: CoordinationConfig
   readonly identity: string
@@ -121,6 +134,7 @@ export function acquireMaintenanceRun(opts: {
       acquisitionToken,
     )
     heartbeat.start()
+    inFlightMaintenanceRunIds.add(runId)
     let stopped = false
 
     const release = (finalPhase: 'COMPLETED' | 'FAILED', detailsPatch?: Record<string, unknown>): Effect.Effect<void> =>
@@ -201,7 +215,14 @@ export function acquireMaintenanceRun(opts: {
         if (released.success === false) {
           logger.warn({repo, runId, err: released.error.message}, 'maintenance-run: releaseLock failed')
         }
-      })
+      }).pipe(
+        // Forgotten whatever the writes returned, and even if the release itself is interrupted.
+        Effect.ensuring(
+          Effect.sync(() => {
+            inFlightMaintenanceRunIds.delete(runId)
+          }),
+        ),
+      )
 
     return {outcome: 'acquired' as const, handle: {runId, release}}
   })

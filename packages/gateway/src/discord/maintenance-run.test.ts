@@ -19,7 +19,7 @@ vi.mock('../runtime-effect.js', () => ({
   releaseLockIfHolderEffect: (...args: unknown[]): unknown => mockReleaseLockIfHolderEffect(...args) as unknown,
 }))
 
-const {acquireMaintenanceRun} = await import('./maintenance-run.js')
+const {acquireMaintenanceRun, isMaintenanceRunInFlight} = await import('./maintenance-run.js')
 
 const CONFIG = {} as CoordinationConfig
 const LOGGER = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
@@ -382,6 +382,70 @@ describe('acquireMaintenanceRun', () => {
       // #then
       expect(mockTransitionRunEffect).toHaveBeenCalledTimes(1)
       expect(mockReleaseLockEffect).toHaveBeenCalledOnce()
+    })
+  })
+
+  describe('in-flight registry (the stranded-run sweep skips these)', () => {
+    it('lists the run from acquisition until its release finishes, then forgets it', async () => {
+      // #given
+      const handle = await acquire(CONFIG)
+
+      // #then it heartbeats, so the sweep must see it as owned
+      expect(isMaintenanceRunInFlight(handle.runId)).toBe(true)
+      expect(isMaintenanceRunInFlight('some-other-run')).toBe(false)
+
+      // #when it is released
+      await Effect.runPromise(handle.release('COMPLETED'))
+
+      // #then
+      expect(isMaintenanceRunInFlight(handle.runId)).toBe(false)
+    })
+
+    it('forgets the run even when its terminal write and lock release fail', async () => {
+      // #given
+      mockTransitionRunEffect.mockReturnValue(Effect.fail(new Error('412 precondition failed')))
+      mockReleaseLockEffect.mockReturnValue(Effect.fail(new Error('503')))
+      const handle = await acquire(CONFIG)
+
+      // #when
+      await Effect.runPromise(handle.release('FAILED'))
+
+      // #then
+      expect(isMaintenanceRunInFlight(handle.runId)).toBe(false)
+    })
+
+    it('never lists a run that did not acquire the lock or whose record could not be created', async () => {
+      // #given a held lock, then a failed createRun
+      mockAcquireLockEffect.mockReturnValueOnce(
+        Effect.succeed({acquired: false as const, outcome: 'held' as const, etag: null, holder: {holder_id: 'other'}}),
+      )
+      const held = await Effect.runPromise(
+        acquireMaintenanceRun({
+          coordinationConfig: CONFIG,
+          identity: 'gw',
+          repo: 'acme/widget',
+          kind: 'recover-checkout',
+          logger: LOGGER,
+          checkRepoQuiescence: CHECK,
+        }),
+      )
+      mockCreateRunEffect.mockReturnValueOnce(Effect.fail(new Error('store down')))
+      const failed = await Effect.runPromise(
+        acquireMaintenanceRun({
+          coordinationConfig: CONFIG,
+          identity: 'gw',
+          repo: 'acme/widget',
+          kind: 'recover-checkout',
+          logger: LOGGER,
+          checkRepoQuiescence: CHECK,
+        }),
+      )
+
+      // #then
+      expect(held.outcome).toBe('lock-held')
+      expect(failed.outcome).toBe('error')
+      const runIds = mockAcquireLockEffect.mock.calls.map((call: unknown[]) => String(call[4]))
+      expect(runIds.some(runId => isMaintenanceRunInFlight(runId))).toBe(false)
     })
   })
 
