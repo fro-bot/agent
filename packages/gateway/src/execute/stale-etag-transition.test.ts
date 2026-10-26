@@ -675,3 +675,187 @@ describe('transitionRetryingStaleEtag — a write that committed after its bound
     expect(result.success).toBe(false)
   })
 })
+
+const adoptFinalTerminal = (stored: {readonly state: RunState; readonly etag: string}) => ({
+  etag: stored.etag,
+  state: stored.state,
+})
+const FINAL_LIVE = runState({phase: 'EXECUTING'})
+
+/** A store that answers each read in turn, then repeats the last answer. */
+function finalReads(...answers: readonly (Result<{data: string; etag: string}, Error> | 'stall')[]) {
+  let index = 0
+  return vi.fn(async (_key: string) => {
+    const answer = answers[Math.min(index, answers.length - 1)]
+    index += 1
+    return answer === 'stall' || answer === undefined ? new Promise<never>(() => {}) : answer
+  })
+}
+const finalStored = (state: RunState, etag: string) => ok({data: JSON.stringify(state), etag})
+
+describe('transitionRetryingStaleEtag — the final attempt commits after its bound', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('re-reads once after the last attempt stalls, and adopts the terminal record it committed', async () => {
+    // #given the retry's write stalls past its bound and commits meanwhile; the earlier read still showed a live run
+    const terminal = runState({phase: 'COMPLETED', details: {marker: 'committed'}})
+    const getObject = finalReads(finalStored(FINAL_LIVE, 'etag-live'), finalStored(terminal, 'etag-committed'))
+    const attempt = vi.fn(async (etag: string) =>
+      etag === 'etag-stale' ? PRECONDITION() : new Promise<never>(() => {}),
+    )
+    const logger = createLogger()
+
+    // #when
+    const pending = transitionRetryingStaleEtag({
+      config: configWith(getObject),
+      identity: IDENTITY,
+      repo: REPO,
+      runId: RUN_ID,
+      etag: 'etag-stale',
+      logger,
+      attempt,
+      attemptTimeoutMs: 5_000,
+      adoptTerminal: adoptFinalTerminal,
+    })
+    await vi.advanceTimersByTimeAsync(20_000)
+    const result = await pending
+
+    // #then the stored record is the outcome, and the stalled write was not repeated
+    expect(result).toEqual(ok({etag: 'etag-committed', state: terminal}))
+    expect(attempt).toHaveBeenCalledTimes(2)
+    expect(getObject).toHaveBeenCalledTimes(2)
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.objectContaining({phase: 'COMPLETED'}),
+      expect.stringContaining('already terminal'),
+    )
+  })
+
+  it('returns the original failure when the final re-read finds the run still live', async () => {
+    // #given
+    const getObject = finalReads(finalStored(FINAL_LIVE, 'etag-live'))
+    const attempt = vi.fn(async (_etag: string) => PRECONDITION())
+
+    // #when
+    const result = await transitionRetryingStaleEtag({
+      config: configWith(getObject),
+      identity: IDENTITY,
+      repo: REPO,
+      runId: RUN_ID,
+      etag: 'etag-stale',
+      logger: createLogger(),
+      attempt,
+      adoptTerminal: adoptFinalTerminal,
+    })
+
+    // #then both attempts failed, a final read happened, and nothing was adopted
+    expect(result.success).toBe(false)
+    expect(attempt).toHaveBeenCalledTimes(2)
+    expect(getObject).toHaveBeenCalledTimes(2)
+  })
+
+  it("returns the original failure when the final re-read finds another run's record", async () => {
+    // #given
+    const getObject = finalReads(
+      finalStored(FINAL_LIVE, 'etag-live'),
+      finalStored(runState({run_id: 'someone-else', phase: 'FAILED'}), 'etag-x'),
+    )
+    const attempt = vi.fn(async (_etag: string) => PRECONDITION())
+
+    // #when
+    const result = await transitionRetryingStaleEtag({
+      config: configWith(getObject),
+      identity: IDENTITY,
+      repo: REPO,
+      runId: RUN_ID,
+      etag: 'etag-stale',
+      logger: createLogger(),
+      attempt,
+      adoptTerminal: adoptFinalTerminal,
+    })
+
+    // #then
+    expect(result.success).toBe(false)
+  })
+
+  it('bounds a final re-read that stalls: the failure comes back within the extra read budget', async () => {
+    // #given the mid-loop read answers, and the final read never does
+    const getObject = finalReads(finalStored(FINAL_LIVE, 'etag-live'), 'stall')
+    const attempt = vi.fn(async (_etag: string) => PRECONDITION())
+    let settled = false
+
+    // #when
+    const pending = transitionRetryingStaleEtag({
+      config: configWith(getObject),
+      identity: IDENTITY,
+      repo: REPO,
+      runId: RUN_ID,
+      etag: 'etag-stale',
+      logger: createLogger(),
+      attempt,
+      adoptTerminal: adoptFinalTerminal,
+    }).then(result => {
+      settled = true
+      return result
+    })
+    await vi.advanceTimersByTimeAsync(HEARTBEAT_STOP_GRACE_MS - 1)
+    expect(settled).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    const result = await pending
+
+    // #then
+    expect(result.success).toBe(false)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('makes no final re-read without an adoption callback: the default is unchanged', async () => {
+    // #given
+    const getObject = finalReads(finalStored(FINAL_LIVE, 'etag-live'))
+    const attempt = vi.fn(async (_etag: string) => PRECONDITION())
+
+    // #when
+    const result = await transitionRetryingStaleEtag({
+      config: configWith(getObject),
+      identity: IDENTITY,
+      repo: REPO,
+      runId: RUN_ID,
+      etag: 'etag-stale',
+      logger: createLogger(),
+      attempt,
+    })
+
+    // #then only the read before the retry happened
+    expect(result.success).toBe(false)
+    expect(getObject).toHaveBeenCalledTimes(1)
+  })
+
+  it('makes no final re-read when the last attempt succeeds', async () => {
+    // #given
+    const getObject = finalReads(finalStored(FINAL_LIVE, 'etag-live'))
+    const attempt = vi
+      .fn<(etag: string) => Promise<Result<{etag: string}, Error>>>()
+      .mockResolvedValueOnce(PRECONDITION())
+      .mockResolvedValueOnce(ok({etag: 'etag-done'}))
+
+    // #when
+    const result = await transitionRetryingStaleEtag({
+      config: configWith(getObject),
+      identity: IDENTITY,
+      repo: REPO,
+      runId: RUN_ID,
+      etag: 'etag-stale',
+      logger: createLogger(),
+      attempt,
+      adoptTerminal: stored => ({etag: stored.etag}),
+    })
+
+    // #then
+    expect(result).toEqual(ok({etag: 'etag-done'}))
+    expect(getObject).toHaveBeenCalledTimes(1)
+  })
+})

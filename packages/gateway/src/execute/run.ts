@@ -2086,7 +2086,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         if (failedStateForNotify !== undefined) {
           notifyObserverBestEffort(deps, failedStateForNotify)
         }
-        // The write can take up to ~27 s with its retries; an operator cancel that landed meanwhile owns the user's
+        // The write can take up to ~32 s with its retries; an operator cancel that landed meanwhile owns the user's
         // message, so the failure reply and push are skipped (the cancel notice is the user's message).
         const cancelledDuringFailedWrite = abortRegistry.isAborted(runId)
         if (cancelledDuringFailedWrite) {

@@ -38,7 +38,8 @@ export interface StaleEtagTransitionOptions<T> {
 
 /**
  * The arguments every terminal RunState write passes: three bounded writes, 500 ms then 1 s apart. The worst case is
- * about 27 s (three 5 s writes, two 5 s re-reads, 1.5 s of waits), and only when the store stalls.
+ * about 32 s (three 5 s writes, two 5 s re-reads, one final 5 s re-read, 1.5 s of waits), and only when the store
+ * stalls.
  */
 export const TERMINAL_WRITE_RETRY = {
   attempts: 3,
@@ -130,6 +131,26 @@ async function sleep(ms: number): Promise<void> {
   })
 }
 
+/** The adopted outcome when `stored` is this run's own terminal record and the caller can adopt one, else `null`. */
+function adoptIfTerminal<T>(
+  options: StaleEtagTransitionOptions<T>,
+  stored: {readonly state: RunState; readonly etag: string},
+  failure: Error,
+): Result<T, Error> | null {
+  if (
+    options.adoptTerminal === undefined ||
+    stored.state.run_id !== options.runId ||
+    TERMINAL_PHASES.has(stored.state.phase) === false
+  ) {
+    return null
+  }
+  options.logger.info(
+    {repo: options.repo, runId: options.runId, phase: stored.state.phase, err: failure.message},
+    'run: terminal transition failed but the stored run is already terminal — adopting the stored record',
+  )
+  return ok(options.adoptTerminal({state: stored.state, etag: stored.etag}))
+}
+
 /**
  * A terminal `transitionRun` that survives a stale ETag. Every heartbeat tick rewrites the RunState, so the ETag the
  * caller holds may be stale (and after a `tickPending` stop one late write may still land), and a write can also fail
@@ -142,7 +163,7 @@ async function sleep(ms: number): Promise<void> {
  *  3. otherwise (this run, still PENDING / ACKNOWLEDGED / EXECUTING) retry the write with the stored ETag.
  *
  * Bounded: at most `attempts` writes (default 2) and one read before each retry, each write optionally bounded by
- * `attemptTimeoutMs`. The default is one re-read and one retry, with no wait and no bound.
+ * `attemptTimeoutMs`; with `adoptTerminal`, one more read after the last failed write. The default is one re-read and one retry, with no wait and no bound.
  */
 export async function transitionRetryingStaleEtag<T>(
   options: StaleEtagTransitionOptions<T>,
@@ -164,17 +185,8 @@ export async function transitionRetryingStaleEtag<T>(
     if (stored === null) {
       return last
     }
-    if (
-      stored.state.run_id === runId &&
-      TERMINAL_PHASES.has(stored.state.phase) &&
-      options.adoptTerminal !== undefined
-    ) {
-      logger.info(
-        {repo, runId, phase: stored.state.phase, err: last.error.message},
-        'run: terminal transition failed but the stored run is already terminal — adopting the stored record',
-      )
-      return ok(options.adoptTerminal({state: stored.state, etag: stored.etag}))
-    }
+    const adopted = adoptIfTerminal(options, stored, last.error)
+    if (adopted !== null) return adopted
     if (stored.state.run_id !== runId || TERMINAL_PHASES.has(stored.state.phase)) {
       logger.warn(
         {repo, runId, phase: stored.state.phase, err: last.error.message},
@@ -188,6 +200,17 @@ export async function transitionRetryingStaleEtag<T>(
       'run: terminal transition failed — retrying with the stored ETag',
     )
     last = await boundedAttempt(async () => attempt(stored.etag), attemptTimeoutMs)
+  }
+
+  // The last attempt may have been abandoned at its bound and still committed, and nothing reads the record after it.
+  // One more bounded read (no wait first) lets the caller adopt that outcome instead of reporting a lost write that
+  // the sweep would then skip because the record is terminal.
+  if (last.success === false && options.adoptTerminal !== undefined && options.config.storeAdapter?.getObject != null) {
+    const stored = await readStoredRun(options)
+    if (stored !== null) {
+      const adopted = adoptIfTerminal(options, stored, last.error)
+      if (adopted !== null) return adopted
+    }
   }
   return last
 }
