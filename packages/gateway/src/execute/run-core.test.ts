@@ -991,19 +991,28 @@ describe('runOpenCodeCore', () => {
       expect(callArgs.signal).toBe(controller.signal)
     })
 
-    it('passes the AbortSignal to event.subscribe', async () => {
-      // #given
+    it('passes a signal that follows the run signal to event.subscribe', async () => {
+      // #given — the subscription gets the run signal combined with the run's own stream controller, so it is a
+      // derived signal and no longer the run signal object itself; what matters is that aborting the run aborts it
       const controller = new AbortController()
-      const handle = makeHandle()
+      let subscribed: AbortSignal | undefined
+      let abortedWithRun: boolean | undefined
+      const handle = makeHandle({
+        subscribe: async args => {
+          subscribed = (args as {signal?: AbortSignal}).signal
+          controller.abort()
+          abortedWithRun = subscribed?.aborted
+          return subscribeOk([sessionIdleEvent('sess-123')])
+        },
+      })
       const params = {...buildParams(handle), signal: controller.signal, coordinator: makeCoordinator()}
 
-      // #when
-      await runOpenCodeCore(params)
+      // #when — the run is aborted from inside the subscribe call, so it ends as a timeout
+      await expect(runOpenCodeCore(params)).rejects.toThrow()
 
-      // #then — event.subscribe must have received the same signal object
-      const {event} = handle.client as unknown as {event: {subscribe: ReturnType<typeof vi.fn>}}
-      const callArgs = (event.subscribe.mock.calls[0] as [{signal?: AbortSignal}])[0]
-      expect(callArgs.signal).toBe(controller.signal)
+      // #then
+      expect(subscribed).toBeInstanceOf(AbortSignal)
+      expect(abortedWithRun).toBe(true)
     })
 
     it('passes the AbortSignal to session.promptAsync', async () => {

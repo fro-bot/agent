@@ -1,12 +1,13 @@
 ---
 type: subsystem
-last-updated: "2026-10-11"
-updated-by: "18890129"
+last-updated: "2026-10-25"
+updated-by: "fe7f6bda"
 sources:
   - packages/runtime/src/agent/prompt.ts
   - packages/runtime/src/agent/response-file.ts
   - packages/runtime/src/agent/prompt-thread.ts
   - src/features/agent/prompt-sender.ts
+  - packages/runtime/src/shared/errors.ts
   - packages/runtime/src/agent/output-mode.ts
   - packages/runtime/src/agent/response-delivery.ts
   - packages/runtime/src/agent/types.ts
@@ -78,6 +79,8 @@ Long user-authored content (PR descriptions, review bodies, issue comments, trig
 
 Reference files are materialized to disk before being attached to the SDK session as file parts. The naming convention encodes type, sequence number, and author: `{type}-{NNN}-{author-slug}.txt`.
 
+Materialization failures use the runtime's non-throwing `toErrorMessage` helper, so even an error value with a broken string conversion can be logged without replacing the original failure with a reporting exception (`packages/runtime/src/agent/reference-files.ts`).
+
 ## Hydrated Context
 
 For issue and PR events, the prompt builder can include rich context fetched via GraphQL (RFC-015). The `HydratedContext` type carries structured data about the issue or PR: metadata, file changes with diff stats, commit history, reviews, and comments, all subject to budget constraints (50 files fetched, 20 injected into prompt). For PRs, diff status information is merged from the REST diff endpoint when available, adding `added`/`modified`/`removed` status to each file row.
@@ -115,3 +118,5 @@ Mismatches degrade asymmetrically, in the direction that preserves work. A verdi
 The assembled prompt text and reference files are sent to an OpenCode SDK session by `sendPromptToSession()` in `src/features/agent/prompt-sender.ts`. (This module lives in the action layer — the runtime no longer carries a parallel prompt-sender after the execution stack was consolidated; see [[Architecture Overview]].) The function handles model resolution (if a model override is configured), directory scoping to the GitHub workspace, and the construction of the SDK message payload with both text and file parts. For retry attempts after LLM failures, a short continuation prompt is sent instead of the full initial prompt, since the session already has the full context. That continuation text is built from the observed error type rather than a fixed string, and asks the model to continue the remaining objective rather than blindly resume — the [[Execution Lifecycle]] covers how the attempt outcome is classified and how the continuation is phrased.
 
 Submission is also where the run's completion evidence is armed. Immediately before the prompt is sent, the retry loop resets the root-freshness tracker so the attempt starts with no accumulated evidence that a turn has ended. This matters because the send is the boundary between "nothing is running" and "something is," and any idle observation carried across that boundary would describe the previous turn. See [[Background Subagents and Ownership]].
+
+The SDK may return an error envelope rather than throw. Submission keeps that structured value as classification evidence and uses `formatSdkError` (`packages/runtime/src/shared/errors.ts`) only for its readable description, bounded to 500 characters. This avoids opaque `[object Object]` diagnostics without making formatted prose the authority for retry decisions.

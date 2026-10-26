@@ -100,22 +100,23 @@ RUN bun run --filter @fro-bot/workspace-agent build
 # ── Stage 1b: workspace-test (forked from build-deps BEFORE dev-dep pruning) ──
 # Runs the workspace-agent test suite — including the Unit 2 adversarial
 # real-git fixtures under apps/workspace-agent/src/update-fixtures/ — against
-# THIS image's own Alpine `apk` git, not the CI runner's git, so the fixture
-# suite's transport/hook/filter/collision assertions exercise the exact git
-# binary the runtime image ships. Only reachable via `docker build --target
+# an Alpine `apk` git, not the CI runner's git, so the fixture suite's
+# transport/hook/filter/collision assertions exercise Alpine's git. It uses the
+# same package source as runtime, though separate builds are not guaranteed to
+# resolve an identical binary. Only reachable via `docker build --target
 # workspace-test`; the default build (no --target) never builds this stage
 # (BuildKit skips stages that are not ancestors of the requested target), so
 # it adds zero cost to the runtime image build.
 FROM build-deps AS workspace-test
 
-# git: same source as the runtime stage's `apk add git` below (Alpine apk, not
-# a separately curl-fetched binary) — the whole point of this stage is running
-# the fixtures against a git that matches what ships in runtime.
+# git: same package source as the runtime stage's `apk add git` below (Alpine
+# apk, not a separately curl-fetched binary), so the fixtures run against
+# Alpine's git rather than the CI runner's.
 # openssl: CLI binary the self-signed-cert fixtures shell out to
 # (generateSelfSignedCert in update-fixtures/helpers.ts). The runtime image has
 # no need for the openssl CLI (only its libs, transitively, for Node/OpenCode),
 # so this is confined to the test-only stage rather than added to runtime.
-RUN apk add --no-cache git=2.54.0-r0 git-daemon=2.54.0-r0 openssl
+RUN apk add --no-cache git git-daemon openssl
 
 # Vitest 5 does not walk up to find a config, so the suite (run with `--config ../../vitest.config.ts`) needs the
 # root config plus the local modules it imports (setup file, home-isolation helper, incomplete-run reporter).
@@ -153,11 +154,11 @@ WORKDIR /app
 # in the form <base>+harness.<sha>. Bumped in lockstep with the action default
 # by the harness-release workflow; merge the auto-PR to advance both surfaces.
 ARG OPENCODE_VERSION=1.19.0+harness.caa47272
-ARG SYSTEMATIC_VERSION=3.26.0
+ARG SYSTEMATIC_VERSION=3.26.2
 
-# System packages, pinned to exact Alpine 3.24 versions (the base tag's
-# `-alpine3.24` suffix and the apk registryUrls in .github/renovate.json5 name
-# the same branch — change them together). Renovate bumps the pins in one group.
+# System packages come from the base image's Alpine 3.24 branch and are not
+# pinned: the branch index drops older versions, so exact pins would break the
+# build. The base image stays digest-pinned.
 #   git            — clone.ts runs `git clone` via execFile
 #   ca-certificates — entrypoint runs update-ca-certificates to trust the mitmproxy CA
 #   libgcc/libstdc++/ripgrep — required by the opencode musl binary (matches OpenCode's own image)
@@ -173,14 +174,14 @@ ARG SYSTEMATIC_VERSION=3.26.0
 #   tini           — pid 1; reaps orphaned tool processes. Don't also enable
 #                    `--init`/`init: true` (validate-stack.sh rejects it).
 RUN apk add --no-cache \
-      git=2.54.0-r0 \
-      ca-certificates=20261020-r0 \
-      libgcc=15.2.0-r5 \
-      libstdc++=15.2.0-r5 \
-      ripgrep=15.1.0-r0 \
-      curl=8.22.0-r0 \
-      setpriv=2.42.3-r1 \
-      tini=0.19.0-r3 \
+      git \
+      ca-certificates \
+      libgcc \
+      libstdc++ \
+      ripgrep \
+      curl \
+      setpriv \
+      tini \
     && /sbin/tini --version
 
 # ── Unprivileged OpenCode agent account ─────────────────────────────────────

@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-10-18"
-updated-by: "1dcd6a296d36057a6680ca347bf01a6987d78ec9"
+last-updated: "2026-10-25"
+updated-by: "fe7f6bda"
 sources:
   - src/main.ts
   - src/post.ts
@@ -27,6 +27,10 @@ sources:
   - packages/harness/src/integrate.ts
   - packages/gateway/src/main.ts
   - packages/gateway/src/execute/run.ts
+  - packages/gateway/src/execute/checkout-recovery.ts
+  - apps/workspace-agent/src/opencode-proxy.ts
+  - packages/runtime/src/object-store/settings.ts
+  - packages/runtime/src/repo/slug.ts
   - packages/gateway/src/http/server.ts
   - packages/gateway/src/discord/commands/dispatch.ts
   - packages/gateway/src/discord/commands/fro-bot.ts
@@ -100,7 +104,7 @@ All layers may also import from `@fro-bot/runtime`, which is treated as a peer d
 The action defines two Node 24 entry points in `action.yaml`:
 
 - **`dist/main.js`** — The primary execution path. Bootstraps the environment, routes the incoming GitHub event, acquires the per-repo Action lock (`action.json`; fail-closed when S3 is configured), acknowledges the request, runs the AI agent, finalizes results, and attempts a first cache save.
-- **`dist/post.js`** — A post-action hook (RFC-017) that runs after the main step completes, even on failure or cancellation. Its sole job is a durable cache save so that session state survives even if the main step is killed mid-execution.
+- **`dist/post.js`** — A post-action hook (RFC-017) that retries eligible Actions-cache saves and recovers a lock still owned by this invocation, even on failure or cancellation. It withholds the shared S3 session upload because it no longer holds the publication lease.
 
 Both entry points are thin wrappers. `main.ts` delegates to `harness/run.ts`; `post.ts` delegates to `harness/post.ts`.
 
@@ -136,9 +140,13 @@ The gateway has no separate drain stage because it does not need one: `run-core.
 
 **Workspace API** (`workspace-api/`) — Typed client for the workspace-agent's clone, inspect, update, recovery, backup, and readiness endpoints (`client.ts`, `types.ts`). Before a gateway run begins, checkout preparation calls update under the repository lock and only falls back to clone when no checkout exists. The workspace service owns the mutation, journal, and per-repository mutex; the gateway owns admission and the resulting run-state record (see [[Operator Web Control Surface]]).
 
+A dirty checkout can now take one automatic preserve-and-replace recovery path before execution (`execute/checkout-recovery.ts`). The gateway requires a quiet OpenCode workspace and enough remaining budget for every recovery call, then preserves the old checkout as a backup and re-runs update. An uncertain recovery result triggers a fresh observation rather than reusing the original dirty refusal. Other checkout refusals still stop preparation. [[Operator Web Control Surface]] explains the outcomes and cancellation boundary.
+
 **Bindings** (`bindings/`) — Channel-to-repository binding store. Maps Discord channel IDs to the GitHub repository they operate on. Backed by S3 so bindings survive restarts.
 
 **GitHub** (`github/`) — GitHub App authentication client (`app-client.ts`). Generates short-lived installation tokens for the bound repository so the agent can make authenticated GitHub API calls on behalf of the App.
+
+Ordinary repository authentication shares one 30-second deadline across installation discovery and token minting. The client aborts its transport and releases each caller at its own deadline, even when Octokit's token-request coalescing joins another in-flight request. Workflow-dispatch authentication retains separate five-second discovery and mint bounds. Keeping these bounds in the App client protects checkout preparation, maintenance, binding, and backfill callers alike.
 
 **Config / Readiness / Program / Shutdown** — Configuration loading and validation (`config.ts`), readiness lifecycle (`readiness.ts`), the top-level Effect program (`program.ts`), and graceful SIGINT/SIGTERM handling (`shutdown.ts`).
 
@@ -152,6 +160,8 @@ The service retains root authority for protected staging, journal, and network f
 
 The OpenCode server (`opencode-server.ts`) binds to loopback only; a bearer-token proxy (`opencode-proxy.ts`) is its externally reachable surface on the sandbox network. The gateway attaches through `createRemoteOpenCodeHandle()` in the runtime package — a handle whose `close`/`shutdown` are no-ops because the gateway does not own the remote server process.
 
+The proxy ties connection lifetimes together: an upstream error or incomplete close destroys the downstream response, while a departed SSE consumer destroys its upstream event request. SSE remains exempt from the ordinary inactivity timeout; connection teardown prevents that exemption from leaving abandoned subscriptions alive.
+
 ### Runtime Package (`packages/runtime/`)
 
 The runtime package exports five module groups:
@@ -163,6 +173,8 @@ The runtime package exports five module groups:
 **Session** (`session/`) — SDK-backed session storage, search, pruning, writeback, and mapper layers (see [[Session Persistence]]).
 
 **Object Store** (`object-store/`) — S3-compatible persistence: adapter, key builder, content sync, and endpoint/key validation (see [[Session Persistence]]).
+
+Configuration parsing also lives here: `settings.ts` accepts source-labelled values from the Action, gateway, and backfill without performing I/O. Likewise, `repo/slug.ts` separates repository-string shape from GitHub name validation. These small shared primitives centralize interpretation while leaving credential reads, source precedence, and delivery policy with each surface.
 
 **Coordination** (`coordination/`) — S3-backed distributed lock, the shared lease-renewal loop (`lease-loop.ts`), the gateway heartbeat controller (a RunState layer over that loop), and run-state primitives for per-surface mutual exclusion — gateway runs on `repo.json`, Action runs on `action.json` (see [[Execution Lifecycle]]). Run state gained a details-patch primitive alongside the phase-transition helper, because the transition helper refuses a same-phase write and background ownership changes occur mid-execution, with no phase change to hang them on. It re-reads the record on every call rather than threading a caller-held etag — a caller's etag goes stale the moment the heartbeat's own read-modify-write commits — and treats a lost race as non-fatal, since the next ownership change retries with fresher data.
 
@@ -258,7 +270,7 @@ The fully annotated gateway mention-loop and harness release trees that [ARCHITE
 
 ### Gateway Mention-Loop
 
-```
+```text
 Discord messageCreate event
   └─→ packages/gateway/src/discord/mentions.ts
         │
@@ -283,8 +295,9 @@ Discord messageCreate event
               │     then a pack-stream import, then a journaled fast-forward
               │     → `no-checkout` retries once through ensureClone (fresh clone), then
               │       retries /update; `checkout-substituted` fails the run before any
-              │       agent session starts; every other refused/failed outcome ends the
-              │       run before EXECUTING with a CheckoutPreparation record and a reply
+              │       agent session starts; `dirty` may attempt one quiet-workspace,
+              │       budget-gated recovery and another /update; remaining refusals end
+              │       the run before EXECUTING with a CheckoutPreparation record and a reply
               │       (Discord replies carry a one-click Recover button)
               │     → CheckoutProvenance (checked remote evidence) persisted with the
               │       EXECUTING transition on a `ready` outcome
@@ -328,7 +341,7 @@ Discord messageCreate event
 
 ### Harness Release Pipeline
 
-```
+```text
 harness-release.yaml (workflow_dispatch OR push: harness-v* tag)
   │
   ├─→ prepare-integrate job

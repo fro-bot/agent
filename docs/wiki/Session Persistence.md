@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-10-18"
-updated-by: "1dcd6a296d36057a6680ca347bf01a6987d78ec9"
+last-updated: "2026-10-25"
+updated-by: "fe7f6bda"
 sources:
   - src/services/cache/cache-key.ts
   - src/shared/cache-save-result.ts
@@ -23,6 +23,8 @@ sources:
   - packages/runtime/src/object-store/key-builder.ts
   - packages/runtime/src/object-store/validation.ts
   - packages/runtime/src/object-store/types.ts
+  - packages/runtime/src/object-store/settings.ts
+  - packages/runtime/src/object-store/encryption.ts
   - src/services/cache/restore.ts
   - src/services/cache/save.ts
   - RFCs/RFC-004-Session-Management.md
@@ -115,15 +117,17 @@ The coordination read and delete operations also accept an optional abort signal
 
 ### How It Integrates
 
-The object store hooks into the cache layer at two points:
+The object store integrates with restore, save, and cleanup:
 
 1. **On restore** — When the object store is configured, `restoreCache` in `src/services/cache/restore.ts` consults it **before** the Actions cache, not merely as a miss-time fallback. This ordering exists because some runs — mention-triggered runs in particular — cannot write the Actions cache, so their own state only ever lands in the object store; their successful S3 upload was invisible to a restore that took any cache hit first, including a stale prefix-fallback hit from an unrelated earlier run, leaving them to start cold every time. Consulting durable storage first lets the most recent real session win. A store hit still requires the main session database — sidecar WAL/SHM files alone remain a miss, as with the cache path — and the downloaded storage is validated the same way a cache restore is. A store failure or a disabled store falls through to the cache path unchanged, so the behavior is inert until durable storage is configured. A successful S3 restore reports `source: 'storage'` in the `CacheResult` (vs. `source: 'cache'` for an Actions cache hit).
 
-2. **On save** — `saveCache` in `src/services/cache/save.ts` calls `syncSessionsToStore` **before** the Actions cache write, not after. That ordering is what lets the object store carry continuity on triggers whose cache write is denied: the upload has already happened by the time the cache write is rejected. The sync is best-effort and non-fatal, so a failed upload leaves the run falling through to a cache write that may itself be denied — S3 holds a recent copy when the upload succeeded, not unconditionally.
+2. **On save** — When publication is permitted by the caller's lease, `saveCache` in `src/services/cache/save.ts` calls `syncSessionsToStore` **before** the Actions cache write, not after. That ordering is what lets the object store carry continuity on triggers whose cache write is denied. A caller passing `objectStorePublish: 'withhold'` skips only that shared-session upload and still attempts the Actions cache. The sync is best-effort and non-fatal, so a failed upload leaves the run falling through to a cache write that may itself be denied — S3 holds a recent copy when the upload succeeded, not unconditionally.
 
-3. **On cleanup** — The cleanup phase in `src/harness/phases/cleanup.ts` uploads run artifacts and metadata to S3 via `syncArtifactsToStore` and `syncMetadataToStore`. This happens after the server shuts down (ensuring WAL checkpoint) but before the cache save.
+3. **On cleanup** — The cleanup phase in `src/harness/phases/cleanup.ts` uploads run artifacts and metadata to S3 via `syncArtifactsToStore` and `syncMetadataToStore`. This happens after server shutdown and before the cache save; `saveCache` performs the SQLite checkpoint. These invocation-scoped objects are distinct from the shared session database whose publication requires the lease.
 
 S3 operations are always best-effort: failures are logged as warnings but never abort the run. The action supports AWS S3, Cloudflare R2, Backblaze B2, and MinIO, with SSE encryption auto-selected per endpoint type (`aws:kms` for AWS, `AES256` for custom endpoints).
+
+The common settings parser (`packages/runtime/src/object-store/settings.ts`) gives the Action, gateway, and backfill the same prefix, endpoint, expected-owner, and encryption validation. A supplied expected owner is a 12-digit AWS account ID, and a KMS key requires an effective `aws:kms` mode; custom endpoints therefore need that mode explicitly when using KMS. Surface-specific credential reads and region requirements stay outside the parser. See [[Setup and Configuration]].
 
 ## SDK Session Operations
 

@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-10-18"
-updated-by: "1dcd6a296d36057a6680ca347bf01a6987d78ec9"
+last-updated: "2026-10-25"
+updated-by: "fe7f6bda"
 sources:
   - src/harness/config/state-keys.ts
   - src/harness/config/outputs.ts
@@ -49,7 +49,11 @@ sources:
   - packages/runtime/src/agent/response-file.ts
   - packages/runtime/src/coordination/lock.ts
   - packages/runtime/src/coordination/types.ts
+  - packages/runtime/src/coordination/lease-loop.ts
+  - packages/runtime/src/coordination/lock-adoption.ts
   - packages/gateway/src/execute/checkout-recovery.ts
+  - packages/gateway/src/execute/run-core.ts
+  - packages/gateway/src/execute/run.ts
   - RFCs/RFC-005-GitHub-Triggers-Events.md
   - RFCs/RFC-010-Delegated-Work.md
   - RFCs/RFC-012-Agent-Execution-Main-Action.md
@@ -162,13 +166,17 @@ An unresolvable model is also terminal. OpenCode reports this as a generic `Unkn
 
 Usage accounting is per assistant message, not a running total supplied by OpenCode. The stream consumer retains the latest snapshot for each owned session/message pair and sums those snapshots, so repeated updates replace one message's contribution while later root turns and adopted descendants add their own tokens and cost. Final message retrieval uses the same additive interpretation rather than overwriting streamed totals with the last root reply.
 
+Reasoning and response text share the SDK's text-delta shape. The Action records reasoning-part IDs from `message.part.updated` and excludes their later deltas from response text, matching the gateway. A delta arriving before its part is registered remains indistinguishable and is appended; neither surface infers a part's kind from its content.
+
 ## 9. Drain
 
 Execute can finish while work it started is still running. OpenCode's background subagent dispatch returns immediately and leaves the child running as a detached fiber, and the parent session reports idle without consulting it — so the root's turn ending is no longer the same event as the run's work ending. The drain phase (`runDrain`, `src/harness/phases/execute.ts`) exists to reconcile those two.
 
 Its position in the sequence is the design. Drain sits after Execute returns and strictly before Review Reconciliation, Finalize, and Cleanup, because everything below it either publishes a result, persists state, or releases the coordination lock — and each of those is wrong to do on top of a live writer. Folding drain into Cleanup would have been simpler and would have published a response describing work still changing underneath it.
 
-Drain reconciles the run's ownership ledger once unconditionally, even when nothing appears outstanding — that single pass is the only way to learn that a tracked entry's settlement event was dropped by the event stream. If the ledger is drained, the phase returns immediately. Otherwise it polls until the ledger drains or its deadline expires, at which point every entry not confirmed settled is individually aborted and then re-checked, and anything still unconfirmed is recorded as unknown rather than assumed finished. The drain budget is carved out of the same wall-clock budget as execution — the total timeout minus a teardown reserve minus what execution already spent — so one deadline covers both rather than letting drain extend a run indefinitely.
+Drain reconciles the run's ownership ledger once unconditionally, then returns immediately if it is drained; an empty ledger makes no remote calls. Otherwise it polls until the ledger drains or its deadline expires, at which point every entry not confirmed settled is individually aborted and then re-checked, and anything still unconfirmed is recorded as unknown rather than assumed finished. The drain budget is carved out of the same wall-clock budget as execution — the total timeout minus a 30-second teardown reserve minus what execution already spent — so one deadline covers both rather than letting drain extend a finite run indefinitely.
+
+With `timeout: 0`, drain has no Action deadline and keeps waiting while reconciliation observes owned work running. Three consecutive passes observing no tracked live child while ownership remains unresolved end that wait and enter cancellation, so an unreachable server cannot prevent cleanup forever. Every drain reconciliation pass and child abort is bounded to five seconds with an aborted signal; an abandoned pass cannot later mutate the ledger. [[Background Subagents and Ownership]] details the distinction between observed liveness and an unresolved ledger entry.
 
 When there is no ledger, or when execution never ran, the phase is a complete no-op. [[Background Subagents and Ownership]] covers the ledger's states, the reconciliation rules, and the parallel design on the gateway.
 
@@ -222,7 +230,7 @@ The irreversible consumers are gated more narrowly than the outcome itself. Brok
 
 Two state keys cross the process boundary between the main step and the post hook (`src/harness/config/state-keys.ts`), and they answer different questions.
 
-`CACHE_SAVED` carries a five-value enum rather than a boolean — `durable`, `store-only`, `skipped`, `declined-for-safety`, or `not-persisted` — derived from cleanup's `CacheSaveResult` (see [[Session Persistence]]). The boolean it replaced conflated a store-only save with total failure, so the post hook re-ran a save whose object-store upload had already landed, uploading the same content twice. The enum lets the hook gate on durability actually achieved rather than on cache-write success alone. `durable` and `store-only` skip; `skipped` skips because the operator opted out. `declined-for-safety` also skips — it means cleanup's persistence safety gate refused the save because it could not confirm no other writer was still live, and the post hook honors that refusal rather than retrying it, since it runs with strictly less information (no server handle, no ownership ledger, no lease) than the step that declined. Only `not-persisted` retries — including a state value that is absent or unrecognized, which is deliberately mapped to `not-persisted` on the reasoning that the post hook is the last chance to save the Actions cache and a garbled value must fail toward doing the work. The retry writes the Actions cache only (`objectStorePublish: 'withhold'`); a session that reached neither backend in the main step is not published to the store afterwards.
+`CACHE_SAVED` carries a five-value enum rather than a boolean — `durable`, `store-only`, `skipped`, `declined-for-safety`, or `not-persisted` — derived from cleanup's `CacheSaveResult` (see [[Session Persistence]]). The boolean it replaced conflated a store-only save with total failure. The enum lets the hook gate on durability actually achieved rather than on cache-write success alone: `durable` and `store-only` skip because the database already reached a durable backend, and `skipped` skips because the operator opted out. `declined-for-safety` also skips — cleanup could not confirm persistence safety, and the post hook has less information than the step that declined. Only `not-persisted` retries, including an absent or unrecognized value, because the post hook is the last chance to save the Actions cache. The retry writes the Actions cache only (`objectStorePublish: 'withhold'`); a session that reached neither backend in the main step is not published to the store afterwards.
 
 `skipped-empty` is worth calling out as the case that does _not_ fold into `skipped`. "No cacheable content existed" is a point-in-time filesystem observation, not a configuration constant, so the post hook retries it: the retry re-runs the SQLite checkpoint before re-checking for content, a small cost weighed against losing a session.
 
@@ -278,11 +286,15 @@ Two scoped S3 conditional-write locks (`If-None-Match` / `If-Match`) coordinate 
 
 **Stuck busy status.** While the workspace status endpoint is unavailable (`unknown`), expired gateway leases stay blocked — a stopped container cannot be corroborated, so stopping it does not unblock anything. If a repo's workspace reports `busy` and the lease has expired, first wait for or cancel that repo's running sessions. If it stays busy, pause gateway admissions and restart the workspace service (keep the volume; the restart ends its sessions), wait until its status endpoint is reachable again, then run the guarded `force-release-lock` or retry acquisition — the check now reports `clear`. There is no unguarded bypass.
 
+### Gateway Event Stream Loss
+
+A gateway run listens to one OpenCode event stream (`packages/gateway/src/execute/run-core.ts`) and treats losing it as the end of the run. The subscription allows a single attempt (`sseMaxRetryAttempts: 1`), so a transport failure ends the stream rather than reconnecting past events the run never saw, and the transport error is kept as the failure's cause. A second `server.connected` on one stream also counts as a loss. A silence watchdog (`streamSilenceTimeoutMs`, 30 s, set in `packages/gateway/src/execute/run.ts`) fails the run when no event at all, heartbeats included, arrives for that long. Unlike the inactivity watchdog it is never paused by a drain or a pending approval or question. Every one of these ends the run as `stream-ended` through the termination barrier: the root session is aborted and confirmed quiescent before the lock is released. A drain the completion gate admitted in the same tick as the silence timer still completes the run. The `/event` connection is closed on every exit of the run, so it never outlives the lock and slot. The barrier is also where pending approvals and questions are fail-closed, for every failure it handles, not only these: it rejects them to OpenCode before any root abort, so a button pressed while the barrier is confirming the root is refused (`already-claimed`, then `not-found`) and cannot reach OpenCode.
+
 ### Annotated Action Phase Pipeline
 
 The fully annotated tree that [ARCHITECTURE.md](../../ARCHITECTURE.md) condenses in its Data Flow section.
 
-```
+```text
 main.ts
   └─→ harness/run.ts (run)
         │
