@@ -439,9 +439,16 @@ export function createDrainCompletion(options: DrainCompletionOptions): DrainCom
       rerunRequested = true
       return
     }
-    // Nothing to validate without a drained ledger and current-generation root idle evidence.
-    if (!ledger.isDrainComplete()) return
-    if (idleRevision === null || idleRevision !== revision) return
+    // Nothing to validate without a drained ledger and current-generation root idle evidence. Each skip still names
+    // its blocker, so the run's wait reason follows the run instead of staying empty or frozen on an earlier code.
+    if (!ledger.isDrainComplete()) {
+      onNotAdmitted?.('ledger-not-drained')
+      return
+    }
+    if (idleRevision === null || idleRevision !== revision) {
+      onNotAdmitted?.('idle-evidence-stale')
+      return
+    }
     inFlight = true
     rerunRequested = false
     validate()

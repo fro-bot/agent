@@ -422,3 +422,68 @@ describe('createDrainCompletion — reporting why an attempt was declined', () =
     completion.dispose()
   })
 })
+
+describe('createDrainCompletion — reporting a local blocker that skips validation', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it("reports 'ledger-not-drained' while an adopted child is still unsettled, before any REST request", async () => {
+    // #given a child that is adopted and not settled, with the root idle and the drain begun
+    const {completion, onAdmitted, onNotAdmitted, messages, liveSessionIds} = setup({settleChild: false})
+    completion.noteRootIdle()
+    completion.beginDrain()
+
+    // #when the retry timer fires a few times
+    await vi.advanceTimersByTimeAsync(3 * INTERVAL_MS)
+
+    // #then each pass names the blocker, and no validation request was made
+    expect(onNotAdmitted).toHaveBeenCalledWith('ledger-not-drained')
+    expect(onNotAdmitted.mock.calls.every(([code]) => code === 'ledger-not-drained')).toBe(true)
+    expect(messages).not.toHaveBeenCalled()
+    expect(liveSessionIds).not.toHaveBeenCalled()
+    expect(onAdmitted).not.toHaveBeenCalled()
+    completion.dispose()
+  })
+
+  it("reports 'idle-evidence-stale' when root activity has invalidated the idle evidence, replacing the earlier reason", async () => {
+    // #given a drained ledger whose root idle evidence is then invalidated by new root activity
+    const {completion, onNotAdmitted, messages} = setup()
+    completion.noteNotice({childSessionId: CHILD, state: 'completed'}, 'msg-n1', 'p1')
+    completion.beginDrain()
+    completion.noteRootIdle()
+    completion.noteRootActivity()
+
+    // #when the timer fires
+    await vi.advanceTimersByTimeAsync(INTERVAL_MS)
+
+    // #then the latest reported code is the stale-evidence one, and no request was made
+    expect(onNotAdmitted).toHaveBeenLastCalledWith('idle-evidence-stale')
+    expect(messages).not.toHaveBeenCalled()
+    completion.dispose()
+  })
+
+  it('reports the ledger first when both blockers hold, and never reports once closed or before the drain begins', async () => {
+    // #given an unsettled child and stale evidence, but the drain has not begun
+    const {completion, onNotAdmitted} = setup({settleChild: false})
+    completion.noteRootActivity()
+    completion.requestValidation()
+    expect(onNotAdmitted).not.toHaveBeenCalled()
+
+    // #when the drain begins and a pass runs
+    completion.beginDrain()
+    await vi.advanceTimersByTimeAsync(INTERVAL_MS)
+
+    // #then the ledger blocker is the one reported
+    expect(onNotAdmitted).toHaveBeenLastCalledWith('ledger-not-drained')
+
+    // #when the gate is disposed
+    onNotAdmitted.mockClear()
+    completion.dispose()
+    completion.requestValidation()
+    await vi.advanceTimersByTimeAsync(3 * INTERVAL_MS)
+
+    // #then nothing more is reported
+    expect(onNotAdmitted).not.toHaveBeenCalled()
+  })
+})

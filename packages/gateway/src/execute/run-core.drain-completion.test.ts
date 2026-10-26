@@ -2148,6 +2148,37 @@ describe('runOpenCodeCore — the wait reason of a draining run', () => {
     expect(getWaitReason(RUN_ID)).toBeUndefined()
   })
 
+  it('records the ledger blocker while a root-idle run still has a running child, and follows the run as it moves on', async () => {
+    // #given the root idle while its background child is still live
+    const run = startRun({deadlineMs: 60_000, runId: RUN_ID, live: [CHILD]})
+    await run.emit(dispatchEvent(CHILD))
+    await run.emit(idleEvent())
+
+    // #when the gate has been checked a few times
+    await run.advance(3_000)
+
+    // #then the ledger blocker is recorded before the child settles
+    expect(run.ownershipLedger?.isDrainComplete()).toBe(false)
+    expect(getWaitReason(RUN_ID)).toBe('ledger-not-drained')
+
+    // #when root activity invalidates the idle evidence while the child is still running
+    await run.emit(statusEvent('busy'))
+    await run.advance(1_000)
+
+    // #then the reason is still the (first) ledger blocker, not stale evidence from before
+    expect(getWaitReason(RUN_ID)).toBe('ledger-not-drained')
+
+    // #when the child finishes and the ledger drains, with the root idle evidence now stale
+    run.live.delete(CHILD)
+    await run.advance(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS)
+    await run.advance(2_000)
+
+    // #then the reason follows the new blocker rather than staying frozen on the old one
+    expect(run.ownershipLedger?.isDrainComplete()).toBe(true)
+    expect(getWaitReason(RUN_ID)).toBe('idle-evidence-stale')
+    expect(run.outcome()).toBeUndefined()
+  })
+
   it('forgets it when the run fails at its deadline while still declined', async () => {
     // #given
     const run = startRun({deadlineMs: 10_000, runId: RUN_ID})
