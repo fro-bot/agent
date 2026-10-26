@@ -658,6 +658,12 @@ function failureDetailsPatch(
  */
 export const QUARANTINE_HOLD_WINDOW_MS = 5 * 60_000
 
+/**
+ * How long the OpenCode event stream may deliver nothing, heartbeats included, before the run treats it as lost.
+ * OpenCode sends a heartbeat about every 10 s, so 30 s is three missed beats.
+ */
+export const STREAM_SILENCE_TIMEOUT_MS = 30_000
+
 interface ScheduleQuarantineReleaseOpts {
   readonly heartbeat: ReturnType<typeof createHeartbeatController>
   readonly repo: string
@@ -1679,6 +1685,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           onHumanWaitTerminal: deps.requestGate?.onTerminal,
           approvalMode,
           inactivityTimeoutMs: runInactivityTimeoutMs,
+          streamSilenceTimeoutMs: STREAM_SILENCE_TIMEOUT_MS,
           onActivity: (summary: string) => {
             statusSink.noteActivity(summary)
           },

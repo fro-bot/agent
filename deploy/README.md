@@ -519,9 +519,9 @@ The workspace control API (`/clone`, `/inspect` on :9100) now requires this same
 
 The image's `ENTRYPOINT` runs `tini` as pid 1; the workspace-agent service is its only child. tini reaps orphaned tool processes (otherwise they pile up as zombies). Do **not** also set `init: true` / `--init` or override `entrypoint` in `compose.yaml` — `deploy/validate-stack.sh` rejects both, and `deploy/tests/isolation-harness.sh` asserts pid 1 is `tini`.
 
-#### Base image and apk pins
+#### Base image and system-package policy
 
-Both images build on `node:<ver>-alpine3.24@sha256:…`, and the workspace runtime's `apk add` packages are pinned to exact Alpine 3.24 versions. Renovate bumps them in one grouped "Alpine packages" PR, using the `registryUrls` rule in `.github/renovate.json5`. The tag's Alpine suffix, that `registryUrls` branch, and the pins must all name the same Alpine minor — to move to a new minor, change them together in one deliberate PR.
+Both images build on `node:<ver>-alpine3.24@sha256:…`, and the base image is digest-pinned. Alpine packages installed with `apk add` are not pinned: they float within the base image's Alpine branch (3.24), because that branch's index drops older versions and exact pins would break the build. Rebuilding the same ref can therefore pick up newer packages, so the package layer is not byte-reproducible. A deployed image digest is immutable. To move to a new Alpine minor, change the base tag's `-alpine3.X` suffix and digest together.
 
 #### Reuse guard (baked plugin + managed config)
 

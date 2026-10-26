@@ -1,7 +1,7 @@
 ---
 type: convention
-last-updated: "2026-10-18"
-updated-by: "1dcd6a296d36057a6680ca347bf01a6987d78ec9"
+last-updated: "2026-10-25"
+updated-by: "fe7f6bda"
 sources:
   - action.yaml
   - src/harness/phases/routing.ts
@@ -28,10 +28,13 @@ sources:
   - packages/gateway/src/execute/run.ts
   - packages/gateway/src/execute/checkout-recovery.ts
   - packages/gateway/src/execute/settle-owned-sessions.ts
+  - packages/gateway/src/execute/run-core.ts
   - apps/workspace-agent/src/server.ts
   - apps/workspace-agent/src/recover.ts
   - apps/workspace-agent/src/opencode-instance.ts
   - apps/workspace-agent/src/opencode-proxy.ts
+  - packages/runtime/src/shared/errors.ts
+  - packages/gateway/src/github/app-client.ts
   - docs/solutions/test-failures/gateway-operator-route-health-timeout-flake-2026-07-30.md
   - src/harness/post.ts
 summary: "Common failure symptoms and their causes across action execution, persistence, setup, and gateway runs"
@@ -121,6 +124,8 @@ Stock fallback and pinned-harness failure have different meanings. The current s
 
 ## Model Resolution Failures
 
+SDK failures now retain readable envelope details in diagnostics rather than collapsing to `[object Object]`. The shared `formatSdkError` helper prefers the nested SDK message and bounds the result to 500 characters; an unreadable or unserializable value becomes `[unprintable error]`. These strings are diagnostic descriptions, while retry and terminal-failure decisions retain their structured evidence (`packages/runtime/src/shared/errors.ts`).
+
 `model_not_found` means OpenCode could not resolve the configured provider/model identifier, not that a network request to the model timed out. The Action stops immediately and reports a sanitized model ID and any validated suggestions, plus a suggested action in the job summary (`packages/runtime/src/agent/error-format/format.ts`, `src/features/agent/execution.ts`). The two usual causes are an incorrect identifier and a model catalog that did not load; the latter can occur when the job cannot reach `models.opencode.ai` and the model is not defined explicitly in OpenCode config. Repeating the same turn or increasing its timeout does not repair either configuration problem.
 
 ## Timeout Errors
@@ -158,7 +163,7 @@ Since the failure paths above are hard to tell apart from a reason string alone,
 The coordination lock normally disappears when a run finishes. If a repo stays blocked, look at the lease-renewal log lines for the run (gateway logs or the Action step log):
 
 - **`Coordination lease ETag adopted after a renewal outcome was lost`** (info) means a renewal reached S3 but the response was lost, and the next failed tick or the stop recovered by taking the stored ETag. Nothing is wrong; the release used the adopted ETag.
-- **`Coordination lease renewal failed`** / **`threw`** (warning) is logged for every failed renewal, with an adoption line after it only when the failure was recovered. With no adoption line, the renewal did not commit: the stored record is still this run's at the ETag the loop holds, and if renewals keep failing the lease lapses by its TTL (15 minutes by default). `Lock record not adopted` at debug is the line that says a different record was found, and why: another holder or run, a different acquisition token, or no token.
+- **`Coordination lease renewal failed`** / **`threw`** (warning) is logged for every failed renewal, with an adoption line after it when the stored ETag was recovered. No adoption line does not prove the PUT failed to commit: the read may also have failed or exhausted its budget. If ownership cannot be recovered, the lease is left to its TTL (15 minutes by default). `Lock record not adopted` at debug names a record mismatch: another holder or run, a different acquisition token, or no token.
 - A record without an `acquisition_token` was written by an older gateway build and is never adopted; it falls back to its TTL. This lasts only while old and new builds overlap during a deploy.
 - A tick that was still pending when the 5 s stop budget ran out leaves no budget to look for a committed renewal, so the ETag stop reports may be stale. The gateway's release then retries once by ownership (`run: lock released by ownership after a stale ETag`, info): it reads the lock and deletes it only if the holder, run and `acquisition_token` are this run's. A `lock now belongs to another acquisition` line means a successor holds the lock and it was left alone. The retry is bounded at 5 s: if the store stalls, `ownership release did not finish within 5000ms — lock left to its TTL` is logged (warning), then `releaseLock failed`, and the lock lapses by TTL. Only a failure of the retry logs `releaseLock failed`.
 
@@ -175,7 +180,14 @@ When a gateway run ends before the agent starts, or a cancel does not seem to st
 - **`run: dirty checkout recovered automatically`** / **`run: automatic checkout recovery declined`** / **`run: automatic checkout recovery ambiguous`** (gateway, warning) fires once when a `dirty` refusal triggers the automatic recovery, which runs only while the run holds the repo lock, has budget for the quiet check, two token mints, preview, recover, backup lookup and update ceilings (574 s by default), and OpenCode reports the workspace quiet. All three carry `repo`, `runId` and `outcome`. `recovered` adds `backupId`: the previous checkout is preserved under that id, and the run continues or replies from a second `update`. `declined` adds `reason` and means nothing moved, so the usual `dirty` refusal follows (`budget-insufficient`, `token-unavailable`, `workspace-busy`, `workspace-unknown`, `preview-unavailable`, `preview-not-ok`, `size-incomplete`, `quota-exceeded`, `insufficient-disk-space`, `checkout-changed`, `inspection-failed`, `maintenance-hold`, `journal-in-progress`, `fetch-failed`, `build-failed`). `token-unavailable` means the GitHub installation token could not be minted within 30 s (or the mint failed), so no `/recover` request was sent and nothing moved; that line also carries `cause`, an error class name such as `AuthTimeoutError` or `timeout`, never a message. A `quota-exceeded` or `insufficient-disk-space` reply names the cause and has no Recover button; free space with `/fro-bot checkout-backup delete <id>`. `ambiguous` adds `reason` (`timeout`, `transport-error`, `unexpected-result`, `rollback-failed`, `quarantine-failed`, `install-failed`, `verification-failed`, `termination-unconfirmed`) and `lookup`, and means something may have moved, so the reply comes from what the second `update` observed. `lookup` is the result of the run's search for its own backup by run id. The search runs after the follow-up `update` has returned (that update waits for any swap in progress), and this line is written once the search is done: `found` (with `backupId`), `not-found` or `failed`. The reply names a found backup, and says a fresh checkout was installed only when the checkout is ready; with `not-found` or `failed` it says a recovery was attempted and points at `/fro-bot checkout-backup list`. `rollback-failed` means a pre-quarantine failure could not clean up after itself: the original checkout is untouched, but the next `/update` refuses `needs-recovery` until the workspace restarts and retries the cleanup, and the reply says so without a Recover button. If the journal is still there after a restart, an admin needs to clear it. `/fro-bot checkout-backup list` shows the `runId` of the run that triggered each backup. Paths are never logged.
 - **`workspace-agent: OpenCode instance dispose failed after recovery`** (workspace, warning) means a recovery succeeded but the best-effort `POST /instance/dispose` to OpenCode did not. It carries `owner`, `repo`, `reason` (`timeout`, `network-error`, `http-error`, `threw`) and `status` for `http-error`. The checkout on disk is correct; OpenCode may keep listing the old files until its instance is disposed, which a restart of the workspace does.
 - **`opencode-proxy: session abort forwarded`** (workspace, info) is the only workspace-side trace of an operator cancel, since the gateway aborts through the proxy. It carries `sessionId`, the `status` the gateway saw, and `durationMs`. `session delete`, `instance dispose` and `global dispose` requests are logged the same way. Request bodies, headers and the query string are never logged.
+- **`run-core: event stream closed before session.idle`** (gateway, error) means the OpenCode event stream ended without the root going idle. It carries `sessionId`, `totalEvents`, `activityEvents`, `lastEventType` and, when the transport reported a failure, `streamError` (the transport error's message, for example `fetch failed`). The stream is not reconnected; the run ends as `stream-ended` after the root is aborted and confirmed quiescent.
+- **`run-core: event stream silent — failing the run`** (gateway, error) means no event at all, heartbeats included, arrived for `silenceMs` (30000). It carries `sessionId`, the event counters and `lastEventType`. The run ends as `stream-ended` ("Event stream silent for 30s") even while an approval or question is pending, and the pending request is rejected when the termination barrier starts.
+- **`run-core: event stream announced itself again — stream was replaced`** (gateway, error) means a second `server.connected` arrived on one stream. Events between the two connections were never delivered, so the run ends as `stream-ended`.
 - **`settle-owned-sessions: ...`** and **`run-core: owned work could not be confirmed settled`** (gateway) carry `runId` as well as `rootSessionId`, so an abort that did not confirm, and the quarantine that follows, join to their run. Match the `rootSessionId` to the `sessionId` on the workspace's abort line to see whether the abort request reached OpenCode.
+
+## Workspace Stream Disconnects
+
+The workspace OpenCode proxy closes its downstream response when the upstream errors or closes incompletely. A workspace restart during an SSE stream therefore surfaces as a closed or failed stream rather than an indefinitely open connection. Conversely, a disconnected SSE client releases its upstream event request. SSE has no ordinary inactivity timeout, so silence alone still does not prove a failed connection (`apps/workspace-agent/src/opencode-proxy.ts`).
 
 ## Known Gateway Test Flake
 
