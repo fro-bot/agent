@@ -3074,6 +3074,60 @@ describe('waiting status wiring', () => {
     expect(statuses).toEqual(['running'])
   })
 
+  it('shows a wait reason on a running run when the completion gate records one, and drops it when it is cleared', async () => {
+    // #given a running web run observed by the wired manager
+    const {manager} = await startWithRealRegistries()
+    const run = makeRunningRun()
+    await projectOnce(run)
+    await manager.observe(run)
+    const frames: {status: string; waitReason?: string}[] = []
+    manager.subscribe('run-wait-1', {
+      onEvent: frame => {
+        if (frame.type === 'status') frames.push({status: frame.data.status, waitReason: frame.data.waitReason})
+      },
+      onClose: () => undefined,
+    })
+    await flush()
+
+    // #when run-core records, then clears, why the gate has not admitted the run
+    const {clearWaitReason, setWaitReason} = await import('./execute/wait-reason-registry.js')
+    setWaitReason('run-wait-1', 'notice-not-observed')
+    await flush()
+    clearWaitReason('run-wait-1')
+    await flush()
+
+    // #then the live status carried the wire value, never the raw code, and then lost it
+    expect(frames).toEqual([
+      {status: 'running', waitReason: undefined},
+      {status: 'running', waitReason: 'awaiting-background-task'},
+      {status: 'running', waitReason: undefined},
+    ])
+  })
+
+  it('stops refreshing from wait-reason changes once shutdown has unsubscribed the listener', async () => {
+    // #given a wired program with a spy on the manager's per-run refresh seam
+    const {manager, shutdownHandler} = await startWithRealRegistries()
+    const refreshRun = vi.spyOn(manager, 'refreshRun')
+    const exited = new Promise<number | string | null | undefined>(resolve => {
+      vi.spyOn(process, 'exit').mockImplementation((code?: number | string | null) => {
+        resolve(code)
+        return undefined as never
+      })
+    })
+    const {clearWaitReason, setWaitReason} = await import('./execute/wait-reason-registry.js')
+    setWaitReason('run-wait-1', 'root-live')
+    expect(refreshRun).toHaveBeenCalledExactlyOnceWith('run-wait-1')
+
+    // #when shutdown runs
+    shutdownHandler('SIGTERM')
+    expect(await exited).toBe(0)
+    setWaitReason('run-wait-1', 'revision-drift')
+
+    // #then the change did not reach the manager
+    expect(refreshRun).toHaveBeenCalledOnce()
+    clearWaitReason('run-wait-1')
+  })
+
   it('stops refreshing from gate events once shutdown has unsubscribed the listeners', async () => {
     // #given a wired program with a spy on the manager's refresh seam
     const {manager, questionRegistry, shutdownHandler} = await startWithRealRegistries()

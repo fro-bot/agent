@@ -834,3 +834,23 @@ describe('toOperatorRunStatus — providerFailureReason (1.12.0)', () => {
     expect(JSON.stringify(result)).not.toContain('SENTINEL-PROMPT')
   })
 })
+
+describe('toOperatorRunStatus — waitReason', () => {
+  it('never derives a wait reason from the stored run, whatever its details hold: it is a live overlay only', () => {
+    // #given an EXECUTING run whose details try to smuggle a wait reason in
+    const runState = makeRunState({
+      phase: 'EXECUTING',
+      details: {waitReason: 'agent-working', wait_reason: 'notice-not-observed'},
+    })
+
+    // #when
+    const result = toOperatorRunStatus(runState, BASE_OPTS)
+
+    // #then
+    assert(result !== null)
+    expect(Object.keys(result)).not.toContain('waitReason')
+    expectTypeOf(result.waitReason).toEqualTypeOf<
+      'agent-working' | 'awaiting-reply' | 'awaiting-background-task' | 'confirming-completion' | undefined
+    >()
+  })
+})

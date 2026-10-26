@@ -40,6 +40,27 @@ import {
   toErrorMessage,
 } from '@fro-bot/runtime'
 
+/**
+ * Every code a declined admission attempt reports (to the debug log and to `onNotAdmitted`). Declared once: the
+ * operator wait-reason mapping is exhaustive over it.
+ */
+export const DRAIN_REJECT_CODES = [
+  'root-liveness-unavailable',
+  'root-live',
+  'root-messages-unavailable',
+  'no-root-user-message',
+  'stream-user-message-not-persisted',
+  'latest-root-user-message-unanswered',
+  'notice-not-observed',
+  'reply-text-not-delivered',
+  'revision-drift',
+  'idle-evidence-stale',
+  'ledger-not-drained',
+  'validation-threw',
+] as const
+
+export type DrainRejectCode = (typeof DRAIN_REJECT_CODES)[number]
+
 /** Cadence of re-validation while draining. A rejected pass is re-run no faster than this. */
 export const DRAIN_VALIDATION_INTERVAL_MS = 1_000
 
@@ -174,6 +195,11 @@ export interface DrainCompletionOptions {
   /** Called at most once, only for an admitted completion. */
   readonly onAdmitted: () => void
   /**
+   * Called with the code of every declined admission attempt (the same code the debug log carries), so the run can
+   * show why it has not finished. Never called for an admission.
+   */
+  readonly onNotAdmitted?: (code: DrainRejectCode) => void
+  /**
    * Delivery fence, AND'ed with every other admission condition: whether the stream has delivered the follow-up
    * turns' persisted reply text parts (non-synthetic, non-ignored, in message order) to the reply sink in full.
    * The sink is append-only and may already be on screen, so completion never repairs missing text — it waits for
@@ -213,6 +239,7 @@ export function createDrainCompletion(options: DrainCompletionOptions): DrainCom
     signal,
     logger,
     onAdmitted,
+    onNotAdmitted,
     isReplyDelivered,
     validationIntervalMs = DRAIN_VALIDATION_INTERVAL_MS,
     requestTimeoutMs = DRAIN_REQUEST_TIMEOUT_MS,
@@ -335,8 +362,9 @@ export function createDrainCompletion(options: DrainCompletionOptions): DrainCom
     return result.value.data.has(rootSessionId)
   }
 
-  function reject(reason: string, context: Record<string, unknown> = {}): void {
+  function reject(reason: DrainRejectCode, context: Record<string, unknown> = {}): void {
     logger.debug({sessionId: rootSessionId, reason, ...context}, 'run-core: drain completion not admitted')
+    onNotAdmitted?.(reason)
   }
 
   async function validate(): Promise<void> {

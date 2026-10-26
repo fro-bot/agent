@@ -36,6 +36,8 @@ interface SetupOptions {
   readonly messages?: (args: {readonly signal?: AbortSignal}) => Promise<unknown>
   /** `liveSessionIds` implementation. Default: nothing live, immediately. */
   readonly liveSessionIds?: (signal?: AbortSignal) => ReturnType<typeof liveOk>
+  /** Adopt the child without settling it, so its notice is the only thing missing. */
+  readonly settleChild?: boolean
 }
 
 const liveOk = async (): Promise<ReturnType<typeof ok<ReadonlySet<string>>>> => ok(new Set<string>())
@@ -44,9 +46,10 @@ function setup(options: SetupOptions = {}) {
   vi.useFakeTimers()
   const ledger = createOwnershipLedger()
   ledger.adopt(CHILD, 'background task')
-  ledger.settle(CHILD)
+  if (options.settleChild !== false) ledger.settle(CHILD)
   const runController = new AbortController()
   const onAdmitted = vi.fn()
+  const onNotAdmitted = vi.fn()
   const messages = vi.fn(async (args: {readonly signal?: AbortSignal}) =>
     options.messages === undefined ? {data: answeredTurns, error: null} : options.messages(args),
   )
@@ -63,10 +66,11 @@ function setup(options: SetupOptions = {}) {
     signal: runController.signal,
     logger: {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
     onAdmitted,
+    onNotAdmitted,
     validationIntervalMs: INTERVAL_MS,
     requestTimeoutMs: CAP_MS,
   })
-  return {completion, runController, onAdmitted, messages, liveSessionIds}
+  return {completion, runController, onAdmitted, onNotAdmitted, messages, liveSessionIds}
 }
 
 /** Everything the gate needs to start validating: a notice, a current idle, and a drain in progress. */
@@ -321,5 +325,100 @@ describe('createDrainCompletion — a result that arrives after the run ended ne
         ctx.completion.dispose()
       },
     )
+  })
+})
+
+describe('createDrainCompletion — reporting why an attempt was declined', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('reports the code of each declined attempt, and nothing once the completion is admitted', async () => {
+    // #given the root is live for the first two passes, then idle
+    let passes = 0
+    const {completion, onAdmitted, onNotAdmitted} = setup({
+      liveSessionIds: async () => {
+        passes += 1
+        return ok(passes <= 2 ? new Set([ROOT]) : new Set<string>())
+      },
+    })
+
+    // #when
+    startValidating(completion)
+    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(INTERVAL_MS)
+    await vi.advanceTimersByTimeAsync(INTERVAL_MS)
+
+    // #then two declines, both 'root-live', then an admission that reports no code
+    expect(onNotAdmitted.mock.calls).toEqual([['root-live'], ['root-live']])
+    expect(onAdmitted).toHaveBeenCalledTimes(1)
+    completion.dispose()
+  })
+
+  it("reports 'notice-not-observed' while a child's completion notice has not been seen", async () => {
+    // #given a child that is in the ledger and whose notice never arrives
+    const {completion, onAdmitted, onNotAdmitted} = setup({
+      messages: async () => ({
+        data: [
+          {info: {id: 'msg-prompt', role: 'user', sessionID: ROOT}, parts: []},
+          {
+            info: {
+              id: 'msg-r0',
+              role: 'assistant',
+              sessionID: ROOT,
+              parentID: 'msg-prompt',
+              time: {completed: 1},
+              finish: 'stop',
+            },
+            parts: [],
+          },
+        ],
+        error: null,
+      }),
+    })
+    completion.noteRootUserMessage('msg-prompt')
+    completion.noteRootIdle()
+    completion.beginDrain()
+
+    // #when
+    completion.requestValidation()
+    await vi.advanceTimersByTimeAsync(0)
+
+    // #then
+    expect(onNotAdmitted).toHaveBeenCalledWith('notice-not-observed')
+    expect(onAdmitted).not.toHaveBeenCalled()
+    completion.dispose()
+  })
+
+  it('works without a reporter: a declined attempt still just logs', async () => {
+    // #given
+    const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const ledger = createOwnershipLedger()
+    ledger.adopt(CHILD, 'background task')
+    ledger.settle(CHILD)
+    vi.useFakeTimers()
+    const completion = createDrainCompletion({
+      client: {
+        session: {messages: vi.fn(async () => ({data: answeredTurns, error: null}))},
+      } as unknown as OpenCodeServerHandle['client'],
+      directory: '/workspace/repo',
+      rootSessionId: ROOT,
+      ledger,
+      adapter: {children: async () => ok([]), liveSessionIds: async () => ok(new Set([ROOT]))},
+      signal: new AbortController().signal,
+      logger,
+      onAdmitted: vi.fn(),
+    })
+
+    // #when
+    completion.noteNotice({childSessionId: CHILD, state: 'completed'}, 'msg-n1', 'p1')
+    completion.noteRootIdle()
+    completion.beginDrain()
+    completion.requestValidation()
+    await vi.advanceTimersByTimeAsync(0)
+
+    // #then
+    expect(logger.debug).toHaveBeenCalledWith(expect.objectContaining({reason: 'root-live'}), expect.any(String))
+    completion.dispose()
   })
 })

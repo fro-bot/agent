@@ -57,6 +57,7 @@ import {createReplyDeliveryTracker} from './reply-delivery.js'
 import {toRuntimeLogger} from './runtime-logger.js'
 import {settleOwnedSessions} from './settle-owned-sessions.js'
 import {createTextBoundaryTracker} from './text-boundary.js'
+import {clearWaitReason, setWaitReason} from './wait-reason-registry.js'
 
 // ---------------------------------------------------------------------------
 // Typed error
@@ -645,7 +646,14 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       logger,
       isReplyDelivered: parts => replyDelivery.covers(parts),
       // The only path that completes a drain: an admitted validation unblocks the stream.
-      onAdmitted: () => drainDoneController.abort(),
+      onAdmitted: () => {
+        if (runId !== undefined) clearWaitReason(runId)
+        drainDoneController.abort()
+      },
+      // Why the gate has not admitted the run yet, for the operator status (in-process only, cleared on every exit).
+      onNotAdmitted: code => {
+        if (runId !== undefined) setWaitReason(runId, code)
+      },
     })
   }
 
@@ -1489,6 +1497,8 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     reconciler?.dispose()
     // No validation result may admit success once the loop has exited, and its retry timer must not leak.
     drainCompletion?.dispose()
+    // A run that is no longer draining has no wait reason, whatever way the loop ended.
+    if (runId !== undefined) clearWaitReason(runId)
     // The watchdog is gone: stop reacting to gate notifications and late releases.
     humanWaitsClosed = true
     unsubscribeHumanWaitTerminal?.()

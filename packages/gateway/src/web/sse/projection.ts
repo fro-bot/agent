@@ -9,6 +9,9 @@
  */
 
 import type {RunState} from '@fro-bot/runtime'
+import type {OperatorWaitReason} from '../../operator-contract/wait-reason.js'
+
+import {toOperatorWaitReason} from '../../operator-contract/wait-reason.js'
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -59,4 +62,18 @@ export function overlayWaitingStatus<S extends string>(
   if (predicates.hasPendingApproval(scopeId) === true) return 'waiting_for_approval'
   if (predicates.hasPendingQuestion(scopeId) === true) return 'waiting_for_question'
   return status
+}
+
+// ---------------------------------------------------------------------------
+// overlayWaitReason — why a draining run has not finished
+// ---------------------------------------------------------------------------
+
+/**
+ * The wire wait reason for a status, from the gate's latest declined-attempt code. Only a `running` status carries one:
+ * an approval or question wait (already overlaid into `status`), a queued run and every terminal run have none, even if
+ * a stale code is still recorded. The code goes through the closed allowlist, so an unknown code yields nothing.
+ */
+export function overlayWaitReason(status: string, rawCode: string | undefined): OperatorWaitReason | undefined {
+  if (status !== 'running') return undefined
+  return toOperatorWaitReason(rawCode)
 }
