@@ -88,7 +88,7 @@ import {
 import {createQuestionEffects} from './question-client.js'
 import {RunCoreError, runOpenCodeCore} from './run-core.js'
 import {toRuntimeLogger} from './runtime-logger.js'
-import {transitionRetryingStaleEtag} from './stale-etag-transition.js'
+import {TERMINAL_WRITE_RETRY, transitionRetryingStaleEtag} from './stale-etag-transition.js'
 
 // ---------------------------------------------------------------------------
 // Public interfaces
@@ -1028,11 +1028,10 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     heartbeat.start()
 
     let heartbeatStopped = false
-    // Set when a heartbeat stop fails. Every tick rewrites the RunState, so the ETag the terminal transition then
-    // uses may be stale (after a `tickPending` stop one more write may still land): the transition re-reads once
-    // and retries once on failure (`transitionRetryingStaleEtag`). A clean stop returns an authoritative ETag, so
-    // those transitions keep their single attempt.
-    let heartbeatStopFailed = false
+    // Every terminal write, of every phase, goes through the retrying helper: a lost conditional write or a transient
+    // store error must not strand the record in EXECUTING (the periodic sweep is the backstop, not the plan). Up to
+    // three bounded writes, 500 ms then 1 s apart, each re-reading the stored record first and never writing over a
+    // terminal record or another run's.
     const transitionTerminal = async (
       phase: RunState['phase'],
       etag: string,
@@ -1040,9 +1039,16 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     ) => {
       const attempt = async (attemptEtag: string) =>
         transitionRun(coordinationConfig, identity, repo, runId, phase, attemptEtag, coordLogger, options)
-      return heartbeatStopFailed === true
-        ? transitionRetryingStaleEtag({config: coordinationConfig, identity, repo, runId, etag, logger, attempt})
-        : attempt(etag)
+      return transitionRetryingStaleEtag({
+        config: coordinationConfig,
+        identity,
+        repo,
+        runId,
+        etag,
+        logger,
+        attempt,
+        ...TERMINAL_WRITE_RETRY,
+      })
     }
 
     // ── Ownership ledger — tracks background subagents this run dispatches ──
@@ -1131,7 +1137,6 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           // A failed stop still reports the freshest lock and RunState ETags the heartbeat confirmed.
           lockEtag = stopResult.error.lockEtag
           runEtag = stopResult.error.runEtag
-          heartbeatStopFailed = true
           logger.warn(
             {repo, runId, err: stopResult.error.message, tickPending: stopResult.error.tickPending},
             'run: heartbeat stop failed during preparation termination; using the ETags it last confirmed',
@@ -1148,9 +1153,10 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         logger.error({repo, runId, err: failedResult.error.message}, 'run: transitionRun FAILED (preparation) failed')
       } else {
         notifyObserverBestEffort(deps, failedResult.data.state)
-        // eslint-disable-next-line no-void
-        void deps.operatorPushDispatcher?.dispatchRunFailed(runId, 'workspace-unavailable')
       }
+      // The operator is told whatever the write result: the record is the sweep's to repair, the failure is real.
+      // eslint-disable-next-line no-void
+      void deps.operatorPushDispatcher?.dispatchRunFailed(runId, 'workspace-unavailable')
 
       // The button is attached whenever the reply ends with RECOVER_SUFFIX (every refusal except
       // maintenance-hold, plus an apply-failed reply whose mutation may have started) - never for
@@ -1719,7 +1725,6 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       } else {
         lockEtag = stopResult.error.lockEtag
         runEtag = stopResult.error.runEtag
-        heartbeatStopFailed = true
         logger.warn(
           {repo, runId, err: stopResult.error.message, tickPending: stopResult.error.tickPending},
           'run: heartbeat stop failed; using last known etags',
@@ -1821,75 +1826,31 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           quarantineHoldUntil: new Date(Date.now() + QUARANTINE_HOLD_WINDOW_MS).toISOString(),
           ...failureDetailsPatch(execError),
         }
-        const quarantineResult = await transitionRun(
-          coordinationConfig,
+        // The heartbeat is deliberately still running here, so its ticks keep moving the stored ETag under this
+        // write: the retrying helper re-reads and retries with a fresh one, so the quarantine flag is not silently
+        // lost to a 412. Not `runEtag = result.data.etag`: no further conditional write follows on this path
+        // (`scheduleQuarantineRelease` reads its own fresh ETags), and the lease is left to expire into stale-run
+        // recovery. Capture the ETag fresh from that call's own result if a later write is ever added.
+        const quarantineResult = await transitionRetryingStaleEtag({
+          config: coordinationConfig,
           identity,
           repo,
           runId,
-          'FAILED',
-          runEtag,
-          coordLogger,
-          {detailsPatch: quarantineDetailsPatch},
-        )
+          etag: runEtag,
+          logger,
+          attempt: async attemptEtag =>
+            transitionRun(coordinationConfig, identity, repo, runId, 'FAILED', attemptEtag, coordLogger, {
+              detailsPatch: quarantineDetailsPatch,
+            }),
+          ...TERMINAL_WRITE_RETRY,
+        })
         let quarantineStateForNotify: RunState | undefined
         if (quarantineResult.success === false) {
           logger.error(
             {repo, runId, err: quarantineResult.error.message},
-            'run: transitionRun FAILED (quarantine) failed — retrying with a fresh etag so the quarantine flag is not silently lost',
+            'run: transitionRun FAILED (quarantine) failed — record may misrepresent this run as non-terminal; the bounded hold below still applies regardless',
           )
-
-          // Retry once with a freshly-read etag — mirrors the CANCELLED→FAILED fallback
-          // pattern below. A 412 here is almost always a stale caller etag (e.g. this
-          // run's own heartbeat tick landed a write between our last read and this
-          // call), not a structural failure. Losing this write silently would leave
-          // the persisted record misrepresenting this run as non-terminal, with
-          // nothing recorded that this run is quarantined — a future reader has no
-          // way to learn the bounded hold below is in effect.
-          const reReadResult = await readCurrentRunStateWithEtag(deps, repo, runId)
-          if (reReadResult === null) {
-            logger.error(
-              {repo, runId},
-              'run: quarantine FAILED transition retry skipped — run-state re-read also failed; record may misrepresent this run as non-terminal',
-            )
-          } else if (
-            reReadResult.phase === 'COMPLETED' ||
-            reReadResult.phase === 'FAILED' ||
-            reReadResult.phase === 'CANCELLED'
-          ) {
-            logger.warn(
-              {repo, runId, phase: reReadResult.phase},
-              'run: quarantine FAILED transition failed but a concurrent writer already terminalized the run — skipping retry',
-            )
-          } else {
-            const retryResult = await transitionRun(
-              coordinationConfig,
-              identity,
-              repo,
-              runId,
-              'FAILED',
-              reReadResult.etag,
-              coordLogger,
-              {detailsPatch: quarantineDetailsPatch},
-            )
-            if (retryResult.success === false) {
-              logger.error(
-                {repo, runId, err: retryResult.error.message},
-                'run: quarantine FAILED transition retry also failed — record may misrepresent this run as non-terminal; the bounded hold below still applies regardless',
-              )
-            } else {
-              // Not `runEtag = retryResult.data.etag`: the quarantine path performs no
-              // further conditional write after this point (scheduleQuarantineRelease's
-              // heartbeat.stop() below reads its own fresh etags and never consults this
-              // one) — the lease is deliberately left to expire into stale-run recovery.
-              // If a future change adds a conditional write here, capture the etag fresh
-              // from that call's own result rather than reaching for this stale binding.
-              quarantineStateForNotify = retryResult.data.state
-              logger.warn({repo, runId}, 'run: quarantine FAILED transition recovered on retry with a fresh etag')
-            }
-          }
         } else {
-          // Not `runEtag = quarantineResult.data.etag`: see the comment in the retry
-          // branch above — no further conditional write follows on this path.
           quarantineStateForNotify = quarantineResult.data.state
         }
 
@@ -1902,9 +1863,10 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
         if (quarantineStateForNotify !== undefined) {
           notifyObserverBestEffort(deps, quarantineStateForNotify)
-          // eslint-disable-next-line no-void
-          void deps.operatorPushDispatcher?.dispatchRunFailed(runId, toOperatorFailureKind(quarantineFailureKind))
         }
+        // The operator is told whatever the write result.
+        // eslint-disable-next-line no-void
+        void deps.operatorPushDispatcher?.dispatchRunFailed(runId, toOperatorFailureKind(quarantineFailureKind))
 
         const quarantineMessage = withProvenanceLine(
           'The task failed and its background work could not be confirmed stopped. This repository stays reserved for a bounded window while that resolves — please contact an operator if it persists.',
@@ -1961,7 +1923,6 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           } else {
             lockEtag = stopResult.error.lockEtag
             runEtag = stopResult.error.runEtag
-            heartbeatStopFailed = true
             logger.warn(
               {repo, runId, err: stopResult.error.message, tickPending: stopResult.error.tickPending},
               'run: heartbeat stop failed on cancel path; using last known etags',
@@ -2072,7 +2033,6 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           } else {
             lockEtag = stopResult.error.lockEtag
             runEtag = stopResult.error.runEtag
-            heartbeatStopFailed = true
             logger.warn(
               {repo, runId, err: stopResult.error.message, tickPending: stopResult.error.tickPending},
               'run: heartbeat stop failed; using last known etags',
@@ -2116,9 +2076,10 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         // status frame (which closes run subscribers). Best-effort, fire-and-forget.
         if (failedStateForNotify !== undefined) {
           notifyObserverBestEffort(deps, failedStateForNotify)
-          // eslint-disable-next-line no-void
-          void deps.operatorPushDispatcher?.dispatchRunFailed(runId, toOperatorFailureKind(inFlightFailureKind))
         }
+        // The operator is told whatever the write result: the record is the sweep's to repair, the failure is real.
+        // eslint-disable-next-line no-void
+        void deps.operatorPushDispatcher?.dispatchRunFailed(runId, toOperatorFailureKind(inFlightFailureKind))
 
         // Coarse user message — no internal detail
         const timeoutDuration = formatTimeoutDuration(runTimeoutMs)

@@ -366,3 +366,200 @@ describe('transitionRetryingStaleEtag', () => {
     expect(attempt).toHaveBeenCalledTimes(2)
   })
 })
+
+function options(overrides: Partial<Parameters<typeof transitionRetryingStaleEtag<{etag: string}>>[0]> = {}) {
+  return {
+    config: configWith(storedAs(runState(), 'etag-fresh')),
+    identity: IDENTITY,
+    repo: REPO,
+    runId: RUN_ID,
+    etag: 'etag-stale',
+    logger: createLogger(),
+    attempt: vi.fn(async (_etag: string) => ok({etag: 'etag-done'})),
+    ...overrides,
+  }
+}
+
+describe('transitionRetryingStaleEtag — more attempts, a delay, a per-attempt bound', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('succeeds on the third write when the first two fail, waiting 500 ms then 1 s between writes', async () => {
+    // #given two failed writes, then a success
+    let calls = 0
+    const attempt = vi.fn(async (_etag: string) => {
+      calls += 1
+      return calls < 3 ? PRECONDITION() : ok({etag: 'etag-done'})
+    })
+    const getObject = storedAs(runState(), 'etag-fresh')
+
+    // #when
+    const pending = transitionRetryingStaleEtag(
+      options({config: configWith(getObject), attempt, attempts: 3, delaysMs: [500, 1_000]}),
+    )
+    await vi.advanceTimersByTimeAsync(0)
+    expect(attempt).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(499)
+    expect(attempt).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(attempt).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(999)
+    expect(attempt).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(1)
+    const result = await pending
+
+    // #then the retries used the stored ETag, and the stored record was re-read before each one
+    expect(result).toEqual(ok({etag: 'etag-done'}))
+    expect(attempt.mock.calls.map(call => call[0])).toEqual(['etag-stale', 'etag-fresh', 'etag-fresh'])
+    expect(getObject).toHaveBeenCalledTimes(2)
+  })
+
+  it('returns the last failure after every attempt failed, without a further write', async () => {
+    // #given
+    const attempt = vi.fn(async (etag: string) => err(new Error(`failed with ${etag}`)))
+
+    // #when
+    const pending = transitionRetryingStaleEtag(options({attempt, attempts: 3, delaysMs: [500, 1_000]}))
+    await vi.advanceTimersByTimeAsync(5_000)
+    const result = await pending
+
+    // #then
+    expect(result.success === false ? result.error.message : '').toBe('failed with etag-fresh')
+    expect(attempt).toHaveBeenCalledTimes(3)
+  })
+
+  it('stops retrying and overwrites nothing when the stored record became terminal between attempts', async () => {
+    // #given the first retry loses, and the record is COMPLETED when it is read for the second
+    const reads = [runState({phase: 'EXECUTING'}), runState({phase: 'COMPLETED'})]
+    const getObject = vi.fn(async () => ok({data: JSON.stringify(reads.shift() ?? runState()), etag: 'etag-fresh'}))
+    const attempt = vi.fn(async (_etag: string) => PRECONDITION())
+    const logger = createLogger()
+
+    // #when
+    const pending = transitionRetryingStaleEtag(
+      options({config: configWith(getObject), attempt, attempts: 3, delaysMs: [500, 1_000], logger}),
+    )
+    await vi.advanceTimersByTimeAsync(5_000)
+    const result = await pending
+
+    // #then it wrote twice (the original and one retry), then left the terminal record alone
+    expect(result.success).toBe(false)
+    expect(attempt).toHaveBeenCalledTimes(2)
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({phase: 'COMPLETED'}),
+      expect.stringContaining('skipping retry'),
+    )
+  })
+
+  it('never retries over a record that belongs to another run', async () => {
+    // #given
+    const attempt = vi.fn(async (_etag: string) => PRECONDITION())
+
+    // #when
+    const pending = transitionRetryingStaleEtag(
+      options({
+        config: configWith(storedAs(runState({run_id: 'run-other'}), 'etag-other')),
+        attempt,
+        attempts: 3,
+        delaysMs: [500, 1_000],
+      }),
+    )
+    await vi.advanceTimersByTimeAsync(5_000)
+    await pending
+
+    // #then
+    expect(attempt).toHaveBeenCalledExactlyOnceWith('etag-stale')
+  })
+
+  it('bounds a stalled write, retries after it, and keeps the whole retry within its budget', async () => {
+    // #given a first write that never settles, then writes that succeed
+    const stalled = new Promise<never>(() => {})
+    let calls = 0
+    const attempt = vi.fn(async (_etag: string) => {
+      calls += 1
+      return calls === 1 ? stalled : ok({etag: 'etag-done'})
+    })
+
+    // #when the per-attempt bound passes
+    const pending = transitionRetryingStaleEtag(
+      options({attempt, attempts: 3, delaysMs: [500, 1_000], attemptTimeoutMs: 5_000}),
+    )
+    await vi.advanceTimersByTimeAsync(4_999)
+    expect(attempt).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1 + 500)
+    const result = await pending
+
+    // #then the stall was abandoned at its bound and the next write went out with the stored ETag
+    expect(result).toEqual(ok({etag: 'etag-done'}))
+    expect(attempt.mock.calls.map(call => call[0])).toEqual(['etag-stale', 'etag-fresh'])
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('ends within attempts x bound plus delays when every write stalls', async () => {
+    // #given
+    const attempt = vi.fn(async (_etag: string) => new Promise<never>(() => {}))
+    let settled = false
+
+    // #when
+    const pending = transitionRetryingStaleEtag(
+      options({attempt, attempts: 3, delaysMs: [500, 1_000], attemptTimeoutMs: 5_000}),
+    ).then(result => {
+      settled = true
+      return result
+    })
+    // 3 bounded writes + 1.5 s of delays + 2 store reads (instant here)
+    await vi.advanceTimersByTimeAsync(3 * 5_000 + 1_500 - 1)
+    expect(settled).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    const result = await pending
+
+    // #then
+    expect(settled).toBe(true)
+    expect(result.success).toBe(false)
+    expect(attempt).toHaveBeenCalledTimes(3)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('does not surface a late rejection of an abandoned write as unhandled', async () => {
+    // #given a write that rejects only after its bound passed
+    let rejectLate: (error: Error) => void = () => {}
+    const late = new Promise<never>((_resolve, reject) => {
+      rejectLate = reject
+    })
+    let calls = 0
+    const attempt = vi.fn(async (_etag: string) => {
+      calls += 1
+      return calls === 1 ? late : ok({etag: 'etag-done'})
+    })
+    const unhandled = vi.fn()
+    process.on('unhandledRejection', unhandled)
+
+    // #when
+    const pending = transitionRetryingStaleEtag(options({attempt, attempts: 2, attemptTimeoutMs: 1_000}))
+    await vi.advanceTimersByTimeAsync(1_000)
+    await pending
+    rejectLate(new Error('late'))
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #then
+    process.off('unhandledRejection', unhandled)
+    expect(unhandled).not.toHaveBeenCalled()
+  })
+
+  it("keeps today's default: one re-read and one retry with no delay, no bound", async () => {
+    // #given
+    const attempt = vi.fn(async (_etag: string) => PRECONDITION())
+
+    // #when
+    const result = await transitionRetryingStaleEtag(options({attempt}))
+
+    // #then
+    expect(result.success).toBe(false)
+    expect(attempt.mock.calls.map(call => call[0])).toEqual(['etag-stale', 'etag-fresh'])
+  })
+})

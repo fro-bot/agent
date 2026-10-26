@@ -385,6 +385,56 @@ describe('acquireMaintenanceRun', () => {
     })
   })
 
+  describe('release with a clean heartbeat stop', () => {
+    it('retries a lost terminal write with the stored etag: every terminal write retries, not only after a failed stop', async () => {
+      // #given the stop was clean but the terminal write still loses its condition once
+      mockTransitionRunEffect
+        .mockReturnValueOnce(Effect.fail(new Error('412 precondition failed')))
+        .mockReturnValueOnce(Effect.succeed({etag: 'run-etag-done', state: {}}))
+      let runId = ''
+      const handle = await acquire(configStoring('EXECUTING', () => runId))
+      runId = handle.runId
+
+      // #when
+      await Effect.runPromise(handle.release('COMPLETED'))
+
+      // #then the retry used the stored etag, and the lock was released as usual
+      const etags = mockTransitionRunEffect.mock.calls.map((call: unknown[]) => call[5])
+      expect(etags).toEqual(['run-etag-2', 'run-etag-stored'])
+      expect(mockReleaseLockEffect).toHaveBeenCalledOnce()
+    })
+
+    it('makes three bounded attempts, 500 ms then 1 s apart, then warns and still releases the lock', async () => {
+      // #given every terminal write loses
+      vi.useFakeTimers()
+      try {
+        mockTransitionRunEffect.mockReturnValue(Effect.fail(new Error('412 precondition failed')))
+        let runId = ''
+        const handle = await acquire(configStoring('EXECUTING', () => runId))
+        runId = handle.runId
+
+        // #when
+        const releasing = Effect.runPromise(handle.release('FAILED'))
+        await vi.advanceTimersByTimeAsync(0)
+        expect(mockTransitionRunEffect).toHaveBeenCalledTimes(1)
+        await vi.advanceTimersByTimeAsync(500)
+        expect(mockTransitionRunEffect).toHaveBeenCalledTimes(2)
+        await vi.advanceTimersByTimeAsync(1_000)
+        await releasing
+
+        // #then
+        expect(mockTransitionRunEffect).toHaveBeenCalledTimes(3)
+        expect(LOGGER.warn).toHaveBeenCalledWith(
+          expect.objectContaining({err: '412 precondition failed'}),
+          'maintenance-run: terminal transition failed',
+        )
+        expect(mockReleaseLockEffect).toHaveBeenCalledOnce()
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+  })
+
   describe('release by ownership when the lock ETag is stale', () => {
     const stale = () => Effect.fail(new Error('PreconditionFailed'))
 

@@ -20,7 +20,7 @@ import {err, ok} from '@fro-bot/runtime'
 import {Effect} from 'effect'
 import {releaseLockOrByOwnership} from '../execute/lock-release.js'
 import {toRuntimeLogger} from '../execute/runtime-logger.js'
-import {transitionRetryingStaleEtag} from '../execute/stale-etag-transition.js'
+import {TERMINAL_WRITE_RETRY, transitionRetryingStaleEtag} from '../execute/stale-etag-transition.js'
 import {
   acquireLockEffect,
   createHeartbeatController,
@@ -126,9 +126,8 @@ export function acquireMaintenanceRun(opts: {
     const release = (finalPhase: 'COMPLETED' | 'FAILED', detailsPatch?: Record<string, unknown>): Effect.Effect<void> =>
       Effect.gen(function* () {
         let finalLockEtag = lockEtag
-        // A failed stop leaves `runEtag` possibly stale (every tick rewrites the RunState), so the terminal
-        // transition re-reads once and retries once on failure. A clean stop returns an authoritative ETag.
-        let stopFailed = false
+        // A failed stop leaves `runEtag` possibly stale (every tick rewrites the RunState); the terminal write
+        // retries either way.
         if (stopped === false) {
           stopped = true
           const stopResult = yield* Effect.tryPromise({
@@ -139,7 +138,6 @@ export function acquireMaintenanceRun(opts: {
             runEtag = stopResult.right.data.runEtag
             finalLockEtag = stopResult.right.data.lockEtag
           } else {
-            stopFailed = true
             // A failed stop still reports the freshest ETags its successful writes produced.
             if (stopResult._tag === 'Right' && stopResult.right.success === false) {
               finalLockEtag = stopResult.right.error.lockEtag
@@ -163,18 +161,19 @@ export function acquireMaintenanceRun(opts: {
           )
           return attempted._tag === 'Right' ? ok(attempted.right) : err(attempted.left)
         }
+        // Every terminal write retries (three bounded attempts), whether or not the stop was clean: a lost conditional
+        // write or a transient store error must not strand the record, and a failed stop only makes it likelier.
         const transitionResult = yield* Effect.promise(async () =>
-          stopFailed === true
-            ? transitionRetryingStaleEtag({
-                config: coordinationConfig,
-                identity,
-                repo,
-                runId,
-                etag: runEtag,
-                logger,
-                attempt,
-              })
-            : attempt(runEtag),
+          transitionRetryingStaleEtag({
+            config: coordinationConfig,
+            identity,
+            repo,
+            runId,
+            etag: runEtag,
+            logger,
+            attempt,
+            ...TERMINAL_WRITE_RETRY,
+          }),
         )
         if (transitionResult.success === false) {
           logger.warn({repo, runId, err: transitionResult.error.message}, 'maintenance-run: terminal transition failed')

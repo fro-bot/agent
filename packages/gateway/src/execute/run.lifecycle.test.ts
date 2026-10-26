@@ -1201,24 +1201,38 @@ describe('runMention', () => {
       )
     })
 
-    it('without a stop failure, a failed COMPLETED transition is not retried', async () => {
-      // #given a clean stop: the existing non-fatal handling is unchanged
-      const {runMention} = await import('./run.js')
-      setupHappyPath()
-      mockRuntime.transitionRun.mockImplementation(async (...args: unknown[]) => {
-        if (args[4] === 'COMPLETED') {
-          return {success: false as const, error: new Error('412 precondition failed')}
-        }
-        return {success: true as const, data: {etag: 'etag-after', state: buildMockRunState()}}
-      })
-      const deps = makeDeps({coordinationConfig: configStoring('EXECUTING', 'etag-stored')})
+    it('without a stop failure, a failed COMPLETED transition is retried too, and is non-fatal once every attempt fails', async () => {
+      // #given a clean stop and a COMPLETED write that always loses: every terminal write retries, not only after a
+      // failed stop (the retries wait 500 ms then 1 s)
+      vi.useFakeTimers()
+      try {
+        const {runMention} = await import('./run.js')
+        setupHappyPath()
+        mockRuntime.transitionRun.mockImplementation(async (...args: unknown[]) => {
+          if (args[4] === 'COMPLETED') {
+            return {success: false as const, error: new Error('412 precondition failed')}
+          }
+          return {success: true as const, data: {etag: 'etag-after', state: buildMockRunState()}}
+        })
+        const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+        const deps = makeDeps({coordinationConfig: configStoring('EXECUTING', 'etag-stored'), logger})
 
-      // #when
-      await runMention(makeMessage(), makeBinding(), deps)
+        // #when
+        const running = runMention(makeMessage(), makeBinding(), deps)
+        await vi.advanceTimersByTimeAsync(10_000)
+        await running
 
-      // #then
-      const completedCalls = mockRuntime.transitionRun.mock.calls.filter((c: unknown[]) => c[4] === 'COMPLETED')
-      expect(completedCalls).toHaveLength(1)
+        // #then three writes, then the loss is logged as before and the run still finished
+        const completedCalls = mockRuntime.transitionRun.mock.calls.filter((c: unknown[]) => c[4] === 'COMPLETED')
+        expect(completedCalls).toHaveLength(3)
+        expect(logger.error).toHaveBeenCalledWith(
+          expect.objectContaining({err: '412 precondition failed'}),
+          'run: transitionRun COMPLETED failed',
+        )
+        expect(mockRuntime.releaseLock).toHaveBeenCalledOnce()
+      } finally {
+        vi.useRealTimers()
+      }
     })
 
     it('on success path: heartbeat.stop() failure logs warning and continues to COMPLETED', async () => {
