@@ -859,3 +859,244 @@ describe('transitionRetryingStaleEtag — the final attempt commits after its bo
     expect(getObject).toHaveBeenCalledTimes(1)
   })
 })
+
+// ---------------------------------------------------------------------------
+// A write the helper abandoned at its bound can still commit after the helper has returned a failure.
+// ---------------------------------------------------------------------------
+
+interface Written {
+  readonly etag: string
+  readonly state: RunState
+}
+
+/** A write that stays pending until the test settles it. */
+function deferredWrite() {
+  let settle: (result: Result<Written, Error>) => void = () => {}
+  const promise = new Promise<Result<Written, Error>>(resolve => {
+    settle = resolve
+  })
+  return {promise, settle}
+}
+
+const COMMITTED: Written = {etag: 'etag-late', state: runState({phase: 'COMPLETED', details: {marker: 'late'}})}
+
+function lateCommitOptions(overrides: {
+  readonly attempt: (etag: string) => Promise<Result<Written, Error>>
+  readonly onLateCommit?: (written: Written) => void
+  readonly getObject?: GetObject
+  readonly attempts?: number
+  readonly adopt?: boolean
+}) {
+  return {
+    config: configWith(overrides.getObject ?? storedAs(runState({phase: 'EXECUTING'}), 'etag-live')),
+    identity: IDENTITY,
+    repo: REPO,
+    runId: RUN_ID,
+    etag: 'etag-stale',
+    logger: createLogger(),
+    attempt: overrides.attempt,
+    attempts: overrides.attempts ?? 1,
+    attemptTimeoutMs: 5_000,
+    ...(overrides.adopt === true
+      ? {
+          adoptTerminal: (stored: {state: RunState; etag: string}): Written => ({
+            etag: stored.etag,
+            state: stored.state,
+          }),
+        }
+      : {}),
+    ...(overrides.onLateCommit === undefined ? {} : {onLateCommit: overrides.onLateCommit}),
+  }
+}
+
+describe('transitionRetryingStaleEtag — a write that commits after the helper gave up', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('reports the late commit once, with the written record, after the helper already returned a failure', async () => {
+    // #given the only attempt times out, and the final re-read still shows a live run
+    const write = deferredWrite()
+    const onLateCommit = vi.fn()
+    const options = lateCommitOptions({attempt: async () => write.promise, onLateCommit, adopt: true})
+
+    // #when the helper gives up, and only then does the abandoned write resolve
+    const pending = transitionRetryingStaleEtag(options)
+    await vi.advanceTimersByTimeAsync(20_000)
+    const result = await pending
+    expect(result.success).toBe(false)
+    expect(onLateCommit).not.toHaveBeenCalled()
+    write.settle(ok(COMMITTED))
+    await vi.advanceTimersByTimeAsync(0)
+
+    // #then
+    expect(onLateCommit).toHaveBeenCalledExactlyOnceWith(COMMITTED)
+    expect(options.logger.info).toHaveBeenCalledWith(
+      expect.objectContaining({runId: RUN_ID}),
+      expect.stringContaining('committed late'),
+    )
+  })
+
+  it('reports at most one late commit even when several abandoned writes commit', async () => {
+    // #given two attempts that both time out
+    const first = deferredWrite()
+    const second = deferredWrite()
+    const writes = [first, second]
+    const onLateCommit = vi.fn()
+    const options = lateCommitOptions({
+      attempt: async () => (writes.shift() ?? second).promise,
+      onLateCommit,
+      attempts: 2,
+      adopt: true,
+    })
+
+    // #when
+    const pending = transitionRetryingStaleEtag(options)
+    await vi.advanceTimersByTimeAsync(30_000)
+    await pending
+    first.settle(ok(COMMITTED))
+    second.settle(ok({etag: 'etag-late-2', state: COMMITTED.state}))
+    await vi.advanceTimersByTimeAsync(0)
+
+    // #then
+    expect(onLateCommit).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not report a late commit after the helper already returned success', async () => {
+    // #given the first attempt times out, the retry succeeds
+    const first = deferredWrite()
+    const onLateCommit = vi.fn()
+    let calls = 0
+    const options = lateCommitOptions({
+      attempt: async () => {
+        calls += 1
+        return calls === 1 ? first.promise : ok({etag: 'etag-done', state: runState({phase: 'COMPLETED'})})
+      },
+      onLateCommit,
+      attempts: 2,
+    })
+
+    // #when
+    const pending = transitionRetryingStaleEtag(options)
+    await vi.advanceTimersByTimeAsync(30_000)
+    const result = await pending
+    first.settle(ok(COMMITTED))
+    await vi.advanceTimersByTimeAsync(0)
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(onLateCommit).not.toHaveBeenCalled()
+  })
+
+  it('does not report a late commit after the helper adopted a terminal record', async () => {
+    // #given the only attempt times out, and the final re-read finds the run terminal
+    const write = deferredWrite()
+    const onLateCommit = vi.fn()
+    const options = lateCommitOptions({
+      attempt: async () => write.promise,
+      onLateCommit,
+      getObject: storedAs(runState({phase: 'FAILED'}), 'etag-terminal'),
+      adopt: true,
+    })
+
+    // #when
+    const pending = transitionRetryingStaleEtag(options)
+    await vi.advanceTimersByTimeAsync(20_000)
+    const result = await pending
+    write.settle(ok(COMMITTED))
+    await vi.advanceTimersByTimeAsync(0)
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(onLateCommit).not.toHaveBeenCalled()
+  })
+
+  it('does not report a late failure', async () => {
+    // #given
+    const write = deferredWrite()
+    const onLateCommit = vi.fn()
+    const options = lateCommitOptions({attempt: async () => write.promise, onLateCommit, adopt: true})
+
+    // #when
+    const pending = transitionRetryingStaleEtag(options)
+    await vi.advanceTimersByTimeAsync(20_000)
+    await pending
+    write.settle(err(new Error('412 precondition failed')))
+    await vi.advanceTimersByTimeAsync(0)
+
+    // #then
+    expect(onLateCommit).not.toHaveBeenCalled()
+  })
+
+  it('contains a throwing callback and logs it at debug', async () => {
+    // #given
+    const write = deferredWrite()
+    const options = lateCommitOptions({
+      attempt: async () => write.promise,
+      onLateCommit: () => {
+        throw new Error('observer exploded')
+      },
+      adopt: true,
+    })
+    const unhandled = vi.fn()
+    process.on('unhandledRejection', unhandled)
+
+    // #when
+    const pending = transitionRetryingStaleEtag(options)
+    await vi.advanceTimersByTimeAsync(20_000)
+    await pending
+    write.settle(ok(COMMITTED))
+    await vi.advanceTimersByTimeAsync(0)
+    process.off('unhandledRejection', unhandled)
+
+    // #then
+    expect(unhandled).not.toHaveBeenCalled()
+    expect(options.logger.debug).toHaveBeenCalledWith(
+      expect.objectContaining({err: 'observer exploded'}),
+      expect.stringContaining('late'),
+    )
+  })
+
+  it('without a callback, a late commit changes nothing', async () => {
+    // #given
+    const write = deferredWrite()
+    const options = lateCommitOptions({attempt: async () => write.promise, adopt: true})
+
+    // #when
+    const pending = transitionRetryingStaleEtag(options)
+    await vi.advanceTimersByTimeAsync(20_000)
+    const result = await pending
+    write.settle(ok(COMMITTED))
+    await vi.advanceTimersByTimeAsync(0)
+
+    // #then
+    expect(result.success).toBe(false)
+  })
+
+  it('returns success, not a failure, when the abandoned write commits before the helper returns', async () => {
+    // #given the attempt times out and the final re-read stalls; the abandoned write commits during that read
+    const write = deferredWrite()
+    const onLateCommit = vi.fn()
+    const options = lateCommitOptions({
+      attempt: async () => write.promise,
+      onLateCommit,
+      getObject: vi.fn(async () => new Promise<never>(() => {})),
+      adopt: true,
+    })
+
+    // #when
+    const pending = transitionRetryingStaleEtag(options)
+    await vi.advanceTimersByTimeAsync(6_000)
+    write.settle(ok(COMMITTED))
+    await vi.advanceTimersByTimeAsync(20_000)
+    const result = await pending
+
+    // #then the helper reports the write it now knows about, and the callback is not needed
+    expect(result).toEqual(ok(COMMITTED))
+    expect(onLateCommit).not.toHaveBeenCalled()
+  })
+})

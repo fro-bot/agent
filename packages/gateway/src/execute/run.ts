@@ -1056,6 +1056,10 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         logger,
         attempt,
         ...TERMINAL_WRITE_RETRY,
+        // A write abandoned at its bound that commits after we gave up: observers still need the terminal frame.
+        onLateCommit: written => {
+          notifyObserverBestEffort(deps, written.state)
+        },
       })
     }
 
@@ -1852,6 +1856,9 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
               detailsPatch: quarantineDetailsPatch,
             }),
           ...TERMINAL_WRITE_RETRY,
+          onLateCommit: written => {
+            notifyObserverBestEffort(deps, written.state)
+          },
         })
         let quarantineStateForNotify: RunState | undefined
         if (quarantineResult.success === false) {

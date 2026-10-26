@@ -34,6 +34,13 @@ export interface StaleEtagTransitionOptions<T> {
    * run is always a failure.
    */
   readonly adoptTerminal?: (stored: {readonly state: RunState; readonly etag: string}) => T
+  /**
+   * Called at most once, with the write's result, when a write the helper abandoned at its bound commits AFTER the
+   * helper has already returned a failure (no read can see it by then, and the sweep skips terminal records). The
+   * caller can then tell its observers; it must not re-run anything else. Never called after a success or an
+   * adoption, or for a late failure. A throw is contained.
+   */
+  readonly onLateCommit?: (written: T) => void
 }
 
 /**
@@ -110,18 +117,24 @@ async function readStoredRun(
 async function boundedAttempt<T>(
   attempt: () => Promise<Result<T, Error>>,
   timeoutMs: number | undefined,
+  onAbandoned?: (write: Promise<Result<T, Error>>) => void,
 ): Promise<Result<T, Error>> {
   if (timeoutMs === undefined) return attempt()
   let timer: ReturnType<typeof setTimeout> | undefined
+  let timedOut = false
   const bound = new Promise<Result<T, Error>>(resolve => {
     timer = setTimeout(() => {
+      timedOut = true
       resolve(err(new Error(`terminal transition did not settle within ${timeoutMs}ms`)))
     }, timeoutMs)
   })
+  const write = attempt()
   try {
-    return await Promise.race([attempt(), bound])
+    return await Promise.race([write, bound])
   } finally {
     clearTimeout(timer)
+    // The write is still in flight; keep a handle so a late commit is not lost.
+    if (timedOut) onAbandoned?.(write)
   }
 }
 
@@ -168,9 +181,56 @@ function adoptIfTerminal<T>(
 export async function transitionRetryingStaleEtag<T>(
   options: StaleEtagTransitionOptions<T>,
 ): Promise<Result<T, Error>> {
+  // A write abandoned at its bound can still commit. One that does so before this returns turns a failure into the
+  // success it was; one that does so afterwards goes to `onLateCommit` (the result of a lost race is otherwise lost).
+  let returned = false
+  let outcomeWasSuccess = false
+  let lateWrite: T | undefined
+  let lateReported = false
+  const watchAbandoned = (write: Promise<Result<T, Error>>): void => {
+    write.then(
+      result => {
+        if (result.success === false || lateReported || lateWrite !== undefined) return
+        if (returned === false) {
+          lateWrite = result.data
+          return
+        }
+        lateReported = true
+        if (outcomeWasSuccess || options.onLateCommit === undefined) return
+        options.logger.info(
+          {repo: options.repo, runId: options.runId},
+          'run: an abandoned terminal write committed late — notifying the observer',
+        )
+        try {
+          options.onLateCommit(result.data)
+        } catch (error: unknown) {
+          options.logger.debug(
+            {repo: options.repo, runId: options.runId, err: toErrorMessage(error)},
+            'run: late-commit callback threw — ignoring',
+          )
+        }
+      },
+      () => {},
+    )
+  }
+  const result = await retryTerminalWrite(options, watchAbandoned)
+  if (result.success === false && lateWrite !== undefined) {
+    returned = true
+    outcomeWasSuccess = true
+    return ok(lateWrite)
+  }
+  returned = true
+  outcomeWasSuccess = result.success
+  return result
+}
+
+async function retryTerminalWrite<T>(
+  options: StaleEtagTransitionOptions<T>,
+  onAbandoned: (write: Promise<Result<T, Error>>) => void,
+): Promise<Result<T, Error>> {
   const {repo, runId, etag, logger, attempt, attempts = 2, delaysMs = [], attemptTimeoutMs} = options
 
-  let last = await boundedAttempt(async () => attempt(etag), attemptTimeoutMs)
+  let last = await boundedAttempt(async () => attempt(etag), attemptTimeoutMs, onAbandoned)
   for (let retry = 1; last.success === false && retry < attempts; retry += 1) {
     // Nothing can be re-read without a store adapter that reads, so waiting would only delay the failure. The read
     // returns `null` at once and logs why the retry is disabled.
@@ -199,7 +259,7 @@ export async function transitionRetryingStaleEtag<T>(
       {repo, runId, phase: stored.state.phase, retry, attempts, err: last.error.message},
       'run: terminal transition failed — retrying with the stored ETag',
     )
-    last = await boundedAttempt(async () => attempt(stored.etag), attemptTimeoutMs)
+    last = await boundedAttempt(async () => attempt(stored.etag), attemptTimeoutMs, onAbandoned)
   }
 
   // The last attempt may have been abandoned at its bound and still committed, and nothing reads the record after it.

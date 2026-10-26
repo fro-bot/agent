@@ -344,4 +344,45 @@ describe('terminal RunState writes retry', () => {
     // #and it is not reported as a lost write
     expect(logger.error).not.toHaveBeenCalledWith(expect.anything(), 'run: transitionRun COMPLETED failed')
   })
+
+  it('a COMPLETED write abandoned at its bound that commits after the run gave up still gives observers the terminal frame', async () => {
+    // #given every COMPLETED write hangs, and the store keeps showing a live run, so the helper returns a failure
+    setupHappyPath()
+    const pending: ((state: ReturnType<typeof buildMockRunState>) => void)[] = []
+    mockRuntime.transitionRun.mockImplementation(async (...args: unknown[]) => {
+      if (args[4] === 'COMPLETED') {
+        return new Promise<{success: true; data: {etag: string; state: ReturnType<typeof buildMockRunState>}}>(
+          resolve => {
+            pending.push(state => {
+              resolve({success: true as const, data: {etag: 'etag-late', state}})
+            })
+          },
+        )
+      }
+      return {
+        success: true as const,
+        data: {etag: 'etag-after', state: buildMockRunState({phase: args[4] as 'FAILED'})},
+      }
+    })
+    const observe = vi.fn(async (_state: unknown) => {})
+    const logger = makeLogger()
+    const deps = makeDeps({coordinationConfig: configStoring('EXECUTING'), logger, runObserver: {observe}})
+
+    // #when the run finishes without a successful write, and only then does an abandoned write commit
+    await runToEnd(makeInMemoryRequest(), deps)
+    expect(logger.error).toHaveBeenCalledWith(expect.anything(), 'run: transitionRun COMPLETED failed')
+    expect(observe.mock.calls.some(call => (call[0] as {phase: string}).phase === 'COMPLETED')).toBe(false)
+    const written = buildMockRunState({
+      phase: 'COMPLETED',
+      run_id: String(mockRuntime.transitionRun.mock.calls.at(-1)?.[3]),
+      details: {marker: 'late'},
+    })
+    pending[0]?.(written)
+    await vi.advanceTimersByTimeAsync(0)
+
+    // #then the observer received the written terminal state, once
+    const frames = observe.mock.calls.map(call => call[0] as {phase: string; details?: Record<string, unknown>})
+    expect(frames.filter(state => state.phase === 'COMPLETED')).toHaveLength(1)
+    expect(frames.find(state => state.phase === 'COMPLETED')?.details).toEqual({marker: 'late'})
+  })
 })
