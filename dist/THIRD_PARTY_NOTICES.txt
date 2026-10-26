@@ -9915,7 +9915,7 @@ Apache License
    limitations under the License.
 
 
-effect@3.22.3
+effect@3.22.4
 MIT
 MIT License
 
