@@ -17,6 +17,26 @@ import {afterEach, describe, expect, it, vi} from 'vitest'
 
 import {runOpenCodeCore} from './run-core.js'
 
+// Every inactivity timer the run creates, with its options, so a test can tell the silence watchdog (the one built
+// with the silence window) from the activity watchdog and the reconciler's timers.
+const createdTimers = vi.hoisted(
+  () =>
+    [] as {readonly timeoutMs: number; readonly timer: {readonly signal: AbortSignal; readonly dispose: () => void}}[],
+)
+
+vi.mock('@fro-bot/runtime', async importOriginal => {
+  const original = await importOriginal<typeof import('@fro-bot/runtime')>()
+  return {
+    ...original,
+    createInactivityTimer: (options: {readonly timeoutMs: number}) => {
+      const timer = original.createInactivityTimer(options)
+      vi.spyOn(timer, 'dispose')
+      createdTimers.push({timeoutMs: options.timeoutMs, timer})
+      return timer
+    },
+  }
+})
+
 const ROOT = 'sess-123'
 const CHILD = 'child-1'
 const DIRECTORY = '/workspace/repo'
@@ -61,6 +81,52 @@ const permissionAsked = (requestID: string): object => ({
   type: 'permission.asked',
   properties: {id: requestID, sessionID: ROOT, permission: 'bash', patterns: [], tool: 'bash'},
 })
+const taskNotice = (childId: string): object => ({
+  type: 'message.part.updated',
+  properties: {
+    sessionID: ROOT,
+    part: {
+      id: 'part-notice-1',
+      messageID: 'msg-notice-1',
+      sessionID: ROOT,
+      type: 'text',
+      synthetic: true,
+      text: `<task id="${childId}" state="completed">\n<summary>Background task completed</summary>\n</task>`,
+    },
+  },
+})
+
+/** REST `session.messages` shape of a persisted root turn: the prompt answered, then an injected notice answered. */
+const completedFollowUp = (childId: string): readonly object[] => [
+  {info: {id: 'msg-prompt', role: 'user', sessionID: ROOT}, parts: [{type: 'text', text: 'prompt'}]},
+  {
+    info: {
+      id: 'msg-reply-1',
+      role: 'assistant',
+      sessionID: ROOT,
+      parentID: 'msg-prompt',
+      time: {completed: 1},
+      finish: 'stop',
+    },
+    parts: [],
+  },
+  {
+    info: {id: 'msg-notice-1', role: 'user', sessionID: ROOT},
+    parts: [{id: 'part-notice-1', type: 'text', synthetic: true, text: `<task id="${childId}" state="completed">`}],
+  },
+  {
+    info: {
+      id: 'msg-reply-2',
+      role: 'assistant',
+      sessionID: ROOT,
+      parentID: 'msg-notice-1',
+      time: {completed: 2},
+      finish: 'stop',
+    },
+    parts: [],
+  },
+]
+
 const backgroundTaskCompleted = (jobId: string): object => ({
   type: 'message.part.updated',
   properties: {
@@ -84,6 +150,12 @@ interface StartOptions {
   readonly coordinator?: PermissionCoordinator
   /** Whether the child session is reported live by the reconciler (a drain that never settles). */
   readonly childLive?: boolean
+  /** Replaces `session.status`; defaults to the `childLive` answer. */
+  readonly status?: () => Promise<unknown>
+  /** Replaces `session.messages`, the REST read the drain-completion gate validates against. */
+  readonly messages?: (args: unknown) => Promise<unknown>
+  /** `promptAsync` answers with an error envelope instead of success. */
+  readonly promptFails?: boolean
 }
 
 interface Run {
@@ -91,6 +163,8 @@ interface Run {
   readonly emit: (event: object) => void
   readonly close: () => void
   readonly subscribe: ReturnType<typeof vi.fn>
+  /** The signal the event subscription was given: the connection is open for as long as it is not aborted. */
+  readonly subscribeSignal: () => AbortSignal
   readonly abort: ReturnType<typeof vi.fn>
   readonly logger: GatewayLogger
   readonly coordinator: PermissionCoordinator
@@ -128,12 +202,17 @@ function startRun(options: StartOptions = {}): Run {
   const client = {
     session: {
       create: vi.fn().mockResolvedValue({data: {id: ROOT}, error: null}),
-      messages: vi.fn().mockResolvedValue({data: [], error: null}),
-      promptAsync: vi.fn().mockResolvedValue({data: {}, error: null}),
-      children: vi.fn().mockResolvedValue({data: [{id: CHILD}], error: null}),
-      status: vi
+      messages: vi.fn(options.messages ?? (async () => ({data: [], error: null}))),
+      promptAsync: vi
         .fn()
-        .mockResolvedValue({data: options.childLive === true ? {[CHILD]: {}, [ROOT]: {}} : {}, error: null}),
+        .mockResolvedValue(
+          options.promptFails === true ? {data: undefined, error: {message: 'boom'}} : {data: {}, error: null},
+        ),
+      children: vi.fn().mockResolvedValue({data: [{id: CHILD}], error: null}),
+      status: vi.fn(
+        options.status ??
+          (async () => ({data: options.childLive === true ? {[CHILD]: {}, [ROOT]: {}} : {}, error: null})),
+      ),
       abort,
     },
     event: {subscribe},
@@ -180,6 +259,7 @@ function startRun(options: StartOptions = {}): Run {
       wakeStream()
     },
     subscribe,
+    subscribeSignal: () => (subscribe.mock.calls[0]?.[0] as {signal: AbortSignal}).signal,
     abort,
     logger,
     coordinator,
@@ -206,6 +286,7 @@ async function startDrainingRun(options: StartOptions = {}): Promise<Run> {
 
 afterEach(() => {
   vi.useRealTimers()
+  createdTimers.length = 0
 })
 
 describe('runOpenCodeCore — the event stream watchdog', () => {
@@ -284,22 +365,25 @@ describe('runOpenCodeCore — the event stream watchdog', () => {
       expect(error.message).toContain('silent')
     })
 
-    it('leaves a run that completes before 30 s of silence COMPLETED', async () => {
+    it('leaves a run that completes before 30 s of silence COMPLETED, with the silence timer disposed', async () => {
       // #given a run with the watchdog armed that goes idle after 20 s
       const run = startRun({streamSilenceTimeoutMs: SILENCE_MS})
       await vi.advanceTimersByTimeAsync(20_000)
+      const silence = createdTimers.filter(entry => entry.timeoutMs === SILENCE_MS)
+      expect(silence).toHaveLength(1)
 
       // #when the root goes idle
       run.emit(idle())
       await vi.advanceTimersByTimeAsync(10)
 
-      // #then the run completed, and no watchdog timer is left running to flip it to a failure later
+      // #then the run completed and exactly that timer was disposed
       expect(run.outcome()).toEqual({ok: true})
-      expect(vi.getTimerCount()).toBe(0)
+      expect(silence[0]?.timer.dispose).toHaveBeenCalledTimes(1)
 
-      // #and the silence window passing changes nothing
+      // #and the silence window passing never flips it, because the disposed timer cannot fire
       await vi.advanceTimersByTimeAsync(SILENCE_MS * 2)
       expect(run.outcome()).toEqual({ok: true})
+      expect(silence[0]?.timer.signal.aborted).toBe(false)
     })
 
     it('changes nothing when streamSilenceTimeoutMs is unset: a quiet stream stays open', async () => {
@@ -381,5 +465,136 @@ describe('runOpenCodeCore — the event stream watchdog', () => {
       // #then
       expect(run.outcome()).toEqual({ok: true})
     })
+  })
+})
+
+describe('runOpenCodeCore — the event subscription is closed on every exit', () => {
+  it('aborts the subscription after a silence failure', async () => {
+    // #given a run whose stream goes silent
+    const run = startRun({streamSilenceTimeoutMs: SILENCE_MS})
+    await vi.advanceTimersByTimeAsync(10)
+    expect(run.subscribeSignal().aborted).toBe(false)
+
+    // #when the watchdog fires and the barrier runs
+    await vi.advanceTimersByTimeAsync(SILENCE_MS + PAST_SETTLE_BOUND_MS)
+
+    // #then the run failed and the connection to /event was torn down with it
+    expect(failure(run).kind).toBe('stream-ended')
+    expect(run.subscribeSignal().aborted).toBe(true)
+  })
+
+  it('aborts the subscription after a second server.connected', async () => {
+    // #given
+    const run = startRun()
+    await vi.advanceTimersByTimeAsync(10)
+    run.emit(connected())
+    run.emit(connected())
+
+    // #when
+    await vi.advanceTimersByTimeAsync(PAST_SETTLE_BOUND_MS)
+
+    // #then
+    expect(failure(run).kind).toBe('stream-ended')
+    expect(run.subscribeSignal().aborted).toBe(true)
+  })
+
+  it('aborts the subscription after a normal completion', async () => {
+    // #given
+    const run = startRun()
+    await vi.advanceTimersByTimeAsync(10)
+    expect(run.subscribeSignal().aborted).toBe(false)
+
+    // #when
+    run.emit(idle())
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #then
+    expect(run.outcome()).toEqual({ok: true})
+    expect(run.subscribeSignal().aborted).toBe(true)
+  })
+
+  it('aborts the subscription when the prompt is rejected, before the event loop ever starts', async () => {
+    // #given a prompt the server refuses
+    const run = startRun({promptFails: true})
+
+    // #when
+    await vi.advanceTimersByTimeAsync(PAST_SETTLE_BOUND_MS)
+
+    // #then the run failed before the loop, and the connection did not outlive it
+    expect(failure(run).kind).toBe('prompt-error')
+    expect(run.subscribeSignal().aborted).toBe(true)
+  })
+
+  it('still follows the run signal', async () => {
+    // #given
+    const controller = new AbortController()
+    const run = startRun({controller})
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #when the wall clock fires
+    controller.abort()
+
+    // #then the subscription follows it
+    expect(run.subscribeSignal().aborted).toBe(true)
+    await vi.advanceTimersByTimeAsync(PAST_SETTLE_BOUND_MS)
+  })
+})
+
+describe('runOpenCodeCore — a drain that completes in the same tick as the silence timer', () => {
+  it('completes the run: the REST-validated drain wins over the silence watchdog', async () => {
+    // #given a draining run whose REST validation is held until just before the silence window ends
+    let releaseMessages: () => void = () => {}
+    const messagesHeld = new Promise<void>(resolve => {
+      releaseMessages = resolve
+    })
+    let statusCalls = 0
+    let armed = false
+    let silenceFiredInsideCommit = false
+    let silenceDueAt = 0
+    const base = createOwnershipLedger()
+    // The drain gate asks the ledger one last time at its commit point, with nothing awaited before it admits.
+    // Firing the silence timer from inside that call puts both aborts in the same synchronous region.
+    const ledger: OwnershipLedger = {
+      ...base,
+      isDrainComplete: () => {
+        if (armed && !silenceFiredInsideCommit) {
+          silenceFiredInsideCommit = true
+          vi.advanceTimersByTime(silenceDueAt - Date.now())
+        }
+        return base.isDrainComplete()
+      },
+    }
+    const run = startRun({
+      streamSilenceTimeoutMs: SILENCE_MS,
+      ownershipLedger: ledger,
+      status: async () => {
+        statusCalls += 1
+        return {data: statusCalls === 1 ? {[CHILD]: {}} : {}, error: null}
+      },
+      messages: async args => {
+        await messagesHeld
+        const id = (args as {readonly path?: {readonly id?: string}}).path?.id
+        return {data: id === ROOT ? completedFollowUp(CHILD) : [], error: null}
+      },
+    })
+    await vi.advanceTimersByTimeAsync(10)
+    run.emit(backgroundTaskCompleted(CHILD))
+    run.emit(idle())
+    await vi.advanceTimersByTimeAsync(10)
+    run.emit(taskNotice(CHILD))
+    run.emit(idle())
+    await vi.advanceTimersByTimeAsync(0)
+    silenceDueAt = Date.now() + SILENCE_MS
+
+    // #when the validation answers one millisecond before the silence window ends, and the timer fires inside it
+    await vi.advanceTimersByTimeAsync(SILENCE_MS - 1)
+    expect(run.outcome()).toBeUndefined()
+    armed = true
+    releaseMessages()
+    await vi.advanceTimersByTimeAsync(PAST_SETTLE_BOUND_MS)
+
+    // #then both fired together, and the run completed instead of failing as a lost stream
+    expect(silenceFiredInsideCommit).toBe(true)
+    expect(run.outcome()).toEqual({ok: true})
   })
 })

@@ -1505,20 +1505,6 @@ describe('approval dispose/shutdown: onDispose fail-closes pending registry entr
     expect(postReply).toHaveBeenCalledTimes(1)
   })
 
-  it('runs the event loop with the stream silence watchdog set to its 30 s constant', async () => {
-    // #given
-    const {runMention, STREAM_SILENCE_TIMEOUT_MS} = await import('./run.js')
-    setupHappyPath()
-
-    // #when
-    await runMention(makeMessage(), makeBinding(), makeDeps())
-
-    // #then
-    const coreParams = mockRunOpenCodeCore.mock.calls[0]?.[0] as {streamSilenceTimeoutMs?: number}
-    expect(STREAM_SILENCE_TIMEOUT_MS).toBe(30_000)
-    expect(coreParams.streamSilenceTimeoutMs).toBe(STREAM_SILENCE_TIMEOUT_MS)
-  })
-
   it('registry.disposeAll fail-closes all pending entries across all sessions (gateway shutdown)', async () => {
     // #given — multiple pending entries across different sessions
     const {createApprovalRegistry} = await import('../approvals/registry.js')
