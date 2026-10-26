@@ -301,10 +301,14 @@ describe('termination barrier — quarantine (Unit 8)', () => {
       const {RunCoreError} = runCoreModule
       const executingState = buildMockRunState({phase: 'EXECUTING'})
       const failedState = buildMockRunState({phase: 'FAILED', details: {quarantined: true}})
-      const getObjectMock = vi.fn().mockResolvedValue({
+      // The run id is generated per run; the stored record must be this run's for the retry to be allowed.
+      const getObjectMock = vi.fn(async () => ({
         success: true as const,
-        data: {data: JSON.stringify(executingState), etag: 'fresh-etag-after-quarantine-412'},
-      })
+        data: {
+          data: JSON.stringify({...executingState, run_id: String(mockRuntime.transitionRun.mock.calls.at(-1)?.[3])}),
+          etag: 'fresh-etag-after-quarantine-412',
+        },
+      }))
       const coordinationConfig = {
         storeAdapter: {upload: vi.fn(), download: vi.fn(), list: vi.fn(), getObject: getObjectMock},
         storeConfig: {enabled: true, bucket: 'test', region: 'us-east-1', prefix: 'state'},
@@ -366,10 +370,13 @@ describe('termination barrier — quarantine (Unit 8)', () => {
       const {runMention, QUARANTINE_HOLD_WINDOW_MS} = await import('./run.js')
       const {RunCoreError} = runCoreModule
       const executingState = buildMockRunState({phase: 'EXECUTING'})
-      const getObjectMock = vi.fn().mockResolvedValue({
+      const getObjectMock = vi.fn(async () => ({
         success: true as const,
-        data: {data: JSON.stringify(executingState), etag: 'fresh-etag-that-also-conflicts'},
-      })
+        data: {
+          data: JSON.stringify({...executingState, run_id: String(mockRuntime.transitionRun.mock.calls.at(-1)?.[3])}),
+          etag: 'fresh-etag-that-also-conflicts',
+        },
+      }))
       const coordinationConfig = {
         storeAdapter: {upload: vi.fn(), download: vi.fn(), list: vi.fn(), getObject: getObjectMock},
         storeConfig: {enabled: true, bucket: 'test', region: 'us-east-1', prefix: 'state'},
@@ -409,8 +416,10 @@ describe('termination barrier — quarantine (Unit 8)', () => {
       const deps = makeDeps({coordinationConfig, concurrency: sharedConcurrency, queue})
       const message = makeMessage()
 
-      // #when — must not throw even though both the transition and its retry failed.
-      await expect(runMention(message, makeBinding(), deps)).resolves.toBeUndefined()
+      // #when — must not throw even though every write failed (the retries wait 500 ms then 1 s).
+      const running = runMention(message, makeBinding(), deps)
+      await vi.advanceTimersByTimeAsync(10_000)
+      await expect(running).resolves.toBeUndefined()
 
       // #then — the bounded hold is scheduled regardless of the persisted record's fate, and
       // still fires the deferred release once the window elapses.

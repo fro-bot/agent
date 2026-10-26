@@ -127,10 +127,14 @@ describe('provider failure reason — persisted at the terminal FAILED write (re
         upload: vi.fn(),
         download: vi.fn(),
         list: vi.fn(),
-        getObject: vi.fn().mockResolvedValue({
+        // The run id is generated per run; the stored record must be this run's for the retry to be allowed.
+        getObject: vi.fn(async () => ({
           success: true as const,
-          data: {data: JSON.stringify(executing), etag: 'fresh-etag'},
-        }),
+          data: {
+            data: JSON.stringify({...executing, run_id: String(mockRuntime.transitionRun.mock.calls.at(-1)?.[3])}),
+            etag: 'fresh-etag',
+          },
+        })),
       },
       storeConfig: {enabled: true, bucket: 'test', region: 'us-east-1', prefix: 'state'},
       lockTtlSeconds: 900,

@@ -3456,3 +3456,67 @@ describe('durable operator sessions — program wiring', () => {
     })
   })
 })
+
+// ---------------------------------------------------------------------------
+// Stranded-run sweep — program wiring
+// ---------------------------------------------------------------------------
+
+describe('stranded-run sweep wiring', () => {
+  const SWEEP_MS = 60_000
+
+  async function bootPlain() {
+    const intervalSpy = vi.spyOn(globalThis, 'setInterval')
+    const deps = {
+      makeClient: () => makeFakeClient() as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer: vi.fn(),
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+    await Effect.runPromise(makeGatewayProgram(deps, makeFakeConfig({announce: undefined, operatorWeb: undefined})))
+    const index = intervalSpy.mock.calls.findIndex(([, ms]) => ms === SWEEP_MS)
+    const handle = intervalSpy.mock.results[index]?.value as ReturnType<typeof setInterval> | undefined
+    return {
+      intervalSpy,
+      handle,
+      timers: intervalSpy.mock.calls.filter(([, ms]) => ms === SWEEP_MS),
+      deps,
+    }
+  }
+
+  it("starts one unref'd 60 s timer, even with operator web disabled", async () => {
+    // #given / #when
+    const {handle, timers} = await bootPlain()
+
+    // #then
+    expect(timers).toHaveLength(1)
+    expect(handle?.hasRef()).toBe(false)
+  })
+
+  it('starts the timer after login, when startup recovery runs, so its first tick is one interval after boot', async () => {
+    // #given / #when
+    const {deps, intervalSpy} = await bootPlain()
+
+    // #then the sweep timer was created after login returned
+    const sweepCall = intervalSpy.mock.calls.findIndex(([, ms]) => ms === SWEEP_MS)
+    const loginOrder = deps.login.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY
+    const timerOrder = intervalSpy.mock.invocationCallOrder[sweepCall] ?? 0
+    expect(timerOrder).toBeGreaterThan(loginOrder)
+  })
+
+  it('clears the timer when the shutdown drain runs', async () => {
+    // #given
+    const {handle} = await bootPlain()
+    const {installShutdownHandlers} = await import('./shutdown.js')
+    const drain = vi.mocked(installShutdownHandlers).mock.calls.at(-1)?.[4]
+    if (drain === undefined) throw new Error('expected the program to pass a drain callback')
+    const clearSpy = vi.spyOn(globalThis, 'clearInterval')
+
+    // #when
+    await drain().catch(() => {})
+
+    // #then
+    expect(clearSpy).toHaveBeenCalledWith(handle)
+  })
+})

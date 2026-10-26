@@ -20,7 +20,7 @@ import {err, ok} from '@fro-bot/runtime'
 import {Effect} from 'effect'
 import {releaseLockOrByOwnership} from '../execute/lock-release.js'
 import {toRuntimeLogger} from '../execute/runtime-logger.js'
-import {transitionRetryingStaleEtag} from '../execute/stale-etag-transition.js'
+import {TERMINAL_WRITE_RETRY, transitionRetryingStaleEtag} from '../execute/stale-etag-transition.js'
 import {
   acquireLockEffect,
   createHeartbeatController,
@@ -52,6 +52,19 @@ export type AcquireMaintenanceRunResult =
   /** An expired lease exists but the workspace is not confirmed clear; nothing was mutated. */
   | {readonly outcome: 'blocked'; readonly reason: 'workspace-busy' | 'workspace-unknown'}
   | {readonly outcome: 'error'; readonly message: string}
+
+/**
+ * Run ids of maintenance runs whose heartbeat is live in this process. A maintenance run heartbeats its record like any
+ * run but is not in the abort registry, so the stranded-run sweep asks this set before it treats a stale-looking
+ * EXECUTING record as orphaned. An id is added once the record exists and removed when the release finishes, whatever
+ * its writes returned.
+ */
+const inFlightMaintenanceRunIds = new Set<string>()
+
+/** Whether a maintenance run with this id is heartbeating in this process. */
+export function isMaintenanceRunInFlight(runId: string): boolean {
+  return inFlightMaintenanceRunIds.has(runId)
+}
 
 /**
  * Acquire the repo lock and create a heartbeating maintenance run record. Never waits for a held
@@ -121,14 +134,14 @@ export function acquireMaintenanceRun(opts: {
       acquisitionToken,
     )
     heartbeat.start()
+    inFlightMaintenanceRunIds.add(runId)
     let stopped = false
 
     const release = (finalPhase: 'COMPLETED' | 'FAILED', detailsPatch?: Record<string, unknown>): Effect.Effect<void> =>
       Effect.gen(function* () {
         let finalLockEtag = lockEtag
-        // A failed stop leaves `runEtag` possibly stale (every tick rewrites the RunState), so the terminal
-        // transition re-reads once and retries once on failure. A clean stop returns an authoritative ETag.
-        let stopFailed = false
+        // A failed stop leaves `runEtag` possibly stale (every tick rewrites the RunState); the terminal write
+        // retries either way.
         if (stopped === false) {
           stopped = true
           const stopResult = yield* Effect.tryPromise({
@@ -139,7 +152,6 @@ export function acquireMaintenanceRun(opts: {
             runEtag = stopResult.right.data.runEtag
             finalLockEtag = stopResult.right.data.lockEtag
           } else {
-            stopFailed = true
             // A failed stop still reports the freshest ETags its successful writes produced.
             if (stopResult._tag === 'Right' && stopResult.right.success === false) {
               finalLockEtag = stopResult.right.error.lockEtag
@@ -163,18 +175,19 @@ export function acquireMaintenanceRun(opts: {
           )
           return attempted._tag === 'Right' ? ok(attempted.right) : err(attempted.left)
         }
+        // Every terminal write retries (three bounded attempts), whether or not the stop was clean: a lost conditional
+        // write or a transient store error must not strand the record, and a failed stop only makes it likelier.
         const transitionResult = yield* Effect.promise(async () =>
-          stopFailed === true
-            ? transitionRetryingStaleEtag({
-                config: coordinationConfig,
-                identity,
-                repo,
-                runId,
-                etag: runEtag,
-                logger,
-                attempt,
-              })
-            : attempt(runEtag),
+          transitionRetryingStaleEtag({
+            config: coordinationConfig,
+            identity,
+            repo,
+            runId,
+            etag: runEtag,
+            logger,
+            attempt,
+            ...TERMINAL_WRITE_RETRY,
+          }),
         )
         if (transitionResult.success === false) {
           logger.warn({repo, runId, err: transitionResult.error.message}, 'maintenance-run: terminal transition failed')
@@ -202,7 +215,14 @@ export function acquireMaintenanceRun(opts: {
         if (released.success === false) {
           logger.warn({repo, runId, err: released.error.message}, 'maintenance-run: releaseLock failed')
         }
-      })
+      }).pipe(
+        // Forgotten whatever the writes returned, and even if the release itself is interrupted.
+        Effect.ensuring(
+          Effect.sync(() => {
+            inFlightMaintenanceRunIds.delete(runId)
+          }),
+        ),
+      )
 
     return {outcome: 'acquired' as const, handle: {runId, release}}
   })
