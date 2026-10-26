@@ -52,6 +52,8 @@ sources:
   - packages/runtime/src/coordination/lease-loop.ts
   - packages/runtime/src/coordination/lock-adoption.ts
   - packages/gateway/src/execute/checkout-recovery.ts
+  - packages/gateway/src/execute/run-core.ts
+  - packages/gateway/src/execute/run.ts
   - RFCs/RFC-005-GitHub-Triggers-Events.md
   - RFCs/RFC-010-Delegated-Work.md
   - RFCs/RFC-012-Agent-Execution-Main-Action.md
@@ -283,6 +285,10 @@ Two scoped S3 conditional-write locks (`If-None-Match` / `If-Match`) coordinate 
 **Scope.** This is snapshot corroboration, not fencing. It checks current OpenCode activity at one instant; it does not prevent a stale holder from resuming later, cover detached writers outside OpenCode, prove an old Action finished, or fix ordinary premature-release paths. Hard exclusion (an epoch checked by the workspace on each mutating request) remains future work (#1655, Phase 2).
 
 **Stuck busy status.** While the workspace status endpoint is unavailable (`unknown`), expired gateway leases stay blocked — a stopped container cannot be corroborated, so stopping it does not unblock anything. If a repo's workspace reports `busy` and the lease has expired, first wait for or cancel that repo's running sessions. If it stays busy, pause gateway admissions and restart the workspace service (keep the volume; the restart ends its sessions), wait until its status endpoint is reachable again, then run the guarded `force-release-lock` or retry acquisition — the check now reports `clear`. There is no unguarded bypass.
+
+### Gateway Event Stream Loss
+
+A gateway run listens to one OpenCode event stream (`packages/gateway/src/execute/run-core.ts`) and treats losing it as the end of the run. The subscription allows a single attempt (`sseMaxRetryAttempts: 1`), so a transport failure ends the stream rather than reconnecting past events the run never saw, and the transport error is kept as the failure's cause. A second `server.connected` on one stream also counts as a loss. A silence watchdog (`streamSilenceTimeoutMs`, 30 s, set in `packages/gateway/src/execute/run.ts`) fails the run when no event at all, heartbeats included, arrives for that long. Unlike the inactivity watchdog it is never paused by a drain or a pending approval or question. Every one of these ends the run as `stream-ended` through the termination barrier: the root session is aborted and confirmed quiescent before the lock is released. A drain the completion gate admitted in the same tick as the silence timer still completes the run. The `/event` connection is closed on every exit of the run, so it never outlives the lock and slot. The barrier is also where pending approvals and questions are fail-closed, for every failure it handles, not only these: it rejects them to OpenCode before any root abort, so a button pressed while the barrier is confirming the root is refused (`already-claimed`, then `not-found`) and cannot reach OpenCode.
 
 ### Annotated Action Phase Pipeline
 

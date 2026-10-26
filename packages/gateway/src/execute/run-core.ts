@@ -207,6 +207,14 @@ export interface RunCoreParams {
    */
   readonly onHumanWaitTerminal?: (listener: TerminalListener) => () => void
   /**
+   * Silence watchdog for the event stream. When set (> 0), a second inactivity timer starts when the event loop
+   * starts and resets on EVERY raw event (heartbeats included), before any type dispatch. Unlike the activity
+   * watchdog it is never paused (not by a drain, not by a human wait): OpenCode sends a heartbeat every ~10 s, so
+   * a stream with no event at all for this long is dead, whatever the run is waiting on. Its firing fails the run
+   * as `stream-ended` through the termination barrier. Unset: no watchdog.
+   */
+  readonly streamSilenceTimeoutMs?: number
+  /**
    * Optional hook called with each essential tool-action summary string as it is appended.
    * Receives the same summary string that `appendToolSummary` computes — no recomputation.
    * Used by `run.ts` to drive the status controller's `noteActivity`.
@@ -431,6 +439,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     onActivity,
     onBusy,
     inactivityTimeoutMs,
+    streamSilenceTimeoutMs,
     ownershipLedger,
     onOwnershipChange,
   } = params
@@ -663,6 +672,9 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // Follow-up window: a run that adopted background work keeps draining after its children settle, because
   // upstream then injects a follow-up turn on the ROOT, which may be writing to the checkout again. A failure
   // there (cancel, deadline, a dropped stream) takes the same root teardown.
+  // Loop-scoped: aborted on every exit so the `/event` connection never outlives the run (see `subscribe`).
+  const streamController = new AbortController()
+
   async function throwWithBarrier(
     kind: RunCoreErrorKind,
     message: string,
@@ -673,6 +685,17 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     } = {},
   ): Promise<never> {
     const {rootMayBeRunning = false, providerFailureReason, cause} = options
+    // Fail-close the human waits FIRST. The run is over, but the barrier below can take up to 15 s to confirm the
+    // root quiescent, and until the waits are settled an `always` press inside that window could still reach
+    // OpenCode and persist a permission rule. This is the teardown `run.ts`'s `finally` runs again afterwards;
+    // it is idempotent, and neither family sends a second reply for an entry already in flight or gone. Neither
+    // call is awaited: the replies are bounded by their own timeouts and must not delay the root abort.
+    ownershipCoordinator.dispose('run ended')
+    // eslint-disable-next-line no-void
+    void questions?.dispose('run ended')
+    // The run is over: close the event connection with it, whichever path got here (a failure before the event
+    // loop never reaches the loop's own `finally`).
+    streamController.abort()
     liveReconcileClosed = true
     // Nothing after this point reads from either handle: the barrier always ends in a throw, and its decision
     // reads `drainCompletion` only for existence. Disposing here also covers exits before the event loop, whose
@@ -730,8 +753,22 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // Subscribe BEFORE prompt to eliminate the race where permission.asked fires
   // before the SSE listener exists.
   let eventStream: AsyncIterable<unknown>
+  // The SDK would reconnect a failed stream with backoff and replay nothing, so events could be lost while the
+  // run believes it is still listening. One attempt means a transport failure ends the iterator, which takes the
+  // premature-end path below; `onSseError` records why, for the log and the error's cause.
+  let streamError: unknown
   try {
-    const eventsResult = await client.event.subscribe({query: {directory}, signal: combinedSignal})
+    const eventsResult = await client.event.subscribe({
+      query: {directory},
+      // The run's own deadline and cancel, and `streamController`, which every exit of the run aborts: a silence
+      // or replaced-stream failure never aborts `combinedSignal`, and the SDK would otherwise stay parked reading
+      // a socket nobody listens to until the run budget ended.
+      signal: AbortSignal.any([combinedSignal, streamController.signal]),
+      sseMaxRetryAttempts: 1,
+      onSseError: (error: unknown) => {
+        streamError = error
+      },
+    })
     eventStream = eventsResult.stream as AsyncIterable<unknown>
     logger.info({sessionId, directory}, 'run-core: event stream subscribed')
   } catch (error) {
@@ -842,25 +879,12 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     if (emit.length > 0) sink.append(emit)
   }
 
-  // Wrap the raw event stream in an abort-aware iterator so we do not block
-  // indefinitely waiting for the next event when the signal fires mid-stream.
-  // The inner generator races each `next()` call against the abort signal so
-  // the loop exits promptly even when the SSE server is silent.
-  //
-  // `iterationSignal` additionally includes `drainDoneController.signal` so the
-  // loop also unblocks the instant the ledger reports drain-complete, rather
-  // than waiting for the next SSE event that may never arrive. Every existing
-  // `combinedSignal.aborted` check below is unaffected — it still means
-  // exactly "timeout/inactivity/cancel", never "drain finished".
-  const iterationSignal =
-    ledger === undefined ? combinedSignal : AbortSignal.any([combinedSignal, drainDoneController.signal])
-  const abortableStream = makeAbortableStream(eventStream, iterationSignal)
-
   // Observability counters (#1101): disambiguate a genuine workspace hang (zero events
   // observed) from an event-delivery/routing gap (events arrived but none reset the
   // inactivity timer, e.g. session-mismatched or unrecognized event types).
   let totalEvents = 0
   let activityEvents = 0
+  let serverConnectedCount = 0
   let lastEventType: string | undefined
 
   // Marks a real run-activity event: bumps the activity counter and re-arms the
@@ -966,11 +990,34 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       drainCompletion.noteRootActivity()
   }
 
+  // The silence watchdog starts here (the primitive arms on creation), immediately before the `try` whose `finally`
+  // disposes it, so nothing can throw in between and leak it. It feeds only the loop's own abort: the wall-clock and
+  // activity signals keep their meaning for every check on `combinedSignal`.
+  const silenceTimer = createInactivityTimer({timeoutMs: streamSilenceTimeoutMs ?? 0})
+  //
+  // The raw event stream is wrapped in an abort-aware iterator so the loop does not block indefinitely waiting for
+  // the next event when a signal fires mid-stream: the inner generator races each `next()` call against the abort
+  // signal, so the loop exits promptly even when the SSE server is silent. That signal additionally includes
+  // `drainDoneController.signal` so the loop also unblocks the instant the ledger reports drain-complete, rather than
+  // waiting for an event that may never arrive. Every `combinedSignal.aborted` check below is unaffected: it still
+  // means exactly "timeout/inactivity/cancel", never "drain finished" or "silent".
+  const abortableStream = makeAbortableStream(
+    eventStream,
+    AbortSignal.any([
+      combinedSignal,
+      ...(ledger === undefined ? [] : [drainDoneController.signal]),
+      silenceTimer.signal,
+    ]),
+  )
+
   try {
     for await (const rawEvent of abortableStream) {
       // Check abort at the top of each iteration so we exit as soon as the signal
       // fires, even if the stream itself keeps yielding events.
       if (combinedSignal.aborted) break
+
+      // Any event, heartbeats included, proves the stream is alive. Before type dispatch, so no branch can skip it.
+      silenceTimer.reset()
 
       const eventType = getEventKind(rawEvent)
       const eventPayload = getEventPayload(rawEvent)
@@ -1395,6 +1442,23 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
           const retryFailure = failureFromRetryStatus(getObjectProperty(eventPayload, 'status'))
           if (retryFailure !== null) throw await failFromProvider(retryFailure, 'session.status', true)
         }
+      } else if (eventType === 'server.connected') {
+        // The server announces a stream once, when it opens. A second announcement means the connection was
+        // replaced, and events in between were never delivered: this run can no longer trust what it saw.
+        serverConnectedCount += 1
+        if (serverConnectedCount > 1) {
+          logger.error(
+            {sessionId, totalEvents, activityEvents, lastEventType},
+            'run-core: event stream announced itself again — stream was replaced',
+          )
+          throw await throwWithBarrier(
+            'stream-ended',
+            'Event stream was replaced (a second server.connected arrived)',
+            {
+              rootMayBeRunning: true,
+            },
+          )
+        }
       } else {
         // Unrecognized event type — log at debug so a lost-event/routing gap (events arriving
         // as types we do not handle) is visible rather than silently falling through.
@@ -1418,6 +1482,9 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     // The explicit clearInactivity() calls on the session.idle and session.error paths are
     // kept as defensive double-clears — pause()/dispose() on an already-cleared timer is a no-op.
     inactivityTimer.dispose()
+    silenceTimer.dispose()
+    // Every exit of the loop closes the connection: the SDK's reader is otherwise left parked on a socket.
+    streamController.abort()
     liveReconcileClosed = true
     reconciler?.dispose()
     // No validation result may admit success once the loop has exited, and its retry timer must not leak.
@@ -1434,7 +1501,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
 
   // Drain completed successfully: the ledger reported drain-complete and
   // `drainDoneController` unblocked the stream — NOT a failure path. Checked
-  // before `combinedSignal.aborted` because both signals feed `iterationSignal`
+  // before `combinedSignal.aborted` because both signals feed the loop's abort
   // and only one can be responsible for a given exit.
   if (combinedSignal.aborted === false && drainDoneController.signal.aborted === true) {
     logger.info(
@@ -1444,6 +1511,23 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     onBusy?.(false)
     clearInactivity()
     return
+  }
+
+  // The silence watchdog is classified by its own signal, ahead of the drain-timeout, inactivity and wall-clock
+  // branches below: a silent stream is a lost stream whichever of those deadlines fired alongside it, and must not
+  // be reported as any of them. It sits after the drain-complete success above on purpose: a drain the gate admitted
+  // (REST-validated) in the same tick as the silence timer is a completed run. The disposed timer cannot fire after
+  // a run that already returned.
+  if (silenceTimer.signal.aborted) {
+    logger.error(
+      {sessionId, totalEvents, activityEvents, lastEventType, silenceMs: streamSilenceTimeoutMs},
+      'run-core: event stream silent — failing the run',
+    )
+    throw await throwWithBarrier(
+      'stream-ended',
+      `Event stream silent for ${Math.round((streamSilenceTimeoutMs ?? 0) / 1000)}s`,
+      {rootMayBeRunning: true},
+    )
   }
 
   // Stream exhausted (loop exited normally or via break). Distinguish timeout from premature close.
@@ -1484,11 +1568,18 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // Stream closed without session.idle and not aborted by us → OpenCode
   // may still be working; mark as failed so the run is not silently completed.
   logger.error(
-    {sessionId, totalEvents, activityEvents, lastEventType},
+    {
+      sessionId,
+      totalEvents,
+      activityEvents,
+      lastEventType,
+      ...(streamError === undefined ? {} : {streamError: toErrorMessage(streamError)}),
+    },
     'run-core: event stream closed before session.idle',
   )
   throw await throwWithBarrier('stream-ended', 'Event stream closed before session.idle was received', {
     rootMayBeRunning: true,
+    ...(streamError === undefined ? {} : {cause: streamError}),
   })
 }
 
