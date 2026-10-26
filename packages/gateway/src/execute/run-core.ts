@@ -647,7 +647,6 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       isReplyDelivered: parts => replyDelivery.covers(parts),
       // The only path that completes a drain: an admitted validation unblocks the stream.
       onAdmitted: () => {
-        if (runId !== undefined) clearWaitReason(runId)
         drainDoneController.abort()
       },
       // Why the gate has not admitted the run yet, for the operator status (in-process only, cleared on every exit).
