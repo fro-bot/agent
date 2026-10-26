@@ -29,6 +29,7 @@ import {
   DEFAULT_STALE_THRESHOLD_MS,
   err,
   redactSensitiveFields,
+  toErrorMessage,
 } from '@fro-bot/runtime'
 import {Effect} from 'effect'
 import {composeQuestionHooks, createDiscordQuestionOnRegistered} from './approvals/discord-question-transport.js'
@@ -1247,6 +1248,13 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       pass: createStrandedRunPass({
         recoverDeps,
         isOwned: isRunOwnedByThisProcess,
+        // A swept run has no run-core to tell the observation manager it ended, so its SSE subscribers would wait
+        // out their max duration; the swept state is the terminal frame.
+        observeTerminal: state => {
+          runObservationManager.observe(state).catch((error: unknown) => {
+            logger.warn({err: toErrorMessage(error)}, 'stranded-run sweep: runObserver.observe failed')
+          })
+        },
       }),
       logger,
     })

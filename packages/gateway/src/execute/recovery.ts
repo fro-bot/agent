@@ -64,8 +64,15 @@ export interface RecoverStaleRunsOptions {
   readonly requireQuiescence?: boolean
   /** The note posted to the run's thread after the record is written. */
   readonly note?: string
-  /** Aborting ends the pass between repos and between runs. */
+  /** Aborting ends the pass between repos and between runs, and cuts the scan of a repo short between records. */
   readonly signal?: AbortSignal
+  /** Read only run records modified at or after this time (see `FindStaleRunsOptions.modifiedSince`). Default: all. */
+  readonly modifiedSince?: Date
+  /**
+   * Called with the written state after a run is terminalized, so a run observer can close the run's subscribers. It
+   * is best-effort: a throw is swallowed and never stops the pass.
+   */
+  readonly observeTerminal?: (state: RunState) => void
 }
 
 export interface RecoverStaleRunsDeps {
@@ -167,7 +174,10 @@ export async function recoverStaleRuns(
     const repo = `${binding.owner}/${binding.repo}`
 
     try {
-      const staleResult = await findStaleRuns(coordinationConfig, identity, repo, coordLogger)
+      const staleResult = await findStaleRuns(coordinationConfig, identity, repo, coordLogger, {
+        ...(signal === undefined ? {} : {signal}),
+        ...(options.modifiedSince === undefined ? {} : {modifiedSince: options.modifiedSince}),
+      })
       if (staleResult.success === false) {
         logger.warn({repo, err: staleResult.error.message}, 'recovery: findStaleRuns failed — skipping repo')
         continue
@@ -322,6 +332,11 @@ async function recoverOneRun(opts: RecoverOneRunOpts): Promise<void> {
     return
   }
   logger.info({runId: run.run_id, repo}, 'recovery: run transitioned to FAILED')
+  try {
+    options.observeTerminal?.(transitionResult.data.state)
+  } catch (error: unknown) {
+    logger.warn({runId: run.run_id, repo, err: toErrorMessage(error)}, 'recovery: run observer threw — continuing')
+  }
 
   // ── 3. Best-effort thread note ───────────────────────────────────────────
   try {

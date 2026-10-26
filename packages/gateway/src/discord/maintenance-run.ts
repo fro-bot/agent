@@ -54,10 +54,6 @@ export type AcquireMaintenanceRunResult =
   | {readonly outcome: 'error'; readonly message: string}
 
 /**
- * Acquire the repo lock and create a heartbeating maintenance run record. Never waits for a held
- * lock \u2014 `lock-held` is returned immediately so the caller can refuse with a named reason.
- */
-/**
  * Run ids of maintenance runs whose heartbeat is live in this process. A maintenance run heartbeats its record like any
  * run but is not in the abort registry, so the stranded-run sweep asks this set before it treats a stale-looking
  * EXECUTING record as orphaned. An id is added once the record exists and removed when the release finishes, whatever
@@ -70,6 +66,10 @@ export function isMaintenanceRunInFlight(runId: string): boolean {
   return inFlightMaintenanceRunIds.has(runId)
 }
 
+/**
+ * Acquire the repo lock and create a heartbeating maintenance run record. Never waits for a held
+ * lock \u2014 `lock-held` is returned immediately so the caller can refuse with a named reason.
+ */
 export function acquireMaintenanceRun(opts: {
   readonly coordinationConfig: CoordinationConfig
   readonly identity: string

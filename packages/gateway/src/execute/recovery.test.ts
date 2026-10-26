@@ -640,6 +640,99 @@ describe('recoverStaleRuns — options for the periodic sweep', () => {
     expect(mockTransitionRun).not.toHaveBeenCalled()
   })
 
+  it('hands findStaleRuns the pass signal and the read window, and startup recovery neither', async () => {
+    // #given
+    const controller = new AbortController()
+    const modifiedSince = new Date('2026-04-24T17:00:00.000Z')
+    const {deps} = makeDeps()
+
+    // #when
+    await recoverStaleRuns(deps, {requireQuiescence: false, signal: controller.signal, modifiedSince})
+    await recoverStaleRuns(deps)
+
+    // #then
+    expect(mockFindStaleRuns.mock.calls[0]?.[4]).toEqual({signal: controller.signal, modifiedSince})
+    expect(mockFindStaleRuns.mock.calls[1]?.[4]).toEqual({})
+  })
+
+  it('tells the observer about a run it terminalized, and only then', async () => {
+    // #given two stale runs; the second one loses the compare-and-swap
+    mockFindStaleRuns.mockResolvedValue({
+      success: true,
+      data: [makeStaleRun(), makeStaleRun({run_id: 'run-lost'})],
+    })
+    mockGetRunKey.mockImplementation((_config, _identity, _repo, runId) => ({
+      success: true,
+      data: `state/identity/acme/widget/runs/${runId}.json`,
+    }))
+    const {config} = makeCoordinationConfig()
+    vi.mocked(config.storeAdapter.getObject as NonNullable<typeof config.storeAdapter.getObject>).mockResolvedValue({
+      success: true,
+      data: {data: JSON.stringify(makeStaleRun()), etag: RUN_ETAG},
+    })
+    const failed = makeStaleRun({phase: 'FAILED'})
+    mockTransitionRun
+      .mockResolvedValueOnce({success: true, data: {etag: 'e2', state: failed}})
+      .mockResolvedValueOnce({success: false, error: new Error('412')})
+    const observeTerminal = vi.fn()
+    const {deps} = makeDeps({coordinationConfig: config})
+
+    // #when
+    await recoverStaleRuns(deps, {requireQuiescence: false, observeTerminal})
+
+    // #then
+    expect(observeTerminal).toHaveBeenCalledExactlyOnceWith(failed)
+  })
+
+  it('does not let a throwing observer stop the thread note or the pass', async () => {
+    // #given
+    mockFindStaleRuns.mockResolvedValue({success: true, data: [makeStaleRun()]})
+    const thread = makeThread()
+    const {deps} = makeDeps({resolveThread: vi.fn().mockResolvedValue(thread)})
+
+    // #when
+    await recoverStaleRuns(deps, {
+      requireQuiescence: false,
+      observeTerminal: () => {
+        throw new Error('observer down')
+      },
+    })
+
+    // #then
+    expect(thread.send).toHaveBeenCalledOnce()
+  })
+
+  it('terminalizes a stale ACKNOWLEDGED run past the pending threshold, and skips a live one', async () => {
+    // #given two ACKNOWLEDGED records whose heartbeat is 40 minutes old, one of them live in this process
+    const old = new Date(Date.now() - 40 * 60_000).toISOString()
+    const stale = {...makeStaleRun({phase: 'ACKNOWLEDGED', run_id: 'run-stale'}), last_heartbeat: old}
+    const live = {...makeStaleRun({phase: 'ACKNOWLEDGED', run_id: 'run-live'}), last_heartbeat: old}
+    mockFindStaleRuns.mockResolvedValue({success: true, data: [live, stale]})
+    mockGetRunKey.mockImplementation((_config, _identity, _repo, runId) => ({
+      success: true,
+      data: `state/identity/acme/widget/runs/${runId}.json`,
+    }))
+    const {config} = makeCoordinationConfig()
+    vi.mocked(config.storeAdapter.getObject as NonNullable<typeof config.storeAdapter.getObject>).mockImplementation(
+      async (key: string) => ({
+        success: true as const,
+        data: {data: JSON.stringify(key.includes('run-live') ? live : stale), etag: RUN_ETAG},
+      }),
+    )
+    const {deps} = makeDeps({coordinationConfig: config})
+
+    // #when
+    await recoverStaleRuns(deps, {
+      phases: new Set<RunPhase>(['EXECUTING', 'ACKNOWLEDGED']),
+      isOwned: runId => runId === 'run-live',
+      requireQuiescence: false,
+    })
+
+    // #then
+    expect(mockTransitionRun).toHaveBeenCalledOnce()
+    expect(mockTransitionRun.mock.calls[0]?.[3]).toBe('run-stale')
+  })
+
   it('stops between runs once the pass signal aborts', async () => {
     // #given
     mockFindStaleRuns.mockResolvedValue({

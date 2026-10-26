@@ -65,6 +65,7 @@ import {toOperatorFailureKind} from '../operator-contract/run-status.js'
 import {canonicalWorkspaceTarget} from '../workspace-api/client.js'
 import {abortRegistry} from './abort-registry.js'
 import {settleAmbiguousRecovery, tryAutoRecoverDirtyCheckout} from './checkout-recovery.js'
+import {markRunEnded, markRunLive} from './live-run-registry.js'
 import {releaseLockOrByOwnership} from './lock-release.js'
 import {attachOpencode} from './opencode-attach.js'
 import {
@@ -727,6 +728,8 @@ function scheduleQuarantineRelease(opts: ScheduleQuarantineReleaseOpts): void {
           'run: heartbeat.stop failed at quarantine-window expiry — lease will still lapse via TTL',
         )
       }
+      // The heartbeat no longer writes this record, so a stale one is now the sweep's to repair.
+      markRunEnded(runId)
 
       if (deps.isShuttingDown?.() === true) {
         try {
@@ -1009,6 +1012,9 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
     // ACK succeeded — mark pre-ACK section complete so the dual-finally catch does not run.
     preAckCompleted = true
+    // From here to the true end of the run (the outer finally, or the quarantine hold's deferred stop) the stranded-run
+    // sweep must treat this record as owned, however stale its heartbeat looks.
+    markRunLive(runId)
 
     let runEtag = ackResult.data.etag
 
@@ -1823,6 +1829,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         const quarantineDetailsPatch: Record<string, unknown> = {
           quarantined: true,
           // Audit evidence for a later takeover decision; not consulted for any gating.
+          // A lower bound: computed before the terminal write's retries, which delay the hold's real start.
           quarantineHoldUntil: new Date(Date.now() + QUARANTINE_HOLD_WINDOW_MS).toISOString(),
           ...failureDetailsPatch(execError),
         }
@@ -2077,55 +2084,64 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         if (failedStateForNotify !== undefined) {
           notifyObserverBestEffort(deps, failedStateForNotify)
         }
-        // The operator is told whatever the write result: the record is the sweep's to repair, the failure is real.
-        // eslint-disable-next-line no-void
-        void deps.operatorPushDispatcher?.dispatchRunFailed(runId, toOperatorFailureKind(inFlightFailureKind))
+        // The write can take up to ~27 s with its retries; an operator cancel that landed meanwhile owns the user's
+        // message, so the failure reply and push are skipped (the cancel notice is the user's message).
+        const cancelledDuringFailedWrite = abortRegistry.isAborted(runId)
+        if (cancelledDuringFailedWrite) {
+          logger.info({repo, runId}, 'run: operator cancel landed during the FAILED write — skipping the failure reply')
+        } else {
+          // The operator is told whatever the write result: the record is the sweep's to repair, the failure is real.
+          // eslint-disable-next-line no-void
+          void deps.operatorPushDispatcher?.dispatchRunFailed(runId, toOperatorFailureKind(inFlightFailureKind))
+        }
 
-        // Coarse user message — no internal detail
-        const timeoutDuration = formatTimeoutDuration(runTimeoutMs)
-        const inactivityDuration = formatTimeoutDuration(runInactivityTimeoutMs)
-        const hasVisibleOutput = replySink.hasVisibleOutput() === true
-        const userMessage = withProvenanceLine(
-          isTimeout === true
-            ? hasVisibleOutput === true
-              ? `The task reached the ${timeoutDuration} time limit after posting updates above. Start a new @fro-bot request with what to do next and include any needed context from the output above.`
-              : `The task reached the ${timeoutDuration} time limit. Please try again.`
-            : isInactivityTimeout === true
+        if (cancelledDuringFailedWrite === false) {
+          // Coarse user message — no internal detail
+          const timeoutDuration = formatTimeoutDuration(runTimeoutMs)
+          const inactivityDuration = formatTimeoutDuration(runInactivityTimeoutMs)
+          const hasVisibleOutput = replySink.hasVisibleOutput() === true
+          const userMessage = withProvenanceLine(
+            isTimeout === true
               ? hasVisibleOutput === true
-                ? `The task stopped producing output for ${inactivityDuration} after posting updates above. Start a new @fro-bot request with what to do next and include any needed context from the output above.`
-                : `The task stopped producing output for ${inactivityDuration}. Please try again.`
-              : isDrainTimeout === true
+                ? `The task reached the ${timeoutDuration} time limit after posting updates above. Start a new @fro-bot request with what to do next and include any needed context from the output above.`
+                : `The task reached the ${timeoutDuration} time limit. Please try again.`
+              : isInactivityTimeout === true
                 ? hasVisibleOutput === true
-                  ? `The task's background work did not finish within the ${timeoutDuration} time limit and was cancelled. Start a new @fro-bot request with what to do next and include any needed context from the output above.`
-                  : `The task's background work did not finish within the ${timeoutDuration} time limit and was cancelled. Please try again.`
-                : isCheckoutSubstituted === true
-                  ? "The workspace checkout doesn't match this repository. An operator needs to look at it before this can continue."
-                  : isWorkspaceUnavailable === true
-                    ? 'The workspace could not prepare this repository. An operator needs to look at it before this can continue.'
-                    : isReachability === true
-                      ? 'The workspace is not reachable right now. Please try again later.'
-                      : isEmptyPrompt === true
-                        ? 'Nothing to do — please include a task in your message.'
-                        : isStreamEnded === true
-                          ? 'The task stream closed unexpectedly. Please try again.'
-                          : 'The task failed. Please try again.',
-        )
+                  ? `The task stopped producing output for ${inactivityDuration} after posting updates above. Start a new @fro-bot request with what to do next and include any needed context from the output above.`
+                  : `The task stopped producing output for ${inactivityDuration}. Please try again.`
+                : isDrainTimeout === true
+                  ? hasVisibleOutput === true
+                    ? `The task's background work did not finish within the ${timeoutDuration} time limit and was cancelled. Start a new @fro-bot request with what to do next and include any needed context from the output above.`
+                    : `The task's background work did not finish within the ${timeoutDuration} time limit and was cancelled. Please try again.`
+                  : isCheckoutSubstituted === true
+                    ? "The workspace checkout doesn't match this repository. An operator needs to look at it before this can continue."
+                    : isWorkspaceUnavailable === true
+                      ? 'The workspace could not prepare this repository. An operator needs to look at it before this can continue.'
+                      : isReachability === true
+                        ? 'The workspace is not reachable right now. Please try again later.'
+                        : isEmptyPrompt === true
+                          ? 'Nothing to do — please include a task in your message.'
+                          : isStreamEnded === true
+                            ? 'The task stream closed unexpectedly. Please try again.'
+                            : 'The task failed. Please try again.',
+          )
 
-        // ── Status controller failure transition ──────────────────────────────────────────────────
-        // resolveToFailure returns:
-        //   'handled'   → controller edited the status message into the failure note; skip sendMessage.
-        //   'delegated' → no status to edit (or typing-only); post via sendMessage as normal.
-        // Never both — single owner for the failure message.
-        const failureResult = await statusSink.resolveToFailure(userMessage).catch((error: unknown) => {
-          logger.warn({repo, runId, err: String(error)}, 'run: statusController.resolveToFailure failed — delegating')
-          return {transition: 'delegated' as const}
-        })
-        if (failureResult.transition === 'delegated') {
-          const failureSendResult = await replySink.send('thread', {content: userMessage})
-          if (failureSendResult !== undefined) {
-            const result = failureSendResult as {success?: boolean; error?: {message: string}}
-            if (result.success === false && result.error !== undefined) {
-              logger.warn({repo, runId, err: result.error.message}, 'run: failed to send error reply to thread')
+          // ── Status controller failure transition ──────────────────────────────────────────────────
+          // resolveToFailure returns:
+          //   'handled'   → controller edited the status message into the failure note; skip sendMessage.
+          //   'delegated' → no status to edit (or typing-only); post via sendMessage as normal.
+          // Never both — single owner for the failure message.
+          const failureResult = await statusSink.resolveToFailure(userMessage).catch((error: unknown) => {
+            logger.warn({repo, runId, err: String(error)}, 'run: statusController.resolveToFailure failed — delegating')
+            return {transition: 'delegated' as const}
+          })
+          if (failureResult.transition === 'delegated') {
+            const failureSendResult = await replySink.send('thread', {content: userMessage})
+            if (failureSendResult !== undefined) {
+              const result = failureSendResult as {success?: boolean; error?: {message: string}}
+              if (result.success === false && result.error !== undefined) {
+                logger.warn({repo, runId, err: result.error.message}, 'run: failed to send error reply to thread')
+              }
             }
           }
         }
@@ -2205,6 +2221,12 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     }
     throw gateError
   } finally {
+    // The run is over for the sweep's purposes: every terminal write above has finished. A quarantined run stays live
+    // through its hold; `scheduleQuarantineRelease` ends it after the deferred heartbeat stop.
+    if (quarantined === false) {
+      markRunEnded(runId)
+    }
+
     // ── Atomic handoff — replaces bare concurrency.release ──────────────────
     //
     // While the channel slot is still held, attempt to drain the next queued task.

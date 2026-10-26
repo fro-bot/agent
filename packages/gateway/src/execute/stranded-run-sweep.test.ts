@@ -8,6 +8,7 @@ import {
   createStrandedRunSweep,
   isRunOwnedByThisProcess,
   STRANDED_RUN_NOTE,
+  STRANDED_RUN_READ_WINDOW_MS,
   STRANDED_RUN_SWEEP_INTERVAL_MS,
   STRANDED_RUN_SWEEP_PASS_BOUND_MS,
 } from './stranded-run-sweep.js'
@@ -182,6 +183,70 @@ describe('createStrandedRunSweep', () => {
     expect(vi.getTimerCount()).toBe(0)
   })
 
+  it('does not start after it was stopped: a stop that lands before start schedules nothing', async () => {
+    // #given shutdown began while startup recovery was still running
+    const pass = vi.fn(async (_signal: AbortSignal) => {})
+    const sweep = createStrandedRunSweep({pass, logger: makeLogger()})
+    sweep.stop()
+
+    // #when
+    sweep.start()
+    await vi.advanceTimersByTimeAsync(10 * STRANDED_RUN_SWEEP_INTERVAL_MS)
+
+    // #then
+    expect(pass).not.toHaveBeenCalled()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('a pass that ignores its signal is abandoned at the bound, and the next tick runs a new pass', async () => {
+    // #given a pass that never settles and never looks at its signal
+    const pass = vi.fn(async (_signal: AbortSignal) => new Promise<void>(() => {}))
+    const logger = makeLogger()
+    const sweep = createStrandedRunSweep({pass, logger})
+    sweep.start()
+    await vi.advanceTimersByTimeAsync(STRANDED_RUN_SWEEP_INTERVAL_MS)
+    expect(pass).toHaveBeenCalledTimes(1)
+
+    // #when the bound passes
+    await vi.advanceTimersByTimeAsync(STRANDED_RUN_SWEEP_PASS_BOUND_MS)
+
+    // #then it was abandoned, and the following tick started a second pass
+    await vi.advanceTimersByTimeAsync(STRANDED_RUN_SWEEP_INTERVAL_MS)
+    expect(pass.mock.calls.length).toBeGreaterThanOrEqual(2)
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({passBoundMs: STRANDED_RUN_SWEEP_PASS_BOUND_MS}),
+      'stranded-run sweep: pass exceeded its bound — aborting it',
+    )
+    sweep.stop()
+  })
+
+  it('a pass abandoned at the bound that later fails does not log as a fresh failure or unhandled rejection', async () => {
+    // #given a pass that rejects only after the bound
+    let rejectPass: (error: Error) => void = () => {}
+    const pass = vi.fn(
+      async (_signal: AbortSignal) =>
+        new Promise<void>((_resolve, reject) => {
+          rejectPass = reject
+        }),
+    )
+    const unhandled = vi.fn()
+    process.on('unhandledRejection', unhandled)
+    const logger = makeLogger()
+    const sweep = createStrandedRunSweep({pass, logger, intervalMs: 100_000})
+    sweep.start()
+    await vi.advanceTimersByTimeAsync(100_000 + STRANDED_RUN_SWEEP_PASS_BOUND_MS)
+
+    // #when
+    rejectPass(new Error('late'))
+    await vi.advanceTimersByTimeAsync(0)
+
+    // #then
+    expect(unhandled).not.toHaveBeenCalled()
+    expect(logger.error).not.toHaveBeenCalled()
+    process.off('unhandledRejection', unhandled)
+    sweep.stop()
+  })
+
   it('start is idempotent: a second start does not add a second timer', async () => {
     // #given
     const pass = vi.fn(async (_signal: AbortSignal) => {})
@@ -199,14 +264,23 @@ describe('createStrandedRunSweep', () => {
 })
 
 describe('createStrandedRunPass', () => {
-  it('recovers only EXECUTING runs, skips owned ones, ignores the workspace gate, and posts the neutral note', async () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('recovers only EXECUTING and ACKNOWLEDGED runs, never PENDING, skips owned ones, ignores the workspace gate, and posts the neutral note', async () => {
     // #given
     const recoverDeps = {identity: 'gw'} as unknown as RecoverStaleRunsDeps
     const isOwned = vi.fn((runId: string) => runId === 'owned')
     const controller = new AbortController()
+    const observe = vi.fn()
 
     // #when
-    await createStrandedRunPass({recoverDeps, isOwned})(controller.signal)
+    await createStrandedRunPass({recoverDeps, isOwned, observeTerminal: observe})(controller.signal)
 
     // #then
     expect(mockRecoverStaleRuns).toHaveBeenCalledTimes(1)
@@ -217,16 +291,21 @@ describe('createStrandedRunPass', () => {
         isOwned: (runId: string) => boolean
         requireQuiescence: boolean
         note: string
+        modifiedSince: Date
+        observeTerminal: (state: unknown) => void
         signal: AbortSignal
       },
     ]
     expect(passedDeps).toBe(recoverDeps)
-    expect([...options.phases]).toEqual(['EXECUTING'])
+    expect([...options.phases].sort()).toEqual(['ACKNOWLEDGED', 'EXECUTING'])
     expect(options.requireQuiescence).toBe(false)
     expect(options.note).toBe(STRANDED_RUN_NOTE)
+    expect(options.modifiedSince.getTime()).toBe(Date.now() - STRANDED_RUN_READ_WINDOW_MS)
+    expect(STRANDED_RUN_READ_WINDOW_MS).toBe(60 * 60_000)
     expect(options.signal).toBe(controller.signal)
     expect(options.isOwned('owned')).toBe(true)
     expect(options.isOwned('other')).toBe(false)
+    expect(options.observeTerminal).toBe(observe)
   })
 
   it('words the note neutrally: it neither claims a restart nor contradicts a reply that already posted', () => {

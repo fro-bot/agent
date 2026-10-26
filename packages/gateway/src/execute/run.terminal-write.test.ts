@@ -88,7 +88,7 @@ describe('terminal RunState writes retry', () => {
     vi.useRealTimers()
   })
 
-  it('cOMPLETED, with a clean heartbeat stop, re-reads and retries with the stored ETag after a lost write', async () => {
+  it('a COMPLETED write, with a clean heartbeat stop, re-reads and retries with the stored ETag after a lost write', async () => {
     // #given the first COMPLETED write loses its condition, and the record is still EXECUTING under a newer ETag
     setupHappyPath()
     failTerminal('COMPLETED', 1)
@@ -101,7 +101,7 @@ describe('terminal RunState writes retry', () => {
     expect(writesOf('COMPLETED')).toEqual(['run-etag-after-heartbeat', STORED_ETAG])
   })
 
-  it('fAILED succeeds on the third write, after the first two fail', async () => {
+  it('a FAILED write succeeds on the third write, after the first two fail', async () => {
     // #given
     setupHappyPath()
     failTerminal('FAILED', 2)

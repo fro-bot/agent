@@ -7,18 +7,28 @@
  *
  * Lifecycle: an unref'd interval whose first tick is one interval after `start`; a pass never starts while the
  * previous one is running; each pass gets a signal that aborts at `STRANDED_RUN_SWEEP_PASS_BOUND_MS` (the pass stops
- * between repos and runs) and when the sweep is stopped. A failing pass is logged and never stops the ticking.
+ * between repos, runs and records) and when the sweep is stopped. A pass that has not ended by the bound is abandoned,
+ * so one stuck store call cannot stop the ticking. `start` after `stop` does nothing. A failing pass is logged and never stops the ticking.
  */
 
+import type {RunState} from '@fro-bot/runtime'
 import type {GatewayLogger} from '../discord/client.js'
 import type {RecoverStaleRunsDeps} from './recovery.js'
 import {toErrorMessage} from '@fro-bot/runtime'
 import {isMaintenanceRunInFlight} from '../discord/maintenance-run.js'
 import {abortRegistry} from './abort-registry.js'
+import {isRunLive} from './live-run-registry.js'
 import {recoverStaleRuns} from './recovery.js'
 
 /** How often a pass runs. A stranded record is therefore repaired within its stale threshold plus about a minute. */
 export const STRANDED_RUN_SWEEP_INTERVAL_MS = 60_000
+
+/**
+ * A pass reads only run records modified within this window. A run that is alive keeps writing its record every
+ * heartbeat, so a record untouched for an hour is terminal or long dead; the latter is startup recovery's, which scans
+ * everything. It bounds the reads, not the listing.
+ */
+export const STRANDED_RUN_READ_WINDOW_MS = 60 * 60_000
 
 /** How long one pass may run before its signal aborts. Four minutes: well past a normal pass, short of overlapping many. */
 export const STRANDED_RUN_SWEEP_PASS_BOUND_MS = 4 * 60_000
@@ -30,17 +40,20 @@ export const STRANDED_RUN_SWEEP_PASS_BOUND_MS = 4 * 60_000
 export const STRANDED_RUN_NOTE = "This run's status was reconciled: it is no longer running."
 
 /**
- * Whether this process is still running `runId`: a mention or web run (registered in the abort registry for its whole
- * execution) or a maintenance run (heartbeating, but never in the abort registry). Such a record can look stale
+ * Whether this process is still running `runId`: a mention or web run (in the live-run set from its ACKNOWLEDGED commit
+ * to the end of the run or its quarantine hold, and in the abort registry while it executes) or a maintenance run
+ * (heartbeating, but never in the abort registry). Such a record can look stale
  * during a stalled heartbeat tick and must not be terminalized.
  */
 export function isRunOwnedByThisProcess(runId: string): boolean {
-  return abortRegistry.has(runId) || isMaintenanceRunInFlight(runId)
+  return isRunLive(runId) || abortRegistry.has(runId) || isMaintenanceRunInFlight(runId)
 }
 
 export interface StrandedRunPassDeps {
   /** The same wiring startup recovery uses. */
   readonly recoverDeps: RecoverStaleRunsDeps
+  /** Tells the run observer that a swept run is terminal, so its subscribers close instead of waiting it out. */
+  readonly observeTerminal: (state: RunState) => void
   /** Whether this process still owns the run: it is in the abort registry, or it is an in-flight maintenance run. */
   readonly isOwned: (runId: string) => boolean
 }
@@ -53,10 +66,12 @@ export interface StrandedRunPassDeps {
 export function createStrandedRunPass(deps: StrandedRunPassDeps): (signal: AbortSignal) => Promise<void> {
   return async signal =>
     recoverStaleRuns(deps.recoverDeps, {
-      phases: new Set(['EXECUTING']),
+      phases: new Set<RunState['phase']>(['EXECUTING', 'ACKNOWLEDGED']),
       isOwned: deps.isOwned,
       requireQuiescence: false,
       note: STRANDED_RUN_NOTE,
+      modifiedSince: new Date(Date.now() - STRANDED_RUN_READ_WINDOW_MS),
+      observeTerminal: deps.observeTerminal,
       signal,
     })
 }
@@ -86,6 +101,7 @@ export function createStrandedRunSweep(deps: StrandedRunSweepDeps): StrandedRunS
   } = deps
   let timer: ReturnType<typeof setInterval> | undefined
   let running: AbortController | undefined
+  let stopped = false
 
   function tick(): void {
     if (running !== undefined) {
@@ -94,31 +110,45 @@ export function createStrandedRunSweep(deps: StrandedRunSweepDeps): StrandedRunS
     }
     const controller = new AbortController()
     running = controller
-    const bound = setTimeout(() => {
+    let abandoned = false
+    let bound: ReturnType<typeof setTimeout> | undefined
+    const endPass = (): void => {
+      clearTimeout(bound)
+      if (running === controller) running = undefined
+    }
+    // When the bound wins the pass is abandoned and the next tick may start a new one, so a pass stuck in a store call
+    // that ignores its signal cannot wedge the sweep. Whatever the abandoned pass still writes is an ETag-conditional
+    // write, so a late one either lands the same repair or loses.
+    bound = setTimeout(() => {
+      abandoned = true
       logger.warn({passBoundMs}, 'stranded-run sweep: pass exceeded its bound — aborting it')
       controller.abort()
+      endPass()
     }, passBoundMs)
-    // The pass is awaited to the end even after its abort, so two passes never overlap.
     pass(controller.signal)
       .catch((error: unknown) => {
+        if (abandoned) {
+          logger.debug({err: toErrorMessage(error)}, 'stranded-run sweep: abandoned pass ended with an error')
+          return
+        }
         logger.error({err: toErrorMessage(error)}, 'stranded-run sweep: pass failed')
       })
-      .finally(() => {
-        clearTimeout(bound)
-        running = undefined
-      })
+      .finally(endPass)
   }
 
   return {
     start: () => {
-      if (timer !== undefined) return
+      // A stop that landed first (shutdown during startup recovery) wins: nothing is scheduled afterwards.
+      if (stopped || timer !== undefined) return
       timer = setInterval(tick, intervalMs)
       timer.unref()
     },
     stop: () => {
+      stopped = true
       if (timer !== undefined) clearInterval(timer)
       timer = undefined
       running?.abort()
+      running = undefined
     },
   }
 }
