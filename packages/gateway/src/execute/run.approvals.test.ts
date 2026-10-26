@@ -1458,6 +1458,67 @@ describe('approval dispose/shutdown: onDispose fail-closes pending registry entr
     expect(postReply).toHaveBeenCalledWith('req-dispose-1', '/ws/dispose', 'reject')
   })
 
+  it('a stream-ended failure settles a pending approval as run ended, and a late button press finds nothing', async () => {
+    // #given a run that holds a pending approval when its event stream is declared dead
+    const {runMention, STREAM_SILENCE_TIMEOUT_MS} = await import('./run.js')
+    const {RunCoreError} = runCoreModule
+    const {createApprovalRegistry} = await import('../approvals/registry.js')
+    const {createPermissionCoordinator: realCreatePermissionCoordinator} =
+      await vi.importActual<typeof import('../approvals/coordinator.js')>('../approvals/coordinator.js')
+    setupHappyPath()
+
+    const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const registry = createApprovalRegistry({logger})
+    const postReply = vi.fn().mockResolvedValue({ok: true})
+    mockCreatePermissionCoordinator.mockImplementation(coordinatorDeps =>
+      realCreatePermissionCoordinator(coordinatorDeps),
+    )
+    mockRunOpenCodeCore.mockImplementation(async params => {
+      registry.register({
+        requestID: 'req-stream-1',
+        sessionID: 'ses-stream',
+        approvalScopeId: 'chan-stream',
+        directory: '/ws/stream',
+        request: {requestID: 'req-stream-1', sessionID: 'ses-stream', permission: 'bash', patterns: [], title: 'cmd'},
+        effects: {postReply},
+      })
+      params.coordinator?.addOwnedSession('ses-stream')
+      throw new RunCoreError('stream-ended', `Event stream silent for ${STREAM_SILENCE_TIMEOUT_MS / 1000}s`)
+    })
+
+    // #when the run fails
+    await runMention(makeMessage(), makeBinding(), makeDeps({approvalRegistry: registry}))
+    await new Promise(resolve => setTimeout(resolve, 10))
+
+    // #then the approval left the gate through the run-teardown path, rejected on the agent's side
+    expect(registry.has('req-stream-1')).toBe(false)
+    expect(postReply).toHaveBeenCalledExactlyOnceWith('req-stream-1', '/ws/stream', 'reject')
+
+    // #and a button pressed afterwards finds nothing to settle and sends nothing
+    const late = await registry.handleDecision({
+      requestID: 'req-stream-1',
+      approvalScopeId: 'chan-stream',
+      decision: 'once',
+      actor: {kind: 'discord-user', userId: 'user-late'},
+    })
+    expect(late).toBe('not-found')
+    expect(postReply).toHaveBeenCalledTimes(1)
+  })
+
+  it('runs the event loop with the stream silence watchdog set to its 30 s constant', async () => {
+    // #given
+    const {runMention, STREAM_SILENCE_TIMEOUT_MS} = await import('./run.js')
+    setupHappyPath()
+
+    // #when
+    await runMention(makeMessage(), makeBinding(), makeDeps())
+
+    // #then
+    const coreParams = mockRunOpenCodeCore.mock.calls[0]?.[0] as {streamSilenceTimeoutMs?: number}
+    expect(STREAM_SILENCE_TIMEOUT_MS).toBe(30_000)
+    expect(coreParams.streamSilenceTimeoutMs).toBe(STREAM_SILENCE_TIMEOUT_MS)
+  })
+
   it('registry.disposeAll fail-closes all pending entries across all sessions (gateway shutdown)', async () => {
     // #given — multiple pending entries across different sessions
     const {createApprovalRegistry} = await import('../approvals/registry.js')
