@@ -7,10 +7,17 @@
  * in a checkout the next run may already own. Absence from `session.status` therefore proves nothing: a root that
  * has not started yet is absent too.
  *
- * Positive evidence that the root stopped is a terminal assistant reply to its latest user message: the last message
- * in the session is an assistant message answering that user message with `time.completed` set (an abort writes
- * `MessageAbortedError` and a completion time, so an aborted reply counts). A reply to an older turn does not.
- * Without such a reply the root cannot be confirmed stopped.
+ * Positive evidence that the root stopped is a turn-terminal assistant reply to its latest user message: the last
+ * message in the session is an assistant message answering that user message that is either
+ * - a qualified terminal reply (`isQualifiedTerminalReply`, the rule the completion gate uses): completed, no error,
+ *   a `finish` other than `tool-calls` and `unknown`, and no blocking tool part. `time.completed` alone is not enough:
+ *   OpenCode sets it when it cleans up an intermediate step too (`finish: 'tool-calls'`), and the turn goes on; or
+ * - an aborted reply: `MessageAbortedError` with `time.completed`. An abort sets the error and leaves `finish` unset,
+ *   or at whatever the last finished step wrote, so no finish rule applies to it.
+ * A reply to an older turn does not count. Without such a reply the root cannot be confirmed stopped.
+ *
+ * The messages are read after the liveness reading, so a cold root can start in between. `probeRootStop` therefore
+ * takes one more liveness reading after it has read terminal-looking evidence: live then means `busy`.
  *
  * That evidence only rules out the turns that already exist. While background work is open (`followUpPossible`) OpenCode
  * starts root turns by itself: a child that finishes, or is cancelled by the abort, makes it inject a notice turn into
@@ -21,8 +28,8 @@
  * aborting the root on every busy observation.
  *
  * Two pieces build on that:
- * - `probeRootStop` is one observation: confirmed (not live, with that reply), busy (live, so it is aborted again),
- *   or unconfirmed (not live and no reply yet, or the lookup failed).
+ * - `probeRootStop` is one observation: confirmed (not live before and after reading that reply), busy (live, so it
+ *   is aborted again), or unconfirmed (not live and no reply yet, or a lookup failed).
  * - `startQuarantineRootWatch` keeps probing for the whole quarantine hold, so a prompt that started after the
  *   barrier gave up is aborted as soon as it shows up instead of running through the hold unchecked.
  */
@@ -31,6 +38,10 @@ import type {LedgerReconcileAdapter, SessionClient} from '@fro-bot/runtime'
 import type {GatewayLogger} from '../discord/client.js'
 
 import {formatSdkError, getNumberProperty, getObjectProperty, getStringProperty, toErrorMessage} from '@fro-bot/runtime'
+
+import {isQualifiedTerminalReply} from './drain-completion.js'
+
+const ABORTED_ERROR_NAME = 'MessageAbortedError'
 
 /** Cadence of the root-quiescence probe (inside the barrier's budget and during the quarantine hold). */
 export const ROOT_QUIESCENCE_POLL_INTERVAL_MS = 500
@@ -102,7 +113,7 @@ export function rootHasTerminalReply(messages: unknown, streamedUserMessageIds: 
   if (!Array.isArray(messages)) return false
   const userMessageIds = new Set<string>()
   let latestUserId: string | null = null
-  let last: {readonly role: string | null; readonly info: unknown} | null = null
+  let last: {readonly role: string | null; readonly info: unknown; readonly parts: unknown} | null = null
   for (const message of messages as readonly unknown[]) {
     const info = getObjectProperty(message, 'info')
     const id = getStringProperty(info, 'id')
@@ -112,7 +123,7 @@ export function rootHasTerminalReply(messages: unknown, streamedUserMessageIds: 
       userMessageIds.add(id)
       latestUserId = id
     }
-    last = {role, info}
+    last = {role, info, parts: getObjectProperty(message, 'parts')}
   }
   if (latestUserId === null || last === null) return false
   if (last.role !== 'assistant') return false
@@ -120,7 +131,11 @@ export function rootHasTerminalReply(messages: unknown, streamedUserMessageIds: 
     if (!userMessageIds.has(streamed)) return false
   }
   if (getStringProperty(last.info, 'parentID') !== latestUserId) return false
-  return getNumberProperty(getObjectProperty(last.info, 'time'), 'completed') !== null
+  if (isQualifiedTerminalReply(last, latestUserId)) return true
+  return (
+    getStringProperty(getObjectProperty(last.info, 'error'), 'name') === ABORTED_ERROR_NAME &&
+    getNumberProperty(getObjectProperty(last.info, 'time'), 'completed') !== null
+  )
 }
 
 export type RootProbe = 'confirmed' | 'busy' | 'unconfirmed'
@@ -155,7 +170,12 @@ export async function probeRootStop(options: ProbeRootStopOptions): Promise<Root
     const response = (await client.session.messages({path: {id: rootSessionId}, query: {directory}, signal})) as
       {readonly error?: unknown; readonly data?: unknown} | undefined
     if (response === undefined || response.error != null) return 'unconfirmed'
-    return rootHasTerminalReply(response.data, streamedUserMessageIds()) ? 'confirmed' : 'unconfirmed'
+    if (!rootHasTerminalReply(response.data, streamedUserMessageIds())) return 'unconfirmed'
+    // A cold root can start between the first reading and the messages read. Only a root that is still absent now,
+    // after the evidence was read, is stopped.
+    const after = await adapter.liveSessionIds(signal)
+    if (after.success === false) return 'unconfirmed'
+    return after.data.has(rootSessionId) ? 'busy' : 'confirmed'
   } catch {
     return 'unconfirmed'
   }

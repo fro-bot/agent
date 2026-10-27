@@ -22,10 +22,26 @@ const ROOT = 'sess-root'
 const NONE: ReadonlySet<string> = new Set<string>()
 
 const user = (id: string): object => ({info: {id, role: 'user'}, parts: []})
-const reply = (id: string, parentID: string, time: object = {completed: 2}): object => ({
-  info: {id, role: 'assistant', parentID, time},
+/** A turn-terminal reply by default: completed, with a `stop` finish and no tool parts. */
+const reply = (
+  id: string,
+  parentID: string,
+  time: object = {completed: 2},
+  extra: object = {finish: 'stop'},
+): object => ({
+  info: {id, role: 'assistant', parentID, time, ...extra},
   parts: [],
 })
+/** An intermediate step: upstream sets `time.completed` on it too, with `finish: 'tool-calls'`. */
+const toolCallsStep = (id: string, parentID: string): object =>
+  reply(id, parentID, {completed: 2}, {finish: 'tool-calls'})
+const abortedReply = (id: string, parentID: string, extra: object = {}): object =>
+  reply(
+    id,
+    parentID,
+    {completed: 2},
+    {error: {name: 'MessageAbortedError', data: {message: 'The operation was aborted.'}}, ...extra},
+  )
 
 function makeLogger(): GatewayLogger {
   return {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
@@ -38,6 +54,49 @@ describe('rootHasTerminalReply', () => {
 
   it('accepts an aborted reply (an error and a completion time)', () => {
     expect(rootHasTerminalReply(stoppedRootMessages(ROOT), NONE)).toBe(true)
+  })
+
+  it.each([
+    ['an aborted step that never got a finish', abortedReply('a1', 'u1')],
+    ['an aborted step that had already finished a tool-calls step', abortedReply('a1', 'u1', {finish: 'tool-calls'})],
+  ])('accepts %s', (_label, aborted) => {
+    expect(rootHasTerminalReply([user('u1'), aborted], NONE)).toBe(true)
+  })
+
+  it.each([
+    ['an intermediate tool-calls step', toolCallsStep('a1', 'u1')],
+    ['a step with an unknown finish', reply('a1', 'u1', {completed: 2}, {finish: 'unknown'})],
+    ['a completed step that never got a finish', reply('a1', 'u1', {completed: 2}, {})],
+    [
+      'a failed step (an error that is not an abort)',
+      reply('a1', 'u1', {completed: 2}, {finish: 'error', error: {name: 'APIError'}}),
+    ],
+    [
+      'a step that still has a tool part running',
+      {
+        info: {id: 'a1', role: 'assistant', parentID: 'u1', time: {completed: 2}, finish: 'stop'},
+        parts: [{type: 'tool', state: {status: 'running'}}],
+      },
+    ],
+    ['an aborted reply that answers an older message', abortedReply('a1', 'u0')],
+    [
+      'an aborted reply that has no completion time yet (still cleaning up)',
+      abortedReply('a1', 'u1', {time: {created: 1}}),
+    ],
+  ])('rejects %s', (_label, last) => {
+    expect(rootHasTerminalReply([user('u0'), user('u1'), last], NONE)).toBe(false)
+  })
+
+  it('accepts a normal stop reply whose only tool parts were interrupted by an abort', () => {
+    const interrupted = {
+      type: 'tool',
+      state: {status: 'error', error: 'Tool execution aborted', metadata: {interrupted: true}},
+    }
+    const last = {
+      info: {id: 'a1', role: 'assistant', parentID: 'u1', time: {completed: 2}, finish: 'stop'},
+      parts: [interrupted],
+    }
+    expect(rootHasTerminalReply([user('u1'), last], NONE)).toBe(true)
   })
 
   it.each([
@@ -97,6 +156,46 @@ describe('probeRootStop', () => {
   it('is confirmed when the root is absent and its latest prompt has a terminal reply', async () => {
     const {client, adapter} = makeFixtures({messages: () => stoppedRootMessages(ROOT)})
     expect(await probeRootStop({...base, client, adapter, signal: new AbortController().signal})).toBe('confirmed')
+  })
+
+  it('takes a final liveness reading after the reply evidence: a root that started in between is busy, not confirmed', async () => {
+    // #given absent at the first reading, a terminal-looking reply, then live at the second (a new step started)
+    let readings = 0
+    const {client, adapter, messages} = makeFixtures({
+      live: () => {
+        readings += 1
+        return readings === 1 ? [] : [ROOT]
+      },
+      messages: () => [user('u1'), reply('a1', 'u1')],
+    })
+
+    // #then
+    expect(await probeRootStop({...base, client, adapter, signal: new AbortController().signal})).toBe('busy')
+    expect(messages).toHaveBeenCalledTimes(1)
+    expect(adapter.liveSessionIds).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not confirm when the root started between the readings and left an intermediate tool-calls step', async () => {
+    // #given a cold root absent at the first reading that then runs a whole tool-calling step before the messages read
+    const {client, adapter} = makeFixtures({messages: () => [user('u1'), toolCallsStep('a1', 'u1')]})
+
+    // #then a completed intermediate step is not a stopped turn, and there is nothing to confirm from
+    expect(await probeRootStop({...base, client, adapter, signal: new AbortController().signal})).toBe('unconfirmed')
+    expect(adapter.liveSessionIds).toHaveBeenCalledTimes(1)
+  })
+
+  it('is unconfirmed when the final liveness reading fails', async () => {
+    let readings = 0
+    const {client} = makeFixtures({messages: () => [user('u1'), reply('a1', 'u1')]})
+    const adapter = {
+      liveSessionIds: vi.fn(async () => {
+        readings += 1
+        return readings === 1
+          ? {success: true as const, data: new Set<string>()}
+          : {success: false as const, error: new Error('down')}
+      }),
+    } as unknown as LedgerReconcileAdapter
+    expect(await probeRootStop({...base, client, adapter, signal: new AbortController().signal})).toBe('unconfirmed')
   })
 
   it('with a follow-up possible, a terminal reply to the latest message still does not confirm', async () => {
@@ -177,6 +276,45 @@ describe('startQuarantineRootWatch', () => {
       expect.stringContaining('confirmed stopped'),
     )
     expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('a root that starts after the first reading and leaves an intermediate step is aborted, not confirmed', async () => {
+    // #given the first probe sees an absent root and an intermediate tool-calls step; the next sees the root running
+    let polls = 0
+    const fixtures = makeFixtures({
+      live: () => {
+        polls += 1
+        return polls >= 2 ? [ROOT] : []
+      },
+      messages: () => [user('u1'), toolCallsStep('a1', 'u1')],
+    })
+    const {logger} = startWatch(fixtures, {windowMs: 10_000})
+
+    // #when
+    await vi.advanceTimersByTimeAsync(ROOT_QUIESCENCE_POLL_INTERVAL_MS * 4)
+
+    // #then the watch did not end on the intermediate step, and aborted the busy root
+    expect(logger.info).not.toHaveBeenCalledWith(expect.anything(), expect.stringContaining('confirmed stopped'))
+    expect(fixtures.abort).toHaveBeenCalled()
+  })
+
+  it('a request that hits its cap does not stop the watch: it resumes and aborts the root before the hold ends', async () => {
+    // #given the first liveness lookup never answers, and the root is running from then on
+    const fixtures = makeFixtures({live: () => [ROOT]})
+    vi.mocked(fixtures.adapter.liveSessionIds).mockReturnValueOnce(new Promise<never>(() => undefined))
+    startWatch(fixtures, {windowMs: 60_000})
+
+    // #when just past the cap
+    await vi.advanceTimersByTimeAsync(ROOT_WATCH_REQUEST_TIMEOUT_MS - 100)
+
+    // #then nothing was aborted yet: the hung request still holds the tick
+    expect(fixtures.abort).not.toHaveBeenCalled()
+
+    // #when the cap passes and polling resumes
+    await vi.advanceTimersByTimeAsync(ROOT_QUIESCENCE_POLL_INTERVAL_MS * 3 + 200)
+
+    // #then the busy root was aborted well before the hold would have ended
+    expect(fixtures.abort).toHaveBeenCalled()
   })
 
   it('with a follow-up possible, never ends on a terminal reply: it aborts each busy observation until the window closes', async () => {
