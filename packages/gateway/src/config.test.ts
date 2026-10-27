@@ -3901,11 +3901,11 @@ describe('operatorPush config', () => {
     // OperatorPushTriggerKind to 1.10.0. The waiting_for_approval / waiting_for_question run-summary statuses
     // and the question push deep link then bumped it to 1.11.0. The approval push run ID,
     // RunSummary.prompt and providerFailureReason then bumped it to 1.12.0. The provider-quota-exceeded
-    // reason then bumped it to 1.13.0.
+    // reason then bumped it to 1.13.0, and the optional OperatorRunStatus.waitReason to 1.14.0.
     const {OPERATOR_CONTRACT_VERSION} = await import('./operator-contract/index.js')
 
     // #when / #then
-    expect(OPERATOR_CONTRACT_VERSION).toBe('1.13.0')
+    expect(OPERATOR_CONTRACT_VERSION).toBe('1.14.0')
   })
 })
 

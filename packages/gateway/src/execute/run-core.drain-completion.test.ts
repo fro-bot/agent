@@ -29,6 +29,7 @@ import {createQuestionCoordinator} from '../approvals/question-coordinator.js'
 import {createQuestionRegistry} from '../approvals/question-registry.js'
 import {createRequestGate} from '../approvals/request-gate.js'
 import {RunCoreError, runOpenCodeCore} from './run-core.js'
+import {getWaitReason} from './wait-reason-registry.js'
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -291,6 +292,7 @@ interface RunOptions {
   /** `client.session.abort` implementation (the root and child teardown). Default: resolves OK immediately. */
   readonly sessionAbort?: (args: unknown) => Promise<unknown>
   readonly onBusy?: (busy: boolean) => void
+  readonly runId?: string
 }
 
 function startRun(options: RunOptions = {}) {
@@ -373,6 +375,7 @@ function startRun(options: RunOptions = {}) {
     onBusy,
     ...(options.withQuestions === true ? {questions, onHumanWaitTerminal: gate.onTerminal} : {}),
     ...(options.inactivityTimeoutMs === undefined ? {} : {inactivityTimeoutMs: options.inactivityTimeoutMs}),
+    ...(options.runId === undefined ? {} : {runId: options.runId}),
     ...(ownershipLedger === undefined ? {} : {ownershipLedger}),
   }).then(
     () => {
@@ -2113,5 +2116,112 @@ describe('runOpenCodeCore — drain completion for background work', () => {
         expectKind(run.outcome(), 'drain-timeout')
       },
     )
+  })
+})
+
+describe('runOpenCodeCore — the wait reason of a draining run', () => {
+  const RUN_ID = 'run-wait-reason'
+
+  it('records why the gate declined while the run drains, and forgets it on admission', async () => {
+    // #given a settled child whose completion notice has not been seen
+    const run = startRun({deadlineMs: 60_000, runId: RUN_ID})
+    await run.emit(dispatchEvent(CHILD))
+    await run.emit(idleEvent())
+
+    // #when the gate has been declining for a few passes
+    await run.advance(3_000)
+
+    // #then the latest declined code is recorded for the run, and the run is still going
+    expect(getWaitReason(RUN_ID)).toBe('notice-not-observed')
+    expect(run.outcome()).toBeUndefined()
+
+    // #when the notice and the parent's follow-up arrive
+    run.fixture.root = async () => ({data: [...completedTurns(CHILD)], error: null})
+    await run.emit(noticeEvent(CHILD))
+    await run.emit(statusEvent('busy'))
+    await run.emit(textDeltaEvent('follow-up text'))
+    await run.emit(idleEvent())
+    await run.done
+
+    // #then the run completed and nothing is left recorded
+    expect(run.outcome()).toEqual({ok: true})
+    expect(getWaitReason(RUN_ID)).toBeUndefined()
+  })
+
+  it('records the ledger blocker while a root-idle run still has a running child, and follows the run as it moves on', async () => {
+    // #given the root idle while its background child is still live
+    const run = startRun({deadlineMs: 60_000, runId: RUN_ID, live: [CHILD]})
+    await run.emit(dispatchEvent(CHILD))
+    await run.emit(idleEvent())
+
+    // #when the gate has been checked a few times
+    await run.advance(3_000)
+
+    // #then the ledger blocker is recorded before the child settles
+    expect(run.ownershipLedger?.isDrainComplete()).toBe(false)
+    expect(getWaitReason(RUN_ID)).toBe('ledger-not-drained')
+
+    // #when root activity invalidates the idle evidence while the child is still running
+    await run.emit(statusEvent('busy'))
+    await run.advance(1_000)
+
+    // #then the reason is still the (first) ledger blocker, not stale evidence from before
+    expect(getWaitReason(RUN_ID)).toBe('ledger-not-drained')
+
+    // #when the child finishes and the ledger drains, with the root idle evidence now stale
+    run.live.delete(CHILD)
+    await run.advance(DEFAULT_LEDGER_RECONCILE_INTERVAL_MS)
+    await run.advance(2_000)
+
+    // #then the reason follows the new blocker rather than staying frozen on the old one
+    expect(run.ownershipLedger?.isDrainComplete()).toBe(true)
+    expect(getWaitReason(RUN_ID)).toBe('idle-evidence-stale')
+    expect(run.outcome()).toBeUndefined()
+  })
+
+  it('forgets it when the run fails at its deadline while still declined', async () => {
+    // #given
+    const run = startRun({deadlineMs: 10_000, runId: RUN_ID})
+    await run.emit(dispatchEvent(CHILD))
+    await run.emit(idleEvent())
+    await run.advance(3_000)
+    expect(getWaitReason(RUN_ID)).toBe('notice-not-observed')
+
+    // #when the deadline passes
+    await run.advance(10_000)
+    await run.done
+
+    // #then
+    expect(run.outcome()?.ok).toBe(false)
+    expect(getWaitReason(RUN_ID)).toBeUndefined()
+  })
+
+  it('forgets it when the stream ends under a declined run', async () => {
+    // #given
+    const run = startRun({deadlineMs: 60_000, runId: RUN_ID})
+    await run.emit(dispatchEvent(CHILD))
+    await run.emit(idleEvent())
+    await run.advance(3_000)
+    expect(getWaitReason(RUN_ID)).toBe('notice-not-observed')
+
+    // #when
+    await run.closeStream()
+    await run.advance(1_000)
+    await run.done
+
+    // #then
+    expect(run.outcome()?.ok).toBe(false)
+    expect(getWaitReason(RUN_ID)).toBeUndefined()
+  })
+
+  it('records nothing for a run that has no id, and nothing for a run that never drains', async () => {
+    // #given a draining run with no run id
+    const anonymous = startRun({deadlineMs: 60_000})
+    await anonymous.emit(dispatchEvent(CHILD))
+    await anonymous.emit(idleEvent())
+    await anonymous.advance(3_000)
+
+    // #then
+    expect(getWaitReason(RUN_ID)).toBeUndefined()
   })
 })

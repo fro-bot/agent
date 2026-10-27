@@ -57,6 +57,7 @@ import {createRepoQuiescenceChecker} from './execute/repo-quiescence.js'
 import {createRunIndex} from './execute/run-index.js'
 import {getInFlightRuns} from './execute/run.js'
 import {createStrandedRunPass, createStrandedRunSweep, isRunOwnedByThisProcess} from './execute/stranded-run-sweep.js'
+import {getWaitReason, onWaitReasonChange} from './execute/wait-reason-registry.js'
 import {createWorkspaceCalls} from './execute/workspace-calls.js'
 import {createAppClient} from './github/app-client.js'
 import {createWorkflowDispatcher} from './github/dispatch.js'
@@ -572,6 +573,8 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
         hasPendingApproval: scopeId => approvalRegistry.hasPendingForScope(scopeId),
         hasPendingQuestion: scopeId => questionRegistry.hasPendingForScope(scopeId),
       },
+      // Why a draining run has not finished (the completion gate's latest declined code), mapped to the wire by the manager.
+      readWaitReason: getWaitReason,
       isRepoDenied: denylistCache.isRepoDenied,
       logger,
       setInterval: (cb, ms) => setInterval(cb, ms),
@@ -591,6 +594,10 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       }),
       requestGate.onTerminal(event => {
         runObservationManager.refreshScope(event.scopeId)
+      }),
+      // The gate declining a draining run for a different reason changes its status without any lifecycle event.
+      onWaitReasonChange(runId => {
+        runObservationManager.refreshRun(runId)
       }),
     ]
 
