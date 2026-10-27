@@ -788,7 +788,7 @@ describe('processEventStream — ownership ledger integration', () => {
     expect(ledger.snapshot()).toContainEqual({sessionId: CHILD_SESSION_ID, label: 'do the thing', state: 'unknown'})
 
     // #then termination metadata says the channel closed unexpectedly — not that the turn concluded
-    expect(result.discontinuity).toEqual({message: 'connection reset'})
+    expect(result.discontinuity).toEqual({message: 'connection reset', errorName: 'Error'})
   })
 
   it('does not mark outstanding entries unknown, and does not fabricate a discontinuity, on an intentional abort', async () => {
@@ -1051,7 +1051,7 @@ describe('processEventStream — ownership ledger integration', () => {
     )
 
     // #then the thrown discontinuity is still recorded
-    expect(result.discontinuity).toEqual({message: 'connection reset'})
+    expect(result.discontinuity).toEqual({message: 'connection reset', errorName: 'Error'})
   })
 
   it('an ordinary successful run records no discontinuity and still completes normally', async () => {

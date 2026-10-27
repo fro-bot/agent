@@ -1247,17 +1247,20 @@ describe('runPromptAttempt — settlement causality matrix (Steps 3b/5)', () => 
   it('row 10 — a genuine (non-timeout) exception from prompt submission propagates unchanged even though the deadline has already expired', async () => {
     // #given a real thrown error, unrelated to the deadline, with the deadline already expired
     const {runPromptAttempt} = await import('./retry.js')
+    // (the deadline expires as the submission starts: before that, the attempt still waits for its stream)
+    let expired = false
     const deadline: ExecutionDeadline = {
       timeoutMs: 1,
       signal: new AbortController().signal,
-      isExpired: () => true,
-      isTimedOut: () => true,
-      remainingMs: () => 0,
+      isExpired: () => expired,
+      isTimedOut: () => expired,
+      remainingMs: () => (expired ? 0 : 60_000),
       run: async operation => operation(),
       dispose: vi.fn(),
     }
     const boom = new Error('submission transport exploded')
     const startPrompt = vi.fn(async (): Promise<never> => {
+      expired = true
       throw boom
     })
     const mockClient = {session: {status: vi.fn()}}

@@ -5,7 +5,7 @@ import type {Logger} from '../../shared/logger.js'
 import type {AttemptObservation, FailureObservation, TurnEvidence} from './attempt-outcome.js'
 import type {AttemptResult} from './prompt-sender.js'
 import type {ActivityTracker, EventStreamResult, PermissionAskedResponder} from './streaming.js'
-import {getNumberProperty, getObjectProperty, getStringProperty} from '@fro-bot/runtime'
+import {createLLMFetchError, getNumberProperty, getObjectProperty, getStringProperty} from '@fro-bot/runtime'
 import {formatSdkError, toErrorMessage} from '../../shared/errors.js'
 import {reduceAttemptOutcome, shouldRetryFromOutcome} from './attempt-outcome.js'
 import {
@@ -415,7 +415,13 @@ async function startV2SessionWait(
 
 type StreamConnectOutcome = 'connected' | 'stream-ended' | 'timeout' | 'deadline'
 
-/** Waits for the event stream's `server.connected` frame, or for the reason it will not come. */
+/**
+ * Waits for the event stream's `server.connected` frame, or for the reason it will not come.
+ *
+ * `deadline` means the run's time ran out first (the caller rejects as a deadline expiry, like any other
+ * deadline-bounded step); `timeout` means the full 10 s passed with time to spare; `stream-ended` means the stream
+ * ended, or the attempt was cancelled, first.
+ */
 async function awaitStreamConnected(options: {
   readonly connected: Promise<void>
   readonly streamEnded: Promise<unknown>
@@ -423,16 +429,23 @@ async function awaitStreamConnected(options: {
   readonly deadline: ExecutionDeadline | undefined
 }): Promise<StreamConnectOutcome> {
   const {connected, streamEnded, signal, deadline} = options
-  if (deadline?.signal.aborted === true) return 'deadline'
+  // Decided before any timer is armed: an expired deadline wins over everything else.
+  if (deadline != null && (deadline.signal.aborted || deadline.isExpired() || deadline.remainingMs() <= 0)) {
+    return 'deadline'
+  }
+  if (signal.aborted) return 'stream-ended'
+  const remainingMs = deadline?.remainingMs() ?? Number.POSITIVE_INFINITY
+  // The timer is the clipped remaining time, not the 10 s cap, when the run has less than 10 s left.
+  const clipped = remainingMs < EVENT_STREAM_CONNECT_TIMEOUT_MS
   let timer: ReturnType<typeof setTimeout> | undefined
   let onAbort: (() => void) | undefined
   try {
     const timeout = new Promise<StreamConnectOutcome>(resolve => {
       timer = setTimeout(
         () => {
-          resolve('timeout')
+          resolve(clipped || deadline?.isExpired() === true ? 'deadline' : 'timeout')
         },
-        Math.min(EVENT_STREAM_CONNECT_TIMEOUT_MS, deadline?.remainingMs() ?? EVENT_STREAM_CONNECT_TIMEOUT_MS),
+        Math.min(EVENT_STREAM_CONNECT_TIMEOUT_MS, remainingMs),
       )
     })
     const aborted = new Promise<StreamConnectOutcome>(resolve => {
@@ -454,24 +467,32 @@ async function awaitStreamConnected(options: {
 }
 
 /**
- * The attempt result for a stream that did not connect before the prompt: the same shape a failed prompt submission
- * has (`submit_failed`), since nothing reached the remote.
+ * The attempt result for a stream that did not connect before the prompt. Nothing reached the remote, so it has the
+ * shape of a failed prompt submission (`submit_failed`), and it carries the same retryable transport error
+ * (`llm_fetch_error`) a transport failure of the submission itself does: the retry loop (`MAX_LLM_RETRIES`, with its
+ * backoff bounded by the deadline) then resends the original prompt, and each attempt subscribes a fresh stream.
+ * `cause` is the discontinuity recorded when an error ended the stream, if one did; only its name and message are
+ * surfaced.
  */
 function createStreamNotConnectedResult(
-  reason: Exclude<StreamConnectOutcome, 'connected' | 'deadline'>,
+  reason: 'timeout' | 'stream-ended',
   logger: Logger,
   sessionId: string,
+  cause: EventStreamResult['discontinuity'],
 ): AttemptResult {
+  const causeParts = cause?.errorName == null ? undefined : {errorName: cause.errorName, errorMessage: cause.message}
+  const detail = causeParts == null ? '' : ` (${causeParts.errorName}: ${causeParts.errorMessage})`
   const message =
     reason === 'timeout'
       ? `Event stream did not connect within ${EVENT_STREAM_CONNECT_TIMEOUT_MS / 1000}s; the prompt was not sent`
-      : 'Event stream ended before it connected; the prompt was not sent'
-  logger.warning('Event stream did not connect before the prompt', {sessionId, reason})
+      : `Event stream ended before it connected${detail}; the prompt was not sent`
+  logger.warning('Event stream did not connect before the prompt', {sessionId, reason, ...causeParts})
+  const llmError = createLLMFetchError(message)
   const outcome = 'submit_failed' as const
   return {
     success: false,
     error: message,
-    llmError: null,
+    llmError,
     outcome,
     shouldRetry: shouldRetryFromOutcome(outcome),
     settlement: {kind: 'failure-observed'},
@@ -482,8 +503,8 @@ function createStreamNotConnectedResult(
       prsCreated: [],
       commitsCreated: [],
       commentsPosted: 0,
-      llmError: null,
-      classificationPath: 'unclassified',
+      llmError,
+      classificationPath: 'fallback',
     },
   }
 }
@@ -602,7 +623,7 @@ export async function runPromptAttempt(
       })
       if (connect !== 'connected') {
         if (connect === 'deadline') throw createDeadlineExceededError('event stream connection')
-        return createStreamNotConnectedResult(connect, logger, sessionId)
+        return createStreamNotConnectedResult(connect, logger, sessionId, eventStreamResult.discontinuity)
       }
       activityTracker.baselineMessageIds =
         (await listSessionMessageIds(client, sessionId, directory, logger, deadline)) ?? undefined

@@ -133,6 +133,7 @@ async function run(
     readonly deadline?: ExecutionDeadline
     readonly onPermissionAsked?: Parameters<typeof runPromptAttempt>[10]
     readonly timeoutMs?: number
+    readonly attemptAbortController?: AbortController
   } = {},
 ) {
   return runPromptAttempt(
@@ -145,7 +146,7 @@ async function run(
     undefined,
     harness.startPrompt as unknown as Parameters<typeof runPromptAttempt>[7],
     options.deadline,
-    undefined,
+    options.attemptAbortController,
     options.onPermissionAsked,
   )
 }
@@ -262,8 +263,38 @@ describe('runPromptAttempt — the prompt waits for the event stream to connect'
       expect(result.outcome).toBe('submit_failed')
       expect(result.settlement).toEqual({kind: 'failure-observed'})
       expect(result.error).toContain('Event stream')
+      // nothing was sent, and the failure is a transient transport one: the retry loop may resend the original prompt
+      expect(result.llmError?.retryable).toBe(true)
       expect(harness.startPrompt).not.toHaveBeenCalled()
       expect(harness.messages).not.toHaveBeenCalled()
+    })
+
+    it('keeps the error that ended the stream, in the result and in a warning that carries only its name and message', async () => {
+      // #given a stream whose first read fails
+      const harness = makeHarness()
+      const logger = createMockLogger()
+      const failing: AsyncIterable<Event> = {
+        [Symbol.asyncIterator]: () => ({
+          next: async () => {
+            const error = new TypeError('socket hang up')
+            throw error
+          },
+        }),
+      }
+
+      // #when
+      const result = await run(harness, failing, {logger})
+
+      // #then the cause rides in the message, and the warning has exactly its name and message, not the error object
+      expect(result.success).toBe(false)
+      expect(result.error).toContain('TypeError: socket hang up')
+      expect(harness.startPrompt).not.toHaveBeenCalled()
+      expect(logger.warning).toHaveBeenCalledWith(
+        'Event stream did not connect before the prompt',
+        expect.objectContaining({reason: 'stream-ended', errorName: 'TypeError', errorMessage: 'socket hang up'}),
+      )
+      const context = vi.mocked(logger.warning).mock.calls.at(-1)?.[1] as Record<string, unknown>
+      expect(Object.keys(context).sort()).toEqual(['errorMessage', 'errorName', 'reason', 'sessionId'])
     })
 
     it('stays silent for the barrier bound', async () => {
@@ -284,7 +315,8 @@ describe('runPromptAttempt — the prompt waits for the event stream to connect'
       // #then
       expect(result.success).toBe(false)
       expect(result.outcome).toBe('submit_failed')
-      expect(result.error).toContain('10')
+      expect(result.error).toContain('within 10s')
+      expect(result.llmError?.retryable).toBe(true)
       expect(harness.startPrompt).not.toHaveBeenCalled()
       expect(vi.getTimerCount()).toBe(0)
     })
@@ -331,30 +363,66 @@ describe('runPromptAttempt — the prompt waits for the event stream to connect'
   })
 
   describe('the wait is clipped to the time the run has left', () => {
-    it('gives up at the remaining time when that is shorter than the bound, even if the deadline signal has not fired', async () => {
-      // #given 2 s left on the clock and a stream that never connects
+    it('ends the wait at the remaining time as a deadline expiry, not a connect failure, when that is shorter than the bound', async () => {
+      // #given 2 s left on the clock (its signal has not fired yet) and a stream that never connects
       vi.useFakeTimers()
       const harness = makeHarness()
       const fed = makeControlledStream()
       const attempt = run(harness, fed.stream, {deadline: stubDeadline(2_000, new AbortController().signal)})
-
-      // #when 2 s pass, and the bounded event-processor cleanup (2 s) runs
       let settledAt: number | undefined
-      attempt.then(
-        () => {
+      const settled = attempt.then(
+        () => 'resolved',
+        (error: unknown) => {
           settledAt = Date.now()
+          return (error as Error).name
         },
-        () => undefined,
       )
       const startedAt = Date.now()
+
+      // #when 2 s pass, and the bounded event-processor cleanup (2 s) runs
       await vi.advanceTimersByTimeAsync(2_000 + 2_100)
+
+      // #then it ended there as a deadline expiry, not at the 10 s bound and not as a retryable connect failure
+      expect(await settled).toBe('DeadlineExceededError')
+      expect((settledAt ?? Number.POSITIVE_INFINITY) - startedAt).toBeLessThan(EVENT_STREAM_CONNECT_TIMEOUT_MS)
+      expect(harness.startPrompt).not.toHaveBeenCalled()
+    })
+
+    it('treats a deadline with no time left as expired at once, even though its signal has not fired', async () => {
+      // #given
+      vi.useFakeTimers()
+      const harness = makeHarness()
+      const fed = makeControlledStream()
+      fed.emit(connected())
+
+      // #when / #then
+      const attempt = run(harness, fed.stream, {deadline: stubDeadline(0, new AbortController().signal)})
+      const settled = attempt.then(
+        () => 'resolved',
+        (error: unknown) => (error as Error).name,
+      )
+      await vi.advanceTimersByTimeAsync(SHUTDOWN_WINDOW_MS)
+      expect(await settled).toBe('DeadlineExceededError')
+      expect(harness.startPrompt).not.toHaveBeenCalled()
+      expect(harness.messages).not.toHaveBeenCalled()
+    })
+
+    it('settles at once, without arming a timer, when the attempt was already cancelled', async () => {
+      // #given an attempt controller aborted before the wait
+      vi.useFakeTimers()
+      const harness = makeHarness()
+      const fed = makeControlledStream()
+      const cancelled = new AbortController()
+      cancelled.abort()
+
+      // #when
+      const attempt = run(harness, fed.stream, {attemptAbortController: cancelled})
+      // (only the bounded event-processor cleanup, 2 s, is left to run: far short of the 10 s bound)
+      await vi.advanceTimersByTimeAsync(2_100)
       const result = await attempt
 
-      // #then it failed there, not at the 10 s bound
-      expect(settledAt).toBeDefined()
-      expect((settledAt ?? 0) - startedAt).toBeLessThan(EVENT_STREAM_CONNECT_TIMEOUT_MS)
+      // #then it did not wait for the 10 s bound
       expect(result.success).toBe(false)
-      expect(result.outcome).toBe('submit_failed')
       expect(harness.startPrompt).not.toHaveBeenCalled()
     })
 

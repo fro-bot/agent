@@ -66,13 +66,13 @@ import {clearWaitReason, setWaitReason} from './wait-reason-registry.js'
 /** Which kind of request a human wait is held for. */
 type HumanWaitKind = 'approval' | 'question'
 
-/** Discriminant for `RunCoreError` — `run.ts` maps these to coarse Discord replies. */
 /**
  * How long the run waits for the event stream to announce itself (`server.connected`) before it gives up on the
  * server as unreachable. The wait is also bounded by the run's own deadline and cancel, whichever comes first.
  */
 export const EVENT_STREAM_CONNECT_TIMEOUT_MS = 10_000
 
+/** Discriminant for `RunCoreError` — `run.ts` maps these to coarse Discord replies. */
 export type RunCoreErrorKind =
   | 'unreachable' // network error / server not reachable
   | 'auth' // proxy rejected the bearer token (401)
@@ -801,8 +801,10 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // Take ONE iterator and read its first frame. The server registers its listener before it emits `server.connected`,
   // so once that frame is read nothing published later can be missed: a permission ask, output, idle or error that
   // follows is queued behind it. The same iterator is consumed by the event loop below (this frame included), so the
-  // stream is never opened twice and never closed early. Nothing has been sent yet, so a failure here never touches
-  // the root: it is `unreachable` (cancel and deadline keep `timeout`) with no root abort and no quarantine.
+  // stream is never opened twice and never closed early. Nothing has been sent yet, so a failure here is
+  // `unreachable` (cancel and deadline keep `timeout`) and adds no abort of its own. It still leaves through
+  // `throwWithBarrier`, so sessions this run already owns from an earlier turn are settled as on any other early exit
+  // (a run that owns nothing sends no abort at all), and the run is quarantined if they cannot be confirmed settled.
   const eventIterator = eventStream[Symbol.asyncIterator]()
   const firstFrame = await awaitFirstEvent(eventIterator, combinedSignal, EVENT_STREAM_CONNECT_TIMEOUT_MS)
   if (firstFrame.kind === 'aborted') {
@@ -1632,16 +1634,6 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Wrap an async iterable so that each `next()` call races against the abort
- * signal. When the signal fires while the stream is blocked waiting for the
- * next event, the generator terminates immediately rather than hanging until
- * the server sends another event.
- *
- * This is the key fix for the "silent stream" reliability issue: without this
- * wrapper the `for await` loop only checks `signal.aborted` AFTER an event
- * arrives, meaning a timed-out run can block indefinitely on a quiet stream.
- */
 /** The result of waiting for the first frame of an event stream. */
 type FirstEvent =
   | {readonly kind: 'frame'; readonly value: unknown}
@@ -1703,6 +1695,16 @@ function resumeWith(iterator: AsyncIterator<unknown>, first: unknown): AsyncIter
   }
 }
 
+/**
+ * Wrap an async iterable so that each `next()` call races against the abort
+ * signal. When the signal fires while the stream is blocked waiting for the
+ * next event, the generator terminates immediately rather than hanging until
+ * the server sends another event.
+ *
+ * This is the key fix for the "silent stream" reliability issue: without this
+ * wrapper the `for await` loop only checks `signal.aborted` AFTER an event
+ * arrives, meaning a timed-out run can block indefinitely on a quiet stream.
+ */
 async function* makeAbortableStream(stream: AsyncIterable<unknown>, signal: AbortSignal): AsyncGenerator<unknown> {
   const iterator = stream[Symbol.asyncIterator]()
 

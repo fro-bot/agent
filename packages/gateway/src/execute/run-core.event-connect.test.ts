@@ -27,6 +27,13 @@ const DIRECTORY = '/workspace/repo'
 const BASE_URL = 'http://workspace:9200'
 const PAST_SETTLE_BOUND_MS = 20_000
 
+interface OpenCodeClientDoubles {
+  readonly session: {
+    readonly children: ReturnType<typeof vi.fn>
+    readonly status: ReturnType<typeof vi.fn>
+  }
+}
+
 const connected = (): object => ({type: 'server.connected', properties: {}})
 const idle = (): object => ({type: 'session.idle', properties: {sessionID: ROOT}})
 const textDelta = (text: string): object => ({
@@ -181,6 +188,7 @@ function startRun(options: StartOptions = {}) {
       closed = true
       wakeStream()
     },
+    client,
     subscribe,
     promptAsync,
     abort,
@@ -280,6 +288,18 @@ function startRealClientRun() {
 
 const eventCalls = (fetchStub: ReturnType<typeof vi.fn>): readonly unknown[][] =>
   fetchStub.mock.calls.filter(call => new URL(String(call[0])).pathname === '/event')
+
+/** A stream that never connects, a ledger that already owns a child, and a status mock the test controls. */
+function startOwningRun(childStillLive: boolean) {
+  const ledger = createOwnershipLedger()
+  ledger.adopt('child-1', 'background task')
+  const run = startRun({ownershipLedger: ledger})
+  // `startRun` builds its own client; swap the doubles the barrier consults.
+  const client = run.client as unknown as OpenCodeClientDoubles
+  client.session.children.mockResolvedValue({data: [{id: 'child-1'}], error: null})
+  client.session.status.mockResolvedValue({data: childStillLive ? {'child-1': {}} : {}, error: null})
+  return {run, ledger}
+}
 
 describe('runOpenCodeCore — the prompt waits for the event stream to connect', () => {
   it('sends no prompt until server.connected has been read, then sends exactly one', async () => {
@@ -461,6 +481,52 @@ describe('runOpenCodeCore — the prompt waits for the event stream to connect',
       expect(caught.cause).toBe(error)
       expect(harness.promptAsync).not.toHaveBeenCalled()
       expect(harness.abort).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('a resumed run that still owns sessions from an earlier turn', () => {
+    it('sends no prompt, settles the owned child through the barrier, and does not quarantine once it is confirmed gone', async () => {
+      // #given
+      const {run, ledger} = startOwningRun(false)
+
+      // #when the stream never connects and the bound passes
+      await vi.advanceTimersByTimeAsync(EVENT_STREAM_CONNECT_TIMEOUT_MS + PAST_SETTLE_BOUND_MS)
+
+      // #then
+      expect(failure(run).kind).toBe('unreachable')
+      expect(failure(run).quarantined).toBe(false)
+      expect(run.promptAsync).not.toHaveBeenCalled()
+      expect(run.abort).toHaveBeenCalledWith(expect.objectContaining({path: {id: 'child-1'}}))
+      // (as on any early exit with owned work, the barrier's safety net also aborts the root)
+      expect(run.abort).toHaveBeenCalledWith(expect.objectContaining({path: {id: ROOT}}))
+      expect(ledger.snapshot().find(entry => entry.sessionId === 'child-1')?.state).toBe('settled')
+    })
+
+    it('quarantines the run when the owned child cannot be confirmed settled', async () => {
+      // #given a child that stays live whatever is asked of it
+      const {run, ledger} = startOwningRun(true)
+
+      // #when
+      await vi.advanceTimersByTimeAsync(EVENT_STREAM_CONNECT_TIMEOUT_MS + PAST_SETTLE_BOUND_MS)
+
+      // #then the failure is still unreachable, and the run holds its lock
+      expect(failure(run).kind).toBe('unreachable')
+      expect(failure(run).quarantined).toBe(true)
+      expect(run.promptAsync).not.toHaveBeenCalled()
+      expect(ledger.snapshot().find(entry => entry.sessionId === 'child-1')?.state).toBe('unknown')
+    })
+
+    it('asks nothing of the server when the run owns nothing', async () => {
+      // #given
+      const run = startRun({ownershipLedger: createOwnershipLedger()})
+
+      // #when
+      await vi.advanceTimersByTimeAsync(EVENT_STREAM_CONNECT_TIMEOUT_MS + PAST_SETTLE_BOUND_MS)
+
+      // #then no abort of any session
+      expect(failure(run).kind).toBe('unreachable')
+      expect(failure(run).quarantined).toBe(false)
+      expect(run.abort).not.toHaveBeenCalled()
     })
   })
 
