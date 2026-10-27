@@ -73,16 +73,6 @@ vi.mock('../../features/agent/index.js', () => ({
 
 vi.mock('../../shared/logger.js', () => ({createLogger: vi.fn(() => mocks.logger)}))
 
-const disabledProviders = {
-  claude: 'no',
-  copilot: 'no',
-  gemini: 'no',
-  openai: 'no',
-  opencodeZen: 'no',
-  zaiCodingPlan: 'no',
-  kimiForCoding: 'no',
-} as const
-
 function createAgentResult(overrides: Partial<AgentResult> = {}): AgentResult {
   return {
     success: false,
@@ -123,14 +113,9 @@ function createBootstrap(
       model: null,
       timeoutMs,
       serverBootstrapTimeoutMs: 5000,
-      enableOmo: false,
-      enableOmoSlim: false,
       opencodeVersion: '1.0.0',
       skipCache: false,
-      omoVersion: '1.0.0',
       systematicVersion: '1.0.0',
-      omoProviders: disabledProviders,
-      omoSlimPreset: 'openai',
       opencodeConfig: null,
       systematicConfig: null,
       dedupWindow: 0,

@@ -3,7 +3,6 @@ import type {ParsedResponse, ResponseSurface} from '../packages/runtime/src/agen
 import type {SessionContext, TriggerContext} from '../packages/runtime/src/agent/types.js'
 import type {SessionClient} from '../packages/runtime/src/session/backend.js'
 import type {LogicalSessionKey} from '../packages/runtime/src/session/logical-key.js'
-import type {OmoProviders} from '../packages/runtime/src/shared/types.js'
 import type {AgentResult, ExecutionConfig, PromptOptions} from '../src/features/agent/types.js'
 import type {GitHubContext} from '../src/services/github/types.js'
 import type {Logger} from '../src/shared/logger.js'
@@ -169,15 +168,6 @@ export function resolveEvalTimeoutMs(): number {
   }
 
   return Number(configured)
-}
-const NO_OMO_PROVIDERS: OmoProviders = {
-  claude: 'no',
-  copilot: 'no',
-  gemini: 'no',
-  openai: 'no',
-  opencodeZen: 'no',
-  zaiCodingPlan: 'no',
-  kimiForCoding: 'no',
 }
 
 interface IsolatedEvalEnv {
@@ -1003,7 +993,6 @@ export async function runScenario(
       agent: 'build',
       model: modelConfig,
       timeoutMs,
-      omoProviders: NO_OMO_PROVIDERS,
       ...(continuationSessionId == null ? {} : {continueSessionId: continuationSessionId}),
     }
     let agentResult: AgentResult

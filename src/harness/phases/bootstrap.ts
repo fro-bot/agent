@@ -12,7 +12,6 @@ import {buildResponseFileDir, buildResponseFilePathCandidates, resolveResponseDe
 import {ensureOpenCodeAvailable} from '../../features/agent/index.js'
 import {createExecAdapter} from '../../services/setup/adapters.js'
 import {assertNoPersistedGitCredentials} from '../../services/setup/git-credential-check.js'
-import {DEFAULT_OMO_SLIM_VERSION} from '../../shared/constants.js'
 import {getGitHubRunAttempt, getGitHubRunId} from '../../shared/env.js'
 import {createLogger} from '../../shared/logger.js'
 import {parseActionInputs} from '../config/inputs.js'
@@ -92,15 +91,9 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
     opencodeVersion: inputs.opencodeVersion,
     githubToken: inputs.githubToken,
     authJson: inputs.authJson,
-    enableOmo: inputs.enableOmo,
-    omoVersion: inputs.omoVersion,
     systematicVersion: inputs.systematicVersion,
-    omoProviders: inputs.omoProviders,
     opencodeConfig: inputs.opencodeConfig,
     systematicConfig: inputs.systematicConfig,
-    enableOmoSlim: inputs.enableOmoSlim,
-    omoSlimVersion: DEFAULT_OMO_SLIM_VERSION,
-    omoSlimPreset: inputs.omoSlimPreset,
     credential,
   })
 

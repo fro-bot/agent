@@ -272,7 +272,7 @@ describe('agent/error-format/format', () => {
   describe('isAgentNotFoundError', () => {
     it('detects "agent not found" error messages', () => {
       // #given various agent error messages
-      const errors = ['agent not found', 'Agent Not Found', 'Agent not found: sisyphus']
+      const errors = ['agent not found', 'Agent Not Found', 'Agent not found: build-agent']
 
       // #then all should be detected as agent errors
       for (const msg of errors) {
@@ -282,7 +282,7 @@ describe('agent/error-format/format', () => {
 
     it('detects "unknown agent" error messages', () => {
       // #given unknown agent messages
-      const errors = ['unknown agent: sisyphus', 'Unknown Agent']
+      const errors = ['unknown agent: build-agent', 'Unknown Agent']
 
       // #then all should be detected as agent errors
       for (const msg of errors) {
@@ -302,7 +302,7 @@ describe('agent/error-format/format', () => {
 
     it('detects "agent does not exist" patterns', () => {
       // #given agent does not exist messages
-      const errors = ['agent sisyphus does not exist', 'Agent foo does not exist']
+      const errors = ['agent build-agent does not exist', 'Agent foo does not exist']
 
       // #then all should be detected as agent errors
       for (const msg of errors) {
@@ -312,12 +312,12 @@ describe('agent/error-format/format', () => {
 
     it('detects "no agent named" patterns', () => {
       // #given no agent named messages
-      expect(isAgentNotFoundError('no agent named sisyphus')).toBe(true)
+      expect(isAgentNotFoundError('no agent named build-agent')).toBe(true)
     })
 
     it('detects "agent is not available" patterns', () => {
       // #given agent not available messages
-      expect(isAgentNotFoundError('agent sisyphus is not available')).toBe(true)
+      expect(isAgentNotFoundError('agent build-agent is not available')).toBe(true)
     })
 
     it('returns false for non-agent errors', () => {
@@ -355,14 +355,14 @@ describe('agent/error-format/format', () => {
 
   describe('createAgentError', () => {
     it('creates non-retryable configuration error with the generic suggested action', () => {
-      const error = createAgentError('agent not found', 'sisyphus')
+      const error = createAgentError('agent not found', 'build-agent')
 
       expect(error.type).toBe('configuration')
       expect(error.retryable).toBe(false)
       expect(error.message).toContain('agent not found')
-      expect(error.details).toContain('sisyphus')
+      expect(error.details).toContain('build-agent')
       expect(error.suggestedAction).toBe(
-        'Verify the agent name is correct and the required plugins (e.g., oMo) are installed.',
+        'Verify the agent name is correct and the agent is defined in your OpenCode config or provided by a plugin you configured.',
       )
     })
 
@@ -373,7 +373,7 @@ describe('agent/error-format/format', () => {
       expect(error.message).toContain('unknown agent error')
       expect(error.details).toBeUndefined()
       expect(error.suggestedAction).toBe(
-        'Verify the agent name is correct and the required plugins (e.g., oMo) are installed.',
+        'Verify the agent name is correct and the agent is defined in your OpenCode config or provided by a plugin you configured.',
       )
     })
   })

@@ -64,14 +64,6 @@ inputs:
   agent:
     description: 'Agent to use. When unset, uses OpenCode build agent. Must be a primary agent, not subagent.'
     required: false
-  enable-omo:
-    description: 'Enable Oh My OpenAgent (oMo) for extended provider and agent support. Default: false.'
-    required: false
-    default: 'false'
-  enable-omo-slim:
-    description: 'Enable OMO Slim (oh-my-opencode-slim) orchestration. Mutually exclusive with enable-omo. Default: false.'
-    required: false
-    default: 'false'
   model:
     description: "Model override (format: provider/model). If not set, uses agent's configured model."
     required: false
@@ -96,9 +88,6 @@ inputs:
   opencode-version:
     description: OpenCode CLI version to install if auto-setup is needed. Defaults to version pinned in source code if not set. An existing opencode is reused only when it reports exactly this version (the `-harness.` and `+harness.` spellings are equivalent); otherwise the pinned build is installed.
     required: false
-  omo-version:
-    description: oMo (Oh My OpenAgent) version to install if auto-setup is needed. Defaults to version pinned in source code if not set.
-    required: false
   systematic-version:
     description: Systematic plugin version to register with OpenCode. Defaults to version pinned in source code if not set.
     required: false
@@ -106,18 +95,6 @@ inputs:
     description: Skip session cache restore (default false)
     required: false
     default: 'false'
-  omo-providers:
-    description: >-
-      Comma-separated list of oMo providers to enable. Values: claude, claude-max20,
-      copilot, gemini, openai, opencode-zen, zai-coding-plan, kimi-for-coding.
-      Default: empty (uses free OpenCode models)
-    required: false
-  omo-slim-preset:
-    description: >-
-      OMO Slim preset to install (single name). Values: openai, opencode-go.
-      Only applies when enable-omo-slim is true. Default: openai.
-    required: false
-    default: openai
   opencode-config:
     description: >-
       JSON object to merge into the OpenCode config (OPENCODE_CONFIG_CONTENT).

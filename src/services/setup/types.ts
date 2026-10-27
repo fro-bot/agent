@@ -2,7 +2,6 @@ import type {Buffer} from 'node:buffer'
 import type {CredentialDisposition} from '@fro-bot/runtime'
 
 import type {Logger} from '../../shared/logger.js'
-import type {OmoProviders, OmoSlimPreset} from '../../shared/types.js'
 
 // Re-export Logger for convenience in setup modules
 export type {Logger}
@@ -17,13 +16,7 @@ export interface SetupInputs {
   readonly privateKey: string | null
   readonly opencodeConfig: string | null
   readonly systematicConfig: string | null
-  readonly enableOmo: boolean
-  readonly omoVersion: string
   readonly systematicVersion: string
-  readonly omoProviders: OmoProviders
-  readonly enableOmoSlim: boolean
-  readonly omoSlimPreset: OmoSlimPreset
-  readonly omoSlimVersion: string
   /**
    * Whether the child's GitHub token should be withheld ('withhold') or
    * provisioned as today ('provision'). Resolved once at bootstrap from the
@@ -42,10 +35,6 @@ export interface SetupResult {
   readonly opencodeBinaryPath: string
   readonly opencodeVersion: string
   readonly ghAuthenticated: boolean
-  readonly omoStatus: 'installed' | 'failed' | 'skipped'
-  readonly omoError: string | null
-  readonly omoSlimStatus: 'installed' | 'failed' | 'skipped'
-  readonly omoSlimError: string | null
   readonly toolsCacheStatus: 'hit' | 'miss'
   readonly duration: number
 }
@@ -57,15 +46,6 @@ export interface OpenCodeInstallResult {
   readonly path: string
   readonly version: string
   readonly cached: boolean
-}
-
-/**
- * oMo plugin installation result
- */
-export interface OmoInstallResult {
-  readonly installed: boolean
-  readonly version: string | null
-  readonly error: string | null
 }
 
 /**

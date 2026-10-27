@@ -61,7 +61,7 @@ function createMockOptions(overrides: Partial<CommentSummaryOptions> = {}): Comm
     runId: 12345,
     runUrl: 'https://github.com/owner/repo/actions/runs/12345',
     metrics: createMockMetrics(),
-    agent: 'sisyphus',
+    agent: 'build',
     resolvedOutputMode: resolvedOutputMode ?? null,
     deliveryKind: 'none',
     ...restOverrides,
@@ -108,7 +108,7 @@ describe('writeJobSummary', () => {
     expect(tableCall).toBeDefined()
     expect(tableCall.some(row => Array.isArray(row) && row.includes('issue_comment'))).toBe(true)
     expect(tableCall.some(row => Array.isArray(row) && row.includes('owner/repo'))).toBe(true)
-    expect(tableCall.some(row => Array.isArray(row) && row.includes('sisyphus'))).toBe(true)
+    expect(tableCall.some(row => Array.isArray(row) && row.includes('build'))).toBe(true)
   })
 
   it('renders build (default) when agent is null', async () => {

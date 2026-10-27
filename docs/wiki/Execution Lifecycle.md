@@ -96,7 +96,7 @@ post.ts
 
 ## 1. Bootstrap
 
-Parses action inputs (`parseActionInputs`), validates credentials, and ensures the OpenCode CLI is available. If the tools aren't already cached, the setup module installs OpenCode. When `enable-omo: true`, it also installs Bun and oMo (see [[Setup and Configuration]]). On failure, the run exits immediately with code 1.
+Parses action inputs (`parseActionInputs`), validates credentials, and ensures the OpenCode CLI is available. If the tools aren't already cached, the setup module installs OpenCode and the Systematic plugin (see [[Setup and Configuration]]). On failure, the run exits immediately with code 1.
 
 Bootstrap also resolves the run's **response-delivery decision** — a two-axis object (`resolveResponseDelivery()` in `packages/runtime/src/agent/response-delivery.ts`) that decides both _how_ the agent's answer reaches GitHub and _whether the agent is given a GitHub credential at all_. Comment and review triggers (`issue_comment`, `pull_request`, `issues`) resolve to `file-convention` delivery with the credential **withheld**; `schedule` and `workflow_dispatch` resolve to `model-gh` delivery with the credential **provisioned**, because those flows legitimately create branches, commits, and PRs on their own. The decision is computed once here from the raw event name, threaded through setup so the credential is (or is not) provisioned, and re-asserted against the routing classification so a mismatch fails loudly rather than silently mis-provisioning. See [[Setup and Configuration]] for how the credential is withheld and [[Prompt Architecture]] for how the delivery mode reshapes the response protocol the agent is told to follow.
 

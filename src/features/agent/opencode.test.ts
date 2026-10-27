@@ -534,7 +534,6 @@ describe('executeOpenCode', () => {
       agent: null,
       model: null,
       timeoutMs: 25,
-      omoProviders: createDisabledProviders(),
     })
     await new Promise<void>(resolve => setTimeout(resolve, 50))
 
@@ -556,7 +555,6 @@ describe('executeOpenCode', () => {
       agent: null,
       model: null,
       timeoutMs: 25,
-      omoProviders: createDisabledProviders(),
     })
 
     // #then — timeout is terminal and the already-created remote session receives one best-effort abort
@@ -576,7 +574,6 @@ describe('executeOpenCode', () => {
       agent: null,
       model: null,
       timeoutMs: 25,
-      omoProviders: createDisabledProviders(),
     })
 
     // #then
@@ -599,7 +596,6 @@ describe('executeOpenCode', () => {
       agent: null,
       model: null,
       timeoutMs: 700,
-      omoProviders: createDisabledProviders(),
     })
 
     // #then
@@ -636,7 +632,6 @@ describe('executeOpenCode', () => {
         agent: null,
         model: null,
         timeoutMs: 1_000,
-        omoProviders: createDisabledProviders(),
       })
       await vi.advanceTimersByTimeAsync(1_000)
       const result = await resultPromise
@@ -683,7 +678,6 @@ describe('executeOpenCode', () => {
         agent: null,
         model: null,
         timeoutMs: 1_000,
-        omoProviders: createDisabledProviders(),
         sessionTitle: 'pre-deadline success',
       })
       await vi.advanceTimersByTimeAsync(2_500)
@@ -723,7 +717,6 @@ describe('executeOpenCode', () => {
         agent: null,
         model: null,
         timeoutMs: 1_000,
-        omoProviders: createDisabledProviders(),
         sessionTitle: 'envelope failure',
       })
       await vi.advanceTimersByTimeAsync(10_000)
@@ -763,7 +756,6 @@ describe('executeOpenCode', () => {
         agent: null,
         model: null,
         timeoutMs: 1_000,
-        omoProviders: createDisabledProviders(),
         sessionTitle: 'pre-deadline failure',
       })
       await vi.advanceTimersByTimeAsync(10_000)
@@ -796,7 +788,6 @@ describe('executeOpenCode', () => {
       agent: null,
       model: null,
       timeoutMs: 700,
-      omoProviders: createDisabledProviders(),
       sessionTitle: 'deadline title',
     })
 
@@ -822,7 +813,6 @@ describe('executeOpenCode', () => {
         agent: null,
         model: null,
         timeoutMs: 1_000,
-        omoProviders: createDisabledProviders(),
         sessionTitle: 'artifact deadline',
       })
       await vi.advanceTimersByTimeAsync(1_000)
@@ -857,7 +847,6 @@ describe('executeOpenCode', () => {
       agent: null,
       model: null,
       timeoutMs: 0,
-      omoProviders: createDisabledProviders(),
     })
 
     // #then
@@ -880,7 +869,6 @@ describe('executeOpenCode', () => {
         agent: null,
         model: null,
         timeoutMs: 25,
-        omoProviders: createDisabledProviders(),
         sessionTitle: 'late title',
       })
       await vi.advanceTimersByTimeAsync(25)
@@ -916,7 +904,6 @@ describe('executeOpenCode', () => {
       agent: null,
       model: null,
       timeoutMs: 50,
-      omoProviders: createDisabledProviders(),
     })
 
     // #then — the retry shares the first attempt's budget instead of opening a fresh 5-second window
@@ -938,7 +925,6 @@ describe('executeOpenCode', () => {
       agent: null,
       model: null,
       timeoutMs: 25,
-      omoProviders: createDisabledProviders(),
     })
 
     // #then — teardown is fail-soft and cannot replace the terminal timeout result
@@ -984,7 +970,6 @@ describe('executeOpenCode', () => {
         agent: null,
         model: null,
         timeoutMs: 25,
-        omoProviders: createDisabledProviders(),
       })
       await vi.advanceTimersByTimeAsync(25)
 
@@ -1024,7 +1009,6 @@ describe('executeOpenCode', () => {
         agent: null,
         model: null,
         timeoutMs: 25,
-        omoProviders: createDisabledProviders(),
       })
       await vi.advanceTimersByTimeAsync(25)
 
@@ -1058,18 +1042,9 @@ describe('executeOpenCode', () => {
     vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
 
     const config: ExecutionConfig = {
-      agent: 'sisyphus',
+      agent: 'build',
       model: {providerID: 'anthropic', modelID: 'claude-sonnet-4-20250514'},
       timeoutMs: 1800000,
-      omoProviders: {
-        claude: 'no',
-        copilot: 'no',
-        gemini: 'no',
-        openai: 'no',
-        opencodeZen: 'no',
-        zaiCodingPlan: 'no',
-        kimiForCoding: 'no',
-      },
     }
 
     // #when
@@ -1098,18 +1073,9 @@ describe('executeOpenCode', () => {
     vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
 
     const config: ExecutionConfig = {
-      agent: 'sisyphus',
+      agent: 'build',
       model: null,
       timeoutMs: 1800000,
-      omoProviders: {
-        claude: 'no',
-        copilot: 'no',
-        gemini: 'no',
-        openai: 'no',
-        opencodeZen: 'no',
-        zaiCodingPlan: 'no',
-        kimiForCoding: 'no',
-      },
     }
 
     // #when
@@ -1145,72 +1111,6 @@ describe('executeOpenCode', () => {
     expect(subscribeOrder).toBeLessThan(promptOrder)
   })
 
-  it('omits default model when omo providers are configured', async () => {
-    // #given
-    const mockClient = createMockClient({
-      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
-    })
-    const mockOpencode = createMockOpencode({client: mockClient})
-    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
-
-    const config: ExecutionConfig = {
-      agent: 'sisyphus',
-      model: null,
-      timeoutMs: 1800000,
-      omoProviders: {
-        claude: 'yes',
-        copilot: 'no',
-        gemini: 'no',
-        openai: 'no',
-        opencodeZen: 'no',
-        zaiCodingPlan: 'no',
-        kimiForCoding: 'no',
-      },
-    }
-
-    // #when
-    await executeOpenCode(createMockPromptOptions(), mockLogger, config)
-
-    // #then
-    const promptCalls = vi.mocked(mockClient.session.promptAsync).mock.calls
-    const firstCall = promptCalls[0] as [{body?: {model?: {providerID: string; modelID: string}}}] | undefined
-    const promptCall = firstCall?.[0]
-    expect(promptCall?.body?.model).toBeUndefined()
-  })
-
-  it('keeps explicit model override when omo providers are configured', async () => {
-    // #given
-    const mockClient = createMockClient({
-      promptResponse: {parts: [{type: 'text', text: 'Response'}]},
-    })
-    const mockOpencode = createMockOpencode({client: mockClient})
-    vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
-
-    const config: ExecutionConfig = {
-      agent: 'sisyphus',
-      model: {providerID: 'openai', modelID: 'gpt-5'},
-      timeoutMs: 1800000,
-      omoProviders: {
-        claude: 'yes',
-        copilot: 'no',
-        gemini: 'no',
-        openai: 'yes',
-        opencodeZen: 'no',
-        zaiCodingPlan: 'no',
-        kimiForCoding: 'no',
-      },
-    }
-
-    // #when
-    await executeOpenCode(createMockPromptOptions(), mockLogger, config)
-
-    // #then
-    const promptCalls = vi.mocked(mockClient.session.promptAsync).mock.calls
-    const firstCall = promptCalls[0] as [{body?: {model?: {providerID: string; modelID: string}}}] | undefined
-    const promptCall = firstCall?.[0]
-    expect(promptCall?.body?.model).toEqual({providerID: 'openai', modelID: 'gpt-5'})
-  })
-
   it('uses custom agent from config', async () => {
     // #given
     const mockClient = createMockClient({
@@ -1223,15 +1123,6 @@ describe('executeOpenCode', () => {
       agent: 'CustomAgent',
       model: null,
       timeoutMs: 1800000,
-      omoProviders: {
-        claude: 'no',
-        copilot: 'no',
-        gemini: 'no',
-        openai: 'no',
-        opencodeZen: 'no',
-        zaiCodingPlan: 'no',
-        kimiForCoding: 'no',
-      },
     }
 
     // #when
@@ -1254,18 +1145,9 @@ describe('executeOpenCode', () => {
     vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
 
     const config: ExecutionConfig = {
-      agent: 'oracle',
+      agent: 'plan',
       model: null,
       timeoutMs: 1800000,
-      omoProviders: {
-        claude: 'no',
-        copilot: 'no',
-        gemini: 'no',
-        openai: 'no',
-        opencodeZen: 'no',
-        zaiCodingPlan: 'no',
-        kimiForCoding: 'no',
-      },
     }
 
     // #when
@@ -1275,7 +1157,7 @@ describe('executeOpenCode', () => {
     const callArgs = vi.mocked(mockClient.session.promptAsync).mock.calls[0]?.[0] as {
       body?: {agent?: string}
     }
-    expect(callArgs?.body?.agent).toBe('oracle')
+    expect(callArgs?.body?.agent).toBe('plan')
   })
 
   it('returns success result on successful execution', async () => {
@@ -1304,18 +1186,9 @@ describe('executeOpenCode', () => {
     const mockOpencode = createMockOpencode({client: mockClient})
     vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
     const config: ExecutionConfig = {
-      agent: 'sisyphus',
+      agent: 'build',
       model: null,
       timeoutMs: 1800000,
-      omoProviders: {
-        claude: 'no',
-        copilot: 'no',
-        gemini: 'no',
-        openai: 'no',
-        opencodeZen: 'no',
-        zaiCodingPlan: 'no',
-        kimiForCoding: 'no',
-      },
       sessionTitle: 'fro-bot: schedule-c757a308',
     }
 
@@ -1338,18 +1211,9 @@ describe('executeOpenCode', () => {
     const mockOpencode = createMockOpencode({client: mockClient})
     vi.mocked(createOpencode).mockResolvedValue(mockOpencode as unknown as Awaited<ReturnType<typeof createOpencode>>)
     const config: ExecutionConfig = {
-      agent: 'sisyphus',
+      agent: 'build',
       model: null,
       timeoutMs: 1800000,
-      omoProviders: {
-        claude: 'no',
-        copilot: 'no',
-        gemini: 'no',
-        openai: 'no',
-        opencodeZen: 'no',
-        zaiCodingPlan: 'no',
-        kimiForCoding: 'no',
-      },
       sessionTitle: 'fro-bot: schedule-c757a308',
     }
 
@@ -2072,7 +1936,6 @@ describe('executeOpenCode retry behavior', () => {
       agent: null,
       model: null,
       timeoutMs: 2_000,
-      omoProviders: createDisabledProviders(),
     })
     await vi.runOnlyPendingTimersAsync()
     const result = await resultPromise
@@ -2370,7 +2233,6 @@ describe('executeOpenCode retry behavior', () => {
       agent: null,
       model: null,
       timeoutMs: 1800000,
-      omoProviders: createDisabledProviders(),
       credentialProvisioned: true,
     })
     await vi.advanceTimersByTimeAsync(5000)
@@ -2428,7 +2290,6 @@ describe('executeOpenCode retry behavior', () => {
         agent: null,
         model: null,
         timeoutMs: 1800000,
-        omoProviders: createDisabledProviders(),
       },
     )
     await vi.advanceTimersByTimeAsync(5000)
@@ -2586,18 +2447,6 @@ describe('LLM error detection', () => {
   })
 })
 
-function createDisabledProviders(): ExecutionConfig['omoProviders'] {
-  return {
-    claude: 'no',
-    copilot: 'no',
-    gemini: 'no',
-    openai: 'no',
-    opencodeZen: 'no',
-    zaiCodingPlan: 'no',
-    kimiForCoding: 'no',
-  }
-}
-
 function setupMockClient() {
   const mockClient = createMockClient({
     promptResponse: {parts: [{type: 'text', text: 'Response'}]},
@@ -2620,13 +2469,12 @@ describe('SDK prompt body shape', () => {
   })
 
   it('omits agent field when agent is null', async () => {
-    // #given — null agent, no model, disabled oMo providers
+    // #given — null agent, no model
     const mockClient = setupMockClient()
     const config: ExecutionConfig = {
       agent: null,
       model: null,
       timeoutMs: 1800000,
-      omoProviders: createDisabledProviders(),
     }
 
     // #when
@@ -2647,7 +2495,6 @@ describe('SDK prompt body shape', () => {
       agent: 'custom',
       model: null,
       timeoutMs: 1800000,
-      omoProviders: createDisabledProviders(),
     }
 
     // #when
@@ -2667,7 +2514,6 @@ describe('SDK prompt body shape', () => {
       agent: null,
       model: {providerID: 'anthropic', modelID: 'claude-sonnet-4-20250514'},
       timeoutMs: 1800000,
-      omoProviders: createDisabledProviders(),
     }
 
     // #when
@@ -2681,54 +2527,6 @@ describe('SDK prompt body shape', () => {
     expect(callArgs?.body?.agent).toBeUndefined()
   })
 
-  it('omits model when oMo providers are enabled with no explicit model', async () => {
-    // #given — null agent, enabled oMo provider, no explicit model
-    const mockClient = setupMockClient()
-    const config: ExecutionConfig = {
-      agent: null,
-      model: null,
-      timeoutMs: 1800000,
-      omoProviders: {
-        claude: 'yes',
-        copilot: 'no',
-        gemini: 'no',
-        openai: 'no',
-        opencodeZen: 'no',
-        zaiCodingPlan: 'no',
-        kimiForCoding: 'no',
-      },
-    }
-
-    // #when
-    await executeOpenCode(createMockPromptOptions(), mockLogger, config)
-
-    // #then — body.model is undefined so providers/agent config decides
-    const callArgs = vi.mocked(mockClient.session.promptAsync).mock.calls[0]?.[0] as {
-      body?: {model?: {providerID: string; modelID: string}}
-    }
-    expect(callArgs?.body?.model).toBeUndefined()
-  })
-
-  it('passes sisyphus agent through with disabled oMo', async () => {
-    // #given — explicit sisyphus with all oMo providers disabled
-    const mockClient = setupMockClient()
-    const config: ExecutionConfig = {
-      agent: 'sisyphus',
-      model: null,
-      timeoutMs: 1800000,
-      omoProviders: createDisabledProviders(),
-    }
-
-    // #when
-    await executeOpenCode(createMockPromptOptions(), mockLogger, config)
-
-    // #then — body.agent is 'sisyphus', no oMo install implied by runtime
-    const callArgs = vi.mocked(mockClient.session.promptAsync).mock.calls[0]?.[0] as {
-      body?: {agent?: string}
-    }
-    expect(callArgs?.body?.agent).toBe('sisyphus')
-  })
-
   it('logs build (default) when agent is null', async () => {
     // #given
     setupMockClient()
@@ -2736,7 +2534,6 @@ describe('SDK prompt body shape', () => {
       agent: null,
       model: null,
       timeoutMs: 1800000,
-      omoProviders: createDisabledProviders(),
     }
 
     // #when
@@ -2749,12 +2546,6 @@ describe('SDK prompt body shape', () => {
         agent: 'build (default)',
       }),
     )
-  })
-
-  it('regression: no test asserts sisyphus as default agent', () => {
-    // #then — no test in this file asserts that undefined agent equals 'sisyphus'.
-    // Any such test would violate the omit-when-null contract.
-    expect(true).toBe(true)
   })
 })
 

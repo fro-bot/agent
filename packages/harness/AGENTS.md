@@ -80,7 +80,7 @@ Resolves the base version (dispatch input or tag) and renders the merge prompt f
 
 ### `integrate` job (merge via Fro Bot)
 
-Skipped when `has_refs == 'false'` (empty carry set). When it runs, `uses: ./.github/workflows/harness-integrate.yaml` — a dedicated workflow, **not** `fro-bot.yaml`, and **never** `secrets: inherit`. The caller job declares `permissions: {id-token: write, contents: read}` and passes exactly four secrets explicitly (`APPLICATION_ID`, `APPLICATION_PRIVATE_KEY`, `OPENCODE_CONFIG`, `OMO_PROVIDERS`) plus `model: ${{ vars.HARNESS_MODEL }}` and the rendered prompt. Withholding the durable model credential is the point: it must never reach this workflow. The Fro Bot agent:
+Skipped when `has_refs == 'false'` (empty carry set). When it runs, `uses: ./.github/workflows/harness-integrate.yaml` — a dedicated workflow, **not** `fro-bot.yaml`, and **never** `secrets: inherit`. The caller job declares `permissions: {id-token: write, contents: read}` and passes exactly three secrets explicitly (`APPLICATION_ID`, `APPLICATION_PRIVATE_KEY`, `OPENCODE_CONFIG`) plus `model: ${{ vars.HARNESS_MODEL }}` and the rendered prompt. Withholding the durable model credential is the point: it must never reach this workflow. The Fro Bot agent:
 
 1. Clones `anomalyco/opencode` into a disposable work dir, creates the integration branch at the base version tag, and merges the configured refs.
 2. Builds and verifies the host CLI as a correctness gate.
