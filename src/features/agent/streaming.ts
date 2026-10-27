@@ -55,7 +55,7 @@ export interface EventStreamResult {
    * failure, never evidence the turn ended: this field says the channel closed early, and
    * nothing more. Ledger reconciliation and polling continue independently of it.
    */
-  readonly discontinuity?: {readonly message: string}
+  readonly discontinuity?: {readonly message: string; readonly errorName?: string}
 }
 
 /** Mutable by design — updated in-place during stream processing. */
@@ -609,6 +609,11 @@ export async function processEventStream(
   deadline?: ExecutionDeadline,
   onPermissionAsked?: PermissionAskedResponder,
   ownershipLedger?: OwnershipLedger,
+  /**
+   * Called when the stream's `server.connected` frame is read, whatever the turn's arming state. The server registers
+   * its listener before it emits that frame, so it is the proof that the subscription is live.
+   */
+  onStreamConnected?: () => void,
 ): Promise<EventStreamResult> {
   let lastText = ''
   // Part ids of reasoning parts, from `message.part.updated`. A reasoning delta is a `message.part.delta` with
@@ -647,6 +652,9 @@ export async function processEventStream(
       logServerEvent(event, logger)
       const eventType = getEventKind(event)
       const eventPayload = getEventPayload(event)
+
+      // Before the unarmed-turn guard below: the announcement arrives before any prompt is sent, i.e. while unarmed.
+      if (eventType === 'server.connected') onStreamConnected?.()
 
       if (eventType === 'permission.asked') {
         const eventSessionID = getEventSessionID(event)
@@ -1098,12 +1106,12 @@ export async function processEventStream(
     }
   }
 
-  let discontinuity: {readonly message: string} | undefined
+  let discontinuity: {readonly message: string; readonly errorName?: string} | undefined
 
   // Shared by both the thrown-discontinuity path and the unexpected-EOF path below so the
   // freshness/ledger consequences of "we can no longer see this stream" are recorded exactly
   // once, the same way, regardless of which exit triggered it.
-  function recordDiscontinuity(message: string): void {
+  function recordDiscontinuity(message: string, errorName?: string): void {
     // Unexpected discontinuity: the observation channel closed without an intentional
     // shutdown and without a terminal signal. Selecting an error never proves quiescence,
     // and observing quiescence never erases an error -- this must never be read as the turn
@@ -1111,7 +1119,7 @@ export async function processEventStream(
     // instead of throwing it away, and mark every currently-outstanding owned entry unknown
     // -- reconciliation (triggered by the caller that owns the SDK client, since this
     // function only has the stream) is how they later resolve to settled or cancelled.
-    discontinuity = {message}
+    discontinuity = errorName == null ? {message} : {message, errorName}
     logger.warning('Event stream discontinuity — observation channel closed unexpectedly', {
       sessionId,
       error: message,
@@ -1166,7 +1174,7 @@ export async function processEventStream(
       // about the turn: no diagnostic, no ledger churn, no fabricated failure.
     } else {
       const message = toErrorMessage(error)
-      recordDiscontinuity(message)
+      recordDiscontinuity(message, error instanceof Error ? error.name : undefined)
     }
   }
 

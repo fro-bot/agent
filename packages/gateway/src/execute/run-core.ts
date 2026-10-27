@@ -54,6 +54,7 @@ import {
   isContextOverflowError,
 } from './provider-failure.js'
 import {createReplyDeliveryTracker} from './reply-delivery.js'
+import {startQuarantineRootWatch} from './root-stop.js'
 import {toRuntimeLogger} from './runtime-logger.js'
 import {settleOwnedSessions} from './settle-owned-sessions.js'
 import {createTextBoundaryTracker} from './text-boundary.js'
@@ -65,6 +66,12 @@ import {clearWaitReason, setWaitReason} from './wait-reason-registry.js'
 
 /** Which kind of request a human wait is held for. */
 type HumanWaitKind = 'approval' | 'question'
+
+/**
+ * How long the run waits for the event stream to announce itself (`server.connected`) before it gives up on the
+ * server as unreachable. The wait is also bounded by the run's own deadline and cancel, whichever comes first.
+ */
+export const EVENT_STREAM_CONNECT_TIMEOUT_MS = 10_000
 
 /** Discriminant for `RunCoreError` — `run.ts` maps these to coarse Discord replies. */
 export type RunCoreErrorKind =
@@ -681,6 +688,8 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // there (cancel, deadline, a dropped stream) takes the same root teardown.
   // Loop-scoped: aborted on every exit so the `/event` connection never outlives the run (see `subscribe`).
   const streamController = new AbortController()
+  // Ids of the root session's user messages the event stream has shown (the prompt's own, and any injected notice).
+  const streamedRootUserMessageIds = new Set<string>()
 
   async function throwWithBarrier(
     kind: RunCoreErrorKind,
@@ -716,6 +725,14 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     if (barrierLedger === undefined || (barrierLedger.isDrainComplete() === true && rootFollowUpOpen === false)) {
       throw new RunCoreError(kind, message, false, providerFailureReason, cause)
     }
+    // Background work can start root turns by itself (a finished or cancelled child makes OpenCode inject a notice
+    // turn, prepared like any prompt), so nothing seen in the message list rules out a turn that is not saved yet.
+    // Open means: a child that is not settled, or the drain's follow-up window. Read before settlement, which itself
+    // cancels children and so can trigger notices.
+    const followUpPossible =
+      rootFollowUpOpen &&
+      (barrierLedger.snapshot().some(entry => entry.state !== 'settled') ||
+        (drainCompletion !== undefined && draining === true && drainDoneController.signal.aborted === false))
     const settlement = await settleOwnedSessions({
       client,
       directory,
@@ -724,9 +741,27 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       logger,
       ...(runId === undefined ? {} : {runId}),
       ...(rootFollowUpOpen ? {confirmRootQuiescent: true} : {}),
+      ...(followUpPossible ? {followUpPossible: true} : {}),
+      streamedUserMessageIds: () => streamedRootUserMessageIds,
     })
     if (settlement.settled === true) {
       throw new RunCoreError(kind, message, false, providerFailureReason, cause)
+    }
+    // A root the barrier could not confirm stopped may still be preparing a prompt (an abort sent before the runner
+    // exists does nothing). Keep probing it for the length of the quarantine hold, aborting it whenever it shows up
+    // busy, so it cannot run through the hold unchecked. The watch ends itself at the first confirmation or when the
+    // hold window closes, and its timer is unref'd.
+    if (settlement.rootUnconfirmed) {
+      startQuarantineRootWatch({
+        client,
+        adapter: createSdkLedgerReconcileAdapter(client, directory),
+        directory,
+        rootSessionId: sessionId,
+        streamedUserMessageIds: () => streamedRootUserMessageIds,
+        ...(followUpPossible ? {followUpPossible: true} : {}),
+        logger,
+        ...(runId === undefined ? {} : {runId}),
+      })
     }
     logger.error(
       {...(runId === undefined ? {} : {runId}), sessionId, kind, detail: settlement.reason},
@@ -757,8 +792,8 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   }
 
   // ── 2. Subscribe to events — directory threaded to query (SSE-routing) ─────
-  // Subscribe BEFORE prompt to eliminate the race where permission.asked fires
-  // before the SSE listener exists.
+  // `subscribe()` only builds the stream: the SDK sends no `GET /event` until the first `next()`, and OpenCode replays
+  // nothing to a late connection. So the stream is connected here (step 2c) before the prompt is sent.
   let eventStream: AsyncIterable<unknown>
   // The SDK would reconnect a failed stream with backoff and replay nothing, so events could be lost while the
   // run believes it is still listening. One attempt means a transport failure ends the iterator, which takes the
@@ -790,6 +825,38 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     logger.warn({sessionId}, 'run-core: signal aborted after event subscribe')
     throw await throwWithBarrier('timeout', 'Run timed out: signal aborted after event subscribe')
   }
+
+  // ── 2c. Connect barrier ───────────────────────────────────────────────────
+  // Take ONE iterator and read its first frame. The server registers its listener before it emits `server.connected`,
+  // so once that frame is read nothing published later can be missed: a permission ask, output, idle or error that
+  // follows is queued behind it. The same iterator is consumed by the event loop below (this frame included), so the
+  // stream is never opened twice and never closed early. Nothing has been sent yet, so a failure here is
+  // `unreachable` (cancel and deadline keep `timeout`) and adds no abort of its own. It still leaves through
+  // `throwWithBarrier`, so sessions this run already owns from an earlier turn are settled as on any other early exit
+  // (a run that owns nothing sends no abort at all), and the run is quarantined if they cannot be confirmed settled.
+  const eventIterator = eventStream[Symbol.asyncIterator]()
+  const firstFrame = await awaitFirstEvent(eventIterator, combinedSignal, EVENT_STREAM_CONNECT_TIMEOUT_MS)
+  if (firstFrame.kind === 'aborted') {
+    clearInactivity()
+    logger.warn({sessionId}, 'run-core: signal aborted while waiting for the event stream to connect')
+    throw await throwWithBarrier(
+      'timeout',
+      'Run timed out: signal aborted while waiting for the event stream to connect',
+    )
+  }
+  if (firstFrame.kind !== 'frame' || getEventKind(firstFrame.value) !== 'server.connected') {
+    const detail =
+      firstFrame.kind === 'frame'
+        ? `first frame was ${getEventKind(firstFrame.value) ?? 'not an event'}`
+        : firstFrame.kind === 'error'
+          ? toErrorMessage(firstFrame.error)
+          : firstFrame.kind
+    logger.error({sessionId, detail}, 'run-core: event stream did not connect before the prompt')
+    throw await throwWithBarrier('unreachable', `Event stream did not connect: ${detail}`, {
+      cause: firstFrame.kind === 'error' ? firstFrame.error : streamError,
+    })
+  }
+  eventStream = resumeWith(eventIterator, firstFrame.value)
 
   // ── 3. Send prompt — directory threaded to query ───────────────────────────
   try {
@@ -964,6 +1031,17 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // status, and root assistant/text/tool activity. A notice also registers its injected user message before
   // anything can test completion. No-op for a run with no ledger.
   function observeRootForDrain(rawEvent: unknown, eventType: string | null, eventPayload: unknown): void {
+    // Root user messages the stream showed: the barrier only trusts a message list that holds every one of them.
+    if (eventType === 'message.updated') {
+      const info = getObjectProperty(eventPayload, 'info')
+      if (
+        (getSessionID(eventPayload) ?? getSessionID(info)) === sessionId &&
+        getStringProperty(info, 'role') === 'user'
+      ) {
+        const messageId = getStringProperty(info, 'id')
+        if (messageId !== null) streamedRootUserMessageIds.add(messageId)
+      }
+    }
     if (drainCompletion === undefined) return
     if (eventType === 'message.part.updated') {
       const part = getObjectProperty(eventPayload, 'part')
@@ -1595,6 +1673,67 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/** The result of waiting for the first frame of an event stream. */
+type FirstEvent =
+  | {readonly kind: 'frame'; readonly value: unknown}
+  | {readonly kind: 'ended'}
+  | {readonly kind: 'error'; readonly error: unknown}
+  | {readonly kind: 'timeout'}
+  | {readonly kind: 'aborted'}
+
+/**
+ * Reads the first frame of `iterator`, bounded by `timeoutMs` and abortable. Never closes the iterator: the caller
+ * decides what happens to it. A read that loses the race is left pending, with its rejection absorbed (a late failure
+ * must not become an unhandled rejection), because the caller aborts the subscription that backs it.
+ */
+export async function awaitFirstEvent(
+  iterator: AsyncIterator<unknown>,
+  signal: AbortSignal,
+  timeoutMs: number,
+): Promise<FirstEvent> {
+  if (signal.aborted) return {kind: 'aborted'}
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let onAbort: (() => void) | undefined
+  try {
+    const read: Promise<FirstEvent> = iterator.next().then(
+      (result): FirstEvent => (result.done === true ? {kind: 'ended'} : {kind: 'frame', value: result.value}),
+      (error: unknown): FirstEvent => ({kind: 'error', error}),
+    )
+    const timedOut = new Promise<FirstEvent>(resolve => {
+      timer = setTimeout(() => {
+        resolve({kind: 'timeout'})
+      }, timeoutMs)
+    })
+    const aborted = new Promise<FirstEvent>(resolve => {
+      onAbort = () => {
+        resolve({kind: 'aborted'})
+      }
+      signal.addEventListener('abort', onAbort, {once: true})
+    })
+    return await Promise.race([read, timedOut, aborted])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+    if (onAbort !== undefined) signal.removeEventListener('abort', onAbort)
+  }
+}
+
+/** An iterable over `iterator` that yields `first` (already read from it) before anything else, then the rest. */
+function resumeWith(iterator: AsyncIterator<unknown>, first: unknown): AsyncIterable<unknown> {
+  let pending = true
+  return {
+    [Symbol.asyncIterator]: () => ({
+      next: async () => {
+        if (pending) {
+          pending = false
+          return {done: false, value: first}
+        }
+        return iterator.next()
+      },
+      return: async (value?: unknown) => iterator.return?.(value) ?? {done: true, value},
+    }),
+  }
+}
 
 /**
  * Wrap an async iterable so that each `next()` call races against the abort

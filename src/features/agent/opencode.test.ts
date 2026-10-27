@@ -15,6 +15,9 @@ import {INITIAL_ACTIVITY_TIMEOUT_MS, pollForSessionCompletion, waitForEventProce
 import {logServerEvent, processEventStream, type ActivityTracker} from './streaming.js'
 
 // Mock node:fs/promises
+/** The first frame of every event stream: a new prompt is sent only after it is read. */
+const SERVER_CONNECTED = {type: 'server.connected', properties: {}} as unknown as Event
+
 vi.mock('node:fs/promises', () => ({
   mkdir: vi.fn(),
   writeFile: vi.fn(),
@@ -105,6 +108,7 @@ function createMockEventStream(
 } {
   return {
     stream: (async function* () {
+      yield SERVER_CONNECTED
       for (const event of events) {
         yield event
       }
@@ -163,6 +167,7 @@ function createCurrentTurnActivityStream(
   // Tests using fake timers must call vi.advanceTimersByTimeAsync(0) or similar.
   return {
     stream: (async function* () {
+      yield SERVER_CONNECTED
       await new Promise<void>(resolve => setTimeout(resolve, 0))
       yield createCurrentTurnActivityEvent(sessionID)
       // session.idle is the terminal signal — required for currentTurnTerminalSignalReceived
@@ -221,6 +226,7 @@ function createPromptStartedEventStream(
   signal?.addEventListener('abort', setAborted, {once: true})
   return {
     stream: (async function* () {
+      yield SERVER_CONNECTED
       const callsBeforeSubscribe = promptAsync.mock.calls.length
       while (promptAsync.mock.calls.length === callsBeforeSubscribe) {
         if (aborted) return
@@ -266,6 +272,7 @@ function createPromptStartedErrorEventStream(
   signal?.addEventListener('abort', setAborted, {once: true})
   return {
     stream: (async function* () {
+      yield SERVER_CONNECTED
       const callsBeforeSubscribe = promptAsync.mock.calls.length
       while (promptAsync.mock.calls.length === callsBeforeSubscribe) {
         if (aborted) return
@@ -294,6 +301,7 @@ function createPromptStartedHangingEventStream(
   events: Event[],
 ): AsyncIterable<Event> {
   return (async function* () {
+    yield SERVER_CONNECTED
     const callsBeforeSubscribe = promptAsync.mock.calls.length
     while (promptAsync.mock.calls.length === callsBeforeSubscribe) {
       await new Promise<void>(resolve => {
@@ -951,7 +959,9 @@ describe('executeOpenCode', () => {
       const teardownOrder: string[] = []
       const mockClient = createMockClient({promptResponse: {parts: [{type: 'text', text: 'Response'}]}})
       vi.mocked(mockClient.event.subscribe).mockResolvedValue({
-        stream: (async function* () {})(),
+        stream: (async function* () {
+          yield SERVER_CONNECTED
+        })(),
       } as Awaited<ReturnType<typeof mockClient.event.subscribe>>)
       vi.mocked(mockClient.session.promptAsync).mockReturnValue(new Promise<never>(() => undefined))
       vi.mocked(mockClient.session.abort).mockReturnValue(
@@ -996,7 +1006,9 @@ describe('executeOpenCode', () => {
       const mockClient = createMockClient({promptResponse: {parts: [{type: 'text', text: 'Response'}]}})
       const logger = createMockLogger()
       vi.mocked(mockClient.event.subscribe).mockResolvedValue({
-        stream: (async function* () {})(),
+        stream: (async function* () {
+          yield SERVER_CONNECTED
+        })(),
       } as Awaited<ReturnType<typeof mockClient.event.subscribe>>)
       vi.mocked(mockClient.session.promptAsync).mockReturnValue(new Promise<never>(() => undefined))
       vi.mocked(mockClient.session.abort).mockReturnValue(new Promise<never>(() => undefined))
@@ -5843,6 +5855,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     const stalePreArmEvent: Event = {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event
     const currentTurnEvent = createCurrentTurnActivityEvent()
     const stream = (async function* () {
+      yield SERVER_CONNECTED
       streamStarted = true
       yield stalePreArmEvent
       await postArmEventReady
@@ -5890,6 +5903,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
       releasePromptStarted = resolve
     })
     const events: Event[] = [
+      SERVER_CONNECTED,
       {
         type: 'message.updated',
         properties: {
@@ -5911,7 +5925,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
           next: async (): Promise<IteratorResult<Event>> => {
             const event = events[index]
             if (event != null) {
-              if (index === 0) await promptStarted
+              if (index === 1) await promptStarted
               index++
               return {done: false, value: event}
             }
@@ -5983,6 +5997,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     try {
       const {runPromptAttempt} = await import('./retry.js')
       const events: Event[] = [
+        SERVER_CONNECTED,
         {
           type: 'message.part.delta',
           properties: {sessionID: 'ses_123', delta: {type: 'text', text: 'activity'}},
@@ -6057,6 +6072,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
         releaseStream = resolve
       })
       const events: Event[] = [
+        SERVER_CONNECTED,
         {
           type: 'message.updated',
           properties: {
@@ -7262,6 +7278,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     }
     const eventStream = {
       stream: (async function* () {
+        yield SERVER_CONNECTED
         await new Promise<void>(resolve => {
           setTimeout(resolve, 0)
         })

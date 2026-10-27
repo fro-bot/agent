@@ -16,7 +16,12 @@ import type {RunCoreError} from './run-core.js'
 import {createOwnershipLedger} from '@fro-bot/runtime'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
+import {QUARANTINE_HOLD_WINDOW_MS} from './root-stop.js'
 import {runOpenCodeCore} from './run-core.js'
+import {stoppedRootMessages} from './test-helpers.js'
+
+/** The first frame of every event stream: the run waits for it before it sends the prompt. */
+const SERVER_CONNECTED = {type: 'server.connected', properties: {}} as const
 
 const ROOT = 'sess-123'
 const DIRECTORY = '/workspace/repo'
@@ -63,7 +68,14 @@ interface StartOptions {
   readonly onPrompt?: () => void
   /** `session.status` reply per call (the last entry repeats). Defaults to nothing live. */
   readonly statuses?: readonly Readonly<Record<string, object>>[]
+  /** `session.status` reply by call, overriding `statuses` (e.g. a root that turns up busy at a given time). */
+  readonly status?: () => Readonly<Record<string, object>>
   readonly abort?: () => Promise<unknown>
+  /**
+   * `session.messages` data per call. Defaults to the aborted reply once `session.abort` has been called, and
+   * nothing before: a root that was never told to stop has not produced the evidence that it did.
+   */
+  readonly messages?: (abortCalls: number) => readonly object[]
   /** Called by every `sink.append`; throwing from it makes the event loop body throw. */
   readonly onAppend?: () => void
   /** The gateway run id threaded into `runOpenCodeCore`; omitted by default. */
@@ -90,6 +102,9 @@ function startRun(options: StartOptions = {}): Run {
   let wake: (() => void) | null = null
 
   async function* stream(): AsyncGenerator<object> {
+    // The server announces the stream first; the run sends its prompt only after reading it.
+
+    yield SERVER_CONNECTED
     while (true) {
       if (streamFailure !== null) throw streamFailure.error
       const next = queue.shift()
@@ -105,18 +120,23 @@ function startRun(options: StartOptions = {}): Run {
     }
   }
 
+  const defaultMessages = (abortCalls: number): readonly object[] => (abortCalls > 0 ? stoppedRootMessages(ROOT) : [])
   const statuses = options.statuses ?? [{}]
   let statusCalls = 0
   const client = {
     session: {
       create: vi.fn().mockResolvedValue({data: {id: ROOT}, error: null}),
-      messages: vi.fn().mockResolvedValue({data: [], error: null}),
+      messages: vi.fn(async () => ({
+        data: (options.messages ?? defaultMessages)(client.session.abort.mock.calls.length),
+        error: null,
+      })),
       promptAsync: vi.fn(async () => {
         options.onPrompt?.()
         return {data: {}, error: null}
       }),
       children: vi.fn().mockResolvedValue({data: [], error: null}),
       status: vi.fn(async () => {
+        if (options.status !== undefined) return {data: options.status(), error: null}
         const reply = statuses[Math.min(statusCalls, statuses.length - 1)] ?? {}
         statusCalls += 1
         return {data: reply, error: null}
@@ -299,7 +319,8 @@ describe('root abort on a stop that may leave the root running', () => {
       const error = failure(run)
       expect(error.kind).toBe(scenario.kind)
       expect(error.quarantined).toBe(true)
-      expect(run.abort).toHaveBeenCalledTimes(1)
+      // the root kept showing up live, so it was told to stop again on every poll, not once
+      expect(run.abort.mock.calls.length).toBeGreaterThan(1)
     })
 
     it('quarantines when the abort throws and the root stays live', async () => {
@@ -578,5 +599,175 @@ describe('run id on the termination barrier logs', () => {
       expect(context.runId).toBe(RUN_ID)
     }
     expect(barrierContexts(run).every(context => context.runId === RUN_ID)).toBe(true)
+  })
+})
+
+/**
+ * Models a cold server. The first abort (while the prompt is still being prepared) is acknowledged and lost. The
+ * prompt then starts `startsAfterMs` after that abort and runs until it is aborted AGAIN, after which its aborted
+ * reply is the last message and the root leaves the live set.
+ */
+function coldServer(startsAfterMs: number) {
+  const state = {firstAbortAt: null as number | null, effectiveAbort: false}
+  const running = (): boolean =>
+    !state.effectiveAbort && state.firstAbortAt !== null && Date.now() >= state.firstAbortAt + startsAfterMs
+  const options: StartOptions = {
+    abort: async () => {
+      state.firstAbortAt ??= Date.now()
+      // an abort only works once the prompt is running; before that it is acknowledged and lost
+      if (running()) state.effectiveAbort = true
+      return {data: {}, error: null}
+    },
+    status: (): Record<string, object> => (running() ? {[ROOT]: {type: 'busy'}} : {}),
+    messages: () => (state.effectiveAbort ? stoppedRootMessages(ROOT) : []),
+  }
+  return {state, options}
+}
+
+describe('a cold OpenCode server: an abort sent before the runner exists does nothing', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.clearAllTimers()
+  })
+
+  const cancelScenario = STOP_SCENARIOS.find(scenario => scenario.label === 'operator cancel')
+  if (cancelScenario === undefined) throw new Error('missing scenario')
+
+  it('inside the barrier: no release before evidence, then a re-abort on busy stops the prompt and releases clean', async () => {
+    // #given the prompt starts 1.5 s after the (lost) first abort
+    const {state, options} = coldServer(1_500)
+    const run = await cancelScenario.stop(options)
+
+    // #then about a second into the barrier the root is absent and nothing proves it stopped: no release yet
+    expect(run.outcome()).toBeUndefined()
+    expect(state.effectiveAbort).toBe(false)
+
+    // #when the prompt starts and is aborted again
+    await vi.advanceTimersByTimeAsync(2_000)
+
+    // #then the re-abort stopped it, the terminal reply confirmed it, and the run released without quarantine
+    expect(state.effectiveAbort).toBe(true)
+    expect(failure(run).quarantined).toBe(false)
+    expect(run.abort.mock.calls.length).toBeGreaterThanOrEqual(2)
+  })
+
+  it('past the barrier: quarantines for want of evidence, then the root watch re-aborts the late prompt', async () => {
+    // #given the prompt starts only after the 15 s barrier has given up
+    const {state, options} = coldServer(30_000)
+    const run = await cancelScenario.stop(options)
+
+    // #when the barrier's budget runs out
+    await vi.advanceTimersByTimeAsync(PAST_SETTLE_BOUND_MS)
+
+    // #then nothing confirmed the root, so the run is quarantined, the prompt has not been stopped, and the watch runs
+    expect(failure(run).quarantined).toBe(true)
+    expect(state.effectiveAbort).toBe(false)
+    expect(vi.getTimerCount()).toBeGreaterThan(0)
+
+    // #when the late prompt appears during the hold
+    await vi.advanceTimersByTimeAsync(40_000)
+
+    // #then the watch aborted it, the aborted reply exists, and the watch ended itself
+    expect(state.effectiveAbort).toBe(true)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  /** The persisted turns of a root that answered its prompt: the prompt and a normal, completed reply to it. */
+  const turnOneAnswered = (): readonly object[] => [
+    {info: {id: 'msg_user_1', sessionID: ROOT, role: 'user', time: {created: 1}}, parts: []},
+    {
+      info: {
+        id: 'msg_assistant_1',
+        sessionID: ROOT,
+        role: 'assistant',
+        parentID: 'msg_user_1',
+        time: {created: 2, completed: 3},
+        finish: 'stop',
+      },
+      parts: [],
+    },
+  ]
+
+  it('background work open and a prior completed reply: never confirmed, so the run takes the whole hold and the watch re-aborts busy turns', async () => {
+    // #given a child still running, and a root whose only persisted turn is answered. OpenCode will inject a notice
+    // turn when the child finishes or is cancelled; that turn is prepared like any prompt, so it is not in the list yet
+    const ledger = createOwnershipLedger()
+    ledger.adopt('sess-child', 'background task')
+    const startedAt = Date.now()
+    const run = await cancelScenario.stop({
+      ownershipLedger: ledger,
+      messages: turnOneAnswered,
+      // the notice turn starts well after the barrier gave up, runs, and is gone again
+      status: (): Record<string, object> => {
+        const elapsed = Date.now() - startedAt
+        return elapsed > 40_000 && elapsed < 41_000 ? {[ROOT]: {type: 'busy'}} : {}
+      },
+    })
+
+    // #when the barrier finishes
+    await vi.advanceTimersByTimeAsync(2_000)
+
+    // #then the stop is quarantined at once: the reply to turn 1 cannot speak for a turn that is not saved yet
+    expect(failure(run).quarantined).toBe(true)
+    const abortsAtRelease = run.abort.mock.calls.filter(call => (call[0] as {path: {id: string}}).path.id === ROOT)
+    expect(abortsAtRelease).toHaveLength(1)
+
+    // #when the notice turn shows up as busy inside the hold
+    await vi.advanceTimersByTimeAsync(60_000)
+
+    // #then the watch aborted it, and it did NOT end on the confirmed-looking probe (a completed reply, root absent)
+    const rootAborts = run.abort.mock.calls.filter(call => (call[0] as {path: {id: string}}).path.id === ROOT)
+    expect(rootAborts.length).toBeGreaterThan(1)
+    expect(vi.getTimerCount()).toBeGreaterThan(0)
+    expect(run.logger.info).not.toHaveBeenCalledWith(expect.anything(), expect.stringContaining('confirmed stopped'))
+
+    // #when the hold closes
+    await vi.advanceTimersByTimeAsync(QUARANTINE_HOLD_WINDOW_MS)
+
+    // #then nothing is left
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('no background work and the same completed reply to turn 1: confirmed and released with no quarantine', async () => {
+    // #given the same persisted turn, but nothing owned
+    const run = await cancelScenario.stop({ownershipLedger: createOwnershipLedger(), messages: turnOneAnswered})
+
+    // #then it is confirmed stopped and released at once: over-quarantining would hold the slot for nothing
+    expect(failure(run).quarantined).toBe(false)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('a user message the stream showed but the message list does not hold: the list is stale, so the root is unconfirmed', async () => {
+    // #given the stream announced a user message, and the message list holds an aborted reply but not that message
+    const controller = new AbortController()
+    const run = startRun({controller, messages: () => stoppedRootMessages(ROOT)})
+    await vi.advanceTimersByTimeAsync(100)
+    run.emit({type: 'message.updated', properties: {info: {id: 'msg_user_newer', role: 'user', sessionID: ROOT}}})
+    await vi.advanceTimersByTimeAsync(100)
+
+    // #when the run is cancelled and the barrier runs its course
+    controller.abort()
+    await vi.advanceTimersByTimeAsync(PAST_SETTLE_BOUND_MS)
+
+    // #then the reply cannot be tied to the latest prompt, so the run quarantines
+    expect(failure(run).quarantined).toBe(true)
+  })
+
+  it('a root that never produces evidence is watched for the whole hold and then everything is released', async () => {
+    // #given an abort that never works and a root that stays absent
+    const run = await cancelScenario.stop({messages: () => []})
+
+    // #when the barrier gives up
+    await vi.advanceTimersByTimeAsync(PAST_SETTLE_BOUND_MS)
+
+    // #then quarantined, with the watch still running
+    expect(failure(run).quarantined).toBe(true)
+    expect(vi.getTimerCount()).toBeGreaterThan(0)
+
+    // #when the hold window closes
+    await vi.advanceTimersByTimeAsync(QUARANTINE_HOLD_WINDOW_MS + 1_000)
+
+    // #then no timer is left
+    expect(vi.getTimerCount()).toBe(0)
   })
 })

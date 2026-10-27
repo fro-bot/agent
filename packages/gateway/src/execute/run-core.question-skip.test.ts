@@ -43,6 +43,9 @@ import {createRequestGate} from '../approvals/request-gate.js'
 import {createQuestionEffects} from './question-client.js'
 import {runOpenCodeCore} from './run-core.js'
 
+/** The first frame of every event stream: the run waits for it before it sends the prompt. */
+const SERVER_CONNECTED = {type: 'server.connected', properties: {}} as const
+
 const DIRECTORY = '/workspace/repos/acme/widget'
 const TOKEN = 'fake-bearer-token'
 const SESSION_ID = 'sess-123'
@@ -108,6 +111,8 @@ async function startFakeOpenCode() {
     resume?.()
   }
   async function* stream(): AsyncGenerator<object> {
+    // The server announces the stream first; the run sends its prompt only after reading it.
+    yield SERVER_CONNECTED
     while (true) {
       if (lifecycle.closed) return
       const next = queue.shift()

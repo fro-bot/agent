@@ -5,9 +5,9 @@ import type {Logger} from '../../shared/logger.js'
 import type {AttemptObservation, FailureObservation, TurnEvidence} from './attempt-outcome.js'
 import type {AttemptResult} from './prompt-sender.js'
 import type {ActivityTracker, EventStreamResult, PermissionAskedResponder} from './streaming.js'
-import {getNumberProperty, getObjectProperty, getStringProperty} from '@fro-bot/runtime'
+import {createLLMFetchError, getNumberProperty, getObjectProperty, getStringProperty} from '@fro-bot/runtime'
 import {formatSdkError, toErrorMessage} from '../../shared/errors.js'
-import {reduceAttemptOutcome} from './attempt-outcome.js'
+import {reduceAttemptOutcome, shouldRetryFromOutcome} from './attempt-outcome.js'
 import {
   ledgerBlocksCompletion,
   pollForSessionCompletionObservation,
@@ -22,6 +22,12 @@ import {
   hasFreshIdleCandidate,
   processEventStream,
 } from './streaming.js'
+
+/**
+ * How long a new prompt waits for the event stream to announce itself (`server.connected`) before the attempt fails
+ * without sending it. The wait is also bounded by the run's execution deadline, whichever comes first.
+ */
+export const EVENT_STREAM_CONNECT_TIMEOUT_MS = 10_000
 
 export type PromptStartResult = AttemptResult | null
 export type PromptStarter = () => Promise<PromptStartResult>
@@ -407,6 +413,102 @@ async function startV2SessionWait(
   }
 }
 
+type StreamConnectOutcome = 'connected' | 'stream-ended' | 'timeout' | 'deadline'
+
+/**
+ * Waits for the event stream's `server.connected` frame, or for the reason it will not come.
+ *
+ * `deadline` means the run's time ran out first (the caller rejects as a deadline expiry, like any other
+ * deadline-bounded step); `timeout` means the full 10 s passed with time to spare; `stream-ended` means the stream
+ * ended, or the attempt was cancelled, first.
+ */
+async function awaitStreamConnected(options: {
+  readonly connected: Promise<void>
+  readonly streamEnded: Promise<unknown>
+  readonly signal: AbortSignal
+  readonly deadline: ExecutionDeadline | undefined
+}): Promise<StreamConnectOutcome> {
+  const {connected, streamEnded, signal, deadline} = options
+  // Decided before any timer is armed: an expired deadline wins over everything else.
+  if (deadline != null && (deadline.signal.aborted || deadline.isExpired() || deadline.remainingMs() <= 0)) {
+    return 'deadline'
+  }
+  if (signal.aborted) return 'stream-ended'
+  const remainingMs = deadline?.remainingMs() ?? Number.POSITIVE_INFINITY
+  // The timer is the clipped remaining time, not the 10 s cap, when the run has less than 10 s left.
+  const clipped = remainingMs < EVENT_STREAM_CONNECT_TIMEOUT_MS
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let onAbort: (() => void) | undefined
+  try {
+    const timeout = new Promise<StreamConnectOutcome>(resolve => {
+      timer = setTimeout(
+        () => {
+          resolve(clipped || deadline?.isExpired() === true ? 'deadline' : 'timeout')
+        },
+        Math.min(EVENT_STREAM_CONNECT_TIMEOUT_MS, remainingMs),
+      )
+    })
+    const aborted = new Promise<StreamConnectOutcome>(resolve => {
+      onAbort = () => {
+        resolve(deadline?.signal.aborted === true ? 'deadline' : 'stream-ended')
+      }
+      signal.addEventListener('abort', onAbort, {once: true})
+    })
+    return await Promise.race([
+      connected.then((): StreamConnectOutcome => 'connected'),
+      streamEnded.then((): StreamConnectOutcome => 'stream-ended'),
+      timeout,
+      aborted,
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+    if (onAbort !== undefined) signal.removeEventListener('abort', onAbort)
+  }
+}
+
+/**
+ * The attempt result for a stream that did not connect before the prompt. Nothing reached the remote, so it has the
+ * shape of a failed prompt submission (`submit_failed`), and it carries the same retryable transport error
+ * (`llm_fetch_error`) a transport failure of the submission itself does: the retry loop (`MAX_LLM_RETRIES`, with its
+ * backoff bounded by the deadline) then resends the original prompt, and each attempt subscribes a fresh stream.
+ * `cause` is the discontinuity recorded when an error ended the stream, if one did; only its name and message are
+ * surfaced.
+ */
+function createStreamNotConnectedResult(
+  reason: 'timeout' | 'stream-ended',
+  logger: Logger,
+  sessionId: string,
+  cause: EventStreamResult['discontinuity'],
+): AttemptResult {
+  const causeParts = cause?.errorName == null ? undefined : {errorName: cause.errorName, errorMessage: cause.message}
+  const detail = causeParts == null ? '' : ` (${causeParts.errorName}: ${causeParts.errorMessage})`
+  const message =
+    reason === 'timeout'
+      ? `Event stream did not connect within ${EVENT_STREAM_CONNECT_TIMEOUT_MS / 1000}s; the prompt was not sent`
+      : `Event stream ended before it connected${detail}; the prompt was not sent`
+  logger.warning('Event stream did not connect before the prompt', {sessionId, reason, ...causeParts})
+  const llmError = createLLMFetchError(message)
+  const outcome = 'submit_failed' as const
+  return {
+    success: false,
+    error: message,
+    llmError,
+    outcome,
+    shouldRetry: shouldRetryFromOutcome(outcome),
+    settlement: {kind: 'failure-observed'},
+    eventStreamResult: {
+      tokens: null,
+      model: null,
+      cost: null,
+      prsCreated: [],
+      commitsCreated: [],
+      commentsPosted: 0,
+      llmError,
+      classificationPath: 'fallback',
+    },
+  }
+}
+
 export async function runPromptAttempt(
   client: Awaited<ReturnType<typeof createOpencode>>['client'],
   sessionId: string,
@@ -460,6 +562,11 @@ export async function runPromptAttempt(
     llmError: null,
   }
 
+  let markStreamConnected: () => void = () => {}
+  const streamConnected = new Promise<void>(resolve => {
+    markStreamConnected = resolve
+  })
+
   const eventProcessor = processEventStream(
     events,
     sessionId,
@@ -469,6 +576,7 @@ export async function runPromptAttempt(
     deadline,
     onPermissionAsked,
     ownershipLedger,
+    markStreamConnected,
   )
     .then(result => {
       eventStreamResult = result
@@ -502,11 +610,21 @@ export async function runPromptAttempt(
   let preservedSubmissionFailure: FailureObservation | null = null
 
   try {
-    // Ensure the lazy SDK SSE stream begins connecting before prompt submission. Without this,
-    // event.subscribe().stream is only consumed after promptAsync returns, so early current-turn
-    // events can be missed while the agent is already working.
-    await Promise.resolve()
     if (startPrompt != null) {
+      // The SDK stream is lazy (no `GET /event` until the first `next()`, which the event processor above has
+      // already made) and OpenCode replays nothing to a late connection. The server registers its listener before it
+      // emits `server.connected`, so once that frame is read no later event can be missed. Wait for it before the
+      // baseline read and the prompt: a stream that never connects fails the attempt with nothing sent.
+      const connect = await awaitStreamConnected({
+        connected: streamConnected,
+        streamEnded: eventProcessor,
+        signal: subscriptionSignal,
+        deadline,
+      })
+      if (connect !== 'connected') {
+        if (connect === 'deadline') throw createDeadlineExceededError('event stream connection')
+        return createStreamNotConnectedResult(connect, logger, sessionId, eventStreamResult.discontinuity)
+      }
       activityTracker.baselineMessageIds =
         (await listSessionMessageIds(client, sessionId, directory, logger, deadline)) ?? undefined
       activityTracker.currentTurnArmed = true

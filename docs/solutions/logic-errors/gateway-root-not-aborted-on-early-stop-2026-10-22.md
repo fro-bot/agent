@@ -37,8 +37,9 @@ In #1889, an operator cancel was followed by 11 more minutes of writes. Every la
 
 ## What Didn't Work
 
-- **Requiring positive evidence before trusting absence.** A static reading of the source suggested that an abort sent before the prompt runner exists is a no-op. If so, the root being absent from the live set would falsely confirm it was quiescent. A live probe on OpenCode 1.19.0 contradicted that reading: aborts sent 0 ms and about 500 ms after the `204` were honoured, and the prompt never ran.
-- **Treating session idle as terminal.** Idle also means "not started yet". When a terminal marker is needed, use the last assistant message after the prompt with `time.completed` set.
+- **Trusting absence from the live set.** The first version of this fix confirmed the root stopped once it was absent from `session.status`. A live probe on OpenCode 1.19.0 seemed to support that: aborts sent 0 ms and about 500 ms after the `204` were honoured. Later probes on a cold server showed the static reading was right after all: an abort sent before the prompt's runner exists returns `true` and does nothing (no tombstone, no pending-prompt token), because preparation (agent and skill discovery, provider state, the `chat.message` hook) runs before the runner is registered. The prompt then starts 0.8–2.5 s later. Absence from status held in that window, so the barrier released the lock and slot and the prompt ran in a checkout the next run owned (#1958). The earlier probes had warm servers.
+- **Trusting a terminal reply while background work is open.** A completed reply to the latest user message rules out the turns that exist. It says nothing about a turn that is not saved yet. When a background child finishes, or is cancelled by the barrier's own abort, OpenCode injects a notice turn into the root; that turn runs the same preparation as any prompt (agent and skill discovery, provider state, the `chat.message` hook) before its user message is stored and its runner registers. In that window the root is absent, the last message is the completed reply to the earlier turn, and every streamed id is present. A stop with background work open therefore never confirms the root: it is quarantined, and the root watch aborts every busy observation for the whole hold.
+- **Treating session idle as terminal.** Idle also means "not started yet", and `session.status` has no "preparing" state, so absence proves nothing. The terminal marker is the last assistant message answering the latest user message that is either a qualified terminal reply (completed, no error, `finish` not `tool-calls` or `unknown`, no blocking tool part) or an aborted reply (`MessageAbortedError` with `time.completed`). `time.completed` alone is not enough: OpenCode sets it when it cleans up an intermediate `tool-calls` step too, and the turn goes on. The probe also reads liveness once more after it has read that evidence, because a cold root can start between the first reading and the messages read.
 
 ## Solution
 
@@ -50,7 +51,7 @@ Every stop that may leave the root running passes `rootMayBeRunning: true` to `t
 - an unexpected event-loop error;
 - an abort during or after `promptAsync`.
 
-Other failures keep the default `false`: unreachable, auth, prompt error, subscribe failure and drain timeout. When the flag is set, `throwWithBarrier` runs `settleOwnedSessions` with `confirmRootQuiescent: true`. It aborts the root and polls the directory's live set until the root is absent (`packages/gateway/src/execute/settle-owned-sessions.ts:244-254`), within the 15 s settle budget. If the root cannot be confirmed quiescent, the run quarantines.
+Other failures keep the default `false`: unreachable, auth, prompt error, subscribe failure and drain timeout. When the flag is set, `throwWithBarrier` runs `settleOwnedSessions` with `confirmRootQuiescent: true`. It aborts the root and polls until the root is absent from the directory's live set **and** its session shows a terminal reply to the latest prompt (`packages/gateway/src/execute/root-stop.ts` `probeRootStop`), within the 15 s settle budget. Every poll that finds the root live sends another abort. If the root cannot be confirmed quiescent, the run quarantines.
 
 The fast-path decision in `throwWithBarrier` is at `packages/gateway/src/execute/run-core.ts:673-679`:
 
@@ -70,8 +71,8 @@ A `promptAsync` that throws after the run signal aborted is treated as a stop wh
 
 ## Why This Works
 
-- An abort is a request, not proof that the root stopped. Absence from the directory-scoped live set after the abort is the confirmation.
-- The probe that sent early aborts at 0 ms and 500 ms after the `204` (one run each) saw them honoured. Absence after an early abort therefore counts as confirmation.
+- An abort is a request, not proof that the root stopped. Only a completed assistant reply to the latest user message is positive evidence; a root that has not started yet is absent from the live set too.
+- A cold server loses an early abort. With no terminal reply inside the confirm window the run quarantines, and a root watch keeps probing through the quarantine hold, aborting again each time the root turns up busy, so a late prompt is stopped instead of running through the hold.
 - An unconfirmed stop reuses the existing quarantine path, which holds the lock and slot for the quarantine window.
 - A dead server always quarantines. `liveSessionIds` fails, so the root can never be seen absent. This is the intended fail-safe direction.
 
@@ -79,7 +80,7 @@ A `promptAsync` that throws after the run signal aborted is treated as a stop wh
 
 - `rootMayBeRunning` defaults to `false` in the `throwWithBarrier` options, so a new termination path in `run-core.ts` that omits it takes the fast path.
 - `packages/gateway/src/execute/run-core.root-abort.test.ts` runs every stop reason against an absent ledger and against an empty one. It covers quarantine when the root stays live and when the abort fails, and it checks that a clean completion sends no abort.
-- `confirms and releases on absence after an abort sent right after promptAsync returned` in `packages/gateway/src/execute/settle-owned-sessions.test.ts` pins the probe result with a mock. When `base_version` in `packages/harness/harness.config.json` moves, re-run the live probe: abort at 0 ms and 500 ms after the `204`, then watch for busy status or written files for 40 s.
+- `packages/gateway/src/execute/run-core.root-abort.test.ts` (`a cold OpenCode server`) models a server that loses the first abort and starts the prompt later, inside and past the barrier. `settle-owned-sessions.test.ts` and `root-stop.test.ts` pin the evidence rules: an older turn's reply, no user message yet, an unfinished reply, a last message that is not an assistant message and a stale message list never confirm, and a stop with background work open never confirms at all. When `base_version` in `packages/harness/harness.config.json` moves, re-run the live probe against a COLD server: abort at 0 ms and 500 ms after the `204`, then watch for busy status or written files for 40 s.
 
 ## Related Issues
 

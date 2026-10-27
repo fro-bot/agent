@@ -23,7 +23,7 @@ FROM node:24.22.1-alpine3.24@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c
 
 WORKDIR /workspace
 
-ARG BUN_VERSION=1.3.14
+ARG BUN_VERSION=1.4.4
 
 # curl + unzip to fetch and extract the verified Bun release archive.
 RUN apk add --no-cache curl unzip
@@ -153,8 +153,8 @@ WORKDIR /app
 # OPENCODE_VERSION is the harness build of OpenCode (fro-bot/agent releases),
 # in the form <base>+harness.<sha>. Bumped in lockstep with the action default
 # by the harness-release workflow; merge the auto-PR to advance both surfaces.
-ARG OPENCODE_VERSION=1.19.0+harness.caa47272
-ARG SYSTEMATIC_VERSION=3.26.3
+ARG OPENCODE_VERSION=1.19.4+harness.5bde2635
+ARG SYSTEMATIC_VERSION=3.26.4
 
 # System packages come from the base image's Alpine 3.24 branch and are not
 # pinned: the branch index drops older versions, so exact pins would break the

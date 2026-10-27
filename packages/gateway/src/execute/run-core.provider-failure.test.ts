@@ -14,6 +14,10 @@ import {createOwnershipLedger} from '@fro-bot/runtime'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
 import {RunCoreError, runOpenCodeCore} from './run-core.js'
+import {stoppedRootMessages} from './test-helpers.js'
+
+/** The first frame of every event stream: the run waits for it before it sends the prompt. */
+const SERVER_CONNECTED = {type: 'server.connected', properties: {}} as const
 
 const ROOT = 'sess-123'
 const CHILD = 'sess-child'
@@ -79,7 +83,10 @@ interface StartOptions {
   readonly abort?: () => Promise<unknown>
   /** Direct children `session.children` reports for the root; defaults to none. */
   readonly children?: readonly string[]
-  /** The root's persisted messages, read on every `session.messages` call; defaults to none. */
+  /**
+   * The root's persisted messages, read on every `session.messages` call. Defaults to none until the root is
+   * aborted, then the abort's reply: the evidence the termination barrier accepts as "the root stopped".
+   */
   readonly rootMessages?: () => readonly object[]
 }
 
@@ -89,6 +96,9 @@ function startRun(options: StartOptions = {}): Run {
   let wake: (() => void) | null = null
 
   async function* stream(): AsyncGenerator<object> {
+    // The server announces the stream first; the run sends its prompt only after reading it.
+
+    yield SERVER_CONNECTED
     while (true) {
       const next = queue.shift()
       if (next === undefined) {
@@ -105,7 +115,11 @@ function startRun(options: StartOptions = {}): Run {
     session: {
       create: vi.fn().mockResolvedValue({data: {id: ROOT}, error: null}),
       messages: vi.fn(async (args: {path: {id: string}}) => ({
-        data: args.path.id === ROOT ? (options.rootMessages?.() ?? []) : [],
+        data:
+          args.path.id === ROOT
+            ? (options.rootMessages?.() ??
+              (client.session.abort.mock.calls.length > 0 ? stoppedRootMessages(ROOT) : []))
+            : [],
         error: null,
       })),
       promptAsync: vi.fn().mockResolvedValue({data: {}, error: null}),
