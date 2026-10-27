@@ -67,6 +67,12 @@ import {clearWaitReason, setWaitReason} from './wait-reason-registry.js'
 type HumanWaitKind = 'approval' | 'question'
 
 /** Discriminant for `RunCoreError` — `run.ts` maps these to coarse Discord replies. */
+/**
+ * How long the run waits for the event stream to announce itself (`server.connected`) before it gives up on the
+ * server as unreachable. The wait is also bounded by the run's own deadline and cancel, whichever comes first.
+ */
+export const EVENT_STREAM_CONNECT_TIMEOUT_MS = 10_000
+
 export type RunCoreErrorKind =
   | 'unreachable' // network error / server not reachable
   | 'auth' // proxy rejected the bearer token (401)
@@ -757,8 +763,8 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   }
 
   // ── 2. Subscribe to events — directory threaded to query (SSE-routing) ─────
-  // Subscribe BEFORE prompt to eliminate the race where permission.asked fires
-  // before the SSE listener exists.
+  // `subscribe()` only builds the stream: the SDK sends no `GET /event` until the first `next()`, and OpenCode replays
+  // nothing to a late connection. So the stream is connected here (step 2c) before the prompt is sent.
   let eventStream: AsyncIterable<unknown>
   // The SDK would reconnect a failed stream with backoff and replay nothing, so events could be lost while the
   // run believes it is still listening. One attempt means a transport failure ends the iterator, which takes the
@@ -790,6 +796,36 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     logger.warn({sessionId}, 'run-core: signal aborted after event subscribe')
     throw await throwWithBarrier('timeout', 'Run timed out: signal aborted after event subscribe')
   }
+
+  // ── 2c. Connect barrier ───────────────────────────────────────────────────
+  // Take ONE iterator and read its first frame. The server registers its listener before it emits `server.connected`,
+  // so once that frame is read nothing published later can be missed: a permission ask, output, idle or error that
+  // follows is queued behind it. The same iterator is consumed by the event loop below (this frame included), so the
+  // stream is never opened twice and never closed early. Nothing has been sent yet, so a failure here never touches
+  // the root: it is `unreachable` (cancel and deadline keep `timeout`) with no root abort and no quarantine.
+  const eventIterator = eventStream[Symbol.asyncIterator]()
+  const firstFrame = await awaitFirstEvent(eventIterator, combinedSignal, EVENT_STREAM_CONNECT_TIMEOUT_MS)
+  if (firstFrame.kind === 'aborted') {
+    clearInactivity()
+    logger.warn({sessionId}, 'run-core: signal aborted while waiting for the event stream to connect')
+    throw await throwWithBarrier(
+      'timeout',
+      'Run timed out: signal aborted while waiting for the event stream to connect',
+    )
+  }
+  if (firstFrame.kind !== 'frame' || getEventKind(firstFrame.value) !== 'server.connected') {
+    const detail =
+      firstFrame.kind === 'frame'
+        ? `first frame was ${getEventKind(firstFrame.value) ?? 'not an event'}`
+        : firstFrame.kind === 'error'
+          ? toErrorMessage(firstFrame.error)
+          : firstFrame.kind
+    logger.error({sessionId, detail}, 'run-core: event stream did not connect before the prompt')
+    throw await throwWithBarrier('unreachable', `Event stream did not connect: ${detail}`, {
+      cause: firstFrame.kind === 'error' ? firstFrame.error : streamError,
+    })
+  }
+  eventStream = resumeWith(eventIterator, firstFrame.value)
 
   // ── 3. Send prompt — directory threaded to query ───────────────────────────
   try {
@@ -1606,6 +1642,67 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
  * wrapper the `for await` loop only checks `signal.aborted` AFTER an event
  * arrives, meaning a timed-out run can block indefinitely on a quiet stream.
  */
+/** The result of waiting for the first frame of an event stream. */
+type FirstEvent =
+  | {readonly kind: 'frame'; readonly value: unknown}
+  | {readonly kind: 'ended'}
+  | {readonly kind: 'error'; readonly error: unknown}
+  | {readonly kind: 'timeout'}
+  | {readonly kind: 'aborted'}
+
+/**
+ * Reads the first frame of `iterator`, bounded by `timeoutMs` and abortable. Never closes the iterator: the caller
+ * decides what happens to it. A read that loses the race is left pending, with its rejection absorbed (a late failure
+ * must not become an unhandled rejection), because the caller aborts the subscription that backs it.
+ */
+export async function awaitFirstEvent(
+  iterator: AsyncIterator<unknown>,
+  signal: AbortSignal,
+  timeoutMs: number,
+): Promise<FirstEvent> {
+  if (signal.aborted) return {kind: 'aborted'}
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let onAbort: (() => void) | undefined
+  try {
+    const read: Promise<FirstEvent> = iterator.next().then(
+      (result): FirstEvent => (result.done === true ? {kind: 'ended'} : {kind: 'frame', value: result.value}),
+      (error: unknown): FirstEvent => ({kind: 'error', error}),
+    )
+    const timedOut = new Promise<FirstEvent>(resolve => {
+      timer = setTimeout(() => {
+        resolve({kind: 'timeout'})
+      }, timeoutMs)
+    })
+    const aborted = new Promise<FirstEvent>(resolve => {
+      onAbort = () => {
+        resolve({kind: 'aborted'})
+      }
+      signal.addEventListener('abort', onAbort, {once: true})
+    })
+    return await Promise.race([read, timedOut, aborted])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+    if (onAbort !== undefined) signal.removeEventListener('abort', onAbort)
+  }
+}
+
+/** An iterable over `iterator` that yields `first` (already read from it) before anything else, then the rest. */
+function resumeWith(iterator: AsyncIterator<unknown>, first: unknown): AsyncIterable<unknown> {
+  let pending = true
+  return {
+    [Symbol.asyncIterator]: () => ({
+      next: async () => {
+        if (pending) {
+          pending = false
+          return {done: false, value: first}
+        }
+        return iterator.next()
+      },
+      return: async (value?: unknown) => iterator.return?.(value) ?? {done: true, value},
+    }),
+  }
+}
+
 async function* makeAbortableStream(stream: AsyncIterable<unknown>, signal: AbortSignal): AsyncGenerator<unknown> {
   const iterator = stream[Symbol.asyncIterator]()
 

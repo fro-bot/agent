@@ -30,6 +30,9 @@ import {RunCoreError, runOpenCodeCore, wrapLedgerWithHooks} from './run-core.js'
 // ---------------------------------------------------------------------------
 
 /** A fake sink that records appended text and always resolves flush. */
+/** The first frame of every event stream: the run waits for it before it sends the prompt. */
+const SERVER_CONNECTED = {type: 'server.connected', properties: {}} as const
+
 function makeSink(): DiscordStreamSink & {readonly _appended: string[]} {
   const appended: string[] = []
   let buffer = ''
@@ -59,6 +62,8 @@ function makeLogger(): GatewayLogger {
 
 /** Build an async generator that yields the given events then terminates. */
 async function* makeEventStream(events: readonly object[]): AsyncGenerator<object> {
+  // The server announces the stream first; the run sends its prompt only after reading it.
+  yield SERVER_CONNECTED
   for (const event of events) {
     yield event
   }
@@ -69,6 +74,8 @@ async function* makeEventStream(events: readonly object[]): AsyncGenerator<objec
  * Used by inactivity-timeout tests that need a stream that never completes.
  */
 async function* hangingStreamAfterFirst(firstEvent: object): AsyncGenerator<object> {
+  // The server announces the stream first; the run sends its prompt only after reading it.
+  yield SERVER_CONNECTED
   yield firstEvent
   await new Promise<void>(() => {
     /* never resolves */
@@ -83,6 +90,8 @@ function makeControlledStream(): {
   const eventQueue: object[] = []
   let resolveNext: (() => void) | null = null
   async function* controlledStream(): AsyncGenerator<object> {
+    // The server announces the stream first; the run sends its prompt only after reading it.
+    yield SERVER_CONNECTED
     while (true) {
       if (eventQueue.length > 0) {
         const next = eventQueue.shift()
@@ -1288,6 +1297,7 @@ describe('runOpenCodeCore', () => {
         subscribe: async () => {
           return Promise.resolve({
             stream: (async function* () {
+              yield SERVER_CONNECTED
               // Yield nothing — simulates a silent/hanging stream
               await new Promise<void>(() => {
                 /* never resolves */
@@ -1333,7 +1343,7 @@ describe('runOpenCodeCore', () => {
       expect(logger.warn).toHaveBeenCalledWith(
         expect.objectContaining({
           sessionId: 'sess-123',
-          totalEvents: 1,
+          totalEvents: 2, // server.connected, then the delta
           activityEvents: 1,
           lastEventType: 'message.part.delta',
         }),
@@ -2436,6 +2446,7 @@ describe('runOpenCodeCore', () => {
         subscribe: async () =>
           Promise.resolve({
             stream: (async function* () {
+              yield SERVER_CONNECTED
               // Yields nothing — stream closes immediately without session.idle
             })(),
           }),
@@ -2467,7 +2478,7 @@ describe('runOpenCodeCore', () => {
       expect(logger.error).toHaveBeenCalledWith(
         expect.objectContaining({
           sessionId: 'sess-123',
-          totalEvents: 1,
+          totalEvents: 2, // server.connected, then the delta
           activityEvents: 1,
           lastEventType: 'message.part.delta',
         }),
@@ -2486,6 +2497,7 @@ describe('runOpenCodeCore', () => {
         subscribe: async () =>
           Promise.resolve({
             stream: (async function* () {
+              yield SERVER_CONNECTED
               // Silent stream — never yields
               await new Promise<void>(() => {
                 /* never resolves */
@@ -2794,6 +2806,7 @@ describe('runOpenCodeCore', () => {
         subscribe: async () =>
           Promise.resolve({
             stream: (async function* () {
+              yield SERVER_CONNECTED
               // Yield nothing — simulate a completely silent stream
               await new Promise<void>(() => {
                 /* never resolves */
@@ -2883,6 +2896,7 @@ describe('runOpenCodeCore', () => {
         subscribe: async () =>
           Promise.resolve({
             stream: (async function* () {
+              yield SERVER_CONNECTED
               await new Promise<void>(() => {
                 /* never resolves */
               })
@@ -2899,11 +2913,16 @@ describe('runOpenCodeCore', () => {
       // #when
       const err = await runOpenCodeCore(params).catch((error: unknown) => error)
 
-      // #then — inactivity-timeout thrown with totalEvents:0, activityEvents:0 (silent hang signature)
+      // #then — inactivity-timeout thrown with only the connect frame counted and no activity (silent hang signature)
       expect(err).toBeInstanceOf(RunCoreError)
       expect((err as RunCoreError).kind).toBe('inactivity-timeout')
       expect(logger.warn).toHaveBeenCalledWith(
-        expect.objectContaining({sessionId: 'sess-123', totalEvents: 0, activityEvents: 0}),
+        expect.objectContaining({
+          sessionId: 'sess-123',
+          totalEvents: 1,
+          activityEvents: 0,
+          lastEventType: 'server.connected',
+        }),
         'run-core: stream ended due to inactivity timeout',
       )
     }, 10_000)
@@ -2916,6 +2935,7 @@ describe('runOpenCodeCore', () => {
         subscribe: async () =>
           Promise.resolve({
             stream: (async function* () {
+              yield SERVER_CONNECTED
               yield partDeltaObjectEvent('should be ignored', 'other-session')
               yield {type: 'some.unrecognized.event', properties: {sessionID: 'sess-123'}}
               await new Promise<void>(() => {
@@ -2975,9 +2995,9 @@ describe('runOpenCodeCore', () => {
         {eventType: 'some.unrecognized.event', sessionId: 'sess-123'},
         'run-core: unrecognized event type',
       )
-      // session.idle log carries totalEvents > 0 (counts the unrecognized event + session.idle itself)
+      // session.idle log carries totalEvents (counts server.connected + the unrecognized event + session.idle itself)
       expect(logger.info).toHaveBeenCalledWith(
-        expect.objectContaining({sessionId: 'sess-123', totalEvents: 2}),
+        expect.objectContaining({sessionId: 'sess-123', totalEvents: 3}),
         'run-core: session.idle received — stream complete',
       )
     })
@@ -3023,6 +3043,7 @@ describe('runOpenCodeCore', () => {
         subscribe: async () =>
           Promise.resolve({
             stream: (async function* () {
+              yield SERVER_CONNECTED
               await new Promise<void>(() => {
                 /* never resolves */
               })
@@ -3048,6 +3069,7 @@ describe('runOpenCodeCore', () => {
         subscribe: async () =>
           Promise.resolve({
             stream: (async function* () {
+              yield SERVER_CONNECTED
               await new Promise<void>(() => {
                 /* never resolves */
               })
@@ -3107,6 +3129,9 @@ describe('runOpenCodeCore', () => {
         let resolveNext: (() => void) | null = null
 
         async function* controlledStream(): AsyncGenerator<object> {
+          // The server announces the stream first; the run sends its prompt only after reading it.
+
+          yield SERVER_CONNECTED
           while (true) {
             if (eventQueue.length > 0) {
               const next = eventQueue.shift()
@@ -3199,6 +3224,8 @@ describe('runOpenCodeCore', () => {
         // Stream: permission.asked, then (after a long wait) permission.replied, then session.idle
         let emitReply!: () => void
         async function* controlledStream(): AsyncGenerator<object> {
+          // The server announces the stream first; the run sends its prompt only after reading it.
+          yield SERVER_CONNECTED
           yield permissionAskedEvent('req-pause-1')
           // Simulate a long human approval wait — longer than the inactivity window
           await new Promise<void>(resolve => {
@@ -3276,6 +3303,9 @@ describe('runOpenCodeCore', () => {
         let wake: (() => void) | null = null
 
         async function* stream(): AsyncGenerator<object> {
+          // The server announces the stream first; the run sends its prompt only after reading it.
+
+          yield SERVER_CONNECTED
           while (true) {
             const next = queue.shift()
             if (next === undefined) {
@@ -3589,6 +3619,8 @@ describe('runOpenCodeCore', () => {
       const eventQueue: object[] = []
       let resolveNext: (() => void) | null = null
       async function* controlledStream(): AsyncGenerator<object> {
+        // The server announces the stream first; the run sends its prompt only after reading it.
+        yield SERVER_CONNECTED
         while (true) {
           if (eventQueue.length > 0) {
             const next = eventQueue.shift()
