@@ -609,6 +609,11 @@ export async function processEventStream(
   deadline?: ExecutionDeadline,
   onPermissionAsked?: PermissionAskedResponder,
   ownershipLedger?: OwnershipLedger,
+  /**
+   * Called when the stream's `server.connected` frame is read, whatever the turn's arming state. The server registers
+   * its listener before it emits that frame, so it is the proof that the subscription is live.
+   */
+  onStreamConnected?: () => void,
 ): Promise<EventStreamResult> {
   let lastText = ''
   // Part ids of reasoning parts, from `message.part.updated`. A reasoning delta is a `message.part.delta` with
@@ -647,6 +652,9 @@ export async function processEventStream(
       logServerEvent(event, logger)
       const eventType = getEventKind(event)
       const eventPayload = getEventPayload(event)
+
+      // Before the unarmed-turn guard below: the announcement arrives before any prompt is sent, i.e. while unarmed.
+      if (eventType === 'server.connected') onStreamConnected?.()
 
       if (eventType === 'permission.asked') {
         const eventSessionID = getEventSessionID(event)

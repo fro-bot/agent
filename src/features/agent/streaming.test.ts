@@ -2653,3 +2653,52 @@ describe('RootFreshnessTracker — Phase A scaffolding transitions (previously u
     expect(hasFreshIdleCandidate(tracker)).toBe(true)
   })
 })
+
+describe('processEventStream — the connect announcement', () => {
+  const connectedEvent = (): Event => ({type: 'server.connected', properties: {}}) as unknown as Event
+
+  it('reports server.connected even while the turn is unarmed, and only for that frame', async () => {
+    // #given a turn that has not been armed (no prompt sent yet) and a stream that announces itself
+    const abortController = new AbortController()
+    const tracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      currentTurnArmed: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const onStreamConnected = vi.fn()
+    const eventStream = createMockEventStream(
+      [{type: 'server.heartbeat', properties: {}} as unknown as Event, connectedEvent()],
+      () => abortController.abort(),
+    )
+
+    // #when
+    await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      abortController.signal,
+      createMockLogger(),
+      tracker,
+      undefined,
+      undefined,
+      undefined,
+      onStreamConnected,
+    )
+
+    // #then it was reported once, and the unarmed turn recorded no activity from it
+    expect(onStreamConnected).toHaveBeenCalledOnce()
+    expect(tracker.firstMeaningfulEventReceived).toBe(false)
+  })
+
+  it('does not require a listener', async () => {
+    // #given
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([connectedEvent()], () => abortController.abort())
+
+    // #when / #then
+    await expect(
+      processEventStream(eventStream, ROOT_SESSION_ID, abortController.signal, createMockLogger()),
+    ).resolves.toBeDefined()
+  })
+})
