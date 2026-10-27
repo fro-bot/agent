@@ -56,7 +56,7 @@ export const DEFAULT_MODEL = {
 // the stock OpenCode binary with verified SHA256SUMS. Downloaded from fro-bot/agent
 // releases, checksum-verified, and fail-closed on mismatch — no silent stock fallback.
 // FALLBACK_VERSION (in opencode.ts) is the plain stock base used when latest-fetch fails.
-export const DEFAULT_OPENCODE_VERSION = '1.19.0+harness.caa47272'
+export const DEFAULT_OPENCODE_VERSION = '1.19.4+harness.5bde2635'
 export const DEFAULT_BUN_VERSION = '1.4.4'
 export const DEFAULT_OMO_VERSION = '4.19.4'
 // OMO Slim (oh-my-opencode-slim) pinned version. Stable line only — the 2.0.0-beta
