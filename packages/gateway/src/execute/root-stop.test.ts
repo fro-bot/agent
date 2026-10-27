@@ -52,6 +52,11 @@ describe('rootHasTerminalReply', () => {
     expect(rootHasTerminalReply(messages, NONE)).toBe(false)
   })
 
+  it('rejects a last message that is not an assistant message, even with a matching parent and a completion time', () => {
+    const toolResult = {info: {id: 't1', role: 'tool', parentID: 'u1', time: {completed: 2}}, parts: []}
+    expect(rootHasTerminalReply([user('u1'), toolResult], NONE)).toBe(false)
+  })
+
   it('rejects a list that lacks a user message the stream showed', () => {
     expect(rootHasTerminalReply([user('u1'), reply('a1', 'u1')], new Set(['u-newer']))).toBe(false)
   })
@@ -94,6 +99,29 @@ describe('probeRootStop', () => {
     expect(await probeRootStop({...base, client, adapter, signal: new AbortController().signal})).toBe('confirmed')
   })
 
+  it('with a follow-up possible, a terminal reply to the latest message still does not confirm', async () => {
+    // #given a root that is absent, with a completed aborted reply: exactly what confirms without background work
+    const {client, adapter, messages} = makeFixtures({messages: () => stoppedRootMessages(ROOT)})
+    const probe = await probeRootStop({
+      ...base,
+      client,
+      adapter,
+      signal: new AbortController().signal,
+      followUpPossible: true,
+    })
+
+    // #then a newer turn that is not saved yet cannot be ruled out, so it is only unconfirmed (no messages read)
+    expect(probe).toBe('unconfirmed')
+    expect(messages).not.toHaveBeenCalled()
+  })
+
+  it('with a follow-up possible, a live root is still busy (so it is aborted again)', async () => {
+    const {client, adapter} = makeFixtures({live: () => [ROOT], messages: () => stoppedRootMessages(ROOT)})
+    expect(
+      await probeRootStop({...base, client, adapter, signal: new AbortController().signal, followUpPossible: true}),
+    ).toBe('busy')
+  })
+
   it('is unconfirmed when the liveness lookup fails', async () => {
     const {client} = makeFixtures({})
     const adapter = {
@@ -103,7 +131,10 @@ describe('probeRootStop', () => {
   })
 })
 
-function startWatch(fixtures: ReturnType<typeof makeFixtures>, extra: {windowMs?: number} = {}) {
+function startWatch(
+  fixtures: ReturnType<typeof makeFixtures>,
+  extra: {windowMs?: number; followUpPossible?: boolean} = {},
+) {
   vi.useFakeTimers()
   const logger = makeLogger()
   const stop = startQuarantineRootWatch({
@@ -144,6 +175,37 @@ describe('startQuarantineRootWatch', () => {
     expect(logger.info).toHaveBeenCalledWith(
       expect.objectContaining({runId: 'run-1'}),
       expect.stringContaining('confirmed stopped'),
+    )
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('with a follow-up possible, never ends on a terminal reply: it aborts each busy observation until the window closes', async () => {
+    // #given a root with a completed reply to its latest turn, busy now and then, and a follow-up that may start
+    let polls = 0
+    const fixtures = makeFixtures({
+      live: () => {
+        polls += 1
+        return polls % 4 === 0 ? [ROOT] : []
+      },
+      messages: () => stoppedRootMessages(ROOT),
+    })
+    const {logger} = startWatch(fixtures, {windowMs: 10_000, followUpPossible: true})
+
+    // #when most of the window passes
+    await vi.advanceTimersByTimeAsync(9_000)
+
+    // #then it is still watching, and it aborted the busy observations
+    expect(fixtures.abort.mock.calls.length).toBeGreaterThan(1)
+    expect(vi.getTimerCount()).toBeGreaterThan(0)
+    expect(logger.info).not.toHaveBeenCalledWith(expect.anything(), expect.stringContaining('confirmed stopped'))
+
+    // #when the window closes
+    await vi.advanceTimersByTimeAsync(2_000)
+
+    // #then it ended at the window, with nothing left
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining('hold ended without confirming'),
     )
     expect(vi.getTimerCount()).toBe(0)
   })

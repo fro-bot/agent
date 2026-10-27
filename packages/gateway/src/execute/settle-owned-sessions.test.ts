@@ -634,6 +634,22 @@ describe('settleOwnedSessions', () => {
       expect(abort).toHaveBeenCalledTimes(1)
     })
 
+    it('with a follow-up possible: aborts the root and the child, never polls for the root, and reports it unconfirmed', async () => {
+      // #given background work is open and the root already has a completed reply (the evidence that confirms otherwise)
+      const ledger = createOwnershipLedger()
+      ledger.adopt(CHILD, 'background task')
+      const {client, abort, session} = makePromptedClient({messages: () => STOPPED()})
+
+      // #when
+      const result = await settle(client, {ledger, followUpPossible: true})
+
+      // #then the children are still cancelled, but no poll can confirm a turn that is not saved yet
+      expect(result).toMatchObject({settled: false, rootUnconfirmed: true})
+      expect(abort).toHaveBeenCalledWith(expect.objectContaining({path: {id: ROOT}}))
+      expect(abort).toHaveBeenCalledWith(expect.objectContaining({path: {id: CHILD}}))
+      expect(session.messages).not.toHaveBeenCalled()
+    })
+
     it('cold server: absence from the live set alone is not confirmation; the root is unconfirmed at the bound', async () => {
       // #given an abort that did nothing (no runner yet): the root is absent and no reply exists
       const {client} = makePromptedClient({})

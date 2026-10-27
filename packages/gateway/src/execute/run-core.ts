@@ -725,6 +725,14 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     if (barrierLedger === undefined || (barrierLedger.isDrainComplete() === true && rootFollowUpOpen === false)) {
       throw new RunCoreError(kind, message, false, providerFailureReason, cause)
     }
+    // Background work can start root turns by itself (a finished or cancelled child makes OpenCode inject a notice
+    // turn, prepared like any prompt), so nothing seen in the message list rules out a turn that is not saved yet.
+    // Open means: a child that is not settled, or the drain's follow-up window. Read before settlement, which itself
+    // cancels children and so can trigger notices.
+    const followUpPossible =
+      rootFollowUpOpen &&
+      (barrierLedger.snapshot().some(entry => entry.state !== 'settled') ||
+        (drainCompletion !== undefined && draining === true && drainDoneController.signal.aborted === false))
     const settlement = await settleOwnedSessions({
       client,
       directory,
@@ -733,6 +741,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       logger,
       ...(runId === undefined ? {} : {runId}),
       ...(rootFollowUpOpen ? {confirmRootQuiescent: true} : {}),
+      ...(followUpPossible ? {followUpPossible: true} : {}),
       streamedUserMessageIds: () => streamedRootUserMessageIds,
     })
     if (settlement.settled === true) {
@@ -749,6 +758,7 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
         directory,
         rootSessionId: sessionId,
         streamedUserMessageIds: () => streamedRootUserMessageIds,
+        ...(followUpPossible ? {followUpPossible: true} : {}),
         logger,
         ...(runId === undefined ? {} : {runId}),
       })

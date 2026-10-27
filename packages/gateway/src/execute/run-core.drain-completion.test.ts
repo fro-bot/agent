@@ -478,6 +478,8 @@ async function expectNothingLeftBehind(run: Run, held: Deferred<unknown>) {
   held.resolve({data: [...completedTurns(CHILD)], error: null})
   await vi.advanceTimersByTimeAsync(5_000)
   expect(run.outcome()?.ok).toBe(false)
+  // background work was open, so the run is quarantined: its root watch is the only thing left, and it ends with the hold
+  await vi.advanceTimersByTimeAsync(QUARANTINE_HOLD_WINDOW_MS + 2_000)
   expect(vi.getTimerCount()).toBe(0)
 }
 
@@ -1007,9 +1009,10 @@ describe('runOpenCodeCore — drain completion for background work', () => {
     await run.done
 
     // #then the existing incomplete classification is reported; the settled child is not re-cancelled, but the
-    // root (which may be running a follow-up turn) is aborted and confirmed quiescent first
+    // root (which may be running a follow-up turn) is aborted. Background work was open, so a turn OpenCode starts by
+    // itself cannot be ruled out: the run takes the quarantine hold instead of being confirmed stopped
     expectKind(run.outcome(), 'drain-timeout')
-    expect((run.outcome() as {error: RunCoreError}).error.quarantined).toBe(false)
+    expect((run.outcome() as {error: RunCoreError}).error.quarantined).toBe(true)
     expect(run.sessionAbort).toHaveBeenCalledTimes(1)
     expect(run.sessionAbort).toHaveBeenCalledWith(expect.objectContaining({path: {id: ROOT}}))
   })
@@ -1396,13 +1399,13 @@ describe('runOpenCodeCore — drain completion for background work', () => {
         },
       ],
     ])(
-      '%s while the parent runs its follow-up: the root is aborted and confirmed quiescent before the run rejects',
+      '%s while the parent runs its follow-up: the root is aborted, and the run takes the quarantine hold',
       async (_label, interrupt) => {
         // #given the follow-up turn running, a root abort that takes ~700ms to actually stop it
         const order: string[] = []
         const run = await inFollowUp({
           sessionAbort: async () => {
-            // the root is aborted again on every poll that finds it live: record the first abort only
+            // the root is aborted again by the watch on every poll that finds it live: record the first abort only
             if (!order.includes('abort-root')) {
               order.push('abort-root')
               setTimeout(() => run.live.delete(ROOT), 700)
@@ -1410,12 +1413,6 @@ describe('runOpenCodeCore — drain completion for background work', () => {
             return {data: {}, error: null}
           },
         })
-        const healthyStatus = run.fixture.status
-        run.fixture.status = async () => {
-          const result = await healthyStatus()
-          if (order.includes('abort-root') && !run.live.has(ROOT)) order.push('confirmed-quiescent')
-          return result
-        }
         run.done.then(
           () => order.push('rejected'),
           () => order.push('rejected'),
@@ -1425,21 +1422,20 @@ describe('runOpenCodeCore — drain completion for background work', () => {
         await interrupt(run)
         await run.advance(400)
 
-        // #then the root was told to stop (scoped to the run's directory) but the run has not yet released anything
+        // #then the root was told to stop (scoped to the run's directory), and the run did not wait for evidence that
+        // cannot exist: the follow-up turn is quarantined at once, with the existing classification
         expect(run.sessionAbort).toHaveBeenCalledWith(
           expect.objectContaining({path: {id: ROOT}, query: {directory: DIRECTORY}}),
         )
-        expect(run.outcome()).toBeUndefined()
-
-        // #when the root stops
-        await run.advance(1_200)
         await run.done
-
-        // #then the run rejected only after quiescence was confirmed, with the existing classification, unquarantined
         expectKind(run.outcome(), 'drain-timeout')
-        expect((run.outcome() as {error: RunCoreError}).error.quarantined).toBe(false)
-        expect(order).toEqual(['abort-root', 'confirmed-quiescent', 'rejected'])
+        expect((run.outcome() as {error: RunCoreError}).error.quarantined).toBe(true)
+        expect(order).toEqual(['abort-root', 'rejected'])
         expect(run.sessionAbort).not.toHaveBeenCalledWith(expect.objectContaining({path: {id: CHILD}}))
+
+        // #and the root watch keeps probing for the hold, and nothing outlives it
+        await run.advance(QUARANTINE_HOLD_WINDOW_MS + 2_000)
+        expect(vi.getTimerCount()).toBe(0)
       },
     )
 
@@ -1480,20 +1476,14 @@ describe('runOpenCodeCore — drain completion for background work', () => {
           run.fixture.status = async () => hangForever()
         },
       ],
-    ])('%s: the barrier is bounded and the run is quarantined', async (_label, options, sabotage) => {
+    ])('%s: the run is quarantined and nothing outlives the hold', async (_label, options, sabotage) => {
       // #given the follow-up turn running and the teardown sabotaged
       const run = await inFollowUp(options)
       sabotage(run)
 
-      // #when the deadline expires
+      // #when the deadline expires and the barrier's bound passes
       await run.advance(DEADLINE_MS + 50)
-
-      // #then it is still inside the teardown bound — nothing released yet
-      await run.advance(14_000)
-      expect(run.outcome()).toBeUndefined()
-
-      // #when the bound passes
-      await run.advance(1_500)
+      await run.advance(15_500)
       await run.done
 
       // #then the run is quarantined with the original classification, and nothing keeps polling
@@ -1504,7 +1494,26 @@ describe('runOpenCodeCore — drain completion for background work', () => {
       expect(vi.getTimerCount()).toBe(0)
     })
 
-    it('a failed abort is not a quarantine when the root is nonetheless confirmed quiescent', async () => {
+    it('a hung abort call keeps the run inside the barrier bound until it passes', async () => {
+      // #given the follow-up turn running and a root abort that never answers
+      const run = await inFollowUp({sessionAbort: async () => hangForever()})
+
+      // #when the deadline expires and almost the whole bound passes
+      await run.advance(DEADLINE_MS + 50)
+      await run.advance(14_000)
+
+      // #then nothing is released yet
+      expect(run.outcome()).toBeUndefined()
+
+      // #when the bound passes
+      await run.advance(1_500)
+      await run.done
+
+      // #then it is quarantined
+      expect((run.outcome() as {error: RunCoreError}).error.quarantined).toBe(true)
+    })
+
+    it('a root that is already gone is still quarantined while background work is open: an earlier reply says nothing about a turn OpenCode starts itself', async () => {
       // #given the follow-up turn already over from the server's point of view, and an abort that errors
       const run = await inFollowUp({sessionAbort: async () => ({data: undefined, error: {message: 'nope'}})})
       run.live.delete(ROOT)
@@ -1513,9 +1522,9 @@ describe('runOpenCodeCore — drain completion for background work', () => {
       await run.advance(DEADLINE_MS + 600)
       await run.done
 
-      // #then the confirmation, not the abort receipt, is the authority
+      // #then the root cannot be confirmed, whatever the abort receipt or the live set says
       expectKind(run.outcome(), 'drain-timeout')
-      expect((run.outcome() as {error: RunCoreError}).error.quarantined).toBe(false)
+      expect((run.outcome() as {error: RunCoreError}).error.quarantined).toBe(true)
     })
   })
 

@@ -56,6 +56,13 @@
  * that started late is stopped. A root that cannot be confirmed in time is reported `settled: false` with
  * `rootUnconfirmed`, which `throwWithBarrier` turns into the existing quarantine and a root watch for the hold.
  *
+ * Background work open (`followUpPossible`): OpenCode then starts root turns by itself (a finished or cancelled child
+ * makes it inject a notice turn into the root, prepared like any prompt, so the turn is not in the message list yet).
+ * A terminal reply to an earlier turn cannot rule that out, so the root is never confirmed. Polling could not change
+ * that, so the barrier aborts the root and the owned children once, settles the children, and reports
+ * `rootUnconfirmed` without waiting out its budget; the run always takes the quarantine hold, and the root watch
+ * (which aborts the root on every busy observation) does the polling.
+ *
  * This module deliberately does NOT decide what `run.ts` does with a
  * quarantine outcome — it only reports whether settlement was confirmed. The
  * decision to hold the lock, keep the heartbeat renewing it, and refuse
@@ -103,6 +110,11 @@ export interface SettleOwnedSessionsParams {
    * confirmed. Omitted when the root has already halted.
    */
   readonly confirmRootQuiescent?: boolean
+  /**
+   * Background work is open, so a root turn the message list does not show yet can still start. Makes the root
+   * unconfirmable (see the module doc). Only meaningful with `confirmRootQuiescent`.
+   */
+  readonly followUpPossible?: boolean
   /** Overrides `ROOT_QUIESCENCE_POLL_INTERVAL_MS` — for tests only. */
   readonly rootPollIntervalMs?: number
   /**
@@ -170,6 +182,7 @@ export async function settleOwnedSessions(params: SettleOwnedSessionsParams): Pr
     ledger,
     timeoutMs = DEFAULT_SETTLE_TIMEOUT_MS,
     confirmRootQuiescent = false,
+    followUpPossible = false,
     rootPollIntervalMs = ROOT_QUIESCENCE_POLL_INTERVAL_MS,
     streamedUserMessageIds = (): ReadonlySet<string> => new Set<string>(),
   } = params
@@ -252,6 +265,8 @@ export async function settleOwnedSessions(params: SettleOwnedSessionsParams): Pr
         let rootQuiescent = confirmRootQuiescent === false
         let reaborts = 0
         while (!rootQuiescent && !isFinished() && !teardownSignal.aborted) {
+          // Nothing can confirm the root with background work open; the quarantine watch does the polling.
+          if (followUpPossible) break
           const probe = await probeRootStop({
             client,
             adapter,

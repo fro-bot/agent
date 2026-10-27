@@ -12,6 +12,14 @@
  * `MessageAbortedError` and a completion time, so an aborted reply counts). A reply to an older turn does not.
  * Without such a reply the root cannot be confirmed stopped.
  *
+ * That evidence only rules out the turns that already exist. While background work is open (`followUpPossible`) OpenCode
+ * starts root turns by itself: a child that finishes, or is cancelled by the abort, makes it inject a notice turn into
+ * the root, and that turn goes through the same preparation as the prompt (its user message is saved only after agent,
+ * skill and provider initialisation and the `chat.message` hook, and its runner registers after that). A reply to the
+ * turn before it says nothing about a turn that is not saved yet, so with `followUpPossible` nothing confirms the
+ * root: the probe is only ever `busy` or `unconfirmed`, the barrier quarantines, and the watch runs for the whole hold,
+ * aborting the root on every busy observation.
+ *
  * Two pieces build on that:
  * - `probeRootStop` is one observation: confirmed (not live, with that reply), busy (live, so it is aborted again),
  *   or unconfirmed (not live and no reply yet, or the lookup failed).
@@ -107,6 +115,7 @@ export function rootHasTerminalReply(messages: unknown, streamedUserMessageIds: 
     last = {role, info}
   }
   if (latestUserId === null || last === null) return false
+  if (last.role !== 'assistant') return false
   for (const streamed of streamedUserMessageIds) {
     if (!userMessageIds.has(streamed)) return false
   }
@@ -117,6 +126,11 @@ export function rootHasTerminalReply(messages: unknown, streamedUserMessageIds: 
 export type RootProbe = 'confirmed' | 'busy' | 'unconfirmed'
 
 export interface ProbeRootStopOptions {
+  /**
+   * Background work is open, so OpenCode can start a root turn the message list does not show yet. Makes confirmation
+   * impossible: a terminal reply to an earlier turn is not evidence about a newer one.
+   */
+  readonly followUpPossible?: boolean
   readonly client: SessionClient
   readonly adapter: LedgerReconcileAdapter
   readonly directory: string
@@ -132,10 +146,11 @@ export interface ProbeRootStopOptions {
  * has not started is not live either. A failed lookup is `unconfirmed`.
  */
 export async function probeRootStop(options: ProbeRootStopOptions): Promise<RootProbe> {
-  const {client, adapter, directory, rootSessionId, signal, streamedUserMessageIds} = options
+  const {client, adapter, directory, rootSessionId, signal, streamedUserMessageIds, followUpPossible = false} = options
   const live = await adapter.liveSessionIds(signal)
   if (live.success === false) return 'unconfirmed'
   if (live.data.has(rootSessionId)) return 'busy'
+  if (followUpPossible) return 'unconfirmed'
   try {
     const response = (await client.session.messages({path: {id: rootSessionId}, query: {directory}, signal})) as
       {readonly error?: unknown; readonly data?: unknown} | undefined
@@ -156,7 +171,8 @@ export interface QuarantineRootWatchOptions extends Omit<ProbeRootStopOptions, '
 /**
  * Keeps probing a root the barrier could not confirm, for the length of the quarantine hold: every busy observation
  * sends another abort, so a prompt that started late is stopped instead of running through the hold. Ends at the
- * first confirmation or when the window closes, whichever comes first. A window timer ends it even if a request
+ * first confirmation or when the window closes, whichever comes first (with `followUpPossible` nothing confirms, so it
+ * always runs to the end of the window). A window timer ends it even if a request
  * hangs, and every request is bounded. Everything it owns (both timers and the in-flight request) is released when it
  * ends; the timers are unref'd so they never keep the process alive.
  *
