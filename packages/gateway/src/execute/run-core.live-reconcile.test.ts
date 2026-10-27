@@ -18,6 +18,9 @@ import {afterEach, describe, expect, it, vi} from 'vitest'
 import {LIVE_RECONCILE_TIMEOUT_MS} from './live-reconcile.js'
 import {runOpenCodeCore} from './run-core.js'
 
+/** The first frame of every event stream: the run waits for it before it sends the prompt. */
+const SERVER_CONNECTED = {type: 'server.connected', properties: {}} as const
+
 const ROOT = 'sess-123'
 const CHILD = 'sess-child'
 const TICK_MS = DEFAULT_LEDGER_RECONCILE_INTERVAL_MS
@@ -85,6 +88,8 @@ function startRun(script: ChildrenScript, options: StartOptions = {}): Run {
   const queue: object[] = []
   let wake: (() => void) | null = null
   async function* stream(): AsyncGenerator<object> {
+    // The server announces the stream first; the run sends its prompt only after reading it.
+    yield SERVER_CONNECTED
     while (true) {
       const next = queue.shift()
       if (next === undefined) {

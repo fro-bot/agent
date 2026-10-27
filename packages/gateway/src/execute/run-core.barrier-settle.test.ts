@@ -22,6 +22,9 @@ import {createApprovalRegistry} from '../approvals/registry.js'
 import {createRequestGate} from '../approvals/request-gate.js'
 import {runOpenCodeCore} from './run-core.js'
 
+/** The first frame of every event stream: the run waits for it before it sends the prompt. */
+const SERVER_CONNECTED = {type: 'server.connected', properties: {}} as const
+
 const ROOT = 'sess-123'
 const DIRECTORY = '/workspace/repo'
 const SCOPE = 'chan-1'
@@ -119,6 +122,8 @@ function startRun(setup: {
   let closed = false
   let wake: (() => void) | null = null
   async function* stream(): AsyncGenerator<object> {
+    // The server announces the stream first; the run sends its prompt only after reading it.
+    yield SERVER_CONNECTED
     while (true) {
       const next = queue.shift()
       if (next !== undefined) {
@@ -357,6 +362,8 @@ describe('runOpenCodeCore — the barrier fail-closes pending human waits when i
     })
     const queue: object[] = [permissionAsked('perm-9')]
     async function* stream(): AsyncGenerator<object> {
+      // The server announces the stream first; the run sends its prompt only after reading it.
+      yield SERVER_CONNECTED
       const first = queue.shift()
       if (first !== undefined) yield first
       await new Promise<void>(() => {})

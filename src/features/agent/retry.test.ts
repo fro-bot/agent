@@ -27,6 +27,9 @@ import {createMockLogger} from '../../shared/test-helpers.js'
 // Default: v2 wait is unavailable so tests that don't explicitly mock it fall back to poll —
 // matches opencode.test.ts's module-level default; per-test vi.doMock + vi.resetModules()
 // overrides it where the v2 path itself is under test.
+/** The first frame of every event stream: a new prompt is sent only after it is read. */
+const SERVER_CONNECTED = {type: 'server.connected', properties: {}} as unknown as Event
+
 vi.mock('@opencode-ai/sdk/v2', () => ({
   createOpencodeClient: vi.fn().mockReturnValue({
     v2: {session: {wait: vi.fn().mockRejectedValue(new Error('v2 not available in test'))}},
@@ -60,6 +63,7 @@ function makeV2Module(waitFn: TestWaitFn) {
 // events; `waitForEventProcessorShutdown`'s bounded cleanup window is what lets callers proceed.
 function createMockEventStream(events: Event[] = []): AsyncIterable<Event> {
   return (async function* () {
+    yield SERVER_CONNECTED
     for (const event of events) {
       yield event
     }
@@ -73,6 +77,7 @@ function createMockEventStream(events: Event[] = []): AsyncIterable<Event> {
 // Deferring the first yield past a `setTimeout(0)` guarantees arming has already happened.
 function createArmedEventStream(events: Event[] = []): AsyncIterable<Event> {
   return (async function* () {
+    yield SERVER_CONNECTED
     await new Promise<void>(resolve => setTimeout(resolve, 0))
     for (const event of events) {
       yield event
@@ -250,6 +255,7 @@ describe('runPromptAttempt — ownership ledger gating (Unit 9)', () => {
         const statusFn = vi.fn().mockResolvedValue({data: {ses_123: {type: 'busy'}}})
         const mockClient = {session: {status: statusFn}}
         const eventStream = (async function* (): AsyncIterable<Event> {
+          yield SERVER_CONNECTED
           yield {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event
           yield {
             type: 'message.part.delta',
@@ -1241,17 +1247,20 @@ describe('runPromptAttempt — settlement causality matrix (Steps 3b/5)', () => 
   it('row 10 — a genuine (non-timeout) exception from prompt submission propagates unchanged even though the deadline has already expired', async () => {
     // #given a real thrown error, unrelated to the deadline, with the deadline already expired
     const {runPromptAttempt} = await import('./retry.js')
+    // (the deadline expires as the submission starts: before that, the attempt still waits for its stream)
+    let expired = false
     const deadline: ExecutionDeadline = {
       timeoutMs: 1,
       signal: new AbortController().signal,
-      isExpired: () => true,
-      isTimedOut: () => true,
-      remainingMs: () => 0,
+      isExpired: () => expired,
+      isTimedOut: () => expired,
+      remainingMs: () => (expired ? 0 : 60_000),
       run: async operation => operation(),
       dispose: vi.fn(),
     }
     const boom = new Error('submission transport exploded')
     const startPrompt = vi.fn(async (): Promise<never> => {
+      expired = true
       throw boom
     })
     const mockClient = {session: {status: vi.fn()}}
@@ -1405,6 +1414,7 @@ describe('runPromptAttempt — settlement causality matrix (Steps 3b/5)', () => 
       const {runPromptAttempt} = await import('./retry.js')
       const mockClient = {session: {status: vi.fn()}}
       const eventStream = (async function* (): AsyncIterable<Event> {
+        yield SERVER_CONNECTED
         yield {type: 'session.idle', properties: {sessionID: 'ses_123'}} as unknown as Event
         // A continuation that never actually lands within this attempt's bounded cleanup window --
         // it must never get a chance to change a decision the race already made.

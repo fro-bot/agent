@@ -35,6 +35,9 @@ import {getWaitReason} from './wait-reason-registry.js'
 // Fixtures
 // ---------------------------------------------------------------------------
 
+/** The first frame of every event stream: the run waits for it before it sends the prompt. */
+const SERVER_CONNECTED = {type: 'server.connected', properties: {}} as const
+
 const ROOT = 'sess-123'
 const CHILD = 'sess-child-1'
 const CHILD2 = 'sess-child-2'
@@ -83,6 +86,8 @@ function makeControlledStream(): {
     resolve?.()
   }
   async function* generate(): AsyncGenerator<object> {
+    // The server announces the stream first; the run sends its prompt only after reading it.
+    yield SERVER_CONNECTED
     while (true) {
       const next = queue.shift()
       if (next !== undefined) {

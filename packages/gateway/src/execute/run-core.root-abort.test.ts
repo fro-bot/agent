@@ -18,6 +18,9 @@ import {afterEach, describe, expect, it, vi} from 'vitest'
 
 import {runOpenCodeCore} from './run-core.js'
 
+/** The first frame of every event stream: the run waits for it before it sends the prompt. */
+const SERVER_CONNECTED = {type: 'server.connected', properties: {}} as const
+
 const ROOT = 'sess-123'
 const DIRECTORY = '/workspace/repo'
 const INACTIVITY_MS = 5_000
@@ -90,6 +93,9 @@ function startRun(options: StartOptions = {}): Run {
   let wake: (() => void) | null = null
 
   async function* stream(): AsyncGenerator<object> {
+    // The server announces the stream first; the run sends its prompt only after reading it.
+
+    yield SERVER_CONNECTED
     while (true) {
       if (streamFailure !== null) throw streamFailure.error
       const next = queue.shift()

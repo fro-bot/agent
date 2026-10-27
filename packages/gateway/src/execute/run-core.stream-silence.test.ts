@@ -19,6 +19,9 @@ import {runOpenCodeCore} from './run-core.js'
 
 // Every inactivity timer the run creates, with its options, so a test can tell the silence watchdog (the one built
 // with the silence window) from the activity watchdog and the reconciler's timers.
+/** The first frame of every event stream: the run waits for it before it sends the prompt. */
+const SERVER_CONNECTED = {type: 'server.connected', properties: {}} as const
+
 const createdTimers = vi.hoisted(
   () =>
     [] as {readonly timeoutMs: number; readonly timer: {readonly signal: AbortSignal; readonly dispose: () => void}}[],
@@ -177,6 +180,9 @@ function startRun(options: StartOptions = {}): Run {
   let wake: (() => void) | null = null
 
   async function* stream(): AsyncGenerator<object> {
+    // The server announces the stream first; the run sends its prompt only after reading it.
+
+    yield SERVER_CONNECTED
     while (true) {
       const next = queue.shift()
       if (next !== undefined) {
@@ -436,10 +442,8 @@ describe('runOpenCodeCore — the event stream watchdog', () => {
     })
 
     it('ends as stream-ended on a second server.connected, the sign of a replaced stream', async () => {
-      // #given a stream that connected once
+      // #given a stream that connected once (the fixture's stream announces itself first, as the server does)
       const run = startRun()
-      await vi.advanceTimersByTimeAsync(10)
-      run.emit(connected())
       await vi.advanceTimersByTimeAsync(10)
       expect(run.outcome()).toBeUndefined()
 
@@ -453,12 +457,11 @@ describe('runOpenCodeCore — the event stream watchdog', () => {
     })
 
     it('treats a single server.connected as ordinary', async () => {
-      // #given
+      // #given a stream that announced itself once, as the fixture's stream does first
       const run = startRun()
       await vi.advanceTimersByTimeAsync(10)
 
-      // #when
-      run.emit(connected())
+      // #when the root goes idle
       run.emit(idle())
       await vi.advanceTimersByTimeAsync(10)
 
@@ -487,7 +490,6 @@ describe('runOpenCodeCore — the event subscription is closed on every exit', (
     // #given
     const run = startRun()
     await vi.advanceTimersByTimeAsync(10)
-    run.emit(connected())
     run.emit(connected())
 
     // #when
