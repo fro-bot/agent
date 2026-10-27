@@ -214,6 +214,7 @@ function toClosedStatus(status: OperatorRunStatus): OperatorRunStatus {
     providerFailureReason,
     checkoutProvenance,
     checkoutPreparation,
+    waitReason,
     ...uncopied
   } = status
   uncopied satisfies Record<string, never>
@@ -230,6 +231,7 @@ function toClosedStatus(status: OperatorRunStatus): OperatorRunStatus {
     ...(providerFailureReason === undefined ? {} : {providerFailureReason}),
     ...(checkoutProvenance === undefined ? {} : {checkoutProvenance}),
     ...(checkoutPreparation === undefined ? {} : {checkoutPreparation}),
+    ...(waitReason === undefined ? {} : {waitReason}),
   }
 }
 

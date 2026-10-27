@@ -414,7 +414,7 @@ describe('operator cancel — abort-registry integration', () => {
     abortRegistry.delete(CANCEL_FALLBACK_PUSH_RUN_ID)
   })
 
-  it('in-flight FAILED transitionRun failure — dispatchRunFailed is NOT called (success guard is load-bearing)', async () => {
+  it('in-flight FAILED transitionRun failure — dispatchRunFailed is still called: the operator is told whatever the write result', async () => {
     // #given — the in-flight FAILED transition itself fails (not the cancel-fallback path)
     const {launchWork} = await import('./run.js')
     mockRuntime.acquireLock.mockResolvedValue({
@@ -455,9 +455,9 @@ describe('operator cancel — abort-registry integration', () => {
     // #when
     await expect(awaitLaunchWorkRun(launchWork, request, deps)).resolves.toBeDefined()
 
-    // #then — the FAILED transition did not succeed, so the notify/dispatch that only runs
-    // on success never fires
-    expect(pushDispatcher.dispatchRunFailed).not.toHaveBeenCalled()
+    // #then — the FAILED transition did not succeed, but the failure is real: the push still goes out
+    // (the observer frame needs the written state, so it does not)
+    expect(pushDispatcher.dispatchRunFailed).toHaveBeenCalledTimes(1)
   })
 
   for (const terminalPhase of ['COMPLETED', 'FAILED', 'CANCELLED'] as const) {
@@ -530,10 +530,10 @@ describe('operator cancel — abort-registry integration', () => {
       const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
       expect(transitionPhases).not.toContain('FAILED')
 
-      // #and — a log records the concurrent terminalization with the observed phase
+      // #and — the write helper adopted the stored terminal record and logged the observed phase
       expect(logger.info).toHaveBeenCalledWith(
         expect.objectContaining({runId: TERMINAL_RUN_ID, phase: terminalPhase}),
-        expect.stringContaining('already terminalized'),
+        expect.stringContaining('already terminal'),
       )
 
       abortRegistry.delete(TERMINAL_RUN_ID)
@@ -1259,17 +1259,24 @@ describe('failureKind persistence on FAILED transitions', () => {
       staleThresholdMs: 60_000,
       pendingStaleThresholdMs: 30 * 60_000,
     } as unknown as CoordinationConfig
-    mockRuntime.transitionRun
-      .mockResolvedValueOnce({
-        success: true as const,
-        data: {etag: 'ack-etag', state: buildMockRunState({phase: 'ACKNOWLEDGED', run_id: FALLBACK_RUN_ID})},
-      })
-      .mockResolvedValueOnce({
-        success: true as const,
-        data: {etag: 'exec-etag', state: buildMockRunState({phase: 'EXECUTING', run_id: FALLBACK_RUN_ID})},
-      })
-      .mockResolvedValueOnce({success: false as const, error: new Error('CANCELLED transition failed')})
-      .mockResolvedValueOnce({success: true as const, data: {etag: 'failed-etag', state: failedFallbackState}})
+    // Keyed by phase: the CANCELLED write is retried, so a call-order sequence would hand its retry the FAILED success.
+    mockRuntime.transitionRun.mockImplementation(
+      async (_config: unknown, _identity: unknown, _repo: unknown, _runId: unknown, phase: string) => {
+        if (phase === 'CANCELLED') {
+          return {success: false as const, error: new Error('CANCELLED transition failed')}
+        }
+        if (phase === 'FAILED') {
+          return {success: true as const, data: {etag: 'failed-etag', state: failedFallbackState}}
+        }
+        return {
+          success: true as const,
+          data: {
+            etag: `${phase.toLowerCase()}-etag`,
+            state: buildMockRunState({phase: phase as 'EXECUTING', run_id: FALLBACK_RUN_ID}),
+          },
+        }
+      },
+    )
 
     const {RunCoreError} = runCoreModule
     mockRunOpenCodeCore.mockImplementation(async () => {
@@ -1281,8 +1288,15 @@ describe('failureKind persistence on FAILED transitions', () => {
     ;(request as {runId?: string}).runId = FALLBACK_RUN_ID
     const deps = makeDeps({coordinationConfig})
 
-    // #when
-    await awaitLaunchWorkRun(launchWork, request, deps)
+    // #when — the CANCELLED retries wait 500 ms then 1 s
+    vi.useFakeTimers()
+    try {
+      const done = awaitLaunchWorkRun(launchWork, request, deps)
+      await vi.advanceTimersByTimeAsync(10_000)
+      await done
+    } finally {
+      vi.useRealTimers()
+    }
 
     // #then — the CANCELLED call was attempted, then the FAILED fallback carries failureKind
     const transitionCalls = mockRuntime.transitionRun.mock.calls

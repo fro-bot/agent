@@ -288,12 +288,33 @@ export function isRunStale(config: CoordinationConfig, state: RunState, now: num
   return new Date(state.last_heartbeat).getTime() < now - thresholdMs
 }
 
+/** Narrows one `findStaleRuns` scan. With no options it lists the whole prefix and reads every record. */
+export interface FindStaleRunsOptions {
+  /**
+   * Aborting ends the scan between records and makes it return an error rather than a partial list (a half-read repo
+   * must not look like a fully-read one). The signal is also given to each read.
+   */
+  readonly signal?: AbortSignal
+  /**
+   * Read only records whose object was modified at or after this time, when the adapter lists metadata; an adapter
+   * that cannot (or a metadata listing that fails) falls back to the full list. A run that is still alive keeps
+   * writing its record, so a record untouched for the whole window is terminal or long dead. This narrows reads only,
+   * not the listing: a listing that hits the adapter's iteration cap is truncated by key order, which is unrelated to
+   * recency.
+   */
+  readonly modifiedSince?: Date
+}
+
 export async function findStaleRuns(
   config: CoordinationConfig,
   identity: string,
   repo: string,
   logger: {debug: (message: string, context?: Record<string, unknown>) => void},
+  options: FindStaleRunsOptions = {},
 ): Promise<Result<RunState[], Error>> {
+  const {signal, modifiedSince} = options
+  // A function, not a property read: the signal can abort across any await, which narrowing would hide.
+  const aborted = (): boolean => signal?.aborted === true
   const prefix = getRunPrefix(config, identity, repo)
   if (prefix.success === false) {
     return err(prefix.error)
@@ -304,15 +325,37 @@ export async function findStaleRuns(
     return err(getObject.error)
   }
 
-  const listed = await config.storeAdapter.list(prefix.data)
-  if (listed.success === false) {
-    return err(listed.error)
+  if (aborted()) {
+    return err(new Error('findStaleRuns aborted'))
+  }
+
+  let keys: readonly string[] | undefined
+  if (modifiedSince !== undefined && config.storeAdapter.listWithMetadata !== undefined) {
+    const listedWithMetadata = await config.storeAdapter.listWithMetadata(prefix.data)
+    if (listedWithMetadata.success) {
+      keys = listedWithMetadata.data
+        .filter(entry => entry.lastModified.getTime() >= modifiedSince.getTime())
+        .sort((a, b) => b.lastModified.getTime() - a.lastModified.getTime())
+        .map(entry => entry.key)
+    } else {
+      logger.debug('Metadata listing failed, falling back to the full list', {error: listedWithMetadata.error.message})
+    }
+  }
+  if (keys === undefined) {
+    const listed = await config.storeAdapter.list(prefix.data)
+    if (listed.success === false) {
+      return err(listed.error)
+    }
+    keys = listed.data
   }
 
   const now = Date.now()
   const staleRuns: RunState[] = []
-  for (const key of listed.data) {
-    const current = await getObject.data(key)
+  for (const key of keys) {
+    if (aborted()) {
+      return err(new Error('findStaleRuns aborted'))
+    }
+    const current = await (signal === undefined ? getObject.data(key) : getObject.data(key, {signal}))
     if (current.success === false) {
       logger.debug('Skipping unreadable run-state file', {key, error: current.error.message})
       continue

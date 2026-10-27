@@ -1,4 +1,4 @@
-//#region deploy/plugins/no-task-reuse.mjs
+// deploy/plugins/no-task-reuse.mjs
 /** The fixed, model-visible rejection. No session ids, no arguments, no secrets. */
 const TASK_REUSE_REJECTION = "Session reuse is disabled in this environment. Start a new task and include the context it needs.";
 /**
@@ -18,5 +18,4 @@ var no_task_reuse_default = {
 	server: async () => ({ "tool.execute.before": rejectTaskReuse })
 };
 
-//#endregion
 export { TASK_REUSE_REJECTION, no_task_reuse_default as default, rejectTaskReuse };

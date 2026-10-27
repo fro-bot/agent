@@ -40,7 +40,7 @@ import type {WaitingPredicates} from './projection.js'
 
 import {isDeepStrictEqual} from 'node:util'
 
-import {overlayWaitingStatus, scopeIdFor} from './projection.js'
+import {overlayWaitingStatus, overlayWaitReason, scopeIdFor} from './projection.js'
 
 // ---------------------------------------------------------------------------
 // Constants (injectable for tests)
@@ -217,6 +217,12 @@ export interface RunObservationManagerDeps {
   readonly waiting: WaitingPredicates
 
   /**
+   * The completion gate's latest declined-attempt code for a run, if it is draining. The manager maps it to the
+   * closed wire `waitReason` and shows it only on a `running` status. Optional: without it no run shows one.
+   */
+  readonly readWaitReason?: (runId: string) => string | undefined
+
+  /**
    * Synchronous denylist check, re-run on every scope refresh so a repository denied mid-run stops
    * emitting without waiting for a lifecycle observation.
    */
@@ -258,6 +264,13 @@ export interface ScopeRefresher {
    * No-op after shutdown.
    */
   readonly refreshScope: (scopeId: string) => void
+
+  /**
+   * Reapply the overlays to one run, synchronously. Call it when the run's wait reason changes. Emits and caches only
+   * on a status change; a run without retained state, or whose repository is now denied, is skipped. No-op after
+   * shutdown.
+   */
+  readonly refreshRun: (runId: string) => void
 }
 
 export interface RunObservationManager {
@@ -566,7 +579,9 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
   function overlaidStatus(runId: string, base: OperatorRunStatus): OperatorRunStatus {
     const scopeId = scopeByRun.get(runId)
     const status = scopeId === undefined ? base.status : overlayWaitingStatus(base.status, scopeId, deps.waiting)
-    return status === base.status ? base : {...base, status}
+    const waitReason = overlayWaitReason(status, deps.readWaitReason?.(runId))
+    const withStatus = status === base.status ? base : {...base, status}
+    return waitReason === undefined ? withStatus : {...withStatus, waitReason}
   }
 
   /** Cache the status BEFORE fan-out, then fan it out to the run's subscribers. */
@@ -1378,6 +1393,24 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
   // refreshScope
   // ---------------------------------------------------------------------------
 
+  const refreshRetainedRun = (runId: string): void => {
+    const retained = retainedRuns.get(runId)
+    if (retained === undefined) {
+      return
+    }
+    try {
+      // The denylist is TTL-cached, so a repository can be denied while its run is live. Check
+      // before the overlay so a newly denied run emits nothing and is not refreshed again.
+      if (deps.isRepoDenied(retained.repoKey) === true) {
+        dropRunState(runId)
+        return
+      }
+      commitRefreshedStatus(runId, retained.base)
+    } catch (error) {
+      logger.warn({runId, err: String(error)}, 'manager: scope refresh threw — skipping run')
+    }
+  }
+
   const refreshScope = (scopeId: string): void => {
     if (isShutdown === true) {
       return
@@ -1388,22 +1421,15 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     }
 
     for (const runId of Array.from(runIds)) {
-      const retained = retainedRuns.get(runId)
-      if (retained === undefined) {
-        continue
-      }
-      try {
-        // The denylist is TTL-cached, so a repository can be denied while its run is live. Check
-        // before the overlay so a newly denied run emits nothing and is not refreshed again.
-        if (deps.isRepoDenied(retained.repoKey) === true) {
-          dropRunState(runId)
-          continue
-        }
-        commitRefreshedStatus(runId, retained.base)
-      } catch (error) {
-        logger.warn({runId, err: String(error)}, 'manager: scope refresh threw — skipping run')
-      }
+      refreshRetainedRun(runId)
     }
+  }
+
+  const refreshRun = (runId: string): void => {
+    if (isShutdown === true) {
+      return
+    }
+    refreshRetainedRun(runId)
   }
 
   // ---------------------------------------------------------------------------
@@ -1814,6 +1840,7 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
   return {
     observe,
     refreshScope,
+    refreshRun,
     observeOutput,
     observeApproval,
     observeQuestion,
