@@ -881,3 +881,25 @@ export function mockRunOpenCodeCoreAbortedBy(viaRegistryAbort: () => void) {
     throw new runCoreModule.RunCoreError('timeout', 'run-core: signal aborted')
   })
 }
+
+/**
+ * `session.messages` data for a root session that has stopped: its prompt, then an assistant reply to it that an
+ * abort finished (`MessageAbortedError`, with a completion time). This is the evidence the termination barrier
+ * accepts as "the root stopped"; a root that is merely absent from `session.status` is not.
+ */
+export function stoppedRootMessages(rootSessionId: string): readonly object[] {
+  return [
+    {info: {id: 'msg_user_1', sessionID: rootSessionId, role: 'user', time: {created: 1_000}}, parts: []},
+    {
+      info: {
+        id: 'msg_assistant_1',
+        sessionID: rootSessionId,
+        role: 'assistant',
+        parentID: 'msg_user_1',
+        time: {created: 1_001, completed: 1_002},
+        error: {name: 'MessageAbortedError', data: {message: 'The operation was aborted.'}},
+      },
+      parts: [],
+    },
+  ]
+}

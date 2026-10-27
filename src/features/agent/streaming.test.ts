@@ -788,7 +788,7 @@ describe('processEventStream — ownership ledger integration', () => {
     expect(ledger.snapshot()).toContainEqual({sessionId: CHILD_SESSION_ID, label: 'do the thing', state: 'unknown'})
 
     // #then termination metadata says the channel closed unexpectedly — not that the turn concluded
-    expect(result.discontinuity).toEqual({message: 'connection reset'})
+    expect(result.discontinuity).toEqual({message: 'connection reset', errorName: 'Error'})
   })
 
   it('does not mark outstanding entries unknown, and does not fabricate a discontinuity, on an intentional abort', async () => {
@@ -1051,7 +1051,7 @@ describe('processEventStream — ownership ledger integration', () => {
     )
 
     // #then the thrown discontinuity is still recorded
-    expect(result.discontinuity).toEqual({message: 'connection reset'})
+    expect(result.discontinuity).toEqual({message: 'connection reset', errorName: 'Error'})
   })
 
   it('an ordinary successful run records no discontinuity and still completes normally', async () => {
@@ -2651,5 +2651,54 @@ describe('RootFreshnessTracker — Phase A scaffolding transitions (previously u
     expect(hasFreshIdleCandidate(tracker)).toBe(false)
     clearRootRevalidationRequirement(tracker)
     expect(hasFreshIdleCandidate(tracker)).toBe(true)
+  })
+})
+
+describe('processEventStream — the connect announcement', () => {
+  const connectedEvent = (): Event => ({type: 'server.connected', properties: {}}) as unknown as Event
+
+  it('reports server.connected even while the turn is unarmed, and only for that frame', async () => {
+    // #given a turn that has not been armed (no prompt sent yet) and a stream that announces itself
+    const abortController = new AbortController()
+    const tracker: ActivityTracker = {
+      firstMeaningfulEventReceived: false,
+      currentTurnTerminalSignalReceived: false,
+      currentTurnArmed: false,
+      sessionIdle: false,
+      sessionError: null,
+    }
+    const onStreamConnected = vi.fn()
+    const eventStream = createMockEventStream(
+      [{type: 'server.heartbeat', properties: {}} as unknown as Event, connectedEvent()],
+      () => abortController.abort(),
+    )
+
+    // #when
+    await processEventStream(
+      eventStream,
+      ROOT_SESSION_ID,
+      abortController.signal,
+      createMockLogger(),
+      tracker,
+      undefined,
+      undefined,
+      undefined,
+      onStreamConnected,
+    )
+
+    // #then it was reported once, and the unarmed turn recorded no activity from it
+    expect(onStreamConnected).toHaveBeenCalledOnce()
+    expect(tracker.firstMeaningfulEventReceived).toBe(false)
+  })
+
+  it('does not require a listener', async () => {
+    // #given
+    const abortController = new AbortController()
+    const eventStream = createMockEventStream([connectedEvent()], () => abortController.abort())
+
+    // #when / #then
+    await expect(
+      processEventStream(eventStream, ROOT_SESSION_ID, abortController.signal, createMockLogger()),
+    ).resolves.toBeDefined()
   })
 })

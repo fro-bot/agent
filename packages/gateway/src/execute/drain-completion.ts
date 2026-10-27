@@ -135,7 +135,7 @@ function readMessages(data: unknown): RestMessageFacts | null {
  * - no tool part blocks it (`hasBlockingToolPart`: a pending tool means the model has not yet received the
  *   result and will produce another turn).
  */
-function isQualifiedTerminalReply(
+export function isQualifiedTerminalReply(
   assistant: {readonly info: unknown; readonly parts: unknown},
   parentId: string,
 ): boolean {

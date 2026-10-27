@@ -23,6 +23,9 @@ import {createMockLogger} from '../../shared/test-helpers.js'
 import {executeOpenCode} from './execution.js'
 import {MAX_LLM_RETRIES} from './retry.js'
 
+/** The first frame of every event stream: a new prompt is sent only after it is read. */
+const SERVER_CONNECTED = {type: 'server.connected', properties: {}} as unknown as Event
+
 vi.mock('node:fs/promises', () => ({
   mkdir: vi.fn(),
   writeFile: vi.fn(),
@@ -126,6 +129,7 @@ function createPromptStartedEventStream(
   events: readonly Event[],
 ): AsyncIterable<Event> {
   return (async function* () {
+    yield SERVER_CONNECTED
     const callsBeforeSubscribe = promptAsync.mock.calls.length
     while (promptAsync.mock.calls.length === callsBeforeSubscribe) {
       await new Promise<void>(resolve => setTimeout(resolve, 0))

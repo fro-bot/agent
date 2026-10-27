@@ -9,4 +9,4 @@
  * Do not change this value without also updating the workflow's bun-version
  * and verifying it matches upstream's packageManager field.
  */
-export const HARNESS_BUN_VERSION = '1.3.14'
+export const HARNESS_BUN_VERSION = '1.4.4'

@@ -13,7 +13,7 @@ describe('getProvenance', () => {
     const p = getProvenance()
 
     // #then
-    expect(p.baseVersion).toBe('1.19.0')
+    expect(p.baseVersion).toBe('1.19.4')
     expect(Array.isArray(p.integrationRefs)).toBe(true)
     expect(p.integrationCommit).toBeNull()
     expect(p.buildSha).toBe('dev')
