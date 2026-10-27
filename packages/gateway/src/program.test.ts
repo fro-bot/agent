@@ -3074,6 +3074,60 @@ describe('waiting status wiring', () => {
     expect(statuses).toEqual(['running'])
   })
 
+  it('shows a wait reason on a running run when the completion gate records one, and drops it when it is cleared', async () => {
+    // #given a running web run observed by the wired manager
+    const {manager} = await startWithRealRegistries()
+    const run = makeRunningRun()
+    await projectOnce(run)
+    await manager.observe(run)
+    const frames: {status: string; waitReason?: string}[] = []
+    manager.subscribe('run-wait-1', {
+      onEvent: frame => {
+        if (frame.type === 'status') frames.push({status: frame.data.status, waitReason: frame.data.waitReason})
+      },
+      onClose: () => undefined,
+    })
+    await flush()
+
+    // #when run-core records, then clears, why the gate has not admitted the run
+    const {clearWaitReason, setWaitReason} = await import('./execute/wait-reason-registry.js')
+    setWaitReason('run-wait-1', 'notice-not-observed')
+    await flush()
+    clearWaitReason('run-wait-1')
+    await flush()
+
+    // #then the live status carried the wire value, never the raw code, and then lost it
+    expect(frames).toEqual([
+      {status: 'running', waitReason: undefined},
+      {status: 'running', waitReason: 'awaiting-background-task'},
+      {status: 'running', waitReason: undefined},
+    ])
+  })
+
+  it('stops refreshing from wait-reason changes once shutdown has unsubscribed the listener', async () => {
+    // #given a wired program with a spy on the manager's per-run refresh seam
+    const {manager, shutdownHandler} = await startWithRealRegistries()
+    const refreshRun = vi.spyOn(manager, 'refreshRun')
+    const exited = new Promise<number | string | null | undefined>(resolve => {
+      vi.spyOn(process, 'exit').mockImplementation((code?: number | string | null) => {
+        resolve(code)
+        return undefined as never
+      })
+    })
+    const {clearWaitReason, setWaitReason} = await import('./execute/wait-reason-registry.js')
+    setWaitReason('run-wait-1', 'root-live')
+    expect(refreshRun).toHaveBeenCalledExactlyOnceWith('run-wait-1')
+
+    // #when shutdown runs
+    shutdownHandler('SIGTERM')
+    expect(await exited).toBe(0)
+    setWaitReason('run-wait-1', 'revision-drift')
+
+    // #then the change did not reach the manager
+    expect(refreshRun).toHaveBeenCalledOnce()
+    clearWaitReason('run-wait-1')
+  })
+
   it('stops refreshing from gate events once shutdown has unsubscribed the listeners', async () => {
     // #given a wired program with a spy on the manager's refresh seam
     const {manager, questionRegistry, shutdownHandler} = await startWithRealRegistries()
@@ -3454,5 +3508,69 @@ describe('durable operator sessions — program wiring', () => {
       await expect(runSessionMaintenance(store, {...stubLogger, warn})).resolves.toBeUndefined()
       expect(warn).toHaveBeenCalledWith({errorClass: 'Error'}, expect.stringContaining('maintenance tick failed'))
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Stranded-run sweep — program wiring
+// ---------------------------------------------------------------------------
+
+describe('stranded-run sweep wiring', () => {
+  const SWEEP_MS = 60_000
+
+  async function bootPlain() {
+    const intervalSpy = vi.spyOn(globalThis, 'setInterval')
+    const deps = {
+      makeClient: () => makeFakeClient() as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer: vi.fn(),
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+    await Effect.runPromise(makeGatewayProgram(deps, makeFakeConfig({announce: undefined, operatorWeb: undefined})))
+    const index = intervalSpy.mock.calls.findIndex(([, ms]) => ms === SWEEP_MS)
+    const handle = intervalSpy.mock.results[index]?.value as ReturnType<typeof setInterval> | undefined
+    return {
+      intervalSpy,
+      handle,
+      timers: intervalSpy.mock.calls.filter(([, ms]) => ms === SWEEP_MS),
+      deps,
+    }
+  }
+
+  it("starts one unref'd 60 s timer, even with operator web disabled", async () => {
+    // #given / #when
+    const {handle, timers} = await bootPlain()
+
+    // #then
+    expect(timers).toHaveLength(1)
+    expect(handle?.hasRef()).toBe(false)
+  })
+
+  it('starts the timer after login, when startup recovery runs, so its first tick is one interval after boot', async () => {
+    // #given / #when
+    const {deps, intervalSpy} = await bootPlain()
+
+    // #then the sweep timer was created after login returned
+    const sweepCall = intervalSpy.mock.calls.findIndex(([, ms]) => ms === SWEEP_MS)
+    const loginOrder = deps.login.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY
+    const timerOrder = intervalSpy.mock.invocationCallOrder[sweepCall] ?? 0
+    expect(timerOrder).toBeGreaterThan(loginOrder)
+  })
+
+  it('clears the timer when the shutdown drain runs', async () => {
+    // #given
+    const {handle} = await bootPlain()
+    const {installShutdownHandlers} = await import('./shutdown.js')
+    const drain = vi.mocked(installShutdownHandlers).mock.calls.at(-1)?.[4]
+    if (drain === undefined) throw new Error('expected the program to pass a drain callback')
+    const clearSpy = vi.spyOn(globalThis, 'clearInterval')
+
+    // #when
+    await drain().catch(() => {})
+
+    // #then
+    expect(clearSpy).toHaveBeenCalledWith(handle)
   })
 })

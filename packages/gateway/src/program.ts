@@ -29,6 +29,7 @@ import {
   DEFAULT_STALE_THRESHOLD_MS,
   err,
   redactSensitiveFields,
+  toErrorMessage,
 } from '@fro-bot/runtime'
 import {Effect} from 'effect'
 import {composeQuestionHooks, createDiscordQuestionOnRegistered} from './approvals/discord-question-transport.js'
@@ -55,6 +56,8 @@ import {recoverStaleRuns} from './execute/recovery.js'
 import {createRepoQuiescenceChecker} from './execute/repo-quiescence.js'
 import {createRunIndex} from './execute/run-index.js'
 import {getInFlightRuns} from './execute/run.js'
+import {createStrandedRunPass, createStrandedRunSweep, isRunOwnedByThisProcess} from './execute/stranded-run-sweep.js'
+import {getWaitReason, onWaitReasonChange} from './execute/wait-reason-registry.js'
 import {createWorkspaceCalls} from './execute/workspace-calls.js'
 import {createAppClient} from './github/app-client.js'
 import {createWorkflowDispatcher} from './github/dispatch.js'
@@ -570,6 +573,8 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
         hasPendingApproval: scopeId => approvalRegistry.hasPendingForScope(scopeId),
         hasPendingQuestion: scopeId => questionRegistry.hasPendingForScope(scopeId),
       },
+      // Why a draining run has not finished (the completion gate's latest declined code), mapped to the wire by the manager.
+      readWaitReason: getWaitReason,
       isRepoDenied: denylistCache.isRepoDenied,
       logger,
       setInterval: (cb, ms) => setInterval(cb, ms),
@@ -589,6 +594,10 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       }),
       requestGate.onTerminal(event => {
         runObservationManager.refreshScope(event.scopeId)
+      }),
+      // The gate declining a draining run for a different reason changes its status without any lifecycle event.
+      onWaitReasonChange(runId => {
+        runObservationManager.refreshRun(runId)
       }),
     ]
 
@@ -915,6 +924,8 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
     //     When absent, operatorServerHandle is undefined and shutdown skips it.
     let operatorServerHandle: CloseableServer | undefined
     let sessionMaintenanceInterval: ReturnType<typeof setInterval> | undefined
+    // Created after startup recovery; the shutdown drain stops it if it exists.
+    let strandedRunSweep: ReturnType<typeof createStrandedRunSweep> | undefined
     if (config.operatorWeb === undefined || deps.startOperatorServer === undefined) {
       logger.info({}, 'operator web endpoint disabled — no operator web config set')
     } else {
@@ -1165,6 +1176,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       if (sessionMaintenanceInterval !== undefined) {
         clearInterval(sessionMaintenanceInterval)
       }
+      strandedRunSweep?.stop()
 
       // Stop refreshing status from gate events, then shut down the run-observation manager —
       // closes all SSE subscriptions and clears timers.
@@ -1214,27 +1226,46 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
     // j. Stale-run recovery — transition any runs left EXECUTING by a prior crash.
     //    Called after login so the Discord client is available for best-effort thread notes.
     //    Errors are logged internally; the startup sequence continues regardless.
+    const recoverDeps = {
+      coordinationConfig: makeCoordinationConfig(s3Adapter, config),
+      identity: config.identity,
+      bindingsStore,
+      checkRepoQuiescence,
+      resolveThread: async (threadId: string): Promise<SinkThread | null> => {
+        try {
+          const channel = await client.channels.fetch(threadId)
+          if (channel === null) return null
+          if (!('send' in channel)) return null
+          return channel
+        } catch {
+          return null
+        }
+      },
+      logger,
+    }
     yield* Effect.tryPromise({
-      try: async () =>
-        recoverStaleRuns({
-          coordinationConfig: makeCoordinationConfig(s3Adapter, config),
-          identity: config.identity,
-          bindingsStore,
-          checkRepoQuiescence,
-          resolveThread: async (threadId: string): Promise<SinkThread | null> => {
-            try {
-              const channel = await client.channels.fetch(threadId)
-              if (channel === null) return null
-              if (!('send' in channel)) return null
-              return channel
-            } catch {
-              return null
-            }
-          },
-          logger,
-        }),
+      try: async () => recoverStaleRuns(recoverDeps),
       catch: error => (error instanceof Error ? error : new Error(String(error))),
     })
+
+    // j2. Periodic stranded-run sweep — repairs an EXECUTING record whose terminal write failed (or whose run died)
+    //     without waiting for the next boot. Owned runs (in the abort registry, or an in-flight maintenance run) are
+    //     skipped; locks are never touched. Started after startup recovery, so its first tick is one interval later.
+    strandedRunSweep = createStrandedRunSweep({
+      pass: createStrandedRunPass({
+        recoverDeps,
+        isOwned: isRunOwnedByThisProcess,
+        // A swept run has no run-core to tell the observation manager it ended, so its SSE subscribers would wait
+        // out their max duration; the swept state is the terminal frame.
+        observeTerminal: state => {
+          runObservationManager.observe(state).catch((error: unknown) => {
+            logger.warn({err: toErrorMessage(error)}, 'stranded-run sweep: runObserver.observe failed')
+          })
+        },
+      }),
+      logger,
+    })
+    strandedRunSweep.start()
 
     // k. Log startup
     logger.info({applicationId: config.discordApplicationId}, 'gateway started')

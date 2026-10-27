@@ -79,7 +79,7 @@ Symbols verified against the live source tree. Where a symbol has moved to `pack
 | `createQuestionCoordinator` | Function | `packages/gateway/src/approvals/question-coordinator.ts` | Per-run `question.*` event seam |
 | `createDiscordQuestionOnRegistered` | Function | `packages/gateway/src/approvals/discord-question-transport.ts` | Discord question transport |
 | `buildPendingQuestionsRoute` / `buildQuestionDecisionRoute` | Function | `packages/gateway/src/web/operator/{pending-questions-route,question-decision-route}.ts` | Question list and answer/skip routes |
-| `recoverStaleRuns` | Function | `packages/gateway/src/execute/recovery.ts` | Startup stale-run sweep |
+| `recoverStaleRuns` | Function | `packages/gateway/src/execute/recovery.ts` | Stale-run sweeps |
 | `classifyInspectResult` | Function | `packages/gateway/src/execute/provenance.ts` | `inspect()` → failure or `CheckoutProvenance` |
 | `parseOperatorCheckoutProvenance` | Function | `packages/gateway/src/operator-contract/provenance.ts` | Persisted provenance → operator DTO |
 | `inspectCheckout` | Function | `apps/workspace-agent/src/inspect.ts` | `POST /inspect` read-only checkout report |
@@ -92,7 +92,7 @@ Symbols verified against the live source tree. Where a symbol has moved to `pack
 | `createApp` | Function | `apps/workspace-agent/src/server.ts` | Control-API Hono app; required `auth` union |
 | `withRepoLock` | Function | `apps/workspace-agent/src/repo-mutex.ts` | Per-repo mutation mutex and maintenance hold |
 | `createRecoverCheckoutCommand` / `createCheckoutBackupCommand` | Function | `packages/gateway/src/discord/commands/{recover-checkout,checkout-backup}.ts` | `/fro-bot recover-checkout` and `checkout-backup` |
-| `OPERATOR_CONTRACT_VERSION` | Constant | `packages/gateway/src/operator-contract/version.ts` | Pinned operator contract version (`1.13.0`) |
+| `OPERATOR_CONTRACT_VERSION` | Constant | `packages/gateway/src/operator-contract/version.ts` | Pinned operator contract version (`1.14.0`) |
 | `resolveClient` / `parseCanonicalAddress` | Function | `packages/gateway/src/web/ingress/{resolve-client,canonical-address}.ts` | Trusted-proxy-aware client address; strict IP parser |
 | `createPushHealthTracker` / `observePushAdapterHealth` | Function | `packages/gateway/src/web/operator-push/{push-health,push-health-adapter}.ts` | Passive operator push health |
 

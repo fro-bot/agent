@@ -1082,3 +1082,179 @@ describe('parseRunState — malformed JSON never echoes record content', () => {
     expect(result.success === false ? result.error.message : '').toBe('Invalid run-state payload')
   })
 })
+
+describe('findStaleRuns — options for a bounded scan', () => {
+  const NOW = Date.parse('2026-04-24T18:15:00.000Z')
+  const KEY = (name: string) => `fro-bot-state/coordination/owner/repo/runs/${name}.json`
+  const staleExecuting = (runId: string) =>
+    createRunState({run_id: runId, phase: 'EXECUTING', last_heartbeat: '2026-04-24T18:13:00.000Z'})
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(NOW)
+  })
+
+  it('stops between keys once the signal aborts, and returns an error instead of a partial list', async () => {
+    // #given three keys, and a read of the first one that aborts the scan
+    const controller = new AbortController()
+    const getObject = vi.fn<Required<ObjectStoreAdapter>['getObject']>(async () => {
+      controller.abort()
+      return ok({data: JSON.stringify(staleExecuting('run-a')), etag: 'etag-a'})
+    })
+    const storeAdapter = createStoreAdapter({
+      list: vi.fn(async () => ok([KEY('a'), KEY('b'), KEY('c')])),
+      getObject,
+    })
+
+    // #when
+    const result = await findStaleRuns(
+      createCoordinationConfig(storeAdapter),
+      'coordination',
+      'owner/repo',
+      createLogger(),
+      {
+        signal: controller.signal,
+      },
+    )
+
+    // #then
+    expect(getObject).toHaveBeenCalledTimes(1)
+    expect(result.success).toBe(false)
+  })
+
+  it('hands the signal to each read so an in-flight read can be cut short', async () => {
+    // #given
+    const controller = new AbortController()
+    const getObject = vi.fn<Required<ObjectStoreAdapter>['getObject']>(async () =>
+      ok({data: JSON.stringify(staleExecuting('run-a')), etag: 'etag-a'}),
+    )
+    const storeAdapter = createStoreAdapter({list: vi.fn(async () => ok([KEY('a')])), getObject})
+
+    // #when
+    await findStaleRuns(createCoordinationConfig(storeAdapter), 'coordination', 'owner/repo', createLogger(), {
+      signal: controller.signal,
+    })
+
+    // #then
+    expect(getObject).toHaveBeenCalledWith(KEY('a'), {signal: controller.signal})
+  })
+
+  it('does not scan at all when the signal is already aborted', async () => {
+    // #given
+    const storeAdapter = createStoreAdapter({list: vi.fn(async () => ok([KEY('a')]))})
+    const controller = new AbortController()
+    controller.abort()
+
+    // #when
+    const result = await findStaleRuns(
+      createCoordinationConfig(storeAdapter),
+      'coordination',
+      'owner/repo',
+      createLogger(),
+      {
+        signal: controller.signal,
+      },
+    )
+
+    // #then
+    expect(result.success).toBe(false)
+    expect(storeAdapter.list).not.toHaveBeenCalled()
+    expect(storeAdapter.listWithMetadata).not.toHaveBeenCalled()
+  })
+
+  it('reads only keys modified since the window when the adapter lists metadata', async () => {
+    // #given an old terminal record and a recent stale one
+    const since = new Date(NOW - 60 * 60_000)
+    const getObject = vi.fn<Required<ObjectStoreAdapter>['getObject']>(async key =>
+      ok({data: JSON.stringify(staleExecuting(key === KEY('recent') ? 'run-recent' : 'run-old')), etag: 'etag'}),
+    )
+    const storeAdapter = createStoreAdapter({
+      listWithMetadata: vi.fn(async () =>
+        ok([
+          {key: KEY('old'), lastModified: new Date(NOW - 3 * 60 * 60_000)},
+          {key: KEY('recent'), lastModified: new Date(NOW - 5 * 60_000)},
+        ]),
+      ),
+      getObject,
+    })
+
+    // #when
+    const result = await findStaleRuns(
+      createCoordinationConfig(storeAdapter),
+      'coordination',
+      'owner/repo',
+      createLogger(),
+      {
+        modifiedSince: since,
+      },
+    )
+
+    // #then the old record was never read, and the recent stale one is reported
+    expect(getObject).toHaveBeenCalledTimes(1)
+    expect(getObject).toHaveBeenCalledWith(KEY('recent'))
+    expect(result.success === true ? result.data.map(run => run.run_id) : []).toEqual(['run-recent'])
+    expect(storeAdapter.list).not.toHaveBeenCalled()
+  })
+
+  it('reads every key when the adapter cannot list metadata, even with a window', async () => {
+    // #given
+    const getObject = vi.fn<Required<ObjectStoreAdapter>['getObject']>(async () =>
+      ok({data: JSON.stringify(staleExecuting('run-a')), etag: 'etag'}),
+    )
+    const storeAdapter = createStoreAdapter({list: vi.fn(async () => ok([KEY('a'), KEY('b')])), getObject})
+    const adapterWithoutMetadata = {...storeAdapter, listWithMetadata: undefined}
+
+    // #when
+    await findStaleRuns(
+      {...createCoordinationConfig(storeAdapter), storeAdapter: adapterWithoutMetadata},
+      'coordination',
+      'owner/repo',
+      createLogger(),
+      {modifiedSince: new Date(NOW - 60 * 60_000)},
+    )
+
+    // #then
+    expect(getObject).toHaveBeenCalledTimes(2)
+  })
+
+  it('without options, lists and reads exactly as before', async () => {
+    // #given
+    const getObject = vi.fn<Required<ObjectStoreAdapter>['getObject']>(async () =>
+      ok({data: JSON.stringify(staleExecuting('run-a')), etag: 'etag'}),
+    )
+    const storeAdapter = createStoreAdapter({list: vi.fn(async () => ok([KEY('a')])), getObject})
+
+    // #when
+    await findStaleRuns(createCoordinationConfig(storeAdapter), 'coordination', 'owner/repo', createLogger())
+
+    // #then the read carries no options, as existing callers expect
+    expect(getObject).toHaveBeenCalledWith(KEY('a'))
+    expect(storeAdapter.listWithMetadata).not.toHaveBeenCalled()
+  })
+
+  it('falls back to the full list when listing metadata fails', async () => {
+    // #given
+    const getObject = vi.fn<Required<ObjectStoreAdapter>['getObject']>(async () =>
+      ok({data: JSON.stringify(staleExecuting('run-a')), etag: 'etag'}),
+    )
+    const storeAdapter = createStoreAdapter({
+      listWithMetadata: vi.fn(async () => err(new Error('metadata list failed'))),
+      list: vi.fn(async () => ok([KEY('a')])),
+      getObject,
+    })
+
+    // #when
+    const result = await findStaleRuns(
+      createCoordinationConfig(storeAdapter),
+      'coordination',
+      'owner/repo',
+      createLogger(),
+      {
+        modifiedSince: new Date(NOW - 60 * 60_000),
+      },
+    )
+
+    // #then
+    expect(result.success === true ? result.data : []).toHaveLength(1)
+  })
+})

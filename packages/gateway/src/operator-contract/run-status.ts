@@ -32,6 +32,7 @@ import type {RunPhase, RunState, Surface} from '@fro-bot/runtime'
 import type {RunCoreErrorKind} from '../execute/run-core.js'
 import type {OperatorCheckoutPreparation, OperatorCheckoutProvenance} from './provenance.js'
 import type {OperatorProviderFailureReason} from './provider-failure-reason.js'
+import type {OperatorWaitReason} from './wait-reason.js'
 
 import {parseOperatorCheckoutPreparation, parseOperatorCheckoutProvenance} from './provenance.js'
 import {projectProviderFailureReason, PROVIDER_FAILURE_REASON_DETAILS_KEY} from './provider-failure-reason.js'
@@ -120,6 +121,14 @@ export interface OperatorRunStatus {
    * of the same run — each run attempt is its own record.
    */
   readonly checkoutPreparation?: OperatorCheckoutPreparation
+  /**
+   * Why a draining run has not finished yet (contract 1.14.0): a closed enum with no raw text. Present only on a
+   * `running` status, and only while the completion gate is declining the run; absent on every other status
+   * (approval and question waits take precedence, terminal runs never carry it). Not derived from `RunState` and
+   * never stored: it is an in-memory overlay on a live run, so a client that reconnects reads it fresh. Consumers must
+   * tolerate a value they do not recognise (later MINOR versions may add values) and treat absence as "no detail".
+   */
+  readonly waitReason?: OperatorWaitReason
 }
 
 /**

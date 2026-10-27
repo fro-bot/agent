@@ -1943,6 +1943,7 @@ describe('observer-only invariant — observeOutput extension', () => {
     const allowedManagerKeys = new Set([
       'observe',
       'refreshScope',
+      'refreshRun',
       'observeOutput',
       'observeApproval',
       'observeQuestion',
@@ -4725,5 +4726,171 @@ describe('waiting refresh — binding store unavailable', () => {
     expect(statusNames(frames)).toEqual(['running'])
 
     harness.manager.shutdown()
+  })
+})
+
+// ===========================================================================
+// Wait reason: why a draining running run has not finished (in-memory overlay)
+// ===========================================================================
+
+/** A harness whose per-run wait-reason store the test controls, and whose refresh the test triggers. */
+function makeWaitReasonHarness() {
+  const reasons = new Map<string, string>()
+  const harness = makeWaitingHarness({readWaitReason: runId => reasons.get(runId)})
+  const setReason = async (runId: string, code: string | undefined): Promise<void> => {
+    if (code === undefined) reasons.delete(runId)
+    else reasons.set(runId, code)
+    harness.manager.refreshRun(runId)
+    await drain()
+  }
+  return {...harness, reasons, setReason}
+}
+
+describe('wait reason overlay', () => {
+  const waitReasons = (frames: readonly ObservationFrame[]): (string | undefined)[] =>
+    frames.flatMap(frame => (frame.type === 'status' ? [frame.data.waitReason] : []))
+
+  it('shows the wire reason on a running status while the gate declines, and drops it on admission', async () => {
+    // #given an observed running run
+    const harness = makeWaitReasonHarness()
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    await observeAndDrain(harness.manager, makeRunState())
+
+    // #when the gate declines because a child's notice has not been seen, and then admits
+    await harness.setReason('run-001', 'notice-not-observed')
+    await harness.setReason('run-001', undefined)
+
+    // #then the status carries the wire value (never the raw code) and then loses it
+    expect(statusNames(frames)).toEqual(['running', 'running', 'running'])
+    expect(waitReasons(frames)).toEqual([undefined, 'awaiting-background-task', undefined])
+    harness.manager.shutdown()
+  })
+
+  it('includes the reason in the snapshot a late subscriber gets', async () => {
+    // #given
+    const harness = makeWaitReasonHarness()
+    await observeAndDrain(harness.manager, makeRunState())
+    await harness.setReason('run-001', 'root-live')
+
+    // #when
+    const late = collectFrames(harness.manager, 'run-001')
+    await drain()
+
+    // #then
+    expect(waitReasons(late.frames)).toEqual(['agent-working'])
+    harness.manager.shutdown()
+  })
+
+  it('lets a pending approval win: no wait reason while the run waits for approval, and it returns after', async () => {
+    // #given a run with a wait reason
+    const harness = makeWaitReasonHarness()
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    await observeAndDrain(harness.manager, makeRunState())
+    await harness.setReason('run-001', 'notice-not-observed')
+
+    // #when an approval opens, then settles
+    harness.registries.openApproval('run-001')
+    harness.manager.refreshScope('run-001')
+    await drain()
+    harness.registries.closeApproval('run-001')
+    harness.manager.refreshScope('run-001')
+    await drain()
+
+    // #then the approval frame has no waitReason, and running resumes with it
+    expect(statusNames(frames)).toEqual(['running', 'running', 'waiting_for_approval', 'running'])
+    expect(waitReasons(frames)).toEqual([undefined, 'awaiting-background-task', undefined, 'awaiting-background-task'])
+    harness.manager.shutdown()
+  })
+
+  it('lets a pending question win the same way', async () => {
+    // #given
+    const harness = makeWaitReasonHarness()
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    await observeAndDrain(harness.manager, makeRunState())
+    await harness.setReason('run-001', 'root-live')
+
+    // #when
+    await openQuestionAndRefresh(harness, 'run-001')
+
+    // #then
+    expect(statusNames(frames).at(-1)).toBe('waiting_for_question')
+    expect(waitReasons(frames).at(-1)).toBeUndefined()
+    harness.manager.shutdown()
+  })
+
+  it('sends nothing for a repeated reason, one frame for a changed wire value, and nothing for a different code with the same wire value', async () => {
+    // #given
+    const harness = makeWaitReasonHarness()
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    await observeAndDrain(harness.manager, makeRunState())
+    await harness.setReason('run-001', 'root-live')
+
+    // #when the same code repeats, another code maps to the same wire value, then a different wire value arrives
+    const before = frames.length
+    await harness.setReason('run-001', 'root-live')
+    await harness.setReason('run-001', 'root-liveness-unavailable')
+    expect(frames.length).toBe(before)
+    await harness.setReason('run-001', 'ledger-not-drained')
+
+    // #then
+    expect(frames.length).toBe(before + 1)
+    expect(waitReasons(frames).at(-1)).toBe('awaiting-background-task')
+    harness.manager.shutdown()
+  })
+
+  it('never puts an unknown code on the wire, and sends no frame for it', async () => {
+    // #given
+    const harness = makeWaitReasonHarness()
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    await observeAndDrain(harness.manager, makeRunState())
+    const before = frames.length
+
+    // #when
+    await harness.setReason('run-001', '/workspace/repos/acme/widget/secret')
+    await harness.setReason('run-001', 'toString')
+
+    // #then
+    expect(frames.length).toBe(before)
+    expect(JSON.stringify(frames)).not.toContain('secret')
+    harness.manager.shutdown()
+  })
+
+  it('carries no wait reason on a terminal status, live or replayed, even if a stale reason is still recorded', async () => {
+    // #given a run with a recorded reason that the process has not yet cleared
+    const harness = makeWaitReasonHarness()
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    await observeAndDrain(harness.manager, makeRunState())
+    await harness.setReason('run-001', 'notice-not-observed')
+
+    // #when the run reaches a terminal phase
+    await observeAndDrain(harness.manager, makeRunState({phase: 'COMPLETED'}))
+
+    // #then the terminal frame has none, and neither does a late subscriber's replay
+    expect(statusNames(frames).at(-1)).toBe('succeeded')
+    expect(waitReasons(frames).at(-1)).toBeUndefined()
+    const late = collectFrames(harness.manager, 'run-001')
+    await drain()
+    expect(waitReasons(late.frames).every(reason => reason === undefined)).toBe(true)
+    harness.manager.shutdown()
+  })
+
+  it('does not refresh a run that was never observed, or after shutdown', async () => {
+    // #given
+    const harness = makeWaitReasonHarness()
+    await observeAndDrain(harness.manager, makeRunState())
+    const {frames} = collectFrames(harness.manager, 'run-001')
+    await drain()
+    const before = frames.length
+
+    // #when
+    harness.reasons.set('run-never', 'root-live')
+    expect(() => harness.manager.refreshRun('run-never')).not.toThrow()
+    harness.manager.shutdown()
+    harness.reasons.set('run-001', 'root-live')
+    harness.manager.refreshRun('run-001')
+    await drain()
+
+    // #then
+    expect(frames.length).toBe(before)
   })
 })
