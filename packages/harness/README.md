@@ -45,7 +45,7 @@ Windows is not supported. Install does not fail when the platform package is mis
 
 ### Install caveats
 
-Both commands share the name `opencode` with the stock `opencode-ai` package, so the two compete for the same bin. OpenCode 2's `@opencode/cli` (which also declares `opencode2`) declares an `opencode` bin too and collides the same way. The legacy `opencode-ai` and `@opencode-ai/sdk` packages end at 1.19.0.
+Both commands share the name `opencode` with the stock `opencode-ai` package, so the two compete for the same bin. OpenCode 2's `@opencode/cli` (which also declares `opencode2`) declares an `opencode` bin too and collides the same way. The legacy `opencode-ai` and `@opencode-ai/sdk` packages stay on the 1.x line.
 
 - **npm:** if `opencode-ai` is installed globally, installing the harness fails with `EEXIST` because that package already owns the `opencode` bin. `npm i -g --force @fro.bot/harness` overwrites the bin. Uninstalling the harness afterwards removes it and leaves no `opencode` on your system; reinstall `opencode-ai` if you want the stock command back.
 - **bun:** a global install silently overwrites the existing `opencode` bin.
@@ -79,9 +79,9 @@ mise upgrade
 
 Do not run `opencode upgrade --method <pm>`: that installs stock `opencode-ai` from the package manager, not the harness. `opencode upgrade --major --method <pm>` is worse: it removes the global `opencode-ai` package and installs OpenCode 2 (`@opencode/cli`), also not the harness.
 
-Since 1.19, OpenCode never installs updates automatically; the `autoupdate` setting only controls the update notice. The interactive TUI checks for a newer release shortly after startup and every 10 minutes, and may show an update notice or an "OpenCode 2" notice. Set `autoupdate: false` or `OPENCODE_DISABLE_AUTOUPDATE` to turn the check off. `opencode serve` never runs the check.
+Since 1.19, OpenCode never installs updates automatically; the `autoupdate` setting only controls the update notice. The interactive TUI checks for a newer release shortly after startup and every 10 minutes, and may show an update notice or an "OpenCode 2" notice. Set `autoupdate: false` or `OPENCODE_DISABLE_AUTOUPDATE` to turn the check off. `opencode serve` never runs the check. The check reads the newest `opencode-ai` release from the npm registry for every install method (Homebrew Core is the exception: its formula is OpenCode 2, so the check reports no update). Only a newer 1.x release counts as an update, and the installed version's build metadata is ignored when comparing, so `<base>+harness.<sha>` is not older than `<base>`.
 
-The install method is detected by asking each package manager whether `opencode-ai` is installed globally (a binary under `.opencode/bin` or `.local/bin` counts as a curl install). A harness install matches none of these, so its method is `unknown`, and applying an update from `/update`, `opencode upgrade`, or `opencode upgrade --major` fails: the TUI reports "Installation method not found", and the CLI reports an unknown installation method (`opencode upgrade` first asks "Install anyways?", defaulting to No). Because the check for an unknown method reads the stock GitHub release and the harness reports `<base>+harness.<sha>`, the TUI may show an update notice even when the base release is current.
+The install method is detected by asking each package manager whether `opencode-ai` is installed globally (a binary under `.opencode/bin` or `.local/bin` counts as a curl install). A harness install matches none of these, so its method is `unknown`, and applying an update from `/update`, `opencode upgrade`, or `opencode upgrade --major` fails: the TUI reports "Installation method not found", and the CLI reports an unknown installation method (`opencode upgrade` first asks "Install anyways?", defaulting to No).
 
 If stock `opencode-ai` is also installed under a detected package manager, the method is detected as that manager, and an applied update targets that stock install instead.
 
