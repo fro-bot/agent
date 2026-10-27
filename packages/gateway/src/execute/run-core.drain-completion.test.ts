@@ -28,7 +28,9 @@ import {afterEach, describe, expect, it, vi} from 'vitest'
 import {createQuestionCoordinator} from '../approvals/question-coordinator.js'
 import {createQuestionRegistry} from '../approvals/question-registry.js'
 import {createRequestGate} from '../approvals/request-gate.js'
+import {QUARANTINE_HOLD_WINDOW_MS} from './root-stop.js'
 import {RunCoreError, runOpenCodeCore} from './run-core.js'
+import {stoppedRootMessages} from './test-helpers.js'
 import {getWaitReason} from './wait-reason-registry.js'
 
 // ---------------------------------------------------------------------------
@@ -352,6 +354,12 @@ function startRun(options: RunOptions = {}) {
       abort: sessionAbort,
       messages: vi.fn().mockImplementation(async (args: {readonly path: {readonly id: string}}) => {
         if (args.path.id === ROOT) {
+          // Once the run has told the root to stop, the termination barrier reads the root's messages for the
+          // evidence that it did (the abort's reply). That read is the barrier's, not a drain validation: it is
+          // answered here and never reaches `fixture.root`, which scripts what the drain gate sees.
+          if (sessionAbort.mock.calls.some(call => (call[0] as {path?: {id?: string}}).path?.id === ROOT)) {
+            return {data: stoppedRootMessages(ROOT), error: null}
+          }
           rootMessageCalls += 1
           return fixture.root()
         }
@@ -1394,8 +1402,11 @@ describe('runOpenCodeCore — drain completion for background work', () => {
         const order: string[] = []
         const run = await inFollowUp({
           sessionAbort: async () => {
-            order.push('abort-root')
-            setTimeout(() => run.live.delete(ROOT), 700)
+            // the root is aborted again on every poll that finds it live: record the first abort only
+            if (!order.includes('abort-root')) {
+              order.push('abort-root')
+              setTimeout(() => run.live.delete(ROOT), 700)
+            }
             return {data: {}, error: null}
           },
         })
@@ -1488,7 +1499,8 @@ describe('runOpenCodeCore — drain completion for background work', () => {
       // #then the run is quarantined with the original classification, and nothing keeps polling
       expectKind(run.outcome(), 'drain-timeout')
       expect((run.outcome() as {error: RunCoreError}).error.quarantined).toBe(true)
-      await run.advance(2_000)
+      // the only thing that can still be running is the root watch for the quarantine hold, which ends with the hold
+      await run.advance(QUARANTINE_HOLD_WINDOW_MS + 2_000)
       expect(vi.getTimerCount()).toBe(0)
     })
 
@@ -1514,7 +1526,7 @@ describe('runOpenCodeCore — drain completion for background work', () => {
       ['an empty ledger', 'deadline', {}],
       ['an empty ledger', 'cancel', {}],
     ])(
-      '%s, %s: the root is aborted and confirmed quiescent, no children or messages lookups, original classification',
+      '%s, %s: the root is aborted and confirmed quiescent, no children lookups, original classification',
       async (_label, how, options) => {
         // #given a run with nothing adopted, mid-execution
         const run = startRun({deadlineMs: 10_000, ...options})
@@ -1539,7 +1551,9 @@ describe('runOpenCodeCore — drain completion for background work', () => {
         expect(run.client.session.abort).toHaveBeenCalledWith(expect.objectContaining({path: {id: ROOT}}))
         expect(run.client.session.status).toHaveBeenCalled()
         expect(run.client.session.children).not.toHaveBeenCalled()
-        expect(run.client.session.messages).not.toHaveBeenCalled()
+        // the only messages read is the root's own, for the evidence that it stopped
+        expect(run.client.session.messages).toHaveBeenCalledTimes(1)
+        expect(run.client.session.messages).toHaveBeenCalledWith(expect.objectContaining({path: {id: ROOT}}))
       },
     )
   })

@@ -32,6 +32,7 @@ sources:
   - packages/gateway/src/execute/recovery.ts
   - packages/gateway/src/execute/checkout-recovery.ts
   - packages/gateway/src/execute/settle-owned-sessions.ts
+  - packages/gateway/src/execute/root-stop.ts
   - packages/gateway/src/execute/run-core.ts
   - apps/workspace-agent/src/server.ts
   - apps/workspace-agent/src/recover.ts
@@ -191,6 +192,7 @@ When a gateway run ends before the agent starts, or a cancel does not seem to st
 - **`run-core: event stream silent — failing the run`** (gateway, error) means no event at all, heartbeats included, arrived for `silenceMs` (30000). It carries `sessionId`, the event counters and `lastEventType`. The run ends as `stream-ended` ("Event stream silent for 30s") even while an approval or question is pending, and the pending request is rejected when the termination barrier starts.
 - **`run-core: event stream announced itself again — stream was replaced`** (gateway, error) means a second `server.connected` arrived on one stream. Events between the two connections were never delivered, so the run ends as `stream-ended`.
 - **`settle-owned-sessions: ...`** and **`run-core: owned work could not be confirmed settled`** (gateway) carry `runId` as well as `rootSessionId`, so an abort that did not confirm, and the quarantine that follows, join to their run. Match the `rootSessionId` to the `sessionId` on the workspace's abort line to see whether the abort request reached OpenCode.
+- **`settle-owned-sessions: the root is running after the abort`** (gateway, warn) means the root session showed up live after the barrier's first abort, so the abort had been sent before the prompt was running and did nothing. The barrier aborts it again on every poll until its terminal reply exists. **`root-watch: the root is running during the quarantine hold`** (warn) is the same observation during the quarantine hold, with `aborts` counting the extra aborts; **`root-watch: the root is confirmed stopped`** (info) and **`root-watch: quarantine hold ended without confirming the root stopped`** (warn) end the watch. All carry `runId` and `rootSessionId` and never message content.
 
 ## Workspace Stream Disconnects
 

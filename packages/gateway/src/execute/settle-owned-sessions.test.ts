@@ -47,6 +47,62 @@ const CHILD = 'sess-child'
 // Tests
 // ---------------------------------------------------------------------------
 
+const STOPPED = (): readonly object[] => [
+  {info: {id: 'u1', role: 'user'}, parts: []},
+  {
+    info: {
+      id: 'a1',
+      role: 'assistant',
+      parentID: 'u1',
+      time: {completed: 2},
+      error: {name: 'MessageAbortedError'},
+    },
+    parts: [],
+  },
+]
+
+function makePromptedClient(options: {
+  readonly status?: (calls: number) => object
+  readonly messages?: (abortCalls: number) => readonly object[]
+  readonly abort?: () => Promise<unknown>
+}) {
+  let statusCalls = 0
+  const abort = vi.fn(options.abort ?? (async () => ({data: {}, error: null})))
+  const client = {
+    session: {
+      abort,
+      children: vi.fn().mockResolvedValue({data: [], error: null}),
+      status: vi.fn(async () => {
+        statusCalls += 1
+        return {data: options.status?.(statusCalls) ?? {}, error: null}
+      }),
+      messages: vi.fn(async () => ({data: options.messages?.(abort.mock.calls.length) ?? [], error: null})),
+    },
+  } as unknown as SessionClient
+  return {
+    client,
+    abort,
+    session: client.session as unknown as {
+      readonly status: ReturnType<typeof vi.fn>
+      readonly messages: ReturnType<typeof vi.fn>
+    },
+  }
+}
+
+async function settle(client: SessionClient, extra: Partial<Parameters<typeof settleOwnedSessions>[0]> = {}) {
+  return settleOwnedSessions({
+    client,
+    directory: '/workspace/repo',
+    rootSessionId: ROOT,
+    ledger: createOwnershipLedger(),
+    logger: makeLogger(),
+    confirmRootQuiescent: true,
+    rootPollIntervalMs: 5,
+    timeoutMs: 400,
+    ...extra,
+  })
+}
+
 describe('settleOwnedSessions', () => {
   it('exports DEFAULT_SETTLE_TIMEOUT_MS', () => {
     expect(DEFAULT_SETTLE_TIMEOUT_MS).toBeGreaterThan(0)
@@ -370,6 +426,7 @@ describe('settleOwnedSessions', () => {
       expect(result).toEqual({
         settled: false,
         reason: 'settle attempt threw unexpectedly: boom: unexpected ledger failure',
+        rootUnconfirmed: false,
       })
       expect(logger.error).toHaveBeenCalledWith(
         expect.objectContaining({detail: 'boom: unexpected ledger failure'}),
@@ -565,33 +622,158 @@ describe('settleOwnedSessions', () => {
     })
   })
   describe('confirming a root that was prompted', () => {
-    it('confirms and releases on absence after an abort sent right after promptAsync returned', async () => {
-      // #given a root aborted immediately after the 204: on OpenCode 1.19.0 the abort wins even before any busy
-      // status exists (live probe: the session never goes busy, nothing runs, and the assistant turn is created
-      // and completed with MessageAbortedError), so the live set never shows the root
-      const ledger = createOwnershipLedger()
-      const client = makeClient({status: async () => ({data: {}, error: null})})
+    it('warm server: confirms and releases once the aborted reply is the last message, with one abort', async () => {
+      // #given an abort that produces a terminal MessageAbortedError reply, and a root that is not live
+      const {client, abort} = makePromptedClient({messages: calls => (calls > 0 ? STOPPED() : [])})
 
       // #when
-      const result = await settleOwnedSessions({
-        client,
-        directory: '/workspace/repo',
-        rootSessionId: ROOT,
-        ledger,
-        logger: makeLogger(),
-        confirmRootQuiescent: true,
-        rootPollIntervalMs: 5,
+      const result = await settle(client)
+
+      // #then absence plus the terminal reply is the confirmation
+      expect(result).toEqual({settled: true})
+      expect(abort).toHaveBeenCalledTimes(1)
+    })
+
+    it('cold server: absence from the live set alone is not confirmation; the root is unconfirmed at the bound', async () => {
+      // #given an abort that did nothing (no runner yet): the root is absent and no reply exists
+      const {client} = makePromptedClient({})
+
+      // #when
+      const result = await settle(client)
+
+      // #then it fails closed
+      expect(result.settled).toBe(false)
+      expect(result).toMatchObject({rootUnconfirmed: true})
+    })
+
+    it('cold server: aborts again when the root turns up busy, and confirms once its prompt is stopped', async () => {
+      // #given the prompt starts late (busy from the third status read), and only the SECOND abort stops it
+      const {client, abort} = makePromptedClient({
+        status: calls => (calls >= 3 && calls < 5 ? {[ROOT]: {type: 'busy'}} : {}),
+        messages: calls => (calls >= 2 ? STOPPED() : []),
       })
 
-      // #then absence after the abort is the confirmation: one abort, no extra evidence required
+      // #when
+      const result = await settle(client)
+
+      // #then the busy observation triggered another abort, and the terminal reply confirmed it
+      expect(abort.mock.calls.length).toBeGreaterThanOrEqual(2)
       expect(result).toEqual({settled: true})
-      const session = client.session as unknown as {
-        readonly abort: ReturnType<typeof vi.fn>
-        readonly status: ReturnType<typeof vi.fn>
+    })
+
+    it("an older turn's terminal reply does not count", async () => {
+      // #given an answered first turn, then a newer user message nobody has answered
+      const {client} = makePromptedClient({
+        messages: () => [
+          {info: {id: 'u1', role: 'user'}, parts: []},
+          {info: {id: 'a1', role: 'assistant', parentID: 'u1', time: {completed: 2}}, parts: []},
+          {info: {id: 'u2', role: 'user'}, parts: []},
+        ],
+      })
+
+      // #when
+      const result = await settle(client)
+
+      // #then
+      expect(result).toMatchObject({settled: false, rootUnconfirmed: true})
+    })
+
+    it('a terminal reply to an older user message, with a newer one answered by nothing yet, does not count', async () => {
+      // #given the last message is a reply, but to the OLDER user message
+      const {client} = makePromptedClient({
+        messages: () => [
+          {info: {id: 'u1', role: 'user'}, parts: []},
+          {info: {id: 'u2', role: 'user'}, parts: []},
+          {info: {id: 'a1', role: 'assistant', parentID: 'u1', time: {completed: 2}}, parts: []},
+        ],
+      })
+
+      // #then
+      expect(await settle(client)).toMatchObject({settled: false, rootUnconfirmed: true})
+    })
+
+    it('no user message yet: fails closed', async () => {
+      // #given a prompt that is still being prepared: nothing persisted
+      const {client} = makePromptedClient({messages: () => []})
+
+      // #then
+      expect(await settle(client)).toMatchObject({settled: false, rootUnconfirmed: true})
+    })
+
+    it('an unfinished reply (no completion time) does not count', async () => {
+      // #given a reply that has not completed
+      const {client} = makePromptedClient({
+        messages: () => [
+          {info: {id: 'u1', role: 'user'}, parts: []},
+          {info: {id: 'a1', role: 'assistant', parentID: 'u1', time: {created: 2}}, parts: []},
+        ],
+      })
+
+      // #then
+      expect(await settle(client)).toMatchObject({settled: false, rootUnconfirmed: true})
+    })
+
+    it('a user message the stream showed that the list does not hold: the list describes an older state', async () => {
+      // #given a stopped-looking list that lacks the user message the stream announced
+      const {client} = makePromptedClient({messages: () => STOPPED()})
+
+      // #when
+      const result = await settle(client, {streamedUserMessageIds: () => new Set(['u-newer'])})
+
+      // #then
+      expect(result).toMatchObject({settled: false, rootUnconfirmed: true})
+    })
+
+    it('a failed abort is still confirmed when the terminal reply is there (the evidence, not the receipt, decides)', async () => {
+      // #given an abort that errors, but a root that had already finished with a terminal reply
+      const {client} = makePromptedClient({
+        abort: async () => ({data: undefined, error: {message: 'nope'}}),
+        messages: () => STOPPED(),
+      })
+
+      // #then
+      expect(await settle(client)).toEqual({settled: true})
+    })
+
+    it('a failed abort with no terminal reply is not confirmed', async () => {
+      // #given an abort that errors and a root that is simply absent
+      const {client} = makePromptedClient({abort: async () => ({data: undefined, error: {message: 'nope'}})})
+
+      // #then
+      expect(await settle(client)).toMatchObject({settled: false, rootUnconfirmed: true})
+    })
+
+    it('a messages lookup that keeps failing is unconfirmed', async () => {
+      // #given
+      const client = {
+        session: {
+          abort: vi.fn().mockResolvedValue({data: {}, error: null}),
+          children: vi.fn().mockResolvedValue({data: [], error: null}),
+          status: vi.fn().mockResolvedValue({data: {}, error: null}),
+          messages: vi.fn().mockResolvedValue({data: undefined, error: {message: 'boom'}}),
+        },
+      } as unknown as SessionClient
+
+      // #then
+      expect(await settle(client)).toMatchObject({settled: false, rootUnconfirmed: true})
+    })
+
+    it('leaves no timer behind once it has decided', async () => {
+      // #given
+      vi.useFakeTimers()
+      try {
+        const {client} = makePromptedClient({})
+
+        // #when the bound passes
+        const pending = settle(client, {timeoutMs: 400})
+        await vi.advanceTimersByTimeAsync(1_000)
+        await pending
+
+        // #then
+        expect(vi.getTimerCount()).toBe(0)
+      } finally {
+        vi.useRealTimers()
       }
-      expect(session.abort).toHaveBeenCalledTimes(1)
-      expect(session.abort).toHaveBeenCalledWith(expect.objectContaining({path: {id: ROOT}}))
-      expect(session.status).toHaveBeenCalledTimes(1)
     })
   })
 })

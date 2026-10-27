@@ -24,6 +24,7 @@ import {createRequestGate} from '../approvals/request-gate.js'
 import {createDiscordStreamSink} from '../discord/streaming.js'
 import {createWebReplySink} from '../web/operator/web-sinks.js'
 import {RunCoreError, runOpenCodeCore, wrapLedgerWithHooks} from './run-core.js'
+import {stoppedRootMessages} from './test-helpers.js'
 
 // ---------------------------------------------------------------------------
 // Test-double helpers
@@ -410,7 +411,15 @@ function makeHandle(
   const sessionChildren = overrides.sessionChildren ?? (async () => ({data: [], error: null}))
   const sessionStatus = overrides.sessionStatus ?? (async () => ({data: {}, error: null}))
   const sessionAbort = overrides.sessionAbort ?? (async () => ({data: {}, error: null}))
-  const sessionMessages = overrides.sessionMessages ?? (async () => ({data: [], error: null}))
+  // Nothing is persisted until the run aborts the root; then the abort's reply is, which is the evidence the
+  // termination barrier needs to treat the root as stopped (absence from `session.status` is not enough).
+  let abortCalls = (): number => 0
+  const sessionMessages: (args: unknown) => Promise<unknown> =
+    overrides.sessionMessages ??
+    (async () => ({
+      data: abortCalls() > 0 ? stoppedRootMessages('sess-123') : [],
+      error: null,
+    }))
 
   const client = {
     session: {
@@ -426,6 +435,8 @@ function makeHandle(
     },
     postSessionIdPermissionsPermissionId: vi.fn().mockImplementation(postPermissionReply),
   }
+
+  abortCalls = () => client.session.abort.mock.calls.length
 
   return {
     client,

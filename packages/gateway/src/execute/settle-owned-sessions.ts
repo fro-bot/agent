@@ -48,10 +48,13 @@
  * Root that may still be running (`confirmRootQuiescent`): a run that stops while the prompt it sent may still
  * be executing (deadline, inactivity, a dropped stream, an operator cancel, a follow-up turn injected after
  * background work settled, a provider retry) cannot take the settled-ledger fast path, because `promptAsync`
- * keeps running server-side until `session.abort`. The root is aborted, then confirmed quiescent — absent from
- * the directory-scoped live set — by bounded polling inside the same teardown budget. A root that cannot be
- * confirmed quiescent in time is reported `settled: false`, which `throwWithBarrier` turns into the existing
- * quarantine.
+ * keeps running server-side until `session.abort`. The root is aborted, then confirmed stopped by bounded polling
+ * inside the same teardown budget. Absence from the directory-scoped live set is NOT confirmation: an abort sent
+ * before the runner exists returns success and does nothing, and a prompt still being prepared is absent too. The
+ * root is confirmed only when it is absent AND the last message in its session is a completed assistant reply to
+ * its latest user message (`root-stop.ts`). Every poll that finds the root live sends another abort, so a prompt
+ * that started late is stopped. A root that cannot be confirmed in time is reported `settled: false` with
+ * `rootUnconfirmed`, which `throwWithBarrier` turns into the existing quarantine and a root watch for the hold.
  *
  * This module deliberately does NOT decide what `run.ts` does with a
  * quarantine outcome — it only reports whether settlement was confirmed. The
@@ -62,8 +65,11 @@
 import type {OwnershipLedger, SessionClient} from '@fro-bot/runtime'
 import type {GatewayLogger} from '../discord/client.js'
 
-import {createSdkLedgerReconcileAdapter, formatSdkError, reconcileLedgerOnce, toErrorMessage} from '@fro-bot/runtime'
+import {createSdkLedgerReconcileAdapter, reconcileLedgerOnce, toErrorMessage} from '@fro-bot/runtime'
+import {abortSession, probeRootStop, ROOT_QUIESCENCE_POLL_INTERVAL_MS} from './root-stop.js'
 import {toRuntimeLogger} from './runtime-logger.js'
+
+export {ROOT_QUIESCENCE_POLL_INTERVAL_MS}
 
 /**
  * Upper bound, in milliseconds, on the whole settle attempt (abort round +
@@ -72,9 +78,6 @@ import {toRuntimeLogger} from './runtime-logger.js'
  * fresh budget, not a remainder of the run's budget.
  */
 export const DEFAULT_SETTLE_TIMEOUT_MS = 15_000
-
-/** Cadence of the root-quiescence confirmation poll (inside `DEFAULT_SETTLE_TIMEOUT_MS`). */
-export const ROOT_QUIESCENCE_POLL_INTERVAL_MS = 500
 
 export interface SettleOwnedSessionsParams {
   /** SDK client for the workspace OpenCode server this run is attached to. */
@@ -102,9 +105,21 @@ export interface SettleOwnedSessionsParams {
   readonly confirmRootQuiescent?: boolean
   /** Overrides `ROOT_QUIESCENCE_POLL_INTERVAL_MS` — for tests only. */
   readonly rootPollIntervalMs?: number
+  /**
+   * Root user message ids the event stream showed. A terminal reply only counts when every one of them is in the
+   * persisted message list (otherwise the list describes an older state). Absent: the list alone is trusted.
+   */
+  readonly streamedUserMessageIds?: () => ReadonlySet<string>
 }
 
-export type SettleOwnedSessionsResult = {readonly settled: true} | {readonly settled: false; readonly reason: string}
+export type SettleOwnedSessionsResult =
+  | {readonly settled: true}
+  | {
+      readonly settled: false
+      readonly reason: string
+      /** The root was to be confirmed stopped and was not. The caller keeps watching it through the hold. */
+      readonly rootUnconfirmed: boolean
+    }
 
 /**
  * A logger that merges `{runId}` into every context. Returns `logger` itself when there is no run id,
@@ -117,34 +132,6 @@ function withRunId(logger: GatewayLogger, runId: string | undefined): GatewayLog
     info: (context, message) => logger.info({runId, ...context}, message),
     warn: (context, message) => logger.warn({runId, ...context}, message),
     error: (context, message) => logger.error({runId, ...context}, message),
-  }
-}
-
-/**
- * Cancel a single session. Best-effort: checks BOTH the SDK error envelope
- * and a thrown exception, logs either, and never throws — a failed cancel
- * request is evidence for the confirmation step below, not a reason to abort
- * the whole settle attempt.
- */
-async function abortSession(
-  client: SessionClient,
-  sessionId: string,
-  directory: string,
-  signal: AbortSignal,
-  logger: GatewayLogger,
-  role: 'root' | 'owned',
-): Promise<void> {
-  try {
-    const response = await client.session.abort({path: {id: sessionId}, query: {directory}, signal})
-    const envelope = response as {readonly error?: unknown} | undefined
-    if (envelope?.error != null) {
-      logger.warn(
-        {sessionId, role, detail: formatSdkError(envelope.error)},
-        'settle-owned-sessions: session.abort returned an error envelope',
-      )
-    }
-  } catch (error) {
-    logger.warn({sessionId, role, detail: toErrorMessage(error)}, 'settle-owned-sessions: session.abort threw')
   }
 }
 
@@ -184,6 +171,7 @@ export async function settleOwnedSessions(params: SettleOwnedSessionsParams): Pr
     timeoutMs = DEFAULT_SETTLE_TIMEOUT_MS,
     confirmRootQuiescent = false,
     rootPollIntervalMs = ROOT_QUIESCENCE_POLL_INTERVAL_MS,
+    streamedUserMessageIds = (): ReadonlySet<string> => new Set<string>(),
   } = params
   const logger = withRunId(params.logger, params.runId)
 
@@ -200,6 +188,8 @@ export async function settleOwnedSessions(params: SettleOwnedSessionsParams): Pr
   )
   let finished = false
   const isFinished = (): boolean => finished
+  // Whether the root was confirmed stopped, readable from the bound's timeout path too.
+  let rootConfirmed = confirmRootQuiescent === false
 
   return withBound(
     timeoutMs,
@@ -255,18 +245,40 @@ export async function settleOwnedSessions(params: SettleOwnedSessionsParams): Pr
           }
         }
 
-        // The root's own follow-up turn: confirmed only by the directory-scoped live set no longer holding it.
-        // The abort call is a delivery receipt here too. Poll inside the same teardown budget; the outer bound
-        // turns a root that never quiesces (or a lookup that hangs) into the same quarantine decision.
+        // The root's own turn: confirmed only by positive evidence (see `probeRootStop`), never by absence alone.
+        // The abort call is a delivery receipt, and may have been sent before the runner existed. Poll inside the
+        // same teardown budget, aborting again whenever the root turns up live; the outer bound turns a root that
+        // never stops (or a lookup that hangs) into the same quarantine decision.
         let rootQuiescent = confirmRootQuiescent === false
+        let reaborts = 0
         while (!rootQuiescent && !isFinished() && !teardownSignal.aborted) {
-          const live = await adapter.liveSessionIds(teardownSignal)
-          if (live.success === true && !live.data.has(rootSessionId)) {
+          const probe = await probeRootStop({
+            client,
+            adapter,
+            directory,
+            rootSessionId,
+            signal: teardownSignal,
+            streamedUserMessageIds,
+          })
+          if (probe === 'confirmed') {
             rootQuiescent = true
-          } else if (!isFinished()) {
-            await new Promise<void>(resolve => {
-              setTimeout(resolve, rootPollIntervalMs)
-            })
+            rootConfirmed = true
+          } else {
+            if (probe === 'busy' && !isFinished()) {
+              reaborts += 1
+              if (reaborts === 1) {
+                logger.warn(
+                  {rootSessionId},
+                  'settle-owned-sessions: the root is running after the abort — aborting it again until it is confirmed stopped',
+                )
+              }
+              await abortSession(client, rootSessionId, directory, teardownSignal, logger, 'root')
+            }
+            if (!isFinished()) {
+              await new Promise<void>(resolve => {
+                setTimeout(resolve, rootPollIntervalMs)
+              })
+            }
           }
         }
 
@@ -274,7 +286,7 @@ export async function settleOwnedSessions(params: SettleOwnedSessionsParams): Pr
           logger.info(
             {rootSessionId, confirmRootQuiescent},
             confirmRootQuiescent
-              ? 'settle-owned-sessions: owned work settled and the root confirmed quiescent'
+              ? 'settle-owned-sessions: owned work settled and the root confirmed stopped'
               : 'settle-owned-sessions: owned work confirmed settled',
           )
           return {settled: true}
@@ -296,21 +308,30 @@ export async function settleOwnedSessions(params: SettleOwnedSessionsParams): Pr
         if (!rootQuiescent) {
           return {
             settled: false,
-            reason: `root session not confirmed quiescent after abort${
+            reason: `root session not confirmed stopped after abort${
               stillUnresolvedIds.length > 0
                 ? `; owned sessions not confirmed settled: ${stillUnresolvedIds.join(', ')}`
                 : ''
             }`,
+            rootUnconfirmed: true,
           }
         }
-        return {settled: false, reason: `owned sessions not confirmed settled: ${stillUnresolvedIds.join(', ')}`}
+        return {
+          settled: false,
+          reason: `owned sessions not confirmed settled: ${stillUnresolvedIds.join(', ')}`,
+          rootUnconfirmed: false,
+        }
       } catch (error) {
         const message = toErrorMessage(error)
         logger.error(
           {rootSessionId, detail: message},
           'settle-owned-sessions: unexpected error during settle attempt — quarantining rather than letting it escape',
         )
-        return {settled: false, reason: `settle attempt threw unexpectedly: ${message}`}
+        return {
+          settled: false,
+          reason: `settle attempt threw unexpectedly: ${message}`,
+          rootUnconfirmed: !rootConfirmed,
+        }
       } finally {
         finished = true
       }
@@ -327,7 +348,11 @@ export async function settleOwnedSessions(params: SettleOwnedSessionsParams): Pr
         {rootSessionId, timeoutMs, abandonedIds: abandonedEntries.map(entry => entry.sessionId)},
         'settle-owned-sessions: settle attempt exceeded its bound — quarantining rather than hanging',
       )
-      return {settled: false, reason: `settle attempt exceeded its ${timeoutMs}ms bound`}
+      return {
+        settled: false,
+        reason: `settle attempt exceeded its ${timeoutMs}ms bound`,
+        rootUnconfirmed: !rootConfirmed,
+      }
     },
   )
 }
