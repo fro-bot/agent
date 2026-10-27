@@ -207,6 +207,36 @@ describe('buildCIConfig', () => {
       expect(result.config.plugin).toContain('@fro.bot/systematic@2.1.0')
     })
 
+    it('does not duplicate the systematic plugin when the user config already declares it, and keeps the user version', () => {
+      // #given - the user already pinned their own Systematic version
+      const logger = createLogger()
+
+      // #when
+      const result = buildCIConfig(
+        {opencodeConfig: '{"plugin":["@fro.bot/systematic@9.9.9"]}', systematicVersion: '2.1.0'},
+        logger,
+      )
+
+      // #then - exactly one Systematic entry, and it is the user's, not the harness default
+      expect(result.error).toBeNull()
+      expect(result.config.plugin).toEqual(['@fro.bot/systematic@9.9.9'])
+    })
+
+    it('appends the systematic plugin after custom plugins and keeps them', () => {
+      // #given - the user declared a custom plugin only
+      const logger = createLogger()
+
+      // #when
+      const result = buildCIConfig(
+        {opencodeConfig: '{"plugin":["my-plugin@1.0.0"]}', systematicVersion: '2.1.0'},
+        logger,
+      )
+
+      // #then - the custom entry survives untouched and Systematic is appended exactly once
+      expect(result.error).toBeNull()
+      expect(result.config.plugin).toEqual(['my-plugin@1.0.0', '@fro.bot/systematic@2.1.0'])
+    })
+
     it('denies external directory access for the build agent so it cannot block on permission prompts', () => {
       // #given
       const logger = createLogger()
