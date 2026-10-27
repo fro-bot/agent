@@ -3,7 +3,7 @@ FROM node:24.22.1-alpine3.24@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c
 
 WORKDIR /workspace
 
-ARG BUN_VERSION=1.3.14
+ARG BUN_VERSION=1.4.4
 
 # curl + unzip to fetch and extract the verified Bun release archive.
 RUN apk add --no-cache curl unzip
