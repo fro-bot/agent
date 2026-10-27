@@ -1,9 +1,8 @@
 /**
- * build-platform.test.ts — drift guard + enforceBunVersion coverage + source-tree mode.
+ * build-platform.test.ts — workflow guard + enforceBunVersion coverage + source-tree mode.
  *
  * Tests:
- *   1. Drift guard: all `bun-version: X.Y.Z` literals in harness-release.yaml
- *      must equal HARNESS_BUN_VERSION. Catches the original version-drift gap.
+ *   1. Workflow guard: harness-release.yaml installs workspace dependencies before the harness build.
  *   2. enforceBunVersion: exact match → no throw/exit; mismatch → process.exit(1);
  *      bun not found → process.exit(1).
  *   3. parseArgs: --source-tree parsed into BuildArgs; --integration-commit still required.
@@ -45,33 +44,7 @@ import {
 // Drift guard
 // ---------------------------------------------------------------------------
 
-describe('drift guard: harness-release.yaml bun-version literals', () => {
-  it('all bun-version occurrences in harness-release.yaml equal HARNESS_BUN_VERSION', async () => {
-    // #given — resolve the workflow file relative to this test file (scripts/ → repo root)
-    const thisDir = path.dirname(fileURLToPath(import.meta.url))
-    const repoRoot = path.resolve(thisDir, '..', '..', '..')
-    const workflowPath = path.join(repoRoot, '.github', 'workflows', 'harness-release.yaml')
-
-    // #when — use the REAL readFileSync (not the vi.mock'd one) to read the workflow file.
-    // vi.mock('node:fs') is hoisted and intercepts the module-level import, so we use
-    // vi.importActual to get the real node:fs module and bypass the mock.
-    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs')
-    const content = realFs.readFileSync(workflowPath, 'utf8')
-    const matches = [...content.matchAll(/bun-version:\s*(\d+\.\d+\.\d+)/g)]
-
-    // #then — there must be at least one occurrence (sanity check)
-    expect(matches.length).toBeGreaterThan(0)
-
-    // Every occurrence must equal the pinned constant
-    for (const match of matches) {
-      const workflowVersion = match[1]
-      expect(
-        workflowVersion,
-        `bun-version literal '${workflowVersion}' in harness-release.yaml does not match HARNESS_BUN_VERSION '${HARNESS_BUN_VERSION}'`,
-      ).toBe(HARNESS_BUN_VERSION)
-    }
-  })
-
+describe('drift guard: harness-release.yaml', () => {
   it('installs workspace dependencies before building the harness package', async () => {
     // #given — harness build imports root tsconfig/tooling, so release CI must install the workspace, not just the package.
     const thisDir = path.dirname(fileURLToPath(import.meta.url))

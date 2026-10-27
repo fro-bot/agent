@@ -184,7 +184,7 @@ Installers reuse the pinned version constant instead of hardcoding version liter
 Repo-specific behaviors today:
 
 - **OpenCode**: supports explicit `latest` resolution, falls back to `FALLBACK_VERSION` (independent stock pin in `src/services/setup/opencode.ts` — deliberately not the harness-build `DEFAULT_OPENCODE_VERSION`)
-- **Bun**: installs from `DEFAULT_BUN_VERSION`, no user override
+- **Bun**: installs from `DEFAULT_BUN_VERSION`, no user override. The repo's own CI Bun is not this constant: `.github/actions/setup` installs the version in the root `package.json` `packageManager` field
 - **oMo**: installs from `DEFAULT_OMO_VERSION`, but package/runtime identity differs
 
 Do not copy installer structure blindly between tools. Copy the version-source pattern; verify the install mechanics per tool.
