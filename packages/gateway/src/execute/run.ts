@@ -87,6 +87,7 @@ import {
   toRemoteFreshnessFromUpdateReady,
 } from './provenance.js'
 import {createQuestionEffects} from './question-client.js'
+import {QUARANTINE_HOLD_WINDOW_MS} from './root-stop.js'
 import {RunCoreError, runOpenCodeCore} from './run-core.js'
 import {toRuntimeLogger} from './runtime-logger.js'
 import {TERMINAL_WRITE_RETRY, transitionRetryingStaleEtag} from './stale-etag-transition.js'
@@ -638,26 +639,7 @@ function failureDetailsPatch(
 // Quarantine — bounded hold
 // ---------------------------------------------------------------------------
 
-/**
- * Upper bound, in milliseconds, on how long a quarantined run's lock lease and
- * concurrency slot are held past the failure that quarantined it.
- *
- * The termination barrier (`settle-owned-sessions.ts`) already spends up to
- * `DEFAULT_SETTLE_TIMEOUT_MS` (15 s) trying to confirm settlement before giving
- * up and quarantining. This window is deliberately much larger than that bound —
- * roughly 20x — so a background child that is genuinely still finishing a write
- * after being cancelled (a slow git operation, a large diff) is not abandoned
- * mid-write, while still being short enough that a wedged concurrency slot
- * recovers unattended rather than needing an operator to notice and intervene.
- *
- * Only the concurrency slot is released deterministically at this boundary (see
- * `scheduleQuarantineRelease`). The repo lock is left to lapse via its own lease TTL
- * (`CoordinationConfig.lockTtlSeconds`, 900 s / 15 min by default) once this window stops
- * renewing it. An expired lease is NOT reclaimed on elapsed time alone: acquisition and the
- * operator `force-release-lock` both require a clear OpenCode workspace status check first, so a
- * quarantined run whose children are still busy keeps the repo blocked.
- */
-export const QUARANTINE_HOLD_WINDOW_MS = 5 * 60_000
+export {QUARANTINE_HOLD_WINDOW_MS}
 
 /**
  * How long the OpenCode event stream may deliver nothing, heartbeats included, before the run treats it as lost.

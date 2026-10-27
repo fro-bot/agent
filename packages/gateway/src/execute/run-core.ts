@@ -54,6 +54,7 @@ import {
   isContextOverflowError,
 } from './provider-failure.js'
 import {createReplyDeliveryTracker} from './reply-delivery.js'
+import {startQuarantineRootWatch} from './root-stop.js'
 import {toRuntimeLogger} from './runtime-logger.js'
 import {settleOwnedSessions} from './settle-owned-sessions.js'
 import {createTextBoundaryTracker} from './text-boundary.js'
@@ -687,6 +688,8 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // there (cancel, deadline, a dropped stream) takes the same root teardown.
   // Loop-scoped: aborted on every exit so the `/event` connection never outlives the run (see `subscribe`).
   const streamController = new AbortController()
+  // Ids of the root session's user messages the event stream has shown (the prompt's own, and any injected notice).
+  const streamedRootUserMessageIds = new Set<string>()
 
   async function throwWithBarrier(
     kind: RunCoreErrorKind,
@@ -722,6 +725,14 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
     if (barrierLedger === undefined || (barrierLedger.isDrainComplete() === true && rootFollowUpOpen === false)) {
       throw new RunCoreError(kind, message, false, providerFailureReason, cause)
     }
+    // Background work can start root turns by itself (a finished or cancelled child makes OpenCode inject a notice
+    // turn, prepared like any prompt), so nothing seen in the message list rules out a turn that is not saved yet.
+    // Open means: a child that is not settled, or the drain's follow-up window. Read before settlement, which itself
+    // cancels children and so can trigger notices.
+    const followUpPossible =
+      rootFollowUpOpen &&
+      (barrierLedger.snapshot().some(entry => entry.state !== 'settled') ||
+        (drainCompletion !== undefined && draining === true && drainDoneController.signal.aborted === false))
     const settlement = await settleOwnedSessions({
       client,
       directory,
@@ -730,9 +741,27 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
       logger,
       ...(runId === undefined ? {} : {runId}),
       ...(rootFollowUpOpen ? {confirmRootQuiescent: true} : {}),
+      ...(followUpPossible ? {followUpPossible: true} : {}),
+      streamedUserMessageIds: () => streamedRootUserMessageIds,
     })
     if (settlement.settled === true) {
       throw new RunCoreError(kind, message, false, providerFailureReason, cause)
+    }
+    // A root the barrier could not confirm stopped may still be preparing a prompt (an abort sent before the runner
+    // exists does nothing). Keep probing it for the length of the quarantine hold, aborting it whenever it shows up
+    // busy, so it cannot run through the hold unchecked. The watch ends itself at the first confirmation or when the
+    // hold window closes, and its timer is unref'd.
+    if (settlement.rootUnconfirmed) {
+      startQuarantineRootWatch({
+        client,
+        adapter: createSdkLedgerReconcileAdapter(client, directory),
+        directory,
+        rootSessionId: sessionId,
+        streamedUserMessageIds: () => streamedRootUserMessageIds,
+        ...(followUpPossible ? {followUpPossible: true} : {}),
+        logger,
+        ...(runId === undefined ? {} : {runId}),
+      })
     }
     logger.error(
       {...(runId === undefined ? {} : {runId}), sessionId, kind, detail: settlement.reason},
@@ -1002,6 +1031,17 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   // status, and root assistant/text/tool activity. A notice also registers its injected user message before
   // anything can test completion. No-op for a run with no ledger.
   function observeRootForDrain(rawEvent: unknown, eventType: string | null, eventPayload: unknown): void {
+    // Root user messages the stream showed: the barrier only trusts a message list that holds every one of them.
+    if (eventType === 'message.updated') {
+      const info = getObjectProperty(eventPayload, 'info')
+      if (
+        (getSessionID(eventPayload) ?? getSessionID(info)) === sessionId &&
+        getStringProperty(info, 'role') === 'user'
+      ) {
+        const messageId = getStringProperty(info, 'id')
+        if (messageId !== null) streamedRootUserMessageIds.add(messageId)
+      }
+    }
     if (drainCompletion === undefined) return
     if (eventType === 'message.part.updated') {
       const part = getObjectProperty(eventPayload, 'part')
