@@ -202,10 +202,10 @@ interface HeldTurn {
 }
 
 /** Starts a server whose provider holds the turn, prompts, and waits until the claim is written. */
-async function startHeldTurn(box: Sandbox): Promise<HeldTurn> {
+async function startHeldTurn(box: Sandbox, overrides: Partial<StartOpenCodeV2ServerOptions> = {}): Promise<HeldTurn> {
   const provider = await startHeldProvider()
   providers.push(provider)
-  const result = await boot(box, {config: providerConfig(provider.baseURL)})
+  const result = await boot(box, {config: providerConfig(provider.baseURL), ...overrides})
   if (!result.success) throw new Error(`start failed: ${result.error.kind}`)
   const created = (await json(result.data, '/api/session', {
     method: 'POST',
@@ -344,6 +344,23 @@ describe.skipIf(!hasBinary)('startOpenCodeV2Server against the real stock binary
       const shutdown = await turn.handle.shutdown({ownedSessionIds: [turn.sessionId]})
 
       // #then the stop is confirmed, the exit is clean, and the saved database holds no claim
+      expect(shutdown.interrupts).toEqual({stopped: [turn.sessionId], notRunning: [], unconfirmed: []})
+      expect(shutdown.exit).toMatchObject({outcome: 'graceful', code: 0})
+      expect(readSessionClaim(box.dbPath, turn.sessionId)).toBeNull()
+    })
+
+    it('leaves no claim when the caller aborts first and shutdown follows', async () => {
+      // #given a held turn on a server started with a caller signal, its session registered as owned
+      const box = sandbox()
+      const controller = new AbortController()
+      const turn = await startHeldTurn(box, {signal: controller.signal})
+      turn.handle.registerOwnedSession(turn.sessionId)
+
+      // #when the caller aborts and shutdown is requested afterwards
+      controller.abort()
+      const shutdown = await turn.handle.shutdown()
+
+      // #then the abort path interrupted the owned session before stdin closed, so no claim is left
       expect(shutdown.interrupts).toEqual({stopped: [turn.sessionId], notRunning: [], unconfirmed: []})
       expect(shutdown.exit).toMatchObject({outcome: 'graceful', code: 0})
       expect(readSessionClaim(box.dbPath, turn.sessionId)).toBeNull()

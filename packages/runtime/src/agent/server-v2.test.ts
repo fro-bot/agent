@@ -7,6 +7,7 @@ import type {
   StartOpenCodeV2ServerOptions,
 } from './server-v2.js'
 import {Buffer} from 'node:buffer'
+import {getEventListeners} from 'node:events'
 import process from 'node:process'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 import {createFixture} from './server-v2-test-kit.js'
@@ -735,6 +736,110 @@ describe('startOpenCodeV2Server', () => {
       expect(shutdown.exit.outcome).toBe('already-exited')
       expect(shutdown.interrupts.unconfirmed).toEqual(['ses_a'])
       expect(created.readLog().some(line => line.startsWith('interrupt '))).toBe(false)
+    })
+  })
+
+  describe('cancellation after readiness', () => {
+    const eventLog = (created: Fixture): readonly string[] => created.readLog().filter(line => !line.startsWith('req '))
+
+    it('stops the child within the cleanup bound when the caller aborts after the server is ready', async () => {
+      // #given a ready server whose caller signal is still live
+      const created = fixture()
+      const controller = new AbortController()
+      const result = await start(created, {signal: controller.signal})
+      expect(result.success).toBe(true)
+      if (!result.success) return
+
+      // #when the caller aborts
+      const abortedAt = Date.now()
+      controller.abort()
+      const exit = await Promise.race([
+        result.data.exited,
+        new Promise<'timeout'>(resolve => setTimeout(() => resolve('timeout'), FAST.exitTimeoutMs ?? 1500)),
+      ])
+
+      // #then the child exited on its own within the bound, from the stdin close
+      expect(exit).not.toBe('timeout')
+      expect(Date.now() - abortedAt).toBeLessThan(FAST.exitTimeoutMs ?? 1500)
+      expect(isAlive(created.readRecord().pid)).toBe(false)
+      expect(eventLog(created)).toContain('stdin-closed')
+    })
+
+    it('interrupts a registered session before stdin closes when the abort comes first, and confirms the stop', async () => {
+      // #given a ready server with an active session registered as owned
+      const created = fixture({activeSessions: ['ses_a'], dropDelayMs: 50})
+      const controller = new AbortController()
+      const result = await start(created, {signal: controller.signal})
+      expect(result.success).toBe(true)
+      if (!result.success) return
+      result.data.registerOwnedSession('ses_a')
+
+      // #when the caller aborts, and shutdown is requested afterwards
+      controller.abort()
+      const shutdown = await result.data.shutdown()
+
+      // #then the interrupt reached the server on the cleanup signal and the stop is confirmed
+      expect(shutdown.interrupts).toEqual({stopped: ['ses_a'], notRunning: [], unconfirmed: []})
+      expect(shutdown.exit.outcome).toBe('graceful')
+      const log = eventLog(created)
+      expect(log.indexOf('interrupt ses_a')).toBeGreaterThan(-1)
+      expect(log.indexOf('interrupt ses_a')).toBeLessThan(log.indexOf('stdin-closed'))
+      expect(log.indexOf('dropped ses_a')).toBeLessThan(log.indexOf('stdin-closed'))
+    })
+
+    it('merges sessions passed to shutdown with the registered ones', async () => {
+      // #given one registered and one passed session, both active
+      const created = fixture({activeSessions: ['ses_a', 'ses_b']})
+      const result = await start(created)
+      expect(result.success).toBe(true)
+      if (!result.success) return
+      result.data.registerOwnedSession('ses_a')
+
+      // #when
+      const shutdown = await result.data.shutdown({ownedSessionIds: ['ses_b']})
+
+      // #then both were stopped
+      expect([...shutdown.interrupts.stopped].sort()).toEqual(['ses_a', 'ses_b'])
+    })
+
+    it('runs one interrupt sequence for an abort plus shutdown, and for concurrent shutdowns', async () => {
+      // #given a ready server with one registered session that is not running, so a single round sends exactly one interrupt
+      const created = fixture({activeSessions: []})
+      const controller = new AbortController()
+      const result = await start(created, {signal: controller.signal})
+      expect(result.success).toBe(true)
+      if (!result.success) return
+      result.data.registerOwnedSession('ses_idle')
+
+      // #when an abort and two shutdown calls race
+      controller.abort()
+      const [first, second] = await Promise.all([result.data.shutdown(), result.data.shutdown()])
+      const third = await result.data.shutdown()
+
+      // #then every caller got the same result object and the server saw a single sequence
+      expect(second).toBe(first)
+      expect(third).toBe(first)
+      expect(first.interrupts).toEqual({stopped: [], notRunning: ['ses_idle'], unconfirmed: []})
+      const log = eventLog(created)
+      expect(log.filter(line => line === 'interrupt ses_idle')).toHaveLength(1)
+      expect(log.filter(line => line === 'stdin-closed')).toHaveLength(1)
+    })
+
+    it('removes its abort listener once the child has exited', async () => {
+      // #given a ready server on a signal that never aborts
+      const created = fixture()
+      const controller = new AbortController()
+      const result = await start(created, {signal: controller.signal})
+      expect(result.success).toBe(true)
+      if (!result.success) return
+      expect(getEventListeners(controller.signal, 'abort')).toHaveLength(1)
+
+      // #when shut down normally
+      await result.data.shutdown()
+      await result.data.exited
+
+      // #then the signal holds no listener for the finished server
+      expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0)
     })
   })
 })

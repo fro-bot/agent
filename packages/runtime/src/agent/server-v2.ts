@@ -133,7 +133,17 @@ export interface OpenCodeV2ServerHandle {
   readonly authorizationHeader: () => string
   /** Resolves on the process exit event. Never rejects. */
   readonly exited: Promise<OpenCodeV2ExitInfo>
-  /** Interrupts owned sessions, closes stdin and confirms the exit. Idempotent: later calls return the first result. */
+  /**
+   * Marks a session as owned by this run. Owned sessions are interrupted before stdin closes on every shutdown
+   * path, including the caller's abort signal, which cannot carry ids of its own. Register a session as soon as it
+   * exists.
+   */
+  readonly registerOwnedSession: (sessionId: string) => void
+  /**
+   * Interrupts owned sessions (registered ones plus `ownedSessionIds`), closes stdin and confirms the exit.
+   * Idempotent and shared with the abort path: later calls return the first result, and ids that arrive after
+   * the first call or after an abort are not interrupted.
+   */
   readonly shutdown: (options?: OpenCodeV2ShutdownOptions) => Promise<OpenCodeV2ShutdownResult>
 }
 
@@ -156,7 +166,11 @@ export interface StartOpenCodeV2ServerOptions {
   /** Default: a free loopback port picked here. */
   readonly port?: number
   readonly timeouts?: Partial<OpenCodeV2Timeouts>
-  /** The caller's deadline. Aborting kills the child. */
+  /**
+   * The caller's deadline, honoured for the server's whole life. Aborting during startup fails the start. Aborting
+   * afterwards runs the handle's `shutdown`. The signal governs the child only: shutdown's own requests use a bound
+   * of their own, so an aborted signal never disables the owned-session interrupts.
+   */
   readonly signal?: AbortSignal
   /**
    * Called with the generated password before the child is spawned, so the host can mask it
@@ -519,12 +533,17 @@ export async function startOpenCodeV2Server(
     return fetch(`${expectedUrl}${path}`, {...init, headers})
   }
 
-  const request = async (path: string, init: RequestInit = {}): Promise<RequestOutcome> => {
+  /** One request bounded by `requestTimeoutMs` and by `governing`, when given. */
+  const boundedRequest = async (
+    path: string,
+    init: RequestInit,
+    governing: AbortSignal | undefined,
+  ): Promise<RequestOutcome> => {
     const timeout = AbortSignal.timeout(timeouts.requestTimeoutMs)
     try {
       const response = await send(path, {
         ...init,
-        signal: signal === undefined ? timeout : AbortSignal.any([signal, timeout]),
+        signal: governing === undefined ? timeout : AbortSignal.any([governing, timeout]),
       })
       const body = parseJson(await response.text())
       return {kind: 'response', status: response.status, body}
@@ -533,6 +552,10 @@ export async function startOpenCodeV2Server(
       return {kind: 'unreachable'}
     }
   }
+
+  /** Startup requests: governed by the caller's signal. */
+  const request = async (path: string, init: RequestInit = {}): Promise<RequestOutcome> =>
+    boundedRequest(path, init, signal)
 
   type PollDecision<T> =
     | {readonly kind: 'done'; readonly value: T}
@@ -631,14 +654,18 @@ export async function startOpenCodeV2Server(
   }
 
   // --- Shutdown -----------------------------------------------------------------------------------------------
-  const readActiveSessions = async (): Promise<ReadonlySet<string> | null> => {
-    const outcome = await request('/api/session/active')
+  // Teardown requests never use the caller's signal: after a cancellation it is already aborted, and cleanup
+  // is exactly when the server must still be reachable. Each is bounded by `requestTimeoutMs` and by the
+  // interrupt-settle bound, a signal created when the interrupt round starts.
+  const readActiveSessions = async (cleanup: AbortSignal): Promise<ReadonlySet<string> | null> => {
+    const outcome = await boundedRequest('/api/session/active', {}, cleanup)
     return outcome.kind === 'response' && outcome.status === 200 ? parseActiveSessions(outcome.body) : null
   }
 
   const interruptOwnedSessions = async (ids: readonly string[]): Promise<OpenCodeV2ShutdownResult['interrupts']> => {
     if (ids.length === 0) return {stopped: [], notRunning: [], unconfirmed: []}
     const deadline = Date.now() + timeouts.interruptSettleTimeoutMs
+    const cleanup = AbortSignal.timeout(timeouts.interruptSettleTimeoutMs)
     const remaining = new Set(ids)
     const interrupted = new Set<string>()
     const stopped: string[] = []
@@ -646,13 +673,17 @@ export async function startOpenCodeV2Server(
 
     // POST /api/session/:id/interrupt carries reason `user`, which releases the execution claim (P11).
     const interrupt = async (id: string): Promise<void> => {
-      const outcome = await request(`/api/session/${encodeURIComponent(id)}/interrupt`, {method: 'POST'})
+      const outcome = await boundedRequest(
+        `/api/session/${encodeURIComponent(id)}/interrupt`,
+        {method: 'POST'},
+        cleanup,
+      )
       if (outcome.kind === 'response' && outcome.status === 200 && isInterrupted(outcome.body)) interrupted.add(id)
     }
 
     await Promise.all(ids.map(interrupt))
     for (;;) {
-      const active = await readActiveSessions()
+      const active = await readActiveSessions(cleanup)
       if (active !== null) {
         for (const id of [...remaining]) {
           if (active.has(id)) continue
@@ -688,7 +719,31 @@ export async function startOpenCodeV2Server(
     return {interrupts, exit}
   }
 
+  // A cancellation that landed between the last gate and here has nothing to shut down yet: fail the start.
+  if (signal?.aborted === true) return fail(aborted())
+
+  const ownedSessionIds = new Set<string>()
   let shutdownResult: Promise<OpenCodeV2ShutdownResult> | undefined
+  const shutdown = async (shutdownOptions?: OpenCodeV2ShutdownOptions): Promise<OpenCodeV2ShutdownResult> => {
+    shutdownResult ??= runShutdown([...new Set([...ownedSessionIds, ...(shutdownOptions?.ownedSessionIds ?? [])])])
+    return shutdownResult
+  }
+
+  // The caller's signal keeps governing the child for its whole life: an abort runs the same shared shutdown.
+  if (signal !== undefined) {
+    const onLifetimeAbort = (): void => {
+      logger.info('OpenCode V2 server stopping: the caller aborted', {pid})
+      shutdown().catch((error: unknown) => {
+        logger.error('OpenCode V2 server shutdown after abort failed', {error: scrub(toErrorMessage(error))})
+      })
+    }
+    signal.addEventListener('abort', onLifetimeAbort, {once: true})
+    state.exited.then(
+      () => signal.removeEventListener('abort', onLifetimeAbort),
+      () => undefined,
+    )
+  }
+
   return ok({
     url: expectedUrl,
     pid,
@@ -696,9 +751,9 @@ export async function startOpenCodeV2Server(
     fetch: send,
     authorizationHeader: () => authorization,
     exited: state.exited,
-    shutdown: async shutdownOptions => {
-      shutdownResult ??= runShutdown(shutdownOptions?.ownedSessionIds ?? [])
-      return shutdownResult
+    registerOwnedSession: sessionId => {
+      ownedSessionIds.add(sessionId)
     },
+    shutdown,
   })
 }
