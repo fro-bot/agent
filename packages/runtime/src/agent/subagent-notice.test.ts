@@ -1,3 +1,4 @@
+import type {V2DomainEvent} from './event-v2.js'
 import type {SubagentNotice} from './subagent-notice.js'
 
 import {describe, expect, it} from 'vitest'
@@ -6,12 +7,15 @@ import {
   CHILD_SESSION_ID,
   FORGED_USER_ENQUEUED_FRAME,
   PARENT_SESSION_ID,
-  SUBAGENT_BACKGROUND_METADATA,
+  SUBAGENT_BACKGROUND_SUCCESS_FRAME,
   SUBAGENT_FOREGROUND_SUCCESS_FRAME,
   SUBAGENT_NOTICE_CANCELLED_METADATA,
   SUBAGENT_NOTICE_ENQUEUED_FRAME,
   SUBAGENT_NOTICE_MESSAGE,
+  SUBAGENT_PROMPT_FAILED_FRAME,
+  SUBAGENT_RUNNING_PROGRESS_FRAME,
 } from './event-v2.fixtures.js'
+import {mapV2Event} from './event-v2.js'
 import {createOwnershipLedger} from './ownership-ledger.js'
 import {
   readBackgroundDispatch,
@@ -202,29 +206,64 @@ describe('settleLedgerFromSubagentNotice', () => {
   })
 })
 
+function mapped(frame: unknown): V2DomainEvent {
+  const event = mapV2Event(frame)
+  if (event === null) throw new Error('fixture frame did not map')
+  return event
+}
+
 describe('readBackgroundDispatch', () => {
-  it('reads a running subagent dispatch as a background child (derived metadata)', () => {
-    expect(readBackgroundDispatch('subagent', SUBAGENT_BACKGROUND_METADATA)).toEqual({childSessionId: CHILD_SESSION_ID})
+  it('reads the success of a backgrounded subagent call as a background child', () => {
+    // #given the terminal success of a call that returned the background result
+    const event = mapped(SUBAGENT_BACKGROUND_SUCCESS_FRAME)
+    // #when reading it
+    // #then the child id comes from the result metadata
+    expect(readBackgroundDispatch('subagent', event)).toEqual({childSessionId: CHILD_SESSION_ID})
   })
 
-  it('does not treat a completed foreground subagent as a background dispatch (real capture)', () => {
-    const metadata = (SUBAGENT_FOREGROUND_SUCCESS_FRAME as {data: {metadata: unknown}}).data.metadata
-    expect(readBackgroundDispatch('subagent', metadata)).toBeNull()
+  it('does not treat running progress as a dispatch: foreground calls emit it too', () => {
+    // #given the progress subagent.ts:201 emits before it branches on foreground vs background
+    const event = mapped(SUBAGENT_RUNNING_PROGRESS_FRAME)
+    // #when reading it
+    // #then nothing is adopted
+    expect(readBackgroundDispatch('subagent', event)).toBeNull()
   })
 
-  it('ignores other tools and metadata without a session id', () => {
-    expect(readBackgroundDispatch('shell', SUBAGENT_BACKGROUND_METADATA)).toBeNull()
-    expect(readBackgroundDispatch('subagent', {status: 'running'})).toBeNull()
-    expect(readBackgroundDispatch('subagent', {sessionID: '', status: 'running'})).toBeNull()
-    expect(readBackgroundDispatch('subagent', null)).toBeNull()
+  it('reads no dispatch from a foreground call: progress, then completion (real capture)', () => {
+    // #given the progress a foreground call emits, then its completed success
+    const progress = mapped(SUBAGENT_RUNNING_PROGRESS_FRAME)
+    const completed = mapped(SUBAGENT_FOREGROUND_SUCCESS_FRAME)
+    // #when reading each event in order
+    // #then neither is a dispatch
+    expect(readBackgroundDispatch('subagent', progress)).toBeNull()
+    expect(readBackgroundDispatch('subagent', completed)).toBeNull()
+  })
+
+  it('reads no dispatch from a call whose prompt admission failed after progress', () => {
+    // #given progress, then a failure carrying the progress snapshot as its metadata
+    const progress = mapped(SUBAGENT_RUNNING_PROGRESS_FRAME)
+    const failed = mapped(SUBAGENT_PROMPT_FAILED_FRAME)
+    // #when reading each event in order
+    // #then neither is a dispatch
+    expect(readBackgroundDispatch('subagent', progress)).toBeNull()
+    expect(readBackgroundDispatch('subagent', failed)).toBeNull()
+  })
+
+  it('ignores other tools and a success without a child session id', () => {
+    const success = mapped(SUBAGENT_BACKGROUND_SUCCESS_FRAME)
+    expect(readBackgroundDispatch('shell', success)).toBeNull()
+    const data = (SUBAGENT_BACKGROUND_SUCCESS_FRAME as {data: object}).data
+    const withMetadata = (metadata: unknown): V2DomainEvent =>
+      mapped({type: 'session.tool.success', data: {...data, metadata}})
+    expect(readBackgroundDispatch('subagent', withMetadata({status: 'running'}))).toBeNull()
+    expect(readBackgroundDispatch('subagent', withMetadata({sessionID: '', status: 'running'}))).toBeNull()
   })
 
   it('names the parent only through the caller, never the metadata', () => {
     // #given a dispatch
     // #then the helper returns only the child id; the parent is whatever session emitted the tool event
-    expect(Object.keys(readBackgroundDispatch('subagent', SUBAGENT_BACKGROUND_METADATA) ?? {})).toEqual([
-      'childSessionId',
-    ])
+    const dispatch = readBackgroundDispatch('subagent', mapped(SUBAGENT_BACKGROUND_SUCCESS_FRAME))
+    expect(Object.keys(dispatch ?? {})).toEqual(['childSessionId'])
     expect(PARENT_SESSION_ID).not.toBe(CHILD_SESSION_ID)
   })
 })

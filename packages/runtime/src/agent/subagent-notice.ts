@@ -1,3 +1,4 @@
+import type {V2DomainEvent} from './event-v2.js'
 import type {OwnershipLedger} from './ownership-ledger.js'
 
 import {getObjectProperty, getStringProperty} from './payload-accessors.js'
@@ -95,17 +96,23 @@ export interface BackgroundDispatch {
 }
 
 /**
- * Whether a `subagent` tool event's `metadata` is a background dispatch: `{sessionID, status: "running"}`, written
- * by `packages/core/src/tool/plugin/subagent.ts` before the child starts and returned as the tool result for a
- * backgrounded call. A foreground call finishes with `status: "completed"` (probe P6 capture) and is not a dispatch.
+ * Whether a `subagent` tool event is the result of a background dispatch.
+ *
+ * `packages/core/src/tool/plugin/subagent.ts` emits `context.progress({sessionID, status: "running"})` at `:201` for
+ * foreground AND background calls, before it branches on `background` (`:229`). A failed call also keeps that progress
+ * snapshot as its `metadata` (`packages/core/src/session/runner/publish-llm-event.ts:109-112`). So running metadata
+ * alone proves nothing. Only a successful terminal event does: a backgrounded call returns `backgroundResult`
+ * (`status: "running"`, `:19-21,231,243`) as its tool result, and a foreground call that finishes returns
+ * `status: "completed"` (`:254`; probe P6 capture).
  *
  * The caller supplies the tool name (correlated from `session.tool.input.started`); the success event does not carry it.
  */
-export function readBackgroundDispatch(toolName: string, metadata: unknown): BackgroundDispatch | null {
+export function readBackgroundDispatch(toolName: string, event: V2DomainEvent): BackgroundDispatch | null {
   if (toolName !== 'subagent') return null
-  if (getStringProperty(metadata, 'status') !== 'running') return null
+  if (event.kind !== 'tool_finished' || event.outcome !== 'success') return null
+  if (getStringProperty(event.metadata, 'status') !== 'running') return null
 
-  const childSessionId = getStringProperty(metadata, 'sessionID')
+  const childSessionId = getStringProperty(event.metadata, 'sessionID')
   if (childSessionId === null || childSessionId.length === 0) return null
   return {childSessionId}
 }

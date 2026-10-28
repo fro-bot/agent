@@ -324,6 +324,44 @@ describe('listBusyV2SessionIdsInDirectory (P9 quiescence join)', () => {
     expect(server.listCalls).toHaveLength(0)
   })
 
+  it('returns an error when the signal aborts while realpath never resolves', async () => {
+    // #given a realpath that hangs and a signal that aborts afterwards
+    const server = makeServer({active: ACTIVE_WHILE_CHILD_HELD, sessions: ALL_SESSIONS})
+    const controller = new AbortController()
+    const pending = listBusyV2SessionIdsInDirectory(
+      server.api,
+      REPO_A_DIRECTORY,
+      {realpath: async () => new Promise<string>(() => {})},
+      {signal: controller.signal},
+    )
+    // #when the signal aborts
+    controller.abort(new Error('quiescence deadline'))
+    const result = await pending
+    // #then the call settles with an error and issued no session request
+    expect(result.success).toBe(false)
+    expect(!result.success && result.error.message).toBe('quiescence deadline')
+    expect(server.listCalls).toHaveLength(0)
+  })
+
+  it('does no I/O when the signal is already aborted', async () => {
+    // #given an aborted signal
+    const server = makeServer({active: ACTIVE_WHILE_CHILD_HELD, sessions: ALL_SESSIONS})
+    const realpath = vi.fn(async (path: string) => path)
+    const controller = new AbortController()
+    controller.abort(new Error('already aborted'))
+    // #when joining
+    const result = await listBusyV2SessionIdsInDirectory(
+      server.api,
+      REPO_A_DIRECTORY,
+      {realpath},
+      {signal: controller.signal},
+    )
+    // #then realpath is never called and the call fails
+    expect(result.success).toBe(false)
+    expect(realpath).not.toHaveBeenCalled()
+    expect(server.listCalls).toHaveLength(0)
+  })
+
   it('fails when the active list fails', async () => {
     const api: V2SessionApi = {
       active: async () => {

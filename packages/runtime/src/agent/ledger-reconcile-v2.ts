@@ -184,7 +184,8 @@ export interface DirectoryQuiescenceDeps {
  *
  * `directory` is canonicalised first because the server compares it as an exact string (probe P9). That only works if
  * the sessions were created with the canonical path too; the caller must create them that way. A failed `realpath`
- * fails the call: falling back to the raw path would silently miss sessions and read as "quiet".
+ * fails the call: falling back to the raw path would silently miss sessions and read as "quiet". An aborted `signal`
+ * fails the call before `realpath` runs and bounds a `realpath` that never settles.
  *
  * Known limit (probe P12): a session that moved is listed under its destination, so it drops out of a join keyed on the
  * directory it started in. A run treats a move of an owned session as fatal (`mapV2EventStream`), it does not rely on
@@ -200,7 +201,8 @@ export async function listBusyV2SessionIdsInDirectory(
 ): Promise<Result<ReadonlySet<string>, Error>> {
   const {signal, ...listOptions} = options
   try {
-    const canonical = await deps.realpath(directory)
+    if (signal?.aborted === true) throw toError(signal.reason ?? new Error('aborted'))
+    const canonical = await raceAbort(deps.realpath(directory), signal)
     const active = await fetchActive(api, signal)
     if (active.size === 0) return ok(new Set<string>())
 

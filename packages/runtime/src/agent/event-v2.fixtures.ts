@@ -502,5 +502,44 @@ export const REASONING_FRAMES = [
   }),
 ] as const
 
-/** Derived: `subagent` tool `progress` with `{sessionID, status: "running"}` (`subagent.ts:201`), then its running success. */
+/**
+ * Derived: the `{sessionID, status: "running"}` metadata `subagent.ts` passes to `context.progress` (`:201`) and returns
+ * as a backgrounded call's result (`:19-21`).
+ */
 export const SUBAGENT_BACKGROUND_METADATA = {sessionID: CHILD_SESSION_ID, status: 'running'} as const
+
+const SUBAGENT_TOOL_ENVELOPE = {
+  sessionID: PARENT_SESSION_ID,
+  assistantMessageID: 'msg_18389bbfb001CZWJmESBpyKCto',
+  id: 'call_16_0',
+} as const
+
+/** Derived: `context.progress` at `subagent.ts:201`, emitted for foreground and background calls alike. */
+export const SUBAGENT_RUNNING_PROGRESS_FRAME = frame('session.tool.progress', {
+  ...SUBAGENT_TOOL_ENVELOPE,
+  metadata: SUBAGENT_BACKGROUND_METADATA,
+})
+
+/** Derived: the success of a backgrounded call; its `metadata` is the `backgroundResult` (`subagent.ts:19-21,264`). */
+export const SUBAGENT_BACKGROUND_SUCCESS_FRAME = frame('session.tool.success', {
+  ...SUBAGENT_TOOL_ENVELOPE,
+  content: [
+    {
+      type: 'text',
+      text: `The subagent is working in the background (sessionID: ${CHILD_SESSION_ID}). You will be notified automatically when it finishes.`,
+    },
+  ],
+  metadata: {...SUBAGENT_BACKGROUND_METADATA, truncated: false},
+  executed: false,
+})
+
+/**
+ * Derived: a `subagent` call whose prompt admission failed after the progress emit. A failed tool keeps its last
+ * progress snapshot as `metadata` (`packages/core/src/session/runner/publish-llm-event.ts:109-112`).
+ */
+export const SUBAGENT_PROMPT_FAILED_FRAME = frame('session.tool.failed', {
+  ...SUBAGENT_TOOL_ENVELOPE,
+  error: {type: 'tool.execution', message: `Failed to prompt subagent: ${CHILD_SESSION_ID}`},
+  metadata: SUBAGENT_BACKGROUND_METADATA,
+  executed: false,
+})
