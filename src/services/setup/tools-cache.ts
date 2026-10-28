@@ -6,6 +6,12 @@ import {toErrorMessage} from '../../shared/errors.js'
 export interface ToolsCacheKeyComponents {
   readonly os: string
   readonly opencodeVersion: string
+  /**
+   * Digest component of a stock V2 key (`StockV2Policy.cacheId`). Omitted for V1 and harness pins, whose
+   * keys are unchanged. It makes a V2 key unmatchable by an entry saved before digests were recorded
+   * or for a different digest.
+   */
+  readonly opencodeDigestId?: string
   readonly systematicVersion: string
 }
 
@@ -23,6 +29,7 @@ export interface RestoreToolsCacheOptions {
   readonly logger: Logger
   readonly os: string
   readonly opencodeVersion: string
+  readonly opencodeDigestId?: string
   readonly systematicVersion: string
   readonly toolCachePath: string
   readonly opencodeCachePath: string
@@ -33,6 +40,7 @@ export interface SaveToolsCacheOptions {
   readonly logger: Logger
   readonly os: string
   readonly opencodeVersion: string
+  readonly opencodeDigestId?: string
   readonly systematicVersion: string
   readonly toolCachePath: string
   readonly opencodeCachePath: string
@@ -44,16 +52,20 @@ export interface ToolsCacheResult {
   readonly restoredKey: string | null
 }
 
-export function buildToolsCacheKey(components: ToolsCacheKeyComponents): string {
-  const {os, opencodeVersion, systematicVersion} = components
+function openCodeKeyPart({opencodeVersion, opencodeDigestId}: ToolsCacheKeyComponents): string {
+  return opencodeDigestId === undefined ? opencodeVersion : `${opencodeVersion}-${opencodeDigestId}`
+}
 
-  return `${TOOLS_CACHE_PREFIX}-${os}-oc-${opencodeVersion}-sys-${systematicVersion}`
+export function buildToolsCacheKey(components: ToolsCacheKeyComponents): string {
+  const {os, systematicVersion} = components
+
+  return `${TOOLS_CACHE_PREFIX}-${os}-oc-${openCodeKeyPart(components)}-sys-${systematicVersion}`
 }
 
 export function buildToolsRestoreKeys(components: ToolsCacheKeyComponents): readonly string[] {
-  const {os, opencodeVersion, systematicVersion} = components
+  const {os, systematicVersion} = components
 
-  return [`${TOOLS_CACHE_PREFIX}-${os}-oc-${opencodeVersion}-sys-${systematicVersion}-`] as const
+  return [`${TOOLS_CACHE_PREFIX}-${os}-oc-${openCodeKeyPart(components)}-sys-${systematicVersion}-`] as const
 }
 
 export function buildCachePaths(options: {toolCachePath: string; opencodeCachePath: string}): readonly string[] {
@@ -65,14 +77,15 @@ export async function restoreToolsCache(options: RestoreToolsCacheOptions): Prom
     logger,
     os,
     opencodeVersion,
+    opencodeDigestId,
     systematicVersion,
     toolCachePath,
     opencodeCachePath,
     cacheAdapter = defaultToolsCacheAdapter,
   } = options
 
-  const primaryKey = buildToolsCacheKey({os, opencodeVersion, systematicVersion})
-  const restoreKeys = buildToolsRestoreKeys({os, opencodeVersion, systematicVersion})
+  const primaryKey = buildToolsCacheKey({os, opencodeVersion, opencodeDigestId, systematicVersion})
+  const restoreKeys = buildToolsRestoreKeys({os, opencodeVersion, opencodeDigestId, systematicVersion})
   const cachePaths = buildCachePaths({toolCachePath, opencodeCachePath})
 
   logger.info('Restoring tools cache', {primaryKey, restoreKeys: [...restoreKeys], paths: cachePaths})
@@ -109,13 +122,14 @@ export async function saveToolsCache(options: SaveToolsCacheOptions): Promise<bo
     logger,
     os,
     opencodeVersion,
+    opencodeDigestId,
     systematicVersion,
     toolCachePath,
     opencodeCachePath,
     cacheAdapter = defaultToolsCacheAdapter,
   } = options
 
-  const saveKey = buildToolsCacheKey({os, opencodeVersion, systematicVersion})
+  const saveKey = buildToolsCacheKey({os, opencodeVersion, opencodeDigestId, systematicVersion})
   const cachePaths = buildCachePaths({toolCachePath, opencodeCachePath})
 
   logger.info('Saving tools cache', {saveKey, paths: cachePaths})

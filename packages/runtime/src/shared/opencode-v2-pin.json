@@ -1,0 +1,11 @@
+{
+  "version": "2.2.0",
+  "assets": {
+    "opencode-linux-x64.tar.gz": "6d597970a8cc448f1b9a9f645532584b339dd3ab9583bb5f063f13d83e54768f",
+    "opencode-linux-arm64.tar.gz": "1f1ce0fc07b9245a815ffa9d652dbb80e6b0f07e5bf74ea87d2b1c0339fbac52",
+    "opencode-darwin-x64.zip": "cc191a1cec9b9cd0192d78dc066bbf48730639131422fa54c87c485a821ba1d5",
+    "opencode-darwin-arm64.zip": "c71b1cd96541539ad38e2a75377d2f43d2a27567289a14371a182e9a0800db3d",
+    "opencode-linux-x64-musl.tar.gz": "41779c8bb115189a2949f5638e7007c3e75a137ec72e9219dd26ae812e561623",
+    "opencode-linux-arm64-musl.tar.gz": "d5aa42f33abc7af1075854e9be94224219a37d98c28289cacc5544cc88f1af82"
+  }
+}

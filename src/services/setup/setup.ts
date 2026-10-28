@@ -13,7 +13,17 @@ import {parseAuthJsonInput, populateAuthJson} from './auth-json.js'
 import {buildCIConfig} from './ci-config.js'
 import {configureGhAuth, configureGitIdentity} from './gh-auth.js'
 import {defaultOpenCodeConfigDir} from './no-task-reuse-config.js'
-import {FALLBACK_VERSION, getLatestVersion, installOpenCode, opencodeBinaryPath, toolCacheVersion} from './opencode.js'
+import {
+  FALLBACK_VERSION,
+  getLatestVersion,
+  getPlatformInfo,
+  installOpenCode,
+  isStockV2Pin,
+  opencodeBinaryPath,
+  RECORDED_V2_PIN,
+  resolveStockV2Policy,
+  toolCacheVersion,
+} from './opencode.js'
 import {writeSessionToolsFile} from './session-tools-config.js'
 import {writeSystematicConfig} from './systematic-config.js'
 import {installSystematicPlugin} from './systematic-plugin.js'
@@ -57,6 +67,19 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
       }
     }
 
+    // A stock V2 pin is checked against the recorded pin BEFORE any cache is consulted, and every
+    // reusable V2 installation is keyed by the recorded digest. An unpinned version, a platform with
+    // no recorded digest, or a cache entry written before digests were recorded can never be accepted.
+    let v2Policy: ReturnType<typeof resolveStockV2Policy> | undefined
+    if (isStockV2Pin(version)) {
+      try {
+        v2Policy = resolveStockV2Policy(version, getPlatformInfo(), RECORDED_V2_PIN)
+      } catch (error) {
+        core.setFailed(`Failed to install OpenCode: ${toErrorMessage(error)}`)
+        return null
+      }
+    }
+
     const systematicVersion = inputs.systematicVersion
 
     // Restore tools cache before installs
@@ -70,6 +93,7 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
       logger,
       os: runnerOS,
       opencodeVersion: version,
+      ...(v2Policy === undefined ? {} : {opencodeDigestId: v2Policy.cacheId}),
       systematicVersion,
       toolCachePath,
       opencodeCachePath,
@@ -79,7 +103,8 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
 
     let opencodeResult: OpenCodeInstallResult | undefined
 
-    if (toolsCacheResult.hit) {
+    // V2 never takes this shortcut: installOpenCode looks up the digest-bound identity itself.
+    if (toolsCacheResult.hit && v2Policy === undefined) {
       const cachedPath = toolCache.find('opencode', toolCacheVersion(version))
       if (cachedPath.length > 0) {
         opencodeResult = {path: cachedPath, version, cached: true}
@@ -168,6 +193,7 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
           logger,
           os: runnerOS,
           opencodeVersion: version,
+          ...(v2Policy === undefined ? {} : {opencodeDigestId: v2Policy.cacheId}),
           systematicVersion,
           toolCachePath,
           opencodeCachePath,
