@@ -15,6 +15,11 @@
 # the harness-release workflow; the merge gate on the auto-PR is the control).
 # SYSTEMATIC_VERSION tracks DEFAULT_SYSTEMATIC_VERSION in
 # packages/runtime/src/shared/constants.ts.
+#
+# An OPENCODE_VERSION with major 2 or higher selects the stock V2 install path
+# instead (the `opencode-v2` stage below): the musl asset from anomalyco/opencode,
+# verified against the digest recorded in
+# packages/runtime/src/shared/opencode-v2-pin.json.
 
 # ── Stage 1: build-deps (full workspace, dev deps, workspace-agent build) ──────
 # Forked into `workspace-test` below BEFORE dev dependencies are pruned, then
@@ -144,6 +149,76 @@ FROM build-deps AS build
 RUN rm -rf node_modules apps/*/node_modules packages/*/node_modules \
     && bun install --production --frozen-lockfile --ignore-scripts
 
+# ── Stage 1c: opencode-v2 (stock V2 binary, digest-verified) ──────────────────
+# Runs only when OPENCODE_VERSION has major 2 or higher and is not a harness
+# build; otherwise it leaves /out empty and the runtime stage takes the harness
+# path. Build it alone with:
+#   docker build --target opencode-v2 --build-arg OPENCODE_VERSION=2.2.0 -f deploy/workspace.Dockerfile .
+#
+# The recorded digest is read from the SAME JSON file the Action's
+# installOpenCode imports (packages/runtime/src/shared/opencode-v2-pin.json), with
+# node — already in this base image — so no digest is hand-copied here. The archive
+# must match BOTH that digest and the release's SHA256SUMS line. Any failure
+# aborts the build: no fallback version, no retry-around-mismatch, no skipped check.
+#
+# OPENCODE_VERSION has no default here on purpose: the runtime stage's ARG owns the
+# default (a second default would drift, and the harness-release sync job rewrites
+# only the first `ARG OPENCODE_VERSION=` line). An unset value leaves /out empty;
+# the runtime stage then refuses a V2 version it finds no matching /out/VERSION for.
+FROM node:24.22.1-alpine3.24@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS opencode-v2
+
+ARG OPENCODE_VERSION
+ARG TARGETARCH
+
+COPY packages/runtime/src/shared/opencode-v2-pin.json /opt/opencode-v2-pin.json
+
+RUN set -euo pipefail \
+    && mkdir -p /out \
+    # Keep this version test in sync with the V2 arm in the runtime stage.
+    && case "${OPENCODE_VERSION:-}" in \
+         *[!0-9A-Za-z.+_-]*) \
+           echo "OPENCODE_VERSION contains disallowed characters: ${OPENCODE_VERSION}" >&2; exit 1 ;; \
+         *harness*) exit 0 ;; \
+         [2-9].*|[1-9][0-9]*.*) : ;; \
+         *) exit 0 ;; \
+       esac \
+    # Fixed allowlist of musl assets (Alpine), keyed by TARGETARCH.
+    && case "${TARGETARCH}" in \
+         amd64) oc_asset="opencode-linux-x64-musl.tar.gz" ;; \
+         arm64) oc_asset="opencode-linux-arm64-musl.tar.gz" ;; \
+         *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+       esac \
+    # Read the pinned version and this asset's digest from the shared JSON file.
+    && pin_version="$(node -p 'JSON.parse(fs.readFileSync(process.argv[1], "utf8")).version' /opt/opencode-v2-pin.json)" \
+    && if [ "${pin_version}" != "${OPENCODE_VERSION}" ]; then \
+         echo "OPENCODE_VERSION ${OPENCODE_VERSION} is not the pinned V2 version ${pin_version} (packages/runtime/src/shared/opencode-v2-pin.json)" >&2; exit 1; \
+       fi \
+    && recorded_hash="$(node -p 'JSON.parse(fs.readFileSync(process.argv[1], "utf8")).assets[process.argv[2]] ?? ""' /opt/opencode-v2-pin.json "${oc_asset}")" \
+    && if [ "${#recorded_hash}" -ne 64 ]; then \
+         echo "opencode-v2-pin.json has no valid sha256 for ${oc_asset}" >&2; exit 1; \
+       fi \
+    && apk add --no-cache curl \
+    && oc_base_url="https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}" \
+    && curl -fsSL --connect-timeout 30 --max-time 120 --retry 3 --retry-delay 2 -o "/tmp/${oc_asset}" "${oc_base_url}/${oc_asset}" \
+    && curl -fsSL --connect-timeout 30 --max-time 120 --retry 3 --retry-delay 2 -o /tmp/SHA256SUMS "${oc_base_url}/SHA256SUMS" \
+    # The SHA256SUMS line must equal the recorded digest, and so must the archive.
+    && sums_hash="$(awk -v f="${oc_asset}" '$2 == f {print $1}' /tmp/SHA256SUMS)" \
+    && if [ -z "${sums_hash}" ]; then \
+         echo "SHA256SUMS does not contain an entry for ${oc_asset}" >&2; exit 1; \
+       fi \
+    && if [ "${sums_hash}" != "${recorded_hash}" ]; then \
+         echo "SHA256SUMS entry for ${oc_asset} disagrees with the recorded digest: SHA256SUMS has ${sums_hash}, recorded ${recorded_hash}" >&2; exit 1; \
+       fi \
+    && actual_hash="$(sha256sum "/tmp/${oc_asset}" | awk '{print $1}')" \
+    && if [ "${actual_hash}" != "${recorded_hash}" ]; then \
+         echo "SHA256 mismatch for ${oc_asset}: expected ${recorded_hash}, got ${actual_hash}" >&2; exit 1; \
+       fi \
+    && tar -xz -C /out -f "/tmp/${oc_asset}" \
+    && chmod 755 /out/opencode \
+    # Tell the runtime stage which version this output was verified for.
+    && printf '%s' "${OPENCODE_VERSION}" > /out/VERSION \
+    && rm -f "/tmp/${oc_asset}" /tmp/SHA256SUMS
+
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
 FROM node:24.22.1-alpine3.24@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS runtime
 
@@ -231,8 +306,29 @@ ENV HOME=/var/lib/workspace-agent/home
 # SHA256SUMS verification is fail-closed: any download failure, checksum fetch
 # failure, hash mismatch, missing entry, or partial download aborts the build
 # immediately with no fallback (no cached binary, no stock fallback, no retry).
+#
+# Stock V2 (OPENCODE_VERSION major 2 or higher, not a harness build): the first
+# step below installs the binary the `opencode-v2` stage already verified against
+# the recorded digest, then exits the RUN. It refuses output that is missing or was
+# verified for a different version. Anything else falls through to the harness
+# path unchanged.
 ARG TARGETARCH
+COPY --from=opencode-v2 /out/ /tmp/opencode-v2/
 RUN set -euo pipefail \
+    # Keep this version test in sync with the one in the opencode-v2 stage.
+    && case "${OPENCODE_VERSION}" in \
+         *[!0-9A-Za-z.+_-]*) : ;; \
+         *harness*) rm -rf /tmp/opencode-v2 ;; \
+         [2-9].*|[1-9][0-9]*.*) \
+           if [ "$(cat /tmp/opencode-v2/VERSION 2>/dev/null || true)" != "${OPENCODE_VERSION}" ] || [ ! -x /tmp/opencode-v2/opencode ]; then \
+             echo "no verified V2 binary for OPENCODE_VERSION ${OPENCODE_VERSION}: pass the same --build-arg OPENCODE_VERSION to every stage" >&2; exit 1; \
+           fi; \
+           install -m 755 /tmp/opencode-v2/opencode /usr/local/bin/opencode; \
+           rm -rf /tmp/opencode-v2; \
+           opencode --version; \
+           exit 0 ;; \
+         *) rm -rf /tmp/opencode-v2 ;; \
+       esac \
     # Validate the version string before interpolation (defense-in-depth:
     # rejects path traversal, shell metacharacters, and unexpected forms).
     && case "${OPENCODE_VERSION}" in \

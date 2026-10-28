@@ -1,3 +1,4 @@
+import type {V2Pin} from './opencode.js'
 import type {ExecAdapter, Logger, PlatformInfo, ToolCacheAdapter} from './types.js'
 import {Buffer} from 'node:buffer'
 import {createHash} from 'node:crypto'
@@ -14,7 +15,9 @@ import {
   getPlatformInfo,
   installOpenCode,
   isHarnessVersion,
+  isV2Version,
   opencodeBinaryPath,
+  RECORDED_V2_PIN,
   toHarnessReleaseTag,
   toolCacheVersion,
 } from './opencode.js'
@@ -86,6 +89,17 @@ function createMockExecAdapter(overrides: Partial<ExecAdapter> = {}): ExecAdapte
     getExecOutput: vi.fn().mockResolvedValue({exitCode: 0, stdout: '', stderr: ''}),
     ...overrides,
   }
+}
+
+function downloadedUrls(toolCache: ToolCacheAdapter): string[] {
+  return (toolCache.downloadTool as ReturnType<typeof vi.fn>).mock.calls.map(([url]) => String(url))
+}
+
+function createGzipExec(overrides: Partial<ExecAdapter> = {}): ExecAdapter {
+  return createMockExecAdapter({
+    getExecOutput: vi.fn().mockResolvedValue({exitCode: 0, stdout: 'gzip compressed data', stderr: ''}),
+    ...overrides,
+  })
 }
 
 describe('opencode', () => {
@@ -584,7 +598,8 @@ describe('opencode', () => {
       })
 
       // #when
-      const result = await installOpenCode('999.0.0', mockLogger, mockToolCache, mockExec)
+      // A nonexistent 1.x stock version: major 2+ now takes the digest-verified V2 path instead
+      const result = await installOpenCode('1.999.0', mockLogger, mockToolCache, mockExec)
 
       // #then
       expect(result.version).toBe(FALLBACK_VERSION)
@@ -879,6 +894,244 @@ describe('opencode', () => {
       expect(mockToolCache.downloadTool).toHaveBeenCalledTimes(1)
       const calls = (mockToolCache.downloadTool as ReturnType<typeof vi.fn>).mock.calls as [string][]
       expect(calls.every(([url]) => !url.endsWith('SHA256SUMS'))).toBe(true)
+    })
+  })
+
+  describe('isV2Version', () => {
+    it('is true from major 2 upward, with or without a v prefix', () => {
+      expect(isV2Version('2.2.0')).toBe(true)
+      expect(isV2Version('v2.2.0')).toBe(true)
+      expect(isV2Version('10.0.1')).toBe(true)
+    })
+
+    it('is false for major 0 and 1, including the current harness default', () => {
+      expect(isV2Version('1.19.4')).toBe(false)
+      expect(isV2Version('0.9.0')).toBe(false)
+      expect(isV2Version(DEFAULT_OPENCODE_VERSION)).toBe(false)
+    })
+
+    it('is false for non-version input such as latest', () => {
+      expect(isV2Version('latest')).toBe(false)
+    })
+  })
+
+  describe('buildChecksumsUrl (stock V2)', () => {
+    it('returns the anomalyco release SHA256SUMS URL for a V2 pin', () => {
+      expect(buildChecksumsUrl('2.2.0')).toBe(
+        'https://github.com/anomalyco/opencode/releases/download/v2.2.0/SHA256SUMS',
+      )
+    })
+  })
+
+  describe('RECORDED_V2_PIN', () => {
+    it('pins a V2 version with a sha256 for every asset the Action and workspace use', () => {
+      // #given the committed pin file
+      // #then it is itself a V2 version and every digest is a lowercase sha256
+      expect(isV2Version(RECORDED_V2_PIN.version)).toBe(true)
+      expect(Object.keys(RECORDED_V2_PIN.assets).sort()).toEqual([
+        'opencode-darwin-arm64.zip',
+        'opencode-darwin-x64.zip',
+        'opencode-linux-arm64-musl.tar.gz',
+        'opencode-linux-arm64.tar.gz',
+        'opencode-linux-x64-musl.tar.gz',
+        'opencode-linux-x64.tar.gz',
+      ])
+      for (const digest of Object.values(RECORDED_V2_PIN.assets)) {
+        expect(digest).toMatch(/^[0-9a-f]{64}$/)
+      }
+    })
+  })
+
+  describe('stock V2 pin install', () => {
+    const ARCHIVE_FILENAME = 'opencode-linux-x64.tar.gz'
+    const ARCHIVE_PATH = '/tmp/opencode-linux-x64.tar.gz'
+    const CHECKSUMS_PATH = '/tmp/SHA256SUMS'
+    const V2_VERSION = '2.2.0'
+    const archiveBytes = Buffer.from('genuine-v2-archive')
+    const archiveHash = createHash('sha256').update(archiveBytes).digest('hex')
+    const recordedPin: V2Pin = {version: V2_VERSION, assets: {[ARCHIVE_FILENAME]: archiveHash}}
+
+    function createV2ToolCache(overrides: Partial<ToolCacheAdapter> = {}): ToolCacheAdapter {
+      return createMockToolCache({
+        find: vi.fn().mockReturnValue(''),
+        downloadTool: vi.fn().mockImplementation(async (url: string) => {
+          return Promise.resolve(url.endsWith('SHA256SUMS') ? CHECKSUMS_PATH : ARCHIVE_PATH)
+        }),
+        extractTar: vi.fn().mockResolvedValue('/tmp/extracted'),
+        cacheDir: vi.fn().mockResolvedValue('/cached/opencode/2.2.0'),
+        ...overrides,
+      })
+    }
+
+    function serve(options: {readonly checksums: string; readonly archive?: Buffer}): void {
+      fsState.readFileSyncImpl = (path: unknown) => (path === CHECKSUMS_PATH ? options.checksums : Buffer.alloc(0))
+      fsState.createReadStreamImpl = () => options.archive ?? archiveBytes
+    }
+
+    beforeEach(() => {
+      Object.defineProperty(process, 'platform', {value: 'linux'})
+      Object.defineProperty(process, 'arch', {value: 'x64'})
+    })
+
+    it('happy path: installs when the archive matches the recorded digest and the SHA256SUMS line', async () => {
+      // #given a release whose archive and SHA256SUMS line both equal the recorded digest
+      serve({checksums: `${archiveHash}  ${ARCHIVE_FILENAME}\n`})
+      const toolCache = createV2ToolCache()
+
+      // #when
+      const result = await installOpenCode(V2_VERSION, mockLogger, toolCache, createGzipExec(), undefined, recordedPin)
+
+      // #then it installs from the stock release, with the checksums fetched from the same release
+      expect(result).toEqual({path: '/cached/opencode/2.2.0', version: V2_VERSION, cached: false})
+      expect(downloadedUrls(toolCache)).toEqual([
+        `https://github.com/anomalyco/opencode/releases/download/v2.2.0/${ARCHIVE_FILENAME}`,
+        'https://github.com/anomalyco/opencode/releases/download/v2.2.0/SHA256SUMS',
+      ])
+      expect(toolCache.extractTar).toHaveBeenCalledTimes(1)
+      expect(toolCache.cacheDir).toHaveBeenCalledWith('/tmp/extracted', 'opencode', V2_VERSION, 'x64')
+    })
+
+    it('returns the tool-cache hit without downloading', async () => {
+      // #given a previously verified install in the tool cache
+      const toolCache = createV2ToolCache({find: vi.fn().mockReturnValue('/cached/opencode/2.2.0')})
+
+      // #when
+      const result = await installOpenCode(V2_VERSION, mockLogger, toolCache, createGzipExec(), undefined, recordedPin)
+
+      // #then
+      expect(result.cached).toBe(true)
+      expect(toolCache.downloadTool).not.toHaveBeenCalled()
+    })
+
+    it('a tampered archive fails the install and is not retried against the fallback version', async () => {
+      // #given SHA256SUMS and the recorded digest agree, but the archive bytes differ
+      serve({checksums: `${archiveHash}  ${ARCHIVE_FILENAME}\n`, archive: Buffer.from('tampered-archive')})
+      const toolCache = createV2ToolCache()
+
+      // #when/#then
+      await expect(
+        installOpenCode(V2_VERSION, mockLogger, toolCache, createGzipExec(), undefined, recordedPin),
+      ).rejects.toThrow(/SHA256 mismatch/)
+
+      // #then exactly one attempt: archive + SHA256SUMS, no second download, nothing extracted or cached
+      expect(toolCache.downloadTool).toHaveBeenCalledTimes(2)
+      expect(downloadedUrls(toolCache).some(url => url.includes(`v${FALLBACK_VERSION}`))).toBe(false)
+      expect(toolCache.extractTar).not.toHaveBeenCalled()
+      expect(toolCache.cacheDir).not.toHaveBeenCalled()
+      expect(mockLogger.warning).not.toHaveBeenCalled()
+    })
+
+    it('a platform with no recorded digest fails before anything is downloaded', async () => {
+      // #given a pin that records no digest for this platform's asset
+      const pinWithoutPlatform: V2Pin = {version: V2_VERSION, assets: {'opencode-linux-arm64.tar.gz': archiveHash}}
+      const toolCache = createV2ToolCache()
+
+      // #when/#then
+      await expect(
+        installOpenCode(V2_VERSION, mockLogger, toolCache, createGzipExec(), undefined, pinWithoutPlatform),
+      ).rejects.toThrow(/no recorded digest for opencode-linux-x64\.tar\.gz/)
+      expect(toolCache.downloadTool).not.toHaveBeenCalled()
+    })
+
+    it('a version other than the recorded pin fails before anything is downloaded', async () => {
+      // #given a V2 version the pin file has no digests for
+      const toolCache = createV2ToolCache()
+
+      // #when/#then
+      await expect(
+        installOpenCode('2.3.0', mockLogger, toolCache, createGzipExec(), undefined, recordedPin),
+      ).rejects.toThrow(/2\.3\.0.*2\.2\.0/)
+      expect(toolCache.find).not.toHaveBeenCalled()
+      expect(toolCache.downloadTool).not.toHaveBeenCalled()
+    })
+
+    it('fails when SHA256SUMS disagrees with the recorded digest, even if the archive matches SHA256SUMS', async () => {
+      // #given a release whose archive and SHA256SUMS were replaced together
+      const replaced = Buffer.from('replaced-archive')
+      const replacedHash = createHash('sha256').update(replaced).digest('hex')
+      serve({checksums: `${replacedHash}  ${ARCHIVE_FILENAME}\n`, archive: replaced})
+      const toolCache = createV2ToolCache()
+
+      // #when/#then the recorded digest is the anchor, so self-consistent upstream data is not enough
+      await expect(
+        installOpenCode(V2_VERSION, mockLogger, toolCache, createGzipExec(), undefined, recordedPin),
+      ).rejects.toThrow(/SHA256SUMS.*disagrees with the recorded digest/)
+      expect(toolCache.extractTar).not.toHaveBeenCalled()
+      expect(downloadedUrls(toolCache).some(url => url.includes(`v${FALLBACK_VERSION}`))).toBe(false)
+    })
+
+    it('fails when SHA256SUMS has no entry for the asset', async () => {
+      // #given
+      serve({checksums: `${archiveHash}  opencode-linux-arm64.tar.gz\n`})
+      const toolCache = createV2ToolCache()
+
+      // #when/#then
+      await expect(
+        installOpenCode(V2_VERSION, mockLogger, toolCache, createGzipExec(), undefined, recordedPin),
+      ).rejects.toThrow(/does not contain an entry for opencode-linux-x64\.tar\.gz/)
+      expect(toolCache.extractTar).not.toHaveBeenCalled()
+    })
+
+    it('does not pass validation when the file command is unavailable', async () => {
+      // #given a verified archive but no `file` binary to run the magic-byte check
+      serve({checksums: `${archiveHash}  ${ARCHIVE_FILENAME}\n`})
+      const toolCache = createV2ToolCache()
+      const exec = createGzipExec({getExecOutput: vi.fn().mockRejectedValue(new Error('spawn file ENOENT'))})
+
+      // #when/#then the V1 fail-open default does not apply to a V2 pin
+      await expect(installOpenCode(V2_VERSION, mockLogger, toolCache, exec, undefined, recordedPin)).rejects.toThrow(
+        /file command unavailable/,
+      )
+      expect(toolCache.extractTar).not.toHaveBeenCalled()
+      expect(toolCache.cacheDir).not.toHaveBeenCalled()
+    })
+
+    it('fails when file reports a different archive type', async () => {
+      // #given a digest-verified archive that `file` does not recognise as gzip
+      serve({checksums: `${archiveHash}  ${ARCHIVE_FILENAME}\n`})
+      const toolCache = createV2ToolCache()
+      const exec = createGzipExec({
+        getExecOutput: vi.fn().mockResolvedValue({exitCode: 0, stdout: 'HTML document text', stderr: ''}),
+      })
+
+      // #when/#then
+      await expect(installOpenCode(V2_VERSION, mockLogger, toolCache, exec, undefined, recordedPin)).rejects.toThrow(
+        /appears corrupted/,
+      )
+      expect(toolCache.extractTar).not.toHaveBeenCalled()
+    })
+
+    it('throws on a download failure and does not retry against the fallback version', async () => {
+      // #given
+      const toolCache = createV2ToolCache({downloadTool: vi.fn().mockRejectedValue(new Error('HTTP 503'))})
+
+      // #when/#then
+      await expect(
+        installOpenCode(V2_VERSION, mockLogger, toolCache, createGzipExec(), undefined, recordedPin),
+      ).rejects.toThrow(/V2 OpenCode download\/verify failed for pin "2\.2\.0".*HTTP 503.*No fallback/)
+      expect(toolCache.downloadTool).toHaveBeenCalledTimes(1)
+      expect(mockLogger.warning).not.toHaveBeenCalled()
+    })
+
+    it('a V1 pin still takes the V1 path: magic-byte check only, fail-open, fallback retry', async () => {
+      // #given a stock 1.x pin whose first download fails and whose `file` command is missing
+      let downloads = 0
+      const toolCache = createV2ToolCache({
+        downloadTool: vi.fn().mockImplementation(async () => {
+          downloads++
+          if (downloads === 1) throw new Error('Download failed')
+          return Promise.resolve(ARCHIVE_PATH)
+        }),
+      })
+      const exec = createGzipExec({getExecOutput: vi.fn().mockRejectedValue(new Error('spawn file ENOENT'))})
+
+      // #when
+      const result = await installOpenCode('1.17.3', mockLogger, toolCache, exec, undefined, recordedPin)
+
+      // #then V1 retried with the fallback, never fetched SHA256SUMS, and passed validation without `file`
+      expect(result.version).toBe(FALLBACK_VERSION)
+      expect(downloadedUrls(toolCache).some(url => url.endsWith('SHA256SUMS'))).toBe(false)
+      expect(mockLogger.warning).toHaveBeenCalled()
     })
   })
 })
