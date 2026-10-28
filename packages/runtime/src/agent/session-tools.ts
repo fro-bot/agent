@@ -1,10 +1,9 @@
 /**
- * Native session tools — always-on implementations of the oMo session_* contract.
+ * Native session tools — always-on `session_list`, `session_read`, `session_search` and `session_info`.
  *
  * Ships as a config-dir file tool (`tool/session.js`), loaded by OpenCode's tool
- * registry BEFORE plugin tools (`registry.ts:172-193`); oMo plugin tools with the
- * same id override these by id at registry time (later-wins), giving deterministic
- * precedence when oMo is installed.
+ * registry BEFORE plugin tools (`registry.ts:172-193`); a plugin tool with the
+ * same id overrides these at registry time (later-wins).
  *
  * Constraints (do not relax):
  * - NO import from '@opencode-ai/plugin' — plain-object shape `{description, args, execute}`
@@ -13,8 +12,8 @@
  * - NO import-time I/O. All env/network access happens inside `execute()`.
  * - NEVER throw. Every failure path returns a human-readable `'session store unavailable: ...'`
  *   string — a session-tool failure must never fail the run.
- * - Arg schemas MUST match the oMo contract exactly: same tool names, same params, same
- *   string-shaped outputs, so the override is invisible to the model.
+ * - Arg schemas are the tools' contract with the model (the prompt names them): keep the tool names,
+ *   params and string-shaped outputs stable.
  */
 
 import type {Part, SessionInfo} from '../session/index.js'
@@ -260,7 +259,7 @@ export function createSessionTools(resolveBaseUrl: () => string | undefined): Se
 
       try {
         const client = createOpencodeClient({baseUrl: resolved.baseUrl})
-        // Intentionally no project_path arg here (oMo contract parity): search
+        // Intentionally no project_path arg here: search
         // always scopes to the current workspace, unlike `list`.
         const projectPath = process.cwd()
         const scopedSessionId = asString(args.session_id)

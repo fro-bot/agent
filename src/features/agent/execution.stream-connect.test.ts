@@ -207,15 +207,6 @@ describe('executeOpenCode — a stream that does not connect is retried', () => 
       agent: null,
       model: null,
       timeoutMs: 12_000,
-      omoProviders: {
-        claude: 'no',
-        copilot: 'no',
-        gemini: 'no',
-        openai: 'no',
-        opencodeZen: 'no',
-        zaiCodingPlan: 'no',
-        kimiForCoding: 'no',
-      },
     })
     await advance(12_000 + 20_000)
 

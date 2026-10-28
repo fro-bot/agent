@@ -1,5 +1,4 @@
 import type {Logger} from '../shared/logger.js'
-import type {OmoProviders, OmoSlimPreset} from '../shared/types.js'
 import type {CredentialDisposition} from './response-delivery.js'
 
 /**
@@ -13,14 +12,7 @@ export interface SetupInputs {
   readonly privateKey: string | null
   readonly opencodeConfig: string | null
   readonly systematicConfig: string | null
-  readonly omoConfig: string | null
-  readonly enableOmo: boolean
-  readonly omoVersion: string
   readonly systematicVersion: string
-  readonly omoProviders: OmoProviders
-  readonly enableOmoSlim: boolean
-  readonly omoSlimVersion: string
-  readonly omoSlimPreset: OmoSlimPreset
   readonly credential: CredentialDisposition
 }
 

@@ -36,7 +36,7 @@
 
 ## Overview
 
-Fro Bot Agent is a **multi-modality agent harness** that runs OpenCode with Oh My OpenAgent (oMo) capabilities to act as an autonomous collaborator across multiple platforms:
+Fro Bot Agent is a **multi-modality agent harness** that runs OpenCode to act as an autonomous collaborator across multiple platforms:
 
 - **GitHub Action** (MVP): Issues, Discussions, and Pull Requests via GitHub Actions triggers
 - **Discord Bot** (MVP): Long-running daemon with channel=repo, thread=session UX
@@ -72,7 +72,7 @@ Fro Bot addresses this by:
 
 1. Persisting OpenCode's stateful storage directory between runs.
 2. **Action-side utilities (RFC-004)**: Infrastructure-level session management (`listSessions`, `searchSessions`, `pruneSessions`, `writeSessionSummary`).
-3. **Agent-side tools (oMo)**: Runtime session discovery and reuse (`session_list`, `session_read`, `session_search`, `session_info`).
+3. **Agent-side tools**: Runtime session discovery and reuse (`session_list`, `session_read`, `session_search`, `session_info`).
 4. Producing auditable "run summaries" in platform-native formats.
 
 ---
@@ -287,7 +287,7 @@ These requirements apply to **all modalities**.
 | Layer | Tools/Functions | Used By | When |
 | --- | --- | --- | --- |
 | **Action-side (RFC-004)** | `listSessions()`, `searchSessions()`, `pruneSessions()`, `writeSessionSummary()` | Platform harness (GitHub Action, Discord bot) | Before/after agent execution |
-| **Agent-side (oMo)** | `session_list`, `session_read`, `session_search`, `session_info` | AI agent via LLM tool calls | During agent execution |
+| **Agent-side** | `session_list`, `session_read`, `session_search`, `session_info` | AI agent via LLM tool calls | During agent execution |
 
 Both layers operate on the same OpenCode storage directory.
 
@@ -338,7 +338,7 @@ Both layers operate on the same OpenCode storage directory.
 
 #### Agent Selection
 
-- Default agent: configurable per modality (e.g., "Sisyphus" for GitHub Action)
+- Default agent: configurable per modality (e.g., `build` for GitHub Action)
 - Agent validation: **server-side** (SDK validates; client passes agent name)
 - Fallback: if agent invalid or unavailable, use default with warning
 

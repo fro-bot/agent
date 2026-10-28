@@ -53,24 +53,24 @@ describe('createSessionTools — contract shape', () => {
     expect(Object.keys(tools).sort()).toEqual(['info', 'list', 'read', 'search'])
   })
 
-  it('list args match the oMo contract: limit?, from_date?, to_date?, project_path?', () => {
+  it('list args are: limit?, from_date?, to_date?, project_path?', () => {
     // #then
     expect(Object.keys(list.args).sort()).toEqual(['from_date', 'limit', 'project_path', 'to_date'])
     expect(typeof list.execute).toBe('function')
     expect(typeof list.description).toBe('string')
   })
 
-  it('read args match the oMo contract: session_id!, include_todos?, include_transcript?, limit?', () => {
+  it('read args are: session_id!, include_todos?, include_transcript?, limit?', () => {
     // #then
     expect(Object.keys(read.args).sort()).toEqual(['include_todos', 'include_transcript', 'limit', 'session_id'])
   })
 
-  it('search args match the oMo contract: query!, session_id?, case_sensitive?, limit?', () => {
+  it('search args are: query!, session_id?, case_sensitive?, limit?', () => {
     // #then
     expect(Object.keys(search.args).sort()).toEqual(['case_sensitive', 'limit', 'query', 'session_id'])
   })
 
-  it('info args match the oMo contract: session_id!', () => {
+  it('info args are: session_id!', () => {
     // #then
     expect(Object.keys(info.args)).toEqual(['session_id'])
   })

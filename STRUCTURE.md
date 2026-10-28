@@ -11,7 +11,7 @@ fro-bot/agent/
 │   ├── services/               # Layer 1: external adapters (GitHub, cache, setup, object-store, artifact)
 │   │   ├── github/             # Octokit client, context parsing, NormalizedEvent
 │   │   ├── cache/              # Restore/save with WAL checkpoint repair and corruption detection
-│   │   ├── setup/              # Bun, oMo, OpenCode + Systematic install/config
+│   │   ├── setup/              # OpenCode + Systematic install/config
 │   │   └── artifact/           # Artifact upload
 │   ├── features/               # Layer 2: business logic
 │   │   ├── agent/              # SDK execution, prompts, streaming, retry
@@ -23,7 +23,7 @@ fro-bot/agent/
 │   │   ├── delegated/          # Branch/commit/PR operations
 │   │   └── observability/      # Metrics collection, run summaries
 │   └── harness/                # Layer 3: workflow composition (entry points, phases)
-│       ├── config/             # Input parsing, outputs, state keys, omo-providers
+│       ├── config/             # Input parsing, outputs, state keys
 │       └── phases/             # Bootstrap, routing, dedup, execute, finalize, cleanup, …
 │
 ├── apps/
@@ -161,7 +161,7 @@ Use this decision tree to find the right home for new code:
 - **New Action phase, trigger handler, comment handler, or reviewer** → `src/features/<capability>/` (e.g. `src/features/triggers/`, `src/features/comments/`); wire it into `src/harness/phases/` or `src/features/triggers/router.ts`.
 - **New Discord command** → `packages/gateway/src/discord/commands/`; register it in the commands index.
 - **New operator web route** → `packages/gateway/src/web/`; register through `registerOperatorRoute`/`registerPublicRoute` (`packages/gateway/src/web/operator-route.ts`) and derive any unauthenticated client key from `resolveClient` (`packages/gateway/src/web/ingress/resolve-client.ts`) — never read an address header directly and never fall back to a shared key.
-- **New bundled CLI tool or version-pinned binary** (Bun, oMo, OpenCode, Systematic) → add a versioned-tool entry in `src/services/setup/` following the existing adapter pattern; pin the version constant in `packages/runtime/src/shared/constants.ts`.
+- **New bundled CLI tool or version-pinned binary** (OpenCode, Systematic) → add a versioned-tool entry in `src/services/setup/` following the existing adapter pattern; pin the version constant in `packages/runtime/src/shared/constants.ts`.
 - **New workspace API endpoint** → `apps/workspace-agent/src/`; add the route to the Hono server (`createApp` in `apps/workspace-agent/src/server.ts` — it inherits the bearer check unless it is a probe) and call it from `packages/gateway/src/workspace-api/client.ts` with the bearer header. A route that mutates a repository's checkout, bare mirror, or quarantine tree must run inside `withRepoLock` (`src/repo-mutex.ts`) and journal its in-flight phase (`src/journal.ts`) before mutating — see `apps/workspace-agent/AGENTS.md`.
 - **Shared primitive used by both Action and gateway** → `packages/runtime/src/`; export from its `index.ts`.
 - **New GitHub API helper** → `src/services/github/api.ts` or a new file under `src/services/github/`.

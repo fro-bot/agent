@@ -2,7 +2,7 @@
 
 **Location:** `src/services/setup/`
 
-Environment bootstrap logic: Bun runtime, OpenCode CLI, and oMo plugin installation. Manages authentication state (Git identity, gh CLI) and tool cache persistence.
+Environment bootstrap logic: OpenCode CLI and Systematic plugin installation. Manages authentication state (Git identity, gh CLI) and tool cache persistence.
 
 ## WHERE TO LOOK
 
@@ -14,9 +14,7 @@ Environment bootstrap logic: Bun runtime, OpenCode CLI, and oMo plugin installat
 | **Reuse guard**| `no-task-reuse-config.ts` | Writes the task-reuse guard plugin; builds its `file://` spec and the server config that carries it |
 | **Adapters**   | `adapters.ts`          | Exec/tool-cache adapter factories (20 L)                |
 | **OpenCode**   | `opencode.ts`          | CLI resolution & installation (169 L)                   |
-| **Bun**        | `bun.ts`               | Bun runtime setup (required for oMo) (170 L)            |
-| **oMo**        | `omo.ts`               | oh-my-openagent install (graceful fail) (120 L)         |
-| **oMo Config** | `omo-config.ts`        | Plugin configuration (97 L)                             |
+| **Deep merge** | `deep-merge.ts`        | Plain-object deep merge used for Systematic config      |
 | **GH Auth**    | `gh-auth.ts`           | gh CLI auth & Git user identity (101 L)                 |
 | **Auth JSON**  | `auth-json.ts`         | Temporary auth.json generation (70 L)                   |
 | **Project ID** | `project-id.ts`        | Deterministic project ID generation (121 L)             |
@@ -31,8 +29,6 @@ Environment bootstrap logic: Bun runtime, OpenCode CLI, and oMo plugin installat
 | `buildCIConfig`         | Function | `ci-config.ts:8`          | Build OPENCODE_CONFIG_CONTENT |
 | `writeSystematicConfig` | Function | `systematic-config.ts:12` | Write merged systematic.json  |
 | `installOpenCode`       | Function | `opencode.ts:87`          | CLI install + cache           |
-| `installBun`            | Function | `bun.ts:77`               | Runtime setup                 |
-| `installOmo`            | Function | `omo.ts:56`               | Plugin setup (graceful fail)  |
 | `configureGhAuth`       | Function | `gh-auth.ts:7`            | CLI authentication            |
 | `populateAuthJson`      | Function | `auth-json.ts:41`         | Secure credentials write      |
 | `ensureProjectId`       | Function | `project-id.ts:35`        | Deterministic ID for OpenCode |
@@ -41,12 +37,11 @@ Environment bootstrap logic: Bun runtime, OpenCode CLI, and oMo plugin installat
 
 - **Tool Cache**: `tc.downloadTool` → `tc.extract` → `tc.cacheDir`.
 - **Platform Gate**: `getPlatformInfo()` maps OS/Arch to release assets, and rejects anything outside linux/darwin × x64/arm64 by name. It is the first thing `installOpenCode` calls, before the tool-cache lookup and outside the stock-fallback `try`, so an unsupported platform fails as itself rather than as a download 404 or a binary that cannot execute.
-- **Graceful Fail**: Optional components (oMo, Bun) warn on error, don't crash.
+- **Graceful Fail**: Optional components (Systematic config) warn on error, don't crash.
 - **Dynamic Version**: Resolves 'latest' via GitHub Releases API.
 - **Verification**: Validates binaries (`--version`) BEFORE caching.
 - **Systematic Bundling**: `buildCIConfig()` ensures `@fro.bot/systematic@<version>` exists in OpenCode CI plugins.
 - **Task-reuse guard (fail-closed)**: `writeNoTaskReuseFile` copies `dist/no-task-reuse.js` (built from `deploy/plugins/no-task-reuse.mjs`, the same file the gateway image bakes) to `<configDir>/fro-bot/no-task-reuse.mjs`, and `taskReuseGuardServerConfig` builds `{plugin: [file:// URL]}`. Both are used by the Action's server-start choke point (`bootstrapOpenCodeServer`, `src/features/agent/server-adapter.ts`), NOT by setup or `buildCIConfig`: the guard rides the SDK's `OPENCODE_CONFIG_CONTENT` layer, which loads after every user/project/global file and cannot be dropped by them, so no user config file is read or edited and setup never lists the guard (one channel; a preinstalled OpenCode that skips setup is guarded too). It rejects any `task` call with a truthy `task_id`, so a background dispatch can never reuse a settled child session (#1757). If the file cannot be written, no server starts. Keep the file out of `<configDir>/plugin(s)/` (OpenCode auto-scans those). `<configDir>` is `$XDG_CONFIG_HOME/opencode` (else `~/.config/opencode`), the directory the server reads. Boundary on model behavior, not a sandbox: earlier-layer plugins still load before it, and `OPENCODE_PURE` would skip it (denied by `filterAgentEnv`; setup warns).
-- `parseOmoProviders` moved to `src/harness/config/omo-providers.ts`.
 
 ## SECURITY
 

@@ -32,23 +32,9 @@ function createEnsureOptions(logger: Logger) {
     opencodeVersion: PINNED_VERSION,
     githubToken: 'ghs_test',
     authJson: '{}',
-    enableOmo: false,
-    omoVersion: '4.19.4',
     systematicVersion: '3.16.3',
-    omoProviders: {
-      claude: 'no',
-      copilot: 'no',
-      gemini: 'no',
-      openai: 'no',
-      opencodeZen: 'no',
-      zaiCodingPlan: 'no',
-      kimiForCoding: 'no',
-    },
     opencodeConfig: null,
     systematicConfig: null,
-    enableOmoSlim: false,
-    omoSlimVersion: '1.1.1',
-    omoSlimPreset: 'openai',
     credential: 'provision',
   } as const
 }

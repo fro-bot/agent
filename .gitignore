@@ -106,9 +106,6 @@ eslint-typegen.d.ts
 !.opencode/themes/
 !.opencode/tui.json
 
-# Oh My OpenCode
-.sisyphus/
-
 # Systematic skill scratch artifacts (ce:review, deepen-plan, etc.)
 .context/
 

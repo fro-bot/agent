@@ -1,22 +1,18 @@
 import type {OpenCodeInstallResult, SetupInputs, SetupResult} from './types.js'
-import {mkdir, readFile, writeFile} from 'node:fs/promises'
+import {mkdir, writeFile} from 'node:fs/promises'
 import {homedir} from 'node:os'
 import {join} from 'node:path'
 import process from 'node:process'
 import * as core from '@actions/core'
 import {getOctokit} from '@actions/github'
-import {DEFAULT_BUN_VERSION} from '../../shared/constants.js'
 import {getRunnerOS, getXdgDataHome} from '../../shared/env.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {createLogger} from '../../shared/logger.js'
 import {createExecAdapter, createToolCacheAdapter} from './adapters.js'
 import {parseAuthJsonInput, populateAuthJson} from './auth-json.js'
-import {installBun} from './bun.js'
-import {buildCIConfig, isOmoSlimVersionVerified, pluginPrefix} from './ci-config.js'
+import {buildCIConfig} from './ci-config.js'
 import {configureGhAuth, configureGitIdentity} from './gh-auth.js'
 import {defaultOpenCodeConfigDir} from './no-task-reuse-config.js'
-import {installOmoSlim} from './omo-slim.js'
-import {installOmo} from './omo.js'
 import {FALLBACK_VERSION, getLatestVersion, installOpenCode, opencodeBinaryPath, toolCacheVersion} from './opencode.js'
 import {writeSessionToolsFile} from './session-tools-config.js'
 import {writeSystematicConfig} from './systematic-config.js'
@@ -37,7 +33,7 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
   const execAdapter = createExecAdapter()
 
   try {
-    logger.info('Starting setup', {version: inputs.opencodeVersion, enableOmo: inputs.enableOmo})
+    logger.info('Starting setup', {version: inputs.opencodeVersion})
 
     // Parse auth.json early to fail fast
     let authConfig
@@ -61,13 +57,11 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
       }
     }
 
-    const omoVersion = inputs.omoVersion
     const systematicVersion = inputs.systematicVersion
 
     // Restore tools cache before installs
     const runnerToolCache = process.env.RUNNER_TOOL_CACHE ?? '/opt/hostedtoolcache'
     const toolCachePath = join(runnerToolCache, 'opencode')
-    const bunCachePath = join(runnerToolCache, 'bun')
     const configDir = defaultOpenCodeConfigDir()
     const opencodeCachePath = join(homedir(), '.cache', 'opencode')
     const runnerOS = getRunnerOS()
@@ -75,30 +69,21 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
     const toolsCacheResult = await restoreToolsCache({
       logger,
       os: runnerOS,
-      bunVersion: DEFAULT_BUN_VERSION,
       opencodeVersion: version,
-      omoVersion,
       systematicVersion,
-      cacheMode: inputs.enableOmo || inputs.enableOmoSlim ? 'enabled' : 'disabled',
       toolCachePath,
-      bunCachePath,
-      omoConfigPath: configDir,
       opencodeCachePath,
     })
 
     const toolsCacheStatus: 'hit' | 'miss' = toolsCacheResult.hit ? 'hit' : 'miss'
 
     let opencodeResult: OpenCodeInstallResult | undefined
-    let omoStatus: 'installed' | 'failed' | 'skipped' = 'skipped'
-    let omoError: string | null = null
-    let omoSlimStatus: 'installed' | 'failed' | 'skipped' = 'skipped'
-    let omoSlimError: string | null = null
 
     if (toolsCacheResult.hit) {
       const cachedPath = toolCache.find('opencode', toolCacheVersion(version))
       if (cachedPath.length > 0) {
         opencodeResult = {path: cachedPath, version, cached: true}
-        logger.info('Tools cache hit, using cached OpenCode CLI', {version, omoVersion})
+        logger.info('Tools cache hit, using cached OpenCode CLI', {version})
       } else {
         logger.warning('Tools cache hit but binary not found in tool-cache, falling through to install', {
           requestedVersion: version,
@@ -116,85 +101,7 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
       }
     }
 
-    // Enabled mode: Bun install, oMo telemetry, oMo install
-    if (inputs.enableOmo) {
-      let bunInstalled = false
-      try {
-        await installBun(logger, toolCache, execAdapter, core.addPath, DEFAULT_BUN_VERSION)
-        bunInstalled = true
-      } catch (error) {
-        logger.warning('Bun installation failed, oMo will be unavailable', {
-          error: toErrorMessage(error),
-        })
-      }
-
-      // Disable oMo telemetry before any oMo code runs
-      core.exportVariable('OMO_SEND_ANONYMOUS_TELEMETRY', '0')
-      core.exportVariable('OMO_DISABLE_POSTHOG', '1')
-
-      if (bunInstalled) {
-        const omoResult = await installOmo(omoVersion, {logger, execAdapter}, inputs.omoProviders)
-        if (omoResult.installed) {
-          logger.info('oMo installed', {version: omoResult.version})
-          omoStatus = 'installed'
-        } else {
-          logger.warning('oMo installation failed, continuing without oMo', {
-            error: omoResult.error ?? 'unknown error',
-          })
-          omoStatus = 'failed'
-        }
-        omoError = omoResult.error
-      } else {
-        omoStatus = 'failed'
-        omoError = 'Bun installation failed'
-      }
-    } else if (inputs.enableOmoSlim) {
-      // Fix B (R19 early gate): reject unverified versions before touching the installer
-      if (!isOmoSlimVersionVerified(inputs.omoSlimVersion)) {
-        core.setFailed(
-          `OMO Slim version ${inputs.omoSlimVersion} is not verified to register the orchestrator agent (known-good: 1.1.1)`,
-        )
-        return null
-      }
-
-      // Slim mode: Bun install (required for bunx), then OMO Slim install (no telemetry exports)
-      let bunInstalled = false
-      try {
-        await installBun(logger, toolCache, execAdapter, core.addPath, DEFAULT_BUN_VERSION)
-        bunInstalled = true
-      } catch (error) {
-        logger.warning('Bun installation failed, OMO Slim will be unavailable', {
-          error: toErrorMessage(error),
-        })
-      }
-
-      // Fix A: track actual install success — used below to pass correct enableOmoSlim to buildCIConfig
-      let slimReady = false
-      if (bunInstalled) {
-        const slimResult = await installOmoSlim(inputs.omoSlimVersion, {logger, execAdapter}, inputs.omoSlimPreset)
-        if (slimResult.installed) {
-          logger.info('OMO Slim installed', {version: slimResult.version})
-          omoSlimStatus = 'installed'
-          slimReady = true
-        } else {
-          logger.warning('OMO Slim installation failed, continuing without OMO Slim', {
-            error: slimResult.error ?? 'unknown error',
-          })
-          omoSlimStatus = 'failed'
-        }
-        omoSlimError = slimResult.error
-      } else {
-        omoSlimStatus = 'failed'
-        omoSlimError = 'Bun installation failed'
-      }
-
-      // Re-assign enableOmoSlim to reflect actual install success for buildCIConfig
-      inputs = {...inputs, enableOmoSlim: slimReady}
-    } else {
-      logger.info('oMo disabled, skipping oMo install')
-    }
-
-    // Write Systematic config regardless of oMo mode — always honored
+    // Write Systematic config — always honored
     if (inputs.systematicConfig != null) {
       try {
         await writeSystematicConfig(inputs.systematicConfig, configDir, logger)
@@ -203,9 +110,7 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
       }
     }
 
-    // Native session tools are always-on, regardless of oMo mode. oMo's own
-    // plugin tools (when present) override by id at registry time, so this
-    // never needs to be gated on enableOmo.
+    // Native session tools are always-on.
     await writeSessionToolsFile(configDir, logger)
 
     // OPENCODE_PURE makes OpenCode skip every external plugin (plugin/index.ts:181), Systematic and the
@@ -222,10 +127,6 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
       {
         opencodeConfig: inputs.opencodeConfig,
         systematicVersion,
-        enableOmo: inputs.enableOmo,
-        enableOmoSlim: inputs.enableOmoSlim,
-        omoSlimVersion: inputs.omoSlimVersion,
-        omoSlimPreset: inputs.omoSlimPreset,
         integrationWorkDir: process.env.FRO_BOT_INTEGRATION_WORK_DIR,
       },
       logger,
@@ -238,68 +139,14 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
     const opencodeConfigPath = join(configDir, 'opencode.json')
     await mkdir(configDir, {recursive: true})
 
-    if (inputs.enableOmo) {
-      // Enabled mode: merge CI config with existing opencode.json (e.g. oMo plugin registration)
-      let existingConfig: Record<string, unknown> = {}
-      try {
-        const raw = await readFile(opencodeConfigPath, 'utf8')
-        const parsed: unknown = JSON.parse(raw)
-        if (parsed != null && typeof parsed === 'object' && !Array.isArray(parsed)) {
-          existingConfig = parsed as Record<string, unknown>
-        }
-      } catch {
-        // File doesn't exist yet or is invalid — start fresh
-      }
-
-      // Strip legacy "plugins" (plural) key — OpenCode only accepts "plugin" (singular)
-      delete existingConfig.plugins
-
-      // Normalize oMo plugin specifiers to pinned version
-      const normalizePlugins = (plugins: unknown[]): unknown[] =>
-        plugins.map(p => {
-          if (typeof p !== 'string') return p
-          if (p === 'oh-my-openagent' || p === 'oh-my-openagent@latest') {
-            return `oh-my-openagent@${omoVersion}`
-          }
-          return p
-        })
-
-      // Merge plugin arrays: existing plugins + CI plugins, deduplicated by package name prefix
-      const existingPlugins: unknown[] = normalizePlugins(
-        Array.isArray(existingConfig.plugin) ? (existingConfig.plugin as unknown[]) : [],
-      )
-      const ciPlugins: unknown[] = Array.isArray(ciConfigResult.config.plugin)
-        ? (ciConfigResult.config.plugin as unknown[])
-        : []
-      const mergedPlugins = [...existingPlugins]
-      for (const ciPlugin of ciPlugins) {
-        if (typeof ciPlugin !== 'string') continue
-        const prefix = pluginPrefix(ciPlugin)
-        const alreadyPresent = mergedPlugins.some(p => typeof p === 'string' && pluginPrefix(p) === prefix)
-        if (!alreadyPresent) {
-          mergedPlugins.push(ciPlugin)
-        }
-      }
-
-      const mergedConfig = {...existingConfig, ...ciConfigResult.config, plugin: mergedPlugins}
-      const mergedConfigJson = JSON.stringify(mergedConfig, null, 2)
-      core.exportVariable('OPENCODE_CONFIG_CONTENT', mergedConfigJson)
-      await writeFile(opencodeConfigPath, mergedConfigJson)
-      logger.info('Wrote merged OpenCode config', {
-        path: opencodeConfigPath,
-        pluginCount: mergedPlugins.length,
-        plugins: mergedPlugins,
-      })
-    } else {
-      // Disabled mode: start fresh from CI config — no merge with existing local/restored opencode.json
-      const freshConfigJson = JSON.stringify(ciConfigResult.config, null, 2)
-      core.exportVariable('OPENCODE_CONFIG_CONTENT', freshConfigJson)
-      await writeFile(opencodeConfigPath, freshConfigJson)
-      logger.info('Wrote fresh OpenCode config (disabled oMo)', {
-        path: opencodeConfigPath,
-        pluginCount: Array.isArray(ciConfigResult.config.plugin) ? ciConfigResult.config.plugin.length : 0,
-      })
-    }
+    // Start fresh from the CI config: no merge with a local or restored opencode.json
+    const freshConfigJson = JSON.stringify(ciConfigResult.config, null, 2)
+    core.exportVariable('OPENCODE_CONFIG_CONTENT', freshConfigJson)
+    await writeFile(opencodeConfigPath, freshConfigJson)
+    logger.info('Wrote fresh OpenCode config', {
+      path: opencodeConfigPath,
+      pluginCount: Array.isArray(ciConfigResult.config.plugin) ? ciConfigResult.config.plugin.length : 0,
+    })
 
     core.addPath(opencodeResult.path)
 
@@ -320,14 +167,9 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
         await saveToolsCache({
           logger,
           os: runnerOS,
-          bunVersion: DEFAULT_BUN_VERSION,
           opencodeVersion: version,
-          omoVersion,
           systematicVersion,
-          cacheMode: inputs.enableOmo || inputs.enableOmoSlim ? 'enabled' : 'disabled',
           toolCachePath,
-          bunCachePath,
-          omoConfigPath: configDir,
           opencodeCachePath,
         })
       } else {
@@ -389,10 +231,6 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
       opencodeBinaryPath: opencodeBinaryPath(opencodeResult.path),
       opencodeVersion: opencodeResult.version,
       ghAuthenticated: ghResult.authenticated,
-      omoStatus,
-      omoError,
-      omoSlimStatus,
-      omoSlimError,
       toolsCacheStatus,
       duration,
     }

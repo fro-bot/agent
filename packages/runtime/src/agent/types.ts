@@ -1,6 +1,6 @@
 import type {FilePartInput} from '@opencode-ai/sdk'
 import type {LogicalSessionKey, SessionSearchResult, SessionSummary} from '../session/index.js'
-import type {ModelConfig, OmoProviders, ResolvedOutputMode, ResponseMode, TokenUsage} from '../shared/types.js'
+import type {ModelConfig, ResolvedOutputMode, ResponseMode, TokenUsage} from '../shared/types.js'
 import type {ErrorInfo} from './error-format/types.js'
 import type {ResponseDelivery} from './response-delivery.js'
 import type {ResponseSurface} from './response-file.js'
@@ -320,7 +320,6 @@ export interface ExecutionConfig {
   readonly agent: string | null
   readonly model: ModelConfig | null
   readonly timeoutMs: number
-  readonly omoProviders: OmoProviders
   readonly continueSessionId?: string
   readonly sessionTitle?: string
   /** Whether the agent can directly affect external GitHub state during execution. */

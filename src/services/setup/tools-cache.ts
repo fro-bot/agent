@@ -3,15 +3,10 @@ import * as cache from '@actions/cache'
 import {TOOLS_CACHE_PREFIX} from '../../shared/constants.js'
 import {toErrorMessage} from '../../shared/errors.js'
 
-export type CacheMode = 'enabled' | 'disabled'
-
 export interface ToolsCacheKeyComponents {
   readonly os: string
-  readonly bunVersion: string
   readonly opencodeVersion: string
-  readonly omoVersion: string
   readonly systematicVersion: string
-  readonly cacheMode: CacheMode
 }
 
 export interface ToolsCacheAdapter {
@@ -27,14 +22,9 @@ export const defaultToolsCacheAdapter: ToolsCacheAdapter = {
 export interface RestoreToolsCacheOptions {
   readonly logger: Logger
   readonly os: string
-  readonly bunVersion: string
   readonly opencodeVersion: string
-  readonly omoVersion: string
   readonly systematicVersion: string
-  readonly cacheMode: CacheMode
   readonly toolCachePath: string
-  readonly bunCachePath: string
-  readonly omoConfigPath: string
   readonly opencodeCachePath: string
   readonly cacheAdapter?: ToolsCacheAdapter
 }
@@ -42,14 +32,9 @@ export interface RestoreToolsCacheOptions {
 export interface SaveToolsCacheOptions {
   readonly logger: Logger
   readonly os: string
-  readonly bunVersion: string
   readonly opencodeVersion: string
-  readonly omoVersion: string
   readonly systematicVersion: string
-  readonly cacheMode: CacheMode
   readonly toolCachePath: string
-  readonly bunCachePath: string
-  readonly omoConfigPath: string
   readonly opencodeCachePath: string
   readonly cacheAdapter?: ToolsCacheAdapter
 }
@@ -60,64 +45,35 @@ export interface ToolsCacheResult {
 }
 
 export function buildToolsCacheKey(components: ToolsCacheKeyComponents): string {
-  const {os, bunVersion, opencodeVersion, omoVersion, systematicVersion, cacheMode} = components
+  const {os, opencodeVersion, systematicVersion} = components
 
-  if (cacheMode === 'disabled') {
-    return `${TOOLS_CACHE_PREFIX}-${os}-disabled-oc-${opencodeVersion}-sys-${systematicVersion}-bun-${bunVersion}`
-  }
-
-  return `${TOOLS_CACHE_PREFIX}-${os}-enabled-oc-${opencodeVersion}-omo-${omoVersion}-sys-${systematicVersion}-bun-${bunVersion}`
+  return `${TOOLS_CACHE_PREFIX}-${os}-oc-${opencodeVersion}-sys-${systematicVersion}`
 }
 
 export function buildToolsRestoreKeys(components: ToolsCacheKeyComponents): readonly string[] {
-  const {os, bunVersion, opencodeVersion, omoVersion, systematicVersion, cacheMode} = components
+  const {os, opencodeVersion, systematicVersion} = components
 
-  if (cacheMode === 'disabled') {
-    return [
-      `${TOOLS_CACHE_PREFIX}-${os}-disabled-oc-${opencodeVersion}-sys-${systematicVersion}-bun-${bunVersion}-`,
-    ] as const
-  }
-
-  return [
-    `${TOOLS_CACHE_PREFIX}-${os}-enabled-oc-${opencodeVersion}-omo-${omoVersion}-sys-${systematicVersion}-bun-${bunVersion}-`,
-  ] as const
+  return [`${TOOLS_CACHE_PREFIX}-${os}-oc-${opencodeVersion}-sys-${systematicVersion}-`] as const
 }
 
-export function buildCachePaths(options: {
-  cacheMode: CacheMode
-  toolCachePath: string
-  bunCachePath: string
-  omoConfigPath: string
-  opencodeCachePath: string
-}): readonly string[] {
-  const {cacheMode, toolCachePath, bunCachePath, omoConfigPath, opencodeCachePath} = options
-
-  if (cacheMode === 'disabled') {
-    return [toolCachePath, opencodeCachePath]
-  }
-
-  return [toolCachePath, bunCachePath, omoConfigPath, opencodeCachePath]
+export function buildCachePaths(options: {toolCachePath: string; opencodeCachePath: string}): readonly string[] {
+  return [options.toolCachePath, options.opencodeCachePath]
 }
 
 export async function restoreToolsCache(options: RestoreToolsCacheOptions): Promise<ToolsCacheResult> {
   const {
     logger,
     os,
-    bunVersion,
     opencodeVersion,
-    omoVersion,
     systematicVersion,
-    cacheMode,
     toolCachePath,
-    bunCachePath,
-    omoConfigPath,
     opencodeCachePath,
     cacheAdapter = defaultToolsCacheAdapter,
   } = options
 
-  const primaryKey = buildToolsCacheKey({os, bunVersion, opencodeVersion, omoVersion, systematicVersion, cacheMode})
-  const restoreKeys = buildToolsRestoreKeys({os, bunVersion, opencodeVersion, omoVersion, systematicVersion, cacheMode})
-  const cachePaths = buildCachePaths({cacheMode, toolCachePath, bunCachePath, omoConfigPath, opencodeCachePath})
+  const primaryKey = buildToolsCacheKey({os, opencodeVersion, systematicVersion})
+  const restoreKeys = buildToolsRestoreKeys({os, opencodeVersion, systematicVersion})
+  const cachePaths = buildCachePaths({toolCachePath, opencodeCachePath})
 
   logger.info('Restoring tools cache', {primaryKey, restoreKeys: [...restoreKeys], paths: cachePaths})
 
@@ -152,20 +108,15 @@ export async function saveToolsCache(options: SaveToolsCacheOptions): Promise<bo
   const {
     logger,
     os,
-    bunVersion,
     opencodeVersion,
-    omoVersion,
     systematicVersion,
-    cacheMode,
     toolCachePath,
-    bunCachePath,
-    omoConfigPath,
     opencodeCachePath,
     cacheAdapter = defaultToolsCacheAdapter,
   } = options
 
-  const saveKey = buildToolsCacheKey({os, bunVersion, opencodeVersion, omoVersion, systematicVersion, cacheMode})
-  const cachePaths = buildCachePaths({cacheMode, toolCachePath, bunCachePath, omoConfigPath, opencodeCachePath})
+  const saveKey = buildToolsCacheKey({os, opencodeVersion, systematicVersion})
+  const cachePaths = buildCachePaths({toolCachePath, opencodeCachePath})
 
   logger.info('Saving tools cache', {saveKey, paths: cachePaths})
 

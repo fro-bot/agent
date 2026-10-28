@@ -23,7 +23,7 @@ export const DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS = 5000
 // OPENCODE_ENABLE_QUESTION_TOOL is set) -- `tool/registry.ts:207` at the pinned base_version --
 // and the unset default is `cli`. Nobody can answer a question in CI, so any non-interactive
 // value keeps the tool out of the registry entirely. Distinct from `run`/`acp` (other upstream
-// and oMo clients) so it is attributable in the models.dev user agent and OTLP attributes.
+// clients) so it is attributable in the models.dev user agent and OTLP attributes.
 export const NON_INTERACTIVE_OPENCODE_CLIENT = 'fro-bot-action'
 
 // Bound on bootstrapOpenCodeServer's instance-scoped readiness probe -- time-to-first-
@@ -57,24 +57,7 @@ export const DEFAULT_MODEL = {
 // releases, checksum-verified, and fail-closed on mismatch — no silent stock fallback.
 // FALLBACK_VERSION (in opencode.ts) is the plain stock base used when latest-fetch fails.
 export const DEFAULT_OPENCODE_VERSION = '1.19.4+harness.5bde2635'
-export const DEFAULT_BUN_VERSION = '1.4.4'
-export const DEFAULT_OMO_VERSION = '4.19.4'
-// OMO Slim (oh-my-opencode-slim) pinned version. Stable line only — the 2.0.0-beta
-// channel is not the default. Renovate tracks this via .github/renovate.json5.
-export const DEFAULT_OMO_SLIM_VERSION = '2.2.25'
-export const DEFAULT_OMO_PROVIDERS = ''
 export const DEFAULT_SYSTEMATIC_VERSION = '3.26.4'
-
-// All-'no' OmoProviders sentinel for disabled oMo mode
-export const OMO_PROVIDERS_DISABLED = {
-  claude: 'no',
-  copilot: 'no',
-  gemini: 'no',
-  openai: 'no',
-  opencodeZen: 'no',
-  zaiCodingPlan: 'no',
-  kimiForCoding: 'no',
-} as const
 
 // Retry configuration lives in the Action layer's src/features/agent/retry.ts,
 // colocated with the retry logic that consumes the values.

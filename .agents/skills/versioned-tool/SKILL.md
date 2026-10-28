@@ -1,6 +1,6 @@
 ---
 name: versioned-tool
-description: Use when adding or updating external CLI tools managed by pinned version constants, including OpenCode, Bun, oMo, action inputs, or Renovate customManagers.
+description: Use when adding or updating external CLI tools managed by pinned version constants, including OpenCode, Systematic, action inputs, or Renovate customManagers.
 ---
 
 # Versioned Tool
@@ -16,8 +16,6 @@ This project manages external CLI tools through a **single-source-of-truth versi
 | OpenCode (action default) | `DEFAULT_OPENCODE_VERSION` | `opencode-version` | _Release-job coupled — NOT Renovate (see below)_ |
 | OpenCode (action fallback) | `FALLBACK_VERSION` in `src/services/setup/opencode.ts` | _(internal only)_ | `github-releases` (`anomalyco/opencode`) |
 | OpenCode (workspace image) | `ARG OPENCODE_VERSION` in `deploy/workspace.Dockerfile` | _(internal only)_ | _Release-job coupled — NOT Renovate (see below)_ |
-| oMo | `DEFAULT_OMO_VERSION` | `omo-version` | `npm` (`oh-my-openagent`) |
-| Bun | `DEFAULT_BUN_VERSION` | _(internal only)_ | `github-releases` (`oven-sh/bun`, extract `bun-v` prefix) |
 | Systematic | `DEFAULT_SYSTEMATIC_VERSION` | `systematic-version` | `npm` (`@fro.bot/systematic`) |
 | OpenCode (harness base) | `base_version` in `packages/harness/harness.config.json` | _(internal only — config-JSON, not a TS constant)_ | `github-releases` (`anomalyco/opencode`) |
 
@@ -45,8 +43,7 @@ The invariant flow is: `constants.ts` → installer import → input fallback (i
 Before editing, inspect the nearest existing implementation:
 
 - `src/services/setup/opencode.ts` — supports `latest` resolution + fallback
-- `src/services/setup/omo.ts` — dual-identity package (npm name ≠ runtime name)
-- `src/services/setup/bun.ts` — internal-only, no action.yaml input
+- `src/services/setup/systematic-plugin.ts` — installs a plugin package through the OpenCode CLI at the pinned version
 
 **If this skill conflicts with the current repo, follow the repo and update this skill afterward.**
 
@@ -54,14 +51,7 @@ Before editing, inspect the nearest existing implementation:
 
 Do not assume the install package name, config filename, and runtime version string are the same.
 
-The oMo integration is the cautionary example:
-
-| Concern          | Install identity         | Runtime identity        |
-| ---------------- | ------------------------ | ----------------------- |
-| Package name     | `oh-my-openagent`        | `oh-my-opencode`        |
-| Config filename  | —                        | `oh-my-opencode.json`   |
-| Version output   | —                        | `oh-my-opencode@3.11.2` |
-| bunx install arg | `oh-my-openagent@3.11.2` | —                       |
+A package can install under one name and report another at runtime (a different config filename, a different `--version` string).
 
 When adding or renaming a tool, verify independently:
 
@@ -81,8 +71,7 @@ All tools share the same version-source and Renovate tracking. User-facing tools
 All default versions live in `packages/runtime/src/shared/constants.ts` (re-exported through the root barrel `src/shared/constants.ts`):
 
 ```typescript
-export const DEFAULT_BUN_VERSION = "1.3.9"
-export const DEFAULT_OMO_VERSION = "3.11.2"
+export const DEFAULT_SYSTEMATIC_VERSION = "3.26.4"
 ```
 
 Rules: semver string, no `v` prefix, named `DEFAULT_<TOOL>_VERSION`. This is the ONLY place the version literal appears. (Exception: `DEFAULT_OPENCODE_VERSION` carries the harness build format `<base>+harness.<sha>` and is bumped by the release job, not by hand.)
@@ -184,8 +173,8 @@ Installers reuse the pinned version constant instead of hardcoding version liter
 Repo-specific behaviors today:
 
 - **OpenCode**: supports explicit `latest` resolution, falls back to `FALLBACK_VERSION` (independent stock pin in `src/services/setup/opencode.ts` — deliberately not the harness-build `DEFAULT_OPENCODE_VERSION`)
-- **Bun**: installs from `DEFAULT_BUN_VERSION`, no user override. The repo's own CI Bun is not this constant: `.github/actions/setup` installs the version in the root `package.json` `packageManager` field
-- **oMo**: installs from `DEFAULT_OMO_VERSION`, but package/runtime identity differs
+- **Systematic**: installs from `DEFAULT_SYSTEMATIC_VERSION` through the OpenCode CLI's plugin install
+- **Bun**: not an Action-installed tool. The repo's own CI Bun comes from the root `package.json` `packageManager` field through `.github/actions/setup`
 
 Do not copy installer structure blindly between tools. Copy the version-source pattern; verify the install mechanics per tool.
 

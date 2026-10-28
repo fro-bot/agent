@@ -30,7 +30,7 @@ Traditional CI-based AI agents are stateless: each run starts from scratch, repe
 - **Auto-setup** — installs OpenCode on first run; no manual toolchain setup.
 - **Security-first** — author-association gating, credential hygiene, and fork-PR protection are enforced, not optional.
 - **Observability** — every run writes a summary with metrics and error context.
-- **Extensible orchestration** — opt in to [Oh My OpenAgent](https://github.com/code-yeongyu/oh-my-openagent) or [OMO Slim](https://github.com/alvinunreal/oh-my-opencode-slim) when you need extended provider and agent workflows.
+- **Extensible** — the [Systematic](https://github.com/marcusrbrown/systematic) plugin is installed by default; add your own plugins, agents, and providers through `opencode-config`.
 
 ## Getting Started
 
@@ -168,7 +168,6 @@ A few inputs most workflows touch:
 - **`agent`** / **`model`** — override the agent (a primary agent, not a subagent) or the model (`provider/model`).
 - **`timeout`** — OpenCode execution timeout in milliseconds; governs the Action's internal execution deadline only, not the whole GitHub Actions job. Default `1800000` (30 minutes); `0` disables the Action-internal execution deadline. Set the job's `timeout-minutes` as the whole-job/process backstop, with headroom beyond this value for setup, fallback response delivery, and cleanup.
 - **`response-mode`** — `github` (default) posts exactly one comment or review; `none` suppresses all GitHub writes and uses the run log as the response surface.
-- **`enable-omo`** / **`enable-omo-slim`** — opt into extended orchestration (mutually exclusive).
 - **`brokered-push-extra-paths`** — optional comma-separated relative path prefixes to add to the brokered-push allowlist; defaults to empty. Protected surfaces are hard-denied at the root by prefix screening and within opted-in prefixes by path-segment/basename screening; files admitted by the default allowlist remain governed by the default rules. Do not stage secrets or execution surfaces.
 
 <details>
@@ -192,16 +191,11 @@ A few inputs most workflows touch:
 | `s3-sse-kms-key-id` | No | — | Customer-managed KMS key ID for SSE-KMS. Requires the effective mode to be `aws:kms`: on a custom endpoint the default is `AES256`, so also set `s3-sse-encryption: aws:kms` |
 | `s3-sse-encryption` | No | Endpoint-dependent | `aws:kms` (AWS S3) or `AES256` (custom endpoints) |
 | `agent` | No | — | Agent to use (a primary agent, not a subagent). Defaults to OpenCode's built-in `build` agent |
-| `enable-omo` | No | `false` | Enable Oh My OpenAgent for extended provider and agent support |
-| `enable-omo-slim` | No | `false` | Enable OMO Slim orchestration (mutually exclusive with `enable-omo`) |
 | `model` | No | — | Model override in `provider/model` format |
 | `timeout` | No | `1800000` | OpenCode execution timeout in milliseconds; Action-internal only, not the job timeout (`0` = no Action-internal deadline) |
 | `opencode-version` | No | Source-pinned | OpenCode CLI version to install. An existing opencode is reused only when it reports exactly this version (the `-harness.` and `+harness.` spellings are equivalent); otherwise the pinned build is installed. |
-| `omo-version` | No | Source-pinned | oMo version to install |
 | `systematic-version` | No | Source-pinned | Systematic plugin version to register |
 | `skip-cache` | No | `false` | Skip session cache restore |
-| `omo-providers` | No | — | Comma-separated oMo providers to enable |
-| `omo-slim-preset` | No | `openai` | OMO Slim preset (`openai`, `opencode-go`); only when `enable-omo-slim` is true |
 | `opencode-config` | No | — | JSON deep-merged into the OpenCode config |
 | `systematic-config` | No | — | JSON deep-merged into the Systematic plugin config |
 | `dedup-window` | No | `600000` | Skip a run if the agent already ran for the same PR/issue within this window (ms); `0` disables |
@@ -275,7 +269,7 @@ bun run lint      # Lint (includes the committed-dist/ check)
 ## Resources
 
 - [OpenCode Documentation](https://opencode.ai/docs/) — the OpenCode platform.
-- [Oh My OpenAgent](https://github.com/code-yeongyu/oh-my-openagent) — extended agent workflows.
+- [Systematic](https://github.com/marcusrbrown/systematic) — the OpenCode plugin installed by default.
 - [GitHub Actions Documentation](https://docs.github.com/en/actions) — Actions reference.
 
 ## License

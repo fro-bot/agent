@@ -292,7 +292,7 @@ async function validateDownload(
  * exact harness binary or fail closed.
  *
  * For stock versions, falls back to the known stable FALLBACK_VERSION on
- * failure (pattern from oMo Sisyphus workflow).
+ * failure.
  */
 export async function installOpenCode(
   version: string,

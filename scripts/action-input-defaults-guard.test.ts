@@ -9,26 +9,23 @@ import {
   DEFAULT_SESSION_RETENTION,
   DEFAULT_TIMEOUT_MS,
 } from '../src/shared/constants.js'
-import {DEFAULT_OMO_SLIM_PRESET} from '../src/shared/types.js'
 
 // action.yaml declares a literal `default:` for several inputs whose "unset" fallback in
-// src/harness/config/inputs.ts is a named constant from src/shared/constants.ts or
-// src/shared/types.ts. A literal default in the metadata means core.getInput() never
-// returns an empty string for that input in a real Action run, so the TypeScript fallback
-// branch is defense-in-depth rather than the live path — but nothing asserts the two
+// src/harness/config/inputs.ts is a named constant from src/shared/constants.ts. A literal
+// default in the metadata means core.getInput() never returns an empty string for that input in
+// a real Action run, so the TypeScript fallback branch is defense-in-depth rather than the live
+// path — but nothing asserts the two
 // values actually agree. A drift here silently changes every run's behavior for that
 // input while every existing unit test still passes, because those tests exercise the
 // TypeScript fallback directly (mocked core.getInput returning ''), never the YAML value.
 //
-// Every other action.yaml `default:` was checked against inputs.ts and shared/constants.ts
-// (and shared/types.ts for the one non-numeric case): boolean flags (s3-backup, enable-omo,
-// enable-omo-slim, skip-cache, s3-allow-insecure-endpoint) and string flags with an inline
+// Every other action.yaml `default:` was checked against inputs.ts and shared/constants.ts:
+// boolean flags (s3-backup, skip-cache, s3-allow-insecure-endpoint) and string flags with an inline
 // literal fallback (response-mode: 'github', review-skip-label -> null when empty,
 // brokered-push-extra-paths: '') have no backing named constant to drift against, so they
 // are not part of this shape and are intentionally excluded.
 const ACTION_YAML_PATH = join(import.meta.dirname, '..', 'action.yaml')
 const CONSTANTS_PATH = 'src/shared/constants.ts (re-exports @fro-bot/runtime)'
-const TYPES_PATH = 'src/shared/types.ts (re-exports @fro-bot/runtime)'
 
 interface ActionInputSchema {
   readonly default?: unknown
@@ -75,12 +72,6 @@ const DUPLICATED_DEFAULTS: readonly DuplicatedDefault[] = [
     constantName: 'DEFAULT_DEDUP_WINDOW_MS',
     constantSource: CONSTANTS_PATH,
     constantValue: DEFAULT_DEDUP_WINDOW_MS,
-  },
-  {
-    inputName: 'omo-slim-preset',
-    constantName: 'DEFAULT_OMO_SLIM_PRESET',
-    constantSource: TYPES_PATH,
-    constantValue: DEFAULT_OMO_SLIM_PRESET,
   },
 ]
 

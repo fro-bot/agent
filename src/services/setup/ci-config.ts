@@ -1,4 +1,3 @@
-import type {OmoSlimPreset} from '../../shared/types.js'
 import type {Logger} from './types.js'
 import * as path from 'node:path'
 import process from 'node:process'
@@ -9,78 +8,10 @@ import {
   getGitHubRunId,
   RESPONSE_FILE_DIR_SEGMENT,
 } from '@fro-bot/runtime'
-import {DEFAULT_OMO_SLIM_VERSION} from '../../shared/constants.js'
 
 export interface CIConfigResult {
   readonly config: Record<string, unknown>
   readonly error: string | null
-}
-
-/**
- * Known oMo plugin specifier prefixes to strip in disabled mode.
- * Matches bare names and versioned variants (e.g., oh-my-openagent, oh-my-openagent@latest, oh-my-openagent@3.7.4).
- */
-const OMO_PLUGIN_PREFIXES = ['oh-my-openagent']
-
-/**
- * Known OMO Slim plugin specifier prefixes.
- */
-const OMO_SLIM_PLUGIN_PREFIXES = ['oh-my-opencode-slim']
-
-/**
- * R19: Versions of oh-my-opencode-slim that are verified to register the orchestrator agent.
- * Updated deliberately when Renovate bumps the pinned version and the orchestrator is confirmed.
- */
-export const OMO_SLIM_ORCHESTRATOR_VERIFIED_VERSIONS = ['1.1.1']
-
-/**
- * Returns true if the given OMO Slim version is in the R19 verified allowlist.
- */
-export function isOmoSlimVersionVerified(version: string): boolean {
-  return OMO_SLIM_ORCHESTRATOR_VERIFIED_VERSIONS.includes(version)
-}
-
-/**
- * Extract the package prefix from a plugin specifier.
- * Handles scoped packages (@scope/name) and unscoped packages (name).
- */
-export function pluginPrefix(plugin: string): string {
-  const versionSeparator = plugin.lastIndexOf('@')
-  return versionSeparator > 0 ? plugin.slice(0, versionSeparator) : plugin
-}
-
-/**
- * Check whether a plugin specifier matches any known oMo plugin prefix.
- */
-function isOmoPlugin(plugin: string): boolean {
-  const prefix = pluginPrefix(plugin)
-  return OMO_PLUGIN_PREFIXES.includes(prefix)
-}
-
-/**
- * Check whether a plugin specifier matches any known OMO Slim plugin prefix.
- */
-function isOmoSlimPlugin(plugin: string): boolean {
-  const prefix = pluginPrefix(plugin)
-  return OMO_SLIM_PLUGIN_PREFIXES.includes(prefix)
-}
-
-/**
- * Filter oMo plugin entries from a plugin array, returning cleaned array and a flag indicating whether anything was removed.
- */
-function stripOmoPlugins(plugins: unknown[]): {cleaned: unknown[]; removed: boolean} {
-  const removedCount = plugins.filter(p => typeof p === 'string' && isOmoPlugin(p)).length
-  const cleaned = plugins.filter(p => typeof p !== 'string' || !isOmoPlugin(p))
-  return {cleaned, removed: removedCount > 0}
-}
-
-/**
- * Filter OMO Slim plugin entries from a plugin array.
- */
-function stripOmoSlimPlugins(plugins: unknown[]): {cleaned: unknown[]; removed: boolean} {
-  const removedCount = plugins.filter(p => typeof p === 'string' && isOmoSlimPlugin(p)).length
-  const cleaned = plugins.filter(p => typeof p !== 'string' || !isOmoSlimPlugin(p))
-  return {cleaned, removed: removedCount > 0}
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -207,7 +138,7 @@ function scopeExternalDirectoryPermission(
       // attachment subdirectory (`<attachmentDir>/*`) without needing anything deeper. This is
       // ALSO layered onto the top-level, global `permission.external_directory` key by
       // `scopeAttachmentDirectoryPermission` below -- that global grant is what reaches a
-      // dispatched subagent or an oMo/OMO-Slim orchestrator session, neither of which is the
+      // dispatched subagent session, which is not the
       // `build` agent this function scopes. This entry exists because the `build` agent's own
       // permission block (built below) fully re-asserts `external_directory`, which would
       // otherwise shadow the global grant for the `build` agent specifically (its `'*': 'deny'`
@@ -245,15 +176,13 @@ function scopeExternalDirectoryPermission(
 /**
  * Grant the run-scoped reference-file ATTACHMENT directory (`buildAttachmentDir` /
  * `ATTACHMENT_DIR_SEGMENT`, `@fro-bot/runtime`) at the TOP-LEVEL, GLOBAL `permission` key --
- * deliberately NOT `agent.build.permission`, and called unconditionally in every oMo mode
- * (disabled, oMo, OMO Slim), unlike `scopeExternalDirectoryPermission` above (which only
- * runs in disabled mode and only ever reaches the `build` agent).
+ * deliberately NOT `agent.build.permission`. It is called unconditionally, unlike
+ * `scopeExternalDirectoryPermission` above (which only ever reaches the `build` agent).
  *
- * Why the mode-agnostic, global placement is required: subagent dispatch (the `task` tool --
- * the actual trigger for the hang this exists to prevent) only happens through an
- * orchestrator agent, which only exists in oMo / OMO Slim mode. A grant that only reached
- * the `build` agent (as `scopeExternalDirectoryPermission` does) would never reach a
- * dispatched subagent at all in the modes where dispatch actually occurs.
+ * Why the global placement is required: subagent dispatch (the `task` tool -- the actual
+ * trigger for the hang this exists to prevent) starts a session that is not the `build` agent's
+ * own. A grant that only reached the `build` agent (as `scopeExternalDirectoryPermission` does)
+ * would never reach a dispatched subagent at all.
  *
  * Why the global key reaches a dispatched subagent (verified against the pinned tag,
  * `packages/harness/harness.config.json`'s `base_version`, since the vendored clone this
@@ -273,19 +202,16 @@ function scopeExternalDirectoryPermission(
  *    `external_directory` (and deny) rules directly -- not recomputed from the subagent's
  *    own named agent. So once this global grant reaches whichever agent is running the root
  *    session, every subagent it dispatches inherits it too, regardless of which named agent
- *    (e.g. an OMO Slim reviewer/implementer persona) that subagent runs as.
+ *    that subagent runs as.
  *
  * The gap this does NOT close, and cannot close from this project's own config: a
- * plugin-defined agent (e.g. OMO Slim's orchestrator, or one of its own named subagents)
- * that ships its OWN `external_directory` rule for pattern `'*'` in ITS OWN agent-specific
- * config block would have that rule appended AFTER this global grant in THAT agent's own
- * ruleset (mirroring exactly how `agent.build.permission` shadows this same global grant for
- * the `build` agent above, which is why that block re-asserts the attachment pattern
- * itself) -- and would win for that agent's OWN session, before it ever dispatches anything.
- * This project's CI config has no visibility into a plugin's own agent definitions, and this
- * has NOT been verified against the pinned OMO Slim version's actual agent config (out of
- * scope: that package is not vendored in this repo, unlike the OpenCode core clone). What IS
- * verified is the dispatch/inheritance step itself (points 1-3 above): once ANY session
+ * plugin-defined agent that ships its OWN `external_directory` rule for pattern `'*'` in ITS
+ * OWN agent-specific config block would have that rule appended AFTER this global grant in
+ * THAT agent's own ruleset (mirroring exactly how `agent.build.permission` shadows this same
+ * global grant for the `build` agent above, which is why that block re-asserts the attachment
+ * pattern itself) -- and would win for that agent's OWN session, before it ever dispatches
+ * anything. This project's CI config has no visibility into a plugin's own agent definitions.
+ * What IS verified is the dispatch/inheritance step itself (points 1-3 above): once ANY session
  * reaches the point of calling the `task` tool, its child inherits from it directly.
  *
  * Mirrors `scopeExternalDirectoryPermission`'s own fail-safe: when RUNNER_TEMP isn't set
@@ -307,7 +233,7 @@ function scopeAttachmentDirectoryPermission(
   // Run-attempt-scoped, not segment-wide -- see the matching note in
   // `scopeExternalDirectoryPermission` above. This is the GLOBAL grant a dispatched subagent
   // actually inherits, so leaving it segment-wide here is the more exploitable of the two copies:
-  // it is reachable from every mode that dispatches subagents at all.
+  // it is reachable from every session that dispatches subagents at all.
   const attachmentPattern = path.join(
     buildAttachmentDir({runnerTemp: trimmedRunnerTemp, runId: getGitHubRunId(), runAttempt: getGitHubRunAttempt()}),
     '*',
@@ -362,18 +288,10 @@ export function buildCIConfig(
   inputs: {
     opencodeConfig: string | null
     systematicVersion: string
-    enableOmo: boolean
-    enableOmoSlim?: boolean
-    omoSlimVersion?: string
-    omoSlimPreset?: OmoSlimPreset
     integrationWorkDir?: string
   },
   logger: Logger,
 ): CIConfigResult {
-  const enableOmoSlim = inputs.enableOmoSlim ?? false
-  const omoSlimVersion = inputs.omoSlimVersion ?? DEFAULT_OMO_SLIM_VERSION
-  const omoSlimPreset = inputs.omoSlimPreset ?? 'openai'
-
   const ciConfig: Record<string, unknown> = {autoupdate: false}
 
   if (inputs.opencodeConfig != null) {
@@ -390,22 +308,6 @@ export function buildCIConfig(
     Object.assign(ciConfig, parsed)
   }
 
-  // Dual-plugin guard: detect conflict before any mode-specific assembly
-  const rawPluginsForGuard: unknown[] = Array.isArray(ciConfig.plugin) ? (ciConfig.plugin as unknown[]) : []
-  const hasOmoInConfig = rawPluginsForGuard.some(p => typeof p === 'string' && isOmoPlugin(p))
-  const hasOmoSlimInConfig = rawPluginsForGuard.some(p => typeof p === 'string' && isOmoSlimPlugin(p))
-  if (hasOmoInConfig && hasOmoSlimInConfig) {
-    return {config: ciConfig, error: 'oMo and OMO Slim plugins cannot both be present'}
-  }
-
-  // R19: Version-gated allowlist for OMO Slim
-  if (enableOmoSlim && !OMO_SLIM_ORCHESTRATOR_VERIFIED_VERSIONS.includes(omoSlimVersion)) {
-    return {
-      config: ciConfig,
-      error: `OMO Slim version ${omoSlimVersion} is not verified to register the orchestrator agent (known-good: ${OMO_SLIM_ORCHESTRATOR_VERIFIED_VERSIONS.join(', ')})`,
-    }
-  }
-
   const systematicPlugin = `@fro.bot/systematic@${inputs.systematicVersion}`
   const rawPlugins: unknown[] = Array.isArray(ciConfig.plugin) ? (ciConfig.plugin as unknown[]) : []
   const hasSystematic = rawPlugins.some(
@@ -415,7 +317,7 @@ export function buildCIConfig(
     ciConfig.plugin = [...rawPlugins, systematicPlugin]
   }
 
-  // R12: pin subagent_depth to one, unconditionally, across every mode below.
+  // R12: pin subagent_depth to one, unconditionally.
   // Upstream checks depth before execution against real session ancestry
   // (`.slim/clonedeps/repos/anomalyco__opencode/packages/opencode/src/tool/task.ts:104-117`)
   // — a depth value this project supplied would be a guess a client is in no
@@ -453,73 +355,37 @@ export function buildCIConfig(
     )
   }
 
-  // Grant the reference-file attachment directory unconditionally, in every mode -- unlike
-  // `scopeExternalDirectoryPermission` below, which only runs (and only ever reaches the
-  // `build` agent) in disabled mode. See `scopeAttachmentDirectoryPermission`'s doc comment.
+  // Grant the reference-file attachment directory at the global `permission` key, which a dispatched
+  // subagent inherits -- unlike `scopeExternalDirectoryPermission` below, which only ever reaches the
+  // `build` agent. See `scopeAttachmentDirectoryPermission`'s doc comment.
   scopeAttachmentDirectoryPermission(ciConfig, process.env.RUNNER_TEMP, logger)
 
-  if (enableOmoSlim) {
-    // Slim mode: strip OMO plugins, add slim plugin, pin orchestrator
-    const currentPlugins: unknown[] = Array.isArray(ciConfig.plugin) ? (ciConfig.plugin as unknown[]) : []
-    const {cleaned: withoutOmo} = stripOmoPlugins(currentPlugins)
-    const {cleaned: withoutOmoSlim} = stripOmoSlimPlugins(withoutOmo)
-    const slimPlugin = `oh-my-opencode-slim@${omoSlimVersion}`
-    ciConfig.plugin = [...withoutOmoSlim, slimPlugin]
-    // Strip legacy 'plugins' (plural) key — mirrors disabled mode (PR #449 bug)
-    if ('plugins' in ciConfig) {
-      delete ciConfig.plugins
-    }
-    // Pin default_agent to orchestrator unconditionally — load-bearing
-    ciConfig.default_agent = 'orchestrator'
-    // Do NOT call denyBuildExternalDirectoryPermission in slim mode
-    logger.debug('Built CI OpenCode config (slim mode)', {
-      hasUserConfig: inputs.opencodeConfig != null,
-      pluginCount: Array.isArray(ciConfig.plugin) ? ciConfig.plugin.length : 0,
-      preset: omoSlimPreset,
-    })
-  } else if (inputs.enableOmo) {
-    // OMO enabled mode: no modifications beyond systematic plugin injection
-    logger.debug('Built CI OpenCode config', {
-      hasUserConfig: inputs.opencodeConfig != null,
-      pluginCount: Array.isArray(ciConfig.plugin) ? ciConfig.plugin.length : 0,
-    })
-  } else {
-    // Disabled mode: strip oMo plugins, strip legacy plugins key, pin default_agent to build
-    const rewrittenFields: string[] = []
+  const rewrittenFields: string[] = []
 
-    // Strip oMo entries from 'plugin' array
-    const currentPlugins: unknown[] = Array.isArray(ciConfig.plugin) ? (ciConfig.plugin as unknown[]) : []
-    const {cleaned: cleanedPlugins, removed: removedOmo} = stripOmoPlugins(currentPlugins)
-    if (removedOmo) {
-      rewrittenFields.push('plugin')
-      ciConfig.plugin = cleanedPlugins
-    }
-
-    // Strip legacy 'plugins' (plural) key entirely
-    if ('plugins' in ciConfig) {
-      delete ciConfig.plugins
-      rewrittenFields.push('plugins')
-    }
-
-    // Pin default_agent to "build" — overrides any user-provided value
-    const userAgent: unknown = ciConfig.default_agent
-    ciConfig.default_agent = 'build'
-    scopeExternalDirectoryPermission(ciConfig, process.env.RUNNER_TEMP, inputs.integrationWorkDir, logger)
-    if (userAgent != null && userAgent !== 'build') {
-      rewrittenFields.push('default_agent')
-    }
-
-    if (rewrittenFields.length > 0) {
-      logger.warning(
-        `OpenCode config rewritten for disabled oMo mode (enable-omo: false): ${rewrittenFields.join(', ')}. oMo plugin entries are stripped and default_agent is pinned to "build". Set enable-omo: true to use oMo features.`,
-      )
-    }
-
-    logger.debug('Built CI OpenCode config', {
-      hasUserConfig: inputs.opencodeConfig != null,
-      pluginCount: Array.isArray(ciConfig.plugin) ? ciConfig.plugin.length : 0,
-    })
+  // Strip legacy 'plugins' (plural) key entirely
+  if ('plugins' in ciConfig) {
+    delete ciConfig.plugins
+    rewrittenFields.push('plugins')
   }
+
+  // Pin default_agent to "build" — overrides any user-provided value
+  const userAgent: unknown = ciConfig.default_agent
+  ciConfig.default_agent = 'build'
+  scopeExternalDirectoryPermission(ciConfig, process.env.RUNNER_TEMP, inputs.integrationWorkDir, logger)
+  if (userAgent != null && userAgent !== 'build') {
+    rewrittenFields.push('default_agent')
+  }
+
+  if (rewrittenFields.length > 0) {
+    logger.warning(
+      `OpenCode config rewritten: ${rewrittenFields.join(', ')}. The legacy "plugins" key is removed and default_agent is pinned to "build".`,
+    )
+  }
+
+  logger.debug('Built CI OpenCode config', {
+    hasUserConfig: inputs.opencodeConfig != null,
+    pluginCount: Array.isArray(ciConfig.plugin) ? ciConfig.plugin.length : 0,
+  })
 
   return {config: ciConfig, error: null}
 }

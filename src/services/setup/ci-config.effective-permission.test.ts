@@ -108,15 +108,11 @@ afterEach(() => {
 
 describe('effective child permission for the reference-file attachment directory', () => {
   it('a subagent dispatched from an agent with no external_directory override of its own can read the attachment directory (the fix this test pins)', () => {
-    // #given the harness's own generated OMO Slim config -- the mode where subagent dispatch
-    // actually happens
+    // #given the harness's own generated config
     const result = buildCIConfig(
       {
         opencodeConfig: null,
         systematicVersion: '1.0.0',
-        enableOmo: false,
-        enableOmoSlim: true,
-        omoSlimVersion: '1.1.1',
       },
       createMockLogger(),
     )
@@ -147,9 +143,6 @@ describe('effective child permission for the reference-file attachment directory
       {
         opencodeConfig: null,
         systematicVersion: '1.0.0',
-        enableOmo: false,
-        enableOmoSlim: true,
-        omoSlimVersion: '1.1.1',
       },
       createMockLogger(),
     )
@@ -172,9 +165,6 @@ describe('effective child permission for the reference-file attachment directory
       {
         opencodeConfig: null,
         systematicVersion: '1.0.0',
-        enableOmo: false,
-        enableOmoSlim: true,
-        omoSlimVersion: '1.1.1',
       },
       createMockLogger(),
     )
@@ -195,14 +185,11 @@ describe('effective child permission for the reference-file attachment directory
     expect(resolved.action).toBe('deny')
   })
 
-  it('matches the exact same effective-permission mechanism for the build agent (disabled mode) via its own agent-specific block, not the global grant', () => {
-    // #given disabled mode, where `scopeExternalDirectoryPermission` writes a full,
+  it('matches the exact same effective-permission mechanism for the build agent via its own agent-specific block, not the global grant', () => {
+    // #given the build agent, where `scopeExternalDirectoryPermission` writes a full,
     // self-contained override into `agent.build.permission` -- appended AFTER the global grant
     // for the `build` agent specifically
-    const result = buildCIConfig(
-      {opencodeConfig: null, systematicVersion: '1.0.0', enableOmo: false},
-      createMockLogger(),
-    )
+    const result = buildCIConfig({opencodeConfig: null, systematicVersion: '1.0.0'}, createMockLogger())
     const config = result.config as {
       permission?: Record<string, unknown>
       agent: {build: {permission: Record<string, unknown>}}
@@ -242,14 +229,11 @@ describe('effective child permission for the reference-file attachment directory
   })
 
   it("does NOT grant a sibling run-attempt's attachment subdirectory under the same segment -- the disclosure this fix closes", () => {
-    // #given the harness's own generated OMO Slim config for THIS run (RUN_ID/RUN_ATTEMPT)
+    // #given the harness's own generated config for THIS run (RUN_ID/RUN_ATTEMPT)
     const result = buildCIConfig(
       {
         opencodeConfig: null,
         systematicVersion: '1.0.0',
-        enableOmo: false,
-        enableOmoSlim: true,
-        omoSlimVersion: '1.1.1',
       },
       createMockLogger(),
     )
@@ -277,9 +261,6 @@ describe('effective child permission for the reference-file attachment directory
       {
         opencodeConfig: JSON.stringify({permission: {external_directory: {'*': 'allow'}}}),
         systematicVersion: '1.0.0',
-        enableOmo: false,
-        enableOmoSlim: true,
-        omoSlimVersion: '1.1.1',
       },
       createMockLogger(),
     )
