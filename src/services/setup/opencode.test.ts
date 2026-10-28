@@ -15,9 +15,11 @@ import {
   getPlatformInfo,
   installOpenCode,
   isHarnessVersion,
+  isStockV2Pin,
   isV2Version,
   opencodeBinaryPath,
   RECORDED_V2_PIN,
+  resolveStockV2Policy,
   toHarnessReleaseTag,
   toolCacheVersion,
 } from './opencode.js'
@@ -988,7 +990,12 @@ describe('opencode', () => {
         'https://github.com/anomalyco/opencode/releases/download/v2.2.0/SHA256SUMS',
       ])
       expect(toolCache.extractTar).toHaveBeenCalledTimes(1)
-      expect(toolCache.cacheDir).toHaveBeenCalledWith('/tmp/extracted', 'opencode', V2_VERSION, 'x64')
+      expect(toolCache.cacheDir).toHaveBeenCalledWith(
+        '/tmp/extracted',
+        'opencode',
+        `${V2_VERSION}-sha256-${archiveHash.slice(0, 16)}`,
+        'x64',
+      )
     })
 
     it('returns the tool-cache hit without downloading', async () => {
@@ -1113,6 +1120,160 @@ describe('opencode', () => {
       expect(mockLogger.warning).not.toHaveBeenCalled()
     })
 
+    describe('cache identity', () => {
+      const ID = `sha256-${archiveHash.slice(0, 16)}`
+      const BOUND_VERSION = `${V2_VERSION}-${ID}`
+
+      it('looks up and saves the tool cache under a digest-bound version, never the bare version', async () => {
+        // #given a cold cache and a valid release
+        serve({checksums: `${archiveHash}  ${ARCHIVE_FILENAME}\n`})
+        const toolCache = createV2ToolCache()
+
+        // #when
+        await installOpenCode(V2_VERSION, mockLogger, toolCache, createGzipExec(), undefined, recordedPin)
+
+        // #then
+        expect(toolCache.find).toHaveBeenCalledWith('opencode', BOUND_VERSION, 'x64')
+        expect(toolCache.cacheDir).toHaveBeenCalledWith('/tmp/extracted', 'opencode', BOUND_VERSION, 'x64')
+      })
+
+      it('does not reuse a legacy entry cached under the bare version before digests were recorded', async () => {
+        // #given a warm cache that only holds the pre-change entry for 2.2.0
+        serve({checksums: `${archiveHash}  ${ARCHIVE_FILENAME}\n`})
+        const toolCache = createV2ToolCache({
+          find: vi
+            .fn()
+            .mockImplementation((_name: string, version: string) => (version === V2_VERSION ? '/legacy/2.2.0' : '')),
+        })
+
+        // #when
+        const result = await installOpenCode(
+          V2_VERSION,
+          mockLogger,
+          toolCache,
+          createGzipExec(),
+          undefined,
+          recordedPin,
+        )
+
+        // #then it re-downloads and verifies instead of trusting the unverified entry
+        expect(result.cached).toBe(false)
+        expect(result.path).not.toBe('/legacy/2.2.0')
+        expect(toolCache.downloadTool).toHaveBeenCalledTimes(2)
+      })
+
+      it('reuses an entry bound to the recorded digest without downloading', async () => {
+        // #given
+        const toolCache = createV2ToolCache({
+          find: vi
+            .fn()
+            .mockImplementation((_name: string, version: string) => (version === BOUND_VERSION ? '/bound' : '')),
+        })
+
+        // #when
+        const result = await installOpenCode(
+          V2_VERSION,
+          mockLogger,
+          toolCache,
+          createGzipExec(),
+          undefined,
+          recordedPin,
+        )
+
+        // #then
+        expect(result).toEqual({path: '/bound', version: V2_VERSION, cached: true})
+        expect(toolCache.downloadTool).not.toHaveBeenCalled()
+      })
+
+      it('does not reuse an entry bound to a different digest', async () => {
+        // #given a cache entry written for a previous digest of the same version
+        serve({checksums: `${archiveHash}  ${ARCHIVE_FILENAME}\n`})
+        const oldBound = `${V2_VERSION}-sha256-${'0'.repeat(16)}`
+        const toolCache = createV2ToolCache({
+          find: vi
+            .fn()
+            .mockImplementation((_name: string, version: string) => (version === oldBound ? '/old-digest' : '')),
+        })
+
+        // #when
+        const result = await installOpenCode(
+          V2_VERSION,
+          mockLogger,
+          toolCache,
+          createGzipExec(),
+          undefined,
+          recordedPin,
+        )
+
+        // #then
+        expect(result.cached).toBe(false)
+        expect(toolCache.downloadTool).toHaveBeenCalledTimes(2)
+      })
+
+      it('consults no cache when the version is unpinned or the platform has no digest, even if one is warm', async () => {
+        // #given a cache that would return a hit for any lookup
+        const toolCache = createV2ToolCache({find: vi.fn().mockReturnValue('/warm')})
+        const pinWithoutPlatform: V2Pin = {version: V2_VERSION, assets: {'opencode-linux-arm64.tar.gz': archiveHash}}
+
+        // #when/#then
+        await expect(
+          installOpenCode('2.3.0', mockLogger, toolCache, createGzipExec(), undefined, recordedPin),
+        ).rejects.toThrow(/2\.3\.0/)
+        await expect(
+          installOpenCode(V2_VERSION, mockLogger, toolCache, createGzipExec(), undefined, pinWithoutPlatform),
+        ).rejects.toThrow(/no recorded digest/)
+        expect(toolCache.find).not.toHaveBeenCalled()
+      })
+    })
+
+    describe('resolveStockV2Policy', () => {
+      const info: PlatformInfo = {os: 'linux', arch: 'x64', ext: '.tar.gz'}
+
+      it('derives a cache identity from the first 16 hex characters of the recorded digest', () => {
+        expect(resolveStockV2Policy('2.2.0', info, recordedPin)).toEqual({
+          recordedDigest: archiveHash,
+          cacheId: `sha256-${archiveHash.slice(0, 16)}`,
+          cacheVersion: `2.2.0-sha256-${archiveHash.slice(0, 16)}`,
+        })
+      })
+
+      it('normalises a v prefix so both spellings share one identity', () => {
+        expect(resolveStockV2Policy('v2.2.0', info, recordedPin).cacheVersion).toBe(
+          resolveStockV2Policy('2.2.0', info, recordedPin).cacheVersion,
+        )
+      })
+
+      it('changes the identity when the recorded digest changes', () => {
+        const changed: V2Pin = {version: V2_VERSION, assets: {[ARCHIVE_FILENAME]: 'a'.repeat(64)}}
+        expect(resolveStockV2Policy('2.2.0', info, changed).cacheVersion).not.toBe(
+          resolveStockV2Policy('2.2.0', info, recordedPin).cacheVersion,
+        )
+        expect(resolveStockV2Policy('2.2.0', info, changed).cacheId).not.toBe(
+          resolveStockV2Policy('2.2.0', info, recordedPin).cacheId,
+        )
+      })
+
+      it('throws for an unpinned version and for a platform with no digest', () => {
+        expect(() => resolveStockV2Policy('2.3.0', info, recordedPin)).toThrow(/2\.3\.0/)
+        expect(() => resolveStockV2Policy('2.2.0', {...info, arch: 'arm64'}, recordedPin)).toThrow(/no recorded digest/)
+      })
+
+      it('produces a tool-cache version that semver accepts as a prerelease', () => {
+        expect(resolveStockV2Policy('2.2.0', info, recordedPin).cacheVersion).toMatch(
+          /^\d+\.\d+\.\d+-sha256-[0-9a-f]{16}$/,
+        )
+      })
+    })
+
+    describe('isStockV2Pin', () => {
+      it('is true for stock major 2+, false for V1, harness builds and non-versions', () => {
+        expect(isStockV2Pin('2.2.0')).toBe(true)
+        expect(isStockV2Pin('1.19.4')).toBe(false)
+        expect(isStockV2Pin('2.0.0+harness.abc12345')).toBe(false)
+        expect(isStockV2Pin('latest')).toBe(false)
+      })
+    })
+
     it('a V1 pin still takes the V1 path: magic-byte check only, fail-open, fallback retry', async () => {
       // #given a stock 1.x pin whose first download fails and whose `file` command is missing
       let downloads = 0
@@ -1130,6 +1291,9 @@ describe('opencode', () => {
 
       // #then V1 retried with the fallback, never fetched SHA256SUMS, and passed validation without `file`
       expect(result.version).toBe(FALLBACK_VERSION)
+      // and kept the plain, digest-free cache identity
+      expect(toolCache.find).toHaveBeenCalledWith('opencode', '1.17.3', 'x64')
+      expect(toolCache.cacheDir).toHaveBeenCalledWith('/tmp/extracted', 'opencode', FALLBACK_VERSION, 'x64')
       expect(downloadedUrls(toolCache).some(url => url.endsWith('SHA256SUMS'))).toBe(false)
       expect(mockLogger.warning).toHaveBeenCalled()
     })

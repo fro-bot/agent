@@ -33,6 +33,9 @@ export interface V2Pin {
 
 export const RECORDED_V2_PIN: V2Pin = v2PinFile
 
+/** Hex characters of the recorded digest used in V2 cache identities (64 bits: collision-proof for a pin). */
+const V2_CACHE_DIGEST_LENGTH = 16
+
 /**
  * Resolves the OpenCode executable inside an install directory.
  *
@@ -111,7 +114,7 @@ export function isV2Version(version: string): boolean {
  * A stock (anomalyco/opencode) V2 pin. Harness builds keep their own, already fail-closed, path
  * regardless of major.
  */
-function isStockV2Pin(version: string): boolean {
+export function isStockV2Pin(version: string): boolean {
   return isV2Version(version) && !isHarnessVersion(version)
 }
 
@@ -411,21 +414,28 @@ export async function installOpenCode(
 }
 
 /**
- * Install a stock V2 pin. Integrity over availability: the install succeeds only for the version
- * recorded in `v2Pin`, with an archive that matches the recorded digest and the release's
- * SHA256SUMS line, and that `file` recognises as the expected archive type. Every failure throws.
- * There is no FALLBACK_VERSION retry and no check that passes because it could not run.
- *
- * A version or platform with no recorded digest fails before anything is downloaded.
+ * What a stock V2 pin is allowed to install on this platform, and the cache identity that binds any
+ * reusable installation to the recorded digest.
  */
-async function installStockV2(
-  version: string,
-  platformInfo: PlatformInfo,
-  logger: Logger,
-  toolCache: ToolCacheAdapter,
-  execAdapter: ExecAdapter,
-  v2Pin: V2Pin,
-): Promise<OpenCodeInstallResult> {
+export interface StockV2Policy {
+  /** The sha256 recorded for this platform's asset. */
+  readonly recordedDigest: string
+  /** `sha256-<first 16 hex of the digest>`: the digest component of every V2 cache key. */
+  readonly cacheId: string
+  /** `<version>-<cacheId>`: the @actions/tool-cache version. A prerelease, so semver keeps it whole. */
+  readonly cacheVersion: string
+}
+
+/**
+ * Enforce the V2 pin policy: the version must be the recorded one and this platform must have a
+ * recorded digest. Call it BEFORE consulting any cache (the local tool cache or the persistent tools
+ * cache): a cache hit must never be accepted for a version or platform the pin does not cover.
+ *
+ * The returned identity ties every reusable V2 installation to the recorded digest. An entry cached
+ * under the bare version by an earlier release, or under a different digest, can never match it.
+ * V1 and harness pins keep their existing identities; this applies to stock V2 only.
+ */
+export function resolveStockV2Policy(version: string, platformInfo: PlatformInfo, v2Pin: V2Pin): StockV2Policy {
   const bareVersion = version.startsWith('v') ? version.slice(1) : version
   if (bareVersion !== v2Pin.version) {
     throw new Error(
@@ -440,14 +450,41 @@ async function installStockV2(
     throw new Error(`OpenCode ${version} has no recorded digest for ${archiveFilename} in opencode-v2-pin.json`)
   }
 
-  const cachedPath = toolCache.find(TOOL_NAME, toolCacheVersion(version), platformInfo.arch)
+  const cacheId = `sha256-${recordedDigest.slice(0, V2_CACHE_DIGEST_LENGTH).toLowerCase()}`
+  return {recordedDigest, cacheId, cacheVersion: `${bareVersion}-${cacheId}`}
+}
+
+/**
+ * Install a stock V2 pin. Integrity over availability: the install succeeds only for the version
+ * recorded in `v2Pin`, with an archive that matches the recorded digest and the release's
+ * SHA256SUMS line, and that `file` recognises as the expected archive type. Every failure throws.
+ * There is no FALLBACK_VERSION retry and no check that passes because it could not run.
+ *
+ * The pin policy runs first, so a version or platform with no recorded digest fails before any
+ * cache lookup or download. The local tool cache is keyed by the digest-bound version: entries
+ * cached before digests were recorded, or for another digest, are never reused.
+ */
+async function installStockV2(
+  version: string,
+  platformInfo: PlatformInfo,
+  logger: Logger,
+  toolCache: ToolCacheAdapter,
+  execAdapter: ExecAdapter,
+  v2Pin: V2Pin,
+): Promise<OpenCodeInstallResult> {
+  const {recordedDigest, cacheVersion} = resolveStockV2Policy(version, platformInfo, v2Pin)
+
+  const cachedPath = toolCache.find(TOOL_NAME, cacheVersion, platformInfo.arch)
   if (cachedPath.length > 0) {
     logger.info('OpenCode found in cache', {version, path: cachedPath})
     return {path: cachedPath, version, cached: true}
   }
 
   try {
-    return await downloadAndInstall(version, platformInfo, logger, toolCache, execAdapter, recordedDigest)
+    return await downloadAndInstall(version, platformInfo, logger, toolCache, execAdapter, {
+      recordedDigest,
+      cacheVersion,
+    })
   } catch (error) {
     throw new Error(
       `Stock V2 OpenCode download/verify failed for pin "${version}": ${toErrorMessage(error)}. ` +
@@ -462,15 +499,15 @@ async function downloadAndInstall(
   logger: Logger,
   toolCache: ToolCacheAdapter,
   execAdapter: ExecAdapter,
-  v2RecordedDigest?: string,
+  v2Install?: Pick<StockV2Policy, 'recordedDigest' | 'cacheVersion'>,
 ): Promise<OpenCodeInstallResult> {
   logger.info('Downloading OpenCode', {version})
   const downloadUrl = buildDownloadUrl(version, platformInfo)
   const downloadPath = await toolCache.downloadTool(downloadUrl)
 
-  if (v2RecordedDigest !== undefined) {
+  if (v2Install !== undefined) {
     // Stock V2 pin: digest + SHA256SUMS verification, then a magic-byte check that cannot be skipped.
-    await verifyHarnessChecksum(downloadPath, version, platformInfo, toolCache, logger, v2RecordedDigest)
+    await verifyHarnessChecksum(downloadPath, version, platformInfo, toolCache, logger, v2Install.recordedDigest)
     const isValid = await validateDownload(downloadPath, platformInfo.ext, logger, execAdapter, true)
     if (!isValid) {
       throw new Error('Downloaded archive appears corrupted')
@@ -492,7 +529,12 @@ async function downloadAndInstall(
     platformInfo.ext === '.zip' ? await toolCache.extractZip(downloadPath) : await toolCache.extractTar(downloadPath)
 
   logger.info('Caching OpenCode')
-  const toolPath = await toolCache.cacheDir(extractedPath, TOOL_NAME, toolCacheVersion(version), platformInfo.arch)
+  const toolPath = await toolCache.cacheDir(
+    extractedPath,
+    TOOL_NAME,
+    v2Install?.cacheVersion ?? toolCacheVersion(version),
+    platformInfo.arch,
+  )
 
   logger.info('OpenCode installed', {version, path: toolPath})
   return {path: toolPath, version, cached: false}
