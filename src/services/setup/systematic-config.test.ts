@@ -35,7 +35,7 @@ describe('writeSystematicConfig', () => {
 
   it('writes config to systematic.json in configDir', async () => {
     // #given
-    const configJson = JSON.stringify({agents: {default: 'sisyphus'}, mode: 'strict'})
+    const configJson = JSON.stringify({agents: {default: 'build'}, mode: 'strict'})
 
     // #when
     await writeSystematicConfig(configJson, tmpDir, logger)
@@ -43,15 +43,15 @@ describe('writeSystematicConfig', () => {
     // #then
     const filePath = path.join(tmpDir, 'systematic.json')
     const content = await fs.readFile(filePath, 'utf8')
-    expect(JSON.parse(content)).toEqual({agents: {default: 'sisyphus'}, mode: 'strict'})
+    expect(JSON.parse(content)).toEqual({agents: {default: 'build'}, mode: 'strict'})
   })
 
   it('deep-merges with existing config, user values win', async () => {
     // #given
-    const existingConfig = {mode: 'permissive', agents: {default: 'oracle', fallback: 'hephaestus'}}
+    const existingConfig = {mode: 'permissive', agents: {default: 'oracle', fallback: 'plan'}}
     const filePath = path.join(tmpDir, 'systematic.json')
     await fs.writeFile(filePath, JSON.stringify(existingConfig))
-    const userConfig = JSON.stringify({mode: 'strict', agents: {default: 'sisyphus'}})
+    const userConfig = JSON.stringify({mode: 'strict', agents: {default: 'build'}})
 
     // #when
     await writeSystematicConfig(userConfig, tmpDir, logger)
@@ -60,7 +60,7 @@ describe('writeSystematicConfig', () => {
     const content = await fs.readFile(filePath, 'utf8')
     expect(JSON.parse(content)).toEqual({
       mode: 'strict',
-      agents: {default: 'sisyphus', fallback: 'hephaestus'},
+      agents: {default: 'build', fallback: 'plan'},
     })
   })
 

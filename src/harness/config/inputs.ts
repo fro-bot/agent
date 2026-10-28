@@ -1,13 +1,6 @@
 import type {Result} from '@bfra.me/es/result'
 import type {ObjectStoreConfig} from '@fro-bot/runtime'
-import type {
-  ActionInputs,
-  ModelConfig,
-  OmoProviders,
-  OmoSlimPreset,
-  OutputMode,
-  ResponseMode,
-} from '../../shared/types.js'
+import type {ActionInputs, ModelConfig, OutputMode, ResponseMode} from '../../shared/types.js'
 import process from 'node:process'
 import * as core from '@actions/core'
 import * as github from '@actions/github'
@@ -15,20 +8,14 @@ import {parseObjectStoreSettings} from '@fro-bot/runtime'
 import {parseBrokeredPushExtraPaths} from '../../shared/brokered-push-paths.js'
 import {
   DEFAULT_DEDUP_WINDOW_MS,
-  DEFAULT_OMO_PROVIDERS,
-  DEFAULT_OMO_VERSION,
   DEFAULT_OPENCODE_VERSION,
   DEFAULT_SERVER_BOOTSTRAP_TIMEOUT_MS,
   DEFAULT_SESSION_RETENTION,
   DEFAULT_SYSTEMATIC_VERSION,
   DEFAULT_TIMEOUT_MS,
-  OMO_PROVIDERS_DISABLED,
 } from '../../shared/constants.js'
-import {DEFAULT_OMO_SLIM_PRESET, err, ok, VALID_OMO_SLIM_PRESETS} from '../../shared/types.js'
+import {err, ok} from '../../shared/types.js'
 import {validateJsonString, validatePositiveInteger} from '../../shared/validation.js'
-
-// Known oMo-provided agent names for migration warnings
-const KNOWN_OMO_AGENTS = new Set(['sisyphus', 'hephaestus', 'oracle', 'librarian', 'prometheus', 'explore'])
 
 /**
  * Parse model input string in "provider/model" format.
@@ -75,17 +62,6 @@ function parseTimeoutMs(value: string, inputName = 'timeout'): number {
   return parsed
 }
 
-const VALID_OMO_PROVIDERS = [
-  'claude',
-  'claude-max20',
-  'copilot',
-  'gemini',
-  'openai',
-  'opencode-zen',
-  'zai-coding-plan',
-  'kimi-for-coding',
-] as const
-
 const VALID_OUTPUT_MODES = ['auto', 'working-dir', 'branch-pr'] as const
 const VALID_RESPONSE_MODES = ['github', 'none'] as const
 
@@ -95,73 +71,6 @@ const VALID_RESPONSE_MODES = ['github', 'none'] as const
 // input exists for. 120000ms gives generous headroom over the 5000ms SDK default for a
 // contended runner while still failing well inside any realistic job timeout.
 const MAX_SERVER_BOOTSTRAP_TIMEOUT_MS = 120_000
-
-function parseOmoSlimPreset(input: string): OmoSlimPreset {
-  if (!VALID_OMO_SLIM_PRESETS.includes(input as OmoSlimPreset)) {
-    throw new Error(`Invalid omo-slim-preset value: "${input}". Valid values: ${VALID_OMO_SLIM_PRESETS.join(', ')}`)
-  }
-  return input as OmoSlimPreset
-}
-
-type OmoProviderInput = (typeof VALID_OMO_PROVIDERS)[number]
-
-function parseOmoProviders(input: string): OmoProviders {
-  const providers = input
-    .split(',')
-    .map(p => p.trim().toLowerCase())
-    .filter(p => p.length > 0)
-
-  let claude: 'no' | 'yes' | 'max20' = 'no'
-  let copilot: 'no' | 'yes' = 'no'
-  let gemini: 'no' | 'yes' = 'no'
-  let openai: 'no' | 'yes' = 'no'
-  let opencodeZen: 'no' | 'yes' = 'no'
-  let zaiCodingPlan: 'no' | 'yes' = 'no'
-  let kimiForCoding: 'no' | 'yes' = 'no'
-
-  for (const provider of providers) {
-    if (!VALID_OMO_PROVIDERS.includes(provider as OmoProviderInput)) {
-      throw new Error(`Invalid omo-providers value: "${provider}". Valid values: ${VALID_OMO_PROVIDERS.join(', ')}`)
-    }
-
-    switch (provider) {
-      case 'claude':
-        claude = 'yes'
-        break
-      case 'claude-max20':
-        claude = 'max20'
-        break
-      case 'copilot':
-        copilot = 'yes'
-        break
-      case 'gemini':
-        gemini = 'yes'
-        break
-      case 'openai':
-        openai = 'yes'
-        break
-      case 'opencode-zen':
-        opencodeZen = 'yes'
-        break
-      case 'zai-coding-plan':
-        zaiCodingPlan = 'yes'
-        break
-      case 'kimi-for-coding':
-        kimiForCoding = 'yes'
-        break
-    }
-  }
-
-  return {
-    claude,
-    copilot,
-    gemini,
-    openai,
-    opencodeZen,
-    zaiCodingPlan,
-    kimiForCoding,
-  }
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
@@ -295,18 +204,6 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     }
 
     // RFC-013: SDK execution configuration
-    const enableOmoRaw = core.getInput('enable-omo').trim().toLowerCase()
-    const enableOmo = enableOmoRaw === 'true'
-
-    const enableOmoSlimRaw = core.getInput('enable-omo-slim').trim().toLowerCase()
-    const enableOmoSlim = enableOmoSlimRaw === 'true'
-
-    // oMo and OMO Slim both own the OpenCode plugin/agent surface — running both
-    // is undefined. Fail fast rather than silently picking one.
-    if (enableOmo && enableOmoSlim) {
-      throw new Error('enable-omo and enable-omo-slim are mutually exclusive. Enable only one orchestration plugin.')
-    }
-
     const agentRaw = core.getInput('agent').trim()
     const agent = agentRaw.length > 0 ? agentRaw : null
 
@@ -335,21 +232,8 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     const skipCacheRaw = core.getInput('skip-cache').trim().toLowerCase()
     const skipCache = skipCacheRaw === 'true'
 
-    const omoVersionRaw = core.getInput('omo-version').trim()
-    const omoVersion = omoVersionRaw.length > 0 ? omoVersionRaw : DEFAULT_OMO_VERSION
-
     const systematicVersionRaw = core.getInput('systematic-version').trim()
     const systematicVersion = systematicVersionRaw.length > 0 ? systematicVersionRaw : DEFAULT_SYSTEMATIC_VERSION
-
-    const omoProvidersRaw = core.getInput('omo-providers').trim()
-    const omoProviders = enableOmo
-      ? parseOmoProviders(omoProvidersRaw.length > 0 ? omoProvidersRaw : DEFAULT_OMO_PROVIDERS)
-      : OMO_PROVIDERS_DISABLED
-
-    // Preset always validated when provided so an invalid value never reaches the
-    // installer argv; defaults to 'openai' when omo-slim is enabled without one.
-    const omoSlimPresetRaw = core.getInput('omo-slim-preset').trim()
-    const omoSlimPreset = omoSlimPresetRaw.length > 0 ? parseOmoSlimPreset(omoSlimPresetRaw) : DEFAULT_OMO_SLIM_PRESET
 
     const opencodeConfigRaw = core.getInput('opencode-config').trim()
     const opencodeConfig = opencodeConfigRaw.length > 0 ? opencodeConfigRaw : null
@@ -375,29 +259,6 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
       }
     }
 
-    // Disabled-mode warnings
-    if (!enableOmo) {
-      const ignoredInputs: string[] = []
-      if (omoProvidersRaw.length > 0) {
-        ignoredInputs.push('omo-providers')
-      }
-      if (omoVersionRaw.length > 0 && omoVersionRaw !== DEFAULT_OMO_VERSION) {
-        ignoredInputs.push('omo-version')
-      }
-      if (ignoredInputs.length > 0) {
-        core.warning(
-          `oMo is disabled (enable-omo: false). The following inputs are ignored: ${ignoredInputs.join(', ')}. Set enable-omo: true to use oMo features.`,
-        )
-      }
-
-      // Agent migration warning for known oMo-provided agents
-      if (agent != null && KNOWN_OMO_AGENTS.has(agent.toLowerCase())) {
-        core.warning(
-          `Agent "${agent}" is a known oMo-provided agent but oMo is disabled (enable-omo: false). Set enable-omo: true to use oMo agents, or configure "${agent}" via your OpenCode config.`,
-        )
-      }
-    }
-
     return ok({
       githubToken,
       authJson,
@@ -411,14 +272,9 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
       model,
       timeoutMs,
       serverBootstrapTimeoutMs,
-      enableOmo,
-      enableOmoSlim,
       opencodeVersion,
       skipCache,
-      omoVersion,
       systematicVersion,
-      omoProviders,
-      omoSlimPreset,
       opencodeConfig,
       systematicConfig,
       dedupWindow,

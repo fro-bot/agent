@@ -1,6 +1,5 @@
 import type {CredentialDisposition} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
-import type {OmoSlimPreset} from '../../shared/types.js'
 import type {EnsureOpenCodeResult} from './types.js'
 import {
   bootstrapOpenCodeServer as bootstrapRuntimeOpenCodeServer,
@@ -54,23 +53,9 @@ export async function ensureOpenCodeAvailable(options: {
   readonly opencodeVersion: string
   readonly githubToken: string
   readonly authJson: string
-  readonly enableOmo: boolean
-  readonly omoVersion: string
   readonly systematicVersion: string
-  readonly omoProviders: {
-    readonly claude: 'no' | 'yes' | 'max20'
-    readonly copilot: 'no' | 'yes'
-    readonly gemini: 'no' | 'yes'
-    readonly openai: 'no' | 'yes'
-    readonly opencodeZen: 'no' | 'yes'
-    readonly zaiCodingPlan: 'no' | 'yes'
-    readonly kimiForCoding: 'no' | 'yes'
-  }
   readonly opencodeConfig: string | null
   readonly systematicConfig: string | null
-  readonly enableOmoSlim: boolean
-  readonly omoSlimVersion: string
-  readonly omoSlimPreset: OmoSlimPreset
   readonly credential: CredentialDisposition
 }): Promise<EnsureOpenCodeResult> {
   return ensureRuntimeOpenCodeAvailable(options, runtimeSetupAdapter)

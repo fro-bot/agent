@@ -180,7 +180,8 @@ export function isAgentNotFoundError(error: unknown): boolean {
 export function createAgentError(message: string, agent?: string): ErrorInfo {
   return createErrorInfo('configuration', `Agent error: ${message}`, false, {
     details: agent == null ? undefined : `Requested agent: ${agent}`,
-    suggestedAction: 'Verify the agent name is correct and the required plugins (e.g., oMo) are installed.',
+    suggestedAction:
+      'Verify the agent name is correct and the agent is defined in your OpenCode config or provided by a plugin you configured.',
   })
 }
 

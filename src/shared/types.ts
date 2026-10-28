@@ -1,12 +1,4 @@
-export {
-  ALLOWED_ASSOCIATIONS,
-  DEFAULT_OMO_SLIM_PRESET,
-  err,
-  isErr,
-  isOk,
-  ok,
-  VALID_OMO_SLIM_PRESETS,
-} from '@fro-bot/runtime'
+export {ALLOWED_ASSOCIATIONS, err, isErr, isOk, ok} from '@fro-bot/runtime'
 
 export type {
   ActionInputs,
@@ -18,8 +10,6 @@ export type {
   ModelConfig,
   ObjectStoreConfig,
   Ok,
-  OmoProviders,
-  OmoSlimPreset,
   OutputMode,
   ParseResult,
   PruningConfig,

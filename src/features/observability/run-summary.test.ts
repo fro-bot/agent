@@ -41,7 +41,7 @@ function createMockOptions(overrides: Partial<CommentSummaryOptions> = {}): Comm
     runId: 12345,
     runUrl: 'https://github.com/owner/repo/actions/runs/12345',
     metrics: createMockMetrics(),
-    agent: 'sisyphus',
+    agent: 'build',
     resolvedOutputMode: resolvedOutputMode ?? null,
     deliveryKind: 'none',
     ...restOverrides,
@@ -156,7 +156,7 @@ describe('generateCommentSummary', () => {
     expect(summary).toContain('owner/repo')
     expect(summary).toContain('main')
     expect(summary).toContain('12345')
-    expect(summary).toContain('sisyphus')
+    expect(summary).toContain('build')
     expect(summary).toContain('✅ hit')
   })
 

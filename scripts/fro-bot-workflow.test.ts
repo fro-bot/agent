@@ -598,12 +598,7 @@ describe('harness integration workflow wiring', () => {
     expect(jobNames).toEqual(['integrate'])
     expect(job.permissions).toEqual({'id-token': 'write', contents: 'read'})
     expect((inputs['base-version'] as Record<string, unknown>).required).toBe(true)
-    expect(Object.keys(secrets).sort()).toEqual([
-      'APPLICATION_ID',
-      'APPLICATION_PRIVATE_KEY',
-      'OMO_PROVIDERS',
-      'OPENCODE_CONFIG',
-    ])
+    expect(Object.keys(secrets).sort()).toEqual(['APPLICATION_ID', 'APPLICATION_PRIVATE_KEY', 'OPENCODE_CONFIG'])
     expect(JSON.stringify(workflow)).not.toContain('secrets: inherit')
   })
 

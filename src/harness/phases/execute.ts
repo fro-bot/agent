@@ -361,7 +361,6 @@ export async function runExecute(
       agent: bootstrap.inputs.agent,
       model: bootstrap.inputs.model,
       timeoutMs: bootstrap.inputs.timeoutMs,
-      omoProviders: bootstrap.inputs.omoProviders,
       continueSessionId: sessionPrep.continueSessionId ?? undefined,
       sessionTitle: sessionPrep.sessionTitle ?? undefined,
       credentialProvisioned:

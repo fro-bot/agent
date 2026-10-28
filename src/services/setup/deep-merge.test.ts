@@ -1,5 +1,5 @@
 import {describe, expect, it} from 'vitest'
-import {deepMerge} from './omo-config.js'
+import {deepMerge} from './deep-merge.js'
 
 describe('deepMerge', () => {
   it('merges top-level keys from both objects', () => {
