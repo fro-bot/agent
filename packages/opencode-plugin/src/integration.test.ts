@@ -1,13 +1,6 @@
 /**
- * Loads the BUILT plugin into a real stock OpenCode v2.2.0 binary.
- *
- * Skipped unless both of these hold, so the default test run needs neither a download nor a build:
- * - `FRO_BOT_OPENCODE_V2_BIN` points at a v2.2.0 `opencode` executable, and
- * - `dist/index.mjs` exists (`bun run --filter @fro.bot/opencode-plugin build`).
- *
- * To run it locally, fetch the release asset for your platform, verify it against the release's `SHA256SUMS` (v2.2.0
- * `opencode-darwin-arm64.zip` is `c71b1cd96541539ad38e2a75377d2f43d2a27567289a14371a182e9a0800db3d`), unpack it into a
- * temp directory, and set the variable. Delete the download afterwards.
+ * Loads the built plugin into a real OpenCode V2 binary. Skipped unless `FRO_BOT_OPENCODE_V2_BIN` points at one and
+ * `dist/index.mjs` exists.
  */
 
 import type {FakeProvider, RunningServer, SandboxPaths} from './integration.fixture.js'
@@ -50,7 +43,7 @@ function dataOf(response: {readonly data: unknown}): unknown {
   return typeof response.data === 'object' && response.data !== null ? Reflect.get(response.data, 'data') : undefined
 }
 
-describe.skipIf(!runnable)('built plugin in a real opencode v2.2.0', () => {
+describe.skipIf(!runnable)('built plugin in a real opencode V2', () => {
   let provider: FakeProvider
   let server: RunningServer
   let sandbox: SandboxPaths

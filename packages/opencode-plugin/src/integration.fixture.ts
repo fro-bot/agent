@@ -1,9 +1,4 @@
-/**
- * Harness for `integration.test.ts`: a scripted OpenAI-compatible provider and a real `opencode serve --stdio` process.
- *
- * Modelled on the one-off v2.2.0 probe harness (fro-bot/agent#1805, unit 1): isolated HOME and XDG dirs, a random
- * per-spawn password, a held stdin pipe, and a process-group kill. Nothing here touches the real home directory.
- */
+/** Harness for `integration.test.ts`: a scripted OpenAI-compatible provider and a real `opencode serve --stdio` process. */
 
 import {Buffer} from 'node:buffer'
 import {spawn} from 'node:child_process'
@@ -82,8 +77,7 @@ export async function startFakeProvider(): Promise<FakeProvider> {
       const toolNames = (parsed.tools ?? []).flatMap(tool => (tool.function?.name == null ? [] : [tool.function.name]))
       requests.push({body, toolNames, messages: parsed.messages ?? []})
 
-      // Requests with no tools offered are title or summary generation; they only ever get the default reply, so they
-      // cannot steal a step meant for the agent loop.
+      // Requests with no tools are title or summary generation; they get the default reply.
       const index =
         toolNames.length === 0
           ? -1

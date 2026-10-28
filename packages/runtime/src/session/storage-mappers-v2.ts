@@ -1,10 +1,4 @@
-/**
- * V2 sibling of `storage-mappers.ts`: parse raw V2 session payloads into the projected `SessionInfoV2`.
- *
- * Parse, don't validate: every mapper takes `unknown`, returns `null` for anything that is not the shape it expects, and
- * never throws. The plugin context returns bare payloads while the HTTP client wraps most of them in `{data}`, so each
- * mapper unwraps first and accepts both.
- */
+/** V2 sibling of `storage-mappers.ts`: parse raw V2 session payloads; every mapper takes `unknown` and never throws. */
 
 import type {SessionInfoV2} from './types-v2.js'
 

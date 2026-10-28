@@ -59,10 +59,7 @@ export const DEFAULT_MODEL = {
 export const DEFAULT_OPENCODE_VERSION = '1.19.4+harness.5bde2635'
 export const DEFAULT_SYSTEMATIC_VERSION = '3.26.4'
 
-// The fro-bot OpenCode V2 plugin (packages/opencode-plugin). The surfaces install the package and then require this id
-// to be listed `active` by `GET /api/plugin` (a plugin that fails to load is skipped while the server stays up). The id
-// is duplicated in the package itself, which cannot import runtime; its tests assert the two stay equal. No version is
-// pinned here yet: the pin is added alongside the first publish, set the same way as DEFAULT_SYSTEMATIC_VERSION.
+// The fro-bot OpenCode V2 plugin (packages/opencode-plugin); the package duplicates the id and a test keeps them equal.
 export const FRO_BOT_PLUGIN_PACKAGE = '@fro.bot/opencode-plugin'
 export const FRO_BOT_PLUGIN_ID = 'fro-bot.opencode-plugin'
 

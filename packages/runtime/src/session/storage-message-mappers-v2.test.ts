@@ -2,7 +2,7 @@ import {describe, expect, it} from 'vitest'
 
 import {latestTodosV2, mapMessagesV2} from './storage-message-mappers-v2.js'
 
-// Shapes captured from a real v2.2.0 `ctx.session.context` call, then extended with the variants the schema allows.
+// Message payloads as `ctx.session.context` returns them, plus the variants the schema allows.
 const user = {id: 'msg_1', time: {created: 1000}, text: 'hello there', type: 'user'}
 const assistantText = {
   id: 'msg_2',

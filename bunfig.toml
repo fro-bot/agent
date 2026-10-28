@@ -17,9 +17,7 @@ minimumReleaseAge = 259200
 # this repo. The age gate buys a cooling-off period against a compromised upstream
 # publish; it has nothing to buy here, and it blocks Renovate's own update PRs from
 # installing for three days. Bun matches these exactly — no glob support.
-# `@opencode/*` is the OpenCode V2 plugin API (first-party upstream, published in lockstep). `@opencode/plugin` pulls in
-# the other five as hard dependencies, so the exemption names every package of the pinned build rather than a glob. The
-# array stays JSON-compatible (scripts/bfra-me-exemption-guard.test.ts parses it), so these notes live up here.
+# `@opencode/*`: the OpenCode V2 plugin API, named exactly (no globs) including the packages `@opencode/plugin` pulls in.
 minimumReleaseAgeExcludes = [
   "@bfra.me/es",
   "@bfra.me/eslint-config",

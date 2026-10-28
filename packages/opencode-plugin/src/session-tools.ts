@@ -1,20 +1,10 @@
 /**
- * The four session tools, `session_list`, `session_read`, `session_search` and `session_info`, rebuilt on the V2
- * session API.
+ * The session tools `session_list`, `session_read`, `session_search` and `session_info` on the V2 session API.
  *
- * Port of `packages/runtime/src/agent/session-tools.ts` (V1). The contract with the model is unchanged: tool names,
- * parameter names and string-shaped output. What changed underneath:
- * - the client is a `SessionClientV2` (the plugin passes `ctx.session`), not an HTTP client with a base URL from the
- *   environment, so there is no `FRO_BOT_OPENCODE_URL` and no credential to carry;
- * - V2 has no message-list or todo endpoint in the plugin context. Transcripts and search read the session's active
- *   context window (messages since the last compaction, with the compaction summary standing in for older ones), and
- *   todos are the list the last `todowrite` call in that window set.
+ * Transcripts and search read the session's active context window (messages since the last compaction, with its summary
+ * standing in for older ones); todos are the list the last `todowrite` call in that window set.
  *
- * Constraints (do not relax):
- * - No import-time I/O. Everything happens inside `run()`.
- * - `run()` never throws. Every failure returns `session store unavailable: <reason>`; a session-tool failure must
- *   never fail the run.
- * - Output reasons are one line and length-capped: they are model-visible.
+ * `run()` never throws: every failure returns `session store unavailable: <reason>`, one line and length-capped.
  */
 
 import type {MessageV2, SessionClientV2, SessionInfoV2} from '@fro-bot/runtime/session-v2'
@@ -41,7 +31,7 @@ export const SESSION_TOOL_NAMES = {
   info: 'session_info',
 } as const
 
-/** No-op logger: the plugin runs inside the OpenCode server process, which gives plugins no logging channel. */
+/** No-op logger: plugins have no logging channel. */
 const silentLogger = {
   debug: (): void => {},
   info: (): void => {},
@@ -259,8 +249,7 @@ export function createSessionTools(options: {
         if (asBoolean(args.include_transcript) === true) {
           const messages = await getSessionMessagesV2(client, sessionId, logger)
           if (!messages.success) return unavailable(describeFailure(messages.error))
-          // Deliberately oldest-first: chronological reading order. A bounded transcript (limit set) returns the
-          // earliest N messages, not the most recent: callers wanting recent context should omit limit.
+          // Oldest-first; a limit returns the earliest N messages.
           const limit = normalizeLimit(asNumber(args.limit))
           const sliced = limit == null ? messages.data : messages.data.slice(0, limit)
           lines.push('', 'Transcript:')
@@ -294,7 +283,7 @@ export function createSessionTools(options: {
           if (found.data == null) return `session not found: ${scopedSessionId}`
         }
 
-        // Intentionally no project_path arg here: search always scopes to the current workspace, unlike `list`.
+        // Search always scopes to the current workspace; there is no project_path.
         const results = await searchSessionsV2(
           query,
           client,

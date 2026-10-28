@@ -1,12 +1,4 @@
-/**
- * V2 sibling of `storage-message-mappers.ts`: flatten V2 session messages into `MessageV2`.
- *
- * Source of truth for the shapes is `packages/schema/src/session-message.ts` in anomalyco/opencode@v2.2.0
- * (`User`, `Synthetic`, `Assistant`, `Compaction*`), confirmed against a real server's `ctx.session.context` output.
- * Records of any other type (agent/model/location switches, system, skill, shell, idle) are not conversation and are
- * dropped. Like the session mappers, these take `unknown`, never throw, and return `null` only when the payload is not
- * list-shaped.
- */
+/** V2 sibling of `storage-message-mappers.ts`: flatten V2 session messages (user, synthetic, assistant, compaction). */
 
 import type {MessageV2, PartV2, TodoItemV2} from './types-v2.js'
 

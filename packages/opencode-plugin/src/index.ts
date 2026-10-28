@@ -1,12 +1,4 @@
-/**
- * `@fro.bot/opencode-plugin`: Fro Bot's OpenCode V2 plugin.
- *
- * - the session tools (`session_list`, `session_read`, `session_search`, `session_info`), and
- * - the subagent session-reuse guard (`execute.before` on `subagent` + `sessionID`).
- *
- * `effect` and `@opencode/plugin` are provided by the host at load time and must stay external in the bundle
- * (`tsdown.config.ts`). The public surface is the default export and the id; everything else is internal.
- */
+/** `@fro.bot/opencode-plugin`: the session tools and the subagent session-reuse guard. */
 
 import {Plugin} from '@opencode/plugin'
 import {FRO_BOT_PLUGIN_ID} from './plugin-id.js'

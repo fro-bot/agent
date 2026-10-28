@@ -57,7 +57,7 @@ function fakeHost() {
 describe('plugin identity', () => {
   it('has a stable, explicit id and a setup function', () => {
     // #given the default export the host loads
-    // #when / #then a plugin without a valid id/setup is skipped silently and shows up with no id (probe P13)
+    // #when / #then
     expect(FRO_BOT_PLUGIN_ID).toBe('fro-bot.opencode-plugin')
     expect(plugin.id).toBe(FRO_BOT_PLUGIN_ID)
     expect(typeof plugin.setup).toBe('function')

@@ -2,7 +2,7 @@ import {describe, expect, it, vi} from 'vitest'
 
 import {createPluginSessionClient, isSessionNotFound} from './session-client.js'
 
-// Failure shapes captured from a real v2.2.0 server through `ctx.session.get`.
+// Failure shapes as `ctx.session.get` rejects with them.
 const notFound = Object.assign(new Error('placeholder'), {
   message: '',
   _tag: 'Session.NotFoundError',

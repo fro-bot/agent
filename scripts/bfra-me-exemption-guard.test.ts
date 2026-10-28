@@ -47,10 +47,7 @@ function isBfraMePackage(name: string): boolean {
   return /^@bfra\.me\/[^/]+$/.test(name)
 }
 
-// The OpenCode V2 plugin API (`@opencode/plugin` and the `@opencode/*` packages it depends on) is the one other scope
-// allowed to skip the age gate: upstream's own build, published in lockstep. Only a bare `@opencode/<name>` entry
-// qualifies, so a version pin, a nested path or a look-alike scope is still rejected. These are exemptions only; nothing
-// requires a dependency to appear here, because the packages arrive transitively.
+// Only a bare `@opencode/<name>` (the OpenCode V2 plugin API) may also skip the age gate; versions, paths and look-alikes fail.
 function isOpenCodePackage(name: string): boolean {
   return /^@opencode\/[^/@]+$/.test(name)
 }

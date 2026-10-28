@@ -2,7 +2,7 @@ import {describe, expect, it} from 'vitest'
 
 import {mapSessionInfoV2, mapSessionPageV2} from './storage-mappers-v2.js'
 
-// Shape captured from a real v2.2.0 server (`ctx.session.list` / `.get` inside a loaded plugin).
+// Session payload as `ctx.session.list` / `.get` return it.
 const rawSession = {
   id: 'ses_e7c3de9a1ffergLi0Cw6pu106S',
   projectID: '9478f66770974ac2776a01decd9114287946f8b4',

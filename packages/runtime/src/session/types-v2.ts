@@ -1,10 +1,4 @@
-/**
- * V2 session model, projected down to what the session tools read.
- *
- * V2 has no `{info, parts[]}` message shape: a message is one tagged record, and an assistant message carries its
- * content inline. `storage-message-mappers-v2.ts` flattens that into searchable text parts so search, transcript
- * rendering and todo extraction work on one small type instead of the upstream union.
- */
+/** V2 session model, projected down to what the session tools read. */
 
 export interface SessionInfoV2 {
   readonly id: string
@@ -34,7 +28,7 @@ export interface TodoItemV2 {
 
 export interface MessageV2 {
   readonly id: string
-  /** Synthetic and compaction messages are folded into these two; the rest of the V2 union is not conversation. */
+  /** Synthetic messages count as user, compaction summaries as assistant. */
   readonly role: 'user' | 'assistant'
   readonly agent?: string
   readonly createdAt: number

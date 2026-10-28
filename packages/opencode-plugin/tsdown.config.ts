@@ -5,14 +5,8 @@ import {defineConfig} from 'tsdown'
 
 const dirname = path.dirname(fileURLToPath(import.meta.url))
 
-// The entry is absolute on purpose: with `rootDir: ../../` in tsconfig.json a relative `src/index.ts` resolves against
-// the repo root and silently bundles the Action's `src/index.ts` instead (the same trap packages/gateway guards
-// against).
-//
-// `effect` and `@opencode/plugin` are provided by the OpenCode host at load time (packages/plugin/README.md,
-// "Packaging And Runtime effect"): the host swaps every import of either for its own module instance, so a bundled copy
-// would be a second, unshared one. Keep both external. Everything else, including the private `@fro-bot/runtime`
-// session code, is inlined, because that package is not published.
+// The entry is absolute: with `rootDir: ../../` a relative `src/index.ts` would bundle the Action's entry instead.
+// `effect` and `@opencode/plugin` come from the host at load time and stay external; `@fro-bot/runtime` is inlined.
 export default defineConfig({
   entry: [path.join(dirname, 'src/index.ts')],
   format: 'esm',

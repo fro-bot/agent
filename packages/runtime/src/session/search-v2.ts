@@ -1,12 +1,4 @@
-/**
- * V2 sibling of `search.ts`: listing, content search and per-session summaries over a `SessionClientV2`.
- *
- * The search semantics are the V1 ones (substring match over text, reasoning and completed tool output, with a 50
- * character excerpt window), re-pointed at the flattened V2 message model. Two deliberate differences:
- * - listing returns `SessionInfoV2` and does not read every session's messages for counts nobody displays (V1 did);
- * - a content search reads at most `SEARCH_MAX_SESSIONS` sessions, most recently updated first, so one tool call has a
- *   bounded cost.
- */
+/** V2 sibling of `search.ts`: listing, content search (reads at most `SEARCH_MAX_SESSIONS` sessions) and summaries. */
 
 import type {Result} from '@bfra.me/es/result'
 import type {Logger} from '../shared/logger.js'
@@ -35,8 +27,7 @@ export async function listSessionsV2(
   const listed = await listSessionsForDirectoryV2(client, directory, logger)
   if (!listed.success) return listed
 
-  // The query already asks the server for roots and unarchived sessions; filter again so a server that ignores either
-  // filter cannot leak children or archived sessions into the tool output.
+  // Filter again in case the server ignores the root and unarchived query filters.
   const filtered = listed.data.filter(session => {
     if (session.parentID != null || session.time.archived != null) return false
     if (fromDate != null && session.time.created < fromDate.getTime()) return false

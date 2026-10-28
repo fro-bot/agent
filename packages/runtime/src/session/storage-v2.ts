@@ -1,9 +1,4 @@
-/**
- * V2 sibling of `storage.ts`: reads against a `SessionClientV2`.
- *
- * V1 turned every failure into an empty result plus a warning, which made an outage look like "no sessions". These
- * return a `Result` instead, so the caller can say the store is unavailable and only treat `ok(null)` as "not found".
- */
+/** V2 sibling of `storage.ts`: reads against a `SessionClientV2`, returning a `Result` so an outage is not "no sessions". */
 
 import type {Result} from '@bfra.me/es/result'
 import type {Logger} from '../shared/logger.js'
@@ -20,12 +15,7 @@ const SESSION_LIST_PAGE_SIZE = 100
 /** Upper bound on pages followed per listing: 10 pages of 100 sessions. */
 export const SESSION_LIST_MAX_PAGES = 10
 
-/**
- * Lists the root, unarchived sessions created in `directory`, newest first, following cursors up to a bound.
- *
- * `directory` is matched as an exact string against the directory the session was created with, so pass the same
- * spelling the run used (a symlinked path will not match its realpath).
- */
+/** Lists root, unarchived sessions created in `directory` (exact string match), newest first, up to a page bound. */
 export async function listSessionsForDirectoryV2(
   client: SessionClientV2,
   directory: string,
@@ -52,7 +42,6 @@ export async function listSessionsForDirectoryV2(
 
     const parsed = mapSessionPageV2(payload)
     if (parsed == null) {
-      // Not the same as "no sessions"; do not log the payload itself.
       logger.warning('V2 session list returned a payload that is not a session list', {
         source: 'listSessionsForDirectoryV2',
         type: typeof payload,
@@ -61,7 +50,7 @@ export async function listSessionsForDirectoryV2(
     }
 
     sessions.push(...parsed.sessions)
-    // An empty page ends the walk even if the server still offers a cursor; so does a cursor that did not advance.
+    // Stop on an empty page or a cursor that did not advance.
     if (parsed.sessions.length === 0 || parsed.nextCursor == null || parsed.nextCursor === cursor) break
     cursor = parsed.nextCursor
   }
