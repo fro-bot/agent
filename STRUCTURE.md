@@ -134,6 +134,7 @@ fro-bot/agent/
 | `fro-bot.yaml` | `issue_comment`, `issues`, `schedule`, `workflow_dispatch` | Fro Bot agent invocation (the Action under development) |
 | `harness-integrate.yaml` | `workflow_call` | LLM-merge integration of OpenCode refs into the harness build; called by `harness-release.yaml` |
 | `harness-release.yaml` | `push (harness-v* tags), workflow_dispatch` | Build matrix and publish for `@fro.bot/harness` |
+| `opencode-plugin-release.yaml` | `workflow_dispatch` | Verify, pack and publish `@fro.bot/opencode-plugin` (npm trusted publishing) |
 | `osv-scanner.yaml` | `merge_group`, `pull_request`, `push`, `schedule` | PR-differential vulnerability enforcement plus report-only full scans for merge queue/main/scheduled runs |
 | `prepare-release-pr.yaml` | `schedule`, `workflow_dispatch` | Opens release PR via semantic-release |
 | `renovate.yaml` | `issues`, `pull_request`, `push`, `workflow_dispatch`, `workflow_run` | Renovate dependency update automation |

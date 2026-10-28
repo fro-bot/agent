@@ -29,3 +29,7 @@ bun run --filter @fro.bot/opencode-plugin build       # bundle to dist/
 ```
 
 `src/integration.test.ts` loads the built bundle into a real OpenCode binary. It is skipped unless `dist/index.mjs` exists and `FRO_BOT_OPENCODE_V2_BIN` points at an OpenCode v2.2.0 executable. Download the release asset for your platform, verify it against the release's `SHA256SUMS`, unpack it into a temporary directory, and delete it afterwards.
+
+## Release
+
+Dispatch `.github/workflows/opencode-plugin-release.yaml` with the version to publish. It publishes with npm trusted publishing (OIDC). See [`BOOTSTRAP.md`](BOOTSTRAP.md) for the one-time setup.
