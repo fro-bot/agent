@@ -250,7 +250,7 @@ async function attemptReadinessProbe(
  * from the registry rather than merely denied, which is what makes this airtight: a top-level
  * config `permission.question: 'deny'` is merged into each agent BEFORE that agent's own
  * `permission` block (`agent/agent.ts:138-150`, `:293`, last matching rule wins), so an agent
- * that ships `permission.question: 'allow'` -- oMo's Sisyphus and Prometheus do -- silently
+ * that ships `permission.question: 'allow'` -- a plugin or custom agent can -- silently
  * re-enables it. A config-level deny cannot guarantee absence; a missing registry entry can.
  *
  * Unlike the watcher/background-subagent defaults above, an operator value does NOT win: this
@@ -484,15 +484,9 @@ export interface EnsureOpenCodeOptions {
   readonly opencodeVersion: string
   readonly githubToken: string
   readonly authJson: string
-  readonly enableOmo: boolean
-  readonly omoVersion: string
   readonly systematicVersion: string
-  readonly omoProviders: SetupInputs['omoProviders']
   readonly opencodeConfig: string | null
   readonly systematicConfig: string | null
-  readonly enableOmoSlim: boolean
-  readonly omoSlimVersion: string
-  readonly omoSlimPreset: SetupInputs['omoSlimPreset']
   readonly credential: SetupInputs['credential']
 }
 
@@ -551,14 +545,7 @@ export async function ensureOpenCodeAvailable(
     privateKey: null,
     opencodeConfig: options.opencodeConfig,
     systematicConfig: options.systematicConfig,
-    omoConfig: null,
-    enableOmo: options.enableOmo,
-    omoVersion: options.omoVersion,
     systematicVersion: options.systematicVersion,
-    omoProviders: options.omoProviders,
-    enableOmoSlim: options.enableOmoSlim,
-    omoSlimVersion: options.omoSlimVersion,
-    omoSlimPreset: options.omoSlimPreset,
     credential: options.credential,
   }
   const setupResult = await setupAdapter.runSetup(setupInputs, options.githubToken)

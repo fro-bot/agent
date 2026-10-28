@@ -15,20 +15,6 @@
   ignorePaths: ['dist/**'],
   customManagers: [
     {
-      customType: 'regex',
-      managerFilePatterns: ['/src\\/shared\\/constants\\.ts/'],
-      matchStrings: ["DEFAULT_OMO_VERSION = '(?<currentValue>\\d+\\.\\d+\\.\\d+)'"],
-      depNameTemplate: 'oh-my-openagent',
-      datasourceTemplate: 'npm',
-    },
-    {
-      customType: 'regex',
-      managerFilePatterns: ['/src\\/shared\\/constants\\.ts/'],
-      matchStrings: ["DEFAULT_OMO_SLIM_VERSION = '(?<currentValue>\\d+\\.\\d+\\.\\d+)'"],
-      depNameTemplate: 'oh-my-opencode-slim',
-      datasourceTemplate: 'npm',
-    },
-    {
       // Tracks the stock OpenCode fallback pin (FALLBACK_VERSION in
       // src/services/setup/opencode.ts). The action default is the harness
       // build, maintained by harness-release.yaml on publish — not Renovate.
@@ -48,14 +34,6 @@
       depNameTemplate: 'anomalyco/opencode',
       datasourceTemplate: 'github-releases',
       extractVersionTemplate: '^v?(?<version>.*)$',
-    },
-    {
-      customType: 'regex',
-      managerFilePatterns: ['/src\\/shared\\/constants\\.ts/'],
-      matchStrings: ["DEFAULT_BUN_VERSION = '(?<currentValue>\\d+\\.\\d+\\.\\d+)'"],
-      depNameTemplate: 'oven-sh/bun',
-      datasourceTemplate: 'github-releases',
-      extractVersionTemplate: '^bun-v(?<version>.*)$',
     },
     {
       // Tracks the harness native-build Bun pin in packages/harness/src/bun-version.ts.
@@ -156,8 +134,6 @@
         '@semantic-release/git',
         'anomalyco/opencode',
         'conventional-changelog-conventionalcommits',
-        'oh-my-openagent',
-        'oh-my-opencode-slim',
         'oven-sh/bun',
         'semantic-release',
         'tsdown',

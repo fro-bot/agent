@@ -47,9 +47,6 @@ on:
       OPENCODE_CONFIG:
         description: JSON merged into the OpenCode config (OPENCODE_CONFIG_CONTENT). Optional.
         required: false
-      OMO_PROVIDERS:
-        description: Comma-separated oMo providers passed through to the merge (enable-omo is true on this path). Optional.
-        required: false
       # NO OPENCODE_AUTH_JSON. NO secrets: inherit. The durable model credential must
       # never reach this workflow — see docs/plans/2026-07-01-001-feat-harness-merge-credential-broker-plan.md.
 
@@ -73,7 +70,7 @@ jobs:
 
     steps:
       - name: Harden runner egress
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: block
           disable-telemetry: true

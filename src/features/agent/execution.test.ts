@@ -427,18 +427,6 @@ describe('executeOpenCode — ownership ledger threading (Unit 11)', () => {
   })
 })
 
-function createDisabledProviders() {
-  return {
-    claude: 'no',
-    copilot: 'no',
-    gemini: 'no',
-    openai: 'no',
-    opencodeZen: 'no',
-    zaiCodingPlan: 'no',
-    kimiForCoding: 'no',
-  } as const
-}
-
 /**
  * Prompt submission that fails immediately, and a session that never reports idle -- the poll
  * watchdog never completes on its own, so only the shared deadline forces a resolution.
@@ -477,7 +465,7 @@ async function runExpiredWithAbortResult(abortResult: unknown, mockLogger: Logge
   const resultPromise = executeOpenCode(
     createMockPromptOptions(),
     mockLogger,
-    {agent: null, model: null, timeoutMs: 1_000, omoProviders: createDisabledProviders()},
+    {agent: null, model: null, timeoutMs: 1_000},
     undefined,
     ledger,
   )
@@ -521,7 +509,6 @@ describe('executeOpenCode — deadline teardown consults the shared deadline dir
         agent: null,
         model: null,
         timeoutMs: 1_000,
-        omoProviders: createDisabledProviders(),
       },
       undefined,
       ledger,
@@ -566,7 +553,6 @@ describe('executeOpenCode — deadline teardown consults the shared deadline dir
         agent: null,
         model: null,
         timeoutMs: 1_000,
-        omoProviders: createDisabledProviders(),
       },
       undefined,
       ledger,
@@ -658,7 +644,6 @@ describe('executeOpenCode — finalizer abort matrix (step 6 of the settlement r
       agent: null,
       model: null,
       timeoutMs: 60_000,
-      omoProviders: createDisabledProviders(),
     })
 
     expect(result.success).toBe(true)
@@ -685,7 +670,6 @@ describe('executeOpenCode — finalizer abort matrix (step 6 of the settlement r
       agent: null,
       model: null,
       timeoutMs: 60_000,
-      omoProviders: createDisabledProviders(),
     })
 
     expect(result.success).toBe(false)
@@ -719,7 +703,7 @@ describe('executeOpenCode — finalizer abort matrix (step 6 of the settlement r
     const result = await freshExecuteOpenCode(
       createMockPromptOptions(),
       mockLogger,
-      {agent: null, model: null, timeoutMs: 60_000, omoProviders: createDisabledProviders()},
+      {agent: null, model: null, timeoutMs: 60_000},
       undefined,
       ledger,
     )
@@ -758,7 +742,7 @@ describe('executeOpenCode — finalizer abort matrix (step 6 of the settlement r
     const result = await freshExecuteOpenCode(
       createMockPromptOptions(),
       mockLogger,
-      {agent: null, model: null, timeoutMs: 1_000, omoProviders: createDisabledProviders()},
+      {agent: null, model: null, timeoutMs: 1_000},
       undefined,
       ledger,
     )
@@ -793,7 +777,6 @@ describe('executeOpenCode — finalizer abort matrix (step 6 of the settlement r
       agent: null,
       model: null,
       timeoutMs: 600_000,
-      omoProviders: createDisabledProviders(),
     })
     await vi.advanceTimersByTimeAsync(600_000)
     const result = await resultPromise
@@ -837,7 +820,6 @@ describe('executeOpenCode — finalizer abort matrix (step 6 of the settlement r
       agent: null,
       model: null,
       timeoutMs: 1_000,
-      omoProviders: createDisabledProviders(),
     })
 
     expect(result.success).toBe(false)
@@ -865,7 +847,6 @@ describe('executeOpenCode — finalizer abort matrix (step 6 of the settlement r
       agent: null,
       model: null,
       timeoutMs: 60_000,
-      omoProviders: createDisabledProviders(),
     })
 
     expect(result.success).toBe(true)
@@ -893,7 +874,7 @@ describe('executeOpenCode — finalizer abort matrix (step 6 of the settlement r
     const result = await freshExecuteOpenCode(
       createMockPromptOptions(),
       mockLogger,
-      {agent: null, model: null, timeoutMs: 60_000, omoProviders: createDisabledProviders()},
+      {agent: null, model: null, timeoutMs: 60_000},
       undefined,
       ledger,
     )
@@ -932,7 +913,6 @@ describe('executeOpenCode — finalizer abort matrix (step 6 of the settlement r
       agent: null,
       model: null,
       timeoutMs: 1_000,
-      omoProviders: createDisabledProviders(),
     })
 
     // #then — no attempt was ever made (immediate timeoutResult()), yet the finalizer still aborts

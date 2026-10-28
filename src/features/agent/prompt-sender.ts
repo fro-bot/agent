@@ -27,10 +27,7 @@ export function buildContinuationPrompt(error: ErrorInfo, credentialProvisioned:
 
 const resolvePromptModel = (config: ExecutionConfig | undefined): {providerID: string; modelID: string} | undefined => {
   if (config?.model != null) return {providerID: config.model.providerID, modelID: config.model.modelID}
-  const hasConfiguredProviders =
-    config != null && Object.values(config.omoProviders).some(provider => provider !== 'no')
-  if (!hasConfiguredProviders) return {providerID: DEFAULT_MODEL.providerID, modelID: DEFAULT_MODEL.modelID}
-  return undefined
+  return {providerID: DEFAULT_MODEL.providerID, modelID: DEFAULT_MODEL.modelID}
 }
 
 export interface AttemptResult {

@@ -1,7 +1,7 @@
 import type {Logger} from './types.js'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
-import {deepMerge} from './omo-config.js'
+import {deepMerge} from './deep-merge.js'
 
 const SYSTEMATIC_CONFIG_FILENAME = 'systematic.json'
 

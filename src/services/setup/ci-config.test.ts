@@ -1,7 +1,7 @@
 import type {Logger} from './types.js'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
-import {buildCIConfig, pluginPrefix} from './ci-config.js'
+import {buildCIConfig} from './ci-config.js'
 
 function createLogger(): Logger {
   return createMockLogger()
@@ -29,133 +29,13 @@ afterEach(() => {
 })
 
 describe('buildCIConfig', () => {
-  describe('pluginPrefix', () => {
-    it('strips version suffix from scoped package names', () => {
-      expect(pluginPrefix('@scope/name@1.0.0')).toBe('@scope/name')
-    })
-
-    it('strips version suffix from unscoped package names', () => {
-      expect(pluginPrefix('name@1.0.0')).toBe('name')
-    })
-  })
-
-  describe('enabled mode (enableOmo: true)', () => {
-    it('returns autoupdate baseline with systematic plugin when no user config', () => {
-      // #given
-      const logger = createLogger()
-
-      // #when
-      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0', enableOmo: true}, logger)
-
-      // #then
-      expect(result.error).toBeNull()
-      expect(result.config).toEqual({autoupdate: false, plugin: ['@fro.bot/systematic@2.1.0'], subagent_depth: 1})
-    })
-
-    it('merges user config keys and appends systematic plugin', () => {
-      // #given
-      const logger = createLogger()
-
-      // #when
-      const result = buildCIConfig(
-        {opencodeConfig: '{"model":"claude-opus-4-5","autoupdate":true}', systematicVersion: '2.1.0', enableOmo: true},
-        logger,
-      )
-
-      // #then
-      expect(result.error).toBeNull()
-      expect(result.config).toEqual({
-        autoupdate: true,
-        model: 'claude-opus-4-5',
-        plugin: ['@fro.bot/systematic@2.1.0'],
-        subagent_depth: 1,
-      })
-    })
-
-    it('appends systematic plugin to existing plugin array', () => {
-      // #given
-      const logger = createLogger()
-
-      // #when
-      const result = buildCIConfig(
-        {opencodeConfig: '{"plugin":["custom-plugin@1.0.0"]}', systematicVersion: '2.1.0', enableOmo: true},
-        logger,
-      )
-
-      // #then
-      expect(result.error).toBeNull()
-      expect(result.config).toEqual({
-        autoupdate: false,
-        plugin: ['custom-plugin@1.0.0', '@fro.bot/systematic@2.1.0'],
-        subagent_depth: 1,
-      })
-    })
-
-    it('does not duplicate systematic plugin when already present', () => {
-      // #given
-      const logger = createLogger()
-
-      // #when
-      const result = buildCIConfig(
-        {
-          opencodeConfig: '{"plugin":["custom-plugin@1.0.0","@fro.bot/systematic@9.9.9"]}',
-          systematicVersion: '2.1.0',
-          enableOmo: true,
-        },
-        logger,
-      )
-
-      // #then
-      expect(result.error).toBeNull()
-      expect(result.config).toEqual({
-        autoupdate: false,
-        plugin: ['custom-plugin@1.0.0', '@fro.bot/systematic@9.9.9'],
-        subagent_depth: 1,
-      })
-    })
-
-    it('does not pin default_agent in enabled mode', () => {
-      // #given
-      const logger = createLogger()
-
-      // #when
-      const result = buildCIConfig(
-        {opencodeConfig: '{"default_agent":"sisyphus"}', systematicVersion: '2.1.0', enableOmo: true},
-        logger,
-      )
-
-      // #then - enabled mode preserves user agent
-      expect(result.error).toBeNull()
-      expect(result.config.default_agent).toBe('sisyphus')
-    })
-
-    it('preserves oh-my-openagent plugin in enabled mode', () => {
-      // #given
-      const logger = createLogger()
-
-      // #when
-      const result = buildCIConfig(
-        {
-          opencodeConfig: '{"plugin":["custom-plugin@1.0.0","oh-my-openagent@3.7.4"]}',
-          systematicVersion: '2.1.0',
-          enableOmo: true,
-        },
-        logger,
-      )
-
-      // #then - oMo plugin kept in enabled mode
-      expect(result.error).toBeNull()
-      expect(result.config.plugin).toContain('oh-my-openagent@3.7.4')
-    })
-  })
-
-  describe('disabled mode (enableOmo: false)', () => {
+  describe('default CI config', () => {
     it('returns autoupdate baseline with systematic plugin and pinned default_agent when no user config', () => {
       // #given
       const logger = createLogger()
 
       // #when
-      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0', enableOmo: false}, logger)
+      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0'}, logger)
 
       // #then
       expect(result.error).toBeNull()
@@ -181,17 +61,14 @@ describe('buildCIConfig', () => {
       })
     })
 
-    it('pins default_agent to build even when user config sets sisyphus', () => {
+    it('pins default_agent to build even when user config sets another agent', () => {
       // #given
       const logger = createLogger()
 
       // #when
-      const result = buildCIConfig(
-        {opencodeConfig: '{"default_agent":"sisyphus"}', systematicVersion: '2.1.0', enableOmo: false},
-        logger,
-      )
+      const result = buildCIConfig({opencodeConfig: '{"default_agent":"custom"}', systematicVersion: '2.1.0'}, logger)
 
-      // #then - disabled mode pins build
+      // #then - build is pinned
       expect(result.error).toBeNull()
       expect(result.config.default_agent).toBe('build')
       expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining('default_agent'))
@@ -202,91 +79,27 @@ describe('buildCIConfig', () => {
       const logger = createLogger()
 
       // #when
-      const result = buildCIConfig(
-        {opencodeConfig: '{"default_agent":"build"}', systematicVersion: '2.1.0', enableOmo: false},
-        logger,
-      )
+      const result = buildCIConfig({opencodeConfig: '{"default_agent":"build"}', systematicVersion: '2.1.0'}, logger)
 
       // #then - safely idempotent
       expect(result.error).toBeNull()
       expect(result.config.default_agent).toBe('build')
     })
 
-    it('strips oh-my-openagent bare entry from plugin array', () => {
+    it('strips the legacy plugins (plural) key', () => {
       // #given
       const logger = createLogger()
 
-      // #when
+      // #when - legacy "plugins" entries
       const result = buildCIConfig(
         {
-          opencodeConfig: '{"plugin":["custom-plugin@1.0.0","oh-my-openagent"]}',
+          opencodeConfig: '{"plugins":["legacy-plugin@3.7.4","other-plugin@1.0.0"],"plugin":["custom@1.0.0"]}',
           systematicVersion: '2.1.0',
-          enableOmo: false,
         },
         logger,
       )
 
-      // #then
-      expect(result.error).toBeNull()
-      expect(result.config.plugin).toEqual(['custom-plugin@1.0.0', '@fro.bot/systematic@2.1.0'])
-      expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining('plugin'))
-    })
-
-    it('strips oh-my-openagent@latest from plugin array', () => {
-      // #given
-      const logger = createLogger()
-
-      // #when
-      const result = buildCIConfig(
-        {
-          opencodeConfig: '{"plugin":["custom-plugin@1.0.0","oh-my-openagent@latest"]}',
-          systematicVersion: '2.1.0',
-          enableOmo: false,
-        },
-        logger,
-      )
-
-      // #then
-      expect(result.error).toBeNull()
-      expect(result.config.plugin).toEqual(['custom-plugin@1.0.0', '@fro.bot/systematic@2.1.0'])
-      expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining('plugin'))
-    })
-
-    it('strips oh-my-openagent@x.y.z from plugin array', () => {
-      // #given
-      const logger = createLogger()
-
-      // #when
-      const result = buildCIConfig(
-        {
-          opencodeConfig: '{"plugin":["custom-plugin@1.0.0","oh-my-openagent@3.7.4"]}',
-          systematicVersion: '2.1.0',
-          enableOmo: false,
-        },
-        logger,
-      )
-
-      // #then
-      expect(result.error).toBeNull()
-      expect(result.config.plugin).toEqual(['custom-plugin@1.0.0', '@fro.bot/systematic@2.1.0'])
-      expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining('plugin'))
-    })
-
-    it('strips legacy plugins (plural) key containing oh-my-openagent', () => {
-      // #given
-      const logger = createLogger()
-
-      // #when - legacy "plugins" with oMo entries
-      const result = buildCIConfig(
-        {
-          opencodeConfig: '{"plugins":["oh-my-openagent@3.7.4","other-plugin@1.0.0"],"plugin":["custom@1.0.0"]}',
-          systematicVersion: '2.1.0',
-          enableOmo: false,
-        },
-        logger,
-      )
-
-      // #then - legacy plugins key is deleted entirely, primary plugin untouched for non-oMo entries
+      // #then - legacy plugins key is deleted entirely, primary plugin untouched
       expect(result.error).toBeNull()
       expect(result.config).not.toHaveProperty('plugins')
       expect(result.config.plugin).toContain('custom@1.0.0')
@@ -294,36 +107,15 @@ describe('buildCIConfig', () => {
       expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining('plugins'))
     })
 
-    it('keeps unrelated plugin entries and strips only oh-my-openagent', () => {
-      // #given
-      const logger = createLogger()
-
-      // #when
-      const result = buildCIConfig(
-        {
-          opencodeConfig: '{"plugin":["plugin-a@1.0.0","oh-my-openagent@3.7.4","plugin-b@2.0.0"]}',
-          systematicVersion: '2.1.0',
-          enableOmo: false,
-        },
-        logger,
-      )
-
-      // #then - only oMo removed
-      expect(result.error).toBeNull()
-      expect(result.config.plugin).toEqual(['plugin-a@1.0.0', 'plugin-b@2.0.0', '@fro.bot/systematic@2.1.0'])
-      expect(result.config.default_agent).toBe('build')
-    })
-
     it('emits single warning when multiple fields are rewritten', () => {
       // #given
       const logger = createLogger()
 
-      // #when - user has both default_agent and oMo plugin
+      // #when - user has both default_agent and the legacy plugins key
       const result = buildCIConfig(
         {
-          opencodeConfig: '{"default_agent":"sisyphus","plugin":["oh-my-openagent@3.7.4","tool@1.0.0"]}',
+          opencodeConfig: '{"default_agent":"custom","plugins":["legacy@1.0.0"],"plugin":["tool@1.0.0"]}',
           systematicVersion: '2.1.0',
-          enableOmo: false,
         },
         logger,
       )
@@ -336,9 +128,8 @@ describe('buildCIConfig', () => {
         (call: unknown[]) => typeof call[0] === 'string' && call[0].includes('OpenCode config rewritten'),
       )
       expect(rewriteWarning).toBeDefined()
-      expect(rewriteWarning![0]).toContain('plugin')
+      expect(rewriteWarning![0]).toContain('plugins')
       expect(rewriteWarning![0]).toContain('default_agent')
-      expect(rewriteWarning![0]).toContain('enable-omo: false')
     })
 
     it('does not emit rewrite warning when no user config changes needed', () => {
@@ -346,7 +137,7 @@ describe('buildCIConfig', () => {
       const logger = createLogger()
 
       // #when
-      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0', enableOmo: false}, logger)
+      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0'}, logger)
 
       // #then - default_agent pinned but no user value was overridden, so no rewrite warning
       expect(result.error).toBeNull()
@@ -377,7 +168,6 @@ describe('buildCIConfig', () => {
             },
           }),
           systematicVersion: '2.1.0',
-          enableOmo: false,
         },
         logger,
       )
@@ -410,19 +200,49 @@ describe('buildCIConfig', () => {
       const logger = createLogger()
 
       // #when
-      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0', enableOmo: false}, logger)
+      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0'}, logger)
 
       // #then
       expect(result.error).toBeNull()
       expect(result.config.plugin).toContain('@fro.bot/systematic@2.1.0')
     })
 
-    it('denies external directory access for the build agent so disabled mode cannot block on permission prompts', () => {
+    it('does not duplicate the systematic plugin when the user config already declares it, and keeps the user version', () => {
+      // #given - the user already pinned their own Systematic version
+      const logger = createLogger()
+
+      // #when
+      const result = buildCIConfig(
+        {opencodeConfig: '{"plugin":["@fro.bot/systematic@9.9.9"]}', systematicVersion: '2.1.0'},
+        logger,
+      )
+
+      // #then - exactly one Systematic entry, and it is the user's, not the harness default
+      expect(result.error).toBeNull()
+      expect(result.config.plugin).toEqual(['@fro.bot/systematic@9.9.9'])
+    })
+
+    it('appends the systematic plugin after custom plugins and keeps them', () => {
+      // #given - the user declared a custom plugin only
+      const logger = createLogger()
+
+      // #when
+      const result = buildCIConfig(
+        {opencodeConfig: '{"plugin":["my-plugin@1.0.0"]}', systematicVersion: '2.1.0'},
+        logger,
+      )
+
+      // #then - the custom entry survives untouched and Systematic is appended exactly once
+      expect(result.error).toBeNull()
+      expect(result.config.plugin).toEqual(['my-plugin@1.0.0', '@fro.bot/systematic@2.1.0'])
+    })
+
+    it('denies external directory access for the build agent so it cannot block on permission prompts', () => {
       // #given
       const logger = createLogger()
 
       // #when
-      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0', enableOmo: false}, logger)
+      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0'}, logger)
 
       // #then
       expect(result.error).toBeNull()
@@ -443,7 +263,7 @@ describe('buildCIConfig', () => {
       vi.stubEnv('RUNNER_TEMP', '/home/runner/work/_temp')
 
       // #when
-      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0', enableOmo: false}, logger)
+      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0'}, logger)
 
       // #then
       expect(result.error).toBeNull()
@@ -466,8 +286,8 @@ describe('buildCIConfig', () => {
       const logger = createLogger()
       vi.stubEnv('RUNNER_TEMP', '/home/runner/work/_temp')
 
-      // #when building disabled-mode config
-      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0', enableOmo: false}, logger)
+      // #when building the default config
+      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0'}, logger)
 
       // #then only the response directory is denied for edit permission
       expect(result.config).toMatchObject({
@@ -495,7 +315,6 @@ describe('buildCIConfig', () => {
         {
           opencodeConfig: JSON.stringify({agent: {build: {permission: {edit: 'deny'}}}}),
           systematicVersion: '2.1.0',
-          enableOmo: false,
         },
         logger,
       )
@@ -519,7 +338,6 @@ describe('buildCIConfig', () => {
             agent: {build: {permission: {edit: {src: 'ask', docs: 'deny'}}}},
           }),
           systematicVersion: '2.1.0',
-          enableOmo: false,
         },
         logger,
       )
@@ -556,7 +374,6 @@ describe('buildCIConfig', () => {
             },
           }),
           systematicVersion: '2.1.0',
-          enableOmo: false,
         },
         logger,
       )
@@ -582,7 +399,6 @@ describe('buildCIConfig', () => {
         {
           opencodeConfig: null,
           systematicVersion: '2.1.0',
-          enableOmo: false,
           integrationWorkDir: '/home/runner/work/_temp/harness-integrate-work',
         },
         logger,
@@ -612,7 +428,7 @@ describe('buildCIConfig', () => {
       vi.stubEnv('RUNNER_TEMP', '/home/runner/work/_temp')
 
       // #when
-      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0', enableOmo: false}, logger)
+      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0'}, logger)
 
       // #then - generic runs retain response delivery without guessing an integration path
       expect(result.error).toBeNull()
@@ -640,7 +456,6 @@ describe('buildCIConfig', () => {
         {
           opencodeConfig: null,
           systematicVersion: '2.1.0',
-          enableOmo: false,
           integrationWorkDir: '/home/runner/work/other/harness-integrate-work',
         },
         logger,
@@ -676,7 +491,6 @@ describe('buildCIConfig', () => {
         {
           opencodeConfig: null,
           systematicVersion: '2.1.0',
-          enableOmo: false,
           integrationWorkDir: '/home/runner/work/_temp/../../etc',
         },
         logger,
@@ -705,7 +519,6 @@ describe('buildCIConfig', () => {
         {
           opencodeConfig: null,
           systematicVersion: '2.1.0',
-          enableOmo: false,
           integrationWorkDir: '/home/runner/work/_tempevil/harness-integrate-work',
         },
         logger,
@@ -729,7 +542,7 @@ describe('buildCIConfig', () => {
       const logger = createLogger()
 
       // #when
-      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0', enableOmo: false}, logger)
+      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0'}, logger)
 
       // #then
       expect(result.error).toBeNull()
@@ -748,7 +561,6 @@ describe('buildCIConfig', () => {
         {
           opencodeConfig: '{"agent":{"build":{"permission":{"external_directory":"allow"}}}}',
           systematicVersion: '2.1.0',
-          enableOmo: false,
         },
         logger,
       )
@@ -778,7 +590,6 @@ describe('buildCIConfig', () => {
         {
           opencodeConfig: '{"agent":{"build":{"permission":{"external_directory":{"/etc/**":"allow","*":"allow"}}}}}',
           systematicVersion: '2.1.0',
-          enableOmo: false,
         },
         logger,
       )
@@ -790,71 +601,17 @@ describe('buildCIConfig', () => {
     })
   })
 
-  describe('scopeAttachmentDirectoryPermission (top-level, mode-agnostic grant)', () => {
-    it('grants the attachment directory at the top-level permission key in disabled mode', () => {
+  describe('scopeAttachmentDirectoryPermission (top-level grant)', () => {
+    it('grants the attachment directory at the top-level permission key', () => {
       // #given
       const logger = createLogger()
       vi.stubEnv('RUNNER_TEMP', '/home/runner/work/_temp')
 
       // #when
-      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0', enableOmo: false}, logger)
+      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0'}, logger)
 
       // #then the global grant exists independently of the build-agent-scoped one
       expect(result.error).toBeNull()
-      expect(result.config).toMatchObject({
-        permission: {
-          external_directory: {
-            '*': 'deny',
-            '/home/runner/work/_temp/fro-bot-attachments/12345-1/*': 'allow',
-          },
-        },
-      })
-    })
-
-    it('grants the attachment directory at the top-level permission key in oMo mode (enableOmo: true) -- the mode where subagent dispatch actually happens', () => {
-      // #given
-      const logger = createLogger()
-      vi.stubEnv('RUNNER_TEMP', '/home/runner/work/_temp')
-
-      // #when
-      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0', enableOmo: true}, logger)
-
-      // #then
-      expect(result.error).toBeNull()
-      expect(result.config).toMatchObject({
-        permission: {
-          external_directory: {
-            '*': 'deny',
-            '/home/runner/work/_temp/fro-bot-attachments/12345-1/*': 'allow',
-          },
-        },
-      })
-      // #then this is the mechanism that reaches an orchestrator/subagent -- there is no
-      // `agent.build` block at all in this mode, unlike disabled mode
-      expect(result.config).not.toHaveProperty('agent.build')
-    })
-
-    it('grants the attachment directory at the top-level permission key in OMO Slim mode (enableOmoSlim: true) -- the mode where subagent dispatch actually happens', () => {
-      // #given
-      const logger = createLogger()
-      vi.stubEnv('RUNNER_TEMP', '/home/runner/work/_temp')
-
-      // #when
-      const result = buildCIConfig(
-        {
-          opencodeConfig: null,
-          systematicVersion: '2.1.0',
-          enableOmo: false,
-          enableOmoSlim: true,
-          omoSlimVersion: '1.1.1',
-          omoSlimPreset: 'openai',
-        },
-        logger,
-      )
-
-      // #then
-      expect(result.error).toBeNull()
-      expect(result.config.default_agent).toBe('orchestrator')
       expect(result.config).toMatchObject({
         permission: {
           external_directory: {
@@ -875,7 +632,6 @@ describe('buildCIConfig', () => {
         {
           opencodeConfig: '{"permission":{"bash":"allow"}}',
           systematicVersion: '2.1.0',
-          enableOmo: true,
         },
         logger,
       )
@@ -890,28 +646,15 @@ describe('buildCIConfig', () => {
       })
     })
 
-    it('fail-safe: does not add a top-level permission key at all when RUNNER_TEMP is unset, in any mode', () => {
-      // #given RUNNER_TEMP is unset (deleted by beforeEach) in every mode
+    it('fail-safe: does not add a top-level permission key at all when RUNNER_TEMP is unset', () => {
+      // #given RUNNER_TEMP is unset (deleted by beforeEach)
       const logger = createLogger()
 
       // #when
-      const disabled = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0', enableOmo: false}, logger)
-      const omo = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0', enableOmo: true}, logger)
-      const omoSlim = buildCIConfig(
-        {
-          opencodeConfig: null,
-          systematicVersion: '2.1.0',
-          enableOmo: false,
-          enableOmoSlim: true,
-          omoSlimVersion: '1.1.1',
-        },
-        logger,
-      )
+      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0'}, logger)
 
-      // #then no broad allow pattern is guessed in any mode
-      expect(disabled.config).not.toHaveProperty('permission')
-      expect(omo.config).not.toHaveProperty('permission')
-      expect(omoSlim.config).not.toHaveProperty('permission')
+      // #then no broad allow pattern is guessed
+      expect(result.config).not.toHaveProperty('permission')
     })
   })
 
@@ -921,10 +664,7 @@ describe('buildCIConfig', () => {
       const logger = createLogger()
 
       // #when
-      const result = buildCIConfig(
-        {opencodeConfig: '{invalid-json}', systematicVersion: '2.1.0', enableOmo: false},
-        logger,
-      )
+      const result = buildCIConfig({opencodeConfig: '{invalid-json}', systematicVersion: '2.1.0'}, logger)
 
       // #then
       expect(result.error).toBe('opencode-config must be valid JSON')
@@ -935,16 +675,10 @@ describe('buildCIConfig', () => {
       const logger = createLogger()
 
       // #when
-      const nullResult = buildCIConfig({opencodeConfig: 'null', systematicVersion: '2.1.0', enableOmo: false}, logger)
-      const arrayResult = buildCIConfig(
-        {opencodeConfig: '[1,2,3]', systematicVersion: '2.1.0', enableOmo: false},
-        logger,
-      )
-      const numberResult = buildCIConfig({opencodeConfig: '42', systematicVersion: '2.1.0', enableOmo: false}, logger)
-      const stringResult = buildCIConfig(
-        {opencodeConfig: '"hello"', systematicVersion: '2.1.0', enableOmo: false},
-        logger,
-      )
+      const nullResult = buildCIConfig({opencodeConfig: 'null', systematicVersion: '2.1.0'}, logger)
+      const arrayResult = buildCIConfig({opencodeConfig: '[1,2,3]', systematicVersion: '2.1.0'}, logger)
+      const numberResult = buildCIConfig({opencodeConfig: '42', systematicVersion: '2.1.0'}, logger)
+      const stringResult = buildCIConfig({opencodeConfig: '"hello"', systematicVersion: '2.1.0'}, logger)
 
       // #then
       expect(nullResult.error).toBe('opencode-config must be a JSON object')
@@ -954,249 +688,13 @@ describe('buildCIConfig', () => {
     })
   })
 
-  describe('slim mode (enableOmoSlim: true)', () => {
-    it('includes oh-my-opencode-slim plugin and systematic in plugin array', () => {
-      // #given
-      const logger = createLogger()
-
-      // #when
-      const result = buildCIConfig(
-        {
-          opencodeConfig: null,
-          systematicVersion: '2.1.0',
-          enableOmo: false,
-          enableOmoSlim: true,
-          omoSlimVersion: '1.1.1',
-          omoSlimPreset: 'openai',
-        },
-        logger,
-      )
-
-      // #then
-      expect(result.error).toBeNull()
-      const plugins = result.config.plugin as string[]
-      expect(plugins).toContain('oh-my-opencode-slim@1.1.1')
-      expect(plugins.filter(p => p.startsWith('@fro.bot/systematic'))).toHaveLength(1)
-    })
-
-    it('pins default_agent to orchestrator unconditionally', () => {
-      // #given
-      const logger = createLogger()
-
-      // #when
-      const result = buildCIConfig(
-        {
-          opencodeConfig: '{"default_agent":"build"}',
-          systematicVersion: '2.1.0',
-          enableOmo: false,
-          enableOmoSlim: true,
-          omoSlimVersion: '1.1.1',
-          omoSlimPreset: 'openai',
-        },
-        logger,
-      )
-
-      // #then
-      expect(result.error).toBeNull()
-      expect(result.config.default_agent).toBe('orchestrator')
-    })
-
-    it('does NOT deny external_directory for build agent in slim mode', () => {
-      // #given
-      const logger = createLogger()
-
-      // #when
-      const result = buildCIConfig(
-        {
-          opencodeConfig: null,
-          systematicVersion: '2.1.0',
-          enableOmo: false,
-          enableOmoSlim: true,
-          omoSlimVersion: '1.1.1',
-          omoSlimPreset: 'openai',
-        },
-        logger,
-      )
-
-      // #then
-      expect(result.error).toBeNull()
-      // external_directory deny should NOT be set in slim mode
-      const agent = result.config.agent as Record<string, unknown> | undefined
-      const build = (agent?.build ?? {}) as Record<string, unknown>
-      const permission = (build.permission ?? {}) as Record<string, unknown>
-      expect(permission.external_directory).not.toBe('deny')
-    })
-
-    it('does NOT include oh-my-openagent in slim mode', () => {
-      // #given
-      const logger = createLogger()
-
-      // #when
-      const result = buildCIConfig(
-        {
-          opencodeConfig: null,
-          systematicVersion: '2.1.0',
-          enableOmo: false,
-          enableOmoSlim: true,
-          omoSlimVersion: '1.1.1',
-          omoSlimPreset: 'openai',
-        },
-        logger,
-      )
-
-      // #then
-      expect(result.error).toBeNull()
-      const plugins = result.config.plugin as string[]
-      expect(plugins.every(p => !p.startsWith('oh-my-openagent'))).toBe(true)
-    })
-
-    it('strips pre-existing oh-my-openagent from opencodeConfig in slim mode (cache restore edge case)', () => {
-      // #given - config pre-seeded with OMO entry from cache restore
-      const logger = createLogger()
-
-      // #when
-      const result = buildCIConfig(
-        {
-          opencodeConfig: '{"plugin":["oh-my-openagent@3.0.0"]}',
-          systematicVersion: '2.1.0',
-          enableOmo: false,
-          enableOmoSlim: true,
-          omoSlimVersion: '1.1.1',
-          omoSlimPreset: 'openai',
-        },
-        logger,
-      )
-
-      // #then
-      expect(result.error).toBeNull()
-      const plugins = result.config.plugin as string[]
-      expect(plugins.every(p => !p.startsWith('oh-my-openagent'))).toBe(true)
-      expect(plugins).toContain('oh-my-opencode-slim@1.1.1')
-    })
-
-    it('fix C: strips legacy plugins (plural) key in slim mode', () => {
-      // #given - opencodeConfig contains both plugin and plugins (plural) keys
-      const logger = createLogger()
-
-      // #when
-      const result = buildCIConfig(
-        {
-          opencodeConfig: '{"plugins":["some-old-plugin"],"plugin":[]}',
-          systematicVersion: '2.1.0',
-          enableOmo: false,
-          enableOmoSlim: true,
-          omoSlimVersion: '1.1.1',
-          omoSlimPreset: 'openai',
-        },
-        logger,
-      )
-
-      // #then
-      expect(result.error).toBeNull()
-      expect('plugins' in result.config).toBe(false)
-    })
-
-    it('includes opencode-go preset in slim plugin specifier', () => {
-      // #given
-      const logger = createLogger()
-
-      // #when - preset doesn't affect the plugin specifier, but verifies we pass through
-      const result = buildCIConfig(
-        {
-          opencodeConfig: null,
-          systematicVersion: '2.1.0',
-          enableOmo: false,
-          enableOmoSlim: true,
-          omoSlimVersion: '1.1.1',
-          omoSlimPreset: 'opencode-go',
-        },
-        logger,
-      )
-
-      // #then
-      expect(result.error).toBeNull()
-      const plugins = result.config.plugin as string[]
-      expect(plugins).toContain('oh-my-opencode-slim@1.1.1')
-      expect(result.config.default_agent).toBe('orchestrator')
-    })
-  })
-
-  describe('dual-plugin guard', () => {
-    it('returns error when both oh-my-openagent and oh-my-opencode-slim would be present', () => {
-      // #given - opencodeConfig has both OMO and slim
-      const logger = createLogger()
-
-      // #when
-      const result = buildCIConfig(
-        {
-          opencodeConfig: '{"plugin":["oh-my-openagent@3.0.0","oh-my-opencode-slim@1.1.1"]}',
-          systematicVersion: '2.1.0',
-          enableOmo: true,
-          enableOmoSlim: false,
-          omoSlimVersion: '1.1.1',
-          omoSlimPreset: 'openai',
-        },
-        logger,
-      )
-
-      // #then
-      expect(result.error).toBe('oMo and OMO Slim plugins cannot both be present')
-    })
-  })
-
-  describe('R19 version-gated allowlist', () => {
-    it('returns error for unverified omoSlimVersion in slim mode', () => {
-      // #given
-      const logger = createLogger()
-
-      // #when
-      const result = buildCIConfig(
-        {
-          opencodeConfig: null,
-          systematicVersion: '2.1.0',
-          enableOmo: false,
-          enableOmoSlim: true,
-          omoSlimVersion: '9.9.9',
-          omoSlimPreset: 'openai',
-        },
-        logger,
-      )
-
-      // #then
-      expect(result.error).toContain('9.9.9')
-      expect(result.error).toContain('not verified')
-      expect(result.error).toContain('1.1.1')
-    })
-
-    it('succeeds for verified version 1.1.1', () => {
-      // #given
-      const logger = createLogger()
-
-      // #when
-      const result = buildCIConfig(
-        {
-          opencodeConfig: null,
-          systematicVersion: '2.1.0',
-          enableOmo: false,
-          enableOmoSlim: true,
-          omoSlimVersion: '1.1.1',
-          omoSlimPreset: 'openai',
-        },
-        logger,
-      )
-
-      // #then
-      expect(result.error).toBeNull()
-    })
-  })
-
   describe('R12 subagent_depth pin', () => {
     it('pins subagent_depth to 1 when no user config is supplied', () => {
       // #given
       const logger = createLogger()
 
       // #when
-      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0', enableOmo: true}, logger)
+      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0'}, logger)
 
       // #then
       expect(result.error).toBeNull()
@@ -1208,10 +706,7 @@ describe('buildCIConfig', () => {
       const logger = createLogger()
 
       // #when
-      const result = buildCIConfig(
-        {opencodeConfig: '{"subagent_depth":3}', systematicVersion: '2.1.0', enableOmo: true},
-        logger,
-      )
+      const result = buildCIConfig({opencodeConfig: '{"subagent_depth":3}', systematicVersion: '2.1.0'}, logger)
 
       // #then - pinned to 1 rather than silently honoring the operator value, and the override is recorded
       expect(result.error).toBeNull()
@@ -1224,10 +719,7 @@ describe('buildCIConfig', () => {
       const logger = createLogger()
 
       // #when
-      const result = buildCIConfig(
-        {opencodeConfig: '{"subagent_depth":1}', systematicVersion: '2.1.0', enableOmo: true},
-        logger,
-      )
+      const result = buildCIConfig({opencodeConfig: '{"subagent_depth":1}', systematicVersion: '2.1.0'}, logger)
 
       // #then
       expect(result.error).toBeNull()
@@ -1237,40 +729,6 @@ describe('buildCIConfig', () => {
         (call: unknown[]) => typeof call[0] === 'string' && call[0].includes('subagent_depth'),
       )
       expect(depthWarning).toBeUndefined()
-    })
-
-    it('pins subagent_depth to 1 in disabled mode (enableOmo: false)', () => {
-      // #given
-      const logger = createLogger()
-
-      // #when
-      const result = buildCIConfig({opencodeConfig: null, systematicVersion: '2.1.0', enableOmo: false}, logger)
-
-      // #then
-      expect(result.error).toBeNull()
-      expect(result.config.subagent_depth).toBe(1)
-    })
-
-    it('pins subagent_depth to 1 in slim mode (enableOmoSlim: true)', () => {
-      // #given
-      const logger = createLogger()
-
-      // #when
-      const result = buildCIConfig(
-        {
-          opencodeConfig: null,
-          systematicVersion: '2.1.0',
-          enableOmo: false,
-          enableOmoSlim: true,
-          omoSlimVersion: '1.1.1',
-          omoSlimPreset: 'openai',
-        },
-        logger,
-      )
-
-      // #then
-      expect(result.error).toBeNull()
-      expect(result.config.subagent_depth).toBe(1)
     })
   })
 })

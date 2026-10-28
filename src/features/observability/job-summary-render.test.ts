@@ -58,7 +58,7 @@ function createOptions(overrides: Partial<CommentSummaryOptions> = {}): CommentS
     runId: 123,
     runUrl: 'https://github.com/owner/repo/actions/runs/123',
     metrics: createMetrics(),
-    agent: 'sisyphus',
+    agent: 'build',
     resolvedOutputMode: null,
     deliveryKind: 'none',
     ...overrides,

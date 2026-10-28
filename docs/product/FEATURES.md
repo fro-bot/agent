@@ -30,7 +30,7 @@
 
 ## Product Overview
 
-Fro Bot Agent is a reusable **agent harness** that runs OpenCode with an Oh My OpenAgent (oMo) Sisyphus agent workflow to act as an autonomous collaborator on GitHub (Issues, Discussions, PRs) and Discord (long-running bot with Kimaki-like UX).
+Fro Bot Agent is a reusable **agent harness** that runs OpenCode with the bundled Systematic workflows to act as an autonomous collaborator on GitHub (Issues, Discussions, PRs) and Discord (long-running bot with Kimaki-like UX).
 
 **Core Differentiator:** Durable memory across runs - OpenCode session/application state is restored at start and saved at end, enabling the agent to pick up work without repeating expensive investigation.
 
@@ -84,7 +84,7 @@ Fro Bot Agent is a reusable **agent harness** that runs OpenCode with an Oh My O
 **Dependencies:** None
 
 **Description:**
-The product ships as a TypeScript GitHub Action (Node.js 24 runtime) supporting oMo/Sisyphus-style triggers with expanded event support.
+The product ships as a TypeScript GitHub Action (Node.js 24 runtime) supporting GitHub triggers with expanded event support.
 
 **Core Triggers:**
 | Event                         | Supported Actions                   | Prompt Requirement            | Scope      |
@@ -466,16 +466,16 @@ Save OpenCode storage directory at end of GitHub Action run.
 **Dependencies:** F17
 
 **Description:**
-On startup, the agent uses oMo session tools to find relevant prior work.
+On startup, the agent uses its session tools to find relevant prior work.
 
 **Two layers involved:**
 1. **Action-side (RFC-004)**: `listSessions()` and `searchSessions()` utilities run at startup
-2. **Agent-side (oMo)**: Agent uses `session_search` and `session_read` LLM tools during execution
+2. **Agent-side**: Agent uses `session_search` and `session_read` LLM tools during execution
 
 **Acceptance Criteria:**
 - [ ] Action harness calls RFC-004 `listSessions()` to discover prior sessions
 - [ ] Agent prompt includes session context from startup introspection
-- [ ] Agent is instructed to call oMo `session_search` before re-investigating
+- [ ] Agent is instructed to call `session_search` before re-investigating
 - [ ] Agent reads relevant prior sessions when found via `session_read`
 - [ ] Evidence of session search appears in logs
 
@@ -586,7 +586,7 @@ Environment setup is integrated into the main action via auto-setup. The separat
 
 **Acceptance Criteria:**
 - [x] Auto-setup integrated into main action (`fro-bot/agent@v0`)
-- [x] OpenCode and oMo installed automatically on first run
+- [x] OpenCode installed automatically on first run
 - [x] Outputs: `session-id`, `resolved-output-mode`, `output-mode-migration`, `cache-status`, `duration`, `brokered-push-allowlist`
 
 ---
@@ -607,20 +607,9 @@ Install OpenCode binary via `@actions/tool-cache` for cross-run caching.
 
 ---
 
-### F27: oMo Plugin Installation
+### F27: oMo Plugin Installation (removed)
 
-**Priority:** Must Have (P0)
-**Complexity:** Medium
-**Dependencies:** F26
-
-**Description:**
-Automatically install Bun runtime and oMo plugins.
-
-**Acceptance Criteria:**
-- [ ] Automatically installs Bun runtime via `@actions/tool-cache`
-- [ ] Installs oMo plugin via `bunx oh-my-openagent install`
-- [ ] Users do NOT need `oven-sh/setup-bun`
-- [ ] Graceful degradation: warn on failure, do not fail the run
+oMo and oMo Slim support was removed. The Action no longer installs Bun or oMo plugins.
 
 ---
 
@@ -695,7 +684,7 @@ Restore OpenCode storage from cache during setup phase.
 
 **Priority:** Must Have (P0)
 **Complexity:** High
-**Dependencies:** F26, F27
+**Dependencies:** F26
 
 **Description:**
 Use `@opencode-ai/sdk` for agent execution, replacing CLI model.
@@ -978,7 +967,6 @@ Only respond to comments from authorized users on fork PRs.
 
 **Technical Considerations:**
 - `github.event.comment.author_association` for association check
-- Matches oMo Sisyphus agent approach for secure fork handling
 
 ---
 
@@ -1690,7 +1678,7 @@ Enforce privacy-first telemetry policy across all modalities.
 │                                                                     │   │   │
 │  F25 (Setup Action) ────────────────────────────────────────────────┤   │   │
 │  ├── F26 (OpenCode Install)                                         │   │   │
-│  │   └── F27 (oMo Install)                                          │   │   │
+│  │   └── F27 (removed)                                              │   │   │
 │  │       └── F32 (SDK Exec) ────────────────────────────────────┐   │   │   │
 │  │           ├── F33 (Event Subscription)                       │   │   │   │
 │  │           ├── F34 (Completion Detection)                     │   │   │   │

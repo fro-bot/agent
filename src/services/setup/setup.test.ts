@@ -21,21 +21,7 @@ function createSetupInputs(overrides: Partial<SetupInputs> = {}): SetupInputs {
     privateKey: null,
     opencodeConfig: null,
     systematicConfig: null,
-    enableOmo: false,
-    omoVersion: '3.7.4',
     systematicVersion: '2.1.0',
-    omoProviders: {
-      claude: 'no',
-      copilot: 'no',
-      gemini: 'no',
-      openai: 'no',
-      opencodeZen: 'no',
-      zaiCodingPlan: 'no',
-      kimiForCoding: 'no',
-    },
-    enableOmoSlim: false,
-    omoSlimPreset: 'openai' as const,
-    omoSlimVersion: '1.1.1',
     credential: 'provision',
     ...overrides,
   }
@@ -111,17 +97,6 @@ vi.mock('./adapters.js', () => ({
     exec: vi.mocked(exec.exec),
     getExecOutput: vi.mocked(exec.getExecOutput),
   })),
-}))
-
-// Mock bun module
-vi.mock('./bun.js', () => ({
-  installBun: vi.fn().mockResolvedValue({path: '/cached/bun', version: '1.3.5', cached: true}),
-  DEFAULT_BUN_VERSION: '1.3.5',
-}))
-
-// Mock omo-slim module
-vi.mock('./omo-slim.js', () => ({
-  installOmoSlim: vi.fn().mockResolvedValue({installed: true, version: '1.1.1', error: null}),
 }))
 
 // Mock session-tools-config module so tests can assert the native session tools file is
@@ -534,7 +509,7 @@ describe('setup', () => {
       expect(exec.exec).not.toHaveBeenCalledWith('git', expect.arrayContaining(['user.email']), expect.anything())
     })
 
-    describe('disabled mode (enableOmo: false, default)', () => {
+    describe('default config', () => {
       beforeEach(() => {
         vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
         vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
@@ -544,15 +519,14 @@ describe('setup', () => {
         vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
       })
 
-      it('returns omoStatus skipped and writes config with default_agent build', async () => {
-        // #given - default disabled mode
+      it('writes config with default_agent build', async () => {
+        // #given - default inputs
 
         // #when
         const result = await runSetup(createSetupInputs(), 'ghs_test_token')
 
         // #then
         expect(result).not.toBeNull()
-        expect(result?.omoStatus).toBe('skipped')
         expect(core.exportVariable).toHaveBeenCalledWith('OPENCODE_CONFIG_CONTENT', expect.any(String))
 
         // Verify the config JSON has default_agent: build
@@ -565,8 +539,8 @@ describe('setup', () => {
         expect(config.default_agent).toBe('build')
       })
 
-      it('creates the OpenCode config directory before writing disabled-mode config', async () => {
-        // #given - disabled mode does not run oMo, so setup owns config dir creation; with XDG_CONFIG_HOME unset the
+      it('creates the OpenCode config directory before writing the config', async () => {
+        // #given - setup owns config dir creation; with XDG_CONFIG_HOME unset the
         // default is `~/.config/opencode` under the suite's isolated (temp) HOME
         delete process.env.XDG_CONFIG_HOME
         const configDir = join(homedir(), '.config', 'opencode')
@@ -580,42 +554,7 @@ describe('setup', () => {
         expect(fs.writeFile).toHaveBeenCalledWith(join(configDir, 'opencode.json'), expect.any(String))
       })
 
-      it('does not call Bun installer, bunx, installOmo, or writeOmoConfig', async () => {
-        // #given
-        const bunModule = await import('./bun.js')
-
-        // #when
-        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
-
-        // #then
-        expect(result).not.toBeNull()
-        expect(bunModule.installBun).not.toHaveBeenCalled()
-
-        // Should not call bunx (oMo installer)
-        const execCalls = vi.mocked(exec.exec).mock.calls
-        const bunxCalls = execCalls.filter(([cmd]) => cmd === 'bunx')
-        expect(bunxCalls).toHaveLength(0)
-
-        // Should not write oh-my-openagent.json
-        const writeFileCalls = vi.mocked(fs.writeFile).mock.calls
-        const omoConfigCall = writeFileCalls.find(
-          ([filePath]) => typeof filePath === 'string' && filePath.includes('oh-my-openagent.json'),
-        )
-        expect(omoConfigCall).toBeUndefined()
-      })
-
-      it('does not export oMo telemetry env vars in disabled mode', async () => {
-        // #given
-
-        // #when
-        await runSetup(createSetupInputs(), 'ghs_test_token')
-
-        // #then
-        expect(core.exportVariable).not.toHaveBeenCalledWith('OMO_SEND_ANONYMOUS_TELEMETRY', '0')
-        expect(core.exportVariable).not.toHaveBeenCalledWith('OMO_DISABLE_POSTHOG', '1')
-      })
-
-      it('writes Systematic config when provided in disabled mode', async () => {
+      it('writes Systematic config when provided', async () => {
         // #given
         const systematicConfig = JSON.stringify({agents: {default: 'build'}, mode: 'strict'})
 
@@ -633,7 +572,7 @@ describe('setup', () => {
         expect(written).toMatchObject({agents: {default: 'build'}, mode: 'strict'})
       })
 
-      it('always attempts to write the session tools file, regardless of oMo mode', async () => {
+      it('always attempts to write the session tools file', async () => {
         // #given
 
         // #when
@@ -672,15 +611,15 @@ describe('setup', () => {
       })
 
       it('writes fresh config without merging existing opencode.json', async () => {
-        // #given - simulate existing opencode.json with stale oMo data
+        // #given - simulate an existing opencode.json with stale data
         vi.mocked(fs.readFile).mockResolvedValue(
-          JSON.stringify({default_agent: 'sisyphus', plugin: ['oh-my-openagent@3.7.4']}),
+          JSON.stringify({default_agent: 'custom', plugin: ['stale-plugin@3.7.4']}),
         )
 
         // #when
         const result = await runSetup(createSetupInputs(), 'ghs_test_token')
 
-        // #then - fresh config has build, no oMo plugin
+        // #then - fresh config has build and none of the stale plugins
         expect(result).not.toBeNull()
         const configExportCall = vi
           .mocked(core.exportVariable)
@@ -690,175 +629,8 @@ describe('setup', () => {
         const config = JSON.parse(String(configExportCall?.[1])) as Record<string, unknown>
         expect(config.default_agent).toBe('build')
 
-        // Should NOT contain oh-my-openagent
         const configPlugins = config.plugin as unknown[]
-        expect(configPlugins?.some(p => typeof p === 'string' && p.includes('oh-my-openagent'))).toBe(false)
-      })
-
-      it('warns when user config has oh-my-openagent plugin', async () => {
-        // #given
-        const opencodeConfig = JSON.stringify({
-          plugin: ['tool@1.0.0', 'oh-my-openagent@3.7.4'],
-        })
-
-        // #when
-        const result = await runSetup(createSetupInputs({opencodeConfig}), 'ghs_test_token')
-
-        // #then - warning emitted
-        expect(result).not.toBeNull()
-        expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('plugin'))
-      })
-    })
-
-    describe('enabled mode (enableOmo: true)', () => {
-      beforeEach(() => {
-        vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
-        vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
-        vi.mocked(exec.exec).mockResolvedValue(0)
-        vi.mocked(fs.writeFile).mockResolvedValue()
-        vi.mocked(fs.mkdir).mockResolvedValue(undefined)
-        vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
-        vi.mocked(fs.readFile).mockRejectedValue(Object.assign(new Error('not found'), {code: 'ENOENT'}))
-      })
-
-      it('installs Bun and oMo, returns omoStatus installed', async () => {
-        // #given - bunx succeeds
-        const bunModule = await import('./bun.js')
-
-        // #when
-        const result = await runSetup(createSetupInputs({enableOmo: true}), 'ghs_test_token')
-
-        // #then
-        expect(result).not.toBeNull()
-        expect(bunModule.installBun).toHaveBeenCalled()
-        expect(core.exportVariable).toHaveBeenCalledWith('OMO_SEND_ANONYMOUS_TELEMETRY', '0')
-        expect(core.exportVariable).toHaveBeenCalledWith('OMO_DISABLE_POSTHOG', '1')
-        expect(result?.omoStatus).toBe('installed')
-      })
-
-      it('writes the session tools file in enabled mode too', async () => {
-        // #given
-
-        // #when
-        const result = await runSetup(createSetupInputs({enableOmo: true}), 'ghs_test_token')
-
-        // #then
-        expect(result).not.toBeNull()
-        expect(sessionToolsConfig.writeSessionToolsFile).toHaveBeenCalledTimes(1)
-      })
-
-      it('returns omoStatus failed when oMo installer fails', async () => {
-        // #given - bunx oMo fails
-        vi.mocked(exec.exec).mockImplementation(async (cmd: string) => {
-          if (cmd === 'bunx') {
-            throw new Error('bunx failed')
-          }
-          return 0
-        })
-
-        // #when
-        const result = await runSetup(createSetupInputs({enableOmo: true}), 'ghs_test_token')
-
-        // #then - should warn but continue (RFC-011 graceful degradation)
-        expect(result).not.toBeNull()
-        expect(result?.omoStatus).toBe('failed')
-        expect(core.setFailed).not.toHaveBeenCalled()
-        expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('oMo installation failed'))
-      })
-
-      it('returns omoStatus failed when Bun installation fails', async () => {
-        // #given - Bun install throws
-        const bunModule = await import('./bun.js')
-        vi.mocked(bunModule.installBun).mockRejectedValueOnce(new Error('download failed'))
-
-        // #when
-        const result = await runSetup(createSetupInputs({enableOmo: true}), 'ghs_test_token')
-
-        // #then - setup continues but oMo is not attempted
-        expect(result).not.toBeNull()
-        expect(result?.omoStatus).toBe('failed')
-        expect(core.setFailed).not.toHaveBeenCalled()
-        expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('Bun installation failed'))
-        expect(exec.exec).not.toHaveBeenCalledWith('bunx', expect.anything(), expect.anything())
-      })
-
-      it('does not pin default_agent in enabled mode', async () => {
-        // #given
-
-        // #when
-        const result = await runSetup(createSetupInputs({enableOmo: true}), 'ghs_test_token')
-
-        // #then
-        expect(result).not.toBeNull()
-        const configExportCall = vi
-          .mocked(core.exportVariable)
-          .mock.calls.find(([name]) => name === 'OPENCODE_CONFIG_CONTENT')
-        expect(configExportCall).toBeDefined()
-        const config = JSON.parse(configExportCall![1] as string) as Record<string, unknown>
-        // Without user config, no default_agent should be set
-        expect(config.default_agent).toBeUndefined()
-      })
-
-      it('preserves user plugin array with oMo installer plugin entries', async () => {
-        // #given - existing opencode.json with oMo plugin
-        vi.mocked(fs.readFile).mockResolvedValue(JSON.stringify({plugin: ['oh-my-openagent@3.7.4', 'custom@1.0.0']}))
-
-        // #when
-        const result = await runSetup(
-          createSetupInputs({enableOmo: true, opencodeConfig: '{"plugin":["custom-plugin@1.0.0"]}'}),
-          'ghs_test_token',
-        )
-
-        // #then - existing oMo plugin merged with CI plugin
-        expect(result).not.toBeNull()
-        const configExportCall = vi
-          .mocked(core.exportVariable)
-          .mock.calls.find(([name]) => name === 'OPENCODE_CONFIG_CONTENT')
-        expect(configExportCall).toBeDefined()
-        const config = JSON.parse(configExportCall![1] as string) as Record<string, unknown>
-        const plugins = config.plugin as unknown[]
-        expect(plugins).toContain('oh-my-openagent@3.7.4')
-        expect(plugins).toContain('custom-plugin@1.0.0')
-      })
-
-      it('keeps distinct scoped plugins that share a package-name prefix', async () => {
-        // #given - existing plugin differs only by the suffix after the package name
-        vi.mocked(fs.readFile).mockResolvedValue(JSON.stringify({plugin: ['@scope/name-extra@1.0.0']}))
-
-        // #when
-        const result = await runSetup(
-          createSetupInputs({enableOmo: true, opencodeConfig: '{"plugin":["@scope/name@2.0.0"]}'}),
-          'ghs_test_token',
-        )
-
-        // #then
-        expect(result).not.toBeNull()
-        const configExportCall = vi
-          .mocked(core.exportVariable)
-          .mock.calls.find(([name]) => name === 'OPENCODE_CONFIG_CONTENT')
-        expect(configExportCall).toBeDefined()
-        const config = JSON.parse(configExportCall![1] as string) as Record<string, unknown>
-        const plugins = config.plugin as unknown[]
-        expect(plugins).toContain('@scope/name-extra@1.0.0')
-        expect(plugins).toContain('@scope/name@2.0.0')
-      })
-
-      it('writes Systematic config when provided in enabled mode', async () => {
-        // #given
-        const systematicConfig = JSON.stringify({agents: {default: 'sisyphus'}})
-
-        // #when
-        const result = await runSetup(createSetupInputs({enableOmo: true, systematicConfig}), 'ghs_test_token')
-
-        // #then
-        expect(result).not.toBeNull()
-        const writeFileCalls = vi.mocked(fs.writeFile).mock.calls
-        const systematicConfigCall = writeFileCalls.find(
-          ([filePath]) => typeof filePath === 'string' && filePath.includes('systematic.json'),
-        )
-        expect(systematicConfigCall).toBeDefined()
-        const written = JSON.parse(systematicConfigCall![1] as string) as Record<string, unknown>
-        expect(written).toMatchObject({agents: {default: 'sisyphus'}})
+        expect(configPlugins?.some(p => typeof p === 'string' && p.includes('stale-plugin'))).toBe(false)
       })
     })
 
@@ -911,55 +683,8 @@ describe('setup', () => {
         const callArgs = vi.mocked(toolsCache.restoreToolsCache).mock.calls[0]?.[0]
         expect(callArgs).toBeDefined()
         expect(callArgs?.toolCachePath).toContain('opencode')
-        expect(callArgs?.omoConfigPath).toContain('opencode')
         expect(callArgs?.opencodeCachePath).toContain('opencode')
         expect(callArgs?.systematicVersion).toBe('2.1.0')
-      })
-
-      it('passes disabled cacheMode to restoreToolsCache when enableOmo is false', async () => {
-        // #given - default disabled mode
-
-        // #when
-        await runSetup(createSetupInputs(), 'ghs_test_token')
-
-        // #then
-        const callArgs = vi.mocked(toolsCache.restoreToolsCache).mock.calls[0]?.[0]
-        expect(callArgs?.cacheMode).toBe('disabled')
-      })
-
-      it('passes enabled cacheMode to restoreToolsCache when enableOmo is true', async () => {
-        // #given - enabled mode
-
-        // #when
-        await runSetup(createSetupInputs({enableOmo: true}), 'ghs_test_token')
-
-        // #then
-        const callArgs = vi.mocked(toolsCache.restoreToolsCache).mock.calls[0]?.[0]
-        expect(callArgs?.cacheMode).toBe('enabled')
-      })
-
-      it('passes disabled cacheMode to saveToolsCache when enableOmo is false', async () => {
-        // #given - default disabled mode
-
-        // #when
-        await runSetup(createSetupInputs(), 'ghs_test_token')
-
-        // #then
-        const saveArgs = vi.mocked(toolsCache.saveToolsCache).mock.calls[0]?.[0]
-        expect(saveArgs?.cacheMode).toBe('disabled')
-      })
-
-      it('passes enabled cacheMode to saveToolsCache when enableOmo is true on cache miss', async () => {
-        // #given - enabled mode with cache miss
-        vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({hit: false, restoredKey: null})
-        vi.mocked(toolsCache.saveToolsCache).mockResolvedValue(true)
-
-        // #when
-        await runSetup(createSetupInputs({enableOmo: true}), 'ghs_test_token')
-
-        // #then
-        const saveArgs = vi.mocked(toolsCache.saveToolsCache).mock.calls[0]?.[0]
-        expect(saveArgs?.cacheMode).toBe('enabled')
       })
 
       it('calls saveToolsCache after successful installs on cache miss', async () => {
@@ -1074,7 +799,7 @@ describe('setup', () => {
         // #given
         vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
           hit: true,
-          restoredKey: 'opencode-tools-v2-Linux-oc-1.0.300-omo-3.5.5-sys-2.1.0',
+          restoredKey: 'opencode-tools-v2-Linux-oc-1.0.300-sys-2.1.0',
         })
         vi.mocked(tc.find).mockReturnValue('/opt/hostedtoolcache/opencode/1.0.300/x64')
 
@@ -1093,7 +818,7 @@ describe('setup', () => {
         // #given
         vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
           hit: true,
-          restoredKey: 'opencode-tools-v2-Linux-oc-1.0.299-omo-3.5.5-sys-2.1.0',
+          restoredKey: 'opencode-tools-v2-Linux-oc-1.0.299-sys-2.1.0',
         })
         vi.mocked(tc.find).mockReturnValue('')
         vi.mocked(tc.downloadTool).mockResolvedValue('/tmp/opencode.tar.gz')
@@ -1180,7 +905,7 @@ describe('setup', () => {
         // #given
         vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
           hit: true,
-          restoredKey: 'opencode-tools-v2-Linux-oc-1.0.299-omo-3.5.5-sys-2.1.0',
+          restoredKey: 'opencode-tools-v2-Linux-oc-1.0.299-sys-2.1.0',
         })
         vi.mocked(tc.find).mockReturnValue('')
         vi.mocked(tc.downloadTool).mockResolvedValue('/tmp/opencode.tar.gz')
@@ -1229,7 +954,7 @@ describe('setup', () => {
         // #given a cache hit where the binary is actually found (opencodeResult.cached === true)
         vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
           hit: true,
-          restoredKey: 'opencode-tools-v2-Linux-oc-1.0.300-omo-3.5.5-sys-2.1.0',
+          restoredKey: 'opencode-tools-v2-Linux-oc-1.0.300-sys-2.1.0',
         })
         vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
 
@@ -1241,7 +966,7 @@ describe('setup', () => {
       })
     })
 
-    describe('Systematic config in both modes', () => {
+    describe('Systematic config', () => {
       beforeEach(() => {
         vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
         vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
@@ -1251,30 +976,14 @@ describe('setup', () => {
         vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
       })
 
-      it('writes Systematic config in disabled mode even if Bun would have failed', async () => {
-        // #given - Systematic config provided in disabled mode (no Bun involved)
+      it('writes Systematic config', async () => {
+        // #given - Systematic config provided
         const systematicConfig = JSON.stringify({mode: 'test'})
 
         // #when
         const result = await runSetup(createSetupInputs({systematicConfig}), 'ghs_test_token')
 
         // #then - Systematic config still written
-        expect(result).not.toBeNull()
-        const writeFileCalls = vi.mocked(fs.writeFile).mock.calls
-        const systematicConfigCall = writeFileCalls.find(
-          ([filePath]) => typeof filePath === 'string' && filePath.includes('systematic.json'),
-        )
-        expect(systematicConfigCall).toBeDefined()
-      })
-
-      it('writes Systematic config in enabled mode', async () => {
-        // #given
-        const systematicConfig = JSON.stringify({mode: 'test'})
-
-        // #when
-        const result = await runSetup(createSetupInputs({enableOmo: true, systematicConfig}), 'ghs_test_token')
-
-        // #then
         expect(result).not.toBeNull()
         const writeFileCalls = vi.mocked(fs.writeFile).mock.calls
         const systematicConfigCall = writeFileCalls.find(
@@ -1307,121 +1016,6 @@ describe('setup', () => {
         expect(result).not.toBeNull()
         expect(core.setFailed).not.toHaveBeenCalled()
         expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('systematic-config write failed'))
-      })
-    })
-
-    describe('slim mode (enableOmoSlim: true)', () => {
-      beforeEach(async () => {
-        vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
-        vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
-        vi.mocked(exec.exec).mockResolvedValue(0)
-        vi.mocked(fs.writeFile).mockResolvedValue()
-        vi.mocked(fs.mkdir).mockResolvedValue(undefined)
-        vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
-        vi.mocked(fs.readFile).mockRejectedValue(Object.assign(new Error('not found'), {code: 'ENOENT'}))
-        vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({hit: true, restoredKey: 'tools-key'})
-        vi.mocked(toolsCache.saveToolsCache).mockResolvedValue(true)
-        vi.mocked(github.getOctokit).mockReturnValue({
-          rest: {
-            users: {
-              getAuthenticated: vi.fn().mockResolvedValue({data: {login: 'fro-bot[bot]', type: 'Bot'}}),
-              getByUsername: vi.fn().mockResolvedValue({data: {id: 123456, login: 'fro-bot[bot]'}}),
-            },
-          },
-        } as never)
-        // Re-apply module mocks cleared by vi.resetAllMocks()
-        const bunMod = await import('./bun.js')
-        vi.mocked(bunMod.installBun).mockResolvedValue({path: '/cached/bun', version: '1.3.5', cached: true})
-        const omoSlimMod = await import('./omo-slim.js')
-        vi.mocked(omoSlimMod.installOmoSlim).mockResolvedValue({installed: true, version: '1.1.1', error: null})
-      })
-
-      it('writes the session tools file in slim mode too', async () => {
-        // #given
-
-        // #when
-        const result = await runSetup(createSetupInputs({enableOmoSlim: true}), 'ghs_test_token')
-
-        // #then
-        expect(result).not.toBeNull()
-        expect(sessionToolsConfig.writeSessionToolsFile).toHaveBeenCalledTimes(1)
-      })
-
-      it('slim install success: config has default_agent orchestrator and oh-my-opencode-slim plugin', async () => {
-        // #given - installOmoSlim returns {installed: true} (default mock)
-        const omoSlimModule = await import('./omo-slim.js')
-
-        // #when
-        const result = await runSetup(
-          createSetupInputs({enableOmoSlim: true, omoSlimVersion: '1.1.1'}),
-          'ghs_test_token',
-        )
-
-        // #then
-        expect(result).not.toBeNull()
-        expect(omoSlimModule.installOmoSlim).toHaveBeenCalled()
-        const configExportCall = vi
-          .mocked(core.exportVariable)
-          .mock.calls.find(([name]) => name === 'OPENCODE_CONFIG_CONTENT')
-        expect(configExportCall).toBeDefined()
-        const config = JSON.parse(configExportCall![1] as string) as Record<string, unknown>
-        expect(config.default_agent).toBe('orchestrator')
-        const plugins = config.plugin as string[]
-        expect(plugins.some(p => p.startsWith('oh-my-opencode-slim'))).toBe(true)
-      })
-
-      it('fix A: slim install failure → config falls back to disabled mode (default_agent: build, no slim plugin)', async () => {
-        // #given - installOmoSlim returns {installed: false}
-        const omoSlimModule = await import('./omo-slim.js')
-        vi.mocked(omoSlimModule.installOmoSlim).mockResolvedValueOnce({
-          installed: false,
-          version: null,
-          error: 'install failed',
-        })
-
-        // #when
-        const result = await runSetup(
-          createSetupInputs({enableOmoSlim: true, omoSlimVersion: '1.1.1'}),
-          'ghs_test_token',
-        )
-
-        // #then - graceful degradation: action continues, config falls back to disabled mode
-        expect(result).not.toBeNull()
-        expect(result?.omoSlimStatus).toBe('failed')
-        expect(core.setFailed).not.toHaveBeenCalled()
-        const configExportCall = vi
-          .mocked(core.exportVariable)
-          .mock.calls.find(([name]) => name === 'OPENCODE_CONFIG_CONTENT')
-        expect(configExportCall).toBeDefined()
-        const config = JSON.parse(configExportCall![1] as string) as Record<string, unknown>
-        // Must NOT pin orchestrator when slim install failed
-        expect(config.default_agent).toBe('build')
-        // Must NOT include oh-my-opencode-slim plugin
-        const plugins = config.plugin as string[]
-        expect(plugins.every(p => !p.startsWith('oh-my-opencode-slim'))).toBe(true)
-      })
-
-      it('fix B: unverified omoSlimVersion → setFailed called before installOmoSlim/installBun', async () => {
-        // #given - unverified version
-        const omoSlimModule = await import('./omo-slim.js')
-        const bunModule = await import('./bun.js')
-        vi.mocked(omoSlimModule.installOmoSlim).mockClear()
-        vi.mocked(bunModule.installBun).mockClear()
-
-        // #when
-        const result = await runSetup(
-          createSetupInputs({enableOmoSlim: true, omoSlimVersion: '9.9.9'}),
-          'ghs_test_token',
-        )
-
-        // #then - hard fail before installer
-        expect(result).toBeNull()
-        expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('9.9.9'))
-        expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('not verified'))
-        // installer MUST NOT have been called
-        expect(omoSlimModule.installOmoSlim).not.toHaveBeenCalled()
-        // Bun MUST NOT have been called (gate is before installBun)
-        expect(bunModule.installBun).not.toHaveBeenCalled()
       })
     })
   })
