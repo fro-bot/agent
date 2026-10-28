@@ -153,6 +153,24 @@ function stripTrailingCommas(content: string): string {
 }
 
 /**
+ * Maps a bun.lock package key to the directory it is installed in. A key is the chain of packages from the hoisted
+ * root down to the package ("archiver-utils/glob", "@a/b/@c/d"), and each hop is a nested `node_modules` directory.
+ */
+function installDirForKey(nodeModulesDir: string, key: string): string {
+  const parts = key.split('/').reduce<string[]>((acc, part) => {
+    const last = acc.at(-1)
+    // A scope and its package name are one hop ("@scope/name").
+    if (last !== undefined && last.startsWith('@') && !last.includes('/')) {
+      acc[acc.length - 1] = `${last}/${part}`
+    } else {
+      acc.push(part)
+    }
+    return acc
+  }, [])
+  return parts.reduce((dir, part, index) => join(dir, index === 0 ? part : join('node_modules', part)), nodeModulesDir)
+}
+
+/**
  * Resolves the lockfile key for a dependency given the current package's key.
  * Bun uses nested keys like "parent/dep" when a package uses a different version
  * of a dep than the hoisted top-level version.
@@ -268,8 +286,7 @@ export function collectProdClosureFromBunLock(
     // Only record the highest version per package name (matches existing dedup logic)
     const existing = result.get(actualName)
     if (existing === undefined || compareVersions(existing.version, version) < 0) {
-      const pkgDir = join(nodeModulesDir, actualName)
-      result.set(actualName, {version, pkgDir})
+      result.set(actualName, {version, pkgDir: installDirForKey(nodeModulesDir, key)})
     }
 
     // Traverse required + optional + peer deps.
