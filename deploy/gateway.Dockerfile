@@ -66,6 +66,7 @@ COPY apps/workspace-agent/package.json apps/workspace-agent/package.json
 COPY packages/runtime/package.json packages/runtime/package.json
 COPY packages/gateway/package.json packages/gateway/package.json
 COPY packages/harness/package.json packages/harness/package.json
+COPY packages/opencode-plugin/package.json packages/opencode-plugin/package.json
 
 # Install the full workspace (including devDependencies). The build typechecks
 # test files (which import vitest) and runs tsc/tsdown, so the build toolchain

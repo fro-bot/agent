@@ -1,0 +1,52 @@
+{
+  "name": "@fro.bot/opencode-plugin",
+  "version": "0.0.0-development",
+  "description": "Fro Bot's OpenCode V2 plugin: session history tools and the subagent session-reuse guard",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "fro-bot"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fro-bot/agent.git",
+    "directory": "packages/opencode-plugin"
+  },
+  "license": "MIT",
+  "author": "Fro Bot <agent@fro.bot>",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs"
+    }
+  },
+  "files": [
+    "LICENSE",
+    "README.md",
+    "dist"
+  ],
+  "scripts": {
+    "build": "bunx tsc -p tsconfig.json --noEmit && bunx tsdown",
+    "check-types": "bunx tsc -p tsconfig.json --noEmit",
+    "fix": "bunx eslint --fix src",
+    "lint": "bunx eslint src",
+    "test": "bunx vitest run --config ../../vitest.config.ts --passWithNoTests src"
+  },
+  "devDependencies": {
+    "@fro-bot/runtime": "workspace:*",
+    "@opencode/plugin": "2.2.0",
+    "effect": "4.0.1"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "^2.2.0",
+    "effect": "^4.0.0"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

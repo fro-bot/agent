@@ -47,6 +47,14 @@ function isBfraMePackage(name: string): boolean {
   return /^@bfra\.me\/[^/]+$/.test(name)
 }
 
+// The OpenCode V2 plugin API (`@opencode/plugin` and the `@opencode/*` packages it depends on) is the one other scope
+// allowed to skip the age gate: upstream's own build, published in lockstep. Only a bare `@opencode/<name>` entry
+// qualifies, so a version pin, a nested path or a look-alike scope is still rejected. These are exemptions only; nothing
+// requires a dependency to appear here, because the packages arrive transitively.
+function isOpenCodePackage(name: string): boolean {
+  return /^@opencode\/[^/@]+$/.test(name)
+}
+
 function dependencyNames(packageJson: PackageJson): readonly string[] {
   return (['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies'] as const).flatMap(field => {
     const value = packageJson[field]
@@ -116,7 +124,9 @@ export function checkBfraMeExemptions(
 
   return {
     missingDependencies: uniqueDependencies.filter(dependency => uniqueExcludes.includes(dependency) === false),
-    invalidExcludes: uniqueExcludes.filter(entry => isBfraMePackage(entry) === false),
+    invalidExcludes: uniqueExcludes.filter(
+      entry => isBfraMePackage(entry) === false && isOpenCodePackage(entry) === false,
+    ),
   }
 }
 
@@ -131,7 +141,7 @@ function actionableMessage(check: BfraMeExemptionCheck, lineNumber: number): str
   }
   if (check.invalidExcludes.length > 0) {
     messages.push(
-      `minimumReleaseAgeExcludes contains non-@bfra.me packages: ${check.invalidExcludes.join(', ')}; ` +
+      `minimumReleaseAgeExcludes contains packages outside the @bfra.me and @opencode scopes: ${check.invalidExcludes.join(', ')}; ` +
         `remove them from ${configLine}.`,
     )
   }
@@ -207,7 +217,34 @@ describe('checkBfraMeExemptions', () => {
 
     // #when / #then
     expect(check).toEqual({missingDependencies: [], invalidExcludes: ['lodash']})
-    expect(actionableMessage(check, 20)).toContain('non-@bfra.me packages: lodash; remove them from bunfig.toml:20.')
+    expect(actionableMessage(check, 20)).toContain(
+      'outside the @bfra.me and @opencode scopes: lodash; remove them from bunfig.toml:20.',
+    )
+  })
+
+  it('allows the @opencode packages of the OpenCode V2 plugin API as exemptions', () => {
+    // #given exemptions for the upstream plugin API packages next to the first-party ones
+    const check = checkBfraMeExemptions(['@bfra.me/es', '@opencode/plugin', '@opencode/schema'], ['@bfra.me/es'])
+
+    // #when / #then
+    expect(check).toEqual({missingDependencies: [], invalidExcludes: []})
+  })
+
+  it('does not widen the @opencode scope to look-alikes, nested paths or versioned entries', () => {
+    // #given entries that resemble the scope but are not a bare @opencode/<name> package
+    const check = checkBfraMeExemptions(
+      ['@opencode-ai/sdk', '@opencode/', '@opencode/plugin/extra', '@opencode/plugin@2.2.0', 'opencode'],
+      [],
+    )
+
+    // #when / #then
+    expect(check.invalidExcludes).toEqual([
+      '@opencode-ai/sdk',
+      '@opencode/',
+      '@opencode/plugin/extra',
+      '@opencode/plugin@2.2.0',
+      'opencode',
+    ])
   })
 
   it('allows a retained first-party exemption when its dependency is temporarily absent', () => {

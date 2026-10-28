@@ -77,6 +77,7 @@ export default defineConfig(
             join(import.meta.dirname, 'packages/runtime'),
             join(import.meta.dirname, 'packages/gateway'),
             join(import.meta.dirname, 'packages/harness'),
+            join(import.meta.dirname, 'packages/opencode-plugin'),
           ],
           // devDependencies are legitimate in tests, test support, config, and
           // build scripts.
