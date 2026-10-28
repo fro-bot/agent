@@ -20,7 +20,8 @@ export interface WorkspaceConfigV2Inputs {
 }
 
 /**
- * The workspace `OPENCODE_CONFIG_CONTENT`. Unlike the Action it keeps `question`, which the gateway relays to Discord.
+ * The workspace `OPENCODE_CONFIG_CONTENT`. Unlike the Action it keeps `question`, which the gateway relays to Discord,
+ * and it asks before tool access outside the checkout, which the gateway relays to Discord approval.
  * The caller sets `OPENCODE_DISABLE_PROJECT_CONFIG=1` on the spawn.
  */
 export function buildWorkspaceConfigV2(inputs: WorkspaceConfigV2Inputs, logger: Logger): Result<BuiltConfigV2, string> {
@@ -31,7 +32,12 @@ export function buildWorkspaceConfigV2(inputs: WorkspaceConfigV2Inputs, logger: 
     return err(`allowedExternalDirectories must be absolute paths, got: ${relative}`)
   }
 
-  const rules = buildPermissionRulesV2({allowedExternalDirectories, editDenyResources: [], denyQuestion: false})
+  const rules = buildPermissionRulesV2({
+    outsideEffect: 'ask',
+    allowedExternalDirectories,
+    editDenyResources: [],
+    denyQuestion: false,
+  })
 
   logger.debug('Built workspace OpenCode config', {
     pluginCount: inputs.plugins.length,
@@ -42,6 +48,7 @@ export function buildWorkspaceConfigV2(inputs: WorkspaceConfigV2Inputs, logger: 
     content: buildConfigContentV2({plugins: inputs.plugins, rules}),
     expectations: {
       outsideDirectories: [OUTSIDE_SENTINEL_DIRECTORY],
+      outsidePolicy: 'ask-or-deny',
       allowedDirectories: allowedExternalDirectories,
       deniedActions: FORBIDDEN_TOOL_ACTIONS_V2,
     },

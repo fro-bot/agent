@@ -87,6 +87,7 @@ describe('buildCIConfigV2', () => {
 
       // #then
       expect(expectations.allowedDirectories).toEqual([RESPONSE_DIR, ATTACHMENT_DIR])
+      expect(expectations.outsidePolicy).toBe('deny')
       expect(expectations.outsideDirectories).toEqual([
         '/fro-bot-gate-sentinel/outside',
         `${RUNNER_TEMP}/fro-bot-response/gate-sentinel-other-run`,

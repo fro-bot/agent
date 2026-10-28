@@ -17,6 +17,7 @@ const ATTACHMENT_DIR = '/runner/_temp/fro-bot-attachments/42-1'
 
 const EXPECTATIONS: PermissionGateExpectations = {
   outsideDirectories: ['/fro-bot-gate-sentinel/outside', '/runner/_temp/fro-bot-attachments/other-run'],
+  outsidePolicy: 'deny',
   allowedDirectories: [RESPONSE_DIR, ATTACHMENT_DIR],
   deniedActions: ['opencode_session_move', 'opencode_worktree_create'],
 }
@@ -27,6 +28,7 @@ function makeLogger(): Logger {
 
 function goodRules(): readonly PermissionRuleV2[] {
   return buildPermissionRulesV2({
+    outsideEffect: 'deny',
     allowedExternalDirectories: [RESPONSE_DIR, ATTACHMENT_DIR],
     editDenyResources: [],
     denyQuestion: true,
@@ -155,7 +157,77 @@ describe('verifyPermissionRules', () => {
     const result = await verifyPermissionRules(source, EXPECTATIONS, makeLogger())
 
     // #then
-    expect(violationsOf(result).map(v => [v.agentId, v.check])).toContainEqual(['build', 'outside-not-denied'])
+    expect(violationsOf(result).map(v => [v.agentId, v.check])).toContainEqual(['build', 'outside-policy-violated'])
+  })
+
+  it('fails an Action expectation when the outside rule is ask, because the Action requires deny', async () => {
+    // #given
+    const askOutside = buildPermissionRulesV2({
+      outsideEffect: 'ask',
+      allowedExternalDirectories: [RESPONSE_DIR, ATTACHMENT_DIR],
+      editDenyResources: [],
+      denyQuestion: true,
+    })
+    const source = sourceOf(envelope(effectiveAgents(askOutside)))
+
+    // #when
+    const result = await verifyPermissionRules(source, EXPECTATIONS, makeLogger())
+
+    // #then
+    const violations = violationsOf(result)
+    expect(violations.length).toBeGreaterThan(0)
+    expect(violations.every(v => v.check === 'outside-policy-violated' && v.effect === 'ask')).toBe(true)
+  })
+
+  it('passes a workspace expectation when the outside rule is ask, or deny', async () => {
+    // #given
+    const workspace: PermissionGateExpectations = {...EXPECTATIONS, outsidePolicy: 'ask-or-deny'}
+    const rulesFor = (outsideEffect: 'ask' | 'deny') =>
+      buildPermissionRulesV2({
+        outsideEffect,
+        allowedExternalDirectories: [RESPONSE_DIR, ATTACHMENT_DIR],
+        editDenyResources: [],
+        denyQuestion: false,
+      })
+
+    // #when
+    const asked = await verifyPermissionRules(
+      sourceOf(envelope(effectiveAgents(rulesFor('ask')))),
+      workspace,
+      makeLogger(),
+    )
+    const denied = await verifyPermissionRules(
+      sourceOf(envelope(effectiveAgents(rulesFor('deny')))),
+      workspace,
+      makeLogger(),
+    )
+
+    // #then
+    expect(reportOf(asked).checkedAgents).toEqual(['build', 'general', 'explore'])
+    expect(reportOf(denied).checkedAgents).toEqual(['build', 'general', 'explore'])
+  })
+
+  it('fails a workspace expectation when an outside sentinel resolves to allow', async () => {
+    // #given
+    const workspace: PermissionGateExpectations = {...EXPECTATIONS, outsidePolicy: 'ask-or-deny'}
+    const overridden: readonly PermissionRuleV2[] = [
+      ...buildPermissionRulesV2({
+        outsideEffect: 'ask',
+        allowedExternalDirectories: [RESPONSE_DIR, ATTACHMENT_DIR],
+        editDenyResources: [],
+        denyQuestion: false,
+      }),
+      {action: 'external_directory', resource: '*', effect: 'allow'},
+    ]
+    const source = sourceOf(envelope(effectiveAgents(goodRules(), {build: overridden})))
+
+    // #when
+    const result = await verifyPermissionRules(source, workspace, makeLogger())
+
+    // #then
+    const violations = violationsOf(result)
+    expect(violations.every(v => v.agentId === 'build' && v.check === 'outside-policy-violated')).toBe(true)
+    expect(violations.every(v => v.effect === 'allow')).toBe(true)
   })
 
   it('fails when a subagent is missing the deny while build has it', async () => {
@@ -184,12 +256,13 @@ describe('verifyPermissionRules', () => {
     const result = await verifyPermissionRules(source, EXPECTATIONS, makeLogger())
 
     // #then
-    expect(violationsOf(result).some(v => v.agentId === 'explore' && v.check === 'outside-not-denied')).toBe(true)
+    expect(violationsOf(result).some(v => v.agentId === 'explore' && v.check === 'outside-policy-violated')).toBe(true)
   })
 
   it('fails when the response-file exception is missing', async () => {
     // #given
     const rules = buildPermissionRulesV2({
+      outsideEffect: 'deny',
       allowedExternalDirectories: [ATTACHMENT_DIR],
       editDenyResources: [],
       denyQuestion: true,
@@ -209,6 +282,7 @@ describe('verifyPermissionRules', () => {
   it('fails when the attachment exception is missing', async () => {
     // #given
     const rules = buildPermissionRulesV2({
+      outsideEffect: 'deny',
       allowedExternalDirectories: [RESPONSE_DIR],
       editDenyResources: [],
       denyQuestion: true,
@@ -250,7 +324,7 @@ describe('verifyPermissionRules', () => {
     // #then
     const violations = violationsOf(result)
     expect(new Set(violations.map(v => v.check))).toEqual(
-      new Set(['outside-not-denied', 'exception-not-allowed', 'action-not-denied']),
+      new Set(['outside-policy-violated', 'exception-not-allowed', 'action-not-denied']),
     )
     expect(violations.every(v => v.effect === 'ask')).toBe(true)
   })
@@ -258,6 +332,7 @@ describe('verifyPermissionRules', () => {
   it('evaluates a directory given with a trailing slash as the same resource', async () => {
     // #given
     const rules = buildPermissionRulesV2({
+      outsideEffect: 'deny',
       allowedExternalDirectories: [RESPONSE_DIR, ATTACHMENT_DIR],
       editDenyResources: [],
       denyQuestion: true,

@@ -35,7 +35,9 @@ export function externalDirectoryResource(directory: string): string {
 }
 
 export interface PermissionRulesInput {
-  /** Directories outside the checkout that stay reachable. Each becomes one `<dir>/*` allow after the outside deny. */
+  /** What a directory outside the checkout resolves to: `deny` in the Action, `ask` in the gateway workspace. */
+  readonly outsideEffect: Exclude<PermissionEffectV2, 'allow'>
+  /** Directories outside the checkout that stay reachable. Each becomes one `<dir>/*` allow after the outside rule. */
   readonly allowedExternalDirectories: readonly string[]
   /** `edit` resources denied outright, for example workspace-relative shadows of the response-file directory. */
   readonly editDenyResources: readonly string[]
@@ -44,10 +46,10 @@ export interface PermissionRulesInput {
 }
 
 /**
- * The ordered rule list. Order matters: the specific allows come after the `*` deny they carve out of.
+ * The ordered rule list. Order matters: the specific allows come after the `*` outside rule they carve out of.
  */
 export function buildPermissionRulesV2(input: PermissionRulesInput): readonly PermissionRuleV2[] {
-  const rules: PermissionRuleV2[] = [{action: 'external_directory', resource: '*', effect: 'deny'}]
+  const rules: PermissionRuleV2[] = [{action: 'external_directory', resource: '*', effect: input.outsideEffect}]
 
   for (const directory of input.allowedExternalDirectories) {
     rules.push({action: 'external_directory', resource: externalDirectoryResource(directory), effect: 'allow'})

@@ -33,7 +33,7 @@ V2 is a rewrite. It has a new `/api/*` HTTP API, new event names, a new client a
 | R11 Systematic V2 gates each switch                                        | U9, U13           |
 | R12 probes gate each switch                                                | U1, U9, U13       |
 | R13-R16 Action continuity (precedence, key name, V1 deletion, import wait) | U10, U11, U14     |
-| R17 outside-directory deny, fail closed                                    | U5                |
+| R17 outside-directory deny (Action) or ask (gateway), fail closed                                    | U5                |
 | R18 no pending question in Action runs                                     | U5, U12           |
 | R19 Code Mode on; deny holds; session move and worktree tools denied       | U1, U5, U8, U12   |
 | R20 per-spawn password, never logged                                       | U3, U7            |
@@ -489,7 +489,7 @@ install pinned binary (digest) -> install plugins (bounded) -> write V2 config
 
 - [ ] **Unit 5: V2 config builder and permission gate**
 
-**Goal:** CI and workspace config in V2 shape, with fail-closed deny checks against the effective rules.
+**Goal:** CI and workspace config in V2 shape, with fail-closed outside-access checks against the effective rules.
 
 **Requirements:** R17, R18, R19
 
@@ -507,11 +507,11 @@ install pinned binary (digest) -> install plugins (bounded) -> write V2 config
 - The builder emits:
   - `plugins` (V2 key);
   - `experimental.subagent_depth`;
-  - an ordered permission list: outside the checkout denied, with the run-scoped response-file and attachment exceptions; `.env` edits denied; `doom_loop` denied;
+  - an ordered permission list: outside the checkout denied in the Action and asked in the gateway workspace, with the run-scoped response-file and attachment exceptions in the Action and caller-supplied directories in the workspace; `.env` edits denied; `doom_loop` denied;
   - in the Action only, `question` denied;
   - the session-move and worktree-create tools denied.
 - Project config is disabled in CI.
-- The gate reads effective per-agent rules from `GET /api/agent`. For every agent that can run tools, including subagents, it evaluates the outside-checkout, response-file and attachment sentinels. A missing deny or a missing exception fails startup.
+- The gate reads effective per-agent rules from `GET /api/agent`. For every agent that can run tools, including subagents, it evaluates the outside-checkout, response-file and attachment sentinels. The Action requires `deny` outside the checkout. The workspace accepts `ask` or `deny`, never `allow`. A violated outside policy, a missing exception or a missing forbidden-tool deny fails startup.
 - The Action's no-pending-question guarantee has two parts: the config deny on `question`, and the runtime form-cancel in U12. The gate does not check for `question`.
 - The V2 managed config for the workspace is a separate file. The V1 file stays unchanged.
 
@@ -521,9 +521,10 @@ install pinned binary (digest) -> install plugins (bounded) -> write V2 config
 
 **Test scenarios:**
 
-- Happy path: for the build agent and each subagent type, the golden rules deny outside paths and `.env` and allow the response-file and attachment directories.
+- Happy path: for the build agent and each subagent type, the golden Action rules deny outside paths and `.env` and allow the response-file and attachment directories. The workspace rules ask for outside paths.
 - Error path: the outside deny is missing, so the gate fails startup.
-- Error path: a later allow overrides the deny under last-match-wins, so the gate fails startup.
+- Error path: a later allow overrides the deny under last-match-wins, so the gate fails startup. In the workspace, a later allow overriding the ask fails the same way.
+- Error path: an Action config with `ask` outside fails the gate, because the Action requires `deny`.
 - Edge case: on the gateway, `question` is kept.
 - Integration: when the builder's output is loaded by a fixture server, the gate passes. That test is gated on the P6 result shape.
 

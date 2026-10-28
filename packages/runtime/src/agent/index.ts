@@ -87,6 +87,7 @@ export {
 export {evaluatePermissionV2, verifyPermissionRules} from './permission-gate-v2.js'
 export type {
   AgentListSource,
+  OutsidePolicyV2,
   PermissionGateCheck,
   PermissionGateError,
   PermissionGateExpectations,

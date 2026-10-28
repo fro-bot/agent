@@ -145,6 +145,7 @@ export function buildCIConfigV2(inputs: CIConfigV2Inputs, logger: Logger): Resul
   }
 
   const rules = buildPermissionRulesV2({
+    outsideEffect: 'deny',
     allowedExternalDirectories: allowedDirectories,
     editDenyResources,
     denyQuestion: true,
@@ -172,6 +173,7 @@ export function buildCIConfigV2(inputs: CIConfigV2Inputs, logger: Logger): Resul
     content,
     expectations: {
       outsideDirectories,
+      outsidePolicy: 'deny',
       allowedDirectories,
       deniedActions: FORBIDDEN_TOOL_ACTIONS_V2,
     },

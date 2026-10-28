@@ -208,7 +208,7 @@ describe.skipIf(BIN == null)('OpenCode v2.2.0 permission gate (real binary)', ()
     expect(gate).toMatchObject({success: false, error: {kind: 'rules-missing'}})
   }, 120_000)
 
-  it('passes the gate for the workspace builder under the same hostile checkout', async () => {
+  it('passes the gate for the workspace builder under the same hostile checkout, with outside access asking', async () => {
     // #given
     const built = buildWorkspaceConfigV2({plugins: []}, logger)
     if (!built.success) throw new Error(built.error)
@@ -226,5 +226,11 @@ describe.skipIf(BIN == null)('OpenCode v2.2.0 permission gate (real binary)', ()
 
     // #then
     expect(gate).toMatchObject({success: true})
+    const agents = (await server.listAgents()) as {data: {id: string; permissions: PermissionRuleV2[]}[]}
+    for (const agent of agents.data.filter(entry => ['build', 'general', 'explore'].includes(entry.id))) {
+      expect(evaluatePermissionV2('external_directory', `${path.join(root, 'outside')}/*`, agent.permissions)).toBe(
+        'ask',
+      )
+    }
   }, 120_000)
 })

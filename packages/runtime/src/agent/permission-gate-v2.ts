@@ -5,7 +5,8 @@
  * with the configured `permissions` appended (`protocol/src/groups/agent.ts` `agent.list`, response
  * `{location, data: Agent.Info[]}`; `schema/src/agent.ts` `Agent.Info.permissions` is `{action, resource, effect}[]`).
  * The gate evaluates sentinel resources against each tool-capable agent, subagents included, and fails if an outside
- * deny, a delivery-path exception or a forbidden-tool deny is missing.
+ * resource is reachable under the surface's policy, a delivery-path exception is missing, or a forbidden-tool deny is
+ * missing.
  *
  * It checks that the rules exist, not that the server enforces them. It does not check `question` or `.env`.
  */
@@ -25,16 +26,30 @@ export interface AgentListSource {
   readonly listAgents: () => Promise<unknown>
 }
 
+/**
+ * What an outside-checkout directory must evaluate to.
+ * - `deny`: the Action, where nobody can answer an ask.
+ * - `ask-or-deny`: the gateway workspace, where an ask goes to Discord approval. `allow` never passes.
+ */
+export type OutsidePolicyV2 = 'deny' | 'ask-or-deny'
+
+const OUTSIDE_POLICY_EFFECTS = {
+  deny: ['deny'],
+  'ask-or-deny': ['ask', 'deny'],
+} as const satisfies Record<OutsidePolicyV2, readonly PermissionEffectV2[]>
+
 export interface PermissionGateExpectations {
-  /** Directories outside the checkout that must evaluate to `deny`. */
+  /** Directories outside the checkout that `outsidePolicy` is checked against. */
   readonly outsideDirectories: readonly string[]
+  /** The effects an outside directory may evaluate to. */
+  readonly outsidePolicy: OutsidePolicyV2
   /** Delivery-path directories that must evaluate to `allow`. */
   readonly allowedDirectories: readonly string[]
   /** Tool actions that must evaluate to `deny`. */
   readonly deniedActions: readonly string[]
 }
 
-export type PermissionGateCheck = 'outside-not-denied' | 'exception-not-allowed' | 'action-not-denied'
+export type PermissionGateCheck = 'outside-policy-violated' | 'exception-not-allowed' | 'action-not-denied'
 
 export interface PermissionGateViolation {
   readonly agentId: string
@@ -111,7 +126,8 @@ function checkAgent(
   for (const directory of expectations.outsideDirectories) {
     const subject = externalDirectoryResource(directory)
     const effect = evaluatePermissionV2('external_directory', subject, rules)
-    if (effect !== 'deny') violations.push({agentId, check: 'outside-not-denied', subject, effect})
+    const permitted: readonly PermissionEffectV2[] = OUTSIDE_POLICY_EFFECTS[expectations.outsidePolicy]
+    if (!permitted.includes(effect)) violations.push({agentId, check: 'outside-policy-violated', subject, effect})
   }
 
   for (const directory of expectations.allowedDirectories) {

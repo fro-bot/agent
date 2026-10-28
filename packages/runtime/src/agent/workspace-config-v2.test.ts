@@ -51,15 +51,16 @@ describe('buildWorkspaceConfigV2', () => {
     }
   })
 
-  it('denies outside the checkout with no exceptions by default', () => {
+  it('asks before outside-checkout access with no exceptions by default', () => {
     // #given / #when
     const {content, expectations} = build()
     const rules = rulesOf(content)
 
     // #then
     expect(rules.filter(rule => rule.action === 'external_directory')).toEqual([
-      {action: 'external_directory', resource: '*', effect: 'deny'},
+      {action: 'external_directory', resource: '*', effect: 'ask'},
     ])
+    expect(expectations.outsidePolicy).toBe('ask-or-deny')
     expect(expectations.allowedDirectories).toEqual([])
     expect(expectations.outsideDirectories.length).toBeGreaterThan(0)
   })
@@ -70,7 +71,7 @@ describe('buildWorkspaceConfigV2', () => {
 
     // #then
     expect(evaluatePermissionV2('external_directory', '/var/lib/fro-bot/shared/*', rulesOf(content))).toBe('allow')
-    expect(evaluatePermissionV2('external_directory', '/etc/*', rulesOf(content))).toBe('deny')
+    expect(evaluatePermissionV2('external_directory', '/etc/*', rulesOf(content))).toBe('ask')
     expect(expectations.allowedDirectories).toEqual(['/var/lib/fro-bot/shared'])
   })
 
@@ -90,6 +91,27 @@ describe('buildWorkspaceConfigV2', () => {
   it('rejects a relative exception directory', () => {
     // #given / #when
     const result = buildWorkspaceConfigV2({plugins: [], allowedExternalDirectories: ['shared']}, makeLogger())
+
+    // #then
+    expect(result.success).toBe(false)
+  })
+
+  it('fails its own gate when an outside sentinel resolves to allow', async () => {
+    // #given
+    const {content, expectations} = build()
+    const agents = [
+      {
+        id: 'build',
+        permissions: [...rulesOf(content), {action: 'external_directory', resource: '*', effect: 'allow'}],
+      },
+    ]
+
+    // #when
+    const result = await verifyPermissionRules(
+      {listAgents: async () => ({location: {}, data: agents})},
+      expectations,
+      makeLogger(),
+    )
 
     // #then
     expect(result.success).toBe(false)
