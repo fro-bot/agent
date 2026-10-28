@@ -1,17 +1,18 @@
+import type {SessionGeneration} from '@fro-bot/runtime'
 import type {CacheSaveResult} from '../../shared/cache-save-result.js'
 import type {Logger} from '../../shared/logger.js'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import process from 'node:process'
 import * as core from '@actions/core'
-import {createS3Adapter, syncSessionsToStore} from '@fro-bot/runtime'
+import {createS3Adapter, getSessionDbBasenames, syncSessionsToStore} from '@fro-bot/runtime'
 import {STORAGE_VERSION} from '../../shared/constants.js'
 import {getGitHubRunAttempt, getInvocationIdentity} from '../../shared/env.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {htmlParagraph, htmlStrong, htmlText} from '../../shared/summary-html.js'
-import {buildSaveCacheKey} from './cache-key.js'
+import {buildSaveCacheKey, resolveSessionGeneration} from './cache-key.js'
 import {checkpointDatabase} from './checkpoint.js'
-import {buildCachePaths, DB_FAMILY_BASENAMES, DB_MAIN_BASENAME, DB_WAL_BASENAME, deleteAuthJson} from './paths.js'
+import {buildCachePaths, buildCachePathsV2, deleteAuthJson} from './paths.js'
 import {defaultCacheAdapter, type SaveCacheOptions} from './types.js'
 
 async function writeStorageVersion(storagePath: string): Promise<void> {
@@ -56,7 +57,11 @@ async function directoryHasContent(dirPath: string): Promise<boolean> {
  * machine-local and stale by construction), so it never appears in cachePaths here. A
  * workspace whose only non-empty file is -shm correctly reports no cacheable content.
  */
-async function hasCacheableContent(storagePath: string, cachePaths: readonly string[]): Promise<boolean> {
+async function hasCacheableContent(
+  storagePath: string,
+  cachePaths: readonly string[],
+  generation: SessionGeneration,
+): Promise<boolean> {
   if (await directoryHasContent(storagePath)) {
     return true
   }
@@ -65,7 +70,7 @@ async function hasCacheableContent(storagePath: string, cachePaths: readonly str
   // sufficient. DB_FAMILY_BASENAMES is the single shared definition of these filenames
   // (see paths.ts); checking cachePaths membership is the right gate (avoids redundant
   // stat calls) and naturally excludes -shm since it is never in cachePaths.
-  const dbFamilyPaths = cachePaths.filter(p => DB_FAMILY_BASENAMES.includes(path.basename(p)))
+  const dbFamilyPaths = cachePaths.filter(p => getSessionDbBasenames(generation).family.includes(path.basename(p)))
 
   for (const dbPath of dbFamilyPaths) {
     try {
@@ -138,7 +143,11 @@ export async function saveCache(options: SaveCacheOptions): Promise<CacheSaveRes
   // widening SaveCacheOptions -- runAttempt and the invocation identity (job + matrix leg) are
   // process-wide runner facts, not per-call configuration. Deriving both here is also what
   // guarantees the post-action retry (post.ts) saves under exactly the key cleanup would have.
-  const saveKey = buildSaveCacheKey(components, runId, getGitHubRunAttempt(), getInvocationIdentity())
+  //
+  // V2 saves write only V2 keys (`opencode-v2-storage-*` in the cache, `sessions-v2/` in the object store); V1
+  // saves are unchanged. The generation comes from the same `opencodeVersion` the restore and the post hook use.
+  const generation = resolveSessionGeneration(opencodeVersion)
+  const saveKey = buildSaveCacheKey(components, runId, getGitHubRunAttempt(), getInvocationIdentity(), generation)
   // Tracked across the try block (and visible to the catch below) because the store sync
   // and the cache write are independent backends: a thrown error from the cache write
   // (including the caught "already exists" collision) must not erase whatever the object
@@ -158,8 +167,9 @@ export async function saveCache(options: SaveCacheOptions): Promise<CacheSaveRes
     // through opencode.db by the time either transport looks for it, rather than sitting
     // unmerged in a file neither one will ever pick up.
     const dbDir = path.dirname(storagePath)
-    const dbPath = path.join(dbDir, DB_MAIN_BASENAME)
-    const walPath = path.join(dbDir, DB_WAL_BASENAME)
+    const dbBasenames = getSessionDbBasenames(generation)
+    const dbPath = path.join(dbDir, dbBasenames.main)
+    const walPath = path.join(dbDir, dbBasenames.wal)
     const checkpointOutcome = await checkpointDatabase({dbPath, walPath, logger})
     if (checkpointOutcome.status === 'failed') {
       logger.warning('Declining cache save: SQLite checkpoint did not complete', {
@@ -169,10 +179,13 @@ export async function saveCache(options: SaveCacheOptions): Promise<CacheSaveRes
       return {cachePersisted: false, storePersisted: false, outcome: 'checkpoint-declined'}
     }
 
-    const cachePaths = await buildCachePaths(storagePath, projectIdPath, opencodeVersion)
+    const cachePaths =
+      generation === 'v2'
+        ? buildCachePathsV2(storagePath, projectIdPath)
+        : await buildCachePaths(storagePath, projectIdPath, opencodeVersion)
     logger.info('Saving cache', {saveKey, paths: cachePaths})
 
-    const hasContent = await hasCacheableContent(storagePath, cachePaths)
+    const hasContent = await hasCacheableContent(storagePath, cachePaths, generation)
     if (hasContent === false) {
       logger.info('No storage content to cache')
       return {cachePersisted: false, storePersisted: false, outcome: 'skipped-empty'}
@@ -195,6 +208,7 @@ export async function saveCache(options: SaveCacheOptions): Promise<CacheSaveRes
           components.repo,
           storagePath,
           logger,
+          generation,
         )
         logger.info('Object store session sync completed', syncResult)
         storePersisted = syncResult.uploaded > 0 && syncResult.failed === 0

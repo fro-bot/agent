@@ -1,13 +1,21 @@
+import type {SessionGeneration} from '@fro-bot/runtime'
 import type {CacheResult} from '../../shared/types.js'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import process from 'node:process'
-import {createS3Adapter, syncSessionsFromStore} from '@fro-bot/runtime'
+import {createS3Adapter, getSessionDbBasenames, syncSessionsFromStore} from '@fro-bot/runtime'
 import {STORAGE_VERSION} from '../../shared/constants.js'
 import {toErrorMessage} from '../../shared/errors.js'
-import {buildPrimaryCacheKey, buildRestoreKeys} from './cache-key.js'
+import {
+  buildPrimaryCacheKey,
+  buildRestoreTiers,
+  classifyRestoreHit,
+  resolveSessionGeneration,
+  type RestoreTier,
+} from './cache-key.js'
 import {
   buildCachePaths,
+  buildCachePathsV2,
   buildDbFamilyPaths,
   buildDbShmPath,
   buildDbWalPath,
@@ -79,14 +87,19 @@ export async function cleanStorage(storagePath: string): Promise<void> {
 // from another runner is stale by construction and safe to delete locally — SQLite
 // rebuilds it on demand. Deleting it (rather than waiting for old cache entries to age
 // out) removes the hazard immediately after every restore, cache or object-store.
-async function deleteRestoredShm(storagePath: string, logger: RestoreCacheOptions['logger']): Promise<void> {
-  const shmPath = buildDbShmPath(storagePath)
+async function deleteRestoredShm(
+  storagePath: string,
+  logger: RestoreCacheOptions['logger'],
+  generation: SessionGeneration,
+): Promise<void> {
+  const shmPath = buildDbShmPath(storagePath, generation)
+  const shmName = getSessionDbBasenames(generation).shm
   try {
     await fs.unlink(shmPath)
-    logger.debug('Deleted restored opencode.db-shm (machine-local, stale by construction)')
+    logger.debug(`Deleted restored ${shmName} (machine-local, stale by construction)`)
   } catch (error) {
     if (!isErrnoException(error) || error.code !== 'ENOENT') {
-      logger.warning('Failed to delete restored opencode.db-shm', {
+      logger.warning(`Failed to delete restored ${shmName}`, {
         error: toErrorMessage(error),
       })
     }
@@ -130,8 +143,9 @@ async function deleteRestoredShm(storagePath: string, logger: RestoreCacheOption
 async function deleteDownloadedObjectStoreWal(
   storagePath: string,
   logger: RestoreCacheOptions['logger'],
+  generation: SessionGeneration,
 ): Promise<void> {
-  const walPath = buildDbWalPath(storagePath)
+  const walPath = buildDbWalPath(storagePath, generation)
   try {
     await fs.unlink(walPath)
     logger.debug('Deleted write-ahead log downloaded from object store (untrusted pairing, see restore.ts)')
@@ -144,7 +158,10 @@ async function deleteDownloadedObjectStoreWal(
   }
 }
 
-async function restoreFromObjectStore(options: RestoreCacheOptions): Promise<CacheResult> {
+async function restoreFromObjectStore(
+  options: RestoreCacheOptions,
+  generation: SessionGeneration,
+): Promise<CacheResult> {
   const {storeConfig, storeAdapter, logger, storagePath, components} = options
 
   if (storeConfig?.enabled !== true) {
@@ -166,12 +183,13 @@ async function restoreFromObjectStore(options: RestoreCacheOptions): Promise<Cac
       components.repo,
       storagePath,
       logger,
+      generation,
     )
 
     if (syncResult.mainDbRestored === true) {
       // The object store sync writes opencode.db beside storagePath; ensure this cache directory exists before returning.
       await fs.mkdir(storagePath, {recursive: true})
-      await deleteRestoredShm(storagePath, logger)
+      await deleteRestoredShm(storagePath, logger, generation)
 
       // A successful object-store restore used to return here, before either integrity
       // check ever ran — the path that wins on restore had no checks. A corrupt or
@@ -222,7 +240,7 @@ async function restoreFromObjectStore(options: RestoreCacheOptions): Promise<Cac
       error: toErrorMessage(error),
     })
   } finally {
-    await deleteDownloadedObjectStoreWal(storagePath, logger)
+    await deleteDownloadedObjectStoreWal(storagePath, logger, generation)
   }
 
   return {
@@ -244,16 +262,109 @@ function restoreAfterCorruption(restoredKey: string): CacheResult {
   }
 }
 
+/**
+ * Object-store restore order: the run's own generation first, then V1 when the run is V2. The first hit wins. A
+ * miss that left corrupted storage behind is reported as corrupted even when a later attempt also misses.
+ */
+async function restoreFromObjectStoreTiers(
+  options: RestoreCacheOptions,
+  generation: SessionGeneration,
+): Promise<CacheResult> {
+  const attempts: readonly SessionGeneration[] = generation === 'v2' ? ['v2', 'v1'] : ['v1']
+  let corrupted = false
+
+  for (const attempt of attempts) {
+    const result = await restoreFromObjectStore(options, attempt)
+    if (result.hit === true) {
+      return result
+    }
+    corrupted = corrupted || result.corrupted
+  }
+
+  return {
+    hit: false,
+    key: null,
+    restoredPath: null,
+    corrupted,
+    source: null,
+  }
+}
+
+interface CacheTierHit {
+  readonly key: string
+  readonly generation: SessionGeneration
+}
+
+interface CacheRestorePlan {
+  readonly generation: SessionGeneration
+  readonly tiers: readonly RestoreTier[]
+  readonly pathsFor: (generation: SessionGeneration) => string[]
+}
+
+/**
+ * Builds every key and path list a restore needs before anything touches disk, so the object-store attempts that
+ * run first cannot change what the cache is asked for (`buildCachePaths` probes the filesystem when no version is
+ * known).
+ */
+async function planCacheRestore(
+  options: RestoreCacheOptions,
+  generation: SessionGeneration,
+): Promise<CacheRestorePlan> {
+  const {components, logger, storagePath, projectIdPath, opencodeVersion} = options
+  const v1Paths = await buildCachePaths(storagePath, projectIdPath, opencodeVersion)
+  const v2Paths = generation === 'v2' ? buildCachePathsV2(storagePath, projectIdPath) : v1Paths
+  const tiers = buildRestoreTiers(components, generation)
+  const plan: CacheRestorePlan = {
+    generation,
+    tiers,
+    pathsFor: tierGeneration => (tierGeneration === 'v2' ? v2Paths : v1Paths),
+  }
+
+  logger.info('Restoring cache', {
+    primaryKey: buildPrimaryCacheKey(components, generation),
+    restoreKeys: tiers.map(tier => tier.key),
+    paths: plan.pathsFor(generation),
+  })
+
+  return plan
+}
+
+/**
+ * Actions-cache restore. A V1 run makes the one call it always made. A V2 run walks the tiers in order, V2 branch,
+ * V1 branch, V2 repo, V1 repo, one call each with that generation's own primary key and path list, and stops at
+ * the first hit.
+ */
+async function restoreFromCacheTiers(
+  options: RestoreCacheOptions,
+  plan: CacheRestorePlan,
+): Promise<CacheTierHit | undefined> {
+  const {components, cacheAdapter = defaultCacheAdapter} = options
+
+  if (plan.generation === 'v1') {
+    const restoredKey = await cacheAdapter.restoreCache(
+      plan.pathsFor('v1'),
+      buildPrimaryCacheKey(components),
+      plan.tiers.map(tier => tier.key),
+    )
+    return restoredKey == null ? undefined : {key: restoredKey, generation: 'v1'}
+  }
+
+  for (const tier of plan.tiers) {
+    const restoredKey = await cacheAdapter.restoreCache(
+      plan.pathsFor(tier.generation),
+      buildPrimaryCacheKey(components, tier.generation),
+      [tier.key],
+    )
+    if (restoredKey != null) {
+      return {key: restoredKey, generation: tier.generation}
+    }
+  }
+
+  return undefined
+}
+
 export async function restoreCache(options: RestoreCacheOptions): Promise<CacheResult> {
-  const {
-    components,
-    logger,
-    storagePath,
-    authPath,
-    projectIdPath,
-    opencodeVersion,
-    cacheAdapter = defaultCacheAdapter,
-  } = options
+  const {components, logger, storagePath, authPath, opencodeVersion} = options
 
   if (process.env.SKIP_CACHE === 'true') {
     logger.debug('Skipping cache restore (SKIP_CACHE=true)')
@@ -267,28 +378,29 @@ export async function restoreCache(options: RestoreCacheOptions): Promise<CacheR
     }
   }
 
-  const primaryKey = buildPrimaryCacheKey(components)
-  const restoreKeys = buildRestoreKeys(components)
-  const cachePaths = await buildCachePaths(storagePath, projectIdPath, opencodeVersion)
+  const generation = resolveSessionGeneration(opencodeVersion)
+  const plan = await planCacheRestore(options, generation)
 
-  logger.info('Restoring cache', {primaryKey, restoreKeys: [...restoreKeys], paths: cachePaths})
-
-  const objectStoreResult = await restoreFromObjectStore(options)
+  const objectStoreResult = await restoreFromObjectStoreTiers(options, generation)
   if (objectStoreResult.hit === true) {
     return objectStoreResult
   }
 
   try {
-    const restoredKey = await cacheAdapter.restoreCache(cachePaths, primaryKey, [...restoreKeys])
+    const tierHit = await restoreFromCacheTiers(options, plan)
 
-    if (restoredKey == null) {
+    if (tierHit == null) {
       logger.info('Cache miss - starting with fresh state')
       await fs.mkdir(storagePath, {recursive: true})
       return objectStoreResult
     }
 
-    logger.info('Cache restored', {restoredKey})
-    await deleteRestoredShm(storagePath, logger)
+    const restoredKey = tierHit.key
+    logger.info('Cache restored', {
+      restoredKey,
+      source: classifyRestoreHit(components, {store: 'cache', key: restoredKey}),
+    })
+    await deleteRestoredShm(storagePath, logger, tierHit.generation)
 
     const isCorrupted = await checkStorageCorruption(storagePath, logger)
     if (isCorrupted === true) {

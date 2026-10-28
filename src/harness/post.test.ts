@@ -1,3 +1,6 @@
+import * as fs from 'node:fs/promises'
+import * as os from 'node:os'
+import * as path from 'node:path'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {toCacheSaveStateValue} from '../shared/cache-save-result.js'
 import {createMockLogger} from '../shared/test-helpers.js'
@@ -23,6 +26,11 @@ vi.mock('../services/cache/index.js', async importOriginal => {
     saveCache: vi.fn(),
   }
 })
+
+vi.mock('@actions/cache', () => ({
+  restoreCache: vi.fn(),
+  saveCache: vi.fn(),
+}))
 
 vi.mock('../services/artifact/index.js', () => ({
   uploadLogArtifact: vi.fn(),
@@ -58,6 +66,22 @@ async function stubState(state: Record<string, string>): Promise<void> {
     list: async () => ok([]),
   })
   vi.mocked(releaseLockIfHolder).mockResolvedValue(ok('released'))
+}
+
+// Runs the real saveCache against a stubbed @actions/cache, so the keys the post hook actually writes are
+// what the assertions see. The hook's own state handling is not mocked.
+async function runPostWithRealSave(state: Record<string, string>) {
+  const core = await import('@actions/core')
+  vi.mocked(core.getState).mockImplementation((key: string) => state[key] ?? '')
+  const actual = await vi.importActual<typeof import('../services/cache/index.js')>('../services/cache/index.js')
+  const {saveCache} = await import('../services/cache/index.js')
+  vi.mocked(saveCache).mockImplementation(actual.saveCache)
+  const actionsCache = await import('@actions/cache')
+  vi.mocked(actionsCache.saveCache).mockResolvedValue(1)
+
+  const {runPost} = await import('./post.js')
+  await runPost({logger: createMockLogger()})
+  return vi.mocked(actionsCache.saveCache)
 }
 
 describe('post action', () => {
@@ -289,6 +313,64 @@ describe('post action', () => {
       )
 
       delete process.env.GITHUB_WORKSPACE
+    })
+
+    describe('session generation', () => {
+      let dataHome: string
+      let dbPath: string
+
+      beforeEach(async () => {
+        dataHome = await fs.mkdtemp(path.join(os.tmpdir(), 'post-generation-'))
+        vi.stubEnv('XDG_DATA_HOME', dataHome)
+        vi.stubEnv('GITHUB_WORKSPACE', '/runner/work/repo/repo')
+        dbPath = path.join(dataHome, 'opencode', 'opencode.db')
+        await fs.mkdir(path.join(dataHome, 'opencode', 'storage'), {recursive: true})
+        await fs.writeFile(path.join(dataHome, 'opencode', 'storage', 'session.json'), '{"session":"created"}')
+        await fs.writeFile(dbPath, 'post-run-db')
+      })
+
+      afterEach(async () => {
+        vi.unstubAllEnvs()
+        await fs.rm(dataHome, {recursive: true, force: true})
+      })
+
+      it('saves only V2 keys when the version state is a V2 pin', async () => {
+        // #given the main step recorded a V2 OpenCode version and an object store is configured
+        const actionsSave = await runPostWithRealSave({
+          shouldSaveCache: 'true',
+          cacheSaved: 'not-persisted',
+          opencodeVersion: '2.2.0',
+          ...storeState,
+        })
+
+        // #then the cache write uses the V2 key and path list, and nothing is saved under a V1 name
+        expect(actionsSave).toHaveBeenCalledTimes(1)
+        expect(actionsSave).toHaveBeenCalledWith(
+          [path.join(dataHome, 'opencode', 'storage'), '/runner/work/repo/repo/.git/opencode', dbPath],
+          'opencode-v2-storage-github-test-owner-test-repo-main-Linux-12345-1',
+        )
+      })
+
+      it('takes the V1 path when there is no version state', async () => {
+        // #given a main step that crashed before it saved the version
+        const actionsSave = await runPostWithRealSave({shouldSaveCache: 'true', cacheSaved: 'not-persisted'})
+
+        // #then the save is the V1 save, byte for byte
+        expect(actionsSave).toHaveBeenCalledTimes(1)
+        expect(actionsSave.mock.calls[0]?.[1]).toBe('opencode-storage-github-test-owner-test-repo-main-Linux-12345-1')
+      })
+
+      it('takes the V1 path for a V1 version state', async () => {
+        // #given a recorded V1 harness version
+        const actionsSave = await runPostWithRealSave({
+          shouldSaveCache: 'true',
+          cacheSaved: 'not-persisted',
+          opencodeVersion: '1.19.4+harness.5bde2635',
+        })
+
+        // #then the V1 key is used
+        expect(actionsSave.mock.calls[0]?.[1]).toBe('opencode-storage-github-test-owner-test-repo-main-Linux-12345-1')
+      })
     })
 
     it('reconstructs storeConfig from state and passes it to saveCache', async () => {
