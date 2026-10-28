@@ -28,9 +28,35 @@ export type {ErrorInfo, ErrorType} from './error-format/types.js'
 
 export {ERROR_TYPES} from './error-format/types.js'
 export {getEventKind, getEventPayload, getEventSessionID, getSessionID} from './event-shape.js'
+export {isFatalV2Event, mapV2Event, mapV2EventStream, v2InnerCallKey} from './event-v2.js'
+export type {
+  MapV2EventStreamOptions,
+  V2DomainEvent,
+  V2ErrorInfo,
+  V2FormField,
+  V2FormOption,
+  V2InnerCall,
+  V2InnerCallStatus,
+  V2InterruptReason,
+} from './event-v2.js'
 export {filterAgentEnv} from './filter-env.js'
 export {createInactivityTimer} from './inactivity-timer.js'
 export type {InactivityTimer} from './inactivity-timer.js'
+export {
+  createV2LedgerReconcileAdapter,
+  DEFAULT_V2_LIST_MAX_PAGES,
+  DEFAULT_V2_LIST_PAGE_SIZE,
+  listBusyV2SessionIdsInDirectory,
+} from './ledger-reconcile-v2.js'
+export type {
+  DirectoryQuiescenceDeps,
+  V2ListOptions,
+  V2RequestOptions,
+  V2SessionApi,
+  V2SessionInfoLike,
+  V2SessionListInput,
+  V2SessionListPage,
+} from './ledger-reconcile-v2.js'
 export {
   createLedgerReconciler,
   createSdkLedgerReconcileAdapter,
@@ -94,6 +120,18 @@ export type {OpenCodeServerHandle, ShutdownResult} from './server.js'
 export {createSessionTools, info, list, read, search} from './session-tools.js'
 export type {SessionToolDefinition, SessionTools} from './session-tools.js'
 export type {SetupAdapter} from './setup-adapter.js'
+export {
+  readBackgroundDispatch,
+  readSubagentNotice,
+  readSubagentNoticeItem,
+  settleLedgerFromSubagentNotice,
+} from './subagent-notice.js'
+export type {
+  BackgroundDispatch,
+  SubagentNotice,
+  SubagentNoticeSettlement,
+  SubagentNoticeState,
+} from './subagent-notice.js'
 export {parseSyntheticNoticePart, parseTaskNotice} from './task-notice.js'
 export type {TaskNotice} from './task-notice.js'
 export type {
