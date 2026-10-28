@@ -97,6 +97,68 @@ describe('buildToolsRestoreKeys', () => {
   })
 })
 
+describe('tools-cache keys bound to a recorded V2 digest', () => {
+  const V2_COMPONENTS = {os: 'Linux', opencodeVersion: '2.2.0', systematicVersion: '2.1.0'} as const
+  const ID_A = 'sha256-6d597970a8cc448f'
+  const ID_B = 'sha256-1f1ce0fc07b9245a'
+
+  it('puts the digest id into the primary key and the restore key', () => {
+    expect(buildToolsCacheKey({...V2_COMPONENTS, opencodeDigestId: ID_A})).toBe(
+      `opencode-tools-v2-Linux-oc-2.2.0-${ID_A}-sys-2.1.0`,
+    )
+    expect(buildToolsRestoreKeys({...V2_COMPONENTS, opencodeDigestId: ID_A})).toEqual([
+      `opencode-tools-v2-Linux-oc-2.2.0-${ID_A}-sys-2.1.0-`,
+    ])
+  })
+
+  it('never restores a key written before the digest was part of the identity, or for another digest', () => {
+    // #given the key an older release saved for the same version, and one for a different digest
+    const legacyKey = buildToolsCacheKey(V2_COMPONENTS)
+    const otherDigestKey = buildToolsCacheKey({...V2_COMPONENTS, opencodeDigestId: ID_B})
+    const [restoreKey] = buildToolsRestoreKeys({...V2_COMPONENTS, opencodeDigestId: ID_A})
+
+    // #then neither matches the digest-bound primary key or its restore prefix
+    expect(legacyKey).not.toBe(buildToolsCacheKey({...V2_COMPONENTS, opencodeDigestId: ID_A}))
+    expect(legacyKey.startsWith(restoreKey ?? '')).toBe(false)
+    expect(otherDigestKey.startsWith(restoreKey ?? '')).toBe(false)
+  })
+
+  it('leaves V1 and harness keys exactly as they were', () => {
+    expect(buildToolsCacheKey({...V2_COMPONENTS, opencodeVersion: '1.19.4'})).toBe(
+      'opencode-tools-v2-Linux-oc-1.19.4-sys-2.1.0',
+    )
+    expect(buildToolsCacheKey({...V2_COMPONENTS, opencodeVersion: '1.19.4+harness.5bde2635'})).toBe(
+      'opencode-tools-v2-Linux-oc-1.19.4+harness.5bde2635-sys-2.1.0',
+    )
+  })
+
+  it('restores and saves under the digest-bound key', async () => {
+    // #given
+    const adapter = createMockToolsCacheAdapter({restoreResult: undefined})
+    const expectedKey = `opencode-tools-v2-Linux-oc-2.2.0-${ID_A}-sys-2.1.0`
+
+    // #when
+    await restoreToolsCache({
+      logger: createTestLogger(),
+      ...V2_COMPONENTS,
+      ...PATHS,
+      opencodeDigestId: ID_A,
+      cacheAdapter: adapter,
+    })
+    await saveToolsCache({
+      logger: createTestLogger(),
+      ...V2_COMPONENTS,
+      ...PATHS,
+      opencodeDigestId: ID_A,
+      cacheAdapter: adapter,
+    })
+
+    // #then
+    expect(adapter.restoreCache).toHaveBeenCalledWith(expect.any(Array), expectedKey, [`${expectedKey}-`])
+    expect(adapter.saveCache).toHaveBeenCalledWith(expect.any(Array), expectedKey)
+  })
+})
+
 describe('buildCachePaths', () => {
   it('caches the tool cache and the OpenCode cache', () => {
     expect(buildCachePaths(PATHS)).toEqual(['/cache/tool/opencode', '/cache/home/opencode'])

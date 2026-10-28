@@ -8,6 +8,7 @@ import * as exec from '@actions/exec'
 import * as github from '@actions/github'
 import * as tc from '@actions/tool-cache'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import {getPlatformInfo, installOpenCode, RECORDED_V2_PIN} from './opencode.js'
 import * as sessionToolsConfig from './session-tools-config.js'
 import {runSetup} from './setup.js'
 import * as systematicPlugin from './systematic-plugin.js'
@@ -84,6 +85,13 @@ vi.mock('./tools-cache.js', () => ({
   restoreToolsCache: vi.fn(),
   saveToolsCache: vi.fn(),
 }))
+
+// Real opencode.js, except installOpenCode is a pass-through spy so a test can stand in a successful V2
+// install (a real one needs the genuine release archive).
+vi.mock('./opencode.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('./opencode.js')>()
+  return {...actual, installOpenCode: vi.fn(actual.installOpenCode)}
+})
 
 vi.mock('./adapters.js', () => ({
   createToolCacheAdapter: vi.fn(() => ({
@@ -812,6 +820,127 @@ describe('setup', () => {
         expect(systematicPlugin.installSystematicPlugin).not.toHaveBeenCalled()
         expect(result).not.toBeNull()
         expect(result?.toolsCacheStatus).toBe('hit')
+      })
+
+      it('keeps V1 cache identities unchanged: no digest id, bare version lookup', async () => {
+        // #given a V1 pin with a warm tools cache and a warm tool cache
+        vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({hit: true, restoredKey: 'opencode-tools-v2-key'})
+        vi.mocked(tc.find).mockReturnValue('/opt/hostedtoolcache/opencode/1.19.4/x64')
+
+        // #when
+        const result = await runSetup(createSetupInputs({opencodeVersion: '1.19.4'}), 'ghs_test_token')
+
+        // #then
+        const restoreArgs = vi.mocked(toolsCache.restoreToolsCache).mock.calls[0]?.[0]
+        expect(restoreArgs?.opencodeVersion).toBe('1.19.4')
+        expect(restoreArgs).not.toHaveProperty('opencodeDigestId')
+        expect(tc.find).toHaveBeenCalledWith('opencode', '1.19.4')
+        expect(tc.downloadTool).not.toHaveBeenCalled()
+        expect(result?.toolsCacheStatus).toBe('hit')
+      })
+
+      describe('stock V2 pin', () => {
+        const platform = getPlatformInfo()
+        const recordedDigest = RECORDED_V2_PIN.assets[`opencode-${platform.os}-${platform.arch}${platform.ext}`] ?? ''
+        const digestId = `sha256-${recordedDigest.slice(0, 16)}`
+        const boundVersion = `${RECORDED_V2_PIN.version}-${digestId}`
+        const v2Inputs = () => createSetupInputs({opencodeVersion: RECORDED_V2_PIN.version})
+
+        it('keys the persistent tools cache by the recorded digest', async () => {
+          // #when
+          await runSetup(v2Inputs(), 'ghs_test_token')
+
+          // #then the restore key carries the digest id, so a pre-change V2 key cannot match
+          expect(digestId).toMatch(/^sha256-[0-9a-f]{16}$/)
+          const restoreArgs = vi.mocked(toolsCache.restoreToolsCache).mock.calls[0]?.[0]
+          expect(restoreArgs?.opencodeVersion).toBe(RECORDED_V2_PIN.version)
+          expect(restoreArgs?.opencodeDigestId).toBe(digestId)
+        })
+
+        it('does not reuse a pre-change V2 entry from a warm local tool cache', async () => {
+          // #given the local tool cache only holds the entry cached under the bare version
+          vi.mocked(tc.find).mockImplementation((_name: string, version: string) =>
+            version === RECORDED_V2_PIN.version ? '/opt/hostedtoolcache/opencode/legacy' : '',
+          )
+
+          // #when
+          await runSetup(v2Inputs(), 'ghs_test_token')
+
+          // #then the legacy entry is never offered, and a verified install is attempted
+          expect(core.addPath).not.toHaveBeenCalledWith('/opt/hostedtoolcache/opencode/legacy')
+          expect(tc.find).not.toHaveBeenCalledWith('opencode', RECORDED_V2_PIN.version)
+          expect(tc.find).toHaveBeenCalledWith('opencode', boundVersion, platform.arch)
+          expect(tc.downloadTool).toHaveBeenCalled()
+        })
+
+        it('does not use an older V2 tools-cache restore hit', async () => {
+          // #given a tools-cache restore reports a hit (an older entry) and the legacy binary is findable
+          vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
+            hit: true,
+            restoredKey: `opencode-tools-v2-Linux-oc-${RECORDED_V2_PIN.version}-sys-2.1.0`,
+          })
+          vi.mocked(tc.find).mockImplementation((_name: string, version: string) =>
+            version === RECORDED_V2_PIN.version ? '/opt/hostedtoolcache/opencode/legacy' : '',
+          )
+
+          // #when
+          await runSetup(v2Inputs(), 'ghs_test_token')
+
+          // #then the setup-level shortcut does not accept the legacy binary
+          expect(core.addPath).not.toHaveBeenCalledWith('/opt/hostedtoolcache/opencode/legacy')
+          expect(tc.downloadTool).toHaveBeenCalled()
+        })
+
+        it('reuses a V2 entry bound to the recorded digest on a tools-cache hit', async () => {
+          // #given a restore hit and a binary cached under the digest-bound identity
+          vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({hit: true, restoredKey: 'bound-key'})
+          vi.mocked(tc.find).mockImplementation((_name: string, version: string) =>
+            version === boundVersion ? '/opt/hostedtoolcache/opencode/bound' : '',
+          )
+
+          // #when
+          const result = await runSetup(v2Inputs(), 'ghs_test_token')
+
+          // #then
+          expect(tc.downloadTool).not.toHaveBeenCalled()
+          expect(core.addPath).toHaveBeenCalledWith('/opt/hostedtoolcache/opencode/bound')
+          expect(result?.toolsCacheStatus).toBe('hit')
+          expect(toolsCache.saveToolsCache).not.toHaveBeenCalled()
+        })
+
+        it('saves the tools cache under the digest-bound key after a fresh verified install', async () => {
+          // #given a cold tools cache and a successful (stood-in) verified install
+          vi.mocked(installOpenCode).mockResolvedValueOnce({
+            path: '/opt/hostedtoolcache/opencode/fresh',
+            version: RECORDED_V2_PIN.version,
+            cached: false,
+          })
+
+          // #when
+          await runSetup(v2Inputs(), 'ghs_test_token')
+
+          // #then
+          const saveArgs = vi.mocked(toolsCache.saveToolsCache).mock.calls[0]?.[0]
+          expect(saveArgs?.opencodeVersion).toBe(RECORDED_V2_PIN.version)
+          expect(saveArgs?.opencodeDigestId).toBe(digestId)
+        })
+
+        it('fails an unpinned V2 version before any cache is consulted, even with warm caches', async () => {
+          // #given warm caches that would accept anything
+          vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({hit: true, restoredKey: 'warm'})
+          vi.mocked(tc.find).mockReturnValue('/opt/hostedtoolcache/opencode/warm')
+
+          // #when
+          const result = await runSetup(createSetupInputs({opencodeVersion: '2.9.9'}), 'ghs_test_token')
+
+          // #then
+          expect(result).toBeNull()
+          expect(core.setFailed).toHaveBeenCalledWith(expect.stringMatching(/2\.9\.9.*no recorded digest/))
+          expect(toolsCache.restoreToolsCache).not.toHaveBeenCalled()
+          expect(tc.find).not.toHaveBeenCalled()
+          expect(tc.downloadTool).not.toHaveBeenCalled()
+          expect(core.addPath).not.toHaveBeenCalled()
+        })
       })
 
       it('falls through to install when tools cache hits but binary not findable', async () => {
