@@ -40,6 +40,8 @@ export type {
   V2InterruptReason,
 } from './event-v2.js'
 export {filterAgentEnv} from './filter-env.js'
+export {clearHeldClaims} from './held-claims-v2.js'
+export type {ClearHeldClaimsOutcome} from './held-claims-v2.js'
 export {createInactivityTimer} from './inactivity-timer.js'
 export type {InactivityTimer} from './inactivity-timer.js'
 export {
@@ -115,6 +117,19 @@ export type {
   ResponseSurface,
   ResponseSurfacePolicy,
 } from './response-file.js'
+export {DEFAULT_OPENCODE_V2_TIMEOUTS, startOpenCodeV2Server} from './server-v2.js'
+export type {
+  OpenCodeV2ExitInfo,
+  OpenCodeV2ExitOutcome,
+  OpenCodeV2PluginProblem,
+  OpenCodeV2ServerHandle,
+  OpenCodeV2ShutdownOptions,
+  OpenCodeV2ShutdownResult,
+  OpenCodeV2StartError,
+  OpenCodeV2StartErrorKind,
+  OpenCodeV2Timeouts,
+  StartOpenCodeV2ServerOptions,
+} from './server-v2.js'
 export {bootstrapOpenCodeServer, ensureOpenCodeAvailable} from './server.js'
 export type {OpenCodeServerHandle, ShutdownResult} from './server.js'
 export {createSessionTools, info, list, read, search} from './session-tools.js'
