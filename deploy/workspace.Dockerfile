@@ -24,7 +24,7 @@
 # ── Stage 1: build-deps (full workspace, dev deps, workspace-agent build) ──────
 # Forked into `workspace-test` below BEFORE dev dependencies are pruned, then
 # continued as `build` (prune to production) for the runtime stage to copy from.
-FROM node:24.22.1-alpine3.24@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS build-deps
+FROM node:24.22.2-alpine3.24@sha256:8a32c8cf649a49915a66e81e7a609223c708d0adabf288ee3f4077d765542f85 AS build-deps
 
 WORKDIR /workspace
 
@@ -166,7 +166,7 @@ RUN rm -rf node_modules apps/*/node_modules packages/*/node_modules \
 # default (a second default would drift, and the harness-release sync job rewrites
 # only the first `ARG OPENCODE_VERSION=` line). An unset value leaves /out empty;
 # the runtime stage then refuses a V2 version it finds no matching /out/VERSION for.
-FROM node:24.22.1-alpine3.24@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS opencode-v2
+FROM node:24.22.2-alpine3.24@sha256:8a32c8cf649a49915a66e81e7a609223c708d0adabf288ee3f4077d765542f85 AS opencode-v2
 
 ARG OPENCODE_VERSION
 ARG TARGETARCH
@@ -221,7 +221,7 @@ RUN set -euo pipefail \
     && rm -f "/tmp/${oc_asset}" /tmp/SHA256SUMS
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
-FROM node:24.22.1-alpine3.24@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS runtime
+FROM node:24.22.2-alpine3.24@sha256:8a32c8cf649a49915a66e81e7a609223c708d0adabf288ee3f4077d765542f85 AS runtime
 
 WORKDIR /app
 
