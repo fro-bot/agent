@@ -11,7 +11,7 @@ import {
   DEFAULT_LEDGER_RECONCILE_INTERVAL_MS,
   reconcileLedgerOnce,
 } from './ledger-reconcile.js'
-import {createOwnershipLedger} from './ownership-ledger.js'
+import {createOwnershipLedger, shellLedgerKey} from './ownership-ledger.js'
 
 const PARENT_SESSION_ID = 'parent-session'
 
@@ -164,6 +164,61 @@ describe('reconcileLedgerOnce', () => {
       {sessionId: 'other-tracked-child', label: 'reviewer-subagent', state: 'outstanding'},
     ])
     expect(ledger.isTracked('foreground-child')).toBe(false)
+  })
+
+  it('shell entries are not sessions: a ledger of only shells performs no remote calls', async () => {
+    // #given
+    const ledger = createOwnershipLedger()
+    ledger.adopt(shellLedgerKey('sh_1'), 'sleep 8')
+    const adapter = makeAdapter({
+      children: vi.fn(async () => ok([])),
+      liveSessionIds: vi.fn(async () => ok(new Set<string>())),
+    })
+
+    // #when
+    const result = await reconcileLedgerOnce({
+      ledger,
+      adapter,
+      parentSessionId: PARENT_SESSION_ID,
+      logger: makeLogger(),
+    })
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(adapter.children).not.toHaveBeenCalled()
+    expect(adapter.liveSessionIds).not.toHaveBeenCalled()
+    expect(ledger.outstanding()).toBe(1)
+  })
+
+  it('shell entries are left alone beside a session entry: not downgraded as a non-child, not settled as not-live', async () => {
+    // #given
+    const ledger = createOwnershipLedger()
+    ledger.adopt('child-1', 'task')
+    ledger.adopt(shellLedgerKey('sh_1'), 'sleep 8')
+    const adapter = makeAdapter({children: async () => ok([{id: 'child-1'}])})
+
+    // #when
+    await reconcileLedgerOnce({ledger, adapter, parentSessionId: PARENT_SESSION_ID, logger: makeLogger()})
+
+    // #then — the child settled (not live); the shell is exactly as it was
+    expect(ledger.snapshot()).toEqual([
+      {sessionId: 'child-1', label: 'task', state: 'settled'},
+      {sessionId: shellLedgerKey('sh_1'), label: 'sleep 8', state: 'outstanding'},
+    ])
+  })
+
+  it('a failed session pass does not mark a shell unknown: the shell pass owns it', async () => {
+    // #given
+    const ledger = createOwnershipLedger()
+    ledger.adopt('child-1', 'task')
+    ledger.adopt(shellLedgerKey('sh_1'), 'sleep 8')
+    const adapter = makeAdapter({children: async () => err(new Error('down'))})
+
+    // #when
+    await reconcileLedgerOnce({ledger, adapter, parentSessionId: PARENT_SESSION_ID, logger: makeLogger()})
+
+    // #then
+    expect(ledger.snapshot().map(entry => entry.state)).toEqual(['unknown', 'outstanding'])
   })
 
   it('empty ledger: performs no remote calls at all', async () => {

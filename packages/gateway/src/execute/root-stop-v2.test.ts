@@ -2,10 +2,11 @@ import type {LedgerReconcileAdapter, V2CallError, V2SessionOutcome} from '@fro-b
 import type {GatewayLogger} from '../discord/client.js'
 import type {RootStopClientV2, StreamTerminal} from './root-stop-v2.js'
 
-import {err, ok} from '@fro-bot/runtime'
+import {createOwnershipLedger, err, ok, shellLedgerKey} from '@fro-bot/runtime'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
 import {interruptSession, probeRootStopV2, startQuarantineRootWatchV2} from './root-stop-v2.js'
+import {makeShellServer} from './shell-server-v2.fixture.js'
 
 const ROOT = 'ses_root'
 const DIRECTORY = '/workspace/repos/o/r'
@@ -280,6 +281,114 @@ describe('startQuarantineRootWatchV2', () => {
     await vi.advanceTimersByTimeAsync(20_000)
 
     // #then
+    expect(watch.interrupt.mock.calls.length).toBeGreaterThan(1)
+    watch.stop()
+  })
+})
+
+describe('startQuarantineRootWatchV2: background shells', () => {
+  const SHELL = 'sh_bg1'
+  const OWNERS = new Set([ROOT])
+
+  function startShellWatch(
+    setup: Setup,
+    server: ReturnType<typeof makeShellServer>,
+    extra: {followUpPossible?: boolean; windowMs?: number; ledgerHoldsShell?: boolean} = {},
+  ) {
+    vi.useFakeTimers()
+    const made = makeProbe(setup)
+    const ledger = createOwnershipLedger()
+    if (extra.ledgerHoldsShell !== false) ledger.adopt(shellLedgerKey(SHELL), 'background shell')
+    const stop = startQuarantineRootWatchV2({
+      client: made.client,
+      adapter: made.adapter,
+      rootSessionId: ROOT,
+      streamTerminal: () => null,
+      logger: makeLogger(),
+      pollIntervalMs: 500,
+      shells: {api: server.routes, directory: DIRECTORY, ownerSessionIds: OWNERS, ledger},
+      ...(extra.windowMs === undefined ? {} : {windowMs: extra.windowMs}),
+      ...(extra.followUpPossible === undefined ? {} : {followUpPossible: extra.followUpPossible}),
+    })
+    return {...made, stop, ledger}
+  }
+
+  it('re-deletes an owned shell it finds running during the hold', async () => {
+    // #given — the root is gone for good, but a shell survived the barrier's kill
+    const server = makeShellServer({shells: {[SHELL]: {status: 'running', owner: ROOT}}})
+    const watch = startShellWatch({live: [[]], outcome: 'interrupted'}, server)
+
+    // #when
+    await vi.advanceTimersByTimeAsync(600)
+
+    // #then
+    expect(server.deleteShell).toHaveBeenCalledWith(expect.objectContaining({shellId: SHELL, directory: DIRECTORY}))
+    expect(server.shells[SHELL]).toBeUndefined()
+    watch.stop()
+  })
+
+  it('does not end on a confirmed root while a shell is still running', async () => {
+    // #given — the root confirms at once, and the shell shrugs off the DELETE
+    const server = makeShellServer({
+      shells: {[SHELL]: {status: 'running', owner: ROOT}},
+      deleteDoesNotKill: [SHELL],
+    })
+    const watch = startShellWatch({live: [[]], outcome: 'interrupted'}, server)
+
+    // #when
+    await vi.advanceTimersByTimeAsync(2_100)
+
+    // #then — still watching and still deleting
+    expect(server.deleteShell.mock.calls.length).toBeGreaterThanOrEqual(3)
+    watch.stop()
+  })
+
+  it('ends once the root is confirmed and no shell is running', async () => {
+    // #given
+    const server = makeShellServer({shells: {[SHELL]: {status: 'running', owner: ROOT}}})
+    const watch = startShellWatch({live: [[]], outcome: 'interrupted'}, server)
+
+    // #when
+    await vi.advanceTimersByTimeAsync(5_000)
+
+    // #then — one sweep killed it, and the watch stopped asking
+    expect(server.deleteShell).toHaveBeenCalledTimes(1)
+    const probes = watch.adapter.liveSessionIds as ReturnType<typeof vi.fn>
+    const callsAtEnd = probes.mock.calls.length
+    await vi.advanceTimersByTimeAsync(5_000)
+    expect(probes.mock.calls.length).toBe(callsAtEnd)
+  })
+
+  it('keeps watching for the whole window while follow-up work is open, deleting a late shell', async () => {
+    // #given — nothing runs yet
+    const server = makeShellServer()
+    const watch = startShellWatch({live: [[]], outcome: 'succeeded'}, server, {
+      followUpPossible: true,
+      windowMs: 3_000,
+      ledgerHoldsShell: false,
+    })
+    await vi.advanceTimersByTimeAsync(1_100)
+    expect(server.deleteShell).not.toHaveBeenCalled()
+
+    // #when — the woken root starts a shell
+    server.shells[SHELL] = {status: 'running', owner: ROOT}
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    // #then
+    expect(server.deleteShell).toHaveBeenCalledWith(expect.objectContaining({shellId: SHELL}))
+    watch.stop()
+  })
+
+  it('does not stall on a shell list that never answers', async () => {
+    // #given
+    const server = makeShellServer({shells: {[SHELL]: {status: 'running', owner: ROOT}}})
+    server.listShells.mockImplementation(async () => new Promise<never>(() => undefined))
+    const watch = startShellWatch({live: [[ROOT]]}, server)
+
+    // #when — past the per-request cap and a few polls
+    await vi.advanceTimersByTimeAsync(20_000)
+
+    // #then — the root was still probed and interrupted
     expect(watch.interrupt.mock.calls.length).toBeGreaterThan(1)
     watch.stop()
   })

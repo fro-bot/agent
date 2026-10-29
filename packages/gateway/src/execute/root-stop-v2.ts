@@ -23,15 +23,21 @@
  * The liveness reading is taken again after the evidence is read, so a cold root that starts in between reads as busy.
  */
 
-import type {LedgerReconcileAdapter, RemoteOpenCodeV2Client} from '@fro-bot/runtime'
+import type {
+  KillOwnedShellsOptions,
+  KillOwnedShellsResult,
+  LedgerReconcileAdapter,
+  RemoteOpenCodeV2Client,
+} from '@fro-bot/runtime'
 import type {GatewayLogger} from '../discord/client.js'
 
-import {toErrorMessage} from '@fro-bot/runtime'
+import {killOwnedShells, toErrorMessage} from '@fro-bot/runtime'
 import {
   QUARANTINE_HOLD_WINDOW_MS,
   ROOT_QUIESCENCE_POLL_INTERVAL_MS,
   ROOT_WATCH_REQUEST_TIMEOUT_MS,
 } from './root-stop.js'
+import {toRuntimeLogger} from './runtime-logger.js'
 
 /** The two calls this module makes; the real V2 client satisfies it. */
 export type RootStopClientV2 = Pick<RemoteOpenCodeV2Client, 'getSession' | 'interrupt'>
@@ -115,6 +121,12 @@ export async function probeRootStopV2(options: ProbeRootStopV2Options): Promise<
 }
 
 export interface QuarantineRootWatchV2Options extends Omit<ProbeRootStopV2Options, 'signal'> {
+  /**
+   * The background shells to keep killing. Each tick DELETEs any owned shell it finds running before it probes the root,
+   * and the watch does not end on a confirmed root while a shell is still running: a DELETE wakes the owner, and a shell
+   * that outlived the barrier must not outlive the hold.
+   */
+  readonly shells?: Omit<KillOwnedShellsOptions, 'logger' | 'pollIntervalMs' | 'rounds' | 'signal'>
   readonly logger: GatewayLogger
   readonly runId?: string
   readonly windowMs?: number
@@ -123,7 +135,8 @@ export interface QuarantineRootWatchV2Options extends Omit<ProbeRootStopV2Option
 
 /**
  * Keeps probing a root the barrier could not confirm, for the length of the quarantine hold: every busy observation
- * sends another interrupt, so a prompt that started late is stopped instead of running through the hold. Ends at the
+ * sends another interrupt, so a prompt that started late is stopped instead of running through the hold. With `shells`
+ * it also re-deletes every owned shell it finds running. Ends at the
  * first confirmation or when the window closes (with `followUpPossible` nothing confirms, so it always runs to the end
  * of the window). A window timer ends it even if a request hangs, every request is bounded, and the timers are unref'd.
  *
@@ -189,12 +202,37 @@ export function startQuarantineRootWatchV2(options: QuarantineRootWatchV2Options
     }
   }
 
+  const unconfirmedSweep: KillOwnedShellsResult = {confirmed: false, stillRunning: []}
+
   async function tick(): Promise<void> {
     timer = undefined
     if (ended) return
+    let shellsClear = true
+    if (options.shells !== undefined) {
+      const shells = options.shells
+      const swept = await bounded<KillOwnedShellsResult>(
+        async signal =>
+          killOwnedShells({
+            ...shells,
+            logger: toRuntimeLogger(logger),
+            signal,
+            rounds: 1,
+            pollIntervalMs: 0,
+          }),
+        unconfirmedSweep,
+      )
+      if (ended) return
+      shellsClear = swept.confirmed
+      if (swept.confirmed && swept.deleted.length > 0) {
+        logger.warn(
+          {rootSessionId, shellCount: swept.deleted.length},
+          'root-watch: owned background shells were running during the quarantine hold — deleted them',
+        )
+      }
+    }
     const probe = await bounded<RootProbe>(async signal => probeRootStopV2({...options, signal}), 'unconfirmed')
     if (ended) return
-    if (probe === 'confirmed') {
+    if (probe === 'confirmed' && shellsClear) {
       logger.info({rootSessionId, interrupts}, 'root-watch: the root is confirmed stopped; ending the watch')
       end()
       return

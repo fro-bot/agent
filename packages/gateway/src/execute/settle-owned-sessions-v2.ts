@@ -15,6 +15,12 @@
  * fresh teardown signal, because the run's own signal is already aborted by the time a failure reaches here. Anything
  * still unresolved when the attempt ends is downgraded to `unknown`, and the caller quarantines.
  *
+ * Background shells: a session interrupt does not stop them (`Job.cancel(sessionID)` finds no job under a session id), and
+ * they outlive the run's lock. So BEFORE the root is interrupted, every owned shell is killed with
+ * `DELETE /api/shell/:id` and the stop is confirmed by `GET /api/shell` no longer listing it. A shell that cannot be
+ * confirmed gone keeps the stop unconfirmed. The kill queues an `error` notice that wakes the root, which is why the
+ * root interrupt comes after it, and why an owned shell counts as background work open (`followUpPossible`).
+ *
  * Background work open (`followUpPossible`): the server then starts root turns by itself, so the root is never
  * confirmed. The barrier interrupts the root and the owned children once, settles the children, and reports
  * `rootUnconfirmed` without waiting out its budget; the quarantine watch does the polling.
@@ -26,7 +32,14 @@ import type {OwnershipLedger, RemoteOpenCodeV2Client} from '@fro-bot/runtime'
 import type {GatewayLogger} from '../discord/client.js'
 import type {StreamTerminal} from './root-stop-v2.js'
 
-import {createV2LedgerReconcileAdapter, reconcileLedgerOnce, toErrorMessage} from '@fro-bot/runtime'
+import {
+  collectOwnerSessionIds,
+  createV2LedgerReconcileAdapter,
+  isShellLedgerKey,
+  killOwnedShells,
+  reconcileLedgerOnce,
+  toErrorMessage,
+} from '@fro-bot/runtime'
 import {interruptSession, probeRootStopV2} from './root-stop-v2.js'
 import {ROOT_QUIESCENCE_POLL_INTERVAL_MS} from './root-stop.js'
 import {toRuntimeLogger} from './runtime-logger.js'
@@ -42,6 +55,8 @@ export const DEFAULT_SETTLE_TIMEOUT_MS = 15_000
 export interface SettleOwnedSessionsV2Params {
   /** Client for the workspace OpenCode V2 server this run is attached to. */
   readonly client: RemoteOpenCodeV2Client
+  /** The location the run's sessions and shells live in: the directory the root was created at. */
+  readonly directory: string
   /** The root session this run created. */
   readonly rootSessionId: string
   /** The run's ownership ledger. Mutated in place (`markUnknown`/`settle` via reconciliation). */
@@ -68,6 +83,8 @@ export type SettleOwnedSessionsV2Result =
       readonly reason: string
       /** The root was to be confirmed stopped and was not. The caller keeps watching it through the hold. */
       readonly rootUnconfirmed: boolean
+      /** An owned background shell is not confirmed stopped. The caller keeps killing it through the hold. */
+      readonly shellsUnconfirmed: boolean
     }
 
 function withRunId(logger: GatewayLogger, runId: string | undefined): GatewayLogger {
@@ -78,6 +95,10 @@ function withRunId(logger: GatewayLogger, runId: string | undefined): GatewayLog
     warn: (context, message) => logger.warn({runId, ...context}, message),
     error: (context, message) => logger.error({runId, ...context}, message),
   }
+}
+
+function hasUnsettledShells(ledger: OwnershipLedger): boolean {
+  return ledger.snapshot().some(entry => isShellLedgerKey(entry.sessionId) && entry.state !== 'settled')
 }
 
 /** Race `work` against its own timer, so work that ignores cancellation still resolves into a decision. */
@@ -96,6 +117,7 @@ async function withBound<T>(ms: number, work: () => Promise<T>, onTimeout: () =>
 export async function settleOwnedSessionsV2(params: SettleOwnedSessionsV2Params): Promise<SettleOwnedSessionsV2Result> {
   const {
     client,
+    directory,
     rootSessionId,
     ledger,
     timeoutMs = DEFAULT_SETTLE_TIMEOUT_MS,
@@ -105,6 +127,7 @@ export async function settleOwnedSessionsV2(params: SettleOwnedSessionsV2Params)
     streamTerminal = (): StreamTerminal | null => null,
   } = params
   const logger = withRunId(params.logger, params.runId)
+  const runtimeLogger = toRuntimeLogger(logger)
 
   if (ledger.isDrainComplete() && !confirmRootQuiescent) {
     return {settled: true}
@@ -121,6 +144,10 @@ export async function settleOwnedSessionsV2(params: SettleOwnedSessionsV2Params)
   const isFinished = (): boolean => finished
   // Whether the root was confirmed stopped, readable from the bound's timeout path too.
   let rootConfirmed = !confirmRootQuiescent
+  // Whether every owned shell was confirmed stopped. False until the kill has answered: a bound that passes first has
+  // not ruled out a shell the ledger never heard of.
+  let shellsConfirmed = false
+  let unconfirmedShellIds: readonly string[] = []
 
   return withBound(
     timeoutMs,
@@ -128,13 +155,6 @@ export async function settleOwnedSessionsV2(params: SettleOwnedSessionsV2Params)
       // The barrier always resolves to a decision, even when a callee misbehaves.
       try {
         const teardownSignal = AbortSignal.timeout(timeoutMs)
-
-        // Stop the root from producing more work. Confirmed below only when `confirmRootQuiescent`.
-        await interruptSession(client, rootSessionId, teardownSignal, logger, 'root')
-
-        await Promise.allSettled(
-          unsettled.map(async entry => interruptSession(client, entry.sessionId, teardownSignal, logger, 'owned')),
-        )
 
         const adapter = createV2LedgerReconcileAdapter(client.session)
         // Once the bound has passed this attempt is abandoned: whatever it still has in flight must not change the
@@ -148,12 +168,36 @@ export async function settleOwnedSessionsV2(params: SettleOwnedSessionsV2Params)
             if (!isFinished()) ledger.markUnknown(sessionId)
           },
         }
-        if (unsettled.length > 0) {
+
+        // Owned background shells first. A session interrupt does not stop them, and the kill wakes the root with an
+        // error notice, so the root is interrupted AFTER it, never before. Confirmed ones are settled in the ledger.
+        const shellKill = await killOwnedShells({
+          api: client,
+          directory,
+          ownerSessionIds: collectOwnerSessionIds(rootSessionId, attemptLedger),
+          ledger: attemptLedger,
+          logger: runtimeLogger,
+          signal: teardownSignal,
+        })
+        shellsConfirmed = shellKill.confirmed
+        unconfirmedShellIds = shellKill.confirmed ? [] : shellKill.stillRunning
+
+        // Stop the root from producing more work. Confirmed below only when `confirmRootQuiescent`.
+        await interruptSession(client, rootSessionId, teardownSignal, logger, 'root')
+
+        const unsettledSessions = unsettled.filter(entry => !isShellLedgerKey(entry.sessionId))
+        await Promise.allSettled(
+          unsettledSessions.map(async entry =>
+            interruptSession(client, entry.sessionId, teardownSignal, logger, 'owned'),
+          ),
+        )
+
+        if (unsettledSessions.length > 0) {
           const reconcileResult = await reconcileLedgerOnce({
             ledger: attemptLedger,
             adapter,
             parentSessionId: rootSessionId,
-            logger: toRuntimeLogger(logger),
+            logger: runtimeLogger,
             signal: teardownSignal,
           })
           if (!reconcileResult.success) {
@@ -200,7 +244,7 @@ export async function settleOwnedSessionsV2(params: SettleOwnedSessionsV2Params)
           }
         }
 
-        if (ledger.isDrainComplete() && rootQuiescent) {
+        if (ledger.isDrainComplete() && rootQuiescent && shellsConfirmed) {
           logger.info(
             {rootSessionId, confirmRootQuiescent},
             confirmRootQuiescent
@@ -217,25 +261,31 @@ export async function settleOwnedSessionsV2(params: SettleOwnedSessionsV2Params)
           attemptLedger.markUnknown(entry.sessionId)
         }
         const stillUnresolvedIds = stillUnresolved.map(entry => entry.sessionId)
+        const unresolvedNotes = [
+          ...(stillUnresolvedIds.length > 0
+            ? [`owned sessions not confirmed settled: ${stillUnresolvedIds.join(', ')}`]
+            : []),
+          ...(shellsConfirmed
+            ? []
+            : [`owned shells not confirmed stopped: ${unconfirmedShellIds.join(', ') || 'unknown'}`]),
+        ].join('; ')
         logger.error(
-          {rootSessionId, stillUnresolvedIds, rootQuiescent},
+          {rootSessionId, stillUnresolvedIds, unconfirmedShellIds, rootQuiescent},
           'settle-owned-sessions: owned work could not be confirmed settled',
         )
         if (!rootQuiescent) {
           return {
             settled: false as const,
-            reason: `root session not confirmed stopped after interrupt${
-              stillUnresolvedIds.length > 0
-                ? `; owned sessions not confirmed settled: ${stillUnresolvedIds.join(', ')}`
-                : ''
-            }`,
+            reason: `root session not confirmed stopped after interrupt${unresolvedNotes === '' ? '' : `; ${unresolvedNotes}`}`,
             rootUnconfirmed: true,
+            shellsUnconfirmed: !shellsConfirmed || hasUnsettledShells(attemptLedger),
           }
         }
         return {
           settled: false as const,
-          reason: `owned sessions not confirmed settled: ${stillUnresolvedIds.join(', ')}`,
+          reason: unresolvedNotes,
           rootUnconfirmed: false,
+          shellsUnconfirmed: !shellsConfirmed || hasUnsettledShells(attemptLedger),
         }
       } catch (error) {
         const message = toErrorMessage(error)
@@ -247,6 +297,7 @@ export async function settleOwnedSessionsV2(params: SettleOwnedSessionsV2Params)
           settled: false as const,
           reason: `settle attempt threw unexpectedly: ${message}`,
           rootUnconfirmed: !rootConfirmed,
+          shellsUnconfirmed: !shellsConfirmed || hasUnsettledShells(ledger),
         }
       } finally {
         finished = true
@@ -267,6 +318,7 @@ export async function settleOwnedSessionsV2(params: SettleOwnedSessionsV2Params)
         settled: false as const,
         reason: `settle attempt exceeded its ${timeoutMs}ms bound`,
         rootUnconfirmed: !rootConfirmed,
+        shellsUnconfirmed: !shellsConfirmed || hasUnsettledShells(ledger),
       }
     },
   )

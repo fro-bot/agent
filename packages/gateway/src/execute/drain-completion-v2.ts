@@ -11,7 +11,8 @@
  * (`session.inbox.delivered`), so the gate keeps that state itself and asks the server one thing: is the root in the
  * active list. Success is admitted only when ALL of these hold at one commit point:
  * - the ledger reports drain-complete (`unknown` still blocks, exactly as before);
- * - every ledger entry's notice was observed. A cancelled child's notice counts: the notice is the server's own
+ * - every ledger entry's notice was observed (a background shell is a ledger entry like a child: its notice wakes the root
+ *   the same way). A cancelled child's notice counts: the notice is the server's own
  *   statement that the child ended, and a notice carries no model-forgeable text here (`readSubagentNotice` reads only
  *   metadata);
  * - every queued notice has been delivered into a root turn;
@@ -28,11 +29,11 @@
  * Not a state machine framework: a revision counter, an idle stamp, the notices seen, and one validation in flight.
  */
 
-import type {LedgerReconcileAdapter, OwnershipLedger, SubagentNotice} from '@fro-bot/runtime'
+import type {LedgerReconcileAdapter, OwnershipLedger, ShellNoticeState, SubagentNotice} from '@fro-bot/runtime'
 import type {GatewayLogger} from '../discord/client.js'
 import type {DrainRejectCode} from './drain-completion.js'
 
-import {toErrorMessage} from '@fro-bot/runtime'
+import {shellLedgerKey, toErrorMessage} from '@fro-bot/runtime'
 import {DRAIN_REQUEST_TIMEOUT_MS, DRAIN_VALIDATION_INTERVAL_MS} from './drain-completion.js'
 
 type BoundedResult<T> = {readonly ok: true; readonly value: T} | {readonly ok: false}
@@ -67,6 +68,14 @@ export interface DrainCompletionV2 {
    * `unknown`) is what still blocks admission until the child is seen to stop.
    */
   readonly noteUnreadableNotice: (childSessionId: string) => void
+  /**
+   * A completion notice for one of the root's background shells, with the same meaning as `noteNotice`. A shell is
+   * waited on exactly like a child: its notice wakes the root, so the first idle after it is not terminal. Deduped by
+   * shell and state. Invalidates idle evidence.
+   */
+  readonly noteShellNotice: (shellId: string, state: ShellNoticeState, inboxId: string | null) => void
+  /** As `noteUnreadableNotice`, for a shell. The ledger entry (the caller marks it `unknown`) still blocks admission. */
+  readonly noteUnreadableShellNotice: (shellId: string) => void
   /** A queued inbox item entered a turn of an owned session. */
   readonly noteInboxDelivered: (inboxId: string) => void
   /** The root's execution succeeded: stamps the current revision, unless a notice is still queued. */
@@ -126,9 +135,10 @@ export function createDrainCompletionV2(options: DrainCompletionV2Options): Drai
     invalidate()
   }
 
-  function noteNotice(notice: SubagentNotice, inboxId: string | null): void {
+  // Notices and fences are keyed by ledger key, so a child and a shell can never stand in for each other.
+  function recordNotice(ledgerKey: string, state: string, inboxId: string | null): void {
     if (closed) return
-    const key = `${notice.childSessionId}:${notice.state}`
+    const key = `${ledgerKey}:${state}`
     const existing = notices.get(key)
     if (existing === undefined) {
       // A queued item is not in a turn yet; a transcript message already is.
@@ -137,15 +147,31 @@ export function createDrainCompletionV2(options: DrainCompletionV2Options): Drai
     } else if (existing.inboxId === null && inboxId !== null && !existing.delivered) {
       existing.inboxId = inboxId
     }
-    noticedChildren.add(notice.childSessionId)
+    noticedChildren.add(ledgerKey)
+    requestValidation()
+  }
+
+  function noteNotice(notice: SubagentNotice, inboxId: string | null): void {
+    recordNotice(notice.childSessionId, notice.state, inboxId)
+  }
+
+  function noteShellNotice(shellId: string, state: ShellNoticeState, inboxId: string | null): void {
+    recordNotice(shellLedgerKey(shellId), state, inboxId)
+  }
+
+  function fenceUnreadable(ledgerKey: string): void {
+    if (closed) return
+    invalidate()
+    noticedChildren.add(ledgerKey)
     requestValidation()
   }
 
   function noteUnreadableNotice(childSessionId: string): void {
-    if (closed) return
-    invalidate()
-    noticedChildren.add(childSessionId)
-    requestValidation()
+    fenceUnreadable(childSessionId)
+  }
+
+  function noteUnreadableShellNotice(shellId: string): void {
+    fenceUnreadable(shellLedgerKey(shellId))
   }
 
   function noteInboxDelivered(inboxId: string): void {
@@ -281,6 +307,8 @@ export function createDrainCompletionV2(options: DrainCompletionV2Options): Drai
     noteRootActivity,
     noteNotice,
     noteUnreadableNotice,
+    noteShellNotice,
+    noteUnreadableShellNotice,
     noteInboxDelivered,
     noteRootIdle,
     beginDrain,

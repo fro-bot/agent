@@ -376,6 +376,13 @@ export function wrapLedgerWithHooks(
       if (statesEqual(before, after)) return
       onChange()
     },
+    release: sessionId => {
+      const before = snapshotStates(ledger)
+      ledger.release(sessionId)
+      const after = snapshotStates(ledger)
+      if (statesEqual(before, after)) return
+      onChange()
+    },
     outstanding: () => ledger.outstanding(),
     unknown: () => ledger.unknown(),
     isDrainComplete: () => ledger.isDrainComplete(),

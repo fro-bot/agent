@@ -75,7 +75,7 @@ export type {
 } from './ledger-reconcile.js'
 export {hasBlockingToolPart} from './message-facts.js'
 export {resolveOutputMode} from './output-mode.js'
-export {createOwnershipLedger} from './ownership-ledger.js'
+export {createOwnershipLedger, isShellLedgerKey, shellIdFromLedgerKey, shellLedgerKey} from './ownership-ledger.js'
 export type {OwnershipEntryState, OwnershipLedger, OwnershipLedgerEntry} from './ownership-ledger.js'
 export {
   getBooleanProperty,
@@ -124,6 +124,7 @@ export type {
   V2PermissionDecision,
   V2SessionOutcome,
   V2SessionSummary,
+  V2ShellSummary,
 } from './remote-client-v2.js'
 export {createRemoteOpenCodeHandle} from './remote-client.js'
 export {buildQuestionFormAnswer, createRemoteQuestionClientV2} from './remote-question-client-v2.js'
@@ -170,6 +171,36 @@ export type {OpenCodeServerHandle, ShutdownResult} from './server.js'
 export {createSessionTools, info, list, read, search} from './session-tools.js'
 export type {SessionToolDefinition, SessionTools} from './session-tools.js'
 export type {SetupAdapter} from './setup-adapter.js'
+export {
+  collectOwnerSessionIds,
+  DEFAULT_SHELL_KILL_POLL_INTERVAL_MS,
+  DEFAULT_SHELL_KILL_ROUNDS,
+  killOwnedShells,
+  reconcileShellsOnce,
+} from './shell-jobs-v2.js'
+export type {
+  KillOwnedShellsOptions,
+  KillOwnedShellsResult,
+  ReconcileShellsOptions,
+  ShellApi,
+  ShellReconcileObservation,
+} from './shell-jobs-v2.js'
+export {
+  classifyShellNotice,
+  classifyShellNoticeItem,
+  isShellStatus,
+  readBackgroundShellDispatch,
+  readToolShellId,
+  settleLedgerFromShellNotice,
+} from './shell-notice.js'
+export type {
+  BackgroundShellDispatch,
+  ShellNotice,
+  ShellNoticeRead,
+  ShellNoticeSettlement,
+  ShellNoticeState,
+  V2ShellStatus,
+} from './shell-notice.js'
 export {
   readBackgroundDispatch,
   readSubagentNotice,

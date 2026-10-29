@@ -1,5 +1,13 @@
 import {describe, expect, it, vi} from 'vitest'
 
+import {
+  SHELL_DIRECTORY,
+  SHELL_GET_EXITED_RESPONSE,
+  SHELL_ID,
+  SHELL_LIST_EMPTY_RESPONSE,
+  SHELL_LIST_RUNNING_RESPONSE,
+  SHELL_SESSION_ID,
+} from './event-v2.fixtures.js'
 import {createRemoteOpenCodeV2Client, V2_HEARTBEAT_FRAME} from './remote-client-v2.js'
 
 interface RecordedRequest {
@@ -363,6 +371,168 @@ describe('createRemoteOpenCodeV2Client', () => {
 
       // #then
       await expect(reading).resolves.toEqual([])
+    })
+  })
+  describe('background shells', () => {
+    it('lists the running shells of a location, reading owner, status and pid from the real response (p20)', async () => {
+      // #given
+      const {fetch, requests} = makeFetch(() => json(200, SHELL_LIST_RUNNING_RESPONSE))
+      const client = createRemoteOpenCodeV2Client({baseUrl: 'http://w:9200/', headers: AUTH, fetch})
+
+      // #when
+      const result = await client.listShells({directory: SHELL_DIRECTORY})
+
+      // #then
+      expect(result).toEqual({
+        success: true,
+        data: [{id: SHELL_ID, status: 'running', ownerSessionId: SHELL_SESSION_ID, pid: 67593}],
+      })
+      expect(requests).toHaveLength(1)
+      expect(requests[0]).toMatchObject({url: 'http://w:9200/api/shell', method: 'GET'})
+      expect(requests[0]?.headers).toMatchObject({...AUTH, 'x-opencode-directory': SHELL_DIRECTORY})
+    })
+
+    it('reads an empty list and an untagged shell', async () => {
+      // #given
+      const empty = createRemoteOpenCodeV2Client({
+        baseUrl: 'http://w',
+        fetch: makeFetch(() => json(200, SHELL_LIST_EMPTY_RESPONSE)).fetch,
+      })
+      const untagged = createRemoteOpenCodeV2Client({
+        baseUrl: 'http://w',
+        fetch: makeFetch(() => json(200, {data: [{id: 'sh_1', status: 'running', metadata: {}}]})).fetch,
+      })
+
+      // #when / #then
+      expect(await empty.listShells({directory: '/d'})).toEqual({success: true, data: []})
+      expect(await untagged.listShells({directory: '/d'})).toEqual({
+        success: true,
+        data: [{id: 'sh_1', status: 'running', ownerSessionId: null, pid: null}],
+      })
+    })
+
+    it('fails closed on a list it cannot read: a hidden shell would read as stopped', async () => {
+      // #given
+      const notArray = createRemoteOpenCodeV2Client({
+        baseUrl: 'http://w',
+        fetch: makeFetch(() => json(200, {data: {}})).fetch,
+      })
+      const noId = createRemoteOpenCodeV2Client({
+        baseUrl: 'http://w',
+        fetch: makeFetch(() => json(200, {data: [{status: 'running'}]})).fetch,
+      })
+
+      // #when / #then
+      expect(await notArray.listShells({directory: '/d'})).toEqual({success: false, error: {kind: 'parse'}})
+      expect(await noId.listShells({directory: '/d'})).toEqual({success: false, error: {kind: 'parse'}})
+    })
+
+    it('reads a status it does not know as unknown rather than stopped', async () => {
+      // #given
+      const client = createRemoteOpenCodeV2Client({
+        baseUrl: 'http://w',
+        fetch: makeFetch(() => json(200, {data: [{id: 'sh_1', status: 'suspended'}]})).fetch,
+      })
+
+      // #when
+      const result = await client.listShells({directory: '/d'})
+
+      // #then
+      expect(result).toEqual({
+        success: true,
+        data: [{id: 'sh_1', status: 'unknown', ownerSessionId: null, pid: null}],
+      })
+    })
+
+    it('gets one shell by id, including an exited one', async () => {
+      // #given
+      const {fetch, requests} = makeFetch(() => json(200, SHELL_GET_EXITED_RESPONSE))
+      const client = createRemoteOpenCodeV2Client({baseUrl: 'http://w', fetch})
+
+      // #when
+      const result = await client.getShell({directory: SHELL_DIRECTORY, shellId: SHELL_ID})
+
+      // #then
+      expect(result).toEqual({
+        success: true,
+        data: {id: SHELL_ID, status: 'exited', ownerSessionId: SHELL_SESSION_ID, pid: 67593},
+      })
+      expect(requests[0]).toMatchObject({url: `http://w/api/shell/${SHELL_ID}`, method: 'GET'})
+      expect(requests[0]?.headers).toMatchObject({'x-opencode-directory': SHELL_DIRECTORY})
+    })
+
+    it('reports an unknown shell as http 404', async () => {
+      // #given
+      const client = createRemoteOpenCodeV2Client({baseUrl: 'http://w', fetch: makeFetch(() => json(404, {})).fetch})
+
+      // #when / #then
+      expect(await client.getShell({directory: '/d', shellId: 'sh_gone'})).toEqual({
+        success: false,
+        error: {kind: 'http', status: 404},
+      })
+    })
+
+    it('deletes a shell with a DELETE in the shell location and reads 204 as success', async () => {
+      // #given
+      const {fetch, requests} = makeFetch(() => new Response(null, {status: 204}))
+      const client = createRemoteOpenCodeV2Client({baseUrl: 'http://w', headers: AUTH, fetch})
+
+      // #when
+      const result = await client.deleteShell({directory: SHELL_DIRECTORY, shellId: SHELL_ID})
+
+      // #then
+      expect(result).toEqual({success: true, data: undefined})
+      expect(requests[0]).toMatchObject({url: `http://w/api/shell/${SHELL_ID}`, method: 'DELETE'})
+      expect(requests[0]?.headers).toMatchObject({...AUTH, 'x-opencode-directory': SHELL_DIRECTORY})
+    })
+
+    it('encodes the shell id in the path', async () => {
+      // #given
+      const {fetch, requests} = makeFetch(() => new Response(null, {status: 204}))
+      const client = createRemoteOpenCodeV2Client({baseUrl: 'http://w', fetch})
+
+      // #when
+      await client.deleteShell({directory: '/d', shellId: 'sh_a/b?c'})
+
+      // #then
+      expect(requests[0]?.url).toBe('http://w/api/shell/sh_a%2Fb%3Fc')
+    })
+
+    it('maps auth, transport and abort failures without leaking a body, and passes the signal through', async () => {
+      // #given
+      const controller = new AbortController()
+      const unauthorized = createRemoteOpenCodeV2Client({
+        baseUrl: 'http://w',
+        fetch: makeFetch(() => json(401, {})).fetch,
+      })
+      const down = createRemoteOpenCodeV2Client({
+        baseUrl: 'http://w',
+        fetch: async () => {
+          throw new Error('connect refused')
+        },
+      })
+      const aborting = createRemoteOpenCodeV2Client({
+        baseUrl: 'http://w',
+        fetch: async (_input, init) => {
+          controller.abort()
+          if (init?.signal?.aborted === true) throw new DOMException('aborted', 'AbortError')
+          return json(200, {data: []})
+        },
+      })
+
+      // #when / #then
+      expect(await unauthorized.deleteShell({directory: '/d', shellId: 'sh_1'})).toEqual({
+        success: false,
+        error: {kind: 'auth', status: 401},
+      })
+      expect(await down.listShells({directory: '/d'})).toEqual({
+        success: false,
+        error: {kind: 'network', message: 'connect refused'},
+      })
+      expect(await aborting.getShell({directory: '/d', shellId: 'sh_1', signal: controller.signal})).toEqual({
+        success: false,
+        error: {kind: 'aborted'},
+      })
     })
   })
 })

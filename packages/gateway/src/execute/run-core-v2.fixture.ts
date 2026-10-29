@@ -16,6 +16,7 @@ import type {QuestionCoordinator} from '../approvals/question-coordinator.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {RunCoreV2Params} from './run-core-v2.js'
 import type {RunCoreError} from './run-core.js'
+import type {ShellServerOptions} from './shell-server-v2.fixture.js'
 
 import {err, ok} from '@fro-bot/runtime'
 import {
@@ -29,6 +30,12 @@ import {
   RETRY_SCHEDULED_FRAME,
   SERVER_CONNECTED_FRAME,
   SESSION_MOVED_FRAME,
+  SHELL_BACKGROUND_SUCCESS_FRAME,
+  SHELL_CREATED_FRAME,
+  SHELL_EXITED_FRAME,
+  SHELL_FOREGROUND_SUCCESS_FRAME,
+  SHELL_NOTICE_ENQUEUED_FRAME,
+  SHELL_TOOL_PROGRESS_FRAME,
   SUBAGENT_BACKGROUND_SUCCESS_FRAME,
   SUBAGENT_NOTICE_ENQUEUED_FRAME,
   TEXT_DELTA_FRAME,
@@ -38,12 +45,15 @@ import {
 import {vi} from 'vitest'
 
 import {runOpenCodeCoreV2} from './run-core-v2.js'
+import {makeShellServer} from './shell-server-v2.fixture.js'
 
 export const ROOT = 'ses_root'
 export const CHILD = 'ses_child'
 export const OTHER_CHILD = 'ses_other_child'
 export const STRANGER = 'ses_stranger'
 export const DIRECTORY = '/workspace/repos/o/r'
+export const SHELL = 'sh_bg1'
+export const OTHER_SHELL = 'sh_bg2'
 
 // ---------------------------------------------------------------------------
 // Frames
@@ -156,6 +166,67 @@ export const frames = {
       id,
       metadata: {sessionID: child, status: 'running', truncated: false},
     }),
+
+  // Background shells: the real p20 frames (captured on stock v2.2.0) moved onto the ids under test.
+
+  /** `shell.created` for `shellId`, tagged with `owner` (`metadata` extends the captured `{sessionID}` tag). */
+  shellCreated: (shellId = SHELL, owner = ROOT, metadata: Record<string, unknown> = {}) => {
+    const info = (SHELL_CREATED_FRAME.data as {info: Record<string, unknown>}).info
+    return {...SHELL_CREATED_FRAME, data: {info: {...info, id: shellId, metadata: {sessionID: owner, ...metadata}}}}
+  },
+  /** `session.tool.progress` of a `shell` call: it names the shell before the call finishes. */
+  shellProgress: (callId = 'call_shell', shellId = SHELL, session = ROOT) =>
+    withData(onSession(SHELL_TOOL_PROGRESS_FRAME, session) as Frame, {id: callId, metadata: {shellID: shellId}}),
+  /** The success of a call that backgrounded `shellId` (`status: running`). */
+  shellBackgrounded: (callId = 'call_shell', shellId = SHELL, session = ROOT) =>
+    withData(onSession(SHELL_BACKGROUND_SUCCESS_FRAME, session) as Frame, {
+      id: callId,
+      metadata: {status: 'running', truncated: false, shellID: shellId},
+    }),
+  /** The success of a FOREGROUND call: it ran to completion inside the call. */
+  shellForegroundDone: (callId = 'call_shell', shellId = SHELL, session = ROOT) =>
+    withData(onSession(SHELL_FOREGROUND_SUCCESS_FRAME, session) as Frame, {
+      id: callId,
+      metadata: {status: 'completed', truncated: false, shellID: shellId},
+    }),
+  shellExited: (shellId = SHELL, status = 'exited') => ({
+    ...SHELL_EXITED_FRAME,
+    data: {id: shellId, ...(status === 'exited' ? {exit: 0} : {}), status},
+  }),
+  /** The completion notice the owner receives (the captured p20 shape, `jobID` and `shellID` both set). */
+  shellNotice: (shellId = SHELL, state = 'completed', inboxId = 'msg_shell', session = ROOT) => {
+    const data = SHELL_NOTICE_ENQUEUED_FRAME.data
+    return {
+      ...SHELL_NOTICE_ENQUEUED_FRAME,
+      data: {
+        inboxID: inboxId,
+        sessionID: session,
+        item: {
+          ...data.item,
+          payload: {
+            ...data.item.payload,
+            metadata: {...data.item.payload.metadata, shellID: shellId, jobID: shellId, state},
+          },
+        },
+      },
+    }
+  },
+  /** A user shell command's notice: `source: shell` and no `jobID`. */
+  userShellNotice: (inboxId = 'msg_user_shell', session = ROOT) => ({
+    type: 'session.inbox.enqueued',
+    data: {
+      inboxID: inboxId,
+      sessionID: session,
+      item: {
+        type: 'synthetic',
+        payload: {
+          text: 'The following shell command was executed by the user:',
+          metadata: {source: 'shell', shellID: 'sh_user', state: 'completed'},
+        },
+        delivery: 'steer',
+      },
+    },
+  }),
 
   permissionAsked: (requestId: string, session = ROOT, action = 'external_directory', resource = '/tmp/outside') =>
     withData(onSession(ENV_PERMISSION_ASKED_FRAME, session) as Frame, {
@@ -290,6 +361,8 @@ export interface StartOptions {
   readonly interrupt?: (sessionId: string) => ReturnType<RemoteOpenCodeV2Client['interrupt']>
   /** Called by every `sink.append`; throwing from it makes the event loop body throw. */
   readonly onAppend?: () => void
+  /** The background shells the fake server holds, and how its shell routes misbehave. */
+  readonly shellServer?: ShellServerOptions
 }
 
 export interface Run {
@@ -310,6 +383,8 @@ export interface Run {
   readonly replyForm: ReturnType<typeof vi.fn>
   readonly cancelForm: ReturnType<typeof vi.fn>
   readonly subscribe: ReturnType<typeof vi.fn>
+  /** The shell server double: its routes, its table, and the ordered call log (shared with `interrupt`). */
+  readonly shellServer: ReturnType<typeof makeShellServer>
   readonly signalOfSubscription: () => AbortSignal | undefined
 }
 
@@ -340,8 +415,11 @@ export function startRun(options: StartOptions = {}): Run {
     }
   }
 
+  const callLog = options.shellServer?.log ?? []
+  const shellServer = makeShellServer({...options.shellServer, log: callLog})
   const active = new Set(options.active ?? [ROOT])
   const interrupt = vi.fn(async ({sessionId}: {sessionId: string}) => {
+    callLog.push(`interrupt:${sessionId}`)
     if (options.interrupt !== undefined) return options.interrupt(sessionId)
     active.delete(sessionId)
     return ok({interrupted: true})
@@ -388,6 +466,7 @@ export function startRun(options: StartOptions = {}): Run {
     replyPermission,
     replyForm,
     cancelForm,
+    ...shellServer.routes,
   } as unknown as RemoteOpenCodeV2Client
 
   const logger = makeLogger()
@@ -455,6 +534,7 @@ export function startRun(options: StartOptions = {}): Run {
     replyForm,
     cancelForm,
     subscribe,
+    shellServer,
     signalOfSubscription: () => subscriptionSignal,
   }
 }

@@ -1,8 +1,10 @@
 import type {Result} from '@bfra.me/es/result'
 import type {V2RequestOptions, V2SessionApi, V2SessionListInput, V2SessionListPage} from './ledger-reconcile-v2.js'
+import type {V2ShellStatus} from './shell-notice.js'
 
 import {err, ok} from '@bfra.me/es/result'
-import {getObjectProperty, getStringProperty} from './payload-accessors.js'
+import {getNumberProperty, getObjectProperty, getStringProperty} from './payload-accessors.js'
+import {isShellStatus} from './shell-notice.js'
 
 /**
  * Client for an OpenCode V2 (v2.2.0) server reached through a proxy that injects the server's own credentials.
@@ -22,6 +24,9 @@ import {getObjectProperty, getStringProperty} from './payload-accessors.js'
  * - `GET /api/session/active` and `GET /api/session` back the ledger adapter (`ledger-reconcile-v2.ts`).
  * - `POST /api/session/:id/permission/:requestID/reply` takes `{decision: 'once' | 'always' | 'reject'}`.
  * - `POST /api/session/:id/form/:formID/reply` takes `{answer}`; `DELETE /api/session/:id/form/:formID?message=` cancels.
+ * - `GET /api/shell`, `GET /api/shell/:id` and `DELETE /api/shell/:id` (`groups/shell.ts`) read and stop background shells.
+ *   They are location-scoped: the location rides in `x-opencode-directory`, and a DELETE in another location is a
+ *   silent 204 that kills nothing.
  * - `GET /api/event` is the SSE stream for every location on the server; it starts with `server.connected`.
  *
  * Failures come back as a `V2CallError`. The error never carries a response body, a header or the request URL: a body
@@ -47,6 +52,16 @@ export interface V2SessionSummary {
   readonly directory: string | null
   /** The persisted outcome of the last execution that ended, or `null` when none has. */
   readonly outcome: V2SessionOutcome | null
+}
+
+export interface V2ShellSummary {
+  readonly id: string
+  /** `unknown` for a status this client does not know: never read as stopped. */
+  readonly status: V2ShellStatus | 'unknown'
+  /** `info.metadata.sessionID`: the session that started the shell. `null` when nobody tagged it. */
+  readonly ownerSessionId: string | null
+  /** Present on `GET /api/shell` and `GET /api/shell/:id`; absent on the `shell.created` frame. */
+  readonly pid: number | null
 }
 
 /**
@@ -115,6 +130,29 @@ export interface RemoteOpenCodeV2Client {
     readonly message?: string
     readonly signal?: AbortSignal
   }) => Promise<Result<undefined, V2CallError>>
+  /**
+   * The RUNNING shells of a location (exited ones are not listed). A list that cannot be read in full is a `parse`
+   * failure, never a shorter list: a shell that did not make it into the answer would read as stopped.
+   */
+  readonly listShells: (input: {
+    readonly directory: string
+    readonly signal?: AbortSignal
+  }) => Promise<Result<readonly V2ShellSummary[], V2CallError>>
+  /** One shell, running or exited (the server retains the last 25 exited per location). Unknown or evicted: `http 404`. */
+  readonly getShell: (input: {
+    readonly directory: string
+    readonly shellId: string
+    readonly signal?: AbortSignal
+  }) => Promise<Result<V2ShellSummary, V2CallError>>
+  /**
+   * Kill and remove a shell. Answers 204 for an unknown id too, so success means "the request was accepted", never
+   * "the process is gone": confirm with `listShells`. The job ends as `error` and its notice WAKES the owning session.
+   */
+  readonly deleteShell: (input: {
+    readonly directory: string
+    readonly shellId: string
+    readonly signal?: AbortSignal
+  }) => Promise<Result<undefined, V2CallError>>
 }
 
 interface RequestInput {
@@ -142,6 +180,18 @@ function describeCallError(error: V2CallError): string {
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function readShell(value: unknown): V2ShellSummary | null {
+  const id = getStringProperty(value, 'id')
+  if (id === null || id.length === 0) return null
+  const status = getStringProperty(value, 'status')
+  return {
+    id,
+    status: isShellStatus(status) ? status : 'unknown',
+    ownerSessionId: getStringProperty(getObjectProperty(value, 'metadata'), 'sessionID'),
+    pid: getNumberProperty(value, 'pid'),
+  }
 }
 
 function readOutcome(value: unknown): V2SessionOutcome | null {
@@ -366,6 +416,45 @@ export function createRemoteOpenCodeV2Client(options: RemoteOpenCodeV2ClientOpti
         method: 'DELETE',
         path: `/api/session/${encodeURIComponent(sessionId)}/form/${encodeURIComponent(formId)}`,
         ...(message === undefined ? {} : {query: {message}}),
+        ...(signal === undefined ? {} : {signal}),
+      }),
+
+    listShells: async ({directory, signal}) => {
+      const result = await sendJson({
+        method: 'GET',
+        path: '/api/shell',
+        directory,
+        ...(signal === undefined ? {} : {signal}),
+      })
+      if (!result.success) return result
+      const data = getObjectProperty(result.data, 'data')
+      if (!Array.isArray(data)) return err({kind: 'parse'})
+      const shells: V2ShellSummary[] = []
+      for (const entry of data) {
+        const shell = readShell(entry)
+        if (shell === null) return err({kind: 'parse'})
+        shells.push(shell)
+      }
+      return ok(shells)
+    },
+
+    getShell: async ({directory, shellId, signal}) => {
+      const result = await sendJson({
+        method: 'GET',
+        path: `/api/shell/${encodeURIComponent(shellId)}`,
+        directory,
+        ...(signal === undefined ? {} : {signal}),
+      })
+      if (!result.success) return result
+      const shell = readShell(getObjectProperty(result.data, 'data'))
+      return shell === null ? err({kind: 'parse'}) : ok(shell)
+    },
+
+    deleteShell: async ({directory, shellId, signal}) =>
+      sendNoContent({
+        method: 'DELETE',
+        path: `/api/shell/${encodeURIComponent(shellId)}`,
+        directory,
         ...(signal === undefined ? {} : {signal}),
       }),
   }

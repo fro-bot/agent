@@ -63,6 +63,12 @@ export interface OwnershipLedger {
    * a safe no-op.
    */
   readonly markUnknown: (sessionId: string) => void
+  /**
+   * Drop the entry for `sessionId`, in any state. For an entry adopted on a tentative signal that turned out not to be
+   * owned work: a foreground shell is adopted when it is created and released when its tool call ends, because only a
+   * backgrounded shell outlives the call and sends a notice. A no-op when the entry was never adopted.
+   */
+  readonly release: (sessionId: string) => void
   /** Count of entries currently `outstanding`. Zero means nothing left to drain. */
   readonly outstanding: () => number
   /** Count of entries currently `unknown`. Zero means nothing unconfirmed remains. */
@@ -158,6 +164,10 @@ export function createOwnershipLedger(): OwnershipLedger {
       entries.set(sessionId, {label: entry.label, state: 'unknown'})
     },
 
+    release: (sessionId: string): void => {
+      entries.delete(sessionId)
+    },
+
     outstanding: (): number => countByState('outstanding'),
 
     unknown: (): number => countByState('unknown'),
@@ -175,4 +185,25 @@ export function createOwnershipLedger(): OwnershipLedger {
 
     isTracked: (sessionId: string): boolean => entries.has(sessionId),
   }
+}
+
+const SHELL_LEDGER_KEY_PREFIX = 'shell:'
+
+/**
+ * The ledger key of a background shell. A shell is not a session, so it is keyed in a separate key space: no session id
+ * can equal it, and a notice that names a bare id can never settle a shell's entry or the other way round. Callers
+ * that walk the ledger as sessions (interrupt, reconcile by parent, ownership checks) skip these keys.
+ */
+export function shellLedgerKey(shellId: string): string {
+  return `${SHELL_LEDGER_KEY_PREFIX}${shellId}`
+}
+
+/** Whether a ledger key was made by `shellLedgerKey`. */
+export function isShellLedgerKey(key: string): boolean {
+  return key.startsWith(SHELL_LEDGER_KEY_PREFIX)
+}
+
+/** The shell id a shell ledger key was made from. Only meaningful when `isShellLedgerKey(key)`. */
+export function shellIdFromLedgerKey(key: string): string {
+  return key.slice(SHELL_LEDGER_KEY_PREFIX.length)
 }

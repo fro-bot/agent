@@ -1,6 +1,7 @@
-import type {V2SessionApi, V2SessionInfoLike} from '@fro-bot/runtime'
+import type {V2CallError, V2SessionApi, V2SessionInfoLike, V2ShellSummary} from '@fro-bot/runtime'
 import type {GatewayLogger} from '../discord/client.js'
 
+import {err, ok} from '@fro-bot/runtime'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
 import {REPO_QUIESCENCE_TIMEOUT_MS} from './recovery-budget.js'
@@ -16,12 +17,21 @@ interface Options {
   readonly active?: Readonly<Record<string, {readonly type: string}>>
   readonly sessions?: readonly V2SessionInfoLike[]
   readonly active_?: () => Promise<Readonly<Record<string, {readonly type: string}>>>
+  /** Shells the server lists as running for the location, whoever owns them. */
+  readonly shells?: readonly V2ShellSummary[]
+  readonly shellsError?: V2CallError
+  readonly shells_?: () => Promise<never>
 }
 
 function makeChecker(options: Options = {}) {
   const list = vi.fn(async (input: {readonly directory?: string}) => ({
     data: (options.sessions ?? []).filter(session => session.location?.directory === input.directory),
   }))
+  const listShells = vi.fn(async (_input: {readonly directory: string; readonly signal?: AbortSignal}) => {
+    if (options.shells_ !== undefined) return options.shells_()
+    if (options.shellsError !== undefined) return err(options.shellsError)
+    return ok(options.shells ?? [])
+  })
   const api: V2SessionApi = {
     active: options.active_ ?? (async () => options.active ?? {}),
     list,
@@ -31,10 +41,10 @@ function makeChecker(options: Options = {}) {
     workspaceOpencodeUrl: 'http://workspace:9200',
     workspaceOpencodeToken: 'secret',
     logger,
-    createClient: () => ({session: api}),
+    createClient: () => ({session: api, listShells}),
     now: () => new Date('2026-10-28T00:00:00.000Z'),
   })
-  return {checker, list, logger}
+  return {checker, list, listShells, logger}
 }
 
 const context = (signal: AbortSignal = new AbortController().signal) => ({repo: 'o/r', signal})
@@ -159,5 +169,96 @@ describe('createRepoQuiescenceCheckerV2', () => {
       expect.objectContaining({busyCount: 40, sessionIds: ids.slice(0, 32)}),
       'repo-quiescence: workspace busy',
     )
+  })
+
+  describe('background shells', () => {
+    const shell = (id: string, owner: string | null, status: V2ShellSummary['status'] = 'running'): V2ShellSummary => ({
+      id,
+      status,
+      ownerSessionId: owner,
+      pid: 4242,
+    })
+
+    it('is busy while a shell runs in the repo directory, with every session idle', async () => {
+      // #given — the root finished, the lock holder is gone, and a background shell still runs (probe p20)
+      const {checker, listShells} = makeChecker({shells: [shell('sh_bg', 'ses_root')]})
+
+      // #when
+      const result = await checker(context())
+
+      // #then — a shell can write the checkout whether or not any session is active
+      expect(result).toMatchObject({kind: 'busy', directory: DIRECTORY, sessionIds: ['sh_bg']})
+      expect(listShells).toHaveBeenCalledWith(expect.objectContaining({directory: DIRECTORY}))
+    })
+
+    it('is busy for a shell nobody tagged and one whose owner this check cannot name', async () => {
+      // #given — `POST /api/shell` has no owner, and the dead run's sessions are not recoverable from its lease
+      const {checker} = makeChecker({shells: [shell('sh_untagged', null), shell('sh_stranger', 'ses_unrelated')]})
+
+      // #when
+      const result = await checker(context())
+
+      // #then
+      expect(result).toMatchObject({kind: 'busy', sessionIds: ['sh_untagged', 'sh_stranger']})
+    })
+
+    it('lists busy sessions and running shells together', async () => {
+      // #given
+      const {checker} = makeChecker({
+        active: {ses_child: {type: 'running'}},
+        sessions: [{id: 'ses_child', location: {directory: DIRECTORY}}],
+        shells: [shell('sh_bg', 'ses_child')],
+      })
+
+      // #when
+      const result = await checker(context())
+
+      // #then
+      expect(result).toMatchObject({kind: 'busy', sessionIds: ['ses_child', 'sh_bg']})
+    })
+
+    it('is clear when the only shells are stopped ones', async () => {
+      // #given — a list that includes records with a stopped status is not a running shell
+      const {checker} = makeChecker({shells: [shell('sh_a', 'ses_root', 'exited'), shell('sh_b', null, 'killed')]})
+
+      // #when / #then
+      expect(await checker(context())).toMatchObject({kind: 'clear'})
+    })
+
+    it('reads a shell with a status it does not know as running', async () => {
+      // #given
+      const {checker} = makeChecker({shells: [shell('sh_a', null, 'unknown')]})
+
+      // #when / #then
+      expect(await checker(context())).toMatchObject({kind: 'busy', sessionIds: ['sh_a']})
+    })
+
+    it('is unknown, never clear, when the shell list cannot be read', async () => {
+      // #given — the session side answers, the shell side does not
+      const {checker} = makeChecker({shellsError: {kind: 'http', status: 503}})
+
+      // #when
+      const result = await checker(context())
+
+      // #then
+      expect(result).toMatchObject({
+        kind: 'unknown',
+        source: 'opencode-session-status',
+        reason: 'status-request-failed',
+      })
+    })
+
+    it('is unknown when the shell request outlives the bound', async () => {
+      // #given
+      vi.useFakeTimers()
+      const {checker} = makeChecker({shells_: async () => new Promise<never>(() => undefined)})
+
+      // #when
+      const pending = checker(context())
+      await vi.advanceTimersByTimeAsync(REPO_QUIESCENCE_TIMEOUT_MS + 1)
+
+      // #then
+      await expect(pending).resolves.toMatchObject({kind: 'unknown', reason: 'status-request-timeout'})
+    })
   })
 })

@@ -2,7 +2,7 @@ import type {LedgerReconcileAdapter, SubagentNotice} from '@fro-bot/runtime'
 import type {GatewayLogger} from '../discord/client.js'
 import type {DrainRejectCode} from './drain-completion.js'
 
-import {createOwnershipLedger, err, ok} from '@fro-bot/runtime'
+import {createOwnershipLedger, err, ok, shellLedgerKey} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {createDrainCompletionV2} from './drain-completion-v2.js'
@@ -400,6 +400,137 @@ describe('createDrainCompletionV2', () => {
     await vi.advanceTimersByTimeAsync(10)
 
     // #then
+    expect(s.onAdmitted).not.toHaveBeenCalled()
+    expect(s.reasons.at(-1)).toBe('notice-not-observed')
+  })
+})
+
+describe('createDrainCompletionV2: background shells', () => {
+  const SHELL = 'sh_185e8678e001OVuLXzTBhwDmUx'
+  const SHELL_KEY = shellLedgerKey(SHELL)
+
+  function shellSetup(options: {readonly live?: readonly Live[]} = {}) {
+    const s = setup({children: [], ...options})
+    s.ledger.adopt(SHELL_KEY, 'sleep 8')
+    return s
+  }
+
+  /** The server's own statement that a background shell ended: the ledger settles and the gate hears the notice. */
+  function shellEnds(s: ReturnType<typeof setup>, inboxId: string | null = 'msg_shell_notice') {
+    s.ledger.settle(SHELL_KEY)
+    s.drain.noteShellNotice(SHELL, 'completed', inboxId)
+  }
+
+  it('does not admit while a shell is outstanding, whatever the root did', async () => {
+    // #given — the root went idle and the shell still runs
+    const s = shellSetup()
+    s.drain.noteRootIdle()
+    s.drain.beginDrain()
+
+    // #when
+    s.drain.requestValidation()
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #then
+    expect(s.onAdmitted).not.toHaveBeenCalled()
+    expect(s.reasons.at(-1)).toBe('ledger-not-drained')
+  })
+
+  it('admits only after the shell notice and the root turn it woke have both ended (real p20 order)', async () => {
+    // #given — idle once, shell running
+    const s = shellSetup()
+    s.drain.noteRootIdle()
+    s.drain.beginDrain()
+
+    // #when — the notice arrives and the shell settles, but the woken turn has not run yet
+    shellEnds(s)
+    s.drain.requestValidation()
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #then — the first idle is not terminal
+    expect(s.onAdmitted).not.toHaveBeenCalled()
+
+    // #when — the woken turn takes the notice in and ends
+    noticeTurn(s, 'msg_shell_notice')
+    s.drain.requestValidation()
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #then
+    expect(s.onAdmitted).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not admit a settled shell whose notice was never observed', async () => {
+    // #given — reconciliation saw the shell stop; its notice has not arrived
+    const s = shellSetup()
+    s.drain.noteRootIdle()
+    s.drain.beginDrain()
+    s.ledger.settle(SHELL_KEY)
+
+    // #when
+    s.drain.requestValidation()
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #then
+    expect(s.onAdmitted).not.toHaveBeenCalled()
+    expect(s.reasons.at(-1)).toBe('notice-not-observed')
+  })
+
+  it('holds a queued shell notice until it is delivered into a root turn', async () => {
+    // #given
+    const s = shellSetup()
+    s.drain.noteRootIdle()
+    s.drain.beginDrain()
+    shellEnds(s)
+
+    // #when — a root idle that did not take the notice in
+    s.drain.noteRootIdle()
+    s.drain.requestValidation()
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #then
+    expect(s.onAdmitted).not.toHaveBeenCalled()
+  })
+
+  it('counts an unreadable shell notice as observed, but still needs idle evidence', async () => {
+    // #given
+    const s = shellSetup()
+    s.drain.noteRootIdle()
+    s.drain.beginDrain()
+    s.ledger.settle(SHELL_KEY)
+
+    // #when
+    s.drain.noteUnreadableShellNotice(SHELL)
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #then — the earlier idle is stale
+    expect(s.onAdmitted).not.toHaveBeenCalled()
+    expect(s.reasons.at(-1)).toBe('idle-evidence-stale')
+
+    // #when — the turn that follows ends
+    s.drain.noteRootActivity()
+    s.drain.noteRootIdle()
+    s.drain.requestValidation()
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #then
+    expect(s.onAdmitted).toHaveBeenCalledTimes(1)
+  })
+
+  it('a child notice does not stand in for a shell notice, and the other way round', async () => {
+    // #given — a child and a shell are outstanding, and only the child ends
+    const s = setup({children: [CHILD]})
+    s.ledger.adopt(SHELL_KEY, 'sleep 8')
+    s.drain.noteRootIdle()
+    s.drain.beginDrain()
+    childEnds(s)
+    s.ledger.settle(SHELL_KEY)
+
+    // #when
+    noticeTurn(s)
+    s.drain.requestValidation()
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #then — the shell's own notice is still missing
     expect(s.onAdmitted).not.toHaveBeenCalled()
     expect(s.reasons.at(-1)).toBe('notice-not-observed')
   })

@@ -28,7 +28,14 @@
  * and its wait reason, owned children marked `unknown` on error, and the human-wait gauge that pauses the watchdog.
  */
 
-import type {OwnershipLedger, RemoteOpenCodeV2Client, V2CallError, V2DomainEvent, V2FormField} from '@fro-bot/runtime'
+import type {
+  OwnershipLedger,
+  ReconcileLedgerOptions,
+  RemoteOpenCodeV2Client,
+  V2CallError,
+  V2DomainEvent,
+  V2FormField,
+} from '@fro-bot/runtime'
 import type {PermissionCoordinator} from '../approvals/coordinator.js'
 import type {QuestionAskedRequest, QuestionCoordinator} from '../approvals/question-coordinator.js'
 import type {TerminalListener} from '../approvals/request-gate.js'
@@ -40,14 +47,21 @@ import type {FormDirectoryV2} from './question-client-v2.js'
 import type {StreamTerminal} from './root-stop-v2.js'
 import type {CoreStreamSink, RunCoreErrorKind} from './run-core.js'
 import {
+  collectOwnerSessionIds,
   createInactivityTimer,
   createLedgerReconciler,
   createOwnershipLedger,
   createV2LedgerReconcileAdapter,
+  isShellLedgerKey,
   mapV2Event,
   mapV2EventStream,
   readBackgroundDispatch,
+  readBackgroundShellDispatch,
+  readToolShellId,
+  reconcileShellsOnce,
+  settleLedgerFromShellNotice,
   settleLedgerFromSubagentNotice,
+  shellLedgerKey,
   toErrorMessage,
 } from '@fro-bot/runtime'
 import {parsePermissionReply, parsePermissionRequest} from '../approvals/coordinator.js'
@@ -321,9 +335,10 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
 
   function persistOwnership(): void {
     if (ownershipLedger === undefined) return
+    // Sessions only: recovery reads these as session ids, and a background shell is not one.
     const ownedSessionIds = ownershipLedger
       .snapshot()
-      .filter(entry => entry.state !== 'settled')
+      .filter(entry => entry.state !== 'settled' && !isShellLedgerKey(entry.sessionId))
       .map(entry => entry.sessionId)
     onOwnershipChange?.({rootSessionId: sessionId, ownedSessionIds})
   }
@@ -331,6 +346,8 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
   // Children whose completion notice was seen. A notice can precede the dispatch result on the stream; the child is then
   // settled the moment it is adopted.
   const noticedChildIds = new Set<string>()
+  // The same for background shells, by shell id.
+  const noticedShellIds = new Set<string>()
 
   const ledger: OwnershipLedger | undefined =
     ownershipLedger === undefined
@@ -342,8 +359,11 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
             drainCompletion?.requestValidation()
           },
           // The single place a directly observed dispatch reaches the coordinator, so its events and approvals route
-          // from the moment it is adopted. Reconciliation never adopts.
-          adoptedSessionId => ownershipCoordinator.addOwnedSession(adoptedSessionId),
+          // from the moment it is adopted. Reconciliation never adopts. A background shell is not a session: it has
+          // no events or approvals of its own to route.
+          adoptedKey => {
+            if (!isShellLedgerKey(adoptedKey)) ownershipCoordinator.addOwnedSession(adoptedKey)
+          },
         )
 
   const reconcileAdapter = ledger === undefined ? undefined : createV2LedgerReconcileAdapter(client.session)
@@ -355,12 +375,31 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
     ledger === undefined || reconcileAdapter === undefined || runtimeLogger === undefined
       ? undefined
       : {ledger, adapter: reconcileAdapter, parentSessionId: sessionId, logger: runtimeLogger}
+  // The shell entries get their own pass: sessions are asked about through the session API, shells through the shell
+  // routes, and a failing or slow one must not hold the other back.
+  async function reconcileShellPass(passOptions: ReconcileLedgerOptions): Promise<unknown> {
+    return reconcileShellsOnce({
+      ledger: passOptions.ledger,
+      api: client,
+      directory,
+      logger: passOptions.logger,
+      ...(passOptions.signal === undefined ? {} : {signal: passOptions.signal}),
+    })
+  }
+
+  async function runLivePasses(passOptions: ReconcileLedgerOptions): Promise<void> {
+    await Promise.all([
+      reconcileLivePass(passOptions, () => liveReconcileClosed),
+      reconcileLivePass(passOptions, () => liveReconcileClosed, undefined, reconcileShellPass),
+    ])
+  }
+
   const reconciler =
     liveReconcileOptions === undefined
       ? undefined
       : createLedgerReconciler({
           ...liveReconcileOptions,
-          runPass: async () => reconcileLivePass(liveReconcileOptions, () => liveReconcileClosed),
+          runPass: async () => runLivePasses(liveReconcileOptions),
         })
 
   if (ledger !== undefined && reconcileAdapter !== undefined) {
@@ -442,6 +481,7 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
         (drainCompletion !== undefined && draining && !drainDoneController.signal.aborted))
     const settlement = await settleOwnedSessionsV2({
       client,
+      directory,
       rootSessionId: sessionId,
       ledger: barrierLedger,
       logger,
@@ -456,11 +496,19 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
     // A root the barrier could not confirm stopped may still be preparing a prompt (an interrupt sent before the
     // execution is admitted does nothing). Keep probing it for the quarantine hold, interrupting it whenever it shows
     // up busy.
-    if (settlement.rootUnconfirmed) {
+    if (settlement.rootUnconfirmed || settlement.shellsUnconfirmed) {
       startQuarantineRootWatchV2({
         client,
         adapter: createV2LedgerReconcileAdapter(client.session),
         rootSessionId: sessionId,
+        // The watch keeps killing owned shells it finds running: a DELETEd shell's notice wakes its owner, and a shell
+        // that survived the barrier's kill must not outlive the hold.
+        shells: {
+          api: client,
+          directory,
+          ownerSessionIds: collectOwnerSessionIds(sessionId, barrierLedger),
+          ledger: barrierLedger,
+        },
         streamTerminal: () => rootTerminal,
         ...(followUpPossible ? {followUpPossible: true} : {}),
         logger,
@@ -608,6 +656,9 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
   // ── 4. Consume event stream ────────────────────────────────────────────────
   // Tool name and input by call id: `session.tool.success` carries neither.
   const toolCalls = new Map<string, {name: string | null; input: Readonly<Record<string, unknown>> | null}>()
+  // The shell a tool call started, by call id: `session.tool.progress` names it before the call finishes, and a failed
+  // call may not repeat it.
+  const shellByCall = new Map<string, string>()
   // Inner calls of `execute` calls already shown, by `v2InnerCallKey`.
   const shownInnerCalls = new Set<string>()
   // Text parts that received at least one delta, by message and ordinal: an end event repeats their text.
@@ -702,6 +753,22 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
           logger.warn({formId: safeLogId(formId)}, 'run-core: form cancel threw')
         },
       )
+  }
+
+  /**
+   * Adopt a background shell into the ledger. Idempotent by shell id: a shell is seen at creation, and again when its
+   * tool call returns `running`. A notice that preceded the adoption settles it at once.
+   */
+  function adoptShell(shellId: string, source: 'shell-created' | 'tool-result'): void {
+    if (ledger === undefined) return
+    const key = shellLedgerKey(shellId)
+    const fresh = !ledger.isTracked(key)
+    // The command is model-controlled text and stays out of the ledger label and the logs.
+    ledger.adopt(key, 'background shell')
+    if (noticedShellIds.has(shellId)) ledger.settle(key)
+    if (fresh) {
+      logger.info({sessionId, shellId, source}, 'run-core: background shell adopted into ownership ledger')
+    }
   }
 
   // The silence watchdog starts here (the primitive arms on creation), immediately before the `try` whose `finally`
@@ -836,6 +903,8 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
 
         case 'tool_progress': {
           if (!isOwnedSession(event.sessionId)) break
+          const progressShellId = readToolShellId(event.metadata)
+          if (progressShellId !== null) shellByCall.set(event.callId, progressShellId)
           showInnerCalls(event)
           noteActivity(event.sessionId)
           break
@@ -845,6 +914,8 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
           if (!isOwnedSession(event.sessionId)) break
           const info = toolCalls.get(event.callId)
           toolCalls.delete(event.callId)
+          const callShellId = readToolShellId(event.metadata) ?? shellByCall.get(event.callId) ?? null
+          shellByCall.delete(event.callId)
           const name = info?.name ?? null
           logger.debug({callId: event.callId, tool: name, outcome: event.outcome}, 'run-core: tool finished')
 
@@ -865,6 +936,17 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
                 {sessionId, childSessionId: dispatch.childSessionId, label},
                 'run-core: background dispatch observed -- adopted into ownership ledger',
               )
+            }
+            if (ledger !== undefined && name === 'shell') {
+              // A shell is adopted when it is created, before anyone knows whether it will outlive its call. Only a
+              // call that returns `running` did: it sends a notice and wakes its owner. A call that ended any other
+              // way ran in the foreground and is over, so its entry would wait for a notice that never comes.
+              const shellDispatch = readBackgroundShellDispatch(name, event)
+              if (shellDispatch !== null) {
+                adoptShell(shellDispatch.shellId, 'tool-result')
+              } else if (callShellId !== null) {
+                ledger.release(shellLedgerKey(callShellId))
+              }
             }
             const title = titleFromInput(info?.input ?? null)
             appendToolSummary(
@@ -1026,6 +1108,36 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
           break
         }
 
+        case 'shell_started': {
+          // The earliest signal that an owned session started a shell. A shell nobody tagged (`POST /api/shell`), one
+          // a stranger's session started, and a user-run command (awaited by its request, no notice) are not owned.
+          if (event.userCommand || event.ownerSessionId === null || !isOwnedSession(event.ownerSessionId)) break
+          adoptShell(event.shellId, 'shell-created')
+          break
+        }
+
+        case 'shell_exited': {
+          // Informational only. The process ending is not the job ending: the notice is, and it can arrive on either
+          // side of this frame (probes p20 and p22).
+          logger.debug({shellId: event.shellId, status: event.status}, 'run-core: shell exited')
+          break
+        }
+
+        case 'shell_notice': {
+          // The server's own statement that a background shell ended, read from metadata and never from text. It
+          // wakes the owner, so the gate waits for the turn it triggers exactly as it does for a child.
+          if (!isOwnedSession(event.ownerSessionId)) break
+          noticedShellIds.add(event.shellId)
+          drainCompletion?.noteShellNotice(event.shellId, event.state, event.inboxId)
+          if (ledger !== undefined) settleLedgerFromShellNotice(ledger, {shellId: event.shellId, state: event.state})
+          markActivity()
+          logger.info(
+            {sessionId, shellId: event.shellId, state: event.state},
+            'run-core: background shell completion notice observed',
+          )
+          break
+        }
+
         case 'inbox_delivered': {
           // Any owned session: a notice can be queued into a busy child, and is delivered there. Inbox ids are unique
           // message ids, so a delivery can only match the notice it names.
@@ -1082,7 +1194,7 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
           // Fire-and-forget: its mutations (via the wrapped ledger) trigger persistence and validation on their own.
           if (!ledgerSettled && liveReconcileOptions !== undefined) {
             // eslint-disable-next-line no-void
-            void reconcileLivePass(liveReconcileOptions, () => liveReconcileClosed)
+            void runLivePasses(liveReconcileOptions)
           }
 
           // Validate now that this generation has idle evidence. Coalesced: at most one in flight.
@@ -1177,7 +1289,9 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
           const safetyRelevant =
             event.eventType === 'permission.asked' ||
             event.eventType === 'form.created' ||
-            event.eventType === 'session.moved'
+            event.eventType === 'session.moved' ||
+            // A shell of an owned session that cannot be identified is a writer nobody can wait for or stop.
+            event.eventType === 'shell.created'
           if (event.childSessionId !== undefined && isOwnedSession(event.sessionId)) {
             // A child's notice the server sent and this client cannot read. It proves nothing about the child, so the
             // child is fenced rather than waited on: the gate stops expecting a readable notice, and the entry is
@@ -1188,6 +1302,19 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
             logger.warn(
               {sessionId, childSessionId: event.childSessionId, eventType: event.eventType},
               'run-core: a child completion notice could not be read — child fenced and marked unknown',
+            )
+            break
+          }
+          if (event.shellId !== undefined && isOwnedSession(event.sessionId)) {
+            // A shell job's notice the server sent and this client cannot read: fenced like a child's. The gate stops
+            // expecting a readable notice, and the entry is `unknown` (never `settled`) until reconciliation sees the
+            // shell stop.
+            drainCompletion?.noteUnreadableShellNotice(event.shellId)
+            ledger?.markUnknown(shellLedgerKey(event.shellId))
+            markActivity()
+            logger.warn(
+              {sessionId, shellId: event.shellId, eventType: event.eventType},
+              'run-core: a background shell notice could not be read — shell fenced and marked unknown',
             )
             break
           }
