@@ -26,6 +26,8 @@ function makeLogger(): GatewayLogger {
 interface ServerOptions {
   /** Sessions stored under the directory. */
   readonly sessions?: readonly string[]
+  /** Sessions that are stored under another directory (they moved): active, and not placed here. */
+  readonly movedSessions?: readonly string[]
   /** Sessions of earlier runs stored under the directory: last updated an hour before `RUN_STARTED`. */
   readonly oldSessions?: readonly string[]
   /** Sessions that are active before any interrupt. */
@@ -41,8 +43,11 @@ function makeServer(options: ServerOptions = {}) {
   const shellServer = makeShellServer(options.shellServer)
   const sessions = [...(options.sessions ?? [ROOT])]
   const active = new Set(options.active ?? [])
-  const interrupt = vi.fn(async ({sessionId}: {sessionId: string}) => {
+  /** Whether each interrupt's signal was already aborted when the request was made. */
+  const interruptSignals: {sessionId: string; abortedAtCall: boolean}[] = []
+  const interrupt = vi.fn(async ({sessionId, signal}: {sessionId: string; signal?: AbortSignal}) => {
     shellServer.log.push(`interrupt:${sessionId}`)
+    interruptSignals.push({sessionId, abortedAtCall: signal?.aborted === true})
     if (options.interruptFails === true)
       return {success: false as const, error: {kind: 'network' as const, message: 'down'}}
     if (options.unstoppable?.includes(sessionId) !== true) active.delete(sessionId)
@@ -70,12 +75,14 @@ function makeServer(options: ServerOptions = {}) {
     getSession: vi.fn(async ({sessionId}: {sessionId: string}) =>
       sessions.includes(sessionId)
         ? ok({id: sessionId, parentId: null, directory: DIR, outcome: null})
-        : {success: false as const, error: {kind: 'http' as const, status: 404}},
+        : options.movedSessions?.includes(sessionId) === true
+          ? ok({id: sessionId, parentId: null, directory: '/workspace/repos/elsewhere', outcome: null})
+          : {success: false as const, error: {kind: 'http' as const, status: 404}},
     ),
     interrupt,
     ...shellServer.routes,
   } as unknown as RemoteOpenCodeV2Client
-  return {client, interrupt, activeCalls, active, sessions, shellServer}
+  return {client, interrupt, interruptSignals, activeCalls, active, sessions, shellServer}
 }
 
 function ledgerWith(...ids: string[]) {
@@ -116,6 +123,64 @@ afterEach(() => {
 })
 
 describe('settleOwnedSessionsV2', () => {
+  it('interrupts an owned session that moved, wherever the directory places it', async () => {
+    // #given — the child moved: it is active, stored under its destination, and the directory cannot place it
+    vi.useFakeTimers()
+    const server = makeServer({sessions: [ROOT], active: [CHILD], movedSessions: [CHILD]})
+
+    // #when
+    const result = await settleAndWait(server, {knownSessionIds: () => [CHILD]})
+
+    // #then — stopped, and since it was active the first readings were not quiet
+    expect(server.interrupt).toHaveBeenCalledWith(expect.objectContaining({sessionId: CHILD}))
+    expect(result.settled).toBe(true)
+  })
+
+  it('does not interrupt a moved session that is not active', async () => {
+    // #given
+    vi.useFakeTimers()
+    const server = makeServer({sessions: [ROOT], active: [], movedSessions: [CHILD]})
+
+    // #when
+    await settleAndWait(server, {knownSessionIds: () => [CHILD]})
+
+    // #then
+    expect(server.interrupt).not.toHaveBeenCalled()
+  })
+
+  it('leaves a session that moved alone when it is not told it is the run’s', async () => {
+    // #given — the same world without the explicit target: placement drops it
+    vi.useFakeTimers()
+    const server = makeServer({sessions: [ROOT], active: [CHILD], movedSessions: [CHILD]})
+
+    // #when
+    await settleAndWait(server)
+
+    // #then
+    expect(server.interrupt).not.toHaveBeenCalledWith(expect.objectContaining({sessionId: CHILD}))
+  })
+
+  it('interrupts the root and the children with live signals while a shell DELETE stalls', async () => {
+    // #given — the DELETE never answers; the sessions answer their interrupts and keep running
+    vi.useFakeTimers()
+    const server = makeServer({
+      sessions: [ROOT, CHILD],
+      active: [ROOT, CHILD],
+      unstoppable: [ROOT, CHILD],
+      shellServer: {shells: {[SHELL]: {status: 'running', owner: ROOT}}, deleteHangs: true},
+    })
+
+    // #when — the barrier runs to its bound
+    const result = await settleAndWait(server, {}, 30_000)
+
+    // #then — unconfirmed, and no interrupt went out on a signal the stalled DELETE had used up
+    expect(result.settled).toBe(false)
+    const rootCalls = server.interruptSignals.filter(call => call.sessionId === ROOT)
+    expect(rootCalls.length).toBeGreaterThanOrEqual(1)
+    expect(server.interruptSignals.some(call => call.sessionId === CHILD)).toBe(true)
+    expect(server.interruptSignals.every(call => !call.abortedAtCall)).toBe(true)
+  })
+
   it('settles once the directory shows nothing for the whole window, without touching anything', async () => {
     // #given
     vi.useFakeTimers()

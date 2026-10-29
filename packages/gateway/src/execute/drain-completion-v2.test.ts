@@ -633,6 +633,50 @@ describe('createDrainCompletionV2: the directory gate', () => {
     expect(s.observe.mock.calls.length - readsBefore).toBeGreaterThanOrEqual(3)
   })
 
+  it('needs a fresh window after activity and a new idle land during the final reading', async () => {
+    // #given — the third and last reading is held; the root takes a turn and goes idle again while it is in flight
+    const s = setup({
+      onRead: reading => {
+        if (reading !== 3) return
+        s.drain.noteRootActivity()
+        s.drain.noteRootIdle()
+        s.drain.requestValidation()
+      },
+    })
+    readyToAdmit(s)
+    s.drain.requestValidation()
+
+    // #when — the held reading comes back quiet, and the retry runs
+    await vi.advanceTimersByTimeAsync(60)
+    const readsAtDrift = s.observe.mock.calls.length
+    expect(s.onAdmitted).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(2_000)
+
+    // #then — the retry did not reuse the old streak: it took a whole new window, three readings, before admitting
+    expect(s.onAdmitted).toHaveBeenCalledTimes(1)
+    expect(s.observe.mock.calls.length - readsAtDrift).toBeGreaterThanOrEqual(3)
+    expect(s.reasons).toContain('revision-drift')
+  })
+
+  it('drops the count on a reading that passes with the evidence already obsolete', async () => {
+    // #given — one reading from passing, then the evidence changes under it
+    const s = setup({
+      tuning: {requiredObservations: 2, minSpacingMs: 50, minSpanMs: 50},
+      onRead: reading => {
+        if (reading === 2) s.drain.noteRootActivity()
+      },
+    })
+    readyToAdmit(s)
+
+    // #when
+    s.drain.requestValidation()
+    await vi.advanceTimersByTimeAsync(80)
+
+    // #then — the streak the changed evidence produced was thrown away, not left to count toward the next attempt
+    expect(s.gate.state().streak).toBe(0)
+    expect(s.onAdmitted).not.toHaveBeenCalled()
+  })
+
   it('does not read the directory before the cheap evidence is in', async () => {
     // #given — idle evidence is stale
     const s = setup()

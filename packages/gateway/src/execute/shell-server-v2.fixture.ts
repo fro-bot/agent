@@ -34,6 +34,8 @@ export interface ShellServerOptions {
   readonly onDelete?: (shellId: string, shell: FakeShell) => void
   /** Queued inbox items per session id. */
   readonly inbox?: Readonly<Record<string, number>>
+  /** A DELETE never answers until its signal aborts. */
+  readonly deleteHangs?: boolean
   /** Sessions whose inbox read fails. */
   readonly inboxFails?: readonly string[]
   /** Fail the per-shell read with this error. */
@@ -75,8 +77,15 @@ export function makeShellServer(options: ShellServerOptions = {}) {
     const shell = shells[shellId]
     return shell === undefined ? err<V2CallError>({kind: 'http', status: 404}) : ok(summary(shellId, shell))
   })
-  const deleteShell = vi.fn(async ({shellId}: {readonly shellId: string}) => {
+  const deleteShell = vi.fn(async ({shellId, signal}: {readonly shellId: string; readonly signal?: AbortSignal}) => {
     log.push(`delete:${shellId}`)
+    if (options.deleteHangs === true) {
+      // A request that answers only when its signal aborts, as a stalled connection does.
+      return new Promise<never>((_resolve, reject) => {
+        if (signal?.aborted === true) reject(new Error('aborted'))
+        signal?.addEventListener('abort', () => reject(new Error('aborted')), {once: true})
+      })
+    }
     if (options.deleteFails === true) return err<V2CallError>({kind: 'network', message: 'down'})
     if (options.deleteDoesNotKill?.includes(shellId) !== true) {
       const killed = shells[shellId]

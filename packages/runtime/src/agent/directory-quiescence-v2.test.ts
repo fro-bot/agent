@@ -56,6 +56,12 @@ function makeClient(
     readonly activeHangs?: boolean
     readonly pages?: number
     readonly getFails?: readonly string[]
+    /** Session lookups that never answer until their signal aborts. */
+    readonly getHangs?: readonly string[]
+    /** The shell list never answers until its signal aborts. */
+    readonly shellsHang?: boolean
+    /** The inbox reads of these sessions never answer until their signal aborts. */
+    readonly inboxHangs?: readonly string[]
     /** Pages of this many sessions, newest first, following the real `order` and `cursor` contract. */
     readonly pageSize?: number
     /** Ignore `order` and answer oldest first, as a server that did not honour it would. */
@@ -96,30 +102,57 @@ function makeClient(
     getSession: vi.fn(
       async ({
         sessionId,
+        signal,
       }: {
         readonly sessionId: string
+        readonly signal?: AbortSignal
       }): Promise<
         Result<{id: string; parentId: string | null; directory: string | null; outcome: null}, V2CallError>
       > => {
         calls.push(`get:${sessionId}`)
+        if (hooks.getHangs?.includes(sessionId) === true) {
+          return new Promise<never>((_resolve, reject) => {
+            signal?.addEventListener('abort', () => reject(new Error('aborted')), {once: true})
+          })
+        }
         if (hooks.getFails?.includes(sessionId) === true) return err({kind: 'network', message: 'down'})
         if (world.gone?.includes(sessionId) === true) return err({kind: 'http', status: 404})
         const here = world.sessions.includes(sessionId)
         return ok({id: sessionId, parentId: null, directory: here ? DIR : '/workspace/repos/other', outcome: null})
       },
     ),
-    listShells: vi.fn(async (): Promise<Result<readonly V2ShellSummary[], V2CallError>> => {
-      calls.push('shells')
-      if (hooks.shellsFail === true) return err({kind: 'network', message: 'down'})
-      return ok(
-        world.shells
-          .filter(shell => shell.status === 'running' || shell.status === 'unknown')
-          .map(shell => ({id: shell.id, status: shell.status, ownerSessionId: shell.owner, pid: 1})),
-      )
-    }),
+    listShells: vi.fn(
+      async ({signal}: {readonly signal?: AbortSignal} = {}): Promise<
+        Result<readonly V2ShellSummary[], V2CallError>
+      > => {
+        calls.push('shells')
+        if (hooks.shellsHang === true) {
+          return new Promise<never>((_resolve, reject) => {
+            signal?.addEventListener('abort', () => reject(new Error('aborted')), {once: true})
+          })
+        }
+        if (hooks.shellsFail === true) return err({kind: 'network', message: 'down'})
+        return ok(
+          world.shells
+            .filter(shell => shell.status === 'running' || shell.status === 'unknown')
+            .map(shell => ({id: shell.id, status: shell.status, ownerSessionId: shell.owner, pid: 1})),
+        )
+      },
+    ),
     listSessionInbox: vi.fn(
-      async ({sessionId}: {readonly sessionId: string}): Promise<Result<{queued: number}, V2CallError>> => {
+      async ({
+        sessionId,
+        signal,
+      }: {
+        readonly sessionId: string
+        readonly signal?: AbortSignal
+      }): Promise<Result<{queued: number}, V2CallError>> => {
         calls.push(`inbox:${sessionId}`)
+        if (hooks.inboxHangs?.includes(sessionId) === true) {
+          return new Promise<never>((_resolve, reject) => {
+            signal?.addEventListener('abort', () => reject(new Error('aborted')), {once: true})
+          })
+        }
         if (hooks.inboxFails?.includes(sessionId) === true) return err({kind: 'network', message: 'down'})
         if (hooks.inboxMissing?.includes(sessionId) === true) return err({kind: 'http', status: 404})
         return ok({queued: world.inbox[sessionId] ?? 0})
@@ -160,7 +193,7 @@ describe('observeDirectoryV2', () => {
     // #then — a session active elsewhere on the server is not this directory's
     expect(observation).toMatchObject({kind: 'active'})
     if (observation.kind !== 'active') throw new Error('unreachable')
-    expect([...observation.activity.activeSessionIds].sort()).toEqual([CHILD, GRAND, 'ses_resumed'].sort())
+    expect([...activityOf(observation).activeSessionIds].sort()).toEqual([CHILD, GRAND, 'ses_resumed'].sort())
   })
 
   it('reports a running shell whoever owns it, and counts a status it does not know as running', async () => {
@@ -179,7 +212,7 @@ describe('observeDirectoryV2', () => {
 
     // #then
     if (observation.kind !== 'active') throw new Error('expected activity')
-    expect([...observation.activity.runningShellIds].sort()).toEqual(['sh_owned', 'sh_stranger', 'sh_untagged'])
+    expect([...activityOf(observation).runningShellIds].sort()).toEqual(['sh_owned', 'sh_stranger', 'sh_untagged'])
   })
 
   it('reports a queued inbox item on any session of the directory, active or not', async () => {
@@ -703,6 +736,178 @@ describe('observeDirectoryV2: which inboxes are read', () => {
   })
 })
 
+/** What a reading that was not quiet saw. */
+function activityOf(observation: DirectoryObservation) {
+  if (observation.kind === 'quiescent') throw new Error('expected a reading that was not quiet')
+  return observation.activity
+}
+
+describe('observeDirectoryV2: an incomplete reading keeps what it found', () => {
+  const SHORT = 200
+
+  it('keeps the placed sessions when another session lookup fails', async () => {
+    // #given — three active sessions; one lookup fails, two are placed in the directory
+    const world: World = {sessions: [ROOT, CHILD], active: [ROOT, CHILD, 'ses_unlocatable'], shells: [], inbox: {}}
+    const {client} = makeClient(world, {getFails: ['ses_unlocatable']})
+
+    // #when
+    const observation = await observeDirectoryV2({client, directory: DIR, realpath: identityRealpath, inbox: false})
+
+    // #then — unreadable for the release, and the two it did place are still there to be stopped
+    expect(observation.kind).toBe('unreadable')
+    expect([...activityOf(observation).activeSessionIds].sort()).toEqual([CHILD, ROOT].sort())
+  })
+
+  it('keeps the placed sessions when one lookup never answers', async () => {
+    // #given
+    vi.useFakeTimers()
+    const world: World = {sessions: [ROOT, CHILD], active: [ROOT, CHILD, 'ses_slow'], shells: [], inbox: {}}
+    const {client} = makeClient(world, {getHangs: ['ses_slow']})
+
+    // #when
+    const pending = observeDirectoryV2({
+      client,
+      directory: DIR,
+      realpath: identityRealpath,
+      inbox: false,
+      readTimeoutMs: SHORT,
+    })
+    await vi.advanceTimersByTimeAsync(SHORT + 10)
+    const observation = await pending
+
+    // #then
+    expect(observation.kind).toBe('unreadable')
+    expect([...activityOf(observation).activeSessionIds].sort()).toEqual([CHILD, ROOT].sort())
+  })
+
+  it('keeps a running shell when the active read times out', async () => {
+    // #given — the shell list answered; the active list never does
+    vi.useFakeTimers()
+    const world = emptyWorld()
+    world.shells = [{id: 'sh_known', status: 'running', owner: ROOT}]
+    const {client} = makeClient(world, {activeHangs: true})
+
+    // #when
+    const pending = observeDirectoryV2({
+      client,
+      directory: DIR,
+      realpath: identityRealpath,
+      inbox: false,
+      readTimeoutMs: SHORT,
+    })
+    await vi.advanceTimersByTimeAsync(SHORT + 10)
+    const observation = await pending
+
+    // #then
+    expect(observation.kind).toBe('unreadable')
+    expect(activityOf(observation).runningShellIds).toEqual(['sh_known'])
+  })
+
+  it('keeps the active sessions when the shell list times out', async () => {
+    // #given
+    vi.useFakeTimers()
+    const world: World = {sessions: [ROOT, CHILD], active: [CHILD], shells: [], inbox: {}}
+    const {client} = makeClient(world, {shellsHang: true})
+
+    // #when
+    const pending = observeDirectoryV2({
+      client,
+      directory: DIR,
+      realpath: identityRealpath,
+      inbox: false,
+      readTimeoutMs: SHORT,
+    })
+    await vi.advanceTimersByTimeAsync(SHORT + 10)
+    const observation = await pending
+
+    // #then
+    expect(observation.kind).toBe('unreadable')
+    expect(activityOf(observation).activeSessionIds).toEqual([CHILD])
+  })
+
+  it('keeps a queued inbox item when another inbox read times out', async () => {
+    // #given
+    vi.useFakeTimers()
+    const world: World = {sessions: [ROOT, CHILD], active: [], shells: [], inbox: {[CHILD]: 2}}
+    const {client} = makeClient(world, {inboxHangs: [ROOT]})
+
+    // #when
+    const pending = observeDirectoryV2({
+      client,
+      directory: DIR,
+      realpath: identityRealpath,
+      inbox: SCOPE,
+      readTimeoutMs: SHORT,
+    })
+    await vi.advanceTimersByTimeAsync(SHORT + 10)
+    const observation = await pending
+
+    // #then
+    expect(observation.kind).toBe('unreadable')
+    expect(activityOf(observation).queuedInbox).toEqual([{sessionId: CHILD, queued: 2}])
+  })
+
+  it('keeps what completed when the caller aborts the reading', async () => {
+    // #given
+    const world: World = {sessions: [ROOT, CHILD], active: [ROOT, CHILD, 'ses_slow'], shells: [], inbox: {}}
+    const {client} = makeClient(world, {getHangs: ['ses_slow']})
+    const controller = new AbortController()
+
+    // #when
+    const pending = observeDirectoryV2({
+      client,
+      directory: DIR,
+      realpath: identityRealpath,
+      inbox: false,
+      signal: controller.signal,
+    })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    controller.abort()
+    const observation = await pending
+
+    // #then
+    expect(observation.kind).toBe('unreadable')
+    expect([...activityOf(observation).activeSessionIds].sort()).toEqual([CHILD, ROOT].sort())
+  })
+
+  it('counts a known session as active when it is on the active list, without locating it', async () => {
+    // #given — a session that moved: it is stored under another directory now, and its lookup would say so
+    const world: World = {sessions: [ROOT], active: ['ses_moved'], shells: [], inbox: {}}
+    const {client, calls} = makeClient(world)
+
+    // #when
+    const observation = await observeDirectoryV2({
+      client,
+      directory: DIR,
+      realpath: identityRealpath,
+      inbox: false,
+      knownSessionIds: () => ['ses_moved', 'ses_not_active'],
+    })
+
+    // #then — active wherever it is, and not looked up
+    expect(observation).toMatchObject({kind: 'active', activity: {activeSessionIds: ['ses_moved']}})
+    expect(calls).not.toContain('get:ses_moved')
+  })
+
+  it('does not count a known session that is not active', async () => {
+    // #given
+    const world: World = {sessions: [ROOT], active: [], shells: [], inbox: {}}
+    const {client} = makeClient(world)
+
+    // #when
+    const observation = await observeDirectoryV2({
+      client,
+      directory: DIR,
+      realpath: identityRealpath,
+      inbox: false,
+      knownSessionIds: () => ['ses_moved'],
+    })
+
+    // #then
+    expect(observation).toEqual({kind: 'quiescent'})
+  })
+})
+
 describe('observeDirectoryV2: locating the active sessions', () => {
   it('does not list the directory to place an active session: the cost follows the active list, not the history', async () => {
     // #given — a long history, and a session active in another repo
@@ -835,6 +1040,36 @@ describe('awaitDirectoryStability', () => {
     // #then — and the streak does not carry over to whatever comes next
     expect(await waiting).toEqual({passed: false, reason: 'invalidated'})
     expect(gate.state().streak).toBe(0)
+  })
+
+  it('does not pass on a reading that would have passed when the evidence changed while it was in flight', async () => {
+    // #given — the reading that completes the window is held; the caller's evidence changes before it returns
+    vi.useFakeTimers()
+    let keep = true
+    let readings = 0
+    const gate = createDirectoryStabilityGate({
+      requiredObservations: 2,
+      minSpacingMs: 10,
+      minSpanMs: 10,
+      observe: async () => {
+        readings += 1
+        if (readings === 2) keep = false
+        return {kind: 'quiescent'} as const
+      },
+    })
+
+    // #when
+    const waiting = awaitDirectoryStability({
+      gate,
+      signal: new AbortController().signal,
+      spacingMs: 10,
+      shouldContinue: () => keep,
+    })
+    await vi.advanceTimersByTimeAsync(100)
+
+    // #then — invalidated and the count dropped, instead of passing on a streak counted for the old evidence
+    expect(await waiting).toEqual({passed: false, reason: 'invalidated'})
+    expect(gate.state()).toMatchObject({passed: false, streak: 0})
   })
 
   it('stops on abort, mid-sleep, with an unpassed result', async () => {

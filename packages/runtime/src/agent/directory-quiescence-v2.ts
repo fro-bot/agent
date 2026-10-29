@@ -38,7 +38,9 @@ import {isShellLedgerKey} from './ownership-ledger.js'
  * nothing in any of the three. The gate therefore passes only after `DIRECTORY_QUIESCENCE_REQUIRED_OBSERVATIONS`
  * consecutive quiet readings, at least `DIRECTORY_QUIESCENCE_MIN_SPACING_MS` apart, spanning at least
  * `DIRECTORY_QUIESCENCE_MIN_SPAN_MS`. Any activity, and any read that fails, times out or comes back partial, resets the
- * count: a reading the run could not take is never read as quiet.
+ * count: a reading the run could not take is never read as quiet. An unreadable reading still carries the positive
+ * evidence its reads did find (a running shell, an active session placed in the directory, a queued inbox item), so a
+ * stop can act on it; only the release treats it as unreadable.
  *
  * What this does not prove: an upstream producer paused for longer than the window that wakes later. That is the
  * residual risk; it is mitigated by quarantining a stop that could not be confirmed and by the next run's acquire check
@@ -106,29 +108,66 @@ export async function listActiveSessionIdsInDirectoryV2(
   directory: string,
   options: {readonly realpath: (path: string) => Promise<string>; readonly signal?: AbortSignal},
 ): Promise<Result<readonly string[], Error>> {
-  const {realpath, signal} = options
+  const located = await locateActiveSessionsV2(client, directory, options)
+  return located.failure === null ? ok(located.placed) : err(new Error(located.failure))
+}
+
+/**
+ * What `listActiveSessionIdsInDirectoryV2` found, without discarding the sessions it did place when something else
+ * failed: a failed or unfinished lookup of one active session says nothing about the others, and the caller that has to
+ * stop what runs wants every session that is known to be here. `failure` is `null` only when the whole list was placed.
+ */
+interface LocatedActiveSessions {
+  readonly placed: readonly string[]
+  readonly failure: string | null
+}
+
+async function locateActiveSessionsV2(
+  client: Pick<DirectoryQuiescenceClient, 'getSession' | 'session'>,
+  directory: string,
+  options: {
+    readonly realpath: (path: string) => Promise<string>
+    readonly signal?: AbortSignal
+    /** Sessions that are this run's wherever they are stored: active means active, with no lookup. */
+    readonly knownSessionIds?: () => readonly string[]
+    /** Called with each session as soon as it is placed, so a reading cut short can still report it. */
+    readonly onPlaced?: (sessionId: string) => void
+  },
+): Promise<LocatedActiveSessions> {
+  const {realpath, signal, onPlaced} = options
+  const placed: string[] = []
+  const place = (sessionId: string): void => {
+    placed.push(sessionId)
+    onPlaced?.(sessionId)
+  }
   try {
     if (signal?.aborted === true) throw toError(signal.reason ?? new Error('aborted'))
     const canonical = await realpath(directory)
     const active: unknown = await client.session.active(signal === undefined ? undefined : {signal})
     if (active === null || typeof active !== 'object' || Array.isArray(active)) {
-      return err(new Error('session.active: not an object keyed by session id'))
+      return {placed, failure: 'session.active: not an object keyed by session id'}
     }
-    const located = await mapPool(Object.keys(active), DIRECTORY_INBOX_READ_CONCURRENCY, async sessionId => {
+    const known = new Set(options.knownSessionIds?.() ?? [])
+    const candidates = Object.keys(active).filter(sessionId => {
+      if (!known.has(sessionId)) return true
+      place(sessionId)
+      return false
+    })
+    const located = await mapPool(candidates, DIRECTORY_INBOX_READ_CONCURRENCY, async sessionId => {
       const info = await client.getSession({sessionId, ...(signal === undefined ? {} : {signal})})
       if (!info.success) {
         return info.error.kind === 'http' && info.error.status === 404
-          ? ({sessionId, here: false, failure: null} as const)
-          : ({sessionId, here: false, failure: info.error.kind} as const)
+          ? ({sessionId, failure: null} as const)
+          : ({sessionId, failure: info.error.kind} as const)
       }
-      if (info.data.directory === null) return {sessionId, here: false, failure: 'no location'} as const
-      return {sessionId, here: info.data.directory === canonical, failure: null} as const
+      if (info.data.directory === null) return {sessionId, failure: 'no location'} as const
+      if (info.data.directory === canonical) place(sessionId)
+      return {sessionId, failure: null} as const
     })
     const unreadable = located.find(entry => entry.failure !== null)
-    if (unreadable !== undefined) return err(new Error(`session.get: ${unreadable.failure ?? 'unreadable'}`))
-    return ok(located.filter(entry => entry.here).map(entry => entry.sessionId))
+    return {placed, failure: unreadable === undefined ? null : `session.get: ${unreadable.failure ?? 'unreadable'}`}
   } catch (error) {
-    return err(toError(error))
+    return {placed, failure: toError(error).message}
   }
 }
 
@@ -166,6 +205,11 @@ export interface ObserveDirectoryOptions {
    * Required, so a caller decides: reading all of them is not an option.
    */
   readonly inbox: InboxScope | false
+  /**
+   * Sessions that belong to the run wherever they are stored, such as an owned session that moved to another
+   * directory. One on the active list counts as active here without a lookup, so the barrier and the watch act on it.
+   */
+  readonly knownSessionIds?: () => readonly string[]
 }
 
 const identityRealpath = async (path: string): Promise<string> => path
@@ -211,6 +255,7 @@ export async function observeDirectoryV2(options: ObserveDirectoryOptions): Prom
     readTimeoutMs = DIRECTORY_QUIESCENCE_READ_TIMEOUT_MS,
     realpath = identityRealpath,
     inbox,
+    knownSessionIds,
   } = options
   const emptyActivity: DirectoryActivity = {activeSessionIds: [], runningShellIds: [], queuedInbox: []}
   const callerAborted = (): boolean => signal?.aborted === true
@@ -225,65 +270,68 @@ export async function observeDirectoryV2(options: ObserveDirectoryOptions): Prom
     controller.signal.addEventListener('abort', () => resolve('abandoned'), {once: true})
   })
 
+  // Positive evidence is recorded the moment a read finds it, so a reading that is cut short (a branch timed out, the
+  // caller aborted) still reports what completed. The release treats such a reading as unreadable; the barrier and the
+  // watch act on what it found.
+  const seenSessions = new Set<string>()
+  const seenShells = new Set<string>()
+  const seenQueued = new Map<string, number>()
+  const snapshot = (): DirectoryActivity => ({
+    activeSessionIds: [...seenSessions],
+    runningShellIds: [...seenShells],
+    queuedInbox: [...seenQueued].map(([sessionId, queued]) => ({sessionId, queued})),
+  })
+
   const reads = async (): Promise<DirectoryObservation> => {
     const requestSignal = controller.signal
     const deps = {realpath}
 
-    const activeRead = guarded<readonly string[]>('session.active', async () => {
-      const located = await listActiveSessionIdsInDirectoryV2(client, directory, {
+    const activeRead = guarded<null>('session.active', async () => {
+      const located = await locateActiveSessionsV2(client, directory, {
         realpath,
         signal: requestSignal,
+        ...(knownSessionIds === undefined ? {} : {knownSessionIds}),
+        onPlaced: sessionId => seenSessions.add(sessionId),
       })
-      return located.success ? {ok: true, value: located.data} : failed(located.error.message)
+      return located.failure === null ? {ok: true, value: null} : failed(located.failure)
     })
 
-    const shellRead = guarded<readonly string[]>('shell.list', async () => {
+    const shellRead = guarded<null>('shell.list', async () => {
       const listed = await client.listShells({directory, signal: requestSignal})
       if (!listed.success) return failed(`shell.list: ${listed.error.kind}`)
-      return {
-        ok: true,
-        value: listed.data
-          .filter(shell => shell.status === 'running' || shell.status === 'unknown')
-          .map(shell => shell.id),
+      for (const shell of listed.data) {
+        if (shell.status === 'running' || shell.status === 'unknown') seenShells.add(shell.id)
       }
+      return {ok: true, value: null}
     })
 
-    const inboxRead = guarded<readonly {readonly sessionId: string; readonly queued: number}[]>(
-      'session.inbox',
-      async () => {
-        if (inbox === false) return {ok: true, value: []}
-        const recent = await listV2SessionsInDirectory(client.session, directory, deps, {
-          signal: requestSignal,
-          updatedSince: inbox.runStartedAt - DIRECTORY_INBOX_RECENT_MARGIN_MS,
-        })
-        if (!recent.success) return failed(`session.list: ${recent.error.message}`)
-        const sessionIds = [...new Set([...inbox.ownedSessionIds(), ...recent.data])]
-        const readings = await mapPool(sessionIds, DIRECTORY_INBOX_READ_CONCURRENCY, async sessionId => {
-          const listed = await client.listSessionInbox({sessionId, signal: requestSignal})
-          // A session deleted between the list and this read has nothing left to wake.
-          if (!listed.success) {
-            return listed.error.kind === 'http' && listed.error.status === 404
-              ? ({sessionId, queued: 0, failure: null} as const)
-              : ({sessionId, queued: 0, failure: listed.error.kind} as const)
-          }
-          return {sessionId, queued: listed.data.queued, failure: null} as const
-        })
-        const unreadable = readings.find(reading => reading.failure !== null)
-        if (unreadable !== undefined) return failed(`session.inbox: ${unreadable.failure ?? 'unreadable'}`)
-        return {
-          ok: true,
-          value: readings.filter(reading => reading.queued > 0).map(({sessionId, queued}) => ({sessionId, queued})),
+    const inboxRead = guarded<null>('session.inbox', async () => {
+      if (inbox === false) return {ok: true, value: null}
+      const recent = await listV2SessionsInDirectory(client.session, directory, deps, {
+        signal: requestSignal,
+        updatedSince: inbox.runStartedAt - DIRECTORY_INBOX_RECENT_MARGIN_MS,
+      })
+      if (!recent.success) return failed(`session.list: ${recent.error.message}`)
+      const sessionIds = [...new Set([...inbox.ownedSessionIds(), ...recent.data])]
+      const readings = await mapPool(sessionIds, DIRECTORY_INBOX_READ_CONCURRENCY, async sessionId => {
+        const listed = await client.listSessionInbox({sessionId, signal: requestSignal})
+        // A session deleted between the list and this read has nothing left to wake.
+        if (!listed.success) {
+          return listed.error.kind === 'http' && listed.error.status === 404
+            ? ({sessionId, failure: null} as const)
+            : ({sessionId, failure: listed.error.kind} as const)
         }
-      },
-    )
+        if (listed.data.queued > 0) seenQueued.set(sessionId, listed.data.queued)
+        return {sessionId, failure: null} as const
+      })
+      const unreadable = readings.find(reading => reading.failure !== null)
+      if (unreadable !== undefined) return failed(`session.inbox: ${unreadable.failure ?? 'unreadable'}`)
+      return {ok: true, value: null}
+    })
 
-    const [active, shells, queued] = await Promise.all([activeRead, shellRead, inboxRead])
-    const activity: DirectoryActivity = {
-      activeSessionIds: active.ok ? active.value : [],
-      runningShellIds: shells.ok ? shells.value : [],
-      queuedInbox: queued.ok ? queued.value : [],
-    }
-    const failures = [active, shells, queued].flatMap(read => (read.ok ? [] : [read.reason]))
+    const results = await Promise.all([activeRead, shellRead, inboxRead])
+    const activity = snapshot()
+    const failures = results.flatMap(read => (read.ok ? [] : [read.reason]))
     if (failures.length > 0) return {kind: 'unreadable', reason: failures.join('; '), activity}
     if (
       activity.activeSessionIds.length > 0 ||
@@ -298,11 +346,11 @@ export async function observeDirectoryV2(options: ObserveDirectoryOptions): Prom
   try {
     const outcome = await Promise.race([reads(), abandoned])
     if (outcome === 'abandoned') {
-      return {kind: 'unreadable', reason: callerAborted() ? 'aborted' : 'timed out', activity: emptyActivity}
+      return {kind: 'unreadable', reason: callerAborted() ? 'aborted' : 'timed out', activity: snapshot()}
     }
     return outcome
   } catch (error) {
-    return {kind: 'unreadable', reason: toError(error).message, activity: emptyActivity}
+    return {kind: 'unreadable', reason: toError(error).message, activity: snapshot()}
   } finally {
     clearTimeout(timer)
     signal?.removeEventListener('abort', forward)
@@ -415,8 +463,9 @@ export interface AwaitDirectoryStabilityOptions {
   /** Called after every reading. */
   readonly onObservation?: (state: DirectoryStabilityState) => void
   /**
-   * Asked before each further reading. `false` ends the wait and drops the streak: whatever it was waiting for has
-   * changed, and readings taken for the old evidence do not carry over to the new.
+   * Asked before each reading and again after each one, the passing one included. `false` ends the wait and drops the
+   * streak: whatever it was waiting for has changed, and readings taken for the old evidence do not carry over to the
+   * new.
    */
   readonly shouldContinue?: () => boolean
 }
@@ -449,6 +498,12 @@ export async function awaitDirectoryStability(
       return {passed: false, reason: 'invalidated'}
     }
     const state = await gate.step(signal)
+    // Asked again once the reading is in, the passing one included: the evidence it is for can change while it is in
+    // flight, and a streak counted toward evidence that is gone must not outlive it.
+    if (shouldContinue?.() === false) {
+      gate.reset()
+      return {passed: false, reason: 'invalidated'}
+    }
     onObservation?.(state)
     if (state.passed) return {passed: true}
     if (signal.aborted) return {passed: false, reason: 'aborted'}

@@ -363,6 +363,9 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
   const noticedChildIds = new Set<string>()
   // The same for background shells, by shell id.
   const noticedShellIds = new Set<string>()
+  // Owned sessions that moved to another directory. They keep running at their destination, where a placement by the
+  // directory cannot find them, so the barrier and the watch take them as explicit targets.
+  const movedSessionIds = new Set<string>()
 
   const ledger: OwnershipLedger = wrapLedgerWithHooks(
     ownershipLedger,
@@ -483,6 +486,7 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
       rootSessionId: sessionId,
       ledger,
       runStartedAt,
+      knownSessionIds: () => [...movedSessionIds],
       logger,
       ...(runId === undefined ? {} : {runId}),
       ...(directoryStability === undefined ? {} : {stability: directoryStability}),
@@ -496,6 +500,7 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
       client,
       directory,
       rootSessionId: sessionId,
+      knownSessionIds: () => [...movedSessionIds],
       logger,
       ...(runId === undefined ? {} : {runId}),
     })
@@ -1240,6 +1245,7 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
           // The outside-checkout rules re-base on the destination (probe P12), so the run can no longer be trusted to
           // stay inside its sandbox. The barrier interrupts the root and every owned child, then the run fails.
           logger.error({sessionId, movedSessionId: event.sessionId}, 'run-core: an owned session moved — failing run')
+          movedSessionIds.add(event.sessionId)
           clearInactivity()
           // Always quarantined: the destination's shells and sessions cannot be read from the directory this run lists, so
           // a quiet directory says nothing about where the moved session's work went.

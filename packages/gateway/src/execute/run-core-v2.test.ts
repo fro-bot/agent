@@ -5,6 +5,7 @@
  * v2.2.0 frames (see `run-core-v2.fixture.ts`). Root stop, drain and approvals have their own files.
  */
 
+import {ok} from '@fro-bot/runtime'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
 import {
@@ -554,8 +555,9 @@ describe('runOpenCodeCoreV2: failures the server reports', () => {
     expect(failure(own).kind).toBe('timeout')
   })
 
-  it('fails closed on a session move of an owned session and interrupts it', async () => {
-    // #given — the outside-checkout rules re-base on the destination after a move (probe P12)
+  it('fails closed on a session move of an owned session and interrupts it where it now lives', async () => {
+    // #given — the outside-checkout rules re-base on the destination after a move (probe P12). The session is stored
+    // under its destination from then on, so the directory no longer places it.
     const run = startRun()
     await vi.advanceTimersByTimeAsync(10)
 
@@ -563,11 +565,41 @@ describe('runOpenCodeCoreV2: failures the server reports', () => {
     run.emit(frames.moved(ROOT))
     await vi.advanceTimersByTimeAsync(20_000)
 
-    // #then — and never confirmed: the destination's shells cannot be seen from the directory the run lists
+    // #then — never confirmed (the destination's shells cannot be seen from here), and still interrupted
     const error = failure(run)
     expect(error.kind).toBe('session-error')
     expect(error.quarantined).toBe(true)
     expect(run.interrupt).toHaveBeenCalledWith(expect.objectContaining({sessionId: ROOT}))
+  })
+
+  it('keeps interrupting a moved session through the quarantine hold while it stays active', async () => {
+    // #given — the moved root keeps running at its destination and ignores the interrupt
+    let rootBusy = true
+    const run = startRun({
+      activeReply: async (): Promise<Record<string, {readonly type: string}>> =>
+        rootBusy ? {[ROOT]: {type: 'running'}} : {},
+      interrupt: async () => ok({interrupted: true}),
+    })
+    await vi.advanceTimersByTimeAsync(10)
+    run.emit(frames.moved(ROOT))
+    await vi.advanceTimersByTimeAsync(20_000)
+    expect(failure(run).quarantined).toBe(true)
+    const atQuarantine = run.interrupt.mock.calls.length
+
+    // #when — the hold goes on
+    await vi.advanceTimersByTimeAsync(5_000)
+
+    // #then — the watch still reaches it, wherever the directory would place it
+    expect(run.interrupt.mock.calls.length).toBeGreaterThan(atQuarantine)
+
+    // #when — it stops
+    rootBusy = false
+    await vi.advanceTimersByTimeAsync(2_000)
+    const atStop = run.interrupt.mock.calls.length
+    await vi.advanceTimersByTimeAsync(5_000)
+
+    // #then — nothing more is sent once it is off the active list
+    expect(run.interrupt.mock.calls.length).toBe(atStop)
   })
 
   it('ignores a session move of a session it does not own', async () => {

@@ -9,7 +9,10 @@
  *
  * 1. Read the directory (`observeDirectoryV2`): active sessions, running shells, queued inbox items.
  * 2. Act on what it showed (`stopDirectoryActivityV2`): DELETE every running shell, then interrupt every active session,
- *    the root first. Every session and shell in a gateway checkout directory is the run's: nothing else shares it.
+ *    the root first. Every session and shell in a gateway checkout directory is the run's: nothing else shares it. A
+ *    reading that could not be completed still carries what it did find, and that is acted on too. An owned session that
+ *    moved is a target wherever it is stored (`knownSessionIds`): it keeps running at its destination, where placement by
+ *    the directory cannot find it.
  * 3. Repeat until `createDirectoryStabilityGate` passes (11 quiet readings, 500 ms apart, over 5 s). Any activity and
  *    any read that fails, times out or comes back partial resets the count.
  *
@@ -58,6 +61,11 @@ export interface SettleOwnedSessionsV2Params {
   readonly logger: GatewayLogger
   /** When the run began (epoch ms): which sessions' inboxes a reading reads. */
   readonly runStartedAt: number
+  /**
+   * Owned sessions that are stored somewhere else now (a move). One on the active list is stopped like any other, with
+   * no placement by the directory: it keeps running at its destination, where the directory cannot see it.
+   */
+  readonly knownSessionIds?: () => readonly string[]
   /** The gateway run this attempt belongs to. Stamped on every log line. */
   readonly runId?: string
   /** Overrides `DEFAULT_SETTLE_TIMEOUT_MS` — for tests only. */
@@ -104,6 +112,7 @@ export async function settleOwnedSessionsV2(params: SettleOwnedSessionsV2Params)
     rootSessionId,
     ledger,
     runStartedAt,
+    knownSessionIds,
     timeoutMs = DEFAULT_SETTLE_TIMEOUT_MS,
     stability = {},
   } = params
@@ -141,6 +150,7 @@ export async function settleOwnedSessionsV2(params: SettleOwnedSessionsV2Params)
               directory,
               signal,
               inbox: {runStartedAt, ownedSessionIds: () => ownedSessionIdsOf(rootSessionId, ledger)},
+              ...(knownSessionIds === undefined ? {} : {knownSessionIds}),
             })
             if (observation.kind === 'quiescent') return observation
             lastReason =

@@ -5,7 +5,13 @@ import type {DirectoryStopClientV2} from './root-stop-v2.js'
 import {err, ok} from '@fro-bot/runtime'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
-import {interruptSession, startQuarantineWatchV2, stopDirectoryActivityV2} from './root-stop-v2.js'
+import {
+  interruptSession,
+  startQuarantineWatchV2,
+  STOP_DELETE_TIMEOUT_MS,
+  STOP_INTERRUPT_TIMEOUT_MS,
+  stopDirectoryActivityV2,
+} from './root-stop-v2.js'
 import {makeShellServer} from './shell-server-v2.fixture.js'
 
 const ROOT = 'ses_root'
@@ -30,12 +36,15 @@ function makeStopClient(
   } = {},
 ) {
   const shellServer = makeShellServer(options.shellServer)
-  const interrupt = vi.fn<InterruptImpl>(async ({sessionId}) => {
+  /** Whether each interrupt's signal was already aborted when the request was made. */
+  const interruptSignals: {sessionId: string; abortedAtCall: boolean}[] = []
+  const interrupt = vi.fn<InterruptImpl>(async ({sessionId, signal}) => {
     shellServer.log.push(`interrupt:${sessionId}`)
-    return options.interrupt === undefined ? ok({interrupted: true}) : options.interrupt({sessionId})
+    interruptSignals.push({sessionId, abortedAtCall: signal?.aborted === true})
+    return options.interrupt === undefined ? ok({interrupted: true}) : options.interrupt({sessionId, signal})
   })
   const client: DirectoryStopClientV2 = {interrupt, deleteShell: shellServer.deleteShell}
-  return {client, interrupt, shellServer}
+  return {client, interrupt, interruptSignals, shellServer}
 }
 
 afterEach(() => {
@@ -87,6 +96,120 @@ describe('interruptSession', () => {
   })
 })
 
+describe('stopDirectoryActivityV2: a DELETE that stalls', () => {
+  it('still interrupts the root and every active session, with signals that are not aborted', async () => {
+    // #given — the shell DELETE never answers; the interrupt endpoints are healthy
+    vi.useFakeTimers()
+    const {client, interruptSignals} = makeStopClient({
+      shellServer: {shells: {sh_1: {status: 'running', owner: ROOT}}, deleteHangs: true},
+    })
+    const lifecycle = new AbortController()
+
+    // #when
+    const stopping = stopDirectoryActivityV2({
+      client,
+      rootSessionId: ROOT,
+      directory: DIRECTORY,
+      activity: activity({activeSessionIds: [ROOT, CHILD], runningShellIds: ['sh_1']}),
+      signal: lifecycle.signal,
+      logger: makeLogger(),
+    })
+    await vi.advanceTimersByTimeAsync(10_000)
+    await stopping
+
+    // #then — the stall used up the DELETE's own bound, and the interrupts had a fresh one
+    expect(interruptSignals.map(call => call.sessionId)).toEqual([ROOT, CHILD])
+    expect(interruptSignals.every(call => !call.abortedAtCall)).toBe(true)
+  })
+
+  it('bounds the stalled DELETE so the stop returns', async () => {
+    // #given
+    vi.useFakeTimers()
+    const {client} = makeStopClient({
+      shellServer: {shells: {sh_1: {status: 'running', owner: ROOT}}, deleteHangs: true},
+    })
+    let returned = false
+
+    // #when
+    const stopping = stopDirectoryActivityV2({
+      client,
+      rootSessionId: ROOT,
+      directory: DIRECTORY,
+      activity: activity({activeSessionIds: [ROOT], runningShellIds: ['sh_1']}),
+      signal: new AbortController().signal,
+      logger: makeLogger(),
+    }).then(() => {
+      returned = true
+    })
+    await vi.advanceTimersByTimeAsync(STOP_DELETE_TIMEOUT_MS + STOP_INTERRUPT_TIMEOUT_MS + 100)
+    await stopping
+
+    // #then
+    expect(returned).toBe(true)
+  })
+
+  it.each([ROOT, CHILD])(
+    'bounds an interrupt of %s that never answers, so the stop returns and the others still go out',
+    async stalled => {
+      // #given — one endpoint stalls until its signal aborts; the other answers
+      vi.useFakeTimers()
+      const {client, interruptSignals} = makeStopClient({
+        interrupt: async ({sessionId, signal}) =>
+          sessionId === stalled
+            ? new Promise<never>((_resolve, reject) => {
+                signal?.addEventListener('abort', () => reject(new Error('aborted')), {once: true})
+              })
+            : ok({interrupted: true}),
+      })
+      let returned = false
+
+      // #when
+      const stopping = stopDirectoryActivityV2({
+        client,
+        rootSessionId: ROOT,
+        directory: DIRECTORY,
+        activity: activity({activeSessionIds: [ROOT, CHILD]}),
+        signal: new AbortController().signal,
+        logger: makeLogger(),
+      }).then(() => {
+        returned = true
+      })
+      await vi.advanceTimersByTimeAsync(STOP_INTERRUPT_TIMEOUT_MS + 100)
+      await stopping
+
+      // #then
+      expect(returned).toBe(true)
+      expect(interruptSignals.map(call => call.sessionId)).toEqual([ROOT, CHILD])
+    },
+  )
+
+  it('stops everything at once when the lifecycle signal aborts', async () => {
+    // #given
+    vi.useFakeTimers()
+    const {client, interruptSignals} = makeStopClient({
+      shellServer: {shells: {sh_1: {status: 'running', owner: ROOT}}, deleteHangs: true},
+    })
+    const lifecycle = new AbortController()
+    const stopping = stopDirectoryActivityV2({
+      client,
+      rootSessionId: ROOT,
+      directory: DIRECTORY,
+      activity: activity({activeSessionIds: [ROOT], runningShellIds: ['sh_1']}),
+      signal: lifecycle.signal,
+      logger: makeLogger(),
+    })
+
+    // #when — the barrier or the hold ends while the DELETE is stalled
+    await vi.advanceTimersByTimeAsync(100)
+    lifecycle.abort()
+    await vi.advanceTimersByTimeAsync(10)
+    await stopping
+
+    // #then — nothing is sent on a signal that is already dead
+    expect(interruptSignals).toEqual([])
+  })
+})
+
 describe('stopDirectoryActivityV2', () => {
   const signal = new AbortController().signal
 
@@ -115,13 +238,16 @@ describe('stopDirectoryActivityV2', () => {
     expect(log.slice(3).sort()).toEqual([`interrupt:${CHILD}`, `interrupt:${GRAND}`].sort())
   })
 
-  it('passes the directory and the signal to every DELETE', async () => {
+  it('passes the directory and a signal that follows the stop’s life to every DELETE', async () => {
     // #given
+    vi.useFakeTimers()
     const controller = new AbortController()
-    const {client, shellServer} = makeStopClient({shellServer: {shells: {sh_1: {status: 'running', owner: ROOT}}}})
+    const {client, shellServer} = makeStopClient({
+      shellServer: {shells: {sh_1: {status: 'running', owner: ROOT}}, deleteHangs: true},
+    })
 
-    // #when
-    await stopDirectoryActivityV2({
+    // #when — the DELETE is in flight, then the stop's life ends
+    const stopping = stopDirectoryActivityV2({
       client,
       rootSessionId: ROOT,
       directory: DIRECTORY,
@@ -129,13 +255,16 @@ describe('stopDirectoryActivityV2', () => {
       signal: controller.signal,
       logger: makeLogger(),
     })
+    await vi.advanceTimersByTimeAsync(10)
+    const sent = shellServer.deleteShell.mock.calls[0]?.[0]
+    expect(sent).toMatchObject({directory: DIRECTORY, shellId: 'sh_1'})
+    expect(sent?.signal?.aborted).toBe(false)
+    controller.abort()
+    await vi.advanceTimersByTimeAsync(10)
+    await stopping
 
     // #then
-    expect(shellServer.deleteShell).toHaveBeenCalledWith({
-      directory: DIRECTORY,
-      shellId: 'sh_1',
-      signal: controller.signal,
-    })
+    expect(sent?.signal?.aborted).toBe(true)
   })
 
   it('does nothing for a queued inbox item: only a wake that has started can be interrupted', async () => {
@@ -254,6 +383,26 @@ function startWatch(
 }
 
 describe('startQuarantineWatchV2', () => {
+  it('interrupts the root and the children on every tick even when a shell DELETE stalls', async () => {
+    // #given — a DELETE that never answers, and root and child endpoints that answer but leave the sessions running
+    const w = startWatch({
+      active: [ROOT, CHILD],
+      shellServer: {shells: {sh_stuck: {status: 'running', owner: ROOT}}, deleteHangs: true},
+      interrupt: async () => ok({interrupted: true}),
+    })
+
+    // #when — several ticks of the hold
+    await vi.advanceTimersByTimeAsync(20_000)
+
+    // #then — every tick got its interrupts out, none on a signal the DELETE had already used up
+    const rootCalls = w.interruptSignals.filter(call => call.sessionId === ROOT)
+    const childCalls = w.interruptSignals.filter(call => call.sessionId === CHILD)
+    expect(rootCalls.length).toBeGreaterThanOrEqual(3)
+    expect(childCalls.length).toBeGreaterThanOrEqual(3)
+    expect(w.interruptSignals.every(call => !call.abortedAtCall)).toBe(true)
+    w.stop()
+  })
+
   it('interrupts every active session of the directory on every tick of the hold, root first', async () => {
     // #given
     const w = startWatch({active: [CHILD, ROOT]})

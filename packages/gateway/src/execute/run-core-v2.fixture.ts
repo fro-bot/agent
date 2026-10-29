@@ -451,6 +451,8 @@ export function startRun(options: StartOptions = {}): Run {
   const callLog = options.shellServer?.log ?? []
   const shellServer = makeShellServer({...options.shellServer, log: callLog})
   const active = new Set(options.active ?? [ROOT])
+  /** Where each session that moved is stored now. */
+  const movedTo = new Map<string, string>()
   const interrupt = vi.fn(async ({sessionId}: {sessionId: string}) => {
     callLog.push(`interrupt:${sessionId}`)
     if (options.interrupt !== undefined) return options.interrupt(sessionId)
@@ -495,11 +497,12 @@ export function startRun(options: StartOptions = {}): Run {
       }),
     },
     createSession: vi.fn(options.createSessionResult ?? (async () => ok({id: ROOT}))),
-    getSession: vi.fn(async () =>
+    getSession: vi.fn(async ({sessionId}: {readonly sessionId: string}) =>
       ok({
-        id: ROOT,
+        id: sessionId,
         parentId: null,
-        directory: DIRECTORY,
+        // A session that moved is stored under its destination from then on, as the server does.
+        directory: movedTo.get(sessionId) ?? DIRECTORY,
         outcome:
           options.outcome === undefined
             ? interrupt.mock.calls.length > 0
@@ -565,6 +568,16 @@ export function startRun(options: StartOptions = {}): Run {
     logger,
     client,
     emit: (...events) => {
+      for (const event of events) {
+        const moved = event as {type?: unknown; data?: {sessionID?: unknown; location?: {directory?: unknown}}}
+        if (
+          moved.type === 'session.moved' &&
+          typeof moved.data?.sessionID === 'string' &&
+          typeof moved.data.location?.directory === 'string'
+        ) {
+          movedTo.set(moved.data.sessionID, moved.data.location.directory)
+        }
+      }
       // The server drops a session from the active list when its execution ends.
       for (const event of events) {
         const type = (event as {type?: unknown}).type
