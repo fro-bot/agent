@@ -27,6 +27,16 @@ function makeChecker(options: Options = {}) {
   const list = vi.fn(async (input: {readonly directory?: string}) => ({
     data: (options.sessions ?? []).filter(session => session.location?.directory === input.directory),
   }))
+  const getSession = vi.fn(async ({sessionId}: {readonly sessionId: string}) => {
+    const stored = (options.sessions ?? []).find(session => session.id === sessionId)
+    if (stored === undefined) return err<V2CallError>({kind: 'http', status: 404})
+    return ok({
+      id: sessionId,
+      parentId: stored.parentID ?? null,
+      directory: stored.location?.directory ?? null,
+      outcome: null,
+    })
+  })
   const listShells = vi.fn(async (_input: {readonly directory: string; readonly signal?: AbortSignal}) => {
     if (options.shells_ !== undefined) return options.shells_()
     if (options.shellsError !== undefined) return err(options.shellsError)
@@ -41,10 +51,10 @@ function makeChecker(options: Options = {}) {
     workspaceOpencodeUrl: 'http://workspace:9200',
     workspaceOpencodeToken: 'secret',
     logger,
-    createClient: () => ({session: api, listShells}),
+    createClient: () => ({session: api, getSession, listShells}),
     now: () => new Date('2026-10-28T00:00:00.000Z'),
   })
-  return {checker, list, listShells, logger}
+  return {checker, list, getSession, listShells, logger}
 }
 
 const context = (signal: AbortSignal = new AbortController().signal) => ({repo: 'o/r', signal})
@@ -73,7 +83,7 @@ describe('createRepoQuiescenceCheckerV2', () => {
 
   it('is busy when an active session lives in the repo directory, a background child included', async () => {
     // #given — the parent finished; its child is still running (probe P2, P9)
-    const {checker, list} = makeChecker({
+    const {checker, list, getSession} = makeChecker({
       active: {ses_child: {type: 'running'}},
       sessions: [
         {id: 'ses_parent', location: {directory: DIRECTORY}},
@@ -86,7 +96,9 @@ describe('createRepoQuiescenceCheckerV2', () => {
 
     // #then
     expect(result).toMatchObject({kind: 'busy', directory: DIRECTORY, sessionIds: ['ses_child']})
-    expect(list).toHaveBeenCalledWith(expect.objectContaining({directory: DIRECTORY}), expect.anything())
+    // placed by the active session's own stored directory: the history under the directory is never listed
+    expect(getSession).toHaveBeenCalledWith(expect.objectContaining({sessionId: 'ses_child'}))
+    expect(list).not.toHaveBeenCalled()
   })
 
   it('is clear when the active session belongs to another repo', async () => {

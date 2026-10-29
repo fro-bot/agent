@@ -86,6 +86,11 @@ export interface RemoteOpenCodeV2ClientOptions {
   readonly fetch?: typeof fetch
 }
 
+export interface V2InboxSummary {
+  /** Items enqueued on the session and not yet delivered into a turn. */
+  readonly queued: number
+}
+
 export interface RemoteOpenCodeV2Client {
   /** The ledger adapter's view of the session API. `active` and `list` throw when the request fails. */
   readonly session: V2SessionApi
@@ -130,6 +135,15 @@ export interface RemoteOpenCodeV2Client {
     readonly message?: string
     readonly signal?: AbortSignal
   }) => Promise<Result<undefined, V2CallError>>
+  /**
+   * The durable inbox of one session: work enqueued and not yet delivered (`GET /api/session/:id/inbox`). A queued item
+   * is a turn the server will start by itself, so it is activity that no active list shows yet. A payload that cannot be
+   * read in full is a `parse` failure, never an empty inbox. An unknown session is `http 404`.
+   */
+  readonly listSessionInbox: (input: {
+    readonly sessionId: string
+    readonly signal?: AbortSignal
+  }) => Promise<Result<V2InboxSummary, V2CallError>>
   /**
    * The RUNNING shells of a location (exited ones are not listed). A list that cannot be read in full is a `parse`
    * failure, never a shorter list: a shell that did not make it into the answer would read as stopped.
@@ -220,12 +234,18 @@ async function* readFrames(response: Response, signal: AbortSignal | undefined):
   const reader = body.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
+  // A CR at the end of a chunk may be the first half of a CRLF whose LF is in the next one, so it is held back.
+  let heldCr = false
   try {
     while (true) {
       // The runtime's lib set has no DOM stream types, so the read result is typed here.
       const chunk = (await reader.read()) as {readonly done: boolean; readonly value?: Uint8Array}
-      if (chunk.done) break
-      buffer += decoder.decode(chunk.value, {stream: true}).replaceAll('\r\n', '\n')
+      let text = chunk.done ? decoder.decode() : decoder.decode(chunk.value, {stream: true})
+      if (heldCr) text = `\r${text}`
+      heldCr = !chunk.done && text.endsWith('\r')
+      if (heldCr) text = text.slice(0, -1)
+      // Every line end, CRLF or lone CR, becomes LF before the frame delimiter is looked for.
+      buffer += text.replaceAll('\r\n', '\n').replaceAll('\r', '\n')
       let boundary = buffer.indexOf('\n\n')
       while (boundary >= 0) {
         const block = buffer.slice(0, boundary)
@@ -234,6 +254,7 @@ async function* readFrames(response: Response, signal: AbortSignal | undefined):
         if (frame !== null) yield frame
         boundary = buffer.indexOf('\n\n')
       }
+      if (chunk.done) break
     }
   } catch (error) {
     // An abort the caller asked for ends the stream; any other failure is a lost connection and propagates.
@@ -318,6 +339,7 @@ export function createRemoteOpenCodeV2Client(options: RemoteOpenCodeV2ClientOpti
     const query: Record<string, string> = {}
     if (input.parentID !== undefined) query.parentID = input.parentID
     if (input.directory !== undefined) query.directory = input.directory
+    if (input.order !== undefined) query.order = input.order
     if (input.cursor !== undefined) query.cursor = input.cursor
     if (input.limit !== undefined) query.limit = String(input.limit)
     const result = await sendJson({
@@ -424,6 +446,17 @@ export function createRemoteOpenCodeV2Client(options: RemoteOpenCodeV2ClientOpti
         ...(message === undefined ? {} : {query: {message}}),
         ...(signal === undefined ? {} : {signal}),
       }),
+
+    listSessionInbox: async ({sessionId, signal}) => {
+      const result = await sendJson({
+        method: 'GET',
+        path: `/api/session/${encodeURIComponent(sessionId)}/inbox`,
+        ...(signal === undefined ? {} : {signal}),
+      })
+      if (!result.success) return result
+      const data = getObjectProperty(result.data, 'data')
+      return Array.isArray(data) ? ok({queued: data.length}) : err({kind: 'parse'})
+    },
 
     listShells: async ({directory, signal}) => {
       const result = await sendJson({

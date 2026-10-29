@@ -1,11 +1,12 @@
 /**
- * A run that stops while its root may still be running must interrupt that root and confirm it stopped before the
- * failure escapes, even when the ownership ledger is empty. The prompt runs in server scope, so only an interrupt stops
- * it; releasing the lock and slot without that leaves the root writing the checkout under the next run (#1958).
+ * A run that stops interrupts what its directory shows and waits for the directory to stay quiet before the failure
+ * escapes, even when the ownership ledger is empty. The prompt runs in server scope, so only an interrupt stops it;
+ * releasing the lock and slot without that leaves the root writing the checkout under the next run (#1958).
  *
- * The V2 rules under test: an `{interrupted: false}` reply is never a stop (an interrupt sent before the prompt is
- * admitted leaves no trace), absence from the active list is never a stop, and an interrupt with reason `shutdown` is
- * never a stop. A stop needs an ended execution AND absence from the active list.
+ * The V2 rules under test: an interrupt reply is never read as a stop (an interrupt sent before the prompt is admitted
+ * leaves no trace, and the root’s late start is seen in the quiet window instead), and a stop is confirmed only by the
+ * directory staying quiet. Anything the barrier cannot confirm quarantines the run and keeps the watch stopping the
+ * directory through the hold.
  */
 
 import type {OwnershipLedger} from '@fro-bot/runtime'
@@ -208,20 +209,54 @@ describe('root interrupt on a stop that may leave the root running', () => {
     })
   })
 
-  it('does not read an interrupt reply of false as a stop: a root with no ended execution is quarantined', async () => {
-    // #given — the root is absent and the reply says nothing was interrupted: what a prompt that is not admitted
-    // yet looks like (probe P1). No execution has ended, so there is no evidence the root stopped.
+  it('does not release on an absent root: a prompt admitted late shows up in the window and is stopped', async () => {
+    // #given — the prompt was sent but is not admitted yet, so the root is absent from the active list and an interrupt
+    // now says `{interrupted: false}` (probe P1). A window of three readings 100 ms apart.
     const controller = new AbortController()
+    let admitted = false
     const run = startRun({
       controller,
-      active: [],
-      interrupt: async () => ok({interrupted: false}),
-      outcome: () => null,
+      directoryStability: {requiredObservations: 3, minSpacingMs: 100, minSpanMs: 200},
+      activeReply: async (): Promise<Record<string, {readonly type: string}>> =>
+        admitted ? {[ROOT]: {type: 'running'}} : {},
+      interrupt: async () => {
+        const wasAdmitted = admitted
+        admitted = false
+        return ok({interrupted: wasAdmitted})
+      },
     })
-    await vi.advanceTimersByTimeAsync(100)
+    await vi.advanceTimersByTimeAsync(50)
+
+    // #when — the stop starts, and the root is admitted 150 ms in
+    controller.abort()
+    await vi.advanceTimersByTimeAsync(150)
+    admitted = true
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    // #then — the late start was seen and interrupted, and only then did the run release
+    expect(run.interrupt).toHaveBeenCalledWith(expect.objectContaining({sessionId: ROOT}))
+    const error = failure(run)
+    expect(error.kind).toBe('timeout')
+    expect(error.quarantined).toBe(false)
+  })
+
+  it('quarantines when the prompt is admitted late and never stops', async () => {
+    // #given — the same, but the root ignores every interrupt
+    const controller = new AbortController()
+    let admitted = false
+    const run = startRun({
+      controller,
+      directoryStability: {requiredObservations: 3, minSpacingMs: 100, minSpanMs: 200},
+      activeReply: async (): Promise<Record<string, {readonly type: string}>> =>
+        admitted ? {[ROOT]: {type: 'running'}} : {},
+      interrupt: async () => ok({interrupted: false}),
+    })
+    await vi.advanceTimersByTimeAsync(50)
+    controller.abort()
+    await vi.advanceTimersByTimeAsync(150)
+    admitted = true
 
     // #when
-    controller.abort()
     await vi.advanceTimersByTimeAsync(PAST_SETTLE_BOUND_MS)
 
     // #then
@@ -229,20 +264,22 @@ describe('root interrupt on a stop that may leave the root running', () => {
   })
 
   it('keeps interrupting during the hold, so a prompt that starts late is stopped', async () => {
-    // #given — quarantined with the root absent, then it turns up busy as the late prompt starts
+    // #given — quarantined because the root ignored the interrupt; it then goes quiet, and later a wake starts it again
     const controller = new AbortController()
+    let rootBusy = true
     let lateStart = false
     const run = startRun({
       controller,
       activeReply: async (): Promise<Record<string, {readonly type: string}>> =>
-        lateStart ? {[ROOT]: {type: 'running'}} : {},
+        rootBusy || lateStart ? {[ROOT]: {type: 'running'}} : {},
       interrupt: async () => ok({interrupted: lateStart}),
-      outcome: () => null,
     })
     await vi.advanceTimersByTimeAsync(100)
     controller.abort()
     await vi.advanceTimersByTimeAsync(PAST_SETTLE_BOUND_MS)
     expect(failure(run).quarantined).toBe(true)
+    rootBusy = false
+    await vi.advanceTimersByTimeAsync(2_000)
     const interruptsAtQuarantine = run.interrupt.mock.calls.length
 
     // #when
@@ -286,18 +323,20 @@ describe('root interrupt on a stop that may leave the root running', () => {
     expect(error.quarantined).toBe(true)
   })
 
-  it('takes the fast path, with no remote call, for a failure after the root already halted', async () => {
+  it('has no fast path: a failure after the root already halted still waits for the directory to stay quiet', async () => {
     // #given
     const run = startRun()
     await vi.advanceTimersByTimeAsync(100)
+    const readsBefore = run.active.mock.calls.length
 
     // #when
     run.emit(frames.failed())
     await vi.advanceTimersByTimeAsync(1_000)
 
-    // #then
+    // #then — nothing to stop, nothing quarantined, but the directory was read
     expect(failure(run).quarantined).toBe(false)
     expect(run.interrupt).not.toHaveBeenCalled()
+    expect(run.active.mock.calls.length).toBeGreaterThan(readsBefore)
   })
 
   it("stamps the run id on the barrier's log lines", async () => {

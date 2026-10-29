@@ -1,59 +1,48 @@
 /**
- * Termination barrier for a run's owned background sessions, on OpenCode V2: the sibling of
- * `settle-owned-sessions.ts`. The contract is the same; read that module's doc for the reasoning. What differs is how a
- * stop is requested and how it is confirmed:
+ * Termination barrier for a run on OpenCode V2: the sibling of `settle-owned-sessions.ts`. The contract is the same (the
+ * run's lock is not released while a writer it started can still touch the checkout); what differs is what is believed.
  *
- * - A session is stopped with `POST /api/session/:id/interrupt`. Its reply is a delivery receipt, never a stop
- *   (`{interrupted: false}` is also what a not-yet-admitted prompt returns, probe P1).
- * - A child is confirmed settled by the same reconciliation primitive the drain uses (`reconcileLedgerOnce`) over the V2
- *   adapter: absent from `GET /api/session/active` and listed by `session.list({parentID})`.
- * - A root is confirmed stopped by positive evidence plus absence from the active list (`probeRootStopV2`), and never
- *   by an interrupt with reason `shutdown`.
+ * Stock v2.2.0 cannot prove that no session of the run can still be woken: a background shell's DELETE, a subagent's
+ * completion and a queued notice all wake a session in a step the event stream does not show, and no REST route says a
+ * producer is mid-way. So the barrier does not try to account for each entity the run started, and it does not confirm
+ * a stop from an interrupt's reply. It acts on what the DIRECTORY shows and decides by the directory staying quiet:
  *
- * Fast path: returns `{settled: true}` with zero remote calls when the ledger has no unsettled work and the root need
- * not be confirmed. Otherwise the whole attempt (interrupt round, confirmation round) runs under its own bound, with a
- * fresh teardown signal, because the run's own signal is already aborted by the time a failure reaches here. Anything
- * still unresolved when the attempt ends is downgraded to `unknown`, and the caller quarantines.
+ * 1. Read the directory (`observeDirectoryV2`): active sessions, running shells, queued inbox items.
+ * 2. Act on what it showed (`stopDirectoryActivityV2`): DELETE every running shell, then interrupt every active session,
+ *    the root first. Every session and shell in a gateway checkout directory is the run's: nothing else shares it.
+ * 3. Repeat until `createDirectoryStabilityGate` passes (11 quiet readings, 500 ms apart, over 5 s). Any activity and
+ *    any read that fails, times out or comes back partial resets the count.
  *
- * Background shells: a session interrupt does not stop them (`Job.cancel(sessionID)` finds no job under a session id), and
- * they outlive the run's lock. So the barrier first kills every owned shell with `DELETE /api/shell/:id` and confirms it
- * by `GET /api/shell` no longer listing it. The root is interrupted next WHETHER OR NOT that kill was confirmed: the
- * interrupt stops the root producing more work, and nothing about a shell that survives makes that wait.
+ * It all runs under one bound (`DEFAULT_SETTLE_TIMEOUT_MS`) with a fresh teardown signal, because the run's own signal is
+ * already aborted by the time a failure reaches here. If the gate has not passed when the bound is reached, the stop is
+ * unconfirmed: the ledger's entries become `unknown`, and the caller quarantines the run and starts the watch
+ * (`startQuarantineWatchV2`), which repeats step 2 for the whole hold.
  *
- * A DELETE queues an `error` notice that wakes the owning session, so a stop that deleted any shell, tracked or not,
- * never confirms the root: it reports `followUpPossible` and the caller quarantines. That is the accepted cost: any stop
- * with a live owned shell quarantines, even after a clean kill. After the root is confirmed the barrier sweeps once
- * more, because the root may have started a shell while it was being stopped; a sweep that deletes or sees anything is an
- * unconfirmed stop. A shell that cannot be confirmed gone keeps the stop unconfirmed.
+ * The ledger is bookkeeping here, not evidence. A pass settles its entries because the directory showed no activity; it
+ * never decides whether to release.
  *
- * Background work open (`followUpPossible`): the server then starts root turns by itself, so the root is never
- * confirmed. The barrier interrupts the root and the owned children once, settles the children, and reports
- * `rootUnconfirmed` without waiting out its budget; the quarantine watch does the polling.
+ * Accepted cost: any stop with a live shell kills it, and the kill wakes the root, so the barrier needs a full quiet
+ * window after it. A stop whose window cannot be completed in the bound quarantines.
  *
  * This module does not decide what `run.ts` does with a quarantine outcome.
  */
 
-import type {OwnershipLedger, RemoteOpenCodeV2Client} from '@fro-bot/runtime'
+import type {DirectoryStabilityTuning, OwnershipLedger, RemoteOpenCodeV2Client} from '@fro-bot/runtime'
 import type {GatewayLogger} from '../discord/client.js'
-import type {StreamTerminal} from './root-stop-v2.js'
 
 import {
-  collectOwnerSessionIds,
-  createV2LedgerReconcileAdapter,
-  isShellLedgerKey,
-  killOwnedShells,
-  reconcileLedgerOnce,
+  awaitDirectoryStability,
+  createDirectoryStabilityGate,
+  DIRECTORY_QUIESCENCE_MIN_SPACING_MS,
+  observeDirectoryV2,
+  ownedSessionIdsOf,
   toErrorMessage,
 } from '@fro-bot/runtime'
-import {interruptSession, probeRootStopV2} from './root-stop-v2.js'
-import {ROOT_QUIESCENCE_POLL_INTERVAL_MS} from './root-stop.js'
-import {toRuntimeLogger} from './runtime-logger.js'
-
-export {ROOT_QUIESCENCE_POLL_INTERVAL_MS}
+import {stopDirectoryActivityV2} from './root-stop-v2.js'
 
 /**
- * Upper bound, in milliseconds, on the whole settle attempt (interrupt round + confirmation round). A fresh budget,
- * not a remainder of the run's.
+ * Upper bound, in milliseconds, on the whole barrier (acting plus the stability window). A fresh budget, not a remainder
+ * of the run's. The window alone is 5 s.
  */
 export const DEFAULT_SETTLE_TIMEOUT_MS = 15_000
 
@@ -64,40 +53,25 @@ export interface SettleOwnedSessionsV2Params {
   readonly directory: string
   /** The root session this run created. */
   readonly rootSessionId: string
-  /** The run's ownership ledger. Mutated in place (`markUnknown`/`settle` via reconciliation). */
+  /** The run's ownership ledger: settled on a pass, marked `unknown` on a failure. */
   readonly ledger: OwnershipLedger
   readonly logger: GatewayLogger
-  /** The gateway run this attempt belongs to. Stamped on every log line, including the reconciliation lines. */
+  /** When the run began (epoch ms): which sessions' inboxes a reading reads. */
+  readonly runStartedAt: number
+  /** The gateway run this attempt belongs to. Stamped on every log line. */
   readonly runId?: string
   /** Overrides `DEFAULT_SETTLE_TIMEOUT_MS` — for tests only. */
   readonly timeoutMs?: number
-  /** The root may still be executing. Disables the settled-ledger fast path and adds root quiescence to the checks. */
-  readonly confirmRootQuiescent?: boolean
-  /** Background work is open, so a root turn the stream has not shown can still start. Only meaningful with `confirmRootQuiescent`. */
-  readonly followUpPossible?: boolean
-  /** Overrides `ROOT_QUIESCENCE_POLL_INTERVAL_MS` — for tests only. */
-  readonly rootPollIntervalMs?: number
-  /** Overrides the shell kill's rounds and pause (`DEFAULT_SHELL_KILL_*`) — for tests only. */
-  readonly shellKillRounds?: number
-  readonly shellKillPollIntervalMs?: number
-  /** How the root's latest execution ended on the stream, or `null`. Absent: the server's persisted outcome decides. */
-  readonly streamTerminal?: () => StreamTerminal | null
+  /** Overrides the stability window — for tests only. */
+  readonly stability?: DirectoryStabilityTuning
 }
 
 export type SettleOwnedSessionsV2Result =
   | {readonly settled: true}
   | {
       readonly settled: false
+      /** Why the directory was not confirmed quiet. The caller quarantines and keeps stopping it through the hold. */
       readonly reason: string
-      /** The root was to be confirmed stopped and was not. The caller keeps watching it through the hold. */
-      readonly rootUnconfirmed: boolean
-      /** An owned background shell is not confirmed stopped. The caller keeps killing it through the hold. */
-      readonly shellsUnconfirmed: boolean
-      /**
-       * A root turn the stream has not shown can still start: background work was open, or the barrier deleted a shell
-       * whose error notice wakes the root. The caller's quarantine watch must not treat the root as confirmable.
-       */
-      readonly followUpPossible: boolean
     }
 
 function withRunId(logger: GatewayLogger, runId: string | undefined): GatewayLogger {
@@ -108,10 +82,6 @@ function withRunId(logger: GatewayLogger, runId: string | undefined): GatewayLog
     warn: (context, message) => logger.warn({runId, ...context}, message),
     error: (context, message) => logger.error({runId, ...context}, message),
   }
-}
-
-function hasUnsettledShells(ledger: OwnershipLedger): boolean {
-  return ledger.snapshot().some(entry => isShellLedgerKey(entry.sessionId) && entry.state !== 'settled')
 }
 
 /** Race `work` against its own timer, so work that ignores cancellation still resolves into a decision. */
@@ -133,238 +103,108 @@ export async function settleOwnedSessionsV2(params: SettleOwnedSessionsV2Params)
     directory,
     rootSessionId,
     ledger,
+    runStartedAt,
     timeoutMs = DEFAULT_SETTLE_TIMEOUT_MS,
-    confirmRootQuiescent = false,
-    followUpPossible = false,
-    rootPollIntervalMs = ROOT_QUIESCENCE_POLL_INTERVAL_MS,
-    shellKillRounds,
-    shellKillPollIntervalMs,
-    streamTerminal = (): StreamTerminal | null => null,
+    stability = {},
   } = params
   const logger = withRunId(params.logger, params.runId)
-  const runtimeLogger = toRuntimeLogger(logger)
-
-  if (ledger.isDrainComplete() && !confirmRootQuiescent) {
-    return {settled: true}
-  }
 
   const unsettled = ledger.snapshot().filter(entry => entry.state !== 'settled')
   logger.warn(
-    {rootSessionId, unsettled: unsettled.map(entry => entry.sessionId), confirmRootQuiescent},
-    confirmRootQuiescent
-      ? 'settle-owned-sessions: run failed while the root may still be running — interrupting the root and confirming it stopped before releasing resources'
-      : 'settle-owned-sessions: run failed with owned work outstanding — cancelling before releasing resources',
+    {rootSessionId, directory, unsettled: unsettled.map(entry => entry.sessionId)},
+    'settle-owned-sessions: stopping the run’s directory and waiting for it to stay quiet before releasing resources',
   )
+
   let finished = false
-  const isFinished = (): boolean => finished
-  // Whether the root was confirmed stopped, readable from the bound's timeout path too.
-  let rootConfirmed = !confirmRootQuiescent
-  // Whether every owned shell was confirmed stopped. False until the kill has answered: a bound that passes first has
-  // not ruled out a shell the ledger never heard of.
-  let shellsConfirmed = false
-  let unconfirmedShellIds: readonly string[] = []
-  // Whether the barrier deleted a shell (or could not tell): its error notice wakes the root, off the stream we read.
-  let shellWake = false
-  const killTuning = {
-    ...(shellKillRounds === undefined ? {} : {rounds: shellKillRounds}),
-    ...(shellKillPollIntervalMs === undefined ? {} : {pollIntervalMs: shellKillPollIntervalMs}),
+  // The last reason the gate had not passed, for the report when the bound is reached.
+  let lastReason = 'the directory was never read'
+
+  /** Mark what is unsettled `unknown`: "we gave up waiting" must not read as "we never tried". */
+  function markUnresolved(): readonly string[] {
+    const unresolved = ledger.snapshot().filter(entry => entry.state !== 'settled')
+    for (const entry of unresolved) ledger.markUnknown(entry.sessionId)
+    return unresolved.map(entry => entry.sessionId)
   }
 
   return withBound(
     timeoutMs,
     async () => {
       // The barrier always resolves to a decision, even when a callee misbehaves.
+      const teardown = new AbortController()
+      const teardownTimer = setTimeout(() => teardown.abort(), timeoutMs)
       try {
-        const teardownSignal = AbortSignal.timeout(timeoutMs)
-
-        const adapter = createV2LedgerReconcileAdapter(client.session)
-        // Once the bound has passed this attempt is abandoned: whatever it still has in flight must not change the
-        // ledger the caller has already read the decision from.
-        const attemptLedger: OwnershipLedger = {
-          ...ledger,
-          settle: sessionId => {
-            if (!isFinished()) ledger.settle(sessionId)
+        const gate = createDirectoryStabilityGate({
+          ...stability,
+          observe: async signal => {
+            const observation = await observeDirectoryV2({
+              client,
+              directory,
+              signal,
+              inbox: {runStartedAt, ownedSessionIds: () => ownedSessionIdsOf(rootSessionId, ledger)},
+            })
+            if (observation.kind === 'quiescent') return observation
+            lastReason =
+              observation.kind === 'unreadable'
+                ? `a read of the directory failed: ${observation.reason}`
+                : `the directory was active: ${observation.activity.activeSessionIds.length} session(s), ${observation.activity.runningShellIds.length} shell(s), ${observation.activity.queuedInbox.length} queued inbox(es)`
+            // A partial reading is acted on too: what it did show is still there to stop.
+            await stopDirectoryActivityV2({
+              client,
+              rootSessionId,
+              directory,
+              activity: observation.activity,
+              signal,
+              logger,
+            })
+            return observation
           },
-          markUnknown: sessionId => {
-            if (!isFinished()) ledger.markUnknown(sessionId)
-          },
-        }
+        })
 
-        // Owned background shells first. A session interrupt does not stop them. Confirmed ones are settled in the ledger.
-        const sweepShells = async () =>
-          killOwnedShells({
-            api: client,
-            directory,
-            ownerSessionIds: collectOwnerSessionIds(rootSessionId, attemptLedger),
-            ledger: attemptLedger,
-            logger: runtimeLogger,
-            signal: teardownSignal,
-            ...killTuning,
-          })
-        const shellKill = await sweepShells()
-        shellsConfirmed = shellKill.confirmed
-        unconfirmedShellIds = shellKill.confirmed ? [] : shellKill.stillRunning
-        // A DELETE's error notice wakes the owner, tracked or not, so the root cannot be confirmed from here on.
-        shellWake = !shellKill.confirmed || shellKill.deleted.length > 0
-        const followUp = followUpPossible || shellWake
+        const outcome = await awaitDirectoryStability({
+          gate,
+          signal: teardown.signal,
+          spacingMs: stability.minSpacingMs ?? DIRECTORY_QUIESCENCE_MIN_SPACING_MS,
+        })
 
-        // Stop the root from producing more work, whether or not the kill was confirmed. Confirmed below only when
-        // `confirmRootQuiescent`.
-        await interruptSession(client, rootSessionId, teardownSignal, logger, 'root')
-
-        const unsettledSessions = unsettled.filter(entry => !isShellLedgerKey(entry.sessionId))
-        await Promise.allSettled(
-          unsettledSessions.map(async entry =>
-            interruptSession(client, entry.sessionId, teardownSignal, logger, 'owned'),
-          ),
-        )
-
-        if (unsettledSessions.length > 0) {
-          const reconcileResult = await reconcileLedgerOnce({
-            ledger: attemptLedger,
-            adapter,
-            parentSessionId: rootSessionId,
-            logger: runtimeLogger,
-            signal: teardownSignal,
-          })
-          if (!reconcileResult.success) {
-            logger.warn(
-              {rootSessionId, detail: reconcileResult.error.message},
-              'settle-owned-sessions: reconciliation call failed while confirming settlement',
-            )
-          }
-        }
-
-        // The root's own turn: confirmed only by positive evidence, never by absence alone. Poll inside the same
-        // teardown budget, interrupting again whenever the root turns up live.
-        let rootQuiescent = !confirmRootQuiescent
-        let reinterrupts = 0
-        while (!rootQuiescent && !isFinished() && !teardownSignal.aborted) {
-          // Nothing can confirm the root with background work open; the quarantine watch does the polling.
-          if (followUp) break
-          const probe = await probeRootStopV2({
-            client,
-            adapter,
-            rootSessionId,
-            signal: teardownSignal,
-            streamTerminal,
-          })
-          if (probe === 'confirmed') {
-            rootQuiescent = true
-            rootConfirmed = true
-          } else {
-            if (probe === 'busy' && !isFinished()) {
-              reinterrupts += 1
-              if (reinterrupts === 1) {
-                logger.warn(
-                  {rootSessionId},
-                  'settle-owned-sessions: the root is running after the interrupt — interrupting it again until it is confirmed stopped',
-                )
-              }
-              await interruptSession(client, rootSessionId, teardownSignal, logger, 'root')
-            }
-            if (!isFinished()) {
-              await new Promise<void>(resolve => {
-                setTimeout(resolve, rootPollIntervalMs)
-              })
-            }
-          }
-        }
-
-        if (ledger.isDrainComplete() && rootQuiescent && shellsConfirmed && !shellWake) {
-          // The root may have started a shell while it was being stopped. One more sweep before anything is released;
-          // anything it deletes or still lists leaves the stop unconfirmed.
-          const finalSweep = await sweepShells()
-          if (!finalSweep.confirmed) {
-            shellsConfirmed = false
-            unconfirmedShellIds = finalSweep.stillRunning
-            shellWake = true
-          } else if (finalSweep.deleted.length > 0) {
-            shellWake = true
-          }
-        }
-
-        if (ledger.isDrainComplete() && rootQuiescent && shellsConfirmed && !shellWake) {
+        if (finished) return {settled: false as const, reason: lastReason}
+        if (outcome.passed) {
+          for (const entry of ledger.snapshot()) if (entry.state !== 'settled') ledger.settle(entry.sessionId)
           logger.info(
-            {rootSessionId, confirmRootQuiescent},
-            confirmRootQuiescent
-              ? 'settle-owned-sessions: owned work settled and the root confirmed stopped'
-              : 'settle-owned-sessions: owned work confirmed settled',
+            {rootSessionId, directory},
+            'settle-owned-sessions: the directory stayed quiet for the whole window — safe to release',
           )
           return {settled: true as const}
         }
 
-        // Still not confirmed. Downgrade every remaining entry to `unknown` rather than leaving it `outstanding`,
-        // which would misrepresent "we gave up waiting" as "we never tried".
-        const stillUnresolved = attemptLedger.snapshot().filter(entry => entry.state !== 'settled')
-        for (const entry of stillUnresolved) {
-          attemptLedger.markUnknown(entry.sessionId)
-        }
-        const stillUnresolvedIds = stillUnresolved.map(entry => entry.sessionId)
-        const unresolvedNotes = [
-          ...(stillUnresolvedIds.length > 0
-            ? [`owned sessions not confirmed settled: ${stillUnresolvedIds.join(', ')}`]
-            : []),
-          ...(shellsConfirmed
-            ? []
-            : [`owned shells not confirmed stopped: ${unconfirmedShellIds.join(', ') || 'unknown'}`]),
-          ...(shellWake ? ['a deleted shell’s error notice can wake the root'] : []),
-        ].join('; ')
+        const unresolvedIds = markUnresolved()
         logger.error(
-          {rootSessionId, stillUnresolvedIds, unconfirmedShellIds, rootQuiescent},
-          'settle-owned-sessions: owned work could not be confirmed settled',
+          {rootSessionId, directory, unresolvedIds, reason: lastReason},
+          'settle-owned-sessions: the directory could not be confirmed quiet',
         )
-        if (!rootQuiescent) {
-          return {
-            settled: false as const,
-            reason: `root session not confirmed stopped after interrupt${unresolvedNotes === '' ? '' : `; ${unresolvedNotes}`}`,
-            rootUnconfirmed: true,
-            shellsUnconfirmed: !shellsConfirmed || hasUnsettledShells(attemptLedger),
-            followUpPossible: followUpPossible || shellWake,
-          }
-        }
-        return {
-          settled: false as const,
-          reason: unresolvedNotes,
-          rootUnconfirmed: shellWake,
-          shellsUnconfirmed: !shellsConfirmed || hasUnsettledShells(attemptLedger),
-          followUpPossible: followUpPossible || shellWake,
-        }
+        return {settled: false as const, reason: lastReason}
       } catch (error) {
         const message = toErrorMessage(error)
         logger.error(
           {rootSessionId, detail: message},
           'settle-owned-sessions: unexpected error during settle attempt — quarantining rather than letting it escape',
         )
-        return {
-          settled: false as const,
-          reason: `settle attempt threw unexpectedly: ${message}`,
-          rootUnconfirmed: !rootConfirmed,
-          shellsUnconfirmed: !shellsConfirmed || hasUnsettledShells(ledger),
-          followUpPossible: true,
-        }
+        if (!finished) markUnresolved()
+        return {settled: false as const, reason: `settle attempt threw unexpectedly: ${message}`}
       } finally {
+        clearTimeout(teardownTimer)
+        teardown.abort()
         finished = true
       }
     },
     () => {
       finished = true
       // Marking happens after `finished` is set, so the abandoned attempt cannot undo it.
-      const abandonedEntries = ledger.snapshot().filter(entry => entry.state !== 'settled')
-      for (const entry of abandonedEntries) {
-        ledger.markUnknown(entry.sessionId)
-      }
+      const abandonedIds = markUnresolved()
       logger.error(
-        {rootSessionId, timeoutMs, abandonedIds: abandonedEntries.map(entry => entry.sessionId)},
+        {rootSessionId, timeoutMs, abandonedIds},
         'settle-owned-sessions: settle attempt exceeded its bound — quarantining rather than hanging',
       )
-      return {
-        settled: false as const,
-        reason: `settle attempt exceeded its ${timeoutMs}ms bound`,
-        rootUnconfirmed: !rootConfirmed,
-        shellsUnconfirmed: !shellsConfirmed || hasUnsettledShells(ledger),
-        followUpPossible: true,
-      }
+      return {settled: false as const, reason: `settle attempt exceeded its ${timeoutMs}ms bound: ${lastReason}`}
     },
   )
 }

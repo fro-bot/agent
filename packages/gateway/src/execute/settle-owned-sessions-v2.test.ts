@@ -1,9 +1,8 @@
-import type {RemoteOpenCodeV2Client, V2SessionOutcome} from '@fro-bot/runtime'
+import type {DirectoryStabilityTuning, RemoteOpenCodeV2Client} from '@fro-bot/runtime'
 import type {GatewayLogger} from '../discord/client.js'
-import type {StreamTerminal} from './root-stop-v2.js'
 import type {ShellServerOptions} from './shell-server-v2.fixture.js'
 
-import {createOwnershipLedger, err, ok, shellLedgerKey} from '@fro-bot/runtime'
+import {createOwnershipLedger, ok, shellLedgerKey} from '@fro-bot/runtime'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
 import {DEFAULT_SETTLE_TIMEOUT_MS, settleOwnedSessionsV2} from './settle-owned-sessions-v2.js'
@@ -11,56 +10,72 @@ import {makeShellServer} from './shell-server-v2.fixture.js'
 
 const ROOT = 'ses_root'
 const CHILD = 'ses_child'
-const OTHER_CHILD = 'ses_other'
+const GRAND = 'ses_grandchild'
+const SHELL = 'sh_bg1'
 const DIR = '/workspace/repos/o/r'
+/** The run began a moment ago: sessions the fakes list carry no time, and are read whatever the cut-off. */
+const RUN_STARTED = 1_800_000_000_000
+
+/** A short window for the tests that are not about the window itself: 3 readings, 50 ms apart, over 100 ms. */
+const FAST: DirectoryStabilityTuning = {requiredObservations: 3, minSpacingMs: 50, minSpanMs: 100}
 
 function makeLogger(): GatewayLogger {
   return {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
 }
 
 interface ServerOptions {
+  /** Sessions stored under the directory. */
+  readonly sessions?: readonly string[]
+  /** Sessions of earlier runs stored under the directory: last updated an hour before `RUN_STARTED`. */
+  readonly oldSessions?: readonly string[]
   /** Sessions that are active before any interrupt. */
   readonly active?: readonly string[]
-  /** Sessions an interrupt stops (removes from `active`). Defaults to all of them. */
-  readonly stoppable?: readonly string[]
-  readonly children?: readonly string[]
-  readonly outcome?: V2SessionOutcome | null
-  readonly interrupt?: (sessionId: string) => Promise<unknown>
+  /** Sessions an interrupt does NOT stop. */
+  readonly unstoppable?: readonly string[]
+  readonly interruptFails?: boolean
   readonly activeFails?: boolean
   readonly shellServer?: ShellServerOptions
 }
 
 function makeServer(options: ServerOptions = {}) {
   const shellServer = makeShellServer(options.shellServer)
+  const sessions = [...(options.sessions ?? [ROOT])]
   const active = new Set(options.active ?? [])
-  const stoppable = new Set(options.stoppable ?? [ROOT, CHILD, OTHER_CHILD])
   const interrupt = vi.fn(async ({sessionId}: {sessionId: string}) => {
     shellServer.log.push(`interrupt:${sessionId}`)
-    if (options.interrupt !== undefined) return options.interrupt(sessionId) as never
-    if (stoppable.has(sessionId)) active.delete(sessionId)
+    if (options.interruptFails === true)
+      return {success: false as const, error: {kind: 'network' as const, message: 'down'}}
+    if (options.unstoppable?.includes(sessionId) !== true) active.delete(sessionId)
     return ok({interrupted: true})
   })
   const activeCalls = vi.fn(async () => {
+    shellServer.log.push('active')
     if (options.activeFails === true) throw new Error('session.active failed: http 503')
     return Object.fromEntries([...active].map(id => [id, {type: 'running'}]))
   })
   const client = {
     session: {
       active: activeCalls,
-      list: vi.fn(async () => ({data: (options.children ?? []).map(id => ({id, parentID: ROOT}))})),
+      list: vi.fn(async () => ({
+        data: [
+          ...sessions.map(id => ({id, location: {directory: DIR}})),
+          ...(options.oldSessions ?? []).map(id => ({
+            id,
+            location: {directory: DIR},
+            time: {updated: RUN_STARTED - 60 * 60 * 1000},
+          })),
+        ],
+      })),
     },
+    getSession: vi.fn(async ({sessionId}: {sessionId: string}) =>
+      sessions.includes(sessionId)
+        ? ok({id: sessionId, parentId: null, directory: DIR, outcome: null})
+        : {success: false as const, error: {kind: 'http' as const, status: 404}},
+    ),
     interrupt,
-    getSession: vi.fn(async () => ok({id: ROOT, parentId: null, directory: '/d', outcome: options.outcome ?? null})),
     ...shellServer.routes,
   } as unknown as RemoteOpenCodeV2Client
-  return {client, interrupt, activeCalls, active, shellServer}
-}
-
-function unknownIds(ledger: ReturnType<typeof createOwnershipLedger>): string[] {
-  return ledger
-    .snapshot()
-    .filter(entry => entry.state === 'unknown')
-    .map(entry => entry.sessionId)
+  return {client, interrupt, activeCalls, active, sessions, shellServer}
 }
 
 function ledgerWith(...ids: string[]) {
@@ -69,733 +84,447 @@ function ledgerWith(...ids: string[]) {
   return ledger
 }
 
+async function settle(
+  server: ReturnType<typeof makeServer>,
+  extra: Partial<Parameters<typeof settleOwnedSessionsV2>[0]> = {},
+) {
+  return settleOwnedSessionsV2({
+    client: server.client,
+    directory: DIR,
+    rootSessionId: ROOT,
+    ledger: createOwnershipLedger(),
+    runStartedAt: RUN_STARTED,
+    logger: makeLogger(),
+    stability: FAST,
+    ...extra,
+  })
+}
+
+/** Run `settle` under fake timers to completion. */
+async function settleAndWait(
+  server: ReturnType<typeof makeServer>,
+  extra: Partial<Parameters<typeof settleOwnedSessionsV2>[0]> = {},
+  advanceMs = 5_000,
+) {
+  const pending = settle(server, extra)
+  await vi.advanceTimersByTimeAsync(advanceMs)
+  return pending
+}
+
 afterEach(() => {
   vi.useRealTimers()
 })
 
 describe('settleOwnedSessionsV2', () => {
-  it('settles with zero remote calls when nothing is owned and the root need not be confirmed', async () => {
+  it('settles once the directory shows nothing for the whole window, without touching anything', async () => {
     // #given
+    vi.useFakeTimers()
     const server = makeServer()
 
     // #when
-    const result = await settleOwnedSessionsV2({
-      client: server.client,
-      directory: DIR,
-      rootSessionId: ROOT,
-      ledger: createOwnershipLedger(),
-      logger: makeLogger(),
-    })
+    const result = await settleAndWait(server)
 
     // #then
     expect(result).toEqual({settled: true})
     expect(server.interrupt).not.toHaveBeenCalled()
-    expect(server.activeCalls).not.toHaveBeenCalled()
-  })
-
-  it('interrupts the root and every unsettled child and settles a child that left the active list', async () => {
-    // #given
-    const ledger = ledgerWith(CHILD)
-    const server = makeServer({active: [CHILD], children: [CHILD]})
-
-    // #when
-    const result = await settleOwnedSessionsV2({
-      client: server.client,
-      directory: DIR,
-      rootSessionId: ROOT,
-      ledger,
-      logger: makeLogger(),
-    })
-
-    // #then
-    expect(result).toEqual({settled: true})
-    expect(server.interrupt.mock.calls.map(([input]) => input.sessionId).sort()).toEqual([CHILD, ROOT])
-    expect(ledger.isDrainComplete()).toBe(true)
-  })
-
-  it('downgrades a child that is still active to unknown and reports it unsettled', async () => {
-    // #given — the child ignores the interrupt
-    const ledger = ledgerWith(CHILD)
-    const server = makeServer({active: [CHILD], stoppable: [], children: [CHILD]})
-
-    // #when
-    const result = await settleOwnedSessionsV2({
-      client: server.client,
-      directory: DIR,
-      rootSessionId: ROOT,
-      ledger,
-      logger: makeLogger(),
-    })
-
-    // #then
-    expect(result).toMatchObject({settled: false, rootUnconfirmed: false})
-    expect(unknownIds(ledger)).toEqual([CHILD])
-  })
-
-  it('does not treat an interrupt reply of false as a stop for a child', async () => {
-    // #given — the reply says nothing was interrupted, and the child is still active
-    const ledger = ledgerWith(CHILD)
-    const server = makeServer({
-      active: [CHILD],
-      children: [CHILD],
-      interrupt: async () => ok({interrupted: false}),
-    })
-
-    // #when
-    const result = await settleOwnedSessionsV2({
-      client: server.client,
-      directory: DIR,
-      rootSessionId: ROOT,
-      ledger,
-      logger: makeLogger(),
-    })
-
-    // #then
-    expect(result).toMatchObject({settled: false})
-    expect(ledger.isDrainComplete()).toBe(false)
-  })
-
-  describe('root confirmation', () => {
-    it('confirms a root that ended with a persisted outcome and is absent from the active list', async () => {
-      // #given
-      const server = makeServer({active: [ROOT], outcome: 'interrupted'})
-
-      // #when
-      const result = await settleOwnedSessionsV2({
-        client: server.client,
-        directory: DIR,
-        rootSessionId: ROOT,
-        ledger: createOwnershipLedger(),
-        logger: makeLogger(),
-        confirmRootQuiescent: true,
-        rootPollIntervalMs: 10,
-      })
-
-      // #then
-      expect(result).toEqual({settled: true})
-      expect(server.interrupt).toHaveBeenCalledWith(expect.objectContaining({sessionId: ROOT}))
-    })
-
-    it('accepts an interrupt with reason user from the stream', async () => {
-      // #given — no persisted outcome yet, but the stream saw the user interrupt
-      const server = makeServer({active: [ROOT]})
-      const terminal: StreamTerminal = 'user'
-
-      // #when
-      const result = await settleOwnedSessionsV2({
-        client: server.client,
-        directory: DIR,
-        rootSessionId: ROOT,
-        ledger: createOwnershipLedger(),
-        logger: makeLogger(),
-        confirmRootQuiescent: true,
-        streamTerminal: () => terminal,
-        rootPollIntervalMs: 10,
-      })
-
-      // #then
-      expect(result).toEqual({settled: true})
-    })
-
-    it('quarantines when the interrupt that stopped the root had reason shutdown', async () => {
-      // #given — the root is gone from the active list, but its last interrupt was a shutdown (claim still held)
-      vi.useFakeTimers()
-      const server = makeServer({active: [ROOT], outcome: 'interrupted'})
-      const pending = settleOwnedSessionsV2({
-        client: server.client,
-        directory: DIR,
-        rootSessionId: ROOT,
-        ledger: createOwnershipLedger(),
-        logger: makeLogger(),
-        confirmRootQuiescent: true,
-        streamTerminal: () => 'shutdown',
-        rootPollIntervalMs: 50,
-      })
-
-      // #when
-      await vi.advanceTimersByTimeAsync(DEFAULT_SETTLE_TIMEOUT_MS + 100)
-
-      // #then
-      await expect(pending).resolves.toMatchObject({settled: false, rootUnconfirmed: true})
-    })
-
-    it('interrupts the root again whenever it turns up live, and quarantines if it never stops', async () => {
-      // #given
-      vi.useFakeTimers()
-      const server = makeServer({active: [ROOT], stoppable: [], outcome: 'succeeded'})
-      const pending = settleOwnedSessionsV2({
-        client: server.client,
-        directory: DIR,
-        rootSessionId: ROOT,
-        ledger: createOwnershipLedger(),
-        logger: makeLogger(),
-        confirmRootQuiescent: true,
-        rootPollIntervalMs: 100,
-      })
-
-      // #when
-      await vi.advanceTimersByTimeAsync(DEFAULT_SETTLE_TIMEOUT_MS + 100)
-
-      // #then
-      await expect(pending).resolves.toMatchObject({settled: false, rootUnconfirmed: true})
-      expect(server.interrupt.mock.calls.length).toBeGreaterThan(2)
-    })
-
-    it('quarantines when the root has no evidence of an ended execution', async () => {
-      // #given — absent from the active list, but no outcome and nothing on the stream: not started, or not admitted
-      vi.useFakeTimers()
-      const server = makeServer({outcome: null})
-      const pending = settleOwnedSessionsV2({
-        client: server.client,
-        directory: DIR,
-        rootSessionId: ROOT,
-        ledger: createOwnershipLedger(),
-        logger: makeLogger(),
-        confirmRootQuiescent: true,
-        rootPollIntervalMs: 100,
-      })
-
-      // #when
-      await vi.advanceTimersByTimeAsync(DEFAULT_SETTLE_TIMEOUT_MS + 100)
-
-      // #then
-      await expect(pending).resolves.toMatchObject({settled: false, rootUnconfirmed: true})
-    })
-
-    it('does not poll when background work is open: it reports the root unconfirmed at once', async () => {
-      // #given — a child is still running and can start a root turn
-      const ledger = ledgerWith(CHILD)
-      const server = makeServer({active: [ROOT, CHILD], children: [CHILD], outcome: 'succeeded'})
-
-      // #when
-      const result = await settleOwnedSessionsV2({
-        client: server.client,
-        directory: DIR,
-        rootSessionId: ROOT,
-        ledger,
-        logger: makeLogger(),
-        confirmRootQuiescent: true,
-        followUpPossible: true,
-      })
-
-      // #then — the children settled, the root did not, and no budget was spent waiting
-      expect(result).toMatchObject({settled: false, rootUnconfirmed: true})
-      expect(server.client.getSession).not.toHaveBeenCalled()
-      expect(ledger.isDrainComplete()).toBe(true)
-    })
-  })
-
-  describe('bound and failure', () => {
-    it('quarantines instead of hanging when the server never answers', async () => {
-      // #given
-      vi.useFakeTimers()
-      const ledger = ledgerWith(CHILD)
-      const server = makeServer({active: [CHILD], interrupt: async () => new Promise(() => undefined)})
-      const pending = settleOwnedSessionsV2({
-        client: server.client,
-        directory: DIR,
-        rootSessionId: ROOT,
-        ledger,
-        logger: makeLogger(),
-        confirmRootQuiescent: true,
-      })
-
-      // #when
-      await vi.advanceTimersByTimeAsync(DEFAULT_SETTLE_TIMEOUT_MS + 1)
-
-      // #then
-      await expect(pending).resolves.toMatchObject({settled: false, rootUnconfirmed: true})
-      expect(unknownIds(ledger)).toEqual([CHILD])
-    })
-
-    it('does not let an abandoned attempt settle the ledger after the bound has passed', async () => {
-      // #given — the active list answers only after the bound
-      vi.useFakeTimers()
-      const ledger = ledgerWith(CHILD)
-      let release: (() => void) | undefined
-      const server = makeServer({active: [CHILD], children: [CHILD]})
-      ;(server.client.session as unknown as {active: unknown}).active = async () =>
-        new Promise(resolve => {
-          release = () => resolve({})
-        })
-      const pending = settleOwnedSessionsV2({
-        client: server.client,
-        directory: DIR,
-        rootSessionId: ROOT,
-        ledger,
-        logger: makeLogger(),
-        timeoutMs: 1_000,
-      })
-      await vi.advanceTimersByTimeAsync(1_001)
-      await expect(pending).resolves.toMatchObject({settled: false})
-
-      // #when — the late answer would have settled the child
-      release?.()
-      await vi.advanceTimersByTimeAsync(10)
-
-      // #then
-      expect(unknownIds(ledger)).toEqual([CHILD])
-    })
-
-    it('quarantines when the active list cannot be read, and never settles on a failed read', async () => {
-      // #given
-      const ledger = ledgerWith(CHILD)
-      const server = makeServer({active: [CHILD], children: [CHILD], activeFails: true})
-
-      // #when
-      const result = await settleOwnedSessionsV2({
-        client: server.client,
-        directory: DIR,
-        rootSessionId: ROOT,
-        ledger,
-        logger: makeLogger(),
-      })
-
-      // #then
-      expect(result).toMatchObject({settled: false, rootUnconfirmed: false})
-      expect(unknownIds(ledger)).toEqual([CHILD])
-    })
-
-    it('stamps the run id on its log lines when it has one', async () => {
-      // #given
-      const logger = makeLogger()
-      const server = makeServer({active: [CHILD], stoppable: [], children: [CHILD]})
-
-      // #when
-      await settleOwnedSessionsV2({
-        client: server.client,
-        directory: DIR,
-        rootSessionId: ROOT,
-        ledger: ledgerWith(CHILD),
-        logger,
-        runId: 'run-1',
-      })
-
-      // #then
-      expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({runId: 'run-1'}), expect.any(String))
-      expect(logger.error).toHaveBeenCalledWith(expect.objectContaining({runId: 'run-1'}), expect.any(String))
-    })
-  })
-
-  it('reports an interrupt failure as evidence, not as a reason to skip the confirmation', async () => {
-    // #given — the root interrupt errors, the child still gets interrupted and settles
-    const ledger = ledgerWith(CHILD)
-    const server = makeServer({
-      active: [CHILD],
-      children: [CHILD],
-      interrupt: async sessionId => {
-        if (sessionId === ROOT) return err({kind: 'http', status: 500})
-        return ok({interrupted: true})
-      },
-    })
-    ;(server.client.session as unknown as {active: unknown}).active = async () => ({})
-
-    // #when
-    const result = await settleOwnedSessionsV2({
-      client: server.client,
-      directory: DIR,
-      rootSessionId: ROOT,
-      ledger,
-      logger: makeLogger(),
-    })
-
-    // #then
-    expect(result).toEqual({settled: true})
-  })
-})
-
-describe('settleOwnedSessionsV2: background shells', () => {
-  const SHELL = 'sh_bg1'
-  const SHELL_KEY = shellLedgerKey(SHELL)
-  const RUNNING = {shells: {[SHELL]: {status: 'running' as const, owner: ROOT}}}
-
-  function shellLedger() {
-    const ledger = createOwnershipLedger()
-    ledger.adopt(SHELL_KEY, 'background shell')
-    return ledger
-  }
-
-  function stateOf(ledger: ReturnType<typeof createOwnershipLedger>): string | undefined {
-    return ledger.snapshot().find(entry => entry.sessionId === SHELL_KEY)?.state
-  }
-
-  it('kills an owned shell, confirms and settles it, and interrupts the root anyway', async () => {
-    // #given — a stop where the root is not confirmable by the stream
-    const ledger = shellLedger()
-    const server = makeServer({shellServer: RUNNING})
-
-    // #when
-    const result = await settleOwnedSessionsV2({
-      client: server.client,
-      directory: DIR,
-      rootSessionId: ROOT,
-      ledger,
-      logger: makeLogger(),
-      confirmRootQuiescent: true,
-      streamTerminal: () => 'user',
-      rootPollIntervalMs: 1,
-    })
-
-    // #then — the kill and its confirming re-list come first, the root is interrupted either way, and the DELETE's error
-    // notice can wake the root, so the root is not confirmed and the stop quarantines
-    const log = server.shellServer.log
-    expect(log.indexOf(`delete:${SHELL}`)).toBeGreaterThanOrEqual(0)
-    expect(log.indexOf(`delete:${SHELL}`)).toBeLessThan(log.indexOf(`interrupt:${ROOT}`))
-    expect(log.slice(log.indexOf(`delete:${SHELL}`) + 1, log.indexOf(`interrupt:${ROOT}`))).toContain('list')
-    expect(stateOf(ledger)).toBe('settled')
-    expect(result).toMatchObject({
-      settled: false,
-      rootUnconfirmed: true,
-      followUpPossible: true,
-      shellsUnconfirmed: false,
-    })
-  })
-
-  it('interrupts the root whether or not the kill is confirmed', async () => {
-    // #given — every DELETE fails, so no kill can be confirmed
-    const server = makeServer({shellServer: {...RUNNING, deleteFails: true}})
-
-    // #when
-    await settleOwnedSessionsV2({
-      client: server.client,
-      directory: DIR,
-      rootSessionId: ROOT,
-      ledger: shellLedger(),
-      logger: makeLogger(),
-      confirmRootQuiescent: true,
-      rootPollIntervalMs: 1,
-      shellKillRounds: 2,
-      shellKillPollIntervalMs: 0,
-    })
-
-    // #then
-    expect(server.interrupt).toHaveBeenCalledWith(expect.objectContaining({sessionId: ROOT}))
-  })
-
-  it('does not confirm the root after it deleted a shell the ledger never heard of (probe A)', async () => {
-    // #given — an owned running shell whose creation frame was lost, and a root that stops at once
-    const server = makeServer({shellServer: RUNNING})
-
-    // #when
-    const result = await settleOwnedSessionsV2({
-      client: server.client,
-      directory: DIR,
-      rootSessionId: ROOT,
-      ledger: createOwnershipLedger(),
-      logger: makeLogger(),
-      confirmRootQuiescent: true,
-      followUpPossible: false,
-      streamTerminal: () => 'user',
-      rootPollIntervalMs: 1,
-    })
-
-    // #then — the DELETE queued an error notice that wakes the root, which nothing on the stream will show
-    expect(server.shellServer.deleteShell).toHaveBeenCalledTimes(1)
-    expect(result).toMatchObject({settled: false, rootUnconfirmed: true, followUpPossible: true})
-  })
-
-  it('settles clean, with a sweep before and after, when no shell is owned', async () => {
-    // #given
-    const server = makeServer({shellServer: {shells: {sh_stranger: {status: 'running', owner: 'ses_stranger'}}}})
-
-    // #when
-    const result = await settleOwnedSessionsV2({
-      client: server.client,
-      directory: DIR,
-      rootSessionId: ROOT,
-      ledger: createOwnershipLedger(),
-      logger: makeLogger(),
-      confirmRootQuiescent: true,
-      streamTerminal: () => 'user',
-      rootPollIntervalMs: 1,
-    })
-
-    // #then
-    expect(result).toEqual({settled: true})
-    expect(server.shellServer.listShells).toHaveBeenCalledTimes(2)
     expect(server.shellServer.deleteShell).not.toHaveBeenCalled()
   })
 
-  it('sweeps again after the root is confirmed: a shell started during the barrier does not survive the release', async () => {
-    // #given — nothing runs at the first sweep; the shell appears while the root is being interrupted
-    const server = makeServer({
-      interrupt: async () => {
-        server.shellServer.shells[SHELL] = {status: 'running', owner: ROOT}
-        return ok({interrupted: true})
-      },
-    })
-
-    // #when
-    const result = await settleOwnedSessionsV2({
-      client: server.client,
-      directory: DIR,
-      rootSessionId: ROOT,
-      ledger: createOwnershipLedger(),
-      logger: makeLogger(),
-      confirmRootQuiescent: true,
-      streamTerminal: () => 'user',
-      rootPollIntervalMs: 1,
-    })
-
-    // #then — the final sweep killed it, and its error notice means the root is no longer confirmed
-    expect(server.shellServer.deleteShell).toHaveBeenCalledWith(expect.objectContaining({shellId: SHELL}))
-    expect(server.shellServer.shells[SHELL]).toBeUndefined()
-    expect(result).toMatchObject({settled: false, rootUnconfirmed: true, followUpPossible: true})
-  })
-
-  it('reports a shell the final sweep still lists as unconfirmed', async () => {
-    // #given — the late shell shrugs off the DELETE
-    const server = makeServer({
-      shellServer: {deleteDoesNotKill: [SHELL]},
-      interrupt: async () => {
-        server.shellServer.shells[SHELL] = {status: 'running', owner: ROOT}
-        return ok({interrupted: true})
-      },
-    })
-
-    // #when
-    const result = await settleOwnedSessionsV2({
-      client: server.client,
-      directory: DIR,
-      shellKillRounds: 1,
-      shellKillPollIntervalMs: 0,
-      rootSessionId: ROOT,
-      ledger: createOwnershipLedger(),
-      logger: makeLogger(),
-      confirmRootQuiescent: true,
-      streamTerminal: () => 'user',
-      rootPollIntervalMs: 1,
-      timeoutMs: 3_000,
-    })
-
-    // #then
-    expect(result).toMatchObject({settled: false, shellsUnconfirmed: true})
-  })
-
-  it('does not sweep for a late shell when the stop was already unconfirmed', async () => {
-    // #given — follow-up work is open, so the root is not confirmed and the watch owns the polling
-    const server = makeServer({shellServer: RUNNING})
-
-    // #when
-    await settleOwnedSessionsV2({
-      client: server.client,
-      directory: DIR,
-      rootSessionId: ROOT,
-      ledger: shellLedger(),
-      logger: makeLogger(),
-      confirmRootQuiescent: true,
-      followUpPossible: true,
-    })
-
-    // #then — one sweep: the kill and its confirming list, no second
-    expect(server.shellServer.listShells).toHaveBeenCalledTimes(2)
-  })
-
-  it('keeps the stop unconfirmed when the shell is still running after the kill', async () => {
-    // #given — the same stop, but the server accepts the DELETE and kills nothing
-    const ledger = shellLedger()
-    const server = makeServer({shellServer: {...RUNNING, deleteDoesNotKill: [SHELL]}})
-
-    // #when
-    const result = await settleOwnedSessionsV2({
-      client: server.client,
-      directory: DIR,
-      shellKillRounds: 1,
-      shellKillPollIntervalMs: 0,
-      rootSessionId: ROOT,
-      ledger,
-      logger: makeLogger(),
-      confirmRootQuiescent: true,
-      streamTerminal: () => 'user',
-      rootPollIntervalMs: 1,
-    })
-
-    // #then — never settled, downgraded to unknown, and reported so the caller keeps killing through the hold
-    expect(result).toMatchObject({settled: false, shellsUnconfirmed: true})
-    expect(stateOf(ledger)).toBe('unknown')
-  })
-
-  it('still interrupts the root when the kill is unconfirmed', async () => {
+  it('interrupts the root while it is active, then settles after a full quiet window', async () => {
     // #given
-    const server = makeServer({shellServer: {...RUNNING, deleteFails: true}})
+    vi.useFakeTimers()
+    const server = makeServer({active: [ROOT]})
 
     // #when
-    await settleOwnedSessionsV2({
-      client: server.client,
-      directory: DIR,
-      shellKillRounds: 1,
-      shellKillPollIntervalMs: 0,
-      rootSessionId: ROOT,
-      ledger: shellLedger(),
-      logger: makeLogger(),
-      confirmRootQuiescent: true,
-      followUpPossible: true,
-    })
+    const result = await settleAndWait(server)
 
     // #then
+    expect(result).toEqual({settled: true})
     expect(server.interrupt).toHaveBeenCalledWith(expect.objectContaining({sessionId: ROOT}))
   })
 
-  it('does not confirm the root while the shell is open work, even when the kill is confirmed', async () => {
-    // #given — the DELETE queues an error notice that wakes the root
-    const ledger = shellLedger()
-    const server = makeServer({shellServer: RUNNING})
-
-    // #when
-    const result = await settleOwnedSessionsV2({
-      client: server.client,
-      directory: DIR,
-      rootSessionId: ROOT,
-      ledger,
-      logger: makeLogger(),
-      confirmRootQuiescent: true,
-      followUpPossible: true,
-      streamTerminal: () => 'succeeded',
+  it('interrupts every active session of the directory, root first, ledger or not (grandchildren, resumed descendants)', async () => {
+    // #given — the ledger knows only the child; the grandchild and a resumed session are active under the directory
+    vi.useFakeTimers()
+    const server = makeServer({
+      sessions: [ROOT, CHILD, GRAND, 'ses_resumed'],
+      active: [GRAND, CHILD, ROOT, 'ses_resumed'],
     })
 
-    // #then — quarantine, with the shell itself no longer the problem
-    expect(result).toMatchObject({settled: false, rootUnconfirmed: true, shellsUnconfirmed: false})
-    expect(stateOf(ledger)).toBe('settled')
-  })
-
-  it('reports a shell it could not kill even when the root is not confirmed either', async () => {
-    // #given — follow-up work is open, so the root cannot be confirmed; the shell ignores the DELETE
-    const ledger = shellLedger()
-    const server = makeServer({shellServer: {...RUNNING, deleteDoesNotKill: [SHELL]}})
-
     // #when
-    const result = await settleOwnedSessionsV2({
-      client: server.client,
-      directory: DIR,
-      shellKillRounds: 1,
-      shellKillPollIntervalMs: 0,
-      rootSessionId: ROOT,
-      ledger,
-      logger: makeLogger(),
-      confirmRootQuiescent: true,
-      followUpPossible: true,
-    })
-
-    // #then — both are unresolved, and the caller must watch for both
-    expect(result).toMatchObject({settled: false, rootUnconfirmed: true, shellsUnconfirmed: true})
-  })
-
-  it('does not settle while a shell the ledger never heard of survives the kill, whatever the root did', async () => {
-    // #given — an empty ledger and a root that stops at once; only a stray shell ignores the DELETE
-    const server = makeServer({shellServer: {...RUNNING, deleteDoesNotKill: [SHELL]}})
-
-    // #when
-    const result = await settleOwnedSessionsV2({
-      client: server.client,
-      directory: DIR,
-      shellKillRounds: 1,
-      shellKillPollIntervalMs: 0,
-      rootSessionId: ROOT,
-      ledger: createOwnershipLedger(),
-      logger: makeLogger(),
-      confirmRootQuiescent: true,
-      streamTerminal: () => 'user',
-      rootPollIntervalMs: 1,
-    })
-
-    // #then — the shell is the reason; the DELETE was accepted, so its notice can wake the root as well
-    expect(result).toMatchObject({settled: false, rootUnconfirmed: true, shellsUnconfirmed: true})
-    expect(result.settled === false && result.reason.includes(SHELL)).toBe(true)
-  })
-
-  it('reports a stray shell it could not kill when the root is unconfirmed as well', async () => {
-    // #given — follow-up work is open, and the only shell is one the ledger never heard of
-    const server = makeServer({shellServer: {...RUNNING, deleteDoesNotKill: [SHELL]}})
-
-    // #when
-    const result = await settleOwnedSessionsV2({
-      client: server.client,
-      directory: DIR,
-      shellKillRounds: 1,
-      shellKillPollIntervalMs: 0,
-      rootSessionId: ROOT,
-      ledger: createOwnershipLedger(),
-      logger: makeLogger(),
-      confirmRootQuiescent: true,
-      followUpPossible: true,
-    })
+    const result = await settleAndWait(server, {ledger: ledgerWith(CHILD)})
 
     // #then
-    expect(result).toMatchObject({settled: false, rootUnconfirmed: true, shellsUnconfirmed: true})
+    const interrupted = server.interrupt.mock.calls.map(([input]) => input.sessionId)
+    expect(result).toEqual({settled: true})
+    expect(interrupted[0]).toBe(ROOT)
+    expect([...interrupted].sort()).toEqual([CHILD, GRAND, ROOT, 'ses_resumed'].sort())
   })
 
-  it('kills a shell of the root that the ledger never heard of, and leaves a stranger’s alone', async () => {
-    // #given — nothing adopted
+  it('does not touch a session active elsewhere on the server', async () => {
+    // #given
+    vi.useFakeTimers()
+    const server = makeServer({active: ['ses_elsewhere']})
+
+    // #when
+    const result = await settleAndWait(server)
+
+    // #then
+    expect(result).toEqual({settled: true})
+    expect(server.interrupt).not.toHaveBeenCalled()
+  })
+
+  it('deletes every running shell of the directory, owned or not, before it interrupts anything', async () => {
+    // #given — one owned, one untagged, one of a stranger: the directory is the run's
+    vi.useFakeTimers()
     const server = makeServer({
+      active: [ROOT],
       shellServer: {
         shells: {
-          [SHELL]: {status: 'running', owner: ROOT},
+          sh_owned: {status: 'running', owner: ROOT},
+          sh_untagged: {status: 'running', owner: null},
           sh_stranger: {status: 'running', owner: 'ses_stranger'},
         },
       },
     })
 
     // #when
-    const result = await settleOwnedSessionsV2({
-      client: server.client,
-      directory: DIR,
-      rootSessionId: ROOT,
-      ledger: createOwnershipLedger(),
-      logger: makeLogger(),
-      confirmRootQuiescent: true,
-      streamTerminal: () => 'user',
-      rootPollIntervalMs: 1,
-    })
+    const result = await settleAndWait(server)
 
-    // #then — the root's stray shell is handled and the stranger's left alone; the root is not confirmed
-    expect(result).toMatchObject({settled: false, rootUnconfirmed: true, followUpPossible: true})
-    expect(server.shellServer.deleteShell).toHaveBeenCalledTimes(1)
-    expect(server.shellServer.shells[SHELL]).toBeUndefined()
-    expect(server.shellServer.shells.sh_stranger).toBeDefined()
+    // #then — the DELETEs come first because each one wakes its owner, which the interrupt then stops
+    const log = server.shellServer.log
+    expect(result).toEqual({settled: true})
+    expect(server.shellServer.shells).toEqual({})
+    expect(log.indexOf('delete:sh_owned')).toBeLessThan(log.indexOf(`interrupt:${ROOT}`))
+    expect(log.indexOf('delete:sh_stranger')).toBeLessThan(log.indexOf(`interrupt:${ROOT}`))
   })
 
-  it('never treats a shell entry as a session to interrupt', async () => {
-    // #given
-    const server = makeServer({shellServer: RUNNING})
+  it('does not settle while a deleted shell’s wake keeps the root running, and gives up at the bound', async () => {
+    // #given — every interrupt is accepted and the root stays active
+    vi.useFakeTimers()
+    const server = makeServer({active: [ROOT], unstoppable: [ROOT]})
 
     // #when
-    await settleOwnedSessionsV2({
-      client: server.client,
-      directory: DIR,
-      rootSessionId: ROOT,
-      ledger: shellLedger(),
-      logger: makeLogger(),
-      confirmRootQuiescent: true,
-      followUpPossible: true,
-    })
+    const result = await settleAndWait(server, {timeoutMs: 2_000}, 3_000)
 
     // #then
-    expect(server.interrupt.mock.calls.map(([input]) => input.sessionId)).toEqual([ROOT])
+    expect(result).toMatchObject({settled: false})
+    expect(server.interrupt.mock.calls.length).toBeGreaterThan(2)
   })
 
-  it('reports shells unconfirmed on the bound, and settles nothing late', async () => {
-    // #given — the list never answers
+  it('does not settle, and does not end early, when a DELETE commits, its response is lost, and the root is woken', async () => {
+    // #given — the shell is gone from the list after the DELETE, so an empty list is all the barrier ever sees
     vi.useFakeTimers()
-    const ledger = shellLedger()
-    const server = makeServer({shellServer: RUNNING})
-    ;(
-      server.shellServer.listShells as unknown as {mockImplementation: (fn: () => Promise<never>) => void}
-    ).mockImplementation(async () => new Promise<never>(() => undefined))
+    const server = makeServer({
+      shellServer: {shells: {[SHELL]: {status: 'running', owner: ROOT}}, deleteLosesResponse: true},
+    })
+    const ledger = ledgerWith()
+
+    // #when — the DELETE's error notice wakes the root 120 ms in, inside the window
+    let resolved = false
+    const pending = settle(server, {ledger}).then(result => {
+      resolved = true
+      return result
+    })
+    await vi.advanceTimersByTimeAsync(20)
+    expect(server.shellServer.deleteShell).toHaveBeenCalled()
+    expect(server.shellServer.shells).toEqual({})
+    await vi.advanceTimersByTimeAsync(100)
+    server.active.add(ROOT)
+    await vi.advanceTimersByTimeAsync(60)
+
+    // #then — the wake is seen and stopped, and the window starts again from there
+    expect(server.interrupt).toHaveBeenCalledWith(expect.objectContaining({sessionId: ROOT}))
+    expect(resolved).toBe(false)
+    await vi.advanceTimersByTimeAsync(2_000)
+    expect(await pending).toEqual({settled: true})
+  })
+
+  it('reports unsettled when the wake after a lost-response DELETE never stops', async () => {
+    // #given
+    vi.useFakeTimers()
+    const server = makeServer({
+      unstoppable: [ROOT],
+      shellServer: {shells: {[SHELL]: {status: 'running', owner: ROOT}}, deleteLosesResponse: true},
+    })
+    const pending = settle(server, {timeoutMs: 2_000})
+    await vi.advanceTimersByTimeAsync(50)
+    server.active.add(ROOT)
+
+    // #when
+    await vi.advanceTimersByTimeAsync(3_000)
+
+    // #then
+    expect(await pending).toMatchObject({settled: false})
+  })
+
+  it('catches a notice whose wake was deferred inside the window: a queued inbox item holds the gate', async () => {
+    // #given — the root is idle with a notice enqueued; the wake starts 70 ms in
+    vi.useFakeTimers()
+    const server = makeServer({shellServer: {inbox: {[ROOT]: 1}}})
+    const pending = settle(server)
+
+    // #when
+    await vi.advanceTimersByTimeAsync(40)
+    delete server.shellServer.inbox[ROOT]
+    server.active.add(ROOT)
+    await vi.advanceTimersByTimeAsync(40)
+
+    // #then — the wake was seen as activity and the root interrupted, not released on an idle reading
+    expect(server.interrupt).toHaveBeenCalledWith(expect.objectContaining({sessionId: ROOT}))
+    await vi.advanceTimersByTimeAsync(2_000)
+    expect(await pending).toEqual({settled: true})
+  })
+
+  it('does not settle while a queued inbox item never drains', async () => {
+    // #given
+    vi.useFakeTimers()
+    const server = makeServer({shellServer: {inbox: {[CHILD]: 1}}, sessions: [ROOT, CHILD]})
+
+    // #when
+    const result = await settleAndWait(server, {timeoutMs: 1_000}, 2_000)
+
+    // #then
+    expect(result).toMatchObject({settled: false})
+  })
+
+  it('treats any read failure as not quiet, then settles once reads recover', async () => {
+    // #given — the shell list fails for the first three reads
+    vi.useFakeTimers()
+    const server = makeServer({shellServer: {listFailsOn: [1, 2, 3]}})
+
+    // #when
+    const pending = settle(server)
+    await vi.advanceTimersByTimeAsync(100)
+
+    // #then — three failed readings, none counted
+    expect(await Promise.race([pending, Promise.resolve('waiting' as const)])).toBe('waiting')
+    await vi.advanceTimersByTimeAsync(2_000)
+    expect(await pending).toEqual({settled: true})
+  })
+
+  it('does not settle when reads never succeed', async () => {
+    // #given
+    vi.useFakeTimers()
+    const server = makeServer({shellServer: {listFails: true}})
+
+    // #when
+    const result = await settleAndWait(server, {timeoutMs: 1_000}, 2_000)
+
+    // #then
+    expect(result).toMatchObject({settled: false})
+  })
+
+  it('does not settle when the active list cannot be read', async () => {
+    // #given
+    vi.useFakeTimers()
+    const server = makeServer({activeFails: true})
+
+    // #when
+    const result = await settleAndWait(server, {timeoutMs: 1_000}, 2_000)
+
+    // #then
+    expect(result).toMatchObject({settled: false})
+  })
+
+  it('still acts on what a partial reading showed: a running shell is deleted although the active list failed', async () => {
+    // #given
+    vi.useFakeTimers()
+    const server = makeServer({
+      activeFails: true,
+      shellServer: {shells: {[SHELL]: {status: 'running', owner: ROOT}}},
+    })
+
+    // #when
+    await settleAndWait(server, {timeoutMs: 500}, 1_000)
+
+    // #then
+    expect(server.shellServer.deleteShell).toHaveBeenCalledWith(expect.objectContaining({shellId: SHELL}))
+  })
+
+  it('keeps a shell that survives its DELETE counted as activity until it is gone', async () => {
+    // #given — the server accepts the DELETE and kills nothing
+    vi.useFakeTimers()
+    const server = makeServer({
+      shellServer: {shells: {[SHELL]: {status: 'running', owner: ROOT}}, deleteDoesNotKill: [SHELL]},
+    })
+
+    // #when
+    const result = await settleAndWait(server, {timeoutMs: 1_000}, 2_000)
+
+    // #then
+    expect(result).toMatchObject({settled: false})
+    expect(server.shellServer.deleteShell.mock.calls.length).toBeGreaterThan(1)
+  })
+
+  it('a shell that appears late in the window is deleted and restarts the window (the final-sweep case)', async () => {
+    // #given
+    vi.useFakeTimers()
+    const server = makeServer()
+    const pending = settle(server)
+
+    // #when — a shell starts after two readings
+    await vi.advanceTimersByTimeAsync(60)
+    server.shellServer.shells[SHELL] = {status: 'running', owner: ROOT}
+    await vi.advanceTimersByTimeAsync(60)
+
+    // #then
+    expect(server.shellServer.deleteShell).toHaveBeenCalledWith(expect.objectContaining({shellId: SHELL}))
+    await vi.advanceTimersByTimeAsync(2_000)
+    expect(await pending).toEqual({settled: true})
+  })
+
+  it('times out with a late shell that stalls the window: unsettled, ledger entries unknown', async () => {
+    // #given — the late shell never dies
+    vi.useFakeTimers()
+    const server = makeServer({shellServer: {deleteDoesNotKill: [SHELL]}})
+    const ledger = ledgerWith(CHILD)
+    const pending = settle(server, {ledger, timeoutMs: 1_000})
+    await vi.advanceTimersByTimeAsync(60)
+    server.shellServer.shells[SHELL] = {status: 'running', owner: ROOT}
+
+    // #when
+    await vi.advanceTimersByTimeAsync(2_000)
+
+    // #then
+    expect(await pending).toMatchObject({settled: false})
+    expect(ledger.snapshot().map(entry => entry.state)).toEqual(['unknown'])
+  })
+
+  it('settles every ledger entry on a pass, and marks them unknown on a failure', async () => {
+    // #given
+    vi.useFakeTimers()
+    const passLedger = ledgerWith(CHILD)
+    passLedger.adopt(shellLedgerKey(SHELL), 'background shell')
+    const failLedger = ledgerWith(CHILD)
+
+    // #when
+    const passed = await settleAndWait(makeServer(), {ledger: passLedger})
+    const failed = await settleAndWait(
+      makeServer({active: [ROOT], unstoppable: [ROOT]}),
+      {
+        ledger: failLedger,
+        timeoutMs: 500,
+      },
+      1_000,
+    )
+
+    // #then
+    expect(passed).toEqual({settled: true})
+    expect(passLedger.isDrainComplete()).toBe(true)
+    expect(failed).toMatchObject({settled: false})
+    expect(failLedger.snapshot().map(entry => entry.state)).toEqual(['unknown'])
+  })
+
+  it('names why it gave up', async () => {
+    // #given
+    vi.useFakeTimers()
+    const server = makeServer({active: [ROOT], unstoppable: [ROOT]})
+
+    // #when
+    const result = await settleAndWait(server, {timeoutMs: 500}, 1_000)
+
+    // #then
+    expect(result.settled === false && result.reason.length > 0).toBe(true)
+  })
+
+  it('bounds a barrier whose requests never answer', async () => {
+    // #given — every request hangs
+    vi.useFakeTimers()
+    const server = makeServer()
+    server.activeCalls.mockImplementation(async () => new Promise<never>(() => undefined))
+
+    // #when
+    const pending = settle(server, {timeoutMs: 1_000})
+    await vi.advanceTimersByTimeAsync(1_100)
+
+    // #then
+    expect(await pending).toMatchObject({settled: false})
+  })
+
+  it('does not let an abandoned attempt change the ledger after the bound has passed', async () => {
+    // #given
+    vi.useFakeTimers()
+    const server = makeServer()
+    server.activeCalls.mockImplementation(async () => new Promise<never>(() => undefined))
+    const ledger = ledgerWith(CHILD)
+
+    // #when
+    const pending = settle(server, {ledger, timeoutMs: 500})
+    await vi.advanceTimersByTimeAsync(600)
+    await pending
+
+    // #then
+    expect(ledger.snapshot().map(entry => entry.state)).toEqual(['unknown'])
+  })
+
+  it('uses the real window by default: eleven readings over five seconds', async () => {
+    // #given
+    vi.useFakeTimers()
+    const server = makeServer()
     const pending = settleOwnedSessionsV2({
       client: server.client,
       directory: DIR,
       rootSessionId: ROOT,
-      ledger,
+      ledger: createOwnershipLedger(),
+      runStartedAt: RUN_STARTED,
       logger: makeLogger(),
-      confirmRootQuiescent: true,
-      timeoutMs: 1_000,
     })
 
     // #when
-    await vi.advanceTimersByTimeAsync(1_001)
+    await vi.advanceTimersByTimeAsync(4_900)
+    const early = await Promise.race([pending, Promise.resolve('waiting' as const)])
+    await vi.advanceTimersByTimeAsync(200)
 
     // #then
-    await expect(pending).resolves.toMatchObject({settled: false, shellsUnconfirmed: true})
-    expect(stateOf(ledger)).toBe('unknown')
+    expect(early).toBe('waiting')
+    expect(await pending).toEqual({settled: true})
+    expect(DEFAULT_SETTLE_TIMEOUT_MS).toBeGreaterThan(5_000)
+  })
+
+  it('stamps the run id on its log lines', async () => {
+    // #given
+    vi.useFakeTimers()
+    const logger = makeLogger()
+    const server = makeServer({active: [ROOT], unstoppable: [ROOT]})
+
+    // #when
+    await settleAndWait(server, {logger, runId: 'run-9', timeoutMs: 300}, 600)
+
+    // #then
+    expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({runId: 'run-9'}), expect.any(String))
+  })
+
+  it('does not read the inbox of a session from an earlier run, so its queued item does not hold the stop', async () => {
+    // #given — a stored session from an hour before the run, with an item that was queued back then
+    const server = makeServer({oldSessions: ['ses_earlier'], shellServer: {shells: {}, inbox: {ses_earlier: 1}}})
+    vi.useFakeTimers()
+
+    // #when
+    const pending = settle(server)
+    await vi.advanceTimersByTimeAsync(5_000)
+    const result = await pending
+
+    // #then
+    expect(result).toEqual({settled: true})
+    expect(server.shellServer.listSessionInbox).not.toHaveBeenCalledWith(
+      expect.objectContaining({sessionId: 'ses_earlier'}),
+    )
+  })
+
+  it('reads the inbox of the root and of a ledger session, whatever their stored time', async () => {
+    // #given — the child is in the ledger, so it is owned
+    const server = makeServer({sessions: [ROOT, CHILD], shellServer: {shells: {}, inbox: {[CHILD]: 1}}})
+    vi.useFakeTimers()
+
+    // #when
+    const pending = settle(server, {ledger: ledgerWith(CHILD)})
+    await vi.advanceTimersByTimeAsync(100)
+    await vi.advanceTimersByTimeAsync(30_000)
+    const result = await pending
+
+    // #then — the queued item never clears, so the bound ends it unconfirmed
+    expect(result.settled).toBe(false)
+    expect(server.shellServer.listSessionInbox).toHaveBeenCalledWith(expect.objectContaining({sessionId: CHILD}))
   })
 })

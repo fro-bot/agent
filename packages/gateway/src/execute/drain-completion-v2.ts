@@ -8,36 +8,50 @@
  *
  * What differs is the evidence. V1 had to reconstruct the root's state from REST message lists. V2 publishes the root's
  * executions on the stream (`session.execution.started` / `succeeded`) and says when a queued inbox item enters a turn
- * (`session.inbox.delivered`), so the gate keeps that state itself and asks the server one thing: is the root in the
- * active list. Success is admitted only when ALL of these hold at one commit point:
+ * (`session.inbox.delivered`), so the gate keeps that state itself. Success is admitted only when ALL of these hold at one
+ * commit point:
  * - the ledger reports drain-complete (`unknown` still blocks, exactly as before);
- * - every ledger entry's notice was observed (a background shell is a ledger entry like a child: its notice wakes the root
- *   the same way). A cancelled child's notice counts: the notice is the server's own
- *   statement that the child ended, and a notice carries no model-forgeable text here (`readSubagentNotice` reads only
- *   metadata);
  * - every queued notice has been delivered into a root turn;
  * - the root idle evidence is current-generation: no root activity (an execution starting, text, a tool) and no new
  *   notice since the root's last `execution.succeeded`, which is how "idle after the last turn a notice triggered" reads
  *   on this stream;
  * - the active list shows the root is not live;
- * - no running shell of the location is tagged with the root or an owned session. The ledger only knows the shells whose
- *   creation frame arrived after their owner was adopted; the server's own list is read for the rest, so a shell the
- *   stream dropped still holds the drain open. A list that cannot be read admits nothing;
- * - the revision captured before that request still equals the current one.
+ * - the DIRECTORY has stayed quiet for the stability window (`directory-quiescence-v2.ts`): no session located in it is
+ *   active, no shell of it is running, no session of this run (the root, what it owns, and what was updated since it
+ *   began) has a queued inbox item, for 11 consecutive readings 500 ms apart.
+ *   This is what the run is released on. The ledger and the notices cannot prove that no producer is mid-way between
+ *   admitting a notice and waking its session, and a session an adopted child's shell wakes later is not on the stream
+ *   either; the directory shows both. So the gate does not wait for a notice per entity: a child or shell the ledger
+ *   settled is covered by the directory, whether or not its notice was seen. Activity does not fail the run: the gate keeps
+ *   reading until the directory is quiet or the run's deadline ends it;
+ * - the revision captured before that wait still equals the current one.
  *
- * No notice never admits: the run's hard deadline reports it incomplete. The stream is trusted as the run's own record:
- * a stream that is lost fails the run through the barrier, so a stream that is delivering is complete. That is why no
- * reply-delivery fence is needed: the follow-up turn's text arrives before its `execution.succeeded`.
+ * The reads happen BEFORE the commit point, like the liveness read, so the commit stays one synchronous block. Root
+ * activity or a new notice during the wait ends it and drops the readings taken so far: they described the old evidence.
+ *
+ * Whatever never becomes quiet never admits: the run's hard deadline reports it incomplete. The stream is trusted as the
+ * run's own record: a stream that is lost fails the run through the barrier, so a stream that is delivering is complete.
+ * That is why no reply-delivery fence is needed: the follow-up turn's text arrives before its `execution.succeeded`.
  *
  * Not a state machine framework: a revision counter, an idle stamp, the notices seen, and one validation in flight.
  */
 
-import type {Result} from '@bfra.me/es/result'
-import type {LedgerReconcileAdapter, OwnershipLedger, ShellNoticeState, SubagentNotice} from '@fro-bot/runtime'
+import type {
+  DirectoryStabilityGate,
+  LedgerReconcileAdapter,
+  OwnershipLedger,
+  ShellNoticeState,
+  SubagentNotice,
+} from '@fro-bot/runtime'
 import type {GatewayLogger} from '../discord/client.js'
 import type {DrainRejectCode} from './drain-completion.js'
 
-import {shellLedgerKey, toErrorMessage} from '@fro-bot/runtime'
+import {
+  awaitDirectoryStability,
+  DIRECTORY_QUIESCENCE_MIN_SPACING_MS,
+  shellLedgerKey,
+  toErrorMessage,
+} from '@fro-bot/runtime'
 import {DRAIN_REQUEST_TIMEOUT_MS, DRAIN_VALIDATION_INTERVAL_MS} from './drain-completion.js'
 
 type BoundedResult<T> = {readonly ok: true; readonly value: T} | {readonly ok: false}
@@ -48,11 +62,12 @@ export interface DrainCompletionV2Options {
   /** Global liveness: the V2 reconcile adapter's `liveSessionIds`. */
   readonly adapter: LedgerReconcileAdapter
   /**
-   * The running shells of the location tagged with the root or an owned session (`listOwnedRunningShells`, with the
-   * owner set read at call time). Read BEFORE the commit point like the liveness read, so the commit stays one
-   * synchronous block. Absent: no shell read, for a run that does not track shells.
+   * The directory's stability gate (`createDirectoryStabilityGate` over `observeDirectoryV2`). Read BEFORE the commit
+   * point; the gate's streak is dropped whenever the evidence it was waiting on changes.
    */
-  readonly ownedRunningShells?: (signal: AbortSignal) => Promise<Result<readonly string[], Error>>
+  readonly directoryGate: DirectoryStabilityGate
+  /** Time between directory readings. Defaults to `DIRECTORY_QUIESCENCE_MIN_SPACING_MS`. */
+  readonly directorySpacingMs?: number
   /** The run's combined signal: deadline, inactivity, cancel. Aborting it ends validation. */
   readonly signal: AbortSignal
   readonly logger: GatewayLogger
@@ -73,19 +88,16 @@ export interface DrainCompletionV2 {
    */
   readonly noteNotice: (notice: SubagentNotice, inboxId: string | null) => void
   /**
-   * A notice about `childSessionId` arrived and could not be read, so the child's end is unproven. The gate stops
-   * waiting for a readable notice from it and invalidates idle evidence; the ledger entry (the caller marks it
-   * `unknown`) is what still blocks admission until the child is seen to stop.
+   * A notice about a child or a shell arrived and could not be read. It invalidates idle evidence; the ledger entry (the
+   * caller marks it `unknown`) still blocks admission until it is seen to stop.
    */
-  readonly noteUnreadableNotice: (childSessionId: string) => void
+  readonly noteUnreadableNotice: () => void
   /**
    * A completion notice for one of the root's background shells, with the same meaning as `noteNotice`. A shell is
    * waited on exactly like a child: its notice wakes the root, so the first idle after it is not terminal. Deduped by
    * shell and state. Invalidates idle evidence.
    */
   readonly noteShellNotice: (shellId: string, state: ShellNoticeState, inboxId: string | null) => void
-  /** As `noteUnreadableNotice`, for a shell. The ledger entry (the caller marks it `unknown`) still blocks admission. */
-  readonly noteUnreadableShellNotice: (shellId: string) => void
   /** A queued inbox item entered a turn of an owned session. */
   readonly noteInboxDelivered: (inboxId: string) => void
   /** The root's execution succeeded: stamps the current revision, unless a notice is still queued. */
@@ -111,7 +123,8 @@ export function createDrainCompletionV2(options: DrainCompletionV2Options): Drai
     logger,
     onAdmitted,
     onNotAdmitted,
-    ownedRunningShells,
+    directoryGate,
+    directorySpacingMs = DIRECTORY_QUIESCENCE_MIN_SPACING_MS,
     validationIntervalMs = DRAIN_VALIDATION_INTERVAL_MS,
     requestTimeoutMs = DRAIN_REQUEST_TIMEOUT_MS,
   } = options
@@ -128,7 +141,6 @@ export function createDrainCompletionV2(options: DrainCompletionV2Options): Drai
   let revision = 0
   let idleRevision: number | null = null
   const notices = new Map<string, NoticeRecord>()
-  const noticedChildren = new Set<string>()
 
   function invalidate(): void {
     revision += 1
@@ -146,7 +158,7 @@ export function createDrainCompletionV2(options: DrainCompletionV2Options): Drai
     invalidate()
   }
 
-  // Notices and fences are keyed by ledger key, so a child and a shell can never stand in for each other.
+  // Notices are keyed by ledger key, so a child and a shell can never stand in for each other.
   function recordNotice(ledgerKey: string, state: string, inboxId: string | null): void {
     if (closed) return
     const key = `${ledgerKey}:${state}`
@@ -158,7 +170,6 @@ export function createDrainCompletionV2(options: DrainCompletionV2Options): Drai
     } else if (existing.inboxId === null && inboxId !== null && !existing.delivered) {
       existing.inboxId = inboxId
     }
-    noticedChildren.add(ledgerKey)
     requestValidation()
   }
 
@@ -170,19 +181,10 @@ export function createDrainCompletionV2(options: DrainCompletionV2Options): Drai
     recordNotice(shellLedgerKey(shellId), state, inboxId)
   }
 
-  function fenceUnreadable(ledgerKey: string): void {
+  function noteUnreadableNotice(): void {
     if (closed) return
     invalidate()
-    noticedChildren.add(ledgerKey)
     requestValidation()
-  }
-
-  function noteUnreadableNotice(childSessionId: string): void {
-    fenceUnreadable(childSessionId)
-  }
-
-  function noteUnreadableShellNotice(shellId: string): void {
-    fenceUnreadable(shellLedgerKey(shellId))
   }
 
   function noteInboxDelivered(inboxId: string): void {
@@ -243,14 +245,6 @@ export function createDrainCompletionV2(options: DrainCompletionV2Options): Drai
     return result.value.data.has(rootSessionId)
   }
 
-  /** The owned running shells, or `null` when they cannot be told. No `ownedRunningShells`: none. */
-  async function runningShells(): Promise<readonly string[] | null> {
-    if (ownedRunningShells === undefined) return []
-    const result = await bounded(async requestSignal => ownedRunningShells(requestSignal))
-    if (!result.ok || !result.value.success) return null
-    return result.value.data
-  }
-
   function reject(reason: DrainRejectCode, context: Record<string, unknown> = {}): void {
     logger.debug({sessionId: rootSessionId, reason, ...context}, 'run-core: drain completion not admitted')
     onNotAdmitted?.(reason)
@@ -266,17 +260,44 @@ export function createDrainCompletionV2(options: DrainCompletionV2Options): Drai
     if (live === null) return reject('root-liveness-unavailable')
     if (live) return reject('root-live')
 
-    // Read here, before the commit point: nothing may be awaited after it.
-    const shells = await runningShells()
+    // Wait for the directory to stay quiet. Read here, before the commit point: nothing may be awaited after it. The
+    // wait ends early if the evidence it is for changes, and its readings are dropped with it.
+    const waitController = new AbortController()
+    const abortWait = (): void => waitController.abort()
+    signal.addEventListener('abort', abortWait, {once: true})
+    lifecycle.signal.addEventListener('abort', abortWait, {once: true})
+    let stable: Awaited<ReturnType<typeof awaitDirectoryStability>>
+    try {
+      stable = await awaitDirectoryStability({
+        gate: directoryGate,
+        signal: waitController.signal,
+        spacingMs: directorySpacingMs,
+        shouldContinue: () =>
+          !closed &&
+          !signal.aborted &&
+          revision === requestedRevision &&
+          idleRevision === revision &&
+          ledger.isDrainComplete(),
+        onObservation: state => {
+          // Why the run has not finished yet, for the operator status.
+          if (state.last?.kind === 'unreadable') reject('root-liveness-unavailable', {read: state.last.reason})
+          else if (!state.passed) {
+            reject('ledger-not-drained', {
+              directory: state.last?.kind === 'active' ? state.last.activity : 'quiet',
+              quietReadings: state.streak,
+            })
+          }
+        },
+      })
+    } finally {
+      signal.removeEventListener('abort', abortWait)
+      lifecycle.signal.removeEventListener('abort', abortWait)
+    }
     if (closed || signal.aborted) return
-    if (shells === null) return reject('root-liveness-unavailable', {read: 'shells'})
-    if (shells.length > 0) return reject('ledger-not-drained', {runningShells: shells})
-
-    const unfenced = ledger
-      .snapshot()
-      .map(entry => entry.sessionId)
-      .filter(id => !noticedChildren.has(id))
-    if (unfenced.length > 0) return reject('notice-not-observed', {children: unfenced})
+    if (!stable.passed) {
+      if (revision !== requestedRevision) return reject('revision-drift')
+      return reject('idle-evidence-stale')
+    }
 
     // Commit point — nothing awaited between here and `onAdmitted`.
     if (revision !== requestedRevision) return reject('revision-drift')
@@ -333,7 +354,6 @@ export function createDrainCompletionV2(options: DrainCompletionV2Options): Drai
     noteNotice,
     noteUnreadableNotice,
     noteShellNotice,
-    noteUnreadableShellNotice,
     noteInboxDelivered,
     noteRootIdle,
     beginDrain,

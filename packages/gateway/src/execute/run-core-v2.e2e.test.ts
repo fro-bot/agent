@@ -358,10 +358,11 @@ describe.skipIf(!hasBinary)('runOpenCodeCoreV2 against the real OpenCode v2.2.0 
     )
     clearTimeout(deadline)
 
-    // #then — a drain that ran out of time, quarantined (the kill's notice wakes the root), and the job is gone
+    // #then — a drain that ran out of time. The kill's error notice woke the root; the stop interrupted it and the
+    // directory then stayed quiet for the whole window, so the stop is confirmed and the run is not quarantined.
     expect(outcome).toBeInstanceOf(RunCoreError)
     expect((outcome as RunCoreError).kind).toBe('drain-timeout')
-    expect((outcome as RunCoreError).quarantined).toBe(true)
+    expect((outcome as RunCoreError).quarantined).toBe(false)
     expect(await stock.client.listShells({directory: stock.repo})).toEqual({success: true, data: []})
 
     // #when — long enough for the job to have finished had it been left alone

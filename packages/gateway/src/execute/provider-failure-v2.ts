@@ -7,6 +7,9 @@
  * upstream fields but NEVER returns them: every result is a closed, fixed `reason`. The error `type` and `message` are
  * provider- or plugin-controlled, so the logged error name is always `unknown`, never the upstream string.
  *
+ * The error `type` is the structured evidence for auth: `provider.auth` is mapped onto the classifier's `ProviderAuthError`
+ * name whatever the provider's message says. Every other type is passed on unchanged and judged by the shared rules.
+ *
  * A retry (`session.retry.scheduled`) is never a failure here. V1 stopped on a retry only when the structured
  * `action.reason` said the model could never be served. The V2 retry event carries the retried error and no such
  * action, and the message of a retried (often 5xx) failure is not evidence the retry is hopeless, so the loop keeps
@@ -33,11 +36,15 @@ function toReason(kind: ProviderFailureKind): ProviderFailureReason {
   }
 }
 
+/** The V2 error type the server uses for a rejected credential (`to-session-error.ts`: `providerError("provider.auth")`). */
+const V2_PROVIDER_AUTH_TYPE = 'provider.auth'
+const PROVIDER_AUTH_NAME = 'ProviderAuthError'
+
 /** Label a V2 execution failure. Total: an unrecognized error still yields a fixed reason. */
 export function failureFromV2Error(error: V2ErrorInfo): ProviderFailure {
   const classification = classifyProviderFailure(
     terminalSignalFromPayload({
-      name: error.type,
+      name: error.type === V2_PROVIDER_AUTH_TYPE ? PROVIDER_AUTH_NAME : error.type,
       message: error.message,
       ...(error.status === null ? {} : {status: error.status}),
     }),

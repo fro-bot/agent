@@ -12,16 +12,21 @@
  *   frames to a small domain union; this loop never reads a raw event name.
  * - Completion. There is no `session.idle`. A root that finished a turn is `session.execution.succeeded`, a failed one
  *   `execution.failed`, a stopped one `execution.interrupted` with a reason.
- * - Stop. `interrupt` replies `{interrupted: false}` for an idle session AND for a prompt not admitted yet, so it is a
- *   delivery receipt, never a stop. A stop is confirmed in `root-stop-v2.ts` by an ended execution plus absence from the
- *   active list, and never by an interrupt with reason `shutdown`.
+ * - Release. Stock v2.2.0 cannot prove that nothing the run started can still wake one of its sessions (`interrupt` is a
+ *   delivery receipt, a shell DELETE wakes its owner, a notice is admitted and its wake started in separate steps). So
+ *   the run is released on the DIRECTORY, not on its own accounting: only after no session of the directory is active, no
+ *   shell of it is running and no session of it has a queued inbox item, for 11 readings over 5 s
+ *   (`directory-quiescence-v2.ts`). Success waits for that in the drain gate; a stop waits for it in
+ *   `settle-owned-sessions-v2.ts` after killing and interrupting whatever the directory shows. The ledger and the
+ *   notices stay for ownership, approvals, event routing and progress; they no longer decide a release.
  * - Code Mode. Plugin and MCP tools run inside one `execute` call, so a tool line comes from the calls listed in the
  *   call's `metadata.toolCalls[]`, not from the wrapper. `shell`, `read`, `edit`, `question` and `subagent` are direct
  *   tools. A nested approval is its own request, keyed by request id, never by the `execute` call id.
  * - Questions. The `question` tool asks a form; a reply is a form reply and a reject is a form cancel. Any other form
  *   kind is cancelled with a visible notice, since nobody can fill it in here.
  * - Reasoning. It has its own events and carries no text into this loop, so it cannot reach the reply.
- * - A session move. The outside-checkout rules re-base on the destination, so a moved owned session fails the run.
+ * - A session move. The outside-checkout rules re-base on the destination, so a moved owned session fails the run. It
+ *   always quarantines too: the destination's shells and sessions cannot be read from the directory this run reads.
  *
  * Everything else is parity with V1 and is commented where it lives: the termination barrier and its quarantine, the
  * cold-abort rule (#1958), the silence watchdog, eager subscribe, bounded and guarded reconcile passes, the drain gate
@@ -29,6 +34,7 @@
  */
 
 import type {
+  DirectoryStabilityTuning,
   OwnershipLedger,
   ReconcileLedgerOptions,
   RemoteOpenCodeV2Client,
@@ -44,25 +50,24 @@ import type {DrainCompletionV2} from './drain-completion-v2.js'
 import type {ExtractedToolPart} from './format-part.js'
 import type {ProviderFailure, ProviderFailureReason} from './provider-failure.js'
 import type {FormDirectoryV2} from './question-client-v2.js'
-import type {StreamTerminal} from './root-stop-v2.js'
 import type {CoreStreamSink, RunCoreErrorKind} from './run-core.js'
 import {
-  collectOwnerSessionIds,
+  createDirectoryStabilityGate,
   createInactivityTimer,
   createLedgerReconciler,
   createOwnershipLedger,
   createV2LedgerReconcileAdapter,
   isShellLedgerKey,
-  listOwnedRunningShells,
   mapV2Event,
   mapV2EventStream,
+  observeDirectoryV2,
+  ownedSessionIdsOf,
   readBackgroundDispatch,
   readBackgroundShellDispatch,
   readToolShellId,
   reconcileShellsOnce,
   settleLedgerFromShellNotice,
   settleLedgerFromSubagentNotice,
-  shellIdFromLedgerKey,
   shellLedgerKey,
   toErrorMessage,
 } from '@fro-bot/runtime'
@@ -73,7 +78,7 @@ import {formatToolPart} from './format-part.js'
 import {reconcileLivePass} from './live-reconcile.js'
 import {failureFromV2Error} from './provider-failure-v2.js'
 import {createFormDirectoryV2} from './question-client-v2.js'
-import {startQuarantineRootWatchV2} from './root-stop-v2.js'
+import {startQuarantineWatchV2} from './root-stop-v2.js'
 import {
   awaitFirstEvent,
   EVENT_STREAM_CONNECT_TIMEOUT_MS,
@@ -150,6 +155,8 @@ export interface RunCoreV2Params {
     readonly rootSessionId: string
     readonly ownedSessionIds: readonly string[]
   }) => void
+  /** Overrides the directory stability window of the drain gate and the barrier — for tests only. */
+  readonly directoryStability?: DirectoryStabilityTuning
 }
 
 // ---------------------------------------------------------------------------
@@ -245,10 +252,14 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
     onBusy,
     inactivityTimeoutMs,
     streamSilenceTimeoutMs,
-    ownershipLedger,
+    ownershipLedger: providedLedger,
     onOwnershipChange,
+    directoryStability,
   } = params
   const forms = params.forms ?? createFormDirectoryV2()
+  // Which sessions' inboxes a directory reading reads: those updated since the run began (less a margin), the root and
+  // what the run owns. Taken before anything is created, so the root counts.
+  const runStartedAt = Date.now()
 
   // ── 0. Mode/coordinator pre-flight ────────────────────────────────────────
   // approval-required is the only supported mode and it needs a coordinator before any session or prompt exists.
@@ -335,8 +346,10 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
   // child is non-live, which the server does BEFORE the parent's follow-up turn, so the ledger alone is not completion.
   let drainCompletion: DrainCompletionV2 | undefined
 
+  // A run without a caller-supplied ledger still keeps one: every success goes through the drain gate.
+  const ownershipLedger = providedLedger ?? createOwnershipLedger()
+
   function persistOwnership(): void {
-    if (ownershipLedger === undefined) return
     // Sessions only: recovery reads these as session ids, and a background shell is not one.
     const ownedSessionIds = ownershipLedger
       .snapshot()
@@ -350,45 +363,32 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
   const noticedChildIds = new Set<string>()
   // The same for background shells, by shell id.
   const noticedShellIds = new Set<string>()
-  // Ledger keys whose notice could not be read: the server did send one, so it is accounted for (and fenced `unknown`).
-  const fencedLedgerKeys = new Set<string>()
 
-  /**
-   * Whether the server's completion notice for a ledger entry has been seen (or fenced as unreadable). Until it has, the
-   * entry can still wake the root, whatever the ledger says: reconciliation can settle an entry from the server's
-   * answer while its notice is in flight.
-   */
-  function noticeAccountedFor(key: string): boolean {
-    if (fencedLedgerKeys.has(key)) return true
-    return isShellLedgerKey(key) ? noticedShellIds.has(shellIdFromLedgerKey(key)) : noticedChildIds.has(key)
-  }
+  const ledger: OwnershipLedger = wrapLedgerWithHooks(
+    ownershipLedger,
+    () => {
+      persistOwnership()
+      drainCompletion?.requestValidation()
+    },
+    // The single place a directly observed dispatch reaches the coordinator, so its events and approvals route
+    // from the moment it is adopted. Reconciliation never adopts. A background shell is not a session: it has
+    // no events or approvals of its own to route.
+    adoptedKey => {
+      if (!isShellLedgerKey(adoptedKey)) ownershipCoordinator.addOwnedSession(adoptedKey)
+    },
+  )
 
-  const ledger: OwnershipLedger | undefined =
-    ownershipLedger === undefined
-      ? undefined
-      : wrapLedgerWithHooks(
-          ownershipLedger,
-          () => {
-            persistOwnership()
-            drainCompletion?.requestValidation()
-          },
-          // The single place a directly observed dispatch reaches the coordinator, so its events and approvals route
-          // from the moment it is adopted. Reconciliation never adopts. A background shell is not a session: it has
-          // no events or approvals of its own to route.
-          adoptedKey => {
-            if (!isShellLedgerKey(adoptedKey)) ownershipCoordinator.addOwnedSession(adoptedKey)
-          },
-        )
-
-  const reconcileAdapter = ledger === undefined ? undefined : createV2LedgerReconcileAdapter(client.session)
-  const runtimeLogger = ledger === undefined ? undefined : toRuntimeLogger(logger)
+  const reconcileAdapter = createV2LedgerReconcileAdapter(client.session)
+  const runtimeLogger = toRuntimeLogger(logger)
   // Live reconcile passes (the periodic tick and the one-shot on root idle) are bounded and write through a guarded
   // ledger. Once the run tears down or leaves the loop, settle owns the ledger and a pass still in flight is inert.
   let liveReconcileClosed = false
-  const liveReconcileOptions =
-    ledger === undefined || reconcileAdapter === undefined || runtimeLogger === undefined
-      ? undefined
-      : {ledger, adapter: reconcileAdapter, parentSessionId: sessionId, logger: runtimeLogger}
+  const liveReconcileOptions = {
+    ledger,
+    adapter: reconcileAdapter,
+    parentSessionId: sessionId,
+    logger: runtimeLogger,
+  }
   // The shell entries get their own pass: sessions are asked about through the session API, shells through the shell
   // routes, and a failing or slow one must not hold the other back.
   async function reconcileShellPass(passOptions: ReconcileLedgerOptions): Promise<unknown> {
@@ -408,162 +408,121 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
     ])
   }
 
-  const reconciler =
-    liveReconcileOptions === undefined
-      ? undefined
-      : createLedgerReconciler({
-          ...liveReconcileOptions,
-          runPass: async () => runLivePasses(liveReconcileOptions),
-        })
+  const reconciler = createLedgerReconciler({
+    ...liveReconcileOptions,
+    runPass: async () => runLivePasses(liveReconcileOptions),
+  })
 
-  if (ledger !== undefined && reconcileAdapter !== undefined) {
-    drainCompletion = createDrainCompletionV2({
-      rootSessionId: sessionId,
-      ledger,
-      adapter: reconcileAdapter,
-      // The shells the server lists for the location tagged with the root or an owned session, read at the commit point:
-      // the ledger only knows a shell whose creation frame arrived after its owner was adopted.
-      ownedRunningShells: async signal =>
-        listOwnedRunningShells({
-          api: client,
+  const drain = createDrainCompletionV2({
+    rootSessionId: sessionId,
+    ledger,
+    adapter: reconcileAdapter,
+    // What lets the run go: the directory staying quiet for the window. Every success waits for it, whatever the ledger
+    // holds.
+    directoryGate: createDirectoryStabilityGate({
+      ...directoryStability,
+      observe: async signal =>
+        observeDirectoryV2({
+          client,
           directory,
-          ownerSessionIds: collectOwnerSessionIds(sessionId, ledger),
           signal,
+          inbox: {runStartedAt, ownedSessionIds: () => ownedSessionIdsOf(sessionId, ledger)},
         }),
-      signal: combinedSignal,
-      logger,
-      // The only path that completes a drain: an admitted validation unblocks the stream.
-      onAdmitted: () => {
-        drainDoneController.abort()
-      },
-      // Why the gate has not admitted the run yet, for the operator status (in-process only, cleared on every exit).
-      onNotAdmitted: code => {
-        if (runId !== undefined) setWaitReason(runId, code)
-      },
-    })
-  }
+    }),
+    ...(directoryStability?.minSpacingMs === undefined ? {} : {directorySpacingMs: directoryStability.minSpacingMs}),
+    signal: combinedSignal,
+    logger,
+    // The only path that completes a drain: an admitted validation unblocks the stream.
+    onAdmitted: () => {
+      drainDoneController.abort()
+    },
+    // Why the gate has not admitted the run yet, for the operator status (in-process only, cleared on every exit).
+    onNotAdmitted: code => {
+      if (runId !== undefined) setWaitReason(runId, code)
+    },
+  })
+  drainCompletion = drain
 
   // ── 1d. Termination barrier ─────────────────────────────────────────────────
-  // Every RunCoreError thrown from here on goes through `throwWithBarrier`: it settles the owned sessions and, where
-  // the root may still be executing, interrupts the root and confirms it stopped, BEFORE the causal error escapes to
-  // `run.ts`. `run.ts` must never stop the heartbeat, release the lock or hand off the slot while a sibling of the
-  // failed session is alive and writing. If settlement cannot be confirmed within its bound, the SAME kind and message
-  // re-throw with `quarantined: true`. Pass-through (zero remote calls) when nothing unsettled is owned.
+  // Every RunCoreError thrown once the session exists goes through `throwWithBarrier`: it kills and interrupts whatever
+  // the run's directory shows and waits for the directory to stay quiet, BEFORE the causal error escapes to `run.ts`.
+  // `run.ts` must never stop the heartbeat, release the lock or hand off the slot while a session or shell of the
+  // directory can still write. If the directory cannot be confirmed quiet within the barrier's bound, the SAME kind and
+  // message re-throw with `quarantined: true` and the quarantine watch keeps stopping the directory for the whole hold.
   //
-  // The prompt is admitted into server scope, so closing the stream or giving up on the run does not stop it: only
-  // an interrupt does. A stop where the root may still be executing (`rootMayBeRunning`: the wall-clock or inactivity
-  // deadline, a stream that ended, a signal after the prompt was sent, an operator cancel) must therefore interrupt the
-  // root and confirm it before the run releases its lock and slot, even with an empty ledger. A failure where the root
-  // has already halted (a terminal provider error, a rejected prompt) and a clean completion keep the fast path.
-  //
-  // Follow-up window: after background work settles, the server starts a parent turn to take the notices in, which may
-  // be writing to the checkout again. A failure there takes the same root teardown.
+  // There is no fast path for "the root has already halted" or "nothing is adopted": the prompt is admitted into server
+  // scope, a shell's DELETE wakes its owner, a notice wakes its session in a step the stream does not show, and none of
+  // that is visible in the ledger. Only a failure before the session exists (nothing to stop) skips it.
   const streamController = new AbortController()
-
-  // How the root's latest execution ended on the stream, as the loop saw it. Cleared when a new execution starts.
-  let rootTerminal: StreamTerminal | null = null
 
   async function throwWithBarrier(
     kind: RunCoreErrorKind,
     message: string,
     options: {
-      readonly rootMayBeRunning?: boolean
-      /** The root can be woken from somewhere this run cannot see, so it is never confirmed stopped. */
-      readonly neverConfirm?: boolean
       readonly providerFailureReason?: ProviderFailureReason
       readonly cause?: unknown
+      /** Quarantine whatever the barrier finds: the run cannot read where the work went (a moved session). */
+      readonly alwaysQuarantine?: boolean
     } = {},
   ): Promise<never> {
-    const {rootMayBeRunning = false, neverConfirm = false, providerFailureReason, cause} = options
+    const {providerFailureReason, cause, alwaysQuarantine = false} = options
     // Fail-close the human waits FIRST: the barrier can take up to 15 s, and until the waits are settled an `always`
     // press could still persist a permission rule. Neither call is awaited; their replies are bounded by their own
-    // timeouts and must not delay the root interrupt.
+    // timeouts and must not delay the stop.
     ownershipCoordinator.dispose('run ended')
     // eslint-disable-next-line no-void
     void questions?.dispose('run ended')
     // The run is over: close the event connection with it, whichever path got here.
     streamController.abort()
     liveReconcileClosed = true
-    reconciler?.dispose()
-    drainCompletion?.dispose()
-    // Adopted background work keeps a successor root turn possible even after the root halted: settling cancels the
-    // children, each cancel delivers a notice, and the coordinator starts a root turn for it whatever way the last one
-    // ended.
-    const hasAdoptedWork = ledger !== undefined && ledger.snapshot().length > 0
-    const rootFollowUpOpen =
-      rootMayBeRunning ||
-      neverConfirm ||
-      hasAdoptedWork ||
-      (drainCompletion !== undefined && draining && !drainDoneController.signal.aborted)
-    const barrierLedger = ledger ?? (rootMayBeRunning ? createOwnershipLedger() : undefined)
-    if (barrierLedger === undefined || (barrierLedger.isDrainComplete() && !rootFollowUpOpen)) {
-      throw new RunCoreError(kind, message, false, providerFailureReason, cause)
-    }
-    // Background work can start root turns by itself, so nothing seen so far rules out a turn that is not on the stream
-    // yet. An entry is open until its notice (or its fence) has been seen, not until the ledger settles it:
-    // reconciliation can settle an entry from the server's answer while the notice that wakes the root is in flight.
-    // Read before settlement, which itself cancels children and so can trigger notices.
-    const followUpPossible =
-      rootFollowUpOpen &&
-      (neverConfirm ||
-        barrierLedger.snapshot().some(entry => entry.state !== 'settled' || !noticeAccountedFor(entry.sessionId)) ||
-        (drainCompletion !== undefined && draining && !drainDoneController.signal.aborted))
+    reconciler.dispose()
+    drain.dispose()
     const settlement = await settleOwnedSessionsV2({
       client,
       directory,
       rootSessionId: sessionId,
-      ledger: barrierLedger,
+      ledger,
+      runStartedAt,
       logger,
       ...(runId === undefined ? {} : {runId}),
-      ...(rootFollowUpOpen ? {confirmRootQuiescent: true} : {}),
-      ...(followUpPossible ? {followUpPossible: true} : {}),
-      streamTerminal: () => rootTerminal,
+      ...(directoryStability === undefined ? {} : {stability: directoryStability}),
     })
-    if (settlement.settled) {
+    if (settlement.settled && !alwaysQuarantine) {
       throw new RunCoreError(kind, message, false, providerFailureReason, cause)
     }
-    // A root the barrier could not confirm stopped may still be preparing a prompt (an interrupt sent before the
-    // execution is admitted does nothing). Keep probing it for the quarantine hold, interrupting it whenever it shows
-    // up busy.
-    if (settlement.rootUnconfirmed || settlement.shellsUnconfirmed) {
-      startQuarantineRootWatchV2({
-        client,
-        adapter: createV2LedgerReconcileAdapter(client.session),
-        rootSessionId: sessionId,
-        // The watch keeps killing owned shells it finds running: a DELETEd shell's notice wakes its owner, and a shell
-        // that survived the barrier's kill must not outlive the hold.
-        shells: {
-          api: client,
-          directory,
-          ownerSessionIds: collectOwnerSessionIds(sessionId, barrierLedger),
-          ledger: barrierLedger,
-        },
-        streamTerminal: () => rootTerminal,
-        // A shell the barrier deleted wakes the root too, which the pre-barrier reading could not know.
-        ...(followUpPossible || settlement.followUpPossible ? {followUpPossible: true} : {}),
-        logger,
-        ...(runId === undefined ? {} : {runId}),
-      })
-    }
+    // The directory could not be confirmed quiet (or must not be trusted to be): a paused producer can still wake a
+    // session. Keep stopping whatever shows up for the whole hold.
+    startQuarantineWatchV2({
+      client,
+      directory,
+      rootSessionId: sessionId,
+      logger,
+      ...(runId === undefined ? {} : {runId}),
+    })
     logger.error(
-      {...(runId === undefined ? {} : {runId}), sessionId, kind, detail: settlement.reason},
-      'run-core: owned work could not be confirmed settled before this failure — quarantining run',
+      {
+        ...(runId === undefined ? {} : {runId}),
+        sessionId,
+        kind,
+        detail: settlement.settled ? 'forced' : settlement.reason,
+      },
+      'run-core: the run’s directory could not be confirmed quiet before this failure — quarantining run',
     )
     throw new RunCoreError(kind, message, true, providerFailureReason, cause)
   }
 
   // Fails the run on a provider rejection the server will not recover from (#1836). Reuses `session-error`: a new
   // operator failure kind would be a contract change. Only the fixed `reason` leaves the classifier; the provider's own
-  // message is never logged or placed in the error. `rootMayBeRunning` only when the root may not have halted.
-  async function failFromProvider(failure: ProviderFailure, source: string, rootMayBeRunning = false): Promise<never> {
+  // message is never logged or placed in the error.
+  async function failFromProvider(failure: ProviderFailure, source: string, alwaysQuarantine = false): Promise<never> {
     logger.error(
       {sessionId, source, errorName: failure.errorName, reason: failure.reason},
       'run-core: provider rejected the request — failing run',
     )
     clearInactivity()
     throw await throwWithBarrier('session-error', `Provider failure: ${failure.reason}`, {
-      rootMayBeRunning,
       providerFailureReason: failure.reason,
+      alwaysQuarantine,
     })
   }
 
@@ -642,9 +601,7 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
         // running, not an unreachable server.
         clearInactivity()
         logger.warn({sessionId, detail}, 'run-core: signal aborted while sending the prompt')
-        throw await throwWithBarrier('timeout', 'Run timed out: signal aborted while sending the prompt', {
-          rootMayBeRunning: true,
-        })
+        throw await throwWithBarrier('timeout', 'Run timed out: signal aborted while sending the prompt')
       }
       if (prompted.error.kind === 'auth') {
         logger.error({sessionId, detail: 'prompt 401'}, 'run-core: workspace proxy rejected bearer token')
@@ -666,9 +623,7 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
     if (combinedSignal.aborted) {
       clearInactivity()
       logger.warn({sessionId, detail: message}, 'run-core: signal aborted while sending the prompt')
-      throw await throwWithBarrier('timeout', 'Run timed out: signal aborted while sending the prompt', {
-        rootMayBeRunning: true,
-      })
+      throw await throwWithBarrier('timeout', 'Run timed out: signal aborted while sending the prompt')
     }
     logger.error({sessionId, detail: message}, 'run-core: prompt threw (server unreachable?)')
     throw await throwWithBarrier('unreachable', `Prompt threw: ${message}`)
@@ -678,9 +633,7 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
   if (combinedSignal.aborted) {
     clearInactivity()
     logger.warn({sessionId}, 'run-core: signal aborted after prompt send')
-    throw await throwWithBarrier('timeout', 'Run timed out: signal aborted after prompt send', {
-      rootMayBeRunning: true,
-    })
+    throw await throwWithBarrier('timeout', 'Run timed out: signal aborted after prompt send')
   }
 
   // ── 4. Consume event stream ────────────────────────────────────────────────
@@ -757,7 +710,7 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
   /** Real run activity on an owned session: re-arms the watchdog, and invalidates the drain gate's idle evidence. */
   function noteActivity(eventSessionId: string): void {
     markActivity()
-    if (eventSessionId === sessionId) drainCompletion?.noteRootActivity()
+    if (eventSessionId === sessionId) drain.noteRootActivity()
   }
 
   function cancelUnanswerableForm(formId: string, formSessionId: string, message: string): void {
@@ -790,7 +743,6 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
    * tool call returns `running`. A notice that preceded the adoption settles it at once.
    */
   function adoptShell(shellId: string, source: 'shell-created' | 'tool-result'): void {
-    if (ledger === undefined) return
     const key = shellLedgerKey(shellId)
     const fresh = !ledger.isTracked(key)
     // The command is model-controlled text and stays out of the ledger label and the logs.
@@ -810,11 +762,7 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
   // abort signal also includes `drainDoneController.signal`, so the loop unblocks the instant the gate admits.
   const abortableStream = makeAbortableStream(
     eventStream,
-    AbortSignal.any([
-      combinedSignal,
-      ...(ledger === undefined ? [] : [drainDoneController.signal]),
-      silenceTimer.signal,
-    ]),
+    AbortSignal.any([combinedSignal, drainDoneController.signal, silenceTimer.signal]),
   )
 
   // Any frame, heartbeats included, proves the stream is alive. Before type dispatch, so no branch can skip it.
@@ -884,7 +832,6 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
             throw await throwWithBarrier(
               'stream-ended',
               'Event stream was replaced (a second server.connected arrived)',
-              {rootMayBeRunning: true},
             )
           }
           break
@@ -956,8 +903,8 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
             // Background dispatch observed: a `subagent` call that finished successfully with running metadata. Adopt
             // the child; the wrapped ledger's `onAdopted` hook registers it with the coordinator. This is the ONLY
             // path that calls `ledger.adopt` — reconciliation never adopts an untracked session.
-            const dispatch = ledger === undefined ? null : readBackgroundDispatch(name, event)
-            if (ledger !== undefined && dispatch !== null) {
+            const dispatch = readBackgroundDispatch(name, event)
+            if (dispatch !== null) {
               const description = info?.input?.description
               const label = typeof description === 'string' && description.length > 0 ? description : 'background task'
               ledger.adopt(dispatch.childSessionId, label)
@@ -967,7 +914,7 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
                 'run-core: background dispatch observed -- adopted into ownership ledger',
               )
             }
-            if (ledger !== undefined && name === 'shell') {
+            if (name === 'shell') {
               // A shell is adopted when it is created, before anyone knows whether it will outlive its call. Only a
               // call that returns `running` did: it sends a notice and wakes its owner. A call that ended any other
               // way ran in the foreground and is over, so its entry would wait for a notice that never comes.
@@ -1128,8 +1075,8 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
           if (!isOwnedSession(event.sessionId)) break
           noticedChildIds.add(event.notice.childSessionId)
           // The gate hears it first: the notice must be registered before the settle can ask it to validate.
-          drainCompletion?.noteNotice(event.notice, event.inboxId)
-          if (ledger !== undefined) settleLedgerFromSubagentNotice(ledger, event.notice)
+          drain.noteNotice(event.notice, event.inboxId)
+          settleLedgerFromSubagentNotice(ledger, event.notice)
           markActivity()
           logger.info(
             {sessionId, childSessionId: event.notice.childSessionId, state: event.notice.state},
@@ -1158,8 +1105,8 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
           // wakes the owner, so the gate waits for the turn it triggers exactly as it does for a child.
           if (!isOwnedSession(event.ownerSessionId)) break
           noticedShellIds.add(event.shellId)
-          drainCompletion?.noteShellNotice(event.shellId, event.state, event.inboxId)
-          if (ledger !== undefined) settleLedgerFromShellNotice(ledger, {shellId: event.shellId, state: event.state})
+          drain.noteShellNotice(event.shellId, event.state, event.inboxId)
+          settleLedgerFromShellNotice(ledger, {shellId: event.shellId, state: event.state})
           markActivity()
           logger.info(
             {sessionId, shellId: event.shellId, state: event.state},
@@ -1171,14 +1118,13 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
         case 'inbox_delivered': {
           // Any owned session: a notice can be queued into a busy child, and is delivered there. Inbox ids are unique
           // message ids, so a delivery can only match the notice it names.
-          if (isOwnedSession(event.sessionId)) drainCompletion?.noteInboxDelivered(event.inboxId)
+          if (isOwnedSession(event.sessionId)) drain.noteInboxDelivered(event.inboxId)
           break
         }
 
         case 'execution_started': {
           if (event.sessionId === sessionId) {
-            rootTerminal = null
-            drainCompletion?.noteRootActivity()
+            drain.noteRootActivity()
           }
           break
         }
@@ -1186,55 +1132,42 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
         case 'execution_succeeded': {
           // Deliberately root-scoped, NOT an ownership check: a descendant finishing a turn must never end the run
           // while the root is still working. Root success is the signal to CONSIDER finishing; whether that is allowed
-          // is the ledger's call, below.
+          // is the drain gate's call, below.
           if (event.sessionId !== sessionId) break
-          rootTerminal = 'succeeded'
-          // A run that never adopted a dispatch (no ledger, or an empty one) completes on the root's success. Once ANY
-          // dispatch was adopted, a settled ledger is not enough: see the drain-completion gate.
-          if (ledger === undefined || drainCompletion === undefined || ledger.snapshot().length === 0) {
-            logger.info(
-              {sessionId, totalEvents, activityEvents, lastEventType},
-              'run-core: root execution succeeded — stream complete',
-            )
-            onBusy?.(false)
-            clearInactivity()
-            return
-          }
-
-          // A background dispatch was adopted: enter (or remain in) drain rather than completing. The run stays alive —
-          // slot, lease and approval routing continue — until the gate admits success or the run's deadline expires.
+          // Every success drains, whether or not anything was adopted: the root's own idle is evidence about the root
+          // only, and the run is released on the directory staying quiet (see the drain-completion gate). The run stays
+          // alive — slot, lease and approval routing continue — until the gate admits success or the deadline expires.
           const ledgerSettled = ledger.isDrainComplete()
           if (!draining) {
             draining = true
             logger.info(
               {sessionId, outstanding: ledger.outstanding(), totalEvents, activityEvents},
               ledgerSettled
-                ? 'run-core: root idle with background work settled — awaiting completion notice and root freshness'
+                ? 'run-core: root idle — waiting for the directory to stay quiet'
                 : 'run-core: root idle with owned work outstanding — draining',
             )
             onBusy?.(false)
             clearInactivity()
-            drainCompletion.beginDrain()
+            drain.beginDrain()
           }
 
           // Root idle is evidence only for the generation it arrives in: stamp the current revision.
-          drainCompletion.noteRootIdle()
+          drain.noteRootIdle()
 
           // Immediate reconcile pass so already-finished background work settles without waiting for the interval.
           // Fire-and-forget: its mutations (via the wrapped ledger) trigger persistence and validation on their own.
-          if (!ledgerSettled && liveReconcileOptions !== undefined) {
+          if (!ledgerSettled) {
             // eslint-disable-next-line no-void
             void runLivePasses(liveReconcileOptions)
           }
 
           // Validate now that this generation has idle evidence. Coalesced: at most one in flight.
-          drainCompletion.requestValidation()
+          drain.requestValidation()
           break
         }
 
         case 'execution_failed': {
           if (event.sessionId === sessionId) {
-            rootTerminal = 'failed'
             throw await failFromProvider(failureFromV2Error(event.error), 'session.execution.failed')
           }
           if (isOwnedSession(event.sessionId)) {
@@ -1242,7 +1175,7 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
             // stopped writing, so the entry is marked `unknown` — never `settled` — and the root learns the outcome from
             // the child's notice. The drain settles the entry once reconciliation sees it stop, or cancels it at the
             // deadline.
-            ledger?.markUnknown(event.sessionId)
+            ledger.markUnknown(event.sessionId)
             logger.warn(
               {sessionId, childSessionId: event.sessionId},
               'run-core: owned child reported a terminal execution failure — marked unknown, run continues',
@@ -1253,11 +1186,12 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
 
         case 'execution_interrupted': {
           if (event.sessionId === sessionId) {
-            rootTerminal = event.reason
             // An interrupt the gateway did not send. The run's own stop ends the loop before this is read, so one that
             // arrives here came from another client, or from the server (reason `shutdown`, which leaves the claim held
             // and the execution resumable, so the root may not have stopped).
             logger.error({sessionId, reason: event.reason}, 'run-core: root execution was interrupted — failing run')
+            // A `shutdown` interrupt leaves the execution claim held and resumable (probe P11): the root can start again
+            // by itself later, which no reading of the directory can rule out, so it always quarantines.
             throw await failFromProvider(
               INTERRUPTED_FAILURE,
               'session.execution.interrupted',
@@ -1265,7 +1199,7 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
             )
           }
           if (isOwnedSession(event.sessionId)) {
-            ledger?.markUnknown(event.sessionId)
+            ledger.markUnknown(event.sessionId)
             logger.warn(
               {sessionId, childSessionId: event.sessionId, reason: event.reason},
               'run-core: owned child was interrupted — marked unknown, run continues',
@@ -1307,11 +1241,10 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
           // stay inside its sandbox. The barrier interrupts the root and every owned child, then the run fails.
           logger.error({sessionId, movedSessionId: event.sessionId}, 'run-core: an owned session moved — failing run')
           clearInactivity()
-          // Never confirmed: the destination's shells cannot be seen from the directory this run lists, so nothing says
-          // the root cannot be woken from there.
+          // Always quarantined: the destination's shells and sessions cannot be read from the directory this run lists, so
+          // a quiet directory says nothing about where the moved session's work went.
           throw await throwWithBarrier('session-error', 'An owned session changed location during the run', {
-            rootMayBeRunning: true,
-            neverConfirm: true,
+            alwaysQuarantine: true,
           })
         }
 
@@ -1329,9 +1262,8 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
             // A child's notice the server sent and this client cannot read. It proves nothing about the child, so the
             // child is fenced rather than waited on: the gate stops expecting a readable notice, and the entry is
             // `unknown` (never `settled`) until reconciliation sees it stop.
-            drainCompletion?.noteUnreadableNotice(event.childSessionId)
-            fencedLedgerKeys.add(event.childSessionId)
-            ledger?.markUnknown(event.childSessionId)
+            drain.noteUnreadableNotice()
+            ledger.markUnknown(event.childSessionId)
             markActivity()
             logger.warn(
               {sessionId, childSessionId: event.childSessionId, eventType: event.eventType},
@@ -1343,9 +1275,8 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
             // A shell job's notice the server sent and this client cannot read: fenced like a child's. The gate stops
             // expecting a readable notice, and the entry is `unknown` (never `settled`) until reconciliation sees the
             // shell stop.
-            drainCompletion?.noteUnreadableShellNotice(event.shellId)
-            fencedLedgerKeys.add(shellLedgerKey(event.shellId))
-            ledger?.markUnknown(shellLedgerKey(event.shellId))
+            drain.noteUnreadableNotice()
+            ledger.markUnknown(shellLedgerKey(event.shellId))
             markActivity()
             logger.warn(
               {sessionId, shellId: event.shellId, eventType: event.eventType},
@@ -1359,9 +1290,7 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
               'run-core: an unreadable event from an owned session could hide a request — failing run',
             )
             clearInactivity()
-            throw await throwWithBarrier('session-error', 'An unreadable event from an owned session', {
-              rootMayBeRunning: true,
-            })
+            throw await throwWithBarrier('session-error', 'An unreadable event from an owned session')
           }
           break
         }
@@ -1376,7 +1305,6 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
     clearInactivity()
     logger.error({sessionId, detail: message}, 'run-core: event loop failed unexpectedly')
     throw await throwWithBarrier('stream-ended', `Event stream failed: ${message}`, {
-      rootMayBeRunning: true,
       cause: error,
     })
   } finally {
@@ -1386,9 +1314,9 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
     // Every exit of the loop closes the connection: the reader is otherwise left parked on a socket.
     streamController.abort()
     liveReconcileClosed = true
-    reconciler?.dispose()
+    reconciler.dispose()
     // No validation result may admit success once the loop has exited, and its retry timer must not leak.
-    drainCompletion?.dispose()
+    drain.dispose()
     // A run that is no longer draining has no wait reason, whatever way the loop ended.
     if (runId !== undefined) clearWaitReason(runId)
     // The watchdog is gone: stop reacting to gate notifications and late releases.
@@ -1422,13 +1350,12 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
     throw await throwWithBarrier(
       'stream-ended',
       `Event stream silent for ${Math.round((streamSilenceTimeoutMs ?? 0) / 1000)}s`,
-      {rootMayBeRunning: true},
     )
   }
 
   // Stream exhausted (loop exited normally or via break). Distinguish timeout from premature close.
   if (combinedSignal.aborted) {
-    if (ledger !== undefined && draining) {
+    if (draining) {
       // The run's own deadline covers execution AND drain. Cancelling and confirming every unsettled entry (outstanding
       // AND unknown) lives in `throwWithBarrier`, which cancels per entry rather than with a tree-cancel.
       logger.warn(
@@ -1444,14 +1371,10 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
         {sessionId, totalEvents, activityEvents, lastEventType},
         'run-core: stream ended due to inactivity timeout',
       )
-      throw await throwWithBarrier('inactivity-timeout', 'Run timed out: no activity within the inactivity window', {
-        rootMayBeRunning: true,
-      })
+      throw await throwWithBarrier('inactivity-timeout', 'Run timed out: no activity within the inactivity window')
     }
     logger.warn({sessionId, totalEvents, activityEvents, lastEventType}, 'run-core: stream ended due to timeout signal')
-    throw await throwWithBarrier('timeout', 'Run timed out: event stream aborted by timeout signal', {
-      rootMayBeRunning: true,
-    })
+    throw await throwWithBarrier('timeout', 'Run timed out: event stream aborted by timeout signal')
   }
 
   // Stream closed without a root success and not aborted by us → the server may still be working; fail so the run is
@@ -1460,7 +1383,5 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
     {sessionId, totalEvents, activityEvents, lastEventType},
     'run-core: event stream closed before the root finished',
   )
-  throw await throwWithBarrier('stream-ended', 'Event stream closed before the root execution finished', {
-    rootMayBeRunning: true,
-  })
+  throw await throwWithBarrier('stream-ended', 'Event stream closed before the root execution finished')
 }

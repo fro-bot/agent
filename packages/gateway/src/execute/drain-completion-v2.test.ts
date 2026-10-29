@@ -1,8 +1,13 @@
-import type {LedgerReconcileAdapter, SubagentNotice} from '@fro-bot/runtime'
+import type {
+  DirectoryObservation,
+  DirectoryStabilityTuning,
+  LedgerReconcileAdapter,
+  SubagentNotice,
+} from '@fro-bot/runtime'
 import type {GatewayLogger} from '../discord/client.js'
 import type {DrainRejectCode} from './drain-completion.js'
 
-import {createOwnershipLedger, err, ok, shellLedgerKey} from '@fro-bot/runtime'
+import {createDirectoryStabilityGate, createOwnershipLedger, err, ok, shellLedgerKey} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {createDrainCompletionV2} from './drain-completion-v2.js'
@@ -21,14 +26,37 @@ function makeLogger(): GatewayLogger {
 
 type Live = readonly string[] | 'fail' | 'hang'
 
-type Shells = readonly string[] | 'fail'
+/** A short window: three quiet readings, 50 ms apart, over 100 ms. */
+const FAST: DirectoryStabilityTuning = {requiredObservations: 3, minSpacingMs: 50, minSpanMs: 100}
+
+const QUIET: DirectoryObservation = {kind: 'quiescent'}
+const ACTIVE_CHILD: DirectoryObservation = {
+  kind: 'active',
+  activity: {activeSessionIds: ['ses_child'], runningShellIds: [], queuedInbox: []},
+}
+const RUNNING_SHELL: DirectoryObservation = {
+  kind: 'active',
+  activity: {activeSessionIds: [], runningShellIds: ['sh_1'], queuedInbox: []},
+}
+const QUEUED_NOTICE: DirectoryObservation = {
+  kind: 'active',
+  activity: {activeSessionIds: [], runningShellIds: [], queuedInbox: [{sessionId: 'ses_child', queued: 1}]},
+}
+const UNREADABLE: DirectoryObservation = {
+  kind: 'unreadable',
+  reason: 'shell.list: network',
+  activity: {activeSessionIds: [], runningShellIds: [], queuedInbox: []},
+}
 
 function setup(
   options: {
     readonly live?: readonly Live[]
     readonly children?: readonly string[]
-    /** Running owned shells per read (the last entry repeats). Absent: the gate is not given the read. */
-    readonly shells?: readonly Shells[]
+    /** What each directory reading shows, in order; once spent, the directory is quiet. */
+    readonly directory?: DirectoryObservation[]
+    /** Called for each reading, so a test can change the world between readings. */
+    readonly onRead?: (reading: number) => void
+    readonly tuning?: DirectoryStabilityTuning
   } = {},
 ) {
   const ledger = createOwnershipLedger()
@@ -51,26 +79,29 @@ function setup(
   const controller = new AbortController()
   const onAdmitted = vi.fn()
   const reasons: DrainRejectCode[] = []
-  const shellReadings = options.shells
-  let shellCall = 0
-  const ownedRunningShells = vi.fn(async () => {
-    const reading = shellReadings?.[Math.min(shellCall, shellReadings.length - 1)] ?? []
-    shellCall += 1
-    return reading === 'fail' ? err(new Error('shell.list failed')) : ok(reading)
+  const script = [...(options.directory ?? [])]
+  let reading = 0
+  const observe = vi.fn(async () => {
+    reading += 1
+    options.onRead?.(reading)
+    return script.shift() ?? QUIET
   })
+  const tuning = options.tuning ?? FAST
+  const gate = createDirectoryStabilityGate({...tuning, observe})
   const drain = createDrainCompletionV2({
     rootSessionId: ROOT,
     ledger,
     adapter,
+    directoryGate: gate,
+    directorySpacingMs: tuning.minSpacingMs ?? 500,
     signal: controller.signal,
     logger: makeLogger(),
     onAdmitted,
     onNotAdmitted: code => reasons.push(code),
     validationIntervalMs: 1_000,
     requestTimeoutMs: 5_000,
-    ...(shellReadings === undefined ? {} : {ownedRunningShells}),
   })
-  return {ledger, adapter, controller, onAdmitted, reasons, drain, ownedRunningShells}
+  return {ledger, adapter, controller, onAdmitted, reasons, drain, observe, gate}
 }
 
 /** The server's own statement that a child ended: the ledger settles and the gate hears the notice. */
@@ -96,27 +127,6 @@ afterEach(() => {
 })
 
 describe('createDrainCompletionV2', () => {
-  it('stops waiting for a readable notice from a child whose notice could not be read', async () => {
-    // #given — the ledger settled the child (reconciliation saw it stop), and no readable notice ever came
-    const s = setup()
-    s.drain.noteRootIdle()
-    s.drain.beginDrain()
-    s.ledger.settle(CHILD)
-    s.drain.requestValidation()
-    await vi.advanceTimersByTimeAsync(10)
-    expect(s.reasons.at(-1)).toBe('notice-not-observed')
-
-    // #when — an unreadable notice names it, and the turn that follows ends
-    s.drain.noteUnreadableNotice(CHILD)
-    s.drain.noteRootActivity()
-    s.drain.noteRootIdle()
-    s.drain.requestValidation()
-    await vi.advanceTimersByTimeAsync(10)
-
-    // #then
-    expect(s.onAdmitted).toHaveBeenCalledTimes(1)
-  })
-
   it('still needs idle evidence after an unreadable notice', async () => {
     // #given
     const s = setup()
@@ -125,8 +135,8 @@ describe('createDrainCompletionV2', () => {
     s.ledger.settle(CHILD)
 
     // #when — the notice invalidates the earlier idle
-    s.drain.noteUnreadableNotice(CHILD)
-    await vi.advanceTimersByTimeAsync(10)
+    s.drain.noteUnreadableNotice()
+    await vi.advanceTimersByTimeAsync(300)
 
     // #then
     expect(s.onAdmitted).not.toHaveBeenCalled()
@@ -143,7 +153,7 @@ describe('createDrainCompletionV2', () => {
     // #when — the notice's turn runs and ends
     noticeTurn(s)
     s.drain.requestValidation()
-    await vi.advanceTimersByTimeAsync(10)
+    await vi.advanceTimersByTimeAsync(300)
 
     // #then
     expect(s.onAdmitted).toHaveBeenCalledTimes(1)
@@ -158,7 +168,7 @@ describe('createDrainCompletionV2', () => {
     // #when
     childEnds(s)
     s.drain.requestValidation()
-    await vi.advanceTimersByTimeAsync(10)
+    await vi.advanceTimersByTimeAsync(300)
 
     // #then — the earlier idle is stale, so nothing is admitted
     expect(s.onAdmitted).not.toHaveBeenCalled()
@@ -175,7 +185,7 @@ describe('createDrainCompletionV2', () => {
     s.drain.noteRootActivity()
     s.drain.noteRootIdle()
     s.drain.requestValidation()
-    await vi.advanceTimersByTimeAsync(10)
+    await vi.advanceTimersByTimeAsync(300)
 
     // #then
     expect(s.onAdmitted).not.toHaveBeenCalled()
@@ -188,7 +198,7 @@ describe('createDrainCompletionV2', () => {
     childEnds(s)
     s.drain.noteRootActivity()
     s.drain.noteRootIdle()
-    await vi.advanceTimersByTimeAsync(10)
+    await vi.advanceTimersByTimeAsync(300)
     expect(s.onAdmitted).not.toHaveBeenCalled()
 
     // #when — the delivery arrives, then the turn ends
@@ -196,7 +206,7 @@ describe('createDrainCompletionV2', () => {
     s.drain.noteRootActivity()
     s.drain.noteRootIdle()
     s.drain.requestValidation()
-    await vi.advanceTimersByTimeAsync(10)
+    await vi.advanceTimersByTimeAsync(300)
 
     // #then
     expect(s.onAdmitted).toHaveBeenCalledTimes(1)
@@ -212,14 +222,14 @@ describe('createDrainCompletionV2', () => {
     s.drain.noteRootActivity()
     s.drain.noteRootIdle()
     s.drain.requestValidation()
-    await vi.advanceTimersByTimeAsync(10)
+    await vi.advanceTimersByTimeAsync(300)
 
     // #then
     expect(s.onAdmitted).toHaveBeenCalledTimes(1)
   })
 
-  it('does not admit a settled ledger without the child notice', async () => {
-    // #given — reconciliation settled the child, but no notice has been seen
+  it('does not hold the run for a notice the directory never showed: the directory decides, not the notice', async () => {
+    // #given — reconciliation settled the child and no notice was ever seen; the directory stays quiet
     const s = setup()
     s.drain.noteRootIdle()
     s.drain.beginDrain()
@@ -227,11 +237,10 @@ describe('createDrainCompletionV2', () => {
 
     // #when
     s.drain.requestValidation()
-    await vi.advanceTimersByTimeAsync(10)
+    await vi.advanceTimersByTimeAsync(500)
 
     // #then
-    expect(s.onAdmitted).not.toHaveBeenCalled()
-    expect(s.reasons.at(-1)).toBe('notice-not-observed')
+    expect(s.onAdmitted).toHaveBeenCalledTimes(1)
   })
 
   it("accepts a cancelled notice as the child's terminal word", async () => {
@@ -244,7 +253,7 @@ describe('createDrainCompletionV2', () => {
     // #when
     noticeTurn(s, 'msg_cancel')
     s.drain.requestValidation()
-    await vi.advanceTimersByTimeAsync(10)
+    await vi.advanceTimersByTimeAsync(300)
 
     // #then
     expect(s.onAdmitted).toHaveBeenCalledTimes(1)
@@ -259,7 +268,7 @@ describe('createDrainCompletionV2', () => {
     // #when
     noticeTurn(s, 'msg_a')
     s.drain.requestValidation()
-    await vi.advanceTimersByTimeAsync(10)
+    await vi.advanceTimersByTimeAsync(300)
 
     // #then
     expect(s.onAdmitted).not.toHaveBeenCalled()
@@ -275,7 +284,7 @@ describe('createDrainCompletionV2', () => {
 
     // #when
     s.drain.requestValidation()
-    await vi.advanceTimersByTimeAsync(10)
+    await vi.advanceTimersByTimeAsync(300)
 
     // #then
     expect(s.onAdmitted).not.toHaveBeenCalled()
@@ -291,7 +300,7 @@ describe('createDrainCompletionV2', () => {
 
     // #when
     s.drain.requestValidation()
-    await vi.advanceTimersByTimeAsync(10)
+    await vi.advanceTimersByTimeAsync(300)
 
     // #then
     expect(s.onAdmitted).not.toHaveBeenCalled()
@@ -308,7 +317,7 @@ describe('createDrainCompletionV2', () => {
 
     // #when — the root starts another turn before the answer lands
     s.drain.noteRootActivity()
-    await vi.advanceTimersByTimeAsync(10)
+    await vi.advanceTimersByTimeAsync(300)
 
     // #then
     expect(s.onAdmitted).not.toHaveBeenCalled()
@@ -324,7 +333,7 @@ describe('createDrainCompletionV2', () => {
 
     // #when — another full turn runs before the answer lands, leaving fresh idle evidence behind it
     noticeTurn(s)
-    await vi.advanceTimersByTimeAsync(10)
+    await vi.advanceTimersByTimeAsync(300)
 
     // #then — the reading predates that turn, so this pass must not admit
     expect(s.reasons.at(-1)).toBe('revision-drift')
@@ -338,7 +347,7 @@ describe('createDrainCompletionV2', () => {
     childEnds(s)
     noticeTurn(s)
     s.drain.requestValidation()
-    await vi.advanceTimersByTimeAsync(10)
+    await vi.advanceTimersByTimeAsync(300)
     expect(s.onAdmitted).not.toHaveBeenCalled()
 
     // #when
@@ -373,7 +382,7 @@ describe('createDrainCompletionV2', () => {
 
     // #when
     s.drain.requestValidation()
-    await vi.advanceTimersByTimeAsync(10)
+    await vi.advanceTimersByTimeAsync(300)
     s.drain.requestValidation()
     await vi.advanceTimersByTimeAsync(2_000)
 
@@ -403,23 +412,6 @@ describe('createDrainCompletionV2', () => {
     expect(disposed.onAdmitted).not.toHaveBeenCalled()
     expect(aborted.onAdmitted).not.toHaveBeenCalled()
   })
-
-  it('ignores a notice for a child the ledger never adopted when judging the ledger', async () => {
-    // #given — a stranger's notice cannot satisfy this run's children
-    const s = setup()
-    s.drain.beginDrain()
-    s.ledger.settle(CHILD)
-    s.drain.noteNotice(notice('ses_stranger'), 'msg_x')
-
-    // #when
-    noticeTurn(s, 'msg_x')
-    s.drain.requestValidation()
-    await vi.advanceTimersByTimeAsync(10)
-
-    // #then
-    expect(s.onAdmitted).not.toHaveBeenCalled()
-    expect(s.reasons.at(-1)).toBe('notice-not-observed')
-  })
 })
 
 describe('createDrainCompletionV2: background shells', () => {
@@ -446,7 +438,7 @@ describe('createDrainCompletionV2: background shells', () => {
 
     // #when
     s.drain.requestValidation()
-    await vi.advanceTimersByTimeAsync(10)
+    await vi.advanceTimersByTimeAsync(300)
 
     // #then
     expect(s.onAdmitted).not.toHaveBeenCalled()
@@ -462,7 +454,7 @@ describe('createDrainCompletionV2: background shells', () => {
     // #when — the notice arrives and the shell settles, but the woken turn has not run yet
     shellEnds(s)
     s.drain.requestValidation()
-    await vi.advanceTimersByTimeAsync(10)
+    await vi.advanceTimersByTimeAsync(300)
 
     // #then — the first idle is not terminal
     expect(s.onAdmitted).not.toHaveBeenCalled()
@@ -470,26 +462,10 @@ describe('createDrainCompletionV2: background shells', () => {
     // #when — the woken turn takes the notice in and ends
     noticeTurn(s, 'msg_shell_notice')
     s.drain.requestValidation()
-    await vi.advanceTimersByTimeAsync(10)
+    await vi.advanceTimersByTimeAsync(300)
 
     // #then
     expect(s.onAdmitted).toHaveBeenCalledTimes(1)
-  })
-
-  it('does not admit a settled shell whose notice was never observed', async () => {
-    // #given — reconciliation saw the shell stop; its notice has not arrived
-    const s = shellSetup()
-    s.drain.noteRootIdle()
-    s.drain.beginDrain()
-    s.ledger.settle(SHELL_KEY)
-
-    // #when
-    s.drain.requestValidation()
-    await vi.advanceTimersByTimeAsync(10)
-
-    // #then
-    expect(s.onAdmitted).not.toHaveBeenCalled()
-    expect(s.reasons.at(-1)).toBe('notice-not-observed')
   })
 
   it('holds a queued shell notice until it is delivered into a root turn', async () => {
@@ -502,54 +478,10 @@ describe('createDrainCompletionV2: background shells', () => {
     // #when — a root idle that did not take the notice in
     s.drain.noteRootIdle()
     s.drain.requestValidation()
-    await vi.advanceTimersByTimeAsync(10)
+    await vi.advanceTimersByTimeAsync(300)
 
     // #then
     expect(s.onAdmitted).not.toHaveBeenCalled()
-  })
-
-  it('counts an unreadable shell notice as observed, but still needs idle evidence', async () => {
-    // #given
-    const s = shellSetup()
-    s.drain.noteRootIdle()
-    s.drain.beginDrain()
-    s.ledger.settle(SHELL_KEY)
-
-    // #when
-    s.drain.noteUnreadableShellNotice(SHELL)
-    await vi.advanceTimersByTimeAsync(10)
-
-    // #then — the earlier idle is stale
-    expect(s.onAdmitted).not.toHaveBeenCalled()
-    expect(s.reasons.at(-1)).toBe('idle-evidence-stale')
-
-    // #when — the turn that follows ends
-    s.drain.noteRootActivity()
-    s.drain.noteRootIdle()
-    s.drain.requestValidation()
-    await vi.advanceTimersByTimeAsync(10)
-
-    // #then
-    expect(s.onAdmitted).toHaveBeenCalledTimes(1)
-  })
-
-  it('a child notice does not stand in for a shell notice, and the other way round', async () => {
-    // #given — a child and a shell are outstanding, and only the child ends
-    const s = setup({children: [CHILD]})
-    s.ledger.adopt(SHELL_KEY, 'sleep 8')
-    s.drain.noteRootIdle()
-    s.drain.beginDrain()
-    childEnds(s)
-    s.ledger.settle(SHELL_KEY)
-
-    // #when
-    noticeTurn(s)
-    s.drain.requestValidation()
-    await vi.advanceTimersByTimeAsync(10)
-
-    // #then — the shell's own notice is still missing
-    expect(s.onAdmitted).not.toHaveBeenCalled()
-    expect(s.reasons.at(-1)).toBe('notice-not-observed')
   })
 })
 
@@ -561,85 +493,189 @@ function readyToAdmit(s: ReturnType<typeof setup>) {
   noticeTurn(s)
 }
 
-describe('createDrainCompletionV2: running shells at the commit point', () => {
-  it('does not admit while a running shell tagged with an owned session is listed, whatever the ledger says', async () => {
-    // #given — the ledger is drained and every notice is in, but the server lists a child's shell nobody adopted
-    const s = setup({shells: [['sh_dropped']]})
+describe('createDrainCompletionV2: the directory gate', () => {
+  it('does not admit before the directory has stayed quiet for the whole window', async () => {
+    // #given — everything else is in place
+    const s = setup()
     readyToAdmit(s)
 
     // #when
     s.drain.requestValidation()
-    await vi.advanceTimersByTimeAsync(10)
+    await vi.advanceTimersByTimeAsync(60)
 
-    // #then — the run keeps draining, and the wait reason is the outstanding background work
+    // #then — two readings of three are not enough
     expect(s.onAdmitted).not.toHaveBeenCalled()
     expect(s.reasons.at(-1)).toBe('ledger-not-drained')
+
+    // #when
+    await vi.advanceTimersByTimeAsync(100)
+
+    // #then
+    expect(s.onAdmitted).toHaveBeenCalledTimes(1)
   })
 
-  it('admits on a later pass once the listed shell has stopped', async () => {
+  it('uses the production window by default: eleven readings over five seconds', async () => {
     // #given
-    const s = setup({shells: [['sh_dropped'], []]})
+    const s = setup({tuning: {}})
     readyToAdmit(s)
+
+    // #when
     s.drain.requestValidation()
-    await vi.advanceTimersByTimeAsync(10)
+    await vi.advanceTimersByTimeAsync(4_900)
+
+    // #then
+    expect(s.onAdmitted).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(200)
+    expect(s.onAdmitted).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not admit while an awakened, settled child is still active, and keeps draining', async () => {
+    // #given — the ledger settled the child long ago; its shell’s exit woke it, and it is running again
+    const s = setup({directory: [ACTIVE_CHILD, ACTIVE_CHILD, ACTIVE_CHILD, ACTIVE_CHILD]})
+    readyToAdmit(s)
+
+    // #when
+    s.drain.requestValidation()
+    await vi.advanceTimersByTimeAsync(180)
+
+    // #then — still not admitted, though every other piece of evidence is in
+    expect(s.onAdmitted).not.toHaveBeenCalled()
+    expect(s.reasons.at(-1)).toBe('ledger-not-drained')
+
+    // #when — the child stops and the directory stays quiet
+    await vi.advanceTimersByTimeAsync(400)
+
+    // #then
+    expect(s.onAdmitted).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not admit on a wake inside the window, after readings that looked quiet', async () => {
+    // #given — two quiet readings, then a REST-discovered shell’s completion wakes a session
+    const s = setup({directory: [QUIET, QUIET, ACTIVE_CHILD]})
+    readyToAdmit(s)
+
+    // #when
+    s.drain.requestValidation()
+    await vi.advanceTimersByTimeAsync(120)
+
+    // #then — the count started again
+    expect(s.onAdmitted).not.toHaveBeenCalled()
+    expect(s.observe.mock.calls.length).toBeGreaterThanOrEqual(3)
+
+    // #when
+    await vi.advanceTimersByTimeAsync(400)
+
+    // #then — and a full window later it passes
+    expect(s.onAdmitted).toHaveBeenCalledTimes(1)
+    expect(s.observe.mock.calls.length).toBeGreaterThanOrEqual(6)
+  })
+
+  it('does not admit while a shell the ledger never heard of runs, and admits once it is gone', async () => {
+    // #given — the shell disappears, then nothing else shows
+    const s = setup({directory: [RUNNING_SHELL, RUNNING_SHELL]})
+    readyToAdmit(s)
+
+    // #when
+    s.drain.requestValidation()
+    await vi.advanceTimersByTimeAsync(90)
+
+    // #then
     expect(s.onAdmitted).not.toHaveBeenCalled()
 
-    // #when — the retry timer asks again
+    // #when
+    await vi.advanceTimersByTimeAsync(400)
+
+    // #then — admitted on the directory alone: the disappearance is not what admits, the following quiet window is
+    expect(s.onAdmitted).toHaveBeenCalledTimes(1)
+  })
+
+  it('catches an enqueued notice whose wake is deferred inside the window', async () => {
+    // #given — the notice sits in the inbox for the first readings, then the wake starts
+    const s = setup({directory: [QUIET, QUEUED_NOTICE, ACTIVE_CHILD]})
+    readyToAdmit(s)
+
+    // #when
+    s.drain.requestValidation()
+    await vi.advanceTimersByTimeAsync(140)
+
+    // #then
+    expect(s.onAdmitted).not.toHaveBeenCalled()
+  })
+
+  it('reads a failed reading as not quiet and says it cannot tell', async () => {
+    // #given
+    const s = setup({directory: [UNREADABLE, UNREADABLE, UNREADABLE]})
+    readyToAdmit(s)
+
+    // #when
+    s.drain.requestValidation()
+    await vi.advanceTimersByTimeAsync(140)
+
+    // #then
+    expect(s.onAdmitted).not.toHaveBeenCalled()
+    expect(s.reasons).toContain('root-liveness-unavailable')
+  })
+
+  it('drops the count when root activity invalidates the evidence mid-window, and starts over', async () => {
+    // #given
+    const s = setup()
+    readyToAdmit(s)
+    s.drain.requestValidation()
+    await vi.advanceTimersByTimeAsync(60)
+    const readsBefore = s.observe.mock.calls.length
+
+    // #when — the root takes another turn
+    noticeTurn(s)
     await vi.advanceTimersByTimeAsync(1_500)
 
-    // #then
+    // #then — admitted, but only after a fresh window: the earlier readings did not carry over
     expect(s.onAdmitted).toHaveBeenCalledTimes(1)
+    expect(s.observe.mock.calls.length - readsBefore).toBeGreaterThanOrEqual(3)
   })
 
-  it('does not admit when the shell list cannot be read', async () => {
-    // #given
-    const s = setup({shells: ['fail']})
-    readyToAdmit(s)
+  it('does not read the directory before the cheap evidence is in', async () => {
+    // #given — idle evidence is stale
+    const s = setup()
+    s.drain.beginDrain()
+    childEnds(s)
 
     // #when
     s.drain.requestValidation()
-    await vi.advanceTimersByTimeAsync(10)
+    await vi.advanceTimersByTimeAsync(300)
+
+    // #then
+    expect(s.observe).not.toHaveBeenCalled()
+  })
+
+  it('does not admit once the run signal aborted mid-window', async () => {
+    // #given
+    const s = setup()
+    readyToAdmit(s)
+    s.drain.requestValidation()
+    await vi.advanceTimersByTimeAsync(60)
+
+    // #when
+    s.controller.abort()
+    await vi.advanceTimersByTimeAsync(1_000)
 
     // #then
     expect(s.onAdmitted).not.toHaveBeenCalled()
-    expect(s.reasons.at(-1)).toBe('root-liveness-unavailable')
   })
 
-  it('admits when no owned shell is running', async () => {
+  it('does not admit after dispose mid-window, and reads no more', async () => {
     // #given
-    const s = setup({shells: [[]]})
-    readyToAdmit(s)
-
-    // #when
-    s.drain.requestValidation()
-    await vi.advanceTimersByTimeAsync(10)
-
-    // #then
-    expect(s.onAdmitted).toHaveBeenCalledTimes(1)
-    expect(s.ownedRunningShells).toHaveBeenCalled()
-  })
-
-  it('reads the shells before the commit point: root activity while the read is in flight blocks admission', async () => {
-    // #given — the read answers only after the root has started working again
-    const s = setup({shells: [[]]})
-    let release: (() => void) | undefined
-    s.ownedRunningShells.mockImplementationOnce(
-      async () =>
-        new Promise(resolve => {
-          release = () => resolve(ok([]))
-        }),
-    )
+    const s = setup()
     readyToAdmit(s)
     s.drain.requestValidation()
-    await vi.advanceTimersByTimeAsync(10)
+    await vi.advanceTimersByTimeAsync(60)
 
     // #when
-    s.drain.noteRootActivity()
-    release?.()
-    await vi.advanceTimersByTimeAsync(10)
+    s.drain.dispose()
+    const reads = s.observe.mock.calls.length
+    await vi.advanceTimersByTimeAsync(1_000)
 
     // #then
     expect(s.onAdmitted).not.toHaveBeenCalled()
-    expect(s.reasons.at(-1)).toBe('revision-drift')
+    expect(s.observe.mock.calls.length).toBeLessThanOrEqual(reads + 1)
   })
 })

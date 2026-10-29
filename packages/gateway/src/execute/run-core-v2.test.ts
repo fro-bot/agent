@@ -158,10 +158,10 @@ describe('runOpenCodeCoreV2: a plain turn', () => {
     // #when
     await vi.advanceTimersByTimeAsync(10)
     run.emit(frames.succeeded())
-    await vi.advanceTimersByTimeAsync(10)
+    await vi.advanceTimersByTimeAsync(100)
 
-    // #then
-    expect(onBusy.mock.calls.map(call => call[0] as boolean)).toEqual([true, false])
+    // #then — busy while it works, not busy from the root's success on (waiting for the directory is not work)
+    expect(onBusy.mock.calls.map(call => call[0] as boolean)).toEqual([true, false, false])
   })
 })
 
@@ -712,5 +712,43 @@ describe('runOpenCodeCoreV2: unrelated forms and approvals do not touch a plain 
 
     // #then
     expect(coordinator.onPermissionAsked).not.toHaveBeenCalled()
+  })
+})
+
+describe('runOpenCodeCoreV2: a directory with the history of earlier runs', () => {
+  it('releases without reading the inbox of a session from an earlier run, even one with an item queued', async () => {
+    // #given — the workspace server keeps the sessions of every run; this one last changed an hour ago
+    const run = startRun({
+      active: [],
+      oldSessions: ['ses_earlier'],
+      shellServer: {shells: {}, inbox: {ses_earlier: 2}},
+    })
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #when
+    run.emit(frames.started(), frames.succeeded())
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    // #then
+    expect(run.outcome()).toEqual({ok: true})
+    expect(run.shellServer.listSessionInbox).not.toHaveBeenCalledWith(
+      expect.objectContaining({sessionId: 'ses_earlier'}),
+    )
+  })
+
+  it('does not release while a session updated during the run has an item queued', async () => {
+    // #given — a session of the directory (read as recent) with a notice queued and no wake yet
+    const run = startRun({active: [], sessions: ['ses_recent'], shellServer: {shells: {}, inbox: {ses_recent: 1}}})
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #when
+    run.emit(frames.started(), frames.succeeded())
+    await vi.advanceTimersByTimeAsync(3_000)
+
+    // #then
+    expect(run.outcome()).toBeUndefined()
+    expect(run.shellServer.listSessionInbox).toHaveBeenCalledWith(expect.objectContaining({sessionId: 'ses_recent'}))
+    run.close()
+    await vi.advanceTimersByTimeAsync(20_000)
   })
 })

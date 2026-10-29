@@ -10,7 +10,12 @@
  * own bounds end it.
  */
 
-import type {OwnershipLedger, RemoteOpenCodeV2Client, V2SessionOutcome} from '@fro-bot/runtime'
+import type {
+  DirectoryStabilityTuning,
+  OwnershipLedger,
+  RemoteOpenCodeV2Client,
+  V2SessionOutcome,
+} from '@fro-bot/runtime'
 import type {PermissionCoordinator} from '../approvals/coordinator.js'
 import type {QuestionCoordinator} from '../approvals/question-coordinator.js'
 import type {GatewayLogger} from '../discord/client.js'
@@ -329,7 +334,33 @@ export function makeQuestions(): QuestionCoordinator {
 
 export type Outcome = {readonly ok: true} | {readonly ok: false; readonly error: RunCoreError}
 
+/**
+ * The directory window the fixture runs with: two readings 5 ms apart. The production window is eleven readings over
+ * 5 s; the tests that are about the window say so and pass `directoryStability: {}`.
+ */
+export const FIXTURE_DIRECTORY_STABILITY: DirectoryStabilityTuning = {
+  requiredObservations: 2,
+  minSpacingMs: 5,
+  minSpanMs: 5,
+}
+
+/**
+ * A window the tests about draining and stopping use: two readings 500 ms apart. It is short enough for a test and long
+ * enough that the quiet window is still open when a test checks that the run has not finished yet.
+ */
+export const FIXTURE_WINDOWED_STABILITY: DirectoryStabilityTuning = {
+  requiredObservations: 2,
+  minSpacingMs: 500,
+  minSpanMs: 500,
+}
+
 export interface StartOptions {
+  /** Overrides the fixture's short directory window. `{}` is the production window. */
+  readonly directoryStability?: DirectoryStabilityTuning
+  /** Sessions stored under the directory besides the root and the children. They carry no time, so they read as recent. */
+  readonly sessions?: readonly string[]
+  /** Sessions of earlier runs stored under the directory: last updated an hour before the test starts. */
+  readonly oldSessions?: readonly string[]
   readonly controller?: AbortController
   readonly ownershipLedger?: OwnershipLedger
   readonly inactivityTimeoutMs?: number
@@ -379,6 +410,8 @@ export interface Run {
   readonly prompt: ReturnType<typeof vi.fn>
   readonly interrupt: ReturnType<typeof vi.fn>
   readonly active: ReturnType<typeof vi.fn>
+  /** The managed active set behind `active`: a test adds a session to wake it, and an interrupt or a terminal frame removes it. */
+  readonly activeSet: Set<string>
   readonly replyPermission: ReturnType<typeof vi.fn>
   readonly replyForm: ReturnType<typeof vi.fn>
   readonly cancelForm: ReturnType<typeof vi.fn>
@@ -442,9 +475,24 @@ export function startRun(options: StartOptions = {}): Run {
   const client = {
     session: {
       active: activeFn,
-      list: vi.fn(async () => ({
-        data: (options.children ?? []).map(id => ({id, parentID: ROOT, location: {directory: DIRECTORY}})),
-      })),
+      list: vi.fn(async (input: {readonly parentID?: string}) => {
+        const children = (options.children ?? []).map(id => ({id, parentID: ROOT, location: {directory: DIRECTORY}}))
+        if (input.parentID !== undefined) return {data: children}
+        // A directory listing: every session stored under it, the root and the extras included.
+        return {
+          data: [
+            {id: ROOT, parentID: null, location: {directory: DIRECTORY}},
+            ...children,
+            ...(options.sessions ?? []).map(id => ({id, parentID: null, location: {directory: DIRECTORY}})),
+            ...(options.oldSessions ?? []).map(id => ({
+              id,
+              parentID: null,
+              location: {directory: DIRECTORY},
+              time: {updated: Date.now() - 60 * 60 * 1000},
+            })),
+          ],
+        }
+      }),
     },
     createSession: vi.fn(options.createSessionResult ?? (async () => ok({id: ROOT}))),
     getSession: vi.fn(async () =>
@@ -491,6 +539,7 @@ export function startRun(options: StartOptions = {}): Run {
     ...(options.onBusy === undefined ? {} : {onBusy: options.onBusy}),
     ...(options.onOwnershipChange === undefined ? {} : {onOwnershipChange: options.onOwnershipChange}),
     ...(options.onHumanWaitTerminal === undefined ? {} : {onHumanWaitTerminal: options.onHumanWaitTerminal}),
+    directoryStability: options.directoryStability ?? FIXTURE_DIRECTORY_STABILITY,
   }).then(
     () => {
       settled = {ok: true}
@@ -516,6 +565,19 @@ export function startRun(options: StartOptions = {}): Run {
     logger,
     client,
     emit: (...events) => {
+      // The server drops a session from the active list when its execution ends.
+      for (const event of events) {
+        const type = (event as {type?: unknown}).type
+        const sessionId = (event as {data?: {sessionID?: unknown}}).data?.sessionID
+        if (
+          typeof sessionId === 'string' &&
+          (type === 'session.execution.succeeded' ||
+            type === 'session.execution.failed' ||
+            type === 'session.execution.interrupted')
+        ) {
+          active.delete(sessionId)
+        }
+      }
       queue.push(...events)
       wakeStream()
     },
@@ -530,6 +592,7 @@ export function startRun(options: StartOptions = {}): Run {
     prompt,
     interrupt,
     active: activeFn,
+    activeSet: active,
     replyPermission,
     replyForm,
     cancelForm,
@@ -550,3 +613,8 @@ export function succeeded(run: Run): boolean {
 }
 
 export const authFailure = () => err({kind: 'auth', status: 401} as const)
+
+/** `startRun` with `FIXTURE_WINDOWED_STABILITY`, for the tests about draining and stopping. */
+export function startWindowedRun(options: StartOptions = {}): Run {
+  return startRun({directoryStability: FIXTURE_WINDOWED_STABILITY, ...options})
+}

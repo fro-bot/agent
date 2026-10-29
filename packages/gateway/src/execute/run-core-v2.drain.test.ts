@@ -18,7 +18,7 @@ import {
   onSession,
   OTHER_CHILD,
   ROOT,
-  startRun,
+  startWindowedRun,
   STRANGER,
   succeeded,
 } from './run-core-v2.fixture.js'
@@ -29,7 +29,7 @@ function states(ledger: OwnershipLedger): Record<string, string> {
 }
 
 /** Root dispatches `child` in the background and finishes its first turn. */
-async function dispatchAndIdle(run: ReturnType<typeof startRun>, child = CHILD): Promise<void> {
+async function dispatchAndIdle(run: ReturnType<typeof startWindowedRun>, child = CHILD): Promise<void> {
   run.emit(
     frames.started(),
     frames.toolStarted('subagent', 'call_dispatch'),
@@ -42,7 +42,12 @@ async function dispatchAndIdle(run: ReturnType<typeof startRun>, child = CHILD):
 }
 
 /** The server enqueues the child's notice, runs the parent to take it in, and the parent answers. */
-function noticeTurn(run: ReturnType<typeof startRun>, child = CHILD, state = 'completed', inbox = 'msg_notice'): void {
+function noticeTurn(
+  run: ReturnType<typeof startWindowedRun>,
+  child = CHILD,
+  state = 'completed',
+  inbox = 'msg_notice',
+): void {
   run.emit(
     frames.notice(child, state, inbox),
     frames.started(),
@@ -61,7 +66,7 @@ describe('runOpenCodeCoreV2: adopting background work', () => {
     // #given
     const ledger = createOwnershipLedger()
     const onOwnershipChange = vi.fn()
-    const run = startRun({ownershipLedger: ledger, onOwnershipChange, active: [CHILD], children: [CHILD]})
+    const run = startWindowedRun({ownershipLedger: ledger, onOwnershipChange, active: [CHILD], children: [CHILD]})
     await vi.advanceTimersByTimeAsync(10)
 
     // #when
@@ -78,7 +83,7 @@ describe('runOpenCodeCoreV2: adopting background work', () => {
   it('does not adopt a foreground subagent call, whose result text claims a completion', async () => {
     // #given — the captured foreground result has completed metadata and a <subagent …> text a child could forge
     const ledger = createOwnershipLedger()
-    const run = startRun({ownershipLedger: ledger})
+    const run = startWindowedRun({ownershipLedger: ledger})
     await vi.advanceTimersByTimeAsync(10)
 
     // #when
@@ -87,9 +92,9 @@ describe('runOpenCodeCoreV2: adopting background work', () => {
       onSession(SUBAGENT_FOREGROUND_SUCCESS_FRAME, ROOT),
       frames.succeeded(),
     )
-    await vi.advanceTimersByTimeAsync(10)
+    await vi.advanceTimersByTimeAsync(1_000)
 
-    // #then — nothing was adopted, so the root's success completes the run
+    // #then — nothing was adopted, so once the directory has stayed quiet the root's success completes the run
     expect(ledger.snapshot()).toEqual([])
     expect(succeeded(run)).toBe(true)
   })
@@ -97,7 +102,7 @@ describe('runOpenCodeCoreV2: adopting background work', () => {
   it('does not adopt a failed subagent call that kept its running progress metadata', async () => {
     // #given
     const ledger = createOwnershipLedger()
-    const run = startRun({ownershipLedger: ledger})
+    const run = startWindowedRun({ownershipLedger: ledger})
     await vi.advanceTimersByTimeAsync(10)
 
     // #when
@@ -116,7 +121,7 @@ describe('runOpenCodeCoreV2: adopting background work', () => {
       },
       frames.succeeded(),
     )
-    await vi.advanceTimersByTimeAsync(10)
+    await vi.advanceTimersByTimeAsync(1_000)
 
     // #then
     expect(ledger.snapshot()).toEqual([])
@@ -129,7 +134,7 @@ describe('runOpenCodeCoreV2: draining', () => {
     // #given
     const ledger = createOwnershipLedger()
     const onBusy = vi.fn()
-    const run = startRun({ownershipLedger: ledger, onBusy, active: [CHILD], children: [CHILD]})
+    const run = startWindowedRun({ownershipLedger: ledger, onBusy, active: [CHILD], children: [CHILD]})
     await vi.advanceTimersByTimeAsync(10)
 
     // #when
@@ -146,7 +151,7 @@ describe('runOpenCodeCoreV2: draining', () => {
   it('completes after the turn the notice triggered, with one reply carrying the follow-up text', async () => {
     // #given — the child ends after the root went idle; nothing is active any more
     const ledger = createOwnershipLedger()
-    const run = startRun({ownershipLedger: ledger, active: [], children: [CHILD]})
+    const run = startWindowedRun({ownershipLedger: ledger, active: [], children: [CHILD]})
     await vi.advanceTimersByTimeAsync(10)
     await dispatchAndIdle(run)
     expect(run.outcome()).toBeUndefined()
@@ -167,7 +172,7 @@ describe('runOpenCodeCoreV2: draining', () => {
   it("completes on a cancelled child's notice as it does on a completed one", async () => {
     // #given
     const ledger = createOwnershipLedger()
-    const run = startRun({ownershipLedger: ledger, active: [], children: [CHILD]})
+    const run = startWindowedRun({ownershipLedger: ledger, active: [], children: [CHILD]})
     await vi.advanceTimersByTimeAsync(10)
     await dispatchAndIdle(run)
 
@@ -183,7 +188,7 @@ describe('runOpenCodeCoreV2: draining', () => {
   it('does not complete on a notice alone: the parent must run the turn that takes it in', async () => {
     // #given — the notice is queued, the parent has not run again
     const ledger = createOwnershipLedger()
-    const run = startRun({ownershipLedger: ledger, active: [], children: [CHILD]})
+    const run = startWindowedRun({ownershipLedger: ledger, active: [], children: [CHILD]})
     await vi.advanceTimersByTimeAsync(10)
     await dispatchAndIdle(run)
 
@@ -200,7 +205,7 @@ describe('runOpenCodeCoreV2: draining', () => {
   it('waits for every child: one notice of two does not complete the run', async () => {
     // #given
     const ledger = createOwnershipLedger()
-    const run = startRun({ownershipLedger: ledger, active: [OTHER_CHILD], children: [CHILD, OTHER_CHILD]})
+    const run = startWindowedRun({ownershipLedger: ledger, active: [OTHER_CHILD], children: [CHILD, OTHER_CHILD]})
     await vi.advanceTimersByTimeAsync(10)
     await dispatchAndIdle(run, CHILD)
     run.emit(frames.toolStarted('subagent', 'call_dispatch_2'), frames.dispatch(OTHER_CHILD, ROOT, 'call_dispatch_2'))
@@ -220,7 +225,7 @@ describe('runOpenCodeCoreV2: draining', () => {
   it('ignores a notice about a child it never adopted', async () => {
     // #given — this run's own child is still running
     const ledger = createOwnershipLedger()
-    const run = startRun({ownershipLedger: ledger, active: [CHILD], children: [CHILD]})
+    const run = startWindowedRun({ownershipLedger: ledger, active: [CHILD], children: [CHILD]})
     await vi.advanceTimersByTimeAsync(10)
     await dispatchAndIdle(run)
 
@@ -238,7 +243,7 @@ describe('runOpenCodeCoreV2: draining', () => {
   it('ignores a notice delivered to a session this run does not own', async () => {
     // #given — the child is still running
     const ledger = createOwnershipLedger()
-    const run = startRun({ownershipLedger: ledger, active: [CHILD], children: [CHILD]})
+    const run = startWindowedRun({ownershipLedger: ledger, active: [CHILD], children: [CHILD]})
     await vi.advanceTimersByTimeAsync(10)
     await dispatchAndIdle(run)
 
@@ -255,7 +260,7 @@ describe('runOpenCodeCoreV2: draining', () => {
   it('settles a child whose notice arrived before its dispatch result', async () => {
     // #given — the notice reaches the stream first
     const ledger = createOwnershipLedger()
-    const run = startRun({ownershipLedger: ledger, active: [], children: [CHILD]})
+    const run = startWindowedRun({ownershipLedger: ledger, active: [], children: [CHILD]})
     await vi.advanceTimersByTimeAsync(10)
 
     // #when
@@ -276,7 +281,7 @@ describe('runOpenCodeCoreV2: draining', () => {
   it('marks an owned child unknown when its execution fails, and keeps the run going', async () => {
     // #given
     const ledger = createOwnershipLedger()
-    const run = startRun({ownershipLedger: ledger, active: [CHILD], children: [CHILD]})
+    const run = startWindowedRun({ownershipLedger: ledger, active: [CHILD], children: [CHILD]})
     await vi.advanceTimersByTimeAsync(10)
     await dispatchAndIdle(run)
 
@@ -294,7 +299,7 @@ describe('runOpenCodeCoreV2: draining', () => {
   it('lets a later notice settle a child that was marked unknown, and then completes', async () => {
     // #given
     const ledger = createOwnershipLedger()
-    const run = startRun({ownershipLedger: ledger, active: [], children: [CHILD]})
+    const run = startWindowedRun({ownershipLedger: ledger, active: [], children: [CHILD]})
     await vi.advanceTimersByTimeAsync(10)
     await dispatchAndIdle(run)
     run.emit(frames.failed(CHILD))
@@ -312,7 +317,7 @@ describe('runOpenCodeCoreV2: draining', () => {
   it('marks an owned child unknown, not settled, when something else interrupts it', async () => {
     // #given
     const ledger = createOwnershipLedger()
-    const run = startRun({ownershipLedger: ledger, active: [CHILD], children: [CHILD]})
+    const run = startWindowedRun({ownershipLedger: ledger, active: [CHILD], children: [CHILD]})
     await vi.advanceTimersByTimeAsync(10)
     await dispatchAndIdle(run)
 
@@ -330,7 +335,7 @@ describe('runOpenCodeCoreV2: draining', () => {
   it("streams an owned child's text and ignores a stranger's", async () => {
     // #given
     const ledger = createOwnershipLedger()
-    const run = startRun({ownershipLedger: ledger, active: [CHILD], children: [CHILD]})
+    const run = startWindowedRun({ownershipLedger: ledger, active: [CHILD], children: [CHILD]})
     await vi.advanceTimersByTimeAsync(10)
     await dispatchAndIdle(run)
 
@@ -349,7 +354,7 @@ describe('runOpenCodeCoreV2: draining', () => {
     // #given — the child never ends
     const ledger = createOwnershipLedger()
     const controller = new AbortController()
-    const run = startRun({ownershipLedger: ledger, controller, active: [CHILD], children: [CHILD]})
+    const run = startWindowedRun({ownershipLedger: ledger, controller, active: [CHILD], children: [CHILD]})
     await vi.advanceTimersByTimeAsync(10)
     await dispatchAndIdle(run)
 
@@ -361,14 +366,15 @@ describe('runOpenCodeCoreV2: draining', () => {
     const error = failure(run)
     expect(error.kind).toBe('drain-timeout')
     expect(run.interrupt).toHaveBeenCalledWith(expect.objectContaining({sessionId: CHILD}))
-    expect(run.interrupt).toHaveBeenCalledWith(expect.objectContaining({sessionId: ROOT}))
+    // the root is idle while it drains, so there is nothing to interrupt on it
+    expect(run.interrupt).not.toHaveBeenCalledWith(expect.objectContaining({sessionId: ROOT}))
   })
 
   it('does not trip the inactivity timer while it waits on a quiet child', async () => {
     // #given
     const ledger = createOwnershipLedger()
     const controller = new AbortController()
-    const run = startRun({
+    const run = startWindowedRun({
       ownershipLedger: ledger,
       controller,
       inactivityTimeoutMs: 5_000,
@@ -392,7 +398,7 @@ describe('runOpenCodeCoreV2: draining', () => {
     // #given
     const ledger = createOwnershipLedger()
     const controller = new AbortController()
-    const run = startRun({
+    const run = startWindowedRun({
       ownershipLedger: ledger,
       controller,
       runId: 'run-drain',
@@ -416,21 +422,32 @@ describe('runOpenCodeCoreV2: draining', () => {
     expect(getWaitReason('run-drain')).toBeUndefined()
   })
 
-  it('reports a missing notice as the reason once the ledger is drained without one', async () => {
+  it('reports the directory window as the reason once the ledger is drained, and does not wait for a notice', async () => {
     // #given — reconciliation settled the child, but its notice never came
     const ledger = createOwnershipLedger()
     const controller = new AbortController()
-    const run = startRun({ownershipLedger: ledger, controller, runId: 'run-nonotice', active: [], children: [CHILD]})
+    const run = startWindowedRun({
+      ownershipLedger: ledger,
+      controller,
+      runId: 'run-window',
+      active: [],
+      children: [CHILD],
+    })
     await vi.advanceTimersByTimeAsync(10)
 
     // #when
     await dispatchAndIdle(run)
-    await vi.advanceTimersByTimeAsync(2_000)
+    await vi.advanceTimersByTimeAsync(200)
 
-    // #then — the idle pass settles the child by reconciliation; the gate still wants the notice
-    expect(getWaitReason('run-nonotice')).toBe('notice-not-observed')
-    controller.abort()
-    await vi.advanceTimersByTimeAsync(20_000)
+    // #then — the directory window is what the run waits on, not the missing notice
+    expect(run.outcome()).toBeUndefined()
+    expect(getWaitReason('run-window')).toBe('ledger-not-drained')
+
+    // #when — the window completes
+    await vi.advanceTimersByTimeAsync(1_500)
+
+    // #then — released on the directory alone
+    expect(succeeded(run)).toBe(true)
   })
 })
 
@@ -438,7 +455,7 @@ describe('runOpenCodeCoreV2: bounded reconcile passes', () => {
   it('bounds a reconcile pass that never answers: the child becomes unknown and the loop keeps reading', async () => {
     // #given — listing children hangs
     const ledger = createOwnershipLedger()
-    const run = startRun({ownershipLedger: ledger, active: [CHILD], children: [CHILD]})
+    const run = startWindowedRun({ownershipLedger: ledger, active: [CHILD], children: [CHILD]})
     await vi.advanceTimersByTimeAsync(10)
     vi.mocked(run.client.session.list).mockImplementation(async () => new Promise(() => undefined))
     await dispatchAndIdle(run)
@@ -459,7 +476,7 @@ describe('runOpenCodeCoreV2: bounded reconcile passes', () => {
     // #given — the pass is in flight when the run ends
     const ledger = createOwnershipLedger()
     const controller = new AbortController()
-    const run = startRun({ownershipLedger: ledger, controller, active: [CHILD], children: [CHILD]})
+    const run = startWindowedRun({ownershipLedger: ledger, controller, active: [CHILD], children: [CHILD]})
     await vi.advanceTimersByTimeAsync(10)
     let release: (() => void) | undefined
     vi.mocked(run.client.session.list).mockImplementation(
@@ -485,7 +502,7 @@ describe('runOpenCodeCoreV2: a notice queued into a busy child', () => {
   it('completes once the child takes the notice in, instead of waiting for a delivery it never forwarded', async () => {
     // #given — the root's child is still busy when its own child (a grandchild) ends, so that notice queues there
     const ledger = createOwnershipLedger()
-    const run = startRun({ownershipLedger: ledger, active: [], children: [CHILD]})
+    const run = startWindowedRun({ownershipLedger: ledger, active: [], children: [CHILD]})
     await vi.advanceTimersByTimeAsync(10)
     await dispatchAndIdle(run)
 
@@ -504,7 +521,7 @@ describe('runOpenCodeCoreV2: a notice queued into a busy child', () => {
   it('does not complete while the notice is still queued in the child', async () => {
     // #given
     const ledger = createOwnershipLedger()
-    const run = startRun({ownershipLedger: ledger, active: [], children: [CHILD]})
+    const run = startWindowedRun({ownershipLedger: ledger, active: [], children: [CHILD]})
     await vi.advanceTimersByTimeAsync(10)
     await dispatchAndIdle(run)
 
@@ -522,7 +539,7 @@ describe('runOpenCodeCoreV2: a notice queued into a busy child', () => {
   it('ignores a delivery in a session this run does not own', async () => {
     // #given — a notice queued in the child
     const ledger = createOwnershipLedger()
-    const run = startRun({ownershipLedger: ledger, active: [], children: [CHILD]})
+    const run = startWindowedRun({ownershipLedger: ledger, active: [], children: [CHILD]})
     await vi.advanceTimersByTimeAsync(10)
     await dispatchAndIdle(run)
 
@@ -541,20 +558,37 @@ describe('runOpenCodeCoreV2: a notice queued into a busy child', () => {
   })
 })
 
-/** The root dispatches a child in the background, then halts before it ever reports a success. */
-async function haltWithChildRunning(halt: (run: ReturnType<typeof startRun>) => void) {
+/**
+ * The root dispatches a child in the background, then halts before it ever reports a success. Cancelling the child
+ * delivers a notice that makes the server start a successor root turn; `successor` says when, relative to the cancel.
+ */
+async function haltWithChildRunning(
+  halt: (run: ReturnType<typeof startWindowedRun>) => void,
+  successor: {readonly afterMs: number; readonly stoppable: boolean},
+) {
   const ledger = createOwnershipLedger()
   let rootBusy = false
   let rootInterrupts = 0
-  const run = startRun({
+  const run: ReturnType<typeof startWindowedRun> = startWindowedRun({
     ownershipLedger: ledger,
     children: [CHILD],
-    // The cancelled child's notice makes the server start a successor root turn: the root turns up busy later.
-    activeReply: async (): Promise<Record<string, {readonly type: string}>> =>
-      rootBusy ? {[ROOT]: {type: 'running'}} : {},
+    active: [CHILD],
+    activeReply: async (): Promise<Record<string, {readonly type: string}>> => ({
+      ...(rootBusy ? {[ROOT]: {type: 'running'}} : {}),
+      ...(run.activeSet.has(CHILD) ? {[CHILD]: {type: 'running'}} : {}),
+    }),
     interrupt: async sessionId => {
-      if (sessionId === ROOT) rootInterrupts += 1
-      return ok({interrupted: rootBusy})
+      if (sessionId === ROOT) {
+        rootInterrupts += 1
+        if (successor.stoppable) rootBusy = false
+        return ok({interrupted: true})
+      }
+      // Cancelling the child delivers its notice, which wakes the root a moment later.
+      run.activeSet.delete(CHILD)
+      setTimeout(() => {
+        rootBusy = true
+      }, successor.afterMs)
+      return ok({interrupted: true})
     },
   })
   await vi.advanceTimersByTimeAsync(10)
@@ -578,32 +612,49 @@ async function haltWithChildRunning(halt: (run: ReturnType<typeof startRun>) => 
 }
 
 describe('runOpenCodeCoreV2: a halted root with background work outstanding', () => {
-  it.each([
-    ['execution.failed', (run: ReturnType<typeof startRun>) => run.emit(frames.failed())],
+  const HALTS = [
+    ['execution.failed', (run: ReturnType<typeof startWindowedRun>) => run.emit(frames.failed())],
     [
       'execution.interrupted by a user',
-      (run: ReturnType<typeof startRun>) => run.emit(frames.interrupted(ROOT, 'user')),
+      (run: ReturnType<typeof startWindowedRun>) => run.emit(frames.interrupted(ROOT, 'user')),
     ],
-  ] as const)('quarantines on %s and keeps interrupting the root through the hold', async (_label, halt) => {
-    // #given / #when — the root halts while its background child is still running
-    const {run, rootInterrupts, startSuccessor} = await haltWithChildRunning(halt)
+  ] as const
 
-    // #then — the stop is never confirmed: cancelling the child delivers a notice that wakes the root
-    expect(failure(run).quarantined).toBe(true)
-    const interruptsAtQuarantine = rootInterrupts()
+  it.each(HALTS)(
+    'stops the successor root turn the child’s cancel wakes inside the window, on %s',
+    async (_label, halt) => {
+      // #given / #when — the root halts with the child running; the child's cancel wakes the root 200 ms later
+      const {run, rootInterrupts} = await haltWithChildRunning(halt, {afterMs: 200, stoppable: true})
 
-    // #when — the server starts the successor turn during the hold
-    startSuccessor()
-    await vi.advanceTimersByTimeAsync(2_000)
+      // #then — the wake was seen in the window and interrupted, and the run released once the directory stayed quiet
+      expect(rootInterrupts()).toBeGreaterThanOrEqual(1)
+      expect(failure(run).quarantined).toBe(false)
+    },
+  )
 
-    // #then — the root is interrupted again
-    expect(rootInterrupts()).toBeGreaterThan(interruptsAtQuarantine)
-  })
+  it.each(HALTS)(
+    'quarantines on %s when the successor root turn cannot be stopped, and keeps interrupting through the hold',
+    async (_label, halt) => {
+      // #given / #when
+      const {run, rootInterrupts, startSuccessor} = await haltWithChildRunning(halt, {afterMs: 200, stoppable: false})
 
-  it('keeps the fast path for a halted root that owns no background work', async () => {
+      // #then
+      expect(failure(run).quarantined).toBe(true)
+      const interruptsAtQuarantine = rootInterrupts()
+
+      // #when — the server starts yet another successor turn during the hold
+      startSuccessor()
+      await vi.advanceTimersByTimeAsync(2_000)
+
+      // #then — the root is interrupted again
+      expect(rootInterrupts()).toBeGreaterThan(interruptsAtQuarantine)
+    },
+  )
+
+  it('has no fast path for a halted root that owns no background work: it still reads the directory', async () => {
     // #given
     const ledger = createOwnershipLedger()
-    const run = startRun({ownershipLedger: ledger})
+    const run = startWindowedRun({ownershipLedger: ledger})
     await vi.advanceTimersByTimeAsync(10)
 
     // #when
@@ -620,7 +671,7 @@ describe('runOpenCodeCoreV2: a notice that cannot be read', () => {
   it('fences the child it names, so the run completes instead of waiting out its deadline', async () => {
     // #given — the child ended, but its notice carries a state this client does not know
     const ledger = createOwnershipLedger()
-    const run = startRun({ownershipLedger: ledger, active: [], children: [CHILD]})
+    const run = startWindowedRun({ownershipLedger: ledger, active: [], children: [CHILD]})
     await vi.advanceTimersByTimeAsync(10)
     await dispatchAndIdle(run)
 
@@ -635,7 +686,7 @@ describe('runOpenCodeCoreV2: a notice that cannot be read', () => {
   it('marks a still-running child unknown rather than settled, and keeps the run going', async () => {
     // #given
     const ledger = createOwnershipLedger()
-    const run = startRun({ownershipLedger: ledger, active: [CHILD], children: [CHILD]})
+    const run = startWindowedRun({ownershipLedger: ledger, active: [CHILD], children: [CHILD]})
     await vi.advanceTimersByTimeAsync(10)
     await dispatchAndIdle(run)
 
@@ -653,7 +704,7 @@ describe('runOpenCodeCoreV2: a notice that cannot be read', () => {
   it('ignores an unreadable notice delivered to a session this run does not own', async () => {
     // #given
     const ledger = createOwnershipLedger()
-    const run = startRun({ownershipLedger: ledger, active: [CHILD], children: [CHILD]})
+    const run = startWindowedRun({ownershipLedger: ledger, active: [CHILD], children: [CHILD]})
     await vi.advanceTimersByTimeAsync(10)
     await dispatchAndIdle(run)
 

@@ -1,56 +1,40 @@
 /**
- * Confirming that an interrupted root session has really stopped, on OpenCode V2: the sibling of `root-stop.ts`.
+ * Stopping what a run left running in its directory, on OpenCode V2: the sibling of `root-stop.ts`.
  *
- * `POST /api/session/:id/interrupt` is a request, and its reply cannot be read as a stop. `{interrupted: false}` is what
- * an idle session returns AND what a prompt that is not admitted yet returns (admission takes about 270 ms on a cold
- * location, probe P1), and an interrupt sent in that window leaves no trace: the turn then runs to completion. Absence
- * from `GET /api/session/active` proves nothing for the same reason, since a root that has not started is absent too.
+ * `POST /api/session/:id/interrupt` is a request, and its reply cannot be read as a stop (`{interrupted: false}` is also
+ * what a prompt that is not admitted yet returns, probe P1). `DELETE /api/shell/:id` answers 204 for an unknown id, and a
+ * shell it kills queues an `error` notice that WAKES the shell's owner (probe p22). Neither reply proves anything, and
+ * stock v2.2.0 offers no route that does. So the stop is never "confirmed" from a reply or from the run's own ledger. The
+ * stop acts on what the DIRECTORY shows (`observeDirectoryV2`), and whether it worked is decided by the directory staying
+ * quiet for a window (`directory-quiescence-v2.ts`).
  *
- * So a stop is confirmed only by positive evidence that an execution of the root ended, and the root absent from the
- * active list on both sides of reading it:
- * - on the stream: `session.execution.interrupted` with reason `user`, `session.execution.succeeded`, or
- *   `session.execution.failed`. An interrupt with reason `shutdown` is never evidence: it leaves the execution claim
- *   held and resumable (probe P11), which is the opposite of stopped;
- * - or, when the stream cannot say (it was closed before the end), the server's own persisted `outcome` of the session.
- *   A `shutdown` interrupt never writes it (`projectIdle` returns early), so a persisted `interrupted` is a real stop.
+ * This module is the acting half:
+ * - `stopDirectoryActivityV2` takes one reading's activity and kills every running shell, then interrupts every active
+ *   session, the root first. Shells go first because each kill wakes its owner, which the interrupt then stops.
+ * - `startQuarantineWatchV2` repeats that for the whole quarantine hold of a stop that could not be confirmed.
  *
- * That evidence only rules out executions that already happened. While background work is open (`followUpPossible`),
- * a finished or cancelled child makes the server start a root turn by itself, and a persisted outcome of the turn
- * before says nothing about it. With `followUpPossible` nothing confirms the root: the probe is only ever `busy` or
- * `unconfirmed`, the barrier quarantines, and the watch runs for the whole hold, interrupting the root on every busy
- * observation.
- *
- * The liveness reading is taken again after the evidence is read, so a cold root that starts in between reads as busy.
+ * Every session and shell in the directory is treated as the run's: nothing else shares a gateway checkout directory.
  */
 
-import type {
-  KillOwnedShellsOptions,
-  KillOwnedShellsResult,
-  LedgerReconcileAdapter,
-  RemoteOpenCodeV2Client,
-} from '@fro-bot/runtime'
+import type {DirectoryActivity, RemoteOpenCodeV2Client} from '@fro-bot/runtime'
 import type {GatewayLogger} from '../discord/client.js'
 
-import {killOwnedShells, toErrorMessage} from '@fro-bot/runtime'
+import {observeDirectoryV2, toErrorMessage} from '@fro-bot/runtime'
 import {
   QUARANTINE_HOLD_WINDOW_MS,
   ROOT_QUIESCENCE_POLL_INTERVAL_MS,
   ROOT_WATCH_REQUEST_TIMEOUT_MS,
 } from './root-stop.js'
-import {toRuntimeLogger} from './runtime-logger.js'
 
-/** The two calls this module makes; the real V2 client satisfies it. */
-export type RootStopClientV2 = Pick<RemoteOpenCodeV2Client, 'getSession' | 'interrupt'>
-
-/** How the root's latest execution ended on the stream, as the event loop recorded it. */
-export type StreamTerminal = 'failed' | 'inactivity' | 'shutdown' | 'succeeded' | 'superseded' | 'user'
+/** The two calls the acting half makes; the real V2 client satisfies it. */
+export type DirectoryStopClientV2 = Pick<RemoteOpenCodeV2Client, 'deleteShell' | 'interrupt'>
 
 /**
- * Interrupt one session. Best-effort: a failed request is evidence for the confirmation step, not a reason to abort the
- * settle attempt. Never throws.
+ * Interrupt one session. Best-effort: a failed request is not a reason to abort the stop, and the next reading of the
+ * directory shows whether it worked. Never throws.
  */
 export async function interruptSession(
-  client: RootStopClientV2,
+  client: Pick<RemoteOpenCodeV2Client, 'interrupt'>,
   sessionId: string,
   signal: AbortSignal,
   logger: GatewayLogger,
@@ -66,7 +50,7 @@ export async function interruptSession(
       return
     }
     if (!result.data.interrupted) {
-      // Not a stop and not a failure: nothing active was interrupted. Confirmation never reads it as either.
+      // Not a stop and not a failure: nothing active was interrupted.
       logger.debug({sessionId, role, interrupted: false}, 'settle-owned-sessions: session interrupt was a no-op')
     }
   } catch (error) {
@@ -74,59 +58,52 @@ export async function interruptSession(
   }
 }
 
-export type RootProbe = 'busy' | 'confirmed' | 'unconfirmed'
-
-export interface ProbeRootStopV2Options {
-  /** Background work is open, so a root turn the stream has not shown can still start. Makes confirmation impossible. */
-  readonly followUpPossible?: boolean
-  readonly client: RootStopClientV2
-  /** Global liveness: the V2 reconcile adapter's `liveSessionIds`. */
-  readonly adapter: LedgerReconcileAdapter
+export interface StopDirectoryActivityOptions {
+  readonly client: DirectoryStopClientV2
   readonly rootSessionId: string
+  readonly directory: string
+  /** What one reading of the directory showed. */
+  readonly activity: DirectoryActivity
+  /** Interrupt the root even if the reading did not show it, for a root whose prompt may not be admitted yet. */
+  readonly alwaysInterruptRoot?: boolean
   readonly signal: AbortSignal
-  /** How the root's latest execution ended on the stream, or `null` when it has not (or the stream is gone). */
-  readonly streamTerminal: () => StreamTerminal | null
+  readonly logger: GatewayLogger
 }
 
 /**
- * One observation of the root. Live is `busy`: the caller interrupts again. Not live is only `confirmed` with positive
- * evidence that an execution ended (see the module doc); without it it is `unconfirmed`. A failed lookup is
- * `unconfirmed`.
+ * Kill every running shell of the directory, then interrupt every active session, the root first. A queued inbox item is
+ * left alone: only a wake that has started can be interrupted, and the next reading sees it. Best-effort and never
+ * throws: a failed DELETE or interrupt shows up as activity in the next reading.
  */
-export async function probeRootStopV2(options: ProbeRootStopV2Options): Promise<RootProbe> {
-  const {client, adapter, rootSessionId, signal, streamTerminal, followUpPossible = false} = options
-  const live = await adapter.liveSessionIds(signal)
-  if (!live.success) return 'unconfirmed'
-  if (live.data.has(rootSessionId)) return 'busy'
-  if (followUpPossible) return 'unconfirmed'
+export async function stopDirectoryActivityV2(options: StopDirectoryActivityOptions): Promise<void> {
+  const {client, rootSessionId, directory, activity, alwaysInterruptRoot = false, signal, logger} = options
 
-  const terminal = streamTerminal()
-  if (terminal === 'shutdown') return 'unconfirmed'
-  let evidence = terminal === 'user' || terminal === 'succeeded' || terminal === 'failed'
-  if (!evidence) {
-    try {
-      const session = await client.getSession({sessionId: rootSessionId, signal})
-      if (!session.success) return 'unconfirmed'
-      evidence = session.data.outcome !== null
-    } catch {
-      return 'unconfirmed'
-    }
-  }
-  if (!evidence) return 'unconfirmed'
+  await Promise.all(
+    activity.runningShellIds.map(async shellId => {
+      try {
+        const result = await client.deleteShell({directory, shellId, signal})
+        if (!result.success) {
+          logger.warn({shellId, error: result.error.kind}, 'settle-owned-sessions: shell delete returned an error')
+        }
+      } catch (error) {
+        logger.warn({shellId, detail: toErrorMessage(error)}, 'settle-owned-sessions: shell delete threw')
+      }
+    }),
+  )
 
-  // A cold root can start between the first reading and the evidence. Only a root that is still absent now is stopped.
-  const after = await adapter.liveSessionIds(signal)
-  if (!after.success) return 'unconfirmed'
-  return after.data.has(rootSessionId) ? 'busy' : 'confirmed'
+  const rootActive = activity.activeSessionIds.includes(rootSessionId)
+  if (rootActive || alwaysInterruptRoot) await interruptSession(client, rootSessionId, signal, logger, 'root')
+  await Promise.allSettled(
+    activity.activeSessionIds
+      .filter(sessionId => sessionId !== rootSessionId)
+      .map(async sessionId => interruptSession(client, sessionId, signal, logger, 'owned')),
+  )
 }
 
-export interface QuarantineRootWatchV2Options extends Omit<ProbeRootStopV2Options, 'signal'> {
-  /**
-   * The background shells to keep killing. Each tick DELETEs any owned shell it finds running before it probes the root,
-   * and the watch does not end on a confirmed root while a shell is still running: a DELETE wakes the owner, and a shell
-   * that outlived the barrier must not outlive the hold.
-   */
-  readonly shells?: Omit<KillOwnedShellsOptions, 'logger' | 'pollIntervalMs' | 'rounds' | 'signal'>
+export interface QuarantineWatchV2Options {
+  readonly client: RemoteOpenCodeV2Client
+  readonly directory: string
+  readonly rootSessionId: string
   readonly logger: GatewayLogger
   readonly runId?: string
   readonly windowMs?: number
@@ -134,16 +111,17 @@ export interface QuarantineRootWatchV2Options extends Omit<ProbeRootStopV2Option
 }
 
 /**
- * Keeps probing a root the barrier could not confirm, for the length of the quarantine hold: every busy observation
- * sends another interrupt, so a prompt that started late is stopped instead of running through the hold. With `shells`
- * it also re-deletes every owned shell it finds running. Ends at the
- * first confirmation or when the window closes (with `followUpPossible` nothing confirms, so it always runs to the end
- * of the window). A window timer ends it even if a request hangs, every request is bounded, and the timers are unref'd.
+ * Keeps stopping the directory for the whole quarantine hold: every tick reads it (without the inbox, which cannot be
+ * acted on), kills every running shell and interrupts every active session. It never ends on a quiet reading, because a
+ * paused producer can wake a session at any point in the hold; only the window closes it. A window timer ends it even if
+ * a request hangs, every request is bounded, and the timers are unref'd.
  *
  * @returns `stop`, which ends the watch early. Safe to call more than once.
  */
-export function startQuarantineRootWatchV2(options: QuarantineRootWatchV2Options): () => void {
+export function startQuarantineWatchV2(options: QuarantineWatchV2Options): () => void {
   const {
+    client,
+    directory,
     windowMs = QUARANTINE_HOLD_WINDOW_MS,
     pollIntervalMs = ROOT_QUIESCENCE_POLL_INTERVAL_MS,
     rootSessionId,
@@ -163,7 +141,7 @@ export function startQuarantineRootWatchV2(options: QuarantineRootWatchV2Options
   let timer: ReturnType<typeof setTimeout> | undefined
   let windowTimer: ReturnType<typeof setTimeout> | undefined
   let ended = false
-  let interrupts = 0
+  let sweeps = 0
 
   function end(): void {
     if (ended) return
@@ -176,76 +154,68 @@ export function startQuarantineRootWatchV2(options: QuarantineRootWatchV2Options
 
   windowTimer = setTimeout(() => {
     if (ended) return
-    logger.warn({rootSessionId, interrupts}, 'root-watch: quarantine hold ended without confirming the root stopped')
+    logger.warn({rootSessionId, sweeps}, 'root-watch: quarantine hold ended')
     end()
   }, windowMs)
   windowTimer.unref()
 
-  /** One request bounded by its own cap; a hung request resolves `fallback` instead of stalling the watch. */
-  async function bounded<T>(work: (signal: AbortSignal) => Promise<T>, fallback: T): Promise<T> {
+  /** One sweep bounded by its own cap; a hung request resolves instead of stalling the watch. */
+  async function boundedSweep(): Promise<void> {
     const requestController = new AbortController()
     const forward = (): void => requestController.abort()
     controller.signal.addEventListener('abort', forward, {once: true})
     let capTimer: ReturnType<typeof setTimeout> | undefined
-    const capped = new Promise<T>(resolve => {
+    const capped = new Promise<void>(resolve => {
       capTimer = setTimeout(() => {
         requestController.abort()
-        resolve(fallback)
+        resolve()
       }, ROOT_WATCH_REQUEST_TIMEOUT_MS)
       capTimer.unref()
     })
+    const sweep = async (): Promise<void> => {
+      const observation = await observeDirectoryV2({
+        client,
+        directory,
+        signal: requestController.signal,
+        inbox: false,
+        readTimeoutMs: ROOT_WATCH_REQUEST_TIMEOUT_MS,
+      })
+      // A partial reading is acted on too: what it did show is still there to stop.
+      if (observation.kind === 'quiescent') return
+      const {activity} = observation
+      if (activity.activeSessionIds.length === 0 && activity.runningShellIds.length === 0) return
+      sweeps += 1
+      logger.warn(
+        {
+          rootSessionId,
+          sweeps,
+          activeSessionCount: activity.activeSessionIds.length,
+          runningShellCount: activity.runningShellIds.length,
+        },
+        'root-watch: the directory is active during the quarantine hold — stopping it again',
+      )
+      await stopDirectoryActivityV2({
+        client,
+        rootSessionId,
+        directory,
+        activity,
+        signal: requestController.signal,
+        logger,
+      })
+    }
     try {
-      return await Promise.race([work(requestController.signal).catch(() => fallback), capped])
+      await Promise.race([sweep().catch(() => undefined), capped])
     } finally {
       if (capTimer !== undefined) clearTimeout(capTimer)
       controller.signal.removeEventListener('abort', forward)
     }
   }
 
-  const unconfirmedSweep: KillOwnedShellsResult = {confirmed: false, stillRunning: []}
-
   async function tick(): Promise<void> {
     timer = undefined
     if (ended) return
-    let shellsClear = true
-    if (options.shells !== undefined) {
-      const shells = options.shells
-      const swept = await bounded<KillOwnedShellsResult>(
-        async signal =>
-          killOwnedShells({
-            ...shells,
-            logger: toRuntimeLogger(logger),
-            signal,
-            rounds: 1,
-            pollIntervalMs: 0,
-          }),
-        unconfirmedSweep,
-      )
-      if (ended) return
-      shellsClear = swept.confirmed
-      if (swept.confirmed && swept.deleted.length > 0) {
-        logger.warn(
-          {rootSessionId, shellCount: swept.deleted.length},
-          'root-watch: owned background shells were running during the quarantine hold — deleted them',
-        )
-      }
-    }
-    const probe = await bounded<RootProbe>(async signal => probeRootStopV2({...options, signal}), 'unconfirmed')
+    await boundedSweep()
     if (ended) return
-    if (probe === 'confirmed' && shellsClear) {
-      logger.info({rootSessionId, interrupts}, 'root-watch: the root is confirmed stopped; ending the watch')
-      end()
-      return
-    }
-    if (probe === 'busy') {
-      interrupts += 1
-      logger.warn(
-        {rootSessionId, interrupts},
-        'root-watch: the root is running during the quarantine hold — interrupting it again',
-      )
-      await bounded(async signal => interruptSession(options.client, rootSessionId, signal, logger, 'root'), undefined)
-      if (ended) return
-    }
     timer = setTimeout(() => {
       // eslint-disable-next-line no-void
       void tick()

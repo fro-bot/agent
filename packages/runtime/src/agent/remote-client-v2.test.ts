@@ -316,6 +316,80 @@ describe('createRemoteOpenCodeV2Client', () => {
       expect(requests[0]?.headers.accept).toBe('text/event-stream')
     })
 
+    it('reads a CRLF delimiter split across chunks at every boundary', async () => {
+      // #given — two frames with CRLF line ends, cut at every position (a CR and its LF in different chunks included)
+      const wire = 'data: {"type":"a","data":{}}\r\n\r\ndata: {"type":"b","data":{}}\r\n\r\n'
+      const expected = [
+        {type: 'a', data: {}},
+        {type: 'b', data: {}},
+      ]
+
+      for (let cut = 0; cut <= wire.length; cut++) {
+        const client = createRemoteOpenCodeV2Client({
+          baseUrl: 'http://w',
+          fetch: makeFetch(() => sseResponse([wire.slice(0, cut), wire.slice(cut)])).fetch,
+        })
+
+        // #when
+        const result = await client.subscribeEvents({directory: '/d'})
+
+        // #then
+        if (!result.success) throw new Error('expected a stream')
+        const frames: unknown[] = []
+        for await (const frame of result.data) frames.push(frame)
+        expect(frames, `cut at ${cut}`).toEqual(expected)
+      }
+    })
+
+    it('reads a CRLF delimiter split across three chunks, and one byte at a time', async () => {
+      // #given
+      const wire = 'data: {"type":"a","data":{}}\r\n\r\ndata: {"type":"b","data":{}}\r\n\r\n'
+      const expected = [
+        {type: 'a', data: {}},
+        {type: 'b', data: {}},
+      ]
+      const splits: string[][] = [[...wire]]
+      for (let first = 1; first < wire.length; first++) {
+        for (let second = first + 1; second < wire.length; second++) {
+          splits.push([wire.slice(0, first), wire.slice(first, second), wire.slice(second)])
+        }
+      }
+
+      for (const chunks of splits) {
+        const client = createRemoteOpenCodeV2Client({
+          baseUrl: 'http://w',
+          fetch: makeFetch(() => sseResponse(chunks)).fetch,
+        })
+
+        // #when
+        const result = await client.subscribeEvents({directory: '/d'})
+
+        // #then
+        if (!result.success) throw new Error('expected a stream')
+        const frames: unknown[] = []
+        for await (const frame of result.data) frames.push(frame)
+        expect({chunks, frames}).toEqual({chunks, frames: expected})
+      }
+    })
+
+    it('reads lone CR line ends and a final frame whose delimiter ends the stream', async () => {
+      // #given
+      const client = createRemoteOpenCodeV2Client({
+        baseUrl: 'http://w',
+        fetch: makeFetch(() => sseResponse(['data: {"type":"a","data":{}}\r\r', 'data: {"type":"b","data":{}}\r']))
+          .fetch,
+      })
+
+      // #when
+      const result = await client.subscribeEvents({directory: '/d'})
+
+      // #then — the trailing lone CR is a line end, but one line end is not a frame delimiter
+      if (!result.success) throw new Error('expected a stream')
+      const frames: unknown[] = []
+      for await (const frame of result.data) frames.push(frame)
+      expect(frames).toEqual([{type: 'a', data: {}}])
+    })
+
     it('ends the stream with an error at a frame it cannot parse, after delivering the frames before it', async () => {
       // #given — a frame that is cut off, then a frame that would parse
       const client = createRemoteOpenCodeV2Client({
@@ -546,6 +620,71 @@ describe('createRemoteOpenCodeV2Client', () => {
         error: {kind: 'network', message: 'connect refused'},
       })
       expect(await aborting.getShell({directory: '/d', shellId: 'sh_1', signal: controller.signal})).toEqual({
+        success: false,
+        error: {kind: 'aborted'},
+      })
+    })
+  })
+  describe('session inbox', () => {
+    it('reads the number of queued items of a session', async () => {
+      // #given — the shape of `session.inbox.list`: durable enqueued work not yet delivered
+      const {fetch, requests} = makeFetch(() =>
+        json(200, {
+          data: [
+            {id: 'msg_1', type: 'synthetic', payload: {text: 'x', metadata: {source: 'shell'}}, delivery: 'steer'},
+            {id: 'msg_2', type: 'user', payload: {text: 'y'}, delivery: 'steer'},
+          ],
+        }),
+      )
+      const client = createRemoteOpenCodeV2Client({baseUrl: 'http://w', headers: AUTH, fetch})
+
+      // #when
+      const result = await client.listSessionInbox({sessionId: 'ses_a/b'})
+
+      // #then
+      expect(result).toEqual({success: true, data: {queued: 2}})
+      expect(requests[0]).toMatchObject({url: 'http://w/api/session/ses_a%2Fb/inbox', method: 'GET'})
+      expect(requests[0]?.headers).toMatchObject(AUTH)
+    })
+
+    it('reads an empty inbox', async () => {
+      // #given
+      const client = createRemoteOpenCodeV2Client({
+        baseUrl: 'http://w',
+        fetch: makeFetch(() => json(200, {data: []})).fetch,
+      })
+
+      // #when / #then
+      expect(await client.listSessionInbox({sessionId: 'ses_1'})).toEqual({success: true, data: {queued: 0}})
+    })
+
+    it('fails closed on a payload without a data array, never reading it as empty', async () => {
+      // #given
+      const client = createRemoteOpenCodeV2Client({baseUrl: 'http://w', fetch: makeFetch(() => json(200, {})).fetch})
+
+      // #when / #then
+      expect(await client.listSessionInbox({sessionId: 'ses_1'})).toEqual({success: false, error: {kind: 'parse'}})
+    })
+
+    it('reports an unknown session as http 404 and passes the signal through', async () => {
+      // #given
+      const controller = new AbortController()
+      const notFound = createRemoteOpenCodeV2Client({baseUrl: 'http://w', fetch: makeFetch(() => json(404, {})).fetch})
+      const aborting = createRemoteOpenCodeV2Client({
+        baseUrl: 'http://w',
+        fetch: async (_input, init) => {
+          controller.abort()
+          if (init?.signal?.aborted === true) throw new DOMException('aborted', 'AbortError')
+          return json(200, {data: []})
+        },
+      })
+
+      // #when / #then
+      expect(await notFound.listSessionInbox({sessionId: 'ses_gone'})).toEqual({
+        success: false,
+        error: {kind: 'http', status: 404},
+      })
+      expect(await aborting.listSessionInbox({sessionId: 'ses_1', signal: controller.signal})).toEqual({
         success: false,
         error: {kind: 'aborted'},
       })

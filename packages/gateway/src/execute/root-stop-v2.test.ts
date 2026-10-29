@@ -1,165 +1,52 @@
-import type {LedgerReconcileAdapter, V2CallError, V2SessionOutcome} from '@fro-bot/runtime'
+import type {DirectoryActivity, RemoteOpenCodeV2Client} from '@fro-bot/runtime'
 import type {GatewayLogger} from '../discord/client.js'
-import type {RootStopClientV2, StreamTerminal} from './root-stop-v2.js'
+import type {DirectoryStopClientV2} from './root-stop-v2.js'
 
-import {createOwnershipLedger, err, ok, shellLedgerKey} from '@fro-bot/runtime'
+import {err, ok} from '@fro-bot/runtime'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
-import {interruptSession, probeRootStopV2, startQuarantineRootWatchV2} from './root-stop-v2.js'
+import {interruptSession, startQuarantineWatchV2, stopDirectoryActivityV2} from './root-stop-v2.js'
 import {makeShellServer} from './shell-server-v2.fixture.js'
 
 const ROOT = 'ses_root'
+const CHILD = 'ses_child'
+const GRAND = 'ses_grand'
 const DIRECTORY = '/workspace/repos/o/r'
 
 function makeLogger(): GatewayLogger {
   return {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
 }
 
-type Live = readonly string[] | 'fail'
-
-interface Setup {
-  /** Active-list reading per call (the last entry repeats). */
-  readonly live?: readonly Live[]
-  /** The persisted outcome `getSession` reports; `'fail'` makes the lookup fail. */
-  readonly outcome?: V2SessionOutcome | null | 'fail'
-  readonly interrupt?: () => ReturnType<RootStopClientV2['interrupt']>
+function activity(overrides: Partial<DirectoryActivity> = {}): DirectoryActivity {
+  return {activeSessionIds: [], runningShellIds: [], queuedInbox: [], ...overrides}
 }
 
-function makeProbe(setup: Setup = {}) {
-  const readings = setup.live ?? [[]]
-  let call = 0
-  const adapter: LedgerReconcileAdapter = {
-    children: vi.fn(async () => ok([])),
-    liveSessionIds: vi.fn(async () => {
-      const reading = readings[Math.min(call, readings.length - 1)] ?? []
-      call += 1
-      return reading === 'fail' ? err(new Error('active failed')) : ok(new Set(reading))
-    }),
-  }
-  const getSession = vi.fn<RootStopClientV2['getSession']>(async () => {
-    if (setup.outcome === 'fail') return err({kind: 'http', status: 500} satisfies V2CallError)
-    return ok({id: ROOT, parentId: null, directory: DIRECTORY, outcome: setup.outcome ?? null})
-  })
-  const interrupt = vi.fn<RootStopClientV2['interrupt']>(setup.interrupt ?? (async () => ok({interrupted: true})))
-  const client: RootStopClientV2 = {getSession, interrupt}
-  return {client, adapter, getSession, interrupt}
-}
+type InterruptImpl = DirectoryStopClientV2['interrupt']
 
-function probe(setup: Setup, extra: {terminal?: StreamTerminal | null; followUpPossible?: boolean} = {}) {
-  const made = makeProbe(setup)
-  const result = probeRootStopV2({
-    client: made.client,
-    adapter: made.adapter,
-    rootSessionId: ROOT,
-    signal: new AbortController().signal,
-    streamTerminal: () => extra.terminal ?? null,
-    ...(extra.followUpPossible === undefined ? {} : {followUpPossible: extra.followUpPossible}),
+function makeStopClient(
+  options: {
+    readonly interrupt?: InterruptImpl
+    readonly shellServer?: Parameters<typeof makeShellServer>[0]
+  } = {},
+) {
+  const shellServer = makeShellServer(options.shellServer)
+  const interrupt = vi.fn<InterruptImpl>(async ({sessionId}) => {
+    shellServer.log.push(`interrupt:${sessionId}`)
+    return options.interrupt === undefined ? ok({interrupted: true}) : options.interrupt({sessionId})
   })
-  return {result, ...made}
+  const client: DirectoryStopClientV2 = {interrupt, deleteShell: shellServer.deleteShell}
+  return {client, interrupt, shellServer}
 }
 
 afterEach(() => {
   vi.useRealTimers()
 })
 
-describe('probeRootStopV2', () => {
-  it.each<[string, StreamTerminal]>([
-    ['an interrupt with reason user', 'user'],
-    ['a terminal success', 'succeeded'],
-    ['a terminal failure', 'failed'],
-  ])(
-    'confirms the root on %s from the stream when the root is absent from the active list',
-    async (_label, terminal) => {
-      // #given / #when
-      const {result, getSession} = probe({}, {terminal})
-
-      // #then — the stream was evidence enough; nothing more was asked of the server
-      await expect(result).resolves.toBe('confirmed')
-      expect(getSession).not.toHaveBeenCalled()
-    },
-  )
-
-  it('never accepts an interrupt with reason shutdown, whatever the persisted outcome says', async () => {
-    // #given — a shutdown interrupt releases nothing and leaves the claim held (probe P11)
-    const {result} = probe({outcome: 'interrupted'}, {terminal: 'shutdown'})
-
-    // #then
-    await expect(result).resolves.toBe('unconfirmed')
-  })
-
-  it('is busy while the root is in the active list, whatever else it shows', async () => {
-    // #given
-    const {result} = probe({live: [[ROOT]], outcome: 'succeeded'}, {terminal: 'user'})
-
-    // #then
-    await expect(result).resolves.toBe('busy')
-  })
-
-  it('does not read an interrupt reply of false as a stop', async () => {
-    // #given — the root is absent, nothing was seen on the stream, and no execution has ended: a root whose prompt is
-    // not admitted yet looks exactly like this (probe P1)
-    const {result} = probe({outcome: null})
-
-    // #then
-    await expect(result).resolves.toBe('unconfirmed')
-  })
-
-  it.each<V2SessionOutcome>(['succeeded', 'failed', 'interrupted'])(
-    'confirms from a persisted outcome of %s when the stream showed nothing',
-    async outcome => {
-      // #given — the stream was closed before the end; the server's own record of the last execution is evidence
-      const {result} = probe({outcome})
-
-      // #then
-      await expect(result).resolves.toBe('confirmed')
-    },
-  )
-
-  it('is unconfirmed when the persisted outcome cannot be read', async () => {
-    // #given
-    const {result} = probe({outcome: 'fail'})
-
-    // #then
-    await expect(result).resolves.toBe('unconfirmed')
-  })
-
-  it('is unconfirmed when the active list cannot be read, before or after the evidence', async () => {
-    // #then
-    await expect(probe({live: ['fail']}, {terminal: 'user'}).result).resolves.toBe('unconfirmed')
-    await expect(probe({live: [[], 'fail']}, {terminal: 'user'}).result).resolves.toBe('unconfirmed')
-  })
-
-  it('is busy when a cold root starts between the first reading and the evidence', async () => {
-    // #given — absent first, listed on the second reading
-    const {result} = probe({live: [[], [ROOT]]}, {terminal: 'succeeded'})
-
-    // #then
-    await expect(result).resolves.toBe('busy')
-  })
-
-  it('never confirms while background work can still start a root turn', async () => {
-    // #given — a finished or cancelled child makes the server prepare a notice turn that is not on the stream yet
-    const {result, getSession} = probe({outcome: 'succeeded'}, {terminal: 'succeeded', followUpPossible: true})
-
-    // #then
-    await expect(result).resolves.toBe('unconfirmed')
-    expect(getSession).not.toHaveBeenCalled()
-  })
-
-  it('is still busy, not unconfirmed, when follow-up is possible and the root is live', async () => {
-    // #given
-    const {result} = probe({live: [[ROOT]]}, {followUpPossible: true})
-
-    // #then
-    await expect(result).resolves.toBe('busy')
-  })
-})
-
 describe('interruptSession', () => {
   it('reports nothing and never throws when the interrupt fails', async () => {
     // #given
     const logger = makeLogger()
-    const client = makeProbe({interrupt: async () => err({kind: 'network', message: 'down'})}).client
+    const {client} = makeStopClient({interrupt: async () => err({kind: 'network', message: 'down'})})
 
     // #when / #then
     await expect(interruptSession(client, ROOT, new AbortController().signal, logger, 'root')).resolves.toBeUndefined()
@@ -172,7 +59,7 @@ describe('interruptSession', () => {
   it('treats an interrupt reply of false as a no-op worth a debug line, not a warning', async () => {
     // #given
     const logger = makeLogger()
-    const client = makeProbe({interrupt: async () => ok({interrupted: false})}).client
+    const {client} = makeStopClient({interrupt: async () => ok({interrupted: false})})
 
     // #when
     await interruptSession(client, ROOT, new AbortController().signal, logger, 'owned')
@@ -188,11 +75,11 @@ describe('interruptSession', () => {
   it('swallows a thrown interrupt', async () => {
     // #given
     const logger = makeLogger()
-    const client = makeProbe({
+    const {client} = makeStopClient({
       interrupt: async () => {
         throw new Error('boom')
       },
-    }).client
+    })
 
     // #when / #then
     await expect(interruptSession(client, ROOT, new AbortController().signal, logger, 'root')).resolves.toBeUndefined()
@@ -200,196 +87,305 @@ describe('interruptSession', () => {
   })
 })
 
-function startWatch(setup: Setup, extra: {windowMs?: number; followUpPossible?: boolean} = {}) {
-  vi.useFakeTimers()
-  const made = makeProbe(setup)
-  const logger = makeLogger()
-  const stop = startQuarantineRootWatchV2({
-    client: made.client,
-    adapter: made.adapter,
-    rootSessionId: ROOT,
-    streamTerminal: () => null,
-    logger,
-    pollIntervalMs: 500,
-    ...(extra.windowMs === undefined ? {} : {windowMs: extra.windowMs}),
-    ...(extra.followUpPossible === undefined ? {} : {followUpPossible: extra.followUpPossible}),
-  })
-  return {...made, logger, stop}
-}
+describe('stopDirectoryActivityV2', () => {
+  const signal = new AbortController().signal
 
-describe('startQuarantineRootWatchV2', () => {
-  it('interrupts the root on every busy observation during the hold', async () => {
-    // #given — the root keeps showing up live
-    const watch = startWatch({live: [[ROOT]]})
-
-    // #when
-    await vi.advanceTimersByTimeAsync(2_100)
-
-    // #then
-    expect(watch.interrupt.mock.calls.length).toBeGreaterThanOrEqual(3)
-    expect(watch.interrupt).toHaveBeenCalledWith(expect.objectContaining({sessionId: ROOT}))
-    watch.stop()
-  })
-
-  it('ends at the first confirmation', async () => {
-    // #given — busy once, then stopped with a persisted outcome
-    const watch = startWatch({live: [[ROOT], []], outcome: 'interrupted'})
-
-    // #when
-    await vi.advanceTimersByTimeAsync(5_000)
-
-    // #then
-    expect(watch.interrupt).toHaveBeenCalledTimes(1)
-    expect(watch.logger.info).toHaveBeenCalledWith(expect.anything(), expect.stringContaining('confirmed stopped'))
-    const probesAfterEnd = watch.adapter.liveSessionIds as ReturnType<typeof vi.fn>
-    const callsAtEnd = probesAfterEnd.mock.calls.length
-    await vi.advanceTimersByTimeAsync(5_000)
-    expect(probesAfterEnd.mock.calls.length).toBe(callsAtEnd)
-  })
-
-  it('ends when the hold window closes even if the root is never confirmed', async () => {
+  it('deletes every running shell, then interrupts the root first and every other active session', async () => {
     // #given
-    const watch = startWatch({outcome: null}, {windowMs: 3_000})
+    const {client, shellServer} = makeStopClient({
+      shellServer: {
+        shells: {sh_1: {status: 'running', owner: ROOT}, sh_2: {status: 'running', owner: null}},
+      },
+    })
 
     // #when
-    await vi.advanceTimersByTimeAsync(10_000)
+    await stopDirectoryActivityV2({
+      client,
+      rootSessionId: ROOT,
+      directory: DIRECTORY,
+      activity: activity({activeSessionIds: [GRAND, CHILD, ROOT], runningShellIds: ['sh_1', 'sh_2']}),
+      signal,
+      logger: makeLogger(),
+    })
 
     // #then
-    expect(watch.logger.warn).toHaveBeenCalledWith(
-      expect.objectContaining({rootSessionId: ROOT}),
-      expect.stringContaining('hold ended'),
-    )
+    const log = shellServer.log
+    expect(log.slice(0, 2).sort()).toEqual(['delete:sh_1', 'delete:sh_2'])
+    expect(log[2]).toBe(`interrupt:${ROOT}`)
+    expect(log.slice(3).sort()).toEqual([`interrupt:${CHILD}`, `interrupt:${GRAND}`].sort())
   })
 
-  it('keeps aborting for the whole window while follow-up work is open, since nothing can confirm the root', async () => {
+  it('passes the directory and the signal to every DELETE', async () => {
     // #given
-    const watch = startWatch({live: [[ROOT]], outcome: 'succeeded'}, {followUpPossible: true, windowMs: 3_000})
+    const controller = new AbortController()
+    const {client, shellServer} = makeStopClient({shellServer: {shells: {sh_1: {status: 'running', owner: ROOT}}}})
 
     // #when
-    await vi.advanceTimersByTimeAsync(2_900)
+    await stopDirectoryActivityV2({
+      client,
+      rootSessionId: ROOT,
+      directory: DIRECTORY,
+      activity: activity({runningShellIds: ['sh_1']}),
+      signal: controller.signal,
+      logger: makeLogger(),
+    })
 
     // #then
-    expect(watch.interrupt.mock.calls.length).toBeGreaterThan(1)
-    watch.stop()
+    expect(shellServer.deleteShell).toHaveBeenCalledWith({
+      directory: DIRECTORY,
+      shellId: 'sh_1',
+      signal: controller.signal,
+    })
   })
 
-  it('does not stall on an interrupt that never answers', async () => {
-    // #given — the first interrupt hangs; the probe keeps seeing the root busy
-    const watch = startWatch({live: [[ROOT]], interrupt: async () => new Promise(() => undefined)})
+  it('does nothing for a queued inbox item: only a wake that has started can be interrupted', async () => {
+    // #given
+    const {client, interrupt, shellServer} = makeStopClient()
 
-    // #when — past the per-request cap and a few polls
-    await vi.advanceTimersByTimeAsync(20_000)
+    // #when
+    await stopDirectoryActivityV2({
+      client,
+      rootSessionId: ROOT,
+      directory: DIRECTORY,
+      activity: activity({queuedInbox: [{sessionId: ROOT, queued: 1}]}),
+      signal,
+      logger: makeLogger(),
+    })
 
     // #then
-    expect(watch.interrupt.mock.calls.length).toBeGreaterThan(1)
-    watch.stop()
+    expect(interrupt).not.toHaveBeenCalled()
+    expect(shellServer.deleteShell).not.toHaveBeenCalled()
+  })
+
+  it('keeps going when a DELETE fails or throws, and when an interrupt throws', async () => {
+    // #given
+    const {client, interrupt} = makeStopClient({
+      shellServer: {shells: {sh_1: {status: 'running', owner: ROOT}}, deleteFails: true},
+      interrupt: async () => {
+        throw new Error('boom')
+      },
+    })
+
+    // #when / #then
+    await expect(
+      stopDirectoryActivityV2({
+        client,
+        rootSessionId: ROOT,
+        directory: DIRECTORY,
+        activity: activity({activeSessionIds: [ROOT, CHILD], runningShellIds: ['sh_1']}),
+        signal,
+        logger: makeLogger(),
+      }),
+    ).resolves.toBeUndefined()
+    expect(interrupt).toHaveBeenCalledTimes(2)
+  })
+
+  it('interrupts the root even when it is not in the activity, if asked to', async () => {
+    // #given — the root’s prompt may not be admitted yet
+    const {client, interrupt} = makeStopClient()
+
+    // #when
+    await stopDirectoryActivityV2({
+      client,
+      rootSessionId: ROOT,
+      directory: DIRECTORY,
+      activity: activity({activeSessionIds: [CHILD]}),
+      alwaysInterruptRoot: true,
+      signal,
+      logger: makeLogger(),
+    })
+
+    // #then
+    expect(interrupt.mock.calls.map(([input]) => input.sessionId)).toEqual([ROOT, CHILD])
   })
 })
 
-describe('startQuarantineRootWatchV2: background shells', () => {
-  const SHELL = 'sh_bg1'
-  const OWNERS = new Set([ROOT])
+function startWatch(
+  world: {
+    active?: string[]
+    sessions?: string[]
+    shellServer?: Parameters<typeof makeShellServer>[0]
+    interrupt?: InterruptImpl
+    activeFails?: boolean
+    activeHangs?: boolean
+  } = {},
+  extra: {windowMs?: number} = {},
+) {
+  vi.useFakeTimers()
+  const active = new Set(world.active ?? [])
+  const made = makeStopClient({
+    shellServer: world.shellServer,
+    interrupt: async ({sessionId}) => {
+      if (world.interrupt !== undefined) return world.interrupt({sessionId})
+      active.delete(sessionId)
+      return ok({interrupted: true})
+    },
+  })
+  const activeCalls = vi.fn(async () => {
+    if (world.activeHangs === true) return new Promise<never>(() => undefined)
+    if (world.activeFails === true) throw new Error('down')
+    return Object.fromEntries([...active].map(id => [id, {type: 'running'}]))
+  })
+  const sessions = world.sessions ?? [ROOT, CHILD]
+  const client = {
+    ...made.client,
+    session: {
+      active: activeCalls,
+      list: vi.fn(async () => ({data: sessions.map(id => ({id, location: {directory: DIRECTORY}}))})),
+    },
+    getSession: vi.fn(async ({sessionId}: {sessionId: string}) =>
+      sessions.includes(sessionId)
+        ? ok({id: sessionId, parentId: null, directory: DIRECTORY, outcome: null})
+        : {success: false as const, error: {kind: 'http' as const, status: 404}},
+    ),
+    listShells: made.shellServer.listShells,
+    listSessionInbox: made.shellServer.listSessionInbox,
+  } as unknown as RemoteOpenCodeV2Client
+  const logger = makeLogger()
+  const stop = startQuarantineWatchV2({
+    client,
+    directory: DIRECTORY,
+    rootSessionId: ROOT,
+    logger,
+    pollIntervalMs: 500,
+    ...(extra.windowMs === undefined ? {} : {windowMs: extra.windowMs}),
+  })
+  return {...made, active, activeCalls, logger, stop}
+}
 
-  function startShellWatch(
-    setup: Setup,
-    server: ReturnType<typeof makeShellServer>,
-    extra: {followUpPossible?: boolean; windowMs?: number; ledgerHoldsShell?: boolean} = {},
-  ) {
-    vi.useFakeTimers()
-    const made = makeProbe(setup)
-    const ledger = createOwnershipLedger()
-    if (extra.ledgerHoldsShell !== false) ledger.adopt(shellLedgerKey(SHELL), 'background shell')
-    const stop = startQuarantineRootWatchV2({
-      client: made.client,
-      adapter: made.adapter,
-      rootSessionId: ROOT,
-      streamTerminal: () => null,
-      logger: makeLogger(),
-      pollIntervalMs: 500,
-      shells: {api: server.routes, directory: DIRECTORY, ownerSessionIds: OWNERS, ledger},
-      ...(extra.windowMs === undefined ? {} : {windowMs: extra.windowMs}),
-      ...(extra.followUpPossible === undefined ? {} : {followUpPossible: extra.followUpPossible}),
-    })
-    return {...made, stop, ledger}
-  }
-
-  it('re-deletes an owned shell it finds running during the hold', async () => {
-    // #given — the root is gone for good, but a shell survived the barrier's kill
-    const server = makeShellServer({shells: {[SHELL]: {status: 'running', owner: ROOT}}})
-    const watch = startShellWatch({live: [[]], outcome: 'interrupted'}, server)
+describe('startQuarantineWatchV2', () => {
+  it('interrupts every active session of the directory on every tick of the hold, root first', async () => {
+    // #given
+    const w = startWatch({active: [CHILD, ROOT]})
 
     // #when
     await vi.advanceTimersByTimeAsync(600)
 
     // #then
-    expect(server.deleteShell).toHaveBeenCalledWith(expect.objectContaining({shellId: SHELL, directory: DIRECTORY}))
-    expect(server.shells[SHELL]).toBeUndefined()
-    watch.stop()
+    expect(w.interrupt.mock.calls.map(([input]) => input.sessionId)).toEqual([ROOT, CHILD])
+    w.stop()
   })
 
-  it('does not end on a confirmed root while a shell is still running', async () => {
-    // #given — the root confirms at once, and the shell shrugs off the DELETE
-    const server = makeShellServer({
-      shells: {[SHELL]: {status: 'running', owner: ROOT}},
-      deleteDoesNotKill: [SHELL],
-    })
-    const watch = startShellWatch({live: [[]], outcome: 'interrupted'}, server)
+  it('catches a session that wakes later in the hold, not only at the first tick', async () => {
+    // #given — quiet at first
+    const w = startWatch()
+    await vi.advanceTimersByTimeAsync(2_100)
+    expect(w.interrupt).not.toHaveBeenCalled()
+
+    // #when — the root is woken
+    w.active.add(ROOT)
+    await vi.advanceTimersByTimeAsync(600)
+
+    // #then
+    expect(w.interrupt).toHaveBeenCalledWith(expect.objectContaining({sessionId: ROOT}))
+    w.stop()
+  })
+
+  it('deletes every running shell of the directory it finds during the hold, owned or not', async () => {
+    // #given
+    const w = startWatch({shellServer: {shells: {sh_stray: {status: 'running', owner: null}}}})
+
+    // #when
+    await vi.advanceTimersByTimeAsync(600)
+
+    // #then
+    expect(w.shellServer.deleteShell).toHaveBeenCalledWith(
+      expect.objectContaining({shellId: 'sh_stray', directory: DIRECTORY}),
+    )
+    expect(w.shellServer.shells).toEqual({})
+    w.stop()
+  })
+
+  it('catches a shell that starts late in the hold', async () => {
+    // #given
+    const w = startWatch()
+    await vi.advanceTimersByTimeAsync(3_000)
+
+    // #when
+    w.shellServer.shells.sh_late = {status: 'running', owner: ROOT}
+    await vi.advanceTimersByTimeAsync(600)
+
+    // #then
+    expect(w.shellServer.deleteShell).toHaveBeenCalledWith(expect.objectContaining({shellId: 'sh_late'}))
+    w.stop()
+  })
+
+  it('does not end when the directory looks quiet: the hold runs to the end of its window', async () => {
+    // #given
+    const w = startWatch({}, {windowMs: 10_000})
+
+    // #when
+    await vi.advanceTimersByTimeAsync(9_000)
+    const callsBefore = w.activeCalls.mock.calls.length
+    await vi.advanceTimersByTimeAsync(900)
+
+    // #then — still polling
+    expect(w.activeCalls.mock.calls.length).toBeGreaterThan(callsBefore)
+    w.stop()
+  })
+
+  it('ends when the hold window closes, and polls no more', async () => {
+    // #given
+    const w = startWatch({}, {windowMs: 2_000})
 
     // #when
     await vi.advanceTimersByTimeAsync(2_100)
-
-    // #then — still watching and still deleting
-    expect(server.deleteShell.mock.calls.length).toBeGreaterThanOrEqual(3)
-    watch.stop()
-  })
-
-  it('ends once the root is confirmed and no shell is running', async () => {
-    // #given
-    const server = makeShellServer({shells: {[SHELL]: {status: 'running', owner: ROOT}}})
-    const watch = startShellWatch({live: [[]], outcome: 'interrupted'}, server)
-
-    // #when
+    const callsAtEnd = w.activeCalls.mock.calls.length
     await vi.advanceTimersByTimeAsync(5_000)
-
-    // #then — one sweep killed it, and the watch stopped asking
-    expect(server.deleteShell).toHaveBeenCalledTimes(1)
-    const probes = watch.adapter.liveSessionIds as ReturnType<typeof vi.fn>
-    const callsAtEnd = probes.mock.calls.length
-    await vi.advanceTimersByTimeAsync(5_000)
-    expect(probes.mock.calls.length).toBe(callsAtEnd)
-  })
-
-  it('keeps watching for the whole window while follow-up work is open, deleting a late shell', async () => {
-    // #given — nothing runs yet
-    const server = makeShellServer()
-    const watch = startShellWatch({live: [[]], outcome: 'succeeded'}, server, {
-      followUpPossible: true,
-      windowMs: 3_000,
-      ledgerHoldsShell: false,
-    })
-    await vi.advanceTimersByTimeAsync(1_100)
-    expect(server.deleteShell).not.toHaveBeenCalled()
-
-    // #when — the woken root starts a shell
-    server.shells[SHELL] = {status: 'running', owner: ROOT}
-    await vi.advanceTimersByTimeAsync(1_000)
 
     // #then
-    expect(server.deleteShell).toHaveBeenCalledWith(expect.objectContaining({shellId: SHELL}))
-    watch.stop()
+    expect(w.activeCalls.mock.calls.length).toBe(callsAtEnd)
+    expect(w.logger.warn).toHaveBeenCalledWith(expect.anything(), expect.stringContaining('quarantine hold ended'))
   })
 
-  it('does not stall on a shell list that never answers', async () => {
+  it('does not read the inbox: only a wake that has started can be stopped', async () => {
     // #given
-    const server = makeShellServer({shells: {[SHELL]: {status: 'running', owner: ROOT}}})
-    server.listShells.mockImplementation(async () => new Promise<never>(() => undefined))
-    const watch = startShellWatch({live: [[ROOT]]}, server)
+    const w = startWatch({shellServer: {inbox: {[ROOT]: 3}}})
+
+    // #when
+    await vi.advanceTimersByTimeAsync(1_200)
+
+    // #then
+    expect(w.shellServer.listSessionInbox).not.toHaveBeenCalled()
+    w.stop()
+  })
+
+  it('keeps sweeping when the active list cannot be read, and still deletes the shells it can see', async () => {
+    // #given
+    const w = startWatch({activeFails: true, shellServer: {shells: {sh_1: {status: 'running', owner: ROOT}}}})
+
+    // #when
+    await vi.advanceTimersByTimeAsync(1_200)
+
+    // #then
+    expect(w.shellServer.deleteShell).toHaveBeenCalledWith(expect.objectContaining({shellId: 'sh_1'}))
+    w.stop()
+  })
+
+  it('does not stall on a read that never answers', async () => {
+    // #given
+    const w = startWatch({activeHangs: true})
 
     // #when — past the per-request cap and a few polls
     await vi.advanceTimersByTimeAsync(20_000)
 
-    // #then — the root was still probed and interrupted
-    expect(watch.interrupt.mock.calls.length).toBeGreaterThan(1)
-    watch.stop()
+    // #then — the watch is still ticking
+    expect(w.activeCalls.mock.calls.length).toBeGreaterThan(1)
+    w.stop()
+  })
+
+  it('stops when asked, and stopping twice is safe', async () => {
+    // #given
+    const w = startWatch()
+    await vi.advanceTimersByTimeAsync(600)
+    const calls = w.activeCalls.mock.calls.length
+
+    // #when
+    w.stop()
+    w.stop()
+    await vi.advanceTimersByTimeAsync(5_000)
+
+    // #then
+    expect(w.activeCalls.mock.calls.length).toBe(calls)
   })
 })

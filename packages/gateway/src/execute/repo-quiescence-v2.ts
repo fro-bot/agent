@@ -2,7 +2,8 @@
  * Repo workspace quiescence for an OpenCode V2 workspace: the V2 sibling of `repo-quiescence.ts`.
  *
  * V1 asked `session.status` for one directory. V2 has no per-directory status, so the busy set is the server's global
- * active list joined with `session.list({directory})` (`listBusyV2SessionIdsInDirectory`, probes P2 and P9). The
+ * active list with each entry located by its stored directory (`listActiveSessionIdsInDirectoryV2`, probes P2 and P9).
+ * The cost follows the sessions running on the server, not the history stored under the directory. The
  * contract is the same: only `clear` permits replacing or deleting an expired lease, `busy` and `unknown` both block,
  * and every failure (transport, non-2xx, bad shape, timeout, bad repo) resolves to `unknown`. No retries, no cached
  * clearance.
@@ -23,12 +24,12 @@
  */
 
 import type {Result} from '@bfra.me/es/result'
-import type {RemoteOpenCodeV2Client, V2SessionApi} from '@fro-bot/runtime'
+import type {DirectoryQuiescenceClient, RemoteOpenCodeV2Client} from '@fro-bot/runtime'
 import type {GatewayLogger} from '../discord/client.js'
 import type {RepoQuiescence} from '../runtime-effect.js'
 import type {RepoQuiescenceChecker} from './repo-quiescence.js'
 
-import {err, listBusyV2SessionIdsInDirectory, ok, toErrorMessage} from '@fro-bot/runtime'
+import {err, listActiveSessionIdsInDirectoryV2, ok, toErrorMessage} from '@fro-bot/runtime'
 import {attachOpencodeV2} from './opencode-attach-v2.js'
 import {REPO_QUIESCENCE_TIMEOUT_MS} from './recovery-budget.js'
 import {resolveRepoDirectory} from './repo-quiescence.js'
@@ -38,7 +39,8 @@ const MAX_LOGGED_SESSION_IDS = 32
 
 /** The one client surface this check needs; the real V2 client satisfies it. */
 export interface ActiveSessionsClient {
-  readonly session: V2SessionApi
+  readonly session: DirectoryQuiescenceClient['session']
+  readonly getSession: RemoteOpenCodeV2Client['getSession']
   readonly listShells: RemoteOpenCodeV2Client['listShells']
 }
 
@@ -105,12 +107,10 @@ export function createRepoQuiescenceCheckerV2(options: RepoQuiescenceCheckerV2Op
     try {
       const outcome = await Promise.race([
         Promise.all([
-          listBusyV2SessionIdsInDirectory(
-            client.session,
-            directory,
-            {realpath: async path => path},
-            {signal: controller.signal},
-          ),
+          listActiveSessionIdsInDirectoryV2(client, directory, {
+            realpath: async path => path,
+            signal: controller.signal,
+          }),
           listRunningShellIds(client, directory, controller.signal),
         ]),
         aborted,
