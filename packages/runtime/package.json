@@ -18,6 +18,11 @@
       "types": "./src/session/v2.ts",
       "import": "./src/session/v2.ts",
       "default": "./src/session/v2.ts"
+    },
+    "./event-v2-fixtures": {
+      "types": "./src/agent/event-v2.fixtures.ts",
+      "import": "./src/agent/event-v2.fixtures.ts",
+      "default": "./src/agent/event-v2.fixtures.ts"
     }
   },
   "main": "src/index.ts",

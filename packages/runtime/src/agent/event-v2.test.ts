@@ -41,6 +41,7 @@ import {
   STEP_FAILED_FRAME,
   STEP_STARTED_FRAME,
   SUBAGENT_NOTICE_ENQUEUED_FRAME,
+  SUBAGENT_NOTICE_MESSAGE,
   TEXT_DELTA_FRAME,
   TEXT_ENDED_FRAME,
   TEXT_MESSAGE_ID,
@@ -423,6 +424,7 @@ describe('mapV2Event: forms', () => {
       formId: QUESTION_FORM_ID,
       sessionId: QUESTION_SESSION_ID,
       outcome: 'cancelled',
+      answer: null,
     })
   })
 
@@ -432,6 +434,7 @@ describe('mapV2Event: forms', () => {
       formId: 'frm_1',
       sessionId: 'ses_x',
       outcome: 'replied',
+      answer: {q0: 'A'},
     })
   })
 
@@ -457,7 +460,33 @@ describe('mapV2Event: subagent notices', () => {
       kind: 'subagent_notice',
       sessionId: PARENT_SESSION_ID,
       notice: {childSessionId: CHILD_SESSION_ID, state: 'completed', agent: 'General', description: 'bg child'},
+      inboxId: SUBAGENT_NOTICE_MESSAGE.id,
     })
+  })
+
+  it('maps an inbox delivery, captured from a real turn, to the item that entered the model turn', () => {
+    expect(
+      mapV2Event({
+        type: 'session.inbox.delivered',
+        data: {sessionID: TEXT_SESSION_ID, inboxID: 'msg_1836d7c84001UcG33UmRHZFsFl'},
+      }),
+    ).toEqual({kind: 'inbox_delivered', sessionId: TEXT_SESSION_ID, inboxId: 'msg_1836d7c84001UcG33UmRHZFsFl'})
+  })
+
+  it('ignores an inbox delivery that names no item', () => {
+    expect(mapV2Event({type: 'session.inbox.delivered', data: {sessionID: TEXT_SESSION_ID}})).toBeNull()
+  })
+
+  it('carries no inbox id for a session.synthetic notice', () => {
+    expect(
+      mapV2Event({
+        type: 'session.synthetic',
+        data: {
+          sessionID: PARENT_SESSION_ID,
+          metadata: {source: 'subagent', childID: CHILD_SESSION_ID, agent: 'General', state: 'completed'},
+        },
+      }),
+    ).toMatchObject({kind: 'subagent_notice', inboxId: null})
   })
 
   it('maps a session.synthetic event with subagent metadata', () => {

@@ -115,7 +115,19 @@ export {
 export {buildAgentPrompt, buildTaskSection, getTriggerDirective} from './prompt.js'
 export type {TriggerDirective} from './prompt.js'
 export {materializeReferenceFiles} from './reference-files.js'
+export {createRemoteOpenCodeV2Client, V2_HEARTBEAT_FRAME} from './remote-client-v2.js'
+export type {
+  RemoteOpenCodeV2Client,
+  RemoteOpenCodeV2ClientOptions,
+  V2CallError,
+  V2FormValue,
+  V2PermissionDecision,
+  V2SessionOutcome,
+  V2SessionSummary,
+} from './remote-client-v2.js'
 export {createRemoteOpenCodeHandle} from './remote-client.js'
+export {buildQuestionFormAnswer, createRemoteQuestionClientV2} from './remote-question-client-v2.js'
+export type {RemoteQuestionClientV2, RemoteQuestionResponseV2} from './remote-question-client-v2.js'
 export {createRemoteQuestionClient} from './remote-question-client.js'
 export type {RemoteQuestionClient, RemoteQuestionResponse} from './remote-question-client.js'
 export {resolveResponseDelivery} from './response-delivery.js'

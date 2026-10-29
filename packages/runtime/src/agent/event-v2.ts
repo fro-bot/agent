@@ -151,6 +151,8 @@ export type V2DomainEvent =
       readonly formId: string
       readonly sessionId: string
       readonly outcome: 'cancelled' | 'replied'
+      /** The answer of a replied form, keyed by field key. `null` for a cancelled form or an unreadable answer. */
+      readonly answer: Readonly<Record<string, unknown>> | null
     }
   | {readonly kind: 'execution_started'; readonly sessionId: string}
   | {readonly kind: 'execution_succeeded'; readonly sessionId: string}
@@ -166,8 +168,20 @@ export type V2DomainEvent =
     }
   /** A session changed location. Informational on its own; `mapV2EventStream` upgrades an owned move to `fatal`. */
   | {readonly kind: 'session_moved'; readonly sessionId: string; readonly directory: string | null}
-  /** The parent session `sessionId` received a completion notice for a child. Read from event `metadata`, never text. */
-  | {readonly kind: 'subagent_notice'; readonly sessionId: string; readonly notice: SubagentNotice}
+  /**
+   * The parent session `sessionId` received a completion notice for a child. Read from event `metadata`, never text.
+   * `inboxId` is the inbox item that carries it, when the notice arrived as an enqueued item: the item is queued, not
+   * yet part of a model turn, until a matching `inbox_delivered`. `null` for a `session.synthetic` event, which is the
+   * message already in the transcript.
+   */
+  | {
+      readonly kind: 'subagent_notice'
+      readonly sessionId: string
+      readonly notice: SubagentNotice
+      readonly inboxId: string | null
+    }
+  /** A queued inbox item of `sessionId` entered a model turn (`session.inbox.delivered`). */
+  | {readonly kind: 'inbox_delivered'; readonly sessionId: string; readonly inboxId: string}
   /** The run must fail. Produced by `mapV2EventStream` for an owned session that moved. */
   | {
       readonly kind: 'fatal'
@@ -407,7 +421,14 @@ function mapFormResolved(type: string, data: unknown): V2DomainEvent {
   const formId = getStringProperty(data, 'id')
   const sessionId = getStringProperty(data, 'sessionID')
   if (formId === null || sessionId === null) return malformed(type, data, 'missing form id or sessionID')
-  return {kind: 'form_resolved', formId, sessionId, outcome: type === 'form.replied' ? 'replied' : 'cancelled'}
+  const answer = getObjectProperty(data, 'answer')
+  return {
+    kind: 'form_resolved',
+    formId,
+    sessionId,
+    outcome: type === 'form.replied' ? 'replied' : 'cancelled',
+    answer: type === 'form.replied' && isRecord(answer) ? answer : null,
+  }
 }
 
 function mapExecution(type: string, data: unknown): V2DomainEvent {
@@ -447,8 +468,12 @@ function mapSessionError(type: string, data: unknown): V2DomainEvent {
     : {kind: 'retry_scheduled', sessionId, attempt, at, error}
 }
 
-function mapNotice(sessionId: string | null, notice: SubagentNotice | null): V2DomainEvent | null {
-  return sessionId === null || notice === null ? null : {kind: 'subagent_notice', sessionId, notice}
+function mapNotice(
+  sessionId: string | null,
+  notice: SubagentNotice | null,
+  inboxId: string | null,
+): V2DomainEvent | null {
+  return sessionId === null || notice === null ? null : {kind: 'subagent_notice', sessionId, notice, inboxId}
 }
 
 /**
@@ -528,10 +553,20 @@ export function mapV2Event(frame: unknown): V2DomainEvent | null {
     }
 
     case 'session.inbox.enqueued':
-      return mapNotice(getStringProperty(data, 'sessionID'), readSubagentNoticeItem(getObjectProperty(data, 'item')))
+      return mapNotice(
+        getStringProperty(data, 'sessionID'),
+        readSubagentNoticeItem(getObjectProperty(data, 'item')),
+        getStringProperty(data, 'inboxID'),
+      )
+
+    case 'session.inbox.delivered': {
+      const sessionId = getStringProperty(data, 'sessionID')
+      const inboxId = getStringProperty(data, 'inboxID')
+      return sessionId === null || inboxId === null ? null : {kind: 'inbox_delivered', sessionId, inboxId}
+    }
 
     case 'session.synthetic':
-      return mapNotice(getStringProperty(data, 'sessionID'), readSubagentNotice(data))
+      return mapNotice(getStringProperty(data, 'sessionID'), readSubagentNotice(data), null)
 
     default:
       return null
