@@ -176,11 +176,13 @@ export {
   DEFAULT_SHELL_KILL_POLL_INTERVAL_MS,
   DEFAULT_SHELL_KILL_ROUNDS,
   killOwnedShells,
+  listOwnedRunningShells,
   reconcileShellsOnce,
 } from './shell-jobs-v2.js'
 export type {
   KillOwnedShellsOptions,
   KillOwnedShellsResult,
+  ListOwnedRunningShellsOptions,
   ReconcileShellsOptions,
   ShellApi,
   ShellReconcileObservation,

@@ -7,7 +7,14 @@ import {err, ok} from '@bfra.me/es/result'
 import {describe, expect, it, vi} from 'vitest'
 
 import {createOwnershipLedger, shellLedgerKey} from './ownership-ledger.js'
-import {collectOwnerSessionIds, killOwnedShells, reconcileShellsOnce} from './shell-jobs-v2.js'
+import {
+  collectOwnerSessionIds,
+  DEFAULT_SHELL_KILL_POLL_INTERVAL_MS,
+  DEFAULT_SHELL_KILL_ROUNDS,
+  killOwnedShells,
+  listOwnedRunningShells,
+  reconcileShellsOnce,
+} from './shell-jobs-v2.js'
 
 const DIR = '/workspace/repo'
 const ROOT = 'ses_root'
@@ -369,5 +376,54 @@ describe('killOwnedShells', () => {
 
     // #then
     expect(result.confirmed).toBe(false)
+  })
+})
+
+describe('kill budget', () => {
+  it('allows six rounds half a second apart: a kill takes about a second to leave the running list (p22)', () => {
+    // #given / #when / #then
+    expect(DEFAULT_SHELL_KILL_ROUNDS).toBe(6)
+    expect(DEFAULT_SHELL_KILL_POLL_INTERVAL_MS).toBe(500)
+  })
+})
+
+describe('listOwnedRunningShells', () => {
+  const owners = new Set([ROOT, CHILD])
+
+  it('lists the running shells tagged with the root or an owned session, and no others', async () => {
+    // #given
+    const {api, calls} = makeApi({
+      sh_root: {status: 'running', owner: ROOT},
+      sh_child: {status: 'running', owner: CHILD},
+      sh_stranger: {status: 'running', owner: OTHER},
+      sh_untagged: {status: 'running', owner: null},
+      sh_done: {status: 'exited', owner: ROOT},
+      sh_unknown: {status: 'unknown', owner: ROOT},
+    })
+
+    // #when
+    const result = await listOwnedRunningShells({api, directory: DIR, ownerSessionIds: owners})
+
+    // #then — a status the client does not know is read as running; the list is one request
+    expect(result).toEqual({success: true, data: ['sh_root', 'sh_child', 'sh_unknown']})
+    expect(calls).toEqual(['list'])
+  })
+
+  it('fails when the list cannot be read or throws, never reading it as empty', async () => {
+    // #given
+    const failing = makeApi({}, {listFails: [1]})
+    const throwing: ShellApi = {
+      listShells: async () => {
+        throw new Error('boom')
+      },
+      getShell: async () => err({kind: 'parse'}),
+      deleteShell: async () => err({kind: 'parse'}),
+    }
+
+    // #when / #then
+    expect((await listOwnedRunningShells({api: failing.api, directory: DIR, ownerSessionIds: owners})).success).toBe(
+      false,
+    )
+    expect((await listOwnedRunningShells({api: throwing, directory: DIR, ownerSessionIds: owners})).success).toBe(false)
   })
 })

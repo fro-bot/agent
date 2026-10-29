@@ -20,6 +20,9 @@
  *   notice since the root's last `execution.succeeded`, which is how "idle after the last turn a notice triggered" reads
  *   on this stream;
  * - the active list shows the root is not live;
+ * - no running shell of the location is tagged with the root or an owned session. The ledger only knows the shells whose
+ *   creation frame arrived after their owner was adopted; the server's own list is read for the rest, so a shell the
+ *   stream dropped still holds the drain open. A list that cannot be read admits nothing;
  * - the revision captured before that request still equals the current one.
  *
  * No notice never admits: the run's hard deadline reports it incomplete. The stream is trusted as the run's own record:
@@ -29,6 +32,7 @@
  * Not a state machine framework: a revision counter, an idle stamp, the notices seen, and one validation in flight.
  */
 
+import type {Result} from '@bfra.me/es/result'
 import type {LedgerReconcileAdapter, OwnershipLedger, ShellNoticeState, SubagentNotice} from '@fro-bot/runtime'
 import type {GatewayLogger} from '../discord/client.js'
 import type {DrainRejectCode} from './drain-completion.js'
@@ -43,6 +47,12 @@ export interface DrainCompletionV2Options {
   readonly ledger: OwnershipLedger
   /** Global liveness: the V2 reconcile adapter's `liveSessionIds`. */
   readonly adapter: LedgerReconcileAdapter
+  /**
+   * The running shells of the location tagged with the root or an owned session (`listOwnedRunningShells`, with the
+   * owner set read at call time). Read BEFORE the commit point like the liveness read, so the commit stays one
+   * synchronous block. Absent: no shell read, for a run that does not track shells.
+   */
+  readonly ownedRunningShells?: (signal: AbortSignal) => Promise<Result<readonly string[], Error>>
   /** The run's combined signal: deadline, inactivity, cancel. Aborting it ends validation. */
   readonly signal: AbortSignal
   readonly logger: GatewayLogger
@@ -101,6 +111,7 @@ export function createDrainCompletionV2(options: DrainCompletionV2Options): Drai
     logger,
     onAdmitted,
     onNotAdmitted,
+    ownedRunningShells,
     validationIntervalMs = DRAIN_VALIDATION_INTERVAL_MS,
     requestTimeoutMs = DRAIN_REQUEST_TIMEOUT_MS,
   } = options
@@ -232,6 +243,14 @@ export function createDrainCompletionV2(options: DrainCompletionV2Options): Drai
     return result.value.data.has(rootSessionId)
   }
 
+  /** The owned running shells, or `null` when they cannot be told. No `ownedRunningShells`: none. */
+  async function runningShells(): Promise<readonly string[] | null> {
+    if (ownedRunningShells === undefined) return []
+    const result = await bounded(async requestSignal => ownedRunningShells(requestSignal))
+    if (!result.ok || !result.value.success) return null
+    return result.value.data
+  }
+
   function reject(reason: DrainRejectCode, context: Record<string, unknown> = {}): void {
     logger.debug({sessionId: rootSessionId, reason, ...context}, 'run-core: drain completion not admitted')
     onNotAdmitted?.(reason)
@@ -246,6 +265,12 @@ export function createDrainCompletionV2(options: DrainCompletionV2Options): Drai
 
     if (live === null) return reject('root-liveness-unavailable')
     if (live) return reject('root-live')
+
+    // Read here, before the commit point: nothing may be awaited after it.
+    const shells = await runningShells()
+    if (closed || signal.aborted) return
+    if (shells === null) return reject('root-liveness-unavailable', {read: 'shells'})
+    if (shells.length > 0) return reject('ledger-not-drained', {runningShells: shells})
 
     const unfenced = ledger
       .snapshot()

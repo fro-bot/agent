@@ -16,10 +16,15 @@
  * still unresolved when the attempt ends is downgraded to `unknown`, and the caller quarantines.
  *
  * Background shells: a session interrupt does not stop them (`Job.cancel(sessionID)` finds no job under a session id), and
- * they outlive the run's lock. So BEFORE the root is interrupted, every owned shell is killed with
- * `DELETE /api/shell/:id` and the stop is confirmed by `GET /api/shell` no longer listing it. A shell that cannot be
- * confirmed gone keeps the stop unconfirmed. The kill queues an `error` notice that wakes the root, which is why the
- * root interrupt comes after it, and why an owned shell counts as background work open (`followUpPossible`).
+ * they outlive the run's lock. So the barrier first kills every owned shell with `DELETE /api/shell/:id` and confirms it
+ * by `GET /api/shell` no longer listing it. The root is interrupted next WHETHER OR NOT that kill was confirmed: the
+ * interrupt stops the root producing more work, and nothing about a shell that survives makes that wait.
+ *
+ * A DELETE queues an `error` notice that wakes the owning session, so a stop that deleted any shell, tracked or not,
+ * never confirms the root: it reports `followUpPossible` and the caller quarantines. That is the accepted cost: any stop
+ * with a live owned shell quarantines, even after a clean kill. After the root is confirmed the barrier sweeps once
+ * more, because the root may have started a shell while it was being stopped; a sweep that deletes or sees anything is an
+ * unconfirmed stop. A shell that cannot be confirmed gone keeps the stop unconfirmed.
  *
  * Background work open (`followUpPossible`): the server then starts root turns by itself, so the root is never
  * confirmed. The barrier interrupts the root and the owned children once, settles the children, and reports
@@ -72,6 +77,9 @@ export interface SettleOwnedSessionsV2Params {
   readonly followUpPossible?: boolean
   /** Overrides `ROOT_QUIESCENCE_POLL_INTERVAL_MS` — for tests only. */
   readonly rootPollIntervalMs?: number
+  /** Overrides the shell kill's rounds and pause (`DEFAULT_SHELL_KILL_*`) — for tests only. */
+  readonly shellKillRounds?: number
+  readonly shellKillPollIntervalMs?: number
   /** How the root's latest execution ended on the stream, or `null`. Absent: the server's persisted outcome decides. */
   readonly streamTerminal?: () => StreamTerminal | null
 }
@@ -85,6 +93,11 @@ export type SettleOwnedSessionsV2Result =
       readonly rootUnconfirmed: boolean
       /** An owned background shell is not confirmed stopped. The caller keeps killing it through the hold. */
       readonly shellsUnconfirmed: boolean
+      /**
+       * A root turn the stream has not shown can still start: background work was open, or the barrier deleted a shell
+       * whose error notice wakes the root. The caller's quarantine watch must not treat the root as confirmable.
+       */
+      readonly followUpPossible: boolean
     }
 
 function withRunId(logger: GatewayLogger, runId: string | undefined): GatewayLogger {
@@ -124,6 +137,8 @@ export async function settleOwnedSessionsV2(params: SettleOwnedSessionsV2Params)
     confirmRootQuiescent = false,
     followUpPossible = false,
     rootPollIntervalMs = ROOT_QUIESCENCE_POLL_INTERVAL_MS,
+    shellKillRounds,
+    shellKillPollIntervalMs,
     streamTerminal = (): StreamTerminal | null => null,
   } = params
   const logger = withRunId(params.logger, params.runId)
@@ -148,6 +163,12 @@ export async function settleOwnedSessionsV2(params: SettleOwnedSessionsV2Params)
   // not ruled out a shell the ledger never heard of.
   let shellsConfirmed = false
   let unconfirmedShellIds: readonly string[] = []
+  // Whether the barrier deleted a shell (or could not tell): its error notice wakes the root, off the stream we read.
+  let shellWake = false
+  const killTuning = {
+    ...(shellKillRounds === undefined ? {} : {rounds: shellKillRounds}),
+    ...(shellKillPollIntervalMs === undefined ? {} : {pollIntervalMs: shellKillPollIntervalMs}),
+  }
 
   return withBound(
     timeoutMs,
@@ -169,20 +190,26 @@ export async function settleOwnedSessionsV2(params: SettleOwnedSessionsV2Params)
           },
         }
 
-        // Owned background shells first. A session interrupt does not stop them, and the kill wakes the root with an
-        // error notice, so the root is interrupted AFTER it, never before. Confirmed ones are settled in the ledger.
-        const shellKill = await killOwnedShells({
-          api: client,
-          directory,
-          ownerSessionIds: collectOwnerSessionIds(rootSessionId, attemptLedger),
-          ledger: attemptLedger,
-          logger: runtimeLogger,
-          signal: teardownSignal,
-        })
+        // Owned background shells first. A session interrupt does not stop them. Confirmed ones are settled in the ledger.
+        const sweepShells = async () =>
+          killOwnedShells({
+            api: client,
+            directory,
+            ownerSessionIds: collectOwnerSessionIds(rootSessionId, attemptLedger),
+            ledger: attemptLedger,
+            logger: runtimeLogger,
+            signal: teardownSignal,
+            ...killTuning,
+          })
+        const shellKill = await sweepShells()
         shellsConfirmed = shellKill.confirmed
         unconfirmedShellIds = shellKill.confirmed ? [] : shellKill.stillRunning
+        // A DELETE's error notice wakes the owner, tracked or not, so the root cannot be confirmed from here on.
+        shellWake = !shellKill.confirmed || shellKill.deleted.length > 0
+        const followUp = followUpPossible || shellWake
 
-        // Stop the root from producing more work. Confirmed below only when `confirmRootQuiescent`.
+        // Stop the root from producing more work, whether or not the kill was confirmed. Confirmed below only when
+        // `confirmRootQuiescent`.
         await interruptSession(client, rootSessionId, teardownSignal, logger, 'root')
 
         const unsettledSessions = unsettled.filter(entry => !isShellLedgerKey(entry.sessionId))
@@ -214,7 +241,7 @@ export async function settleOwnedSessionsV2(params: SettleOwnedSessionsV2Params)
         let reinterrupts = 0
         while (!rootQuiescent && !isFinished() && !teardownSignal.aborted) {
           // Nothing can confirm the root with background work open; the quarantine watch does the polling.
-          if (followUpPossible) break
+          if (followUp) break
           const probe = await probeRootStopV2({
             client,
             adapter,
@@ -244,7 +271,20 @@ export async function settleOwnedSessionsV2(params: SettleOwnedSessionsV2Params)
           }
         }
 
-        if (ledger.isDrainComplete() && rootQuiescent && shellsConfirmed) {
+        if (ledger.isDrainComplete() && rootQuiescent && shellsConfirmed && !shellWake) {
+          // The root may have started a shell while it was being stopped. One more sweep before anything is released;
+          // anything it deletes or still lists leaves the stop unconfirmed.
+          const finalSweep = await sweepShells()
+          if (!finalSweep.confirmed) {
+            shellsConfirmed = false
+            unconfirmedShellIds = finalSweep.stillRunning
+            shellWake = true
+          } else if (finalSweep.deleted.length > 0) {
+            shellWake = true
+          }
+        }
+
+        if (ledger.isDrainComplete() && rootQuiescent && shellsConfirmed && !shellWake) {
           logger.info(
             {rootSessionId, confirmRootQuiescent},
             confirmRootQuiescent
@@ -268,6 +308,7 @@ export async function settleOwnedSessionsV2(params: SettleOwnedSessionsV2Params)
           ...(shellsConfirmed
             ? []
             : [`owned shells not confirmed stopped: ${unconfirmedShellIds.join(', ') || 'unknown'}`]),
+          ...(shellWake ? ['a deleted shell’s error notice can wake the root'] : []),
         ].join('; ')
         logger.error(
           {rootSessionId, stillUnresolvedIds, unconfirmedShellIds, rootQuiescent},
@@ -279,13 +320,15 @@ export async function settleOwnedSessionsV2(params: SettleOwnedSessionsV2Params)
             reason: `root session not confirmed stopped after interrupt${unresolvedNotes === '' ? '' : `; ${unresolvedNotes}`}`,
             rootUnconfirmed: true,
             shellsUnconfirmed: !shellsConfirmed || hasUnsettledShells(attemptLedger),
+            followUpPossible: followUpPossible || shellWake,
           }
         }
         return {
           settled: false as const,
           reason: unresolvedNotes,
-          rootUnconfirmed: false,
+          rootUnconfirmed: shellWake,
           shellsUnconfirmed: !shellsConfirmed || hasUnsettledShells(attemptLedger),
+          followUpPossible: followUpPossible || shellWake,
         }
       } catch (error) {
         const message = toErrorMessage(error)
@@ -298,6 +341,7 @@ export async function settleOwnedSessionsV2(params: SettleOwnedSessionsV2Params)
           reason: `settle attempt threw unexpectedly: ${message}`,
           rootUnconfirmed: !rootConfirmed,
           shellsUnconfirmed: !shellsConfirmed || hasUnsettledShells(ledger),
+          followUpPossible: true,
         }
       } finally {
         finished = true
@@ -319,6 +363,7 @@ export async function settleOwnedSessionsV2(params: SettleOwnedSessionsV2Params)
         reason: `settle attempt exceeded its ${timeoutMs}ms bound`,
         rootUnconfirmed: !rootConfirmed,
         shellsUnconfirmed: !shellsConfirmed || hasUnsettledShells(ledger),
+        followUpPossible: true,
       }
     },
   )

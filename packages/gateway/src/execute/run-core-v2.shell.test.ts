@@ -40,8 +40,24 @@ async function backgroundAndIdle(run: ReturnType<typeof startRun>, shellId = SHE
   await vi.advanceTimersByTimeAsync(10)
 }
 
+/** The root backgrounds a shell and keeps working: no idle yet, so the run is not draining. */
+async function backgroundMidTurn(run: ReturnType<typeof startRun>, shellId = SHELL, callId = 'call_shell') {
+  run.emit(
+    frames.started(),
+    frames.toolStarted('shell', callId),
+    frames.toolCalled(callId, {command: 'sleep 8', background: true}),
+    frames.shellCreated(shellId),
+    frames.shellProgress(callId, shellId),
+    frames.shellBackgrounded(callId, shellId),
+    frames.delta('Started it.'),
+  )
+  await vi.advanceTimersByTimeAsync(10)
+}
+
 /** The server enqueues the shell's notice, wakes the root to take it in, and the root answers (p20 order). */
 function noticeTurn(run: ReturnType<typeof startRun>, shellId = SHELL, state = 'completed', inbox = 'msg_shell') {
+  // The process has ended by the time its notice is sent, so the server no longer lists it as running.
+  run.shellServer.shells[shellId] = {status: 'exited', owner: ROOT}
   run.emit(
     frames.shellExited(shellId),
     frames.shellNotice(shellId, state, inbox),
@@ -276,6 +292,7 @@ describe('runOpenCodeCoreV2: draining a background shell', () => {
     if (exitFirst) {
       noticeTurn(run)
     } else {
+      run.shellServer.shells[SHELL] = {status: 'exited', owner: ROOT}
       run.emit(
         frames.shellNotice(SHELL, 'completed', 'msg_shell'),
         frames.shellExited(SHELL),
@@ -628,6 +645,185 @@ describe('runOpenCodeCoreV2: stopping with a background shell owned', () => {
     // #then — the watch re-issued the DELETE
     expect(run.shellServer.deleteShell.mock.calls.length).toBeGreaterThan(deletesAtQuarantine)
     expect(run.shellServer.shells[SHELL]).toBeDefined()
+  })
+
+  it('quarantines when the barrier deleted a shell the ledger never heard of: its error notice wakes the root', async () => {
+    // #given — probe A: an owned running shell whose creation frame was lost, and a wall-clock failure
+    const controller = new AbortController()
+    const {run, log} = await runningShellRun({controller, active: []})
+    run.emit(frames.started())
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #when
+    controller.abort()
+    await vi.advanceTimersByTimeAsync(PAST_SETTLE_BOUND_MS)
+
+    // #then — killed, the root interrupted anyway, and the run quarantined rather than released
+    expect(firstIndex(log, `delete:${SHELL}`)).toBeGreaterThanOrEqual(0)
+    expect(firstIndex(log, `interrupt:${ROOT}`)).toBeGreaterThan(firstIndex(log, `delete:${SHELL}`))
+    const error = failure(run)
+    expect(error.kind).toBe('timeout')
+    expect(error.quarantined).toBe(true)
+  })
+
+  it('keeps the quarantine watch open after the barrier deleted a shell: the woken root can start another', async () => {
+    // #given — probe A, then a wall-clock failure; the root is confirmed stopped at once, but a DELETE woke it
+    const controller = new AbortController()
+    const {run} = await runningShellRun({controller, active: []})
+    run.emit(frames.started())
+    await vi.advanceTimersByTimeAsync(10)
+    controller.abort()
+    await vi.advanceTimersByTimeAsync(PAST_SETTLE_BOUND_MS)
+    expect(failure(run).quarantined).toBe(true)
+    const deletesBefore = run.shellServer.deleteShell.mock.calls.length
+
+    // #when — the woken root starts a new shell well into the hold
+    run.shellServer.shells[OTHER_SHELL] = {status: 'running', owner: ROOT}
+    await vi.advanceTimersByTimeAsync(5_000)
+
+    // #then — the watch is still sweeping and kills it
+    expect(run.shellServer.deleteShell.mock.calls.length).toBeGreaterThan(deletesBefore)
+    expect(run.shellServer.shells[OTHER_SHELL]).toBeUndefined()
+  })
+
+  it('quarantines a provider failure after reconcile settled a shell whose notice is still in flight', async () => {
+    // #given — the shell is gone from the server, so reconcile settles it at the root idle; no notice has arrived
+    const ledger = createOwnershipLedger()
+    const run = startRun({
+      ownershipLedger: ledger,
+      active: [],
+      shellServer: {shells: {[SHELL]: {status: 'exited', owner: ROOT}}},
+    })
+    await vi.advanceTimersByTimeAsync(10)
+    await backgroundMidTurn(run)
+    await vi.advanceTimersByTimeAsync(31_000)
+    expect(states(ledger)).toEqual({[SHELL_KEY]: 'settled'})
+
+    // #when — the root's turn fails before the notice shows
+    run.emit(frames.failed(ROOT, {type: 'provider.auth', message: 'bad key', status: 401}))
+    await vi.advanceTimersByTimeAsync(PAST_SETTLE_BOUND_MS)
+
+    // #then — the notice can still wake the root, so the stop is not confirmed
+    const error = failure(run)
+    expect(error.kind).toBe('session-error')
+    expect(error.quarantined).toBe(true)
+  })
+
+  it('quarantines a provider failure after reconcile settled a child whose notice is still in flight', async () => {
+    // #given — the same for a background child (the round-1 residual)
+    const ledger = createOwnershipLedger()
+    const run = startRun({ownershipLedger: ledger, active: [], children: [CHILD]})
+    await vi.advanceTimersByTimeAsync(10)
+    run.emit(frames.started(), frames.toolStarted('subagent', 'call_dispatch'), frames.dispatch(CHILD))
+    await vi.advanceTimersByTimeAsync(31_000)
+    expect(states(ledger)).toEqual({[CHILD]: 'settled'})
+
+    // #when
+    run.emit(frames.failed(ROOT, {type: 'provider.auth', message: 'bad key', status: 401}))
+    await vi.advanceTimersByTimeAsync(PAST_SETTLE_BOUND_MS)
+
+    // #then
+    expect(failure(run).quarantined).toBe(true)
+  })
+
+  it('does not quarantine a provider failure once the shell notice has been observed', async () => {
+    // #given — the notice arrived and settled the shell, the woken root turn then fails; nothing is left running
+    const ledger = createOwnershipLedger()
+    const run = startRun({
+      ownershipLedger: ledger,
+      active: [],
+      shellServer: {shells: {[SHELL]: {status: 'exited', owner: ROOT}}},
+    })
+    await vi.advanceTimersByTimeAsync(10)
+    await backgroundMidTurn(run)
+
+    // #when — the shell ends while the root works, and the root's turn then fails
+    run.emit(
+      frames.shellExited(SHELL),
+      frames.shellNotice(SHELL),
+      frames.delivered('msg_shell'),
+      frames.failed(ROOT, {type: 'provider.auth', message: 'bad key', status: 401}),
+    )
+    await vi.advanceTimersByTimeAsync(PAST_SETTLE_BOUND_MS)
+
+    // #then — the stop confirms: no notice is owed, and no shell was deleted
+    const error = failure(run)
+    expect(error.kind).toBe('session-error')
+    expect(error.quarantined).toBe(false)
+    expect(run.shellServer.deleteShell).not.toHaveBeenCalled()
+  })
+
+  it('treats an unreadable notice as accounted for, so the fence closes the follow-up window', async () => {
+    // #given — the shell stopped, and its job notice cannot be read
+    const ledger = createOwnershipLedger()
+    const run = startRun({
+      ownershipLedger: ledger,
+      active: [],
+      shellServer: {shells: {[SHELL]: {status: 'exited', owner: ROOT}}},
+    })
+    await vi.advanceTimersByTimeAsync(10)
+    await backgroundMidTurn(run)
+    run.emit({
+      type: 'session.inbox.enqueued',
+      data: {
+        inboxID: 'msg_bad',
+        sessionID: ROOT,
+        item: {
+          type: 'synthetic',
+          payload: {text: 'x', metadata: {source: 'shell', shellID: SHELL, jobID: SHELL, state: 'paused'}},
+          delivery: 'steer',
+        },
+      },
+    })
+    await vi.advanceTimersByTimeAsync(31_000)
+
+    // #when
+    run.emit(frames.failed(ROOT, {type: 'provider.auth', message: 'bad key', status: 401}))
+    await vi.advanceTimersByTimeAsync(PAST_SETTLE_BOUND_MS)
+
+    // #then
+    expect(failure(run).quarantined).toBe(false)
+  })
+
+  it('does not admit the drain while a child’s shell runs whose creation frame was dropped (child not adopted yet)', async () => {
+    // #given — the child's shell is created before the dispatch result adopts the child, so the loop ignores it
+    const ledger = createOwnershipLedger()
+    const run = startRun({
+      ownershipLedger: ledger,
+      active: [],
+      children: [CHILD],
+      shellServer: {shells: {[SHELL]: {status: 'running', owner: CHILD}}},
+    })
+    await vi.advanceTimersByTimeAsync(10)
+    run.emit(
+      frames.started(),
+      frames.shellCreated(SHELL, CHILD),
+      frames.toolStarted('subagent', 'call_dispatch'),
+      frames.dispatch(CHILD),
+      frames.succeeded(),
+    )
+    await vi.advanceTimersByTimeAsync(10)
+    expect(Object.keys(states(ledger))).toEqual([CHILD])
+
+    // #when — the child ends and the root takes its notice in; everything the ledger tracks is done
+    run.emit(
+      frames.notice(CHILD, 'completed', 'msg_notice'),
+      frames.started(),
+      frames.delivered('msg_notice'),
+      frames.succeeded(),
+    )
+    await vi.advanceTimersByTimeAsync(5_000)
+
+    // #then — the server still lists the shell, so the run keeps draining
+    expect(states(ledger)).toEqual({[CHILD]: 'settled'})
+    expect(run.outcome()).toBeUndefined()
+
+    // #when — the shell stops
+    run.shellServer.shells[SHELL] = {status: 'exited', owner: CHILD}
+    await vi.advanceTimersByTimeAsync(3_000)
+
+    // #then
+    expect(succeeded(run)).toBe(true)
   })
 
   it('keeps deleting through the hold when only a shell the stream never reported is left running', async () => {

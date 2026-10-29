@@ -53,6 +53,7 @@ import {
   createOwnershipLedger,
   createV2LedgerReconcileAdapter,
   isShellLedgerKey,
+  listOwnedRunningShells,
   mapV2Event,
   mapV2EventStream,
   readBackgroundDispatch,
@@ -61,6 +62,7 @@ import {
   reconcileShellsOnce,
   settleLedgerFromShellNotice,
   settleLedgerFromSubagentNotice,
+  shellIdFromLedgerKey,
   shellLedgerKey,
   toErrorMessage,
 } from '@fro-bot/runtime'
@@ -348,6 +350,18 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
   const noticedChildIds = new Set<string>()
   // The same for background shells, by shell id.
   const noticedShellIds = new Set<string>()
+  // Ledger keys whose notice could not be read: the server did send one, so it is accounted for (and fenced `unknown`).
+  const fencedLedgerKeys = new Set<string>()
+
+  /**
+   * Whether the server's completion notice for a ledger entry has been seen (or fenced as unreadable). Until it has, the
+   * entry can still wake the root, whatever the ledger says: reconciliation can settle an entry from the server's
+   * answer while its notice is in flight.
+   */
+  function noticeAccountedFor(key: string): boolean {
+    if (fencedLedgerKeys.has(key)) return true
+    return isShellLedgerKey(key) ? noticedShellIds.has(shellIdFromLedgerKey(key)) : noticedChildIds.has(key)
+  }
 
   const ledger: OwnershipLedger | undefined =
     ownershipLedger === undefined
@@ -407,6 +421,15 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
       rootSessionId: sessionId,
       ledger,
       adapter: reconcileAdapter,
+      // The shells the server lists for the location tagged with the root or an owned session, read at the commit point:
+      // the ledger only knows a shell whose creation frame arrived after its owner was adopted.
+      ownedRunningShells: async signal =>
+        listOwnedRunningShells({
+          api: client,
+          directory,
+          ownerSessionIds: collectOwnerSessionIds(sessionId, ledger),
+          signal,
+        }),
       signal: combinedSignal,
       logger,
       // The only path that completes a drain: an admitted validation unblocks the stream.
@@ -445,11 +468,13 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
     message: string,
     options: {
       readonly rootMayBeRunning?: boolean
+      /** The root can be woken from somewhere this run cannot see, so it is never confirmed stopped. */
+      readonly neverConfirm?: boolean
       readonly providerFailureReason?: ProviderFailureReason
       readonly cause?: unknown
     } = {},
   ): Promise<never> {
-    const {rootMayBeRunning = false, providerFailureReason, cause} = options
+    const {rootMayBeRunning = false, neverConfirm = false, providerFailureReason, cause} = options
     // Fail-close the human waits FIRST: the barrier can take up to 15 s, and until the waits are settled an `always`
     // press could still persist a permission rule. Neither call is awaited; their replies are bounded by their own
     // timeouts and must not delay the root interrupt.
@@ -467,6 +492,7 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
     const hasAdoptedWork = ledger !== undefined && ledger.snapshot().length > 0
     const rootFollowUpOpen =
       rootMayBeRunning ||
+      neverConfirm ||
       hasAdoptedWork ||
       (drainCompletion !== undefined && draining && !drainDoneController.signal.aborted)
     const barrierLedger = ledger ?? (rootMayBeRunning ? createOwnershipLedger() : undefined)
@@ -474,10 +500,13 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
       throw new RunCoreError(kind, message, false, providerFailureReason, cause)
     }
     // Background work can start root turns by itself, so nothing seen so far rules out a turn that is not on the stream
-    // yet. Read before settlement, which itself cancels children and so can trigger notices.
+    // yet. An entry is open until its notice (or its fence) has been seen, not until the ledger settles it:
+    // reconciliation can settle an entry from the server's answer while the notice that wakes the root is in flight.
+    // Read before settlement, which itself cancels children and so can trigger notices.
     const followUpPossible =
       rootFollowUpOpen &&
-      (barrierLedger.snapshot().some(entry => entry.state !== 'settled') ||
+      (neverConfirm ||
+        barrierLedger.snapshot().some(entry => entry.state !== 'settled' || !noticeAccountedFor(entry.sessionId)) ||
         (drainCompletion !== undefined && draining && !drainDoneController.signal.aborted))
     const settlement = await settleOwnedSessionsV2({
       client,
@@ -510,7 +539,8 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
           ledger: barrierLedger,
         },
         streamTerminal: () => rootTerminal,
-        ...(followUpPossible ? {followUpPossible: true} : {}),
+        // A shell the barrier deleted wakes the root too, which the pre-barrier reading could not know.
+        ...(followUpPossible || settlement.followUpPossible ? {followUpPossible: true} : {}),
         logger,
         ...(runId === undefined ? {} : {runId}),
       })
@@ -1277,8 +1307,11 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
           // stay inside its sandbox. The barrier interrupts the root and every owned child, then the run fails.
           logger.error({sessionId, movedSessionId: event.sessionId}, 'run-core: an owned session moved — failing run')
           clearInactivity()
+          // Never confirmed: the destination's shells cannot be seen from the directory this run lists, so nothing says
+          // the root cannot be woken from there.
           throw await throwWithBarrier('session-error', 'An owned session changed location during the run', {
             rootMayBeRunning: true,
+            neverConfirm: true,
           })
         }
 
@@ -1297,6 +1330,7 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
             // child is fenced rather than waited on: the gate stops expecting a readable notice, and the entry is
             // `unknown` (never `settled`) until reconciliation sees it stop.
             drainCompletion?.noteUnreadableNotice(event.childSessionId)
+            fencedLedgerKeys.add(event.childSessionId)
             ledger?.markUnknown(event.childSessionId)
             markActivity()
             logger.warn(
@@ -1310,6 +1344,7 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
             // expecting a readable notice, and the entry is `unknown` (never `settled`) until reconciliation sees the
             // shell stop.
             drainCompletion?.noteUnreadableShellNotice(event.shellId)
+            fencedLedgerKeys.add(shellLedgerKey(event.shellId))
             ledger?.markUnknown(shellLedgerKey(event.shellId))
             markActivity()
             logger.warn(

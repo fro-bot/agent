@@ -419,7 +419,7 @@ describe('settleOwnedSessionsV2: background shells', () => {
     return ledger.snapshot().find(entry => entry.sessionId === SHELL_KEY)?.state
   }
 
-  it('dELETEs an owned shell before it interrupts the root, then confirms and settles it', async () => {
+  it('kills an owned shell, confirms and settles it, and interrupts the root anyway', async () => {
     // #given — a stop where the root is not confirmable by the stream
     const ledger = shellLedger()
     const server = makeServer({shellServer: RUNNING})
@@ -436,13 +436,159 @@ describe('settleOwnedSessionsV2: background shells', () => {
       rootPollIntervalMs: 1,
     })
 
-    // #then — kill, confirm by re-list, and only then the root interrupt
+    // #then — the kill and its confirming re-list come first, the root is interrupted either way, and the DELETE's error
+    // notice can wake the root, so the root is not confirmed and the stop quarantines
     const log = server.shellServer.log
     expect(log.indexOf(`delete:${SHELL}`)).toBeGreaterThanOrEqual(0)
     expect(log.indexOf(`delete:${SHELL}`)).toBeLessThan(log.indexOf(`interrupt:${ROOT}`))
     expect(log.slice(log.indexOf(`delete:${SHELL}`) + 1, log.indexOf(`interrupt:${ROOT}`))).toContain('list')
     expect(stateOf(ledger)).toBe('settled')
+    expect(result).toMatchObject({
+      settled: false,
+      rootUnconfirmed: true,
+      followUpPossible: true,
+      shellsUnconfirmed: false,
+    })
+  })
+
+  it('interrupts the root whether or not the kill is confirmed', async () => {
+    // #given — every DELETE fails, so no kill can be confirmed
+    const server = makeServer({shellServer: {...RUNNING, deleteFails: true}})
+
+    // #when
+    await settleOwnedSessionsV2({
+      client: server.client,
+      directory: DIR,
+      rootSessionId: ROOT,
+      ledger: shellLedger(),
+      logger: makeLogger(),
+      confirmRootQuiescent: true,
+      rootPollIntervalMs: 1,
+      shellKillRounds: 2,
+      shellKillPollIntervalMs: 0,
+    })
+
+    // #then
+    expect(server.interrupt).toHaveBeenCalledWith(expect.objectContaining({sessionId: ROOT}))
+  })
+
+  it('does not confirm the root after it deleted a shell the ledger never heard of (probe A)', async () => {
+    // #given — an owned running shell whose creation frame was lost, and a root that stops at once
+    const server = makeServer({shellServer: RUNNING})
+
+    // #when
+    const result = await settleOwnedSessionsV2({
+      client: server.client,
+      directory: DIR,
+      rootSessionId: ROOT,
+      ledger: createOwnershipLedger(),
+      logger: makeLogger(),
+      confirmRootQuiescent: true,
+      followUpPossible: false,
+      streamTerminal: () => 'user',
+      rootPollIntervalMs: 1,
+    })
+
+    // #then — the DELETE queued an error notice that wakes the root, which nothing on the stream will show
+    expect(server.shellServer.deleteShell).toHaveBeenCalledTimes(1)
+    expect(result).toMatchObject({settled: false, rootUnconfirmed: true, followUpPossible: true})
+  })
+
+  it('settles clean, with a sweep before and after, when no shell is owned', async () => {
+    // #given
+    const server = makeServer({shellServer: {shells: {sh_stranger: {status: 'running', owner: 'ses_stranger'}}}})
+
+    // #when
+    const result = await settleOwnedSessionsV2({
+      client: server.client,
+      directory: DIR,
+      rootSessionId: ROOT,
+      ledger: createOwnershipLedger(),
+      logger: makeLogger(),
+      confirmRootQuiescent: true,
+      streamTerminal: () => 'user',
+      rootPollIntervalMs: 1,
+    })
+
+    // #then
     expect(result).toEqual({settled: true})
+    expect(server.shellServer.listShells).toHaveBeenCalledTimes(2)
+    expect(server.shellServer.deleteShell).not.toHaveBeenCalled()
+  })
+
+  it('sweeps again after the root is confirmed: a shell started during the barrier does not survive the release', async () => {
+    // #given — nothing runs at the first sweep; the shell appears while the root is being interrupted
+    const server = makeServer({
+      interrupt: async () => {
+        server.shellServer.shells[SHELL] = {status: 'running', owner: ROOT}
+        return ok({interrupted: true})
+      },
+    })
+
+    // #when
+    const result = await settleOwnedSessionsV2({
+      client: server.client,
+      directory: DIR,
+      rootSessionId: ROOT,
+      ledger: createOwnershipLedger(),
+      logger: makeLogger(),
+      confirmRootQuiescent: true,
+      streamTerminal: () => 'user',
+      rootPollIntervalMs: 1,
+    })
+
+    // #then — the final sweep killed it, and its error notice means the root is no longer confirmed
+    expect(server.shellServer.deleteShell).toHaveBeenCalledWith(expect.objectContaining({shellId: SHELL}))
+    expect(server.shellServer.shells[SHELL]).toBeUndefined()
+    expect(result).toMatchObject({settled: false, rootUnconfirmed: true, followUpPossible: true})
+  })
+
+  it('reports a shell the final sweep still lists as unconfirmed', async () => {
+    // #given — the late shell shrugs off the DELETE
+    const server = makeServer({
+      shellServer: {deleteDoesNotKill: [SHELL]},
+      interrupt: async () => {
+        server.shellServer.shells[SHELL] = {status: 'running', owner: ROOT}
+        return ok({interrupted: true})
+      },
+    })
+
+    // #when
+    const result = await settleOwnedSessionsV2({
+      client: server.client,
+      directory: DIR,
+      shellKillRounds: 1,
+      shellKillPollIntervalMs: 0,
+      rootSessionId: ROOT,
+      ledger: createOwnershipLedger(),
+      logger: makeLogger(),
+      confirmRootQuiescent: true,
+      streamTerminal: () => 'user',
+      rootPollIntervalMs: 1,
+      timeoutMs: 3_000,
+    })
+
+    // #then
+    expect(result).toMatchObject({settled: false, shellsUnconfirmed: true})
+  })
+
+  it('does not sweep for a late shell when the stop was already unconfirmed', async () => {
+    // #given — follow-up work is open, so the root is not confirmed and the watch owns the polling
+    const server = makeServer({shellServer: RUNNING})
+
+    // #when
+    await settleOwnedSessionsV2({
+      client: server.client,
+      directory: DIR,
+      rootSessionId: ROOT,
+      ledger: shellLedger(),
+      logger: makeLogger(),
+      confirmRootQuiescent: true,
+      followUpPossible: true,
+    })
+
+    // #then — one sweep: the kill and its confirming list, no second
+    expect(server.shellServer.listShells).toHaveBeenCalledTimes(2)
   })
 
   it('keeps the stop unconfirmed when the shell is still running after the kill', async () => {
@@ -454,6 +600,8 @@ describe('settleOwnedSessionsV2: background shells', () => {
     const result = await settleOwnedSessionsV2({
       client: server.client,
       directory: DIR,
+      shellKillRounds: 1,
+      shellKillPollIntervalMs: 0,
       rootSessionId: ROOT,
       ledger,
       logger: makeLogger(),
@@ -475,6 +623,8 @@ describe('settleOwnedSessionsV2: background shells', () => {
     await settleOwnedSessionsV2({
       client: server.client,
       directory: DIR,
+      shellKillRounds: 1,
+      shellKillPollIntervalMs: 0,
       rootSessionId: ROOT,
       ledger: shellLedger(),
       logger: makeLogger(),
@@ -517,6 +667,8 @@ describe('settleOwnedSessionsV2: background shells', () => {
     const result = await settleOwnedSessionsV2({
       client: server.client,
       directory: DIR,
+      shellKillRounds: 1,
+      shellKillPollIntervalMs: 0,
       rootSessionId: ROOT,
       ledger,
       logger: makeLogger(),
@@ -536,6 +688,8 @@ describe('settleOwnedSessionsV2: background shells', () => {
     const result = await settleOwnedSessionsV2({
       client: server.client,
       directory: DIR,
+      shellKillRounds: 1,
+      shellKillPollIntervalMs: 0,
       rootSessionId: ROOT,
       ledger: createOwnershipLedger(),
       logger: makeLogger(),
@@ -544,8 +698,8 @@ describe('settleOwnedSessionsV2: background shells', () => {
       rootPollIntervalMs: 1,
     })
 
-    // #then — the root is fine, the shell is the reason
-    expect(result).toMatchObject({settled: false, rootUnconfirmed: false, shellsUnconfirmed: true})
+    // #then — the shell is the reason; the DELETE was accepted, so its notice can wake the root as well
+    expect(result).toMatchObject({settled: false, rootUnconfirmed: true, shellsUnconfirmed: true})
     expect(result.settled === false && result.reason.includes(SHELL)).toBe(true)
   })
 
@@ -557,6 +711,8 @@ describe('settleOwnedSessionsV2: background shells', () => {
     const result = await settleOwnedSessionsV2({
       client: server.client,
       directory: DIR,
+      shellKillRounds: 1,
+      shellKillPollIntervalMs: 0,
       rootSessionId: ROOT,
       ledger: createOwnershipLedger(),
       logger: makeLogger(),
@@ -591,8 +747,8 @@ describe('settleOwnedSessionsV2: background shells', () => {
       rootPollIntervalMs: 1,
     })
 
-    // #then
-    expect(result).toEqual({settled: true})
+    // #then — the root's stray shell is handled and the stranger's left alone; the root is not confirmed
+    expect(result).toMatchObject({settled: false, rootUnconfirmed: true, followUpPossible: true})
     expect(server.shellServer.deleteShell).toHaveBeenCalledTimes(1)
     expect(server.shellServer.shells[SHELL]).toBeUndefined()
     expect(server.shellServer.shells.sh_stranger).toBeDefined()

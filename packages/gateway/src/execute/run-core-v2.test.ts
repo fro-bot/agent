@@ -563,8 +563,10 @@ describe('runOpenCodeCoreV2: failures the server reports', () => {
     run.emit(frames.moved(ROOT))
     await vi.advanceTimersByTimeAsync(20_000)
 
-    // #then
-    expect(failure(run).kind).toBe('session-error')
+    // #then — and never confirmed: the destination's shells cannot be seen from the directory the run lists
+    const error = failure(run)
+    expect(error.kind).toBe('session-error')
+    expect(error.quarantined).toBe(true)
     expect(run.interrupt).toHaveBeenCalledWith(expect.objectContaining({sessionId: ROOT}))
   })
 

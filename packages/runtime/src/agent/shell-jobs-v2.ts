@@ -45,6 +45,39 @@ export function collectOwnerSessionIds(rootSessionId: string, ledger: OwnershipL
   return owners
 }
 
+export interface ListOwnedRunningShellsOptions {
+  readonly api: ShellApi
+  readonly directory: string
+  /** The root and the sessions this run owns (`collectOwnerSessionIds`). */
+  readonly ownerSessionIds: ReadonlySet<string>
+  readonly signal?: AbortSignal
+}
+
+/**
+ * Ids of the running shells in `directory` tagged with an owned session, straight from the server and not from the
+ * ledger. A shell whose creation frame arrived before its owner was adopted, or never arrived, is invisible to the
+ * ledger and visible here. A status the client does not know counts as running. A list that cannot be read is an error,
+ * never an empty answer. Never throws.
+ */
+export async function listOwnedRunningShells(
+  options: ListOwnedRunningShellsOptions,
+): Promise<Result<readonly string[], Error>> {
+  const {api, directory, ownerSessionIds, signal} = options
+  try {
+    const listed = await api.listShells({directory, ...(signal === undefined ? {} : {signal})})
+    if (!listed.success) return err(new Error(`shell.list failed: ${describe(listed.error)}`))
+    return ok(
+      listed.data
+        .filter(
+          shell => !isStopped(shell) && shell.ownerSessionId !== null && ownerSessionIds.has(shell.ownerSessionId),
+        )
+        .map(shell => shell.id),
+    )
+  } catch (error) {
+    return err(toError(error))
+  }
+}
+
 export interface ReconcileShellsOptions {
   readonly ledger: OwnershipLedger
   readonly api: ShellApi
@@ -126,10 +159,10 @@ export async function reconcileShellsOnce(
   }
 }
 
-/** Pause between kill rounds. A killed process leaves the running list within a second (probe p22). */
-export const DEFAULT_SHELL_KILL_POLL_INTERVAL_MS = 250
-/** Kill rounds before a shell is reported as still running. */
-export const DEFAULT_SHELL_KILL_ROUNDS = 3
+/** Pause between kill rounds. A killed process leaves the running list in about a second (probe p22). */
+export const DEFAULT_SHELL_KILL_POLL_INTERVAL_MS = 500
+/** Kill rounds before a shell is reported as still running: about three seconds, three times the observed kill. */
+export const DEFAULT_SHELL_KILL_ROUNDS = 6
 
 export interface KillOwnedShellsOptions {
   readonly api: ShellApi
@@ -156,7 +189,9 @@ export type KillOwnedShellsResult =
  * stranger, or one nobody tagged, is left alone.
  *
  * Confirmed ledger entries are settled. A DELETE queues an `error` notice that wakes the owning session, so settling
- * here does not mean the owner is quiet. Never throws; every failure is an unconfirmed result.
+ * here does not mean the owner is quiet: a caller that deleted anything (`deleted` is non-empty) must not confirm the
+ * root. The accepted cost is that every stop with a live owned shell quarantines, even after a clean kill. Never
+ * throws; every failure is an unconfirmed result.
  */
 export async function killOwnedShells(options: KillOwnedShellsOptions): Promise<KillOwnedShellsResult> {
   const {

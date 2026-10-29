@@ -21,7 +21,16 @@ function makeLogger(): GatewayLogger {
 
 type Live = readonly string[] | 'fail' | 'hang'
 
-function setup(options: {readonly live?: readonly Live[]; readonly children?: readonly string[]} = {}) {
+type Shells = readonly string[] | 'fail'
+
+function setup(
+  options: {
+    readonly live?: readonly Live[]
+    readonly children?: readonly string[]
+    /** Running owned shells per read (the last entry repeats). Absent: the gate is not given the read. */
+    readonly shells?: readonly Shells[]
+  } = {},
+) {
   const ledger = createOwnershipLedger()
   for (const child of options.children ?? [CHILD]) ledger.adopt(child, child)
   const readings = options.live ?? [[]]
@@ -42,6 +51,13 @@ function setup(options: {readonly live?: readonly Live[]; readonly children?: re
   const controller = new AbortController()
   const onAdmitted = vi.fn()
   const reasons: DrainRejectCode[] = []
+  const shellReadings = options.shells
+  let shellCall = 0
+  const ownedRunningShells = vi.fn(async () => {
+    const reading = shellReadings?.[Math.min(shellCall, shellReadings.length - 1)] ?? []
+    shellCall += 1
+    return reading === 'fail' ? err(new Error('shell.list failed')) : ok(reading)
+  })
   const drain = createDrainCompletionV2({
     rootSessionId: ROOT,
     ledger,
@@ -52,8 +68,9 @@ function setup(options: {readonly live?: readonly Live[]; readonly children?: re
     onNotAdmitted: code => reasons.push(code),
     validationIntervalMs: 1_000,
     requestTimeoutMs: 5_000,
+    ...(shellReadings === undefined ? {} : {ownedRunningShells}),
   })
-  return {ledger, adapter, controller, onAdmitted, reasons, drain}
+  return {ledger, adapter, controller, onAdmitted, reasons, drain, ownedRunningShells}
 }
 
 /** The server's own statement that a child ended: the ledger settles and the gate hears the notice. */
@@ -533,5 +550,96 @@ describe('createDrainCompletionV2: background shells', () => {
     // #then — the shell's own notice is still missing
     expect(s.onAdmitted).not.toHaveBeenCalled()
     expect(s.reasons.at(-1)).toBe('notice-not-observed')
+  })
+})
+
+/** A child that ended and a root turn that took its notice in: everything else says the run may finish. */
+function readyToAdmit(s: ReturnType<typeof setup>) {
+  s.drain.noteRootIdle()
+  s.drain.beginDrain()
+  childEnds(s)
+  noticeTurn(s)
+}
+
+describe('createDrainCompletionV2: running shells at the commit point', () => {
+  it('does not admit while a running shell tagged with an owned session is listed, whatever the ledger says', async () => {
+    // #given — the ledger is drained and every notice is in, but the server lists a child's shell nobody adopted
+    const s = setup({shells: [['sh_dropped']]})
+    readyToAdmit(s)
+
+    // #when
+    s.drain.requestValidation()
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #then — the run keeps draining, and the wait reason is the outstanding background work
+    expect(s.onAdmitted).not.toHaveBeenCalled()
+    expect(s.reasons.at(-1)).toBe('ledger-not-drained')
+  })
+
+  it('admits on a later pass once the listed shell has stopped', async () => {
+    // #given
+    const s = setup({shells: [['sh_dropped'], []]})
+    readyToAdmit(s)
+    s.drain.requestValidation()
+    await vi.advanceTimersByTimeAsync(10)
+    expect(s.onAdmitted).not.toHaveBeenCalled()
+
+    // #when — the retry timer asks again
+    await vi.advanceTimersByTimeAsync(1_500)
+
+    // #then
+    expect(s.onAdmitted).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not admit when the shell list cannot be read', async () => {
+    // #given
+    const s = setup({shells: ['fail']})
+    readyToAdmit(s)
+
+    // #when
+    s.drain.requestValidation()
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #then
+    expect(s.onAdmitted).not.toHaveBeenCalled()
+    expect(s.reasons.at(-1)).toBe('root-liveness-unavailable')
+  })
+
+  it('admits when no owned shell is running', async () => {
+    // #given
+    const s = setup({shells: [[]]})
+    readyToAdmit(s)
+
+    // #when
+    s.drain.requestValidation()
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #then
+    expect(s.onAdmitted).toHaveBeenCalledTimes(1)
+    expect(s.ownedRunningShells).toHaveBeenCalled()
+  })
+
+  it('reads the shells before the commit point: root activity while the read is in flight blocks admission', async () => {
+    // #given — the read answers only after the root has started working again
+    const s = setup({shells: [[]]})
+    let release: (() => void) | undefined
+    s.ownedRunningShells.mockImplementationOnce(
+      async () =>
+        new Promise(resolve => {
+          release = () => resolve(ok([]))
+        }),
+    )
+    readyToAdmit(s)
+    s.drain.requestValidation()
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #when
+    s.drain.noteRootActivity()
+    release?.()
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #then
+    expect(s.onAdmitted).not.toHaveBeenCalled()
+    expect(s.reasons.at(-1)).toBe('revision-drift')
   })
 })
