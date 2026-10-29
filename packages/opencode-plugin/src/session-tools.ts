@@ -12,8 +12,8 @@ import type {MessageV2, SessionClientV2, SessionInfoV2} from '@fro-bot/runtime/s
 import {
   getSessionInfoV2,
   getSessionMessagesV2,
-  getSessionTodosV2,
   getSessionV2,
+  latestTodosV2,
   listSessionsV2,
   searchSessionsV2,
 } from '@fro-bot/runtime/session-v2'
@@ -235,20 +235,25 @@ export function createSessionTools(options: {
 
         const lines = sessionHeader(found.data)
 
-        if (asBoolean(args.include_todos) === true) {
-          const todos = await getSessionTodosV2(client, sessionId, logger)
-          if (!todos.success) return unavailable(describeFailure(todos.error))
+        const includeTodos = asBoolean(args.include_todos) === true
+        const includeTranscript = asBoolean(args.include_transcript) === true
+        if (!includeTodos && !includeTranscript) return lines.join('\n')
+
+        // One snapshot of the active context feeds both sections.
+        const messages = await getSessionMessagesV2(client, sessionId, logger)
+        if (!messages.success) return unavailable(describeFailure(messages.error))
+
+        if (includeTodos) {
+          const todos = latestTodosV2(messages.data)
           lines.push('', 'Todos:')
-          if (todos.data.length === 0) {
+          if (todos.length === 0) {
             lines.push('  (none)')
           } else {
-            for (const todo of todos.data) lines.push(`  [${todo.status}] ${todo.content}`)
+            for (const todo of todos) lines.push(`  [${todo.status}] ${todo.content}`)
           }
         }
 
-        if (asBoolean(args.include_transcript) === true) {
-          const messages = await getSessionMessagesV2(client, sessionId, logger)
-          if (!messages.success) return unavailable(describeFailure(messages.error))
+        if (includeTranscript) {
           // Oldest-first; a limit returns the earliest N messages.
           const limit = normalizeLimit(asNumber(args.limit))
           const sliced = limit == null ? messages.data : messages.data.slice(0, limit)

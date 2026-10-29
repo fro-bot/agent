@@ -6,6 +6,8 @@ export {getSessionInfoV2, listSessionsV2, SEARCH_MAX_SESSIONS, searchSessionsV2}
 
 export type {SessionDetailsV2} from './search-v2.js'
 
+export {latestTodosV2} from './storage-message-mappers-v2.js'
+
 export {
   getSessionMessagesV2,
   getSessionTodosV2,

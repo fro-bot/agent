@@ -105,17 +105,31 @@ export async function searchSessionsV2(
 
   const results: SessionSearchResult[] = []
   let totalMatches = 0
+  let attempted = 0
+  let succeeded = 0
+  let firstReadError: Error | undefined
   for (const session of listed.data.filter(s => !excluded.has(s.id)).slice(0, SEARCH_MAX_SESSIONS)) {
     if (totalMatches >= limit) break
 
+    attempted += 1
     const messages = await getSessionMessagesV2(client, session.id, logger)
-    if (!messages.success) continue // already logged; one unreadable session must not sink the whole search
+    if (!messages.success) {
+      // already logged; one unreadable session must not sink the whole search
+      firstReadError ??= messages.error
+      continue
+    }
+    succeeded += 1
 
     const matches = searchMessages(messages.data, pattern, caseSensitive)
     if (matches.length === 0) continue
     const kept = matches.slice(0, limit - totalMatches)
     results.push({sessionId: session.id, matches: kept})
     totalMatches += kept.length
+  }
+
+  // Nothing was searched: "no matches" would be a lie.
+  if (attempted > 0 && succeeded === 0 && firstReadError != null) {
+    return err(new Error(`could not read any of ${attempted} sessions: ${firstReadError.message}`))
   }
 
   logger.info('V2 session search complete', {resultCount: results.length, totalMatches})

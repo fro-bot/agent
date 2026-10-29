@@ -298,6 +298,30 @@ describe('session_read', () => {
     expect(output).toMatch(/\.\.\. transcript truncated \(\d+ of 200 messages shown\)/)
   })
 
+  it('reads the context once for a combined todos and transcript request', async () => {
+    // #given
+    const t = tools()
+
+    // #when
+    const output = await t.read.run({session_id: 'ses_a', include_todos: true, include_transcript: true})
+
+    // #then one snapshot feeds both sections
+    expect(client.messages).toHaveBeenCalledTimes(1)
+    expect(output).toContain('Todos:\n  [completed] reproduce\n  [in_progress] fix')
+    expect(output).toContain('Transcript:\n  [user] please fix the Flaky cache test')
+  })
+
+  it('reads the context once for a todos-only request', async () => {
+    // #given
+    const t = tools()
+
+    // #when
+    await t.read.run({session_id: 'ses_a', include_todos: true})
+
+    // #then
+    expect(client.messages).toHaveBeenCalledTimes(1)
+  })
+
   it('returns an unavailable message when messages cannot be read', async () => {
     // #given
     const t = tools({messages: vi.fn(failing)})
@@ -387,6 +411,18 @@ describe('session_search', () => {
 
     // #when / #then
     expect(await t.search.run({query: 'cache'})).toBe('session store unavailable: store offline')
+  })
+
+  it('says the store is unavailable, not that nothing matched, when every session read fails', async () => {
+    // #given listing works but no session's messages can be read
+    const t = tools({messages: vi.fn(failing)})
+
+    // #when
+    const output = await t.search.run({query: 'cache'})
+
+    // #then
+    expect(output).toBe('session store unavailable: could not read any of 3 sessions: store offline')
+    expect(output).not.toContain('No matches')
   })
 })
 

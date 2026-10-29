@@ -220,6 +220,41 @@ describe('searchSessionsV2', () => {
     expect(logger.warning).toHaveBeenCalled()
   })
 
+  it('fails instead of reporting no matches when listing succeeds but every session read fails', async () => {
+    // #given three listed sessions and a store whose message reads all fail
+    const client: SessionClientV2 = {
+      ...clientFor(store),
+      messages: vi.fn(async () => {
+        throw new Error('store offline')
+      }),
+    }
+
+    // #when
+    const result = await searchSessionsV2('cache', client, '/work/repo', {}, logger)
+
+    // #then the search says it could not read, rather than "no matches"
+    expect(result.success).toBe(false)
+    expect(!result.success && result.error.message).toBe('could not read any of 3 sessions: store offline')
+  })
+
+  it('returns an empty result when every session reads fine but none match', async () => {
+    // #given
+    // #when
+    const result = await searchSessionsV2('zzz-no-such-text', clientFor(store), '/work/repo', {}, logger)
+
+    // #then
+    expect(result.success && result.data).toEqual([])
+  })
+
+  it('returns an empty result when there are no sessions to read', async () => {
+    // #given nothing is attempted, so nothing can fail
+    // #when
+    const result = await searchSessionsV2('cache', clientFor({sessions: [], messages: {}}), '/work/repo', {}, logger)
+
+    // #then
+    expect(result.success && result.data).toEqual([])
+  })
+
   it('fails when a single-session scope cannot be read', async () => {
     // #given
     const client: SessionClientV2 = {
