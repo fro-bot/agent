@@ -78,6 +78,22 @@ describe('createRemoteOpenCodeV2Client', () => {
     expect(requests[0]?.headers.authorization).toBe('Bearer secret-token')
   })
 
+  it('trims every trailing slash from the base URL in linear time', async () => {
+    // #given — a base URL ending in a long run of slashes
+    const {fetch, requests} = makeFetch(() => json(200, {data: {id: 'ses_1'}}))
+    const client = createRemoteOpenCodeV2Client({
+      baseUrl: `http://workspace:9200${'/'.repeat(100_000)}`,
+      headers: AUTH,
+      fetch,
+    })
+
+    // #when
+    await client.createSession({directory: '/workspace/repo'})
+
+    // #then
+    expect(requests[0]?.url).toBe('http://workspace:9200/api/session')
+  })
+
   it('reports a 401 as an auth failure and never carries the body', async () => {
     // #given — the 401 body is always the same shape and says nothing about why
     const {fetch} = makeFetch(() => json(401, {_tag: 'UnauthorizedError', message: 'Authentication required'}))

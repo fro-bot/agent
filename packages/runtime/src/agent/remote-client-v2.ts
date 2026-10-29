@@ -244,8 +244,14 @@ async function* readFrames(response: Response, signal: AbortSignal | undefined):
   }
 }
 
+function trimTrailingSlashes(value: string): string {
+  let end = value.length
+  while (end > 0 && value.charCodeAt(end - 1) === 0x2f) end--
+  return value.slice(0, end)
+}
+
 export function createRemoteOpenCodeV2Client(options: RemoteOpenCodeV2ClientOptions): RemoteOpenCodeV2Client {
-  const baseUrl = options.baseUrl.replace(/\/+$/, '')
+  const baseUrl = trimTrailingSlashes(options.baseUrl)
   const baseHeaders = options.headers ?? {}
   const doFetch = options.fetch ?? fetch
 
