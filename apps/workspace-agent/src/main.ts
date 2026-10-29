@@ -13,8 +13,11 @@
 
 import type {AddressInfo} from 'node:net'
 import type {ServerType} from '@hono/node-server'
+import type {CreateInstanceDisposerV2Options} from './opencode-instance-v2.js'
 import type {CreateInstanceDisposerOptions, InstanceDisposer} from './opencode-instance.js'
+import type {OpencodeProxyV2Options} from './opencode-proxy-v2.js'
 import type {OpencodeProxyHandle, OpencodeProxyOptions} from './opencode-proxy.js'
+import type {RunSupervisedOpencodeV2Options} from './opencode-server-v2.js'
 import type {RunSupervisedOpencodeOptions} from './opencode-server.js'
 import type {ReconcileRecoveryJournalsOnStartupDeps} from './recover.js'
 import type {ProxyListeningRef, ServerDeps} from './server.js'
@@ -27,8 +30,12 @@ import {serve} from '@hono/node-server'
 
 import {asyncCleanupAllAskpassDirs} from './clone.js'
 import {readReadyTimeoutMs, readSecret, readUpdateNetworkConfig} from './config.js'
+import {readOpencodeGeneration} from './opencode-generation.js'
+import {createInstanceDisposerV2} from './opencode-instance-v2.js'
 import {createInstanceDisposer} from './opencode-instance.js'
+import {createOpencodeProxyV2} from './opencode-proxy-v2.js'
 import {createOpencodeProxy} from './opencode-proxy.js'
+import {createUpstreamCredentials, runSupervisedOpencodeV2} from './opencode-server-v2.js'
 import {runSupervisedOpencode} from './opencode-server.js'
 import {reconcileRecoveryJournalsOnStartup} from './recover.js'
 import {createApp} from './server.js'
@@ -84,6 +91,15 @@ export type CreateOpencodeProxyFn = (options: OpencodeProxyOptions) => OpencodeP
 
 /** Supervisor runner function. */
 export type RunSupervisedOpencodeFn = (options: RunSupervisedOpencodeOptions) => Promise<void>
+
+/** V2 factory for the OpenCode proxy: bearer in, the current server's Basic credential out. */
+export type CreateOpencodeProxyV2Fn = (options: OpencodeProxyV2Options) => OpencodeProxyHandle
+
+/** V2 supervisor runner function. */
+export type RunSupervisedOpencodeV2Fn = (options: RunSupervisedOpencodeV2Options) => Promise<void>
+
+/** V2 factory for the best-effort location evictor. */
+export type CreateInstanceDisposerV2Fn = (options: CreateInstanceDisposerV2Options) => InstanceDisposer
 
 /** Secret reader function. */
 export type ReadSecretFn = (name: string) => string
@@ -162,6 +178,15 @@ export interface WorkspaceAgentDeps {
    * assert which upstream and readiness predicate startup wires, without a real OpenCode.
    */
   readonly createInstanceDisposerFn?: CreateInstanceDisposerFn
+  /**
+   * V2 supervised runner. Defaults to the real `runSupervisedOpencodeV2`. Used instead of `runSupervisedOpencodeFn`
+   * when the image's `WORKSPACE_IMAGE_OPENCODE_VERSION` has major version 2 or above.
+   */
+  readonly runSupervisedOpencodeV2Fn?: RunSupervisedOpencodeV2Fn
+  /** V2 proxy factory. Defaults to the real `createOpencodeProxyV2`. Used instead of `createOpencodeProxyFn` on V2. */
+  readonly createOpencodeProxyV2Fn?: CreateOpencodeProxyV2Fn
+  /** V2 instance-disposer factory. Defaults to the real `createInstanceDisposerV2`. Used on V2 only. */
+  readonly createInstanceDisposerV2Fn?: CreateInstanceDisposerV2Fn
 }
 
 /**
@@ -236,6 +261,9 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
     reconcileRecoveryJournalsFn = reconcileRecoveryJournalsOnStartup,
     createAppFn = createApp,
     createInstanceDisposerFn = createInstanceDisposer,
+    runSupervisedOpencodeV2Fn = runSupervisedOpencodeV2,
+    createOpencodeProxyV2Fn = createOpencodeProxyV2,
+    createInstanceDisposerV2Fn = createInstanceDisposerV2,
   } = deps
 
   // Supervisor writes all status transitions here; /healthz and /readyz read it.
@@ -259,6 +287,20 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
 
   // Read env before any server bind: fail-fast if WORKSPACE_OPENCODE_READY_TIMEOUT_MS is malformed.
   const opencodeReadyTimeoutMs = readReadyTimeoutMs(env)
+
+  // Which OpenCode the image carries: the one value the image bakes selects the whole V1 or V2 trio (runner, proxy,
+  // disposer), and is reported on /healthz and /readyz so the gateway picks its run loop from the workspace. A value
+  // that is set but is not a version is fatal: guessing would run one generation's spawn flags on the other's binary.
+  const generation = readOpencodeGeneration(env)
+  if (!generation.success) {
+    console.error('workspace-agent: cannot start — invalid OpenCode image version', {message: generation.error})
+    return exitFn(1)
+  }
+  const isV2 = generation.data.kind === 'v2'
+  const opencodeVersion = generation.data.version
+  // One holder for the whole process on V2: the runner publishes the ready server's credential, the proxy and the
+  // disposer read it. Unused on V1.
+  const upstreamCredentials = createUpstreamCredentials()
 
   // Read the control-API bearer once, before any server bind, and reuse it for both the Hono
   // app's auth middleware (every route but /healthz and /readyz) and the 9200 OpenCode proxy
@@ -314,10 +356,17 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
     logger: opencodeLogger,
     // After a successful recovery, drop OpenCode's cached instance for the replaced checkout. Only
     // while the supervisor reports it ready: before that (or while it is down) there is no instance.
-    instanceDisposer: createInstanceDisposerFn({
-      upstreamUrl: OPENCODE_UPSTREAM_URL,
-      isRunning: () => opencodeStatus.status === 'ready',
-    }),
+    instanceDisposer: isV2
+      ? createInstanceDisposerV2Fn({
+          upstreamUrl: OPENCODE_UPSTREAM_URL,
+          credentials: upstreamCredentials,
+          isRunning: () => opencodeStatus.status === 'ready',
+        })
+      : createInstanceDisposerFn({
+          upstreamUrl: OPENCODE_UPSTREAM_URL,
+          isRunning: () => opencodeStatus.status === 'ready',
+        }),
+    ...(opencodeVersion === undefined ? {} : {opencodeVersion}),
   })
 
   // Bind :9100 and WAIT for the first of three outcomes before doing anything else that could
@@ -381,11 +430,18 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
 
   try {
     // Reuses the `token` read once, above, before any server bind — see that comment.
-    proxy = createOpencodeProxyFn({
-      token,
-      upstreamUrl: OPENCODE_UPSTREAM_URL,
-      logger: opencodeLogger,
-    })
+    proxy = isV2
+      ? createOpencodeProxyV2Fn({
+          token,
+          upstreamUrl: OPENCODE_UPSTREAM_URL,
+          logger: opencodeLogger,
+          credentials: upstreamCredentials,
+        })
+      : createOpencodeProxyFn({
+          token,
+          upstreamUrl: OPENCODE_UPSTREAM_URL,
+          logger: opencodeLogger,
+        })
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     console.error('workspace-agent: cannot start proxy', {message})
@@ -444,15 +500,26 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
   // Spawned only now — AFTER :9100 is confirmed listening and the :9200 bind attempt has
   // settled — so an unprivileged OpenCode process (uid 10001) can never win a race to bind
   // either control port first.
-  const opencodeServerPromise = runSupervisedOpencodeFn({
-    rootDir: WORKSPACE_REPOS_ROOT,
-    logger: opencodeLogger,
-    statusRef: opencodeStatus,
-    signal: opencodeController.signal,
-    hostname: OPENCODE_HOSTNAME,
-    port: OPENCODE_PORT,
-    readyTimeoutMs: opencodeReadyTimeoutMs,
-  }).catch((error: unknown) => {
+  const opencodeRun = isV2
+    ? runSupervisedOpencodeV2Fn({
+        rootDir: WORKSPACE_REPOS_ROOT,
+        logger: opencodeLogger,
+        statusRef: opencodeStatus,
+        credentials: upstreamCredentials,
+        signal: opencodeController.signal,
+        port: OPENCODE_PORT,
+        readyTimeoutMs: opencodeReadyTimeoutMs,
+      })
+    : runSupervisedOpencodeFn({
+        rootDir: WORKSPACE_REPOS_ROOT,
+        logger: opencodeLogger,
+        statusRef: opencodeStatus,
+        signal: opencodeController.signal,
+        hostname: OPENCODE_HOSTNAME,
+        port: OPENCODE_PORT,
+        readyTimeoutMs: opencodeReadyTimeoutMs,
+      })
+  const opencodeServerPromise = opencodeRun.catch((error: unknown) => {
     // Unexpected supervisor crash (should not happen — supervisor catches internally).
     opencodeStatus.status = 'down'
     const message = error instanceof Error ? error.message : String(error)
@@ -483,10 +550,16 @@ export async function startWorkspaceAgent(deps: WorkspaceAgentDeps = {}): Promis
       return Promise.resolve()
     }
 
+    // V2 only: the abort starts an interrupt-then-close teardown that outlives the abort call, so the service waits
+    // for it (inside the drain window) before it closes the proxy and exits. V1's abort kills the process group
+    // synchronously, so it needs no wait and none is added.
+    const opencodeStopped: Promise<void> = isV2 ? opencodeServerPromise : Promise.resolve()
+
     asyncCleanupAllAskpassDirs()
       .catch(() => {
         // Best-effort
       })
+      .finally(async () => opencodeStopped)
       .finally(() => {
         cleanupProxy()
           .catch(() => {

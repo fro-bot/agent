@@ -98,8 +98,11 @@ COPY packages/opencode-plugin/package.json packages/opencode-plugin/package.json
 # devDependencies and breaks the typecheck.
 RUN bun install --frozen-lockfile
 
-# Source for the package we actually build
+# Source for the package we actually build. The V2 runner imports @fro-bot/runtime/workspace-v2, a
+# TypeScript-source workspace package that the build type-checks and bundles in, so its source comes too
+# (deploy/gateway.Dockerfile does the same).
 COPY apps/workspace-agent/ apps/workspace-agent/
+COPY packages/runtime/ packages/runtime/
 
 RUN bun run --filter @fro-bot/workspace-agent build
 
@@ -366,6 +369,27 @@ RUN set -euo pipefail \
     && rm -f "/tmp/${oc_asset}.tar.gz" /tmp/SHA256SUMS \
     && opencode --version
 
+# Stock V2 (same version test as above): install the Systematic and fro-bot plugins into the agent's cache NOW, at
+# build time, as uid 10001 and under a bound. The server then finds them by spec at boot with no registry access,
+# which is what the --network none smoke test proves. An unbounded boot-time install would hang `GET /api/agent`
+# for as long as the registry hangs (probe P10). The versions must equal SYSTEMATIC_V2_VERSION and
+# FRO_BOT_PLUGIN_VERSION in packages/runtime/src/shared/constants.ts; deploy/scripts/workspace-v2-image.test.mjs
+# keeps them in step, and the plugin gate refuses a server whose plugins differ from what the workspace expects.
+# Harness and V1 builds skip this step entirely.
+ARG SYSTEMATIC_V2_VERSION=3.27.0
+ARG FRO_BOT_PLUGIN_VERSION=0.1.0
+COPY deploy/scripts/install-opencode-v2-plugins.sh /usr/local/lib/workspace-scripts/install-opencode-v2-plugins.sh
+RUN set -euo pipefail \
+    && case "${OPENCODE_VERSION}" in \
+         *[!0-9A-Za-z.+_-]*) echo "OPENCODE_VERSION contains disallowed characters: ${OPENCODE_VERSION}" >&2; exit 1 ;; \
+         *harness*) exit 0 ;; \
+         [2-9].*|[1-9][0-9]*.*) : ;; \
+         *) exit 0 ;; \
+       esac \
+    && sh /usr/local/lib/workspace-scripts/install-opencode-v2-plugins.sh \
+         "@fro.bot/systematic@${SYSTEMATIC_V2_VERSION}" \
+         "@fro.bot/opencode-plugin@${FRO_BOT_PLUGIN_VERSION}"
+
 # Disable OpenCode's file watcher by default: nothing in this container consumes
 # file-change events, so the watcher is pure overhead. A deployer can still
 # override this through compose. Accepted consequence: OpenCode's cached VCS
@@ -378,6 +402,15 @@ ENV OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER=true
 # this repo built for it is otherwise unreachable dead code. A deployer can
 # still override this through compose.
 ENV OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true
+
+# The V2 spelling of the file-watcher switch above (V2 has no environment flag for background subagents; they are
+# native). The V1 launch spec copies only the two EXPERIMENTAL_ names, so a V1 child never sees this one.
+ENV OPENCODE_DISABLE_FILEWATCHER=true
+
+# Which OpenCode this image carries. The workspace agent selects its V1 or V2 supervised runner, proxy and disposer
+# from it (major 2 or above is V2) and reports it on /readyz, where the gateway picks its run loop. It is the same
+# build argument that selected the binary above, so the two cannot disagree; it is not an operator setting.
+ENV WORKSPACE_IMAGE_OPENCODE_VERSION=${OPENCODE_VERSION}
 
 # Base workspace OpenCode config: declare the Systematic plugin and disable
 # autoupdate. The model and provider block are NOT baked — the entrypoint
@@ -392,9 +425,23 @@ ENV OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true
 # near. The entrypoint's agent-uid subprocess reads this file (world-readable
 # is sufficient — no write access is needed) and writes the merged result to
 # the agent's own $XDG_CONFIG_HOME.
+#
+# Stock V2 gets a base without a plugin entry: the Systematic and fro-bot plugins are listed in the config content the
+# workspace agent passes at spawn (and installed at build time above), and `plugin` is the V1 key. The entrypoint
+# rewrites the global file it builds from this base at every start, so a plugin listed only there would not survive.
 RUN mkdir -p /usr/local/share/fro-bot \
-    && printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "autoupdate": false,\n  "plugin": ["@fro.bot/systematic@%s"]\n}\n' "${SYSTEMATIC_VERSION}" \
-      > /usr/local/share/fro-bot/opencode.base.json \
+    && case "${OPENCODE_VERSION}" in \
+         *harness*) v2=0 ;; \
+         [2-9].*|[1-9][0-9]*.*) v2=1 ;; \
+         *) v2=0 ;; \
+       esac \
+    && if [ "${v2}" = 1 ]; then \
+         printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "update": "disable"\n}\n' \
+           > /usr/local/share/fro-bot/opencode.base.json; \
+       else \
+         printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "autoupdate": false,\n  "plugin": ["@fro.bot/systematic@%s"]\n}\n' "${SYSTEMATIC_VERSION}" \
+           > /usr/local/share/fro-bot/opencode.base.json; \
+       fi \
     && chown 0:0 /usr/local/share/fro-bot/opencode.base.json \
     && chmod 0644 /usr/local/share/fro-bot/opencode.base.json
 
@@ -410,6 +457,18 @@ COPY deploy/plugins/no-task-reuse.mjs /usr/local/lib/fro-bot/plugins/no-task-reu
 COPY deploy/managed-config/opencode.json /etc/opencode/opencode.json
 RUN chown 0:0 /usr/local/lib/fro-bot/plugins/no-task-reuse.mjs /etc/opencode/opencode.json \
     && chmod 0644 /usr/local/lib/fro-bot/plugins/no-task-reuse.mjs /etc/opencode/opencode.json
+
+# Stock V2 replaces the managed config with its V2 form (deploy/managed-config/opencode-v2.json). The reuse guard is
+# the fro-bot plugin there, loaded from the config content, so the V1 plugin file above stays in the image but is
+# not referenced. Root-owned and 0644 like the V1 file.
+COPY deploy/managed-config/opencode-v2.json /usr/local/share/fro-bot/opencode-managed.v2.json
+RUN case "${OPENCODE_VERSION}" in \
+      *harness*) : ;; \
+      [2-9].*|[1-9][0-9]*.*) cp /usr/local/share/fro-bot/opencode-managed.v2.json /etc/opencode/opencode.json ;; \
+      *) : ;; \
+    esac \
+    && chown 0:0 /usr/local/share/fro-bot/opencode-managed.v2.json /etc/opencode/opencode.json \
+    && chmod 0644 /usr/local/share/fro-bot/opencode-managed.v2.json /etc/opencode/opencode.json
 
 # Production node_modules + bundled entrypoint (mirror gateway.Dockerfile layout).
 COPY --from=build /workspace/node_modules ./node_modules

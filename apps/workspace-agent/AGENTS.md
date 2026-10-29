@@ -137,6 +137,10 @@ src/
 ├── recover.ts          /recover/preview and /recover: fingerprint preview, quarantine-and-replace mutation
 ├── backups.ts          /backups list/delete; the quarantine-generation metadata schema (including the optional run id)
 ├── opencode-instance.ts Best-effort POST /instance/dispose to the loopback OpenCode, run after a successful /recover
+├── opencode-generation.ts  Reads WORKSPACE_IMAGE_OPENCODE_VERSION (baked by the image); major 2+ selects the V2 trio below
+├── opencode-server-v2.ts   V2 supervisor: allowlisted env, fresh database per spawn, credential holder, plugin + permission gates
+├── opencode-proxy-v2.ts    V2 proxy: gateway bearer in, the ready server's Basic credential out, upstream 401 reported as such
+├── opencode-instance-v2.ts V2 best-effort location evict (DELETE /api/debug/location), authenticated as the running server
 ├── checkout-profile.ts Config inventory, layout, and temp-index cleanliness admission checks shared by update/recover
 ├── git-safety.ts       Sealed, credential-free git invocation profiles for git against an EXISTING checkout
 ├── git-stream.ts       pack-objects | index-pack streaming primitive (runPackStream)
@@ -149,6 +153,17 @@ src/
 ├── sanitize.test.ts Sanitization unit tests
 └── types.ts        Request/response types (shared contract with gateway workspace-api)
 ```
+
+## OpenCode V2 (stock 2.x images)
+
+`deploy/workspace.Dockerfile` bakes `WORKSPACE_IMAGE_OPENCODE_VERSION` (the `OPENCODE_VERSION` that chose the binary). `main.ts` reads it through `readOpencodeGeneration`: major 2 or higher injects the V2 runner, proxy and disposer; unset or older keeps the V1 ones exactly. A value that is set but is not a version exits 1 before any bind. The same value is reported as `opencodeVersion` on `/healthz` and `/readyz`, and the gateway picks its run loop from it. The image pin is the only switch; there is no operator setting.
+
+- **Spawn** goes through `startOpenCodeV2Server` (`@fro-bot/runtime/workspace-v2`): `serve --stdio` with a held stdin, an explicit port, a per-spawn Basic password, readiness on `/api/agent`, and the plugin gate (Systematic `systematic` and `fro-bot.opencode-plugin` must be `active`). The child runs as uid/gid 10001 with an environment built from an allowlist.
+- **Plugins are installed at image build time** by `deploy/scripts/install-opencode-v2-plugins.sh` (bounded, as uid 10001) and listed in the config content passed at spawn. Nothing installs at boot.
+- **Every spawn gets a fresh database** (`prepareFreshDatabase`, under the root-owned `/var/lib/workspace-agent/opencode-v2-db`), so V2 has no execution claim to resume after a restart.
+- **The credential holder** is written before readiness flips to ready and cleared on any exit, so the proxy answers 503 (never forwards a stale password) between servers. An upstream 401 is reported as a 502 with `x-fro-bot-proxy-error: upstream-auth`.
+- **Shutdown** lists the sessions still active, interrupts them (reason `user`), closes stdin and confirms the exit, inside the 25s drain. `main.ts` waits for the V2 supervisor before it closes the proxy.
+- **Permission gate:** after the plugin gate the supervisor checks the effective rules from `/api/agent` (`ask` or `deny` outside the checkout, `session_move` and `worktree_create` denied). A server that fails never serves.
 
 ## Build
 

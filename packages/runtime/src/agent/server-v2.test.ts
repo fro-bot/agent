@@ -383,6 +383,48 @@ describe('startOpenCodeV2Server', () => {
       expect(errorOf(result)?.kind).toBe('spawn-failed')
     })
 
+    it('runs the child as the uid and gid it is given', async () => {
+      // #given the current identity, which an unprivileged process may always switch to
+      const created = fixture()
+      const uid = process.getuid?.()
+      const gid = process.getgid?.()
+      if (uid === undefined || gid === undefined) return
+
+      // #when started with that uid and gid
+      const result = await start(created, {uid, gid})
+
+      // #then the server runs
+      expect(result.success).toBe(true)
+    })
+
+    it('refuses to start when the child cannot take the uid it was asked to drop to', async () => {
+      // #given an unprivileged parent asked to run the child as a different uid. A start that silently ignored
+      // the option would run the server as the caller, which is exactly what a privilege drop must never do.
+      const uid = process.getuid?.()
+      if (uid === undefined || uid === 0) return
+      const created = fixture()
+
+      // #when
+      const result = await start(created, {uid: uid + 1, gid: process.getgid?.() ?? 0})
+
+      // #then the spawn fails instead of falling back to the caller's identity
+      expect(result.success).toBe(false)
+      expect(errorOf(result)?.kind).toBe('spawn-failed')
+    })
+
+    it('rejects a uid without a gid, and a gid without a uid', async () => {
+      // #given a half-specified identity
+      const created = fixture()
+
+      // #when
+      const uidOnly = await start(created, {uid: 1234})
+      const gidOnly = await start(created, {gid: 1234})
+
+      // #then neither spawns
+      expect(errorOf(uidOnly)?.kind).toBe('invalid-options')
+      expect(errorOf(gidOnly)?.kind).toBe('invalid-options')
+    })
+
     it('rejects a listening line that advertises a different port, and kills the child', async () => {
       // #given a server that advertises a port other than the one it was told to bind
       const created = fixture({advertisePort: 4096})

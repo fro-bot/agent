@@ -59,9 +59,21 @@ export const DEFAULT_MODEL = {
 export const DEFAULT_OPENCODE_VERSION = '1.19.4+harness.5bde2635'
 export const DEFAULT_SYSTEMATIC_VERSION = '3.27.1'
 
+// Systematic for OpenCode V2. 3.27.0 is the first release that loads there, so the V2 path pins it exactly and
+// DEFAULT_SYSTEMATIC_VERSION stays the V1 default. The plugin id is the `id` of the object the package's default
+// export carries (`systematicPlugin = {id: "systematic", ...}` in `@fro.bot/systematic@3.27.0` `dist/index.js`); `GET /api/plugin` lists it
+// under that id. Dockerfile ARG SYSTEMATIC_V2_VERSION in deploy/workspace.Dockerfile must equal this version, and
+// deploy/scripts/workspace-v2-image.test.mjs keeps them in step.
+export const SYSTEMATIC_PACKAGE = '@fro.bot/systematic'
+export const SYSTEMATIC_V2_VERSION = '3.27.0'
+export const SYSTEMATIC_V2_PLUGIN_ID = 'systematic'
+
 // The fro-bot OpenCode V2 plugin (packages/opencode-plugin); the package duplicates the id and a test keeps them equal.
+// The version is the one published to npm, installed at image build time. Dockerfile ARG FRO_BOT_PLUGIN_VERSION must
+// equal it.
 export const FRO_BOT_PLUGIN_PACKAGE = '@fro.bot/opencode-plugin'
 export const FRO_BOT_PLUGIN_ID = 'fro-bot.opencode-plugin'
+export const FRO_BOT_PLUGIN_VERSION = '0.1.0'
 
 // Retry configuration lives in the Action layer's src/features/agent/retry.ts,
 // colocated with the retry logic that consumes the values.

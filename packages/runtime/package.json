@@ -9,6 +9,11 @@
       "import": "./src/index.ts",
       "default": "./src/index.ts"
     },
+    "./workspace-v2": {
+      "types": "./src/agent/workspace-v2.ts",
+      "import": "./src/agent/workspace-v2.ts",
+      "default": "./src/agent/workspace-v2.ts"
+    },
     "./session-v2": {
       "types": "./src/session/v2.ts",
       "import": "./src/session/v2.ts",
