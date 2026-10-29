@@ -84,6 +84,29 @@ export {
   getStringProperty,
   ownValue,
 } from './payload-accessors.js'
+export {evaluatePermissionV2, verifyPermissionRules} from './permission-gate-v2.js'
+export type {
+  AgentListSource,
+  OutsidePolicyV2,
+  PermissionGateCheck,
+  PermissionGateError,
+  PermissionGateExpectations,
+  PermissionGateReport,
+  PermissionGateViolation,
+} from './permission-gate-v2.js'
+export {
+  buildConfigContentV2,
+  buildPermissionRulesV2,
+  externalDirectoryResource,
+  FORBIDDEN_TOOL_ACTIONS_V2,
+} from './permission-rules-v2.js'
+export type {
+  BuiltConfigV2,
+  ConfigContentInput,
+  PermissionEffectV2,
+  PermissionRulesInput,
+  PermissionRuleV2,
+} from './permission-rules-v2.js'
 export {
   buildCurrentThreadContextSection,
   buildHarnessRulesSection,
@@ -180,3 +203,5 @@ export {
   WORKING_LABEL_DESCRIPTION,
 } from './types.js'
 export {withScrubbedEnv} from './with-scrubbed-env.js'
+export {buildWorkspaceConfigV2} from './workspace-config-v2.js'
+export type {WorkspaceConfigV2Inputs} from './workspace-config-v2.js'

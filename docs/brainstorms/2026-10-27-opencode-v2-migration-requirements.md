@@ -65,7 +65,7 @@ The gateway and workspace keep no persisted OpenCode session history. Each Disco
 
 **Safety posture**
 
-- R17. Tool access outside the checkout stays denied, with the same exceptions as on V1. This holds for the build agent and for dispatched subagents. A run fails if its converted rules have no outside-directory deny.
+- R17. Action runs deny tool access outside the checkout, with the same exceptions as on V1. Gateway runs ask before it, and the ask goes to Discord approval, as on V1. Either way, this holds for the build agent and for dispatched subagents. A run fails if its converted rules allow outside-checkout access.
 - R18. In Action runs, the agent cannot leave an interactive question pending, and a probe proves it. The gateway keeps interactive questions.
 - R19. Code Mode stays on. Deny rules still block a call made inside Code Mode. Streaming, ownership, approvals and stop confirmation work correctly when tool calls run through it. The tools that move a session or create a worktree are denied, and a run fails if its session is moved.
 - R20. The server password V2 requires is random for each spawn and never appears in logs. It is not a boundary against the agent, which already has local server access on V1.
@@ -83,7 +83,7 @@ The gateway and workspace keep no persisted OpenCode session history. Each Disco
 - AE3. **Covers R16.** A large V1 history is restored while the V2 import is still running. The run waits before sending its first prompt. If the import exceeds its bound, the run fails without prompting and saves nothing.
 - AE4. **Covers R4.** The Systematic install hangs on the network. Startup fails at the install bound and reports a plugin install failure. The run does not wait for the job timeout.
 - AE5. **Covers R18.** In an Action run, the model tries to ask the user a question. The run continues without blocking, whether the question tool is absent or its request is dismissed. The probe records which happened.
-- AE6. **Covers R19, R17.** Inside Code Mode, the model runs a shell command and reads a file outside the checkout. Both are denied, the same as a direct tool call.
+- AE6. **Covers R19, R17.** Inside Code Mode, the model runs a shell command and reads a file outside the checkout. In an Action run both are denied, and in a gateway run both ask for Discord approval, the same as a direct tool call.
 
 ---
 
