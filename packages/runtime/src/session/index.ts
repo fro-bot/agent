@@ -66,11 +66,18 @@ export {
   DB_MAIN_BASENAME,
   DB_SHM_BASENAME,
   DB_TRANSPORTABLE_BASENAMES,
+  DB_V2_FAMILY_BASENAMES,
+  DB_V2_MAIN_BASENAME,
+  DB_V2_SHM_BASENAME,
+  DB_V2_TRANSPORTABLE_BASENAMES,
+  DB_V2_WAL_BASENAME,
   DB_WAL_BASENAME,
   getOpenCodeDbPath,
+  getSessionDbBasenames,
   isSqliteBackend,
   OPENCODE_SQLITE_VERSION,
 } from './version.js'
+export type {SessionDbBasenames, SessionGeneration} from './version.js'
 
 // Writeback
 export {writeSessionSummary} from './writeback.js'

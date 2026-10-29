@@ -1,9 +1,10 @@
+import type {SessionGeneration} from '../session/version.js'
 import type {Logger} from '../shared/logger.js'
-import type {ObjectStoreAdapter, ObjectStoreConfig} from './types.js'
+import type {ContentType, ObjectStoreAdapter, ObjectStoreConfig} from './types.js'
 import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import {DB_MAIN_BASENAME, DB_TRANSPORTABLE_BASENAMES} from '../session/version.js'
+import {getSessionDbBasenames} from '../session/version.js'
 import {toErrorMessage} from '../shared/errors.js'
 import {buildObjectStoreKey} from './key-builder.js'
 import {validateDownloadPath} from './validation.js'
@@ -19,8 +20,13 @@ import {validateDownloadPath} from './validation.js'
 // the store lists, unfiltered) so objects uploaded before this change still restore; the
 // restore path (src/services/cache/restore.ts) is what deletes a downloaded write-ahead
 // log locally before anything opens the database.
-const SESSION_DB_UPLOAD_FILENAMES = DB_TRANSPORTABLE_BASENAMES
-const MAIN_DB_FILENAME = DB_MAIN_BASENAME
+//
+// V2 sessions live under a sibling content type, `sessions-v2/`. The V1 listing prefix ends in `sessions/`, so
+// it never matches a `sessions-v2/` key, and the V2 listing never matches V1 keys.
+const SESSIONS_CONTENT_TYPE: Readonly<Record<SessionGeneration, ContentType>> = {
+  v1: 'sessions',
+  v2: 'sessions-v2',
+}
 
 function getSessionDbDirectory(sessionStoragePath: string): string {
   return path.dirname(sessionStoragePath)
@@ -30,8 +36,13 @@ function getSessionDbPath(sessionStoragePath: string, fileName: string): string 
   return path.join(getSessionDbDirectory(sessionStoragePath), fileName)
 }
 
-function buildSessionsPrefix(config: ObjectStoreConfig, identity: string, repo: string): string | null {
-  const result = buildObjectStoreKey(config, identity, repo, 'sessions')
+function buildSessionsPrefix(
+  config: ObjectStoreConfig,
+  identity: string,
+  repo: string,
+  generation: SessionGeneration,
+): string | null {
+  const result = buildObjectStoreKey(config, identity, repo, SESSIONS_CONTENT_TYPE[generation])
   return result.success ? result.data : null
 }
 
@@ -65,8 +76,9 @@ export async function syncSessionsToStore(
   repo: string,
   sessionStoragePath: string,
   logger: Logger,
+  generation: SessionGeneration = 'v1',
 ): Promise<{uploaded: number; failed: number}> {
-  const prefix = buildSessionsPrefix(config, identity, repo)
+  const prefix = buildSessionsPrefix(config, identity, repo, generation)
   if (prefix == null) {
     logger.warning('Failed to build object store sessions prefix for upload', {identity, repo})
     return {uploaded: 0, failed: 0}
@@ -75,7 +87,7 @@ export async function syncSessionsToStore(
   let uploaded = 0
   let failed = 0
 
-  for (const fileName of SESSION_DB_UPLOAD_FILENAMES) {
+  for (const fileName of getSessionDbBasenames(generation).transportable) {
     const localPath = getSessionDbPath(sessionStoragePath, fileName)
     try {
       await fs.access(localPath)
@@ -107,8 +119,9 @@ export async function syncSessionsFromStore(
   repo: string,
   sessionStoragePath: string,
   logger: Logger,
+  generation: SessionGeneration = 'v1',
 ): Promise<{downloaded: number; failed: number; mainDbRestored: boolean}> {
-  const prefix = buildSessionsPrefix(config, identity, repo)
+  const prefix = buildSessionsPrefix(config, identity, repo, generation)
   if (prefix == null) {
     logger.warning('Failed to build object store sessions prefix for download', {identity, repo})
     return {downloaded: 0, failed: 0, mainDbRestored: false}
@@ -131,6 +144,7 @@ export async function syncSessionsFromStore(
   let downloaded = 0
   let failed = 0
   let mainDbRestored = false
+  const mainDbFilename = getSessionDbBasenames(generation).main
 
   for (const key of listedKeys.data) {
     const relativePath = key.startsWith(prefix) ? key.slice(prefix.length) : key
@@ -149,7 +163,7 @@ export async function syncSessionsFromStore(
     const downloadResult = await adapter.download(key, localPathResult.data)
     if (downloadResult.success) {
       downloaded++
-      if (path.basename(localPathResult.data) === MAIN_DB_FILENAME) {
+      if (path.basename(localPathResult.data) === mainDbFilename) {
         mainDbRestored = true
       }
       continue

@@ -1,11 +1,13 @@
+import type {SessionGeneration} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import {
   DB_FAMILY_BASENAMES,
   DB_MAIN_BASENAME,
-  DB_SHM_BASENAME,
-  DB_WAL_BASENAME,
+  DB_V2_FAMILY_BASENAMES,
+  DB_V2_MAIN_BASENAME,
+  getSessionDbBasenames,
   isSqliteBackend,
 } from '@fro-bot/runtime'
 import {toErrorMessage} from '../../shared/errors.js'
@@ -73,17 +75,29 @@ export async function deleteAuthJson(authPath: string, storagePath: string, logg
  * two lists that must agree about which files constitute the database, which is the drift
  * shape this repository has been bitten by before.
  */
-export {DB_FAMILY_BASENAMES, DB_MAIN_BASENAME, DB_SHM_BASENAME, DB_WAL_BASENAME} from '@fro-bot/runtime'
+export {
+  DB_FAMILY_BASENAMES,
+  DB_MAIN_BASENAME,
+  DB_SHM_BASENAME,
+  DB_V2_FAMILY_BASENAMES,
+  DB_V2_MAIN_BASENAME,
+  DB_V2_SHM_BASENAME,
+  DB_V2_WAL_BASENAME,
+  DB_WAL_BASENAME,
+} from '@fro-bot/runtime'
 
-/** Builds absolute paths for every DB-family file beside `storagePath`, present or not. */
+/**
+ * Builds absolute paths for every DB-family file beside `storagePath`, present or not. Covers both generations'
+ * names (deduplicated), because the clean-slate path must remove whatever a restore from either generation left.
+ */
 export function buildDbFamilyPaths(storagePath: string): string[] {
   const dbDir = path.dirname(storagePath)
-  return DB_FAMILY_BASENAMES.map(basename => path.join(dbDir, basename))
+  return [...new Set([...DB_FAMILY_BASENAMES, ...DB_V2_FAMILY_BASENAMES])].map(basename => path.join(dbDir, basename))
 }
 
 /** The machine-local wal-index sidecar path beside `storagePath`. Never valid to transport. */
-export function buildDbShmPath(storagePath: string): string {
-  return path.join(path.dirname(storagePath), DB_SHM_BASENAME)
+export function buildDbShmPath(storagePath: string, generation: SessionGeneration = 'v1'): string {
+  return path.join(path.dirname(storagePath), getSessionDbBasenames(generation).shm)
 }
 
 /**
@@ -92,8 +106,8 @@ export function buildDbShmPath(storagePath: string): string {
  * write-ahead log before anything opens the database -- see `DB_TRANSPORTABLE_BASENAMES`
  * in `packages/runtime/src/session/version.ts` for why that log can no longer be trusted.
  */
-export function buildDbWalPath(storagePath: string): string {
-  return path.join(path.dirname(storagePath), DB_WAL_BASENAME)
+export function buildDbWalPath(storagePath: string, generation: SessionGeneration = 'v1'): string {
+  return path.join(path.dirname(storagePath), getSessionDbBasenames(generation).wal)
 }
 
 /**
@@ -112,14 +126,41 @@ export async function buildCachePaths(
   projectIdPath: string | undefined,
   opencodeVersion: string | null | undefined,
 ): Promise<string[]> {
+  if (await isSqliteBackend(opencodeVersion ?? null)) {
+    return buildCachePathsV1Sqlite(storagePath, projectIdPath)
+  }
   const paths = [storagePath]
   if (projectIdPath != null) {
     paths.push(projectIdPath)
   }
-  if (await isSqliteBackend(opencodeVersion ?? null)) {
-    const dbDir = path.dirname(storagePath)
-    const dbPath = path.join(dbDir, DB_MAIN_BASENAME)
-    paths.push(dbPath)
+  return paths
+}
+
+/**
+ * The path list a V1 SQLite save writes, built without consulting any version. A V2 run restoring its V1 fallback
+ * tiers needs exactly this list: those tiers look up entries a V1 SQLite run saved, and `@actions/cache` hashes the
+ * path list into the entry version. Deriving it from the V2 version string instead is wrong (a `v2.2.0` input
+ * parses as NaN in `isSqliteBackend` and drops the database path).
+ */
+export function buildCachePathsV1Sqlite(storagePath: string, projectIdPath: string | undefined): string[] {
+  const paths = [storagePath]
+  if (projectIdPath != null) {
+    paths.push(projectIdPath)
   }
+  paths.push(path.join(path.dirname(storagePath), DB_MAIN_BASENAME))
+  return paths
+}
+
+/**
+ * The V2 sibling of `buildCachePaths`, passed to both `restoreCache` and `saveCache` on a V2 run (same shared-hash
+ * rule as above). The V2 database filename is `DB_V2_MAIN_BASENAME`, the one constant the V2 object-store upload
+ * also reads. No `isSqliteBackend` probe: every V2 release stores sessions in SQLite.
+ */
+export function buildCachePathsV2(storagePath: string, projectIdPath: string | undefined): string[] {
+  const paths = [storagePath]
+  if (projectIdPath != null) {
+    paths.push(projectIdPath)
+  }
+  paths.push(path.join(path.dirname(storagePath), DB_V2_MAIN_BASENAME))
   return paths
 }

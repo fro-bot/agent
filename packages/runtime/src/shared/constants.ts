@@ -68,6 +68,9 @@ export const FRO_BOT_PLUGIN_ID = 'fro-bot.opencode-plugin'
 
 // Cache key components
 export const CACHE_PREFIX = 'opencode-storage' as const
+// Must not start with CACHE_PREFIX, and CACHE_PREFIX must not start with it: each generation's restore-key
+// prefixes then never match the other's entries. Distinct from TOOLS_CACHE_PREFIX ('opencode-tools-v2').
+export const CACHE_V2_PREFIX = 'opencode-v2-storage' as const
 export const DEFAULT_S3_PREFIX = 'fro-bot-state' as const
 export const TOOLS_CACHE_PREFIX = 'opencode-tools-v2' as const
 

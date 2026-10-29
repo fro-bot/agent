@@ -3,6 +3,7 @@ import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import {DB_V2_MAIN_BASENAME} from '../session/version.js'
 import {err, ok} from '../shared/types.js'
 import {syncArtifactsToStore, syncMetadataToStore, syncSessionsFromStore, syncSessionsToStore} from './index.js'
 
@@ -274,5 +275,160 @@ describe('content sync', () => {
     const result = await syncSessionsFromStore(adapter, config, 'github', 'owner/repo', storagePath, createLogger())
 
     expect(result).toEqual({downloaded: 0, failed: 0, mainDbRestored: false})
+  })
+})
+
+function createStore(initial: Readonly<Record<string, string>> = {}) {
+  const objects = new Map(Object.entries(initial))
+  const upload = vi.fn<ObjectStoreAdapter['upload']>(async (key, localPath) => {
+    objects.set(key, await fs.readFile(localPath, 'utf8'))
+    return ok(undefined)
+  })
+  const download = vi.fn<ObjectStoreAdapter['download']>(async (key, localPath) => {
+    const contents = objects.get(key)
+    if (contents === undefined) return err(new Error(`missing ${key}`))
+    await fs.mkdir(path.dirname(localPath), {recursive: true})
+    await fs.writeFile(localPath, contents)
+    return ok(undefined)
+  })
+  // Prefix filtering like a real bucket listing, so a key that shares a prefix by accident would show up.
+  const list = vi.fn<ObjectStoreAdapter['list']>(async prefix =>
+    ok([...objects.keys()].filter(key => key.startsWith(prefix)).sort()),
+  )
+  return {adapter: createAdapter({upload, download, list}), objects, upload, download, list}
+}
+
+describe('content sync, V2 generation', () => {
+  const v1Prefix = 'fro-bot-state/github/owner/repo/sessions/'
+  const v2Prefix = 'fro-bot-state/github/owner/repo/sessions-v2/'
+  let tempDir: string
+  let storagePath: string
+  let dbDir: string
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'content-sync-v2-'))
+    storagePath = path.join(tempDir, 'storage')
+    dbDir = path.dirname(storagePath)
+    await fs.mkdir(storagePath, {recursive: true})
+  })
+
+  afterEach(async () => {
+    await fs.rm(tempDir, {recursive: true, force: true})
+  })
+
+  it('uploads only the V2 main database under the sessions-v2 prefix', async () => {
+    // #given a V2 database with both sidecars on disk
+    await fs.writeFile(path.join(dbDir, DB_V2_MAIN_BASENAME), 'v2-db')
+    await fs.writeFile(path.join(dbDir, `${DB_V2_MAIN_BASENAME}-wal`), 'wal')
+    await fs.writeFile(path.join(dbDir, `${DB_V2_MAIN_BASENAME}-shm`), 'shm')
+    const store = createStore()
+
+    // #when syncing a V2 session to the store
+    const result = await syncSessionsToStore(
+      store.adapter,
+      config,
+      'github',
+      'owner/repo',
+      storagePath,
+      createLogger(),
+      'v2',
+    )
+
+    // #then exactly one object is written, at the V2 key, and nothing lands under the V1 prefix
+    expect(result).toEqual({uploaded: 1, failed: 0})
+    expect(store.upload.mock.calls.map(([key]) => key)).toEqual([`${v2Prefix}${DB_V2_MAIN_BASENAME}`])
+    expect([...store.objects.keys()].some(key => key.startsWith(v1Prefix))).toBe(false)
+  })
+
+  it('writes the exact S3 key <prefix>/github/<owner>/<repo>/sessions-v2/opencode.db', async () => {
+    // #given a V2 database #when uploading #then the key is pinned literally
+    await fs.writeFile(path.join(dbDir, 'opencode.db'), 'v2-db')
+    const store = createStore()
+
+    await syncSessionsToStore(store.adapter, config, 'github', 'owner/repo', storagePath, createLogger(), 'v2')
+
+    expect([...store.objects.keys()]).toEqual(['fro-bot-state/github/owner/repo/sessions-v2/opencode.db'])
+  })
+
+  it('downloads from the sessions-v2 prefix and reports the main database restored', async () => {
+    // #given only a V2 object in the store
+    const store = createStore({[`${v2Prefix}opencode.db`]: 'v2-db'})
+
+    // #when restoring a V2 session
+    const result = await syncSessionsFromStore(
+      store.adapter,
+      config,
+      'github',
+      'owner/repo',
+      storagePath,
+      createLogger(),
+      'v2',
+    )
+
+    // #then the V2 prefix is listed and the database lands beside the storage directory
+    expect(result).toEqual({downloaded: 1, failed: 0, mainDbRestored: true})
+    expect(store.list).toHaveBeenCalledWith(v2Prefix)
+    await expect(fs.readFile(path.join(dbDir, 'opencode.db'), 'utf8')).resolves.toBe('v2-db')
+  })
+
+  it('reports a V2 miss when only V1 objects exist', async () => {
+    // #given only a V1 object #when restoring V2 #then it is a miss and nothing is downloaded
+    const store = createStore({[`${v1Prefix}opencode.db`]: 'v1-db'})
+
+    const result = await syncSessionsFromStore(
+      store.adapter,
+      config,
+      'github',
+      'owner/repo',
+      storagePath,
+      createLogger(),
+      'v2',
+    )
+
+    expect(result).toEqual({downloaded: 0, failed: 0, mainDbRestored: false})
+    expect(store.download).not.toHaveBeenCalled()
+  })
+
+  it('never lists or downloads sessions-v2 objects when restoring V1', async () => {
+    // #given both generations in the bucket
+    const store = createStore({
+      [`${v1Prefix}opencode.db`]: 'v1-db',
+      [`${v2Prefix}opencode.db`]: 'v2-db',
+    })
+
+    // #when restoring with the default (V1) and the explicit V1 generation
+    const implicit = await syncSessionsFromStore(
+      store.adapter,
+      config,
+      'github',
+      'owner/repo',
+      storagePath,
+      createLogger(),
+    )
+    const explicit = await syncSessionsFromStore(
+      store.adapter,
+      config,
+      'github',
+      'owner/repo',
+      storagePath,
+      createLogger(),
+      'v1',
+    )
+
+    // #then only the V1 object is downloaded, because 'sessions/' never prefixes 'sessions-v2/'
+    expect(implicit).toEqual({downloaded: 1, failed: 0, mainDbRestored: true})
+    expect(explicit).toEqual(implicit)
+    expect(store.download.mock.calls.map(([key]) => key)).toEqual([`${v1Prefix}opencode.db`, `${v1Prefix}opencode.db`])
+    expect(store.list.mock.calls.map(([prefix]) => prefix)).toEqual([v1Prefix, v1Prefix])
+  })
+
+  it('keeps V1 uploads byte-identical when the generation is omitted', async () => {
+    // #given a database #when uploading without a generation #then it lands under sessions/ only
+    await fs.writeFile(path.join(dbDir, 'opencode.db'), 'db')
+    const store = createStore()
+
+    await syncSessionsToStore(store.adapter, config, 'github', 'owner/repo', storagePath, createLogger())
+
+    expect([...store.objects.keys()]).toEqual([`${v1Prefix}opencode.db`])
   })
 })
