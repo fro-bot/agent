@@ -15,7 +15,7 @@ import {test} from 'node:test'
 import {fileURLToPath} from 'node:url'
 
 const SCRIPT = fileURLToPath(new URL('./install-opencode-v2-plugins.sh', import.meta.url))
-const SYSTEMATIC = '@fro.bot/systematic@3.27.0'
+const SYSTEMATIC = '@fro.bot/systematic@3.27.1'
 const FRO_BOT = '@fro.bot/opencode-plugin@0.1.0'
 
 /**
@@ -136,14 +136,14 @@ test('refuses a bound that is not a number, before anything is installed', () =>
 
 for (const spec of [
   '@fro.bot/systematic@latest',
-  '@fro.bot/systematic@^3.27.0',
+  '@fro.bot/systematic@^3.27.1',
   '@fro.bot/systematic@3',
   '@fro.bot/systematic',
   '@fro.bot/opencode-plugin@>=0.1.0',
   '@evil/plugin@1.0.0',
   'git+https://example.com/x.git',
   '/tmp/local-plugin',
-  '@fro.bot/systematic@3.27.0; touch /tmp/pwned',
+  '@fro.bot/systematic@3.27.1; touch /tmp/pwned',
 ]) {
   test(`refuses ${JSON.stringify(spec)}: only the two fro.bot packages at an exact version`, () => {
     // #given

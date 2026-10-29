@@ -1,6 +1,5 @@
 import {describe, expect, it} from 'vitest'
 
-import {DEFAULT_SYSTEMATIC_VERSION} from '../shared/constants.js'
 import * as workspaceV2 from './workspace-v2.js'
 
 describe('workspace V2 entry', () => {
@@ -12,16 +11,12 @@ describe('workspace V2 entry', () => {
     expect(workspaceV2.DEFAULT_OPENCODE_V2_TIMEOUTS.pollIntervalMs).toBeGreaterThan(0)
   })
 
-  it('pins Systematic for V2 at exactly 3.27.0, the first release that loads there', () => {
-    // #then the V2 pin is exact, with no range, and names the plugin id the V2 build registers
-    expect(workspaceV2.SYSTEMATIC_V2_VERSION).toBe('3.27.0')
+  it('installs Systematic for V2 at the shared default, an exact version with no range', () => {
+    // #then V1 and V2 share one Systematic pin, and the V2 build registers the plugin under the expected id
+    expect(workspaceV2.DEFAULT_SYSTEMATIC_VERSION).toMatch(/^\d+\.\d+\.\d+$/)
+    expect(workspaceV2).not.toHaveProperty('SYSTEMATIC_V2_VERSION')
     expect(workspaceV2.SYSTEMATIC_V2_PLUGIN_ID).toBe('systematic')
     expect(workspaceV2.SYSTEMATIC_PACKAGE).toBe('@fro.bot/systematic')
-  })
-
-  it('leaves the V1 Systematic default untouched', () => {
-    // #then the V1 default is the version V1 images and Action runs install
-    expect(DEFAULT_SYSTEMATIC_VERSION).toBe('3.26.4')
   })
 
   it('pins the fro-bot plugin at an exact version', () => {

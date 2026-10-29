@@ -4,12 +4,12 @@
  */
 
 export {
+  DEFAULT_SYSTEMATIC_VERSION,
   FRO_BOT_PLUGIN_ID,
   FRO_BOT_PLUGIN_PACKAGE,
   FRO_BOT_PLUGIN_VERSION,
   SYSTEMATIC_PACKAGE,
   SYSTEMATIC_V2_PLUGIN_ID,
-  SYSTEMATIC_V2_VERSION,
 } from '../shared/constants.js'
 
 export type {Logger} from '../shared/logger.js'

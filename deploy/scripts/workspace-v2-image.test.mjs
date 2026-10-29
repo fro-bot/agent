@@ -38,16 +38,16 @@ const V2_VERSION_ARM = '[2-9].*|[1-9][0-9]*.*)'
 test('the plugin versions the image installs are the ones the workspace agent expects', () => {
   // #then the build-time ARG defaults equal the runtime constants, so the specs the server is told to load are the
   // specs that were cached
-  assert.equal(argDefault('SYSTEMATIC_V2_VERSION'), constant('SYSTEMATIC_V2_VERSION'))
+  assert.equal(argDefault('SYSTEMATIC_VERSION'), constant('DEFAULT_SYSTEMATIC_VERSION'))
   assert.equal(argDefault('FRO_BOT_PLUGIN_VERSION'), constant('FRO_BOT_PLUGIN_VERSION'))
 })
 
-test('the V2 pins are exact versions, and the V1 Systematic default is untouched by them', () => {
-  // #then
-  assert.match(constant('SYSTEMATIC_V2_VERSION'), /^\d+\.\d+\.\d+$/)
+test('the plugin pins are exact versions, and V2 has no Systematic pin of its own', () => {
+  // #then V1 and V2 share the one Systematic pin that Renovate manages
+  assert.match(constant('DEFAULT_SYSTEMATIC_VERSION'), /^\d+\.\d+\.\d+$/)
   assert.match(constant('FRO_BOT_PLUGIN_VERSION'), /^\d+\.\d+\.\d+$/)
-  assert.equal(argDefault('SYSTEMATIC_VERSION'), constant('DEFAULT_SYSTEMATIC_VERSION'))
-  assert.notEqual(constant('SYSTEMATIC_V2_VERSION'), constant('DEFAULT_SYSTEMATIC_VERSION'))
+  assert.doesNotMatch(constants, /SYSTEMATIC_V2_VERSION/)
+  assert.doesNotMatch(dockerfile, /SYSTEMATIC_V2_VERSION/)
 })
 
 test('the plugins are installed at build time by the bounded script, behind the V2 version test', () => {
@@ -60,7 +60,7 @@ test('the plugins are installed at build time by the bounded script, behind the 
   // #then it is skipped for harness and V1 builds, and passes exactly the two pinned specs
   assert.match(run[0], /\*harness\*\) exit 0/)
   assert.ok(run[0].includes(V2_VERSION_ARM))
-  assert.ok(run[0].includes('"@fro.bot/systematic@${SYSTEMATIC_V2_VERSION}"'))
+  assert.ok(run[0].includes('"@fro.bot/systematic@${SYSTEMATIC_VERSION}"'))
   assert.ok(run[0].includes('"@fro.bot/opencode-plugin@${FRO_BOT_PLUGIN_VERSION}"'))
 })
 

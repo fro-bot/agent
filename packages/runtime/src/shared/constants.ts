@@ -59,13 +59,12 @@ export const DEFAULT_MODEL = {
 export const DEFAULT_OPENCODE_VERSION = '1.19.4+harness.5bde2635'
 export const DEFAULT_SYSTEMATIC_VERSION = '3.27.1'
 
-// Systematic for OpenCode V2. 3.27.0 is the first release that loads there, so the V2 path pins it exactly and
-// DEFAULT_SYSTEMATIC_VERSION stays the V1 default. The plugin id is the `id` of the object the package's default
-// export carries (`systematicPlugin = {id: "systematic", ...}` in `@fro.bot/systematic@3.27.0` `dist/index.js`); `GET /api/plugin` lists it
-// under that id. Dockerfile ARG SYSTEMATIC_V2_VERSION in deploy/workspace.Dockerfile must equal this version, and
-// deploy/scripts/workspace-v2-image.test.mjs keeps them in step.
+// Systematic for OpenCode V2. 3.27.x loads on both V1 and V2, so the V2 path installs DEFAULT_SYSTEMATIC_VERSION too
+// and there is no separate V2 pin. The plugin id is the `id` of the object the package's default export carries
+// (`systematicPlugin = {id: "systematic", ...}` in `@fro.bot/systematic` `dist/index.js`); `GET /api/plugin` lists it
+// under that id. Dockerfile ARG SYSTEMATIC_VERSION in deploy/workspace.Dockerfile must equal DEFAULT_SYSTEMATIC_VERSION,
+// and deploy/scripts/workspace-v2-image.test.mjs keeps them in step.
 export const SYSTEMATIC_PACKAGE = '@fro.bot/systematic'
-export const SYSTEMATIC_V2_VERSION = '3.27.0'
 export const SYSTEMATIC_V2_PLUGIN_ID = 'systematic'
 
 // The fro-bot OpenCode V2 plugin (packages/opencode-plugin); the package duplicates the id and a test keeps them equal.

@@ -31,13 +31,13 @@ import {setTimeout as sleep} from 'node:timers/promises'
 
 import {
   buildWorkspaceConfigV2,
+  DEFAULT_SYSTEMATIC_VERSION,
   FRO_BOT_PLUGIN_ID,
   FRO_BOT_PLUGIN_PACKAGE,
   FRO_BOT_PLUGIN_VERSION,
   startOpenCodeV2Server,
   SYSTEMATIC_PACKAGE,
   SYSTEMATIC_V2_PLUGIN_ID,
-  SYSTEMATIC_V2_VERSION,
   verifyPermissionRules,
 } from '@fro-bot/runtime/workspace-v2'
 
@@ -66,7 +66,7 @@ const DATABASE_FILE_NAME = 'opencode.db'
 
 /** The plugin specs the image installs at build time, in the order the config lists them. */
 export const WORKSPACE_V2_PLUGIN_SPECS: readonly string[] = [
-  `${SYSTEMATIC_PACKAGE}@${SYSTEMATIC_V2_VERSION}`,
+  `${SYSTEMATIC_PACKAGE}@${DEFAULT_SYSTEMATIC_VERSION}`,
   `${FRO_BOT_PLUGIN_PACKAGE}@${FRO_BOT_PLUGIN_VERSION}`,
 ]
 

@@ -32,11 +32,11 @@ import {DatabaseSync} from 'node:sqlite'
 import {fileURLToPath} from 'node:url'
 
 import {
+  DEFAULT_SYSTEMATIC_VERSION,
   FRO_BOT_PLUGIN_ID,
   FRO_BOT_PLUGIN_VERSION,
   startOpenCodeV2Server,
   SYSTEMATIC_V2_PLUGIN_ID,
-  SYSTEMATIC_V2_VERSION,
 } from '@fro-bot/runtime/workspace-v2'
 import {afterAll, beforeAll, describe, expect, it, vi} from 'vitest'
 
@@ -366,7 +366,7 @@ describe.skipIf(!hasBinary)('the workspace V2 runner against the real stock bina
         }
         expect(await listPlugins()).toEqual(expect.arrayContaining([SYSTEMATIC_V2_PLUGIN_ID, FRO_BOT_PLUGIN_ID]))
         expect(WORKSPACE_V2_PLUGIN_SPECS).toEqual([
-          `@fro.bot/systematic@${SYSTEMATIC_V2_VERSION}`,
+          `@fro.bot/systematic@${DEFAULT_SYSTEMATIC_VERSION}`,
           `@fro.bot/opencode-plugin@${FRO_BOT_PLUGIN_VERSION}`,
         ])
 

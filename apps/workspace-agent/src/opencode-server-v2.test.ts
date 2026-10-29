@@ -11,7 +11,7 @@ import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 
-import {FRO_BOT_PLUGIN_ID, SYSTEMATIC_V2_PLUGIN_ID} from '@fro-bot/runtime/workspace-v2'
+import {DEFAULT_SYSTEMATIC_VERSION, FRO_BOT_PLUGIN_ID, SYSTEMATIC_V2_PLUGIN_ID} from '@fro-bot/runtime/workspace-v2'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
 import {
@@ -320,7 +320,10 @@ describe('runSupervisedOpencodeV2', () => {
     expect(start?.directory).toBe('/workspace/repos')
     expect(start?.port).toBe(54_321)
     expect(start?.expectedPluginIds).toEqual([SYSTEMATIC_V2_PLUGIN_ID, FRO_BOT_PLUGIN_ID])
-    expect(start?.config?.plugins).toEqual(['@fro.bot/systematic@3.27.0', '@fro.bot/opencode-plugin@0.1.0'])
+    expect(start?.config?.plugins).toEqual([
+      `@fro.bot/systematic@${DEFAULT_SYSTEMATIC_VERSION}`,
+      '@fro.bot/opencode-plugin@0.1.0',
+    ])
     expect(start?.config?.permissions).toEqual(
       expect.arrayContaining([{action: 'external_directory', resource: '*', effect: 'ask'}]),
     )

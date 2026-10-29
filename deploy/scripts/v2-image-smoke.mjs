@@ -6,7 +6,7 @@
 //     -e HOME=/home/opencode -e XDG_CONFIG_HOME=/home/opencode/.config -e XDG_DATA_HOME=/home/opencode/.local/share \
 //     -e XDG_CACHE_HOME=/home/opencode/.cache -e XDG_STATE_HOME=/home/opencode/.local/state \
 //     -v "$PWD/deploy/scripts/v2-image-smoke.mjs:/smoke.mjs:ro" --entrypoint node "$IMAGE" /smoke.mjs \
-//     '@fro.bot/systematic@3.27.0' '@fro.bot/opencode-plugin@0.1.0'
+//     '@fro.bot/systematic@3.27.1' '@fro.bot/opencode-plugin@0.1.0'
 //
 // What it proves that nothing else here can, because Docker is what builds the image:
 // 1. the musl stock binary starts on Alpine as the agent uid (`serve --stdio`, held stdin, explicit port);

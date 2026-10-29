@@ -372,11 +372,11 @@ RUN set -euo pipefail \
 # Stock V2 (same version test as above): install the Systematic and fro-bot plugins into the agent's cache NOW, at
 # build time, as uid 10001 and under a bound. The server then finds them by spec at boot with no registry access,
 # which is what the --network none smoke test proves. An unbounded boot-time install would hang `GET /api/agent`
-# for as long as the registry hangs (probe P10). The versions must equal SYSTEMATIC_V2_VERSION and
-# FRO_BOT_PLUGIN_VERSION in packages/runtime/src/shared/constants.ts; deploy/scripts/workspace-v2-image.test.mjs
-# keeps them in step, and the plugin gate refuses a server whose plugins differ from what the workspace expects.
+# for as long as the registry hangs (probe P10). Systematic installs at SYSTEMATIC_VERSION (declared above; V1 and V2
+# share it), and the versions must equal DEFAULT_SYSTEMATIC_VERSION and FRO_BOT_PLUGIN_VERSION in
+# packages/runtime/src/shared/constants.ts; deploy/scripts/workspace-v2-image.test.mjs keeps them in step, and the
+# plugin gate refuses a server whose plugins differ from what the workspace expects.
 # Harness and V1 builds skip this step entirely.
-ARG SYSTEMATIC_V2_VERSION=3.27.0
 ARG FRO_BOT_PLUGIN_VERSION=0.1.0
 COPY deploy/scripts/install-opencode-v2-plugins.sh /usr/local/lib/workspace-scripts/install-opencode-v2-plugins.sh
 RUN set -euo pipefail \
@@ -387,7 +387,7 @@ RUN set -euo pipefail \
          *) exit 0 ;; \
        esac \
     && sh /usr/local/lib/workspace-scripts/install-opencode-v2-plugins.sh \
-         "@fro.bot/systematic@${SYSTEMATIC_V2_VERSION}" \
+         "@fro.bot/systematic@${SYSTEMATIC_VERSION}" \
          "@fro.bot/opencode-plugin@${FRO_BOT_PLUGIN_VERSION}"
 
 # Disable OpenCode's file watcher by default: nothing in this container consumes
