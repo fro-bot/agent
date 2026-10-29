@@ -230,7 +230,7 @@ WORKDIR /app
 # in the form <base>+harness.<sha>. Bumped in lockstep with the action default
 # by the harness-release workflow; merge the auto-PR to advance both surfaces.
 ARG OPENCODE_VERSION=1.19.4+harness.5bde2635
-ARG SYSTEMATIC_VERSION=3.26.4
+ARG SYSTEMATIC_VERSION=3.27.1
 
 # System packages come from the base image's Alpine 3.24 branch and are not
 # pinned: the branch index drops older versions, so exact pins would break the
