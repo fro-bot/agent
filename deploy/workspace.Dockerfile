@@ -403,10 +403,6 @@ ENV OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER=true
 # still override this through compose.
 ENV OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true
 
-# The V2 spelling of the file-watcher switch above (V2 has no environment flag for background subagents; they are
-# native). The V1 launch spec copies only the two EXPERIMENTAL_ names, so a V1 child never sees this one.
-ENV OPENCODE_DISABLE_FILEWATCHER=true
-
 # Which OpenCode this image carries. The workspace agent selects its V1 or V2 supervised runner, proxy and disposer
 # from it (major 2 or above is V2) and reports it on /readyz, where the gateway picks its run loop. It is the same
 # build argument that selected the binary above, so the two cannot disagree; it is not an operator setting.

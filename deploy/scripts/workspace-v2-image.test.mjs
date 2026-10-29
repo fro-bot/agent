@@ -88,9 +88,9 @@ test('the image carries the version the workspace agent selects on, from the sam
   assert.match(dockerfile, new RegExp(`^ENV ${name}=\\$\\{OPENCODE_VERSION\\}$`, 'm'))
 })
 
-test('the V2 file-watcher flag uses the V2 spelling, beside the V1 flag the V1 child still gets', () => {
+test('the image leaves the V2 file watcher at its default and keeps the V1 flags the V1 child still gets', () => {
   // #then
-  assert.match(dockerfile, /^ENV OPENCODE_DISABLE_FILEWATCHER=true$/m)
+  assert.doesNotMatch(dockerfile, /OPENCODE_DISABLE_FILEWATCHER/)
   assert.match(dockerfile, /^ENV OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER=true$/m)
   assert.match(dockerfile, /^ENV OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true$/m)
 })

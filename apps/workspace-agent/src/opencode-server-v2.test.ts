@@ -158,23 +158,23 @@ describe('buildOpencodeV2Env', () => {
     expect(env.HOME).toBe('/home/opencode')
   })
 
-  it('points the database at the fresh path and uses the V2 file-watcher flag, not the V1 spelling', () => {
+  it('points the database at the fresh path and leaves the file watcher at its default', () => {
     // #when
     const env = buildOpencodeV2Env({}, '/db/spawn-a/opencode.db')
 
     // #then
     expect(env.OPENCODE_DB).toBe('/db/spawn-a/opencode.db')
-    expect(env.OPENCODE_DISABLE_FILEWATCHER).toBe('true')
+    expect(env).not.toHaveProperty('OPENCODE_DISABLE_FILEWATCHER')
     expect(env).not.toHaveProperty('OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER')
     expect(env).not.toHaveProperty('OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS')
   })
 
-  it('lets the deployer override the file-watcher flag, as V1 images allowed', () => {
+  it('does not forward a parent file-watcher flag: it is not on the allowlist', () => {
     // #when
-    const env = buildOpencodeV2Env({OPENCODE_DISABLE_FILEWATCHER: 'false'}, '/db/opencode.db')
+    const env = buildOpencodeV2Env({OPENCODE_DISABLE_FILEWATCHER: 'true'}, '/db/opencode.db')
 
     // #then
-    expect(env.OPENCODE_DISABLE_FILEWATCHER).toBe('false')
+    expect(env).not.toHaveProperty('OPENCODE_DISABLE_FILEWATCHER')
   })
 })
 

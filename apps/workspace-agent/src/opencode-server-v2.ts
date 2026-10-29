@@ -93,9 +93,9 @@ function copyEnvIfSet(source: NodeJS.ProcessEnv, target: Record<string, string>,
  * Builds the V2 child environment from an allowlist, never by subtracting from `parentEnv`. The runtime spawn then
  * adds the password, the config content and the project-config and auto-update switches itself.
  *
- * `OPENCODE_DISABLE_FILEWATCHER` is the V2 spelling of the V1 flag the image bakes; nothing consumes file-change
- * events in this container, so it defaults on, and a deployer may still override it. V2 has no environment flag for
- * background subagents (they are native), so no V1 flag is carried over.
+ * The file watcher stays at V2's default: probe P3 found no difference with it on or off, so
+ * `OPENCODE_DISABLE_FILEWATCHER` is neither set nor defaulted here, and the allowlist does not forward it from the
+ * parent. V2 has no environment flag for background subagents (they are native), so no V1 flag is carried over.
  */
 export function buildOpencodeV2Env(parentEnv: NodeJS.ProcessEnv, databasePath: string): NodeJS.ProcessEnv {
   const env: Record<string, string> = {
@@ -109,7 +109,6 @@ export function buildOpencodeV2Env(parentEnv: NodeJS.ProcessEnv, databasePath: s
     XDG_STATE_HOME: AGENT_XDG_STATE_HOME,
     TMPDIR: AGENT_TMPDIR,
     OPENCODE_DB: databasePath,
-    OPENCODE_DISABLE_FILEWATCHER: parentEnv.OPENCODE_DISABLE_FILEWATCHER ?? 'true',
   }
 
   for (const name of PROXY_ENV_NAMES) copyEnvIfSet(parentEnv, env, name)
