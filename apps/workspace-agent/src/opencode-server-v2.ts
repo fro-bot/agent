@@ -206,6 +206,8 @@ export interface RunSupervisedOpencodeV2Options {
   readonly port?: number
   /** Per-phase readiness bound for each attempt (listen, `/api/info`, plugin activation). Default 60000. */
   readonly readyTimeoutMs?: number
+  /** Bound on each runtime request and on the permission-gate read, headers and body together. Default 5000. */
+  readonly requestTimeoutMs?: number
   /** Absolute OpenCode executable. Default: `/usr/local/bin/opencode`. */
   readonly binaryPath?: string
   /** Literal absolute directories outside the checkout that stay reachable without a prompt. Default none. */
@@ -231,6 +233,25 @@ function toRuntimeLogger(logger: Logger): RuntimeLogger {
 
 /** Bound on the active-session listing a shutdown does before it interrupts. */
 const ACTIVE_LISTING_TIMEOUT_MS = 5000
+
+/** Per-request bound for the runtime's own calls and for the permission-gate read. */
+const REQUEST_TIMEOUT_MS = 5000
+
+/**
+ * Settles with `work`, or rejects as soon as `signal` aborts, whichever comes first. A response whose body stalls
+ * after the headers arrived is covered even when the transport underneath ignores the signal.
+ */
+async function untilAborted<T>(signal: AbortSignal, work: Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(signal.reason)
+    if (signal.aborted) {
+      onAbort()
+      return
+    }
+    signal.addEventListener('abort', onAbort, {once: true})
+    work.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort))
+  })
+}
 
 /**
  * Every session still active on this spawn. The database is fresh per spawn, so every session on the server belongs
@@ -263,6 +284,7 @@ export async function runSupervisedOpencodeV2(options: RunSupervisedOpencodeV2Op
     parentEnv = process.env,
     port = OPENCODE_PORT,
     readyTimeoutMs = 60_000,
+    requestTimeoutMs = REQUEST_TIMEOUT_MS,
     binaryPath = OPENCODE_EXECUTABLE_PATH,
     allowedExternalDirectories = [],
     maxAttempts = 4,
@@ -346,6 +368,8 @@ export async function runSupervisedOpencodeV2(options: RunSupervisedOpencodeV2Op
       let handle: OpenCodeV2ServerHandle | undefined
       try {
         const databasePath = await prepareDatabase()
+        // An abort during preparation found no start in flight to cancel, so nothing else stops this attempt.
+        if (isAborted()) return
         const startController = new AbortController()
         startAbort = startController
         const started = await startServer(
@@ -363,7 +387,7 @@ export async function runSupervisedOpencodeV2(options: RunSupervisedOpencodeV2Op
               infoTimeoutMs: readyTimeoutMs,
               agentReadyTimeoutMs: readyTimeoutMs,
               // Teardown has to finish inside main.ts's 25s drain: listing 5s + interrupts 8s + exit 5s + kill 2s.
-              requestTimeoutMs: 5000,
+              requestTimeoutMs,
               interruptSettleTimeoutMs: 8000,
               exitTimeoutMs: 5000,
               killConfirmTimeoutMs: 2000,
@@ -399,9 +423,15 @@ export async function runSupervisedOpencodeV2(options: RunSupervisedOpencodeV2Op
         const gate = await verifyRules(
           {
             listAgents: async () => {
-              const response = await serving.fetch('/api/agent')
-              if (!response.ok) throw new Error(`HTTP ${response.status}`)
-              return response.json()
+              // One bound for headers and body, joined with service cancellation: the handle's raw fetch has none.
+              const bound = AbortSignal.timeout(requestTimeoutMs)
+              const gateSignal = signal === undefined ? bound : AbortSignal.any([signal, bound])
+              const read = async (): Promise<unknown> => {
+                const response = await serving.fetch('/api/agent', {signal: gateSignal})
+                if (!response.ok) throw new Error(`HTTP ${response.status}`)
+                return response.json()
+              }
+              return untilAborted(gateSignal, read())
             },
           },
           built.data.expectations,

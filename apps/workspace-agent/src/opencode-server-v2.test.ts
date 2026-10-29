@@ -11,7 +11,12 @@ import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 
-import {DEFAULT_SYSTEMATIC_VERSION, FRO_BOT_PLUGIN_ID, SYSTEMATIC_V2_PLUGIN_ID} from '@fro-bot/runtime/workspace-v2'
+import {
+  DEFAULT_SYSTEMATIC_VERSION,
+  FRO_BOT_PLUGIN_ID,
+  SYSTEMATIC_V2_PLUGIN_ID,
+  verifyPermissionRules,
+} from '@fro-bot/runtime/workspace-v2'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
 import {
@@ -52,6 +57,8 @@ function createHandle(options: {
   authorization: string
   activeSessions?: readonly string[] | 'fail'
   agentsBody?: unknown
+  /** Replaces the `/api/agent` answer, to stall the response headers or the body. */
+  agentResponse?: () => Promise<Response>
 }): FakeHandle {
   let resolveExit: (info: {code: number | null; signal: NodeJS.Signals | null}) => void = () => undefined
   const exited = new Promise<{code: number | null; signal: NodeJS.Signals | null}>(resolve => {
@@ -81,7 +88,11 @@ function createHandle(options: {
           status: 200,
         })
       }
-      if (pathname === '/api/agent') return new Response(JSON.stringify(agentsBody), {status: 200})
+      if (pathname === '/api/agent') {
+        return options.agentResponse === undefined
+          ? new Response(JSON.stringify(agentsBody), {status: 200})
+          : options.agentResponse()
+      }
       return new Response('{}', {status: 404})
     },
     authorizationHeader: () => options.authorization,
@@ -267,6 +278,28 @@ describe('createUpstreamCredentials', () => {
     expect(String(JSON.stringify({credentials}))).not.toContain('c2VjcmV0')
   })
 })
+
+function recordStatuses(): {statusRef: SupervisedStatusRef; seen: SupervisedStatusRef['status'][]} {
+  const seen: SupervisedStatusRef['status'][] = []
+  let status: SupervisedStatusRef['status'] = 'starting'
+  return {
+    seen,
+    statusRef: {
+      get status() {
+        return status
+      },
+      set status(value) {
+        status = value
+        seen.push(value)
+      },
+    },
+  }
+}
+
+function stalledBody(): Response {
+  // Headers arrive; the body never produces a byte and never closes.
+  return new Response(new ReadableStream<Uint8Array>({start: () => undefined}), {status: 200})
+}
 
 describe('runSupervisedOpencodeV2', () => {
   const NO_BACKOFF = {initialBackoffMs: 0, maxBackoffMs: 0}
@@ -511,6 +544,112 @@ describe('runSupervisedOpencodeV2', () => {
     // #then no server is ever started on a database the supervisor did not create
     expect(startOptions).toHaveLength(0)
     expect(statusRef.status).toBe('degraded')
+  })
+
+  it('does not spawn when the service aborts while the database is being prepared', async () => {
+    // #given a database preparation that is still pending when the service aborts
+    const {options, startOptions} = setup()
+    const controller = new AbortController()
+    let finishPreparing: (databasePath: string) => void = () => undefined
+    const preparing = new Promise<string>(resolve => {
+      finishPreparing = resolve
+    })
+    const startServer = vi.fn(scriptedStart([createHandle({authorization: 'Basic x'})], startOptions))
+    options.deps = {...options.deps, prepareDatabase: async () => preparing, startServer}
+    const done = runSupervisedOpencodeV2({...options, signal: controller.signal})
+    controller.abort()
+
+    // #when the preparation completes after the abort
+    finishPreparing('/db/spawn-1/opencode.db')
+    await done
+
+    // #then the supervisor returned without starting a server during shutdown
+    expect(startServer).not.toHaveBeenCalled()
+  })
+
+  describe('permission-gate request', () => {
+    const REAL_GATE = {verifyRules: verifyPermissionRules}
+
+    it('shuts the server down and never reports ready when the response headers stall', async () => {
+      // #given an /api/agent response that never arrives
+      const fake = createHandle({
+        authorization: 'Basic one',
+        agentResponse: async () => new Promise<Response>(() => {}),
+      })
+      const {options, startOptions, credentials, capture} = setup({maxAttempts: 1, requestTimeoutMs: 50})
+      const {statusRef, seen} = recordStatuses()
+      options.deps = {...options.deps, ...REAL_GATE, startServer: scriptedStart([fake], startOptions)}
+
+      // #when the supervisor runs
+      await runSupervisedOpencodeV2({...options, statusRef})
+
+      // #then the request was bounded, the handle shut down, and nothing was ever published as ready
+      expect(fake.shutdown).toHaveBeenCalledTimes(1)
+      expect(seen).not.toContain('ready')
+      expect(statusRef.status).toBe('degraded')
+      expect(credentials.authorization()).toBeUndefined()
+      expect(capture.serialized()).toContain('agent-list-unavailable')
+    })
+
+    it('shuts the server down and never reports ready when the response body stalls', async () => {
+      // #given headers that arrive and a body that never completes
+      const fake = createHandle({authorization: 'Basic one', agentResponse: async () => stalledBody()})
+      const {options, startOptions, credentials} = setup({maxAttempts: 1, requestTimeoutMs: 50})
+      const {statusRef, seen} = recordStatuses()
+      options.deps = {...options.deps, ...REAL_GATE, startServer: scriptedStart([fake], startOptions)}
+
+      // #when
+      await runSupervisedOpencodeV2({...options, statusRef})
+
+      // #then the timeout stays in force through the body read
+      expect(fake.shutdown).toHaveBeenCalledTimes(1)
+      expect(seen).not.toContain('ready')
+      expect(statusRef.status).toBe('degraded')
+      expect(credentials.authorization()).toBeUndefined()
+    })
+
+    it('hands the request an abort signal so a real connection is released', async () => {
+      // #given a handle that records the signal its /api/agent request carries
+      let received: AbortSignal | undefined
+      const fake = createHandle({authorization: 'Basic one'})
+      const handle: OpenCodeV2ServerHandle = {
+        ...fake.handle,
+        fetch: async (pathname, init) => {
+          if (pathname === '/api/agent') received = init?.signal ?? undefined
+          return fake.handle.fetch(pathname, init)
+        },
+      }
+      const {options, startOptions} = setup({maxAttempts: 1})
+      const controller = new AbortController()
+      options.deps = {...options.deps, ...REAL_GATE, startServer: scriptedStart([{...fake, handle}], startOptions)}
+      const done = runSupervisedOpencodeV2({...options, signal: controller.signal})
+      await vi.waitFor(() => expect(received).toBeInstanceOf(AbortSignal))
+
+      // #when / #then
+      controller.abort()
+      await done
+    })
+
+    it('shuts the server down when the service aborts during a stalled request', async () => {
+      // #given a stalled request with a timeout far longer than the test
+      const fake = createHandle({authorization: 'Basic one', agentResponse: async () => stalledBody()})
+      const {options, startOptions, credentials} = setup({maxAttempts: 3, requestTimeoutMs: 60_000})
+      const {statusRef, seen} = recordStatuses()
+      const controller = new AbortController()
+      options.deps = {...options.deps, ...REAL_GATE, startServer: scriptedStart([fake], startOptions)}
+      const done = runSupervisedOpencodeV2({...options, statusRef, signal: controller.signal})
+      await vi.waitFor(() => expect(fake.fetchPaths).toContain('/api/agent'))
+
+      // #when the service aborts
+      controller.abort()
+      await done
+
+      // #then the request was cancelled, the handle shut down once, and no second server was started
+      expect(fake.shutdown).toHaveBeenCalledTimes(1)
+      expect(startOptions).toHaveLength(1)
+      expect(seen).not.toContain('ready')
+      expect(credentials.authorization()).toBeUndefined()
+    })
   })
 
   it('interrupts the sessions that are active, then shuts the server down, on abort', async () => {
