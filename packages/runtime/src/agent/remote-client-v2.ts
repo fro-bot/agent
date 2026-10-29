@@ -55,8 +55,12 @@ export interface V2SessionSummary {
  */
 export const V2_HEARTBEAT_FRAME = {type: 'server.heartbeat'} as const
 
-/** Stand-in for a data frame whose JSON could not be parsed. It carries nothing from the payload. */
-const V2_UNREADABLE_FRAME = {type: 'server.unreadable'} as const
+/**
+ * What the event stream throws for a data frame whose JSON cannot be parsed. A frame that cannot be read has no type, so
+ * nothing can say whether it was a request somebody has to answer: the stream ends, and the consumer treats that as a
+ * lost connection. The message carries nothing from the payload.
+ */
+const V2_UNREADABLE_FRAME_MESSAGE = 'OpenCode V2 event stream carried a data frame that could not be parsed'
 
 export interface RemoteOpenCodeV2ClientOptions {
   /** Base URL of the proxy (no trailing path). */
@@ -145,7 +149,10 @@ function readOutcome(value: unknown): V2SessionOutcome | null {
   return outcome === 'succeeded' || outcome === 'failed' || outcome === 'interrupted' ? outcome : null
 }
 
-/** SSE blocks are separated by a blank line; a block of comment lines only is a heartbeat. */
+/**
+ * SSE blocks are separated by a blank line; a block of comment lines only is a heartbeat. Throws on a data block that is
+ * not JSON.
+ */
 function readBlock(block: string): unknown {
   const lines = block.split('\n')
   const dataLines = lines.filter(line => line.startsWith('data:')).map(line => line.slice(5).replace(/^ /, ''))
@@ -153,7 +160,7 @@ function readBlock(block: string): unknown {
   try {
     return JSON.parse(dataLines.join('\n'))
   } catch {
-    return V2_UNREADABLE_FRAME
+    throw new Error(V2_UNREADABLE_FRAME_MESSAGE)
   }
 }
 

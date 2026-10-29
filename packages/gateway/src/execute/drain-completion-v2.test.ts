@@ -79,6 +79,43 @@ afterEach(() => {
 })
 
 describe('createDrainCompletionV2', () => {
+  it('stops waiting for a readable notice from a child whose notice could not be read', async () => {
+    // #given — the ledger settled the child (reconciliation saw it stop), and no readable notice ever came
+    const s = setup()
+    s.drain.noteRootIdle()
+    s.drain.beginDrain()
+    s.ledger.settle(CHILD)
+    s.drain.requestValidation()
+    await vi.advanceTimersByTimeAsync(10)
+    expect(s.reasons.at(-1)).toBe('notice-not-observed')
+
+    // #when — an unreadable notice names it, and the turn that follows ends
+    s.drain.noteUnreadableNotice(CHILD)
+    s.drain.noteRootActivity()
+    s.drain.noteRootIdle()
+    s.drain.requestValidation()
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #then
+    expect(s.onAdmitted).toHaveBeenCalledTimes(1)
+  })
+
+  it('still needs idle evidence after an unreadable notice', async () => {
+    // #given
+    const s = setup()
+    s.drain.noteRootIdle()
+    s.drain.beginDrain()
+    s.ledger.settle(CHILD)
+
+    // #when — the notice invalidates the earlier idle
+    s.drain.noteUnreadableNotice(CHILD)
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #then
+    expect(s.onAdmitted).not.toHaveBeenCalled()
+    expect(s.reasons.at(-1)).toBe('idle-evidence-stale')
+  })
+
   it('admits success only after the turn the notice triggered has ended and the root is not live', async () => {
     // #given — the root went idle once, the child settled, its notice arrived
     const s = setup()

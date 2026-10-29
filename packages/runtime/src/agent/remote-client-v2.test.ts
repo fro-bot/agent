@@ -292,21 +292,31 @@ describe('createRemoteOpenCodeV2Client', () => {
       expect(requests[0]?.headers.accept).toBe('text/event-stream')
     })
 
-    it('keeps reading after a frame it cannot parse', async () => {
-      // #given
+    it('ends the stream with an error at a frame it cannot parse, after delivering the frames before it', async () => {
+      // #given — a frame that is cut off, then a frame that would parse
       const client = createRemoteOpenCodeV2Client({
         baseUrl: 'http://w',
-        fetch: makeFetch(() => sseResponse(['data: {not json\n\n', 'data: {"type":"x"}\n\n'])).fetch,
+        fetch: makeFetch(() =>
+          sseResponse([
+            'data: {"type":"x"}\n\n',
+            'data: {"type":"permission.asked","data":{"id":"sec\n\n',
+            'data: {"type":"y"}\n\n',
+          ]),
+        ).fetch,
       })
-
-      // #when
       const result = await client.subscribeEvents({directory: '/d'})
       if (!result.success) throw new Error('expected a stream')
-      const frames: unknown[] = []
-      for await (const frame of result.data) frames.push(frame)
 
-      // #then — the unreadable frame is still a sign of life, and carries no payload
-      expect(frames).toEqual([{type: 'server.unreadable'}, {type: 'x'}])
+      // #when
+      const frames: unknown[] = []
+      const reading = (async () => {
+        for await (const frame of result.data) frames.push(frame)
+      })()
+
+      // #then — the stream fails instead of skipping a frame of unknown type, and the error carries no payload
+      await expect(reading).rejects.toThrow('could not be parsed')
+      await expect(reading).rejects.not.toThrow('sec')
+      expect(frames).toEqual([{type: 'x'}])
     })
 
     it('fails a subscription the proxy rejects, as auth', async () => {

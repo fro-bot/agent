@@ -422,8 +422,14 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
     liveReconcileClosed = true
     reconciler?.dispose()
     drainCompletion?.dispose()
+    // Adopted background work keeps a successor root turn possible even after the root halted: settling cancels the
+    // children, each cancel delivers a notice, and the coordinator starts a root turn for it whatever way the last one
+    // ended.
+    const hasAdoptedWork = ledger !== undefined && ledger.snapshot().length > 0
     const rootFollowUpOpen =
-      rootMayBeRunning || (drainCompletion !== undefined && draining && !drainDoneController.signal.aborted)
+      rootMayBeRunning ||
+      hasAdoptedWork ||
+      (drainCompletion !== undefined && draining && !drainDoneController.signal.aborted)
     const barrierLedger = ledger ?? (rootMayBeRunning ? createOwnershipLedger() : undefined)
     if (barrierLedger === undefined || (barrierLedger.isDrainComplete() && !rootFollowUpOpen)) {
       throw new RunCoreError(kind, message, false, providerFailureReason, cause)
@@ -1021,7 +1027,9 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
         }
 
         case 'inbox_delivered': {
-          if (event.sessionId === sessionId) drainCompletion?.noteInboxDelivered(event.inboxId)
+          // Any owned session: a notice can be queued into a busy child, and is delivered there. Inbox ids are unique
+          // message ids, so a delivery can only match the notice it names.
+          if (isOwnedSession(event.sessionId)) drainCompletion?.noteInboxDelivered(event.inboxId)
           break
         }
 
@@ -1170,6 +1178,19 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
             event.eventType === 'permission.asked' ||
             event.eventType === 'form.created' ||
             event.eventType === 'session.moved'
+          if (event.childSessionId !== undefined && isOwnedSession(event.sessionId)) {
+            // A child's notice the server sent and this client cannot read. It proves nothing about the child, so the
+            // child is fenced rather than waited on: the gate stops expecting a readable notice, and the entry is
+            // `unknown` (never `settled`) until reconciliation sees it stop.
+            drainCompletion?.noteUnreadableNotice(event.childSessionId)
+            ledger?.markUnknown(event.childSessionId)
+            markActivity()
+            logger.warn(
+              {sessionId, childSessionId: event.childSessionId, eventType: event.eventType},
+              'run-core: a child completion notice could not be read — child fenced and marked unknown',
+            )
+            break
+          }
           if (safetyRelevant && isOwnedSession(event.sessionId)) {
             logger.error(
               {sessionId, eventType: event.eventType},

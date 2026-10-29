@@ -509,6 +509,51 @@ describe('mapV2Event: subagent notices', () => {
     expect(event).toBeNull()
   })
 
+  it.each([
+    ['an unknown state', {source: 'subagent', childID: CHILD_SESSION_ID, agent: 'General', state: 'paused'}],
+    ['state running, which is never delivered', {source: 'subagent', childID: CHILD_SESSION_ID, state: 'running'}],
+    ['no state', {source: 'subagent', childID: CHILD_SESSION_ID}],
+  ])('maps a subagent notice with %s to malformed, naming the child', (_label, metadata) => {
+    const inbox = mapV2Event({
+      type: 'session.inbox.enqueued',
+      data: {inboxID: 'msg_odd', sessionID: PARENT_SESSION_ID, item: {type: 'synthetic', payload: {metadata}}},
+    })
+    const synthetic = mapV2Event({type: 'session.synthetic', data: {sessionID: PARENT_SESSION_ID, metadata}})
+
+    for (const event of [inbox, synthetic]) {
+      expect(event).toMatchObject({
+        kind: 'malformed',
+        sessionId: PARENT_SESSION_ID,
+        childSessionId: CHILD_SESSION_ID,
+      })
+    }
+  })
+
+  it('maps a subagent notice that names no readable child to malformed without a child id', () => {
+    const event = mapV2Event({
+      type: 'session.synthetic',
+      data: {sessionID: PARENT_SESSION_ID, metadata: {source: 'subagent', state: 'completed'}},
+    })
+    expect(event).toEqual({
+      kind: 'malformed',
+      eventType: 'session.synthetic',
+      sessionId: PARENT_SESSION_ID,
+      reason: 'unreadable subagent notice',
+    })
+  })
+
+  it('still ignores an enqueued item that is not synthetic, whatever its metadata says', () => {
+    const event = mapV2Event({
+      type: 'session.inbox.enqueued',
+      data: {
+        inboxID: 'msg_user',
+        sessionID: PARENT_SESSION_ID,
+        item: {type: 'user', payload: {metadata: {source: 'subagent', childID: CHILD_SESSION_ID, state: 'paused'}}},
+      },
+    })
+    expect(event).toBeNull()
+  })
+
   it('ignores a synthetic event from instruction loading', () => {
     const event = mapV2Event({
       type: 'session.synthetic',

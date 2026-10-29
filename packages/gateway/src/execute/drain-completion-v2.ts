@@ -61,7 +61,13 @@ export interface DrainCompletionV2 {
    * notice is already a transcript message. Deduped by child and state. Invalidates idle evidence.
    */
   readonly noteNotice: (notice: SubagentNotice, inboxId: string | null) => void
-  /** A queued inbox item entered a root turn. */
+  /**
+   * A notice about `childSessionId` arrived and could not be read, so the child's end is unproven. The gate stops
+   * waiting for a readable notice from it and invalidates idle evidence; the ledger entry (the caller marks it
+   * `unknown`) is what still blocks admission until the child is seen to stop.
+   */
+  readonly noteUnreadableNotice: (childSessionId: string) => void
+  /** A queued inbox item entered a turn of an owned session. */
   readonly noteInboxDelivered: (inboxId: string) => void
   /** The root's execution succeeded: stamps the current revision, unless a notice is still queued. */
   readonly noteRootIdle: () => void
@@ -132,6 +138,13 @@ export function createDrainCompletionV2(options: DrainCompletionV2Options): Drai
       existing.inboxId = inboxId
     }
     noticedChildren.add(notice.childSessionId)
+    requestValidation()
+  }
+
+  function noteUnreadableNotice(childSessionId: string): void {
+    if (closed) return
+    invalidate()
+    noticedChildren.add(childSessionId)
     requestValidation()
   }
 
@@ -264,5 +277,14 @@ export function createDrainCompletionV2(options: DrainCompletionV2Options): Drai
     retryTimer = undefined
   }
 
-  return {noteRootActivity, noteNotice, noteInboxDelivered, noteRootIdle, beginDrain, requestValidation, dispose}
+  return {
+    noteRootActivity,
+    noteNotice,
+    noteUnreadableNotice,
+    noteInboxDelivered,
+    noteRootIdle,
+    beginDrain,
+    requestValidation,
+    dispose,
+  }
 }

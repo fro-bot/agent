@@ -1,8 +1,8 @@
 import type {Logger} from '../shared/logger.js'
-import type {SubagentNotice} from './subagent-notice.js'
+import type {SubagentNotice, SubagentNoticeRead} from './subagent-notice.js'
 
 import {getNumberProperty, getObjectProperty, getStringProperty, ownValue} from './payload-accessors.js'
-import {readSubagentNotice, readSubagentNoticeItem} from './subagent-notice.js'
+import {classifySubagentNotice, classifySubagentNoticeItem} from './subagent-notice.js'
 
 /**
  * OpenCode V2 event mapper: turns parsed V2 event frames into one small, surface-neutral domain union that the Action
@@ -195,6 +195,8 @@ export type V2DomainEvent =
       readonly eventType: string
       readonly sessionId: string | null
       readonly reason: string
+      /** Set for a subagent notice that could not be read and still named its child; the loop fences that child. */
+      readonly childSessionId?: string
     }
 
 /** Stable identity of an inner call of an `execute` tool call. */
@@ -469,11 +471,24 @@ function mapSessionError(type: string, data: unknown): V2DomainEvent {
 }
 
 function mapNotice(
-  sessionId: string | null,
-  notice: SubagentNotice | null,
+  type: string,
+  data: unknown,
+  read: SubagentNoticeRead,
   inboxId: string | null,
 ): V2DomainEvent | null {
-  return sessionId === null || notice === null ? null : {kind: 'subagent_notice', sessionId, notice, inboxId}
+  const sessionId = getStringProperty(data, 'sessionID')
+  if (read.kind === 'none') return null
+  if (read.kind === 'notice') {
+    return sessionId === null ? null : {kind: 'subagent_notice', sessionId, notice: read.notice, inboxId}
+  }
+  // A notice the server sent that this reader cannot take. Dropping it would leave its child unaccounted for.
+  return {
+    kind: 'malformed',
+    eventType: type,
+    sessionId,
+    reason: 'unreadable subagent notice',
+    ...(read.childSessionId === null ? {} : {childSessionId: read.childSessionId}),
+  }
 }
 
 /**
@@ -554,8 +569,9 @@ export function mapV2Event(frame: unknown): V2DomainEvent | null {
 
     case 'session.inbox.enqueued':
       return mapNotice(
-        getStringProperty(data, 'sessionID'),
-        readSubagentNoticeItem(getObjectProperty(data, 'item')),
+        type,
+        data,
+        classifySubagentNoticeItem(getObjectProperty(data, 'item')),
         getStringProperty(data, 'inboxID'),
       )
 
@@ -566,7 +582,7 @@ export function mapV2Event(frame: unknown): V2DomainEvent | null {
     }
 
     case 'session.synthetic':
-      return mapNotice(getStringProperty(data, 'sessionID'), readSubagentNotice(data), null)
+      return mapNotice(type, data, classifySubagentNotice(data), null)
 
     default:
       return null

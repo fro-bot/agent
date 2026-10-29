@@ -6,7 +6,7 @@
 
 import type {OwnershipLedger} from '@fro-bot/runtime'
 
-import {createOwnershipLedger} from '@fro-bot/runtime'
+import {createOwnershipLedger, ok} from '@fro-bot/runtime'
 import {SUBAGENT_FOREGROUND_SUCCESS_FRAME} from '@fro-bot/runtime/event-v2-fixtures'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
@@ -478,5 +478,192 @@ describe('runOpenCodeCoreV2: bounded reconcile passes', () => {
 
     // #then — teardown owns the ledger from the moment the run ended
     expect(states(ledger)[CHILD]).not.toBe('settled')
+  })
+})
+
+describe('runOpenCodeCoreV2: a notice queued into a busy child', () => {
+  it('completes once the child takes the notice in, instead of waiting for a delivery it never forwarded', async () => {
+    // #given — the root's child is still busy when its own child (a grandchild) ends, so that notice queues there
+    const ledger = createOwnershipLedger()
+    const run = startRun({ownershipLedger: ledger, active: [], children: [CHILD]})
+    await vi.advanceTimersByTimeAsync(10)
+    await dispatchAndIdle(run)
+
+    // #when — the child takes the grandchild's notice in, then ends itself and the root takes that notice in
+    run.emit(
+      frames.notice('ses_grandchild', 'completed', 'msg_grandchild', CHILD),
+      frames.delivered('msg_grandchild', CHILD),
+    )
+    noticeTurn(run)
+    await vi.advanceTimersByTimeAsync(2_000)
+
+    // #then
+    expect(succeeded(run)).toBe(true)
+  })
+
+  it('does not complete while the notice is still queued in the child', async () => {
+    // #given
+    const ledger = createOwnershipLedger()
+    const run = startRun({ownershipLedger: ledger, active: [], children: [CHILD]})
+    await vi.advanceTimersByTimeAsync(10)
+    await dispatchAndIdle(run)
+
+    // #when — never delivered
+    run.emit(frames.notice('ses_grandchild', 'completed', 'msg_grandchild', CHILD))
+    noticeTurn(run)
+    await vi.advanceTimersByTimeAsync(2_000)
+
+    // #then
+    expect(run.outcome()).toBeUndefined()
+    run.close()
+    await vi.advanceTimersByTimeAsync(20_000)
+  })
+
+  it('ignores a delivery in a session this run does not own', async () => {
+    // #given — a notice queued in the child
+    const ledger = createOwnershipLedger()
+    const run = startRun({ownershipLedger: ledger, active: [], children: [CHILD]})
+    await vi.advanceTimersByTimeAsync(10)
+    await dispatchAndIdle(run)
+
+    // #when — the id is "delivered" in a stranger's session
+    run.emit(
+      frames.notice('ses_grandchild', 'completed', 'msg_grandchild', CHILD),
+      frames.delivered('msg_grandchild', STRANGER),
+    )
+    noticeTurn(run)
+    await vi.advanceTimersByTimeAsync(2_000)
+
+    // #then
+    expect(run.outcome()).toBeUndefined()
+    run.close()
+    await vi.advanceTimersByTimeAsync(20_000)
+  })
+})
+
+/** The root dispatches a child in the background, then halts before it ever reports a success. */
+async function haltWithChildRunning(halt: (run: ReturnType<typeof startRun>) => void) {
+  const ledger = createOwnershipLedger()
+  let rootBusy = false
+  let rootInterrupts = 0
+  const run = startRun({
+    ownershipLedger: ledger,
+    children: [CHILD],
+    // The cancelled child's notice makes the server start a successor root turn: the root turns up busy later.
+    activeReply: async (): Promise<Record<string, {readonly type: string}>> =>
+      rootBusy ? {[ROOT]: {type: 'running'}} : {},
+    interrupt: async sessionId => {
+      if (sessionId === ROOT) rootInterrupts += 1
+      return ok({interrupted: rootBusy})
+    },
+  })
+  await vi.advanceTimersByTimeAsync(10)
+  run.emit(
+    frames.started(),
+    frames.toolStarted('subagent', 'call_dispatch'),
+    frames.toolCalled('call_dispatch', {description: 'bg child', prompt: 'work', background: true}),
+    frames.dispatch(CHILD),
+  )
+  await vi.advanceTimersByTimeAsync(10)
+  expect(states(ledger)).toEqual({[CHILD]: 'outstanding'})
+  halt(run)
+  await vi.advanceTimersByTimeAsync(20_000)
+  return {
+    run,
+    rootInterrupts: () => rootInterrupts,
+    startSuccessor: () => {
+      rootBusy = true
+    },
+  }
+}
+
+describe('runOpenCodeCoreV2: a halted root with background work outstanding', () => {
+  it.each([
+    ['execution.failed', (run: ReturnType<typeof startRun>) => run.emit(frames.failed())],
+    [
+      'execution.interrupted by a user',
+      (run: ReturnType<typeof startRun>) => run.emit(frames.interrupted(ROOT, 'user')),
+    ],
+  ] as const)('quarantines on %s and keeps interrupting the root through the hold', async (_label, halt) => {
+    // #given / #when — the root halts while its background child is still running
+    const {run, rootInterrupts, startSuccessor} = await haltWithChildRunning(halt)
+
+    // #then — the stop is never confirmed: cancelling the child delivers a notice that wakes the root
+    expect(failure(run).quarantined).toBe(true)
+    const interruptsAtQuarantine = rootInterrupts()
+
+    // #when — the server starts the successor turn during the hold
+    startSuccessor()
+    await vi.advanceTimersByTimeAsync(2_000)
+
+    // #then — the root is interrupted again
+    expect(rootInterrupts()).toBeGreaterThan(interruptsAtQuarantine)
+  })
+
+  it('keeps the fast path for a halted root that owns no background work', async () => {
+    // #given
+    const ledger = createOwnershipLedger()
+    const run = startRun({ownershipLedger: ledger})
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #when
+    run.emit(frames.failed())
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    // #then
+    expect(failure(run).quarantined).toBe(false)
+    expect(run.interrupt).not.toHaveBeenCalled()
+  })
+})
+
+describe('runOpenCodeCoreV2: a notice that cannot be read', () => {
+  it('fences the child it names, so the run completes instead of waiting out its deadline', async () => {
+    // #given — the child ended, but its notice carries a state this client does not know
+    const ledger = createOwnershipLedger()
+    const run = startRun({ownershipLedger: ledger, active: [], children: [CHILD]})
+    await vi.advanceTimersByTimeAsync(10)
+    await dispatchAndIdle(run)
+
+    // #when — the unreadable notice, then the turn that takes it in
+    noticeTurn(run, CHILD, 'paused', 'msg_odd')
+    await vi.advanceTimersByTimeAsync(2_000)
+
+    // #then
+    expect(succeeded(run)).toBe(true)
+  })
+
+  it('marks a still-running child unknown rather than settled, and keeps the run going', async () => {
+    // #given
+    const ledger = createOwnershipLedger()
+    const run = startRun({ownershipLedger: ledger, active: [CHILD], children: [CHILD]})
+    await vi.advanceTimersByTimeAsync(10)
+    await dispatchAndIdle(run)
+
+    // #when
+    run.emit(frames.notice(CHILD, 'paused', 'msg_odd'))
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #then — the notice proves nothing about the child, so it blocks the drain
+    expect(states(ledger)).toEqual({[CHILD]: 'unknown'})
+    expect(run.outcome()).toBeUndefined()
+    run.close()
+    await vi.advanceTimersByTimeAsync(20_000)
+  })
+
+  it('ignores an unreadable notice delivered to a session this run does not own', async () => {
+    // #given
+    const ledger = createOwnershipLedger()
+    const run = startRun({ownershipLedger: ledger, active: [CHILD], children: [CHILD]})
+    await vi.advanceTimersByTimeAsync(10)
+    await dispatchAndIdle(run)
+
+    // #when
+    run.emit(frames.notice(CHILD, 'paused', 'msg_odd', STRANGER))
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #then
+    expect(states(ledger)).toEqual({[CHILD]: 'outstanding'})
+    run.close()
+    await vi.advanceTimersByTimeAsync(20_000)
   })
 })
