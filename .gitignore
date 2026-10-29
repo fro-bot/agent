@@ -113,6 +113,7 @@ eslint-typegen.d.ts
 packages/runtime/dist/
 packages/gateway/dist/
 packages/harness/dist/
+packages/opencode-plugin/dist/
 apps/action/dist/
 apps/workspace-agent/dist/
 

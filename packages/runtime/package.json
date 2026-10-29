@@ -8,6 +8,11 @@
       "types": "./src/index.ts",
       "import": "./src/index.ts",
       "default": "./src/index.ts"
+    },
+    "./session-v2": {
+      "types": "./src/session/v2.ts",
+      "import": "./src/session/v2.ts",
+      "default": "./src/session/v2.ts"
     }
   },
   "main": "src/index.ts",

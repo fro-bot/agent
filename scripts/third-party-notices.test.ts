@@ -183,6 +183,41 @@ describe('collectProdClosureFromBunLock', () => {
     expect(closure.get('shared')?.version).toBe('2.0.0')
   })
 
+  it.each([
+    ['a hoisted package', 'glob', 'glob', '/fake/node_modules/glob'],
+    ['a scoped hoisted package', '@actions/core', '@actions/core', '/fake/node_modules/@actions/core'],
+    [
+      'a package nested under its parent',
+      'archiver-utils/glob',
+      'glob',
+      '/fake/node_modules/archiver-utils/node_modules/glob',
+    ],
+    ['a scoped package nested under a scoped parent', '@a/b/@c/d', '@c/d', '/fake/node_modules/@a/b/node_modules/@c/d'],
+    ['a package nested two levels deep', 'a/b/c', 'c', '/fake/node_modules/a/node_modules/b/node_modules/c'],
+  ])('locates %s at its installed path', (_label, key, name, expectedDir) => {
+    // #given the key's parent chain, each package depending on the next, and the leaf recorded under the full key
+    const parts = key.split('/').reduce<string[]>((acc, part) => {
+      const last = acc.at(-1)
+      if (last !== undefined && last.startsWith('@') && !last.includes('/')) acc[acc.length - 1] = `${last}/${part}`
+      else acc.push(part)
+      return acc
+    }, [])
+    const packages: Record<string, unknown> = {}
+    parts.forEach((part, index) => {
+      const entryKey = parts.slice(0, index + 1).join('/')
+      const next = parts[index + 1]
+      packages[entryKey] =
+        next === undefined ? [`${name}@1.0.0`, '', {}] : [`${part}@1.0.0`, '', {dependencies: {[next]: '*'}}]
+    })
+    mockReadFileSync.mockReturnValue(makeBunLock({[parts[0] ?? key]: '1.0.0'}, packages))
+
+    // #when
+    const closure = collectProdClosureFromBunLock('/fake/bun.lock', '/fake/node_modules')
+
+    // #then the directory follows the key, not the hoisted node_modules/<name>
+    expect([...closure.values()].map(entry => entry.pkgDir)).toContain(expectedDir)
+  })
+
   it('exercises stripTrailingCommas — trailing commas in lockfile input are handled', () => {
     // JSON.stringify never emits trailing commas, so this exercises the regex path
     // that stripTrailingCommas must handle (bun.lock uses JSON5-style trailing commas).
@@ -365,6 +400,45 @@ describe('collectThirdPartyNoticesBun', () => {
     expect(result).toContain('react@18.2.0')
     expect(result).toContain('MIT')
     expect(result).toContain('MIT License')
+  })
+
+  it('reads each version of a package from its own installed directory when licences differ', async () => {
+    // #given glob@13 hoisted (BlueOak) and glob@10 nested under archiver-utils (ISC); only the nested one is a prod dep
+    const lockContent = makeBunLock(
+      {'archiver-utils': '5.0.2'},
+      {
+        'archiver-utils': ['archiver-utils@5.0.2', '', {dependencies: {glob: '^10.0.0'}}],
+        glob: ['glob@13.0.5', '', {}],
+        'archiver-utils/glob': ['glob@10.5.0', '', {}],
+      },
+    )
+    const files: Record<string, {readonly license: string; readonly text: string}> = {
+      '/fake/node_modules/glob': {license: 'BlueOak-1.0.0', text: 'Blue Oak Model License'},
+      '/fake/node_modules/archiver-utils/node_modules/glob': {license: 'ISC', text: 'The ISC License'},
+      '/fake/node_modules/archiver-utils': {license: 'MIT', text: 'MIT License'},
+    }
+    mockExistsSync.mockImplementation((p: unknown) => {
+      const path = String(p)
+      return path.endsWith('bun.lock') || Object.keys(files).some(dir => path === dir || path.startsWith(`${dir}/`))
+    })
+    mockReaddirSync.mockImplementation((p: unknown) => {
+      return (String(p) in files ? ['LICENSE', 'package.json'] : []) as unknown as ReturnType<typeof readdirSync>
+    })
+    mockReadFileSync.mockImplementation((p: unknown) => {
+      const path = String(p)
+      if (path.endsWith('bun.lock')) return lockContent
+      const dir = path.replace(/\/(?:LICENSE|package\.json)$/, '')
+      const file = files[dir]
+      if (file === undefined) return ''
+      return path.endsWith('package.json') ? JSON.stringify({license: file.license}) : file.text
+    })
+
+    // #when
+    const result = await collectThirdPartyNoticesBun('/fake/bun.lock', '/fake/node_modules')
+
+    // #then the glob@10.5.0 entry carries ISC, not the hoisted copy's BlueOak
+    expect(result).toContain('glob@10.5.0\nISC\nThe ISC License')
+    expect(result).not.toContain('BlueOak')
   })
 
   it('throws when bun.lock does not exist', async () => {

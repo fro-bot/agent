@@ -1,0 +1,167 @@
+name: opencode-plugin-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to publish (for example 0.1.0 or 0.2.0-rc.1)
+        required: true
+        type: string
+      dry_run:
+        description: 'Dry run: verify and pack, but do not publish'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: opencode-plugin-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify (gates, build, pack)
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: read
+
+    outputs:
+      version: ${{ steps.params.outputs.version }}
+      dry_run: ${{ steps.params.outputs.dry_run }}
+      tarball: ${{ steps.pack.outputs.tarball }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Resolve version
+        id: params
+        env:
+          VERSION: ${{ inputs.version }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          if ! printf '%s' "${VERSION}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::'${VERSION}' is not a plain semver version"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "dry_run=${DRY_RUN:-false}" >> "${GITHUB_OUTPUT}"
+
+      - name: Setup Node.js and Bun
+        uses: ./.github/actions/setup
+
+      - name: Lint, type-check and test
+        run: |
+          set -euo pipefail
+          bun run --filter @fro.bot/opencode-plugin lint
+          bun run --filter @fro.bot/opencode-plugin check-types
+          bun run --filter @fro.bot/opencode-plugin test
+
+      - name: Build
+        run: bun run --filter @fro.bot/opencode-plugin build
+
+      - name: Check the bundle only imports what the host provides
+        working-directory: packages/opencode-plugin
+        run: |
+          set -euo pipefail
+          node --input-type=module -e '
+            import {readFileSync} from "node:fs"
+            const source = readFileSync("dist/index.mjs", "utf8")
+            const patterns = [/\bfrom\s*["\x27]([^"\x27]+)["\x27]/g, /\bimport\s*["\x27]([^"\x27]+)["\x27]/g, /\b(?:import|require)\(\s*["\x27]([^"\x27]+)["\x27]\s*\)/g]
+            const specifiers = patterns.flatMap(pattern => [...source.matchAll(pattern)].map(m => m[1]))
+            const allowed = (s) => s === "effect" || s.startsWith("effect/") || s === "@opencode/plugin" || s.startsWith("@opencode/plugin/") || s.startsWith("node:")
+            const bad = [...new Set(specifiers.filter(s => !allowed(s)))]
+            if (bad.length > 0) { console.error("::error::unexpected imports in dist/index.mjs: " + bad.join(", ")); process.exit(1) }
+            if (!specifiers.includes("@opencode/plugin")) { console.error("::error::dist/index.mjs no longer imports @opencode/plugin"); process.exit(1) }
+            console.log("bundle imports ok: " + [...new Set(specifiers)].join(", "))
+          '
+
+      - name: Pack
+        id: pack
+        env:
+          VERSION: ${{ steps.params.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Packed from a staging copy so the workspace manifest (workspace:* devDependencies) is never published.
+          STAGE="$(mktemp -d)"
+          PKG=packages/opencode-plugin
+          mkdir -p "${STAGE}/pkg" "${STAGE}/out"
+          cp -R "${PKG}/dist" "${PKG}/README.md" "${PKG}/LICENSE" "${PKG}/package.json" "${STAGE}/pkg/"
+          (
+            cd "${STAGE}/pkg"
+            npm pkg set "version=${VERSION}"
+            npm pkg delete devDependencies scripts
+            npm pack --pack-destination "${STAGE}/out"
+          )
+          TARBALL="$(ls "${STAGE}/out")"
+          mkdir -p dist-tarball
+          cp "${STAGE}/out/${TARBALL}" "dist-tarball/${TARBALL}"
+          echo "Packed contents:"
+          tar -tzf "dist-tarball/${TARBALL}"
+          echo "tarball=${TARBALL}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: opencode-plugin-tarball
+          path: dist-tarball/
+          if-no-files-found: error
+          retention-days: 7
+
+  # id-token is granted here only. This job runs none of the repository's code, so nothing in the build can obtain an
+  # OIDC token; it publishes the tarball verify produced.
+  publish:
+    name: publish (npm trusted publishing)
+    needs: verify
+    if: ${{ !cancelled() && needs.verify.result == 'success' && needs.verify.outputs.dry_run != 'true' }}
+    runs-on: ubuntu-24.04
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Download tarball
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: opencode-plugin-tarball
+          path: dist-tarball
+
+      - name: Setup Node.js (for npm trusted publishing via OIDC)
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Check npm supports trusted publishing
+        run: |
+          version="$(npm --version)"
+          node -e 'const [a, b, c] = process.argv[1].split(".").map(Number); process.exit(a > 11 || (a === 11 && (b > 5 || (b === 5 && c >= 1))) ? 0 : 1)' "$version" \
+            || { echo "::error::npm ${version} is older than 11.5.1, which trusted publishing requires"; exit 1; }
+
+      - name: Publish to npm (trusted publishing)
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          TARBALL: ${{ needs.verify.outputs.tarball }}
+        run: |
+          set -euo pipefail
+          if npm view "@fro.bot/opencode-plugin@${VERSION}" version >/dev/null 2>&1; then
+            echo "Already published: @fro.bot/opencode-plugin@${VERSION}; skipping"
+            exit 0
+          fi
+
+          case "${VERSION}" in
+            *-*) DIST_TAG="next" ;;
+            *) DIST_TAG="latest" ;;
+          esac
+
+          echo "Publishing @fro.bot/opencode-plugin@${VERSION} (dist-tag ${DIST_TAG})..."
+          npm publish "./dist-tarball/${TARBALL}" --tag "${DIST_TAG}"
