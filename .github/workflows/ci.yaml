@@ -708,7 +708,7 @@ jobs:
           body=''
           ready=false
           for _ in $(seq 1 90); do
-            if body="$(docker exec "$cid" curl -fsS http://127.0.0.1:9100/readyz 2>/dev/null)"; then
+            if body="$(docker exec "$cid" curl -fsS --max-time 5 http://127.0.0.1:9100/readyz 2>/dev/null)"; then
               ready=true
               break
             fi
