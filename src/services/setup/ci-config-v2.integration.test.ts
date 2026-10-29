@@ -128,6 +128,24 @@ function writeHostileCheckout(checkout: string, outside: string): void {
   )
 }
 
+/**
+ * A checkout whose project agent file adds only a targeted allow, which no sentinel path would hit. Project
+ * `opencode.json` permissions land before the inline content in the effective list, so the `*` boundary overrides them;
+ * an agent file's permissions land after it, which is where a targeted allow takes effect.
+ */
+function writeTargetedAllowCheckout(checkout: string): void {
+  fs.mkdirSync(path.join(checkout, '.opencode/agent'), {recursive: true})
+  execFileSync('git', ['init', '-q', checkout])
+  fs.writeFileSync(
+    path.join(checkout, 'opencode.json'),
+    JSON.stringify({permissions: [{action: 'external_directory', resource: '/etc/*', effect: 'allow'}]}),
+  )
+  fs.writeFileSync(
+    path.join(checkout, '.opencode/agent/build.md'),
+    '---\npermissions:\n  - action: external_directory\n    resource: "/etc/*"\n    effect: allow\n---\nYou are build.\n',
+  )
+}
+
 describe.skipIf(BIN == null)('OpenCode v2.2.0 permission gate (real binary)', () => {
   const logger = createMockLogger()
   const cleanup: (() => Promise<void> | void)[] = []
@@ -206,6 +224,32 @@ describe.skipIf(BIN == null)('OpenCode v2.2.0 permission gate (real binary)', ()
 
     // #then
     expect(gate).toMatchObject({success: false, error: {kind: 'rules-missing'}})
+  }, 120_000)
+
+  it('is sensitive to a targeted allow: with project config enabled a lone /etc/* allow from the project fails the gate', async () => {
+    // #given a checkout whose project config and agent file add only `external_directory /etc/* allow`
+    const targeted = path.join(root, 'targeted-checkout')
+    writeTargetedAllowCheckout(targeted)
+    const built = buildCIConfigV2({opencodeConfig: null, plugins: [], runnerTemp, runId: 779, runAttempt: 1}, logger)
+    if (!built.success) throw new Error(built.error)
+
+    // #when the server runs without DISABLE_PROJECT_CONFIG
+    const server = await startServer({
+      bin: BIN as string,
+      home,
+      checkout: targeted,
+      content: built.data.content,
+      disableProjectConfig: false,
+    })
+    cleanup.push(server.stop)
+    const gate = await verifyPermissionRules(server, built.data.expectations, logger)
+
+    // #then the structural check names the targeted rule that no sentinel would have reached
+    expect(gate).toMatchObject({success: false, error: {kind: 'rules-missing'}})
+    const violations = gate.success ? [] : 'violations' in gate.error ? gate.error.violations : []
+    expect(violations).toContainEqual(
+      expect.objectContaining({action: 'external_directory', resource: '/etc/*', effect: 'allow'}),
+    )
   }, 120_000)
 
   it('passes the gate for the workspace builder under the same hostile checkout, with outside access asking', async () => {

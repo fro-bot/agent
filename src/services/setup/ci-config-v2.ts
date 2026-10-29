@@ -5,19 +5,14 @@ import type {Logger} from './types.js'
 import * as path from 'node:path'
 import {err, ok} from '@bfra.me/es/result'
 import {
-  ATTACHMENT_DIR_SEGMENT,
   buildAttachmentDir,
   buildConfigContentV2,
   buildPermissionRulesV2,
   buildResponseFileDir,
   buildResponseFileFallbackRoots,
   FORBIDDEN_TOOL_ACTIONS_V2,
-  OUTSIDE_SENTINEL_DIRECTORY,
   RESPONSE_FILE_DIR_SEGMENT,
 } from '@fro-bot/runtime'
-
-/** Sibling run id the gate evaluates to prove an exception stays scoped to this run. */
-const OTHER_RUN_SENTINEL = 'gate-sentinel-other-run'
 
 export interface CIConfigV2Inputs {
   /** The `opencode-config` action input, or null. */
@@ -92,7 +87,8 @@ function stripOperatorPermissions(operator: Record<string, unknown>, logger: Log
  *
  * Pure: the run identity and `RUNNER_TEMP` come in as inputs. The spawn sets `OPENCODE_DISABLE_PROJECT_CONFIG=1`.
  * The response-file and attachment directories are run-scoped and live outside the checkout, so a hostile checkout
- * cannot plant or read them; every other external directory stays denied.
+ * cannot plant or read them; every other external directory stays denied. Fails when `RUNNER_TEMP`, the run identity or
+ * the integration workdir would make an exception directory contain `*` or `?`, which the server reads as wildcards.
  */
 export function buildCIConfigV2(inputs: CIConfigV2Inputs, logger: Logger): Result<BuiltConfigV2, string> {
   let operator: Record<string, unknown> = {}
@@ -116,16 +112,11 @@ export function buildCIConfigV2(inputs: CIConfigV2Inputs, logger: Logger): Resul
   }
 
   const allowedDirectories: string[] = []
-  const outsideDirectories = [OUTSIDE_SENTINEL_DIRECTORY]
   const editDenyResources: string[] = []
 
   if (hasRunnerTemp) {
     const identity = {runnerTemp, runId: inputs.runId, runAttempt: inputs.runAttempt}
     allowedDirectories.push(buildResponseFileDir(identity), buildAttachmentDir(identity))
-    outsideDirectories.push(
-      path.join(runnerTemp, RESPONSE_FILE_DIR_SEGMENT, OTHER_RUN_SENTINEL),
-      path.join(runnerTemp, ATTACHMENT_DIR_SEGMENT, OTHER_RUN_SENTINEL),
-    )
     // Workspace-relative shadows of the response-file directory: the model must write the real one, never a copy in
     // the checkout.
     for (const root of buildResponseFileFallbackRoots(runnerTemp)) {
@@ -150,7 +141,8 @@ export function buildCIConfigV2(inputs: CIConfigV2Inputs, logger: Logger): Resul
     editDenyResources,
     denyQuestion: true,
   })
-  const base = buildConfigContentV2({plugins: [], rules})
+  if (!rules.success) return err(rules.error)
+  const base = buildConfigContentV2({plugins: [], rules: rules.data})
 
   const operatorPlugins = Array.isArray(operator.plugins)
     ? (operator.plugins as unknown[]).filter((plugin): plugin is string => typeof plugin === 'string')
@@ -172,7 +164,6 @@ export function buildCIConfigV2(inputs: CIConfigV2Inputs, logger: Logger): Resul
   return ok({
     content,
     expectations: {
-      outsideDirectories,
       outsidePolicy: 'deny',
       allowedDirectories,
       deniedActions: FORBIDDEN_TOOL_ACTIONS_V2,

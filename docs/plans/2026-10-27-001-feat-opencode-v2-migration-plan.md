@@ -205,7 +205,7 @@ V2 is a rewrite. It has a new `/api/*` HTTP API, new event names, a new client a
   - Because interrupting with reason `user` releases the claim, a normal shutdown saves a database with no held claims.
   - Stop confirmation never accepts an interrupt whose reason is `shutdown`.
 - **Plugin gate after spawn.** V2 skips a plugin that fails to load, and the server stays up. After spawn, both surfaces require the Systematic and fro-bot plugin IDs to be listed with status `active`. If either one is listed as `failed`, or is not listed at all, startup fails.
-- **The effective permissions are the source of truth for the deny check.** After spawn, each surface reads the effective per-agent rules from the server. It then evaluates sentinel paths outside the checkout and inside the response-file and attachment directories. The run fails if any agent that can run tools lacks the outside deny, or if any of those exceptions is missing. Project config is disabled in CI.
+- **The effective permissions are the source of truth for the deny check.** After spawn, each surface reads the effective per-agent rules from the server and checks every agent's rule list structurally. The boundary is the last `external_directory` rule whose resource is exactly `*`. Its effect must satisfy the surface policy, and every later matching rule must carry a permitted effect or sit on an authorized exception pattern. The run fails if any agent breaks this, or if any exception does not evaluate to `allow`. Project config is disabled in CI.
   - The gate checks that the rules exist, not that they are enforced. Probe P5 is the evidence that Code Mode enforces them for the pinned version.
 - **Restore precedence is unchanged.**
   - **Order:** S3 V2, then S3 V1, then the cache tiers: V2 branch, V1 branch, V2 repo, V1 repo.
@@ -255,7 +255,7 @@ V2 is a rewrite. It has a new `/api/*` HTTP API, new event names, a new client a
       event-v2.ts                        # V2 event to domain event mapper (U4)
       ledger-reconcile-v2.ts             # V2 LedgerReconcileAdapter (U4)
       subagent-notice.ts                 # metadata-based notice reader (U4)
-      permission-gate-v2.ts              # effective-rule sentinel evaluation (U5)
+      permission-gate-v2.ts              # structural boundary check over effective rules (U5)
 
 ## High-Level Technical Design
 
@@ -511,7 +511,7 @@ install pinned binary (digest) -> install plugins (bounded) -> write V2 config
   - in the Action only, `question` denied;
   - the session-move and worktree-create tools denied.
 - Project config is disabled in CI.
-- The gate reads effective per-agent rules from `GET /api/agent`. For every agent that can run tools, including subagents, it evaluates the outside-checkout, response-file and attachment sentinels. The Action requires `deny` outside the checkout. The workspace accepts `ask` or `deny`, never `allow`. A violated outside policy, a missing exception or a missing forbidden-tool deny fails startup.
+- The gate reads effective per-agent rules from `GET /api/agent`. For every agent, including subagents and agents that look tool-less, it finds the `external_directory` boundary and checks each later rule against the surface policy and the authorized exception patterns. The Action requires `deny` outside the checkout. The workspace accepts `ask` or `deny`, never `allow`. The two forbidden tools get the same check with no exceptions. A violated outside policy, a missing exception or a missing forbidden-tool deny fails startup.
 - The Action's no-pending-question guarantee has two parts: the config deny on `question`, and the runtime form-cancel in U12. The gate does not check for `question`.
 - The V2 managed config for the workspace is a separate file. The V1 file stays unchanged.
 

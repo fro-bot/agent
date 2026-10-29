@@ -99,7 +99,6 @@ export {
   buildPermissionRulesV2,
   externalDirectoryResource,
   FORBIDDEN_TOOL_ACTIONS_V2,
-  OUTSIDE_SENTINEL_DIRECTORY,
 } from './permission-rules-v2.js'
 export type {
   BuiltConfigV2,

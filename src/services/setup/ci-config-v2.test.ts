@@ -81,18 +81,13 @@ describe('buildCIConfigV2', () => {
       ])
     })
 
-    it('tells the gate to expect the exceptions and to check sibling run directories stay denied', () => {
+    it('tells the gate to expect the exceptions and the deny policy', () => {
       // #given / #when
       const {expectations} = build()
 
       // #then
       expect(expectations.allowedDirectories).toEqual([RESPONSE_DIR, ATTACHMENT_DIR])
       expect(expectations.outsidePolicy).toBe('deny')
-      expect(expectations.outsideDirectories).toEqual([
-        '/fro-bot-gate-sentinel/outside',
-        `${RUNNER_TEMP}/fro-bot-response/gate-sentinel-other-run`,
-        `${RUNNER_TEMP}/fro-bot-attachments/gate-sentinel-other-run`,
-      ])
       expect(expectations.deniedActions).toEqual(['opencode_session_move', 'opencode_worktree_create'])
     })
 
@@ -289,6 +284,24 @@ describe('buildCIConfigV2', () => {
     expect(result.success).toBe(false)
   })
 
+  describe('literal exception paths', () => {
+    it.each([
+      ['a ? in RUNNER_TEMP', {runnerTemp: '/home/runner/work/_temp?'}],
+      ['a * in RUNNER_TEMP', {runnerTemp: '/home/runner/*/_temp'}],
+      ['a * in the run id', {runId: '12*'}],
+      ['a ? in the run attempt', {runAttempt: '1?'}],
+      ['a ? in the integration workdir', {integrationWorkDir: `${RUNNER_TEMP}/integration?`}],
+      ['a * in the integration workdir', {integrationWorkDir: `${RUNNER_TEMP}/integration*`}],
+    ])('rejects %s instead of widening it into a grant', (_label, overrides) => {
+      // #given / #when
+      const result = buildCIConfigV2({...BASE_INPUTS, ...overrides}, createMockLogger())
+
+      // #then
+      expect(result.success).toBe(false)
+      expect(JSON.stringify(result)).toMatch(/wildcard/)
+    })
+  })
+
   describe('permission gate', () => {
     const BUILTIN_EXPLORE: readonly PermissionRuleV2[] = [
       {action: '*', resource: '*', effect: 'deny'},
@@ -315,6 +328,26 @@ describe('buildCIConfigV2', () => {
 
       // #then
       expect(result.success).toBe(true)
+    })
+
+    it('fails for a later targeted external_directory allow on any agent', async () => {
+      // #given
+      const {content, expectations} = build()
+      const hostile = [...permissionsOf(content), {action: 'external_directory', resource: '/etc/*', effect: 'allow'}]
+      const agents = [
+        {id: 'build', permissions: [{action: '*', resource: '*', effect: 'allow'}, ...permissionsOf(content)]},
+        {id: 'explore', permissions: [...BUILTIN_EXPLORE, ...hostile]},
+      ]
+
+      // #when
+      const result = await verifyPermissionRules(
+        {listAgents: async () => ({location: {}, data: agents})},
+        expectations,
+        createMockLogger(),
+      )
+
+      // #then
+      expect(result).toMatchObject({success: false, error: {kind: 'rules-missing'}})
     })
 
     it('fails for a subagent that never received the rules', async () => {

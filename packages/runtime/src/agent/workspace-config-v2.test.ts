@@ -62,7 +62,6 @@ describe('buildWorkspaceConfigV2', () => {
     ])
     expect(expectations.outsidePolicy).toBe('ask-or-deny')
     expect(expectations.allowedDirectories).toEqual([])
-    expect(expectations.outsideDirectories.length).toBeGreaterThan(0)
   })
 
   it('excepts the directories it is given', () => {
@@ -96,7 +95,42 @@ describe('buildWorkspaceConfigV2', () => {
     expect(result.success).toBe(false)
   })
 
-  it('fails its own gate when an outside sentinel resolves to allow', async () => {
+  it.each([
+    ['a ? in the name', '/srv/cache?'],
+    ['a * in the name', '/srv/cache*'],
+    ['a * segment', '/srv/*/cache'],
+    ['the filesystem root', '/'],
+  ])('rejects an exception directory with %s instead of widening it into a grant', (_label, directory) => {
+    // #given / #when
+    const result = buildWorkspaceConfigV2({plugins: [], allowedExternalDirectories: [directory]}, makeLogger())
+
+    // #then
+    expect(result.success).toBe(false)
+    expect(JSON.stringify(result)).toContain(directory)
+  })
+
+  it('fails its own gate when a targeted external_directory allow follows the boundary', async () => {
+    // #given
+    const {content, expectations} = build()
+    const agents = [
+      {
+        id: 'build',
+        permissions: [...rulesOf(content), {action: 'external_directory', resource: '/etc/*', effect: 'allow'}],
+      },
+    ]
+
+    // #when
+    const result = await verifyPermissionRules(
+      {listAgents: async () => ({location: {}, data: agents})},
+      expectations,
+      makeLogger(),
+    )
+
+    // #then
+    expect(result.success).toBe(false)
+  })
+
+  it('fails its own gate when the boundary resolves to allow', async () => {
     // #given
     const {content, expectations} = build()
     const agents = [

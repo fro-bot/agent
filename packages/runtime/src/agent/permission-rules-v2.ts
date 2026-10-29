@@ -12,7 +12,11 @@
  * Spawns must also set `OPENCODE_DISABLE_PROJECT_CONFIG=1`.
  */
 
+import type {Result} from '@bfra.me/es/result'
 import type {PermissionGateExpectations} from './permission-gate-v2.js'
+
+import * as path from 'node:path'
+import {err, ok} from '@bfra.me/es/result'
 
 export type PermissionEffectV2 = 'allow' | 'ask' | 'deny'
 
@@ -26,12 +30,27 @@ export interface PermissionRuleV2 {
 /** Permission action names of the Code Mode `opencode` tools that move a session or create a worktree. */
 export const FORBIDDEN_TOOL_ACTIONS_V2 = ['opencode_session_move', 'opencode_worktree_create'] as const
 
-/** Sentinel directory outside every checkout and every allowed directory. */
-export const OUTSIDE_SENTINEL_DIRECTORY = '/fro-bot-gate-sentinel/outside'
-
 /** The resource the server asks about for a file in `directory` (`core/src/file-access.ts` `resolve`). */
 export function externalDirectoryResource(directory: string): string {
   return `${directory.replaceAll('\\', '/').replace(/\/+$/, '')}/*`
+}
+
+/**
+ * An exception directory becomes the pattern `<dir>/*`, and the server reads `*` and `?` in a pattern as wildcards.
+ * So a directory must be a literal, absolute path: `/srv/cache?` would otherwise also grant `/srv/cache1/*`.
+ * The filesystem root is refused because `/` normalizes to the pattern `/*`, which matches every path.
+ */
+function validateExceptionDirectory(directory: string): Result<string, string> {
+  if (!path.isAbsolute(directory)) {
+    return err(`Exception directories must be absolute paths, got: ${directory}`)
+  }
+  if (/[*?]/.test(directory)) {
+    return err(`Exception directories must not contain the wildcard characters * or ?, got: ${directory}`)
+  }
+  if (directory.replaceAll('\\', '/').replace(/\/+$/, '') === '') {
+    return err(`Exception directories must not be the filesystem root, got: ${directory}`)
+  }
+  return ok(directory)
 }
 
 export interface PermissionRulesInput {
@@ -47,8 +66,14 @@ export interface PermissionRulesInput {
 
 /**
  * The ordered rule list. Order matters: the specific allows come after the `*` outside rule they carve out of.
+ * Fails when an exception directory is not a literal absolute path (see `validateExceptionDirectory`).
  */
-export function buildPermissionRulesV2(input: PermissionRulesInput): readonly PermissionRuleV2[] {
+export function buildPermissionRulesV2(input: PermissionRulesInput): Result<readonly PermissionRuleV2[], string> {
+  for (const directory of input.allowedExternalDirectories) {
+    const valid = validateExceptionDirectory(directory)
+    if (!valid.success) return valid
+  }
+
   const rules: PermissionRuleV2[] = [{action: 'external_directory', resource: '*', effect: input.outsideEffect}]
 
   for (const directory of input.allowedExternalDirectories) {
@@ -76,7 +101,7 @@ export function buildPermissionRulesV2(input: PermissionRulesInput): readonly Pe
     rules.push({action, resource: '*', effect: 'deny'})
   }
 
-  return rules
+  return ok(rules)
 }
 
 export interface ConfigContentInput {
