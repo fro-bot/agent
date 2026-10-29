@@ -698,6 +698,8 @@ function isReadyzResponse(value: unknown): value is ReadyzResponse {
   if (typeof value !== 'object' || value === null) return false
   const v = value as Record<string, unknown>
   if (typeof v.ready !== 'boolean') return false
+  // The version is optional, but a present value that is not a string cannot select a run loop: reject the body.
+  if (v.opencodeVersion !== undefined && typeof v.opencodeVersion !== 'string') return false
   if (v.ready === true) {
     return v.opencode === 'ready'
   }

@@ -37,6 +37,46 @@ describe('WorkspaceClient.readyz', () => {
       vi.unstubAllGlobals()
     })
 
+    it('carries the OpenCode version the workspace reports, which selects the run loop', async () => {
+      // #given
+      const client = makeClient()
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockResolvedValue({
+          ok: true,
+          status: 200,
+          json: async () => ({ready: true, opencode: 'ready', opencodeVersion: '2.2.0'}),
+        }),
+      )
+
+      // #when
+      const result = await client.readyz()
+
+      // #then
+      expect(result).toEqual(ok({ready: true, opencode: 'ready', opencodeVersion: '2.2.0'}))
+      vi.unstubAllGlobals()
+    })
+
+    it('rejects a body whose version is not a string, rather than guess a run loop', async () => {
+      // #given
+      const client = makeClient()
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockResolvedValue({
+          ok: true,
+          status: 200,
+          json: async () => ({ready: true, opencode: 'ready', opencodeVersion: 2}),
+        }),
+      )
+
+      // #when
+      const result = await client.readyz()
+
+      // #then
+      expect(result.success).toBe(false)
+      vi.unstubAllGlobals()
+    })
+
     it('gETs /readyz on the same base URL as /clone', async () => {
       // #given
       const client = makeClient()
