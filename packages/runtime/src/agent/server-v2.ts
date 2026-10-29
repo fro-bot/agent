@@ -165,6 +165,12 @@ export interface StartOpenCodeV2ServerOptions {
   readonly env?: NodeJS.ProcessEnv
   /** Default: a free loopback port picked here. */
   readonly port?: number
+  /**
+   * Run the child as this uid and gid (POSIX). The workspace service is root and the server must not be. Both or
+   * neither: when the spawn cannot take the identity it fails (`spawn-failed`), never falling back to the caller's.
+   */
+  readonly uid?: number
+  readonly gid?: number
   readonly timeouts?: Partial<OpenCodeV2Timeouts>
   /**
    * The caller's deadline, honoured for the server's whole life. Aborting during startup fails the start. Aborting
@@ -366,6 +372,10 @@ export async function startOpenCodeV2Server(
   if (options.port !== undefined && !isValidPort(options.port)) {
     return err(startError('invalid-options', 'The OpenCode V2 server port is out of range'))
   }
+  // A uid without a gid would keep the caller's group, which is half a privilege drop.
+  if ((options.uid === undefined) !== (options.gid === undefined)) {
+    return err(startError('invalid-options', 'The OpenCode V2 server uid and gid must be given together'))
+  }
 
   // Per spawn, never reused and never logged. 256 random bits.
   const password = randomBytes(32).toString('base64url')
@@ -404,14 +414,29 @@ export async function startOpenCodeV2Server(
   // A self-update would replace the digest-verified binary mid-run.
   childEnv.OPENCODE_DISABLE_AUTOUPDATE = '1'
 
-  const child = spawn(options.binaryPath, ['serve', '--stdio', '--hostname', LOOPBACK, '--port', String(port)], {
-    cwd: options.directory,
-    env: childEnv,
-    // A held pipe: with 'ignore' the server exits after about 150 ms (P15). stderr is not captured because the
-    // server may echo config content, which can hold provider credentials.
-    stdio: ['pipe', 'pipe', 'ignore'],
-    detached: process.platform !== 'win32',
-  })
+  let child: ChildProcess
+  try {
+    child = spawn(options.binaryPath, ['serve', '--stdio', '--hostname', LOOPBACK, '--port', String(port)], {
+      cwd: options.directory,
+      env: childEnv,
+      // A held pipe: with 'ignore' the server exits after about 150 ms (P15). stderr is not captured because the
+      // server may echo config content, which can hold provider credentials.
+      stdio: ['pipe', 'pipe', 'ignore'],
+      detached: process.platform !== 'win32',
+      ...(options.uid === undefined ? {} : {uid: options.uid}),
+      ...(options.gid === undefined ? {} : {gid: options.gid}),
+    })
+  } catch (error) {
+    // Node throws synchronously for a uid or gid the process may not take (EPERM). The password is in the env
+    // that was passed, so only the code is reported.
+    const code = (error as NodeJS.ErrnoException).code
+    const failure = startError(
+      'spawn-failed',
+      `Failed to spawn the OpenCode V2 binary${code === undefined ? '' : ` (${code})`}`,
+    )
+    logger.warning('OpenCode V2 server start failed', {kind: failure.kind})
+    return err(failure)
+  }
   const state = trackChild(child)
   // The server closing its end of the pipe at exit raises EPIPE on a late write; there is nothing to do about it.
   child.stdin?.on('error', () => undefined)
