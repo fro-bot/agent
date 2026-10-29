@@ -63,7 +63,8 @@ Symbols verified against the live source tree. Where a symbol has moved to `pack
 | `createRemoteQuestionClient` | Function | `packages/runtime/src/agent/remote-question-client.ts` | v2-SDK `question` reply/reject client |
 | `TriggerDirective` | Interface | `packages/runtime/src/agent/prompt.ts` | Directive + appendMode for triggers |
 | `DEFAULT_SYSTEMATIC_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned Systematic version |
-| `DEFAULT_OPENCODE_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned harness build version |
+| `DEFAULT_OPENCODE_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned harness build (Action default; not the workspace image's) |
+| `opencode-v2-pin.json` | JSON | `packages/runtime/src/shared/opencode-v2-pin.json` | Stock V2 version + asset sha256 |
 
 ### `packages/gateway/`
 
@@ -300,7 +301,8 @@ Per-repo S3 conditional-write locks (`If-None-Match` / `If-Match`) built by `get
 
 - Root `session.idle` with a non-empty ledger enters drain. The drain-completion gate (`execute/drain-completion.ts`) requires each child's notice, current-generation root idle, and a REST-confirmed terminal root reply. Reconciliation settles tracked entries only; it never adopts.
 - Teardown settles through `settleOwnedSessions`; an unconfirmed root or child means `quarantined` (held lock, no slot hand-off).
-- `deploy/plugins/no-task-reuse.mjs` rejects any `task` call with a non-empty `task_id`, so each background job has its own child session.
+- `deploy/plugins/no-task-reuse.mjs` rejects any `task` call with a non-empty `task_id`, so each background job has its own child session. On V2 the `@fro.bot/opencode-plugin` guard does this.
+- Each run picks its loop from the workspace's `/readyz` `opencodeVersion`: V1 `run-core.ts`, V2 `run-core-v2.ts` (with the `-v2` drain and settle modules).
 
 > See also: [Background Subagents and Ownership](docs/wiki/Background%20Subagents%20and%20Ownership.md#background-subagent-ownership-ledger-gateway)
 

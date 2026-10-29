@@ -654,6 +654,101 @@ jobs:
           # watcher assertion above: nothing else asserts it, so pin it here.
           docker exec "$cid" sh -c '[ "$OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS" = "true" ]'
           echo "OK: clone API up on :9100, opencode present, base config (no baked model), watcher disabled, background subagents enabled, auth fail-soft"
+      - name: Build workspace Docker image (OpenCode V2)
+        run: |
+          # The V2 leg of this job. The Dockerfile selects the stock V2 binary when OPENCODE_VERSION
+          # has major 2 or higher; the only valid value is the pin, so it is read from the pin file
+          # (never hard-coded here) and bumps in one place. Every stage before the OpenCode version
+          # is shared with the V1 build above and comes from this runner's layer cache.
+          v2_version="$(node -p 'JSON.parse(fs.readFileSync("packages/runtime/src/shared/opencode-v2-pin.json", "utf8")).version')"
+          echo "V2 pin: ${v2_version}"
+          for attempt in 1 2 3; do
+            if docker build --build-arg "OPENCODE_VERSION=${v2_version}" -f deploy/workspace.Dockerfile -t fro-bot-workspace:smoke-v2 .; then
+              exit 0
+            fi
+            echo "::warning::docker build (V2) attempt ${attempt} failed"
+            [ "${attempt}" -eq 3 ] && { echo "docker build (V2) failed after 3 attempts"; exit 1; }
+            sleep $((attempt * 15))
+          done
+      - name: Smoke-test workspace image (OpenCode V2 boots through its entrypoint, no network)
+        run: |
+          set -euo pipefail
+          v2_version="$(node -p 'JSON.parse(fs.readFileSync("packages/runtime/src/shared/opencode-v2-pin.json", "utf8")).version')"
+          case "${v2_version}" in
+            [2-9].*|[1-9][0-9]*.*) : ;;
+            *) echo "opencode-v2-pin.json version is not a V2 version: ${v2_version}" >&2; exit 1 ;;
+          esac
+
+          # 1. The stock musl binary starts as the agent uid with NO network, and both plugins load
+          #    from the image's cache and report active. Plugin specs come from the runtime pins, the
+          #    same values the Dockerfile installs (workspace-v2-image.test.mjs pins ARG == constant).
+          systematic_version="$(node -e "const m=fs.readFileSync('packages/runtime/src/shared/constants.ts','utf8').match(/DEFAULT_SYSTEMATIC_VERSION\s*=\s*'([^']+)'/); if(!m) process.exit(1); process.stdout.write(m[1])")"
+          plugin_version="$(node -e "const m=fs.readFileSync('packages/runtime/src/shared/constants.ts','utf8').match(/FRO_BOT_PLUGIN_VERSION\s*=\s*'([^']+)'/); if(!m) process.exit(1); process.stdout.write(m[1])")"
+          docker run --rm --network none --user 10001:10001 \
+            -e HOME=/home/opencode -e XDG_CONFIG_HOME=/home/opencode/.config \
+            -e XDG_DATA_HOME=/home/opencode/.local/share -e XDG_CACHE_HOME=/home/opencode/.cache \
+            -e XDG_STATE_HOME=/home/opencode/.local/state \
+            -v "$PWD/deploy/scripts/v2-image-smoke.mjs:/smoke.mjs:ro" \
+            --entrypoint node fro-bot-workspace:smoke-v2 /smoke.mjs \
+            "@fro.bot/systematic@${systematic_version}" "@fro.bot/opencode-plugin@${plugin_version}"
+
+          # 2. The real entrypoint, with the production security posture and no network. /readyz is 200
+          #    only after the supervisor's plugin gate (systematic + fro-bot.opencode-plugin active) and
+          #    permission gate pass, and it echoes the version the gateway selects its V2 loop from.
+          #    Readiness needs no provider and no network: the plugins are installed at image build.
+          cid="$(docker run -d --network none \
+            -e WORKSPACE_OPENCODE_TOKEN=dummy-smoke-token \
+            -e MITMPROXY_CA_WAIT_SECONDS=0 \
+            -e NO_PROXY='*' \
+            $WORKSPACE_DOCKER_SECURITY_FLAGS \
+            fro-bot-workspace:smoke-v2)"
+          cleanup() { docker rm -f "$cid" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+
+          body=''
+          ready=false
+          for _ in $(seq 1 90); do
+            if body="$(docker exec "$cid" curl -fsS http://127.0.0.1:9100/readyz 2>/dev/null)"; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          # Read the logs once: a `docker logs | grep -q` pipeline can SIGPIPE under pipefail.
+          logs="$(docker logs "$cid" 2>&1)"
+          echo "--- workspace logs ---"
+          echo "${logs}"
+          if [ "${ready}" != "true" ]; then
+            echo "REGRESSION: /readyz did not return 200 within 90s on the V2 image"
+            exit 1
+          fi
+          echo "/readyz: ${body}"
+          echo "${body}" | node -e '
+            const body = JSON.parse(fs.readFileSync(0, "utf8"))
+            if (body.ready !== true || body.opencode !== "ready" || body.opencodeVersion !== process.argv[1]) {
+              console.error("unexpected /readyz body for the V2 pin " + process.argv[1])
+              process.exit(1)
+            }
+          ' "${v2_version}"
+          echo "${logs}" | grep -q "opencode-server-v2: ready"
+          if echo "${logs}" | grep -q "ERR_MODULE_NOT_FOUND"; then
+            echo "REGRESSION: module resolution failed (ERR_MODULE_NOT_FOUND)"
+            exit 1
+          fi
+
+          # 3. The binary is stock V2 at the pin: no +harness build.
+          oc_version="$(docker exec "$cid" opencode --version)"
+          echo "opencode --version: ${oc_version}"
+          if echo "${oc_version}" | grep -qF "harness"; then
+            echo "REGRESSION: V2 image reports a harness build: ${oc_version}"
+            exit 1
+          fi
+          reported="${oc_version#opencode }"
+          if [ "${reported#v}" != "${v2_version}" ]; then
+            echo "REGRESSION: expected OpenCode ${v2_version}, got: ${oc_version}"
+            exit 1
+          fi
+          echo "OK: V2 image ready on ${oc_version}, plugins active, no network"
       - name: Smoke-test auth provisioning (valid blob → auth.json written 0600)
         run: |
           set -e
