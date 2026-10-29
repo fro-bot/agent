@@ -15,6 +15,7 @@ import {
 } from './cache-key.js'
 import {
   buildCachePaths,
+  buildCachePathsV1Sqlite,
   buildCachePathsV2,
   buildDbFamilyPaths,
   buildDbShmPath,
@@ -311,7 +312,12 @@ async function planCacheRestore(
   generation: SessionGeneration,
 ): Promise<CacheRestorePlan> {
   const {components, logger, storagePath, projectIdPath, opencodeVersion} = options
-  const v1Paths = await buildCachePaths(storagePath, projectIdPath, opencodeVersion)
+  // A V2 run's V1 fallback tiers look up entries a V1 SQLite run saved, so their path list is the V1 SQLite list
+  // outright, never derived from the V2 version string.
+  const v1Paths =
+    generation === 'v2'
+      ? buildCachePathsV1Sqlite(storagePath, projectIdPath)
+      : await buildCachePaths(storagePath, projectIdPath, opencodeVersion)
   const v2Paths = generation === 'v2' ? buildCachePathsV2(storagePath, projectIdPath) : v1Paths
   const tiers = buildRestoreTiers(components, generation)
   const plan: CacheRestorePlan = {

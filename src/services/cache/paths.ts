@@ -126,15 +126,28 @@ export async function buildCachePaths(
   projectIdPath: string | undefined,
   opencodeVersion: string | null | undefined,
 ): Promise<string[]> {
+  if (await isSqliteBackend(opencodeVersion ?? null)) {
+    return buildCachePathsV1Sqlite(storagePath, projectIdPath)
+  }
   const paths = [storagePath]
   if (projectIdPath != null) {
     paths.push(projectIdPath)
   }
-  if (await isSqliteBackend(opencodeVersion ?? null)) {
-    const dbDir = path.dirname(storagePath)
-    const dbPath = path.join(dbDir, DB_MAIN_BASENAME)
-    paths.push(dbPath)
+  return paths
+}
+
+/**
+ * The path list a V1 SQLite save writes, built without consulting any version. A V2 run restoring its V1 fallback
+ * tiers needs exactly this list: those tiers look up entries a V1 SQLite run saved, and `@actions/cache` hashes the
+ * path list into the entry version. Deriving it from the V2 version string instead is wrong (a `v2.2.0` input
+ * parses as NaN in `isSqliteBackend` and drops the database path).
+ */
+export function buildCachePathsV1Sqlite(storagePath: string, projectIdPath: string | undefined): string[] {
+  const paths = [storagePath]
+  if (projectIdPath != null) {
+    paths.push(projectIdPath)
   }
+  paths.push(path.join(path.dirname(storagePath), DB_MAIN_BASENAME))
   return paths
 }
 

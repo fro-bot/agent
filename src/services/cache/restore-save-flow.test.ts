@@ -3,9 +3,11 @@ import type {Logger} from '../../shared/logger.js'
 import type {CacheKeyComponents} from './cache-key.js'
 import {Buffer} from 'node:buffer'
 import * as fs from 'node:fs/promises'
+import {createRequire} from 'node:module'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import {DatabaseSync} from 'node:sqlite'
+import {fileURLToPath} from 'node:url'
 import * as core from '@actions/core'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {err, ok} from '../../shared/types.js'
@@ -34,6 +36,17 @@ const testStoreConfig: ObjectStoreConfig = {
   bucket: 'test-bucket',
   region: 'us-east-1',
   prefix: 'fro-bot-state',
+}
+
+// `getCacheVersion` is not in @actions/cache's exports map, so load it from the resolved package directory
+// (paths.test.ts loads it the same way).
+function loadGetCacheVersion(): (paths: string[]) => string {
+  const cacheUtilsPath = path.join(
+    path.dirname(fileURLToPath(import.meta.resolve('@actions/cache'))),
+    'internal/cacheUtils.js',
+  )
+  const cacheUtils = createRequire(import.meta.url)(cacheUtilsPath) as {getCacheVersion: (paths: string[]) => string}
+  return cacheUtils.getCacheVersion
 }
 
 function createTestLogger(): Logger {
@@ -770,26 +783,54 @@ describe('restore/save flow across session generations', () => {
       expect((await fs.stat(storagePath)).isDirectory()).toBe(true)
     })
 
-    it("asks each tier with that generation's own primary key and path list", async () => {
-      // #given an empty cache and a project id path
-      const cache = createTieredCacheAdapter()
-      const projectIdPath = path.join(tempDir, '.git', 'opencode')
+    it.each(['2.2.0', 'v2.2.0'])(
+      "asks each tier with that generation's own primary key and path list for %s",
+      async v2Version => {
+        // #given an empty cache, a project id path, and the path list a current V1 SQLite save writes
+        const cache = createTieredCacheAdapter()
+        const projectIdPath = path.join(tempDir, '.git', 'opencode')
+        const v1SaveCache = createTieredCacheAdapter()
+        await fs.mkdir(storagePath, {recursive: true})
+        await fs.writeFile(dbPath, 'v1-run-db', 'utf8')
+        await saveCache({
+          components: testComponents,
+          runId: 1,
+          logger: createTestLogger(),
+          storagePath,
+          authPath,
+          projectIdPath,
+          opencodeVersion: '1.19.4',
+          cacheAdapter: v1SaveCache.adapter,
+        })
+        const v1SavePaths = v1SaveCache.saveCache.mock.calls[0]?.[0] ?? []
 
-      // #when a V2 run restores
-      await restoreCache({...restoreOptions('2.2.0', cache.adapter), projectIdPath})
+        // #when a V2 run restores
+        await restoreCache({...restoreOptions(v2Version, cache.adapter), projectIdPath})
 
-      // #then the V2 tiers use the V2 primary key and the V1 tiers use the V1 primary key
-      const primaryKeys = cache.restoreCache.mock.calls.map(([, primaryKey]) => primaryKey)
-      expect(primaryKeys).toEqual([
-        'opencode-v2-storage-github-owner-repo-main-Linux',
-        'opencode-storage-github-owner-repo-main-Linux',
-        'opencode-v2-storage-github-owner-repo-main-Linux',
-        'opencode-storage-github-owner-repo-main-Linux',
-      ])
-      for (const [paths] of cache.restoreCache.mock.calls) {
-        expect(paths).toEqual([storagePath, projectIdPath, dbPath])
-      }
-    })
+        // #then the V2 tiers use the V2 primary key and the V1 tiers use the V1 primary key
+        const primaryKeys = cache.restoreCache.mock.calls.map(([, primaryKey]) => primaryKey)
+        expect(primaryKeys).toEqual([
+          'opencode-v2-storage-github-owner-repo-main-Linux',
+          'opencode-storage-github-owner-repo-main-Linux',
+          'opencode-v2-storage-github-owner-repo-main-Linux',
+          'opencode-storage-github-owner-repo-main-Linux',
+        ])
+        for (const [paths] of cache.restoreCache.mock.calls) {
+          expect(paths).toEqual([storagePath, projectIdPath, dbPath])
+        }
+
+        // #then each V1 tier asks for the entry version a V1 SQLite save writes, so it can match an existing entry
+        expect(v1SavePaths).toEqual([storagePath, projectIdPath, dbPath])
+        const getCacheVersion = loadGetCacheVersion()
+        const v1TierCalls = cache.restoreCache.mock.calls.filter(
+          ([, primaryKey]) => primaryKey === 'opencode-storage-github-owner-repo-main-Linux',
+        )
+        expect(v1TierCalls).toHaveLength(2)
+        for (const [paths] of v1TierCalls) {
+          expect(getCacheVersion(paths)).toBe(getCacheVersion([...v1SavePaths]))
+        }
+      },
+    )
 
     it('makes exactly one V1 call, with V1 keys only, when there is no V2 version state', async () => {
       // #given a cache that misses, and each form of "no V2 version state"
