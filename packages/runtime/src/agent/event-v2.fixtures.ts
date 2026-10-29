@@ -543,3 +543,286 @@ export const SUBAGENT_PROMPT_FAILED_FRAME = frame('session.tool.failed', {
   metadata: SUBAGENT_BACKGROUND_METADATA,
   executed: false,
 })
+
+// --- Background `shell` jobs: captured on stock v2.2.0 (bgshell probes p20 and p22) -----------------------------------
+//
+// Captured verbatim from `/tmp/v2-plan/bgshell/logs/p20.sse.raw.jsonl` and `p22-0.sse.raw.jsonl` (same binary, sha256
+// `c71b1cd9…db3d`). `data` is untouched, including ids and paths. Only the envelope `location` is kept where the
+// capture had it. The user-shell notice and the unreadable variants are derived and labelled so.
+
+export const SHELL_SESSION_ID = 'ses_e7a179c05ffeZRtvviWr7imnQn'
+export const SHELL_ID = 'sh_185e8678e001OVuLXzTBhwDmUx'
+export const SHELL_CALL_ID = 'call_2_0'
+export const SHELL_DIRECTORY = '/tmp/v2-plan/bgshell/work/p20-repo'
+export const SHELL_COMMAND =
+  'sleep 8 && echo job-output-line && touch /tmp/v2-plan/bgshell/work/p20-repo/p20-marker.txt'
+
+const SHELL_TOOL_ENVELOPE = {
+  sessionID: SHELL_SESSION_ID,
+  assistantMessageID: 'msg_185e8672c001GymJIPp1OAqSng',
+  id: SHELL_CALL_ID,
+} as const
+
+/** p20: the model's call. `input.background` is how a backgrounded launch reads before it runs. */
+export const SHELL_TOOL_CALLED_FRAME = {
+  id: 'evt_185e867530029x6liDzri4mZnq',
+  created: 1793247962963,
+  type: 'session.tool.called',
+  location: {directory: SHELL_DIRECTORY},
+  data: {...SHELL_TOOL_ENVELOPE, input: {command: SHELL_COMMAND, background: true}, executed: false},
+} as const
+
+/** p20: ephemeral (no `durable` envelope), the full `Shell.Info` of the new shell, owner in `info.metadata.sessionID`. */
+export const SHELL_CREATED_FRAME = {
+  id: 'evt_185e86791001Xju8nWQr5akQeZ',
+  created: 1793247963025,
+  type: 'shell.created',
+  location: {directory: SHELL_DIRECTORY},
+  data: {
+    info: {
+      id: SHELL_ID,
+      status: 'running',
+      command: SHELL_COMMAND,
+      cwd: SHELL_DIRECTORY,
+      shell: '/bin/zsh',
+      file: '/tmp/v2-plan/bgshell/work/p20/home/.local/share/opencode/shell/61bfacef230eefd6f7413bab7af63a82ae4dffc2/sh_185e8678e001OVuLXzTBhwDmUx.out',
+      metadata: {sessionID: SHELL_SESSION_ID},
+      time: {started: 1793247963022},
+    },
+  },
+} as const
+
+/** p20: `context.progress({shellID})`, emitted for foreground and background calls alike. */
+export const SHELL_TOOL_PROGRESS_FRAME = {
+  id: 'evt_185e86791002aufEhTIkaoTZgN',
+  created: 1793247963025,
+  type: 'session.tool.progress',
+  location: {directory: SHELL_DIRECTORY},
+  data: {...SHELL_TOOL_ENVELOPE, metadata: {shellID: SHELL_ID}},
+} as const
+
+/** p20: the success of the backgrounded call. `metadata.status` is `running`; there is no `jobID`, only `shellID`. */
+export const SHELL_BACKGROUND_SUCCESS_FRAME = {
+  id: 'evt_185e867920015svLVO3obT1Qz7',
+  created: 1793247963026,
+  type: 'session.tool.success',
+  location: {directory: SHELL_DIRECTORY},
+  data: {
+    ...SHELL_TOOL_ENVELOPE,
+    content: [
+      {
+        type: 'text',
+        text: 'Command moved to the background (shell ID: sh_185e8678e001OVuLXzTBhwDmUx).\nOutput is streaming to: /tmp/v2-plan/bgshell/work/p20/home/.local/share/opencode/shell/61bfacef230eefd6f7413bab7af63a82ae4dffc2/sh_185e8678e001OVuLXzTBhwDmUx.out',
+      },
+      {
+        type: 'text',
+        text: "You will be notified automatically when the command finishes. The notification will include the command's output.",
+      },
+    ],
+    metadata: {status: 'running', truncated: false, shellID: SHELL_ID},
+    executed: false,
+  },
+  durable: {aggregateID: SHELL_SESSION_ID, seq: 12, version: 2},
+} as const
+
+/**
+ * Derived: the success of a FOREGROUND `shell` call. A foreground call returns `status: "completed"`
+ * (`packages/core/src/tool/plugin/shell.ts`, `Deferred.await(settled)` branch), and carries the progress `shellID`.
+ */
+export const SHELL_FOREGROUND_SUCCESS_FRAME = {
+  type: 'session.tool.success',
+  data: {
+    ...SHELL_TOOL_ENVELOPE,
+    content: [{type: 'text', text: 'job-output-line'}],
+    metadata: {status: 'completed', truncated: false, shellID: SHELL_ID},
+    executed: false,
+  },
+} as const
+
+/** p20: ephemeral. Arrives BEFORE the notice here and after it in p22, so the order is not a contract. */
+export const SHELL_EXITED_FRAME = {
+  id: 'evt_185e886ea001wjJJ7Vp758844T',
+  created: 1793247971050,
+  type: 'shell.exited',
+  location: {directory: SHELL_DIRECTORY},
+  data: {id: SHELL_ID, exit: 0, status: 'exited'},
+} as const
+
+export const SHELL_INBOX_ID = 'msg_185e867910037tyFxgDGN4vtxX'
+
+/** p20: the completion notice. `jobID` equals `shellID`; `source` is `shell`. It wakes the owning session. */
+export const SHELL_NOTICE_ENQUEUED_FRAME = {
+  id: 'evt_185e886ed001IXHLcLmGc8H6P4',
+  created: 1793247971053,
+  type: 'session.inbox.enqueued',
+  location: {directory: SHELL_DIRECTORY},
+  data: {
+    inboxID: SHELL_INBOX_ID,
+    sessionID: SHELL_SESSION_ID,
+    item: {
+      type: 'synthetic',
+      payload: {
+        text: `<shell id="${SHELL_ID}" state="completed" command="${SHELL_COMMAND}">\njob-output-line\n\n</shell>`,
+        description: SHELL_COMMAND,
+        metadata: {
+          source: 'shell',
+          shellID: SHELL_ID,
+          jobID: SHELL_ID,
+          state: 'completed',
+          truncated: false,
+          exit: 0,
+        },
+      },
+      delivery: 'steer',
+    },
+  },
+  durable: {aggregateID: SHELL_SESSION_ID, seq: 20, version: 1},
+} as const
+
+/** p20: the server delivers the notice into the woken turn. */
+export const SHELL_INBOX_DELIVERED_FRAME = {
+  type: 'session.inbox.delivered',
+  data: {sessionID: SHELL_SESSION_ID, inboxID: SHELL_INBOX_ID},
+} as const
+
+/** p20: `GET /api/shell` while the shell runs. Unlike `shell.created`, each element carries `pid`. */
+export const SHELL_LIST_RUNNING_RESPONSE = {
+  location: {directory: SHELL_DIRECTORY},
+  data: [
+    {
+      id: SHELL_ID,
+      status: 'running',
+      command: SHELL_COMMAND,
+      cwd: SHELL_DIRECTORY,
+      shell: '/bin/zsh',
+      file: '/tmp/v2-plan/bgshell/work/p20/home/.local/share/opencode/shell/61bfacef230eefd6f7413bab7af63a82ae4dffc2/sh_185e8678e001OVuLXzTBhwDmUx.out',
+      pid: 67593,
+      metadata: {sessionID: SHELL_SESSION_ID},
+      time: {started: 1793247963022},
+    },
+  ],
+} as const
+
+/** p20: `GET /api/shell` once the shell exited. */
+export const SHELL_LIST_EMPTY_RESPONSE = {location: {directory: SHELL_DIRECTORY}, data: []} as const
+
+/** p20: `GET /api/shell/:id` after the exit. Derived from the listed element plus the fields the exit adds. */
+export const SHELL_GET_EXITED_RESPONSE = {
+  location: {directory: SHELL_DIRECTORY},
+  data: {
+    ...SHELL_LIST_RUNNING_RESPONSE.data[0],
+    status: 'exited',
+    exit: 0,
+    time: {started: 1793247963022, completed: 1793247971050},
+  },
+} as const
+
+// p22: a DELETE of a running background shell. The job ends as `error` and the notice wakes the owner.
+
+export const KILLED_SHELL_SESSION_ID = 'ses_e7a075cf8ffeSlUo7N396E1CGq'
+export const KILLED_SHELL_ID = 'sh_185f8a788001iLe3eMww69Jts2'
+export const KILLED_SHELL_INBOX_ID = 'msg_185f8a78e001AxX17ueFdq6MsK'
+const KILLED_SHELL_DIRECTORY = '/tmp/v2-plan/bgshell/work/p22-0-repo'
+
+/** p22: the notice a DELETE produces: `state: "error"`, body `Shell.NotFoundError`, no `exit`. */
+export const KILLED_SHELL_NOTICE_ENQUEUED_FRAME = {
+  id: 'evt_185f8aed40016XFJJnEs6Ua5Ed',
+  created: 1793249029844,
+  type: 'session.inbox.enqueued',
+  location: {directory: KILLED_SHELL_DIRECTORY},
+  data: {
+    inboxID: KILLED_SHELL_INBOX_ID,
+    sessionID: KILLED_SHELL_SESSION_ID,
+    item: {
+      type: 'synthetic',
+      payload: {
+        text: `<shell id="${KILLED_SHELL_ID}" state="error" command="sleep 20 && touch /tmp/v2-plan/bgshell/work/p22-0-repo/mkA1">\nShell.NotFoundError\n</shell>`,
+        description: 'sleep 20 && touch /tmp/v2-plan/bgshell/work/p22-0-repo/mkA1',
+        metadata: {source: 'shell', shellID: KILLED_SHELL_ID, jobID: KILLED_SHELL_ID, state: 'error'},
+      },
+      delivery: 'steer',
+    },
+  },
+  durable: {aggregateID: KILLED_SHELL_SESSION_ID, seq: 27, version: 1},
+} as const
+
+/** p22: ephemeral, no `exit`. */
+export const KILLED_SHELL_EXITED_FRAME = {
+  id: 'evt_185f8aee5001W6OIOI7sO3QTrM',
+  created: 1793249029861,
+  type: 'shell.exited',
+  location: {directory: KILLED_SHELL_DIRECTORY},
+  data: {id: KILLED_SHELL_ID, status: 'killed'},
+} as const
+
+/**
+ * Derived: a user shell command's notice (`POST /api/session/:id/shell`, `packages/core/src/shell/result.ts`
+ * `userNotification`). It carries `shellID` but no `jobID`, and is delivered with `resume: false`.
+ */
+export const USER_SHELL_NOTICE_ENQUEUED_FRAME = {
+  type: 'session.inbox.enqueued',
+  data: {
+    inboxID: 'msg_user_shell',
+    sessionID: SHELL_SESSION_ID,
+    item: {
+      type: 'synthetic',
+      payload: {
+        text: 'The following shell command was executed by the user:\n<shell id="sh_user" state="completed" command="ls">\n\n</shell>',
+        description: 'ls',
+        metadata: {source: 'shell', shellID: 'sh_user', state: 'completed', truncated: false, exit: 0},
+      },
+      delivery: 'steer',
+    },
+  },
+} as const
+
+/** Derived: the shell a user command runs (`packages/core/src/session/shell.ts:17`) is tagged `background: true`. */
+export const USER_SHELL_CREATED_FRAME = {
+  type: 'shell.created',
+  data: {
+    info: {
+      id: 'sh_user',
+      status: 'running',
+      command: 'ls',
+      cwd: SHELL_DIRECTORY,
+      shell: '/bin/zsh',
+      file: '/tmp/x.out',
+      metadata: {sessionID: SHELL_SESSION_ID, background: true},
+      time: {started: 1793247963022},
+    },
+  },
+} as const
+
+/** Derived: a job notice whose `state` this reader does not know, naming its shell. */
+export const UNREADABLE_SHELL_NOTICE_ENQUEUED_FRAME = {
+  type: 'session.inbox.enqueued',
+  data: {
+    inboxID: 'msg_unreadable_shell',
+    sessionID: SHELL_SESSION_ID,
+    item: {
+      type: 'synthetic',
+      payload: {
+        text: 'x',
+        metadata: {source: 'shell', shellID: SHELL_ID, jobID: SHELL_ID, state: 'paused'},
+      },
+      delivery: 'steer',
+    },
+  },
+} as const
+
+/** Derived: a user item that claims shell-job metadata. Only the server sets this on synthetic items. */
+export const FORGED_USER_SHELL_ENQUEUED_FRAME = {
+  type: 'session.inbox.enqueued',
+  data: {
+    inboxID: 'msg_forged_shell',
+    sessionID: SHELL_SESSION_ID,
+    item: {
+      type: 'user',
+      payload: {
+        text: 'hi',
+        metadata: {source: 'shell', shellID: SHELL_ID, jobID: SHELL_ID, state: 'completed'},
+      },
+      delivery: 'steer',
+    },
+  },
+} as const

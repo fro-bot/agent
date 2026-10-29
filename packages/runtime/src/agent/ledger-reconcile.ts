@@ -129,6 +129,7 @@ import type {OwnershipLedger} from './ownership-ledger.js'
 
 import {err, ok} from '@bfra.me/es/result'
 import {toError} from '../shared/errors.js'
+import {isShellLedgerKey} from './ownership-ledger.js'
 
 /** Bounded interval between reconciliation passes run only because the interval elapsed. */
 export const DEFAULT_LEDGER_RECONCILE_INTERVAL_MS = 30_000
@@ -207,7 +208,12 @@ export async function reconcileLedgerOnce(
 ): Promise<Result<ReconcileObservation, Error>> {
   const {ledger, adapter, parentSessionId, logger, signal} = options
 
-  if (ledger.snapshot().length === 0) {
+  // Background shells share the ledger and are not sessions: `shell-jobs-v2.ts` reconciles them. Everything below
+  // reads sessions only, so a shell entry is never downgraded as "not a child" or settled as "not live".
+  const sessionEntries = (): ReturnType<OwnershipLedger['snapshot']> =>
+    ledger.snapshot().filter(entry => !isShellLedgerKey(entry.sessionId))
+
+  if (sessionEntries().length === 0) {
     return ok({liveTrackedSessionIds: new Set<string>()})
   }
 
@@ -219,7 +225,7 @@ export async function reconcileLedgerOnce(
 
   if (childrenResult.success === false || liveResult.success === false) {
     const error = childrenResult.success === false ? childrenResult.error : (liveResult as {error: Error}).error
-    const previouslyOutstanding = ledger.snapshot().filter(entry => entry.state === 'outstanding')
+    const previouslyOutstanding = sessionEntries().filter(entry => entry.state === 'outstanding')
     for (const entry of previouslyOutstanding) {
       ledger.markUnknown(entry.sessionId)
     }
@@ -239,7 +245,7 @@ export async function reconcileLedgerOnce(
   const settled: string[] = []
   const downgradedToUnknown: string[] = []
   const liveTrackedSessionIds = new Set<string>()
-  for (const entry of ledger.snapshot()) {
+  for (const entry of sessionEntries()) {
     if (entry.state !== 'outstanding' && entry.state !== 'unknown') continue
 
     if (childSessionIds.has(entry.sessionId) === false) {

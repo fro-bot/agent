@@ -51,8 +51,10 @@ import {handleRecoverEntryButtonClick, parseRecoverEntryCustomId} from './discor
 import {abortRegistry} from './execute/abort-registry.js'
 import {totalRecoveryBudgetMs} from './execute/checkout-recovery.js'
 import {createConcurrencyRegistry} from './execute/concurrency.js'
+import {createGenerationAwareQuiescenceChecker} from './execute/opencode-generation.js'
 import {createChannelQueue, DEFAULT_MAX_QUEUE_DEPTH} from './execute/queue.js'
 import {recoverStaleRuns} from './execute/recovery.js'
+import {createRepoQuiescenceCheckerV2} from './execute/repo-quiescence-v2.js'
 import {createRepoQuiescenceChecker} from './execute/repo-quiescence.js'
 import {createRunIndex} from './execute/run-index.js'
 import {getInFlightRuns} from './execute/run.js'
@@ -505,9 +507,17 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
     const workspaceCalls = createWorkspaceCalls({appClient, workspaceClient, logger})
 
     // One workspace quiescence checker shared by acquisition, maintenance, recovery and operator release.
-    const checkRepoQuiescence = createRepoQuiescenceChecker({
+    // The check follows the OpenCode generation the workspace reports on every call (V1 session status, or the V2
+    // active-list join), and is `unknown` when the workspace cannot be asked.
+    const quiescenceOptions = {
       workspaceOpencodeUrl: config.workspaceOpencodeUrl,
       workspaceOpencodeToken: config.workspaceOpencodeToken,
+      logger,
+    }
+    const checkRepoQuiescence = createGenerationAwareQuiescenceChecker({
+      readyz: async () => workspaceClient.readyz(),
+      v1: createRepoQuiescenceChecker(quiescenceOptions),
+      v2: createRepoQuiescenceCheckerV2(quiescenceOptions),
       logger,
     })
 

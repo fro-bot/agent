@@ -135,6 +135,11 @@ export type InspectErrorCode =
 export interface ReadyzReady {
   readonly ready: true
   readonly opencode: 'ready'
+  /**
+   * The OpenCode version the workspace runs (`2.2.0`). Absent on a workspace that does not report it, which the
+   * gateway reads as OpenCode V1. The gateway picks its run loop from the major version.
+   */
+  readonly opencodeVersion?: string
 }
 
 /**
@@ -144,6 +149,7 @@ export interface ReadyzReady {
 export interface ReadyzNotReady {
   readonly ready: false
   readonly opencode: 'starting' | 'down' | 'degraded' | 'unknown'
+  readonly opencodeVersion?: string
 }
 
 /** Discriminated union of all /readyz response shapes. */

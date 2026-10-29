@@ -15,7 +15,7 @@ import {
 import {
   createV2LedgerReconcileAdapter,
   DEFAULT_V2_LIST_MAX_PAGES,
-  listBusyV2SessionIdsInDirectory,
+  listV2SessionsInDirectory,
 } from './ledger-reconcile-v2.js'
 import {reconcileLedgerOnce} from './ledger-reconcile.js'
 import {createOwnershipLedger} from './ownership-ledger.js'
@@ -273,109 +273,105 @@ describe('reconcileLedgerOnce with the V2 adapter', () => {
   })
 })
 
-describe('listBusyV2SessionIdsInDirectory (P9 quiescence join)', () => {
-  it('joins the global active list with the directory list: only the background child is busy in repo A', async () => {
-    const server = makeServer({active: ACTIVE_WHILE_CHILD_HELD, sessions: ALL_SESSIONS})
-    const result = await listBusyV2SessionIdsInDirectory(server.api, REPO_A_DIRECTORY, {realpath: async path => path})
-    expect(result.success && [...result.data]).toEqual([CHILD_SESSION_ID])
+/** A directory of sessions served newest first in pages of two, as the real list does. */
+function makeSortedServer(updated: readonly (number | null)[]) {
+  const sessions = updated.map((time, index) => ({
+    id: `ses_${String(index)}`,
+    location: {directory: REPO_A_DIRECTORY},
+    ...(time === null ? {} : {time: {updated: time}}),
+  }))
+  const inputs: V2SessionListInput[] = []
+  const api: V2SessionApi = {
+    active: async () => ({}),
+    list: async (input): Promise<V2SessionListPage> => {
+      inputs.push(input)
+      const start = input.cursor === undefined ? 0 : Number(input.cursor)
+      const data = sessions.slice(start, start + 2)
+      return {data, cursor: {next: start + 2 < sessions.length ? String(start + 2) : null}}
+    },
+  }
+  return {api, inputs}
+}
+
+describe('listV2SessionsInDirectory: updatedSince', () => {
+  const NOW = 1_800_000_000_000
+  const identity = {realpath: async (path: string) => path}
+
+  it('asks newest first, keeps the sessions updated since, and stops at the first page that reaches the cut-off', async () => {
+    // #given — two recent, two old, two older: pages [0,1] [2,3] [4,5]
+    const server = makeSortedServer([NOW + 2, NOW + 1, NOW - 10, NOW - 20, NOW - 30, NOW - 40])
+
+    // #when
+    const result = await listV2SessionsInDirectory(server.api, REPO_A_DIRECTORY, identity, {updatedSince: NOW})
+
+    // #then — the walk ended on page two; the old half of that page is dropped by the filter
+    expect(result.success && result.data).toEqual(['ses_0', 'ses_1'])
+    expect(server.inputs).toHaveLength(2)
+    expect(server.inputs.every(input => input.order === 'desc')).toBe(true)
   })
 
-  it('reports nothing busy in repo B while repo A has a running child', async () => {
-    const server = makeServer({active: ACTIVE_WHILE_CHILD_HELD, sessions: ALL_SESSIONS})
-    const result = await listBusyV2SessionIdsInDirectory(server.api, REPO_B_SESSION_INFO.location.directory, {
-      realpath: async path => path,
+  it('applies the page bound to the narrowed walk, not to the stored history', async () => {
+    // #given — 40 sessions, only the first two recent, and a bound of three pages
+    const times = [NOW + 2, NOW + 1, ...Array.from({length: 38}, (_, index) => NOW - 1_000 - index)]
+    const server = makeSortedServer(times)
+
+    // #when
+    const result = await listV2SessionsInDirectory(server.api, REPO_A_DIRECTORY, identity, {
+      updatedSince: NOW,
+      maxPages: 3,
     })
-    expect(result.success && result.data.size).toBe(0)
+
+    // #then
+    expect(result.success && result.data).toEqual(['ses_0', 'ses_1'])
   })
 
-  it('canonicalises the directory before the exact-string match', async () => {
-    // #given sessions created under the canonical path, and a caller holding the symlinked path
-    const canonical = '/private/tmp/v2-plan/probes/work/p02-repoA-0'
-    const sessions = [
-      {...PARENT_SESSION_INFO, location: {directory: canonical}},
-      {...CHILD_SESSION_INFO, location: {directory: canonical}},
-    ]
-    const server = makeServer({active: ACTIVE_WHILE_CHILD_HELD, sessions})
-    // #when joining with the symlinked path and a realpath that resolves it
-    const result = await listBusyV2SessionIdsInDirectory(server.api, REPO_A_DIRECTORY, {
-      realpath: async path => path.replace(/^\/tmp\//, '/private/tmp/'),
+  it('still fails when the sessions inside the window overrun the page bound', async () => {
+    // #given — every session is recent
+    const server = makeSortedServer(Array.from({length: 40}, (_, index) => NOW + 100 - index))
+
+    // #when
+    const result = await listV2SessionsInDirectory(server.api, REPO_A_DIRECTORY, identity, {
+      updatedSince: NOW,
+      maxPages: 3,
     })
-    // #then the child is found; the server filter saw the canonical string
-    expect(result.success && [...result.data]).toEqual([CHILD_SESSION_ID])
-    expect(server.listCalls[0]?.directory).toBe(canonical)
-  })
 
-  it('misses the session when the path is not canonicalised (the P9 hazard)', async () => {
-    const canonical = '/private/tmp/v2-plan/probes/work/p02-repoA-0'
-    const sessions = [{...CHILD_SESSION_INFO, location: {directory: canonical}}]
-    const server = makeServer({active: ACTIVE_WHILE_CHILD_HELD, sessions})
-    const result = await listBusyV2SessionIdsInDirectory(server.api, REPO_A_DIRECTORY, {realpath: async path => path})
-    expect(result.success && result.data.size).toBe(0)
-  })
-
-  it('fails when realpath fails, never falling back to the raw path', async () => {
-    const server = makeServer({active: ACTIVE_WHILE_CHILD_HELD, sessions: ALL_SESSIONS})
-    const result = await listBusyV2SessionIdsInDirectory(server.api, REPO_A_DIRECTORY, {
-      realpath: async () => {
-        throw new Error('ENOENT')
-      },
-    })
+    // #then
     expect(result.success).toBe(false)
-    expect(server.listCalls).toHaveLength(0)
   })
 
-  it('returns an error when the signal aborts while realpath never resolves', async () => {
-    // #given a realpath that hangs and a signal that aborts afterwards
-    const server = makeServer({active: ACTIVE_WHILE_CHILD_HELD, sessions: ALL_SESSIONS})
-    const controller = new AbortController()
-    const pending = listBusyV2SessionIdsInDirectory(
-      server.api,
-      REPO_A_DIRECTORY,
-      {realpath: async () => new Promise<string>(() => {})},
-      {signal: controller.signal},
-    )
-    // #when the signal aborts
-    controller.abort(new Error('quiescence deadline'))
-    const result = await pending
-    // #then the call settles with an error and issued no session request
-    expect(result.success).toBe(false)
-    expect(!result.success && result.error.message).toBe('quiescence deadline')
-    expect(server.listCalls).toHaveLength(0)
+  it('keeps paging when the list is not in newest-first order', async () => {
+    // #given — oldest first
+    const server = makeSortedServer([NOW - 40, NOW - 30, NOW - 20, NOW - 10, NOW + 1, NOW + 2])
+
+    // #when
+    const result = await listV2SessionsInDirectory(server.api, REPO_A_DIRECTORY, identity, {updatedSince: NOW})
+
+    // #then
+    expect(result.success && result.data).toEqual(['ses_4', 'ses_5'])
+    expect(server.inputs).toHaveLength(3)
   })
 
-  it('does no I/O when the signal is already aborted', async () => {
-    // #given an aborted signal
-    const server = makeServer({active: ACTIVE_WHILE_CHILD_HELD, sessions: ALL_SESSIONS})
-    const realpath = vi.fn(async (path: string) => path)
-    const controller = new AbortController()
-    controller.abort(new Error('already aborted'))
-    // #when joining
-    const result = await listBusyV2SessionIdsInDirectory(
-      server.api,
-      REPO_A_DIRECTORY,
-      {realpath},
-      {signal: controller.signal},
-    )
-    // #then realpath is never called and the call fails
-    expect(result.success).toBe(false)
-    expect(realpath).not.toHaveBeenCalled()
-    expect(server.listCalls).toHaveLength(0)
+  it('keeps a session whose time cannot be read, and does not stop on one', async () => {
+    // #given — the last entry of the first page has no time
+    const server = makeSortedServer([NOW + 2, null, NOW - 10, NOW - 20])
+
+    // #when
+    const result = await listV2SessionsInDirectory(server.api, REPO_A_DIRECTORY, identity, {updatedSince: NOW})
+
+    // #then — it was kept, the walk went on to the next page, and stopped there
+    expect(result.success && result.data).toEqual(['ses_0', 'ses_1'])
+    expect(server.inputs).toHaveLength(2)
   })
 
-  it('fails when the active list fails', async () => {
-    const api: V2SessionApi = {
-      active: async () => {
-        throw new Error('down')
-      },
-      list: async () => ({data: []}),
-    }
-    expect((await listBusyV2SessionIdsInDirectory(api, REPO_A_DIRECTORY, {realpath: async p => p})).success).toBe(false)
-  })
+  it('lists every session and sends no order when no cut-off is given', async () => {
+    // #given
+    const server = makeSortedServer([NOW - 10, NOW - 20, NOW - 30])
 
-  it('does not call the directory list when nothing is active', async () => {
-    const server = makeServer({active: {}, sessions: ALL_SESSIONS})
-    const result = await listBusyV2SessionIdsInDirectory(server.api, REPO_A_DIRECTORY, {realpath: async p => p})
-    expect(result.success && result.data.size).toBe(0)
-    expect(server.listCalls).toHaveLength(0)
+    // #when
+    const result = await listV2SessionsInDirectory(server.api, REPO_A_DIRECTORY, identity)
+
+    // #then
+    expect(result.success && result.data).toEqual(['ses_0', 'ses_1', 'ses_2'])
+    expect(server.inputs.some(input => input.order !== undefined)).toBe(false)
   })
 })

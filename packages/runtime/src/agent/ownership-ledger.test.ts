@@ -173,4 +173,35 @@ describe('createOwnershipLedger', () => {
     expect(ledger.isDrainComplete()).toBe(true)
     expect(ledger.isPersistenceSafe()).toBe(true)
   })
+  it('release drops an entry in any state, so a released entry no longer blocks the drain', () => {
+    // #given — one entry per state
+    const ledger = createOwnershipLedger()
+    ledger.adopt('shell:sh_outstanding', 'sleep 1')
+    ledger.adopt('shell:sh_unknown', 'sleep 2')
+    ledger.markUnknown('shell:sh_unknown')
+    ledger.adopt('shell:sh_settled', 'sleep 3')
+    ledger.settle('shell:sh_settled')
+
+    // #when
+    ledger.release('shell:sh_outstanding')
+    ledger.release('shell:sh_unknown')
+    ledger.release('shell:sh_settled')
+
+    // #then
+    expect(ledger.snapshot()).toEqual([])
+    expect(ledger.isDrainComplete()).toBe(true)
+    expect(ledger.isTracked('shell:sh_outstanding')).toBe(false)
+  })
+
+  it('release of an entry that was never adopted is a no-op', () => {
+    // #given
+    const ledger = createOwnershipLedger()
+    ledger.adopt('session-1', 'reviewer-subagent')
+
+    // #when
+    ledger.release('session-never-adopted')
+
+    // #then
+    expect(ledger.snapshot()).toEqual([{sessionId: 'session-1', label: 'reviewer-subagent', state: 'outstanding'}])
+  })
 })

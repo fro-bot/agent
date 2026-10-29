@@ -376,6 +376,13 @@ export function wrapLedgerWithHooks(
       if (statesEqual(before, after)) return
       onChange()
     },
+    release: sessionId => {
+      const before = snapshotStates(ledger)
+      ledger.release(sessionId)
+      const after = snapshotStates(ledger)
+      if (statesEqual(before, after)) return
+      onChange()
+    },
     outstanding: () => ledger.outstanding(),
     unknown: () => ledger.unknown(),
     isDrainComplete: () => ledger.isDrainComplete(),
@@ -1719,7 +1726,7 @@ export async function awaitFirstEvent(
 }
 
 /** An iterable over `iterator` that yields `first` (already read from it) before anything else, then the rest. */
-function resumeWith(iterator: AsyncIterator<unknown>, first: unknown): AsyncIterable<unknown> {
+export function resumeWith(iterator: AsyncIterator<unknown>, first: unknown): AsyncIterable<unknown> {
   let pending = true
   return {
     [Symbol.asyncIterator]: () => ({
@@ -1745,7 +1752,10 @@ function resumeWith(iterator: AsyncIterator<unknown>, first: unknown): AsyncIter
  * wrapper the `for await` loop only checks `signal.aborted` AFTER an event
  * arrives, meaning a timed-out run can block indefinitely on a quiet stream.
  */
-async function* makeAbortableStream(stream: AsyncIterable<unknown>, signal: AbortSignal): AsyncGenerator<unknown> {
+export async function* makeAbortableStream(
+  stream: AsyncIterable<unknown>,
+  signal: AbortSignal,
+): AsyncGenerator<unknown> {
   const iterator = stream[Symbol.asyncIterator]()
 
   try {
