@@ -116,6 +116,23 @@ export function readOptionalSecret(name: string): string | null {
 }
 
 /**
+ * Read an optional secret file that holds a JSON blob, with the same hardened open as `readOptionalSecret`:
+ * `O_NOFOLLOW`, regular file only, size cap. Unlike `readOptionalSecret` it takes a path, has no env-var fallback, and
+ * accepts embedded line breaks, because the credential blob is JSON an operator may have pretty-printed (the
+ * entrypoint tolerates that too). Returns null when the file is absent or blank. Never logs the contents.
+ */
+export function readOptionalSecretBlob(filePath: string): string | null {
+  let contents: string
+  try {
+    contents = readSecretFile(filePath)
+  } catch (error) {
+    if (error instanceof SecretFileNotFoundError) return null
+    throw error
+  }
+  return contents.trim() === '' ? null : contents
+}
+
+/**
  * Read a required secret by name. Throws if missing.
  */
 export function readSecret(name: string): string {

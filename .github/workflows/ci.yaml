@@ -749,6 +749,169 @@ jobs:
             exit 1
           fi
           echo "OK: V2 image ready on ${oc_version}, plugins active, no network"
+      - name: Smoke-test OpenCode V2 provider credential (the provisioned key reaches the model request)
+        run: |
+          set -euo pipefail
+          # fro-bot/agent#1992: V2 imports auth.json only through a migration that a fresh per-spawn database
+          # skips, so every V2 model call went out with no key. The supervisor now provisions the root-only
+          # credential blob into each spawn over loopback. This step proves it through the real entrypoint:
+          # a no-network fake Anthropic-compatible provider runs INSIDE the container (loopback only) and answers
+          # 401 unless the request carries the provisioned dummy key in x-api-key, the header V1 sent.
+          smoke_key='sk-ci-v2-smoke-dummy-not-real'
+          fake_port=9701
+          auth_dir="$(mktemp -d)"
+          chmod 755 "${auth_dir}"
+          printf '{"anthropic":{"type":"api","key":"%s"}}' "${smoke_key}" > "${auth_dir}/auth.json"
+          cid="$(docker run -d --network none \
+            -e WORKSPACE_OPENCODE_TOKEN=dummy-smoke-token \
+            -e MITMPROXY_CA_WAIT_SECONDS=0 \
+            -e NO_PROXY='*' \
+            -e WORKSPACE_OPENCODE_MODEL=anthropic/claude-sonnet-4-6 \
+            -e WORKSPACE_OPENCODE_CONFIG="{\"provider\":{\"anthropic\":{\"options\":{\"baseURL\":\"http://127.0.0.1:${fake_port}/v1\"}}}}" \
+            $WORKSPACE_DOCKER_SECURITY_FLAGS \
+            -v "${auth_dir}/auth.json:/run/workspace-agent/secrets/workspace_opencode_auth:ro" \
+            -v "$PWD/deploy/scripts/fake-anthropic-provider.mjs:/fake-provider.mjs:ro" \
+            fro-bot-workspace:smoke-v2)"
+          cleanup() {
+            status=$?
+            if [ "${status}" -ne 0 ]; then
+              echo "--- workspace logs ---"
+              docker logs "${cid}" 2>&1 || true
+            fi
+            docker rm -f "${cid}" >/dev/null 2>&1 || true
+            rm -rf "${auth_dir}"
+          }
+          trap cleanup EXIT
+
+          docker exec -d "${cid}" node /fake-provider.mjs "${fake_port}" "${smoke_key}"
+          fake_up=false
+          for _ in $(seq 1 30); do
+            if docker exec "${cid}" curl -fsS --max-time 2 "http://127.0.0.1:${fake_port}/__hits" >/dev/null 2>&1; then
+              fake_up=true
+              break
+            fi
+            sleep 1
+          done
+          [ "${fake_up}" = "true" ] || { echo "REGRESSION: the fake provider did not start"; exit 1; }
+
+          # Readiness now includes the credential gate: the model's provider must hold a credential.
+          ready=false
+          for _ in $(seq 1 90); do
+            if docker exec "${cid}" curl -fsS --max-time 5 http://127.0.0.1:9100/readyz >/dev/null 2>&1; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          [ "${ready}" = "true" ] || { echo "REGRESSION: /readyz did not return 200 within 90s with a provisioned credential"; exit 1; }
+
+          # One prompt through the :9200 bearer proxy, the path the gateway uses.
+          dir_header="x-opencode-directory: $(node -p 'encodeURIComponent("/workspace/repos")')"
+          session="$(docker exec "${cid}" curl -fsS --max-time 15 \
+            -H 'Authorization: Bearer dummy-smoke-token' -H "${dir_header}" -H 'content-type: application/json' \
+            -d '{"location":{"directory":"/workspace/repos"}}' http://127.0.0.1:9200/api/session)"
+          session_id="$(echo "${session}" | node -p 'JSON.parse(fs.readFileSync(0, "utf8")).data.id')"
+          docker exec "${cid}" curl -fsS --max-time 15 \
+            -H 'Authorization: Bearer dummy-smoke-token' -H "${dir_header}" -H 'content-type: application/json' \
+            -d '{"text":"ping"}' "http://127.0.0.1:9200/api/session/${session_id}/prompt" >/dev/null
+
+          # The fake must see a model request carrying the key in x-api-key.
+          hits=''
+          matched=false
+          for _ in $(seq 1 60); do
+            hits="$(docker exec "${cid}" curl -fsS --max-time 5 "http://127.0.0.1:${fake_port}/__hits")"
+            if echo "${hits}" | node -e 'process.exit(JSON.parse(fs.readFileSync(0, "utf8")).requests.some(r => r.xApiKey === "match") ? 0 : 1)'; then
+              matched=true
+              break
+            fi
+            sleep 1
+          done
+          echo "provider verdicts: ${hits}"
+          [ "${matched}" = "true" ] || { echo "REGRESSION: no model request carried the provisioned key in x-api-key"; exit 1; }
+          # Every request carried it, and none sent it as a bearer.
+          echo "${hits}" | node -e '
+            const bad = JSON.parse(fs.readFileSync(0, "utf8")).requests.filter(r => r.xApiKey !== "match" || r.authorization !== "absent")
+            if (bad.length > 0) { console.error("unexpected provider requests: " + JSON.stringify(bad)); process.exit(1) }
+          '
+
+          logs="$(docker logs "${cid}" 2>&1)"
+          echo "--- workspace logs ---"
+          echo "${logs}"
+          case "${logs}" in
+            *"provider credentials provisioned"*) : ;;
+            *) echo "REGRESSION: the supervisor did not log credential provisioning"; exit 1 ;;
+          esac
+          if echo "${logs}" | grep -qF "${smoke_key}"; then
+            echo "REGRESSION: the provider key leaked into the workspace logs"
+            exit 1
+          fi
+          echo "OK: V2 provisioned the credential into the fresh database; the model request carried it in x-api-key"
+      - name: Smoke-test OpenCode V2 credential gate (model configured, no credential, never ready)
+        run: |
+          set -euo pipefail
+          # The fail-loud half of #1992: with a model configured and no credential blob, the supervisor must
+          # refuse readiness at spawn instead of letting the first model call 401.
+          fake_port=9701
+          cid="$(docker run -d --network none \
+            -e WORKSPACE_OPENCODE_TOKEN=dummy-smoke-token \
+            -e MITMPROXY_CA_WAIT_SECONDS=0 \
+            -e NO_PROXY='*' \
+            -e WORKSPACE_OPENCODE_MODEL=anthropic/claude-sonnet-4-6 \
+            -e WORKSPACE_OPENCODE_CONFIG="{\"provider\":{\"anthropic\":{\"options\":{\"baseURL\":\"http://127.0.0.1:${fake_port}/v1\"}}}}" \
+            $WORKSPACE_DOCKER_SECURITY_FLAGS \
+            -v "$PWD/deploy/scripts/fake-anthropic-provider.mjs:/fake-provider.mjs:ro" \
+            fro-bot-workspace:smoke-v2)"
+          cleanup() {
+            status=$?
+            if [ "${status}" -ne 0 ]; then
+              echo "--- workspace logs ---"
+              docker logs "${cid}" 2>&1 || true
+            fi
+            docker rm -f "${cid}" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker exec -d "${cid}" node /fake-provider.mjs "${fake_port}" 'sk-ci-v2-smoke-dummy-not-real'
+
+          # Wait for the supervisor's verdict, failing at once if /readyz ever answers 200.
+          decided=false
+          for _ in $(seq 1 90); do
+            if docker exec "${cid}" curl -fsS --max-time 5 http://127.0.0.1:9100/readyz >/dev/null 2>&1; then
+              echo "REGRESSION: /readyz returned 200 with a model configured and no credential"
+              exit 1
+            fi
+            logs="$(docker logs "${cid}" 2>&1)"
+            case "${logs}" in
+              *"credential gate failed"*) decided=true; break ;;
+            esac
+            sleep 1
+          done
+          [ "${decided}" = "true" ] || { echo "REGRESSION: the credential gate never reported within 90s"; exit 1; }
+
+          # Keep watching across the respawns: readiness must stay refused.
+          for _ in $(seq 1 15); do
+            if docker exec "${cid}" curl -fsS --max-time 5 http://127.0.0.1:9100/readyz >/dev/null 2>&1; then
+              echo "REGRESSION: /readyz turned 200 after the credential gate failed"
+              exit 1
+            fi
+            sleep 1
+          done
+
+          logs="$(docker logs "${cid}" 2>&1)"
+          echo "--- workspace logs ---"
+          echo "${logs}"
+          case "${logs}" in
+            *"credential-missing"*) : ;;
+            *) echo "REGRESSION: the gate failure was not credential-missing"; exit 1 ;;
+          esac
+          case "${logs}" in
+            *"opencode-server-v2: ready"*) echo "REGRESSION: the supervisor reported ready without a credential"; exit 1 ;;
+          esac
+          hits="$(docker exec "${cid}" curl -fsS --max-time 5 "http://127.0.0.1:${fake_port}/__hits")"
+          echo "provider verdicts: ${hits}"
+          echo "${hits}" | node -e 'if (JSON.parse(fs.readFileSync(0, "utf8")).requests.length !== 0) process.exit(1)' \
+            || { echo "REGRESSION: a model request reached the provider with no credential provisioned"; exit 1; }
+          echo "OK: no credential → the credential gate refused readiness and no model request was made"
       - name: Smoke-test auth provisioning (valid blob → auth.json written 0600)
         run: |
           set -e
@@ -827,7 +990,7 @@ jobs:
           logs="$(docker logs "$cid" 2>&1)"
           echo "--- workspace logs ---"; echo "$logs"
           [ "$ok" = "true" ] || { echo "REGRESSION: /healthz down with config overlay"; exit 1; }
-          echo "$logs" | grep -q "provider-overlay=applied"
+          echo "$logs" | grep -q "provider-overlay=merged-into-config-file"
           # Effective config carries the overlaid model + provider baseURL, AND the
           # hostile overlay could NOT drop the plugin or re-enable autoupdate.
           docker exec "$cid" sh -c 'grep -q "\"model\": \"anthropic/claude-sonnet-4-6\"" /home/opencode/.config/opencode/opencode.json'
@@ -876,7 +1039,7 @@ jobs:
           echo "--- workspace logs ---"; echo "$logs"
           [ "$ok" = "true" ] || { echo "REGRESSION: /healthz down with combined auth+model+overlay"; exit 1; }
           echo "$logs" | grep -q "auth: provisioned"
-          echo "$logs" | grep -q "provider-overlay=applied"
+          echo "$logs" | grep -q "provider-overlay=merged-into-config-file"
           docker exec "$cid" sh -c 'test "$(stat -c %u:%a /home/opencode/.local/share/opencode/auth.json)" = "10001:600"'
           docker exec "$cid" sh -c 'grep -q "\"model\": \"anthropic/claude-sonnet-4-6\"" /home/opencode/.config/opencode/opencode.json'
           docker exec "$cid" sh -c 'grep -q "cliproxy.fro.bot/v1" /home/opencode/.config/opencode/opencode.json'

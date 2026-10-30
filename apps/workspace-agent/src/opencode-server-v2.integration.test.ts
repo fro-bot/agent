@@ -15,6 +15,11 @@
  * What it proves that the fake-server tests cannot: with the plugins installed that way, the real runner passes both
  * the plugin gate and the permission gate; the proxy turns the gateway bearer into the live credential; a new spawn
  * starts on an empty database; and a shutdown with a turn in flight leaves no execution claim in the database.
+ *
+ * It also pins fro-bot/agent#1992. The provider credential reaches the model request only through the production path:
+ * a root-only auth blob read by the supervisor and provisioned over `POST /api/credential`, with the config overlay
+ * carrying a `baseURL` and no key. A fresh database never imports `auth.json`, so without provisioning the fake
+ * Anthropic-compatible provider sees no `x-api-key`, and with no credential at all readiness never turns ready.
  */
 
 import type {AddressInfo} from 'node:net'
@@ -60,6 +65,9 @@ const PIN = JSON.parse(
 const INSTALL_SCRIPT = fileURLToPath(new URL('../../../deploy/scripts/install-opencode-v2-plugins.sh', import.meta.url))
 
 const GATEWAY_BEARER = 'integration-gateway-bearer'
+/** The provider key. It reaches the fake provider only through the supervisor's credential provisioning. */
+const PROVIDER_KEY = 'sk-integration-FIXTURE-KEY-not-a-credential'
+const MODEL = 'anthropic/claude-sonnet-4-6'
 const RUNNER_TIMEOUT_MS = 180_000
 
 const lines: string[] = []
@@ -75,38 +83,82 @@ interface Sandbox {
   readonly reposRoot: string
   readonly repo: string
   readonly dbBase: string
+  /** The root-only credential blob the supervisor reads (`WORKSPACE_OPENCODE_AUTH_FILE`). */
+  readonly authFile: string
 }
 
 let box: Sandbox
-let provider: HeldProvider | undefined
+let provider: FakeProvider | undefined
 
-interface HeldProvider {
+interface ProviderHit {
+  readonly headers: http.IncomingHttpHeaders
+  readonly authorized: boolean
+}
+
+interface FakeProvider {
   readonly baseURL: string
-  readonly requests: () => number
+  /** Every model request, with the headers it carried. */
+  readonly hits: () => readonly ProviderHit[]
+  /** Model requests that carried the expected `x-api-key`. */
+  readonly authorizedRequests: () => number
+  /** When true, an authorized request gets its first frame and is then held open (a turn in flight). */
+  readonly setHold: (hold: boolean) => void
   readonly stop: () => Promise<void>
 }
 
-/** An OpenAI-compatible endpoint that answers every chat request with headers and then never finishes. */
-async function startHeldProvider(): Promise<HeldProvider> {
-  let requests = 0
+/**
+ * An Anthropic-compatible endpoint that records request headers. It answers 401 unless `x-api-key` equals the key, so a
+ * request that carries no credential, or the wrong header shape, fails the turn instead of passing.
+ */
+async function startFakeProvider(expectedKey: string): Promise<FakeProvider> {
+  const hits: ProviderHit[] = []
+  let hold = false
   const server = http.createServer((req, res) => {
     req.resume()
-    if (req.method === 'GET') {
-      res.writeHead(200, {'content-type': 'application/json'})
-      res.end(JSON.stringify({object: 'list', data: [{id: 'fixture-model', object: 'model'}]}))
+    if (req.method !== 'POST') {
+      res.writeHead(404).end()
       return
     }
-    requests += 1
+    const authorized = req.headers['x-api-key'] === expectedKey
+    hits.push({headers: req.headers, authorized})
+    if (!authorized) {
+      res.writeHead(401, {'content-type': 'application/json'})
+      res.end(JSON.stringify({type: 'error', error: {type: 'authentication_error', message: 'invalid x-api-key'}}))
+      return
+    }
     res.writeHead(200, {'content-type': 'text/event-stream', 'cache-control': 'no-cache'})
-    res.write(
-      `data: ${JSON.stringify({id: 'c', object: 'chat.completion.chunk', created: 1, model: 'fixture-model', choices: [{index: 0, delta: {role: 'assistant', content: ''}, finish_reason: null}]})}\n\n`,
-    )
+    const frame = (event: string, data: unknown): void => {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+    }
+    frame('message_start', {
+      type: 'message_start',
+      message: {
+        id: 'msg_1',
+        type: 'message',
+        role: 'assistant',
+        model: 'claude-sonnet-4-6',
+        content: [],
+        stop_reason: null,
+        usage: {input_tokens: 1, output_tokens: 1},
+      },
+    })
+    if (hold) return
+    frame('content_block_start', {type: 'content_block_start', index: 0, content_block: {type: 'text', text: ''}})
+    frame('content_block_delta', {type: 'content_block_delta', index: 0, delta: {type: 'text_delta', text: 'pong'}})
+    frame('content_block_stop', {type: 'content_block_stop', index: 0})
+    frame('message_delta', {type: 'message_delta', delta: {stop_reason: 'end_turn'}, usage: {output_tokens: 1}})
+    frame('message_stop', {type: 'message_stop'})
+    res.end()
   })
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
   const {port} = server.address() as AddressInfo
   return {
     baseURL: `http://127.0.0.1:${port}/v1`,
-    requests: () => requests,
+    hits: () => hits,
+    authorizedRequests: () => hits.filter(hit => hit.authorized).length,
+    setHold: next => {
+      hold = next
+    },
     stop: async () => {
       server.closeAllConnections()
       await new Promise<void>(resolve => server.close(() => resolve()))
@@ -151,7 +203,9 @@ function createSandbox(): Sandbox {
   writeFileSync(path.join(repo, 'a.txt'), 'hello\n')
   git('add', '.')
   git('commit', '-qm', 'init')
-  return {root, home, reposRoot, repo, dbBase: path.join(root, 'db')}
+  const authFile = path.join(root, 'workspace_opencode_auth')
+  writeFileSync(authFile, JSON.stringify({anthropic: {type: 'api', key: PROVIDER_KEY}}), {mode: 0o600})
+  return {root, home, reposRoot, repo, dbBase: path.join(root, 'db'), authFile}
 }
 
 /** Installs both plugins exactly as the image build does, into the sandbox home. */
@@ -173,22 +227,17 @@ function installPlugins(sandbox: Sandbox): void {
     timeout: 280_000,
   })
   if (result.status !== 0) throw new Error(`plugin install failed:\n${result.stderr}`)
-  // The entrypoint's merged global config: provider and model only, no plugin entry (the config content carries those).
+  // The entrypoint's merged global config, as production writes it: the provider overlay carries a baseURL and NO key
+  // (the key lives in the root-only blob the supervisor provisions), plus the model. No plugin entry (the config content
+  // carries those).
   writeFileSync(
     path.join(sandbox.home, '.config', 'opencode', 'opencode.json'),
     JSON.stringify({
       $schema: 'https://opencode.ai/config.json',
       autoupdate: false,
       share: 'disabled',
-      provider: {
-        fake: {
-          npm: '@ai-sdk/openai-compatible',
-          name: 'Fake',
-          options: {baseURL: provider?.baseURL, apiKey: 'fake-integration-key-not-a-credential'},
-          models: {'fixture-model': {name: 'Fixture', tool_call: true, limit: {context: 100_000, output: 8000}}},
-        },
-      },
-      model: 'fake/fixture-model',
+      provider: {anthropic: {options: {baseURL: provider?.baseURL}}},
+      model: MODEL,
     }),
   )
 }
@@ -209,12 +258,13 @@ function sandboxEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     // The fake provider is on loopback; everything else (the registry included) is refused.
     NO_PROXY: '127.0.0.1,localhost',
     npm_config_registry: `${refused}/`,
-    OPENCODE_DISABLE_MODELS_FETCH: '1',
   }
 }
 
 interface RunningWorkspace {
   readonly statusRef: SupervisedStatusRef
+  /** Every status the supervisor wrote, in order. */
+  readonly statuses: readonly SupervisedStatusRef['status'][]
   readonly credentials: ReturnType<typeof createUpstreamCredentials>
   readonly proxyUrl: string
   readonly upstreamUrl: string
@@ -223,9 +273,28 @@ interface RunningWorkspace {
   readonly stop: () => Promise<void>
 }
 
+interface StartWorkspaceOptions {
+  /** Provision the blob like production does. False leaves the model configured and no credential anywhere. */
+  readonly withCredential?: boolean
+  /** The outcome the caller expects: `ready` (default) or a supervisor that gave up without ever being ready. */
+  readonly expect?: 'ready' | 'refused'
+}
+
 /** Runs the real supervisor and the real V2 proxy on loopback ports, against the real binary. */
-async function startWorkspace(): Promise<RunningWorkspace> {
-  const statusRef: SupervisedStatusRef = {status: 'starting'}
+async function startWorkspace(options: StartWorkspaceOptions = {}): Promise<RunningWorkspace> {
+  const {withCredential = true, expect: outcome = 'ready'} = options
+  // Records every transition, so a test can prove readiness was never reported, not merely absent at the end.
+  const seen: SupervisedStatusRef['status'][] = []
+  let current: SupervisedStatusRef['status'] = 'starting'
+  const statusRef: SupervisedStatusRef = {
+    get status() {
+      return current
+    },
+    set status(value) {
+      current = value
+      seen.push(value)
+    },
+  }
   const credentials = createUpstreamCredentials()
   const controller = new AbortController()
   const databasePaths: string[] = []
@@ -242,7 +311,13 @@ async function startWorkspace(): Promise<RunningWorkspace> {
     port,
     readyTimeoutMs: 90_000,
     maxAttempts: 1,
-    parentEnv: {},
+    // What the service gets from compose: the model, and the path of the root-only credential blob.
+    parentEnv: {
+      WORKSPACE_OPENCODE_MODEL: MODEL,
+      WORKSPACE_OPENCODE_AUTH_FILE: withCredential
+        ? box.authFile
+        : path.join(box.root, 'absent-workspace_opencode_auth'),
+    },
     deps: {
       prepareDatabase: async () => {
         const dbPath = await prepareFreshDatabase({
@@ -278,6 +353,10 @@ async function startWorkspace(): Promise<RunningWorkspace> {
 
   await vi.waitFor(
     () => {
+      if (outcome === 'refused') {
+        expect(statusRef.status).toBe('degraded')
+        return
+      }
       if (statusRef.status === 'degraded') throw new Error(`supervisor degraded: ${JSON.stringify(startErrors)}`)
       expect(statusRef.status).toBe('ready')
     },
@@ -286,6 +365,7 @@ async function startWorkspace(): Promise<RunningWorkspace> {
 
   return {
     statusRef,
+    statuses: seen,
     credentials,
     proxyUrl,
     upstreamUrl: `http://127.0.0.1:${port}`,
@@ -333,7 +413,7 @@ describe.skipIf(!hasBinary)('the workspace V2 runner against the real stock bina
       throw new Error(`FRO_BOT_OPENCODE_V2_BIN reports "${reported}", not the pinned ${PIN.version}`)
     }
     box = createSandbox()
-    provider = await startHeldProvider()
+    provider = await startFakeProvider(PROVIDER_KEY)
     installPlugins(box)
   }, 300_000)
 
@@ -406,6 +486,8 @@ describe.skipIf(!hasBinary)('the workspace V2 runner against the real stock bina
     {timeout: RUNNER_TIMEOUT_MS},
     async () => {
       // #given a first spawn with a session and a turn held at the provider
+      provider?.setHold(true)
+      const authorizedBefore = provider?.authorizedRequests() ?? 0
       const first = await startWorkspace()
       const firstDb = first.databasePaths[0] as string
       let sessionId: string
@@ -422,7 +504,10 @@ describe.skipIf(!hasBinary)('the workspace V2 runner against the real stock bina
           body: JSON.stringify({text: 'go'}),
         })
         expect(prompt.status).toBeLessThan(300)
-        await vi.waitFor(() => expect(provider?.requests()).toBeGreaterThan(0), {timeout: 30_000, interval: 100})
+        await vi.waitFor(() => expect(provider?.authorizedRequests()).toBeGreaterThan(authorizedBefore), {
+          timeout: 30_000,
+          interval: 100,
+        })
         await vi.waitFor(() => expect(readClaim(firstDb, sessionId)).not.toBeNull(), {timeout: 15_000, interval: 100})
       } finally {
         // #when the service stops: the supervisor interrupts the active session before it closes stdin
@@ -443,6 +528,96 @@ describe.skipIf(!hasBinary)('the workspace V2 runner against the real stock bina
         expect(old.status).toBe(404)
       } finally {
         await second.stop()
+        provider?.setHold(false)
+      }
+    },
+  )
+
+  it(
+    'provisions the key into a fresh database so the model request carries it (fro-bot/agent#1992)',
+    {timeout: RUNNER_TIMEOUT_MS},
+    async () => {
+      // #given the production layout: an overlay with a baseURL and no key, a model, and a root-only blob
+      provider?.setHold(false)
+      const hitsBefore = provider?.hits().length ?? 0
+      const workspace = await startWorkspace()
+      try {
+        // #then the spawn's credential store holds the provisioned credential (counted, never read)
+        const dbPath = workspace.databasePaths[0] as string
+        const db = new DatabaseSync(dbPath)
+        try {
+          const row = db.prepare('SELECT count(*) AS n FROM credential WHERE integration_id = ?').get('anthropic') as {
+            n: number
+          }
+          expect(row.n).toBe(1)
+        } finally {
+          db.close()
+        }
+
+        // #and the read-back the gate relies on lists the connection and carries no secret
+        const integration = await fetch(`${workspace.upstreamUrl}/api/integration/anthropic`, {
+          headers: {
+            authorization: workspace.credentials.authorization() as string,
+            'x-opencode-directory': encodeURIComponent(box.reposRoot),
+          },
+        })
+        const integrationText = await integration.text()
+        expect(integration.status).toBe(200)
+        expect(integrationText).not.toContain(PROVIDER_KEY)
+        expect(JSON.parse(integrationText)).toMatchObject({data: {connections: [{type: 'credential', method: 'key'}]}})
+
+        // #when one prompt is sent
+        const created = (await (
+          await viaProxy(workspace, '/api/session', {
+            method: 'POST',
+            body: JSON.stringify({location: {directory: box.repo}}),
+          })
+        ).json()) as {data: {id: string}}
+        const prompt = await viaProxy(workspace, `/api/session/${created.data.id}/prompt`, {
+          method: 'POST',
+          body: JSON.stringify({text: 'ping'}),
+        })
+        expect(prompt.status).toBeLessThan(300)
+        await vi.waitFor(() => expect(provider?.hits().slice(hitsBefore).length).toBeGreaterThan(0), {
+          timeout: 30_000,
+          interval: 100,
+        })
+
+        // #then the request arrived with the key in x-api-key, the header V1 sent, and no authorization header
+        const hits = provider?.hits().slice(hitsBefore) ?? []
+        expect(hits.length).toBeGreaterThan(0)
+        for (const hit of hits) {
+          expect(hit.headers['x-api-key']).toBe(PROVIDER_KEY)
+          expect(hit.headers.authorization).toBeUndefined()
+        }
+
+        // #and the key reached no log line
+        expect(lines.join('\n')).not.toContain(PROVIDER_KEY)
+      } finally {
+        await workspace.stop()
+      }
+    },
+  )
+
+  it(
+    'never turns ready when the model provider has no credential, and the provider sees no request',
+    {timeout: RUNNER_TIMEOUT_MS},
+    async () => {
+      // #given a configured model and no credential blob
+      provider?.setHold(false)
+      const hitsBefore = provider?.hits().length ?? 0
+
+      // #when the supervisor runs to its verdict
+      const workspace = await startWorkspace({withCredential: false, expect: 'refused'})
+      try {
+        // #then readiness was never reported, the proxy holds no credential, and the failure is named in the log
+        expect(workspace.statuses).not.toContain('ready')
+        expect(workspace.statusRef.status).toBe('degraded')
+        expect(workspace.credentials.authorization()).toBeUndefined()
+        expect(lines).toContain('error opencode-server-v2: credential gate failed')
+        expect(provider?.hits().length).toBe(hitsBefore)
+      } finally {
+        await workspace.stop()
       }
     },
   )

@@ -138,7 +138,8 @@ src/
 ├── backups.ts          /backups list/delete; the quarantine-generation metadata schema (including the optional run id)
 ├── opencode-instance.ts Best-effort POST /instance/dispose to the loopback OpenCode, run after a successful /recover
 ├── opencode-generation.ts  Reads WORKSPACE_IMAGE_OPENCODE_VERSION (baked by the image); major 2+ selects the V2 trio below
-├── opencode-server-v2.ts   V2 supervisor: allowlisted env, fresh database per spawn, credential holder, plugin + permission gates
+├── opencode-server-v2.ts   V2 supervisor: allowlisted env, fresh database per spawn, credential holder, plugin + permission + credential gates
+├── opencode-credentials-v2.ts  V2 provider-credential provisioning (POST /api/credential per provider) and the credential-missing gate
 ├── opencode-proxy-v2.ts    V2 proxy: gateway bearer in, the ready server's Basic credential out, upstream 401 reported as such
 ├── opencode-instance-v2.ts V2 best-effort location evict (DELETE /api/debug/location), authenticated as the running server
 ├── checkout-profile.ts Config inventory, layout, and temp-index cleanliness admission checks shared by update/recover
@@ -164,6 +165,7 @@ src/
 - **The credential holder** is written before readiness flips to ready and cleared on any exit, so the proxy answers 503 (never forwards a stale password) between servers. An upstream 401 is reported as a 502 with `x-fro-bot-proxy-error: upstream-auth`.
 - **Shutdown** lists the sessions still active, interrupts them (reason `user`), closes stdin and confirms the exit, inside the 25s drain. `main.ts` waits for the V2 supervisor before it closes the proxy.
 - **Permission gate:** after the plugin gate the supervisor checks the effective rules from `/api/agent` (`ask` or `deny` outside the checkout, `session_move` and `worktree_create` denied). A server that fails never serves.
+- **Credential gate (#1992):** V2 imports `auth.json` only through a migration that a fresh per-spawn database skips, so each spawn starts with an empty credential store. After the permission gate the supervisor reads the root-only blob (`WORKSPACE_OPENCODE_AUTH_FILE`, default `/run/workspace-agent/secrets/workspace_opencode_auth`), `POST`s each `{type:"api",key}` entry to `/api/credential` over loopback with the per-spawn Basic credential, then reads `GET /api/integration/<provider of WORKSPACE_OPENCODE_MODEL>` back and requires a `credential` (or `env`) connection (`credential-missing` otherwise: never ready). With no model configured it checks the providers it provisioned, and with neither (clone-only) it checks nothing. The key never reaches argv, env, config content, logs, errors or `/readyz`; a non-`api` entry or an unparseable blob is a loud error naming the provider id only. `OPENCODE_DISABLE_MODELS_FETCH=1` is set in `buildOpencodeV2Env` (the egress allowlist blocks `models.opencode.ai`; the bundled snapshot is the floor).
 
 ## Build
 
