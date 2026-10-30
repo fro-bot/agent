@@ -29,7 +29,8 @@ export interface ProviderKeyEntry {
   readonly key: string
 }
 
-export type CredentialErrorKind = 'credential-blob-invalid' | 'credential-provision-failed' | 'credential-missing'
+export type CredentialErrorKind =
+  'credential-blob-invalid' | 'credential-missing' | 'credential-provision-failed' | 'model-config-invalid'
 
 /** A credential failure. `message` and `providers` carry provider ids and statuses, never a key or a response body. */
 export interface CredentialError {
@@ -91,6 +92,24 @@ export function parseAuthBlob(raw: string): CredentialResult<readonly ProviderKe
     return fail('credential-blob-invalid', 'The provider credential blob has no provider entries')
   }
   return {success: true, data: entries}
+}
+
+/**
+ * The model the spawn will use, read from the merged `opencode.json` the entrypoint wrote and the server loads. That
+ * file is the one place `deploy/scripts/merge-config.mjs` has already resolved env model against overlay model, so
+ * this does not re-implement that rule. Undefined when the file names no model. The error never quotes the file,
+ * which may hold an inline provider key from the operator's overlay.
+ */
+export function modelFromMergedConfig(raw: string): CredentialResult<string | undefined> {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return fail('model-config-invalid', 'The merged OpenCode config is not valid JSON')
+  }
+  if (!isRecord(parsed)) return fail('model-config-invalid', 'The merged OpenCode config is not a JSON object')
+  const model = typeof parsed.model === 'string' ? parsed.model.trim() : ''
+  return {success: true, data: model === '' ? undefined : model}
 }
 
 /** The provider half of a `provider/model` string, or undefined when no model is configured. */

@@ -50,6 +50,7 @@ import {createOpencodeProxyV2} from './opencode-proxy-v2.js'
 import {
   createUpstreamCredentials,
   prepareFreshDatabase,
+  readEffectiveModelFromConfig,
   runSupervisedOpencodeV2,
   WORKSPACE_V2_PLUGIN_SPECS,
 } from './opencode-server-v2.js'
@@ -313,12 +314,14 @@ async function startWorkspace(options: StartWorkspaceOptions = {}): Promise<Runn
     maxAttempts: 1,
     // What the service gets from compose: the model, and the path of the root-only credential blob.
     parentEnv: {
-      WORKSPACE_OPENCODE_MODEL: MODEL,
       WORKSPACE_OPENCODE_AUTH_FILE: withCredential
         ? box.authFile
         : path.join(box.root, 'absent-workspace_opencode_auth'),
     },
     deps: {
+      // The model comes from the merged config the sandbox wrote (installPlugins), as in production.
+      readEffectiveModel: () =>
+        readEffectiveModelFromConfig(path.join(box.home, '.config', 'opencode', 'opencode.json')),
       prepareDatabase: async () => {
         const dbPath = await prepareFreshDatabase({
           baseDir: box.dbBase,
@@ -565,6 +568,18 @@ describe.skipIf(!hasBinary)('the workspace V2 runner against the real stock bina
         expect(integration.status).toBe(200)
         expect(integrationText).not.toContain(PROVIDER_KEY)
         expect(JSON.parse(integrationText)).toMatchObject({data: {connections: [{type: 'credential', method: 'key'}]}})
+
+        // #and provisioning works while the bearer proxy refuses the credential group: the supervisor stored the key
+        // straight to loopback, the group answers there (control), and the gateway bearer gets a 404 for it
+        const direct = await fetch(`${workspace.upstreamUrl}/api/credential`, {
+          headers: {authorization: workspace.credentials.authorization() as string},
+        })
+        expect(direct.status).toBe(200)
+        for (const spelling of ['/api/credential', '/api/CREDENTIAL', '/api/%63redential', '/api/credential/']) {
+          const viaGateway = await viaProxy(workspace, spelling)
+          expect(viaGateway.status).toBe(404)
+          expect(await viaGateway.text()).not.toContain(PROVIDER_KEY)
+        }
 
         // #when one prompt is sent
         const created = (await (

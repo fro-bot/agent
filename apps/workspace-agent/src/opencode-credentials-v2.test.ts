@@ -3,6 +3,7 @@ import type {Logger} from './opencode-server.js'
 import {describe, expect, it, vi} from 'vitest'
 
 import {
+  modelFromMergedConfig,
   modelProviderId,
   parseAuthBlob,
   provisionCredentials,
@@ -116,6 +117,43 @@ describe('modelProviderId', () => {
     ['/model', undefined],
   ])('reads %j as %j', (model, expected) => {
     expect(modelProviderId(model)).toBe(expected)
+  })
+})
+
+describe('modelFromMergedConfig', () => {
+  it('reads the model the merged config names, wherever it came from (env model or overlay)', () => {
+    // #given the file merge-config writes: base + overlay, with the env model winning only when it is non-blank
+    const merged = JSON.stringify({
+      autoupdate: false,
+      provider: {openai: {options: {baseURL: 'https://x/v1'}}},
+      model: 'openai/gpt-5.4-mini',
+    })
+
+    // #then
+    expect(modelFromMergedConfig(merged)).toEqual({success: true, data: 'openai/gpt-5.4-mini'})
+  })
+
+  it.each([
+    ['no model', {autoupdate: false}],
+    ['a blank model', {model: '   '}],
+    ['a non-string model', {model: {id: 'x'}}],
+  ])('reads %s as no model', (_label, config) => {
+    expect(modelFromMergedConfig(JSON.stringify(config))).toEqual({success: true, data: undefined})
+  })
+
+  it('trims the model', () => {
+    expect(modelFromMergedConfig('{"model":"  anthropic/claude-sonnet-4-6 "}')).toEqual({
+      success: true,
+      data: 'anthropic/claude-sonnet-4-6',
+    })
+  })
+
+  it('refuses a config that is not a JSON object, without quoting it (it may hold an inline key)', () => {
+    for (const raw of ['{"provider": {"x": {"options": {"apiKey": "sk-SUPERSECRET', '[]', '"model"']) {
+      const result = modelFromMergedConfig(raw)
+      expect(result.success).toBe(false)
+      expect(JSON.stringify(result)).not.toContain('SUPERSECRET')
+    }
   })
 })
 

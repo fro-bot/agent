@@ -16,6 +16,8 @@
  *   and `host` do). The SSE stream (`/api/event`) is uncompressed, delivered incrementally, and sends a `:
  *   heartbeat` comment every 15 seconds, so it needs no special handling beyond the timeout exemption.
  * - The teardown classifier knows the V2 routes.
+ * - The `/api/credential` group is never forwarded (fro-bot/agent#1992). The supervisor stores provider keys there,
+ *   straight to loopback and not through this proxy, and `credential.list` returns every stored value in the clear.
  *
  * SECURITY INVARIANTS:
  * 1. The bearer is compared with `timingSafeEqual`, length-checked first, and is never logged or echoed.
@@ -24,6 +26,7 @@
  * 4. No header value, query string or request body is logged. The workspace directory travels in a header and in
  *    the evict query, so the teardown log carries only a validated session id, the status and the duration.
  * 5. Non-SSE requests have an inactivity timeout (504). SSE is exempt.
+ * 6. A bearer holder never reaches `/api/credential`: it is answered 404 and not forwarded, however the path is spelled.
  */
 
 import type {OpencodeProxyHandle} from './opencode-proxy.js'
@@ -41,6 +44,7 @@ const SERVICE_UNAVAILABLE_BODY = 'Service Unavailable\n'
 const GATEWAY_TIMEOUT_BODY = 'Gateway Timeout\n'
 const UPSTREAM_AUTH_FAILED_BODY = 'Upstream Authentication Failed\n'
 const BAD_GATEWAY_BODY = 'Bad Gateway\n'
+const NOT_FOUND_BODY = 'Not Found\n'
 
 /** Names the cause of a 502 the proxy synthesised, so a caller can tell an auth failure from a missing server. */
 const PROXY_ERROR_HEADER = 'x-fro-bot-proxy-error'
@@ -103,6 +107,51 @@ function classifyTeardown(method: string | undefined, rawUrl: string | undefined
   return undefined
 }
 
+/** How many times a path is percent-decoded before it is judged. A path still changing after this is not legitimate. */
+const MAX_PATH_DECODE_ROUNDS = 3
+
+/**
+ * The path segments the server's router would see, or undefined when the path cannot be judged.
+ *
+ * Measured against v2.2.0 (/tmp/v2-plan/cred/echo-check.md): the router matches `credential` case-insensitively and
+ * after percent-decoding, collapses empty segments and ignores `;params`. So the path is decoded until it is stable
+ * (bounded), split on `/` and `\`, emptied of `.` and empty segments, resolved for `..`, and stripped of `;params`.
+ * The query and fragment are not part of the path.
+ */
+function canonicalPathSegments(rawUrl: string | undefined): readonly string[] | undefined {
+  if (rawUrl === undefined) return undefined
+  let path = rawUrl.split(/[?#]/, 1)[0] ?? ''
+  for (let round = 0; ; round++) {
+    let decoded: string
+    try {
+      decoded = decodeURIComponent(path)
+    } catch {
+      return undefined
+    }
+    if (decoded === path) break
+    if (round === MAX_PATH_DECODE_ROUNDS - 1) return undefined
+    path = decoded
+  }
+  const segments: string[] = []
+  for (const raw of path.split(/[/\\]/)) {
+    const segment = raw.split(';', 1)[0] ?? ''
+    if (segment === '' || segment === '.') continue
+    if (segment === '..') segments.pop()
+    else segments.push(segment)
+  }
+  return segments
+}
+
+/**
+ * True for any request that could reach the `credential` route group, and for any path that cannot be judged. Fails
+ * closed: a malformed or endlessly encoded path is not forwarded either.
+ */
+function targetsCredentialRoutes(rawUrl: string | undefined): boolean {
+  const segments = canonicalPathSegments(rawUrl)
+  if (segments === undefined) return true
+  return segments[0]?.toLowerCase() === 'api' && segments[1]?.toLowerCase() === 'credential'
+}
+
 export interface OpencodeProxyV2Options {
   /** Expected bearer token. Compared with `timingSafeEqual`. Never logged. */
   readonly token: string
@@ -155,6 +204,15 @@ export function createOpencodeProxyV2(options: OpencodeProxyV2Options): Opencode
       // Never log the Authorization header value or the url (the query can carry a directory).
       logger.warn('opencode-proxy-v2: unauthorized request', {method: req.method})
       reply(res, 401, UNAUTHORIZED_BODY)
+      return
+    }
+
+    // --- Credential routes: never forwarded ---
+    // After the bearer check (an unauthenticated caller learns nothing) and before the 503 and the forward, so the
+    // answer is the same whether or not a server is ready. Nothing request-derived is logged but the method.
+    if (targetsCredentialRoutes(req.url)) {
+      logger.warn('opencode-proxy-v2: credential route blocked', {method: req.method})
+      reply(res, 404, NOT_FOUND_BODY)
       return
     }
 

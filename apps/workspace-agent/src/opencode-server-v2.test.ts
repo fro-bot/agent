@@ -6,7 +6,7 @@ import type {
 import type {RunSupervisedOpencodeV2Options} from './opencode-server-v2.js'
 import type {Logger, SupervisedStatusRef} from './opencode-server.js'
 
-import {mkdtempSync, readdirSync, rmSync, statSync, writeFileSync} from 'node:fs'
+import {mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync} from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
@@ -23,6 +23,7 @@ import {
   buildOpencodeV2Env,
   createUpstreamCredentials,
   prepareFreshDatabase,
+  readEffectiveModelFromConfig,
   runSupervisedOpencodeV2,
 } from './opencode-server-v2.js'
 
@@ -60,7 +61,7 @@ function createHandle(options: {
   /** Replaces the `/api/agent` answer, to stall the response headers or the body. */
   agentResponse?: () => Promise<Response>
   /** Answers any other path (the credential and integration routes); undefined falls through to 404. */
-  routes?: (pathname: string, init?: RequestInit) => Response | Promise<Response> | undefined
+  routes?: (pathname: string, init?: RequestInit) => Response | Promise<Response | undefined> | undefined
 }): FakeHandle {
   let resolveExit: (info: {code: number | null; signal: NodeJS.Signals | null}) => void = () => undefined
   const exited = new Promise<{code: number | null; signal: NodeJS.Signals | null}>(resolve => {
@@ -83,7 +84,7 @@ function createHandle(options: {
     directory: '/workspace/repos',
     fetch: async (pathname, init) => {
       fetchPaths.push(pathname)
-      const routed = options.routes?.(pathname, init)
+      const routed = await options.routes?.(pathname, init)
       if (routed !== undefined) return routed
       if (pathname === '/api/session/active') {
         if (options.activeSessions === 'fail') throw new Error('unreachable')
@@ -198,6 +199,60 @@ describe('buildOpencodeV2Env', () => {
 
     // #then
     expect(env).not.toHaveProperty('OPENCODE_DISABLE_FILEWATCHER')
+  })
+})
+
+describe('readEffectiveModelFromConfig', () => {
+  const roots: string[] = []
+  afterEach(() => {
+    for (const root of roots.splice(0)) rmSync(root, {recursive: true, force: true})
+  })
+  function configDir(): string {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'ws-v2-model-'))
+    roots.push(root)
+    return root
+  }
+
+  it('reads the model the merged config names, including one that came only from the overlay', () => {
+    // #given the merged file for WORKSPACE_OPENCODE_MODEL unset and an overlay that carries `model`
+    const file = path.join(configDir(), 'opencode.json')
+    writeFileSync(file, JSON.stringify({autoupdate: false, model: 'openai/gpt-5.4-mini', provider: {openai: {}}}))
+
+    // #when / #then
+    expect(readEffectiveModelFromConfig(file)).toBe('openai/gpt-5.4-mini')
+  })
+
+  it('reads no model for an absent file or one without a model', () => {
+    const dir = configDir()
+    const file = path.join(dir, 'opencode.json')
+    writeFileSync(file, JSON.stringify({autoupdate: false}))
+    expect(readEffectiveModelFromConfig(path.join(dir, 'missing.json'))).toBeUndefined()
+    expect(readEffectiveModelFromConfig(file)).toBeUndefined()
+  })
+
+  it('refuses a symlink, an oversized file and malformed JSON, without quoting the file', () => {
+    const dir = configDir()
+    const target = path.join(dir, 'target.json')
+    writeFileSync(target, '{"model":"x/y"}')
+    const link = path.join(dir, 'link.json')
+    symlinkSync(target, link)
+    const big = path.join(dir, 'big.json')
+    writeFileSync(big, `${' '.repeat(600 * 1024)}{}`)
+    const bad = path.join(dir, 'bad.json')
+    writeFileSync(bad, '{"provider":{"x":{"options":{"apiKey":"sk-SUPERSECRETKEY"')
+
+    expect(() => readEffectiveModelFromConfig(link)).toThrow(/symlink/)
+    expect(() => readEffectiveModelFromConfig(big)).toThrow(/too large/)
+    expect(() => readEffectiveModelFromConfig(bad)).toThrow(/not valid JSON/)
+    const thrown = (): string => {
+      try {
+        readEffectiveModelFromConfig(bad)
+        return ''
+      } catch (error) {
+        return String(error)
+      }
+    }
+    expect(thrown()).not.toContain('SUPERSECRET')
   })
 })
 
@@ -316,7 +371,9 @@ function stalledBody(): Response {
 describe('runSupervisedOpencodeV2', () => {
   const NO_BACKOFF = {initialBackoffMs: 0, maxBackoffMs: 0}
 
-  function setup(overrides: Partial<RunSupervisedOpencodeV2Options> = {}) {
+  /** `model` is the effective model the merged config file names; absent means no model is configured. */
+  function setup(overrides: Partial<RunSupervisedOpencodeV2Options> & {readonly model?: string} = {}) {
+    const {model, ...runOverrides} = overrides
     const capture = createCapturingLogger()
     const credentials = createUpstreamCredentials()
     const statusRef: SupervisedStatusRef = {status: 'starting'}
@@ -331,7 +388,7 @@ describe('runSupervisedOpencodeV2', () => {
       parentEnv: {HTTPS_PROXY: 'http://mitmproxy:8080'},
       ...NO_BACKOFF,
       maxAttempts: 3,
-      ...overrides,
+      ...runOverrides,
       deps: {
         prepareDatabase: async () => {
           dbCounter += 1
@@ -342,6 +399,7 @@ describe('runSupervisedOpencodeV2', () => {
         verifyRules: OK_GATE,
         // Never the real secret path: the default reads /run/workspace-agent/secrets.
         readAuthBlob: () => null,
+        readEffectiveModel: () => model,
         ...overrides.deps,
       },
     }
@@ -842,7 +900,8 @@ describe('runSupervisedOpencodeV2', () => {
       const fake = createHandle({authorization: 'Basic one', routes: store.routes})
       const blob = JSON.stringify({anthropic: {type: 'api', key: KEY}, openai: {type: 'api', key: `${KEY}-openai`}})
       const {options, startOptions, capture, credentials} = setup({
-        parentEnv: {HTTPS_PROXY: 'http://mitmproxy:8080', WORKSPACE_OPENCODE_MODEL: MODEL},
+        parentEnv: {HTTPS_PROXY: 'http://mitmproxy:8080'},
+        model: MODEL,
       })
       const seenAtReady: (string | undefined)[] = []
       let status: SupervisedStatusRef['status'] = 'starting'
@@ -892,7 +951,7 @@ describe('runSupervisedOpencodeV2', () => {
       const secondStore = credentialStore()
       const first = createHandle({authorization: 'Basic first', routes: firstStore.routes})
       const second = createHandle({authorization: 'Basic second', routes: secondStore.routes})
-      const {options, startOptions, credentials} = setup({parentEnv: {WORKSPACE_OPENCODE_MODEL: MODEL}})
+      const {options, startOptions, credentials} = setup({model: MODEL})
       const controller = new AbortController()
       options.deps = {
         ...options.deps,
@@ -919,7 +978,7 @@ describe('runSupervisedOpencodeV2', () => {
       const fake = createHandle({authorization: 'Basic one', routes: store.routes})
       const {options, startOptions, capture, credentials} = setup({
         maxAttempts: 1,
-        parentEnv: {WORKSPACE_OPENCODE_MODEL: MODEL},
+        model: MODEL,
       })
       const {statusRef, seen} = recordStatuses()
       options.deps = {...options.deps, readAuthBlob: () => BLOB, startServer: scriptedStart([fake], startOptions)}
@@ -946,7 +1005,7 @@ describe('runSupervisedOpencodeV2', () => {
           return undefined
         },
       })
-      const {options, startOptions, capture} = setup({maxAttempts: 1, parentEnv: {WORKSPACE_OPENCODE_MODEL: MODEL}})
+      const {options, startOptions, capture} = setup({maxAttempts: 1, model: MODEL})
       const {statusRef, seen} = recordStatuses()
       options.deps = {...options.deps, readAuthBlob: () => BLOB, startServer: scriptedStart([fake], startOptions)}
 
@@ -965,7 +1024,7 @@ describe('runSupervisedOpencodeV2', () => {
       const fake = createHandle({authorization: 'Basic one', routes: store.routes})
       const {options, startOptions, capture, credentials} = setup({
         maxAttempts: 2,
-        parentEnv: {WORKSPACE_OPENCODE_MODEL: MODEL},
+        model: MODEL,
       })
       const {statusRef, seen} = recordStatuses()
       options.deps = {...options.deps, readAuthBlob: () => null, startServer: scriptedStart([fake], startOptions)}
@@ -987,7 +1046,7 @@ describe('runSupervisedOpencodeV2', () => {
       // #given a blob for openai and a model on anthropic
       const store = credentialStore()
       const fake = createHandle({authorization: 'Basic one', routes: store.routes})
-      const {options, startOptions, capture} = setup({maxAttempts: 1, parentEnv: {WORKSPACE_OPENCODE_MODEL: MODEL}})
+      const {options, startOptions, capture} = setup({maxAttempts: 1, model: MODEL})
       const {statusRef, seen} = recordStatuses()
       options.deps = {
         ...options.deps,
@@ -1104,6 +1163,113 @@ describe('runSupervisedOpencodeV2', () => {
       expect(statusRef.status).toBe('degraded')
       expect(capture.serialized()).toContain('cannot read the provider credential blob')
     })
+
+    it('refuses readiness for an overlay-only model whose provider the blob does not cover', async () => {
+      // #given the effective model came from the overlay (openai) and the blob holds only anthropic
+      const store = credentialStore()
+      const fake = createHandle({authorization: 'Basic one', routes: store.routes})
+      const {options, startOptions, capture} = setup({maxAttempts: 1, model: 'openai/gpt-5.4-mini'})
+      const {statusRef, seen} = recordStatuses()
+      options.deps = {...options.deps, readAuthBlob: () => BLOB, startServer: scriptedStart([fake], startOptions)}
+
+      // #when
+      await runSupervisedOpencodeV2({...options, statusRef})
+
+      // #then the gate looked at openai, found nothing, and the server never served
+      expect(seen).not.toContain('ready')
+      expect(fake.fetchPaths).toContain('/api/integration/openai')
+      expect(capture.serialized()).toContain('credential-missing')
+      expect(capture.serialized()).toContain('openai')
+    })
+
+    it('reaches ready for an overlay-only model whose provider the blob covers', async () => {
+      // #given
+      const store = credentialStore()
+      const fake = createHandle({authorization: 'Basic one', routes: store.routes})
+      const {options, startOptions, statusRef} = setup({model: 'openai/gpt-5.4-mini'})
+      const controller = new AbortController()
+      options.deps = {
+        ...options.deps,
+        readAuthBlob: () => JSON.stringify({openai: {type: 'api', key: KEY}}),
+        startServer: scriptedStart([fake], startOptions),
+      }
+
+      // #when
+      const done = runSupervisedOpencodeV2({...options, signal: controller.signal})
+      await vi.waitFor(() => expect(statusRef.status).toBe('ready'))
+
+      // #then
+      expect(fake.fetchPaths).toContain('/api/integration/openai')
+      expect(fake.fetchPaths).not.toContain('/api/integration/anthropic')
+      controller.abort()
+      await done
+    })
+
+    it('does not spawn when the effective model cannot be read', async () => {
+      // #given
+      const {options, startOptions, statusRef, capture} = setup()
+      options.deps = {
+        ...options.deps,
+        readEffectiveModel: () => {
+          throw new Error('Secret path is not a regular file: /home/opencode/.config/opencode/opencode.json')
+        },
+        startServer: scriptedStart([createHandle({authorization: 'Basic x'})], startOptions),
+      }
+
+      // #when
+      await runSupervisedOpencodeV2(options)
+
+      // #then
+      expect(startOptions).toHaveLength(0)
+      expect(statusRef.status).toBe('degraded')
+      expect(capture.serialized()).toContain('cannot read the effective model')
+    })
+
+    it.each([
+      ['during provisioning', 'provision'],
+      ['during the gate read-back', 'gate'],
+    ] as const)(
+      'stops cleanly when the service aborts %s: no gate-failure log and no degraded status',
+      async (_label, phase) => {
+        // #given a server whose credential route (or integration route) never answers
+        let reached: () => void = () => undefined
+        const inFlight = new Promise<void>(resolve => {
+          reached = resolve
+        })
+        const store = credentialStore()
+        const fake = createHandle({
+          authorization: 'Basic one',
+          routes: async (pathname, init) => {
+            const stall =
+              phase === 'provision' ? pathname === '/api/credential' : pathname.startsWith('/api/integration/')
+            if (stall) {
+              reached()
+              return new Promise<Response>(() => undefined)
+            }
+            return store.routes(pathname, init)
+          },
+        })
+        const {options, startOptions, capture} = setup({model: MODEL, requestTimeoutMs: 60_000, maxAttempts: 3})
+        const {statusRef, seen} = recordStatuses()
+        const controller = new AbortController()
+        options.deps = {...options.deps, readAuthBlob: () => BLOB, startServer: scriptedStart([fake], startOptions)}
+        const done = runSupervisedOpencodeV2({...options, statusRef, signal: controller.signal})
+        await inFlight
+
+        // #when the service stops while the request is in flight
+        controller.abort()
+        await done
+
+        // #then the server was stopped once, nothing was retried, and the stop is not reported as a failure
+        expect(fake.shutdown).toHaveBeenCalledTimes(1)
+        expect(startOptions).toHaveLength(1)
+        expect(seen).not.toContain('degraded')
+        expect(seen).not.toContain('ready')
+        expect(capture.serialized()).not.toContain('credential gate failed')
+        expect(capture.serialized()).not.toContain('credential-provision-failed')
+        expect(capture.serialized()).not.toContain('credential-missing')
+      },
+    )
 
     it('puts OPENCODE_DISABLE_MODELS_FETCH=1 in the spawn environment', async () => {
       // #given

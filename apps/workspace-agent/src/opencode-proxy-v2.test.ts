@@ -362,6 +362,128 @@ describe('opencode-proxy-v2', () => {
     expect(upstream.openSse()).toBe(0)
   })
 
+  describe('credential routes (fro-bot/agent#1992)', () => {
+    // The supervisor stores provider keys through /api/credential, and `credential.list` returns them in the clear.
+    // The gateway bearer must never reach that group, however the path is written.
+    const BLOCKED_PATHS = [
+      '/api/credential',
+      '/api/credential/',
+      '/api/credential?x=1',
+      '/api/credential/cred_1',
+      '/api/credential/cred_1/',
+      '/api/credential/cred_1/activate',
+      '/API/credential',
+      '/api/CREDENTIAL',
+      '/Api/Credential/cred_1',
+      '/api/%63redential',
+      '/api/%43REDENTIAL/cred_1',
+      '/%61pi/credential',
+      '/%41PI/%63redential/cred_1/activate',
+      '/api/credential%2F',
+      '/api/credential%2Fcred_1',
+      '/api%2Fcredential',
+      '/api%2fcredential%2fcred_1',
+      '/api/credential%252Fcred_1',
+      '/api/%2563redential',
+      '/api//credential',
+      '//api/credential',
+      '/api/./credential',
+      '/api/x/../credential',
+      '/api/x/%2e%2e/credential',
+      '/api/credential;x=1',
+      String.raw`/api\credential`,
+      '/api%5Ccredential/cred_1',
+    ]
+    const METHODS = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']
+
+    it.each(BLOCKED_PATHS)('answers 404 and never calls the server for %s, whatever the method', async path => {
+      // #given a ready server
+      const {upstream, url} = await setup()
+
+      // #when every method asks for the credential group in this spelling
+      const replies = []
+      for (const method of METHODS) {
+        replies.push(await request(url, {method, path, headers: BEARER}))
+      }
+
+      // #then each is a 404 with the fixed body (HEAD has none) and the server saw nothing
+      for (const [index, reply] of replies.entries()) {
+        expect(reply.status).toBe(404)
+        expect(reply.body).toBe(METHODS[index] === 'HEAD' ? '' : 'Not Found\n')
+      }
+      expect(upstream.seen).toHaveLength(0)
+    })
+
+    it('blocks a path that cannot be decoded, or that is still changing after three decodes', async () => {
+      // #given
+      const {upstream, url} = await setup()
+
+      // #when
+      const malformed = await request(url, {path: '/api/%E0%A4%A', headers: BEARER})
+      const nested = await request(url, {path: '/api/%25252563redential', headers: BEARER})
+
+      // #then
+      expect(malformed.status).toBe(404)
+      expect(nested.status).toBe(404)
+      expect(upstream.seen).toHaveLength(0)
+    })
+
+    it('blocks the credential group even while no server is ready, and still asks for the bearer first', async () => {
+      // #given
+      const {upstream, url} = await setup({credentialed: false})
+
+      // #when
+      const noBearer = await request(url, {path: '/api/credential'})
+      const withBearer = await request(url, {path: '/api/credential', headers: BEARER})
+
+      // #then an unauthenticated caller learns nothing, and an authenticated one gets the same 404 either way
+      expect(noBearer.status).toBe(401)
+      expect(withBearer.status).toBe(404)
+      expect(upstream.seen).toHaveLength(0)
+    })
+
+    it('logs the block without the path, the query or any header', async () => {
+      // #given
+      const {url, lines} = await setup()
+
+      // #when
+      await request(url, {path: '/api/credential/cred_secret_id?label=x', headers: BEARER})
+
+      // #then
+      const blocked = lines.find(line => line.message === 'opencode-proxy-v2: credential route blocked')
+      expect(blocked?.meta).toEqual({method: 'GET'})
+      expect(JSON.stringify(lines)).not.toContain('cred_secret_id')
+    })
+
+    it.each([
+      '/api/info',
+      '/api/session',
+      '/api/session/ses_1/prompt',
+      '/api/integration',
+      '/api/integration/anthropic',
+      '/api/integration/credential',
+      '/api/session/credential',
+      '/api/credentials',
+      '/api/credentialx/y',
+      '/api/provider/credential',
+      '/api/file%2Fcredential',
+      '/api/session?next=/api/credential',
+      '/v1/credential',
+      '/credential',
+    ])('still forwards %s', async path => {
+      // #given
+      const {upstream, url} = await setup()
+
+      // #when
+      const reply = await request(url, {path, headers: {...BEARER, 'x-opencode-directory': '%2Fapi%2Fcredential'}})
+
+      // #then
+      expect(reply.status).toBe(200)
+      expect(upstream.seen).toHaveLength(1)
+      expect(upstream.seen[0]?.url).toBe(path)
+    })
+  })
+
   describe('teardown logging', () => {
     it('logs an interrupt with the session id, the status the caller saw, and no directory', async () => {
       // #given

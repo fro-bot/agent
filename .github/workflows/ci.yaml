@@ -759,6 +759,22 @@ jobs:
           # 401 unless the request carries the provisioned dummy key in x-api-key, the header V1 sent.
           smoke_key='sk-ci-v2-smoke-dummy-not-real'
           fake_port=9701
+          # The trap goes in before anything it cleans up exists, so a failed mktemp or `docker run` still removes the
+          # temp dir and the container.
+          cid=''
+          auth_dir=''
+          cleanup() {
+            status=$?
+            if [ -n "${cid}" ]; then
+              if [ "${status}" -ne 0 ]; then
+                echo "--- workspace logs ---"
+                docker logs "${cid}" 2>&1 || true
+              fi
+              docker rm -f "${cid}" >/dev/null 2>&1 || true
+            fi
+            if [ -n "${auth_dir}" ]; then rm -rf "${auth_dir}"; fi
+          }
+          trap cleanup EXIT
           auth_dir="$(mktemp -d)"
           chmod 755 "${auth_dir}"
           printf '{"anthropic":{"type":"api","key":"%s"}}' "${smoke_key}" > "${auth_dir}/auth.json"
@@ -772,16 +788,6 @@ jobs:
             -v "${auth_dir}/auth.json:/run/workspace-agent/secrets/workspace_opencode_auth:ro" \
             -v "$PWD/deploy/scripts/fake-anthropic-provider.mjs:/fake-provider.mjs:ro" \
             fro-bot-workspace:smoke-v2)"
-          cleanup() {
-            status=$?
-            if [ "${status}" -ne 0 ]; then
-              echo "--- workspace logs ---"
-              docker logs "${cid}" 2>&1 || true
-            fi
-            docker rm -f "${cid}" >/dev/null 2>&1 || true
-            rm -rf "${auth_dir}"
-          }
-          trap cleanup EXIT
 
           docker exec -d "${cid}" node /fake-provider.mjs "${fake_port}" "${smoke_key}"
           fake_up=false
@@ -814,6 +820,17 @@ jobs:
           docker exec "${cid}" curl -fsS --max-time 15 \
             -H 'Authorization: Bearer dummy-smoke-token' -H "${dir_header}" -H 'content-type: application/json' \
             -d '{"text":"ping"}' "http://127.0.0.1:9200/api/session/${session_id}/prompt" >/dev/null
+
+          # The stored key is readable through /api/credential on the loopback server, so the bearer proxy must refuse
+          # that group in every spelling a router could match.
+          for credential_path in /api/credential /api/CREDENTIAL /api/%63redential /api/credential/cred_x; do
+            proxy_status="$(docker exec "${cid}" curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+              -H 'Authorization: Bearer dummy-smoke-token' "http://127.0.0.1:9200${credential_path}")"
+            if [ "${proxy_status}" != "404" ]; then
+              echo "REGRESSION: the :9200 proxy answered ${proxy_status} for ${credential_path}, expected 404"
+              exit 1
+            fi
+          done
 
           # The fake must see a model request carrying the key in x-api-key.
           hits=''
