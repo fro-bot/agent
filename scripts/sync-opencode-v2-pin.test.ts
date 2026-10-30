@@ -163,7 +163,7 @@ describe('main', () => {
 
       // #then it exits 2 with a usage line and touched nothing
       expect(code).toBe(EXIT_USAGE)
-      expect(h.err.join('')).toContain('usage: node scripts/sync-opencode-v2-pin.ts')
+      expect(h.err.join('')).toContain('usage: bun scripts/sync-opencode-v2-pin.ts')
       expect(h.fetchMock).not.toHaveBeenCalled()
       expect(h.writes).toEqual([])
     },
