@@ -193,4 +193,48 @@ describe('reconcileLivePass', () => {
       expect(logger.warning).not.toHaveBeenCalled()
     })
   })
+
+  it('runs an injected pass through the same guard: inert once the run is closed', async () => {
+    // #given — a pass that answers after the run has moved on to teardown
+    const inner = createOwnershipLedger()
+    inner.adopt('child-1', 'task')
+    let closed = false
+    const pass = vi.fn(async (options: {readonly ledger: {settle: (id: string) => void}}) => {
+      options.ledger.settle('child-1')
+    })
+
+    // #when
+    await reconcileLivePass(
+      {ledger: inner, adapter: makeAdapter(), parentSessionId: PARENT, logger: makeLogger()},
+      () => closed,
+      undefined,
+      async options => {
+        closed = true
+        await pass(options)
+      },
+    )
+
+    // #then — the pass ran, and its settle was ignored
+    expect(pass).toHaveBeenCalledTimes(1)
+    expect(inner.outstanding()).toBe(1)
+  })
+
+  it('runs an injected pass that settles while the run is live', async () => {
+    // #given
+    const inner = createOwnershipLedger()
+    inner.adopt('child-1', 'task')
+
+    // #when
+    await reconcileLivePass(
+      {ledger: inner, adapter: makeAdapter(), parentSessionId: PARENT, logger: makeLogger()},
+      () => false,
+      undefined,
+      async options => {
+        options.ledger.settle('child-1')
+      },
+    )
+
+    // #then
+    expect(inner.outstanding()).toBe(0)
+  })
 })

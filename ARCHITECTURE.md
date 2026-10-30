@@ -12,7 +12,7 @@ This monorepo ships three distinct deployable surfaces from one codebase:
 - **`@fro-bot/gateway`** (`packages/gateway/`) — a Discord-first daemon that listens for `@fro-bot` mentions in bound guild channels and runs OpenCode inside a sandboxed workspace container. Includes an operator web surface (Hono, gateway-net only), an inbound announce webhook, and an S3-backed coordination layer. The `/fro-bot dispatch` slash command is a separate, simpler path: it asks the bound repo's `fro-bot.yaml` workflow to run via the GitHub Actions API and returns the run URL — it never touches the gateway's queue, concurrency cap, or run-state.
 - **`@fro.bot/harness`** (`packages/harness/`) — a patched OpenCode binary built via an LLM-merge integration pipeline. Published to npm and GitHub Releases; the Action setup phase downloads the checksum-verified release tarball (not the npm package) as the default OpenCode binary, and reuses an existing `opencode` only when it reports exactly the pinned version. The npm package ships `harness` and `opencode` commands (see [`packages/harness/README.md`](packages/harness/README.md)).
 
-Supporting packages: `@fro-bot/runtime` (`packages/runtime/`) owns shared runtime primitives and version-pin constants; `@fro-bot/action` (`apps/action/`) is a thin workspace wrapper whose build produces the committed root `dist/`; `@fro-bot/workspace-agent` (`apps/workspace-agent/`) is the Hono HTTP sidecar inside the workspace container.
+Supporting packages: `@fro-bot/runtime` (`packages/runtime/`) owns shared runtime primitives and version-pin constants; `@fro-bot/action` (`apps/action/`) is a thin workspace wrapper whose build produces the committed root `dist/`; `@fro-bot/workspace-agent` (`apps/workspace-agent/`) is the Hono HTTP sidecar inside the workspace container. `@fro.bot/opencode-plugin` (`packages/opencode-plugin/`) is the OpenCode V2 plugin published to npm: the `session_*` tools plus a guard that rejects `subagent` calls resuming a session. V2 skips a plugin that fails to load and keeps serving, so its id (`fro-bot.opencode-plugin`) is fixed and the surfaces confirm it by id; no surface loads it yet.
 
 ## Codemap
 
@@ -63,7 +63,8 @@ Symbols verified against the live source tree. Where a symbol has moved to `pack
 | `createRemoteQuestionClient` | Function | `packages/runtime/src/agent/remote-question-client.ts` | v2-SDK `question` reply/reject client |
 | `TriggerDirective` | Interface | `packages/runtime/src/agent/prompt.ts` | Directive + appendMode for triggers |
 | `DEFAULT_SYSTEMATIC_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned Systematic version |
-| `DEFAULT_OPENCODE_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned harness build version |
+| `DEFAULT_OPENCODE_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned harness build (Action default; not the workspace image's) |
+| `opencode-v2-pin.json` | JSON | `packages/runtime/src/shared/opencode-v2-pin.json` | Stock V2 version + asset sha256 |
 
 ### `packages/gateway/`
 
@@ -300,7 +301,8 @@ Per-repo S3 conditional-write locks (`If-None-Match` / `If-Match`) built by `get
 
 - Root `session.idle` with a non-empty ledger enters drain. The drain-completion gate (`execute/drain-completion.ts`) requires each child's notice, current-generation root idle, and a REST-confirmed terminal root reply. Reconciliation settles tracked entries only; it never adopts.
 - Teardown settles through `settleOwnedSessions`; an unconfirmed root or child means `quarantined` (held lock, no slot hand-off).
-- `deploy/plugins/no-task-reuse.mjs` rejects any `task` call with a non-empty `task_id`, so each background job has its own child session.
+- `deploy/plugins/no-task-reuse.mjs` rejects any `task` call with a non-empty `task_id`, so each background job has its own child session. On V2 the `@fro.bot/opencode-plugin` guard does this.
+- Each run picks its loop from the workspace's `/readyz` `opencodeVersion`: V1 `run-core.ts`, V2 `run-core-v2.ts` (with the `-v2` drain and settle modules).
 
 > See also: [Background Subagents and Ownership](docs/wiki/Background%20Subagents%20and%20Ownership.md#background-subagent-ownership-ledger-gateway)
 

@@ -50,6 +50,52 @@ export const DB_FAMILY_BASENAMES: readonly string[] = [DB_MAIN_BASENAME, DB_WAL_
  */
 export const DB_TRANSPORTABLE_BASENAMES: readonly string[] = [DB_MAIN_BASENAME]
 
+/**
+ * Which OpenCode session store a run reads and writes. `v1` is the original key scheme; `v2` has its own
+ * Actions-cache prefix and object-store prefix (`CACHE_V2_PREFIX`, `sessions-v2/`) so the two never overlap.
+ */
+export type SessionGeneration = 'v1' | 'v2'
+
+/**
+ * The OpenCode V2 database and its sidecars. The V2 database filename is pinned once here: the V2 cache path list
+ * and the V2 object-store upload both read it, so neither can drift. V2 names it `opencode.db` on release
+ * channels (probe P15), which today equals the V1 name, but that is a fact about the pinned release, not a
+ * reason to share the constant.
+ */
+export const DB_V2_MAIN_BASENAME = 'opencode.db'
+export const DB_V2_WAL_BASENAME = `${DB_V2_MAIN_BASENAME}-wal`
+export const DB_V2_SHM_BASENAME = `${DB_V2_MAIN_BASENAME}-shm`
+export const DB_V2_FAMILY_BASENAMES: readonly string[] = [DB_V2_MAIN_BASENAME, DB_V2_WAL_BASENAME, DB_V2_SHM_BASENAME]
+
+/** Same transport rule as `DB_TRANSPORTABLE_BASENAMES`: the main database file only, never a sidecar. */
+export const DB_V2_TRANSPORTABLE_BASENAMES: readonly string[] = [DB_V2_MAIN_BASENAME]
+
+export interface SessionDbBasenames {
+  readonly main: string
+  readonly wal: string
+  readonly shm: string
+  readonly family: readonly string[]
+  readonly transportable: readonly string[]
+}
+
+export function getSessionDbBasenames(generation: SessionGeneration): SessionDbBasenames {
+  return generation === 'v2'
+    ? {
+        main: DB_V2_MAIN_BASENAME,
+        wal: DB_V2_WAL_BASENAME,
+        shm: DB_V2_SHM_BASENAME,
+        family: DB_V2_FAMILY_BASENAMES,
+        transportable: DB_V2_TRANSPORTABLE_BASENAMES,
+      }
+    : {
+        main: DB_MAIN_BASENAME,
+        wal: DB_WAL_BASENAME,
+        shm: DB_SHM_BASENAME,
+        family: DB_FAMILY_BASENAMES,
+        transportable: DB_TRANSPORTABLE_BASENAMES,
+      }
+}
+
 export function getOpenCodeDbPath(): string {
   const xdgDataHome = process.env.XDG_DATA_HOME
   const basePath = xdgDataHome ?? path.join(os.homedir(), '.local', 'share')

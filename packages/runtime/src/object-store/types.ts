@@ -2,7 +2,7 @@ import type {Result} from '../shared/types.js'
 
 export type {ObjectStoreConfig} from '../shared/types.js'
 
-export type ContentType = 'artifacts' | 'bindings' | 'locks' | 'metadata' | 'runs' | 'sessions'
+export type ContentType = 'artifacts' | 'bindings' | 'locks' | 'metadata' | 'runs' | 'sessions' | 'sessions-v2'
 
 export interface ObjectStoreAdapter {
   readonly upload: (key: string, localPath: string) => Promise<Result<void, Error>>

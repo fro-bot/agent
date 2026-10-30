@@ -30,11 +30,15 @@ export const LIVE_RECONCILE_TIMEOUT_MS = DEFAULT_SETTLE_TIMEOUT_MS
 /**
  * Runs one reconcile pass under `LIVE_RECONCILE_TIMEOUT_MS`. Never rejects. `isClosed` reports that the run no
  * longer owns the ledger; a pass that is still running by then is inert whenever it answers.
+ *
+ * `reconcile` is the pass to run (default: the session pass). The V2 loop runs the background-shell pass through the
+ * same guard, so each kind of entry gets its own bound.
  */
 export async function reconcileLivePass(
   options: ReconcileLedgerOptions,
   isClosed: () => boolean,
   timeoutMs: number = LIVE_RECONCILE_TIMEOUT_MS,
+  reconcile: (passOptions: ReconcileLedgerOptions) => Promise<unknown> = reconcileLedgerOnce,
 ): Promise<void> {
   const {ledger, logger, parentSessionId} = options
   if (isClosed()) return
@@ -63,9 +67,7 @@ export async function reconcileLivePass(
   })
   try {
     const outcome = await Promise.race([
-      reconcileLedgerOnce({...options, ledger: guardedLedger, signal: controller.signal}).then(
-        () => 'finished' as const,
-      ),
+      reconcile({...options, ledger: guardedLedger, signal: controller.signal}).then(() => 'finished' as const),
       timedOut,
     ])
     logger.debug('Ledger reconciliation pass finished', {

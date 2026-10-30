@@ -42,5 +42,11 @@ export default defineConfig({
   entry: [path.join(dirname, 'src/main.ts')],
   format: 'esm',
   outDir: 'dist',
+  // An entry bundle with no type consumer. Declaration output would also have to resolve the runtime subpath's
+  // TypeScript source as declarations, which it cannot.
+  dts: false,
+  // The V2 runner imports `@fro-bot/runtime/workspace-v2`. Runtime is a TypeScript-source workspace package, so it
+  // is bundled in (as the gateway does), never left as a bare import the production image could not resolve.
+  noExternal: id => id === '@fro-bot/runtime' || id.startsWith('@fro-bot/runtime/'),
   plugins: [bundleSymbolGuardPlugin()],
 })

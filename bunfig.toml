@@ -17,4 +17,16 @@ minimumReleaseAge = 259200
 # this repo. The age gate buys a cooling-off period against a compromised upstream
 # publish; it has nothing to buy here, and it blocks Renovate's own update PRs from
 # installing for three days. Bun matches these exactly — no glob support.
-minimumReleaseAgeExcludes = ["@bfra.me/es", "@bfra.me/eslint-config", "@bfra.me/prettier-config", "@bfra.me/tsconfig"]
+# `@opencode/*`: the OpenCode V2 plugin API, named exactly (no globs) including the packages `@opencode/plugin` pulls in.
+minimumReleaseAgeExcludes = [
+  "@bfra.me/es",
+  "@bfra.me/eslint-config",
+  "@bfra.me/prettier-config",
+  "@bfra.me/tsconfig",
+  "@opencode/ai",
+  "@opencode/client",
+  "@opencode/plugin",
+  "@opencode/protocol",
+  "@opencode/schema",
+  "@opencode/util"
+]

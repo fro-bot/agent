@@ -1,5 +1,13 @@
 import {describe, expect, it} from 'vitest'
-import {buildPrimaryCacheKey, buildRestoreKeys, buildSaveCacheKey, type CacheKeyComponents} from './cache-key.js'
+import {
+  buildPrimaryCacheKey,
+  buildRestoreKeys,
+  buildRestoreTiers,
+  buildSaveCacheKey,
+  classifyRestoreHit,
+  resolveSessionGeneration,
+  type CacheKeyComponents,
+} from './cache-key.js'
 
 describe('buildPrimaryCacheKey', () => {
   it('generates correct key format with all components', () => {
@@ -286,5 +294,170 @@ describe('buildSaveCacheKey', () => {
         expect(key.startsWith(repoScoped as string)).toBe(true)
       }
     })
+  })
+})
+
+describe('resolveSessionGeneration', () => {
+  it.each(['2.2.0', 'v2.2.0', '10.0.1', '2.0.0-beta.1'])('selects V2 for major 2 or above (%s)', version => {
+    // #given a V2 version #when resolving #then V2
+    expect(resolveSessionGeneration(version)).toBe('v2')
+  })
+
+  it.each(['1.19.4', '1.19.4+harness.5bde2635', '0.9.0', 'latest', ''])('selects V1 for %j', version => {
+    // #given a V1 or unparseable version #when resolving #then V1
+    expect(resolveSessionGeneration(version)).toBe('v1')
+  })
+
+  it.each([null, undefined])('treats a missing version (%s) as V1', version => {
+    // #given no OPENCODE_VERSION state #when resolving #then V1, so a missing key never selects V2
+    expect(resolveSessionGeneration(version)).toBe('v1')
+  })
+})
+
+describe('V2 cache keys', () => {
+  const components: CacheKeyComponents = {
+    agentIdentity: 'github',
+    repo: 'owner/repo',
+    ref: 'main',
+    os: 'Linux',
+  }
+
+  it('builds the primary key under the opencode-v2-storage prefix', () => {
+    // #given standard components #when building the V2 primary key
+    const key = buildPrimaryCacheKey(components, 'v2')
+
+    // #then it uses the V2 prefix
+    expect(key).toBe('opencode-v2-storage-github-owner-repo-main-Linux')
+  })
+
+  it('builds branch-scoped then repo-scoped V2 restore keys', () => {
+    // #given standard components #when building the V2 restore keys
+    const keys = buildRestoreKeys(components, 'v2')
+
+    // #then the order is the same as V1's, under the V2 prefix
+    expect(keys).toEqual(['opencode-v2-storage-github-owner-repo-main-', 'opencode-v2-storage-github-owner-repo-'])
+  })
+
+  it('builds the save key with run, attempt and identity suffixes', () => {
+    // #given a run, an attempt and a job identity #when building the V2 save key
+    const key = buildSaveCacheKey(components, 42, 2, 'fro-bot-observe', 'v2')
+
+    // #then it is the V2 primary key plus the same suffixes V1 uses
+    expect(key).toBe('opencode-v2-storage-github-owner-repo-main-Linux-42-2-fro-bot-observe')
+  })
+
+  it('leaves V1 key builders byte-identical when no generation is given', () => {
+    // #given the V1 default #when building each key
+    // #then the output is unchanged
+    expect(buildPrimaryCacheKey(components)).toBe('opencode-storage-github-owner-repo-main-Linux')
+    expect(buildPrimaryCacheKey(components, 'v1')).toBe(buildPrimaryCacheKey(components))
+    expect(buildRestoreKeys(components)).toEqual([
+      'opencode-storage-github-owner-repo-main-',
+      'opencode-storage-github-owner-repo-',
+    ])
+    expect(buildRestoreKeys(components, 'v1')).toEqual(buildRestoreKeys(components))
+    expect(buildSaveCacheKey(components, 42, 2, null)).toBe('opencode-storage-github-owner-repo-main-Linux-42-2')
+    expect(buildSaveCacheKey(components, 42, 2, null, 'v1')).toBe(buildSaveCacheKey(components, 42, 2, null))
+  })
+
+  it('never matches a V2 key with a V1 restore-key prefix, nor a V1 key with a V2 prefix', () => {
+    // #given a V1 and a V2 save key for the same run, and both generations' restore keys
+    const v1Save = buildSaveCacheKey(components, 42, 1, null, 'v1')
+    const v2Save = buildSaveCacheKey(components, 42, 1, null, 'v2')
+    const v1Restore = buildRestoreKeys(components, 'v1')
+    const v2Restore = buildRestoreKeys(components, 'v2')
+
+    // #then neither generation's prefixes match the other's keys
+    for (const prefix of v1Restore) {
+      expect(v2Save.startsWith(prefix)).toBe(false)
+      expect(v1Save.startsWith(prefix)).toBe(true)
+    }
+    for (const prefix of v2Restore) {
+      expect(v1Save.startsWith(prefix)).toBe(false)
+      expect(v2Save.startsWith(prefix)).toBe(true)
+    }
+  })
+
+  it("does not start the V2 prefix with V1's prefix", () => {
+    // #given the two generations' repo-scoped prefixes
+    const [, v1Repo] = buildRestoreKeys(components, 'v1')
+    const [, v2Repo] = buildRestoreKeys(components, 'v2')
+
+    // #then neither is a prefix of the other
+    expect(v2Repo?.startsWith(v1Repo as string)).toBe(false)
+    expect(v1Repo?.startsWith(v2Repo as string)).toBe(false)
+  })
+})
+
+describe('buildRestoreTiers', () => {
+  const components: CacheKeyComponents = {
+    agentIdentity: 'github',
+    repo: 'owner/repo',
+    ref: 'main',
+    os: 'Linux',
+  }
+
+  it('orders V2 runs as V2 branch, V1 branch, V2 repo, V1 repo', () => {
+    // #given a V2 run #when building the tiers
+    const tiers = buildRestoreTiers(components, 'v2')
+
+    // #then V2 is tried before V1 at each scope, and branch before repo
+    expect(tiers).toEqual([
+      {generation: 'v2', scope: 'branch', key: 'opencode-v2-storage-github-owner-repo-main-'},
+      {generation: 'v1', scope: 'branch', key: 'opencode-storage-github-owner-repo-main-'},
+      {generation: 'v2', scope: 'repo', key: 'opencode-v2-storage-github-owner-repo-'},
+      {generation: 'v1', scope: 'repo', key: 'opencode-storage-github-owner-repo-'},
+    ])
+  })
+
+  it('lists only the V1 branch and repo tiers for V1 runs', () => {
+    // #given a V1 run #when building the tiers
+    const tiers = buildRestoreTiers(components, 'v1')
+
+    // #then it is exactly today's restore keys
+    expect(tiers.map(tier => tier.key)).toEqual([...buildRestoreKeys(components, 'v1')])
+    expect(tiers.every(tier => tier.generation === 'v1')).toBe(true)
+  })
+})
+
+describe('classifyRestoreHit', () => {
+  const components: CacheKeyComponents = {
+    agentIdentity: 'github',
+    repo: 'owner/repo',
+    ref: 'main',
+    os: 'Linux',
+  }
+
+  it('maps an object-store hit to its generation at repo scope', () => {
+    // #given an object-store hit for each generation #when classifying
+    // #then store and generation are carried through
+    expect(classifyRestoreHit(components, {store: 'object-store', generation: 'v2'})).toEqual({
+      store: 'object-store',
+      generation: 'v2',
+      scope: 'repo',
+    })
+    expect(classifyRestoreHit(components, {store: 'object-store', generation: 'v1'})).toEqual({
+      store: 'object-store',
+      generation: 'v1',
+      scope: 'repo',
+    })
+  })
+
+  it.each([
+    ['opencode-v2-storage-github-owner-repo-main-Linux', 'v2', 'exact'],
+    ['opencode-v2-storage-github-owner-repo-main-Linux-42-1', 'v2', 'branch'],
+    ['opencode-v2-storage-github-owner-repo-develop-Linux-42-1', 'v2', 'repo'],
+    ['opencode-storage-github-owner-repo-main-Linux', 'v1', 'exact'],
+    ['opencode-storage-github-owner-repo-main-Linux-42-1', 'v1', 'branch'],
+    ['opencode-storage-github-owner-repo-develop-Linux-42-1', 'v1', 'repo'],
+  ] as const)('maps the cache key %s to %s at %s scope', (key, generation, scope) => {
+    // #given a restored cache key #when classifying
+    // #then generation and scope follow from the prefix that matched
+    expect(classifyRestoreHit(components, {store: 'cache', key})).toEqual({store: 'cache', generation, scope})
+  })
+
+  it('returns null for a cache key that matches no restore prefix', () => {
+    // #given a key outside both generations #when classifying #then it is unrecognised
+    expect(classifyRestoreHit(components, {store: 'cache', key: 'something-else-entirely'})).toBeNull()
   })
 })

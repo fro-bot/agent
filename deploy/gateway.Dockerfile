@@ -1,5 +1,5 @@
 # ── Stage 1: build ────────────────────────────────────────────────────────────
-FROM node:24.22.1-alpine3.24@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS build
+FROM node:24.22.2-alpine3.24@sha256:8a32c8cf649a49915a66e81e7a609223c708d0adabf288ee3f4077d765542f85 AS build
 
 WORKDIR /workspace
 
@@ -66,6 +66,7 @@ COPY apps/workspace-agent/package.json apps/workspace-agent/package.json
 COPY packages/runtime/package.json packages/runtime/package.json
 COPY packages/gateway/package.json packages/gateway/package.json
 COPY packages/harness/package.json packages/harness/package.json
+COPY packages/opencode-plugin/package.json packages/opencode-plugin/package.json
 
 # Install the full workspace (including devDependencies). The build typechecks
 # test files (which import vitest) and runs tsc/tsdown, so the build toolchain
@@ -100,7 +101,7 @@ RUN rm -rf node_modules apps/*/node_modules packages/*/node_modules \
     && bun install --production --frozen-lockfile --ignore-scripts
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
-FROM node:24.22.1-alpine3.24@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS runtime
+FROM node:24.22.2-alpine3.24@sha256:8a32c8cf649a49915a66e81e7a609223c708d0adabf288ee3f4077d765542f85 AS runtime
 
 WORKDIR /app
 

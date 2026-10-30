@@ -70,7 +70,7 @@ type ParsedStatuses =
  * `null` for anything that is not a valid slug (`parseRepoSlug`) or not a canonical workspace name. `session.status` returns `{}` for any directory without
  * sessions, so `clear` is only meaningful because this is the directory the run's sessions are created under.
  */
-function resolveRepoDirectory(repo: string): string | null {
+export function resolveRepoDirectory(repo: string): string | null {
   const parsed = parseRepoSlug(repo)
   if (parsed.success === false) return null
   // Validate the RAW names before the workspace helper lowercases them: Unicode case folding maps some non-ASCII

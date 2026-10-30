@@ -294,6 +294,11 @@ export interface ServerDeps {
   /** OpenCode server readiness reference. When absent, opencode field is omitted from /healthz. */
   readonly opencodeStatus?: OpencodeStatusRef
   /**
+   * The OpenCode version this image runs, reported on /healthz and /readyz so the gateway can choose its run loop
+   * from the workspace it attaches to. Omitted from the responses when absent.
+   */
+  readonly opencodeVersion?: string
+  /**
    * Bearer proxy listening reference. When present, /readyz requires BOTH
    * opencodeStatus === 'ready' AND proxyListening.listening === true.
    * When absent, /readyz falls back to the opencode-only check (legacy/clone-only mode).
@@ -335,10 +340,13 @@ export function createApp(deps: ServerDeps): Hono {
     logger,
     instanceDisposer,
     opencodeStatus,
+    opencodeVersion,
     proxyListening,
     auth,
   } = deps
   const app = new Hono()
+  // Spread only when set: the wire shape of an image that reports nothing must not gain a key.
+  const versionField = opencodeVersion === undefined ? {} : {opencodeVersion}
 
   // Control-API bearer check — every route except /healthz and /readyz. Registered before any
   // route so it runs (and can short-circuit with 401) before body parsing, JSON parsing, or
@@ -377,7 +385,9 @@ export function createApp(deps: ServerDeps): Hono {
   // GET /healthz — liveness probe (always 200; clone-only signal)
   app.get('/healthz', c => {
     const body: HealthzResponse =
-      opencodeStatus === undefined ? {ok: true} : {ok: true, opencode: opencodeStatus.status}
+      opencodeStatus === undefined
+        ? {ok: true, ...versionField}
+        : {ok: true, opencode: opencodeStatus.status, ...versionField}
     return c.json(body, 200)
   })
 
@@ -395,13 +405,13 @@ export function createApp(deps: ServerDeps): Hono {
   // When proxyListening is absent (legacy/clone-only mode), falls back to opencode-only check.
   app.get('/readyz', c => {
     if (opencodeStatus === undefined) {
-      const body: ReadyzResponse = {ready: false, opencode: 'unknown'}
+      const body: ReadyzResponse = {ready: false, opencode: 'unknown', ...versionField}
       return c.json(body, 503)
     }
     const opencodeReady = opencodeStatus.status === 'ready'
     const proxyReady = proxyListening === undefined || proxyListening.listening === true
     const isReady = opencodeReady === true && proxyReady === true
-    const body: ReadyzResponse = {ready: isReady, opencode: opencodeStatus.status}
+    const body: ReadyzResponse = {ready: isReady, opencode: opencodeStatus.status, ...versionField}
     return c.json(body, isReady === true ? 200 : 503)
   })
 

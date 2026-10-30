@@ -1,8 +1,16 @@
 import type {Logger} from '../shared/logger.js'
-import type {SubagentNotice} from './subagent-notice.js'
+import type {ShellNoticeRead, ShellNoticeState, V2ShellStatus} from './shell-notice.js'
+import type {SubagentNotice, SubagentNoticeRead} from './subagent-notice.js'
 
-import {getNumberProperty, getObjectProperty, getStringProperty, ownValue} from './payload-accessors.js'
-import {readSubagentNotice, readSubagentNoticeItem} from './subagent-notice.js'
+import {
+  getBooleanProperty,
+  getNumberProperty,
+  getObjectProperty,
+  getStringProperty,
+  ownValue,
+} from './payload-accessors.js'
+import {classifyShellNotice, classifyShellNoticeItem, isShellStatus} from './shell-notice.js'
+import {classifySubagentNotice, classifySubagentNoticeItem} from './subagent-notice.js'
 
 /**
  * OpenCode V2 event mapper: turns parsed V2 event frames into one small, surface-neutral domain union that the Action
@@ -28,6 +36,9 @@ import {readSubagentNotice, readSubagentNoticeItem} from './subagent-notice.js'
  * Events that need no consumer are ignored (mapped to `null`): `session.text.started`, `session.tool.input.delta` and
  * `.ended` (superseded by `session.tool.called`, which carries the parsed input), `session.step.started/streamed/ended`,
  * usage, rename, inbox delivered/cancelled, compaction, and the project, VCS, plugin and agent update families.
+ *
+ * Background `shell` jobs are not sessions and ride two streams: `shell.created` / `shell.exited` (ephemeral, keyed by
+ * shell id, owner in `info.metadata.sessionID`) and the owner's completion notice (`shell-notice.ts`).
  */
 
 /** Error fields a loop may classify on. The upstream `response.body` is deliberately not carried. */
@@ -151,6 +162,8 @@ export type V2DomainEvent =
       readonly formId: string
       readonly sessionId: string
       readonly outcome: 'cancelled' | 'replied'
+      /** The answer of a replied form, keyed by field key. `null` for a cancelled form or an unreadable answer. */
+      readonly answer: Readonly<Record<string, unknown>> | null
     }
   | {readonly kind: 'execution_started'; readonly sessionId: string}
   | {readonly kind: 'execution_succeeded'; readonly sessionId: string}
@@ -166,8 +179,50 @@ export type V2DomainEvent =
     }
   /** A session changed location. Informational on its own; `mapV2EventStream` upgrades an owned move to `fatal`. */
   | {readonly kind: 'session_moved'; readonly sessionId: string; readonly directory: string | null}
-  /** The parent session `sessionId` received a completion notice for a child. Read from event `metadata`, never text. */
-  | {readonly kind: 'subagent_notice'; readonly sessionId: string; readonly notice: SubagentNotice}
+  /**
+   * The parent session `sessionId` received a completion notice for a child. Read from event `metadata`, never text.
+   * `inboxId` is the inbox item that carries it, when the notice arrived as an enqueued item: the item is queued, not
+   * yet part of a model turn, until a matching `inbox_delivered`. `null` for a `session.synthetic` event, which is the
+   * message already in the transcript.
+   */
+  | {
+      readonly kind: 'subagent_notice'
+      readonly sessionId: string
+      readonly notice: SubagentNotice
+      readonly inboxId: string | null
+    }
+  /**
+   * A shell was created (`shell.created`, ephemeral). `ownerSessionId` is the session that started it, read from
+   * `info.metadata.sessionID`: an opaque tag the creator sets, `null` for a shell nobody tagged (`POST /api/shell`).
+   * `userCommand` is set for the shell of a user command (`POST /api/session/:id/shell`), which is awaited by the
+   * request and never sends a job notice. The frame carries no pid.
+   */
+  | {
+      readonly kind: 'shell_started'
+      readonly shellId: string
+      readonly ownerSessionId: string | null
+      readonly userCommand: boolean
+    }
+  /** A shell process ended (`shell.exited`, ephemeral). It can arrive before or after the notice, and settles nothing. */
+  | {
+      readonly kind: 'shell_exited'
+      readonly shellId: string
+      readonly status: V2ShellStatus
+      readonly exit: number | null
+    }
+  /**
+   * The session `ownerSessionId` received the completion notice of a background shell job. Read from event `metadata`,
+   * never text; `inboxId` as for `subagent_notice`. A user shell command's notice (no `jobID`) is not mapped.
+   */
+  | {
+      readonly kind: 'shell_notice'
+      readonly shellId: string
+      readonly ownerSessionId: string
+      readonly state: ShellNoticeState
+      readonly inboxId: string | null
+    }
+  /** A queued inbox item of `sessionId` entered a model turn (`session.inbox.delivered`). */
+  | {readonly kind: 'inbox_delivered'; readonly sessionId: string; readonly inboxId: string}
   /** The run must fail. Produced by `mapV2EventStream` for an owned session that moved. */
   | {
       readonly kind: 'fatal'
@@ -181,6 +236,10 @@ export type V2DomainEvent =
       readonly eventType: string
       readonly sessionId: string | null
       readonly reason: string
+      /** Set for a subagent notice that could not be read and still named its child; the loop fences that child. */
+      readonly childSessionId?: string
+      /** Set for a shell job notice that could not be read and still named its shell; the loop fences that shell. */
+      readonly shellId?: string
     }
 
 /** Stable identity of an inner call of an `execute` tool call. */
@@ -407,7 +466,14 @@ function mapFormResolved(type: string, data: unknown): V2DomainEvent {
   const formId = getStringProperty(data, 'id')
   const sessionId = getStringProperty(data, 'sessionID')
   if (formId === null || sessionId === null) return malformed(type, data, 'missing form id or sessionID')
-  return {kind: 'form_resolved', formId, sessionId, outcome: type === 'form.replied' ? 'replied' : 'cancelled'}
+  const answer = getObjectProperty(data, 'answer')
+  return {
+    kind: 'form_resolved',
+    formId,
+    sessionId,
+    outcome: type === 'form.replied' ? 'replied' : 'cancelled',
+    answer: type === 'form.replied' && isRecord(answer) ? answer : null,
+  }
 }
 
 function mapExecution(type: string, data: unknown): V2DomainEvent {
@@ -447,8 +513,81 @@ function mapSessionError(type: string, data: unknown): V2DomainEvent {
     : {kind: 'retry_scheduled', sessionId, attempt, at, error}
 }
 
-function mapNotice(sessionId: string | null, notice: SubagentNotice | null): V2DomainEvent | null {
-  return sessionId === null || notice === null ? null : {kind: 'subagent_notice', sessionId, notice}
+function mapNotice(
+  type: string,
+  data: unknown,
+  read: SubagentNoticeRead,
+  inboxId: string | null,
+): V2DomainEvent | null {
+  const sessionId = getStringProperty(data, 'sessionID')
+  if (read.kind === 'none') return null
+  if (read.kind === 'notice') {
+    return sessionId === null ? null : {kind: 'subagent_notice', sessionId, notice: read.notice, inboxId}
+  }
+  // A notice the server sent that this reader cannot take. Dropping it would leave its child unaccounted for.
+  return {
+    kind: 'malformed',
+    eventType: type,
+    sessionId,
+    reason: 'unreadable subagent notice',
+    ...(read.childSessionId === null ? {} : {childSessionId: read.childSessionId}),
+  }
+}
+
+function mapShellNotice(
+  type: string,
+  data: unknown,
+  read: ShellNoticeRead,
+  inboxId: string | null,
+): V2DomainEvent | null {
+  const sessionId = getStringProperty(data, 'sessionID')
+  if (read.kind === 'none') return null
+  if (read.kind === 'notice') {
+    return sessionId === null
+      ? null
+      : {
+          kind: 'shell_notice',
+          shellId: read.notice.shellId,
+          ownerSessionId: sessionId,
+          state: read.notice.state,
+          inboxId,
+        }
+  }
+  // A job notice the server sent that this reader cannot take. Dropping it would leave its shell unaccounted for.
+  return {
+    kind: 'malformed',
+    eventType: type,
+    sessionId,
+    reason: 'unreadable shell notice',
+    ...(read.shellId === null ? {} : {shellId: read.shellId}),
+  }
+}
+
+function mapShellCreated(data: unknown): V2DomainEvent {
+  const type = 'shell.created'
+  const info = getObjectProperty(data, 'info')
+  const metadata = getObjectProperty(info, 'metadata')
+  const ownerSessionId = getStringProperty(metadata, 'sessionID')
+  const shellId = getStringProperty(info, 'id')
+  if (shellId === null || shellId.length === 0) {
+    return {kind: 'malformed', eventType: type, sessionId: ownerSessionId, reason: 'unreadable shell'}
+  }
+  return {
+    kind: 'shell_started',
+    shellId,
+    ownerSessionId,
+    userCommand: getBooleanProperty(metadata, 'background') === true,
+  }
+}
+
+function mapShellExited(data: unknown): V2DomainEvent {
+  const type = 'shell.exited'
+  const shellId = getStringProperty(data, 'id')
+  const status = getStringProperty(data, 'status')
+  if (shellId === null || !isShellStatus(status)) {
+    return {kind: 'malformed', eventType: type, sessionId: null, reason: 'unreadable shell exit'}
+  }
+  return {kind: 'shell_exited', shellId, status, exit: getNumberProperty(data, 'exit')}
 }
 
 /**
@@ -527,11 +666,33 @@ export function mapV2Event(frame: unknown): V2DomainEvent | null {
           }
     }
 
-    case 'session.inbox.enqueued':
-      return mapNotice(getStringProperty(data, 'sessionID'), readSubagentNoticeItem(getObjectProperty(data, 'item')))
+    case 'shell.created':
+      return mapShellCreated(data)
 
-    case 'session.synthetic':
-      return mapNotice(getStringProperty(data, 'sessionID'), readSubagentNotice(data))
+    case 'shell.exited':
+      return mapShellExited(data)
+
+    case 'session.inbox.enqueued': {
+      const item = getObjectProperty(data, 'item')
+      const inboxId = getStringProperty(data, 'inboxID')
+      const subagent = classifySubagentNoticeItem(item)
+      return subagent.kind === 'none'
+        ? mapShellNotice(type, data, classifyShellNoticeItem(item), inboxId)
+        : mapNotice(type, data, subagent, inboxId)
+    }
+
+    case 'session.inbox.delivered': {
+      const sessionId = getStringProperty(data, 'sessionID')
+      const inboxId = getStringProperty(data, 'inboxID')
+      return sessionId === null || inboxId === null ? null : {kind: 'inbox_delivered', sessionId, inboxId}
+    }
+
+    case 'session.synthetic': {
+      const subagent = classifySubagentNotice(data)
+      return subagent.kind === 'none'
+        ? mapShellNotice(type, data, classifyShellNotice(data), null)
+        : mapNotice(type, data, subagent, null)
+    }
 
     default:
       return null

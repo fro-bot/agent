@@ -23,6 +23,7 @@ import type {
 import type {ListBackupsFn, PreviewRecoveryFn, RecoverFn} from './checkout-recovery.js'
 import type {ConcurrencyRegistry} from './concurrency.js'
 import type {LaunchAdmission, LaunchWorkRequest, PostReplyFactory, ReplySink, StatusSink} from './launch-types.js'
+import type {OpenCodeGeneration} from './opencode-generation.js'
 import type {CheckoutPreparation, CheckoutProvenance} from './provenance.js'
 import type {ChannelQueue} from './queue.js'
 import type {RepoQuiescenceChecker} from './repo-quiescence.js'
@@ -43,7 +44,6 @@ import {
   toErrorMessage,
   transitionRun,
 } from '@fro-bot/runtime'
-
 import {createPermissionCoordinator} from '../approvals/coordinator.js'
 import {createDiscordApprovalOnPending} from '../approvals/discord-transport.js'
 import {createQuestionCoordinator} from '../approvals/question-coordinator.js'
@@ -67,7 +67,10 @@ import {abortRegistry} from './abort-registry.js'
 import {settleAmbiguousRecovery, tryAutoRecoverDirtyCheckout} from './checkout-recovery.js'
 import {markRunEnded, markRunLive} from './live-run-registry.js'
 import {releaseLockOrByOwnership} from './lock-release.js'
+import {attachOpencodeV2} from './opencode-attach-v2.js'
 import {attachOpencode} from './opencode-attach.js'
+import {selectOpenCodeGeneration} from './opencode-generation.js'
+import {createPostReplyFactoryV2} from './permission-reply-v2.js'
 import {
   CLIENT_TIMEOUT_REPLY,
   formatPreparationFailedReply,
@@ -86,8 +89,10 @@ import {
   toCheckoutPreparation,
   toRemoteFreshnessFromUpdateReady,
 } from './provenance.js'
+import {createFormDirectoryV2, createQuestionEffectsV2} from './question-client-v2.js'
 import {createQuestionEffects} from './question-client.js'
 import {QUARANTINE_HOLD_WINDOW_MS} from './root-stop.js'
+import {runOpenCodeCoreV2} from './run-core-v2.js'
 import {RunCoreError, runOpenCodeCore} from './run-core.js'
 import {toRuntimeLogger} from './runtime-logger.js'
 import {TERMINAL_WRITE_RETRY, transitionRetryingStaleEtag} from './stale-etag-transition.js'
@@ -379,6 +384,32 @@ const PERMANENT_CLONE_ERROR_CODES: ReadonlySet<CloneErrorCode> = new Set<CloneEr
   'head-resolution-failed',
   'checkout-handoff-failed',
 ])
+
+/**
+ * The V1 approval reply: `POST /session/{id}/permissions/{permissionID}` through the V1 SDK handle. The V2 reply is
+ * `createPostReplyFactoryV2` (`permission-reply-v2.ts`).
+ */
+function createPostReplyFactoryV1(handle: ReturnType<typeof attachOpencode>): PostReplyFactory {
+  return sessionID => async (rID, dir, decision) => {
+    // Call the OpenCode SDK permission reply endpoint.
+    // Uses the session-scoped API: POST /session/{id}/permissions/{permissionID}
+    try {
+      const res = await handle.client.postSessionIdPermissionsPermissionId({
+        path: {id: sessionID, permissionID: rID},
+        body: {response: decision},
+        query: {directory: dir},
+        signal: AbortSignal.timeout(10_000),
+      })
+      const envelope = res as {error?: unknown} | undefined
+      if (envelope?.error != null) {
+        return {ok: false as const, error: formatSdkError(envelope.error)}
+      }
+      return {ok: true as const}
+    } catch (error) {
+      return {ok: false as const, error: toErrorMessage(error)}
+    }
+  }
+}
 
 /**
  * Map an `EnsureCloneFailure` to a `RunCoreErrorKind` honestly, instead of
@@ -856,9 +887,21 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     // This prevents creating a thread, acquiring a lock, or creating run-state
     // for a workspace that is not yet serving OpenCode.
     let workspaceReady = false
+    // The OpenCode generation the workspace runs, read from the version it reports on its control API. A workspace
+    // that reports none runs V1. A version that is present but unreadable selects neither loop: not ready.
+    let openCodeGeneration: OpenCodeGeneration = 'v1'
     try {
       const readyzResult = await readyz()
       workspaceReady = readyzResult.success === true && readyzResult.data.ready === true
+      if (workspaceReady && readyzResult.success === true) {
+        const selected = selectOpenCodeGeneration(readyzResult.data.opencodeVersion)
+        if (selected.success) {
+          openCodeGeneration = selected.data
+        } else {
+          logger.warn({channelId, repo}, 'run: the workspace reported an unreadable OpenCode version — not ready')
+          workspaceReady = false
+        }
+      }
     } catch {
       // Thrown exception (e.g. timeout) → fail closed
       workspaceReady = false
@@ -1506,7 +1549,11 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
       // ── Execute prompt via OpenCode ─────────────────────────────────────────────────────────────────────────────────────────
 
-      const handle = attachOpencode(attachUrl, attachToken)
+      // One attach per run, by the generation the workspace reported. The V1 handle and the V2 client never coexist.
+      const openCode =
+        openCodeGeneration === 'v2'
+          ? ({generation: 'v2', client: attachOpencodeV2(attachUrl, attachToken)} as const)
+          : ({generation: 'v1', handle: attachOpencode(attachUrl, attachToken)} as const)
       const promptText =
         request.promptBuilder === undefined
           ? buildDiscordPrompt({
@@ -1559,25 +1606,10 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       //
       // AbortSignal.timeout(10_000) avoids the dangling-timer leak from the old
       // Promise.race approach. AbortSignal.timeout is self-cleaning.
-      const postReplyFactory: PostReplyFactory = sessionID => async (rID, dir, decision) => {
-        // Call the OpenCode SDK permission reply endpoint.
-        // Uses the session-scoped API: POST /session/{id}/permissions/{permissionID}
-        try {
-          const res = await handle.client.postSessionIdPermissionsPermissionId({
-            path: {id: sessionID, permissionID: rID},
-            body: {response: decision},
-            query: {directory: dir},
-            signal: AbortSignal.timeout(10_000),
-          })
-          const envelope = res as {error?: unknown} | undefined
-          if (envelope?.error != null) {
-            return {ok: false as const, error: formatSdkError(envelope.error)}
-          }
-          return {ok: true as const}
-        } catch (error) {
-          return {ok: false as const, error: toErrorMessage(error)}
-        }
-      }
+      const postReplyFactory: PostReplyFactory =
+        openCode.generation === 'v2'
+          ? createPostReplyFactoryV2(openCode.client)
+          : createPostReplyFactoryV1(openCode.handle)
 
       // ── Approval transport selection — resolved before coordinator creation ──────
       // `resolvedApprovalOnPending` is resolved first. If the factory throws, the outer
@@ -1646,6 +1678,8 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       // canonical directory. The deadline is evaluated when a question is asked, from the budget
       // left then (not at run start), so a late question never outlives the hard abort. Scope
       // matches cancellation's: the Discord thread for Discord runs, the run id otherwise.
+      // The open question forms of this run: V2 addresses a reply by session and form id, which the loop records here.
+      const v2Forms = createFormDirectoryV2()
       const announceQuestion = deps.createQuestionOnRegistered?.({runId, repo, surface: request.surface, replySink})
       // Runs after the registry holds the question: surface announcement first, push last so a
       // push failure can never preempt the surfaces. Neither can throw into the coordinator.
@@ -1660,11 +1694,14 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           : createQuestionCoordinator({
               logger,
               registry: deps.questionRegistry,
-              effects: createQuestionEffects({
-                baseURL: attachUrl,
-                token: attachToken,
-                directory: sessionDirectory,
-              }),
+              effects:
+                openCode.generation === 'v2'
+                  ? createQuestionEffectsV2({client: openCode.client, forms: v2Forms})
+                  : createQuestionEffects({
+                      baseURL: attachUrl,
+                      token: attachToken,
+                      directory: sessionDirectory,
+                    }),
               scopeId: request.surface === 'discord' ? threadId : runId,
               runId,
               computeDeadlineMs: () => computeApprovalDeadlineMs(Math.max(0, runTimeoutMs - (Date.now() - runStartMs))),
@@ -1672,8 +1709,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
             })
 
       try {
-        await runOpenCodeCore({
-          handle,
+        const commonCoreParams = {
           directory: sessionDirectory,
           promptText: promptTextWithProvenance,
           sink: replySink,
@@ -1694,7 +1730,10 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           },
           ownershipLedger,
           onOwnershipChange: persistOwnership,
-        })
+        }
+        await (openCode.generation === 'v2'
+          ? runOpenCodeCoreV2({...commonCoreParams, client: openCode.client, forms: v2Forms})
+          : runOpenCodeCore({...commonCoreParams, handle: openCode.handle}))
       } finally {
         // Fail-closed: dispose any still-open coordinator entries so pending approvals
         // don't hang if the run ended (normally or via error) before they were settled.

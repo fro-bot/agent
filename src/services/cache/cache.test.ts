@@ -2179,3 +2179,193 @@ describe('isAuthPathSafe', () => {
     expect(result).toBe(true)
   })
 })
+
+describe('restoreCache, V2 session generation', () => {
+  let tempDir: string
+  let storagePath: string
+  let authPath: string
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cache-v2-test-'))
+    storagePath = path.join(tempDir, 'storage')
+    authPath = path.join(tempDir, 'auth.json')
+  })
+
+  afterEach(async () => {
+    await fs.rm(tempDir, {recursive: true, force: true})
+  })
+
+  // Stands in for @actions/cache extracting an archive: writes the entry's files, then reports its key.
+  function createExtractingAdapter(
+    entries: Readonly<Record<string, {readonly version?: string; readonly db?: string}>>,
+  ): {adapter: CacheAdapter; calls: string[]} {
+    const calls: string[] = []
+    return {
+      calls,
+      adapter: {
+        restoreCache: async (_paths, _primaryKey, restoreKeys) => {
+          calls.push(...restoreKeys)
+          for (const restoreKey of restoreKeys) {
+            const entryKey = Object.keys(entries).find(key => key.startsWith(restoreKey))
+            if (entryKey === undefined) continue
+            const entry = entries[entryKey]
+            await fs.mkdir(storagePath, {recursive: true})
+            if (entry?.version !== undefined) await fs.writeFile(path.join(storagePath, '.version'), entry.version)
+            if (entry?.db !== undefined) await fs.writeFile(path.join(tempDir, 'opencode.db'), entry.db)
+            return entryKey
+          }
+          return undefined
+        },
+        saveCache: async () => 1,
+      },
+    }
+  }
+
+  it('keeps a restored V1 entry whose .version marker is 1', async () => {
+    // #given the cache holds only a V1 entry, saved with the unchanged marker
+    const cache = createExtractingAdapter({
+      'opencode-storage-github-owner-repo-main-Linux-1-1': {version: '1', db: 'v1'},
+    })
+
+    // #when a V2 run restores
+    const result = await restoreCache({
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      opencodeVersion: '2.2.0',
+      cacheAdapter: cache.adapter,
+    })
+
+    // #then the V1 entry is accepted and its database survives, because V2 uses marker 1 too
+    expect(result).toMatchObject({hit: true, source: 'cache', key: 'opencode-storage-github-owner-repo-main-Linux-1-1'})
+    await expect(fs.readFile(path.join(tempDir, 'opencode.db'), 'utf8')).resolves.toBe('v1')
+  })
+
+  it('still wipes a restored V2-tier entry whose .version marker does not match', async () => {
+    // #given a V2 entry carrying a marker from some other storage version
+    const cache = createExtractingAdapter({
+      'opencode-v2-storage-github-owner-repo-main-Linux-1-1': {version: '2', db: 'v2'},
+    })
+
+    // #when a V2 run restores
+    const result = await restoreCache({
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      opencodeVersion: '2.2.0',
+      cacheAdapter: cache.adapter,
+    })
+
+    // #then the mismatch is treated as corruption and the database family is cleaned
+    expect(result).toMatchObject({hit: false, corrupted: true})
+    await expect(fs.access(path.join(tempDir, 'opencode.db'))).rejects.toThrow()
+  })
+
+  it('does not cross-match: a V1 run ignores a V2 entry, and a V2 run lists V2 before V1', async () => {
+    // #given a cache that holds only a V2 entry
+    const v2Only = createExtractingAdapter({
+      'opencode-v2-storage-github-owner-repo-main-Linux-1-1': {version: '1', db: 'v2'},
+    })
+
+    // #when a V1 run restores
+    const v1Result = await restoreCache({
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      opencodeVersion: '1.19.4',
+      cacheAdapter: v2Only.adapter,
+    })
+
+    // #then it never offers a V2 prefix and so misses
+    expect(v1Result).toMatchObject({hit: false})
+    expect(v2Only.calls).toEqual(['opencode-storage-github-owner-repo-main-', 'opencode-storage-github-owner-repo-'])
+    expect(v2Only.calls.some(key => key.startsWith('opencode-v2-storage-'))).toBe(false)
+
+    // #when a V2 run restores from the same cache
+    const v2Cache = createExtractingAdapter({
+      'opencode-v2-storage-github-owner-repo-main-Linux-1-1': {version: '1', db: 'v2'},
+    })
+    const v2Result = await restoreCache({
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      opencodeVersion: '2.2.0',
+      cacheAdapter: v2Cache.adapter,
+    })
+
+    // #then the first tier it asks for is the V2 branch tier, and it hits
+    expect(v2Cache.calls).toEqual(['opencode-v2-storage-github-owner-repo-main-'])
+    expect(v2Result).toMatchObject({hit: true, key: 'opencode-v2-storage-github-owner-repo-main-Linux-1-1'})
+  })
+
+  it('reports corrupted when a corrupt S3 V2 object is followed by an S3 V1 miss and a cache miss', async () => {
+    // #given only a V2 object, whose storage version marker is wrong
+    const store = createMockStoreAdapter({
+      list: async prefix =>
+        ok(prefix.endsWith('/sessions-v2/') ? ['fro-bot-state/github/owner/repo/sessions-v2/opencode.db'] : []),
+      download: async (_key, localPath) => {
+        await fs.mkdir(path.dirname(localPath), {recursive: true})
+        await fs.writeFile(localPath, 'v2-db')
+        await fs.mkdir(storagePath, {recursive: true})
+        await fs.writeFile(path.join(storagePath, '.version'), '9')
+        return ok(undefined)
+      },
+    })
+
+    // #when a V2 run restores and the cache misses too
+    const result = await restoreCache({
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      opencodeVersion: '2.2.0',
+      cacheAdapter: createMockCacheAdapter({restoreResult: undefined}),
+      storeConfig: testStoreConfig,
+      storeAdapter: store,
+    })
+
+    // #then the earlier corruption is still reported
+    expect(result).toMatchObject({hit: false, corrupted: true})
+  })
+
+  it('falls through from a corrupt S3 V2 object to S3 V1', async () => {
+    // #given a V2 object that downloads, but whose storage version marker is wrong, and a good V1 object
+    const objects = new Map<string, string>([
+      ['fro-bot-state/github/owner/repo/sessions-v2/opencode.db', 'v2-db'],
+      ['fro-bot-state/github/owner/repo/sessions/opencode.db', 'v1-db'],
+    ])
+    const store = createMockStoreAdapter({
+      list: async prefix => ok([...objects.keys()].filter(key => key.startsWith(prefix))),
+      download: async (key, localPath) => {
+        await fs.mkdir(path.dirname(localPath), {recursive: true})
+        await fs.writeFile(localPath, objects.get(key) ?? '')
+        if (key.includes('/sessions-v2/')) {
+          // A marker that disagrees with STORAGE_VERSION marks this download as unusable.
+          await fs.mkdir(storagePath, {recursive: true})
+          await fs.writeFile(path.join(storagePath, '.version'), '9')
+        }
+        return ok(undefined)
+      },
+    })
+
+    // #when a V2 run restores
+    const result = await restoreCache({
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      opencodeVersion: '2.2.0',
+      cacheAdapter: createMockCacheAdapter({restoreResult: undefined}),
+      storeConfig: testStoreConfig,
+      storeAdapter: store,
+    })
+
+    // #then the V2 object is discarded and the V1 object is restored in its place
+    expect(result).toMatchObject({hit: true, source: 'storage'})
+    await expect(fs.readFile(path.join(tempDir, 'opencode.db'), 'utf8')).resolves.toBe('v1-db')
+  })
+})

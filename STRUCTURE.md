@@ -42,6 +42,7 @@ fro-bot/agent/
 │   │       ├── operator-contract/ # Operator contract types
 │   │       └── redaction/      # PII/secret redaction gate
 │   ├── harness/                # @fro.bot/harness — patched-OpenCode build + publish pipeline
+│   ├── opencode-plugin/        # @fro.bot/opencode-plugin — OpenCode V2 plugin (session tools + subagent reuse guard)
 │   └── runtime/                # @fro-bot/runtime — shared runtime primitives + version-pin constants
 │       └── src/
 │           ├── shared/         # Logger, types, constants (owns real version pins)
@@ -94,12 +95,13 @@ fro-bot/agent/
 - **`apps/workspace-agent/`** — Hono HTTP service that runs inside the workspace container (clone setup with staged root→agent ownership handoff, read-only `POST /inspect` checkout observation, `POST /update` checkout fast-forward, `POST /recover/preview`+`/recover` quarantine-and-replace, `GET`/`DELETE /backups` generations, bearer-gated control API, per-repo mutex and journal store, checkout-update git primitives, supervised unprivileged OpenCode); touch when adding workspace-side API endpoints. Serialize every mutating repo operation through `src/repo-mutex.ts` (also the sticky, restart-only maintenance hold) and record in-flight update/recovery state in `src/journal.ts`; real-git adversarial fixtures live in `src/update-fixtures/`. Import uid/gid/path constants from `src/identity.ts` (mirrored in `deploy/workspace.Dockerfile`) and run any git against an existing checkout through `src/git-safety.ts` as the agent uid — never as the root service. Checkout size/entry counts go through `src/agent-walk.ts`'s agent-uid or sealed-fd walker, never a root-owned path lookup. Checkout types in `src/types.ts` are mirrored in `packages/gateway/src/workspace-api/types.ts` and pinned by `scripts/checkout-types-drift-guard.test.ts` — change both sides together.
 - **`packages/gateway/`** — Discord-first daemon and operator web surface; the largest package, containing the mention loop, command handlers, approval gate, redaction pipeline, and the `web/ingress/` trusted-proxy client-address resolver that keys the unauthenticated operator-surface rate limits and OAuth bindings.
 - **`packages/harness/`** — Patched-OpenCode build and publish pipeline; touch when updating the bundled OpenCode binary.
+- **`packages/opencode-plugin/`** — Fro Bot's OpenCode V2 plugin, published to npm: the `session_*` tools and the `subagent` session-reuse guard, bundled with the V2 session code from `@fro-bot/runtime/session-v2`; touch when changing what the plugin gives the agent. The V2 workspace image installs it from npm at build time and loads it at each OpenCode spawn.
 - **`packages/runtime/`** — Shared runtime primitives consumed by both `src/` and `packages/gateway/`; owns the authoritative version-pin constants.
 - **`deploy/`** — Docker Compose stack, Dockerfiles, mitmproxy egress topology, and deploy validation scripts.
 - **`deploy/plugins/`**, **`deploy/managed-config/`** — the baked OpenCode reuse-guard plugin (`no-task-reuse.mjs`) and the root-owned managed config (`/etc/opencode/opencode.json`) that loads it; plain Node ESM / JSON, tested from `deploy/scripts/*.test.mjs`. The same `no-task-reuse.mjs` is the single source for the Action's guard: `tsdown.config.ts` builds it into `dist/no-task-reuse.js`, and `src/services/setup/no-task-reuse-config.ts` copies it into the CI OpenCode config dir at every Action server start (`no-task-reuse.d.mts` types it for the Vitest suite).
-- **`deploy/scripts/`** — Plain Node ESM (`.mjs`) helpers for deploy-time operations (auth validation, config merge, protected-dir creation, legacy checkout ownership migration, agent-side config provisioning); uses `node --test`, not Vitest.
+- **`deploy/scripts/`** — Plain Node ESM (`.mjs`) helpers for deploy-time operations (auth validation, config merge, protected-dir creation, legacy checkout ownership migration, agent-side config provisioning, V2 plugin install and image smoke); uses `node --test`, not Vitest.
 - **`deploy/tests/`** — `isolation-harness.sh`, the CI acceptance harness that proves the service/agent uid boundary in a real container started with production's security posture.
-- **`scripts/`** — Repo-level build tooling: action dist builder, hidden-Unicode scrubber, third-party notices, release dispatch.
+- **`scripts/`** — Repo-level build tooling: action dist builder, hidden-Unicode scrubber, third-party notices, release dispatch, and `sync-opencode-v2-pin.ts` (regenerates the OpenCode V2 pin's digests on a Renovate bump).
 - **`evals/`** — Gated agent-outcome eval corpus that runs the real execution path against disposable fixture repos; the pure gate and baseline tests run in normal CI, while live scenarios require `FRO_BOT_EVAL=1`.
 - **`.github/workflows/`** — All CI/CD automation; 12 workflow files covering tests, releases, security scanning, and bot triggers.
 - **`RFCs/`** — 19 architecture specification documents; read before making cross-cutting changes.
@@ -118,6 +120,7 @@ fro-bot/agent/
 | `@fro-bot/workspace-agent` | `apps/workspace-agent/` | Hono HTTP service in the workspace container |
 | `@fro-bot/gateway` | `packages/gateway/` | Discord daemon, operator web surface, mention loop, redaction |
 | `@fro.bot/harness` | `packages/harness/` | Patched-OpenCode build and publish pipeline; ships the `harness` and `opencode` commands |
+| `@fro.bot/opencode-plugin` | `packages/opencode-plugin/` | OpenCode V2 plugin: session tools and the subagent reuse guard; the `fro-bot.opencode-plugin` id |
 | `@fro-bot/runtime` | `packages/runtime/` | Shared runtime primitives; owns authoritative version-pin constants |
 
 ### CI Workflows
@@ -131,6 +134,7 @@ fro-bot/agent/
 | `fro-bot.yaml` | `issue_comment`, `issues`, `schedule`, `workflow_dispatch` | Fro Bot agent invocation (the Action under development) |
 | `harness-integrate.yaml` | `workflow_call` | LLM-merge integration of OpenCode refs into the harness build; called by `harness-release.yaml` |
 | `harness-release.yaml` | `push (harness-v* tags), workflow_dispatch` | Build matrix and publish for `@fro.bot/harness` |
+| `opencode-plugin-release.yaml` | `workflow_dispatch` | Verify, pack and publish `@fro.bot/opencode-plugin` (npm trusted publishing) |
 | `osv-scanner.yaml` | `merge_group`, `pull_request`, `push`, `schedule` | PR-differential vulnerability enforcement plus report-only full scans for merge queue/main/scheduled runs |
 | `prepare-release-pr.yaml` | `schedule`, `workflow_dispatch` | Opens release PR via semantic-release |
 | `renovate.yaml` | `issues`, `pull_request`, `push`, `workflow_dispatch`, `workflow_run` | Renovate dependency update automation |
