@@ -24,7 +24,7 @@
  */
 
 import type {OpenCodeV2ServerHandle, Logger as RuntimeLogger} from '@fro-bot/runtime/workspace-v2'
-import type {ProviderKeyEntry} from './opencode-credentials-v2.js'
+import type {CredentialResult, ProviderKeyEntry, SpawnConfig} from './opencode-credentials-v2.js'
 import type {Logger, SupervisedStatusRef} from './opencode-server.js'
 import {chmod, mkdir, mkdtemp, chown as nodeChown, rm} from 'node:fs/promises'
 import path from 'node:path'
@@ -56,10 +56,10 @@ import {
   OPENCODE_EXECUTABLE_PATH,
 } from './identity.js'
 import {
-  modelFromMergedConfig,
   modelProviderId,
   parseAuthBlob,
   provisionCredentials,
+  spawnConfigFromMergedConfig,
   verifyCredentialGate,
 } from './opencode-credentials-v2.js'
 
@@ -208,10 +208,11 @@ export interface RunSupervisedOpencodeV2Deps {
    */
   readonly readAuthBlob: () => string | null
   /**
-   * The model the spawn will use (`provider/model`), or undefined when none is configured. May throw for an
-   * unreadable or malformed config. Default: the `model` in the merged `opencode.json` the entrypoint wrote.
+   * The model and the inline-authenticated providers the NEXT spawn will see. Called once per spawn, after the server
+   * is up, because the file is agent-writable and a later spawn may load a different one. May throw for an unreadable
+   * or malformed config. Default: the merged `opencode.json` the entrypoint wrote.
    */
-  readonly readEffectiveModel: () => string | undefined
+  readonly readSpawnConfig: () => SpawnConfig
 }
 
 export interface RunSupervisedOpencodeV2Options {
@@ -249,16 +250,17 @@ export interface RunSupervisedOpencodeV2Options {
 export const MERGED_CONFIG_PATH = path.join(AGENT_XDG_CONFIG_HOME, 'opencode', 'opencode.json')
 
 /**
- * The effective model, read from the merged config the spawn loads (base + `WORKSPACE_OPENCODE_CONFIG` overlay + the
- * `WORKSPACE_OPENCODE_MODEL` that wins when non-blank, all resolved by `merge-config.mjs`). Reading the file the server
- * loads, rather than recomputing the rule from the environment, leaves one source that cannot drift from the server's.
- * Absent file: no model. The file is agent-writable, so it is opened without following symlinks and size-capped; the
- * answer only selects which provider the gate checks, it grants nothing.
+ * The effective model and the providers that carry an inline credential setting, read from the merged config the spawn
+ * loads (base + `WORKSPACE_OPENCODE_CONFIG` overlay + the `WORKSPACE_OPENCODE_MODEL` that wins when non-blank, all
+ * resolved by `merge-config.mjs`). Reading the file the server loads, rather than recomputing the rule from the
+ * environment, leaves one source that cannot drift from the server's. Absent file: no model, no inline auth. The file
+ * is agent-writable, so it is opened without following symlinks and size-capped; the answer only selects which
+ * providers the gate checks, it grants nothing, and it carries provider ids, never a value.
  */
-export function readEffectiveModelFromConfig(configPath: string = MERGED_CONFIG_PATH): string | undefined {
+export function readSpawnConfigFromFile(configPath: string = MERGED_CONFIG_PATH): SpawnConfig {
   const raw = readOptionalBoundedFile(configPath, MAX_CONFIG_FILE_BYTES)
-  if (raw === null) return undefined
-  const parsed = modelFromMergedConfig(raw)
+  if (raw === null) return {authenticatedProviders: []}
+  const parsed = spawnConfigFromMergedConfig(raw)
   if (!parsed.success) throw new Error(parsed.error.message)
   return parsed.data
 }
@@ -345,7 +347,7 @@ export async function runSupervisedOpencodeV2(options: RunSupervisedOpencodeV2Op
     verifyRules = verifyPermissionRules,
     prepareDatabase = async () => prepareFreshDatabase(),
     readAuthBlob = () => readOptionalSecretBlob(authFilePath(parentEnv)),
-    readEffectiveModel = () => readEffectiveModelFromConfig(),
+    readSpawnConfig = () => readSpawnConfigFromFile(),
   } = options.deps ?? {}
 
   const runtimeLogger = toRuntimeLogger(logger)
@@ -385,27 +387,6 @@ export async function runSupervisedOpencodeV2(options: RunSupervisedOpencodeV2Op
     })
     return
   }
-  // The gate checks the provider of the effective model: the one the merged config names, which is the model the
-  // server will use whether it came from WORKSPACE_OPENCODE_MODEL or from the overlay. With no model configured (a
-  // clone-only deployment) there is no request it could fail, so it checks the providers this run provisioned
-  // instead, and with neither it has nothing to check and does not block readiness.
-  let effectiveModel: string | undefined
-  try {
-    effectiveModel = readEffectiveModel()
-  } catch (error) {
-    credentials.clear()
-    statusRef.status = 'degraded'
-    logger.error('opencode-server-v2: cannot read the effective model from the merged config', {
-      message: error instanceof Error ? error.message : 'unknown',
-    })
-    return
-  }
-  const modelProvider = modelProviderId(effectiveModel)
-  const requiredProviders = modelProvider === undefined ? keyEntries.map(entry => entry.providerId) : [modelProvider]
-  if (requiredProviders.length === 0) {
-    logger.info('opencode-server-v2: no model or provider credentials configured, credential gate skipped')
-  }
-
   let attempt = 1
   let backoffMs = initialBackoffMs
   // One listener for the whole lifetime, however many respawns: it aborts a start in flight and wakes a ready wait.
@@ -451,6 +432,50 @@ export async function runSupervisedOpencodeV2(options: RunSupervisedOpencodeV2Op
     if (isAborted()) return false
     backoffMs = Math.min(backoffMs * 2, maxBackoffMs)
     return true
+  }
+
+  /**
+   * Provisions the keys into this spawn's credential store, then gates on the model it will use. Runs once per spawn,
+   * after the server is up, and reads the merged config fresh each time: the file is agent-writable, so a replacement
+   * spawn can load a different model than the one before it, and the gate must check the one this server loaded.
+   *
+   * The gate checks the provider of the effective model (from the overlay or the env, whichever the merge chose). With
+   * no model (a clone-only deployment) there is no request it could fail, so it checks the providers provisioned
+   * instead, and with neither it has nothing to check and does not block readiness. A provider whose merged config
+   * carries an inline credential setting needs no stored connection.
+   */
+  const credentialStep = async (serving: OpenCodeV2ServerHandle): Promise<CredentialResult<unknown>> => {
+    let spawnConfig: SpawnConfig
+    try {
+      spawnConfig = readSpawnConfig()
+    } catch (error) {
+      return {
+        success: false,
+        error: {
+          kind: 'model-config-invalid',
+          message: `Cannot read the effective model from the merged config: ${error instanceof Error ? error.message : 'unknown'}`,
+        },
+      }
+    }
+    const modelProvider = modelProviderId(spawnConfig.model)
+    const requiredProviders = modelProvider === undefined ? keyEntries.map(entry => entry.providerId) : [modelProvider]
+    if (requiredProviders.length === 0) {
+      logger.info('opencode-server-v2: no model or provider credentials configured, credential gate skipped')
+      return {success: true, data: []}
+    }
+    const request = {handle: serving, requestTimeoutMs, ...(signal === undefined ? {} : {signal})}
+    // The fresh database has no credentials (V2 only imports auth.json through a migration a fresh database skips), so
+    // every spawn stores them again. Then the gate reads them back: a server that cannot authenticate its model's
+    // provider never goes ready.
+    if (keyEntries.length > 0) {
+      const provisioned = await provisionCredentials({...request, entries: keyEntries, logger})
+      if (!provisioned.success) return provisioned
+    }
+    return verifyCredentialGate({
+      ...request,
+      providers: requiredProviders,
+      configuredAuth: spawnConfig.authenticatedProviders,
+    })
   }
 
   try {
@@ -545,19 +570,9 @@ export async function runSupervisedOpencodeV2(options: RunSupervisedOpencodeV2Op
         }
       }
 
-      if (handle !== undefined && requiredProviders.length > 0) {
+      if (handle !== undefined) {
         const serving = handle
-        const request = {handle: serving, requestTimeoutMs, ...(signal === undefined ? {} : {signal})}
-        // The fresh database has no credentials (V2 only imports auth.json through a migration a fresh database skips),
-        // so every spawn stores them again. Then the gate reads them back: a server that cannot authenticate its
-        // model's provider never goes ready.
-        const provisioned =
-          keyEntries.length > 0
-            ? await provisionCredentials({...request, entries: keyEntries, logger})
-            : ({success: true, data: []} as const)
-        const gated = provisioned.success
-          ? await verifyCredentialGate({...request, providers: requiredProviders})
-          : provisioned
+        const gated = await credentialStep(serving)
         if (!gated.success && isAborted()) {
           // The service is stopping: the request was cut short by the abort, not refused. A clean stop, not a failure.
           await stopServer(handle)

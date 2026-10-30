@@ -26,6 +26,7 @@ import type {AddressInfo} from 'node:net'
 import type {OpenCodeV2StartError, StartOpenCodeV2ServerOptions} from '@fro-bot/runtime/workspace-v2'
 import type {Logger, SupervisedStatusRef} from './opencode-server.js'
 
+import {Buffer} from 'node:buffer'
 import {execFileSync, spawnSync} from 'node:child_process'
 import {chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node:fs'
 import http from 'node:http'
@@ -50,7 +51,7 @@ import {createOpencodeProxyV2} from './opencode-proxy-v2.js'
 import {
   createUpstreamCredentials,
   prepareFreshDatabase,
-  readEffectiveModelFromConfig,
+  readSpawnConfigFromFile,
   runSupervisedOpencodeV2,
   WORKSPACE_V2_PLUGIN_SPECS,
 } from './opencode-server-v2.js'
@@ -228,16 +229,27 @@ function installPlugins(sandbox: Sandbox): void {
     timeout: 280_000,
   })
   if (result.status !== 0) throw new Error(`plugin install failed:\n${result.stderr}`)
-  // The entrypoint's merged global config, as production writes it: the provider overlay carries a baseURL and NO key
-  // (the key lives in the root-only blob the supervisor provisions), plus the model. No plugin entry (the config content
-  // carries those).
+  writeMergedConfig(sandbox)
+}
+
+/**
+ * The entrypoint's merged global config, as production writes it. By default the provider overlay carries a baseURL and
+ * NO key (the key lives in the root-only blob the supervisor provisions), plus the model. `inlineKey` puts the key in the
+ * overlay instead, the way an operator who keeps it in `WORKSPACE_OPENCODE_CONFIG` would. No plugin entry (the config
+ * content carries those).
+ */
+function writeMergedConfig(sandbox: Sandbox, options: {readonly inlineKey?: boolean} = {}): void {
   writeFileSync(
     path.join(sandbox.home, '.config', 'opencode', 'opencode.json'),
     JSON.stringify({
       $schema: 'https://opencode.ai/config.json',
       autoupdate: false,
       share: 'disabled',
-      provider: {anthropic: {options: {baseURL: provider?.baseURL}}},
+      provider: {
+        anthropic: {
+          options: {baseURL: provider?.baseURL, ...(options.inlineKey === true ? {apiKey: PROVIDER_KEY} : {})},
+        },
+      },
       model: MODEL,
     }),
   )
@@ -320,8 +332,7 @@ async function startWorkspace(options: StartWorkspaceOptions = {}): Promise<Runn
     },
     deps: {
       // The model comes from the merged config the sandbox wrote (installPlugins), as in production.
-      readEffectiveModel: () =>
-        readEffectiveModelFromConfig(path.join(box.home, '.config', 'opencode', 'opencode.json')),
+      readSpawnConfig: () => readSpawnConfigFromFile(path.join(box.home, '.config', 'opencode', 'opencode.json')),
       prepareDatabase: async () => {
         const dbPath = await prepareFreshDatabase({
           baseDir: box.dbBase,
@@ -440,9 +451,13 @@ describe.skipIf(!hasBinary)('the workspace V2 runner against the real stock bina
         // #and both plugins are listed active under the ids the workspace expects
         // (plugins activate per location, so a location the gates did not ask about answers /api/agent 503 until its
         // own activation finishes; the supervisor's location is box.reposRoot)
+        // (read straight from the loopback server: /api/plugin is not a route the gateway calls, so the proxy refuses it)
         const listPlugins = async (): Promise<string[]> => {
-          const response = await viaProxy(workspace, '/api/plugin', {
-            headers: {'x-opencode-directory': encodeURIComponent(box.reposRoot)},
+          const response = await fetch(`${workspace.upstreamUrl}/api/plugin`, {
+            headers: {
+              authorization: workspace.credentials.authorization() as string,
+              'x-opencode-directory': encodeURIComponent(box.reposRoot),
+            },
           })
           const body = (await response.json()) as {data: {id?: string; state: {status: string}}[]}
           return body.data.filter(entry => entry.state.status === 'active').map(entry => entry.id ?? '')
@@ -456,8 +471,9 @@ describe.skipIf(!hasBinary)('the workspace V2 runner against the real stock bina
         // #and the bearer is the only door: no bearer is refused by the proxy, and the server itself refuses anonymous callers
         expect((await fetch(`${workspace.proxyUrl}/api/info`)).status).toBe(401)
         expect((await fetch(`${workspace.upstreamUrl}/api/info`)).status).toBe(401)
-        const info = await viaProxy(workspace, '/api/info')
-        expect(info.status).toBe(200)
+        // #and the proxy forwards only the gateway's routes: the server's own info route is not one of them
+        expect((await viaProxy(workspace, '/api/info')).status).toBe(404)
+        expect((await viaProxy(workspace, '/api/session/active')).status).toBe(200)
 
         // #and the SSE stream opens through the proxy with the server.connected frame first
         const stream = await viaProxy(workspace, '/api/event', {headers: {accept: 'text/event-stream'}})
@@ -633,6 +649,161 @@ describe.skipIf(!hasBinary)('the workspace V2 runner against the real stock bina
         expect(provider?.hits().length).toBe(hitsBefore)
       } finally {
         await workspace.stop()
+      }
+    },
+  )
+
+  it(
+    'cannot be made to return a provider key through the bearer proxy, by any request target tried',
+    {timeout: RUNNER_TIMEOUT_MS},
+    async () => {
+      // #given a ready server that holds the provisioned key, behind the real proxy
+      const workspace = await startWorkspace()
+      try {
+        const proxy = new URL(workspace.proxyUrl)
+        const rawGet = async (target: string, method = 'GET'): Promise<{status: number; body: string}> =>
+          new Promise((resolve, reject) => {
+            const socket = net.connect(Number(proxy.port), proxy.hostname, () => {
+              socket.write(
+                [
+                  `${method} ${target} HTTP/1.1`,
+                  `host: ${proxy.host}`,
+                  `authorization: Bearer ${GATEWAY_BEARER}`,
+                  `x-opencode-directory: ${encodeURIComponent(box.reposRoot)}`,
+                  'connection: close',
+                  '',
+                  '',
+                ].join('\r\n'),
+              )
+            })
+            const chunks: Buffer[] = []
+            socket.on('data', chunk => chunks.push(chunk))
+            socket.on('error', reject)
+            socket.setTimeout(15_000, () => socket.destroy(new Error('timeout')))
+            socket.on('close', () => {
+              const text = Buffer.concat(chunks).toString('utf8')
+              resolve({
+                status: Number(/^HTTP\/1\.[01] (\d{3})/.exec(text)?.[1] ?? 0),
+                body: text.split('\r\n\r\n').slice(1).join('\r\n\r\n'),
+              })
+            })
+          })
+
+        // #and the control: the loopback server really does return the key at /api/credential
+        const direct = await fetch(`${workspace.upstreamUrl}/api/credential`, {
+          headers: {authorization: workspace.credentials.authorization() as string},
+        })
+        expect(await direct.text()).toContain(PROVIDER_KEY)
+
+        // #when every spelling the earlier denylist missed, and the ones it caught, is tried raw
+        const targets = [
+          'http://localhost/api/credential',
+          'http://localhost:9200/api/credential',
+          'HTTP://LOCALHOST/api/credential',
+          'http://user@localhost/api/credential',
+          'http://localhost/api/session/active',
+          '/api/credential;ignored/../info',
+          '/api/credential;ignored/../session/active',
+          '/api/session/active;x/../../credential',
+          '/api/session;x/../credential',
+          '/api/credential',
+          '/api/credential/',
+          '/api/CREDENTIAL',
+          '/api/%63redential',
+          '/api//credential',
+          '//api/credential',
+          '/api/./credential',
+          '/api/x/../credential',
+          '/api/x/%2e%2e/credential',
+          '/api/credential%2F',
+          '/api/credential%252F',
+          '/api/credential;x=1',
+          String.raw`/api\credential`,
+          '/api%2Fcredential',
+          '/api/session/active%3B/../credential',
+          '/api/session/ses_abc/%2e%2e/%2e%2e/credential',
+          '/api/session/active?x=/../credential',
+          '/api/session/active#/../../credential',
+          '/api/integration/anthropic/connect/key',
+          '/api/provider',
+          '/api/model',
+          '/api/config',
+          '*',
+        ]
+        const replies: {target: string; method: string; status: number; body: string}[] = []
+        for (const target of targets) {
+          for (const method of ['GET', 'POST', 'DELETE', 'PATCH']) {
+            // The one allowlisted route in the list answers 200 and is the control for "the proxy still forwards".
+            replies.push({target, method, ...(await rawGet(target, method))})
+          }
+        }
+
+        // #then none returned the key; and none is a bypass: anything but the plain allowlisted GET is a 404
+        for (const reply of replies) {
+          expect(reply.body, `${reply.method} ${reply.target}`).not.toContain(PROVIDER_KEY)
+          expect(reply.body, `${reply.method} ${reply.target}`).not.toContain('"value"')
+          // the plain allowlisted GET (its query only looks like a traversal) is forwarded; `*` may be refused by the parser
+          const allowed =
+            reply.target === '/api/session/active?x=/../credential' && reply.method === 'GET'
+              ? [200]
+              : reply.target === '*'
+                ? [400, 404]
+                : [404]
+          expect(allowed, `${reply.method} ${reply.target}`).toContain(reply.status)
+        }
+
+        // #and the gateway's own routes still work through the same proxy
+        expect((await viaProxy(workspace, '/api/session/active')).status).toBe(200)
+      } finally {
+        await workspace.stop()
+      }
+    },
+  )
+
+  it(
+    'reaches ready and sends the key when it is configured inline in the overlay, with no stored credential',
+    {timeout: RUNNER_TIMEOUT_MS},
+    async () => {
+      // #given the key in provider.anthropic.options.apiKey (the shape V1 migrates into V2 settings) and no blob
+      provider?.setHold(false)
+      const hitsBefore = provider?.hits().length ?? 0
+      writeMergedConfig(box, {inlineKey: true})
+      const workspace = await startWorkspace({withCredential: false})
+      try {
+        // #then the gate accepted the inline key: the spawn's credential store is empty and it is ready anyway
+        const db = new DatabaseSync(workspace.databasePaths[0] as string)
+        try {
+          const row = db.prepare('SELECT count(*) AS n FROM credential').get() as {n: number}
+          expect(row.n).toBe(0)
+        } finally {
+          db.close()
+        }
+        expect(workspace.statuses).toContain('ready')
+
+        // #when a prompt is sent
+        const created = (await (
+          await viaProxy(workspace, '/api/session', {
+            method: 'POST',
+            body: JSON.stringify({location: {directory: box.repo}}),
+          })
+        ).json()) as {data: {id: string}}
+        await viaProxy(workspace, `/api/session/${created.data.id}/prompt`, {
+          method: 'POST',
+          body: JSON.stringify({text: 'ping'}),
+        })
+        await vi.waitFor(() => expect(provider?.hits().slice(hitsBefore).length).toBeGreaterThan(0), {
+          timeout: 30_000,
+          interval: 100,
+        })
+
+        // #then the inline key reached the provider in x-api-key, and never in a log line
+        for (const hit of provider?.hits().slice(hitsBefore) ?? []) {
+          expect(hit.headers['x-api-key']).toBe(PROVIDER_KEY)
+        }
+        expect(lines.join('\n')).not.toContain(PROVIDER_KEY)
+      } finally {
+        await workspace.stop()
+        writeMergedConfig(box)
       }
     },
   )

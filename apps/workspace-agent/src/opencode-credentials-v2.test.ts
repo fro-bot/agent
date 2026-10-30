@@ -3,10 +3,10 @@ import type {Logger} from './opencode-server.js'
 import {describe, expect, it, vi} from 'vitest'
 
 import {
-  modelFromMergedConfig,
   modelProviderId,
   parseAuthBlob,
   provisionCredentials,
+  spawnConfigFromMergedConfig,
   verifyCredentialGate,
   WORKSPACE_CREDENTIAL_LABEL,
 } from './opencode-credentials-v2.js'
@@ -120,7 +120,7 @@ describe('modelProviderId', () => {
   })
 })
 
-describe('modelFromMergedConfig', () => {
+describe('spawnConfigFromMergedConfig', () => {
   it('reads the model the merged config names, wherever it came from (env model or overlay)', () => {
     // #given the file merge-config writes: base + overlay, with the env model winning only when it is non-blank
     const merged = JSON.stringify({
@@ -130,7 +130,10 @@ describe('modelFromMergedConfig', () => {
     })
 
     // #then
-    expect(modelFromMergedConfig(merged)).toEqual({success: true, data: 'openai/gpt-5.4-mini'})
+    expect(spawnConfigFromMergedConfig(merged)).toEqual({
+      success: true,
+      data: {model: 'openai/gpt-5.4-mini', authenticatedProviders: []},
+    })
   })
 
   it.each([
@@ -138,19 +141,62 @@ describe('modelFromMergedConfig', () => {
     ['a blank model', {model: '   '}],
     ['a non-string model', {model: {id: 'x'}}],
   ])('reads %s as no model', (_label, config) => {
-    expect(modelFromMergedConfig(JSON.stringify(config))).toEqual({success: true, data: undefined})
+    expect(spawnConfigFromMergedConfig(JSON.stringify(config))).toEqual({
+      success: true,
+      data: {authenticatedProviders: []},
+    })
   })
 
   it('trims the model', () => {
-    expect(modelFromMergedConfig('{"model":"  anthropic/claude-sonnet-4-6 "}')).toEqual({
+    expect(spawnConfigFromMergedConfig('{"model":"  anthropic/claude-sonnet-4-6 "}')).toMatchObject({
       success: true,
-      data: 'anthropic/claude-sonnet-4-6',
+      data: {model: 'anthropic/claude-sonnet-4-6'},
     })
+  })
+
+  it.each([
+    ['options.apiKey (V1 shape)', {anthropic: {options: {apiKey: 'sk-INLINE'}}}],
+    ['settings.apiKey (V2 shape)', {anthropic: {settings: {apiKey: 'sk-INLINE'}}}],
+    ['options.authToken', {anthropic: {options: {authToken: 'tok-INLINE'}}}],
+    ['settings.accessToken', {anthropic: {settings: {accessToken: 'tok-INLINE'}}}],
+  ])(
+    'counts a provider with an inline %s as authenticated, naming the provider and never the value',
+    (_label, provider) => {
+      // #when
+      const result = spawnConfigFromMergedConfig(JSON.stringify({provider}))
+
+      // #then
+      expect(result).toEqual({success: true, data: {authenticatedProviders: ['anthropic']}})
+      expect(JSON.stringify(result)).not.toContain('INLINE')
+    },
+  )
+
+  it.each([
+    ['an empty key', {anthropic: {options: {apiKey: ''}}}],
+    ['a blank key', {anthropic: {options: {apiKey: '   '}}}],
+    ['a non-string key', {anthropic: {options: {apiKey: 42}}}],
+    ['a baseURL only', {anthropic: {options: {baseURL: 'https://x/v1'}}}],
+    ['an env reference that may resolve to nothing', {anthropic: {options: {apiKey: '{env:ANTHROPIC_API_KEY}'}}}],
+    ['a file reference that may resolve to nothing', {anthropic: {options: {apiKey: '{file:/run/key}'}}}],
+    ['a model-level key (not provider auth)', {anthropic: {models: {m: {options: {apiKey: 'sk-INLINE'}}}}}],
+    ['a provider that is not an object', {anthropic: 'sk-INLINE'}],
+  ])('does not count %s as authentication', (_label, provider) => {
+    expect(spawnConfigFromMergedConfig(JSON.stringify({provider}))).toEqual({
+      success: true,
+      data: {authenticatedProviders: []},
+    })
+  })
+
+  it('lists only the providers that carry one', () => {
+    const result = spawnConfigFromMergedConfig(
+      JSON.stringify({provider: {anthropic: {options: {baseURL: 'x'}}, openai: {options: {apiKey: 'k'}}}}),
+    )
+    expect(result).toEqual({success: true, data: {authenticatedProviders: ['openai']}})
   })
 
   it('refuses a config that is not a JSON object, without quoting it (it may hold an inline key)', () => {
     for (const raw of ['{"provider": {"x": {"options": {"apiKey": "sk-SUPERSECRET', '[]', '"model"']) {
-      const result = modelFromMergedConfig(raw)
+      const result = spawnConfigFromMergedConfig(raw)
       expect(result.success).toBe(false)
       expect(JSON.stringify(result)).not.toContain('SUPERSECRET')
     }
@@ -366,5 +412,95 @@ describe('verifyCredentialGate', () => {
     // #then
     expect(result).toMatchObject({success: false, error: {providers: ['a b/c']}})
     expect(handle.calls.map(call => call.pathname)).toContain('/api/integration/a%20b%2Fc')
+  })
+})
+
+describe('verifyCredentialGate with inline authentication', () => {
+  it('passes a provider whose merged config carries an inline key, without asking the server', async () => {
+    // #given a server that lists no connection at all
+    const handle = handleWith(() => new Response(JSON.stringify({data: {connections: []}}), {status: 200}))
+
+    // #when
+    const result = await verifyCredentialGate({
+      handle,
+      providers: ['anthropic'],
+      configuredAuth: ['anthropic'],
+      requestTimeoutMs: 1000,
+    })
+
+    // #then
+    expect(result).toEqual({success: true, data: ['anthropic']})
+    expect(handle.calls).toHaveLength(0)
+  })
+
+  it('still refuses a provider that has neither a connection nor an inline key', async () => {
+    const handle = handleWith(() => new Response(JSON.stringify({data: {connections: []}}), {status: 200}))
+
+    const result = await verifyCredentialGate({
+      handle,
+      providers: ['openai'],
+      configuredAuth: ['anthropic'],
+      requestTimeoutMs: 1000,
+    })
+
+    expect(result).toMatchObject({success: false, error: {kind: 'credential-missing', providers: ['openai']}})
+    expect(handle.calls).toHaveLength(1)
+  })
+})
+
+describe('request bounds after the headers arrive', () => {
+  const entry = [{providerId: 'anthropic', key: KEY}] as const
+
+  /** Headers now, a body that never produces a byte and never closes. */
+  const stalledBody = (): Response =>
+    new Response(new ReadableStream<Uint8Array>({start: () => undefined}), {status: 200})
+
+  it('bounds a gate read whose integration JSON body stalls', async () => {
+    // #given
+    const handle = handleWith(stalledBody)
+    const started = Date.now()
+
+    // #when
+    const result = await verifyCredentialGate({handle, providers: ['anthropic'], requestTimeoutMs: 40})
+
+    // #then it gave up at the whole-request bound and refused, instead of waiting on the body
+    expect(result).toMatchObject({success: false, error: {kind: 'credential-missing'}})
+    expect(Date.now() - started).toBeLessThan(2000)
+  })
+
+  it('bounds a credential response whose body cancellation never settles', async () => {
+    // #given a created response whose body ignores cancel(): the transport honours neither the signal nor the cancel
+    const body = new ReadableStream<Uint8Array>({
+      start: () => undefined,
+      cancel: async () => new Promise<void>(() => undefined),
+    })
+    const handle = handleWith(() => new Response(body, {status: 200}))
+    const started = Date.now()
+
+    // #when
+    const result = await provisionCredentials({
+      handle,
+      entries: entry,
+      requestTimeoutMs: 40,
+      logger: capturingLogger().logger,
+    })
+
+    // #then the whole-request bound ended it: a provisioning failure naming the provider, not a hang
+    expect(result).toMatchObject({
+      success: false,
+      error: {kind: 'credential-provision-failed', providers: ['anthropic']},
+    })
+    expect(Date.now() - started).toBeLessThan(2000)
+  })
+
+  it('bounds a credential response whose headers never arrive', async () => {
+    const handle = handleWith(async () => new Promise<Response>(() => undefined))
+    const result = await provisionCredentials({
+      handle,
+      entries: entry,
+      requestTimeoutMs: 40,
+      logger: capturingLogger().logger,
+    })
+    expect(result).toMatchObject({success: false, error: {kind: 'credential-provision-failed'}})
   })
 })

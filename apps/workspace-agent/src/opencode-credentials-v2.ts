@@ -94,13 +94,40 @@ export function parseAuthBlob(raw: string): CredentialResult<readonly ProviderKe
   return {success: true, data: entries}
 }
 
+/** What the merged `opencode.json` says about the model and about authentication, with no secret value in it. */
+export interface SpawnConfig {
+  /** The `model` the spawn will use (`provider/model`), when the file names one. */
+  readonly model?: string
+  /** Providers that carry a non-empty inline credential setting in the file. Presence only: never the value. */
+  readonly authenticatedProviders: readonly string[]
+}
+
+/** The provider settings the resolver counts as configured authentication (`hasConfiguredAuth`, model-resolver.ts). */
+const INLINE_AUTH_KEYS = ['apiKey', 'authToken', 'accessToken'] as const
+
+/** A value that is a variable reference (`{env:X}`, `{file:X}`) resolves later, possibly to nothing: it proves nothing. */
+const VARIABLE_REFERENCE = /\{(?:env|file):/
+
+function hasInlineAuth(provider: unknown): boolean {
+  if (!isRecord(provider)) return false
+  // V1-shaped `options` is migrated into V2 `settings`; V2-native config writes `settings` directly. Both are read.
+  return [provider.options, provider.settings].some(
+    bag =>
+      isRecord(bag) &&
+      INLINE_AUTH_KEYS.some(key => {
+        const value = bag[key]
+        return typeof value === 'string' && value.trim() !== '' && !VARIABLE_REFERENCE.test(value)
+      }),
+  )
+}
+
 /**
- * The model the spawn will use, read from the merged `opencode.json` the entrypoint wrote and the server loads. That
- * file is the one place `deploy/scripts/merge-config.mjs` has already resolved env model against overlay model, so
- * this does not re-implement that rule. Undefined when the file names no model. The error never quotes the file,
- * which may hold an inline provider key from the operator's overlay.
+ * The model and the authenticated providers of the merged `opencode.json` the entrypoint wrote and the server loads.
+ * That file is the one place `deploy/scripts/merge-config.mjs` has already resolved env model against overlay model,
+ * so this does not re-implement that rule. The error never quotes the file, which may hold an inline provider key from
+ * the operator's overlay, and the result carries provider ids only.
  */
-export function modelFromMergedConfig(raw: string): CredentialResult<string | undefined> {
+export function spawnConfigFromMergedConfig(raw: string): CredentialResult<SpawnConfig> {
   let parsed: unknown
   try {
     parsed = JSON.parse(raw)
@@ -109,7 +136,11 @@ export function modelFromMergedConfig(raw: string): CredentialResult<string | un
   }
   if (!isRecord(parsed)) return fail('model-config-invalid', 'The merged OpenCode config is not a JSON object')
   const model = typeof parsed.model === 'string' ? parsed.model.trim() : ''
-  return {success: true, data: model === '' ? undefined : model}
+  const providers = isRecord(parsed.provider) ? parsed.provider : {}
+  const authenticatedProviders = Object.entries(providers)
+    .filter(([, provider]) => hasInlineAuth(provider))
+    .map(([providerId]) => providerId)
+  return {success: true, data: {...(model === '' ? {} : {model}), authenticatedProviders}}
 }
 
 /** The provider half of a `provider/model` string, or undefined when no model is configured. */
@@ -208,14 +239,20 @@ function hasUsableConnection(body: unknown): boolean {
 }
 
 /**
- * The fail-loud gate. For each required provider, `GET /api/integration/<provider>` must list a `credential` (or
- * `env`) connection, or the server never goes ready. That route returns connection ids, labels and methods only.
+ * The fail-loud gate. Each required provider must either carry an inline credential setting in the merged config
+ * (`configuredAuth`; the integration listing omits those) or have `GET /api/integration/<provider>` list a `credential`
+ * (or `env`) connection, or the server never goes ready. That route returns connection ids, labels and methods only.
  */
 export async function verifyCredentialGate(
-  options: CredentialRequestOptions & {readonly providers: readonly string[]},
+  options: CredentialRequestOptions & {
+    readonly providers: readonly string[]
+    /** Providers whose merged config carries an inline credential setting: usable without a stored connection. */
+    readonly configuredAuth?: readonly string[]
+  },
 ): Promise<CredentialResult<readonly string[]>> {
   const missing: string[] = []
   for (const providerId of options.providers) {
+    if (options.configuredAuth?.includes(providerId) === true) continue
     const usable = await boundedRequest(options, async signal => {
       const response = await options.handle.fetch(`/api/integration/${encodeURIComponent(providerId)}`, {signal})
       if (response.status !== 200) {

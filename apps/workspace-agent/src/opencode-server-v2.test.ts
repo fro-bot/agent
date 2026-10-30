@@ -3,6 +3,7 @@ import type {
   OpenCodeV2StartError,
   StartOpenCodeV2ServerOptions,
 } from '@fro-bot/runtime/workspace-v2'
+import type {SpawnConfig} from './opencode-credentials-v2.js'
 import type {RunSupervisedOpencodeV2Options} from './opencode-server-v2.js'
 import type {Logger, SupervisedStatusRef} from './opencode-server.js'
 
@@ -23,7 +24,7 @@ import {
   buildOpencodeV2Env,
   createUpstreamCredentials,
   prepareFreshDatabase,
-  readEffectiveModelFromConfig,
+  readSpawnConfigFromFile,
   runSupervisedOpencodeV2,
 } from './opencode-server-v2.js'
 
@@ -202,7 +203,7 @@ describe('buildOpencodeV2Env', () => {
   })
 })
 
-describe('readEffectiveModelFromConfig', () => {
+describe('readSpawnConfigFromFile', () => {
   const roots: string[] = []
   afterEach(() => {
     for (const root of roots.splice(0)) rmSync(root, {recursive: true, force: true})
@@ -219,15 +220,25 @@ describe('readEffectiveModelFromConfig', () => {
     writeFileSync(file, JSON.stringify({autoupdate: false, model: 'openai/gpt-5.4-mini', provider: {openai: {}}}))
 
     // #when / #then
-    expect(readEffectiveModelFromConfig(file)).toBe('openai/gpt-5.4-mini')
+    expect(readSpawnConfigFromFile(file)).toEqual({model: 'openai/gpt-5.4-mini', authenticatedProviders: []})
+  })
+
+  it('reads inline-authenticated providers as ids only', () => {
+    const file = path.join(configDir(), 'opencode.json')
+    writeFileSync(file, JSON.stringify({model: 'anthropic/m', provider: {anthropic: {options: {apiKey: 'sk-INLINE'}}}}))
+
+    const config = readSpawnConfigFromFile(file)
+
+    expect(config).toEqual({model: 'anthropic/m', authenticatedProviders: ['anthropic']})
+    expect(JSON.stringify(config)).not.toContain('INLINE')
   })
 
   it('reads no model for an absent file or one without a model', () => {
     const dir = configDir()
     const file = path.join(dir, 'opencode.json')
     writeFileSync(file, JSON.stringify({autoupdate: false}))
-    expect(readEffectiveModelFromConfig(path.join(dir, 'missing.json'))).toBeUndefined()
-    expect(readEffectiveModelFromConfig(file)).toBeUndefined()
+    expect(readSpawnConfigFromFile(path.join(dir, 'missing.json'))).toEqual({authenticatedProviders: []})
+    expect(readSpawnConfigFromFile(file)).toEqual({authenticatedProviders: []})
   })
 
   it('refuses a symlink, an oversized file and malformed JSON, without quoting the file', () => {
@@ -241,12 +252,12 @@ describe('readEffectiveModelFromConfig', () => {
     const bad = path.join(dir, 'bad.json')
     writeFileSync(bad, '{"provider":{"x":{"options":{"apiKey":"sk-SUPERSECRETKEY"')
 
-    expect(() => readEffectiveModelFromConfig(link)).toThrow(/symlink/)
-    expect(() => readEffectiveModelFromConfig(big)).toThrow(/too large/)
-    expect(() => readEffectiveModelFromConfig(bad)).toThrow(/not valid JSON/)
+    expect(() => readSpawnConfigFromFile(link)).toThrow(/symlink/)
+    expect(() => readSpawnConfigFromFile(big)).toThrow(/too large/)
+    expect(() => readSpawnConfigFromFile(bad)).toThrow(/not valid JSON/)
     const thrown = (): string => {
       try {
-        readEffectiveModelFromConfig(bad)
+        readSpawnConfigFromFile(bad)
         return ''
       } catch (error) {
         return String(error)
@@ -371,9 +382,18 @@ function stalledBody(): Response {
 describe('runSupervisedOpencodeV2', () => {
   const NO_BACKOFF = {initialBackoffMs: 0, maxBackoffMs: 0}
 
-  /** `model` is the effective model the merged config file names; absent means no model is configured. */
-  function setup(overrides: Partial<RunSupervisedOpencodeV2Options> & {readonly model?: string} = {}) {
-    const {model, ...runOverrides} = overrides
+  /**
+   * `model` is the effective model the merged config names (absent: none configured). `spawnConfigs` replaces it with
+   * one config per spawn, in order, the last repeating: the file is read fresh for every spawn.
+   */
+  function setup(
+    overrides: Partial<RunSupervisedOpencodeV2Options> & {
+      readonly model?: string
+      readonly spawnConfigs?: readonly SpawnConfig[]
+    } = {},
+  ) {
+    const {model, spawnConfigs, ...runOverrides} = overrides
+    let spawnConfigReads = 0
     const capture = createCapturingLogger()
     const credentials = createUpstreamCredentials()
     const statusRef: SupervisedStatusRef = {status: 'starting'}
@@ -399,7 +419,12 @@ describe('runSupervisedOpencodeV2', () => {
         verifyRules: OK_GATE,
         // Never the real secret path: the default reads /run/workspace-agent/secrets.
         readAuthBlob: () => null,
-        readEffectiveModel: () => model,
+        readSpawnConfig: () => {
+          const configs = spawnConfigs ?? [{...(model === undefined ? {} : {model}), authenticatedProviders: []}]
+          const next = configs[Math.min(spawnConfigReads, configs.length - 1)] as SpawnConfig
+          spawnConfigReads += 1
+          return next
+        },
         ...overrides.deps,
       },
     }
@@ -1205,24 +1230,104 @@ describe('runSupervisedOpencodeV2', () => {
       await done
     })
 
-    it('does not spawn when the effective model cannot be read', async () => {
+    it('refuses readiness and stops the server when the merged config cannot be read after the spawn', async () => {
       // #given
-      const {options, startOptions, statusRef, capture} = setup()
+      const fake = createHandle({authorization: 'Basic one'})
+      const {options, startOptions, capture} = setup({maxAttempts: 1})
+      const {statusRef, seen} = recordStatuses()
       options.deps = {
         ...options.deps,
-        readEffectiveModel: () => {
+        readSpawnConfig: () => {
           throw new Error('Secret path is not a regular file: /home/opencode/.config/opencode/opencode.json')
         },
-        startServer: scriptedStart([createHandle({authorization: 'Basic x'})], startOptions),
+        startServer: scriptedStart([fake], startOptions),
       }
 
       // #when
-      await runSupervisedOpencodeV2(options)
+      await runSupervisedOpencodeV2({...options, statusRef})
+
+      // #then it never turned ready, the server was stopped, and the failure kind is named
+      expect(seen).not.toContain('ready')
+      expect(statusRef.status).toBe('degraded')
+      expect(fake.shutdown).toHaveBeenCalledTimes(1)
+      expect(capture.serialized()).toContain('model-config-invalid')
+      expect(capture.serialized()).toContain('Cannot read the effective model')
+    })
+
+    it('reaches ready for a provider authenticated by an inline key in the merged config, with no stored credential', async () => {
+      // #given an overlay that carries the key inline, and no blob
+      const store = credentialStore()
+      const fake = createHandle({authorization: 'Basic one', routes: store.routes})
+      const {options, startOptions, statusRef, capture} = setup({
+        spawnConfigs: [{model: MODEL, authenticatedProviders: ['anthropic']}],
+      })
+      const controller = new AbortController()
+      options.deps = {...options.deps, startServer: scriptedStart([fake], startOptions)}
+
+      // #when
+      const done = runSupervisedOpencodeV2({...options, signal: controller.signal})
+      await vi.waitFor(() => expect(statusRef.status).toBe('ready'))
+
+      // #then the gate accepted the inline key without a connection, and nothing was posted
+      expect(store.posts).toHaveLength(0)
+      expect(fake.fetchPaths).not.toContain('/api/integration/anthropic')
+      expect(capture.serialized()).not.toContain('SUPERSECRETKEY')
+      controller.abort()
+      await done
+    })
+
+    it('still refuses a provider with no inline key, no stored credential and no connection', async () => {
+      // #given an inline key for openai only, and a model on anthropic
+      const store = credentialStore()
+      const fake = createHandle({authorization: 'Basic one', routes: store.routes})
+      const {options, startOptions, capture} = setup({
+        maxAttempts: 1,
+        spawnConfigs: [{model: MODEL, authenticatedProviders: ['openai']}],
+      })
+      const {statusRef, seen} = recordStatuses()
+      options.deps = {...options.deps, startServer: scriptedStart([fake], startOptions)}
+
+      // #when
+      await runSupervisedOpencodeV2({...options, statusRef})
 
       // #then
-      expect(startOptions).toHaveLength(0)
+      expect(seen).not.toContain('ready')
+      expect(capture.serialized()).toContain('credential-missing')
+    })
+
+    it('reads the merged config fresh for every spawn and gates the provider the replacement server loaded', async () => {
+      // #given the file names anthropic for the first spawn and openai for the second, and a blob that covers only anthropic
+      const store = credentialStore()
+      const first = createHandle({authorization: 'Basic first', routes: store.routes})
+      const second = createHandle({authorization: 'Basic second', routes: store.routes})
+      const {options, startOptions, credentials, capture} = setup({
+        maxAttempts: 2,
+        spawnConfigs: [
+          {model: 'anthropic/claude-sonnet-4-6', authenticatedProviders: []},
+          {model: 'openai/gpt-5.4-mini', authenticatedProviders: []},
+        ],
+      })
+      const {statusRef, seen} = recordStatuses()
+      options.deps = {
+        ...options.deps,
+        readAuthBlob: () => BLOB,
+        startServer: scriptedStart([first, second], startOptions),
+      }
+      const done = runSupervisedOpencodeV2({...options, statusRef})
+      await vi.waitFor(() => expect(credentials.authorization()).toBe('Basic first'))
+
+      // #when the first server dies and the replacement loads a different model
+      first.exit(1)
+      await done
+
+      // #then the replacement was gated on openai, found no credential, and never served
+      expect(first.fetchPaths).toContain('/api/integration/anthropic')
+      expect(second.fetchPaths).toContain('/api/integration/openai')
+      expect(second.fetchPaths).not.toContain('/api/integration/anthropic')
+      expect(seen.filter(status => status === 'ready')).toHaveLength(1)
       expect(statusRef.status).toBe('degraded')
-      expect(capture.serialized()).toContain('cannot read the effective model')
+      expect(capture.serialized()).toContain('credential-missing')
+      expect(credentials.authorization()).toBeUndefined()
     })
 
     it.each([

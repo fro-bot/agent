@@ -821,13 +821,15 @@ jobs:
             -H 'Authorization: Bearer dummy-smoke-token' -H "${dir_header}" -H 'content-type: application/json' \
             -d '{"text":"ping"}' "http://127.0.0.1:9200/api/session/${session_id}/prompt" >/dev/null
 
-          # The stored key is readable through /api/credential on the loopback server, so the bearer proxy must refuse
-          # that group in every spelling a router could match.
-          for credential_path in /api/credential /api/CREDENTIAL /api/%63redential /api/credential/cred_x; do
-            proxy_status="$(docker exec "${cid}" curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
-              -H 'Authorization: Bearer dummy-smoke-token' "http://127.0.0.1:9200${credential_path}")"
+          # The stored key is readable through /api/credential on the loopback server, so the bearer proxy forwards only
+          # the gateway's own routes (an allowlist) and answers 404 for anything else, in every spelling: case,
+          # percent-encoding, absolute-form, and `;` plus dot segments (the server's router truncates a path at `;`).
+          for target in /api/credential /api/CREDENTIAL /api/%63redential /api/credential/cred_x \
+            'http://localhost/api/credential' '/api/credential;ignored/../info' /api/info /api/integration/anthropic; do
+            proxy_status="$(docker exec "${cid}" curl -s -o /dev/null -w '%{http_code}' --max-time 10 --path-as-is \
+              --request-target "${target}" -H 'Authorization: Bearer dummy-smoke-token' http://127.0.0.1:9200/)"
             if [ "${proxy_status}" != "404" ]; then
-              echo "REGRESSION: the :9200 proxy answered ${proxy_status} for ${credential_path}, expected 404"
+              echo "REGRESSION: the :9200 proxy answered ${proxy_status} for ${target}, expected 404"
               exit 1
             fi
           done

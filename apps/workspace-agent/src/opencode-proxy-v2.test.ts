@@ -12,10 +12,12 @@ import type {Logger} from './opencode-server.js'
 
 import {Buffer} from 'node:buffer'
 import http from 'node:http'
+import net from 'node:net'
 
+import {V2_GATEWAY_ROUTES} from '@fro-bot/runtime/workspace-v2'
 import {afterEach, describe, expect, it} from 'vitest'
 
-import {createOpencodeProxyV2} from './opencode-proxy-v2.js'
+import {createOpencodeProxyV2, isForwardableTarget} from './opencode-proxy-v2.js'
 import {createUpstreamCredentials} from './opencode-server-v2.js'
 
 const TOKEN = 'gateway-bearer-token-xyz'
@@ -69,6 +71,20 @@ async function startUpstream(initialPassword: string): Promise<Upstream> {
         res.end(body)
         return
       }
+      // A router that behaves like the pinned one: case-insensitive, decoded, truncated at `;`, authority stripped.
+      const routed = (() => {
+        try {
+          return decodeURIComponent(new URL(req.url ?? '', 'http://x').pathname.split(';', 1)[0] ?? '').toLowerCase()
+        } catch {
+          return ''
+        }
+      })()
+      if (routed.includes('/api/credential') || (req.url ?? '').toLowerCase().includes('/api/credential')) {
+        const leak = JSON.stringify({data: [{id: 'cred_1', value: {type: 'key', key: 'sk-LEAKED-PROVIDER-KEY'}}]})
+        res.writeHead(200, {'content-type': 'application/json', 'content-length': String(Buffer.byteLength(leak))})
+        res.end(leak)
+        return
+      }
       if (req.url === '/api/event') {
         sseOpen += 1
         res.writeHead(200, {'content-type': 'text/event-stream', 'cache-control': 'no-cache, no-transform'})
@@ -79,7 +95,7 @@ async function startUpstream(initialPassword: string): Promise<Upstream> {
         })
         return
       }
-      if (req.url === '/api/slow') return
+      if (req.url === '/api/session/slow') return
       const body = JSON.stringify({directory: req.headers['x-opencode-directory'] ?? null, echoed: req.url})
       res.writeHead(200, {'content-type': 'application/json', 'content-length': String(Buffer.byteLength(body))})
       res.end(body)
@@ -144,6 +160,24 @@ function basic(password: string): string {
   return `Basic ${Buffer.from(`opencode:${password}`).toString('base64')}`
 }
 
+/** A raw request: the request line is written exactly as given (absolute-form, `*` and unescaped bytes included). */
+async function raw(base: string, requestLine: string, headers: string[] = [`authorization: Bearer ${TOKEN}`]) {
+  const parsed = new URL(base)
+  return new Promise<{status: number; body: string}>((resolve, reject) => {
+    const socket = net.connect(Number(parsed.port), parsed.hostname, () => {
+      socket.write([requestLine, 'host: workspace', 'connection: close', ...headers, '', ''].join('\r\n'))
+    })
+    const chunks: Buffer[] = []
+    socket.on('data', chunk => chunks.push(chunk))
+    socket.on('error', reject)
+    socket.on('close', () => {
+      const text = Buffer.concat(chunks).toString('utf8')
+      const status = Number(/^HTTP\/1\.[01] (\d{3})/.exec(text)?.[1] ?? 0)
+      resolve({status, body: text.split('\r\n\r\n').slice(1).join('\r\n\r\n')})
+    })
+  })
+}
+
 describe('opencode-proxy-v2', () => {
   const cleanups: (() => Promise<void>)[] = []
   afterEach(async () => {
@@ -177,7 +211,7 @@ describe('opencode-proxy-v2', () => {
     const {upstream, url} = await setup()
 
     // #when a request carries the gateway bearer
-    const reply = await request(url, {path: '/api/info', headers: BEARER})
+    const reply = await request(url, {path: '/api/session/active', headers: BEARER})
 
     // #then the server saw Basic auth with its password, never the bearer
     expect(reply.status).toBe(200)
@@ -225,9 +259,9 @@ describe('opencode-proxy-v2', () => {
     const {upstream, url} = await setup()
 
     // #when
-    const missing = await request(url, {path: '/api/info'})
-    const wrong = await request(url, {path: '/api/info', headers: {authorization: 'Bearer nope'}})
-    const basicScheme = await request(url, {path: '/api/info', headers: {authorization: basic('pw-one')}})
+    const missing = await request(url, {path: '/api/session/active'})
+    const wrong = await request(url, {path: '/api/session/active', headers: {authorization: 'Bearer nope'}})
+    const basicScheme = await request(url, {path: '/api/session/active', headers: {authorization: basic('pw-one')}})
 
     // #then the fixed body, and the server never saw a request
     for (const reply of [missing, wrong, basicScheme]) {
@@ -242,8 +276,8 @@ describe('opencode-proxy-v2', () => {
     const {url, lines} = await setup()
 
     // #when a bad request and a good one both pass through
-    await request(url, {path: '/api/info', headers: {authorization: 'Bearer wrong-token-value'}})
-    await request(url, {path: '/api/info', headers: BEARER})
+    await request(url, {path: '/api/session/active', headers: {authorization: 'Bearer wrong-token-value'}})
+    await request(url, {path: '/api/session/active', headers: BEARER})
 
     // #then
     const serialized = JSON.stringify(lines)
@@ -258,7 +292,7 @@ describe('opencode-proxy-v2', () => {
     const {upstream, url} = await setup({credentialed: false})
 
     // #when
-    const reply = await request(url, {path: '/api/info', headers: BEARER})
+    const reply = await request(url, {path: '/api/session/active', headers: BEARER})
 
     // #then a request is never sent unauthenticated to a server that is not the current one
     expect(reply.status).toBe(503)
@@ -269,13 +303,13 @@ describe('opencode-proxy-v2', () => {
   it('uses the new password for the next request after a respawn', async () => {
     // #given a ready server, then a respawn that rotates the password in the holder
     const {upstream, credentials, url} = await setup({password: 'pw-one'})
-    expect((await request(url, {path: '/api/info', headers: BEARER})).status).toBe(200)
+    expect((await request(url, {path: '/api/session/active', headers: BEARER})).status).toBe(200)
     credentials.clear()
     upstream.password = 'pw-two'
     credentials.set(() => basic('pw-two'))
 
     // #when
-    const reply = await request(url, {path: '/api/info', headers: BEARER})
+    const reply = await request(url, {path: '/api/session/active', headers: BEARER})
 
     // #then the proxy read the holder again and the request succeeds
     expect(reply.status).toBe(200)
@@ -289,7 +323,7 @@ describe('opencode-proxy-v2', () => {
     upstream.password = 'pw-rotated'
 
     // #when
-    const reply = await request(url, {path: '/api/info', headers: BEARER})
+    const reply = await request(url, {path: '/api/session/active', headers: BEARER})
 
     // #then the caller can tell it from its own 401 (wrong bearer) and from a 502 (nothing listening)
     expect(reply.status).toBe(502)
@@ -306,7 +340,7 @@ describe('opencode-proxy-v2', () => {
     await upstream.close()
 
     // #when
-    const reply = await request(url, {path: '/api/info', headers: BEARER})
+    const reply = await request(url, {path: '/api/session/active', headers: BEARER})
 
     // #then
     expect(reply.status).toBe(502)
@@ -318,7 +352,7 @@ describe('opencode-proxy-v2', () => {
     const {url} = await setup({timeoutMs: 80})
 
     // #when
-    const reply = await request(url, {path: '/api/slow', headers: BEARER})
+    const reply = await request(url, {path: '/api/session/slow', headers: BEARER})
 
     // #then
     expect(reply.status).toBe(504)
@@ -362,27 +396,27 @@ describe('opencode-proxy-v2', () => {
     expect(upstream.openSse()).toBe(0)
   })
 
-  describe('credential routes (fro-bot/agent#1992)', () => {
-    // The supervisor stores provider keys through /api/credential, and `credential.list` returns them in the clear.
-    // The gateway bearer must never reach that group, however the path is written.
-    const BLOCKED_PATHS = [
+  describe('route allowlist (fro-bot/agent#1992)', () => {
+    // The supervisor stores provider keys through /api/credential and `credential.list` returns them in the clear, so the
+    // gateway bearer may reach only the routes the gateway's clients call (V2_GATEWAY_ROUTES). Requests here are raw
+    // sockets, so the request line is exactly what is written: absolute-form, `*` and unescaped bytes included.
+    const METHODS = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']
+
+    const BLOCKED_TARGETS = [
+      // the credential group, every spelling the pinned router could match
       '/api/credential',
       '/api/credential/',
       '/api/credential?x=1',
       '/api/credential/cred_1',
-      '/api/credential/cred_1/',
       '/api/credential/cred_1/activate',
       '/API/credential',
       '/api/CREDENTIAL',
-      '/Api/Credential/cred_1',
       '/api/%63redential',
       '/api/%43REDENTIAL/cred_1',
       '/%61pi/credential',
-      '/%41PI/%63redential/cred_1/activate',
       '/api/credential%2F',
       '/api/credential%2Fcred_1',
       '/api%2Fcredential',
-      '/api%2fcredential%2fcred_1',
       '/api/credential%252Fcred_1',
       '/api/%2563redential',
       '/api//credential',
@@ -393,56 +427,157 @@ describe('opencode-proxy-v2', () => {
       '/api/credential;x=1',
       String.raw`/api\credential`,
       '/api%5Ccredential/cred_1',
+      // the two bypasses of the earlier denylist (review of #1993)
+      'http://localhost/api/credential',
+      '/api/credential;ignored/../info',
+      // absolute-form, authority-form and asterisk-form, whatever the path
+      'http://localhost:9200/api/credential',
+      'HTTP://LOCALHOST/api/credential',
+      'http://localhost/api/session/active',
+      'http://user@localhost/api/session/active',
+      'https://workspace/api/session',
+      'workspace:9200',
+      '*',
+      // dot, empty and parameter segments around an allowlisted route
+      '/api/session/active;x',
+      '/api/session;x/active',
+      '/api/session/active/',
+      '/api/session//active',
+      '/api/session/./active',
+      '/api/session/..',
+      '/api/session/.',
+      '/api/shell/..',
+      '/api/session/../session/active',
+      '/api/session/ses_abc/../../credential',
+      '/api/session/ses_abc/%2e%2e/%2e%2e/credential',
+      '/api/session/active%2e',
+      '/api/session%2Factive',
+      '/api/session/active%3B',
+      '/api/session/active%3b/../credential',
+      '/api/session/active%5C',
+      '/api/session/%25',
+      '/api/session/ses_abc%2F..%2Fcredential',
+      String.raw`/api/session/active\..\credential`,
+      '/api/session/ses_abc/prompt/..',
+      // a fragment is never part of a request target
+      '/api/session/active#/../../credential',
+      '/api/session/active?x#y',
+      // not routes the gateway calls
+      '/api/info',
+      '/api/plugin',
+      '/api/agent',
+      '/api/config',
+      '/api/provider',
+      '/api/model',
+      '/api/integration',
+      '/api/integration/anthropic',
+      '/api/integration/anthropic/connect/key',
+      '/api/debug/location',
+      '/api/location/reload',
+      '/api/experimental/integration/wellknown',
+      '/api/session/ses_abc/shell',
+      '/api/session/ses_abc/message',
+      '/api',
+      '/',
+      '/credential',
+      '/v1/credential',
     ]
-    const METHODS = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']
 
-    it.each(BLOCKED_PATHS)('answers 404 and never calls the server for %s, whatever the method', async path => {
+    it.each(BLOCKED_TARGETS)('answers 404 and never calls the server for %s, whatever the method', async target => {
       // #given a ready server
       const {upstream, url} = await setup()
 
-      // #when every method asks for the credential group in this spelling
+      // #when every method asks for it, raw
       const replies = []
       for (const method of METHODS) {
-        replies.push(await request(url, {method, path, headers: BEARER}))
+        replies.push({method, ...(await raw(url, `${method} ${target} HTTP/1.1`))})
       }
 
       // #then each is a 404 with the fixed body (HEAD has none) and the server saw nothing
-      for (const [index, reply] of replies.entries()) {
+      for (const reply of replies) {
+        // authority-form is a CONNECT target: for any other method the HTTP parser itself may answer 400 first
+        if (target === 'workspace:9200' && reply.status === 400) continue
         expect(reply.status).toBe(404)
-        expect(reply.body).toBe(METHODS[index] === 'HEAD' ? '' : 'Not Found\n')
+        expect(reply.body).toBe(reply.method === 'HEAD' ? '' : 'Not Found\n')
       }
       expect(upstream.seen).toHaveLength(0)
     })
 
-    it('blocks a path that cannot be decoded, or that is still changing after three decodes', async () => {
+    it('refuses control characters, a space and non-ASCII bytes in the target, and never calls the server', async () => {
       // #given
       const {upstream, url} = await setup()
 
       // #when
-      const malformed = await request(url, {path: '/api/%E0%A4%A', headers: BEARER})
-      const nested = await request(url, {path: '/api/%25252563redential', headers: BEARER})
+      const replies = [
+        await raw(url, 'GET /api/session/active?x=\u0001 HTTP/1.1'),
+        await raw(url, 'GET /api/session/active?x=\u007F HTTP/1.1'),
+        await raw(url, 'GET /api/session/\u00E9 HTTP/1.1'),
+        await raw(url, 'GET /api/session/active\u0000/../credential HTTP/1.1'),
+      ]
 
-      // #then
-      expect(malformed.status).toBe(404)
-      expect(nested.status).toBe(404)
+      // #then the parser or the proxy refuses each (400 or 404), and nothing was forwarded
+      for (const reply of replies) expect([400, 404]).toContain(reply.status)
       expect(upstream.seen).toHaveLength(0)
     })
 
-    it('blocks the credential group even while no server is ready, and still asks for the bearer first', async () => {
+    it('never forwards a bypass attempt that reaches the key, even with the privileged credential held', async () => {
+      // #given an upstream that answers the credential group with a key, wherever its router would put the request
+      const {upstream, url} = await setup()
+
+      // #when
+      const replies = []
+      for (const target of BLOCKED_TARGETS) replies.push(await raw(url, `GET ${target} HTTP/1.1`))
+
+      // #then no reply carries a key, and nothing reached the server except the one allowlisted route in the list
+      for (const reply of replies) expect(reply.body).not.toContain('sk-LEAKED-PROVIDER-KEY')
+      expect(upstream.seen).toHaveLength(0)
+    })
+
+    it.each(
+      V2_GATEWAY_ROUTES.filter(route => route.path !== '/api/event').map(
+        route => [route.method, route.path.replaceAll(/:\w+/g, 'abc_123')] as const,
+      ),
+    )('forwards the allowlisted route %s %s unchanged', async (method, path) => {
+      // #given
+      const {upstream, url} = await setup()
+
+      // #when
+      const reply = await request(url, {method, path: `${path}?x=1&y=%2Fapi%2Fcredential`, headers: BEARER})
+
+      // #then
+      expect(reply.status).toBe(200)
+      expect(upstream.seen).toHaveLength(1)
+      expect(upstream.seen[0]).toMatchObject({method, url: `${path}?x=1&y=%2Fapi%2Fcredential`})
+    })
+
+    it('lets a query say anything without changing the route: it is not inspected for routing', async () => {
+      // #given
+      const {upstream, url} = await setup()
+
+      // #when a query names credential routes, dot segments and parameters
+      await request(url, {path: '/api/session/active?next=/api/credential;x=1/../..', headers: BEARER})
+
+      // #then the allowlisted route was forwarded with its query intact
+      expect(upstream.seen[0]?.url).toBe('/api/session/active?next=/api/credential;x=1/../..')
+    })
+
+    it('answers 404 for a route outside the allowlist while no server is ready, and still asks for the bearer first', async () => {
       // #given
       const {upstream, url} = await setup({credentialed: false})
 
       // #when
       const noBearer = await request(url, {path: '/api/credential'})
       const withBearer = await request(url, {path: '/api/credential', headers: BEARER})
+      const allowlisted = await request(url, {path: '/api/session/active', headers: BEARER})
 
-      // #then an unauthenticated caller learns nothing, and an authenticated one gets the same 404 either way
+      // #then
       expect(noBearer.status).toBe(401)
       expect(withBearer.status).toBe(404)
+      expect(allowlisted.status).toBe(503)
       expect(upstream.seen).toHaveLength(0)
     })
 
-    it('logs the block without the path, the query or any header', async () => {
+    it('logs a refusal with the method only: no path, query or header', async () => {
       // #given
       const {url, lines} = await setup()
 
@@ -450,37 +585,66 @@ describe('opencode-proxy-v2', () => {
       await request(url, {path: '/api/credential/cred_secret_id?label=x', headers: BEARER})
 
       // #then
-      const blocked = lines.find(line => line.message === 'opencode-proxy-v2: credential route blocked')
+      const blocked = lines.find(line => line.message === 'opencode-proxy-v2: route not allowed')
       expect(blocked?.meta).toEqual({method: 'GET'})
       expect(JSON.stringify(lines)).not.toContain('cred_secret_id')
     })
+  })
+
+  describe('isForwardableTarget', () => {
+    it.each([
+      ['GET', '/api/session/active'],
+      ['GET', '/api/session?parentID=ses_1&limit=5'],
+      ['POST', '/api/session/ses_1/prompt'],
+      ['GET', '/api/event'],
+      ['DELETE', '/api/shell/shl_1?x=%2F'],
+    ])('accepts %s %s', (method, target) => {
+      expect(isForwardableTarget(method, target)).toBe(true)
+    })
 
     it.each([
-      '/api/info',
-      '/api/session',
-      '/api/session/ses_1/prompt',
-      '/api/integration',
-      '/api/integration/anthropic',
-      '/api/integration/credential',
-      '/api/session/credential',
-      '/api/credentials',
-      '/api/credentialx/y',
-      '/api/provider/credential',
-      '/api/file%2Fcredential',
-      '/api/session?next=/api/credential',
-      '/v1/credential',
-      '/credential',
-    ])('still forwards %s', async path => {
-      // #given
-      const {upstream, url} = await setup()
-
-      // #when
-      const reply = await request(url, {path, headers: {...BEARER, 'x-opencode-directory': '%2Fapi%2Fcredential'}})
-
-      // #then
-      expect(reply.status).toBe(200)
-      expect(upstream.seen).toHaveLength(1)
-      expect(upstream.seen[0]?.url).toBe(path)
+      ['GET', undefined],
+      [undefined, '/api/session/active'],
+      ['GET', ''],
+      ['GET', 'api/session/active'],
+      ['GET', 'http://localhost/api/session/active'],
+      ['GET', '//localhost/api/session/active'],
+      ['CONNECT', 'localhost:9200'],
+      ['OPTIONS', '*'],
+      ['GET', '/api/session/active\t'],
+      ['GET', '/api/session/active\n'],
+      ['GET', '/api/session/active\u0000'],
+      ['GET', '/api/session/active?x=\u001F'],
+      ['GET', '/api/session/active?x=\u007F'],
+      ['GET', '/api/session/active x'],
+      ['GET', '/api/session/\u00E9'],
+      ['GET', '/api/session/active#x'],
+      ['GET', '/api/session/active;x'],
+      ['GET', String.raw`/api/session\active`],
+      ['GET', '/api/session/%2fx'],
+      ['GET', '/api/session/%2Fx'],
+      ['GET', '/api/session/%5cx'],
+      ['GET', '/api/session/%5Cx'],
+      ['GET', '/api/session/%2ex'],
+      ['GET', '/api/session/%2Ex'],
+      ['GET', '/api/session/%3bx'],
+      ['GET', '/api/session/%3Bx'],
+      ['GET', '/api/session/%25x'],
+      ['GET', '/api/session/%41'],
+      ['GET', '/api/session//x'],
+      ['GET', '/api/session/'],
+      ['GET', '/api/session/./x'],
+      ['GET', '/api/session/../x'],
+      ['GET', '/api/session/.'],
+      ['GET', '/api/session/..'],
+      ['GET', '/api/shell/..'],
+      ['DELETE', '/api/shell/.'],
+      ['GET', '/api/session/ses_1/inbox/..'],
+      ['GET', '/'],
+      ['GET', '/api/credential'],
+      ['get', '/api/session/active'],
+    ])('refuses %j %j', (method, target) => {
+      expect(isForwardableTarget(method, target)).toBe(false)
     })
   })
 
@@ -503,26 +667,18 @@ describe('opencode-proxy-v2', () => {
       expect(JSON.stringify(lines)).not.toContain('secret-repo')
     })
 
-    it('logs session delete, location evict and location reload', async () => {
+    it('does not forward session delete, location evict or location reload: no gateway client calls them', async () => {
       // #given
-      const {url, lines} = await setup()
+      const {upstream, url, lines} = await setup()
 
       // #when
       await request(url, {method: 'DELETE', path: '/api/session/ses_abc123', headers: BEARER})
-      await request(url, {
-        method: 'DELETE',
-        path: '/api/debug/location?location[directory]=%2Fworkspace%2Frepos%2Fa%2Fb',
-        headers: BEARER,
-      })
+      await request(url, {method: 'DELETE', path: '/api/debug/location?location[directory]=%2Fa', headers: BEARER})
       await request(url, {method: 'POST', path: '/api/location/reload', headers: BEARER})
-      await new Promise<void>(resolve => setTimeout(resolve, 20))
 
-      // #then each teardown request is recorded once, and the query string (which carries the directory) is not
-      const messages = lines.map(line => line.message)
-      expect(messages).toContain('opencode-proxy-v2: session delete forwarded')
-      expect(messages).toContain('opencode-proxy-v2: location evict forwarded')
-      expect(messages).toContain('opencode-proxy-v2: location reload forwarded')
-      expect(JSON.stringify(lines)).not.toContain('workspace%2Frepos')
+      // #then
+      expect(upstream.seen).toHaveLength(0)
+      expect(lines.some(line => line.message.includes('forwarded'))).toBe(false)
     })
 
     it('does not log a forwarded line for an unauthorised caller', async () => {

@@ -14,6 +14,10 @@ export {
 
 export type {Logger} from '../shared/logger.js'
 
+export {isGatewayRouteV2, V2_GATEWAY_ROUTES} from './gateway-routes-v2.js'
+
+export type {V2GatewayRoute} from './gateway-routes-v2.js'
+
 export {verifyPermissionRules} from './permission-gate-v2.js'
 
 export type {AgentListSource, PermissionGateError, PermissionGateExpectations} from './permission-gate-v2.js'

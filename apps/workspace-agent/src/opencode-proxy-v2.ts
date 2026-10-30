@@ -15,9 +15,13 @@
  * - `x-opencode-directory` selects the location and passes through untouched (all headers except `authorization`
  *   and `host` do). The SSE stream (`/api/event`) is uncompressed, delivered incrementally, and sends a `:
  *   heartbeat` comment every 15 seconds, so it needs no special handling beyond the timeout exemption.
- * - The teardown classifier knows the V2 routes.
- * - The `/api/credential` group is never forwarded (fro-bot/agent#1992). The supervisor stores provider keys there,
- *   straight to loopback and not through this proxy, and `credential.list` returns every stored value in the clear.
+ * - The teardown classifier knows the one allowlisted stop route (session interrupt).
+ * - Only the routes the gateway's clients call are forwarded (`V2_GATEWAY_ROUTES`, an allowlist; fro-bot/agent#1992).
+ *   The supervisor stores provider keys through `/api/credential`, straight to loopback and not through this proxy,
+ *   and `credential.list` returns every stored value in the clear, so a bearer holder must not be able to reach it by
+ *   any spelling. A denylist lost that race twice (absolute-form `http://host/api/credential`, and
+ *   `/api/credential;x/../info`, which the server's router truncates at `;`), so the target is checked to be
+ *   canonical origin-form and then matched against the allowlist by exact segments, with no decoding.
  *
  * SECURITY INVARIANTS:
  * 1. The bearer is compared with `timingSafeEqual`, length-checked first, and is never logged or echoed.
@@ -26,7 +30,8 @@
  * 4. No header value, query string or request body is logged. The workspace directory travels in a header and in
  *    the evict query, so the teardown log carries only a validated session id, the status and the duration.
  * 5. Non-SSE requests have an inactivity timeout (504). SSE is exempt.
- * 6. A bearer holder never reaches `/api/credential`: it is answered 404 and not forwarded, however the path is spelled.
+ * 6. A request whose target is not canonical origin-form, or is not an allowlisted method and route, is answered 404 and
+ *    never forwarded, and only the method is logged.
  */
 
 import type {OpencodeProxyHandle} from './opencode-proxy.js'
@@ -38,6 +43,8 @@ import {timingSafeEqual} from 'node:crypto'
 import http from 'node:http'
 import process from 'node:process'
 import {URL} from 'node:url'
+
+import {isGatewayRouteV2} from '@fro-bot/runtime/workspace-v2'
 
 const UNAUTHORIZED_BODY = 'Unauthorized\n'
 const SERVICE_UNAVAILABLE_BODY = 'Service Unavailable\n'
@@ -72,84 +79,61 @@ interface TeardownRequest {
 }
 
 /**
- * Recognizes the V2 requests that tear down a session or a location. Matches on method and path only (the query
- * string is dropped), and returns a fixed message so nothing request-derived but a validated session id is logged.
+ * Recognizes the one allowlisted request that stops a session. Runs only on a target `isForwardableTarget` accepted, so
+ * the path is canonical, and returns a fixed message so nothing request-derived but a validated session id is logged.
  */
 function classifyTeardown(method: string | undefined, rawUrl: string | undefined): TeardownRequest | undefined {
-  if (method === undefined || rawUrl === undefined) return undefined
-  let pathname: string
-  try {
-    pathname = new URL(rawUrl, 'http://proxy.invalid').pathname
-  } catch {
-    return undefined
-  }
-  // ['', 'api', 'session', ':id', 'interrupt'] | ['', 'api', 'session', ':id']
-  // | ['', 'api', 'debug', 'location'] | ['', 'api', 'location', 'reload']
-  const segments = pathname.split('/')
-  if (segments[0] !== '' || segments[1] !== 'api') return undefined
-
-  const [, , head, second, third] = segments
-  if (head === 'session' && second !== undefined && SESSION_ID_PATTERN.test(second)) {
-    if (method === 'POST' && segments.length === 5 && third === 'interrupt') {
-      return {message: 'opencode-proxy-v2: session interrupt forwarded', sessionId: second}
-    }
-    if (method === 'DELETE' && segments.length === 4) {
-      return {message: 'opencode-proxy-v2: session delete forwarded', sessionId: second}
-    }
-    return undefined
-  }
-  if (method === 'DELETE' && segments.length === 4 && head === 'debug' && second === 'location') {
-    return {message: 'opencode-proxy-v2: location evict forwarded'}
-  }
-  if (method === 'POST' && segments.length === 4 && head === 'location' && second === 'reload') {
-    return {message: 'opencode-proxy-v2: location reload forwarded'}
+  if (method !== 'POST' || rawUrl === undefined) return undefined
+  const segments = (rawUrl.split('?', 1)[0] ?? '').split('/')
+  // ['', 'api', 'session', ':id', 'interrupt']
+  const [, api, head, id, tail] = segments
+  if (
+    segments.length === 5 &&
+    api === 'api' &&
+    head === 'session' &&
+    tail === 'interrupt' &&
+    id !== undefined &&
+    SESSION_ID_PATTERN.test(id)
+  ) {
+    return {message: 'opencode-proxy-v2: session interrupt forwarded', sessionId: id}
   }
   return undefined
 }
 
-/** How many times a path is percent-decoded before it is judged. A path still changing after this is not legitimate. */
-const MAX_PATH_DECODE_ROUNDS = 3
+/** Printable ASCII only: no control character, space, DEL or byte above 0x7e anywhere in the target. */
+const PRINTABLE_ASCII = /^[\x21-\x7E]+$/
+
+/** The percent-encodings of `/`, `\`, `.`, `;` and `%`: the characters a router can decode into path structure. */
+const STRUCTURAL_ENCODING = /%(?:2f|5c|2e|3b|25)/i
 
 /**
- * The path segments the server's router would see, or undefined when the path cannot be judged.
+ * True when a request may be forwarded: its target is canonical origin-form and its method and path are an allowlisted
+ * route. The check is strict on purpose, because the forwarded target is what the server's router sees:
  *
- * Measured against v2.2.0 (/tmp/v2-plan/cred/echo-check.md): the router matches `credential` case-insensitively and
- * after percent-decoding, collapses empty segments and ignores `;params`. So the path is decoded until it is stable
- * (bounded), split on `/` and `\`, emptied of `.` and empty segments, resolved for `..`, and stripped of `;params`.
- * The query and fragment are not part of the path.
+ * - origin-form only: it starts with exactly one `/`, so absolute-form (`http://host/...`, which the server's router
+ *   reduces to its path), authority-form and `*` are refused;
+ * - printable ASCII only, and no `#`;
+ * - the path (everything before the first `?`) has no `;` (the router truncates a segment there), no `\`, no empty
+ *   segment, no `.` or `..` segment, and no percent-encoding of `/`, `\`, `.`, `;` or `%`;
+ * - the path matches an allowlisted route by exact segments, with no decoding (`isGatewayRouteV2`).
+ *
+ * The query is allowed and is never inspected for routing: nothing after the first `?` decides the route.
  */
-function canonicalPathSegments(rawUrl: string | undefined): readonly string[] | undefined {
-  if (rawUrl === undefined) return undefined
-  let path = rawUrl.split(/[?#]/, 1)[0] ?? ''
-  for (let round = 0; ; round++) {
-    let decoded: string
-    try {
-      decoded = decodeURIComponent(path)
-    } catch {
-      return undefined
-    }
-    if (decoded === path) break
-    if (round === MAX_PATH_DECODE_ROUNDS - 1) return undefined
-    path = decoded
-  }
-  const segments: string[] = []
-  for (const raw of path.split(/[/\\]/)) {
-    const segment = raw.split(';', 1)[0] ?? ''
-    if (segment === '' || segment === '.') continue
-    if (segment === '..') segments.pop()
-    else segments.push(segment)
-  }
-  return segments
-}
-
-/**
- * True for any request that could reach the `credential` route group, and for any path that cannot be judged. Fails
- * closed: a malformed or endlessly encoded path is not forwarded either.
- */
-function targetsCredentialRoutes(rawUrl: string | undefined): boolean {
-  const segments = canonicalPathSegments(rawUrl)
-  if (segments === undefined) return true
-  return segments[0]?.toLowerCase() === 'api' && segments[1]?.toLowerCase() === 'credential'
+export function isForwardableTarget(method: string | undefined, target: string | undefined): boolean {
+  if (method === undefined || target === undefined) return false
+  if (!PRINTABLE_ASCII.test(target) || target.includes('#')) return false
+  if (!target.startsWith('/') || target.startsWith('//')) return false
+  const queryStart = target.indexOf('?')
+  const path = queryStart === -1 ? target : target.slice(0, queryStart)
+  if (path.includes(';') || path.includes('\\') || STRUCTURAL_ENCODING.test(path)) return false
+  if (
+    path
+      .split('/')
+      .slice(1)
+      .some(segment => segment === '' || segment === '.' || segment === '..')
+  )
+    return false
+  return isGatewayRouteV2(method, path)
 }
 
 export interface OpencodeProxyV2Options {
@@ -207,11 +191,11 @@ export function createOpencodeProxyV2(options: OpencodeProxyV2Options): Opencode
       return
     }
 
-    // --- Credential routes: never forwarded ---
+    // --- Allowlist: only the gateway's own routes, in canonical origin-form ---
     // After the bearer check (an unauthenticated caller learns nothing) and before the 503 and the forward, so the
     // answer is the same whether or not a server is ready. Nothing request-derived is logged but the method.
-    if (targetsCredentialRoutes(req.url)) {
-      logger.warn('opencode-proxy-v2: credential route blocked', {method: req.method})
+    if (!isForwardableTarget(req.method, req.url)) {
+      logger.warn('opencode-proxy-v2: route not allowed', {method: req.method})
       reply(res, 404, NOT_FOUND_BODY)
       return
     }
