@@ -15,11 +15,12 @@ This project manages external CLI tools through a **single-source-of-truth versi
 | --- | --- | --- | --- |
 | OpenCode (action default) | `DEFAULT_OPENCODE_VERSION` | `opencode-version` | _Release-job coupled — NOT Renovate (see below)_ |
 | OpenCode (action fallback) | `FALLBACK_VERSION` in `src/services/setup/opencode.ts` | _(internal only)_ | `github-releases` (`anomalyco/opencode`) |
-| OpenCode (workspace image) | `ARG OPENCODE_VERSION` in `deploy/workspace.Dockerfile` | _(internal only)_ | _Release-job coupled — NOT Renovate (see below)_ |
+| OpenCode (workspace image, V1 default) | `ARG OPENCODE_VERSION` in `deploy/workspace.Dockerfile` | _(internal only)_ | _Release-job coupled — NOT Renovate (see below)_ |
+| OpenCode (workspace image, V2) | `version` in `packages/runtime/src/shared/opencode-v2-pin.json`, passed as the workspace build's `--build-arg OPENCODE_VERSION` | _(internal only)_ | `github-releases` (`anomalyco/opencode`, major 2 only; custom manager on the JSON file) |
 | Systematic | `DEFAULT_SYSTEMATIC_VERSION` | `systematic-version` | `npm` (`@fro.bot/systematic`) |
 | OpenCode (harness base) | `base_version` in `packages/harness/harness.config.json` | _(internal only — config-JSON, not a TS constant)_ | `github-releases` (`anomalyco/opencode`) |
 
-**Release-job coupled sites (not Renovate-tracked):** `DEFAULT_OPENCODE_VERSION` and the workspace `ARG OPENCODE_VERSION` hold the harness build version (`<base>+harness.<sha>`). Renovate cannot order SemVer build-metadata tags, so both are bumped together by `harness-release.yaml`'s `sync-default-version` job at publish time (one auto-PR, dual-source idempotency guard). Do not add Renovate `customManager` entries for these — they would be dropped. See `docs/solutions/best-practices/cross-libc-build-and-release-safety-2026-06-14.md` §4 and `docs/solutions/workflow-issues/harness-base-version-source-of-truth-2026-06-12.md`.
+**Release-job coupled sites (not Renovate-tracked):** `DEFAULT_OPENCODE_VERSION` and the workspace `ARG OPENCODE_VERSION` hold the harness build version (`<base>+harness.<sha>`); the Dockerfile ARG default stays this V1 harness build, and V2 is selected by build-arg instead. Renovate cannot order SemVer build-metadata tags, so both are bumped together by `harness-release.yaml`'s `sync-default-version` job at publish time (one auto-PR, dual-source idempotency guard). Do not add Renovate `customManager` entries for these — they would be dropped. **V2 pin:** the JSON file's `version` is Renovate-tracked, but its per-asset digests are not; after a bump, run `node scripts/sync-opencode-v2-pin.ts` and commit the result (see `deploy/README.md` § OpenCode V2). See `docs/solutions/best-practices/cross-libc-build-and-release-safety-2026-06-14.md` §4 and `docs/solutions/workflow-issues/harness-base-version-source-of-truth-2026-06-12.md`.
 
 ## Quick Start
 
