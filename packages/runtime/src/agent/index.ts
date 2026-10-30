@@ -1,5 +1,32 @@
 export {ATTACHMENT_DIR_SEGMENT, buildAttachmentDir, createAttachmentDirExclusive} from './attachment-dir.js'
 export {
+  awaitDirectoryStability,
+  createDirectoryStabilityGate,
+  DIRECTORY_INBOX_READ_CONCURRENCY,
+  DIRECTORY_INBOX_RECENT_MARGIN_MS,
+  DIRECTORY_QUIESCENCE_MIN_SPACING_MS,
+  DIRECTORY_QUIESCENCE_MIN_SPAN_MS,
+  DIRECTORY_QUIESCENCE_READ_TIMEOUT_MS,
+  DIRECTORY_QUIESCENCE_REQUIRED_OBSERVATIONS,
+  listActiveSessionIdsInDirectoryV2,
+  observeDirectoryV2,
+  ownedSessionIdsOf,
+} from './directory-quiescence-v2.js'
+
+export type {
+  AwaitDirectoryStabilityOptions,
+  AwaitDirectoryStabilityResult,
+  DirectoryActivity,
+  DirectoryObservation,
+  DirectoryQuiescenceClient,
+  DirectoryStabilityGate,
+  DirectoryStabilityGateOptions,
+  DirectoryStabilityState,
+  DirectoryStabilityTuning,
+  InboxScope,
+  ObserveDirectoryOptions,
+} from './directory-quiescence-v2.js'
+export {
   createAgentError,
   createErrorInfo,
   createLLMFetchError,
@@ -10,12 +37,12 @@ export {
   isAgentNotFoundError,
   isLlmFetchError,
 } from './error-format/format.js'
-
 export {
   classifyProviderFailure,
   retrySignalFromStatus,
   terminalSignalFromPayload,
 } from './error-format/provider-failure.js'
+
 export type {
   ProviderFailureClassification,
   ProviderFailureEvidence,
@@ -25,7 +52,6 @@ export type {
   TerminalPayloadSignal,
 } from './error-format/provider-failure.js'
 export type {ErrorInfo, ErrorType} from './error-format/types.js'
-
 export {ERROR_TYPES} from './error-format/types.js'
 export {getEventKind, getEventPayload, getEventSessionID, getSessionID} from './event-shape.js'
 export {isFatalV2Event, mapV2Event, mapV2EventStream, v2InnerCallKey} from './event-v2.js'
@@ -40,13 +66,15 @@ export type {
   V2InterruptReason,
 } from './event-v2.js'
 export {filterAgentEnv} from './filter-env.js'
+export {clearHeldClaims} from './held-claims-v2.js'
+export type {ClearHeldClaimsOutcome} from './held-claims-v2.js'
 export {createInactivityTimer} from './inactivity-timer.js'
 export type {InactivityTimer} from './inactivity-timer.js'
 export {
   createV2LedgerReconcileAdapter,
   DEFAULT_V2_LIST_MAX_PAGES,
   DEFAULT_V2_LIST_PAGE_SIZE,
-  listBusyV2SessionIdsInDirectory,
+  listV2SessionsInDirectory,
 } from './ledger-reconcile-v2.js'
 export type {
   DirectoryQuiescenceDeps,
@@ -73,7 +101,7 @@ export type {
 } from './ledger-reconcile.js'
 export {hasBlockingToolPart} from './message-facts.js'
 export {resolveOutputMode} from './output-mode.js'
-export {createOwnershipLedger} from './ownership-ledger.js'
+export {createOwnershipLedger, isShellLedgerKey, shellIdFromLedgerKey, shellLedgerKey} from './ownership-ledger.js'
 export type {OwnershipEntryState, OwnershipLedger, OwnershipLedgerEntry} from './ownership-ledger.js'
 export {
   getBooleanProperty,
@@ -82,6 +110,29 @@ export {
   getStringProperty,
   ownValue,
 } from './payload-accessors.js'
+export {evaluatePermissionV2, verifyPermissionRules} from './permission-gate-v2.js'
+export type {
+  AgentListSource,
+  OutsidePolicyV2,
+  PermissionGateCheck,
+  PermissionGateError,
+  PermissionGateExpectations,
+  PermissionGateReport,
+  PermissionGateViolation,
+} from './permission-gate-v2.js'
+export {
+  buildConfigContentV2,
+  buildPermissionRulesV2,
+  externalDirectoryResource,
+  FORBIDDEN_TOOL_ACTIONS_V2,
+} from './permission-rules-v2.js'
+export type {
+  BuiltConfigV2,
+  ConfigContentInput,
+  PermissionEffectV2,
+  PermissionRulesInput,
+  PermissionRuleV2,
+} from './permission-rules-v2.js'
 export {
   buildCurrentThreadContextSection,
   buildHarnessRulesSection,
@@ -90,7 +141,20 @@ export {
 export {buildAgentPrompt, buildTaskSection, getTriggerDirective} from './prompt.js'
 export type {TriggerDirective} from './prompt.js'
 export {materializeReferenceFiles} from './reference-files.js'
+export {createRemoteOpenCodeV2Client, V2_HEARTBEAT_FRAME} from './remote-client-v2.js'
+export type {
+  RemoteOpenCodeV2Client,
+  RemoteOpenCodeV2ClientOptions,
+  V2CallError,
+  V2FormValue,
+  V2PermissionDecision,
+  V2SessionOutcome,
+  V2SessionSummary,
+  V2ShellSummary,
+} from './remote-client-v2.js'
 export {createRemoteOpenCodeHandle} from './remote-client.js'
+export {buildQuestionFormAnswer, createRemoteQuestionClientV2} from './remote-question-client-v2.js'
+export type {RemoteQuestionClientV2, RemoteQuestionResponseV2} from './remote-question-client-v2.js'
 export {createRemoteQuestionClient} from './remote-question-client.js'
 export type {RemoteQuestionClient, RemoteQuestionResponse} from './remote-question-client.js'
 export {resolveResponseDelivery} from './response-delivery.js'
@@ -115,11 +179,42 @@ export type {
   ResponseSurface,
   ResponseSurfacePolicy,
 } from './response-file.js'
+export {DEFAULT_OPENCODE_V2_TIMEOUTS, startOpenCodeV2Server} from './server-v2.js'
+export type {
+  OpenCodeV2ExitInfo,
+  OpenCodeV2ExitOutcome,
+  OpenCodeV2PluginProblem,
+  OpenCodeV2ServerHandle,
+  OpenCodeV2ShutdownOptions,
+  OpenCodeV2ShutdownResult,
+  OpenCodeV2StartError,
+  OpenCodeV2StartErrorKind,
+  OpenCodeV2Timeouts,
+  StartOpenCodeV2ServerOptions,
+} from './server-v2.js'
 export {bootstrapOpenCodeServer, ensureOpenCodeAvailable} from './server.js'
 export type {OpenCodeServerHandle, ShutdownResult} from './server.js'
 export {createSessionTools, info, list, read, search} from './session-tools.js'
 export type {SessionToolDefinition, SessionTools} from './session-tools.js'
 export type {SetupAdapter} from './setup-adapter.js'
+export {reconcileShellsOnce} from './shell-jobs-v2.js'
+export type {ReconcileShellsOptions, ShellApi, ShellReconcileObservation} from './shell-jobs-v2.js'
+export {
+  classifyShellNotice,
+  classifyShellNoticeItem,
+  isShellStatus,
+  readBackgroundShellDispatch,
+  readToolShellId,
+  settleLedgerFromShellNotice,
+} from './shell-notice.js'
+export type {
+  BackgroundShellDispatch,
+  ShellNotice,
+  ShellNoticeRead,
+  ShellNoticeSettlement,
+  ShellNoticeState,
+  V2ShellStatus,
+} from './shell-notice.js'
 export {
   readBackgroundDispatch,
   readSubagentNotice,
@@ -165,3 +260,5 @@ export {
   WORKING_LABEL_DESCRIPTION,
 } from './types.js'
 export {withScrubbedEnv} from './with-scrubbed-env.js'
+export {buildWorkspaceConfigV2} from './workspace-config-v2.js'
+export type {WorkspaceConfigV2Inputs} from './workspace-config-v2.js'

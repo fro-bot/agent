@@ -68,6 +68,39 @@ export function readSubagentNoticeItem(item: unknown): SubagentNotice | null {
   return readSubagentNotice(getObjectProperty(item, 'payload'))
 }
 
+/** How a synthetic message or inbox item reads as a subagent notice. */
+export type SubagentNoticeRead =
+  | {readonly kind: 'none'}
+  | {readonly kind: 'notice'; readonly notice: SubagentNotice}
+  /**
+   * The server marked it as a subagent notice (`metadata.source === 'subagent'`), but this reader cannot take it: an
+   * unknown state or a changed shape. The child it names, when readable, is no longer known to be running or ended.
+   */
+  | {readonly kind: 'unreadable'; readonly childSessionId: string | null}
+
+/** Like `readSubagentNotice`, but tells a message that is not a notice from a notice that cannot be read. */
+export function classifySubagentNotice(value: unknown): SubagentNoticeRead {
+  const notice = readSubagentNotice(value)
+  if (notice !== null) return {kind: 'notice', notice}
+
+  const type = getStringProperty(value, 'type')
+  if (type !== null && type !== 'synthetic') return {kind: 'none'}
+  const metadata = getObjectProperty(value, 'metadata')
+  if (getStringProperty(metadata, 'source') !== 'subagent') return {kind: 'none'}
+
+  const childSessionId = getStringProperty(metadata, 'childID')
+  return {
+    kind: 'unreadable',
+    childSessionId: childSessionId === null || childSessionId.length === 0 ? null : childSessionId,
+  }
+}
+
+/** Like `readSubagentNoticeItem`, with the same distinction. Only `synthetic` items are considered. */
+export function classifySubagentNoticeItem(item: unknown): SubagentNoticeRead {
+  if (getStringProperty(item, 'type') !== 'synthetic') return {kind: 'none'}
+  return classifySubagentNotice(getObjectProperty(item, 'payload'))
+}
+
 export interface SubagentNoticeSettlement {
   readonly childSessionId: string
   readonly state: SubagentNoticeState

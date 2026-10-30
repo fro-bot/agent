@@ -37,7 +37,7 @@ Exposes `POST /clone` (clones a GitHub repo into `/workspace/repos/{owner}/{repo
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | GET | /healthz | none | Liveness probe — returns `{ok: true}` |
-| GET | /readyz | none | Readiness probe — gates on OpenCode + proxy state |
+| GET | /readyz | none | Readiness probe — gates on OpenCode + proxy state; echoes `opencodeVersion` (the gateway picks its V1 or V2 loop from it) |
 | POST | /clone | bearer | Clone a GitHub repo into the workspace |
 | POST | /inspect | bearer | Read-only observation of an existing checkout |
 | POST | /update | bearer | Admission, bare-repo fetch, pack-stream import, journaled fast-forward of an existing checkout |
@@ -137,6 +137,10 @@ src/
 ├── recover.ts          /recover/preview and /recover: fingerprint preview, quarantine-and-replace mutation
 ├── backups.ts          /backups list/delete; the quarantine-generation metadata schema (including the optional run id)
 ├── opencode-instance.ts Best-effort POST /instance/dispose to the loopback OpenCode, run after a successful /recover
+├── opencode-generation.ts  Reads WORKSPACE_IMAGE_OPENCODE_VERSION (baked by the image); major 2+ selects the V2 trio below
+├── opencode-server-v2.ts   V2 supervisor: allowlisted env, fresh database per spawn, credential holder, plugin + permission gates
+├── opencode-proxy-v2.ts    V2 proxy: gateway bearer in, the ready server's Basic credential out, upstream 401 reported as such
+├── opencode-instance-v2.ts V2 best-effort location evict (DELETE /api/debug/location), authenticated as the running server
 ├── checkout-profile.ts Config inventory, layout, and temp-index cleanliness admission checks shared by update/recover
 ├── git-safety.ts       Sealed, credential-free git invocation profiles for git against an EXISTING checkout
 ├── git-stream.ts       pack-objects | index-pack streaming primitive (runPackStream)
@@ -150,6 +154,17 @@ src/
 └── types.ts        Request/response types (shared contract with gateway workspace-api)
 ```
 
+## OpenCode V2 (stock 2.x images)
+
+`deploy/workspace.Dockerfile` bakes `WORKSPACE_IMAGE_OPENCODE_VERSION` (the `OPENCODE_VERSION` that chose the binary). `main.ts` reads it through `readOpencodeGeneration`: major 2 or higher injects the V2 runner, proxy and disposer; unset or older keeps the V1 ones exactly. A value that is set but is not a version exits 1 before any bind. The same value is reported as `opencodeVersion` on `/healthz` and `/readyz`, and the gateway picks its run loop from it. The image pin is the only switch; there is no operator setting.
+
+- **Spawn** goes through `startOpenCodeV2Server` (`@fro-bot/runtime/workspace-v2`): `serve --stdio` with a held stdin, an explicit port, a per-spawn Basic password, readiness on `/api/agent`, and the plugin gate (Systematic `systematic` and `fro-bot.opencode-plugin` must be `active`). The child runs as uid/gid 10001 with an environment built from an allowlist.
+- **Plugins are installed at image build time** by `deploy/scripts/install-opencode-v2-plugins.sh` (bounded, as uid 10001) and listed in the config content passed at spawn. Nothing installs at boot.
+- **Every spawn gets a fresh database** (`prepareFreshDatabase`, under the root-owned `/var/lib/workspace-agent/opencode-v2-db`), so V2 has no execution claim to resume after a restart.
+- **The credential holder** is written before readiness flips to ready and cleared on any exit, so the proxy answers 503 (never forwards a stale password) between servers. An upstream 401 is reported as a 502 with `x-fro-bot-proxy-error: upstream-auth`.
+- **Shutdown** lists the sessions still active, interrupts them (reason `user`), closes stdin and confirms the exit, inside the 25s drain. `main.ts` waits for the V2 supervisor before it closes the proxy.
+- **Permission gate:** after the plugin gate the supervisor checks the effective rules from `/api/agent` (`ask` or `deny` outside the checkout, `session_move` and `worktree_create` denied). A server that fails never serves.
+
 ## Build
 
 ```bash
@@ -161,7 +176,7 @@ bun run --filter @fro-bot/workspace-agent check-types
 
 ## Deployment
 
-`deploy/workspace.Dockerfile` builds this package and bakes the OpenCode CLI (musl build, pinned to `DEFAULT_OPENCODE_VERSION`) plus a base `@fro.bot/systematic` plugin config. No model or provider is baked — those are deploy-time config. The container launches via `deploy/workspace-entrypoint.sh`, which (1) installs the mitmproxy CA into the **system** trust store (`update-ca-certificates`) — `git` and the `opencode` binary read the system CA bundle, so this is required for egress through the proxy; (2) validates the optional `workspace-opencode-auth` secret (API-key `auth.json` blob) and writes it to OpenCode's data path (`$XDG_DATA_HOME/opencode/auth.json`, `0600`) so the mention-loop agent can authenticate — written as a file, never exported as env, so the clone subprocess never sees it; and (3) overlays `WORKSPACE_OPENCODE_MODEL` (the `provider/model` string) and `WORKSPACE_OPENCODE_CONFIG` (a JSON `provider` block, e.g. a cliproxyapi `baseURL`) onto the base `opencode.json`, mirroring the action's `model` + `opencode-config` inputs (the Systematic plugin is always preserved). Auth and config are fail-soft when absent (clone-only boot) and fail fast when malformed. The supervisor (`main.ts`) then runs the clone API (9100), the loopback OpenCode server (54321), and the bearer proxy (9200).
+`deploy/workspace.Dockerfile` builds this package and bakes the OpenCode CLI (musl build) plus a base config. A V1 image runs the harness build (`ARG OPENCODE_VERSION`, in step with `DEFAULT_OPENCODE_VERSION`) with a base config that lists `@fro.bot/systematic`. A V2 image is selected by building with `--build-arg OPENCODE_VERSION=<version in packages/runtime/src/shared/opencode-v2-pin.json>`: it runs the stock binary verified against that pin, installs `@fro.bot/systematic` and `@fro.bot/opencode-plugin` at build time, and its base config is `{"update":"disable"}` with no plugin entry (the supervisor passes the plugins as config content at each spawn; see [deploy/README.md](../../deploy/README.md#opencode-v2)). `WORKSPACE_IMAGE_OPENCODE_VERSION` carries the version to `main.ts`, which picks the V1 or V2 supervisor. No model or provider is baked — those are deploy-time config. The container launches via `deploy/workspace-entrypoint.sh`, which (1) installs the mitmproxy CA into the **system** trust store (`update-ca-certificates`) — `git` and the `opencode` binary read the system CA bundle, so this is required for egress through the proxy; (2) validates the optional `workspace-opencode-auth` secret (API-key `auth.json` blob) and writes it to OpenCode's data path (`$XDG_DATA_HOME/opencode/auth.json`, `0600`) so the mention-loop agent can authenticate — written as a file, never exported as env, so the clone subprocess never sees it; and (3) overlays `WORKSPACE_OPENCODE_MODEL` (the `provider/model` string) and `WORKSPACE_OPENCODE_CONFIG` (a JSON `provider` block, e.g. a cliproxyapi `baseURL`) onto the base `opencode.json`, mirroring the action's `model` + `opencode-config` inputs (plugin entries already in the base are preserved; the V1 base lists Systematic, the V2 base lists none). Auth and config are fail-soft when absent (clone-only boot) and fail fast when malformed. The supervisor (`main.ts`) then runs the clone API (9100), the loopback OpenCode server (54321), and the bearer proxy (9200).
 
 Steps (2) and (3) are implemented by two checked-in Node ESM helpers in `deploy/scripts/` — `validate-auth.mjs` (`validateAuth`) and `merge-config.mjs` (`mergeConfig`) — which the entrypoint invokes (`node "$SCRIPTS_DIR/<script>.mjs"`); the Dockerfile copies them to `/usr/local/lib/workspace-scripts/`. They are plain ESM (no build step) with `node --test` coverage colocated as `*.test.mjs`, run in CI before the image build. `merge-config.mjs` writes the merged config atomically (temp file + `renameSync`) and rejects a `WORKSPACE_OPENCODE_MODEL` that is not in `provider/model` form. The config merge is an **intentionally narrow provider overlay** (shallow-merge + force `autoupdate:false` + strings-only `plugin` union/dedup) — it deliberately does **not** replicate the action's `buildCIConfig` normalization (`default_agent` pinning, legacy `plugins` stripping, permission scoping), which the workspace never needs.
 

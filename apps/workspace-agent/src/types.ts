@@ -312,6 +312,8 @@ export interface HealthzResponse {
   readonly ok: true
   /** OpenCode server readiness. Present when the server lifecycle is managed. */
   readonly opencode?: 'ready' | 'starting' | 'down' | 'degraded'
+  /** The OpenCode version the image runs. Absent when the image does not report one. See `/readyz`. */
+  readonly opencodeVersion?: string
 }
 
 /** GET /readyz response. */
@@ -322,6 +324,12 @@ export interface ReadyzResponse {
    * 'degraded' = retries exhausted, clone API still alive, /readyz returns 503.
    */
   readonly opencode: 'ready' | 'starting' | 'down' | 'degraded' | 'unknown'
+  /**
+   * The OpenCode version this image runs (`WORKSPACE_IMAGE_OPENCODE_VERSION`, set by the Dockerfile). The gateway
+   * picks its V1 or V2 run loop from it: major 2 or above is V2. Absent from an image that predates the variable,
+   * which the gateway treats as V1. Present while not ready too, so the choice does not wait for readiness.
+   */
+  readonly opencodeVersion?: string
 }
 
 /** POST /recover/preview request body. */

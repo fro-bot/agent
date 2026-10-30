@@ -1,6 +1,14 @@
 import * as fs from 'node:fs/promises'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import {baseVersion, compareVersions, getOpenCodeDbPath, isSqliteBackend, OPENCODE_SQLITE_VERSION} from './version.js'
+import {
+  baseVersion,
+  compareVersions,
+  DB_V2_MAIN_BASENAME,
+  getOpenCodeDbPath,
+  getSessionDbBasenames,
+  isSqliteBackend,
+  OPENCODE_SQLITE_VERSION,
+} from './version.js'
 
 vi.mock('node:fs/promises')
 
@@ -190,5 +198,29 @@ describe('version', () => {
     it('returns true for version at exact threshold (regression)', async () => {
       expect(await isSqliteBackend(OPENCODE_SQLITE_VERSION)).toBe(true)
     })
+  })
+})
+
+describe('getSessionDbBasenames', () => {
+  it('returns the V1 database family unchanged', () => {
+    // #given the V1 generation #when asking for its names #then they are the long-standing ones
+    expect(getSessionDbBasenames('v1')).toEqual({
+      main: 'opencode.db',
+      wal: 'opencode.db-wal',
+      shm: 'opencode.db-shm',
+      family: ['opencode.db', 'opencode.db-wal', 'opencode.db-shm'],
+      transportable: ['opencode.db'],
+    })
+  })
+
+  it('returns the V2 database family from the pinned V2 name, transporting only the main file', () => {
+    // #given the V2 generation #when asking for its names
+    const names = getSessionDbBasenames('v2')
+
+    // #then every name derives from the one pinned constant (P15: opencode.db, with -wal and -shm beside it)
+    expect(names.main).toBe(DB_V2_MAIN_BASENAME)
+    expect(names.main).toBe('opencode.db')
+    expect(names.family).toEqual([`${DB_V2_MAIN_BASENAME}`, `${DB_V2_MAIN_BASENAME}-wal`, `${DB_V2_MAIN_BASENAME}-shm`])
+    expect(names.transportable).toEqual([DB_V2_MAIN_BASENAME])
   })
 })

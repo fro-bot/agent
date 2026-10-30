@@ -8,6 +8,21 @@
       "types": "./src/index.ts",
       "import": "./src/index.ts",
       "default": "./src/index.ts"
+    },
+    "./workspace-v2": {
+      "types": "./src/agent/workspace-v2.ts",
+      "import": "./src/agent/workspace-v2.ts",
+      "default": "./src/agent/workspace-v2.ts"
+    },
+    "./session-v2": {
+      "types": "./src/session/v2.ts",
+      "import": "./src/session/v2.ts",
+      "default": "./src/session/v2.ts"
+    },
+    "./event-v2-fixtures": {
+      "types": "./src/agent/event-v2.fixtures.ts",
+      "import": "./src/agent/event-v2.fixtures.ts",
+      "default": "./src/agent/event-v2.fixtures.ts"
     }
   },
   "main": "src/index.ts",

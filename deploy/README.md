@@ -525,26 +525,61 @@ Both images build on `node:<ver>-alpine3.24@sha256:…`, and the base image is d
 
 #### Reuse guard (baked plugin + managed config)
 
-Gateway runs reject any `task` tool call that carries a non-empty `task_id` before the task executes (see [Background Subagents and Ownership](../docs/wiki/Background%20Subagents%20and%20Ownership.md#background-subagent-ownership-ledger-gateway) for why). The workspace image bakes two root-owned, read-only files for this:
+Gateway runs reject any `task` tool call that carries a non-empty `task_id` before the task executes (see [Background Subagents and Ownership](../docs/wiki/Background%20Subagents%20and%20Ownership.md#background-subagent-ownership-ledger-gateway) for why). On a V1 (harness) workspace image the guard is two root-owned, read-only files. A V2 image replaces both: its managed config (`deploy/managed-config/opencode-v2.json`) only disables self-update, and the guard is the `task` reuse check in the `@fro.bot/opencode-plugin` the image installs (see [OpenCode V2](#opencode-v2)). The rest of this section describes the V1 files:
 
 - `/usr/local/lib/fro-bot/plugins/no-task-reuse.mjs` — an OpenCode server plugin (source: `deploy/plugins/no-task-reuse.mjs`) whose `tool.execute.before` hook throws a fixed error for `tool === 'task'` with a truthy `task_id`. The tool part ends in `error` with that message, the model sees it, and the turn continues.
 - `/etc/opencode/opencode.json` (source: `deploy/managed-config/opencode.json`) — OpenCode's Linux **managed config** layer. It is merged LAST (after the agent's own config, project config and `OPENCODE_CONFIG_CONTENT`) and plugin arrays are concatenated, so nothing written under `/home/opencode` or into a checkout can remove the entry. The OpenCode child's environment is built from a fixed allowlist, so `OPENCODE_PURE` and `OPENCODE_TEST_MANAGED_CONFIG_DIR` cannot reach it.
 
 The Systematic plugin and the `subagent_depth: 1` pin are different: they live in the agent-writable merged config (`merge-config.mjs`) and are enforced at provisioning time only. `deploy/tests/isolation-harness.sh` proves the agent uid cannot modify, replace, rename, chmod or delete either guard file (root can), and `deploy/scripts/managed-config.test.mjs` pins the config-to-file path and ownership. Residual exposure: a plugin the agent loads from its own config or a project `.opencode/plugins` directory runs before the guard and could mutate the tool arguments in memory; that code already runs inside the OpenCode process as uid 10001, so the guard is a model-behavior boundary, not a sandbox.
 
-#### Harness OpenCode binary
+#### Harness OpenCode binary (V1, the Dockerfile default)
 
-The workspace runs the **harness build** of OpenCode — the patched binary published to [fro-bot/agent releases](https://github.com/fro-bot/agent/releases), not the stock `anomalyco/opencode` build. The harness binary carries session, plugin, and compaction fixes that apply to the mention-loop execution path.
+By default the workspace runs the **harness build** of OpenCode — the patched binary published to [fro-bot/agent releases](https://github.com/fro-bot/agent/releases), not the stock `anomalyco/opencode` build. The harness binary carries session, plugin, and compaction fixes that apply to the V1 mention-loop execution path. The image runs a stock V2 binary instead when it is built for V2 (see [OpenCode V2](#opencode-v2)).
 
-The version is pinned in `deploy/workspace.Dockerfile` as `ARG OPENCODE_VERSION=<base>+harness.<sha>` (e.g. `1.17.3+harness.2c9cdbd2`). The Dockerfile downloads the musl variant for the target architecture, verifies its SHA256 against the release's `SHA256SUMS` file, and aborts the image build if the hash does not match or the checksum file is missing — there is no fallback to a cached or stock binary.
+The default version is `ARG OPENCODE_VERSION=<base>+harness.<sha>` in `deploy/workspace.Dockerfile` (e.g. `1.17.3+harness.2c9cdbd2`). The Dockerfile downloads the musl variant for the target architecture, verifies its SHA256 against the release's `SHA256SUMS` file, and aborts the image build if the hash does not match or the checksum file is missing — there is no fallback to a cached or stock binary.
 
-**The workspace pin and the action default advance together.** The `harness-release` workflow opens an auto-PR that bumps both `ARG OPENCODE_VERSION` in `deploy/workspace.Dockerfile` and `DEFAULT_OPENCODE_VERSION` in `packages/runtime/src/shared/constants.ts` to the same new harness build. Merging that PR is the gate — not merging holds both surfaces at the prior build.
+**The Dockerfile default and the action default advance together.** The `harness-release` workflow opens an auto-PR that bumps both `ARG OPENCODE_VERSION` in `deploy/workspace.Dockerfile` and `DEFAULT_OPENCODE_VERSION` in `packages/runtime/src/shared/constants.ts` to the same new harness build. Merging that PR is the gate — not merging holds both surfaces at the prior build. The workflow rewrites the first `ARG OPENCODE_VERSION=` line on every harness release, so do not set that default to a V2 version; select V2 with a build-arg.
 
-**To bump the workspace to a newer harness release:** merge the auto-PR opened by the `harness-release` workflow. Both the action default and the workspace image advance together.
+**To bump a V1 workspace to a newer harness release:** merge the auto-PR opened by the `harness-release` workflow. Both the action default and the workspace image advance together.
 
-**Rollback / hold procedure:** to hold or roll back the workspace independently, manually edit `ARG OPENCODE_VERSION` in `deploy/workspace.Dockerfile` and rebuild the workspace image. Note that a manually pinned value will be overwritten the next time an auto-PR for a new harness release is merged — do not merge the next auto-PR until you are ready to advance. As a last resort, you can pin to a prior stock musl release from `anomalyco/opencode` (note: stock releases do not publish `SHA256SUMS`, so you would need to remove the checksum verification step temporarily).
+**Rollback / hold procedure (V1):** to hold or roll back a V1 workspace independently, manually edit `ARG OPENCODE_VERSION` in `deploy/workspace.Dockerfile` and rebuild the workspace image. Note that a manually pinned value will be overwritten the next time an auto-PR for a new harness release is merged — do not merge the next auto-PR until you are ready to advance. As a last resort, you can pin to a prior stock musl release from `anomalyco/opencode` (note: stock releases do not publish `SHA256SUMS`, so you would need to remove the checksum verification step temporarily).
 
 > **⚠️ BREAK-GLASS ONLY — removing checksum verification drops the fail-closed integrity guarantee.** Without it, the image build will accept any binary served at the download URL — including a tampered or substituted one. This must be treated as a temporary incident measure only: document the incident, revert the checksum step as soon as the harness release is available, and do not merge any auto-PR that advances `OPENCODE_VERSION` while verification is disabled.
+
+#### OpenCode V2
+
+The same Dockerfile builds a workspace that runs stock OpenCode V2 instead of the harness build. The gateway needs no setting for it.
+
+**The pin.** `packages/runtime/src/shared/opencode-v2-pin.json` holds the V2 `version` and the sha256 of each release asset. The Dockerfile's `opencode-v2` stage and the Action's `installOpenCode` both read it. The stage downloads the musl asset for the target architecture and requires the archive to match the pinned digest and the release's `SHA256SUMS` line; any mismatch aborts the build, with no fallback.
+
+**Selecting V2.** Pass the pinned version as a build-arg on the **workspace** build only:
+
+```bash
+docker build -f deploy/workspace.Dockerfile \
+  --build-arg OPENCODE_VERSION="$(node -p 'require("./packages/runtime/src/shared/opencode-v2-pin.json").version')" \
+  -t workspace-v2 .
+```
+
+A major of 2 or higher selects the V2 path; the value must equal the pin's `version`, or the build fails. The Dockerfile default stays the V1 harness build (see above), so an image built without the build-arg is V1. The gateway image has no OpenCode version. Whatever builds the deployed images (for example `marcusrbrown/infra`) passes the build-arg in its workspace build step only.
+
+**What a V2 image differs in.** The binary is the stock `opencode-linux-*-musl` release. `@fro.bot/systematic` and `@fro.bot/opencode-plugin` are installed at image build and loaded from the config content the workspace agent passes at each spawn; nothing installs at boot, so readiness needs no network and no provider. The base config (`/usr/local/share/fro-bot/opencode.base.json`) is `{"update":"disable"}` with no plugin entry, and `/etc/opencode/opencode.json` is `deploy/managed-config/opencode-v2.json`. The `task` reuse guard is the fro-bot plugin, not `no-task-reuse.mjs`.
+
+**Readiness and the gateway's choice of loop.** The workspace agent's `/readyz` returns `{"ready":true,"opencode":"ready","opencodeVersion":"<version>"}`. On V2 it turns 200 only after both plugins (`systematic`, `fro-bot.opencode-plugin`) are active and the permission gate passes. The gateway reads `opencodeVersion` on every run: absent runs the V1 loop, a major of 2 or higher runs the V2 loop (`packages/gateway/src/execute/run-core-v2.ts`), and an unreadable value is not ready.
+
+**No session history across spawns.** Each OpenCode V2 spawn deletes and recreates its database (`/var/lib/workspace-agent/opencode-v2-db`), so a workspace restart drops all OpenCode session state. The gateway keeps no OpenCode session history of its own.
+
+**Paired deploy.** Deploy a gateway that includes the V2 run loop (#1985) before the V2 workspace, or together with it, from the same ref. A gateway without that loop runs the V1 loop against a V2 server, which is unsafe. A V2-capable gateway in front of a V1 workspace is safe. The shared control-API token requirement above applies to both.
+
+**Bumping the pin.** Renovate opens a PR that changes only `version` (major 2 only; no automerge). Regenerate the digests before merging:
+
+```bash
+node scripts/sync-opencode-v2-pin.ts            # rewrite the digests from the release's SHA256SUMS
+node scripts/sync-opencode-v2-pin.ts --check    # exit 1 if the file disagrees with upstream
+```
+
+Commit the updated `opencode-v2-pin.json`. The **Workspace Image Smoke Test** CI job builds the image against the pin, starts it with no network, and fails on a stale digest.
+
+**Revert.** Before switching, record the digests of the running workspace and gateway images. To revert, redeploy those previous workspace and gateway images by digest. Rebuilding an older ref does not reproduce the same digests.
 
 Outbound TLS from the workspace flows through `mitmproxy`. The container entrypoint installs the mitmproxy CA into the **system** trust store via `update-ca-certificates` before launching — `git` and the OpenCode binary read the system bundle, not `NODE_EXTRA_CA_CERTS`, so this step is required for cloning and model calls to succeed through the proxy. Set `OBJECT_STORE_HOSTS` and any provider hosts your deployment uses (see [Egress Allowlist](#egress-allowlist)).
 
@@ -558,7 +593,7 @@ The mention-loop agent needs a model and a provider to talk to. These mirror the
 - `WORKSPACE_OPENCODE_CONFIG` — a JSON object shallow-merged over the baked base config; supply the `provider` block that points OpenCode at your endpoint.
 - `WORKSPACE_OPENCODE_READY_TIMEOUT_MS` — how long (in milliseconds) the workspace agent waits for the OpenCode server to become ready before marking it `down`. Default: `60000` (60 s — sized for a cold boot behind the egress proxy). Absent or empty → default applies (fail-soft). Set to a non-numeric value, zero, or a negative number → startup fails immediately with an explicit error (fail-fast).
 
-The image bakes no default model — the entrypoint overlays these onto the base config at startup (the Systematic plugin is always preserved; a malformed value fails fast; the reuse guard lives in the root-owned managed config layer and is unaffected by the overlay). Provider **credentials** stay in the `workspace-opencode-auth` secret (above); these two are non-secret operator config.
+The image bakes no default model — the entrypoint overlays these onto the base config at startup (plugin entries in the base are preserved — the V1 base lists Systematic, the V2 base lists none; a malformed value fails fast; the reuse guard lives in the root-owned managed config layer and is unaffected by the overlay). Provider **credentials** stay in the `workspace-opencode-auth` secret (above); these two are non-secret operator config.
 
 To route Claude/OpenAI through a [cliproxyapi](https://github.com/router-for-me/CLIProxyAPI) proxy (the default in `marcusrbrown/infra`), point the stock `anthropic`/`openai` providers at the proxy's `/v1` base URL and set the model:
 

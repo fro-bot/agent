@@ -231,4 +231,33 @@ describe('filterAgentEnv', () => {
     // #then
     expect(result).toEqual({})
   })
+
+  // The V2 server (server-v2.ts) reads these names from its own environment. The password must reach it only
+  // through the spawn, never through the scrub, so a parent that already holds one cannot hand it to a child.
+  it('drops both V2 server password names, so the password can only be injected at spawn', () => {
+    // #given
+    const env = {OPENCODE_PASSWORD: 'pw-1', OPENCODE_SERVER_PASSWORD: 'pw-2', PATH: '/usr/bin'}
+
+    // #when
+    const result = filterAgentEnv(env)
+
+    // #then
+    expect(result).toEqual({PATH: '/usr/bin'})
+  })
+
+  it('keeps the V2 server variables the lifecycle relies on', () => {
+    // #given
+    const env = {
+      OPENCODE_DB: '/data/opencode.db',
+      OPENCODE_DISABLE_MODELS_FETCH: '1',
+      OPENCODE_CONFIG_DIR: '/etc/opencode',
+      XDG_DATA_HOME: '/data',
+    }
+
+    // #when
+    const result = filterAgentEnv(env)
+
+    // #then
+    expect(result).toEqual(env)
+  })
 })

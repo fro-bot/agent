@@ -16,6 +16,7 @@ import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 // fail this test without needing to know anything about save.ts's internals.
 const mocks = vi.hoisted(() => ({
   buildCachePaths: vi.fn(),
+  buildCachePathsV2: vi.fn(),
 }))
 
 vi.mock('./paths.js', async importOriginal => {
@@ -23,6 +24,7 @@ vi.mock('./paths.js', async importOriginal => {
   return {
     ...original,
     buildCachePaths: mocks.buildCachePaths.mockImplementation(original.buildCachePaths),
+    buildCachePathsV2: mocks.buildCachePathsV2.mockImplementation(original.buildCachePathsV2),
   }
 })
 
@@ -130,5 +132,59 @@ describe('saveCache checkpoint-then-paths ordering', () => {
     // silently passing because it is never exercised at all
     expect(result).toMatchObject({cachePersisted: true, outcome: 'persisted'})
     expect(mocks.buildCachePaths).toHaveBeenCalledTimes(1)
+  })
+  it("returns without building V2 cache paths when a V2 run's checkpoint fails", async () => {
+    // #given a database held under an exclusive lock, and a V2 run
+    const holder = new DatabaseSync(dbPath)
+    holder.exec('PRAGMA journal_mode=WAL')
+    holder.exec('CREATE TABLE sessions(id INTEGER PRIMARY KEY, data TEXT)')
+    holder.exec("INSERT INTO sessions (data) VALUES ('session-1')")
+    holder.exec('PRAGMA locking_mode=EXCLUSIVE')
+    holder.exec('BEGIN IMMEDIATE')
+    holder.exec("INSERT INTO sessions (data) VALUES ('in-flight')")
+
+    const {saveCache} = await import('./save.js')
+
+    // #when saving cache
+    const result = await saveCache({
+      components: testComponents,
+      runId: 12345,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      opencodeVersion: '2.2.0',
+      cacheAdapter: createStubCacheAdapter(),
+    })
+
+    // #then the V2 path builder is never reached, the same ordering the V1 path guarantees
+    expect(result).toMatchObject({cachePersisted: false, storePersisted: false, outcome: 'checkpoint-declined'})
+    expect(mocks.buildCachePathsV2).not.toHaveBeenCalled()
+    expect(mocks.buildCachePaths).not.toHaveBeenCalled()
+
+    holder.exec('COMMIT')
+    holder.close()
+  })
+
+  it("builds V2 paths, and only V2 paths, once a V2 run's checkpoint resolves", async () => {
+    // #given a healthy workspace and a V2 run
+    await fs.writeFile(path.join(storagePath, 'session.json'), '{"session":"created"}', 'utf8')
+
+    const {saveCache} = await import('./save.js')
+
+    // #when saving cache
+    const result = await saveCache({
+      components: testComponents,
+      runId: 12345,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      opencodeVersion: '2.2.0',
+      cacheAdapter: createStubCacheAdapter(),
+    })
+
+    // #then the V2 builder supplies the list and the V1 builder is not consulted
+    expect(result).toMatchObject({cachePersisted: true, outcome: 'persisted'})
+    expect(mocks.buildCachePathsV2).toHaveBeenCalledTimes(1)
+    expect(mocks.buildCachePaths).not.toHaveBeenCalled()
   })
 })
