@@ -30,9 +30,10 @@
 import type {GatewayLogger} from '../discord/client.js'
 import type {PermissionReply} from '../operator-contract/approval.js'
 import type {DecisionOutcome} from './registry.js'
-import type {RunGrants} from './run-grants.js'
+import type {EchoWait, RunGrants} from './run-grants.js'
 
 import {getObjectProperty, getStringProperty, toErrorMessage} from '@fro-bot/runtime'
+import {startEchoWait} from './run-grants.js'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -268,22 +269,15 @@ interface Entry {
   resolve: (reply: PermissionReply) => void
 }
 
-/**
- * How long a failed or thrown auto-answer waits for the request's `permission.replied` echo before the ask goes to an
- * operator. A failed HTTP reply is ambiguous: OpenCode may have accepted the `once` and only the response was lost.
- *
- * Residual: an echo later than this bound can still follow an operator reply, so OpenCode would get a second reply for
- * the request. It answers not-found, which surfaces as a reply error on that reply; the ask itself was answered once.
- */
-export const AUTO_ANSWER_ECHO_WAIT_MS = 5000
+export {AUTO_ANSWER_ECHO_WAIT_MS} from './run-grants.js'
 
 /**
  * An auto-answer in flight. `echoed` is set when its `permission.replied` arrives, even before the reply call returns;
- * `wake` ends the post-failure wait for the echo early (the echo arrived, or the run is disposed).
+ * `wait` is the post-failure wait for the echo early (the echo arrived, or the run is disposed).
  */
 interface AutoState {
   echoed: boolean
-  wake: (() => void) | undefined
+  wait: EchoWait | undefined
 }
 
 /**
@@ -376,7 +370,7 @@ export function createPermissionCoordinator(deps: PermissionCoordinatorDeps): Pe
     request: PermissionRequest,
     runGrants: NonNullable<PermissionCoordinatorDeps['runGrants']>,
   ): Promise<PermissionReply> {
-    const state: AutoState = {echoed: false, wake: undefined}
+    const state: AutoState = {echoed: false, wait: undefined}
     autoInFlight.set(request.requestID, state)
     let ok: boolean
     try {
@@ -386,15 +380,9 @@ export function createPermissionCoordinator(deps: PermissionCoordinatorDeps): Pe
     }
     if (!ok && !state.echoed && !disposed) {
       // Ambiguous: OpenCode may have accepted the once with only the response lost. Give the echo a bounded chance.
-      await new Promise<void>(resolve => {
-        const timer = setTimeout(done, AUTO_ANSWER_ECHO_WAIT_MS)
-        function done(): void {
-          clearTimeout(timer)
-          state.wake = undefined
-          resolve()
-        }
-        state.wake = done
-      })
+      state.wait = startEchoWait()
+      await state.wait.outcome
+      state.wait = undefined
     }
     autoInFlight.delete(request.requestID)
     if (ok || state.echoed) {
@@ -480,7 +468,7 @@ export function createPermissionCoordinator(deps: PermissionCoordinatorDeps): Pe
     const auto = autoInFlight.get(event.requestID)
     if (auto !== undefined) {
       auto.echoed = true
-      auto.wake?.()
+      auto.wait?.end('echo')
     }
     // The echo can confirm an operator Always whose HTTP response was lost; a grant it records settles covered siblings.
     deps.runGrants?.grants.confirm(event.requestID, event.reply)
@@ -505,7 +493,7 @@ export function createPermissionCoordinator(deps: PermissionCoordinatorDeps): Pe
     disposed = true
     deps.runGrants?.grants.drop()
     // End any auto-answer waiting for its echo: it now takes the reject path.
-    for (const auto of autoInFlight.values()) auto.wake?.()
+    for (const auto of autoInFlight.values()) auto.wait?.end('cancelled')
     const open = Array.from(localMap.keys())
     if (open.length > 0) {
       logger.warn({reason, count: open.length}, 'approvals: disposing open permission requests — fail-closed')

@@ -56,9 +56,11 @@ import type {GatewayLogger} from '../discord/client.js'
 import type {ApprovalRequestDetail} from '../operator-contract/approval-frame.js'
 import type {PermissionReply, PermissionReplyEvent, PermissionRequest, SettlementReason} from './coordinator.js'
 import type {ApprovalGateEntry, GateActor, RequestGate, ScopePolicy, TerminalOutcome} from './request-gate.js'
+import type {EchoWait} from './run-grants.js'
 
 import {boundApprovalDetail} from './approval-detail.js'
 import {createRequestGate} from './request-gate.js'
+import {startEchoWait} from './run-grants.js'
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -488,6 +490,36 @@ export function createApprovalRegistry(deps: {
   // autoApprove — a run grant settling an open ask
   // -------------------------------------------------------------------------
 
+  /** Echo waits of auto-approves whose reply failed, by request id. The entry stays `claimed` while one is open. */
+  const echoWaits = new Map<string, EchoWait>()
+
+  /**
+   * Send the `once` for an auto-approve. A failed or thrown reply is ambiguous (OpenCode may have accepted it and only
+   * the response was lost), so the entry stays claimed for a bounded wait for its `permission.replied` echo, which
+   * settles it. Only when none comes does the failure reach the gate, which reopens the entry to the operator. A run
+   * that is ending skips the wait: the failure then takes the gate's disposed path (one recovery reject, no reopen).
+   */
+  async function postAutoApprove(entry: ApprovalGateEntry): Promise<{readonly ok: boolean; readonly error?: string}> {
+    const {requestID} = entry
+    const {effects, directory} = entry.payload
+    let result: {readonly ok: boolean; readonly error?: string}
+    try {
+      result = await effects.postReply(requestID, directory, 'once')
+    } catch {
+      result = {ok: false, error: 'threw'}
+    }
+    if (result.ok) return result
+    // The entry left the gate while the reply was in flight. Disposed: the failure takes the gate's disposed path
+    // (one recovery reject, no reopen). Settled by the echo: it was accepted after all.
+    if (getEntry(requestID) !== entry) return entry.state === 'disposed' ? result : {ok: true}
+
+    const wait = startEchoWait()
+    echoWaits.set(requestID, wait)
+    const ended = await wait.outcome
+    echoWaits.delete(requestID)
+    return ended === 'echo' ? {ok: true} : result
+  }
+
   async function autoApprove(requestID: string): Promise<DecisionOutcome> {
     const entry = getEntry(requestID)
     if (entry === undefined) return 'not-found'
@@ -497,9 +529,8 @@ export function createApprovalRegistry(deps: {
     if (admission.kind === 'scope-mismatch') return 'channel-mismatch'
     if (admission.kind === 'already-claimed') return 'already-claimed'
 
-    const {effects, directory} = entry.payload
     // eslint-disable-next-line @typescript-eslint/promise-function-async
-    const outcome = await admission.submit(() => effects.postReply(requestID, directory, 'once'))
+    const outcome = await admission.submit(() => postAutoApprove(entry))
     switch (outcome) {
       case 'ok':
         return 'ok'
@@ -548,6 +579,9 @@ export function createApprovalRegistry(deps: {
       // Open entry: OpenCode-initiated (unsolicited reject or always-rule). No POST needed.
       logger.info({requestID, state: entry.state, reply}, 'ApprovalRegistry: confirmReply — OpenCode-initiated')
     }
+
+    // An auto-approve waiting on this echo is answered: it settles below and must not be reopened.
+    echoWaits.get(requestID)?.end('echo')
 
     // Render asynchronously (best-effort; errors logged by the gate).
     // eslint-disable-next-line no-void
@@ -627,7 +661,11 @@ export function createApprovalRegistry(deps: {
       // A claimed entry's reply may still be in flight. Mark the entry disposed so the gate never
       // reopens it when that reply fails, and so `handleDecision` can deny the permission once the
       // reply settles. A reply that already succeeded awaits its echo, which finds nothing to settle.
-      if (reason === 'disposed' && entry.state === 'claimed') entry.state = 'disposed'
+      if (reason === 'disposed' && entry.state === 'claimed') {
+        entry.state = 'disposed'
+        // An auto-approve waiting for its echo stops waiting: the run is over, so its failure takes the disposed path.
+        echoWaits.get(requestID)?.end('cancelled')
+      }
 
       // For non-replied/non-cascade reasons on open entries: best-effort postReply.
       // Skip if already claimed/confirmed (postReply was or is being sent).

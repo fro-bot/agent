@@ -17,6 +17,7 @@
  * 9. disposeRun — only settles entries for the matching sessionID
  */
 
+import type {Mock} from 'vitest'
 import type {GatewayLogger} from '../discord/client.js'
 import type {PermissionRequest} from './coordinator.js'
 import type {
@@ -30,6 +31,7 @@ import type {
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
+import {AUTO_ANSWER_ECHO_WAIT_MS} from './coordinator.js'
 import {createApprovalRegistry} from './registry.js'
 
 // ---------------------------------------------------------------------------
@@ -1442,14 +1444,18 @@ describe('autoApprove (run grant)', () => {
     expect(await registry.autoApprove('ghost')).toBe('not-found')
   })
 
-  it('reopens the entry for the operator when the reply fails', async () => {
+  it('reopens the entry for the operator when the reply fails and no echo comes', async () => {
     // #given a reply that fails
+    vi.useFakeTimers()
     const registry = createApprovalRegistry({logger: makeLogger()})
     const postReply = vi.fn().mockResolvedValue({ok: false, error: 'http 500'})
     registry.register(makeParams({effects: {postReply}}))
 
-    // #when
-    const outcome = await registry.autoApprove('per_1')
+    // #when the bounded wait for the echo passes
+    const auto = registry.autoApprove('per_1')
+    await vi.advanceTimersByTimeAsync(AUTO_ANSWER_ECHO_WAIT_MS)
+    const outcome = await auto
+    vi.useRealTimers()
 
     // #then the operator can still decide
     expect(outcome).toBe('reply-failed')
@@ -1462,5 +1468,140 @@ describe('autoApprove (run grant)', () => {
         actor: makeActor(),
       }),
     ).toBe('ok')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// autoApprove — a failed reply is ambiguous: wait for the echo before reopening
+// ---------------------------------------------------------------------------
+
+function registerWith(postReply: Mock<ApprovalSideEffects['postReply']>) {
+  const registry = createApprovalRegistry({logger: makeLogger()})
+  registry.register(makeParams({effects: {postReply}}))
+  const render = makeRenderFn()
+  registry.attachMessage('per_1', render)
+  const click = async (decision: 'once' | 'reject' = 'once') =>
+    registry.handleDecision({requestID: 'per_1', approvalScopeId: 'chan_1', decision, actor: makeActor()})
+  return {registry, render, click}
+}
+
+describe('autoApprove: a failed or thrown reply', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it.each(['a failed reply', 'a thrown reply'] as const)(
+    'keeps the entry claimed until the delayed echo settles it, with one upstream reply (%s)',
+    async how => {
+      // #given OpenCode accepted the once but the response was lost
+      vi.useFakeTimers()
+      const postReply = vi.fn<ApprovalSideEffects['postReply']>()
+      if (how === 'a failed reply') postReply.mockResolvedValue({ok: false, error: 'threw'})
+      else postReply.mockRejectedValue(new Error('socket hang up'))
+      const {registry, render, click} = registerWith(postReply)
+      const auto = registry.autoApprove('per_1')
+      await vi.advanceTimersByTimeAsync(1000)
+
+      // #when the operator clicks before the echo
+      const raced = await click()
+
+      // #then the click is refused: the entry is still claimed, not reopened
+      expect(raced).toBe('already-claimed')
+
+      // #when the delayed echo arrives
+      registry.confirmReply({requestID: 'per_1', sessionID: 'ses_1', reply: 'once'})
+
+      // #then the entry settles and is not reopened; upstream saw exactly one reply
+      await expect(auto).resolves.toBe('ok')
+      await vi.waitFor(() => expect(render).toHaveBeenCalledTimes(1))
+      expect(registry.has('per_1')).toBe(false)
+      expect(postReply).toHaveBeenCalledTimes(1)
+      expect(vi.getTimerCount()).toBe(0)
+    },
+  )
+
+  it('settles, without waiting or reopening, when the echo lands while the reply is still in flight', async () => {
+    // #given an auto-approve reply that will fail, and an echo that beats it
+    vi.useFakeTimers()
+    const reply = Promise.withResolvers<{ok: boolean; error?: string}>()
+    const postReply = vi.fn<ApprovalSideEffects['postReply']>().mockReturnValueOnce(reply.promise)
+    const {registry, render} = registerWith(postReply)
+    const auto = registry.autoApprove('per_1')
+    registry.confirmReply({requestID: 'per_1', sessionID: 'ses_1', reply: 'once'})
+    await vi.waitFor(() => expect(render).toHaveBeenCalledTimes(1))
+
+    // #when the response then fails
+    reply.resolve({ok: false, error: 'threw'})
+
+    // #then it counts as accepted: no wait, no reopen
+    await expect(auto).resolves.toBe('ok')
+    expect(registry.has('per_1')).toBe(false)
+    expect(vi.getTimerCount()).toBe(0)
+    expect(postReply).toHaveBeenCalledTimes(1)
+  })
+
+  it('reopens the entry to the operator when no echo arrives within the bound', async () => {
+    // #given a reply that failed
+    vi.useFakeTimers()
+    const postReply = vi.fn<ApprovalSideEffects['postReply']>().mockResolvedValue({ok: false, error: 'http 500'})
+    const {registry, click} = registerWith(postReply)
+    const auto = registry.autoApprove('per_1')
+
+    // #when the wait is not yet over
+    await vi.advanceTimersByTimeAsync(AUTO_ANSWER_ECHO_WAIT_MS - 1)
+
+    // #then it is still claimed
+    expect(await click()).toBe('already-claimed')
+
+    // #when it is over
+    await vi.advanceTimersByTimeAsync(1)
+
+    // #then the operator gets the entry
+    await expect(auto).resolves.toBe('reply-failed')
+    postReply.mockResolvedValue({ok: true})
+    expect(await click()).toBe('ok')
+  })
+
+  it('rejects once, and does not reopen, when the run is disposed while the reply is in flight and then fails', async () => {
+    // #given an auto-approve reply still in flight
+    vi.useFakeTimers()
+    const reply = Promise.withResolvers<{ok: boolean; error?: string}>()
+    const postReply = vi
+      .fn<ApprovalSideEffects['postReply']>()
+      .mockReturnValueOnce(reply.promise)
+      .mockResolvedValue({ok: true})
+    const {registry} = registerWith(postReply)
+    const auto = registry.autoApprove('per_1')
+
+    // #when the run ends, and then the reply fails
+    await registry.disposeRun('ses_1', 'run ended')
+    reply.resolve({ok: false, error: 'threw'})
+
+    // #then one recovery reject, no wait for an echo, and nothing reopened
+    await expect(auto).resolves.toBe('reply-failed')
+    expect(postReply.mock.calls.map(call => call[2])).toEqual(['once', 'reject'])
+    expect(registry.has('per_1')).toBe(false)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('rejects once, ending the wait early, when the run is disposed during the wait', async () => {
+    // #given a failed reply waiting for its echo
+    vi.useFakeTimers()
+    const postReply = vi
+      .fn<ApprovalSideEffects['postReply']>()
+      .mockResolvedValueOnce({ok: false, error: 'threw'})
+      .mockResolvedValue({ok: true})
+    const {registry} = registerWith(postReply)
+    const auto = registry.autoApprove('per_1')
+    await vi.advanceTimersByTimeAsync(1000)
+
+    // #when the run ends
+    await registry.disposeRun('ses_1', 'run ended')
+
+    // #then the wait ends at once: one recovery reject, nothing reopened
+    await expect(auto).resolves.toBe('reply-failed')
+    expect(postReply.mock.calls.map(call => call[2])).toEqual(['once', 'reject'])
+    expect(registry.has('per_1')).toBe(false)
+    expect(vi.getTimerCount()).toBe(0)
   })
 })

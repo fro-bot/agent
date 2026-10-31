@@ -66,6 +66,40 @@ export function replyUpstream(decision: PermissionReply): PermissionReply {
   return decision === 'always' ? 'once' : decision
 }
 
+/**
+ * How long a failed or thrown auto-answer waits for the request's `permission.replied` echo before the ask is handed
+ * to an operator. A failed HTTP reply is ambiguous: OpenCode may have accepted the `once` and only the response was
+ * lost. Shared by the coordinator (asks it answers itself) and the registry (open asks a grant settles).
+ *
+ * Residual: an echo later than this bound can still follow an operator reply, so OpenCode would get a second reply for
+ * the request. It answers not-found, which surfaces as a reply error on that reply; the ask itself was answered once.
+ */
+export const AUTO_ANSWER_ECHO_WAIT_MS = 5000
+
+/** How an {@link EchoWait} ended: the echo arrived, the bound passed, or the run ended and cancelled it. */
+export type EchoWaitOutcome = 'echo' | 'timeout' | 'cancelled'
+
+/** A bounded wait for one request's `permission.replied` echo. */
+export interface EchoWait {
+  readonly outcome: Promise<EchoWaitOutcome>
+  /** End the wait early. The first ending wins; later calls do nothing. Clears the timer. */
+  readonly end: (outcome: 'echo' | 'cancelled') => void
+}
+
+export function startEchoWait(boundMs: number = AUTO_ANSWER_ECHO_WAIT_MS): EchoWait {
+  const {promise, resolve} = Promise.withResolvers<EchoWaitOutcome>()
+  const timer = setTimeout(() => {
+    resolve('timeout')
+  }, boundMs)
+  return {
+    outcome: promise,
+    end: outcome => {
+      clearTimeout(timer)
+      resolve(outcome)
+    },
+  }
+}
+
 /** One stored grant: the ask's action and the patterns an `always` on it would have saved. */
 interface Grant {
   readonly permission: string
