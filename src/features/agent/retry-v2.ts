@@ -7,6 +7,8 @@ import type {FormAskedResponderV2, PermissionAskedResponderV2} from './streaming
 import type {EventStreamResult} from './streaming.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {reduceAttemptOutcome} from './attempt-outcome.js'
+import {registerLiveObservationV2} from './live-observation-v2.js'
+import {createOwnedWorkReconcilerV2} from './reconcile-v2.js'
 import {awaitStreamConnected, createDeadlineExceededError, createStreamNotConnectedResult} from './retry.js'
 import {
   observeRootTerminal,
@@ -37,7 +39,10 @@ import {createActivityTrackerV2, processEventStreamV2} from './streaming-v2.js'
  *   no-activity bound.
  *
  * Release is not decided here. Root idle is not terminal on V2 (a background child's notice starts a second turn), so
- * the directory-quiescence drain is U12b.
+ * a successful attempt with a ledger does not stop its event processor: it hands the observation over
+ * (`live-observation-v2.ts`) and the release stops it once the directory is confirmed quiet. Until then the same
+ * processor keeps rejecting permission asks, cancelling forms and recording the root's turns, including the one a
+ * notice starts. Every other result stops it here, as before.
  */
 
 const TERMINAL_GRACE_MS = 500
@@ -61,8 +66,17 @@ export interface RunPromptAttemptV2Options {
   readonly onFormAsked?: FormAskedResponderV2
   readonly onFatal?: (cause: 'session_moved') => void
   readonly ownershipLedger?: OwnershipLedger
+  /**
+   * Set by the caller that can keep the subscription open past this call. When present, a successful attempt sets `kept`
+   * and leaves the processor running; the caller must then not abort `attemptAbortController`.
+   */
+  readonly liveHandoff?: {kept: boolean}
+  /** The location the run's shells run in. With a ledger it turns on REST reconciliation of children and shells. */
+  readonly directory?: string
   /** Test seam: poll cadence and the no-activity bound. */
   readonly poll?: Pick<PollOptionsV2, 'initialActivityTimeoutMs' | 'pollIntervalMs' | 'restEveryTicks'>
+  /** Test seam: cadence of the live reconcile tick. */
+  readonly reconcileIntervalMs?: number
 }
 
 async function startSessionWaitV2(options: {
@@ -134,10 +148,13 @@ export async function runPromptAttemptV2(options: RunPromptAttemptV2Options): Pr
   const attemptController = options.attemptAbortController ?? new AbortController()
   const eventAbortController = new AbortController()
   const waitAbortController = new AbortController()
+  const pollAbortController = new AbortController()
   const eventSignal =
     deadline === undefined
       ? eventAbortController.signal
       : AbortSignal.any([eventAbortController.signal, deadline.signal])
+  const pollSignal =
+    deadline === undefined ? pollAbortController.signal : AbortSignal.any([pollAbortController.signal, deadline.signal])
   const waitSignal =
     deadline === undefined ? waitAbortController.signal : AbortSignal.any([waitAbortController.signal, deadline.signal])
   const subscriptionSignal =
@@ -154,6 +171,22 @@ export async function runPromptAttemptV2(options: RunPromptAttemptV2Options): Pr
     llmError: null,
   }
 
+  // The net under the stream's notices: a settlement the stream missed must not hold the attempt until its deadline.
+  // The tick runs for the whole attempt and the root going idle triggers one pass at once, because that is the moment
+  // the ledger is what stands between the run and its result.
+  const reconciler =
+    ownershipLedger === undefined || options.directory === undefined
+      ? null
+      : createOwnedWorkReconcilerV2({
+          client,
+          ledger: ownershipLedger,
+          directory: options.directory,
+          parentSessionId: sessionId,
+          logger,
+          ...(options.reconcileIntervalMs === undefined ? {} : {intervalMs: options.reconcileIntervalMs}),
+        })
+
+  const snapshotRef: {read: (() => EventStreamResult) | null} = {read: null}
   let markStreamConnected: () => void = () => {}
   const streamConnected = new Promise<void>(resolve => {
     markStreamConnected = resolve
@@ -169,7 +202,14 @@ export async function runPromptAttemptV2(options: RunPromptAttemptV2Options): Pr
     ...(options.onPermissionAsked === undefined ? {} : {onPermissionAsked: options.onPermissionAsked}),
     ...(options.onFormAsked === undefined ? {} : {onFormAsked: options.onFormAsked}),
     ...(options.onFatal === undefined ? {} : {onFatal: options.onFatal}),
+    exposeSnapshot: snapshot => {
+      snapshotRef.read = snapshot
+    },
     onStreamConnected: markStreamConnected,
+    onRootTerminal: terminal => {
+      // eslint-disable-next-line no-void
+      if (terminal.kind === 'succeeded') void reconciler?.reconcileNow()
+    },
   })
     .then(result => {
       eventStreamResult = result
@@ -184,6 +224,7 @@ export async function runPromptAttemptV2(options: RunPromptAttemptV2Options): Pr
     if (eventProcessorShutdown !== null) return eventProcessorShutdown
     attemptController.abort()
     waitAbortController.abort()
+    pollAbortController.abort()
     eventAbortController.abort()
     eventProcessorShutdown = waitForEventProcessorShutdown(eventProcessor)
     return eventProcessorShutdown
@@ -258,7 +299,7 @@ export async function runPromptAttemptV2(options: RunPromptAttemptV2Options): Pr
     const pollObservation = pollForSessionCompletionObservationV2({
       client,
       sessionId,
-      signal: eventSignal,
+      signal: pollSignal,
       logger,
       tracker,
       ...(deadline === undefined ? {} : {deadline}),
@@ -282,10 +323,36 @@ export async function runPromptAttemptV2(options: RunPromptAttemptV2Options): Pr
       pollObservation,
     ])
 
-    await stopEventProcessor()
-
     const turnEvidence: TurnEvidence = {accepted: tracker.firstMeaningfulEventReceived}
     const reduced = reduceAttemptOutcome(winning, preservedSubmissionFailure, turnEvidence)
+
+    const handoff = options.liveHandoff
+    if (reduced.success && ownershipLedger !== undefined && handoff !== undefined && snapshotRef.read !== null) {
+      // The wait and poll producers have decided; only the event processor stays. See the module doc.
+      waitAbortController.abort()
+      pollAbortController.abort()
+      const snapshot = snapshotRef.read
+      registerLiveObservationV2(ownershipLedger, {
+        tracker,
+        snapshot,
+        stop: async () => {
+          await stopEventProcessor()
+          return snapshot()
+        },
+      })
+      handoff.kept = true
+      return {
+        success: reduced.success,
+        error: reduced.error,
+        llmError: reduced.llmError,
+        outcome: reduced.outcome,
+        shouldRetry: reduced.shouldRetry,
+        settlement: reduced.settlement,
+        eventStreamResult: snapshot(),
+      }
+    }
+
+    await stopEventProcessor()
     let merged = eventStreamResult
     if (reduced.llmError !== null && eventStreamResult.llmError?.type !== reduced.llmError.type) {
       merged = {...eventStreamResult, llmError: reduced.llmError}
@@ -300,6 +367,7 @@ export async function runPromptAttemptV2(options: RunPromptAttemptV2Options): Pr
       eventStreamResult: merged,
     }
   } finally {
-    await stopEventProcessor()
+    reconciler?.dispose()
+    if (options.liveHandoff?.kept !== true) await stopEventProcessor()
   }
 }

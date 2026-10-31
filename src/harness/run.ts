@@ -34,8 +34,16 @@ import {runCleanup} from './phases/cleanup.js'
 import {runBlockedLabelClear} from './phases/coordination-clear.js'
 import {runCoordinationDecline} from './phases/coordination-decline.js'
 import {runDedup, saveDedupMarker} from './phases/dedup.js'
-import {computeDrainDeadlineMs, resolveRequestedOutputModeState, runDrain, runExecute} from './phases/execute.js'
+import {
+  computeDrainDeadlineMs,
+  resolveRequestedOutputModeState,
+  runDrain,
+  runExecute,
+  type DrainOutcome,
+} from './phases/execute.js'
 import {runFinalizeWithResult} from './phases/finalize.js'
+import {mergeObservedTurn, recordObservedTurn} from './phases/observed-turn-v2.js'
+import {runReleaseV2} from './phases/release-v2.js'
 import {runReviewReconciliation} from './phases/review-reconciliation.js'
 import {runRouting} from './phases/routing.js'
 import {runSessionPrep} from './phases/session-prep.js'
@@ -53,6 +61,9 @@ export async function run(): Promise<number> {
   let detectedOpencodeVersion: string | null = null
   let serverHandle: OpenCodeServerHandle | null = null
   let serverHandleV2: OpenCodeV2ServerHandle | null = null
+  // Set once the V2 server has been released (drained or stopped, then shut down). A run that left the try block without
+  // reaching that point is released in the `finally` before cleanup.
+  let serverReleasedV2 = false
   let repo = ''
   let runId = ''
   let sessionRetention: number | null = null
@@ -247,7 +258,7 @@ export async function run(): Promise<number> {
     const sessionPrep = await runSessionPrep(bootstrap, routing, cacheRestore, metrics)
     attachmentResult = sessionPrep.attachmentResult
 
-    const execution = await runExecute(bootstrap, routing, cacheRestore, sessionPrep, metrics, startTime)
+    let execution = await runExecute(bootstrap, routing, cacheRestore, sessionPrep, metrics, startTime)
     ownershipLedger = execution.ownershipLedger
     // Sticky, invocation-scoped facts -- feed the invocation-outcome assessment
     // (src/harness/outcome.ts), never `execution.success` itself.
@@ -259,24 +270,46 @@ export async function run(): Promise<number> {
     // `SKIP_AGENT_EXECUTION=true` skipped execution entirely, in which case this
     // call is a no-op exactly like before.
     const drainLogger = createLogger({phase: 'drain'})
-    // V2 has its own release rule (directory quiescence, owned shells, a bounded drain) in U12b. Until it lands a V2 run
-    // is not drained: whatever the ledger still holds is reported unresolved, so persistence stays closed for it.
-    // TODO(U12b): replace this branch with the V2 drain adapter.
-    const drainResult = isCacheRestoreV2(cacheRestore)
-      ? {
-          expired: false,
-          cancelledCount: 0,
-          settledCount: 0,
-          unknownCount: (execution.ownershipLedger?.outstanding() ?? 0) + (execution.ownershipLedger?.unknown() ?? 0),
-        }
-      : await runDrain({
-          ledger: execution.ownershipLedger,
-          client: cacheRestore.serverHandle.client,
-          parentSessionId: execution.sessionId,
-          directory: getGitHubWorkspace(),
-          deadlineMs: computeDrainDeadlineMs(bootstrap.inputs.timeoutMs, execution.executionDurationMs),
-          logger: drainLogger,
-        })
+    let drainResult: DrainOutcome
+    if (isCacheRestoreV2(cacheRestore)) {
+      // V2 is released by its directory, not by the ledger (probe P2: root idle is not terminal): drain a succeeded run,
+      // stop anything else, confirm the directory quiet, then shut the server down. A run that cannot be confirmed quiet
+      // must not be saved, whatever the ledger says.
+      const release = await runReleaseV2({
+        serverHandle: cacheRestore.serverHandle,
+        executionSucceeded: execution.success,
+        rootSessionId: execution.sessionId,
+        ledger: execution.ownershipLedger,
+        runStartedAt: startTime,
+        deadlineMs: computeDrainDeadlineMs(bootstrap.inputs.timeoutMs, execution.executionDurationMs),
+        sessionRetention,
+        logger: drainLogger,
+      })
+      serverReleasedV2 = true
+      drainResult = release.drain
+      if (release.observed !== undefined) {
+        // The root's turns after the attempt returned (a notice starting a second one) are part of the run: the last
+        // one decides whether it succeeded, and what it did joins the artifacts and usage.
+        const merged = mergeObservedTurn(execution, release.observed)
+        recordObservedTurn(execution, merged, metrics)
+        execution = merged
+        observationGap = execution.observationGap === true
+      }
+      if (release.persistenceDeclineReason !== undefined) {
+        skipSessionPersistence = true
+        persistenceDeclineReason = release.persistenceDeclineReason
+        core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
+      }
+    } else {
+      drainResult = await runDrain({
+        ledger: execution.ownershipLedger,
+        client: cacheRestore.serverHandle.client,
+        parentSessionId: execution.sessionId,
+        directory: getGitHubWorkspace(),
+        deadlineMs: computeDrainDeadlineMs(bootstrap.inputs.timeoutMs, execution.executionDurationMs),
+        logger: drainLogger,
+      })
+    }
     if (drainResult.expired) {
       drainLogger.warning('Drain deadline reached before owned work settled; run reports incomplete', {
         cancelledCount: drainResult.cancelledCount,
@@ -287,7 +320,14 @@ export async function run(): Promise<number> {
     // Carries forward the overflow-recovery boundary's own unresolved ownership facts too
     // (see ExecutePhaseResult.recoveryBoundaryUnresolved) -- the top-level drain above only
     // ever observes the recovery session's own ledger, never the overflowed session's.
-    ownershipUnresolved = drainResult.unknownCount > 0 || execution.recoveryBoundaryUnresolved === true
+    //
+    // A V2 drain that expired is incomplete whether or not the stop after it confirmed the directory quiet: the response
+    // was produced while owned work was still running, so it may describe work that was then cut off. (V1 reads only
+    // `unknownCount`, because its cancellation reports each child it confirmed stopped.)
+    ownershipUnresolved =
+      drainResult.unknownCount > 0 ||
+      execution.recoveryBoundaryUnresolved === true ||
+      (isCacheRestoreV2(cacheRestore) && drainResult.expired)
 
     // `true` when this invocation already knows, before publication, that its own execution
     // was not fully observed -- computed from exactly the two facts above, both genuinely
@@ -372,6 +412,32 @@ export async function run(): Promise<number> {
       core.setFailed('An unknown error occurred')
     }
   } finally {
+    // A V2 run that never reached its release (a phase threw first) still has a server, and maybe a shell or a child the
+    // server's shutdown would kill or strand mid-write. Stop what the directory shows and confirm it quiet before cleanup
+    // saves anything.
+    if (serverHandleV2 !== null && !serverReleasedV2) {
+      try {
+        const release = await runReleaseV2({
+          serverHandle: serverHandleV2,
+          executionSucceeded: false,
+          rootSessionId: null,
+          ledger: ownershipLedger,
+          runStartedAt: startTime,
+          deadlineMs: 0,
+          sessionRetention,
+          logger: createLogger({phase: 'drain'}),
+        })
+        if (release.persistenceDeclineReason !== undefined) {
+          skipSessionPersistence = true
+          persistenceDeclineReason = release.persistenceDeclineReason
+          core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
+        }
+      } catch (releaseError) {
+        skipSessionPersistence = true
+        persistenceDeclineReason = `the OpenCode V2 server could not be released (${toErrorMessage(releaseError)}), so no session state is saved`
+        core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
+      }
+    }
     const cleanupResult = await runCleanup({
       bootstrapLogger,
       reactionCtx,

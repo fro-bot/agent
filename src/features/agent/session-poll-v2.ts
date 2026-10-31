@@ -71,6 +71,14 @@ export function observeRootTerminal(
         failures: [...snapshotFailuresV2(tracker), interruptedFailure(terminal.reason)],
       }
     case 'succeeded': {
+      // A completion notice queued for the root owes it a second turn (probe P2). Only a stream that lost events may
+      // be missing the delivery that clears it; the directory drain after the attempt is the net for that case.
+      if (tracker.queuedNoticeInboxIds.size > 0 && !tracker.streamBlind) {
+        logger.debug('Root turn succeeded but a completion notice is still queued; deferring completion', {
+          queued: tracker.queuedNoticeInboxIds.size,
+        })
+        return null
+      }
       if (ledgerBlocksCompletion(ownershipLedger)) {
         logger.debug('Root turn succeeded but owned work is outstanding; deferring completion', {
           outstanding: ownershipLedger?.outstanding(),

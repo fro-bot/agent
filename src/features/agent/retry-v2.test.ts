@@ -3,16 +3,26 @@
  * is a hint that never completes an attempt by itself (it answers at once for a prompt that is not admitted yet).
  */
 import type {Logger} from '../../shared/logger.js'
-import {createOwnershipLedger} from '@fro-bot/runtime'
+import {createOwnershipLedger, shellLedgerKey} from '@fro-bot/runtime'
+import {
+  CHILD_SESSION_ID,
+  SHELL_ID,
+  SHELL_INBOX_ID,
+  SHELL_NOTICE_ENQUEUED_FRAME,
+  SUBAGENT_NOTICE_ENQUEUED_FRAME,
+  SUBAGENT_NOTICE_MESSAGE,
+} from '@fro-bot/runtime/event-v2-fixtures'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {createFakeServer, frame, ROOT_SESSION_ID, STARTED, SUCCEEDED} from './execution-v2.fixture.js'
+import {takeLiveObservationV2} from './live-observation-v2.js'
 import {runPromptAttemptV2} from './retry-v2.js'
 import {createDeadlineExceededError, createExecutionDeadline} from './retry.js'
 import {observeRootTerminal} from './session-poll-v2.js'
 import {createActivityTrackerV2} from './streaming-v2.js'
 
-vi.mock('../../shared/console.js', () => ({outputTextContent: vi.fn(), outputToolExecution: vi.fn()}))
+const consoleMock = vi.hoisted(() => ({outputTextContent: vi.fn(), outputToolExecution: vi.fn()}))
+vi.mock('../../shared/console.js', () => consoleMock)
 
 async function advance(totalMs: number, stepMs = 100): Promise<void> {
   for (let elapsed = 0; elapsed < totalMs; elapsed += stepMs) await vi.advanceTimersByTimeAsync(stepMs)
@@ -49,6 +59,25 @@ describe('runPromptAttemptV2', () => {
       attemptAbortController,
       ...extra,
     })
+  }
+
+  /** A root that succeeded while a child was still tracked; the child then settles through REST, before its notice. */
+  async function succeededThenSettledByRest(extra: Parameters<typeof attempt>[1] = {}) {
+    const ledger = createOwnershipLedger()
+    ledger.adopt(CHILD_SESSION_ID, 'child')
+    const server = createFakeServer({
+      onPrompt: (_, pipe) => {
+        pipe.push(STARTED)
+        pipe.push(SUCCEEDED)
+      },
+    })
+    const handoff = {kept: false}
+    const result = attempt(server, {ownershipLedger: ledger, liveHandoff: handoff, ...extra})
+    await advance(300)
+    ledger.settle(CHILD_SESSION_ID)
+    await advance(2_000)
+    const outcome = await result
+    return {server, ledger, handoff, outcome}
   }
 
   it('does not complete on a wait that answered before the prompt was admitted; it asks again', async () => {
@@ -212,6 +241,273 @@ describe('runPromptAttemptV2', () => {
     expect(await result).toMatchObject({success: true})
   })
 
+  describe('background work that outlives the root turn', () => {
+    // The captured notices, addressed to the run's root (the fixtures were captured against other sessions).
+    const childNotice = frame('session.inbox.enqueued', {
+      ...(SUBAGENT_NOTICE_ENQUEUED_FRAME.data as object),
+      sessionID: ROOT_SESSION_ID,
+    })
+    const shellNotice = frame('session.inbox.enqueued', {
+      ...SHELL_NOTICE_ENQUEUED_FRAME.data,
+      sessionID: ROOT_SESSION_ID,
+    })
+    const delivered = (inboxID: string) => frame('session.inbox.delivered', {sessionID: ROOT_SESSION_ID, inboxID})
+
+    async function completesOnlyAfterTheTriggeredTurn(
+      ledgerKey: string,
+      notice: ReturnType<typeof frame>,
+      inboxId: string,
+    ) {
+      // #given a root that succeeded while a background job still ran
+      const ledger = createOwnershipLedger()
+      ledger.adopt(ledgerKey, 'background work')
+      const server = createFakeServer({
+        onPrompt: (_, pipe) => {
+          pipe.push(STARTED)
+          pipe.push(SUCCEEDED)
+          setTimeout(() => pipe.push(notice), 1_000)
+          setTimeout(() => pipe.push(delivered(inboxId)), 3_000)
+          setTimeout(() => pipe.push(STARTED), 3_100)
+          setTimeout(() => pipe.push(SUCCEEDED), 4_000)
+        },
+      })
+      let done = false
+
+      // #when the job's notice lands: the ledger is settled, but the notice still owes the root a turn
+      const result = attempt(server, {ownershipLedger: ledger})
+      // eslint-disable-next-line no-void
+      void result.then(() => {
+        done = true
+      })
+      await advance(2_500)
+
+      // #then the first idle is not terminal, and neither is a settled ledger
+      expect(ledger.isDrainComplete()).toBe(true)
+      expect(done).toBe(false)
+
+      // #when the notice is delivered and the turn it started runs
+      await advance(900)
+      expect(done).toBe(false)
+      await advance(1_500)
+
+      // #then the attempt completes on that turn's own success
+      return result
+    }
+
+    it('waits for the turn a background child notice triggers before completing', async () => {
+      const outcome = await completesOnlyAfterTheTriggeredTurn(
+        CHILD_SESSION_ID,
+        childNotice,
+        SUBAGENT_NOTICE_MESSAGE.id,
+      )
+
+      expect(outcome).toMatchObject({success: true, settlement: {kind: 'completion-observed'}})
+    })
+
+    it('waits for the turn a background shell notice triggers before completing', async () => {
+      const outcome = await completesOnlyAfterTheTriggeredTurn(shellLedgerKey(SHELL_ID), shellNotice, SHELL_INBOX_ID)
+
+      expect(outcome).toMatchObject({success: true, settlement: {kind: 'completion-observed'}})
+    })
+
+    it('settles a child whose notice the stream missed from the REST view when the root goes idle', async () => {
+      // #given a child that is a finished direct child of the root, and no notice on the stream
+      const ledger = createOwnershipLedger()
+      ledger.adopt(CHILD_SESSION_ID, 'child')
+      const server = createFakeServer({
+        onPrompt: (_, pipe) => {
+          pipe.push(STARTED)
+          pipe.push(SUCCEEDED)
+        },
+      })
+      vi.mocked(server.client.session.list).mockResolvedValue({
+        data: [{id: CHILD_SESSION_ID, parentID: ROOT_SESSION_ID, time: {updated: 1}}],
+      })
+
+      // #when
+      const result = attempt(server, {ownershipLedger: ledger, directory: '/d', reconcileIntervalMs: 600_000})
+      await advance(2_000)
+
+      // #then
+      expect(ledger.snapshot().map(entry => entry.state)).toEqual(['settled'])
+      expect(await result).toMatchObject({success: true})
+    })
+
+    it('settles a background shell that is gone from the shell list when the root goes idle', async () => {
+      // #given a shell the server no longer lists and no longer knows
+      const ledger = createOwnershipLedger()
+      ledger.adopt(shellLedgerKey(SHELL_ID), 'background shell')
+      const server = createFakeServer({
+        onPrompt: (_, pipe) => {
+          pipe.push(STARTED)
+          pipe.push(SUCCEEDED)
+        },
+      })
+
+      // #when
+      const result = attempt(server, {ownershipLedger: ledger, directory: '/d', reconcileIntervalMs: 600_000})
+      await advance(2_000)
+
+      // #then
+      expect(vi.mocked(server.client.listShells)).toHaveBeenCalled()
+      expect(ledger.snapshot().map(entry => entry.state)).toEqual(['settled'])
+      expect(await result).toMatchObject({success: true})
+    })
+
+    it('keeps waiting on a shell the server still lists as running', async () => {
+      // #given
+      const ledger = createOwnershipLedger()
+      ledger.adopt(shellLedgerKey(SHELL_ID), 'background shell')
+      const server = createFakeServer({
+        onPrompt: (_, pipe) => {
+          pipe.push(STARTED)
+          pipe.push(SUCCEEDED)
+        },
+      })
+      vi.mocked(server.client.listShells).mockResolvedValue({
+        success: true,
+        data: [{id: SHELL_ID, status: 'running'}],
+      } as never)
+      let done = false
+
+      // #when
+      const result = attempt(server, {ownershipLedger: ledger, directory: '/d', reconcileIntervalMs: 1_000})
+      // eslint-disable-next-line no-void
+      void result.then(() => {
+        done = true
+      })
+      await advance(8_000)
+
+      // #then
+      expect(done).toBe(false)
+      expect(ledger.outstanding()).toBe(1)
+
+      // cleanup: let the attempt end through its own stop so the test leaves no pending timers
+      ledger.settle(shellLedgerKey(SHELL_ID))
+      await advance(2_000)
+      await result
+    })
+  })
+
+  describe('the event observation outlives a successful attempt', () => {
+    const noticeEnqueued = frame('session.inbox.enqueued', {
+      ...(SUBAGENT_NOTICE_ENQUEUED_FRAME.data as object),
+      sessionID: ROOT_SESSION_ID,
+    })
+    const noticeDelivered = frame('session.inbox.delivered', {
+      sessionID: ROOT_SESSION_ID,
+      inboxID: SUBAGENT_NOTICE_MESSAGE.id,
+    })
+    const askedFrame = frame('permission.asked', {
+      id: 'per_notice_turn',
+      sessionID: ROOT_SESSION_ID,
+      action: 'bash',
+      resources: ['rm -rf /'],
+    })
+    const noticeText = frame('session.text.ended', {
+      sessionID: ROOT_SESSION_ID,
+      assistantMessageID: 'msg_notice_turn',
+      ordinal: 0,
+      text: 'The background child reported: all green.',
+    })
+
+    it('hands the processor over instead of stopping it, so the subscription stays open', async () => {
+      // #given / #when
+      const {handoff, outcome, ledger} = await succeededThenSettledByRest()
+
+      // #then
+      expect(outcome).toMatchObject({success: true})
+      expect(handoff.kept).toBe(true)
+      const live = takeLiveObservationV2(ledger)
+      expect(live).toBeDefined()
+      await live?.stop()
+    })
+
+    it('does not hand over a run without a ledger, or a failed attempt', async () => {
+      // #given a run with no ledger
+      const server = createFakeServer({
+        onPrompt: (_, pipe) => {
+          pipe.push(STARTED)
+          pipe.push(SUCCEEDED)
+        },
+      })
+      const handoff = {kept: false}
+
+      // #when
+      const result = attempt(server, {liveHandoff: handoff})
+      await advance(2_000)
+
+      // #then
+      expect(await result).toMatchObject({success: true})
+      expect(handoff.kept).toBe(false)
+    })
+
+    it('records a failed turn the notice starts after the attempt returned, so the last turn decides', async () => {
+      // #given
+      const {server, ledger} = await succeededThenSettledByRest()
+      const live = takeLiveObservationV2(ledger)
+
+      // #when a notice turn runs and fails
+      const pipe = server.pipes.at(-1)
+      pipe?.push(noticeEnqueued)
+      pipe?.push(noticeDelivered)
+      pipe?.push(STARTED)
+      pipe?.push(
+        frame('session.execution.failed', {
+          sessionID: ROOT_SESSION_ID,
+          error: {type: 'provider.quota', message: 'out of credit', status: 402},
+        }),
+      )
+      await advance(200)
+      const result = await live?.stop()
+
+      // #then
+      expect(live?.tracker.rootTerminal).toEqual({kind: 'failed'})
+      expect(result?.llmError).toMatchObject({type: 'quota_exceeded'})
+    })
+
+    it('still rejects a permission ask the notice turn raises', async () => {
+      // #given
+      const onPermissionAsked = vi.fn(async () => undefined)
+      const {server, ledger} = await succeededThenSettledByRest({onPermissionAsked})
+      const live = takeLiveObservationV2(ledger)
+
+      // #when the notice turn asks for a permission after the attempt returned
+      const pipe = server.pipes.at(-1)
+      pipe?.push(noticeEnqueued)
+      pipe?.push(STARTED)
+      pipe?.push(askedFrame)
+      await advance(200)
+      await live?.stop()
+
+      // #then
+      expect(onPermissionAsked).toHaveBeenCalledWith(
+        expect.objectContaining({requestId: 'per_notice_turn', sessionId: ROOT_SESSION_ID}),
+      )
+    })
+
+    it("streams the text of a notice turn that succeeds, and ends on that turn's success", async () => {
+      // #given
+      consoleMock.outputTextContent.mockClear()
+      const {server, ledger} = await succeededThenSettledByRest()
+      const live = takeLiveObservationV2(ledger)
+
+      // #when
+      const pipe = server.pipes.at(-1)
+      pipe?.push(noticeEnqueued)
+      pipe?.push(noticeDelivered)
+      pipe?.push(STARTED)
+      pipe?.push(noticeText)
+      pipe?.push(SUCCEEDED)
+      await advance(200)
+      await live?.stop()
+
+      // #then the later turn's text was written, after the first turn's, and the root ended succeeded
+      expect(consoleMock.outputTextContent).toHaveBeenCalledWith('The background child reported: all green.')
+      expect(live?.tracker.rootTerminal).toEqual({kind: 'succeeded'})
+    })
+  })
+
   it('ends a turn that never shows activity as a watchdog failure', async () => {
     // #given a stream that connects and stays silent
     const server = createFakeServer({})
@@ -257,6 +553,18 @@ describe('observeRootTerminal', () => {
     expect(observeRootTerminal(tracker, logger)).toBeNull()
     tracker.rootTerminal = {kind: 'succeeded'}
     expect(observeRootTerminal(tracker, logger, ledger)).toBeNull()
+    expect(observeRootTerminal(tracker, logger)?.settlement.kind).toBe('completion-observed')
+  })
+
+  it('defers a success while a completion notice is queued, unless the stream is known to have lost events', () => {
+    // #given
+    const tracker = createActivityTrackerV2()
+    tracker.rootTerminal = {kind: 'succeeded'}
+    tracker.queuedNoticeInboxIds.add('msg_1')
+
+    // #when / #then
+    expect(observeRootTerminal(tracker, logger)).toBeNull()
+    tracker.streamBlind = true
     expect(observeRootTerminal(tracker, logger)?.settlement.kind).toBe('completion-observed')
   })
 

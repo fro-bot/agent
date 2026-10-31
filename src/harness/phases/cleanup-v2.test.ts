@@ -45,14 +45,20 @@ vi.mock('@fro-bot/runtime', async importOriginal => {
   }
 })
 
-function v2Handle(outcome: OpenCodeV2ExitOutcome): {
+function v2Handle(
+  outcome: OpenCodeV2ExitOutcome,
+  onShutdown?: () => void,
+): {
   handle: OpenCodeV2ServerHandle
   shutdown: ReturnType<typeof vi.fn>
 } {
-  const shutdown = vi.fn(async () => ({
-    interrupts: {stopped: [], notRunning: [], unconfirmed: []},
-    exit: {outcome, code: 0, signal: null},
-  }))
+  const shutdown = vi.fn(async () => {
+    onShutdown?.()
+    return {
+      interrupts: {stopped: [], notRunning: [], unconfirmed: []},
+      exit: {outcome, code: 0, signal: null},
+    }
+  })
   const handle = {
     url: 'http://127.0.0.1:4096',
     pid: 1,
@@ -122,6 +128,42 @@ describe('runCleanup on an OpenCode V2 server', () => {
 
     // #then
     expect(result.quiescenceConfirmed).toBe(false)
+    expect(saveCache).not.toHaveBeenCalled()
+  })
+
+  it('saves only after the server exit is confirmed, so the checkpoint inside the save sees a database no writer holds', async () => {
+    // #given
+    const order: string[] = []
+    const {handle} = v2Handle('graceful', () => order.push('shutdown'))
+    const {saveCache} = await import('../../services/cache/index.js')
+    vi.mocked(saveCache).mockImplementation(async () => {
+      order.push('save')
+      return {cachePersisted: true, storePersisted: false, outcome: 'persisted'}
+    })
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when
+    await runCleanup(options(handle))
+
+    // #then the V2 save names the V2 generation, whose database `saveCache` checkpoints before it reads sizes
+    expect(order).toEqual(['shutdown', 'save'])
+    expect(vi.mocked(saveCache).mock.calls[0]?.[0]).toMatchObject({opencodeVersion: '2.2.5'})
+  })
+
+  it('does not save when the release declined persistence (the directory was not confirmed quiet)', async () => {
+    // #given a release that already shut the server down but could not confirm the directory quiet
+    const {handle} = v2Handle('graceful')
+    const {saveCache} = await import('../../services/cache/index.js')
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when
+    await runCleanup({
+      ...options(handle),
+      skipSessionPersistence: true,
+      persistenceDeclineReason: 'the run directory could not be confirmed quiet',
+    })
+
+    // #then
     expect(saveCache).not.toHaveBeenCalled()
   })
 

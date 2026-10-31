@@ -23,6 +23,7 @@ import {
   isOpenCodePromptArtifactEnabled,
 } from '../../shared/env.js'
 import {toErrorMessage} from '../../shared/errors.js'
+import {peekLiveObservationV2} from './live-observation-v2.js'
 import {sendPromptToSessionV2} from './prompt-sender-v2.js'
 import {buildContinuationPrompt} from './prompt-sender.js'
 import {buildAgentPrompt} from './prompt.js'
@@ -31,6 +32,7 @@ import {inspectResponseFile} from './response-file.js'
 import {createExecutionDeadline, MAX_LLM_RETRIES, mergeArtifactResults, RETRY_DELAYS_MS} from './retry.js'
 import {waitForAbortableDelay} from './session-poll.js'
 import {mergeAttemptUsage} from './streaming.js'
+import {collectRunUsageV2, readSessionUsageV2, type SessionUsageV2} from './usage-v2.js'
 
 const SESSION_INTERRUPT_TIMEOUT_MS = 2_000
 const PERMISSION_REPLY_TIMEOUT_MS = 5_000
@@ -43,11 +45,14 @@ const FORM_CANCEL_MESSAGE = 'This run cannot answer questions. Continue without 
  * one-comment protocol and the result shape are V1's; what changes is the wire (`/api/*` through the runtime remote
  * client over the server handle's authenticated fetch) and where the model and agent live (the session, not the prompt).
  *
- * U12b boundary: after a successful attempt this returns and the caller shuts the server down (`handle.shutdown()`).
- * TODO(U12b): release only once nothing the run started can still wake a session. Root idle is not terminal on V2 (a
- * background child's notice starts a second turn, probe P2), so the directory-quiescence drain, owned-shell kill,
- * interrupt-on-deadline for owned children and the checkpoint-before-save belong there. This unit interrupts only the
- * root, on the Action's own timeout.
+ * Release boundary: after the attempt this returns, and `releaseRunV2` (`drain-v2.ts`, called from `run.ts`) decides when
+ * the server may go. Root idle is not terminal on V2 (a background child's notice starts a second turn, probe P2), so
+ * what this function reports is the root's own turn; the drain waits for the directory, and on a deadline the stop path
+ * kills the shells and interrupts every owned session. This function interrupts only the root, on the Action's own
+ * timeout.
+ *
+ * Usage: the V2 mapper maps no usage event, so tokens, cost and model are read from the session records
+ * (`usage-v2.ts`) once the attempt is over.
  */
 
 /**
@@ -171,28 +176,50 @@ export async function executeOpenCodeV2(
   let stoppingCause: 'deadline' | 'other' | null = null
   // Sticky across attempts: a later clean attempt must not clear an earlier gap.
   let observationGap = false
+  // The root's usage before this run's first prompt: V2 reports cumulative figures per session, so a continued session
+  // is read once up front. Without a baseline a continued session's usage would include earlier runs, so it is left out.
+  let usageBaseline: SessionUsageV2 | null = null
+  let usageReadable = true
+  const applyUsage = async (): Promise<void> => {
+    if (sessionId == null || !usageReadable) return
+    const usage = await collectRunUsageV2({
+      fetchRoute: serverHandle.fetch,
+      rootSessionId: sessionId,
+      baseline: usageBaseline,
+      ...(ownershipLedger === undefined ? {} : {ledger: ownershipLedger}),
+    })
+    final = {
+      ...final,
+      tokens: usage.tokens ?? final.tokens,
+      cost: usage.cost ?? final.cost,
+      model: usage.model ?? final.model,
+    }
+  }
   logger.info('Executing OpenCode agent (V2)', {
     agent: config?.agent ?? 'build (default)',
     hasModelOverride: config?.model != null,
     timeoutMs,
   })
 
-  const timeoutResult = (): AgentResult => ({
-    success: false,
-    exitCode: 130,
-    duration: Date.now() - startTime,
-    sessionId,
-    error: `Execution timed out after ${timeoutMs}ms`,
-    tokenUsage: final.tokens,
-    model: final.model,
-    cost: final.cost,
-    prsCreated: final.prsCreated,
-    commitsCreated: final.commitsCreated,
-    commentsPosted: final.commentsPosted,
-    llmError: lastLlmError,
-    classificationPath: final.classificationPath,
-    observationGap,
-  })
+  const timeoutResult = async (): Promise<AgentResult> => {
+    await applyUsage()
+    return {
+      success: false,
+      exitCode: 130,
+      duration: Date.now() - startTime,
+      sessionId,
+      error: `Execution timed out after ${timeoutMs}ms`,
+      tokenUsage: final.tokens,
+      model: final.model,
+      cost: final.cost,
+      prsCreated: final.prsCreated,
+      commitsCreated: final.commitsCreated,
+      commentsPosted: final.commentsPosted,
+      llmError: lastLlmError,
+      classificationPath: final.classificationPath,
+      observationGap,
+    }
+  }
 
   try {
     const model = config?.model ?? DEFAULT_MODEL
@@ -248,6 +275,8 @@ export async function executeOpenCodeV2(
         return null
       }, 'session configuration')
       if (switches !== null) throw new Error(`Failed to configure the continued session: ${switches}`)
+      usageBaseline = await readSessionUsageV2(serverHandle.fetch, activeSessionId)
+      usageReadable = usageBaseline !== null
     }
 
     const {text: initialPrompt, referenceFiles} = buildAgentPrompt(
@@ -300,7 +329,7 @@ export async function executeOpenCodeV2(
     for (let attempt = 1; attempt <= MAX_LLM_RETRIES; attempt++) {
       if (deadline.isExpired()) {
         stoppingCause = 'deadline'
-        return timeoutResult()
+        return await timeoutResult()
       }
       const retryDelay = RETRY_DELAYS_MS[Math.min(attempt - 1, RETRY_DELAYS_MS.length - 1)] ?? RETRY_DELAYS_MS[0]
       const prompt =
@@ -339,6 +368,19 @@ export async function executeOpenCodeV2(
 
       if (result.success) {
         stoppingCause = 'other'
+        const live = peekLiveObservationV2(ownershipLedger)
+        if (live !== undefined && usageReadable) {
+          // The turn a notice starts after this return adds to the session's figures; the release reads them again.
+          const rootId = activeSessionId
+          live.refreshUsage = async () =>
+            collectRunUsageV2({
+              fetchRoute: serverHandle.fetch,
+              rootSessionId: rootId,
+              baseline: usageBaseline,
+              ...(ownershipLedger === undefined ? {} : {ledger: ownershipLedger}),
+            })
+        }
+        await applyUsage()
         return {
           success: true,
           exitCode: 0,
@@ -359,7 +401,7 @@ export async function executeOpenCodeV2(
 
       if (result.outcome === 'timeout') {
         stoppingCause = 'deadline'
-        return timeoutResult()
+        return await timeoutResult()
       }
 
       lastError = result.error
@@ -409,6 +451,7 @@ export async function executeOpenCodeV2(
       }, 'retry delay')
     }
 
+    await applyUsage()
     return {
       success: false,
       exitCode: 1,
@@ -429,7 +472,7 @@ export async function executeOpenCodeV2(
     // An explicit, tagged deadline rejection is the one exception that IS a deadline cause, identified by name.
     if (error instanceof Error && error.name === 'DeadlineExceededError') {
       stoppingCause = 'deadline'
-      return timeoutResult()
+      return await timeoutResult()
     }
     // An untagged exception never became an attempt result. If the deadline already expired, default to deadline-caused
     // so teardown interrupts (nothing was decided); otherwise 'other' gives teardown no interrupt authority.

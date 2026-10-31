@@ -58,6 +58,12 @@ export interface ActivityTrackerV2 {
   rootExecutionStarted: boolean
   /** The root's most recent turn ended this way. Cleared by the next `execution.started`. */
   rootTerminal: RootTerminalV2 | null
+  /**
+   * Inbox items carrying a completion notice for the root that are queued and not yet part of a turn. Root idle is not
+   * terminal while one is queued (probe P2): the notice wakes the root for a second turn. Cleared by the matching
+   * `inbox.delivered`.
+   */
+  readonly queuedNoticeInboxIds: Set<string>
   /** A terminal provider failure (the shared rule's `stop`, or context overflow). First one wins. */
   terminalProviderError?: ErrorInfo
   /** The first generic (non-terminal) failure. Dropped when a terminal one arrives. */
@@ -77,6 +83,7 @@ export function createActivityTrackerV2(): ActivityTrackerV2 {
     firstMeaningfulEventReceived: false,
     rootExecutionStarted: false,
     rootTerminal: null,
+    queuedNoticeInboxIds: new Set<string>(),
     streamBlind: false,
     idleHintWithoutTerminal: false,
   }
@@ -115,6 +122,11 @@ export interface ProcessEventStreamV2Options {
   readonly onRootTerminal?: (terminal: RootTerminalV2) => void
   /** An owned session moved: the run must fail and the session must stop. */
   readonly onFatal?: (cause: 'session_moved') => void
+  /**
+   * Receives a reader of what has been gathered so far, once at the start. The result is otherwise returned only when the
+   * stream ends, which a run that keeps observing past its attempt cannot wait for.
+   */
+  readonly exposeSnapshot?: (snapshot: () => EventStreamResult) => void
 }
 
 const V2_AUTH_TYPE = 'provider.auth'
@@ -237,8 +249,26 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
   const adoptShell = (shellId: string): void => {
     if (ownershipLedger === undefined) return
     const key = shellLedgerKey(shellId)
+    const fresh = !ownershipLedger.isTracked(key)
+    // The command is model-controlled text and stays out of the ledger label and the logs.
     ownershipLedger.adopt(key, 'background shell')
     if (noticedShellIds.has(shellId)) ownershipLedger.settle(key)
+    if (fresh) logger.info('Background shell adopted into ownership ledger', {sessionId, shellId})
+  }
+
+  /**
+   * A completion notice for the root was queued, or the one queued was delivered. Either way the root's earlier success
+   * no longer stands: the notice starts a second turn, and only that turn's own success ends the run. A failed or
+   * interrupted root keeps its result, because no later turn is owed to a run that already ended badly.
+   */
+  const invalidateRootSuccess = (): void => {
+    if (tracker.rootTerminal?.kind === 'succeeded') tracker.rootTerminal = null
+  }
+
+  const noteRootNotice = (targetSessionId: string, inboxId: string | null): void => {
+    if (targetSessionId !== sessionId || inboxId === null) return
+    tracker.queuedNoticeInboxIds.add(inboxId)
+    invalidateRootSuccess()
   }
 
   const markTerminal = (terminal: RootTerminalV2): void => {
@@ -248,6 +278,23 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
   }
 
   const events = mapV2EventStream(stream, {logger, isOwnedSession: isOwned})
+
+  const snapshot = (): EventStreamResult => {
+    const failure = getObservedFailureV2(tracker)
+    return {
+      tokens: null,
+      model: null,
+      cost: null,
+      prsCreated: [...prsCreated],
+      commitsCreated: [...commitsCreated],
+      commentsPostedUrls: [...commentsPostedUrls],
+      commentsPosted,
+      llmError: failure?.error ?? null,
+      classificationPath: failure?.classificationPath,
+      ...(discontinuity === undefined ? {} : {discontinuity}),
+    }
+  }
+  options.exposeSnapshot?.(snapshot)
 
   async function consume(): Promise<void> {
     for await (const event of events) {
@@ -411,12 +458,24 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
         return true
       }
 
+      case 'shell_started': {
+        // The earliest signal that an owned session started a shell, ahead of the tool call returning. A shell nobody
+        // tagged (`POST /api/shell`), one a stranger's session started, and a user-run command (awaited by its own
+        // request, no notice) are not owned. Idempotent: the tool result adopts the same key again.
+        if (event.userCommand || event.ownerSessionId === null || !isOwned(event.ownerSessionId)) return true
+        adoptShell(event.shellId)
+        return true
+      }
+
+      case 'inbox_delivered': {
+        if (event.sessionId === sessionId && tracker.queuedNoticeInboxIds.delete(event.inboxId)) invalidateRootSuccess()
+        return true
+      }
+
       case 'permission_replied':
       case 'form_resolved':
       case 'session_moved':
-      case 'shell_started':
       case 'shell_exited':
-      case 'inbox_delivered':
       case 'step_failed': {
         return true
       }
@@ -437,6 +496,7 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
         if (!isOwned(event.sessionId)) return true
         noticedChildIds.add(event.notice.childSessionId)
         if (ownershipLedger !== undefined) settleLedgerFromSubagentNotice(ownershipLedger, event.notice)
+        noteRootNotice(event.sessionId, event.inboxId)
         return true
       }
 
@@ -446,6 +506,7 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
         if (ownershipLedger !== undefined) {
           settleLedgerFromShellNotice(ownershipLedger, {shellId: event.shellId, state: event.state})
         }
+        noteRootNotice(event.ownerSessionId, event.inboxId)
         return true
       }
 
@@ -548,17 +609,5 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
   }
 
   flushText()
-  const failure = getObservedFailureV2(tracker)
-  return {
-    tokens: null,
-    model: null,
-    cost: null,
-    prsCreated,
-    commitsCreated,
-    commentsPostedUrls,
-    commentsPosted,
-    llmError: failure?.error ?? null,
-    classificationPath: failure?.classificationPath,
-    ...(discontinuity === undefined ? {} : {discontinuity}),
-  }
+  return snapshot()
 }

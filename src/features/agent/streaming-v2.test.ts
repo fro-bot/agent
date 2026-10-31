@@ -9,8 +9,13 @@ import {
   REASONING_FRAMES,
   SERVER_CONNECTED_FRAME,
   SESSION_MOVED_FRAME,
+  SHELL_CREATED_FRAME,
+  SHELL_ID,
+  SHELL_NOTICE_ENQUEUED_FRAME,
+  SHELL_SESSION_ID,
   SUBAGENT_BACKGROUND_SUCCESS_FRAME,
   SUBAGENT_NOTICE_ENQUEUED_FRAME,
+  SUBAGENT_NOTICE_MESSAGE,
   TEXT_DELTA_FRAME,
   TEXT_ENDED_FRAME,
   TEXT_SESSION_ID,
@@ -400,6 +405,118 @@ describe('processEventStreamV2', () => {
 
       // #then
       expect(ledger.unknown()).toBe(1)
+    })
+
+    it('adopts a background shell the moment an owned session creates it', async () => {
+      // #given
+      const ledger = createOwnershipLedger()
+
+      // #when — `shell.created` precedes the tool result, so adoption cannot wait for the call to return
+      const open = openRun([SHELL_CREATED_FRAME], {ownershipLedger: ledger}, SHELL_SESSION_ID)
+      await open.settled
+      const adopted = ledger.snapshot().map(entry => entry.sessionId)
+      const outstanding = ledger.outstanding()
+      open.controller.abort()
+      await open.result
+
+      // #then
+      expect(adopted).toEqual([`shell:${SHELL_ID}`])
+      expect(outstanding).toBe(1)
+    })
+
+    it('does not adopt a shell that an unowned session started', async () => {
+      // #given
+      const ledger = createOwnershipLedger()
+
+      // #when
+      const open = openRun([SHELL_CREATED_FRAME], {ownershipLedger: ledger}, PARENT_SESSION_ID)
+      await open.settled
+      open.controller.abort()
+      await open.result
+
+      // #then
+      expect(ledger.snapshot()).toEqual([])
+    })
+
+    it('settles a shell adopted from shell.created when its completion notice arrives', async () => {
+      // #given
+      const ledger = createOwnershipLedger()
+
+      // #when
+      const open = openRun(
+        [SHELL_CREATED_FRAME, SHELL_NOTICE_ENQUEUED_FRAME],
+        {ownershipLedger: ledger},
+        SHELL_SESSION_ID,
+      )
+      await open.settled
+      open.controller.abort()
+      await open.result
+
+      // #then
+      expect(ledger.snapshot().map(entry => entry.state)).toEqual(['settled'])
+    })
+
+    it('does not treat the root as finished while a completion notice is queued and has not started a turn', async () => {
+      // #given a root that succeeded, then a background child's notice is queued for it
+      const started = frame('session.execution.started', {sessionID: PARENT_SESSION_ID})
+      const succeeded = frame('session.execution.succeeded', {sessionID: PARENT_SESSION_ID})
+      const delivered = frame('session.inbox.delivered', {
+        sessionID: PARENT_SESSION_ID,
+        inboxID: SUBAGENT_NOTICE_MESSAGE.id,
+      })
+      const snapshotAfter = async (items: readonly unknown[]) => {
+        const ledger = createOwnershipLedger()
+        ledger.adopt(CHILD_SESSION_ID, 'child')
+        const tracker = createActivityTrackerV2()
+        const open = openRun(items, {ownershipLedger: ledger, tracker}, PARENT_SESSION_ID)
+        await open.settled
+        open.controller.abort()
+        await open.result
+        return {terminal: tracker.rootTerminal, queued: [...tracker.queuedNoticeInboxIds]}
+      }
+
+      // #when / #then — the earlier success no longer stands and the queued notice is remembered
+      expect(await snapshotAfter([started, succeeded, SUBAGENT_NOTICE_ENQUEUED_FRAME])).toEqual({
+        terminal: null,
+        queued: [SUBAGENT_NOTICE_MESSAGE.id],
+      })
+      // delivery alone is not the end of the turn it starts
+      expect(await snapshotAfter([started, succeeded, SUBAGENT_NOTICE_ENQUEUED_FRAME, delivered])).toEqual({
+        terminal: null,
+        queued: [],
+      })
+      // the triggered turn finishing is
+      expect(
+        await snapshotAfter([started, succeeded, SUBAGENT_NOTICE_ENQUEUED_FRAME, delivered, started, succeeded]),
+      ).toEqual({terminal: {kind: 'succeeded'}, queued: []})
+      // a turn that ended while the notice was still queued did not take it in: its success is not the end either, even
+      // after the delivery (which starts the turn the notice is owed)
+      expect(await snapshotAfter([started, SUBAGENT_NOTICE_ENQUEUED_FRAME, succeeded])).toEqual({
+        terminal: {kind: 'succeeded'},
+        queued: [SUBAGENT_NOTICE_MESSAGE.id],
+      })
+      expect(await snapshotAfter([started, SUBAGENT_NOTICE_ENQUEUED_FRAME, succeeded, delivered])).toEqual({
+        terminal: null,
+        queued: [],
+      })
+    })
+
+    it('keeps a failed root failed when a notice arrives after it', async () => {
+      // #given
+      const tracker = createActivityTrackerV2()
+      const failed = frame('session.execution.failed', {
+        sessionID: PARENT_SESSION_ID,
+        error: {type: 'unknown', message: 'x'},
+      })
+
+      // #when
+      const open = openRun([failed, SUBAGENT_NOTICE_ENQUEUED_FRAME], {tracker}, PARENT_SESSION_ID)
+      await open.settled
+      open.controller.abort()
+      await open.result
+
+      // #then
+      expect(tracker.rootTerminal).toEqual({kind: 'failed'})
     })
 
     it('detects a pull request URL from a shell call', async () => {

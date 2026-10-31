@@ -6,6 +6,7 @@
 import type {OpenCodeV2ServerHandle} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
 import type {PromptOptions} from './types.js'
+import {createOwnershipLedger} from '@fro-bot/runtime'
 import {
   QUESTION_FORM_CREATED_FRAME,
   QUESTION_FORM_ID,
@@ -24,6 +25,7 @@ import {
   succeedWithText,
 } from './execution-v2.fixture.js'
 import {cancelFormV2, executeOpenCodeV2, interruptRootSession, replyToPermissionAskV2} from './execution-v2.js'
+import {takeLiveObservationV2} from './live-observation-v2.js'
 import {EVENT_STREAM_CONNECT_TIMEOUT_MS, MAX_LLM_RETRIES, RETRY_DELAYS_MS} from './retry.js'
 
 const consoleMock = vi.hoisted(() => ({outputTextContent: vi.fn(), outputToolExecution: vi.fn()}))
@@ -69,14 +71,28 @@ function promptOptions(): PromptOptions {
   }
 }
 
-function handle(): OpenCodeV2ServerHandle & {readonly registered: string[]} {
+function handle(
+  fetchRoute?: OpenCodeV2ServerHandle['fetch'],
+): OpenCodeV2ServerHandle & {readonly registered: string[]} {
   const registered: string[] = []
   return {
     url: 'http://127.0.0.1:4096',
     directory: DIRECTORY,
     registerOwnedSession: (id: string) => registered.push(id),
     registered,
+    ...(fetchRoute === undefined ? {} : {fetch: fetchRoute}),
   } as unknown as OpenCodeV2ServerHandle & {readonly registered: string[]}
+}
+
+function usageRecord(input: number, cost: number): unknown {
+  return {
+    data: {
+      id: ROOT_SESSION_ID,
+      cost,
+      tokens: {input, output: 10, reasoning: 0, cache: {read: 0, write: 0}},
+      model: {providerID: 'anthropic', id: 'claude-x'},
+    },
+  }
 }
 
 async function advance(totalMs: number, stepMs = 250): Promise<void> {
@@ -94,6 +110,114 @@ describe('executeOpenCodeV2', () => {
 
   afterEach(() => {
     vi.useRealTimers()
+  })
+
+  describe('usage', () => {
+    it('fills tokens, cost and model from the session record once the attempt succeeded', async () => {
+      // #given a new session whose record carries the turn's usage
+      const server = createFakeServer({onPrompt: (_, pipe) => succeedWithText(pipe)})
+      const route = vi.fn(async (_path: string) => new Response(JSON.stringify(usageRecord(120, 0.5)), {status: 200}))
+
+      // #when
+      const result = executeOpenCodeV2(
+        promptOptions(),
+        logger,
+        {agent: null, model: null, timeoutMs: 60_000},
+        handle(route),
+        undefined,
+        server.client,
+      )
+      await advance(2_000)
+
+      // #then
+      expect(await result).toMatchObject({
+        success: true,
+        tokenUsage: {input: 120, output: 10, reasoning: 0, cache: {read: 0, write: 0}},
+        cost: 0.5,
+        model: 'anthropic/claude-x',
+      })
+    })
+
+    it('leaves the observation running and lets the release re-read usage after the last turn', async () => {
+      // #given a run with a ledger, whose session record grows after the attempt returned
+      const server = createFakeServer({onPrompt: (_, pipe) => succeedWithText(pipe)})
+      const records = [usageRecord(120, 0.5), usageRecord(200, 0.9)]
+      const route = vi.fn(async (_path: string) => new Response(JSON.stringify(records.shift()), {status: 200}))
+      const ledger = createOwnershipLedger()
+
+      // #when
+      const result = executeOpenCodeV2(
+        promptOptions(),
+        logger,
+        {agent: null, model: null, timeoutMs: 60_000},
+        handle(route),
+        ledger,
+        server.client,
+      )
+      await advance(2_000)
+      const outcome = await result
+
+      // #then the attempt reported the usage it saw, and the observation it left can read the later figures
+      expect(outcome.tokenUsage?.input).toBe(120)
+      const live = takeLiveObservationV2(ledger)
+      expect(live?.refreshUsage).toBeDefined()
+      expect(await live?.refreshUsage?.()).toMatchObject({tokens: {input: 200}, cost: 0.9})
+
+      // #and the subscription is still open: a turn that starts and fails after the return is recorded
+      server.pipes.at(-1)?.push(frame('session.execution.started', {sessionID: ROOT_SESSION_ID}))
+      server.pipes.at(-1)?.push(
+        frame('session.execution.failed', {
+          sessionID: ROOT_SESSION_ID,
+          error: {type: 'provider.quota', message: 'out of credit', status: 402},
+        }),
+      )
+      await advance(500)
+      expect(live?.tracker.rootTerminal).toEqual({kind: 'failed'})
+      await live?.stop()
+    })
+
+    it('reports only the growth of a continued session, from a baseline read before the first prompt', async () => {
+      // #given a continued session that already carried 100 tokens and 0.2
+      const server = createFakeServer({onPrompt: (_, pipe) => succeedWithText(pipe)})
+      const records = [usageRecord(100, 0.2), usageRecord(160, 0.5)]
+      const route = vi.fn(async (_path: string) => new Response(JSON.stringify(records.shift()), {status: 200}))
+
+      // #when
+      const result = executeOpenCodeV2(
+        promptOptions(),
+        logger,
+        {agent: null, model: null, timeoutMs: 60_000, continueSessionId: ROOT_SESSION_ID},
+        handle(route),
+        undefined,
+        server.client,
+      )
+      await advance(2_000)
+
+      // #then
+      const outcome = await result
+      expect(outcome.tokenUsage?.input).toBe(60)
+      expect(outcome.cost).toBeCloseTo(0.3)
+    })
+
+    it('leaves usage out of a continued session whose baseline cannot be read, rather than overcounting', async () => {
+      // #given
+      const server = createFakeServer({onPrompt: (_, pipe) => succeedWithText(pipe)})
+      const route = vi.fn(async (_path: string) => new Response(null, {status: 500}))
+
+      // #when
+      const result = executeOpenCodeV2(
+        promptOptions(),
+        logger,
+        {agent: null, model: null, timeoutMs: 60_000, continueSessionId: ROOT_SESSION_ID},
+        handle(route),
+        undefined,
+        server.client,
+      )
+      await advance(2_000)
+
+      // #then
+      expect(await result).toMatchObject({success: true, tokenUsage: null, cost: null, model: null})
+    })
   })
 
   it('creates the session with its title, agent and model, subscribes before it prompts, and completes', async () => {

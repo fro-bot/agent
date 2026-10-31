@@ -11,6 +11,7 @@ import type {CacheRestorePhaseResult, CacheRestoreV2PhaseResult} from './cache-r
 import type {RoutingPhaseResult} from './routing.js'
 import type {SessionPrepPhaseResult} from './session-prep.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
+import {takeDeferredSummaryV2} from './deferred-summary-v2.js'
 import {runExecute} from './execute.js'
 
 const mocks = vi.hoisted(() => ({
@@ -22,6 +23,7 @@ const mocks = vi.hoisted(() => ({
   findLatestSession: vi.fn(),
   updateSession: vi.fn(),
   addSyntheticMessage: vi.fn(),
+  stopAndConfirmQuietV2: vi.fn(),
   getInput: vi.fn(),
   logger: {debug: vi.fn(), info: vi.fn(), warning: vi.fn(), error: vi.fn()},
 }))
@@ -58,6 +60,7 @@ vi.mock('../../features/agent/execution-v2.js', () => ({
     addSyntheticMessage: mocks.addSyntheticMessage,
   })),
 }))
+vi.mock('../../features/agent/drain-v2.js', () => ({stopAndConfirmQuietV2: mocks.stopAndConfirmQuietV2}))
 vi.mock('../../shared/logger.js', () => ({createLogger: vi.fn(() => mocks.logger)}))
 
 const OVERFLOW = {
@@ -229,6 +232,7 @@ describe('runExecute generation selector', () => {
     mocks.searchSessions.mockResolvedValue([])
     mocks.updateSession.mockResolvedValue({success: true, data: undefined})
     mocks.addSyntheticMessage.mockResolvedValue({success: true, data: undefined})
+    mocks.stopAndConfirmQuietV2.mockResolvedValue({quiet: true})
   })
 
   it('leaves a V1 run on the V1 executor and never touches the V2 one', async () => {
@@ -263,10 +267,13 @@ describe('runExecute generation selector', () => {
     const call = mocks.executeOpenCodeV2.mock.calls[0]
     expect(call?.[3]).toBe(cacheRestore.serverHandle)
     expect(call?.[4]).toBe(result.ownershipLedger)
-    // The summary goes through the V2 synthetic-message route, not the SDK client.
+    // The summary is not written through the SDK client, and not yet through the V2 route either: a queued synthetic
+    // message would keep the root's inbox non-empty, and the release waits for an empty one. It is held for the release.
     expect(mocks.writeSessionSummary).not.toHaveBeenCalled()
-    expect(mocks.addSyntheticMessage).toHaveBeenCalledWith(expect.objectContaining({sessionId: 'ses_v2'}))
-    expect((mocks.addSyntheticMessage.mock.calls[0]?.[0] as {text: string}).text).toContain('Fro Bot Run Summary')
+    expect(mocks.addSyntheticMessage).not.toHaveBeenCalled()
+    const held = takeDeferredSummaryV2(cacheRestore.serverHandle)
+    expect(held?.sessionId).toBe('ses_v2')
+    expect(held?.text).toContain('Fro Bot Run Summary')
   })
 
   it('routes the overflow-recovery restart through the V2 executor, archiving over the V2 route', async () => {
@@ -317,10 +324,10 @@ describe('runExecute generation selector', () => {
     expect(mocks.executeOpenCodeV2).toHaveBeenCalledTimes(2)
   })
 
-  it('does not archive or restart after an overflow that left a child running, and reports the run incomplete', async () => {
-    // #given the overflowed session's ledger still holds a child that was never confirmed stopped. The ledger is the
-    // one `runExecute` builds, so it is reached through the first executor call. A restart is not scripted: a second call
+  it('does not archive or restart when a child survives the stop, and reports the run incomplete', async () => {
+    // #given an overflowed session whose child the stop could not bring down. A restart is not scripted: a second call
     // would resolve to undefined and fail the run loudly.
+    mocks.stopAndConfirmQuietV2.mockResolvedValue({quiet: false, reason: 'the directory was active'})
     mocks.executeOpenCodeV2.mockImplementationOnce(
       async (_p: unknown, _l: unknown, _c: unknown, _h: unknown, ledger: OwnershipLedger) => {
         ledger.adopt('ses_child', 'child')
@@ -344,7 +351,69 @@ describe('runExecute generation selector', () => {
       llmError: {type: 'context_overflow'},
     })
     expect(result.overflowRecovery).toBeUndefined()
-    expect(result.ownershipLedger?.outstanding()).toBe(1)
+  })
+
+  it('does not restart when the stop could not confirm the directory quiet, even with an empty ledger', async () => {
+    // #given
+    mocks.stopAndConfirmQuietV2.mockResolvedValue({quiet: false, reason: 'the directory was active'})
+    mocks.executeOpenCodeV2.mockResolvedValueOnce(agentResult())
+
+    // #when
+    const result = await runExecute(bootstrap(), routing(), v2CacheRestore(), sessionPrep(), metrics(), 0)
+
+    // #then an empty ledger does not make an unconfirmed stop look clean
+    expect(mocks.executeOpenCodeV2).toHaveBeenCalledTimes(1)
+    expect(mocks.updateSession).not.toHaveBeenCalledWith(expect.objectContaining({archived: true}))
+    expect(result.recoveryBoundaryUnresolved).toBe(true)
+  })
+
+  it('does not restart when the stop reads quiet but the ledger still holds a child', async () => {
+    // #given the gate passed, but the child was never settled in the ledger
+    mocks.executeOpenCodeV2.mockImplementationOnce(
+      async (_p: unknown, _l: unknown, _c: unknown, _h: unknown, ledger: OwnershipLedger) => {
+        ledger.adopt('ses_child', 'child')
+        return agentResult()
+      },
+    )
+
+    // #when
+    const result = await runExecute(bootstrap(), routing(), v2CacheRestore(), sessionPrep(), metrics(), 0)
+
+    // #then
+    expect(mocks.executeOpenCodeV2).toHaveBeenCalledTimes(1)
+    expect(result.recoveryBoundaryUnresolved).toBe(true)
+  })
+
+  it('stops the overflowed session children and shells and waits for the directory before it archives', async () => {
+    // #given an overflowed session that owns a child, and a stop that settles it
+    const calls: string[] = []
+    mocks.stopAndConfirmQuietV2.mockImplementation(
+      async (context: {ledger: OwnershipLedger; rootSessionId: string}) => {
+        calls.push('stop')
+        context.ledger.settle('ses_child')
+        return {quiet: true}
+      },
+    )
+    mocks.updateSession.mockImplementation(async () => {
+      calls.push('archive')
+      return {success: true, data: undefined}
+    })
+    mocks.executeOpenCodeV2
+      .mockImplementationOnce(async (_p: unknown, _l: unknown, _c: unknown, _h: unknown, ledger: OwnershipLedger) => {
+        ledger.adopt('ses_child', 'child')
+        return agentResult()
+      })
+      .mockResolvedValueOnce(agentResult({success: true, exitCode: 0, error: null, llmError: null}))
+
+    // #when
+    const result = await runExecute(bootstrap(), routing(), v2CacheRestore(), sessionPrep(), metrics(), 0)
+
+    // #then the stop is aimed at the overflowed session's directory and comes first; nothing is left unresolved
+    expect(calls.slice(0, 2)).toEqual(['stop', 'archive'])
+    expect(mocks.stopAndConfirmQuietV2).toHaveBeenCalledWith(
+      expect.objectContaining({directory: '/workspace', rootSessionId: 'overflowed-session'}),
+    )
+    expect(result.recoveryBoundaryUnresolved).toBe(false)
   })
 
   it('searches prior work for the V2 restart over the V2 session routes, excluding the overflowed session', async () => {

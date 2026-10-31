@@ -229,9 +229,9 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
 
     const pruneLogger = createLogger({phase: 'prune'})
     const finalWorkspace = getGitHubWorkspace()
-    // V2 has no SDK client to prune through, so `serverHandleV2` is not pruned here. TODO(U12b): prune V2 sessions over
-    // `DELETE /api/session/:id` with the rest of the V2 release step; until then a V2 database only grows by the
-    // sessions of the runs that saved it.
+    // V2 has no SDK client to prune through, so `serverHandleV2` is not pruned here. A V2 run is pruned over
+    // `DELETE /api/session/:id` by its release step (`release-v2.ts` -> `prune-v2.ts`), which runs before this phase
+    // because pruning needs a live server and a directory already confirmed quiet, and the release shuts the server down.
     if (serverHandle != null) {
       try {
         const normalizedFinalWorkspace = normalizeWorkspacePath(finalWorkspace)

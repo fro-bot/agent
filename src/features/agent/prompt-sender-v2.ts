@@ -88,6 +88,9 @@ export interface SendPromptV2Options {
 export async function sendPromptToSessionV2(options: SendPromptV2Options): Promise<AttemptResult> {
   const {client, sessionId, promptText, files, directory, logger, deadline} = options
   const attemptAbortController = new AbortController()
+  // Set by the attempt when it keeps its event processor running past its return (a successful attempt with a ledger):
+  // the subscription must then outlive this call, and the release closes it.
+  const liveHandoff = {kept: false}
   try {
     const subscriptionSignal =
       deadline === undefined
@@ -123,10 +126,12 @@ export async function sendPromptToSessionV2(options: SendPromptV2Options): Promi
     return await runPromptAttemptV2({
       client,
       sessionId,
+      directory,
       eventStream: subscribed.data,
       startPrompt,
       logger,
       attemptAbortController,
+      liveHandoff,
       ...(deadline === undefined ? {} : {deadline}),
       ...(options.onPermissionAsked === undefined ? {} : {onPermissionAsked: options.onPermissionAsked}),
       ...(options.onFormAsked === undefined ? {} : {onFormAsked: options.onFormAsked}),
@@ -135,6 +140,6 @@ export async function sendPromptToSessionV2(options: SendPromptV2Options): Promi
       ...(options.poll === undefined ? {} : {poll: options.poll}),
     })
   } finally {
-    attemptAbortController.abort()
+    if (!liveHandoff.kept) attemptAbortController.abort()
   }
 }
