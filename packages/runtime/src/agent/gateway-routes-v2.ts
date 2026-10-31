@@ -37,7 +37,21 @@ export const V2_GATEWAY_ROUTES: readonly V2GatewayRoute[] = [
 /** One identifier segment: what OpenCode ids are made of. Nothing that could be decoded, split or truncated by a router. */
 const PARAM_SEGMENT = /^[\w-]{1,128}$/
 
-const COMPILED = V2_GATEWAY_ROUTES.map(route => ({method: route.method, segments: route.path.split('/').slice(1)}))
+/**
+ * True when `method` and `pathname` match this one route: the same method, the same number of segments, each literal
+ * segment equal and each `:name` segment one identifier. `pathname` is the canonical path of an origin-form target.
+ */
+export function routeMatches(route: V2GatewayRoute, method: string, pathname: string): boolean {
+  if (!pathname.startsWith('/') || route.method !== method) return false
+  const expected = route.path.split('/').slice(1)
+  const actual = pathname.split('/').slice(1)
+  return (
+    expected.length === actual.length &&
+    expected.every((segment, index) =>
+      segment.startsWith(':') ? PARAM_SEGMENT.test(actual[index] as string) : segment === actual[index],
+    )
+  )
+}
 
 /**
  * True when `method` and `pathname` are an allowlisted route. `pathname` must already be the canonical path of an
@@ -46,15 +60,5 @@ const COMPILED = V2_GATEWAY_ROUTES.map(route => ({method: route.method, segments
  * literal segment matches only its exact, lower-case spelling.
  */
 export function isGatewayRouteV2(method: string, pathname: string): boolean {
-  if (!pathname.startsWith('/')) return false
-  const segments = pathname.split('/').slice(1)
-  return COMPILED.some(
-    route =>
-      route.method === method &&
-      route.segments.length === segments.length &&
-      route.segments.every((expected, index) => {
-        const actual = segments[index] as string
-        return expected.startsWith(':') ? PARAM_SEGMENT.test(actual) : expected === actual
-      }),
-  )
+  return V2_GATEWAY_ROUTES.some(route => routeMatches(route, method, pathname))
 }

@@ -87,6 +87,8 @@ interface Sandbox {
   readonly dbBase: string
   /** The root-only credential blob the supervisor reads (`WORKSPACE_OPENCODE_AUTH_FILE`). */
   readonly authFile: string
+  /** A key file the child can read, for `{file:}` references. A trailing newline is trimmed by the server. */
+  readonly keyFile: string
 }
 
 let box: Sandbox
@@ -207,7 +209,9 @@ function createSandbox(): Sandbox {
   git('commit', '-qm', 'init')
   const authFile = path.join(root, 'workspace_opencode_auth')
   writeFileSync(authFile, JSON.stringify({anthropic: {type: 'api', key: PROVIDER_KEY}}), {mode: 0o600})
-  return {root, home, reposRoot, repo, dbBase: path.join(root, 'db'), authFile}
+  const keyFile = path.join(root, 'provider-key')
+  writeFileSync(keyFile, `${PROVIDER_KEY}\n`, {mode: 0o600})
+  return {root, home, reposRoot, repo, dbBase: path.join(root, 'db'), authFile, keyFile}
 }
 
 /** Installs both plugins exactly as the image build does, into the sandbox home. */
@@ -238,7 +242,10 @@ function installPlugins(sandbox: Sandbox): void {
  * overlay instead, the way an operator who keeps it in `WORKSPACE_OPENCODE_CONFIG` would. No plugin entry (the config
  * content carries those).
  */
-function writeMergedConfig(sandbox: Sandbox, options: {readonly inlineKey?: boolean} = {}): void {
+function writeMergedConfig(
+  sandbox: Sandbox,
+  options: {readonly inlineKey?: boolean; readonly fileKey?: boolean} = {},
+): void {
   writeFileSync(
     path.join(sandbox.home, '.config', 'opencode', 'opencode.json'),
     JSON.stringify({
@@ -247,7 +254,11 @@ function writeMergedConfig(sandbox: Sandbox, options: {readonly inlineKey?: bool
       share: 'disabled',
       provider: {
         anthropic: {
-          options: {baseURL: provider?.baseURL, ...(options.inlineKey === true ? {apiKey: PROVIDER_KEY} : {})},
+          options: {
+            baseURL: provider?.baseURL,
+            ...(options.inlineKey === true ? {apiKey: PROVIDER_KEY} : {}),
+            ...(options.fileKey === true ? {apiKey: `{file:${sandbox.keyFile}}`} : {}),
+          },
         },
       },
       model: MODEL,
@@ -760,14 +771,17 @@ describe.skipIf(!hasBinary)('the workspace V2 runner against the real stock bina
     },
   )
 
-  it(
-    'reaches ready and sends the key when it is configured inline in the overlay, with no stored credential',
+  it.each([
+    ['inline in the overlay', {inlineKey: true}],
+    ['as a {file:} reference to a key file the child can read', {fileKey: true}],
+  ] as const)(
+    'reaches ready and sends the key when it is configured %s, with no stored credential',
     {timeout: RUNNER_TIMEOUT_MS},
-    async () => {
+    async (_label, configOptions) => {
       // #given the key in provider.anthropic.options.apiKey (the shape V1 migrates into V2 settings) and no blob
       provider?.setHold(false)
       const hitsBefore = provider?.hits().length ?? 0
-      writeMergedConfig(box, {inlineKey: true})
+      writeMergedConfig(box, configOptions)
       const workspace = await startWorkspace({withCredential: false})
       try {
         // #then the gate accepted the inline key: the spawn's credential store is empty and it is ready anyway

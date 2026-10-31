@@ -20,6 +20,7 @@ import {
 } from '@fro-bot/runtime/workspace-v2'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
+import {spawnConfigFromMergedConfig} from './opencode-credentials-v2.js'
 import {
   buildOpencodeV2Env,
   createUpstreamCredentials,
@@ -1274,6 +1275,66 @@ describe('runSupervisedOpencodeV2', () => {
       expect(capture.serialized()).not.toContain('SUPERSECRETKEY')
       controller.abort()
       await done
+    })
+
+    it.each([
+      ['a {file:} reference', '{file:/home/opencode/provider-key}'],
+      ['an {env:} reference', '{env:ANTHROPIC_API_KEY}'],
+    ])('reaches ready for a provider keyed only by %s in the merged config', async (_label, reference) => {
+      // #given the real parser on a merged config whose only credential is a reference, and no blob
+      const config = JSON.stringify({model: MODEL, provider: {anthropic: {options: {apiKey: reference}}}})
+      const store = credentialStore()
+      const fake = createHandle({authorization: 'Basic one', routes: store.routes})
+      const {options, startOptions, statusRef} = setup()
+      const controller = new AbortController()
+      options.deps = {
+        ...options.deps,
+        readSpawnConfig: () => {
+          const parsed = spawnConfigFromMergedConfig(config)
+          if (!parsed.success) throw new Error(parsed.error.message)
+          return parsed.data
+        },
+        startServer: scriptedStart([fake], startOptions),
+      }
+
+      // #when
+      const done = runSupervisedOpencodeV2({...options, signal: controller.signal})
+      await vi.waitFor(() => expect(statusRef.status).toBe('ready'))
+
+      // #then the reference satisfied the gate without a connection read, and nothing was posted
+      expect(fake.fetchPaths).not.toContain('/api/integration/anthropic')
+      expect(store.posts).toHaveLength(0)
+      controller.abort()
+      await done
+    })
+
+    it.each([
+      ['an empty key', ''],
+      ['a {file:} reference with an empty target', '{file:}'],
+      ['an {env:} reference with an empty target', '{env:}'],
+    ])('refuses readiness for a provider whose only configured key is %s', async (_label, value) => {
+      // #given
+      const store = credentialStore()
+      const fake = createHandle({authorization: 'Basic one', routes: store.routes})
+      const {options, startOptions, capture} = setup({maxAttempts: 1})
+      const {statusRef, seen} = recordStatuses()
+      const config = JSON.stringify({model: MODEL, provider: {anthropic: {options: {apiKey: value}}}})
+      options.deps = {
+        ...options.deps,
+        readSpawnConfig: () => {
+          const parsed = spawnConfigFromMergedConfig(config)
+          if (!parsed.success) throw new Error(parsed.error.message)
+          return parsed.data
+        },
+        startServer: scriptedStart([fake], startOptions),
+      }
+
+      // #when
+      await runSupervisedOpencodeV2({...options, statusRef})
+
+      // #then
+      expect(seen).not.toContain('ready')
+      expect(capture.serialized()).toContain('credential-missing')
     })
 
     it('still refuses a provider with no inline key, no stored credential and no connection', async () => {

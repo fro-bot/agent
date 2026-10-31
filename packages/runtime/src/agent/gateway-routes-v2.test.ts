@@ -1,8 +1,9 @@
+import type {V2GatewayRoute} from './gateway-routes-v2.js'
 import type {RemoteOpenCodeV2Client} from './remote-client-v2.js'
 
 import {describe, expect, it} from 'vitest'
 
-import {isGatewayRouteV2, V2_GATEWAY_ROUTES} from './gateway-routes-v2.js'
+import {isGatewayRouteV2, routeMatches, V2_GATEWAY_ROUTES} from './gateway-routes-v2.js'
 import {createRemoteOpenCodeV2Client} from './remote-client-v2.js'
 
 /**
@@ -56,6 +57,18 @@ async function recordedRequests(call: (client: RemoteOpenCodeV2Client) => Promis
   return seen
 }
 
+/**
+ * The allowlist entries no exercised request matches. Each exercised request is judged against ITS OWN entry (method plus
+ * segment pattern), never against the whole list: with the whole list, an unused `GET /api/credential` would pass
+ * because an exercised `GET /api/session` happens to match some other GET entry.
+ */
+function unexercisedRoutes(routes: readonly V2GatewayRoute[], exercised: ReadonlySet<string>): string[] {
+  const requests = [...exercised].map(entry => entry.split(' ') as [string, string])
+  return routes
+    .filter(route => !requests.some(([method, pathname]) => routeMatches(route, method, pathname)))
+    .map(route => `${route.method} ${route.path}`)
+}
+
 describe('V2_GATEWAY_ROUTES drift guard', () => {
   it.each(Object.entries(CALLS))('allowlists every route RemoteOpenCodeV2Client.%s can call', async (_name, call) => {
     // #when the real client method runs against a recording fetch
@@ -91,14 +104,36 @@ describe('V2_GATEWAY_ROUTES drift guard', () => {
     exercised.add('GET /api/session/active')
     exercised.add('GET /api/session')
 
-    // #then each allowlist entry matches at least one of them, so a route nobody calls cannot linger
-    for (const route of V2_GATEWAY_ROUTES) {
-      const matched = [...exercised].some(entry => {
-        const [method, pathname] = entry.split(' ') as [string, string]
-        return method === route.method && isGatewayRouteV2(route.method, pathname)
-      })
-      expect(matched, `${route.method} ${route.path} is allowlisted but no client method calls it`).toBe(true)
-    }
+    // #then every allowlist entry is the one some request actually matches, so a route nobody calls cannot linger
+    expect(unexercisedRoutes(V2_GATEWAY_ROUTES, exercised)).toEqual([])
+  })
+
+  it('fails on an unexercised entry that shares a method with an exercised one', () => {
+    // #given the real exercised set and one extra allowlisted route that no client method calls
+    const exercised = new Set(['GET /api/session', 'GET /api/session/active', 'GET /api/session/ses_abc123'])
+    const withExtra: readonly V2GatewayRoute[] = [
+      {method: 'GET', path: '/api/session'},
+      {method: 'GET', path: '/api/session/active'},
+      {method: 'GET', path: '/api/session/:sessionId'},
+      {method: 'GET', path: '/api/credential'},
+    ]
+
+    // #then the guard names it, even though `GET /api/session` matches another GET entry
+    expect(unexercisedRoutes(withExtra, exercised)).toEqual(['GET /api/credential'])
+  })
+
+  it('also fails on an extra entry whose method nobody uses', () => {
+    const exercised = new Set(['GET /api/session/ses_abc123/inbox'])
+    expect(
+      unexercisedRoutes(
+        [
+          {method: 'GET', path: '/api/session/:sessionId/inbox'},
+          {method: 'DELETE', path: '/api/session/:sessionId/inbox'},
+          {method: 'GET', path: '/api/session/:sessionId/:anything'},
+        ],
+        exercised,
+      ),
+    ).toEqual(['DELETE /api/session/:sessionId/inbox'])
   })
 })
 

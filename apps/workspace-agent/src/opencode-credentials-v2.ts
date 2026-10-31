@@ -105,19 +105,29 @@ export interface SpawnConfig {
 /** The provider settings the resolver counts as configured authentication (`hasConfiguredAuth`, model-resolver.ts). */
 const INLINE_AUTH_KEYS = ['apiKey', 'authToken', 'accessToken'] as const
 
-/** A value that is a variable reference (`{env:X}`, `{file:X}`) resolves later, possibly to nothing: it proves nothing. */
-const VARIABLE_REFERENCE = /\{(?:env|file):/
+/** A `{env:X}` or `{file:X}` reference whose target is empty or only whitespace: it can name nothing. */
+const EMPTY_REFERENCE = /\{(?:env|file):\s*\}/g
+
+/**
+ * Whether an inline credential setting is present. A literal counts, and so does a `{file:...}` or `{env:...}`
+ * reference with a non-empty target, because the server substitutes it before it resolves provider settings. Presence
+ * only: the reference is NEVER resolved here. Root must not read a path or an environment variable that the agent
+ * controls, and the value would be a secret in the supervisor's memory for nothing.
+ *
+ * Residual, accepted: a reference that resolves to nothing at load time (a missing or unreadable file, an unset variable)
+ * passes the gate and then fails at the first model call with a 401, the same as before this gate existed. An empty
+ * string, or a reference with an empty target (`{file:}`, `{env:}`), does not count.
+ */
+function isConfiguredKey(value: unknown): boolean {
+  if (typeof value !== 'string') return false
+  return value.replaceAll(EMPTY_REFERENCE, '').trim() !== ''
+}
 
 function hasInlineAuth(provider: unknown): boolean {
   if (!isRecord(provider)) return false
   // V1-shaped `options` is migrated into V2 `settings`; V2-native config writes `settings` directly. Both are read.
   return [provider.options, provider.settings].some(
-    bag =>
-      isRecord(bag) &&
-      INLINE_AUTH_KEYS.some(key => {
-        const value = bag[key]
-        return typeof value === 'string' && value.trim() !== '' && !VARIABLE_REFERENCE.test(value)
-      }),
+    bag => isRecord(bag) && INLINE_AUTH_KEYS.some(key => isConfiguredKey(bag[key])),
   )
 }
 

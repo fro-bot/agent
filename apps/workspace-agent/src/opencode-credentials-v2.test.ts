@@ -172,12 +172,40 @@ describe('spawnConfigFromMergedConfig', () => {
   )
 
   it.each([
+    ['a file reference', '{file:/home/opencode/provider-key}'],
+    ['an env reference', '{env:ANTHROPIC_API_KEY}'],
+    ['a file reference with a home-relative path', '{file:~/.config/key}'],
+    ['a literal with an empty reference next to it', 'sk-INLINE{env:}'],
+  ])('counts %s as configured authentication, without resolving it', (_label, value) => {
+    for (const bag of ['options', 'settings']) {
+      for (const key of ['apiKey', 'authToken', 'accessToken']) {
+        const result = spawnConfigFromMergedConfig(JSON.stringify({provider: {anthropic: {[bag]: {[key]: value}}}}))
+        expect(result, `${bag}.${key}`).toEqual({success: true, data: {authenticatedProviders: ['anthropic']}})
+      }
+    }
+  })
+
+  it('never reads the referenced file or variable: presence only', () => {
+    // #given a reference to a path that would be an error to open, and a variable that is not set
+    const result = spawnConfigFromMergedConfig(
+      JSON.stringify({
+        provider: {a: {options: {apiKey: '{file:/proc/1/environ}'}}, b: {options: {apiKey: '{env:HOME}'}}},
+      }),
+    )
+
+    // #then the answer names the providers and nothing from the target
+    expect(result).toEqual({success: true, data: {authenticatedProviders: ['a', 'b']}})
+  })
+
+  it.each([
     ['an empty key', {anthropic: {options: {apiKey: ''}}}],
     ['a blank key', {anthropic: {options: {apiKey: '   '}}}],
     ['a non-string key', {anthropic: {options: {apiKey: 42}}}],
     ['a baseURL only', {anthropic: {options: {baseURL: 'https://x/v1'}}}],
-    ['an env reference that may resolve to nothing', {anthropic: {options: {apiKey: '{env:ANTHROPIC_API_KEY}'}}}],
-    ['a file reference that may resolve to nothing', {anthropic: {options: {apiKey: '{file:/run/key}'}}}],
+    ['a file reference with an empty target', {anthropic: {options: {apiKey: '{file:}'}}}],
+    ['an env reference with an empty target', {anthropic: {options: {apiKey: '{env:}'}}}],
+    ['a reference with a blank target', {anthropic: {settings: {apiKey: '{env:  }'}}}],
+    ['only empty references', {anthropic: {options: {apiKey: ' {file:}{env:} '}}}],
     ['a model-level key (not provider auth)', {anthropic: {models: {m: {options: {apiKey: 'sk-INLINE'}}}}}],
     ['a provider that is not an object', {anthropic: 'sk-INLINE'}],
   ])('does not count %s as authentication', (_label, provider) => {
