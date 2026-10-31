@@ -407,6 +407,8 @@ function operatedRun(stock: StockServer, runId: string, decision: 'always' | 'on
         autoAnswered.push(request.requestID)
         return upstream(request.sessionID)(request.requestID, stock.repo, decision)
       },
+      // These runs ask one at a time, so no open sibling ever needs settling here.
+      settleCovered: async () => 'not-found',
     },
     onPending: request => {
       asked.push({

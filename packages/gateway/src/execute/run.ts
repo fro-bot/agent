@@ -1639,6 +1639,9 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           // A covered ask is answered `once` (or `reject` when the run is ending) straight to upstream.
           answer: async (req, decision) =>
             upstreamReplyFactory(req.sessionID)(req.requestID, sessionDirectory, decision),
+          // An ask already open in the approval UI settles through the registry's claim gate, so a click racing it
+          // cannot double-answer.
+          settleCovered: async req => approvalRegistry.autoApprove(req.requestID),
         },
         onPending: req => {
           // Awaiting-approval reaction — best-effort, fire-and-forget.

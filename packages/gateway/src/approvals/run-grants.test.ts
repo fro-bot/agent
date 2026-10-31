@@ -249,3 +249,151 @@ describe('scopeAlwaysToRun', () => {
     expect(grants.covers(makeRequest({requestID: 'per_2'}))).toBe(false)
   })
 })
+
+describe('createRunGrants: pending Always and the reply echo', () => {
+  it('records the grant from the echo when the Always reply’s response is lost', () => {
+    // #given an Always reply sent whose HTTP response never came
+    const grants = createRunGrants({logger: makeLogger(), runId: 'run_1'})
+    grants.noteAsked(makeRequest())
+    grants.beginAlways('per_1')
+
+    // #when OpenCode's permission.replied echo arrives
+    grants.confirm('per_1', 'once')
+
+    // #then the grant is in force
+    expect(grants.covers(makeRequest({requestID: 'per_2'}))).toBe(true)
+  })
+
+  it('records one grant when both the success and the echo arrive, in either order', () => {
+    const listener = vi.fn()
+    for (const order of ['success-first', 'echo-first'] as const) {
+      const grants = createRunGrants({logger: makeLogger(), runId: 'run_1'})
+      grants.onGranted(listener)
+      grants.noteAsked(makeRequest())
+      grants.beginAlways('per_1')
+      if (order === 'success-first') {
+        grants.grant('per_1')
+        grants.confirm('per_1', 'once')
+      } else {
+        grants.confirm('per_1', 'once')
+        grants.grant('per_1')
+      }
+    }
+    expect(listener).toHaveBeenCalledTimes(2)
+  })
+
+  it('tells the listener which request produced the grant', () => {
+    const grants = createRunGrants({logger: makeLogger(), runId: 'run_1'})
+    const listener = vi.fn()
+    grants.onGranted(listener)
+    grants.noteAsked(makeRequest())
+    grants.beginAlways('per_1')
+    grants.confirm('per_1', 'once')
+    expect(listener).toHaveBeenCalledExactlyOnceWith('per_1')
+  })
+
+  it('records nothing from an echo after the set was dropped', () => {
+    const grants = createRunGrants({logger: makeLogger(), runId: 'run_1'})
+    grants.noteAsked(makeRequest())
+    grants.beginAlways('per_1')
+    grants.drop()
+
+    grants.confirm('per_1', 'once')
+
+    expect(grants.covers(makeRequest({requestID: 'per_2'}))).toBe(false)
+  })
+
+  it('records nothing from the echo of an ask whose Always was never sent', () => {
+    // #given an ask the operator answered once (or another surface did)
+    const grants = createRunGrants({logger: makeLogger(), runId: 'run_1'})
+    grants.noteAsked(makeRequest())
+
+    // #when its echo arrives
+    grants.confirm('per_1', 'once')
+
+    // #then nothing is granted
+    expect(grants.covers(makeRequest({requestID: 'per_2'}))).toBe(false)
+  })
+
+  it('records nothing from a reject echo, and forgets the pending Always', () => {
+    const grants = createRunGrants({logger: makeLogger(), runId: 'run_1'})
+    grants.noteAsked(makeRequest())
+    grants.beginAlways('per_1')
+
+    grants.confirm('per_1', 'reject')
+    grants.confirm('per_1', 'once')
+
+    expect(grants.covers(makeRequest({requestID: 'per_2'}))).toBe(false)
+  })
+
+  it('forgets a pending Always that was released (a retry with another decision)', () => {
+    const grants = createRunGrants({logger: makeLogger(), runId: 'run_1'})
+    grants.noteAsked(makeRequest())
+    grants.beginAlways('per_1')
+    grants.releaseAlways('per_1')
+
+    grants.confirm('per_1', 'once')
+
+    expect(grants.covers(makeRequest({requestID: 'per_2'}))).toBe(false)
+  })
+})
+
+describe('scopeAlwaysToRun: pending Always', () => {
+  it('keeps the Always pending across an ambiguous failure, so the echo can still confirm it', async () => {
+    // #given an Always reply that threw (the request may have landed)
+    const grants = createRunGrants({logger: makeLogger(), runId: 'run_1'})
+    const scoped = scopeAlwaysToRun(() => async () => ({ok: false, error: 'threw'}), grants)
+    grants.noteAsked(makeRequest())
+
+    // #when
+    const result = await scoped('ses_root')('per_1', '/d', 'always')
+    grants.confirm('per_1', 'once')
+
+    // #then the echo recorded the grant
+    expect(result.ok).toBe(false)
+    expect(grants.covers(makeRequest({requestID: 'per_2'}))).toBe(true)
+  })
+
+  it('records the grant from the echo that lands while the response is still in flight', async () => {
+    const grants = createRunGrants({logger: makeLogger(), runId: 'run_1'})
+    let finish: (value: {ok: boolean}) => void = () => {}
+    const scoped = scopeAlwaysToRun(
+      () => async () =>
+        new Promise<{ok: boolean}>(resolve => {
+          finish = resolve
+        }),
+      grants,
+    )
+    grants.noteAsked(makeRequest())
+    const pending = scoped('ses_root')('per_1', '/d', 'always')
+
+    grants.confirm('per_1', 'once')
+
+    expect(grants.covers(makeRequest({requestID: 'per_2'}))).toBe(true)
+    finish({ok: true})
+    await pending
+  })
+
+  it.each(['http 404', 'auth 401'])('forgets the Always after a definite failure (%s)', async error => {
+    const grants = createRunGrants({logger: makeLogger(), runId: 'run_1'})
+    const scoped = scopeAlwaysToRun(() => async () => ({ok: false, error}), grants)
+    grants.noteAsked(makeRequest())
+
+    await scoped('ses_root')('per_1', '/d', 'always')
+    grants.confirm('per_1', 'once')
+
+    expect(grants.covers(makeRequest({requestID: 'per_2'}))).toBe(false)
+  })
+
+  it('forgets the Always when the operator retries with another decision', async () => {
+    const grants = createRunGrants({logger: makeLogger(), runId: 'run_1'})
+    const scoped = scopeAlwaysToRun(() => async () => ({ok: false, error: 'threw'}), grants)
+    grants.noteAsked(makeRequest())
+    await scoped('ses_root')('per_1', '/d', 'always')
+
+    await scoped('ses_root')('per_1', '/d', 'reject')
+    grants.confirm('per_1', 'once')
+
+    expect(grants.covers(makeRequest({requestID: 'per_2'}))).toBe(false)
+  })
+})

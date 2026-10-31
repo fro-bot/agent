@@ -211,6 +211,13 @@ export interface ApprovalRegistry {
     readonly actor: ApprovalActor
   }) => Promise<DecisionOutcome>
   /**
+   * Settle an open approval from the run's own grant (an operator's earlier Always): claim it through the same
+   * single-winner gate an operator click uses, and send `once`. An operator click that already claimed the entry
+   * wins (`already-claimed`, nothing is sent); one that arrives while this reply is in flight is refused. The card
+   * closes through the usual `permission.replied` echo, attributed to no person. `reply-failed` reopens the entry.
+   */
+  autoApprove: (requestID: string) => Promise<DecisionOutcome>
+  /**
    * Authoritative settlement from `permission.replied`.
    * - Entry `open` → OpenCode-initiated (unsolicited or always-rule): render, clear timer, delete. No POST.
    * - Entry `claimed` → echo of our own button POST: render with event.reply, clear timer, delete.
@@ -249,6 +256,8 @@ export interface ApprovalPayload {
   /** Set by attachMessage once the approval notification is posted. */
   renderFn: RenderFn | null
 }
+
+const RUN_GRANT_ACTOR: GateActor = {kind: 'run-grant'}
 
 /** Approvals keep strict scope binding: the acting scope must equal the entry's scope. */
 const approvalScopePolicy: ScopePolicy = (entry, request) => entry.scopeId === request.scopeId
@@ -476,6 +485,38 @@ export function createApprovalRegistry(deps: {
   }
 
   // -------------------------------------------------------------------------
+  // autoApprove — a run grant settling an open ask
+  // -------------------------------------------------------------------------
+
+  async function autoApprove(requestID: string): Promise<DecisionOutcome> {
+    const entry = getEntry(requestID)
+    if (entry === undefined) return 'not-found'
+
+    // The grant acts inside the entry's own scope, so the strict scope policy passes by construction.
+    const admission = gate.admit(entry, {scopeId: entry.scopeId, actor: RUN_GRANT_ACTOR}, approvalScopePolicy)
+    if (admission.kind === 'scope-mismatch') return 'channel-mismatch'
+    if (admission.kind === 'already-claimed') return 'already-claimed'
+
+    const {effects, directory} = entry.payload
+    // eslint-disable-next-line @typescript-eslint/promise-function-async
+    const outcome = await admission.submit(() => effects.postReply(requestID, directory, 'once'))
+    switch (outcome) {
+      case 'ok':
+        return 'ok'
+      case 'already-claimed':
+        return 'already-claimed'
+      case 'not-found':
+        return 'not-found'
+      case 'reply-failed':
+        // Same teardown rule as an operator reply: nothing owns the permission any more, so deny it once.
+        if (entry.state === 'disposed' && entry.recoveryStarted !== true) {
+          await rejectAfterDisposedReplyFailure(entry)
+        }
+        return 'reply-failed'
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // confirmReply — authoritative path for permission.replied
   // -------------------------------------------------------------------------
 
@@ -624,6 +665,7 @@ export function createApprovalRegistry(deps: {
     hasPendingForScope,
     describePendingForScope,
     handleDecision,
+    autoApprove,
     confirmReply,
     applySettlement,
     disposeRun: async (sessionID, reason) => gate.disposeFamilyRun('approval', sessionID, reason),

@@ -7,10 +7,17 @@
 
 import type {GatewayLogger} from '../discord/client.js'
 import type {PermissionReply, PermissionRequest, SettlementReason} from './coordinator.js'
+import type {DecisionOutcome} from './registry.js'
 
-import {describe, expect, it, vi} from 'vitest'
+import {afterEach, describe, expect, it, vi} from 'vitest'
 
-import {createPermissionCoordinator, parsePermissionReply, parsePermissionRequest} from './coordinator.js'
+import {
+  AUTO_ANSWER_ECHO_WAIT_MS,
+  createPermissionCoordinator,
+  parsePermissionReply,
+  parsePermissionRequest,
+} from './coordinator.js'
+import {createApprovalRegistry} from './registry.js'
 import {createRunGrants, scopeAlwaysToRun} from './run-grants.js'
 
 // ---------------------------------------------------------------------------
@@ -530,14 +537,19 @@ function makeRun(runId = 'run_b', replyResult: {ok: boolean} = {ok: true}) {
   const answer = vi.fn(async (request: PermissionRequest, decision: 'once' | 'reject') =>
     upstream(request.requestID, '/d', decision),
   )
-  const coordinator = createPermissionCoordinator({logger, onPending, runGrants: {grants, runId, answer}})
+  const settleCovered = vi.fn(async (_request: PermissionRequest): Promise<DecisionOutcome> => 'ok')
+  const coordinator = createPermissionCoordinator({
+    logger,
+    onPending,
+    runGrants: {grants, runId, answer, settleCovered},
+  })
   coordinator.addOwnedSession('ses_root')
   // The operator surface posts through the scoped factory, as run.ts wires it.
   const operatorPost = scopeAlwaysToRun(
     () => async (requestID, directory, decision) => upstream(requestID, directory, decision),
     grants,
   )('ses_root')
-  return {logger, grants, upstream, onPending, answer, coordinator, operatorPost}
+  return {logger, grants, upstream, onPending, answer, settleCovered, coordinator, operatorPost}
 }
 
 async function operatorAlways(run: ReturnType<typeof makeRun>, requestID = 'per_1'): Promise<void> {
@@ -545,6 +557,70 @@ async function operatorAlways(run: ReturnType<typeof makeRun>, requestID = 'per_
   await run.operatorPost(requestID, '/d', 'always')
   run.upstream.mockClear()
   run.onPending.mockClear()
+}
+
+async function failingAutoAnswer(how: 'fails' | 'throws') {
+  vi.useFakeTimers()
+  const run = makeRun()
+  await operatorAlways(run)
+  if (how === 'fails') run.answer.mockResolvedValueOnce({ok: false})
+  else run.answer.mockRejectedValueOnce(new Error('socket hang up'))
+  const outcome = run.coordinator.onPermissionAsked(
+    makeRequest({requestID: 'per_2', sessionID: 'ses_root', ...RM_ASK, patterns: ['rm /tmp/b']}),
+  )
+  await vi.advanceTimersByTimeAsync(0)
+  return {run, outcome}
+}
+
+function wire() {
+  const logger = makeLogger()
+  const registry = createApprovalRegistry({logger})
+  const grants = createRunGrants({logger, runId: 'run_b'})
+  const sent: [string, string][] = []
+  const deferred = new Map<string, PromiseWithResolvers<{ok: boolean}>>()
+  const scoped = scopeAlwaysToRun(
+    () => async (requestID, _directory, decision) => {
+      sent.push([requestID, decision === 'always' ? 'once' : decision])
+      const gate = deferred.get(requestID)
+      return gate === undefined ? {ok: true} : gate.promise
+    },
+    grants,
+  )
+  const renders: [string, string, string][] = []
+  const coordinator = createPermissionCoordinator({
+    logger,
+    onReplied: event => {
+      registry.confirmReply(event)
+    },
+    onPending: request => {
+      registry.register({
+        requestID: request.requestID,
+        sessionID: request.sessionID,
+        approvalScopeId: 'thread_1',
+        directory: '/d',
+        request,
+        effects: {postReply: scoped(request.sessionID).bind(undefined)},
+      })
+      registry.attachMessage(request.requestID, async (_request, decision, actor, reason) => {
+        renders.push([request.requestID, decision, `${actor?.kind ?? 'none'}:${reason}`])
+      })
+    },
+    runGrants: {
+      grants,
+      runId: 'run_b',
+      answer: async () => ({ok: true}),
+      settleCovered: async request => registry.autoApprove(request.requestID),
+    },
+  })
+  coordinator.addOwnedSession('ses_root')
+  const click = async (requestID: string, decision: PermissionReply) =>
+    registry.handleDecision({
+      requestID,
+      approvalScopeId: 'thread_1',
+      decision,
+      actor: {kind: 'discord-user', userId: 'u1'},
+    })
+  return {coordinator, registry, sent, renders, deferred, click}
 }
 
 describe('createPermissionCoordinator — run-local grants', () => {
@@ -675,6 +751,10 @@ describe('createPermissionCoordinator — run-local grants', () => {
           record(request.requestID, decision)
           return {ok: true}
         },
+        settleCovered: async request => {
+          record(request.requestID, 'once')
+          return 'ok'
+        },
       },
     })
     coordinator.addOwnedSession('ses_root')
@@ -696,13 +776,14 @@ describe('createPermissionCoordinator — run-local grants', () => {
       makeRequest({requestID: 'per_2', sessionID: 'ses_root', ...RM_ASK, patterns: ['rm /tmp/b']}),
     )
 
-    // #then it is not auto-answered: it waits for the operator like any ask
+    // #then it is not auto-answered yet: it waits like any ask
     expect(replies.has('per_2')).toBe(false)
     expect(onPending).toHaveBeenCalledTimes(2)
 
-    // #when the reply lands, a third ask is covered and answered once
+    // #when the reply lands, the waiting sibling settles once and a third ask is covered and answered once
     landOperatorReply()
     await inFlight
+    expect(replies.get('per_2')).toEqual(['once'])
     await coordinator.onPermissionAsked(
       makeRequest({requestID: 'per_3', sessionID: 'ses_root', ...RM_ASK, patterns: ['rm /tmp/c']}),
     )
@@ -710,6 +791,7 @@ describe('createPermissionCoordinator — run-local grants', () => {
     // #then no request got more than one reply
     expect(replies.get('per_1')).toEqual(['once'])
     expect(replies.get('per_3')).toEqual(['once'])
+    expect(onPending).toHaveBeenCalledTimes(2)
     expect([...replies.values()].every(decisions => decisions.length === 1)).toBe(true)
   })
 
@@ -753,19 +835,6 @@ describe('createPermissionCoordinator — run-local grants', () => {
     expect(run.onPending).not.toHaveBeenCalled()
   })
 
-  it('falls back to the operator when the auto-answer cannot be delivered', async () => {
-    const run = makeRun()
-    await operatorAlways(run)
-    run.answer.mockResolvedValueOnce({ok: false})
-
-    void run.coordinator.onPermissionAsked(
-      makeRequest({requestID: 'per_2', sessionID: 'ses_root', ...RM_ASK, patterns: ['rm /tmp/b']}),
-    )
-    await vi.waitFor(() => expect(run.onPending).toHaveBeenCalledTimes(1))
-
-    expect(run.coordinator.pending()).toContain('per_2')
-  })
-
   it('rejects instead when the auto-answer cannot be delivered and the run is ending', async () => {
     const run = makeRun()
     await operatorAlways(run)
@@ -788,6 +857,226 @@ describe('createPermissionCoordinator — run-local grants', () => {
     await expect(result).resolves.toBe('reject')
     expect(run.answer).toHaveBeenLastCalledWith(expect.objectContaining({requestID: 'per_2'}), 'reject')
     expect(run.onPending).not.toHaveBeenCalled()
+  })
+
+  it('waits five seconds for an echo, no more and no less', () => {
+    expect(AUTO_ANSWER_ECHO_WAIT_MS).toBe(5000)
+  })
+
+  describe('an auto-answer that fails or throws (ambiguous: OpenCode may have accepted the once)', () => {
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    it.each(['fails', 'throws'] as const)(
+      'counts the ask as answered when its echo arrives within the bound (%s): no operator approval',
+      async how => {
+        // #given
+        const {run, outcome} = await failingAutoAnswer(how)
+        await vi.advanceTimersByTimeAsync(AUTO_ANSWER_ECHO_WAIT_MS - 1000)
+        expect(run.onPending).not.toHaveBeenCalled()
+
+        // #when OpenCode's echo arrives
+        run.coordinator.onPermissionReplied({requestID: 'per_2', sessionID: 'ses_root', reply: 'once'})
+
+        // #then
+        await expect(outcome).resolves.toBe('once')
+        await vi.advanceTimersByTimeAsync(AUTO_ANSWER_ECHO_WAIT_MS)
+        expect(run.onPending).not.toHaveBeenCalled()
+        expect(run.answer).toHaveBeenCalledTimes(1)
+      },
+    )
+
+    it.each(['fails', 'throws'] as const)(
+      'asks the operator only once the bound passes with no echo (%s)',
+      async how => {
+        // #given
+        const {run, outcome} = await failingAutoAnswer(how)
+
+        // #when the wait is not yet over
+        await vi.advanceTimersByTimeAsync(AUTO_ANSWER_ECHO_WAIT_MS - 1)
+        expect(run.onPending).not.toHaveBeenCalled()
+        expect(run.coordinator.pending()).not.toContain('per_2')
+
+        // #when it is
+        await vi.advanceTimersByTimeAsync(1)
+
+        // #then the operator gets the ask, and the ask is still the same single request
+        expect(run.onPending).toHaveBeenCalledTimes(1)
+        expect(run.coordinator.pending()).toContain('per_2')
+        run.coordinator.onPermissionReplied({requestID: 'per_2', sessionID: 'ses_root', reply: 'once'})
+        await expect(outcome).resolves.toBe('once')
+      },
+    )
+
+    it('ends the wait with a reject when the run is disposed during it', async () => {
+      // #given an auto-answer waiting for its echo
+      const {run, outcome} = await failingAutoAnswer('fails')
+      await vi.advanceTimersByTimeAsync(1000)
+
+      // #when the run ends
+      run.coordinator.dispose('run ended')
+
+      // #then the ask is rejected, not handed to an operator, and not left to wait out the bound
+      await expect(outcome).resolves.toBe('reject')
+      expect(run.answer).toHaveBeenLastCalledWith(expect.objectContaining({requestID: 'per_2'}), 'reject')
+      await vi.advanceTimersByTimeAsync(AUTO_ANSWER_ECHO_WAIT_MS)
+      expect(run.onPending).not.toHaveBeenCalled()
+      expect(vi.getTimerCount()).toBe(0)
+    })
+  })
+
+  describe('covered open asks settle when a grant lands', () => {
+    it('settles an already-open covered sibling, once, and logs the run-grant line', async () => {
+      // #given two matching asks open at once (parallel tool calls)
+      const run = makeRun()
+      void run.coordinator.onPermissionAsked(makeRequest({requestID: 'per_1', sessionID: 'ses_root', ...RM_ASK}))
+      void run.coordinator.onPermissionAsked(
+        makeRequest({requestID: 'per_2', sessionID: 'ses_root', ...RM_ASK, patterns: ['rm /tmp/b']}),
+      )
+      expect(run.onPending).toHaveBeenCalledTimes(2)
+
+      // #when the operator picks Always on the first
+      await run.operatorPost('per_1', '/d', 'always')
+
+      // #then the second settled through the registry gate, once; the operator's own ask was left alone
+      await vi.waitFor(() => expect(run.settleCovered).toHaveBeenCalledTimes(1))
+      expect(run.settleCovered).toHaveBeenCalledWith(expect.objectContaining({requestID: 'per_2'}))
+      expect(run.logger.info).toHaveBeenCalledWith(
+        {runId: 'run_b', permission: 'bash', auto: 'run-grant'},
+        expect.any(String),
+      )
+      expect(JSON.stringify(vi.mocked(run.logger.info).mock.calls)).not.toContain('rm /tmp/b')
+    })
+
+    it('leaves an uncovered open ask open', async () => {
+      const run = makeRun()
+      void run.coordinator.onPermissionAsked(makeRequest({requestID: 'per_1', sessionID: 'ses_root', ...RM_ASK}))
+      void run.coordinator.onPermissionAsked(
+        makeRequest({requestID: 'per_2', sessionID: 'ses_root', ...RM_ASK, patterns: ['curl http://x']}),
+      )
+
+      await run.operatorPost('per_1', '/d', 'always')
+
+      expect(run.settleCovered).not.toHaveBeenCalled()
+    })
+
+    it('does not log when the operator won the race for the sibling', async () => {
+      const run = makeRun()
+      run.settleCovered.mockResolvedValue('already-claimed')
+      void run.coordinator.onPermissionAsked(makeRequest({requestID: 'per_1', sessionID: 'ses_root', ...RM_ASK}))
+      void run.coordinator.onPermissionAsked(
+        makeRequest({requestID: 'per_2', sessionID: 'ses_root', ...RM_ASK, patterns: ['rm /tmp/b']}),
+      )
+
+      await run.operatorPost('per_1', '/d', 'always')
+      await vi.waitFor(() => expect(run.settleCovered).toHaveBeenCalledTimes(1))
+
+      expect(run.logger.info).not.toHaveBeenCalledWith(expect.objectContaining({auto: 'run-grant'}), expect.any(String))
+    })
+
+    it('settles siblings from a grant recorded by the echo alone (the response was lost)', async () => {
+      const run = makeRun()
+      void run.coordinator.onPermissionAsked(makeRequest({requestID: 'per_1', sessionID: 'ses_root', ...RM_ASK}))
+      void run.coordinator.onPermissionAsked(
+        makeRequest({requestID: 'per_2', sessionID: 'ses_root', ...RM_ASK, patterns: ['rm /tmp/b']}),
+      )
+      const lost = scopeAlwaysToRun(() => async () => ({ok: false, error: 'threw'}), run.grants)('ses_root')
+      await lost('per_1', '/d', 'always')
+      expect(run.settleCovered).not.toHaveBeenCalled()
+
+      // #when the echo for the Always arrives
+      run.coordinator.onPermissionReplied({requestID: 'per_1', sessionID: 'ses_root', reply: 'once'})
+
+      // #then the grant exists and the sibling settles
+      await vi.waitFor(() => expect(run.settleCovered).toHaveBeenCalledTimes(1))
+    })
+
+    it('settles nothing once the run is disposed', async () => {
+      const run = makeRun()
+      void run.coordinator.onPermissionAsked(makeRequest({requestID: 'per_1', sessionID: 'ses_root', ...RM_ASK}))
+      void run.coordinator.onPermissionAsked(
+        makeRequest({requestID: 'per_2', sessionID: 'ses_root', ...RM_ASK, patterns: ['rm /tmp/b']}),
+      )
+      const reply = Promise.withResolvers<{ok: boolean}>()
+      const slow = scopeAlwaysToRun(() => async () => reply.promise, run.grants)('ses_root')
+      const pending = slow('per_1', '/d', 'always')
+
+      run.coordinator.dispose('run ended')
+      reply.resolve({ok: true})
+      await pending
+
+      expect(run.settleCovered).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('with the real approval registry (claim gate)', () => {
+    it('settles the sibling exactly once and closes its UI as an operator reply would', async () => {
+      // #given two matching asks open
+      const {coordinator, sent, renders, click} = wire()
+      void coordinator.onPermissionAsked(makeRequest({requestID: 'per_1', sessionID: 'ses_root', ...RM_ASK}))
+      void coordinator.onPermissionAsked(
+        makeRequest({requestID: 'per_2', sessionID: 'ses_root', ...RM_ASK, patterns: ['rm /tmp/b']}),
+      )
+
+      // #when the operator picks Always on the first
+      expect(await click('per_1', 'always')).toBe('ok')
+      await vi.waitFor(() => expect(sent).toHaveLength(2))
+
+      // #then each request got exactly one upstream reply, both once
+      expect(sent).toEqual([
+        ['per_1', 'once'],
+        ['per_2', 'once'],
+      ])
+
+      // #when OpenCode echoes both
+      coordinator.onPermissionReplied({requestID: 'per_1', sessionID: 'ses_root', reply: 'once'})
+      coordinator.onPermissionReplied({requestID: 'per_2', sessionID: 'ses_root', reply: 'once'})
+      await vi.waitFor(() => expect(renders).toHaveLength(2))
+
+      // #then the sibling's card closed once, as replied, attributed to the run grant
+      expect(renders).toContainEqual(['per_2', 'once', 'run-grant:replied'])
+      expect(renders.filter(([id]) => id === 'per_2')).toHaveLength(1)
+    })
+
+    it('gives a racing operator click on the sibling no second upstream reply', async () => {
+      // #given the sibling's auto reply is still in flight when the operator clicks it
+      const {coordinator, sent, deferred, click} = wire()
+      deferred.set('per_2', Promise.withResolvers<{ok: boolean}>())
+      void coordinator.onPermissionAsked(makeRequest({requestID: 'per_1', sessionID: 'ses_root', ...RM_ASK}))
+      void coordinator.onPermissionAsked(
+        makeRequest({requestID: 'per_2', sessionID: 'ses_root', ...RM_ASK, patterns: ['rm /tmp/b']}),
+      )
+      await click('per_1', 'always')
+      await vi.waitFor(() => expect(sent).toContainEqual(['per_2', 'once']))
+
+      // #when
+      const raced = await click('per_2', 'reject')
+      deferred.get('per_2')?.resolve({ok: true})
+
+      // #then
+      expect(raced).toBe('already-claimed')
+      expect(sent.filter(([id]) => id === 'per_2')).toEqual([['per_2', 'once']])
+    })
+
+    it('lets the sibling’s click win when it claimed first: the auto-settle stands aside', async () => {
+      // #given the operator's click on the sibling is in flight when the Always lands
+      const {coordinator, sent, deferred, click} = wire()
+      deferred.set('per_2', Promise.withResolvers<{ok: boolean}>())
+      void coordinator.onPermissionAsked(makeRequest({requestID: 'per_1', sessionID: 'ses_root', ...RM_ASK}))
+      void coordinator.onPermissionAsked(
+        makeRequest({requestID: 'per_2', sessionID: 'ses_root', ...RM_ASK, patterns: ['rm /tmp/b']}),
+      )
+      const siblingClick = click('per_2', 'reject')
+
+      // #when
+      await click('per_1', 'always')
+      deferred.get('per_2')?.resolve({ok: true})
+      await siblingClick
+
+      // #then one reply for the sibling: the operator's
+      expect(sent.filter(([id]) => id === 'per_2')).toEqual([['per_2', 'reject']])
+    })
   })
 
   it('asks the operator as before when no run grants are wired', () => {

@@ -730,6 +730,25 @@ describe('runMention', () => {
         expect(captured.deps().runGrants?.grants.isDropped()).toBe(true)
       })
 
+      it('settles a covered open ask through the approval registry’s claim gate', async () => {
+        // #given
+        const {runMention} = await import('./run.js')
+        setupHappyPath()
+        const approvalRegistry = makeApprovalRegistry()
+        vi.mocked(approvalRegistry.autoApprove).mockResolvedValue('ok')
+        const captured = captureCoordinatorDeps()
+        await runMention(makeMessage(), makeBinding(), makeDeps({approvalRegistry}))
+        const {runGrants} = captured.deps()
+        if (runGrants === undefined) throw new Error('run grants not wired')
+
+        // #when
+        const outcome = await runGrants.settleCovered(RM_ASK)
+
+        // #then
+        expect(outcome).toBe('ok')
+        expect(approvalRegistry.autoApprove).toHaveBeenCalledExactlyOnceWith('req-rm-1')
+      })
+
       it('auto-answers a covered ask with once at the run directory', async () => {
         // #given
         const {runMention} = await import('./run.js')

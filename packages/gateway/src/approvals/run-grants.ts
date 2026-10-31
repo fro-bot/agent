@@ -76,11 +76,28 @@ interface Grant {
 export interface RunGrants {
   /** Remember an ask, so an `always` reply on it can later be turned into a grant. No-op once dropped. */
   readonly noteAsked: (request: PermissionRequest) => void
-  /** The operator's `always` on `requestID` landed: store that ask's patterns as a grant. No-op once dropped. */
+  /**
+   * The operator's `always` reply on `requestID` is being sent: remember it as pending, so the reply succeeding or
+   * its `permission.replied` echo arriving (whichever comes first) turns it into a grant. No-op for an unknown ask.
+   */
+  readonly beginAlways: (requestID: string) => void
+  /** Forget a pending `always` (it definitely failed, or the operator answered the ask another way). */
+  readonly releaseAlways: (requestID: string) => void
+  /**
+   * The operator's `always` on `requestID` landed: store that ask's patterns as a grant, and tell the
+   * {@link onGranted} listeners. Records at most one grant per ask. No-op once dropped.
+   */
   readonly grant: (requestID: string) => void
+  /**
+   * OpenCode's `permission.replied` echo for `requestID`. Grants it when an `always` is pending for it and the echo
+   * is an approval; a `reject` echo forgets the pending `always`. Anything else is ignored.
+   */
+  readonly confirm: (requestID: string, reply: PermissionReply) => void
+  /** Called with the granting ask's id each time a grant is recorded. Cleared by {@link drop}. */
+  readonly onGranted: (listener: (requestID: string) => void) => void
   /** `true` when a stored grant covers the ask: same action, every resource matched. Nothing is stored once dropped. */
   readonly covers: (request: PermissionRequest) => boolean
-  /** End of the run: forget every grant and every remembered ask, and refuse new ones. Idempotent. */
+  /** End of the run: forget every grant, remembered ask and listener, and refuse new ones. Idempotent. */
   readonly drop: () => void
   readonly isDropped: () => boolean
 }
@@ -88,7 +105,10 @@ export interface RunGrants {
 export function createRunGrants(deps: {readonly logger: GatewayLogger; readonly runId: string}): RunGrants {
   const {logger, runId} = deps
   const asked = new Map<string, Grant>()
+  const pendingAlways = new Set<string>()
+  const granted = new Set<string>()
   let grants: Grant[] = []
+  let listeners: ((requestID: string) => void)[] = []
   let dropped = false
 
   function noteAsked(request: PermissionRequest): void {
@@ -96,12 +116,30 @@ export function createRunGrants(deps: {readonly logger: GatewayLogger; readonly 
     asked.set(request.requestID, {permission: request.permission, patterns: request.alwaysPatterns ?? []})
   }
 
+  function beginAlways(requestID: string): void {
+    // Unknown after a drop (`drop` clears `asked`), so a late reply cannot start one.
+    if (asked.has(requestID) && !granted.has(requestID)) pendingAlways.add(requestID)
+  }
+
+  function releaseAlways(requestID: string): void {
+    pendingAlways.delete(requestID)
+  }
+
   function grant(requestID: string): void {
     // Nothing is remembered once dropped (`noteAsked` refuses, `drop` clears), so a late grant finds nothing.
+    pendingAlways.delete(requestID)
     const pending = asked.get(requestID)
-    if (pending === undefined || pending.patterns.length === 0) return
+    if (pending === undefined || pending.patterns.length === 0 || granted.has(requestID)) return
+    granted.add(requestID)
     grants.push(pending)
     logger.info({runId, permission: pending.permission}, 'approvals: operator Always kept as a run-local grant')
+    for (const listener of listeners) listener(requestID)
+  }
+
+  function confirm(requestID: string, reply: PermissionReply): void {
+    if (!pendingAlways.has(requestID)) return
+    if (reply === 'reject') pendingAlways.delete(requestID)
+    else grant(requestID)
   }
 
   function covers(request: PermissionRequest): boolean {
@@ -118,25 +156,58 @@ export function createRunGrants(deps: {readonly logger: GatewayLogger; readonly 
   function drop(): void {
     dropped = true
     grants = []
+    listeners = []
     asked.clear()
+    pendingAlways.clear()
+    granted.clear()
   }
 
-  return {noteAsked, grant, covers, drop, isDropped: () => dropped}
+  return {
+    noteAsked,
+    beginAlways,
+    releaseAlways,
+    grant,
+    confirm,
+    onGranted: listener => {
+      if (!dropped) listeners.push(listener)
+    },
+    covers,
+    drop,
+    isDropped: () => dropped,
+  }
 }
 
 /**
- * Wrap a reply factory so an operator `always` becomes a run-local grant once its reply has landed.
+ * A failure that proves OpenCode did not accept the reply: an HTTP or auth status came back. The V2 reply path reports
+ * exactly these as `http <status>` / `auth <status>`; anything else (`threw`, a timeout, a transport error) leaves it
+ * unknown whether OpenCode applied the reply, and the echo may still confirm it.
+ */
+function isDefiniteFailure(error: string | undefined): boolean {
+  return error !== undefined && /^(?:http|auth) \d{3}$/.test(error)
+}
+
+/**
+ * Wrap a reply factory so an operator `always` becomes a run-local grant.
+ *
+ * The grant is recorded when the reply succeeds OR when OpenCode's `permission.replied` echo for it arrives
+ * ({@link RunGrants.confirm}), whichever comes first and only once: a response lost after OpenCode accepted the reply
+ * still yields the grant. A definite failure forgets the pending `always` (the operator can retry), and so does any
+ * other decision sent for the ask.
  *
  * The wrapped factory still passes `always` down: the generation's own factory downgrades it with
- * {@link replyUpstream}, so no layer on the way can leak it upstream. A failed reply stores nothing (the operator can
- * retry), and a grant that lands after the run's set was dropped is discarded by {@link RunGrants.grant}.
+ * {@link replyUpstream}, so no layer on the way can leak it upstream.
  */
 export function scopeAlwaysToRun(inner: PostReplyFactory, grants: RunGrants): PostReplyFactory {
   return sessionId => {
     const post = inner(sessionId)
     return async (requestId, directory, decision) => {
+      if (decision === 'always') grants.beginAlways(requestId)
+      else grants.releaseAlways(requestId)
       const result = await post(requestId, directory, decision)
-      if (decision === 'always' && result.ok) grants.grant(requestId)
+      if (decision === 'always') {
+        if (result.ok) grants.grant(requestId)
+        else if (isDefiniteFailure(result.error)) grants.releaseAlways(requestId)
+      }
       return result
     }
   }

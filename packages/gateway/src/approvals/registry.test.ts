@@ -1346,3 +1346,121 @@ describe('describePendingForScope', () => {
     expect(dto.command).toBe('ls -la')
   })
 })
+
+// ---------------------------------------------------------------------------
+// autoApprove — a run grant settling an open ask (fro-bot/agent#1990)
+// ---------------------------------------------------------------------------
+
+describe('autoApprove (run grant)', () => {
+  it('claims an open entry, sends once, and the echo renders it once with the run-grant actor', async () => {
+    // #given an open entry with a render function
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    const effects = makeEffects()
+    registry.register(makeParams({effects}))
+    const render = makeRenderFn()
+    registry.attachMessage('per_1', render)
+
+    // #when the run's grant settles it
+    const outcome = await registry.autoApprove('per_1')
+
+    // #then one once-reply went upstream, and the entry stays claimed until the echo
+    expect(outcome).toBe('ok')
+    expect(effects.postReply).toHaveBeenCalledExactlyOnceWith('per_1', '/workspace/proj', 'once')
+    expect(registry.has('per_1')).toBe(true)
+
+    // #when the authoritative echo arrives
+    registry.confirmReply({requestID: 'per_1', sessionID: 'ses_1', reply: 'once'})
+    await vi.waitFor(() => expect(render).toHaveBeenCalledTimes(1))
+
+    // #then it closes the way an operator reply closes it, attributed to no person
+    expect(render).toHaveBeenCalledWith(
+      expect.objectContaining({requestID: 'per_1'}),
+      'once',
+      {kind: 'run-grant'},
+      'replied',
+    )
+    expect(registry.has('per_1')).toBe(false)
+  })
+
+  it('loses to an operator click that already claimed the entry: exactly one upstream reply', async () => {
+    // #given an operator reply still in flight
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    let landOperator: (value: {ok: boolean}) => void = () => {}
+    const postReply = vi.fn().mockReturnValue(
+      new Promise<{ok: boolean}>(resolve => {
+        landOperator = resolve
+      }),
+    )
+    registry.register(makeParams({effects: {postReply}}))
+    const operator = registry.handleDecision({
+      requestID: 'per_1',
+      approvalScopeId: 'chan_1',
+      decision: 'reject',
+      actor: makeActor(),
+    })
+
+    // #when the grant tries to settle it too
+    const outcome = await registry.autoApprove('per_1')
+    landOperator({ok: true})
+    await operator
+
+    // #then it stands aside
+    expect(outcome).toBe('already-claimed')
+    expect(postReply).toHaveBeenCalledTimes(1)
+    expect(postReply).toHaveBeenCalledWith('per_1', '/workspace/proj', 'reject')
+  })
+
+  it('wins over an operator click that arrives while its reply is in flight', async () => {
+    // #given an auto-approve reply still in flight
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    let landAuto: (value: {ok: boolean}) => void = () => {}
+    const postReply = vi.fn().mockReturnValue(
+      new Promise<{ok: boolean}>(resolve => {
+        landAuto = resolve
+      }),
+    )
+    registry.register(makeParams({effects: {postReply}}))
+    const auto = registry.autoApprove('per_1')
+
+    // #when an operator clicks on the same entry
+    const click = await registry.handleDecision({
+      requestID: 'per_1',
+      approvalScopeId: 'chan_1',
+      decision: 'once',
+      actor: makeActor(),
+    })
+    landAuto({ok: true})
+    await auto
+
+    // #then the click is refused and upstream got one reply
+    expect(click).toBe('already-claimed')
+    expect(postReply).toHaveBeenCalledTimes(1)
+  })
+
+  it('reports an unknown entry', async () => {
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    expect(await registry.autoApprove('ghost')).toBe('not-found')
+  })
+
+  it('reopens the entry for the operator when the reply fails', async () => {
+    // #given a reply that fails
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    const postReply = vi.fn().mockResolvedValue({ok: false, error: 'http 500'})
+    registry.register(makeParams({effects: {postReply}}))
+
+    // #when
+    const outcome = await registry.autoApprove('per_1')
+
+    // #then the operator can still decide
+    expect(outcome).toBe('reply-failed')
+    postReply.mockResolvedValue({ok: true})
+    expect(
+      await registry.handleDecision({
+        requestID: 'per_1',
+        approvalScopeId: 'chan_1',
+        decision: 'once',
+        actor: makeActor(),
+      }),
+    ).toBe('ok')
+  })
+})
