@@ -129,8 +129,8 @@ export async function writeCredentialFilesV2(options: {
   const keyFiles: Record<string, string> = {}
   try {
     await fs.mkdir(resolvedBase, {recursive: true})
+    // `mkdtemp` creates the directory 0700, whatever the umask.
     directory = await fs.mkdtemp(path.join(resolvedBase, 'fro-bot-credentials-'))
-    await fs.chmod(directory, 0o700)
     for (const {providerId, key} of entries) {
       const file = path.join(directory, `${providerId}.key`)
       // `wx`: never follow or overwrite anything already there. The mode is applied at creation, so the key is
