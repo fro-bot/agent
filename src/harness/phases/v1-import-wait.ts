@@ -4,7 +4,7 @@ import type {Logger} from '../../shared/logger.js'
 import {existsSync, statSync} from 'node:fs'
 import {DatabaseSync} from 'node:sqlite'
 import {err, ok} from '@bfra.me/es/result'
-import {readV1MigrationStatus} from '@fro-bot/runtime'
+import {MIGRATION_V1_STATUS_TIMEOUT_MS, readV1MigrationStatus} from '@fro-bot/runtime'
 
 /**
  * Waits for OpenCode V2's V1 session-history import to finish before the Action sends a prompt.
@@ -15,7 +15,9 @@ import {readV1MigrationStatus} from '@fro-bot/runtime'
  *
  * - `required` and `running` keep waiting (probe P7 never saw `required` at 250 ms polling, but it is in the union);
  * - `error` fails at once;
- * - the whole wait is bounded (300 s: about 2.7 times the worst P7 sample, 111 s on a 488 MB row-heavy database);
+ * - the whole wait is bounded (300 s: about 2.7 times the worst P7 sample, 111 s on a 488 MB row-heavy database). The
+ *   bound is a deadline on the clock, not on the loop: no read starts at or after it, each read is cut at whatever time
+ *   is left, and a `completed` that arrives after it is a timeout, not a success;
  * - `running` progress (`numerator`, sessions migrated) that does not move for the stall window fails the wait before the
  *   hard bound. A `running` reading with no progress at all cannot show a stall, so only the hard bound applies;
  * - an `unreadable` reading is retried, bounded by a count of consecutive failures, and is never read as `completed`.
@@ -106,6 +108,14 @@ export async function waitForV1Import(
     stallTimeoutMs,
   })
 
+  const timedOut = (pollCount: number): Result<never, V1ImportWaitError> => {
+    logger.error('OpenCode V2 import of V1 session history exceeded its bound', {timeoutMs, polls: pollCount})
+    return err({
+      kind: 'timeout',
+      message: `The OpenCode V2 import of V1 session history did not finish within ${Math.round(timeoutMs / 1000)}s`,
+    })
+  }
+
   let polls = 0
   let consecutiveUnreadable = 0
   let lastNumerator: number | undefined
@@ -117,9 +127,18 @@ export async function waitForV1Import(
       return err({kind: 'aborted', message: 'The wait for the OpenCode V2 import was cancelled'})
     }
 
-    const reading = await readV1MigrationStatus({fetch, ...(signal === undefined ? {} : {signal})})
+    const remainingMs = deadline - Date.now()
+    if (remainingMs <= 0) return timedOut(polls)
+
+    const reading = await readV1MigrationStatus({
+      fetch,
+      timeoutMs: Math.min(MIGRATION_V1_STATUS_TIMEOUT_MS, remainingMs),
+      ...(signal === undefined ? {} : {signal}),
+    })
     polls += 1
     const now = Date.now()
+    // A read that finished past the deadline does not get to report success: the bound is the bound.
+    if (reading.status === 'completed' && now >= deadline) return timedOut(polls)
 
     switch (reading.status) {
       case 'completed': {
@@ -190,13 +209,7 @@ export async function waitForV1Import(
         message: `The OpenCode V2 import of V1 session history made no progress for ${Math.round(stallTimeoutMs / 1000)}s (${lastNumerator ?? 0} sessions migrated)`,
       })
     }
-    if (now >= deadline) {
-      logger.error('OpenCode V2 import of V1 session history exceeded its bound', {timeoutMs, polls})
-      return err({
-        kind: 'timeout',
-        message: `The OpenCode V2 import of V1 session history did not finish within ${Math.round(timeoutMs / 1000)}s`,
-      })
-    }
+    if (now >= deadline) return timedOut(polls)
 
     await sleepUnlessAborted(Math.min(pollIntervalMs, Math.max(0, deadline - now)), signal)
   }

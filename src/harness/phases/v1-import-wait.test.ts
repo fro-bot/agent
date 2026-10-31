@@ -108,15 +108,76 @@ describe('waitForV1Import', () => {
 
   it('fails when the import runs past the hard bound while progress keeps moving', async () => {
     // #given progress that advances every 10 s, so the stall check never trips
+    const startedAt = Date.now()
     const server = statusServer(elapsed => running(Math.floor(elapsed / 10_000), 100_000))
 
     // #when
     const result = await drive(waitForV1Import({fetch: server.fetch, logger: createMockLogger()}))
 
-    // #then
+    // #then it failed at the bound, not before it: elapsed fake time is measured, not the epoch-valued clock
     expect(result).toMatchObject({success: false, error: {kind: 'timeout'}})
     expect(V1_IMPORT_WAIT_TIMEOUT_MS).toBe(300_000)
-    expect(Date.now()).toBeGreaterThanOrEqual(V1_IMPORT_WAIT_TIMEOUT_MS)
+    const elapsed = Date.now() - startedAt
+    expect(elapsed).toBeGreaterThanOrEqual(V1_IMPORT_WAIT_TIMEOUT_MS)
+    expect(elapsed).toBeLessThan(V1_IMPORT_WAIT_TIMEOUT_MS + 1_000)
+  })
+
+  it('starts no status read at or after the deadline', async () => {
+    // #given a running import that keeps moving, under a 10 s bound
+    const readStartedAt: number[] = []
+    const server = statusServer(elapsed => {
+      readStartedAt.push(elapsed)
+      return running(Math.floor(elapsed / 1_000), 100_000)
+    })
+
+    // #when
+    const result = await drive(waitForV1Import({fetch: server.fetch, logger: createMockLogger(), timeoutMs: 10_000}))
+
+    // #then
+    expect(result).toMatchObject({success: false, error: {kind: 'timeout'}})
+    expect(readStartedAt.length).toBeGreaterThan(5)
+    expect(Math.max(...readStartedAt)).toBeLessThan(10_000)
+  })
+
+  it('bounds a hung status read by the time left, not by the full read bound', async () => {
+    // #given a server that answers until 6 s and then never answers, under a 7 s overall bound
+    const startedAt = Date.now()
+    const fetchThenHang = async (): Promise<Response> => {
+      if (Date.now() - startedAt < 6_000) return new Response(JSON.stringify(running(1)), {status: 200})
+      return new Promise<Response>(() => undefined)
+    }
+
+    // #when
+    const result = await drive(
+      waitForV1Import({
+        fetch: fetchThenHang,
+        logger: createMockLogger(),
+        timeoutMs: 7_000,
+        stallTimeoutMs: 600_000,
+      }),
+      100,
+    )
+
+    // #then the 5 s read that began near 6 s was cut at the 7 s deadline instead of running on to about 11 s
+    expect(result).toMatchObject({success: false, error: {kind: 'timeout'}})
+    expect(Date.now() - startedAt).toBeLessThan(7_000 + 500)
+  })
+
+  it('counts a completion that arrives after the deadline as a timeout', async () => {
+    // #given the read that straddles the 5 s deadline answers `completed`, and the clock passes the deadline first
+    const server = statusServer(elapsed => {
+      if (elapsed < 4_000) return running(Math.floor(elapsed / 500), 100_000)
+      vi.setSystemTime(Date.now() + 2_000)
+      return {status: 'completed'}
+    })
+
+    // #when
+    const result = await drive(
+      waitForV1Import({fetch: server.fetch, logger: createMockLogger(), timeoutMs: 5_000, stallTimeoutMs: 600_000}),
+    )
+
+    // #then
+    expect(result).toMatchObject({success: false, error: {kind: 'timeout'}})
   })
 
   it('fails before the hard bound when the numerator stops advancing', async () => {

@@ -1,5 +1,6 @@
 import type {Result} from '@bfra.me/es/result'
 import type {OpenCodeV2ServerHandle, StartOpenCodeV2ServerOptions} from '@fro-bot/runtime'
+import type {InstallPluginsV2Options, PluginInstallV2Error} from '../../services/setup/plugin-install-v2.js'
 import type {Logger} from '../../shared/logger.js'
 import type {V1DatabaseFacts, V1ImportWaitError, WaitForV1ImportOptions} from './v1-import-wait.js'
 import {err, ok} from '@bfra.me/es/result'
@@ -13,6 +14,7 @@ import {
   verifyCredentialGate,
   verifyPermissionRules,
 } from '@fro-bot/runtime'
+import {createExecAdapter} from '../../services/setup/adapters.js'
 import {parseAuthJsonInput} from '../../services/setup/auth-json.js'
 import {buildCIConfigV2} from '../../services/setup/ci-config-v2.js'
 import {
@@ -21,7 +23,12 @@ import {
   resolveCredentialBaseDir,
   writeCredentialFilesV2,
 } from '../../services/setup/credential-files-v2.js'
-import {resolvePluginSpecsV2} from '../../services/setup/plugin-install-v2.js'
+import {
+  arePluginsCachedV2,
+  installPluginsV2,
+  resolveCacheHome,
+  resolvePluginSpecsV2,
+} from '../../services/setup/plugin-install-v2.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {readV1DatabaseFacts, waitForV1Import} from './v1-import-wait.js'
 
@@ -35,14 +42,19 @@ import {readV1DatabaseFacts, waitForV1Import} from './v1-import-wait.js'
  *    V2's m39 migration has nothing to import into the database the post hook saves.
  * 2. Config. `buildCIConfigV2` (the outside-directory deny with run-scoped exceptions, `question` denied, the plugins)
  *    plus a `{file:}` reference per key file.
- * 3. Held claims. `clearHeldClaims` runs on the restored database before the spawn: a V2 server resumes a claim a
+ * 3. Plugin preparation. Setup installs both plugins under their own bound, but a matching binary that is already
+ *    installed skips setup, and a missing plugin would then install during server readiness, whose deadline is shorter
+ *    than the healthy install tail (181-370 s measured; the bound is 420 s). So this runs before every spawn,
+ *    whatever setup or the tools cache did: a cache that already holds both exact specs costs two directory reads, and
+ *    anything else gets the bounded installer.
+ * 4. Held claims. `clearHeldClaims` runs on the restored database before the spawn: a V2 server resumes a claim a
  *    killed run left behind. A fresh database, a V1 database (no claim tables) and a database no V2 server opened are
  *    no-ops.
- * 4. Spawn. `startOpenCodeV2Server` scrubs the environment itself (`filterAgentEnv`), so the process environment is
+ * 5. Spawn. `startOpenCodeV2Server` scrubs the environment itself (`filterAgentEnv`), so the process environment is
  *    passed as-is and not filtered twice. Its plugin gate requires `systematic` and `fro-bot.opencode-plugin` active.
- * 5. Permission gate over the effective per-agent rules, then the credential gate for the provider the run needs. A
+ * 6. Permission gate over the effective per-agent rules, then the credential gate for the provider the run needs. A
  *    `{file:}` reference counts as authentication.
- * 6. Import wait: no prompt until the V1 history import reports `completed`.
+ * 7. Import wait: no prompt until the V1 history import reports `completed`.
  *
  * Any failure after the spawn shuts the server down before returning, so a failed start leaves no process behind. The
  * caller decides what a failure means for persistence (it means no save).
@@ -86,6 +98,10 @@ export interface StartActionOpenCodeV2Options {
 
 export interface StartActionOpenCodeV2Deps {
   readonly startServer: typeof startOpenCodeV2Server
+  /** The bounded plugin installer (`installPluginsV2`), minus its exec adapter. */
+  readonly installPlugins: (
+    options: Omit<InstallPluginsV2Options, 'execAdapter'>,
+  ) => Promise<Result<void, PluginInstallV2Error>>
   readonly clearClaims: typeof clearHeldClaims
   readonly waitForImport: (options: WaitForV1ImportOptions) => Promise<Result<unknown, V1ImportWaitError>>
   readonly readDatabaseFacts: (dbPath: string) => V1DatabaseFacts
@@ -96,6 +112,7 @@ const GATE_REQUEST_TIMEOUT_MS = 5_000
 
 const defaultDeps: StartActionOpenCodeV2Deps = {
   startServer: startOpenCodeV2Server,
+  installPlugins: async installOptions => installPluginsV2({...installOptions, execAdapter: createExecAdapter()}),
   clearClaims: clearHeldClaims,
   waitForImport: waitForV1Import,
   readDatabaseFacts: readV1DatabaseFacts,
@@ -152,14 +169,29 @@ export async function startActionOpenCodeV2(
   )
   if (!built.success) return stageError('config', `Invalid OpenCode configuration: ${built.error}`)
 
-  // --- 3. Held claims ----------------------------------------------------------------------------------------
+  // --- 3. Plugin preparation ---------------------------------------------------------------------------------
+  const cacheHome = resolveCacheHome(options.env)
+  if (await arePluginsCachedV2(cacheHome, specs.data.specs)) {
+    logger.info('OpenCode V2 plugins already in the cache', {specs: specs.data.specs})
+  } else {
+    const installed = await deps.installPlugins({
+      logger,
+      opencodeBinaryPath: options.binaryPath,
+      specs: specs.data.specs,
+      cacheHome,
+      env: options.env,
+    })
+    if (!installed.success) return stageError('plugins', `OpenCode plugin install failed: ${installed.error.message}`)
+  }
+
+  // --- 4. Held claims ----------------------------------------------------------------------------------------
   const facts = deps.readDatabaseFacts(options.dbPath)
   const cleared = await deps.clearClaims(options.dbPath, logger)
   if (!cleared.success) {
     return stageError('held-claims', 'Could not clear held execution claims in the restored OpenCode database')
   }
 
-  // --- 4. Spawn (plugin gate inside) -------------------------------------------------------------------------
+  // --- 5. Spawn (plugin gate inside) -------------------------------------------------------------------------
   const started = await deps.startServer(
     {
       binaryPath: options.binaryPath,
@@ -194,7 +226,7 @@ export async function startActionOpenCodeV2(
     return stageError(stage, message)
   }
 
-  // --- 5. Permission gate, then credential gate -------------------------------------------------------------
+  // --- 6. Permission gate, then credential gate -------------------------------------------------------------
   const permissions = await verifyPermissionRules(
     {
       listAgents: async () => {
@@ -231,7 +263,7 @@ export async function startActionOpenCodeV2(
     }
   }
 
-  // --- 6. Import wait ----------------------------------------------------------------------------------------
+  // --- 7. Import wait ----------------------------------------------------------------------------------------
   const imported = await deps.waitForImport({
     fetch: handle.fetch,
     logger,

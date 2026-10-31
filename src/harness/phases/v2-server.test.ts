@@ -6,7 +6,8 @@ import * as path from 'node:path'
 import {DatabaseSync} from 'node:sqlite'
 import {clearHeldClaims} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi, type Mock} from 'vitest'
-import {createMockLogger, serializeLoggerCalls, unwrapErr} from '../../shared/test-helpers.js'
+import {pluginCacheDir, resolvePluginSpecsV2} from '../../services/setup/plugin-install-v2.js'
+import {createMockLogger, serializeLoggerCalls, unwrapErr, unwrapOk} from '../../shared/test-helpers.js'
 import {ok} from '../../shared/types.js'
 import {startActionOpenCodeV2} from './v2-server.js'
 
@@ -69,6 +70,20 @@ function realClearDeps(server: FakeServer): Partial<StartActionOpenCodeV2Deps> {
     clearClaims: clearHeldClaims,
     waitForImport: vi.fn(async () => ({success: true, data: undefined}) as const),
     readDatabaseFacts: () => ({bytes: null, sessions: null}),
+    installPlugins: vi.fn(async () => ({success: true, data: undefined}) as const),
+  }
+}
+
+type InstallPlugins = StartActionOpenCodeV2Deps['installPlugins']
+
+/** The two exact specs a default run installs, as the code under test resolves them. */
+const PLUGIN_SPECS = unwrapOk(resolvePluginSpecsV2('latest')).specs
+
+function populatePluginCache(cacheHome: string): void {
+  for (const spec of PLUGIN_SPECS) {
+    const dir = pluginCacheDir(cacheHome, spec)
+    fs.mkdirSync(dir, {recursive: true})
+    fs.writeFileSync(path.join(dir, 'package.json'), '{}')
   }
 }
 
@@ -77,12 +92,16 @@ describe('startActionOpenCodeV2', () => {
   let runnerTemp: string
   let dbPath: string
   let authPath: string
+  let cacheHome: string
   let calls: string[]
 
   beforeEach(() => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'v2-server-test-'))
     runnerTemp = path.join(root, 'runner-temp')
     fs.mkdirSync(runnerTemp)
+    // A warm plugin cache by default: a run with both plugins cached installs nothing.
+    cacheHome = path.join(root, 'cache')
+    populatePluginCache(cacheHome)
     const dataDir = path.join(root, 'data', 'opencode')
     fs.mkdirSync(dataDir, {recursive: true})
     dbPath = path.join(dataDir, 'opencode.db')
@@ -106,7 +125,7 @@ describe('startActionOpenCodeV2', () => {
       model: 'anthropic/claude-sonnet',
       dbPath,
       authPath,
-      env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin'},
+      env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome},
       runId: 42,
       runAttempt: 1,
       logger: createMockLogger(),
@@ -134,6 +153,10 @@ describe('startActionOpenCodeV2', () => {
         return {success: true, data: undefined} as const
       }),
       readDatabaseFacts: () => ({bytes: 1234, sessions: 5}),
+      installPlugins: vi.fn<InstallPlugins>(async () => {
+        calls.push('install-plugins')
+        return ok(undefined)
+      }),
       ...overrides,
     }
   }
@@ -153,7 +176,7 @@ describe('startActionOpenCodeV2', () => {
     expect(startArgs?.binaryPath).toBe('/opt/opencode')
     expect(startArgs?.directory).toBe('/workspace')
     // the process environment goes in as-is: the spawn scrubs it itself, so it is not filtered twice
-    expect(startArgs?.env).toEqual({RUNNER_TEMP: runnerTemp, PATH: '/usr/bin'})
+    expect(startArgs?.env).toEqual({RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome})
 
     const content = startArgs?.config as {provider: Record<string, {options: {apiKey: string}}>; plugins: string[]}
     const reference = content.provider.anthropic?.options.apiKey ?? ''
@@ -168,6 +191,76 @@ describe('startActionOpenCodeV2', () => {
     ])
     // the config JSON holds the reference, never the key
     expect(JSON.stringify(startArgs?.config)).not.toContain(CANARY)
+  })
+
+  it('installs the plugins under the bound before the spawn when a matching binary meets an empty plugin cache', async () => {
+    // #given a binary that is already installed (so setup never ran its installer) and nothing in the plugin cache
+    fs.rmSync(cacheHome, {recursive: true, force: true})
+    const server = fakeServer()
+    const deps = recordingDeps(server)
+
+    // #when
+    const result = await startActionOpenCodeV2(options({deps}))
+
+    // #then the bounded install ran first, for both exact specs, against the cache home the server will read
+    expect(result.success).toBe(true)
+    expect(calls).toEqual(['install-plugins', 'clear-claims', 'spawn', 'import-wait'])
+    const installArgs = vi.mocked(deps.installPlugins as InstallPlugins).mock.calls[0]?.[0]
+    expect(installArgs?.specs).toEqual(PLUGIN_SPECS)
+    expect(installArgs?.opencodeBinaryPath).toBe('/opt/opencode')
+    expect(installArgs?.cacheHome).toBe(cacheHome)
+    expect(installArgs?.env).toMatchObject({XDG_CACHE_HOME: cacheHome})
+  })
+
+  it('installs nothing when the cache already holds both exact plugin versions', async () => {
+    // #given the default warm cache
+    const server = fakeServer()
+    const deps = recordingDeps(server)
+
+    // #when
+    const result = await startActionOpenCodeV2(options({deps}))
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(deps.installPlugins).not.toHaveBeenCalled()
+    expect(calls).toEqual(['clear-claims', 'spawn', 'import-wait'])
+  })
+
+  it('installs when only one of the two plugins is cached', async () => {
+    // #given a cache that lost the fro.bot plugin
+    fs.rmSync(pluginCacheDir(cacheHome, PLUGIN_SPECS[1] as string), {recursive: true, force: true})
+    const deps = recordingDeps(fakeServer())
+
+    // #when
+    const result = await startActionOpenCodeV2(options({deps}))
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(deps.installPlugins).toHaveBeenCalledTimes(1)
+  })
+
+  it('fails the plugins stage before the claims are touched or anything is spawned when the install fails', async () => {
+    // #given an empty cache and an install that times out
+    fs.rmSync(cacheHome, {recursive: true, force: true})
+    const deps = recordingDeps(fakeServer(), {
+      installPlugins: vi.fn<InstallPlugins>(async () => ({
+        success: false,
+        error: {
+          kind: 'install-timeout',
+          spec: PLUGIN_SPECS[0] as string,
+          message: 'Installing OpenCode plugin x exceeded 420s',
+        },
+      })),
+    })
+
+    // #when
+    const result = await startActionOpenCodeV2(options({deps}))
+
+    // #then
+    expect(result).toMatchObject({success: false, error: {stage: 'plugins'}})
+    expect(unwrapErr(result).message).toContain('exceeded 420s')
+    expect(deps.startServer).not.toHaveBeenCalled()
+    expect(deps.clearClaims).not.toHaveBeenCalled()
   })
 
   it('deletes an auth.json that was restored or left behind, before the spawn', async () => {

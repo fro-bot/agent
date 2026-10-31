@@ -234,6 +234,19 @@ async function restoreV1DatabaseWithHeldClaim(box: Sandbox): Promise<void> {
   ).toBe(1)
 }
 
+/** How long after a failed start the spawned process may still be running. A graceful stop is under a second. */
+const PROCESS_EXIT_BOUND_MS = 10_000
+
+/** True while a process with this pid exists (signal 0 checks existence and permission without sending anything). */
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
 const sandboxes: Sandbox[] = []
 const handles: OpenCodeV2ServerHandle[] = []
 const providers: Provider[] = []
@@ -405,7 +418,8 @@ describe.skipIf(!hasBinary)('startActionOpenCodeV2 against the real stock binary
       }),
     )
 
-    // #when
+    // #when the start fails at the credential gate; the real server handle is captured as the spawn returns it
+    let spawned: OpenCodeV2ServerHandle | undefined
     const started = await startActionOpenCodeV2({
       binaryPath: BINARY as string,
       workspacePath: box.repo,
@@ -419,12 +433,40 @@ describe.skipIf(!hasBinary)('startActionOpenCodeV2 against the real stock binary
       runId: 2,
       runAttempt: 1,
       logger: createMockLogger(),
-      deps: {startOptions: {timeouts: {agentReadyTimeoutMs: 90_000}}},
+      deps: {
+        startServer: async (spawnOptions, spawnLogger) => {
+          const {startOpenCodeV2Server} = await import('@fro-bot/runtime')
+          const result = await startOpenCodeV2Server(
+            {...spawnOptions, timeouts: {agentReadyTimeoutMs: 90_000}},
+            spawnLogger,
+          )
+          if (result.success) spawned = result.data
+          return result
+        },
+      },
     })
 
     // #then the credential gate refuses, naming the provider
     const error = unwrapErr(started)
     expect(error.stage).toBe('credential-gate')
     expect(error.message).toContain('fake')
+
+    // #and the process the start spawned is gone by the time it returns: observed on the real handle, before any
+    // fallback cleanup (the suite's afterAll shutdown) gets a chance to be the thing that stops it
+    expect(spawned).toBeDefined()
+    const server = spawned as OpenCodeV2ServerHandle
+    try {
+      const exit = await Promise.race([
+        server.exited,
+        new Promise<'still-running'>(resolve => setTimeout(() => resolve('still-running'), PROCESS_EXIT_BOUND_MS)),
+      ])
+      expect(exit, `pid ${server.pid} still running ${PROCESS_EXIT_BOUND_MS} ms after the failed start`).not.toBe(
+        'still-running',
+      )
+      expect(isProcessAlive(server.pid), `pid ${server.pid} is still alive`).toBe(false)
+    } finally {
+      // Only now does the fallback apply; on a failed assertion above it stops the leak the assertion found.
+      handles.push(server)
+    }
   }, 240_000)
 })
