@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 
 // Regenerates the per-asset sha256 digests in packages/runtime/src/shared/opencode-v2-pin.json from the upstream
-// release's SHA256SUMS. Run it on the Renovate bump PR, which changes only `version`:
+// release's SHA256SUMS. Renovate changes only `version`, then runs this as `bun run postupgrade` on the update branch
+// (.github/renovate.json5, the OpenCode V2 pin rule). It also runs by hand:
 //
-//   node scripts/sync-opencode-v2-pin.ts            # rewrite the digests for the pinned version
-//   node scripts/sync-opencode-v2-pin.ts 2.3.0      # set the version too, then rewrite the digests
-//   node scripts/sync-opencode-v2-pin.ts --check    # exit 1 if the file disagrees with upstream; writes nothing
+//   bun scripts/sync-opencode-v2-pin.ts            # rewrite the digests for the pinned version
+//   bun scripts/sync-opencode-v2-pin.ts 2.3.0      # set the version too, then rewrite the digests
+//   bun scripts/sync-opencode-v2-pin.ts --check    # exit 1 if the file disagrees with upstream; writes nothing
 //
 // The only option is `--check`, and at most one positional version is accepted. Anything else (`--help`, `--check=true`,
 // a second positional) exits 2 with a usage line, before the pin is read, fetched or written.
@@ -14,7 +15,7 @@
 // release has no SHA256SUMS line for one. The Dockerfile's `opencode-v2` stage and the Action's installOpenCode
 // re-verify each digest against SHA256SUMS and the archive at install time, so a wrong digest cannot ship silently.
 //
-// Plain Node (24 strips types), no dependencies. The relative `.ts` extensions in sibling scripts follow the same rule.
+// No dependencies, and no runtime-specific API: it runs under bun (the Renovate runner) and under Node 24, which strips types.
 
 import {readFileSync, writeFileSync} from 'node:fs'
 import process from 'node:process'
@@ -82,7 +83,7 @@ function serializePin(pin: OpenCodeV2Pin): string {
   return `${JSON.stringify(pin, null, 2)}\n`
 }
 
-const USAGE = 'usage: node scripts/sync-opencode-v2-pin.ts [--check | <x.y.z>]'
+const USAGE = 'usage: bun scripts/sync-opencode-v2-pin.ts [--check | <x.y.z>]'
 
 /** The exit code for a rejected command line (distinct from 1, a failed sync or check). */
 export const EXIT_USAGE = 2
