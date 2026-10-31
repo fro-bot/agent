@@ -14,6 +14,9 @@
  * Two more runs background a short `shell` job (bgshell probes p20 and p22): one completes after the job's notice and
  * the root turn it wakes, with the job's marker written; the other hits the wall-clock deadline while draining, and the
  * job is killed by `DELETE /api/shell/:id` before it can write its marker.
+ *
+ * A last group pins fro-bot/agent#1990 against the real server: an operator's Always is kept for the run and never
+ * reaches the server's saved-permission store, so the next run on the same directory is asked again.
  */
 
 import type {AddressInfo} from 'node:net'
@@ -30,6 +33,8 @@ import process from 'node:process'
 import {createOwnershipLedger, createRemoteOpenCodeV2Client, startOpenCodeV2Server} from '@fro-bot/runtime'
 import {afterAll, describe, expect, it, vi} from 'vitest'
 
+import {createPermissionCoordinator} from '../approvals/coordinator.js'
+import {createRunGrants, scopeAlwaysToRun} from '../approvals/run-grants.js'
 import {createPostReplyFactoryV2} from './permission-reply-v2.js'
 import {makeCoordinator, makeLogger, makeSink} from './run-core-v2.fixture.js'
 import {runOpenCodeCoreV2} from './run-core-v2.js'
@@ -178,13 +183,21 @@ interface StockServer {
   readonly repo: string
   readonly provider: ScriptedProvider
   readonly client: ReturnType<typeof createRemoteOpenCodeV2Client>
+  /** The loopback base URL and bearer, for a call the gateway never makes (reading the saved-permission store). */
+  readonly baseUrl: string
+  readonly authorization: string
 }
 
 /**
  * The stock server at a fresh git repo, with a provider that plays the turns `script` returns (it is given the repo path,
  * so a turn can name a file in it) and edits gated behind an approval.
  */
-async function startStockServer(script: (repo: string) => readonly Turn[]): Promise<StockServer> {
+async function startStockServer(
+  script: (repo: string) => readonly Turn[],
+  permissions: readonly {action: string; resource: string; effect: 'allow' | 'ask' | 'deny'}[] = [
+    {action: 'edit', resource: '*', effect: 'ask'},
+  ],
+): Promise<StockServer> {
   const root = mkdtempSync(path.join(os.tmpdir(), 'run-core-v2-e2e-'))
   cleanups.push(() => rmSync(root, {recursive: true, force: true}))
   const repo = createRepo(root)
@@ -210,7 +223,7 @@ async function startStockServer(script: (repo: string) => readonly Turn[]): Prom
           },
         },
         model: 'fake/fixture-model',
-        permissions: [{action: 'edit', resource: '*', effect: 'ask'}],
+        permissions,
       },
     },
     makeLogger() as never,
@@ -225,7 +238,7 @@ async function startStockServer(script: (repo: string) => readonly Turn[]): Prom
     baseUrl: server.url,
     headers: {authorization: server.authorizationHeader()},
   })
-  return {repo, provider, client}
+  return {repo, provider, client, baseUrl: server.url, authorization: server.authorizationHeader()}
 }
 
 /** A coordinator that answers every approval `once` through the same reply route the gateway uses. */
@@ -372,3 +385,175 @@ describe.skipIf(!hasBinary)('runOpenCodeCoreV2 against the real OpenCode v2.2.0 
     expect(existsSync(marker)).toBe(false)
   }, 120_000)
 })
+
+const RM_PERMISSIONS = [{action: 'shell', resource: '*', effect: 'ask'}] as const
+
+/* eslint-disable no-void */
+/** A run's coordinator wired as `run.ts` wires it, with an operator who answers every approval with `decision`. */
+function operatedRun(stock: StockServer, runId: string, decision: 'always' | 'once') {
+  const logger = makeLogger()
+  const grants = createRunGrants({logger, runId})
+  const upstream = createPostReplyFactoryV2(stock.client)
+  const operatorPost = scopeAlwaysToRun(upstream, grants)
+  const asked: {requestID: string; permission: string; patterns: readonly string[]; save: readonly string[]}[] = []
+  const autoAnswered: string[] = []
+  const operatorReplies: string[] = []
+  const coordinator = createPermissionCoordinator({
+    logger,
+    runGrants: {
+      grants,
+      runId,
+      answer: async (request, decision) => {
+        autoAnswered.push(request.requestID)
+        return upstream(request.sessionID)(request.requestID, stock.repo, decision)
+      },
+      // These runs ask one at a time, so no open sibling ever needs settling here.
+      settleCovered: async () => 'not-found',
+    },
+    onPending: request => {
+      asked.push({
+        requestID: request.requestID,
+        permission: request.permission,
+        patterns: request.patterns,
+        save: request.alwaysPatterns ?? [],
+      })
+      // The operator surface: reply by request id on the asking session, through the scoped factory.
+      void operatorPost(request.sessionID)(request.requestID, stock.repo, decision).then(result => {
+        operatorReplies.push(result.ok ? 'ok' : (result.error ?? 'failed'))
+      })
+    },
+  })
+  return {coordinator, grants, asked, autoAnswered, operatorReplies}
+}
+
+async function savedPermissions(stock: StockServer): Promise<unknown[]> {
+  // The project id is the session's own (the repo root commit), as the saved store keys it.
+  const sessions = await fetch(`${stock.baseUrl}/api/session?directory=${encodeURIComponent(stock.repo)}`, {
+    headers: {authorization: stock.authorization},
+  })
+  const body = (await sessions.json()) as {data?: {projectID?: string}[]}
+  const projectID = body.data?.find(session => typeof session.projectID === 'string')?.projectID
+  const url = new URL(`${stock.baseUrl}/api/permission/saved`)
+  url.searchParams.set('directory', stock.repo)
+  expect(projectID).toEqual(expect.any(String))
+  url.searchParams.set('projectID', projectID as string)
+  const response = await fetch(url, {headers: {authorization: stock.authorization}})
+  expect(response.status).toBe(200)
+  const saved = (await response.json()) as {data: unknown[]}
+  return saved.data
+}
+
+describe.skipIf(!hasBinary)('an operator Always against the real OpenCode v2.2.0 server (#1990)', () => {
+  it('answers the same run’s later rm itself, saves nothing upstream, and asks again in the next run', async () => {
+    // #given — three files, a provider that removes a, then b (run B), then c (run C), edits and shell gated
+    const files: Record<'a' | 'b' | 'c', string> = {a: '', b: '', c: ''}
+    const stock = await startStockServer(repo => {
+      for (const name of ['a', 'b', 'c'] as const) {
+        files[name] = path.join(repo, `victim-${name}.txt`)
+        writeFileSync(files[name], name)
+      }
+      return [
+        {tool: {name: 'shell', args: {command: `rm ${files.a}`}}},
+        {tool: {name: 'shell', args: {command: `rm ${files.b}`}}},
+        {text: 'run B done'},
+        {tool: {name: 'shell', args: {command: `rm ${files.c}`}}},
+        {text: 'run C done'},
+      ]
+    }, RM_PERMISSIONS)
+    const common = {client: stock.client, directory: stock.repo, logger: makeLogger()}
+
+    // #when — run B: the operator picks Always on `rm` of file a
+    const runB = operatedRun(stock, 'run_b', 'always')
+    const sinkB = makeSink()
+    await runOpenCodeCoreV2({
+      ...common,
+      promptText: 'remove a and b',
+      sink: sinkB,
+      signal: AbortSignal.timeout(90_000),
+      coordinator: runB.coordinator,
+      inactivityTimeoutMs: 60_000,
+      streamSilenceTimeoutMs: 45_000,
+    })
+
+    // #then — the second rm in the same run was answered by the gateway, with once, and succeeded
+    expect(sinkB.text()).toContain('run B done')
+    expect(runB.asked).toHaveLength(1)
+    expect(runB.asked[0]?.permission).toBe('bash')
+    expect(runB.asked[0]?.save.length).toBeGreaterThan(0)
+    expect(runB.operatorReplies).toEqual(['ok'])
+    expect(runB.autoAnswered).toHaveLength(1)
+    expect(existsSync(files.a)).toBe(false)
+    expect(existsSync(files.b)).toBe(false)
+
+    // #when — run B ends the way run.ts ends it
+    runB.coordinator.dispose('run ended')
+    runB.grants.drop()
+
+    // #then — the server stored no grant for the project, so nothing can leak to another run
+    expect(await savedPermissions(stock)).toEqual([])
+
+    // #when — run C, a new session on the same directory, tries `rm` of file c
+    const runC = operatedRun(stock, 'run_c', 'once')
+    const sinkC = makeSink()
+    await runOpenCodeCoreV2({
+      ...common,
+      promptText: 'remove c',
+      sink: sinkC,
+      signal: AbortSignal.timeout(90_000),
+      coordinator: runC.coordinator,
+      inactivityTimeoutMs: 60_000,
+      streamSilenceTimeoutMs: 45_000,
+    })
+
+    // #then — it is asked again, as if Always had never been picked, and only then does the rm run
+    expect(runC.asked).toHaveLength(1)
+    expect(runC.asked[0]).toMatchObject({permission: 'bash'})
+    expect(runC.autoAnswered).toEqual([])
+    expect(existsSync(files.c)).toBe(false)
+    expect(await savedPermissions(stock)).toEqual([])
+  }, 180_000)
+
+  it('control: an always sent upstream does persist a project-wide grant, which is what #1990 reported', async () => {
+    // #given — the same script, but the operator's Always goes to the server unchanged
+    let victims: string[] = []
+    const stock = await startStockServer(repo => {
+      victims = ['a', 'b'].map(name => path.join(repo, `control-${name}.txt`))
+      for (const victim of victims) writeFileSync(victim, 'x')
+      return [
+        {tool: {name: 'shell', args: {command: `rm ${victims[0]}`}}},
+        {tool: {name: 'shell', args: {command: `rm ${victims[1]}`}}},
+        {text: 'control done'},
+      ]
+    }, RM_PERMISSIONS)
+    const asked: string[] = []
+    const coordinator = createPermissionCoordinator({
+      logger: makeLogger(),
+      onPending: request => {
+        asked.push(request.requestID)
+        void stock.client.replyPermission({
+          sessionId: request.sessionID,
+          requestId: request.requestID,
+          decision: 'always',
+        })
+      },
+    })
+
+    // #when
+    await runOpenCodeCoreV2({
+      client: stock.client,
+      directory: stock.repo,
+      logger: makeLogger(),
+      promptText: 'remove both',
+      sink: makeSink(),
+      signal: AbortSignal.timeout(90_000),
+      coordinator,
+      inactivityTimeoutMs: 60_000,
+      streamSilenceTimeoutMs: 45_000,
+    })
+
+    // #then — upstream answered the second rm on its own, and kept a row any later run in the project matches
+    expect(asked).toHaveLength(1)
+    expect(await savedPermissions(stock)).not.toEqual([])
+  }, 180_000)
+})
+/* eslint-enable no-void */

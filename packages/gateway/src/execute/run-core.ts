@@ -709,8 +709,8 @@ export async function runOpenCodeCore(params: RunCoreParams): Promise<void> {
   ): Promise<never> {
     const {rootMayBeRunning = false, providerFailureReason, cause} = options
     // Fail-close the human waits FIRST. The run is over, but the barrier below can take up to 15 s to confirm the
-    // root quiescent, and until the waits are settled an `always` press inside that window could still reach
-    // OpenCode and persist a permission rule. This is the teardown `run.ts`'s `finally` runs again afterwards;
+    // root quiescent, and until the coordinator is disposed an approval inside that window could still be answered
+    // and the run's grants (dropped by the same dispose) could still cover a late ask. This is the teardown `run.ts`'s `finally` runs again afterwards;
     // it is idempotent, and neither family sends a second reply for an entry already in flight or gone. Neither
     // call is awaited: the replies are bounded by their own timeouts and must not delay the root abort.
     ownershipCoordinator.dispose('run ended')

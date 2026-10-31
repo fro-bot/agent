@@ -29,8 +29,11 @@
 
 import type {GatewayLogger} from '../discord/client.js'
 import type {PermissionReply} from '../operator-contract/approval.js'
+import type {DecisionOutcome} from './registry.js'
+import type {EchoWait, RunGrants} from './run-grants.js'
 
 import {getObjectProperty, getStringProperty, toErrorMessage} from '@fro-bot/runtime'
+import {startEchoWait} from './run-grants.js'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -58,6 +61,12 @@ export interface PermissionRequest {
   readonly permission: string
   /** Patterns the gate matched, e.g. `["/tmp/x/*"]`. May be empty. */
   readonly patterns: readonly string[]
+  /**
+   * The patterns an `always` reply on this ask would have saved upstream: `save` on a V2 ask, `always` on a V1 one.
+   * The gateway never sends `always` upstream; it keeps these as a run-local grant instead (see `run-grants.ts`).
+   * Absent or empty when the ask carried none (`parsePermissionRequest` always sets it).
+   */
+  readonly alwaysPatterns?: readonly string[]
   /** Human-readable, redaction-safe summary for the Discord embed. */
   readonly title: string
   /**
@@ -157,6 +166,22 @@ export interface PermissionCoordinatorDeps {
    * 'replied' from the coordinator's perspective — cascade is in the registry).
    */
   readonly onSettled?: (requestID: string, reply: PermissionReply, reason: SettlementReason) => void
+  /**
+   * Run-local grants: lets an ask this run's earlier operator `always` already covers be answered `once` without
+   * showing an approval. Absent: every ask goes to the operator, as before.
+   */
+  readonly runGrants?: {
+    readonly grants: RunGrants
+    /** Stamped on the auto-answer log line. */
+    readonly runId: string
+    /** Post the upstream reply for an ask: `once` for a covered ask, `reject` for one the run can no longer answer. */
+    readonly answer: (request: PermissionRequest, decision: 'once' | 'reject') => Promise<{readonly ok: boolean}>
+    /**
+     * Settle an ask that is already open (registered with the approval UI) because a grant now covers it: wired to
+     * the approval registry's claim gate, so an operator click racing it cannot cause a second upstream reply.
+     */
+    readonly settleCovered: (request: PermissionRequest) => Promise<DecisionOutcome>
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +230,7 @@ export function parsePermissionRequest(payload: unknown): PermissionRequest | nu
   if (requestID == null || sessionID == null) return null
   const permission = getStringProperty(payload, 'permission') ?? 'unknown'
   const patterns = getStringArray(payload, 'patterns')
+  const alwaysPatterns = getStringArray(payload, 'always')
   const metadata = getObjectProperty(payload, 'metadata')
   // Extract raw command/filepath via the prototype-safe accessor so prototype-
   // polluted metadata objects cannot inject values through the prototype chain.
@@ -215,6 +241,7 @@ export function parsePermissionRequest(payload: unknown): PermissionRequest | nu
     sessionID,
     permission,
     patterns,
+    alwaysPatterns,
     title: deriveTitle(permission, patterns, metadata),
     // Omit the optional fields entirely when absent (undefined is not emitted
     // in the object literal when the conditional spread is used).
@@ -242,6 +269,17 @@ interface Entry {
   resolve: (reply: PermissionReply) => void
 }
 
+export {AUTO_ANSWER_ECHO_WAIT_MS} from './run-grants.js'
+
+/**
+ * An auto-answer in flight. `echoed` is set when its `permission.replied` arrives, even before the reply call returns;
+ * `wait` is the post-failure wait for the echo early (the echo arrived, or the run is disposed).
+ */
+interface AutoState {
+  echoed: boolean
+  wait: EchoWait | undefined
+}
+
 /**
  * Create a permission coordinator. One instance per run; its local promise map
  * is scoped to that run. Deadline, cascade, and rendering are owned by the registry.
@@ -251,6 +289,16 @@ export function createPermissionCoordinator(deps: PermissionCoordinatorDeps): Pe
   const localMap = new Map<string, Entry>()
   /** SessionIDs seen by this coordinator instance — used by onDispose. */
   const ownedSessionIDs = new Set<string>()
+  /** Asks being auto-answered from a run grant: the reply is in flight and no approval is shown for them. */
+  const autoInFlight = new Map<string, AutoState>()
+  /** Set when the run starts ending; from then on nothing is auto-answered. */
+  let disposed = false
+  if (deps.runGrants !== undefined) {
+    const {runGrants} = deps
+    runGrants.grants.onGranted(requestID => {
+      settleCoveredOpenAsks(requestID, runGrants)
+    })
+  }
 
   function notifyPending(request: PermissionRequest): void {
     if (onPending === undefined) return
@@ -298,6 +346,93 @@ export function createPermissionCoordinator(deps: PermissionCoordinatorDeps): Pe
     }
   }
 
+  /** Open the operator path for an ask: register the local entry and hand it to the approval UI. */
+  async function registerForOperator(request: PermissionRequest): Promise<PermissionReply> {
+    return new Promise<PermissionReply>(resolve => {
+      const entry: Entry = {request, resolve}
+      localMap.set(request.requestID, entry)
+      ownedSessionIDs.add(request.sessionID)
+      logger.info(
+        {requestID: request.requestID, sessionID: request.sessionID, permission: request.permission},
+        'approvals: permission requested',
+      )
+      notifyPending(request)
+    })
+  }
+
+  /**
+   * Answer an ask the run's earlier operator `always` covers, with `once`. Exactly one reply per ask:
+   * - the reply landed (or its `permission.replied` echo already arrived): done, no approval is shown;
+   * - the reply failed and the run is still live: the operator decides, as for any ask;
+   * - the reply failed and the run is ending: reject, because nothing will decide it any more.
+   */
+  async function autoAnswer(
+    request: PermissionRequest,
+    runGrants: NonNullable<PermissionCoordinatorDeps['runGrants']>,
+  ): Promise<PermissionReply> {
+    const state: AutoState = {echoed: false, wait: undefined}
+    autoInFlight.set(request.requestID, state)
+    let ok: boolean
+    try {
+      ok = (await runGrants.answer(request, 'once')).ok
+    } catch {
+      ok = false
+    }
+    if (!ok && !state.echoed && !disposed) {
+      // Ambiguous: OpenCode may have accepted the once with only the response lost. Give the echo a bounded chance.
+      state.wait = startEchoWait()
+      await state.wait.outcome
+      state.wait = undefined
+    }
+    autoInFlight.delete(request.requestID)
+    if (ok || state.echoed) {
+      logAutoAnswered(request, runGrants.runId)
+      return 'once'
+    }
+    if (disposed) {
+      await runGrants.answer(request, 'reject').catch(() => undefined)
+      return 'reject'
+    }
+    logger.warn(
+      {requestID: request.requestID, permission: request.permission},
+      'approvals: run-grant auto-answer failed — asking the operator',
+    )
+    return registerForOperator(request)
+  }
+
+  /** The permission and run id only: the command, path and URL are never logged here. */
+  function logAutoAnswered(request: PermissionRequest, runId: string): void {
+    logger.info({runId, permission: request.permission, auto: 'run-grant'}, 'approvals: auto-answered')
+  }
+
+  /**
+   * A grant just landed: settle every other open ask on an owned session that it now covers, through the approval
+   * registry's claim gate. This is what upstream does for siblings when it stores an `always`.
+   */
+  function settleCoveredOpenAsks(
+    grantedRequestID: string,
+    runGrants: NonNullable<PermissionCoordinatorDeps['runGrants']>,
+  ): void {
+    // After dispose nothing runs here: dispose drops the grants (and with them the listener) and clears `localMap`.
+    for (const entry of [...localMap.values()]) {
+      const {request} = entry
+      if (request.requestID === grantedRequestID) continue
+      // Every entry in `localMap` was registered for an owned session, so covering is the only test left.
+      if (!runGrants.grants.covers(request)) continue
+      runGrants
+        .settleCovered(request)
+        .then(outcome => {
+          if (outcome === 'ok') logAutoAnswered(request, runGrants.runId)
+        })
+        .catch((error: unknown) => {
+          logger.warn(
+            {requestID: request.requestID, detail: toErrorMessage(error)},
+            'approvals: settling a covered ask threw (left open)',
+          )
+        })
+    }
+  }
+
   async function onPermissionAsked(request: PermissionRequest): Promise<PermissionReply> {
     const existing = localMap.get(request.requestID)
     if (existing !== undefined) {
@@ -311,20 +446,32 @@ export function createPermissionCoordinator(deps: PermissionCoordinatorDeps): Pe
         }
       })
     }
+    if (autoInFlight.has(request.requestID)) {
+      // The auto-answer is already on its way: a second reply would be a double answer.
+      logger.warn({requestID: request.requestID}, 'approvals: duplicate permission.asked for an auto-answer (ignored)')
+      return 'once'
+    }
 
-    return new Promise<PermissionReply>(resolve => {
-      const entry: Entry = {request, resolve}
-      localMap.set(request.requestID, entry)
-      ownedSessionIDs.add(request.sessionID)
-      logger.info(
-        {requestID: request.requestID, sessionID: request.sessionID, permission: request.permission},
-        'approvals: permission requested',
-      )
-      notifyPending(request)
-    })
+    const {runGrants} = deps
+    if (runGrants !== undefined) {
+      runGrants.grants.noteAsked(request)
+      // Auto-answer only for a session this run already owns (root or adopted descendant). Once teardown started the
+      // grants are dropped (`dispose`), so nothing covers an ask: it follows the operator path and dispose rejects it.
+      if (ownedSessionIDs.has(request.sessionID) && runGrants.grants.covers(request)) {
+        return autoAnswer(request, runGrants)
+      }
+    }
+    return registerForOperator(request)
   }
 
   function onPermissionReplied(event: PermissionReplyEvent): void {
+    const auto = autoInFlight.get(event.requestID)
+    if (auto !== undefined) {
+      auto.echoed = true
+      auto.wait?.end('echo')
+    }
+    // The echo can confirm an operator Always whose HTTP response was lost; a grant it records settles covered siblings.
+    deps.runGrants?.grants.confirm(event.requestID, event.reply)
     const entry = localMap.get(event.requestID)
     if (entry === undefined) {
       logger.debug({requestID: event.requestID, reply: event.reply}, 'approvals: reply for unknown request (no-op)')
@@ -342,6 +489,11 @@ export function createPermissionCoordinator(deps: PermissionCoordinatorDeps): Pe
   }
 
   function dispose(reason: string): void {
+    // First: the run is over, so its grants go before anything below can run, and no ask is auto-answered again.
+    disposed = true
+    deps.runGrants?.grants.drop()
+    // End any auto-answer waiting for its echo: it now takes the reject path.
+    for (const auto of autoInFlight.values()) auto.wait?.end('cancelled')
     const open = Array.from(localMap.keys())
     if (open.length > 0) {
       logger.warn({reason, count: open.length}, 'approvals: disposing open permission requests — fail-closed')
