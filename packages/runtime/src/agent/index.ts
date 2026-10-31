@@ -100,6 +100,12 @@ export type {
   ReconcileObservation,
 } from './ledger-reconcile.js'
 export {hasBlockingToolPart} from './message-facts.js'
+export {MIGRATION_V1_STATUS_PATH, MIGRATION_V1_STATUS_TIMEOUT_MS, readV1MigrationStatus} from './migration-status-v2.js'
+export type {
+  ReadV1MigrationStatusOptions,
+  V1MigrationProgress,
+  V1MigrationStatusReading,
+} from './migration-status-v2.js'
 export {resolveOutputMode} from './output-mode.js'
 export {createOwnershipLedger, isShellLedgerKey, shellIdFromLedgerKey, shellLedgerKey} from './ownership-ledger.js'
 export type {OwnershipEntryState, OwnershipLedger, OwnershipLedgerEntry} from './ownership-ledger.js'
