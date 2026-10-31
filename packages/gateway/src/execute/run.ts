@@ -35,7 +35,6 @@ import {
   createHeartbeatController,
   createOwnershipLedger,
   createRun,
-  formatSdkError,
   getRunKey,
   parseRunState,
   patchRunDetails,
@@ -47,6 +46,7 @@ import {
 import {createPermissionCoordinator} from '../approvals/coordinator.js'
 import {createDiscordApprovalOnPending} from '../approvals/discord-transport.js'
 import {createQuestionCoordinator} from '../approvals/question-coordinator.js'
+import {createRunGrants, scopeAlwaysToRun} from '../approvals/run-grants.js'
 import {sendMessage} from '../discord/io.js'
 import {setRunReaction} from '../discord/reactions.js'
 import {buildRecoverEntryButton} from '../discord/recover-checkout-button.js'
@@ -70,6 +70,7 @@ import {releaseLockOrByOwnership} from './lock-release.js'
 import {attachOpencodeV2} from './opencode-attach-v2.js'
 import {attachOpencode} from './opencode-attach.js'
 import {selectOpenCodeGeneration} from './opencode-generation.js'
+import {createPostReplyFactoryV1} from './permission-reply-v1.js'
 import {createPostReplyFactoryV2} from './permission-reply-v2.js'
 import {
   CLIENT_TIMEOUT_REPLY,
@@ -384,32 +385,6 @@ const PERMANENT_CLONE_ERROR_CODES: ReadonlySet<CloneErrorCode> = new Set<CloneEr
   'head-resolution-failed',
   'checkout-handoff-failed',
 ])
-
-/**
- * The V1 approval reply: `POST /session/{id}/permissions/{permissionID}` through the V1 SDK handle. The V2 reply is
- * `createPostReplyFactoryV2` (`permission-reply-v2.ts`).
- */
-function createPostReplyFactoryV1(handle: ReturnType<typeof attachOpencode>): PostReplyFactory {
-  return sessionID => async (rID, dir, decision) => {
-    // Call the OpenCode SDK permission reply endpoint.
-    // Uses the session-scoped API: POST /session/{id}/permissions/{permissionID}
-    try {
-      const res = await handle.client.postSessionIdPermissionsPermissionId({
-        path: {id: sessionID, permissionID: rID},
-        body: {response: decision},
-        query: {directory: dir},
-        signal: AbortSignal.timeout(10_000),
-      })
-      const envelope = res as {error?: unknown} | undefined
-      if (envelope?.error != null) {
-        return {ok: false as const, error: formatSdkError(envelope.error)}
-      }
-      return {ok: true as const}
-    } catch (error) {
-      return {ok: false as const, error: toErrorMessage(error)}
-    }
-  }
-}
 
 /**
  * Map an `EnsureCloneFailure` to a `RunCoreErrorKind` honestly, instead of
@@ -1606,10 +1581,19 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       //
       // AbortSignal.timeout(10_000) avoids the dangling-timer leak from the old
       // Promise.race approach. AbortSignal.timeout is self-cleaning.
-      const postReplyFactory: PostReplyFactory =
+      //
+      // ── "Always" is scoped to this run ──────────────────────────────────────────────
+      // Upstream stores an `always` beyond the run (V2: a saved row for the whole project; V1: the directory's approved
+      // list), so the gateway never sends it: both generations' reply factories downgrade it to `once`. The operator's
+      // Always becomes a grant in this run's own in-memory set instead, which the coordinator uses to answer later
+      // matching asks from the run's owned sessions, and which is dropped on every terminal path (see the `finally`
+      // below and the coordinator's `dispose`). Nothing here outlives the run, and no other run can read it.
+      const runGrants = createRunGrants({logger, runId})
+      const upstreamReplyFactory: PostReplyFactory =
         openCode.generation === 'v2'
           ? createPostReplyFactoryV2(openCode.client)
           : createPostReplyFactoryV1(openCode.handle)
+      const postReplyFactory = scopeAlwaysToRun(upstreamReplyFactory, runGrants)
 
       // ── Approval transport selection — resolved before coordinator creation ──────
       // `resolvedApprovalOnPending` is resolved first. If the factory throws, the outer
@@ -1649,6 +1633,16 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
       const coordinator = createPermissionCoordinator({
         logger,
+        runGrants: {
+          grants: runGrants,
+          runId,
+          // A covered ask is answered `once` (or `reject` when the run is ending) straight to upstream.
+          answer: async (req, decision) =>
+            upstreamReplyFactory(req.sessionID)(req.requestID, sessionDirectory, decision),
+          // An ask already open in the approval UI settles through the registry's claim gate, so a click racing it
+          // cannot double-answer.
+          settleCovered: async req => approvalRegistry.autoApprove(req.requestID),
+        },
         onPending: req => {
           // Awaiting-approval reaction — best-effort, fire-and-forget.
           // Replaces the working reaction with the awaiting-approval cue.
@@ -1738,6 +1732,9 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         // Fail-closed: dispose any still-open coordinator entries so pending approvals
         // don't hang if the run ended (normally or via error) before they were settled.
         coordinator.dispose('run ended')
+        // Every terminal path (success, failure, cancel, timeout, barrier, quarantine) leaves through here: the run's
+        // grants go with it. Idempotent with the coordinator's own dispose, which drops them first inside the barrier.
+        runGrants.drop()
         // Pending questions are rejected (ending the agent's turn) before the run releases its
         // resources. Bounded by the reject call's own timeout; never rejects.
         await questionCoordinator?.dispose('run ended')

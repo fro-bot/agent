@@ -47,6 +47,7 @@ function makeApprovalRegistry(): ApprovalRegistry {
     handleDecision: vi.fn(async () => 'ok' as const),
     confirmReply: vi.fn(),
     applySettlement: vi.fn(async () => undefined),
+    autoApprove: vi.fn().mockResolvedValue('not-found'),
     disposeRun: vi.fn(async () => undefined),
     disposeAll: vi.fn(async () => undefined),
   }

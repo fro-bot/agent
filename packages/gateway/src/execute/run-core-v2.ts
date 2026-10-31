@@ -469,8 +469,8 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
     } = {},
   ): Promise<never> {
     const {providerFailureReason, cause, alwaysQuarantine = false} = options
-    // Fail-close the human waits FIRST: the barrier can take up to 15 s, and until the waits are settled an `always`
-    // press could still persist a permission rule. Neither call is awaited; their replies are bounded by their own
+    // Fail-close the human waits FIRST: the barrier can take up to 15 s, and until the waits are settled an approval
+    // could still be answered, and the run's grants (dropped with the coordinator) could still cover a late ask. Neither call is awaited; their replies are bounded by their own
     // timeouts and must not delay the stop.
     ownershipCoordinator.dispose('run ended')
     // eslint-disable-next-line no-void
@@ -958,6 +958,8 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
             sessionID: event.sessionId,
             permission: event.action === 'shell' ? 'bash' : event.action,
             patterns: event.resources,
+            // `save` is what upstream would store on an `always`; the coordinator keeps it as a run-local grant.
+            always: event.save,
           })
           if (request === null) {
             logger.warn({eventType: 'permission.asked'}, 'run-core: permission.asked payload malformed — skipping')

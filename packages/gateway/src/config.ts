@@ -41,9 +41,11 @@ const DEFAULT_LOG_LEVEL = 'info' as const
 const VALID_LOG_LEVELS = ['debug', 'info', 'warn', 'error'] as const
 
 const DEFAULT_APPROVAL_MODE = 'approval-required' as const
-// autonomous-low-risk is deferred: OpenCode evaluates session rules before persisted project
-// 'approved' rules, and last-match-wins means persisted 'always' approvals can override session
-// denies. No permission.asked fires in that case, so gateway autonomous reject cannot save it.
+// autonomous-low-risk is deferred: OpenCode evaluates session rules before its stored 'always'
+// grants (V2: saved rows keyed by project, V1: the directory's approved list), and last-match-wins
+// means a stored 'always' can override session denies. No permission.asked fires in that case, so
+// gateway autonomous reject cannot save it. The gateway itself never sends 'always' upstream: an
+// operator's Always is kept in memory for the rest of that run only (approvals/run-grants.ts).
 // Keep the env var so operators get a clear error instead of silent fallback if they set it.
 const VALID_APPROVAL_MODES = ['approval-required'] as const
 const DEFERRED_APPROVAL_MODES = ['autonomous-low-risk'] as const
@@ -357,7 +359,7 @@ export function loadGatewayConfig(): GatewayConfig {
   const rawApprovalMode = readOptionalSecret('GATEWAY_APPROVAL_MODE') ?? DEFAULT_APPROVAL_MODE
   if ((DEFERRED_APPROVAL_MODES as readonly string[]).includes(rawApprovalMode)) {
     throw new Error(
-      `GATEWAY_APPROVAL_MODE value "${rawApprovalMode}" is not supported: autonomous-low-risk is deferred because OpenCode evaluates session rules before persisted project 'approved' rules, and last-match-wins means persisted 'always' approvals can override session denies. Use "approval-required" (the default).`,
+      `GATEWAY_APPROVAL_MODE value "${rawApprovalMode}" is not supported: autonomous-low-risk is deferred because OpenCode evaluates session rules before its stored 'always' grants, and last-match-wins means a stored 'always' can override session denies. Use "approval-required" (the default).`,
     )
   }
   if (!(VALID_APPROVAL_MODES as readonly string[]).includes(rawApprovalMode)) {
