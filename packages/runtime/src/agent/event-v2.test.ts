@@ -376,6 +376,29 @@ describe('mapV2Event: permissions', () => {
     })
   })
 
+  it('carries the patterns an `always` reply would save, as delivered on the ask (real captures)', () => {
+    // #given asks captured from stock v2.2.0, which deliver `save: ["*"]`
+    // #then the mapped event keeps them: the gateway scopes its own run-local grant by them
+    expect(mapV2Event(ENV_PERMISSION_ASKED_FRAME)).toMatchObject({kind: 'permission_asked', save: ['*']})
+    expect(mapV2Event(NESTED_PERMISSION_ASKED_FRAMES[0])).toMatchObject({kind: 'permission_asked', save: ['*']})
+  })
+
+  it('maps an ask with no `save` (nothing an `always` reply could save) to an empty list', () => {
+    const event = mapV2Event({
+      type: 'permission.asked',
+      data: {id: 'per_1', sessionID: 'ses_x', action: 'edit', resources: ['a']},
+    })
+    expect(event).toMatchObject({kind: 'permission_asked', save: []})
+  })
+
+  it('drops non-string `save` entries instead of trusting the wire', () => {
+    const event = mapV2Event({
+      type: 'permission.asked',
+      data: {id: 'per_1', sessionID: 'ses_x', action: 'shell', resources: ['rm a'], save: ['rm *', 7, null]},
+    })
+    expect(event).toMatchObject({kind: 'permission_asked', save: ['rm *']})
+  })
+
   it('flags an ask with no request id as malformed so the consumer cannot silently skip a hang', () => {
     expect(
       mapV2Event({type: 'permission.asked', data: {sessionID: 'ses_x', action: 'edit', resources: []}}),

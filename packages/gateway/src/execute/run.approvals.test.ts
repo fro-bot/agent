@@ -16,6 +16,7 @@ import {
   mockRuntime,
   setupHappyPath,
 } from './test-helpers.js'
+import type * as coordinatorModule from '../approvals/coordinator.js'
 import * as attachModule from './opencode-attach.js'
 import * as runCoreModule from './run-core.js'
 /* eslint-enable perfectionist/sort-imports */
@@ -648,6 +649,193 @@ describe('runMention', () => {
           query: {directory: canonicalDirectory},
         }),
       )
+    })
+
+    // ── "Always" stays inside the run (fro-bot/agent#1990) ──────────────────────────────
+
+    describe('run-local grants', () => {
+      type CoordinatorDeps = Parameters<typeof coordinatorModule.createPermissionCoordinator>[0]
+
+      const RM_ASK: import('../approvals/coordinator.js').PermissionRequest = {
+        requestID: 'req-rm-1',
+        sessionID: 'sess-run',
+        permission: 'bash',
+        patterns: ['rm /tmp/a'],
+        alwaysPatterns: ['rm *'],
+        title: 'Run command: rm /tmp/a',
+      }
+
+      function captureCoordinatorDeps(): {readonly deps: () => CoordinatorDeps} {
+        let captured: CoordinatorDeps | undefined
+        mockCreatePermissionCoordinator.mockImplementation(coordinatorDeps => {
+          captured = coordinatorDeps
+          return {
+            onPermissionAsked: vi.fn(),
+            onPermissionReplied: vi.fn(),
+            pending: vi.fn().mockReturnValue([]),
+            dispose: vi.fn(),
+            addOwnedSession: vi.fn(),
+            isOwned: vi.fn().mockReturnValue(true),
+          }
+        })
+        return {
+          deps: () => {
+            if (captured === undefined) throw new Error('coordinator deps not captured')
+            return captured
+          },
+        }
+      }
+
+      it('sends once upstream when the operator picks Always on a V1 run, and keeps the grant for the run', async () => {
+        // #given a V1 run whose operator surface posts through the registered effects, while the run is live
+        const {runMention} = await import('./run.js')
+        setupHappyPath()
+        const postSessionIdPermissionsPermissionId = vi.fn().mockResolvedValue({error: null})
+        vi.mocked(attachModule.attachOpencode).mockReturnValue({
+          server: {url: 'http://workspace:9200'},
+          session: {create: vi.fn(), prompt: vi.fn()},
+          client: {postSessionIdPermissionsPermissionId},
+        } as unknown as ReturnType<typeof attachModule.attachOpencode>)
+        const approvalRegistry = makeApprovalRegistry()
+        const thread = makeThread()
+        thread.send.mockResolvedValue({id: 'msg-approval', edit: vi.fn()})
+        const captured = captureCoordinatorDeps()
+        let result: {ok: boolean} | undefined
+        let coveredDuringRun: boolean | undefined
+        mockRunOpenCodeCore.mockImplementation(async () => {
+          const {onPending, runGrants} = captured.deps()
+          if (onPending === undefined || runGrants === undefined) throw new Error('coordinator not wired')
+          // The mocked coordinator never sees the ask, so note it the way the real one does.
+          runGrants.grants.noteAsked(RM_ASK)
+          onPending(RM_ASK)
+          await new Promise(resolve => setTimeout(resolve, 0))
+          const registerCall = (approvalRegistry.register as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as
+            | {effects: {postReply: (requestID: string, directory: string, decision: string) => Promise<{ok: boolean}>}}
+            | undefined
+          if (registerCall === undefined) throw new Error('registerCall not captured')
+
+          // #when the operator picks Always
+          result = await registerCall.effects.postReply('req-rm-1', '/workspace/repos/acme/widget', 'always')
+          coveredDuringRun = runGrants.grants.covers({...RM_ASK, requestID: 'req-rm-2', patterns: ['rm -rf /tmp/b']})
+        })
+        await runMention(makeMessage(thread), makeBinding(), makeDeps({approvalRegistry}))
+
+        // #then upstream got once, never always
+        expect(result?.ok).toBe(true)
+        expect(postSessionIdPermissionsPermissionId).toHaveBeenCalledExactlyOnceWith(
+          expect.objectContaining({body: {response: 'once'}}),
+        )
+        // #and the run kept the grant for the rest of the run, then dropped it with the run
+        expect(coveredDuringRun).toBe(true)
+        expect(captured.deps().runGrants?.grants.isDropped()).toBe(true)
+      })
+
+      it('settles a covered open ask through the approval registry’s claim gate', async () => {
+        // #given
+        const {runMention} = await import('./run.js')
+        setupHappyPath()
+        const approvalRegistry = makeApprovalRegistry()
+        vi.mocked(approvalRegistry.autoApprove).mockResolvedValue('ok')
+        const captured = captureCoordinatorDeps()
+        await runMention(makeMessage(), makeBinding(), makeDeps({approvalRegistry}))
+        const {runGrants} = captured.deps()
+        if (runGrants === undefined) throw new Error('run grants not wired')
+
+        // #when
+        const outcome = await runGrants.settleCovered(RM_ASK)
+
+        // #then
+        expect(outcome).toBe('ok')
+        expect(approvalRegistry.autoApprove).toHaveBeenCalledExactlyOnceWith('req-rm-1')
+      })
+
+      it('auto-answers a covered ask with once at the run directory', async () => {
+        // #given
+        const {runMention} = await import('./run.js')
+        setupHappyPath()
+        const postSessionIdPermissionsPermissionId = vi.fn().mockResolvedValue({error: null})
+        vi.mocked(attachModule.attachOpencode).mockReturnValue({
+          server: {url: 'http://workspace:9200'},
+          session: {create: vi.fn(), prompt: vi.fn()},
+          client: {postSessionIdPermissionsPermissionId},
+        } as unknown as ReturnType<typeof attachModule.attachOpencode>)
+        const captured = captureCoordinatorDeps()
+        await runMention(makeMessage(), makeBinding(), makeDeps())
+        const {runGrants} = captured.deps()
+        if (runGrants === undefined) throw new Error('run grants not wired')
+
+        // #when the coordinator asks the run to answer
+        const once = await runGrants.answer(RM_ASK, 'once')
+        const reject = await runGrants.answer({...RM_ASK, requestID: 'req-rm-2'}, 'reject')
+
+        // #then
+        expect(once.ok).toBe(true)
+        expect(reject.ok).toBe(true)
+        const sentBodies = (postSessionIdPermissionsPermissionId.mock.calls as [{body: unknown}][]).map(
+          ([input]) => input.body,
+        )
+        expect(sentBodies).toEqual([{response: 'once'}, {response: 'reject'}])
+        expect(runGrants.runId).toEqual(expect.any(String))
+      })
+
+      it.each([
+        ['succeeds', () => undefined],
+        ['fails', () => new Error('boom')],
+        ['times out', () => new runCoreModule.RunCoreError('timeout', 'Run timed out')],
+        ['is cancelled', () => new DOMException('aborted', 'AbortError')],
+        ['hits the barrier', () => new runCoreModule.RunCoreError('stream-ended', 'stream closed')],
+        ['is quarantined', () => new runCoreModule.RunCoreError('stream-ended', 'stream closed', true)],
+      ])('drops the run’s grants when the run %s', async (_outcome, makeFailure) => {
+        // #given a run that earned a grant
+        const {runMention} = await import('./run.js')
+        setupHappyPath()
+        const captured = captureCoordinatorDeps()
+        let coveredDuringRun: boolean | undefined
+        mockRunOpenCodeCore.mockImplementation(async () => {
+          const {runGrants} = captured.deps()
+          runGrants?.grants.noteAsked(RM_ASK)
+          runGrants?.grants.grant(RM_ASK.requestID)
+          coveredDuringRun = runGrants?.grants.covers({...RM_ASK, requestID: 'req-rm-2'})
+          const failure = makeFailure()
+          if (failure !== undefined) throw failure
+        })
+
+        // #when the run ends
+        await runMention(makeMessage(), makeBinding(), makeDeps())
+
+        // #then the grant was live during the run, and nothing of it survives the run
+        expect(coveredDuringRun).toBe(true)
+        const grants = captured.deps().runGrants?.grants
+        expect(grants?.isDropped()).toBe(true)
+        expect(grants?.covers({...RM_ASK, requestID: 'req-rm-3'})).toBe(false)
+      })
+
+      it('gives each run its own grants (two runs on one workspace)', async () => {
+        // #given two runs
+        const {runMention} = await import('./run.js')
+        setupHappyPath()
+        const seen: CoordinatorDeps[] = []
+        mockCreatePermissionCoordinator.mockImplementation(coordinatorDeps => {
+          seen.push(coordinatorDeps)
+          return {
+            onPermissionAsked: vi.fn(),
+            onPermissionReplied: vi.fn(),
+            pending: vi.fn().mockReturnValue([]),
+            dispose: vi.fn(),
+            addOwnedSession: vi.fn(),
+            isOwned: vi.fn().mockReturnValue(true),
+          }
+        })
+
+        // #when
+        await runMention(makeMessage(), makeBinding(), makeDeps())
+        await runMention(makeMessage(), makeBinding(), makeDeps())
+
+        // #then distinct sets, distinct run ids
+        expect(seen).toHaveLength(2)
+        expect(seen[0]?.runGrants?.grants).not.toBe(seen[1]?.runGrants?.grants)
+        expect(seen[0]?.runGrants?.runId).not.toBe(seen[1]?.runGrants?.runId)
+      })
     })
 
     it('coordinator is passed into runOpenCodeCore as the coordinator param', async () => {

@@ -293,7 +293,12 @@ async function callEffect(run: () => Promise<QuestionEffectResult>): Promise<Rep
 function actorLogFields(actor: GateActor): {readonly actorKind: GateActor['kind']; readonly actorId: string} {
   return {
     actorKind: actor.kind,
-    actorId: actor.kind === 'discord-user' ? actor.userId : String(actor.githubUserId),
+    actorId:
+      actor.kind === 'discord-user'
+        ? actor.userId
+        : actor.kind === 'run-grant'
+          ? 'run-grant'
+          : String(actor.githubUserId),
   }
 }
 
