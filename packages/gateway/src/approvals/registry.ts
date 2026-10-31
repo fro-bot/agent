@@ -509,9 +509,11 @@ export function createApprovalRegistry(deps: {
       result = {ok: false, error: 'threw'}
     }
     if (result.ok) return result
-    // The entry left the gate while the reply was in flight. Disposed: the failure takes the gate's disposed path
-    // (one recovery reject, no reopen). Settled by the echo: it was accepted after all.
-    if (getEntry(requestID) !== entry) return entry.state === 'disposed' ? result : {ok: true}
+    // Disposed, but the entry stays in the gate until its render finishes, so the check below cannot see it: the
+    // failure must take the gate's disposed path now (one recovery reject, no reopen), not wait out an echo.
+    if (entry.state === 'disposed') return result
+    // Not disposed, yet gone from the gate: the echo settled it while the reply was in flight, so it was accepted.
+    if (getEntry(requestID) !== entry) return {ok: true}
 
     const wait = startEchoWait()
     echoWaits.set(requestID, wait)

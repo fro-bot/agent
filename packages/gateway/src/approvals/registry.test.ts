@@ -1584,6 +1584,40 @@ describe('autoApprove: a failed or thrown reply', () => {
     expect(vi.getTimerCount()).toBe(0)
   })
 
+  it('rejects at once, with no echo wait, when the reply fails while the disposal render is still pending', async () => {
+    // #given an auto-approve reply in flight, and a run disposal held up in its render
+    vi.useFakeTimers()
+    const reply = Promise.withResolvers<{ok: boolean; error?: string}>()
+    const postReply = vi
+      .fn<ApprovalSideEffects['postReply']>()
+      .mockReturnValueOnce(reply.promise)
+      .mockResolvedValue({ok: true})
+    const {registry, click} = registerWith(postReply)
+    const render = Promise.withResolvers<undefined>()
+    registry.attachMessage('per_1', async () => render.promise)
+    const auto = registry.autoApprove('per_1')
+    const disposal = registry.disposeRun('ses_1', 'run ended')
+    await vi.advanceTimersByTimeAsync(0)
+
+    // #when the in-flight reply fails during that render (the entry is disposed but still in the gate)
+    reply.resolve({ok: false, error: 'threw'})
+    await vi.advanceTimersByTimeAsync(0)
+
+    // #then the recovery reject went out now: no echo wait started, one reject, nothing reopened
+    expect(vi.getTimerCount()).toBe(0)
+    expect(postReply.mock.calls.map(call => call[2])).toEqual(['once', 'reject'])
+    expect(await click()).toBe('already-claimed')
+    await expect(auto).resolves.toBe('reply-failed')
+
+    // #when the render finishes
+    render.resolve(undefined)
+    await disposal
+
+    // #then still exactly one reject
+    expect(postReply.mock.calls.map(call => call[2])).toEqual(['once', 'reject'])
+    expect(registry.has('per_1')).toBe(false)
+  })
+
   it('rejects once, ending the wait early, when the run is disposed during the wait', async () => {
     // #given a failed reply waiting for its echo
     vi.useFakeTimers()
