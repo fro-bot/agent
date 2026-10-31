@@ -16,6 +16,7 @@ import type {InvocationOutcome, InvocationVerificationFacts} from './outcome.js'
 import * as core from '@actions/core'
 import {applyTerminalReaction} from '../features/agent/index.js'
 import {createMetricsCollector, writeInvocationOutcomeSummary} from '../features/observability/index.js'
+import {resolveSessionGeneration} from '../services/cache/cache-key.js'
 import {createReviewDeliveryReceiptOperations} from '../services/github/review-delivery-receipt.js'
 import {getGitHubRunAttempt, getGitHubWorkspace, getInvocationIdentity} from '../shared/env.js'
 import {toErrorMessage} from '../shared/errors.js'
@@ -62,6 +63,8 @@ export async function run(): Promise<number> {
   // True when S3 coordination is configured but the Action lock was not acquired (contended, or the
   // fail-closed lock error). Such a run must not persist session state (see CleanupPhaseOptions).
   let skipSessionPersistence = false
+  // Why persistence is skipped, when it is not the lock. Shown in the cleanup warning in place of the lock message.
+  let persistenceDeclineReason: string | undefined
   // Hoisted out of the try block (like lockEtag above) because runCleanup runs from the
   // outer finally block, where a `const` declared inside try is out of scope. Populated
   // right after runExecute returns; stays undefined only when execution never ran
@@ -226,6 +229,13 @@ export async function run(): Promise<number> {
     if (cacheRestore == null) {
       deliveryOutcome = 'failed'
       setUnavailableActionOutputs(Date.now() - startTime)
+      // A V2 start that fails (credentials, gates, the V1 import wait) must not write session state: the database may
+      // be mid-import or half-gated, and the post hook would otherwise save whatever is on disk. V1 is unchanged.
+      if (resolveSessionGeneration(bootstrap.opencodeResult.version) === 'v2') {
+        skipSessionPersistence = true
+        persistenceDeclineReason = 'the OpenCode V2 server did not complete its start, so no session state is saved'
+        core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
+      }
       return 1
     }
     serverHandle = cacheRestore.serverHandle
@@ -365,6 +375,7 @@ export async function run(): Promise<number> {
       ownershipLedger,
       leaseRenewal,
       skipSessionPersistence,
+      ...(persistenceDeclineReason === undefined ? {} : {persistenceDeclineReason}),
     })
 
     // FINAL assessment: the single call to this pure function, made only now that

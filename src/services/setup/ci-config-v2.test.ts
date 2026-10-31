@@ -1,7 +1,7 @@
 import type {PermissionRuleV2} from '@fro-bot/runtime'
 import {evaluatePermissionV2, verifyPermissionRules} from '@fro-bot/runtime'
 import {describe, expect, it} from 'vitest'
-import {createMockLogger} from '../../shared/test-helpers.js'
+import {createMockLogger, serializeLoggerCalls, unwrapErr} from '../../shared/test-helpers.js'
 import {buildCIConfigV2} from './ci-config-v2.js'
 
 const RUNNER_TEMP = '/home/runner/work/_temp'
@@ -367,6 +367,76 @@ describe('buildCIConfigV2', () => {
 
       // #then
       expect(result.success).toBe(false)
+    })
+  })
+
+  describe('provider key files', () => {
+    const KEY_FILES = {
+      anthropic: '/home/runner/work/_temp/fro-bot-credentials-AbC123/anthropic.key',
+      openai: '/home/runner/work/_temp/fro-bot-credentials-AbC123/openai.key',
+    } as const
+
+    it('references each key file with {file:} under provider.<id>.options.apiKey', () => {
+      // #given / #when
+      const {content} = build({providerKeyFiles: KEY_FILES})
+
+      // #then
+      expect(content.provider).toEqual({
+        anthropic: {options: {apiKey: `{file:${KEY_FILES.anthropic}}`}},
+        openai: {options: {apiKey: `{file:${KEY_FILES.openai}}`}},
+      })
+    })
+
+    it('adds no provider block when there are no key files', () => {
+      expect(build().content).not.toHaveProperty('provider')
+      expect(build({providerKeyFiles: {}}).content).not.toHaveProperty('provider')
+    })
+
+    it('keeps an operator baseURL and models, and lets the key file win over an inline operator key', () => {
+      // #given operator config that sets a proxy URL and an inline key for the same provider
+      const opencodeConfig = JSON.stringify({
+        model: 'anthropic/claude-sonnet',
+        provider: {
+          anthropic: {options: {baseURL: 'https://proxy.example.test', apiKey: 'operator-inline-key'}, models: {x: {}}},
+          custom: {options: {baseURL: 'https://custom.example.test'}},
+        },
+      })
+
+      // #when
+      const {content} = build({opencodeConfig, providerKeyFiles: {anthropic: KEY_FILES.anthropic}})
+
+      // #then
+      expect(content.model).toBe('anthropic/claude-sonnet')
+      expect(content.provider).toEqual({
+        anthropic: {
+          options: {baseURL: 'https://proxy.example.test', apiKey: `{file:${KEY_FILES.anthropic}}`},
+          models: {x: {}},
+        },
+        custom: {options: {baseURL: 'https://custom.example.test'}},
+      })
+      expect(JSON.stringify(content)).not.toContain('operator-inline-key')
+    })
+
+    it('refuses a key file path that could end the reference early', () => {
+      const result = buildCIConfigV2(
+        {...BASE_INPUTS, providerKeyFiles: {anthropic: '/tmp/bad}path/anthropic.key'}},
+        createMockLogger(),
+      )
+
+      expect(unwrapErr(result)).toContain('anthropic')
+    })
+
+    it('does not log a key file path', () => {
+      const {logger} = build({providerKeyFiles: KEY_FILES})
+
+      const logged = serializeLoggerCalls(logger)
+      expect(logged).not.toContain('fro-bot-credentials')
+    })
+
+    it('still denies question, so no turn waits on an answer nobody can give', () => {
+      const {content} = build({providerKeyFiles: KEY_FILES})
+
+      expect(evaluatePermissionV2('question', '*', permissionsOf(content))).toBe('deny')
     })
   })
 })

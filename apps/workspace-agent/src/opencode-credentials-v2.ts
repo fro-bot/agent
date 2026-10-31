@@ -20,8 +20,26 @@
  * - `JSON.parse` errors quote the input, so they are never forwarded.
  */
 
-import type {OpenCodeV2ServerHandle} from '@fro-bot/runtime/workspace-v2'
+import type {CredentialRequestOptions, CredentialResult} from '@fro-bot/runtime/workspace-v2'
 import type {Logger} from './opencode-server.js'
+import {
+  boundedCredentialRequest,
+  credentialFailure,
+  modelProviderId,
+  spawnConfigFromMergedConfig,
+  verifyCredentialGate as verifySharedCredentialGate,
+} from '@fro-bot/runtime/workspace-v2'
+
+// The gate half (what counts as configured auth, the integration read-back) is shared with the Action and lives in
+// the runtime. These names stay importable from here.
+export {modelProviderId, spawnConfigFromMergedConfig}
+export type {
+  CredentialError,
+  CredentialErrorKind,
+  CredentialRequestOptions,
+  CredentialResult,
+  SpawnConfig,
+} from '@fro-bot/runtime/workspace-v2'
 
 /** One provider's API key, parsed from the credential blob. */
 export interface ProviderKeyEntry {
@@ -29,22 +47,7 @@ export interface ProviderKeyEntry {
   readonly key: string
 }
 
-export type CredentialErrorKind =
-  'credential-blob-invalid' | 'credential-missing' | 'credential-provision-failed' | 'model-config-invalid'
-
-/** A credential failure. `message` and `providers` carry provider ids and statuses, never a key or a response body. */
-export interface CredentialError {
-  readonly kind: CredentialErrorKind
-  readonly message: string
-  readonly providers?: readonly string[]
-}
-
-export type CredentialResult<T> =
-  {readonly success: true; readonly data: T} | {readonly success: false; readonly error: CredentialError}
-
-function fail(kind: CredentialErrorKind, message: string, providers?: readonly string[]): CredentialResult<never> {
-  return {success: false, error: {kind, message, ...(providers === undefined ? {} : {providers})}}
-}
+const fail = credentialFailure
 
 /** Same alphabet `deploy/scripts/validate-auth.mjs` enforces on provider ids. */
 const PROVIDER_ID_PATTERN = /^[\w.-]+$/
@@ -94,109 +97,6 @@ export function parseAuthBlob(raw: string): CredentialResult<readonly ProviderKe
   return {success: true, data: entries}
 }
 
-/** What the merged `opencode.json` says about the model and about authentication, with no secret value in it. */
-export interface SpawnConfig {
-  /** The `model` the spawn will use (`provider/model`), when the file names one. */
-  readonly model?: string
-  /** Providers that carry a non-empty inline credential setting in the file. Presence only: never the value. */
-  readonly authenticatedProviders: readonly string[]
-}
-
-/** The provider settings the resolver counts as configured authentication (`hasConfiguredAuth`, model-resolver.ts). */
-const INLINE_AUTH_KEYS = ['apiKey', 'authToken', 'accessToken'] as const
-
-/** A `{env:X}` or `{file:X}` reference whose target is empty or only whitespace: it can name nothing. */
-const EMPTY_REFERENCE = /\{(?:env|file):\s*\}/g
-
-/**
- * Whether an inline credential setting is present. A literal counts, and so does a `{file:...}` or `{env:...}`
- * reference with a non-empty target, because the server substitutes it before it resolves provider settings. Presence
- * only: the reference is NEVER resolved here. Root must not read a path or an environment variable that the agent
- * controls, and the value would be a secret in the supervisor's memory for nothing.
- *
- * Residual, accepted: a reference that resolves to nothing at load time (a missing or unreadable file, an unset variable)
- * passes the gate and then fails at the first model call with a 401, the same as before this gate existed. An empty
- * string, or a reference with an empty target (`{file:}`, `{env:}`), does not count.
- */
-function isConfiguredKey(value: unknown): boolean {
-  if (typeof value !== 'string') return false
-  return value.replaceAll(EMPTY_REFERENCE, '').trim() !== ''
-}
-
-function hasInlineAuth(provider: unknown): boolean {
-  if (!isRecord(provider)) return false
-  // V1-shaped `options` is migrated into V2 `settings`; V2-native config writes `settings` directly. Both are read.
-  return [provider.options, provider.settings].some(
-    bag => isRecord(bag) && INLINE_AUTH_KEYS.some(key => isConfiguredKey(bag[key])),
-  )
-}
-
-/**
- * The model and the authenticated providers of the merged `opencode.json` the entrypoint wrote and the server loads.
- * That file is the one place `deploy/scripts/merge-config.mjs` has already resolved env model against overlay model,
- * so this does not re-implement that rule. The error never quotes the file, which may hold an inline provider key from
- * the operator's overlay, and the result carries provider ids only.
- */
-export function spawnConfigFromMergedConfig(raw: string): CredentialResult<SpawnConfig> {
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(raw)
-  } catch {
-    return fail('model-config-invalid', 'The merged OpenCode config is not valid JSON')
-  }
-  if (!isRecord(parsed)) return fail('model-config-invalid', 'The merged OpenCode config is not a JSON object')
-  const model = typeof parsed.model === 'string' ? parsed.model.trim() : ''
-  const providers = isRecord(parsed.provider) ? parsed.provider : {}
-  const authenticatedProviders = Object.entries(providers)
-    .filter(([, provider]) => hasInlineAuth(provider))
-    .map(([providerId]) => providerId)
-  return {success: true, data: {...(model === '' ? {} : {model}), authenticatedProviders}}
-}
-
-/** The provider half of a `provider/model` string, or undefined when no model is configured. */
-export function modelProviderId(model: string | undefined): string | undefined {
-  const trimmed = model?.trim() ?? ''
-  if (trimmed === '') return undefined
-  const provider = trimmed.split('/')[0] ?? ''
-  return provider === '' ? undefined : provider
-}
-
-export interface CredentialRequestOptions {
-  /** The spawned server. Its `fetch` carries the Basic credential. */
-  readonly handle: Pick<OpenCodeV2ServerHandle, 'fetch'>
-  /** Bound on each request, headers and body together. */
-  readonly requestTimeoutMs: number
-  /** Service cancellation, joined with the per-request bound. */
-  readonly signal?: AbortSignal
-}
-
-/**
- * Runs one bounded request. The bound covers a body that stalls after its headers, which the transport may not honour
- * on its own. Any thrown error (network, timeout, abort) becomes `undefined`; the caller reports a status-free failure.
- */
-async function boundedRequest<T>(
-  options: CredentialRequestOptions,
-  send: (signal: AbortSignal) => Promise<T>,
-): Promise<T | undefined> {
-  const bound = AbortSignal.timeout(options.requestTimeoutMs)
-  const signal = options.signal === undefined ? bound : AbortSignal.any([options.signal, bound])
-  try {
-    return await new Promise<T>((resolve, reject) => {
-      const onAbort = (): void => reject(signal.reason)
-      if (signal.aborted) {
-        onAbort()
-        return
-      }
-      signal.addEventListener('abort', onAbort, {once: true})
-      send(signal)
-        .then(resolve, reject)
-        .finally(() => signal.removeEventListener('abort', onAbort))
-    })
-  } catch {
-    return undefined
-  }
-}
-
 /**
  * Stores each key in the spawn's credential store. Stops at the first failure, so a half-provisioned server never
  * reaches the gate. Returns the provider ids it stored.
@@ -206,7 +106,7 @@ export async function provisionCredentials(
 ): Promise<CredentialResult<readonly string[]>> {
   const stored: string[] = []
   for (const {providerId, key} of options.entries) {
-    const status = await boundedRequest(options, async signal => {
+    const status = await boundedCredentialRequest(options, async signal => {
       const response = await options.handle.fetch('/api/credential', {
         method: 'POST',
         headers: {'content-type': 'application/json'},
@@ -240,14 +140,6 @@ export async function provisionCredentials(
   return {success: true, data: stored}
 }
 
-/** True when the integration response lists a connection that can authenticate a request. */
-function hasUsableConnection(body: unknown): boolean {
-  if (!isRecord(body) || !isRecord(body.data) || !Array.isArray(body.data.connections)) return false
-  return body.data.connections.some(
-    connection => isRecord(connection) && (connection.type === 'credential' || connection.type === 'env'),
-  )
-}
-
 /**
  * The fail-loud gate. Each required provider must either carry an inline credential setting in the merged config
  * (`configuredAuth`; the integration listing omits those) or have `GET /api/integration/<provider>` list a `credential`
@@ -260,25 +152,5 @@ export async function verifyCredentialGate(
     readonly configuredAuth?: readonly string[]
   },
 ): Promise<CredentialResult<readonly string[]>> {
-  const missing: string[] = []
-  for (const providerId of options.providers) {
-    if (options.configuredAuth?.includes(providerId) === true) continue
-    const usable = await boundedRequest(options, async signal => {
-      const response = await options.handle.fetch(`/api/integration/${encodeURIComponent(providerId)}`, {signal})
-      if (response.status !== 200) {
-        await response.body?.cancel().catch(() => undefined)
-        return false
-      }
-      return hasUsableConnection(await response.json())
-    })
-    if (usable !== true) missing.push(providerId)
-  }
-  if (missing.length > 0) {
-    return fail(
-      'credential-missing',
-      `No credential for provider(s): ${missing.join(', ')}. Provision the workspace-opencode-auth secret.`,
-      missing,
-    )
-  }
-  return {success: true, data: options.providers}
+  return verifySharedCredentialGate({...options, remedy: 'Provision the workspace-opencode-auth secret.'})
 }

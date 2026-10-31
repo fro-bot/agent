@@ -1,4 +1,4 @@
-import {describe, expect, it, vi} from 'vitest'
+import {afterEach, describe, expect, it, vi} from 'vitest'
 
 import {MIGRATION_V1_STATUS_PATH, MIGRATION_V1_STATUS_TIMEOUT_MS, readV1MigrationStatus} from './migration-status-v2.js'
 
@@ -190,5 +190,138 @@ describe('readV1MigrationStatus', () => {
     // #then
     expect(seen).toHaveLength(1)
     expect(seen[0]?.aborted).toBe(true)
+  })
+
+  describe('bounds under fake timers', () => {
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    it('ends a fetch that never resolves as unreadable (timeout) at the 5000 ms default', async () => {
+      // #given a fetch that never settles and no timeoutMs
+      vi.useFakeTimers()
+      const fetch = vi.fn(async () => new Promise<Response>(() => {}))
+      let settled: unknown
+
+      // #when
+      const pending = readV1MigrationStatus({fetch}).then(reading => {
+        settled = reading
+        return reading
+      })
+      await vi.advanceTimersByTimeAsync(MIGRATION_V1_STATUS_TIMEOUT_MS - 1)
+
+      // #then it is still waiting one millisecond before the default bound
+      expect(settled).toBeUndefined()
+
+      // #when the bound passes
+      await vi.advanceTimersByTimeAsync(1)
+
+      // #then
+      expect(await pending).toEqual({status: 'unreadable', reason: 'timeout'})
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it('reads as aborted when the caller aborts while the response body is still being consumed', async () => {
+      // #given headers have arrived and the body stalls, ignoring every signal
+      vi.useFakeTimers()
+      const controller = new AbortController()
+      let bodyRequested = false
+      const stalled = {
+        ok: true,
+        status: 200,
+        json: async () => {
+          bodyRequested = true
+          return new Promise<unknown>(() => {})
+        },
+      } as unknown as Response
+
+      // #when the caller aborts once the body read has started
+      const pending = readV1MigrationStatus({fetch: serving(stalled), signal: controller.signal, timeoutMs: 60_000})
+      await vi.advanceTimersByTimeAsync(10)
+      expect(bodyRequested).toBe(true)
+      controller.abort()
+
+      // #then it settles at once as aborted, long before the bound
+      expect(await pending).toEqual({status: 'unreadable', reason: 'aborted'})
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it('reads as aborted when a real streaming body is cut off by the caller mid-read', async () => {
+      // #given a streaming body that has sent one chunk and then stops
+      vi.useFakeTimers()
+      const controller = new AbortController()
+      const body = new ReadableStream<Uint8Array>({
+        start(stream) {
+          stream.enqueue(new TextEncoder().encode('{"status":'))
+        },
+      })
+      const response = new Response(body, {status: 200, headers: {'content-type': 'application/json'}})
+
+      // #when
+      const pending = readV1MigrationStatus({fetch: serving(response), signal: controller.signal, timeoutMs: 60_000})
+      await vi.advanceTimersByTimeAsync(10)
+      controller.abort()
+
+      // #then
+      expect(await pending).toEqual({status: 'unreadable', reason: 'aborted'})
+    })
+
+    it('settles an HTTP error as unreadable (http) when cancelling its body rejects', async () => {
+      // #given
+      const failing = {
+        ok: false,
+        status: 503,
+        body: {cancel: async () => Promise.reject(new Error('stream already errored'))},
+      } as unknown as Response
+
+      // #when
+      const reading = await readV1MigrationStatus({fetch: serving(failing)})
+
+      // #then
+      expect(reading).toEqual({status: 'unreadable', reason: 'http', httpStatus: 503})
+    })
+
+    it('settles an HTTP error as unreadable (http) when cancelling its body throws synchronously', async () => {
+      // #given
+      const throwing = {
+        ok: false,
+        status: 502,
+        body: {
+          cancel: () => {
+            throw new TypeError('locked')
+          },
+        },
+      } as unknown as Response
+
+      // #when
+      const reading = await readV1MigrationStatus({fetch: serving(throwing)})
+
+      // #then
+      expect(reading).toEqual({status: 'unreadable', reason: 'http', httpStatus: 502})
+    })
+
+    it('settles an HTTP error whose body cancellation stalls as unreadable within the bound', async () => {
+      // #given a cancel() that never resolves
+      vi.useFakeTimers()
+      const stalling = {
+        ok: false,
+        status: 503,
+        body: {cancel: async () => new Promise<void>(() => {})},
+      } as unknown as Response
+      let settled = false
+
+      // #when
+      const pending = readV1MigrationStatus({fetch: serving(stalling)}).then(reading => {
+        settled = true
+        return reading
+      })
+      await vi.advanceTimersByTimeAsync(MIGRATION_V1_STATUS_TIMEOUT_MS)
+      const reading = await pending
+
+      // #then the HTTP status is still reported, it settled, and no timer is left behind
+      expect(settled).toBe(true)
+      expect(reading).toEqual({status: 'unreadable', reason: 'http', httpStatus: 503})
+      expect(vi.getTimerCount()).toBe(0)
+    })
   })
 })
