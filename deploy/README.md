@@ -570,14 +570,14 @@ A major of 2 or higher selects the V2 path; the value must equal the pin's `vers
 
 **Paired deploy.** Deploy a gateway that includes the V2 run loop (#1985) before the V2 workspace, or together with it, from the same ref. A gateway without that loop runs the V1 loop against a V2 server, which is unsafe. A V2-capable gateway in front of a V1 workspace is safe. The shared control-API token requirement above applies to both.
 
-**Bumping the pin.** Renovate opens a PR that changes only `version` (major 2 only; no automerge). Regenerate the digests before merging:
+**Bumping the pin.** Renovate opens the PR (major 2 only; no automerge). It changes `version`, then its post-upgrade tasks run `bun run postupgrade` (`scripts/sync-opencode-v2-pin.ts`), which rewrites every asset digest from the release's `SHA256SUMS`, before the build. The PR already carries matching digests. To run the same step by hand:
 
 ```bash
-node scripts/sync-opencode-v2-pin.ts            # rewrite the digests from the release's SHA256SUMS
-node scripts/sync-opencode-v2-pin.ts --check    # exit 1 if the file disagrees with upstream
+bun scripts/sync-opencode-v2-pin.ts            # rewrite the digests from the release's SHA256SUMS
+bun scripts/sync-opencode-v2-pin.ts --check    # exit 1 if the file disagrees with upstream
 ```
 
-Commit the updated `opencode-v2-pin.json`. The **Workspace Image Smoke Test** CI job builds the image against the pin, starts it with no network, and fails on a stale digest.
+The **Workspace Image Smoke Test** CI job builds the image against the pin, starts it with no network, and fails on a stale digest.
 
 **Revert.** Before switching, record the digests of the running workspace and gateway images. To revert, redeploy those previous workspace and gateway images by digest. Rebuilding an older ref does not reproduce the same digests.
 
