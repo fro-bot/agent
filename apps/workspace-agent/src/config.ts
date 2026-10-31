@@ -25,7 +25,7 @@ class SecretFileNotFoundError extends Error {
  * and read), then `fstatSync` on the already-open file descriptor to confirm
  * the file is a regular file under the size limit.
  */
-function readSecretFile(filePath: string): string {
+function readSecretFile(filePath: string, maxBytes: number = MAX_SECRET_BYTES): string {
   let fd: number
   try {
     fd = openSync(filePath, constants.O_RDONLY | constants.O_NOFOLLOW)
@@ -50,8 +50,8 @@ function readSecretFile(filePath: string): string {
         `Secret path is not a regular file: ${filePath} (got ${kind}). FIFOs, devices, and directories are not supported.`,
       )
     }
-    if (stat.size > MAX_SECRET_BYTES) {
-      throw new Error(`Secret file is too large: ${filePath} (${stat.size} bytes > ${MAX_SECRET_BYTES} byte limit).`)
+    if (stat.size > maxBytes) {
+      throw new Error(`Secret file is too large: ${filePath} (${stat.size} bytes > ${maxBytes} byte limit).`)
     }
     return readFileSync(fd, 'utf8')
   } finally {
@@ -113,6 +113,34 @@ export function readOptionalSecret(name: string): string | null {
   }
 
   return null
+}
+
+/**
+ * Read an optional secret file that holds a JSON blob, with the same hardened open as `readOptionalSecret`:
+ * `O_NOFOLLOW`, regular file only, size cap. Unlike `readOptionalSecret` it takes a path, has no env-var fallback, and
+ * accepts embedded line breaks, because the credential blob is JSON an operator may have pretty-printed (the
+ * entrypoint tolerates that too). Returns null when the file is absent or blank. Never logs the contents.
+ */
+export function readOptionalSecretBlob(filePath: string): string | null {
+  return readOptionalBoundedFile(filePath, MAX_SECRET_BYTES)
+}
+
+/** Size cap for the merged `opencode.json`, which carries provider and model definitions, not a secret. */
+export const MAX_CONFIG_FILE_BYTES = 512 * 1024
+
+/**
+ * `readOptionalSecretBlob` with a caller-chosen size cap: the same `O_NOFOLLOW`, regular-file-only open, for a file an
+ * unprivileged uid can write (the merged config), so a planted symlink cannot redirect a root read.
+ */
+export function readOptionalBoundedFile(filePath: string, maxBytes: number): string | null {
+  let contents: string
+  try {
+    contents = readSecretFile(filePath, maxBytes)
+  } catch (error) {
+    if (error instanceof SecretFileNotFoundError) return null
+    throw error
+  }
+  return contents.trim() === '' ? null : contents
 }
 
 /**

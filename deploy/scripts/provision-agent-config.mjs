@@ -108,9 +108,12 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   if (result.authProvisioned) {
     process.stderr.write('workspace-entrypoint: auth: provisioned\n')
   }
+  // What this checked: WORKSPACE_OPENCODE_CONFIG was a non-empty string and was merged into the on-disk opencode.json.
+  // It says nothing about whether the server loaded a provider from it or holds a credential for it (fro-bot/agent#1992
+  // went unnoticed behind the old wording, `applied`). On V2 the credential gate in the supervisor answers that.
   process.stderr.write(
     `workspace-entrypoint: opencode config: model=${modelRaw.trim() !== '' ? 'set' : 'default'}, ` +
-      `provider-overlay=${overlayRaw.trim() !== '' ? 'applied' : 'none'}\n`,
+      `provider-overlay=${overlayRaw.trim() !== '' ? 'merged-into-config-file' : 'none'}\n`,
   )
   process.exit(0)
 }
