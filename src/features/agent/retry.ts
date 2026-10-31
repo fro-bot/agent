@@ -413,7 +413,7 @@ async function startV2SessionWait(
   }
 }
 
-type StreamConnectOutcome = 'connected' | 'stream-ended' | 'timeout' | 'deadline'
+export type StreamConnectOutcome = 'connected' | 'stream-ended' | 'timeout' | 'deadline'
 
 /**
  * Waits for the event stream's `server.connected` frame, or for the reason it will not come.
@@ -422,7 +422,7 @@ type StreamConnectOutcome = 'connected' | 'stream-ended' | 'timeout' | 'deadline
  * deadline-bounded step); `timeout` means the full 10 s passed with time to spare; `stream-ended` means the stream
  * ended, or the attempt was cancelled, first.
  */
-async function awaitStreamConnected(options: {
+export async function awaitStreamConnected(options: {
   readonly connected: Promise<void>
   readonly streamEnded: Promise<unknown>
   readonly signal: AbortSignal
@@ -474,7 +474,7 @@ async function awaitStreamConnected(options: {
  * `cause` is the discontinuity recorded when an error ended the stream, if one did; only its name and message are
  * surfaced.
  */
-function createStreamNotConnectedResult(
+export function createStreamNotConnectedResult(
   reason: 'timeout' | 'stream-ended',
   logger: Logger,
   sessionId: string,
