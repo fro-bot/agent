@@ -1,5 +1,22 @@
 export {ATTACHMENT_DIR_SEGMENT, buildAttachmentDir, createAttachmentDirExclusive} from './attachment-dir.js'
 export {
+  boundedCredentialRequest,
+  credentialFailure,
+  modelProviderId,
+  spawnConfigFromConfig,
+  spawnConfigFromMergedConfig,
+  verifyCredentialGate,
+} from './credential-gate-v2.js'
+
+export type {
+  CredentialError,
+  CredentialErrorKind,
+  CredentialRequestOptions,
+  CredentialResult,
+  SpawnConfig,
+  VerifyCredentialGateOptions,
+} from './credential-gate-v2.js'
+export {
   awaitDirectoryStability,
   createDirectoryStabilityGate,
   DIRECTORY_INBOX_READ_CONCURRENCY,
@@ -12,7 +29,6 @@ export {
   observeDirectoryV2,
   ownedSessionIdsOf,
 } from './directory-quiescence-v2.js'
-
 export type {
   AwaitDirectoryStabilityOptions,
   AwaitDirectoryStabilityResult,
@@ -26,6 +42,7 @@ export type {
   InboxScope,
   ObserveDirectoryOptions,
 } from './directory-quiescence-v2.js'
+
 export {
   createAgentError,
   createErrorInfo,
@@ -42,7 +59,6 @@ export {
   retrySignalFromStatus,
   terminalSignalFromPayload,
 } from './error-format/provider-failure.js'
-
 export type {
   ProviderFailureClassification,
   ProviderFailureEvidence,

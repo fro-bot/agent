@@ -5,6 +5,7 @@ import {createReadStream, readFileSync} from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
+import {selectOpenCodeGeneration} from '@fro-bot/runtime'
 import v2PinFile from '../../../packages/runtime/src/shared/opencode-v2-pin.json'
 import {toErrorMessage} from '../../shared/errors.js'
 
@@ -103,11 +104,12 @@ export function toolCacheVersion(version: string): string {
 /**
  * Returns true when the version's major is 2 or higher (a V2 pin), with or without a `v` prefix.
  *
- * Anything that does not start with a numeric major (e.g. `latest`) is not a V2 pin.
+ * The rule is the runtime's `selectOpenCodeGeneration`, the one selector every caller shares. Anything it cannot read
+ * (e.g. `latest`) is not a V2 pin.
  */
 export function isV2Version(version: string): boolean {
-  const major = /^v?(\d+)\./.exec(version)?.[1]
-  return major !== undefined && Number(major) >= 2
+  const generation = selectOpenCodeGeneration(version)
+  return generation.success && generation.data === 'v2'
 }
 
 /**
