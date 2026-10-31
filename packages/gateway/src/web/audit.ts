@@ -151,7 +151,9 @@ export interface ApprovalDecisionEvent {
   readonly requestId: string
   /**
    * Pass-through enum: 'once' | 'always' | 'reject' — never a free-form string.
-   * 'always' is the higher-blast-radius grant (persists as an OpenCode always-rule).
+   * 'always' approves this request and answers later matching requests from the same run (and its owned
+   * sessions) without asking, for the rest of that run only. The gateway keeps that grant in memory and
+   * sends 'once' upstream, so no OpenCode always-rule is ever stored and nothing outlives the run.
    * 'once' approves for this request only. 'reject' denies.
    */
   readonly decision: 'once' | 'always' | 'reject'

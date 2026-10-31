@@ -333,6 +333,7 @@ type SettlementActor = QuestionSettlement['actor']
 
 function actorLabel(actor: SettlementActor): string | null {
   if (actor === null) return null
+  if (actor.kind === 'run-grant') return null
   if (actor.kind === 'discord-user') return /^\d{1,25}$/.test(actor.userId) ? `<@${actor.userId}>` : null
   const login = boundQuestionText(actor.login, 64).trim()
   return login.length === 0 ? null : escapeText(login)

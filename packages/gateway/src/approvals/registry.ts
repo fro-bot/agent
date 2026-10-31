@@ -56,9 +56,11 @@ import type {GatewayLogger} from '../discord/client.js'
 import type {ApprovalRequestDetail} from '../operator-contract/approval-frame.js'
 import type {PermissionReply, PermissionReplyEvent, PermissionRequest, SettlementReason} from './coordinator.js'
 import type {ApprovalGateEntry, GateActor, RequestGate, ScopePolicy, TerminalOutcome} from './request-gate.js'
+import type {EchoWait} from './run-grants.js'
 
 import {boundApprovalDetail} from './approval-detail.js'
 import {createRequestGate} from './request-gate.js'
+import {startEchoWait} from './run-grants.js'
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -211,6 +213,13 @@ export interface ApprovalRegistry {
     readonly actor: ApprovalActor
   }) => Promise<DecisionOutcome>
   /**
+   * Settle an open approval from the run's own grant (an operator's earlier Always): claim it through the same
+   * single-winner gate an operator click uses, and send `once`. An operator click that already claimed the entry
+   * wins (`already-claimed`, nothing is sent); one that arrives while this reply is in flight is refused. The card
+   * closes through the usual `permission.replied` echo, attributed to no person. `reply-failed` reopens the entry.
+   */
+  autoApprove: (requestID: string) => Promise<DecisionOutcome>
+  /**
    * Authoritative settlement from `permission.replied`.
    * - Entry `open` → OpenCode-initiated (unsolicited or always-rule): render, clear timer, delete. No POST.
    * - Entry `claimed` → echo of our own button POST: render with event.reply, clear timer, delete.
@@ -249,6 +258,8 @@ export interface ApprovalPayload {
   /** Set by attachMessage once the approval notification is posted. */
   renderFn: RenderFn | null
 }
+
+const RUN_GRANT_ACTOR: GateActor = {kind: 'run-grant'}
 
 /** Approvals keep strict scope binding: the acting scope must equal the entry's scope. */
 const approvalScopePolicy: ScopePolicy = (entry, request) => entry.scopeId === request.scopeId
@@ -476,6 +487,69 @@ export function createApprovalRegistry(deps: {
   }
 
   // -------------------------------------------------------------------------
+  // autoApprove — a run grant settling an open ask
+  // -------------------------------------------------------------------------
+
+  /** Echo waits of auto-approves whose reply failed, by request id. The entry stays `claimed` while one is open. */
+  const echoWaits = new Map<string, EchoWait>()
+
+  /**
+   * Send the `once` for an auto-approve. A failed or thrown reply is ambiguous (OpenCode may have accepted it and only
+   * the response was lost), so the entry stays claimed for a bounded wait for its `permission.replied` echo, which
+   * settles it. Only when none comes does the failure reach the gate, which reopens the entry to the operator. A run
+   * that is ending skips the wait: the failure then takes the gate's disposed path (one recovery reject, no reopen).
+   */
+  async function postAutoApprove(entry: ApprovalGateEntry): Promise<{readonly ok: boolean; readonly error?: string}> {
+    const {requestID} = entry
+    const {effects, directory} = entry.payload
+    let result: {readonly ok: boolean; readonly error?: string}
+    try {
+      result = await effects.postReply(requestID, directory, 'once')
+    } catch {
+      result = {ok: false, error: 'threw'}
+    }
+    if (result.ok) return result
+    // Disposed, but the entry stays in the gate until its render finishes, so the check below cannot see it: the
+    // failure must take the gate's disposed path now (one recovery reject, no reopen), not wait out an echo.
+    if (entry.state === 'disposed') return result
+    // Not disposed, yet gone from the gate: the echo settled it while the reply was in flight, so it was accepted.
+    if (getEntry(requestID) !== entry) return {ok: true}
+
+    const wait = startEchoWait()
+    echoWaits.set(requestID, wait)
+    const ended = await wait.outcome
+    echoWaits.delete(requestID)
+    return ended === 'echo' ? {ok: true} : result
+  }
+
+  async function autoApprove(requestID: string): Promise<DecisionOutcome> {
+    const entry = getEntry(requestID)
+    if (entry === undefined) return 'not-found'
+
+    // The grant acts inside the entry's own scope, so the strict scope policy passes by construction.
+    const admission = gate.admit(entry, {scopeId: entry.scopeId, actor: RUN_GRANT_ACTOR}, approvalScopePolicy)
+    if (admission.kind === 'scope-mismatch') return 'channel-mismatch'
+    if (admission.kind === 'already-claimed') return 'already-claimed'
+
+    // eslint-disable-next-line @typescript-eslint/promise-function-async
+    const outcome = await admission.submit(() => postAutoApprove(entry))
+    switch (outcome) {
+      case 'ok':
+        return 'ok'
+      case 'already-claimed':
+        return 'already-claimed'
+      case 'not-found':
+        return 'not-found'
+      case 'reply-failed':
+        // Same teardown rule as an operator reply: nothing owns the permission any more, so deny it once.
+        if (entry.state === 'disposed' && entry.recoveryStarted !== true) {
+          await rejectAfterDisposedReplyFailure(entry)
+        }
+        return 'reply-failed'
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // confirmReply — authoritative path for permission.replied
   // -------------------------------------------------------------------------
 
@@ -507,6 +581,9 @@ export function createApprovalRegistry(deps: {
       // Open entry: OpenCode-initiated (unsolicited reject or always-rule). No POST needed.
       logger.info({requestID, state: entry.state, reply}, 'ApprovalRegistry: confirmReply — OpenCode-initiated')
     }
+
+    // An auto-approve waiting on this echo is answered: it settles below and must not be reopened.
+    echoWaits.get(requestID)?.end('echo')
 
     // Render asynchronously (best-effort; errors logged by the gate).
     // eslint-disable-next-line no-void
@@ -586,7 +663,11 @@ export function createApprovalRegistry(deps: {
       // A claimed entry's reply may still be in flight. Mark the entry disposed so the gate never
       // reopens it when that reply fails, and so `handleDecision` can deny the permission once the
       // reply settles. A reply that already succeeded awaits its echo, which finds nothing to settle.
-      if (reason === 'disposed' && entry.state === 'claimed') entry.state = 'disposed'
+      if (reason === 'disposed' && entry.state === 'claimed') {
+        entry.state = 'disposed'
+        // An auto-approve waiting for its echo stops waiting: the run is over, so its failure takes the disposed path.
+        echoWaits.get(requestID)?.end('cancelled')
+      }
 
       // For non-replied/non-cascade reasons on open entries: best-effort postReply.
       // Skip if already claimed/confirmed (postReply was or is being sent).
@@ -624,6 +705,7 @@ export function createApprovalRegistry(deps: {
     hasPendingForScope,
     describePendingForScope,
     handleDecision,
+    autoApprove,
     confirmReply,
     applySettlement,
     disposeRun: async (sessionID, reason) => gate.disposeFamilyRun('approval', sessionID, reason),

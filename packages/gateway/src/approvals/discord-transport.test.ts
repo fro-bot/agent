@@ -108,6 +108,7 @@ function makeApprovalRegistry(overrides: Partial<ApprovalRegistry> = {}): Approv
     handleDecision: vi.fn(),
     confirmReply: vi.fn(),
     applySettlement: vi.fn().mockResolvedValue(undefined),
+    autoApprove: vi.fn().mockResolvedValue('not-found'),
     disposeRun: vi.fn().mockResolvedValue(undefined),
     disposeAll: vi.fn().mockResolvedValue(undefined),
     ...overrides,

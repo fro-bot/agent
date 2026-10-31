@@ -10,28 +10,29 @@ function makeClient(reply: ReturnType<typeof vi.fn>): RemoteOpenCodeV2Client {
 }
 
 describe('createPostReplyFactoryV2', () => {
-  it.each(['once', 'always', 'reject'] as const)(
-    'sends %s keyed by the request id on the asking session',
-    async decision => {
-      // #given
-      const reply = vi.fn().mockResolvedValue(ok(undefined))
-      const postReply = createPostReplyFactoryV2(makeClient(reply))('ses_1')
+  it.each([
+    ['once', 'once'],
+    ['always', 'once'],
+    ['reject', 'reject'],
+  ] as const)('sends %s as %s keyed by the request id on the asking session', async (decision, sent) => {
+    // #given
+    const reply = vi.fn().mockResolvedValue(ok(undefined))
+    const postReply = createPostReplyFactoryV2(makeClient(reply))('ses_1')
 
-      // #when
-      const result = await postReply('per_a', '/workspace/repos/o/r', decision)
+    // #when
+    const result = await postReply('per_a', '/workspace/repos/o/r', decision)
 
-      // #then
-      expect(result).toEqual({ok: true})
-      const input = reply.mock.calls[0]?.[0] as {
-        sessionId: string
-        requestId: string
-        decision: string
-        signal: unknown
-      }
-      expect(input).toMatchObject({sessionId: 'ses_1', requestId: 'per_a', decision})
-      expect(input.signal).toBeInstanceOf(AbortSignal)
-    },
-  )
+    // #then
+    expect(result).toEqual({ok: true})
+    const input = reply.mock.calls[0]?.[0] as {
+      sessionId: string
+      requestId: string
+      decision: string
+      signal: unknown
+    }
+    expect(input).toMatchObject({sessionId: 'ses_1', requestId: 'per_a', decision: sent})
+    expect(input.signal).toBeInstanceOf(AbortSignal)
+  })
 
   it('keeps two nested approvals from one execute call distinct', async () => {
     // #given — one execute call asked twice; the two replies differ

@@ -19,7 +19,10 @@ import type {ApprovalActor, DecisionOutcome} from '../approvals/registry.js'
 // PermissionReply — sole definer (coordinator.ts re-exports from here)
 // ---------------------------------------------------------------------------
 
-/** Reply verbs accepted by the OpenCode permission reply endpoint. */
+/**
+ * Operator decision verbs. `always` means "for the rest of this run": the gateway keeps the grant in memory for the
+ * run and its owned sessions, and sends `once` upstream, so OpenCode never stores a grant that outlives the run.
+ */
 export type PermissionReply = 'once' | 'always' | 'reject'
 
 // ---------------------------------------------------------------------------

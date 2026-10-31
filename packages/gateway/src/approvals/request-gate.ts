@@ -80,8 +80,13 @@ export interface DiscordApprovalActor {
 /** A web operator who acted through the control surface (alias of the canonical identity). */
 export type WebOperatorActor = OperatorIdentity
 
+/** The run's own grant (an operator's earlier Always) settling an ask: no person acted. */
+export interface RunGrantActor {
+  readonly kind: 'run-grant'
+}
+
 /** Transport-neutral actor identity, discriminated on `kind`. */
-export type GateActor = DiscordApprovalActor | WebOperatorActor
+export type GateActor = DiscordApprovalActor | WebOperatorActor | RunGrantActor
 
 // ---------------------------------------------------------------------------
 // Entries

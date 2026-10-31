@@ -305,7 +305,12 @@ export function createDiscordApprovalOnPending(
                 // Derive a display string from the typed actor for the settled embed.
                 // Discord-specific: extract the userId for the decidedBy display.
                 // For web operators, use the display login (mutable but human-readable for embeds).
-                const decidedBy = actor === null ? null : actor.kind === 'discord-user' ? actor.userId : actor.login
+                const decidedBy =
+                  actor === null || actor.kind === 'run-grant'
+                    ? null
+                    : actor.kind === 'discord-user'
+                      ? actor.userId
+                      : actor.login
                 const editResult = await editMessage(
                   postedMessage,
                   {

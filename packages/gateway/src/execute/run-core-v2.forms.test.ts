@@ -83,6 +83,23 @@ describe('permission asks', () => {
     await vi.advanceTimersByTimeAsync(20_000)
   })
 
+  it('carries the ask’s save list, so the run can keep an operator Always as a run-local grant', async () => {
+    // #given — a captured ask delivers `save` (the patterns upstream would store on `always`)
+    const coordinator = makeCoordinator()
+    const run = startRun({coordinator})
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #when
+    run.emit(frames.permissionAsked('per_a', ROOT, 'shell', 'rm -rf build'))
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #then
+    const request = vi.mocked(coordinator.onPermissionAsked).mock.calls[0]?.[0]
+    expect(request?.alwaysPatterns).toEqual(['*'])
+    run.close()
+    await vi.advanceTimersByTimeAsync(20_000)
+  })
+
   it('forwards the authoritative reply for each request on its own', async () => {
     // #given
     const coordinator = makeCoordinator()

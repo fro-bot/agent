@@ -137,6 +137,11 @@ export type V2DomainEvent =
       readonly sessionId: string
       readonly action: string
       readonly resources: readonly string[]
+      /**
+       * `save` as delivered on the ask: the patterns upstream would store if the operator replied `always`. Empty when
+       * the ask carries none. The gateway never sends `always`; it keeps these as a run-local grant instead.
+       */
+      readonly save: readonly string[]
       /** The tool-call id that raised the ask. For a nested `execute` call this is the `execute` call id. */
       readonly sourceToolCallId: string | null
       readonly message: string | null
@@ -398,12 +403,15 @@ function mapPermissionAsked(data: unknown): V2DomainEvent {
   const resources = Array.isArray(rawResources)
     ? rawResources.filter((resource): resource is string => typeof resource === 'string')
     : []
+  const rawSave = getObjectProperty(data, 'save')
+  const save = Array.isArray(rawSave) ? rawSave.filter((pattern): pattern is string => typeof pattern === 'string') : []
   return {
     kind: 'permission_asked',
     requestId,
     sessionId,
     action,
     resources,
+    save,
     sourceToolCallId: getStringProperty(getObjectProperty(data, 'source'), 'id'),
     message: getStringProperty(data, 'message'),
   }
