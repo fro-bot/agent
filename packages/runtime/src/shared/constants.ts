@@ -57,7 +57,7 @@ export const DEFAULT_MODEL = {
 // releases, checksum-verified, and fail-closed on mismatch — no silent stock fallback.
 // FALLBACK_VERSION (in opencode.ts) is the plain stock base used when latest-fetch fails.
 export const DEFAULT_OPENCODE_VERSION = '1.19.4+harness.5bde2635'
-export const DEFAULT_SYSTEMATIC_VERSION = '3.28.0'
+export const DEFAULT_SYSTEMATIC_VERSION = '3.29.0'
 
 // Systematic for OpenCode V2. 3.27.x loads on both V1 and V2, so the V2 path installs DEFAULT_SYSTEMATIC_VERSION too
 // and there is no separate V2 pin. The plugin id is the `id` of the object the package's default export carries
