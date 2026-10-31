@@ -86,6 +86,14 @@ function parseStatus(body: unknown): V1MigrationStatusReading {
   }
 }
 
+function releaseBody(response: Response): void {
+  try {
+    response.body?.cancel().catch(() => {})
+  } catch {
+    // A body that cannot be cancelled is already unusable; there is nothing further to release.
+  }
+}
+
 async function readOnce(
   fetchStatus: OpenCodeV2ServerHandle['fetch'],
   signal: AbortSignal,
@@ -97,8 +105,9 @@ async function readOnce(
     return {status: 'unreadable', reason: 'network'}
   }
   if (!response.ok) {
-    // Release the connection; the body of an error answer is of no use here.
-    await response.body?.cancel().catch(() => {})
+    // Release the connection; the body of an error answer is of no use here. Not awaited: a cancel that stalls must not
+    // hold back the status, and one that throws or rejects must not turn this read into a throw.
+    releaseBody(response)
     return {status: 'unreadable', reason: 'http', httpStatus: response.status}
   }
   try {
