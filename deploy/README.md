@@ -415,7 +415,7 @@ All privileged operator endpoints are under `/operator/` and require a valid ses
 | `GET` | `/operator/runs` | Session | Session-gated, binding-scoped, denylist-filtered run enumeration; returns `{runs: RunSummary[]}` newest-first, capped at 100; mounts only when both the approval and question registries are wired, like the other dependency-gated routes |
 | `POST` | `/operator/runs` | Session + CSRF | Launch a run against a bound repo (returns 202 `{runId}`). The prompt is checked before the repository: over 8,000 UTF-16 code units is `400 {error: 'bad request', reason: 'prompt-too-long'}`, empty is `400 {error: 'prompt is required'}` |
 | `GET` | `/operator/runs/:runId/stream` | Session | SSE stream of run status/output (binding and denylist re-checked continuously) |
-| `POST` | `/operator/runs/:runId/approvals/:requestId/decision` | Session + CSRF | Submit a tool-approval decision (once/always/reject) |
+| `POST` | `/operator/runs/:runId/approvals/:requestId/decision` | Session + CSRF | Submit a tool-approval decision (once/always/reject); `always` holds for the rest of that run only |
 | `GET` | `/operator/runs/:runId/approvals` | Session | List pending tool-approval requests for a run |
 | `POST` | `/operator/runs/:runId/questions/:requestId/decision` | Session + CSRF | Answer or skip an agent question (`{decision: 'skip'}` or `{decision: 'answer', answers}`; options by index, free text up to 4,000 characters; a refused body is `400 {error: 'bad request', reason, questionIndex}`) |
 | `GET` | `/operator/runs/:runId/questions` | Session | List pending agent-question requests for a run |

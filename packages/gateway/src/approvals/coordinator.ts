@@ -29,6 +29,7 @@
 
 import type {GatewayLogger} from '../discord/client.js'
 import type {PermissionReply} from '../operator-contract/approval.js'
+import type {RunGrants} from './run-grants.js'
 
 import {getObjectProperty, getStringProperty, toErrorMessage} from '@fro-bot/runtime'
 
@@ -58,6 +59,12 @@ export interface PermissionRequest {
   readonly permission: string
   /** Patterns the gate matched, e.g. `["/tmp/x/*"]`. May be empty. */
   readonly patterns: readonly string[]
+  /**
+   * The patterns an `always` reply on this ask would have saved upstream: `save` on a V2 ask, `always` on a V1 one.
+   * The gateway never sends `always` upstream; it keeps these as a run-local grant instead (see `run-grants.ts`).
+   * Absent or empty when the ask carried none (`parsePermissionRequest` always sets it).
+   */
+  readonly alwaysPatterns?: readonly string[]
   /** Human-readable, redaction-safe summary for the Discord embed. */
   readonly title: string
   /**
@@ -157,6 +164,17 @@ export interface PermissionCoordinatorDeps {
    * 'replied' from the coordinator's perspective — cascade is in the registry).
    */
   readonly onSettled?: (requestID: string, reply: PermissionReply, reason: SettlementReason) => void
+  /**
+   * Run-local grants: lets an ask this run's earlier operator `always` already covers be answered `once` without
+   * showing an approval. Absent: every ask goes to the operator, as before.
+   */
+  readonly runGrants?: {
+    readonly grants: RunGrants
+    /** Stamped on the auto-answer log line. */
+    readonly runId: string
+    /** Post the upstream reply for an ask: `once` for a covered ask, `reject` for one the run can no longer answer. */
+    readonly answer: (request: PermissionRequest, decision: 'once' | 'reject') => Promise<{readonly ok: boolean}>
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +223,7 @@ export function parsePermissionRequest(payload: unknown): PermissionRequest | nu
   if (requestID == null || sessionID == null) return null
   const permission = getStringProperty(payload, 'permission') ?? 'unknown'
   const patterns = getStringArray(payload, 'patterns')
+  const alwaysPatterns = getStringArray(payload, 'always')
   const metadata = getObjectProperty(payload, 'metadata')
   // Extract raw command/filepath via the prototype-safe accessor so prototype-
   // polluted metadata objects cannot inject values through the prototype chain.
@@ -215,6 +234,7 @@ export function parsePermissionRequest(payload: unknown): PermissionRequest | nu
     sessionID,
     permission,
     patterns,
+    alwaysPatterns,
     title: deriveTitle(permission, patterns, metadata),
     // Omit the optional fields entirely when absent (undefined is not emitted
     // in the object literal when the conditional spread is used).
@@ -242,6 +262,11 @@ interface Entry {
   resolve: (reply: PermissionReply) => void
 }
 
+/** An auto-answer in flight; `echoed` is set when its `permission.replied` arrives before the reply call returns. */
+interface AutoState {
+  echoed: boolean
+}
+
 /**
  * Create a permission coordinator. One instance per run; its local promise map
  * is scoped to that run. Deadline, cascade, and rendering are owned by the registry.
@@ -251,6 +276,10 @@ export function createPermissionCoordinator(deps: PermissionCoordinatorDeps): Pe
   const localMap = new Map<string, Entry>()
   /** SessionIDs seen by this coordinator instance — used by onDispose. */
   const ownedSessionIDs = new Set<string>()
+  /** Asks being auto-answered from a run grant: the reply is in flight and no approval is shown for them. */
+  const autoInFlight = new Map<string, AutoState>()
+  /** Set when the run starts ending; from then on nothing is auto-answered. */
+  let disposed = false
 
   function notifyPending(request: PermissionRequest): void {
     if (onPending === undefined) return
@@ -298,6 +327,58 @@ export function createPermissionCoordinator(deps: PermissionCoordinatorDeps): Pe
     }
   }
 
+  /** Open the operator path for an ask: register the local entry and hand it to the approval UI. */
+  async function registerForOperator(request: PermissionRequest): Promise<PermissionReply> {
+    return new Promise<PermissionReply>(resolve => {
+      const entry: Entry = {request, resolve}
+      localMap.set(request.requestID, entry)
+      ownedSessionIDs.add(request.sessionID)
+      logger.info(
+        {requestID: request.requestID, sessionID: request.sessionID, permission: request.permission},
+        'approvals: permission requested',
+      )
+      notifyPending(request)
+    })
+  }
+
+  /**
+   * Answer an ask the run's earlier operator `always` covers, with `once`. Exactly one reply per ask:
+   * - the reply landed (or its `permission.replied` echo already arrived): done, no approval is shown;
+   * - the reply failed and the run is still live: the operator decides, as for any ask;
+   * - the reply failed and the run is ending: reject, because nothing will decide it any more.
+   */
+  async function autoAnswer(
+    request: PermissionRequest,
+    runGrants: NonNullable<PermissionCoordinatorDeps['runGrants']>,
+  ): Promise<PermissionReply> {
+    const state: AutoState = {echoed: false}
+    autoInFlight.set(request.requestID, state)
+    let ok: boolean
+    try {
+      ok = (await runGrants.answer(request, 'once')).ok
+    } catch {
+      ok = false
+    }
+    autoInFlight.delete(request.requestID)
+    if (ok || state.echoed) {
+      // The permission and run id only: the command, path and URL are never logged here.
+      logger.info(
+        {runId: runGrants.runId, permission: request.permission, auto: 'run-grant'},
+        'approvals: auto-answered',
+      )
+      return 'once'
+    }
+    if (disposed) {
+      await runGrants.answer(request, 'reject').catch(() => undefined)
+      return 'reject'
+    }
+    logger.warn(
+      {requestID: request.requestID, permission: request.permission},
+      'approvals: run-grant auto-answer failed — asking the operator',
+    )
+    return registerForOperator(request)
+  }
+
   async function onPermissionAsked(request: PermissionRequest): Promise<PermissionReply> {
     const existing = localMap.get(request.requestID)
     if (existing !== undefined) {
@@ -311,20 +392,27 @@ export function createPermissionCoordinator(deps: PermissionCoordinatorDeps): Pe
         }
       })
     }
+    if (autoInFlight.has(request.requestID)) {
+      // The auto-answer is already on its way: a second reply would be a double answer.
+      logger.warn({requestID: request.requestID}, 'approvals: duplicate permission.asked for an auto-answer (ignored)')
+      return 'once'
+    }
 
-    return new Promise<PermissionReply>(resolve => {
-      const entry: Entry = {request, resolve}
-      localMap.set(request.requestID, entry)
-      ownedSessionIDs.add(request.sessionID)
-      logger.info(
-        {requestID: request.requestID, sessionID: request.sessionID, permission: request.permission},
-        'approvals: permission requested',
-      )
-      notifyPending(request)
-    })
+    const {runGrants} = deps
+    if (runGrants !== undefined) {
+      runGrants.grants.noteAsked(request)
+      // Auto-answer only for a session this run already owns (root or adopted descendant). Once teardown started the
+      // grants are dropped (`dispose`), so nothing covers an ask: it follows the operator path and dispose rejects it.
+      if (ownedSessionIDs.has(request.sessionID) && runGrants.grants.covers(request)) {
+        return autoAnswer(request, runGrants)
+      }
+    }
+    return registerForOperator(request)
   }
 
   function onPermissionReplied(event: PermissionReplyEvent): void {
+    const auto = autoInFlight.get(event.requestID)
+    if (auto !== undefined) auto.echoed = true
     const entry = localMap.get(event.requestID)
     if (entry === undefined) {
       logger.debug({requestID: event.requestID, reply: event.reply}, 'approvals: reply for unknown request (no-op)')
@@ -342,6 +430,9 @@ export function createPermissionCoordinator(deps: PermissionCoordinatorDeps): Pe
   }
 
   function dispose(reason: string): void {
+    // First: the run is over, so its grants go before anything below can run, and no ask is auto-answered again.
+    disposed = true
+    deps.runGrants?.grants.drop()
     const open = Array.from(localMap.keys())
     if (open.length > 0) {
       logger.warn({reason, count: open.length}, 'approvals: disposing open permission requests — fail-closed')

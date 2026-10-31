@@ -11,6 +11,7 @@ import type {PermissionReply, PermissionRequest, SettlementReason} from './coord
 import {describe, expect, it, vi} from 'vitest'
 
 import {createPermissionCoordinator, parsePermissionReply, parsePermissionRequest} from './coordinator.js'
+import {createRunGrants, scopeAlwaysToRun} from './run-grants.js'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -26,6 +27,7 @@ function makeRequest(overrides: Partial<PermissionRequest> = {}): PermissionRequ
     sessionID: 'ses_1',
     permission: 'external_directory',
     patterns: ['/tmp/x/*'],
+    alwaysPatterns: [],
     title: 'Access outside workspace: /tmp/x/secret.txt',
     ...overrides,
   }
@@ -54,6 +56,21 @@ describe('parsePermissionRequest', () => {
     expect(result?.permission).toBe('external_directory')
     expect(result?.patterns).toEqual(['/tmp/oc-iso-outside/*'])
     expect(result?.title).toContain('/tmp/oc-iso-outside/secret.txt')
+  })
+
+  it('reads the patterns an always reply would save: `always` on the wire (V1, and V2 mapped to the same shape)', () => {
+    const result = parsePermissionRequest({
+      id: 'per_1',
+      sessionID: 'ses_1',
+      permission: 'bash',
+      patterns: ['rm /tmp/a'],
+      always: ['rm *', 7],
+    })
+    expect(result?.alwaysPatterns).toEqual(['rm *'])
+  })
+
+  it('leaves alwaysPatterns empty when the ask carried none', () => {
+    expect(parsePermissionRequest({id: 'per_1', sessionID: 'ses_1', permission: 'bash'})?.alwaysPatterns).toEqual([])
   })
 
   it('returns null when requestID (id) is missing', () => {
@@ -491,3 +508,296 @@ describe('createPermissionCoordinator', () => {
     expect(coordinator.pending()).toEqual([])
   })
 })
+
+// ---------------------------------------------------------------------------
+// Run-local grants
+// ---------------------------------------------------------------------------
+
+/* eslint-disable no-void */
+const RM_ASK = {
+  permission: 'bash',
+  patterns: ['rm /tmp/a'],
+  alwaysPatterns: ['rm *'],
+  title: 'Run command: rm /tmp/a',
+  command: 'rm /tmp/a',
+} as const
+
+function makeRun(runId = 'run_b', replyResult: {ok: boolean} = {ok: true}) {
+  const logger = makeLogger()
+  const grants = createRunGrants({logger, runId})
+  const upstream = vi.fn(async (_requestID: string, _directory: string, _decision: PermissionReply) => replyResult)
+  const onPending = vi.fn()
+  const answer = vi.fn(async (request: PermissionRequest, decision: 'once' | 'reject') =>
+    upstream(request.requestID, '/d', decision),
+  )
+  const coordinator = createPermissionCoordinator({logger, onPending, runGrants: {grants, runId, answer}})
+  coordinator.addOwnedSession('ses_root')
+  // The operator surface posts through the scoped factory, as run.ts wires it.
+  const operatorPost = scopeAlwaysToRun(
+    () => async (requestID, directory, decision) => upstream(requestID, directory, decision),
+    grants,
+  )('ses_root')
+  return {logger, grants, upstream, onPending, answer, coordinator, operatorPost}
+}
+
+async function operatorAlways(run: ReturnType<typeof makeRun>, requestID = 'per_1'): Promise<void> {
+  void run.coordinator.onPermissionAsked(makeRequest({requestID, sessionID: 'ses_root', ...RM_ASK}))
+  await run.operatorPost(requestID, '/d', 'always')
+  run.upstream.mockClear()
+  run.onPending.mockClear()
+}
+
+describe('createPermissionCoordinator — run-local grants', () => {
+  it('auto-answers a later matching ask once, with no approval UI, and logs no command text', async () => {
+    // #given the operator picked Always on `rm /tmp/a`
+    const run = makeRun()
+    await operatorAlways(run)
+
+    // #when a later rm asks in the same run
+    const result = await run.coordinator.onPermissionAsked(
+      makeRequest({
+        requestID: 'per_2',
+        sessionID: 'ses_root',
+        ...RM_ASK,
+        patterns: ['rm -rf /tmp/b'],
+        command: 'rm -rf /tmp/b',
+      }),
+    )
+
+    // #then it is answered once upstream, shows nothing, and the log carries the run id, action and marker only
+    expect(result).toBe('once')
+    expect(run.upstream).toHaveBeenCalledTimes(1)
+    expect(run.upstream).toHaveBeenCalledWith('per_2', '/d', 'once')
+    expect(run.onPending).not.toHaveBeenCalled()
+    expect(run.logger.info).toHaveBeenCalledWith(
+      {runId: 'run_b', permission: 'bash', auto: 'run-grant'},
+      expect.any(String),
+    )
+    expect(JSON.stringify(vi.mocked(run.logger.info).mock.calls)).not.toContain('rm -rf /tmp/b')
+  })
+
+  it('covers a session the run owns through adoption (an owned child)', async () => {
+    const run = makeRun()
+    await operatorAlways(run)
+    run.coordinator.addOwnedSession('ses_child')
+
+    const result = await run.coordinator.onPermissionAsked(
+      makeRequest({requestID: 'per_2', sessionID: 'ses_child', ...RM_ASK, patterns: ['rm /tmp/c']}),
+    )
+
+    expect(result).toBe('once')
+    expect(run.onPending).not.toHaveBeenCalled()
+  })
+
+  it('does not cover a session the run does not own', async () => {
+    const run = makeRun()
+    await operatorAlways(run)
+
+    void run.coordinator.onPermissionAsked(
+      makeRequest({requestID: 'per_2', sessionID: 'ses_stranger', ...RM_ASK, patterns: ['rm /tmp/c']}),
+    )
+
+    expect(run.upstream).not.toHaveBeenCalled()
+    expect(run.onPending).toHaveBeenCalledTimes(1)
+  })
+
+  it('still asks when only part of the request matches a grant', async () => {
+    const run = makeRun()
+    await operatorAlways(run)
+
+    void run.coordinator.onPermissionAsked(
+      makeRequest({requestID: 'per_2', sessionID: 'ses_root', ...RM_ASK, patterns: ['rm /tmp/c', 'curl http://x']}),
+    )
+
+    expect(run.upstream).not.toHaveBeenCalled()
+    expect(run.onPending).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['dispose', 'drop'] as const)('stops auto-answering once the run has started ending (%s)', async how => {
+    // #given a grant in force
+    const run = makeRun()
+    await operatorAlways(run)
+
+    // #when the run starts ending
+    if (how === 'dispose') run.coordinator.dispose('run ended')
+    else run.grants.drop()
+
+    // #then a late ask follows the operator path (dispose rejects it later) and nothing is auto-answered
+    void run.coordinator.onPermissionAsked(
+      makeRequest({requestID: 'per_late', sessionID: 'ses_root', ...RM_ASK, patterns: ['rm /tmp/z']}),
+    )
+    expect(run.upstream).not.toHaveBeenCalled()
+    expect(run.onPending).toHaveBeenCalledTimes(1)
+  })
+
+  it('drops the grants on dispose', async () => {
+    const run = makeRun()
+    await operatorAlways(run)
+
+    run.coordinator.dispose('run ended')
+
+    expect(run.grants.isDropped()).toBe(true)
+  })
+
+  it('does not apply one run’s grant to another run', async () => {
+    // #given an Always in run B, and a second run C
+    const runB = makeRun('run_b')
+    const runC = makeRun('run_c')
+    await operatorAlways(runB)
+
+    // #when run C asks for the same thing
+    void runC.coordinator.onPermissionAsked(
+      makeRequest({requestID: 'per_c', sessionID: 'ses_root', ...RM_ASK, patterns: ['rm /tmp/a']}),
+    )
+
+    // #then it goes to its own operator
+    expect(runC.upstream).not.toHaveBeenCalled()
+    expect(runC.onPending).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not answer an ask that arrives during the operator’s in-flight Always, and answers each ask exactly once', async () => {
+    // #given an Always reply that has not landed yet
+    const logger = makeLogger()
+    const grants = createRunGrants({logger, runId: 'run_b'})
+    const replies = new Map<string, string[]>()
+    const record = (requestID: string, decision: string) => {
+      replies.set(requestID, [...(replies.get(requestID) ?? []), decision])
+    }
+    let landOperatorReply: () => void = () => {}
+    const onPending = vi.fn()
+    const coordinator = createPermissionCoordinator({
+      logger,
+      onPending,
+      runGrants: {
+        grants,
+        runId: 'run_b',
+        answer: async (request, decision) => {
+          record(request.requestID, decision)
+          return {ok: true}
+        },
+      },
+    })
+    coordinator.addOwnedSession('ses_root')
+    const operatorPost = scopeAlwaysToRun(
+      () => async (requestID, _directory, decision) =>
+        new Promise<{ok: boolean}>(resolve => {
+          landOperatorReply = () => {
+            record(requestID, decision === 'always' ? 'once' : decision)
+            resolve({ok: true})
+          }
+        }),
+      grants,
+    )('ses_root')
+    void coordinator.onPermissionAsked(makeRequest({requestID: 'per_1', sessionID: 'ses_root', ...RM_ASK}))
+    const inFlight = operatorPost('per_1', '/d', 'always')
+
+    // #when a matching ask arrives before it lands
+    void coordinator.onPermissionAsked(
+      makeRequest({requestID: 'per_2', sessionID: 'ses_root', ...RM_ASK, patterns: ['rm /tmp/b']}),
+    )
+
+    // #then it is not auto-answered: it waits for the operator like any ask
+    expect(replies.has('per_2')).toBe(false)
+    expect(onPending).toHaveBeenCalledTimes(2)
+
+    // #when the reply lands, a third ask is covered and answered once
+    landOperatorReply()
+    await inFlight
+    await coordinator.onPermissionAsked(
+      makeRequest({requestID: 'per_3', sessionID: 'ses_root', ...RM_ASK, patterns: ['rm /tmp/c']}),
+    )
+
+    // #then no request got more than one reply
+    expect(replies.get('per_1')).toEqual(['once'])
+    expect(replies.get('per_3')).toEqual(['once'])
+    expect([...replies.values()].every(decisions => decisions.length === 1)).toBe(true)
+  })
+
+  it('sends one reply for a duplicate ask that arrives while its auto-answer is in flight', async () => {
+    // #given an auto-answer whose reply call is slow
+    const run = makeRun()
+    await operatorAlways(run)
+    let land: () => void = () => {}
+    run.answer.mockImplementationOnce(
+      async () =>
+        new Promise<{ok: boolean}>(resolve => {
+          land = () => resolve({ok: true})
+        }),
+    )
+    const ask = makeRequest({requestID: 'per_2', sessionID: 'ses_root', ...RM_ASK, patterns: ['rm /tmp/b']})
+
+    // #when the same ask is delivered twice
+    const first = run.coordinator.onPermissionAsked(ask)
+    const second = run.coordinator.onPermissionAsked(ask)
+    land()
+
+    // #then it was replied to once
+    await expect(first).resolves.toBe('once')
+    await expect(second).resolves.toBe('once')
+    expect(run.answer).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not fall back to the operator when the permission.replied echo beat the reply call', async () => {
+    const run = makeRun()
+    await operatorAlways(run)
+    run.answer.mockImplementationOnce(async () => {
+      run.coordinator.onPermissionReplied({requestID: 'per_2', sessionID: 'ses_root', reply: 'once'})
+      return {ok: false}
+    })
+
+    const result = await run.coordinator.onPermissionAsked(
+      makeRequest({requestID: 'per_2', sessionID: 'ses_root', ...RM_ASK, patterns: ['rm /tmp/b']}),
+    )
+
+    expect(result).toBe('once')
+    expect(run.onPending).not.toHaveBeenCalled()
+  })
+
+  it('falls back to the operator when the auto-answer cannot be delivered', async () => {
+    const run = makeRun()
+    await operatorAlways(run)
+    run.answer.mockResolvedValueOnce({ok: false})
+
+    void run.coordinator.onPermissionAsked(
+      makeRequest({requestID: 'per_2', sessionID: 'ses_root', ...RM_ASK, patterns: ['rm /tmp/b']}),
+    )
+    await vi.waitFor(() => expect(run.onPending).toHaveBeenCalledTimes(1))
+
+    expect(run.coordinator.pending()).toContain('per_2')
+  })
+
+  it('rejects instead when the auto-answer cannot be delivered and the run is ending', async () => {
+    const run = makeRun()
+    await operatorAlways(run)
+    let fail: () => void = () => {}
+    run.answer.mockImplementationOnce(
+      async () =>
+        new Promise<{ok: boolean}>(resolve => {
+          fail = () => resolve({ok: false})
+        }),
+    )
+    const result = run.coordinator.onPermissionAsked(
+      makeRequest({requestID: 'per_2', sessionID: 'ses_root', ...RM_ASK, patterns: ['rm /tmp/b']}),
+    )
+
+    // #when the run ends while the auto-answer is in flight, and then it fails
+    run.coordinator.dispose('run ended')
+    fail()
+
+    // #then the operator path is not reopened; the ask is rejected
+    await expect(result).resolves.toBe('reject')
+    expect(run.answer).toHaveBeenLastCalledWith(expect.objectContaining({requestID: 'per_2'}), 'reject')
+    expect(run.onPending).not.toHaveBeenCalled()
+  })
+
+  it('asks the operator as before when no run grants are wired', () => {
+    const onPending = vi.fn()
+    const coordinator = createPermissionCoordinator({logger: makeLogger(), onPending})
+    coordinator.addOwnedSession('ses_root')
+
+    void coordinator.onPermissionAsked(makeRequest({sessionID: 'ses_root', ...RM_ASK}))
+
+    expect(onPending).toHaveBeenCalledTimes(1)
+  })
+})
+/* eslint-enable no-void */
