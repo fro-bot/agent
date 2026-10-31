@@ -24,9 +24,9 @@ V2 is a rewrite. It has a new `/api/*` HTTP API, new event names, a new client a
 | R2 no carries by default                                                   | U1, U15           |
 | R3 retire the harness                                                      | U15               |
 | R4 plugins installed before start, under the bound                         | U3, U7, U11       |
-| R5 V2 beside V1, main unchanged until a switch                             | U3-U12            |
+| R5 V2 beside V1, main unchanged until a switch                             | U3-U12b           |
 | R6 each surface switches and reverts whole                                 | U9, U13           |
-| R7 behaviour parity                                                        | U4, U8, U12       |
+| R7 behaviour parity                                                        | U4, U8, U12a-b    |
 | R8 same-PR mirroring                                                       | Operational Notes |
 | R9 delete V1 after the last switch                                         | U14               |
 | R10 gateway and workspace first; Action as a breaking minor                | U9, U13           |
@@ -34,8 +34,8 @@ V2 is a rewrite. It has a new `/api/*` HTTP API, new event names, a new client a
 | R12 probes gate each switch                                                | U1, U9, U13       |
 | R13-R16 Action continuity (precedence, key name, V1 deletion, import wait) | U10, U11, U14     |
 | R17 outside-directory deny (Action) or ask (gateway), fail closed                                    | U5                |
-| R18 no pending question in Action runs                                     | U5, U12           |
-| R19 Code Mode on; deny holds; session move and worktree tools denied       | U1, U5, U8, U12   |
+| R18 no pending question in Action runs                                     | U5, U11, U12a     |
+| R19 Code Mode on; deny holds; session move and worktree tools denied       | U1, U5, U8, U12a  |
 | R20 per-spawn password, never logged                                       | U3, U7            |
 | R21 fro-bot V2 plugin package                                              | U6                |
 
@@ -48,6 +48,7 @@ V2 is a rewrite. It has a new `/api/*` HTTP API, new event names, a new client a
 - No pre-decided Code Mode fallback. If deny rules don't hold inside `execute`, we decide then.
 - No rollback-copy lifecycle. V1 data is deleted when V1 is cut.
 - Eval work is limited to the minimum needed to run the evals on V2.
+- The Action never writes `auth.json` on V2, so upstream's import of it (migration m39) has nothing to read and the saved database holds no credentials. Credentials reach the server only as `{file:}` references (U11).
 - Systematic V2 is built separately.
 
 ### Deferred to Separate Tasks
@@ -201,10 +202,13 @@ V2 is a rewrite. It has a new `/api/*` HTTP API, new event names, a new client a
 - **No resumed work after a restart.** V2 keeps a session's execution claim across a shutdown and resumes it at the next boot. To prevent that:
   - Every shutdown first interrupts all owned sessions.
   - The workspace starts each spawn with a fresh database.
-  - The Action clears leftover claims in the restored database before it spawns the server. Such a claim comes only from an earlier run that was killed. The mechanism comes from probe P11.
+  - The Action clears leftover claims in the restored database before it spawns the server. A claim survives any shutdown that did not interrupt the turn with reason `user`: a killed run, but also stdin close (exit 0) and SIGTERM (exit 130). The mechanism comes from probe P11.
   - Because interrupting with reason `user` releases the claim, a normal shutdown saves a database with no held claims.
   - Stop confirmation never accepts an interrupt whose reason is `shutdown`.
 - **Plugin gate after spawn.** V2 skips a plugin that fails to load, and the server stays up. After spawn, both surfaces require the Systematic and fro-bot plugin IDs to be listed with status `active`. If either one is listed as `failed`, or is not listed at all, startup fails.
+- **Action credentials are file references.** On V2 the Action writes each `type: "api"` entry of the `auth-json` input to its own 0600 file outside every cached path, and the V2 config points at it with `provider.<id>.options.apiKey: "{file:/path}"`. It does not write `auth.json` to the XDG path and does not provision keys over REST.
+  - A fresh V2 database never runs migration m39, and a restored V1 one would import `auth.json` as plaintext rows that the post hook then caches. File references keep the saved `opencode.db` free of secrets and pick up rotated keys on every run.
+  - Any entry that is not `type: "api"` fails startup with a named error. The V2 credential gate (#1993) already counts `{file:}` references as auth.
 - **The effective permissions are the source of truth for the deny check.** After spawn, each surface reads the effective per-agent rules from the server and checks every agent's rule list structurally. The boundary is the last `external_directory` rule whose resource is exactly `*`. Its effect must satisfy the surface policy, and every later matching rule must carry a permitted effect or sit on an authorized exception pattern. The run fails if any agent breaks this, or if any exception does not evaluate to `allow`. Project config is disabled in CI.
   - The gate checks that the rules exist, not that they are enforced. Probe P5 is the evidence that Code Mode enforces them for the pinned version.
 - **Restore precedence is unchanged.**
@@ -281,7 +285,8 @@ flowchart LR
   subgraph P4[Phase 4: Action]
     U10[U10 V2 session keys]
     U11[U11 V2 setup + spawn + import wait]
-    U12[U12 V2 execution loop]
+    U12a[U12a V2 execution loop]
+    U12b[U12b V2 release and drain]
     U13[U13 switch, breaking minor]
   end
   subgraph P5[Phase 5: cut V1]
@@ -291,13 +296,13 @@ flowchart LR
   U1 --> U3 & U4 & U5
   U2 --> U7 & U11
   U3 --> U7 & U11
-  U4 --> U8 & U12
+  U4 --> U8 & U12a
   U5 --> U7 & U8 & U11
-  U10 --> U11 --> U12
+  U10 --> U11 --> U12a --> U12b
   U6 --> U7 & U11
   U7 & U8 --> U9
   U9 --> U13
-  U10 & U11 & U12 --> U13
+  U10 & U11 & U12b --> U13
   U13 --> U14 --> U15
   SYS[Systematic V2 release] -.gates.-> U9 & U13
 ```
@@ -305,12 +310,12 @@ flowchart LR
 Run order for a V2 Action run:
 
 ```text
-install pinned binary (digest) -> install plugins (bounded) -> write V2 config
+install pinned binary (digest) -> install both plugins (bounded) -> write credential files + V2 config
 -> restore (S3 V2, S3 V1, cache tiers) -> SQLite repair -> clear held claims
 -> spawn serve --stdio (password) -> /api/info -> plugin gate -> permission gate
 -> wait for V1 import (bounded; fail = no prompt, no save)
 -> subscribe (await server.connected) -> prompt -> event loop (Code Mode, form cancel, permission reply)
--> drain owned children -> interrupt owned -> close stdin -> confirm exit -> checkpoint -> save V2 keys only
+-> drain (directory quiet, ledger and shells settled; deadline interrupts owned sessions) -> close stdin -> confirm exit -> checkpoint -> save V2 keys only
 ```
 
 ## Implementation Units
@@ -512,7 +517,7 @@ install pinned binary (digest) -> install plugins (bounded) -> write V2 config
   - the session-move and worktree-create tools denied.
 - Project config is disabled in CI.
 - The gate reads effective per-agent rules from `GET /api/agent`. For every agent, including subagents and agents that look tool-less, it finds the `external_directory` boundary and checks each later rule against the surface policy and the authorized exception patterns. The Action requires `deny` outside the checkout. The workspace accepts `ask` or `deny`, never `allow`. The two forbidden tools get the same check with no exceptions. A violated outside policy, a missing exception or a missing forbidden-tool deny fails startup.
-- The Action's no-pending-question guarantee has two parts: the config deny on `question`, and the runtime form-cancel in U12. The gate does not check for `question`.
+- The Action's no-pending-question guarantee has two parts: the config deny on `question`, and the runtime form-cancel in U12a. The gate does not check for `question`.
 - The V2 managed config for the workspace is a separate file. The V1 file stays unchanged.
 
 **Patterns to follow:**
@@ -732,44 +737,61 @@ install pinned binary (digest) -> install plugins (bounded) -> write V2 config
 
 - [ ] **Unit 11: Action V2 setup, spawn and import wait**
 
-**Goal:** A V2 Action run installs and starts a gated V2 server on a clean restored database, and doesn't prompt until the V1 import finishes.
+**Goal:** A V2 Action run installs and starts a gated V2 server with its credentials on a clean restored database, and doesn't prompt until the V1 import finishes.
 
-**Requirements:** R4, R13, R16, R20
+**Requirements:** R4, R13, R16, R18, R20
 
 **Dependencies:** U2, U3, U5, U6 (published), U10, and U1 (P7, P10, P11, P15)
 
 **Files:**
 
-- Modify: `src/harness/phases/{bootstrap,cache-restore}.ts` (`cache-restore.ts` is the only place that selects the bootstrap), `src/services/setup/setup.ts`, `src/services/setup/systematic-plugin.ts` (V2 install command; a failed install fails startup)
-- Create: a V2 sibling of `src/features/attachments/{injector,types}.ts` for V2 file inputs
-- Create: `src/harness/phases/v1-import-wait.ts`
-- Test: `src/harness/phases/cache-restore.test.ts`, `v1-import-wait.test.ts`, `src/services/setup/setup.test.ts`, `systematic-plugin.test.ts`
+- Modify: `src/harness/phases/{bootstrap,cache-restore}.ts` (`cache-restore.ts` is the only place that selects the bootstrap, through the runtime `selectOpenCodeGeneration`), `src/services/setup/setup.ts`, `src/services/setup/ci-config-v2.ts` (wire `buildCIConfigV2`, which has no caller yet), `src/services/setup/systematic-plugin.ts` (V2 install of both plugins; a failed install fails startup)
+- Create: `src/services/setup/credential-files-v2.ts`, a V2 sibling of `src/features/attachments/{injector,types}.ts` for V2 file inputs, and `src/harness/phases/v1-import-wait.ts`
+- Test: `src/harness/phases/cache-restore.test.ts`, `v1-import-wait.test.ts`, `src/services/setup/{setup,systematic-plugin,credential-files-v2,ci-config-v2}.test.ts`
 
 **Approach:**
 
-- On a V2 pin, setup installs plugins before writing the config, under the 420s bound. A failure or timeout fails startup with a named plugin-install error. The order of the global config writes follows P10.
-- Held claims are cleared in the restored database before spawn, using the mechanism from P11.
-- Spawn uses U3, then the plugin and permission gates run.
-- The import wait polls `migration.v1.status` until it reports `completed`. It fails immediately on `error`, or when the bound set from P7 runs out. Any failure means no prompt and no save.
+- On a V2 pin, setup installs `@fro.bot/systematic` and `@fro.bot/opencode-plugin` before writing the config, each under the 420s bound. It ports the logic of `deploy/scripts/install-opencode-v2-plugins.sh` to TypeScript:
+  - exact `x.y.z` versions only, so a `latest` input is resolved to an exact version first;
+  - `opencode plugin add <spec>` under `filterAgentEnv` plus explicit XDG and throwaway `OPENCODE_DB` isolation;
+  - an assertion that the npm cache directory for each spec is non-empty;
+  - deletion of the global `opencode.json` that `plugin add` writes, because a later rewrite of it drops the plugin (P10).
+  - The tools-cache key includes the fro.bot plugin version. A failure or timeout fails startup with a named plugin-install error.
+- Credentials follow the KTD: one 0600 file per `type: "api"` entry in a directory outside every cached path, with the provider id validated before it names a file. `buildCIConfigV2` references each file with `provider.<id>.options.apiKey: "{file:/path}"`. A non-`api` entry fails startup, naming the provider and the type, never the value.
+- The V2 config carries an explicit `question` deny. The V2 spawn has no equivalent of V1's `pinQuestionToolOff`, so the deny is the guarantee (R18). `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` is not set: P2 ran background children without it and the v2.2.0 sources never read it. The U12b background-child test confirms it.
+- Held claims are cleared in the restored database before spawn with `clearHeldClaims` (runtime, mechanism from P11).
+- Spawn uses U3, then the plugin and permission gates run. `GET /api/agent` answering 503 reads as not ready, not as "no agents" (P10).
+- The import wait polls the runtime `readV1MigrationStatus` (`GET /api/experimental/migration/v1`) until it reports `completed`. It fails immediately on `error`.
+  - The hard bound is 300s, about 2.7 times the worst P7 sample (111s on a 488 MB database).
+  - Stall detection watches `progress.numerator` (sessions migrated). No advance within the stall window fails the wait.
+  - An `unreadable` reading is retried under the bound and never read as `completed`.
+  - Each wait logs the database size in bytes and the session count.
+  - Any failure means no prompt and no save.
 
 **Patterns to follow:**
 
-- `runCacheRestore` (the SQLite repair sits before spawn) and `installSystematicPlugin`.
+- `runCacheRestore` (the SQLite repair sits before spawn), `installSystematicPlugin`, and `populateAuthJson` for the 0600 write.
 
 **Test scenarios:**
 
 - Happy path: the restore hits V1, the import reports running then completed, and the prompt is sent after completion.
+- Happy path: each `api` entry gets its own 0600 file, the config references it with `{file:}`, and no `auth.json` exists at the XDG path.
+- Happy path: after a run with a canary key, the saved `opencode.db` does not contain the canary.
 - Edge case: a V2-tier restore that reports `running` still waits.
+- Edge case: a `latest` plugin input resolves to an exact version before the install, and a range is rejected.
+- Error path: an `auth-json` entry that is not `type: "api"` fails startup with a named error that does not echo the value.
 - Error path: an import `error` fails without prompting, and the save step is skipped.
 - Error path: the import runs past its bound, so the run fails without prompting and saves nothing.
-- Error path: a Systematic install times out, so startup fails and names the plugin install.
+- Error path: the import `numerator` stops advancing, so the wait fails before the hard bound.
+- Error path: a plugin install times out, so startup fails and names the plugin install.
+- Error path: a plugin install leaves an empty cache directory, so startup fails.
 - Integration: a restored database with a held claim starts a server that resumes nothing before the first prompt.
 
 **Verification:**
 
 - The V1 pin path is unchanged.
 
-- [ ] **Unit 12: Action V2 execution loop**
+- [ ] **Unit 12a: Action V2 execution loop**
 
 **Goal:** The Action runs a prompt to completion on V2 with today's behaviour.
 
@@ -780,20 +802,18 @@ install pinned binary (digest) -> install plugins (bounded) -> write V2 config
 **Files:**
 
 - Create: `src/features/agent/{execution-v2,streaming-v2,prompt-sender-v2,session-poll-v2,retry-v2}.ts` (`retry-v2` covers the `session.wait` client and the retry path)
-- Create: a V2 sibling of `packages/runtime/src/session/archive.ts` for archive-on-overflow
-- Modify: `src/harness/phases/execute.ts` (one selector in `runExecute` for both `executeOpenCode` call sites, plus the V2 drain adapter)
+- Modify: `src/harness/phases/execute.ts` (one selector in `runExecute` that covers both `executeOpenCode` call sites, the main call at `:395` and the overflow-recovery call at `:251` inside `recoverFromContextOverflow`, so the executor is threaded through `ContextOverflowRecoveryOptions`)
+- Verify, and add a V2 sibling only if it fails against a V2 server: `packages/runtime/src/session/archive.ts` (archive-on-overflow already calls the V2 SDK client)
 - Test: the matching `*-v2.test.ts` files, and `src/harness/phases/execute.test.ts`
 
 **Approach:**
 
-- Subscribe and wait for `server.connected` before prompting.
+- Subscribe and wait for `server.connected` before prompting. Use the raw-HTTP `createRemoteOpenCodeV2Client`, not the V1 SDK types.
 - The loop uses U4 domain events:
-  - Any form is cancelled at once, and the run fails if the cancel fails.
-  - Permission requests are auto-replied through `permission.reply`, as V1 does today.
+  - Any form is cancelled and the run continues. A failed cancel is logged, not fatal, matching the gateway's `cancelUnanswerableForm` and V1.
+  - Permission requests are auto-rejected through `permission.reply`, as V1's `replyToPermissionAsk` does (5s timeout, 2 attempts).
   - Reasoning text is excluded from the response.
-- Completion goes through `session.wait`, raced with the event loop as V1 does.
-- Drain uses the V2 ledger adapter, and finishes only once the root is idle after the last turn a notice triggered.
-- On a deadline, owned sessions are interrupted before shutdown.
+- Completion goes through `session.wait`, raced with the event loop as V1 does. The root going idle is a hint, not release: release is U12b.
 - The ownership ledger, deadline policy and one-comment protocol are unchanged.
 
 **Patterns to follow:**
@@ -804,15 +824,54 @@ install pinned binary (digest) -> install plugins (bounded) -> write V2 config
 
 - Happy path: a prompt streams text and completes, and the response excludes reasoning.
 - Edge case: the model calls `question`. The form is cancelled and the run continues.
-- Edge case: a background child finishes after the root succeeded. Completion waits for the turn the notice triggered.
-- Error path: the form cancel fails, so the run fails.
+- Edge case: a permission request is rejected and the run continues.
+- Edge case: a context overflow routes the recovery call through the V2 executor.
+- Error path: the form cancel fails, so the failure is logged and the run continues.
 - Error path: the event stream never connects, so the attempt is retried under `MAX_LLM_RETRIES`, as in V1.
-- Error path: on a deadline, owned sessions are interrupted and the run is reported as timed out.
-- Integration: with `timeout: 0`, the drain waits only while work is observed running, as V1 does.
 
 **Verification:**
 
 - Every V1 Action behaviour test that covers a parity item has a V2 counterpart that passes.
+
+- [ ] **Unit 12b: Action V2 release and drain**
+
+**Goal:** A V2 Action run releases only once nothing it started can still wake a session, and shuts down so the saved database is quiet.
+
+**Requirements:** R5, R7, R8
+
+**Dependencies:** U12a, and U1 (P2, P9, P11)
+
+**Files:**
+
+- Create: `src/features/agent/drain-v2.ts`
+- Modify: `src/harness/phases/execute.ts` (`runDrain` takes the V2 drain adapter)
+- Test: `src/features/agent/drain-v2.test.ts`, `src/harness/phases/execute.test.ts`
+
+**Approach:**
+
+- Root idle is not terminal: a background child keeps running after the root succeeds, and its notice starts a second turn (P2). The ledger also cannot see a child whose adoption event was lost.
+- Release when the directory is quiet. Use the runtime `awaitDirectoryStability` over `observeDirectoryV2` (the global active list joined with `session.list({directory})`, P9), with the ledger and background shells (`reconcileShellsOnce`, `shell-notice`) settled. The whole drain is bounded by the deadline.
+- On the deadline, or if the drain fails, `handle.shutdown({ownedSessionIds})` interrupts owned sessions, closes stdin and confirms the exit. An interrupt with reason `shutdown` is never accepted as a stop (P11).
+- Checkpoint the WAL after the confirmed exit, then save. A stop that can't be confirmed fails the run as incomplete and saves nothing. The Action does not adopt the gateway's quarantine watch.
+- The gateway's `drain-completion-v2`, `settle-owned-sessions-v2` and `root-stop-v2` stay in the gateway. Share a primitive only where this unit needs it.
+
+**Patterns to follow:**
+
+- `packages/gateway/src/execute/run-core-v2.ts` (directory gate, `adoptShell`, `reconcileShellPass`) and `docs/solutions/logic-errors/no-deadline-drain-counts-observation-not-ledger-state-2026-10-22.md`.
+
+**Test scenarios:**
+
+- Edge case: a background child finishes after the root succeeded. Release waits until the directory is quiet.
+- Edge case: a child the ledger never adopted is running in the directory. Release waits for it.
+- Edge case: a background shell is running after the root succeeded. Release waits for it.
+- Error path: on a deadline, owned sessions are interrupted and the run is reported as timed out.
+- Error path: an interrupt that reports reason `shutdown` is not accepted as a stop.
+- Error path: the exit is not confirmed, so nothing is saved and the run is reported incomplete.
+- Integration: with `timeout: 0`, the drain waits only while work is observed running, as V1 does.
+
+**Verification:**
+
+- A background child or shell started by a run never outlives the saved database.
 
 - [ ] **Unit 13: Action switch**
 
@@ -820,7 +879,7 @@ install pinned binary (digest) -> install plugins (bounded) -> write V2 config
 
 **Requirements:** R6, R10, R11, R12
 
-**Dependencies:** U9 in production, U10 through U12, the U1 probes that gate the Action, and a released Systematic V2
+**Dependencies:** U9 in production, U10 through U12b, the U1 probes that gate the Action, and a released Systematic V2
 
 **Files:**
 
@@ -928,7 +987,8 @@ install pinned binary (digest) -> install plugins (bounded) -> write V2 config
 | --- | --- |
 | Systematic V2 slips | Phase 2 and the V2 modules land without it. Only the switches wait. |
 | A blocking probe fails | The switch it gates waits for Marcus's decision. |
-| The import runs too long for the largest real database | P7 sizes the bound. If the bound is exceeded, the run fails without saving and the V1 data stays intact. |
+| The import runs too long for the largest real database | P7 sizes the bound (300s hard, with stall detection). If the bound is exceeded, the run fails without saving and the V1 data stays intact. |
+| The import roughly doubles the database (P7: 488 to 799 MB, 512 to 996 MB) | The V1 tables stay in the file, so the saved entry grows once. Watch Actions cache and S3 quotas at the first V2 save. |
 | The duplicated modules drift during the window | The same-PR mirroring rule applies. The window is kept short. |
 | The `minimumReleaseAge` policy blocks the `@opencode/*` installs | Ask first about an exclusion, or wait for the age to pass (after about 2026-10-30). |
 
