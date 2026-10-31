@@ -119,9 +119,14 @@ describe('credential-files-v2', () => {
       for (const [providerId, file] of Object.entries(keyFiles)) {
         expect(path.isAbsolute(file)).toBe(true)
         expect(path.dirname(file)).toBe(directory)
-        expect((await fs.stat(file)).mode & 0o777).toBe(0o600)
         const expected = providerId === 'anthropic' ? CANARY_A : CANARY_B
-        expect(await fs.readFile(file, 'utf8')).toBe(expected)
+        const handle = await fs.open(file, 'r')
+        try {
+          expect((await handle.stat()).mode & 0o777).toBe(0o600)
+          expect(await handle.readFile('utf8')).toBe(expected)
+        } finally {
+          await handle.close()
+        }
       }
     })
 

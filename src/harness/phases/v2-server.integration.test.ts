@@ -19,7 +19,18 @@ import type {AddressInfo} from 'node:net'
 import type {OpenCodeV2ServerHandle} from '@fro-bot/runtime'
 import type {StartActionOpenCodeV2Options} from './v2-server.js'
 import {execFileSync} from 'node:child_process'
-import {existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync} from 'node:fs'
+import {
+  closeSync,
+  existsSync,
+  fstatSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
@@ -358,15 +369,19 @@ describe.skipIf(!hasBinary)('startActionOpenCodeV2 against the real stock binary
     expect(query<{c: number}>(box.dbPath, 'SELECT COUNT(*) AS c FROM credential')[0]?.c).toBe(0)
     expect(existsSync(box.authPath)).toBe(false)
     for (const file of filesUnder(box.dataDir)) {
-      if (statSync(file).size === 0) continue
       expect(readFileSync(file).includes(CANARY), `${path.relative(box.root, file)} must not hold the key`).toBe(false)
     }
     // #and the key lives only in its own 0600 file under RUNNER_TEMP, outside the data directory and the cache home
     const keyDirs = readdirSync(box.runnerTemp)
     expect(keyDirs).toHaveLength(1)
     const keyFile = path.join(box.runnerTemp, keyDirs[0] as string, 'fake.key')
-    expect(readFileSync(keyFile, 'utf8')).toBe(CANARY)
-    expect(statSync(keyFile).mode & 0o777).toBe(0o600)
+    const keyFd = openSync(keyFile, 'r')
+    try {
+      expect(fstatSync(keyFd).mode & 0o777).toBe(0o600)
+      expect(readFileSync(keyFd, 'utf8')).toBe(CANARY)
+    } finally {
+      closeSync(keyFd)
+    }
     // #and nothing the Action logged carries it
     expect(JSON.stringify(vi.mocked(logger.info).mock.calls)).not.toContain(CANARY)
     expect(JSON.stringify(vi.mocked(logger.info).mock.calls)).not.toContain(keyFile)
