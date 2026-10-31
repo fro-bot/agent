@@ -7,6 +7,7 @@ import {
   getGitHubRunAttempt,
   getGitHubRunId,
   RESPONSE_FILE_DIR_SEGMENT,
+  systematicSkillsEditDenyPatternV1,
 } from '@fro-bot/runtime'
 
 export interface CIConfigResult {
@@ -65,6 +66,7 @@ function scopeExternalDirectoryPermission(
   config: Record<string, unknown>,
   runnerTemp: string | undefined,
   integrationWorkDir: string | undefined,
+  skills: BundledSkillsGrant | undefined,
   logger: Logger,
 ): void {
   const agent = isRecord(config.agent) ? config.agent : {}
@@ -160,6 +162,18 @@ function scopeExternalDirectoryPermission(
     }
   }
 
+  // The installed Systematic skills directory, after the deny it carves out of (see `BundledSkillsGrant`).
+  if (skills != null) {
+    const grant: Record<string, 'allow' | 'deny'> = externalDirectory === 'deny' ? {'*': 'deny'} : externalDirectory
+    for (const dir of skills.dirs) {
+      const pattern = path.join(dir, '*')
+      delete grant[pattern]
+      grant[pattern] = 'allow'
+    }
+    externalDirectory = grant
+    denySkillsEdits(editPermission, skills)
+  }
+
   config.agent = {
     ...agent,
     build: {
@@ -170,6 +184,96 @@ function scopeExternalDirectoryPermission(
         external_directory: externalDirectory,
       },
     },
+  }
+}
+
+/**
+ * The installed Systematic `skills/` directory of the version in use (fro-bot/agent#2009), resolved at setup.
+ *
+ * A skill reads its own `references/` and runs its own `scripts/` from there, outside the checkout. OpenCode adds an
+ * `external_directory` allow for each skill directory to the built-in agents' defaults, but the build agent's own block
+ * re-asserts `'*': 'deny'` after them and the last matching rule wins, so the allow is shadowed. It is granted again
+ * here, after the deny, for that one directory and nothing wider: not the package, not another version, not the cache.
+ *
+ * SECURITY: `external_directory` is not read-only. It also gates the edit, write and apply_patch tools and the paths a
+ * shell command touches, so this grant lets the agent WRITE inside that directory during its own run, and a poisoned
+ * validator script is a trust boundary. Two things bound that, and one does not:
+ * - the `edit` permission is denied for the directory (`denySkillsEdits`), which covers edit, write and apply_patch;
+ * - on a hosted runner the tools cache is saved during setup, before the agent runs, so a write never persists;
+ * - a shell command is NOT an `edit` request, so `bash` can still write there. On a persistent or self-hosted runner
+ *   such a write survives into later runs, because the directory is the plugin's real install location.
+ */
+export interface BundledSkillsGrant {
+  /** Absolute, literal directories (no `*`/`?`): the lexical path and, when it differs, its real path. */
+  readonly dirs: readonly string[]
+  /** Anchored `edit` deny for the directory, or undefined when the version cannot be expressed safely. */
+  readonly editDenyPattern: string | undefined
+}
+
+/**
+ * V1's edit, write and apply_patch ask `permission: "edit"` with `path.relative(instance.worktree, file)`, never the
+ * absolute path, so the pattern is anchored on the version-specific tail (`systematicSkillsEditDenyPatternV1`) and
+ * matches whatever worktree the relative path is taken from. It moves to the end of the map so it outranks any `*`.
+ */
+function denySkillsEdits(editPermission: Record<string, unknown>, skills: BundledSkillsGrant): void {
+  if (skills.editDenyPattern == null) return
+  delete editPermission[skills.editDenyPattern]
+  editPermission[skills.editDenyPattern] = 'deny'
+}
+
+/**
+ * Keep only directories that are literal absolute paths: a server reads `*` and `?` in a pattern as wildcards, so one
+ * in a directory name would widen the grant. Nothing usable resolves to no grant at all.
+ */
+function toBundledSkillsGrant(
+  dirs: readonly string[],
+  systematicVersion: string,
+  logger: Logger,
+): BundledSkillsGrant | undefined {
+  const usable = dirs.filter(dir => path.isAbsolute(dir) && !/[*?]/.test(dir))
+  if (usable.length < dirs.length) {
+    logger.warning('Ignoring a bundled skills directory that is not a literal absolute path')
+  }
+  if (usable.length === 0) return undefined
+  return {dirs: usable, editDenyPattern: systematicSkillsEditDenyPatternV1(systematicVersion)}
+}
+
+/**
+ * The same grant at the TOP-LEVEL `permission` key, so a root session of an agent with no block of its own, and every
+ * subagent that inherits from it (`deriveSubagentSessionPermission` keeps the parent's `external_directory` and `deny`
+ * rules), resolves it too. The build agent's block (`scopeExternalDirectoryPermission`) is what decides for the build
+ * agent. Runs after `scopeAttachmentDirectoryPermission`, which owns the `'*'` entry; when that did not run
+ * (no RUNNER_TEMP) the wildcard falls back to the operator's, else to `deny`.
+ */
+function scopeBundledSkillsGlobalPermission(config: Record<string, unknown>, skills: BundledSkillsGrant): void {
+  const existingPermission = isRecord(config.permission) ? config.permission : {}
+  const rawExternal = existingPermission.external_directory
+  const existingExternal: Record<string, unknown> = isRecord(rawExternal)
+    ? {...rawExternal}
+    : typeof rawExternal === 'string'
+      ? {'*': rawExternal}
+      : {}
+  // The wildcard must sort first, or it would shadow every specific entry behind it.
+  const external: Record<string, unknown> =
+    existingExternal['*'] == null ? {'*': 'deny', ...existingExternal} : existingExternal
+  for (const dir of skills.dirs) {
+    const pattern = path.join(dir, '*')
+    delete external[pattern]
+    external[pattern] = 'allow'
+  }
+
+  const rawEdit = existingPermission.edit
+  const edit: Record<string, unknown> = isRecord(rawEdit)
+    ? {...rawEdit}
+    : typeof rawEdit === 'string'
+      ? {'*': rawEdit}
+      : {}
+  denySkillsEdits(edit, skills)
+
+  config.permission = {
+    ...existingPermission,
+    external_directory: external,
+    ...(Object.keys(edit).length > 0 ? {edit} : {}),
   }
 }
 
@@ -289,6 +393,11 @@ export function buildCIConfig(
     opencodeConfig: string | null
     systematicVersion: string
     integrationWorkDir?: string
+    /**
+     * The installed Systematic `skills/` directory of `systematicVersion` (`resolveSystematicSkillsDirsV1`). Empty or
+     * absent when it could not be resolved: nothing is added then, and the caller has already said so.
+     */
+    systematicSkillsDirs?: readonly string[]
   },
   logger: Logger,
 ): CIConfigResult {
@@ -360,6 +469,11 @@ export function buildCIConfig(
   // `build` agent. See `scopeAttachmentDirectoryPermission`'s doc comment.
   scopeAttachmentDirectoryPermission(ciConfig, process.env.RUNNER_TEMP, logger)
 
+  const skillsGrant = toBundledSkillsGrant(inputs.systematicSkillsDirs ?? [], inputs.systematicVersion, logger)
+  if (skillsGrant != null) {
+    scopeBundledSkillsGlobalPermission(ciConfig, skillsGrant)
+  }
+
   const rewrittenFields: string[] = []
 
   // Strip legacy 'plugins' (plural) key entirely
@@ -371,7 +485,7 @@ export function buildCIConfig(
   // Pin default_agent to "build" — overrides any user-provided value
   const userAgent: unknown = ciConfig.default_agent
   ciConfig.default_agent = 'build'
-  scopeExternalDirectoryPermission(ciConfig, process.env.RUNNER_TEMP, inputs.integrationWorkDir, logger)
+  scopeExternalDirectoryPermission(ciConfig, process.env.RUNNER_TEMP, inputs.integrationWorkDir, skillsGrant, logger)
   if (userAgent != null && userAgent !== 'build') {
     rewrittenFields.push('default_agent')
   }

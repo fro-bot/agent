@@ -1,5 +1,10 @@
 export {ATTACHMENT_DIR_SEGMENT, buildAttachmentDir, createAttachmentDirExclusive} from './attachment-dir.js'
 export {
+  resolveSystematicSkillsDirsV1,
+  resolveSystematicSkillsDirsV2,
+  systematicSkillsEditDenyPatternV1,
+} from './bundled-skills-dir.js'
+export {
   boundedCredentialRequest,
   credentialFailure,
   modelProviderId,

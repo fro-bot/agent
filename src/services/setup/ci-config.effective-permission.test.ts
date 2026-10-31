@@ -1,3 +1,4 @@
+import * as path from 'node:path'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {buildCIConfig} from './ci-config.js'
@@ -281,5 +282,187 @@ describe('effective child permission for the reference-file attachment directory
     // reintroduced hardcoded deny
     const unrelatedResolved = evaluate('external_directory', '/some/other/path/*', globalUser)
     expect(unrelatedResolved.action).toBe('allow')
+  })
+})
+
+/**
+ * The installed Systematic `skills/` directory (fro-bot/agent#2009). A skill reads its own `references/` and runs its
+ * own `scripts/` from there. OpenCode adds an `external_directory` allow for it to the built-in agents' defaults, but
+ * the build agent's block re-asserts `'*': 'deny'` after it, and `findLast` makes the deny win. The harness therefore
+ * re-allows exactly that directory after the deny, and (see the edit tests) denies the edit tools there.
+ */
+const SKILLS_VERSION = '3.29.0'
+const SYSTEMATIC_PACKAGE_DIR = `/home/runner/.cache/opencode/packages/@fro.bot/systematic@${SKILLS_VERSION}/node_modules/@fro.bot/systematic`
+const SKILLS_DIR = `${SYSTEMATIC_PACKAGE_DIR}/skills`
+const SKILLS_OPTIONS = {opencodeConfig: null, systematicVersion: SKILLS_VERSION, systematicSkillsDirs: [SKILLS_DIR]}
+
+interface ConfigShape {
+  permission?: Record<string, unknown>
+  agent: {build: {permission: Record<string, unknown>}}
+}
+
+/** The build agent's effective ruleset as upstream composes it: defaults, then the global key, then `agent.build`. */
+function buildAgentRuleset(config: ConfigShape, extraDefaults: Record<string, unknown> = {}): readonly Rule[] {
+  const defaults = fromConfig({'*': 'allow', external_directory: {'*': 'ask'}, ...extraDefaults})
+  return merge(defaults, fromConfig(config.permission ?? {}), fromConfig(config.agent.build.permission))
+}
+
+function configFor(options: Parameters<typeof buildCIConfig>[0] = SKILLS_OPTIONS): ConfigShape {
+  return buildCIConfig(options, createMockLogger()).config as unknown as ConfigShape
+}
+
+describe('effective permission for the bundled Systematic skills directory', () => {
+  it('lets the build agent read a skill reference and run a skill script', () => {
+    // #given
+    const ruleset = buildAgentRuleset(configFor())
+
+    // #then the asks a read, a glob and a shell scan raise (`<parentDir>/*`) all resolve to allow
+    expect(evaluate('external_directory', `${SKILLS_DIR}/ce-review/references/*`, ruleset).action).toBe('allow')
+    expect(evaluate('external_directory', `${SKILLS_DIR}/ce-review/scripts/*`, ruleset).action).toBe('allow')
+    expect(evaluate('external_directory', `${SKILLS_DIR}/*`, ruleset).action).toBe('allow')
+  })
+
+  it('keeps denying everything else outside the checkout: package siblings, the package, the cache, other versions', () => {
+    const ruleset = buildAgentRuleset(configFor())
+
+    // #then a sibling inside the package, outside skills/
+    expect(evaluate('external_directory', `${SYSTEMATIC_PACKAGE_DIR}/dist/*`, ruleset).action).toBe('deny')
+    expect(evaluate('external_directory', `${SYSTEMATIC_PACKAGE_DIR}/agents/*`, ruleset).action).toBe('deny')
+    expect(evaluate('external_directory', `${SYSTEMATIC_PACKAGE_DIR}/*`, ruleset).action).toBe('deny')
+    // #then a directory that merely shares the `skills` prefix
+    expect(evaluate('external_directory', `${SYSTEMATIC_PACKAGE_DIR}/skills-evil/*`, ruleset).action).toBe('deny')
+    // #then the cache root and the package cache
+    expect(evaluate('external_directory', '/home/runner/.cache/opencode/*', ruleset).action).toBe('deny')
+    expect(evaluate('external_directory', '/home/runner/.cache/opencode/packages/*', ruleset).action).toBe('deny')
+    // #then another installed version of the same package
+    const otherVersion = SKILLS_DIR.replace(SKILLS_VERSION, '3.28.0')
+    expect(evaluate('external_directory', `${otherVersion}/ce-review/references/*`, ruleset).action).toBe('deny')
+    // #then an unrelated external path
+    expect(evaluate('external_directory', '/etc/*', ruleset).action).toBe('deny')
+    expect(evaluate('external_directory', '/home/runner/.ssh/*', ruleset).action).toBe('deny')
+  })
+
+  it('keeps the response and attachment directories allowed', () => {
+    const ruleset = buildAgentRuleset(configFor())
+
+    expect(evaluate('external_directory', attachmentPattern(RUNNER_TEMP, RUN_ID, RUN_ATTEMPT), ruleset).action).toBe(
+      'allow',
+    )
+    expect(
+      evaluate('external_directory', `${RUNNER_TEMP}/fro-bot-response/${RUN_ID}-${RUN_ATTEMPT}/*`, ruleset).action,
+    ).toBe('allow')
+  })
+
+  it('reaches a dispatched subagent through the parent session, for the build agent and for a plain root session', () => {
+    const config = configFor()
+    const rulesets = {
+      'build agent': buildAgentRuleset(config),
+      // The global key alone: what a root session of an agent with no `external_directory` block of its own resolves.
+      'global key only': merge(fromConfig({external_directory: {'*': 'ask'}}), fromConfig(config.permission ?? {})),
+    }
+
+    for (const [label, parentSession] of Object.entries(rulesets)) {
+      // #when a subagent is dispatched
+      const child = deriveSubagentSessionPermission(parentSession)
+
+      // #then it can read the skill references, and only those
+      expect([label, evaluate('external_directory', `${SKILLS_DIR}/ce-review/references/*`, child).action]).toEqual([
+        label,
+        'allow',
+      ])
+      expect([label, evaluate('external_directory', `${SYSTEMATIC_PACKAGE_DIR}/dist/*`, child).action]).toEqual([
+        label,
+        'deny',
+      ])
+      expect([label, evaluate('external_directory', '/etc/*', child).action]).toEqual([label, 'deny'])
+    }
+  })
+
+  it('adds nothing when the directory could not be resolved', () => {
+    // #given setup found no installed plugin
+    const config = configFor({opencodeConfig: null, systematicVersion: SKILLS_VERSION})
+    const ruleset = buildAgentRuleset(config)
+
+    // #then the skills directory stays denied and no skills-shaped rule was written anywhere
+    expect(evaluate('external_directory', `${SKILLS_DIR}/ce-review/references/*`, ruleset).action).toBe('deny')
+    expect(JSON.stringify(config)).not.toContain('node_modules')
+    expect(JSON.stringify(config)).not.toContain('/skills/')
+    // #then an empty resolution is the same as none
+    expect(configFor({opencodeConfig: null, systematicVersion: SKILLS_VERSION, systematicSkillsDirs: []})).toEqual(
+      config,
+    )
+  })
+
+  it('still grants it without RUNNER_TEMP, where the response and attachment directories are not known', () => {
+    // #given a local, non-Actions run
+    vi.stubEnv('RUNNER_TEMP', '')
+
+    // #when
+    const config = configFor()
+    const ruleset = buildAgentRuleset(config)
+
+    // #then the skills directory is the only exception, behind a deny
+    expect(evaluate('external_directory', `${SKILLS_DIR}/ce-review/references/*`, ruleset).action).toBe('allow')
+    expect(evaluate('external_directory', '/etc/*', ruleset).action).toBe('deny')
+  })
+
+  it("keeps an operator's own external_directory wildcard and puts the skills allow after it", () => {
+    const config = configFor({
+      ...SKILLS_OPTIONS,
+      opencodeConfig: JSON.stringify({permission: {external_directory: {'*': 'ask'}}}),
+    })
+    const globalRules = fromConfig(config.permission ?? {})
+
+    expect(evaluate('external_directory', `${SKILLS_DIR}/ce-review/references/*`, globalRules).action).toBe('allow')
+    expect(evaluate('external_directory', '/etc/*', globalRules).action).toBe('ask')
+  })
+
+  describe('edit tools', () => {
+    // Upstream's edit, write and apply_patch ask `permission: "edit"` with `path.relative(instance.worktree, file)`
+    // (tool/edit.ts:104, write.ts:56, apply_patch.ts:205), NOT the absolute path. An absolute `<dir>/*` deny would
+    // therefore never match what they ask, so the deny has to match the relative spelling for any worktree.
+    const WORKTREES = ['/home/runner/work/repo/repo', '/home/runner/work/repo/repo/packages/app', '/', '/workspace']
+    const file = `${SKILLS_DIR}/ce-review/scripts/validate-review.mjs`
+
+    it('an absolute-path pattern does not match what the edit tools ask (why the deny is anchored on the tail)', () => {
+      for (const worktree of WORKTREES) {
+        expect(wildcardMatch(path.relative(worktree, file), `${SKILLS_DIR}/*`)).toBe(false)
+      }
+    })
+
+    it('denies edit, write and apply_patch there, whatever the worktree is', () => {
+      const ruleset = buildAgentRuleset(configFor())
+      const child = deriveSubagentSessionPermission(ruleset)
+
+      for (const worktree of WORKTREES) {
+        const asked = path.relative(worktree, file)
+        // #then the build agent and a dispatched subagent (which inherits parent denies) are both refused
+        expect([worktree, evaluate('edit', asked, ruleset).action]).toEqual([worktree, 'deny'])
+        expect([worktree, evaluate('edit', asked, child).action]).toEqual([worktree, 'deny'])
+        // #then and the absolute spelling too
+        expect([worktree, evaluate('edit', file, ruleset).action]).toEqual([worktree, 'deny'])
+      }
+    })
+
+    it('leaves edits elsewhere alone: the checkout, the package outside skills/, another version', () => {
+      const ruleset = buildAgentRuleset(configFor())
+      const worktree = WORKTREES[0] ?? ''
+
+      expect(evaluate('edit', 'src/index.ts', ruleset).action).toBe('allow')
+      expect(evaluate('edit', path.relative(worktree, `${SYSTEMATIC_PACKAGE_DIR}/package.json`), ruleset).action).toBe(
+        'allow',
+      )
+      expect(evaluate('edit', path.relative(worktree, file.replace(SKILLS_VERSION, '3.28.0')), ruleset).action).toBe(
+        'allow',
+      )
+    })
+
+    it('keeps the operator edit rules that were already there', () => {
+      const config = configFor({...SKILLS_OPTIONS, opencodeConfig: JSON.stringify({permission: {edit: 'ask'}})})
+      const ruleset = buildAgentRuleset(config, {edit: 'ask'})
+
+      expect(evaluate('edit', 'src/index.ts', ruleset).action).toBe('ask')
+      expect(evaluate('edit', path.relative(WORKTREES[0] ?? '', file), ruleset).action).toBe('deny')
+    })
   })
 })

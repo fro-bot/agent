@@ -18,6 +18,7 @@
 import type {AddressInfo} from 'node:net'
 import type {OpenCodeV2ServerHandle} from '@fro-bot/runtime'
 import type {StartActionOpenCodeV2Options} from './v2-server.js'
+import {Buffer} from 'node:buffer'
 import {execFileSync} from 'node:child_process'
 import {
   closeSync,
@@ -37,7 +38,7 @@ import path from 'node:path'
 import process from 'node:process'
 import {DatabaseSync} from 'node:sqlite'
 import {fileURLToPath} from 'node:url'
-import {clearHeldClaims} from '@fro-bot/runtime'
+import {clearHeldClaims, resolveSystematicSkillsDirsV2} from '@fro-bot/runtime'
 import {afterAll, beforeAll, describe, expect, it, vi} from 'vitest'
 import pin from '../../../packages/runtime/src/shared/opencode-v2-pin.json'
 import {createExecAdapter} from '../../services/setup/adapters.js'
@@ -152,6 +153,96 @@ async function startProvider(): Promise<Provider> {
   }
 }
 
+interface SkillReadProvider {
+  readonly baseURL: string
+  /** What the model was told after each tool call, in order: the skill load, then the file read. */
+  readonly toolResults: () => readonly string[]
+  readonly stop: () => Promise<void>
+}
+
+interface ChatMessage {
+  readonly role?: string
+  readonly content?: unknown
+}
+
+function sse(res: http.ServerResponse, delta: Record<string, unknown>, finish: string | null): void {
+  res.write(
+    `data: ${JSON.stringify({id: 'c', object: 'chat.completion.chunk', created: 1, model: 'fixture-model', choices: [{index: 0, delta, finish_reason: finish}]})}\n\n`,
+  )
+}
+
+function toolCall(res: http.ServerResponse, id: string, name: string, args: Record<string, unknown>): void {
+  sse(
+    res,
+    {
+      role: 'assistant',
+      tool_calls: [{index: 0, id, type: 'function', function: {name, arguments: JSON.stringify(args)}}],
+    },
+    null,
+  )
+  sse(res, {}, 'tool_calls')
+  res.end('data: [DONE]\n\n')
+}
+
+/**
+ * An OpenAI-compatible stub that scripts a four-step turn: load the `ce-review` skill, read `readPath` (one of that
+ * skill's reference files), try to write `writePath` (a new file beside it), then stop. The skill's own output is too long for the model to see its base directory (the
+ * server truncates it to a file), so the path comes from the test, which knows where the plugin was installed. It keeps what each tool returned, so a test can tell a
+ * read that worked from one the permission rules refused.
+ */
+async function startSkillReadProvider(readPath: string, writePath: string): Promise<SkillReadProvider> {
+  const results: string[] = []
+  const server = http.createServer((req, res) => {
+    if (req.method === 'GET') {
+      res.writeHead(200, {'content-type': 'application/json'})
+      res.end(JSON.stringify({object: 'list', data: [{id: 'fixture-model', object: 'model'}]}))
+      return
+    }
+    const chunks: Buffer[] = []
+    req.on('data', chunk => chunks.push(chunk as Buffer))
+    req.on('end', () => {
+      const text = Buffer.concat(chunks).toString('utf8')
+      const body = JSON.parse(text) as {messages?: ChatMessage[]; tools?: unknown[]}
+      res.writeHead(200, {'content-type': 'text/event-stream', 'cache-control': 'no-cache'})
+      const toolMessages = (body.messages ?? []).filter(message => message.role === 'tool')
+      const last = toolMessages.at(-1)
+      const lastText = typeof last?.content === 'string' ? last.content : JSON.stringify(last?.content ?? '')
+      if ((body.tools ?? []).length === 0) {
+        // Not an agent turn (a title or summary request): answer without a tool.
+        sse(res, {role: 'assistant', content: 'ok'}, 'stop')
+        res.end('data: [DONE]\n\n')
+        return
+      }
+      if (toolMessages.length === 0) {
+        const id = /ce[:-]review/.exec(text)?.[0] ?? 'ce-review'
+        toolCall(res, 'call_skill', 'skill', {id})
+        return
+      }
+      results[toolMessages.length - 1] = lastText
+      if (toolMessages.length === 1) {
+        toolCall(res, 'call_read', 'read', {path: readPath})
+        return
+      }
+      if (toolMessages.length === 2) {
+        toolCall(res, 'call_write', 'write', {path: writePath, content: 'poisoned\n'})
+        return
+      }
+      sse(res, {role: 'assistant', content: 'done'}, 'stop')
+      res.end('data: [DONE]\n\n')
+    })
+  })
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  const {port} = server.address() as AddressInfo
+  return {
+    baseURL: `http://127.0.0.1:${port}/v1`,
+    toolResults: () => results,
+    stop: async () => {
+      server.closeAllConnections()
+      await new Promise<void>(resolve => server.close(() => resolve()))
+    },
+  }
+}
+
 /** The operator's `opencode-config` input: the stub provider and the model. The key comes from `auth-json`, not here. */
 function operatorConfig(baseURL: string): string {
   return JSON.stringify({
@@ -250,6 +341,7 @@ function isProcessAlive(pid: number): boolean {
 const sandboxes: Sandbox[] = []
 const handles: OpenCodeV2ServerHandle[] = []
 const providers: Provider[] = []
+const skillProviders: SkillReadProvider[] = []
 
 describe.skipIf(!hasBinary)('startActionOpenCodeV2 against the real stock binary', () => {
   beforeAll(() => {
@@ -262,6 +354,7 @@ describe.skipIf(!hasBinary)('startActionOpenCodeV2 against the real stock binary
   afterAll(async () => {
     for (const handle of handles) await handle.shutdown()
     for (const provider of providers) await provider.stop()
+    for (const provider of skillProviders) await provider.stop()
     for (const box of sandboxes) rmSync(box.root, {recursive: true, force: true})
   })
 
@@ -468,5 +561,79 @@ describe.skipIf(!hasBinary)('startActionOpenCodeV2 against the real stock binary
       // Only now does the fallback apply; on a failed assertion above it stops the leak the assertion found.
       handles.push(server)
     }
+  }, 240_000)
+
+  it('lets the ce-review skill read its own reference file under the outside-checkout deny (fro-bot/agent#2009)', async () => {
+    // #given the plugins installed the way setup installs them, and a model that loads the skill and then reads one of
+    // the references the skill reports a base directory for
+    const box = createSandbox()
+    sandboxes.push(box)
+    const resolved = unwrapOk(resolvePluginSpecsV2('latest'))
+    unwrapOk(
+      await installPluginsV2({
+        logger: createMockLogger(),
+        execAdapter: createExecAdapter(),
+        opencodeBinaryPath: BINARY as string,
+        specs: resolved.specs,
+        cacheHome: box.cacheHome,
+        env: box.env,
+      }),
+    )
+    const [skillsDir] = await resolveSystematicSkillsDirsV2(box.cacheHome, resolved.systematicVersion)
+    expect(skillsDir).toBeDefined()
+    const reference = path.join(skillsDir as string, 'ce-review', 'references', 'diff-scope.md')
+    const planted = path.join(skillsDir as string, 'ce-review', 'references', 'planted-by-the-agent.md')
+    const provider = await startSkillReadProvider(reference, planted)
+    skillProviders.push(provider)
+
+    // #when the Action starts the real server, which sets the deny and the skills exception, and the turn runs
+    const started = await startActionOpenCodeV2({
+      binaryPath: BINARY as string,
+      workspacePath: box.repo,
+      authJson: JSON.stringify({fake: {type: 'api', key: CANARY}}),
+      opencodeConfig: operatorConfig(provider.baseURL),
+      systematicVersion: 'latest',
+      model: MODEL,
+      dbPath: box.dbPath,
+      authPath: box.authPath,
+      env: box.env,
+      runId: 3,
+      runAttempt: 1,
+      logger: createMockLogger(),
+      deps: {
+        startServer: async (spawnOptions, spawnLogger) => {
+          const {startOpenCodeV2Server} = await import('@fro-bot/runtime')
+          return startOpenCodeV2Server({...spawnOptions, timeouts: {agentReadyTimeoutMs: 90_000}}, spawnLogger)
+        },
+      },
+    })
+    const handle = unwrapOk(started)
+    handles.push(handle)
+    const created = (await (
+      await handle.fetch('/api/session', {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        body: JSON.stringify({location: {directory: box.repo}}),
+      })
+    ).json()) as {data: {id: string}}
+    handle.registerOwnedSession(created.data.id)
+    const prompt = await handle.fetch(`/api/session/${created.data.id}/prompt`, {
+      method: 'POST',
+      headers: {'content-type': 'application/json'},
+      body: JSON.stringify({text: 'review'}),
+    })
+    expect(prompt.status).toBeLessThan(300)
+    expect(await waitFor(() => provider.toolResults().length >= 3, 60_000)).toBe(true)
+
+    // #then the skill loaded
+    const [skillResult = '', readResult = '', writeResult = ''] = provider.toolResults()
+    expect(skillResult).toContain('ce-review')
+    // #and the reference outside the checkout was read: its content came back, not a permission refusal
+    expect(readResult).toContain(readFileSync(reference, 'utf8').split('\n')[2] ?? '\u0000')
+    expect(readResult.toLowerCase()).not.toContain('denied')
+    expect(readResult.toLowerCase()).not.toContain('external_directory')
+    // #and the write tool is refused there by the `edit` deny (V2 asks `edit` with the absolute path outside the checkout)
+    expect(writeResult).toContain('permission.rejected')
+    expect(existsSync(planted)).toBe(false)
   }, 240_000)
 })
