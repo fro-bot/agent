@@ -3,7 +3,7 @@ import type {AttachmentResult} from '../../features/attachments/index.js'
 import type {MetricsCollector} from '../../features/observability/index.js'
 import type {Logger} from '../../shared/logger.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
-import type {CacheRestorePhaseResult} from './cache-restore.js'
+import type {CacheRestorePhaseResult, CacheRestoreV2PhaseResult} from './cache-restore.js'
 import type {RoutingPhaseResult} from './routing.js'
 import {
   buildLogicalKey,
@@ -22,6 +22,8 @@ import {getGitHubWorkspace, getInvocationIdentity} from '../../shared/env.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {createLogger} from '../../shared/logger.js'
 import {normalizeWorkspacePath} from '../../shared/paths.js'
+import {isCacheRestoreV2} from './cache-restore-kind.js'
+import {createSessionReaderV2, prepareSessionContextV2, resolveSessionForLogicalKeyV2} from './session-v2.js'
 
 export interface SessionPrepPhaseResult {
   readonly recentSessions: readonly SessionSummary[]
@@ -87,7 +89,7 @@ export const eagerSessionPrepStrategy: SessionPrepStrategy = async ({
 export async function runSessionPrep(
   bootstrap: BootstrapPhaseResult,
   routing: RoutingPhaseResult,
-  cacheRestore: CacheRestorePhaseResult,
+  cacheRestore: CacheRestorePhaseResult | CacheRestoreV2PhaseResult,
   metrics: MetricsCollector,
   strategy: SessionPrepStrategy = eagerSessionPrepStrategy,
 ): Promise<SessionPrepPhaseResult> {
@@ -99,16 +101,24 @@ export async function runSessionPrep(
   let continueSessionId: string | null = null
   let isContinuation = false
 
+  // The one place the session reads pick a generation: V1 reads through the SDK client, V2 over the server's routes.
   if (logicalKey != null) {
-    const resolution = await resolveSessionForLogicalKey(
-      cacheRestore.serverHandle.client,
-      normalizedWorkspace,
-      logicalKey,
-      sessionLogger,
-    )
+    const resolution = isCacheRestoreV2(cacheRestore)
+      ? await resolveSessionForLogicalKeyV2(
+          createSessionReaderV2(cacheRestore.serverHandle.fetch),
+          normalizedWorkspace,
+          logicalKey,
+          sessionLogger,
+        )
+      : await resolveSessionForLogicalKey(
+          cacheRestore.serverHandle.client,
+          normalizedWorkspace,
+          logicalKey,
+          sessionLogger,
+        )
 
     if (resolution.status === 'found') {
-      continueSessionId = resolution.session.id
+      continueSessionId = 'session' in resolution ? resolution.session.id : resolution.sessionId
       isContinuation = true
       sessionLogger.info('Session continuity: found existing session', {
         logicalKey: logicalKey.key,
@@ -129,13 +139,20 @@ export async function runSessionPrep(
   const searchQuery = buildSessionSearchQuery(logicalKey, routing.agentContext.issueTitle, routing.agentContext.repo)
   let preparedContext: SessionPrepStrategyResult = {recentSessions: [], priorWorkContext: []}
   try {
-    preparedContext = await strategy({
-      client: cacheRestore.serverHandle.client,
-      workspacePath: normalizedWorkspace,
-      searchQuery,
-      logicalKey,
-      logger: sessionLogger,
-    })
+    preparedContext = isCacheRestoreV2(cacheRestore)
+      ? await prepareSessionContextV2({
+          reader: createSessionReaderV2(cacheRestore.serverHandle.fetch),
+          workspacePath: normalizedWorkspace,
+          searchQuery,
+          logger: sessionLogger,
+        })
+      : await strategy({
+          client: cacheRestore.serverHandle.client,
+          workspacePath: normalizedWorkspace,
+          searchQuery,
+          logicalKey,
+          logger: sessionLogger,
+        })
   } catch (error: unknown) {
     sessionLogger.warning('Session presearch strategy failed; proceeding with empty context', {
       error: toErrorMessage(error),

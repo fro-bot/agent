@@ -1,5 +1,6 @@
 import type {
   ObjectStoreConfig,
+  OpenCodeV2ServerHandle,
   OutputModeMigrationState,
   OutputModeRequestState,
   OwnershipLedger,
@@ -27,6 +28,7 @@ import {assessInvocationOutcome} from './outcome.js'
 import {runAcknowledge} from './phases/acknowledge.js'
 import {runAcquireLock, type LeaseController} from './phases/acquire-lock.js'
 import {runBootstrap} from './phases/bootstrap.js'
+import {isCacheRestoreV2} from './phases/cache-restore-kind.js'
 import {runCacheRestore} from './phases/cache-restore.js'
 import {runCleanup} from './phases/cleanup.js'
 import {runBlockedLabelClear} from './phases/coordination-clear.js'
@@ -50,6 +52,7 @@ export async function run(): Promise<number> {
   let attachmentResult: AttachmentResult | null = null
   let detectedOpencodeVersion: string | null = null
   let serverHandle: OpenCodeServerHandle | null = null
+  let serverHandleV2: OpenCodeV2ServerHandle | null = null
   let repo = ''
   let runId = ''
   let sessionRetention: number | null = null
@@ -238,7 +241,8 @@ export async function run(): Promise<number> {
       }
       return 1
     }
-    serverHandle = cacheRestore.serverHandle
+    if (isCacheRestoreV2(cacheRestore)) serverHandleV2 = cacheRestore.serverHandle
+    else serverHandle = cacheRestore.serverHandle
 
     const sessionPrep = await runSessionPrep(bootstrap, routing, cacheRestore, metrics)
     attachmentResult = sessionPrep.attachmentResult
@@ -255,14 +259,24 @@ export async function run(): Promise<number> {
     // `SKIP_AGENT_EXECUTION=true` skipped execution entirely, in which case this
     // call is a no-op exactly like before.
     const drainLogger = createLogger({phase: 'drain'})
-    const drainResult = await runDrain({
-      ledger: execution.ownershipLedger,
-      client: cacheRestore.serverHandle.client,
-      parentSessionId: execution.sessionId,
-      directory: getGitHubWorkspace(),
-      deadlineMs: computeDrainDeadlineMs(bootstrap.inputs.timeoutMs, execution.executionDurationMs),
-      logger: drainLogger,
-    })
+    // V2 has its own release rule (directory quiescence, owned shells, a bounded drain) in U12b. Until it lands a V2 run
+    // is not drained: whatever the ledger still holds is reported unresolved, so persistence stays closed for it.
+    // TODO(U12b): replace this branch with the V2 drain adapter.
+    const drainResult = isCacheRestoreV2(cacheRestore)
+      ? {
+          expired: false,
+          cancelledCount: 0,
+          settledCount: 0,
+          unknownCount: (execution.ownershipLedger?.outstanding() ?? 0) + (execution.ownershipLedger?.unknown() ?? 0),
+        }
+      : await runDrain({
+          ledger: execution.ownershipLedger,
+          client: cacheRestore.serverHandle.client,
+          parentSessionId: execution.sessionId,
+          directory: getGitHubWorkspace(),
+          deadlineMs: computeDrainDeadlineMs(bootstrap.inputs.timeoutMs, execution.executionDurationMs),
+          logger: drainLogger,
+        })
     if (drainResult.expired) {
       drainLogger.warning('Drain deadline reached before owned work settled; run reports incomplete', {
         cancelledCount: drainResult.cancelledCount,
@@ -364,6 +378,7 @@ export async function run(): Promise<number> {
       githubClient,
       attachmentResult,
       serverHandle,
+      ...(serverHandleV2 === null ? {} : {serverHandleV2}),
       sessionRetention,
       detectedOpencodeVersion,
       storeConfig,
