@@ -3,6 +3,8 @@ import {test} from 'node:test'
 import {mkdtemp, writeFile, readFile, rm, stat, open} from 'node:fs/promises'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
+import {spawnSync} from 'node:child_process'
+import {fileURLToPath} from 'node:url'
 
 import {provisionAgentConfig} from './provision-agent-config.mjs'
 
@@ -155,4 +157,44 @@ test('rejects a malformed overlay and writes nothing', async () => {
   } finally {
     await rm(root, {recursive: true, force: true})
   }
+})
+
+const SCRIPT = fileURLToPath(new URL('./provision-agent-config.mjs', import.meta.url))
+
+async function runCli({overlay, model}) {
+  const root = await makeTempRoot()
+  try {
+    const baseConfigPath = join(root, 'base.json')
+    await writeFile(baseConfigPath, JSON.stringify(BASE_CONFIG))
+    const result = spawnSync(
+      process.execPath,
+      [SCRIPT, baseConfigPath, join(root, 'auth.json'), join(root, 'opencode.json')],
+      {
+        input: '',
+        encoding: 'utf8',
+        env: {PATH: process.env.PATH, WORKSPACE_OPENCODE_CONFIG: overlay, WORKSPACE_OPENCODE_MODEL: model},
+      },
+    )
+    return {status: result.status, stderr: result.stderr}
+  } finally {
+    await rm(root, {recursive: true, force: true})
+  }
+}
+
+test('the startup marker says the overlay was merged into the config file, not that a provider loaded', async () => {
+  const {status, stderr} = await runCli({
+    overlay: JSON.stringify({provider: {anthropic: {options: {baseURL: 'https://cliproxy.fro.bot/v1'}}}}),
+    model: 'anthropic/claude-sonnet-4-6',
+  })
+
+  assert.equal(status, 0)
+  assert.match(stderr, /provider-overlay=merged-into-config-file/)
+  assert.doesNotMatch(stderr, /provider-overlay=applied/)
+})
+
+test('the startup marker reports none when no overlay is set', async () => {
+  const {status, stderr} = await runCli({overlay: '', model: ''})
+
+  assert.equal(status, 0)
+  assert.match(stderr, /provider-overlay=none/)
 })
