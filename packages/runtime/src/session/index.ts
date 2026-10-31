@@ -84,4 +84,4 @@ export {
 export type {SessionDbBasenames, SessionGeneration} from './version.js'
 
 // Writeback
-export {writeSessionSummary} from './writeback.js'
+export {formatSummaryForSession, writeSessionSummary} from './writeback.js'
