@@ -104,6 +104,18 @@ describe('buildWorkspaceConfigV2', () => {
       expect(evaluatePermissionV2('edit', 'src/index.ts', rules)).toBe('ask')
     })
 
+    it('denies edits through every granted spelling, including a real path outside the cache layout', () => {
+      // #given the lexical path and a real path elsewhere (a symlinked cache)
+      const REAL = '/mnt/agent-cache/@fro.bot/systematic/skills'
+      const rules = rulesOf(build({plugins: [], bundledSkillsDirectories: [SKILLS, REAL]}).content)
+
+      // #then each is readable and neither is writable through the edit tools
+      for (const dir of [SKILLS, REAL]) {
+        expect(evaluatePermissionV2('external_directory', `${dir}/*`, rules)).toBe('allow')
+        expect(evaluatePermissionV2('edit', `${dir}/ce-review/scripts/validate-review.mjs`, rules)).toBe('deny')
+      }
+    })
+
     it('is an authorized exception, so the permission gate passes for every agent', async () => {
       // #given
       const {content, expectations} = build({plugins: [], bundledSkillsDirectories: [SKILLS]})

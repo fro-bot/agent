@@ -43,7 +43,8 @@ interface Rule {
 
 function wildcardToRegExp(pattern: string): RegExp {
   const escaped = pattern.replaceAll(/[.+^${}()|[\]\\]/g, String.raw`\$&`).replaceAll('*', '.*')
-  return new RegExp(`^${escaped}$`)
+  // The `s` flag is upstream's (`core/src/util/wildcard.ts`): `.` then matches every character.
+  return new RegExp(`^${escaped}$`, 's')
 }
 
 function wildcardMatch(value: string, pattern: string): boolean {
@@ -444,7 +445,7 @@ describe('effective permission for the bundled Systematic skills directory', () 
       }
     })
 
-    it('leaves edits elsewhere alone: the checkout, the package outside skills/, another version', () => {
+    it('leaves edits elsewhere alone: the checkout and the package outside skills/', () => {
       const ruleset = buildAgentRuleset(configFor())
       const worktree = WORKTREES[0] ?? ''
 
@@ -452,9 +453,89 @@ describe('effective permission for the bundled Systematic skills directory', () 
       expect(evaluate('edit', path.relative(worktree, `${SYSTEMATIC_PACKAGE_DIR}/package.json`), ruleset).action).toBe(
         'allow',
       )
-      expect(evaluate('edit', path.relative(worktree, file.replace(SKILLS_VERSION, '3.28.0')), ruleset).action).toBe(
-        'allow',
-      )
+    })
+
+    it('also denies another version of the same package, which shares the tail (by design: one pattern, no version)', () => {
+      const ruleset = buildAgentRuleset(configFor())
+      const other = file.replace(SKILLS_VERSION, '3.28.0')
+
+      expect(evaluate('edit', path.relative(WORKTREES[0] ?? '', other), ruleset).action).toBe('deny')
+    })
+
+    describe('every granted spelling is denied, not only the one in the package layout', () => {
+      // A symlinked cache surfaces the real path: it is granted (`external_directory`) so it must be denied (`edit`).
+      const REAL_SKILLS_DIR = '/mnt/agent-cache/@fro.bot/systematic/skills'
+      const SPELLINGS = [SKILLS_DIR, REAL_SKILLS_DIR]
+      const ALL_WORKTREES = [...WORKTREES, '/mnt/data/checkout', '/mnt/agent-cache/work', '/srv/a/b/c/d/e/f']
+
+      it('denies edit, write and apply_patch through a real path outside the cache layout, from any worktree', () => {
+        const config = configFor({...SKILLS_OPTIONS, systematicSkillsDirs: SPELLINGS})
+        const ruleset = buildAgentRuleset(config)
+        const child = deriveSubagentSessionPermission(ruleset)
+
+        for (const dir of SPELLINGS) {
+          const target = `${dir}/ce-review/scripts/x.mjs`
+          // #then the external_directory grant exists for it
+          expect(evaluate('external_directory', `${dir}/ce-review/scripts/*`, ruleset).action).toBe('allow')
+          for (const worktree of ALL_WORKTREES) {
+            const asked = path.relative(worktree, target)
+            // #then and so does the edit deny, for the build agent and for a dispatched subagent
+            expect([dir, worktree, asked, evaluate('edit', asked, ruleset).action]).toEqual([
+              dir,
+              worktree,
+              asked,
+              'deny',
+            ])
+            expect([dir, worktree, evaluate('edit', asked, child).action]).toEqual([dir, worktree, 'deny'])
+          }
+          expect(evaluate('edit', target, ruleset).action).toBe('deny')
+        }
+      })
+
+      it('is one deny anchored on the shared tail: not a per-directory absolute path, not a version tail', () => {
+        const config = configFor({...SKILLS_OPTIONS, systematicSkillsDirs: SPELLINGS})
+        const editRules = Object.entries(config.permission?.edit as Record<string, string>)
+
+        expect(editRules).toEqual([['*/@fro.bot/systematic/skills/*', 'deny']])
+      })
+
+      it('shows why: a pattern built from the whole directory misses a worktree that shares a parent with it', () => {
+        // #given the common CI layout, a checkout and the cache under the same home
+        const asked = path.relative('/home/runner/work/repo/repo', `${SKILLS_DIR}/ce-review/scripts/x.mjs`)
+        expect(asked.startsWith('../')).toBe(true)
+
+        // #then `*` + the directory without its leading slash does not match (`home/runner` is not in the path) ...
+        expect(wildcardMatch(asked, `*${SKILLS_DIR.slice(1)}/*`)).toBe(false)
+        // #then the tail-anchored deny does
+        expect(wildcardMatch(asked, '*/@fro.bot/systematic/skills/*')).toBe(true)
+      })
+
+      it('refuses a granted directory that does not end in the tail, so no grant goes without its deny', () => {
+        const config = configFor({...SKILLS_OPTIONS, systematicSkillsDirs: ['/srv/other/skills', '/']})
+
+        expect(config.permission?.edit).toBeUndefined()
+        expect(JSON.stringify(config)).not.toContain('/srv/other')
+        expect(evaluate('external_directory', '/srv/other/skills/x/*', buildAgentRuleset(config)).action).toBe('deny')
+      })
+
+      it('leaves unrelated paths alone: inside the checkout, near the directory, another package', () => {
+        const config = configFor({...SKILLS_OPTIONS, systematicSkillsDirs: SPELLINGS})
+        const ruleset = buildAgentRuleset(config)
+
+        const unrelated = [
+          'src/index.ts',
+          'skills/ce-review/scripts/x.mjs',
+          '@fro.bot/systematic/skills/ce-review/scripts/x.mjs',
+          'systematic/skills/x.mjs',
+          path.relative('/mnt/data/checkout', '/mnt/agent-cache/@fro.bot/systematic/package.json'),
+          path.relative('/mnt/data/checkout', '/mnt/agent-cache/@fro.bot/systematic/skills-evil/x.mjs'),
+          path.relative('/mnt/data/checkout', '/mnt/agent-cache/@fro.bot/other/skills/x.mjs'),
+          path.relative('/mnt/data/checkout', '/mnt/agent-cache/other/@fro.bot/systematic/skills'),
+        ]
+        for (const asked of unrelated) {
+          expect([asked, evaluate('edit', asked, ruleset).action]).toEqual([asked, 'allow'])
+        }
+      })
     })
 
     it('keeps the operator edit rules that were already there', () => {

@@ -218,7 +218,7 @@ export interface RunSupervisedOpencodeV2Deps {
    * The installed Systematic `skills/` directory the image baked, or none when it is not on disk. Called once, before the
    * config is built. Default: the cache the image build filled, at the pinned Systematic version.
    */
-  readonly resolveBundledSkillsDirs: () => Promise<readonly string[]>
+  readonly resolveBundledSkillsDirs: (logger: RuntimeLogger) => Promise<readonly string[]>
 }
 
 export interface RunSupervisedOpencodeV2Options {
@@ -354,8 +354,8 @@ export async function runSupervisedOpencodeV2(options: RunSupervisedOpencodeV2Op
     prepareDatabase = async () => prepareFreshDatabase(),
     readAuthBlob = () => readOptionalSecretBlob(authFilePath(parentEnv)),
     readSpawnConfig = () => readSpawnConfigFromFile(),
-    resolveBundledSkillsDirs = async () =>
-      resolveSystematicSkillsDirsV2(AGENT_XDG_CACHE_HOME, DEFAULT_SYSTEMATIC_VERSION),
+    resolveBundledSkillsDirs = async (skillsLogger: RuntimeLogger) =>
+      resolveSystematicSkillsDirsV2(AGENT_XDG_CACHE_HOME, DEFAULT_SYSTEMATIC_VERSION, skillsLogger),
   } = options.deps ?? {}
 
   const runtimeLogger = toRuntimeLogger(logger)
@@ -369,7 +369,7 @@ export async function runSupervisedOpencodeV2(options: RunSupervisedOpencodeV2Op
   // change persists until the container is recreated. The `edit`/`write`/`patch` tools are denied for it
   // (permission-rules-v2.ts `bundledSkillsDirectories`); a shell command is not, and nothing but the agent's own
   // container reads what it writes. Not found (a harness-only image, a cache that was cleared): the ask stays.
-  const bundledSkillsDirectories = await resolveBundledSkillsDirs()
+  const bundledSkillsDirectories = await resolveBundledSkillsDirs(runtimeLogger)
   if (bundledSkillsDirectories.length === 0) {
     logger.warn('opencode-server-v2: the bundled Systematic skills directory was not found; skill reads will ask', {
       systematicVersion: DEFAULT_SYSTEMATIC_VERSION,

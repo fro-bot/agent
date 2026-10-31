@@ -155,8 +155,10 @@ async function startProvider(): Promise<Provider> {
 
 interface SkillReadProvider {
   readonly baseURL: string
-  /** What the model was told after each tool call, in order: the skill load, then the file read. */
+  /** What the model was told after each tool call, in order: the skill load, the file read, the write, the script. */
   readonly toolResults: () => readonly string[]
+  /** The tool names the server offered the model on its last agent turn. */
+  readonly toolNames: () => readonly string[]
   readonly stop: () => Promise<void>
 }
 
@@ -185,13 +187,19 @@ function toolCall(res: http.ServerResponse, id: string, name: string, args: Reco
 }
 
 /**
- * An OpenAI-compatible stub that scripts a four-step turn: load the `ce-review` skill, read `readPath` (one of that
- * skill's reference files), try to write `writePath` (a new file beside it), then stop. The skill's own output is too long for the model to see its base directory (the
- * server truncates it to a file), so the path comes from the test, which knows where the plugin was installed. It keeps what each tool returned, so a test can tell a
- * read that worked from one the permission rules refused.
+ * An OpenAI-compatible stub that scripts a five-step turn: load the `ce-review` skill, read `readPath` (one of that
+ * skill's reference files), try to write `writePath` (a new file beside it), run `command` through the shell tool (one
+ * of that skill's scripts), then stop. The skill's own output is too long for the model to see its base directory (the
+ * server truncates it to a file), so the paths come from the test, which knows where the plugin was installed. It keeps
+ * what each tool returned, so a test can tell a call that worked from one the permission rules refused.
  */
-async function startSkillReadProvider(readPath: string, writePath: string): Promise<SkillReadProvider> {
+async function startSkillReadProvider(
+  readPath: string,
+  writePath: string,
+  command: string,
+): Promise<SkillReadProvider> {
   const results: string[] = []
+  let toolNames: readonly string[] = []
   const server = http.createServer((req, res) => {
     if (req.method === 'GET') {
       res.writeHead(200, {'content-type': 'application/json'})
@@ -202,11 +210,15 @@ async function startSkillReadProvider(readPath: string, writePath: string): Prom
     req.on('data', chunk => chunks.push(chunk as Buffer))
     req.on('end', () => {
       const text = Buffer.concat(chunks).toString('utf8')
-      const body = JSON.parse(text) as {messages?: ChatMessage[]; tools?: unknown[]}
+      const body = JSON.parse(text) as {
+        messages?: ChatMessage[]
+        tools?: {function?: {name?: string}}[]
+      }
       res.writeHead(200, {'content-type': 'text/event-stream', 'cache-control': 'no-cache'})
       const toolMessages = (body.messages ?? []).filter(message => message.role === 'tool')
       const last = toolMessages.at(-1)
       const lastText = typeof last?.content === 'string' ? last.content : JSON.stringify(last?.content ?? '')
+      if ((body.tools ?? []).length > 0) toolNames = (body.tools ?? []).map(tool => tool.function?.name ?? '')
       if ((body.tools ?? []).length === 0) {
         // Not an agent turn (a title or summary request): answer without a tool.
         sse(res, {role: 'assistant', content: 'ok'}, 'stop')
@@ -227,6 +239,10 @@ async function startSkillReadProvider(readPath: string, writePath: string): Prom
         toolCall(res, 'call_write', 'write', {path: writePath, content: 'poisoned\n'})
         return
       }
+      if (toolMessages.length === 3) {
+        toolCall(res, 'call_bash', toolNames.find(name => name === 'bash' || name === 'shell') ?? 'bash', {command})
+        return
+      }
       sse(res, {role: 'assistant', content: 'done'}, 'stop')
       res.end('data: [DONE]\n\n')
     })
@@ -236,6 +252,7 @@ async function startSkillReadProvider(readPath: string, writePath: string): Prom
   return {
     baseURL: `http://127.0.0.1:${port}/v1`,
     toolResults: () => results,
+    toolNames: () => toolNames,
     stop: async () => {
       server.closeAllConnections()
       await new Promise<void>(resolve => server.close(() => resolve()))
@@ -579,11 +596,17 @@ describe.skipIf(!hasBinary)('startActionOpenCodeV2 against the real stock binary
         env: box.env,
       }),
     )
-    const [skillsDir] = await resolveSystematicSkillsDirsV2(box.cacheHome, resolved.systematicVersion)
+    const [skillsDir] = await resolveSystematicSkillsDirsV2(
+      box.cacheHome,
+      resolved.systematicVersion,
+      createMockLogger(),
+    )
     expect(skillsDir).toBeDefined()
     const reference = path.join(skillsDir as string, 'ce-review', 'references', 'diff-scope.md')
     const planted = path.join(skillsDir as string, 'ce-review', 'references', 'planted-by-the-agent.md')
-    const provider = await startSkillReadProvider(reference, planted)
+    const script = path.join(skillsDir as string, 'ce-review', 'scripts', 'validate-review.mjs')
+    // `--help` prints the usage and exits at once; what matters is that the shell tool was allowed to run the script.
+    const provider = await startSkillReadProvider(reference, planted, `node ${script} --help`)
     skillProviders.push(provider)
 
     // #when the Action starts the real server, which sets the deny and the skills exception, and the turn runs
@@ -623,10 +646,10 @@ describe.skipIf(!hasBinary)('startActionOpenCodeV2 against the real stock binary
       body: JSON.stringify({text: 'review'}),
     })
     expect(prompt.status).toBeLessThan(300)
-    expect(await waitFor(() => provider.toolResults().length >= 3, 60_000)).toBe(true)
+    expect(await waitFor(() => provider.toolResults().length >= 4, 60_000)).toBe(true)
 
     // #then the skill loaded
-    const [skillResult = '', readResult = '', writeResult = ''] = provider.toolResults()
+    const [skillResult = '', readResult = '', writeResult = '', scriptResult = ''] = provider.toolResults()
     expect(skillResult).toContain('ce-review')
     // #and the reference outside the checkout was read: its content came back, not a permission refusal
     expect(readResult).toContain(readFileSync(reference, 'utf8').split('\n')[2] ?? '\u0000')
@@ -635,5 +658,9 @@ describe.skipIf(!hasBinary)('startActionOpenCodeV2 against the real stock binary
     // #and the write tool is refused there by the `edit` deny (V2 asks `edit` with the absolute path outside the checkout)
     expect(writeResult).toContain('permission.rejected')
     expect(existsSync(planted)).toBe(false)
+    // #and the skill's own script ran through the shell tool: its usage text came back, not a permission refusal
+    expect(scriptResult).toContain('Usage: node validate-review.mjs')
+    expect(scriptResult.toLowerCase()).not.toContain('permission.rejected')
+    expect(scriptResult.toLowerCase()).not.toContain('external_directory')
   }, 240_000)
 })

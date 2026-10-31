@@ -173,7 +173,7 @@ export async function startActionOpenCodeV2(
   //
   // After the plugins on purpose: the config names the installed Systematic skills directory, which does not exist
   // until the plugin is in the cache.
-  const bundledSkillsDirectories = await resolveSystematicSkillsDirsV2(cacheHome, specs.data.systematicVersion)
+  const bundledSkillsDirectories = await resolveSystematicSkillsDirsV2(cacheHome, specs.data.systematicVersion, logger)
   if (bundledSkillsDirectories.length === 0) {
     logger.warning(
       'Bundled Systematic skills directory not found; skills cannot read their own references under the external_directory deny',

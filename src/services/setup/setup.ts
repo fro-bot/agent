@@ -309,7 +309,11 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
     // that one directory. Unresolved (the plugin is not installed, or the install failed): say so and add nothing,
     // since the run can still do useful work without the skills' supporting files.
     if (v2Specs === undefined) {
-      const systematicSkillsDirs = await resolveSystematicSkillsDirsV1(resolveCacheHome(process.env), systematicVersion)
+      const systematicSkillsDirs = await resolveSystematicSkillsDirsV1(
+        resolveCacheHome(process.env),
+        systematicVersion,
+        logger,
+      )
       if (systematicSkillsDirs.length === 0) {
         logger.warning(
           'Bundled Systematic skills directory not found; skills cannot read their own references under the external_directory deny',

@@ -721,7 +721,7 @@ describe('setup', () => {
 
           // #then it is looked up where OpenCode installs (honouring XDG_CACHE_HOME), for the version installed,
           // and only once the install has run: on a cache miss the directory does not exist before
-          expect(resolveSystematicSkillsDirsV1).toHaveBeenCalledWith('/custom/cache', '2.1.0')
+          expect(resolveSystematicSkillsDirsV1).toHaveBeenCalledWith('/custom/cache', '2.1.0', expect.anything())
           const installOrder = vi.mocked(systematicPlugin.installSystematicPlugin).mock.invocationCallOrder[0] ?? 0
           const resolveOrder = vi.mocked(resolveSystematicSkillsDirsV1).mock.invocationCallOrder[0] ?? 0
           expect(resolveOrder).toBeGreaterThan(installOrder)

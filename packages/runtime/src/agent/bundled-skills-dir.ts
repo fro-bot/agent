@@ -11,15 +11,19 @@
  *
  * Both skill tools report `dirname(SKILL.md)` as the skill's base directory, built from the path the loader found the
  * file at, so a symlinked cache can surface the real path instead of the one named here. When the two differ both are
- * returned.
+ * returned, each as a spelling the caller grants and pairs with an edit deny.
  *
- * The version lands in a path and, on V1, in a wildcard pattern, so only a plain version or tag is accepted. An unsafe
- * value, a relative cache home and a directory that is not on disk all resolve to nothing, never to a wider path.
+ * Only a spelling that ends in `/@fro.bot/systematic/skills` is returned. A skills directory, or a parent of it, that
+ * links to `/` or any other shallow path would otherwise resolve to a real path whose grant (`/*`) covers the whole
+ * filesystem. Such a spelling is dropped with a warning, which never prints the path.
+ *
+ * The version lands in a path, so only a plain version or tag is accepted. An unsafe value, a relative cache home and a
+ * directory that is not on disk all resolve to nothing, never to a wider path.
  */
 
+import type {Logger} from '../shared/logger.js'
 import {readdir, realpath} from 'node:fs/promises'
 import path from 'node:path'
-
 import {SYSTEMATIC_PACKAGE} from '../shared/constants.js'
 
 /** A version or dist-tag as it appears in a plugin spec, with nothing that could widen a path or a wildcard. */
@@ -31,18 +35,33 @@ function isSafeInput(cacheHome: string, version: string): boolean {
   return path.isAbsolute(cacheHome) && SAFE_SPEC_VERSION.test(version) && !version.includes('..')
 }
 
+/** Every granted spelling names the package's own `skills` directory, however deep the cache sits. The edit deny keys on it. */
+const SKILLS_TAIL = `/${SYSTEMATIC_PACKAGE}/skills`
+
 /** The candidate and, when it differs, its real path. Empty when the candidate is not on disk. */
-async function existingSpellings(candidate: string): Promise<readonly string[]> {
+async function existingSpellings(candidate: string, logger: Logger): Promise<readonly string[]> {
+  let spellings: readonly string[]
   try {
     const real = await realpath(candidate)
-    return real === candidate ? [candidate] : [candidate, real]
+    spellings = real === candidate ? [candidate] : [candidate, real]
   } catch {
     return []
   }
+  const accepted = spellings.filter(isSystematicSkillsDir)
+  if (accepted.length < spellings.length) {
+    logger.warning(
+      'Ignoring a bundled Systematic skills path that resolves outside the package layout; skills there will ask',
+    )
+  }
+  return accepted
 }
 
 /** The installed V1 skills directory of `@fro.bot/systematic@<version>`, as the paths it may be reported under. */
-export async function resolveSystematicSkillsDirsV1(cacheHome: string, version: string): Promise<readonly string[]> {
+export async function resolveSystematicSkillsDirsV1(
+  cacheHome: string,
+  version: string,
+  logger: Logger,
+): Promise<readonly string[]> {
   if (!isSafeInput(cacheHome, version)) return []
   return existingSpellings(
     path.join(
@@ -54,11 +73,16 @@ export async function resolveSystematicSkillsDirsV1(cacheHome: string, version: 
       SYSTEMATIC_PACKAGE,
       'skills',
     ),
+    logger,
   )
 }
 
 /** The installed V2 skills directory of `@fro.bot/systematic@<version>`, as the paths it may be reported under. */
-export async function resolveSystematicSkillsDirsV2(cacheHome: string, version: string): Promise<readonly string[]> {
+export async function resolveSystematicSkillsDirsV2(
+  cacheHome: string,
+  version: string,
+  logger: Logger,
+): Promise<readonly string[]> {
   if (!isSafeInput(cacheHome, version)) return []
   const specDir = path.join(cacheHome, 'opencode', 'npm', `${SYSTEMATIC_PACKAGE}@${version}`)
   let entries: string[]
@@ -72,19 +96,24 @@ export async function resolveSystematicSkillsDirsV2(cacheHome: string, version: 
     .toSorted((a, b) => Number(a) - Number(b))
     .at(-1)
   if (newest === undefined) return []
-  return existingSpellings(path.join(specDir, newest, 'node_modules', SYSTEMATIC_PACKAGE, 'skills'))
+  return existingSpellings(path.join(specDir, newest, 'node_modules', SYSTEMATIC_PACKAGE, 'skills'), logger)
+}
+
+/** Whether `directory` is a spelling of the package's own `skills` directory (see `SKILLS_TAIL`). */
+export function isSystematicSkillsDir(directory: string): boolean {
+  return directory.endsWith(SKILLS_TAIL)
 }
 
 /**
- * The `edit` resource pattern that denies writes to the V1 skills directory.
+ * The V1 `edit` resource pattern that denies writes to every granted skills directory, from any worktree.
  *
  * V1's `edit`, `write` and `apply_patch` ask `permission: "edit"` with `path.relative(instance.worktree, file)`
- * (`tool/edit.ts`, `write.ts`, `apply_patch.ts`), so an absolute `<dir>/*` pattern never matches: from a checkout it is
- * `../../../.cache/opencode/...`, and the number of `..` depends on where the worktree is. `*` compiles to `.*` and
- * matches `/` and `..` too, so a pattern anchored on the version-specific tail matches the path whatever the worktree is
- * (and the absolute spelling as well). The tail names this one package version, so nothing else is caught.
+ * (`tool/edit.ts`, `write.ts`, `apply_patch.ts`), so an absolute `<dir>/*` pattern never matches. What the relative
+ * path keeps of the directory depends on how much of it the worktree shares: from `/home/runner/work/repo` the cache
+ * `/home/runner/.cache/opencode/...` is `../../.cache/opencode/...`, with no `home/runner` in it, so a pattern built
+ * from the whole directory misses the common case. The one thing every spelling has is its tail, and
+ * `existingSpellings` guarantees it. `*` compiles to `.*` and matches `/` and `..` too, so `*` + the tail matches the
+ * relative path from any worktree, and the absolute spelling as well. Nothing else ends in `/@fro.bot/systematic/skills`
+ * (not the package, not `skills-evil`, not the checkout), so one pattern pairs with every grant.
  */
-export function systematicSkillsEditDenyPatternV1(version: string): string | undefined {
-  if (!SAFE_SPEC_VERSION.test(version) || version.includes('..')) return undefined
-  return `*/opencode/packages/${SYSTEMATIC_PACKAGE}@${version}/node_modules/${SYSTEMATIC_PACKAGE}/skills/*`
-}
+export const SKILLS_EDIT_DENY_PATTERN_V1 = `*${SKILLS_TAIL}/*`

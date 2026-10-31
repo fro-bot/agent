@@ -537,7 +537,12 @@ describe('runSupervisedOpencodeV2', () => {
         mkdirSync(skills, {recursive: true})
 
         // #when the same resolver the default uses reads that cache
-        const dirs = await resolveSystematicSkillsDirsV2(cache, DEFAULT_SYSTEMATIC_VERSION)
+        const dirs = await resolveSystematicSkillsDirsV2(cache, DEFAULT_SYSTEMATIC_VERSION, {
+          debug: () => undefined,
+          info: () => undefined,
+          warning: () => undefined,
+          error: () => undefined,
+        })
 
         // #then
         expect(dirs[0]).toBe(skills)

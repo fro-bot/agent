@@ -6,8 +6,9 @@ import {
   buildResponseFileFallbackRoots,
   getGitHubRunAttempt,
   getGitHubRunId,
+  isSystematicSkillsDir,
   RESPONSE_FILE_DIR_SEGMENT,
-  systematicSkillsEditDenyPatternV1,
+  SKILLS_EDIT_DENY_PATTERN_V1,
 } from '@fro-bot/runtime'
 
 export interface CIConfigResult {
@@ -171,7 +172,7 @@ function scopeExternalDirectoryPermission(
       grant[pattern] = 'allow'
     }
     externalDirectory = grant
-    denySkillsEdits(editPermission, skills)
+    denySkillsEdits(editPermission)
   }
 
   config.agent = {
@@ -206,36 +207,32 @@ function scopeExternalDirectoryPermission(
 export interface BundledSkillsGrant {
   /** Absolute, literal directories (no `*`/`?`): the lexical path and, when it differs, its real path. */
   readonly dirs: readonly string[]
-  /** Anchored `edit` deny for the directory, or undefined when the version cannot be expressed safely. */
-  readonly editDenyPattern: string | undefined
 }
 
 /**
- * V1's edit, write and apply_patch ask `permission: "edit"` with `path.relative(instance.worktree, file)`, never the
- * absolute path, so the pattern is anchored on the version-specific tail (`systematicSkillsEditDenyPatternV1`) and
- * matches whatever worktree the relative path is taken from. It moves to the end of the map so it outranks any `*`.
+ * The `edit` deny that pairs with every granted directory. V1's edit, write and apply_patch ask `permission: "edit"`
+ * with `path.relative(instance.worktree, file)`, never the absolute path, and how much of the directory that keeps
+ * depends on the worktree, so the pattern is anchored on the tail all granted directories share
+ * (`SKILLS_EDIT_DENY_PATTERN_V1`). It moves to the end of the map so it outranks any `*`.
  */
-function denySkillsEdits(editPermission: Record<string, unknown>, skills: BundledSkillsGrant): void {
-  if (skills.editDenyPattern == null) return
-  delete editPermission[skills.editDenyPattern]
-  editPermission[skills.editDenyPattern] = 'deny'
+function denySkillsEdits(editPermission: Record<string, unknown>): void {
+  delete editPermission[SKILLS_EDIT_DENY_PATTERN_V1]
+  editPermission[SKILLS_EDIT_DENY_PATTERN_V1] = 'deny'
 }
 
 /**
  * Keep only directories that are literal absolute paths: a server reads `*` and `?` in a pattern as wildcards, so one
- * in a directory name would widen the grant. Nothing usable resolves to no grant at all.
+ * in a directory name would widen the grant. A directory must also be a spelling of the package's own `skills`
+ * directory, because that tail is what the edit deny is anchored on: a grant without it would be a grant without a deny.
+ * Nothing usable resolves to no grant at all.
  */
-function toBundledSkillsGrant(
-  dirs: readonly string[],
-  systematicVersion: string,
-  logger: Logger,
-): BundledSkillsGrant | undefined {
-  const usable = dirs.filter(dir => path.isAbsolute(dir) && !/[*?]/.test(dir))
+function toBundledSkillsGrant(dirs: readonly string[], logger: Logger): BundledSkillsGrant | undefined {
+  const usable = dirs.filter(dir => path.isAbsolute(dir) && !/[*?]/.test(dir) && isSystematicSkillsDir(dir))
   if (usable.length < dirs.length) {
-    logger.warning('Ignoring a bundled skills directory that is not a literal absolute path')
+    logger.warning('Ignoring a bundled skills directory that is not a literal absolute path to the Systematic skills')
   }
   if (usable.length === 0) return undefined
-  return {dirs: usable, editDenyPattern: systematicSkillsEditDenyPatternV1(systematicVersion)}
+  return {dirs: usable}
 }
 
 /**
@@ -268,7 +265,7 @@ function scopeBundledSkillsGlobalPermission(config: Record<string, unknown>, ski
     : typeof rawEdit === 'string'
       ? {'*': rawEdit}
       : {}
-  denySkillsEdits(edit, skills)
+  denySkillsEdits(edit)
 
   config.permission = {
     ...existingPermission,
@@ -469,7 +466,7 @@ export function buildCIConfig(
   // `build` agent. See `scopeAttachmentDirectoryPermission`'s doc comment.
   scopeAttachmentDirectoryPermission(ciConfig, process.env.RUNNER_TEMP, logger)
 
-  const skillsGrant = toBundledSkillsGrant(inputs.systematicSkillsDirs ?? [], inputs.systematicVersion, logger)
+  const skillsGrant = toBundledSkillsGrant(inputs.systematicSkillsDirs ?? [], logger)
   if (skillsGrant != null) {
     scopeBundledSkillsGlobalPermission(ciConfig, skillsGrant)
   }
