@@ -891,6 +891,28 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
     expect(releaseLock).not.toHaveBeenCalled()
   })
 
+  it('declines session persistence with its own reason when an OpenCode V2 start did not complete, even with S3 disabled', async () => {
+    // #given a V2 start that failed, so the run must not save: no coordination is involved
+    const {saveCache} = await import('../../services/cache/index.js')
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when
+    await runCleanup(
+      baseOptions({
+        skipSessionPersistence: true,
+        persistenceDeclineReason: 'the OpenCode V2 server did not complete its start, so no session state is saved',
+      }),
+    )
+
+    // #then nothing is saved, the post hook honors the decline, and the summary names the V2 reason, not the lock
+    expect(saveCache).not.toHaveBeenCalled()
+    const core = await import('@actions/core')
+    expect(core.saveState).toHaveBeenCalledWith('cacheSaved', 'declined-for-safety')
+    const summary = vi.mocked(core.summary.addRaw).mock.calls.flat().join(' ')
+    expect(summary).toContain('OpenCode V2 server did not complete its start')
+    expect(summary).not.toContain('Action coordination lock')
+  })
+
   describe('lock holder state handoff', () => {
     const lockedOptions = () =>
       baseOptions({

@@ -1,10 +1,14 @@
+import type {OpenCodeV2ServerHandle} from '@fro-bot/runtime'
 import type {OpenCodeServerHandle} from '../../features/agent/index.js'
 import type {MetricsCollector} from '../../features/observability/index.js'
 import type {CacheResult} from '../../shared/types.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
 import * as path from 'node:path'
+import process from 'node:process'
 import * as core from '@actions/core'
+import {DB_V2_MAIN_BASENAME} from '@fro-bot/runtime'
 import {bootstrapOpenCodeServer} from '../../features/agent/index.js'
+import {resolveSessionGeneration} from '../../services/cache/cache-key.js'
 import {
   buildCacheKeyComponents,
   checkpointDatabase,
@@ -14,15 +18,40 @@ import {
 } from '../../services/cache/index.js'
 import {DB_MAIN_BASENAME, DB_WAL_BASENAME} from '../../services/cache/paths.js'
 import {ensureProjectId} from '../../services/setup/project-id.js'
-import {getGitHubWorkspace, getOpenCodeAuthPath, getOpenCodeStoragePath} from '../../shared/env.js'
+import {
+  getGitHubRunAttempt,
+  getGitHubRunId,
+  getGitHubWorkspace,
+  getOpenCodeAuthPath,
+  getOpenCodeStoragePath,
+} from '../../shared/env.js'
 import {createLogger} from '../../shared/logger.js'
 import {normalizeWorkspacePath} from '../../shared/paths.js'
+import {startActionOpenCodeV2} from './v2-server.js'
 
 export interface CacheRestorePhaseResult {
   readonly cacheResult: CacheResult
   readonly cacheStatus: 'corrupted' | 'hit' | 'miss'
   readonly serverHandle: OpenCodeServerHandle
 }
+
+/**
+ * What U12a's execution loop receives on V2: the restored cache facts and a server that is spawned, gated (plugins,
+ * permissions, credentials) and past its V1 import. No prompt has been sent.
+ */
+export interface CacheRestoreV2PhaseResult {
+  readonly cacheResult: CacheResult
+  readonly cacheStatus: 'corrupted' | 'hit' | 'miss'
+  readonly serverHandle: OpenCodeV2ServerHandle
+}
+
+/**
+ * Why a V2 run stops after the start. The V2 execution loop (U12a) does not exist yet, so a run that selects V2 does
+ * everything up to the prompt, which proves the start, and then fails here instead of silently running the V1 loop
+ * against a V2 server. The default OpenCode version stays V1 until U13, so no production run reaches this.
+ */
+export const V2_EXECUTION_UNSUPPORTED_MESSAGE =
+  'OpenCode V2 execution is not supported yet. Use an OpenCode 1.x version (the default) until the V2 execution loop lands.'
 
 export async function runCacheRestore(
   bootstrap: BootstrapPhaseResult,
@@ -135,6 +164,19 @@ export async function runCacheRestore(
     }
   }
 
+  if (resolveSessionGeneration(bootstrap.opencodeResult.version) === 'v2') {
+    // The V1 server bootstrap below is not reachable on V2. This is the only place that selects the generation's
+    // server: the repair above is generation-neutral (the V1 and V2 databases share a file name and a WAL).
+    const started = await startV2Server(bootstrap, workspacePath, storagePath, cacheResult, cacheStatus)
+    if (started == null) return null
+
+    // SEAM (U12a): hand `started` (a spawned, gated server past its import) to the V2 execution loop here, and return
+    // its result instead of failing. Until then the server is stopped cleanly and the run fails closed.
+    await shutdownV2Server(started.serverHandle, bootstrap.logger)
+    core.setFailed(V2_EXECUTION_UNSUPPORTED_MESSAGE)
+    return null
+  }
+
   const serverLogger = createLogger({phase: 'server-bootstrap'})
   const abortController = new AbortController()
   // Normalized to match what the harness's own session-scoped calls use
@@ -159,5 +201,51 @@ export async function runCacheRestore(
     cacheResult,
     cacheStatus,
     serverHandle,
+  }
+}
+
+async function startV2Server(
+  bootstrap: BootstrapPhaseResult,
+  workspacePath: string,
+  storagePath: string,
+  cacheResult: CacheResult,
+  cacheStatus: 'corrupted' | 'hit' | 'miss',
+): Promise<CacheRestoreV2PhaseResult | null> {
+  const serverLogger = createLogger({phase: 'server-bootstrap'})
+  const {inputs, opencodeResult} = bootstrap
+  const started = await startActionOpenCodeV2({
+    binaryPath: opencodeResult.path,
+    // Normalized to match what the harness's own session-scoped calls use: the gates and every later request address
+    // the same location the spawn was given.
+    workspacePath: normalizeWorkspacePath(workspacePath),
+    authJson: inputs.authJson,
+    opencodeConfig: inputs.opencodeConfig,
+    systematicVersion: inputs.systematicVersion,
+    model: inputs.model == null ? null : `${inputs.model.providerID}/${inputs.model.modelID}`,
+    dbPath: path.join(path.dirname(storagePath), DB_V2_MAIN_BASENAME),
+    authPath: getOpenCodeAuthPath(),
+    env: process.env,
+    runId: getGitHubRunId(),
+    runAttempt: getGitHubRunAttempt(),
+    logger: serverLogger,
+    maskSecret: value => core.setSecret(value),
+  })
+
+  if (!started.success) {
+    core.setFailed(`OpenCode V2 start failed (${started.error.stage}): ${started.error.message}`)
+    return null
+  }
+  serverLogger.info('OpenCode V2 server started and gated')
+  return {cacheResult, cacheStatus, serverHandle: started.data}
+}
+
+async function shutdownV2Server(handle: OpenCodeV2ServerHandle, logger: BootstrapPhaseResult['logger']): Promise<void> {
+  try {
+    const result = await handle.shutdown()
+    if (result.exit.outcome === 'unconfirmed') {
+      logger.error('OpenCode V2 server exit could not be confirmed')
+    }
+  } catch (error) {
+    logger.error('OpenCode V2 server shutdown failed', {error: error instanceof Error ? error.message : String(error)})
   }
 }

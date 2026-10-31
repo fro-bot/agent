@@ -202,6 +202,30 @@ function createRouting(): RoutingPhaseResult {
   }
 }
 
+async function runWithFailedCacheRestore(version: string) {
+  const {runBootstrap} = await import('./phases/bootstrap.js')
+  const {runRouting} = await import('./phases/routing.js')
+  const {runDedup} = await import('./phases/dedup.js')
+  const {runAcquireLock} = await import('./phases/acquire-lock.js')
+  const {runAcknowledge} = await import('./phases/acknowledge.js')
+  const {runCacheRestore} = await import('./phases/cache-restore.js')
+
+  const bootstrap = createBootstrap()
+  vi.mocked(runBootstrap).mockResolvedValue({...bootstrap, opencodeResult: {...bootstrap.opencodeResult, version}})
+  vi.mocked(runRouting).mockResolvedValue(createRouting())
+  vi.mocked(runDedup).mockResolvedValue({shouldProceed: true, entity: {entityType: 'pr', entityNumber: 42}})
+  vi.mocked(runAcquireLock).mockResolvedValue({outcome: 's3-disabled'})
+  vi.mocked(runAcknowledge).mockResolvedValue({
+    repo: 'owner/repo',
+    commentId: 99,
+    issueNumber: 42,
+    issueType: 'pr',
+    botLogin: 'fro-bot',
+  })
+  vi.mocked(runCacheRestore).mockResolvedValue(null)
+  return run()
+}
+
 describe('run', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -536,6 +560,43 @@ describe('run', () => {
     expect(exitCode).toBe(1)
     expect(vi.mocked(setInvocationOutcomeOutput)).toHaveBeenCalledWith('failed')
     expect(vi.mocked(saveDedupMarker)).not.toHaveBeenCalled()
+  })
+
+  describe('when cache restore fails', () => {
+    it('declines to persist session state when the OpenCode V2 start failed, so nothing is saved', async () => {
+      // #given a V2 run whose start failed (credentials, a gate, or the V1 import wait)
+      const core = await import('@actions/core')
+      const {runCleanup} = await import('./phases/cleanup.js')
+
+      // #when
+      const exitCode = await runWithFailedCacheRestore('2.2.5')
+
+      // #then cleanup is told not to save, with the reason, and the post hook is disabled
+      expect(exitCode).toBe(1)
+      const options = vi.mocked(runCleanup).mock.calls[0]?.[0]
+      expect(options?.skipSessionPersistence).toBe(true)
+      expect(options?.persistenceDeclineReason).toContain('OpenCode V2 server did not complete its start')
+      expect(vi.mocked(core.saveState)).toHaveBeenLastCalledWith('should-save-cache', 'false')
+    })
+
+    it('leaves persistence untouched when a V1 start failed, as before', async () => {
+      // #given
+      const core = await import('@actions/core')
+      const {runCleanup} = await import('./phases/cleanup.js')
+
+      // #when
+      const exitCode = await runWithFailedCacheRestore('1.19.4')
+
+      // #then
+      expect(exitCode).toBe(1)
+      const options = vi.mocked(runCleanup).mock.calls[0]?.[0]
+      expect(options?.skipSessionPersistence).toBe(false)
+      expect(options).not.toHaveProperty('persistenceDeclineReason')
+      expect(vi.mocked(core.saveState)).not.toHaveBeenCalledWith('should-save-cache', 'true')
+      expect(vi.mocked(core.saveState).mock.calls.filter(call => call[0] === 'should-save-cache')).toEqual([
+        ['should-save-cache', 'false'],
+      ])
+    })
   })
 
   it('drains owned work after execution and strictly before review reconciliation, finalize (publish), and cleanup (prune/shutdown/persist/release)', async () => {
