@@ -7,7 +7,7 @@ import type {SpawnConfig} from './opencode-credentials-v2.js'
 import type {RunSupervisedOpencodeV2Options} from './opencode-server-v2.js'
 import type {Logger, SupervisedStatusRef} from './opencode-server.js'
 
-import {mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync} from 'node:fs'
+import {mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync} from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
@@ -15,6 +15,7 @@ import process from 'node:process'
 import {
   DEFAULT_SYSTEMATIC_VERSION,
   FRO_BOT_PLUGIN_ID,
+  resolveSystematicSkillsDirsV2,
   SYSTEMATIC_V2_PLUGIN_ID,
   verifyPermissionRules,
 } from '@fro-bot/runtime/workspace-v2'
@@ -418,6 +419,8 @@ describe('runSupervisedOpencodeV2', () => {
           return dbPath
         },
         verifyRules: OK_GATE,
+        // Never the real image cache: the default reads /home/opencode/.cache.
+        resolveBundledSkillsDirs: async () => [],
         // Never the real secret path: the default reads /run/workspace-agent/secrets.
         readAuthBlob: () => null,
         readSpawnConfig: () => {
@@ -430,6 +433,22 @@ describe('runSupervisedOpencodeV2', () => {
       },
     }
     return {options, capture, credentials, statusRef, startOptions, dbPaths}
+  }
+
+  async function spawnWith(resolveBundledSkillsDirs: () => Promise<readonly string[]>) {
+    const fake = createHandle({authorization: 'Basic one'})
+    const {options, startOptions, statusRef, capture} = setup()
+    const controller = new AbortController()
+    options.deps = {
+      ...options.deps,
+      resolveBundledSkillsDirs,
+      startServer: scriptedStart([fake], startOptions),
+    }
+    const done = runSupervisedOpencodeV2({...options, signal: controller.signal})
+    await vi.waitFor(() => expect(statusRef.status).toBe('ready'))
+    controller.abort()
+    await done
+    return {start: startOptions[0], capture}
   }
 
   it('spawns as the agent identity with V2 config, both plugin ids expected, and a fresh database', async () => {
@@ -463,6 +482,69 @@ describe('runSupervisedOpencodeV2', () => {
 
     controller.abort()
     await done
+  })
+
+  describe('bundled Systematic skills directory', () => {
+    const PACKAGE = `/home/opencode/.cache/opencode/npm/@fro.bot/systematic@${DEFAULT_SYSTEMATIC_VERSION}/1800000000000/node_modules/@fro.bot/systematic`
+    const SKILLS = `${PACKAGE}/skills`
+
+    it('allows the resolved directory without an ask and keeps every other outside path at ask', async () => {
+      // #given the image baked the plugin and the directory resolves
+      const {start} = await spawnWith(async () => [SKILLS])
+      const rules = start?.config?.permissions as {action: string; resource: string; effect: string}[]
+
+      // #then the spawn config allows exactly that directory
+      expect(rules).toEqual(
+        expect.arrayContaining([{action: 'external_directory', resource: `${SKILLS}/*`, effect: 'allow'}]),
+      )
+      // #then it is the only allow, so the package root, the cache and every unrelated path still fall to the ask
+      expect(rules.filter(rule => rule.action === 'external_directory' && rule.effect === 'allow')).toEqual([
+        {action: 'external_directory', resource: `${SKILLS}/*`, effect: 'allow'},
+      ])
+      expect(rules.filter(rule => rule.action === 'external_directory' && rule.resource === '*')).toEqual([
+        {action: 'external_directory', resource: '*', effect: 'ask'},
+      ])
+      // #then the edit tools cannot rewrite it
+      expect(rules).toEqual(expect.arrayContaining([{action: 'edit', resource: `${SKILLS}/*`, effect: 'deny'}]))
+    })
+
+    it('warns and keeps the ask when the directory is not on disk, without failing the start', async () => {
+      // #given a harness-only or cleared cache
+      const {start, capture} = await spawnWith(async () => [])
+      const rules = start?.config?.permissions as {action: string; resource: string; effect: string}[]
+
+      // #then no exception is configured and the operator is told once
+      expect(rules.filter(rule => rule.action === 'external_directory' && rule.effect === 'allow')).toEqual([])
+      expect(capture.serialized()).toContain('bundled Systematic skills directory was not found')
+    })
+
+    it('resolves the default from the agent cache at the pinned Systematic version, not a literal version', async () => {
+      // #given a throwaway agent cache laid out the way the installer lays it out
+      const cache = mkdtempSync(path.join(os.tmpdir(), 'ws-skills-'))
+      try {
+        const skills = path.join(
+          cache,
+          'opencode',
+          'npm',
+          '@fro.bot',
+          `systematic@${DEFAULT_SYSTEMATIC_VERSION}`,
+          '1800000000000',
+          'node_modules',
+          '@fro.bot',
+          'systematic',
+          'skills',
+        )
+        mkdirSync(skills, {recursive: true})
+
+        // #when the same resolver the default uses reads that cache
+        const dirs = await resolveSystematicSkillsDirsV2(cache, DEFAULT_SYSTEMATIC_VERSION)
+
+        // #then
+        expect(dirs[0]).toBe(skills)
+      } finally {
+        rmSync(cache, {recursive: true, force: true})
+      }
+    })
   })
 
   it('stores the credential before readiness flips to ready', async () => {
