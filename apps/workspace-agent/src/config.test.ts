@@ -6,8 +6,55 @@
  *         invalid (non-numeric, zero, negative) → throws (fail-fast).
  */
 
-import {describe, expect, it} from 'vitest'
-import {readReadyTimeoutMs, readUpdateNetworkConfig} from './config.js'
+import {mkdtempSync, rmSync, symlinkSync, writeFileSync} from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+
+import {afterEach, describe, expect, it} from 'vitest'
+import {readOptionalSecretBlob, readReadyTimeoutMs, readUpdateNetworkConfig} from './config.js'
+
+describe('readOptionalSecretBlob', () => {
+  const roots: string[] = []
+  afterEach(() => {
+    for (const root of roots.splice(0)) rmSync(root, {recursive: true, force: true})
+  })
+  function root(): string {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'ws-blob-'))
+    roots.push(dir)
+    return dir
+  }
+
+  it('returns the file contents, line breaks included', () => {
+    // #given a pretty-printed JSON blob
+    const file = path.join(root(), 'auth')
+    writeFileSync(file, '{\n  "anthropic": {"type": "api", "key": "k"}\n}\n')
+
+    // #when / #then
+    expect(readOptionalSecretBlob(file)).toBe('{\n  "anthropic": {"type": "api", "key": "k"}\n}\n')
+  })
+
+  it('returns null for an absent or blank file', () => {
+    const dir = root()
+    const blank = path.join(dir, 'blank')
+    writeFileSync(blank, ' \n\t\n')
+    expect(readOptionalSecretBlob(path.join(dir, 'missing'))).toBeNull()
+    expect(readOptionalSecretBlob(blank)).toBeNull()
+  })
+
+  it('refuses a symlink, a directory and an oversized file', () => {
+    const dir = root()
+    const target = path.join(dir, 'target')
+    writeFileSync(target, '{}')
+    const link = path.join(dir, 'link')
+    symlinkSync(target, link)
+    const big = path.join(dir, 'big')
+    writeFileSync(big, 'x'.repeat(5000))
+
+    expect(() => readOptionalSecretBlob(link)).toThrow(/symlink/)
+    expect(() => readOptionalSecretBlob(dir)).toThrow(/directory/)
+    expect(() => readOptionalSecretBlob(big)).toThrow(/too large/)
+  })
+})
 
 describe('readReadyTimeoutMs', () => {
   describe('absent / empty → fail-soft default', () => {

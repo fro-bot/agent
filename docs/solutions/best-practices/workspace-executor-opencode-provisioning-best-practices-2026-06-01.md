@@ -79,7 +79,7 @@ Validate the auth blob too: require a JSON object with ≥1 provider entry, each
 
 ### 5. Fail-soft when absent, fail-fast when malformed
 
-The same image serves clone-only deployments, so missing auth/config must **boot** (the mention turn then surfaces OpenCode's own auth error). A *malformed* secret or overlay must **exit at startup** with a clear message, not defer to a cryptic turn-time failure. Emit startup markers so an operator can read the state in `docker logs`: `auth: provisioned` / `auth: absent`, `provider-overlay=applied` / `provider-overlay=none`.
+The same image serves clone-only deployments, so missing auth/config must **boot** (the mention turn then surfaces OpenCode's own auth error). A *malformed* secret or overlay must **exit at startup** with a clear message, not defer to a cryptic turn-time failure. Emit startup markers so an operator can read the state in `docker logs`: `auth: provisioned` / `auth: absent`, `provider-overlay=merged-into-config-file` / `provider-overlay=none` (the former only says the overlay string was non-empty and merged into the config file; it does not prove a provider loaded or holds a credential).
 
 ### 6. Mind POSIX `set -eu` in the entrypoint
 
