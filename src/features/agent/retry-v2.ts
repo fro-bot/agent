@@ -1,7 +1,7 @@
 import type {ActionOpenCodeV2Client, OwnershipLedger} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
 import type {AttemptObservation, FailureObservation, TurnEvidence} from './attempt-outcome.js'
-import type {AttemptResultV2, LiveObservationV2} from './live-observation-v2.js'
+import type {AttemptResultV2} from './live-observation-v2.js'
 import type {AttemptResult} from './prompt-sender.js'
 import type {ExecutionDeadline} from './retry.js'
 import type {FormAskedResponderV2, PermissionAskedResponderV2} from './streaming-v2.js'
@@ -20,13 +20,14 @@ import {ledgerBlocksCompletion, waitForAbortableDelay, waitForEventProcessorShut
 import {createActivityTrackerV2, processEventStreamV2} from './streaming-v2.js'
 
 /**
- * One prompt attempt on OpenCode V2: the sibling of `runPromptAttempt` in `retry.ts`. The retry policy itself
- * (`MAX_LLM_RETRIES`, `RETRY_DELAYS_MS`, the deadline, the continuation prompt) is shared with V1 and lives there.
+ * One prompt attempt on OpenCode V2: the sibling of `runPromptAttempt` in `retry.ts`. The pre-send retry constants
+ * (`MAX_LLM_RETRIES`, `RETRY_DELAYS_MS`) and the deadline are shared with V1 and live there. There is no continuation
+ * prompt on V2: a turn that fails after the send is the end of the run.
  *
  * Order, which is what keeps a late connection from losing events: the stream is subscribed by the caller, the event
  * processor starts, and the prompt is sent only after the stream's first `server.connected` frame was read. A stream
- * that never connects fails the attempt with nothing sent (`submit_failed`, retryable `llm_fetch_error`), so the retry
- * loop resends the original prompt and each attempt subscribes a fresh stream.
+ * that never connects fails the attempt with nothing sent (`submit_failed`, retryable `llm_fetch_error`), so the loop
+ * sends the original prompt on a fresh stream.
  *
  * Completion is raced between two producers, as on V1:
  * - the session-wait route (`POST /api/experimental/session/:id/wait`, `packages/server/src/handlers/session.ts:438` →
@@ -234,35 +235,6 @@ export async function runPromptAttemptV2(options: RunPromptAttemptV2Options): Pr
   let kept = false
   let sendUncertain = false
 
-  /**
-   * The observation of an attempt that failed in a way the caller may retry. Its processor keeps answering permission asks
-   * and cancelling forms until the caller has stopped the directory and confirmed it quiet: a notice-triggered turn can
-   * begin during the retry backoff, and an ask it raises while nobody listens strands that turn (a replacement
-   * subscription replays nothing). The caller stops it, or hands it to the release.
-   */
-  const mayRetry = (reduced: {
-    readonly outcome: string
-    readonly llmError: {readonly retryable?: boolean} | null
-  }): boolean =>
-    reduced.outcome === 'turn_failed_retryable' ||
-    (reduced.outcome === 'submit_failed' && reduced.llmError?.retryable === true)
-
-  const keepForRetry = (retryable: boolean): LiveObservationV2 | undefined => {
-    if (!retryable || options.keepObserving !== true || snapshotRef.read === null) return undefined
-    waitAbortController.abort()
-    pollAbortController.abort()
-    const snapshot = snapshotRef.read
-    kept = true
-    return {
-      tracker,
-      snapshot,
-      stop: async () => {
-        await stopEventProcessor()
-        return snapshot()
-      },
-    }
-  }
-
   // A failed prompt submission deferred past the early exit below, as a snapshot that joins the single reduction.
   let preservedSubmissionFailure: FailureObservation | null = null
 
@@ -308,8 +280,7 @@ export async function runPromptAttemptV2(options: RunPromptAttemptV2Options): Pr
           ]
           const turnEvidence: TurnEvidence = {accepted: tracker.firstMeaningfulEventReceived}
           const reduced = reduceAttemptOutcome({settlement: {kind: 'failure-observed'}, failures}, null, turnEvidence)
-          const held = keepForRetry(mayRetry(reduced))
-          if (held === undefined) await stopEventProcessor()
+          await stopEventProcessor()
           // Only an accepted turn has real artifacts; otherwise the synthetic result already carries the failure.
           let merged = turnEvidence.accepted ? eventStreamResult : promptStartResult.eventStreamResult
           if (reduced.llmError !== null && merged.llmError?.type !== reduced.llmError.type) {
@@ -328,10 +299,8 @@ export async function runPromptAttemptV2(options: RunPromptAttemptV2Options): Pr
             settlement: reduced.settlement,
             eventStreamResult: merged,
             ...(sendUncertain ? {sendUncertain} : {}),
-            ...(held === undefined ? {} : {liveObservation: held}),
           }
         }
-        await stopEventProcessor()
         return promptStartResult
       }
     }
@@ -391,8 +360,7 @@ export async function runPromptAttemptV2(options: RunPromptAttemptV2Options): Pr
       }
     }
 
-    const heldForRetry = keepForRetry(mayRetry(reduced))
-    if (heldForRetry === undefined) await stopEventProcessor()
+    await stopEventProcessor()
     let merged = eventStreamResult
     if (reduced.llmError !== null && eventStreamResult.llmError?.type !== reduced.llmError.type) {
       merged = {...eventStreamResult, llmError: reduced.llmError}
@@ -406,7 +374,6 @@ export async function runPromptAttemptV2(options: RunPromptAttemptV2Options): Pr
       settlement: reduced.settlement,
       eventStreamResult: merged,
       ...(sendUncertain ? {sendUncertain} : {}),
-      ...(heldForRetry === undefined ? {} : {liveObservation: heldForRetry}),
     }
   } finally {
     reconciler?.dispose()

@@ -23,15 +23,11 @@ import {
   isOpenCodePromptArtifactEnabled,
 } from '../../shared/env.js'
 import {toErrorMessage} from '../../shared/errors.js'
-import {stopAndConfirmQuietV2} from './drain-v2.js'
 import {sendPromptToSessionV2} from './prompt-sender-v2.js'
-import {buildContinuationPrompt} from './prompt-sender.js'
 import {buildAgentPrompt} from './prompt.js'
 import {materializeReferenceFiles} from './reference-files.js'
-import {inspectResponseFile} from './response-file.js'
-import {createExecutionDeadline, MAX_LLM_RETRIES, mergeArtifactResults, RETRY_DELAYS_MS} from './retry.js'
+import {createExecutionDeadline, MAX_LLM_RETRIES, RETRY_DELAYS_MS} from './retry.js'
 import {waitForAbortableDelay} from './session-poll.js'
-import {mergeAttemptUsage} from './streaming.js'
 import {collectRunUsageV2, readSessionUsageV2, type SessionUsageV2} from './usage-v2.js'
 
 const SESSION_INTERRUPT_TIMEOUT_MS = 2_000
@@ -41,8 +37,9 @@ const FORM_CANCEL_TIMEOUT_MS = 10_000
 const FORM_CANCEL_MESSAGE = 'This run cannot answer questions. Continue without an answer.'
 
 /**
- * Run a prompt to completion on OpenCode V2: the sibling of `executeOpenCode`. The retry policy, the deadline, the
- * one-comment protocol and the result shape are V1's; what changes is the wire (`/api/*` through the runtime remote
+ * Run a prompt to completion on OpenCode V2: the sibling of `executeOpenCode`. The deadline, the one-comment protocol and
+ * the result shape are V1's; the retry policy is not: a turn that fails after the send ends the run (V2 retries transient
+ * provider errors itself), and only a prompt that never reached a turn is sent again; what changes is the wire (`/api/*` through the runtime remote
  * client over the server handle's authenticated fetch) and where the model and agent live (the session, not the prompt).
  *
  * Release boundary: after the attempt this returns, and `releaseRunV2` (`drain-v2.ts`, called from `run.ts`) decides when
@@ -178,10 +175,6 @@ export async function executeOpenCodeV2(
   let observationGap = false
   // An attempt's prompt POST failed after it may have been sent: sticky, and reported to the caller whatever happens next.
   let sendUncertain = false
-  // The event observation of the latest failed attempt, kept running while a retry is decided (see `keepForRetry`).
-  let heldObservation: LiveObservationV2 | undefined
-  const heldField = (): {readonly liveObservation?: LiveObservationV2} =>
-    heldObservation === undefined ? {} : {liveObservation: heldObservation}
   // The root's usage before this run's first prompt: V2 reports cumulative figures per session, so a continued session
   // is read once up front. Without a baseline a continued session's usage would include earlier runs, so it is left out.
   let usageBaseline: SessionUsageV2 | null = null
@@ -225,7 +218,6 @@ export async function executeOpenCodeV2(
       classificationPath: final.classificationPath,
       observationGap,
       ...(sendUncertain ? {sendUncertain} : {}),
-      ...heldField(),
     }
   }
 
@@ -331,26 +323,18 @@ export async function executeOpenCodeV2(
 
     let lastError: string | null = null
     let promptAccepted = false
-    let nextPrompt: {readonly kind: 'initial'} | {readonly kind: 'continuation'; readonly error: ErrorInfo} = {
-      kind: 'initial',
-    }
     for (let attempt = 1; attempt <= MAX_LLM_RETRIES; attempt++) {
       if (deadline.isExpired()) {
         stoppingCause = 'deadline'
         return await timeoutResult()
       }
       const retryDelay = RETRY_DELAYS_MS[Math.min(attempt - 1, RETRY_DELAYS_MS.length - 1)] ?? RETRY_DELAYS_MS[0]
-      const prompt =
-        nextPrompt.kind === 'initial'
-          ? initialPrompt
-          : buildContinuationPrompt(nextPrompt.error, config?.credentialProvisioned === true)
-
       const result: AttemptResultV2 = await (async (): Promise<AttemptResultV2> => {
         try {
           return await sendPromptToSessionV2({
             client,
             sessionId: activeSessionId,
-            promptText: prompt,
+            promptText: initialPrompt,
             files,
             directory,
             logger,
@@ -371,10 +355,9 @@ export async function executeOpenCodeV2(
         }
       })()
 
-      final = mergeAttemptUsage(mergeArtifactResults(result.eventStreamResult, final), final)
+      final = result.eventStreamResult
       if (result.eventStreamResult.discontinuity != null) observationGap = true
       if (result.sendUncertain === true) sendUncertain = true
-      if (!result.success && result.liveObservation !== undefined) heldObservation = result.liveObservation
 
       if (result.success) {
         stoppingCause = 'other'
@@ -423,63 +406,16 @@ export async function executeOpenCodeV2(
       const promptWasAccepted = promptAccepted
       if (result.outcome !== 'submit_failed') promptAccepted = true
 
-      const responseFileStatus = await inspectResponseFile(
-        promptOptions.responseFilePath,
-        promptOptions.responseSurface,
-        logger,
-      )
-      if (responseFileStatus !== 'absent') break
-
+      // After the send a failed turn ends the run: V2 retries transient provider errors itself (rate limits, provider
+      // internals, transport failures; at most four retries with backoff, `specs/v2/session.md` "Retry Is Narrow And
+      // Observable"), so a failure that reaches here already outlasted that, and a second prompt would only risk repeating
+      // side effects. The job re-run is the retry. Only a failure BEFORE the prompt reached a turn (the event stream never
+      // connected, or the server refused the prompt) is sent again.
       const canResendOriginalPrompt =
         result.outcome === 'submit_failed' && !promptWasAccepted && result.llmError?.retryable === true
-      const canContinueTurn = result.outcome === 'turn_failed_retryable'
-      const settlementAdmitsRetry = stoppingCause !== 'deadline'
-      const ledgerAdmitsRetry = ownershipLedger == null || ownershipLedger.isDrainComplete()
-      if (
-        (!canResendOriginalPrompt && !canContinueTurn) ||
-        attempt >= MAX_LLM_RETRIES ||
-        !settlementAdmitsRetry ||
-        !ledgerAdmitsRetry
-      ) {
-        break
-      }
+      if (!canResendOriginalPrompt || attempt >= MAX_LLM_RETRIES || stoppingCause === 'deadline') break
 
-      if (canContinueTurn) {
-        if (result.llmError == null) break
-        nextPrompt = {kind: 'continuation', error: result.llmError}
-      } else {
-        nextPrompt = {kind: 'initial'}
-      }
-
-      // A notice can start another root turn while the retry waits, and that turn can ask for a permission or a form with
-      // nobody answering. So nothing waits on the backoff until the directory is stopped and confirmed quiet; the
-      // observation that answers those asks stays up until then. An unconfirmed stop is not retried: the run fails and the
-      // release takes the stop-and-decline path.
-      // A run whose prompt never reached a turn (the subscription failed, the prompt was refused) started nothing that
-      // could wake a session, so there is nothing to stop.
-      const confirmation = promptAccepted
-        ? await stopAndConfirmQuietV2({
-            client,
-            directory,
-            rootSessionId: activeSessionId,
-            ledger: ownershipLedger,
-            runStartedAt: startTime,
-            logger,
-          })
-        : ({quiet: true} as const)
-      if (!confirmation.quiet) {
-        logger.error('The directory could not be confirmed quiet before a retry; not retrying', {
-          reason: confirmation.reason,
-        })
-        lastError = `${lastError ?? 'The attempt failed'}; not retried because the run could not be stopped (${confirmation.reason})`
-        break
-      }
-      if (heldObservation !== undefined) {
-        await heldObservation.stop()
-        heldObservation = undefined
-      }
-
-      logger.warning('LLM fetch error detected, retrying with continuation prompt', {
+      logger.warning('Prompt not delivered; sending it again', {
         attempt,
         maxAttempts: MAX_LLM_RETRIES,
         error: result.error,
@@ -509,7 +445,6 @@ export async function executeOpenCodeV2(
       classificationPath: final.classificationPath,
       observationGap,
       ...(sendUncertain ? {sendUncertain} : {}),
-      ...heldField(),
     }
   } catch (error) {
     // An explicit, tagged deadline rejection is the one exception that IS a deadline cause, identified by name.
@@ -540,7 +475,6 @@ export async function executeOpenCodeV2(
       classificationPath: transportFailure ? 'fallback' : 'unclassified',
       observationGap,
       ...(sendUncertain ? {sendUncertain} : {}),
-      ...heldField(),
     }
   } finally {
     // Interrupt the root if and only if the selected stopping cause is 'deadline' and a session exists. This never

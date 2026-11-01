@@ -13,12 +13,12 @@ import {createDeadlineExceededError, shouldRetryFromOutcome} from './retry.js'
  * Prompt submission on OpenCode V2: the sibling of `prompt-sender.ts`.
  *
  * The V2 prompt carries only text and files (`PromptInput`): the model and agent are properties of the session, set
- * where the session is created or continued (`execution-v2.ts`), not per prompt as on V1. The continuation prompt text
- * is shared with V1 (`buildContinuationPrompt`).
+ * where the session is created or continued (`execution-v2.ts`), not per prompt as on V1.
  *
  * A failed call is classified by its kind, never by response text: a transport failure, a 5xx, a 408 or a 429 is the
- * retryable `llm_fetch_error` that the retry loop resends under `MAX_LLM_RETRIES`; an auth failure or another 4xx is
- * not retryable. The error message names the kind and status only, since a response body can echo prompt text.
+ * retryable `llm_fetch_error` that the loop resends under `MAX_LLM_RETRIES` (the server answered, so nothing was
+ * admitted); an auth failure or another 4xx is not retryable. A transport failure of the POST itself is the exception:
+ * it may have been admitted, so it is never resent (`sendUncertain`). The error message names the kind and status only, since a response body can echo prompt text.
  */
 
 function describeCallError(error: V2CallError): string {
