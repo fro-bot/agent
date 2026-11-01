@@ -1,4 +1,4 @@
-import {createOwnershipLedger} from '@fro-bot/runtime'
+import {createOwnershipLedger, shellLedgerKey} from '@fro-bot/runtime'
 import {
   CHILD_SESSION_ID,
   EXECUTION_STARTED_FRAME,
@@ -370,6 +370,173 @@ describe('processEventStreamV2', () => {
     })
   })
 
+  describe('ownership through a foreground subagent', () => {
+    const MSG = 'msg_foreground_parent'
+    const CALL = 'call_fg_1'
+    const subagentStarted = frame('session.tool.input.started', {
+      sessionID: PARENT_SESSION_ID,
+      id: CALL,
+      assistantMessageID: MSG,
+      name: 'subagent',
+    })
+    const foregroundProgress = frame('session.tool.progress', {
+      sessionID: PARENT_SESSION_ID,
+      id: CALL,
+      assistantMessageID: MSG,
+      metadata: {sessionID: CHILD_SESSION_ID, status: 'running'},
+    })
+    const foregroundSuccess = frame('session.tool.success', {
+      sessionID: PARENT_SESSION_ID,
+      id: CALL,
+      assistantMessageID: MSG,
+      content: [{type: 'text', text: 'done'}],
+      metadata: {sessionID: CHILD_SESSION_ID, status: 'completed', truncated: false},
+      executed: false,
+    })
+    const childShellCreated = {
+      ...SHELL_CREATED_FRAME,
+      data: {info: {...SHELL_CREATED_FRAME.data.info, metadata: {sessionID: CHILD_SESSION_ID}}},
+    }
+    const childShellNotice = {
+      ...SHELL_NOTICE_ENQUEUED_FRAME,
+      data: {...SHELL_NOTICE_ENQUEUED_FRAME.data, sessionID: CHILD_SESSION_ID},
+    }
+
+    async function stateAfter(items: readonly unknown[]) {
+      const ledger = createOwnershipLedger()
+      const open = openRun(items, {ownershipLedger: ledger}, PARENT_SESSION_ID)
+      await open.settled
+      open.controller.abort()
+      await open.result
+      return Object.fromEntries(ledger.snapshot().map(entry => [entry.sessionId, entry.state]))
+    }
+
+    it('adopts the child a foreground call names, owns its background shell, and settles the child at the call end', async () => {
+      // #given a foreground child that starts a background shell and returns while the shell still runs
+      const state = await stateAfter([subagentStarted, foregroundProgress, childShellCreated, foregroundSuccess])
+
+      // #then the child is settled by its call, and the shell it left behind is still the run's, outstanding
+      expect(state).toEqual({[CHILD_SESSION_ID]: 'settled', [`shell:${SHELL_ID}`]: 'outstanding'})
+    })
+
+    it("settles that shell from its notice, which is addressed to the child's inbox", async () => {
+      // #given / #when
+      const state = await stateAfter([
+        subagentStarted,
+        foregroundProgress,
+        childShellCreated,
+        foregroundSuccess,
+        childShellNotice,
+      ])
+
+      // #then
+      expect(state).toEqual({[CHILD_SESSION_ID]: 'settled', [`shell:${SHELL_ID}`]: 'settled'})
+    })
+
+    it('accounts for events a descendant emitted before the dispatch named it, in their original order', async () => {
+      // #given the shell and its notice arrive BEFORE the progress that attributes the child to the run
+      const state = await stateAfter([childShellCreated, childShellNotice, subagentStarted, foregroundProgress])
+
+      // #then both were replayed on adoption: the shell was adopted and then settled by its notice
+      expect(state).toEqual({[CHILD_SESSION_ID]: 'outstanding', [`shell:${SHELL_ID}`]: 'settled'})
+    })
+
+    it('never adopts what a session outside the run tree does', async () => {
+      // #given a shell created by a stranger, and a dispatch that names a different child
+      const stranger = {
+        ...SHELL_CREATED_FRAME,
+        data: {info: {...SHELL_CREATED_FRAME.data.info, metadata: {sessionID: SHELL_SESSION_ID}}},
+      }
+
+      // #when / #then
+      expect(await stateAfter([stranger, subagentStarted, foregroundProgress])).toEqual({
+        [CHILD_SESSION_ID]: 'outstanding',
+      })
+    })
+
+    it('keeps tool names, inputs and shell ids apart when two sessions reuse a call id', async () => {
+      // #given the root and a tracked child, each running a backgrounded shell under the SAME call id, interleaved
+      const ledger = createOwnershipLedger()
+      ledger.adopt(CHILD_SESSION_ID, 'child')
+      const started = (sessionID: string, assistantMessageID: string) =>
+        frame('session.tool.input.started', {sessionID, id: 'call_shared', assistantMessageID, name: 'shell'})
+      const succeeded = (sessionID: string, assistantMessageID: string, shellID: string) =>
+        frame('session.tool.success', {
+          sessionID,
+          id: 'call_shared',
+          assistantMessageID,
+          content: [{type: 'text', text: 'moved to the background'}],
+          metadata: {status: 'running', truncated: false, shellID},
+          executed: false,
+        })
+      const items = [
+        started(PARENT_SESSION_ID, 'msg_root'),
+        started(CHILD_SESSION_ID, 'msg_child'),
+        succeeded(PARENT_SESSION_ID, 'msg_root', 'sh_root'),
+        succeeded(CHILD_SESSION_ID, 'msg_child', 'sh_child'),
+      ]
+
+      // #when
+      const open = openRun(items, {ownershipLedger: ledger}, PARENT_SESSION_ID)
+      await open.settled
+      open.controller.abort()
+      await open.result
+
+      // #then both shells were adopted; one call's end did not delete the other's name
+      expect(ledger.isTracked(shellLedgerKey('sh_root'))).toBe(true)
+      expect(ledger.isTracked(shellLedgerKey('sh_child'))).toBe(true)
+    })
+  })
+
+  describe('the turn a notice owes the root', () => {
+    const started = frame('session.execution.started', {sessionID: PARENT_SESSION_ID})
+    const succeeded = frame('session.execution.succeeded', {sessionID: PARENT_SESSION_ID})
+    const delivered = frame('session.inbox.delivered', {
+      sessionID: PARENT_SESSION_ID,
+      inboxID: SUBAGENT_NOTICE_MESSAGE.id,
+    })
+
+    async function trackerAfter(items: readonly unknown[]) {
+      const ledger = createOwnershipLedger()
+      ledger.adopt(CHILD_SESSION_ID, 'child')
+      const tracker = createActivityTrackerV2()
+      const open = openRun(items, {ownershipLedger: ledger, tracker}, PARENT_SESSION_ID)
+      await open.settled
+      open.controller.abort()
+      await open.result
+      return tracker
+    }
+
+    it('fences the previous success from a notice queued for an idle root until the triggered turn starts', async () => {
+      // #given an idle root with a notice queued, then delivered, and the triggered turn not started yet
+      const queued = await trackerAfter([started, succeeded, SUBAGENT_NOTICE_ENQUEUED_FRAME])
+      const deliveredIdle = await trackerAfter([started, succeeded, SUBAGENT_NOTICE_ENQUEUED_FRAME, delivered])
+      const running = await trackerAfter([started, succeeded, SUBAGENT_NOTICE_ENQUEUED_FRAME, delivered, started])
+
+      // #then the fence holds through the gap (queued, and delivered-but-not-started) and lifts at the start
+      expect(queued).toMatchObject({rootTerminal: null, turnOwed: true})
+      expect(deliveredIdle).toMatchObject({rootTerminal: null, turnOwed: true})
+      expect(running).toMatchObject({rootTerminal: null, turnOwed: false, rootRunning: true})
+    })
+
+    it('owes nothing when a running root takes the notice into the turn it is in', async () => {
+      // #given a notice queued and delivered while the root's turn is running, which then ends
+      const tracker = await trackerAfter([started, SUBAGENT_NOTICE_ENQUEUED_FRAME, delivered, succeeded])
+
+      // #then the turn's own success stands: no second turn is owed, so the run cannot wait for one that never comes
+      expect(tracker).toMatchObject({rootTerminal: {kind: 'succeeded'}, turnOwed: false})
+      expect(tracker.queuedNoticeInboxIds.size).toBe(0)
+    })
+
+    it('advances the revision for each change of what the result means', async () => {
+      // #given / #when
+      const tracker = await trackerAfter([started, succeeded, SUBAGENT_NOTICE_ENQUEUED_FRAME, delivered, started])
+
+      // #then started, terminal, enqueue, delivery, started
+      expect(tracker.rootRevision).toBe(5)
+    })
+  })
+
   describe('ownership and artifacts', () => {
     it('adopts a background child from its dispatch and settles it from the notice', async () => {
       // #given
@@ -378,7 +545,7 @@ describe('processEventStreamV2', () => {
         frame('session.tool.input.started', {
           sessionID: PARENT_SESSION_ID,
           id: 'call_16_0',
-          assistantMessageID: 'msg_x',
+          assistantMessageID: 'msg_18389bbfb001CZWJmESBpyKCto',
           name: 'subagent',
         }),
         SUBAGENT_BACKGROUND_SUCCESS_FRAME,

@@ -73,9 +73,10 @@ export function observeRootTerminal(
     case 'succeeded': {
       // A completion notice queued for the root owes it a second turn (probe P2). Only a stream that lost events may
       // be missing the delivery that clears it; the directory drain after the attempt is the net for that case.
-      if (tracker.queuedNoticeInboxIds.size > 0 && !tracker.streamBlind) {
-        logger.debug('Root turn succeeded but a completion notice is still queued; deferring completion', {
+      if ((tracker.queuedNoticeInboxIds.size > 0 || tracker.turnOwed) && !tracker.streamBlind) {
+        logger.debug('Root turn succeeded but a notice-triggered turn is owed; deferring completion', {
           queued: tracker.queuedNoticeInboxIds.size,
+          turnOwed: tracker.turnOwed,
         })
         return null
       }
@@ -122,6 +123,7 @@ export async function pollForSessionCompletionObservationV2(options: PollOptions
   let ticks = 0
   let restSawRootActive = false
   let inactiveReads = 0
+  let seenRevision = tracker.rootRevision
 
   while (!signal.aborted) {
     const decided = observeRootTerminal(tracker, logger, ownershipLedger)
@@ -144,19 +146,38 @@ export async function pollForSessionCompletionObservationV2(options: PollOptions
     if (signal.aborted) return terminalObservationOnAbort(options)
     ticks += 1
 
+    // The root restarted (or a notice changed what its result means) since the last tick: the confirmation that it had
+    // stopped belongs to the earlier turn.
+    if (tracker.rootRevision !== seenRevision) {
+      seenRevision = tracker.rootRevision
+      inactiveReads = 0
+    }
+
     const restTrusted = tracker.streamBlind || tracker.idleHintWithoutTerminal
     if (restTrusted && ticks % restEvery === 0 && tracker.rootTerminal === null) {
+      // Taken before any read: a read that returns under a newer revision describes a turn that is no longer the
+      // current one, and must change nothing.
+      const readRevision = tracker.rootRevision
+      const stale = (): boolean => tracker.rootRevision !== readRevision
       try {
         const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(REST_REQUEST_TIMEOUT_MS)])
         const active = await client.session.active({signal: requestSignal})
-        if (Object.keys(active).includes(sessionId)) {
+        if (stale()) {
+          inactiveReads = 0
+          logger.debug('Discarding a stale active-session read: the root changed while it was pending', {sessionId})
+        } else if (Object.keys(active).includes(sessionId)) {
           restSawRootActive = true
           inactiveReads = 0
         } else if (restSawRootActive || tracker.rootExecutionStarted) {
           inactiveReads += 1
           if (inactiveReads >= INACTIVE_READS_REQUIRED) {
             const info = await client.getSession({sessionId, signal: requestSignal})
-            if (info.success && info.data.outcome !== null) {
+            if (stale() || (!tracker.streamBlind && (tracker.turnOwed || tracker.queuedNoticeInboxIds.size > 0))) {
+              // The persisted outcome is the last ended turn's: with a newer turn running, or one owed, it is not this
+              // run's result.
+              inactiveReads = 0
+              logger.debug('Discarding a persisted outcome read: a newer turn is running or owed', {sessionId})
+            } else if (info.success && info.data.outcome !== null) {
               logger.warning('Root turn result read from the persisted session state; the event stream missed it', {
                 sessionId,
                 outcome: info.data.outcome,

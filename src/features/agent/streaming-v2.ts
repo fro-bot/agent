@@ -64,6 +64,19 @@ export interface ActivityTrackerV2 {
    * `inbox.delivered`.
    */
   readonly queuedNoticeInboxIds: Set<string>
+  /** The root is between `execution.started` and its terminal event. */
+  rootRunning: boolean
+  /**
+   * A completion notice was delivered to an IDLE root, or queued for one: a turn is owed and has not started. It is the
+   * fence that keeps the previous turn's success (still sitting in memory, or persisted on the server) from being read
+   * as the run's result in the gap before that turn's `execution.started`. Cleared by that start.
+   */
+  turnOwed: boolean
+  /**
+   * Bumped by every event that changes what the root's result means: a turn starting, a root notice queued or delivered,
+   * a terminal. A REST read that began under one revision and ends under another is stale and is discarded.
+   */
+  rootRevision: number
   /** A terminal provider failure (the shared rule's `stop`, or context overflow). First one wins. */
   terminalProviderError?: ErrorInfo
   /** The first generic (non-terminal) failure. Dropped when a terminal one arrives. */
@@ -84,6 +97,9 @@ export function createActivityTrackerV2(): ActivityTrackerV2 {
     rootExecutionStarted: false,
     rootTerminal: null,
     queuedNoticeInboxIds: new Set<string>(),
+    rootRunning: false,
+    turnOwed: false,
+    rootRevision: 0,
     streamBlind: false,
     idleHintWithoutTerminal: false,
   }
@@ -207,6 +223,11 @@ function recordFailure(tracker: ActivityTrackerV2, observed: ReturnType<typeof c
   }
 }
 
+function subagentLabel(input: Readonly<Record<string, unknown>> | null | undefined): string {
+  const description = input?.description
+  return typeof description === 'string' && description.length > 0 ? description : 'subagent'
+}
+
 function stringInput(input: Readonly<Record<string, unknown>> | null | undefined, key: string): string {
   const value = input?.[key]
   return typeof value === 'string' ? value : ''
@@ -215,6 +236,21 @@ function stringInput(input: Readonly<Record<string, unknown>> | null | undefined
 function titleFromInput(input: Readonly<Record<string, unknown>> | null | undefined): string {
   const title = stringInput(input, 'description') || stringInput(input, 'command') || stringInput(input, 'filePath')
   return title.length > 120 ? `${title.slice(0, 117)}...` : title
+}
+
+const UNATTRIBUTED_EVENTS_PER_SESSION = 16
+const UNATTRIBUTED_SESSIONS_MAX = 64
+
+function getStringProperty(value: unknown, key: string): string | null {
+  if (typeof value !== 'object' || value === null) return null
+  const property = (value as Record<string, unknown>)[key]
+  return typeof property === 'string' ? property : null
+}
+
+/** The child session a `subagent` call's metadata names (`context.progress({sessionID, status})`), or `null`. */
+function readSubagentSessionId(metadata: unknown): string | null {
+  const id = getStringProperty(metadata, 'sessionID')
+  return id !== null && id.length > 0 ? id : null
 }
 
 interface ToolCallInfo {
@@ -226,8 +262,18 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
   const {stream, sessionId, signal, logger, tracker, ownershipLedger, onPermissionAsked, onFormAsked} = options
 
   const pendingText = new Map<string, string>()
+  // Keyed by session, message and call: provider call ids repeat across sessions, and two sessions running tools at once
+  // would otherwise overwrite and delete each other's names, inputs and shell ids.
   const toolCalls = new Map<string, ToolCallInfo>()
   const shellByCall = new Map<string, string>()
+  const callKey = (event: {
+    readonly sessionId: string
+    readonly messageId: string | null
+    readonly callId: string
+  }): string => `${event.sessionId}\u0000${event.messageId ?? ''}\u0000${event.callId}`
+  // Events about a session that is not owned YET, kept in case an owned session's progress later shows it descends from
+  // the run. Bounded: a stranger's events are never replayed and must not grow without limit.
+  const unattributed = new Map<string, V2DomainEvent[]>()
   // A notice can precede the dispatch result on the stream; the child or shell is then settled the moment it is adopted.
   const noticedChildIds = new Set<string>()
   const noticedShellIds = new Set<string>()
@@ -244,6 +290,37 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
   const flushText = (): void => {
     for (const text of pendingText.values()) if (text.length > 0) outputTextContent(text)
     pendingText.clear()
+  }
+
+  const bufferUnattributed = (sessionKey: string | null, event: V2DomainEvent): void => {
+    if (sessionKey === null || ownershipLedger === undefined) return
+    const held = unattributed.get(sessionKey)
+    if (held !== undefined) {
+      if (held.length < UNATTRIBUTED_EVENTS_PER_SESSION) held.push(event)
+      return
+    }
+    if (unattributed.size >= UNATTRIBUTED_SESSIONS_MAX) return
+    unattributed.set(sessionKey, [event])
+  }
+
+  /**
+   * A session the run's tree provably contains: named by an owned session's own `subagent` tool progress or result. It is
+   * tracked so its background shells and notices are owned, and any event it emitted before it was known is replayed.
+   * Foreground or background alike; the dispatching call's end settles a foreground one.
+   */
+  const adoptDescendant = (childSessionId: string, label: string): void => {
+    if (ownershipLedger === undefined || childSessionId === sessionId) return
+    const known = ownershipLedger.isTracked(childSessionId)
+    ownershipLedger.adopt(childSessionId, label)
+    if (noticedChildIds.has(childSessionId)) ownershipLedger.settle(childSessionId)
+    if (known) return
+    logger.info('Owned subagent session discovered; adopted into ownership ledger', {
+      sessionId,
+      childSessionId,
+    })
+    const held = unattributed.get(childSessionId)
+    unattributed.delete(childSessionId)
+    for (const event of held ?? []) handle(event)
   }
 
   const adoptShell = (shellId: string): void => {
@@ -268,10 +345,15 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
   const noteRootNotice = (targetSessionId: string, inboxId: string | null): void => {
     if (targetSessionId !== sessionId || inboxId === null) return
     tracker.queuedNoticeInboxIds.add(inboxId)
+    tracker.rootRevision += 1
+    // An idle root will be woken for it; a running one may take it into the turn it is in (see `inbox_delivered`).
+    if (!tracker.rootRunning) tracker.turnOwed = true
     invalidateRootSuccess()
   }
 
   const markTerminal = (terminal: RootTerminalV2): void => {
+    tracker.rootRunning = false
+    tracker.rootRevision += 1
     tracker.rootTerminal = terminal
     flushText()
     options.onRootTerminal?.(terminal)
@@ -343,14 +425,14 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
       }
 
       case 'tool_started': {
-        if (isOwned(event.sessionId)) toolCalls.set(event.callId, {name: event.name, input: null})
+        if (isOwned(event.sessionId)) toolCalls.set(callKey(event), {name: event.name, input: null})
         return true
       }
 
       case 'tool_called': {
         if (!isOwned(event.sessionId)) return true
         tracker.firstMeaningfulEventReceived = true
-        toolCalls.set(event.callId, {name: toolCalls.get(event.callId)?.name ?? null, input: event.input})
+        toolCalls.set(callKey(event), {name: toolCalls.get(callKey(event))?.name ?? null, input: event.input})
         return true
       }
 
@@ -358,17 +440,24 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
         if (!isOwned(event.sessionId)) return true
         tracker.firstMeaningfulEventReceived = true
         const shellId = readToolShellId(event.metadata)
-        if (shellId !== null) shellByCall.set(event.callId, shellId)
+        if (shellId !== null) shellByCall.set(callKey(event), shellId)
+        // A `subagent` call names the child it started in its progress, foreground or background: the child is part of
+        // this run's tree from that moment, and what it starts (a background shell above all) belongs to the run.
+        if (toolCalls.get(callKey(event))?.name === 'subagent') {
+          const childSessionId = readSubagentSessionId(event.metadata)
+          if (childSessionId !== null)
+            adoptDescendant(childSessionId, subagentLabel(toolCalls.get(callKey(event))?.input))
+        }
         return true
       }
 
       case 'tool_finished': {
         if (!isOwned(event.sessionId)) return true
         tracker.firstMeaningfulEventReceived = true
-        const info = toolCalls.get(event.callId)
-        toolCalls.delete(event.callId)
-        const callShellId = readToolShellId(event.metadata) ?? shellByCall.get(event.callId) ?? null
-        shellByCall.delete(event.callId)
+        const info = toolCalls.get(callKey(event))
+        toolCalls.delete(callKey(event))
+        const callShellId = readToolShellId(event.metadata) ?? shellByCall.get(callKey(event)) ?? null
+        shellByCall.delete(callKey(event))
         const name = info?.name ?? null
         if (name !== null && event.calls.length === 0) {
           outputToolExecution(name, titleFromInput(info?.input))
@@ -398,14 +487,20 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
         if (ownershipLedger !== undefined && name !== null) {
           const dispatch = readBackgroundDispatch(name, event)
           if (dispatch !== null) {
-            const description = info?.input?.description
-            const label = typeof description === 'string' && description.length > 0 ? description : 'background task'
-            ownershipLedger.adopt(dispatch.childSessionId, label)
-            if (noticedChildIds.has(dispatch.childSessionId)) ownershipLedger.settle(dispatch.childSessionId)
+            adoptDescendant(dispatch.childSessionId, subagentLabel(info?.input))
             logger.info('Background dispatch observed; adopted into ownership ledger', {
               sessionId,
               childSessionId: dispatch.childSessionId,
             })
+          }
+          if (name === 'subagent' && dispatch === null && event.outcome === 'success') {
+            // A foreground call that completed: its child ended with the call. The child stays tracked (a late trailing
+            // event is still the run's), and what it left running is accounted for by its own shell entries.
+            const childSessionId = readSubagentSessionId(event.metadata)
+            if (childSessionId !== null && getStringProperty(event.metadata, 'status') === 'completed') {
+              adoptDescendant(childSessionId, subagentLabel(info?.input))
+              ownershipLedger.settle(childSessionId)
+            }
           }
           if (name === 'shell') {
             // Only a call that returned `running` outlives its call and sends a notice.
@@ -462,13 +557,23 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
         // The earliest signal that an owned session started a shell, ahead of the tool call returning. A shell nobody
         // tagged (`POST /api/shell`), one a stranger's session started, and a user-run command (awaited by its own
         // request, no notice) are not owned. Idempotent: the tool result adopts the same key again.
-        if (event.userCommand || event.ownerSessionId === null || !isOwned(event.ownerSessionId)) return true
+        if (event.userCommand || event.ownerSessionId === null) return true
+        if (!isOwned(event.ownerSessionId)) {
+          bufferUnattributed(event.ownerSessionId, event)
+          return true
+        }
         adoptShell(event.shellId)
         return true
       }
 
       case 'inbox_delivered': {
-        if (event.sessionId === sessionId && tracker.queuedNoticeInboxIds.delete(event.inboxId)) invalidateRootSuccess()
+        if (event.sessionId === sessionId && tracker.queuedNoticeInboxIds.delete(event.inboxId)) {
+          tracker.rootRevision += 1
+          // Delivered to an idle root: its turn is on the way, and the fence holds until that turn starts. Delivered to a
+          // running one: that turn took the notice in, and nothing further is owed.
+          if (!tracker.rootRunning) tracker.turnOwed = true
+          invalidateRootSuccess()
+        }
         return true
       }
 
@@ -493,7 +598,10 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
       }
 
       case 'subagent_notice': {
-        if (!isOwned(event.sessionId)) return true
+        if (!isOwned(event.sessionId)) {
+          bufferUnattributed(event.sessionId, event)
+          return true
+        }
         noticedChildIds.add(event.notice.childSessionId)
         if (ownershipLedger !== undefined) settleLedgerFromSubagentNotice(ownershipLedger, event.notice)
         noteRootNotice(event.sessionId, event.inboxId)
@@ -501,7 +609,10 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
       }
 
       case 'shell_notice': {
-        if (!isOwned(event.ownerSessionId)) return true
+        if (!isOwned(event.ownerSessionId)) {
+          bufferUnattributed(event.ownerSessionId, event)
+          return true
+        }
         noticedShellIds.add(event.shellId)
         if (ownershipLedger !== undefined) {
           settleLedgerFromShellNotice(ownershipLedger, {shellId: event.shellId, state: event.state})
@@ -514,6 +625,9 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
         if (event.sessionId === sessionId) {
           tracker.firstMeaningfulEventReceived = true
           tracker.rootExecutionStarted = true
+          tracker.rootRunning = true
+          tracker.turnOwed = false
+          tracker.rootRevision += 1
           // A new turn (for instance the one a child's notice starts) invalidates the earlier turn's result.
           tracker.rootTerminal = null
         } else if (isOwned(event.sessionId)) {
@@ -539,6 +653,8 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
             sessionId,
             childSessionId: event.sessionId,
           })
+        } else {
+          bufferUnattributed(event.sessionId, event)
         }
         return true
       }
@@ -552,6 +668,8 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
             childSessionId: event.sessionId,
             reason: event.reason,
           })
+        } else {
+          bufferUnattributed(event.sessionId, event)
         }
         return true
       }
