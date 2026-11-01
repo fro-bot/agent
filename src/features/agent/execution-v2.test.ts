@@ -554,11 +554,13 @@ describe('executeOpenCodeV2', () => {
         expect(server.calls.prompt).toHaveBeenCalledTimes(1)
       })
 
-      it('does not resend it either when a retryable turn failure arrives alongside', async () => {
+      it('does not resend it either when a retryable turn failure arrives alongside, and that failure was observed', async () => {
         // #given the acknowledgment is lost, and the root (which the prompt did start) fails with a retryable error
+        const competing = vi.fn()
         const server = createFakeServer({
           promptResults: [lost],
-          onFailedPrompt: (_, pipe) => {
+          onFailedPrompt: (attempt, pipe) => {
+            competing(attempt)
             pipe.push(STARTED)
             pipe.push(
               frame('session.execution.failed', {
@@ -580,8 +582,12 @@ describe('executeOpenCodeV2', () => {
         )
         await advance(15_000)
 
-        // #then neither a resend nor a continuation went out
-        expect(await result).toMatchObject({success: false, sendUncertain: true})
+        // #then the competing event was emitted and read: the reported cause is the session's own retryable-classified
+        // failure (not the submission failure alone), and still nothing was resent
+        const outcome = await result
+        expect(competing).toHaveBeenCalledWith(1)
+        expect(outcome).toMatchObject({success: false, sendUncertain: true, llmError: {type: 'llm_fetch_error'}})
+        expect(outcome.error).toContain('type=provider.transport')
         expect(server.calls.prompt).toHaveBeenCalledTimes(1)
       })
 

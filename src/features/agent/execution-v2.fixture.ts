@@ -181,11 +181,7 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
       order.push('subscribe')
       subscribeCount += 1
       const failed = options.subscribeResults?.[subscribeCount - 1] ?? null
-      if (failed !== null) {
-        const failedPipe = pipes.at(-1)
-        if (failedPipe !== undefined) options.onFailedPrompt?.(promptCount, failedPipe)
-        return fail(failed)
-      }
+      if (failed !== null) return fail(failed)
       if (options.silentFirstStream === true && subscribeCount === 1) return ok(neverEndingStream())
       const pipe = createEventPipe(input.signal)
       pipes.push(pipe)
@@ -197,7 +193,15 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
       order.push('prompt')
       promptCount += 1
       const failed = options.promptResults?.[promptCount - 1] ?? null
-      if (failed !== null) return fail(failed)
+      if (failed !== null) {
+        // The events the server would emit while the connection broke arrive on the stream the attempt is watching.
+        const failedPipe = pipes.at(-1)
+        if (failedPipe !== undefined) options.onFailedPrompt?.(promptCount, failedPipe)
+        // Let the attempt's event loop read what was just emitted before the failure is reported, as it would for events
+        // that were already in flight when the connection broke.
+        for (let tick = 0; tick < 20; tick++) await Promise.resolve()
+        return fail(failed)
+      }
       const pipe = pipes.at(-1)
       if (pipe !== undefined) options.onPrompt?.(promptCount, pipe)
       return ok(undefined)
