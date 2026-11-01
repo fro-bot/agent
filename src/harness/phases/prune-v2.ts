@@ -1,7 +1,7 @@
 import type {PruningConfig} from '@fro-bot/runtime'
 import type {SessionClientV2} from '@fro-bot/runtime/session-v2'
 import type {Logger} from '../../shared/logger.js'
-import {listSessionsForDirectoryV2} from '@fro-bot/runtime/session-v2'
+import {listSessionsForPruningV2} from '@fro-bot/runtime/session-v2'
 import {toErrorMessage} from '../../shared/errors.js'
 
 /**
@@ -12,9 +12,9 @@ import {toErrorMessage} from '../../shared/errors.js'
  * `maxSessions`; delete the rest. V1 deleted a root and then each of its children; on V2 `DELETE /api/session/:id` is
  * documented to delete the session and its child sessions, so one call per root is enough.
  *
- * What it reads: the unarchived root sessions created in `directory`, newest first, up to the list page bound
- * (`SESSION_LIST_MAX_PAGES` pages of 100). A session archived by overflow recovery is therefore not counted and not
- * pruned: it is dead by construction and rare. A list that cannot be read prunes nothing.
+ * What it reads: the root sessions created in `directory`, archived ones included, up to the list page bound
+ * (`SESSION_LIST_MAX_PAGES` pages of 100 per listing). An overflow-archived session ages out under the same rule as any
+ * other; it is not exempt and is not counted twice. A list that cannot be read prunes nothing.
  *
  * It runs only after the run's directory was confirmed quiet and while the server is still up: deleting a session that
  * is still running is exactly what a release must not do.
@@ -56,7 +56,7 @@ export async function pruneSessionsV2(options: PruneSessionsV2Options): Promise<
   const now = options.now ?? Date.now
   logger.info('Starting session pruning', {maxSessions: config.maxSessions, maxAgeDays: config.maxAgeDays})
 
-  const listed = await listSessionsForDirectoryV2(reader, directory, logger)
+  const listed = await listSessionsForPruningV2(reader, directory, logger)
   if (!listed.success) {
     logger.warning('Session pruning skipped: the session list could not be read', {error: listed.error.message})
     return {prunedCount: 0, remainingCount: 0}

@@ -72,6 +72,32 @@ describe('pruneSessionsV2', () => {
     expect(result).toEqual({prunedCount: 1, remainingCount: 3})
   })
 
+  it('prunes an archived root that is past retention, and keeps one that is recent', async () => {
+    // #given a server that lists archived roots only when asked for them
+    const live = [session('ses_live', 0)]
+    const archived = [session('ses_archived_old', 90), session('ses_archived_recent', 1)]
+    const route = fetchRoute()
+    const client: SessionClientV2 = {
+      list: vi.fn(async (query: {archived?: boolean}) => ({data: query.archived === true ? archived : live})),
+      get: vi.fn(),
+      messages: vi.fn(),
+    }
+
+    // #when
+    const result = await pruneSessionsV2({
+      reader: client,
+      fetchRoute: route,
+      directory: '/w',
+      config: {maxSessions: 1, maxAgeDays: 30},
+      logger: createMockLogger(),
+      now: () => NOW,
+    })
+
+    // #then only the old archived tree is deleted
+    expect(route.mock.calls.map(([path]) => path)).toEqual(['/api/session/ses_archived_old'])
+    expect(result.prunedCount).toBe(1)
+  })
+
   it('keeps an old session while it is among the newest maxSessions', async () => {
     // #given
     const route = fetchRoute()

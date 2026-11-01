@@ -21,6 +21,35 @@ export async function listSessionsForDirectoryV2(
   directory: string,
   logger: Logger,
 ): Promise<Result<readonly SessionInfoV2[], Error>> {
+  return listRootSessionsV2(client, directory, logger, false)
+}
+
+/**
+ * Root sessions in `directory` for retention: the unarchived ones AND the archived ones, each listed once. An archived
+ * session (the context-overflow path archives the one it replaces) is out of every other listing by design, so it would
+ * never age out; retention is the one reader that must see it. Both listings must succeed: pruning from half the
+ * sessions would count the other half as absent.
+ */
+export async function listSessionsForPruningV2(
+  client: SessionClientV2,
+  directory: string,
+  logger: Logger,
+): Promise<Result<readonly SessionInfoV2[], Error>> {
+  const live = await listRootSessionsV2(client, directory, logger, false)
+  if (!live.success) return live
+  const archived = await listRootSessionsV2(client, directory, logger, true)
+  if (!archived.success) return archived
+  const byId = new Map<string, SessionInfoV2>()
+  for (const session of [...live.data, ...archived.data]) byId.set(session.id, session)
+  return ok([...byId.values()])
+}
+
+async function listRootSessionsV2(
+  client: SessionClientV2,
+  directory: string,
+  logger: Logger,
+  archivedOnly: boolean,
+): Promise<Result<readonly SessionInfoV2[], Error>> {
   const sessions: SessionInfoV2[] = []
   let cursor: string | undefined
 
@@ -32,7 +61,7 @@ export async function listSessionsForDirectoryV2(
         limit: SESSION_LIST_PAGE_SIZE,
         order: 'desc',
         parentID: null,
-        archived: false,
+        archived: archivedOnly,
         ...(cursor == null ? {} : {cursor}),
       })
     } catch (error) {
