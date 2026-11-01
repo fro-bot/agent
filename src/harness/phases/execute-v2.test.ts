@@ -381,6 +381,53 @@ describe('runExecute generation selector', () => {
     }
   })
 
+  it('never archives or restarts an overflow whose prompt send was uncertain, and keeps the uncertainty', async () => {
+    // #given a lost prompt acknowledgment accompanied by a context-overflow event (the reviewer's reducer probe: the
+    // submission veto makes the outcome terminal while the overflow diagnostic survives)
+    mocks.executeOpenCodeV2.mockResolvedValueOnce({...agentResult(), sendUncertain: true})
+
+    // #when
+    const result = await runExecute(bootstrap(), routing(), v2CacheRestore(), sessionPrep(), metrics(), 0)
+
+    // #then nothing was replayed: no stop-and-archive, no replacement, and the flag that vetoes publication and the
+    // save is still on the result
+    expect(mocks.executeOpenCodeV2).toHaveBeenCalledTimes(1)
+    expect(mocks.updateSession).not.toHaveBeenCalled()
+    expect(mocks.stopAndConfirmQuietV2).not.toHaveBeenCalled()
+    expect(result).toMatchObject({sendUncertain: true, sessionId: 'overflowed-session'})
+    expect(result.overflowRecovery).toBeUndefined()
+  })
+
+  it('keeps an uncertain send on the result when the replacement itself loses its acknowledgment', async () => {
+    // #given an ordinary overflow, and a replacement whose own prompt acknowledgment is lost
+    mocks.executeOpenCodeV2.mockResolvedValueOnce(agentResult()).mockResolvedValueOnce({
+      ...agentResult({success: false, exitCode: 1, error: 'lost', llmError: null, sessionId: 'recovered'}),
+      sendUncertain: true,
+    })
+
+    // #when
+    const result = await runExecute(bootstrap(), routing(), v2CacheRestore(), sessionPrep(), metrics(), 0)
+
+    // #then the flag survives the boundary, so the run is vetoed
+    expect(mocks.executeOpenCodeV2).toHaveBeenCalledTimes(2)
+    expect(result.sendUncertain).toBe(true)
+  })
+
+  it('keeps an observation gap of the overflowed run when a clean replacement succeeds', async () => {
+    // #given
+    mocks.executeOpenCodeV2
+      .mockResolvedValueOnce(agentResult({observationGap: true}))
+      .mockResolvedValueOnce(
+        agentResult({success: true, exitCode: 0, error: null, llmError: null, sessionId: 'recovered'}),
+      )
+
+    // #when
+    const result = await runExecute(bootstrap(), routing(), v2CacheRestore(), sessionPrep(), metrics(), 0)
+
+    // #then
+    expect(result).toMatchObject({success: true, observationGap: true})
+  })
+
   it('records a failed V2 archive and still restarts', async () => {
     // #given
     mocks.updateSession.mockResolvedValue({success: false, error: {kind: 'http', status: 500}})

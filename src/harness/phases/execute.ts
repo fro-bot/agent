@@ -333,6 +333,11 @@ async function recoverFromContextOverflow(options: ContextOverflowRecoveryOption
     // The overflowed session's own observation gap and unresolved ownership facts must not
     // be erased by this boundary -- see this field's doc comment and recoveryBoundaryUnresolved's.
     observationGap: overflowedResult.observationGap || recoveryExecResult.observationGap,
+    // Monotonic like the gap above: no replacement can clear the original run's uncertainty. (The guard in `runExecute`
+    // keeps an uncertain run from being replaced at all; this keeps the flag if that ever changes.)
+    ...(overflowedResult.sendUncertain === true || recoveryExecResult.sendUncertain === true
+      ? {sendUncertain: true}
+      : {}),
     recoveryBoundaryUnresolved,
     overflowRecovery: {
       recovered: recoveryExecResult.success,
@@ -468,8 +473,11 @@ export async function runExecute(
       execLogger,
     )
     // Provisioned credentials can hide completed external writes; only a non-provisioned run without a valid response may be replayed.
+    // An uncertain send (the prompt POST failed after it may have reached the server) may already have run: replaying it
+    // would repeat whatever it did, so it is never archived or restarted, whatever else it reports.
     if (
       result.llmError?.type === 'context_overflow' &&
+      result.sendUncertain !== true &&
       credentialProvisioned === false &&
       responseFileStatus === 'absent' &&
       sessionId != null
