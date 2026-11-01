@@ -272,7 +272,7 @@ describe('runExecute generation selector', () => {
     expect(mocks.writeSessionSummary).not.toHaveBeenCalled()
     expect(mocks.addSyntheticMessage).not.toHaveBeenCalled()
     expect(result.deferredSummary?.sessionId).toBe('ses_v2')
-    expect(result.deferredSummary?.text).toContain('Fro Bot Run Summary')
+    expect(result.deferredSummary?.summary).toMatchObject({eventType: 'pull_request', sessionIds: ['ses_v2']})
   })
 
   it('routes the overflow-recovery restart through the V2 executor, archiving over the V2 route', async () => {

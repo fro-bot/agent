@@ -482,7 +482,7 @@ describe('run on an OpenCode V2 server', () => {
     // #given an execute result that carries both
     const {runReleaseV2} = await import('./phases/release-v2.js')
     const liveObservation = {tracker: {}, snapshot: vi.fn(), stop: vi.fn()} as never
-    const deferredSummary = {sessionId: 'ses_v2', text: 'summary'}
+    const deferredSummary = {sessionId: 'ses_v2', summary: {} as never}
     await arrange({extras: {liveObservation, deferredSummary}})
 
     // #when

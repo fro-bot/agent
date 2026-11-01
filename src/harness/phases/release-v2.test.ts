@@ -1,5 +1,6 @@
 import type {OpenCodeV2ServerHandle} from '@fro-bot/runtime'
 import type {ReleaseOutcomeV2} from '../../features/agent/drain-v2.js'
+import type {RunSummary} from '../../shared/types.js'
 import {createOwnershipLedger} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {PRE_SHUTDOWN_REQUEST_TIMEOUT_MS} from '../../features/agent/drain-v2.js'
@@ -58,6 +59,21 @@ async function release(overrides: Partial<Parameters<typeof import('./release-v2
     logger: createMockLogger(),
     ...overrides,
   })
+}
+
+function summaryOf(tag: string): RunSummary {
+  return {
+    eventType: 'issue_comment',
+    repo: 'o/r',
+    ref: 'refs/heads/main',
+    runId: tag as unknown as number,
+    cacheStatus: 'hit',
+    sessionIds: [tag],
+    createdPRs: [],
+    createdCommits: [],
+    duration: 3,
+    tokenUsage: null,
+  }
 }
 
 function liveFor(order: string[]) {
@@ -213,11 +229,13 @@ describe('runReleaseV2', () => {
     )
 
     // #when
-    await release({deferredSummary: {sessionId: 'ses_root', text: 'summary text'}})
+    await release({deferredSummary: {sessionId: 'ses_root', summary: summaryOf('ses_root')}})
 
     // #then
     expect(order).toEqual(['quiet', 'summary', 'prune', 'shutdown'])
-    expect(mocks.addSyntheticMessage).toHaveBeenCalledWith({sessionId: 'ses_root', text: 'summary text'})
+    expect(mocks.addSyntheticMessage).toHaveBeenCalledWith(
+      expect.objectContaining({sessionId: 'ses_root', text: expect.stringContaining('Fro Bot Run Summary') as unknown}),
+    )
   })
 
   it('does not write the held summary when the release never reached a quiet directory', async () => {
@@ -225,7 +243,7 @@ describe('runReleaseV2', () => {
     mocks.releaseRunV2.mockResolvedValue(outcome({quiet: false, declineReason: 'not quiet'}))
 
     // #when
-    await release({deferredSummary: {sessionId: 'ses_root', text: 'summary text'}})
+    await release({deferredSummary: {sessionId: 'ses_root', summary: summaryOf('ses_root')}})
 
     // #then nothing is written to a session that may still be running
     expect(mocks.addSyntheticMessage).not.toHaveBeenCalled()
@@ -242,10 +260,60 @@ describe('runReleaseV2', () => {
     )
 
     // #when
-    await release({deferredSummary: {sessionId: 'ses_root', text: 'summary text'}})
+    await release({deferredSummary: {sessionId: 'ses_root', summary: summaryOf('ses_root')}})
 
     // #then
     expect(mocks.pruneSessionsV2).toHaveBeenCalledTimes(1)
+  })
+
+  it('formats the held summary at release, after the drain-observed turn, with its artifacts and usage', async () => {
+    // #given a summary taken before the drain, and a notice-triggered turn that opened a PR and used tokens
+    const order: string[] = []
+    const {observation} = liveFor(order)
+    const seenAfterDrain = {
+      tokens: null,
+      model: null,
+      cost: null,
+      prsCreated: ['https://github.com/o/r/pull/9'],
+      commitsCreated: ['abc1234'],
+      commentsPosted: 0,
+      llmError: null,
+    }
+    const live = {
+      ...observation,
+      stop: async () => seenAfterDrain,
+      refreshUsage: vi.fn(async () => ({
+        tokens: {input: 120, output: 30, reasoning: 0, cache: {read: 0, write: 0}},
+        cost: 0.4,
+        model: 'p/m',
+      })),
+    }
+    mocks.releaseRunV2.mockImplementation(
+      async (options: {
+        onSettled?: (quiet: boolean, signal: AbortSignal) => Promise<void>
+        beforeShutdown?: (signal: AbortSignal) => Promise<void>
+      }) => {
+        await options.onSettled?.(true, new AbortController().signal)
+        await options.beforeShutdown?.(new AbortController().signal)
+        return outcome()
+      },
+    )
+
+    // #when
+    await release({
+      liveObservation: live,
+      deferredSummary: {
+        sessionId: 'ses_root',
+        summary: {...summaryOf('ses_root'), createdPRs: ['https://github.com/o/r/pull/1']},
+      },
+    })
+
+    // #then the written text carries the PR and commit seen only during the drain, and the final usage
+    const written = (mocks.addSyntheticMessage.mock.calls[0]?.[0] as {text: string}).text
+    expect(written).toContain('https://github.com/o/r/pull/1')
+    expect(written).toContain('https://github.com/o/r/pull/9')
+    expect(written).toContain('abc1234')
+    expect(written).toContain('Tokens: 120 in / 30 out')
   })
 
   describe('the event observation kept through the wait', () => {
@@ -328,13 +396,26 @@ describe('runReleaseV2', () => {
 
     // #when
     const [a, b] = await Promise.all([
-      release({liveObservation: first.observation, deferredSummary: {sessionId: 'ses_a', text: 'summary a'}}),
-      release({liveObservation: second.observation, deferredSummary: {sessionId: 'ses_b', text: 'summary b'}}),
+      release({liveObservation: first.observation, deferredSummary: {sessionId: 'ses_a', summary: summaryOf('ses_a')}}),
+      release({
+        liveObservation: second.observation,
+        deferredSummary: {sessionId: 'ses_b', summary: summaryOf('ses_b')},
+      }),
     ])
 
     // #then
-    expect(mocks.addSyntheticMessage).toHaveBeenCalledWith({sessionId: 'ses_a', text: 'summary a'})
-    expect(mocks.addSyntheticMessage).toHaveBeenCalledWith({sessionId: 'ses_b', text: 'summary b'})
+    expect(mocks.addSyntheticMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: 'ses_a',
+        text: expect.stringContaining('Run ID: ses_a') as unknown as string,
+      }),
+    )
+    expect(mocks.addSyntheticMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: 'ses_b',
+        text: expect.stringContaining('Run ID: ses_b') as unknown as string,
+      }),
+    )
     expect(mocks.addSyntheticMessage).toHaveBeenCalledTimes(2)
     expect(order).toEqual(['stop', 'stop'])
     expect(first.refreshUsage).toHaveBeenCalledTimes(1)
@@ -372,7 +453,7 @@ describe('runReleaseV2', () => {
       // #when the request goes out and never answers
       const pending = release({
         serverHandle: hangingHandle,
-        deferredSummary: {sessionId: 'ses_root', text: 'summary text'},
+        deferredSummary: {sessionId: 'ses_root', summary: summaryOf('ses_root')},
       }).then(() => {
         done = true
       })

@@ -17,7 +17,11 @@ import type {RunSummary} from '../../shared/types.js'
  */
 export interface DeferredSummaryV2 {
   readonly sessionId: string
-  readonly text: string
+  /**
+   * The structured inputs, not the formatted text: turns the run observes after the execute phase (a notice-triggered
+   * turn during the drain) add artifacts and usage, and the release formats the summary only once those are merged in.
+   */
+  readonly summary: RunSummary
 }
 
 /** What draining the overflowed session's own work left behind (the V1 `DrainOutcome` fields the recovery reads). */

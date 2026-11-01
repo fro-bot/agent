@@ -2,7 +2,6 @@ import type {OwnershipLedger} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
 import type {CacheRestoreV2PhaseResult} from './cache-restore.js'
 import type {ExecutionBackend} from './execution-backend.js'
-import {formatSummaryForSession} from '@fro-bot/runtime'
 import {searchSessionsV2} from '@fro-bot/runtime/session-v2'
 import {stopAndConfirmQuietV2} from '../../features/agent/drain-v2.js'
 import {createActionClientV2, executeOpenCodeV2} from '../../features/agent/execution-v2.js'
@@ -99,7 +98,7 @@ export function createExecutionBackendV2(cacheRestore: CacheRestoreV2PhaseResult
     // just before the shutdown (`release-v2.ts`).
     writeSummary: async (sessionId, summary, logger) => {
       logger.debug('Session summary deferred until the run is released', {sessionId})
-      return {sessionId, text: formatSummaryForSession(summary)}
+      return {sessionId, summary}
     },
   }
 }

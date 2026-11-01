@@ -1,10 +1,11 @@
 import type {OpenCodeV2ServerHandle, OwnershipLedger} from '@fro-bot/runtime'
 import type {LiveObservationV2} from '../../features/agent/live-observation-v2.js'
 import type {Logger} from '../../shared/logger.js'
+import type {RunSummary} from '../../shared/types.js'
 import type {DrainOutcome} from './execute.js'
 import type {DeferredSummaryV2} from './execution-backend.js'
 import type {ObservedTurnV2} from './observed-turn-v2.js'
-import {DEFAULT_PRUNING_CONFIG} from '@fro-bot/runtime'
+import {DEFAULT_PRUNING_CONFIG, formatSummaryForSession} from '@fro-bot/runtime'
 import {PRE_SHUTDOWN_REQUEST_TIMEOUT_MS, releaseRunV2} from '../../features/agent/drain-v2.js'
 import {createActionClientV2} from '../../features/agent/execution-v2.js'
 import {getObservedFailureV2} from '../../features/agent/streaming-v2.js'
@@ -77,14 +78,34 @@ export function boundRequests(
   }
 }
 
+/** The held summary with what the drain-observed turns added: their artifacts and the usage re-read after them. */
+export function summaryAfterObservation(summary: RunSummary, observed: ObservedTurnV2 | undefined): RunSummary {
+  if (observed === undefined) return summary
+  const appendNew = (known: readonly string[], seen: readonly string[]): string[] => [
+    ...known,
+    ...seen.filter(item => !known.includes(item)),
+  ]
+  return {
+    ...summary,
+    createdPRs: appendNew(summary.createdPRs, observed.result.prsCreated),
+    createdCommits: appendNew(summary.createdCommits, observed.result.commitsCreated),
+    tokenUsage: observed.usage?.tokens ?? summary.tokenUsage,
+  }
+}
+
 /** The run summary the execute phase held back. Best-effort: a summary that cannot be written costs the next run context. */
 async function writeDeferredSummary(
   serverHandle: OpenCodeV2ServerHandle,
-  summary: DeferredSummaryV2 | undefined,
+  held: DeferredSummaryV2 | undefined,
+  observed: ObservedTurnV2 | undefined,
   fetchRoute: FetchRoute,
   logger: Logger,
 ): Promise<void> {
-  if (summary === undefined) return
+  if (held === undefined) return
+  const summary = {
+    sessionId: held.sessionId,
+    text: formatSummaryForSession(summaryAfterObservation(held.summary, observed)),
+  }
   try {
     const result = await createActionClientV2({...serverHandle, fetch: fetchRoute}).addSyntheticMessage({
       sessionId: summary.sessionId,
@@ -123,7 +144,7 @@ export async function runReleaseV2(options: RunReleaseV2Options): Promise<RunRel
     },
     beforeShutdown: async signal => {
       const fetchRoute = boundRequests(serverHandle.fetch, signal)
-      await writeDeferredSummary(serverHandle, options.deferredSummary, fetchRoute, logger)
+      await writeDeferredSummary(serverHandle, options.deferredSummary, seen.observed, fetchRoute, logger)
       await pruneSessionsV2({
         reader: createSessionReaderV2(fetchRoute),
         fetchRoute,
