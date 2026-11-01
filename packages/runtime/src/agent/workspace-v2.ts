@@ -14,6 +14,26 @@ export {
 
 export type {Logger} from '../shared/logger.js'
 
+export {resolveSystematicSkillsDirsV2} from './bundled-skills-dir.js'
+
+export {
+  boundedCredentialRequest,
+  credentialFailure,
+  modelProviderId,
+  spawnConfigFromConfig,
+  spawnConfigFromMergedConfig,
+  verifyCredentialGate,
+} from './credential-gate-v2.js'
+
+export type {
+  CredentialError,
+  CredentialErrorKind,
+  CredentialRequestOptions,
+  CredentialResult,
+  SpawnConfig,
+  VerifyCredentialGateOptions,
+} from './credential-gate-v2.js'
+
 export {isGatewayRouteV2, V2_GATEWAY_ROUTES} from './gateway-routes-v2.js'
 
 export type {V2GatewayRoute} from './gateway-routes-v2.js'

@@ -1,5 +1,28 @@
 export {ATTACHMENT_DIR_SEGMENT, buildAttachmentDir, createAttachmentDirExclusive} from './attachment-dir.js'
 export {
+  isSystematicSkillsDir,
+  resolveSystematicSkillsDirsV1,
+  resolveSystematicSkillsDirsV2,
+  SKILLS_EDIT_DENY_PATTERN_V1,
+} from './bundled-skills-dir.js'
+export {
+  boundedCredentialRequest,
+  credentialFailure,
+  modelProviderId,
+  spawnConfigFromConfig,
+  spawnConfigFromMergedConfig,
+  verifyCredentialGate,
+} from './credential-gate-v2.js'
+
+export type {
+  CredentialError,
+  CredentialErrorKind,
+  CredentialRequestOptions,
+  CredentialResult,
+  SpawnConfig,
+  VerifyCredentialGateOptions,
+} from './credential-gate-v2.js'
+export {
   awaitDirectoryStability,
   createDirectoryStabilityGate,
   DIRECTORY_INBOX_READ_CONCURRENCY,
@@ -12,7 +35,6 @@ export {
   observeDirectoryV2,
   ownedSessionIdsOf,
 } from './directory-quiescence-v2.js'
-
 export type {
   AwaitDirectoryStabilityOptions,
   AwaitDirectoryStabilityResult,
@@ -26,6 +48,7 @@ export type {
   InboxScope,
   ObserveDirectoryOptions,
 } from './directory-quiescence-v2.js'
+
 export {
   createAgentError,
   createErrorInfo,
@@ -42,7 +65,6 @@ export {
   retrySignalFromStatus,
   terminalSignalFromPayload,
 } from './error-format/provider-failure.js'
-
 export type {
   ProviderFailureClassification,
   ProviderFailureEvidence,
@@ -100,6 +122,12 @@ export type {
   ReconcileObservation,
 } from './ledger-reconcile.js'
 export {hasBlockingToolPart} from './message-facts.js'
+export {MIGRATION_V1_STATUS_PATH, MIGRATION_V1_STATUS_TIMEOUT_MS, readV1MigrationStatus} from './migration-status-v2.js'
+export type {
+  ReadV1MigrationStatusOptions,
+  V1MigrationProgress,
+  V1MigrationStatusReading,
+} from './migration-status-v2.js'
 export {resolveOutputMode} from './output-mode.js'
 export {createOwnershipLedger, isShellLedgerKey, shellIdFromLedgerKey, shellLedgerKey} from './ownership-ledger.js'
 export type {OwnershipEntryState, OwnershipLedger, OwnershipLedgerEntry} from './ownership-ledger.js'

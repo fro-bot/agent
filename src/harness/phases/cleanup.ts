@@ -91,6 +91,11 @@ export interface CleanupPhaseOptions {
    * Absent/`false` for locked runs and for S3-disabled runs, which have no coordination to lack.
    */
   readonly skipSessionPersistence?: boolean
+  /**
+   * Why `skipSessionPersistence` is set when the reason is not the coordination lock (an OpenCode V2 start that did not
+   * complete). Replaces the lock wording in the decline warning. Ignored unless `skipSessionPersistence` is true.
+   */
+  readonly persistenceDeclineReason?: string
 }
 
 /**
@@ -135,6 +140,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
     ownershipLedger,
     leaseRenewal,
     skipSessionPersistence = false,
+    persistenceDeclineReason,
   } = options
 
   // Populated below (quiescence during the shutdown step; lease continuity at the very end,
@@ -376,7 +382,8 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
     const continuityUnverifiedNow =
       leaseRenewal != null && (leaseRenewal.continuityUnverified?.() ?? leaseRenewal.hasFailed())
     const declineReason = skipSessionPersistence
-      ? 'this run did not acquire the Action coordination lock, so it must not write the shared session store'
+      ? (persistenceDeclineReason ??
+        'this run did not acquire the Action coordination lock, so it must not write the shared session store')
       : ownershipSafe === false
         ? 'background subagent work this run owns is still unresolved (the ownership ledger has entries that are outstanding or unknown), so persisting could race a live writer'
         : quiescenceConfirmed === false

@@ -13,6 +13,11 @@ export interface ToolsCacheKeyComponents {
    */
   readonly opencodeDigestId?: string
   readonly systematicVersion: string
+  /**
+   * Version of the fro.bot OpenCode plugin installed beside Systematic on V2. Omitted for V1, whose keys are unchanged.
+   * It is in the key so a bump of the plugin pin never restores a cache that holds the old plugin.
+   */
+  readonly frobotPluginVersion?: string
 }
 
 export interface ToolsCacheAdapter {
@@ -31,6 +36,7 @@ export interface RestoreToolsCacheOptions {
   readonly opencodeVersion: string
   readonly opencodeDigestId?: string
   readonly systematicVersion: string
+  readonly frobotPluginVersion?: string
   readonly toolCachePath: string
   readonly opencodeCachePath: string
   readonly cacheAdapter?: ToolsCacheAdapter
@@ -42,6 +48,7 @@ export interface SaveToolsCacheOptions {
   readonly opencodeVersion: string
   readonly opencodeDigestId?: string
   readonly systematicVersion: string
+  readonly frobotPluginVersion?: string
   readonly toolCachePath: string
   readonly opencodeCachePath: string
   readonly cacheAdapter?: ToolsCacheAdapter
@@ -56,16 +63,22 @@ function openCodeKeyPart({opencodeVersion, opencodeDigestId}: ToolsCacheKeyCompo
   return opencodeDigestId === undefined ? opencodeVersion : `${opencodeVersion}-${opencodeDigestId}`
 }
 
-export function buildToolsCacheKey(components: ToolsCacheKeyComponents): string {
-  const {os, systematicVersion} = components
+function pluginKeyPart({systematicVersion, frobotPluginVersion}: ToolsCacheKeyComponents): string {
+  return frobotPluginVersion === undefined
+    ? `sys-${systematicVersion}`
+    : `sys-${systematicVersion}-fbp-${frobotPluginVersion}`
+}
 
-  return `${TOOLS_CACHE_PREFIX}-${os}-oc-${openCodeKeyPart(components)}-sys-${systematicVersion}`
+export function buildToolsCacheKey(components: ToolsCacheKeyComponents): string {
+  const {os} = components
+
+  return `${TOOLS_CACHE_PREFIX}-${os}-oc-${openCodeKeyPart(components)}-${pluginKeyPart(components)}`
 }
 
 export function buildToolsRestoreKeys(components: ToolsCacheKeyComponents): readonly string[] {
-  const {os, systematicVersion} = components
+  const {os} = components
 
-  return [`${TOOLS_CACHE_PREFIX}-${os}-oc-${openCodeKeyPart(components)}-sys-${systematicVersion}-`] as const
+  return [`${TOOLS_CACHE_PREFIX}-${os}-oc-${openCodeKeyPart(components)}-${pluginKeyPart(components)}-`] as const
 }
 
 export function buildCachePaths(options: {toolCachePath: string; opencodeCachePath: string}): readonly string[] {
@@ -79,13 +92,15 @@ export async function restoreToolsCache(options: RestoreToolsCacheOptions): Prom
     opencodeVersion,
     opencodeDigestId,
     systematicVersion,
+    frobotPluginVersion,
     toolCachePath,
     opencodeCachePath,
     cacheAdapter = defaultToolsCacheAdapter,
   } = options
 
-  const primaryKey = buildToolsCacheKey({os, opencodeVersion, opencodeDigestId, systematicVersion})
-  const restoreKeys = buildToolsRestoreKeys({os, opencodeVersion, opencodeDigestId, systematicVersion})
+  const keyComponents = {os, opencodeVersion, opencodeDigestId, systematicVersion, frobotPluginVersion}
+  const primaryKey = buildToolsCacheKey(keyComponents)
+  const restoreKeys = buildToolsRestoreKeys(keyComponents)
   const cachePaths = buildCachePaths({toolCachePath, opencodeCachePath})
 
   logger.info('Restoring tools cache', {primaryKey, restoreKeys: [...restoreKeys], paths: cachePaths})
@@ -124,12 +139,13 @@ export async function saveToolsCache(options: SaveToolsCacheOptions): Promise<bo
     opencodeVersion,
     opencodeDigestId,
     systematicVersion,
+    frobotPluginVersion,
     toolCachePath,
     opencodeCachePath,
     cacheAdapter = defaultToolsCacheAdapter,
   } = options
 
-  const saveKey = buildToolsCacheKey({os, opencodeVersion, opencodeDigestId, systematicVersion})
+  const saveKey = buildToolsCacheKey({os, opencodeVersion, opencodeDigestId, systematicVersion, frobotPluginVersion})
   const cachePaths = buildCachePaths({toolCachePath, opencodeCachePath})
 
   logger.info('Saving tools cache', {saveKey, paths: cachePaths})
