@@ -1,4 +1,4 @@
-import type {ObjectStoreConfig, OwnershipLedger} from '@fro-bot/runtime'
+import type {ObjectStoreConfig, OpenCodeV2ServerHandle, OwnershipLedger} from '@fro-bot/runtime'
 import type {OpenCodeServerHandle} from '../../features/agent/index.js'
 import type {ReactionContext} from '../../features/agent/types.js'
 import type {AttachmentResult} from '../../features/attachments/index.js'
@@ -54,6 +54,11 @@ export interface CleanupPhaseOptions {
   readonly githubClient: Octokit | null
   readonly attachmentResult: AttachmentResult | null
   readonly serverHandle: OpenCodeServerHandle | null
+  /**
+   * The server of an OpenCode V2 run, in place of `serverHandle` (a run has one or the other). Kept as its own field so
+   * the V1 handle type, and every V1 caller of this phase, are unchanged.
+   */
+  readonly serverHandleV2?: OpenCodeV2ServerHandle | null
   readonly sessionRetention: number | null
   readonly detectedOpencodeVersion: string | null
   readonly storeConfig: ObjectStoreConfig
@@ -129,6 +134,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
     githubClient,
     attachmentResult,
     serverHandle,
+    serverHandleV2 = null,
     sessionRetention,
     detectedOpencodeVersion,
     storeConfig,
@@ -160,7 +166,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
   // `true` -- that was the false-certification bug this default exists to close. See also
   // the individual try/catch around each best-effort step below, which keeps those failures
   // from skipping the shutdown attempt itself in the first place.
-  let quiescenceConfirmed = serverHandle == null
+  let quiescenceConfirmed = serverHandle == null && serverHandleV2 == null
   let continuityUnverified = false
 
   try {
@@ -223,6 +229,9 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
 
     const pruneLogger = createLogger({phase: 'prune'})
     const finalWorkspace = getGitHubWorkspace()
+    // V2 has no SDK client to prune through, so `serverHandleV2` is not pruned here. A V2 run is pruned over
+    // `DELETE /api/session/:id` by its release step (`release-v2.ts` -> `prune-v2.ts`), which runs before this phase
+    // because pruning needs a live server and a directory already confirmed quiet, and the release shuts the server down.
     if (serverHandle != null) {
       try {
         const normalizedFinalWorkspace = normalizeWorkspacePath(finalWorkspace)
@@ -266,11 +275,15 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
     // unknown ownership-ledger entry -- persistence must decline rather than risk a
     // checkpoint racing a still-live writer. No server handle at all (e.g.
     // SKIP_AGENT_EXECUTION=true) has no writer to be unconfirmed about, so it stays true.
-    if (serverHandle != null) {
+    if (serverHandle != null || serverHandleV2 != null) {
       try {
-        const shutdownResult = await serverHandle.shutdown()
-        quiescenceConfirmed = shutdownResult.quiesced
-        if (!shutdownResult.quiesced) {
+        // V1 reports `quiesced`; V2 reports how the exit was confirmed. An exit it could not confirm is the same fact.
+        const quiesced =
+          serverHandleV2 == null
+            ? (await serverHandle?.shutdown())?.quiesced === true
+            : (await serverHandleV2.shutdown()).exit.outcome !== 'unconfirmed'
+        quiescenceConfirmed = quiesced
+        if (!quiesced) {
           bootstrapLogger.warning(
             'OpenCode server did not confirm shutdown within the quiescence window; the checkpoint that follows may race a still-live writer',
           )
