@@ -124,43 +124,4 @@ describe('createActionOpenCodeV2Client', () => {
       body: {text: 'summary', resume: false},
     })
   })
-
-  it('lists the newest user messages and drops assistant, synthetic and unreadable entries', async () => {
-    // #given
-    const {fetch, requests} = makeFetch(() =>
-      json(200, {
-        data: [
-          {id: 'msg_3', type: 'assistant', time: {created: 3}},
-          {id: 'msg_2', type: 'user', text: 'prompt', time: {created: 2}},
-          {id: 'msg_1', type: 'user', text: 5, time: {created: 1}},
-          {id: 'msg_0', type: 'user', text: 'no time'},
-        ],
-        cursor: {},
-      }),
-    )
-    const client = createActionOpenCodeV2Client({baseUrl: 'http://w', fetch})
-
-    // #when
-    const result = await client.listRecentUserMessages({sessionId: 'ses_1'})
-
-    // #then
-    expect(requests[0]).toMatchObject({method: 'GET', url: 'http://w/api/session/ses_1/message'})
-    expect(result).toEqual({success: true, data: [{id: 'msg_2', text: 'prompt', createdAt: 2}]})
-  })
-
-  it('reports a failed or unreadable message list as an error, never as an empty list', async () => {
-    // #given
-    const failing = createActionOpenCodeV2Client({baseUrl: 'http://w', fetch: makeFetch(() => json(503, {})).fetch})
-    const garbled = createActionOpenCodeV2Client({baseUrl: 'http://w', fetch: makeFetch(() => json(200, {})).fetch})
-
-    // #when / #then
-    expect(await failing.listRecentUserMessages({sessionId: 'ses_1'})).toEqual({
-      success: false,
-      error: {kind: 'http', status: 503},
-    })
-    expect(await garbled.listRecentUserMessages({sessionId: 'ses_1'})).toEqual({
-      success: false,
-      error: {kind: 'parse'},
-    })
-  })
 })

@@ -442,6 +442,27 @@ describe('run on an OpenCode V2 server', () => {
     expect(exitCode).toBe(1)
   })
 
+  it('declines the save and vetoes publication for a prompt whose acknowledgment was lost, after the stop path', async () => {
+    // #given an execution that failed because its prompt POST failed after it may have been sent
+    const {runFinalizeWithResult} = await import('./phases/finalize.js')
+    const {runCleanup} = await import('./phases/cleanup.js')
+    const {runReleaseV2} = await import('./phases/release-v2.js')
+    const core = await import('@actions/core')
+    await arrange({executeSuccess: false, extras: {sendUncertain: true}})
+
+    // #when
+    await run()
+
+    // #then the release was the STOP path (not a drain), and a confirmed-quiet directory still does not allow the save
+    expect(vi.mocked(runReleaseV2).mock.calls[0]?.[0]).toMatchObject({executionSucceeded: false})
+    expect(vi.mocked(runFinalizeWithResult).mock.calls[0]?.[7]).toMatchObject({knownExecutionVeto: true})
+    expect(vi.mocked(runCleanup).mock.calls[0]?.[0]).toMatchObject({
+      skipSessionPersistence: true,
+      persistenceDeclineReason: expect.stringContaining('acknowledgment was lost') as string,
+    })
+    expect(vi.mocked(core.saveState)).toHaveBeenCalledWith('should-save-cache', 'false')
+  })
+
   it('does not report a drain that finished in time as incomplete', async () => {
     // #given
     const {runFinalizeWithResult} = await import('./phases/finalize.js')

@@ -29,7 +29,18 @@ export interface LiveObservationV2 {
 }
 
 /** A V2 attempt's result. Only a successful attempt of a run that can keep observing carries an observation. */
-export type AttemptResultV2 = AttemptResult & {readonly liveObservation?: LiveObservationV2}
+export type AttemptResultV2 = AttemptResult & {
+  readonly liveObservation?: LiveObservationV2
+  /**
+   * The prompt POST failed AFTER it may have reached the server (the connection broke before an answer): the prompt may be
+   * admitted and running. It is never resent, and the run's state cannot be trusted to match what this run did.
+   */
+  readonly sendUncertain?: boolean
+}
 
 /** The V2 loop's result: V1's `AgentResult`, plus the observation a successful run keeps for the release. */
-export type AgentResultV2 = AgentResult & {readonly liveObservation?: LiveObservationV2}
+export type AgentResultV2 = AgentResult & {
+  readonly liveObservation?: LiveObservationV2
+  /** An attempt's prompt POST failed after it may have been sent; see `AttemptResultV2.sendUncertain`. */
+  readonly sendUncertain?: boolean
+}

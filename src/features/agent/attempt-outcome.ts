@@ -197,7 +197,15 @@ export function reduceAttemptOutcome(
   const winningFailure = selectWinningFailure(observation.failures, preservedSubmissionFailure)
 
   if (winningFailure != null) {
-    const outcome = outcomeForFailure(winningFailure, turnEvidence)
+    let outcome = outcomeForFailure(winningFailure, turnEvidence)
+    // A submission failure that must not be retried (an auth refusal, or a prompt that may already be running) keeps that
+    // prohibition even when a session failure outranks it as the reported cause: the cause decides what is reported, not
+    // whether another prompt may go out. A submission failure with a retryable `llmError` is the ordinary resend case.
+    const submissionVeto = [
+      ...observation.failures,
+      ...(preservedSubmissionFailure === null ? [] : [preservedSubmissionFailure]),
+    ].some(failure => failure.source === 'submission' && failure.llmError === null)
+    if (submissionVeto && outcome === 'turn_failed_retryable') outcome = 'turn_failed_terminal'
     return assertSuccessInvariant({
       success: false,
       error: winningFailure.message,

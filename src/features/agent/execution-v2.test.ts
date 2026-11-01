@@ -533,15 +533,40 @@ describe('executeOpenCodeV2', () => {
 
     describe('a prompt acknowledgment that is lost', () => {
       const lost = {kind: 'network', message: 'socket hang up'} as const
-      const sentRecently = () => Date.now()
 
-      it('does not send the prompt again when the server admitted it, and completes from the first execution', async () => {
-        // #given the connection fails after the server admitted the prompt and started its turn
+      it('never sends the prompt again, fails the run, and reports the send as uncertain', async () => {
+        // #given the connection fails after the prompt may have reached the server
+        const server = createFakeServer({promptResults: [lost], onPrompt: (_, pipe) => succeedWithText(pipe)})
+
+        // #when
+        const result = executeOpenCodeV2(
+          promptOptions(),
+          logger,
+          {agent: null, model: null, timeoutMs: 120_000},
+          handle(),
+          undefined,
+          server.client,
+        )
+        await advance(15_000)
+
+        // #then one POST, a failed run, and the flag the caller declines the save on
+        expect(await result).toMatchObject({success: false, exitCode: 1, sendUncertain: true})
+        expect(server.calls.prompt).toHaveBeenCalledTimes(1)
+      })
+
+      it('does not resend it either when a retryable turn failure arrives alongside', async () => {
+        // #given the acknowledgment is lost, and the root (which the prompt did start) fails with a retryable error
         const server = createFakeServer({
           promptResults: [lost],
-          admittedDespiteError: [true],
-          onPrompt: (_, pipe) => succeedWithText(pipe),
-          recentUserMessages: [[{id: 'msg_1', text: 'Built prompt', createdAt: sentRecently() + 10}]],
+          onFailedPrompt: (_, pipe) => {
+            pipe.push(STARTED)
+            pipe.push(
+              frame('session.execution.failed', {
+                sessionID: ROOT_SESSION_ID,
+                error: {type: 'provider.transport', message: 'socket hang up'},
+              }),
+            )
+          },
         })
 
         // #when
@@ -553,17 +578,17 @@ describe('executeOpenCodeV2', () => {
           undefined,
           server.client,
         )
-        await advance(10_000)
+        await advance(15_000)
 
-        // #then one prompt, observed to its end
-        expect(await result).toMatchObject({success: true})
+        // #then neither a resend nor a continuation went out
+        expect(await result).toMatchObject({success: false, sendUncertain: true})
         expect(server.calls.prompt).toHaveBeenCalledTimes(1)
       })
 
-      it('sends it again when the server did not admit it', async () => {
-        // #given nothing of the prompt reached the server: no message, root idle, inbox empty
+      it('retries a failure that happened before the send: the event subscription', async () => {
+        // #given the first subscription fails before any prompt is sent
         const server = createFakeServer({
-          promptResults: [lost],
+          subscribeResults: [{kind: 'network', message: 'connection refused'}],
           onPrompt: (_, pipe) => succeedWithText(pipe),
         })
 
@@ -578,76 +603,43 @@ describe('executeOpenCodeV2', () => {
         )
         await advance(10_000 + (RETRY_DELAYS_MS[0] ?? 0))
 
-        // #then
-        expect(await result).toMatchObject({success: true})
-        expect(server.calls.prompt).toHaveBeenCalledTimes(2)
-      })
-
-      it('fails without sending again when admission cannot be determined', async () => {
-        // #given reads that keep failing, so neither "admitted" nor "absent" can be shown
-        const server = createFakeServer({
-          promptResults: [lost],
-          recentUserMessages: [{kind: 'network', message: 'down'}],
-        })
-
-        // #when
-        const result = executeOpenCodeV2(
-          promptOptions(),
-          logger,
-          {agent: null, model: null, timeoutMs: 120_000},
-          handle(),
-          undefined,
-          server.client,
-        )
-        await advance(15_000)
-
-        // #then a duplicate run is worse than a failed one
-        expect(await result).toMatchObject({success: false, exitCode: 1})
+        // #then it resubscribed and sent the prompt once
+        const outcome = await result
+        expect(outcome).toMatchObject({success: true})
+        expect(outcome).not.toHaveProperty('sendUncertain')
+        expect(server.calls.subscribeEvents).toHaveBeenCalledTimes(2)
         expect(server.calls.prompt).toHaveBeenCalledTimes(1)
       })
 
-      it('fails without sending again when the root is running but no message shows the prompt', async () => {
-        // #given the root is active: an admitted prompt queued behind a turn is not a message yet
-        const server = createFakeServer({promptResults: [lost]})
-        server.sessionActive.mockResolvedValue({[ROOT_SESSION_ID]: {type: 'running'}})
-
-        // #when
-        const result = executeOpenCodeV2(
-          promptOptions(),
-          logger,
-          {agent: null, model: null, timeoutMs: 120_000},
-          handle(),
-          undefined,
-          server.client,
-        )
-        await advance(15_000)
-
-        // #then
-        expect(await result).toMatchObject({success: false})
-        expect(server.calls.prompt).toHaveBeenCalledTimes(1)
-      })
-
-      it('does not treat a refusal as ambiguous: a 429 is a definite "not admitted" and keeps its own handling', async () => {
+      it('keeps the existing handling of an explicit rejection: a 429 is retried, an auth failure is not', async () => {
         // #given
-        const server = createFakeServer({
+        const rateLimited = createFakeServer({
           promptResults: [{kind: 'http', status: 429}],
           onPrompt: (_, pipe) => succeedWithText(pipe),
         })
+        const refused = createFakeServer({promptResults: [{kind: 'auth', status: 401}]})
+        const run = async (server: typeof rateLimited) =>
+          executeOpenCodeV2(
+            promptOptions(),
+            logger,
+            {agent: null, model: null, timeoutMs: 120_000},
+            handle(),
+            undefined,
+            server.client,
+          )
 
         // #when
-        const result = executeOpenCodeV2(
-          promptOptions(),
-          logger,
-          {agent: null, model: null, timeoutMs: 120_000},
-          handle(),
-          undefined,
-          server.client,
-        )
+        const first = run(rateLimited)
+        const second = run(refused)
         await advance(10_000 + (RETRY_DELAYS_MS[0] ?? 0))
 
-        // #then no admission check was needed
-        expect(await result).toMatchObject({success: true})
-        expect(server.listRecentUserMessages).not.toHaveBeenCalled()
+        // #then neither is reported as an uncertain send
+        const [limited, auth] = await Promise.all([first, second])
+        expect(limited).toMatchObject({success: true})
+        expect(rateLimited.calls.prompt).toHaveBeenCalledTimes(2)
+        expect(auth).toMatchObject({success: false})
+        expect(auth).not.toHaveProperty('sendUncertain')
+        expect(refused.calls.prompt).toHaveBeenCalledTimes(1)
       })
     })
 

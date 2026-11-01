@@ -69,6 +69,12 @@ export interface ExecutePhaseResult {
    * After an overflow recovery this is the replacement run's; the overflowed run's is stopped at the restart.
    */
   readonly liveObservation?: LiveObservationV2
+  /**
+   * V2 only. The prompt POST failed after it may have reached the server (see `AttemptResultV2.sendUncertain`): it was not
+   * resent, the run failed, and what the session holds cannot be vouched for. `run.ts` declines the save and vetoes
+   * publication for it.
+   */
+  readonly sendUncertain?: boolean
   /** V2 only. The run summary held back for the release to write (see `DeferredSummaryV2`). */
   readonly deferredSummary?: DeferredSummaryV2
   /**

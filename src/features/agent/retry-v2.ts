@@ -49,7 +49,7 @@ const TERMINAL_GRACE_MS = 500
 const TERMINAL_POLL_INTERVAL_MS = 10
 const BEFORE_ADMISSION_RETRY_MS = 250
 
-export type PromptStartResultV2 = AttemptResult | null
+export type PromptStartResultV2 = (AttemptResult & {readonly sendUncertain?: boolean}) | null
 export type PromptStarterV2 = () => Promise<PromptStartResultV2>
 
 type V2WaitObservation = {readonly kind: 'fallback-to-poll'} | AttemptObservation
@@ -232,6 +232,7 @@ export async function runPromptAttemptV2(options: RunPromptAttemptV2Options): Pr
 
   // Set when the processor is handed over: the finally block then leaves it running.
   let kept = false
+  let sendUncertain = false
 
   // A failed prompt submission deferred past the early exit below, as a snapshot that joins the single reduction.
   let preservedSubmissionFailure: FailureObservation | null = null
@@ -250,6 +251,9 @@ export async function runPromptAttemptV2(options: RunPromptAttemptV2Options): Pr
 
     const promptStartResult =
       deadline === undefined ? await startPrompt() : await deadline.run(startPrompt, 'prompt submission')
+    // Sticky for the rest of the attempt: a prompt that may be running must neither be resent nor trusted to leave the
+    // session in a state this run can vouch for, whichever failure the reduction below selects.
+    if (promptStartResult?.sendUncertain === true) sendUncertain = true
     if (promptStartResult !== null) {
       if (ledgerBlocksCompletion(ownershipLedger)) {
         if (!promptStartResult.success) {
@@ -293,6 +297,7 @@ export async function runPromptAttemptV2(options: RunPromptAttemptV2Options): Pr
             shouldRetry: reduced.shouldRetry,
             settlement: reduced.settlement,
             eventStreamResult: merged,
+            ...(sendUncertain ? {sendUncertain} : {}),
           }
         }
         return promptStartResult
@@ -367,6 +372,7 @@ export async function runPromptAttemptV2(options: RunPromptAttemptV2Options): Pr
       shouldRetry: reduced.shouldRetry,
       settlement: reduced.settlement,
       eventStreamResult: merged,
+      ...(sendUncertain ? {sendUncertain} : {}),
     }
   } finally {
     reconciler?.dispose()

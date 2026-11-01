@@ -54,22 +54,6 @@ export interface ActionOpenCodeV2Client extends RemoteOpenCodeV2Client {
     readonly text: string
     readonly signal?: AbortSignal
   }) => Promise<Result<undefined, V2CallError>>
-  /**
-   * `GET /api/session/:id/message`: the newest page of the session's messages, user messages only, newest first. It is how
-   * a caller learns whether a prompt whose acknowledgment was lost was admitted: admission is durable and synchronous, so
-   * an admitted prompt is already a user message when the server answers (probed on the pinned binary).
-   */
-  readonly listRecentUserMessages: (input: {
-    readonly sessionId: string
-    readonly signal?: AbortSignal
-  }) => Promise<Result<readonly V2UserMessage[], V2CallError>>
-}
-
-export interface V2UserMessage {
-  readonly id: string
-  readonly text: string
-  /** Epoch milliseconds, the server's clock. */
-  readonly createdAt: number
 }
 
 function trimTrailingSlashes(value: string): string {
@@ -147,42 +131,6 @@ export function createActionOpenCodeV2Client(options: RemoteOpenCodeV2ClientOpti
         body: {...(title === undefined ? {} : {title}), ...(archived === undefined ? {} : {archived})},
         ...(signal === undefined ? {} : {signal}),
       }),
-
-    listRecentUserMessages: async ({sessionId, signal}) => {
-      const headers = new Headers(options.headers ?? {})
-      headers.set('accept', 'application/json')
-      try {
-        const response = await doFetch(`${baseUrl}${sessionPath(sessionId)}/message`, {
-          method: 'GET',
-          headers,
-          ...(signal === undefined ? {} : {signal}),
-        })
-        if (response.status === 401 || response.status === 403) {
-          await response.body?.cancel().catch(() => undefined)
-          return err({kind: 'auth', status: response.status})
-        }
-        if (!response.ok) {
-          await response.body?.cancel().catch(() => undefined)
-          return err({kind: 'http', status: response.status})
-        }
-        const body: unknown = await response.json()
-        const data = typeof body === 'object' && body !== null ? (body as {data?: unknown}).data : undefined
-        if (!Array.isArray(data)) return err({kind: 'parse'})
-        const messages: V2UserMessage[] = []
-        for (const item of data as unknown[]) {
-          if (typeof item !== 'object' || item === null) continue
-          const record = item as {id?: unknown; type?: unknown; text?: unknown; time?: {created?: unknown}}
-          if (record.type !== 'user' || typeof record.id !== 'string' || typeof record.text !== 'string') continue
-          const created = record.time?.created
-          if (typeof created !== 'number') continue
-          messages.push({id: record.id, text: record.text, createdAt: created})
-        }
-        return ok(messages)
-      } catch (error) {
-        if (signal?.aborted === true) return err({kind: 'aborted'})
-        return err({kind: 'network', message: error instanceof Error ? error.message : 'request failed'})
-      }
-    },
 
     addSyntheticMessage: async ({sessionId, text, signal}) =>
       sendNoContent({

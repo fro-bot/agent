@@ -175,6 +175,8 @@ export async function executeOpenCodeV2(
   let stoppingCause: 'deadline' | 'other' | null = null
   // Sticky across attempts: a later clean attempt must not clear an earlier gap.
   let observationGap = false
+  // An attempt's prompt POST failed after it may have been sent: sticky, and reported to the caller whatever happens next.
+  let sendUncertain = false
   // The root's usage before this run's first prompt: V2 reports cumulative figures per session, so a continued session
   // is read once up front. Without a baseline a continued session's usage would include earlier runs, so it is left out.
   let usageBaseline: SessionUsageV2 | null = null
@@ -217,6 +219,7 @@ export async function executeOpenCodeV2(
       llmError: lastLlmError,
       classificationPath: final.classificationPath,
       observationGap,
+      ...(sendUncertain ? {sendUncertain} : {}),
     }
   }
 
@@ -364,6 +367,7 @@ export async function executeOpenCodeV2(
 
       final = mergeAttemptUsage(mergeArtifactResults(result.eventStreamResult, final), final)
       if (result.eventStreamResult.discontinuity != null) observationGap = true
+      if (result.sendUncertain === true) sendUncertain = true
 
       if (result.success) {
         stoppingCause = 'other'
@@ -469,6 +473,7 @@ export async function executeOpenCodeV2(
       llmError: lastLlmError,
       classificationPath: final.classificationPath,
       observationGap,
+      ...(sendUncertain ? {sendUncertain} : {}),
     }
   } catch (error) {
     // An explicit, tagged deadline rejection is the one exception that IS a deadline cause, identified by name.
@@ -498,6 +503,7 @@ export async function executeOpenCodeV2(
       llmError: transportFailure ? createLLMFetchError(errorMessage) : null,
       classificationPath: transportFailure ? 'fallback' : 'unclassified',
       observationGap,
+      ...(sendUncertain ? {sendUncertain} : {}),
     }
   } finally {
     // Interrupt the root if and only if the selected stopping cause is 'deadline' and a session exists. This never

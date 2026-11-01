@@ -111,6 +111,8 @@ export async function run(): Promise<number> {
   let ownershipUnresolved = false
   // V2: the server's exit was not confirmed after a release that otherwise looked clean. Raised before publication.
   let serverExitUnconfirmed = false
+  // V2: a prompt POST failed after it may have been sent, and was not resent.
+  let promptSendUncertain = false
   let triggerContext: TriggerContext | null = null
   let dedupEntity: DeduplicationEntity | null = null
   // Hoisted for the post-cleanup blocked-label clear in the `finally` block; null until bootstrap resolves inputs.
@@ -299,6 +301,15 @@ export async function run(): Promise<number> {
       serverReleasedV2 = true
       drainResult = release.drain
       serverExitUnconfirmed = release.serverExitUnconfirmed === true
+      if (execution.sendUncertain === true) {
+        // The prompt may have run without this run seeing it. The stop path above already confirmed the directory quiet,
+        // but the session's content may include work this run cannot account for, so nothing is saved or endorsed.
+        promptSendUncertain = true
+        skipSessionPersistence = true
+        persistenceDeclineReason ??=
+          'the prompt acknowledgment was lost, so what the session holds cannot be vouched for'
+        core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
+      }
       if (release.observed !== undefined) {
         // The root's turns after the attempt returned (a notice starting a second one) are part of the run: the last
         // one decides whether it succeeded, and what it did joins the artifacts and usage.
@@ -354,7 +365,7 @@ export async function run(): Promise<number> {
     // removed). A known defect can veto an endorsement without the absence of that defect
     // certifying the invocation -- this flag is the veto, never a certificate, and it never
     // feeds `assessInvocationOutcome` or the final `InvocationVerificationFacts` below.
-    const knownExecutionVeto = observationGap || ownershipUnresolved || serverExitUnconfirmed
+    const knownExecutionVeto = observationGap || ownershipUnresolved || serverExitUnconfirmed || promptSendUncertain
 
     // Review reconciliation: after the agent session, check if a formal APPROVE
     // is needed to satisfy branch protection when the agent delivered a PASS

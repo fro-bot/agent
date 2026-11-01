@@ -101,6 +101,26 @@ export interface FakeServerOptions {
   readonly endWithoutConnect?: boolean
   /** Per-call prompt results; a missing entry succeeds. */
   readonly promptResults?: readonly (V2CallError | null)[]
+  /** Called for each prompt call that FAILS (1-based), as the server's events would arrive while the connection broke. */
+  readonly onFailedPrompt?: (attempt: number, pipe: EventPipe) => void
+  /** Subscription results; a missing entry succeeds. */
+  readonly subscribeResults?: readonly (V2CallError | null)[]
+  /** `waitSession` resolves only when this resolves; default resolves at once. */
+  readonly waitGate?: Promise<void>
+  readonly interruptResult?: {readonly interrupted: boolean}
+}
+
+export interface FakeServerOptions {
+  /** Called for each accepted prompt (1-based). Push frames from here. */
+  readonly onPrompt?: (attempt: number, pipe: EventPipe) => void
+  /** Do not announce `server.connected`; the stream stays open. */
+  readonly neverConnect?: boolean
+  /** The first subscribed stream never announces itself and never ends; later ones are healthy. */
+  readonly silentFirstStream?: boolean
+  /** Close the stream without announcing it. */
+  readonly endWithoutConnect?: boolean
+  /** Per-call prompt results; a missing entry succeeds. */
+  readonly promptResults?: readonly (V2CallError | null)[]
   /**
    * Per-call: the server admitted the prompt (and ran `onPrompt`) even though the call reports `promptResults`' error,
    * which is what a connection lost after admission looks like.
@@ -137,7 +157,6 @@ export interface FakeServer {
   readonly order: string[]
   readonly getSession: ReturnType<typeof vi.fn>
   readonly sessionActive: ReturnType<typeof vi.fn>
-  readonly listRecentUserMessages: ReturnType<typeof vi.fn>
 }
 
 async function* neverEndingStream(): AsyncGenerator<unknown> {
@@ -162,7 +181,11 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
       order.push('subscribe')
       subscribeCount += 1
       const failed = options.subscribeResults?.[subscribeCount - 1] ?? null
-      if (failed !== null) return fail(failed)
+      if (failed !== null) {
+        const failedPipe = pipes.at(-1)
+        if (failedPipe !== undefined) options.onFailedPrompt?.(promptCount, failedPipe)
+        return fail(failed)
+      }
       if (options.silentFirstStream === true && subscribeCount === 1) return ok(neverEndingStream())
       const pipe = createEventPipe(input.signal)
       pipes.push(pipe)
@@ -174,13 +197,7 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
       order.push('prompt')
       promptCount += 1
       const failed = options.promptResults?.[promptCount - 1] ?? null
-      if (failed !== null) {
-        if (options.admittedDespiteError?.[promptCount - 1] === true) {
-          const admittedPipe = pipes.at(-1)
-          if (admittedPipe !== undefined) options.onPrompt?.(promptCount, admittedPipe)
-        }
-        return fail(failed)
-      }
+      if (failed !== null) return fail(failed)
       const pipe = pipes.at(-1)
       if (pipe !== undefined) options.onPrompt?.(promptCount, pipe)
       return ok(undefined)
@@ -202,17 +219,7 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
 
   const sessionActive = vi.fn(async (_input?: unknown): Promise<Record<string, unknown>> => ({}))
   const getSession = vi.fn(async (_input?: unknown): Promise<unknown> => fail({kind: 'http', status: 404}))
-  let messageReads = 0
-  const listRecentUserMessages = vi.fn(async (_input?: unknown) => {
-    const scripted = options.recentUserMessages
-    if (scripted === undefined || scripted.length === 0) return ok([])
-    const entry = scripted[Math.min(messageReads, scripted.length - 1)] as
-      readonly {id: string; text: string; createdAt: number}[] | V2CallError
-    messageReads += 1
-    return Array.isArray(entry) ? ok(entry) : fail(entry as V2CallError)
-  })
   const client = {
-    listRecentUserMessages,
     session: {active: sessionActive, list: vi.fn(async () => ({data: []}))},
     getSession,
     replyForm: vi.fn(async () => ok(undefined)),
@@ -224,7 +231,7 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
     ...calls,
   } as unknown as ActionOpenCodeV2Client
 
-  return {client, pipes, calls, order, getSession, sessionActive, listRecentUserMessages}
+  return {client, pipes, calls, order, getSession, sessionActive}
 }
 
 /** The frames of a plain successful turn (text, then root success). */

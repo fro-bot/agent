@@ -9,6 +9,7 @@
  */
 import type {ErrorInfo} from '@fro-bot/runtime'
 import type {AttemptOutcome} from './prompt-sender.js'
+import {createLLMFetchError} from '@fro-bot/runtime'
 import {describe, expect, it} from 'vitest'
 import {
   reduceAttemptOutcome,
@@ -525,5 +526,59 @@ describe('reduceAttemptOutcome', () => {
       const {observation, turnEvidence} = observationFor()
       expect(reduceAttemptOutcome(observation, null, turnEvidence).shouldRetry).toBe(expectedShouldRetry)
     })
+  })
+})
+
+describe('a submission failure that must not be retried', () => {
+  it('keeps the prohibition when a retryable session failure outranks it as the reported cause', () => {
+    // #given the reviewer's probe: a retryable transport failure on the session, and a submission failure that says
+    // "admission unknown; do not resend" (no retryable error)
+    const result = reduceAttemptOutcome(
+      {
+        settlement: {kind: 'failure-observed'},
+        failures: [
+          {source: 'session', message: 'transport', llmError: createLLMFetchError('transport')},
+          {source: 'submission', message: 'admission unknown; do not resend', llmError: null},
+        ],
+      },
+      null,
+      {accepted: true},
+    )
+
+    // #then the session failure is still the reported cause, but nothing may be resent
+    expect(result).toMatchObject({outcome: 'turn_failed_terminal', shouldRetry: false, error: 'transport'})
+  })
+
+  it('also holds for a submission failure carried past an early exit', () => {
+    // #given
+    const result = reduceAttemptOutcome(
+      {
+        settlement: {kind: 'failure-observed'},
+        failures: [{source: 'session', message: 'transport', llmError: createLLMFetchError('transport')}],
+      },
+      {source: 'submission', message: 'not resent', llmError: null},
+      {accepted: true},
+    )
+
+    // #then
+    expect(result.shouldRetry).toBe(false)
+  })
+
+  it('leaves an ordinary retryable session failure retryable', () => {
+    // #given a session failure and a RETRYABLE submission diagnostic
+    const result = reduceAttemptOutcome(
+      {
+        settlement: {kind: 'failure-observed'},
+        failures: [
+          {source: 'session', message: 'transport', llmError: createLLMFetchError('transport')},
+          {source: 'submission', message: 'lost', llmError: createLLMFetchError('lost')},
+        ],
+      },
+      null,
+      {accepted: true},
+    )
+
+    // #then
+    expect(result).toMatchObject({outcome: 'turn_failed_retryable', shouldRetry: true})
   })
 })
