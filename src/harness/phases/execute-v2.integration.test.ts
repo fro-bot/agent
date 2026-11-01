@@ -485,7 +485,7 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
     for (const handle of handles) await handle.shutdown()
     for (const provider of providers) await provider.stop()
     for (const box of sandboxes) rmSync(box.root, {recursive: true, force: true})
-  })
+  }, 60_000)
 
   it('runs one prompt: the answer is captured without reasoning, the question tool is neutralized, the outside read is rejected', async () => {
     // #given a started and gated server, and a scripted model
@@ -789,6 +789,50 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
     }
     expect(sessionClaims(box.dbPath).every(row => row.suspended === null)).toBe(true)
     expect(sizeOrZero(path.join(dbDir, 'opencode.db-wal'))).toBe(0)
+  }, 300_000)
+
+  it('accounts for a background shell that a FOREGROUND subagent started, through completion', async () => {
+    // #given a root that runs a foreground subagent, whose child starts a 5 s background shell and ends its own turn
+    const box = createSandbox()
+    sandboxes.push(box)
+    const marker = 'foreground-child-job-e72'
+    const provider = await startScriptedProvider([
+      {tool: 'subagent', args: {agent: 'general', description: 'fg child', prompt: 'start the job'}},
+      {tool: 'shell', args: {command: `sleep 5 && echo ${marker}`, background: true}},
+      {text: 'The child started the job.'},
+      {text: 'The root is done.'},
+    ])
+    providers.push(provider)
+    const real = await startRealServer(box, provider)
+    const startedAt = Date.now()
+
+    // #when the execute phase runs, then the run is released the way `run.ts` releases it
+    const result = await executePhase(real, box, 120_000)
+    const ledgerAtReturn = result.ownershipLedger?.snapshot() ?? []
+    const release = await runReleaseV2({
+      serverHandle: real,
+      executionSucceeded: result.success,
+      rootSessionId: result.sessionId,
+      ledger: result.ownershipLedger,
+      liveObservation: result.liveObservation,
+      deferredSummary: result.deferredSummary,
+      runStartedAt: startedAt,
+      deadlineMs: computeDrainDeadlineMs(120_000, result.executionDurationMs),
+      sessionRetention: 50,
+      logger: createMockLogger(),
+    })
+
+    // #then the ledger knew the child AND the shell its child left behind, before anything was released
+    expect(result).toMatchObject({success: true})
+    expect(ledgerAtReturn.some(entry => entry.sessionId.startsWith('shell:'))).toBe(true)
+    expect(ledgerAtReturn.some(entry => !entry.sessionId.startsWith('shell:') && entry.label === 'fg child')).toBe(true)
+
+    // #and everything was settled by the end, the shell was waited for, and the server exited
+    expect(result.ownershipLedger?.isDrainComplete()).toBe(true)
+    expect(release.persistenceDeclineReason).toBeUndefined()
+    expect(release.drain).toMatchObject({expired: false, unknownCount: 0})
+    expect((await real.exited).code).toBe(0)
+    expect(processRunning(marker)).toBe(false)
   }, 300_000)
 
   it('kills a shell the deadline lands on, interrupts the sessions, and the server process exits', async () => {
