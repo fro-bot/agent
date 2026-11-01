@@ -414,6 +414,34 @@ describe('run on an OpenCode V2 server', () => {
     expect(exitCode).toBe(1)
   })
 
+  it('withholds publication and the save when the server exit could not be confirmed after a clean drain', async () => {
+    // #given a quiet drain with settled ownership, and a shutdown that threw or came back unconfirmed
+    const {runFinalizeWithResult} = await import('./phases/finalize.js')
+    const {runCleanup} = await import('./phases/cleanup.js')
+    const {runReleaseV2} = await import('./phases/release-v2.js')
+    const {setInvocationOutcomeOutput} = await import('./config/outputs.js')
+    await arrange()
+    vi.mocked(runReleaseV2).mockResolvedValue({
+      drain: {expired: false, cancelledCount: 0, settledCount: 0, unknownCount: 0},
+      persistenceDeclineReason: 'the OpenCode server exit could not be confirmed',
+      serverExitUnconfirmed: true,
+    })
+
+    // #when
+    const exitCode = await run()
+
+    // #then the pre-publication veto (approval, brokered push, endorsing comment) is raised, as the drain facts are clean
+    expect(vi.mocked(runFinalizeWithResult).mock.calls[0]?.[7]).toMatchObject({knownExecutionVeto: true})
+
+    // #and the save is declined with the release's reason
+    expect(vi.mocked(runCleanup).mock.calls[0]?.[0]).toMatchObject({
+      skipSessionPersistence: true,
+      persistenceDeclineReason: 'the OpenCode server exit could not be confirmed',
+    })
+    expect(vi.mocked(setInvocationOutcomeOutput)).toHaveBeenCalledWith('incomplete')
+    expect(exitCode).toBe(1)
+  })
+
   it('does not report a drain that finished in time as incomplete', async () => {
     // #given
     const {runFinalizeWithResult} = await import('./phases/finalize.js')

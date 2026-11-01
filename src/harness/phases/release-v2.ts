@@ -42,6 +42,11 @@ export interface RunReleaseV2Result {
   readonly drain: DrainOutcome
   /** Why nothing may be saved, or `undefined` when the directory was confirmed quiet. */
   readonly persistenceDeclineReason: string | undefined
+  /**
+   * The server's exit could not be confirmed (shutdown threw, or reported `unconfirmed`) while everything before it looked
+   * clean. Publication must not proceed on it: a writer that may still be alive can change what the run published.
+   */
+  readonly serverExitUnconfirmed?: boolean
   /** What the event observation saw after the attempt returned, when it was kept running. See `observed-turn-v2.ts`. */
   readonly observed?: ObservedTurnV2 | undefined
 }
@@ -132,6 +137,12 @@ export async function runReleaseV2(options: RunReleaseV2Options): Promise<RunRel
     },
   })
 
+  // `null` is a shutdown that threw; `unconfirmed` is one that returned without proving the process gone.
+  const serverExitUnconfirmed = outcome.shutdown === null || outcome.shutdown.exit.outcome === 'unconfirmed'
+  const exitDeclineReason = serverExitUnconfirmed
+    ? 'the OpenCode server exit could not be confirmed, so a still-live writer could change the session state'
+    : undefined
+
   return {
     // `expired` keeps V1's meaning: the wait for a succeeded run's own work did not finish inside its bound. A stop after
     // a failed or timed-out execution is not an expiry; the run already reported that.
@@ -141,7 +152,8 @@ export async function runReleaseV2(options: RunReleaseV2Options): Promise<RunRel
       settledCount: 0,
       unknownCount: outcome.quiet ? outcome.unknownCount : Math.max(1, outcome.unknownCount),
     },
-    persistenceDeclineReason: outcome.declineReason ?? undefined,
+    persistenceDeclineReason: outcome.declineReason ?? exitDeclineReason,
+    serverExitUnconfirmed,
     observed: seen.observed,
   }
 }

@@ -36,7 +36,10 @@ function outcome(overrides: Partial<ReleaseOutcomeV2> = {}): ReleaseOutcomeV2 {
     drain: 'quiet',
     stopped: false,
     unknownCount: 0,
-    shutdown: null,
+    shutdown: {
+      interrupts: {stopped: [], notRunning: [], unconfirmed: []},
+      exit: {outcome: 'graceful', code: 0, signal: null},
+    },
     declineReason: null,
     ...overrides,
   }
@@ -99,9 +102,10 @@ describe('runReleaseV2', () => {
     const result = await release()
 
     // #then
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       drain: {expired: false, cancelledCount: 0, settledCount: 0, unknownCount: 0},
       persistenceDeclineReason: undefined,
+      serverExitUnconfirmed: false,
     })
     expect(mocks.releaseRunV2.mock.calls[0]?.[0]).toMatchObject({
       directory: '/workspace',
@@ -109,6 +113,31 @@ describe('runReleaseV2', () => {
       executionSucceeded: true,
       deadlineMs: 60_000,
     })
+  })
+
+  it('reports an exit that could not be confirmed, and declines persistence for it, when the drain itself was clean', async () => {
+    // #given a quiet directory, settled ownership, and a shutdown that came back unconfirmed, threw, or confirmed
+    const unconfirmed = {
+      interrupts: {stopped: [], notRunning: [], unconfirmed: []},
+      exit: {outcome: 'unconfirmed' as const, code: null, signal: null},
+    }
+    const graceful = {...unconfirmed, exit: {outcome: 'graceful' as const, code: 0, signal: null}}
+
+    // #when
+    mocks.releaseRunV2.mockResolvedValueOnce(outcome({shutdown: unconfirmed}))
+    const unconfirmedResult = await release()
+    mocks.releaseRunV2.mockResolvedValueOnce(outcome({shutdown: null}))
+    const threw = await release()
+    mocks.releaseRunV2.mockResolvedValueOnce(outcome({shutdown: graceful}))
+    const clean = await release()
+
+    // #then
+    expect(unconfirmedResult.serverExitUnconfirmed).toBe(true)
+    expect(unconfirmedResult.persistenceDeclineReason).toContain('exit')
+    expect(threw.serverExitUnconfirmed).toBe(true)
+    expect(threw.persistenceDeclineReason).toContain('exit')
+    expect(clean.serverExitUnconfirmed).toBe(false)
+    expect(clean.persistenceDeclineReason).toBeUndefined()
   })
 
   it('reports a drain that ran out as expired, and an unconfirmed directory as a reason not to save', async () => {

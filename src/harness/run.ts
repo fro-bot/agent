@@ -109,6 +109,8 @@ export async function run(): Promise<number> {
   // those paths' pre-existing exit codes exactly.
   let observationGap = false
   let ownershipUnresolved = false
+  // V2: the server's exit was not confirmed after a release that otherwise looked clean. Raised before publication.
+  let serverExitUnconfirmed = false
   let triggerContext: TriggerContext | null = null
   let dedupEntity: DeduplicationEntity | null = null
   // Hoisted for the post-cleanup blocked-label clear in the `finally` block; null until bootstrap resolves inputs.
@@ -296,6 +298,7 @@ export async function run(): Promise<number> {
       })
       serverReleasedV2 = true
       drainResult = release.drain
+      serverExitUnconfirmed = release.serverExitUnconfirmed === true
       if (release.observed !== undefined) {
         // The root's turns after the attempt returned (a notice starting a second one) are part of the run: the last
         // one decides whether it succeeded, and what it did joins the artifacts and usage.
@@ -351,7 +354,7 @@ export async function run(): Promise<number> {
     // removed). A known defect can veto an endorsement without the absence of that defect
     // certifying the invocation -- this flag is the veto, never a certificate, and it never
     // feeds `assessInvocationOutcome` or the final `InvocationVerificationFacts` below.
-    const knownExecutionVeto = observationGap || ownershipUnresolved
+    const knownExecutionVeto = observationGap || ownershipUnresolved || serverExitUnconfirmed
 
     // Review reconciliation: after the agent session, check if a formal APPROVE
     // is needed to satisfy branch protection when the agent delivered a PASS
@@ -491,7 +494,7 @@ export async function run(): Promise<number> {
       const finalVerification: InvocationVerificationFacts = {
         observationGap,
         ownershipUnresolved,
-        quiescenceConfirmed: cleanupResult.quiescenceConfirmed,
+        quiescenceConfirmed: cleanupResult.quiescenceConfirmed && !serverExitUnconfirmed,
         continuityUnverified: cleanupResult.continuityUnverified,
       }
       // 'failed' (bootstrap/cache-restore could not start) forces deliverySucceeded false
