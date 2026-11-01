@@ -1,8 +1,20 @@
 ---
 type: subsystem
-last-updated: "2026-10-25"
-updated-by: "fe7f6bda"
+last-updated: "2026-11-01"
+updated-by: "9a429e2a6ddc692bd6098b5504c225830af85bf9"
 sources:
+  - packages/runtime/src/session/version.ts
+  - packages/runtime/src/session/generation.ts
+  - packages/runtime/src/session/storage-v2.ts
+  - packages/runtime/src/session/storage-mappers-v2.ts
+  - packages/runtime/src/session/storage-message-mappers-v2.ts
+  - packages/runtime/src/session/search-v2.ts
+  - packages/runtime/src/agent/held-claims-v2.ts
+  - packages/opencode-plugin/src/session-tools.ts
+  - src/harness/phases/session-v2.ts
+  - src/harness/phases/v1-import-wait.ts
+  - src/harness/phases/release-v2.ts
+  - src/harness/phases/prune-v2.ts
   - src/services/cache/cache-key.ts
   - src/shared/cache-save-result.ts
   - packages/runtime/src/session/storage.ts
@@ -34,7 +46,7 @@ sources:
   - src/harness/post.ts
   - src/services/cache/types.ts
   - src/harness/phases/cleanup.ts
-summary: "How agent memory survives across CI runs via cache, SDK sessions, S3 object store, and pruning"
+summary: "Generation-isolated session transport, V1-to-V2 history import, session tools, and durable run memory"
 ---
 
 # Session Persistence
@@ -46,20 +58,31 @@ The defining feature of Fro Bot is persistent memory. Unlike typical CI-based AI
 Session persistence involves three cooperating subsystems:
 
 1. **Cache layer** (`src/services/cache/`) — Saves and restores the OpenCode storage directory to/from GitHub Actions cache, with optional S3 write-through backup.
-2. **Session layer** (`packages/runtime/src/session/`) — Reads, searches, and manages individual sessions within that storage directory via the OpenCode SDK. Part of the `@fro-bot/runtime` package (see [[Architecture Overview]]).
-3. **Writeback** (`packages/runtime/src/session/writeback.ts`) — Injects synthetic summary messages into session history after each run, making past work discoverable by future runs.
+2. **Session layer** (`packages/runtime/src/session/`) — Reads, searches, and manages sessions through the V1 SDK or native V2 routes, with generation-specific mappers. Part of `@fro-bot/runtime` (see [[Architecture Overview]]).
+3. **Writeback** — Injects a synthetic summary into session history, making past work discoverable. V1 uses `writeback.ts`; V2 defers its write to `src/harness/phases/release-v2.ts` after draining notice-triggered turns.
 
 ## Cache Strategy
 
-The storage directory (`~/.local/share/opencode/`) is cached using a branch-scoped key:
+The data directory (`~/.local/share/opencode/`) is cached using generation-specific, agent- and branch-qualified keys (`src/services/cache/cache-key.ts`):
 
 ```text
-opencode-storage-{repo}-{branch}-{os}
+V1: opencode-storage-{agent}-{repo}-{branch}-{os}
+V2: opencode-v2-storage-{agent}-{repo}-{branch}-{os}
 ```
 
-Branch scoping prevents one branch's session history from leaking into another. The OS component handles the rare case of cross-platform runners.
+The repository segment replaces its slash with a dash. Branch-specific restore is preferred, with repository-wide fallback for continuity; branch scoping is not an absolute isolation boundary. The OS component distinguishes cross-platform runners. V1 and V2 prefixes never overlap, so a V1 run cannot accidentally restore a V2 archive.
 
-Restore and save use that key differently. Restore matches on two prefixes — branch-scoped first, then repo-scoped — while the key a run _writes_ appends its run ID, run attempt, and an invocation identity (the save-key format is in the [Invocation Identity](#invocation-identity-job-qualified-keys) table).
+For a V2 run, restore first checks the configured object store's `sessions-v2/` object, then its V1 `sessions/` object. Only after those miss does Actions-cache restore try V2 branch, V1 branch, V2 repository, and V1 repository, in that order. Each cache tier has its own path list and call because Actions cache derives an archive version from those paths. V2 saves only to its own namespace, leaving V1 backups available. Both generations currently name the main database `opencode.db`, but share neither cache prefix nor object-store prefix.
+
+### V1 history import on a V2 run
+
+Restoring a V1 database into a V2 invocation begins a history import, not a prompt. `src/harness/phases/v1-import-wait.ts` polls `/api/experimental/migration/v1` until it reports completed. Required or running states keep waiting; errors fail immediately. The whole wait is bounded to 300 seconds, reported progress that stalls for 60 seconds fails earlier, and five consecutive unreadable observations fail rather than count as success. No prompt and no session save follow a failed import gate.
+
+Before spawning, restored V2 held execution claims are cleared (`held-claims-v2.ts`), preventing a killed invocation's claimed work from automatically resuming. Provider secrets use external key files and stale `auth.json` is removed so it cannot be imported into the persisted database. These are separate preparation steps: clearing claims is not deleting session history. [[Setup and Configuration]] describes credential and permission gates.
+
+### Save keys and transport checks
+
+Restore and save use these keys differently. Each generation has branch- and repository-scoped restore prefixes, tried in the tier order above, while the key a run writes appends its run ID, run attempt, and invocation identity (the save-key format is in the [Invocation Identity](#invocation-identity-job-qualified-keys) table).
 
 The run-attempt component exists because Actions cache entries are immutable: a re-run keeps the same `GITHUB_RUN_ID`, so without the attempt suffix the second attempt's save collided with the first attempt's entry. The invocation identity exists for the same reason one level up: run ID and attempt name the _workflow run_, not the job, so two jobs of one run (for example a `needs:`-chained "Remediate" then "Observe") used to compute the identical key. The second job restored the first job's just-saved entry, then failed to save (`Unable to reserve cache … another job may be creating this cache`), and its session state was lost. The identity is derived deterministically, so the post-action retry saves under exactly the key the main step tried; see [Invocation Identity](#invocation-identity-job-qualified-keys) for its derivation and every key it qualifies.
 
@@ -131,7 +154,7 @@ The common settings parser (`packages/runtime/src/object-store/settings.ts`) giv
 
 ## SDK Session Operations
 
-All session operations go through the `@opencode-ai/sdk` client — the session module never does direct file I/O against the storage directory. This is important because OpenCode may change its storage format between versions, and the SDK provides a stable abstraction.
+On V1, session operations go through `@opencode-ai/sdk`; V2 uses the native session API through `SessionClientV2`. Ordinary listing and message retrieval do not directly inspect database rows. Transport repair and held-claim cleanup are explicit exceptions outside those read APIs.
 
 The key operations:
 
@@ -146,9 +169,15 @@ These runtime-side operations are distinct from the native agent tools described
 
 ### Native Agent Session Tools
 
+V2 provides the same four tool names through `@fro.bot/opencode-plugin`, backed by `storage-v2.ts`, `search-v2.ts`, and the V2 mappers. Reads and searches cover the active context window since the latest compaction, including its compaction summary, rather than promising an unlimited original transcript. Todos are recovered from the last completed `todowrite` in that window. The Action's eager context lookup uses those same reader primitives, so plugin tools and injected history agree on session IDs and titles. The plugin must be active before a V2 run is admitted.
+
+The file-tool installation described next is the V1 path.
+
 `packages/runtime/src/agent/session-tools.ts` implements the always-on `session_list` / `session_read` / `session_search` / `session_info` tool contract as a plain config-dir file tool (`tool/session.js`), independent of any plugin. Setup copies the compiled asset into the CI OpenCode config dir via `writeSessionToolsFile` (`src/services/setup/session-tools-config.ts`); OpenCode's tool registry loads it as a file tool before plugin tools, so a plugin tool of the same id overrides it at registry time (later-wins). The tools resolve an OpenCode client from `FRO_BOT_OPENCODE_URL` at call time (never at import time) and delegate to the same `packages/runtime/src/session/` primitives (`listSessions`, `getSession`, `getSessionMessages`, `getSessionTodos`, `getSessionInfo`, `searchSessions`) described above — they are a thin, string-formatted, model-facing wrapper over the SDK operations, not a separate storage path. Every failure path returns a `'session store unavailable: ...'` string rather than throwing, so a session-tool failure never fails the run; if the asset is missing at setup time, setup warns and continues, and the tools are simply absent from that run.
 
 ## Mapper Architecture
+
+V2 has sibling `storage-mappers-v2.ts` and `storage-message-mappers-v2.ts` modules for its session and active-context responses. Its logical-key resolver (`src/harness/phases/session-v2.ts`) matches the latest eligible root titled `fro-bot: <logical key>`, and execution reasserts that title after a prompt because V2 can regenerate it. A listing failure is explicitly different from no matching session.
 
 SDK types don't perfectly match the project's local types. The mapper layer in `packages/runtime/src/session/` (`storage-mappers.ts`, `storage-message-mappers.ts`) translates between them:
 
@@ -180,6 +209,8 @@ Time-based triggers are subtler. Earlier, `schedule` runs keyed their logical se
 
 ## Pruning
 
+V2 applies the retention policy through `src/harness/phases/prune-v2.ts` during its bounded, quiet-directory pre-shutdown phase. It does not wait until Finalize after the server has exited. The SDK-specific pruning module below remains the V1 implementation.
+
 Without pruning, the storage directory would grow unboundedly. The pruning module (`packages/runtime/src/session/prune.ts`) uses a dual-condition retention policy:
 
 A session is kept if **either**:
@@ -191,9 +222,9 @@ This "age OR count" approach prevents both unbounded growth (count limit) and pr
 
 ## Run Summary Writeback
 
-After each run, the finalize phase writes a synthetic user message into the session containing a structured summary of what the agent did — including the event type, repository, cache status, session ID, and any errors. This message becomes searchable by future runs, enabling the agent to find its own prior work via `searchSessions`.
+Each run's session writeback records a structured summary of what the agent did, including the event type, repository, cache status, session ID, and errors. It becomes searchable by future runs through session search. The write happens during V1 execution or V2 release, while the selected server remains available.
 
-The writeback uses `role: 'user'` for the synthetic message so the OpenCode session system treats it as input rather than agent output, which keeps the session in a consistent state for potential continuation.
+V1 writes a synthetic user message. V2 writes through its synthetic-message route only after the final directory observation, merging later notice-triggered artifacts and refreshing usage first. Writing that summary before drain would put a new item in the very root inbox the release gate needs empty. Both paths keep the summary searchable without treating model prose as an authoritative run-state record.
 
 ## Implementation Reference
 

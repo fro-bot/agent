@@ -1,8 +1,19 @@
 ---
 type: architecture
-last-updated: "2026-10-25"
-updated-by: "fe7f6bda"
+last-updated: "2026-11-01"
+updated-by: "9a429e2a6ddc692bd6098b5504c225830af85bf9"
 sources:
+  - src/harness/phases/execution-backend.ts
+  - src/harness/phases/execute-v2.ts
+  - src/harness/phases/release-v2.ts
+  - src/harness/phases/observed-turn-v2.ts
+  - src/harness/phases/v2-server.ts
+  - src/harness/phases/v1-import-wait.ts
+  - src/features/agent/execution-v2.ts
+  - src/features/agent/prompt-sender-v2.ts
+  - src/features/agent/retry-v2.ts
+  - src/features/agent/drain-v2.ts
+  - src/features/agent/streaming-v2.ts
   - src/harness/config/state-keys.ts
   - src/harness/config/outputs.ts
   - src/harness/outcome.ts
@@ -64,7 +75,7 @@ sources:
   - RFCs/RFC-019-S3-Storage-Backend.md
   - ARCHITECTURE.md
   - src/services/cache/types.ts
-summary: "Phase-by-phase walkthrough of a single action run, from bootstrap through drain, review reconciliation, brokered push, and the final invocation outcome"
+summary: "Action phases across OpenCode V1 and V2, from bootstrap and prompt submission through verified release and persistence"
 ---
 
 # Execution Lifecycle
@@ -72,6 +83,8 @@ summary: "Phase-by-phase walkthrough of a single action run, from bootstrap thro
 Every Fro Bot run follows the same phase sequence, orchestrated by `src/harness/run.ts`. This page builds on the [[Architecture Overview]] — specifically the harness layer — and walks through each phase in execution order. Each phase is a standalone module under `src/harness/phases/`, a deliberate design that keeps the orchestrator thin and each phase independently testable.
 
 ## Phase Sequence
+
+The phase order is shared by both generations. The resolved executable version selects the server, session reader, execution backend, and release path together; it is not independently inferred at each call. V1 remains the default harness build. A V2 selection uses the `-v2.ts` implementations described below.
 
 ```text
 main.ts
@@ -141,11 +154,27 @@ Restores the OpenCode storage directory from S3 backup first when configured, th
 
 This phase also bootstraps the OpenCode SDK server and establishes a client connection — the server handle is reused throughout the remaining phases. Bootstrap does not report success on the SDK's own signal alone (a stdout string match satisfied once the HTTP listener binds, before this instance's lazy config/plugin/service init has run); it issues one bounded, instance-scoped `session.list` probe first, so a blocked instance bootstrap fails here, by name, instead of surfacing later as an unexplained request failure.
 
+That readiness mechanism is V1-specific. V2 uses `src/harness/phases/v2-server.ts`: prepare owner-only provider-key files, remove stale `auth.json`, ensure both required plugins are installed, assemble the ordered permission rules, clear held execution claims from restored state, then spawn and verify plugins, effective permissions, and provider authentication. Finally it waits for the V1 history-import endpoint to report completed. A failed gate shuts the server down and disables both main-step and post-hook session saves, avoiding persistence of half-imported or half-gated state. See [[Setup and Configuration]] and [[Session Persistence]].
+
 ## 7. Session Prep
 
 Processes any file attachments from the triggering context, searches prior sessions for relevant context (see [[Session Persistence]]), and builds the agent prompt (see [[Prompt Architecture]]). The prompt is a multi-section XML-tagged document that includes environment metadata, issue/PR context, session history, the task directive, and response protocol rules.
 
+V2 reads context through the native `/api/session` and session-context routes (`src/harness/phases/session-v2.ts`), using the same V2 mappers as the plugin's session tools. Logical-key continuation matches the newest eligible root session title; a failed listing is an error rather than evidence that no prior session exists.
+
 ## 8. Execute
+
+### V2 submission and observation
+
+`execute-v2.ts` selects a backend whose session creation, prompt submission, overflow recovery, and prior-work search all use V2. Agent and model are session properties, while a prompt carries text and files. The event subscription must connect before the first send because the stream has no replay.
+
+V2 does not replay a failed admitted turn with the V1 continuation loop. The server handles transient provider retries. The Action retries eligible pre-send connection failures or explicit submission refusals; a transport failure of the prompt POST is instead `sendUncertain`. The request may already have been admitted, so resending could duplicate external effects. That case fails, stops the directory, and declines persistence and endorsement even if teardown later looks quiet.
+
+The V2 consumer rejects permission requests and cancels forms in CI. Native events are normalized into root freshness, subagent and shell ownership, usage, and artifact observations. Successful execution leaves its observer running through release, since a queued notice may start a later root turn whose output or failure belongs to this same invocation.
+
+### V1 execution and continuation
+
+The SDK-specific details and continuation-prompt policy below describe the retained V1 path.
 
 The core phase. Calls `executeOpenCode()` which creates (or continues) an SDK session, sends the assembled prompt, and streams events back in real time. The SDK lifecycle follows the pattern: spawn server, connect client, create session, send prompt, process event stream, close.
 
@@ -173,6 +202,16 @@ Reasoning and response text share the SDK's text-delta shape. The Action records
 
 ## 9. Drain
 
+### V2 directory release
+
+`runReleaseV2` (`src/harness/phases/release-v2.ts`) occupies this phase on V2. A successful execution drains within the remaining budget; a failed run or expired drain stops directory activity. Release requires eleven quiet readings spanning at least five seconds, covering active sessions, running shells, and queued inbox items. A settled ledger or an interrupt receipt alone cannot authorize it. [[Background Subagents and Ownership]] explains why background completion can wake a parent after its earlier idle event.
+
+The observer remains open until the directory decision. Later root turns are merged into success/failure, artifacts, and usage before Finalize. The run summary is written only after that observation ends, followed by pruning while the server is still available. Shutdown then confirms the child process exited. Thus V2 has already shut down before review reconciliation and response delivery, and Cleanup handles persistence rather than repeating that lifecycle.
+
+An exceptional exit before this phase still runs a stop-and-release attempt from `run.ts`'s outer `finally`. An unconfirmed stop or server exit declines saving; an expired successful-run drain remains incomplete even if cancellation subsequently confirms quiet, because work was cut short. A failed overflow stop also prevents starting a replacement session in the same checkout.
+
+### V1 ledger drain
+
 Execute can finish while work it started is still running. OpenCode's background subagent dispatch returns immediately and leaves the child running as a detached fiber, and the parent session reports idle without consulting it — so the root's turn ending is no longer the same event as the run's work ending. The drain phase (`runDrain`, `src/harness/phases/execute.ts`) exists to reconcile those two.
 
 Its position in the sequence is the design. Drain sits after Execute returns and strictly before Review Reconciliation, Finalize, and Cleanup, because everything below it either publishes a result, persists state, or releases the coordination lock — and each of those is wrong to do on top of a live writer. Folding drain into Cleanup would have been simpler and would have published a response describing work still changing underneath it.
@@ -193,7 +232,7 @@ The phase is **fail-safe**: any error logs a warning and no-ops. It never throws
 
 ## 11. Finalize
 
-Writes a synthetic summary message into the session history so future runs can discover what this run accomplished. Prunes old sessions based on dual-condition retention (age OR count). Collects metrics and sets action outputs (session ID, cache status, duration).
+Collects metrics and sets action outputs (session ID, cache status, duration), and owns response delivery. On V1 the preceding execution path writes a synthetic summary and Finalize prunes sessions. V2 has already written its deferred summary and pruned during release, before shutting down the server, so these operations are not repeated here.
 
 The Actions job summary is HTML, while the comment footer is Markdown. `src/shared/summary-html.ts` builds escaped links, emphasis, code spans, and paragraphs for `job-summary.ts`, because GitHub does not interpret Markdown inside the toolkit's HTML tables and lists. Dynamic diagnostic text is escaped once, and remediation paragraphs stay outside the tables, preserving readable links and line breaks without treating error text as markup.
 
@@ -223,7 +262,7 @@ After Cleanup returns, `run()` assesses the invocation once (`src/harness/outcom
 
 `incomplete` is the outcome that did not previously exist, and it names a case the harness could not previously express: a useful result may well exist, but this invocation cannot certify that it finished. It forces a non-zero exit code rather than introducing a third numeric code — the structured output is what distinguishes "the harness contract was not met" from "the agent was wrong" — and it withholds the reversible certificates, writing no dedup marker and posting no success reaction, so a re-run is not dedup-skipped into a silent success. `skipped` bypasses the assessment entirely.
 
-The irreversible consumers are gated more narrowly than the outcome itself. Brokered push and the formal review-approve downgrade key off a _known execution veto_ — an observation gap or unresolved ownership — rather than the full assessment, on the reasoning that a known defect can veto an endorsement without the absence of that defect certifying the invocation. It is a veto, never a certificate.
+The irreversible consumers use a _known execution veto_ rather than assuming that delivery certifies the invocation. Observation gaps and unresolved ownership veto brokered push and formal approval; V2 also includes an unconfirmed server exit and an uncertain prompt acknowledgment, already known before publication. Lease continuity is assessed after cleanup. A known defect can veto an endorsement without the absence of that defect certifying completion.
 
 ## Post-Action Hook
 

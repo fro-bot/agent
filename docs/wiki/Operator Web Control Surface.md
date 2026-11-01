@@ -1,8 +1,19 @@
 ---
 type: subsystem
-last-updated: "2026-10-25"
-updated-by: "fe7f6bda"
+last-updated: "2026-11-01"
+updated-by: "9a429e2a6ddc692bd6098b5504c225830af85bf9"
 sources:
+  - packages/gateway/src/execute/run-core-v2.ts
+  - packages/gateway/src/execute/opencode-generation.ts
+  - packages/gateway/src/execute/drain-completion-v2.ts
+  - packages/gateway/src/execute/settle-owned-sessions-v2.ts
+  - packages/gateway/src/execute/question-client-v2.ts
+  - packages/gateway/src/execute/permission-reply-v1.ts
+  - packages/gateway/src/execute/permission-reply-v2.ts
+  - packages/gateway/src/execute/stranded-run-sweep.ts
+  - packages/gateway/src/approvals/run-grants.ts
+  - packages/gateway/src/approvals/coordinator.ts
+  - packages/runtime/src/agent/directory-quiescence-v2.ts
   - packages/gateway/src/execute/run.ts
   - packages/gateway/src/execute/run-core.ts
   - packages/gateway/src/execute/drain-completion.ts
@@ -194,6 +205,8 @@ Recovery preserves the whole checkout against the five-generation/10 GiB retenti
 
 ### Browser launch
 
+The operator contract does not select the OpenCode generation. For every admitted run the gateway reads workspace readiness and chooses the V1 or V2 core loop from `opencodeVersion`; a missing version preserves V1 compatibility and an unreadable version blocks execution. V2 maps native permission and form requests onto the same approval/question registries, so browser authorization and decision routes remain shared.
+
 `POST /operator/runs` (`web/operator/launch-route.ts`) is a fire-and-return endpoint: the operator submits a repository and a prompt, and the server responds `202` with a `runId` almost immediately, leaving the operator to observe progress over SSE. Before anything launches, the request passes an ordered gauntlet: the browser guard, an operator-keyed rate limit, session identity resolution, body validation, the prompt checks (below), **server-owned binding resolution** (the client names a repo but the server resolves the actual binding — client-supplied paths or owners are ignored) followed by the denylist check, both inside the single repo-access predicate, and finally a per-operator idempotency guard.
 
 The idempotency guard (`web/operator/idempotency.ts`) namespaces its key by the operator's numeric ID (`{githubUserId}:{clientKey}`), so one operator can never suppress another's launch. It uses a two-phase reserve-then-commit lifecycle: the key is reserved before `launchWork` is called and committed only on success, so a concurrent duplicate during the reservation window is recognized as in-flight rather than launching the work twice. On rejection the reservation is rolled back so no dead `runId` is echoed. A key is bound to the request it was first used for: the repository (as the stored binding spells it, so `Acme/Widget` and `acme/widget` are one repository) and the prompt exactly as submitted. An identical retry echoes the first run's `runId` without launching again; the same key with a different repository or prompt is rejected with `400 {error: "idempotency key reuse with different request"}`, the same answer dispatch gives, and the first run is unaffected.
@@ -228,7 +241,13 @@ The web approval transport (`web/operator/web-approval.ts`) follows a **register
 
 Operators observe and settle approvals two ways. The SSE stream carries **approval frames** (described below), and `GET /operator/runs/:runId/approvals` (`web/operator/pending-approvals-route.ts`) is a reconciliation fallback: a browser that reconnects after a dropped stream can re-fetch the currently-open requests instead of waiting for a replay. Listing approvals and settling one, via `POST /operator/runs/:runId/approvals/:requestId/decision` (`web/operator/decision-route.ts`), use the same repo-access predicate. The decision route resolves the run to its repository through the server-owned run index, re-runs that predicate, and hands a transport-bound operator identity to `registry.handleDecision`, which records the `once` / `always` / `reject` outcome as the authoritative settlement.
 
+**Always is scoped to this run.** The gateway translates an operator's `always` decision to `once` upstream on both generations. OpenCode would otherwise store that grant beyond the run: V1 in directory memory, V2 in project-scoped database rows. Instead, `approvals/run-grants.ts` retains the ask's save patterns in a per-run set once the reply or its authoritative echo confirms approval. Later asks from the root or an owned descendant are auto-answered once only when the action and every resource match; partial matches still ask, and a configured deny still wins before the gateway sees a request.
+
+A newly confirmed grant can also settle already-open matching asks through the registry's single-winner claim gate, closing their cards normally. An ambiguous auto-reply waits up to five seconds for its echo before returning the ask to an operator. Teardown drops all grants before stopping the run, including failure, cancel, timeout, and quarantine; another run on the same workspace inherits none of them. This scope is the same on Discord and web.
+
 ## Answering Agent Questions
+
+On V2, `question-client-v2.ts` adapts native forms to the existing question contract, maps answers back to form fields, and uses the session-scoped reply/cancel routes. The browser continues to see the bounded question DTOs and index-based answers described here, not raw V2 form payloads.
 
 When an agent calls OpenCode's `question` tool, the run blocks until the request is answered, skipped, or expires. A question from the root session or an adopted background child reaches operators; one from a session the run does not own is ignored. Questions are a second family of the same request gate that backs tool approvals (see [[Architecture Overview]]), so each request settles exactly once across web answers, Discord answers, skips, the deadline, cancellation, and OpenCode's own echo.
 
@@ -286,6 +305,8 @@ When a run fails, both projections may carry a `failureKind` — a coarse, sanit
 The engine's newer `drain-timeout` kind — a run whose deadline expired while it was still waiting for background subagent work to settle — is mapped onto the existing `max-duration-timeout` rather than given a vocabulary entry of its own. That is a judgment about what the operator surface is for: a run's deadline covers execution and drain together, so from an operator's point of view it is the same wall-clock story, and the distinction only matters to someone reading the engine's logs. The internal-to-operator mapping table is exhaustiveness-checked against the internal kind union, so a future kind added without a mapping decision fails the type check rather than silently collapsing to `unknown`.
 
 ### Quarantined runs
+
+For V2, the release authority is directory stability: no active session, running shell, or queued inbox item across eleven quiet observations spanning five seconds. The gateway stops shells before interrupting sessions because a shell's termination can wake its owner. Failure to confirm that same gate during teardown starts quarantine and a continued stop watch; an empty ledger alone cannot bypass it. See [[Background Subagents and Ownership]] for the shared observer and the bounded evidence it provides.
 
 A gateway run that fails while it may still own live background work is held rather than released. Instead of stopping its heartbeat and handing the channel's concurrency slot to the next queued run, it transitions to `FAILED` with a quarantine flag recorded on its run details, and a bounded hold window elapses before the heartbeat stops and the slot is freed. The lock is deliberately _not_ released on that path — lock takeover and force-release both require an expired lease plus a clear workspace status check, which is precisely why the hold has to be bounded rather than indefinite. A run also lands here when the server cannot be reached at teardown: the root cannot be confirmed stopped, so the run is held. Operators see an ordinary failed run; what they will notice is that the channel does not immediately accept the next run. Run details also carry the run's persisted ownership claim (its root session and not-yet-settled child sessions), which the gateway keeps as a diagnostic; on restart it checks the workspace status before terminalizing a stale run and never deletes locks. See [[Background Subagents and Ownership]].
 

@@ -1,8 +1,13 @@
 ---
 type: subsystem
-last-updated: "2026-10-25"
-updated-by: "fe7f6bda"
+last-updated: "2026-11-01"
+updated-by: "9a429e2a6ddc692bd6098b5504c225830af85bf9"
 sources:
+  - src/features/agent/prompt-sender-v2.ts
+  - src/features/agent/execution-v2.ts
+  - src/features/agent/retry-v2.ts
+  - src/harness/phases/session-v2.ts
+  - packages/opencode-plugin/src/session-tools.ts
   - packages/runtime/src/agent/prompt.ts
   - packages/runtime/src/agent/response-file.ts
   - packages/runtime/src/agent/prompt-thread.ts
@@ -114,6 +119,16 @@ The policy for each surface lives in one total table (`RESPONSE_SURFACE_POLICIES
 Mismatches degrade asymmetrically, in the direction that preserves work. A verdict arriving on a comment surface drops the frontmatter and posts the prose with a warning rather than discarding the turn; a missing verdict where one is genuinely required still fails closed.
 
 ## Prompt Sender
+
+### V2 session-based submission
+
+V2 keeps the XML prompt and delivery contracts above, but changes their transport. `src/features/agent/prompt-sender-v2.ts` sends text and file attachments through the native prompt route; agent and model are set on session creation or continuation in `execution-v2.ts`, rather than attached to each prompt as on V1. The event subscription must connect before submission because it has no replay.
+
+The V1 continuation-prompt loop below is not applied to an admitted V2 turn. V2 retries transient provider failures itself. The Action retries eligible failures before sending, or explicit submission refusals, but never resends a prompt whose POST lost its transport acknowledgment: that request may already have started tools or GitHub writes. Such a run records `sendUncertain`, stops directory activity, and declines persistence and endorsement. Error diagnostics retain call kind and status rather than response bodies that could echo the task.
+
+V2 also obtains injected prior-work context through the native session reader used by the Fro Bot plugin's session tools. Those reads represent the active context window, including the latest compaction summary, so the prompt's invitation to search history does not imply access to every pre-compaction message. [[Session Persistence]] describes the continuity and import boundaries.
+
+### V1 SDK submission
 
 The assembled prompt text and reference files are sent to an OpenCode SDK session by `sendPromptToSession()` in `src/features/agent/prompt-sender.ts`. (This module lives in the action layer — the runtime no longer carries a parallel prompt-sender after the execution stack was consolidated; see [[Architecture Overview]].) The function handles model resolution (if a model override is configured), directory scoping to the GitHub workspace, and the construction of the SDK message payload with both text and file parts. For retry attempts after LLM failures, a short continuation prompt is sent instead of the full initial prompt, since the session already has the full context. That continuation text is built from the observed error type rather than a fixed string, and asks the model to continue the remaining objective rather than blindly resume — the [[Execution Lifecycle]] covers how the attempt outcome is classified and how the continuation is phrased.
 
