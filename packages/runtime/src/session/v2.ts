@@ -13,6 +13,7 @@ export {
   getSessionTodosV2,
   getSessionV2,
   listSessionsForDirectoryV2,
+  listSessionsForPruningV2,
   SESSION_LIST_MAX_PAGES,
 } from './storage-v2.js'
 

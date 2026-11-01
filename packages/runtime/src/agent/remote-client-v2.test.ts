@@ -690,4 +690,45 @@ describe('createRemoteOpenCodeV2Client', () => {
       })
     })
   })
+
+  describe('session setup, wait and maintenance (the Action loop)', () => {
+    it('creates a session with a title, agent and model when given', async () => {
+      // #given
+      const {fetch, requests} = makeFetch(() => json(200, {data: {id: 'ses_1'}}))
+      const client = createRemoteOpenCodeV2Client({baseUrl: 'http://w', fetch})
+
+      // #when
+      await client.createSession({
+        directory: '/d',
+        title: 'Fro Bot: issue #1',
+        agent: 'build',
+        model: {providerID: 'anthropic', modelID: 'claude-x'},
+      })
+
+      // #then
+      expect(requests[0]?.body).toEqual({
+        location: {directory: '/d'},
+        title: 'Fro Bot: issue #1',
+        agent: 'build',
+        model: {id: 'claude-x', providerID: 'anthropic'},
+      })
+    })
+
+    it('sends prompt files as uri and name', async () => {
+      // #given
+      const {fetch, requests} = makeFetch(() => json(200, {data: {}}))
+      const client = createRemoteOpenCodeV2Client({baseUrl: 'http://w', fetch})
+
+      // #when
+      await client.prompt({
+        sessionId: 'ses_1',
+        text: 'look',
+        directory: '/d',
+        files: [{uri: 'file:///tmp/a.png', name: 'a.png'}],
+      })
+
+      // #then
+      expect(requests[0]?.body).toEqual({text: 'look', files: [{uri: 'file:///tmp/a.png', name: 'a.png'}]})
+    })
+  })
 })

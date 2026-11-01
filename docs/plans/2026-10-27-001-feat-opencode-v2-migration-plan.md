@@ -801,7 +801,7 @@ install pinned binary (digest) -> install both plugins (bounded) -> write creden
 
 **Files:**
 
-- Create: `src/features/agent/{execution-v2,streaming-v2,prompt-sender-v2,session-poll-v2,retry-v2}.ts` (`retry-v2` covers the `session.wait` client and the retry path)
+- Create: `src/features/agent/{execution-v2,streaming-v2,prompt-sender-v2,session-poll-v2,retry-v2}.ts` (`retry-v2` covers the `session.wait` client and the pre-send stream-connect retry)
 - Modify: `src/harness/phases/execute.ts` (one selector in `runExecute` that covers both `executeOpenCode` call sites, the main call at `:395` and the overflow-recovery call at `:251` inside `recoverFromContextOverflow`, so the executor is threaded through `ContextOverflowRecoveryOptions`)
 - Verify, and add a V2 sibling only if it fails against a V2 server: `packages/runtime/src/session/archive.ts` (archive-on-overflow already calls the V2 SDK client)
 - Test: the matching `*-v2.test.ts` files, and `src/harness/phases/execute.test.ts`
@@ -828,6 +828,7 @@ install pinned binary (digest) -> install both plugins (bounded) -> write creden
 - Edge case: a context overflow routes the recovery call through the V2 executor.
 - Error path: the form cancel fails, so the failure is logged and the run continues.
 - Error path: the event stream never connects, so the attempt is retried under `MAX_LLM_RETRIES`, as in V1.
+- Error path: a turn that fails after the send ends the run and is not re-prompted. V2 retries transient provider errors itself (`specs/v2/session.md` "Retry Is Narrow And Observable"), so the job re-run is the retry. A transport failure of the prompt POST is never resent either: it fails the run and declines the save.
 
 **Verification:**
 

@@ -8,6 +8,7 @@ import {
   getSessionTodosV2,
   getSessionV2,
   listSessionsForDirectoryV2,
+  listSessionsForPruningV2,
   SESSION_LIST_MAX_PAGES,
 } from './storage-v2.js'
 
@@ -32,6 +33,44 @@ function clientWith(overrides: Partial<SessionClientV2>): SessionClientV2 {
 
 beforeEach(() => {
   vi.clearAllMocks()
+})
+
+describe('listSessionsForPruningV2', () => {
+  it('lists unarchived and archived roots, each once, so archived trees can age out too', async () => {
+    // #given the server filters by the archived flag, and lists one session under both (an unfiltered server would)
+    const list = vi.fn(async (query: {archived?: boolean}) => ({
+      data:
+        query.archived === true
+          ? [session('ses_archived'), session('ses_both')]
+          : [session('ses_live'), session('ses_both')],
+    }))
+
+    // #when
+    const result = await listSessionsForPruningV2(clientWith({list}), '/work/repo', logger)
+
+    // #then both populations were requested, roots only, and the union has no duplicates
+    expect(list).toHaveBeenCalledWith(
+      expect.objectContaining({archived: true, parentID: null, directory: '/work/repo'}),
+    )
+    expect(list).toHaveBeenCalledWith(
+      expect.objectContaining({archived: false, parentID: null, directory: '/work/repo'}),
+    )
+    expect(result.success && result.data.map(s => s.id).sort()).toEqual(['ses_archived', 'ses_both', 'ses_live'])
+  })
+
+  it('fails when either listing fails, rather than pruning from half the sessions', async () => {
+    // #given
+    const list = vi.fn(async (query: {archived?: boolean}) => {
+      if (query.archived === true) throw new Error('boom')
+      return {data: [session('ses_live')]}
+    })
+
+    // #when
+    const result = await listSessionsForPruningV2(clientWith({list}), '/work/repo', logger)
+
+    // #then
+    expect(result.success).toBe(false)
+  })
 })
 
 describe('listSessionsForDirectoryV2', () => {

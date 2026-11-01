@@ -179,29 +179,28 @@ describe('runCacheRestore on OpenCode V2', () => {
     expect(order).toEqual(['checkpoint', 'spawn'])
   })
 
-  it('fails with an explicit "not supported yet" error after a complete start, stops the server and returns null', async () => {
+  it('hands a complete start to the execution loop: the V2 handle is returned live and the run is not failed', async () => {
     // #given
     const {handle, shutdown} = v2Handle()
     mocks.startActionOpenCodeV2.mockResolvedValue({success: true, data: handle})
-    const {runCacheRestore, V2_EXECUTION_UNSUPPORTED_MESSAGE} = await import('./cache-restore.js')
+    const {runCacheRestore} = await import('./cache-restore.js')
 
     // #when
     const result = await runCacheRestore(bootstrap(V2_VERSION), createMetricsCollector())
 
-    // #then
-    expect(result).toBeNull()
-    expect(shutdown).toHaveBeenCalledTimes(1)
-    expect(mocks.setFailed).toHaveBeenCalledWith(V2_EXECUTION_UNSUPPORTED_MESSAGE)
-    expect(V2_EXECUTION_UNSUPPORTED_MESSAGE).toMatch(/V2 execution is not supported yet/)
+    // #then the server is left running for the loop, tagged as V2, and nothing failed
+    expect(result).toMatchObject({generation: 'v2', serverHandle: handle})
+    expect(shutdown).not.toHaveBeenCalled()
+    expect(mocks.setFailed).not.toHaveBeenCalled()
   })
 
-  it('names the stage of a failed V2 start and returns null without a "not supported" message', async () => {
+  it('names the stage of a failed V2 start and returns null', async () => {
     // #given
     mocks.startActionOpenCodeV2.mockResolvedValue({
       success: false,
       error: {stage: 'import-wait', message: 'no progress for 60s'},
     })
-    const {runCacheRestore, V2_EXECUTION_UNSUPPORTED_MESSAGE} = await import('./cache-restore.js')
+    const {runCacheRestore} = await import('./cache-restore.js')
 
     // #when
     const result = await runCacheRestore(bootstrap(V2_VERSION), createMetricsCollector())
@@ -210,7 +209,6 @@ describe('runCacheRestore on OpenCode V2', () => {
     expect(result).toBeNull()
     expect(mocks.setFailed).toHaveBeenCalledTimes(1)
     expect(mocks.setFailed).toHaveBeenCalledWith('OpenCode V2 start failed (import-wait): no progress for 60s')
-    expect(mocks.setFailed).not.toHaveBeenCalledWith(V2_EXECUTION_UNSUPPORTED_MESSAGE)
   })
 
   it('passes a null model when the model input is unset', async () => {
