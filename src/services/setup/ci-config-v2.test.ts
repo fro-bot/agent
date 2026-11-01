@@ -1,7 +1,7 @@
 import type {PermissionRuleV2} from '@fro-bot/runtime'
 import {evaluatePermissionV2, verifyPermissionRules} from '@fro-bot/runtime'
 import {describe, expect, it} from 'vitest'
-import {createMockLogger} from '../../shared/test-helpers.js'
+import {createMockLogger, serializeLoggerCalls, unwrapErr} from '../../shared/test-helpers.js'
 import {buildCIConfigV2} from './ci-config-v2.js'
 
 const RUNNER_TEMP = '/home/runner/work/_temp'
@@ -367,6 +367,174 @@ describe('buildCIConfigV2', () => {
 
       // #then
       expect(result.success).toBe(false)
+    })
+  })
+
+  describe('provider key files', () => {
+    const KEY_FILES = {
+      anthropic: '/home/runner/work/_temp/fro-bot-credentials-AbC123/anthropic.key',
+      openai: '/home/runner/work/_temp/fro-bot-credentials-AbC123/openai.key',
+    } as const
+
+    it('references each key file with {file:} under provider.<id>.options.apiKey', () => {
+      // #given / #when
+      const {content} = build({providerKeyFiles: KEY_FILES})
+
+      // #then
+      expect(content.provider).toEqual({
+        anthropic: {options: {apiKey: `{file:${KEY_FILES.anthropic}}`}},
+        openai: {options: {apiKey: `{file:${KEY_FILES.openai}}`}},
+      })
+    })
+
+    it('adds no provider block when there are no key files', () => {
+      expect(build().content).not.toHaveProperty('provider')
+      expect(build({providerKeyFiles: {}}).content).not.toHaveProperty('provider')
+    })
+
+    it('keeps an operator baseURL and models, and lets the key file win over an inline operator key', () => {
+      // #given operator config that sets a proxy URL and an inline key for the same provider
+      const opencodeConfig = JSON.stringify({
+        model: 'anthropic/claude-sonnet',
+        provider: {
+          anthropic: {options: {baseURL: 'https://proxy.example.test', apiKey: 'operator-inline-key'}, models: {x: {}}},
+          custom: {options: {baseURL: 'https://custom.example.test'}},
+        },
+      })
+
+      // #when
+      const {content} = build({opencodeConfig, providerKeyFiles: {anthropic: KEY_FILES.anthropic}})
+
+      // #then
+      expect(content.model).toBe('anthropic/claude-sonnet')
+      expect(content.provider).toEqual({
+        anthropic: {
+          options: {baseURL: 'https://proxy.example.test', apiKey: `{file:${KEY_FILES.anthropic}}`},
+          models: {x: {}},
+        },
+        custom: {options: {baseURL: 'https://custom.example.test'}},
+      })
+      expect(JSON.stringify(content)).not.toContain('operator-inline-key')
+    })
+
+    it('refuses a key file path that could end the reference early', () => {
+      const result = buildCIConfigV2(
+        {...BASE_INPUTS, providerKeyFiles: {anthropic: '/tmp/bad}path/anthropic.key'}},
+        createMockLogger(),
+      )
+
+      expect(unwrapErr(result)).toContain('anthropic')
+    })
+
+    it('does not log a key file path', () => {
+      const {logger} = build({providerKeyFiles: KEY_FILES})
+
+      const logged = serializeLoggerCalls(logger)
+      expect(logged).not.toContain('fro-bot-credentials')
+    })
+
+    it('still denies question, so no turn waits on an answer nobody can give', () => {
+      const {content} = build({providerKeyFiles: KEY_FILES})
+
+      expect(evaluatePermissionV2('question', '*', permissionsOf(content))).toBe('deny')
+    })
+  })
+
+  describe('bundled Systematic skills directory (fro-bot/agent#2009)', () => {
+    const PACKAGE =
+      '/home/runner/.cache/opencode/npm/@fro.bot/systematic@9.9.9/1800000000000/node_modules/@fro.bot/systematic'
+    const SKILLS = `${PACKAGE}/skills`
+
+    it('lets a skill read its references and run its scripts, and nothing else outside the checkout', () => {
+      // #given
+      const {content} = build({bundledSkillsDirectories: [SKILLS]})
+      const rules = permissionsOf(content)
+
+      // #then
+      expect(evaluatePermissionV2('external_directory', `${SKILLS}/*`, rules)).toBe('allow')
+      expect(evaluatePermissionV2('external_directory', `${SKILLS}/ce-review/references/*`, rules)).toBe('allow')
+      expect(evaluatePermissionV2('external_directory', `${PACKAGE}/*`, rules)).toBe('deny')
+      expect(evaluatePermissionV2('external_directory', `${PACKAGE}/dist/*`, rules)).toBe('deny')
+      expect(evaluatePermissionV2('external_directory', '/home/runner/.cache/opencode/*', rules)).toBe('deny')
+      expect(evaluatePermissionV2('external_directory', '/etc/*', rules)).toBe('deny')
+      // #then the response and attachment exceptions are untouched
+      expect(evaluatePermissionV2('external_directory', `${RESPONSE_DIR}/*`, rules)).toBe('allow')
+      expect(evaluatePermissionV2('external_directory', `${ATTACHMENT_DIR}/*`, rules)).toBe('allow')
+    })
+
+    it('denies the edit tools there (V2 asks `edit` about the absolute path outside the checkout)', () => {
+      const rules = permissionsOf(build({bundledSkillsDirectories: [SKILLS]}).content)
+
+      expect(evaluatePermissionV2('edit', `${SKILLS}/ce-review/scripts/validate-review.mjs`, rules)).toBe('deny')
+      expect(evaluatePermissionV2('edit', `${PACKAGE}/package.json`, rules)).not.toBe('deny')
+      expect(evaluatePermissionV2('edit', 'src/index.ts', rules)).not.toBe('deny')
+    })
+
+    it('denies edits through every granted spelling, including a real path outside the cache layout', () => {
+      // #given the lexical path and a real path elsewhere (a symlinked cache)
+      const REAL = '/mnt/agent-cache/@fro.bot/systematic/skills'
+      const rules = permissionsOf(build({bundledSkillsDirectories: [SKILLS, REAL]}).content)
+
+      // #then each is readable and neither is writable through the edit tools
+      for (const dir of [SKILLS, REAL]) {
+        expect(evaluatePermissionV2('external_directory', `${dir}/*`, rules)).toBe('allow')
+        expect(evaluatePermissionV2('edit', `${dir}/ce-review/scripts/validate-review.mjs`, rules)).toBe('deny')
+      }
+    })
+
+    it('is an authorized exception of the permission gate, so the real gate passes', async () => {
+      // #given
+      const {content, expectations} = build({bundledSkillsDirectories: [SKILLS]})
+      const agents = [
+        {id: 'build', permissions: [{action: '*', resource: '*', effect: 'allow'}, ...permissionsOf(content)]},
+        {
+          id: 'explore',
+          permissions: [{action: 'external_directory', resource: '*', effect: 'allow'}, ...permissionsOf(content)],
+        },
+      ]
+
+      // #when
+      const result = await verifyPermissionRules(
+        {listAgents: async () => ({location: {}, data: agents})},
+        expectations,
+        createMockLogger(),
+      )
+
+      // #then
+      expect(expectations.allowedDirectories).toContain(SKILLS)
+      expect(result.success).toBe(true)
+    })
+
+    it('still fails the gate when an allow that is not an authorized exception follows the boundary', async () => {
+      const {content, expectations} = build({bundledSkillsDirectories: [SKILLS]})
+      const agents = [
+        {
+          id: 'build',
+          permissions: [
+            ...permissionsOf(content),
+            {action: 'external_directory', resource: `${PACKAGE}/*`, effect: 'allow'},
+          ],
+        },
+      ]
+
+      const result = await verifyPermissionRules(
+        {listAgents: async () => ({location: {}, data: agents})},
+        expectations,
+        createMockLogger(),
+      )
+
+      expect(result.success).toBe(false)
+    })
+
+    it('adds nothing when no directory is given', () => {
+      expect(build().content).toEqual(build({bundledSkillsDirectories: []}).content)
+      expect(JSON.stringify(build().content)).not.toContain('node_modules')
+    })
+
+    it.each(['skills', '/cache/skills?', '/cache/*/skills', '/'])('refuses the unusable directory %j', directory => {
+      expect(buildCIConfigV2({...BASE_INPUTS, bundledSkillsDirectories: [directory]}, createMockLogger()).success).toBe(
+        false,
+      )
     })
   })
 })

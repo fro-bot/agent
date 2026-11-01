@@ -11,6 +11,12 @@ export interface WorkspaceConfigV2Inputs {
   readonly plugins: readonly string[]
   /** Literal absolute directories outside the checkout that stay reachable. `*` and `?` are rejected. */
   readonly allowedExternalDirectories?: readonly string[]
+  /**
+   * The image's installed Systematic `skills/` directory (`resolveSystematicSkillsDirsV2`). Reachable without an ask, so
+   * a skill reading its own references does not raise a Discord approval per call, and denied for `edit`. The gate
+   * treats it as an authorized exception. Unresolved: leave it out, and the ask stays.
+   */
+  readonly bundledSkillsDirectories?: readonly string[]
 }
 
 /**
@@ -21,24 +27,28 @@ export interface WorkspaceConfigV2Inputs {
 export function buildWorkspaceConfigV2(inputs: WorkspaceConfigV2Inputs, logger: Logger): Result<BuiltConfigV2, string> {
   const allowedExternalDirectories = (inputs.allowedExternalDirectories ?? []).map(directory => directory.trim())
 
+  const bundledSkillsDirectories = (inputs.bundledSkillsDirectories ?? []).map(directory => directory.trim())
+
   const rules = buildPermissionRulesV2({
     outsideEffect: 'ask',
     allowedExternalDirectories,
+    bundledSkillsDirectories,
     editDenyResources: [],
     denyQuestion: false,
   })
-  if (!rules.success) return err(`allowedExternalDirectories: ${rules.error}`)
+  if (!rules.success) return err(`allowedExternalDirectories/bundledSkillsDirectories: ${rules.error}`)
 
   logger.debug('Built workspace OpenCode config', {
     pluginCount: inputs.plugins.length,
     allowedExternalDirectoryCount: allowedExternalDirectories.length,
+    bundledSkillsDirectoryCount: bundledSkillsDirectories.length,
   })
 
   return ok({
     content: buildConfigContentV2({plugins: inputs.plugins, rules: rules.data}),
     expectations: {
       outsidePolicy: 'ask-or-deny',
-      allowedDirectories: allowedExternalDirectories,
+      allowedDirectories: [...allowedExternalDirectories, ...bundledSkillsDirectories],
       deniedActions: FORBIDDEN_TOOL_ACTIONS_V2,
     },
   })

@@ -24,6 +24,25 @@ export interface CIConfigV2Inputs {
   readonly runId: string | number
   readonly runAttempt: string | number
   readonly integrationWorkDir?: string
+  /**
+   * The installed Systematic `skills/` directory (`resolveSystematicSkillsDirsV2`), so a skill can read its own
+   * references and run its own scripts under the outside-checkout deny (fro-bot/agent#2009). Becomes an authorized
+   * exception of the permission gate. Empty or absent when unresolved: nothing is added.
+   *
+   * SECURITY: `external_directory` is not read-only, so this also lets a shell command write there during the run. The
+   * `edit`, `write` and `patch` tools are denied for the directory (V2 asks `edit` about the absolute path outside the
+   * checkout, so the absolute resource matches). On a hosted runner the tools cache is saved during setup, before the
+   * agent runs, so a write does not persist; a persistent or self-hosted runner keeps it, as it is the plugin's real
+   * install location.
+   */
+  readonly bundledSkillsDirectories?: readonly string[]
+  /**
+   * Provider id to the absolute path of the file holding that provider's API key (`credential-files-v2.ts`). Each is
+   * referenced as `provider.<id>.options.apiKey: "{file:/path}"`. The V1-shaped `options` is what the server migrates
+   * into V2 `settings`, including the V1-to-V2 provider id mapping, so a provider id from `auth-json` and one from
+   * `model` mean the same thing as they do in V1. The path is never logged.
+   */
+  readonly providerKeyFiles?: Readonly<Record<string, string>>
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -82,6 +101,29 @@ function stripOperatorPermissions(operator: Record<string, unknown>, logger: Log
   return result
 }
 
+/** The server's `{file:...}` substitution ends a reference at the first `}`. */
+const KEY_FILE_PATH_PATTERN = /^\/[^}\n\r"\\]+$/
+
+/**
+ * `provider.<id>.options.apiKey` references for each key file, merged into the operator's `provider` block. The key
+ * file wins over an inline operator key for the same provider; every other operator setting for it is kept.
+ */
+function withProviderKeyFiles(
+  operatorProvider: unknown,
+  keyFiles: Readonly<Record<string, string>>,
+): Result<Record<string, unknown>, string> {
+  const provider: Record<string, unknown> = isRecord(operatorProvider) ? {...operatorProvider} : {}
+  for (const [providerId, keyFile] of Object.entries(keyFiles)) {
+    if (!KEY_FILE_PATH_PATTERN.test(keyFile)) {
+      return err(`The key file for provider "${providerId}" is not an absolute path that a {file:} reference can hold`)
+    }
+    const existing = isRecord(provider[providerId]) ? provider[providerId] : {}
+    const existingOptions = isRecord(existing.options) ? existing.options : {}
+    provider[providerId] = {...existing, options: {...existingOptions, apiKey: `{file:${keyFile}}`}}
+  }
+  return ok(provider)
+}
+
 /**
  * Build the V2 `OPENCODE_CONFIG_CONTENT` for an Action run, plus what the permission gate must find after spawn.
  *
@@ -135,9 +177,12 @@ export function buildCIConfigV2(inputs: CIConfigV2Inputs, logger: Logger): Resul
     logger.debug('Skipping response-file and attachment exceptions: RUNNER_TEMP is not set')
   }
 
+  const bundledSkillsDirectories = inputs.bundledSkillsDirectories ?? []
+
   const rules = buildPermissionRulesV2({
     outsideEffect: 'deny',
     allowedExternalDirectories: allowedDirectories,
+    bundledSkillsDirectories,
     editDenyResources,
     denyQuestion: true,
   })
@@ -149,8 +194,17 @@ export function buildCIConfigV2(inputs: CIConfigV2Inputs, logger: Logger): Resul
     : []
   const operatorExperimental = isRecord(operator.experimental) ? operator.experimental : {}
 
+  const keyFiles = inputs.providerKeyFiles ?? {}
+  let provider: Record<string, unknown> | undefined
+  if (Object.keys(keyFiles).length > 0) {
+    const merged = withProviderKeyFiles(operator.provider, keyFiles)
+    if (!merged.success) return err(merged.error)
+    provider = merged.data
+  }
+
   const content = {
     ...operator,
+    ...(provider === undefined ? {} : {provider}),
     ...base,
     plugins: [...new Set([...inputs.plugins, ...operatorPlugins])],
     experimental: {...operatorExperimental, ...(base.experimental as Record<string, unknown>)},
@@ -159,13 +213,14 @@ export function buildCIConfigV2(inputs: CIConfigV2Inputs, logger: Logger): Resul
   logger.debug('Built CI OpenCode config', {
     hasUserConfig: inputs.opencodeConfig != null,
     pluginCount: content.plugins.length,
+    keyFileProviders: Object.keys(keyFiles),
   })
 
   return ok({
     content,
     expectations: {
       outsidePolicy: 'deny',
-      allowedDirectories,
+      allowedDirectories: [...allowedDirectories, ...bundledSkillsDirectories],
       deniedActions: FORBIDDEN_TOOL_ACTIONS_V2,
     },
   })

@@ -1,4 +1,4 @@
-import type {CoordinationConfig, Result, RunState} from '@fro-bot/runtime'
+import type {CoordinationConfig, Result, RunState, SessionGeneration} from '@fro-bot/runtime'
 import type {Message} from 'discord.js'
 import type {PermissionRequest} from '../approvals/coordinator.js'
 import type {QuestionAskedRequest} from '../approvals/question-coordinator.js'
@@ -23,7 +23,6 @@ import type {
 import type {ListBackupsFn, PreviewRecoveryFn, RecoverFn} from './checkout-recovery.js'
 import type {ConcurrencyRegistry} from './concurrency.js'
 import type {LaunchAdmission, LaunchWorkRequest, PostReplyFactory, ReplySink, StatusSink} from './launch-types.js'
-import type {OpenCodeGeneration} from './opencode-generation.js'
 import type {CheckoutPreparation, CheckoutProvenance} from './provenance.js'
 import type {ChannelQueue} from './queue.js'
 import type {RepoQuiescenceChecker} from './repo-quiescence.js'
@@ -40,6 +39,7 @@ import {
   patchRunDetails,
   releaseLock,
   releaseLockIfHolder,
+  selectOpenCodeGeneration,
   toErrorMessage,
   transitionRun,
 } from '@fro-bot/runtime'
@@ -69,7 +69,6 @@ import {markRunEnded, markRunLive} from './live-run-registry.js'
 import {releaseLockOrByOwnership} from './lock-release.js'
 import {attachOpencodeV2} from './opencode-attach-v2.js'
 import {attachOpencode} from './opencode-attach.js'
-import {selectOpenCodeGeneration} from './opencode-generation.js'
 import {createPostReplyFactoryV1} from './permission-reply-v1.js'
 import {createPostReplyFactoryV2} from './permission-reply-v2.js'
 import {
@@ -864,7 +863,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     let workspaceReady = false
     // The OpenCode generation the workspace runs, read from the version it reports on its control API. A workspace
     // that reports none runs V1. A version that is present but unreadable selects neither loop: not ready.
-    let openCodeGeneration: OpenCodeGeneration = 'v1'
+    let openCodeGeneration: SessionGeneration = 'v1'
     try {
       const readyzResult = await readyz()
       workspaceReady = readyzResult.success === true && readyzResult.data.ready === true

@@ -5,8 +5,8 @@
  * reads it when it attaches and runs the V1 or the V2 loop from the major version: 2 or above is V2. The workspace image
  * pin is the only switch. The gateway keeps no second setting that could disagree with it.
  *
- * A workspace that reports no version predates the report and runs V1. A version that is present but unreadable selects
- * nothing: guessing could point the V1 loop at a V2 server, or the other way round.
+ * The selector itself (`selectOpenCodeGeneration`) lives in `@fro-bot/runtime`, shared with the Action's cache keys.
+ * A workspace that reports no version runs V1; a version that is present but unreadable selects nothing.
  */
 
 import type {Result} from '@fro-bot/runtime'
@@ -15,24 +15,7 @@ import type {RepoQuiescence} from '../runtime-effect.js'
 import type {ReadyzResponse, WorkspaceError} from '../workspace-api/types.js'
 import type {RepoQuiescenceChecker} from './repo-quiescence.js'
 
-import {err, ok} from '@fro-bot/runtime'
-
-export type OpenCodeGeneration = 'v1' | 'v2'
-
-export interface UnparseableVersion {
-  readonly kind: 'unparseable-version'
-}
-
-/** `2.2.0`, `v2.2.0` and `1.19.4+harness.3` all lead with `major.minor.patch`. */
-const VERSION_PATTERN = /^v?(\d+)\.\d+\.\d+/
-
-export function selectOpenCodeGeneration(version: string | undefined): Result<OpenCodeGeneration, UnparseableVersion> {
-  if (version === undefined) return ok('v1')
-  const match = VERSION_PATTERN.exec(version)
-  const major = match?.[1]
-  if (major === undefined) return err({kind: 'unparseable-version'})
-  return ok(Number(major) >= 2 ? 'v2' : 'v1')
-}
+import {selectOpenCodeGeneration} from '@fro-bot/runtime'
 
 export interface GenerationAwareQuiescenceOptions {
   readonly readyz: () => Promise<Result<ReadyzResponse, WorkspaceError>>

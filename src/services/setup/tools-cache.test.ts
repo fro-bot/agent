@@ -292,3 +292,63 @@ describe('saveToolsCache', () => {
     expect(logger.warning).toHaveBeenCalledWith('Tools cache save failed', {error: 'disk full'})
   })
 })
+
+describe('tools cache key with the fro.bot plugin version (OpenCode V2)', () => {
+  const V2_COMPONENTS = {...COMPONENTS, frobotPluginVersion: '0.1.0'} as const
+
+  it('adds the plugin version to the primary and restore keys', () => {
+    // #given / #when
+    const key = buildToolsCacheKey(V2_COMPONENTS)
+    const [restoreKey] = buildToolsRestoreKeys(V2_COMPONENTS)
+
+    // #then
+    expect(key).toBe('opencode-tools-v2-Linux-oc-1.0.0-sys-2.1.0-fbp-0.1.0')
+    expect(restoreKey).toBe('opencode-tools-v2-Linux-oc-1.0.0-sys-2.1.0-fbp-0.1.0-')
+  })
+
+  it('misses an entry saved under a different plugin version, and never matches a V1 key', () => {
+    expect(buildToolsCacheKey({...V2_COMPONENTS, frobotPluginVersion: '0.2.0'})).not.toBe(
+      buildToolsCacheKey(V2_COMPONENTS),
+    )
+    expect(buildToolsCacheKey(V2_COMPONENTS)).not.toBe(buildToolsCacheKey(COMPONENTS))
+    expect(buildToolsCacheKey(V2_COMPONENTS).startsWith(`${buildToolsCacheKey(COMPONENTS)}-`)).toBe(true)
+  })
+
+  it('leaves the V1 key exactly as it was when no plugin version is given', () => {
+    expect(buildToolsCacheKey(COMPONENTS)).toBe('opencode-tools-v2-Linux-oc-1.0.0-sys-2.1.0')
+    expect(buildToolsRestoreKeys(COMPONENTS)).toEqual(['opencode-tools-v2-Linux-oc-1.0.0-sys-2.1.0-'])
+  })
+
+  it('threads the plugin version through restore and save', async () => {
+    const adapter = createMockToolsCacheAdapter({restoreResult: 'hit-key'})
+
+    await restoreToolsCache({
+      logger: createTestLogger(),
+      os: 'Linux',
+      opencodeVersion: '1.0.0',
+      systematicVersion: '2.1.0',
+      frobotPluginVersion: '0.1.0',
+      ...PATHS,
+      cacheAdapter: adapter,
+    })
+    await saveToolsCache({
+      logger: createTestLogger(),
+      os: 'Linux',
+      opencodeVersion: '1.0.0',
+      systematicVersion: '2.1.0',
+      frobotPluginVersion: '0.1.0',
+      ...PATHS,
+      cacheAdapter: adapter,
+    })
+
+    expect(adapter.restoreCache).toHaveBeenCalledWith(
+      expect.any(Array),
+      'opencode-tools-v2-Linux-oc-1.0.0-sys-2.1.0-fbp-0.1.0',
+      ['opencode-tools-v2-Linux-oc-1.0.0-sys-2.1.0-fbp-0.1.0-'],
+    )
+    expect(adapter.saveCache).toHaveBeenCalledWith(
+      expect.any(Array),
+      'opencode-tools-v2-Linux-oc-1.0.0-sys-2.1.0-fbp-0.1.0',
+    )
+  })
+})

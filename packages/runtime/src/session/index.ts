@@ -6,6 +6,10 @@ export type {SessionClient} from './backend.js'
 
 export {findProjectByWorkspace, listProjectsViaSDK} from './discovery.js'
 
+// OpenCode generation selection
+export {selectOpenCodeGeneration} from './generation.js'
+export type {UnparseableVersion} from './generation.js'
+
 // Logical session continuity
 export {buildLogicalKey, buildSessionTitle, findSessionByTitle, resolveSessionForLogicalKey} from './logical-key.js'
 

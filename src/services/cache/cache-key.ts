@@ -1,8 +1,8 @@
 import type {SessionGeneration} from '@fro-bot/runtime'
 import type {AgentIdentity} from '../../shared/types.js'
+import {selectOpenCodeGeneration} from '@fro-bot/runtime'
 import {CACHE_PREFIX, CACHE_V2_PREFIX} from '../../shared/constants.js'
 import {getGitHubRefName, getGitHubRepository, getRunnerOS} from '../../shared/env.js'
-import {isV2Version} from '../setup/opencode.js'
 
 export interface CacheKeyComponents {
   readonly agentIdentity: AgentIdentity
@@ -21,9 +21,13 @@ const CACHE_PREFIXES: Readonly<Record<SessionGeneration, string>> = {
  * (`STATE_KEYS.OPENCODE_VERSION`). A major version of 2 or above is V2. A missing version, an unparseable one
  * and every V1 version (including harness builds) are V1, so a run with no V2 state behaves as it always did.
  * The restore, save and post-hook paths all call this with the same value.
+ *
+ * The selection is the runtime's `selectOpenCodeGeneration`; this keeps only the cache-key decision that an
+ * unreadable version is V1, because a cache key must always pick a side.
  */
 export function resolveSessionGeneration(version: string | null | undefined): SessionGeneration {
-  return version != null && isV2Version(version) ? 'v2' : 'v1'
+  const selected = selectOpenCodeGeneration(version ?? undefined)
+  return selected.success ? selected.data : 'v1'
 }
 
 /**

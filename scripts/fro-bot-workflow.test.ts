@@ -809,6 +809,21 @@ function declaredTriggers(workflowPath: string): readonly string[] {
   return Object.keys(on)
 }
 
+describe('CI workflow: Test GitHub Action deadline', () => {
+  it("ends the action's own deadline at least ten minutes before the job clock", () => {
+    // #given the job's cap and the action's timeout input
+    const job = rawJob(CI_WORKFLOW_PATH, 'test-action')
+    const runStep = stepsFor(CI_WORKFLOW_PATH, 'test-action').find(step => step.name === 'Test main action')
+    if (runStep === undefined) throw new TypeError('test-action Test main action step is missing')
+    const actionTimeoutMs = Number((runStep.with as Record<string, unknown>).timeout)
+    const jobCapMs = Number(job['timeout-minutes']) * 60 * 1000
+
+    // #then the action can drain, cancel and publish before the job clock cancels the job
+    expect(actionTimeoutMs).toBe(40 * 60 * 1000)
+    expect(jobCapMs - actionTimeoutMs).toBeGreaterThanOrEqual(10 * 60 * 1000)
+  })
+})
+
 describe('CI workflow: Test GitHub Action checkout', () => {
   it('disables persisted checkout credentials only for pull_request, preserving other triggers', () => {
     // #given the checkout step in the test-action job's own PAT-authenticated checkout

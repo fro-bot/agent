@@ -37,6 +37,7 @@ import {
   FRO_BOT_PLUGIN_ID,
   FRO_BOT_PLUGIN_PACKAGE,
   FRO_BOT_PLUGIN_VERSION,
+  resolveSystematicSkillsDirsV2,
   startOpenCodeV2Server,
   SYSTEMATIC_PACKAGE,
   SYSTEMATIC_V2_PLUGIN_ID,
@@ -213,6 +214,11 @@ export interface RunSupervisedOpencodeV2Deps {
    * or malformed config. Default: the merged `opencode.json` the entrypoint wrote.
    */
   readonly readSpawnConfig: () => SpawnConfig
+  /**
+   * The installed Systematic `skills/` directory the image baked, or none when it is not on disk. Called once, before the
+   * config is built. Default: the cache the image build filled, at the pinned Systematic version.
+   */
+  readonly resolveBundledSkillsDirs: (logger: RuntimeLogger) => Promise<readonly string[]>
 }
 
 export interface RunSupervisedOpencodeV2Options {
@@ -348,12 +354,33 @@ export async function runSupervisedOpencodeV2(options: RunSupervisedOpencodeV2Op
     prepareDatabase = async () => prepareFreshDatabase(),
     readAuthBlob = () => readOptionalSecretBlob(authFilePath(parentEnv)),
     readSpawnConfig = () => readSpawnConfigFromFile(),
+    resolveBundledSkillsDirs = async (skillsLogger: RuntimeLogger) =>
+      resolveSystematicSkillsDirsV2(AGENT_XDG_CACHE_HOME, DEFAULT_SYSTEMATIC_VERSION, skillsLogger),
   } = options.deps ?? {}
 
   const runtimeLogger = toRuntimeLogger(logger)
 
+  // A skill reads its own references and runs its own scripts from the Systematic package the image installed. That
+  // directory is outside the checkout, so without an exception every read raises a Discord approval. The exact
+  // directory (the installer's generation directory is a timestamp) is read from the cache the image build filled.
+  //
+  // The exception also lets the agent write there during its run: the cache is owned by uid 10001, who installed it
+  // (deploy/scripts/install-opencode-v2-plugins.sh drops to that uid), so the directory is writable by the agent and a
+  // change persists until the container is recreated. The `edit`/`write`/`patch` tools are denied for it
+  // (permission-rules-v2.ts `bundledSkillsDirectories`); a shell command is not, and nothing but the agent's own
+  // container reads what it writes. Not found (a harness-only image, a cache that was cleared): the ask stays.
+  const bundledSkillsDirectories = await resolveBundledSkillsDirs(runtimeLogger)
+  if (bundledSkillsDirectories.length === 0) {
+    logger.warn('opencode-server-v2: the bundled Systematic skills directory was not found; skill reads will ask', {
+      systematicVersion: DEFAULT_SYSTEMATIC_VERSION,
+    })
+  }
+
   // The config is the same for every attempt, and a config that cannot be built is not a transient failure.
-  const built = buildWorkspaceConfigV2({plugins: WORKSPACE_V2_PLUGIN_SPECS, allowedExternalDirectories}, runtimeLogger)
+  const built = buildWorkspaceConfigV2(
+    {plugins: WORKSPACE_V2_PLUGIN_SPECS, allowedExternalDirectories, bundledSkillsDirectories},
+    runtimeLogger,
+  )
   if (!built.success) {
     credentials.clear()
     statusRef.status = 'degraded'
