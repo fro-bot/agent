@@ -9,13 +9,14 @@ import type {
   SessionClient,
   SessionSearchResult,
 } from '@fro-bot/runtime'
+import type {LiveObservationV2} from '../../features/agent/live-observation-v2.js'
 import type {ExecutionConfig, PromptOptions} from '../../features/agent/types.js'
 import type {MetricsCollector} from '../../features/observability/index.js'
 import type {Logger} from '../../shared/logger.js'
 import type {OutputMode, ResolvedOutputMode, TokenUsage} from '../../shared/types.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {CacheRestorePhaseResult, CacheRestoreV2PhaseResult} from './cache-restore.js'
-import type {ExecutionBackend} from './execution-backend.js'
+import type {DeferredSummaryV2, ExecutionBackend} from './execution-backend.js'
 import type {RoutingPhaseResult} from './routing.js'
 import type {SessionPrepPhaseResult} from './session-prep.js'
 import * as fs from 'node:fs/promises'
@@ -63,6 +64,13 @@ export interface ExecutePhaseResult {
     readonly archivedSessionId: string
     readonly archiveSucceeded: boolean
   }
+  /**
+   * V2 only. The event observation a successful run keeps open for the release to stop (see `live-observation-v2.ts`).
+   * After an overflow recovery this is the replacement run's; the overflowed run's is stopped at the restart.
+   */
+  readonly liveObservation?: LiveObservationV2
+  /** V2 only. The run summary held back for the release to write (see `DeferredSummaryV2`). */
+  readonly deferredSummary?: DeferredSummaryV2
   /**
    * The ownership ledger backing this phase's active session (the recovery
    * session's ledger once overflow recovery has run, otherwise the original
@@ -158,8 +166,10 @@ function selectExecutionBackend(cacheRestore: CacheRestorePhaseResult | CacheRes
       const latestSession = await findLatestSession(serverHandle.client, workspace, afterTimestamp, logger)
       return latestSession == null ? null : latestSession.session.id
     },
-    writeSummary: async (sessionId, summary, logger) =>
-      writeSessionSummary(sessionId, summary, serverHandle.client, logger),
+    writeSummary: async (sessionId, summary, logger) => {
+      await writeSessionSummary(sessionId, summary, serverHandle.client, logger)
+      return undefined
+    },
   }
 }
 
@@ -286,6 +296,10 @@ async function recoverFromContextOverflow(options: ContextOverflowRecoveryOption
   // unknown, or settled entries from the session it replaces -- its dispatch budget
   // starts clean rather than carrying over an exhausted one.
   const recoveryLedger = createOwnershipLedger()
+  // The overflowed run's event observation (if it kept one) ends here, now that the replacement is certain to start: the
+  // replacement's own observation is the one the result carries to the release. An early return above keeps the
+  // overflowed run's in its result instead, for the release to stop.
+  await overflowedResult.liveObservation?.stop()
   const recoveryStartTime = Date.now()
   const recoveryExecResult = await backend.execute(
     recoveryPromptOptions,
@@ -504,9 +518,10 @@ export async function runExecute(
     metrics.incrementComments()
   }
 
+  let deferredSummary: DeferredSummaryV2 | undefined
   if (result.sessionId != null) {
     const sessionLogger = createLogger({phase: 'session'})
-    await backend.writeSummary(
+    deferredSummary = await backend.writeSummary(
       result.sessionId,
       {
         eventType: routing.agentContext.eventName,
@@ -526,7 +541,11 @@ export async function runExecute(
     sessionLogger.debug('Wrote session summary', {sessionId: result.sessionId})
   }
 
-  return {...result, executionDurationMs: Date.now() - executionStartTime}
+  return {
+    ...result,
+    ...(deferredSummary === undefined ? {} : {deferredSummary}),
+    executionDurationMs: Date.now() - executionStartTime,
+  }
 }
 
 /**

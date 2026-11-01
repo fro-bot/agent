@@ -1,13 +1,13 @@
 import type {ActionOpenCodeV2Client, OwnershipLedger} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
 import type {AttemptObservation, FailureObservation, TurnEvidence} from './attempt-outcome.js'
+import type {AttemptResultV2} from './live-observation-v2.js'
 import type {AttemptResult} from './prompt-sender.js'
 import type {ExecutionDeadline} from './retry.js'
 import type {FormAskedResponderV2, PermissionAskedResponderV2} from './streaming-v2.js'
 import type {EventStreamResult} from './streaming.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {reduceAttemptOutcome} from './attempt-outcome.js'
-import {registerLiveObservationV2} from './live-observation-v2.js'
 import {createOwnedWorkReconcilerV2} from './reconcile-v2.js'
 import {awaitStreamConnected, createDeadlineExceededError, createStreamNotConnectedResult} from './retry.js'
 import {
@@ -67,10 +67,10 @@ export interface RunPromptAttemptV2Options {
   readonly onFatal?: (cause: 'session_moved') => void
   readonly ownershipLedger?: OwnershipLedger
   /**
-   * Set by the caller that can keep the subscription open past this call. When present, a successful attempt sets `kept`
-   * and leaves the processor running; the caller must then not abort `attemptAbortController`.
+   * The caller can keep the subscription open past this call. A successful attempt then leaves its processor running and
+   * returns it as `liveObservation`; the caller must not abort `attemptAbortController` for such a result.
    */
-  readonly liveHandoff?: {kept: boolean}
+  readonly keepObserving?: boolean
   /** The location the run's shells run in. With a ledger it turns on REST reconciliation of children and shells. */
   readonly directory?: string
   /** Test seam: poll cadence and the no-activity bound. */
@@ -143,7 +143,7 @@ async function startSessionWaitV2(options: {
   return {kind: 'fallback-to-poll'}
 }
 
-export async function runPromptAttemptV2(options: RunPromptAttemptV2Options): Promise<AttemptResult> {
+export async function runPromptAttemptV2(options: RunPromptAttemptV2Options): Promise<AttemptResultV2> {
   const {client, sessionId, logger, deadline, ownershipLedger, startPrompt} = options
   const attemptController = options.attemptAbortController ?? new AbortController()
   const eventAbortController = new AbortController()
@@ -229,6 +229,9 @@ export async function runPromptAttemptV2(options: RunPromptAttemptV2Options): Pr
     eventProcessorShutdown = waitForEventProcessorShutdown(eventProcessor)
     return eventProcessorShutdown
   }
+
+  // Set when the processor is handed over: the finally block then leaves it running.
+  let kept = false
 
   // A failed prompt submission deferred past the early exit below, as a snapshot that joins the single reduction.
   let preservedSubmissionFailure: FailureObservation | null = null
@@ -326,21 +329,12 @@ export async function runPromptAttemptV2(options: RunPromptAttemptV2Options): Pr
     const turnEvidence: TurnEvidence = {accepted: tracker.firstMeaningfulEventReceived}
     const reduced = reduceAttemptOutcome(winning, preservedSubmissionFailure, turnEvidence)
 
-    const handoff = options.liveHandoff
-    if (reduced.success && ownershipLedger !== undefined && handoff !== undefined && snapshotRef.read !== null) {
+    if (reduced.success && options.keepObserving === true && snapshotRef.read !== null) {
       // The wait and poll producers have decided; only the event processor stays. See the module doc.
       waitAbortController.abort()
       pollAbortController.abort()
       const snapshot = snapshotRef.read
-      registerLiveObservationV2(ownershipLedger, {
-        tracker,
-        snapshot,
-        stop: async () => {
-          await stopEventProcessor()
-          return snapshot()
-        },
-      })
-      handoff.kept = true
+      kept = true
       return {
         success: reduced.success,
         error: reduced.error,
@@ -349,6 +343,14 @@ export async function runPromptAttemptV2(options: RunPromptAttemptV2Options): Pr
         shouldRetry: reduced.shouldRetry,
         settlement: reduced.settlement,
         eventStreamResult: snapshot(),
+        liveObservation: {
+          tracker,
+          snapshot,
+          stop: async () => {
+            await stopEventProcessor()
+            return snapshot()
+          },
+        },
       }
     }
 
@@ -368,6 +370,6 @@ export async function runPromptAttemptV2(options: RunPromptAttemptV2Options): Pr
     }
   } finally {
     reconciler?.dispose()
-    if (options.liveHandoff?.kept !== true) await stopEventProcessor()
+    if (!kept) await stopEventProcessor()
   }
 }

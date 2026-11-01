@@ -1,6 +1,6 @@
 import type {ActionOpenCodeV2Client, ErrorInfo, OpenCodeV2ServerHandle, OwnershipLedger} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
-import type {AttemptResult} from './prompt-sender.js'
+import type {AgentResultV2, AttemptResultV2, LiveObservationV2} from './live-observation-v2.js'
 import type {FormAskV2, PermissionAskV2} from './streaming-v2.js'
 import type {EventStreamResult} from './streaming.js'
 import type {AgentResult, ExecutionConfig, PromptOptions} from './types.js'
@@ -23,7 +23,6 @@ import {
   isOpenCodePromptArtifactEnabled,
 } from '../../shared/env.js'
 import {toErrorMessage} from '../../shared/errors.js'
-import {peekLiveObservationV2} from './live-observation-v2.js'
 import {sendPromptToSessionV2} from './prompt-sender-v2.js'
 import {buildContinuationPrompt} from './prompt-sender.js'
 import {buildAgentPrompt} from './prompt.js'
@@ -154,7 +153,7 @@ export async function executeOpenCodeV2(
   serverHandle: OpenCodeV2ServerHandle,
   ownershipLedger?: OwnershipLedger,
   client: ActionOpenCodeV2Client = createActionClientV2(serverHandle),
-): Promise<AgentResult> {
+): Promise<AgentResultV2> {
   const startTime = Date.now()
   const timeoutMs = config?.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const deadline = createExecutionDeadline(timeoutMs, logger)
@@ -337,7 +336,7 @@ export async function executeOpenCodeV2(
           ? initialPrompt
           : buildContinuationPrompt(nextPrompt.error, config?.credentialProvisioned === true)
 
-      const result: AttemptResult = await (async (): Promise<AttemptResult> => {
+      const result: AttemptResultV2 = await (async (): Promise<AttemptResultV2> => {
         try {
           return await sendPromptToSessionV2({
             client,
@@ -368,18 +367,20 @@ export async function executeOpenCodeV2(
 
       if (result.success) {
         stoppingCause = 'other'
-        const live = peekLiveObservationV2(ownershipLedger)
-        if (live !== undefined && usageReadable) {
-          // The turn a notice starts after this return adds to the session's figures; the release reads them again.
-          const rootId = activeSessionId
-          live.refreshUsage = async () =>
-            collectRunUsageV2({
-              fetchRoute: serverHandle.fetch,
-              rootSessionId: rootId,
-              baseline: usageBaseline,
-              ...(ownershipLedger === undefined ? {} : {ledger: ownershipLedger}),
-            })
-        }
+        // The turn a notice starts after this return adds to the session's figures; the release reads them again.
+        const liveObservation: LiveObservationV2 | undefined =
+          result.liveObservation === undefined || !usageReadable
+            ? result.liveObservation
+            : {
+                ...result.liveObservation,
+                refreshUsage: async () =>
+                  collectRunUsageV2({
+                    fetchRoute: serverHandle.fetch,
+                    rootSessionId: activeSessionId,
+                    baseline: usageBaseline,
+                    ...(ownershipLedger === undefined ? {} : {ledger: ownershipLedger}),
+                  }),
+              }
         await applyUsage()
         return {
           success: true,
@@ -396,6 +397,7 @@ export async function executeOpenCodeV2(
           llmError: null,
           classificationPath: final.classificationPath,
           observationGap,
+          ...(liveObservation === undefined ? {} : {liveObservation}),
         }
       }
 

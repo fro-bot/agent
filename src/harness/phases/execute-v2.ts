@@ -7,7 +7,6 @@ import {searchSessionsV2} from '@fro-bot/runtime/session-v2'
 import {stopAndConfirmQuietV2} from '../../features/agent/drain-v2.js'
 import {createActionClientV2, executeOpenCodeV2} from '../../features/agent/execution-v2.js'
 import {toErrorMessage} from '../../shared/errors.js'
-import {deferSummaryV2} from './deferred-summary-v2.js'
 import {createSessionReaderV2} from './session-v2.js'
 
 /**
@@ -71,12 +70,12 @@ export function createExecutionBackendV2(cacheRestore: CacheRestoreV2PhaseResult
     // The V2 loop creates the session itself and reports its id, so there is nothing to look up afterwards.
     findLatestSessionId: async () => null,
 
-    // Recorded, not written: a summary posted now would sit in the root's inbox as a queued item and the directory gate
-    // would wait on it for ever. The release writes it after the final reading, just before the shutdown
-    // (`release-v2.ts`; see `deferred-summary-v2.ts`).
+    // Returned, not written: a summary posted now would sit in the root's inbox as a queued item and the directory gate
+    // would wait on it for ever. It rides on the execute result to the release, which writes it after the final reading,
+    // just before the shutdown (`release-v2.ts`).
     writeSummary: async (sessionId, summary, logger) => {
-      deferSummaryV2(serverHandle, sessionId, formatSummaryForSession(summary))
       logger.debug('Session summary deferred until the run is released', {sessionId})
+      return {sessionId, text: formatSummaryForSession(summary)}
     },
   }
 }

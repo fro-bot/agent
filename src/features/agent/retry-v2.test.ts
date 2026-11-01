@@ -15,7 +15,6 @@ import {
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {createFakeServer, frame, ROOT_SESSION_ID, STARTED, SUCCEEDED} from './execution-v2.fixture.js'
-import {takeLiveObservationV2} from './live-observation-v2.js'
 import {runPromptAttemptV2} from './retry-v2.js'
 import {createDeadlineExceededError, createExecutionDeadline} from './retry.js'
 import {observeRootTerminal} from './session-poll-v2.js'
@@ -71,13 +70,12 @@ describe('runPromptAttemptV2', () => {
         pipe.push(SUCCEEDED)
       },
     })
-    const handoff = {kept: false}
-    const result = attempt(server, {ownershipLedger: ledger, liveHandoff: handoff, ...extra})
+    const result = attempt(server, {ownershipLedger: ledger, keepObserving: true, ...extra})
     await advance(300)
     ledger.settle(CHILD_SESSION_ID)
     await advance(2_000)
     const outcome = await result
-    return {server, ledger, handoff, outcome}
+    return {server, ledger, outcome, live: outcome.liveObservation}
   }
 
   it('does not complete on a wait that answered before the prompt was admitted; it asks again', async () => {
@@ -413,39 +411,36 @@ describe('runPromptAttemptV2', () => {
 
     it('hands the processor over instead of stopping it, so the subscription stays open', async () => {
       // #given / #when
-      const {handoff, outcome, ledger} = await succeededThenSettledByRest()
+      const {outcome, live} = await succeededThenSettledByRest()
 
-      // #then
+      // #then the observation rides on the result itself
       expect(outcome).toMatchObject({success: true})
-      expect(handoff.kept).toBe(true)
-      const live = takeLiveObservationV2(ledger)
       expect(live).toBeDefined()
       await live?.stop()
     })
 
-    it('does not hand over a run without a ledger, or a failed attempt', async () => {
-      // #given a run with no ledger
+    it('does not hand over when the caller cannot keep the subscription, or when the attempt failed', async () => {
+      // #given a caller that did not ask to keep observing
       const server = createFakeServer({
         onPrompt: (_, pipe) => {
           pipe.push(STARTED)
           pipe.push(SUCCEEDED)
         },
       })
-      const handoff = {kept: false}
 
       // #when
-      const result = attempt(server, {liveHandoff: handoff})
+      const result = attempt(server, {ownershipLedger: createOwnershipLedger()})
       await advance(2_000)
 
       // #then
-      expect(await result).toMatchObject({success: true})
-      expect(handoff.kept).toBe(false)
+      const outcome = await result
+      expect(outcome).toMatchObject({success: true})
+      expect(outcome.liveObservation).toBeUndefined()
     })
 
     it('records a failed turn the notice starts after the attempt returned, so the last turn decides', async () => {
       // #given
-      const {server, ledger} = await succeededThenSettledByRest()
-      const live = takeLiveObservationV2(ledger)
+      const {server, live} = await succeededThenSettledByRest()
 
       // #when a notice turn runs and fails
       const pipe = server.pipes.at(-1)
@@ -469,8 +464,7 @@ describe('runPromptAttemptV2', () => {
     it('still rejects a permission ask the notice turn raises', async () => {
       // #given
       const onPermissionAsked = vi.fn(async () => undefined)
-      const {server, ledger} = await succeededThenSettledByRest({onPermissionAsked})
-      const live = takeLiveObservationV2(ledger)
+      const {server, live} = await succeededThenSettledByRest({onPermissionAsked})
 
       // #when the notice turn asks for a permission after the attempt returned
       const pipe = server.pipes.at(-1)
@@ -489,8 +483,7 @@ describe('runPromptAttemptV2', () => {
     it("streams the text of a notice turn that succeeds, and ends on that turn's success", async () => {
       // #given
       consoleMock.outputTextContent.mockClear()
-      const {server, ledger} = await succeededThenSettledByRest()
-      const live = takeLiveObservationV2(ledger)
+      const {server, live} = await succeededThenSettledByRest()
 
       // #when
       const pipe = server.pipes.at(-1)

@@ -25,7 +25,6 @@ import {
   succeedWithText,
 } from './execution-v2.fixture.js'
 import {cancelFormV2, executeOpenCodeV2, interruptRootSession, replyToPermissionAskV2} from './execution-v2.js'
-import {takeLiveObservationV2} from './live-observation-v2.js'
 import {EVENT_STREAM_CONNECT_TIMEOUT_MS, MAX_LLM_RETRIES, RETRY_DELAYS_MS} from './retry.js'
 
 const consoleMock = vi.hoisted(() => ({outputTextContent: vi.fn(), outputToolExecution: vi.fn()}))
@@ -159,7 +158,7 @@ describe('executeOpenCodeV2', () => {
 
       // #then the attempt reported the usage it saw, and the observation it left can read the later figures
       expect(outcome.tokenUsage?.input).toBe(120)
-      const live = takeLiveObservationV2(ledger)
+      const live = outcome.liveObservation
       expect(live?.refreshUsage).toBeDefined()
       expect(await live?.refreshUsage?.()).toMatchObject({tokens: {input: 200}, cost: 0.9})
 
@@ -174,6 +173,50 @@ describe('executeOpenCodeV2', () => {
       await advance(500)
       expect(live?.tracker.rootTerminal).toEqual({kind: 'failed'})
       await live?.stop()
+    })
+
+    it('shares nothing between two runs in one process: each result carries its own observation', async () => {
+      // #given two runs started together, each with its own server, ledger and handle
+      const serverA = createFakeServer({onPrompt: (_, pipe) => succeedWithText(pipe)})
+      const serverB = createFakeServer({onPrompt: (_, pipe) => succeedWithText(pipe)})
+      const route = async (_path: string): Promise<Response> =>
+        new Response(JSON.stringify(usageRecord(1, 0.1)), {status: 200})
+      const start = async (server: typeof serverA) =>
+        executeOpenCodeV2(
+          promptOptions(),
+          logger,
+          {agent: null, model: null, timeoutMs: 60_000},
+          handle(route),
+          createOwnershipLedger(),
+          server.client,
+        )
+
+      // #when
+      const both = Promise.all([start(serverA), start(serverB)])
+      await advance(2_000)
+      const [a, b] = await both
+
+      // #then the observations are two objects over two trackers
+      expect(a.liveObservation).toBeDefined()
+      expect(b.liveObservation).toBeDefined()
+      expect(a.liveObservation).not.toBe(b.liveObservation)
+      expect(a.liveObservation?.tracker).not.toBe(b.liveObservation?.tracker)
+
+      // #when one run's notice turn fails
+      serverA.pipes.at(-1)?.push(frame('session.execution.started', {sessionID: ROOT_SESSION_ID}))
+      serverA.pipes.at(-1)?.push(
+        frame('session.execution.failed', {
+          sessionID: ROOT_SESSION_ID,
+          error: {type: 'provider.quota', message: 'out of credit', status: 402},
+        }),
+      )
+      await advance(500)
+
+      // #then it is recorded for that run only
+      expect(a.liveObservation?.tracker.rootTerminal).toEqual({kind: 'failed'})
+      expect(b.liveObservation?.tracker.rootTerminal).toEqual({kind: 'succeeded'})
+      await a.liveObservation?.stop()
+      await b.liveObservation?.stop()
     })
 
     it('reports only the growth of a continued session, from a baseline read before the first prompt', async () => {

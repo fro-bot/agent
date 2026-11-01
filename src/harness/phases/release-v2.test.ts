@@ -3,10 +3,8 @@ import type {ReleaseOutcomeV2} from '../../features/agent/drain-v2.js'
 import {createOwnershipLedger} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {PRE_SHUTDOWN_REQUEST_TIMEOUT_MS} from '../../features/agent/drain-v2.js'
-import {registerLiveObservationV2} from '../../features/agent/live-observation-v2.js'
 import {createActivityTrackerV2} from '../../features/agent/streaming-v2.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
-import {deferSummaryV2, takeDeferredSummaryV2} from './deferred-summary-v2.js'
 import {boundRequests} from './release-v2.js'
 
 const mocks = vi.hoisted(() => ({
@@ -59,7 +57,7 @@ async function release(overrides: Partial<Parameters<typeof import('./release-v2
   })
 }
 
-function liveFor(ledger: ReturnType<typeof createOwnershipLedger>, order: string[]) {
+function liveFor(order: string[]) {
   const tracker = createActivityTrackerV2()
   tracker.rootTerminal = {kind: 'failed'}
   tracker.genericError = {type: 'api_error', message: 'notice turn failed', retryable: false}
@@ -73,7 +71,7 @@ function liveFor(ledger: ReturnType<typeof createOwnershipLedger>, order: string
     llmError: null,
   }
   const refreshUsage = vi.fn(async () => ({tokens: null, cost: 0.2, model: null}))
-  registerLiveObservationV2(ledger, {
+  const observation = {
     tracker,
     snapshot: () => result,
     stop: async () => {
@@ -81,8 +79,8 @@ function liveFor(ledger: ReturnType<typeof createOwnershipLedger>, order: string
       return result
     },
     refreshUsage,
-  })
-  return {refreshUsage}
+  }
+  return {observation, refreshUsage}
 }
 
 describe('runReleaseV2', () => {
@@ -168,7 +166,6 @@ describe('runReleaseV2', () => {
   it('writes the held run summary once the directory is quiet and before the server goes down, then prunes', async () => {
     // #given a summary the execute phase held back for this handle
     const order: string[] = []
-    deferSummaryV2(handle, 'ses_root', 'summary text')
     mocks.addSyntheticMessage.mockImplementation(async () => {
       order.push('summary')
       return {success: true, data: undefined}
@@ -187,7 +184,7 @@ describe('runReleaseV2', () => {
     )
 
     // #when
-    await release()
+    await release({deferredSummary: {sessionId: 'ses_root', text: 'summary text'}})
 
     // #then
     expect(order).toEqual(['quiet', 'summary', 'prune', 'shutdown'])
@@ -196,20 +193,17 @@ describe('runReleaseV2', () => {
 
   it('does not write the held summary when the release never reached a quiet directory', async () => {
     // #given the release skips its pre-shutdown step
-    deferSummaryV2(handle, 'ses_root', 'summary text')
     mocks.releaseRunV2.mockResolvedValue(outcome({quiet: false, declineReason: 'not quiet'}))
 
     // #when
-    await release()
+    await release({deferredSummary: {sessionId: 'ses_root', text: 'summary text'}})
 
-    // #then the summary stays held; nothing is written to a session that may still be running
+    // #then nothing is written to a session that may still be running
     expect(mocks.addSyntheticMessage).not.toHaveBeenCalled()
-    expect(takeDeferredSummaryV2(handle)?.text).toBe('summary text')
   })
 
   it('still prunes and shuts down when the summary cannot be written', async () => {
     // #given
-    deferSummaryV2(handle, 'ses_root', 'summary text')
     mocks.addSyntheticMessage.mockRejectedValue(new Error('socket closed'))
     mocks.releaseRunV2.mockImplementation(
       async (options: {beforeShutdown?: (signal: AbortSignal) => Promise<void>}) => {
@@ -219,7 +213,7 @@ describe('runReleaseV2', () => {
     )
 
     // #when
-    await release()
+    await release({deferredSummary: {sessionId: 'ses_root', text: 'summary text'}})
 
     // #then
     expect(mocks.pruneSessionsV2).toHaveBeenCalledTimes(1)
@@ -227,10 +221,9 @@ describe('runReleaseV2', () => {
 
   describe('the event observation kept through the wait', () => {
     it('stops after the directory is decided, before the server goes down, and reports the last root turn', async () => {
-      // #given an observation handed over for this run's ledger
+      // #given an observation handed over in the execute result
       const order: string[] = []
-      const ledger = createOwnershipLedger()
-      const {refreshUsage} = liveFor(ledger, order)
+      const {observation, refreshUsage} = liveFor(order)
       mocks.releaseRunV2.mockImplementation(
         async (options: {onSettled?: (quiet: boolean, signal: AbortSignal) => Promise<void>}) => {
           order.push('decided')
@@ -241,7 +234,7 @@ describe('runReleaseV2', () => {
       )
 
       // #when
-      const result = await release({ledger})
+      const result = await release({liveObservation: observation})
 
       // #then
       expect(order).toEqual(['decided', 'stop', 'shutdown'])
@@ -255,8 +248,7 @@ describe('runReleaseV2', () => {
 
     it('does not re-read usage from a directory that was not confirmed quiet', async () => {
       // #given
-      const ledger = createOwnershipLedger()
-      const {refreshUsage} = liveFor(ledger, [])
+      const {observation, refreshUsage} = liveFor([])
       mocks.releaseRunV2.mockImplementation(
         async (options: {onSettled?: (quiet: boolean, signal: AbortSignal) => Promise<void>}) => {
           await options.onSettled?.(false, new AbortController().signal)
@@ -265,7 +257,7 @@ describe('runReleaseV2', () => {
       )
 
       // #when
-      const result = await release({ledger})
+      const result = await release({liveObservation: observation})
 
       // #then
       expect(refreshUsage).not.toHaveBeenCalled()
@@ -282,11 +274,43 @@ describe('runReleaseV2', () => {
       )
 
       // #when
-      const result = await release({ledger: createOwnershipLedger()})
+      const result = await release()
 
       // #then
       expect(result.observed).toBeUndefined()
     })
+  })
+
+  it('shares nothing between two runs released together: each writes its own summary and stops its own observation', async () => {
+    // #given two runs in one process, each with its own observation and summary
+    const order: string[] = []
+    const first = liveFor(order)
+    const second = liveFor(order)
+    mocks.releaseRunV2.mockImplementation(
+      async (options: {
+        onSettled?: (quiet: boolean, signal: AbortSignal) => Promise<void>
+        beforeShutdown?: (signal: AbortSignal) => Promise<void>
+      }) => {
+        await options.onSettled?.(true, new AbortController().signal)
+        await options.beforeShutdown?.(new AbortController().signal)
+        return outcome()
+      },
+    )
+
+    // #when
+    const [a, b] = await Promise.all([
+      release({liveObservation: first.observation, deferredSummary: {sessionId: 'ses_a', text: 'summary a'}}),
+      release({liveObservation: second.observation, deferredSummary: {sessionId: 'ses_b', text: 'summary b'}}),
+    ])
+
+    // #then
+    expect(mocks.addSyntheticMessage).toHaveBeenCalledWith({sessionId: 'ses_a', text: 'summary a'})
+    expect(mocks.addSyntheticMessage).toHaveBeenCalledWith({sessionId: 'ses_b', text: 'summary b'})
+    expect(mocks.addSyntheticMessage).toHaveBeenCalledTimes(2)
+    expect(order).toEqual(['stop', 'stop'])
+    expect(first.refreshUsage).toHaveBeenCalledTimes(1)
+    expect(second.refreshUsage).toHaveBeenCalledTimes(1)
+    expect(a.observed).not.toBe(b.observed)
   })
 
   describe('the pre-shutdown step is bounded', () => {
@@ -308,7 +332,6 @@ describe('runReleaseV2', () => {
       )
       const hangingHandle = {...handle, fetch: hanging} as unknown as OpenCodeV2ServerHandle
       mocks.createClient.mockImplementation((h: OpenCodeV2ServerHandle) => actual.createActionClientV2(h))
-      deferSummaryV2(hangingHandle, 'ses_root', 'summary text')
       mocks.releaseRunV2.mockImplementation(
         async (options: {beforeShutdown?: (signal: AbortSignal) => Promise<void>}) => {
           await options.beforeShutdown?.(new AbortController().signal)
@@ -318,7 +341,10 @@ describe('runReleaseV2', () => {
       let done = false
 
       // #when the request goes out and never answers
-      const pending = release({serverHandle: hangingHandle}).then(() => {
+      const pending = release({
+        serverHandle: hangingHandle,
+        deferredSummary: {sessionId: 'ses_root', text: 'summary text'},
+      }).then(() => {
         done = true
       })
       await vi.advanceTimersByTimeAsync(1_000)

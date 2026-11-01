@@ -1,6 +1,7 @@
-import type {OwnershipLedger} from '@fro-bot/runtime'
+import type {AttemptResult} from './prompt-sender.js'
 import type {ActivityTrackerV2} from './streaming-v2.js'
 import type {EventStreamResult} from './streaming.js'
+import type {AgentResult} from './types.js'
 import type {RunUsageV2} from './usage-v2.js'
 
 /**
@@ -12,8 +13,9 @@ import type {RunUsageV2} from './usage-v2.js'
  * successful attempt hands its processor over instead, and the release (`release-v2.ts`) stops it only once the
  * directory is confirmed quiet, just before the server is shut down.
  *
- * Keyed by the run's ownership ledger: the ledger is what the release already receives, and what ties the observation
- * to the run that started it. A run with no ledger never hands over.
+ * The handover is explicit: the observation travels as a field of the results that already flow from the attempt to
+ * the release (`AttemptResultV2`, `AgentResult` of the V2 loop, `ExecutePhaseResult.liveObservation`, then
+ * `runReleaseV2`'s options). Nothing is held in a module-level table, so two runs in one process share nothing.
  */
 export interface LiveObservationV2 {
   /** The tracker the processor keeps updating: the root's latest turn, and any failure it recorded. */
@@ -26,21 +28,8 @@ export interface LiveObservationV2 {
   refreshUsage?: () => Promise<RunUsageV2>
 }
 
-const live = new WeakMap<OwnershipLedger, LiveObservationV2>()
+/** A V2 attempt's result. Only a successful attempt of a run that can keep observing carries an observation. */
+export type AttemptResultV2 = AttemptResult & {readonly liveObservation?: LiveObservationV2}
 
-export function registerLiveObservationV2(ledger: OwnershipLedger, observation: LiveObservationV2): void {
-  live.set(ledger, observation)
-}
-
-/** The observation handed over for this ledger, removed so it is stopped once. */
-export function takeLiveObservationV2(ledger: OwnershipLedger | undefined): LiveObservationV2 | undefined {
-  if (ledger === undefined) return undefined
-  const observation = live.get(ledger)
-  live.delete(ledger)
-  return observation
-}
-
-/** The observation handed over for this ledger, left in place. */
-export function peekLiveObservationV2(ledger: OwnershipLedger | undefined): LiveObservationV2 | undefined {
-  return ledger === undefined ? undefined : live.get(ledger)
-}
+/** The V2 loop's result: V1's `AgentResult`, plus the observation a successful run keeps for the release. */
+export type AgentResultV2 = AgentResult & {readonly liveObservation?: LiveObservationV2}

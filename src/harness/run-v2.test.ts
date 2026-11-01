@@ -214,6 +214,7 @@ async function arrange(
     readonly executeSuccess?: boolean
     readonly executeError?: Error
     readonly ledger?: OwnershipLedger
+    readonly extras?: Partial<Awaited<ReturnType<typeof import('./phases/execute.js').runExecute>>>
   } = {},
 ) {
   const {runBootstrap} = await import('./phases/bootstrap.js')
@@ -282,6 +283,7 @@ async function arrange(
       recoveryBoundaryUnresolved: false,
       executionDurationMs: 10,
       ownershipLedger: ledger,
+      ...options.extras,
     })
   } else {
     vi.mocked(runExecute).mockRejectedValue(options.executeError)
@@ -393,6 +395,22 @@ describe('run on an OpenCode V2 server', () => {
     expect(vi.mocked(runFinalizeWithResult).mock.calls[0]?.[7]).toMatchObject({knownExecutionVeto: false})
     expect(vi.mocked(setInvocationOutcomeOutput)).toHaveBeenCalledWith('succeeded')
     expect(exitCode).toBe(0)
+  })
+
+  it('hands the execute phase observation and summary to the release, explicitly', async () => {
+    // #given an execute result that carries both
+    const {runReleaseV2} = await import('./phases/release-v2.js')
+    const liveObservation = {tracker: {}, snapshot: vi.fn(), stop: vi.fn()} as never
+    const deferredSummary = {sessionId: 'ses_v2', text: 'summary'}
+    await arrange({extras: {liveObservation, deferredSummary}})
+
+    // #when
+    await run()
+
+    // #then the release receives exactly those values
+    const options = vi.mocked(runReleaseV2).mock.calls[0]?.[0]
+    expect(options?.liveObservation).toBe(liveObservation)
+    expect(options?.deferredSummary).toBe(deferredSummary)
   })
 
   it('stops, rather than drains, a run whose execution did not succeed', async () => {

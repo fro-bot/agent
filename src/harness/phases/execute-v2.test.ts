@@ -11,7 +11,6 @@ import type {CacheRestorePhaseResult, CacheRestoreV2PhaseResult} from './cache-r
 import type {RoutingPhaseResult} from './routing.js'
 import type {SessionPrepPhaseResult} from './session-prep.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
-import {takeDeferredSummaryV2} from './deferred-summary-v2.js'
 import {runExecute} from './execute.js'
 
 const mocks = vi.hoisted(() => ({
@@ -271,9 +270,8 @@ describe('runExecute generation selector', () => {
     // message would keep the root's inbox non-empty, and the release waits for an empty one. It is held for the release.
     expect(mocks.writeSessionSummary).not.toHaveBeenCalled()
     expect(mocks.addSyntheticMessage).not.toHaveBeenCalled()
-    const held = takeDeferredSummaryV2(cacheRestore.serverHandle)
-    expect(held?.sessionId).toBe('ses_v2')
-    expect(held?.text).toContain('Fro Bot Run Summary')
+    expect(result.deferredSummary?.sessionId).toBe('ses_v2')
+    expect(result.deferredSummary?.text).toContain('Fro Bot Run Summary')
   })
 
   it('routes the overflow-recovery restart through the V2 executor, archiving over the V2 route', async () => {
@@ -307,6 +305,46 @@ describe('runExecute generation selector', () => {
     })
     // The restart gets a fresh ledger, not the exhausted one.
     expect(mocks.executeOpenCodeV2.mock.calls[1]?.[4]).not.toBe(mocks.executeOpenCodeV2.mock.calls[0]?.[4])
+  })
+
+  it('carries the replacement run observation and summary across an overflow restart, and stops the overflowed one', async () => {
+    // #given an overflowed run that kept an observation, and a replacement that keeps its own
+    const overflowedStop = vi.fn(async () => ({}) as never)
+    const replacementStop = vi.fn(async () => ({}) as never)
+    const observation = (stop: typeof overflowedStop) => ({tracker: {} as never, snapshot: () => ({}) as never, stop})
+    mocks.executeOpenCodeV2
+      .mockResolvedValueOnce({...agentResult(), liveObservation: observation(overflowedStop)})
+      .mockResolvedValueOnce({
+        ...agentResult({success: true, exitCode: 0, error: null, llmError: null, sessionId: 'recovered'}),
+        liveObservation: observation(replacementStop),
+      })
+
+    // #when
+    const result = await runExecute(bootstrap(), routing(), v2CacheRestore(), sessionPrep(), metrics(), 0)
+
+    // #then the overflowed observation ended at the restart; the result carries the replacement's, and the summary is
+    // the replacement session's
+    expect(overflowedStop).toHaveBeenCalledTimes(1)
+    expect(replacementStop).not.toHaveBeenCalled()
+    expect(result.liveObservation?.stop).toBe(replacementStop)
+    expect(result.deferredSummary?.sessionId).toBe('recovered')
+  })
+
+  it('keeps the overflowed observation in the result when no restart happens, for the release to stop', async () => {
+    // #given an overflow whose stop could not be confirmed
+    const stop = vi.fn(async () => ({}) as never)
+    mocks.stopAndConfirmQuietV2.mockResolvedValue({quiet: false, reason: 'the directory was active'})
+    mocks.executeOpenCodeV2.mockResolvedValueOnce({
+      ...agentResult(),
+      liveObservation: {tracker: {} as never, snapshot: () => ({}) as never, stop},
+    })
+
+    // #when
+    const result = await runExecute(bootstrap(), routing(), v2CacheRestore(), sessionPrep(), metrics(), 0)
+
+    // #then it is neither stopped here nor dropped
+    expect(stop).not.toHaveBeenCalled()
+    expect(result.liveObservation?.stop).toBe(stop)
   })
 
   it('records a failed V2 archive and still restarts', async () => {

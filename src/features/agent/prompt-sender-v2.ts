@@ -1,5 +1,6 @@
 import type {ActionOpenCodeV2Client, OwnershipLedger, V2CallError, V2PromptFile} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
+import type {AttemptResultV2} from './live-observation-v2.js'
 import type {AttemptOutcome, AttemptResult} from './prompt-sender.js'
 import type {RunPromptAttemptV2Options} from './retry-v2.js'
 import type {ExecutionDeadline} from './retry.js'
@@ -85,12 +86,12 @@ export interface SendPromptV2Options {
   readonly poll?: RunPromptAttemptV2Options['poll']
 }
 
-export async function sendPromptToSessionV2(options: SendPromptV2Options): Promise<AttemptResult> {
+export async function sendPromptToSessionV2(options: SendPromptV2Options): Promise<AttemptResultV2> {
   const {client, sessionId, promptText, files, directory, logger, deadline} = options
   const attemptAbortController = new AbortController()
-  // Set by the attempt when it keeps its event processor running past its return (a successful attempt with a ledger):
-  // the subscription must then outlive this call, and the release closes it.
-  const liveHandoff = {kept: false}
+  // A successful attempt of a run with a ledger keeps its event processor running past its return and says so by
+  // returning `liveObservation`: the subscription must then outlive this call, and the release closes it.
+  let kept = false
   try {
     const subscriptionSignal =
       deadline === undefined
@@ -123,7 +124,7 @@ export async function sendPromptToSessionV2(options: SendPromptV2Options): Promi
       return createSubmissionFailureV2('OpenCode V2 prompt submission failed', prompted.error)
     }
 
-    return await runPromptAttemptV2({
+    const attempt = await runPromptAttemptV2({
       client,
       sessionId,
       directory,
@@ -131,7 +132,7 @@ export async function sendPromptToSessionV2(options: SendPromptV2Options): Promi
       startPrompt,
       logger,
       attemptAbortController,
-      liveHandoff,
+      keepObserving: options.ownershipLedger !== undefined,
       ...(deadline === undefined ? {} : {deadline}),
       ...(options.onPermissionAsked === undefined ? {} : {onPermissionAsked: options.onPermissionAsked}),
       ...(options.onFormAsked === undefined ? {} : {onFormAsked: options.onFormAsked}),
@@ -139,7 +140,9 @@ export async function sendPromptToSessionV2(options: SendPromptV2Options): Promi
       ...(options.ownershipLedger === undefined ? {} : {ownershipLedger: options.ownershipLedger}),
       ...(options.poll === undefined ? {} : {poll: options.poll}),
     })
+    kept = attempt.liveObservation !== undefined
+    return attempt
   } finally {
-    if (!liveHandoff.kept) attemptAbortController.abort()
+    if (!kept) attemptAbortController.abort()
   }
 }
