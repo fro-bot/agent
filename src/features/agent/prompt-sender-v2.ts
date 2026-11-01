@@ -6,6 +6,7 @@ import type {RunPromptAttemptV2Options} from './retry-v2.js'
 import type {ExecutionDeadline} from './retry.js'
 import type {FormAskedResponderV2, PermissionAskedResponderV2} from './streaming-v2.js'
 import {createAgentError, createLLMFetchError} from '@fro-bot/runtime'
+import {resolveAmbiguousAdmission} from './admission-v2.js'
 import {runPromptAttemptV2} from './retry-v2.js'
 import {createDeadlineExceededError, shouldRetryFromOutcome} from './retry.js'
 
@@ -47,9 +48,22 @@ export function isRetryableCallError(error: V2CallError): boolean {
   }
 }
 
-export function createSubmissionFailureV2(what: string, error: V2CallError): AttemptResult {
+/**
+ * A failure that may have come AFTER the server admitted the prompt: the connection failed or the server errored while
+ * answering. A refusal (4xx other than 408) is a definite "not admitted"; so is a request that never got out, but the two
+ * cannot be told apart from the error kind, so every retryable kind is treated as ambiguous.
+ */
+export function isAmbiguousAdmission(error: V2CallError): boolean {
+  return isRetryableCallError(error) && !(error.kind === 'http' && error.status === 429)
+}
+
+export function createSubmissionFailureV2(
+  what: string,
+  error: V2CallError,
+  options: {readonly retryable?: boolean} = {},
+): AttemptResult {
   const message = `${what} (${describeCallError(error)})`
-  const llmError = isRetryableCallError(error) ? createLLMFetchError(message) : null
+  const llmError = (options.retryable ?? isRetryableCallError(error)) ? createLLMFetchError(message) : null
   const outcome: AttemptOutcome = 'submit_failed'
   return {
     success: false,
@@ -110,6 +124,7 @@ export async function sendPromptToSessionV2(options: SendPromptV2Options): Promi
     }
 
     const startPrompt = async (): Promise<AttemptResult | null> => {
+      const sentAt = Date.now()
       const prompted = await client.prompt({
         sessionId,
         text: promptText,
@@ -121,7 +136,38 @@ export async function sendPromptToSessionV2(options: SendPromptV2Options): Promi
       if (prompted.error.kind === 'aborted' && deadline?.isExpired() === true) {
         throw createDeadlineExceededError('prompt submission')
       }
-      return createSubmissionFailureV2('OpenCode V2 prompt submission failed', prompted.error)
+      if (!isAmbiguousAdmission(prompted.error)) {
+        return createSubmissionFailureV2('OpenCode V2 prompt submission failed', prompted.error)
+      }
+
+      // The acknowledgment is lost, not the prompt: it may be running. Find out before anything can resend it.
+      const verdict = await resolveAmbiguousAdmission({
+        client,
+        sessionId,
+        promptText,
+        sentAt,
+        logger,
+        ...(deadline === undefined ? {} : {signal: deadline.signal}),
+      })
+      if (verdict === 'admitted') {
+        logger.warning('OpenCode V2 prompt acknowledgment was lost, but the server admitted the prompt; observing it', {
+          sessionId,
+          error: prompted.error.kind,
+        })
+        return null
+      }
+      if (verdict === 'absent') {
+        return createSubmissionFailureV2('OpenCode V2 prompt submission failed; it was not admitted', prompted.error)
+      }
+      logger.error('OpenCode V2 prompt acknowledgment was lost and admission cannot be determined; not resending', {
+        sessionId,
+        error: prompted.error.kind,
+      })
+      return createSubmissionFailureV2(
+        'OpenCode V2 prompt acknowledgment was lost and admission could not be determined; not resent',
+        prompted.error,
+        {retryable: false},
+      )
     }
 
     const attempt = await runPromptAttemptV2({

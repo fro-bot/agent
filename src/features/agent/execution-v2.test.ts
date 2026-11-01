@@ -531,6 +531,126 @@ describe('executeOpenCodeV2', () => {
       expect(server.calls.prompt.mock.calls[1]?.[0]).toMatchObject({text: 'Built prompt'})
     })
 
+    describe('a prompt acknowledgment that is lost', () => {
+      const lost = {kind: 'network', message: 'socket hang up'} as const
+      const sentRecently = () => Date.now()
+
+      it('does not send the prompt again when the server admitted it, and completes from the first execution', async () => {
+        // #given the connection fails after the server admitted the prompt and started its turn
+        const server = createFakeServer({
+          promptResults: [lost],
+          admittedDespiteError: [true],
+          onPrompt: (_, pipe) => succeedWithText(pipe),
+          recentUserMessages: [[{id: 'msg_1', text: 'Built prompt', createdAt: sentRecently() + 10}]],
+        })
+
+        // #when
+        const result = executeOpenCodeV2(
+          promptOptions(),
+          logger,
+          {agent: null, model: null, timeoutMs: 120_000},
+          handle(),
+          undefined,
+          server.client,
+        )
+        await advance(10_000)
+
+        // #then one prompt, observed to its end
+        expect(await result).toMatchObject({success: true})
+        expect(server.calls.prompt).toHaveBeenCalledTimes(1)
+      })
+
+      it('sends it again when the server did not admit it', async () => {
+        // #given nothing of the prompt reached the server: no message, root idle, inbox empty
+        const server = createFakeServer({
+          promptResults: [lost],
+          onPrompt: (_, pipe) => succeedWithText(pipe),
+        })
+
+        // #when
+        const result = executeOpenCodeV2(
+          promptOptions(),
+          logger,
+          {agent: null, model: null, timeoutMs: 120_000},
+          handle(),
+          undefined,
+          server.client,
+        )
+        await advance(10_000 + (RETRY_DELAYS_MS[0] ?? 0))
+
+        // #then
+        expect(await result).toMatchObject({success: true})
+        expect(server.calls.prompt).toHaveBeenCalledTimes(2)
+      })
+
+      it('fails without sending again when admission cannot be determined', async () => {
+        // #given reads that keep failing, so neither "admitted" nor "absent" can be shown
+        const server = createFakeServer({
+          promptResults: [lost],
+          recentUserMessages: [{kind: 'network', message: 'down'}],
+        })
+
+        // #when
+        const result = executeOpenCodeV2(
+          promptOptions(),
+          logger,
+          {agent: null, model: null, timeoutMs: 120_000},
+          handle(),
+          undefined,
+          server.client,
+        )
+        await advance(15_000)
+
+        // #then a duplicate run is worse than a failed one
+        expect(await result).toMatchObject({success: false, exitCode: 1})
+        expect(server.calls.prompt).toHaveBeenCalledTimes(1)
+      })
+
+      it('fails without sending again when the root is running but no message shows the prompt', async () => {
+        // #given the root is active: an admitted prompt queued behind a turn is not a message yet
+        const server = createFakeServer({promptResults: [lost]})
+        server.sessionActive.mockResolvedValue({[ROOT_SESSION_ID]: {type: 'running'}})
+
+        // #when
+        const result = executeOpenCodeV2(
+          promptOptions(),
+          logger,
+          {agent: null, model: null, timeoutMs: 120_000},
+          handle(),
+          undefined,
+          server.client,
+        )
+        await advance(15_000)
+
+        // #then
+        expect(await result).toMatchObject({success: false})
+        expect(server.calls.prompt).toHaveBeenCalledTimes(1)
+      })
+
+      it('does not treat a refusal as ambiguous: a 429 is a definite "not admitted" and keeps its own handling', async () => {
+        // #given
+        const server = createFakeServer({
+          promptResults: [{kind: 'http', status: 429}],
+          onPrompt: (_, pipe) => succeedWithText(pipe),
+        })
+
+        // #when
+        const result = executeOpenCodeV2(
+          promptOptions(),
+          logger,
+          {agent: null, model: null, timeoutMs: 120_000},
+          handle(),
+          undefined,
+          server.client,
+        )
+        await advance(10_000 + (RETRY_DELAYS_MS[0] ?? 0))
+
+        // #then no admission check was needed
+        expect(await result).toMatchObject({success: true})
+        expect(server.listRecentUserMessages).not.toHaveBeenCalled()
+      })
+    })
+
     it('does not retry an auth failure of the prompt route', async () => {
       // #given
       const server = createFakeServer({promptResults: [{kind: 'auth', status: 401}]})
@@ -618,6 +738,38 @@ describe('executeOpenCodeV2', () => {
       expect(server.calls.prompt).toHaveBeenCalledTimes(2)
       const resent = server.calls.prompt.mock.calls[1]?.[0] as {text: string}
       expect(resent.text).toContain('observed failure type `llm_fetch_error`')
+    })
+
+    it('does not retry a failed turn once a valid response file is present', async () => {
+      // #given a turn that fails with a retryable transport error AFTER the agent wrote its deliverable
+      const fs = await import('node:fs/promises')
+      vi.mocked(fs.readFile).mockResolvedValueOnce('The finished review body.')
+      const server = createFakeServer({
+        onPrompt: (_, pipe) => {
+          pipe.push(STARTED)
+          pipe.push(
+            frame('session.execution.failed', {
+              sessionID: ROOT_SESSION_ID,
+              error: {type: 'provider.transport', message: 'socket hang up'},
+            }),
+          )
+        },
+      })
+
+      // #when
+      const result = executeOpenCodeV2(
+        {...promptOptions(), responseFilePath: '/tmp/fro-bot-response.md'},
+        logger,
+        {agent: null, model: null, timeoutMs: 120_000},
+        handle(),
+        undefined,
+        server.client,
+      )
+      await advance(3_000 + (RETRY_DELAYS_MS[0] ?? 0) + 5_000)
+
+      // #then the deliverable is final: no continuation prompt is sent on top of it
+      expect(await result).toMatchObject({success: false})
+      expect(server.calls.prompt).toHaveBeenCalledTimes(1)
     })
 
     it('fails the run when an owned session moves, and interrupts the root', async () => {

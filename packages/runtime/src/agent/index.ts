@@ -170,7 +170,7 @@ export {buildAgentPrompt, buildTaskSection, getTriggerDirective} from './prompt.
 export type {TriggerDirective} from './prompt.js'
 export {materializeReferenceFiles} from './reference-files.js'
 export {createActionOpenCodeV2Client} from './remote-client-action-v2.js'
-export type {ActionOpenCodeV2Client} from './remote-client-action-v2.js'
+export type {ActionOpenCodeV2Client, V2UserMessage} from './remote-client-action-v2.js'
 export {createRemoteOpenCodeV2Client, V2_HEARTBEAT_FRAME} from './remote-client-v2.js'
 export type {
   RemoteOpenCodeV2Client,
