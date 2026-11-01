@@ -643,6 +643,106 @@ describe('executeOpenCodeV2', () => {
       })
     })
 
+    describe('the window between a retryable failure and its retry', () => {
+      const transportFailure = frame('session.execution.failed', {
+        sessionID: ROOT_SESSION_ID,
+        error: {type: 'provider.transport', message: 'socket hang up'},
+      })
+      const askAfterFailure = frame('permission.asked', {
+        id: 'per_backoff',
+        sessionID: ROOT_SESSION_ID,
+        action: 'external_directory',
+        resources: ['/etc/hosts'],
+      })
+
+      it('keeps rejecting permission asks until the directory is confirmed quiet, then retries', async () => {
+        // #given a retryable failure, and a notice-triggered turn that asks for permission one second later, before any retry
+        const ledger = createOwnershipLedger()
+        const server = createFakeServer({
+          onPrompt: (attempt, pipe) => {
+            if (attempt === 1) {
+              pipe.push(STARTED)
+              pipe.push(transportFailure)
+              setTimeout(() => pipe.push(askAfterFailure), 1_000)
+            } else {
+              succeedWithText(pipe)
+            }
+          },
+        })
+
+        // #when
+        const result = executeOpenCodeV2(
+          promptOptions(),
+          logger,
+          {agent: null, model: null, timeoutMs: 300_000},
+          handle(),
+          ledger,
+          server.client,
+        )
+        await advance(30_000 + (RETRY_DELAYS_MS[0] ?? 0))
+
+        // #then the ask was rejected, not stranded, and the retry still went out once the gate passed
+        expect(server.calls.replyPermission).toHaveBeenCalledTimes(1)
+        expect(server.calls.replyPermission.mock.calls[0]?.[0]).toMatchObject({requestId: 'per_backoff'})
+        expect(await result).toMatchObject({success: true})
+        expect(server.calls.prompt).toHaveBeenCalledTimes(2)
+      })
+
+      it('stops what the directory shows before it retries, and does not retry when the stop cannot be confirmed', async () => {
+        // #given a failure after which the root keeps running no matter what is done to it
+        const server = createFakeServer({
+          onPrompt: (_, pipe) => {
+            pipe.push(STARTED)
+            pipe.push(transportFailure)
+          },
+        })
+        server.sessionActive.mockResolvedValue({[ROOT_SESSION_ID]: {type: 'running'}})
+
+        // #when
+        const result = executeOpenCodeV2(
+          promptOptions(),
+          logger,
+          {agent: null, model: null, timeoutMs: 600_000},
+          handle(),
+          createOwnershipLedger(),
+          server.client,
+        )
+        await advance(60_000)
+
+        // #then the root was interrupted, the retry was withheld, and the run failed
+        expect(server.calls.interrupt).toHaveBeenCalled()
+        expect(await result).toMatchObject({success: false})
+        expect(server.calls.prompt).toHaveBeenCalledTimes(1)
+      })
+
+      it('hands the observation still running to the release when it does not retry', async () => {
+        // #given
+        const server = createFakeServer({
+          onPrompt: (_, pipe) => {
+            pipe.push(STARTED)
+            pipe.push(transportFailure)
+          },
+        })
+        server.sessionActive.mockResolvedValue({[ROOT_SESSION_ID]: {type: 'running'}})
+
+        // #when
+        const result = executeOpenCodeV2(
+          promptOptions(),
+          logger,
+          {agent: null, model: null, timeoutMs: 600_000},
+          handle(),
+          createOwnershipLedger(),
+          server.client,
+        )
+        await advance(60_000)
+
+        // #then the release can stop it after the directory is decided
+        const outcome = await result
+        expect(outcome.liveObservation).toBeDefined()
+        await outcome.liveObservation?.stop()
+      })
+    })
+
     it('does not retry an auth failure of the prompt route', async () => {
       // #given
       const server = createFakeServer({promptResults: [{kind: 'auth', status: 401}]})

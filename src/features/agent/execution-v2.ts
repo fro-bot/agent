@@ -23,6 +23,7 @@ import {
   isOpenCodePromptArtifactEnabled,
 } from '../../shared/env.js'
 import {toErrorMessage} from '../../shared/errors.js'
+import {stopAndConfirmQuietV2} from './drain-v2.js'
 import {sendPromptToSessionV2} from './prompt-sender-v2.js'
 import {buildContinuationPrompt} from './prompt-sender.js'
 import {buildAgentPrompt} from './prompt.js'
@@ -177,6 +178,10 @@ export async function executeOpenCodeV2(
   let observationGap = false
   // An attempt's prompt POST failed after it may have been sent: sticky, and reported to the caller whatever happens next.
   let sendUncertain = false
+  // The event observation of the latest failed attempt, kept running while a retry is decided (see `keepForRetry`).
+  let heldObservation: LiveObservationV2 | undefined
+  const heldField = (): {readonly liveObservation?: LiveObservationV2} =>
+    heldObservation === undefined ? {} : {liveObservation: heldObservation}
   // The root's usage before this run's first prompt: V2 reports cumulative figures per session, so a continued session
   // is read once up front. Without a baseline a continued session's usage would include earlier runs, so it is left out.
   let usageBaseline: SessionUsageV2 | null = null
@@ -220,6 +225,7 @@ export async function executeOpenCodeV2(
       classificationPath: final.classificationPath,
       observationGap,
       ...(sendUncertain ? {sendUncertain} : {}),
+      ...heldField(),
     }
   }
 
@@ -368,6 +374,7 @@ export async function executeOpenCodeV2(
       final = mergeAttemptUsage(mergeArtifactResults(result.eventStreamResult, final), final)
       if (result.eventStreamResult.discontinuity != null) observationGap = true
       if (result.sendUncertain === true) sendUncertain = true
+      if (!result.success && result.liveObservation !== undefined) heldObservation = result.liveObservation
 
       if (result.success) {
         stoppingCause = 'other'
@@ -444,6 +451,34 @@ export async function executeOpenCodeV2(
         nextPrompt = {kind: 'initial'}
       }
 
+      // A notice can start another root turn while the retry waits, and that turn can ask for a permission or a form with
+      // nobody answering. So nothing waits on the backoff until the directory is stopped and confirmed quiet; the
+      // observation that answers those asks stays up until then. An unconfirmed stop is not retried: the run fails and the
+      // release takes the stop-and-decline path.
+      // A run whose prompt never reached a turn (the subscription failed, the prompt was refused) started nothing that
+      // could wake a session, so there is nothing to stop.
+      const confirmation = promptAccepted
+        ? await stopAndConfirmQuietV2({
+            client,
+            directory,
+            rootSessionId: activeSessionId,
+            ledger: ownershipLedger,
+            runStartedAt: startTime,
+            logger,
+          })
+        : ({quiet: true} as const)
+      if (!confirmation.quiet) {
+        logger.error('The directory could not be confirmed quiet before a retry; not retrying', {
+          reason: confirmation.reason,
+        })
+        lastError = `${lastError ?? 'The attempt failed'}; not retried because the run could not be stopped (${confirmation.reason})`
+        break
+      }
+      if (heldObservation !== undefined) {
+        await heldObservation.stop()
+        heldObservation = undefined
+      }
+
       logger.warning('LLM fetch error detected, retrying with continuation prompt', {
         attempt,
         maxAttempts: MAX_LLM_RETRIES,
@@ -474,6 +509,7 @@ export async function executeOpenCodeV2(
       classificationPath: final.classificationPath,
       observationGap,
       ...(sendUncertain ? {sendUncertain} : {}),
+      ...heldField(),
     }
   } catch (error) {
     // An explicit, tagged deadline rejection is the one exception that IS a deadline cause, identified by name.
@@ -504,6 +540,7 @@ export async function executeOpenCodeV2(
       classificationPath: transportFailure ? 'fallback' : 'unclassified',
       observationGap,
       ...(sendUncertain ? {sendUncertain} : {}),
+      ...heldField(),
     }
   } finally {
     // Interrupt the root if and only if the selected stopping cause is 'deadline' and a session exists. This never
