@@ -91,11 +91,31 @@ export interface V2InboxSummary {
   readonly queued: number
 }
 
+/** A model as the Action config names it. V2 takes `{id, providerID}` on the wire. */
+export interface V2ModelRef {
+  readonly providerID: string
+  readonly modelID: string
+}
+
+/** A file input of a prompt (`PromptInput.FileAttachment`): the server reads the `file:` URI itself. */
+export interface V2PromptFile {
+  readonly uri: string
+  readonly name?: string
+}
+
+function toWireModel(model: V2ModelRef): {readonly id: string; readonly providerID: string} {
+  return {id: model.modelID, providerID: model.providerID}
+}
+
 export interface RemoteOpenCodeV2Client {
   /** The ledger adapter's view of the session API. `active` and `list` throw when the request fails. */
   readonly session: V2SessionApi
   readonly createSession: (input: {
     readonly directory: string
+    /** Session title (`POST /api/session` takes it at creation). */
+    readonly title?: string
+    readonly agent?: string
+    readonly model?: V2ModelRef
     readonly signal?: AbortSignal
   }) => Promise<Result<{readonly id: string}, V2CallError>>
   readonly getSession: (input: {
@@ -106,6 +126,7 @@ export interface RemoteOpenCodeV2Client {
     readonly sessionId: string
     readonly text: string
     readonly directory: string
+    readonly files?: readonly V2PromptFile[]
     readonly signal?: AbortSignal
   }) => Promise<Result<undefined, V2CallError>>
   readonly interrupt: (input: {
@@ -356,11 +377,16 @@ export function createRemoteOpenCodeV2Client(options: RemoteOpenCodeV2ClientOpti
   return {
     session: {active, list},
 
-    createSession: async ({directory, signal}) => {
+    createSession: async ({directory, title, agent, model, signal}) => {
       const result = await sendJson({
         method: 'POST',
         path: '/api/session',
-        body: {location: {directory}},
+        body: {
+          location: {directory},
+          ...(title === undefined ? {} : {title}),
+          ...(agent === undefined ? {} : {agent}),
+          ...(model === undefined ? {} : {model: toWireModel(model)}),
+        },
         directory,
         ...(signal === undefined ? {} : {signal}),
       })
@@ -387,11 +413,11 @@ export function createRemoteOpenCodeV2Client(options: RemoteOpenCodeV2ClientOpti
       })
     },
 
-    prompt: async ({sessionId, text, directory, signal}) =>
+    prompt: async ({sessionId, text, directory, files, signal}) =>
       sendNoContent({
         method: 'POST',
         path: `/api/session/${encodeURIComponent(sessionId)}/prompt`,
-        body: {text},
+        body: {text, ...(files === undefined || files.length === 0 ? {} : {files})},
         directory,
         ...(signal === undefined ? {} : {signal}),
       }),

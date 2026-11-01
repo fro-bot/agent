@@ -7,7 +7,7 @@ import {formatSdkError, toErrorMessage} from '../shared/errors.js'
 /**
  * Format run summary for session storage.
  */
-function formatSummaryForSession(summary: RunSummary): string {
+export function formatSummaryForSession(summary: RunSummary): string {
   const lines = [
     '--- Fro Bot Run Summary ---',
     `Event: ${summary.eventType}`,

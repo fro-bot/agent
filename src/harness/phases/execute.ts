@@ -9,12 +9,14 @@ import type {
   SessionClient,
   SessionSearchResult,
 } from '@fro-bot/runtime'
+import type {LiveObservationV2} from '../../features/agent/live-observation-v2.js'
 import type {ExecutionConfig, PromptOptions} from '../../features/agent/types.js'
 import type {MetricsCollector} from '../../features/observability/index.js'
 import type {Logger} from '../../shared/logger.js'
 import type {OutputMode, ResolvedOutputMode, TokenUsage} from '../../shared/types.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
-import type {CacheRestorePhaseResult} from './cache-restore.js'
+import type {CacheRestorePhaseResult, CacheRestoreV2PhaseResult} from './cache-restore.js'
+import type {DeferredSummaryV2, ExecutionBackend} from './execution-backend.js'
 import type {RoutingPhaseResult} from './routing.js'
 import type {SessionPrepPhaseResult} from './session-prep.js'
 import * as fs from 'node:fs/promises'
@@ -38,6 +40,8 @@ import {getGitHubWorkspace} from '../../shared/env.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {createLogger} from '../../shared/logger.js'
 import {STATE_KEYS} from '../config/state-keys.js'
+import {isCacheRestoreV2} from './cache-restore-kind.js'
+import {createExecutionBackendV2} from './execute-v2.js'
 import {buildSessionSearchQuery} from './session-prep.js'
 
 export interface ExecutePhaseResult {
@@ -60,6 +64,19 @@ export interface ExecutePhaseResult {
     readonly archivedSessionId: string
     readonly archiveSucceeded: boolean
   }
+  /**
+   * V2 only. The event observation a successful run keeps open for the release to stop (see `live-observation-v2.ts`).
+   * After an overflow recovery this is the replacement run's; the overflowed run's is stopped at the restart.
+   */
+  readonly liveObservation?: LiveObservationV2
+  /**
+   * V2 only. The prompt POST failed after it may have reached the server (see `AttemptResultV2.sendUncertain`): it was not
+   * resent, the run failed, and what the session holds cannot be vouched for. `run.ts` declines the save and vetoes
+   * publication for it.
+   */
+  readonly sendUncertain?: boolean
+  /** V2 only. The run summary held back for the release to write (see `DeferredSummaryV2`). */
+  readonly deferredSummary?: DeferredSummaryV2
   /**
    * The ownership ledger backing this phase's active session (the recovery
    * session's ledger once overflow recovery has run, otherwise the original
@@ -128,10 +145,45 @@ function resolveOutputModeMigration(
   }
 }
 
+/**
+ * The one generation selector of the execute phase. V1 is the exact set of calls `runExecute` always made; V2 is the
+ * sibling in `execute-v2.ts`. Nothing else in this phase branches on the generation.
+ */
+function selectExecutionBackend(cacheRestore: CacheRestorePhaseResult | CacheRestoreV2PhaseResult): ExecutionBackend {
+  if (isCacheRestoreV2(cacheRestore)) return createExecutionBackendV2(cacheRestore)
+
+  const {serverHandle} = cacheRestore
+  return {
+    execute: async (promptOptions, logger, config, ledger) =>
+      executeOpenCode(promptOptions, logger, config, serverHandle, ledger),
+    drainOverflowed: async (ledger, sessionId, logger) =>
+      runDrain({
+        ledger,
+        client: serverHandle.client,
+        parentSessionId: sessionId,
+        directory: getGitHubWorkspace(),
+        deadlineMs: 0,
+        logger,
+      }),
+    archive: async (sessionId, logger) => archiveSession(serverHandle.server.url, sessionId, logger),
+    searchPriorWork: async (query, workspace, excludeSessionIds, logger) =>
+      searchSessions(query, serverHandle.client, workspace, {limit: 5, excludeSessionIds}, logger),
+    findLatestSessionId: async (afterTimestamp, workspace, logger) => {
+      const latestSession = await findLatestSession(serverHandle.client, workspace, afterTimestamp, logger)
+      return latestSession == null ? null : latestSession.session.id
+    },
+    writeSummary: async (sessionId, summary, logger) => {
+      await writeSessionSummary(sessionId, summary, serverHandle.client, logger)
+      return undefined
+    },
+  }
+}
+
 interface ContextOverflowRecoveryOptions {
   readonly bootstrap: BootstrapPhaseResult
   readonly routing: RoutingPhaseResult
-  readonly cacheRestore: CacheRestorePhaseResult
+  /** The generation selected once in `runExecute`; the recovery restart runs on the same one. */
+  readonly backend: ExecutionBackend
   readonly sessionPrep: SessionPrepPhaseResult
   readonly metrics: MetricsCollector
   readonly execLogger: Logger
@@ -149,7 +201,7 @@ async function recoverFromContextOverflow(options: ContextOverflowRecoveryOption
   const {
     bootstrap,
     routing,
-    cacheRestore,
+    backend,
     sessionPrep,
     metrics,
     execLogger,
@@ -169,19 +221,23 @@ async function recoverFromContextOverflow(options: ContextOverflowRecoveryOption
   // cancellation rather than a second implementation; `deadlineMs: 0` skips straight
   // from the unconditional first reconciliation pass to cancellation for anything
   // reconciliation did not already resolve.
-  const overflowedDrainOutcome = await runDrain({
-    ledger: overflowedLedger,
-    client: cacheRestore.serverHandle.client,
-    parentSessionId: overflowedSessionId,
-    directory: getGitHubWorkspace(),
-    deadlineMs: 0,
-    logger: execLogger,
-  })
+  const overflowedDrainOutcome = await backend.drainOverflowed(overflowedLedger, overflowedSessionId, execLogger)
   // Carried forward on the recovery result below (recoveryBoundaryUnresolved) -- the fresh
   // ledger recovery constructs next resets dispatch accounting only, not this fact.
   const recoveryBoundaryUnresolved = overflowedDrainOutcome.unknownCount > 0
 
-  const archiveSucceeded = await archiveSession(cacheRestore.serverHandle.server.url, overflowedSessionId, execLogger)
+  // A stop that could not be confirmed leaves a writer in the directory the replacement session would share. Do not
+  // archive the old session (the next run could not tell it from a finished one) and do not start another: hand the
+  // overflowed result back as it is, incomplete, so the run goes through its normal stop and persistence-decline path.
+  if (overflowedDrainOutcome.restartSafe === false) {
+    execLogger.error('Overflowed session left work running that could not be stopped; skipping the recovery restart', {
+      sessionId: overflowedSessionId,
+      unknownCount: overflowedDrainOutcome.unknownCount,
+    })
+    return {...overflowedResult, recoveryBoundaryUnresolved: true}
+  }
+
+  const archiveSucceeded = await backend.archive(overflowedSessionId, execLogger)
   if (archiveSucceeded === false) {
     execLogger.warning('Overflowed session archive failed; next run may re-continue it', {
       sessionId: overflowedSessionId,
@@ -195,11 +251,10 @@ async function recoverFromContextOverflow(options: ContextOverflowRecoveryOption
   )
   let recoveryPriorWorkContext: readonly SessionSearchResult[] = []
   try {
-    recoveryPriorWorkContext = await searchSessions(
+    recoveryPriorWorkContext = await backend.searchPriorWork(
       recoverySearchQuery,
-      cacheRestore.serverHandle.client,
       sessionPrep.normalizedWorkspace,
-      {limit: 5, excludeSessionIds: [overflowedSessionId]},
+      [overflowedSessionId],
       execLogger,
     )
   } catch (error) {
@@ -247,22 +302,21 @@ async function recoverFromContextOverflow(options: ContextOverflowRecoveryOption
   // unknown, or settled entries from the session it replaces -- its dispatch budget
   // starts clean rather than carrying over an exhausted one.
   const recoveryLedger = createOwnershipLedger()
+  // The overflowed run's event observation (if it kept one) ends here, now that the replacement is certain to start: the
+  // replacement's own observation is the one the result carries to the release. An early return above keeps the
+  // overflowed run's in its result instead, for the release to stop.
+  await overflowedResult.liveObservation?.stop()
   const recoveryStartTime = Date.now()
-  const recoveryExecResult = await executeOpenCode(
+  const recoveryExecResult = await backend.execute(
     recoveryPromptOptions,
     execLogger,
     recoveryExecutionConfig,
-    cacheRestore.serverHandle,
     recoveryLedger,
   )
   const recoverySessionId = await resolveSessionId(recoveryExecResult.sessionId, recoveryStartTime)
 
   if (recoveryExecResult.llmError?.type === 'context_overflow' && recoverySessionId != null) {
-    const recoveryArchiveSucceeded = await archiveSession(
-      cacheRestore.serverHandle.server.url,
-      recoverySessionId,
-      execLogger,
-    )
+    const recoveryArchiveSucceeded = await backend.archive(recoverySessionId, execLogger)
     if (recoveryArchiveSucceeded === false) {
       execLogger.warning('Overflowed recovery session archive failed; next run may re-continue it', {
         sessionId: recoverySessionId,
@@ -279,6 +333,11 @@ async function recoverFromContextOverflow(options: ContextOverflowRecoveryOption
     // The overflowed session's own observation gap and unresolved ownership facts must not
     // be erased by this boundary -- see this field's doc comment and recoveryBoundaryUnresolved's.
     observationGap: overflowedResult.observationGap || recoveryExecResult.observationGap,
+    // Monotonic like the gap above: no replacement can clear the original run's uncertainty. (The guard in `runExecute`
+    // keeps an uncertain run from being replaced at all; this keeps the flag if that ever changes.)
+    ...(overflowedResult.sendUncertain === true || recoveryExecResult.sendUncertain === true
+      ? {sendUncertain: true}
+      : {}),
     recoveryBoundaryUnresolved,
     overflowRecovery: {
       recovered: recoveryExecResult.success,
@@ -294,11 +353,12 @@ async function recoverFromContextOverflow(options: ContextOverflowRecoveryOption
 export async function runExecute(
   bootstrap: BootstrapPhaseResult,
   routing: RoutingPhaseResult,
-  cacheRestore: CacheRestorePhaseResult,
+  cacheRestore: CacheRestorePhaseResult | CacheRestoreV2PhaseResult,
   sessionPrep: SessionPrepPhaseResult,
   metrics: MetricsCollector,
   startTime: number,
 ): Promise<ExecutePhaseResult> {
+  const backend = selectExecutionBackend(cacheRestore)
   const outputModeMigration = resolveOutputModeMigration(
     routing.triggerResult.context.eventType,
     bootstrap.inputs.outputMode,
@@ -375,16 +435,15 @@ export async function runExecute(
       if (candidateSessionId != null) return candidateSessionId
 
       const sessionLogger = createLogger({phase: 'session'})
-      const latestSession = await findLatestSession(
-        cacheRestore.serverHandle.client,
-        sessionPrep.normalizedWorkspace,
+      const latestSessionId = await backend.findLatestSessionId(
         afterTimestamp,
+        sessionPrep.normalizedWorkspace,
         sessionLogger,
       )
-      if (latestSession == null) return null
+      if (latestSessionId == null) return null
 
-      sessionLogger.debug('Identified session from execution', {sessionId: latestSession.session.id})
-      return latestSession.session.id
+      sessionLogger.debug('Identified session from execution', {sessionId: latestSessionId})
+      return latestSessionId
     }
 
     // One ledger per invocation, not per attempt: constructed once here and threaded
@@ -392,13 +451,7 @@ export async function runExecute(
     // and Part 2). Overflow recovery below replaces it with a fresh one rather than
     // reusing this one across the session boundary.
     const ledger = createOwnershipLedger()
-    const execResult = await executeOpenCode(
-      promptOptions,
-      execLogger,
-      executionConfig,
-      cacheRestore.serverHandle,
-      ledger,
-    )
+    const execResult = await backend.execute(promptOptions, execLogger, executionConfig, ledger)
 
     const sessionId = await resolveSessionId(execResult.sessionId, executionStartTime)
 
@@ -420,8 +473,11 @@ export async function runExecute(
       execLogger,
     )
     // Provisioned credentials can hide completed external writes; only a non-provisioned run without a valid response may be replayed.
+    // An uncertain send (the prompt POST failed after it may have reached the server) may already have run: replaying it
+    // would repeat whatever it did, so it is never archived or restarted, whatever else it reports.
     if (
       result.llmError?.type === 'context_overflow' &&
+      result.sendUncertain !== true &&
       credentialProvisioned === false &&
       responseFileStatus === 'absent' &&
       sessionId != null
@@ -429,7 +485,7 @@ export async function runExecute(
       result = await recoverFromContextOverflow({
         bootstrap,
         routing,
-        cacheRestore,
+        backend,
         sessionPrep,
         metrics,
         execLogger,
@@ -476,9 +532,10 @@ export async function runExecute(
     metrics.incrementComments()
   }
 
+  let deferredSummary: DeferredSummaryV2 | undefined
   if (result.sessionId != null) {
     const sessionLogger = createLogger({phase: 'session'})
-    await writeSessionSummary(
+    deferredSummary = await backend.writeSummary(
       result.sessionId,
       {
         eventType: routing.agentContext.eventName,
@@ -493,13 +550,16 @@ export async function runExecute(
         duration: Math.round((Date.now() - startTime) / 1000),
         tokenUsage: result.tokenUsage,
       },
-      cacheRestore.serverHandle.client,
       sessionLogger,
     )
     sessionLogger.debug('Wrote session summary', {sessionId: result.sessionId})
   }
 
-  return {...result, executionDurationMs: Date.now() - executionStartTime}
+  return {
+    ...result,
+    ...(deferredSummary === undefined ? {} : {deferredSummary}),
+    executionDurationMs: Date.now() - executionStartTime,
+  }
 }
 
 /**

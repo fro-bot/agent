@@ -205,7 +205,7 @@ export interface FinalizePhaseOptions {
 export async function runFinalizeWithResult(
   bootstrap: BootstrapPhaseResult,
   routing: RoutingPhaseResult,
-  cacheRestore: CacheRestorePhaseResult,
+  cacheRestore: Pick<CacheRestorePhaseResult, 'cacheStatus'>,
   execution: ExecutePhaseResult,
   metrics: MetricsCollector,
   startTime: number,
@@ -538,7 +538,7 @@ export async function runFinalizeWithResult(
 export async function runFinalize(
   bootstrap: BootstrapPhaseResult,
   routing: RoutingPhaseResult,
-  cacheRestore: CacheRestorePhaseResult,
+  cacheRestore: Pick<CacheRestorePhaseResult, 'cacheStatus'>,
   execution: ExecutePhaseResult,
   metrics: MetricsCollector,
   startTime: number,
