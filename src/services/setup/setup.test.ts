@@ -7,7 +7,7 @@ import * as core from '@actions/core'
 import * as exec from '@actions/exec'
 import * as github from '@actions/github'
 import * as tc from '@actions/tool-cache'
-import {DEFAULT_SYSTEMATIC_VERSION, FRO_BOT_PLUGIN_VERSION} from '@fro-bot/runtime'
+import {DEFAULT_SYSTEMATIC_VERSION, FRO_BOT_PLUGIN_VERSION, resolveSystematicSkillsDirsV1} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {getPlatformInfo, installOpenCode, RECORDED_V2_PIN} from './opencode.js'
 import * as pluginInstallV2 from './plugin-install-v2.js'
@@ -122,9 +122,24 @@ vi.mock('./plugin-install-v2.js', async importOriginal => {
   return {...actual, installPluginsV2: vi.fn(), arePluginsCachedV2: vi.fn()}
 })
 
+// The skills-directory resolver reads the real filesystem, which this suite mocks out; the resolver has its own tests
+// (packages/runtime/src/agent/bundled-skills-dir.test.ts) and this suite covers how setup uses its answer.
+vi.mock('@fro-bot/runtime', async importOriginal => {
+  const actual = await importOriginal<typeof import('@fro-bot/runtime')>()
+  return {...actual, resolveSystematicSkillsDirsV1: vi.fn()}
+})
+
 vi.mock('./systematic-plugin.js', () => ({
   installSystematicPlugin: vi.fn().mockResolvedValue({status: 'installed', duration: 1}),
 }))
+
+/** The OPENCODE_CONFIG_CONTENT values setup exported, in order. */
+function exportedConfigs(): Record<string, unknown>[] {
+  return vi
+    .mocked(core.exportVariable)
+    .mock.calls.filter(([name]) => name === 'OPENCODE_CONFIG_CONTENT')
+    .map(([, value]) => JSON.parse(String(value)) as Record<string, unknown>)
+}
 
 describe('setup', () => {
   const originalEnv = process.env
@@ -179,6 +194,7 @@ describe('setup', () => {
     vi.mocked(systematicPlugin.installSystematicPlugin).mockResolvedValue({status: 'installed', duration: 1})
     vi.mocked(pluginInstallV2.arePluginsCachedV2).mockResolvedValue(false)
     vi.mocked(pluginInstallV2.installPluginsV2).mockResolvedValue({success: true, data: undefined})
+    vi.mocked(resolveSystematicSkillsDirsV1).mockResolvedValue([])
   })
 
   afterEach(() => {
@@ -689,6 +705,91 @@ describe('setup', () => {
 
         vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({hit: false, restoredKey: null})
         vi.mocked(toolsCache.saveToolsCache).mockResolvedValue(true)
+      })
+
+      describe('bundled Systematic skills directory', () => {
+        const SKILLS_DIR =
+          '/home/runner/.cache/opencode/packages/@fro.bot/systematic@2.1.0/node_modules/@fro.bot/systematic/skills'
+
+        it('resolves the directory after the Systematic install, from the cache home and the installed version', async () => {
+          // #given the plugin install produces the directory
+          process.env.XDG_CACHE_HOME = '/custom/cache'
+          vi.mocked(resolveSystematicSkillsDirsV1).mockResolvedValue([SKILLS_DIR])
+
+          // #when
+          await runSetup(createSetupInputs(), 'ghs_test_token')
+
+          // #then it is looked up where OpenCode installs (honouring XDG_CACHE_HOME), for the version installed,
+          // and only once the install has run: on a cache miss the directory does not exist before
+          expect(resolveSystematicSkillsDirsV1).toHaveBeenCalledWith('/custom/cache', '2.1.0', expect.anything())
+          const installOrder = vi.mocked(systematicPlugin.installSystematicPlugin).mock.invocationCallOrder[0] ?? 0
+          const resolveOrder = vi.mocked(resolveSystematicSkillsDirsV1).mock.invocationCallOrder[0] ?? 0
+          expect(resolveOrder).toBeGreaterThan(installOrder)
+        })
+
+        it('re-allows exactly that directory in the config the server loads, after the deny', async () => {
+          // #given
+          vi.mocked(resolveSystematicSkillsDirsV1).mockResolvedValue([SKILLS_DIR])
+
+          // #when
+          await runSetup(createSetupInputs(), 'ghs_test_token')
+
+          // #then the last exported config carries the allow behind the build agent's wildcard deny
+          const final = exportedConfigs().at(-1) as {
+            permission: {external_directory: Record<string, string>}
+            agent: {build: {permission: {external_directory: Record<string, string>}}}
+          }
+          const buildRules = Object.entries(final.agent.build.permission.external_directory)
+          expect(buildRules.at(-1)).toEqual([`${SKILLS_DIR}/*`, 'allow'])
+          expect(buildRules[0]).toEqual(['*', 'deny'])
+          expect(final.permission.external_directory[`${SKILLS_DIR}/*`]).toBe('allow')
+          // #then the file the config is persisted to matches what is exported
+          const written = vi
+            .mocked(fs.writeFile)
+            .mock.calls.filter(([target]) => String(target).endsWith('opencode.json'))
+            .map(([, data]) => String(data))
+            .at(-1)
+          expect(JSON.parse(written ?? '{}')).toEqual(final)
+        })
+
+        it('writes the config before any install too, so an invalid opencode-config still fails first', async () => {
+          // #given
+          vi.mocked(resolveSystematicSkillsDirsV1).mockResolvedValue([SKILLS_DIR])
+
+          // #when
+          await runSetup(createSetupInputs(), 'ghs_test_token')
+
+          // #then a first, directory-less write precedes the install and the second follows it
+          const exportOrders = vi
+            .mocked(core.exportVariable)
+            .mock.calls.flatMap(([name], index) =>
+              name === 'OPENCODE_CONFIG_CONTENT'
+                ? [vi.mocked(core.exportVariable).mock.invocationCallOrder[index] ?? 0]
+                : [],
+            )
+          const installOrder = vi.mocked(systematicPlugin.installSystematicPlugin).mock.invocationCallOrder[0] ?? 0
+          expect(exportOrders).toHaveLength(2)
+          expect(exportOrders[0]).toBeLessThan(installOrder)
+          expect(exportOrders[1]).toBeGreaterThan(installOrder)
+          expect(JSON.stringify(exportedConfigs()[0])).not.toContain(SKILLS_DIR)
+        })
+
+        it('warns and adds nothing when the directory cannot be resolved, without failing the run', async () => {
+          // #given the plugin is not installed
+          vi.mocked(resolveSystematicSkillsDirsV1).mockResolvedValue([])
+
+          // #when
+          const result = await runSetup(createSetupInputs(), 'ghs_test_token')
+
+          // #then setup still succeeds, says so once, and writes the config only once, without a skills rule
+          expect(result).not.toBeNull()
+          expect(core.setFailed).not.toHaveBeenCalled()
+          expect(core.warning).toHaveBeenCalledWith(
+            expect.stringContaining('Bundled Systematic skills directory not found'),
+          )
+          expect(exportedConfigs()).toHaveLength(1)
+          expect(JSON.stringify(exportedConfigs()[0])).not.toContain('/skills')
+        })
       })
 
       it('calls restoreToolsCache before install functions', async () => {

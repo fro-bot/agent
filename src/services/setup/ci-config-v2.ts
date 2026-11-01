@@ -25,6 +25,18 @@ export interface CIConfigV2Inputs {
   readonly runAttempt: string | number
   readonly integrationWorkDir?: string
   /**
+   * The installed Systematic `skills/` directory (`resolveSystematicSkillsDirsV2`), so a skill can read its own
+   * references and run its own scripts under the outside-checkout deny (fro-bot/agent#2009). Becomes an authorized
+   * exception of the permission gate. Empty or absent when unresolved: nothing is added.
+   *
+   * SECURITY: `external_directory` is not read-only, so this also lets a shell command write there during the run. The
+   * `edit`, `write` and `patch` tools are denied for the directory (V2 asks `edit` about the absolute path outside the
+   * checkout, so the absolute resource matches). On a hosted runner the tools cache is saved during setup, before the
+   * agent runs, so a write does not persist; a persistent or self-hosted runner keeps it, as it is the plugin's real
+   * install location.
+   */
+  readonly bundledSkillsDirectories?: readonly string[]
+  /**
    * Provider id to the absolute path of the file holding that provider's API key (`credential-files-v2.ts`). Each is
    * referenced as `provider.<id>.options.apiKey: "{file:/path}"`. The V1-shaped `options` is what the server migrates
    * into V2 `settings`, including the V1-to-V2 provider id mapping, so a provider id from `auth-json` and one from
@@ -165,9 +177,12 @@ export function buildCIConfigV2(inputs: CIConfigV2Inputs, logger: Logger): Resul
     logger.debug('Skipping response-file and attachment exceptions: RUNNER_TEMP is not set')
   }
 
+  const bundledSkillsDirectories = inputs.bundledSkillsDirectories ?? []
+
   const rules = buildPermissionRulesV2({
     outsideEffect: 'deny',
     allowedExternalDirectories: allowedDirectories,
+    bundledSkillsDirectories,
     editDenyResources,
     denyQuestion: true,
   })
@@ -205,7 +220,7 @@ export function buildCIConfigV2(inputs: CIConfigV2Inputs, logger: Logger): Resul
     content,
     expectations: {
       outsidePolicy: 'deny',
-      allowedDirectories,
+      allowedDirectories: [...allowedDirectories, ...bundledSkillsDirectories],
       deniedActions: FORBIDDEN_TOOL_ACTIONS_V2,
     },
   })

@@ -1,11 +1,11 @@
-import type {OpenCodeInstallResult, SetupInputs, SetupResult} from './types.js'
+import type {Logger, OpenCodeInstallResult, SetupInputs, SetupResult} from './types.js'
 import {mkdir, writeFile} from 'node:fs/promises'
 import {homedir} from 'node:os'
 import {join} from 'node:path'
 import process from 'node:process'
 import * as core from '@actions/core'
 import {getOctokit} from '@actions/github'
-import {FRO_BOT_PLUGIN_VERSION} from '@fro-bot/runtime'
+import {FRO_BOT_PLUGIN_VERSION, resolveSystematicSkillsDirsV1} from '@fro-bot/runtime'
 import {getRunnerOS, getXdgDataHome} from '../../shared/env.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {createLogger} from '../../shared/logger.js'
@@ -37,6 +37,13 @@ import {restoreToolsCache, saveToolsCache} from './tools-cache.js'
 function isTruthyFlag(value: string | undefined): boolean {
   const normalized = value?.trim().toLowerCase() ?? ''
   return normalized !== '' && !['0', 'false', 'no', 'off', 'n'].includes(normalized)
+}
+
+const quietLogger: Logger = {
+  debug: () => undefined,
+  info: () => undefined,
+  warning: () => undefined,
+  error: () => undefined,
 }
 
 export async function runSetup(inputs: SetupInputs, githubToken: string): Promise<SetupResult | null> {
@@ -180,18 +187,23 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
     // V1 writes its config here. V2 builds its config at spawn time (`buildCIConfigV2`, called from the cache-restore
     // phase): it carries run-scoped paths and the provider key files, and must exist even when this setup is skipped
     // because a matching binary is already installed. Nothing V2 is written to the global config or exported.
-    if (v2Specs === undefined) {
+    //
+    // Written once here so an invalid `opencode-config` fails before any install, and once more after the Systematic
+    // install when the installed skills directory could be resolved (it does not exist yet on a cache miss). The second
+    // build gets a muted logger: its warnings repeat the first build's.
+    const writeV1Config = async (systematicSkillsDirs: readonly string[], buildLogger: Logger): Promise<boolean> => {
       const ciConfigResult = buildCIConfig(
         {
           opencodeConfig: inputs.opencodeConfig,
           systematicVersion,
           integrationWorkDir: process.env.FRO_BOT_INTEGRATION_WORK_DIR,
+          systematicSkillsDirs,
         },
-        logger,
+        buildLogger,
       )
       if (ciConfigResult.error != null) {
         core.setFailed(ciConfigResult.error)
-        return null
+        return false
       }
 
       const opencodeConfigPath = join(configDir, 'opencode.json')
@@ -205,6 +217,10 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
         path: opencodeConfigPath,
         pluginCount: Array.isArray(ciConfigResult.config.plugin) ? ciConfigResult.config.plugin.length : 0,
       })
+      return true
+    }
+    if (v2Specs === undefined && !(await writeV1Config([], logger))) {
+      return null
     }
 
     core.addPath(opencodeResult.path)
@@ -285,6 +301,26 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
           status: systematicPluginInstall.status,
         })
         core.warning(warningMessage)
+      }
+    }
+
+    // The bundled skills' own references and scripts live in the installed package, outside the checkout, and the
+    // build agent's `external_directory` deny shadows the allow OpenCode adds for them (fro-bot/agent#2009). Re-allow
+    // that one directory. Unresolved (the plugin is not installed, or the install failed): say so and add nothing,
+    // since the run can still do useful work without the skills' supporting files.
+    if (v2Specs === undefined) {
+      const systematicSkillsDirs = await resolveSystematicSkillsDirsV1(
+        resolveCacheHome(process.env),
+        systematicVersion,
+        logger,
+      )
+      if (systematicSkillsDirs.length === 0) {
+        logger.warning(
+          'Bundled Systematic skills directory not found; skills cannot read their own references under the external_directory deny',
+          {systematicVersion},
+        )
+      } else if (!(await writeV1Config(systematicSkillsDirs, quietLogger))) {
+        return null
       }
     }
 

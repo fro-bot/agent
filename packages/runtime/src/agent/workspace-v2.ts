@@ -14,6 +14,8 @@ export {
 
 export type {Logger} from '../shared/logger.js'
 
+export {resolveSystematicSkillsDirsV2} from './bundled-skills-dir.js'
+
 export {
   boundedCredentialRequest,
   credentialFailure,

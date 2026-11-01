@@ -439,4 +439,102 @@ describe('buildCIConfigV2', () => {
       expect(evaluatePermissionV2('question', '*', permissionsOf(content))).toBe('deny')
     })
   })
+
+  describe('bundled Systematic skills directory (fro-bot/agent#2009)', () => {
+    const PACKAGE =
+      '/home/runner/.cache/opencode/npm/@fro.bot/systematic@9.9.9/1800000000000/node_modules/@fro.bot/systematic'
+    const SKILLS = `${PACKAGE}/skills`
+
+    it('lets a skill read its references and run its scripts, and nothing else outside the checkout', () => {
+      // #given
+      const {content} = build({bundledSkillsDirectories: [SKILLS]})
+      const rules = permissionsOf(content)
+
+      // #then
+      expect(evaluatePermissionV2('external_directory', `${SKILLS}/*`, rules)).toBe('allow')
+      expect(evaluatePermissionV2('external_directory', `${SKILLS}/ce-review/references/*`, rules)).toBe('allow')
+      expect(evaluatePermissionV2('external_directory', `${PACKAGE}/*`, rules)).toBe('deny')
+      expect(evaluatePermissionV2('external_directory', `${PACKAGE}/dist/*`, rules)).toBe('deny')
+      expect(evaluatePermissionV2('external_directory', '/home/runner/.cache/opencode/*', rules)).toBe('deny')
+      expect(evaluatePermissionV2('external_directory', '/etc/*', rules)).toBe('deny')
+      // #then the response and attachment exceptions are untouched
+      expect(evaluatePermissionV2('external_directory', `${RESPONSE_DIR}/*`, rules)).toBe('allow')
+      expect(evaluatePermissionV2('external_directory', `${ATTACHMENT_DIR}/*`, rules)).toBe('allow')
+    })
+
+    it('denies the edit tools there (V2 asks `edit` about the absolute path outside the checkout)', () => {
+      const rules = permissionsOf(build({bundledSkillsDirectories: [SKILLS]}).content)
+
+      expect(evaluatePermissionV2('edit', `${SKILLS}/ce-review/scripts/validate-review.mjs`, rules)).toBe('deny')
+      expect(evaluatePermissionV2('edit', `${PACKAGE}/package.json`, rules)).not.toBe('deny')
+      expect(evaluatePermissionV2('edit', 'src/index.ts', rules)).not.toBe('deny')
+    })
+
+    it('denies edits through every granted spelling, including a real path outside the cache layout', () => {
+      // #given the lexical path and a real path elsewhere (a symlinked cache)
+      const REAL = '/mnt/agent-cache/@fro.bot/systematic/skills'
+      const rules = permissionsOf(build({bundledSkillsDirectories: [SKILLS, REAL]}).content)
+
+      // #then each is readable and neither is writable through the edit tools
+      for (const dir of [SKILLS, REAL]) {
+        expect(evaluatePermissionV2('external_directory', `${dir}/*`, rules)).toBe('allow')
+        expect(evaluatePermissionV2('edit', `${dir}/ce-review/scripts/validate-review.mjs`, rules)).toBe('deny')
+      }
+    })
+
+    it('is an authorized exception of the permission gate, so the real gate passes', async () => {
+      // #given
+      const {content, expectations} = build({bundledSkillsDirectories: [SKILLS]})
+      const agents = [
+        {id: 'build', permissions: [{action: '*', resource: '*', effect: 'allow'}, ...permissionsOf(content)]},
+        {
+          id: 'explore',
+          permissions: [{action: 'external_directory', resource: '*', effect: 'allow'}, ...permissionsOf(content)],
+        },
+      ]
+
+      // #when
+      const result = await verifyPermissionRules(
+        {listAgents: async () => ({location: {}, data: agents})},
+        expectations,
+        createMockLogger(),
+      )
+
+      // #then
+      expect(expectations.allowedDirectories).toContain(SKILLS)
+      expect(result.success).toBe(true)
+    })
+
+    it('still fails the gate when an allow that is not an authorized exception follows the boundary', async () => {
+      const {content, expectations} = build({bundledSkillsDirectories: [SKILLS]})
+      const agents = [
+        {
+          id: 'build',
+          permissions: [
+            ...permissionsOf(content),
+            {action: 'external_directory', resource: `${PACKAGE}/*`, effect: 'allow'},
+          ],
+        },
+      ]
+
+      const result = await verifyPermissionRules(
+        {listAgents: async () => ({location: {}, data: agents})},
+        expectations,
+        createMockLogger(),
+      )
+
+      expect(result.success).toBe(false)
+    })
+
+    it('adds nothing when no directory is given', () => {
+      expect(build().content).toEqual(build({bundledSkillsDirectories: []}).content)
+      expect(JSON.stringify(build().content)).not.toContain('node_modules')
+    })
+
+    it.each(['skills', '/cache/skills?', '/cache/*/skills', '/'])('refuses the unusable directory %j', directory => {
+      expect(buildCIConfigV2({...BASE_INPUTS, bundledSkillsDirectories: [directory]}, createMockLogger()).success).toBe(
+        false,
+      )
+    })
+  })
 })

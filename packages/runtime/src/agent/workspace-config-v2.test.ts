@@ -74,6 +74,96 @@ describe('buildWorkspaceConfigV2', () => {
     expect(expectations.allowedDirectories).toEqual(['/var/lib/fro-bot/shared'])
   })
 
+  describe('bundled skills directory', () => {
+    const PACKAGE =
+      '/home/opencode/.cache/opencode/npm/@fro.bot/systematic@9.9.9/1800000000000/node_modules/@fro.bot/systematic'
+    const SKILLS = `${PACKAGE}/skills`
+
+    it('reads skill references without an ask, and nothing else outside the checkout', () => {
+      // #given
+      const {content} = build({plugins: [], bundledSkillsDirectories: [SKILLS]})
+      const rules = rulesOf(content)
+
+      // #then the skills directory is allowed
+      expect(evaluatePermissionV2('external_directory', `${SKILLS}/*`, rules)).toBe('allow')
+      // #then a sibling inside the package, the package root, the cache and an unrelated path still ask
+      expect(evaluatePermissionV2('external_directory', `${PACKAGE}/*`, rules)).toBe('ask')
+      expect(evaluatePermissionV2('external_directory', `${PACKAGE}/dist/*`, rules)).toBe('ask')
+      expect(evaluatePermissionV2('external_directory', '/home/opencode/.cache/opencode/*', rules)).toBe('ask')
+      expect(evaluatePermissionV2('external_directory', '/etc/*', rules)).toBe('ask')
+    })
+
+    it('denies the edit, write and patch tools there, and leaves other external edits alone', () => {
+      // #given
+      const rules = rulesOf(build({plugins: [], bundledSkillsDirectories: [SKILLS]}).content)
+
+      // #then V2 asks `edit` about the absolute path of a file outside the checkout
+      expect(evaluatePermissionV2('edit', `${SKILLS}/ce-review/scripts/validate-review.mjs`, rules)).toBe('deny')
+      expect(evaluatePermissionV2('edit', `${SKILLS}/ce-review/references/x.md`, rules)).toBe('deny')
+      expect(evaluatePermissionV2('edit', `${PACKAGE}/package.json`, rules)).toBe('ask')
+      expect(evaluatePermissionV2('edit', 'src/index.ts', rules)).toBe('ask')
+    })
+
+    it('denies edits through every granted spelling, including a real path outside the cache layout', () => {
+      // #given the lexical path and a real path elsewhere (a symlinked cache)
+      const REAL = '/mnt/agent-cache/@fro.bot/systematic/skills'
+      const rules = rulesOf(build({plugins: [], bundledSkillsDirectories: [SKILLS, REAL]}).content)
+
+      // #then each is readable and neither is writable through the edit tools
+      for (const dir of [SKILLS, REAL]) {
+        expect(evaluatePermissionV2('external_directory', `${dir}/*`, rules)).toBe('allow')
+        expect(evaluatePermissionV2('edit', `${dir}/ce-review/scripts/validate-review.mjs`, rules)).toBe('deny')
+      }
+    })
+
+    it('is an authorized exception, so the permission gate passes for every agent', async () => {
+      // #given
+      const {content, expectations} = build({plugins: [], bundledSkillsDirectories: [SKILLS]})
+      const configured = rulesOf(content)
+      const agents = [
+        {id: 'build', permissions: [{action: '*', resource: '*', effect: 'allow'}, ...configured]},
+        {id: 'explore', permissions: [{action: 'external_directory', resource: '*', effect: 'allow'}, ...configured]},
+      ]
+
+      // #when
+      const result = await verifyPermissionRules(
+        {listAgents: async () => ({location: {}, data: agents})},
+        expectations,
+        makeLogger(),
+      )
+
+      // #then
+      expect(expectations.allowedDirectories).toEqual([SKILLS])
+      expect(result.success).toBe(true)
+    })
+
+    it('is not tolerated by the gate when the expectations do not name it', async () => {
+      // #given rules carrying the skills allow, checked against expectations that do not authorize it
+      const {content} = build({plugins: [], bundledSkillsDirectories: [SKILLS]})
+      const {expectations} = build({plugins: []})
+      const agents = [{id: 'build', permissions: rulesOf(content)}]
+
+      // #when
+      const result = await verifyPermissionRules(
+        {listAgents: async () => ({location: {}, data: agents})},
+        expectations,
+        makeLogger(),
+      )
+
+      // #then an allow the gate does not know about fails it
+      expect(result.success).toBe(false)
+    })
+
+    it.each(['skills', '/srv/skills?', '/srv/*/skills', '/'])(
+      'rejects the unusable directory %j instead of widening it',
+      directory => {
+        expect(buildWorkspaceConfigV2({plugins: [], bundledSkillsDirectories: [directory]}, makeLogger()).success).toBe(
+          false,
+        )
+      },
+    )
+  })
+
   it('keeps question so the gateway can relay it, and still denies .env and the two tools', () => {
     // #given / #when
     const rules = rulesOf(build().content)

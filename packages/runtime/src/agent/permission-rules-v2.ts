@@ -60,6 +60,15 @@ export interface PermissionRulesInput {
   readonly allowedExternalDirectories: readonly string[]
   /** `edit` resources denied outright, for example workspace-relative shadows of the response-file directory. */
   readonly editDenyResources: readonly string[]
+  /**
+   * The installed Systematic `skills/` directory, so a skill can read its own `references/` and run its `scripts/`
+   * (`bundled-skills-dir.ts`). Handled like `allowedExternalDirectories`, with one addition: the same directory is
+   * denied for `edit`, so the edit, write and patch tools cannot rewrite a validator the run then trusts. V2 asks `edit`
+   * about the absolute path for a file outside the checkout (`file-access.ts` `resolve`), so the absolute `<dir>/*`
+   * resource matches. Shell commands are not an `edit` request: `bash` can still write there, which is why this is
+   * defence in depth and not a read-only grant. Callers list these in the gate's `allowedDirectories` too.
+   */
+  readonly bundledSkillsDirectories?: readonly string[]
   /** Deny `question`. Set in the Action, where nobody can answer. */
   readonly denyQuestion: boolean
 }
@@ -69,14 +78,15 @@ export interface PermissionRulesInput {
  * Fails when an exception directory is not a literal absolute path (see `validateExceptionDirectory`).
  */
 export function buildPermissionRulesV2(input: PermissionRulesInput): Result<readonly PermissionRuleV2[], string> {
-  for (const directory of input.allowedExternalDirectories) {
+  const skillsDirectories = input.bundledSkillsDirectories ?? []
+  for (const directory of [...input.allowedExternalDirectories, ...skillsDirectories]) {
     const valid = validateExceptionDirectory(directory)
     if (!valid.success) return valid
   }
 
   const rules: PermissionRuleV2[] = [{action: 'external_directory', resource: '*', effect: input.outsideEffect}]
 
-  for (const directory of input.allowedExternalDirectories) {
+  for (const directory of [...input.allowedExternalDirectories, ...skillsDirectories]) {
     rules.push({action: 'external_directory', resource: externalDirectoryResource(directory), effect: 'allow'})
   }
 
@@ -89,7 +99,7 @@ export function buildPermissionRulesV2(input: PermissionRulesInput): Result<read
     )
   }
 
-  for (const resource of input.editDenyResources) {
+  for (const resource of [...input.editDenyResources, ...skillsDirectories.map(externalDirectoryResource)]) {
     rules.push({action: 'edit', resource, effect: 'deny'})
   }
 

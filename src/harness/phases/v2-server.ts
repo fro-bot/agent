@@ -8,6 +8,7 @@ import {
   clearHeldClaims,
   FRO_BOT_PLUGIN_ID,
   modelProviderId,
+  resolveSystematicSkillsDirsV2,
   spawnConfigFromConfig,
   startOpenCodeV2Server,
   SYSTEMATIC_V2_PLUGIN_ID,
@@ -40,13 +41,14 @@ import {readV1DatabaseFacts, waitForV1Import} from './v1-import-wait.js'
  * 1. Credentials. `auth-json` is narrowed to API-key entries, each written to its own 0600 file outside every cached
  *    path (`credential-files-v2.ts`), and any `auth.json` already at the XDG path (a restore, an earlier run) is deleted so
  *    V2's m39 migration has nothing to import into the database the post hook saves.
- * 2. Config. `buildCIConfigV2` (the outside-directory deny with run-scoped exceptions, `question` denied, the plugins)
- *    plus a `{file:}` reference per key file.
- * 3. Plugin preparation. Setup installs both plugins under their own bound, but a matching binary that is already
+ * 2. Plugin preparation. Setup installs both plugins under their own bound, but a matching binary that is already
  *    installed skips setup, and a missing plugin would then install during server readiness, whose deadline is shorter
  *    than the healthy install tail (181-370 s measured; the bound is 420 s). So this runs before every spawn,
  *    whatever setup or the tools cache did: a cache that already holds both exact specs costs two directory reads, and
  *    anything else gets the bounded installer.
+ * 3. Config. `buildCIConfigV2` (the outside-directory deny with run-scoped exceptions, `question` denied, the plugins)
+ *    plus a `{file:}` reference per key file. After the plugins, because one exception is the installed Systematic
+ *    skills directory (fro-bot/agent#2009), and its generation directory only exists once the plugin is cached.
  * 4. Held claims. `clearHeldClaims` runs on the restored database before the spawn: a V2 server resumes a claim a
  *    killed run left behind. A fresh database, a V1 database (no claim tables) and a database no V2 server opened are
  *    no-ops.
@@ -152,24 +154,7 @@ export async function startActionOpenCodeV2(
   })
   if (!files.success) return stageError('credentials', files.error.message)
 
-  // --- 2. Config ---------------------------------------------------------------------------------------------
-  const built = buildCIConfigV2(
-    {
-      opencodeConfig: options.opencodeConfig,
-      plugins: specs.data.specs,
-      runnerTemp: options.env.RUNNER_TEMP,
-      runId: options.runId,
-      runAttempt: options.runAttempt,
-      ...(options.env.FRO_BOT_INTEGRATION_WORK_DIR === undefined
-        ? {}
-        : {integrationWorkDir: options.env.FRO_BOT_INTEGRATION_WORK_DIR}),
-      providerKeyFiles: files.data.keyFiles,
-    },
-    logger,
-  )
-  if (!built.success) return stageError('config', `Invalid OpenCode configuration: ${built.error}`)
-
-  // --- 3. Plugin preparation ---------------------------------------------------------------------------------
+  // --- 2. Plugin preparation ---------------------------------------------------------------------------------
   const cacheHome = resolveCacheHome(options.env)
   if (await arePluginsCachedV2(cacheHome, specs.data.specs)) {
     logger.info('OpenCode V2 plugins already in the cache', {specs: specs.data.specs})
@@ -183,6 +168,34 @@ export async function startActionOpenCodeV2(
     })
     if (!installed.success) return stageError('plugins', `OpenCode plugin install failed: ${installed.error.message}`)
   }
+
+  // --- 3. Config ---------------------------------------------------------------------------------------------
+  //
+  // After the plugins on purpose: the config names the installed Systematic skills directory, which does not exist
+  // until the plugin is in the cache.
+  const bundledSkillsDirectories = await resolveSystematicSkillsDirsV2(cacheHome, specs.data.systematicVersion, logger)
+  if (bundledSkillsDirectories.length === 0) {
+    logger.warning(
+      'Bundled Systematic skills directory not found; skills cannot read their own references under the external_directory deny',
+      {systematicVersion: specs.data.systematicVersion},
+    )
+  }
+  const built = buildCIConfigV2(
+    {
+      opencodeConfig: options.opencodeConfig,
+      plugins: specs.data.specs,
+      runnerTemp: options.env.RUNNER_TEMP,
+      runId: options.runId,
+      runAttempt: options.runAttempt,
+      ...(options.env.FRO_BOT_INTEGRATION_WORK_DIR === undefined
+        ? {}
+        : {integrationWorkDir: options.env.FRO_BOT_INTEGRATION_WORK_DIR}),
+      providerKeyFiles: files.data.keyFiles,
+      bundledSkillsDirectories,
+    },
+    logger,
+  )
+  if (!built.success) return stageError('config', `Invalid OpenCode configuration: ${built.error}`)
 
   // --- 4. Held claims ----------------------------------------------------------------------------------------
   const facts = deps.readDatabaseFacts(options.dbPath)

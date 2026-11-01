@@ -226,6 +226,124 @@ describe('startActionOpenCodeV2', () => {
     expect(calls).toEqual(['clear-claims', 'spawn', 'import-wait'])
   })
 
+  describe('bundled Systematic skills directory', () => {
+    const SYSTEMATIC_SPEC = PLUGIN_SPECS[0] as string
+
+    /** The installer's layout: `<cache>/opencode/npm/<spec>/<generation>/node_modules/<name>/skills`. */
+    function installSkills(generation = '1800000000000'): string {
+      const skills = path.join(
+        pluginCacheDir(cacheHome, SYSTEMATIC_SPEC),
+        generation,
+        'node_modules',
+        '@fro.bot',
+        'systematic',
+        'skills',
+      )
+      fs.mkdirSync(skills, {recursive: true})
+      return skills
+    }
+
+    interface PermissionRule {
+      action: string
+      resource: string
+      effect: string
+    }
+    function spawnedRules(deps: Partial<StartActionOpenCodeV2Deps>): PermissionRule[] {
+      const config = vi.mocked(deps.startServer as StartServer).mock.calls[0]?.[0].config
+      return (config?.permissions ?? []) as PermissionRule[]
+    }
+
+    it('allows the installed directory, denies the edit tools there, and the permission gate accepts it', async () => {
+      // #given the plugin is cached with its skills
+      const skills = installSkills()
+      const deps = recordingDeps(fakeServer())
+
+      // #when the run starts, through the real permission gate
+      const result = await startActionOpenCodeV2(options({deps}))
+
+      // #then the gate passed with the directory as an authorized exception
+      expect(result.success).toBe(true)
+      const rules = spawnedRules(deps)
+      expect(rules).toEqual(
+        expect.arrayContaining([
+          {action: 'external_directory', resource: `${skills}/*`, effect: 'allow'},
+          {action: 'edit', resource: `${skills}/*`, effect: 'deny'},
+        ]),
+      )
+      // #then it is the only skills-shaped exception (plus its real path when the temp dir is behind a symlink): the
+      // package and the cache stay behind the deny
+      const skillsSpellings = new Set([`${skills}/*`, `${fs.realpathSync(skills)}/*`])
+      const nodeModulesAllows = rules.filter(
+        rule => rule.action === 'external_directory' && rule.resource.includes('/node_modules/'),
+      )
+      expect(nodeModulesAllows.length).toBeGreaterThan(0)
+      expect(nodeModulesAllows.every(rule => rule.effect === 'allow' && skillsSpellings.has(rule.resource))).toBe(true)
+    })
+
+    it('uses the newest generation, the one the server loads', async () => {
+      // #given two generations of the cached plugin
+      installSkills('1700000000000')
+      const newest = installSkills('1800000000000')
+      const deps = recordingDeps(fakeServer())
+
+      // #when
+      await startActionOpenCodeV2(options({deps}))
+
+      // #then
+      const allowed = spawnedRules(deps).filter(rule => rule.action === 'external_directory' && rule.effect === 'allow')
+      expect(allowed.map(rule => rule.resource)).toContain(`${newest}/*`)
+      expect(allowed.map(rule => rule.resource).join()).not.toContain('1700000000000')
+    })
+
+    it('finds a directory the bounded installer has only just created', async () => {
+      // #given an empty cache, so the installer runs before the config is built
+      fs.rmSync(cacheHome, {recursive: true, force: true})
+      let skills = ''
+      const deps = recordingDeps(fakeServer(), {
+        installPlugins: vi.fn<InstallPlugins>(async () => {
+          populatePluginCache(cacheHome)
+          skills = installSkills()
+          return ok(undefined)
+        }),
+      })
+
+      // #when
+      const result = await startActionOpenCodeV2(options({deps}))
+
+      // #then
+      expect(result.success).toBe(true)
+      expect(spawnedRules(deps)).toEqual(
+        expect.arrayContaining([{action: 'external_directory', resource: `${skills}/*`, effect: 'allow'}]),
+      )
+    })
+
+    it('warns and adds nothing when the directory is not there, without failing the run', async () => {
+      // #given the default warm cache holds only package.json files
+      const logger = createMockLogger()
+      const deps = recordingDeps(fakeServer())
+
+      // #when
+      const result = await startActionOpenCodeV2(options({deps, logger}))
+
+      // #then
+      expect(result.success).toBe(true)
+      expect(logger.warning).toHaveBeenCalledWith(
+        expect.stringContaining('Bundled Systematic skills directory not found'),
+        expect.anything(),
+      )
+      expect(
+        spawnedRules(deps).filter(rule => rule.effect === 'allow' && rule.action === 'external_directory'),
+      ).toEqual(
+        spawnedRules(deps).filter(
+          rule =>
+            rule.effect === 'allow' &&
+            rule.action === 'external_directory' &&
+            !rule.resource.includes('/node_modules/'),
+        ),
+      )
+    })
+  })
+
   it('installs when only one of the two plugins is cached', async () => {
     // #given a cache that lost the fro.bot plugin
     fs.rmSync(pluginCacheDir(cacheHome, PLUGIN_SPECS[1] as string), {recursive: true, force: true})
