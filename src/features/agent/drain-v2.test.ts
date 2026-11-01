@@ -171,6 +171,33 @@ describe('drainUntilQuietV2', () => {
     expect(ledger.isDrainComplete()).toBe(true)
   })
 
+  it('does not pass while ownership becomes unresolved inside the quiet window, and starts the window over', async () => {
+    // #given a directory that has been quiet for part of its window, and a child adopted then (a late dispatch)
+    const server = createServer()
+    const ledger = createOwnershipLedger()
+    const stability = {requiredObservations: 6, minSpacingMs: 10, minSpanMs: 50} as const
+    const adoptedAt = 25
+    const finishedAt = 160
+    const startedAt = Date.now()
+    later(adoptedAt, () => {
+      ledger.adopt(CHILD, 'late child')
+      server.state.sessions.set(CHILD, {parentID: ROOT, directory: DIRECTORY})
+      server.state.active.add(CHILD)
+    })
+    later(finishedAt, () => server.state.active.delete(CHILD))
+
+    // #when
+    const outcome = await drainUntilQuietV2(context(server, {ledger, stability}), {
+      deadlineMs: 5_000,
+      pollIntervalMs: 5,
+    })
+
+    // #then it did not release on the window that began before the child, and the child was accounted for
+    expect(outcome).toEqual({kind: 'quiet'})
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(finishedAt)
+    expect(ledger.isDrainComplete()).toBe(true)
+  })
+
   it('waits for a child the ledger never adopted that is running in the directory', async () => {
     // #given
     const server = createServer()

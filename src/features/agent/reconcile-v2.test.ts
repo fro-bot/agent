@@ -145,6 +145,36 @@ describe('createOwnedWorkReconcilerV2', () => {
     vi.useRealTimers()
   })
 
+  it('lets a pass still pending at dispose change nothing when it finally answers', async () => {
+    // #given a reconcile pass held open on its active-session read, for a child that has in fact finished
+    let answer!: (value: Record<string, unknown>) => void
+    const late = new Promise<Record<string, unknown>>(resolve => {
+      answer = resolve
+    })
+    const ledger = createOwnershipLedger()
+    ledger.adopt(CHILD, 'child')
+    const api = client({active: async () => late, children: [CHILD]})
+    const reconciler = createOwnedWorkReconcilerV2({
+      client: api,
+      ledger,
+      directory: '/d',
+      parentSessionId: ROOT,
+      logger: createMockLogger(),
+      intervalMs: 600_000,
+    })
+    const pass = reconciler.reconcileNow()
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #when the run moves on (disposes) and the old read then returns
+    reconciler.dispose()
+    answer({})
+    await vi.advanceTimersByTimeAsync(10)
+    await pass
+
+    // #then the late answer did not settle the child it would have settled
+    expect(ledger.snapshot().map(entry => entry.state)).toEqual(['outstanding'])
+  })
+
   it('ticks on its interval, joins a pass already in flight instead of stacking another, and stops on dispose', async () => {
     // #given a slow shell list that holds the first pass open
     let release!: () => void
