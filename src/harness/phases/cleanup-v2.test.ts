@@ -167,6 +167,23 @@ describe('runCleanup on an OpenCode V2 server', () => {
     expect(saveCache).not.toHaveBeenCalled()
   })
 
+  it('does not save when the run still holds an unresolved ownership entry, even after a clean shutdown', async () => {
+    // #given a V2 server that exited cleanly, and a ledger entry that was never confirmed finished
+    const {handle} = v2Handle('graceful')
+    const {createOwnershipLedger} = await import('@fro-bot/runtime')
+    const ledger = createOwnershipLedger()
+    ledger.adopt('ses_child', 'child')
+    ledger.markUnknown('ses_child')
+    const {saveCache} = await import('../../services/cache/index.js')
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when
+    await runCleanup({...options(handle), ownershipLedger: ledger})
+
+    // #then
+    expect(saveCache).not.toHaveBeenCalled()
+  })
+
   it('does not prune through the V1 session client (a V2 handle has none)', async () => {
     // #given
     const {handle} = v2Handle('graceful')

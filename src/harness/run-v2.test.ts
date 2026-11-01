@@ -382,6 +382,38 @@ describe('run on an OpenCode V2 server', () => {
     expect(finalized).toMatchObject({success: false, exitCode: 1, error: 'out of credit'})
   })
 
+  it('lets unresolved ownership veto publication, persistence and the invocation outcome together', async () => {
+    // #given a ledger entry the drain could not account for, and a release that reports it
+    const {createOwnershipLedger} = await import('@fro-bot/runtime')
+    const {runFinalizeWithResult} = await import('./phases/finalize.js')
+    const {runCleanup} = await import('./phases/cleanup.js')
+    const {runReleaseV2} = await import('./phases/release-v2.js')
+    const {setInvocationOutcomeOutput} = await import('./config/outputs.js')
+    const ledger = createOwnershipLedger()
+    ledger.adopt('ses_child', 'child')
+    ledger.markUnknown('ses_child')
+    await arrange({ledger})
+    vi.mocked(runReleaseV2).mockResolvedValue({
+      drain: {expired: false, cancelledCount: 0, settledCount: 0, unknownCount: 1},
+      persistenceDeclineReason: undefined,
+    })
+
+    // #when
+    const exitCode = await run()
+
+    // #then publication is vetoed before it happens
+    expect(vi.mocked(runFinalizeWithResult).mock.calls[0]?.[7]).toMatchObject({knownExecutionVeto: true})
+
+    // #and cleanup is handed the very ledger whose unknown entry makes persistence unsafe, so it declines the save
+    const cleanupOptions = vi.mocked(runCleanup).mock.calls[0]?.[0]
+    expect(cleanupOptions?.ownershipLedger).toBe(ledger)
+    expect(cleanupOptions?.ownershipLedger?.isPersistenceSafe()).toBe(false)
+
+    // #and the invocation is reported incomplete, with the reason named
+    expect(vi.mocked(setInvocationOutcomeOutput)).toHaveBeenCalledWith('incomplete')
+    expect(exitCode).toBe(1)
+  })
+
   it('does not report a drain that finished in time as incomplete', async () => {
     // #given
     const {runFinalizeWithResult} = await import('./phases/finalize.js')

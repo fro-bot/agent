@@ -11,6 +11,7 @@ import type {CacheRestorePhaseResult, CacheRestoreV2PhaseResult} from './cache-r
 import type {RoutingPhaseResult} from './routing.js'
 import type {SessionPrepPhaseResult} from './session-prep.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
+import {ARCHIVE_TIMEOUT_MS} from './execute-v2.js'
 import {runExecute} from './execute.js'
 
 const mocks = vi.hoisted(() => ({
@@ -295,7 +296,9 @@ describe('runExecute generation selector', () => {
     expect(mocks.executeOpenCodeV2).toHaveBeenCalledTimes(2)
     expect(mocks.executeOpenCode).not.toHaveBeenCalled()
     expect(mocks.archiveSession).not.toHaveBeenCalled()
-    expect(mocks.updateSession).toHaveBeenCalledWith({sessionId: 'overflowed-session', archived: true})
+    expect(mocks.updateSession).toHaveBeenCalledWith(
+      expect.objectContaining({sessionId: 'overflowed-session', archived: true}),
+    )
     const restartConfig = mocks.executeOpenCodeV2.mock.calls[1]?.[2] as {continueSessionId?: string} | undefined
     expect(restartConfig?.continueSessionId).toBeUndefined()
     expect(result).toMatchObject({
@@ -345,6 +348,37 @@ describe('runExecute generation selector', () => {
     // #then it is neither stopped here nor dropped
     expect(stop).not.toHaveBeenCalled()
     expect(result.liveObservation?.stop).toBe(stop)
+  })
+
+  it('ends an archive request that never answers at its bound, and still restarts', async () => {
+    // #given an archive call that ignores its signal and never settles
+    vi.useFakeTimers()
+    try {
+      mocks.updateSession.mockImplementation(async () => new Promise<never>(() => undefined))
+      mocks.executeOpenCodeV2
+        .mockResolvedValueOnce(agentResult())
+        .mockResolvedValueOnce(agentResult({success: true, exitCode: 0, error: null, llmError: null}))
+      let result: Awaited<ReturnType<typeof runExecute>> | undefined
+
+      // #when
+      // No Action deadline, so the time the archive burns does not use up the restart's budget.
+      const noDeadline = {...bootstrap(), inputs: {...bootstrap().inputs, timeoutMs: 0}}
+      const running = runExecute(noDeadline, routing(), v2CacheRestore(), sessionPrep(), metrics(), 0).then(value => {
+        result = value
+      })
+      await vi.advanceTimersByTimeAsync(ARCHIVE_TIMEOUT_MS - 1_000)
+      expect(result).toBeUndefined()
+      await vi.advanceTimersByTimeAsync(2_000)
+      await running
+
+      // #then the archive was given up on (fail-soft), the restart ran, and the signal told the request to stop
+      expect(result?.overflowRecovery).toMatchObject({archiveSucceeded: false, recovered: true})
+      expect(mocks.executeOpenCodeV2).toHaveBeenCalledTimes(2)
+      const passed = mocks.updateSession.mock.calls[0]?.[0] as {signal?: AbortSignal} | undefined
+      expect(passed?.signal?.aborted).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('records a failed V2 archive and still restarts', async () => {

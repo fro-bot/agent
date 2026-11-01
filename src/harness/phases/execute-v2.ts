@@ -14,6 +14,9 @@ import {createSessionReaderV2} from './session-v2.js'
  * routes. The retry policy, deadline and one-comment protocol are not here; they are shared with V1 inside
  * `executeOpenCodeV2`.
  */
+/** The longest the overflow archive may take. It is best-effort: a session left unarchived is re-continued next run. */
+export const ARCHIVE_TIMEOUT_MS = 10_000
+
 export function createExecutionBackendV2(cacheRestore: CacheRestoreV2PhaseResult): ExecutionBackend {
   const {serverHandle} = cacheRestore
   const client = createActionClientV2(serverHandle)
@@ -46,9 +49,28 @@ export function createExecutionBackendV2(cacheRestore: CacheRestoreV2PhaseResult
       }
     },
 
+    // Fail-soft and bounded: this runs after the execution deadline has been disposed, so a request that never answers
+    // would hold the run (and its cleanup) past the budget. The signal stops a client that honors it; the race ends the
+    // wait for one that does not.
     archive: async (sessionId: string, logger: Logger) => {
+      const controller = new AbortController()
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const timedOut = new Promise<'timed-out'>(resolve => {
+        timer = setTimeout(() => {
+          controller.abort()
+          resolve('timed-out')
+        }, ARCHIVE_TIMEOUT_MS)
+      })
       try {
-        const result = await client.updateSession({sessionId, archived: true})
+        const settled = await Promise.race([
+          client.updateSession({sessionId, archived: true, signal: controller.signal}),
+          timedOut,
+        ])
+        if (settled === 'timed-out') {
+          logger.warning('V2 session archive timed out', {sessionId, timeoutMs: ARCHIVE_TIMEOUT_MS})
+          return false
+        }
+        const result = settled
         if (!result.success) {
           logger.warning('V2 session archive failed', {sessionId, error: result.error.kind})
           return false
@@ -58,6 +80,8 @@ export function createExecutionBackendV2(cacheRestore: CacheRestoreV2PhaseResult
       } catch (error) {
         logger.warning('V2 session archive failed', {sessionId, error: toErrorMessage(error)})
         return false
+      } finally {
+        if (timer !== undefined) clearTimeout(timer)
       }
     },
 
