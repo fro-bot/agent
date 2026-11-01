@@ -528,6 +528,18 @@ describe('processEventStreamV2', () => {
       expect(tracker.queuedNoticeInboxIds.size).toBe(0)
     })
 
+    it('fences a notice that was queued while the root ran and is delivered once it is idle', async () => {
+      // #given a notice queued during a turn that then ended, and delivered afterwards to the idle root
+      const afterTurn = await trackerAfter([started, SUBAGENT_NOTICE_ENQUEUED_FRAME, succeeded])
+      const afterDelivery = await trackerAfter([started, SUBAGENT_NOTICE_ENQUEUED_FRAME, succeeded, delivered])
+
+      // #then the queued notice defers the success; once delivered, the turn it owes holds the fence by itself
+      expect(afterTurn).toMatchObject({rootTerminal: {kind: 'succeeded'}, turnOwed: false})
+      expect(afterTurn.queuedNoticeInboxIds.size).toBe(1)
+      expect(afterDelivery).toMatchObject({rootTerminal: null, turnOwed: true})
+      expect(afterDelivery.queuedNoticeInboxIds.size).toBe(0)
+    })
+
     it('advances the revision for each change of what the result means', async () => {
       // #given / #when
       const tracker = await trackerAfter([started, succeeded, SUBAGENT_NOTICE_ENQUEUED_FRAME, delivered, started])

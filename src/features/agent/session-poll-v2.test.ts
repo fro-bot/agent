@@ -1,7 +1,7 @@
 import type {RemoteOpenCodeV2Client} from '@fro-bot/runtime'
 import {describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
-import {pollForSessionCompletionObservationV2} from './session-poll-v2.js'
+import {observeRootTerminal, pollForSessionCompletionObservationV2} from './session-poll-v2.js'
 import {createActivityTrackerV2} from './streaming-v2.js'
 
 const ROOT = 'ses_root'
@@ -162,5 +162,30 @@ describe('pollForSessionCompletionObservationV2', () => {
     expect(tracker.rootTerminal).toBeNull()
     controller.abort()
     await poll
+  })
+})
+
+describe('observeRootTerminal', () => {
+  it('defers a recorded success while a notice-triggered turn is owed, unless the stream is known to have lost events', () => {
+    // #given a success on the tracker and a turn owed with nothing queued (the notice was delivered to the idle root)
+    const tracker = createActivityTrackerV2()
+    tracker.rootTerminal = {kind: 'succeeded'}
+    tracker.turnOwed = true
+    const logger = createMockLogger()
+
+    // #when / #then
+    expect(observeRootTerminal(tracker, logger)).toBeNull()
+    tracker.streamBlind = true
+    expect(observeRootTerminal(tracker, logger)?.settlement.kind).toBe('completion-observed')
+  })
+
+  it('does not defer a failure for an owed turn: a run that ended badly keeps its result', () => {
+    // #given
+    const tracker = createActivityTrackerV2()
+    tracker.rootTerminal = {kind: 'failed'}
+    tracker.turnOwed = true
+
+    // #when / #then
+    expect(observeRootTerminal(tracker, createMockLogger())?.settlement.kind).toBe('failure-observed')
   })
 })
