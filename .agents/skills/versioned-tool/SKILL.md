@@ -172,7 +172,7 @@ Installers reuse the pinned version constant instead of hardcoding version liter
 
 Repo-specific behaviors today:
 
-- **OpenCode**: `latest` resolves to the recorded V2 pin with no network lookup (`resolveRequestedVersion`); a failed install never crosses generations (V1 requests fail closed; V2 falls back only to the pin, digest-checked)
+- **OpenCode**: `latest` resolves to the recorded V2 pin with no network lookup (`resolveRequestedVersion`); there is no install fallback (a failed V1 request throws and never installs V2; an unrecorded V2 version fails in `runSetup`)
 - **Systematic**: installs from `DEFAULT_SYSTEMATIC_VERSION` through the OpenCode CLI's plugin install
 - **Bun**: not an Action-installed tool. The repo's own CI Bun comes from the root `package.json` `packageManager` field through `.github/actions/setup`
 

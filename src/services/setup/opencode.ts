@@ -348,17 +348,15 @@ async function validateDownload(
 }
 
 /**
- * Install OpenCode CLI. A fallback never crosses generations: the caller has already chosen V1 or V2 setup, caches
- * and session keys from the requested version, so a binary of the other generation would run against the wrong
- * setup.
+ * Install OpenCode CLI. There is no fallback: the caller has already chosen V1 or V2 setup, caches and session keys
+ * from the requested version, so a binary of the other generation would run against the wrong setup.
  *
- * V1 requests (a harness build, or a stock version below V2) have no fallback. Any download, checksum or
+ * V1 requests (a harness build, or a stock version below V2) fail closed. Any download, checksum or
  * validation failure THROWS an error naming the requested version and the reason: a harness pin must resolve to
  * the exact harness binary, and a stock V1 failure must not turn into a V2 install.
  *
- * V2 requests (major 2 or higher) install through `installStockV2`, digest-verified or throwing. The pin itself
- * has no retry. A V2 version with no recorded digest cannot be installed, so it falls back to `v2Pin`, through the
- * same digest-checked install; if that fails too, the install throws.
+ * V2 requests (major 2 or higher) install through `installStockV2`, digest-verified or throwing, with no retry. A V2
+ * version with no recorded digest never reaches here: `runSetup` rejects it first.
  */
 export async function installOpenCode(
   version: string,
@@ -370,26 +368,7 @@ export async function installOpenCode(
   const platformInfo = getPlatformInfo()
 
   if (isStockV2Pin(version)) {
-    try {
-      return await installStockV2(version, platformInfo, logger, toolCache, execAdapter, v2Pin)
-    } catch (error) {
-      if ((version.startsWith('v') ? version.slice(1) : version) === v2Pin.version) {
-        throw error
-      }
-      logger.warning('Requested V2 version cannot be installed, falling back to the recorded V2 pin', {
-        requestedVersion: version,
-        fallbackVersion: v2Pin.version,
-        error: toErrorMessage(error),
-      })
-      try {
-        return await installStockV2(v2Pin.version, platformInfo, logger, toolCache, execAdapter, v2Pin)
-      } catch (fallbackError) {
-        throw new Error(
-          `Failed to install OpenCode ${version} (${toErrorMessage(error)}), and the fallback to the recorded V2 pin ` +
-            `${v2Pin.version} failed: ${toErrorMessage(fallbackError)}`,
-        )
-      }
-    }
+    return installStockV2(version, platformInfo, logger, toolCache, execAdapter, v2Pin)
   }
 
   // Check cache first
