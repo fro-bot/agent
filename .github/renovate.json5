@@ -174,6 +174,34 @@
       },
     },
     {
+      // `@opencode/plugin` pins `effect` at an exact version, and the plugin package imports `Schema` from `effect`
+      // directly. A different `effect` devDependency installs a second copy of effect v4 and breaks `tsc` with
+      // "Two different types with this name exist". `bun run postupgrade` (scripts/sync-opencode-plugin-effect.ts)
+      // copies the plugin's pin into packages/opencode-plugin's `effect` devDependency. It reads the installed
+      // manifest, so the first install brings in the bumped plugin and the second one regenerates bun.lock and the
+      // installed tree for the new `effect`. A rule-level `postUpgradeTasks` REPLACES the top-level one rather than
+      // merging with it, so the full list is repeated here on purpose. Every command must match the self-hosted
+      // runner's `allowedCommands` (pinned by scripts/renovate-v2-pin-postupgrade.test.ts).
+      matchFileNames: ['packages/opencode-plugin/package.json'],
+      matchPackageNames: ['@opencode/plugin'],
+      postUpgradeTasks: {
+        commands: [
+          'bun install --ignore-scripts',
+          'bun run postupgrade',
+          'bun install --ignore-scripts',
+          'bun run build',
+        ],
+        executionMode: 'branch',
+      },
+    },
+    {
+      // The plugin package's `effect` follows `@opencode/plugin`'s exact pin (rule above), never its own latest.
+      // `effect` v3 in other manifests keeps updating.
+      matchFileNames: ['packages/opencode-plugin/package.json'],
+      matchPackageNames: ['effect'],
+      enabled: false,
+    },
+    {
       // Cap Bun at 1.4.4. The build gate requires an exact match with upstream
       // anomalyco/opencode's packageManager field at the harness base version.
       // Bun must not outrun the validated release; raise after verifying a newer
