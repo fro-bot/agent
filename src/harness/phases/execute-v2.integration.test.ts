@@ -741,8 +741,9 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
     // #given `shell` set to ask, and a model that runs one shell command and then answers whatever the result was
     const box = createSandbox()
     sandboxes.push(box)
+    const ranMarker = path.join(box.root, 'rejected-command-ran')
     const provider = await startScriptedProvider(
-      [{tool: 'shell', args: {command: 'echo reject-fixture-9f3'}}, {text: 'Carried on without the shell.'}],
+      [{tool: 'shell', args: {command: `touch ${ranMarker}`}}, {text: 'Carried on without the shell.'}],
       'unexpected extra turn',
     )
     providers.push(provider)
@@ -795,8 +796,9 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
     expect(result).toMatchObject({success: true, exitCode: 0, llmError: null})
     expect(JSON.stringify(consoleMock.outputTextContent.mock.calls)).toContain('Carried on without the shell.')
 
-    // #and the command never ran, and no session is left holding a claim the next run would resume
-    expect(processRunning('reject-fixture-9f3')).toBe(false)
+    // #and the command never ran (it would have left the marker file), and no session is left holding a claim the next
+    // run would resume
+    expect(existsSync(ranMarker)).toBe(false)
     expect(release.persistenceDeclineReason).toBeUndefined()
     expect((await real.exited).code).toBe(0)
     expect(sessionClaims(box.dbPath).every(row => row.suspended === null)).toBe(true)
