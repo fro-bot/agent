@@ -30,6 +30,15 @@ export interface PermissionRuleV2 {
 /** Permission action names of the Code Mode `opencode` tools that move a session or create a worktree. */
 export const FORBIDDEN_TOOL_ACTIONS_V2 = ['opencode_session_move', 'opencode_worktree_create'] as const
 
+/**
+ * Permission action of the upstream `websearch` tool. The Action denies it; the gateway workspace does not.
+ *
+ * With no search provider selected, `websearch` opens a `websearch.provider` form that the Action can only cancel, which
+ * wastes the turn. Upstream registers five providers unconditionally and an unauthenticated one (Parallel) sends the
+ * query without a key, so letting a config answer that form would start sending agent queries to a third party.
+ */
+export const WEBSEARCH_ACTION_V2 = 'websearch'
+
 /** The resource the server asks about for a file in `directory` (`core/src/file-access.ts` `resolve`). */
 export function externalDirectoryResource(directory: string): string {
   return `${directory.replaceAll('\\', '/').replace(/\/+$/, '')}/*`
@@ -71,6 +80,8 @@ export interface PermissionRulesInput {
   readonly bundledSkillsDirectories?: readonly string[]
   /** Deny `question`. Set in the Action, where nobody can answer. */
   readonly denyQuestion: boolean
+  /** Deny `websearch` (see `WEBSEARCH_ACTION_V2`). Set in the Action; the gateway workspace leaves it to the operator. */
+  readonly denyWebsearch: boolean
 }
 
 /**
@@ -105,6 +116,10 @@ export function buildPermissionRulesV2(input: PermissionRulesInput): Result<read
 
   if (input.denyQuestion) {
     rules.push({action: 'question', resource: '*', effect: 'deny'})
+  }
+
+  if (input.denyWebsearch) {
+    rules.push({action: WEBSEARCH_ACTION_V2, resource: '*', effect: 'deny'})
   }
 
   for (const action of FORBIDDEN_TOOL_ACTIONS_V2) {

@@ -90,6 +90,25 @@ async function* brokenStream(): AsyncGenerator<unknown> {
   throw new TypeError('socket closed')
 }
 
+/** The frames of one successful tool call: started, called with `input`, and succeeded. */
+function toolFrames(
+  id: string,
+  name: string,
+  input: Record<string, unknown>,
+  metadata: Record<string, unknown> = {},
+): readonly unknown[] {
+  return [
+    frame('session.tool.input.started', {sessionID: TEXT_SESSION_ID, id, name}),
+    frame('session.tool.called', {sessionID: TEXT_SESSION_ID, id, input}),
+    frame('session.tool.success', {
+      sessionID: TEXT_SESSION_ID,
+      id,
+      content: [{type: 'text', text: 'RESULT-TEXT-THAT-MUST-NOT-APPEAR'}],
+      metadata,
+    }),
+  ]
+}
+
 describe('processEventStreamV2', () => {
   beforeEach(() => {
     consoleMock.outputTextContent.mockClear()
@@ -773,6 +792,73 @@ describe('processEventStreamV2', () => {
       // #then
       expect(outcome.prsCreated).toEqual(['https://github.com/fro-bot/agent/pull/42'])
       expect(consoleMock.outputToolExecution).toHaveBeenCalledWith('shell', 'gh pr create --title t')
+    })
+  })
+
+  describe('transcript tool arguments', () => {
+    it('shows the V2 field of each tool and nothing from the bodies or prompts', async () => {
+      // #given
+      const items = [
+        ...toolFrames('c1', 'read', {path: 'src/index.ts', offset: 1}),
+        ...toolFrames('c2', 'webfetch', {url: 'https://example.com/docs?token=abc#frag', format: 'markdown'}),
+        ...toolFrames('c3', 'grep', {pattern: 'TODO', path: 'src'}),
+        ...toolFrames('c4', 'write', {path: 'out.md', content: 'FILE-BODY-THAT-MUST-NOT-APPEAR'}),
+        ...toolFrames('c5', 'subagent', {
+          agent: 'explore',
+          description: 'Find router',
+          prompt: 'PROMPT-MUST-NOT-APPEAR',
+        }),
+        ...toolFrames('c6', 'skill', {id: 'ce-review'}),
+        ...toolFrames('c7', 'todo', {todos: [{content: 'TODO-BODY-MUST-NOT-APPEAR', status: 'pending'}]}),
+      ]
+
+      // #when
+      await run(items).result
+
+      // #then
+      expect(consoleMock.outputToolExecution.mock.calls).toEqual([
+        ['read', 'src/index.ts'],
+        ['webfetch', 'https://example.com/docs'],
+        ['grep', 'TODO in src'],
+        ['write', 'out.md'],
+        ['subagent', 'Find router'],
+        ['skill', 'ce-review'],
+        ['todo', '1 item'],
+      ])
+      expect(JSON.stringify(consoleMock.outputToolExecution.mock.calls)).not.toContain('MUST-NOT-APPEAR')
+    })
+
+    it('prints one execute line and one line per nested call, never the program text', async () => {
+      // #given
+      const nested = [
+        {tool: 'opencode.worktree_list', status: 'completed'},
+        {tool: 'fetch', status: 'completed', input: {method: 'GET', url: 'https://api.test/v1/x?key=k'}},
+        {tool: 'opencode.models', status: 'error', input: {filter: 'NESTED-INPUT-MUST-NOT-APPEAR'}},
+      ]
+      const items = toolFrames('c1', 'execute', {code: 'CODE-MUST-NOT-APPEAR'}, {toolCalls: nested})
+
+      // #when
+      await run(items).result
+
+      // #then
+      expect(consoleMock.outputToolExecution.mock.calls).toEqual([
+        ['execute', ''],
+        ['opencode.worktree_list', ''],
+        ['fetch', 'https://api.test/v1/x'],
+        ['opencode.models', ''],
+      ])
+      expect(JSON.stringify(consoleMock.outputToolExecution.mock.calls)).not.toContain('MUST-NOT-APPEAR')
+    })
+
+    it('prints the execute line when the program made no calls', async () => {
+      // #given
+      const items = toolFrames('c1', 'execute', {code: 'return 1'})
+
+      // #when
+      await run(items).result
+
+      // #then
+      expect(consoleMock.outputToolExecution.mock.calls).toEqual([['execute', '']])
     })
   })
 })

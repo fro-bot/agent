@@ -12,6 +12,7 @@ import {
   buildResponseFileFallbackRoots,
   FORBIDDEN_TOOL_ACTIONS_V2,
   RESPONSE_FILE_DIR_SEGMENT,
+  WEBSEARCH_ACTION_V2,
 } from '@fro-bot/runtime'
 
 export interface CIConfigV2Inputs {
@@ -185,6 +186,7 @@ export function buildCIConfigV2(inputs: CIConfigV2Inputs, logger: Logger): Resul
     bundledSkillsDirectories,
     editDenyResources,
     denyQuestion: true,
+    denyWebsearch: true,
   })
   if (!rules.success) return err(rules.error)
   const base = buildConfigContentV2({plugins: [], rules: rules.data})
@@ -221,7 +223,7 @@ export function buildCIConfigV2(inputs: CIConfigV2Inputs, logger: Logger): Resul
     expectations: {
       outsidePolicy: 'deny',
       allowedDirectories: [...allowedDirectories, ...bundledSkillsDirectories],
-      deniedActions: FORBIDDEN_TOOL_ACTIONS_V2,
+      deniedActions: [...FORBIDDEN_TOOL_ACTIONS_V2, WEBSEARCH_ACTION_V2],
     },
   })
 }
