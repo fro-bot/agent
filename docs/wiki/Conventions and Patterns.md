@@ -1,8 +1,13 @@
 ---
 type: convention
-last-updated: "2026-10-25"
-updated-by: "fe7f6bda"
+last-updated: "2026-11-01"
+updated-by: "9a429e2a6ddc692bd6098b5504c225830af85bf9"
 sources:
+  - packages/runtime/src/session/generation.ts
+  - packages/runtime/src/agent/event-v2.ts
+  - packages/runtime/src/agent/directory-quiescence-v2.ts
+  - src/harness/phases/execution-backend.ts
+  - src/features/agent/prompt-sender-v2.ts
   - AGENTS.md
   - src/harness/outcome.ts
   - src/features/agent/streaming.ts
@@ -112,6 +117,10 @@ Raw GitHub webhook payloads are never accessed directly anywhere in the codebase
 Downstream code narrows via `event.type` before accessing variant-specific fields. All fields are `readonly`. This pattern provides type safety across the entire event-handling pipeline and makes it impossible to accidentally read a field that doesn't exist for the current event type.
 
 ## Adapter Pattern
+
+Generation-specific adapters now keep V1 and V2 protocol differences explicit. The shared generation selector interprets versions once, and the Action's execution backend keeps prompt submission, overflow recovery, archiving, and search on the same generation. V2's event adapter translates its native envelope into the activity and ownership vocabulary rather than leaking raw transport shapes throughout the harness.
+
+This follows the same evidence discipline as named outcomes: a lost V2 prompt acknowledgment means uncertain admission, not permission to retry blindly, and an unreadable directory observation means unknown activity, not quiet. Completion uses consecutive bounded observations instead of equating a successful interrupt response with a stopped writer. [[Background Subagents and Ownership]] describes the release gate.
 
 External I/O operations are wrapped in adapter interfaces: `CacheAdapter` (for `@actions/cache`), `ExecAdapter` (for `@actions/exec`), `ToolCacheAdapter` (for `@actions/tool-cache`). Production code creates real implementations via factory functions (`createExecAdapter`, `createToolCacheAdapter`). Tests substitute fakes.
 

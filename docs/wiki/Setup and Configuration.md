@@ -1,8 +1,22 @@
 ---
 type: subsystem
-last-updated: "2026-11-01"
-updated-by: "fe7f6bda"
+last-updated: "2026-11-02"
+updated-by: "f8ee76a3"
 sources:
+  - tsdown.config.ts
+  - src/services/setup/ci-config-v2.ts
+  - src/services/setup/credential-files-v2.ts
+  - src/services/setup/plugin-install-v2.ts
+  - src/harness/phases/v2-server.ts
+  - packages/runtime/src/agent/server-v2.ts
+  - packages/runtime/src/agent/permission-rules-v2.ts
+  - packages/runtime/src/agent/permission-gate-v2.ts
+  - packages/runtime/src/agent/bundled-skills-dir.ts
+  - packages/runtime/src/shared/opencode-v2-pin.json
+  - apps/workspace-agent/src/opencode-server-v2.ts
+  - apps/workspace-agent/src/opencode-credentials-v2.ts
+  - apps/workspace-agent/src/opencode-proxy-v2.ts
+  - packages/opencode-plugin/src/index.ts
   - src/harness/config/outputs.ts
   - packages/runtime/src/agent/attachment-dir.ts
   - deploy/scripts/merge-config.mjs
@@ -45,7 +59,7 @@ sources:
   - RFCs/RFC-011-Setup-Action-Environment-Bootstrap.md
   - RFCs/RFC-019-S3-Storage-Backend.md
   - ARCHITECTURE.md
-summary: "Tool installation, configuration assembly, credentials, and caching"
+summary: "Generation-aware tool installation, permission gates, provider credentials, plugins, and tools caching"
 ---
 
 # Setup and Configuration
@@ -55,6 +69,8 @@ The setup module (`src/services/setup/`) bootstraps the CI environment before ag
 Before setup is skipped, `ensureOpenCodeAvailable()` in `packages/runtime/src/agent/server.ts` compares the available executable's reported version with the requested pin, including the harness suffix. A single leading `v` and the equivalent `-harness.`/`+harness.` spellings are normalized; a different stock release, harness build, or provenance-reporting shim triggers auto-setup instead of displacing the pinned download. An explicit `OPENCODE_PATH` mismatch emits a warning because setup is replacing an operator-selected executable.
 
 ## Installation Sequence
+
+Setup selects the generation from the resolved executable version. The Action defaults to V2; V1-specific steps in the common flow below remain for explicitly pinned V1 versions. V2's config, plugin installation, and provider-auth steps are described under [OpenCode V2 setup](#opencode-v2-setup). Oh My OpenAgent and oMo Slim inputs and installers have been removed.
 
 The `runSetup()` orchestrator installs OpenCode and the Systematic plugin, assembles the CI configuration, and configures authentication. It installs no other agent framework and no JavaScript runtime.
 
@@ -68,13 +84,13 @@ The `runSetup()` orchestrator installs OpenCode and the Systematic plugin, assem
 
 5. **Build CI config** — On the V1 path, assembles the `OPENCODE_CONFIG_CONTENT` environment variable, which configures OpenCode for CI operation. V2 builds its config when the server spawns and exports no `OPENCODE_CONFIG_CONTENT`; it strips `permission`, `tools`, `autoupdate` and `subagent_depth` from `opencode-config`. This includes disabling auto-updates, injecting the Systematic plugin, and pinning `default_agent` to `"build"`.
 
-6. **Merge user config** — Merges the CI config on top of any user-provided `opencode-config` input. Legacy `plugins` (plural) keys are stripped — OpenCode only accepts `plugin` (singular) — and a warning names any rewritten fields. The result is written fresh; an existing local `opencode.json` is never merged in.
+6. **Merge user config** — On V1, merges the CI config on top of any user-provided `opencode-config` input. Legacy `plugins` (plural) keys are stripped because V1 accepts `plugin` (singular), and a warning names any rewritten fields. V2 retains its native plural key. The result is written fresh; an existing local `opencode.json` is never merged in.
 
-7. **Install Systematic plugin** — Runs the OpenCode CLI's plugin install before caching, gated on either a fresh OpenCode install _or_ a tools-cache miss (see [When the Plugin Install Runs](#when-the-plugin-install-runs)). If the install times out or fails, setup continues but skips saving the tools cache so an incomplete install is not persisted.
+7. **Install plugins** — Runs plugin preparation before caching, gated on either a fresh OpenCode install _or_ a tools-cache miss (see [When the Plugin Install Runs](#when-the-plugin-install-runs)). On V1, a failed Systematic install warns and skips saving the tools cache. On V2, preparing both Systematic and the Fro Bot plugin is required; failure stops setup.
 
 8. **Save tools cache** — If the plugin install ran and succeeded, saves the installed binaries for future runs.
 
-9. **Configure authentication** — Sets up `gh` CLI auth, configures Git identity as `{bot}[bot]` for audit trails, and writes the ephemeral `auth.json` with `0o600` permissions.
+9. **Configure authentication** — Sets up `gh` CLI auth and configures Git identity as `{bot}[bot]` for audit trails. V1 writes ephemeral `auth.json` with `0o600` permissions; V2 provisions the external provider-key files at server startup instead.
 
 ## Pinned Versions
 
@@ -87,23 +103,53 @@ Default versions are defined in `packages/runtime/src/shared/constants.ts` (shar
 
 These can be overridden per-run via action inputs (`opencode-version`, `systematic-version`). Stock tool pins are updated via Renovate-managed PRs. The OpenCode default is the stock V2 pin in `opencode-v2-pin.json`: Renovate bumps its `version` and a post-upgrade task regenerates the per-asset digests. A harness release does not change the Action default.
 
-The bundled Systematic default is currently `3.26.0`. Its pin participates in the tools-cache key, so advancing it triggers a fresh plugin installation even when the OpenCode binary itself is already cached.
+The bundled Systematic default is currently `3.29.0`, shared by V1 and V2. Its pin participates in the tools-cache key, so advancing it triggers a fresh plugin installation even when the OpenCode binary itself is already cached.
 
 Bun is the package manager for this project's own workspace, not a tool the Action installs. Every workflow in this repository gets its Bun from the root `package.json` `packageManager` field through `.github/actions/setup`, which fails the job if the installed Bun differs from it.
 
-`DEFAULT_OPENCODE_VERSION` is the **stock OpenCode V2 pin** (currently `2.2.5`), read from `packages/runtime/src/shared/opencode-v2-pin.json`, the one file that records the version and the sha256 of each release asset. A V2 install succeeds only when the archive matches the recorded digest and the release's `SHA256SUMS` line, and any other V2 version fails before a download starts. The build fails if the pinned version or any pinned digest is missing from the bundle (`tsdown.config.ts`).
+`DEFAULT_OPENCODE_VERSION` is the **stock OpenCode V2 pin** (currently `2.2.5`), read from `packages/runtime/src/shared/opencode-v2-pin.json`, which records the version and each release asset's SHA-256. Installation requires both the recorded digest and the release's `SHA256SUMS` line to match. The build checks that the version and digests survive bundling (`tsdown.config.ts`). `latest` selects this same recorded pin without an upstream lookup.
 
-The previous default, a [harness build](#harness-builds) (`1.19.4+harness.5bde2635`), still installs when pinned through `opencode-version`; that is the rollback path. See the README's "Moving to OpenCode V2" for what changes for consumers.
+The previous Action default, `1.19.4+harness.5bde2635`, remains selectable through `opencode-version` as a rollback path. The workspace image still defaults to that V1 harness build; switching the Action default does not switch the gateway/workspace deployment.
+
+## OpenCode V2 setup
+
+### Binary and plugin preparation
+
+`src/services/setup/opencode.ts` verifies stock V2 archives against the asset digests recorded in `packages/runtime/src/shared/opencode-v2-pin.json`. An unrecorded V2 version or missing digest fails closed, as does a mismatched download; V2 does not silently fall back to a V1 binary. Linux uses tar archives and macOS uses zip archives; the workspace image selects the matching Linux musl asset.
+
+V2 installs both Systematic and `@fro.bot/opencode-plugin` (`0.1.0`). The latter supplies the four session-history tools and the subagent-session reuse guard. `plugin-install-v2.ts` performs bounded preparation outside the real session database. `src/harness/phases/v2-server.ts` checks both exact plugin specs before every spawn, even when a preinstalled matching binary skipped setup. A warm plugin cache makes this a cheap check; a missing plugin uses the bounded installer before the shorter server-readiness deadline begins. Unlike V1's advisory Systematic install, failed V2 preparation or an inactive required plugin prevents execution.
+
+### Provider credentials and restored state
+
+The Action narrows `auth-json` to supported API-key entries and writes each key to its own owner-only file outside cached paths (`credential-files-v2.ts`). Configuration refers to those files through `{file:...}` rather than embedding key bytes. The provided file reference wins over an inline operator key for the same provider while preserving its other settings. Stale `auth.json` is removed before spawn so V2's legacy migration cannot import provider secrets into the database that will later be cached.
+
+Held execution claims from a killed invocation are cleared in the restored database before the server starts. After spawn, a provider credential gate checks the effective model's provider, or the supplied providers when no model selects one. It accepts configured authentication references or a reported connection without reading secret values. Startup then waits for V1 history import to complete before any prompt; [[Session Persistence]] explains that migration barrier.
+
+### Effective configuration and permissions
+
+V2 uses `plugins`, an ordered top-level `permissions` list, `update: disable`, and `experimental.subagent_depth: 1` (`permission-rules-v2.ts`). These are generation-specific spellings, not the V1 config shape. The Action strips operator permission/tool overrides from top-level and agent maps before assembling the harness rules, and disables project-config loading at spawn.
+
+Outside-checkout access defaults to deny in CI. Exceptions name the run-attempt response and attachment directories, an eligible integration work directory, and the installed Systematic skills directory. Secret-shaped reads and edits are denied while `.env.example` remains accessible. `question`, session moves, and worktree creation are denied. The post-spawn permission gate inspects effective per-agent rules, so writing an intended config alone cannot establish readiness.
+
+The bundled-skills exception fixes a precedence problem shared with V1: a catch-all outside-directory deny could shadow OpenCode's own skill grant, leaving a loaded skill unable to read its references or execute its scripts. The resolver admits only the exact installed version's `@fro.bot/systematic/skills` directory, including the newest installed V2 generation directory. It grants neither the entire package cache nor arbitrary symlink destinations. Edit tools are denied there, but this is not filesystem read-only protection: shell commands can still write within an allowed external directory. A missing resolution warns and adds no grant.
+
+### Server and workspace boundary
+
+`packages/runtime/src/agent/server-v2.ts` runs `serve --stdio` with held stdin, an explicit loopback port, a per-spawn Basic credential, and a scrubbed child environment. Readiness includes the agent endpoint and an active-plugin check, followed by the surface's permission and credential gates. Shutdown interrupts remaining sessions, closes stdin, and confirms process exit; [[Background Subagents and Ownership]] explains the directory-release check that precedes it.
+
+A V2 workspace uses a fresh database for every spawn rather than restoring Action memory. Its supervisor provisions API keys over authenticated loopback `POST /api/credential`, then verifies the required provider before reporting ready (`apps/workspace-agent/src/opencode-credentials-v2.ts`). A fresh database skips the legacy auth import, so merely writing `auth.json` would leave it unauthenticated. Keys are not put in argv, environment, or config content on this path.
+
+The workspace proxy translates the gateway bearer to the current spawn's Basic credential and forwards only `V2_GATEWAY_ROUTES`; credential enumeration never reaches the gateway-facing surface. Between spawns it returns unavailable instead of reusing a stale password. The image's baked `WORKSPACE_IMAGE_OPENCODE_VERSION` is reported on readiness and selects the gateway's matching loop. Plugins are baked at image-build time, and the supervisor preserves the unprivileged process identity described below.
 
 ## Harness Builds
 
-OpenCode is consumed in two forms. A _stock_ version is a plain upstream release (for example `1.19.0`) published by the `anomalyco/opencode` project. A _harness_ version carries a `harness.<sha>` suffix (for example `1.19.0+harness.caa47272`) and is a `fro-bot/agent` release that bundles the upstream binary together with a curated set of upstream integration refs — stalled or closed OpenCode PRs — merged onto the base release. The carry set spans provider/model routing fixes, SQLite lock-timeout retries, SSE backlog bounding, several memory-leak and stability patches, a bound on the plugin npm install, and OpenAI-family prompt-cache and version-gate corrections. The current base is `1.19.4`; each rebase re-evaluates which carries remain necessary. The exact carry set is defined in the `integrationRefs` list of `packages/harness/harness.config.json`; the action no longer defaults to a harness build (the default is stock V2); a harness build is selected explicitly via the `opencode-version` input.
+OpenCode is consumed as stock upstream releases or patched V1 harness builds. A harness version carries a `harness.<sha>` suffix and comes from a `fro-bot/agent` release bundling curated upstream integration refs. The current base is `1.19.4`; the exact carry set is `integrationRefs` in `packages/harness/harness.config.json`. Each rebase re-evaluates which patches remain necessary. The Action selects harness builds explicitly through `opencode-version`; its default uses the separate digest-verified stock V2 path above. Harness release publishing no longer opens an Action default-pin sync PR.
 
 ### Two Spellings of the Same Build
 
 A harness build has one identity but two written forms, and understanding why they differ explains most of the surrounding machinery.
 
-The **build-metadata form** — `1.19.0+harness.caa47272` — is what the binary self-reports and what the version pin in `packages/runtime/src/shared/constants.ts` records. The `+` segment is SemVer build metadata (§10), which is deliberately excluded from version precedence.
+The **build-metadata form** — `1.19.0+harness.caa47272` — is what the binary self-reports and what an explicit harness pin can use. The Action's current default constant instead reads the stock V2 pin. The `+` segment is SemVer build metadata (§10), which is deliberately excluded from version precedence.
 
 The **prerelease form** — `1.19.0-harness.caa47272` — is the published GitHub release tag, the npm package version, and the tool-cache key.
 
@@ -117,11 +163,11 @@ Moving the tag to a genuine SemVer prerelease identifier fixes it at the level o
 
 - **Download source** — Harness versions are routed to the `fro-bot/agent` releases URL instead of the upstream `anomalyco/opencode` releases, with the tag derived through the prerelease conversion. Percent-encoding of `+` as `%2B` is retained for the migrated legacy tags, since GitHub stores tags URL-encoded and a raw `+` is misread as a space. Stock versions keep their conventional `v`-prefixed upstream URL.
 
-- **Checksum verification** — Every harness archive is verified against a `SHA256SUMS` manifest published alongside the binary in the same release. Stock downloads have no such manifest and are not checksum-verified by the action. Before any URL is constructed, the version string is validated against a strict semver-ish pattern as a defense-in-depth guard against path traversal or shell metacharacters. A harness pin that fails to download or verify is **fail-closed** — the run aborts rather than silently substituting a stock binary. There is no install fallback: a failed V1 install (stock or harness) fails the run with an error naming the requested version and is never retried as the V2 pin, a failed V2 pin install fails the run, and a V2 version with no recorded digest is rejected before any download.
+- **Checksum verification** — Every harness archive is verified against its published `SHA256SUMS`. Stock V1 retains its legacy install behavior; stock V2 must match both the recorded asset digest and the release manifest. Version strings are validated before URL construction. Installation failures are fail-closed for every generation, without substitution.
 
 - **Tool-cache identity** — `@actions/tool-cache` runs versions through `semver.clean()` internally, which strips `+harness.<sha>` build metadata and would collapse a harness build onto a stock cache entry of the same base version. The prerelease form survives `semver.clean()` intact, so using it as the cache key guarantees a harness build and a stock build of the same base version never share a cache slot. Logs and the binary's own `--version` output keep the build-metadata form.
 
-`latest` has no fallback to resolve: it is the recorded V2 pin. An explicitly-pinned harness build does not fall back — a failed download or checksum mismatch fails the run.
+There is no install fallback. Setup has already selected generation-specific config, caches, and session keys before installation, so silently substituting another generation would cross those boundaries. A failed V1 request names its requested version and fails the run; a failed V2 installation also fails, and an unrecorded V2 version is rejected before download.
 
 Because the tag shape is now load-bearing for two external tools and is derived in more than one place — the release workflow, the npm version builder, and the setup module — the test suite carries drift guards that read the repository's source text and fail if one producer is changed without the others. These guards exist because an earlier mirrored copy of the harness-version predicate asserted the opposite of production behavior and still passed, testing its own copy rather than the module.
 
@@ -148,6 +194,8 @@ The Systematic plugin install is gated on **either** a fresh OpenCode install **
 When the install fails, two diagnostics now accompany the warning. If the parent environment carries `NPM_CONFIG_*` variables, the warning names those keys (names only, never values) and notes that the install child deliberately does not inherit them — the scrub exists so a network-fetched package's lifecycle scripts cannot see registry or proxy overrides, and naming the likely cause is preferable to either silently failing or proposing an allowlist that would defeat the scrub. Separately, when the failure is a spawn error (`ENOENT` or `EACCES`), `diagnoseBinaryPath()` inspects the path and reports what it actually found: absent, a dangling symlink, a directory rather than an executable, present but not executable by the current user, or a parent directory listing when the path itself is gone. That routine runs inside a catch block, so every filesystem call it makes is individually guarded — a failed diagnosis degrades to a short fallback string rather than masking the original error.
 
 ## Configuration Assembly
+
+This section describes V1's config keys and environment switches. V2 uses the ordered permissions and effective-rule verification described above.
 
 The CI config built by `buildCIConfig()` ensures OpenCode operates correctly in a headless CI environment:
 
@@ -187,7 +235,7 @@ The key:
 opencode-tools-v2-{os}-oc-{opencodeVersion}-sys-{systematicVersion}
 ```
 
-Advancing either version produces a new key and a fresh install.
+Advancing either version produces a new key and a fresh install. V2 also qualifies the tools key with the recorded binary digest identity and Fro Bot plugin version, preventing reuse of an older verified asset or guard/session-tools bundle.
 
 On a cache hit, the module verifies the binary is actually present in the tool cache before trusting it — cache hits where the binary is missing fall through to a fresh install. The lookup uses the tool-cache-safe form of the version (see [Harness Builds](#harness-builds)), so a harness build never reuses a stock binary's cache entry. This cache typically saves 10-20 seconds per run.
 
@@ -197,7 +245,7 @@ A denied tools-cache write is now surfaced as a failure rather than swallowed. W
 
 Credentials are handled with care:
 
-- **`auth.json`** is written with `0o600` permissions (owner-only read/write) and is never cached. It's regenerated fresh from secrets on every run.
+- **Provider authentication** uses an ephemeral `auth.json` on V1, owner-only key files referenced by config on the V2 Action, and loopback credential provisioning on the V2 workspace. Credentials are regenerated from secrets, outside the session transport.
 - **Git identity** is forced to `{bot}[bot]` so commits made by the agent have a clear audit trail.
 
 ### GitHub credential disposition
@@ -249,6 +297,8 @@ The gateway reads environment and `_FILE` settings before calling the parser (`p
 Symbol-level reference for mechanisms that [ARCHITECTURE.md](../../ARCHITECTURE.md) summarizes under Cross-Cutting Concerns.
 
 ### OpenCode Question Tool Disabled (Action)
+
+The environment-registration mechanism below is V1-specific. V2 instead denies the native `question` action in its effective permissions and cancels any form request that still reaches the CI stream; the gateway retains its human-answerable form flow.
 
 Nobody can answer an interactive `question` in a CI run, and a pending question has no server-side timeout, so a model that called the tool held the run until the execution deadline (#1756). Upstream registers the tool only when `flags.client` is `app`/`cli`/`desktop` or `OPENCODE_ENABLE_QUESTION_TOOL` is set (`tool/registry.ts:207`), and `client` defaults to `cli` (`effect/runtime-flags.ts:56`). `bootstrapOpenCodeServer` (`packages/runtime/src/agent/server.ts`, `pinQuestionToolOff`) therefore pins `OPENCODE_CLIENT=fro-bot-action` (`NON_INTERACTIVE_OPENCODE_CLIENT`) and deletes `OPENCODE_ENABLE_QUESTION_TOOL` before spawn; both survive the `OPENCODE_`-prefix allowlist in `filterAgentEnv`. The tool is then absent from the registry, so the model is never offered it and the stream needs no `question.*` handling. Unlike the file-watcher default (see OpenCode File Watcher Disabled By Default in [ARCHITECTURE.md](../../ARCHITECTURE.md)), an operator value does **not** win — it is overridden with a warning, the same stance as the `subagent_depth` pin in `buildCIConfig`.
 

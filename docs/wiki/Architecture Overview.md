@@ -1,8 +1,19 @@
 ---
 type: architecture
-last-updated: "2026-11-01"
-updated-by: "fe7f6bda"
+last-updated: "2026-11-02"
+updated-by: "f8ee76a3"
 sources:
+  - packages/runtime/src/session/generation.ts
+  - packages/runtime/src/agent/server-v2.ts
+  - packages/runtime/src/agent/directory-quiescence-v2.ts
+  - src/harness/phases/execution-backend.ts
+  - src/harness/phases/release-v2.ts
+  - packages/gateway/src/execute/opencode-generation.ts
+  - packages/gateway/src/execute/run-core-v2.ts
+  - packages/gateway/src/approvals/run-grants.ts
+  - packages/opencode-plugin/src/index.ts
+  - apps/workspace-agent/src/opencode-server-v2.ts
+  - apps/workspace-agent/src/opencode-proxy-v2.ts
   - src/main.ts
   - packages/runtime/src/shared/opencode-v2-pin.json
   - src/post.ts
@@ -71,7 +82,7 @@ summary: "Monorepo structure, module map, and the boundary between gateway execu
 
 # Architecture Overview
 
-Fro Bot Agent is a GitHub Action that runs an AI coding agent (OpenCode, optionally with Oh My OpenAgent) inside GitHub Actions workflows and preserves the agent's session state across CI runs via GitHub Actions cache when the trigger permits cache writes, and via an S3-compatible object store; `issue_comment` and `issues` runs cannot write the cache and depend on the object store for continuity. The codebase is TypeScript, ESM-only, targeting Node 24.
+Fro Bot Agent is a GitHub Action that runs OpenCode inside GitHub Actions workflows and preserves the agent's session state across CI runs via GitHub Actions cache when the trigger permits cache writes, and via an S3-compatible object store; `issue_comment` and `issues` runs cannot write the cache and depend on the object store for continuity. The codebase is TypeScript, ESM-only, targeting Node 24. Oh My OpenAgent and oMo Slim integrations have been removed.
 
 ## Monorepo Structure
 
@@ -83,6 +94,7 @@ The project is organized as a Bun workspace monorepo with two workspace areas:
 | `@fro.bot/harness` | `packages/harness/` | Published, patched OpenCode binary built via LLM-merge integration. Acts as a drop-in replacement for the stock OpenCode CLI in the action setup. Ships as a main package plus per-platform binary packages (`@fro.bot/harness-linux-x64`, etc.). |
 | `@fro-bot/gateway` | `packages/gateway/` | Discord gateway daemon. Listens for Discord mentions and slash commands, acquires the per-repo gateway lock (`repo.json`), and dispatches agent runs via the runtime. Built with Effect for typed error handling and structured concurrency. |
 | Action root | `src/` + `apps/action/` | The GitHub Action itself. Contains the harness (orchestration phases), features (triggers, comments, reviews, observability), and service adapters (GitHub API, cache, setup). Imports `@fro-bot/runtime` for core logic. |
+| `@fro.bot/opencode-plugin` | `packages/opencode-plugin/` | OpenCode V2 plugin providing workspace session-history tools and a pre-dispatch subagent-session reuse guard. |
 | workspace-agent | `apps/workspace-agent/` | Sandboxed Hono HTTP service alongside the gateway. It clones, inspects, updates, and recovers checkouts in the workspace container; hosts an unprivileged OpenCode process behind a bearer-token proxy; and exposes health/readiness probes. |
 
 The `apps/action/` directory holds the thinnest possible entry points — `main.ts` and `post.ts` — which simply re-export from `src/main.ts` and `src/post.ts`. The split exists to support multiple surfaces (the Discord gateway and workspace-agent are now live) that share the runtime package but have their own entry points.
@@ -101,6 +113,14 @@ Within the action (`src/`), the source tree follows a strict four-layer dependen
 All layers may also import from `@fro-bot/runtime`, which is treated as a peer dependency at the same level as `src/shared/`. This layering prevents circular dependencies and keeps testability high — lower layers can be unit-tested without mocking upper ones.
 
 ## Dual Entry Points
+
+### OpenCode generation boundary
+
+V1 and V2 implementations coexist. `packages/runtime/src/session/generation.ts` selects V2 for a parsed major version of two or higher. The Action selects from its resolved executable version, keeping execution and overflow recovery on one backend (`src/harness/phases/execution-backend.ts`). Its default is the digest-verified stock V2 pin; an explicit V1 harness version remains the rollback path. The workspace image still defaults to the V1 harness build, independently of the Action. The gateway reads the workspace's `/readyz` `opencodeVersion` for each run, so the workspace image's version selects both sides of the protocol. An unreadable reported workspace version blocks admission rather than guessing.
+
+V1 uses the SDK session/status model. V2 uses authenticated `/api/` routes, its event envelope, active sessions, forms, shell jobs, and queued session inboxes. The shared V2 primitives normalize these into the harness's activity and ownership vocabulary, while each surface retains its own lifecycle policy. In particular, V2 release requires a stable, quiet directory, rather than an empty ownership ledger alone; see [[Background Subagents and Ownership]].
+
+### Action entry points
 
 The action defines two Node 24 entry points in `action.yaml`:
 
@@ -129,7 +149,7 @@ The Discord gateway (`@fro-bot/gateway`) is a long-running daemon that bridges D
 
 **Execute** (`execute/`) — The agent-execution pipeline triggered by an `@fro-bot` mention or a web launch. `run.ts` orchestrates the full run: acquires the coordination lock, creates a run-state record with heartbeat, and delegates to `run-core.ts` for session creation, prompt send, and event-stream routing. `opencode-attach.ts` connects to the remote OpenCode server, `prompt.ts` builds the Discord prompt, `concurrency.ts` enforces per-channel run limits via a serial queue (`queue.ts`), and `recovery.ts` handles interrupted runs. An in-memory abort registry (`abort-registry.ts`) plus `cancel.ts` back operator-initiated cancellation: a run registered under its `runId` can be aborted mid-flight and settles as `CANCELLED` rather than `FAILED` (see [[Operator Web Control Surface]]). `run-core.ts` also counts inbound events so a stalled run can be distinguished from a lost-event timeout. Permission events emitted by OpenCode during a run are forwarded to Discord approval buttons via the approvals subsystem.
 
-The gateway has no separate drain stage because it does not need one: `run-core.ts` does not return until the run's ownership ledger drains and the parent's follow-up reply is confirmed, so the heartbeat stop, terminal transition, and concurrency-slot handoff in `run.ts` all happen after owned background work has settled. `settle-owned-sessions.ts` is the termination barrier every post-ledger error passes through — it aborts unsettled sessions, confirms by reconciliation rather than trusting the abort response, and re-raises the original error marked _quarantined_ when it cannot confirm. A quarantined failure holds the channel's slot for a bounded window instead of handing the workspace to the next queued run. On restart, `recovery.ts` checks the repository's OpenCode workspace status rather than persisted ownership: a busy or unconfirmable workspace blocks stale-run terminalization, and recovery never deletes coordination locks. See [[Background Subagents and Ownership]].
+The gateway has no separate drain stage: its selected core loop owns completion before returning. V1's `run-core.ts` checks the ledger and parent's follow-up reply; V2's `run-core-v2.ts` also requires a stable, quiet directory. Each generation has a termination barrier that confirms stopped work rather than trusting an abort receipt. Unconfirmed teardown quarantines the run, holding its channel slot for a bounded window. Startup recovery checks generation-appropriate workspace activity rather than trusting persisted ownership, and never deletes coordination locks. See [[Background Subagents and Ownership]].
 
 **Approvals** (`approvals/`) — Discord approval UI for OpenCode permission gate events. When OpenCode asks for a file-system or shell permission during a gateway run, the coordinator (`coordinator.ts`) registers the pending request and the registry (`registry.ts`) manages the entry lifecycle across all in-flight runs. A Discord button click claims the entry (preventing duplicate replies), calls back to OpenCode's reply endpoint, and the authoritative `permission.replied` event from the SDK confirms settlement. The registry is the single source of truth; the coordinator is a thin forwarder bridging the SDK event stream to the registry.
 
@@ -159,7 +179,7 @@ The control API (`server.ts`) clones repositories (`POST /clone`), inspects chec
 
 The service retains root authority for protected staging, journal, and network fetch operations, but the OpenCode server and its tools run under a separate unprivileged identity. Fresh clones are staged in a root-owned directory and handed off through a symlink-safe filesystem walk; git operations against an existing agent-owned checkout run as that agent identity. See [[Setup and Configuration]] for the deployment boundary.
 
-The OpenCode server (`opencode-server.ts`) binds to loopback only; a bearer-token proxy (`opencode-proxy.ts`) is its externally reachable surface on the sandbox network. The gateway attaches through `createRemoteOpenCodeHandle()` in the runtime package — a handle whose `close`/`shutdown` are no-ops because the gateway does not own the remote server process.
+The OpenCode server binds to loopback only. V1 uses `opencode-server.ts` and `opencode-proxy.ts`; V2 uses their `-v2.ts` siblings, with a fresh database and Basic credential per spawn. The V2 proxy exchanges the gateway's bearer for that credential and forwards only the gateway client's route allowlist, excluding credential enumeration. The gateway does not own the remote server's lifetime; the workspace supervisor does.
 
 The proxy ties connection lifetimes together: an upstream error or incomplete close destroys the downstream response, while a departed SSE consumer destroys its upstream event request. SSE remains exempt from the ordinary inactivity timeout; connection teardown prevents that exemption from leaving abandoned subscriptions alive.
 
@@ -270,6 +290,8 @@ The full, unabridged symbol rows for entries that [ARCHITECTURE.md](../../ARCHIT
 The fully annotated gateway mention-loop and harness release trees that [ARCHITECTURE.md](../../ARCHITECTURE.md) condenses in its Data Flow section. The annotated Action phase pipeline is in [[Execution Lifecycle]].
 
 ### Gateway Mention-Loop
+
+The detailed event names below describe V1. A V2 workspace selects `run-core-v2.ts`, normalizes native subagent, shell, and form events, and waits for directory stability before the same terminal run-state and lock-release steps.
 
 ```text
 Discord messageCreate event
@@ -383,7 +405,7 @@ harness-release.yaml (workflow_dispatch OR push: harness-v* tag)
 
 ## Build and Bundle
 
-The project uses `tsdown` (an esbuild-based bundler) to produce `dist/main.js` and `dist/post.js`. The `dist/` directory is committed to the repository — GitHub Actions requires it. CI validates that `dist/` stays in sync with source by running `bun run build` and checking for diffs.
+The project uses `tsdown` (a Rolldown-based bundler) to produce `dist/main.js` and `dist/post.js`. The `dist/` directory is committed to the repository — GitHub Actions requires it. CI validates that `dist/` stays in sync with source by running `bun run build` and checking for diffs.
 
 The runtime package (`packages/runtime/`) is consumed as a workspace dependency via its TypeScript source — no separate build step is required for development, though it has its own `tsdown` config for publishing.
 
