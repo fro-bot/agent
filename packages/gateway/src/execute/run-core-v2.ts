@@ -368,10 +368,34 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
   // directory cannot find them, so the barrier and the watch take them as explicit targets.
   const movedSessionIds = new Set<string>()
 
+  // Shells the server has confirmed as background: their tool call returned `running`. The ledger owns every shell an
+  // owned session creates (a foreground one too, until its call ends), because `shell.created` carries nothing that tells
+  // them apart and the server publishes no event when a job is backgrounded. Ownership is the ledger's business; this set
+  // only decides which owned shells the operator is told the run is waiting on.
+  const confirmedBackgroundShellKeys = new Set<string>()
+
+  // Before the root's first success the gate is not running, so it cannot say why the run is not done. Owned unsettled
+  // background work (a child, or a shell confirmed as background) is a wait the operator should see from the moment it
+  // is known; with none, the root is simply executing (a foreground shell included) and there is no reason. After the
+  // drain begins the gate owns it.
+  function reportPreSuccessWait(): void {
+    if (draining || runId === undefined) return
+    const waitingOnBackgroundWork = ownershipLedger
+      .snapshot()
+      .some(
+        entry =>
+          entry.state !== 'settled' &&
+          (!isShellLedgerKey(entry.sessionId) || confirmedBackgroundShellKeys.has(entry.sessionId)),
+      )
+    if (waitingOnBackgroundWork) setWaitReason(runId, 'ledger-not-drained')
+    else clearWaitReason(runId)
+  }
+
   const ledger: OwnershipLedger = wrapLedgerWithHooks(
     ownershipLedger,
     () => {
       persistOwnership()
+      reportPreSuccessWait()
       drainCompletion?.requestValidation()
     },
     // The single place a directly observed dispatch reaches the coordinator, so its events and approvals route
@@ -751,12 +775,16 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
   function adoptShell(shellId: string, source: 'shell-created' | 'tool-result'): void {
     const key = shellLedgerKey(shellId)
     const fresh = !ledger.isTracked(key)
+    // Only a call that returned `running` is known to be background; the creation frame is not that signal.
+    if (source === 'tool-result') confirmedBackgroundShellKeys.add(key)
     // The command is model-controlled text and stays out of the ledger label and the logs.
     ledger.adopt(key, 'background shell')
     if (noticedShellIds.has(shellId)) ledger.settle(key)
     if (fresh) {
       logger.info({sessionId, shellId, source}, 'run-core: background shell adopted into ownership ledger')
     }
+    // Adopting a shell the creation frame already tracked changes no ledger state, so the ledger hook stays silent.
+    if (source === 'tool-result') reportPreSuccessWait()
   }
 
   // The silence watchdog starts here (the primitive arms on creation), immediately before the `try` whose `finally`

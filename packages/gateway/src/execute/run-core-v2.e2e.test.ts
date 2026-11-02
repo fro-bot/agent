@@ -22,6 +22,7 @@
 import type {AddressInfo} from 'node:net'
 import type {OpenCodeV2ServerHandle} from '@fro-bot/runtime'
 import type {PermissionCoordinator, PermissionRequest} from '../approvals/coordinator.js'
+import type {GatewayLogger} from '../discord/client.js'
 
 import {Buffer} from 'node:buffer'
 import {execFileSync} from 'node:child_process'
@@ -35,10 +36,12 @@ import {afterAll, describe, expect, it, vi} from 'vitest'
 
 import {createPermissionCoordinator} from '../approvals/coordinator.js'
 import {createRunGrants, scopeAlwaysToRun} from '../approvals/run-grants.js'
+import {toOperatorWaitReason} from '../operator-contract/wait-reason.js'
 import {createPostReplyFactoryV2} from './permission-reply-v2.js'
 import {makeCoordinator, makeLogger, makeSink} from './run-core-v2.fixture.js'
 import {runOpenCodeCoreV2} from './run-core-v2.js'
 import {RunCoreError} from './run-core.js'
+import {getWaitReason, onWaitReasonChange} from './wait-reason-registry.js'
 
 const BINARY = process.env.FRO_BOT_OPENCODE_V2_BIN
 const hasBinary = BINARY !== undefined && BINARY !== '' && existsSync(BINARY)
@@ -55,6 +58,14 @@ const EXECUTE_CALL = {name: 'execute', args: {code: EXECUTE_CODE}} as const
 /** One model turn: a single tool call, or plain text that ends the turn. */
 type Turn =
   {readonly tool: {readonly name: string; readonly args: Readonly<Record<string, unknown>>}} | {readonly text: string}
+
+/** The slice of an OpenAI-compatible chat request a router can look at. */
+interface ChatRequest {
+  readonly messages: readonly {readonly role: string; readonly content?: unknown}[]
+}
+
+/** Picks the turn for one chat request that carries tools (the request counts include this one). */
+type TurnRouter = (request: ChatRequest, toolRequests: number) => Turn
 
 interface ScriptedProvider {
   readonly baseURL: string
@@ -77,7 +88,7 @@ function sse(delta: Record<string, unknown>, finish: string | null = null): stri
  * Each chat request WITH tools plays the next scripted turn (the last one repeats). A request without tools (a title
  * generation) gets plain text and does not advance the script.
  */
-async function startScriptedProvider(turns: readonly Turn[]): Promise<ScriptedProvider> {
+async function startScriptedProvider(turns: readonly Turn[] | TurnRouter): Promise<ScriptedProvider> {
   let requests = 0
   let toolRequests = 0
   const server = http.createServer((req, res) => {
@@ -90,11 +101,15 @@ async function startScriptedProvider(turns: readonly Turn[]): Promise<ScriptedPr
         return
       }
       requests += 1
-      const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {tools?: unknown[]}
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {tools?: unknown[]} & Partial<ChatRequest>
       const hasTools = (body.tools?.length ?? 0) > 0
-      const turn: Turn = hasTools
-        ? (turns[Math.min(toolRequests, turns.length - 1)] ?? {text: FINAL_TEXT})
-        : {text: FINAL_TEXT}
+      let turn: Turn = {text: FINAL_TEXT}
+      if (hasTools) {
+        turn =
+          typeof turns === 'function'
+            ? turns({messages: body.messages ?? []}, toolRequests)
+            : (turns[Math.min(toolRequests, turns.length - 1)] ?? {text: FINAL_TEXT})
+      }
       if (hasTools) toolRequests += 1
       res.writeHead(200, {'content-type': 'text/event-stream', 'cache-control': 'no-cache'})
       res.write(sse({role: 'assistant', content: ''}))
@@ -193,7 +208,7 @@ interface StockServer {
  * so a turn can name a file in it) and edits gated behind an approval.
  */
 async function startStockServer(
-  script: (repo: string) => readonly Turn[],
+  script: (repo: string) => readonly Turn[] | TurnRouter,
   permissions: readonly {action: string; resource: string; effect: 'allow' | 'ask' | 'deny'}[] = [
     {action: 'edit', resource: '*', effect: 'ask'},
   ],
@@ -557,3 +572,268 @@ describe.skipIf(!hasBinary)('an operator Always against the real OpenCode v2.2.0
   }, 180_000)
 })
 /* eslint-enable no-void */
+
+const CHILD_MARKER = 'CHILD-TASK-MARKER'
+const SUBAGENT_ROOT_TEXT = 'subagent dispatched'
+const SUBAGENT_DONE_TEXT = 'DONE'
+
+/**
+ * The root dispatches ONE background subagent (when `dispatch`), which runs `sleep 8` and replies DONE; the root
+ * answers in plain text. Without `dispatch` the root only answers. With `rootBusy` the root keeps executing (a 3 s
+ * foreground shell) after the dispatch, so its first success comes while the child still runs. With
+ * `rootForegroundShell` (and no dispatch) the root runs a 3 s foreground shell, then answers. Requests are told apart by their first user message,
+ * so the script does not depend on how the root's and the child's requests interleave.
+ */
+function subagentRouter({
+  dispatch,
+  rootBusy = false,
+  rootForegroundShell = false,
+}: {
+  dispatch: boolean
+  rootBusy?: boolean
+  rootForegroundShell?: boolean
+}): TurnRouter {
+  return request => {
+    const firstUser = request.messages.find(message => message.role === 'user')
+    const isChild = JSON.stringify(firstUser?.content ?? '').includes(CHILD_MARKER)
+    const toolResults = request.messages.filter(message => message.role === 'tool').length
+    if (isChild) {
+      return toolResults === 0
+        ? {tool: {name: 'shell', args: {command: 'sleep 8', description: 'wait'}}}
+        : {text: SUBAGENT_DONE_TEXT}
+    }
+    if (dispatch && toolResults === 0) {
+      return {
+        tool: {
+          name: 'subagent',
+          args: {
+            agent: 'general',
+            description: 'sleeper',
+            prompt: `${CHILD_MARKER}: run sleep 8, then reply DONE`,
+            background: true,
+          },
+        },
+      }
+    }
+    if (!dispatch && rootForegroundShell && toolResults === 0) {
+      return {tool: {name: 'shell', args: {command: 'sleep 3', description: 'foreground'}}}
+    }
+    if (dispatch && rootBusy && toolResults === 1) {
+      return {tool: {name: 'shell', args: {command: 'sleep 3', description: 'stay busy'}}}
+    }
+    return {text: SUBAGENT_ROOT_TEXT}
+  }
+}
+
+interface WaitTimeline {
+  /** Each change of the run's wait reason (wire value, or `cleared`), with how much of the ledger was unsettled then. */
+  readonly changes: {
+    readonly atMs: number
+    readonly wire: string
+    readonly unsettled: number
+    readonly entries: string
+  }[]
+  /** The loop's own lines that explain a change: root idle (execution.succeeded), notices, declined attempts. */
+  readonly events: {readonly atMs: number; readonly message: string}[]
+  readonly logger: GatewayLogger
+  readonly stop: () => void
+}
+
+/** Records every wait-reason change of `runId` and the loop log lines around it, for the timeline assertions. */
+function recordWaitTimeline(runId: string, ledger: ReturnType<typeof createOwnershipLedger>): WaitTimeline {
+  const startedAt = performance.now()
+  const elapsed = (): number => Math.round(performance.now() - startedAt)
+  const changes: WaitTimeline['changes'][number][] = []
+  const events: {atMs: number; message: string}[] = []
+  const stop = onWaitReasonChange(changed => {
+    if (changed !== runId) return
+    const code = getWaitReason(runId)
+    changes.push({
+      atMs: elapsed(),
+      wire: code === undefined ? 'cleared' : (toOperatorWaitReason(code) ?? `unmapped:${code}`),
+      unsettled: ledger.snapshot().filter(entry => entry.state !== 'settled').length,
+      entries: ledger
+        .snapshot()
+        .map(entry => `${entry.sessionId.slice(0, 12)}=${entry.state}`)
+        .join(','),
+    })
+  })
+  const record = (context: unknown, message: string | undefined): void => {
+    if (
+      message === undefined ||
+      !/run-core: (?:root idle|child completion|background shell|drain completion|.*adopt)/.test(message)
+    )
+      return
+    const reason = (context as {reason?: string} | null)?.reason
+    events.push({atMs: elapsed(), message: reason === undefined ? message : `${message} [${reason}]`})
+  }
+  const logger: GatewayLogger = {
+    debug: record,
+    info: record,
+    warn: () => {},
+    error: () => {},
+  }
+  return {changes, events, logger, stop}
+}
+
+/** Consecutive repeats and `cleared` dropped: the order in which the operator would have seen the reasons. */
+function seenReasons(timeline: WaitTimeline): string[] {
+  const seen: string[] = []
+  for (const {wire} of timeline.changes) {
+    if (wire !== 'cleared' && seen.at(-1) !== wire) seen.push(wire)
+  }
+  return seen
+}
+
+function printTimeline(label: string, timeline: WaitTimeline): void {
+  if (process.env.FRO_BOT_E2E_TIMELINE !== '1') return
+  const rows = [
+    ...timeline.changes.map(change => ({
+      atMs: change.atMs,
+      row: `reason -> ${change.wire} (unsettled ${change.unsettled}: ${change.entries})`,
+    })),
+    ...timeline.events.map(event => ({atMs: event.atMs, row: `log: ${event.message}`})),
+  ].sort((a, b) => a.atMs - b.atMs)
+  // eslint-disable-next-line no-console
+  console.info(
+    `[wait-reason timeline: ${label}]\n${rows.map(({atMs, row}) => `${String(atMs).padStart(6)} ms  ${row}`).join('\n')}`,
+  )
+}
+
+describe.skipIf(!hasBinary)('the wait reason on a real run with a background subagent (#2007)', () => {
+  it('reports awaiting-background-task for the whole subagent run, then confirming-completion, then clears', async () => {
+    // #given — the root dispatches one background subagent that sleeps 8 s, then the root answers
+    const stock = await startStockServer(() => subagentRouter({dispatch: true}), [])
+    const ledger = createOwnershipLedger()
+    const timeline = recordWaitTimeline('run-subagent', ledger)
+    const {coordinator} = answeringCoordinator(stock)
+    const sink = makeSink()
+
+    // #when
+    await runOpenCodeCoreV2({
+      client: stock.client,
+      directory: stock.repo,
+      promptText: 'dispatch the sleeper',
+      sink,
+      signal: AbortSignal.timeout(90_000),
+      logger: timeline.logger,
+      coordinator,
+      ownershipLedger: ledger,
+      runId: 'run-subagent',
+      inactivityTimeoutMs: 60_000,
+      streamSilenceTimeoutMs: 45_000,
+    })
+    timeline.stop()
+    printTimeline('background subagent', timeline)
+
+    // #then — the child was adopted and settled; the operator saw the background wait, then the confirmation, then nothing
+    expect(ledger.snapshot().map(entry => entry.state)).toEqual(['settled'])
+    expect(seenReasons(timeline)).toEqual(['awaiting-background-task', 'confirming-completion'])
+    expect(timeline.changes.at(-1)?.wire).toBe('cleared')
+    // …and the background wait covered the child's run: no change to anything else happened while it was unsettled
+    const whileUnsettled = timeline.changes.filter(change => change.unsettled > 0)
+    expect(whileUnsettled.length).toBeGreaterThan(0)
+    expect(whileUnsettled.every(change => change.wire === 'awaiting-background-task')).toBe(true)
+    // The first report lands when the child is adopted, i.e. long before the 8 s sleep ends
+    expect(timeline.changes[0]?.wire).toBe('awaiting-background-task')
+    expect(timeline.changes[0]?.atMs).toBeLessThan(6_000)
+  }, 120_000)
+
+  it('reports awaiting-background-task while the root is still executing, before its first success', async () => {
+    // #given — the root dispatches the subagent, then keeps working for 3 s; the child sleeps 8 s
+    const stock = await startStockServer(() => subagentRouter({dispatch: true, rootBusy: true}), [])
+    const ledger = createOwnershipLedger()
+    const timeline = recordWaitTimeline('run-root-busy', ledger)
+    const {coordinator} = answeringCoordinator(stock)
+
+    // #when
+    await runOpenCodeCoreV2({
+      client: stock.client,
+      directory: stock.repo,
+      promptText: 'dispatch the sleeper, then keep working',
+      sink: makeSink(),
+      signal: AbortSignal.timeout(90_000),
+      logger: timeline.logger,
+      coordinator,
+      ownershipLedger: ledger,
+      runId: 'run-root-busy',
+      inactivityTimeoutMs: 60_000,
+      streamSilenceTimeoutMs: 45_000,
+    })
+    timeline.stop()
+    printTimeline('background subagent, root still executing', timeline)
+
+    // #then — the reason was already set when the root's first success arrived, not only after it
+    const rootIdleAt = timeline.events.find(event => event.message.startsWith('run-core: root idle'))?.atMs
+    expect(rootIdleAt).toBeGreaterThan(2_000)
+    expect(timeline.changes[0]?.wire).toBe('awaiting-background-task')
+    expect(timeline.changes[0]?.unsettled).toBeGreaterThan(0)
+    expect(timeline.changes[0]?.atMs).toBeLessThan(rootIdleAt as number)
+    expect(seenReasons(timeline)).toEqual(['awaiting-background-task', 'confirming-completion'])
+    expect(timeline.changes.at(-1)?.wire).toBe('cleared')
+  }, 120_000)
+
+  it('shows no reason while the root runs a foreground shell, then only the confirmation window', async () => {
+    // #given — the root runs `sleep 3` in the foreground and answers; nothing is backgrounded
+    const stock = await startStockServer(() => subagentRouter({dispatch: false, rootForegroundShell: true}), [])
+    const ledger = createOwnershipLedger()
+    const timeline = recordWaitTimeline('run-foreground', ledger)
+    const {coordinator} = answeringCoordinator(stock)
+
+    // #when
+    await runOpenCodeCoreV2({
+      client: stock.client,
+      directory: stock.repo,
+      promptText: 'run a foreground sleep',
+      sink: makeSink(),
+      signal: AbortSignal.timeout(90_000),
+      logger: timeline.logger,
+      coordinator,
+      ownershipLedger: ledger,
+      runId: 'run-foreground',
+      inactivityTimeoutMs: 60_000,
+      streamSilenceTimeoutMs: 45_000,
+    })
+    timeline.stop()
+    printTimeline('foreground shell only', timeline)
+
+    // #then — the root was only executing for those 3 s: no reason until it went idle, and never background work
+    const rootIdleAt = timeline.events.find(event => event.message.startsWith('run-core: root idle'))?.atMs
+    expect(rootIdleAt).toBeGreaterThan(2_000)
+    expect(timeline.changes[0]?.atMs).toBeGreaterThanOrEqual(rootIdleAt as number)
+    expect(seenReasons(timeline)).toEqual(['confirming-completion'])
+    expect(timeline.changes.at(-1)?.wire).toBe('cleared')
+  }, 120_000)
+
+  it('control: a run with no background work never reports awaiting-background-task', async () => {
+    // #given — the root only answers
+    const stock = await startStockServer(() => subagentRouter({dispatch: false}), [])
+    const ledger = createOwnershipLedger()
+    const timeline = recordWaitTimeline('run-control', ledger)
+    const {coordinator} = answeringCoordinator(stock)
+    const sink = makeSink()
+
+    // #when
+    await runOpenCodeCoreV2({
+      client: stock.client,
+      directory: stock.repo,
+      promptText: 'Reply with OK',
+      sink,
+      signal: AbortSignal.timeout(90_000),
+      logger: timeline.logger,
+      coordinator,
+      ownershipLedger: ledger,
+      runId: 'run-control',
+      inactivityTimeoutMs: 60_000,
+      streamSilenceTimeoutMs: 45_000,
+    })
+    timeline.stop()
+    printTimeline('control (no background work)', timeline)
+
+    // #then — the quiet window is confirmation, never background work
+    expect(sink.text()).toContain(SUBAGENT_ROOT_TEXT)
+    expect(ledger.snapshot()).toEqual([])
+    expect(seenReasons(timeline)).not.toContain('awaiting-background-task')
+    expect(timeline.changes.at(-1)?.wire).toBe('cleared')
+  }, 120_000)
+})
