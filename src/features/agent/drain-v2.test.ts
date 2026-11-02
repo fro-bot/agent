@@ -3,10 +3,17 @@
  * stability window shortened (a few readings a few milliseconds apart) so the timing is real and the suite stays fast.
  */
 import type {ActionOpenCodeV2Client, OpenCodeV2ShutdownResult} from '@fro-bot/runtime'
-import {createOwnershipLedger, shellLedgerKey} from '@fro-bot/runtime'
-import {describe, expect, it, vi} from 'vitest'
+import {
+  BLOCKING_SET_ID_CAP,
+  createOwnershipLedger,
+  DRAIN_UNREADABLE_MESSAGE,
+  DRAIN_WAITING_MESSAGE,
+  shellLedgerKey,
+} from '@fro-bot/runtime'
+import {afterEach, describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {
+  createReleaseTally,
   drainUntilQuietV2,
   releaseRunV2,
   stopAndConfirmQuietV2,
@@ -648,5 +655,176 @@ describe('releaseRunV2', () => {
     // #then
     expect(outcome.shutdown).toBeNull()
     expect(outcome.quiet).toBe(true)
+  })
+})
+
+describe('drain progress logging', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  const infoLines = (logger: unknown, message: string) =>
+    vi
+      .mocked((logger as ReturnType<typeof createMockLogger>).info)
+      .mock.calls.filter(([line]) => line === message)
+      .map(([, fields]) => fields as Record<string, unknown>)
+
+  it('logs once when the blocker changes, not once per reading, and keeps the per-reading debug line', async () => {
+    // #given a notice queued on the root for a while: many readings, one blocker
+    const server = createServer()
+    server.state.inbox.set(ROOT, 1)
+    later(150, () => server.state.inbox.set(ROOT, 0))
+    const tally = createReleaseTally()
+    const ctx = context(server, {tally})
+
+    // #when
+    const outcome = await drainUntilQuietV2(ctx, {deadlineMs: 2_000, pollIntervalMs: 5})
+
+    // #then
+    expect(outcome).toEqual({kind: 'quiet'})
+    expect(tally.readings).toBeGreaterThan(5)
+    const waiting = infoLines(ctx.logger, DRAIN_WAITING_MESSAGE)
+    expect(waiting).toHaveLength(1)
+    expect(waiting[0]).toMatchObject({
+      sessions: {count: 0, ids: []},
+      shells: {count: 0, ids: []},
+      inbox: {count: 1, items: [{sessionId: ROOT, queued: 1}]},
+      readings: 1,
+      elapsedMs: expect.any(Number) as unknown,
+    })
+    const debugReadings = vi
+      .mocked(ctx.logger.debug)
+      .mock.calls.filter(([line]) => line === 'The run directory is not quiet yet')
+    expect(debugReadings.length).toBeGreaterThan(1)
+  })
+
+  it('logs a heartbeat about every 60 s while the same blocker stays', async () => {
+    // #given a shell that never ends, read once a second (fake timers)
+    vi.useFakeTimers()
+    const server = createServer()
+    server.state.shells.set(SHELL, {owner: ROOT})
+    const ctx = context(server, {stability: {requiredObservations: 3, minSpacingMs: 1_000, minSpanMs: 2_000}})
+
+    // #when
+    const draining = drainUntilQuietV2(ctx, {deadlineMs: 200_000, pollIntervalMs: 1_000})
+    await vi.advanceTimersByTimeAsync(185_000)
+    server.state.shells.delete(SHELL)
+    await vi.advanceTimersByTimeAsync(10_000)
+    const outcome = await draining
+
+    // #then one line for the change, then one a minute
+    expect(outcome).toEqual({kind: 'quiet'})
+    const waiting = infoLines(ctx.logger, DRAIN_WAITING_MESSAGE)
+    expect(waiting).toHaveLength(4)
+    const elapsed = waiting.map(fields => fields.elapsedMs as number)
+    expect(elapsed[0]).toBe(0)
+    expect(elapsed[1]).toBeGreaterThanOrEqual(60_000)
+    expect(elapsed[1]).toBeLessThan(62_000)
+    expect(elapsed[3]).toBeGreaterThanOrEqual(180_000)
+    for (const fields of waiting) expect(fields).toMatchObject({shells: {count: 1, ids: [SHELL]}})
+  })
+
+  it('caps every list in the line and keeps the true count', async () => {
+    // #given more running shells than the cap
+    const server = createServer()
+    const total = BLOCKING_SET_ID_CAP + 5
+    for (let index = 0; index < total; index += 1) server.state.shells.set(`sh_${index}`, {owner: null})
+    const ctx = context(server)
+
+    // #when
+    await drainUntilQuietV2(ctx, {deadlineMs: 60, pollIntervalMs: 5})
+
+    // #then
+    const waiting = infoLines(ctx.logger, DRAIN_WAITING_MESSAGE)
+    expect(waiting).toHaveLength(1)
+    const shells = waiting[0]?.shells as {count: number; ids: string[]}
+    expect(shells.count).toBe(total)
+    expect(shells.ids).toHaveLength(BLOCKING_SET_ID_CAP)
+  })
+
+  it('logs an unreadable directory once, with the reason', async () => {
+    // #given every shell read fails
+    const server = createServer()
+    const networkError = {success: false, error: {kind: 'network', message: 'down'}} as const
+    server.raw.listShells.mockImplementation(async () => networkError as never)
+    const ctx = context(server)
+
+    // #when
+    const outcome = await drainUntilQuietV2(ctx, {deadlineMs: 120, pollIntervalMs: 5})
+
+    // #then
+    expect(outcome).toEqual({kind: 'expired'})
+    const unreadable = infoLines(ctx.logger, DRAIN_UNREADABLE_MESSAGE)
+    expect(unreadable).toHaveLength(1)
+    expect(unreadable[0]).toMatchObject({reason: expect.stringContaining('shell.list') as unknown, readings: 1})
+  })
+
+  it('logs ids and enum-like fields only: no message text or command text from an inbox item', async () => {
+    // #given an inbox item that carries text and a command in the fixture
+    const server = createServer()
+    server.raw.listSessionInbox.mockImplementation(async ({sessionId}: {sessionId: string}) => {
+      const item = {
+        type: 'synthetic',
+        source: 'shell',
+        text: 'SECRET-MESSAGE-TEXT',
+        command: 'SECRET-COMMAND rm -rf /',
+      }
+      return ok({queued: sessionId === ROOT ? 1 : 0, ...(sessionId === ROOT ? {items: [item]} : {})})
+    })
+    const ctx = context(server)
+
+    // #when
+    await drainUntilQuietV2(ctx, {deadlineMs: 60, pollIntervalMs: 5})
+
+    // #then the new info lines name the item by kind, never by content
+    const waiting = infoLines(ctx.logger, DRAIN_WAITING_MESSAGE)
+    expect(waiting).toHaveLength(1)
+    expect(waiting[0]).toMatchObject({
+      inbox: {items: [{sessionId: ROOT, queued: 1, items: [{type: 'synthetic', source: 'shell'}]}]},
+    })
+    expect(JSON.stringify(vi.mocked(ctx.logger.info).mock.calls)).not.toContain('SECRET')
+  })
+
+  it('names the blocking set on the verdict line when the directory could not be confirmed quiet', async () => {
+    // #given a child that stays live and a stop that never lands
+    const server = createServer()
+    const ledger = createOwnershipLedger()
+    ledger.adopt(CHILD, 'stuck child')
+    server.state.sessions.set(CHILD, {parentID: ROOT, directory: DIRECTORY})
+    server.state.active.add(CHILD)
+    server.state.interruptsLand = false
+    const {options} = release(server, {ledger, deadlineMs: 80, stopTimeoutMs: 150})
+
+    // #when
+    const outcome = await releaseRunV2(options)
+
+    // #then
+    expect(outcome).toMatchObject({drain: 'expired', stopped: true, quiet: false})
+    const verdict = infoLines(options.logger, 'Run release verdict')
+    expect(verdict).toHaveLength(1)
+    expect(verdict[0]).toMatchObject({
+      quiet: false,
+      blocking: {
+        sessions: {count: 1, ids: [CHILD]},
+        shells: {count: 0, ids: []},
+        inbox: {count: 0, items: []},
+      },
+    })
+  })
+
+  it('leaves the blocking set off the verdict line when the directory was confirmed quiet', async () => {
+    // #given a blocker that clears
+    const server = createServer()
+    server.state.inbox.set(ROOT, 1)
+    later(40, () => server.state.inbox.set(ROOT, 0))
+    const {options} = release(server)
+
+    // #when
+    await releaseRunV2(options)
+
+    // #then
+    const verdict = infoLines(options.logger, 'Run release verdict')
+    expect(verdict[0]).toMatchObject({quiet: true})
+    expect(verdict[0]).not.toHaveProperty('blocking')
   })
 })

@@ -8,7 +8,7 @@ import {
   SHELL_LIST_RUNNING_RESPONSE,
   SHELL_SESSION_ID,
 } from './event-v2.fixtures.js'
-import {createRemoteOpenCodeV2Client, V2_HEARTBEAT_FRAME} from './remote-client-v2.js'
+import {createRemoteOpenCodeV2Client, V2_HEARTBEAT_FRAME, V2_INBOX_ITEM_META_CAP} from './remote-client-v2.js'
 
 interface RecordedRequest {
   readonly url: string
@@ -660,9 +660,64 @@ describe('createRemoteOpenCodeV2Client', () => {
       const result = await client.listSessionInbox({sessionId: 'ses_a/b'})
 
       // #then
-      expect(result).toEqual({success: true, data: {queued: 2}})
+      expect(result).toEqual({
+        success: true,
+        data: {
+          queued: 2,
+          items: [
+            {type: 'synthetic', delivery: 'steer', source: 'shell'},
+            {type: 'user', delivery: 'steer'},
+          ],
+        },
+      })
       expect(requests[0]).toMatchObject({url: 'http://w/api/session/ses_a%2Fb/inbox', method: 'GET'})
       expect(requests[0]?.headers).toMatchObject(AUTH)
+    })
+
+    it('keeps enum-like item fields only: no message text, no free-form values, bounded count', async () => {
+      // #given
+      const items = [
+        // Free-form values are not enum-like: dropped, and an item left with nothing readable is skipped.
+        {
+          id: 'msg_free',
+          type: 'SECRET free form text',
+          delivery: 'x'.repeat(64),
+          payload: {text: 'T', metadata: {source: 'SECRET a b'}},
+        },
+        ...Array.from({length: V2_INBOX_ITEM_META_CAP + 5}, (_, index) => ({
+          id: `msg_${index}`,
+          type: 'synthetic',
+          delivery: 'steer',
+          payload: {text: 'SECRET-MESSAGE-TEXT rm -rf /', metadata: {source: 'shell', command: 'SECRET-COMMAND'}},
+        })),
+      ]
+      const client = createRemoteOpenCodeV2Client({
+        baseUrl: 'http://w',
+        fetch: makeFetch(() => json(200, {data: items})).fetch,
+      })
+
+      // #when
+      const result = await client.listSessionInbox({sessionId: 'ses_1'})
+
+      // #then
+      expect(result.success).toBe(true)
+      if (!result.success) return
+      expect(result.data.queued).toBe(items.length)
+      // the free-form item is first and yields nothing, so the first nine real items fill what is left of the cap
+      expect(result.data.items).toHaveLength(V2_INBOX_ITEM_META_CAP - 1)
+      expect(result.data.items?.[0]).toEqual({type: 'synthetic', delivery: 'steer', source: 'shell'})
+      expect(JSON.stringify(result.data)).not.toMatch(/SECRET|rm -rf|msg_/)
+    })
+
+    it('omits items when no item carries a readable field', async () => {
+      // #given
+      const client = createRemoteOpenCodeV2Client({
+        baseUrl: 'http://w',
+        fetch: makeFetch(() => json(200, {data: [{id: 'msg_1', payload: {text: 'x'}}]})).fetch,
+      })
+
+      // #when / #then
+      expect(await client.listSessionInbox({sessionId: 'ses_1'})).toEqual({success: true, data: {queued: 1}})
     })
 
     it('reads an empty inbox', async () => {

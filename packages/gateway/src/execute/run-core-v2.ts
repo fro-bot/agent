@@ -53,6 +53,7 @@ import type {FormDirectoryV2} from './question-client-v2.js'
 import type {CoreStreamSink, RunCoreErrorKind} from './run-core.js'
 import {
   createDirectoryStabilityGate,
+  createDrainProgress,
   createInactivityTimer,
   createLedgerReconciler,
   createOwnershipLedger,
@@ -445,6 +446,10 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
     runPass: async () => runLivePasses(liveReconcileOptions),
   })
 
+  // Info lines for a drain that waits: a change of what the directory shows, and a heartbeat. The drain gate's own
+  // per-reading line stays at debug. `lastBlocking` names the blocker on the deadline line below.
+  const drainProgress = createDrainProgress({emit: (message, fields) => logger.info({sessionId, ...fields}, message)})
+
   const drain = createDrainCompletionV2({
     rootSessionId: sessionId,
     ledger,
@@ -453,13 +458,16 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
     // holds.
     directoryGate: createDirectoryStabilityGate({
       ...directoryStability,
-      observe: async signal =>
-        observeDirectoryV2({
+      observe: async signal => {
+        const observation = await observeDirectoryV2({
           client,
           directory,
           signal,
           inbox: {runStartedAt, ownedSessionIds: () => ownedSessionIdsOf(sessionId, ledger)},
-        }),
+        })
+        drainProgress.observe(observation)
+        return observation
+      },
     }),
     ...(directoryStability?.minSpacingMs === undefined ? {} : {directorySpacingMs: directoryStability.minSpacingMs}),
     signal: combinedSignal,
@@ -1407,7 +1415,15 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
       // The run's own deadline covers execution AND drain. Cancelling and confirming every unsettled entry (outstanding
       // AND unknown) lives in `throwWithBarrier`, which cancels per entry rather than with a tree-cancel.
       logger.warn(
-        {sessionId, outstanding: ledger.outstanding(), unknown: ledger.unknown(), totalEvents, activityEvents},
+        {
+          sessionId,
+          outstanding: ledger.outstanding(),
+          unknown: ledger.unknown(),
+          totalEvents,
+          activityEvents,
+          // The last non-quiet reading: what the directory was still showing, so the failure line names the blocker.
+          ...(drainProgress.lastBlocking() === null ? {} : {blocking: drainProgress.lastBlocking()}),
+        },
         'run-core: drain deadline expired — cancelling unsettled owned work, run reports incomplete',
       )
       throw await throwWithBarrier('drain-timeout', 'Run timed out while draining outstanding owned work')

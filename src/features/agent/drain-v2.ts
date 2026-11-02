@@ -1,6 +1,8 @@
 import type {
   ActionOpenCodeV2Client,
+  BlockingDetail,
   DirectoryActivity,
+  DirectoryObservation,
   DirectoryStabilityTuning,
   OpenCodeV2ServerHandle,
   OpenCodeV2ShutdownResult,
@@ -10,6 +12,8 @@ import type {Logger} from '../../shared/logger.js'
 import {
   awaitDirectoryStability,
   createDirectoryStabilityGate,
+  createDrainProgress,
+  describeObservation,
   DIRECTORY_QUIESCENCE_MIN_SPACING_MS,
   isShellLedgerKey,
   observeDirectoryV2,
@@ -68,8 +72,9 @@ export const UNREADABLE_READINGS_BEFORE_DRAIN_EXIT = 20
 const DEFAULT_DRAIN_POLL_INTERVAL_MS = 250
 
 /**
- * What one release did, for the single verdict line. Counts only; nothing the model controls (shell commands, ids of
- * other runs) goes in. Mutable on purpose: the drain and the stop add to it as they read and act.
+ * What one release did, for the single verdict line. Counts, plus the blocking set of the last non-quiet reading (ids
+ * and enum-like fields, capped: `describeBlockingSet`); nothing the model controls (shell commands, message text) goes
+ * in. Mutable on purpose: the drain and the stop add to it as they read and act.
  */
 export interface ReleaseTally {
   /** Directory readings taken, quiet or not, across the drain and the stop. */
@@ -80,10 +85,18 @@ export interface ReleaseTally {
   shellsDeleted: number
   /** Sessions the stop interrupted (an interrupt that was a no-op is not counted). */
   sessionsInterrupted: number
+  /** What the latest non-quiet reading, of the drain or the stop, was blocked on; `null` before any. */
+  lastBlocking: BlockingDetail | null
 }
 
 export function createReleaseTally(): ReleaseTally {
-  return {readings: 0, quietStreak: 0, shellsDeleted: 0, sessionsInterrupted: 0}
+  return {readings: 0, quietStreak: 0, shellsDeleted: 0, sessionsInterrupted: 0, lastBlocking: null}
+}
+
+function noteReading(tally: ReleaseTally | undefined, observation: DirectoryObservation): void {
+  if (tally === undefined) return
+  tally.readings += 1
+  tally.lastBlocking = describeObservation(observation) ?? tally.lastBlocking
 }
 
 /** What a release needs to know about the run. */
@@ -289,7 +302,7 @@ export async function stopAndConfirmQuietV2(
       ...context.stability,
       observe: async signal => {
         const observation = await observe(context, signal)
-        if (context.tally !== undefined) context.tally.readings += 1
+        noteReading(context.tally, observation)
         if (observation.kind === 'quiescent') return observation
         lastReason =
           observation.kind === 'unreadable'
@@ -370,11 +383,15 @@ export async function drainUntilQuietV2(
 
   let unobservablePasses = 0
   let unreadableReadings = 0
+  // A drain that waits for half an hour must say what it waits on: info on a change of the blocking set and on a
+  // heartbeat, where the per-reading line below stays at debug.
+  const progress = createDrainProgress({emit: (message, fields) => logger.info(message, fields)})
   const gate = createDirectoryStabilityGate({
     ...context.stability,
     observe: async readSignal => {
       const observation = await observe(context, readSignal)
-      if (context.tally !== undefined) context.tally.readings += 1
+      noteReading(context.tally, observation)
+      progress.observe(observation)
       unreadableReadings = observation.kind === 'unreadable' ? unreadableReadings + 1 : 0
       if (observation.kind !== 'quiescent') {
         logger.debug('The run directory is not quiet yet', {
@@ -548,6 +565,8 @@ export async function releaseRunV2(options: ReleaseRunOptions): Promise<ReleaseO
     sessionsInterrupted: tally.sessionsInterrupted,
     unknownCount,
     ...(declineReason === null ? {} : {declineReason}),
+    // Names the blocker on the failure line itself: the last non-quiet reading, when the directory was not confirmed.
+    ...(quiet || tally.lastBlocking === null ? {} : {blocking: tally.lastBlocking}),
   })
 
   if (options.onSettled !== undefined) {

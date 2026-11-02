@@ -87,9 +87,45 @@ export interface RemoteOpenCodeV2ClientOptions {
   readonly fetch?: typeof fetch
 }
 
+/**
+ * What one queued inbox item is, and nothing it says: the enum-like fields only (`type`, `delivery`, and the
+ * `payload.metadata.source` a synthetic item carries). Message text and every other payload field are dropped here, at
+ * the client, so nothing downstream can log them. A field that is not a short token is dropped too.
+ */
+export interface V2InboxItemMeta {
+  readonly type?: string
+  readonly delivery?: string
+  readonly source?: string
+}
+
 export interface V2InboxSummary {
   /** Items enqueued on the session and not yet delivered into a turn. */
   readonly queued: number
+  /** Metadata of the first `V2_INBOX_ITEM_META_CAP` queued items; absent when none carried a readable field. */
+  readonly items?: readonly V2InboxItemMeta[]
+}
+
+/** Bound on the item metadata kept per session: a reading stays small however long an inbox grows. */
+export const V2_INBOX_ITEM_META_CAP = 10
+
+const ENUM_TOKEN = /^[A-Z][\w.-]{0,31}$/i
+
+function enumToken(value: string | null): string | null {
+  return value !== null && ENUM_TOKEN.test(value) ? value : null
+}
+
+function readInboxItemMeta(item: unknown): V2InboxItemMeta | null {
+  const type = enumToken(getStringProperty(item, 'type'))
+  const delivery = enumToken(getStringProperty(item, 'delivery'))
+  const source = enumToken(
+    getStringProperty(getObjectProperty(getObjectProperty(item, 'payload'), 'metadata'), 'source'),
+  )
+  if (type === null && delivery === null && source === null) return null
+  return {
+    ...(type === null ? {} : {type}),
+    ...(delivery === null ? {} : {delivery}),
+    ...(source === null ? {} : {source}),
+  }
 }
 
 /** A model as the Action config names it. V2 takes `{id, providerID}` on the wire. */
@@ -488,7 +524,9 @@ export function createRemoteOpenCodeV2Client(options: RemoteOpenCodeV2ClientOpti
       })
       if (!result.success) return result
       const data = getObjectProperty(result.data, 'data')
-      return Array.isArray(data) ? ok({queued: data.length}) : err({kind: 'parse'})
+      if (!Array.isArray(data)) return err({kind: 'parse'})
+      const items = data.slice(0, V2_INBOX_ITEM_META_CAP).flatMap(item => readInboxItemMeta(item) ?? [])
+      return ok({queued: data.length, ...(items.length === 0 ? {} : {items})})
     },
 
     listShells: async ({directory, signal}) => {
