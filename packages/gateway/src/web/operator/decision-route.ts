@@ -94,6 +94,8 @@ function isPermissionReply(value: unknown): value is PermissionReply {
  */
 function decisionOutcomeToRejectedReason(outcome: Exclude<DecisionOutcome, 'ok'>): ApprovalRejectedReason {
   switch (outcome) {
+    case 'reject-only':
+      return 'reject_only'
     case 'already-claimed':
       return 'already_claimed'
     case 'not-found':
@@ -257,6 +259,9 @@ export function buildDecisionRoute(app: Hono, deps: DecisionRouteDeps): void {
       }
 
       // ── Gate 9: Map outcome → JSON response ───────────────────────────────
+      // A reject-only request answers with a 4xx error, not a `{state}`: the request is still open and only a reject
+      // settles it. `OperatorDecisionState` has no state for that, so the contract is left alone.
+      if (outcome === 'reject-only') return c.json({error: 'reject only'}, 409)
       const state = toOperatorDecisionState(outcome)
       return c.json({state}, 200)
     } catch (error: unknown) {

@@ -52,6 +52,7 @@ vi.mock('../approvals/coordinator.js', () => ({
 
 vi.mock('../discord/approvals.js', () => ({
   buildApprovalEmbed: vi.fn().mockReturnValue({type: 'embed'}),
+  approvalCardRejectOnly: vi.fn().mockReturnValue(false),
   buildApprovalButtons: vi.fn().mockReturnValue({type: 'buttons'}),
   buildSettledEmbed: vi.fn().mockReturnValue({type: 'settled-embed'}),
   parseApprovalCustomId: vi.fn().mockReturnValue(null),

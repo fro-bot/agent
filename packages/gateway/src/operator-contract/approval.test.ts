@@ -51,8 +51,11 @@ describe('PermissionReply', () => {
 // 2. DecisionOutcome → OperatorDecisionState mapping (table-driven)
 // ---------------------------------------------------------------------------
 
+/** `reject-only` settles nothing; the decision route answers it with a 4xx error instead of a state. */
+type SettlingOutcome = Exclude<DecisionOutcome, 'reject-only'>
+
 describe('toOperatorDecisionState', () => {
-  const cases: readonly {readonly outcome: DecisionOutcome; readonly expected: OperatorDecisionState}[] = [
+  const cases: readonly {readonly outcome: SettlingOutcome; readonly expected: OperatorDecisionState}[] = [
     {outcome: 'ok', expected: 'claimed'},
     {outcome: 'channel-mismatch', expected: 'scope_mismatch'},
     // CRITICAL: 'already-claimed' maps to 'already_claimed', NOT 'already_settled'.
@@ -96,7 +99,7 @@ describe('toOperatorDecisionState', () => {
 
   it('handles all 5 known DecisionOutcome variants (exhaustiveness coverage)', () => {
     // #given — the complete set of DecisionOutcome variants
-    const allOutcomes: readonly DecisionOutcome[] = [
+    const allOutcomes: readonly SettlingOutcome[] = [
       'ok',
       'channel-mismatch',
       'already-claimed',
