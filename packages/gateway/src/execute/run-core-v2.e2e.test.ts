@@ -734,9 +734,13 @@ describe.skipIf(!hasBinary)('the wait reason on a real run with a background sub
     const whileUnsettled = timeline.changes.filter(change => change.unsettled > 0)
     expect(whileUnsettled.length).toBeGreaterThan(0)
     expect(whileUnsettled.every(change => change.wire === 'awaiting-background-task')).toBe(true)
-    // The first report lands when the child is adopted, i.e. long before the 8 s sleep ends
+    // The first report lands when the child is adopted, i.e. before the child's completion is seen. Ordered against the
+    // run's own events, not a wall-clock budget: the clock here starts before session creation, stream connect and
+    // prompt admission, so setup time must not decide the result.
     expect(timeline.changes[0]?.wire).toBe('awaiting-background-task')
-    expect(timeline.changes[0]?.atMs).toBeLessThan(6_000)
+    const completionAt = timeline.events.find(event => event.message.startsWith('run-core: child completion'))?.atMs
+    expect(completionAt).toBeDefined()
+    expect(timeline.changes[0]?.atMs).toBeLessThan(completionAt as number)
   }, 120_000)
 
   it('reports awaiting-background-task while the root is still executing, before its first success', async () => {

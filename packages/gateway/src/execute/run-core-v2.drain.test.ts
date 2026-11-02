@@ -547,6 +547,84 @@ describe('runOpenCodeCoreV2: the wait reason before the root has succeeded (#200
   })
 })
 
+/** A run whose root has dispatched a background child and has not succeeded yet, so the reason is showing. */
+async function startWithPreSuccessChild(runId: string, options: {readonly stoppable: boolean}) {
+  const ledger = createOwnershipLedger()
+  const controller = new AbortController()
+  const persisted: (readonly string[])[] = []
+  const run = startWindowedRun({
+    ownershipLedger: ledger,
+    controller,
+    runId,
+    active: [CHILD],
+    children: [CHILD],
+    // A child the server will not stop keeps the directory busy, so the barrier cannot confirm it quiet.
+    ...(options.stoppable ? {} : {interrupt: async () => ok({interrupted: true})}),
+    onOwnershipChange: change => persisted.push(change.ownedSessionIds),
+  })
+  await vi.advanceTimersByTimeAsync(10)
+  run.emit(
+    frames.started(),
+    frames.toolStarted('subagent', 'call_dispatch'),
+    frames.toolCalled('call_dispatch', {description: 'bg child', prompt: 'work', background: true}),
+    frames.dispatch(CHILD),
+  )
+  await vi.advanceTimersByTimeAsync(10)
+  return {ledger, controller, run, persisted}
+}
+
+describe('runOpenCodeCoreV2: the wait reason through teardown (#2007)', () => {
+  const ENDINGS = [
+    [
+      'the run deadline expires',
+      'timeout',
+      (_run: ReturnType<typeof startWindowedRun>, c: AbortController) => c.abort(),
+    ],
+    ['the stream closes early', 'stream-ended', (run: ReturnType<typeof startWindowedRun>) => run.close()],
+  ] as const
+
+  it.each(ENDINGS)(
+    'leaves no reason behind when %s and the barrier cannot confirm the directory quiet',
+    async (_label, kind, end) => {
+      // #given — a pre-success background child, with its reason showing
+      const {ledger, controller, run, persisted} = await startWithPreSuccessChild(`run-teardown-${kind}`, {
+        stoppable: false,
+      })
+      expect(toOperatorWaitReason(getWaitReason(`run-teardown-${kind}`))).toBe('awaiting-background-task')
+
+      // #when — the barrier gives up and marks the child unknown, which is a ledger mutation after the loop exited
+      end(run, controller)
+      await vi.advanceTimersByTimeAsync(30_000)
+
+      // #then — the run rejects, quarantined, with the child still owned (unknown) and persisted; nothing reports
+      expect(failure(run).kind).toBe(kind)
+      expect(failure(run).quarantined).toBe(true)
+      expect(states(ledger)).toEqual({[CHILD]: 'unknown'})
+      expect(persisted.at(-1)).toEqual([CHILD])
+      expect(getWaitReason(`run-teardown-${kind}`)).toBeUndefined()
+    },
+  )
+
+  it.each(ENDINGS)(
+    'leaves no reason behind when %s and the barrier confirms termination',
+    async (_label, kind, end) => {
+      // #given
+      const {ledger, controller, run} = await startWithPreSuccessChild(`run-teardown-ok-${kind}`, {stoppable: true})
+      expect(toOperatorWaitReason(getWaitReason(`run-teardown-ok-${kind}`))).toBe('awaiting-background-task')
+
+      // #when
+      end(run, controller)
+      await vi.advanceTimersByTimeAsync(30_000)
+
+      // #then
+      expect(failure(run).kind).toBe(kind)
+      expect(failure(run).quarantined).toBe(false)
+      expect(states(ledger)).toEqual({[CHILD]: 'settled'})
+      expect(getWaitReason(`run-teardown-ok-${kind}`)).toBeUndefined()
+    },
+  )
+})
+
 describe('runOpenCodeCoreV2: bounded reconcile passes', () => {
   it('bounds a reconcile pass that never answers: the child becomes unknown and the loop keeps reading', async () => {
     // #given — listing children hangs

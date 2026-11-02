@@ -282,6 +282,10 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
   inactivityTimer.pause()
 
   let draining = false
+  // Set the moment teardown begins (the barrier, or the loop's `finally`), before the wait reason is cleared. From then on
+  // nothing may report a wait reason: settlement still mutates the ledger (`unknown`/`settled`), and a report made after
+  // the clear would never be cleared again, leaking the process-global registry entry.
+  let tearingDown = false
   const outstandingHumanWaits = new Map<string, HumanWaitKind>()
 
   function clearInactivity(): void {
@@ -379,7 +383,7 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
   // is known; with none, the root is simply executing (a foreground shell included) and there is no reason. After the
   // drain begins the gate owns it.
   function reportPreSuccessWait(): void {
-    if (draining || runId === undefined) return
+    if (draining || tearingDown || runId === undefined) return
     const waitingOnBackgroundWork = ownershipLedger
       .snapshot()
       .some(
@@ -466,7 +470,8 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
     },
     // Why the gate has not admitted the run yet, for the operator status (in-process only, cleared on every exit).
     onNotAdmitted: code => {
-      if (runId !== undefined) setWaitReason(runId, code)
+      // An observation still in flight when the run tears down can land after the clear.
+      if (runId !== undefined && !tearingDown) setWaitReason(runId, code)
     },
   })
   drainCompletion = drain
@@ -494,6 +499,8 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
     } = {},
   ): Promise<never> {
     const {providerFailureReason, cause, alwaysQuarantine = false} = options
+    // Before anything else: the barrier's own ledger mutations must not report a wait reason.
+    tearingDown = true
     // Fail-close the human waits FIRST: the barrier can take up to 15 s, and until the waits are settled an approval
     // could still be answered, and the run's grants (dropped with the coordinator) could still cover a late ask. Neither call is awaited; their replies are bounded by their own
     // timeouts and must not delay the stop.
@@ -1347,6 +1354,8 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
       cause: error,
     })
   } finally {
+    // Before the reason is cleared (below) and before any barrier that follows the loop runs.
+    tearingDown = true
     // The timers are always disposed on loop exit (normal, break, or throw).
     inactivityTimer.dispose()
     silenceTimer.dispose()
