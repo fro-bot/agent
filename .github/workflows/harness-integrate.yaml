@@ -153,6 +153,9 @@ jobs:
           auth-json: ${{ steps.mint.outputs.auth-json }}
           github-token: ${{ github.token }}
           model: ${{ inputs.model || vars.HARNESS_MODEL }}
+          # The merge agent runs on the V1 harness build, not the Action default (stock V2), so this workflow keeps
+          # exercising the harness it integrates. Move it when V1 is cut.
+          opencode-version: 1.19.4+harness.5bde2635
           prompt: ${{ inputs.prompt }}
           response-mode: none
           # Integration delivery is always local; keep this caller explicit so
