@@ -35,7 +35,7 @@
   },
   "devDependencies": {
     "@fro-bot/runtime": "workspace:*",
-    "@opencode/plugin": "2.2.0",
+    "@opencode/plugin": "2.2.2",
     "effect": "4.0.1"
   },
   "peerDependencies": {
