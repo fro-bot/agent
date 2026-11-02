@@ -663,4 +663,57 @@ describe.skipIf(!hasBinary)('startActionOpenCodeV2 against the real stock binary
     expect(scriptResult.toLowerCase()).not.toContain('permission.rejected')
     expect(scriptResult.toLowerCase()).not.toContain('external_directory')
   }, 240_000)
+
+  it('does not offer the websearch tool to the model, and keeps webfetch (Action-only websearch deny)', async () => {
+    // #given the Action's rules, which deny `websearch` for every resource, and a model request that lists its tools
+    const box = createSandbox()
+    sandboxes.push(box)
+    const provider = await startSkillReadProvider('/unused', '/unused', 'true')
+    skillProviders.push(provider)
+
+    // #when the Action starts the real server (the gate verifies the websearch deny on every agent) and a turn runs
+    const started = await startActionOpenCodeV2({
+      binaryPath: BINARY as string,
+      workspacePath: box.repo,
+      authJson: JSON.stringify({fake: {type: 'api', key: CANARY}}),
+      opencodeConfig: operatorConfig(provider.baseURL),
+      systematicVersion: 'latest',
+      model: MODEL,
+      dbPath: box.dbPath,
+      authPath: box.authPath,
+      env: box.env,
+      runId: 4,
+      runAttempt: 1,
+      logger: createMockLogger(),
+      deps: {
+        startServer: async (spawnOptions, spawnLogger) => {
+          const {startOpenCodeV2Server} = await import('@fro-bot/runtime')
+          return startOpenCodeV2Server({...spawnOptions, timeouts: {agentReadyTimeoutMs: 90_000}}, spawnLogger)
+        },
+      },
+    })
+    const handle = unwrapOk(started)
+    handles.push(handle)
+    const created = (await (
+      await handle.fetch('/api/session', {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        body: JSON.stringify({location: {directory: box.repo}}),
+      })
+    ).json()) as {data: {id: string}}
+    handle.registerOwnedSession(created.data.id)
+    const prompt = await handle.fetch(`/api/session/${created.data.id}/prompt`, {
+      method: 'POST',
+      headers: {'content-type': 'application/json'},
+      body: JSON.stringify({text: 'search'}),
+    })
+    expect(prompt.status).toBeLessThan(300)
+    expect(await waitFor(() => provider.toolNames().length > 0, 60_000)).toBe(true)
+
+    // #then websearch is wholly disabled (`tool.ts` `whollyDisabled`): not offered, so no provider form can open
+    expect(provider.toolNames()).not.toContain('websearch')
+    // #and webfetch is still offered, and the tool list is real (not an empty one)
+    expect(provider.toolNames()).toContain('webfetch')
+    expect(provider.toolNames()).toContain('read')
+  }, 240_000)
 })

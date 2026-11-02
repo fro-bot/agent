@@ -88,7 +88,17 @@ describe('buildCIConfigV2', () => {
       // #then
       expect(expectations.allowedDirectories).toEqual([RESPONSE_DIR, ATTACHMENT_DIR])
       expect(expectations.outsidePolicy).toBe('deny')
-      expect(expectations.deniedActions).toEqual(['opencode_session_move', 'opencode_worktree_create'])
+      expect(expectations.deniedActions).toEqual(['opencode_session_move', 'opencode_worktree_create', 'websearch'])
+    })
+
+    it('denies websearch so the model is never offered a tool that opens a provider form, and keeps webfetch', () => {
+      // #given / #when
+      const rules = permissionsOf(build().content)
+
+      // #then
+      expect(rules).toContainEqual({action: 'websearch', resource: '*', effect: 'deny'})
+      expect(evaluatePermissionV2('websearch', '*', rules)).toBe('deny')
+      expect(rules.some(rule => rule.action === 'webfetch')).toBe(false)
     })
 
     it('does not except a sibling run directory', () => {
