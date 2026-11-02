@@ -6,11 +6,11 @@ import {defineConfig} from 'tsdown'
 export type {LicenseEntry} from './scripts/third-party-notices.ts'
 export {formatThirdPartyNotices} from './scripts/third-party-notices.ts'
 
-// Guard: the action is code-split, so the OpenCode default version literal can
-// land in a shared chunk rather than main.js. A harness default carries a
-// `+harness.<sha>` build-metadata suffix that a minifier could strip or collapse
-// against the stock fallback; this fails the build if the configured default does
-// not survive into the emitted bundle.
+// Guard: the action is code-split, so the OpenCode default can land in a shared chunk rather than
+// main.js. DEFAULT_OPENCODE_VERSION derives from opencode-v2-pin.json, so that file is the source of
+// truth: this fails the build if the pinned version or any pinned digest does not survive into the
+// emitted bundle. A bare `2.2.5` is too short to prove much on its own; the 64-character digests are
+// what show the whole pin was bundled, and a missing digest would fail every V2 install closed at runtime.
 
 /**
  * Pure assertion: throws if `expected` is not present in any of the provided chunk contents.
@@ -19,8 +19,21 @@ export {formatThirdPartyNotices} from './scripts/third-party-notices.ts'
 export function assertVersionPresent(expected: string, chunkContents: readonly string[]): void {
   if (!chunkContents.some(c => c.includes(expected))) {
     throw new Error(
-      `[default-version-invariant] DEFAULT_OPENCODE_VERSION '${expected}' is absent from every dist chunk — the bundler likely stripped its build metadata. Aborting to prevent shipping a silent stock default.`,
+      `[default-version-invariant] DEFAULT_OPENCODE_VERSION '${expected}' is absent from every dist chunk — the bundler likely stripped it. Aborting to prevent shipping a silent wrong default.`,
     )
+  }
+}
+
+/**
+ * Pure assertion: throws unless the pinned version and every pinned asset digest are present in some chunk.
+ */
+export function assertPinPresent(
+  pin: {readonly version: string; readonly assets: Readonly<Record<string, string>>},
+  chunkContents: readonly string[],
+): void {
+  assertVersionPresent(pin.version, chunkContents)
+  for (const digest of Object.values(pin.assets)) {
+    assertVersionPresent(digest, chunkContents)
   }
 }
 
@@ -28,15 +41,16 @@ function defaultVersionInvariantPlugin(): Plugin {
   return {
     name: 'default-version-invariant',
     async writeBundle() {
-      const constantsSource = await readFile('packages/runtime/src/shared/constants.ts', 'utf8')
-      const match = /DEFAULT_OPENCODE_VERSION\s*=\s*'([^']+)'/.exec(constantsSource)
-      if (match?.[1] == null) {
-        throw new Error('[default-version-invariant] could not read DEFAULT_OPENCODE_VERSION from source')
+      const pin = JSON.parse(await readFile('packages/runtime/src/shared/opencode-v2-pin.json', 'utf8')) as {
+        version?: unknown
+        assets?: unknown
       }
-      const expected = match[1]
+      if (typeof pin.version !== 'string' || pin.assets == null || typeof pin.assets !== 'object') {
+        throw new Error('[default-version-invariant] could not read the version and assets from opencode-v2-pin.json')
+      }
       const chunks = (await readdir('dist')).filter(name => name.endsWith('.js'))
       const chunkContents = await Promise.all(chunks.map(async name => readFile(join('dist', name), 'utf8')))
-      assertVersionPresent(expected, chunkContents)
+      assertPinPresent({version: pin.version, assets: pin.assets as Record<string, string>}, chunkContents)
     },
   }
 }

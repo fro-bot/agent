@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-11-01"
-updated-by: "9a429e2a6ddc692bd6098b5504c225830af85bf9"
+last-updated: "2026-11-02"
+updated-by: "f8ee76a3"
 sources:
   - packages/gateway/src/execute/run-core-v2.ts
   - packages/gateway/src/execute/opencode-generation.ts
@@ -206,6 +206,8 @@ Recovery preserves the whole checkout against the five-generation/10 GiB retenti
 ### Browser launch
 
 The operator contract does not select the OpenCode generation. For every admitted run the gateway reads workspace readiness and chooses the V1 or V2 core loop from `opencodeVersion`; a missing version preserves V1 compatibility and an unreadable version blocks execution. V2 maps native permission and form requests onto the same approval/question registries, so browser authorization and decision routes remain shared.
+
+The Action's stock V2 default is independent of this selection. The workspace image still defaults to the V1 harness build, and an operator deployment changes generation through its image version rather than inheriting the Action's default pin. [[Setup and Configuration]] describes the separate installation boundaries.
 
 `POST /operator/runs` (`web/operator/launch-route.ts`) is a fire-and-return endpoint: the operator submits a repository and a prompt, and the server responds `202` with a `runId` almost immediately, leaving the operator to observe progress over SSE. Before anything launches, the request passes an ordered gauntlet: the browser guard, an operator-keyed rate limit, session identity resolution, body validation, the prompt checks (below), **server-owned binding resolution** (the client names a repo but the server resolves the actual binding — client-supplied paths or owners are ignored) followed by the denylist check, both inside the single repo-access predicate, and finally a per-operator idempotency guard.
 

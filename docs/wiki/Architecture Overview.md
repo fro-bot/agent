@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-11-01"
-updated-by: "9a429e2a6ddc692bd6098b5504c225830af85bf9"
+last-updated: "2026-11-02"
+updated-by: "f8ee76a3"
 sources:
   - packages/runtime/src/session/generation.ts
   - packages/runtime/src/agent/server-v2.ts
@@ -15,6 +15,7 @@ sources:
   - apps/workspace-agent/src/opencode-server-v2.ts
   - apps/workspace-agent/src/opencode-proxy-v2.ts
   - src/main.ts
+  - packages/runtime/src/shared/opencode-v2-pin.json
   - src/post.ts
   - src/harness/run.ts
   - src/harness/outcome.ts
@@ -115,7 +116,7 @@ All layers may also import from `@fro-bot/runtime`, which is treated as a peer d
 
 ### OpenCode generation boundary
 
-V1 and V2 implementations coexist. `packages/runtime/src/session/generation.ts` selects V2 for a parsed major version of two or higher. The Action selects from its resolved executable version, keeping execution and overflow recovery on one backend (`src/harness/phases/execution-backend.ts`). Its default remains the V1 harness pin; V2 is an explicit version choice. The gateway reads the workspace's `/readyz` `opencodeVersion` for each run, so the workspace image's version selects both sides of the protocol. An unreadable reported workspace version blocks admission rather than guessing.
+V1 and V2 implementations coexist. `packages/runtime/src/session/generation.ts` selects V2 for a parsed major version of two or higher. The Action selects from its resolved executable version, keeping execution and overflow recovery on one backend (`src/harness/phases/execution-backend.ts`). Its default is the digest-verified stock V2 pin; an explicit V1 harness version remains the rollback path. The workspace image still defaults to the V1 harness build, independently of the Action. The gateway reads the workspace's `/readyz` `opencodeVersion` for each run, so the workspace image's version selects both sides of the protocol. An unreadable reported workspace version blocks admission rather than guessing.
 
 V1 uses the SDK session/status model. V2 uses authenticated `/api/` routes, its event envelope, active sessions, forms, shell jobs, and queued session inboxes. The shared V2 primitives normalize these into the harness's activity and ownership vocabulary, while each surface retains its own lifecycle policy. In particular, V2 release requires a stable, quiet directory, rather than an empty ownership ledger alone; see [[Background Subagents and Ownership]].
 
@@ -243,7 +244,7 @@ The full, unabridged symbol rows for entries that [ARCHITECTURE.md](../../ARCHIT
 | `createOwnershipLedger` | Function | `packages/runtime/src/agent/ownership-ledger.ts` | In-memory 3-state (outstanding/settled/unknown) ledger for background subagent executions, keyed by child session id |
 | `reconcileLedgerOnce` / `createLedgerReconciler` | Function | `packages/runtime/src/agent/ledger-reconcile.ts` | Settles tracked ledger entries whose settlement event the SSE stream never delivered, against `children()`/`liveSessionIds()` (both scoped to the run's directory); never adopts an untracked session |
 | `createRemoteQuestionClient` | Function | `packages/runtime/src/agent/remote-question-client.ts` | Narrow v2-SDK client over OpenCode's `question` reply/reject endpoints (the v1 client does not expose them); every call carries the workspace `directory` |
-| `DEFAULT_OPENCODE_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned harness build version (OpenCode base + carries) |
+| `DEFAULT_OPENCODE_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Stock OpenCode V2 pin, derived from `opencode-v2-pin.json` (Action default) |
 
 ### `packages/gateway/`
 

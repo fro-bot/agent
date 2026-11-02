@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-11-01"
-updated-by: "9a429e2a6ddc692bd6098b5504c225830af85bf9"
+last-updated: "2026-11-02"
+updated-by: "f8ee76a3"
 sources:
   - packages/runtime/src/agent/ownership-ledger.ts
   - packages/runtime/src/agent/ledger-reconcile.ts
@@ -63,6 +63,8 @@ An unexpected stream end records an observation gap. An empty ledger cannot disp
 
 ## V2 release is directory-based
 
+V2 adopts shell jobs at start before knowing whether the call will remain in the background (`src/features/agent/streaming-v2.ts`). A foreground result releases that ledger entry; a result reporting a running shell keeps it for later settlement. The logs distinguish initial shell adoption, background retention, and foreground release, so adoption alone is not evidence of detached work.
+
 V2 uses the shared observer and stability gate in `packages/runtime/src/agent/directory-quiescence-v2.ts`. Every success waits for this gate, including a run that adopted no background work. The observer reads the global active-session list and resolves session placement, lists the directory's shells, and checks relevant session inboxes for queued work.
 
 Inbox reads cover the root, owned sessions, and sessions updated since the run began minus a ten-minute margin. This keeps an old workspace's accumulated history from dominating each poll. Queuing an inbox item updates the session timestamp, so newly admitted work falls inside the recent set. The recent-session scan is bounded; an unreadable, incomplete, or over-limit observation cannot count as quiet.
@@ -84,6 +86,8 @@ Successful execution keeps its event observer alive through release. A notice-tr
 Finally, the server is shut down and its exit confirmed. An unconfirmed directory or process exit declines persistence. A lost prompt acknowledgment also declines persistence and endorsement, even if a later stop finds a quiet directory: the harness cannot account for what the accepted prompt may have done.
 
 Overflow recovery uses the same generation-specific backend as the original execution. V2 refuses to archive and restart when stopping the old session's work cannot be confirmed, preventing a replacement session from racing the old writer.
+
+The Action emits one `Run release verdict` line from `src/features/agent/drain-v2.ts` before pre-shutdown work. It records the drain outcome, whether stopping was needed, directory quietness, observation count and passing quiet streak, successful shell deletions and actual session interruptions, unresolved ownership count, and any decline reason. These are bounded counts and states, not model-controlled shell commands. Quietness still needs a separately confirmed server shutdown before persistence is safe.
 
 ## Gateway: drain and quarantine
 

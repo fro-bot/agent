@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-11-01"
-updated-by: "9a429e2a6ddc692bd6098b5504c225830af85bf9"
+last-updated: "2026-11-02"
+updated-by: "f8ee76a3"
 sources:
   - packages/runtime/src/session/version.ts
   - packages/runtime/src/session/generation.ts
@@ -75,6 +75,8 @@ The repository segment replaces its slash with a dash. Branch-specific restore i
 For a V2 run, restore first checks the configured object store's `sessions-v2/` object, then its V1 `sessions/` object. Only after those miss does Actions-cache restore try V2 branch, V1 branch, V2 repository, and V1 repository, in that order. Each cache tier has its own path list and call because Actions cache derives an archive version from those paths. V2 saves only to its own namespace, leaving V1 backups available. Both generations currently name the main database `opencode.db`, but share neither cache prefix nor object-store prefix.
 
 ### V1 history import on a V2 run
+
+The Action's default now selects V2, so an existing V1-only repository reaches this import path without an explicit version override. V2 saves remain isolated from V1 archives, preserving the old namespace for a consumer that pins the previous harness build. The default switch does not change the workspace image's generation or make its fresh per-spawn database part of Action persistence.
 
 Restoring a V1 database into a V2 invocation begins a history import, not a prompt. `src/harness/phases/v1-import-wait.ts` polls `/api/experimental/migration/v1` until it reports completed. Required or running states keep waiting; errors fail immediately. The whole wait is bounded to 300 seconds, reported progress that stalls for 60 seconds fails earlier, and five consecutive unreadable observations fail rather than count as success. No prompt and no session save follow a failed import gate.
 

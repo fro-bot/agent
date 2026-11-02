@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-11-01"
-updated-by: "9a429e2a6ddc692bd6098b5504c225830af85bf9"
+last-updated: "2026-11-02"
+updated-by: "f8ee76a3"
 sources:
   - docs/wiki/Architecture Overview.md
   - docs/wiki/Background Subagents and Ownership.md
@@ -54,7 +54,7 @@ An Obsidian-powered project wiki maintained by Fro Bot. This vault provides huma
 
 ## About This Wiki
 
-Current coverage includes side-by-side OpenCode V1/V2 selection, directory-based release gates, generation-isolated session restore and history import, file-referenced Action credentials, workspace credential provisioning, bundled-skill access, and run-local Always approvals. V1 remains the default harness pin; V2 support is selected by the executable or image version.
+Current coverage includes the Action's stock V2 default and explicit V1 rollback, directory-based release gates and verdict diagnostics, bounded completion waits, generation-isolated session restore and history import, file-referenced Action credentials, workspace credential provisioning, bundled-skill access, and run-local Always approvals. The workspace image retains its independent V1 harness default; the gateway selects its protocol from the image's reported version.
 
 - **Audience:** Human developers — contributors, reviewers, and maintainers
 - **Content:** Descriptive documentation (how the system works, why decisions were made)

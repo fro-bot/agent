@@ -759,15 +759,24 @@ describe('harness integration workflow wiring', () => {
     expect(String(fetch.run)).toContain('integration_commit=${' + 'INTEGRATION_COMMIT}')
   })
 
-  it('cuts sync-default-version from current main, not the dispatch SHA', () => {
-    // #given the sync-default-version job's checkout step
-    const steps = stepsFor(releasePath, 'sync-default-version')
-    const checkout = steps.find(step => String(step.uses ?? '').startsWith('actions/checkout@'))
-    if (checkout === undefined) throw new TypeError('sync-default-version checkout step is missing')
-    const checkoutWith = checkout.with as Record<string, unknown>
+  it('has no job that rewrites the Action default or the workspace Dockerfile ARG', () => {
+    // #given the harness release workflow
+    const jobs = Object.keys(loadRawWorkflow(releasePath).jobs as Record<string, unknown>)
+    const source = readFileSync(releasePath, 'utf8')
 
-    // #then it must track main, not github.sha, or the sync PR opens behind-base
-    expect(checkoutWith.ref, 'sync-default-version checkout must set ref: main').toBe('main')
+    // #then a harness dispatch cannot revert the stock V2 default (or move the Dockerfile ARG) to a harness build
+    expect(jobs).not.toContain('sync-default-version')
+    expect(source).not.toMatch(/DEFAULT_OPENCODE_VERSION/)
+  })
+
+  it('pins harness-integrate to the V1 harness build instead of the Action default', () => {
+    // #given the merge agent's Action step
+    const steps = stepsFor('.github/workflows/harness-integrate.yaml', 'integrate')
+    const run = steps.find(step => step.name === 'Run Fro Bot')
+    const runWith = (run?.with ?? {}) as Record<string, unknown>
+
+    // #then it names a V1 harness build explicitly, so flipping the default does not change the merge agent
+    expect(runWith['opencode-version']).toMatch(/^\d+\.\d+\.\d+\+harness\.[0-9a-f]{8}$/)
   })
 
   it('keeps prepare-integrate, build, and publish pinned to the dispatch SHA (no ref override)', () => {

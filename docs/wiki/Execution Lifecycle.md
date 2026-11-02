@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-11-01"
-updated-by: "9a429e2a6ddc692bd6098b5504c225830af85bf9"
+last-updated: "2026-11-02"
+updated-by: "f8ee76a3"
 sources:
   - src/harness/phases/execution-backend.ts
   - src/harness/phases/execute-v2.ts
@@ -84,7 +84,7 @@ Every Fro Bot run follows the same phase sequence, orchestrated by `src/harness/
 
 ## Phase Sequence
 
-The phase order is shared by both generations. The resolved executable version selects the server, session reader, execution backend, and release path together; it is not independently inferred at each call. V1 remains the default harness build. A V2 selection uses the `-v2.ts` implementations described below.
+The phase order is shared by both generations. The resolved executable version selects the server, session reader, execution backend, and release path together; it is not independently inferred at each call. The Action defaults to the recorded stock V2 pin and its `-v2.ts` implementations. Explicit V1 pins retain the compatibility path.
 
 ```text
 main.ts

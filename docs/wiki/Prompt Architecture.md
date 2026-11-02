@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-11-01"
-updated-by: "9a429e2a6ddc692bd6098b5504c225830af85bf9"
+last-updated: "2026-11-02"
+updated-by: "f8ee76a3"
 sources:
   - src/features/agent/prompt-sender-v2.ts
   - src/features/agent/execution-v2.ts
@@ -127,6 +127,8 @@ V2 keeps the XML prompt and delivery contracts above, but changes their transpor
 The V1 continuation-prompt loop below is not applied to an admitted V2 turn. V2 retries transient provider failures itself. The Action retries eligible failures before sending, or explicit submission refusals, but never resends a prompt whose POST lost its transport acknowledgment: that request may already have started tools or GitHub writes. Such a run records `sendUncertain`, stops directory activity, and declines persistence and endorsement. Error diagnostics retain call kind and status rather than response bodies that could echo the task.
 
 V2 also obtains injected prior-work context through the native session reader used by the Fro Bot plugin's session tools. Those reads represent the active context window, including the latest compaction summary, so the prompt's invitation to search history does not imply access to every pre-compaction message. [[Session Persistence]] describes the continuity and import boundaries.
+
+After V2 submission, `src/features/agent/retry-v2.ts` observes completion through events, session waiting, and a poll watchdog. Each session-wait long poll is bounded to 60 seconds and renewed when that local bound expires; this avoids the HTTP client's longer headers timeout without resending the prompt. A real wait-route failure logs the switch to polling, while the run's own cancellation and overall deadline remain authoritative.
 
 ### V1 SDK submission
 
