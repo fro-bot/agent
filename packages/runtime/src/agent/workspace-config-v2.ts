@@ -35,6 +35,7 @@ export function buildWorkspaceConfigV2(inputs: WorkspaceConfigV2Inputs, logger: 
     bundledSkillsDirectories,
     editDenyResources: [],
     denyQuestion: false,
+    denyWebsearch: false,
   })
   if (!rules.success) return err(`allowedExternalDirectories/bundledSkillsDirectories: ${rules.error}`)
 
