@@ -1823,6 +1823,42 @@ describe('reject-only requests (truncated detail)', () => {
     expect(effects.postReply).toHaveBeenCalledExactlyOnceWith('per_1', '/workspace/proj', 'reject')
   })
 
+  it('rejects a refused request at its deadline', async () => {
+    vi.useFakeTimers()
+    try {
+      // #given a truncated request with a deadline, and a refused approve
+      const {registry, effects} = registerTruncated({deadlineMs: 5_000})
+      await registry.handleDecision({
+        requestID: 'per_1',
+        approvalScopeId: 'chan_1',
+        decision: 'once',
+        actor: makeActor(),
+      })
+
+      // #when the deadline passes
+      await vi.advanceTimersByTimeAsync(6_000)
+
+      // #then it is rejected and gone
+      expect(effects.postReply).toHaveBeenCalledExactlyOnceWith('per_1', '/workspace/proj', 'reject')
+      expect(registry.has('per_1')).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('rejects a refused request at teardown', async () => {
+    // #given a truncated request and a refused approve
+    const {registry, effects} = registerTruncated()
+    await registry.handleDecision({requestID: 'per_1', approvalScopeId: 'chan_1', decision: 'once', actor: makeActor()})
+
+    // #when the gateway shuts down
+    await registry.disposeAll('shutdown')
+
+    // #then it is rejected and gone
+    expect(effects.postReply).toHaveBeenCalledExactlyOnceWith('per_1', '/workspace/proj', 'reject')
+    expect(registry.has('per_1')).toBe(false)
+  })
+
   it('refuses a filepath cut by length the same way', async () => {
     // #given
     const {registry, effects} = registerTruncated({

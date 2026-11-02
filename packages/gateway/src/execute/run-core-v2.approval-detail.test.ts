@@ -300,7 +300,7 @@ describe('a V2 approval whose command the operator cannot see in full', () => {
     // #then — the card posts, with no Approve button, and says why
     expect(shown.buttons).toContain('fb-deny:')
     expect(shown.buttons).not.toContain('fb-approve:')
-    expect(shown.card).toContain('Too long to show here. Review it on the operator dashboard, or reject.')
+    expect(shown.card).toContain('Too long to show here, so it can only be rejected.')
 
     // #when an approve reaches the registry anyway (a stale or forged button id)
     // #then it is refused and nothing goes upstream
@@ -324,8 +324,7 @@ describe('a V2 approval whose command the operator cannot see in full', () => {
     expect(shown.webReply).not.toHaveBeenCalled()
     expect(shown.discordReply).not.toHaveBeenCalled()
     expect(shown.buttons).not.toContain('fb-approve:')
-    expect(shown.card).toContain('Too long to review, so it can only be rejected.')
-    expect(shown.card).not.toContain('operator dashboard')
+    expect(shown.card).toContain('Too long to show here, so it can only be rejected.')
 
     // #and the web operator can still reject
     expect(await shown.decide.web('reject')).toBe('ok')

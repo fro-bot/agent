@@ -27,10 +27,11 @@ function clampFieldValue(value: string): string {
   return value.length <= FIELD_VALUE_MAX ? value : `${value.slice(0, FIELD_VALUE_MAX - 1)}…`
 }
 
-/** Shown on a card whose request the operator cannot see in full; the card then offers Deny only. */
-const TOO_LONG_NOTE = 'Too long to show here. Review it on the operator dashboard, or reject.'
-/** The request is cut everywhere, so it can only be rejected. */
-const TRUNCATED_NOTE = 'Too long to review, so it can only be rejected.'
+/**
+ * Shown on a card whose request the operator cannot see in full; the card then offers Deny only. The dashboard can't
+ * decide a Discord run's approvals (it keys decisions by run id, Discord by thread), so rejecting is the only way out.
+ */
+const TOO_LONG_NOTE = 'Too long to show here, so it can only be rejected.'
 
 /**
  * `true` when the card cannot show the whole request: its Action would be clamped, or the command or path behind it
@@ -95,8 +96,7 @@ export function parseApprovalCustomId(customId: string): {action: 'approve' | 'd
  */
 export function buildApprovalEmbed(request: PermissionRequest): EmbedBuilder {
   const embed = new EmbedBuilder().setTitle('🔐 Tool approval required')
-  if (isRequestDetailTruncated(request)) embed.setDescription(TRUNCATED_NOTE)
-  else if (approvalCardRejectOnly(request)) embed.setDescription(TOO_LONG_NOTE)
+  if (approvalCardRejectOnly(request)) embed.setDescription(TOO_LONG_NOTE)
   return embed
     .setColor(0xffa500) // amber — pending
     .addFields(

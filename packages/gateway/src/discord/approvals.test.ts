@@ -213,23 +213,13 @@ describe('buildApprovalEmbed', () => {
     expect(json.description).toBeUndefined()
   })
 
-  it('tells the operator an Action it clamped is too long to show, and where to review it', () => {
+  it('tells the operator an Action it clamped is too long to show, so it can only be rejected', () => {
     // #given — a title past the 1024-character field limit
     const req: PermissionRequest = {...baseRequest, title: `Run command: ${'x'.repeat(1100)}`}
     // #when
     const json = buildApprovalEmbed(req).toJSON()
     // #then
-    expect(json.description).toBe('Too long to show here. Review it on the operator dashboard, or reject.')
-  })
-
-  it('does not send the operator to the dashboard when the command is cut there too', () => {
-    // #given — a command past the 4 KB detail cap
-    const command = 'x'.repeat(5000)
-    const req: PermissionRequest = {...baseRequest, command, title: `Run command: ${command}`}
-    // #when
-    const json = buildApprovalEmbed(req).toJSON()
-    // #then
-    expect(json.description).toBe('Too long to review, so it can only be rejected.')
+    expect(json.description).toBe('Too long to show here, so it can only be rejected.')
   })
 
   it('includes a footer about fail-closed behaviour', () => {
