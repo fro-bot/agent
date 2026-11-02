@@ -279,13 +279,16 @@ export function createDrainCompletionV2(options: DrainCompletionV2Options): Drai
           idleRevision === revision &&
           ledger.isDrainComplete(),
         onObservation: state => {
-          // Why the run has not finished yet, for the operator status.
-          if (state.last?.kind === 'unreadable') reject('root-liveness-unavailable', {read: state.last.reason})
+          // Why the run has not finished yet, for the operator status. The ledger is drained here (`shouldContinue`
+          // checks it), so only a directory that is actually active is outstanding work; a quiet reading still
+          // counting, or one that could not be read, is the gate confirming completion.
+          if (state.last?.kind === 'unreadable') reject('directory-unreadable', {read: state.last.reason})
           else if (!state.passed) {
-            reject('ledger-not-drained', {
-              directory: state.last?.kind === 'active' ? state.last.activity : 'quiet',
-              quietReadings: state.streak,
-            })
+            if (state.last?.kind === 'active') {
+              reject('ledger-not-drained', {directory: state.last.activity, quietReadings: state.streak})
+            } else {
+              reject('directory-quiet-window', {quietReadings: state.streak})
+            }
           }
         },
       })

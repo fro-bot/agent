@@ -57,6 +57,9 @@ export const DRAIN_REJECT_CODES = [
   'idle-evidence-stale',
   'ledger-not-drained',
   'validation-threw',
+  // V2 only: the directory-quiescence window is counting with the ledger already drained, or a reading failed.
+  'directory-quiet-window',
+  'directory-unreadable',
 ] as const
 
 export type DrainRejectCode = (typeof DRAIN_REJECT_CODES)[number]

@@ -282,6 +282,10 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
   inactivityTimer.pause()
 
   let draining = false
+  // Set the moment teardown begins (the barrier, or the loop's `finally`), before the wait reason is cleared. From then on
+  // nothing may report a wait reason: settlement still mutates the ledger (`unknown`/`settled`), and a report made after
+  // the clear would never be cleared again, leaking the process-global registry entry.
+  let tearingDown = false
   const outstandingHumanWaits = new Map<string, HumanWaitKind>()
 
   function clearInactivity(): void {
@@ -368,10 +372,34 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
   // directory cannot find them, so the barrier and the watch take them as explicit targets.
   const movedSessionIds = new Set<string>()
 
+  // Shells the server has confirmed as background: their tool call returned `running`. The ledger owns every shell an
+  // owned session creates (a foreground one too, until its call ends), because `shell.created` carries nothing that tells
+  // them apart and the server publishes no event when a job is backgrounded. Ownership is the ledger's business; this set
+  // only decides which owned shells the operator is told the run is waiting on.
+  const confirmedBackgroundShellKeys = new Set<string>()
+
+  // Before the root's first success the gate is not running, so it cannot say why the run is not done. Owned unsettled
+  // background work (a child, or a shell confirmed as background) is a wait the operator should see from the moment it
+  // is known; with none, the root is simply executing (a foreground shell included) and there is no reason. After the
+  // drain begins the gate owns it.
+  function reportPreSuccessWait(): void {
+    if (draining || tearingDown || runId === undefined) return
+    const waitingOnBackgroundWork = ownershipLedger
+      .snapshot()
+      .some(
+        entry =>
+          entry.state !== 'settled' &&
+          (!isShellLedgerKey(entry.sessionId) || confirmedBackgroundShellKeys.has(entry.sessionId)),
+      )
+    if (waitingOnBackgroundWork) setWaitReason(runId, 'ledger-not-drained')
+    else clearWaitReason(runId)
+  }
+
   const ledger: OwnershipLedger = wrapLedgerWithHooks(
     ownershipLedger,
     () => {
       persistOwnership()
+      reportPreSuccessWait()
       drainCompletion?.requestValidation()
     },
     // The single place a directly observed dispatch reaches the coordinator, so its events and approvals route
@@ -442,7 +470,8 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
     },
     // Why the gate has not admitted the run yet, for the operator status (in-process only, cleared on every exit).
     onNotAdmitted: code => {
-      if (runId !== undefined) setWaitReason(runId, code)
+      // An observation still in flight when the run tears down can land after the clear.
+      if (runId !== undefined && !tearingDown) setWaitReason(runId, code)
     },
   })
   drainCompletion = drain
@@ -470,6 +499,8 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
     } = {},
   ): Promise<never> {
     const {providerFailureReason, cause, alwaysQuarantine = false} = options
+    // Before anything else: the barrier's own ledger mutations must not report a wait reason.
+    tearingDown = true
     // Fail-close the human waits FIRST: the barrier can take up to 15 s, and until the waits are settled an approval
     // could still be answered, and the run's grants (dropped with the coordinator) could still cover a late ask. Neither call is awaited; their replies are bounded by their own
     // timeouts and must not delay the stop.
@@ -751,12 +782,16 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
   function adoptShell(shellId: string, source: 'shell-created' | 'tool-result'): void {
     const key = shellLedgerKey(shellId)
     const fresh = !ledger.isTracked(key)
+    // Only a call that returned `running` is known to be background; the creation frame is not that signal.
+    if (source === 'tool-result') confirmedBackgroundShellKeys.add(key)
     // The command is model-controlled text and stays out of the ledger label and the logs.
     ledger.adopt(key, 'background shell')
     if (noticedShellIds.has(shellId)) ledger.settle(key)
     if (fresh) {
       logger.info({sessionId, shellId, source}, 'run-core: background shell adopted into ownership ledger')
     }
+    // Adopting a shell the creation frame already tracked changes no ledger state, so the ledger hook stays silent.
+    if (source === 'tool-result') reportPreSuccessWait()
   }
 
   // The silence watchdog starts here (the primitive arms on creation), immediately before the `try` whose `finally`
@@ -1319,6 +1354,8 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
       cause: error,
     })
   } finally {
+    // Before the reason is cleared (below) and before any barrier that follows the loop runs.
+    tearingDown = true
     // The timers are always disposed on loop exit (normal, break, or throw).
     inactivityTimer.dispose()
     silenceTimer.dispose()
