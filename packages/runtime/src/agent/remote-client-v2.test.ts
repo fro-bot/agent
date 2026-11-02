@@ -235,6 +235,24 @@ describe('createRemoteOpenCodeV2Client', () => {
     ])
   })
 
+  it('sends a reject message only when it is non-empty', async () => {
+    // #given
+    const {fetch, requests} = makeFetch(() => new Response(null, {status: 204}))
+    const client = createRemoteOpenCodeV2Client({baseUrl: 'http://w', fetch})
+
+    // #when
+    await client.replyPermission({sessionId: 'ses_1', requestId: 'per_a', decision: 'reject', message: 'not allowed'})
+    await client.replyPermission({sessionId: 'ses_1', requestId: 'per_b', decision: 'reject', message: ''})
+    await client.replyPermission({sessionId: 'ses_1', requestId: 'per_c', decision: 'once'})
+
+    // #then — an empty message is a bare reject upstream, so it is never sent
+    expect(requests.map(request => request.body)).toEqual([
+      {decision: 'reject', message: 'not allowed'},
+      {decision: 'reject'},
+      {decision: 'once'},
+    ])
+  })
+
   it('answers and cancels forms on the session-scoped routes', async () => {
     // #given
     const {fetch, requests} = makeFetch(() => new Response(null, {status: 204}))

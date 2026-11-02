@@ -573,6 +573,10 @@ export function createApprovalRegistry(deps: {
       return
     }
 
+    // A reject settles the asks pending NOW, which is what upstream does on both generations. Take that list before the
+    // first await: the settled render below can take seconds, and the model may raise a new ask in the meantime.
+    const siblings = reply === 'reject' ? openSiblings(sessionID, entry) : []
+
     // Log if OpenCode's reply differs from our claimed decision (it wins).
     if ((entry.state === 'claimed' || entry.state === 'confirmed') && entry.actor !== null) {
       // The reply is the echo of our POST. Render with OpenCode's reply.
@@ -595,20 +599,32 @@ export function createApprovalRegistry(deps: {
         // will settle via its own confirmReply echo (or its own deadline).
         // Sending a cascade reject to a claimed sibling would create a contradiction:
         // OpenCode would receive both 'once' (from the button) and 'reject' (cascade).
-        if (reply === 'reject') {
+        if (siblings.length > 0) {
           // eslint-disable-next-line no-void
-          void cascadeReject(sessionID)
+          void cascadeReject(siblings)
         }
       })
   }
 
-  async function cascadeReject(sessionID: string): Promise<void> {
-    // Only cascade to `open` siblings; skip `claimed` ones.
-    const siblings = approvalEntries().filter(e => e.sessionID === sessionID && e.state === 'open')
+  /** The `open` approvals of a session other than `except`, as they are right now. `claimed` ones own their outcome. */
+  function openSiblings(sessionID: string, except: ApprovalGateEntry): readonly ApprovalGateEntry[] {
+    return approvalEntries().filter(e => e !== except && e.sessionID === sessionID && e.state === 'open')
+  }
+
+  /**
+   * Reject the siblings that were pending when the operator decided. Each is checked again before it is settled: one
+   * that left the gate, was replaced under its id, or was claimed since is not touched, and an ask registered after the
+   * decision is not in the list at all.
+   */
+  async function cascadeReject(siblings: readonly ApprovalGateEntry[]): Promise<void> {
     await Promise.all(
       siblings.map(async sib => {
+        if (getEntry(sib.requestID) !== sib || sib.state !== 'open') return
         gate.settleNow(sib, 'cascade')
-        logger.info({requestID: sib.requestID, sessionID}, 'ApprovalRegistry: cascade-rejecting sibling permission')
+        logger.info(
+          {requestID: sib.requestID, sessionID: sib.sessionID},
+          'ApprovalRegistry: cascade-rejecting sibling permission',
+        )
         // Best-effort reject POST for the sibling (spec: KEEP the cascade POST).
         try {
           await sib.payload.effects.postReply(sib.requestID, sib.payload.directory, 'reject')

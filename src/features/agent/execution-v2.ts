@@ -35,6 +35,12 @@ const PERMISSION_REPLY_TIMEOUT_MS = 5_000
 const PERMISSION_REPLY_MAX_ATTEMPTS = 2
 const FORM_CANCEL_TIMEOUT_MS = 10_000
 const FORM_CANCEL_MESSAGE = 'This run cannot answer questions. Continue without an answer.'
+/**
+ * Sent with every permission reject. A bare reject ends the whole execution upstream (`interrupted`, reason `shutdown`,
+ * which fails the run); a reject with a message fails only the tool, and the model reads the text and takes another
+ * step (fro-bot/agent#2001).
+ */
+const PERMISSION_REJECT_MESSAGE = "This automated run does not allow this action. Don't retry it; continue without it."
 
 /**
  * Run a prompt to completion on OpenCode V2: the sibling of `executeOpenCode`. The deadline, the one-comment protocol and
@@ -53,7 +59,7 @@ const FORM_CANCEL_MESSAGE = 'This run cannot answer questions. Continue without 
  */
 
 /**
- * Reject one permission ask. Never `once` or `always`: `always` would be stored upstream as a saved permission outliving
+ * Reject one permission ask, with a message so the turn continues. Never `once` or `always`: `always` would be stored upstream as a saved permission outliving
  * the run (#1990). Bounded by its own timeout and a small retry budget, independent of the run's deadline, because the
  * stream fires this without awaiting it.
  */
@@ -65,6 +71,7 @@ export async function replyToPermissionAskV2(client: ActionOpenCodeV2Client, req
         sessionId: request.sessionId,
         requestId: request.requestId,
         decision: 'reject',
+        message: PERMISSION_REJECT_MESSAGE,
         signal: AbortSignal.timeout(PERMISSION_REPLY_TIMEOUT_MS),
       })
       if (reply.success) return

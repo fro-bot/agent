@@ -22,7 +22,8 @@ import {isShellStatus} from './shell-notice.js'
  * - `GET /api/session/:id` carries `outcome`, the persisted result of the last execution that ended. A `shutdown`
  *   interrupt does not write it (`packages/core/src/session/projector.ts`, `projectIdle`).
  * - `GET /api/session/active` and `GET /api/session` back the ledger adapter (`ledger-reconcile-v2.ts`).
- * - `POST /api/session/:id/permission/:requestID/reply` takes `{decision: 'once' | 'always' | 'reject'}`.
+ * - `POST /api/session/:id/permission/:requestID/reply` takes `{decision: 'once' | 'always' | 'reject', message?}`; a
+ *   non-empty `message` on a reject fails only the tool, where a bare reject interrupts the whole execution.
  * - `POST /api/session/:id/form/:formID/reply` takes `{answer}`; `DELETE /api/session/:id/form/:formID?message=` cancels.
  * - `GET /api/shell`, `GET /api/shell/:id` and `DELETE /api/shell/:id` (`groups/shell.ts`) read and stop background shells.
  *   They are location-scoped: the location rides in `x-opencode-directory`, and a DELETE in another location is a
@@ -142,6 +143,12 @@ export interface RemoteOpenCodeV2Client {
     readonly sessionId: string
     readonly requestId: string
     readonly decision: V2PermissionDecision
+    /**
+     * Feedback for a `reject`. Upstream turns a non-empty message into a tool failure the model sees, so the turn goes
+     * on; a bare reject interrupts the whole execution (`interrupted`, reason `shutdown`, claim left resumable). Sent
+     * only when non-empty: upstream reads an empty string as no message.
+     */
+    readonly message?: string
     readonly signal?: AbortSignal
   }) => Promise<Result<undefined, V2CallError>>
   readonly replyForm: (input: {
@@ -449,11 +456,11 @@ export function createRemoteOpenCodeV2Client(options: RemoteOpenCodeV2ClientOpti
       return ok(readFrames(sent.data, signal))
     },
 
-    replyPermission: async ({sessionId, requestId, decision, signal}) =>
+    replyPermission: async ({sessionId, requestId, decision, message, signal}) =>
       sendNoContent({
         method: 'POST',
         path: `/api/session/${encodeURIComponent(sessionId)}/permission/${encodeURIComponent(requestId)}/reply`,
-        body: {decision},
+        body: message === undefined || message === '' ? {decision} : {decision, message},
         ...(signal === undefined ? {} : {signal}),
       }),
 
