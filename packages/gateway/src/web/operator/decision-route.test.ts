@@ -795,3 +795,41 @@ describe('POST decision — integration (real route wiring)', () => {
     }
   })
 })
+
+// ---------------------------------------------------------------------------
+// Reject-only requests: part of the request cannot be shown to the operator
+// ---------------------------------------------------------------------------
+
+describe('POST decision — reject-only request', () => {
+  it.each(['once', 'always'] as const)(
+    'refuses %s with a 409 JSON error, and audits it as a refusal, not a decision',
+    async decision => {
+      // #given the registry refuses to approve a request whose command was truncated
+      const auditLogger = makeAuditLogger()
+      const registry = makeRegistry('reject-only')
+      const app = buildApp(makeDeps({auditLogger, registry}))
+
+      // #when the operator tries to approve it
+      const response = await postDecision(app, 'run-abc', 'req-long', {decision})
+
+      // #then the web route refuses with a 4xx JSON error — no `{state}` that reads as settled
+      expect(response.status).toBe(409)
+      expect(response.headers.get('content-type')).toContain('application/json')
+      expect(await response.json()).toEqual({error: 'reject only'})
+      const warned = vi.mocked(auditLogger.warn).mock.calls.map(([ctx]) => ctx)
+      expect(warned.find(ctx => ctx.kind === 'approval.rejected')?.reason).toBe('reject_only')
+      const infos = vi.mocked(auditLogger.info).mock.calls.map(([ctx]) => ctx)
+      expect(infos.find(ctx => ctx.kind === 'approval.decision')).toBeUndefined()
+    },
+  )
+
+  it('still returns the normal 200 state for a reject', async () => {
+    // #given/#when
+    const app = buildApp(makeDeps({registry: makeRegistry('ok')}))
+    const response = await postDecision(app, 'run-abc', 'req-long', {decision: 'reject'})
+
+    // #then
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({state: 'claimed'})
+  })
+})

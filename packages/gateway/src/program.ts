@@ -739,7 +739,9 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
                     ? 'This approval is no longer pending.'
                     : outcome === 'already-claimed'
                       ? 'Already decided.'
-                      : 'Failed to record decision, try again.'
+                      : outcome === 'reject-only'
+                        ? 'This request is too long to show in full, so it can only be rejected.'
+                        : 'Failed to record decision, try again.'
 
             await editInteractionAsync(interaction, {content: ackContent}, buttonLog)
           } catch (error: unknown) {

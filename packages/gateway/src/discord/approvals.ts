@@ -9,6 +9,8 @@ import type {PermissionReply, PermissionRequest, SettlementReason} from '../appr
 
 import {ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder} from 'discord.js'
 
+import {isRequestDetailTruncated} from '../approvals/approval-detail.js'
+
 // ---------------------------------------------------------------------------
 // custom_id prefixes (namespaced to avoid collisions with other interactions)
 // ---------------------------------------------------------------------------
@@ -23,6 +25,19 @@ const FIELD_VALUE_MAX = 1024
 
 function clampFieldValue(value: string): string {
   return value.length <= FIELD_VALUE_MAX ? value : `${value.slice(0, FIELD_VALUE_MAX - 1)}…`
+}
+
+/** Shown on a card whose request the operator cannot see in full; the card then offers Deny only. */
+const TOO_LONG_NOTE = 'Too long to show here. Review it on the operator dashboard, or reject.'
+/** The request is cut everywhere, so it can only be rejected. */
+const TRUNCATED_NOTE = 'Too long to review, so it can only be rejected.'
+
+/**
+ * `true` when the card cannot show the whole request: its Action would be clamped, or the command or path behind it
+ * was cut by length. Such a card offers Deny only, so nothing can be approved that the operator never saw.
+ */
+export function approvalCardRejectOnly(request: PermissionRequest): boolean {
+  return request.title.length > FIELD_VALUE_MAX || isRequestDetailTruncated(request)
 }
 
 // ---------------------------------------------------------------------------
@@ -79,8 +94,10 @@ export function parseApprovalCustomId(customId: string): {action: 'approve' | 'd
  * The requestID lives only in the button custom_ids.
  */
 export function buildApprovalEmbed(request: PermissionRequest): EmbedBuilder {
-  return new EmbedBuilder()
-    .setTitle('🔐 Tool approval required')
+  const embed = new EmbedBuilder().setTitle('🔐 Tool approval required')
+  if (isRequestDetailTruncated(request)) embed.setDescription(TRUNCATED_NOTE)
+  else if (approvalCardRejectOnly(request)) embed.setDescription(TOO_LONG_NOTE)
+  return embed
     .setColor(0xffa500) // amber — pending
     .addFields(
       {name: 'Gate category', value: request.permission, inline: true},
@@ -91,18 +108,20 @@ export function buildApprovalEmbed(request: PermissionRequest): EmbedBuilder {
 }
 
 /**
- * Build an action row with Approve + Deny buttons for a pending request.
+ * Build an action row with Approve + Deny buttons for a pending request. `rejectOnly` drops Approve: the operator
+ * cannot see the whole request, so Deny is the only decision offered.
  */
-export function buildApprovalButtons(requestID: string): ActionRowBuilder<ButtonBuilder> {
-  const approveBtn = new ButtonBuilder()
-    .setCustomId(buildApprovalCustomId('approve', requestID))
-    .setLabel('Approve')
-    .setStyle(ButtonStyle.Success)
-
+export function buildApprovalButtons(requestID: string, rejectOnly = false): ActionRowBuilder<ButtonBuilder> {
   const denyBtn = new ButtonBuilder()
     .setCustomId(buildApprovalCustomId('deny', requestID))
     .setLabel('Deny')
     .setStyle(ButtonStyle.Danger)
+  if (rejectOnly) return new ActionRowBuilder<ButtonBuilder>().addComponents(denyBtn)
+
+  const approveBtn = new ButtonBuilder()
+    .setCustomId(buildApprovalCustomId('approve', requestID))
+    .setLabel('Approve')
+    .setStyle(ButtonStyle.Success)
 
   return new ActionRowBuilder<ButtonBuilder>().addComponents(approveBtn, denyBtn)
 }

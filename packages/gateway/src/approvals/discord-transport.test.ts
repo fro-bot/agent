@@ -53,7 +53,11 @@ function makeRequest(overrides: Partial<PermissionRequest> = {}): PermissionRequ
 
 interface SentCall {
   readonly target: string
-  readonly options: {readonly content?: string; readonly embeds?: readonly unknown[]}
+  readonly options: {
+    readonly content?: string
+    readonly embeds?: readonly unknown[]
+    readonly components?: readonly unknown[]
+  }
 }
 
 /**
@@ -168,6 +172,51 @@ describe('createDiscordApprovalOnPending — happy path', () => {
     // #then the request was never auto-rejected or marked post-failed
     expect(approvalRegistry.applySettlement).not.toHaveBeenCalled()
     expect(approvalRegistry.markMessagePostFailed).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Reject-only cards — the Action would be clamped, so the card must not offer an approval
+// ---------------------------------------------------------------------------
+
+/** Posts the approval card for `request` through the real transport and reports the buttons it carried. */
+async function postCard(request: PermissionRequest) {
+  const approvalRegistry = makeApprovalRegistry()
+  const deps = makeDeps({approvalRegistry})
+  createDiscordApprovalOnPending(deps)(request)
+  await vi.waitFor(() => {
+    expect(approvalRegistry.attachMessage).toHaveBeenCalledOnce()
+  })
+  const card = deps.replySink.sentCalls.find(call => call.options.embeds !== undefined)
+  const row = card?.options.components?.[0] as {toJSON: () => {components: readonly unknown[]}} | undefined
+  const buttons = row?.toJSON().components ?? []
+  return {approvalRegistry, buttons: JSON.stringify(buttons), buttonCount: buttons.length, card}
+}
+
+describe('createDiscordApprovalOnPending — requests the card cannot show in full', () => {
+  it('posts Deny only, and registers the request reject-only, when the Action would be clamped', async () => {
+    // #given — the reviewer's case: the second command sits past the 1024-character clamp
+    const command = `${`echo ${'x'.repeat(1100)}`}; rm -rf important-directory`
+    const request = makeRequest({command, title: `Run command: ${command}`})
+
+    // #when
+    const {approvalRegistry, buttons, buttonCount} = await postCard(request)
+
+    // #then — no Approve button, and the registry will refuse an approve that arrives another way
+    expect(buttonCount).toBe(1)
+    expect(buttons).toContain('fb-deny:per_1')
+    expect(buttons).not.toContain('fb-approve:')
+    expect(approvalRegistry.register).toHaveBeenCalledWith(expect.objectContaining({rejectOnly: true}))
+  })
+
+  it('posts Approve and Deny, and registers the request approvable, when the Action fits', async () => {
+    // #given/#when
+    const {approvalRegistry, buttons, buttonCount} = await postCard(makeRequest())
+
+    // #then
+    expect(buttonCount).toBe(2)
+    expect(buttons).toContain('fb-approve:per_1')
+    expect(approvalRegistry.register).toHaveBeenCalledWith(expect.objectContaining({rejectOnly: false}))
   })
 })
 

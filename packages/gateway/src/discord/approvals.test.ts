@@ -11,6 +11,7 @@ import {ButtonStyle} from 'discord.js'
 import {describe, expect, it} from 'vitest'
 
 import {
+  approvalCardRejectOnly,
   APPROVE_PREFIX,
   buildApprovalButtons,
   buildApprovalCustomId,
@@ -205,6 +206,32 @@ describe('buildApprovalEmbed', () => {
     expect(value?.endsWith('…')).toBe(true)
   })
 
+  it('adds no too-long note to a card that shows the whole Action', () => {
+    // #given/#when
+    const json = buildApprovalEmbed({...baseRequest, title: `Run command: ${'x'.repeat(900)}`}).toJSON()
+    // #then
+    expect(json.description).toBeUndefined()
+  })
+
+  it('tells the operator an Action it clamped is too long to show, and where to review it', () => {
+    // #given — a title past the 1024-character field limit
+    const req: PermissionRequest = {...baseRequest, title: `Run command: ${'x'.repeat(1100)}`}
+    // #when
+    const json = buildApprovalEmbed(req).toJSON()
+    // #then
+    expect(json.description).toBe('Too long to show here. Review it on the operator dashboard, or reject.')
+  })
+
+  it('does not send the operator to the dashboard when the command is cut there too', () => {
+    // #given — a command past the 4 KB detail cap
+    const command = 'x'.repeat(5000)
+    const req: PermissionRequest = {...baseRequest, command, title: `Run command: ${command}`}
+    // #when
+    const json = buildApprovalEmbed(req).toJSON()
+    // #then
+    expect(json.description).toBe('Too long to review, so it can only be rejected.')
+  })
+
   it('includes a footer about fail-closed behaviour', () => {
     // #given/#when
     const json = buildApprovalEmbed(baseRequest).toJSON()
@@ -247,6 +274,42 @@ describe('buildApprovalButtons', () => {
     expect(allText).toContain('"Deny"')
     expect(allText).toContain(`"style":${ButtonStyle.Danger}`)
     expect(allText).toContain(`"custom_id":"${buildApprovalCustomId('deny', 'per_abc123')}"`)
+  })
+})
+
+describe('buildApprovalButtons — reject only', () => {
+  it('offers only Deny when the request cannot be shown in full', () => {
+    // #given/#when
+    const row = buildApprovalButtons('per_abc123', true).toJSON()
+    const allText = JSON.stringify(row)
+    // #then — Once and Always are absent, Deny is the only way to settle the card
+    expect(row.components).toHaveLength(1)
+    expect(allText).toContain('"Deny"')
+    expect(allText).not.toContain('"Approve"')
+    expect(allText).not.toContain(buildApprovalCustomId('approve', 'per_abc123'))
+    expect(allText).toContain(buildApprovalCustomId('deny', 'per_abc123'))
+  })
+
+  it('keeps Approve and Deny by default', () => {
+    // #given/#when/#then
+    expect(buildApprovalButtons('per_abc123', false).toJSON().components).toHaveLength(2)
+  })
+})
+
+describe('approvalCardRejectOnly', () => {
+  it('is false for an Action that fits the card, at the 1024 boundary', () => {
+    // #given/#when/#then
+    expect(approvalCardRejectOnly({...baseRequest, title: 'x'.repeat(1024)})).toBe(false)
+  })
+
+  it('is true for an Action the card would clamp', () => {
+    expect(approvalCardRejectOnly({...baseRequest, title: 'x'.repeat(1025)})).toBe(true)
+  })
+
+  it('is true when the command or filepath was cut by length, even if the title is short', () => {
+    // #given — a short title beside a detail past the 4 KB cap
+    expect(approvalCardRejectOnly({...baseRequest, command: 'x'.repeat(4097)})).toBe(true)
+    expect(approvalCardRejectOnly({...baseRequest, filepath: 'x'.repeat(4097)})).toBe(true)
   })
 })
 
@@ -326,5 +389,18 @@ describe('buildSettledEmbed', () => {
     // #then — each should be unique (not all the same string)
     const unique = new Set(texts)
     expect(unique.size).toBeGreaterThan(1)
+  })
+
+  it('clamps an oversized Action to the Discord field limit instead of failing to build the settled card', () => {
+    // #given — a title past 1024 characters: the embed builder throws on it unclamped
+    const req: PermissionRequest = {...baseRequest, title: `Run command: ${'x'.repeat(5000)}`}
+    // #when / #then — it builds for every settlement outcome
+    for (const reason of ['replied', 'cascade', 'deadline', 'disposed', 'superseded'] as const) {
+      const value = buildSettledEmbed(req, deny, {reason})
+        .toJSON()
+        .fields?.find(field => field.name === 'Action')?.value
+      expect(value).toHaveLength(1024)
+      expect(value?.endsWith('…')).toBe(true)
+    }
   })
 })
