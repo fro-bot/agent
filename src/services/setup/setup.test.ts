@@ -951,6 +951,24 @@ describe('setup', () => {
         expect(result?.toolsCacheStatus).toBe('hit')
       })
 
+      it('keeps a V1 harness pin on the V1 path: prerelease tool-cache identity, no digest id', async () => {
+        // #given the previous default, pinned explicitly as a rollback, with warm caches
+        const harnessPin = '1.19.4+harness.5bde2635'
+        vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({hit: true, restoredKey: 'opencode-tools-v2-key'})
+        vi.mocked(tc.find).mockReturnValue('/opt/hostedtoolcache/opencode/1.19.4-harness.5bde2635/x64')
+
+        // #when
+        const result = await runSetup(createSetupInputs({opencodeVersion: harnessPin}), 'ghs_test_token')
+
+        // #then it is neither rejected as an unpinned V2 nor given a V2 digest identity
+        const restoreArgs = vi.mocked(toolsCache.restoreToolsCache).mock.calls[0]?.[0]
+        expect(restoreArgs?.opencodeVersion).toBe(harnessPin)
+        expect(restoreArgs).not.toHaveProperty('opencodeDigestId')
+        expect(tc.find).toHaveBeenCalledWith('opencode', '1.19.4-harness.5bde2635')
+        expect(core.setFailed).not.toHaveBeenCalled()
+        expect(result).not.toBeNull()
+      })
+
       describe('stock V2 pin', () => {
         const platform = getPlatformInfo()
         const recordedDigest = RECORDED_V2_PIN.assets[`opencode-${platform.os}-${platform.arch}${platform.ext}`] ?? ''
@@ -962,6 +980,29 @@ describe('setup', () => {
             opencodeVersion: RECORDED_V2_PIN.version,
             authJson: '{"anthropic": {"type": "api", "key": "sk-ant-test"}}',
           })
+
+        it('resolves "latest" to the recorded pin with no network lookup', async () => {
+          // #given a network that would name an unverified stock V1 as upstream's latest
+          const fetchSpy = vi
+            .spyOn(globalThis, 'fetch')
+            .mockResolvedValue(new Response(JSON.stringify({tag_name: 'v1.19.5'}), {status: 200}))
+          vi.mocked(installOpenCode).mockResolvedValueOnce({
+            path: '/opt/hostedtoolcache/opencode/fresh',
+            version: RECORDED_V2_PIN.version,
+            cached: false,
+          })
+
+          // #when
+          await runSetup({...v2Inputs(), opencodeVersion: 'latest'}, 'ghs_test_token')
+
+          // #then the pin is what gets cache-keyed and installed, and upstream is never asked
+          const restoreArgs = vi.mocked(toolsCache.restoreToolsCache).mock.calls[0]?.[0]
+          expect(restoreArgs?.opencodeVersion).toBe(RECORDED_V2_PIN.version)
+          expect(restoreArgs?.opencodeDigestId).toBe(digestId)
+          expect(vi.mocked(installOpenCode).mock.calls[0]?.[0]).toBe(RECORDED_V2_PIN.version)
+          expect(fetchSpy).not.toHaveBeenCalled()
+          fetchSpy.mockRestore()
+        })
 
         it('keys the persistent tools cache by the recorded digest', async () => {
           // #when

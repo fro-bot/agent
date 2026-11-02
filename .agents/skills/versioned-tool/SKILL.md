@@ -13,14 +13,13 @@ This project manages external CLI tools through a **single-source-of-truth versi
 
 | Tool | Constant | User-facing input | Renovate datasource |
 | --- | --- | --- | --- |
-| OpenCode (action default) | `DEFAULT_OPENCODE_VERSION` | `opencode-version` | _Release-job coupled — NOT Renovate (see below)_ |
-| OpenCode (action fallback) | `FALLBACK_VERSION` in `src/services/setup/opencode.ts` | _(internal only)_ | `github-releases` (`anomalyco/opencode`) |
+| OpenCode (action default) | `DEFAULT_OPENCODE_VERSION`, derived from `version` in `packages/runtime/src/shared/opencode-v2-pin.json` | `opencode-version` | Pin-coupled: Renovate bumps the JSON file (see below) |
 | OpenCode (workspace image, V1 default) | `ARG OPENCODE_VERSION` in `deploy/workspace.Dockerfile` | _(internal only)_ | _Release-job coupled — NOT Renovate (see below)_ |
 | OpenCode (workspace image, V2) | `version` in `packages/runtime/src/shared/opencode-v2-pin.json`, passed as the workspace build's `--build-arg OPENCODE_VERSION` | _(internal only)_ | `github-releases` (`anomalyco/opencode`, major 2 only; custom manager on the JSON file) |
 | Systematic | `DEFAULT_SYSTEMATIC_VERSION` | `systematic-version` | `npm` (`@fro.bot/systematic`) |
 | OpenCode (harness base) | `base_version` in `packages/harness/harness.config.json` | _(internal only — config-JSON, not a TS constant)_ | `github-releases` (`anomalyco/opencode`) |
 
-**Release-job coupled sites (not Renovate-tracked):** `DEFAULT_OPENCODE_VERSION` and the workspace `ARG OPENCODE_VERSION` hold the harness build version (`<base>+harness.<sha>`); the Dockerfile ARG default stays this V1 harness build, and V2 is selected by build-arg instead. Renovate cannot order SemVer build-metadata tags, so both are bumped together by `harness-release.yaml`'s `sync-default-version` job at publish time (one auto-PR, dual-source idempotency guard). Do not add Renovate `customManager` entries for these — they would be dropped. **V2 pin:** Renovate bumps the JSON file's `version`; its per-asset digests are not Renovate-tracked, so the rule's `postUpgradeTasks` run `bun run postupgrade` (`scripts/sync-opencode-v2-pin.ts`) to regenerate them on the update branch. Any command added there must match the runner's `allowedCommands` (see `scripts/renovate-v2-pin-postupgrade.test.ts`; `node scripts/...` is not allowed). See `deploy/README.md` § OpenCode V2. See `docs/solutions/best-practices/cross-libc-build-and-release-safety-2026-06-14.md` §4 and `docs/solutions/workflow-issues/harness-base-version-source-of-truth-2026-06-12.md`.
+**Release-job coupled site (not Renovate-tracked):** the workspace `ARG OPENCODE_VERSION` holds the V1 harness build version (`<base>+harness.<sha>`) and is edited by hand; V2 is selected by build-arg instead. Renovate cannot order SemVer build-metadata tags, and `harness-release.yaml` no longer rewrites the ARG or `DEFAULT_OPENCODE_VERSION` (the former `sync-default-version` job is gone). Do not add Renovate `customManager` entries for the ARG — they would be dropped. **Action default and V2 pin:** `DEFAULT_OPENCODE_VERSION` is not a literal; it reads the pin file, so there is nothing to bump in TypeScript. Renovate bumps the JSON file's `version`; its per-asset digests are not Renovate-tracked, so the rule's `postUpgradeTasks` run `bun run postupgrade` (`scripts/sync-opencode-v2-pin.ts`) to regenerate them on the update branch. Any command added there must match the runner's `allowedCommands` (see `scripts/renovate-v2-pin-postupgrade.test.ts`; `node scripts/...` is not allowed). See `deploy/README.md` § OpenCode V2. See `docs/solutions/best-practices/cross-libc-build-and-release-safety-2026-06-14.md` §4 and `docs/solutions/workflow-issues/harness-base-version-source-of-truth-2026-06-12.md`.
 
 ## Quick Start
 
@@ -81,7 +80,7 @@ Rules: semver string, no `v` prefix, named `DEFAULT_<TOOL>_VERSION`. This is the
 
 Each installer imports the constant. Never duplicate the same version string across files.
 
-**OpenCode is the exception, not the template:** `FALLBACK_VERSION` in `src/services/setup/opencode.ts` is an independent **stock** pin (e.g. `1.17.13`), deliberately NOT aliased from `DEFAULT_OPENCODE_VERSION` (the harness build, e.g. `1.17.13+harness.<sha>`). They are different artifacts on different update cadences, each with its own Renovate/release-job tracking — do not "deduplicate" them into an alias.
+**OpenCode derives its constants from a JSON pin file:** `DEFAULT_OPENCODE_VERSION` (runtime constants) reads `opencode-v2-pin.json`, which also records the per-asset sha256 digests. Do not re-introduce a literal; the V1 harness build is selected only by pinning `opencode-version` explicitly.
 
 #### 3. Add Renovate Tracking
 
@@ -173,7 +172,7 @@ Installers reuse the pinned version constant instead of hardcoding version liter
 
 Repo-specific behaviors today:
 
-- **OpenCode**: supports explicit `latest` resolution, falls back to `FALLBACK_VERSION` (independent stock pin in `src/services/setup/opencode.ts` — deliberately not the harness-build `DEFAULT_OPENCODE_VERSION`)
+- **OpenCode**: `latest` resolves to the recorded V2 pin with no network lookup (`resolveRequestedVersion`); a failed install never crosses generations (V1 requests fail closed; V2 falls back only to the pin, digest-checked)
 - **Systematic**: installs from `DEFAULT_SYSTEMATIC_VERSION` through the OpenCode CLI's plugin install
 - **Bun**: not an Action-installed tool. The repo's own CI Bun comes from the root `package.json` `packageManager` field through `.github/actions/setup`
 
@@ -197,7 +196,7 @@ Do not copy installer structure blindly between tools. Copy the version-source p
 | Mistake | Why It's Wrong | Fix |
 | --- | --- | --- |
 | Hardcoding default in `action.yaml` | Creates two sources of truth; version drifts | Remove `default:` line, let `inputs.ts` fall back to constant |
-| Duplicating version string in installer | Stale fallback when constant updates | Import the constant (exception: OpenCode's `FALLBACK_VERSION` is an independent stock pin — see §2) |
+| Duplicating version string in installer | Stale fallback when constant updates | Import the constant (OpenCode's constants derive from `opencode-v2-pin.json` — see §2) |
 | Wrong Renovate `extractVersionTemplate` | Renovate can't parse tag format | Check actual tag format: `v1.2.3` vs `bun-v1.2.3` |
 | Using `latest` as default | Non-reproducible builds, surprise breakage | Pin to known stable; let users opt in to `latest` explicitly |
 | Assuming package name == runtime identity | Config paths, version parsing, plugin names break | Verify install name, stdout output, and config file independently |
