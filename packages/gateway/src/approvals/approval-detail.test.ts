@@ -7,7 +7,12 @@
 
 import {describe, expect, it} from 'vitest'
 
-import {APPROVAL_DETAIL_MAX_LENGTH, boundApprovalDetail} from './approval-detail.js'
+import {
+  APPROVAL_DETAIL_MAX_LENGTH,
+  boundApprovalDetail,
+  isApprovalDetailTruncated,
+  isRequestDetailTruncated,
+} from './approval-detail.js'
 
 // ---------------------------------------------------------------------------
 // boundApprovalDetail
@@ -152,5 +157,47 @@ describe('boundApprovalDetail', () => {
     expect(result).not.toBeUndefined()
     expect(result!.length).toBeLessThanOrEqual(APPROVAL_DETAIL_MAX_LENGTH)
     expect(result).not.toContain('\u001B')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// isApprovalDetailTruncated — a length cut hides content; stripping controls does not
+// ---------------------------------------------------------------------------
+
+describe('isApprovalDetailTruncated', () => {
+  it('is false for an absent or short value', () => {
+    // #given/#when/#then
+    expect(isApprovalDetailTruncated(undefined)).toBe(false)
+    expect(isApprovalDetailTruncated('')).toBe(false)
+    expect(isApprovalDetailTruncated('ls -la')).toBe(false)
+  })
+
+  it('is false for a value exactly at the cap', () => {
+    expect(isApprovalDetailTruncated('a'.repeat(APPROVAL_DETAIL_MAX_LENGTH))).toBe(false)
+  })
+
+  it('is true for a value one past the cap', () => {
+    expect(isApprovalDetailTruncated('a'.repeat(APPROVAL_DETAIL_MAX_LENGTH + 1))).toBe(true)
+  })
+
+  it('is false when only control characters push the raw value past the cap (stripping hides nothing)', () => {
+    // #given — raw length over the cap, but within it once control characters are stripped
+    const value = `${'a'.repeat(APPROVAL_DETAIL_MAX_LENGTH)}${'\n'.repeat(50)}`
+    // #when/#then
+    expect(value.length).toBeGreaterThan(APPROVAL_DETAIL_MAX_LENGTH)
+    expect(isApprovalDetailTruncated(value)).toBe(false)
+  })
+})
+
+describe('isRequestDetailTruncated', () => {
+  it('is true when the command or the filepath is cut', () => {
+    // #given/#when/#then
+    expect(isRequestDetailTruncated({command: 'x'.repeat(APPROVAL_DETAIL_MAX_LENGTH + 1)})).toBe(true)
+    expect(isRequestDetailTruncated({filepath: 'x'.repeat(APPROVAL_DETAIL_MAX_LENGTH + 1)})).toBe(true)
+  })
+
+  it('is false when neither is cut', () => {
+    expect(isRequestDetailTruncated({command: 'ls', filepath: '/tmp'})).toBe(false)
+    expect(isRequestDetailTruncated({})).toBe(false)
   })
 })

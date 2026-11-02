@@ -503,9 +503,11 @@ describe('createDrainCompletionV2: the directory gate', () => {
     s.drain.requestValidation()
     await vi.advanceTimersByTimeAsync(60)
 
-    // #then — two readings of three are not enough
+    // #then — two readings of three are not enough; the ledger is drained, so the wait is the confirmation window and
+    // not background work
     expect(s.onAdmitted).not.toHaveBeenCalled()
-    expect(s.reasons.at(-1)).toBe('ledger-not-drained')
+    expect(s.reasons.at(-1)).toBe('directory-quiet-window')
+    expect(s.reasons).not.toContain('ledger-not-drained')
 
     // #when
     await vi.advanceTimersByTimeAsync(100)
@@ -602,7 +604,7 @@ describe('createDrainCompletionV2: the directory gate', () => {
     expect(s.onAdmitted).not.toHaveBeenCalled()
   })
 
-  it('reads a failed reading as not quiet and says it cannot tell', async () => {
+  it('reads a failed directory reading as not quiet and reports it as the confirmation, not as agent work', async () => {
     // #given
     const s = setup({directory: [UNREADABLE, UNREADABLE, UNREADABLE]})
     readyToAdmit(s)
@@ -611,9 +613,10 @@ describe('createDrainCompletionV2: the directory gate', () => {
     s.drain.requestValidation()
     await vi.advanceTimersByTimeAsync(140)
 
-    // #then
+    // #then — the root was read as not live; only the directory could not be read
     expect(s.onAdmitted).not.toHaveBeenCalled()
-    expect(s.reasons).toContain('root-liveness-unavailable')
+    expect(s.reasons).toContain('directory-unreadable')
+    expect(s.reasons).not.toContain('root-liveness-unavailable')
   })
 
   it('drops the count when root activity invalidates the evidence mid-window, and starts over', async () => {

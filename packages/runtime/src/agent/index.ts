@@ -50,6 +50,22 @@ export type {
 } from './directory-quiescence-v2.js'
 
 export {
+  BLOCKING_SET_ID_CAP,
+  createDrainProgress,
+  describeBlockingSet,
+  describeObservation,
+  DRAIN_HEARTBEAT_MS,
+  DRAIN_UNREADABLE_MESSAGE,
+  DRAIN_WAITING_MESSAGE,
+} from './drain-progress-v2.js'
+export type {
+  BlockingDetail,
+  BlockingInboxEntry,
+  BlockingSet,
+  DrainProgress,
+  DrainProgressOptions,
+} from './drain-progress-v2.js'
+export {
   createAgentError,
   createErrorInfo,
   createLLMFetchError,
@@ -177,6 +193,10 @@ export type {
   RemoteOpenCodeV2ClientOptions,
   V2CallError,
   V2FormValue,
+  V2InboxDelivery,
+  V2InboxItemMeta,
+  V2InboxItemType,
+  V2InboxSource,
   V2ModelRef,
   V2PermissionDecision,
   V2PromptFile,

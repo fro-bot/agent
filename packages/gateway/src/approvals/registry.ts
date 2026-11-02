@@ -58,7 +58,7 @@ import type {PermissionReply, PermissionReplyEvent, PermissionRequest, Settlemen
 import type {ApprovalGateEntry, GateActor, RequestGate, ScopePolicy, TerminalOutcome} from './request-gate.js'
 import type {EchoWait} from './run-grants.js'
 
-import {boundApprovalDetail} from './approval-detail.js'
+import {boundApprovalDetail, isRequestDetailTruncated} from './approval-detail.js'
 import {createRequestGate} from './request-gate.js'
 import {startEchoWait} from './run-grants.js'
 
@@ -150,9 +150,20 @@ export interface RegisterParams {
    * NOT called when the button wins before the deadline, or on dispose.
    */
   readonly onDeadlineSettled?: () => void | Promise<void>
+  /**
+   * The transport cannot show the operator the whole request on its own surface (the Discord card clamps the Action
+   * field), so only `reject` is accepted. A request whose `command` or `filepath` was cut by length is reject-only
+   * whatever this says: the registry derives that itself, for every transport.
+   */
+  readonly rejectOnly?: boolean
 }
 
-export type DecisionOutcome = 'ok' | 'not-found' | 'channel-mismatch' | 'already-claimed' | 'reply-failed'
+/**
+ * - `reject-only` — the request cannot be shown in full (a hidden part could be approved unseen), so `once` and
+ *   `always` are refused; only `reject` settles it. Nothing was claimed or sent.
+ */
+export type DecisionOutcome =
+  'ok' | 'not-found' | 'channel-mismatch' | 'already-claimed' | 'reply-failed' | 'reject-only'
 
 export type {EntryState} from './request-gate.js'
 
@@ -255,6 +266,8 @@ export interface ApprovalPayload {
   readonly request: PermissionRequest
   readonly directory: string
   readonly effects: ApprovalSideEffects
+  /** Only `reject` is accepted: part of the request is hidden from the operator. Fixed at registration. */
+  readonly rejectOnly: boolean
   /** Set by attachMessage once the approval notification is posted. */
   renderFn: RenderFn | null
 }
@@ -328,12 +341,15 @@ export function createApprovalRegistry(deps: {
 
   function register(params: RegisterParams): void {
     const {requestID, sessionID, approvalScopeId, directory, request, effects, deadlineMs, onDeadlineSettled} = params
+    // Fail closed when any part of what is being approved is hidden: the frame's detail was cut by length, or the
+    // transport said its own surface cannot show it in full.
+    const rejectOnly = params.rejectOnly === true || isRequestDetailTruncated(request)
     const entry: ApprovalGateEntry = {
       family: 'approval',
       requestID,
       sessionID,
       scopeId: approvalScopeId,
-      payload: {request, directory, effects, renderFn: null},
+      payload: {request, directory, effects, rejectOnly, renderFn: null},
       ops: {
         // The next two return the underlying promise instead of wrapping it in an async function:
         // an async wrapper adds microtask ticks to the fail-close chain, whose depth the
@@ -445,6 +461,14 @@ export function createApprovalRegistry(deps: {
       return 'not-found'
     }
 
+    // Refuse before the claim, so a refused approve leaves the entry open for the operator's reject. The scope check
+    // runs first: a caller outside the entry's scope learns nothing about it.
+    if (decision !== 'reject' && entry.payload.rejectOnly) {
+      if (!approvalScopePolicy(entry, {scopeId: approvalScopeId, actor})) return 'channel-mismatch'
+      logger.warn({requestID, decision}, 'ApprovalRegistry: approve refused — request cannot be shown in full')
+      return 'reject-only'
+    }
+
     const admission = gate.admit(entry, {scopeId: approvalScopeId, actor}, approvalScopePolicy)
     if (admission.kind === 'scope-mismatch') return 'channel-mismatch'
     if (admission.kind === 'already-claimed') return 'already-claimed'
@@ -526,6 +550,10 @@ export function createApprovalRegistry(deps: {
     const entry = getEntry(requestID)
     if (entry === undefined) return 'not-found'
 
+    // A grant is an earlier approval of something the operator saw; it does not cover a part they were never shown.
+    // The entry stays open, so the operator can still reject it.
+    if (entry.payload.rejectOnly) return 'reject-only'
+
     // The grant acts inside the entry's own scope, so the strict scope policy passes by construction.
     const admission = gate.admit(entry, {scopeId: entry.scopeId, actor: RUN_GRANT_ACTOR}, approvalScopePolicy)
     if (admission.kind === 'scope-mismatch') return 'channel-mismatch'
@@ -573,6 +601,10 @@ export function createApprovalRegistry(deps: {
       return
     }
 
+    // A reject settles the asks pending NOW, which is what upstream does on both generations. Take that list before the
+    // first await: the settled render below can take seconds, and the model may raise a new ask in the meantime.
+    const siblings = reply === 'reject' ? openSiblings(sessionID, entry) : []
+
     // Log if OpenCode's reply differs from our claimed decision (it wins).
     if ((entry.state === 'claimed' || entry.state === 'confirmed') && entry.actor !== null) {
       // The reply is the echo of our POST. Render with OpenCode's reply.
@@ -595,20 +627,32 @@ export function createApprovalRegistry(deps: {
         // will settle via its own confirmReply echo (or its own deadline).
         // Sending a cascade reject to a claimed sibling would create a contradiction:
         // OpenCode would receive both 'once' (from the button) and 'reject' (cascade).
-        if (reply === 'reject') {
+        if (siblings.length > 0) {
           // eslint-disable-next-line no-void
-          void cascadeReject(sessionID)
+          void cascadeReject(siblings)
         }
       })
   }
 
-  async function cascadeReject(sessionID: string): Promise<void> {
-    // Only cascade to `open` siblings; skip `claimed` ones.
-    const siblings = approvalEntries().filter(e => e.sessionID === sessionID && e.state === 'open')
+  /** The `open` approvals of a session other than `except`, as they are right now. `claimed` ones own their outcome. */
+  function openSiblings(sessionID: string, except: ApprovalGateEntry): readonly ApprovalGateEntry[] {
+    return approvalEntries().filter(e => e !== except && e.sessionID === sessionID && e.state === 'open')
+  }
+
+  /**
+   * Reject the siblings that were pending when the operator decided. Each is checked again before it is settled: one
+   * that left the gate, was replaced under its id, or was claimed since is not touched, and an ask registered after the
+   * decision is not in the list at all.
+   */
+  async function cascadeReject(siblings: readonly ApprovalGateEntry[]): Promise<void> {
     await Promise.all(
       siblings.map(async sib => {
+        if (getEntry(sib.requestID) !== sib || sib.state !== 'open') return
         gate.settleNow(sib, 'cascade')
-        logger.info({requestID: sib.requestID, sessionID}, 'ApprovalRegistry: cascade-rejecting sibling permission')
+        logger.info(
+          {requestID: sib.requestID, sessionID: sib.sessionID},
+          'ApprovalRegistry: cascade-rejecting sibling permission',
+        )
         // Best-effort reject POST for the sibling (spec: KEEP the cascade POST).
         try {
           await sib.payload.effects.postReply(sib.requestID, sib.payload.directory, 'reject')

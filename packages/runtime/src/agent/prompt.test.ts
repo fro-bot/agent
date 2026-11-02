@@ -2716,3 +2716,68 @@ describe('buildAgentPrompt response delivery gating', () => {
     expect(prompt).not.toContain('### Response Protocol (REQUIRED)')
   })
 })
+
+const BROKERED_PUSH_BULLET =
+  "- Commit your changes; the Action pushes them to the PR branch after the run. Don't run `git push`, and don't say whether the push landed — the result is added to your reply."
+
+function buildPromptForBrokeredPush(
+  brokeredPushActive: boolean | undefined,
+  responseDelivery: ResponseDelivery = 'file-convention',
+  eventType: TriggerContext['eventType'] = 'issue_comment',
+  responseSurface: ResponseSurface = 'pr-review-permitted',
+): string {
+  const options: PromptOptions = {
+    context: createMockContext({eventName: eventType, issueNumber: 42, issueType: 'pr'}),
+    customPrompt: null,
+    cacheStatus: 'hit',
+    triggerContext: createMockTriggerContext({
+      eventType,
+      target: {kind: 'pr', number: 42, title: 'feat: add feature', body: 'PR body', locked: false, isDraft: false},
+    }),
+    responseMode: responseDelivery === 'none' ? 'none' : 'github',
+    responseDelivery,
+    responseFilePath: responseDelivery === 'file-convention' ? '/tmp/fro-bot-response/1-1/nonce123.md' : null,
+    responseSurface,
+    brokeredPushActive,
+  }
+
+  return buildAgentPrompt(options, createMockLogger()).text
+}
+
+describe('buildAgentPrompt brokered push instruction', () => {
+  it('tells the agent the Action pushes its changes when brokered push will run', () => {
+    // #given / #when
+    const prompt = buildPromptForBrokeredPush(true)
+
+    // #then the bullet appears once, inside the Response Protocol
+    expect(prompt.split(BROKERED_PUSH_BULLET)).toHaveLength(2)
+    const protocolStart = prompt.indexOf('### Response Protocol (REQUIRED)')
+    expect(prompt.indexOf(BROKERED_PUSH_BULLET)).toBeGreaterThan(protocolStart)
+  })
+
+  it('keeps the numbered response protocol rules contiguous when the bullet is present', () => {
+    // #given / #when
+    const prompt = buildPromptForBrokeredPush(true)
+    const protocol = getXmlBlock(prompt, 'agent_context')
+    const rules = protocol.slice(protocol.indexOf('**Rules:**'), protocol.indexOf('**File Format'))
+    const numbered = rules
+      .split('\n')
+      .filter(line => /^\d+\. /.test(line))
+      .map(line => Number.parseInt(line, 10))
+
+    // #then
+    expect(numbered).toEqual([1, 2, 3, 4, 5, 6])
+    expect(rules).toContain(BROKERED_PUSH_BULLET)
+  })
+
+  it.each([
+    ['flag false (ineligible run)', false],
+    ['flag omitted', undefined],
+  ] as const)('omits the bullet when %s', (_label, flag) => {
+    expect(buildPromptForBrokeredPush(flag)).not.toContain('the Action pushes them')
+  })
+
+  it.each(['model-gh', 'none'] as const)('omits the bullet under %s delivery even if the flag is set', delivery => {
+    expect(buildPromptForBrokeredPush(true, delivery)).not.toContain('the Action pushes them')
+  })
+})

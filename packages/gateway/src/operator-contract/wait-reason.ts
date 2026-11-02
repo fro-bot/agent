@@ -32,7 +32,8 @@ export type OperatorWaitReason = (typeof OPERATOR_WAIT_REASONS)[number]
  * - `agent-working`: the root agent is still running, or its liveness could not be read.
  * - `awaiting-reply`: the parent's reply (or the evidence for it) is not persisted or delivered yet.
  * - `awaiting-background-task`: a background task's completion has not been observed or settled.
- * - `confirming-completion`: the gate is re-checking after activity moved the evidence.
+ * - `confirming-completion`: the gate is re-checking after activity moved the evidence, or (V2) the directory is still
+ *   being confirmed quiet with nothing left in the ledger.
  */
 export const DRAIN_REJECT_CODE_TO_WAIT_REASON = {
   'root-live': 'agent-working',
@@ -47,6 +48,8 @@ export const DRAIN_REJECT_CODE_TO_WAIT_REASON = {
   'revision-drift': 'confirming-completion',
   'idle-evidence-stale': 'confirming-completion',
   'validation-threw': 'confirming-completion',
+  'directory-quiet-window': 'confirming-completion',
+  'directory-unreadable': 'confirming-completion',
 } satisfies Record<DrainRejectCode, OperatorWaitReason>
 
 const OPERATOR_WAIT_REASON_SET: ReadonlySet<string> = new Set<string>(OPERATOR_WAIT_REASONS)

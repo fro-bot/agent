@@ -54,7 +54,9 @@ describe('OpenCode V2 pin Renovate rule', () => {
 
   it('has a postupgrade script that runs the sync under bun, and the build script it chains to', () => {
     // #given the root scripts / #when / #then
-    expect(packageJson.scripts.postupgrade).toBe('bun scripts/sync-opencode-v2-pin.ts')
+    expect(packageJson.scripts.postupgrade).toBe(
+      'bun scripts/sync-opencode-plugin-effect.ts && bun scripts/sync-opencode-v2-pin.ts',
+    )
     expect(packageJson.scripts.build).toBeDefined()
   })
 })

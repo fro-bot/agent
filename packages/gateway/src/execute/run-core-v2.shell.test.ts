@@ -13,6 +13,7 @@ import type {StartOptions} from './run-core-v2.fixture.js'
 import {createOwnershipLedger, ok, shellLedgerKey} from '@fro-bot/runtime'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
+import {toOperatorWaitReason} from '../operator-contract/wait-reason.js'
 import {
   CHILD,
   failure,
@@ -251,6 +252,101 @@ describe('runOpenCodeCoreV2: adopting a background shell', () => {
 
     // #then
     expect(states(ledger)).toEqual({[SHELL_KEY]: 'outstanding'})
+    run.close()
+    await vi.advanceTimersByTimeAsync(PAST_SETTLE_BOUND_MS)
+  })
+})
+
+describe('runOpenCodeCoreV2: the wait reason for a shell before the root has succeeded (#2007)', () => {
+  it('shows no reason for the whole run of a foreground shell: the root is only executing', async () => {
+    // #given — the ledger owns the shell from its creation frame, but nothing says it will outlive its call
+    const ledger = createOwnershipLedger()
+    const run = startWindowedRun({ownershipLedger: ledger, runId: 'run-shell-fg', shellServer: RUNNING_SHELL})
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #when — a foreground `sleep 3`: created, named by its progress frame, and still running
+    run.emit(
+      frames.started(),
+      frames.toolStarted('shell', 'call_fg'),
+      frames.toolCalled('call_fg', {command: 'sleep 3'}),
+      frames.shellCreated(SHELL),
+      frames.shellProgress('call_fg', SHELL),
+    )
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #then — owned, so the drain and the release safety still see it; no reason, now or for the rest of its duration
+    expect(states(ledger)).toEqual({[SHELL_KEY]: 'outstanding'})
+    expect(getWaitReason('run-shell-fg')).toBeUndefined()
+    await vi.advanceTimersByTimeAsync(3_000)
+    expect(getWaitReason('run-shell-fg')).toBeUndefined()
+
+    // #when — the call ends in the foreground
+    run.emit(frames.shellForegroundDone('call_fg', SHELL))
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #then
+    expect(ledger.snapshot()).toEqual([])
+    expect(getWaitReason('run-shell-fg')).toBeUndefined()
+    run.close()
+    await vi.advanceTimersByTimeAsync(PAST_SETTLE_BOUND_MS)
+  })
+
+  it('reports awaiting-background-task once the shell is confirmed as background, and drops it when it settles', async () => {
+    // #given — created and named, but the call has not returned yet
+    const ledger = createOwnershipLedger()
+    const run = startWindowedRun({ownershipLedger: ledger, runId: 'run-shell-pre', shellServer: RUNNING_SHELL})
+    await vi.advanceTimersByTimeAsync(10)
+    run.emit(
+      frames.started(),
+      frames.toolStarted('shell', 'call_shell'),
+      frames.toolCalled('call_shell', {command: 'sleep 8', background: true}),
+      frames.shellCreated(SHELL),
+      frames.shellProgress('call_shell', SHELL),
+    )
+    await vi.advanceTimersByTimeAsync(10)
+    expect(getWaitReason('run-shell-pre')).toBeUndefined()
+
+    // #when — the call returns `running`, and the root keeps working (no success frame)
+    run.emit(frames.shellBackgrounded('call_shell', SHELL), frames.delta('Started it.'))
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #then
+    expect(states(ledger)).toEqual({[SHELL_KEY]: 'outstanding'})
+    expect(toOperatorWaitReason(getWaitReason('run-shell-pre'))).toBe('awaiting-background-task')
+
+    // #when — the shell's notice arrives while the root is still in that turn
+    run.shellServer.shells[SHELL] = {status: 'exited', owner: ROOT}
+    run.emit(frames.shellExited(SHELL), frames.shellNotice(SHELL, 'completed', 'msg_shell'))
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #then
+    expect(states(ledger)).toEqual({[SHELL_KEY]: 'settled'})
+    expect(getWaitReason('run-shell-pre')).toBeUndefined()
+    run.close()
+    await vi.advanceTimersByTimeAsync(PAST_SETTLE_BOUND_MS)
+  })
+
+  it('counts a foreground shell moved to the background only once its call returns running', async () => {
+    // #given — a foreground call, with no `background` in its input
+    const ledger = createOwnershipLedger()
+    const run = startWindowedRun({ownershipLedger: ledger, runId: 'run-shell-moved', shellServer: RUNNING_SHELL})
+    await vi.advanceTimersByTimeAsync(10)
+    run.emit(
+      frames.started(),
+      frames.toolStarted('shell', 'call_fg'),
+      frames.toolCalled('call_fg', {command: 'make test'}),
+      frames.shellCreated(SHELL),
+      frames.shellProgress('call_fg', SHELL),
+    )
+    await vi.advanceTimersByTimeAsync(10)
+    expect(getWaitReason('run-shell-moved')).toBeUndefined()
+
+    // #when — the user moves it to the background (POST /api/session/:id/background): the call returns `running`
+    run.emit(frames.shellBackgrounded('call_fg', SHELL))
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #then
+    expect(toOperatorWaitReason(getWaitReason('run-shell-moved'))).toBe('awaiting-background-task')
     run.close()
     await vi.advanceTimersByTimeAsync(PAST_SETTLE_BOUND_MS)
   })

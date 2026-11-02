@@ -69,6 +69,7 @@ vi.mock('./discord/mentions.js', async importOriginal => {
 vi.mock('./discord/approvals.js', () => ({
   parseApprovalCustomId: vi.fn().mockReturnValue(null),
   buildApprovalEmbed: vi.fn().mockReturnValue({type: 'embed'}),
+  approvalCardRejectOnly: vi.fn().mockReturnValue(false),
   buildApprovalButtons: vi.fn().mockReturnValue({type: 'buttons'}),
   buildSettledEmbed: vi.fn().mockReturnValue({type: 'settled-embed'}),
   APPROVE_PREFIX: 'fb-approve:',
@@ -1381,6 +1382,31 @@ describe('button interaction handler (approval flow)', () => {
     // #then — editInteraction always injects allowedMentions: {parse: []}
     expect(interaction.editReply).toHaveBeenCalledWith(
       expect.objectContaining({content: 'This approval belongs to another channel.', allowedMentions: {parse: []}}),
+    )
+  })
+
+  it('outcome reject-only → ephemeral refusal naming why, never "Approved."', async () => {
+    // #given — the registry refuses an approve on a request the card could not show in full
+    const {interactionHandler, fakeRegistry} = await runAndCaptureHandler()
+    const {parseApprovalCustomId} = await import('./discord/approvals.js')
+    vi.mocked(parseApprovalCustomId).mockReturnValueOnce({action: 'approve', requestID: 'req-abc'})
+
+    const {userIsAuthorized} = await import('./discord/mentions.js')
+    vi.mocked(userIsAuthorized).mockResolvedValueOnce(true)
+    vi.mocked(fakeRegistry.handleDecision).mockResolvedValueOnce('reject-only')
+
+    const interaction = makeFakeButtonInteraction()
+
+    // #when
+    await interactionHandler(interaction)
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // #then
+    expect(interaction.editReply).toHaveBeenCalledWith(
+      expect.objectContaining({
+        content: 'This request is too long to show in full, so it can only be rejected.',
+        allowedMentions: {parse: []},
+      }),
     )
   })
 
