@@ -223,6 +223,5 @@ async function startV2Server(
     core.setFailed(`OpenCode V2 start failed (${started.error.stage}): ${started.error.message}`)
     return null
   }
-  serverLogger.info('OpenCode V2 server started and gated')
   return {generation: 'v2', cacheResult, cacheStatus, serverHandle: started.data}
 }

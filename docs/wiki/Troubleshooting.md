@@ -1,8 +1,20 @@
 ---
 type: convention
-last-updated: "2026-10-25"
-updated-by: "fe7f6bda"
+last-updated: "2026-11-02"
+updated-by: "f8ee76a3"
 sources:
+  - src/features/agent/retry-v2.ts
+  - src/harness/phases/v2-server.ts
+  - src/harness/phases/v1-import-wait.ts
+  - src/features/agent/prompt-sender-v2.ts
+  - src/features/agent/drain-v2.ts
+  - packages/runtime/src/agent/bundled-skills-dir.ts
+  - packages/runtime/src/shared/opencode-v2-pin.json
+  - packages/gateway/src/execute/opencode-generation.ts
+  - packages/gateway/src/execute/run-core-v2.ts
+  - packages/gateway/src/approvals/run-grants.ts
+  - apps/workspace-agent/src/opencode-credentials-v2.ts
+  - apps/workspace-agent/src/opencode-proxy-v2.ts
   - action.yaml
   - src/harness/phases/routing.ts
   - src/features/triggers/router.ts
@@ -119,13 +131,27 @@ See [[Session Persistence]] for how memory survives across runs.
 
 ## Setup and Install Failures
 
+### OpenCode V2 diagnostics
+
+V2 startup names its failing stage: credentials, plugins, config, held claims, spawn, permission gate, credential gate, or import wait (`src/harness/phases/v2-server.ts`). These fail before any prompt and disable session persistence, so the next run does not restore a half-imported or half-gated database.
+
+An unrecorded stock V2 version, missing asset digest, or checksum mismatch prevents installation without a V1 fallback. The recorded version and platform assets are in `packages/runtime/src/shared/opencode-v2-pin.json`. This is separate from the V1 harness checksum manifest.
+
+A V2 import wait can report an import error, a 60-second progress stall, five consecutive unreadable observations, or the 300-second hard bound. Waiting for history import is expected after restoring V1 state; repeated failure is not a missing-session signal. [[Session Persistence]] describes restore precedence and the migration barrier.
+
+`Bundled Systematic skills directory not found` means the resolver could not grant the exact installed skills directory under the outside-checkout deny. A loaded skill may then fail reading its references or scripts. The grant is intentionally version-specific; a different operator-supplied plugin version does not inherit it. [[Setup and Configuration]] explains the resolver and its edit-tool restriction.
+
+In a V2 workspace, a provider credential failure before readiness often means only legacy `auth.json` was provisioned. Fresh per-spawn databases skip its import; the supervisor separately creates credentials over authenticated loopback and verifies the effective model's provider. The proxy never exposes credential enumeration. An upstream authentication failure is surfaced as `502` with `x-fro-bot-proxy-error: upstream-auth`; a server between spawns remains unavailable instead of forwarding an old password.
+
+The platform and executable-path checks apply across generations; the advisory Systematic-install warning below describes the V1 path.
+
 If the run fails during setup rather than during agent execution:
 
-- **`Unsupported platform: <platform>/<arch>`** — the action supports Linux and macOS on x64 or arm64 only. This is now rejected by name before any download is attempted. Windows runners are not supported, and neither is an architecture outside that matrix; the harness build the action defaults to publishes assets for those four combinations and no others. See [[Setup and Configuration]].
+- **`Unsupported platform: <platform>/<arch>`** — the action supports Linux and macOS on x64 or arm64 only. This is rejected by name before any download is attempted. Windows runners and architectures outside that matrix are not supported. The default V2 pin also requires a recorded digest for the selected asset. See [[Setup and Configuration]].
 - **`EACCES` when spawning OpenCode** — historically caused by handing a consumer the install _directory_ where an executable path was required. If this recurs, the auto-setup log line records both the directory and the resolved binary path, which is enough to tell which one was exported as `OPENCODE_PATH`.
 - **`Skipping tools cache save because Systematic plugin install did not complete`** — setup continues without the plugin rather than failing the run, so this is a warning, not a fatal error. Two hints accompany it. If the parent environment carries `NPM_CONFIG_*` variables, the warning names them and notes that the install child deliberately does not inherit them; that scrub is intentional and should not be worked around by allowlisting those keys. If the failure was a spawn error, the warning carries a path diagnosis stating what was actually found at the binary path — absent, a dangling symlink, a directory, or present-but-not-executable — along with the tail of the child's stderr.
 
-Stock fallback and pinned-harness failure have different meanings. The current stock `FALLBACK_VERSION` in `src/services/setup/opencode.ts` is `1.19.0`; it covers failed `latest` resolution and eligible stock-install retries. An explicitly requested harness build never silently falls back to that stock release after a download or checksum failure. [[Setup and Configuration]] explains the version identity and verification boundaries.
+There is no install fallback. A V1 request (a harness build or a stock V1 version) that fails to download or verify fails the run with an error naming the requested version; it never falls back to the V2 pin. A failed V2 pin install fails the run, and a V2 version with no recorded digest is rejected before any download. [[Setup and Configuration]] explains the version identity and verification boundaries.
 
 ## Model Resolution Failures
 
@@ -134,6 +160,14 @@ SDK failures now retain readable envelope details in diagnostics rather than col
 `model_not_found` means OpenCode could not resolve the configured provider/model identifier, not that a network request to the model timed out. The Action stops immediately and reports a sanitized model ID and any validated suggestions, plus a suggested action in the job summary (`packages/runtime/src/agent/error-format/format.ts`, `src/features/agent/execution.ts`). The two usual causes are an incorrect identifier and a model catalog that did not load; the latter can occur when the job cannot reach `models.opencode.ai` and the model is not defined explicitly in OpenCode config. Repeating the same turn or increasing its timeout does not repair either configuration problem.
 
 ## Timeout Errors
+
+`v2 session wait bound elapsed with no answer; asking again` is a renewed 60-second long poll, not a resent prompt or an execution timeout. A real wait failure instead logs `v2 session wait failed; relying on the poll watchdog for completion`. The overall run deadline still applies. [[Prompt Architecture]] explains the observation and submission boundary.
+
+`Run release verdict` summarizes the Action's directory-release evidence: drain outcome, stop usage, quiet observations, stopped work, and unresolved ownership. It is emitted before final server shutdown, so `quiet: true` alone does not prove persistence succeeded. The shutdown result and `cache-save-result` complete that diagnosis; see [[Background Subagents and Ownership]].
+
+On V2, a root that appears idle can still be waiting for a background shell, a subagent, an inbox wake, or the five-second directory-stability window. This is verified release work, not necessarily a stuck model. Failed or partial activity reads reset the quiet window. If stopping cannot confirm quiet, the Action declines saving and the gateway quarantines instead of handing the checkout to another run.
+
+`OpenCode V2 prompt acknowledgment was lost` is a distinct failure: the POST may have been accepted, so the Action does not resend it or save uncertain state. Increasing the number of retries would risk repeating side effects. [[Execution Lifecycle]] explains the pre-send versus post-send boundary.
 
 If the agent times out before completing:
 
@@ -175,6 +209,10 @@ The coordination lock normally disappears when a run finishes. If a repo stays b
 To clear a stuck gateway lock sooner, use `/fro-bot force-release-lock`; it deletes the lock only when the lease has expired and the repo's workspace reports `clear`.
 
 ## A Gateway Run Was Refused or Cancelled
+
+The gateway selects its protocol from the workspace's reported `opencodeVersion` for each run. A present but unreadable value or failed readiness lookup is unavailable, not an implicit V1 choice. This also affects generation-aware workspace checks used by lock replacement and recovery. The detailed `server.connected` and `session.idle` diagnostics below are V1-specific; V2 uses its native event and directory-release path.
+
+The periodic stranded-run sweep now covers stale `EXECUTING` and `ACKNOWLEDGED` records, leaving `PENDING` alone. It skips runs owned by this process, including live and maintenance runs, and never deletes a lock. A repaired failed status is therefore not evidence that the workspace was cleared. Startup recovery still requires a clear generation-appropriate workspace observation.
 
 When a gateway run ends before the agent starts, or a cancel does not seem to stop the agent, the logs carry the reason without any repository content. Join the lines on `runId` (gateway) and `sessionId` (workspace).
 

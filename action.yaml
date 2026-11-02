@@ -86,7 +86,7 @@ inputs:
     required: false
     default: '5000'
   opencode-version:
-    description: OpenCode CLI version to install if auto-setup is needed. Defaults to version pinned in source code if not set. An existing opencode is reused only when it reports exactly this version (the `-harness.` and `+harness.` spellings are equivalent); otherwise the pinned build is installed.
+    description: OpenCode CLI version to install if auto-setup is needed. Defaults to the stock OpenCode V2 release pinned in source code if not set (`latest` means the same pin). A V1 harness build (for example `1.19.4+harness.5bde2635`) still installs when pinned explicitly. An existing opencode is reused only when it reports exactly this version (the `-harness.` and `+harness.` spellings are equivalent); otherwise the pinned build is installed.
     required: false
   systematic-version:
     description: Systematic plugin version to register with OpenCode. Defaults to version pinned in source code if not set.

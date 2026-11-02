@@ -79,6 +79,8 @@ export function resolveConfiguredPluginVersions(model: string): readonly string[
  * carries this project's upstream patch set, so an eval driven by the stock package is
  * measuring a different system than the one that ships — the same class of error as pinning
  * an outdated version. Override with `FRO_BOT_EVAL_HARNESS_BIN` when testing a candidate build.
+ *
+ * Evals stay on the V1 harness build, independent of the Action's default (stock V2); they move to V2 when V1 is cut.
  */
 export function resolveHarnessBinary(): string {
   const configured = process.env.FRO_BOT_EVAL_HARNESS_BIN
