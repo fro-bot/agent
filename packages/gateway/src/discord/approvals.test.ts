@@ -183,6 +183,28 @@ describe('buildApprovalEmbed', () => {
     expect(allText).not.toContain('__SECRET_PATTERN__')
   })
 
+  it('shows the command a shell approval asks about in the Action field', () => {
+    // #given — the title the parser derives for a V2 shell ask (fro-bot/agent#2002)
+    const req: PermissionRequest = {...baseRequest, patterns: ['echo hi'], title: 'Run command: echo hi'}
+    // #when
+    const json = buildApprovalEmbed(req).toJSON()
+    // #then
+    expect(json.fields?.find(field => field.name === 'Action')?.value).toBe('Run command: echo hi')
+  })
+
+  it('clamps an overlong Action to the Discord field limit instead of failing to build the card', () => {
+    // #given — a long command: the embed builder throws past 1024 characters
+    const req: PermissionRequest = {...baseRequest, title: `Run command: ${'x'.repeat(5000)}`}
+    // #when
+    const value = buildApprovalEmbed(req)
+      .toJSON()
+      .fields?.find(field => field.name === 'Action')?.value
+    // #then
+    expect(value).toHaveLength(1024)
+    expect(value?.startsWith('Run command: xxx')).toBe(true)
+    expect(value?.endsWith('…')).toBe(true)
+  })
+
   it('includes a footer about fail-closed behaviour', () => {
     // #given/#when
     const json = buildApprovalEmbed(baseRequest).toJSON()

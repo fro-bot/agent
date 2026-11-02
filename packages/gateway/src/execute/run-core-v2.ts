@@ -76,6 +76,7 @@ import {parseQuestionRequest, safeLogId} from '../approvals/question-coordinator
 import {createDrainCompletionV2} from './drain-completion-v2.js'
 import {formatToolPart} from './format-part.js'
 import {reconcileLivePass} from './live-reconcile.js'
+import {synthesizeApprovalMetadata} from './permission-detail-v2.js'
 import {failureFromV2Error} from './provider-failure-v2.js'
 import {createFormDirectoryV2} from './question-client-v2.js'
 import {startQuarantineWatchV2} from './root-stop-v2.js'
@@ -960,6 +961,8 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
             patterns: event.resources,
             // `save` is what upstream would store on an `always`; the coordinator keeps it as a run-local grant.
             always: event.save,
+            // A V2 ask names its command or paths only in `resources`; the parser reads them from `metadata`.
+            metadata: synthesizeApprovalMetadata(event.action, event.resources),
           })
           if (request === null) {
             logger.warn({eventType: 'permission.asked'}, 'run-core: permission.asked payload malformed — skipping')

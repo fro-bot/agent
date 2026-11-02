@@ -18,6 +18,13 @@ export const DENY_PREFIX = 'fb-deny:'
 
 const CUSTOM_ID_MAX = 100
 
+/** Discord's cap on an embed field value; the builder throws past it, which would leave the card unposted. */
+const FIELD_VALUE_MAX = 1024
+
+function clampFieldValue(value: string): string {
+  return value.length <= FIELD_VALUE_MAX ? value : `${value.slice(0, FIELD_VALUE_MAX - 1)}…`
+}
+
 // ---------------------------------------------------------------------------
 // custom_id codec
 // ---------------------------------------------------------------------------
@@ -77,7 +84,7 @@ export function buildApprovalEmbed(request: PermissionRequest): EmbedBuilder {
     .setColor(0xffa500) // amber — pending
     .addFields(
       {name: 'Gate category', value: request.permission, inline: true},
-      {name: 'Action', value: request.title, inline: false},
+      {name: 'Action', value: clampFieldValue(request.title), inline: false},
     )
     .setFooter({text: 'If not approved in time, this request will be automatically denied (fail-closed).'})
     .setTimestamp()
@@ -144,7 +151,7 @@ export function buildSettledEmbed(
     .setColor(color)
     .addFields(
       {name: 'Gate category', value: request.permission, inline: true},
-      {name: 'Action', value: request.title, inline: false},
+      {name: 'Action', value: clampFieldValue(request.title), inline: false},
     )
     .setTimestamp()
 }
