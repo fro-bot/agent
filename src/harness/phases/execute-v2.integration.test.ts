@@ -300,7 +300,11 @@ async function startScriptedProvider(script: readonly ScriptStep[], fallback = '
   }
 }
 
-async function startRealServer(box: Sandbox, provider: Provider): Promise<OpenCodeV2ServerHandle> {
+async function startRealServer(
+  box: Sandbox,
+  provider: Provider,
+  extraPermissions: readonly {action: string; resource: string; effect: 'allow' | 'ask' | 'deny'}[] = [],
+): Promise<OpenCodeV2ServerHandle> {
   process.env.RUNNER_TEMP = box.env.RUNNER_TEMP
   process.env.GITHUB_WORKSPACE = box.repo
   process.env.GITHUB_RUN_ID = '78'
@@ -332,7 +336,14 @@ async function startRealServer(box: Sandbox, provider: Provider): Promise<OpenCo
     deps: {
       startServer: async (spawnOptions, spawnLogger) => {
         const {startOpenCodeV2Server} = await import('@fro-bot/runtime')
-        return startOpenCodeV2Server({...spawnOptions, timeouts: {agentReadyTimeoutMs: 90_000}}, spawnLogger)
+        // Operator config cannot carry permission rules (they are stripped), so a test that needs an ask appends its rule
+        // to the spawned content. The server evaluates last-match-wins, so it outranks the built-in `shell` allow.
+        const config = spawnOptions.config as {permissions?: readonly unknown[]} | undefined
+        const withExtras =
+          extraPermissions.length === 0 || config === undefined
+            ? spawnOptions
+            : {...spawnOptions, config: {...config, permissions: [...(config.permissions ?? []), ...extraPermissions]}}
+        return startOpenCodeV2Server({...withExtras, timeouts: {agentReadyTimeoutMs: 90_000}}, spawnLogger)
       },
     },
   })
@@ -472,6 +483,7 @@ function sizeOrZero(file: string): number {
 }
 
 const SHELL_MARKER = 'release-fixture-job-d41'
+const AUTOMATION_REJECT_MESSAGE = "This automated run does not allow this action. Don't retry it; continue without it."
 
 describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock binary', () => {
   beforeAll(() => {
@@ -678,7 +690,7 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
     // #and the permission ask for the outside read was answered with a reject, never once or always
     const replies = seen.filter(item => /\/permission\/[^/]+\/reply$/.test(item.path))
     for (const reply of replies) {
-      expect(JSON.parse(reply.body ?? '{}')).toEqual({decision: 'reject'})
+      expect(JSON.parse(reply.body ?? '{}')).toEqual({decision: 'reject', message: AUTOMATION_REJECT_MESSAGE})
     }
 
     // #and the key never reached a log
@@ -703,6 +715,7 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
       sessionId,
       requestId: 'per_00000000000000000000000000',
       decision: 'reject',
+      message: AUTOMATION_REJECT_MESSAGE,
     })
     expect(reply).toEqual({success: false, error: {kind: 'http', status: 404}})
 
@@ -722,6 +735,71 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
     })
 
     expect(result.error).toBeNull()
+  }, 300_000)
+
+  it('continues the turn after a rejected ask: the reject carries a message, the run succeeds and its claim is released', async () => {
+    // #given `shell` set to ask, and a model that runs one shell command and then answers whatever the result was
+    const box = createSandbox()
+    sandboxes.push(box)
+    const provider = await startScriptedProvider(
+      [{tool: 'shell', args: {command: 'echo reject-fixture-9f3'}}, {text: 'Carried on without the shell.'}],
+      'unexpected extra turn',
+    )
+    providers.push(provider)
+    const real = await startRealServer(box, provider, [{action: 'shell', resource: '*', effect: 'ask'}])
+    const replies: Seen[] = []
+    const recording = {
+      ...real,
+      fetch: async (route: string, init?: RequestInit) => {
+        if (/\/permission\/[^/]+\/reply$/.test(route)) {
+          replies.push({
+            method: init?.method ?? 'GET',
+            path: route,
+            body: typeof init?.body === 'string' ? init.body : null,
+          })
+        }
+        return real.fetch(route, init)
+      },
+    } as OpenCodeV2ServerHandle
+    consoleMock.outputTextContent.mockClear()
+    const startedAt = Date.now()
+
+    // #when the Action loop rejects the ask, and the run is then released the way `run.ts` releases it
+    const result = await executePhase(recording, box, 120_000)
+    const release = await runReleaseV2({
+      serverHandle: real,
+      executionSucceeded: result.success,
+      rootSessionId: result.sessionId,
+      ledger: result.ownershipLedger,
+      liveObservation: result.liveObservation,
+      deferredSummary: result.deferredSummary,
+      runStartedAt: startedAt,
+      deadlineMs: computeDrainDeadlineMs(120_000, result.executionDurationMs),
+      sessionRetention: 50,
+      logger: createMockLogger(),
+    })
+
+    // #then the one ask was rejected, with the message
+    expect(replies).toHaveLength(1)
+    expect(JSON.parse(replies[0]?.body ?? '{}')).toEqual({decision: 'reject', message: AUTOMATION_REJECT_MESSAGE})
+
+    // #and the model saw the message as the tool's failure and took a second step: the run succeeded, not interrupted
+    const toolResults = provider.requests
+      .filter(item => item.hasTools)
+      .flatMap(item => (JSON.parse(item.raw) as {messages: {role: string; content: unknown}[]}).messages)
+      .filter(message => message.role === 'tool')
+      .map(message => JSON.stringify(message.content))
+      .join('\n')
+    expect(toolResults).toContain('permission.rejected')
+    expect(toolResults).toContain(AUTOMATION_REJECT_MESSAGE)
+    expect(result).toMatchObject({success: true, exitCode: 0, llmError: null})
+    expect(JSON.stringify(consoleMock.outputTextContent.mock.calls)).toContain('Carried on without the shell.')
+
+    // #and the command never ran, and no session is left holding a claim the next run would resume
+    expect(processRunning('reject-fixture-9f3')).toBe(false)
+    expect(release.persistenceDeclineReason).toBeUndefined()
+    expect((await real.exited).code).toBe(0)
+    expect(sessionClaims(box.dbPath).every(row => row.suspended === null)).toBe(true)
   }, 300_000)
 
   it('holds the run for a background shell: the final answer arrives after it, and the saved database is consistent', async () => {

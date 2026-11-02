@@ -691,6 +691,53 @@ describe('FIX 1 — cascadeReject skips claimed siblings', () => {
 })
 
 // ---------------------------------------------------------------------------
+// V2: a reject with a message settles every ask pending in the session (fro-bot/agent#2001)
+// ---------------------------------------------------------------------------
+
+describe('a reject that upstream applies to every pending ask in the session', () => {
+  it('closes a sibling card from its own echo and sends no second reply', async () => {
+    // #given two open asks in one session; the operator rejected A, and upstream echoes both as rejected
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    const effectsA = makeEffects()
+    const effectsB = makeEffects()
+    const renderFnA = makeRenderFn()
+    const renderFnB = makeRenderFn()
+    registry.register(
+      makeParams({
+        requestID: 'per_A',
+        sessionID: 'ses_1',
+        request: makeRequest({requestID: 'per_A', sessionID: 'ses_1'}),
+        effects: effectsA,
+      }),
+    )
+    registry.attachMessage('per_A', renderFnA)
+    registry.register(
+      makeParams({
+        requestID: 'per_B',
+        sessionID: 'ses_1',
+        request: makeRequest({requestID: 'per_B', sessionID: 'ses_1'}),
+        effects: effectsB,
+      }),
+    )
+    registry.attachMessage('per_B', renderFnB)
+
+    // #when the echoes arrive back to back, as upstream publishes them
+    registry.confirmReply({requestID: 'per_A', sessionID: 'ses_1', reply: 'reject'})
+    registry.confirmReply({requestID: 'per_B', sessionID: 'ses_1', reply: 'reject'})
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // #then B's card closed once, as rejected, and nothing was posted for either ask
+    expect(registry.has('per_A')).toBe(false)
+    expect(registry.has('per_B')).toBe(false)
+    expect(renderFnB).toHaveBeenCalledOnce()
+    const [, decision] = (renderFnB as ReturnType<typeof vi.fn>).mock.calls[0] as [unknown, string, ...unknown[]]
+    expect(decision).toBe('reject')
+    expect(effectsA.postReply).not.toHaveBeenCalled()
+    expect(effectsB.postReply).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
 // FIX 2: deadlineExpired flag — fail-close on button postReply failure after deadline
 // ---------------------------------------------------------------------------
 
