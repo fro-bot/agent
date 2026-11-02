@@ -23,6 +23,7 @@ import {
   STARTED,
   SUCCEEDED,
   succeedWithText,
+  type EventPipe,
 } from './execution-v2.fixture.js'
 import {cancelFormV2, executeOpenCodeV2, interruptRootSession, replyToPermissionAskV2} from './execution-v2.js'
 import {EVENT_STREAM_CONNECT_TIMEOUT_MS, MAX_LLM_RETRIES, RETRY_DELAYS_MS} from './retry.js'
@@ -420,10 +421,13 @@ describe('executeOpenCodeV2', () => {
     )
   })
 
-  it('rejects a permission ask and the run continues', async () => {
-    // #given
+  it('rejects a permission ask with a message, which is what keeps the run going', async () => {
+    // #given an upstream that behaves as OpenCode 2.2.5 does (fro-bot/agent#2001): a reject with a message fails only
+    // the tool and the turn goes on to succeed; a bare reject interrupts the execution (`shutdown`)
+    let eventPipe: EventPipe | undefined
     const server = createFakeServer({
       onPrompt: (_, pipe) => {
+        eventPipe = pipe
         pipe.push(STARTED)
         pipe.push(
           frame('permission.asked', {
@@ -433,9 +437,35 @@ describe('executeOpenCodeV2', () => {
             resources: ['/etc/hosts'],
           }),
         )
-        pipe.push(SUCCEEDED)
       },
     })
+    // Sync on purpose: the loop awaits the reply, and a plain value awaits the same as a promise.
+    const upstreamReply = (input: {message?: string}): {success: true; data: undefined} => {
+      eventPipe?.push(frame('permission.replied', {sessionID: ROOT_SESSION_ID, requestID: 'per_1', reply: 'reject'}))
+      if (input.message === undefined || input.message === '') {
+        eventPipe?.push(
+          frame('session.step.failed', {
+            sessionID: ROOT_SESSION_ID,
+            assistantMessageID: 'msg_1',
+            error: {type: 'aborted', message: 'Step interrupted'},
+          }),
+        )
+        eventPipe?.push(frame('session.execution.interrupted', {sessionID: ROOT_SESSION_ID, reason: 'shutdown'}))
+      } else {
+        eventPipe?.push(
+          frame('session.tool.failed', {
+            sessionID: ROOT_SESSION_ID,
+            assistantMessageID: 'msg_1',
+            id: 'call_1',
+            error: {type: 'permission.rejected', message: input.message},
+            executed: false,
+          }),
+        )
+        eventPipe?.push(SUCCEEDED)
+      }
+      return {success: true, data: undefined}
+    }
+    server.calls.replyPermission.mockImplementation(upstreamReply)
 
     // #when
     const result = executeOpenCodeV2(
@@ -455,6 +485,7 @@ describe('executeOpenCodeV2', () => {
       sessionId: ROOT_SESSION_ID,
       requestId: 'per_1',
       decision: 'reject',
+      message: "This automated run does not allow this action. Don't retry it; continue without it.",
     })
   })
 
@@ -832,6 +863,20 @@ describe('replyToPermissionAskV2', () => {
     expect(decisions).toEqual(['reject'])
     expect(decisions).not.toContain('once')
     expect(decisions).not.toContain('always')
+  })
+
+  it('sends the exact automation message with the reject, so the turn continues', async () => {
+    // #given
+    const server = createFakeServer()
+
+    // #when
+    await replyToPermissionAskV2(server.client, request)
+
+    // #then — a bare reject would interrupt the execution upstream
+    expect(server.calls.replyPermission.mock.calls[0]?.[0]).toMatchObject({
+      decision: 'reject',
+      message: "This automated run does not allow this action. Don't retry it; continue without it.",
+    })
   })
 
   it('tries twice, then reports the failure, still sending reject each time', async () => {

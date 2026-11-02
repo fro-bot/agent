@@ -691,6 +691,121 @@ describe('FIX 1 — cascadeReject skips claimed siblings', () => {
 })
 
 // ---------------------------------------------------------------------------
+// V2: a reject with a message settles every ask pending in the session (fro-bot/agent#2001)
+// ---------------------------------------------------------------------------
+
+describe('a reject that upstream applies to every pending ask in the session', () => {
+  it('closes a sibling card from its own echo and sends no second reply', async () => {
+    // #given two open asks in one session; the operator rejected A, and upstream echoes both as rejected
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    const effectsA = makeEffects()
+    const effectsB = makeEffects()
+    const renderFnA = makeRenderFn()
+    const renderFnB = makeRenderFn()
+    registry.register(
+      makeParams({
+        requestID: 'per_A',
+        sessionID: 'ses_1',
+        request: makeRequest({requestID: 'per_A', sessionID: 'ses_1'}),
+        effects: effectsA,
+      }),
+    )
+    registry.attachMessage('per_A', renderFnA)
+    registry.register(
+      makeParams({
+        requestID: 'per_B',
+        sessionID: 'ses_1',
+        request: makeRequest({requestID: 'per_B', sessionID: 'ses_1'}),
+        effects: effectsB,
+      }),
+    )
+    registry.attachMessage('per_B', renderFnB)
+
+    // #when the echoes arrive back to back, as upstream publishes them
+    registry.confirmReply({requestID: 'per_A', sessionID: 'ses_1', reply: 'reject'})
+    registry.confirmReply({requestID: 'per_B', sessionID: 'ses_1', reply: 'reject'})
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // #then B's card closed once, as rejected, and nothing was posted for either ask
+    expect(registry.has('per_A')).toBe(false)
+    expect(registry.has('per_B')).toBe(false)
+    expect(renderFnB).toHaveBeenCalledOnce()
+    const [, decision] = (renderFnB as ReturnType<typeof vi.fn>).mock.calls[0] as [unknown, string, ...unknown[]]
+    expect(decision).toBe('reject')
+    expect(effectsA.postReply).not.toHaveBeenCalled()
+    expect(effectsB.postReply).not.toHaveBeenCalled()
+  })
+})
+
+function setupCascade() {
+  const registry = createApprovalRegistry({logger: makeLogger()})
+  const add = (requestID: string, renderFn?: ReturnType<typeof makeRenderFn>) => {
+    const effects = makeEffects()
+    registry.register(
+      makeParams({requestID, sessionID: 'ses_1', request: makeRequest({requestID, sessionID: 'ses_1'}), effects}),
+    )
+    if (renderFn !== undefined) registry.attachMessage(requestID, renderFn)
+    return effects
+  }
+  return {registry, add}
+}
+
+describe('the reject cascade reaches only the approvals pending when the operator decided', () => {
+  it('leaves a request registered while the reject renders alone, and still cascades to the one already pending', async () => {
+    // #given A and B pending in one session, and A's settled render held open (a slow Discord edit)
+    const {registry, add} = setupCascade()
+    let finishRender!: () => void
+    const held = new Promise<void>(resolve => {
+      finishRender = resolve
+    })
+    add(
+      'per_A',
+      vi.fn(async () => held),
+    )
+    const effectsB = add('per_B', makeRenderFn())
+
+    // #when A's reject echo arrives and the model's next step raises C while the render is still pending
+    registry.confirmReply({requestID: 'per_A', sessionID: 'ses_1', reply: 'reject'})
+    const effectsC = add('per_C', makeRenderFn())
+    finishRender()
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // #then C is still open and was sent nothing: it was not pending when the operator decided
+    expect(registry.has('per_C')).toBe(true)
+    expect(effectsC.postReply).not.toHaveBeenCalled()
+
+    // #and B, which was pending at decision time, was cascaded
+    expect(registry.has('per_B')).toBe(false)
+    expect(effectsB.postReply).toHaveBeenCalledExactlyOnceWith('per_B', expect.any(String), 'reject')
+  })
+
+  it('does not settle a snapshot entry that was replaced under the same request id', async () => {
+    // #given B pending at decision time, then re-registered (a new ask under the same id) while A renders
+    const {registry, add} = setupCascade()
+    let finishRender!: () => void
+    const held = new Promise<void>(resolve => {
+      finishRender = resolve
+    })
+    add(
+      'per_A',
+      vi.fn(async () => held),
+    )
+    const oldB = add('per_B', makeRenderFn())
+    registry.confirmReply({requestID: 'per_A', sessionID: 'ses_1', reply: 'reject'})
+    const newB = add('per_B', makeRenderFn())
+
+    // #when the render finishes
+    finishRender()
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // #then the replacement is untouched
+    expect(registry.has('per_B')).toBe(true)
+    expect(newB.postReply).not.toHaveBeenCalled()
+    expect(oldB.postReply).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
 // FIX 2: deadlineExpired flag — fail-close on button postReply failure after deadline
 // ---------------------------------------------------------------------------
 
