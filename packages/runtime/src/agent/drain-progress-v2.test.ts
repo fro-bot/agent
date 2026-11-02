@@ -10,6 +10,7 @@ import {
   DRAIN_UNREADABLE_MESSAGE,
   DRAIN_WAITING_MESSAGE,
 } from './drain-progress-v2.js'
+import {createRemoteOpenCodeV2Client} from './remote-client-v2.js'
 
 interface Line {
   readonly message: string
@@ -75,8 +76,14 @@ describe('describeBlockingSet', () => {
       sessionId: 'ses_a',
       queued: 1,
       items: [
-        {type: 'synthetic', delivery: 'steer', source: 'shell', text: 'SECRET-MESSAGE-TEXT', command: 'SECRET-COMMAND'},
-      ],
+        {
+          type: 'synthetic',
+          delivery: 'steer',
+          source: 'shell',
+          text: 'SECRET-MESSAGE-TEXT',
+          command: 'SECRET-COMMAND',
+        },
+      ] as const,
       text: 'SECRET-ENTRY-TEXT',
     }
 
@@ -140,6 +147,65 @@ describe('createDrainProgress', () => {
     // #then
     expect(lines).toHaveLength(2)
     expect(lines[1]?.fields).toMatchObject({sessions: {count: BLOCKING_SET_ID_CAP + 4}})
+  })
+
+  it('counts a replaced id beyond the id cap as a change when the count stays the same', () => {
+    // #given more ids than the cap, so the last ones are never displayed
+    const {lines, progress} = makeProgress()
+    const base = Array.from({length: BLOCKING_SET_ID_CAP + 3}, (_, index) => `ses_${String(index).padStart(2, '0')}`)
+    const replaced = [...base.slice(0, -1), 'ses_zz']
+
+    // #when the last id is swapped for another, so the count and the displayed ids are the same
+    progress.observe(active({activeSessionIds: base}))
+    progress.observe(active({activeSessionIds: replaced}))
+
+    // #then
+    expect(lines).toHaveLength(2)
+    expect(lines[1]?.fields).toMatchObject({sessions: {count: base.length}})
+    expect(lines[1]?.fields.sessions).toEqual(lines[0]?.fields.sessions)
+  })
+
+  it('starts a new stretch after a gap of a heartbeat between readings, and measures the next heartbeat from it', () => {
+    // #given a blocker read once
+    const {lines, progress} = makeProgress()
+    progress.observe(active({activeSessionIds: ['ses_a']}))
+
+    // #when the next reading of the same blocker comes a full heartbeat later (the gateway reads only while its gate
+    // validates)
+    vi.advanceTimersByTime(DRAIN_HEARTBEAT_MS)
+    progress.observe(active({activeSessionIds: ['ses_a']}))
+
+    // #then it is a new stretch: a line for the change, with the elapsed time restarted, not a heartbeat of the old one
+    expect(lines).toHaveLength(2)
+    expect(lines[1]?.fields).toMatchObject({elapsedMs: 0, readings: 2})
+
+    // #when the blocker is read again before another heartbeat is due
+    vi.advanceTimersByTime(DRAIN_HEARTBEAT_MS - 1_000)
+    progress.observe(active({activeSessionIds: ['ses_a']}))
+
+    // #then the heartbeat clock restarted with the new stretch: still silent
+    expect(lines).toHaveLength(2)
+
+    // #when it is read once a heartbeat has passed since the new stretch's line
+    vi.advanceTimersByTime(1_000)
+    progress.observe(active({activeSessionIds: ['ses_a']}))
+
+    // #then the heartbeat counts from the new stretch (one heartbeat), not from the first reading (two)
+    expect(lines).toHaveLength(3)
+    expect(lines[2]?.fields).toMatchObject({elapsedMs: DRAIN_HEARTBEAT_MS, readings: 4})
+  })
+
+  it('keeps one stretch across a gap shorter than a heartbeat', () => {
+    // #given
+    const {lines, progress} = makeProgress()
+    progress.observe(active({activeSessionIds: ['ses_a']}))
+
+    // #when the next reading is one millisecond short of a heartbeat later
+    vi.advanceTimersByTime(DRAIN_HEARTBEAT_MS - 1)
+    progress.observe(active({activeSessionIds: ['ses_a']}))
+
+    // #then it is the same stretch and the same blocker: no change, and the heartbeat is not due yet
+    expect(lines).toHaveLength(1)
   })
 
   it('logs a heartbeat about every 60 s of continuous non-quiet, with the elapsed time', () => {
@@ -256,7 +322,7 @@ describe('createDrainProgress', () => {
     const rogue = {
       sessionId: 'ses_a',
       queued: 2,
-      items: [{type: 'synthetic', source: 'shell', text: 'SECRET-MESSAGE-TEXT', command: 'SECRET-COMMAND'}],
+      items: [{type: 'synthetic', source: 'shell', text: 'SECRET-MESSAGE-TEXT', command: 'SECRET-COMMAND'}] as const,
     }
 
     // #when
@@ -269,5 +335,68 @@ describe('createDrainProgress', () => {
     })
     expect(JSON.stringify(lines)).not.toContain('SECRET')
     expect(JSON.stringify(progress.lastBlocking())).not.toContain('SECRET')
+  })
+})
+
+/** A client reading an inbox whose items carry caller-chosen metadata, the way a user item or a synthetic one can. */
+async function readInbox(items: readonly unknown[]) {
+  const client = createRemoteOpenCodeV2Client({
+    baseUrl: 'http://example.invalid',
+    fetch: async () =>
+      new Response(JSON.stringify({data: items}), {status: 200, headers: {'content-type': 'application/json'}}),
+  })
+  const result = await client.listSessionInbox({sessionId: 'ses_probe'})
+  if (!result.success) throw new Error(JSON.stringify(result))
+  return result.data
+}
+
+describe('what a queued inbox item can put in a log', () => {
+  const hostileItems = [
+    {type: 'user', delivery: 'queue', payload: {text: 'SECRET-TEXT', metadata: {source: 'PrivateCustomer'}}},
+    {type: 'synthetic', delivery: 'steer', payload: {text: 'SECRET-TEXT', metadata: {source: 'PrivateCustomer'}}},
+    {type: 'TenantAcme', delivery: 'AcmeDelivery', payload: {text: 'SECRET-TEXT'}},
+  ]
+
+  it('never reaches the progress log or the last blocking set, whatever the metadata says', async () => {
+    // #given
+    const {lines, progress} = makeProgress()
+    const summary = await readInbox(hostileItems)
+
+    // #when
+    progress.observe(active({queuedInbox: [{sessionId: 'ses_probe', ...summary}]}))
+
+    // #then the item kinds are named, the caller's strings are not
+    expect(lines).toHaveLength(1)
+    expect(lines[0]?.fields).toMatchObject({
+      inbox: {
+        items: [
+          {
+            sessionId: 'ses_probe',
+            queued: 3,
+            items: [
+              {type: 'user', delivery: 'queue'},
+              {type: 'synthetic', delivery: 'steer', source: 'other'},
+              {type: 'other', delivery: 'other'},
+            ],
+          },
+        ],
+      },
+    })
+    for (const text of [JSON.stringify(lines), JSON.stringify(progress.lastBlocking())]) {
+      expect(text).not.toMatch(/PrivateCustomer|TenantAcme|AcmeDelivery|SECRET/)
+    }
+  })
+
+  it('never reaches the log of an unreadable reading either', async () => {
+    // #given
+    const {lines, progress} = makeProgress()
+    const summary = await readInbox(hostileItems)
+
+    // #when
+    progress.observe(unreadable('session.inbox: http', {queuedInbox: [{sessionId: 'ses_probe', ...summary}]}))
+
+    // #then
+    expect(lines.map(line => line.message)).toEqual([DRAIN_UNREADABLE_MESSAGE, DRAIN_WAITING_MESSAGE])
+    expect(JSON.stringify(lines)).not.toMatch(/PrivateCustomer|TenantAcme|AcmeDelivery|SECRET/)
   })
 })

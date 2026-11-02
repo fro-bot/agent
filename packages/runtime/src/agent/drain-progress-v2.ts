@@ -6,8 +6,9 @@ import type {V2InboxItemMeta} from './remote-client-v2.js'
  * log instead of polling in silence at debug (#2005). Shared by the Action's drain and the gateway's drain gate, which
  * log through differently shaped loggers, so this module takes an `emit` and owns no logger.
  *
- * Log-safe by construction. A line carries ids (session, shell) and enum-like inbox fields, capped; it never carries
- * message text, command text or anything else a user or the model wrote. `describeBlockingSet` copies an explicit
+ * Log-safe by construction. A line carries ids (session, shell) and the closed-set inbox fields of
+ * `remote-client-v2.ts` (a literal upstream produces, or `other`), capped; it never carries message text, command text,
+ * metadata a caller chose or anything else a user or the model wrote. `describeBlockingSet` copies an explicit
  * allow-list of fields, so a reading that grows a new field cannot leak it into a log.
  */
 
@@ -23,7 +24,7 @@ const REASON_CAP = 200
 export interface BlockingInboxEntry {
   readonly sessionId: string
   readonly queued: number
-  /** Enum-like metadata of a bounded sample of the queued items (type, delivery, source). */
+  /** Closed-set metadata of a bounded sample of the queued items (type, delivery, and a synthetic item's source). */
   readonly items?: readonly V2InboxItemMeta[]
 }
 

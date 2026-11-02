@@ -2,10 +2,11 @@
  * Releasing a V2 run. The tests drive the real runtime directory gate over a stateful in-memory server, with the
  * stability window shortened (a few readings a few milliseconds apart) so the timing is real and the suite stays fast.
  */
-import type {ActionOpenCodeV2Client, OpenCodeV2ShutdownResult} from '@fro-bot/runtime'
+import type {ActionOpenCodeV2Client, OpenCodeV2ShutdownResult, RemoteOpenCodeV2Client} from '@fro-bot/runtime'
 import {
   BLOCKING_SET_ID_CAP,
   createOwnershipLedger,
+  createRemoteOpenCodeV2Client,
   DRAIN_UNREADABLE_MESSAGE,
   DRAIN_WAITING_MESSAGE,
   shellLedgerKey,
@@ -74,7 +75,10 @@ function createServer() {
         ? notFound()
         : ok({id: sessionId, parentId: info.parentID, directory: info.directory, outcome: null})
     }),
-    listSessionInbox: vi.fn(async ({sessionId}: {sessionId: string}) => ok({queued: state.inbox.get(sessionId) ?? 0})),
+    listSessionInbox: vi.fn(
+      async ({sessionId}: {sessionId: string}): ReturnType<RemoteOpenCodeV2Client['listSessionInbox']> =>
+        ok({queued: state.inbox.get(sessionId) ?? 0}),
+    ),
     listShells: vi.fn(async () =>
       ok([...state.shells].map(([id, shell]) => ({id, status: 'running', ownerSessionId: shell.owner, pid: 1}))),
     ),
@@ -759,7 +763,7 @@ describe('drain progress logging', () => {
     expect(unreadable[0]).toMatchObject({reason: expect.stringContaining('shell.list') as unknown, readings: 1})
   })
 
-  it('logs ids and enum-like fields only: no message text or command text from an inbox item', async () => {
+  it('logs ids and closed-set fields only: no message text or command text from an inbox item', async () => {
     // #given an inbox item that carries text and a command in the fixture
     const server = createServer()
     server.raw.listSessionInbox.mockImplementation(async ({sessionId}: {sessionId: string}) => {
@@ -768,7 +772,7 @@ describe('drain progress logging', () => {
         source: 'shell',
         text: 'SECRET-MESSAGE-TEXT',
         command: 'SECRET-COMMAND rm -rf /',
-      }
+      } as const
       return ok({queued: sessionId === ROOT ? 1 : 0, ...(sessionId === ROOT ? {items: [item]} : {})})
     })
     const ctx = context(server)
@@ -783,6 +787,58 @@ describe('drain progress logging', () => {
       inbox: {items: [{sessionId: ROOT, queued: 1, items: [{type: 'synthetic', source: 'shell'}]}]},
     })
     expect(JSON.stringify(vi.mocked(ctx.logger.info).mock.calls)).not.toContain('SECRET')
+  })
+
+  it('names no string a caller chose in a progress or verdict line: a metadata source on a user or synthetic item', async () => {
+    // #given an inbox read by the real client, whose items carry a token-shaped source next to allowlisted fields
+    const hostile = createRemoteOpenCodeV2Client({
+      baseUrl: 'http://example.invalid',
+      fetch: async () =>
+        new Response(
+          JSON.stringify({
+            data: [
+              {type: 'user', delivery: 'queue', payload: {text: 'T', metadata: {source: 'PrivateCustomer'}}},
+              {type: 'synthetic', delivery: 'steer', payload: {text: 'T', metadata: {source: 'PrivateCustomer'}}},
+              {type: 'Tenant42', delivery: 'AcmeDelivery', payload: {text: 'T'}},
+            ],
+          }),
+          {status: 200, headers: {'content-type': 'application/json'}},
+        ),
+    })
+    const server = createServer()
+    server.raw.listSessionInbox.mockImplementation(async ({sessionId}: {sessionId: string}) =>
+      sessionId === ROOT ? hostile.listSessionInbox({sessionId}) : ok({queued: 0}),
+    )
+    const {options} = release(server, {deadlineMs: 80, stopTimeoutMs: 100})
+
+    // #when the drain expires on the queued items, so both the progress line and the verdict line are written
+    const outcome = await releaseRunV2(options)
+
+    // #then the kinds are named, the caller's strings are on no line at all
+    expect(outcome).toMatchObject({drain: 'expired'})
+    const waiting = infoLines(options.logger, DRAIN_WAITING_MESSAGE)
+    expect(waiting).toHaveLength(1)
+    expect(waiting[0]).toMatchObject({
+      inbox: {
+        items: [
+          {
+            sessionId: ROOT,
+            queued: 3,
+            items: [
+              {type: 'user', delivery: 'queue'},
+              {type: 'synthetic', delivery: 'steer', source: 'other'},
+              {type: 'other', delivery: 'other'},
+            ],
+          },
+        ],
+      },
+    })
+    expect(infoLines(options.logger, 'Run release verdict')[0]).toHaveProperty('blocking')
+    // every level: debug readings and warnings included
+    const everyLine = Object.values(options.logger as unknown as Record<string, {mock?: {calls: unknown[]}}>).map(
+      method => method.mock?.calls ?? [],
+    )
+    expect(JSON.stringify(everyLine)).not.toMatch(/PrivateCustomer|Tenant42|AcmeDelivery/)
   })
 
   it('names the blocking set on the verdict line when the directory could not be confirmed quiet', async () => {

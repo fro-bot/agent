@@ -8,7 +8,12 @@ import {
   SHELL_LIST_RUNNING_RESPONSE,
   SHELL_SESSION_ID,
 } from './event-v2.fixtures.js'
-import {createRemoteOpenCodeV2Client, V2_HEARTBEAT_FRAME, V2_INBOX_ITEM_META_CAP} from './remote-client-v2.js'
+import {
+  createRemoteOpenCodeV2Client,
+  V2_HEARTBEAT_FRAME,
+  V2_INBOX_ITEM_META_CAP,
+  V2_INBOX_SYNTHETIC_SOURCES,
+} from './remote-client-v2.js'
 
 interface RecordedRequest {
   readonly url: string
@@ -674,23 +679,14 @@ describe('createRemoteOpenCodeV2Client', () => {
       expect(requests[0]?.headers).toMatchObject(AUTH)
     })
 
-    it('keeps enum-like item fields only: no message text, no free-form values, bounded count', async () => {
-      // #given
-      const items = [
-        // Free-form values are not enum-like: dropped, and an item left with nothing readable is skipped.
-        {
-          id: 'msg_free',
-          type: 'SECRET free form text',
-          delivery: 'x'.repeat(64),
-          payload: {text: 'T', metadata: {source: 'SECRET a b'}},
-        },
-        ...Array.from({length: V2_INBOX_ITEM_META_CAP + 5}, (_, index) => ({
-          id: `msg_${index}`,
-          type: 'synthetic',
-          delivery: 'steer',
-          payload: {text: 'SECRET-MESSAGE-TEXT rm -rf /', metadata: {source: 'shell', command: 'SECRET-COMMAND'}},
-        })),
-      ]
+    it('keeps closed-set item fields only: no message text, no command text, bounded count', async () => {
+      // #given a queue longer than the cap, each item carrying text and a command next to its metadata
+      const items = Array.from({length: V2_INBOX_ITEM_META_CAP + 5}, (_, index) => ({
+        id: `msg_${index}`,
+        type: 'synthetic',
+        delivery: 'steer',
+        payload: {text: 'SECRET-MESSAGE-TEXT rm -rf /', metadata: {source: 'shell', command: 'SECRET-COMMAND'}},
+      }))
       const client = createRemoteOpenCodeV2Client({
         baseUrl: 'http://w',
         fetch: makeFetch(() => json(200, {data: items})).fetch,
@@ -703,10 +699,128 @@ describe('createRemoteOpenCodeV2Client', () => {
       expect(result.success).toBe(true)
       if (!result.success) return
       expect(result.data.queued).toBe(items.length)
-      // the free-form item is first and yields nothing, so the first nine real items fill what is left of the cap
-      expect(result.data.items).toHaveLength(V2_INBOX_ITEM_META_CAP - 1)
+      expect(result.data.items).toHaveLength(V2_INBOX_ITEM_META_CAP)
       expect(result.data.items?.[0]).toEqual({type: 'synthetic', delivery: 'steer', source: 'shell'})
       expect(JSON.stringify(result.data)).not.toMatch(/SECRET|rm -rf|msg_/)
+    })
+
+    it('names every source upstream enqueues on a synthetic item, and nothing else', async () => {
+      // #given the source literals OpenCode 2.2.5 sets on a synthetic inbox item, and one it does not
+      const sources = [...V2_INBOX_SYNTHETIC_SOURCES, 'PrivateCustomer']
+      const client = createRemoteOpenCodeV2Client({
+        baseUrl: 'http://w',
+        fetch: makeFetch(() =>
+          json(200, {
+            data: sources.map(source => ({
+              type: 'synthetic',
+              delivery: 'queue',
+              payload: {text: 't', metadata: {source}},
+            })),
+          }),
+        ).fetch,
+      })
+
+      // #when
+      const result = await client.listSessionInbox({sessionId: 'ses_1'})
+
+      // #then
+      expect(V2_INBOX_SYNTHETIC_SOURCES).toEqual(['shell', 'subagent', 'goal', 'experimental_image_generate'])
+      if (!result.success) throw new Error('expected a read')
+      expect(result.data.items?.map(item => item.source)).toEqual([
+        'shell',
+        'subagent',
+        'goal',
+        'experimental_image_generate',
+        'other',
+      ])
+      expect(JSON.stringify(result.data)).not.toContain('PrivateCustomer')
+    })
+
+    it('maps a source the allowlist does not know to a fixed label, whatever its shape', async () => {
+      // #given token-shaped and free-form sources on synthetic items
+      const hostile = ['PrivateCustomer', 'acme-corp', 'tok_abc123', 'SECRET a b', 'x'.repeat(64), '__proto__', 'Shell']
+      const client = createRemoteOpenCodeV2Client({
+        baseUrl: 'http://w',
+        fetch: makeFetch(() =>
+          json(200, {
+            data: hostile.map(source => ({
+              type: 'synthetic',
+              delivery: 'steer',
+              payload: {text: 't', metadata: {source}},
+            })),
+          }),
+        ).fetch,
+      })
+
+      // #when
+      const result = await client.listSessionInbox({sessionId: 'ses_1'})
+
+      // #then
+      if (!result.success) throw new Error('expected a read')
+      expect(result.data.items).toHaveLength(hostile.length)
+      for (const item of result.data.items ?? [])
+        expect(item).toEqual({type: 'synthetic', delivery: 'steer', source: 'other'})
+      expect(JSON.stringify(result.data)).not.toMatch(/PrivateCustomer|acme|tok_|SECRET|xxxx|proto|Shell/)
+    })
+
+    it('takes no source from an item that is not synthetic, even an allowlisted one', async () => {
+      // #given a user item (whose metadata is caller-chosen), and compaction and move items, each naming a source
+      const client = createRemoteOpenCodeV2Client({
+        baseUrl: 'http://w',
+        fetch: makeFetch(() =>
+          json(200, {
+            data: [
+              {type: 'user', delivery: 'queue', payload: {text: 't', metadata: {source: 'PrivateCustomer'}}},
+              {type: 'user', delivery: 'steer', payload: {text: 't', metadata: {source: 'shell'}}},
+              {type: 'compaction', delivery: 'queue', payload: {metadata: {source: 'PrivateCustomer'}}},
+              {type: 'move', delivery: 'steer', payload: {metadata: {source: 'goal'}}},
+            ],
+          }),
+        ).fetch,
+      })
+
+      // #when
+      const result = await client.listSessionInbox({sessionId: 'ses_1'})
+
+      // #then
+      if (!result.success) throw new Error('expected a read')
+      expect(result.data.items).toEqual([
+        {type: 'user', delivery: 'queue'},
+        {type: 'user', delivery: 'steer'},
+        {type: 'compaction', delivery: 'queue'},
+        {type: 'move', delivery: 'steer'},
+      ])
+      expect(JSON.stringify(result.data)).not.toContain('PrivateCustomer')
+    })
+
+    it('maps a type or delivery the allowlist does not know to the fixed label, and skips a non-string one', async () => {
+      // #given
+      const client = createRemoteOpenCodeV2Client({
+        baseUrl: 'http://w',
+        fetch: makeFetch(() =>
+          json(200, {
+            data: [
+              {type: 'SECRET free form text', delivery: 'x'.repeat(64)},
+              {type: 'Tenant42', delivery: 'queue'},
+              {type: 'user', delivery: 'PrivateCustomer'},
+              {type: 7, delivery: null, payload: {metadata: {source: 'shell'}}},
+            ],
+          }),
+        ).fetch,
+      })
+
+      // #when
+      const result = await client.listSessionInbox({sessionId: 'ses_1'})
+
+      // #then the fourth item has nothing readable, so it is skipped
+      if (!result.success) throw new Error('expected a read')
+      expect(result.data.queued).toBe(4)
+      expect(result.data.items).toEqual([
+        {type: 'other', delivery: 'other'},
+        {type: 'other', delivery: 'queue'},
+        {type: 'user', delivery: 'other'},
+      ])
+      expect(JSON.stringify(result.data)).not.toMatch(/SECRET|xxxx|Tenant42|PrivateCustomer/)
     })
 
     it('omits items when no item carries a readable field', async () => {

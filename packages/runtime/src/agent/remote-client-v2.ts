@@ -87,15 +87,45 @@ export interface RemoteOpenCodeV2ClientOptions {
   readonly fetch?: typeof fetch
 }
 
+/** The fixed label for a value outside a closed set below. The value itself is never kept. */
+export const V2_INBOX_OTHER = 'other'
+
 /**
- * What one queued inbox item is, and nothing it says: the enum-like fields only (`type`, `delivery`, and the
- * `payload.metadata.source` a synthetic item carries). Message text and every other payload field are dropped here, at
- * the client, so nothing downstream can log them. A field that is not a short token is dropped too.
+ * The item kinds OpenCode 2.2.5 enqueues: `Session.Inbox.Item` is the union of user, synthetic, compaction and move
+ * (`packages/schema/src/session-inbox.ts:44-53`).
+ */
+export const V2_INBOX_ITEM_TYPES = ['user', 'synthetic', 'compaction', 'move'] as const
+/** `Session.Inbox.Delivery` (`packages/schema/src/session-inbox.ts:11`). */
+export const V2_INBOX_DELIVERIES = ['steer', 'queue'] as const
+/**
+ * The `payload.metadata.source` literals OpenCode 2.2.5 sets when it enqueues a synthetic item (paths under
+ * `packages/core/src`):
+ * - `shell`: `shell/result.ts:56`, and a shell that fails to start, `session/session.ts:205`;
+ * - `subagent`: `session/subagent-completion.ts:43`;
+ * - `goal`: `plugin/goal.ts:201` and `:380`, and the kickoff metadata at `:412`;
+ * - `experimental_image_generate`: `tool/plugin/image-generate.ts:26` (the tool's `name`), used at `:220`, and
+ *   `session/execution/restart.ts:139`.
+ *
+ * The upstream schema types `metadata` as `Record<string, unknown>` (`session-inbox.ts:17`, `:31`), so any caller can
+ * set any `source`, on a user item too: only this list is trusted.
+ */
+export const V2_INBOX_SYNTHETIC_SOURCES = ['shell', 'subagent', 'goal', 'experimental_image_generate'] as const
+
+export type V2InboxItemType = (typeof V2_INBOX_ITEM_TYPES)[number] | typeof V2_INBOX_OTHER
+export type V2InboxDelivery = (typeof V2_INBOX_DELIVERIES)[number] | typeof V2_INBOX_OTHER
+export type V2InboxSource = (typeof V2_INBOX_SYNTHETIC_SOURCES)[number] | typeof V2_INBOX_OTHER
+
+/**
+ * What one queued inbox item is, and nothing it says: `type`, `delivery`, and the `payload.metadata.source` of a
+ * synthetic item, each from a closed set of literals upstream produces, or the fixed label `other`. Message text, every
+ * other payload field, and any string a caller chose are dropped here, at the client, so nothing downstream can log
+ * them. The types are the closed sets, so a log line cannot carry a free-form value without a type error.
  */
 export interface V2InboxItemMeta {
-  readonly type?: string
-  readonly delivery?: string
-  readonly source?: string
+  readonly type?: V2InboxItemType
+  readonly delivery?: V2InboxDelivery
+  /** Only ever set on a synthetic item. */
+  readonly source?: V2InboxSource
 }
 
 export interface V2InboxSummary {
@@ -108,18 +138,27 @@ export interface V2InboxSummary {
 /** Bound on the item metadata kept per session: a reading stays small however long an inbox grows. */
 export const V2_INBOX_ITEM_META_CAP = 10
 
-const ENUM_TOKEN = /^[A-Z][\w.-]{0,31}$/i
-
-function enumToken(value: string | null): string | null {
-  return value !== null && ENUM_TOKEN.test(value) ? value : null
+/** `value` when it is one of `allowed`, `other` for any other string, `null` for a non-string. Never echoes `value`. */
+function closedValue<const Allowed extends readonly string[]>(
+  value: string | null,
+  allowed: Allowed,
+): Allowed[number] | typeof V2_INBOX_OTHER | null {
+  if (value === null) return null
+  return allowed.find(known => known === value) ?? V2_INBOX_OTHER
 }
 
 function readInboxItemMeta(item: unknown): V2InboxItemMeta | null {
-  const type = enumToken(getStringProperty(item, 'type'))
-  const delivery = enumToken(getStringProperty(item, 'delivery'))
-  const source = enumToken(
-    getStringProperty(getObjectProperty(getObjectProperty(item, 'payload'), 'metadata'), 'source'),
-  )
+  const rawType = getStringProperty(item, 'type')
+  const type = closedValue(rawType, V2_INBOX_ITEM_TYPES)
+  const delivery = closedValue(getStringProperty(item, 'delivery'), V2_INBOX_DELIVERIES)
+  // A user item's metadata is caller-chosen and says nothing about what the item is: only a synthetic item has a source.
+  const source =
+    rawType === 'synthetic'
+      ? closedValue(
+          getStringProperty(getObjectProperty(getObjectProperty(item, 'payload'), 'metadata'), 'source'),
+          V2_INBOX_SYNTHETIC_SOURCES,
+        )
+      : null
   if (type === null && delivery === null && source === null) return null
   return {
     ...(type === null ? {} : {type}),

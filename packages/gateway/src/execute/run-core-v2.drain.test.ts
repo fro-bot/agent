@@ -6,7 +6,7 @@
 
 import type {OwnershipLedger} from '@fro-bot/runtime'
 
-import {createOwnershipLedger, DRAIN_WAITING_MESSAGE, ok} from '@fro-bot/runtime'
+import {createOwnershipLedger, createRemoteOpenCodeV2Client, DRAIN_WAITING_MESSAGE, ok} from '@fro-bot/runtime'
 import {SUBAGENT_FOREGROUND_SUCCESS_FRAME} from '@fro-bot/runtime/event-v2-fixtures'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
@@ -954,12 +954,17 @@ describe('runOpenCodeCoreV2: drain progress logging (#2005)', () => {
     await vi.advanceTimersByTimeAsync(20_000)
   })
 
-  it('logs ids and enum-like fields only: no message text or command text from a queued item', async () => {
+  it('logs ids and closed-set fields only: no message text or command text from a queued item', async () => {
     // #given a queued item that carries text and a command
     const controller = new AbortController()
     const run = startWindowedRun({controller})
     vi.mocked(run.shellServer.listSessionInbox).mockImplementation(async ({sessionId}) => {
-      const item = {type: 'synthetic', source: 'shell', text: 'SECRET-MESSAGE-TEXT', command: 'SECRET-COMMAND rm -rf /'}
+      const item = {
+        type: 'synthetic',
+        source: 'shell',
+        text: 'SECRET-MESSAGE-TEXT',
+        command: 'SECRET-COMMAND rm -rf /',
+      } as const
       return ok({queued: sessionId === ROOT ? 1 : 0, ...(sessionId === ROOT ? {items: [item]} : {})})
     })
     await vi.advanceTimersByTimeAsync(10)
@@ -976,6 +981,64 @@ describe('runOpenCodeCoreV2: drain progress logging (#2005)', () => {
 
     controller.abort()
     await vi.advanceTimersByTimeAsync(20_000)
+  })
+
+  it('names no string a caller chose, on the progress line or the deadline line: a metadata source on a user or synthetic item', async () => {
+    // #given an inbox read by the real client, whose items carry a token-shaped source next to allowlisted fields
+    const hostile = createRemoteOpenCodeV2Client({
+      baseUrl: 'http://example.invalid',
+      fetch: async () =>
+        new Response(
+          JSON.stringify({
+            data: [
+              {type: 'user', delivery: 'queue', payload: {text: 'T', metadata: {source: 'PrivateCustomer'}}},
+              {type: 'synthetic', delivery: 'steer', payload: {text: 'T', metadata: {source: 'PrivateCustomer'}}},
+              {type: 'Tenant42', delivery: 'AcmeDelivery', payload: {text: 'T'}},
+            ],
+          }),
+          {status: 200, headers: {'content-type': 'application/json'}},
+        ),
+    })
+    const controller = new AbortController()
+    const run = startWindowedRun({controller})
+    vi.mocked(run.shellServer.listSessionInbox).mockImplementation(async ({sessionId}) =>
+      sessionId === ROOT ? hostile.listSessionInbox({sessionId}) : ok({queued: 0}),
+    )
+    await vi.advanceTimersByTimeAsync(10)
+    run.emit(frames.started(), frames.delta('OK'), frames.succeeded())
+    await vi.advanceTimersByTimeAsync(5_000)
+
+    // #when the run's deadline passes with the items still queued
+    controller.abort()
+    await vi.advanceTimersByTimeAsync(20_000)
+
+    // #then the kinds are named on the progress line and the deadline line, the caller's strings on no line
+    const lines = waitingLines(run)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]?.[0]).toMatchObject({
+      inbox: {
+        items: [
+          {
+            sessionId: ROOT,
+            queued: 3,
+            items: [
+              {type: 'user', delivery: 'queue'},
+              {type: 'synthetic', delivery: 'steer', source: 'other'},
+              {type: 'other', delivery: 'other'},
+            ],
+          },
+        ],
+      },
+    })
+    const expired = vi
+      .mocked(run.logger.warn)
+      .mock.calls.filter(([, message]) => String(message).includes('drain deadline expired'))
+    expect(expired).toHaveLength(1)
+    expect(expired[0]?.[0]).toHaveProperty('blocking')
+    const everyLine = Object.values(run.logger as unknown as Record<string, {mock?: {calls: unknown[]}}>).map(
+      method => method.mock?.calls ?? [],
+    )
+    expect(JSON.stringify(everyLine)).not.toMatch(/PrivateCustomer|Tenant42|AcmeDelivery/)
   })
 
   it('names the blocking set on the deadline line when the drain expires unquiet', async () => {
