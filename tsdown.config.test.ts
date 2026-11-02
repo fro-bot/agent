@@ -1,5 +1,46 @@
+import {readFile} from 'node:fs/promises'
 import {describe, expect, it} from 'vitest'
-import {assertVersionPresent, formatThirdPartyNotices, type LicenseEntry} from './tsdown.config.js'
+import {assertPinPresent, assertVersionPresent, formatThirdPartyNotices, type LicenseEntry} from './tsdown.config.js'
+
+describe('assertPinPresent', () => {
+  const pin = {
+    version: '2.2.5',
+    assets: {'opencode-linux-x64.tar.gz': 'a'.repeat(64), 'opencode-darwin-arm64.zip': 'b'.repeat(64)},
+  }
+
+  it('does not throw when the bundle carries the pinned version and every digest', () => {
+    // #given a chunk that embeds the whole pin
+    const chunk = `var p={version:"2.2.5",assets:{x:"${'a'.repeat(64)}",y:"${'b'.repeat(64)}"}}`
+
+    // #when/#then
+    expect(() => assertPinPresent(pin, [chunk])).not.toThrow()
+  })
+
+  it('throws naming the digest when the version survives but a digest does not', () => {
+    // #given a bundle with the version string (which a 5-character literal makes trivially likely) but no digests
+    const chunks = ['var v="2.2.5"']
+
+    // #when/#then the version alone is not proof the pin was bundled
+    expect(() => assertPinPresent(pin, chunks)).toThrowError('a'.repeat(64))
+  })
+
+  it('throws when the version itself is absent', () => {
+    // #given/#when/#then
+    expect(() => assertPinPresent(pin, [])).toThrowError('2.2.5')
+  })
+
+  it('accepts the committed pin file against a bundle built from it', async () => {
+    // #given the committed pin and a chunk embedding it as JSON
+    const committed = JSON.parse(await readFile('packages/runtime/src/shared/opencode-v2-pin.json', 'utf8')) as {
+      version: string
+      assets: Record<string, string>
+    }
+
+    // #when/#then every value the plugin will demand is present in a bundle that embeds the pin
+    expect(() => assertPinPresent(committed, [JSON.stringify(committed)])).not.toThrow()
+    expect(committed.version).toMatch(/^2\.\d+\.\d+$/)
+  })
+})
 
 describe('assertVersionPresent', () => {
   it('throws when the expected version is absent from every chunk', () => {

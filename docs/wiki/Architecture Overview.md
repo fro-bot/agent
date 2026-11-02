@@ -1,9 +1,10 @@
 ---
 type: architecture
-last-updated: "2026-10-25"
+last-updated: "2026-11-01"
 updated-by: "fe7f6bda"
 sources:
   - src/main.ts
+  - packages/runtime/src/shared/opencode-v2-pin.json
   - src/post.ts
   - src/harness/run.ts
   - src/harness/outcome.ts
@@ -223,7 +224,7 @@ The full, unabridged symbol rows for entries that [ARCHITECTURE.md](../../ARCHIT
 | `createOwnershipLedger` | Function | `packages/runtime/src/agent/ownership-ledger.ts` | In-memory 3-state (outstanding/settled/unknown) ledger for background subagent executions, keyed by child session id |
 | `reconcileLedgerOnce` / `createLedgerReconciler` | Function | `packages/runtime/src/agent/ledger-reconcile.ts` | Settles tracked ledger entries whose settlement event the SSE stream never delivered, against `children()`/`liveSessionIds()` (both scoped to the run's directory); never adopts an untracked session |
 | `createRemoteQuestionClient` | Function | `packages/runtime/src/agent/remote-question-client.ts` | Narrow v2-SDK client over OpenCode's `question` reply/reject endpoints (the v1 client does not expose them); every call carries the workspace `directory` |
-| `DEFAULT_OPENCODE_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned harness build version (OpenCode base + carries) |
+| `DEFAULT_OPENCODE_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Stock OpenCode V2 pin, derived from `opencode-v2-pin.json` (Action default) |
 
 ### `packages/gateway/`
 

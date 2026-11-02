@@ -227,11 +227,21 @@ jobs:
           which bun && bun --version || true
           which opencode && opencode --version || true
 
-          echo "OPENCODE_CONFIG_CONTENT (should include @fro.bot/systematic and the build default agent):"
-          echo "$OPENCODE_CONFIG_CONTENT" | jq . 2>/dev/null || echo "$OPENCODE_CONFIG_CONTENT"
-
-          echo "$OPENCODE_CONFIG_CONTENT" | jq -e '.default_agent == "build"'
-          echo "$OPENCODE_CONFIG_CONTENT" | jq -e '[(.plugin // [])[] | select(type == "string" and startswith("@fro.bot/systematic"))] | length == 1'
+          # The Action's default is the stock OpenCode V2 pin. V2 builds its config at server spawn and exports no
+          # OPENCODE_CONFIG_CONTENT, so the V1 config-env assertions do not apply; assert the installed binary instead.
+          # The input is not set on this step, so this also proves the default resolves to the pin.
+          v2_version="$(node -p 'JSON.parse(fs.readFileSync("packages/runtime/src/shared/opencode-v2-pin.json", "utf8")).version')"
+          oc_version="$(opencode --version)"
+          echo "opencode --version: ${oc_version} (pin: ${v2_version})"
+          if echo "${oc_version}" | grep -qF "harness"; then
+            echo "REGRESSION: the Action default installed a harness build: ${oc_version}"
+            exit 1
+          fi
+          reported="${oc_version#opencode }"
+          if [ "${reported#v}" != "${v2_version}" ]; then
+            echo "REGRESSION: expected stock OpenCode ${v2_version}, got: ${oc_version}"
+            exit 1
+          fi
 
           echo "OpenCode config files:"
           [ ! -d ~/.config/opencode ] || find ~/.config/opencode -maxdepth 2 -type f | sort
@@ -1115,16 +1125,12 @@ jobs:
       - name: Check harness release tag URL (positive checksum path test)
         run: |
           set -euo pipefail
-          default_version="$(node -e "
-            const fs = require('fs');
-            const src = fs.readFileSync('packages/runtime/src/shared/constants.ts', 'utf8');
-            const match = src.match(/DEFAULT_OPENCODE_VERSION\s*=\s*'([^']+)'/);
-            if (!match) process.exit(1);
-            process.stdout.write(match[1]);
-          ")"
+          # The workspace image's own default (deploy/workspace.Dockerfile) stays the V1 harness build until V1 is
+          # cut; the Action's DEFAULT_OPENCODE_VERSION is the stock V2 pin and no longer a harness build.
+          default_version="$(sed -n 's/^ARG OPENCODE_VERSION=//p' deploy/workspace.Dockerfile | head -n 1)"
           case "${default_version}" in
             *+harness.*) : ;;
-            *) echo "DEFAULT_OPENCODE_VERSION is not a harness version: ${default_version}" >&2; exit 1 ;;
+            *) echo "Dockerfile ARG OPENCODE_VERSION is not a harness version: ${default_version}" >&2; exit 1 ;;
           esac
           tag_version="${default_version//+harness./-harness.}"
           sums_url="https://github.com/fro-bot/agent/releases/download/${tag_version}/SHA256SUMS"

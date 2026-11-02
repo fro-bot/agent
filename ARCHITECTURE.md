@@ -63,7 +63,7 @@ Symbols verified against the live source tree. Where a symbol has moved to `pack
 | `createRemoteQuestionClient` | Function | `packages/runtime/src/agent/remote-question-client.ts` | v2-SDK `question` reply/reject client |
 | `TriggerDirective` | Interface | `packages/runtime/src/agent/prompt.ts` | Directive + appendMode for triggers |
 | `DEFAULT_SYSTEMATIC_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned Systematic version |
-| `DEFAULT_OPENCODE_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned harness build (Action default; not the workspace image's) |
+| `DEFAULT_OPENCODE_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Stock OpenCode V2 pin, derived from `opencode-v2-pin.json` (Action default; the workspace image still defaults to the V1 harness build) |
 | `opencode-v2-pin.json` | JSON | `packages/runtime/src/shared/opencode-v2-pin.json` | Stock V2 version + asset sha256 |
 
 ### `packages/gateway/`

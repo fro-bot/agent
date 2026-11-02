@@ -15,12 +15,6 @@ const HARNESS_DOWNLOAD_BASE_URL = 'https://github.com/fro-bot/agent/releases/dow
 const HARNESS_MARKER = '+harness.'
 
 /**
- * Known stable stock version for fallback when latest-fetch fails or for non-harness paths.
- * This is a plain anomalyco/opencode release — not a harness build.
- */
-export const FALLBACK_VERSION = '1.19.4'
-
-/**
  * The pinned stock V2 release: its version and the sha256 of each asset we install.
  *
  * `packages/runtime/src/shared/opencode-v2-pin.json` is the single source. `deploy/workspace.Dockerfile`
@@ -33,6 +27,15 @@ export interface V2Pin {
 }
 
 export const RECORDED_V2_PIN: V2Pin = v2PinFile
+
+/**
+ * Resolve the requested `opencode-version`. `latest` means the recorded V2 pin: no network lookup, so it never
+ * follows upstream's `releases/latest` (an unverified stock release with no recorded digest). Any explicit
+ * version, harness build or stock, is returned unchanged.
+ */
+export function resolveRequestedVersion(requested: string, v2Pin: V2Pin = RECORDED_V2_PIN): string {
+  return requested === 'latest' ? v2Pin.version : requested
+}
 
 /** Hex characters of the recorded digest used in V2 cache identities (64 bits: collision-proof for a pin). */
 const V2_CACHE_DIGEST_LENGTH = 16
@@ -345,25 +348,21 @@ async function validateDownload(
 }
 
 /**
- * Install OpenCode CLI with version fallback.
+ * Install OpenCode CLI. There is no fallback: the caller has already chosen V1 or V2 setup, caches and session keys
+ * from the requested version, so a binary of the other generation would run against the wrong setup.
  *
- * For explicit harness pins (`isHarnessVersion(version) === true`), any
- * download or checksum failure THROWS immediately — no stock fallback is
- * attempted. Integrity over availability: a harness pin must resolve to the
- * exact harness binary or fail closed.
+ * V1 requests (a harness build, or a stock version below V2) fail closed. Any download, checksum or
+ * validation failure THROWS an error naming the requested version and the reason: a harness pin must resolve to
+ * the exact harness binary, and a stock V1 failure must not turn into a V2 install.
  *
- * For stock V2 pins (major 2 or higher), see `installStockV2`: digest-verified
- * or it throws, with no fallback.
- *
- * For stock versions below V2, falls back to the known stable FALLBACK_VERSION
- * on failure.
+ * V2 requests (major 2 or higher) install through `installStockV2`, digest-verified or throwing, with no retry. A V2
+ * version with no recorded digest never reaches here: `runSetup` rejects it first.
  */
 export async function installOpenCode(
   version: string,
   logger: Logger,
   toolCache: ToolCacheAdapter,
   execAdapter: ExecAdapter,
-  fallbackVersion: string = FALLBACK_VERSION,
   v2Pin: V2Pin = RECORDED_V2_PIN,
 ): Promise<OpenCodeInstallResult> {
   const platformInfo = getPlatformInfo()
@@ -379,40 +378,20 @@ export async function installOpenCode(
     return {path: cachedPath, version, cached: true}
   }
 
-  // Try primary version
   try {
-    const result = await downloadAndInstall(version, platformInfo, logger, toolCache, execAdapter)
-    return result
+    return await downloadAndInstall(version, platformInfo, logger, toolCache, execAdapter)
   } catch (error) {
     if (isHarnessVersion(version)) {
-      // Fail closed: harness pins must not silently downgrade to stock OpenCode.
-      // A checksum mismatch, missing SHA256SUMS, or network error on a harness pin
-      // is a hard failure — throw immediately, no fallback.
       throw new Error(
         `Harness OpenCode download/verify failed for explicit pin "${version}": ${toErrorMessage(error)}. ` +
-          `No stock fallback is attempted for an explicit harness pin (fail-closed).`,
+          `No fallback is attempted for an explicit harness pin (fail-closed).`,
       )
     }
-
-    logger.warning('Primary version install failed, trying fallback', {
-      requestedVersion: version,
-      fallbackVersion,
-      error: toErrorMessage(error),
-    })
+    throw new Error(
+      `Failed to install OpenCode ${version}: ${toErrorMessage(error)}. ` +
+        `No fallback is attempted for a V1 request: the V2 pin is a different generation (fail-closed).`,
+    )
   }
-
-  // Fallback to known stable version (stock versions only — harness pins throw above)
-  if (version !== fallbackVersion) {
-    try {
-      const result = await downloadAndInstall(fallbackVersion, platformInfo, logger, toolCache, execAdapter)
-      logger.info('Installed fallback version', {version: fallbackVersion})
-      return result
-    } catch (error) {
-      throw new Error(`Failed to install OpenCode (tried ${version} and ${fallbackVersion}): ${toErrorMessage(error)}`)
-    }
-  }
-
-  throw new Error(`Failed to install OpenCode version ${version}`)
 }
 
 /**
@@ -460,7 +439,7 @@ export function resolveStockV2Policy(version: string, platformInfo: PlatformInfo
  * Install a stock V2 pin. Integrity over availability: the install succeeds only for the version
  * recorded in `v2Pin`, with an archive that matches the recorded digest and the release's
  * SHA256SUMS line, and that `file` recognises as the expected archive type. Every failure throws.
- * There is no FALLBACK_VERSION retry and no check that passes because it could not run.
+ * There is no retry here and no check that passes because it could not run.
  *
  * The pin policy runs first, so a version or platform with no recorded digest fails before any
  * cache lookup or download. The local tool cache is keyed by the digest-bound version: entries
@@ -540,41 +519,4 @@ async function downloadAndInstall(
 
   logger.info('OpenCode installed', {version, path: toolPath})
   return {path: toolPath, version, cached: false}
-}
-
-/**
- * Fetch latest OpenCode version from GitHub API.
- *
- * This function is the STOCK-latest resolver — it only makes sense for
- * anomalyco/opencode stock releases. It must never be called with a harness
- * pin, because harness versions are already fully-qualified and have no
- * "latest" concept on the stock release feed.
- *
- * Guard: if `pinnedVersion` is provided and is a harness pin, return it
- * unchanged without fetching. This covers any future call-site that might
- * inadvertently pass a harness pin through the "resolve latest" path.
- *
- * Current call-site analysis (setup.ts ~line 43): `getLatestVersion` is only
- * called when `version === 'latest'`. A harness pin like `1.17.3+harness.x`
- * never equals `'latest'`, so the guard is a belt-and-suspenders safety net.
- *
- * @param logger - Logger instance for diagnostics.
- * @param pinnedVersion - Optional already-resolved version; if harness-pinned,
- *   returned immediately without a network call.
- */
-export async function getLatestVersion(logger: Logger, pinnedVersion?: string): Promise<string> {
-  // Guard: harness pins are fully-qualified — never route them to stock latest.
-  if (pinnedVersion !== undefined && isHarnessVersion(pinnedVersion)) {
-    logger.debug('Skipping stock latest fetch for harness-pinned version', {version: pinnedVersion})
-    return pinnedVersion
-  }
-
-  const response = await fetch('https://api.github.com/repos/anomalyco/opencode/releases/latest')
-  if (!response.ok) {
-    throw new Error(`Failed to fetch latest OpenCode version: ${response.statusText}`)
-  }
-  const data = (await response.json()) as {tag_name: string}
-  const version = data.tag_name.replace(/^v/, '')
-  logger.info('Latest OpenCode version', {version})
-  return version
 }

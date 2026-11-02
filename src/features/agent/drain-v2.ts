@@ -67,6 +67,25 @@ export const UNOBSERVABLE_PASSES_BEFORE_DRAIN_EXIT = 3
 export const UNREADABLE_READINGS_BEFORE_DRAIN_EXIT = 20
 const DEFAULT_DRAIN_POLL_INTERVAL_MS = 250
 
+/**
+ * What one release did, for the single verdict line. Counts only; nothing the model controls (shell commands, ids of
+ * other runs) goes in. Mutable on purpose: the drain and the stop add to it as they read and act.
+ */
+export interface ReleaseTally {
+  /** Directory readings taken, quiet or not, across the drain and the stop. */
+  readings: number
+  /** Consecutive quiet readings the passing window held. 0 when no window passed. */
+  quietStreak: number
+  /** Running shells the stop deleted. */
+  shellsDeleted: number
+  /** Sessions the stop interrupted (an interrupt that was a no-op is not counted). */
+  sessionsInterrupted: number
+}
+
+export function createReleaseTally(): ReleaseTally {
+  return {readings: 0, quietStreak: 0, shellsDeleted: 0, sessionsInterrupted: 0}
+}
+
 /** What a release needs to know about the run. */
 export interface DirectoryReleaseContext {
   readonly client: ActionOpenCodeV2Client
@@ -81,6 +100,8 @@ export interface DirectoryReleaseContext {
   readonly logger: Logger
   /** Overrides the stability window. For tests only. */
   readonly stability?: DirectoryStabilityTuning
+  /** Where the drain and the stop count what they did. `releaseRunV2` reads it for its verdict line. */
+  readonly tally?: ReleaseTally
 }
 
 /** The root and every session the ledger tracks, in any state. Background shells are not sessions. */
@@ -146,6 +167,8 @@ export interface StopDirectoryActivityOptions {
   readonly logger: Logger
   readonly deleteTimeoutMs?: number
   readonly interruptTimeoutMs?: number
+  /** Counts the shells deleted and sessions interrupted. */
+  readonly tally?: ReleaseTally
 }
 
 async function interruptSession(
@@ -154,12 +177,15 @@ async function interruptSession(
   signal: AbortSignal,
   logger: Logger,
   role: 'owned' | 'root',
+  tally: ReleaseTally | undefined,
 ): Promise<void> {
   try {
     const result = await client.interrupt({sessionId, signal})
     if (!result.success) {
       logger.warning('Session interrupt during release returned an error', {sessionId, role, error: result.error.kind})
-    } else if (!result.data.interrupted) {
+    } else if (result.data.interrupted) {
+      if (tally !== undefined) tally.sessionsInterrupted += 1
+    } else {
       // Not a stop and not a failure: nothing active was interrupted.
       logger.debug('Session interrupt during release was a no-op', {sessionId, role})
     }
@@ -185,6 +211,7 @@ export async function stopDirectoryActivityV2(options: StopDirectoryActivityOpti
     logger,
     deleteTimeoutMs = STOP_DELETE_TIMEOUT_MS,
     interruptTimeoutMs = STOP_INTERRUPT_TIMEOUT_MS,
+    tally,
   } = options
 
   if (activity.runningShellIds.length > 0 && !signal.aborted) {
@@ -196,6 +223,8 @@ export async function stopDirectoryActivityV2(options: StopDirectoryActivityOpti
             const result = await client.deleteShell({directory, shellId, signal: deletes.signal})
             if (!result.success) {
               logger.warning('Shell delete during release returned an error', {shellId, error: result.error.kind})
+            } else if (tally !== undefined) {
+              tally.shellsDeleted += 1
             }
           } catch (error) {
             logger.warning('Shell delete during release threw', {shellId, error: toErrorMessage(error)})
@@ -214,11 +243,11 @@ export async function stopDirectoryActivityV2(options: StopDirectoryActivityOpti
     // Issued together, the root first: one that never answers must not hold up the others.
     await Promise.allSettled([
       ...(rootSessionId !== null && (rootActive || alwaysInterruptRoot)
-        ? [interruptSession(client, rootSessionId, interrupts.signal, logger, 'root')]
+        ? [interruptSession(client, rootSessionId, interrupts.signal, logger, 'root', tally)]
         : []),
       ...activity.activeSessionIds
         .filter(sessionId => sessionId !== rootSessionId)
-        .map(async sessionId => interruptSession(client, sessionId, interrupts.signal, logger, 'owned')),
+        .map(async sessionId => interruptSession(client, sessionId, interrupts.signal, logger, 'owned', tally)),
     ])
   } finally {
     interrupts.release()
@@ -260,6 +289,7 @@ export async function stopAndConfirmQuietV2(
       ...context.stability,
       observe: async signal => {
         const observation = await observe(context, signal)
+        if (context.tally !== undefined) context.tally.readings += 1
         if (observation.kind === 'quiescent') return observation
         lastReason =
           observation.kind === 'unreadable'
@@ -273,6 +303,7 @@ export async function stopAndConfirmQuietV2(
           alwaysInterruptRoot: firstReading,
           signal,
           logger,
+          ...(context.tally === undefined ? {} : {tally: context.tally}),
         })
         firstReading = false
         return observation
@@ -284,6 +315,7 @@ export async function stopAndConfirmQuietV2(
       spacingMs: context.stability?.minSpacingMs ?? DIRECTORY_QUIESCENCE_MIN_SPACING_MS,
     })
     if (outcome.passed) {
+      if (context.tally !== undefined) context.tally.quietStreak = gate.state().streak
       for (const entry of ledger?.snapshot() ?? []) if (entry.state !== 'settled') ledger?.settle(entry.sessionId)
       logger.info('The run directory stayed quiet for the whole window; safe to release', {directory})
       return {quiet: true}
@@ -342,6 +374,7 @@ export async function drainUntilQuietV2(
     ...context.stability,
     observe: async readSignal => {
       const observation = await observe(context, readSignal)
+      if (context.tally !== undefined) context.tally.readings += 1
       unreadableReadings = observation.kind === 'unreadable' ? unreadableReadings + 1 : 0
       if (observation.kind !== 'quiescent') {
         logger.debug('The run directory is not quiet yet', {
@@ -376,7 +409,10 @@ export async function drainUntilQuietV2(
         spacingMs: context.stability?.minSpacingMs ?? DIRECTORY_QUIESCENCE_MIN_SPACING_MS,
         shouldContinue: () => (ledger === undefined || ledger.isDrainComplete()) && !unreadableGiveUp(),
       })
-      if (stable.passed) return {kind: 'quiet'}
+      if (stable.passed) {
+        if (context.tally !== undefined) context.tally.quietStreak = gate.state().streak
+        return {kind: 'quiet'}
+      }
       if (stable.reason === 'aborted') break
       if (unreadableGiveUp()) {
         return {kind: 'unobservable', reason: 'the run directory could not be read'}
@@ -467,13 +503,15 @@ async function runPreShutdownStep(
  */
 export async function releaseRunV2(options: ReleaseRunOptions): Promise<ReleaseOutcomeV2> {
   const {handle, logger, ledger} = options
+  const tally = options.tally ?? createReleaseTally()
+  const context = {...options, tally}
   let quiet = false
   let drain: ReleaseOutcomeV2['drain'] = 'not-attempted'
   let stopped = false
   let declineReason: string | null = null
 
   if (options.executionSucceeded) {
-    const drained = await drainUntilQuietV2(options, {
+    const drained = await drainUntilQuietV2(context, {
       deadlineMs: options.deadlineMs,
       ...(options.pollIntervalMs === undefined ? {} : {pollIntervalMs: options.pollIntervalMs}),
     })
@@ -489,7 +527,7 @@ export async function releaseRunV2(options: ReleaseRunOptions): Promise<ReleaseO
 
   if (!quiet) {
     stopped = true
-    const confirmation = await stopAndConfirmQuietV2(options, {
+    const confirmation = await stopAndConfirmQuietV2(context, {
       ...(options.stopTimeoutMs === undefined ? {} : {timeoutMs: options.stopTimeoutMs}),
     })
     quiet = confirmation.quiet
@@ -497,6 +535,20 @@ export async function releaseRunV2(options: ReleaseRunOptions): Promise<ReleaseO
       declineReason = `the run's directory could not be confirmed quiet before shutdown (${confirmation.reason}), so a background session or shell may still write`
     }
   }
+
+  // One line per run: the verdict the save and the summary rest on, in the Actions log.
+  const unknownCount = (ledger?.unknown() ?? 0) + (ledger?.outstanding() ?? 0)
+  logger.info('Run release verdict', {
+    drain,
+    stopped,
+    quiet,
+    readings: tally.readings,
+    quietStreak: tally.quietStreak,
+    shellsDeleted: tally.shellsDeleted,
+    sessionsInterrupted: tally.sessionsInterrupted,
+    unknownCount,
+    ...(declineReason === null ? {} : {declineReason}),
+  })
 
   if (options.onSettled !== undefined) {
     const onSettled = options.onSettled
@@ -522,7 +574,7 @@ export async function releaseRunV2(options: ReleaseRunOptions): Promise<ReleaseO
     quiet,
     drain,
     stopped,
-    unknownCount: (ledger?.unknown() ?? 0) + (ledger?.outstanding() ?? 0),
+    unknownCount,
     shutdown,
     declineReason,
   }

@@ -123,6 +123,94 @@ describe('runPromptAttemptV2', () => {
     expect(await result).toMatchObject({success: true, settlement: {kind: 'completion-observed'}})
   })
 
+  describe('the session-wait route is bounded and re-issued', () => {
+    const WAIT_BOUND_MS = 1_000
+    const idle = {success: true, data: undefined} as const
+    // Polling is held off so the wait route alone can complete the attempt.
+    const pollOff = {pollIntervalMs: 600_000, initialActivityTimeoutMs: 600_000}
+
+    it('re-issues a wait that outlives its bound; the next wait answers and completion follows', async () => {
+      // #given a first wait that never answers (as the 300 s client timeout would end it) and a turn that ends after it
+      const server = createFakeServer({
+        onPrompt: (_, pipe) => {
+          pipe.push(STARTED)
+          setTimeout(() => pipe.push(SUCCEEDED), 1_500)
+        },
+        waitResponder: async (call, signal) => {
+          if (call > 1) return idle
+          await new Promise<void>(resolve => signal?.addEventListener('abort', () => resolve(), {once: true}))
+          return {success: false, error: {kind: 'aborted'}}
+        },
+      })
+
+      // #when
+      const result = attempt(server, {poll: pollOff, waitBoundMs: WAIT_BOUND_MS})
+      await advance(WAIT_BOUND_MS + 200)
+
+      // #then the bound ended the first call and the wait was asked again, with no fallback to polling
+      expect(server.calls.waitSession.mock.calls.length).toBeGreaterThanOrEqual(2)
+      await advance(3_000)
+      expect(await result).toMatchObject({success: true, settlement: {kind: 'completion-observed'}})
+      expect(logger.info).not.toHaveBeenCalledWith(
+        expect.stringContaining('relying on the poll watchdog'),
+        expect.anything(),
+      )
+    })
+
+    it('hands each wait call its own signal, cut at the bound', async () => {
+      // #given a wait that records whether its signal aborted
+      const aborted: boolean[] = []
+      const server = createFakeServer({
+        onPrompt: (_, pipe) => {
+          pipe.push(STARTED)
+          setTimeout(() => pipe.push(SUCCEEDED), 2_500)
+        },
+        waitResponder: async (call, signal) => {
+          if (call > 2) return idle
+          await new Promise<void>(resolve => signal?.addEventListener('abort', () => resolve(), {once: true}))
+          aborted.push(signal?.aborted === true)
+          return {success: false, error: {kind: 'aborted'}}
+        },
+      })
+
+      // #when two bounds elapse
+      const result = attempt(server, {poll: pollOff, waitBoundMs: WAIT_BOUND_MS})
+      await advance(2 * WAIT_BOUND_MS + 500)
+
+      // #then both calls were cut by their own bound and the wait was asked a third time
+      expect(aborted).toEqual([true, true])
+      expect(server.calls.waitSession.mock.calls.length).toBeGreaterThanOrEqual(3)
+      await advance(3_000)
+      expect(await result).toMatchObject({success: true})
+    })
+
+    it.each([
+      ['an HTTP error status', {kind: 'http', status: 500}],
+      ['a transport failure that is not our bound', {kind: 'network', message: 'socket hang up'}],
+    ] as const)('falls back to polling on %s, and says so at info', async (_label, error) => {
+      // #given a wait that fails for real
+      const server = createFakeServer({
+        onPrompt: (_, pipe) => {
+          pipe.push(STARTED)
+          pipe.push(SUCCEEDED)
+        },
+        waitResponder: async () => ({success: false, error}),
+      })
+
+      // #when
+      const result = attempt(server, {waitBoundMs: WAIT_BOUND_MS})
+      await advance(2_000)
+
+      // #then the poll watchdog completes the attempt, and the switch is visible in the Actions log
+      expect(await result).toMatchObject({success: true, outcome: 'completed'})
+      expect(logger.info).toHaveBeenCalledWith(
+        expect.stringContaining('relying on the poll watchdog'),
+        expect.objectContaining({error: error.kind}),
+      )
+      expect(server.calls.waitSession).toHaveBeenCalledTimes(1)
+    })
+  })
+
   it('reports a failed root turn with its classified error', async () => {
     // #given
     const server = createFakeServer({
