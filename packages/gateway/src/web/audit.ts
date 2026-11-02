@@ -46,7 +46,8 @@ export type AuthzDeniedReason = 'not_allowlisted'
 export type LaunchRejectedReason = 'binding_not_found' | 'concurrency_cap' | 'authz_denied' | 'unknown'
 
 /** Safe reasons for approval rejection. */
-export type ApprovalRejectedReason = 'already_claimed' | 'not_found' | 'deadline_expired' | 'scope_mismatch' | 'unknown'
+export type ApprovalRejectedReason =
+  'already_claimed' | 'not_found' | 'deadline_expired' | 'scope_mismatch' | 'reject_only' | 'unknown'
 
 /** Safe reasons for cancel-request rejection (pre-acceptance denial). */
 export type CancelRejectedReason = 'not_found' | 'authz_denied' | 'unknown'
@@ -468,6 +469,8 @@ const LOG_LEVEL: Record<
  *   (single-winner race) or a stale/duplicate request. Benign operational noise.
  * - 'scope_mismatch': WARN — genuine security signal: an operator tried to settle
  *   a request outside their run's scope. Warrants attention.
+ * - 'reject_only': WARN — an approve was attempted on a request that cannot be shown in full; only a
+ *   reject is accepted, so the attempt is refused.
  * - 'unknown': WARN — operational anomaly (settlement failure); warrants attention.
  * - 'deadline_expired': WARN — registry-internal deadline path; not produced by the
  *   decision route but kept in the taxonomy for completeness.
@@ -478,6 +481,7 @@ function approvalRejectedLevel(reason: ApprovalRejectedReason): 'info' | 'warn' 
     case 'not_found':
       return 'info'
     case 'scope_mismatch':
+    case 'reject_only':
     case 'unknown':
     case 'deadline_expired':
       return 'warn'

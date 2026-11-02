@@ -1,7 +1,7 @@
 import type {Result} from '@bfra.me/es/result'
 import type {V2SessionApi} from './ledger-reconcile-v2.js'
 import type {OwnershipLedger} from './ownership-ledger.js'
-import type {RemoteOpenCodeV2Client} from './remote-client-v2.js'
+import type {RemoteOpenCodeV2Client, V2InboxItemMeta} from './remote-client-v2.js'
 
 import {err, ok} from '@bfra.me/es/result'
 import {toError} from '../shared/errors.js'
@@ -79,8 +79,15 @@ export interface DirectoryActivity {
   readonly activeSessionIds: readonly string[]
   /** Shells of the directory that are running (a status this client does not know counts as running). */
   readonly runningShellIds: readonly string[]
-  /** Sessions of this run's scope (see `InboxScope`) with a queued inbox item. */
-  readonly queuedInbox: readonly {readonly sessionId: string; readonly queued: number}[]
+  /**
+   * Sessions of this run's scope (see `InboxScope`) with a queued inbox item. `items` is the enum-like metadata of the
+   * queued items (a bounded sample, never their content), present when the server sent any readable.
+   */
+  readonly queuedInbox: readonly {
+    readonly sessionId: string
+    readonly queued: number
+    readonly items?: readonly V2InboxItemMeta[]
+  }[]
 }
 
 export type DirectoryObservation =
@@ -275,11 +282,18 @@ export async function observeDirectoryV2(options: ObserveDirectoryOptions): Prom
   // watch act on what it found.
   const seenSessions = new Set<string>()
   const seenShells = new Set<string>()
-  const seenQueued = new Map<string, number>()
+  const seenQueued = new Map<
+    string,
+    {readonly queued: number; readonly items: readonly V2InboxItemMeta[] | undefined}
+  >()
   const snapshot = (): DirectoryActivity => ({
     activeSessionIds: [...seenSessions],
     runningShellIds: [...seenShells],
-    queuedInbox: [...seenQueued].map(([sessionId, queued]) => ({sessionId, queued})),
+    queuedInbox: [...seenQueued].map(([sessionId, {queued, items}]) => ({
+      sessionId,
+      queued,
+      ...(items === undefined ? {} : {items}),
+    })),
   })
 
   const reads = async (): Promise<DirectoryObservation> => {
@@ -321,7 +335,7 @@ export async function observeDirectoryV2(options: ObserveDirectoryOptions): Prom
             ? ({sessionId, failure: null} as const)
             : ({sessionId, failure: listed.error.kind} as const)
         }
-        if (listed.data.queued > 0) seenQueued.set(sessionId, listed.data.queued)
+        if (listed.data.queued > 0) seenQueued.set(sessionId, {queued: listed.data.queued, items: listed.data.items})
         return {sessionId, failure: null} as const
       })
       const unreadable = readings.find(reading => reading.failure !== null)

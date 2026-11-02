@@ -283,6 +283,14 @@ export interface PromptOptions {
    * `responseDelivery === 'file-convention'`; ignored otherwise.
    */
   readonly responseFilePath?: string | null
+  /**
+   * `true` only when the Action will attempt a brokered push of this run's changes to the PR branch
+   * (credentials are withheld from the agent, so it cannot push itself). Resolved once per invocation by
+   * the harness from the same decision finalize uses to run the broker, so the prompt and the broker
+   * cannot disagree. Gates the Response Protocol bullet telling the agent to commit and not push; only
+   * rendered under `file-convention` delivery. Defaults to `false`.
+   */
+  readonly brokeredPushActive?: boolean
 }
 
 export interface ReferenceFile {

@@ -262,6 +262,21 @@ export const ENV_PERMISSION_ASKED_FRAME = frame('permission.asked', {
   source: {type: 'tool', messageID: 'msg_183893b89001zTUTVVjKSYBbSf', id: 'call_11_0'},
 })
 
+// --- OpenCode 2.2.5 shell ask (fro-bot/agent#2002) ------------------------------------------------------------------
+
+/**
+ * A `shell` ask, verbatim `data` of the `permission.asked` frame in the 2.2.5 probe `a.events.jsonl`. Note what it
+ * does not carry: no `metadata`, so the command is only in `resources`.
+ */
+export const SHELL_PERMISSION_ASKED_FRAME = frame('permission.asked', {
+  id: 'per_19a156a17001C9xQjJpLtxVww1',
+  sessionID: 'ses_e65ea9aafffesLnrmtUalEyybV',
+  action: 'shell',
+  resources: ['echo hi'],
+  save: ['echo *'],
+  source: {type: 'tool', messageID: 'msg_19a1569b0001CpGcQodNIfHfb3', id: 'call_probe_1'},
+})
+
 export const QUESTION_SESSION_ID = 'ses_e7c7674b6ffeTCxnqVMBl6nqkF'
 export const QUESTION_MESSAGE_ID = 'msg_183898b610014onEp0BwSoDKpA'
 export const QUESTION_CALL_ID = 'call_13_0'

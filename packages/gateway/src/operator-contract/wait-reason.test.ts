@@ -23,6 +23,8 @@ const EXPECTED = [
   ['revision-drift', 'confirming-completion'],
   ['idle-evidence-stale', 'confirming-completion'],
   ['validation-threw', 'confirming-completion'],
+  ['directory-quiet-window', 'confirming-completion'],
+  ['directory-unreadable', 'confirming-completion'],
 ] as const satisfies readonly (readonly [DrainRejectCode, OperatorWaitReason])[]
 
 describe('toOperatorWaitReason', () => {

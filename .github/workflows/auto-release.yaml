@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # semantic-release pushes the release commit and the tag; the repo's pre-push hook would
-      # re-run install, lint and build on each push. CI and the Build release step already cover those.
+      # re-run install and the Action build on each push. The Build release step already covers those.
       SKIP_INSTALL_SIMPLE_GIT_HOOKS: '1'
     if: >-
       github.event.pull_request.merged == true &&

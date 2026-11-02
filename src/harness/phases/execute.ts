@@ -15,6 +15,7 @@ import type {MetricsCollector} from '../../features/observability/index.js'
 import type {Logger} from '../../shared/logger.js'
 import type {OutputMode, ResolvedOutputMode, TokenUsage} from '../../shared/types.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
+import type {BrokeredPushPlan} from './brokered-push-plan.js'
 import type {CacheRestorePhaseResult, CacheRestoreV2PhaseResult} from './cache-restore.js'
 import type {DeferredSummaryV2, ExecutionBackend} from './execution-backend.js'
 import type {RoutingPhaseResult} from './routing.js'
@@ -40,6 +41,7 @@ import {getGitHubWorkspace} from '../../shared/env.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {createLogger} from '../../shared/logger.js'
 import {STATE_KEYS} from '../config/state-keys.js'
+import {resolveBrokeredPushPlan} from './brokered-push-plan.js'
 import {isCacheRestoreV2} from './cache-restore-kind.js'
 import {createExecutionBackendV2} from './execute-v2.js'
 import {buildSessionSearchQuery} from './session-prep.js'
@@ -357,6 +359,9 @@ export async function runExecute(
   sessionPrep: SessionPrepPhaseResult,
   metrics: MetricsCollector,
   startTime: number,
+  // Resolved once per invocation (run.ts) and shared with finalize; defaults to resolving here for callers
+  // that do not thread it. Either way the prompt and the broker read the same decision.
+  brokeredPushPlan: BrokeredPushPlan = resolveBrokeredPushPlan(bootstrap, routing),
 ): Promise<ExecutePhaseResult> {
   const backend = selectExecutionBackend(cacheRestore)
   const outputModeMigration = resolveOutputModeMigration(
@@ -384,6 +389,7 @@ export async function runExecute(
     responseDelivery: bootstrap.delivery,
     responseFilePath: bootstrap.responseFilePath,
     responseSurface: resolveResponseSurface(routing.agentContext, routing.triggerResult.context),
+    brokeredPushActive: brokeredPushPlan.eligible,
   }
 
   const skipExecution = process.env.SKIP_AGENT_EXECUTION === 'true'

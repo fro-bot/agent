@@ -41,7 +41,12 @@ import type {ApprovalActor, ApprovalRegistry} from './registry.js'
 import {toErrorMessage} from '@fro-bot/runtime'
 import {DiscordAPIError, RESTJSONErrorCodes} from 'discord.js'
 
-import {buildApprovalButtons, buildApprovalEmbed, buildSettledEmbed} from '../discord/approvals.js'
+import {
+  approvalCardRejectOnly,
+  buildApprovalButtons,
+  buildApprovalEmbed,
+  buildSettledEmbed,
+} from '../discord/approvals.js'
 import {editMessage} from '../discord/io.js'
 
 // ---------------------------------------------------------------------------
@@ -212,6 +217,10 @@ export function createDiscordApprovalOnPending(
     // the dangling-timer leak from the old Promise.race approach.
     const postReplyForRequest = postReplyFactory(sessionID)
 
+    // A card that clamps the Action cannot show the whole request: it offers Deny only, and the registry refuses an
+    // approve that reaches it another way (a stale or forged button id).
+    const rejectOnly = approvalCardRejectOnly(req)
+
     // register-before-send: register the entry in the shared registry
     // BEFORE attempting the Discord embed post. This ensures the button
     // handler can look up the entry even if the send is still in-flight.
@@ -229,6 +238,7 @@ export function createDiscordApprovalOnPending(
       effects: {postReply: postReplyForRequest},
       deadlineMs: approvalDeadlineMs,
       onDeadlineSettled,
+      rejectOnly,
     })
 
     // Post a visible waiting-for-approval status BEFORE the embed so the
@@ -282,7 +292,7 @@ export function createDiscordApprovalOnPending(
     const settleEmbed = replySink.markVisibleOutputPending()
     // eslint-disable-next-line no-void
     void replySink
-      .send('thread', {embeds: [buildApprovalEmbed(req)], components: [buildApprovalButtons(requestID)]})
+      .send('thread', {embeds: [buildApprovalEmbed(req)], components: [buildApprovalButtons(requestID, rejectOnly)]})
       .then(result => {
         const r = result as Result<Message, Error> | undefined
         if (r?.success === true) {

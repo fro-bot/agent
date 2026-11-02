@@ -22,7 +22,8 @@ import {isShellStatus} from './shell-notice.js'
  * - `GET /api/session/:id` carries `outcome`, the persisted result of the last execution that ended. A `shutdown`
  *   interrupt does not write it (`packages/core/src/session/projector.ts`, `projectIdle`).
  * - `GET /api/session/active` and `GET /api/session` back the ledger adapter (`ledger-reconcile-v2.ts`).
- * - `POST /api/session/:id/permission/:requestID/reply` takes `{decision: 'once' | 'always' | 'reject'}`.
+ * - `POST /api/session/:id/permission/:requestID/reply` takes `{decision: 'once' | 'always' | 'reject', message?}`; a
+ *   non-empty `message` on a reject fails only the tool, where a bare reject interrupts the whole execution.
  * - `POST /api/session/:id/form/:formID/reply` takes `{answer}`; `DELETE /api/session/:id/form/:formID?message=` cancels.
  * - `GET /api/shell`, `GET /api/shell/:id` and `DELETE /api/shell/:id` (`groups/shell.ts`) read and stop background shells.
  *   They are location-scoped: the location rides in `x-opencode-directory`, and a DELETE in another location is a
@@ -86,9 +87,84 @@ export interface RemoteOpenCodeV2ClientOptions {
   readonly fetch?: typeof fetch
 }
 
+/** The fixed label for a value outside a closed set below. The value itself is never kept. */
+export const V2_INBOX_OTHER = 'other'
+
+/**
+ * The item kinds OpenCode 2.2.5 enqueues: `Session.Inbox.Item` is the union of user, synthetic, compaction and move
+ * (`packages/schema/src/session-inbox.ts:44-53`).
+ */
+export const V2_INBOX_ITEM_TYPES = ['user', 'synthetic', 'compaction', 'move'] as const
+/** `Session.Inbox.Delivery` (`packages/schema/src/session-inbox.ts:11`). */
+export const V2_INBOX_DELIVERIES = ['steer', 'queue'] as const
+/**
+ * The `payload.metadata.source` literals OpenCode 2.2.5 sets when it enqueues a synthetic item (paths under
+ * `packages/core/src`):
+ * - `shell`: `shell/result.ts:56`, and a shell that fails to start, `session/session.ts:205`;
+ * - `subagent`: `session/subagent-completion.ts:43`;
+ * - `goal`: `plugin/goal.ts:201` and `:380`, and the kickoff metadata at `:412`;
+ * - `experimental_image_generate`: `tool/plugin/image-generate.ts:26` (the tool's `name`), used at `:220`, and
+ *   `session/execution/restart.ts:139`.
+ *
+ * The upstream schema types `metadata` as `Record<string, unknown>` (`session-inbox.ts:17`, `:31`), so any caller can
+ * set any `source`, on a user item too: only this list is trusted.
+ */
+export const V2_INBOX_SYNTHETIC_SOURCES = ['shell', 'subagent', 'goal', 'experimental_image_generate'] as const
+
+export type V2InboxItemType = (typeof V2_INBOX_ITEM_TYPES)[number] | typeof V2_INBOX_OTHER
+export type V2InboxDelivery = (typeof V2_INBOX_DELIVERIES)[number] | typeof V2_INBOX_OTHER
+export type V2InboxSource = (typeof V2_INBOX_SYNTHETIC_SOURCES)[number] | typeof V2_INBOX_OTHER
+
+/**
+ * What one queued inbox item is, and nothing it says: `type`, `delivery`, and the `payload.metadata.source` of a
+ * synthetic item, each from a closed set of literals upstream produces, or the fixed label `other`. Message text, every
+ * other payload field, and any string a caller chose are dropped here, at the client, so nothing downstream can log
+ * them. The types are the closed sets, so a log line cannot carry a free-form value without a type error.
+ */
+export interface V2InboxItemMeta {
+  readonly type?: V2InboxItemType
+  readonly delivery?: V2InboxDelivery
+  /** Only ever set on a synthetic item. */
+  readonly source?: V2InboxSource
+}
+
 export interface V2InboxSummary {
   /** Items enqueued on the session and not yet delivered into a turn. */
   readonly queued: number
+  /** Metadata of the first `V2_INBOX_ITEM_META_CAP` queued items; absent when none carried a readable field. */
+  readonly items?: readonly V2InboxItemMeta[]
+}
+
+/** Bound on the item metadata kept per session: a reading stays small however long an inbox grows. */
+export const V2_INBOX_ITEM_META_CAP = 10
+
+/** `value` when it is one of `allowed`, `other` for any other string, `null` for a non-string. Never echoes `value`. */
+function closedValue<const Allowed extends readonly string[]>(
+  value: string | null,
+  allowed: Allowed,
+): Allowed[number] | typeof V2_INBOX_OTHER | null {
+  if (value === null) return null
+  return allowed.find(known => known === value) ?? V2_INBOX_OTHER
+}
+
+function readInboxItemMeta(item: unknown): V2InboxItemMeta | null {
+  const rawType = getStringProperty(item, 'type')
+  const type = closedValue(rawType, V2_INBOX_ITEM_TYPES)
+  const delivery = closedValue(getStringProperty(item, 'delivery'), V2_INBOX_DELIVERIES)
+  // A user item's metadata is caller-chosen and says nothing about what the item is: only a synthetic item has a source.
+  const source =
+    rawType === 'synthetic'
+      ? closedValue(
+          getStringProperty(getObjectProperty(getObjectProperty(item, 'payload'), 'metadata'), 'source'),
+          V2_INBOX_SYNTHETIC_SOURCES,
+        )
+      : null
+  if (type === null && delivery === null && source === null) return null
+  return {
+    ...(type === null ? {} : {type}),
+    ...(delivery === null ? {} : {delivery}),
+    ...(source === null ? {} : {source}),
+  }
 }
 
 /** A model as the Action config names it. V2 takes `{id, providerID}` on the wire. */
@@ -142,6 +218,12 @@ export interface RemoteOpenCodeV2Client {
     readonly sessionId: string
     readonly requestId: string
     readonly decision: V2PermissionDecision
+    /**
+     * Feedback for a `reject`. Upstream turns a non-empty message into a tool failure the model sees, so the turn goes
+     * on; a bare reject interrupts the whole execution (`interrupted`, reason `shutdown`, claim left resumable). Sent
+     * only when non-empty: upstream reads an empty string as no message.
+     */
+    readonly message?: string
     readonly signal?: AbortSignal
   }) => Promise<Result<undefined, V2CallError>>
   readonly replyForm: (input: {
@@ -449,11 +531,11 @@ export function createRemoteOpenCodeV2Client(options: RemoteOpenCodeV2ClientOpti
       return ok(readFrames(sent.data, signal))
     },
 
-    replyPermission: async ({sessionId, requestId, decision, signal}) =>
+    replyPermission: async ({sessionId, requestId, decision, message, signal}) =>
       sendNoContent({
         method: 'POST',
         path: `/api/session/${encodeURIComponent(sessionId)}/permission/${encodeURIComponent(requestId)}/reply`,
-        body: {decision},
+        body: message === undefined || message === '' ? {decision} : {decision, message},
         ...(signal === undefined ? {} : {signal}),
       }),
 
@@ -481,7 +563,9 @@ export function createRemoteOpenCodeV2Client(options: RemoteOpenCodeV2ClientOpti
       })
       if (!result.success) return result
       const data = getObjectProperty(result.data, 'data')
-      return Array.isArray(data) ? ok({queued: data.length}) : err({kind: 'parse'})
+      if (!Array.isArray(data)) return err({kind: 'parse'})
+      const items = data.slice(0, V2_INBOX_ITEM_META_CAP).flatMap(item => readInboxItemMeta(item) ?? [])
+      return ok({queued: data.length, ...(items.length === 0 ? {} : {items})})
     },
 
     listShells: async ({directory, signal}) => {

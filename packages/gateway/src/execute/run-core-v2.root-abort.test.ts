@@ -9,14 +9,17 @@
  * directory through the hold.
  */
 
-import type {OwnershipLedger} from '@fro-bot/runtime'
+import type {OwnershipLedger, RemoteOpenCodeV2Client} from '@fro-bot/runtime'
 import type {Run, StartOptions} from './run-core-v2.fixture.js'
 
 import {createOwnershipLedger, err, ok} from '@fro-bot/runtime'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
+import {createPermissionCoordinator} from '../approvals/coordinator.js'
+import {createApprovalRegistry} from '../approvals/registry.js'
+import {createPostReplyFactoryV2, OPERATOR_REJECT_MESSAGE_V2} from './permission-reply-v2.js'
 import {QUARANTINE_HOLD_WINDOW_MS} from './root-stop.js'
-import {failure, frames, ROOT, startRun} from './run-core-v2.fixture.js'
+import {failure, frames, makeLogger, ROOT, startRun} from './run-core-v2.fixture.js'
 
 const INACTIVITY_MS = 5_000
 /** Longer than the 15 s settle bound, so a run that cannot confirm the root has concluded. */
@@ -368,5 +371,74 @@ describe('root interrupt on a stop that may leave the root running', () => {
     // #then
     expect(run.outcome()).toEqual({ok: true})
     expect(run.interrupt).not.toHaveBeenCalled()
+  })
+
+  it('waits for the directory to go quiet after a teardown reject that carries a message wakes the root', async () => {
+    // #given — an approval is open, wired the way run.ts wires it (coordinator → registry → the V2 reply path), and a
+    // server on which a reject WITH a message wakes the root (the model takes another step)
+    const logger = makeLogger()
+    const registry = createApprovalRegistry({logger})
+    const clientRef: {current?: Run} = {}
+    const proxy = {
+      replyPermission: async (input: Parameters<RemoteOpenCodeV2Client['replyPermission']>[0]) => {
+        const current = clientRef.current
+        if (current === undefined) return err({kind: 'parse'} as const)
+        // Upstream lets the model take another step after a reject that carries a message: the root wakes.
+        if (input.decision === 'reject' && input.message !== undefined && input.message !== '') {
+          setTimeout(() => current.activeSet.add(ROOT), 150)
+        }
+        return current.client.replyPermission(input)
+      },
+    } as unknown as RemoteOpenCodeV2Client
+    const postReplyFactory = createPostReplyFactoryV2(proxy)
+    const coordinator = createPermissionCoordinator({
+      logger,
+      onPending: request =>
+        registry.register({
+          requestID: request.requestID,
+          sessionID: request.sessionID,
+          approvalScopeId: 'chan_1',
+          directory: '/workspace/repos/o/r',
+          request,
+          effects: {postReply: postReplyFactory(request.sessionID)},
+        }),
+      onReplied: event => registry.confirmReply(event),
+      onDispose: sessionIds => {
+        for (const sessionId of sessionIds) registry.disposeRun(sessionId, 'run ended').catch(() => undefined)
+      },
+    })
+    const controller = new AbortController()
+    const run = startRun({
+      controller,
+      coordinator,
+      active: [],
+      directoryStability: {requiredObservations: 3, minSpacingMs: 100, minSpanMs: 200},
+    })
+    clientRef.current = run
+    await vi.advanceTimersByTimeAsync(50)
+    run.emit(frames.permissionAsked('per_a'))
+    await vi.advanceTimersByTimeAsync(50)
+
+    // #when — the run is cancelled; the teardown reject goes out, and the root wakes 150 ms later
+    controller.abort('operator cancel')
+    await vi.advanceTimersByTimeAsync(100)
+
+    // #then — the reject carried the message, and the quiet window (200 ms) is not over, so nothing is released yet
+    expect(run.replyPermission).toHaveBeenCalledOnce()
+    expect(run.replyPermission.mock.calls[0]?.[0]).toMatchObject({
+      requestId: 'per_a',
+      decision: 'reject',
+      message: OPERATOR_REJECT_MESSAGE_V2,
+    })
+    expect(run.outcome()).toBeUndefined()
+
+    // #when — the woken root is seen and stopped
+    await vi.advanceTimersByTimeAsync(2_000)
+
+    // #then — the stop saw the wake, and only then released the checkout, with the directory confirmed quiet
+    expect(run.interrupt).toHaveBeenCalledWith(expect.objectContaining({sessionId: ROOT}))
+    const error = failure(run)
+    expect(error.kind).toBe('timeout')
+    expect(error.quarantined).toBe(false)
   })
 })

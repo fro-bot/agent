@@ -43,4 +43,4 @@ Run before every commit:
 bun run test && bun run lint && bun run build && git diff --exit-code dist/
 ```
 
-The pre-push hook enforces this, but run it yourself first. `bun run build` includes `check-types` — don't run them separately.
+The pre-push hook only enforces the `dist/` check, so run the whole chain yourself. `bun run build` includes `check-types` — don't run them separately.

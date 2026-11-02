@@ -2224,3 +2224,106 @@ describe('runDrain', () => {
     expect(execution.sessionId).toBe('decided-session')
   })
 })
+
+function createEligibleInputs(overrides: {readonly isFork?: boolean} = {}): {
+  bootstrap: BootstrapPhaseResult
+  routing: RoutingPhaseResult
+} {
+  const bootstrap: BootstrapPhaseResult = {
+    ...createBootstrap(1_000, {delivery: 'file-convention', responseFilePath: '/tmp/fro-bot-response.md'}),
+    trustedHeadSha: 'a'.repeat(40),
+  }
+  const baseRouting = createRouting()
+  const routing: RoutingPhaseResult = {
+    ...baseRouting,
+    triggerResult: {
+      ...baseRouting.triggerResult,
+      context: {
+        ...baseRouting.triggerResult.context,
+        eventType: 'issue_comment',
+        eventName: 'issue_comment',
+        author: {login: 'maintainer', association: 'COLLABORATOR', isBot: false},
+      },
+    },
+    agentContext: {
+      ...baseRouting.agentContext,
+      eventName: 'issue_comment',
+      issueType: 'pr',
+      hydratedContext: {
+        type: 'pull_request',
+        headBranch: 'feature/brokered-fix',
+        isFork: overrides.isFork ?? false,
+      } as RoutingPhaseResult['agentContext']['hydratedContext'],
+    },
+  }
+  return {bootstrap, routing}
+}
+
+async function runAndGetPromptOptions(
+  inputs: ReturnType<typeof createEligibleInputs>,
+  plan?: Parameters<typeof runExecute>[6],
+) {
+  vi.mocked(executeOpenCode).mockResolvedValueOnce(
+    createAgentResult({success: true, exitCode: 0, error: null, llmError: null, sessionId: 'session-1'}),
+  )
+  await runExecute(
+    inputs.bootstrap,
+    inputs.routing,
+    createCacheRestore(),
+    createSessionPrep(),
+    createMetrics(),
+    0,
+    plan,
+  )
+  return vi.mocked(executeOpenCode).mock.calls[0]?.[0]
+}
+
+describe('runExecute brokered push prompt flag', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(executeOpenCode).mockReset()
+    mocks.resolveResponseDelivery.mockReturnValue({delivery: 'file-convention', credential: 'withhold'})
+    mocks.resolveOutputMode.mockReturnValue('branch-pr')
+    mocks.getInput.mockReturnValue('branch-pr')
+    mocks.searchSessions.mockResolvedValue([])
+  })
+
+  it('tells the prompt builder brokered push will run for an eligible same-repo PR mention', async () => {
+    // #given / #when
+    const promptOptions = await runAndGetPromptOptions(createEligibleInputs())
+
+    // #then
+    expect(promptOptions?.brokeredPushActive).toBe(true)
+  })
+
+  it('does not set the flag for a fork PR', async () => {
+    // #given / #when
+    const promptOptions = await runAndGetPromptOptions(createEligibleInputs({isFork: true}))
+
+    // #then
+    expect(promptOptions?.brokeredPushActive).toBe(false)
+  })
+
+  it('does not set the flag when the run is not file-convention delivery', async () => {
+    // #given an otherwise-eligible mention under model-gh delivery
+    const inputs = createEligibleInputs()
+    const bootstrap = {...inputs.bootstrap, delivery: 'model-gh' as const, responseFilePath: null}
+
+    // #when
+    const promptOptions = await runAndGetPromptOptions({...inputs, bootstrap})
+
+    // #then
+    expect(promptOptions?.brokeredPushActive).toBe(false)
+  })
+
+  it('uses the threaded plan instead of recomputing it', async () => {
+    // #given an eligible mention but a plan resolved once upstream as ineligible
+    const promptOptions = await runAndGetPromptOptions(createEligibleInputs(), {
+      eligible: false,
+      reason: 'decided upstream',
+    })
+
+    // #then the prompt follows the single upstream decision
+    expect(promptOptions?.brokeredPushActive).toBe(false)
+  })
+})

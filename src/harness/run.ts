@@ -28,6 +28,7 @@ import {assessInvocationOutcome} from './outcome.js'
 import {runAcknowledge} from './phases/acknowledge.js'
 import {runAcquireLock, type LeaseController} from './phases/acquire-lock.js'
 import {runBootstrap} from './phases/bootstrap.js'
+import {resolveBrokeredPushPlan} from './phases/brokered-push-plan.js'
 import {isCacheRestoreV2} from './phases/cache-restore-kind.js'
 import {runCacheRestore} from './phases/cache-restore.js'
 import {runCleanup} from './phases/cleanup.js'
@@ -267,7 +268,19 @@ export async function run(): Promise<number> {
     const sessionPrep = await runSessionPrep(bootstrap, routing, cacheRestore, metrics)
     attachmentResult = sessionPrep.attachmentResult
 
-    let execution = await runExecute(bootstrap, routing, cacheRestore, sessionPrep, metrics, startTime)
+    // The pre-run brokered-push decision, made once. It only gates the prompt bullet telling the agent the Action
+    // pushes its changes; finalize keeps its own, deliberately wider, decision so a failure to push stays loud.
+    const brokeredPushPlan = resolveBrokeredPushPlan(bootstrap, routing)
+
+    let execution = await runExecute(
+      bootstrap,
+      routing,
+      cacheRestore,
+      sessionPrep,
+      metrics,
+      startTime,
+      brokeredPushPlan,
+    )
     ownershipLedger = execution.ownershipLedger
     liveObservation = execution.liveObservation
     deferredSummary = execution.deferredSummary

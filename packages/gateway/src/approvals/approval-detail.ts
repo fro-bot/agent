@@ -33,10 +33,30 @@ export function boundApprovalDetail(value: string | undefined): string | undefin
   // untrusted callers may pass null).
   if (value == null) return undefined
 
-  // Strip control characters: U+0000–U+001F (includes \t, \n, \r) and U+007F.
-  // eslint-disable-next-line no-control-regex
-  const stripped = value.replaceAll(/[\u0000-\u001F\u007F]/g, '')
+  const stripped = stripControlCharacters(value)
 
   // Length-cap after stripping (stripping can only shorten, never lengthen).
   return stripped.length > APPROVAL_DETAIL_MAX_LENGTH ? stripped.slice(0, APPROVAL_DETAIL_MAX_LENGTH) : stripped
+}
+
+function stripControlCharacters(value: string): string {
+  // Strip control characters: U+0000–U+001F (includes \t, \n, \r) and U+007F.
+  // eslint-disable-next-line no-control-regex
+  return value.replaceAll(/[\u0000-\u001F\u007F]/g, '')
+}
+
+/**
+ * `true` when `boundApprovalDetail` cut the value by length, so part of what is being approved is hidden.
+ * Stripping control characters with no length cut hides nothing, so it does not count.
+ */
+export function isApprovalDetailTruncated(value: string | undefined): boolean {
+  return value != null && stripControlCharacters(value).length > APPROVAL_DETAIL_MAX_LENGTH
+}
+
+/** `true` when any detail the operator frame shows for a request (`command`, `filepath`) was cut by length. */
+export function isRequestDetailTruncated(request: {
+  readonly command?: string | undefined
+  readonly filepath?: string | undefined
+}): boolean {
+  return isApprovalDetailTruncated(request.command) || isApprovalDetailTruncated(request.filepath)
 }

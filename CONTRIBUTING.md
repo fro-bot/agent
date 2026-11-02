@@ -59,9 +59,9 @@ Example: `feat(setup): add --skip-auth flag`.
 Hooks are installed automatically on `bun install`:
 
 - **pre-commit** — runs `lint-staged` (ESLint `--fix` on staged files).
-- **pre-push** — syncs `node_modules` to the lockfile (`bun install --frozen-lockfile --ignore-scripts`), runs `bun run lint && bun run build`, then fails the push if the rebuilt `dist/` differs from `HEAD` (`git diff --ignore-space-at-eol --stat --exit-code HEAD -- dist/`).
+- **pre-push** — syncs `node_modules` to the lockfile (`bun install --frozen-lockfile --ignore-scripts`), rebuilds the Action bundle (`bun run --filter @fro-bot/action build && bun run dist:escape-hidden-unicode`), then fails the push if the rebuilt `dist/` differs from `HEAD` (`git diff --ignore-space-at-eol --stat --exit-code HEAD -- dist/`). A build against stale `node_modules` reproduces its own drift and looks clean locally, which is why it installs first.
 
-Run that same chain yourself before pushing to catch failures early — a build against stale `node_modules` reproduces its own drift and looks clean locally.
+The hook does not lint or type-check the whole repo; CI does. Run `bun run lint`, `bun run check-types` and `bun run test` yourself before pushing.
 
 ## Pull Requests
 

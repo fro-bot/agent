@@ -3,8 +3,8 @@
   extends: ['github>fro-bot/.github'],
   // Commit through the GitHub Contents API instead of the git CLI. The CLI path
   // runs local hooks, and `postinstall: simple-git-hooks` installs a pre-push
-  // hook that re-runs `lint && build` — repeating work postUpgradeTasks already
-  // did, at roughly two minutes per branch. The API path cannot run hooks at
+  // hook that rebuilds the Action bundle — repeating work postUpgradeTasks
+  // already did. The API path cannot run hooks at
   // all, and attributes commits to the App rather than a synthesized author.
   platformCommit: 'enabled',
   // dist/ is bundled vendor code (committed for the GitHub Action runtime).
@@ -172,6 +172,34 @@
         commands: ['bun install --ignore-scripts', 'bun run postupgrade', 'bun run build'],
         executionMode: 'branch',
       },
+    },
+    {
+      // `@opencode/plugin` pins `effect` at an exact version, and the plugin package imports `Schema` from `effect`
+      // directly. A different `effect` devDependency installs a second copy of effect v4 and breaks `tsc` with
+      // "Two different types with this name exist". `bun run postupgrade` (scripts/sync-opencode-plugin-effect.ts)
+      // copies the plugin's pin into packages/opencode-plugin's `effect` devDependency. It reads the installed
+      // manifest, so the first install brings in the bumped plugin and the second one regenerates bun.lock and the
+      // installed tree for the new `effect`. A rule-level `postUpgradeTasks` REPLACES the top-level one rather than
+      // merging with it, so the full list is repeated here on purpose. Every command must match the self-hosted
+      // runner's `allowedCommands` (pinned by scripts/renovate-v2-pin-postupgrade.test.ts).
+      matchFileNames: ['packages/opencode-plugin/package.json'],
+      matchPackageNames: ['@opencode/plugin'],
+      postUpgradeTasks: {
+        commands: [
+          'bun install --ignore-scripts',
+          'bun run postupgrade',
+          'bun install --ignore-scripts',
+          'bun run build',
+        ],
+        executionMode: 'branch',
+      },
+    },
+    {
+      // The plugin package's `effect` follows `@opencode/plugin`'s exact pin (rule above), never its own latest.
+      // `effect` v3 in other manifests keeps updating.
+      matchFileNames: ['packages/opencode-plugin/package.json'],
+      matchPackageNames: ['effect'],
+      enabled: false,
     },
     {
       // Cap Bun at 1.4.4. The build gate requires an exact match with upstream

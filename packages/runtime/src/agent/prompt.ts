@@ -33,6 +33,13 @@ import {
   type ResponseSurface,
 } from './response-file.js'
 
+/**
+ * Rendered in the file-convention Response Protocol only when the Action will actually broker a push for this
+ * invocation. The agent holds no push credentials; without this it runs `git push`, fails, and hedges in its reply.
+ */
+const BROKERED_PUSH_INSTRUCTION =
+  "- Commit your changes; the Action pushes them to the PR branch after the run. Don't run `git push`, and don't say whether the push landed — the result is added to your reply."
+
 export interface TriggerDirective {
   readonly directive: string
   readonly appendMode: boolean
@@ -195,6 +202,7 @@ function buildAgentContextSection(
   responseDelivery: ResponseDelivery,
   responseSurface: ResponseSurface,
   responseFilePath: string | null,
+  brokeredPushActive: boolean,
 ): string {
   const issueNum = context.issueNumber ?? '<number>'
   const hasResponseProtocol = context.issueNumber != null && responseMode !== 'none'
@@ -248,6 +256,7 @@ function buildAgentContextSection(
         responseDelivery,
         responseSurface,
         responseFilePath,
+        brokeredPushActive,
       ),
     )
   }
@@ -481,6 +490,7 @@ ${trimmedCustomPrompt}`,
         responseDelivery,
         responseSurface,
         responseFilePath,
+        options.brokeredPushActive === true,
       ),
     ),
   )
@@ -757,6 +767,7 @@ function buildResponseProtocolSection(
   responseDelivery: ResponseDelivery,
   responseSurface: ResponseSurface,
   responseFilePath: string | null,
+  brokeredPushActive: boolean,
 ): string {
   const issueNum = context.issueNumber ?? '<number>'
   const runSummaryBlock = `[Your response content here]
@@ -809,6 +820,7 @@ ${runSummaryBlock}
 `
         : ''
     const verdictExampleSection = verdictExample.length > 0 ? `\n${verdictExample}` : ''
+    const brokeredPushBullet = brokeredPushActive ? `\n${BROKERED_PUSH_INSTRUCTION}` : ''
 
     return `### Response Protocol (REQUIRED)
 This is the authoritative delivery contract for this run.
@@ -818,7 +830,7 @@ You MUST deliver exactly ONE response per invocation by writing it to the respon
 2. **Write to this exact path:** \`${responseFilePath ?? '<response file path>'}\`
 3. **Write SYNCHRONOUSLY, in the foreground.** Use a blocking command such as a heredoc (\`cat > "${responseFilePath ?? '<response file path>'}" <<'EOF' ... EOF\`). Do NOT background the write (no \`&\`, \`nohup\`, or \`disown\`) — a backgrounded write may not be flushed to disk before this run ends, and your response will be lost.
 4. **One write per run.** Write the file exactly once. Do not write it more than once.
-${verdictRule == null ? '' : `${verdictRule}\n`}${verdictRule == null ? 5 : 6}. **Include the Run Summary** at the end of the body (see template below), including the \`<!-- fro-bot-agent -->\` marker.
+${verdictRule == null ? '' : `${verdictRule}\n`}${verdictRule == null ? 5 : 6}. **Include the Run Summary** at the end of the body (see template below), including the \`<!-- fro-bot-agent -->\` marker.${brokeredPushBullet}
 
 **File Format (comment, no frontmatter):**
 ${runSummaryTemplate}${verdictExampleSection}`

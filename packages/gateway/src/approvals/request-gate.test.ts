@@ -472,7 +472,13 @@ function makeEntry(requestID: string, postDeadlineReply = vi.fn().mockResolvedVa
     requestID,
     sessionID: 'ses_1',
     scopeId: 'chan_1',
-    payload: {request: makeRequest(requestID), directory: '/ws', effects: {postReply: vi.fn()}, renderFn: null},
+    payload: {
+      request: makeRequest(requestID),
+      directory: '/ws',
+      effects: {postReply: vi.fn()},
+      rejectOnly: false,
+      renderFn: null,
+    },
     ops: {
       postDeadlineReply,
       renderDeadline: vi.fn().mockResolvedValue(undefined),

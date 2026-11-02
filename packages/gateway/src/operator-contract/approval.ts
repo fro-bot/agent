@@ -58,8 +58,13 @@ export type OperatorDecisionState =
  *
  * `pending` is NOT produced here — it is the implied pre-decision state (open
  * entry, no `DecisionOutcome`). This function only maps the 5 post-decision outcomes.
+ *
+ * `reject-only` is excluded: it refuses an approve on a request that cannot be shown in full, which settles nothing,
+ * so the decision route answers it with a 4xx error instead of a state.
  */
-export function toOperatorDecisionState(outcome: DecisionOutcome): Exclude<OperatorDecisionState, 'pending'> {
+export function toOperatorDecisionState(
+  outcome: Exclude<DecisionOutcome, 'reject-only'>,
+): Exclude<OperatorDecisionState, 'pending'> {
   switch (outcome) {
     case 'ok':
       return 'claimed'

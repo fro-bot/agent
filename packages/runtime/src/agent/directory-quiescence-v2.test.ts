@@ -1,6 +1,6 @@
 import type {Result} from '@bfra.me/es/result'
 import type {DirectoryObservation, DirectoryQuiescenceClient, InboxScope} from './directory-quiescence-v2.js'
-import type {V2CallError, V2ShellSummary} from './remote-client-v2.js'
+import type {V2CallError, V2InboxItemMeta, V2InboxSummary, V2ShellSummary} from './remote-client-v2.js'
 
 import {err, ok} from '@bfra.me/es/result'
 import {afterEach, describe, expect, it, vi} from 'vitest'
@@ -36,6 +36,8 @@ interface World {
   active: string[]
   shells: {id: string; status: V2ShellSummary['status']; owner: string | null}[]
   inbox: Record<string, number>
+  /** Metadata of the queued items per session, when a test is about it. */
+  inboxItems?: Record<string, V2InboxItemMeta[]>
   /** `time.updated` per session stored under DIR; a session not listed here was updated just after the run began. */
   updated?: Record<string, number>
   /** Sessions the server no longer has (a `getSession` or inbox read of one is a 404). */
@@ -146,7 +148,7 @@ function makeClient(
       }: {
         readonly sessionId: string
         readonly signal?: AbortSignal
-      }): Promise<Result<{queued: number}, V2CallError>> => {
+      }): Promise<Result<V2InboxSummary, V2CallError>> => {
         calls.push(`inbox:${sessionId}`)
         if (hooks.inboxHangs?.includes(sessionId) === true) {
           return new Promise<never>((_resolve, reject) => {
@@ -155,7 +157,8 @@ function makeClient(
         }
         if (hooks.inboxFails?.includes(sessionId) === true) return err({kind: 'network', message: 'down'})
         if (hooks.inboxMissing?.includes(sessionId) === true) return err({kind: 'http', status: 404})
-        return ok({queued: world.inbox[sessionId] ?? 0})
+        const items = world.inboxItems?.[sessionId]
+        return ok({queued: world.inbox[sessionId] ?? 0, ...(items === undefined ? {} : {items})})
       },
     ),
   }
@@ -227,6 +230,36 @@ describe('observeDirectoryV2', () => {
     expect(observation).toMatchObject({kind: 'active', activity: {queuedInbox: [{sessionId: CHILD, queued: 2}]}})
     expect(calls).toContain(`inbox:${ROOT}`)
     expect(calls).toContain(`inbox:${CHILD}`)
+  })
+
+  it('carries the metadata of the queued items, and omits it when the server sent none', async () => {
+    // #given
+    const world: World = {
+      sessions: [ROOT, CHILD],
+      active: [],
+      shells: [],
+      inbox: {[ROOT]: 1, [CHILD]: 1},
+      inboxItems: {[CHILD]: [{type: 'synthetic', delivery: 'steer', source: 'subagent'}]},
+    }
+    const {client} = makeClient(world)
+
+    // #when
+    const observation = await observeDirectoryV2({
+      client,
+      directory: DIR,
+      realpath: identityRealpath,
+      inbox: {...SCOPE, ownedSessionIds: () => [ROOT, CHILD]},
+    })
+
+    // #then
+    if (observation.kind !== 'active') throw new Error('expected activity')
+    const byId = Object.fromEntries(observation.activity.queuedInbox.map(entry => [entry.sessionId, entry]))
+    expect(byId[CHILD]).toEqual({
+      sessionId: CHILD,
+      queued: 1,
+      items: [{type: 'synthetic', delivery: 'steer', source: 'subagent'}],
+    })
+    expect(byId[ROOT]).toEqual({sessionId: ROOT, queued: 1})
   })
 
   it('reads the inbox of a session on a later page', async () => {
