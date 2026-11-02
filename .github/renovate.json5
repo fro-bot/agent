@@ -3,8 +3,8 @@
   extends: ['github>fro-bot/.github'],
   // Commit through the GitHub Contents API instead of the git CLI. The CLI path
   // runs local hooks, and `postinstall: simple-git-hooks` installs a pre-push
-  // hook that re-runs `lint && build` — repeating work postUpgradeTasks already
-  // did, at roughly two minutes per branch. The API path cannot run hooks at
+  // hook that rebuilds the Action bundle — repeating work postUpgradeTasks
+  // already did. The API path cannot run hooks at
   // all, and attributes commits to the App rather than a synthesized author.
   platformCommit: 'enabled',
   // dist/ is bundled vendor code (committed for the GitHub Action runtime).
