@@ -330,7 +330,8 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
     // The command is model-controlled text and stays out of the ledger label and the logs.
     ownershipLedger.adopt(key, 'background shell')
     if (noticedShellIds.has(shellId)) ownershipLedger.settle(key)
-    if (fresh) logger.info('Background shell adopted into ownership ledger', {sessionId, shellId})
+    // Foreground and background shells alike are adopted at start; only the tool result says which one this is.
+    if (fresh) logger.info('Shell adopted into ownership ledger', {sessionId, shellId})
   }
 
   /**
@@ -505,8 +506,13 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
           if (name === 'shell') {
             // Only a call that returned `running` outlives its call and sends a notice.
             const shellDispatch = readBackgroundShellDispatch(name, event)
-            if (shellDispatch !== null) adoptShell(shellDispatch.shellId)
-            else if (callShellId !== null) ownershipLedger.release(shellLedgerKey(callShellId))
+            if (shellDispatch !== null) {
+              adoptShell(shellDispatch.shellId)
+              logger.info('Background shell kept in ownership ledger', {sessionId, shellId: shellDispatch.shellId})
+            } else if (callShellId !== null) {
+              ownershipLedger.release(shellLedgerKey(callShellId))
+              logger.debug('Foreground shell released from ownership ledger', {sessionId, shellId: callShellId})
+            }
           }
         }
         return true

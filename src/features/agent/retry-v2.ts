@@ -49,6 +49,13 @@ import {createActivityTrackerV2, processEventStreamV2} from './streaming-v2.js'
 const TERMINAL_GRACE_MS = 500
 const TERMINAL_POLL_INTERVAL_MS = 10
 const BEFORE_ADMISSION_RETRY_MS = 250
+/**
+ * Bound on one call of the session-wait route. The route is a long poll: it answers when the session goes idle, which
+ * can be far longer than the HTTP client allows (its headers timeout is 300 s, and a request that hits it ends 499 and
+ * reads as a transport failure). Each call is therefore cut at this bound and asked again: a long poll that times out
+ * with no answer is not an error.
+ */
+export const WAIT_ROUTE_BOUND_MS = 60_000
 
 export type PromptStartResultV2 = (AttemptResult & {readonly sendUncertain?: boolean}) | null
 export type PromptStarterV2 = () => Promise<PromptStartResultV2>
@@ -78,6 +85,33 @@ export interface RunPromptAttemptV2Options {
   readonly poll?: Pick<PollOptionsV2, 'initialActivityTimeoutMs' | 'pollIntervalMs' | 'restEveryTicks'>
   /** Test seam: cadence of the live reconcile tick. */
   readonly reconcileIntervalMs?: number
+  /** Test seam: the bound on one call of the session-wait route. Defaults to `WAIT_ROUTE_BOUND_MS`. */
+  readonly waitBoundMs?: number
+}
+
+/** The run's signal plus a bound of its own for one wait call. `expired()` says the bound, not the run, ended it. */
+function boundWaitCall(
+  parent: AbortSignal,
+  ms: number,
+): {readonly signal: AbortSignal; readonly expired: () => boolean; readonly release: () => void} {
+  const controller = new AbortController()
+  let fired = false
+  const abortWithParent = (): void => controller.abort()
+  if (parent.aborted) controller.abort()
+  else parent.addEventListener('abort', abortWithParent, {once: true})
+  const timer = setTimeout(() => {
+    fired = true
+    controller.abort()
+  }, ms)
+  timer.unref()
+  return {
+    signal: controller.signal,
+    expired: () => fired,
+    release: () => {
+      clearTimeout(timer)
+      parent.removeEventListener('abort', abortWithParent)
+    },
+  }
 }
 
 async function startSessionWaitV2(options: {
@@ -88,8 +122,9 @@ async function startSessionWaitV2(options: {
   readonly signal: AbortSignal
   readonly deadline?: ExecutionDeadline
   readonly ownershipLedger?: OwnershipLedger
+  readonly boundMs?: number
 }): Promise<V2WaitObservation> {
-  const {client, sessionId, tracker, logger, signal, deadline, ownershipLedger} = options
+  const {client, sessionId, tracker, logger, signal, deadline, ownershipLedger, boundMs = WAIT_ROUTE_BOUND_MS} = options
   const delay = async (ms: number): Promise<void> => {
     if (deadline === undefined) await waitForAbortableDelay(ms, signal)
     else await deadline.run(async () => waitForAbortableDelay(ms, signal), 'v2 session wait delay')
@@ -97,12 +132,25 @@ async function startSessionWaitV2(options: {
 
   try {
     while (!signal.aborted) {
-      const response =
-        deadline === undefined
-          ? await client.waitSession({sessionId, signal})
-          : await deadline.run(async () => client.waitSession({sessionId, signal}), 'v2 session wait')
+      const call = boundWaitCall(signal, boundMs)
+      let response: Awaited<ReturnType<typeof client.waitSession>>
+      try {
+        response =
+          deadline === undefined
+            ? await client.waitSession({sessionId, signal: call.signal})
+            : await deadline.run(async () => client.waitSession({sessionId, signal: call.signal}), 'v2 session wait')
+      } finally {
+        call.release()
+      }
       if (!response.success) {
-        logger.debug('v2 session wait returned an error, relying on the poll watchdog', {
+        // Our own bound ending the call with no answer: the long poll simply timed out. Ask again.
+        if (response.error.kind === 'aborted' && call.expired() && !signal.aborted) {
+          logger.debug('v2 session wait bound elapsed with no answer; asking again', {sessionId, boundMs})
+          continue
+        }
+        // A real failure: an HTTP error status, or a transport failure that was not our bound. Info, not debug, so the
+        // switch to polling shows in the Actions log.
+        logger.info('v2 session wait failed; relying on the poll watchdog for completion', {
           sessionId,
           error: response.error.kind,
         })
@@ -321,6 +369,7 @@ export async function runPromptAttemptV2(options: RunPromptAttemptV2Options): Pr
       tracker,
       logger,
       signal: waitSignal,
+      ...(options.waitBoundMs === undefined ? {} : {boundMs: options.waitBoundMs}),
       ...(deadline === undefined ? {} : {deadline}),
       ...(ownershipLedger === undefined ? {} : {ownershipLedger}),
     })

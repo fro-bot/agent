@@ -453,6 +453,89 @@ describe('releaseRunV2', () => {
     expect(shutdown).toHaveBeenCalledTimes(1)
   })
 
+  describe('the release verdict line', () => {
+    const verdictCalls = (logger: unknown) =>
+      vi
+        .mocked((logger as ReturnType<typeof createMockLogger>).info)
+        .mock.calls.filter(([message]) => message === 'Run release verdict')
+
+    it('logs one line on a clean path, before the pre-shutdown step', async () => {
+      // #given a quiet directory and a pre-shutdown step that notes when it ran
+      const server = createServer()
+      const {options} = release(server)
+      let verdictsBeforeStep = -1
+      const withStep: ReleaseRunOptions = {
+        ...options,
+        beforeShutdown: async () => {
+          verdictsBeforeStep = verdictCalls(options.logger).length
+        },
+      }
+
+      // #when
+      await releaseRunV2(withStep)
+
+      // #then exactly one verdict, logged ahead of the summary write
+      expect(verdictsBeforeStep).toBe(1)
+      expect(verdictCalls(options.logger)).toHaveLength(1)
+      expect(verdictCalls(options.logger)[0]?.[1]).toEqual({
+        drain: 'quiet',
+        stopped: false,
+        quiet: true,
+        readings: FAST.requiredObservations,
+        quietStreak: FAST.requiredObservations,
+        shellsDeleted: 0,
+        sessionsInterrupted: 0,
+        unknownCount: 0,
+      })
+    })
+
+    it('counts the shells deleted and sessions interrupted by a stop', async () => {
+      // #given a failed run with a shell running and the root active
+      const server = createServer()
+      server.state.shells.set(SHELL, {owner: ROOT})
+      server.state.active.add(ROOT)
+      server.state.wakeOwnerOnShellDelete = true
+      const {options} = release(server, {executionSucceeded: false})
+
+      // #when
+      await releaseRunV2(options)
+
+      // #then
+      expect(verdictCalls(options.logger)).toHaveLength(1)
+      expect(verdictCalls(options.logger)[0]?.[1]).toMatchObject({
+        drain: 'not-attempted',
+        stopped: true,
+        quiet: true,
+        shellsDeleted: 1,
+        sessionsInterrupted: 1,
+        unknownCount: 0,
+      })
+      expect(verdictCalls(options.logger)[0]?.[1]).not.toHaveProperty('declineReason')
+    })
+
+    it('names the decline reason and the unknown entries when quiet cannot be confirmed', async () => {
+      // #given a stop that never lands
+      const server = createServer()
+      server.state.active.add(ROOT)
+      server.state.interruptsLand = false
+      const ledger = createOwnershipLedger()
+      ledger.adopt(CHILD, 'child')
+      const {options} = release(server, {executionSucceeded: false, ledger, stopTimeoutMs: 200})
+
+      // #when
+      await releaseRunV2(options)
+
+      // #then
+      expect(verdictCalls(options.logger)).toHaveLength(1)
+      expect(verdictCalls(options.logger)[0]?.[1]).toMatchObject({
+        quiet: false,
+        quietStreak: 0,
+        unknownCount: 1,
+        declineReason: expect.stringContaining('could not be confirmed quiet') as unknown,
+      })
+    })
+  })
+
   it('stops the directory when the drain runs out, and reports the stop, not the drain, as the verdict', async () => {
     // #given a child that is live until the stop interrupts it
     const server = createServer()

@@ -1,3 +1,5 @@
+import v2PinFile from './opencode-v2-pin.json'
+
 // Storage paths
 export const OPENCODE_STORAGE_PATH = '~/.local/share/opencode/storage' as const
 export const OPENCODE_AUTH_PATH = '~/.local/share/opencode/auth.json' as const
@@ -52,11 +54,12 @@ export const DEFAULT_MODEL = {
 } as const
 
 // Setup consolidation defaults
-// DEFAULT_OPENCODE_VERSION is the harness build: a fro-bot/agent release that bundles
-// the stock OpenCode binary with verified SHA256SUMS. Downloaded from fro-bot/agent
-// releases, checksum-verified, and fail-closed on mismatch — no silent stock fallback.
-// FALLBACK_VERSION (in opencode.ts) is the plain stock base used when latest-fetch fails.
-export const DEFAULT_OPENCODE_VERSION = '1.19.4+harness.5bde2635'
+// DEFAULT_OPENCODE_VERSION is the stock OpenCode V2 pin, read from opencode-v2-pin.json: the one place the
+// version and the per-asset sha256 digests are recorded (Renovate bumps it and regenerates the digests; the
+// workspace Dockerfile reads the same file). A V2 install succeeds only against those digests. The V1 harness
+// build is no longer the default; a consumer can still select it by pinning `opencode-version` to the harness
+// build.
+export const DEFAULT_OPENCODE_VERSION: string = v2PinFile.version
 export const DEFAULT_SYSTEMATIC_VERSION = '3.29.0'
 
 // Systematic for OpenCode V2. 3.27.x loads on both V1 and V2, so the V2 path installs DEFAULT_SYSTEMATIC_VERSION too

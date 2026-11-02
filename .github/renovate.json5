@@ -15,17 +15,6 @@
   ignorePaths: ['dist/**'],
   customManagers: [
     {
-      // Tracks the stock OpenCode fallback pin (FALLBACK_VERSION in
-      // src/services/setup/opencode.ts). The action default is the harness
-      // build, maintained by harness-release.yaml on publish — not Renovate.
-      customType: 'regex',
-      managerFilePatterns: ['/src\\/services\\/setup\\/opencode\\.ts/'],
-      matchStrings: ["FALLBACK_VERSION = '(?<currentValue>\\d+\\.\\d+\\.\\d+)'"],
-      depNameTemplate: 'anomalyco/opencode',
-      datasourceTemplate: 'github-releases',
-      extractVersionTemplate: '^v?(?<version>.*)$',
-    },
-    {
       // Tracks the harness base release pin in packages/harness/harness.config.json.
       // Retargeted from the deleted base-version.ts sentinel to the canonical config source.
       customType: 'regex',
@@ -154,9 +143,11 @@
       semanticCommitType: 'build',
     },
     {
-      // Cap OpenCode at the validated release. OpenCode ships breaking changes in
-      // patch releases, so moves past the validated release must be deliberate and
-      // reviewed. Raise after validating a newer release.
+      // Cap the V1 line at the validated release: the harness base_version
+      // (packages/harness/harness.config.json) and the V1 SDK. OpenCode ships breaking
+      // changes in patch releases, so moves past the validated release must be deliberate
+      // and reviewed. Raise after validating a newer release. The Action default derives
+      // from the V2 pin file below, so this cap no longer touches it.
       matchPackageNames: ['@opencode-ai/sdk', 'anomalyco/opencode'],
       allowedVersions: '<=1.19.4',
     },

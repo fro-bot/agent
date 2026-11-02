@@ -40,12 +40,12 @@ Add an `OPENCODE_AUTH_JSON` secret (Settings → Secrets and variables → Actio
 
 ```json
 {
-  "anthropic": {"apiKey": "sk-ant-api-..."},
-  "openai": {"apiKey": "sk-..."}
+  "anthropic": {"type": "api", "key": "sk-ant-api-..."},
+  "openai": {"type": "api", "key": "sk-..."}
 }
 ```
 
-Any provider OpenCode supports works here — see the [OpenCode docs](https://opencode.ai/docs/).
+Each entry is an API key: `{"type": "api", "key": "..."}`. Any provider OpenCode supports works here — see the [OpenCode docs](https://opencode.ai/docs/).
 
 ### 2. Add the workflow
 
@@ -193,7 +193,7 @@ A few inputs most workflows touch:
 | `agent` | No | — | Agent to use (a primary agent, not a subagent). Defaults to OpenCode's built-in `build` agent |
 | `model` | No | — | Model override in `provider/model` format |
 | `timeout` | No | `1800000` | OpenCode execution timeout in milliseconds; Action-internal only, not the job timeout (`0` = no Action-internal deadline) |
-| `opencode-version` | No | Source-pinned | OpenCode CLI version to install. An existing opencode is reused only when it reports exactly this version (the `-harness.` and `+harness.` spellings are equivalent); otherwise the pinned build is installed. |
+| `opencode-version` | No | Source-pinned (stock OpenCode V2) | OpenCode CLI version to install. The default, and `latest`, is the stock OpenCode V2 release pinned in the Action (digest-verified); V2 installs only that pinned version. A harness build (`1.19.4+harness.5bde2635`) or a V1 version still installs when pinned explicitly. An existing opencode is reused only when it reports exactly this version (the `-harness.` and `+harness.` spellings are equivalent); otherwise the pinned build is installed. |
 | `systematic-version` | No | Source-pinned | Systematic plugin version to register |
 | `skip-cache` | No | `false` | Skip session cache restore |
 | `opencode-config` | No | — | JSON deep-merged into the OpenCode config |
@@ -238,6 +238,17 @@ GitHub Actions cache is the default backend when S3 is disabled. Set `s3-backup:
 ```
 
 For Cloudflare R2, Backblaze B2, or MinIO, set `s3-endpoint` and `s3-sse-encryption: AES256` (see the S3 inputs above and [`action.yaml`](action.yaml)). Credentials must come from env vars or IAM roles, never action inputs; the principal needs `s3:GetObject`, `s3:PutObject`, and `s3:DeleteObject` on the scoped object-key prefix, plus `s3:ListBucket` on the bucket constrained to that prefix. The [Setup and Configuration](docs/wiki/Setup%20and%20Configuration.md) deep dive covers the cache and storage strategy in full.
+
+## Moving to OpenCode V2
+
+The Action now runs stock [OpenCode V2](https://opencode.ai/) by default instead of the patched harness build. This is a breaking change for workflows that leave `opencode-version` unset.
+
+- **`auth-json`**: only `{"type": "api", "key": "..."}` entries are accepted. An old `{"apiKey": "..."}` entry, or an `oauth`/`wellknown` entry, fails setup.
+- **`opencode-config`**: `permission`, `tools`, `autoupdate` and `subagent_depth` are stripped with a warning, not translated.
+- **Session history**: the first V2 run imports your V1 session history, waiting up to 300 seconds. V2 saves only to its own cache and S3 keys, so the V1 data is left untouched.
+- **Rollback**: pin `opencode-version` to the V1 harness build (`1.19.4+harness.5bde2635`). A V1 run does not see sessions created on V2.
+
+See [Setup and Configuration](docs/wiki/Setup%20and%20Configuration.md) for how the version is resolved and verified.
 
 ## Repository Structure
 

@@ -130,6 +130,13 @@ export interface FakeServerOptions {
   readonly subscribeResults?: readonly (V2CallError | null)[]
   /** `waitSession` resolves only when this resolves; default resolves at once. */
   readonly waitGate?: Promise<void>
+  /** Overrides `waitSession` entirely: the 1-based call number and the signal of the call. */
+  readonly waitResponder?: (
+    call: number,
+    signal: AbortSignal | undefined,
+  ) => Promise<
+    {readonly success: true; readonly data: undefined} | {readonly success: false; readonly error: V2CallError}
+  >
   readonly interruptResult?: {readonly interrupted: boolean}
   /**
    * What `GET /api/session/:id/message` answers, per call (the last entry repeats). A failed prompt whose request the
@@ -168,6 +175,7 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
   const order: string[] = []
   let promptCount = 0
   let subscribeCount = 0
+  let waitCount = 0
 
   const ok = <T>(data: T): {readonly success: true; readonly data: T} => ({success: true, data})
   const fail = (error: V2CallError): {readonly success: false; readonly error: V2CallError} => ({success: false, error})
@@ -215,7 +223,9 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
     updateSession: vi.fn(async (_input: unknown) => ok(undefined)),
     switchAgent: vi.fn(async (_input: unknown) => ok(undefined)),
     switchModel: vi.fn(async (_input: unknown) => ok(undefined)),
-    waitSession: vi.fn(async (_input: unknown) => {
+    waitSession: vi.fn(async (input: {signal?: AbortSignal}) => {
+      waitCount += 1
+      if (options.waitResponder !== undefined) return options.waitResponder(waitCount, input.signal)
       if (options.waitGate !== undefined) await options.waitGate
       return ok(undefined)
     }),

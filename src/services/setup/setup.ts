@@ -16,13 +16,12 @@ import {parseProviderKeysV2} from './credential-files-v2.js'
 import {configureGhAuth, configureGitIdentity} from './gh-auth.js'
 import {defaultOpenCodeConfigDir} from './no-task-reuse-config.js'
 import {
-  FALLBACK_VERSION,
-  getLatestVersion,
   getPlatformInfo,
   installOpenCode,
   isStockV2Pin,
   opencodeBinaryPath,
   RECORDED_V2_PIN,
+  resolveRequestedVersion,
   resolveStockV2Policy,
   toolCacheVersion,
 } from './opencode.js'
@@ -64,18 +63,9 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
       return null
     }
 
-    // Determine OpenCode version
-    let version = inputs.opencodeVersion
-    if (version === 'latest') {
-      try {
-        version = await getLatestVersion(logger)
-      } catch (error) {
-        logger.warning('Failed to get latest version, using fallback', {
-          error: toErrorMessage(error),
-        })
-        version = FALLBACK_VERSION
-      }
-    }
+    // Determine OpenCode version. `latest` is the recorded V2 pin: no upstream lookup, so it cannot resolve to an
+    // unverified release. An explicit version (a V2 pin, a V1 harness build, a stock V1) is used as given.
+    const version = resolveRequestedVersion(inputs.opencodeVersion)
 
     // A stock V2 pin is checked against the recorded pin BEFORE any cache is consulted, and every
     // reusable V2 installation is keyed by the recorded digest. An unpinned version, a platform with
