@@ -6,7 +6,7 @@
 
 import type {OwnershipLedger} from '@fro-bot/runtime'
 
-import {createOwnershipLedger, ok} from '@fro-bot/runtime'
+import {createOwnershipLedger, createRemoteOpenCodeV2Client, DRAIN_WAITING_MESSAGE, ok} from '@fro-bot/runtime'
 import {SUBAGENT_FOREGROUND_SUCCESS_FRAME} from '@fro-bot/runtime/event-v2-fixtures'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
@@ -890,5 +890,199 @@ describe('runOpenCodeCoreV2: a notice that cannot be read', () => {
     expect(states(ledger)).toEqual({[CHILD]: 'outstanding'})
     run.close()
     await vi.advanceTimersByTimeAsync(20_000)
+  })
+})
+
+/** The root finished with no background work, then a queued inbox item that never wakes it shows up. */
+async function idleWithQueuedItem(
+  options: Parameters<typeof startWindowedRun>[0] = {},
+): Promise<ReturnType<typeof startWindowedRun>> {
+  const run = startWindowedRun({shellServer: {inbox: {[ROOT]: 1}}, ...options})
+  await vi.advanceTimersByTimeAsync(10)
+  run.emit(frames.started(), frames.delta('OK'), frames.succeeded())
+  await vi.advanceTimersByTimeAsync(10)
+  return run
+}
+
+describe('runOpenCodeCoreV2: drain progress logging (#2005)', () => {
+  /** Info lines with this message: `[fields, message]` pairs of the pino-shaped logger. */
+  const waitingLines = (run: ReturnType<typeof startWindowedRun>) =>
+    vi.mocked(run.logger.info).mock.calls.filter(([, message]) => message === DRAIN_WAITING_MESSAGE)
+
+  it('logs what the drain waits on once, not once per reading', async () => {
+    // #given a root that finished, and a queued inbox item that never wakes it
+    const controller = new AbortController()
+    const run = await idleWithQueuedItem({controller})
+
+    // #when the gate reads the directory for a while
+    await vi.advanceTimersByTimeAsync(20_000)
+
+    // #then many readings, one info line, naming the session and the count
+    expect(vi.mocked(run.shellServer.listSessionInbox).mock.calls.length).toBeGreaterThan(10)
+    const lines = waitingLines(run)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]?.[0]).toMatchObject({
+      sessionId: ROOT,
+      sessions: {count: 0, ids: []},
+      shells: {count: 0, ids: []},
+      inbox: {count: 1, items: [{sessionId: ROOT, queued: 1}]},
+      readings: expect.any(Number) as unknown,
+      elapsedMs: expect.any(Number) as unknown,
+    })
+
+    controller.abort()
+    await vi.advanceTimersByTimeAsync(20_000)
+  })
+
+  it('logs a heartbeat about every 60 s while the same item stays queued', async () => {
+    // #given
+    const controller = new AbortController()
+    const run = await idleWithQueuedItem({controller})
+
+    // #when
+    await vi.advanceTimersByTimeAsync(185_000)
+
+    // #then one line for the change, then one a minute, each with its elapsed time
+    const lines = waitingLines(run)
+    expect(lines).toHaveLength(4)
+    const elapsed = lines.map(([fields]) => (fields as {elapsedMs: number}).elapsedMs)
+    expect(elapsed[1]).toBeGreaterThanOrEqual(60_000)
+    expect(elapsed[1]).toBeLessThan(62_000)
+    expect(elapsed[3]).toBeGreaterThanOrEqual(180_000)
+
+    controller.abort()
+    await vi.advanceTimersByTimeAsync(20_000)
+  })
+
+  it('logs ids and closed-set fields only: no message text or command text from a queued item', async () => {
+    // #given a queued item that carries text and a command
+    const controller = new AbortController()
+    const run = startWindowedRun({controller})
+    vi.mocked(run.shellServer.listSessionInbox).mockImplementation(async ({sessionId}) => {
+      const item = {
+        type: 'synthetic',
+        source: 'shell',
+        text: 'SECRET-MESSAGE-TEXT',
+        command: 'SECRET-COMMAND rm -rf /',
+      } as const
+      return ok({queued: sessionId === ROOT ? 1 : 0, ...(sessionId === ROOT ? {items: [item]} : {})})
+    })
+    await vi.advanceTimersByTimeAsync(10)
+    run.emit(frames.started(), frames.delta('OK'), frames.succeeded())
+    await vi.advanceTimersByTimeAsync(5_000)
+
+    // #then
+    const lines = waitingLines(run)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]?.[0]).toMatchObject({
+      inbox: {items: [{sessionId: ROOT, queued: 1, items: [{type: 'synthetic', source: 'shell'}]}]},
+    })
+    expect(JSON.stringify(vi.mocked(run.logger.info).mock.calls)).not.toContain('SECRET')
+
+    controller.abort()
+    await vi.advanceTimersByTimeAsync(20_000)
+  })
+
+  it('names no string a caller chose, on the progress line or the deadline line: a metadata source on a user or synthetic item', async () => {
+    // #given an inbox read by the real client, whose items carry a token-shaped source next to allowlisted fields
+    const hostile = createRemoteOpenCodeV2Client({
+      baseUrl: 'http://example.invalid',
+      fetch: async () =>
+        new Response(
+          JSON.stringify({
+            data: [
+              {type: 'user', delivery: 'queue', payload: {text: 'T', metadata: {source: 'PrivateCustomer'}}},
+              {type: 'synthetic', delivery: 'steer', payload: {text: 'T', metadata: {source: 'PrivateCustomer'}}},
+              {type: 'Tenant42', delivery: 'AcmeDelivery', payload: {text: 'T'}},
+            ],
+          }),
+          {status: 200, headers: {'content-type': 'application/json'}},
+        ),
+    })
+    const controller = new AbortController()
+    const run = startWindowedRun({controller})
+    vi.mocked(run.shellServer.listSessionInbox).mockImplementation(async ({sessionId}) =>
+      sessionId === ROOT ? hostile.listSessionInbox({sessionId}) : ok({queued: 0}),
+    )
+    await vi.advanceTimersByTimeAsync(10)
+    run.emit(frames.started(), frames.delta('OK'), frames.succeeded())
+    await vi.advanceTimersByTimeAsync(5_000)
+
+    // #when the run's deadline passes with the items still queued
+    controller.abort()
+    await vi.advanceTimersByTimeAsync(20_000)
+
+    // #then the kinds are named on the progress line and the deadline line, the caller's strings on no line
+    const lines = waitingLines(run)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]?.[0]).toMatchObject({
+      inbox: {
+        items: [
+          {
+            sessionId: ROOT,
+            queued: 3,
+            items: [
+              {type: 'user', delivery: 'queue'},
+              {type: 'synthetic', delivery: 'steer', source: 'other'},
+              {type: 'other', delivery: 'other'},
+            ],
+          },
+        ],
+      },
+    })
+    const expired = vi
+      .mocked(run.logger.warn)
+      .mock.calls.filter(([, message]) => String(message).includes('drain deadline expired'))
+    expect(expired).toHaveLength(1)
+    expect(expired[0]?.[0]).toHaveProperty('blocking')
+    const everyLine = Object.values(run.logger as unknown as Record<string, {mock?: {calls: unknown[]}}>).map(
+      method => method.mock?.calls ?? [],
+    )
+    expect(JSON.stringify(everyLine)).not.toMatch(/PrivateCustomer|Tenant42|AcmeDelivery/)
+  })
+
+  it('names the blocking set on the deadline line when the drain expires unquiet', async () => {
+    // #given
+    const controller = new AbortController()
+    const run = await idleWithQueuedItem({controller})
+    await vi.advanceTimersByTimeAsync(5_000)
+
+    // #when the run's deadline passes
+    controller.abort()
+    await vi.advanceTimersByTimeAsync(20_000)
+
+    // #then the failure line itself names the blocker
+    expect(failure(run).kind).toBe('drain-timeout')
+    const expired = vi
+      .mocked(run.logger.warn)
+      .mock.calls.filter(([, message]) => String(message).includes('drain deadline expired'))
+    expect(expired).toHaveLength(1)
+    expect(expired[0]?.[0]).toMatchObject({
+      blocking: {
+        sessions: {count: 0, ids: []},
+        shells: {count: 0, ids: []},
+        inbox: {count: 1, items: [{sessionId: ROOT, queued: 1}]},
+      },
+    })
+  })
+
+  it('leaves the blocking set off the deadline line when the directory never showed activity', async () => {
+    // #given a child the ledger waits on: the gate never reads the directory
+    const ledger = createOwnershipLedger()
+    const controller = new AbortController()
+    const run = startWindowedRun({ownershipLedger: ledger, controller, active: [CHILD], children: [CHILD]})
+    await vi.advanceTimersByTimeAsync(10)
+    await dispatchAndIdle(run)
+
+    // #when
+    controller.abort()
+    await vi.advanceTimersByTimeAsync(20_000)
+
+    // #then
+    const expired = vi
+      .mocked(run.logger.warn)
+      .mock.calls.filter(([, message]) => String(message).includes('drain deadline expired'))
+    expect(expired).toHaveLength(1)
+    expect(expired[0]?.[0]).not.toHaveProperty('blocking')
   })
 })
