@@ -276,6 +276,12 @@ Per-run errors are logged and the sweep continues — one corrupted record does 
 
 When the workspace OpenCode config sets any tool to `ask` (rather than the default `allow`), OpenCode will pause execution and emit a `permission.asked` event before running that tool. The gateway intercepts these events and presents an interactive Discord approval prompt.
 
+**Approvals steer a cooperating model; they are not a security boundary.** The security boundary is the workspace container, uid 10001 and the egress allowlist. On OpenCode V2 (2.2.5, probed in #1970):
+- `external_directory` on `shell` covers only the working directory and literal `cd`/`pushd` targets, so `cat /outside/path` runs with no ask. Upstream documents the scan as best effort.
+- A tool process runs as the same uid as the server. It can read the server's password and reply to its own ask, or write a saved permission into the spawn's `opencode.db`, which upstream reads on every ask.
+
+Don't describe an approval as protecting anything an uncooperative model could reach with a shell. A real outside-checkout boundary needs OS-level tool isolation.
+
 **How it works:**
 
 - Each `permission.asked` event creates a Discord embed with Approve / Deny buttons in the run thread.

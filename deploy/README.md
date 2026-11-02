@@ -661,7 +661,9 @@ The gateway and workspace images must roll together, for the same reason as the 
 
 The gateway runs in **`approval-required` mode by default**: when OpenCode requests permission to use a tool, the gateway posts an Approve / Deny embed in the run thread and the run pauses until a Discord button-click is received or the approval deadline fires. This is the only supported mode — there is no global auto-approve path.
 
-> **Warning:** Do not add global `allow` rules for high-risk tools (`bash`, `edit`, `task`, `external_directory`) to the workspace OpenCode config. Doing so bypasses the gateway approval boundary and allows those tools to run without any Discord prompt, regardless of the gateway's approval mode.
+> **Warning:** Do not add global `allow` rules for high-risk tools (`bash`, `edit`, `task`, `external_directory`) to the workspace OpenCode config. Doing so removes the Discord prompt for those tools, regardless of the gateway's approval mode.
+
+Approvals steer a cooperating model; they are not a security boundary. A shell command can reach paths outside the checkout without triggering an `external_directory` ask, and a tool runs as the same uid as the OpenCode server. The security boundary is the workspace container, its uid and the egress allowlist.
 
 The workspace OpenCode config is supplied via `WORKSPACE_OPENCODE_CONFIG` (in `deploy/.env`) as a JSON object shallow-merged over the base config. You can configure per-tool permission defaults there:
 
