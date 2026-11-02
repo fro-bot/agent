@@ -1,6 +1,7 @@
 import type {Octokit} from '../../services/github/types.js'
-import type {ExecAdapter} from '../../services/setup/types.js'
+import type {ExecAdapter, ExecOptions} from '../../services/setup/types.js'
 
+import {Buffer} from 'node:buffer'
 import {beforeEach, describe, expect, it, vi, type Mock} from 'vitest'
 import {createMockOctokit} from '../../services/github/test-helpers.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
@@ -159,14 +160,17 @@ describe('runBrokeredPush', () => {
       const tipSha = 'c'.repeat(40)
       const execAdapter: ExecAdapter = {
         exec: vi.fn().mockResolvedValue(0),
-        getExecOutput: vi.fn(async (_command: string, args?: string[]) => ({
-          stdout:
-            args?.includes('rev-list') === true
-              ? `${tipSha}\n`
-              : 'fix: handle empty input [skip ci]\n\nCo-authored-by: X <x@y.z>\n',
-          stderr: '',
-          exitCode: 0,
-        })),
+        getExecOutput: vi.fn().mockResolvedValue({stdout: '', stderr: '', exitCode: 0}),
+        execWithTimeout: vi.fn(
+          async (_command: string, args?: string[], _timeoutMs?: number, options?: ExecOptions) => {
+            const stdout =
+              args?.includes('rev-list') === true
+                ? `${tipSha}\n`
+                : 'fix: handle empty input [skip ci]\n\nCo-authored-by: X <x@y.z>\n'
+            options?.listeners?.stdout?.(Buffer.from(stdout))
+            return 0
+          },
+        ),
       }
       const createCommit = createCommitMock()
 

@@ -1,9 +1,15 @@
-import type {ExecAdapter} from '../../services/setup/types.js'
+import type {ExecAdapter, ExecOptions} from '../../services/setup/types.js'
 
 import {Buffer} from 'node:buffer'
+import {execFileSync} from 'node:child_process'
+import {mkdtempSync, rmSync} from 'node:fs'
+import {tmpdir} from 'node:os'
+import path from 'node:path'
 import {describe, expect, it, vi} from 'vitest'
+import {createExecAdapter} from '../../services/setup/adapters.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {
+  COMMIT_MESSAGE_LOOKUP_TIMEOUT_MS,
   MAX_COMMIT_BODY_BYTES,
   MAX_COMMIT_SUBJECT_LENGTH,
   resolveBrokeredPushCommitMessage,
@@ -203,20 +209,26 @@ interface FakeGitOptions {
 
 function createFakeExecAdapter(options: FakeGitOptions = {}): {
   adapter: ExecAdapter
-  getExecOutput: ReturnType<typeof vi.fn>
+  execWithTimeout: ReturnType<typeof vi.fn>
 } {
-  const getExecOutput = vi.fn(async (_command: string, args?: string[]) => {
-    const subcommand = (args ?? []).find(arg => arg === 'rev-list' || arg === 'log')
-    const source = subcommand === 'rev-list' ? options.revList : options.log
-    return {stdout: source?.stdout ?? '', stderr: '', exitCode: source?.exitCode ?? 0}
-  })
-  return {adapter: {exec: vi.fn().mockResolvedValue(0), getExecOutput}, getExecOutput}
+  const execWithTimeout = vi.fn(
+    async (_command: string, args: string[] | undefined, _timeoutMs: number, execOptions?: ExecOptions) => {
+      const subcommand = (args ?? []).find(arg => arg === 'rev-list' || arg === 'log')
+      const source = subcommand === 'rev-list' ? options.revList : options.log
+      execOptions?.listeners?.stdout?.(Buffer.from(source?.stdout ?? ''))
+      return source?.exitCode ?? 0
+    },
+  )
+  return {
+    adapter: {exec: vi.fn().mockResolvedValue(0), execWithTimeout, getExecOutput: vi.fn()},
+    execWithTimeout,
+  }
 }
 
 describe('resolveBrokeredPushCommitMessage', () => {
   it('uses the sanitized tip commit message when the agent made commits', async () => {
     // #given
-    const {adapter, getExecOutput} = createFakeExecAdapter({
+    const {adapter, execWithTimeout} = createFakeExecAdapter({
       revList: {stdout: `${TIP_SHA}\n`},
       log: {stdout: 'fix: repair the parser [skip ci]\n\nDetails.\n\nCo-authored-by: X <x@y.z>\n'},
     })
@@ -232,7 +244,7 @@ describe('resolveBrokeredPushCommitMessage', () => {
 
     // #then the message comes from the tip commit via argv-form git, with no shell string
     expect(message).toBe('fix: repair the parser\n\nDetails.')
-    const calls = getExecOutput.mock.calls as unknown as [string, string[]][]
+    const calls = execWithTimeout.mock.calls as unknown as [string, string[]][]
     expect(calls.every(([command]) => command === 'git')).toBe(true)
     expect(calls[0]?.[1]).toContain(`${TRUSTED_HEAD_SHA}..HEAD`)
     expect(calls[1]?.[1]).toEqual(expect.arrayContaining(['log', '-1', '--format=%B', TIP_SHA]))
@@ -240,7 +252,7 @@ describe('resolveBrokeredPushCommitMessage', () => {
 
   it('uses the fallback when the agent made no local commits', async () => {
     // #given an empty trustedHeadSha..HEAD range
-    const {adapter, getExecOutput} = createFakeExecAdapter({revList: {stdout: ''}})
+    const {adapter, execWithTimeout} = createFakeExecAdapter({revList: {stdout: ''}})
 
     // #when
     const message = await resolveBrokeredPushCommitMessage(
@@ -253,7 +265,7 @@ describe('resolveBrokeredPushCommitMessage', () => {
 
     // #then
     expect(message).toBe(FALLBACK)
-    expect(getExecOutput).toHaveBeenCalledTimes(1)
+    expect(execWithTimeout).toHaveBeenCalledTimes(1)
   })
 
   it('uses the fallback when the tip commit subject is empty after sanitizing', async () => {
@@ -291,7 +303,7 @@ describe('resolveBrokeredPushCommitMessage', () => {
 
   it('uses the fallback and never shells out when the trusted SHA is malformed', async () => {
     // #given an attacker-shaped anchor
-    const {adapter, getExecOutput} = createFakeExecAdapter({revList: {stdout: TIP_SHA}})
+    const {adapter, execWithTimeout} = createFakeExecAdapter({revList: {stdout: TIP_SHA}})
 
     // #when
     const message = await resolveBrokeredPushCommitMessage(
@@ -304,12 +316,12 @@ describe('resolveBrokeredPushCommitMessage', () => {
 
     // #then
     expect(message).toBe(FALLBACK)
-    expect(getExecOutput).not.toHaveBeenCalled()
+    expect(execWithTimeout).not.toHaveBeenCalled()
   })
 
   it('uses the fallback when rev-list returns something that is not a commit id', async () => {
     // #given
-    const {adapter, getExecOutput} = createFakeExecAdapter({revList: {stdout: '--exec=evil\n'}})
+    const {adapter, execWithTimeout} = createFakeExecAdapter({revList: {stdout: '--exec=evil\n'}})
 
     // #when
     const message = await resolveBrokeredPushCommitMessage(
@@ -322,19 +334,233 @@ describe('resolveBrokeredPushCommitMessage', () => {
 
     // #then
     expect(message).toBe(FALLBACK)
-    expect(getExecOutput).toHaveBeenCalledTimes(1)
+    expect(execWithTimeout).toHaveBeenCalledTimes(1)
   })
 
   it('uses the fallback when the adapter throws', async () => {
     // #given
     const adapter: ExecAdapter = {
       exec: vi.fn().mockResolvedValue(0),
-      getExecOutput: vi.fn().mockRejectedValue(new Error('spawn failed')),
+      execWithTimeout: vi.fn().mockRejectedValue(new Error('spawn failed')),
+      getExecOutput: vi.fn(),
     }
 
     // #when / #then
     await expect(
       resolveBrokeredPushCommitMessage(adapter, TRUSTED_HEAD_SHA, '/workspace', createMockLogger(), FALLBACK),
     ).resolves.toBe(FALLBACK)
+  })
+})
+
+const HIDDEN_PREFIXES = [
+  ['NBSP', '\u00A0'],
+  ['EM SPACE', '\u2003'],
+  ['IDEOGRAPHIC SPACE', '\u3000'],
+  ['BOM / ZWNBSP', '\uFEFF'],
+  ['ZERO WIDTH SPACE', '\u200B'],
+  ['THIN SPACE', '\u2009'],
+  ['WORD JOINER', '\u2060'],
+] as const
+const FORBIDDEN_TRAILERS = ['Co-authored-by: Mallory <mallory@example.com>', 'skip-checks: true'] as const
+
+function parseTrailers(message: string): string {
+  return execFileSync('git', ['interpret-trailers', '--parse'], {input: message, encoding: 'utf-8'})
+}
+
+describe('sanitizeCommitMessage Unicode whitespace bypass', () => {
+  describe.each(FORBIDDEN_TRAILERS)('%s', trailer => {
+    it.each(HIDDEN_PREFIXES)('removes it when prefixed with %s (own paragraph)', (_name, hidden) => {
+      // #given a trailer hidden behind a character ASCII-only matchers treat as text
+      const raw = `fix: x\n\n${hidden}${trailer}`
+
+      // #when
+      const result = sanitizeCommitMessage(raw) ?? ''
+
+      // #then it is gone, and git agrees there is no trailer left
+      expect(result).toBe('fix: x')
+      expect(result).not.toMatch(/co-authored-by|skip-checks/i)
+      expect(parseTrailers(result)).toBe('')
+    })
+
+    it.each(HIDDEN_PREFIXES)('removes it when prefixed with %s (glued to prose)', (_name, hidden) => {
+      // #given
+      const raw = `fix: x\n\nSome prose.\n${hidden}${trailer}\n`
+
+      // #when
+      const result = sanitizeCommitMessage(raw) ?? ''
+
+      // #then
+      expect(result).toBe('fix: x\n\nSome prose.')
+      expect(parseTrailers(result)).toBe('')
+    })
+
+    it.each(HIDDEN_PREFIXES)('removes it when %s splits the key', (_name, hidden) => {
+      // #given
+      const [key = '', ...rest] = trailer.split(':')
+      const raw = `fix: x\n\nBody.\n\n${key.slice(0, 3)}${hidden}${key.slice(3)}:${rest.join(':')}`
+
+      // #when
+      const result = sanitizeCommitMessage(raw) ?? ''
+
+      // #then
+      expect(result).not.toMatch(/co-?authored|skip-?checks/i)
+      expect(parseTrailers(result)).toBe('')
+    })
+  })
+
+  it('removes a hidden-prefix skip token', () => {
+    expect(sanitizeCommitMessage('fix: x\n\n\u200B[skip ci]\u00A0')).toBe('fix: x')
+    expect(sanitizeCommitMessage('fix: x [ski\u200Bp ci]')).toBe('fix: x')
+  })
+
+  it('rejects a subject that is a trailer behind hidden whitespace', () => {
+    expect(sanitizeCommitMessage('\u00A0Co-authored-by: Mallory <m@example.com>')).toBeNull()
+  })
+
+  it('revalidates after truncation: a body cut that leaves a trailing trailer-shaped paragraph is stripped', () => {
+    // #given the final paragraph is not a trailer until the 4 KB cap cuts it down to `Bug:`
+    const raw = `fix: x\n\n${'x'.repeat(MAX_COMMIT_BODY_BYTES - 6)}\n\nBug:1 more words`
+
+    // #when
+    const result = sanitizeCommitMessage(raw) ?? ''
+
+    // #then
+    expect(result.endsWith('Bug:')).toBe(false)
+    expect(parseTrailers(result)).toBe('')
+  })
+
+  it.each([
+    'fix: x\n\n\u00A0Co-authored-by: Mallory <m@example.com>',
+    'fix: x\n\n\u3000skip-checks: true',
+    `fix: x\n\n${'x'.repeat(MAX_COMMIT_BODY_BYTES - 6)}\n\nBug:1 more words`,
+    '  fix:\u00A0\u00A0x [skip\u2003ci]\n\n\n\n  body \u200B \n\nChange-Id: I1\n  more',
+    'fix: x\n\nSigned-off-by: A <a@b.c>\n\u00A0\n\nCc: z',
+    `${'a'.repeat(100)}\n\n${'€'.repeat(3000)}`,
+  ])('is a fixed point (%#)', raw => {
+    // #given / #when
+    const once = sanitizeCommitMessage(raw)
+
+    // #then sanitizing the output again returns it unchanged
+    expect(once).not.toBeNull()
+    expect(sanitizeCommitMessage(once ?? '')).toBe(once)
+  })
+})
+
+describe('resolveBrokeredPushCommitMessage lookup bounds', () => {
+  it('suppresses signature display and the pager, and bounds both git calls', async () => {
+    // #given
+    const {adapter, execWithTimeout} = createFakeExecAdapter({
+      revList: {stdout: TIP_SHA},
+      log: {stdout: 'fix: signed\n'},
+    })
+
+    // #when
+    await resolveBrokeredPushCommitMessage(adapter, TRUSTED_HEAD_SHA, '/workspace', createMockLogger(), FALLBACK)
+
+    // #then
+    const calls = execWithTimeout.mock.calls as unknown as [string, string[], number][]
+    expect(calls).toHaveLength(2)
+    for (const [command, args, timeoutMs] of calls) {
+      expect(command).toBe('git')
+      expect(args.slice(0, 3)).toEqual(['--no-pager', '-c', 'log.showSignature=false'])
+      expect(timeoutMs).toBeLessThanOrEqual(5_000)
+    }
+    expect(calls[1]?.[1]).toContain('--no-show-signature')
+  })
+
+  it.each(['rev-list', 'log'])('falls back to the constant and warns when %s times out', async stalled => {
+    // #given
+    const logger = createMockLogger()
+    const execWithTimeout = vi.fn(
+      async (_command: string, args?: string[], _timeoutMs?: number, options?: ExecOptions) => {
+        if ((args ?? []).includes(stalled)) {
+          return 'timed-out' as const
+        }
+        options?.listeners?.stdout?.(Buffer.from((args ?? []).includes('rev-list') ? TIP_SHA : 'fix: x'))
+        return 0
+      },
+    )
+    const adapter: ExecAdapter = {exec: vi.fn().mockResolvedValue(0), execWithTimeout, getExecOutput: vi.fn()}
+
+    // #when
+    const message = await resolveBrokeredPushCommitMessage(adapter, TRUSTED_HEAD_SHA, '/workspace', logger, FALLBACK)
+
+    // #then
+    expect(message).toBe(FALLBACK)
+    expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining('timed out'), expect.any(Object))
+  })
+
+  it('uses the fallback and warns when the adapter has no timeout support (never an unbounded call)', async () => {
+    // #given
+    const getExecOutput = vi.fn()
+    const adapter: ExecAdapter = {exec: vi.fn().mockResolvedValue(0), getExecOutput}
+    const logger = createMockLogger()
+
+    // #when
+    const message = await resolveBrokeredPushCommitMessage(adapter, TRUSTED_HEAD_SHA, '/workspace', logger, FALLBACK)
+
+    // #then
+    expect(message).toBe(FALLBACK)
+    expect(getExecOutput).not.toHaveBeenCalled()
+    expect(logger.warning).toHaveBeenCalled()
+  })
+})
+
+function git(cwd: string, ...args: string[]): string {
+  return execFileSync('git', ['-c', 'user.name=T', '-c', 'user.email=t@example.com', ...args], {
+    cwd,
+    encoding: 'utf-8',
+    env: {...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1'},
+  }).trim()
+}
+
+describe('resolveBrokeredPushCommitMessage against real git', () => {
+  it('selects the tip of two local commits and sanitizes it, even with signature display configured on', async () => {
+    // #given a trusted base plus two agent commits, with a repo-local verifier that would hang if invoked
+    const dir = mkdtempSync(path.join(tmpdir(), 'commit-message-'))
+    try {
+      git(dir, 'init', '-q', '-b', 'main')
+      git(dir, 'commit', '-q', '--allow-empty', '-m', 'base')
+      const base = git(dir, 'rev-parse', 'HEAD')
+      git(dir, 'commit', '-q', '--allow-empty', '-m', 'chore: first')
+      git(dir, 'commit', '-q', '--allow-empty', '-m', 'fix: the tip [skip ci]\n\nWhy.\n\nCo-authored-by: X <x@y.z>')
+      git(dir, 'config', 'log.showSignature', 'true')
+      git(dir, 'config', 'gpg.program', 'sleep')
+
+      // #when
+      const message = await resolveBrokeredPushCommitMessage(
+        createExecAdapter(),
+        base,
+        dir,
+        createMockLogger(),
+        FALLBACK,
+      )
+
+      // #then
+      expect(message).toBe('fix: the tip\n\nWhy.')
+    } finally {
+      rmSync(dir, {recursive: true, force: true})
+    }
+  })
+
+  it('uses the fallback when the agent made no commits past the trusted head', async () => {
+    // #given
+    const dir = mkdtempSync(path.join(tmpdir(), 'commit-message-'))
+    try {
+      git(dir, 'init', '-q', '-b', 'main')
+      git(dir, 'commit', '-q', '--allow-empty', '-m', 'base')
+      const base = git(dir, 'rev-parse', 'HEAD')
+
+      // #when / #then
+      await expect(
+        resolveBrokeredPushCommitMessage(createExecAdapter(), base, dir, createMockLogger(), FALLBACK),
+      ).resolves.toBe(FALLBACK)
+    } finally {
+      rmSync(dir, {recursive: true, force: true})
+    }
+  })
+
+  it('keeps the timeout constant within the 5 s bound', () => {
+    expect(COMMIT_MESSAGE_LOOKUP_TIMEOUT_MS).toBeLessThanOrEqual(5_000)
   })
 })
