@@ -1,9 +1,11 @@
 import type {Octokit} from '../../services/github/types.js'
-import type {ExecAdapter} from '../../services/setup/types.js'
+import type {ExecAdapter, ExecOptions} from '../../services/setup/types.js'
 
-import {beforeEach, describe, expect, it, vi} from 'vitest'
+import {Buffer} from 'node:buffer'
+import {beforeEach, describe, expect, it, vi, type Mock} from 'vitest'
 import {createMockOctokit} from '../../services/github/test-helpers.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
+import {DEFAULT_AUTHOR} from './types.js'
 
 const mocks = vi.hoisted(() => ({
   evaluateEarlyGate: vi.fn(),
@@ -64,9 +66,27 @@ function allowGateSequence(changes: readonly object[]): void {
   })
 }
 
+function createDeliverableOctokit(createCommit: Mock): Octokit {
+  return createMockOctokit({
+    getRef: {object: {sha: TRUSTED_HEAD_SHA}},
+    getCommit: {tree: {sha: 'base-tree-sha'}},
+    createBlob: {sha: 'blob-sha'},
+    createTree: {sha: 'tree-sha'},
+    createCommit,
+    updateRef: vi.fn().mockResolvedValue({data: {}}),
+  })
+}
+
+function createCommitMock(): Mock {
+  return vi.fn().mockResolvedValue({
+    data: {sha: 'commit-sha', html_url: 'https://github.com/owner/repo/commit/commit-sha', message: 'm'},
+  })
+}
+
 async function run(
   options: {
     readonly octokit?: Octokit
+    readonly execAdapter?: ExecAdapter
     readonly signal?: AbortSignal
     readonly trustedHeadSha?: string
     readonly extraPathPrefixes?: readonly string[]
@@ -74,7 +94,7 @@ async function run(
 ) {
   return runBrokeredPush({
     octokit: options.octokit ?? createMockOctokit(),
-    execAdapter: createExecAdapter(),
+    execAdapter: options.execAdapter ?? createExecAdapter(),
     logger: createMockLogger(),
     eventFacts: {
       eventType: 'issue_comment',
@@ -131,6 +151,58 @@ describe('runBrokeredPush', () => {
     expect(updateRef).toHaveBeenCalledWith(
       expect.objectContaining({owner: OWNER, repo: REPO, ref: `heads/${BRANCH}`, sha: 'commit-sha', force: false}),
     )
+  })
+
+  describe('commit message', () => {
+    it('commits with the sanitized tip commit message when the agent committed locally', async () => {
+      // #given the agent made a local commit whose message carries a skip token and a co-author trailer
+      allowGateSequence([{path: 'src/fix.ts', content: 'fixed'}])
+      const tipSha = 'c'.repeat(40)
+      const execAdapter: ExecAdapter = {
+        exec: vi.fn().mockResolvedValue(0),
+        getExecOutput: vi.fn().mockResolvedValue({stdout: '', stderr: '', exitCode: 0}),
+        execWithTimeout: vi.fn(
+          async (_command: string, args?: string[], _timeoutMs?: number, options?: ExecOptions) => {
+            const stdout =
+              args?.includes('rev-list') === true
+                ? `${tipSha}\n`
+                : 'fix: handle empty input [skip ci]\n\nCo-authored-by: X <x@y.z>\n'
+            options?.listeners?.stdout?.(Buffer.from(stdout))
+            return 0
+          },
+        ),
+      }
+      const createCommit = createCommitMock()
+
+      // #when brokered push delivery runs
+      const outcome = await run({octokit: createDeliverableOctokit(createCommit), execAdapter})
+
+      // #then the Git Data API commit carries the sanitized message, authored by the App
+      expect(outcome.kind).toBe('pushed')
+      expect(createCommit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          message: 'fix: handle empty input',
+          author: {
+            name: DEFAULT_AUTHOR.name,
+            email: DEFAULT_AUTHOR.email,
+            date: expect.any(String) as unknown as string,
+          },
+        }),
+      )
+    })
+
+    it('commits with the generic message when the agent made no local commits', async () => {
+      // #given an empty trustedHeadSha..HEAD range
+      allowGateSequence([{path: 'src/fix.ts', content: 'fixed'}])
+      const createCommit = createCommitMock()
+
+      // #when brokered push delivery runs
+      const outcome = await run({octokit: createDeliverableOctokit(createCommit)})
+
+      // #then the existing constant is used
+      expect(outcome.kind).toBe('pushed')
+      expect(createCommit).toHaveBeenCalledWith(expect.objectContaining({message: 'chore: apply brokered changes'}))
+    })
   })
 
   it('delivers a consumer-layout change set when an extra path prefix is opted in', async () => {

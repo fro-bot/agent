@@ -12,6 +12,7 @@ import {
   type BrokeredPushEventFacts,
 } from './brokered-push-gate.js'
 import {validateBrokeredPushFiles} from './brokered-push-validation.js'
+import {resolveBrokeredPushCommitMessage} from './commit-message.js'
 import {createCommit} from './commit.js'
 import {reconstructChanges} from './reconstruct-changes.js'
 
@@ -119,13 +120,22 @@ export async function runBrokeredPush(params: BrokeredPushParams): Promise<Broke
 
     const headObservation = {changed: false}
     try {
+      // Reconstruction squashes the net diff into one fresh commit, but the agent's own tip commit message
+      // (sanitized) still describes that change better than a constant. No local commits => the constant.
+      const message = await resolveBrokeredPushCommitMessage(
+        execAdapter,
+        trustedHeadSha,
+        repoRoot,
+        logger,
+        BROKERED_PUSH_COMMIT_MESSAGE,
+      )
       const commit = await createCommit(
         observeBrokeredPushHead(octokit, earlyGate.trustedHeadSha, headObservation),
         {
           owner: preWriteGate.target.owner,
           repo: preWriteGate.target.repo,
           branch: preWriteGate.target.branch,
-          message: BROKERED_PUSH_COMMIT_MESSAGE,
+          message,
           expectedHeadSha: earlyGate.trustedHeadSha,
           files: changes,
           signal,

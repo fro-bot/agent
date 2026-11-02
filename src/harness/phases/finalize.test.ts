@@ -822,6 +822,73 @@ describe('runFinalize file-convention delivery', () => {
     expect(mocks.setFailed).toHaveBeenCalled()
   })
 
+  it('still reaches the broker, and its loud failure, when the PR context was not hydrated', async () => {
+    // #given a successful trusted PR mention whose hydration failed, so no head branch is known
+    const bootstrap = createBootstrap({trustedHeadSha: 'a'.repeat(40)})
+    const eligibleRouting = createEligibleRouting()
+    const routing = createRouting({
+      ...eligibleRouting,
+      agentContext: {...eligibleRouting.agentContext, hydratedContext: null},
+    })
+    mocks.runBrokeredPush.mockResolvedValue({
+      kind: 'fail-loud',
+      failureClass: 'identity',
+      reason: 'Pull request head branch changed',
+    })
+    mocks.postComment.mockResolvedValue({url: 'https://example.com/comment'})
+
+    // #when finalize runs
+    const exitCode = await runFinalize(
+      bootstrap,
+      routing,
+      cacheRestore,
+      createExecution({success: true, commentsPosted: 0}),
+      createMetrics(),
+      Date.now(),
+      createMockLogger(),
+    )
+
+    // #then the broker is not skipped: it fails loud with an error comment and a failing exit code
+    expect(mocks.runBrokeredPush).toHaveBeenCalledWith(expect.objectContaining({expectedHeadBranch: ''}))
+    expect(exitCode).toBe(1)
+    expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('Brokered push delivery failed'))
+    expect(mocks.postComment).toHaveBeenCalledTimes(1)
+    expect(mocks.runResponsePost).not.toHaveBeenCalled()
+  })
+
+  it('still runs the broker for a fork PR so the pre-write gate decides', async () => {
+    // #given a successful trusted PR mention whose hydrated context says the head is a fork
+    const bootstrap = createBootstrap({trustedHeadSha: 'a'.repeat(40)})
+    const eligibleRouting = createEligibleRouting()
+    const routing = createRouting({
+      ...eligibleRouting,
+      agentContext: {
+        ...eligibleRouting.agentContext,
+        hydratedContext: {
+          type: 'pull_request',
+          headBranch: 'feature/brokered-fix',
+          isFork: true,
+        } as AgentContext['hydratedContext'],
+      },
+    })
+    mocks.runBrokeredPush.mockResolvedValue({kind: 'bypass'})
+    mocks.runResponsePost.mockResolvedValue({delivered: true, kind: 'comment'})
+
+    // #when finalize runs
+    await runFinalize(
+      bootstrap,
+      routing,
+      cacheRestore,
+      createExecution({success: true, commentsPosted: 0}),
+      createMetrics(),
+      Date.now(),
+      createMockLogger(),
+    )
+
+    // #then the decision is the one on main: the broker is still consulted
+    expect(mocks.runBrokeredPush).toHaveBeenCalledTimes(1)
+  })
+
   it('posts exactly one normal response for a nothing-to-deliver brokered outcome', async () => {
     // #given an eligible successful run with no workspace changes
     const bootstrap = createBootstrap({trustedHeadSha: 'a'.repeat(40)})
