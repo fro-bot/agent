@@ -24,6 +24,7 @@ import {
 import {outputTextContent, outputToolExecution} from '../../shared/console.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {detectArtifacts, observeClassification} from './streaming.js'
+import {toolArgumentV2} from './tool-argument-v2.js'
 
 /**
  * Event loop for a run on OpenCode V2: the sibling of `streaming.ts`.
@@ -231,11 +232,6 @@ function subagentLabel(input: Readonly<Record<string, unknown>> | null | undefin
 function stringInput(input: Readonly<Record<string, unknown>> | null | undefined, key: string): string {
   const value = input?.[key]
   return typeof value === 'string' ? value : ''
-}
-
-function titleFromInput(input: Readonly<Record<string, unknown>> | null | undefined): string {
-  const title = stringInput(input, 'description') || stringInput(input, 'command') || stringInput(input, 'filePath')
-  return title.length > 120 ? `${title.slice(0, 117)}...` : title
 }
 
 const UNATTRIBUTED_EVENTS_PER_SESSION = 16
@@ -460,8 +456,10 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
         const callShellId = readToolShellId(event.metadata) ?? shellByCall.get(callKey(event)) ?? null
         shellByCall.delete(callKey(event))
         const name = info?.name ?? null
-        if (name !== null && event.calls.length === 0) {
-          outputToolExecution(name, titleFromInput(info?.input))
+        if (name !== null) {
+          outputToolExecution(name, toolArgumentV2(name, info?.input))
+          // An `execute` call lists the calls it made; each gets its own line, in call order, after the `execute` line.
+          for (const call of event.calls) outputToolExecution(call.tool, toolArgumentV2(call.tool, call.input))
         }
 
         // Artifacts: a direct `shell` call carries its command; an `execute` call lists the calls it made.

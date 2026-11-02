@@ -37,6 +37,7 @@ function goodRules(): readonly PermissionRuleV2[] {
     allowedExternalDirectories: [RESPONSE_DIR, ATTACHMENT_DIR],
     editDenyResources: [],
     denyQuestion: true,
+    denyWebsearch: true,
   })
 }
 
@@ -49,6 +50,7 @@ function workspaceRules(...extra: readonly PermissionRuleV2[]): readonly Permiss
       allowedExternalDirectories: [RESPONSE_DIR, ATTACHMENT_DIR],
       editDenyResources: [],
       denyQuestion: false,
+      denyWebsearch: false,
     }),
     ...extra,
   ]
@@ -186,6 +188,7 @@ describe('verifyPermissionRules', () => {
       allowedExternalDirectories: [RESPONSE_DIR, ATTACHMENT_DIR],
       editDenyResources: [],
       denyQuestion: true,
+      denyWebsearch: true,
     })
     const source = sourceOf(envelope(effectiveAgents(askOutside)))
 
@@ -266,6 +269,7 @@ describe('verifyPermissionRules', () => {
       allowedExternalDirectories: [ATTACHMENT_DIR],
       editDenyResources: [],
       denyQuestion: true,
+      denyWebsearch: true,
     })
     const source = sourceOf(envelope(effectiveAgents(rules)))
 
@@ -286,6 +290,7 @@ describe('verifyPermissionRules', () => {
       allowedExternalDirectories: [RESPONSE_DIR],
       editDenyResources: [],
       denyQuestion: true,
+      denyWebsearch: true,
     })
     const source = sourceOf(envelope(effectiveAgents(rules)))
 
@@ -663,5 +668,82 @@ describe('verifyPermissionRules', () => {
     const error = errorOf(result)
     expect(error.kind).toBe('agent-list-unavailable')
     expect(error.message).toContain('503')
+  })
+})
+
+describe('websearch deny (Action only)', () => {
+  const WEBSEARCH_EXPECTATIONS: PermissionGateExpectations = {
+    ...EXPECTATIONS,
+    deniedActions: [...EXPECTATIONS.deniedActions, 'websearch'],
+  }
+
+  it('denies websearch for every resource when the surface asks for it, and leaves webfetch alone', () => {
+    // #given
+    const rules = goodRules()
+
+    // #when / #then
+    expect(evaluatePermissionV2('websearch', '*', rules)).toBe('deny')
+    expect(evaluatePermissionV2('websearch', 'any query', rules)).toBe('deny')
+    expect(rules.some(rule => rule.action === 'webfetch')).toBe(false)
+    expect(evaluatePermissionV2('webfetch', 'https://example.com', rules)).toBe('ask')
+  })
+
+  it('adds no websearch rule when the surface does not ask for it', () => {
+    // #given
+    const rules = workspaceRules()
+
+    // #when / #then
+    expect(rules.some(rule => rule.action === 'websearch')).toBe(false)
+  })
+
+  it('outranks the built-in allows of every agent', async () => {
+    // #given
+    const source = sourceOf(envelope(effectiveAgents(goodRules())))
+
+    // #when
+    const result = await verifyPermissionRules(source, WEBSEARCH_EXPECTATIONS, makeLogger())
+
+    // #then
+    expect(reportOf(result).checkedAgents.length).toBeGreaterThan(0)
+  })
+
+  it('fails when the websearch deny is missing', async () => {
+    // #given
+    const withoutDeny = goodRules().filter(rule => rule.action !== 'websearch')
+    const source = sourceOf(envelope(effectiveAgents(withoutDeny)))
+
+    // #when
+    const result = await verifyPermissionRules(source, WEBSEARCH_EXPECTATIONS, makeLogger())
+
+    // #then
+    const violations = violationsOf(result)
+    expect(violations.length).toBeGreaterThan(0)
+    expect(violations.every(v => v.check === 'action-not-denied' && v.action === 'websearch')).toBe(true)
+  })
+
+  it('fails when a later rule re-allows websearch after the boundary', async () => {
+    // #given: a rule that lands after ours, as a project config could add one
+    const hostile: readonly PermissionRuleV2[] = [...goodRules(), {action: 'websearch', resource: '*', effect: 'allow'}]
+    const source = sourceOf(envelope(effectiveAgents(goodRules(), {build: hostile})))
+
+    // #when
+    const result = await verifyPermissionRules(source, WEBSEARCH_EXPECTATIONS, makeLogger())
+
+    // #then
+    expect(violationsOf(result)).toEqual([
+      {agentId: 'build', check: 'action-not-denied', action: 'websearch', resource: '*', effect: 'allow'},
+    ])
+  })
+
+  it('does not look at websearch when the surface does not guard it', async () => {
+    // #given
+    const hostile: readonly PermissionRuleV2[] = [...goodRules(), {action: 'websearch', resource: '*', effect: 'allow'}]
+    const source = sourceOf(envelope(effectiveAgents(goodRules(), {build: hostile})))
+
+    // #when
+    const result = await verifyPermissionRules(source, EXPECTATIONS, makeLogger())
+
+    // #then
+    expect(reportOf(result).checkedAgents.length).toBeGreaterThan(0)
   })
 })

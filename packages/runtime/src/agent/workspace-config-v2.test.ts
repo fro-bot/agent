@@ -177,6 +177,16 @@ describe('buildWorkspaceConfigV2', () => {
     expect(evaluatePermissionV2('opencode_worktree_create', '*', rules)).toBe('deny')
   })
 
+  it('leaves websearch to the operator: no deny rule and no gate expectation (Action-only deny)', () => {
+    // #given / #when
+    const {content, expectations} = build()
+    const rules = rulesOf(content)
+
+    // #then
+    expect(rules.some(rule => rule.action === 'websearch')).toBe(false)
+    expect(expectations.deniedActions).not.toContain('websearch')
+  })
+
   it('rejects a relative exception directory', () => {
     // #given / #when
     const result = buildWorkspaceConfigV2({plugins: [], allowedExternalDirectories: ['shared']}, makeLogger())
