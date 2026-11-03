@@ -9,17 +9,21 @@
  * Gate ordering (all must pass before any run data is returned):
  *   1. Guard (browser/session/allowlist) — installed by buildOperatorApp
  *   2. Operator rate limit (20/min, operator-keyed) — before binding enumeration
- *   3. listBindings() — enumerate all bound repos
- *   4. filterDeniedRecords() — drop denylisted repos BEFORE any run-state read
- *   5. Dedup by owner/repo, then cap before the run-state scan
- *   6. listRunsForRepo() per surviving binding — enumerate run-states
- *   7. toRunSummary() projection — drop null (entity_ref mismatch) + warn
- *   8. overlayWaitingStatus() — registries read after listRunsForRepo resolves
- *   9. Flatten; sort newest-first by createdAt; cap at MAX_RUNS_PER_LISTING
- *  10. Cache-Control: no-store, private; return 200 {runs: RunSummary[]}
+ *   3. Redaction policy availability — 503 {error: 'redaction-policy-unavailable'}, before any binding read
+ *   4. listBindings() — enumerate all bound repos
+ *   5. filterDeniedRecords() — drop denylisted repos BEFORE any run-state read, then re-check availability
+ *      (grace can expire mid-read → 503)
+ *   6. Dedup by owner/repo, then cap before the run-state scan
+ *   7. listRunsForRepo() per surviving binding — enumerate run-states
+ *   8. toRunSummary() projection — drop null (entity_ref mismatch) + warn
+ *   9. overlayWaitingStatus() — registries read after listRunsForRepo resolves
+ *  10. Flatten; sort newest-first by createdAt; cap at MAX_RUNS_PER_LISTING
+ *  11. Cache-Control: no-store, private; return 200 {runs: RunSummary[]}
  *
  * Security invariants:
  *   - Denylisted repos are silently omitted (no oracle) and their run-states are never read.
+ *   - An unavailable redaction policy is reported as a 503, never as an empty list; no binding or run-state is
+ *     read and nothing is listed. The 503 names no repo and counts none.
  *   - Store errors return a coarse error; no partial list leaks.
  *   - Response carries only {runId, repo, status, createdAt, updatedAt?, failureKind?, providerFailureReason?,
  *     prompt?}: `prompt` is the web launch prompt (web runs only, within its bound), `providerFailureReason`
@@ -43,7 +47,7 @@ import {createRateLimiter} from '../../http/rate-limit.js'
 import {toRunSummary} from '../../operator-contract/run-summary.js'
 import {bindingToRepoKey, filterDeniedRecords} from '../../redaction/surface-gate.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
-import {rateLimitedResponse} from '../safe-response.js'
+import {rateLimitedResponse, redactionPolicyUnavailableResponse} from '../safe-response.js'
 import {overlayWaitingStatus, scopeIdFor} from '../sse/projection.js'
 
 // ---------------------------------------------------------------------------
@@ -97,6 +101,12 @@ export interface RunsRouteDeps {
    * Called synchronously for each binding BEFORE any run-state read.
    */
   readonly isRepoDenied: (repoKey: RepoKey) => boolean
+  /**
+   * Whether the redaction policy is loaded and usable (`DenylistCache.isPolicyAvailable`). Required: an absent
+   * gate would let an unavailable policy read as an empty listing. While false, the route answers 503 before it
+   * reads any binding.
+   */
+  readonly isPolicyAvailable: () => boolean
   /** Structured logger. */
   readonly logger: OperatorLogger
   /** Injectable clock. */
@@ -169,7 +179,18 @@ export function buildRunsRoute(app: Hono, deps: RunsRouteDeps): void {
       return rateLimitedResponse(c)
     }
 
-    // ── Gate 3: List all bound repos ──────────────────────────────────────
+    // ── Gate 3: Redaction policy availability ────────────────────────────────
+    // An unavailable policy denies every repo, which would read as an empty listing. Report it instead, before
+    // any binding is read. One warning per request; it carries no repo identity.
+    if (deps.isPolicyAvailable() === false) {
+      deps.logger.warn(
+        {githubUserId, gate: 'redaction-policy-unavailable'},
+        'runs: redaction policy unavailable — returning 503',
+      )
+      return redactionPolicyUnavailableResponse(c)
+    }
+
+    // ── Gate 4: List all bound repos ──────────────────────────────────────
     // A store error returns a coarse error — no partial list leaks.
     let bindings: RepoBinding[]
     try {
@@ -184,9 +205,20 @@ export function buildRunsRoute(app: Hono, deps: RunsRouteDeps): void {
       return c.json({error: 'unavailable'}, 503)
     }
 
-    // ── Gate 4: Denylist filter — BEFORE any run-state read ─────────────────────
+    // ── Gate 5: Denylist filter — BEFORE any run-state read ─────────────────────
     // Denylisted repos' run-states are never read — tighter than "scan all then filter."
     const allowed = filterDeniedRecords(bindings, bindingToRepoKey, deps.isRepoDenied)
+
+    // ── Gate 5b: Re-check availability after the read — BEFORE any run-state read ──
+    // Grace can expire while listBindings() is pending; the denylist checks then deny every binding, which would
+    // read as an empty listing. Report the outage instead of accepting that result.
+    if (deps.isPolicyAvailable() === false) {
+      deps.logger.warn(
+        {githubUserId, gate: 'redaction-policy-unavailable'},
+        'runs: redaction policy unavailable — returning 503',
+      )
+      return redactionPolicyUnavailableResponse(c)
+    }
 
     // Dedup by owner/repo BEFORE the cap — duplicate channelId bindings for the same
     // repo would otherwise consume cap slots and crowd out distinct repos.

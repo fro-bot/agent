@@ -1,6 +1,15 @@
 // Operator API contract version — build-time pinned, never negotiated over the wire.
 //
 // Changelog (latest first):
+//   1.15.0 — `GET /operator/repos` and `GET /operator/runs` gain a 503 `{error: 'redaction-policy-unavailable'}`
+//            (additive, a new status on existing routes, no field changes): while the gateway holds no usable
+//            redaction policy (a cold start with no successful load, or a grace window that expired without a
+//            refresh) the listings say so instead of answering an empty 200. It is checked after authentication
+//            and the rate limit and before any binding is read; the body is fixed, names no repo and counts none.
+//            Inside the grace window the last-known-good policy is serving and the listings answer as before.
+//            Per-run routes keep the generic 404, and `/operator/health` is unchanged. Clients that do not
+//            update in lockstep see a new status code; a non-2xx is already a typed error for the dashboard.
+//            The gateway and the dashboard deploy as a pair (the dashboard's contract pin must be 1.15.0).
 //   1.14.0 — an optional `waitReason` on `OperatorRunStatus` (additive): while a run drains, the status says why
 //            the completion gate has not admitted it yet, as one of `agent-working | awaiting-reply |
 //            awaiting-background-task | confirming-completion`. Present only on a `running` status (an approval or
@@ -56,4 +65,4 @@
 // Security constraint: the version is BUILD-TIME pinned and is never supplied or
 // negotiated over the wire. Any endpoint reading a version header must reject
 // unrecognized versions fail-closed.
-export const OPERATOR_CONTRACT_VERSION = '1.14.0'
+export const OPERATOR_CONTRACT_VERSION = '1.15.0'

@@ -227,6 +227,7 @@ function makeBrowserGuardStubDeps(): OperatorServerDeps {
     auditLogger: {info: vi.fn(), warn: vi.fn()},
     // Provide the run-stream route deps so the route is registered in the pinned inventory.
     denylistCache: {
+      isPolicyAvailable: () => true,
       getDenylistState: vi.fn(async () => undefined),
       isRepoDenied: vi.fn(() => false),
     },

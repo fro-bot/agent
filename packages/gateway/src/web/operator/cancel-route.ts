@@ -60,7 +60,7 @@ export interface CancelRouteDeps {
   /** Server-owned run index for runId → repo resolution. */
   readonly runIndex: Pick<RunIndex, 'lookup'>
   /** Denylist cache for pre-cancel redaction check. */
-  readonly denylistCache: DenylistCache
+  readonly denylistCache: Pick<DenylistCache, 'getDenylistState' | 'isRepoDenied'>
   /** Bindings lookup for deny-key resolution. */
   readonly bindingsLookup: BindingsLookup
   /** Cancel-run engine dependencies (queue, abort registry, approvals, etc.). */

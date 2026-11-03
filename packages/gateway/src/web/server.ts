@@ -798,9 +798,10 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   //
   // Gate ordering:
   //   1. Guard (browser/session/allowlist) — installed above
-  //   2. listBindings() — enumerate all bound repos
-  //   3. filterDeniedRecords() — drop denylisted repos
-  //   4. Cap at MAX_REPOS_PER_LISTING; map to RepoSummary[]; return 200
+  //   2. Operator rate limit, then redaction policy availability (503 when unavailable)
+  //   3. listBindings() — enumerate all bound repos
+  //   4. filterDeniedRecords() — drop denylisted repos
+  //   5. Cap at MAX_REPOS_PER_LISTING; map to RepoSummary[]; return 200
   if (
     browserGuardDeps !== undefined &&
     deps.sessionStore !== undefined &&
@@ -813,6 +814,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
     buildReposRoute(app, {
       listBindings: deps.listBindings,
       isRepoDenied: deps.denylistCache.isRepoDenied.bind(deps.denylistCache),
+      isPolicyAvailable: deps.denylistCache.isPolicyAvailable.bind(deps.denylistCache),
       logger: deps.logger,
       now: clock,
     })
@@ -852,6 +854,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
     buildRunsRoute(app, {
       listBindings: deps.listBindings,
       isRepoDenied: deps.denylistCache.isRepoDenied.bind(deps.denylistCache),
+      isPolicyAvailable: deps.denylistCache.isPolicyAvailable.bind(deps.denylistCache),
       listRunsForRepo: deps.runIndex.listRunsForRepo.bind(deps.runIndex),
       approvalRegistry: deps.approvalRegistry,
       questionRegistry: deps.questionRegistry,

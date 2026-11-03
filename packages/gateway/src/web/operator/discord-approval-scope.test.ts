@@ -70,6 +70,7 @@ function buildApp(runs: readonly RunState[]) {
   buildRunsRoute(app, {
     listBindings: async () => ({success: true as const, data: [BINDING]}),
     isRepoDenied: () => false,
+    isPolicyAvailable: () => true,
     logger,
     now: () => 0,
     listRunsForRepo: async () => runs,
