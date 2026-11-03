@@ -1075,32 +1075,81 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
     // Persist ownership onto run state continuously as the ledger changes
     // (adopt/settle/markUnknown), not only at completion — a restart can land
-    // at any point during the run. Shape matches what `recovery.ts`'s
-    // `readPersistedOwnership` reads: `details.rootSessionId` (string) and
-    // `details.ownedSessionIds` (string[]). Fire-and-forget and best-effort:
-    // a lost race against the heartbeat's own read-patch-write cycle just means
-    // the next ownership change retries with fresher data.
-    function persistOwnership(info: {
+    // at any point during the run. Shape matches what `lock-audit.ts` reads:
+    // `details.rootSessionId` (string) and `details.ownedSessionIds` (string[]).
+    // Fire-and-forget toward the caller and best-effort.
+    //
+    // One write at a time (fro-bot/agent#2049). `patchRunDetails` reads the ETag fresh and writes
+    // conditionally, so two overlapping calls make the later PUT lose with a 412 — and one shell call fires
+    // this hook 2-3 times within ~30 ms. The hook runs synchronously on every ledger change, so the newest
+    // `info` is always the current snapshot: it overwrites any pending one (last writer wins; the payload is
+    // a full snapshot, so a union would keep settled sessions forever) and the loop below writes it once the
+    // in-flight write finishes. A payload equal to the last one written (shell-only ledger changes never
+    // reach the payload) is skipped. A failed write is not remembered as written, so the next change
+    // retries it.
+    interface OwnershipSnapshot {
       readonly rootSessionId: string
       readonly ownedSessionIds: readonly string[]
-    }): void {
-      const write = async (): Promise<void> => {
-        const result = await patchRunDetails(
-          coordinationConfig,
-          identity,
-          repo,
-          runId,
-          {rootSessionId: info.rootSessionId, ownedSessionIds: [...info.ownedSessionIds]},
-          coordLogger,
-        )
-        if (result.success === false) {
-          logger.warn({repo, runId, err: result.error.message}, 'run: failed to persist ownership onto run state')
+    }
+    const ownershipKey = (info: OwnershipSnapshot): string =>
+      JSON.stringify([info.rootSessionId, [...info.ownedSessionIds].sort()])
+    let pendingOwnership: OwnershipSnapshot | undefined
+    let lastWrittenOwnershipKey: string | undefined
+    let ownershipWrites: Promise<void> | undefined
+
+    async function drainOwnershipQueue(): Promise<void> {
+      while (pendingOwnership !== undefined) {
+        const info = pendingOwnership
+        pendingOwnership = undefined
+        const key = ownershipKey(info)
+        if (key === lastWrittenOwnershipKey) continue
+        try {
+          const result = await patchRunDetails(
+            coordinationConfig,
+            identity,
+            repo,
+            runId,
+            {rootSessionId: info.rootSessionId, ownedSessionIds: [...info.ownedSessionIds]},
+            coordLogger,
+          )
+          if (result.success === true) {
+            lastWrittenOwnershipKey = key
+          } else {
+            logger.warn({repo, runId, err: result.error.message}, 'run: failed to persist ownership onto run state')
+          }
+        } catch (error: unknown) {
+          logger.warn(
+            {repo, runId, err: toErrorMessage(error)},
+            'run: patchRunDetails threw while persisting ownership',
+          )
         }
       }
-      // eslint-disable-next-line no-void
-      void write().catch((error: unknown) => {
-        logger.warn({repo, runId, err: toErrorMessage(error)}, 'run: patchRunDetails threw while persisting ownership')
+    }
+
+    function persistOwnership(info: OwnershipSnapshot): void {
+      pendingOwnership = info
+      if (ownershipWrites !== undefined) return
+      ownershipWrites = drainOwnershipQueue().finally(() => {
+        ownershipWrites = undefined
+        // A change that lands after the loop's last check but before this callback would otherwise sit unwritten.
+        if (pendingOwnership !== undefined) persistOwnership(pendingOwnership)
       })
+    }
+
+    // Wait for the queue to go idle — before the terminal path stops the heartbeat and writes the terminal
+    // record, so the last ownership write (typically the release fired just before the core resolves) cannot
+    // commit between `heartbeat.stop()` capturing its ETag and the terminal PUT. Bounded: a stalled store
+    // must not hold the terminal write, which has its own retry budget.
+    async function settleOwnershipWrites(): Promise<void> {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const bound = new Promise<'bound'>(resolve => {
+        timer = setTimeout(() => resolve('bound'), TERMINAL_WRITE_RETRY.attemptTimeoutMs)
+      })
+      // The queue can restart from its own `finally`, so wait until it is idle, not just for one drain.
+      for (let current = ownershipWrites; current !== undefined; current = ownershipWrites) {
+        if ((await Promise.race([current, bound])) === 'bound') break
+      }
+      clearTimeout(timer)
     }
 
     const {statusSink, replySink} = request
@@ -1737,6 +1786,9 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         // Pending questions are rejected (ending the agent's turn) before the run releases its
         // resources. Bounded by the reject call's own timeout; never rejects.
         await questionCoordinator?.dispose('run ended')
+        // Every terminal path below stops the heartbeat and writes the terminal record next: let the ownership
+        // queue go idle first so none of its writes lands between those two.
+        await settleOwnershipWrites()
       }
 
       // ── Succeeded reaction — best-effort, fire-and-forget ────────────────────────────────────
