@@ -14,7 +14,7 @@
 
 import type {RunState} from '@fro-bot/runtime'
 import type {OperatorRunStatus} from '../../operator-contract/index.js'
-import type {DenylistCache, RepoKey} from '../../redaction/denylist.js'
+import type {RepoKey} from '../../redaction/denylist.js'
 import type {BindingsLookup} from '../../redaction/surface-gate.js'
 import type {AuditLogger} from '../audit.js'
 import type {OperatorAllowlist} from '../auth/allowlist.js'
@@ -110,7 +110,7 @@ function makeRunIndex(repo?: string): RunStreamRouteDeps['runIndex'] {
   }
 }
 
-function makeDenylistCache(denied = false): DenylistCache {
+function makeDenylistCache(denied = false): RunStreamRouteDeps['denylistCache'] {
   return {
     getDenylistState: vi.fn(async () => undefined),
     isRepoDenied: vi.fn(() => denied),
@@ -421,7 +421,7 @@ describe('GET /operator/runs/:runId/stream — denylisted repo', () => {
   it('calls getDenylistState before isRepoDenied', async () => {
     // #given — track call order
     const callOrder: string[] = []
-    const denylistCache: DenylistCache = {
+    const denylistCache: RunStreamRouteDeps['denylistCache'] = {
       getDenylistState: vi.fn(async () => {
         callOrder.push('getDenylistState')
       }),
@@ -674,7 +674,7 @@ describe('GET /operator/runs/:runId/stream — deny-key resolution', () => {
       getBindingByRepo: vi.fn(async () => ({success: false as const, error: new Error('store error')})),
     }
     // Denylist treats null/null as denied
-    const denylistCache: DenylistCache = {
+    const denylistCache: RunStreamRouteDeps['denylistCache'] = {
       getDenylistState: vi.fn(async () => undefined),
       isRepoDenied: vi.fn((repoKey: RepoKey) => repoKey.databaseId === null && repoKey.nodeId === null),
     }
@@ -697,7 +697,7 @@ describe('GET /operator/runs/:runId/stream — deny-key resolution', () => {
     const bindingsLookup: BindingsLookup = {
       getBindingByRepo: vi.fn(async () => ({success: true as const, data: null})),
     }
-    const denylistCache: DenylistCache = {
+    const denylistCache: RunStreamRouteDeps['denylistCache'] = {
       getDenylistState: vi.fn(async () => undefined),
       isRepoDenied: vi.fn((repoKey: RepoKey) => repoKey.databaseId === null && repoKey.nodeId === null),
     }
@@ -719,7 +719,7 @@ describe('GET /operator/runs/:runId/stream — deny-key resolution', () => {
     // #given — binding has both databaseId and nodeId
     const bindingsLookup = makeBindingsLookup(42, 'node-id-1')
     const isRepoDenied = vi.fn(() => false)
-    const denylistCache: DenylistCache = {
+    const denylistCache: RunStreamRouteDeps['denylistCache'] = {
       getDenylistState: vi.fn(async () => undefined),
       isRepoDenied,
     }
@@ -1582,7 +1582,7 @@ describe('GET /operator/runs/:runId/stream — lease: repo denylisted mid-stream
   it('closes the stream on the next tick when isRepoDenied flips to true', async () => {
     // #given — stream opens with repo allowed; denylist flips to denied
     let isDenied = false
-    const denylistCache: DenylistCache = {
+    const denylistCache: RunStreamRouteDeps['denylistCache'] = {
       getDenylistState: vi.fn(async () => undefined),
       isRepoDenied: vi.fn(() => isDenied),
     }
@@ -2144,7 +2144,7 @@ describe('GET /operator/runs/:runId/stream — gate throws → 404', () => {
 
   it('returns 404 when getDenylistState throws (no 500, no stream)', async () => {
     // #given — denylist cache throws on getDenylistState
-    const denylistCache: DenylistCache = {
+    const denylistCache: RunStreamRouteDeps['denylistCache'] = {
       getDenylistState: vi.fn(async () => {
         throw new Error('denylist unavailable')
       }),

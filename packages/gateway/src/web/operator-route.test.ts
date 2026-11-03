@@ -550,7 +550,11 @@ describe('buildOperatorApp — health route is explicitly public', () => {
         allowlist: {isAuthorized: () => true, size: 1},
         csrfSecret: 'stub-csrf-secret-base64url-32bytes-ok',
         auditLogger: {info: () => undefined, warn: () => undefined},
-        denylistCache: {getDenylistState: async () => undefined, isRepoDenied: () => false},
+        denylistCache: {
+          isPolicyAvailable: () => true,
+          getDenylistState: async () => undefined,
+          isRepoDenied: () => false,
+        },
         getBindingByRepo: async () => ({success: true as const, data: null}),
         dispatchWorkflow: async (owner: string, repo: string) => ({outcome: 'accepted' as const, owner, repo}),
       },

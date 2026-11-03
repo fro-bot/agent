@@ -120,6 +120,7 @@ function makeStubSessionStore(
 
 function makeStubDenylistCache() {
   return {
+    isPolicyAvailable: () => true,
     getDenylistState: async () => undefined,
     isRepoDenied: () => false,
   }

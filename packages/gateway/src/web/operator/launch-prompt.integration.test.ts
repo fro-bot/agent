@@ -236,6 +236,7 @@ function makeHarness(store: Store = makeStore()): Harness {
   buildRunsRoute(app, {
     listBindings: async () => ({success: true as const, data: bindings.bound ? [BINDING] : []}),
     isRepoDenied: () => denylist.denied,
+    isPolicyAvailable: () => true,
     logger: capture.logger,
     now: () => Date.now(),
     listRunsForRepo: listRunsForRepoSpy,

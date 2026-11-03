@@ -10,20 +10,6 @@ import type {RunSummary} from '../../shared/types.js'
  * recovery restart, so the two `executeOpenCode` call sites can never end up on different generations.
  */
 
-/**
- * A run summary a backend holds back for the release instead of writing now (V2: a synthetic message posted before the
- * release would sit queued in the root's inbox, and the release waits for an empty one). It travels as a field of the
- * execute phase's result to `runReleaseV2`, which writes it after the final reading of the directory.
- */
-export interface DeferredSummaryV2 {
-  readonly sessionId: string
-  /**
-   * The structured inputs, not the formatted text: turns the run observes after the execute phase (a notice-triggered
-   * turn during the drain) add artifacts and usage, and the release formats the summary only once those are merged in.
-   */
-  readonly summary: RunSummary
-}
-
 /** What draining the overflowed session's own work left behind (the V1 `DrainOutcome` fields the recovery reads). */
 export interface OverflowDrainOutcome {
   readonly unknownCount: number
@@ -58,10 +44,11 @@ export interface ExecutionBackend {
   ) => Promise<readonly SessionSearchResult[]>
   /** The newest session created after `afterTimestamp`, for a run that did not report its session id. */
   readonly findLatestSessionId: (afterTimestamp: number, workspace: string, logger: Logger) => Promise<string | null>
-  /** Write the summary now (V1), or return it for the release to write (V2). */
-  readonly writeSummary: (
-    sessionId: string,
-    summary: RunSummary,
-    logger: Logger,
-  ) => Promise<DeferredSummaryV2 | undefined>
+  /**
+   * Append the run summary to the session so a later run can find it (V1). Absent on V2: its only route for adding text
+   * to a session, `POST /api/session/:id/synthetic`, admits the text to the session inbox and delivers it at the next
+   * step boundary. With `resume: false` and the server about to shut down nothing ever delivers it, so the write left a
+   * queued item in the saved database (#2029) and never put a message in the transcript.
+   */
+  readonly writeSummary?: (sessionId: string, summary: RunSummary, logger: Logger) => Promise<void>
 }

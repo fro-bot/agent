@@ -58,7 +58,7 @@ export interface RunStreamRouteDeps {
    */
   readonly readRunState?: (repo: string, runId: string) => Promise<RunState | undefined>
   /** Denylist cache for pre-subscribe redaction check. */
-  readonly denylistCache: DenylistCache
+  readonly denylistCache: Pick<DenylistCache, 'getDenylistState' | 'isRepoDenied'>
   /** Bindings lookup for deny-key resolution. */
   readonly bindingsLookup: BindingsLookup
   /**

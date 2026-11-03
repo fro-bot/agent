@@ -241,7 +241,6 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
     listShells: vi.fn(async () => ok([])),
     getShell: vi.fn(async () => fail({kind: 'http', status: 404})),
     deleteShell: vi.fn(async () => ok(undefined)),
-    addSyntheticMessage: vi.fn(async () => ok(undefined)),
     ...calls,
   } as unknown as ActionOpenCodeV2Client
 
