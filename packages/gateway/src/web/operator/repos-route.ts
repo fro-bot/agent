@@ -11,7 +11,7 @@
  *   2. Operator rate limit (20/min, operator-keyed) — before binding enumeration
  *   3. Redaction policy availability — 503 {error: 'redaction-policy-unavailable'}, before any binding read
  *   4. listBindings() — enumerate all bound repos
- *   5. filterDeniedRecords() — drop denylisted repos
+ *   5. filterDeniedRecords() — drop denylisted repos, then re-check availability (grace can expire mid-read → 503)
  *   6. Dedup by owner/repo, then cap
  *   7. Map to RepoSummary[]; return 200
  *
@@ -167,6 +167,17 @@ export function buildReposRoute(app: Hono, deps: ReposRouteDeps): void {
     // ── Gate 5: Denylist filter ────────────────────────────────────────────
     // Extract deny keys from each binding; null/null means no usable key (fail closed).
     const allowed = filterDeniedRecords(bindings, bindingToRepoKey, deps.isRepoDenied)
+
+    // ── Gate 5b: Re-check availability after the read ──────────────────────
+    // Grace can expire while listBindings() is pending; the denylist checks then deny every binding, which would
+    // read as an empty listing. Report the outage instead of accepting that result.
+    if (deps.isPolicyAvailable() === false) {
+      deps.logger.warn(
+        {githubUserId, gate: 'redaction-policy-unavailable'},
+        'repos: redaction policy unavailable — returning 503',
+      )
+      return redactionPolicyUnavailableResponse(c)
+    }
 
     // Dedup by owner/repo BEFORE the cap — duplicate channelId bindings for the same
     // repo would otherwise consume cap slots and crowd out distinct repos.

@@ -212,6 +212,46 @@ describe('operator listings — redaction policy availability (#1875)', () => {
     await expectListed(await t.runs(), 'runs')
   })
 
+  describe.each([
+    {kind: 'repos', fetchListing: async (t: ReturnType<typeof setup>) => t.repos()},
+    {kind: 'runs', fetchListing: async (t: ReturnType<typeof setup>) => t.runs()},
+  ] as const)('grace expires while $kind listBindings is pending', ({fetchListing}) => {
+    it('answers 503 instead of an empty 200, with no repo identity', async () => {
+      // #given — a good load at t=0, then the reader breaks; the request starts at the grace boundary (still available)
+      const t = setup()
+      t.reader.healthy = true
+      await t.cache.getDenylistState()
+      t.reader.healthy = false
+      t.setNow(GRACE_MS)
+
+      let resolveBindings: (value: Awaited<ReturnType<typeof t.listBindings>>) => void = () => {}
+      t.listBindings.mockImplementationOnce(
+        async () =>
+          new Promise(resolve => {
+            resolveBindings = resolve
+          }),
+      )
+      const pending = fetchListing(t)
+      await vi.waitFor(() => expect(t.listBindings).toHaveBeenCalledTimes(1))
+
+      // #when — grace runs out while the binding read is in flight, then the read resolves
+      t.advance(1)
+      resolveBindings({success: true, data: [ALLOWED_BINDING, DENIED_BINDING]})
+      const res = await pending
+
+      // #then — the outage is reported, never an empty listing
+      await expectUnavailable(res)
+      expect(res.headers.get('Cache-Control')).toBe('no-store, private')
+      expect(t.listRunsForRepo).not.toHaveBeenCalled()
+      expect(t.routeLogger.warn).toHaveBeenCalledTimes(1)
+      const logged = JSON.stringify(t.routeLogger.warn.mock.calls)
+      expect(logged).toContain('redaction-policy-unavailable')
+      expect(logged).not.toContain('visible-repo')
+      expect(logged).not.toContain('hidden-repo')
+      expect(logged).not.toContain('acme')
+    })
+  })
+
   it('never lists a denied repo and logs no repo identity while unavailable', async () => {
     // #given — cold start with both a bound allowed repo and a bound denied repo
     const t = setup()
