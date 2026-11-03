@@ -143,6 +143,8 @@ export function buildSettledEmbed(
 
   let title: string
   let color: number
+  // Discord renders mentions in a description but never in an embed title, so a human decider goes here.
+  let decider: string | null = null
 
   if (reason === 'superseded') {
     title = '🔄 This approval request was superseded by a newer request.'
@@ -157,16 +159,20 @@ export function buildSettledEmbed(
     title = '⚠️ Cancelled (shutdown)'
     color = 0x99aab5 // grey
   } else if (decision === 'reject') {
-    title = mention === null ? '⛔ Denied' : `⛔ Denied by ${mention}`
+    title = '⛔ Denied'
+    decider = mention === null ? null : `Denied by ${mention}`
     color = 0xed4245 // red
   } else {
     // 'once' or 'always' — approved
-    title = mention === null ? '✅ Approved' : `✅ Approved by ${mention}`
+    title = '✅ Approved'
+    decider = mention === null ? null : `Approved by ${mention}`
     color = 0x57f287 // green
   }
 
-  return new EmbedBuilder()
-    .setTitle(title)
+  const embed = new EmbedBuilder().setTitle(title)
+  // The decider line is the only description content, so it cannot approach the 4096 limit.
+  if (decider !== null) embed.setDescription(decider)
+  return embed
     .setColor(color)
     .addFields(
       {name: 'Gate category', value: request.permission, inline: true},
