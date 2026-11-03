@@ -9,13 +9,16 @@
  * Gate ordering (all must pass before any repo data is returned):
  *   1. Guard (browser/session/allowlist) — installed by buildOperatorApp
  *   2. Operator rate limit (20/min, operator-keyed) — before binding enumeration
- *   3. listBindings() — enumerate all bound repos
- *   4. filterDeniedRecords() — drop denylisted repos
- *   5. Dedup by owner/repo, then cap
- *   6. Map to RepoSummary[]; return 200
+ *   3. Redaction policy availability — 503 {error: 'redaction-policy-unavailable'}, before any binding read
+ *   4. listBindings() — enumerate all bound repos
+ *   5. filterDeniedRecords() — drop denylisted repos, then re-check availability (grace can expire mid-read → 503)
+ *   6. Dedup by owner/repo, then cap
+ *   7. Map to RepoSummary[]; return 200
  *
  * Security invariants:
  *   - Denylisted repos are silently omitted (no oracle).
+ *   - An unavailable redaction policy is reported as a 503, never as an empty list; fail-closed stays fail-closed
+ *     (nothing is listed). The 503 names no repo and counts none.
  *   - Store errors return a coarse error; no partial list leaks.
  *   - Response carries no deny-keys, workspacePath, channelId, or internal IDs.
  *   - Result is capped at MAX_REPOS_PER_LISTING distinct owner/repo pairs (no pagination machinery).
@@ -31,7 +34,7 @@ import {createRateLimiter} from '../../http/rate-limit.js'
 import {toRepoSummary} from '../../operator-contract/repo-summary.js'
 import {bindingToRepoKey, filterDeniedRecords} from '../../redaction/surface-gate.js'
 import {getOperatorAuthContext, registerOperatorRoute} from '../operator-route.js'
-import {rateLimitedResponse} from '../safe-response.js'
+import {rateLimitedResponse, redactionPolicyUnavailableResponse} from '../safe-response.js'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -77,6 +80,12 @@ export interface ReposRouteDeps {
    * Called synchronously for each binding.
    */
   readonly isRepoDenied: (repoKey: RepoKey) => boolean
+  /**
+   * Whether the redaction policy is loaded and usable (`DenylistCache.isPolicyAvailable`). Required: an absent
+   * gate would let an unavailable policy read as an empty listing. While false, the route answers 503 before it
+   * reads any binding.
+   */
+  readonly isPolicyAvailable: () => boolean
   /** Structured logger. */
   readonly logger: OperatorLogger
   /** Injectable clock. */
@@ -129,7 +138,18 @@ export function buildReposRoute(app: Hono, deps: ReposRouteDeps): void {
       return rateLimitedResponse(c)
     }
 
-    // ── Gate 3: List all bound repos ──────────────────────────────────────
+    // ── Gate 3: Redaction policy availability ────────────────────────────────
+    // An unavailable policy denies every repo, which would read as an empty listing. Report it instead, before
+    // any binding is read. One warning per request; it carries no repo identity.
+    if (deps.isPolicyAvailable() === false) {
+      deps.logger.warn(
+        {githubUserId, gate: 'redaction-policy-unavailable'},
+        'repos: redaction policy unavailable — returning 503',
+      )
+      return redactionPolicyUnavailableResponse(c)
+    }
+
+    // ── Gate 4: List all bound repos ──────────────────────────────────────
     // A store error returns a coarse error — no partial list leaks.
     let bindings: RepoBinding[]
     try {
@@ -144,9 +164,20 @@ export function buildReposRoute(app: Hono, deps: ReposRouteDeps): void {
       return c.json({error: 'unavailable'}, 503)
     }
 
-    // ── Gate 4: Denylist filter ────────────────────────────────────────────
+    // ── Gate 5: Denylist filter ────────────────────────────────────────────
     // Extract deny keys from each binding; null/null means no usable key (fail closed).
     const allowed = filterDeniedRecords(bindings, bindingToRepoKey, deps.isRepoDenied)
+
+    // ── Gate 5b: Re-check availability after the read ──────────────────────
+    // Grace can expire while listBindings() is pending; the denylist checks then deny every binding, which would
+    // read as an empty listing. Report the outage instead of accepting that result.
+    if (deps.isPolicyAvailable() === false) {
+      deps.logger.warn(
+        {githubUserId, gate: 'redaction-policy-unavailable'},
+        'repos: redaction policy unavailable — returning 503',
+      )
+      return redactionPolicyUnavailableResponse(c)
+    }
 
     // Dedup by owner/repo BEFORE the cap — duplicate channelId bindings for the same
     // repo would otherwise consume cap slots and crowd out distinct repos.

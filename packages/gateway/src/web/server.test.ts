@@ -2223,6 +2223,7 @@ describe('buildOperatorApp — optional streaming deps accepted without error', 
   it('accepts denylistCache, bindingsLookup, and runObservationManager without registering new routes', () => {
     // #given — stub implementations of the three optional streaming deps
     const stubDenylistCache: import('./server.js').OperatorServerDeps['denylistCache'] = {
+      isPolicyAvailable: () => true,
       getDenylistState: async () => undefined,
       isRepoDenied: () => false,
     }
@@ -2284,6 +2285,7 @@ describe('buildOperatorApp — optional streaming deps accepted without error', 
 /** Shared stub for denylist cache — fail-open for registration tests. */
 function makeStubDenylistCache(): NonNullable<OperatorServerDeps['denylistCache']> {
   return {
+    isPolicyAvailable: () => true,
     getDenylistState: async () => undefined,
     isRepoDenied: () => false,
   }

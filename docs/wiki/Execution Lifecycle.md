@@ -206,7 +206,7 @@ Reasoning and response text share the SDK's text-delta shape. The Action records
 
 `runReleaseV2` (`src/harness/phases/release-v2.ts`) occupies this phase on V2. A successful execution drains within the remaining budget; a failed run or expired drain stops directory activity. Release requires eleven quiet readings spanning at least five seconds, covering active sessions, running shells, and queued inbox items. A settled ledger or an interrupt receipt alone cannot authorize it. [[Background Subagents and Ownership]] explains why background completion can wake a parent after its earlier idle event.
 
-The observer remains open until the directory decision. Later root turns are merged into success/failure, artifacts, and usage before Finalize. The run summary is written only after that observation ends, followed by pruning while the server is still available. Shutdown then confirms the child process exited. Thus V2 has already shut down before review reconciliation and response delivery, and Cleanup handles persistence rather than repeating that lifecycle.
+The observer remains open until the directory decision. Later root turns are merged into success/failure, artifacts, and usage before Finalize. Pruning runs after that observation ends, while the server is still available. Shutdown then confirms the child process exited. Thus V2 has already shut down before review reconciliation and response delivery, and Cleanup handles persistence rather than repeating that lifecycle.
 
 An exceptional exit before this phase still runs a stop-and-release attempt from `run.ts`'s outer `finally`. An unconfirmed stop or server exit declines saving; an expired successful-run drain remains incomplete even if cancellation subsequently confirms quiet, because work was cut short. A failed overflow stop also prevents starting a replacement session in the same checkout.
 
@@ -232,7 +232,7 @@ The phase is **fail-safe**: any error logs a warning and no-ops. It never throws
 
 ## 11. Finalize
 
-Collects metrics and sets action outputs (session ID, cache status, duration), and owns response delivery. On V1 the preceding execution path writes a synthetic summary and Finalize prunes sessions. V2 has already written its deferred summary and pruned during release, before shutting down the server, so these operations are not repeated here.
+Collects metrics and sets action outputs (session ID, cache status, duration), and owns response delivery. On V1 the preceding execution path writes a synthetic summary and Finalize prunes sessions. V2 writes no session summary and has already pruned during release, before shutting down the server, so these operations are not repeated here.
 
 The Actions job summary is HTML, while the comment footer is Markdown. `src/shared/summary-html.ts` builds escaped links, emphasis, code spans, and paragraphs for `job-summary.ts`, because GitHub does not interpret Markdown inside the toolkit's HTML tables and lists. Dynamic diagnostic text is escaped once, and remediation paragraphs stay outside the tables, preserving readable links and line breaks without treating error text as markup.
 

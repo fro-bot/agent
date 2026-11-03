@@ -40,6 +40,7 @@ function makeStubLogger() {
 
 function makeStubDenylistCache() {
   return {
+    isPolicyAvailable: () => true,
     getDenylistState: async () => undefined,
     isRepoDenied: () => false,
   }
@@ -220,6 +221,38 @@ describe('buildOperatorServerInputs — parity with production wiring', () => {
     // #then — the route is mounted and answers
     expect(res.status).toBe(200)
     expect(await res.json()).toEqual({runs: []})
+  })
+
+  it('answers both listings 503 while the redaction policy is unavailable', async () => {
+    // #given — the production deps path over a denylist cache whose policy is unavailable
+    const sessionStore = await createTestSessionStore()
+    const {deps, config} = buildOperatorServerInputs({
+      logger: makeStubLogger(),
+      isShuttingDown: () => false,
+      denylistCache: {...makeStubDenylistCache(), isPolicyAvailable: () => false},
+      bindingsStore: makeStubBindingsStore(),
+      runObservationManager: makeStubRunObservationManager(),
+      runIndex: makeStubRunIndex(),
+      approvalRegistry: makeStubApprovalRegistry(),
+      questionRegistry: makeStubQuestionRegistry(),
+      launchWorkDeps: makeStubLaunchWorkDeps(),
+      dispatchWorkflow: makeStubDispatchWorkflow(),
+      sessionStore,
+      operatorWebConfig: makeStubOperatorWebConfig(),
+    })
+    const app = buildOperatorApp(deps, config)
+    const sessionId = await mintTestSession(sessionStore, {githubUserId: 42, login: 'octocat'})
+    const authed = {cookie: `${SESSION_COOKIE_NAME}=${sessionId}`, origin: 'https://operator.smoke.test'}
+
+    // #when
+    const repos = await app.fetch(new Request('http://localhost/operator/repos', {headers: authed}))
+    const runs = await app.fetch(new Request('http://localhost/operator/runs', {headers: authed}))
+
+    // #then — server.ts wires the cache's policy state into both routes' gate
+    expect(repos.status).toBe(503)
+    expect(await repos.json()).toEqual({error: 'redaction-policy-unavailable'})
+    expect(runs.status).toBe(503)
+    expect(await runs.json()).toEqual({error: 'redaction-policy-unavailable'})
   })
 
   it.each(['approvalRegistry', 'questionRegistry'] as const)(

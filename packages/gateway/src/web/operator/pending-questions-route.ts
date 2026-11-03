@@ -49,7 +49,7 @@ const PENDING_QUESTIONS_RATE_WINDOW_MS = 60_000
 
 export interface PendingQuestionsRouteDeps {
   readonly runIndex: Pick<RunIndex, 'lookup'>
-  readonly denylistCache: DenylistCache
+  readonly denylistCache: Pick<DenylistCache, 'getDenylistState' | 'isRepoDenied'>
   readonly bindingsLookup: BindingsLookup
   /** Question registry — the sole source of pending request detail. */
   readonly registry: Pick<QuestionRegistry, 'describePendingForRun'>

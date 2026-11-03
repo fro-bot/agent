@@ -103,3 +103,16 @@ export function unavailableResponse<E extends Env, P extends string, I extends I
   }
   return c.json({error: 'unavailable'}, 503)
 }
+
+/**
+ * Return the 503 an operator listing sends while the redaction policy is unavailable (contract 1.15.0).
+ *
+ * A fixed reason with no body detail: it names no repo and counts none. Only the listings use it. Per-run routes
+ * keep the generic not-found response, so an unavailable policy never becomes an existence oracle there.
+ */
+export function redactionPolicyUnavailableResponse<E extends Env, P extends string, I extends Input>(
+  c: OperatorResponseContext<E, P, I>,
+): Response {
+  c.header('Cache-Control', 'no-store, private')
+  return c.json({error: 'redaction-policy-unavailable'}, 503)
+}

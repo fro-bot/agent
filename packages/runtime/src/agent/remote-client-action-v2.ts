@@ -14,7 +14,7 @@ import {createRemoteOpenCodeV2Client} from './remote-client-v2.js'
  *
  * They are a separate factory on purpose: the gateway's workspace proxy allowlists exactly what
  * `createRemoteOpenCodeV2Client` sends (`gateway-routes-v2.ts`, with a drift guard), so a route added to that client
- * widens the privileged bearer proxy. These five routes are the Action's own, against a server it owns, and are never
+ * widens the privileged bearer proxy. These four routes are the Action's own, against a server it owns, and are never
  * allowlisted for the gateway.
  *
  * - `POST /api/session/:id/agent` and `/model` set the agent and model of a continued session. A new session takes
@@ -23,7 +23,10 @@ import {createRemoteOpenCodeV2Client} from './remote-client-v2.js'
  *   at once for a prompt that is not admitted yet (probe P1) and says nothing about how an execution ended, so it is a
  *   hint and never a completion by itself.
  * - `PATCH /api/session/:id` re-asserts the title (V2 may regenerate it after the first prompt) and archives a session.
- * - `POST /api/session/:id/synthetic` with `resume: false` records a message in the transcript and starts no turn.
+ *
+ * There is deliberately no route for adding text to a session: `POST /api/session/:id/synthetic` only admits the text to the
+ * session inbox, to be delivered at the next step boundary. With `resume: false` and the server about to shut down
+ * nothing delivers it, so it stays a queued inbox item in the saved database (#2029).
  *
  * Failures are a `V2CallError` that never carries a body, a header or the URL.
  */
@@ -47,11 +50,6 @@ export interface ActionOpenCodeV2Client extends RemoteOpenCodeV2Client {
     readonly sessionId: string
     readonly title?: string
     readonly archived?: boolean
-    readonly signal?: AbortSignal
-  }) => Promise<Result<undefined, V2CallError>>
-  readonly addSyntheticMessage: (input: {
-    readonly sessionId: string
-    readonly text: string
     readonly signal?: AbortSignal
   }) => Promise<Result<undefined, V2CallError>>
 }
@@ -129,14 +127,6 @@ export function createActionOpenCodeV2Client(options: RemoteOpenCodeV2ClientOpti
         method: 'PATCH',
         path: sessionPath(sessionId),
         body: {...(title === undefined ? {} : {title}), ...(archived === undefined ? {} : {archived})},
-        ...(signal === undefined ? {} : {signal}),
-      }),
-
-    addSyntheticMessage: async ({sessionId, text, signal}) =>
-      sendNoContent({
-        method: 'POST',
-        path: `${sessionPath(sessionId)}/synthetic`,
-        body: {text, resume: false},
         ...(signal === undefined ? {} : {signal}),
       }),
   }
