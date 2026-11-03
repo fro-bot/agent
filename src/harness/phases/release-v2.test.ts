@@ -1,6 +1,5 @@
 import type {OpenCodeV2ServerHandle} from '@fro-bot/runtime'
 import type {ReleaseOutcomeV2} from '../../features/agent/drain-v2.js'
-import type {RunSummary} from '../../shared/types.js'
 import {createOwnershipLedger} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {PRE_SHUTDOWN_REQUEST_TIMEOUT_MS} from '../../features/agent/drain-v2.js'
@@ -11,7 +10,6 @@ import {boundRequests} from './release-v2.js'
 const mocks = vi.hoisted(() => ({
   releaseRunV2: vi.fn(),
   pruneSessionsV2: vi.fn(),
-  addSyntheticMessage: vi.fn(),
   createClient: vi.fn(),
 }))
 
@@ -61,21 +59,6 @@ async function release(overrides: Partial<Parameters<typeof import('./release-v2
   })
 }
 
-function summaryOf(tag: string): RunSummary {
-  return {
-    eventType: 'issue_comment',
-    repo: 'o/r',
-    ref: 'refs/heads/main',
-    runId: tag as unknown as number,
-    cacheStatus: 'hit',
-    sessionIds: [tag],
-    createdPRs: [],
-    createdCommits: [],
-    duration: 3,
-    tokenUsage: null,
-  }
-}
-
 function liveFor(order: string[]) {
   const tracker = createActivityTrackerV2()
   tracker.rootTerminal = {kind: 'failed'}
@@ -106,8 +89,7 @@ describe('runReleaseV2', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mocks.pruneSessionsV2.mockResolvedValue({prunedCount: 0, remainingCount: 0})
-    mocks.addSyntheticMessage.mockResolvedValue({success: true, data: undefined})
-    mocks.createClient.mockImplementation(() => ({addSyntheticMessage: mocks.addSyntheticMessage}))
+    mocks.createClient.mockImplementation(() => ({}))
   })
 
   it('reports a drained run as complete and allows persistence', async () => {
@@ -208,13 +190,11 @@ describe('runReleaseV2', () => {
     expect(mocks.pruneSessionsV2.mock.calls[1]?.[0]).toMatchObject({config: {maxSessions: 50}})
   })
 
-  it('writes the held run summary once the directory is quiet and before the server goes down, then prunes', async () => {
-    // #given a summary the execute phase held back for this handle
+  it('prunes once the directory is quiet and before the server goes down, and writes nothing into the session (#2029)', async () => {
+    // #given a quiet release whose server would answer any route
     const order: string[] = []
-    mocks.addSyntheticMessage.mockImplementation(async () => {
-      order.push('summary')
-      return {success: true, data: undefined}
-    })
+    const answering = vi.fn(async () => new Response(null, {status: 204}))
+    const answeringHandle = {...handle, fetch: answering} as unknown as OpenCodeV2ServerHandle
     mocks.pruneSessionsV2.mockImplementation(async () => {
       order.push('prune')
       return {prunedCount: 0, remainingCount: 0}
@@ -229,91 +209,12 @@ describe('runReleaseV2', () => {
     )
 
     // #when
-    await release({deferredSummary: {sessionId: 'ses_root', summary: summaryOf('ses_root')}})
+    await release({serverHandle: answeringHandle})
 
-    // #then
-    expect(order).toEqual(['quiet', 'summary', 'prune', 'shutdown'])
-    expect(mocks.addSyntheticMessage).toHaveBeenCalledWith(
-      expect.objectContaining({sessionId: 'ses_root', text: expect.stringContaining('Fro Bot Run Summary') as unknown}),
-    )
-  })
-
-  it('does not write the held summary when the release never reached a quiet directory', async () => {
-    // #given the release skips its pre-shutdown step
-    mocks.releaseRunV2.mockResolvedValue(outcome({quiet: false, declineReason: 'not quiet'}))
-
-    // #when
-    await release({deferredSummary: {sessionId: 'ses_root', summary: summaryOf('ses_root')}})
-
-    // #then nothing is written to a session that may still be running
-    expect(mocks.addSyntheticMessage).not.toHaveBeenCalled()
-  })
-
-  it('still prunes and shuts down when the summary cannot be written', async () => {
-    // #given
-    mocks.addSyntheticMessage.mockRejectedValue(new Error('socket closed'))
-    mocks.releaseRunV2.mockImplementation(
-      async (options: {beforeShutdown?: (signal: AbortSignal) => Promise<void>}) => {
-        await options.beforeShutdown?.(new AbortController().signal)
-        return outcome()
-      },
-    )
-
-    // #when
-    await release({deferredSummary: {sessionId: 'ses_root', summary: summaryOf('ses_root')}})
-
-    // #then
-    expect(mocks.pruneSessionsV2).toHaveBeenCalledTimes(1)
-  })
-
-  it('formats the held summary at release, after the drain-observed turn, with its artifacts and usage', async () => {
-    // #given a summary taken before the drain, and a notice-triggered turn that opened a PR and used tokens
-    const order: string[] = []
-    const {observation} = liveFor(order)
-    const seenAfterDrain = {
-      tokens: null,
-      model: null,
-      cost: null,
-      prsCreated: ['https://github.com/o/r/pull/9'],
-      commitsCreated: ['abc1234'],
-      commentsPosted: 0,
-      llmError: null,
-    }
-    const live = {
-      ...observation,
-      stop: async () => seenAfterDrain,
-      refreshUsage: vi.fn(async () => ({
-        tokens: {input: 120, output: 30, reasoning: 0, cache: {read: 0, write: 0}},
-        cost: 0.4,
-        model: 'p/m',
-      })),
-    }
-    mocks.releaseRunV2.mockImplementation(
-      async (options: {
-        onSettled?: (quiet: boolean, signal: AbortSignal) => Promise<void>
-        beforeShutdown?: (signal: AbortSignal) => Promise<void>
-      }) => {
-        await options.onSettled?.(true, new AbortController().signal)
-        await options.beforeShutdown?.(new AbortController().signal)
-        return outcome()
-      },
-    )
-
-    // #when
-    await release({
-      liveObservation: live,
-      deferredSummary: {
-        sessionId: 'ses_root',
-        summary: {...summaryOf('ses_root'), createdPRs: ['https://github.com/o/r/pull/1']},
-      },
-    })
-
-    // #then the written text carries the PR and commit seen only during the drain, and the final usage
-    const written = (mocks.addSyntheticMessage.mock.calls[0]?.[0] as {text: string}).text
-    expect(written).toContain('https://github.com/o/r/pull/1')
-    expect(written).toContain('https://github.com/o/r/pull/9')
-    expect(written).toContain('abc1234')
-    expect(written).toContain('Tokens: 120 in / 30 out')
+    // #then pruning runs in the pre-shutdown step, and nothing is posted to a session: a synthetic input would be
+    // admitted to its inbox and, with the server about to exit, stay queued in the saved database
+    expect(order).toEqual(['quiet', 'prune', 'shutdown'])
+    expect(answering).not.toHaveBeenCalled()
   })
 
   describe('the event observation kept through the wait', () => {
@@ -378,8 +279,8 @@ describe('runReleaseV2', () => {
     })
   })
 
-  it('shares nothing between two runs released together: each writes its own summary and stops its own observation', async () => {
-    // #given two runs in one process, each with its own observation and summary
+  it('shares nothing between two runs released together: each stops its own observation', async () => {
+    // #given two runs in one process, each with its own observation
     const order: string[] = []
     const first = liveFor(order)
     const second = liveFor(order)
@@ -396,27 +297,11 @@ describe('runReleaseV2', () => {
 
     // #when
     const [a, b] = await Promise.all([
-      release({liveObservation: first.observation, deferredSummary: {sessionId: 'ses_a', summary: summaryOf('ses_a')}}),
-      release({
-        liveObservation: second.observation,
-        deferredSummary: {sessionId: 'ses_b', summary: summaryOf('ses_b')},
-      }),
+      release({liveObservation: first.observation}),
+      release({liveObservation: second.observation}),
     ])
 
     // #then
-    expect(mocks.addSyntheticMessage).toHaveBeenCalledWith(
-      expect.objectContaining({
-        sessionId: 'ses_a',
-        text: expect.stringContaining('Run ID: ses_a') as unknown as string,
-      }),
-    )
-    expect(mocks.addSyntheticMessage).toHaveBeenCalledWith(
-      expect.objectContaining({
-        sessionId: 'ses_b',
-        text: expect.stringContaining('Run ID: ses_b') as unknown as string,
-      }),
-    )
-    expect(mocks.addSyntheticMessage).toHaveBeenCalledTimes(2)
     expect(order).toEqual(['stop', 'stop'])
     expect(first.refreshUsage).toHaveBeenCalledTimes(1)
     expect(second.refreshUsage).toHaveBeenCalledTimes(1)
@@ -428,12 +313,9 @@ describe('runReleaseV2', () => {
       vi.useRealTimers()
     })
 
-    it('cuts a summary request that never answers at its request bound and still prunes', async () => {
-      // #given the real V2 client over a fetch that only ends when its signal aborts
+    it('cuts a pre-shutdown request that never answers at its request bound and still prunes', async () => {
+      // #given a fetch that only ends when its signal aborts, and a prune whose request goes through the bounded route
       vi.useFakeTimers()
-      const actual = await vi.importActual<typeof import('../../features/agent/execution-v2.js')>(
-        '../../features/agent/execution-v2.js',
-      )
       const hanging = vi.fn(
         async (_path: string, init?: RequestInit) =>
           new Promise<Response>((_resolve, reject) => {
@@ -441,7 +323,10 @@ describe('runReleaseV2', () => {
           }),
       )
       const hangingHandle = {...handle, fetch: hanging} as unknown as OpenCodeV2ServerHandle
-      mocks.createClient.mockImplementation((h: OpenCodeV2ServerHandle) => actual.createActionClientV2(h))
+      mocks.pruneSessionsV2.mockImplementation(async (options: {fetchRoute: OpenCodeV2ServerHandle['fetch']}) => {
+        await options.fetchRoute('/api/session').catch(() => undefined)
+        return {prunedCount: 0, remainingCount: 0}
+      })
       mocks.releaseRunV2.mockImplementation(
         async (options: {beforeShutdown?: (signal: AbortSignal) => Promise<void>}) => {
           await options.beforeShutdown?.(new AbortController().signal)
@@ -451,10 +336,7 @@ describe('runReleaseV2', () => {
       let done = false
 
       // #when the request goes out and never answers
-      const pending = release({
-        serverHandle: hangingHandle,
-        deferredSummary: {sessionId: 'ses_root', summary: summaryOf('ses_root')},
-      }).then(() => {
+      const pending = release({serverHandle: hangingHandle}).then(() => {
         done = true
       })
       await vi.advanceTimersByTimeAsync(1_000)
@@ -462,7 +344,7 @@ describe('runReleaseV2', () => {
       await vi.advanceTimersByTimeAsync(PRE_SHUTDOWN_REQUEST_TIMEOUT_MS)
       await pending
 
-      // #then it was aborted at the bound, and the step went on to the prune
+      // #then it was aborted at the bound, and the release went on
       expect(hanging).toHaveBeenCalledTimes(1)
       expect(mocks.pruneSessionsV2).toHaveBeenCalledTimes(1)
     })

@@ -1,15 +1,12 @@
 import type {OpenCodeV2ServerHandle, OwnershipLedger} from '@fro-bot/runtime'
 import type {LiveObservationV2} from '../../features/agent/live-observation-v2.js'
 import type {Logger} from '../../shared/logger.js'
-import type {RunSummary} from '../../shared/types.js'
-import type {DrainOutcome} from './execute.js'
-import type {DeferredSummaryV2} from './execution-backend.js'
+import type {DrainOutcome, ExecutePhaseResult} from './execute.js'
 import type {ObservedTurnV2} from './observed-turn-v2.js'
-import {DEFAULT_PRUNING_CONFIG, formatSummaryForSession} from '@fro-bot/runtime'
+import {DEFAULT_PRUNING_CONFIG} from '@fro-bot/runtime'
 import {PRE_SHUTDOWN_REQUEST_TIMEOUT_MS, releaseRunV2} from '../../features/agent/drain-v2.js'
 import {createActionClientV2} from '../../features/agent/execution-v2.js'
 import {getObservedFailureV2} from '../../features/agent/streaming-v2.js'
-import {toErrorMessage} from '../../shared/errors.js'
 import {pruneSessionsV2} from './prune-v2.js'
 import {createSessionReaderV2} from './session-v2.js'
 
@@ -19,7 +16,7 @@ import {createSessionReaderV2} from './session-v2.js'
  * `releaseRunV2` (`features/agent/drain-v2.ts`) holds the policy: drain on success, stop on anything else, confirm the
  * directory quiet, shut the server down. This adds what only the harness knows: the session retention to prune to (done
  * while the server is up and the directory is quiet, V1's order) and the verdict as a `DrainOutcome` plus the reason
- * persistence must be declined. The run summary is written here too (`DeferredSummaryV2`).
+ * persistence must be declined. No run summary is written into the session on V2 (see `ExecutionBackend.writeSummary`).
  */
 
 export interface RunReleaseV2Options {
@@ -35,8 +32,6 @@ export interface RunReleaseV2Options {
   readonly logger: Logger
   /** The event observation the execute phase kept open (`ExecutePhaseResult.liveObservation`): stopped here, once. */
   readonly liveObservation?: LiveObservationV2 | undefined
-  /** The run summary the execute phase held back (`ExecutePhaseResult.deferredSummary`): written here, once. */
-  readonly deferredSummary?: DeferredSummaryV2 | undefined
 }
 
 export interface RunReleaseV2Result {
@@ -78,43 +73,21 @@ export function boundRequests(
   }
 }
 
-/** The held summary with what the drain-observed turns added: their artifacts and the usage re-read after them. */
-export function summaryAfterObservation(summary: RunSummary, observed: ObservedTurnV2 | undefined): RunSummary {
-  if (observed === undefined) return summary
-  const appendNew = (known: readonly string[], seen: readonly string[]): string[] => [
-    ...known,
-    ...seen.filter(item => !known.includes(item)),
-  ]
+/**
+ * The release options for a finished execution: the one place the execute phase's result is handed to `runReleaseV2`.
+ * `run.ts` and the real-binary integration tests both build them here, so a field carried from the result to the release
+ * cannot be dropped by a test that assembles the options by hand and still pass (#2029).
+ */
+export function releaseOptionsFromExecution(
+  execution: ExecutePhaseResult,
+  context: Pick<RunReleaseV2Options, 'serverHandle' | 'runStartedAt' | 'deadlineMs' | 'sessionRetention' | 'logger'>,
+): RunReleaseV2Options {
   return {
-    ...summary,
-    createdPRs: appendNew(summary.createdPRs, observed.result.prsCreated),
-    createdCommits: appendNew(summary.createdCommits, observed.result.commitsCreated),
-    tokenUsage: observed.usage?.tokens ?? summary.tokenUsage,
-  }
-}
-
-/** The run summary the execute phase held back. Best-effort: a summary that cannot be written costs the next run context. */
-async function writeDeferredSummary(
-  serverHandle: OpenCodeV2ServerHandle,
-  held: DeferredSummaryV2 | undefined,
-  observed: ObservedTurnV2 | undefined,
-  fetchRoute: FetchRoute,
-  logger: Logger,
-): Promise<void> {
-  if (held === undefined) return
-  const summary = {
-    sessionId: held.sessionId,
-    text: formatSummaryForSession(summaryAfterObservation(held.summary, observed)),
-  }
-  try {
-    const result = await createActionClientV2({...serverHandle, fetch: fetchRoute}).addSyntheticMessage({
-      sessionId: summary.sessionId,
-      text: summary.text,
-    })
-    if (result.success) logger.info('Session summary written via V2 route', {sessionId: summary.sessionId})
-    else logger.warning('V2 summary writeback failed', {sessionId: summary.sessionId, error: result.error.kind})
-  } catch (error) {
-    logger.warning('V2 summary writeback failed', {sessionId: summary.sessionId, error: toErrorMessage(error)})
+    ...context,
+    executionSucceeded: execution.success,
+    rootSessionId: execution.sessionId,
+    ledger: execution.ownershipLedger,
+    liveObservation: execution.liveObservation,
   }
 }
 
@@ -144,7 +117,6 @@ export async function runReleaseV2(options: RunReleaseV2Options): Promise<RunRel
     },
     beforeShutdown: async signal => {
       const fetchRoute = boundRequests(serverHandle.fetch, signal)
-      await writeDeferredSummary(serverHandle, options.deferredSummary, seen.observed, fetchRoute, logger)
       await pruneSessionsV2({
         reader: createSessionReaderV2(fetchRoute),
         fetchRoute,

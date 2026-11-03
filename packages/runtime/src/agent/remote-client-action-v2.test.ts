@@ -107,21 +107,4 @@ describe('createActionOpenCodeV2Client', () => {
       ['PATCH', 'http://w/api/session/ses_1', {archived: true}],
     ])
   })
-
-  it('appends a synthetic message without scheduling a turn', async () => {
-    // #given
-    const {fetch, requests} = makeFetch(() => json(200, {data: {}}))
-    const client = createActionOpenCodeV2Client({baseUrl: 'http://w', fetch})
-
-    // #when
-    const result = await client.addSyntheticMessage({sessionId: 'ses_1', text: 'summary'})
-
-    // #then
-    expect(result.success).toBe(true)
-    expect(requests[0]).toMatchObject({
-      method: 'POST',
-      url: 'http://w/api/session/ses_1/synthetic',
-      body: {text: 'summary', resume: false},
-    })
-  })
 })

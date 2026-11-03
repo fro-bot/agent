@@ -17,7 +17,7 @@ import type {OutputMode, ResolvedOutputMode, TokenUsage} from '../../shared/type
 import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {BrokeredPushPlan} from './brokered-push-plan.js'
 import type {CacheRestorePhaseResult, CacheRestoreV2PhaseResult} from './cache-restore.js'
-import type {DeferredSummaryV2, ExecutionBackend} from './execution-backend.js'
+import type {ExecutionBackend} from './execution-backend.js'
 import type {RoutingPhaseResult} from './routing.js'
 import type {SessionPrepPhaseResult} from './session-prep.js'
 import * as fs from 'node:fs/promises'
@@ -77,8 +77,6 @@ export interface ExecutePhaseResult {
    * publication for it.
    */
   readonly sendUncertain?: boolean
-  /** V2 only. The run summary held back for the release to write (see `DeferredSummaryV2`). */
-  readonly deferredSummary?: DeferredSummaryV2
   /**
    * The ownership ledger backing this phase's active session (the recovery
    * session's ledger once overflow recovery has run, otherwise the original
@@ -176,7 +174,6 @@ function selectExecutionBackend(cacheRestore: CacheRestorePhaseResult | CacheRes
     },
     writeSummary: async (sessionId, summary, logger) => {
       await writeSessionSummary(sessionId, summary, serverHandle.client, logger)
-      return undefined
     },
   }
 }
@@ -538,10 +535,9 @@ export async function runExecute(
     metrics.incrementComments()
   }
 
-  let deferredSummary: DeferredSummaryV2 | undefined
-  if (result.sessionId != null) {
+  if (result.sessionId != null && backend.writeSummary !== undefined) {
     const sessionLogger = createLogger({phase: 'session'})
-    deferredSummary = await backend.writeSummary(
+    await backend.writeSummary(
       result.sessionId,
       {
         eventType: routing.agentContext.eventName,
@@ -563,7 +559,6 @@ export async function runExecute(
 
   return {
     ...result,
-    ...(deferredSummary === undefined ? {} : {deferredSummary}),
     executionDurationMs: Date.now() - executionStartTime,
   }
 }

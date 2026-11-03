@@ -97,7 +97,9 @@ vi.mock('./phases/finalize.js', () => ({
   runFinalizeWithResult: vi.fn().mockResolvedValue({exitCode: 0, deliveryKind: 'none'}),
 }))
 
-vi.mock('./phases/release-v2.js', () => ({
+// Only the release itself is faked: the options builder stays real, so these tests assert the handoff `run.ts` makes.
+vi.mock('./phases/release-v2.js', async importOriginal => ({
+  ...(await importOriginal<typeof import('./phases/release-v2.js')>()),
   runReleaseV2: vi.fn(),
 }))
 
@@ -478,20 +480,18 @@ describe('run on an OpenCode V2 server', () => {
     expect(exitCode).toBe(0)
   })
 
-  it('hands the execute phase observation and summary to the release, explicitly', async () => {
-    // #given an execute result that carries both
+  it('hands the execute phase observation to the release, explicitly', async () => {
+    // #given an execute result that carries one
     const {runReleaseV2} = await import('./phases/release-v2.js')
     const liveObservation = {tracker: {}, snapshot: vi.fn(), stop: vi.fn()} as never
-    const deferredSummary = {sessionId: 'ses_v2', summary: {} as never}
-    await arrange({extras: {liveObservation, deferredSummary}})
+    await arrange({extras: {liveObservation}})
 
     // #when
     await run()
 
-    // #then the release receives exactly those values
+    // #then the release receives exactly that value
     const options = vi.mocked(runReleaseV2).mock.calls[0]?.[0]
     expect(options?.liveObservation).toBe(liveObservation)
-    expect(options?.deferredSummary).toBe(deferredSummary)
   })
 
   it('stops, rather than drains, a run whose execution did not succeed', async () => {

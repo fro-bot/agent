@@ -22,7 +22,6 @@ const mocks = vi.hoisted(() => ({
   writeSessionSummary: vi.fn(),
   findLatestSession: vi.fn(),
   updateSession: vi.fn(),
-  addSyntheticMessage: vi.fn(),
   stopAndConfirmQuietV2: vi.fn(),
   getInput: vi.fn(),
   logger: {debug: vi.fn(), info: vi.fn(), warning: vi.fn(), error: vi.fn()},
@@ -55,10 +54,7 @@ vi.mock('../../features/agent/index.js', () => ({
 }))
 vi.mock('../../features/agent/execution-v2.js', () => ({
   executeOpenCodeV2: mocks.executeOpenCodeV2,
-  createActionClientV2: vi.fn(() => ({
-    updateSession: mocks.updateSession,
-    addSyntheticMessage: mocks.addSyntheticMessage,
-  })),
+  createActionClientV2: vi.fn(() => ({updateSession: mocks.updateSession})),
 }))
 vi.mock('../../features/agent/drain-v2.js', () => ({stopAndConfirmQuietV2: mocks.stopAndConfirmQuietV2}))
 vi.mock('../../shared/logger.js', () => ({createLogger: vi.fn(() => mocks.logger)}))
@@ -231,7 +227,6 @@ describe('runExecute generation selector', () => {
     mocks.archiveSession.mockResolvedValue(true)
     mocks.searchSessions.mockResolvedValue([])
     mocks.updateSession.mockResolvedValue({success: true, data: undefined})
-    mocks.addSyntheticMessage.mockResolvedValue({success: true, data: undefined})
     mocks.stopAndConfirmQuietV2.mockResolvedValue({quiet: true})
   })
 
@@ -247,7 +242,6 @@ describe('runExecute generation selector', () => {
     expect(mocks.executeOpenCode).toHaveBeenCalledTimes(1)
     expect(mocks.executeOpenCodeV2).not.toHaveBeenCalled()
     expect(mocks.writeSessionSummary).toHaveBeenCalledTimes(1)
-    expect(mocks.addSyntheticMessage).not.toHaveBeenCalled()
   })
 
   it('runs a V2 run on the V2 executor with the invocation ledger and never touches the V1 one', async () => {
@@ -267,12 +261,9 @@ describe('runExecute generation selector', () => {
     const call = mocks.executeOpenCodeV2.mock.calls[0]
     expect(call?.[3]).toBe(cacheRestore.serverHandle)
     expect(call?.[4]).toBe(result.ownershipLedger)
-    // The summary is not written through the SDK client, and not yet through the V2 route either: a queued synthetic
-    // message would keep the root's inbox non-empty, and the release waits for an empty one. It is held for the release.
+    // V2 writes no run summary into the session: the SDK client is V1's, and the V2 route that adds text only queues it
+    // in the inbox, where nothing delivers it before the server exits (#2029).
     expect(mocks.writeSessionSummary).not.toHaveBeenCalled()
-    expect(mocks.addSyntheticMessage).not.toHaveBeenCalled()
-    expect(result.deferredSummary?.sessionId).toBe('ses_v2')
-    expect(result.deferredSummary?.summary).toMatchObject({eventType: 'pull_request', sessionIds: ['ses_v2']})
   })
 
   it('routes the overflow-recovery restart through the V2 executor, archiving over the V2 route', async () => {
@@ -310,7 +301,7 @@ describe('runExecute generation selector', () => {
     expect(mocks.executeOpenCodeV2.mock.calls[1]?.[4]).not.toBe(mocks.executeOpenCodeV2.mock.calls[0]?.[4])
   })
 
-  it('carries the replacement run observation and summary across an overflow restart, and stops the overflowed one', async () => {
+  it('carries the replacement run observation across an overflow restart, and stops the overflowed one', async () => {
     // #given an overflowed run that kept an observation, and a replacement that keeps its own
     const overflowedStop = vi.fn(async () => ({}) as never)
     const replacementStop = vi.fn(async () => ({}) as never)
@@ -325,12 +316,10 @@ describe('runExecute generation selector', () => {
     // #when
     const result = await runExecute(bootstrap(), routing(), v2CacheRestore(), sessionPrep(), metrics(), 0)
 
-    // #then the overflowed observation ended at the restart; the result carries the replacement's, and the summary is
-    // the replacement session's
+    // #then the overflowed observation ended at the restart; the result carries the replacement's
     expect(overflowedStop).toHaveBeenCalledTimes(1)
     expect(replacementStop).not.toHaveBeenCalled()
     expect(result.liveObservation?.stop).toBe(replacementStop)
-    expect(result.deferredSummary?.sessionId).toBe('recovered')
   })
 
   it('keeps the overflowed observation in the result when no restart happens, for the release to stop', async () => {
