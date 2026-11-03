@@ -9,8 +9,8 @@ import {toErrorMessage} from '../../shared/errors.js'
 import {createSessionReaderV2} from './session-v2.js'
 
 /**
- * The OpenCode V2 side of `runExecute`'s selector (`execute.ts`): the same six operations as V1, over the V2 server's
- * routes. The retry policy, deadline and one-comment protocol are not here; they are shared with V1 inside
+ * The OpenCode V2 side of `runExecute`'s selector (`execute.ts`): the same operations as V1 except the summary write,
+ * over the V2 server's routes. The retry policy, deadline and one-comment protocol are not here; they are shared with V1 inside
  * `executeOpenCodeV2`.
  */
 /** The longest the overflow archive may take. It is best-effort: a session left unarchived is re-continued next run. */
@@ -93,12 +93,7 @@ export function createExecutionBackendV2(cacheRestore: CacheRestoreV2PhaseResult
     // The V2 loop creates the session itself and reports its id, so there is nothing to look up afterwards.
     findLatestSessionId: async () => null,
 
-    // Returned, not written: a summary posted now would sit in the root's inbox as a queued item and the directory gate
-    // would wait on it for ever. It rides on the execute result to the release, which writes it after the final reading,
-    // just before the shutdown (`release-v2.ts`).
-    writeSummary: async (sessionId, summary, logger) => {
-      logger.debug('Session summary deferred until the run is released', {sessionId})
-      return {sessionId, summary}
-    },
+    // No `writeSummary`: see `ExecutionBackend.writeSummary`. V2 has no way to append a delivered message without starting
+    // a turn, and a synthetic input left queued (#2029) keeps the next run's drain from ever going quiet.
   }
 }

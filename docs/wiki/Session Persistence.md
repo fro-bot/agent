@@ -59,7 +59,7 @@ Session persistence involves three cooperating subsystems:
 
 1. **Cache layer** (`src/services/cache/`) — Saves and restores the OpenCode storage directory to/from GitHub Actions cache, with optional S3 write-through backup.
 2. **Session layer** (`packages/runtime/src/session/`) — Reads, searches, and manages sessions through the V1 SDK or native V2 routes, with generation-specific mappers. Part of `@fro-bot/runtime` (see [[Architecture Overview]]).
-3. **Writeback** — Injects a synthetic summary into session history, making past work discoverable. V1 uses `writeback.ts`; V2 defers its write to `src/harness/phases/release-v2.ts` after draining notice-triggered turns.
+3. **Writeback** — Injects a synthetic summary into session history, making past work discoverable. V1 only, via `writeback.ts`. V2 writes no summary (see [Run Summary Writeback](#run-summary-writeback)).
 
 ## Cache Strategy
 
@@ -224,9 +224,9 @@ This "age OR count" approach prevents both unbounded growth (count limit) and pr
 
 ## Run Summary Writeback
 
-Each run's session writeback records a structured summary of what the agent did, including the event type, repository, cache status, session ID, and errors. It becomes searchable by future runs through session search. The write happens during V1 execution or V2 release, while the selected server remains available.
+On V1, each run's session writeback records a structured summary of what the agent did, including the event type, repository, cache status, session ID, and errors. It becomes searchable by future runs through session search. The write happens during V1 execution, while the server remains available, and the summary is not treated as an authoritative run-state record.
 
-V1 writes a synthetic user message. V2 writes through its synthetic-message route only after the final directory observation, merging later notice-triggered artifacts and refreshing usage first. Writing that summary before drain would put a new item in the very root inbox the release gate needs empty. Both paths keep the summary searchable without treating model prose as an authoritative run-state record.
+V2 writes no summary. Its only route for adding text to a session, `POST /api/session/:id/synthetic`, admits the text to the session inbox and delivers it as a message at the next step boundary. With `resume: false` and the server about to shut down, nothing delivers it, so the old V2 write never reached the transcript. It stayed as a queued inbox row in the saved database, and a run that started within ten minutes read that row as queued work on every pass and never drained quiet (#2029). Nothing on V2 read the summary: prior-work search matches message text, and no summary message ever existed.
 
 ## Implementation Reference
 

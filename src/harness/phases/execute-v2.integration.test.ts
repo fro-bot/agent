@@ -473,6 +473,23 @@ function sessionClaims(dbPath: string): readonly {id: string; suspended: number 
   }
 }
 
+/**
+ * Every row of `session_inbox`. In OpenCode 2.2.5 a row present IS an undelivered item (delivery deletes the row; there is
+ * no state column), so a clean saved database has none.
+ */
+function undeliveredInboxRows(dbPath: string): readonly {session_id: string; type: string; delivery: string}[] {
+  const db = new DatabaseSync(dbPath, {readOnly: true})
+  try {
+    return db.prepare('SELECT session_id, type, delivery FROM session_inbox').all() as unknown as {
+      session_id: string
+      type: string
+      delivery: string
+    }[]
+  } finally {
+    db.close()
+  }
+}
+
 /** A file's size, or 0 when it is not there. One call, so there is no check-then-use window on the path. */
 function sizeOrZero(file: string): number {
   try {
@@ -773,7 +790,6 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
       rootSessionId: result.sessionId,
       ledger: result.ownershipLedger,
       liveObservation: result.liveObservation,
-      deferredSummary: result.deferredSummary,
       runStartedAt: startedAt,
       deadlineMs: computeDrainDeadlineMs(120_000, result.executionDurationMs),
       sessionRetention: 50,
@@ -827,7 +843,6 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
       rootSessionId: result.sessionId,
       ledger: result.ownershipLedger,
       liveObservation: result.liveObservation,
-      deferredSummary: result.deferredSummary,
       runStartedAt: startedAt,
       deadlineMs: computeDrainDeadlineMs(120_000, result.executionDurationMs),
       sessionRetention: 50,
@@ -871,6 +886,51 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
     expect(sizeOrZero(path.join(dbDir, 'opencode.db-wal'))).toBe(0)
   }, 300_000)
 
+  it('leaves nothing queued in the session inbox after release, so the next run drains quiet at once (#2029)', async () => {
+    // #given a plain one-turn run, released the way `run.ts` releases it
+    const box = createSandbox()
+    sandboxes.push(box)
+    const provider = await startScriptedProvider([{text: 'Plain answer.'}])
+    providers.push(provider)
+    const real = await startRealServer(box, provider)
+    const startedAt = Date.now()
+    const result = await executePhase(real, box, 120_000)
+    const release = await runReleaseV2({
+      serverHandle: real,
+      executionSucceeded: result.success,
+      rootSessionId: result.sessionId,
+      ledger: result.ownershipLedger,
+      liveObservation: result.liveObservation,
+      runStartedAt: startedAt,
+      deadlineMs: computeDrainDeadlineMs(120_000, result.executionDurationMs),
+      sessionRetention: 50,
+      logger: createMockLogger(),
+    })
+    expect(result).toMatchObject({success: true, exitCode: 0})
+    expect(release.persistenceDeclineReason).toBeUndefined()
+    expect((await real.exited).code).toBe(0)
+
+    // #then the saved database holds no undelivered inbox item (the run summary used to be left there)
+    expect(undeliveredInboxRows(box.dbPath)).toEqual([])
+
+    // #and a second run started straight away on the same database drains quiet instead of reading `queued: 1` for ever
+    const next = await startRealServer(box, provider)
+    const nextRelease = await runReleaseV2({
+      serverHandle: next,
+      executionSucceeded: true,
+      rootSessionId: null,
+      ledger: undefined,
+      runStartedAt: Date.now(),
+      deadlineMs: 60_000,
+      sessionRetention: 50,
+      logger: createMockLogger(),
+    })
+    expect(nextRelease.drain).toMatchObject({expired: false, unknownCount: 0})
+    expect(nextRelease.persistenceDeclineReason).toBeUndefined()
+    expect((await next.exited).code).toBe(0)
+    expect(undeliveredInboxRows(box.dbPath)).toEqual([])
+  }, 300_000)
+
   it('accounts for a background shell that a FOREGROUND subagent started, through completion', async () => {
     // #given a root that runs a foreground subagent, whose child starts a 5 s background shell and ends its own turn
     const box = createSandbox()
@@ -895,7 +955,6 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
       rootSessionId: result.sessionId,
       ledger: result.ownershipLedger,
       liveObservation: result.liveObservation,
-      deferredSummary: result.deferredSummary,
       runStartedAt: startedAt,
       deadlineMs: computeDrainDeadlineMs(120_000, result.executionDurationMs),
       sessionRetention: 50,
@@ -937,7 +996,6 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
       rootSessionId: result.sessionId,
       ledger: result.ownershipLedger,
       liveObservation: result.liveObservation,
-      deferredSummary: result.deferredSummary,
       runStartedAt: startedAt,
       deadlineMs: 0,
       sessionRetention: 50,

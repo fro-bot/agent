@@ -87,10 +87,9 @@ export async function run(): Promise<number> {
   // (SKIP_AGENT_EXECUTION=true) or the try block failed before reaching that point --
   // both cases runCleanup treats as an empty, persistence-safe ledger.
   let ownershipLedger: OwnershipLedger | undefined
-  // V2 only, hoisted like the ledger so the release in the `finally` block can still stop the observation and write the
-  // summary if a phase between execution and the release threw. Both come from `runExecute`'s result.
+  // V2 only, hoisted like the ledger so the release in the `finally` block can still stop the observation if a phase
+  // between execution and the release threw. It comes from `runExecute`'s result.
   let liveObservation: ExecutePhaseResult['liveObservation']
-  let deferredSummary: ExecutePhaseResult['deferredSummary']
   let requestedOutputModeState: OutputModeRequestState = 'omitted'
   let finalizationStarted = false
   let storeConfig: ObjectStoreConfig = {
@@ -283,7 +282,6 @@ export async function run(): Promise<number> {
     )
     ownershipLedger = execution.ownershipLedger
     liveObservation = execution.liveObservation
-    deferredSummary = execution.deferredSummary
     // Sticky, invocation-scoped facts -- feed the invocation-outcome assessment
     // (src/harness/outcome.ts), never `execution.success` itself.
     observationGap = execution.observationGap === true
@@ -309,7 +307,6 @@ export async function run(): Promise<number> {
         sessionRetention,
         logger: drainLogger,
         liveObservation: execution.liveObservation,
-        deferredSummary: execution.deferredSummary,
       })
       serverReleasedV2 = true
       drainResult = release.drain
@@ -463,7 +460,6 @@ export async function run(): Promise<number> {
           sessionRetention,
           logger: createLogger({phase: 'drain'}),
           liveObservation,
-          deferredSummary,
         })
         if (release.persistenceDeclineReason !== undefined) {
           skipSessionPersistence = true
