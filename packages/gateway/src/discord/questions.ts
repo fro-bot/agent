@@ -173,7 +173,7 @@ export type QuestionPromptPlan =
  * masked links (`[text](url)` would otherwise render as a clickable link with attacker-chosen
  * text), headings, and list markers, so the text reads as the plain text it is.
  */
-function escapeText(text: string): string {
+export function escapeText(text: string): string {
   return escapeMarkdown(text, {maskedLink: true, heading: true, bulletedList: true, numberedList: true})
 }
 
