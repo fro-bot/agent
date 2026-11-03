@@ -72,6 +72,17 @@ export interface DenylistCache {
    * - The databaseId or nodeId matches a redacted entry.
    */
   readonly isRepoDenied: (repoKey: RepoKey) => boolean
+  /**
+   * Synchronous coarse policy state, independent of any repo: true when a last-known-good denylist is being
+   * served, false when none is (cold start, or the grace window expired without a successful refresh).
+   *
+   * Inside the grace window this is true: last-known-good is serving. Expiry is derived from elapsed time on read
+   * (the boundary `lastGoodAt + graceMs` is still usable, matching `isRepoDenied`), and the read never refreshes.
+   *
+   * Operator listings use this to report an unavailable policy instead of an empty list. It never relaxes
+   * `isRepoDenied`: while this is false, every repo is still denied.
+   */
+  readonly isPolicyAvailable: () => boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -232,5 +243,14 @@ export function createDenylistCache(options: DenylistCacheOptions): DenylistCach
     return false
   }
 
-  return {getDenylistState, isRepoDenied}
+  // ---------------------------------------------------------------------------
+  // isPolicyAvailable
+  // ---------------------------------------------------------------------------
+
+  function isPolicyAvailable(): boolean {
+    evictIfGraceExpired()
+    return lastGoodDenylist !== null
+  }
+
+  return {getDenylistState, isRepoDenied, isPolicyAvailable}
 }

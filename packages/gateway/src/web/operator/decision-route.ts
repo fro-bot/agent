@@ -55,7 +55,7 @@ export interface DecisionRouteDeps {
   /** Server-owned run index for runId → repo resolution. */
   readonly runIndex: Pick<RunIndex, 'lookup'>
   /** Denylist cache for pre-decision redaction check. */
-  readonly denylistCache: DenylistCache
+  readonly denylistCache: Pick<DenylistCache, 'getDenylistState' | 'isRepoDenied'>
   /** Bindings lookup for deny-key resolution. */
   readonly bindingsLookup: BindingsLookup
   /** Approval registry — the sole settlement path. */

@@ -119,6 +119,7 @@ function makeBaseDeps(overrides: Partial<ReposRouteDeps> = {}): ReposRouteDeps {
   return {
     listBindings: vi.fn(async () => ({success: true as const, data: [] as RepoBinding[]})),
     isRepoDenied: vi.fn(() => false),
+    isPolicyAvailable: vi.fn(() => true),
     logger: {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
     now: () => 0,
     ...overrides,
@@ -480,5 +481,88 @@ describe('GET /operator/repos — auth context guard', () => {
 
     // #then
     expect(res.status).toBe(401)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Redaction policy unavailable (#1875)
+// ---------------------------------------------------------------------------
+
+describe('GET /operator/repos — redaction policy unavailable', () => {
+  const SECRET_OWNER = 'secret-owner'
+  const SECRET_REPO = 'secret-repo'
+
+  it('returns 503 redaction-policy-unavailable with no-store, before any binding read', async () => {
+    // #given — the policy is unavailable and a binding exists
+    const listBindings = vi.fn(async () => ({
+      success: true as const,
+      data: [makeBinding(SECRET_OWNER, SECRET_REPO)],
+    }))
+    const deps = makeBaseDeps({listBindings, isPolicyAvailable: vi.fn(() => false)})
+    const app = buildTestApp(deps)
+
+    // #when
+    const res = await app.fetch(new Request('http://localhost/operator/repos'))
+
+    // #then — a distinct 503, never an empty 200, and the store is never read
+    expect(res.status).toBe(503)
+    expect(await res.json()).toEqual({error: 'redaction-policy-unavailable'})
+    expect(res.headers.get('Cache-Control')).toBe('no-store, private')
+    expect(listBindings).not.toHaveBeenCalled()
+  })
+
+  it('logs one warning per request and carries no repo identity in the body or the log', async () => {
+    // #given
+    const listBindings = vi.fn(async () => ({
+      success: true as const,
+      data: [makeBinding(SECRET_OWNER, SECRET_REPO)],
+    }))
+    const deps = makeBaseDeps({listBindings, isPolicyAvailable: vi.fn(() => false)})
+    const app = buildTestApp(deps)
+
+    // #when
+    const res = await app.fetch(new Request('http://localhost/operator/repos'))
+    const bodyText = await res.text()
+
+    // #then
+    expect(deps.logger.warn).toHaveBeenCalledTimes(1)
+    const logged = JSON.stringify(vi.mocked(deps.logger.warn).mock.calls)
+    expect(logged).not.toContain(SECRET_OWNER)
+    expect(logged).not.toContain(SECRET_REPO)
+    expect(bodyText).not.toContain(SECRET_OWNER)
+    expect(bodyText).not.toContain(SECRET_REPO)
+  })
+
+  it('does not bypass the rate limit: a rate-limited request still gets 429', async () => {
+    // #given — the policy is unavailable AND the operator is over the limit
+    const deps = makeBaseDeps({isPolicyAvailable: vi.fn(() => false), perMinRateLimiter: {allow: () => false}})
+    const app = buildTestApp(deps)
+
+    // #when
+    const res = await app.fetch(new Request('http://localhost/operator/repos'))
+
+    // #then
+    expect(res.status).toBe(429)
+  })
+
+  it('serves the filtered listing again once the policy is available', async () => {
+    // #given — the policy flips from unavailable to available between requests
+    let available = false
+    const bindings = [makeBinding('acme', 'alpha', {databaseId: 1}), makeBinding('acme', 'denied', {databaseId: 2})]
+    const deps = makeBaseDeps({
+      listBindings: vi.fn(async () => ({success: true as const, data: bindings})),
+      isRepoDenied: vi.fn((key: RepoKey) => key.databaseId === 2),
+      isPolicyAvailable: vi.fn(() => available),
+    })
+    const app = buildTestApp(deps)
+
+    // #when / #then
+    expect((await app.fetch(new Request('http://localhost/operator/repos'))).status).toBe(503)
+
+    available = true
+    const res = await app.fetch(new Request('http://localhost/operator/repos'))
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as {repo: string}[]
+    expect(body.map(r => r.repo)).toEqual(['alpha'])
   })
 })

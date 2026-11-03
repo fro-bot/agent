@@ -50,7 +50,7 @@ import {resolveRepoAccess, resolveRepoFromRunIndex} from './route-helpers.js'
 export interface QuestionDecisionRouteDeps {
   readonly sessionStore: Pick<DurableSessionStore, 'get'>
   readonly runIndex: Pick<RunIndex, 'lookup'>
-  readonly denylistCache: DenylistCache
+  readonly denylistCache: Pick<DenylistCache, 'getDenylistState' | 'isRepoDenied'>
   readonly bindingsLookup: BindingsLookup
   /** Question registry — the sole settlement path. */
   readonly registry: Pick<QuestionRegistry, 'decide' | 'describePendingForRun' | 'isClaimed'>

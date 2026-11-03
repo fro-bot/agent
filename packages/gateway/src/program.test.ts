@@ -112,6 +112,7 @@ vi.mock('./redaction/denylist.js', async importOriginal => {
   return {
     ...actual,
     createDenylistCache: vi.fn().mockReturnValue({
+      isPolicyAvailable: () => true,
       getDenylistState: vi.fn().mockResolvedValue(undefined),
       isRepoDenied: vi.fn().mockReturnValue(false),
     }),
@@ -2295,6 +2296,7 @@ describe('button interaction handler (approval flow)', () => {
 
     // #and — getDenylistState was called at startup to prime the cache
     const fakeCacheInstance = createDenylistCacheMock.mock.results[0]?.value as {
+      isPolicyAvailable: () => true
       getDenylistState: ReturnType<typeof vi.fn>
     }
     expect(fakeCacheInstance).toBeDefined()
@@ -2306,6 +2308,7 @@ describe('button interaction handler (approval flow)', () => {
     const {createDenylistCache} = await import('./redaction/denylist.js')
     const createDenylistCacheMock = vi.mocked(createDenylistCache)
     createDenylistCacheMock.mockReturnValueOnce({
+      isPolicyAvailable: () => true,
       getDenylistState: vi.fn().mockRejectedValue(new Error('prime failed — network error')),
       isRepoDenied: vi.fn().mockReturnValue(true), // stays deny-all
     })

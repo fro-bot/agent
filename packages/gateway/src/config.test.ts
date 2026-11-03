@@ -3902,10 +3902,11 @@ describe('operatorPush config', () => {
     // and the question push deep link then bumped it to 1.11.0. The approval push run ID,
     // RunSummary.prompt and providerFailureReason then bumped it to 1.12.0. The provider-quota-exceeded
     // reason then bumped it to 1.13.0, and the optional OperatorRunStatus.waitReason to 1.14.0.
+    // The 503 redaction-policy-unavailable answer on the repo and run listings then bumped it to 1.15.0.
     const {OPERATOR_CONTRACT_VERSION} = await import('./operator-contract/index.js')
 
     // #when / #then
-    expect(OPERATOR_CONTRACT_VERSION).toBe('1.14.0')
+    expect(OPERATOR_CONTRACT_VERSION).toBe('1.15.0')
   })
 })
 

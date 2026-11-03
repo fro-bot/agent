@@ -646,3 +646,176 @@ describe('concurrent refresh — single in-flight refresh', () => {
     expect(readerSpy).toHaveBeenCalledTimes(1)
   })
 })
+
+// ---------------------------------------------------------------------------
+// isPolicyAvailable — coarse policy state, independent of any repo
+// ---------------------------------------------------------------------------
+
+/** A reader that serves the denylist while `healthy.value` is true and fails otherwise. */
+function makeToggleReader() {
+  const healthy = {value: true}
+  const reader: MetadataReader = async () => {
+    if (healthy.value === false) throw new Error('refresh failure')
+    return DENYLIST_YAML
+  }
+  return {healthy, reader}
+}
+
+describe('isPolicyAvailable', () => {
+  it('is unavailable on a cold start, before any load has been attempted', () => {
+    // #given — a fresh cache
+    const cache = createDenylistCache({
+      reader: fakeOkReader(DENYLIST_YAML),
+      ttlMs: TTL_MS,
+      graceMs: GRACE_MS,
+      now: () => 0,
+      logger: makeLogger(),
+    })
+
+    // #then
+    expect(cache.isPolicyAvailable()).toBe(false)
+  })
+
+  it('is unavailable on a cold start when the first load fails', async () => {
+    // #given — the reader never succeeds
+    const cache = createDenylistCache({
+      reader: fakeErrReader(),
+      ttlMs: TTL_MS,
+      graceMs: GRACE_MS,
+      now: () => 0,
+      logger: makeLogger(),
+    })
+
+    // #when
+    await cache.getDenylistState()
+
+    // #then
+    expect(cache.isPolicyAvailable()).toBe(false)
+  })
+
+  it('is available after a successful load', async () => {
+    // #given
+    const cache = createDenylistCache({
+      reader: fakeOkReader(DENYLIST_YAML),
+      ttlMs: TTL_MS,
+      graceMs: GRACE_MS,
+      now: () => 0,
+      logger: makeLogger(),
+    })
+
+    // #when
+    await cache.getDenylistState()
+
+    // #then
+    expect(cache.isPolicyAvailable()).toBe(true)
+  })
+
+  it('is available while a failed refresh is served from last-known-good within grace', async () => {
+    // #given — one good load, then failures
+    let nowMs = 0
+    const {healthy, reader} = makeToggleReader()
+    const cache = createDenylistCache({
+      reader,
+      ttlMs: TTL_MS,
+      graceMs: GRACE_MS,
+      now: () => nowMs,
+      logger: makeLogger(),
+    })
+    await cache.getDenylistState()
+    healthy.value = false
+
+    // #when — a refresh fails inside the grace window
+    nowMs = TTL_MS + 1
+    await cache.getDenylistState()
+
+    // #then
+    expect(cache.isPolicyAvailable()).toBe(true)
+  })
+
+  it('is still available exactly at the grace boundary and unavailable one millisecond later', async () => {
+    // #given — good load at t=0, then failures
+    let nowMs = 0
+    const {healthy, reader} = makeToggleReader()
+    const cache = createDenylistCache({
+      reader,
+      ttlMs: TTL_MS,
+      graceMs: GRACE_MS,
+      now: () => nowMs,
+      logger: makeLogger(),
+    })
+    await cache.getDenylistState()
+    healthy.value = false
+
+    // #when / #then — the boundary itself is still usable, matching isRepoDenied's `now > lastGoodAt + graceMs`
+    nowMs = GRACE_MS
+    expect(cache.isPolicyAvailable()).toBe(true)
+
+    nowMs = GRACE_MS + 1
+    expect(cache.isPolicyAvailable()).toBe(false)
+  })
+
+  it('expires on read without any refresh being triggered', async () => {
+    // #given — good load at t=0; the reader is counted afterwards
+    let nowMs = 0
+    const reader = vi.fn<MetadataReader>(async () => DENYLIST_YAML)
+    const cache = createDenylistCache({
+      reader,
+      ttlMs: TTL_MS,
+      graceMs: GRACE_MS,
+      now: () => nowMs,
+      logger: makeLogger(),
+    })
+    await cache.getDenylistState()
+    reader.mockClear()
+
+    // #when — time passes with no refresh cadence running
+    nowMs = GRACE_MS + 1
+
+    // #then — expiry is derived from elapsed time on read, and the read does not refresh
+    expect(cache.isPolicyAvailable()).toBe(false)
+    expect(reader).not.toHaveBeenCalled()
+  })
+
+  it('recovers after a successful reload following grace expiry', async () => {
+    // #given — good load, then failures until grace expires
+    let nowMs = 0
+    const {healthy, reader} = makeToggleReader()
+    const cache = createDenylistCache({
+      reader,
+      ttlMs: TTL_MS,
+      graceMs: GRACE_MS,
+      now: () => nowMs,
+      logger: makeLogger(),
+    })
+    await cache.getDenylistState()
+    healthy.value = false
+    nowMs = GRACE_MS + 1
+    await cache.getDenylistState()
+    expect(cache.isPolicyAvailable()).toBe(false)
+
+    // #when — the reader recovers and the next refresh succeeds
+    healthy.value = true
+    nowMs += TTL_MS + 1
+    await cache.getDenylistState()
+
+    // #then
+    expect(cache.isPolicyAvailable()).toBe(true)
+  })
+
+  it('does not change what isRepoDenied reports', async () => {
+    // #given — a loaded cache
+    const cache = createDenylistCache({
+      reader: fakeOkReader(DENYLIST_YAML),
+      ttlMs: TTL_MS,
+      graceMs: GRACE_MS,
+      now: () => 0,
+      logger: makeLogger(),
+    })
+    await cache.getDenylistState()
+
+    // #then — availability does not leak a denied repo
+    expect(cache.isPolicyAvailable()).toBe(true)
+    expect(cache.isRepoDenied({databaseId: REDACTED_DB_ID, nodeId: null})).toBe(true)
+    expect(cache.isRepoDenied({databaseId: ALLOWED_DB_ID, nodeId: ALLOWED_NODE_ID})).toBe(false)
+  })
+})
