@@ -22,6 +22,7 @@
   "scripts": {
     "bootstrap": "bun install",
     "build": "bun run --filter @fro-bot/runtime build && bun run --filter @fro-bot/action build && bun run --filter @fro.bot/harness build && bun run --filter @fro.bot/opencode-plugin build && bun run --filter @fro-bot/gateway build && bun run dist:escape-hidden-unicode",
+    "build-release": "bun run --filter @fro-bot/action build && bun run dist:escape-hidden-unicode",
     "check-types": "bun run --filter @fro-bot/runtime check-types && bun run --filter @fro-bot/action check-types && bun run --filter @fro.bot/harness check-types && bun run --filter @fro.bot/opencode-plugin check-types && bun run --filter @fro-bot/gateway check-types",
     "check:md-links": "node --experimental-strip-types scripts/check-md-links.ts",
     "dist:check-hidden-unicode": "node --experimental-strip-types scripts/check-dist-hidden-unicode.ts",
