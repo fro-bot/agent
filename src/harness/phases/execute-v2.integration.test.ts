@@ -37,7 +37,7 @@ import {createExecAdapter} from '../../services/setup/adapters.js'
 import {installPluginsV2, resolvePluginSpecsV2} from '../../services/setup/plugin-install-v2.js'
 import {createMockLogger, unwrapOk} from '../../shared/test-helpers.js'
 import {computeDrainDeadlineMs, runExecute} from './execute.js'
-import {runReleaseV2} from './release-v2.js'
+import {releaseOptionsFromExecution, runReleaseV2} from './release-v2.js'
 import {createSessionReaderV2, resolveSessionForLogicalKeyV2} from './session-v2.js'
 import {startActionOpenCodeV2} from './v2-server.js'
 
@@ -887,7 +887,7 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
   }, 300_000)
 
   it('leaves nothing queued in the session inbox after release, so the next run drains quiet at once (#2029)', async () => {
-    // #given a plain one-turn run, released the way `run.ts` releases it
+    // #given a plain one-turn run, released through the same execute-to-release handoff `run.ts` uses
     const box = createSandbox()
     sandboxes.push(box)
     const provider = await startScriptedProvider([{text: 'Plain answer.'}])
@@ -895,17 +895,15 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
     const real = await startRealServer(box, provider)
     const startedAt = Date.now()
     const result = await executePhase(real, box, 120_000)
-    const release = await runReleaseV2({
-      serverHandle: real,
-      executionSucceeded: result.success,
-      rootSessionId: result.sessionId,
-      ledger: result.ownershipLedger,
-      liveObservation: result.liveObservation,
-      runStartedAt: startedAt,
-      deadlineMs: computeDrainDeadlineMs(120_000, result.executionDurationMs),
-      sessionRetention: 50,
-      logger: createMockLogger(),
-    })
+    const release = await runReleaseV2(
+      releaseOptionsFromExecution(result, {
+        serverHandle: real,
+        runStartedAt: startedAt,
+        deadlineMs: computeDrainDeadlineMs(120_000, result.executionDurationMs),
+        sessionRetention: 50,
+        logger: createMockLogger(),
+      }),
+    )
     expect(result).toMatchObject({success: true, exitCode: 0})
     expect(release.persistenceDeclineReason).toBeUndefined()
     expect((await real.exited).code).toBe(0)

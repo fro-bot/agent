@@ -1,7 +1,7 @@
 import type {OpenCodeV2ServerHandle, OwnershipLedger} from '@fro-bot/runtime'
 import type {LiveObservationV2} from '../../features/agent/live-observation-v2.js'
 import type {Logger} from '../../shared/logger.js'
-import type {DrainOutcome} from './execute.js'
+import type {DrainOutcome, ExecutePhaseResult} from './execute.js'
 import type {ObservedTurnV2} from './observed-turn-v2.js'
 import {DEFAULT_PRUNING_CONFIG} from '@fro-bot/runtime'
 import {PRE_SHUTDOWN_REQUEST_TIMEOUT_MS, releaseRunV2} from '../../features/agent/drain-v2.js'
@@ -70,6 +70,24 @@ export function boundRequests(
       else signal.addEventListener('abort', abort, {once: true})
     }
     return fetchRoute(path, {...init, signal: controller.signal})
+  }
+}
+
+/**
+ * The release options for a finished execution: the one place the execute phase's result is handed to `runReleaseV2`.
+ * `run.ts` and the real-binary integration tests both build them here, so a field carried from the result to the release
+ * cannot be dropped by a test that assembles the options by hand and still pass (#2029).
+ */
+export function releaseOptionsFromExecution(
+  execution: ExecutePhaseResult,
+  context: Pick<RunReleaseV2Options, 'serverHandle' | 'runStartedAt' | 'deadlineMs' | 'sessionRetention' | 'logger'>,
+): RunReleaseV2Options {
+  return {
+    ...context,
+    executionSucceeded: execution.success,
+    rootSessionId: execution.sessionId,
+    ledger: execution.ownershipLedger,
+    liveObservation: execution.liveObservation,
   }
 }
 

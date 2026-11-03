@@ -45,7 +45,7 @@ import {
 } from './phases/execute.js'
 import {runFinalizeWithResult} from './phases/finalize.js'
 import {mergeObservedTurn, recordObservedTurn} from './phases/observed-turn-v2.js'
-import {runReleaseV2} from './phases/release-v2.js'
+import {releaseOptionsFromExecution, runReleaseV2} from './phases/release-v2.js'
 import {runReviewReconciliation} from './phases/review-reconciliation.js'
 import {runRouting} from './phases/routing.js'
 import {runSessionPrep} from './phases/session-prep.js'
@@ -297,17 +297,15 @@ export async function run(): Promise<number> {
       // V2 is released by its directory, not by the ledger (probe P2: root idle is not terminal): drain a succeeded run,
       // stop anything else, confirm the directory quiet, then shut the server down. A run that cannot be confirmed quiet
       // must not be saved, whatever the ledger says.
-      const release = await runReleaseV2({
-        serverHandle: cacheRestore.serverHandle,
-        executionSucceeded: execution.success,
-        rootSessionId: execution.sessionId,
-        ledger: execution.ownershipLedger,
-        runStartedAt: startTime,
-        deadlineMs: computeDrainDeadlineMs(bootstrap.inputs.timeoutMs, execution.executionDurationMs),
-        sessionRetention,
-        logger: drainLogger,
-        liveObservation: execution.liveObservation,
-      })
+      const release = await runReleaseV2(
+        releaseOptionsFromExecution(execution, {
+          serverHandle: cacheRestore.serverHandle,
+          runStartedAt: startTime,
+          deadlineMs: computeDrainDeadlineMs(bootstrap.inputs.timeoutMs, execution.executionDurationMs),
+          sessionRetention,
+          logger: drainLogger,
+        }),
+      )
       serverReleasedV2 = true
       drainResult = release.drain
       serverExitUnconfirmed = release.serverExitUnconfirmed === true

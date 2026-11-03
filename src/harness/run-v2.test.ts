@@ -97,7 +97,9 @@ vi.mock('./phases/finalize.js', () => ({
   runFinalizeWithResult: vi.fn().mockResolvedValue({exitCode: 0, deliveryKind: 'none'}),
 }))
 
-vi.mock('./phases/release-v2.js', () => ({
+// Only the release itself is faked: the options builder stays real, so these tests assert the handoff `run.ts` makes.
+vi.mock('./phases/release-v2.js', async importOriginal => ({
+  ...(await importOriginal<typeof import('./phases/release-v2.js')>()),
   runReleaseV2: vi.fn(),
 }))
 
