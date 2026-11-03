@@ -318,6 +318,10 @@ describe('buildSettledEmbed', () => {
     const allText = JSON.stringify(json)
     // #then
     expect(allText).toContain('<@123456789>')
+    // Discord does not render mentions in an embed title, so the decider lives in the description
+    expect(json.title).toBe('✅ Approved')
+    expect(json.title).not.toContain('<@')
+    expect(json.description).toBe('Approved by <@123456789>')
     expect(json.color).toBeDefined()
     // green = 0x57F287 or similar; just assert it's the same as the "approved" color
   })
@@ -328,6 +332,9 @@ describe('buildSettledEmbed', () => {
     const allText = JSON.stringify(json)
     // #then
     expect(allText).toContain('<@999>')
+    expect(json.title).toBe('✅ Approved')
+    expect(json.title).not.toContain('<@')
+    expect(json.description).toBe('Approved by <@999>')
   })
 
   it('denied by user — shows mention', () => {
@@ -336,6 +343,31 @@ describe('buildSettledEmbed', () => {
     const allText = JSON.stringify(json)
     // #then
     expect(allText).toContain('<@111>')
+    expect(json.title).toBe('⛔ Denied')
+    expect(json.title).not.toContain('<@')
+    expect(json.description).toBe('Denied by <@111>')
+  })
+
+  it('approval without a human decider (run-grant) keeps a plain title and no description', () => {
+    // #given/#when
+    const json = buildSettledEmbed(baseRequest, always, {reason: 'replied'}).toJSON()
+    // #then
+    expect(json.title).toBe('✅ Approved')
+    expect(json.description).toBeUndefined()
+    expect(JSON.stringify(json)).not.toContain('<@')
+  })
+
+  it('never puts a mention in the title for any reply or settlement reason', () => {
+    // #given
+    const reasons: SettlementReason[] = ['replied', 'cascade', 'deadline', 'disposed', 'superseded']
+    for (const reason of reasons) {
+      for (const reply of [approve, always, deny]) {
+        // #when
+        const json = buildSettledEmbed(baseRequest, reply, {decidedBy: '42', reason}).toJSON()
+        // #then
+        expect(json.title).not.toContain('<@')
+      }
+    }
   })
 
   it('deadline reason — no user mention, shows timeout text', () => {
