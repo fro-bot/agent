@@ -314,7 +314,10 @@ describe('buildSettledEmbed', () => {
 
   it('approved by user — shows mention and green color', () => {
     // #given/#when
-    const json = buildSettledEmbed(baseRequest, approve, {decidedBy: '123456789', reason: 'replied'}).toJSON()
+    const json = buildSettledEmbed(baseRequest, approve, {
+      decidedBy: {kind: 'discord-user', userId: '123456789'},
+      reason: 'replied',
+    }).toJSON()
     const allText = JSON.stringify(json)
     // #then
     expect(allText).toContain('<@123456789>')
@@ -328,7 +331,10 @@ describe('buildSettledEmbed', () => {
 
   it('approved with always — shows mention', () => {
     // #given/#when
-    const json = buildSettledEmbed(baseRequest, always, {decidedBy: '999', reason: 'replied'}).toJSON()
+    const json = buildSettledEmbed(baseRequest, always, {
+      decidedBy: {kind: 'discord-user', userId: '999'},
+      reason: 'replied',
+    }).toJSON()
     const allText = JSON.stringify(json)
     // #then
     expect(allText).toContain('<@999>')
@@ -339,13 +345,60 @@ describe('buildSettledEmbed', () => {
 
   it('denied by user — shows mention', () => {
     // #given/#when
-    const json = buildSettledEmbed(baseRequest, deny, {decidedBy: '111', reason: 'replied'}).toJSON()
+    const json = buildSettledEmbed(baseRequest, deny, {
+      decidedBy: {kind: 'discord-user', userId: '111'},
+      reason: 'replied',
+    }).toJSON()
     const allText = JSON.stringify(json)
     // #then
     expect(allText).toContain('<@111>')
     expect(json.title).toBe('⛔ Denied')
     expect(json.title).not.toContain('<@')
     expect(json.description).toBe('Denied by <@111>')
+  })
+
+  it('approved from the dashboard — shows the login as plain text with an origin marker and no mention', () => {
+    // #given/#when
+    const json = buildSettledEmbed(baseRequest, approve, {
+      decidedBy: {kind: 'web', login: 'octocat'},
+      reason: 'replied',
+    }).toJSON()
+    // #then
+    expect(json.title).toBe('✅ Approved')
+    expect(json.description).toBe('Approved by octocat (dashboard)')
+    expect(JSON.stringify(json)).not.toContain('<@')
+  })
+
+  it('denied from the dashboard — shows the login as plain text with an origin marker and no mention', () => {
+    // #given/#when
+    const json = buildSettledEmbed(baseRequest, deny, {
+      decidedBy: {kind: 'web', login: 'octocat'},
+      reason: 'replied',
+    }).toJSON()
+    // #then
+    expect(json.title).toBe('⛔ Denied')
+    expect(json.description).toBe('Denied by octocat (dashboard)')
+    expect(JSON.stringify(json)).not.toContain('<@')
+  })
+
+  it('escapes markdown in a dashboard login so it renders as the plain text it is', () => {
+    // #given — underscores and emphasis markers would otherwise render as formatting
+    const json = buildSettledEmbed(baseRequest, approve, {
+      decidedBy: {kind: 'web', login: '_a*b_'},
+      reason: 'replied',
+    }).toJSON()
+    // #then
+    expect(json.description).toBe(String.raw`Approved by \_a\*b\_ (dashboard)`)
+  })
+
+  it('omits the decider line for a dashboard decision with an empty login', () => {
+    // #given/#when
+    const json = buildSettledEmbed(baseRequest, approve, {
+      decidedBy: {kind: 'web', login: ''},
+      reason: 'replied',
+    }).toJSON()
+    // #then
+    expect(json.description).toBeUndefined()
   })
 
   it('approval without a human decider (run-grant) keeps a plain title and no description', () => {
@@ -363,7 +416,10 @@ describe('buildSettledEmbed', () => {
     for (const reason of reasons) {
       for (const reply of [approve, always, deny]) {
         // #when
-        const json = buildSettledEmbed(baseRequest, reply, {decidedBy: '42', reason}).toJSON()
+        const json = buildSettledEmbed(baseRequest, reply, {
+          decidedBy: {kind: 'discord-user', userId: '42'},
+          reason,
+        }).toJSON()
         // #then
         expect(json.title).not.toContain('<@')
       }
@@ -397,7 +453,7 @@ describe('buildSettledEmbed', () => {
 
   it('does not include requestID in settled embed', () => {
     // #given/#when
-    const decidedBy = '12345'
+    const decidedBy = {kind: 'discord-user', userId: '12345'} as const
     const json = buildSettledEmbed(baseRequest, approve, {decidedBy, reason: 'replied'}).toJSON()
     const allText = JSON.stringify(json)
     // #then

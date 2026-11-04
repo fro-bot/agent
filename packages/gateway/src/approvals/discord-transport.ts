@@ -33,6 +33,7 @@
 import type {Result} from '@fro-bot/runtime'
 import type {Message} from 'discord.js'
 
+import type {SettledDecider} from '../discord/approvals.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {PostReplyFactory, ReplySink} from '../execute/launch-types.js'
 import type {PermissionReply, PermissionRequest, SettlementReason} from './coordinator.js'
@@ -312,19 +313,18 @@ export function createDiscordApprovalOnPending(
                 actor: ApprovalActor | null,
                 reason: SettlementReason,
               ) => {
-                // Derive a display string from the typed actor for the settled embed.
-                // Discord-specific: extract the userId for the decidedBy display.
-                // For web operators, use the display login (mutable but human-readable for embeds).
-                const decidedBy =
+                // Pass the actor's origin through so the embed mentions a Discord user but shows a
+                // web operator's GitHub login as plain text (Discord cannot resolve it as a mention).
+                const decidedBy: SettledDecider | undefined =
                   actor === null || actor.kind === 'run-grant'
-                    ? null
+                    ? undefined
                     : actor.kind === 'discord-user'
-                      ? actor.userId
-                      : actor.login
+                      ? {kind: 'discord-user', userId: actor.userId}
+                      : {kind: 'web', login: actor.login}
                 const editResult = await editMessage(
                   postedMessage,
                   {
-                    embeds: [buildSettledEmbed(permReq, decision, {decidedBy: decidedBy ?? undefined, reason})],
+                    embeds: [buildSettledEmbed(permReq, decision, {decidedBy, reason})],
                     components: [],
                   },
                   logger,
