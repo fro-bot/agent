@@ -72,6 +72,9 @@ function makeMockDeps(): FroBotDeps {
       data: {outcome: 'no-lock', holderId: null, runId: null, lockAgeMs: null, heartbeatAgeMs: null},
     }),
     dispatchWorkflow: vi.fn<DispatchWorkflow>(),
+    cancelRunDeps: {} as FroBotDeps['cancelRunDeps'],
+    runIndex: {listRunsForRepo: vi.fn().mockResolvedValue([]), readRun: vi.fn().mockResolvedValue(undefined)},
+    listLiveRuns: vi.fn().mockReturnValue([]),
   }
 }
 

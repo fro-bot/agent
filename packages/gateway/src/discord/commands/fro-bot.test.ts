@@ -115,6 +115,9 @@ function makeDeps(overrides?: Partial<FroBotDeps>): FroBotDeps {
     checkRepoQuiescence: vi.fn(),
     forceReleaseStaleLock: defaultForceRelease,
     dispatchWorkflow: vi.fn<DispatchWorkflow>(),
+    cancelRunDeps: {} as FroBotDeps['cancelRunDeps'],
+    runIndex: {listRunsForRepo: vi.fn().mockResolvedValue([]), readRun: vi.fn().mockResolvedValue(undefined)},
+    listLiveRuns: vi.fn().mockReturnValue([]),
     ...overrides,
   }
 }
@@ -168,6 +171,7 @@ describe('createFroBotCommand — builder registration', () => {
     expect(subNames).toContain('add-project')
     expect(subNames).toContain('clear-queue')
     expect(subNames).toContain('dispatch')
+    expect(subNames).toContain('cancel')
 
     const dispatch = (json.options ?? []).find((o: {name: string}) => o.name === 'dispatch') as
       {options?: readonly {name: string; required?: boolean}[]} | undefined

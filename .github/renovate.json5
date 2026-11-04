@@ -152,36 +152,20 @@
       allowedVersions: '<=1.19.4',
     },
     {
-      // The V2 pin lives in its own file and follows its own major, so the V1 cap above does not
-      // apply to it. This entry must stay AFTER that cap (a later rule wins) and must not become the
-      // first `anomalyco/opencode` rule with `allowedVersions`: pin-invariants.test.ts reads the cap
-      // from the first one.
-      //
-      // Renovate only changes `version`; the per-asset sha256 digests still describe the old release, and the
-      // Dockerfile and the Action both fail closed on that. `bun run postupgrade` (scripts/sync-opencode-v2-pin.ts)
-      // rewrites the digests from the release's SHA256SUMS on the update branch. A rule-level `postUpgradeTasks`
-      // REPLACES the top-level one rather than merging with it, so the full list is repeated here on purpose, with
-      // the sync between install and build. Every command must match the self-hosted runner's `allowedCommands`
-      // (pinned by scripts/renovate-v2-pin-postupgrade.test.ts); `node scripts/...` is not allowed there.
+      // V2 pin: keep AFTER the V1 cap (later rule wins; pin-invariants.test.ts reads the first cap).
+      // `postupgrade` resyncs the per-asset digests; rule-level tasks replace the top-level list, so repeat it.
       matchFileNames: ['packages/runtime/src/shared/opencode-v2-pin.json'],
       matchPackageNames: ['anomalyco/opencode'],
       allowedVersions: '/^2\\./',
       commitMessageTopic: 'OpenCode V2 pin',
       automerge: false,
       postUpgradeTasks: {
-        commands: ['bun install --ignore-scripts', 'bun run postupgrade', 'bun run build'],
+        commands: ['bun install --ignore-scripts', 'bun run postupgrade', 'bun run build-release'],
         executionMode: 'branch',
       },
     },
     {
-      // `@opencode/plugin` pins `effect` at an exact version, and the plugin package imports `Schema` from `effect`
-      // directly. A different `effect` devDependency installs a second copy of effect v4 and breaks `tsc` with
-      // "Two different types with this name exist". `bun run postupgrade` (scripts/sync-opencode-plugin-effect.ts)
-      // copies the plugin's pin into packages/opencode-plugin's `effect` devDependency. It reads the installed
-      // manifest, so the first install brings in the bumped plugin and the second one regenerates bun.lock and the
-      // installed tree for the new `effect`. A rule-level `postUpgradeTasks` REPLACES the top-level one rather than
-      // merging with it, so the full list is repeated here on purpose. Every command must match the self-hosted
-      // runner's `allowedCommands` (pinned by scripts/renovate-v2-pin-postupgrade.test.ts).
+      // `postupgrade` syncs the plugin's exact `effect` pin; the second install regenerates bun.lock for it.
       matchFileNames: ['packages/opencode-plugin/package.json'],
       matchPackageNames: ['@opencode/plugin'],
       postUpgradeTasks: {
@@ -189,7 +173,7 @@
           'bun install --ignore-scripts',
           'bun run postupgrade',
           'bun install --ignore-scripts',
-          'bun run build',
+          'bun run build-release',
         ],
         executionMode: 'branch',
       },
@@ -227,10 +211,7 @@
       enabled: false,
     },
     {
-      // `fix` is autofix-only, and update branches touch manifests, lockfiles,
-      // and workflow YAML — none of which ESLint reads. Running it repo-wide on
-      // every branch costs ~95s to change nothing, so it runs only for the
-      // tooling that can actually move lint output.
+      // Lint tooling can't change the Action bundle, so skip `fix` and the build; install only.
       matchPackageNames: [
         'eslint',
         'prettier',
@@ -240,12 +221,25 @@
         'eslint-plugin-prettier',
         '@vitest/eslint-plugin',
       ],
-      // This object replaces the top-level postUpgradeTasks rather than merging
-      // with it, so the full command list is repeated here on purpose.
       postUpgradeTasks: {
-        commands: ['bun install --ignore-scripts', 'bun run fix', 'bun run build'],
+        commands: ['bun install --ignore-scripts'],
         executionMode: 'branch',
       },
+    },
+    {
+      // Workflow updates touch neither the lockfile nor dist/. Limited to depTypes `action`/`workflow`: a
+      // manager-wide match would also hit mixed branches like renovate/node-26.x (uses-with node-version + npm engines).
+      matchManagers: ['github-actions'],
+      matchDepTypes: ['action', 'workflow'],
+      postUpgradeTasks: {
+        commands: [],
+        executionMode: 'branch',
+      },
+    },
+    {
+      // The @aws-sdk changelog fetch walks the whole aws-sdk-js-v3 repo tree (~165s per run).
+      matchPackageNames: ['@aws-sdk/**'],
+      fetchChangeLogs: 'off',
     },
     {
       // Let release-pipeline packages settle before they reach the release job. A
@@ -271,12 +265,8 @@
     },
   ],
   postUpgradeTasks: {
-    // `build` escapes dist hidden Unicode as its final step, so a rebuilt dist on
-    // update branches stays free of characters Renovate would otherwise flag.
-    // --ignore-scripts keeps `postinstall: simple-git-hooks` from installing the
-    // pre-push hook into the runner. Lockfile resolution does not depend on
-    // lifecycle scripts, and neither `fix` nor `build` needs one to have run.
-    commands: ['bun install --ignore-scripts', 'bun run build'],
+    // Rebuild only the committed dist/; --ignore-scripts skips the git-hooks postinstall.
+    commands: ['bun install --ignore-scripts', 'bun run build-release'],
     executionMode: 'branch',
   },
   vulnerabilityAlerts: {

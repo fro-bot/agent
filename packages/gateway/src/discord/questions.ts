@@ -173,7 +173,7 @@ export type QuestionPromptPlan =
  * masked links (`[text](url)` would otherwise render as a clickable link with attacker-chosen
  * text), headings, and list markers, so the text reads as the plain text it is.
  */
-function escapeText(text: string): string {
+export function escapeText(text: string): string {
   return escapeMarkdown(text, {maskedLink: true, heading: true, bulletedList: true, numberedList: true})
 }
 
@@ -378,12 +378,16 @@ export function buildQuestionSettledEmbed(
 
   let title: string
   let color: number
+  // Discord renders mentions in a description but never in an embed title, so the actor goes there.
+  let outcome: string | null = null
   if (settlement.reason === 'replied') {
     if (field === null) {
-      title = by === null ? '⏭️ Skipped' : `⏭️ Skipped by ${by}`
+      title = '⏭️ Skipped'
+      outcome = 'Skipped'
       color = 0x99aab5
     } else {
-      title = by === null ? '✅ Answered' : `✅ Answered by ${by}`
+      title = '✅ Answered'
+      outcome = 'Answered'
       color = 0x57f287
     }
   } else if (settlement.reason === 'deadline') {
@@ -398,14 +402,19 @@ export function buildQuestionSettledEmbed(
   }
 
   const embed = new EmbedBuilder().setTitle(title).setColor(color).setTimestamp()
+  let quoted = ''
   if (question !== undefined) {
     const header = boundQuestionText(question.header, EMBED_TITLE_HEADER_MAX).trim()
     const text = boundQuestionText(question.question, EMBED_QUESTION_MAX).trim()
-    const quoted = [header.length === 0 ? null : `**${escapeText(header)}**`, escapeText(text)]
+    quoted = [header.length === 0 ? null : `**${escapeText(header)}**`, escapeText(text)]
       .filter((part): part is string => part !== null && part.length > 0)
       .join('\n')
-    if (quoted.length > 0) embed.setDescription(quoted)
   }
+  // Worst case is header (100) + question (1800), each escaped to at most ~2x, plus a short actor line:
+  // well under the 4096 description limit.
+  const byLine = outcome !== null && by !== null ? `${outcome} by ${by}` : ''
+  const description = [quoted, byLine].filter(part => part.length > 0).join('\n\n')
+  if (description.length > 0) embed.setDescription(description)
   if (field !== null) embed.addFields(field)
   return embed
 }

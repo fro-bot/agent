@@ -421,7 +421,10 @@ describe('buildQuestionSettledEmbed', () => {
     const embed = buildQuestionSettledEmbed(asked, settlement).toJSON()
 
     // #then
-    expect(embed.title).toBe('✅ Answered by <@123456789>')
+    expect(embed.title).toBe('✅ Answered')
+    expect(embed.title).not.toContain('<@')
+    expect(embed.description).toContain('Answered by <@123456789>')
+    expect(embed.description?.length).toBeLessThanOrEqual(4096)
     const value = embed.fields?.[0]?.value ?? ''
     expect(value).toContain('• prod')
     expect(value).toContain(String.raw`\*\*x\*\*`)
@@ -435,7 +438,8 @@ describe('buildQuestionSettledEmbed', () => {
       actor: {kind: 'web-operator', githubUserId: 1, login: 'octo**cat', sessionCorrelationId: 's'},
     }).toJSON()
 
-    expect(embed.title).toBe(String.raw`⏭️ Skipped by octo\*\*cat`)
+    expect(embed.title).toBe('⏭️ Skipped')
+    expect(embed.description).toContain(String.raw`Skipped by octo\*\*cat`)
     expect(embed.fields).toBeUndefined()
   })
 
@@ -458,6 +462,18 @@ describe('buildQuestionSettledEmbed', () => {
     }).toJSON()
 
     expect(embed.title).toBe('✅ Answered')
+    expect(embed.description).not.toContain('Answered by')
+    expect(embed.description).not.toContain('<@')
+  })
+
+  it('keeps the question text and adds the decider mention after it', () => {
+    const embed = buildQuestionSettledEmbed(question({question: 'Ship it?', header: 'H'}), {
+      reason: 'replied',
+      answers: [['yes']],
+      actor: {kind: 'discord-user', userId: '123456789'},
+    }).toJSON()
+
+    expect(embed.description).toBe('**H**\nShip it?\n\nAnswered by <@123456789>')
   })
 
   it('keeps the question text, escaped, and tolerates a missing question', () => {
