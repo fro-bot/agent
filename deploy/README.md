@@ -665,22 +665,24 @@ The gateway runs in **`approval-required` mode by default**: when OpenCode reque
 
 Approvals steer a cooperating model; they are not a security boundary. A shell command can reach paths outside the checkout without triggering an `external_directory` ask, and a tool runs as the same uid as the OpenCode server. The security boundary is the workspace container, its uid and the egress allowlist.
 
-The workspace OpenCode config is supplied via `WORKSPACE_OPENCODE_CONFIG` (in `deploy/.env`) as a JSON object shallow-merged over the base config. You can configure per-tool permission defaults there:
+The workspace OpenCode config is supplied via `WORKSPACE_OPENCODE_CONFIG` (in `deploy/.env`) as a JSON object shallow-merged over the base config. The base config sets no shell rule, and OpenCode allows a shell command that matches no rule, so a shell command asks only when the operator config sets a rule that matches it. Shell rules match command patterns, and the last matching rule wins:
 
 ```env
-# deploy/.env — set bash to always ask (already the gateway default for all tools)
-WORKSPACE_OPENCODE_CONFIG={"provider":{...},"permission":{"bash":{"default":"ask"}}}
+# deploy/.env: run shell commands without asking, but ask before rm or sudo
+WORKSPACE_OPENCODE_CONFIG={"provider":{...},"permission":{"bash":{"*":"allow","rm *":"ask","sudo *":"ask"}}}
 ```
+
+OpenCode checks each command in a shell line separately, including commands nested in `$(…)` or chained with `;` and `&&`. A line asks when any of its commands matches an `ask` rule. Whether a run asks therefore depends on the command text, not on whether it was launched from Discord or the operator surface.
 
 ### Permission modes
 
 | Mode | Behaviour |
 | --- | --- |
-| `ask` (gateway default) | Gateway posts an Approve / Deny embed in the run thread; run pauses until a decision is received or the deadline fires. |
-| `allow` | Tool runs immediately; no Discord prompt. Use only for low-risk, non-mutating tools. |
+| `ask` | Gateway posts an Approve / Deny embed in the run thread; run pauses until a decision is received or the deadline fires. |
+| `allow` | Tool runs immediately; no Discord prompt. This is the effect for a shell command that matches no rule. |
 | `deny` | Tool is always blocked; no prompt. |
 
-Set `"default":"ask"` inside the tool's permission block to ask for every invocation. More granular patterns (e.g. per-command) follow the OpenCode `permission` config schema.
+To ask for every shell command, set `"bash":"ask"`. Per-command patterns follow the OpenCode `permission` config schema.
 
 ### Who can approve
 
