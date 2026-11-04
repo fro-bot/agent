@@ -399,6 +399,43 @@ describe('cancelRun — quarantined', () => {
     expect(postCancelNotice).not.toHaveBeenCalled()
   })
 
+  it('refuses when quarantine starts during approval settlement: abort delivers to nothing, rendezvous writes nothing', async () => {
+    // #given an executing run with a pending approval; settling it is when the run quarantines (abort entry deleted)
+    const runState = makeRunState({phase: 'EXECUTING'})
+    const coordinationConfig = makeCoordinationConfig(runState)
+    let quarantined = false
+    let hasAbortEntry = true
+    const approvalRegistry = makeApprovalRegistry({
+      describePendingForScope: vi.fn().mockReturnValue([{requestID: 'req-1', permission: 'bash'}]),
+      handleDecision: vi.fn().mockImplementation(async () => {
+        quarantined = true
+        hasAbortEntry = false
+        return 'ok'
+      }),
+    })
+    const abortRegistry = makeAbortRegistry({
+      has: vi.fn(() => hasAbortEntry),
+      abort: vi.fn(() => hasAbortEntry),
+    })
+    const postCancelNotice = vi.fn().mockResolvedValue(undefined)
+    const deps = makeDeps({
+      runState,
+      coordinationConfig,
+      abortRegistry,
+      approvalRegistry,
+      postCancelNotice,
+      isRunQuarantined: vi.fn(() => quarantined),
+    })
+
+    // #when
+    const result = await cancelRun({runId: 'run-1', actor: makeActor(), logger: makeLogger()}, deps)
+
+    // #then the record is untouched and nothing is announced
+    expect(result).toEqual({outcome: 'quarantined'})
+    expect(coordinationConfig.storeAdapter.conditionalPut).not.toHaveBeenCalled()
+    expect(postCancelNotice).not.toHaveBeenCalled()
+  })
+
   it('still reports an already-terminal record as terminal', async () => {
     // #given a quarantined run whose FAILED record landed
     const runState = makeRunState({phase: 'FAILED'})

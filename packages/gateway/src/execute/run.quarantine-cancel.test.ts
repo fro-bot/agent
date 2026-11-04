@@ -157,6 +157,7 @@ describe('cancelRun during a quarantine hold', () => {
     expect(runId).not.toBe('')
     expect(store.phase()).toBe('EXECUTING')
     expect(isRunLive(runId)).toBe(true)
+    expect(isRunQuarantined(runId)).toBe(true)
     expect(abortRegistry.has(runId)).toBe(false)
     const deps = makeCancelDeps(store.coordinationConfig)
 
@@ -179,5 +180,6 @@ describe('cancelRun during a quarantine hold', () => {
     expect(heartbeatStop).toHaveBeenCalledTimes(1)
     expect(concurrency.release).toHaveBeenCalledTimes(1)
     expect(isRunLive(runId)).toBe(false)
+    expect(isRunQuarantined(runId)).toBe(false)
   })
 })
