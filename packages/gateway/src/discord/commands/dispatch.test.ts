@@ -87,6 +87,8 @@ function makeDeps(
     checkRepoQuiescence: vi.fn(),
     forceReleaseStaleLock: vi.fn(),
     dispatchWorkflow,
+    cancelRunDeps: {} as FroBotDeps['cancelRunDeps'],
+    runIndex: {listRunsForRepo: vi.fn().mockResolvedValue([])},
     ...overrides,
   }
 }

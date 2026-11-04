@@ -160,11 +160,16 @@ describe('POST cancel — happy path', () => {
 
     expect(cancelRunMock).toHaveBeenCalledTimes(1)
     const call = cancelRunMock.mock.calls[0] as unknown as [
-      {runId: string; actor: {githubUserId: number; login: string; sessionCorrelationId: string}},
+      {runId: string; actor: {kind: string; githubUserId: number; login: string; sessionCorrelationId: string}},
       unknown,
     ]
     expect(call[0].runId).toBe('run-abc')
-    expect(call[0].actor).toEqual({githubUserId: 1001, login: 'alice', sessionCorrelationId: 'sess-abc'})
+    expect(call[0].actor).toEqual({
+      kind: 'web-operator',
+      githubUserId: 1001,
+      login: 'alice',
+      sessionCorrelationId: 'sess-abc',
+    })
 
     expect(vi.mocked(auditLogger.info)).toHaveBeenCalledWith(
       expect.objectContaining({githubUserId: 1001, runId: 'run-abc', phase: 'CANCELLED'}),

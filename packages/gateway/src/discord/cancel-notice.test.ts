@@ -5,11 +5,32 @@
  */
 
 import type {Client} from 'discord.js'
+import type {CancelActorContext} from '../execute/cancel.js'
 import type {GatewayLogger} from './client.js'
 import {describe, expect, it, vi} from 'vitest'
-import {CANCELLED_NOTICE_TEXT, createCancelNoticeDispatcher} from './cancel-notice.js'
+import {createCancelNoticeDispatcher, formatCancelNotice} from './cancel-notice.js'
 
 type FakeClient = Pick<Client, 'channels'>
+
+const webActor: CancelActorContext = {
+  kind: 'web-operator',
+  githubUserId: 42,
+  login: 'octocat',
+  sessionCorrelationId: 'sess-1',
+}
+const discordActor: CancelActorContext = {kind: 'discord-user', discordUserId: '111222333444555666'}
+
+describe('formatCancelNotice', () => {
+  it('names a Discord actor with a user mention', () => {
+    // #when / #then
+    expect(formatCancelNotice(discordActor)).toBe('Run cancelled by <@111222333444555666>.')
+  })
+
+  it('names a web operator by GitHub login, with no Discord mention', () => {
+    // #when / #then
+    expect(formatCancelNotice(webActor)).toBe('Run cancelled by operator octocat.')
+  })
+})
 
 function makeLogger(): GatewayLogger {
   return {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
@@ -35,7 +56,7 @@ describe('createCancelNoticeDispatcher', () => {
     const dispatch = createCancelNoticeDispatcher(client, logger)
 
     // #when
-    await dispatch('', 'run-1')
+    await dispatch('', 'run-1', webActor)
 
     // #then
 
@@ -54,12 +75,27 @@ describe('createCancelNoticeDispatcher', () => {
     const dispatch = createCancelNoticeDispatcher(client, logger)
 
     // #when
-    await dispatch('thread-1', 'run-1')
+    await dispatch('thread-1', 'run-1', webActor)
 
     // #then
 
     expect(client.channels.fetch).toHaveBeenCalledWith('thread-1')
-    expect(sendMock).toHaveBeenCalledWith(expect.objectContaining({content: CANCELLED_NOTICE_TEXT}))
+    expect(sendMock).toHaveBeenCalledWith(expect.objectContaining({content: 'Run cancelled by operator octocat.'}))
+  })
+
+  it('announces a Discord actor by mention without pinging them', async () => {
+    // #given
+    const sendMock = vi.fn().mockResolvedValue(undefined)
+    const client = makeClient(sendMock)
+    const dispatch = createCancelNoticeDispatcher(client, makeLogger())
+
+    // #when
+    await dispatch('thread-1', 'run-1', discordActor)
+
+    // #then — mention text present; io.sendMessage always injects allowedMentions {parse: []}
+    expect(sendMock).toHaveBeenCalledWith(
+      expect.objectContaining({content: 'Run cancelled by <@111222333444555666>.', allowedMentions: {parse: []}}),
+    )
   })
 
   it('skips (logs) when the channel cannot be resolved', async () => {
@@ -69,7 +105,7 @@ describe('createCancelNoticeDispatcher', () => {
     const dispatch = createCancelNoticeDispatcher(client, logger)
 
     // #when
-    await dispatch('thread-1', 'run-1')
+    await dispatch('thread-1', 'run-1', webActor)
 
     // #then
     expect(logger.warn).toHaveBeenCalledWith(
@@ -86,7 +122,7 @@ describe('createCancelNoticeDispatcher', () => {
     const dispatch = createCancelNoticeDispatcher(client, logger)
 
     // #when
-    await dispatch('thread-1', 'run-1')
+    await dispatch('thread-1', 'run-1', webActor)
 
     // #then
     expect(logger.warn).toHaveBeenCalledWith(
@@ -103,7 +139,7 @@ describe('createCancelNoticeDispatcher', () => {
     const dispatch = createCancelNoticeDispatcher(client, logger)
 
     // #when
-    await expect(dispatch('thread-1', 'run-1')).resolves.toBeUndefined()
+    await expect(dispatch('thread-1', 'run-1', webActor)).resolves.toBeUndefined()
 
     // #then — io.ts's sendMessage catches the throw and returns err(...); logged, not thrown
     expect(logger.warn).toHaveBeenCalledWith(
@@ -121,7 +157,7 @@ describe('createCancelNoticeDispatcher', () => {
     const dispatch = createCancelNoticeDispatcher(client, logger)
 
     // #when
-    await expect(dispatch('thread-1', 'run-1')).resolves.toBeUndefined()
+    await expect(dispatch('thread-1', 'run-1', webActor)).resolves.toBeUndefined()
 
     // #then
     expect(logger.warn).toHaveBeenCalledWith(

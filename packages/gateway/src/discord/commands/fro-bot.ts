@@ -8,14 +8,17 @@
  * - `ping` — smoke-test; responds with ephemeral "pong"
  * - `add-project` — bind a GitHub repo to a Discord channel
  * - `clear-queue` — drop pending queued tasks for the invoking channel
+ * - `cancel` — request cancellation of the executing run for this channel or run thread
  * - `force-release-lock` — corroborated force-release of an expired per-repo lock
  * - `dispatch` — ask GitHub Actions to run the fixed repository workflow
  */
 
 import type {CoordinationConfig, ForceReleaseStaleLockResult} from '@fro-bot/runtime'
 import type {ChatInputCommandInteraction} from 'discord.js'
+import type {CancelRunDeps} from '../../execute/cancel.js'
 import type {ChannelQueue} from '../../execute/queue.js'
 import type {RepoQuiescenceChecker} from '../../execute/repo-quiescence.js'
+import type {RunIndex} from '../../execute/run-index.js'
 import type {RunTask} from '../../execute/run.js'
 import type {DispatchWorkflow} from '../../github/dispatch.js'
 import type {ConfirmExpiredHolder, LockCoordinationLogger} from '../../runtime-effect.js'
@@ -30,6 +33,7 @@ import {Effect} from 'effect'
 import {editInteraction} from '../io.js'
 import {userIsAuthorized} from '../mentions.js'
 import {executeAddProject} from './add-project.js'
+import {createCancelCommand} from './cancel.js'
 import {createCheckoutBackupCommand} from './checkout-backup.js'
 import {buildDispatchSpec} from './dispatch.js'
 import {INTERNAL_ERROR_COPY, makeGuildCommand} from './guild-command.js'
@@ -53,8 +57,9 @@ export interface FroBotDeps extends AddProjectDeps {
   readonly queue: ChannelQueue<RunTask>
   /**
    * Discord role ID that confers trigger authorization.
-   * Mirrors the same field in `MentionDeps` — used by `clear-queue` to apply
-   * the same auth gate as the mention path (trigger role OR guild ManageChannels).
+   * Mirrors the same field in `MentionDeps` — used by `clear-queue` and `cancel` to apply
+   * the same auth gate as the mention path and approvals (`userIsAuthorized`): when set, only
+   * holders of this role are authorized (ManageChannels does not widen it).
    * `null` → fall back to guild-level ManageChannels.
    */
   readonly triggerRoleId: string | null
@@ -87,6 +92,13 @@ export interface FroBotDeps extends AddProjectDeps {
   ) => Effect.Effect<ForceReleaseStaleLockResult, Error>
   /** GitHub Actions dispatch primitive, constructed once in program.ts. */
   readonly dispatchWorkflow: DispatchWorkflow
+  /**
+   * Shared cancellation engine deps, built once in program.ts for both transports (the same object the operator web
+   * cancel route receives), so `/fro-bot cancel` works with the operator web endpoint disabled.
+   */
+  readonly cancelRunDeps: CancelRunDeps
+  /** Run scan used by `cancel` to resolve a run thread or channel to its run. */
+  readonly runIndex: Pick<RunIndex, 'listRunsForRepo'>
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +138,11 @@ export function createFroBotCommand(deps: FroBotDeps): SlashCommand {
     )
     .addSubcommand(sub =>
       sub
+        .setName('cancel')
+        .setDescription('Cancel the running task in this channel or run thread (queued tasks are unaffected)'),
+    )
+    .addSubcommand(sub =>
+      sub
         .setName('force-release-lock')
         .setDescription(
           'Force-release an expired per-repo coordination lock (workspace-verified; requires ManageChannels)',
@@ -159,7 +176,8 @@ export function createFroBotCommand(deps: FroBotDeps): SlashCommand {
   const executeClearQueue = makeGuildCommand(
     {
       name: 'clear-queue',
-      // Same auth gate as the mention path: trigger role OR guild ManageChannels.
+      // Same auth gate as the mention path and approvals (userIsAuthorized): the trigger role when one is
+      // configured, otherwise guild ManageChannels. It is not an OR: a configured role is the only way in.
       // userIsAuthorized is fail-closed (returns false on any resolution error).
       authorize: ctx =>
         Effect.promise(async () => {
@@ -184,6 +202,8 @@ export function createFroBotCommand(deps: FroBotDeps): SlashCommand {
     },
     deps,
   )
+
+  const executeCancel = createCancelCommand(deps)
 
   const executeForceReleaseLock = makeGuildCommand(
     {
@@ -386,6 +406,10 @@ export function createFroBotCommand(deps: FroBotDeps): SlashCommand {
 
     if (subcommand === 'clear-queue') {
       return executeClearQueue(interaction)
+    }
+
+    if (subcommand === 'cancel') {
+      return executeCancel(interaction)
     }
 
     if (subcommand === 'force-release-lock') {

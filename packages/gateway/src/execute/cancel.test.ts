@@ -21,6 +21,7 @@ import {createQuestionRegistry} from '../approvals/question-registry.js'
 import {createRequestGate} from '../approvals/request-gate.js'
 import {createAbortRegistry} from './abort-registry.js'
 import {cancelRun} from './cancel.js'
+import {createChannelQueue} from './queue.js'
 
 // ---------------------------------------------------------------------------
 // Factories
@@ -30,8 +31,12 @@ function makeLogger(): GatewayLogger {
   return {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
 }
 
-function makeActor(overrides: Partial<CancelActorContext> = {}): CancelActorContext {
-  return {githubUserId: 42, login: 'octocat', sessionCorrelationId: 'sess-1', ...overrides}
+function makeActor(): CancelActorContext {
+  return {kind: 'web-operator', githubUserId: 42, login: 'octocat', sessionCorrelationId: 'sess-1'}
+}
+
+function makeDiscordActor(): CancelActorContext {
+  return {kind: 'discord-user', discordUserId: '111222333444555666'}
 }
 
 function makeRunState(overrides: Partial<RunState> = {}): RunState {
@@ -90,10 +95,13 @@ function makeQueue(overrides: Partial<ChannelQueue<RunTask>> = {}): ChannelQueue
   }
 }
 
-function makeAbortRegistry(overrides: Partial<AbortRegistry> = {}): Pick<AbortRegistry, 'has' | 'abort'> {
+function makeAbortRegistry(
+  overrides: Partial<AbortRegistry> = {},
+): Pick<AbortRegistry, 'has' | 'abort' | 'getMetadata'> {
   return {
     has: vi.fn().mockReturnValue(false),
     abort: vi.fn().mockReturnValue(true),
+    getMetadata: vi.fn().mockReturnValue(undefined),
     ...overrides,
   }
 }
@@ -189,11 +197,12 @@ describe('cancelRun — queued', () => {
     expect(observe).toHaveBeenCalledWith(expect.objectContaining({phase: 'CANCELLED'}))
     const observedState = observe.mock.calls[0]?.[0] as RunState
     expect(observedState.details.cancelledBy).toMatchObject({
+      kind: 'web-operator',
       githubUserId: 42,
       login: 'octocat',
       sessionCorrelationId: 'sess-1',
     })
-    expect(postCancelNotice).toHaveBeenCalledWith('thread-1', 'run-1')
+    expect(postCancelNotice).toHaveBeenCalledWith('thread-1', 'run-1', makeActor())
   })
 
   it('does not touch an active run on the same channel (other queue entries untouched)', async () => {
@@ -255,11 +264,11 @@ describe('cancelRun — executing', () => {
     expect(abort).toHaveBeenCalledWith(
       'run-1',
       'operator cancel',
-      expect.objectContaining({githubUserId: 42, login: 'octocat'}),
+      expect.objectContaining({kind: 'web-operator', githubUserId: 42, login: 'octocat'}),
     )
     // #and — settlement happens BEFORE the abort fires
     expect(callOrder).toEqual(['handleDecision', 'abort'])
-    expect(postCancelNotice).toHaveBeenCalledWith('thread-1', 'run-1')
+    expect(postCancelNotice).toHaveBeenCalledWith('thread-1', 'run-1', makeActor())
   })
 
   it('asserts no direct registry-state mutation — only handleDecision is called for settlement', async () => {
@@ -552,7 +561,7 @@ describe('cancelRun — thread notice failure', () => {
 
     // #then — outcome unaffected
     expect(result).toEqual({outcome: 'cancelled', wasQueued: true})
-    expect(postCancelNotice).toHaveBeenCalledWith('thread-1', 'run-1')
+    expect(postCancelNotice).toHaveBeenCalledWith('thread-1', 'run-1', makeActor())
   })
 
   it('does not delay cancelRun return when postCancelNotice never resolves', async () => {
@@ -664,5 +673,156 @@ describe('cancelRun — readRunState failure modes', () => {
 
     // #then
     expect(result).toEqual({outcome: 'not-found'})
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Discord actor attribution
+// ---------------------------------------------------------------------------
+
+describe('cancelRun — Discord actor', () => {
+  it('executing: settles approvals as the Discord user, records a Discord cancelledBy, announces the Discord actor', async () => {
+    // #given — a registered run with one pending approval
+    const runState = makeRunState({phase: 'EXECUTING'})
+    const abortRegistry = createAbortRegistry()
+    abortRegistry.register('run-1')
+    const handleDecision = vi.fn().mockResolvedValue('ok')
+    const approvalRegistry = makeApprovalRegistry({
+      describePendingForScope: vi.fn().mockReturnValue([{requestID: 'req-1', permission: 'bash'}]),
+      handleDecision,
+    })
+    const postCancelNotice = vi.fn().mockResolvedValue(undefined)
+    const deps = makeDeps({runState, abortRegistry, approvalRegistry, postCancelNotice})
+
+    // #when
+    const result = await cancelRun({runId: 'run-1', actor: makeDiscordActor(), logger: makeLogger()}, deps)
+
+    // #then — the existing Discord approval actor, with no GitHub identity invented
+    expect(result).toEqual({outcome: 'cancelled', wasQueued: false})
+    expect(handleDecision).toHaveBeenCalledWith({
+      requestID: 'req-1',
+      approvalScopeId: 'thread-1',
+      decision: 'reject',
+      actor: {kind: 'discord-user', userId: '111222333444555666'},
+    })
+    // #and — the abort metadata (persisted to run-state details by run.ts) is the Discord shape only
+    expect(abortRegistry.getMetadata('run-1')).toEqual({
+      kind: 'discord-user',
+      discordUserId: '111222333444555666',
+      cancelledAt: '2026-07-03T12:00:00.000Z',
+    })
+    expect(postCancelNotice).toHaveBeenCalledExactlyOnceWith('thread-1', 'run-1', makeDiscordActor())
+  })
+
+  it('rendezvous: commits CANCELLED with a Discord-only cancelledBy', async () => {
+    // #given — pre-registration window: queue miss and registry miss
+    const runState = makeRunState({phase: 'ACKNOWLEDGED'})
+    const observe = vi.fn().mockResolvedValue(undefined)
+    const deps = makeDeps({runState, runObserver: {observe}})
+
+    // #when
+    const result = await cancelRun({runId: 'run-1', actor: makeDiscordActor(), logger: makeLogger()}, deps)
+
+    // #then
+    expect(result).toEqual({outcome: 'cancelled', wasQueued: false})
+    const observed = observe.mock.calls[0]?.[0] as RunState
+    expect(observed.details.cancelledBy).toEqual({
+      kind: 'discord-user',
+      discordUserId: '111222333444555666',
+      cancelledAt: '2026-07-03T12:00:00.000Z',
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Idempotent double cancel
+// ---------------------------------------------------------------------------
+
+describe('cancelRun — idempotent repeat cancel of an executing run', () => {
+  it.each([
+    ['Discord then web', makeDiscordActor(), makeActor()],
+    ['web then Discord', makeActor(), makeDiscordActor()],
+    ['Discord then Discord', makeDiscordActor(), makeDiscordActor()],
+  ])('%s: keeps the first actor, reports requested again, posts one notice', async (_label, first, second) => {
+    // #given — a real abort registry holding the run
+    const runState = makeRunState({phase: 'EXECUTING'})
+    const abortRegistry = createAbortRegistry()
+    abortRegistry.register('run-1')
+    const handleDecision = vi.fn().mockResolvedValue('ok')
+    const approvalRegistry = makeApprovalRegistry({
+      // Always reports a pending approval, so a second settlement attempt would be visible.
+      describePendingForScope: vi.fn().mockReturnValue([{requestID: 'req-1', permission: 'bash'}]),
+      handleDecision,
+    })
+    const postCancelNotice = vi.fn().mockResolvedValue(undefined)
+    const deps = makeDeps({runState, abortRegistry, approvalRegistry, postCancelNotice})
+
+    // #when — the same run is cancelled twice
+    const firstResult = await cancelRun({runId: 'run-1', actor: first, logger: makeLogger()}, deps)
+    const secondResult = await cancelRun({runId: 'run-1', actor: second, logger: makeLogger()}, deps)
+
+    // #then — same outcome both times, first actor attributed, notice and settlement once
+    expect(firstResult).toEqual({outcome: 'cancelled', wasQueued: false})
+    expect(secondResult).toEqual({outcome: 'cancelled', wasQueued: false})
+    expect(abortRegistry.getMetadata('run-1')).toMatchObject({kind: first.kind})
+    expect(postCancelNotice).toHaveBeenCalledExactlyOnceWith('thread-1', 'run-1', first)
+    expect(handleDecision).toHaveBeenCalledTimes(1)
+  })
+
+  it('concurrent cancels from Discord and web attribute one actor and post one notice', async () => {
+    // #given — a slow approval settlement keeps both calls inside the pre-abort window
+    const runState = makeRunState({phase: 'EXECUTING'})
+    const abortRegistry = createAbortRegistry()
+    abortRegistry.register('run-1')
+    const approvalRegistry = makeApprovalRegistry({
+      describePendingForScope: vi.fn().mockReturnValue([{requestID: 'req-1', permission: 'bash'}]),
+      handleDecision: vi.fn().mockImplementation(async () => {
+        await Promise.resolve()
+        return 'ok'
+      }),
+    })
+    const postCancelNotice = vi.fn().mockResolvedValue(undefined)
+    const deps = makeDeps({runState, abortRegistry, approvalRegistry, postCancelNotice})
+
+    // #when
+    const results = await Promise.all([
+      cancelRun({runId: 'run-1', actor: makeDiscordActor(), logger: makeLogger()}, deps),
+      cancelRun({runId: 'run-1', actor: makeActor(), logger: makeLogger()}, deps),
+    ])
+
+    // #then — both report requested; the stored attribution and the one notice name the same actor
+    expect(results).toEqual([
+      {outcome: 'cancelled', wasQueued: false},
+      {outcome: 'cancelled', wasQueued: false},
+    ])
+    expect(postCancelNotice).toHaveBeenCalledTimes(1)
+    const announced = postCancelNotice.mock.calls[0]?.[2] as CancelActorContext
+    expect(abortRegistry.getMetadata('run-1')).toMatchObject({kind: announced.kind})
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Queued work survives cancelling the current run
+// ---------------------------------------------------------------------------
+
+describe('cancelRun — executing run with queued work behind it', () => {
+  it('leaves the queued task in place for the normal hand-off', async () => {
+    // #given — run-1 executes in ch-a while run-2 waits in the real per-channel queue
+    const runState = makeRunState({phase: 'EXECUTING'})
+    const queue = createChannelQueue<RunTask>()
+    const queuedTask = {runId: 'run-2'} as unknown as RunTask
+    queue.enqueue('ch-a', queuedTask)
+    const abortRegistry = createAbortRegistry()
+    abortRegistry.register('run-1')
+    const deps = makeDeps({runState, queue, abortRegistry})
+
+    // #when — a Discord user cancels the executing run
+    const result = await cancelRun({runId: 'run-1', actor: makeDiscordActor(), logger: makeLogger()}, deps)
+
+    // #then — the executing run is cancelled and the queued sibling is untouched and still next in line
+    expect(result).toEqual({outcome: 'cancelled', wasQueued: false})
+    expect(abortRegistry.isAborted('run-1')).toBe(true)
+    expect(queue.pendingCount('ch-a')).toBe(1)
+    expect(queue.takeNext('ch-a')).toBe(queuedTask)
   })
 })

@@ -5,6 +5,7 @@ import type {RepoBinding} from './bindings/types.js'
 import type {GatewayConfig} from './config.js'
 import type {GatewayLogger} from './discord/client.js'
 import type {SinkThread} from './discord/streaming.js'
+import type {CancelRunDeps} from './execute/cancel.js'
 import type {RunTask} from './execute/run.js'
 import type {DispatchWorkflow} from './github/dispatch.js'
 import type {AnnounceServerConfig, AnnounceServerDeps} from './http/server.js'
@@ -522,35 +523,6 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       logger,
     })
 
-    const commandDeps = {
-      bindingsStore,
-      appClient,
-      workspaceClient,
-      installUrl: config.gatewayGitHubAppInstallUrl,
-      logger: addProjectLogger,
-      isShuttingDown,
-      queue: channelQueue,
-      triggerRoleId: config.triggerRoleId,
-      binderAllowlist: config.binderAllowlist,
-      gatewayLogger: logger,
-      // force-release-lock deps: pre-built coordination config + Effect-wrapped primitive
-      // (injected so tests can mock without real S3 calls)
-      coordinationConfig: makeCoordinationConfig(s3Adapter, config),
-      identity: config.identity,
-      checkRepoQuiescence,
-      forceReleaseStaleLock: forceReleaseStaleLockEffect,
-      dispatchWorkflow,
-    }
-
-    if (config.binderAllowlist.size === 0) {
-      logger.warn(
-        {},
-        'GATEWAY_BINDER_ALLOWLIST is empty or unset: /fro-bot add-project is disabled and refuses every user',
-      )
-    }
-
-    const registry = getCommandRegistry(commandDeps)
-
     // Program-scoped request gate: one settlement lifecycle for both request families. The
     // approval and question registries share it, so run teardown, shutdown drain, and the
     // terminal notification each run subscribes to span approvals and questions alike.
@@ -594,6 +566,52 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       clearTimeout: id => clearTimeout(id),
       now: () => Date.now(),
     })
+
+    // Shared cancellation engine deps, built once for both transports: the Discord `/fro-bot cancel` command and the
+    // operator web cancel route (only constructed when operator web is enabled) receive this same object, so
+    // cancellation does not depend on the operator endpoint. The notice sink is the Discord dispatcher either way.
+    const cancelRunDeps: CancelRunDeps = {
+      coordinationConfig: makeCoordinationConfig(s3Adapter, config),
+      identity: config.identity,
+      runIndex,
+      queue: channelQueue,
+      abortRegistry,
+      isRunQuarantined,
+      approvalRegistry,
+      postCancelNotice: createCancelNoticeDispatcher(client, logger),
+      runObserver: runObservationManager,
+    }
+
+    const commandDeps = {
+      bindingsStore,
+      appClient,
+      workspaceClient,
+      installUrl: config.gatewayGitHubAppInstallUrl,
+      logger: addProjectLogger,
+      isShuttingDown,
+      queue: channelQueue,
+      triggerRoleId: config.triggerRoleId,
+      binderAllowlist: config.binderAllowlist,
+      gatewayLogger: logger,
+      // force-release-lock deps: pre-built coordination config + Effect-wrapped primitive
+      // (injected so tests can mock without real S3 calls)
+      coordinationConfig: makeCoordinationConfig(s3Adapter, config),
+      identity: config.identity,
+      checkRepoQuiescence,
+      forceReleaseStaleLock: forceReleaseStaleLockEffect,
+      dispatchWorkflow,
+      cancelRunDeps,
+      runIndex,
+    }
+
+    if (config.binderAllowlist.size === 0) {
+      logger.warn(
+        {},
+        'GATEWAY_BINDER_ALLOWLIST is empty or unset: /fro-bot add-project is disabled and refuses every user',
+      )
+    }
+
+    const registry = getCommandRegistry(commandDeps)
 
     // A request opening or leaving the gate changes what a run is waiting on. The gate spans both
     // request families, so two subscriptions cover approvals and questions on every surface.
@@ -1129,17 +1147,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
         runIndex,
         approvalRegistry,
         questionRegistry,
-        cancelRunDeps: {
-          coordinationConfig: makeCoordinationConfig(s3Adapter, config),
-          identity: config.identity,
-          runIndex,
-          queue: channelQueue,
-          abortRegistry,
-          isRunQuarantined,
-          approvalRegistry,
-          postCancelNotice: createCancelNoticeDispatcher(client, logger),
-          runObserver: runObservationManager,
-        },
+        cancelRunDeps,
         launchWorkDeps: runEngineDeps,
         dispatchWorkflow,
         operatorPush,

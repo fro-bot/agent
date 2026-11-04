@@ -263,6 +263,7 @@ describe('run question wiring', () => {
     mockRunOpenCodeCore.mockImplementation(async params => {
       await params.questions?.onAsked(ASKED)
       abortRegistry.abort(WIRE_RUN_ID, 'operator cancel', {
+        kind: 'web-operator',
         githubUserId: 42,
         login: 'octocat',
         sessionCorrelationId: 'sess-1',

@@ -92,7 +92,7 @@ function makeCancelDeps(coordinationConfig: CoordinationConfig): CancelRunDeps &
   }
 }
 
-const ACTOR = {githubUserId: 42, login: 'octocat', sessionCorrelationId: 'sess-1'}
+const ACTOR = {kind: 'web-operator' as const, githubUserId: 42, login: 'octocat', sessionCorrelationId: 'sess-1'}
 
 /** Run a task that quarantines (unconfirmed stop), stopping inside its hold window. */
 async function quarantineARun(failPhases: readonly string[]) {

@@ -186,6 +186,7 @@ export function buildCancelRoute(app: Hono, deps: CancelRouteDeps): void {
       }
 
       const actor: CancelActorContext = {
+        kind: 'web-operator',
         githubUserId,
         login: sessionEntry.login,
         sessionCorrelationId: sessionId,

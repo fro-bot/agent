@@ -72,6 +72,8 @@ function makeDeps(overrides?: Partial<FroBotDeps>): FroBotDeps {
     checkRepoQuiescence: vi.fn(),
     forceReleaseStaleLock: vi.fn(),
     dispatchWorkflow: vi.fn<DispatchWorkflow>(),
+    cancelRunDeps: {} as FroBotDeps['cancelRunDeps'],
+    runIndex: {listRunsForRepo: vi.fn().mockResolvedValue([])},
     ...overrides,
   }
 }
