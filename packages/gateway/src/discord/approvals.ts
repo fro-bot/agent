@@ -10,6 +10,7 @@ import type {PermissionReply, PermissionRequest, SettlementReason} from '../appr
 import {ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder} from 'discord.js'
 
 import {isRequestDetailTruncated} from '../approvals/approval-detail.js'
+import {escapeText} from './questions.js'
 
 // ---------------------------------------------------------------------------
 // custom_id prefixes (namespaced to avoid collisions with other interactions)
@@ -127,22 +128,41 @@ export function buildApprovalButtons(requestID: string, rejectOnly = false): Act
 }
 
 /**
+ * Who settled an approval, by origin. A Discord user can be mentioned; a web operator is only a
+ * GitHub login, which Discord cannot resolve, so it is shown as plain text.
+ */
+export type SettledDecider =
+  {readonly kind: 'discord-user'; readonly userId: string} | {readonly kind: 'web'; readonly login: string}
+
+/** Longest login shown on a card; GitHub logins are far shorter, so this only bounds a malformed one. */
+const WEB_LOGIN_MAX = 64
+
+function deciderLabel(decidedBy: SettledDecider | undefined): string | null {
+  if (decidedBy === undefined) return null
+  if (decidedBy.kind === 'discord-user') return decidedBy.userId.length > 0 ? `<@${decidedBy.userId}>` : null
+  const login = decidedBy.login.trim().slice(0, WEB_LOGIN_MAX)
+  return login.length === 0 ? null : `${escapeText(login)} (dashboard)`
+}
+
+/**
  * Build a resolved-state embed after a request has been settled.
  *
  * Covers all `SettlementReason` variants with appropriate human text.
- * Renders `<@id>` mention only when `decidedBy` is present (human decisions);
+ * Renders a `<@id>` mention for a Discord decider and escaped plain text for a dashboard decider;
  * deadline / cascade / disposed have no human decider.
  */
 export function buildSettledEmbed(
   request: PermissionRequest,
   decision: PermissionReply,
-  opts: {decidedBy?: string; reason: SettlementReason},
+  opts: {decidedBy?: SettledDecider; reason: SettlementReason},
 ): EmbedBuilder {
   const {decidedBy, reason} = opts
-  const mention = decidedBy !== undefined && decidedBy.length > 0 ? `<@${decidedBy}>` : null
+  const mention = deciderLabel(decidedBy)
 
   let title: string
   let color: number
+  // Discord renders mentions in a description but never in an embed title, so a human decider goes here.
+  let decider: string | null = null
 
   if (reason === 'superseded') {
     title = '🔄 This approval request was superseded by a newer request.'
@@ -157,16 +177,20 @@ export function buildSettledEmbed(
     title = '⚠️ Cancelled (shutdown)'
     color = 0x99aab5 // grey
   } else if (decision === 'reject') {
-    title = mention === null ? '⛔ Denied' : `⛔ Denied by ${mention}`
+    title = '⛔ Denied'
+    decider = mention === null ? null : `Denied by ${mention}`
     color = 0xed4245 // red
   } else {
     // 'once' or 'always' — approved
-    title = mention === null ? '✅ Approved' : `✅ Approved by ${mention}`
+    title = '✅ Approved'
+    decider = mention === null ? null : `Approved by ${mention}`
     color = 0x57f287 // green
   }
 
-  return new EmbedBuilder()
-    .setTitle(title)
+  const embed = new EmbedBuilder().setTitle(title)
+  // The decider line is the only description content, so it cannot approach the 4096 limit.
+  if (decider !== null) embed.setDescription(decider)
+  return embed
     .setColor(color)
     .addFields(
       {name: 'Gate category', value: request.permission, inline: true},

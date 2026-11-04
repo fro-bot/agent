@@ -160,11 +160,16 @@ describe('POST cancel — happy path', () => {
 
     expect(cancelRunMock).toHaveBeenCalledTimes(1)
     const call = cancelRunMock.mock.calls[0] as unknown as [
-      {runId: string; actor: {githubUserId: number; login: string; sessionCorrelationId: string}},
+      {runId: string; actor: {kind: string; githubUserId: number; login: string; sessionCorrelationId: string}},
       unknown,
     ]
     expect(call[0].runId).toBe('run-abc')
-    expect(call[0].actor).toEqual({githubUserId: 1001, login: 'alice', sessionCorrelationId: 'sess-abc'})
+    expect(call[0].actor).toEqual({
+      kind: 'web-operator',
+      githubUserId: 1001,
+      login: 'alice',
+      sessionCorrelationId: 'sess-abc',
+    })
 
     expect(vi.mocked(auditLogger.info)).toHaveBeenCalledWith(
       expect.objectContaining({githubUserId: 1001, runId: 'run-abc', phase: 'CANCELLED'}),
@@ -345,6 +350,24 @@ describe('POST cancel — CancelOutcome mapping', () => {
     expect(response.status).toBe(200)
     const body = (await response.json()) as {ok: boolean; runId: string; phase: string}
     expect(body).toEqual({ok: true, runId: 'run-abc', phase: 'COMPLETED'})
+  })
+
+  it('quarantined → 200 reporting the run as FAILED (closed contract, nothing cancelled), audited as FAILED', async () => {
+    const outcome: CancelOutcome = {outcome: 'quarantined'}
+    cancelRunMock.mockReset().mockResolvedValue(outcome)
+    const auditLogger = makeAuditLogger()
+    const deps = makeDeps({auditLogger})
+    const app = buildApp(deps)
+
+    const response = await postCancel(app, 'run-abc')
+
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as {ok: boolean; runId: string; phase: string}
+    expect(body).toEqual({ok: true, runId: 'run-abc', phase: 'FAILED'})
+    expect(vi.mocked(auditLogger.info)).toHaveBeenCalledWith(
+      expect.objectContaining({runId: 'run-abc', phase: 'FAILED'}),
+      'audit: run.cancel.requested',
+    )
   })
 
   it('not-found (from cancelRun itself) → notFoundResponse', async () => {

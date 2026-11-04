@@ -24,7 +24,7 @@ import type {GatewayLogger} from '../discord/client.js'
 import type {ReplySink} from '../execute/launch-types.js'
 import type {PermissionRequest} from './coordinator.js'
 import type {DiscordApprovalTransportDeps} from './discord-transport.js'
-import type {ApprovalRegistry} from './registry.js'
+import type {ApprovalActor, ApprovalRegistry} from './registry.js'
 
 import {DiscordAPIError, RESTJSONErrorCodes} from 'discord.js'
 import {describe, expect, it, vi} from 'vitest'
@@ -172,6 +172,53 @@ describe('createDiscordApprovalOnPending — happy path', () => {
     // #then the request was never auto-rejected or marked post-failed
     expect(approvalRegistry.applySettlement).not.toHaveBeenCalled()
     expect(approvalRegistry.markMessagePostFailed).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Settled card — the decider line follows the actor's origin
+// ---------------------------------------------------------------------------
+
+/** Posts a card, then runs the attached render function for `actor` and returns the edited description. */
+async function settleCardAs(actor: ApprovalActor): Promise<string | undefined> {
+  const edit = vi.fn().mockResolvedValue({})
+  const approvalRegistry = makeApprovalRegistry()
+  const replySink = makeReplySink({embedResult: {success: true, data: {id: 'msg_embed', edit}}})
+  const request = makeRequest()
+  createDiscordApprovalOnPending(makeDeps({approvalRegistry, replySink}))(request)
+  await vi.waitFor(() => {
+    expect(approvalRegistry.attachMessage).toHaveBeenCalledOnce()
+  })
+  const render = vi.mocked(approvalRegistry.attachMessage).mock.calls[0]?.[1] as (
+    req: PermissionRequest,
+    decision: 'once',
+    actor: ApprovalActor,
+    reason: 'replied',
+  ) => Promise<void>
+  await render(request, 'once', actor, 'replied')
+  const edited = edit.mock.calls[0]?.[0] as {embeds: readonly {toJSON: () => {description?: string}}[]}
+  return edited.embeds[0]?.toJSON().description
+}
+
+describe('createDiscordApprovalOnPending — settled card decider', () => {
+  it('mentions a Discord user who decided', async () => {
+    // #given/#when
+    const description = await settleCardAs({kind: 'discord-user', userId: '123456789'})
+    // #then
+    expect(description).toBe('Approved by <@123456789>')
+  })
+
+  it('shows a dashboard operator as a plain login, not a mention', async () => {
+    // #given/#when
+    const description = await settleCardAs({
+      kind: 'web-operator',
+      githubUserId: 1,
+      login: 'octocat',
+      sessionCorrelationId: 'corr_1',
+    })
+    // #then
+    expect(description).toBe('Approved by octocat (dashboard)')
+    expect(description).not.toContain('<@')
   })
 })
 

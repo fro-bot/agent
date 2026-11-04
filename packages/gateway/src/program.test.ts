@@ -776,6 +776,56 @@ describe('makeGatewayProgram', () => {
     expect(typeof commandDeps?.dispatchWorkflow).toBe('function')
   })
 
+  it('builds the cancel deps for /fro-bot cancel even when the operator web endpoint is disabled', async () => {
+    // #given — no operatorWeb config: the operator branch never runs
+    const fakeConfig = makeFakeConfig({announce: undefined, operatorWeb: undefined})
+    const startOperatorServer = vi.fn()
+    const deps = {
+      makeClient: () => makeFakeClient() as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer,
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    // #when
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    // #then — the command registry still received a complete cancel engine, with the Discord notice sink
+    expect(startOperatorServer).not.toHaveBeenCalled()
+    const commandDeps = getCommandRegistrySpy.mock.calls[0]?.[0]
+    expect(commandDeps?.cancelRunDeps.postCancelNotice).toBeTypeOf('function')
+    expect(commandDeps?.cancelRunDeps.abortRegistry.abort).toBeTypeOf('function')
+    expect(commandDeps?.cancelRunDeps.queue).toBe(commandDeps?.queue)
+    expect(commandDeps?.runIndex.listRunsForRepo).toBeTypeOf('function')
+    expect(commandDeps?.listLiveRuns).toBeTypeOf('function')
+    expect(commandDeps?.cancelRunDeps.inFlightCancels.run).toBeTypeOf('function')
+  })
+
+  it('shares one cancel deps object between /fro-bot cancel and the operator cancel route', async () => {
+    // #given — operator web enabled
+    const fakeConfig = makeFakeConfig({announce: undefined, operatorWeb: makeOperatorWebConfig()})
+    const startOperatorServerSpy = vi.fn().mockReturnValue(makeFakeServerHandle())
+    const deps = {
+      makeClient: () => makeFakeClient() as unknown as import('discord.js').Client,
+      setupReadinessFlag: vi.fn(),
+      login: vi.fn().mockResolvedValue(undefined),
+      startAnnounceServer: vi.fn(),
+      startOperatorServer: startOperatorServerSpy,
+      runProviderSelfTest: vi.fn(async () => {}),
+    }
+
+    // #when
+    await Effect.runPromise(makeGatewayProgram(deps, fakeConfig))
+
+    // #then — same instance, so the two transports cannot drift
+    const commandDeps = getCommandRegistrySpy.mock.calls[0]?.[0]
+    const [serverDeps] = startOperatorServerSpy.mock.calls[0] as [import('./web/server.js').OperatorServerDeps]
+    expect(commandDeps?.cancelRunDeps).toBeDefined()
+    expect(serverDeps.cancelRunDeps).toBe(commandDeps?.cancelRunDeps)
+  })
+
   it('boot fails fast when provider self-test rejects', async () => {
     // #given
     const fakeConfig = makeFakeConfig()

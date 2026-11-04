@@ -19,6 +19,13 @@
  *    re-reads, and resolves via a single bounded retry — see
  *    `attemptRendezvousCancel` below).
  *
+ * A **quarantined** run (its owned sessions were not confirmed stopped; lock and slot are held for the hold window)
+ * is refused before any path runs: it has no abort-registry entry and its record may still read EXECUTING, so the
+ * rendezvous would otherwise write CANCELLED over work that is not confirmed stopped.
+ *
+ * A repeat cancel of an executing run that is already cancelling reports the same `cancelled` outcome and does nothing
+ * else: the first actor stays attributed (the abort registry keeps the first metadata) and no second notice is posted.
+ *
  * Already-terminal runs are idempotent no-ops (read-then-short-circuit —
  * `transitionRun` rejects terminal transitions by design, so the orchestrator
  * never attempts one). Unknown runIds resolve to `not-found`.
@@ -43,18 +50,27 @@ import {toRuntimeLogger} from './runtime-logger.js'
 // ---------------------------------------------------------------------------
 
 /**
- * Minimal, readonly actor-attribution shape accepted by `cancelRun`.
+ * Minimal, readonly actor-attribution shape accepted by `cancelRun`, discriminated on `kind` like the approval
+ * gate's actors (`GateActor`).
  *
- * Structurally compatible with `OperatorIdentity`/`WebOperatorActor` — the
- * operator web cancel route passes those fields directly. Kept as its own type here so
- * `cancel.ts` (execute-layer, transport-neutral) does not import the web
+ * - `web-operator`: structurally compatible with `OperatorIdentity`/`WebOperatorActor` — the operator web cancel route
+ *   passes those fields directly.
+ * - `discord-user`: the Discord user who ran `/fro-bot cancel`. No GitHub identity exists for them and none is invented.
+ *
+ * Kept as its own type here so `cancel.ts` (execute-layer, transport-neutral) does not import the web
  * operator-contract module.
  */
-export interface CancelActorContext {
-  readonly githubUserId: number
-  readonly login: string
-  readonly sessionCorrelationId: string
-}
+export type CancelActorContext =
+  | {
+      readonly kind: 'web-operator'
+      readonly githubUserId: number
+      readonly login: string
+      readonly sessionCorrelationId: string
+    }
+  | {
+      readonly kind: 'discord-user'
+      readonly discordUserId: string
+    }
 
 export type CancelOutcome =
   | {readonly outcome: 'not-found'}
@@ -67,6 +83,12 @@ export type CancelOutcome =
    * "cancel not yet applied, safe to retry" rather than a failure.
    */
   | {readonly outcome: 'retry'}
+  /**
+   * The run is in its quarantine hold: it already failed, and its owned sessions are not confirmed stopped. Nothing
+   * was written, released, aborted or announced. Not an error and not retryable — the hold ends on its own. Callers
+   * report it as the failed run it is.
+   */
+  | {readonly outcome: 'quarantined'}
 
 export interface CancelRunParams {
   readonly runId: string
@@ -74,20 +96,54 @@ export interface CancelRunParams {
   readonly logger: GatewayLogger
 }
 
+/**
+ * Per-run in-flight cancel operations. Closure-based; create ONE per process (`program.ts`) and share it between every
+ * transport, so a Discord and a web cancel of the same run collapse into a single operation.
+ */
+export interface InFlightCancels {
+  /**
+   * Run `operation` for `runId`, unless one is already in flight: then return that operation's promise instead. The
+   * slot is reserved synchronously (before `operation` is even called), and cleared when it settles, fulfilled or
+   * rejected. Callers that join an in-flight operation get its outcome (or its rejection).
+   */
+  readonly run: (runId: string, operation: () => Promise<CancelOutcome>) => Promise<CancelOutcome>
+}
+
+export function createInFlightCancels(): InFlightCancels {
+  const inFlight = new Map<string, Promise<CancelOutcome>>()
+  return {
+    run: async (runId, operation) => {
+      const existing = inFlight.get(runId)
+      if (existing !== undefined) return existing
+      // `.finally` runs after `operation` settles either way, so a throw cannot leave the slot occupied.
+      const reserved = operation().finally(() => {
+        inFlight.delete(runId)
+      })
+      inFlight.set(runId, reserved)
+      return reserved
+    },
+  }
+}
+
 export interface CancelRunDeps {
   readonly coordinationConfig: CoordinationConfig
   readonly identity: string
   readonly runIndex: Pick<RunIndex, 'lookup'>
   readonly queue: ChannelQueue<RunTask>
-  readonly abortRegistry: Pick<AbortRegistry, 'has' | 'abort'>
+  readonly abortRegistry: Pick<AbortRegistry, 'has' | 'abort' | 'getMetadata'>
+  /** Collapses concurrent cancels of one run into a single operation (see `InFlightCancels`). */
+  readonly inFlightCancels: InFlightCancels
+  /** Whether the run is in its quarantine hold in this process (see `live-run-registry.ts`). */
+  readonly isRunQuarantined: (runId: string) => boolean
   readonly approvalRegistry: Pick<ApprovalRegistry, 'describePendingForScope' | 'handleDecision'>
   /**
    * Post the cancellation notice for a run to its origin surface. Transport-specific
    * (Discord thread, etc.) — injected by the composition root so this orchestrator
    * stays transport-neutral. Must be fail-soft: never throw. Called fire-and-forget.
-   * `threadId` is the run-state thread_id ('' when the run has no thread).
+   * `threadId` is the run-state thread_id ('' when the run has no thread). `actor` is who cancelled, so the notice
+   * can say so; it is posted at most once per run, for the actor attributed in run-state.
    */
-  readonly postCancelNotice: (threadId: string, runId: string) => Promise<void>
+  readonly postCancelNotice: (threadId: string, runId: string, actor: CancelActorContext) => Promise<void>
   readonly runObserver?: {readonly observe: (runState: RunState) => Promise<void>}
   /** Wall-clock provider — injectable for deterministic tests. Defaults to `Date.now`. */
   readonly now?: () => number
@@ -157,11 +213,29 @@ function isTerminalPhase(phase: RunPhase): phase is TerminalPhase {
 
 /** Build the `cancelledBy` attribution metadata attached to a CANCELLED transition. */
 function makeCancelledBy(actor: CancelActorContext, now?: () => number): CancelledByMetadata {
+  const cancelledAt = new Date(now?.() ?? Date.now()).toISOString()
+  if (actor.kind === 'discord-user') {
+    return {kind: 'discord-user', discordUserId: actor.discordUserId, cancelledAt}
+  }
   return {
+    kind: 'web-operator',
     githubUserId: actor.githubUserId,
     login: actor.login,
     sessionCorrelationId: actor.sessionCorrelationId,
-    cancelledAt: new Date(now?.() ?? Date.now()).toISOString(),
+    cancelledAt,
+  }
+}
+
+/** The approval gate's actor for a cancel: the same identity, in the gate's own shape. */
+function toApprovalActor(actor: CancelActorContext | CancelledByMetadata): ApprovalActor {
+  if (actor.kind === 'discord-user') {
+    return {kind: 'discord-user', userId: actor.discordUserId}
+  }
+  return {
+    kind: 'web-operator',
+    githubUserId: actor.githubUserId,
+    login: actor.login,
+    sessionCorrelationId: actor.sessionCorrelationId,
   }
 }
 
@@ -260,6 +334,13 @@ async function attemptRendezvousCancel(
       return {outcome: 'already-terminal', phase: read.state.phase}
     }
 
+    // Checked right before every write: the run may have started its quarantine during any await on the way here
+    // (approval settlement, a failed queued write, an abort that delivered to nothing, or the read above).
+    if (deps.isRunQuarantined(runId)) {
+      logger.info({repo, runId}, 'cancelRun: run is in its quarantine hold — cancel not applied')
+      return {outcome: 'quarantined'}
+    }
+
     const cancelledBy = makeCancelledBy(actor, deps.now)
 
     const result = await transitionRun(coordinationConfig, identity, repo, runId, 'CANCELLED', read.etag, coordLogger, {
@@ -269,7 +350,7 @@ async function attemptRendezvousCancel(
     if (result.success === true) {
       notifyObserverBestEffort(deps, result.data.state, logger)
       // eslint-disable-next-line no-void
-      void deps.postCancelNotice(result.data.state.thread_id, runId).catch(() => {})
+      void deps.postCancelNotice(result.data.state.thread_id, runId, actor).catch(() => {})
       return {outcome: 'cancelled', wasQueued: false}
     }
 
@@ -294,7 +375,17 @@ async function attemptRendezvousCancel(
 // cancelRun
 // ---------------------------------------------------------------------------
 
+/**
+ * Cancel a run. Concurrent calls for the same run share one operation: the first caller's engine body runs once (one
+ * settlement, one abort, one notice, the first actor attributed) and later callers return its outcome. Not `async`
+ * on purpose: the slot must be reserved synchronously, before the body's first await, or two callers could both pass
+ * the "nobody has started" point.
+ */
 export async function cancelRun(params: CancelRunParams, deps: CancelRunDeps): Promise<CancelOutcome> {
+  return deps.inFlightCancels.run(params.runId, async () => cancelRunOnce(params, deps))
+}
+
+async function cancelRunOnce(params: CancelRunParams, deps: CancelRunDeps): Promise<CancelOutcome> {
   const {runId, actor, logger} = params
 
   const location = await deps.runIndex.lookup(runId)
@@ -312,6 +403,14 @@ export async function cancelRun(params: CancelRunParams, deps: CancelRunDeps): P
   // terminal transition (transitionRun rejects it by design anyway). ──────
   if (isTerminalPhase(initialRead.state.phase)) {
     return {outcome: 'already-terminal', phase: initialRead.state.phase}
+  }
+
+  // ── Quarantined: the cancel must not touch a run whose owned work is unconfirmed. Checked here before every path and
+  // again at the top of `attemptRendezvousCancel`, because quarantine can start during any await below (the abort
+  // entry is then gone and the record may still read EXECUTING); a delivered abort ahead of it is the best-effort case. ──
+  if (deps.isRunQuarantined(runId)) {
+    logger.info({repo, runId}, 'cancelRun: run is in its quarantine hold — cancel not applied')
+    return {outcome: 'quarantined'}
   }
 
   // ── Queued path: PENDING/ACKNOWLEDGED with a matching queue entry ───────
@@ -344,19 +443,25 @@ export async function cancelRun(params: CancelRunParams, deps: CancelRunDeps): P
       }
       notifyObserverBestEffort(deps, transitionResult.data.state, logger)
       // eslint-disable-next-line no-void
-      void deps.postCancelNotice(transitionResult.data.state.thread_id, runId).catch(() => {})
+      void deps.postCancelNotice(transitionResult.data.state.thread_id, runId, actor).catch(() => {})
       return {outcome: 'cancelled', wasQueued: true}
     }
   }
 
   // ── Executing path: abort-registry hit ───────────────────────────────────
   if (deps.abortRegistry.has(runId)) {
-    const approvalActor: ApprovalActor = {
-      kind: 'web-operator',
-      githubUserId: actor.githubUserId,
-      login: actor.login,
-      sessionCorrelationId: actor.sessionCorrelationId,
+    // Repeat cancel: an earlier operation already requested it and the run is settling. Same answer as the first
+    // call, with no new attribution, abort or notice — the first actor stays on record. The one thing worth redoing
+    // is the approval rejection: a failed reply reopens the approval, and a repeat is the only retry it gets. It is
+    // idempotent (nothing open, nothing to do), and runs as the attributed actor so the record stays truthful.
+    const attributed = deps.abortRegistry.getMetadata(runId)
+    if (attributed !== undefined) {
+      logger.info({repo, runId}, 'cancelRun: cancel already requested — retrying approval settlement only')
+      await settlePendingApprovals(deps, initialRead.state, toApprovalActor(attributed), logger)
+      return {outcome: 'cancelled', wasQueued: false}
     }
+
+    const approvalActor = toApprovalActor(actor)
 
     // Settle pending approvals FIRST — the run's error path (triggered by the
     // abort below) owns the run-state transition/cleanup; approvals must be
@@ -390,8 +495,10 @@ export async function cancelRun(params: CancelRunParams, deps: CancelRunDeps): P
     // best-effort message can be briefly stale. Do NOT make this conditional on the
     // eventual terminal state: that would couple this fire-and-forget orchestrator to
     // the async settlement and defeat the point of firing eagerly.
+    //
+    // Only one operation per run is ever in flight (`inFlightCancels`), so this is the single notice for the cancel.
     // eslint-disable-next-line no-void
-    void deps.postCancelNotice(initialRead.state.thread_id, runId).catch(() => {})
+    void deps.postCancelNotice(initialRead.state.thread_id, runId, actor).catch(() => {})
     return {outcome: 'cancelled', wasQueued: false}
   }
 

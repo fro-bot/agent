@@ -22,20 +22,33 @@
  */
 
 /**
- * Attribution metadata for an operator-initiated cancel.
+ * Attribution metadata for an operator-initiated cancel, discriminated on `kind` like the approval gate's actors.
  *
  * Written by `cancelRun` alongside `abort()` so the run's own
  * settlement path in `run.ts` (the single writer of the CANCELLED transition)
  * can read it back and thread `details.cancelledBy` onto the transition —
  * without the orchestrator reaching into run.ts's private execution state.
+ *
+ * Persisted in run-state `details` only: the operator contract (`RunSummary`, `OperatorCancelResponse`) never
+ * carries it. A record written before the union existed has the `web-operator` fields and no `kind`; nothing reads
+ * it back, so it needs no migration.
  */
-export interface CancelledByMetadata {
-  readonly githubUserId: number
-  readonly login: string
-  readonly sessionCorrelationId: string
-  /** ISO timestamp of the cancel request. */
-  readonly cancelledAt: string
-}
+export type CancelledByMetadata =
+  | {
+      readonly kind: 'web-operator'
+      readonly githubUserId: number
+      readonly login: string
+      readonly sessionCorrelationId: string
+      /** ISO timestamp of the cancel request. */
+      readonly cancelledAt: string
+    }
+  | {
+      readonly kind: 'discord-user'
+      /** Discord snowflake of the user who ran `/fro-bot cancel`. */
+      readonly discordUserId: string
+      /** ISO timestamp of the cancel request. */
+      readonly cancelledAt: string
+    }
 
 export interface AbortRegistry {
   /**
@@ -50,7 +63,10 @@ export interface AbortRegistry {
    * `metadata`, when provided, is stored retrievably via `getMetadata` — the
    * run's own settlement path reads it back to attribute the CANCELLED
    * transition's `details.cancelledBy` (single writer = the run's own
-   * settlement path, per the plan's Key Technical Decisions).
+   * settlement path, per the plan's Key Technical Decisions). The FIRST
+   * metadata wins: a repeat cancel never rewrites who cancelled the run, and
+   * callers learn whether they were first by comparing `getMetadata` to what
+   * they passed.
    *
    * Returns `false` (no-op) for an unknown `runId` — the run may already have
    * completed and been deleted, or may not yet be registered (the pre-ACK
@@ -93,7 +109,7 @@ export function createAbortRegistry(): AbortRegistry {
       if (controller === undefined) {
         return false
       }
-      if (metadata !== undefined) {
+      if (metadata !== undefined && metadataByRunId.has(runId) === false) {
         metadataByRunId.set(runId, metadata)
       }
       controller.abort(reason)
