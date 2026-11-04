@@ -116,6 +116,7 @@ function makeDeps(overrides: Partial<CancelRunDeps> & {readonly runState: RunSta
     runIndex: rest.runIndex ?? makeRunIndex(),
     queue: rest.queue ?? makeQueue(),
     abortRegistry: rest.abortRegistry ?? makeAbortRegistry(),
+    isRunQuarantined: rest.isRunQuarantined ?? vi.fn().mockReturnValue(false),
     approvalRegistry: rest.approvalRegistry ?? makeApprovalRegistry(),
     postCancelNotice: rest.postCancelNotice ?? vi.fn().mockResolvedValue(undefined),
     runObserver: rest.runObserver,
@@ -361,6 +362,53 @@ describe('cancelRun — executing with a pending agent question', () => {
     expect(effects.rejectQuestion).toHaveBeenCalledExactlyOnceWith('que_1')
     expect(effects.replyQuestion).not.toHaveBeenCalled()
     expect(registry.pending()).toEqual([])
+  })
+})
+
+describe('cancelRun — quarantined', () => {
+  it.each([
+    ['no abort entry, record still EXECUTING', false],
+    ['abort entry not yet deleted', true],
+  ])('refuses without touching anything (%s)', async (_label, hasAbortEntry) => {
+    // #given a run in its quarantine hold, whose record has not been terminalized
+    const runState = makeRunState({phase: 'EXECUTING'})
+    const coordinationConfig = makeCoordinationConfig(runState)
+    const abortRegistry = makeAbortRegistry({has: vi.fn().mockReturnValue(hasAbortEntry)})
+    const approvalRegistry = makeApprovalRegistry()
+    const queue = makeQueue()
+    const postCancelNotice = vi.fn().mockResolvedValue(undefined)
+    const deps = makeDeps({
+      runState,
+      coordinationConfig,
+      abortRegistry,
+      approvalRegistry,
+      queue,
+      postCancelNotice,
+      isRunQuarantined: vi.fn().mockReturnValue(true),
+    })
+
+    // #when
+    const result = await cancelRun({runId: 'run-1', actor: makeActor(), logger: makeLogger()}, deps)
+
+    // #then it is a distinct outcome and nothing was written, aborted, settled, dequeued or announced
+    expect(result).toEqual({outcome: 'quarantined'})
+    expect(coordinationConfig.storeAdapter.conditionalPut).not.toHaveBeenCalled()
+    expect(abortRegistry.abort).not.toHaveBeenCalled()
+    expect(approvalRegistry.handleDecision).not.toHaveBeenCalled()
+    expect(queue.removeBy).not.toHaveBeenCalled()
+    expect(postCancelNotice).not.toHaveBeenCalled()
+  })
+
+  it('still reports an already-terminal record as terminal', async () => {
+    // #given a quarantined run whose FAILED record landed
+    const runState = makeRunState({phase: 'FAILED'})
+    const deps = makeDeps({runState, isRunQuarantined: vi.fn().mockReturnValue(true)})
+
+    // #when
+    const result = await cancelRun({runId: 'run-1', actor: makeActor(), logger: makeLogger()}, deps)
+
+    // #then the truthful record wins
+    expect(result).toEqual({outcome: 'already-terminal', phase: 'FAILED'})
   })
 })
 

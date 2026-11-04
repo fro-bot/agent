@@ -10,6 +10,14 @@
 
 const liveRunIds = new Set<string>()
 
+/**
+ * Live runs that quarantined: their termination barrier could not confirm the owned sessions stopped, so the repo lock
+ * and channel slot are held (and the quarantine watch keeps interrupting) until the hold window ends. A subset of
+ * `liveRunIds`; cleared with it. In-memory only, and set even when the quarantine's own FAILED write never landed, so
+ * it is the one signal that a still-EXECUTING record belongs to a run that must not be cancelled.
+ */
+const quarantinedRunIds = new Set<string>()
+
 /** Marks `runId` live. Called once its ACKNOWLEDGED write has committed. */
 export function markRunLive(runId: string): void {
   liveRunIds.add(runId)
@@ -18,6 +26,17 @@ export function markRunLive(runId: string): void {
 /** Marks `runId` ended. A no-op for an id that is not live. */
 export function markRunEnded(runId: string): void {
   liveRunIds.delete(runId)
+  quarantinedRunIds.delete(runId)
+}
+
+/** Marks `runId` quarantined. Called when the run's quarantine path begins; ended by `markRunEnded`. */
+export function markRunQuarantined(runId: string): void {
+  quarantinedRunIds.add(runId)
+}
+
+/** Whether `runId` is in its quarantine hold in this process. */
+export function isRunQuarantined(runId: string): boolean {
+  return quarantinedRunIds.has(runId)
 }
 
 /** Whether this process is still running `runId`. */

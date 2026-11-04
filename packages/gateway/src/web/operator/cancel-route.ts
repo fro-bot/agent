@@ -90,7 +90,8 @@ export interface CancelRouteDeps {
  * if the guard allows the request.
  *
  * Response body: OperatorCancelResponse {ok:true, runId, phase} on success
- * (both an active cancel and an idempotent already-terminal hit are 200s).
+ * (an active cancel, an idempotent already-terminal hit, and a cancel of a quarantined run — reported as FAILED,
+ * nothing changed — are all 200s).
  */
 export function buildCancelRoute(app: Hono, deps: CancelRouteDeps): void {
   // Per-operator rate limiter (operator-keyed, not socket-keyed), AFTER authz —
@@ -223,6 +224,22 @@ export function buildCancelRoute(app: Hono, deps: CancelRouteDeps): void {
             deps.auditLogger,
           )
           return c.json({ok: true, runId, phase: outcome.phase}, 200)
+        }
+        case 'quarantined': {
+          // The run already failed and is held while its owned sessions are confirmed stopped; the cancel changed
+          // nothing. The contract's cancel response is closed over terminal phases, so report the failure the run
+          // already has (200, same as any already-terminal hit) rather than a CANCELLED that did not happen.
+          emitAudit(
+            {
+              kind: 'run.cancel.requested',
+              correlationId: `cancel:${githubUserId}:${runId}`,
+              githubUserId,
+              runId,
+              phase: 'FAILED',
+            },
+            deps.auditLogger,
+          )
+          return c.json({ok: true, runId, phase: 'FAILED'}, 200)
         }
         case 'not-found': {
           deps.logger.warn({githubUserId, runId, gate: 'cancelRun-not-found'}, 'cancel: denied')
