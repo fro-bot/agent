@@ -18,7 +18,7 @@ import {
 } from './test-helpers.js'
 import * as runCoreModule from './run-core.js'
 import {abortRegistry} from './abort-registry.js'
-import {cancelRun} from './cancel.js'
+import {cancelRun, createInFlightCancels} from './cancel.js'
 import {isRunLive, isRunQuarantined} from './live-run-registry.js'
 /* eslint-enable perfectionist/sort-imports */
 
@@ -86,6 +86,7 @@ function makeCancelDeps(coordinationConfig: CoordinationConfig): CancelRunDeps &
       removeBy: vi.fn().mockReturnValue(undefined),
     },
     abortRegistry,
+    inFlightCancels: createInFlightCancels(),
     isRunQuarantined,
     approvalRegistry: makeApprovalRegistry(),
     postCancelNotice: vi.fn().mockResolvedValue(undefined),

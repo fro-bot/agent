@@ -96,12 +96,43 @@ export interface CancelRunParams {
   readonly logger: GatewayLogger
 }
 
+/**
+ * Per-run in-flight cancel operations. Closure-based; create ONE per process (`program.ts`) and share it between every
+ * transport, so a Discord and a web cancel of the same run collapse into a single operation.
+ */
+export interface InFlightCancels {
+  /**
+   * Run `operation` for `runId`, unless one is already in flight: then return that operation's promise instead. The
+   * slot is reserved synchronously (before `operation` is even called), and cleared when it settles, fulfilled or
+   * rejected. Callers that join an in-flight operation get its outcome (or its rejection).
+   */
+  readonly run: (runId: string, operation: () => Promise<CancelOutcome>) => Promise<CancelOutcome>
+}
+
+export function createInFlightCancels(): InFlightCancels {
+  const inFlight = new Map<string, Promise<CancelOutcome>>()
+  return {
+    run: async (runId, operation) => {
+      const existing = inFlight.get(runId)
+      if (existing !== undefined) return existing
+      // `.finally` runs after `operation` settles either way, so a throw cannot leave the slot occupied.
+      const reserved = operation().finally(() => {
+        inFlight.delete(runId)
+      })
+      inFlight.set(runId, reserved)
+      return reserved
+    },
+  }
+}
+
 export interface CancelRunDeps {
   readonly coordinationConfig: CoordinationConfig
   readonly identity: string
   readonly runIndex: Pick<RunIndex, 'lookup'>
   readonly queue: ChannelQueue<RunTask>
   readonly abortRegistry: Pick<AbortRegistry, 'has' | 'abort' | 'getMetadata'>
+  /** Collapses concurrent cancels of one run into a single operation (see `InFlightCancels`). */
+  readonly inFlightCancels: InFlightCancels
   /** Whether the run is in its quarantine hold in this process (see `live-run-registry.ts`). */
   readonly isRunQuarantined: (runId: string) => boolean
   readonly approvalRegistry: Pick<ApprovalRegistry, 'describePendingForScope' | 'handleDecision'>
@@ -196,7 +227,7 @@ function makeCancelledBy(actor: CancelActorContext, now?: () => number): Cancell
 }
 
 /** The approval gate's actor for a cancel: the same identity, in the gate's own shape. */
-function toApprovalActor(actor: CancelActorContext): ApprovalActor {
+function toApprovalActor(actor: CancelActorContext | CancelledByMetadata): ApprovalActor {
   if (actor.kind === 'discord-user') {
     return {kind: 'discord-user', userId: actor.discordUserId}
   }
@@ -344,7 +375,17 @@ async function attemptRendezvousCancel(
 // cancelRun
 // ---------------------------------------------------------------------------
 
+/**
+ * Cancel a run. Concurrent calls for the same run share one operation: the first caller's engine body runs once (one
+ * settlement, one abort, one notice, the first actor attributed) and later callers return its outcome. Not `async`
+ * on purpose: the slot must be reserved synchronously, before the body's first await, or two callers could both pass
+ * the "nobody has started" point.
+ */
 export async function cancelRun(params: CancelRunParams, deps: CancelRunDeps): Promise<CancelOutcome> {
+  return deps.inFlightCancels.run(params.runId, async () => cancelRunOnce(params, deps))
+}
+
+async function cancelRunOnce(params: CancelRunParams, deps: CancelRunDeps): Promise<CancelOutcome> {
   const {runId, actor, logger} = params
 
   const location = await deps.runIndex.lookup(runId)
@@ -409,10 +450,14 @@ export async function cancelRun(params: CancelRunParams, deps: CancelRunDeps): P
 
   // ── Executing path: abort-registry hit ───────────────────────────────────
   if (deps.abortRegistry.has(runId)) {
-    // Repeat cancel: someone already requested it and the run is settling. Same answer as the first call, with no
-    // second settlement, attribution or notice — the first actor stays on record.
-    if (deps.abortRegistry.getMetadata(runId) !== undefined) {
-      logger.info({repo, runId}, 'cancelRun: cancel already requested — not repeating')
+    // Repeat cancel: an earlier operation already requested it and the run is settling. Same answer as the first
+    // call, with no new attribution, abort or notice — the first actor stays on record. The one thing worth redoing
+    // is the approval rejection: a failed reply reopens the approval, and a repeat is the only retry it gets. It is
+    // idempotent (nothing open, nothing to do), and runs as the attributed actor so the record stays truthful.
+    const attributed = deps.abortRegistry.getMetadata(runId)
+    if (attributed !== undefined) {
+      logger.info({repo, runId}, 'cancelRun: cancel already requested — retrying approval settlement only')
+      await settlePendingApprovals(deps, initialRead.state, toApprovalActor(attributed), logger)
       return {outcome: 'cancelled', wasQueued: false}
     }
 
@@ -451,12 +496,7 @@ export async function cancelRun(params: CancelRunParams, deps: CancelRunDeps): P
     // eventual terminal state: that would couple this fire-and-forget orchestrator to
     // the async settlement and defeat the point of firing eagerly.
     //
-    // Concurrent cancels both pass the repeat check above (it precedes the awaited settlement). The registry keeps the
-    // first metadata, so only the call whose metadata is stored announces; the other reports the same outcome.
-    const attributed = deps.abortRegistry.getMetadata(runId)
-    if (attributed !== undefined && attributed !== cancelledBy) {
-      return {outcome: 'cancelled', wasQueued: false}
-    }
+    // Only one operation per run is ever in flight (`inFlightCancels`), so this is the single notice for the cancel.
     // eslint-disable-next-line no-void
     void deps.postCancelNotice(initialRead.state.thread_id, runId, actor).catch(() => {})
     return {outcome: 'cancelled', wasQueued: false}

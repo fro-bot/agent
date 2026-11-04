@@ -16,6 +16,7 @@
 import type {CoordinationConfig, ForceReleaseStaleLockResult} from '@fro-bot/runtime'
 import type {ChatInputCommandInteraction} from 'discord.js'
 import type {CancelRunDeps} from '../../execute/cancel.js'
+import type {LiveRun} from '../../execute/live-run-registry.js'
 import type {ChannelQueue} from '../../execute/queue.js'
 import type {RepoQuiescenceChecker} from '../../execute/repo-quiescence.js'
 import type {RunIndex} from '../../execute/run-index.js'
@@ -97,8 +98,10 @@ export interface FroBotDeps extends AddProjectDeps {
    * cancel route receives), so `/fro-bot cancel` works with the operator web endpoint disabled.
    */
   readonly cancelRunDeps: CancelRunDeps
-  /** Run scan used by `cancel` to resolve a run thread or channel to its run. */
-  readonly runIndex: Pick<RunIndex, 'listRunsForRepo'>
+  /** Run reads used by `cancel`: a live run's state, and the capped scan that only picks a refusal's copy. */
+  readonly runIndex: Pick<RunIndex, 'listRunsForRepo' | 'readRun'>
+  /** The runs this process still runs: the authority for what `cancel` may target. */
+  readonly listLiveRuns: () => readonly LiveRun[]
 }
 
 // ---------------------------------------------------------------------------

@@ -73,7 +73,8 @@ function makeMockDeps(): FroBotDeps {
     }),
     dispatchWorkflow: vi.fn<DispatchWorkflow>(),
     cancelRunDeps: {} as FroBotDeps['cancelRunDeps'],
-    runIndex: {listRunsForRepo: vi.fn().mockResolvedValue([])},
+    runIndex: {listRunsForRepo: vi.fn().mockResolvedValue([]), readRun: vi.fn().mockResolvedValue(undefined)},
+    listLiveRuns: vi.fn().mockReturnValue([]),
   }
 }
 

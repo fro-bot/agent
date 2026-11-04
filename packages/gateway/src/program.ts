@@ -50,9 +50,10 @@ import {handleQuestionInteraction} from './discord/question-interactions.js'
 import {parseQuestionCustomId} from './discord/questions.js'
 import {handleRecoverEntryButtonClick, parseRecoverEntryCustomId} from './discord/recover-checkout-button.js'
 import {abortRegistry} from './execute/abort-registry.js'
+import {createInFlightCancels} from './execute/cancel.js'
 import {totalRecoveryBudgetMs} from './execute/checkout-recovery.js'
 import {createConcurrencyRegistry} from './execute/concurrency.js'
-import {isRunQuarantined} from './execute/live-run-registry.js'
+import {isRunQuarantined, listLiveRuns} from './execute/live-run-registry.js'
 import {createGenerationAwareQuiescenceChecker} from './execute/opencode-generation.js'
 import {createChannelQueue, DEFAULT_MAX_QUEUE_DEPTH} from './execute/queue.js'
 import {recoverStaleRuns} from './execute/recovery.js'
@@ -578,6 +579,8 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       abortRegistry,
       isRunQuarantined,
       approvalRegistry,
+      // One in-flight map for the process, so a web and a Discord cancel of the same run share one operation.
+      inFlightCancels: createInFlightCancels(),
       postCancelNotice: createCancelNoticeDispatcher(client, logger),
       runObserver: runObservationManager,
     }
@@ -602,6 +605,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       dispatchWorkflow,
       cancelRunDeps,
       runIndex,
+      listLiveRuns,
     }
 
     if (config.binderAllowlist.size === 0) {

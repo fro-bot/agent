@@ -799,6 +799,8 @@ describe('makeGatewayProgram', () => {
     expect(commandDeps?.cancelRunDeps.abortRegistry.abort).toBeTypeOf('function')
     expect(commandDeps?.cancelRunDeps.queue).toBe(commandDeps?.queue)
     expect(commandDeps?.runIndex.listRunsForRepo).toBeTypeOf('function')
+    expect(commandDeps?.listLiveRuns).toBeTypeOf('function')
+    expect(commandDeps?.cancelRunDeps.inFlightCancels.run).toBeTypeOf('function')
   })
 
   it('shares one cancel deps object between /fro-bot cancel and the operator cancel route', async () => {

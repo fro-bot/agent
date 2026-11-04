@@ -87,7 +87,18 @@ function makeDeps(runs: readonly RunState[] = [makeRun()], overrides: Partial<Fr
     forceReleaseStaleLock: vi.fn(),
     dispatchWorkflow: vi.fn(),
     cancelRunDeps: {sentinel: 'cancel-run-deps'} as unknown as FroBotDeps['cancelRunDeps'],
-    runIndex: {listRunsForRepo: vi.fn().mockResolvedValue(runs)},
+    // The live set is what the process still runs (past the queue, not ended); the scan lists every record.
+    runIndex: {
+      listRunsForRepo: vi.fn().mockResolvedValue(runs),
+      readRun: vi.fn().mockImplementation(async (_repo: string, runId: string) => runs.find(r => r.run_id === runId)),
+    },
+    listLiveRuns: vi
+      .fn()
+      .mockReturnValue(
+        runs
+          .filter(run => run.phase === 'ACKNOWLEDGED' || run.phase === 'EXECUTING')
+          .map(run => ({runId: run.run_id, repo: 'acme/widget'})),
+      ),
     ...overrides,
   }
 }
@@ -190,7 +201,7 @@ describe('/fro-bot cancel — authorization', () => {
     // #then — refused before any lookup or cancel
     expect(replyText(editReply)).toBe('You do not have permission to cancel runs.')
     expect(cancelRunMock).not.toHaveBeenCalled()
-    expect(deps.runIndex.listRunsForRepo).not.toHaveBeenCalled()
+    expect(deps.listLiveRuns).not.toHaveBeenCalled()
   })
 
   it('denies when member resolution fails (fail closed)', async () => {
@@ -349,6 +360,34 @@ describe('/fro-bot cancel — targeting', () => {
       expect(cancelRunMock).not.toHaveBeenCalled()
     },
   )
+
+  it('targets the executing run even when the capped run scan cannot list it', async () => {
+    // #given — the repo has so many newer records that the newest-200 scan no longer includes the live run
+    cancelRunMock.mockResolvedValue({outcome: 'cancelled', wasQueued: false})
+    const deps = makeDeps([makeRun()])
+    vi.mocked(deps.runIndex.listRunsForRepo).mockResolvedValue([])
+    const {interaction} = makeInteraction({channelId: BOUND_CHANNEL, channel: PLAIN_CHANNEL})
+
+    // #when
+    await run(deps, interaction)
+
+    // #then
+    expect(cancelRunMock).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({runId: 'run-1'}), deps.cancelRunDeps)
+  })
+
+  it('reports a lookup failure, not "nothing is executing", when a live run cannot be read', async () => {
+    // #given
+    const deps = makeDeps([makeRun()])
+    vi.mocked(deps.runIndex.readRun).mockResolvedValue(undefined)
+    const {interaction, editReply} = makeInteraction({channelId: BOUND_CHANNEL, channel: PLAIN_CHANNEL})
+
+    // #when
+    await run(deps, interaction)
+
+    // #then
+    expect(replyText(editReply)).toContain('Something went wrong looking up the run')
+    expect(cancelRunMock).not.toHaveBeenCalled()
+  })
 
   it('cancelling the current run never touches queued work', async () => {
     // #given — an executing run plus two queued siblings in the channel

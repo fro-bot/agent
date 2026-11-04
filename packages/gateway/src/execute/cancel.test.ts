@@ -20,7 +20,7 @@ import {createQuestionCoordinator} from '../approvals/question-coordinator.js'
 import {createQuestionRegistry} from '../approvals/question-registry.js'
 import {createRequestGate} from '../approvals/request-gate.js'
 import {createAbortRegistry} from './abort-registry.js'
-import {cancelRun} from './cancel.js'
+import {cancelRun, createInFlightCancels} from './cancel.js'
 import {createChannelQueue} from './queue.js'
 
 // ---------------------------------------------------------------------------
@@ -126,6 +126,7 @@ function makeDeps(overrides: Partial<CancelRunDeps> & {readonly runState: RunSta
     abortRegistry: rest.abortRegistry ?? makeAbortRegistry(),
     isRunQuarantined: rest.isRunQuarantined ?? vi.fn().mockReturnValue(false),
     approvalRegistry: rest.approvalRegistry ?? makeApprovalRegistry(),
+    inFlightCancels: rest.inFlightCancels ?? createInFlightCancels(),
     postCancelNotice: rest.postCancelNotice ?? vi.fn().mockResolvedValue(undefined),
     runObserver: rest.runObserver,
     now: rest.now ?? (() => new Date('2026-07-03T12:00:00.000Z').getTime()),
@@ -750,8 +751,11 @@ describe('cancelRun — idempotent repeat cancel of an executing run', () => {
     abortRegistry.register('run-1')
     const handleDecision = vi.fn().mockResolvedValue('ok')
     const approvalRegistry = makeApprovalRegistry({
-      // Always reports a pending approval, so a second settlement attempt would be visible.
-      describePendingForScope: vi.fn().mockReturnValue([{requestID: 'req-1', permission: 'bash'}]),
+      // Open once; the first settlement settles it, so the repeat has nothing left to reject.
+      describePendingForScope: vi
+        .fn()
+        .mockReturnValueOnce([{requestID: 'req-1', permission: 'bash'}])
+        .mockReturnValue([]),
       handleDecision,
     })
     const postCancelNotice = vi.fn().mockResolvedValue(undefined)
@@ -769,35 +773,204 @@ describe('cancelRun — idempotent repeat cancel of an executing run', () => {
     expect(handleDecision).toHaveBeenCalledTimes(1)
   })
 
-  it('concurrent cancels from Discord and web attribute one actor and post one notice', async () => {
-    // #given — a slow approval settlement keeps both calls inside the pre-abort window
+  it('retries a failed approval rejection on a repeat cancel, with the attributed actor and no new attribution or notice', async () => {
+    // #given — the first cancel's rejection fails, which reopens the approval (the gate releases a failed claim)
     const runState = makeRunState({phase: 'EXECUTING'})
     const abortRegistry = createAbortRegistry()
     abortRegistry.register('run-1')
+    const handleDecision = vi.fn().mockResolvedValueOnce('reply-failed').mockResolvedValue('ok')
     const approvalRegistry = makeApprovalRegistry({
-      describePendingForScope: vi.fn().mockReturnValue([{requestID: 'req-1', permission: 'bash'}]),
-      handleDecision: vi.fn().mockImplementation(async () => {
-        await Promise.resolve()
-        return 'ok'
-      }),
+      describePendingForScope: vi
+        .fn()
+        .mockReturnValueOnce([{requestID: 'req-1', permission: 'bash'}])
+        .mockReturnValueOnce([{requestID: 'req-1', permission: 'bash'}])
+        .mockReturnValue([]),
+      handleDecision,
     })
+    const postCancelNotice = vi.fn().mockResolvedValue(undefined)
+    const abort = vi.spyOn(abortRegistry, 'abort')
+    const deps = makeDeps({runState, abortRegistry, approvalRegistry, postCancelNotice})
+    await cancelRun({runId: 'run-1', actor: makeDiscordActor(), logger: makeLogger()}, deps)
+
+    // #when — another user cancels the same, still-registered run
+    const repeat = await cancelRun({runId: 'run-1', actor: makeActor(), logger: makeLogger()}, deps)
+
+    // #then — the settle ran again, as the FIRST actor (Discord), and nothing else changed
+    expect(repeat).toEqual({outcome: 'cancelled', wasQueued: false})
+    expect(handleDecision).toHaveBeenCalledTimes(2)
+    expect(handleDecision).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({requestID: 'req-1', actor: {kind: 'discord-user', userId: '111222333444555666'}}),
+    )
+    expect(abort).toHaveBeenCalledTimes(1)
+    expect(abortRegistry.getMetadata('run-1')).toMatchObject({kind: 'discord-user'})
+    expect(postCancelNotice).toHaveBeenCalledTimes(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Concurrent cancels share one operation
+// ---------------------------------------------------------------------------
+
+/** An approval registry whose single request is claimed by the first settlement, and settles only when released. */
+function makeClaimingApprovals() {
+  let release: () => void = () => {}
+  const released = new Promise<void>(resolve => {
+    release = resolve
+  })
+  let claimed = false
+  const events: string[] = []
+  const approvalRegistry = makeApprovalRegistry({
+    // Mirrors the gate: a claimed request is no longer 'open', so a second caller sees nothing to reject.
+    describePendingForScope: vi
+      .fn()
+      .mockImplementation(() => (claimed ? [] : [{requestID: 'req-1', permission: 'bash'}])),
+    handleDecision: vi.fn().mockImplementation(async () => {
+      claimed = true
+      events.push('settle:start')
+      await released
+      events.push('settle:end')
+      return 'ok'
+    }),
+  })
+  return {approvalRegistry, release, events}
+}
+
+describe('cancelRun — concurrent cancels', () => {
+  it('one settlement, one abort after it, one notice, and the first actor attributed (Discord first)', async () => {
+    // #given — a claimed approval whose rejection is still in flight when the second cancel arrives
+    const runState = makeRunState({phase: 'EXECUTING'})
+    const realRegistry = createAbortRegistry()
+    realRegistry.register('run-1')
+    const {approvalRegistry, release, events} = makeClaimingApprovals()
+    const abortRegistry = {
+      ...realRegistry,
+      abort: vi.fn((runId: string, reason?: unknown, metadata?: Parameters<typeof realRegistry.abort>[2]) => {
+        events.push('abort')
+        return realRegistry.abort(runId, reason, metadata)
+      }),
+    }
     const postCancelNotice = vi.fn().mockResolvedValue(undefined)
     const deps = makeDeps({runState, abortRegistry, approvalRegistry, postCancelNotice})
 
-    // #when
-    const results = await Promise.all([
-      cancelRun({runId: 'run-1', actor: makeDiscordActor(), logger: makeLogger()}, deps),
-      cancelRun({runId: 'run-1', actor: makeActor(), logger: makeLogger()}, deps),
-    ])
+    // #when — Discord starts, web arrives while the rejection is outstanding, then the rejection lands
+    const discord = cancelRun({runId: 'run-1', actor: makeDiscordActor(), logger: makeLogger()}, deps)
+    const web = cancelRun({runId: 'run-1', actor: makeActor(), logger: makeLogger()}, deps)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(events).not.toContain('abort')
+    release()
+    const results = await Promise.all([discord, web])
 
-    // #then — both report requested; the stored attribution and the one notice name the same actor
+    // #then — abort only after the rejection finished, exactly once, attributed to the first caller
     expect(results).toEqual([
       {outcome: 'cancelled', wasQueued: false},
       {outcome: 'cancelled', wasQueued: false},
     ])
+    expect(events).toEqual(['settle:start', 'settle:end', 'abort'])
+    expect(approvalRegistry.handleDecision).toHaveBeenCalledTimes(1)
+    expect(abortRegistry.abort).toHaveBeenCalledTimes(1)
+    expect(realRegistry.getMetadata('run-1')).toMatchObject({kind: 'discord-user'})
+    expect(postCancelNotice).toHaveBeenCalledExactlyOnceWith('thread-1', 'run-1', makeDiscordActor())
+  })
+
+  it('attributes the first caller when it is the web operator', async () => {
+    // #given
+    const runState = makeRunState({phase: 'EXECUTING'})
+    const abortRegistry = createAbortRegistry()
+    abortRegistry.register('run-1')
+    const {approvalRegistry, release} = makeClaimingApprovals()
+    const postCancelNotice = vi.fn().mockResolvedValue(undefined)
+    const deps = makeDeps({runState, abortRegistry, approvalRegistry, postCancelNotice})
+
+    // #when
+    const web = cancelRun({runId: 'run-1', actor: makeActor(), logger: makeLogger()}, deps)
+    const discord = cancelRun({runId: 'run-1', actor: makeDiscordActor(), logger: makeLogger()}, deps)
+    release()
+    await Promise.all([web, discord])
+
+    // #then
+    expect(abortRegistry.getMetadata('run-1')).toMatchObject({kind: 'web-operator', login: 'octocat'})
+    expect(postCancelNotice).toHaveBeenCalledExactlyOnceWith('thread-1', 'run-1', makeActor())
+  })
+
+  it('shares the first operation across all paths: the second caller does not even look the run up', async () => {
+    // #given — a queued run, so the queued path (not the executing path) is what runs
+    const runState = makeRunState({phase: 'PENDING'})
+    const task = {runId: 'run-1'} as unknown as RunTask
+    const queue = makeQueue({removeBy: vi.fn().mockReturnValueOnce(task).mockReturnValue(undefined)})
+    const runIndex = makeRunIndex()
+    const postCancelNotice = vi.fn().mockResolvedValue(undefined)
+    const deps = makeDeps({runState, queue, runIndex, postCancelNotice})
+
+    // #when
+    const first = cancelRun({runId: 'run-1', actor: makeDiscordActor(), logger: makeLogger()}, deps)
+    const second = cancelRun({runId: 'run-1', actor: makeActor(), logger: makeLogger()}, deps)
+    const results = await Promise.all([first, second])
+
+    // #then
+    expect(results).toEqual([
+      {outcome: 'cancelled', wasQueued: true},
+      {outcome: 'cancelled', wasQueued: true},
+    ])
+    expect(runIndex.lookup).toHaveBeenCalledTimes(1)
     expect(postCancelNotice).toHaveBeenCalledTimes(1)
-    const announced = postCancelNotice.mock.calls[0]?.[2] as CancelActorContext
-    expect(abortRegistry.getMetadata('run-1')).toMatchObject({kind: announced.kind})
+  })
+
+  it('does not share across different runs', async () => {
+    // #given
+    const runState = makeRunState({phase: 'EXECUTING'})
+    const abortRegistry = createAbortRegistry()
+    abortRegistry.register('run-1')
+    abortRegistry.register('run-2')
+    const runIndex = makeRunIndex()
+    const deps = makeDeps({runState, abortRegistry, runIndex})
+
+    // #when
+    await Promise.all([
+      cancelRun({runId: 'run-1', actor: makeDiscordActor(), logger: makeLogger()}, deps),
+      cancelRun({runId: 'run-2', actor: makeDiscordActor(), logger: makeLogger()}, deps),
+    ])
+
+    // #then
+    expect(runIndex.lookup).toHaveBeenCalledTimes(2)
+  })
+
+  it('clears the reservation when the operation throws, so a later cancel runs normally', async () => {
+    // #given — the first cancel's run lookup throws
+    const runState = makeRunState({phase: 'EXECUTING'})
+    const abortRegistry = createAbortRegistry()
+    abortRegistry.register('run-1')
+    const lookup = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('index blew up'))
+      .mockResolvedValue({repo: 'acme/widget', surface: 'discord' as const})
+    const deps = makeDeps({runState, abortRegistry, runIndex: {lookup}})
+
+    // #when
+    await expect(cancelRun({runId: 'run-1', actor: makeDiscordActor(), logger: makeLogger()}, deps)).rejects.toThrow(
+      'index blew up',
+    )
+    const retry = await cancelRun({runId: 'run-1', actor: makeDiscordActor(), logger: makeLogger()}, deps)
+
+    // #then — not stuck behind a dead promise
+    expect(retry).toEqual({outcome: 'cancelled', wasQueued: false})
+  })
+
+  it('clears the reservation once the operation settles, so a repeat is evaluated afresh', async () => {
+    // #given
+    const runState = makeRunState({phase: 'EXECUTING'})
+    const abortRegistry = createAbortRegistry()
+    abortRegistry.register('run-1')
+    const runIndex = makeRunIndex()
+    const deps = makeDeps({runState, abortRegistry, runIndex})
+
+    // #when — sequential, not concurrent
+    await cancelRun({runId: 'run-1', actor: makeDiscordActor(), logger: makeLogger()}, deps)
+    await cancelRun({runId: 'run-1', actor: makeActor(), logger: makeLogger()}, deps)
+
+    // #then — the second call ran its own lookup
+    expect(runIndex.lookup).toHaveBeenCalledTimes(2)
   })
 })
 
