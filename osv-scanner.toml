@@ -1,0 +1,15 @@
+# OSV-Scanner exceptions. The scanner loads this file automatically for the lockfiles in this directory
+# (bun.lock); the OSV-Scanner workflow passes no --config.
+
+# GHSA-g3hv-75wg-m249 (CVE-2026-118764): minimatch globparts amplification DoS, fixed only in 11.0.1.
+# PackageOverrides cannot be scoped to one advisory, so this mutes every advisory for minimatch 10.2.6
+# until effectiveUntil. The other minimatch copies stay visible to the scanner.
+[[PackageOverrides]]
+name = "minimatch"
+version = "10.2.6"
+ecosystem = "npm"
+
+vulnerability.ignore = true
+
+effectiveUntil = 2027-02-01
+reason = "GHSA-g3hv-75wg-m249: not reachable with untrusted input (lint-time globs from repo config); no 10.x fix; 11.x breaks @actions/glob."
