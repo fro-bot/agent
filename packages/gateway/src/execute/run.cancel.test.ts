@@ -72,6 +72,7 @@ describe('operator cancel — abort-registry integration', () => {
     vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
 
     const cancelledByMetadata = {
+      kind: 'web-operator' as const,
       githubUserId: 42,
       login: 'octocat',
       sessionCorrelationId: 'sess-1',
@@ -1215,9 +1216,8 @@ describe('failureKind persistence on FAILED transitions', () => {
       .mockResolvedValueOnce({success: true as const, data: {etag: 'cancelled-etag', state: cancelledState}})
 
     const cancelledByMetadata = {
-      githubUserId: 1,
-      login: 'someone',
-      sessionCorrelationId: 'sess-x',
+      kind: 'discord-user' as const,
+      discordUserId: '111222333444555666',
       cancelledAt: '2026-07-04T00:00:00.000Z',
     }
     mockRunOpenCodeCoreAbortedBy(() => {

@@ -18,7 +18,7 @@ import {
 } from './test-helpers.js'
 import * as runCoreModule from './run-core.js'
 import {abortRegistry} from './abort-registry.js'
-import {cancelRun} from './cancel.js'
+import {cancelRun, createInFlightCancels} from './cancel.js'
 import {isRunLive, isRunQuarantined} from './live-run-registry.js'
 /* eslint-enable perfectionist/sort-imports */
 
@@ -86,13 +86,14 @@ function makeCancelDeps(coordinationConfig: CoordinationConfig): CancelRunDeps &
       removeBy: vi.fn().mockReturnValue(undefined),
     },
     abortRegistry,
+    inFlightCancels: createInFlightCancels(),
     isRunQuarantined,
     approvalRegistry: makeApprovalRegistry(),
     postCancelNotice: vi.fn().mockResolvedValue(undefined),
   }
 }
 
-const ACTOR = {githubUserId: 42, login: 'octocat', sessionCorrelationId: 'sess-1'}
+const ACTOR = {kind: 'web-operator' as const, githubUserId: 42, login: 'octocat', sessionCorrelationId: 'sess-1'}
 
 /** Run a task that quarantines (unconfirmed stop), stopping inside its hold window. */
 async function quarantineARun(failPhases: readonly string[]) {

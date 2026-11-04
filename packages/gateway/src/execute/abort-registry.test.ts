@@ -64,6 +64,7 @@ describe('abort-registry', () => {
     const runId = 'run-4'
     registry.register(runId)
     const metadata = {
+      kind: 'web-operator' as const,
       githubUserId: 42,
       login: 'octocat',
       sessionCorrelationId: 'sess-1',
@@ -85,6 +86,29 @@ describe('abort-registry', () => {
 
     // #then metadata is cleared
     expect(registry.getMetadata(runId)).toBeUndefined()
+  })
+
+  it('keeps the first attribution when a later abort carries different metadata', () => {
+    // #given a run already aborted with a Discord attribution
+    const registry = createAbortRegistry()
+    const runId = 'run-5'
+    registry.register(runId)
+    const first = {kind: 'discord-user' as const, discordUserId: '1', cancelledAt: '2026-07-03T00:00:00.000Z'}
+    const second = {
+      kind: 'web-operator' as const,
+      githubUserId: 42,
+      login: 'octocat',
+      sessionCorrelationId: 'sess-1',
+      cancelledAt: '2026-07-03T00:00:05.000Z',
+    }
+    registry.abort(runId, 'operator cancel', first)
+
+    // #when a second actor aborts
+    const delivered = registry.abort(runId, 'operator cancel', second)
+
+    // #then the abort still reports delivered, but attribution is not overwritten
+    expect(delivered).toBe(true)
+    expect(registry.getMetadata(runId)).toBe(first)
   })
 
   it('delete on an unknown runId is a no-op', () => {

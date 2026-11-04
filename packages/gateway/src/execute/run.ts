@@ -983,7 +983,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     // ACK can be visible in the store while its response is still pending. From here to the true end of the run (the
     // outer finally, which every exit below reaches, or the quarantine hold's deferred stop) the stranded-run sweep
     // must treat the record as owned.
-    markRunLive(runId)
+    markRunLive(runId, repo)
     const ackResult = await transitionRun(
       coordinationConfig,
       identity,
