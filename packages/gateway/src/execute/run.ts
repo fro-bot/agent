@@ -65,7 +65,7 @@ import {toOperatorFailureKind} from '../operator-contract/run-status.js'
 import {canonicalWorkspaceTarget} from '../workspace-api/client.js'
 import {abortRegistry} from './abort-registry.js'
 import {settleAmbiguousRecovery, tryAutoRecoverDirtyCheckout} from './checkout-recovery.js'
-import {markRunEnded, markRunLive} from './live-run-registry.js'
+import {markRunEnded, markRunLive, markRunQuarantined} from './live-run-registry.js'
 import {releaseLockOrByOwnership} from './lock-release.js'
 import {attachOpencodeV2} from './opencode-attach-v2.js'
 import {attachOpencode} from './opencode-attach.js'
@@ -1895,6 +1895,9 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         // so this reservation cannot silently lapse via TTL expiry. This is a failed run
         // with an additional unresolved condition, never a success.
         quarantined = true
+        // Visible to `cancelRun` from here: the abort-registry entry goes in the `finally` below, and the FAILED write
+        // that follows can fail, so neither the entry nor the record can tell a cancel this run is held.
+        markRunQuarantined(runId)
 
         statusSink.setReaction('failed')
 

@@ -347,6 +347,24 @@ describe('POST cancel — CancelOutcome mapping', () => {
     expect(body).toEqual({ok: true, runId: 'run-abc', phase: 'COMPLETED'})
   })
 
+  it('quarantined → 200 reporting the run as FAILED (closed contract, nothing cancelled), audited as FAILED', async () => {
+    const outcome: CancelOutcome = {outcome: 'quarantined'}
+    cancelRunMock.mockReset().mockResolvedValue(outcome)
+    const auditLogger = makeAuditLogger()
+    const deps = makeDeps({auditLogger})
+    const app = buildApp(deps)
+
+    const response = await postCancel(app, 'run-abc')
+
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as {ok: boolean; runId: string; phase: string}
+    expect(body).toEqual({ok: true, runId: 'run-abc', phase: 'FAILED'})
+    expect(vi.mocked(auditLogger.info)).toHaveBeenCalledWith(
+      expect.objectContaining({runId: 'run-abc', phase: 'FAILED'}),
+      'audit: run.cancel.requested',
+    )
+  })
+
   it('not-found (from cancelRun itself) → notFoundResponse', async () => {
     const outcome: CancelOutcome = {outcome: 'not-found'}
     cancelRunMock.mockReset().mockResolvedValue(outcome)

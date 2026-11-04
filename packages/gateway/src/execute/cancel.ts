@@ -19,6 +19,10 @@
  *    re-reads, and resolves via a single bounded retry — see
  *    `attemptRendezvousCancel` below).
  *
+ * A **quarantined** run (its owned sessions were not confirmed stopped; lock and slot are held for the hold window)
+ * is refused before any path runs: it has no abort-registry entry and its record may still read EXECUTING, so the
+ * rendezvous would otherwise write CANCELLED over work that is not confirmed stopped.
+ *
  * Already-terminal runs are idempotent no-ops (read-then-short-circuit —
  * `transitionRun` rejects terminal transitions by design, so the orchestrator
  * never attempts one). Unknown runIds resolve to `not-found`.
@@ -67,6 +71,12 @@ export type CancelOutcome =
    * "cancel not yet applied, safe to retry" rather than a failure.
    */
   | {readonly outcome: 'retry'}
+  /**
+   * The run is in its quarantine hold: it already failed, and its owned sessions are not confirmed stopped. Nothing
+   * was written, released, aborted or announced. Not an error and not retryable — the hold ends on its own. Callers
+   * report it as the failed run it is.
+   */
+  | {readonly outcome: 'quarantined'}
 
 export interface CancelRunParams {
   readonly runId: string
@@ -80,6 +90,8 @@ export interface CancelRunDeps {
   readonly runIndex: Pick<RunIndex, 'lookup'>
   readonly queue: ChannelQueue<RunTask>
   readonly abortRegistry: Pick<AbortRegistry, 'has' | 'abort'>
+  /** Whether the run is in its quarantine hold in this process (see `live-run-registry.ts`). */
+  readonly isRunQuarantined: (runId: string) => boolean
   readonly approvalRegistry: Pick<ApprovalRegistry, 'describePendingForScope' | 'handleDecision'>
   /**
    * Post the cancellation notice for a run to its origin surface. Transport-specific
@@ -260,6 +272,13 @@ async function attemptRendezvousCancel(
       return {outcome: 'already-terminal', phase: read.state.phase}
     }
 
+    // Checked right before every write: the run may have started its quarantine during any await on the way here
+    // (approval settlement, a failed queued write, an abort that delivered to nothing, or the read above).
+    if (deps.isRunQuarantined(runId)) {
+      logger.info({repo, runId}, 'cancelRun: run is in its quarantine hold — cancel not applied')
+      return {outcome: 'quarantined'}
+    }
+
     const cancelledBy = makeCancelledBy(actor, deps.now)
 
     const result = await transitionRun(coordinationConfig, identity, repo, runId, 'CANCELLED', read.etag, coordLogger, {
@@ -312,6 +331,14 @@ export async function cancelRun(params: CancelRunParams, deps: CancelRunDeps): P
   // terminal transition (transitionRun rejects it by design anyway). ──────
   if (isTerminalPhase(initialRead.state.phase)) {
     return {outcome: 'already-terminal', phase: initialRead.state.phase}
+  }
+
+  // ── Quarantined: the cancel must not touch a run whose owned work is unconfirmed. Checked here before every path and
+  // again at the top of `attemptRendezvousCancel`, because quarantine can start during any await below (the abort
+  // entry is then gone and the record may still read EXECUTING); a delivered abort ahead of it is the best-effort case. ──
+  if (deps.isRunQuarantined(runId)) {
+    logger.info({repo, runId}, 'cancelRun: run is in its quarantine hold — cancel not applied')
+    return {outcome: 'quarantined'}
   }
 
   // ── Queued path: PENDING/ACKNOWLEDGED with a matching queue entry ───────

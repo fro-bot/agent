@@ -51,6 +51,7 @@ import {handleRecoverEntryButtonClick, parseRecoverEntryCustomId} from './discor
 import {abortRegistry} from './execute/abort-registry.js'
 import {totalRecoveryBudgetMs} from './execute/checkout-recovery.js'
 import {createConcurrencyRegistry} from './execute/concurrency.js'
+import {isRunQuarantined} from './execute/live-run-registry.js'
 import {createGenerationAwareQuiescenceChecker} from './execute/opencode-generation.js'
 import {createChannelQueue, DEFAULT_MAX_QUEUE_DEPTH} from './execute/queue.js'
 import {recoverStaleRuns} from './execute/recovery.js'
@@ -1134,6 +1135,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           runIndex,
           queue: channelQueue,
           abortRegistry,
+          isRunQuarantined,
           approvalRegistry,
           postCancelNotice: createCancelNoticeDispatcher(client, logger),
           runObserver: runObservationManager,
