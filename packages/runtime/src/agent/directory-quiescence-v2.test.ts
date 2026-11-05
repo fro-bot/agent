@@ -499,11 +499,9 @@ describe('createDirectoryStabilityGate', () => {
     expect(busy).toMatchObject({passed: false, streak: 0})
     expect(after.streak).toBe(1)
     // and the full window is needed again
-    let state = after
     for (let i = 0; i < 9; i++) {
       t.advance(500)
-      state = await t.gate.step(signal)
-      expect(state.passed).toBe(false)
+      expect((await t.gate.step(signal)).passed).toBe(false)
     }
     t.advance(500)
     expect((await t.gate.step(signal)).passed).toBe(true)
