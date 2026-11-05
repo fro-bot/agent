@@ -237,6 +237,17 @@ GitHub Actions cache is the default backend when S3 is disabled. Set `s3-backup:
     AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 ```
 
+With `s3-backup` enabled, the Action coordinates writers through a lease on the session store, and a run that finds the lease held is declined (`agent: blocked`). If your workflow runs for several issues or pull requests at once, add a job-level `concurrency` block so those runs queue (FIFO, up to 100 pending) instead of being skipped. `cancel-in-progress` must stay `false` or unset when using `queue: max`.
+
+```yaml
+jobs:
+  fro-bot:
+    concurrency:
+      group: fro-bot-action-session-store
+      cancel-in-progress: false
+      queue: max
+```
+
 For Cloudflare R2, Backblaze B2, or MinIO, set `s3-endpoint` and `s3-sse-encryption: AES256` (see the S3 inputs above and [`action.yaml`](action.yaml)). Credentials must come from env vars or IAM roles, never action inputs; the principal needs `s3:GetObject`, `s3:PutObject`, and `s3:DeleteObject` on the scoped object-key prefix, plus `s3:ListBucket` on the bucket constrained to that prefix. The [Setup and Configuration](docs/wiki/Setup%20and%20Configuration.md) deep dive covers the cache and storage strategy in full.
 
 ## Moving to OpenCode V2
