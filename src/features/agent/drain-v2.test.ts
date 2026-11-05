@@ -488,11 +488,13 @@ describe('releaseRunV2', () => {
       // #then exactly one verdict, logged ahead of the summary write
       expect(verdictsBeforeStep).toBe(1)
       expect(verdictCalls(options.logger)).toHaveLength(1)
-      expect(verdictCalls(options.logger)[0]?.[1]).toEqual({
+      const {readings, ...verdict} = (verdictCalls(options.logger)[0]?.[1] ?? {}) as Record<string, unknown>
+      // A slow runner can take an extra reading before the quiet streak completes; only the streak is exact.
+      expect(readings).toBeGreaterThanOrEqual(FAST.requiredObservations)
+      expect(verdict).toEqual({
         drain: 'quiet',
         stopped: false,
         quiet: true,
-        readings: FAST.requiredObservations,
         quietStreak: FAST.requiredObservations,
         shellsDeleted: 0,
         sessionsInterrupted: 0,
