@@ -6,7 +6,7 @@ import type {BootstrapPhaseResult} from './bootstrap.js'
 import * as path from 'node:path'
 import process from 'node:process'
 import * as core from '@actions/core'
-import {DB_V2_MAIN_BASENAME} from '@fro-bot/runtime'
+import {DB_V2_MAIN_BASENAME, resolveResponseDelivery} from '@fro-bot/runtime'
 import {bootstrapOpenCodeServer} from '../../features/agent/index.js'
 import {resolveSessionGeneration} from '../../services/cache/cache-key.js'
 import {
@@ -213,6 +213,9 @@ async function startV2Server(
     dbPath: path.join(path.dirname(storagePath), DB_V2_MAIN_BASENAME),
     authPath: getOpenCodeAuthPath(),
     env: process.env,
+    // Same classification `runBootstrap` resolved from `github.context.eventName` (the same variable). It decides which
+    // caller MCP servers the config keeps: a withheld run is driven by untrusted text.
+    credential: resolveResponseDelivery(process.env.GITHUB_EVENT_NAME ?? '', inputs.responseMode).credential,
     runId: getGitHubRunId(),
     runAttempt: getGitHubRunAttempt(),
     logger: serverLogger,

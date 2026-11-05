@@ -250,6 +250,31 @@ jobs:
 
 For Cloudflare R2, Backblaze B2, or MinIO, set `s3-endpoint` and `s3-sse-encryption: AES256` (see the S3 inputs above and [`action.yaml`](action.yaml)). Credentials must come from env vars or IAM roles, never action inputs; the principal needs `s3:GetObject`, `s3:PutObject`, and `s3:DeleteObject` on the scoped object-key prefix, plus `s3:ListBucket` on the bucket constrained to that prefix. The [Setup and Configuration](docs/wiki/Setup%20and%20Configuration.md) deep dive covers the cache and storage strategy in full.
 
+### MCP servers
+
+On OpenCode V2 you can give the agent [MCP](https://modelcontextprotocol.io/) servers through `opencode-config`. Both spellings OpenCode V2 reads work: `mcp.<name>` and `mcp.servers.<name>`. A local server starts a command on the runner (`command` array, optional `cwd` and `environment`); a remote server is a URL (`url`, optional `headers`).
+
+```yaml
+- uses: fro-bot/agent@v0
+  with:
+    github-token: ${{ secrets.GITHUB_TOKEN }}
+    auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
+    opencode-config: |
+      {
+        "mcp": {
+          "docs": {"type": "local", "command": ["npx", "-y", "my-docs-mcp"]},
+          "wiki": {"type": "remote", "url": "https://mcp.example.com/mcp"}
+        }
+      }
+```
+
+- **MCP is off on `pull_request`, `issue_comment` and `issues`.** Untrusted text drives the agent on those triggers, so the Action removes the whole `mcp` block from the config and logs one warning (the server names and a fixed reason, never a value). Individual servers are not screened: OpenCode resolves `{file:...}` and `{env:...}` references in the config text before it reads it, so a header, a URL or a server definition can resolve to something the Action never saw. On `workflow_dispatch`, `schedule` and the other triggers, `mcp` is used as written.
+- **`{env:...}` references are not allowed in `opencode-config` on those triggers.** Setup fails if the text contains `{env:` anywhere (a key, a value or a nested string). OpenCode splices the environment value into the config text before it parses it, so a value an attacker influences, such as a branch name, could add structure to the config. `{file:...}` references are still allowed, and `{env:...}` is unchanged on the other triggers.
+- **A bad shape fails setup** on those other triggers. A server needs `type`, plus a non-empty `command` array (local) or an `http(s)` `url` (remote). `environment` and `headers` must be string maps, `enabled` and `codemode` booleans, `timeout` a positive integer, and `mcp.timeout` a positive integer or an object of positive integers. Two names that become the same tool prefix are rejected. Fields only the native `mcp.servers` spelling has are passed through for OpenCode to check.
+- **The Action adds no permission rule for a server.** The default agent already allows MCP tools; the read-only subagents (`explore`, `title`, `summary`) do not get them. `permission` in `opencode-config` is still stripped. Only add servers you trust with the run.
+- **The model reaches the tools through Code Mode** (`tools.<server>.<tool>(...)` inside OpenCode's `execute` tool) unless you set `"codemode": false` on the server. Servers connect in the background after startup, so a slow-starting server may not be usable on the first turn.
+- **V2 only.** The V2 config is passed to the server at start and is not written to disk. The V1 path (a pinned V1 `opencode-version`) writes `opencode.json`, where the agent can read it, so it keeps passing `mcp` through unchanged: no validation and no trigger rule, so MCP is not turned off on the withheld triggers there.
+
 ## Moving to OpenCode V2
 
 The Action now runs stock [OpenCode V2](https://opencode.ai/) by default instead of the patched harness build. This is a breaking change for workflows that leave `opencode-version` unset.
