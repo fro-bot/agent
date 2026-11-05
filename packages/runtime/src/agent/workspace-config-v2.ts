@@ -6,6 +6,9 @@ import {err, ok} from '@bfra.me/es/result'
 
 import {buildConfigContentV2, buildPermissionRulesV2, FORBIDDEN_TOOL_ACTIONS_V2} from './permission-rules-v2.js'
 
+/** The workspace server's per-location memory is released after 10 minutes idle (upstream default is 60). */
+export const WORKSPACE_LOCATION_IDLE_TIMEOUT_V2 = '10 minutes'
+
 export interface WorkspaceConfigV2Inputs {
   /** Plugin specs from the workspace installers. */
   readonly plugins: readonly string[]
@@ -45,8 +48,16 @@ export function buildWorkspaceConfigV2(inputs: WorkspaceConfigV2Inputs, logger: 
     bundledSkillsDirectoryCount: bundledSkillsDirectories.length,
   })
 
+  const base = buildConfigContentV2({plugins: inputs.plugins, rules: rules.data})
+
   return ok({
-    content: buildConfigContentV2({plugins: inputs.plugins, rules: rules.data}),
+    content: {
+      ...base,
+      experimental: {
+        ...(base.experimental as Record<string, unknown>),
+        location_idle_timeout: WORKSPACE_LOCATION_IDLE_TIMEOUT_V2,
+      },
+    },
     expectations: {
       outsidePolicy: 'ask-or-deny',
       allowedDirectories: [...allowedExternalDirectories, ...bundledSkillsDirectories],
