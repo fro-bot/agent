@@ -60,7 +60,7 @@ export const DEFAULT_MODEL = {
 // build is no longer the default; a consumer can still select it by pinning `opencode-version` to the harness
 // build.
 export const DEFAULT_OPENCODE_VERSION: string = v2PinFile.version
-export const DEFAULT_SYSTEMATIC_VERSION = '3.30.1'
+export const DEFAULT_SYSTEMATIC_VERSION = '3.31.0'
 
 // Systematic for OpenCode V2. 3.27.x loads on both V1 and V2, so the V2 path installs DEFAULT_SYSTEMATIC_VERSION too
 // and there is no separate V2 pin. The plugin id is the `id` of the object the package's default export carries
