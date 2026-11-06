@@ -594,7 +594,7 @@ export async function startOpenCodeV2Server(
     onTimeout: (lastNote: string) => OpenCodeV2StartError,
   ): Promise<{readonly ok: true; readonly value: T} | {readonly ok: false; readonly error: OpenCodeV2StartError}> => {
     const deadline = Date.now() + timeoutMs
-    let lastNote = 'no response'
+    let lastNote: string
     for (;;) {
       if (signal?.aborted === true) return {ok: false, error: aborted()}
       if (state.exit !== null) {

@@ -29,7 +29,7 @@ describe('buildWorkspaceConfigV2', () => {
     expect(content.plugins).toEqual(['file:///usr/local/lib/fro-bot/plugins/a.mjs', '@fro.bot/systematic@9.9.9'])
     expect(content.update).toBe('disable')
     expect(content.default_agent).toBe('build')
-    expect(content.experimental).toEqual({subagent_depth: 1})
+    expect(content.experimental).toEqual({subagent_depth: 1, location_idle_timeout: '10 minutes'})
   })
 
   it('de-duplicates plugins', () => {

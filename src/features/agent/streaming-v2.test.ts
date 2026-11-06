@@ -526,34 +526,43 @@ describe('processEventStreamV2', () => {
       await open.settled
       open.controller.abort()
       await open.result
-      const infoMessages = vi.mocked(logger.info).mock.calls.map(([message]) => message)
-      return {ledger, logger, infoMessages}
+      const debugMessages = vi.mocked(logger.debug).mock.calls.map(([message]) => message)
+      return {ledger, logger, debugMessages}
     }
+
+    it('logs shell adoption at debug, never at info, so the agent transcript is not interleaved with JSON', async () => {
+      // #given a shell that started and whose call completed
+      const {logger, debugMessages} = await run([toolStarted, SHELL_CREATED_FRAME, toolSucceeded('completed')])
+
+      // #then the adoption is a debug line and no ownership line reaches info
+      expect(debugMessages).toContain('Shell adopted into ownership ledger')
+      expect(logger.info).not.toHaveBeenCalledWith(expect.stringContaining('ownership ledger'), expect.anything())
+    })
 
     it('logs a background shell as adopted, then once more as kept, with the ids and no command', async () => {
       // #given a shell that started and whose call returned still running
-      const {ledger, logger, infoMessages} = await run([toolStarted, SHELL_CREATED_FRAME, toolSucceeded('running')])
+      const {ledger, logger, debugMessages} = await run([toolStarted, SHELL_CREATED_FRAME, toolSucceeded('running')])
 
       // #then adoption is labelled neutrally and the background verdict is logged exactly once
-      expect(infoMessages.filter(message => message === 'Shell adopted into ownership ledger')).toHaveLength(1)
-      expect(infoMessages.filter(message => message === 'Background shell kept in ownership ledger')).toHaveLength(1)
-      expect(logger.info).toHaveBeenCalledWith('Background shell kept in ownership ledger', {
+      expect(debugMessages.filter(message => message === 'Shell adopted into ownership ledger')).toHaveLength(1)
+      expect(debugMessages.filter(message => message === 'Background shell kept in ownership ledger')).toHaveLength(1)
+      expect(logger.debug).toHaveBeenCalledWith('Background shell kept in ownership ledger', {
         sessionId: SHELL_SESSION_ID,
         shellId: SHELL_ID,
       })
       expect(ledger.isTracked(shellLedgerKey(SHELL_ID))).toBe(true)
       // the model-controlled command text appears in no log line
-      expect(JSON.stringify(vi.mocked(logger.info).mock.calls)).not.toContain(SHELL_COMMAND)
+      expect(JSON.stringify(vi.mocked(logger.debug).mock.calls)).not.toContain(SHELL_COMMAND)
     })
 
-    it('does not call a foreground shell a background shell, and releases it without an info line', async () => {
+    it('does not call a foreground shell a background shell, and releases it without a keep line', async () => {
       // #given a shell that started and whose call completed in the foreground
-      const {ledger, logger, infoMessages} = await run([toolStarted, SHELL_CREATED_FRAME, toolSucceeded('completed')])
+      const {ledger, logger, debugMessages} = await run([toolStarted, SHELL_CREATED_FRAME, toolSucceeded('completed')])
 
       // #then it was adopted at start, never called background, and released at the call's end
-      expect(infoMessages).toContain('Shell adopted into ownership ledger')
-      expect(infoMessages).not.toContain('Background shell kept in ownership ledger')
-      expect(infoMessages).not.toContain('Background shell adopted into ownership ledger')
+      expect(debugMessages).toContain('Shell adopted into ownership ledger')
+      expect(debugMessages).not.toContain('Background shell kept in ownership ledger')
+      expect(debugMessages).not.toContain('Background shell adopted into ownership ledger')
       expect(ledger.isTracked(shellLedgerKey(SHELL_ID))).toBe(false)
       expect(logger.warning).not.toHaveBeenCalled()
     })

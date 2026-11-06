@@ -2,7 +2,7 @@ import type {OpenCodeV2ServerHandle, OpenCodeV2ShutdownResult} from '@fro-bot/ru
 import type {ActionInputs, CacheResult} from '../../shared/types.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
 import * as path from 'node:path'
-import {beforeEach, describe, expect, it, vi} from 'vitest'
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMetricsCollector} from '../../features/observability/index.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {ok} from '../../shared/types.js'
@@ -127,6 +127,10 @@ describe('runCacheRestore on OpenCode V2', () => {
     mocks.bootstrapOpenCodeServer.mockResolvedValue(ok({}))
   })
 
+  afterEach(() => {
+    vi.unstubAllEnvs()
+  })
+
   it('starts the V2 server with the run, restore and credential facts and never the V1 bootstrap', async () => {
     // #given
     const {handle} = v2Handle()
@@ -155,6 +159,25 @@ describe('runCacheRestore on OpenCode V2', () => {
     // the password is registered for masking through the Actions runner
     ;(call.maskSecret as (value: string) => void)('pw')
     expect(mocks.setSecret).toHaveBeenCalledWith('pw')
+  })
+
+  it.each([
+    ['pull_request', 'withhold'],
+    ['issue_comment', 'withhold'],
+    ['issues', 'withhold'],
+    ['workflow_dispatch', 'provision'],
+    ['schedule', 'provision'],
+  ])('tells the V2 start the credential disposition of %s: %s', async (eventName, credential) => {
+    // #given
+    vi.stubEnv('GITHUB_EVENT_NAME', eventName)
+    mocks.startActionOpenCodeV2.mockResolvedValue({success: true, data: v2Handle().handle})
+    const {runCacheRestore} = await import('./cache-restore.js')
+
+    // #when
+    await runCacheRestore(bootstrap(V2_VERSION), createMetricsCollector())
+
+    // #then
+    expect(mocks.startActionOpenCodeV2.mock.calls[0]?.[0]).toMatchObject({credential})
   })
 
   it('repairs the restored database before the spawn, exactly as V1 does', async () => {

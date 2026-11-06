@@ -15,7 +15,7 @@
  */
 
 import type {AddressInfo} from 'node:net'
-import type {OpenCodeV2ServerHandle} from '@fro-bot/runtime'
+import type {CredentialDisposition, OpenCodeV2ServerHandle} from '@fro-bot/runtime'
 import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {CacheRestoreV2PhaseResult} from './cache-restore.js'
 import type {RoutingPhaseResult} from './routing.js'
@@ -28,7 +28,7 @@ import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 import {DatabaseSync} from 'node:sqlite'
-import {buildSessionTitle} from '@fro-bot/runtime'
+import {buildSessionTitle, evaluatePermissionV2} from '@fro-bot/runtime'
 import {afterAll, beforeAll, describe, expect, it, vi} from 'vitest'
 import pin from '../../../packages/runtime/src/shared/opencode-v2-pin.json'
 import {createActionClientV2} from '../../features/agent/execution-v2.js'
@@ -215,9 +215,10 @@ async function startProvider(outsideFile: string): Promise<Provider> {
   }
 }
 
-function operatorConfig(baseURL: string): string {
+function operatorConfig(baseURL: string, extra: Readonly<Record<string, unknown>> = {}): string {
   return JSON.stringify({
     share: 'disabled',
+    ...extra,
     provider: {
       fake: {
         npm: '@ai-sdk/openai-compatible',
@@ -304,6 +305,7 @@ async function startRealServer(
   box: Sandbox,
   provider: Provider,
   extraPermissions: readonly {action: string; resource: string; effect: 'allow' | 'ask' | 'deny'}[] = [],
+  caller: {readonly extra?: Readonly<Record<string, unknown>>; readonly credential?: CredentialDisposition} = {},
 ): Promise<OpenCodeV2ServerHandle> {
   process.env.RUNNER_TEMP = box.env.RUNNER_TEMP
   process.env.GITHUB_WORKSPACE = box.repo
@@ -324,7 +326,8 @@ async function startRealServer(
     binaryPath: BINARY as string,
     workspacePath: box.repo,
     authJson: JSON.stringify({fake: {type: 'api', key: CANARY}}),
-    opencodeConfig: operatorConfig(provider.baseURL),
+    opencodeConfig: operatorConfig(provider.baseURL, caller.extra),
+    credential: caller.credential ?? 'provision',
     systematicVersion: 'latest',
     model: MODEL,
     dbPath: box.dbPath,
@@ -499,6 +502,56 @@ function sizeOrZero(file: string): number {
   }
 }
 
+/** A dependency-free stdio MCP server (newline-delimited JSON-RPC) with one tool, `say`, that echoes its text. */
+const ECHO_MCP_SERVER = String.raw`
+import readline from 'node:readline'
+const send = message => process.stdout.write(JSON.stringify({jsonrpc: '2.0', ...message}) + '\n')
+readline.createInterface({input: process.stdin}).on('line', line => {
+  let message
+  try { message = JSON.parse(line) } catch { return }
+  if (message.method === 'initialize') {
+    send({id: message.id, result: {protocolVersion: message.params?.protocolVersion ?? '2025-06-18', capabilities: {tools: {}}, serverInfo: {name: 'echo', version: '1.0.0'}}})
+  } else if (message.method === 'tools/list') {
+    send({id: message.id, result: {tools: [{name: 'say', description: 'Echo the text back', inputSchema: {type: 'object', properties: {text: {type: 'string'}}, required: ['text']}}]}})
+  } else if (message.method === 'tools/call') {
+    send({id: message.id, result: {content: [{type: 'text', text: 'echo: ' + (message.params?.arguments?.text ?? '')}]}})
+  } else if (message.id !== undefined) {
+    send({id: message.id, error: {code: -32601, message: 'method not found'}})
+  }
+})
+`
+
+function writeEchoMcpServer(box: Sandbox): {readonly type: 'local'; readonly command: readonly string[]} {
+  const file = path.join(box.root, 'echo-mcp.mjs')
+  writeFileSync(file, ECHO_MCP_SERVER)
+  return {type: 'local', command: [process.execPath, file]}
+}
+
+/** MCP servers connect in the background after the server is ready; wait for one before the model needs it. */
+async function waitForMcpConnected(handle: OpenCodeV2ServerHandle, name: string): Promise<void> {
+  const deadline = Date.now() + 30_000
+  for (;;) {
+    const response = await handle.fetch('/api/mcp')
+    const body = (await response.json()) as {data: {name: string; status: {status: string}}[]}
+    const status = body.data.find(server => server.name === name)?.status.status
+    // The catalog refresh follows the connect by a debounce and a reload, so give it a moment.
+    if (status === 'connected') return new Promise(resolve => setTimeout(resolve, 2000))
+    if (Date.now() > deadline) throw new Error(`MCP server ${name} is "${status}" after 30 s`)
+    await new Promise(resolve => setTimeout(resolve, 250))
+  }
+}
+
+async function runWithheld(box: Sandbox, extra: Record<string, unknown>) {
+  const provider = await startScriptedProvider([{text: 'Done.'}])
+  providers.push(provider)
+  const real = await startRealServer(box, provider, [], {extra, credential: 'withhold'})
+  const result = await executePhase(real, box, 120_000)
+  // MCP servers connect in the background; give a wrongly kept one time to start before checking.
+  await new Promise(resolve => setTimeout(resolve, 3000))
+  const listed = (await (await real.fetch('/api/mcp')).json()) as {data: unknown[]}
+  return {result, listed: listed.data}
+}
+
 const SHELL_MARKER = 'release-fixture-job-d41'
 const AUTOMATION_REJECT_MESSAGE = "This automated run does not allow this action. Don't retry it; continue without it."
 
@@ -545,6 +598,7 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
       workspacePath: box.repo,
       authJson: JSON.stringify({fake: {type: 'api', key: CANARY}}),
       opencodeConfig: operatorConfig(provider.baseURL),
+      credential: 'provision',
       systematicVersion: 'latest',
       model: MODEL,
       dbPath: box.dbPath,
@@ -819,6 +873,151 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
     expect((await real.exited).code).toBe(0)
     expect(sessionClaims(box.dbPath).every(row => row.suspended === null)).toBe(true)
   }, 300_000)
+
+  describe('caller MCP servers (fro-bot/agent#1931)', () => {
+    const toolMessages = (provider: Provider): string =>
+      provider.requests
+        .filter(item => item.hasTools)
+        .flatMap(item => (JSON.parse(item.raw) as {messages: {role: string; content: unknown}[]}).messages)
+        .filter(message => message.role === 'tool')
+        .map(message => JSON.stringify(message.content))
+        .join('\n')
+
+    // Code Mode is on by default, so a server's tools reach the model through the `execute` tool as
+    // `tools.<server>.<tool>(input)`, and each inner call asks the permission action `<server>_<tool>`.
+    const CALL_ECHO = {tool: 'execute', args: {code: 'return await tools.echo.say({text: "hello mcp"})'}} as const
+
+    it.each([
+      ['mcp.<name>', (server: object) => ({echo: server})],
+      ['mcp.servers.<name>', (server: object) => ({servers: {echo: server}})],
+    ])(
+      'runs a configured stdio server tool without an ask on a provisioned run, through the default agent: %s',
+      async (_spelling, spell) => {
+        // #given a local echo MCP server in opencode-config, and a model that calls its tool through Code Mode
+        const box = createSandbox()
+        sandboxes.push(box)
+        const provider = await startScriptedProvider([CALL_ECHO, {text: 'Done.'}], 'unexpected extra turn')
+        providers.push(provider)
+        const real = await startRealServer(box, provider, [], {extra: {mcp: spell(writeEchoMcpServer(box))}})
+        await waitForMcpConnected(real, 'echo')
+        const replies: Seen[] = []
+        const recording = {
+          ...real,
+          fetch: async (route: string, init?: RequestInit) => {
+            if (/\/permission\/[^/]+\/reply$/.test(route)) {
+              replies.push({method: init?.method ?? 'GET', path: route, body: null})
+            }
+            return real.fetch(route, init)
+          },
+        } as OpenCodeV2ServerHandle
+
+        // #when
+        const result = await executePhase(recording, box, 120_000)
+
+        // #then the tool's result came back to the model: it ran, and nothing was asked or rejected
+        expect(toolMessages(provider)).toContain('echo: hello mcp')
+        expect(toolMessages(provider)).not.toContain(AUTOMATION_REJECT_MESSAGE)
+        expect(replies).toEqual([])
+        expect(result).toMatchObject({success: true, exitCode: 0, llmError: null})
+
+        // #and no rule was added for the server: the default agent runs it through its own `allow *`, and the read-only
+        // subagent (`explore` denies `*`) does not get it
+        const agents = (await (await real.fetch('/api/agent')).json()) as {
+          data: {id: string; permissions: {action: string; resource: string; effect: 'allow' | 'ask' | 'deny'}[]}[]
+        }
+        const effectFor = (id: string) =>
+          evaluatePermissionV2('echo_say', '*', agents.data.find(entry => entry.id === id)?.permissions ?? [])
+        expect(effectFor('build')).toBe('allow')
+        expect(effectFor('explore')).toBe('deny')
+      },
+      300_000,
+    )
+
+    describe('on a credential-withheld run the whole mcp block is removed', () => {
+      const STARTED = 'started'
+
+      /** A stdio server that records that it was started, for the cases where nothing may start it. */
+      function writeMarkerServer(box: Sandbox): {readonly command: readonly string[]; readonly marker: string} {
+        const marker = path.join(box.root, 'mcp-started')
+        const file = path.join(box.root, 'marker-mcp.mjs')
+        writeFileSync(file, `import fs from 'node:fs'\nfs.writeFileSync(${JSON.stringify(marker)}, '${STARTED}')\n`)
+        return {command: [process.execPath, file], marker}
+      }
+
+      it('lists nothing and runs no tool for a plain local server', async () => {
+        // #given
+        const box = createSandbox()
+        sandboxes.push(box)
+
+        // #when
+        const {result, listed} = await runWithheld(box, {mcp: {echo: writeEchoMcpServer(box)}})
+
+        // #then
+        expect(listed).toEqual([])
+        expect(result).toMatchObject({success: true})
+      }, 300_000)
+
+      it('sends no request to a remote server whose header is a {file:} reference', async () => {
+        // #given a remote server that records every request, and a header that resolves to a file in the checkout
+        const box = createSandbox()
+        sandboxes.push(box)
+        writeFileSync(path.join(box.repo, 'secret'), 'resolved-secret-value')
+        const requests: {url: string | undefined; headers: http.IncomingHttpHeaders}[] = []
+        const remote = http.createServer((req, res) => {
+          requests.push({url: req.url, headers: req.headers})
+          res.writeHead(500).end()
+        })
+        await new Promise<void>(resolve => remote.listen(0, '127.0.0.1', resolve))
+        try {
+          const {port} = remote.address() as AddressInfo
+
+          // #when
+          const {listed} = await runWithheld(box, {
+            mcp: {
+              wiki: {type: 'remote', url: `http://127.0.0.1:${port}/mcp`, headers: {'X-Session': '{file:./secret}'}},
+            },
+          })
+
+          // #then
+          expect(requests).toEqual([])
+          expect(listed).toEqual([])
+        } finally {
+          remote.closeAllConnections()
+          await new Promise<void>(resolve => remote.close(() => resolve()))
+        }
+      }, 300_000)
+
+      it('starts no command for an mcp.timeout whose type is a {file:} reference that resolves to a local server', async () => {
+        // #given a block the parser takes for a timeout, which substitution turns into a legacy local server
+        const box = createSandbox()
+        sandboxes.push(box)
+        writeFileSync(path.join(box.repo, 't'), 'local')
+        const {command, marker} = writeMarkerServer(box)
+
+        // #when
+        const {listed} = await runWithheld(box, {mcp: {timeout: {type: '{file:./t}', command}}})
+
+        // #then
+        expect(existsSync(marker)).toBe(false)
+        expect(listed).toEqual([])
+      }, 300_000)
+
+      it('starts no command for a top-level key whose name is a {file:} reference that resolves to mcp', async () => {
+        // #given a key that is not mcp until substitution makes it so
+        const box = createSandbox()
+        sandboxes.push(box)
+        writeFileSync(path.join(box.repo, 'k'), 'mcp')
+        const {command, marker} = writeMarkerServer(box)
+
+        // #when
+        const {listed} = await runWithheld(box, {'{file:./k}': {docs: {type: 'local', command}}})
+
+        // #then
+        expect(existsSync(marker)).toBe(false)
+        expect(listed).toEqual([])
+      }, 300_000)
+    })
+  })
 
   it('holds the run for a background shell: the final answer arrives after it, and the saved database is consistent', async () => {
     // #given a model that starts a 5 s background shell, ends its turn, then answers once the shell's notice wakes it

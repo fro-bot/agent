@@ -883,7 +883,7 @@ export async function processEventStream(
             }
             if (ownershipLedger?.isTracked(completion.childSessionId) === true) {
               ownershipLedger.settle(completion.childSessionId)
-              logger.info('Background task completion turn observed — settled ownership entry', {
+              logger.debug('Background task completion turn observed — settled ownership entry', {
                 sessionId,
                 childSessionId: completion.childSessionId,
                 state: completion.state,
@@ -908,7 +908,7 @@ export async function processEventStream(
               if (jobId !== null && isBackground === true) {
                 const label = getStringProperty(toolState, 'title') ?? 'background task'
                 ownershipLedger.adopt(jobId, label)
-                logger.info('Background dispatch observed — adopted into ownership ledger', {sessionId, jobId, label})
+                logger.debug('Background dispatch observed — adopted into ownership ledger', {sessionId, jobId, label})
               }
             }
 
