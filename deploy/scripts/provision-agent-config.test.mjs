@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import {test} from 'node:test'
-import {mkdtemp, writeFile, readFile, rm, stat, open} from 'node:fs/promises'
+import {lstat, mkdir, mkdtemp, writeFile, readFile, rm, stat, symlink, open} from 'node:fs/promises'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 import {spawnSync} from 'node:child_process'
@@ -197,4 +197,177 @@ test('the startup marker reports none when no overlay is set', async () => {
 
   assert.equal(status, 0)
   assert.match(stderr, /provider-overlay=none/)
+})
+
+const AUTH_BLOB = JSON.stringify({anthropic: {type: 'api', key: 'sk-test'}})
+
+async function makeProvisionRoot() {
+  const root = await makeTempRoot()
+  const baseConfigPath = join(root, 'base.json')
+  await writeFile(baseConfigPath, JSON.stringify(BASE_CONFIG))
+  return {
+    root,
+    baseConfigPath,
+    authDestPath: join(root, 'home', '.local', 'share', 'opencode', 'auth.json'),
+    configDestPath: join(root, 'home', '.config', 'opencode', 'opencode.json'),
+  }
+}
+
+test('V2 (writeAuthJson: false) writes no auth.json even when a blob is passed, and still writes the config', async () => {
+  const {root, baseConfigPath, authDestPath, configDestPath} = await makeProvisionRoot()
+  try {
+    const result = await provisionAgentConfig({
+      baseConfigPath,
+      authDestPath,
+      configDestPath,
+      authRaw: AUTH_BLOB,
+      overlayRaw: '',
+      modelRaw: '',
+      writeAuthJson: false,
+    })
+
+    assert.equal(result.ok, true)
+    assert.equal(result.authProvisioned, false)
+    await assert.rejects(stat(authDestPath))
+    assert.equal(JSON.parse(await readFile(configDestPath, 'utf8')).autoupdate, false)
+  } finally {
+    await rm(root, {recursive: true, force: true})
+  }
+})
+
+test('V2 removes a stale auth.json left by an earlier V1 run', async () => {
+  const {root, baseConfigPath, authDestPath, configDestPath} = await makeProvisionRoot()
+  try {
+    await mkdir(join(authDestPath, '..'), {recursive: true})
+    await writeFile(authDestPath, AUTH_BLOB, {mode: 0o600})
+
+    const result = await provisionAgentConfig({
+      baseConfigPath,
+      authDestPath,
+      configDestPath,
+      authRaw: '',
+      overlayRaw: '',
+      modelRaw: '',
+      writeAuthJson: false,
+    })
+
+    assert.equal(result.ok, true)
+    await assert.rejects(stat(authDestPath))
+  } finally {
+    await rm(root, {recursive: true, force: true})
+  }
+})
+
+test('V2 removes a stale auth.json that is a symlink without touching its target', async () => {
+  const {root, baseConfigPath, authDestPath, configDestPath} = await makeProvisionRoot()
+  try {
+    const target = join(root, 'elsewhere.txt')
+    await writeFile(target, 'keep me')
+    await mkdir(join(authDestPath, '..'), {recursive: true})
+    await symlink(target, authDestPath)
+
+    const result = await provisionAgentConfig({
+      baseConfigPath,
+      authDestPath,
+      configDestPath,
+      authRaw: '',
+      overlayRaw: '',
+      modelRaw: '',
+      writeAuthJson: false,
+    })
+
+    assert.equal(result.ok, true)
+    await assert.rejects(lstat(authDestPath))
+    assert.equal(await readFile(target, 'utf8'), 'keep me')
+  } finally {
+    await rm(root, {recursive: true, force: true})
+  }
+})
+
+test('V2 fails closed when a stale auth.json cannot be removed', async () => {
+  const {root, baseConfigPath, authDestPath, configDestPath} = await makeProvisionRoot()
+  try {
+    await mkdir(authDestPath, {recursive: true})
+
+    const result = await provisionAgentConfig({
+      baseConfigPath,
+      authDestPath,
+      configDestPath,
+      authRaw: '',
+      overlayRaw: '',
+      modelRaw: '',
+      writeAuthJson: false,
+    })
+
+    assert.equal(result.ok, false)
+    assert.match(result.error, /cannot remove stale auth\.json/)
+    await assert.rejects(stat(configDestPath))
+  } finally {
+    await rm(root, {recursive: true, force: true})
+  }
+})
+
+test('V1 (writeAuthJson omitted) still writes auth.json with 0600 and overwrites a previous one', async () => {
+  const {root, baseConfigPath, authDestPath, configDestPath} = await makeProvisionRoot()
+  try {
+    await mkdir(join(authDestPath, '..'), {recursive: true})
+    await writeFile(authDestPath, '{"old":true}', {mode: 0o600})
+
+    const result = await provisionAgentConfig({
+      baseConfigPath,
+      authDestPath,
+      configDestPath,
+      authRaw: AUTH_BLOB,
+      overlayRaw: '',
+      modelRaw: '',
+    })
+
+    assert.equal(result.ok, true)
+    assert.equal(result.authProvisioned, true)
+    const handle = await open(authDestPath, 'r')
+    try {
+      assert.equal((await handle.stat()).mode & 0o777, 0o600)
+      assert.equal(await handle.readFile('utf8'), AUTH_BLOB)
+    } finally {
+      await handle.close()
+    }
+  } finally {
+    await rm(root, {recursive: true, force: true})
+  }
+})
+
+function runCliWithAuth({args, input, authDestPath, baseConfigPath, configDestPath}) {
+  return spawnSync(process.execPath, [SCRIPT, baseConfigPath, authDestPath, configDestPath, ...args], {
+    input,
+    encoding: 'utf8',
+    env: {PATH: process.env.PATH},
+  })
+}
+
+test('the CLI writes auth.json by default and drops it with --no-auth-json', async () => {
+  const {root, baseConfigPath, authDestPath, configDestPath} = await makeProvisionRoot()
+  try {
+    const v1 = runCliWithAuth({args: [], input: AUTH_BLOB, authDestPath, baseConfigPath, configDestPath})
+    assert.equal(v1.status, 0, v1.stderr)
+    assert.match(v1.stderr, /auth: provisioned/)
+    assert.equal((await stat(authDestPath)).mode & 0o777, 0o600)
+
+    const v2 = runCliWithAuth({args: ['--no-auth-json'], input: '', authDestPath, baseConfigPath, configDestPath})
+    assert.equal(v2.status, 0, v2.stderr)
+    assert.doesNotMatch(v2.stderr, /auth: provisioned/)
+    await assert.rejects(stat(authDestPath))
+  } finally {
+    await rm(root, {recursive: true, force: true})
+  }
+})
+
+test('the CLI rejects a flag it does not know', async () => {
+  const {root, baseConfigPath, authDestPath, configDestPath} = await makeProvisionRoot()
+  try {
+    const result = runCliWithAuth({args: ['--no-auth'], input: '', authDestPath, baseConfigPath, configDestPath})
+    assert.equal(result.status, 2)
+    assert.match(result.stderr, /usage:/)
+  } finally {
+    await rm(root, {recursive: true, force: true})
+  }
 })

@@ -42,7 +42,10 @@ jobs:
           filters: |
             config: &config
               - .github/**
+              - .opencode/**
               - '**.json5?'
+              - '**.jsonc'
+              - '*.config.ts'
               - '**.md'
               - '**.toml'
               - '**.yaml'
@@ -57,6 +60,7 @@ jobs:
               - packages/**
               - src/**
               - action.yaml
+              - bun.lock
               - package.json
               - tsconfig*.json
               - tsdown.config.ts

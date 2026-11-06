@@ -285,6 +285,8 @@ When the workspace OpenCode config sets any tool to `ask` (rather than the defau
 
 Don't describe an approval as protecting anything an uncooperative model could reach with a shell. A real outside-checkout boundary needs OS-level tool isolation.
 
+The workspace assumes everyone with `GATEWAY_TRIGGER_ROLE_ID` is trusted and bound repos are operator-controlled, because a tool process can read the spawn database's provider key, the server password, other checkouts and the plugin caches. Widening the role or binding repos the operator does not control requires OS-level tool isolation first (fro-bot/agent#2041).
+
 **How it works:**
 
 - Each `permission.asked` event creates a Discord embed with Approve / Deny buttons in the run thread.
