@@ -1,0 +1,12 @@
+{
+  "$schema": "https://fro.bot/systematic/schemas/v3/systematic-config.schema.json",
+  // In-repo decision sources for Systematic past-work search. They are read
+  // only when the user allows this repository in search.allow_project_sources.
+  "search": {
+    "sources": [
+      {"name": "rfcs", "format": "markdown", "roots": ["RFCs"]},
+      {"name": "decisions", "format": "markdown", "roots": ["docs/decisions"]},
+      {"name": "wiki", "format": "markdown", "roots": ["docs/wiki"]},
+    ],
+  },
+}
