@@ -665,6 +665,8 @@ The gateway runs in **`approval-required` mode by default**: when OpenCode reque
 
 Approvals steer a cooperating model; they are not a security boundary. A shell command can reach paths outside the checkout without triggering an `external_directory` ask, and a tool runs as the same uid as the OpenCode server. The security boundary is the workspace container, its uid and the egress allowlist.
 
+The workspace assumes that everyone who holds the Discord trigger role is trusted and that bound repos are operator-controlled. A tool process runs as the same uid as the OpenCode server, so it can read the provider key held in the spawn database, the server password, every other checkout under `/workspace/repos` and the plugin caches. Before you widen the trigger role or bind repos you do not control, the workspace needs OS-level tool isolation ([fro-bot/agent#2041](https://github.com/fro-bot/agent/issues/2041)).
+
 The workspace OpenCode config is supplied via `WORKSPACE_OPENCODE_CONFIG` (in `deploy/.env`) as a JSON object shallow-merged over the base config. The base config sets no shell rule, and OpenCode allows a shell command that matches no rule, so a shell command asks only when the operator config sets a rule that matches it. Shell rules match command patterns, and the last matching rule wins:
 
 ```env
