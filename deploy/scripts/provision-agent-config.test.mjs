@@ -284,6 +284,29 @@ test('V2 removes a stale auth.json that is a symlink without touching its target
   }
 })
 
+test('V2 fails closed when a stale auth.json cannot be removed', async () => {
+  const {root, baseConfigPath, authDestPath, configDestPath} = await makeProvisionRoot()
+  try {
+    await mkdir(authDestPath, {recursive: true})
+
+    const result = await provisionAgentConfig({
+      baseConfigPath,
+      authDestPath,
+      configDestPath,
+      authRaw: '',
+      overlayRaw: '',
+      modelRaw: '',
+      writeAuthJson: false,
+    })
+
+    assert.equal(result.ok, false)
+    assert.match(result.error, /cannot remove stale auth\.json/)
+    await assert.rejects(stat(configDestPath))
+  } finally {
+    await rm(root, {recursive: true, force: true})
+  }
+})
+
 test('V1 (writeAuthJson omitted) still writes auth.json with 0600 and overwrites a previous one', async () => {
   const {root, baseConfigPath, authDestPath, configDestPath} = await makeProvisionRoot()
   try {
@@ -301,8 +324,13 @@ test('V1 (writeAuthJson omitted) still writes auth.json with 0600 and overwrites
 
     assert.equal(result.ok, true)
     assert.equal(result.authProvisioned, true)
-    assert.equal((await stat(authDestPath)).mode & 0o777, 0o600)
-    assert.equal(await readFile(authDestPath, 'utf8'), AUTH_BLOB)
+    const handle = await open(authDestPath, 'r')
+    try {
+      assert.equal((await handle.stat()).mode & 0o777, 0o600)
+      assert.equal(await handle.readFile('utf8'), AUTH_BLOB)
+    } finally {
+      await handle.close()
+    }
   } finally {
     await rm(root, {recursive: true, force: true})
   }
