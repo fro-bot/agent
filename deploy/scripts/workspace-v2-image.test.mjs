@@ -7,6 +7,7 @@
 // starts as uid 10001 with no network, loads both plugins, and passes the permission gate.
 
 import assert from 'node:assert/strict'
+import {spawnSync} from 'node:child_process'
 import fs from 'node:fs'
 import {test} from 'node:test'
 
@@ -144,4 +145,41 @@ test('the workspace agent expects the same plugin ids the V2 image is smoke-test
   // #then
   assert.equal(constant('SYSTEMATIC_V2_PLUGIN_ID'), 'systematic')
   assert.equal(constant('FRO_BOT_PLUGIN_ID'), 'fro-bot.opencode-plugin')
+})
+
+/** The entrypoint's V2 selection (`case "${WORKSPACE_IMAGE_OPENCODE_VERSION:-}" in ... esac`), run by `sh`. */
+function entrypointSelectsV2(version) {
+  const match = /^case "\$\{WORKSPACE_IMAGE_OPENCODE_VERSION:-\}" in\n[\s\S]*?^esac$/m.exec(entrypoint)
+  assert.ok(match, 'the entrypoint has no WORKSPACE_IMAGE_OPENCODE_VERSION selection')
+  const result = spawnSync('sh', ['-c', `${match[0]}\nprintf %s "$OPENCODE_V2"`], {
+    encoding: 'utf8',
+    env: {PATH: process.env.PATH, ...(version === undefined ? {} : {WORKSPACE_IMAGE_OPENCODE_VERSION: version})},
+  })
+  assert.equal(result.status, 0, result.stderr)
+  return result.stdout === 'true'
+}
+
+test('the entrypoint selects V2 from the baked version with the same arm the Dockerfile uses', () => {
+  // #then the entrypoint, the Dockerfile and the workspace agent agree on which images are V2
+  assert.ok(entrypoint.includes(V2_VERSION_ARM))
+  assert.equal(entrypointSelectsV2(argDefault('OPENCODE_VERSION')), false)
+  assert.equal(entrypointSelectsV2(JSON.parse(read('packages/runtime/src/shared/opencode-v2-pin.json')).version), true)
+  assert.equal(entrypointSelectsV2('2.2.5'), true)
+  assert.equal(entrypointSelectsV2('10.0.0'), true)
+  assert.equal(entrypointSelectsV2('1.19.4+harness.5bde2635'), false)
+  assert.equal(entrypointSelectsV2(''), false)
+  assert.equal(entrypointSelectsV2(undefined), false)
+})
+
+test('the entrypoint hands the secret to the agent-uid provisioner and asks for no auth.json only on V2', () => {
+  // #then V1 keeps piping the blob; V2 clears it and passes the flag, both ahead of the one provisioning call
+  const v2Block = /if \[ "\$OPENCODE_V2" = true \]; then\n  AUTH_RAW=""\n  provision_flags="--no-auth-json"\nfi/.exec(
+    entrypoint,
+  )
+  assert.ok(v2Block, 'the V2 branch clears AUTH_RAW and sets --no-auth-json')
+  assert.ok(entrypoint.indexOf(v2Block[0]) < entrypoint.indexOf('printf \'%s\' "$AUTH_RAW" | setpriv'))
+  assert.match(
+    entrypoint,
+    /provision-agent-config\.mjs" "\$BASE_CONFIG_PATH" "\$AUTH_DEST" "\$CONFIG_DEST" \$\{provision_flags:\+"\$provision_flags"\}/,
+  )
 })
