@@ -1,5 +1,5 @@
-// provision-agent-config.mjs — Writes OpenCode's auth.json and merged
-// opencode.json AS THE AGENT UID. Pure ESM, no build step. Used by
+// provision-agent-config.mjs — Writes OpenCode's auth.json (V1 images only) and
+// merged opencode.json AS THE AGENT UID. Pure ESM, no build step. Used by
 // workspace-entrypoint.sh, invoked via `setpriv --reuid=10001 --regid=10001
 // --clear-groups` (never as root).
 //
@@ -18,7 +18,7 @@
 // WORKSPACE_OPENCODE_MODEL are non-secret operator config (see
 // deploy/compose.yaml) and are read from the inherited environment as before.
 
-import {mkdir, readFile, writeFile} from 'node:fs/promises'
+import {mkdir, readFile, rm, writeFile} from 'node:fs/promises'
 import {dirname} from 'node:path'
 import {fileURLToPath} from 'node:url'
 import process from 'node:process'
@@ -30,6 +30,8 @@ import {validateAuth} from './validate-auth.mjs'
  * @param {object} opts
  * @param {string} opts.baseConfigPath - world-readable baked base config
  * @param {string} opts.authDestPath - destination for auth.json (0600)
+ * @param {boolean} [opts.writeAuthJson] - false on OpenCode V2 images: nothing writes auth.json and a stale one is
+ *   removed. Defaults to true (V1 behaviour).
  * @param {string} opts.configDestPath - destination for opencode.json
  * @param {string} opts.authRaw - compact auth JSON, or '' if none provisioned
  * @param {string} opts.overlayRaw - WORKSPACE_OPENCODE_CONFIG value
@@ -37,10 +39,18 @@ import {validateAuth} from './validate-auth.mjs'
  * @returns {Promise<{ok: true, authProvisioned: boolean, warnings: string[]} | {ok: false, error: string}>}
  */
 export async function provisionAgentConfig(opts) {
-  const {baseConfigPath, authDestPath, configDestPath, authRaw, overlayRaw, modelRaw} = opts
+  const {baseConfigPath, authDestPath, configDestPath, authRaw, overlayRaw, modelRaw, writeAuthJson = true} = opts
 
   let authProvisioned = false
-  if (authRaw !== '') {
+  if (writeAuthJson === false) {
+    // V2 never reads auth.json on its fresh per-spawn database; the supervisor provisions keys from the root-only
+    // secret instead. A copy left by an earlier V1 run is a second plaintext key at rest, so it goes.
+    try {
+      await rm(authDestPath, {force: true})
+    } catch (error) {
+      return {ok: false, error: `cannot remove stale auth.json: ${error.message}`}
+    }
+  } else if (authRaw !== '') {
     const authCheck = validateAuth(authRaw)
     if (authCheck.ok === false) {
       return {ok: false, error: `auth secret is present but invalid: ${authCheck.error}`}
@@ -69,13 +79,16 @@ export async function provisionAgentConfig(opts) {
 }
 
 // CLI main guard:
-//   node provision-agent-config.mjs <baseConfigPath> <authDestPath> <configDestPath>
-// Reads the auth secret (compact JSON, or empty) from stdin.
+//   node provision-agent-config.mjs <baseConfigPath> <authDestPath> <configDestPath> [--no-auth-json]
+// Reads the auth secret (compact JSON, or empty) from stdin. --no-auth-json (OpenCode V2 images) writes no auth.json
+// and removes a stale one.
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
-  const [, , baseConfigPath, authDestPath, configDestPath] = process.argv
-  if (!baseConfigPath || !authDestPath || !configDestPath) {
+  const [, , baseConfigPath, authDestPath, configDestPath, ...flags] = process.argv
+  const writeAuthJson = !flags.includes('--no-auth-json')
+  if (!baseConfigPath || !authDestPath || !configDestPath || flags.some(flag => flag !== '--no-auth-json')) {
     process.stderr.write(
-      'usage: provision-agent-config.mjs <baseConfigPath> <authDestPath> <configDestPath> (auth secret on stdin)\n',
+      'usage: provision-agent-config.mjs <baseConfigPath> <authDestPath> <configDestPath> [--no-auth-json] ' +
+        '(auth secret on stdin)\n',
     )
     process.exit(2)
   }
@@ -94,6 +107,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
     authRaw,
     overlayRaw,
     modelRaw,
+    writeAuthJson,
   })
 
   if (result.ok === false) {

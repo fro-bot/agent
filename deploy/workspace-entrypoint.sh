@@ -19,7 +19,8 @@
 #   2. Create/validate the protected directories, without following symlinks.
 #   3. Install the mitmproxy CA into the system trust store.
 #   4. Migrate any pre-existing root-owned checkouts to the agent uid.
-#   5. Provision OpenCode's auth.json + merged config AS THE AGENT UID.
+#   5. Provision OpenCode's merged config (and, on V1 images, auth.json) AS THE
+#      AGENT UID.
 #   6. exec the workspace-agent supervisor (still uid 0 — see compose.yaml
 #      user: "0:0" — the supervisor spawns OpenCode itself as uid 10001;
 #      that spawn logic lives in apps/workspace-agent/src, not here).
@@ -202,8 +203,8 @@ if ! node "$SCRIPTS_DIR/migrate-repo-ownership.mjs" \
 fi
 
 # ---------------------------------------------------------------------------
-# Step 5: provision OpenCode's auth.json and merged opencode.json AS THE
-# AGENT UID (10001), never as root.
+# Step 5: provision OpenCode's merged opencode.json (and, on V1 images, auth.json)
+# AS THE AGENT UID (10001), never as root.
 #
 # Why this has to drop privilege: both destination files live under
 # /home/opencode, which the agent uid owns. If root wrote there directly —
@@ -249,6 +250,12 @@ fi
 AUTH_SRC="${WORKSPACE_OPENCODE_AUTH_FILE:-${RUNTIME_DIR}/secrets/workspace_opencode_auth}"
 BASE_CONFIG_PATH="/usr/local/share/fro-bot/opencode.base.json"
 AUTH_DEST="${AGENT_HOME}/.local/share/opencode/auth.json"
+# V2 is selected by the image's baked OPENCODE_VERSION major (the case patterns the Dockerfile uses); the workspace
+# agent reads the same variable (opencode-generation.ts). No value means V1.
+case "${WORKSPACE_IMAGE_OPENCODE_VERSION:-}" in
+  [2-9].*|[1-9][0-9]*.*) OPENCODE_V2=true ;;
+  *) OPENCODE_V2=false ;;
+esac
 CONFIG_DEST="${AGENT_HOME}/.config/opencode/opencode.json"
 
 # Read (as root) and compact the secret. Absence is fail-soft (clone-only
@@ -279,6 +286,14 @@ auth_was_present=false
 if [ -n "$AUTH_RAW" ]; then
   auth_was_present=true
 fi
+# V2 never reads auth.json on its fresh per-spawn database: the supervisor (root) provisions each spawn from the
+# root-only secret over loopback. So V2 writes no copy under the agent home, gets no secret on stdin, and has a
+# stale auth.json from an earlier V1 run removed.
+provision_flags=""
+if [ "$OPENCODE_V2" = true ]; then
+  AUTH_RAW=""
+  provision_flags="--no-auth-json"
+fi
 if provision_output=$(printf '%s' "$AUTH_RAW" | setpriv --reuid="$AGENT_UID" --regid="$AGENT_GID" --clear-groups \
     env -i \
       PATH="$PATH" \
@@ -289,7 +304,7 @@ if provision_output=$(printf '%s' "$AUTH_RAW" | setpriv --reuid="$AGENT_UID" --r
       XDG_STATE_HOME="${AGENT_HOME}/.local/state" \
       WORKSPACE_OPENCODE_MODEL="${WORKSPACE_OPENCODE_MODEL:-}" \
       WORKSPACE_OPENCODE_CONFIG="${WORKSPACE_OPENCODE_CONFIG:-}" \
-    node "$SCRIPTS_DIR/provision-agent-config.mjs" "$BASE_CONFIG_PATH" "$AUTH_DEST" "$CONFIG_DEST" 2>&1); then
+    node "$SCRIPTS_DIR/provision-agent-config.mjs" "$BASE_CONFIG_PATH" "$AUTH_DEST" "$CONFIG_DEST" ${provision_flags:+"$provision_flags"} 2>&1); then
   provision_rc=0
 else
   provision_rc=$?
@@ -300,6 +315,9 @@ echo "$provision_output" >&2
 if [ "$provision_rc" -ne 0 ]; then
   echo "workspace-entrypoint: OpenCode config/auth provisioning failed — refusing to start. Fix the credential blob / WORKSPACE_OPENCODE_CONFIG / WORKSPACE_OPENCODE_MODEL and restart." >&2
   exit 1
+fi
+if [ "$auth_was_present" = true ] && [ "$OPENCODE_V2" = true ]; then
+  echo "workspace-entrypoint: auth: present (OpenCode V2: the supervisor provisions each spawn, no auth.json written)" >&2
 fi
 if [ "$auth_was_present" = false ]; then
   echo "workspace-entrypoint: auth: absent (mention loop will fail until configured; clone-only deployment is fine)" >&2
