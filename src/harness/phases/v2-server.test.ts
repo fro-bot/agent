@@ -87,6 +87,11 @@ function populatePluginCache(cacheHome: string): void {
   }
 }
 
+function spawnedConfig(deps: Partial<StartActionOpenCodeV2Deps>): {mcp?: unknown} {
+  const config = vi.mocked(deps.startServer as StartServer).mock.calls[0]?.[0].config
+  return config as {mcp?: unknown}
+}
+
 describe('startActionOpenCodeV2', () => {
   let root: string
   let runnerTemp: string
@@ -121,6 +126,7 @@ describe('startActionOpenCodeV2', () => {
       workspacePath: '/workspace',
       authJson: JSON.stringify({anthropic: {type: 'api', key: CANARY}}),
       opencodeConfig: null,
+      credential: 'provision',
       systematicVersion: 'latest',
       model: 'anthropic/claude-sonnet',
       dbPath,
@@ -489,6 +495,78 @@ describe('startActionOpenCodeV2', () => {
     expect(result).toMatchObject({success: false, error: {stage: 'permission-gate'}})
     expect(server.shutdown).toHaveBeenCalledTimes(1)
     expect(calls).not.toContain('import-wait')
+  })
+
+  describe('caller MCP servers (fro-bot/agent#1931)', () => {
+    const MCP = {
+      docs: {type: 'local', command: ['node', 'echo.mjs']},
+      wiki: {type: 'remote', url: 'https://mcp.example.com/mcp'},
+    } as const
+
+    it('spawns with every server on a provisioned run, and the permission gate accepts it', async () => {
+      // #given
+      const server = fakeServer()
+      const deps = recordingDeps(server)
+
+      // #when
+      const result = await startActionOpenCodeV2(
+        options({deps, credential: 'provision', opencodeConfig: JSON.stringify({mcp: MCP})}),
+      )
+
+      // #then
+      expect(result.success).toBe(true)
+      const config = spawnedConfig(deps)
+      expect(config.mcp).toEqual(MCP)
+    })
+
+    it('spawns without any mcp on a credential-withheld run', async () => {
+      // #given
+      const server = fakeServer()
+      const deps = recordingDeps(server)
+
+      // #when
+      const result = await startActionOpenCodeV2(
+        options({deps, credential: 'withhold', opencodeConfig: JSON.stringify({mcp: MCP})}),
+      )
+
+      // #then
+      expect(result.success).toBe(true)
+      const config = spawnedConfig(deps)
+      expect(config).not.toHaveProperty('mcp')
+    })
+
+    it('fails the config stage before any spawn on a {env:} reference on a credential-withheld run', async () => {
+      // #given
+      const server = fakeServer()
+      const deps = recordingDeps(server)
+
+      // #when
+      const result = await startActionOpenCodeV2(
+        options({deps, credential: 'withhold', opencodeConfig: JSON.stringify({share: '{env:SECRET_NAME_456}'})}),
+      )
+
+      // #then
+      expect(result).toMatchObject({success: false, error: {stage: 'config'}})
+      expect(JSON.stringify(result)).toContain('{env:}')
+      expect(JSON.stringify(result)).not.toContain('SECRET_NAME_456')
+      expect(deps.startServer).not.toHaveBeenCalled()
+    })
+
+    it('fails the config stage before any spawn when the mcp shape is bad, naming the server', async () => {
+      // #given
+      const server = fakeServer()
+      const deps = recordingDeps(server)
+
+      // #when
+      const result = await startActionOpenCodeV2(
+        options({deps, opencodeConfig: JSON.stringify({mcp: {docs: {type: 'local'}}})}),
+      )
+
+      // #then
+      expect(result).toMatchObject({success: false, error: {stage: 'config'}})
+      expect(JSON.stringify(result)).toContain(String.raw`server \"docs\"`)
+      expect(deps.startServer).not.toHaveBeenCalled()
+    })
   })
 
   it('fails the permission gate when the agent list cannot be read', async () => {

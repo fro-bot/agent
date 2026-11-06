@@ -1,5 +1,5 @@
 import type {Result} from '@bfra.me/es/result'
-import type {BuiltConfigV2} from '@fro-bot/runtime'
+import type {BuiltConfigV2, CredentialDisposition} from '@fro-bot/runtime'
 import type {Logger} from './types.js'
 
 import * as path from 'node:path'
@@ -14,6 +14,7 @@ import {
   RESPONSE_FILE_DIR_SEGMENT,
   WEBSEARCH_ACTION_V2,
 } from '@fro-bot/runtime'
+import {applyOperatorMcpV2} from './mcp-servers-v2.js'
 
 export interface CIConfigV2Inputs {
   /** The `opencode-config` action input, or null. */
@@ -44,6 +45,12 @@ export interface CIConfigV2Inputs {
    * `model` mean the same thing as they do in V1. The path is never logged.
    */
   readonly providerKeyFiles?: Readonly<Record<string, string>>
+  /**
+   * The run's credential disposition (`resolveResponseDelivery`). Required, so a caller cannot omit it into the
+   * permissive reading. On `withhold` (`pull_request`, `issue_comment`, `issues`) untrusted text drives the model, so
+   * the operator's `mcp` is removed from the config (`applyOperatorMcpV2`).
+   */
+  readonly credential: CredentialDisposition
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -52,6 +59,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isPathInsideDirectory(filePath: string, directoryPath: string): boolean {
   return path.resolve(filePath).startsWith(`${path.resolve(directoryPath)}${path.sep}`)
+}
+
+/** Upstream's `/\{env:([^}]+)\}/` (`core/src/config/variable.ts`), as the opening it needs: case-sensitive. */
+const ENV_REFERENCE_OPENING = '{env:'
+
+/**
+ * Whether the operator's config holds a `{env:...}` reference anywhere: a key, a value or a nested string.
+ *
+ * Checked on the serialized object, which is the text the server substitutes into: a brace written as `\u007b` in the
+ * input is `{` here, and a quote between `{` and `env:` (a key named `env:`) does not match, as upstream.
+ */
+function containsEnvReference(operator: Record<string, unknown>): boolean {
+  return JSON.stringify(operator).includes(ENV_REFERENCE_OPENING)
 }
 
 /** Keys that carry permission rules in either spelling. Any of them in operator config could undo the deny. */
@@ -145,8 +165,23 @@ export function buildCIConfigV2(inputs: CIConfigV2Inputs, logger: Logger): Resul
     if (!isRecord(parsed)) {
       return err('opencode-config must be a JSON object')
     }
+    // Withheld runs: the server splices a `{env:}` value into the config text raw and escapes it only when the result
+    // does not parse (`core/src/config/variable.ts:27-37`), so an attacker-influenced allowlisted value (a branch name in
+    // `GITHUB_HEAD_REF`) could add JSON structure after the strips below. Our own generated config has no `{env:}`: this
+    // inspects the operator's input alone. The message names the rule, never a value.
+    if (inputs.credential === 'withhold' && containsEnvReference(parsed)) {
+      return err(
+        'opencode-config must not contain {env:} references on credential-withheld triggers (pull_request, issue_comment, issues): the server splices an environment value into the config text before it parses it',
+      )
+    }
     operator = stripOperatorPermissions(parsed, logger)
   }
+
+  // Caller MCP servers (fro-bot/agent#1931): removed on a credential-withheld run, validated otherwise. No permission
+  // rule is added: the default agents already allow `*`, and the read-only subagents deny it.
+  const withMcpApplied = applyOperatorMcpV2(operator, inputs.credential, logger)
+  if (!withMcpApplied.success) return err(withMcpApplied.error.message)
+  operator = withMcpApplied.data
 
   const runnerTemp = inputs.runnerTemp?.trim()
   const hasRunnerTemp = runnerTemp != null && runnerTemp.length > 0

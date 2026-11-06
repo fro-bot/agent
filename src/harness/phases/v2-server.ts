@@ -1,5 +1,5 @@
 import type {Result} from '@bfra.me/es/result'
-import type {OpenCodeV2ServerHandle, StartOpenCodeV2ServerOptions} from '@fro-bot/runtime'
+import type {CredentialDisposition, OpenCodeV2ServerHandle, StartOpenCodeV2ServerOptions} from '@fro-bot/runtime'
 import type {InstallPluginsV2Options, PluginInstallV2Error} from '../../services/setup/plugin-install-v2.js'
 import type {Logger} from '../../shared/logger.js'
 import type {V1DatabaseFacts, V1ImportWaitError, WaitForV1ImportOptions} from './v1-import-wait.js'
@@ -89,6 +89,8 @@ export interface StartActionOpenCodeV2Options {
   /** Where V1 and the XDG path would put `auth.json`. */
   readonly authPath: string
   readonly env: NodeJS.ProcessEnv
+  /** The run's credential disposition; `withhold` drops caller MCP servers an untrusted trigger could reach. */
+  readonly credential: CredentialDisposition
   readonly runId: string | number
   readonly runAttempt: string | number
   readonly logger: Logger
@@ -183,6 +185,7 @@ export async function startActionOpenCodeV2(
   const built = buildCIConfigV2(
     {
       opencodeConfig: options.opencodeConfig,
+      credential: options.credential,
       plugins: specs.data.specs,
       runnerTemp: options.env.RUNNER_TEMP,
       runId: options.runId,
