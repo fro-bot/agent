@@ -352,13 +352,14 @@ describe('applyOperatorMcpV2', () => {
           },
         },
       }
+      const expected = structuredClone(operator)
 
       // #when
       const result = unwrapOk(applyOperatorMcpV2(operator, 'provision', createMockLogger()))
 
       // #then
       expect(result).toBe(operator)
-      expect(result).toEqual(structuredClone(operator))
+      expect(result).toEqual(expected)
     })
 
     it('passes a substituted url through unchanged', () => {
