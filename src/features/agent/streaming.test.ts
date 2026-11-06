@@ -1137,7 +1137,7 @@ describe('processEventStream — ownership ledger integration', () => {
     // #then no adoption side effect occurs — nothing to assert on a ledger that was never created,
     // and no dispatch-adoption log line is emitted
     expect(result).toBeDefined()
-    expect(logger.info).not.toHaveBeenCalledWith(
+    expect(logger.debug).not.toHaveBeenCalledWith(
       expect.stringContaining('adopted into ownership ledger'),
       expect.anything(),
     )
