@@ -310,7 +310,7 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
     ownershipLedger.adopt(childSessionId, label)
     if (noticedChildIds.has(childSessionId)) ownershipLedger.settle(childSessionId)
     if (known) return
-    logger.info('Owned subagent session discovered; adopted into ownership ledger', {
+    logger.debug('Owned subagent session discovered; adopted into ownership ledger', {
       sessionId,
       childSessionId,
     })
@@ -327,7 +327,7 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
     ownershipLedger.adopt(key, 'background shell')
     if (noticedShellIds.has(shellId)) ownershipLedger.settle(key)
     // Foreground and background shells alike are adopted at start; only the tool result says which one this is.
-    if (fresh) logger.info('Shell adopted into ownership ledger', {sessionId, shellId})
+    if (fresh) logger.debug('Shell adopted into ownership ledger', {sessionId, shellId})
   }
 
   /**
@@ -487,7 +487,7 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
           const dispatch = readBackgroundDispatch(name, event)
           if (dispatch !== null) {
             adoptDescendant(dispatch.childSessionId, subagentLabel(info?.input))
-            logger.info('Background dispatch observed; adopted into ownership ledger', {
+            logger.debug('Background dispatch observed; adopted into ownership ledger', {
               sessionId,
               childSessionId: dispatch.childSessionId,
             })
@@ -506,7 +506,7 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
             const shellDispatch = readBackgroundShellDispatch(name, event)
             if (shellDispatch !== null) {
               adoptShell(shellDispatch.shellId)
-              logger.info('Background shell kept in ownership ledger', {sessionId, shellId: shellDispatch.shellId})
+              logger.debug('Background shell kept in ownership ledger', {sessionId, shellId: shellDispatch.shellId})
             } else if (callShellId !== null) {
               ownershipLedger.release(shellLedgerKey(callShellId))
               logger.debug('Foreground shell released from ownership ledger', {sessionId, shellId: callShellId})
