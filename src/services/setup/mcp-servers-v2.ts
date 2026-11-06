@@ -14,6 +14,11 @@
  * literally named `servers` or `timeout` is a server only when its value has `type: "local" | "remote"`. Both parse into
  * one typed list. The config is not rewritten into one spelling.
  *
+ * A string field that holds a `{env:}` or `{file:}` reference (a url, a referenced number or boolean, a referenced `type`)
+ * is passed through without our format checks: OpenCode resolves it first, so OpenCode checks it. A referenced `type`
+ * parses as a server of `unresolved` kind, and the launch fields that depend on the kind are then not checked. Structure
+ * is still checked as written (`command` an array, `environment` and `headers` string maps, a url a string).
+ *
  * What is validated is what the 2.2.5 source shows: the legacy server schema in full (`core/src/v1/config/mcp.ts`),
  * `mcp.timeout` (a bare number or an object of positive integers), and for native entries the fields both spellings
  * share (`type`, `command`, `cwd`, `environment`, `url`, `headers`, `codemode`, `enabled`/`disabled`, `timeout`, and that
@@ -49,7 +54,12 @@ export interface RemoteMcpServerV2 extends McpServerBase {
   readonly headers: Readonly<Record<string, string>>
 }
 
-export type McpServerV2 = LocalMcpServerV2 | RemoteMcpServerV2
+/** A server whose `type` is a reference OpenCode resolves later, so nothing that depends on the kind can be checked. */
+export interface UnresolvedMcpServerV2 extends McpServerBase {
+  readonly kind: 'unresolved'
+}
+
+export type McpServerV2 = LocalMcpServerV2 | RemoteMcpServerV2 | UnresolvedMcpServerV2
 
 export interface McpConfigError {
   readonly kind: 'duplicate-name' | 'invalid-name' | 'invalid-server' | 'not-an-object'
@@ -76,8 +86,17 @@ function isStringMap(value: unknown): value is Record<string, string> {
   return isRecord(value) && Object.values(value).every(entry => typeof entry === 'string')
 }
 
+/**
+ * A string that holds a `{env:...}` or `{file:...}` reference, anywhere in it. OpenCode substitutes these in the config
+ * text before it parses it (`core/src/config/variable.ts`), so what the field becomes, and whether that is valid, is
+ * OpenCode's to decide: our format checks defer to it. Structure is still ours: a field's type is checked as written.
+ */
+function isReference(value: unknown): value is string {
+  return typeof value === 'string' && (value.includes('{env:') || value.includes('{file:'))
+}
+
 function isPositiveInt(value: unknown): boolean {
-  return typeof value === 'number' && Number.isInteger(value) && value > 0
+  return isReference(value) || (typeof value === 'number' && Number.isInteger(value) && value > 0)
 }
 
 /** `mcp.timeout`, and a native server's `timeout`: a bare number (V1) or an object of phase timeouts. */
@@ -96,12 +115,15 @@ function isLegacyOAuth(oauth: Record<string, unknown>): boolean {
   const port = oauth.callbackPort
   return (
     strings.every(key => oauth[key] === undefined || typeof oauth[key] === 'string') &&
-    (port === undefined || (Number.isInteger(port) && (port as number) >= 1 && (port as number) <= 65_535))
+    (port === undefined ||
+      isReference(port) ||
+      (Number.isInteger(port) && (port as number) >= 1 && (port as number) <= 65_535))
   )
 }
 
+/** A server definition (`type` is `local`, `remote` or a reference to one), as against the native map or `timeout`. */
 function isDirectServer(value: unknown): boolean {
-  return isRecord(value) && (value.type === 'local' || value.type === 'remote')
+  return isRecord(value) && (value.type === 'local' || value.type === 'remote' || isReference(value.type))
 }
 
 /** `core/src/config/normalize.ts` `isEnabledOnlyMcp`: a legacy `{enabled: false}` entry upstream omits. */
@@ -117,6 +139,15 @@ function invalid(name: string, detail: string): Result<never, McpConfigError> {
   })
 }
 
+function isHttpUrl(value: string): boolean {
+  try {
+    const {protocol} = new URL(value)
+    return protocol === 'http:' || protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
 function parseServer(name: string, value: unknown, origin: 'legacy' | 'native'): Result<McpServerV2, McpConfigError> {
   if (name.length === 0) {
     return err({kind: 'invalid-name', server: name, message: 'opencode-config mcp server names must not be empty'})
@@ -124,13 +155,18 @@ function parseServer(name: string, value: unknown, origin: 'legacy' | 'native'):
   if (!isRecord(value)) return invalid(name, 'must be an object')
 
   for (const flag of ['enabled', 'disabled', 'codemode']) {
-    if (value[flag] !== undefined && typeof value[flag] !== 'boolean') return invalid(name, `${flag} must be a boolean`)
+    if (value[flag] !== undefined && typeof value[flag] !== 'boolean' && !isReference(value[flag])) {
+      return invalid(name, `${flag} must be a boolean`)
+    }
   }
   if (value.timeout !== undefined && !isServerTimeout(value.timeout, origin)) {
     return invalid(name, 'timeout must be a positive integer of milliseconds')
   }
 
   const base = {name, namespace: mcpToolNamespace(name), origin}
+
+  // A referenced `type` is OpenCode's to resolve: which launch fields apply, and whether they are valid, follows from it.
+  if (isReference(value.type)) return ok({...base, kind: 'unresolved'})
 
   if (value.type === 'local') {
     const {command} = value
@@ -157,13 +193,8 @@ function parseServer(name: string, value: unknown, origin: 'legacy' | 'native'):
 
   if (value.type === 'remote') {
     if (typeof value.url !== 'string') return invalid(name, 'remote servers need a url string')
-    let protocol: string
-    try {
-      protocol = new URL(value.url).protocol
-    } catch {
-      return invalid(name, 'url must be an absolute http(s) URL')
-    }
-    if (protocol !== 'http:' && protocol !== 'https:') return invalid(name, 'url must be an absolute http(s) URL')
+    // A literal url is ours to check; one with a reference in it is checked by OpenCode once it is resolved.
+    if (!isReference(value.url) && !isHttpUrl(value.url)) return invalid(name, 'url must be an absolute http(s) URL')
     if (value.headers !== undefined && !isStringMap(value.headers)) {
       return invalid(name, 'headers must be an object of strings')
     }

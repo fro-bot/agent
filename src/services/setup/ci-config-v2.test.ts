@@ -652,6 +652,19 @@ describe('buildCIConfigV2', () => {
       expect(JSON.stringify(result.success && result.data.content)).not.toContain('{env:')
     })
 
+    it.each([
+      ['mcp.<name>', {docs: {type: 'remote', url: '{env:MCP_URL}'}}],
+      ['mcp.servers.<name>', {servers: {docs: {type: 'remote', url: '{env:MCP_URL}'}}}],
+      ['a whole-value {file:} url', {docs: {type: 'remote', url: '{file:./mcp-url}'}}],
+    ])('leaves a substituted mcp url to OpenCode on a provisioned run: %s', (_label, mcp) => {
+      // #given / #when
+      const result = buildWith({mcp}, 'provision')
+
+      // #then
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.content.mcp).toEqual(mcp)
+    })
+
     it('allows {env:} on a provisioned run, as today', () => {
       // #given / #when
       const result = buildWith({share: '{env:SHARE}', '{env:K}': 1}, 'provision')

@@ -887,44 +887,51 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
     // `tools.<server>.<tool>(input)`, and each inner call asks the permission action `<server>_<tool>`.
     const CALL_ECHO = {tool: 'execute', args: {code: 'return await tools.echo.say({text: "hello mcp"})'}} as const
 
-    it('runs a configured stdio server tool without an ask on a provisioned run, through the default agent', async () => {
-      // #given a local echo MCP server in opencode-config, and a model that calls its tool through Code Mode
-      const box = createSandbox()
-      sandboxes.push(box)
-      const provider = await startScriptedProvider([CALL_ECHO, {text: 'Done.'}], 'unexpected extra turn')
-      providers.push(provider)
-      const real = await startRealServer(box, provider, [], {extra: {mcp: {echo: writeEchoMcpServer(box)}}})
-      await waitForMcpConnected(real, 'echo')
-      const replies: Seen[] = []
-      const recording = {
-        ...real,
-        fetch: async (route: string, init?: RequestInit) => {
-          if (/\/permission\/[^/]+\/reply$/.test(route)) {
-            replies.push({method: init?.method ?? 'GET', path: route, body: null})
-          }
-          return real.fetch(route, init)
-        },
-      } as OpenCodeV2ServerHandle
+    it.each([
+      ['mcp.<name>', (server: object) => ({echo: server})],
+      ['mcp.servers.<name>', (server: object) => ({servers: {echo: server}})],
+    ])(
+      'runs a configured stdio server tool without an ask on a provisioned run, through the default agent: %s',
+      async (_spelling, spell) => {
+        // #given a local echo MCP server in opencode-config, and a model that calls its tool through Code Mode
+        const box = createSandbox()
+        sandboxes.push(box)
+        const provider = await startScriptedProvider([CALL_ECHO, {text: 'Done.'}], 'unexpected extra turn')
+        providers.push(provider)
+        const real = await startRealServer(box, provider, [], {extra: {mcp: spell(writeEchoMcpServer(box))}})
+        await waitForMcpConnected(real, 'echo')
+        const replies: Seen[] = []
+        const recording = {
+          ...real,
+          fetch: async (route: string, init?: RequestInit) => {
+            if (/\/permission\/[^/]+\/reply$/.test(route)) {
+              replies.push({method: init?.method ?? 'GET', path: route, body: null})
+            }
+            return real.fetch(route, init)
+          },
+        } as OpenCodeV2ServerHandle
 
-      // #when
-      const result = await executePhase(recording, box, 120_000)
+        // #when
+        const result = await executePhase(recording, box, 120_000)
 
-      // #then the tool's result came back to the model: it ran, and nothing was asked or rejected
-      expect(toolMessages(provider)).toContain('echo: hello mcp')
-      expect(toolMessages(provider)).not.toContain(AUTOMATION_REJECT_MESSAGE)
-      expect(replies).toEqual([])
-      expect(result).toMatchObject({success: true, exitCode: 0, llmError: null})
+        // #then the tool's result came back to the model: it ran, and nothing was asked or rejected
+        expect(toolMessages(provider)).toContain('echo: hello mcp')
+        expect(toolMessages(provider)).not.toContain(AUTOMATION_REJECT_MESSAGE)
+        expect(replies).toEqual([])
+        expect(result).toMatchObject({success: true, exitCode: 0, llmError: null})
 
-      // #and no rule was added for the server: the default agent runs it through its own `allow *`, and the read-only
-      // subagent (`explore` denies `*`) does not get it
-      const agents = (await (await real.fetch('/api/agent')).json()) as {
-        data: {id: string; permissions: {action: string; resource: string; effect: 'allow' | 'ask' | 'deny'}[]}[]
-      }
-      const effectFor = (id: string) =>
-        evaluatePermissionV2('echo_say', '*', agents.data.find(entry => entry.id === id)?.permissions ?? [])
-      expect(effectFor('build')).toBe('allow')
-      expect(effectFor('explore')).toBe('deny')
-    }, 300_000)
+        // #and no rule was added for the server: the default agent runs it through its own `allow *`, and the read-only
+        // subagent (`explore` denies `*`) does not get it
+        const agents = (await (await real.fetch('/api/agent')).json()) as {
+          data: {id: string; permissions: {action: string; resource: string; effect: 'allow' | 'ask' | 'deny'}[]}[]
+        }
+        const effectFor = (id: string) =>
+          evaluatePermissionV2('echo_say', '*', agents.data.find(entry => entry.id === id)?.permissions ?? [])
+        expect(effectFor('build')).toBe('allow')
+        expect(effectFor('explore')).toBe('deny')
+      },
+      300_000,
+    )
 
     describe('on a credential-withheld run the whole mcp block is removed', () => {
       const STARTED = 'started'

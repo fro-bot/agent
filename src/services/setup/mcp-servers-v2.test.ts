@@ -110,6 +110,104 @@ describe('parseMcpServersV2', () => {
     })
   })
 
+  describe('references OpenCode resolves before it reads the config', () => {
+    // OpenCode substitutes {env:} and {file:} in the config text first (`core/src/config/variable.ts`), so the format of
+    // a field that holds one is OpenCode's to check, not ours.
+    it.each([
+      ['a whole-value {env:} url', '{env:MCP_URL}'],
+      ['a whole-value {file:} url', '{file:./mcp-url}'],
+      ['a url with a reference inside it', 'https://{env:MCP_HOST}/mcp'],
+    ])('accepts %s, in both spellings', (_label, url) => {
+      // #given
+      const server = {type: 'remote', url}
+
+      // #when
+      const legacy = parseMcpServersV2({docs: server})
+      const native = parseMcpServersV2({servers: {docs: server}})
+
+      // #then
+      expect(unwrapOk(legacy)[0]).toMatchObject({kind: 'remote', url})
+      expect(unwrapOk(native)[0]).toMatchObject({kind: 'remote', url})
+    })
+
+    it('still checks the format of a literal url', () => {
+      // #given / #when / #then
+      for (const url of ['not a url', 'file:///etc/passwd', 'ftp://x.example']) {
+        expect(parseMcpServersV2({docs: {type: 'remote', url}}).success).toBe(false)
+        expect(parseMcpServersV2({servers: {docs: {type: 'remote', url}}}).success).toBe(false)
+      }
+    })
+
+    it('still checks the structure around a reference: a non-string url, a map that is not a map', () => {
+      // #given / #when / #then
+      expect(parseMcpServersV2({docs: {type: 'remote', url: 5}}).success).toBe(false)
+      expect(parseMcpServersV2({docs: {type: 'remote', url: '{env:U}', headers: ['{env:H}']}}).success).toBe(false)
+      expect(parseMcpServersV2({docs: {type: 'local', command: '{env:CMD}'}}).success).toBe(false)
+      expect(parseMcpServersV2({docs: {type: 'local', command: ['{env:CMD}', 1]}}).success).toBe(false)
+    })
+
+    it('accepts referenced command, cwd, environment and header values', () => {
+      // #given / #when
+      const result = parseMcpServersV2({
+        docs: {type: 'local', command: ['{env:NODE}', '{file:./entry}'], cwd: '{env:DIR}', environment: {A: '{env:A}'}},
+        wiki: {type: 'remote', url: 'https://x.example/mcp', headers: {'X-A': '{file:./a}'}},
+      })
+
+      // #then
+      expect(result.success).toBe(true)
+    })
+
+    it('accepts a referenced number or boolean in a field that otherwise needs one', () => {
+      // #given / #when
+      const result = parseMcpServersV2({
+        timeout: '{env:T}',
+        a: {...LOCAL, timeout: '{env:T}', enabled: '{env:E}', codemode: '{file:./c}'},
+        b: {...REMOTE, oauth: {callbackPort: '{env:PORT}'}},
+        servers: {c: {...LOCAL, timeout: {startup: '{env:T}', catalog: 2000}, disabled: '{env:D}'}},
+      })
+
+      // #then
+      expect(result.success).toBe(true)
+    })
+
+    it('passes a referenced type through as a server of unresolved kind, in every position', () => {
+      // #given: OpenCode decides what `type` is, so nothing that depends on it can be checked here
+      const unresolved = {type: '{env:KIND}', command: '{env:CMD}', url: 5}
+
+      // #when
+      const servers = unwrapOk(
+        parseMcpServersV2({
+          docs: unresolved,
+          timeout: {type: '{file:./t}', command: ['node']},
+          servers: {wiki: unresolved},
+        }),
+      )
+
+      // #then
+      expect(servers.map(server => [server.name, server.kind, server.origin])).toEqual([
+        ['docs', 'unresolved', 'legacy'],
+        ['timeout', 'unresolved', 'legacy'],
+        ['wiki', 'unresolved', 'native'],
+      ])
+    })
+
+    it('reads a referenced-type value named servers as a server, not as the native map', () => {
+      // #given / #when
+      const servers = unwrapOk(parseMcpServersV2({servers: {type: '{env:KIND}'}}))
+
+      // #then
+      expect(servers.map(server => [server.name, server.kind])).toEqual([['servers', 'unresolved']])
+    })
+
+    it('still rejects two servers that sanitize to one name when one has a referenced type', () => {
+      // #given / #when
+      const error = unwrapErr(parseMcpServersV2({'a.b': {type: '{env:K}'}, a_b: LOCAL}))
+
+      // #then
+      expect(error.kind).toBe('duplicate-name')
+    })
+  })
+
   describe('rejected shapes', () => {
     it.each([
       ['an array', []],
@@ -154,7 +252,6 @@ describe('parseMcpServersV2', () => {
       ['a negative mcp.timeout', {timeout: -5}],
       ['an mcp.timeout object with a non-numeric leaf', {timeout: {catalog: 'x'}}],
       ['an mcp.timeout array', {timeout: [1]}],
-      ['an mcp.timeout that is a substituted server definition', {timeout: {type: '{file:./t}', command: ['node']}}],
       ['a native servers value that is not a map', {servers: 'docs'}],
       ['a native server that is not an object', {servers: {docs: 1}}],
     ])('rejects %s with a named error that names the server', (_label, value) => {
@@ -237,6 +334,42 @@ describe('applyOperatorMcpV2', () => {
       // #then
       expect(result).toEqual(operator)
       expect(logger.warning).not.toHaveBeenCalled()
+    })
+
+    it('passes native-only fields through unchanged: protocol and snake_case oauth', () => {
+      // #given
+      const operator = {
+        mcp: {
+          servers: {
+            wiki: {
+              type: 'remote',
+              url: 'https://mcp.example.com/mcp',
+              protocol: '2026-07-28',
+              oauth: {client_id: 'id', client_secret: 'shh', callback_port: 19_876, redirect_uri: 'http://x/cb'},
+              timeout: {startup: 10, catalog: 20, execution: 30},
+              disabled: false,
+            },
+          },
+        },
+      }
+
+      // #when
+      const result = unwrapOk(applyOperatorMcpV2(operator, 'provision', createMockLogger()))
+
+      // #then
+      expect(result).toBe(operator)
+      expect(result).toEqual(structuredClone(operator))
+    })
+
+    it('passes a substituted url through unchanged', () => {
+      // #given
+      const operator = {mcp: {docs: {type: 'remote', url: '{env:MCP_URL}'}}}
+
+      // #when
+      const result = unwrapOk(applyOperatorMcpV2(operator, 'provision', createMockLogger()))
+
+      // #then
+      expect(result).toBe(operator)
     })
 
     it('is a no-op when the operator set no mcp', () => {
