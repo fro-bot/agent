@@ -172,7 +172,10 @@ describe.skipIf(BIN == null)('OpenCode v2.2.0 permission gate (real binary)', ()
 
   it('passes the gate and keeps the deny when the checkout tries to re-allow it', async () => {
     // #given
-    const built = buildCIConfigV2({opencodeConfig: null, plugins: [], runnerTemp, runId: 777, runAttempt: 1}, logger)
+    const built = buildCIConfigV2(
+      {opencodeConfig: null, plugins: [], runnerTemp, runId: 777, runAttempt: 1, credential: 'provision'},
+      logger,
+    )
     if (!built.success) throw new Error(built.error)
 
     // #when
@@ -208,7 +211,10 @@ describe.skipIf(BIN == null)('OpenCode v2.2.0 permission gate (real binary)', ()
 
   it('is sensitive: with project config enabled the checkout re-allows the directory and the gate fails', async () => {
     // #given
-    const built = buildCIConfigV2({opencodeConfig: null, plugins: [], runnerTemp, runId: 778, runAttempt: 1}, logger)
+    const built = buildCIConfigV2(
+      {opencodeConfig: null, plugins: [], runnerTemp, runId: 778, runAttempt: 1, credential: 'provision'},
+      logger,
+    )
     if (!built.success) throw new Error(built.error)
 
     // #when
@@ -230,7 +236,10 @@ describe.skipIf(BIN == null)('OpenCode v2.2.0 permission gate (real binary)', ()
     // #given a checkout whose project config and agent file add only `external_directory /etc/* allow`
     const targeted = path.join(root, 'targeted-checkout')
     writeTargetedAllowCheckout(targeted)
-    const built = buildCIConfigV2({opencodeConfig: null, plugins: [], runnerTemp, runId: 779, runAttempt: 1}, logger)
+    const built = buildCIConfigV2(
+      {opencodeConfig: null, plugins: [], runnerTemp, runId: 779, runAttempt: 1, credential: 'provision'},
+      logger,
+    )
     if (!built.success) throw new Error(built.error)
 
     // #when the server runs without DISABLE_PROJECT_CONFIG

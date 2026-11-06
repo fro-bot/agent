@@ -1,6 +1,6 @@
 import type {PermissionRuleV2} from '@fro-bot/runtime'
 import {evaluatePermissionV2, verifyPermissionRules} from '@fro-bot/runtime'
-import {describe, expect, it} from 'vitest'
+import {describe, expect, it, vi} from 'vitest'
 import {createMockLogger, serializeLoggerCalls, unwrapErr} from '../../shared/test-helpers.js'
 import {buildCIConfigV2} from './ci-config-v2.js'
 
@@ -14,6 +14,7 @@ const BASE_INPUTS = {
   runnerTemp: RUNNER_TEMP,
   runId: 12345,
   runAttempt: 1,
+  credential: 'provision',
 } as const
 
 function build(overrides: Partial<Parameters<typeof buildCIConfigV2>[0]> = {}) {
@@ -25,6 +26,17 @@ function build(overrides: Partial<Parameters<typeof buildCIConfigV2>[0]> = {}) {
 
 function permissionsOf(content: Readonly<Record<string, unknown>>): readonly PermissionRuleV2[] {
   return content.permissions as readonly PermissionRuleV2[]
+}
+
+function withMcp(mcp: unknown, overrides: Partial<Parameters<typeof buildCIConfigV2>[0]> = {}) {
+  return build({opencodeConfig: JSON.stringify({mcp}), ...overrides})
+}
+
+function buildWith(opencodeConfig: unknown, credential: 'provision' | 'withhold') {
+  return buildCIConfigV2(
+    {...BASE_INPUTS, credential, opencodeConfig: JSON.stringify(opencodeConfig)},
+    createMockLogger(),
+  )
 }
 
 describe('buildCIConfigV2', () => {
@@ -545,6 +557,311 @@ describe('buildCIConfigV2', () => {
       expect(buildCIConfigV2({...BASE_INPUTS, bundledSkillsDirectories: [directory]}, createMockLogger()).success).toBe(
         false,
       )
+    })
+  })
+
+  describe('{env:} references in opencode-config', () => {
+    const RULE = /\{env:\} references.*credential-withheld.*pull_request, issue_comment, issues/s
+
+    it.each([
+      ['a value', {share: '{env:SHARE}'}],
+      ['a key', {'{env:KEY}': 1}],
+      ['a key in the middle of its name', {'a{env:KEY}b': 1}],
+      ['a deeply nested value', {a: {b: [{c: {d: ['x', 'prefix {env:DEEP} suffix']}}]}}],
+      ['a nested key', {a: {b: {'{env:K}': true}}}],
+      ['an mcp header', {mcp: {docs: {type: 'remote', url: 'https://x.example', headers: {'X-A': '{env:A}'}}}}],
+    ])('fails setup on a withheld run for {env:} in %s', (_label, config) => {
+      // #given / #when
+      const result = buildWith(config, 'withhold')
+
+      // #then
+      expect(result.success).toBe(false)
+      expect(unwrapErr(result)).toMatch(RULE)
+    })
+
+    it('matches the way upstream does: after JSON decoding, so an escaped brace does not hide it', () => {
+      // #given: the text is `\u007benv:X}` in the input and `{env:X}` once the server sees our serialized config
+      const result = buildCIConfigV2(
+        {...BASE_INPUTS, credential: 'withhold', opencodeConfig: String.raw`{"share": "\u007benv:X}"}`},
+        createMockLogger(),
+      )
+
+      // #then
+      expect(result.success).toBe(false)
+    })
+
+    it('does not echo any config value in the error', () => {
+      // #given
+      const config = {share: 'secret-value-123 {env:SECRET_NAME_456}', other: 'another-value-789'}
+
+      // #when
+      const error = unwrapErr(buildWith(config, 'withhold'))
+
+      // #then
+      for (const value of ['secret-value-123', 'SECRET_NAME_456', 'another-value-789']) {
+        expect(error).not.toContain(value)
+      }
+    })
+
+    it('fails before it removes mcp: the withheld run never reaches the MCP warning', () => {
+      // #given
+      const logger = createMockLogger()
+
+      // #when
+      const result = buildCIConfigV2(
+        {
+          ...BASE_INPUTS,
+          credential: 'withhold',
+          opencodeConfig: JSON.stringify({share: '{env:X}', mcp: {docs: {type: 'local', command: ['node']}}}),
+        },
+        logger,
+      )
+
+      // #then
+      expect(result.success).toBe(false)
+      expect(logger.warning).not.toHaveBeenCalled()
+    })
+
+    it('passes on a withheld run with no {env:}, including {file:} and look-alikes', () => {
+      // #given
+      const config = {
+        share: 'disabled',
+        a: '{file:./x}',
+        b: '{ENV:X}',
+        c: '{env}',
+        d: '{ env:X}',
+        e: 'env:X',
+      }
+
+      // #when
+      const result = buildWith(config, 'withhold')
+
+      // #then
+      expect(result.success).toBe(true)
+    })
+
+    it('does not trip on the config the Action generates itself', () => {
+      // #given: the provider key files are `{file:}` references, and nothing generated is an {env:} one
+      const result = buildCIConfigV2(
+        {...BASE_INPUTS, credential: 'withhold', providerKeyFiles: {anthropic: '/tmp/keys/anthropic'}},
+        createMockLogger(),
+      )
+
+      // #then
+      expect(result.success).toBe(true)
+      expect(JSON.stringify(result.success && result.data.content)).not.toContain('{env:')
+    })
+
+    it.each([
+      ['mcp.<name>', {docs: {type: 'remote', url: '{env:MCP_URL}'}}],
+      ['mcp.servers.<name>', {servers: {docs: {type: 'remote', url: '{env:MCP_URL}'}}}],
+      ['a whole-value {file:} url', {docs: {type: 'remote', url: '{file:./mcp-url}'}}],
+    ])('leaves a substituted mcp url to OpenCode on a provisioned run: %s', (_label, mcp) => {
+      // #given / #when
+      const result = buildWith({mcp}, 'provision')
+
+      // #then
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.content.mcp).toEqual(mcp)
+    })
+
+    it('allows {env:} on a provisioned run, as today', () => {
+      // #given / #when
+      const result = buildWith({share: '{env:SHARE}', '{env:K}': 1}, 'provision')
+
+      // #then
+      expect(result.success).toBe(true)
+    })
+  })
+
+  describe('caller MCP servers (fro-bot/agent#1931)', () => {
+    const LOCAL = {type: 'local', command: ['node', 'echo.mjs'], environment: {GREETING: 'hi'}} as const
+    const REMOTE = {type: 'remote', url: 'https://mcp.example.com/mcp'} as const
+
+    it('passes a legacy map through unchanged', () => {
+      // #given / #when
+      const {content} = withMcp({docs: LOCAL, search: REMOTE})
+
+      // #then
+      expect(content.mcp).toEqual({docs: LOCAL, search: REMOTE})
+    })
+
+    it('passes the native servers map through unchanged', () => {
+      // #given
+      const mcp = {timeout: {catalog: 9000}, servers: {docs: LOCAL}}
+
+      // #when
+      const {content} = withMcp(mcp)
+
+      // #then
+      expect(content.mcp).toEqual(mcp)
+    })
+
+    it('adds no mcp key when the operator configured no server', () => {
+      // #given / #when
+      const {content} = build()
+
+      // #then
+      expect(content).not.toHaveProperty('mcp')
+    })
+
+    it('adds no permission rule for a server: the default agents allow it, the read-only subagents stay without', () => {
+      // #given / #when
+      const {content} = withMcp({docs: LOCAL, search: REMOTE})
+
+      // #then
+      expect(permissionsOf(content)).toEqual(permissionsOf(build().content))
+      expect(evaluatePermissionV2('docs_lookup', '*', permissionsOf(content))).toBe('ask')
+    })
+
+    it('still strips an operator permission rule, so the operator cannot allow an MCP tool by hand', () => {
+      // #given / #when
+      const {content} = build({
+        opencodeConfig: JSON.stringify({mcp: {docs: LOCAL}, permissions: [{action: 'docs_*', effect: 'allow'}]}),
+      })
+
+      // #then
+      expect(permissionsOf(content)).toEqual(permissionsOf(build().content))
+    })
+
+    it.each([
+      ['a non-object mcp', []],
+      ['a server of an unknown type', {docs: {type: 'sse', url: 'https://x.example'}}],
+      ['a local server with no command', {docs: {type: 'local'}}],
+      ['a remote server with a bad url', {docs: {type: 'remote', url: 'nope'}}],
+      ['a malformed recognized field', {docs: {...LOCAL, timeout: 'invalid', codemode: 'yes'}}],
+      ['a non-string environment value', {docs: {...LOCAL, environment: {A: 1}}}],
+      ['colliding sanitized names', {'a.b': LOCAL, a_b: REMOTE}],
+    ])('fails setup for %s', (_label, mcp) => {
+      // #given / #when
+      const result = buildCIConfigV2({...BASE_INPUTS, opencodeConfig: JSON.stringify({mcp})}, createMockLogger())
+
+      // #then
+      expect(result.success).toBe(false)
+      expect(unwrapErr(result)).toMatch(/mcp/i)
+    })
+
+    it('names the server and field in a shape error', () => {
+      // #given / #when
+      const result = buildCIConfigV2(
+        {...BASE_INPUTS, opencodeConfig: JSON.stringify({mcp: {docs: {type: 'local', command: []}}})},
+        createMockLogger(),
+      )
+
+      // #then
+      expect(unwrapErr(result)).toBe(
+        'opencode-config mcp server "docs": local servers need a non-empty command array of strings',
+      )
+    })
+
+    describe('on a credential-withheld trigger', () => {
+      it('removes the whole mcp key, with one warning naming the servers', () => {
+        // #given / #when
+        const {content, logger} = withMcp({docs: LOCAL, wiki: REMOTE}, {credential: 'withhold'})
+
+        // #then
+        expect(content).not.toHaveProperty('mcp')
+        const warnings = vi.mocked(logger.warning).mock.calls.map(call => String(call[0]))
+        expect(warnings.filter(text => text.includes('MCP servers are not run'))).toHaveLength(1)
+        expect(warnings.join('\n')).toContain('docs, wiki')
+      })
+
+      it('removes a native-shape block and keeps the other operator keys', () => {
+        // #given / #when
+        const {content} = build({
+          credential: 'withhold',
+          opencodeConfig: JSON.stringify({mcp: {servers: {docs: LOCAL}}, share: 'disabled'}),
+        })
+
+        // #then
+        expect(content).not.toHaveProperty('mcp')
+        expect(content.share).toBe('disabled')
+      })
+
+      it('removes a block that would not parse, instead of failing setup', () => {
+        // #given / #when
+        const result = buildCIConfigV2(
+          {
+            ...BASE_INPUTS,
+            credential: 'withhold',
+            opencodeConfig: JSON.stringify({mcp: {timeout: {type: '{file:./t}', command: ['node']}}}),
+          },
+          createMockLogger(),
+        )
+
+        // #then
+        expect(result.success).toBe(true)
+        expect(result.success && result.data.content).not.toHaveProperty('mcp')
+      })
+
+      it('removes a top-level key whose name is a file reference, which could resolve to mcp', () => {
+        // #given / #when
+        const {content} = build({
+          credential: 'withhold',
+          opencodeConfig: JSON.stringify({'{file:./key}': {docs: LOCAL}, share: 'disabled'}),
+        })
+
+        // #then
+        expect(JSON.stringify(content)).not.toContain('{file:./key}')
+        expect(content.share).toBe('disabled')
+      })
+
+      it('logs no configured value', () => {
+        // #given
+        const mcp = {
+          docs: {type: 'local', command: ['node', '/opt/secret-tool.mjs'], environment: {SECRET_VALUE: 'env-value-1'}},
+          authed: {
+            type: 'remote',
+            url: 'https://mcp.example.com/mcp',
+            headers: {Authorization: 'Bearer header-value-2', 'X-Session': '{file:./secret}'},
+          },
+        }
+
+        // #when
+        const {logger} = withMcp(mcp, {credential: 'withhold'})
+
+        // #then
+        const logged = serializeLoggerCalls(logger)
+        for (const value of ['/opt/secret-tool', 'env-value-1', 'header-value-2', './secret', 'Authorization']) {
+          expect(logged).not.toContain(value)
+        }
+      })
+
+      it('leaves the permission rules as they are without servers', () => {
+        // #given / #when
+        const {content} = withMcp({docs: LOCAL}, {credential: 'withhold'})
+
+        // #then
+        expect(permissionsOf(content)).toEqual(permissionsOf(build().content))
+      })
+    })
+
+    it('keeps a local server and a credentialed remote server on a provisioned trigger', () => {
+      // #given
+      const mcp = {docs: LOCAL, authed: {...REMOTE, headers: {Authorization: 'Bearer abc'}}}
+
+      // #when
+      const {content, logger} = withMcp(mcp, {credential: 'provision'})
+
+      // #then
+      expect(content.mcp).toEqual(mcp)
+      expect(vi.mocked(logger.warning)).not.toHaveBeenCalled()
+    })
+
+    it('leaves the real permission gate passing with servers configured', async () => {
+      // #given
+      const {content, expectations} = withMcp({docs: LOCAL, wiki: REMOTE})
+      const agents = [{id: 'build', permissions: permissionsOf(content)}]
+
+      // #when
+      const result = await verifyPermissionRules(
+        {listAgents: async () => ({location: {}, data: agents})},
+        expectations,
+        createMockLogger(),
+      )
+
+      // #then
+      expect(result.success).toBe(true)
     })
   })
 })

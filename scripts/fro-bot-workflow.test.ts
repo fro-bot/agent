@@ -1035,6 +1035,31 @@ describe('example workflow — maintenance concurrency', () => {
   })
 })
 
+describe('fro-bot workflow — session-store queueing', () => {
+  it('queues the fro-bot job on the S3 session store while keeping the per-target workflow group', () => {
+    // #given the workflow and the fro-bot job
+    const workflow = loadRawWorkflow(WORKFLOW_PATH)
+    const job = rawJob(WORKFLOW_PATH, 'fro-bot')
+
+    // #then the job queues on the shared session-store group instead of declining on the lease
+    expect(job.concurrency).toStrictEqual({
+      group: 'fro-bot-action-session-store',
+      'cancel-in-progress': false,
+      queue: 'max',
+    })
+
+    // #then the workflow-level per-target group is unchanged
+    const workflowConcurrency = workflow.concurrency as {readonly group: string; readonly 'cancel-in-progress': boolean}
+    const group = workflowConcurrency.group.replaceAll(/\s+/g, ' ')
+    expect(group).toContain('fro-bot-${{')
+    expect(group).toContain('github.event.issue.number')
+    expect(group).toContain('github.event.pull_request.number')
+    expect(group).toContain('github.event.discussion.number')
+    expect(group).toContain('github.run_id')
+    expect(workflowConcurrency['cancel-in-progress']).toBe(false)
+  })
+})
+
 // The #1598 runtime-verification sweep is a temporary addition to the daily maintenance prompt.
 // It grants the schedule run exactly one extra mutable issue and nothing else, so these tests pin
 // the bounds that keep it from becoming a general-purpose issue-editing licence.

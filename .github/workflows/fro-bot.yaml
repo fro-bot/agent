@@ -278,6 +278,11 @@ env:
 
 jobs:
   fro-bot:
+    # All jobs that write this repo's S3 session store queue here instead of declining on the lease.
+    concurrency:
+      group: fro-bot-action-session-store
+      cancel-in-progress: false
+      queue: max
     if: >-
       (
         github.event.pull_request == null ||

@@ -25,7 +25,7 @@ export function buildContinuationPrompt(error: ErrorInfo, credentialProvisioned:
   ].join('\n')
 }
 
-const resolvePromptModel = (config: ExecutionConfig | undefined): {providerID: string; modelID: string} | undefined => {
+const resolvePromptModel = (config: ExecutionConfig | undefined): {providerID: string; modelID: string} => {
   if (config?.model != null) return {providerID: config.model.providerID, modelID: config.model.modelID}
   return {providerID: DEFAULT_MODEL.providerID, modelID: DEFAULT_MODEL.modelID}
 }
@@ -68,9 +68,7 @@ export async function sendPromptToSession(
     agent?: string
     model?: {providerID: string; modelID: string}
     parts: (TextPartInput | FilePartInput)[]
-  } = {parts}
-  const model = resolvePromptModel(config)
-  if (model != null) body.model = model
+  } = {parts, model: resolvePromptModel(config)}
   const agentName = config?.agent ?? null
   if (agentName != null) body.agent = agentName
 
