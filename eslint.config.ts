@@ -34,6 +34,14 @@ export default defineConfig(
     },
   },
   {
+    // Systematic parses its config without trailing-comma support (marcusrbrown/systematic#1313).
+    name: 'systematic config overrides',
+    files: ['.systematic.jsonc'],
+    rules: {
+      'prettier/prettier': ['error', {trailingComma: 'none'}],
+    },
+  },
+  {
     name: 'deploy/scripts plain-Node-ESM overrides',
     files: ['deploy/scripts/**/*.mjs'],
     rules: {

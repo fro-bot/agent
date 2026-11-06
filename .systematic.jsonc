@@ -6,7 +6,7 @@
     "sources": [
       {"name": "rfcs", "format": "markdown", "roots": ["RFCs"]},
       {"name": "decisions", "format": "markdown", "roots": ["docs/decisions"]},
-      {"name": "wiki", "format": "markdown", "roots": ["docs/wiki"]},
-    ],
-  },
+      {"name": "wiki", "format": "markdown", "roots": ["docs/wiki"]}
+    ]
+  }
 }
