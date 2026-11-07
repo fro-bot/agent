@@ -13,6 +13,8 @@
  */
 
 import type {StdioOptions} from 'node:child_process'
+import type {SupervisedStatusRef} from './opencode-server-v2.js'
+import type {Logger} from './types.js'
 
 import {spawn as nodeSpawnRaw} from 'node:child_process'
 import process from 'node:process'
@@ -30,12 +32,6 @@ import {
   AGENT_XDG_STATE_HOME,
   OPENCODE_EXECUTABLE_PATH,
 } from './identity.js'
-
-export interface Logger {
-  readonly info: (msg: string, meta?: Record<string, unknown>) => void
-  readonly warn: (msg: string, meta?: Record<string, unknown>) => void
-  readonly error: (msg: string, meta?: Record<string, unknown>) => void
-}
 
 /** Minimal child process handle used by this module. */
 export interface ChildHandle {
@@ -453,14 +449,6 @@ export async function startOpencodeServer(options: StartOpencodeServerOptions): 
   // Timeout reached — reap the whole process group and throw.
   killChildGroup(child)
   throw new Error(`opencode server did not become ready within ${readyTimeoutMs}ms`)
-}
-
-/** OpenCode status values (mirrors server.ts OpencodeStatus + degraded). */
-export type SupervisedOpencodeStatus = 'starting' | 'ready' | 'down' | 'degraded'
-
-/** Mutable status reference updated by the supervisor. */
-export interface SupervisedStatusRef {
-  status: SupervisedOpencodeStatus
 }
 
 export interface RunSupervisedOpencodeOptions {

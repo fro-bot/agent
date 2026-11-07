@@ -34,9 +34,8 @@
  *    never forwarded, and only the method is logged.
  */
 
-import type {OpencodeProxyHandle} from './opencode-proxy.js'
 import type {UpstreamCredentials} from './opencode-server-v2.js'
-import type {Logger} from './opencode-server.js'
+import type {Logger} from './types.js'
 
 import {Buffer} from 'node:buffer'
 import {timingSafeEqual} from 'node:crypto'
@@ -149,6 +148,15 @@ export interface OpencodeProxyV2Options {
    * 30000 if unset.
    */
   readonly timeoutMs?: number
+}
+
+export interface OpencodeProxyHandle {
+  /** The underlying Node http.Server. */
+  readonly server: http.Server
+  /** Bind the server to a port and start listening. */
+  readonly listen: (port: number, hostname: string) => Promise<void>
+  /** Close the proxy server. */
+  readonly close: () => Promise<void>
 }
 
 /** Create the V2 proxy. The handle is the V1 handle, so `main.ts` drives either the same way. */

@@ -12,7 +12,7 @@
 import type {OpenCodeServerHandle} from '@fro-bot/runtime'
 import type {GatewayLogger} from '../discord/client.js'
 import type {DiscordStreamSink} from '../discord/streaming.js'
-import type {RunCoreError} from './run-core.js'
+import type {RunCoreError} from './run-core-shared.js'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
 import {createPermissionCoordinator} from '../approvals/coordinator.js'

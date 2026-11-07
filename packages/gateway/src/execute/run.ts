@@ -26,7 +26,7 @@ import type {LaunchAdmission, LaunchWorkRequest, PostReplyFactory, ReplySink, St
 import type {CheckoutPreparation, CheckoutProvenance} from './provenance.js'
 import type {ChannelQueue} from './queue.js'
 import type {RepoQuiescenceChecker} from './repo-quiescence.js'
-import type {RunCoreErrorKind} from './run-core.js'
+import type {RunCoreErrorKind} from './run-core-shared.js'
 import type {RunIndex} from './run-index.js'
 
 import {
@@ -91,9 +91,10 @@ import {
 } from './provenance.js'
 import {createFormDirectoryV2, createQuestionEffectsV2} from './question-client-v2.js'
 import {createQuestionEffects} from './question-client.js'
-import {QUARANTINE_HOLD_WINDOW_MS} from './root-stop.js'
+import {QUARANTINE_HOLD_WINDOW_MS} from './root-stop-v2.js'
+import {RunCoreError} from './run-core-shared.js'
 import {runOpenCodeCoreV2} from './run-core-v2.js'
-import {RunCoreError, runOpenCodeCore} from './run-core.js'
+import {runOpenCodeCore} from './run-core.js'
 import {toRuntimeLogger} from './runtime-logger.js'
 import {TERMINAL_WRITE_RETRY, transitionRetryingStaleEtag} from './stale-etag-transition.js'
 

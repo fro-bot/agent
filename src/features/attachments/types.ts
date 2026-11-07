@@ -4,10 +4,9 @@
  * @module attachments/types
  */
 
-// Import SDK types directly - DO NOT duplicate
-import type {FilePartInput, TextPartInput} from '@opencode-ai/sdk'
+// The prompt part shapes are owned by the runtime package; re-exported here for attachment callers.
+import type {FilePartInput, TextPartInput} from '@fro-bot/runtime'
 
-// Re-export SDK types for convenience
 export type {FilePartInput, TextPartInput}
 
 /**

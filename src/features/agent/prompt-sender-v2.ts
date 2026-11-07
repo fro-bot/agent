@@ -1,13 +1,14 @@
 import type {ActionOpenCodeV2Client, OwnershipLedger, V2CallError, V2PromptFile} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
+import type {AttemptOutcome, AttemptResult} from './attempt-outcome.js'
+import type {ExecutionDeadline} from './execution-deadline.js'
 import type {AttemptResultV2} from './live-observation-v2.js'
-import type {AttemptOutcome, AttemptResult} from './prompt-sender.js'
 import type {RunPromptAttemptV2Options} from './retry-v2.js'
-import type {ExecutionDeadline} from './retry.js'
 import type {FormAskedResponderV2, PermissionAskedResponderV2} from './streaming-v2.js'
 import {createAgentError, createLLMFetchError} from '@fro-bot/runtime'
+import {shouldRetryFromOutcome} from './attempt-outcome.js'
+import {createDeadlineExceededError} from './execution-deadline.js'
 import {runPromptAttemptV2} from './retry-v2.js'
-import {createDeadlineExceededError, shouldRetryFromOutcome} from './retry.js'
 
 /**
  * Prompt submission on OpenCode V2: the sibling of `prompt-sender.ts`.

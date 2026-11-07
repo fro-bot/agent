@@ -15,12 +15,12 @@ import type {OpenCodeServerHandle} from '@fro-bot/runtime'
 import type {PermissionCoordinator} from '../approvals/coordinator.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {DiscordStreamSink} from '../discord/streaming.js'
-import type {RunCoreError} from './run-core.js'
-import {getEventListeners} from 'node:events'
+import type {RunCoreError} from './run-core-shared.js'
 import {createOwnershipLedger, createRemoteOpenCodeHandle} from '@fro-bot/runtime'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
-import {awaitFirstEvent, EVENT_STREAM_CONNECT_TIMEOUT_MS, runOpenCodeCore} from './run-core.js'
+import {EVENT_STREAM_CONNECT_TIMEOUT_MS} from './run-core-shared.js'
+import {runOpenCodeCore} from './run-core.js'
 
 const ROOT = 'sess-123'
 const DIRECTORY = '/workspace/repo'
@@ -640,48 +640,5 @@ describe('runOpenCodeCore — the barrier through the real SDK SSE client', () =
     expect(run.promptAsync).not.toHaveBeenCalled()
     expect(run.abort).not.toHaveBeenCalled()
     expect(requestSignal?.aborted).toBe(true)
-  })
-})
-
-describe('awaitFirstEvent — hygiene on the run signal', () => {
-  afterEach(() => {
-    vi.useRealTimers()
-  })
-
-  it('leaves no abort listener and no timer behind, whichever way the wait ends', async () => {
-    // #given a long-lived signal
-    vi.useFakeTimers()
-    const controller = new AbortController()
-    const frame = (): AsyncIterator<unknown> => ({next: async () => ({done: false, value: connected()})})
-    const ended = (): AsyncIterator<unknown> => ({next: async () => ({done: true, value: undefined})})
-    const failing = (): AsyncIterator<unknown> => ({
-      next: async () => {
-        throw new Error('boom')
-      },
-    })
-    const silent = (): AsyncIterator<unknown> => ({next: async () => new Promise<never>(() => {})})
-
-    // #when the wait ends by a frame, an end, an error and a timeout
-    expect(await awaitFirstEvent(frame(), controller.signal, 1_000)).toMatchObject({kind: 'frame'})
-    expect(await awaitFirstEvent(ended(), controller.signal, 1_000)).toEqual({kind: 'ended'})
-    expect(await awaitFirstEvent(failing(), controller.signal, 1_000)).toMatchObject({kind: 'error'})
-    const pending = awaitFirstEvent(silent(), controller.signal, 1_000)
-    await vi.advanceTimersByTimeAsync(1_000)
-    expect(await pending).toEqual({kind: 'timeout'})
-
-    // #then nothing is left on the signal, and no timer is armed
-    expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0)
-    expect(vi.getTimerCount()).toBe(0)
-  })
-
-  it('settles at once on a signal that is already aborted, without reading', async () => {
-    // #given
-    const controller = new AbortController()
-    controller.abort()
-    const next = vi.fn(async () => ({done: false as const, value: connected()}))
-
-    // #when / #then
-    expect(await awaitFirstEvent({next}, controller.signal, 1_000)).toEqual({kind: 'aborted'})
-    expect(next).not.toHaveBeenCalled()
   })
 })

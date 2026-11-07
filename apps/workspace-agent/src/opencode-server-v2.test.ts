@@ -4,8 +4,8 @@ import type {
   StartOpenCodeV2ServerOptions,
 } from '@fro-bot/runtime/workspace-v2'
 import type {SpawnConfig} from './opencode-credentials-v2.js'
-import type {RunSupervisedOpencodeV2Options} from './opencode-server-v2.js'
-import type {Logger, SupervisedStatusRef} from './opencode-server.js'
+import type {RunSupervisedOpencodeV2Options, SupervisedStatusRef} from './opencode-server-v2.js'
+import type {Logger} from './types.js'
 
 import {mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync} from 'node:fs'
 import os from 'node:os'

@@ -1,6 +1,5 @@
-import type {FilePartInput} from '@opencode-ai/sdk'
 import type {Logger} from '../shared/logger.js'
-import type {ReferenceFile} from './types.js'
+import type {FilePartInput, ReferenceFile} from './types.js'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import {pathToFileURL} from 'node:url'

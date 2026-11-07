@@ -26,7 +26,7 @@ import {
   type EventPipe,
 } from './execution-v2.fixture.js'
 import {cancelFormV2, executeOpenCodeV2, interruptRootSession, replyToPermissionAskV2} from './execution-v2.js'
-import {EVENT_STREAM_CONNECT_TIMEOUT_MS, MAX_LLM_RETRIES, RETRY_DELAYS_MS} from './retry.js'
+import {EVENT_STREAM_CONNECT_TIMEOUT_MS, MAX_LLM_RETRIES, RETRY_DELAYS_MS} from './retry-v2.js'
 
 const consoleMock = vi.hoisted(() => ({outputTextContent: vi.fn(), outputToolExecution: vi.fn()}))
 vi.mock('../../shared/console.js', () => consoleMock)

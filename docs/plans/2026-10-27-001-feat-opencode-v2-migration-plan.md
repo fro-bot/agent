@@ -322,7 +322,7 @@ install pinned binary (digest) -> install both plugins (bounded) -> write creden
 
 ### Phase 1: Evidence
 
-- [ ] **Unit 1: One-off V2 probes**
+- [x] **Unit 1: One-off V2 probes**
 
 **Goal:** Establish the V2 behaviours later units depend on, against the pinned v2.2.0 release. Results are posted to #1805 and not committed as repo code.
 
@@ -368,7 +368,7 @@ install pinned binary (digest) -> install both plugins (bounded) -> write creden
 
 ### Phase 2: Shared V2 pieces (no behaviour change on main)
 
-- [ ] **Unit 2: Pinned stock V2 binary with recorded digest**
+- [x] **Unit 2: Pinned stock V2 binary with recorded digest**
 
 **Goal:** A V2 pin installs only a digest-verified stock asset. There is no fallback version and no fail-open path.
 
@@ -406,7 +406,7 @@ install pinned binary (digest) -> install both plugins (bounded) -> write creden
 
 - A V2 pin can't install without a digest match. V1 behaviour is unchanged.
 
-- [ ] **Unit 3: V2 server spawn, auth, gates and shutdown (runtime)**
+- [x] **Unit 3: V2 server spawn, auth, gates and shutdown (runtime)**
 
 **Goal:** One runtime function spawns a V2 server, authenticates to it, gates on plugins, and shuts it down without leaving resumable work.
 
@@ -445,7 +445,7 @@ install pinned binary (digest) -> install both plugins (bounded) -> write creden
 
 - Nothing calls this module yet. Its own tests pass, and the V1 server path is untouched.
 
-- [ ] **Unit 4: V2 event mapper, ledger adapter and subagent notices (runtime)**
+- [x] **Unit 4: V2 event mapper, ledger adapter and subagent notices (runtime)**
 
 **Goal:** Shared V2 primitives that both run loops consume.
 
@@ -492,7 +492,7 @@ install pinned binary (digest) -> install both plugins (bounded) -> write creden
 
 - The domain union covers every event the V1 loops act on today.
 
-- [ ] **Unit 5: V2 config builder and permission gate**
+- [x] **Unit 5: V2 config builder and permission gate**
 
 **Goal:** CI and workspace config in V2 shape, with fail-closed outside-access checks against the effective rules.
 
@@ -537,7 +537,7 @@ install pinned binary (digest) -> install both plugins (bounded) -> write creden
 
 - The V1 `buildCIConfig` and its tests are unchanged.
 
-- [ ] **Unit 6: `@fro.bot/opencode-plugin` package**
+- [x] **Unit 6: `@fro.bot/opencode-plugin` package**
 
 **Goal:** A V2 plugin that provides the session tools and the task-reuse guard, published to npm at an exact version.
 
@@ -580,7 +580,7 @@ install pinned binary (digest) -> install both plugins (bounded) -> write creden
 
 ### Phase 3: Gateway and workspace
 
-- [ ] **Unit 7: Workspace on V2**
+- [x] **Unit 7: Workspace on V2**
 
 **Goal:** The workspace image can run stock V2 behind the bearer proxy.
 
@@ -620,7 +620,7 @@ install pinned binary (digest) -> install both plugins (bounded) -> write creden
 
 - With the version unset or set to V1, the image and the workspace-agent behave exactly as today.
 
-- [ ] **Unit 8: Gateway V2 run loop**
+- [x] **Unit 8: Gateway V2 run loop**
 
 **Goal:** The gateway runs mentions against a V2 workspace with the same stop, approval, cancel and drain behaviour as V1.
 
@@ -668,7 +668,7 @@ install pinned binary (digest) -> install both plugins (bounded) -> write creden
 
 - Every V1 gateway behaviour test that covers a parity item (R7) has a V2 counterpart that passes.
 
-- [ ] **Unit 9: Gateway and workspace switch**
+- [x] **Unit 9: Gateway and workspace switch**
 
 **Goal:** Production gateway and workspace run V2 together.
 
@@ -696,7 +696,7 @@ install pinned binary (digest) -> install both plugins (bounded) -> write creden
 
 ### Phase 4: Action
 
-- [ ] **Unit 10: V2 session key name and restore precedence**
+- [x] **Unit 10: V2 session key name and restore precedence**
 
 **Goal:** The Action saves V2 sessions under their own key name and restores V2 data before V1 data at each step.
 
@@ -735,7 +735,7 @@ install pinned binary (digest) -> install both plugins (bounded) -> write creden
 
 - Behaviour on the V1 path is unchanged, and existing restore and save tests pass unedited.
 
-- [ ] **Unit 11: Action V2 setup, spawn and import wait**
+- [x] **Unit 11: Action V2 setup, spawn and import wait**
 
 **Goal:** A V2 Action run installs and starts a gated V2 server with its credentials on a clean restored database, and doesn't prompt until the V1 import finishes.
 
@@ -791,7 +791,7 @@ install pinned binary (digest) -> install both plugins (bounded) -> write creden
 
 - The V1 pin path is unchanged.
 
-- [ ] **Unit 12a: Action V2 execution loop**
+- [x] **Unit 12a: Action V2 execution loop**
 
 **Goal:** The Action runs a prompt to completion on V2 with today's behaviour.
 
@@ -834,7 +834,7 @@ install pinned binary (digest) -> install both plugins (bounded) -> write creden
 
 - Every V1 Action behaviour test that covers a parity item has a V2 counterpart that passes.
 
-- [ ] **Unit 12b: Action V2 release and drain**
+- [x] **Unit 12b: Action V2 release and drain**
 
 **Goal:** A V2 Action run releases only once nothing it started can still wake a session, and shuts down so the saved database is quiet.
 
@@ -874,7 +874,7 @@ install pinned binary (digest) -> install both plugins (bounded) -> write creden
 
 - A background child or shell started by a run never outlives the saved database.
 
-- [ ] **Unit 13: Action switch**
+- [x] **Unit 13: Action switch**
 
 **Goal:** The Action defaults to V2 and ships as a breaking 0.x minor.
 
@@ -907,6 +907,8 @@ install pinned binary (digest) -> install both plugins (bounded) -> write creden
 ### Phase 5: Cut V1
 
 - [ ] **Unit 14: Delete V1 code and V1 session data**
+
+> Superseded by `docs/plans/2026-11-07-001-refactor-opencode-v1-removal-plan.md`.
 
 **Goal:** Only V2 code paths remain.
 
@@ -941,6 +943,8 @@ install pinned binary (digest) -> install both plugins (bounded) -> write creden
 - No `@opencode-ai/sdk` import remains, and the full gates pass.
 
 - [ ] **Unit 15: Retire the harness**
+
+> Superseded by `docs/plans/2026-11-07-001-refactor-opencode-v1-removal-plan.md`.
 
 **Goal:** Remove the harness package and its pipeline.
 

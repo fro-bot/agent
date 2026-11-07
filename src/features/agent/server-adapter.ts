@@ -5,11 +5,8 @@ import {
   bootstrapOpenCodeServer as bootstrapRuntimeOpenCodeServer,
   ensureOpenCodeAvailable as ensureRuntimeOpenCodeAvailable,
 } from '@fro-bot/runtime'
-import {
-  defaultOpenCodeConfigDir,
-  taskReuseGuardServerConfig,
-  writeNoTaskReuseFile,
-} from '../../services/setup/no-task-reuse-config.js'
+import {taskReuseGuardServerConfig, writeNoTaskReuseFile} from '../../services/setup/no-task-reuse-config.js'
+import {defaultOpenCodeConfigDir} from '../../services/setup/opencode-config-dir.js'
 import {runtimeSetupAdapter} from '../../services/setup/runtime-setup-adapter.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {err} from '../../shared/types.js'

@@ -1,8 +1,7 @@
 import type {ActionOpenCodeV2Client, ErrorInfo, OpenCodeV2ServerHandle, OwnershipLedger} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
 import type {AgentResultV2, AttemptResultV2, LiveObservationV2} from './live-observation-v2.js'
-import type {FormAskV2, PermissionAskV2} from './streaming-v2.js'
-import type {EventStreamResult} from './streaming.js'
+import type {EventStreamResult, FormAskV2, PermissionAskV2} from './streaming-v2.js'
 import type {AgentResult, ExecutionConfig, PromptOptions} from './types.js'
 import * as crypto from 'node:crypto'
 import * as fs from 'node:fs/promises'
@@ -23,11 +22,12 @@ import {
   isOpenCodePromptArtifactEnabled,
 } from '../../shared/env.js'
 import {toErrorMessage} from '../../shared/errors.js'
+import {createExecutionDeadline} from './execution-deadline.js'
 import {sendPromptToSessionV2} from './prompt-sender-v2.js'
 import {buildAgentPrompt} from './prompt.js'
 import {materializeReferenceFiles} from './reference-files.js'
-import {createExecutionDeadline, MAX_LLM_RETRIES, RETRY_DELAYS_MS} from './retry.js'
-import {waitForAbortableDelay} from './session-poll.js'
+import {MAX_LLM_RETRIES, RETRY_DELAYS_MS} from './retry-v2.js'
+import {waitForAbortableDelay} from './session-poll-v2.js'
 import {collectRunUsageV2, readSessionUsageV2, type SessionUsageV2} from './usage-v2.js'
 
 const SESSION_INTERRUPT_TIMEOUT_MS = 2_000

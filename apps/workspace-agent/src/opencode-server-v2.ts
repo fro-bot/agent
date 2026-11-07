@@ -25,7 +25,7 @@
 
 import type {OpenCodeV2ServerHandle, Logger as RuntimeLogger} from '@fro-bot/runtime/workspace-v2'
 import type {CredentialResult, ProviderKeyEntry, SpawnConfig} from './opencode-credentials-v2.js'
-import type {Logger, SupervisedStatusRef} from './opencode-server.js'
+import type {Logger} from './types.js'
 import {chmod, mkdir, mkdtemp, chown as nodeChown, rm} from 'node:fs/promises'
 import path from 'node:path'
 import process from 'node:process'
@@ -63,6 +63,14 @@ import {
   spawnConfigFromMergedConfig,
   verifyCredentialGate,
 } from './opencode-credentials-v2.js'
+
+/** OpenCode status values (mirrors server.ts OpencodeStatus + degraded). */
+export type SupervisedOpencodeStatus = 'starting' | 'ready' | 'down' | 'degraded'
+
+/** Mutable status reference updated by the supervisor. */
+export interface SupervisedStatusRef {
+  status: SupervisedOpencodeStatus
+}
 
 /**
  * Where per-spawn database directories live. Root-owned and never agent-writable: the service creates it, so a

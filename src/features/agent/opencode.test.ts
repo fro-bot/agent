@@ -1,6 +1,6 @@
 import type {Event} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
-import type {ExecutionDeadline} from './retry.js'
+import type {ExecutionDeadline} from './execution-deadline.js'
 import type {OpenCodeServerHandle} from './server-adapter.js'
 import type {ExecutionConfig, PromptOptions} from './types.js'
 import * as fs from 'node:fs/promises'
@@ -11,7 +11,7 @@ import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import * as envUtils from '../../shared/env.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {executeOpenCode} from './execution.js'
-import {INITIAL_ACTIVITY_TIMEOUT_MS, pollForSessionCompletion, waitForEventProcessorShutdown} from './session-poll.js'
+import {INITIAL_ACTIVITY_TIMEOUT_MS, pollForSessionCompletion} from './session-poll.js'
 import {logServerEvent, processEventStream, type ActivityTracker} from './streaming.js'
 
 // Mock node:fs/promises
@@ -3282,36 +3282,6 @@ describe('pollForSessionCompletion', () => {
   })
 })
 
-describe('waitForEventProcessorShutdown', () => {
-  it('resolves when processor completes quickly', async () => {
-    // #given
-    const processor = Promise.resolve()
-
-    // #when / #then
-    await expect(waitForEventProcessorShutdown(processor, 5000)).resolves.toBeUndefined()
-  })
-
-  it('resolves after timeout when processor hangs', async () => {
-    // #given
-    const processor = new Promise<void>(() => {
-      // intentionally never resolves
-    })
-    vi.useFakeTimers()
-
-    // #when
-    const start = Date.now()
-    const waitPromise = waitForEventProcessorShutdown(processor, 100)
-    await vi.advanceTimersByTimeAsync(150)
-    await waitPromise
-    const elapsed = Date.now() - start
-    vi.useRealTimers()
-
-    // #then
-    expect(elapsed).toBeGreaterThanOrEqual(90)
-    expect(elapsed).toBeLessThan(1000)
-  })
-})
-
 describe('processEventStream', () => {
   it('responds to a current-session permission ask using the properties request id', async () => {
     // #given a permission ask whose envelope id differs from the request id
@@ -5684,7 +5654,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
 
   it('collects results from and tears down a keep-open SSE stream for each attempt', async () => {
     // #given — the SSE stream only closes when its attempt-local subscription signal aborts
-    const {createExecutionDeadline} = await import('./retry.js')
+    const {createExecutionDeadline} = await import('./execution-deadline.js')
     const {sendPromptToSession} = await import('./prompt-sender.js')
     const deadline = createExecutionDeadline(10_000, mockLogger)
     let subscriptionSignal: AbortSignal | undefined
@@ -6030,7 +6000,7 @@ describe('runPromptAttempt with v2.session.wait()', () => {
     // #given — a deadline-aware poll whose first interval completes normally
     vi.useFakeTimers()
     try {
-      const {createExecutionDeadline} = await import('./retry.js')
+      const {createExecutionDeadline} = await import('./execution-deadline.js')
       const pollSignalController = new AbortController()
       const addListener = vi.spyOn(pollSignalController.signal, 'addEventListener')
       const removeListener = vi.spyOn(pollSignalController.signal, 'removeEventListener')

@@ -1,6 +1,5 @@
-import type {AttemptResult} from './prompt-sender.js'
-import type {ActivityTrackerV2} from './streaming-v2.js'
-import type {EventStreamResult} from './streaming.js'
+import type {AttemptResult} from './attempt-outcome.js'
+import type {ActivityTrackerV2, EventStreamResult} from './streaming-v2.js'
 import type {AgentResult} from './types.js'
 import type {RunUsageV2} from './usage-v2.js'
 

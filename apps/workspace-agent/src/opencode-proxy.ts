@@ -28,7 +28,8 @@
  * request body, any header, or the query string (which carries the workspace directory).
  */
 
-import type {Logger} from './opencode-server.js'
+import type {OpencodeProxyHandle} from './opencode-proxy-v2.js'
+import type {Logger} from './types.js'
 
 import {Buffer} from 'node:buffer'
 import {timingSafeEqual} from 'node:crypto'
@@ -124,15 +125,6 @@ export interface OpencodeProxyOptions {
    * Defaults to `WORKSPACE_PROXY_TIMEOUT_MS` env var, or 30000ms if unset.
    */
   readonly timeoutMs?: number
-}
-
-export interface OpencodeProxyHandle {
-  /** The underlying Node http.Server. */
-  readonly server: http.Server
-  /** Bind the server to a port and start listening. */
-  readonly listen: (port: number, hostname: string) => Promise<void>
-  /** Close the proxy server. */
-  readonly close: () => Promise<void>
 }
 
 /**

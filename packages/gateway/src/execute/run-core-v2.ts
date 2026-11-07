@@ -48,9 +48,9 @@ import type {TerminalListener} from '../approvals/request-gate.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {DrainCompletionV2} from './drain-completion-v2.js'
 import type {ExtractedToolPart} from './format-part.js'
-import type {ProviderFailure, ProviderFailureReason} from './provider-failure.js'
+import type {ProviderFailure, ProviderFailureReason} from './provider-failure-v2.js'
 import type {FormDirectoryV2} from './question-client-v2.js'
-import type {CoreStreamSink, RunCoreErrorKind} from './run-core.js'
+import type {CoreStreamSink, RunCoreErrorKind} from './run-core-shared.js'
 import {
   createDirectoryStabilityGate,
   createDrainProgress,
@@ -88,7 +88,7 @@ import {
   resumeWith,
   RunCoreError,
   wrapLedgerWithHooks,
-} from './run-core.js'
+} from './run-core-shared.js'
 import {toRuntimeLogger} from './runtime-logger.js'
 import {settleOwnedSessionsV2} from './settle-owned-sessions-v2.js'
 import {createTextBoundaryTracker} from './text-boundary.js'

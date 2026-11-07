@@ -5,8 +5,8 @@
 
 import type {CreateAppFn, ExitFn} from './main.js'
 import type {CreateInstanceDisposerV2Options} from './opencode-instance-v2.js'
-import type {OpencodeProxyV2Options} from './opencode-proxy-v2.js'
-import type {OpencodeProxyHandle, OpencodeProxyOptions} from './opencode-proxy.js'
+import type {OpencodeProxyHandle, OpencodeProxyV2Options} from './opencode-proxy-v2.js'
+import type {OpencodeProxyOptions} from './opencode-proxy.js'
 import type {RunSupervisedOpencodeV2Options} from './opencode-server-v2.js'
 import type {RunSupervisedOpencodeOptions} from './opencode-server.js'
 import type {ServerDeps} from './server.js'

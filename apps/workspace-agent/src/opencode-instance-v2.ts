@@ -12,11 +12,24 @@
  * recovery has already succeeded), so every failure is a value for the caller to log, never a throw.
  */
 
-import type {InstanceDisposeOutcome, InstanceDisposer} from './opencode-instance.js'
 import type {UpstreamCredentials} from './opencode-server-v2.js'
 
 /** Short on purpose: the caller still holds the per-repo mutex while it waits. */
 export const DEFAULT_INSTANCE_DISPOSE_TIMEOUT_MS_V2 = 5000
+
+export type InstanceDisposeOutcome =
+  | {readonly kind: 'disposed'}
+  /** OpenCode is not running (not started yet, down or degraded), so there is no instance to dispose. */
+  | {readonly kind: 'skipped'}
+  | {
+      readonly kind: 'failed'
+      readonly reason: 'timeout' | 'network-error' | 'http-error'
+      /** Present only for `http-error`. */
+      readonly status?: number
+    }
+
+/** Disposes the instance OpenCode caches for `directory`. Resolves to an outcome; never rejects. */
+export type InstanceDisposer = (directory: string) => Promise<InstanceDisposeOutcome>
 
 export interface CreateInstanceDisposerV2Options {
   /** Loopback URL of the OpenCode server, e.g. `http://127.0.0.1:54321`. */
