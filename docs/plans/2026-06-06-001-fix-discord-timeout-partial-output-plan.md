@@ -1,5 +1,5 @@
 ---
-title: fix: Improve Discord timeout messaging after partial output
+title: "fix: Improve Discord timeout messaging after partial output"
 type: fix
 status: done
 date: 2026-06-06
