@@ -1,6 +1,7 @@
 import {describe, expect, it} from 'vitest'
 import {failureFromErrorObject, failureFromErrorText} from '../packages/gateway/src/execute/provider-failure.js'
-import {classifyTerminalPayloadError, observeClassification} from '../src/features/agent/streaming.js'
+import {observeClassification} from '../src/features/agent/streaming-v2.js'
+import {classifyTerminalPayloadError} from '../src/features/agent/streaming.js'
 
 // The Action and the gateway both classify an OpenCode error payload through the shared
 // `classifyProviderFailure`, after reading its fields with the shared `terminalSignalFromPayload`. This test

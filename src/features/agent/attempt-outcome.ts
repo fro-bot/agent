@@ -17,7 +17,29 @@
  * this restructure.
  */
 import type {ClassificationPath, ErrorInfo} from '@fro-bot/runtime'
-import type {AttemptOutcome} from './prompt-sender.js'
+import type {EventStreamResult} from './streaming-v2.js'
+
+export type AttemptOutcome =
+  'submit_failed' | 'turn_failed_retryable' | 'turn_failed_terminal' | 'timeout' | 'completed'
+
+export interface AttemptResult {
+  readonly success: boolean
+  readonly error: string | null
+  readonly llmError: ErrorInfo | null
+  readonly outcome: AttemptOutcome
+  /** Compatibility view derived from outcome; outcome is authoritative. */
+  readonly shouldRetry: boolean
+  readonly eventStreamResult: EventStreamResult
+  /**
+   * Why observation of this attempt stopped, as decided at the one point it was actually decided
+   * -- never re-derived later from a clock read. See attempt-outcome.ts's module doc for the
+   * governing invariant: selecting an error never proves quiescence, and observing quiescence
+   * never erases an error. Every `AttemptResult` construction site states the settlement it
+   * actually observed; callers (execution.ts) read this instead of inferring a cause from deadline
+   * or ledger state observed after the fact.
+   */
+  readonly settlement: AttemptSettlement
+}
 
 /**
  * Why an attempt stopped observing. Deliberately separate from which failure

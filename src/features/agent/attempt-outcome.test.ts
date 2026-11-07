@@ -8,12 +8,12 @@
  * case where it does not.
  */
 import type {ErrorInfo} from '@fro-bot/runtime'
-import type {AttemptOutcome} from './prompt-sender.js'
 import {createLLMFetchError} from '@fro-bot/runtime'
 import {describe, expect, it} from 'vitest'
 import {
   reduceAttemptOutcome,
   type AttemptObservation,
+  type AttemptOutcome,
   type FailureObservation,
   type TurnEvidence,
 } from './attempt-outcome.js'

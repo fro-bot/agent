@@ -1,16 +1,15 @@
 import type {OwnershipLedger} from '@fro-bot/runtime'
 import type {createOpencode, Event, FilePartInput, TextPartInput} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
-import type {AttemptSettlement} from './attempt-outcome.js'
-import type {EventStreamResult, PermissionAskedResponder} from './streaming.js'
+import type {AttemptOutcome, AttemptResult} from './attempt-outcome.js'
+import type {ExecutionDeadline} from './execution-deadline.js'
+import type {PermissionAskedResponder} from './streaming.js'
 import type {ErrorInfo, ExecutionConfig} from './types.js'
 import {createLLMFetchError, isLlmFetchError} from '@fro-bot/runtime'
 import {DEFAULT_MODEL, DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
 import {formatSdkError} from '../../shared/errors.js'
-import {runPromptAttempt, shouldRetryFromOutcome, type ExecutionDeadline, type PromptStartResult} from './retry.js'
-
-export type AttemptOutcome =
-  'submit_failed' | 'turn_failed_retryable' | 'turn_failed_terminal' | 'timeout' | 'completed'
+import {shouldRetryFromOutcome} from './attempt-outcome.js'
+import {runPromptAttempt, type PromptStartResult} from './retry.js'
 
 export function buildContinuationPrompt(error: ErrorInfo, credentialProvisioned: boolean): string {
   const sideEffectGuidance =
@@ -28,25 +27,6 @@ export function buildContinuationPrompt(error: ErrorInfo, credentialProvisioned:
 const resolvePromptModel = (config: ExecutionConfig | undefined): {providerID: string; modelID: string} => {
   if (config?.model != null) return {providerID: config.model.providerID, modelID: config.model.modelID}
   return {providerID: DEFAULT_MODEL.providerID, modelID: DEFAULT_MODEL.modelID}
-}
-
-export interface AttemptResult {
-  readonly success: boolean
-  readonly error: string | null
-  readonly llmError: ErrorInfo | null
-  readonly outcome: AttemptOutcome
-  /** Compatibility view derived from outcome; outcome is authoritative. */
-  readonly shouldRetry: boolean
-  readonly eventStreamResult: EventStreamResult
-  /**
-   * Why observation of this attempt stopped, as decided at the one point it was actually decided
-   * -- never re-derived later from a clock read. See attempt-outcome.ts's module doc for the
-   * governing invariant: selecting an error never proves quiescence, and observing quiescence
-   * never erases an error. Every `AttemptResult` construction site states the settlement it
-   * actually observed; callers (execution.ts) read this instead of inferring a cause from deadline
-   * or ledger state observed after the fact.
-   */
-  readonly settlement: AttemptSettlement
 }
 
 export async function sendPromptToSession(

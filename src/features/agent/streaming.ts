@@ -2,7 +2,8 @@ import type {ClassificationPath, ErrorInfo, OwnershipLedger, ProviderFailureClas
 import type {Event} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
 import type {TokenUsage} from '../../shared/types.js'
-import type {ExecutionDeadline} from './retry.js'
+import type {ExecutionDeadline} from './execution-deadline.js'
+import type {EventStreamResult, MessageUsage, ObservedActivityError} from './streaming-v2.js'
 import {
   classifyProviderFailure,
   getBooleanProperty,
@@ -17,46 +18,9 @@ import {
   retrySignalFromStatus,
   terminalSignalFromPayload,
 } from '@fro-bot/runtime'
-import {extractCommitShas, extractGithubUrls} from '../../services/github/urls.js'
 import {outputTextContent, outputToolExecution} from '../../shared/console.js'
 import {toErrorMessage} from '../../shared/errors.js'
-
-/**
- * Usage reported by ONE assistant message. OpenCode reports `tokens` and `cost` per message (each
- * prompt-loop iteration creates a new assistant message), never cumulatively per session.
- */
-export interface MessageUsage {
-  readonly tokens: TokenUsage
-  readonly cost: number | null
-}
-
-export interface EventStreamResult {
-  /** Sum across every assistant message of every owned session (see `summarizeMessageUsage`). */
-  readonly tokens: TokenUsage | null
-  readonly model: string | null
-  /** Sum across every assistant message of every owned session; `null` when no message reported a cost. */
-  readonly cost: number | null
-  /**
-   * The per-message ledger `tokens`/`cost` were summed from, keyed by assistant message id. Carried so
-   * a caller that runs several attempts against one session (LLM retries) can merge ledgers by message
-   * id — latest report wins — instead of letting the last attempt's totals replace the earlier ones.
-   */
-  readonly usageByMessage?: ReadonlyMap<string, MessageUsage>
-  readonly prsCreated: string[]
-  readonly commitsCreated: string[]
-  readonly commentsPostedUrls?: string[]
-  readonly commentsPosted: number
-  readonly llmError: ErrorInfo | null
-  readonly classificationPath?: ClassificationPath
-  /**
-   * Set only when the event stream loop exited via an unexpected discontinuity -- not an
-   * intentional local shutdown (caller abort, deadline expiry) and not a terminal signal
-   * (session.idle, completed assistant message). A stream break is an observation-channel
-   * failure, never evidence the turn ended: this field says the channel closed early, and
-   * nothing more. Ledger reconciliation and polling continue independently of it.
-   */
-  readonly discontinuity?: {readonly message: string; readonly errorName?: string}
-}
+import {detectArtifacts, observeClassification} from './streaming-v2.js'
 
 /** Mutable by design — updated in-place during stream processing. */
 export interface ActivityTracker {
@@ -309,22 +273,6 @@ export function classifyTerminalPayloadError(
   return {classification, detail}
 }
 
-/**
- * A recorded failure plus the Action's settlement decision. `terminal` failures settle on first observation (no
- * poll grace cycles, no retry): the shared rule's `stop`, plus `context-overflow`, which the Action treats as
- * terminal so `recoverFromContextOverflow` (gated on `llmError.type === 'context_overflow'`) still fires. A
- * label-only result (hint evidence, or no evidence) is not terminal and waits.
- */
-export interface ObservedActivityError {
-  readonly error: ErrorInfo
-  readonly terminal: boolean
-}
-
-/** The one place the Action turns a shared classification into a settlement decision. */
-export function observeClassification(classification: ProviderFailureClassification): ObservedActivityError {
-  return {error: classification.errorInfo, terminal: classification.stop || classification.kind === 'context-overflow'}
-}
-
 /** True when a thrown stream error reflects a shutdown we asked for, not one the transport handed us. */
 function isIntentionalShutdown(error: unknown, signal: AbortSignal): boolean {
   return signal.aborted || (error instanceof Error && error.name === 'AbortError')
@@ -401,55 +349,6 @@ export function logServerEvent(event: Event, logger: Logger): void {
     const properties = getObjectProperty(event, 'properties')
     const sessionId = getSessionID(properties) ?? getSessionID(getObjectProperty(properties, 'part'))
     logger.debug('Server event', sessionId == null ? {eventType} : {eventType, sessionId})
-  }
-}
-
-/**
- * Scans a bash command + its output for artifacts the model created directly
- * via `gh`/`git` (PR URLs, commit SHAs, posted-comment URLs).
- *
- * The comment-URL branch only fires when the model itself ran `gh issue
- * comment`/`gh pr comment` — true for autonomous flows (`workflow_dispatch`,
- * `schedule`) that keep the GitHub credential and self-post. For flows that
- * post through the action-owned response-file convention, the model never
- * runs those `gh` commands (the credential is withheld and the prompt tells
- * it to write a file instead), so this branch simply never matches and
- * `commentsPosted` for those runs stays at 0 here; the count is sourced
- * separately from the finalize post (`runFinalize` calls
- * `metrics.incrementComments()` after the response is delivered). The two
- * sources are mutually exclusive per run, so there is no double-count.
- */
-export function detectArtifacts(
-  command: string,
-  output: string,
-  prsCreated: string[],
-  commitsCreated: string[],
-  onCommentPosted: () => void,
-  commentsPostedUrls?: string[],
-): void {
-  const urls = extractGithubUrls(output)
-  if (command.includes('gh pr create')) {
-    const prUrls = urls.filter(u => u.includes('/pull/') && !u.includes('#'))
-    for (const url of prUrls) {
-      if (!prsCreated.includes(url)) prsCreated.push(url)
-    }
-  }
-
-  if (command.includes('git commit')) {
-    const shas = extractCommitShas(output)
-    for (const sha of shas) {
-      if (!commitsCreated.includes(sha)) commitsCreated.push(sha)
-    }
-  }
-
-  if (command.includes('gh issue comment') || command.includes('gh pr comment')) {
-    const commentUrls = urls.filter(url => url.includes('#issuecomment'))
-    for (const url of commentUrls) {
-      if (commentsPostedUrls == null || !commentsPostedUrls.includes(url)) {
-        commentsPostedUrls?.push(url)
-        onCommentPosted()
-      }
-    }
   }
 }
 

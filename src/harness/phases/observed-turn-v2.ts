@@ -1,6 +1,5 @@
 import type {ErrorInfo} from '@fro-bot/runtime'
-import type {RootTerminalV2} from '../../features/agent/streaming-v2.js'
-import type {EventStreamResult} from '../../features/agent/streaming.js'
+import type {EventStreamResult, RootTerminalV2} from '../../features/agent/streaming-v2.js'
 import type {RunUsageV2} from '../../features/agent/usage-v2.js'
 import type {MetricsCollector} from '../../features/observability/index.js'
 import type {ExecutePhaseResult} from './execute.js'
