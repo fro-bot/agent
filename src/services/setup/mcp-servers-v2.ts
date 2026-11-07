@@ -1,13 +1,20 @@
 /**
  * Caller-provided MCP servers (`opencode-config` `mcp`) for an OpenCode V2 Action run (fro-bot/agent#1931).
  *
- * **Credential-withheld triggers (`pull_request`, `issue_comment`, `issues`): MCP is off.** The whole `mcp` key is
- * removed from the config before it reaches OpenCode. No screen of individual servers can hold, because OpenCode
- * resolves `{file:...}` and `{env:...}` in `OPENCODE_CONFIG_CONTENT` as text, before it parses it
- * (`core/src/config/variable.ts`): a header value, a query string or a server definition can all resolve to something
- * the harness never saw, and the default agent allows MCP tools (`allow *`). So the withheld path inspects nothing but
- * the server names, for the warning, and removes a top-level key whose own name carries a reference, since that could
- * resolve to `mcp`.
+ * **Credential-withheld triggers (`pull_request`, `issue_comment`, `issues`): only static local servers run.** A server
+ * is kept only when its `type` is the literal `"local"`, it parses, and no `{file:` or `{env:` opening appears anywhere in
+ * its original definition: its name, every known field and every nested or unknown key and string. Every other server is
+ * dropped (all `remote` servers, any server with a reference, any malformed entry), and the `mcp` key goes when none is
+ * left. OpenCode resolves `{file:...}` and `{env:...}` in `OPENCODE_CONFIG_CONTENT` as text, before it parses it
+ * (`core/src/config/variable.ts`), so a value or a key with a reference can become anything the harness never saw, and
+ * the default agent allows MCP tools (`allow *`). A top-level key whose own name carries a `{file:}` reference is
+ * removed too, since it could resolve to `mcp`; that check is on top-level key names only, not recursive. `{env:}` in the
+ * whole config fails setup earlier (`buildCIConfigV2`), so dropping a server for it is a helper-level rule.
+ *
+ * A kept server is trusted operator code, not a sandbox. Its definition is static, but the command, its arguments and
+ * any literal `environment` value reach a process that the checkout controls, and the process can read what the runner
+ * lets it. Operators must not put secrets in them. Fork pull requests stay the caller's restriction. The child
+ * environment is unchanged (`filterAgentEnv(process.env)` plus the server keys).
  *
  * **Provisioned runs** trust the caller's workflow: `mcp` passes through after validation. V2 2.2.5 reads two spellings
  * (`core/src/config/normalize.ts`): the legacy per-name map `mcp.<name>` and the native `mcp.servers.<name>`; a server
@@ -216,16 +223,32 @@ function parseServer(name: string, value: unknown, origin: 'legacy' | 'native'):
   return invalid(name, 'type must be "local" or "remote"')
 }
 
+interface McpEntry {
+  /** The key as authored. */
+  readonly name: string
+  /** The definition exactly as written: the withheld path inspects this, not the parsed launch fields. */
+  readonly value: unknown
+  readonly origin: 'legacy' | 'native'
+}
+
+interface McpLayout {
+  readonly entries: readonly McpEntry[]
+  /** The `mcp.timeout` block, when the key holds one rather than a server named `timeout`. */
+  readonly timeout: {readonly value: unknown} | undefined
+}
+
 /**
- * Parse the operator's `mcp` value into a typed server list, or fail with a named error. Fails on the first bad entry.
- * Two servers may not share a name or a sanitized name: both would own one tool prefix.
+ * Split the operator's `mcp` value into its server entries and its `timeout` block, in both spellings and with the
+ * `servers`/`timeout` name disambiguation. The one place that reads the layout: the strict parse and the withheld filter
+ * both start here. Fails only when the layout itself cannot be read.
  */
-export function parseMcpServersV2(mcp: unknown): Result<readonly McpServerV2[], McpConfigError> {
+function readMcpLayout(mcp: unknown): Result<McpLayout, McpConfigError> {
   if (!isRecord(mcp)) {
     return err({kind: 'not-an-object', server: null, message: 'opencode-config mcp must be a JSON object'})
   }
 
-  const entries: {readonly name: string; readonly value: unknown; readonly origin: 'legacy' | 'native'}[] = []
+  const entries: McpEntry[] = []
+  let timeout: McpLayout['timeout']
   for (const [key, value] of Object.entries(mcp)) {
     if (isEnabledOnly(value)) continue
     if (key === 'servers' && !isDirectServer(value)) {
@@ -236,21 +259,32 @@ export function parseMcpServersV2(mcp: unknown): Result<readonly McpServerV2[], 
       continue
     }
     if (key === 'timeout' && !isDirectServer(value)) {
-      if (!isTimeoutBlock(value)) {
-        return err({
-          kind: 'invalid-server',
-          server: null,
-          message: 'opencode-config mcp.timeout must be a positive integer or an object of positive integers',
-        })
-      }
+      timeout = {value}
       continue
     }
     entries.push({name: key, value, origin: 'legacy'})
   }
+  return ok({entries, timeout})
+}
+
+/**
+ * Parse the operator's `mcp` value into a typed server list, or fail with a named error. Fails on the first bad entry.
+ * Two servers may not share a name or a sanitized name: both would own one tool prefix.
+ */
+export function parseMcpServersV2(mcp: unknown): Result<readonly McpServerV2[], McpConfigError> {
+  const layout = readMcpLayout(mcp)
+  if (!layout.success) return layout
+  if (layout.data.timeout !== undefined && !isTimeoutBlock(layout.data.timeout.value)) {
+    return err({
+      kind: 'invalid-server',
+      server: null,
+      message: 'opencode-config mcp.timeout must be a positive integer or an object of positive integers',
+    })
+  }
 
   const servers: McpServerV2[] = []
   const namespaces = new Map<string, string>()
-  for (const {name, value, origin} of entries) {
+  for (const {name, value, origin} of layout.data.entries) {
     const parsed = parseServer(name, value, origin)
     if (!parsed.success) return parsed
     const {namespace} = parsed.data
@@ -268,18 +302,38 @@ export function parseMcpServersV2(mcp: unknown): Result<readonly McpServerV2[], 
 }
 
 /**
- * A `{file:}` reference OpenCode resolves in the config text before it parses it (`core/src/config/variable.ts`).
- * `{env:}` has no branch here: the config builder fails setup on one before this runs.
+ * A `{file:}` or `{env:}` reference OpenCode resolves in the config text before it parses it
+ * (`core/src/config/variable.ts`). On a withheld run `{env:}` fails setup before this runs, so it matters at the helper
+ * level only.
  */
-const FILE_REFERENCE_OPENING = '{file:'
+const REFERENCE_OPENINGS = ['{file:', '{env:'] as const
+
+function hasReferenceOpening(text: string): boolean {
+  return REFERENCE_OPENINGS.some(opening => text.includes(opening))
+}
+
+/** Whether a reference opens anywhere in a definition: a key or a string, at any depth, known field or not. */
+function containsReference(value: unknown): boolean {
+  if (typeof value === 'string') return hasReferenceOpening(value)
+  if (Array.isArray(value)) return value.some(containsReference)
+  if (isRecord(value)) {
+    return Object.entries(value).some(([key, entry]) => hasReferenceOpening(key) || containsReference(entry))
+  }
+  return false
+}
 
 const MAX_LOGGED_NAMES = 20
 const MAX_LOGGED_NAME_LENGTH = 64
 
-/**
- * The configured server names for the warning, sanitized to `[a-zA-Z0-9_-]` and bounded, from whatever shape `mcp`
- * has: a name is operator text, so it is never logged as typed. Empty when the block is not an object.
- */
+/** Sanitize to `[a-zA-Z0-9_-]`, drop repeats and bound the list: a name is operator text, so it is never logged as typed. */
+function namesForLog(names: readonly string[]): readonly string[] {
+  const unique = [...new Set(names.map(name => mcpToolNamespace(name).slice(0, MAX_LOGGED_NAME_LENGTH)))]
+  return unique.length > MAX_LOGGED_NAMES
+    ? [...unique.slice(0, MAX_LOGGED_NAMES), `and ${unique.length - MAX_LOGGED_NAMES} more`]
+    : unique
+}
+
+/** The configured server names, from whatever shape `mcp` has. Empty when the block is not an object. */
 function serverNamesForLog(mcp: unknown): readonly string[] {
   if (!isRecord(mcp)) return []
   const names: string[] = []
@@ -291,18 +345,71 @@ function serverNamesForLog(mcp: unknown): readonly string[] {
     if (key === 'timeout' && !isDirectServer(value)) continue
     names.push(key)
   }
-  const unique = [...new Set(names.map(name => mcpToolNamespace(name).slice(0, MAX_LOGGED_NAME_LENGTH)))]
-  return unique.length > MAX_LOGGED_NAMES
-    ? [...unique.slice(0, MAX_LOGGED_NAMES), `and ${unique.length - MAX_LOGGED_NAMES} more`]
-    : unique
+  return namesForLog(names)
+}
+
+/** A server a credential-withheld run keeps: a literal `local` that parses, with no reference anywhere in it. */
+function isStaticLocal({name, value, origin}: McpEntry): boolean {
+  if (hasReferenceOpening(name) || containsReference(value)) return false
+  if (!isRecord(value) || value.type !== 'local') return false
+  const parsed = parseServer(name, value, origin)
+  return parsed.success && parsed.data.kind === 'local'
+}
+
+interface WithheldMcp {
+  /** What is left of `mcp`, or undefined when nothing is. */
+  readonly mcp: Record<string, unknown> | undefined
+  readonly kept: readonly string[]
+  readonly dropped: readonly string[]
+}
+
+/**
+ * Filter `mcp` server by server. A kept server is passed through exactly as authored, in the spelling it was written in.
+ * A layout that cannot be read drops the whole block. Two kept servers that share a tool prefix are both dropped.
+ */
+function filterWithheldMcp(mcp: unknown): WithheldMcp {
+  const layout = readMcpLayout(mcp)
+  if (!layout.success) return {mcp: undefined, kept: [], dropped: serverNamesForLog(mcp)}
+
+  const candidates = layout.data.entries.filter(isStaticLocal)
+  const prefixCounts = new Map<string, number>()
+  for (const {name} of candidates) {
+    const prefix = mcpToolNamespace(name)
+    prefixCounts.set(prefix, (prefixCounts.get(prefix) ?? 0) + 1)
+  }
+  const kept = candidates.filter(({name}) => prefixCounts.get(mcpToolNamespace(name)) === 1)
+  const keptEntries = new Set(kept)
+  const dropped = layout.data.entries.filter(entry => !keptEntries.has(entry))
+
+  if (kept.length === 0) return {mcp: undefined, kept: [], dropped: namesForLog(dropped.map(({name}) => name))}
+
+  const toEntry = ({name, value}: McpEntry): [string, unknown] => [name, value]
+  const timeout = layout.data.timeout
+  const keptTimeout: [string, unknown][] =
+    timeout !== undefined && isTimeoutBlock(timeout.value) && !containsReference(timeout.value)
+      ? [['timeout', timeout.value]]
+      : []
+  const nativeServers: [string, unknown][] = kept.filter(entry => entry.origin === 'native').map(toEntry)
+  // Object.fromEntries defines own keys, so a server named `__proto__` stays a key.
+  const out: Record<string, unknown> = Object.fromEntries([
+    ...kept.filter(entry => entry.origin === 'legacy').map(toEntry),
+    ...(nativeServers.length === 0 ? [] : [['servers', Object.fromEntries(nativeServers)] as [string, unknown]]),
+    ...keptTimeout,
+  ])
+  return {
+    mcp: out,
+    kept: namesForLog(kept.map(({name}) => name)),
+    dropped: namesForLog(dropped.map(({name}) => name)),
+  }
 }
 
 /**
  * Apply the credential disposition to the operator's config (see the file header).
  *
- * `withhold`: removes `mcp`, and any top-level key whose name carries a `{file:}` reference, with one
- * warning each; never fails, so an unparseable block is removed too. `provision`: validates `mcp` and passes the config
- * through unchanged, failing on a bad shape so a mistyped config stops setup instead of running without its server.
+ * `withhold`: keeps only the static local servers of `mcp`, and removes any top-level key whose name carries a `{file:}`
+ * reference; never fails, so an unparseable block is removed too. Logs the kept and dropped servers by name. `provision`:
+ * validates `mcp` and passes the config through unchanged, failing on a bad shape so a mistyped config stops setup
+ * instead of running without its server.
  */
 export function applyOperatorMcpV2(
   operator: Record<string, unknown>,
@@ -315,25 +422,39 @@ export function applyOperatorMcpV2(
     return parsed.success ? ok(operator) : parsed
   }
 
-  const referencedKeys = Object.keys(operator).filter(key => key.includes(FILE_REFERENCE_OPENING))
+  const referencedKeys = Object.keys(operator).filter(key => key.includes('{file:'))
   const hasMcp = 'mcp' in operator
   if (!hasMcp && referencedKeys.length === 0) return ok(operator)
 
+  let filtered: WithheldMcp = {mcp: undefined, kept: [], dropped: []}
   if (hasMcp) {
-    const names = serverNamesForLog(operator.mcp)
-    logger.warning(
-      `MCP servers are not run while the credential is withheld: removed opencode-config mcp${
-        names.length === 0 ? '' : ` (servers: ${names.join(', ')})`
-      }`,
-    )
+    filtered = filterWithheldMcp(operator.mcp)
+    if (filtered.kept.length > 0) {
+      logger.info(
+        `MCP servers kept while the credential is withheld (local, with no {env:} or {file:} reference): ${filtered.kept.join(', ')}`,
+      )
+    }
+    if (filtered.dropped.length > 0 || filtered.kept.length === 0) {
+      logger.warning(
+        `MCP servers removed while the credential is withheld (only local servers with no {env:} or {file:} reference are run)${
+          filtered.dropped.length === 0 ? '' : `: ${filtered.dropped.join(', ')}`
+        }`,
+      )
+    }
   }
   if (referencedKeys.length > 0) {
     logger.warning(
-      `Removed ${referencedKeys.length} opencode-config key(s) whose name carries a {file:} reference: OpenCode resolves it before it reads the key, so it could be mcp, which is not run while the credential is withheld`,
+      `Removed ${referencedKeys.length} opencode-config key(s) whose name carries a {file:} reference: OpenCode resolves it before it reads the key, so it could be mcp, which is filtered while the credential is withheld`,
     )
   }
 
   return ok(
-    Object.fromEntries(Object.entries(operator).filter(([key]) => key !== 'mcp' && !referencedKeys.includes(key))),
+    Object.fromEntries(
+      Object.entries(operator).flatMap(([key, value]) => {
+        if (referencedKeys.includes(key)) return []
+        if (key !== 'mcp') return [[key, value]]
+        return filtered.mcp === undefined ? [] : [[key, filtered.mcp]]
+      }),
+    ),
   )
 }

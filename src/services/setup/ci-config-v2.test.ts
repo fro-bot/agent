@@ -1,5 +1,5 @@
 import type {PermissionRuleV2} from '@fro-bot/runtime'
-import {evaluatePermissionV2, verifyPermissionRules} from '@fro-bot/runtime'
+import {evaluatePermissionV2, resolveResponseDelivery, verifyPermissionRules} from '@fro-bot/runtime'
 import {describe, expect, it, vi} from 'vitest'
 import {createMockLogger, serializeLoggerCalls, unwrapErr} from '../../shared/test-helpers.js'
 import {buildCIConfigV2} from './ci-config-v2.js'
@@ -754,27 +754,77 @@ describe('buildCIConfigV2', () => {
       )
     })
 
-    describe('on a credential-withheld trigger', () => {
-      it('removes the whole mcp key, with one warning naming the servers', () => {
-        // #given / #when
-        const {content, logger} = withMcp({docs: LOCAL, wiki: REMOTE}, {credential: 'withhold'})
+    describe.each(['pull_request', 'issue_comment', 'issues'])('on a credential-withheld %s trigger', eventName => {
+      const credential = resolveResponseDelivery(eventName, 'github').credential
+      const STATIC_LOCAL = {type: 'local', command: ['node', 'tools/knowledge.mjs']} as const
 
-        // #then
-        expect(content).not.toHaveProperty('mcp')
-        const warnings = vi.mocked(logger.warning).mock.calls.map(call => String(call[0]))
-        expect(warnings.filter(text => text.includes('MCP servers are not run'))).toHaveLength(1)
-        expect(warnings.join('\n')).toContain('docs, wiki')
+      const spellings = [
+        ['mcp.<name>', (servers: Record<string, unknown>): Record<string, unknown> => servers],
+        ['mcp.servers.<name>', (servers: Record<string, unknown>): Record<string, unknown> => ({servers})],
+      ] as const
+
+      it('withholds the credential', () => {
+        expect(credential).toBe('withhold')
       })
 
-      it('removes a native-shape block and keeps the other operator keys', () => {
+      it.each(spellings)(
+        'keeps a static local server and drops a {file:} local and a remote one: %s',
+        (_spelling, spell) => {
+          // #given
+          const mcp = spell({
+            knowledge: STATIC_LOCAL,
+            viaFile: {type: 'local', command: ['node', '{file:./tool}']},
+            wiki: REMOTE,
+          })
+
+          // #when
+          const {content, logger} = withMcp(mcp, {credential})
+
+          // #then
+          expect(content.mcp).toEqual(spell({knowledge: STATIC_LOCAL}))
+          const infos = vi.mocked(logger.info).mock.calls.map(call => String(call[0]))
+          const warnings = vi.mocked(logger.warning).mock.calls.map(call => String(call[0]))
+          expect(infos.filter(text => text.includes('MCP servers kept'))).toHaveLength(1)
+          expect(infos.join('\n')).toContain('knowledge')
+          expect(warnings.filter(text => text.includes('MCP servers removed'))).toHaveLength(1)
+          expect(warnings.join('\n')).toContain('viaFile, wiki')
+        },
+      )
+
+      it.each(spellings)('removes the mcp key when no server survives: %s', (_spelling, spell) => {
         // #given / #when
-        const {content} = build({
-          credential: 'withhold',
-          opencodeConfig: JSON.stringify({mcp: {servers: {docs: LOCAL}}, share: 'disabled'}),
+        const {content} = withMcp(spell({wiki: REMOTE, viaFile: {type: 'local', command: ['{file:./c}']}}), {
+          credential,
         })
 
         // #then
         expect(content).not.toHaveProperty('mcp')
+      })
+
+      it.each(spellings)('fails setup before any filtering for a local server with {env:}: %s', (_spelling, spell) => {
+        // #given
+        const logger = createMockLogger()
+        const mcp = spell({knowledge: STATIC_LOCAL, viaEnv: {type: 'local', command: ['node', '{env:TOOL}']}})
+
+        // #when
+        const result = buildCIConfigV2({...BASE_INPUTS, credential, opencodeConfig: JSON.stringify({mcp})}, logger)
+
+        // #then: the whole-config rule fires first, so the static server is not kept either
+        expect(result.success).toBe(false)
+        expect(unwrapErr(result)).toMatch(/\{env:\} references.*credential-withheld/s)
+        expect(logger.info).not.toHaveBeenCalled()
+        expect(logger.warning).not.toHaveBeenCalled()
+      })
+
+      it('keeps the other operator keys beside a kept server', () => {
+        // #given / #when
+        const {content} = build({
+          credential,
+          opencodeConfig: JSON.stringify({mcp: {servers: {docs: STATIC_LOCAL}}, share: 'disabled'}),
+        })
+
+        // #then
+        expect(content.mcp).toEqual({servers: {docs: STATIC_LOCAL}})
         expect(content.share).toBe('disabled')
       })
 
@@ -783,7 +833,7 @@ describe('buildCIConfigV2', () => {
         const result = buildCIConfigV2(
           {
             ...BASE_INPUTS,
-            credential: 'withhold',
+            credential,
             opencodeConfig: JSON.stringify({mcp: {timeout: {type: '{file:./t}', command: ['node']}}}),
           },
           createMockLogger(),
@@ -797,8 +847,8 @@ describe('buildCIConfigV2', () => {
       it('removes a top-level key whose name is a file reference, which could resolve to mcp', () => {
         // #given / #when
         const {content} = build({
-          credential: 'withhold',
-          opencodeConfig: JSON.stringify({'{file:./key}': {docs: LOCAL}, share: 'disabled'}),
+          credential,
+          opencodeConfig: JSON.stringify({'{file:./key}': {docs: STATIC_LOCAL}, share: 'disabled'}),
         })
 
         // #then
@@ -809,7 +859,11 @@ describe('buildCIConfigV2', () => {
       it('logs no configured value', () => {
         // #given
         const mcp = {
-          docs: {type: 'local', command: ['node', '/opt/secret-tool.mjs'], environment: {SECRET_VALUE: 'env-value-1'}},
+          docs: {
+            type: 'local',
+            command: ['node', '/opt/secret-tool.mjs'],
+            environment: {SECRET_VALUE: 'env-value-1'},
+          },
           authed: {
             type: 'remote',
             url: 'https://mcp.example.com/mcp',
@@ -818,18 +872,19 @@ describe('buildCIConfigV2', () => {
         }
 
         // #when
-        const {logger} = withMcp(mcp, {credential: 'withhold'})
+        const {logger} = withMcp(mcp, {credential})
 
         // #then
         const logged = serializeLoggerCalls(logger)
         for (const value of ['/opt/secret-tool', 'env-value-1', 'header-value-2', './secret', 'Authorization']) {
           expect(logged).not.toContain(value)
         }
+        expect(logged).toContain('docs')
       })
 
-      it('leaves the permission rules as they are without servers', () => {
+      it('leaves the permission rules as they are with a kept server', () => {
         // #given / #when
-        const {content} = withMcp({docs: LOCAL}, {credential: 'withhold'})
+        const {content} = withMcp({docs: STATIC_LOCAL}, {credential})
 
         // #then
         expect(permissionsOf(content)).toEqual(permissionsOf(build().content))
