@@ -1,3 +1,4 @@
+import {resolveResponseDelivery} from '@fro-bot/runtime'
 import {describe, expect, it, vi} from 'vitest'
 import {createMockLogger, serializeLoggerCalls, unwrapErr, unwrapOk} from '../../shared/test-helpers.js'
 import {applyOperatorMcpV2, mcpToolNamespace, parseMcpServersV2} from './mcp-servers-v2.js'
@@ -316,9 +317,11 @@ function warnings(logger: ReturnType<typeof createMockLogger>): readonly string[
   return vi.mocked(logger.warning).mock.calls.map(call => String(call[0]))
 }
 
-describe('applyOperatorMcpV2', () => {
-  const REFERENCE_MESSAGE = 'MCP servers are not run while the credential is withheld'
+function infos(logger: ReturnType<typeof createMockLogger>): readonly string[] {
+  return vi.mocked(logger.info).mock.calls.map(call => String(call[0]))
+}
 
+describe('applyOperatorMcpV2', () => {
   describe('on a provisioned run', () => {
     it('passes the operator config through unchanged, mcp included', () => {
       // #given
@@ -390,57 +393,339 @@ describe('applyOperatorMcpV2', () => {
   })
 
   describe('on a credential-withheld run', () => {
-    it('removes the whole mcp key and keeps every other key', () => {
+    const STATIC_LOCAL = {type: 'local', command: ['node', 'tools/knowledge.mjs']} as const
+    const KEPT_MESSAGE = 'MCP servers kept while the credential is withheld'
+    const DROPPED_MESSAGE = 'MCP servers removed while the credential is withheld'
+
+    const spellings = [
+      ['mcp.<name>', (servers: Record<string, unknown>): Record<string, unknown> => servers],
+      ['mcp.servers.<name>', (servers: Record<string, unknown>): Record<string, unknown> => ({servers})],
+    ] as const
+
+    it.each(['pull_request', 'issue_comment', 'issues'])('%s withholds the credential', eventName => {
+      // #given / #when / #then: the matrix below is pinned to the triggers that withhold
+      expect(resolveResponseDelivery(eventName, 'github').credential).toBe('withhold')
+    })
+
+    describe.each(['pull_request', 'issue_comment', 'issues'])('on %s', eventName => {
+      const credential = resolveResponseDelivery(eventName, 'github').credential
+
+      describe.each(spellings)('%s', (_spelling, spell) => {
+        it('keeps a local server with no reference and drops a referenced local server and a remote one', () => {
+          // #given
+          const logger = createMockLogger()
+          const operator = {
+            share: 'disabled',
+            mcp: spell({
+              knowledge: STATIC_LOCAL,
+              viaEnv: {type: 'local', command: ['node', '{env:TOOL}']},
+              viaFile: {type: 'local', command: ['node', '{file:./tool}']},
+              remote: {type: 'remote', url: 'https://mcp.example.com/mcp'},
+            }),
+          }
+
+          // #when
+          const result = unwrapOk(applyOperatorMcpV2(operator, credential, logger))
+
+          // #then
+          expect(result).toEqual({share: 'disabled', mcp: spell({knowledge: STATIC_LOCAL})})
+          expect(infos(logger)).toHaveLength(1)
+          expect(infos(logger)[0]).toContain(KEPT_MESSAGE)
+          expect(infos(logger)[0]).toContain('knowledge')
+          expect(warnings(logger)).toHaveLength(1)
+          expect(warnings(logger)[0]).toContain(DROPPED_MESSAGE)
+          for (const name of ['viaEnv', 'viaFile', 'remote']) expect(warnings(logger)[0]).toContain(name)
+          expect(warnings(logger)[0]).not.toContain('knowledge')
+        })
+
+        it('drops a local server whose definition carries a {file:} reference', () => {
+          // #given / #when
+          const result = unwrapOk(
+            applyOperatorMcpV2(
+              {mcp: spell({viaFile: {type: 'local', command: ['node', 'a.mjs'], cwd: '{file:./cwd}'}})},
+              credential,
+              createMockLogger(),
+            ),
+          )
+
+          // #then: nothing is left, so the key goes
+          expect(result).not.toHaveProperty('mcp')
+        })
+
+        it('drops a local server whose definition carries an {env:} reference (helper level)', () => {
+          // #given / #when
+          const result = unwrapOk(
+            applyOperatorMcpV2(
+              {mcp: spell({viaEnv: {type: 'local', command: ['node', 'a.mjs'], environment: {A: 'x{env:Y}z'}}})},
+              credential,
+              createMockLogger(),
+            ),
+          )
+
+          // #then
+          expect(result).not.toHaveProperty('mcp')
+        })
+
+        it('drops a remote server, with or without a reference', () => {
+          // #given / #when
+          const result = unwrapOk(
+            applyOperatorMcpV2(
+              {
+                mcp: spell({
+                  plain: {type: 'remote', url: 'https://mcp.example.com/mcp'},
+                  authed: {type: 'remote', url: 'https://mcp.example.com/mcp', headers: {A: '{file:./h}'}},
+                }),
+              },
+              credential,
+              createMockLogger(),
+            ),
+          )
+
+          // #then
+          expect(result).not.toHaveProperty('mcp')
+        })
+
+        it.each([
+          ['a nested field', {type: 'local', command: ['node', 'a.mjs'], extra: {deep: [{x: 'p-{file:./n}-q'}]}}],
+          ['a nested key', {type: 'local', command: ['node', 'a.mjs'], extra: {'{file:./k}': true}}],
+          ['an unknown top-level field', {type: 'local', command: ['node', 'a.mjs'], unknownField: '{file:./u}'}],
+          [
+            'an {env:} reference in an unknown field',
+            {type: 'local', command: ['node', 'a.mjs'], unknownField: '{env:U}'},
+          ],
+          ['a command argument', {type: 'local', command: ['node', '--token={file:./t}']}],
+          ['a referenced enabled flag', {type: 'local', command: ['node', 'a.mjs'], enabled: '{file:./e}'}],
+        ])('drops a local server with a reference in %s', (_label, server) => {
+          // #given / #when
+          const result = unwrapOk(
+            applyOperatorMcpV2({mcp: spell({kept: STATIC_LOCAL, bad: server})}, credential, createMockLogger()),
+          )
+
+          // #then
+          expect(result).toEqual({mcp: spell({kept: STATIC_LOCAL})})
+        })
+
+        it.each([
+          ['{file:} in the middle', 'a{file:./n}b'],
+          ['an {env:} reference', '{env:N}'],
+        ])('drops a server whose name carries %s, which could resolve to servers or timeout', (_label, name) => {
+          // #given / #when
+          const result = unwrapOk(
+            applyOperatorMcpV2(
+              {mcp: spell({kept: STATIC_LOCAL, [name]: STATIC_LOCAL})},
+              credential,
+              createMockLogger(),
+            ),
+          )
+
+          // #then
+          expect(result).toEqual({mcp: spell({kept: STATIC_LOCAL})})
+        })
+
+        it('keeps a local server with a literal environment', () => {
+          // #given
+          const server = {
+            ...STATIC_LOCAL,
+            environment: {LOG_LEVEL: 'debug'},
+            cwd: 'tools',
+            enabled: true,
+            timeout: 5000,
+          }
+
+          // #when
+          const result = unwrapOk(applyOperatorMcpV2({mcp: spell({knowledge: server})}, credential, createMockLogger()))
+
+          // #then
+          expect(result).toEqual({mcp: spell({knowledge: server})})
+        })
+
+        it.each([
+          ['a local server with no command', {type: 'local'}],
+          ['a local server with an empty command', {type: 'local', command: []}],
+          ['a local server with a non-string environment value', {...STATIC_LOCAL, environment: {A: 1}}],
+          ['a non-object entry', 'node server.mjs'],
+          ['a null entry', null],
+          ['an array entry', [STATIC_LOCAL]],
+          ['an unknown type', {type: 'sse', command: ['node', 'a.mjs']}],
+          ['a missing type', {command: ['node', 'a.mjs']}],
+          ['a referenced type', {type: '{file:./t}', command: ['node', 'a.mjs']}],
+          ['a non-literal type', {type: 'Local', command: ['node', 'a.mjs']}],
+        ])('drops %s and keeps the valid server beside it', (_label, bad) => {
+          // #given / #when
+          const logger = createMockLogger()
+          const result = unwrapOk(applyOperatorMcpV2({mcp: spell({kept: STATIC_LOCAL, bad})}, credential, logger))
+
+          // #then
+          expect(result).toEqual({mcp: spell({kept: STATIC_LOCAL})})
+          expect(warnings(logger)[0]).toContain('bad')
+        })
+
+        it('removes the mcp key when every server is dropped, and keeps the other keys', () => {
+          // #given
+          const operator = {
+            share: 'disabled',
+            mcp: spell({remote: REMOTE, viaFile: {type: 'local', command: ['{file:./c}']}}),
+            provider: {a: 1},
+          }
+
+          // #when
+          const result = unwrapOk(applyOperatorMcpV2(operator, credential, createMockLogger()))
+
+          // #then
+          expect(result).toEqual({share: 'disabled', provider: {a: 1}})
+          expect(result).not.toHaveProperty('mcp')
+        })
+
+        it('does not log a kept line when nothing is kept', () => {
+          // #given
+          const logger = createMockLogger()
+
+          // #when
+          unwrapOk(applyOperatorMcpV2({mcp: spell({remote: REMOTE})}, credential, logger))
+
+          // #then
+          expect(infos(logger)).toEqual([])
+          expect(warnings(logger)).toHaveLength(1)
+        })
+
+        it('does not warn about dropped servers when everything is kept', () => {
+          // #given
+          const logger = createMockLogger()
+
+          // #when
+          unwrapOk(applyOperatorMcpV2({mcp: spell({a: STATIC_LOCAL, b: STATIC_LOCAL})}, credential, logger))
+
+          // #then
+          expect(warnings(logger)).toEqual([])
+          expect(infos(logger)).toHaveLength(1)
+        })
+
+        it('drops servers that share one tool prefix, because the prefix would be ambiguous', () => {
+          // #given
+          const logger = createMockLogger()
+
+          // #when
+          const result = unwrapOk(
+            applyOperatorMcpV2(
+              {mcp: spell({'a.b': STATIC_LOCAL, a_b: STATIC_LOCAL, other: STATIC_LOCAL})},
+              credential,
+              logger,
+            ),
+          )
+
+          // #then
+          expect(result).toEqual({mcp: spell({other: STATIC_LOCAL})})
+          expect(warnings(logger)[0]).toContain('a_b')
+        })
+
+        it('does not turn a __proto__ server name into a prototype', () => {
+          // #given: JSON.parse makes it an own key
+          const servers = JSON.parse(`{"__proto__": ${JSON.stringify(STATIC_LOCAL)}}`) as Record<string, unknown>
+
+          // #when
+          const result = unwrapOk(applyOperatorMcpV2({mcp: spell(servers)}, credential, createMockLogger()))
+
+          // #then
+          const out = result.mcp as Record<string, unknown>
+          const target = (out.servers as Record<string, unknown> | undefined) ?? out
+          expect(Object.getPrototypeOf(target)).toBe(Object.prototype)
+          expect(Object.keys(target)).toEqual(['__proto__'])
+        })
+      })
+    })
+
+    it('keeps both spellings at once, each in the spelling it was written in', () => {
       // #given
-      const operator = {share: 'disabled', mcp: {docs: LOCAL, wiki: REMOTE}, provider: {a: 1}}
+      const operator = {
+        mcp: {legacy: STATIC_LOCAL, remoteLegacy: REMOTE, servers: {native: STATIC_LOCAL, remoteNative: REMOTE}},
+      }
 
       // #when
       const result = unwrapOk(applyOperatorMcpV2(operator, 'withhold', createMockLogger()))
 
       // #then
-      expect(result).toEqual({share: 'disabled', provider: {a: 1}})
-      expect(result).not.toHaveProperty('mcp')
+      expect(result).toEqual({mcp: {legacy: STATIC_LOCAL, servers: {native: STATIC_LOCAL}}})
     })
 
-    it('warns once, listing the sanitized server names and a fixed reason, in both spellings', () => {
+    it('keeps a legacy server literally named servers, as upstream reads it', () => {
+      // #given
+      const operator = {mcp: {servers: STATIC_LOCAL}}
+
+      // #when
+      const result = unwrapOk(applyOperatorMcpV2(operator, 'withhold', createMockLogger()))
+
+      // #then
+      expect(result).toEqual({mcp: {servers: STATIC_LOCAL}})
+    })
+
+    it('keeps a literal mcp.timeout beside a kept server, and drops one with a reference or without a server', () => {
+      // #given / #when
+      const kept = unwrapOk(
+        applyOperatorMcpV2({mcp: {timeout: {catalog: 9000}, docs: STATIC_LOCAL}}, 'withhold', createMockLogger()),
+      )
+      const referenced = unwrapOk(
+        applyOperatorMcpV2({mcp: {timeout: '{file:./t}', docs: STATIC_LOCAL}}, 'withhold', createMockLogger()),
+      )
+      const alone = unwrapOk(applyOperatorMcpV2({mcp: {timeout: {catalog: 9000}}}, 'withhold', createMockLogger()))
+
+      // #then
+      expect(kept).toEqual({mcp: {timeout: {catalog: 9000}, docs: STATIC_LOCAL}})
+      expect(referenced).toEqual({mcp: {docs: STATIC_LOCAL}})
+      expect(alone).not.toHaveProperty('mcp')
+    })
+
+    it('does not mutate the operator config', () => {
+      // #given
+      const operator = {mcp: {docs: STATIC_LOCAL, wiki: REMOTE}}
+      const before = structuredClone(operator)
+
+      // #when
+      unwrapOk(applyOperatorMcpV2(operator, 'withhold', createMockLogger()))
+
+      // #then
+      expect(operator).toEqual(before)
+    })
+
+    it('sanitizes a hostile server name before it reaches the log, kept or dropped', () => {
       // #given
       const logger = createMockLogger()
 
       // #when
       unwrapOk(
         applyOperatorMcpV2(
-          {mcp: {timeout: {catalog: 1}, 'my docs': LOCAL, servers: {wiki: REMOTE}, other: REMOTE}},
+          {mcp: {'x\n::error::kept': STATIC_LOCAL, 'y\n::error::dropped': REMOTE}},
           'withhold',
           logger,
         ),
       )
 
       // #then
-      expect(warnings(logger)).toHaveLength(1)
-      expect(warnings(logger)[0]).toContain(REFERENCE_MESSAGE)
-      for (const name of ['my_docs', 'wiki', 'other']) expect(warnings(logger)[0]).toContain(name)
-      expect(warnings(logger)[0]).not.toContain('timeout')
+      const logged = serializeLoggerCalls(logger)
+      expect(logged).not.toContain(String.raw`\n`)
+      expect(logged).not.toContain('::error::')
+      expect(infos(logger)[0]).toContain('x___error__kept')
+      expect(warnings(logger)[0]).toContain('y___error__dropped')
     })
 
-    it('sanitizes a hostile server name before it reaches the log', () => {
+    it('bounds the number of names it logs', () => {
       // #given
       const logger = createMockLogger()
+      const mcp = Object.fromEntries(Array.from({length: 30}, (_unused, index) => [`server${index}`, STATIC_LOCAL]))
 
       // #when
-      unwrapOk(applyOperatorMcpV2({mcp: {'x\n::error::injected': LOCAL}}, 'withhold', logger))
+      unwrapOk(applyOperatorMcpV2({mcp}, 'withhold', logger))
 
       // #then
-      expect(warnings(logger)[0]).not.toContain('\n')
-      expect(warnings(logger)[0]).not.toContain('::error::')
+      expect(infos(logger)[0]).toContain('and 10 more')
+      expect(infos(logger)[0]).not.toContain('server29')
     })
 
     it.each([
       ['a string', 'docs'],
       ['an array', []],
       ['null', null],
-      ['a malformed server', {docs: {type: 'local'}}],
-      ['a substituted timeout block', {timeout: {type: '{file:./t}', command: ['node']}}],
-    ])('still removes mcp when it is %s, and warns without names', (_label, mcp) => {
+      ['a non-object servers wrapper', {servers: 'docs'}],
+    ])('removes mcp when it is %s, and warns', (_label, mcp) => {
       // #given
       const logger = createMockLogger()
 
@@ -450,7 +735,21 @@ describe('applyOperatorMcpV2', () => {
       // #then
       expect(result).toEqual({share: 'disabled'})
       expect(warnings(logger)).toHaveLength(1)
-      expect(warnings(logger)[0]).toContain(REFERENCE_MESSAGE)
+      expect(warnings(logger)[0]).toContain(DROPPED_MESSAGE)
+      expect(infos(logger)).toEqual([])
+    })
+
+    it('drops a timeout entry whose type is a substituted reference that could resolve to a local server', () => {
+      // #given
+      const logger = createMockLogger()
+
+      // #when
+      const result = unwrapOk(
+        applyOperatorMcpV2({mcp: {timeout: {type: '{file:./t}', command: ['node']}}}, 'withhold', logger),
+      )
+
+      // #then
+      expect(result).not.toHaveProperty('mcp')
     })
 
     it('does not warn when there was no mcp', () => {
@@ -462,13 +761,14 @@ describe('applyOperatorMcpV2', () => {
 
       // #then
       expect(logger.warning).not.toHaveBeenCalled()
+      expect(logger.info).not.toHaveBeenCalled()
     })
 
     it('removes a top-level key whose name carries a {file:} reference, which could resolve to mcp', () => {
       // #given: OpenCode substitutes {file:} in the text before it parses the keys (`{env:}` never gets this far: the
       // config builder rejects it on a withheld run)
       const logger = createMockLogger()
-      const operator = {share: 'disabled', '{file:./key}': {docs: LOCAL}, 'm{file:./x}cp': {docs: LOCAL}}
+      const operator = {share: 'disabled', '{file:./key}': {docs: STATIC_LOCAL}, 'm{file:./x}cp': {docs: STATIC_LOCAL}}
 
       // #when
       const result = unwrapOk(applyOperatorMcpV2(operator, 'withhold', logger))
@@ -478,17 +778,36 @@ describe('applyOperatorMcpV2', () => {
       expect(warnings(logger)).toHaveLength(1)
     })
 
-    it('logs no command, url, header, environment or oauth value', () => {
+    it('removes a referenced top-level key and still filters mcp', () => {
       // #given
+      const operator = {'{file:./key}': {docs: STATIC_LOCAL}, mcp: {docs: STATIC_LOCAL, wiki: REMOTE}}
+
+      // #when
+      const result = unwrapOk(applyOperatorMcpV2(operator, 'withhold', createMockLogger()))
+
+      // #then
+      expect(result).toEqual({mcp: {docs: STATIC_LOCAL}})
+    })
+
+    it('logs server names only, never a configured value', () => {
+      // #given a sentinel in every kind of value, on kept and dropped servers alike
+      const SENTINEL = 'SENTINEL-7f3a91'
       const logger = createMockLogger()
       const mcp = {
-        docs: {type: 'local', command: ['node', '/secret/path/server.mjs'], environment: {TOKEN_VALUE: 'tok-env-1234'}},
-        search: {
-          type: 'remote',
-          url: 'https://user:urlpass-5678@mcp.example.com/mcp?sig=querykey-9012',
-          headers: {'X-Session': '{file:./secret}', Authorization: 'Bearer hdr-secret-3456'},
-          oauth: {clientId: 'cid', clientSecret: 'oauth-secret-7890'},
+        kept: {
+          type: 'local',
+          command: ['node', `/path/${SENTINEL}-cmd.mjs`],
+          cwd: `/cwd/${SENTINEL}`,
+          environment: {[`KEY_${SENTINEL}`]: `value-${SENTINEL}`},
         },
+        refLocal: {type: 'local', command: ['node', `${SENTINEL}-{file:./x}`], environment: {A: SENTINEL}},
+        remote: {
+          type: 'remote',
+          url: `https://user:${SENTINEL}@mcp.example.com/mcp?sig=${SENTINEL}`,
+          headers: {Authorization: `Bearer ${SENTINEL}`, [`X-${SENTINEL}`]: '{file:./secret}'},
+          oauth: {clientId: SENTINEL, clientSecret: SENTINEL},
+        },
+        bad: {type: 'local', command: `${SENTINEL}`},
       }
 
       // #when
@@ -496,20 +815,9 @@ describe('applyOperatorMcpV2', () => {
       const logged = serializeLoggerCalls(logger)
 
       // #then
-      for (const value of [
-        '/secret/path',
-        'tok-env-1234',
-        'urlpass-5678',
-        'querykey-9012',
-        'hdr-secret-3456',
-        'oauth-secret-7890',
-        './secret',
-        'Authorization',
-      ]) {
-        expect(logged).not.toContain(value)
-      }
-      expect(logged).toContain('docs')
-      expect(logged).toContain('search')
+      expect(logged).not.toContain(SENTINEL)
+      for (const forbidden of ['./secret', './x', 'Authorization', 'oauth']) expect(logged).not.toContain(forbidden)
+      for (const name of ['kept', 'refLocal', 'remote', 'bad']) expect(logged).toContain(name)
     })
   })
 })
