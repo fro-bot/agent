@@ -22,7 +22,7 @@ export type OpencodeGeneration =
   {readonly kind: 'v1'; readonly version?: string} | {readonly kind: 'v2'; readonly version: string}
 
 /**
- * `<major>.<minor>.<patch>` with an optional `-prerelease` or `+build` tail (`1.19.4+harness.5bde2635` is the V1
+ * `<major>.<minor>.<patch>` with an optional `-prerelease` or `+build` tail (`1.19.5+harness.bf7f7dfe` is the V1
  * harness form). No leading `v` and no leading zeros: the Dockerfile passes OPENCODE_VERSION as is.
  */
 const VERSION_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:[-+][0-9A-Z.+-]+)?$/i

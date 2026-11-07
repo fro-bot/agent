@@ -48,7 +48,7 @@ export interface CIConfigV2Inputs {
   /**
    * The run's credential disposition (`resolveResponseDelivery`). Required, so a caller cannot omit it into the
    * permissive reading. On `withhold` (`pull_request`, `issue_comment`, `issues`) untrusted text drives the model, so
-   * the operator's `mcp` is removed from the config (`applyOperatorMcpV2`).
+   * the operator's `mcp` is cut to its static local servers (`applyOperatorMcpV2`).
    */
   readonly credential: CredentialDisposition
 }
@@ -177,7 +177,8 @@ export function buildCIConfigV2(inputs: CIConfigV2Inputs, logger: Logger): Resul
     operator = stripOperatorPermissions(parsed, logger)
   }
 
-  // Caller MCP servers (fro-bot/agent#1931): removed on a credential-withheld run, validated otherwise. No permission
+  // Caller MCP servers (fro-bot/agent#1931): filtered to static local servers on a credential-withheld run, validated
+  // otherwise. No permission
   // rule is added: the default agents already allow `*`, and the read-only subagents deny it.
   const withMcpApplied = applyOperatorMcpV2(operator, inputs.credential, logger)
   if (!withMcpApplied.success) return err(withMcpApplied.error.message)
