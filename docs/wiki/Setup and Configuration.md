@@ -154,7 +154,7 @@ The workspace proxy translates the gateway bearer to the current spawn's Basic c
 
 ## Harness Builds
 
-OpenCode is consumed as stock upstream releases or patched V1 harness builds. A harness version carries a `harness.<sha>` suffix and comes from a `fro-bot/agent` release bundling curated upstream integration refs. The current base is `1.19.4`; the exact carry set is `integrationRefs` in `packages/harness/harness.config.json`. Each rebase re-evaluates which patches remain necessary. The Action selects harness builds explicitly through `opencode-version`; its default uses the separate digest-verified stock V2 path above. Harness release publishing no longer opens an Action default-pin sync PR.
+OpenCode is consumed as stock upstream releases or patched V1 harness builds. A harness version carries a `harness.<sha>` suffix and comes from a `fro-bot/agent` release bundling curated upstream integration refs. The current base is `1.19.5`; the exact carry set is `integrationRefs` in `packages/harness/harness.config.json`. Each rebase re-evaluates which patches remain necessary. The Action selects harness builds explicitly through `opencode-version`; its default uses the separate digest-verified stock V2 path above. Harness release publishing no longer opens an Action default-pin sync PR.
 
 ### Two Spellings of the Same Build
 
