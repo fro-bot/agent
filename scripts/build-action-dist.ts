@@ -236,10 +236,13 @@ async function main(): Promise<void> {
   process.exitCode = exitCode
 }
 
-try {
-  await main()
-} catch (error: unknown) {
-  const message = error instanceof Error ? error.message : String(error)
-  process.stderr.write(`[build-action-dist] fatal: ${message}\n`)
-  process.exitCode = 1
+// Direct-execution guard: importing this module (e.g. from the test file) must not run the build.
+if (process.argv[1] !== undefined && fileURLToPath(import.meta.url) === process.argv[1]) {
+  try {
+    await main()
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error)
+    process.stderr.write(`[build-action-dist] fatal: ${message}\n`)
+    process.exitCode = 1
+  }
 }
