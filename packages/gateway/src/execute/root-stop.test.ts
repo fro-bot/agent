@@ -9,13 +9,11 @@ import type {GatewayLogger} from '../discord/client.js'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
 import {
-  probeRootStop,
   QUARANTINE_HOLD_WINDOW_MS,
   ROOT_QUIESCENCE_POLL_INTERVAL_MS,
   ROOT_WATCH_REQUEST_TIMEOUT_MS,
-  rootHasTerminalReply,
-  startQuarantineRootWatch,
-} from './root-stop.js'
+} from './root-stop-v2.js'
+import {probeRootStop, rootHasTerminalReply, startQuarantineRootWatch} from './root-stop.js'
 import {stoppedRootMessages} from './test-helpers.js'
 
 const ROOT = 'sess-root'

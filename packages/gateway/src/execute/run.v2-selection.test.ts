@@ -119,7 +119,7 @@ describe('run: OpenCode generation selection', () => {
     // #given
     const {runMention} = await import('./run.js')
     setupHappyPath()
-    const {RunCoreError} = await import('./run-core.js')
+    const {RunCoreError} = await import('./run-core-shared.js')
     vi.mocked(runOpenCodeCoreV2).mockRejectedValue(new RunCoreError('stream-ended', 'lost'))
     const deps = makeDeps({readyz: readyzReporting('2.2.0')})
 

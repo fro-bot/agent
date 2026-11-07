@@ -18,7 +18,7 @@ import {afterEach, describe, expect, it, vi} from 'vitest'
 import {createPermissionCoordinator} from '../approvals/coordinator.js'
 import {createApprovalRegistry} from '../approvals/registry.js'
 import {createPostReplyFactoryV2, OPERATOR_REJECT_MESSAGE_V2} from './permission-reply-v2.js'
-import {QUARANTINE_HOLD_WINDOW_MS} from './root-stop.js'
+import {QUARANTINE_HOLD_WINDOW_MS} from './root-stop-v2.js'
 import {failure, frames, makeLogger, ROOT, startRun} from './run-core-v2.fixture.js'
 
 const INACTIVITY_MS = 5_000

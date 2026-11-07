@@ -11,7 +11,7 @@ import type {OpenCodeServerHandle, OwnershipLedger} from '@fro-bot/runtime'
 import type {PermissionCoordinator} from '../approvals/coordinator.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {DiscordStreamSink} from '../discord/streaming.js'
-import type {RunCoreError} from './run-core.js'
+import type {RunCoreError} from './run-core-shared.js'
 import {createOwnershipLedger} from '@fro-bot/runtime'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 

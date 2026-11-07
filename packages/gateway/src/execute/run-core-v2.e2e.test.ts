@@ -38,9 +38,9 @@ import {createPermissionCoordinator} from '../approvals/coordinator.js'
 import {createRunGrants, scopeAlwaysToRun} from '../approvals/run-grants.js'
 import {toOperatorWaitReason} from '../operator-contract/wait-reason.js'
 import {createPostReplyFactoryV2} from './permission-reply-v2.js'
+import {RunCoreError} from './run-core-shared.js'
 import {makeCoordinator, makeLogger, makeSink} from './run-core-v2.fixture.js'
 import {runOpenCodeCoreV2} from './run-core-v2.js'
-import {RunCoreError} from './run-core.js'
 import {getWaitReason, onWaitReasonChange} from './wait-reason-registry.js'
 
 const BINARY = process.env.FRO_BOT_OPENCODE_V2_BIN

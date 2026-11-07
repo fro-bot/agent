@@ -16,7 +16,7 @@
  */
 
 import type {RunPhase} from '@fro-bot/runtime'
-import type {ProviderFailureReason} from '../execute/provider-failure.js'
+import type {ProviderFailureReason} from '../execute/provider-failure-v2.js'
 
 /**
  * The closed wire set of provider failure reasons, declared once. The type and the runtime membership set derive

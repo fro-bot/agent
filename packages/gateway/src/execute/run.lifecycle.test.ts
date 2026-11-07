@@ -28,7 +28,7 @@ import {
 } from './test-helpers.js'
 import * as reactionsModule from '../discord/reactions.js'
 import {OWNERSHIP_RELEASE_BUDGET_MS} from './lock-release.js'
-import * as runCoreModule from './run-core.js'
+import * as runCoreModule from './run-core-shared.js'
 import {formatTimeoutDuration} from './run.js'
 /* eslint-enable perfectionist/sort-imports */
 
