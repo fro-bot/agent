@@ -49,9 +49,10 @@ jobs:
       - id: git-user
         name: Get GitHub App User ID and Setup Git user
         env:
+          APP_SLUG: ${{ steps.get-app-token.outputs.app-slug }}
           GH_TOKEN: ${{ steps.get-app-token.outputs.token }}
         run: |
-          name="${{ steps.get-app-token.outputs.app-slug }}[bot]"
+          name="${APP_SLUG}[bot]"
           user_id=$(gh api "/users/${name}" --jq .id)
           email="${user_id}+${name}@users.noreply.github.com"
           echo "user-email=${email}" >> "$GITHUB_OUTPUT"
@@ -99,9 +100,11 @@ jobs:
         run: git push --no-verify --force-with-lease origin HEAD:next
 
       - if: steps.release-preview.outputs.next_version != ''
+        env:
+          NEXT_VERSION: ${{ steps.release-preview.outputs.next_version }}
         name: Generate PR body
         run: |
-          VERSION="${{ steps.release-preview.outputs.next_version }}"
+          VERSION="$NEXT_VERSION"
           last_tag=$(git tag --list 'v*' --sort=-version:refname | { grep -vF '+harness' || true; } | head -1)
           COMMIT_LIST=$(git log "${last_tag}..HEAD" --format='* %s (%h)' --no-merges --max-count=50)
           TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
@@ -119,12 +122,14 @@ jobs:
 
       - if: steps.release-preview.outputs.next_version != ''
         env:
+          DISCOVERED_PR_NUMBER: ${{ steps.discover-release-pr.outputs.pr-number }}
           GH_TOKEN: ${{ steps.get-app-token.outputs.token }}
+          NEXT_VERSION: ${{ steps.release-preview.outputs.next_version }}
         id: upsert-release-pr
         name: Create or Update Release PR
         run: |
-          PR_NUMBER="${{ steps.discover-release-pr.outputs.pr-number }}"
-          VERSION="${{ steps.release-preview.outputs.next_version }}"
+          PR_NUMBER="$DISCOVERED_PR_NUMBER"
+          VERSION="$NEXT_VERSION"
           TITLE="chore(release): pending release v${VERSION}"
           if [ -n "$PR_NUMBER" ]; then
             gh pr edit "$PR_NUMBER" --title "$TITLE" --body-file /tmp/pr-body.md
@@ -171,18 +176,22 @@ jobs:
         name: Delete stale `next` branch
         run: git push --no-verify origin --delete next || true
 
-      - id: merge-policy
+      - env:
+          EVENT_NAME: ${{ github.event_name }}
+          FORCE_RELEASE: ${{ github.event.inputs.force-release }}
+          HAS_OPEN_PR: ${{ steps.discover-release-pr.outputs.has-open-pr }}
+        id: merge-policy
         if: steps.release-preview.outputs.next_version != ''
         name: Decide whether to merge release PR now
         run: |
           SHOULD_MERGE=false
-          if [ "${{ github.event_name }}" = 'schedule' ]; then
+          if [ "$EVENT_NAME" = 'schedule' ]; then
             SHOULD_MERGE=true
           fi
-          if [ "${{ github.event_name }}" = 'workflow_dispatch' ] && [ "${{ github.event.inputs.force-release }}" = 'true' ]; then
+          if [ "$EVENT_NAME" = 'workflow_dispatch' ] && [ "$FORCE_RELEASE" = 'true' ]; then
             SHOULD_MERGE=true
           fi
-          if [ "${{ github.event_name }}" = 'workflow_dispatch' ] && [ "${{ steps.discover-release-pr.outputs.has-open-pr }}" = 'true' ]; then
+          if [ "$EVENT_NAME" = 'workflow_dispatch' ] && [ "$HAS_OPEN_PR" = 'true' ]; then
             SHOULD_MERGE=true
           fi
           echo "should-merge=${SHOULD_MERGE}" >> "$GITHUB_OUTPUT"

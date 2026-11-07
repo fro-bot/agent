@@ -431,6 +431,7 @@ jobs:
       - name: Resolve params
         id: params
         env:
+          BUILD_INTEGRATION_COMMIT: ${{ needs.build.outputs.integration_commit }}
           INPUT_BASE_VERSION: ${{ inputs.base_version }}
           INPUT_DRY_RUN: ${{ inputs.dry_run }}
           PREPARE_BASE_VERSION: ${{ needs.prepare-integrate.outputs.base_version }}
@@ -451,7 +452,7 @@ jobs:
           # Integration commit is resolved once by the build job and passed via job output.
           # This avoids a TOCTOU race where a force-push between build and release could
           # cause the release to use a different commit than build verified.
-          INTEGRATION_COMMIT="${{ needs.build.outputs.integration_commit }}"
+          INTEGRATION_COMMIT="${BUILD_INTEGRATION_COMMIT}"
 
           # Validate base_version: must be a semver-ish string (no shell metacharacters).
           if ! echo "${BASE_VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9._-]+)?$'; then
@@ -881,6 +882,7 @@ jobs:
       - name: Resolve params
         id: params
         env:
+          BUILD_INTEGRATION_COMMIT: ${{ needs.build.outputs.integration_commit }}
           INPUT_BASE_VERSION: ${{ inputs.base_version }}
           INPUT_DRY_RUN: ${{ inputs.dry_run }}
           PREPARE_BASE_VERSION: ${{ needs.prepare-integrate.outputs.base_version }}
@@ -901,7 +903,7 @@ jobs:
           # Integration commit is resolved once by the build job and passed via job output.
           # This avoids a TOCTOU race where a force-push between build and publish could
           # cause publish to use a different commit than build verified.
-          INTEGRATION_COMMIT="${{ needs.build.outputs.integration_commit }}"
+          INTEGRATION_COMMIT="${BUILD_INTEGRATION_COMMIT}"
 
           # Validate base_version: must be a semver-ish string (no shell metacharacters).
           if ! echo "${BASE_VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9._-]+)?$'; then
