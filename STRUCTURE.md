@@ -61,10 +61,6 @@ fro-bot/agent/
 ├── .github/
 │   └── workflows/              # 12 CI/CD workflow files
 │
-├── evals/                      # Gated agent-outcome eval corpus (live runs need FRO_BOT_EVAL=1)
-│   ├── scenarios/             # Frozen scenario definitions and fixture repos
-│   └── baselines/             # Committed reviewed baseline + provenance integrity test
-│
 ├── RFCs/                       # 19 RFC documents (architecture specs)
 ├── docs/
 │   ├── wiki/                   # 9 Obsidian deep-dive pages + index.md
@@ -102,7 +98,6 @@ fro-bot/agent/
 - **`deploy/scripts/`** — Plain Node ESM (`.mjs`) helpers for deploy-time operations (auth validation, config merge, protected-dir creation, legacy checkout ownership migration, agent-side config provisioning, V2 plugin install and image smoke); uses `node --test`, not Vitest.
 - **`deploy/tests/`** — `isolation-harness.sh`, the CI acceptance harness that proves the service/agent uid boundary in a real container started with production's security posture.
 - **`scripts/`** — Repo-level build tooling: action dist builder, hidden-Unicode scrubber, third-party notices, release dispatch, `sync-opencode-v2-pin.ts` (regenerates the OpenCode V2 pin's digests), and `sync-opencode-plugin-effect.ts` (sets the plugin package's `effect` devDependency to the exact version `@opencode/plugin` pins); Renovate runs both as `bun run postupgrade`.
-- **`evals/`** — Gated agent-outcome eval corpus that runs the real execution path against disposable fixture repos; the pure gate and baseline tests run in normal CI, while live scenarios require `FRO_BOT_EVAL=1`.
 - **`.github/workflows/`** — All CI/CD automation; 12 workflow files covering tests, releases, security scanning, and bot triggers.
 - **`RFCs/`** — 19 architecture specification documents; read before making cross-cutting changes.
 - **`docs/wiki/`** — 9 Obsidian deep-dive pages (plus `index.md`) covering architecture, execution lifecycle, prompt design, background subagents, setup, troubleshooting, and the operator surface.

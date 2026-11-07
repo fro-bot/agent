@@ -9,9 +9,6 @@
  *
  * `setupFiles` run inside each test file's worker before the test module graph is imported, so module-level
  * captures such as `os.homedir()` in `src/services/cache/dedup.ts` already see the isolated paths.
- *
- * Live evals (`FRO_BOT_EVAL=1`) opt out: the eval runner builds its own sandbox HOME and has to read the operator's
- * real `auth.json` to provision a provider credential.
  */
 
 import {homedir, tmpdir} from 'node:os'
@@ -23,10 +20,8 @@ import {installHomeIsolation} from './vitest-home-isolation.js'
 
 const isolation = installHomeIsolation({env: process.env, tmpRoot: tmpdir(), homedir})
 
-if (isolation !== null) {
-  // Removal runs in `afterAll`, once per test file. Vitest skips it for a file whose tests are all skipped or that
-  // fails before its suite registers, and the pool ends such workers without any exit hook running (`exit` and
-  // `SIGTERM` handlers were tried: the first never fires, the second fights tests that emit SIGTERM). Those files
-  // leave an empty temp tree for the OS to reap.
-  afterAll(isolation.cleanup)
-}
+// Removal runs in `afterAll`, once per test file. Vitest skips it for a file whose tests are all skipped or that
+// fails before its suite registers, and the pool ends such workers without any exit hook running (`exit` and
+// `SIGTERM` handlers were tried: the first never fires, the second fights tests that emit SIGTERM). Those files
+// leave an empty temp tree for the OS to reap.
+afterAll(isolation.cleanup)
