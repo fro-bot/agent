@@ -38,9 +38,10 @@ jobs:
       - id: get-user-id
         name: Get GitHub App User ID and Setup Git user
         env:
+          APP_SLUG: ${{ steps.get-app-token.outputs.app-slug }}
           GH_TOKEN: ${{ steps.get-app-token.outputs.token }}
         run: |
-          name="${{ steps.get-app-token.outputs.app-slug }}[bot]"
+          name="${APP_SLUG}[bot]"
           user_id=$(gh api "/users/${name}" --jq .id)
           email="${user_id}+${name}@users.noreply.github.com"
           echo "user-email=${email}" >> "$GITHUB_OUTPUT"
@@ -89,10 +90,11 @@ jobs:
         env:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ steps.get-app-token.outputs.token }}
+          NEW_RELEASE_VERSION: ${{ steps.semantic-release.outputs.new-release-version }}
         run: |
-          version=${{ steps.semantic-release.outputs.new-release-version }}
+          version="$NEW_RELEASE_VERSION"
           sha=$(git rev-parse HEAD)
-          branch_name=v$(echo ${version} | cut -d . -f 1)
+          branch_name=v$(echo "${version}" | cut -d . -f 1)
           ref=refs/heads/${branch_name}
           if gh api "repos/{owner}/{repo}/git/ref/heads/${branch_name}" &>/dev/null 2>&1; then
             gh api -X PATCH "repos/{owner}/{repo}/git/${ref}" -f sha=$sha -F force=true

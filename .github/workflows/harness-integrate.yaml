@@ -113,7 +113,7 @@ jobs:
       # cannot create its own target and the model clones into a subdirectory instead,
       # leaving trusted finalization pointed at a path that is not a git repository.
       - name: Create the integration workdir
-        run: mkdir -p "${{ runner.temp }}/harness-integrate-work"
+        run: mkdir -p "$RUNNER_TEMP/harness-integrate-work"
 
       # Trusted inline no-post mint. MUST stay a plain run: step invoking the
       # checked-in script — never a marketplace action with a post: hook (the
