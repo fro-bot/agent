@@ -193,7 +193,7 @@ A few inputs most workflows touch:
 | `agent` | No | — | Agent to use (a primary agent, not a subagent). Defaults to OpenCode's built-in `build` agent |
 | `model` | No | — | Model override in `provider/model` format |
 | `timeout` | No | `1800000` | OpenCode execution timeout in milliseconds; Action-internal only, not the job timeout (`0` = no Action-internal deadline) |
-| `opencode-version` | No | Source-pinned (stock OpenCode V2) | OpenCode CLI version to install. The default, and `latest`, is the stock OpenCode V2 release pinned in the Action (digest-verified); V2 installs only that pinned version. A harness build (`1.19.4+harness.5bde2635`) or a V1 version still installs when pinned explicitly. An existing opencode is reused only when it reports exactly this version (the `-harness.` and `+harness.` spellings are equivalent); otherwise the pinned build is installed. |
+| `opencode-version` | No | Source-pinned (stock OpenCode V2) | OpenCode CLI version to install. The default, and `latest`, is the stock OpenCode V2 release pinned in the Action (digest-verified); V2 installs only that pinned version. A harness build (`1.19.5+harness.bf7f7dfe`) or a V1 version still installs when pinned explicitly. An existing opencode is reused only when it reports exactly this version (the `-harness.` and `+harness.` spellings are equivalent); otherwise the pinned build is installed. |
 | `systematic-version` | No | Source-pinned | Systematic plugin version to register |
 | `skip-cache` | No | `false` | Skip session cache restore |
 | `opencode-config` | No | — | JSON deep-merged into the OpenCode config |
@@ -282,7 +282,7 @@ The Action now runs stock [OpenCode V2](https://opencode.ai/) by default instead
 - **`auth-json`**: only `{"type": "api", "key": "..."}` entries are accepted. An old `{"apiKey": "..."}` entry, or an `oauth`/`wellknown` entry, fails setup.
 - **`opencode-config`**: `permission`, `tools`, `autoupdate` and `subagent_depth` are stripped with a warning, not translated.
 - **Session history**: the first V2 run imports your V1 session history, waiting up to 300 seconds. V2 saves only to its own cache and S3 keys, so the V1 data is left untouched.
-- **Rollback**: pin `opencode-version` to the V1 harness build (`1.19.4+harness.5bde2635`). A V1 run does not see sessions created on V2.
+- **Rollback**: pin `opencode-version` to the V1 harness build (`1.19.5+harness.bf7f7dfe`). A V1 run does not see sessions created on V2.
 
 See [Setup and Configuration](docs/wiki/Setup%20and%20Configuration.md) for how the version is resolved and verified.
 
