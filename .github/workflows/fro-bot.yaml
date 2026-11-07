@@ -419,6 +419,8 @@ jobs:
 
       - name: Compute action execution budget
         id: budget
+        env:
+          JOB_START_EPOCH_MS: ${{ steps.job-start.outputs.epoch-ms }}
         # Derives the action's execution deadline from the job-wide 75-minute cap minus an
         # explicit 15-minute reserve for the action's own teardown (drain owned background
         # work, cancel what will not settle, write a job summary, publish a response) --
@@ -450,7 +452,7 @@ jobs:
         run: |
           set -euo pipefail
           now_ms=$(date +%s%3N)
-          start_ms="${{ steps.job-start.outputs.epoch-ms }}"
+          start_ms="$JOB_START_EPOCH_MS"
           elapsed_ms=$(( now_ms - start_ms ))
           job_cap_ms=$(( 75 * 60 * 1000 ))
           reserve_ms=$(( 15 * 60 * 1000 ))
