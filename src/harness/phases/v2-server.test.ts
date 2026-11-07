@@ -519,7 +519,7 @@ describe('startActionOpenCodeV2', () => {
       expect(config.mcp).toEqual(MCP)
     })
 
-    it('spawns without any mcp on a credential-withheld run', async () => {
+    it('spawns with only the static local server on a credential-withheld run', async () => {
       // #given
       const server = fakeServer()
       const deps = recordingDeps(server)
@@ -531,8 +531,22 @@ describe('startActionOpenCodeV2', () => {
 
       // #then
       expect(result.success).toBe(true)
-      const config = spawnedConfig(deps)
-      expect(config).not.toHaveProperty('mcp')
+      expect(spawnedConfig(deps).mcp).toEqual({docs: MCP.docs})
+    })
+
+    it('spawns without any mcp on a credential-withheld run when no server is a static local one', async () => {
+      // #given
+      const server = fakeServer()
+      const deps = recordingDeps(server)
+
+      // #when
+      const result = await startActionOpenCodeV2(
+        options({deps, credential: 'withhold', opencodeConfig: JSON.stringify({mcp: {wiki: MCP.wiki}})}),
+      )
+
+      // #then
+      expect(result.success).toBe(true)
+      expect(spawnedConfig(deps)).not.toHaveProperty('mcp')
     })
 
     it('fails the config stage before any spawn on a {env:} reference on a credential-withheld run', async () => {

@@ -933,7 +933,7 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
       300_000,
     )
 
-    describe('on a credential-withheld run the whole mcp block is removed', () => {
+    describe('on a credential-withheld run only a static local server survives', () => {
       const STARTED = 'started'
 
       /** A stdio server that records that it was started, for the cases where nothing may start it. */
@@ -944,17 +944,54 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
         return {command: [process.execPath, file], marker}
       }
 
-      it('lists nothing and runs no tool for a plain local server', async () => {
+      it.each([
+        ['mcp.<name>', (server: object) => ({echo: server})],
+        ['mcp.servers.<name>', (server: object) => ({servers: {echo: server}})],
+      ])(
+        'lists a static local server as active and runs its tool through the default agent: %s',
+        async (_spelling, spell) => {
+          // #given a static stdio server, and a model that calls its tool through Code Mode
+          const box = createSandbox()
+          sandboxes.push(box)
+          const provider = await startScriptedProvider([CALL_ECHO, {text: 'Done.'}], 'unexpected extra turn')
+          providers.push(provider)
+          const real = await startRealServer(box, provider, [], {
+            extra: {mcp: spell(writeEchoMcpServer(box))},
+            credential: 'withhold',
+          })
+          await waitForMcpConnected(real, 'echo')
+
+          // #when
+          const result = await executePhase(real, box, 120_000)
+          const listed = (await (await real.fetch('/api/mcp')).json()) as {data: {name: string}[]}
+
+          // #then the server is active and its tool ran
+          expect(listed.data.map(server => server.name)).toEqual(['echo'])
+          expect(toolMessages(provider)).toContain('echo: hello mcp')
+          expect(toolMessages(provider)).not.toContain(AUTOMATION_REJECT_MESSAGE)
+          expect(result).toMatchObject({success: true, exitCode: 0, llmError: null})
+        },
+        300_000,
+      )
+
+      it('starts no command for a local server whose command is a {file:} reference, beside a kept one', async () => {
         // #given
         const box = createSandbox()
         sandboxes.push(box)
+        writeFileSync(path.join(box.repo, 'cmd'), process.execPath)
+        const {command, marker} = writeMarkerServer(box)
 
         // #when
-        const {result, listed} = await runWithheld(box, {mcp: {echo: writeEchoMcpServer(box)}})
+        const {listed} = await runWithheld(box, {
+          mcp: {
+            echo: writeEchoMcpServer(box),
+            referenced: {type: 'local', command: ['{file:./cmd}', ...command.slice(1)]},
+          },
+        })
 
         // #then
-        expect(listed).toEqual([])
-        expect(result).toMatchObject({success: true})
+        expect(existsSync(marker)).toBe(false)
+        expect((listed as {name: string}[]).map(server => server.name)).toEqual(['echo'])
       }, 300_000)
 
       it('sends no request to a remote server whose header is a {file:} reference', async () => {

@@ -149,7 +149,7 @@
       // and reviewed. Raise after validating a newer release. The Action default derives
       // from the V2 pin file below, so this cap no longer touches it.
       matchPackageNames: ['@opencode-ai/sdk', 'anomalyco/opencode'],
-      allowedVersions: '<=1.19.4',
+      allowedVersions: '<=1.19.5',
     },
     {
       // V2 pin: keep AFTER the V1 cap (later rule wins; pin-invariants.test.ts reads the first cap).
