@@ -36,7 +36,7 @@ Highest-traffic entry points — see [STRUCTURE.md](STRUCTURE.md) for the full d
 - **Adapter pattern**: `CacheAdapter`, `ExecAdapter` for testable I/O
 - **Prettier**: 120-char line width via `@bfra.me/prettier-config/120-proof`
 - **Vitest**: Colocated `.test.ts` files; BDD comments (`// #given`, `// #when`, `// #then`)
-- **Test isolation**: Every Vitest run gets a throwaway temp `HOME` + `XDG_*` (`scripts/vitest-home-isolation.setup.ts`, via root `vitest.config.ts` `setupFiles`); tests must never read or write the real home, and pass explicit env/dirs when asserting default-path resolution. Live evals (`FRO_BOT_EVAL=1`) opt out
+- **Test isolation**: Every Vitest run gets a throwaway temp `HOME` + `XDG_*` (`scripts/vitest-home-isolation.setup.ts`, via root `vitest.config.ts` `setupFiles`); tests must never read or write the real home, and pass explicit env/dirs when asserting default-path resolution
 - **Exception**: `deploy/scripts/` uses plain Node ESM (`.mjs`) with the built-in `node --test` runner — not Vitest, not a workspace package, no build step; run in CI via the `workspace-smoke` job
 
 ## ANTI-PATTERNS (THIS PROJECT)
@@ -54,9 +54,8 @@ Highest-traffic entry points — see [STRUCTURE.md](STRUCTURE.md) for the full d
 
 ```bash
 bun install                          # Install dependencies
-bun run test                         # Run workspace package tests + evals/ (vitest from repo root)
+bun run test                         # Run workspace package tests (vitest from repo root)
 bun run test:scripts                 # Run only scripts/ tests
-bun run test:evals                   # Run only evals/ tests (live scenarios need FRO_BOT_EVAL=1)
 bun run lint                         # ESLint check (also checks the committed dist/ for hidden Unicode)
 bun run fix                          # ESLint auto-fix
 bun run check-types                  # TypeScript type check (tsc --noEmit)

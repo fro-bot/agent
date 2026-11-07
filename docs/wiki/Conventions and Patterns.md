@@ -154,7 +154,7 @@ Test files use BDD-style comments to structure assertions:
 
 External dependencies (`@actions/core`, `@actions/github`, `@opencode-ai/sdk`) are mocked with `vi.mock()`. Internal modules are not mocked — tests exercise real code paths through the layer below.
 
-The root `vitest.config.ts` supplies a setup file before each test file imports application modules. `scripts/vitest-home-isolation.ts` redirects HOME and the XDG config, data, state, and cache paths into a disposable temporary tree, so tests that exercise default path resolution do not touch a developer's OpenCode history or credentials. It verifies that `os.homedir()` follows the override and fails rather than running unisolated; live evals (`FRO_BOT_EVAL=1`) opt out because their runner manages its own sandbox and needs real provider authentication.
+The root `vitest.config.ts` supplies a setup file before each test file imports application modules. `scripts/vitest-home-isolation.ts` redirects HOME and the XDG config, data, state, and cache paths into a disposable temporary tree, so tests that exercise default path resolution do not touch a developer's OpenCode history or credentials. It verifies that `os.homedir()` follows the override and fails rather than running unisolated.
 
 Vitest 5 no longer searches parent directories for configuration. Workspace package test commands therefore name `../../vitest.config.ts` explicitly, and the Action suite sets its root to the repository. The workspace-test image copies that shared configuration and its imported scripts as well. `scripts/vitest-config-wiring.test.ts` checks these entry points so a package-local run cannot silently lose home isolation or incomplete-run detection after a toolchain update.
 
