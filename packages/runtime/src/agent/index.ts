@@ -293,6 +293,7 @@ export type {
   EnsureOpenCodeResult,
   EventType,
   ExecutionConfig,
+  FilePartInput,
   HydratedContext,
   IssueContext,
   ParsedCommand,
@@ -302,6 +303,7 @@ export type {
   ReactionContext,
   ReferenceFile,
   SessionContext,
+  TextPartInput,
   TriggerContext,
   TriggerTarget,
 } from './types.js'

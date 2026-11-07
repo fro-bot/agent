@@ -1,4 +1,3 @@
-import type {FilePartInput} from '@opencode-ai/sdk'
 import type {LogicalSessionKey, SessionSearchResult, SessionSummary} from '../session/index.js'
 import type {ModelConfig, ResolvedOutputMode, ResponseMode, TokenUsage} from '../shared/types.js'
 import type {ErrorInfo} from './error-format/types.js'
@@ -7,6 +6,24 @@ import type {ResponseSurface} from './response-file.js'
 
 export type {LogicalSessionKey, SessionSearchResult, SessionSummary} from '../session/index.js'
 export type {OutputMode, ResolvedOutputMode, ResponseMode} from '../shared/types.js'
+
+/**
+ * A file attached to a prompt: the `{type, mime, url, filename}` shape the OpenCode V1 SDK's `FilePartInput` had, kept
+ * as a local structural type so nothing in the shared code depends on the SDK. The V2 prompt takes `{uri, name}`, and
+ * the Action maps this shape onto it (`execution-v2.ts`).
+ */
+export interface FilePartInput {
+  readonly type: 'file'
+  readonly mime: string
+  readonly url: string
+  readonly filename?: string
+}
+
+/** A text part of a prompt, in the same V1 SDK-compatible shape as {@link FilePartInput}. */
+export interface TextPartInput {
+  readonly type: 'text'
+  readonly text: string
+}
 
 // Canonically owned by `./error-format/types.js`; re-exported for `./types.js` callers.
 export type {ErrorInfo, ErrorType} from './error-format/types.js'

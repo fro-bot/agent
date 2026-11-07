@@ -4,7 +4,7 @@ import {isAbsolute, relative} from 'node:path'
 import process from 'node:process'
 import {describe, expect, it} from 'vitest'
 
-import {defaultOpenCodeConfigDir} from './no-task-reuse-config.js'
+import {defaultOpenCodeConfigDir} from './opencode-config-dir.js'
 
 // Live evals opt out of isolation (see vitest-home-isolation.setup.ts).
 const isolationEnabled = process.env.FRO_BOT_EVAL !== '1'

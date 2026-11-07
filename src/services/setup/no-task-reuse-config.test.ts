@@ -6,7 +6,6 @@ import {fileURLToPath, pathToFileURL} from 'node:url'
 import {afterEach, beforeEach, describe, expect, it} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {
-  defaultOpenCodeConfigDir,
   noTaskReusePluginPath,
   noTaskReusePluginSpec,
   taskReuseGuardServerConfig,
@@ -36,22 +35,6 @@ describe('noTaskReusePluginPath / noTaskReusePluginSpec', () => {
     // #then the URL is escaped and decodes back to exactly the file the writer targets
     expect(spec.startsWith('file:///')).toBe(true)
     expect(fileURLToPath(spec)).toBe(noTaskReusePluginPath(configDir))
-  })
-
-  it('defaults the config dir to ~/.config/opencode', () => {
-    // #given/#when/#then
-    expect(defaultOpenCodeConfigDir({})).toBe(path.join(os.homedir(), '.config', 'opencode'))
-  })
-
-  it('follows XDG_CONFIG_HOME, the directory the server reads its global config from', () => {
-    // #given a runner that relocates XDG_CONFIG_HOME (filterAgentEnv forwards XDG_* to the server)
-    // #when/#then the guard is registered where the server looks, not under a hard-coded ~/.config
-    expect(defaultOpenCodeConfigDir({XDG_CONFIG_HOME: '/srv/xdg'})).toBe('/srv/xdg/opencode')
-  })
-
-  it('ignores an empty XDG_CONFIG_HOME (GitHub Actions materializes unset env as an empty string)', () => {
-    // #given/#when/#then
-    expect(defaultOpenCodeConfigDir({XDG_CONFIG_HOME: '  '})).toBe(path.join(os.homedir(), '.config', 'opencode'))
   })
 })
 
