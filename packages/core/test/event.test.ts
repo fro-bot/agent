@@ -13,6 +13,7 @@ import { Location } from "@opencode-ai/core/location"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
 import { eq } from "drizzle-orm"
+import { ConstraintError, LockTimeoutError, SqlError } from "effect/unstable/sql/SqlError"
 import { location } from "./fixture/location"
 import { testEffect } from "./lib/effect"
 
@@ -120,6 +121,19 @@ describe("EventV2", () => {
 
       expect(event.type).toBe("test.versioned")
       expect(event.durable?.version).toBe(2)
+    }),
+  )
+
+  it.effect("retries only SQLite lock timeouts", () =>
+    Effect.sync(() => {
+      expect(
+        EventV2.isLockTimeoutSqlError(new SqlError({ reason: new LockTimeoutError({ cause: new Error("locked") }) })),
+      ).toBeTrue()
+      expect(
+        EventV2.isLockTimeoutSqlError(
+          new SqlError({ reason: new ConstraintError({ cause: new Error("constraint") }) }),
+        ),
+      ).toBeFalse()
     }),
   )
 
