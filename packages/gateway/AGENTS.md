@@ -398,3 +398,5 @@ bun run --filter @fro-bot/gateway lint
 ```
 
 The build runs `tsc --noEmit` for type checking, then `tsdown` to bundle `src/main.ts` into `dist/main.mjs` (single ESM file). Production deployment runs that bundle inside the container image — see `deploy/gateway.Dockerfile`.
+
+The gateway image has no package manager: the base's npm, yarn and corepack are removed (#2117). Nothing at runtime may shell out to them.

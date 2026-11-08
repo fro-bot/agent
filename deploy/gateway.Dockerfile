@@ -105,6 +105,26 @@ FROM node:24.22.2-alpine3.24@sha256:a34ab6d7f6f4813f4d0c5469d74685604b962fbdbf57
 
 WORKDIR /app
 
+# The gateway uses no package manager, so drop the base's npm, yarn and corepack. npm's own dependency tree carries
+# HIGH CVEs that overrides can't reach (#2117).
+RUN rm -rf \
+      /usr/local/lib/node_modules/npm \
+      /usr/local/lib/node_modules/corepack \
+      /opt/yarn-v* \
+      /usr/local/bin/npm \
+      /usr/local/bin/npx \
+      /usr/local/bin/corepack \
+      /usr/local/bin/yarn \
+      /usr/local/bin/yarnpkg \
+      /root/.npm \
+      /root/.cache \
+    && for tool in npm npx yarn yarnpkg corepack; do \
+         if command -v "${tool}" >/dev/null 2>&1; then \
+           echo "${tool} is still present after removal" >&2; exit 1; \
+         fi; \
+       done \
+    && node --version
+
 # Copy production node_modules from build stage
 COPY --from=build /workspace/node_modules ./node_modules
 COPY --from=build /workspace/packages/gateway/package.json ./packages/gateway/package.json
