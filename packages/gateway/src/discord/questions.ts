@@ -331,12 +331,24 @@ export const QUESTION_FALLBACK_RESOLVED_NOTICE = '✅ The agent question was res
 
 type SettlementActor = QuestionSettlement['actor']
 
+/** Longest login shown on a settled card; GitHub logins are far shorter, so this only bounds a malformed one. */
+const WEB_LOGIN_MAX = 64
+
+/**
+ * How a dashboard (web) decider is named on a settled card: the login as bounded, escaped plain text — Discord cannot
+ * resolve it to a user — followed by the origin marker. `null` for an empty login. Shared by the approval and
+ * question cards so the two cannot drift.
+ */
+export function webDeciderLabel(login: string): string | null {
+  const bounded = boundQuestionText(login.trim(), WEB_LOGIN_MAX).trim()
+  return bounded.length === 0 ? null : `${escapeText(bounded)} (dashboard)`
+}
+
 function actorLabel(actor: SettlementActor): string | null {
   if (actor === null) return null
   if (actor.kind === 'run-grant') return null
   if (actor.kind === 'discord-user') return /^\d{1,25}$/.test(actor.userId) ? `<@${actor.userId}>` : null
-  const login = boundQuestionText(actor.login, 64).trim()
-  return login.length === 0 ? null : escapeText(login)
+  return webDeciderLabel(actor.login)
 }
 
 function answerLines(answers: QuestionAnswers): string[] {
