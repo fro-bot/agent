@@ -263,6 +263,43 @@ RUN apk add --no-cache \
       tini \
     && /sbin/tini --version
 
+# Package managers for agent tasks: Bun (the binary `build-deps` verified) and npm 12. The base's bundled npm 11,
+# yarn and corepack are removed, because npm 11's own dependency tree carries HIGH CVEs that overrides can't reach
+# (#2117). The V2 plugin install below uses OpenCode's in-process arborist, not this npm.
+ARG NPM_VERSION=12.2.2
+COPY --from=build-deps /usr/local/bin/bun /usr/local/bin/bun
+RUN set -euo pipefail \
+    && case "${NPM_VERSION}" in \
+         *[!0-9A-Za-z._-]*) echo "NPM_VERSION contains disallowed characters: ${NPM_VERSION}" >&2; exit 1 ;; \
+         [0-9]*.[0-9]*.[0-9]*) : ;; \
+         *) echo "NPM_VERSION is not a semver-like version: ${NPM_VERSION}" >&2; exit 1 ;; \
+       esac \
+    && ln -s bun /usr/local/bin/bunx \
+    && npm install -g --prefix /tmp/npm-next --cache /tmp/npm-cache \
+         --ignore-scripts --no-audit --no-fund "npm@${NPM_VERSION}" \
+    && rm -rf \
+         /usr/local/lib/node_modules/npm \
+         /usr/local/lib/node_modules/corepack \
+         /opt/yarn-v* \
+         /usr/local/bin/npm \
+         /usr/local/bin/npx \
+         /usr/local/bin/corepack \
+         /usr/local/bin/yarn \
+         /usr/local/bin/yarnpkg \
+    && mv /tmp/npm-next/lib/node_modules/npm /usr/local/lib/node_modules/npm \
+    && ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+    && rm -rf /tmp/npm-next /tmp/npm-cache /root/.npm /root/.cache \
+    && [ "$(npm --version)" = "${NPM_VERSION}" ] \
+    && [ "$(npx --version)" = "${NPM_VERSION}" ] \
+    && bun --version \
+    && bunx --version \
+    && for tool in yarn yarnpkg corepack; do \
+         if command -v "${tool}" >/dev/null 2>&1; then \
+           echo "${tool} is still present after removal" >&2; exit 1; \
+         fi; \
+       done
+
 # ── Unprivileged OpenCode agent account ─────────────────────────────────────
 # The workspace-agent SERVICE stays uid 0 (reduced capabilities only — see
 # compose.yaml). OpenCode itself — and everything it spawns as tools — runs as

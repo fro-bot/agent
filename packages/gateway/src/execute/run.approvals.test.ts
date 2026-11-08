@@ -1748,6 +1748,22 @@ describe('approval dispose/shutdown: onDispose fail-closes pending registry entr
   })
 })
 
+function captureOnPending() {
+  const captured: {onPending?: (req: import('../approvals/coordinator.js').PermissionRequest) => void} = {}
+  mockCreatePermissionCoordinator.mockImplementation(coordinatorDeps => {
+    captured.onPending = coordinatorDeps.onPending
+    return {
+      onPermissionAsked: vi.fn(),
+      onPermissionReplied: vi.fn(),
+      pending: vi.fn().mockReturnValue([]),
+      dispose: vi.fn(),
+      addOwnedSession: vi.fn(),
+      isOwned: vi.fn().mockReturnValue(true),
+    }
+  })
+  return captured
+}
+
 describe('approval transport selection', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -1781,6 +1797,97 @@ describe('approval transport selection', () => {
     expect(capturedOnPending).toBeDefined()
     // #and — execution completed (Discord path unchanged)
     expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+  })
+
+  describe('operator-stream announce for a Discord-launched run (#2115)', () => {
+    const request: import('../approvals/coordinator.js').PermissionRequest = {
+      requestID: 'per_d1',
+      sessionID: 'ses_d1',
+      permission: 'bash',
+      patterns: [],
+      title: 'Run command: ls',
+    }
+
+    it('registers the run id with the thread scope, and announces each request once registered', async () => {
+      // #given a Discord mention and an announce hook factory
+      const {runMention} = await import('./run.js')
+      setupHappyPath()
+      const captured = captureOnPending()
+      const order: string[] = []
+      const approvalRegistry = makeApprovalRegistry()
+      vi.mocked(approvalRegistry.register).mockImplementation(() => {
+        order.push('register')
+        return Symbol('registration')
+      })
+      const announce = vi.fn(() => {
+        order.push('announce')
+      })
+      const createApprovalOnRegistered = vi.fn(() => announce)
+      const thread = makeThread()
+      thread.send.mockResolvedValue({id: 'm', edit: vi.fn()})
+      const deps = {...makeDeps({approvalRegistry}), createApprovalOnRegistered}
+
+      // #when the run raises a permission request
+      await runMention(makeMessage(thread), makeBinding(), deps)
+      captured.onPending?.(request)
+      await new Promise(resolve => setTimeout(resolve, 0))
+
+      // #then the hook was built for this run, once, with the shared registry
+      expect(createApprovalOnRegistered).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({approvalRegistry, runId: expect.any(String) as unknown, repo: 'acme/widget'}),
+      )
+      const builtRunId = (createApprovalOnRegistered.mock.calls[0] as unknown as [{runId: string}])[0].runId
+      // #and the entry carries both keys: the thread (Discord button) and the run (dashboard)
+      expect(approvalRegistry.register).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({approvalScopeId: thread.id, runId: builtRunId}),
+      )
+      expect(announce).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({requestID: 'per_d1'}))
+      expect(order.slice(0, 2)).toEqual(['register', 'announce'])
+    })
+
+    it('a run launched with its own approval transport (web) does not use the Discord announce hook', async () => {
+      // #given a web-surface launch that supplies its own transport
+      const {launchWork} = await import('./run.js')
+      setupHappyPath()
+      const captured = captureOnPending()
+      const createApprovalOnRegistered = vi.fn(() => vi.fn())
+      const webOnPending = vi.fn()
+      const noopSettle = (_delivered: boolean) => undefined
+      const launch: import('./launch-types.js').LaunchWorkRequest = {
+        promptText: 'do the thing',
+        channelId: CHANNEL_ID,
+        guildId: undefined,
+        surface: 'web',
+        binding: makeBinding(),
+        requester: {kind: 'web-operator', githubUserId: 1, login: 'octocat', sessionCorrelationId: 's'},
+        statusSink: {
+          noteActivity: vi.fn(),
+          setBusy: vi.fn(),
+          resolveToAnswer: vi.fn().mockResolvedValue({transition: 'delegated'}),
+          resolveToFailure: vi.fn().mockResolvedValue({transition: 'delegated'}),
+          dispose: vi.fn().mockResolvedValue(undefined),
+          setReaction: vi.fn(),
+        },
+        replySink: {
+          send: vi.fn().mockResolvedValue({success: true, data: undefined}),
+          append: vi.fn(),
+          flush: vi.fn().mockResolvedValue({kind: 'sent', charCount: 0}),
+          buffered: vi.fn().mockReturnValue(''),
+          hasVisibleOutput: vi.fn().mockReturnValue(false),
+          markVisibleOutputSent: vi.fn(),
+          markVisibleOutputPending: vi.fn().mockReturnValue(noopSettle),
+        },
+        createApprovalOnPending: () => webOnPending,
+      }
+
+      // #when
+      await awaitLaunchWorkRun(launchWork, launch, {...makeDeps(), createApprovalOnRegistered})
+      captured.onPending?.(request)
+
+      // #then the web transport announces for itself; the Discord hook is never built (no double frames)
+      expect(webOnPending).toHaveBeenCalledOnce()
+      expect(createApprovalOnRegistered).not.toHaveBeenCalled()
+    })
   })
 
   it('createApprovalOnPending factory is called with engine-owned context and its callback is used instead of Discord transport', async () => {

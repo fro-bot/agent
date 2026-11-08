@@ -1,4 +1,5 @@
 import type {CoordinationConfig} from '@fro-bot/runtime'
+import type {ReplySink} from './launch-types.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 /* eslint-disable perfectionist/sort-imports -- ./test-helpers.js must import before any real module
    it mocks, to register vi.mock() side effects before those modules are evaluated */
@@ -29,6 +30,50 @@ import * as runCoreModule from './run-core-shared.js'
 // ---------------------------------------------------------------------------
 
 const CANCEL_RUN_ID = 'cancel-run-id-1'
+
+// Drives the REAL Discord stream sink (over a fake thread) behind a ReplySink, because the in-memory sink
+// never posts the `_(no output)_` placeholder (#2116).
+async function makeRealStreamReplySink(): Promise<{
+  readonly replySink: ReplySink
+  readonly threadSend: ReturnType<typeof vi.fn>
+}> {
+  const {createDiscordStreamSink} =
+    await vi.importActual<typeof import('../discord/streaming.js')>('../discord/streaming.js')
+  const threadSend = vi.fn().mockResolvedValue(undefined)
+  const stream = createDiscordStreamSink({send: threadSend})
+  const replySink: ReplySink = {
+    send: vi.fn().mockResolvedValue({success: true, data: undefined}),
+    append: text => stream.append(text),
+    flush: async options => stream.flush(options),
+    buffered: () => stream.buffered(),
+    hasVisibleOutput: () => stream.hasVisibleOutput(),
+    markVisibleOutputSent: () => stream.markVisibleOutputSent(),
+    markVisibleOutputPending: () => stream.markVisibleOutputPending(),
+  }
+  return {replySink, threadSend}
+}
+
+const sentContents = (threadSend: ReturnType<typeof vi.fn>): string[] =>
+  threadSend.mock.calls.map((call: unknown[]) => (call[0] as {content?: string}).content ?? '')
+
+async function runCancelled(runId: string, bufferedText: string): Promise<ReturnType<typeof vi.fn>> {
+  const {launchWork} = await import('./run.js')
+  setupHappyPath()
+  mockRunOpenCodeCore.mockImplementation(async () => {
+    abortRegistry.abort(runId, 'operator cancel')
+    throw new runCoreModule.RunCoreError('timeout', 'combined signal aborted')
+  })
+  const {replySink, threadSend} = await makeRealStreamReplySink()
+  if (bufferedText !== '') replySink.append(bufferedText)
+  const request = makeInMemoryRequest({replySink})
+  ;(request as {runId?: string}).runId = runId
+  await awaitLaunchWorkRun(launchWork, request, makeDeps())
+
+  const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+  expect(transitionPhases).toContain('CANCELLED')
+  abortRegistry.delete(runId)
+  return threadSend
+}
 
 describe('operator cancel — abort-registry integration', () => {
   beforeEach(() => {
@@ -1025,6 +1070,52 @@ describe('operator cancel — abort-registry integration', () => {
     expect(replySink.buffered()).toBe('partial output streamed before cancel')
 
     abortRegistry.delete(PARTIAL_OUTPUT_RUN_ID)
+  })
+
+  describe('#2116 — empty-output placeholder after cancel', () => {
+    it('cancel with an empty buffer posts nothing to the thread (no _(no output)_)', async () => {
+      // #given/#when
+      const threadSend = await runCancelled('cancel-empty-run-id-1', '')
+
+      // #then
+      expect(sentContents(threadSend)).toEqual([])
+    })
+
+    it('cancel with a whitespace-only buffer posts nothing to the thread', async () => {
+      // #given/#when
+      const threadSend = await runCancelled('cancel-whitespace-run-id-1', '  \n\t ')
+
+      // #then
+      expect(sentContents(threadSend)).toEqual([])
+    })
+
+    it('cancel with partial text still flushes it to the thread', async () => {
+      // #given/#when
+      const threadSend = await runCancelled('cancel-partial-run-id-1', 'partial output streamed before cancel')
+
+      // #then
+      expect(sentContents(threadSend)).toEqual(['partial output streamed before cancel'])
+    })
+
+    it('non-cancelled failure with an empty buffer still posts _(no output)_', async () => {
+      // #given — a run that fails (not cancelled) having streamed nothing. A COMPLETED run cannot
+      // exercise this at engine level: its provenance line is appended to the buffer before flush.
+      const {launchWork} = await import('./run.js')
+      setupHappyPath()
+      mockRunOpenCodeCore.mockRejectedValue(new runCoreModule.RunCoreError('stream-ended', 'stream closed'))
+      const {replySink, threadSend} = await makeRealStreamReplySink()
+      const request = makeInMemoryRequest({replySink})
+      ;(request as {runId?: string}).runId = 'fail-empty-run-id-1'
+
+      // #when
+      await awaitLaunchWorkRun(launchWork, request, makeDeps())
+
+      // #then — settled FAILED (not CANCELLED) and the placeholder is unchanged
+      const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+      expect(transitionPhases).toContain('FAILED')
+      expect(transitionPhases).not.toContain('CANCELLED')
+      expect(sentContents(threadSend)).toEqual(['_(no output)_'])
+    })
   })
 
   it('abort for an unknown/already-completed runId is a registry no-op — no signal fired, run unaffected', async () => {

@@ -45,9 +45,11 @@
  *
  * ### register-before-send
  *
- * Callers MUST call `register()` before attempting to post the Discord embed.
- * Once the embed is posted successfully, call `attachMessage(requestID, renderFn)`
- * so that settled state can edit the message.
+ * Callers MUST call `register()` before attempting to post the Discord embed,
+ * and attach their settle renderer (`attachMessage(requestID, renderFn)`) right
+ * after it, NOT after the post resolves: a decision can land while the post is in
+ * flight, and a renderer attached later would find the entry already settled and
+ * gone. A renderer that has no message to edit yet keeps the outcome until it has.
  * If the send fails, call `markMessagePostFailed(requestID)` — the entry stays
  * registered so the permission can still be POSTed when it settles.
  */
@@ -98,6 +100,22 @@ export type {DiscordApprovalActor, WebOperatorActor} from './request-gate.js'
  */
 export type ApprovalActor = GateActor
 
+/**
+ * Arguments of {@link ApprovalRegistry.handleDecision}.
+ *
+ * `runId` binds a **web operator** to a run: the decision is accepted only when the request was raised by that run,
+ * and then the entry's scope is not compared (the dashboard holds no Discord thread id; the route has already
+ * authorized the repo). A mismatch answers `not-found`, the same as an unknown request, so a caller cannot tell
+ * whether the id exists. Every other actor is bound by `approvalScopeId` alone; `runId` is ignored for them.
+ */
+export interface DecisionArgs {
+  readonly requestID: string
+  readonly approvalScopeId: string
+  readonly runId?: string
+  readonly decision: PermissionReply
+  readonly actor: ApprovalActor
+}
+
 /** Render function injected after the approval embed/notification is posted successfully. */
 export type RenderFn = (
   request: PermissionRequest,
@@ -115,6 +133,12 @@ export interface ApprovalSideEffects {
   ) => Promise<{readonly ok: boolean; readonly error?: string}>
 }
 
+/**
+ * Opaque identity of one `register` call. A request id can be registered again (a re-ask), so an operation that must
+ * apply to exactly the registration it was started for takes this, not the id.
+ */
+export type RegistrationId = symbol
+
 export interface RegisterParams {
   readonly requestID: string
   readonly sessionID: string
@@ -129,6 +153,12 @@ export interface RegisterParams {
    * Replaces the Discord-shaped `channelID` field.
    */
   readonly approvalScopeId: string
+  /**
+   * The run that raised the request, for every transport. Unlike `approvalScopeId` (a Discord thread id on a
+   * Discord run), this is the key a web operator uses, so the run-scoped listing and the run-bound decision
+   * reach a Discord-run approval. Absent only for callers that predate it: such an entry is invisible to both.
+   */
+  readonly runId?: string
   /** Workspace dir for reply routing. */
   readonly directory: string
   readonly request: PermissionRequest
@@ -168,11 +198,15 @@ export type DecisionOutcome =
 export type {EntryState} from './request-gate.js'
 
 export interface ApprovalRegistry {
-  /** Register a new entry BEFORE sending the approval embed/notification. */
-  register: (params: RegisterParams) => void
   /**
-   * Attach the settled-embed render function once the approval notification is
-   * posted. Must be called after `register` and only when the send succeeds.
+   * Register a new entry BEFORE sending the approval embed/notification. Returns the identity of this registration,
+   * for {@link ApprovalRegistry.rejectUndeliverable}.
+   */
+  register: (params: RegisterParams) => RegistrationId
+  /**
+   * Attach a settle renderer to a registered entry. Renderers accumulate (one per transport: the SSE settle frame,
+   * the Discord card edit) and all run, in attach order, on every settlement path. A transport that cannot attach
+   * (its post failed) simply attaches nothing; the others still run.
    */
   attachMessage: (requestID: string, renderFn: RenderFn) => void
   /**
@@ -181,6 +215,14 @@ export interface ApprovalRegistry {
    * the render step is skipped since there is nothing to edit.
    */
   markMessagePostFailed: (requestID: string) => void
+  /**
+   * The approval notification can never be delivered (terminal Discord error): reject the permission and retire the
+   * entry, but only if this is still the SAME registration AND it is still `open`. The check and the claim happen in
+   * one synchronous step, so nothing can interleave. An entry that is `claimed` (an operator decision is in flight,
+   * and its approval may still succeed), settled, replaced by a re-ask, or unknown is left exactly as it is, and
+   * `'skipped'` tells the caller not to announce a denial. The in-flight decision then settles through its own path.
+   */
+  rejectUndeliverable: (requestID: string, registration: RegistrationId) => Promise<'rejected' | 'skipped'>
   has: (requestID: string) => boolean
   pending: () => readonly string[]
   /**
@@ -212,17 +254,18 @@ export interface ApprovalRegistry {
    */
   describePendingForScope: (approvalScopeId: string) => readonly PendingApprovalDTO[]
   /**
+   * Same as {@link describePendingForScope}, keyed by the run that raised the request instead of the scope it was
+   * registered under. This is what the web routes use: a Discord run registers under its thread id, which a web
+   * operator never holds. Only `open` entries; an entry registered without a run id is never returned.
+   */
+  describePendingForRun: (runId: string) => readonly PendingApprovalDTO[]
+  /**
    * Transport-neutral decision intake: enforce scope binding, single-winner
    * claim, POST reply. Does NOT edit the embed/notification.
    *
    * Replaces the Discord-shaped `handleButtonDecision` method.
    */
-  handleDecision: (args: {
-    readonly requestID: string
-    readonly approvalScopeId: string
-    readonly decision: PermissionReply
-    readonly actor: ApprovalActor
-  }) => Promise<DecisionOutcome>
+  handleDecision: (args: DecisionArgs) => Promise<DecisionOutcome>
   /**
    * Settle an open approval from the run's own grant (an operator's earlier Always): claim it through the same
    * single-winner gate an operator click uses, and send `once`. An operator click that already claimed the entry
@@ -268,8 +311,12 @@ export interface ApprovalPayload {
   readonly effects: ApprovalSideEffects
   /** Only `reject` is accepted: part of the request is hidden from the operator. Fixed at registration. */
   readonly rejectOnly: boolean
-  /** Set by attachMessage once the approval notification is posted. */
-  renderFn: RenderFn | null
+  /** Identity of the `register` call that created this entry. */
+  readonly registration: RegistrationId
+  /** The run that raised the request; null when the registrant did not say. */
+  readonly runId: string | null
+  /** Settle renderers pushed by attachMessage, one per transport that can show the settlement. */
+  readonly renderFns: RenderFn[]
 }
 
 const RUN_GRANT_ACTOR: GateActor = {kind: 'run-grant'}
@@ -326,12 +373,14 @@ export function createApprovalRegistry(deps: {
     decision: PermissionReply,
     reason: SettlementReason,
   ): Promise<void> {
-    const {renderFn} = entry.payload
-    if (renderFn === null) return
-    try {
-      await renderFn(entry.payload.request, decision, entry.actor, reason)
-    } catch (error) {
-      gate.logRenderFailure(entry, reason, error)
+    // Sequential, in attach order: the SSE settle frame is attached first, so a slow Discord edit never delays it.
+    // Each renderer is isolated: one that throws is logged and the rest still run.
+    for (const renderFn of entry.payload.renderFns) {
+      try {
+        await renderFn(entry.payload.request, decision, entry.actor, reason)
+      } catch (error) {
+        gate.logRenderFailure(entry, reason, error)
+      }
     }
   }
 
@@ -339,17 +388,18 @@ export function createApprovalRegistry(deps: {
   // register
   // -------------------------------------------------------------------------
 
-  function register(params: RegisterParams): void {
+  function register(params: RegisterParams): RegistrationId {
     const {requestID, sessionID, approvalScopeId, directory, request, effects, deadlineMs, onDeadlineSettled} = params
     // Fail closed when any part of what is being approved is hidden: the frame's detail was cut by length, or the
     // transport said its own surface cannot show it in full.
     const rejectOnly = params.rejectOnly === true || isRequestDetailTruncated(request)
+    const registration: RegistrationId = Symbol(`approval:${requestID}`)
     const entry: ApprovalGateEntry = {
       family: 'approval',
       requestID,
       sessionID,
       scopeId: approvalScopeId,
-      payload: {request, directory, effects, rejectOnly, renderFn: null},
+      payload: {request, directory, effects, rejectOnly, registration, runId: params.runId ?? null, renderFns: []},
       ops: {
         // The next two return the underlying promise instead of wrapping it in an async function:
         // an async wrapper adds microtask ticks to the fail-close chain, whose depth the
@@ -374,12 +424,15 @@ export function createApprovalRegistry(deps: {
     if (replaced !== undefined) {
       // Best-effort render the old embed as superseded so its buttons become visibly inert.
       // Wrapped so it never throws into register.
-      if (replaced.family === 'approval' && replaced.payload.renderFn !== null) {
-        // eslint-disable-next-line no-void
-        void replaced.payload.renderFn(replaced.payload.request, 'reject', null, 'superseded').catch(() => {})
+      if (replaced.family === 'approval') {
+        for (const renderFn of replaced.payload.renderFns) {
+          // eslint-disable-next-line no-void
+          void renderFn(replaced.payload.request, 'reject', null, 'superseded').catch(() => {})
+        }
       }
       logger.warn({requestID}, 'ApprovalRegistry: duplicate requestID — overwriting (re-ask)')
     }
+    return registration
   }
 
   // -------------------------------------------------------------------------
@@ -392,7 +445,7 @@ export function createApprovalRegistry(deps: {
       logger.warn({requestID}, 'ApprovalRegistry: attachMessage — entry not found (already settled?)')
       return
     }
-    entry.payload.renderFn = renderFn
+    entry.payload.renderFns.push(renderFn)
   }
 
   function markMessagePostFailed(requestID: string): void {
@@ -401,7 +454,22 @@ export function createApprovalRegistry(deps: {
       logger.warn({requestID}, 'ApprovalRegistry: markMessagePostFailed — entry not found (already settled?)')
       return
     }
-    logger.warn({requestID}, 'ApprovalRegistry: embed post failed — entry stays registered, renderFn will be skipped')
+    logger.warn({requestID}, 'ApprovalRegistry: embed post failed — entry stays registered, the card render is skipped')
+  }
+
+  // -------------------------------------------------------------------------
+  // rejectUndeliverable
+  // -------------------------------------------------------------------------
+
+  async function rejectUndeliverable(requestID: string, registration: RegistrationId): Promise<'rejected' | 'skipped'> {
+    const entry = getEntry(requestID)
+    if (entry === undefined || entry.payload.registration !== registration || entry.state !== 'open') {
+      return 'skipped'
+    }
+    // No await between the check above and the claim inside applySettlement (it reads the entry and takes the gate's
+    // retire step synchronously), so a decision cannot slip in between.
+    await applySettlement({requestID, decision: 'reject', reason: 'disposed'})
+    return 'rejected'
   }
 
   // -------------------------------------------------------------------------
@@ -420,10 +488,10 @@ export function createApprovalRegistry(deps: {
     return gate.hasPendingForScope('approval', approvalScopeId)
   }
 
-  function describePendingForScope(approvalScopeId: string): readonly PendingApprovalDTO[] {
+  function describeOpen(matches: (entry: ApprovalGateEntry) => boolean): readonly PendingApprovalDTO[] {
     const result: PendingApprovalDTO[] = []
     for (const entry of approvalEntries()) {
-      if (entry.scopeId !== approvalScopeId) continue
+      if (!matches(entry)) continue
       // Only return 'open' entries — 'claimed' entries are mid-decision (in-flight)
       // and not actionable by the browser; returning them would render a prompt
       // the browser cannot decide.
@@ -444,21 +512,33 @@ export function createApprovalRegistry(deps: {
     return result
   }
 
+  function describePendingForScope(approvalScopeId: string): readonly PendingApprovalDTO[] {
+    return describeOpen(entry => entry.scopeId === approvalScopeId)
+  }
+
+  function describePendingForRun(runId: string): readonly PendingApprovalDTO[] {
+    return describeOpen(entry => entry.payload.runId !== null && entry.payload.runId === runId)
+  }
+
   // -------------------------------------------------------------------------
   // handleDecision (transport-neutral decision intake)
   // -------------------------------------------------------------------------
 
-  async function handleDecision(args: {
-    readonly requestID: string
-    readonly approvalScopeId: string
-    readonly decision: PermissionReply
-    readonly actor: ApprovalActor
-  }): Promise<DecisionOutcome> {
-    const {requestID, approvalScopeId, decision, actor} = args
+  async function handleDecision(args: DecisionArgs): Promise<DecisionOutcome> {
+    const {requestID, decision, actor} = args
 
     const entry = getEntry(requestID)
     if (entry === undefined) {
       return 'not-found'
+    }
+
+    // A web operator is bound to the run in the URL, not to the entry's scope (a Discord thread id they never hold).
+    // The run is checked before anything else, and a mismatch is indistinguishable from an unknown id: no
+    // `channel-mismatch` here, or the route would confirm that another run's request id exists.
+    let approvalScopeId = args.approvalScopeId
+    if (actor.kind === 'web-operator' && args.runId !== undefined) {
+      if (entry.payload.runId !== args.runId) return 'not-found'
+      approvalScopeId = entry.scopeId
     }
 
     // Refuse before the claim, so a refused approve leaves the entry open for the operator's reject. The scope check
@@ -744,10 +824,12 @@ export function createApprovalRegistry(deps: {
     register,
     attachMessage,
     markMessagePostFailed,
+    rejectUndeliverable,
     has,
     pending,
     hasPendingForScope,
     describePendingForScope,
+    describePendingForRun,
     handleDecision,
     autoApprove,
     confirmReply,

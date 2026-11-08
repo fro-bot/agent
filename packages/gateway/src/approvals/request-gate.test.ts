@@ -477,7 +477,9 @@ function makeEntry(requestID: string, postDeadlineReply = vi.fn().mockResolvedVa
       directory: '/ws',
       effects: {postReply: vi.fn()},
       rejectOnly: false,
-      renderFn: null,
+      registration: Symbol('registration'),
+      runId: null,
+      renderFns: [],
     },
     ops: {
       postDeadlineReply,
