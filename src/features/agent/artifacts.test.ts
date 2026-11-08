@@ -1,5 +1,5 @@
 import {describe, expect, it, vi} from 'vitest'
-import {detectArtifacts} from './streaming.js'
+import {detectArtifacts} from './streaming-v2.js'
 
 describe('detectArtifacts', () => {
   it('detects PR creation from output', () => {

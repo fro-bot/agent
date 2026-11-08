@@ -29,7 +29,6 @@
 import type {LedgerReconcileAdapter, OpenCodeServerHandle, OwnershipLedger, TaskNotice} from '@fro-bot/runtime'
 import type {GatewayLogger} from '../discord/client.js'
 import type {ReplyTextPart} from './reply-delivery.js'
-
 import {
   getBooleanProperty,
   getNumberProperty,
@@ -40,35 +39,7 @@ import {
   toErrorMessage,
 } from '@fro-bot/runtime'
 
-/**
- * Every code a declined admission attempt reports (to the debug log and to `onNotAdmitted`). Declared once: the
- * operator wait-reason mapping is exhaustive over it.
- */
-export const DRAIN_REJECT_CODES = [
-  'root-liveness-unavailable',
-  'root-live',
-  'root-messages-unavailable',
-  'no-root-user-message',
-  'stream-user-message-not-persisted',
-  'latest-root-user-message-unanswered',
-  'notice-not-observed',
-  'reply-text-not-delivered',
-  'revision-drift',
-  'idle-evidence-stale',
-  'ledger-not-drained',
-  'validation-threw',
-  // V2 only: the directory-quiescence window is counting with the ledger already drained, or a reading failed.
-  'directory-quiet-window',
-  'directory-unreadable',
-] as const
-
-export type DrainRejectCode = (typeof DRAIN_REJECT_CODES)[number]
-
-/** Cadence of re-validation while draining. A rejected pass is re-run no faster than this. */
-export const DRAIN_VALIDATION_INTERVAL_MS = 1_000
-
-/** Upper bound on every REST request a validation pass makes. */
-export const DRAIN_REQUEST_TIMEOUT_MS = 5_000
+import {DRAIN_REQUEST_TIMEOUT_MS, DRAIN_VALIDATION_INTERVAL_MS, type DrainRejectCode} from './drain-completion-v2.js'
 
 /**
  * Upstream's `MessageAbortedError` (`packages/core/src/v1/session.ts`: `NamedError.create("MessageAbortedError")`),

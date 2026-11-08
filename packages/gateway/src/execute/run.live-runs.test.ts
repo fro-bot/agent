@@ -12,7 +12,7 @@ import {
   mockRuntime,
   setupHappyPath,
 } from './test-helpers.js'
-import * as runCoreModule from './run-core.js'
+import * as runCoreModule from './run-core-shared.js'
 import {abortRegistry} from './abort-registry.js'
 import {isRunLive} from './live-run-registry.js'
 import {isRunOwnedByThisProcess} from './stranded-run-sweep.js'

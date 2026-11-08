@@ -9,10 +9,13 @@
  */
 import type {Event} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
-import type {ExecutionDeadline, PromptStartResult} from './retry.js'
+import type {ExecutionDeadline} from './execution-deadline.js'
+import type {PromptStartResult} from './retry.js'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
-import {createExecutionDeadline, EVENT_STREAM_CONNECT_TIMEOUT_MS, runPromptAttempt} from './retry.js'
+import {createExecutionDeadline} from './execution-deadline.js'
+import {EVENT_STREAM_CONNECT_TIMEOUT_MS} from './retry-v2.js'
+import {runPromptAttempt} from './retry.js'
 
 // v2 wait is unavailable, so completion detection falls back to the stream/poll path under test.
 vi.mock('@opencode-ai/sdk/v2', () => ({

@@ -439,8 +439,45 @@ describe('buildQuestionSettledEmbed', () => {
     }).toJSON()
 
     expect(embed.title).toBe('⏭️ Skipped')
-    expect(embed.description).toContain(String.raw`Skipped by octo\*\*cat`)
+    expect(embed.description).toContain(String.raw`Skipped by octo\*\*cat (dashboard)`)
     expect(embed.fields).toBeUndefined()
+  })
+
+  it('names a dashboard answerer as plain text with the origin marker and no mention', () => {
+    // #given an answer submitted from the dashboard
+    const embed = buildQuestionSettledEmbed(undefined, {
+      reason: 'replied',
+      answers: [['prod']],
+      actor: {kind: 'web-operator', githubUserId: 1, login: 'octocat', sessionCorrelationId: 's'},
+    }).toJSON()
+
+    // #then
+    expect(embed.title).toBe('✅ Answered')
+    expect(embed.description).toBe('Answered by octocat (dashboard)')
+    expect(JSON.stringify(embed)).not.toContain('<@')
+  })
+
+  it('escapes and caps a long, markdown-laden dashboard login', () => {
+    // #given a login with emphasis markers, a mention-shaped run, and far more than 64 characters
+    const login = `_a*b_ @everyone ${'x'.repeat(200)}`
+    const embed = buildQuestionSettledEmbed(undefined, {
+      reason: 'replied',
+      answers: [['prod']],
+      actor: {kind: 'web-operator', githubUserId: 1, login, sessionCorrelationId: 's'},
+    }).toJSON()
+
+    // #then only the first 64 characters survive, escaped, with the marker after them
+    expect(embed.description).toBe(`Answered by ${String.raw`\_a\*b\_`} @everyone ${'x'.repeat(64 - 16)} (dashboard)`)
+  })
+
+  it('omits the by-line for a dashboard answerer with a blank login', () => {
+    const embed = buildQuestionSettledEmbed(undefined, {
+      reason: 'replied',
+      answers: [['prod']],
+      actor: {kind: 'web-operator', githubUserId: 1, login: '   ', sessionCorrelationId: 's'},
+    }).toJSON()
+
+    expect(embed.description).toBeUndefined()
   })
 
   it.each([

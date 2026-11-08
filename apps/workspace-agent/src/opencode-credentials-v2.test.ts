@@ -1,4 +1,4 @@
-import type {Logger} from './opencode-server.js'
+import type {Logger} from './types.js'
 
 import {describe, expect, it, vi} from 'vitest'
 

@@ -8,8 +8,7 @@
 import type {BackupsDeps} from './backups.js'
 import type {CloneHandlerDeps, CloneHandlerResult} from './clone.js'
 import type {InspectHandlerDeps, InspectHandlerResult} from './inspect.js'
-import type {InstanceDisposer} from './opencode-instance.js'
-import type {Logger} from './opencode-server.js'
+import type {InstanceDisposer} from './opencode-instance-v2.js'
 import type {ExecuteRecoveryDeps, PreviewRecoveryDeps} from './recover.js'
 import type {
   BackupsValidationFailure,
@@ -23,6 +22,7 @@ import type {
   InspectFailure,
   InspectRequest,
   ListBackupsResult,
+  Logger,
   PreviewRecoveryRequest,
   PreviewRecoveryResult,
   PreviewRecoveryValidationFailure,

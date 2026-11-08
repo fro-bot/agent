@@ -33,13 +33,11 @@ describe('installHomeIsolation', () => {
     const b = installHomeIsolation({env: envB, tmpRoot, homedir: followingHome(envB)})
 
     // #then the roots, and every variable pointed into them, are distinct
-    expect(a).not.toBeNull()
-    expect(b).not.toBeNull()
-    expect(a?.root).not.toBe(b?.root)
+    expect(a.root).not.toBe(b.root)
     for (const key of ISOLATED_KEYS) {
       expect(envA[key]).toBeDefined()
       expect(envA[key]).not.toBe(envB[key])
-      expect(envA[key]?.startsWith(`${a?.root}/`)).toBe(true)
+      expect(envA[key]?.startsWith(`${a.root}/`)).toBe(true)
       expect(existsSync(envA[key] ?? '')).toBe(true)
     }
   })
@@ -56,45 +54,12 @@ describe('installHomeIsolation', () => {
     writeFileSync(join(envA.HOME ?? '', '.rc'), 'x')
 
     // #when the first file finishes
-    a?.cleanup()
+    a.cleanup()
 
     // #then its tree is gone (files included), the second is intact, and cleanup is idempotent
-    expect(existsSync(a?.root ?? '')).toBe(false)
-    expect(existsSync(b?.root ?? '')).toBe(true)
-    expect(() => a?.cleanup()).not.toThrow()
-  })
-
-  it('is disabled by FRO_BOT_EVAL=1 and preserves the existing HOME/XDG values', () => {
-    // #given an env with live-eval opt-out and pre-existing values
-    const env: Record<string, string | undefined> = {
-      FRO_BOT_EVAL: '1',
-      HOME: '/real/home',
-      XDG_CONFIG_HOME: '/real/xdg/config',
-      XDG_DATA_HOME: '/real/xdg/data',
-      XDG_STATE_HOME: '/real/xdg/state',
-      XDG_CACHE_HOME: '/real/xdg/cache',
-    }
-    const before = {...env}
-
-    // #when
-    const result = installHomeIsolation({env, tmpRoot, homedir: followingHome(env)})
-
-    // #then nothing was created and nothing was overwritten
-    expect(result).toBeNull()
-    expect(env).toEqual(before)
-    expect(readdirSync(tmpRoot)).toEqual([])
-  })
-
-  it('does not treat other FRO_BOT_EVAL values as an opt-out', () => {
-    // #given
-    const env: Record<string, string | undefined> = {FRO_BOT_EVAL: '0', HOME: '/real/home'}
-
-    // #when
-    const result = installHomeIsolation({env, tmpRoot, homedir: followingHome(env)})
-
-    // #then
-    expect(result).not.toBeNull()
-    expect(env.HOME).not.toBe('/real/home')
+    expect(existsSync(a.root)).toBe(false)
+    expect(existsSync(b.root)).toBe(true)
+    expect(() => a.cleanup()).not.toThrow()
   })
 
   it('fails closed and removes its tree when homedir() ignores the HOME override', () => {

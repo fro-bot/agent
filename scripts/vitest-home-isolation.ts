@@ -26,14 +26,10 @@ export interface HomeIsolation {
 /**
  * Points `HOME` and `XDG_{CONFIG,DATA,STATE,CACHE}_HOME` at a fresh temp tree and returns its handle.
  *
- * Returns `null` without touching `env` when `FRO_BOT_EVAL=1`: the live eval runner builds its own sandbox HOME and has
- * to read the operator's real `auth.json`. Fails closed: when `homedir()` does not follow the `HOME` override (a
- * `worker_threads` pool, whose `process.env` is a copy), the tree is removed and an error is thrown rather than running
- * unisolated.
+ * Fails closed: when `homedir()` does not follow the `HOME` override (a `worker_threads` pool, whose `process.env` is
+ * a copy), the tree is removed and an error is thrown rather than running unisolated.
  */
-export function installHomeIsolation({env, tmpRoot, homedir}: HomeIsolationOptions): HomeIsolation | null {
-  if (env.FRO_BOT_EVAL === '1') return null
-
+export function installHomeIsolation({env, tmpRoot, homedir}: HomeIsolationOptions): HomeIsolation {
   const root = mkdtempSync(join(realpathSync(tmpRoot), 'fro-bot-test-home-'))
   const home = join(root, 'home')
   const isolated = {

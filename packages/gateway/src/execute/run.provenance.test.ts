@@ -134,7 +134,7 @@ describe('checkout provenance', () => {
     // #given
     const {launchWork} = await import('./run.js')
     setupHappyPath()
-    const {RunCoreError} = await import('./run-core.js')
+    const {RunCoreError} = await import('./run-core-shared.js')
     mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('stream-ended', 'stream closed'))
     const request = makeInMemoryRequest()
     const deps = makeDeps({update: makeUpdateFn('ready')})
@@ -996,7 +996,7 @@ describe('the deterministic provenance line appears exactly once per delivery mo
     // the SAME buffer/guard mechanism as the success path ("so the buffer-only web
     // transport still carries it"), before flushing
     const {launchWork} = await import('./run.js')
-    const {RunCoreError} = await import('./run-core.js')
+    const {RunCoreError} = await import('./run-core-shared.js')
     setupHappyPath()
     mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('stream-ended', 'stream closed', true))
     const request = makeInMemoryRequest()

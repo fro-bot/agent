@@ -22,11 +22,35 @@ import type {DirectoryActivity, RemoteOpenCodeV2Client} from '@fro-bot/runtime'
 import type {GatewayLogger} from '../discord/client.js'
 
 import {observeDirectoryV2, toErrorMessage} from '@fro-bot/runtime'
-import {
-  QUARANTINE_HOLD_WINDOW_MS,
-  ROOT_QUIESCENCE_POLL_INTERVAL_MS,
-  ROOT_WATCH_REQUEST_TIMEOUT_MS,
-} from './root-stop.js'
+
+/** Cadence of the root-quiescence probe (inside the barrier's budget and during the quarantine hold). */
+export const ROOT_QUIESCENCE_POLL_INTERVAL_MS = 500
+
+/** Upper bound on one probe or abort request during the quarantine hold, so a hung request cannot stall the watch. */
+export const ROOT_WATCH_REQUEST_TIMEOUT_MS = 5_000
+
+/**
+ * Upper bound, in milliseconds, on how long a quarantined run's lock lease and
+ * concurrency slot are held past the failure that quarantined it.
+ *
+ * The termination barrier (`settle-owned-sessions.ts`) already spends up to
+ * `DEFAULT_SETTLE_TIMEOUT_MS` (15 s) trying to confirm settlement before giving
+ * up and quarantining. This window is deliberately much larger than that bound —
+ * roughly 20x — so a background child that is genuinely still finishing a write
+ * after being cancelled (a slow git operation, a large diff) is not abandoned
+ * mid-write, while still being short enough that a wedged concurrency slot
+ * recovers unattended rather than needing an operator to notice and intervene.
+ *
+ * Only the concurrency slot is released deterministically at this boundary (see
+ * `scheduleQuarantineRelease` in `run.ts`). The repo lock is left to lapse via its own lease TTL
+ * (`CoordinationConfig.lockTtlSeconds`, 900 s / 15 min by default) once this window stops
+ * renewing it. An expired lease is NOT reclaimed on elapsed time alone: acquisition and the
+ * operator `force-release-lock` both require a clear OpenCode workspace status check first, so a
+ * quarantined run whose children are still busy keeps the repo blocked.
+ *
+ * Lives here, not in `run.ts`, so the root watch that covers the same window does not import the run pipeline.
+ */
+export const QUARANTINE_HOLD_WINDOW_MS = 5 * 60_000
 
 /** The longest the shell DELETEs of one stop may take together. Its own bound: a stalled DELETE must not use up more. */
 export const STOP_DELETE_TIMEOUT_MS = 2_000

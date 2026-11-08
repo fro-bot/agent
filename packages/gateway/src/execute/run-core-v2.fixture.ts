@@ -19,8 +19,8 @@ import type {
 import type {PermissionCoordinator} from '../approvals/coordinator.js'
 import type {QuestionCoordinator} from '../approvals/question-coordinator.js'
 import type {GatewayLogger} from '../discord/client.js'
+import type {RunCoreError} from './run-core-shared.js'
 import type {RunCoreV2Params} from './run-core-v2.js'
-import type {RunCoreError} from './run-core.js'
 import type {ShellServerOptions} from './shell-server-v2.fixture.js'
 
 import {err, ok} from '@fro-bot/runtime'

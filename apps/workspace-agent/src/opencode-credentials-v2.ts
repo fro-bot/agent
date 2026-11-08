@@ -21,7 +21,7 @@
  */
 
 import type {CredentialRequestOptions, CredentialResult} from '@fro-bot/runtime/workspace-v2'
-import type {Logger} from './opencode-server.js'
+import type {Logger} from './types.js'
 import {
   boundedCredentialRequest,
   credentialFailure,

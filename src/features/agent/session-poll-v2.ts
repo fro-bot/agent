@@ -1,11 +1,10 @@
 import type {ErrorInfo, OwnershipLedger, RemoteOpenCodeV2Client} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
 import type {AttemptObservation, FailureObservation} from './attempt-outcome.js'
-import type {ExecutionDeadline} from './retry.js'
+import type {ExecutionDeadline} from './execution-deadline.js'
 import type {ActivityTrackerV2} from './streaming-v2.js'
 import {createAgentError} from '@fro-bot/runtime'
 import {toErrorMessage} from '../../shared/errors.js'
-import {ledgerBlocksCompletion, waitForAbortableDelay} from './session-poll.js'
 import {getObservedFailureV2} from './streaming-v2.js'
 
 /**
@@ -23,6 +22,7 @@ import {getObservedFailureV2} from './streaming-v2.js'
  */
 
 const POLL_INTERVAL_MS = 500
+const EVENT_PROCESSOR_SHUTDOWN_TIMEOUT_MS = 2_000
 const REST_POLL_EVERY_TICKS = 4
 const REST_REQUEST_TIMEOUT_MS = 5_000
 const INACTIVE_READS_REQUIRED = 2
@@ -216,4 +216,64 @@ export async function pollForSessionCompletionObservationV2(options: PollOptions
   }
 
   return terminalObservationOnAbort(options)
+}
+
+/**
+ * `true` when a supplied ledger still has owned work outstanding — the gate every
+ * terminal completion path in this module (and in `retry.ts`) consults before
+ * reporting `completed: true`. Absent ledger means single-session behavior:
+ * never blocks (backward-compatible no-op), matching `isOwnedSession` in
+ * `streaming.ts`.
+ */
+export function ledgerBlocksCompletion(ledger?: OwnershipLedger): boolean {
+  return ledger !== undefined && ledger.isDrainComplete() === false
+}
+
+export async function waitForAbortableDelay(delayMs: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted === true) return Promise.resolve()
+
+  return new Promise(resolve => {
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    let onAbort: (() => void) | undefined
+    const finish = (): void => {
+      if (timeout != null) clearTimeout(timeout)
+      if (signal != null && onAbort != null) signal.removeEventListener('abort', onAbort)
+      resolve()
+    }
+
+    timeout = setTimeout(finish, delayMs)
+    if (signal != null) {
+      onAbort = finish
+      signal.addEventListener('abort', onAbort, {once: true})
+    }
+  })
+}
+
+export async function waitForEventProcessorShutdown(
+  eventProcessor: Promise<void>,
+  timeoutMs: number = EVENT_PROCESSOR_SHUTDOWN_TIMEOUT_MS,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (signal?.aborted === true) return
+  let timeoutId: ReturnType<typeof setTimeout> | undefined
+  let onAbort: (() => void) | undefined
+  const abortPromise =
+    signal == null
+      ? null
+      : new Promise<void>(resolve => {
+          onAbort = () => resolve()
+          signal.addEventListener('abort', onAbort, {once: true})
+        })
+  try {
+    await Promise.race([
+      eventProcessor,
+      new Promise<void>(resolve => {
+        timeoutId = setTimeout(resolve, timeoutMs)
+      }),
+      ...(abortPromise == null ? [] : [abortPromise]),
+    ])
+  } finally {
+    if (timeoutId != null) clearTimeout(timeoutId)
+    if (signal != null && onAbort != null) signal.removeEventListener('abort', onAbort)
+  }
 }

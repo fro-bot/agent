@@ -73,7 +73,8 @@ import type {OwnershipLedger, SessionClient} from '@fro-bot/runtime'
 import type {GatewayLogger} from '../discord/client.js'
 
 import {createSdkLedgerReconcileAdapter, reconcileLedgerOnce, toErrorMessage} from '@fro-bot/runtime'
-import {abortSession, probeRootStop, ROOT_QUIESCENCE_POLL_INTERVAL_MS} from './root-stop.js'
+import {ROOT_QUIESCENCE_POLL_INTERVAL_MS} from './root-stop-v2.js'
+import {abortSession, probeRootStop} from './root-stop.js'
 import {toRuntimeLogger} from './runtime-logger.js'
 
 export {ROOT_QUIESCENCE_POLL_INTERVAL_MS}

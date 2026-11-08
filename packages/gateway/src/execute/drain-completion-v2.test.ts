@@ -5,7 +5,7 @@ import type {
   SubagentNotice,
 } from '@fro-bot/runtime'
 import type {GatewayLogger} from '../discord/client.js'
-import type {DrainRejectCode} from './drain-completion.js'
+import type {DrainRejectCode} from './drain-completion-v2.js'
 
 import {createDirectoryStabilityGate, createOwnershipLedger, err, ok, shellLedgerKey} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'

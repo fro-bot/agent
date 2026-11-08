@@ -24,7 +24,8 @@
 
 import type {AddressInfo} from 'node:net'
 import type {OpenCodeV2StartError, StartOpenCodeV2ServerOptions} from '@fro-bot/runtime/workspace-v2'
-import type {Logger, SupervisedStatusRef} from './opencode-server.js'
+import type {SupervisedStatusRef} from './opencode-server-v2.js'
+import type {Logger} from './types.js'
 
 import {Buffer} from 'node:buffer'
 import {execFileSync, spawnSync} from 'node:child_process'

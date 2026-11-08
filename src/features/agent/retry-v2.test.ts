@@ -14,9 +14,9 @@ import {
 } from '@fro-bot/runtime/event-v2-fixtures'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
+import {createDeadlineExceededError, createExecutionDeadline} from './execution-deadline.js'
 import {createFakeServer, frame, ROOT_SESSION_ID, STARTED, SUCCEEDED} from './execution-v2.fixture.js'
 import {runPromptAttemptV2} from './retry-v2.js'
-import {createDeadlineExceededError, createExecutionDeadline} from './retry.js'
 import {observeRootTerminal} from './session-poll-v2.js'
 import {createActivityTrackerV2} from './streaming-v2.js'
 

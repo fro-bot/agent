@@ -13,7 +13,8 @@ import type {DiscordStreamSink} from '../discord/streaming.js'
 import {createOwnershipLedger} from '@fro-bot/runtime'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
-import {RunCoreError, runOpenCodeCore} from './run-core.js'
+import {RunCoreError} from './run-core-shared.js'
+import {runOpenCodeCore} from './run-core.js'
 import {stoppedRootMessages} from './test-helpers.js'
 
 /** The first frame of every event stream: the run waits for it before it sends the prompt. */

@@ -12,8 +12,8 @@
  */
 import type {Event} from '@opencode-ai/sdk'
 import type {Logger} from '../../shared/logger.js'
-import type {AttemptResult} from './prompt-sender.js'
-import type {ExecutionDeadline} from './retry.js'
+import type {AttemptResult} from './attempt-outcome.js'
+import type {ExecutionDeadline} from './execution-deadline.js'
 import type {PromptOptions} from './types.js'
 import {createOwnershipLedger} from '@fro-bot/runtime'
 import {createOpencode} from '@opencode-ai/sdk'
@@ -21,7 +21,7 @@ import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {runDrain} from '../../harness/phases/execute.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {executeOpenCode} from './execution.js'
-import {MAX_LLM_RETRIES} from './retry.js'
+import {MAX_LLM_RETRIES} from './retry-v2.js'
 
 /** The first frame of every event stream: a new prompt is sent only after it is read. */
 const SERVER_CONNECTED = {type: 'server.connected', properties: {}} as unknown as Event
@@ -215,9 +215,9 @@ function createControlledDeadline(): {
 }
 
 async function mockControlledDeadline(): Promise<ReturnType<typeof createControlledDeadline>> {
-  const actualRetry = await vi.importActual<typeof import('./retry.js')>('./retry.js')
+  const actualRetry = await vi.importActual<typeof import('./execution-deadline.js')>('./execution-deadline.js')
   const controlled = createControlledDeadline()
-  vi.doMock('./retry.js', () => ({
+  vi.doMock('./execution-deadline.js', () => ({
     ...actualRetry,
     createExecutionDeadline: vi.fn().mockReturnValue(controlled.deadline),
   }))
@@ -617,7 +617,7 @@ describe('executeOpenCode — finalizer abort matrix (step 6 of the settlement r
 
   afterEach(async () => {
     vi.doUnmock('./prompt-sender.js')
-    vi.doUnmock('./retry.js')
+    vi.doUnmock('./execution-deadline.js')
     vi.doUnmock('./prompt.js')
     vi.resetModules()
     vi.useRealTimers()
@@ -891,7 +891,7 @@ describe('executeOpenCode — finalizer abort matrix (step 6 of the settlement r
     // itself, so this is a genuinely new assertion. The finalizer itself never calls either --
     // this proves the *admission* check at the top of the retry loop (which does) correctly sets
     // the selected stopping cause the finalizer then trusts.
-    const actualRetry = await vi.importActual<typeof import('./retry.js')>('./retry.js')
+    const actualRetry = await vi.importActual<typeof import('./execution-deadline.js')>('./execution-deadline.js')
     const deadline: ExecutionDeadline = {
       timeoutMs: 1_000,
       signal: new AbortController().signal,
@@ -901,7 +901,7 @@ describe('executeOpenCode — finalizer abort matrix (step 6 of the settlement r
       run: async operation => operation(),
       dispose: vi.fn(),
     }
-    vi.doMock('./retry.js', () => ({
+    vi.doMock('./execution-deadline.js', () => ({
       ...actualRetry,
       createExecutionDeadline: vi.fn().mockReturnValue(deadline),
     }))

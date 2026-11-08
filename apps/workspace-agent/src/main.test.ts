@@ -8,8 +8,10 @@
  */
 
 import type {CreateAppFn, ExitFn, ServeFn} from './main.js'
-import type {CreateInstanceDisposerOptions, InstanceDisposer} from './opencode-instance.js'
-import type {OpencodeProxyHandle, OpencodeProxyOptions} from './opencode-proxy.js'
+import type {InstanceDisposer} from './opencode-instance-v2.js'
+import type {CreateInstanceDisposerOptions} from './opencode-instance.js'
+import type {OpencodeProxyHandle} from './opencode-proxy-v2.js'
+import type {OpencodeProxyOptions} from './opencode-proxy.js'
 import type {RunSupervisedOpencodeOptions} from './opencode-server.js'
 import type {ProxyListeningRef, ServerDeps} from './server.js'
 

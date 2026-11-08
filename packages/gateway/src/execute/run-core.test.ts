@@ -23,7 +23,8 @@ import {createQuestionRegistry} from '../approvals/question-registry.js'
 import {createRequestGate} from '../approvals/request-gate.js'
 import {createDiscordStreamSink} from '../discord/streaming.js'
 import {createWebReplySink} from '../web/operator/web-sinks.js'
-import {RunCoreError, runOpenCodeCore, wrapLedgerWithHooks} from './run-core.js'
+import {RunCoreError} from './run-core-shared.js'
+import {runOpenCodeCore} from './run-core.js'
 import {stoppedRootMessages} from './test-helpers.js'
 
 // ---------------------------------------------------------------------------
@@ -4416,47 +4417,6 @@ describe('runOpenCodeCore', () => {
 
       controller.abort()
       await expect(runPromise).rejects.toThrow()
-    })
-
-    it('a settle of an already-settled entry fires no persistence write', () => {
-      // #given — a direct unit test of the wrapper itself. Through the real
-      // `runOpenCodeCore` → `reconcileLedgerOnce` integration path, `settle()` can only
-      // ever be called once per entry per genuine transition (see `wrapLedgerWithHooks`'s
-      // doc comment for why that path cannot force a true duplicate deterministically) —
-      // exercising the wrapper directly is the reliable way to prove its no-op branch.
-      const rawLedger = createOwnershipLedger()
-      rawLedger.adopt(CHILD, 'background task')
-      rawLedger.settle(CHILD)
-      const onChange = vi.fn()
-      const onAdopted = vi.fn()
-      const wrapped = wrapLedgerWithHooks(rawLedger, onChange, onAdopted)
-
-      // #when — settle() is called again on an entry that is already settled.
-      wrapped.settle(CHILD)
-
-      // #then — no persistence write for a call that changed nothing.
-      expect(onChange).not.toHaveBeenCalled()
-      expect(rawLedger.snapshot().find(e => e.sessionId === CHILD)?.state).toBe('settled')
-    })
-
-    it('a markUnknown of an already-unknown entry fires no persistence write', () => {
-      // #given — same rationale as the settle test above: unit-test the wrapper directly.
-      // This is the path the drain-deadline cancellation loop actually exercises in
-      // practice (`ledger.markUnknown(entry.sessionId)` for every unsettled entry,
-      // including ones already `unknown`).
-      const rawLedger = createOwnershipLedger()
-      rawLedger.adopt(CHILD, 'background task')
-      rawLedger.markUnknown(CHILD)
-      const onChange = vi.fn()
-      const onAdopted = vi.fn()
-      const wrapped = wrapLedgerWithHooks(rawLedger, onChange, onAdopted)
-
-      // #when
-      wrapped.markUnknown(CHILD)
-
-      // #then
-      expect(onChange).not.toHaveBeenCalled()
-      expect(rawLedger.snapshot().find(e => e.sessionId === CHILD)?.state).toBe('unknown')
     })
 
     it('a real state change still fires exactly one persistence write', async () => {

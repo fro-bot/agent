@@ -1,8 +1,9 @@
 import type {ErrorInfo, OwnershipLedger} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
-import type {AttemptResult} from './prompt-sender.js'
+import type {AttemptResult} from './attempt-outcome.js'
 import type {OpenCodeServerHandle} from './server-adapter.js'
-import type {EventStreamResult, PermissionAskedRequest, PermissionAskedResponder} from './streaming.js'
+import type {EventStreamResult} from './streaming-v2.js'
+import type {PermissionAskedRequest, PermissionAskedResponder} from './streaming.js'
 import type {AgentResult, ExecutionConfig, PromptOptions} from './types.js'
 import * as crypto from 'node:crypto'
 import * as fs from 'node:fs/promises'
@@ -26,18 +27,14 @@ import {
   isOpenCodePromptArtifactEnabled,
 } from '../../shared/env.js'
 import {formatSdkError, toErrorMessage} from '../../shared/errors.js'
+import {createExecutionDeadline, type ExecutionDeadline} from './execution-deadline.js'
 import {buildContinuationPrompt, sendPromptToSession} from './prompt-sender.js'
 import {buildAgentPrompt} from './prompt.js'
 import {materializeReferenceFiles} from './reference-files.js'
 import {inspectResponseFile} from './response-file.js'
-import {
-  createExecutionDeadline,
-  MAX_LLM_RETRIES,
-  mergeArtifactResults,
-  RETRY_DELAYS_MS,
-  type ExecutionDeadline,
-} from './retry.js'
-import {waitForAbortableDelay} from './session-poll.js'
+import {MAX_LLM_RETRIES, RETRY_DELAYS_MS} from './retry-v2.js'
+import {mergeArtifactResults} from './retry.js'
+import {waitForAbortableDelay} from './session-poll-v2.js'
 import {mergeAttemptUsage} from './streaming.js'
 
 const SESSION_ABORT_TIMEOUT_MS = 2_000

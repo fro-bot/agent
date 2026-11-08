@@ -8,6 +8,7 @@
 import {ok} from '@fro-bot/runtime'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
+import {EVENT_STREAM_CONNECT_TIMEOUT_MS} from './run-core-shared.js'
 import {
   authFailure,
   DIRECTORY,
@@ -21,7 +22,6 @@ import {
   STRANGER,
   succeeded,
 } from './run-core-v2.fixture.js'
-import {EVENT_STREAM_CONNECT_TIMEOUT_MS} from './run-core.js'
 
 afterEach(() => {
   vi.useRealTimers()

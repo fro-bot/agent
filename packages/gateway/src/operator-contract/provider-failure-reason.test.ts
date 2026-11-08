@@ -1,4 +1,4 @@
-import type {ProviderFailureReason} from '../execute/provider-failure.js'
+import type {ProviderFailureReason} from '../execute/provider-failure-v2.js'
 import type {OperatorProviderFailureReason} from './provider-failure-reason.js'
 
 import {describe, expect, it} from 'vitest'

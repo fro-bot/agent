@@ -1,6 +1,7 @@
 import {readdir, readFile as readFileFromDisk} from 'node:fs/promises'
 import {join, relative} from 'node:path'
 import {describe, expect, it} from 'vitest'
+import {parse} from 'yaml'
 
 /** Closed vocabulary for the `status:` field in docs/plans frontmatter. */
 export const PLAN_STATUS_VALUES = ['done', 'active', 'superseded'] as const
@@ -26,6 +27,50 @@ function isPlanType(value: string): value is PlanType {
   return (PLAN_TYPE_VALUES as readonly string[]).includes(value)
 }
 
+/**
+ * Directories Systematic's past-work search reads (`systematic_search` kinds: solution, plan, brainstorm,
+ * ideation). A document whose frontmatter is not valid YAML is skipped by that search ("invalid frontmatter"),
+ * so every one of them must parse — not only plans.
+ */
+export const SEARCHED_DOC_DIRECTORIES = ['docs/plans', 'docs/brainstorms', 'docs/ideation', 'docs/solutions'] as const
+
+/**
+ * Parses the whole frontmatter block as YAML and requires a mapping. Documents without a frontmatter block are
+ * ignored here; plan-specific presence rules live in `validatePlanFrontmatter`.
+ */
+export function validateFrontmatterYaml(documents: readonly PlanFrontmatterDocument[]): readonly string[] {
+  const violations: string[] = []
+
+  for (const document of documents) {
+    const opening = /^---\r?\n/.exec(document.content)
+    if (opening == null) continue
+
+    const remainder = document.content.slice(opening[0].length)
+    const closing = /\r?\n---(?:\r?\n|$)/.exec(remainder)
+    if (closing == null) continue
+
+    const problem = describeYamlProblem(remainder.slice(0, closing.index))
+    if (problem != null) violations.push(`${document.file}: ${problem}`)
+  }
+
+  return violations
+}
+
+function describeYamlProblem(block: string): string | null {
+  let parsed: unknown
+  try {
+    parsed = parse(block)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    return `frontmatter is not valid YAML: ${message.split('\n')[0]?.replace(/:$/, '')}`
+  }
+
+  if (parsed == null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return 'frontmatter is valid YAML but not a mapping'
+  }
+  return null
+}
+
 export function validatePlanFrontmatter(documents: readonly PlanFrontmatterDocument[]): readonly string[] {
   const violations: string[] = []
 
@@ -43,6 +88,12 @@ export function validatePlanFrontmatter(documents: readonly PlanFrontmatterDocum
     const closing = /\r?\n---(?:\r?\n|$)/.exec(remainder)
     if (closing == null) {
       violations.push(`${document.file}: missing YAML frontmatter closing marker ---`)
+      continue
+    }
+
+    const yamlProblem = describeYamlProblem(remainder.slice(0, closing.index))
+    if (yamlProblem != null) {
+      violations.push(`${document.file}: ${yamlProblem}`)
       continue
     }
 
@@ -86,12 +137,24 @@ export function validatePlanFrontmatter(documents: readonly PlanFrontmatterDocum
   return violations
 }
 
-async function collectPlanFiles(directory: string): Promise<readonly string[]> {
+async function collectMarkdownFiles(directory: string): Promise<readonly string[]> {
   const entries = await readdir(directory, {withFileTypes: true})
-  return entries
-    .filter(entry => entry.isFile() && entry.name.endsWith('.md'))
-    .sort((left, right) => left.name.localeCompare(right.name))
-    .map(entry => join(directory, entry.name))
+  const sorted = [...entries].sort((left, right) => left.name.localeCompare(right.name))
+  const nested = await Promise.all(
+    sorted.map(async entry => {
+      const path = join(directory, entry.name)
+      if (entry.isDirectory()) return collectMarkdownFiles(path)
+      return entry.isFile() && entry.name.endsWith('.md') ? [path] : []
+    }),
+  )
+  return nested.flat()
+}
+
+async function loadDocuments(root: string, directory: string): Promise<readonly PlanFrontmatterDocument[]> {
+  const paths = await collectMarkdownFiles(join(root, directory))
+  return Promise.all(
+    paths.map(async path => ({file: relative(root, path), content: await readFileFromDisk(path, 'utf8')})),
+  )
 }
 
 function documentWithFrontmatter(frontmatter: string): PlanFrontmatterDocument {
@@ -159,20 +222,81 @@ describe('validatePlanFrontmatter', () => {
   })
 })
 
-describe('docs/plans frontmatter guard', () => {
-  it('keeps every plan document inside the required frontmatter contract', async () => {
-    // #given every Markdown plan document on disk
-    const root = process.cwd()
-    const paths = await collectPlanFiles(join(root, 'docs/plans'))
-    const documents = await Promise.all(
-      paths.map(async path => ({
-        file: relative(root, path),
-        content: await readFileFromDisk(path, 'utf8'),
-      })),
+describe('frontmatter YAML validity', () => {
+  it('reports an unquoted title containing a colon-space as invalid YAML with the file and parser error', () => {
+    // #given a plan whose title holds an unquoted `fix: ` (a nested mapping in a plain scalar)
+    const document = documentWithFrontmatter('title: fix: Improve timeout\ntype: fix\nstatus: done\ndate: 2026-01-01')
+
+    // #when
+    const violations = validatePlanFrontmatter([document])
+
+    // #then only the YAML failure is reported, naming the file and the parser's message
+    expect(violations).toEqual([
+      'docs/plans/example.md: frontmatter is not valid YAML: Nested mappings are not allowed in compact mappings at line 1, column 8',
+    ])
+  })
+
+  it('reports an unquoted optional shipped value containing a colon-space as invalid YAML', () => {
+    // #given a plan whose optional `shipped` value embeds `fro-bot: {key}` unquoted
+    const document = documentWithFrontmatter(
+      "title: Example\ntype: feat\nstatus: done\ndate: 2026-01-01\nshipped: 2026-03-22 onward ('fro-bot: {key}' titles)",
     )
 
     // #when
+    const violations = validatePlanFrontmatter([document])
+
+    // #then
+    expect(violations).toHaveLength(1)
+    expect(violations[0]).toMatch(/^docs\/plans\/example\.md: frontmatter is not valid YAML: /)
+  })
+
+  it('accepts the quoted equivalents of the malformed title and shipped values', () => {
+    // #given the same values, fully quoted
+    const document = documentWithFrontmatter(
+      'title: "fix: Improve timeout"\ntype: fix\nstatus: done\ndate: 2026-01-01\nshipped: "2026-03-22 onward (\'fro-bot: {key}\' titles)"',
+    )
+
+    // #when / #then
+    expect(validatePlanFrontmatter([document])).toEqual([])
+  })
+
+  it('reports frontmatter that parses to a non-mapping', () => {
+    // #given a frontmatter block that is a YAML sequence
+    const violations = validateFrontmatterYaml([documentWithFrontmatter('- a\n- b')])
+
+    // #when / #then
+    expect(violations).toEqual(['docs/plans/example.md: frontmatter is valid YAML but not a mapping'])
+  })
+
+  it('ignores documents without a complete frontmatter block', () => {
+    // #given non-plan docs that carry no frontmatter
+    const violations = validateFrontmatterYaml([{file: 'docs/solutions/example.md', content: '# Example\n'}])
+
+    // #when / #then
+    expect(violations).toEqual([])
+  })
+})
+
+describe('docs/plans frontmatter guard', () => {
+  it('keeps every plan document inside the required frontmatter contract', async () => {
+    // #given every Markdown plan document on disk
+    const documents = await loadDocuments(process.cwd(), 'docs/plans')
+
+    // #when
     const violations = validatePlanFrontmatter(documents)
+
+    // #then
+    expect(violations.join('\n')).toBe('')
+  })
+})
+
+describe('searched docs frontmatter YAML guard', () => {
+  it.each(SEARCHED_DOC_DIRECTORIES)('keeps every %s frontmatter block parseable as a YAML mapping', async directory => {
+    // #given every Markdown document in a directory Systematic past-work search reads
+    const documents = await loadDocuments(process.cwd(), directory)
+
+    // #when
+    const violations = validateFrontmatterYaml(documents)
 
     // #then
     expect(violations.join('\n')).toBe('')

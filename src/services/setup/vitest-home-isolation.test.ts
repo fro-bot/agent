@@ -4,10 +4,7 @@ import {isAbsolute, relative} from 'node:path'
 import process from 'node:process'
 import {describe, expect, it} from 'vitest'
 
-import {defaultOpenCodeConfigDir} from './no-task-reuse-config.js'
-
-// Live evals opt out of isolation (see vitest-home-isolation.setup.ts).
-const isolationEnabled = process.env.FRO_BOT_EVAL !== '1'
+import {defaultOpenCodeConfigDir} from './opencode-config-dir.js'
 
 function isInside(parent: string, child: string): boolean {
   const rel = relative(parent, child)
@@ -16,7 +13,7 @@ function isInside(parent: string, child: string): boolean {
 
 const tempRoot = realpathSync(tmpdir())
 
-describe.skipIf(isolationEnabled === false)('vitest home isolation', () => {
+describe('vitest home isolation', () => {
   it('points os.homedir() at a temp dir, not the real home', () => {
     // #given the real home recorded by the OS user database (independent of $HOME)
     const realHome = userInfo().homedir

@@ -19,13 +19,13 @@ import type {createOpencode, Event} from '@opencode-ai/sdk'
  */
 import type {Logger} from '../../shared/logger.js'
 import type {AttemptObservation, AttemptSettlement, FailureObservation} from './attempt-outcome.js'
-import type {ExecutionDeadline} from './retry.js'
+import type {ExecutionDeadline} from './execution-deadline.js'
 import type {ActivityTracker} from './streaming.js'
 import {createOwnershipLedger} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {reduceAttemptOutcome} from './attempt-outcome.js'
-import {createExecutionDeadline} from './retry.js'
+import {createExecutionDeadline} from './execution-deadline.js'
 import {
   EXECUTE_LEDGER_RECONCILE_INTERVAL_MS,
   INITIAL_ACTIVITY_TIMEOUT_MS,

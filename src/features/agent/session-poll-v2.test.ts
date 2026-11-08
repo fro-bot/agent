@@ -1,7 +1,11 @@
 import type {RemoteOpenCodeV2Client} from '@fro-bot/runtime'
 import {describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
-import {observeRootTerminal, pollForSessionCompletionObservationV2} from './session-poll-v2.js'
+import {
+  observeRootTerminal,
+  pollForSessionCompletionObservationV2,
+  waitForEventProcessorShutdown,
+} from './session-poll-v2.js'
 import {createActivityTrackerV2} from './streaming-v2.js'
 
 const ROOT = 'ses_root'
@@ -187,5 +191,35 @@ describe('observeRootTerminal', () => {
 
     // #when / #then
     expect(observeRootTerminal(tracker, createMockLogger())?.settlement.kind).toBe('failure-observed')
+  })
+})
+
+describe('waitForEventProcessorShutdown', () => {
+  it('resolves when processor completes quickly', async () => {
+    // #given
+    const processor = Promise.resolve()
+
+    // #when / #then
+    await expect(waitForEventProcessorShutdown(processor, 5000)).resolves.toBeUndefined()
+  })
+
+  it('resolves after timeout when processor hangs', async () => {
+    // #given
+    const processor = new Promise<void>(() => {
+      // intentionally never resolves
+    })
+    vi.useFakeTimers()
+
+    // #when
+    const start = Date.now()
+    const waitPromise = waitForEventProcessorShutdown(processor, 100)
+    await vi.advanceTimersByTimeAsync(150)
+    await waitPromise
+    const elapsed = Date.now() - start
+    vi.useRealTimers()
+
+    // #then
+    expect(elapsed).toBeGreaterThanOrEqual(90)
+    expect(elapsed).toBeLessThan(1000)
   })
 })

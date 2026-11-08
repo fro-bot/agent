@@ -11,7 +11,7 @@ import {
   mockRuntime,
   setupHappyPath,
 } from './test-helpers.js'
-import * as runCoreModule from './run-core.js'
+import * as runCoreModule from './run-core-shared.js'
 /* eslint-enable perfectionist/sort-imports */
 
 // ---------------------------------------------------------------------------

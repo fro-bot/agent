@@ -18,7 +18,7 @@ import {
 } from './test-helpers.js'
 import * as attachModule from './opencode-attach.js'
 import * as promptModule from './prompt.js'
-import * as runCoreModule from './run-core.js'
+import * as runCoreModule from './run-core-shared.js'
 /* eslint-enable perfectionist/sort-imports */
 
 // ---------------------------------------------------------------------------

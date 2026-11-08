@@ -8,7 +8,7 @@
  */
 
 import type {AddressInfo} from 'node:net'
-import type {Logger} from './opencode-server.js'
+import type {Logger} from './types.js'
 
 import {Buffer} from 'node:buffer'
 import http from 'node:http'
