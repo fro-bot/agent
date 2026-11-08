@@ -2178,7 +2178,8 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         // the agent produced nothing. The provenance line is still delivered on this
         // path via `withProvenanceLine(userMessage)` below (Discord's resolveToFailure/
         // send channel).
-        await replySink.flush().catch((flushError: unknown) => {
+        // The failure reply below tells the thread what happened, so an empty buffer posts no `_(no output)_` (#2119).
+        await replySink.flush({suppressEmptyNotice: true}).catch((flushError: unknown) => {
           logger.warn({repo, runId, err: String(flushError)}, 'run: sink.flush failed in error path')
         })
 
