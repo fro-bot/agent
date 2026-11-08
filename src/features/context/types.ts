@@ -132,6 +132,8 @@ export interface PullRequestContext {
   readonly createdAt: string
   readonly baseBranch: string
   readonly headBranch: string
+  /** Head commit SHA of the PR at hydration time -- the revision this run was handed. */
+  readonly headSha: string
   readonly isFork: boolean
   readonly labels: readonly ContextLabel[]
   readonly assignees: readonly ContextAssignee[]
@@ -212,6 +214,7 @@ export interface PullRequestGraphQLResponse {
       readonly author: {readonly login: string} | null
       readonly baseRefName: string
       readonly headRefName: string
+      readonly headRefOid: string
       readonly baseRepository: {readonly owner: {readonly login: string}} | null
       readonly headRepository: {readonly owner: {readonly login: string}} | null
       readonly labels: {

@@ -19,6 +19,7 @@ describe('pull_request ready_for_review routing', () => {
     const payload = {
       action: 'ready_for_review',
       pull_request: {
+        head: {sha: 'event-head-sha'},
         number: 99,
         title: 'feat: finish implementation',
         body: 'This PR is now ready for review',
@@ -46,6 +47,7 @@ describe('pull_request ready_for_review routing', () => {
     const payload = {
       action: 'ready_for_review',
       pull_request: {
+        head: {sha: 'event-head-sha'},
         number: 100,
         title: 'feat: ready but reviewer is someone else',
         body: 'Ready for review',
@@ -73,6 +75,7 @@ describe('pull_request ready_for_review routing', () => {
       action: 'review_requested',
       requested_reviewer: {login: 'fro-bot[bot]', type: 'Bot'},
       pull_request: {
+        head: {sha: 'event-head-sha'},
         number: 101,
         title: 'feat: request bot review',
         body: 'Please review',
@@ -102,6 +105,7 @@ describe('pull_request ready_for_review routing', () => {
       action: 'review_requested',
       requested_reviewer: {login: 'other-user', type: 'User'},
       pull_request: {
+        head: {sha: 'event-head-sha'},
         number: 102,
         title: 'feat: request another review',
         body: 'Please review',
@@ -129,6 +133,7 @@ describe('pull_request ready_for_review routing', () => {
       action: 'review_requested',
       requested_reviewer: {login: 'other-user', type: 'User'},
       pull_request: {
+        head: {sha: 'event-head-sha'},
         number: 103,
         title: 'feat: generic review request',
         body: 'Please review',
@@ -155,6 +160,7 @@ describe('pull_request ready_for_review routing', () => {
       action: 'review_requested',
       requested_team: {name: 'Platform Team', slug: 'platform-team'},
       pull_request: {
+        head: {sha: 'event-head-sha'},
         number: 105,
         title: 'feat: team review',
         body: 'Please review',
@@ -182,6 +188,7 @@ describe('pull_request ready_for_review routing', () => {
       action: 'review_requested',
       requested_reviewer: {login: 'fro-bot[bot]', type: 'Bot'},
       pull_request: {
+        head: {sha: 'event-head-sha'},
         number: 106,
         title: 'chore: renovate dependency updates',
         body: 'Automated dependency update',
@@ -211,6 +218,7 @@ describe('pull_request ready_for_review routing', () => {
       action: 'review_requested',
       requested_reviewer: {login: 'fro-bot[bot]', type: 'Bot'},
       pull_request: {
+        head: {sha: 'event-head-sha'},
         number: 107,
         title: 'feat: request from bot account',
         body: 'Please review',
@@ -240,6 +248,7 @@ describe('pull_request ready_for_review routing', () => {
       action: 'review_requested',
       requested_reviewer: {login: 'fro-bot[bot]', type: 'Bot'},
       pull_request: {
+        head: {sha: 'event-head-sha'},
         number: 108,
         title: 'chore: automated update',
         body: 'Bot-created PR',
@@ -266,6 +275,7 @@ describe('pull_request ready_for_review routing', () => {
     const payload = {
       action: 'opened',
       pull_request: {
+        head: {sha: 'event-head-sha'},
         number: 109,
         title: 'chore: automated PR',
         body: 'Bot-created',
@@ -294,6 +304,7 @@ describe('pull_request ready_for_review routing', () => {
       action: 'review_requested',
       requested_reviewer: {login: 'fro-bot[bot]', type: 'Bot'},
       pull_request: {
+        head: {sha: 'event-head-sha'},
         number: 108,
         title: 'chore: dependency update',
         body: 'Automated update',
@@ -324,6 +335,7 @@ describe('pull_request ready_for_review routing', () => {
     const payload = {
       action: 'ready_for_review',
       pull_request: {
+        head: {sha: 'event-head-sha'},
         number: 110,
         title: 'feat: bot marks PR ready',
         body: 'Ready for review',
@@ -352,6 +364,7 @@ describe('pull_request ready_for_review routing', () => {
     const payload = {
       action: 'ready_for_review',
       pull_request: {
+        head: {sha: 'event-head-sha'},
         number: 22,
         title: 'fix: SPA routing on GitHub Pages',
         body: 'Automated fix',
@@ -379,6 +392,7 @@ describe('pull_request ready_for_review routing', () => {
     const payload = {
       action: 'ready_for_review',
       pull_request: {
+        head: {sha: 'event-head-sha'},
         number: 22,
         title: 'fix: SPA routing on GitHub Pages',
         body: 'Automated fix',
@@ -408,6 +422,7 @@ function labeledPayload(overrides: Record<string, unknown> = {}): Record<string,
   return {
     action: 'synchronize',
     pull_request: {
+      head: {sha: 'event-head-sha'},
       number: 200,
       title: 'feat: work in progress',
       body: 'WIP, do not review yet',

@@ -55,6 +55,7 @@ export const PULL_REQUEST_QUERY = `
         author { login }
         baseRefName
         headRefName
+        headRefOid
         baseRepository { owner { login } }
         headRepository { owner { login } }
         labels(first: 20) {

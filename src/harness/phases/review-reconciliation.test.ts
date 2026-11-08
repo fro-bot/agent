@@ -79,6 +79,7 @@ function makeParams(overrides?: {
   readonly runStartMs?: number
   readonly isFileConventionDelivery?: boolean
   readonly knownExecutionVeto?: boolean
+  readonly reviewedHeadSha?: string | null
   readonly receipt?: {
     readonly ops: ReviewDeliveryReceiptOperations
     readonly runId: string
@@ -100,6 +101,7 @@ function makeParams(overrides?: {
     runStartMs: overrides?.runStartMs ?? RUN_START_MS,
     isFileConventionDelivery: overrides?.isFileConventionDelivery ?? false,
     knownExecutionVeto: overrides?.knownExecutionVeto ?? false,
+    reviewedHeadSha: overrides?.reviewedHeadSha === undefined ? HEAD_SHA : overrides.reviewedHeadSha,
     receipt: overrides?.receipt,
   }
 }
@@ -820,6 +822,33 @@ describe('runReviewReconciliation knownExecutionVeto', () => {
     expect(result.reason).toBe('known-execution-veto')
     expect(octokit.rest.pulls.get).not.toHaveBeenCalled()
     expect(octokit.rest.pulls.listReviews).not.toHaveBeenCalled()
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+  })
+
+  it('fails closed with no-reviewed-head, before any PR fact is fetched, when no reviewed head was captured', async () => {
+    // #given the otherwise-qualifying fixture, but the run captured no reviewed head
+    const octokit = makeQualifyingOctokit()
+    const params = makeParams({octokit, reviewedHeadSha: null})
+
+    // #when running review reconciliation
+    const result = await runReviewReconciliation(params, logger)
+
+    // #then it no-ops: the APPROVE is never pinned to a delivery-time fetch
+    expect(result).toEqual({reconciled: false, reason: 'no-reviewed-head'})
+    expect(octokit.rest.pulls.get).not.toHaveBeenCalled()
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+  })
+
+  it('aborts the approval when the PR head is no longer the head the agent reviewed', async () => {
+    // #given a qualifying bot review at the PR's current head, but the agent reviewed an older head
+    const octokit = makeQualifyingOctokit()
+    const params = makeParams({octokit, reviewedHeadSha: 'older-reviewed-head'})
+
+    // #when running review reconciliation
+    const result = await runReviewReconciliation(params, logger)
+
+    // #then the stale approval is dropped
+    expect(result).toEqual({reconciled: false, reason: 'head-moved-before-submit'})
     expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
   })
 

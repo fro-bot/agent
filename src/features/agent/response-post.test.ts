@@ -1,4 +1,4 @@
-import type {AgentContext} from '@fro-bot/runtime'
+import type {AgentContext, PullRequestContext} from '@fro-bot/runtime'
 import type {TriggerResultProcess} from '../../features/triggers/types.js'
 import type {Logger} from '../../shared/logger.js'
 import * as fs from 'node:fs/promises'
@@ -27,7 +27,45 @@ vi.mock('node:fs/promises', async () => {
   return {...actual, readFile: fsMocks.readFile, readdir: fsMocks.readdir}
 })
 
+function makeHydratedPullRequest(headSha: string): PullRequestContext {
+  return {
+    type: 'pull_request',
+    number: 7,
+    title: 'PR',
+    body: '',
+    bodyTruncated: false,
+    state: 'OPEN',
+    author: 'pr-author',
+    createdAt: '2026-01-01T00:00:00Z',
+    baseBranch: 'main',
+    headBranch: 'feature',
+    headSha,
+    isFork: false,
+    labels: [],
+    assignees: [],
+    comments: [],
+    commentsTruncated: false,
+    totalComments: 0,
+    commits: [],
+    commitsTruncated: false,
+    totalCommits: 0,
+    files: [],
+    filesTruncated: false,
+    totalFiles: 0,
+    reviews: [],
+    reviewsTruncated: false,
+    totalReviews: 0,
+    authorAssociation: 'MEMBER',
+    requestedReviewers: [],
+    requestedReviewerTeams: [],
+  }
+}
+
+// A PR-typed run always carries the head the agent was handed: hydrated context supplies it for
+// issue_comment (see makeTriggerResult for the pull_request event head). Tests that exercise the
+// missing/diverging head cases override `hydratedContext` explicitly.
 function makeAgentContext(overrides?: Partial<AgentContext>): AgentContext {
+  const issueType = overrides?.issueType ?? 'issue'
   return {
     eventName: 'issue_comment',
     repo: 'owner/repo',
@@ -36,20 +74,26 @@ function makeAgentContext(overrides?: Partial<AgentContext>): AgentContext {
     runId: '1',
     issueNumber: 42,
     issueTitle: 'Title',
-    issueType: 'issue',
+    issueType,
     commentBody: null,
     commentAuthor: null,
     commentId: null,
     defaultBranch: 'main',
     diffContext: null,
-    hydratedContext: null,
+    hydratedContext: issueType === 'pr' ? makeHydratedPullRequest('head-sha') : null,
     authorAssociation: null,
     isRequestedReviewer: false,
     ...overrides,
   }
 }
 
-function makeTriggerResult(eventType: TriggerResultProcess['context']['eventType']): TriggerResultProcess {
+// `headSha` is the pull_request event's head: omitted -> 'head-sha' (a realistic event), `null` ->
+// a PR target with no head (malformed event). Non-pull_request events keep a null target.
+function makeTriggerResult(
+  eventType: TriggerResultProcess['context']['eventType'],
+  headSha?: string | null,
+): TriggerResultProcess {
+  const eventHeadSha = headSha === undefined ? 'head-sha' : headSha
   return {
     shouldProcess: true,
     context: {
@@ -66,7 +110,17 @@ function makeTriggerResult(eventType: TriggerResultProcess['context']['eventType
       // Surface derivation fails closed on a null author, so a realistic
       // authorized commenter is required to exercise the review-permitted path.
       author: {login: 'maintainer', association: 'MEMBER', isBot: false},
-      target: null,
+      target:
+        eventType === 'pull_request'
+          ? {
+              kind: 'pr',
+              number: 7,
+              title: 'PR',
+              body: null,
+              locked: false,
+              ...(eventHeadSha == null ? {} : {headSha: eventHeadSha}),
+            }
+          : null,
       commentBody: null,
       commentId: null,
       hasMention: true,
@@ -1600,6 +1654,274 @@ describe('runResponsePost', () => {
     // #then the file is rejected before anything is posted
     expect(result.delivered).toBe(false)
     expect((result as {reason: string}).reason).toBe('parse-failed')
+    expect(octokit.rest.issues.createComment).not.toHaveBeenCalled()
+  })
+})
+
+function prAtHead(headSha: string) {
+  return {
+    data: {
+      head: {sha: headSha, repo: {full_name: 'owner/repo'}},
+      base: {repo: {full_name: 'owner/repo'}},
+      user: {login: 'pr-author'},
+    },
+  }
+}
+
+describe('runResponsePost reviewed-head pinning (#2124)', () => {
+  let logger: Logger
+  let tempFiles: string[] = []
+
+  beforeEach(() => {
+    logger = createMockLogger()
+    tempFiles = []
+    if (fsMocks.actualReadFile !== undefined) {
+      fsMocks.readFile.mockReset().mockImplementation(fsMocks.actualReadFile)
+    }
+  })
+
+  afterEach(async () => {
+    for (const filePath of tempFiles) {
+      await fs.rm(path.dirname(filePath), {recursive: true, force: true})
+    }
+  })
+
+  const STALE_ABORT = {
+    delivered: false,
+    reason: 'review-guard-blocked',
+    detail: 'Review guard blocked submission: head-moved-before-submit',
+  } as const
+
+  it('aborts a pull_request review when a push moved the head between the run start and submit', async () => {
+    // #given the agent reviewed head A (the event head), and a push advanced the PR to B before
+    // delivery; both delivery-time fetches therefore agree on B and the guard's own baseline
+    // cannot see the move
+    const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit({getPR: () => prAtHead('head-B')})
+
+    // #when running response-post for the pull_request trigger
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({eventName: 'pull_request', issueType: 'pr', issueNumber: 7}),
+        triggerResult: makeTriggerResult('pull_request', 'head-A'),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+      },
+      logger,
+    )
+
+    // #then the stale review is dropped: no review, and no comment fallback either
+    expect(result).toEqual(STALE_ABORT)
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+    expect(octokit.rest.issues.createComment).not.toHaveBeenCalled()
+  })
+
+  it('submits a pull_request review with commit_id equal to the event head when nothing was pushed', async () => {
+    // #given the PR still sits at the event head at delivery time
+    const filePath = await writeFixture('---\nverdict: request-changes\n---\n\nFix it.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit({getPR: () => prAtHead('head-A')})
+
+    // #when running response-post
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({eventName: 'pull_request', issueType: 'pr', issueNumber: 7}),
+        triggerResult: makeTriggerResult('pull_request', 'head-A'),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+      },
+      logger,
+    )
+
+    // #then the review is pinned to the reviewed head
+    expect(result).toEqual({delivered: true, kind: 'review'})
+    expect(octokit.rest.pulls.createReview).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({event: 'REQUEST_CHANGES', pull_number: 7, commit_id: 'head-A'}),
+    )
+  })
+
+  it('uses the hydrated head for an issue_comment on a PR and aborts when the PR has moved past it', async () => {
+    // #given an authorized mention on a PR whose hydrated context saw head A, with the PR now at B
+    const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit({getPR: () => prAtHead('head-B')})
+
+    // #when running response-post for the permitted mention surface
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({
+          issueType: 'pr',
+          issueNumber: 7,
+          hydratedContext: makeHydratedPullRequest('head-A'),
+        }),
+        triggerResult: makeTriggerResult('issue_comment'),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+      },
+      logger,
+    )
+
+    // #then the stale review is dropped, not degraded to a comment
+    expect(result).toEqual(STALE_ABORT)
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+    expect(octokit.rest.issues.createComment).not.toHaveBeenCalled()
+  })
+
+  it('pins an issue_comment review to the hydrated head when the PR is unchanged', async () => {
+    // #given hydrated head A and a PR still at A
+    const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit({getPR: () => prAtHead('head-A')})
+
+    // #when running response-post for the permitted mention surface
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({
+          issueType: 'pr',
+          issueNumber: 7,
+          hydratedContext: makeHydratedPullRequest('head-A'),
+        }),
+        triggerResult: makeTriggerResult('issue_comment'),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+      },
+      logger,
+    )
+
+    // #then commit_id is the hydrated head
+    expect(result).toEqual({delivered: true, kind: 'review'})
+    expect(octokit.rest.pulls.createReview).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({event: 'APPROVE', commit_id: 'head-A'}),
+    )
+  })
+
+  it('prefers the pull_request event head over the later-hydrated head', async () => {
+    // #given the event head is A but hydration (taken later) already saw B, and the PR is at B
+    const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit({getPR: () => prAtHead('head-B')})
+
+    // #when running response-post
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({
+          eventName: 'pull_request',
+          issueType: 'pr',
+          issueNumber: 7,
+          hydratedContext: makeHydratedPullRequest('head-B'),
+        }),
+        triggerResult: makeTriggerResult('pull_request', 'head-A'),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+      },
+      logger,
+    )
+
+    // #then the event head wins, so the review aborts instead of being pinned to B
+    expect(result).toEqual(STALE_ABORT)
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+  })
+
+  it('fails closed on a pull_request with no event head, without borrowing the hydrated head', async () => {
+    // #given a malformed pull_request trigger without an event head SHA, hydration that has one,
+    // and a PR that still sits at that hydrated head (so a fallback would succeed)
+    const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit({getPR: () => prAtHead('head-sha')})
+
+    // #when running response-post
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({eventName: 'pull_request', issueType: 'pr', issueNumber: 7}),
+        triggerResult: makeTriggerResult('pull_request', null),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+      },
+      logger,
+    )
+
+    // #then nothing is posted and the reason is explicit; no other head is substituted
+    expect(result).toEqual({
+      delivered: false,
+      reason: 'review-guard-blocked',
+      detail: 'Review guard blocked submission: no-reviewed-head',
+    })
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+    expect(octokit.rest.issues.createComment).not.toHaveBeenCalled()
+    expect(logger.warning).toHaveBeenCalledWith(
+      'Response-post: no reviewed head SHA available, refusing to submit review',
+      expect.objectContaining({prNumber: 7}),
+    )
+  })
+
+  it('fails closed on an issue_comment PR mention whose context hydration failed', async () => {
+    // #given hydration produced nothing, so there is no head the agent was shown
+    const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit({getPR: () => prAtHead('head-B')})
+
+    // #when running response-post for the permitted mention surface
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({issueType: 'pr', issueNumber: 7, hydratedContext: null}),
+        triggerResult: makeTriggerResult('issue_comment'),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+      },
+      logger,
+    )
+
+    // #then no review and no comment is posted
+    expect(result).toEqual({
+      delivered: false,
+      reason: 'review-guard-blocked',
+      detail: 'Review guard blocked submission: no-reviewed-head',
+    })
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+    expect(octokit.rest.issues.createComment).not.toHaveBeenCalled()
+  })
+
+  it('still aborts when the head moves during the receipt reservation, releasing it', async () => {
+    // #given the reviewed head A, a pre-reservation fetch that still reads A, and a post-reservation
+    // re-check that reads B
+    const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
+    tempFiles.push(filePath)
+    const octokit = makeOctokit()
+    octokit.rest.pulls.get
+      .mockResolvedValueOnce(prAtHead('head-A'))
+      .mockResolvedValueOnce(prAtHead('head-A'))
+      .mockResolvedValueOnce(prAtHead('head-B'))
+    const release = vi.fn(async () => undefined)
+
+    // #when running response-post with a configured receipt
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeAgentContext({eventName: 'pull_request', issueType: 'pr', issueNumber: 7}),
+        triggerResult: makeTriggerResult('pull_request', 'head-A'),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+        reviewDeliveryReceiptOps: {
+          reserve: vi.fn(async () => ({kind: 'reserved-configured' as const, etag: 'etag-1'})),
+          recordDelivered: vi.fn(async () => undefined),
+          release,
+        },
+      },
+      logger,
+    )
+
+    // #then the post-reservation re-check aborts, the reservation is released, and nothing is posted
+    expect(result).toEqual(STALE_ABORT)
+    expect(release).toHaveBeenCalledOnce()
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
     expect(octokit.rest.issues.createComment).not.toHaveBeenCalled()
   })
 })
