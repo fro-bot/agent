@@ -14,7 +14,7 @@
  * `__proto__` cannot resolve to prototype members. Unknown or non-string input yields nothing.
  */
 
-import type {DrainRejectCode} from '../execute/drain-completion.js'
+import type {DrainRejectCode} from '../execute/drain-completion-v2.js'
 
 /** The closed wire set. Consumers must tolerate values added in later MINOR versions. */
 export const OPERATOR_WAIT_REASONS = [

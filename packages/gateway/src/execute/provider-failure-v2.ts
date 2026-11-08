@@ -17,9 +17,40 @@
  */
 
 import type {ProviderFailureKind, V2ErrorInfo} from '@fro-bot/runtime'
-import type {ProviderFailure, ProviderFailureReason} from './provider-failure.js'
 
 import {classifyProviderFailure, terminalSignalFromPayload} from '@fro-bot/runtime'
+
+/** Closed set of operator-safe failure reasons. Nothing provider-controlled can become one. */
+export type ProviderFailureReason =
+  | 'provider auth unavailable'
+  | 'model not available'
+  | 'provider quota exceeded'
+  | 'model provider rejected the request'
+  | 'session error'
+
+/**
+ * Closed set of values `errorName` can take: an OpenCode error class the classifier recognizes (v1.19.0:
+ * `packages/core/src/v1/session.ts`), or one of three source markers.
+ */
+export type ProviderFailureErrorName =
+  | 'ProviderAuthError'
+  | 'APIError'
+  | 'UnknownError'
+  | 'MessageAbortedError'
+  | 'MessageOutputLengthError'
+  | 'ContextOverflowError'
+  | 'StructuredOutputError'
+  | 'ContentFilterError'
+  | 'retry-status'
+  | 'error-text'
+  | 'unknown'
+
+export interface ProviderFailure {
+  /** Fixed text, safe for failure messages, logs and operator surfaces. */
+  readonly reason: ProviderFailureReason
+  /** Allowlisted error class or source marker for logging. Upstream strings never pass through. */
+  readonly errorName: ProviderFailureErrorName
+}
 
 function toReason(kind: ProviderFailureKind): ProviderFailureReason {
   switch (kind) {

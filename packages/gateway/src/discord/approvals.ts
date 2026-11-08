@@ -10,7 +10,7 @@ import type {PermissionReply, PermissionRequest, SettlementReason} from '../appr
 import {ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder} from 'discord.js'
 
 import {isRequestDetailTruncated} from '../approvals/approval-detail.js'
-import {escapeText} from './questions.js'
+import {webDeciderLabel} from './questions.js'
 
 // ---------------------------------------------------------------------------
 // custom_id prefixes (namespaced to avoid collisions with other interactions)
@@ -134,14 +134,10 @@ export function buildApprovalButtons(requestID: string, rejectOnly = false): Act
 export type SettledDecider =
   {readonly kind: 'discord-user'; readonly userId: string} | {readonly kind: 'web'; readonly login: string}
 
-/** Longest login shown on a card; GitHub logins are far shorter, so this only bounds a malformed one. */
-const WEB_LOGIN_MAX = 64
-
 function deciderLabel(decidedBy: SettledDecider | undefined): string | null {
   if (decidedBy === undefined) return null
   if (decidedBy.kind === 'discord-user') return decidedBy.userId.length > 0 ? `<@${decidedBy.userId}>` : null
-  const login = decidedBy.login.trim().slice(0, WEB_LOGIN_MAX)
-  return login.length === 0 ? null : `${escapeText(login)} (dashboard)`
+  return webDeciderLabel(decidedBy.login)
 }
 
 /**

@@ -1401,13 +1401,9 @@ function runBudgetScript(elapsedMs: number): BudgetScriptResult {
   const script = budgetRunScript()
   const nowMs = 10_000_000_000_000
   const startMs = nowMs - elapsedMs
-  // The GHA template expression is built via concatenation, not a literal `${{ ... }}`
-  // substring, to avoid tripping the no-template-curly-in-string lint rule on text that is
-  // intentionally not a JS template literal.
-  const jobStartTemplateExpression = ['start_ms="', '$', '{{ steps.job-start.outputs.epoch-ms }}"'].join('')
-  const fixedScript = script
-    .replace('now_ms=$(date +%s%3N)', `now_ms=${nowMs}`)
-    .replace(jobStartTemplateExpression, `start_ms=${startMs}`)
+  // The job-start epoch reaches the script through the step's `env:` (JOB_START_EPOCH_MS), never an
+  // inline template expression, so the harness supplies it the same way and only pins the clock.
+  const fixedScript = script.replace('now_ms=$(date +%s%3N)', `now_ms=${nowMs}`)
   if (fixedScript === script) {
     throw new TypeError('budget script substitution did not match -- script text changed shape')
   }
@@ -1419,7 +1415,9 @@ function runBudgetScript(elapsedMs: number): BudgetScriptResult {
     let exitCode = 0
     let stderr = ''
     try {
-      execFileSync('bash', ['-c', fixedScript], {env: {...process.env, GITHUB_OUTPUT: outputPath}})
+      execFileSync('bash', ['-c', fixedScript], {
+        env: {...process.env, GITHUB_OUTPUT: outputPath, JOB_START_EPOCH_MS: String(startMs)},
+      })
     } catch (error) {
       const execError = error as {status?: number | null; stderr?: Buffer}
       exitCode = execError.status ?? 1

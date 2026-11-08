@@ -18,7 +18,7 @@
 import type {OwnershipLedger, ReconcileLedgerOptions} from '@fro-bot/runtime'
 
 import {reconcileLedgerOnce} from '@fro-bot/runtime'
-import {DEFAULT_SETTLE_TIMEOUT_MS} from './settle-owned-sessions.js'
+import {DEFAULT_SETTLE_TIMEOUT_MS} from './settle-owned-sessions-v2.js'
 
 /**
  * Bound on one live-path reconcile pass, in milliseconds. The same budget teardown's settle gives its confirmation

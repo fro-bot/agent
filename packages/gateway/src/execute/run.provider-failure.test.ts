@@ -1,5 +1,5 @@
 import type {CoordinationConfig} from '@fro-bot/runtime'
-import type {ProviderFailureReason} from './provider-failure.js'
+import type {ProviderFailureReason} from './provider-failure-v2.js'
 
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 /* eslint-disable perfectionist/sort-imports -- ./test-helpers.js must import before any real module
@@ -29,8 +29,8 @@ import {abortRegistry} from './abort-registry.js'
 // `RunCoreError` and the `instanceof` checks in `run.ts` run against the real class.
 // ---------------------------------------------------------------------------
 
-const realRunCore = await vi.importActual<typeof import('./run-core.js')>('./run-core.js')
-vi.doMock('./run-core.js', () => ({...realRunCore, runOpenCodeCore: mockRunOpenCodeCore}))
+const realRunCore = await vi.importActual<typeof import('./run-core-shared.js')>('./run-core-shared.js')
+vi.doMock('./run-core-shared.js', () => realRunCore)
 
 const {RunCoreError} = realRunCore
 
@@ -71,7 +71,7 @@ describe('provider failure reason — persisted at the terminal FAILED write (re
 
     // #then the typed property exists on the real class (the stand-in has no such constructor parameter
     // behavior in production), and run.ts sees the same class through its own import
-    const {RunCoreError: seenByRun} = await import('./run-core.js')
+    const {RunCoreError: seenByRun} = await import('./run-core-shared.js')
     expect(seenByRun).toBe(RunCoreError)
     expect(error.providerFailureReason).toBe('model not available')
   })

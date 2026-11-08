@@ -14,22 +14,10 @@
  * reported as a value for the caller to log, never thrown.
  */
 
+import type {InstanceDisposer} from './opencode-instance-v2.js'
+
 /** Short on purpose: dispose is a hint, and the caller still holds the per-repo mutex while waiting. */
 export const DEFAULT_INSTANCE_DISPOSE_TIMEOUT_MS = 5_000
-
-export type InstanceDisposeOutcome =
-  | {readonly kind: 'disposed'}
-  /** OpenCode is not running (not started yet, down or degraded), so there is no instance to dispose. */
-  | {readonly kind: 'skipped'}
-  | {
-      readonly kind: 'failed'
-      readonly reason: 'timeout' | 'network-error' | 'http-error'
-      /** Present only for `http-error`. */
-      readonly status?: number
-    }
-
-/** Disposes the instance OpenCode caches for `directory`. Resolves to an outcome; never rejects. */
-export type InstanceDisposer = (directory: string) => Promise<InstanceDisposeOutcome>
 
 export interface CreateInstanceDisposerOptions {
   /** Loopback URL of the OpenCode server, e.g. `http://127.0.0.1:54321`. */

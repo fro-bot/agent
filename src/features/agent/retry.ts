@@ -2,18 +2,17 @@ import type {OwnershipLedger} from '@fro-bot/runtime'
 import type {createOpencode, Event} from '@opencode-ai/sdk'
 import type {createOpencodeClient} from '@opencode-ai/sdk/v2'
 import type {Logger} from '../../shared/logger.js'
-import type {AttemptObservation, FailureObservation, TurnEvidence} from './attempt-outcome.js'
-import type {AttemptResult} from './prompt-sender.js'
-import type {ActivityTracker, EventStreamResult, PermissionAskedResponder} from './streaming.js'
-import {createLLMFetchError, getNumberProperty, getObjectProperty, getStringProperty} from '@fro-bot/runtime'
+import type {AttemptObservation, AttemptResult, FailureObservation, TurnEvidence} from './attempt-outcome.js'
+import type {ExecutionDeadline} from './execution-deadline.js'
+import type {EventStreamResult} from './streaming-v2.js'
+import type {ActivityTracker, PermissionAskedResponder} from './streaming.js'
+import {getNumberProperty, getObjectProperty, getStringProperty} from '@fro-bot/runtime'
 import {formatSdkError, toErrorMessage} from '../../shared/errors.js'
-import {reduceAttemptOutcome, shouldRetryFromOutcome} from './attempt-outcome.js'
-import {
-  ledgerBlocksCompletion,
-  pollForSessionCompletionObservation,
-  waitForAbortableDelay,
-  waitForEventProcessorShutdown,
-} from './session-poll.js'
+import {reduceAttemptOutcome} from './attempt-outcome.js'
+import {createDeadlineExceededError} from './execution-deadline.js'
+import {awaitStreamConnected, createStreamNotConnectedResult} from './retry-v2.js'
+import {ledgerBlocksCompletion, waitForAbortableDelay, waitForEventProcessorShutdown} from './session-poll-v2.js'
+import {pollForSessionCompletionObservation} from './session-poll.js'
 import {
   armRootFreshness,
   createRootFreshnessTracker,
@@ -23,116 +22,8 @@ import {
   processEventStream,
 } from './streaming.js'
 
-/**
- * How long a new prompt waits for the event stream to announce itself (`server.connected`) before the attempt fails
- * without sending it. The wait is also bounded by the run's execution deadline, whichever comes first.
- */
-export const EVENT_STREAM_CONNECT_TIMEOUT_MS = 10_000
-
 export type PromptStartResult = AttemptResult | null
 export type PromptStarter = () => Promise<PromptStartResult>
-
-export function createDeadlineExceededError(label: string): Error {
-  const error = new Error(`${label} exceeded the execution deadline`)
-  error.name = 'DeadlineExceededError'
-  return error
-}
-
-export interface ExecutionDeadline {
-  readonly timeoutMs: number
-  readonly signal: AbortSignal
-  readonly isExpired: () => boolean
-  readonly isTimedOut: () => boolean
-  readonly remainingMs: () => number
-  readonly run: <T>(operation: () => Promise<T>, label: string) => Promise<T>
-  readonly dispose: () => void
-}
-
-export function createExecutionDeadline(timeoutMs: number, logger: Logger): ExecutionDeadline {
-  const controller = new AbortController()
-  const deadlineAt = timeoutMs > 0 ? Date.now() + timeoutMs : null
-  let timeoutId: ReturnType<typeof setTimeout> | null = null
-  let timedOut = false
-
-  const latchTimeout = (): void => {
-    if (timedOut) return
-    timedOut = true
-    logger.warning('Execution timeout reached', {timeoutMs})
-    controller.abort()
-  }
-
-  const isExpired = (): boolean => {
-    if (timedOut) return true
-    if (deadlineAt != null && Date.now() >= deadlineAt) {
-      latchTimeout()
-      return true
-    }
-    return false
-  }
-
-  const remainingMs = (): number => {
-    if (deadlineAt == null) return Number.POSITIVE_INFINITY
-    const remaining = Math.max(0, deadlineAt - Date.now())
-    if (remaining === 0) latchTimeout()
-    return remaining
-  }
-
-  // Races the operation against the deadline with an explicitly tagged outcome, and preserves
-  // whichever actually won -- never reinterprets the winner by rereading the clock afterwards.
-  // `isExpired()`/`isTimedOut()` remain valid only for admission (before starting work) and for
-  // completion-admission decisions made by callers; they are never consulted here to explain a
-  // race that has already settled. See createExecutionDeadline's docs for the invariant this
-  // upholds: selecting an error never proves quiescence, and observing quiescence never erases
-  // an error.
-  type RunRaceResult<T> =
-    | {readonly source: 'operation'; readonly success: true; readonly value: T}
-    | {readonly source: 'operation'; readonly success: false; readonly error: unknown}
-    | {readonly source: 'deadline'}
-
-  const run = async <T>(operation: () => Promise<T>, label: string): Promise<T> => {
-    // Admission decision: valid to consult the clock here, before any work has started.
-    if (isExpired()) throw createDeadlineExceededError(label)
-    if (deadlineAt == null) return operation()
-
-    let onAbort: (() => void) | null = null
-    const deadlineOutcome = new Promise<RunRaceResult<T>>(resolve => {
-      onAbort = (): void => resolve({source: 'deadline'})
-      controller.signal.addEventListener('abort', onAbort, {once: true})
-    })
-
-    const operationOutcome: Promise<RunRaceResult<T>> = Promise.resolve()
-      .then(operation)
-      .then(
-        (value): RunRaceResult<T> => ({source: 'operation', success: true, value}),
-        (error: unknown): RunRaceResult<T> => ({source: 'operation', success: false, error}),
-      )
-
-    try {
-      // Whichever settles first genuinely won -- no post-race clock recheck, no rewriting the
-      // operation's own outcome based on state that changed after the race was already decided.
-      const winner = await Promise.race([operationOutcome, deadlineOutcome])
-      if (winner.source === 'deadline') throw createDeadlineExceededError(label)
-      if (winner.success) return winner.value
-      throw winner.error
-    } finally {
-      if (onAbort != null) controller.signal.removeEventListener('abort', onAbort)
-    }
-  }
-
-  if (deadlineAt != null) timeoutId = setTimeout(latchTimeout, timeoutMs)
-
-  return {
-    timeoutMs,
-    signal: controller.signal,
-    isExpired,
-    isTimedOut: () => timedOut,
-    remainingMs,
-    run,
-    dispose: () => {
-      if (timeoutId != null) clearTimeout(timeoutId)
-    },
-  }
-}
 
 function getMessageID(value: unknown): string | null {
   if (value == null || typeof value !== 'object') return null
@@ -278,16 +169,6 @@ export function mergeArtifactResults(
   }
 }
 
-export const MAX_LLM_RETRIES = 4
-export const RETRY_DELAYS_MS = [5_000, 15_000, 30_000, 60_000] as const
-
-// `shouldRetryFromOutcome` now lives in attempt-outcome.ts, beside `reduceAttemptOutcome` which
-// needs it internally -- see that module for the definition. Re-exported here because
-// prompt-sender.ts already depends on retry.ts at runtime for `runPromptAttempt`, and that
-// existing value edge is the direction to extend, not a fresh one back into attempt-outcome.ts
-// (see docs/solutions/best-practices/extract-shared-helpers-toward-the-value-dependency-2026-08-08.md).
-export {shouldRetryFromOutcome} from './attempt-outcome.js'
-
 /**
  * Create a v2 client attached to an existing OpenCode server URL.
  * Returns null if the import fails (older SDK) or no URL is provided.
@@ -410,102 +291,6 @@ async function startV2SessionWait(
   } catch (error) {
     logger.debug('v2.session.wait() threw, relying on poll watchdog', {sessionId, error: toErrorMessage(error)})
     return {kind: 'fallback-to-poll'}
-  }
-}
-
-export type StreamConnectOutcome = 'connected' | 'stream-ended' | 'timeout' | 'deadline'
-
-/**
- * Waits for the event stream's `server.connected` frame, or for the reason it will not come.
- *
- * `deadline` means the run's time ran out first (the caller rejects as a deadline expiry, like any other
- * deadline-bounded step); `timeout` means the full 10 s passed with time to spare; `stream-ended` means the stream
- * ended, or the attempt was cancelled, first.
- */
-export async function awaitStreamConnected(options: {
-  readonly connected: Promise<void>
-  readonly streamEnded: Promise<unknown>
-  readonly signal: AbortSignal
-  readonly deadline: ExecutionDeadline | undefined
-}): Promise<StreamConnectOutcome> {
-  const {connected, streamEnded, signal, deadline} = options
-  // Decided before any timer is armed: an expired deadline wins over everything else.
-  if (deadline != null && (deadline.signal.aborted || deadline.isExpired() || deadline.remainingMs() <= 0)) {
-    return 'deadline'
-  }
-  if (signal.aborted) return 'stream-ended'
-  const remainingMs = deadline?.remainingMs() ?? Number.POSITIVE_INFINITY
-  // The timer is the clipped remaining time, not the 10 s cap, when the run has less than 10 s left.
-  const clipped = remainingMs < EVENT_STREAM_CONNECT_TIMEOUT_MS
-  let timer: ReturnType<typeof setTimeout> | undefined
-  let onAbort: (() => void) | undefined
-  try {
-    const timeout = new Promise<StreamConnectOutcome>(resolve => {
-      timer = setTimeout(
-        () => {
-          resolve(clipped || deadline?.isExpired() === true ? 'deadline' : 'timeout')
-        },
-        Math.min(EVENT_STREAM_CONNECT_TIMEOUT_MS, remainingMs),
-      )
-    })
-    const aborted = new Promise<StreamConnectOutcome>(resolve => {
-      onAbort = () => {
-        resolve(deadline?.signal.aborted === true ? 'deadline' : 'stream-ended')
-      }
-      signal.addEventListener('abort', onAbort, {once: true})
-    })
-    return await Promise.race([
-      connected.then((): StreamConnectOutcome => 'connected'),
-      streamEnded.then((): StreamConnectOutcome => 'stream-ended'),
-      timeout,
-      aborted,
-    ])
-  } finally {
-    if (timer !== undefined) clearTimeout(timer)
-    if (onAbort !== undefined) signal.removeEventListener('abort', onAbort)
-  }
-}
-
-/**
- * The attempt result for a stream that did not connect before the prompt. Nothing reached the remote, so it has the
- * shape of a failed prompt submission (`submit_failed`), and it carries the same retryable transport error
- * (`llm_fetch_error`) a transport failure of the submission itself does: the retry loop (`MAX_LLM_RETRIES`, with its
- * backoff bounded by the deadline) then resends the original prompt, and each attempt subscribes a fresh stream.
- * `cause` is the discontinuity recorded when an error ended the stream, if one did; only its name and message are
- * surfaced.
- */
-export function createStreamNotConnectedResult(
-  reason: 'timeout' | 'stream-ended',
-  logger: Logger,
-  sessionId: string,
-  cause: EventStreamResult['discontinuity'],
-): AttemptResult {
-  const causeParts = cause?.errorName == null ? undefined : {errorName: cause.errorName, errorMessage: cause.message}
-  const detail = causeParts == null ? '' : ` (${causeParts.errorName}: ${causeParts.errorMessage})`
-  const message =
-    reason === 'timeout'
-      ? `Event stream did not connect within ${EVENT_STREAM_CONNECT_TIMEOUT_MS / 1000}s; the prompt was not sent`
-      : `Event stream ended before it connected${detail}; the prompt was not sent`
-  logger.warning('Event stream did not connect before the prompt', {sessionId, reason, ...causeParts})
-  const llmError = createLLMFetchError(message)
-  const outcome = 'submit_failed' as const
-  return {
-    success: false,
-    error: message,
-    llmError,
-    outcome,
-    shouldRetry: shouldRetryFromOutcome(outcome),
-    settlement: {kind: 'failure-observed'},
-    eventStreamResult: {
-      tokens: null,
-      model: null,
-      cost: null,
-      prsCreated: [],
-      commitsCreated: [],
-      commentsPosted: 0,
-      llmError,
-      classificationPath: 'fallback',
-    },
   }
 }
 

@@ -29,7 +29,7 @@
  */
 
 import type {RunPhase, RunState, Surface} from '@fro-bot/runtime'
-import type {RunCoreErrorKind} from '../execute/run-core.js'
+import type {RunCoreErrorKind} from '../execute/run-core-shared.js'
 import type {OperatorCheckoutPreparation, OperatorCheckoutProvenance} from './provenance.js'
 import type {OperatorProviderFailureReason} from './provider-failure-reason.js'
 import type {OperatorWaitReason} from './wait-reason.js'

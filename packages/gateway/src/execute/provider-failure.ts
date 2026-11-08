@@ -27,15 +27,8 @@
 
 import type {ProviderFailureClassification} from '@fro-bot/runtime'
 
+import type {ProviderFailure, ProviderFailureErrorName, ProviderFailureReason} from './provider-failure-v2.js'
 import {classifyProviderFailure, retrySignalFromStatus, terminalSignalFromPayload} from '@fro-bot/runtime'
-
-/** Closed set of operator-safe failure reasons. Nothing provider-controlled can become one. */
-export type ProviderFailureReason =
-  | 'provider auth unavailable'
-  | 'model not available'
-  | 'provider quota exceeded'
-  | 'model provider rejected the request'
-  | 'session error'
 
 /**
  * OpenCode error class names this classifier recognizes (v1.19.0): `packages/core/src/v1/session.ts`
@@ -52,19 +45,7 @@ const KNOWN_ERROR_NAMES = [
   'ContextOverflowError',
   'StructuredOutputError',
   'ContentFilterError',
-] as const
-
-type KnownErrorName = (typeof KNOWN_ERROR_NAMES)[number]
-
-/** Closed set of values `errorName` can take: a known class, or one of three source markers. */
-export type ProviderFailureErrorName = KnownErrorName | 'retry-status' | 'error-text' | 'unknown'
-
-export interface ProviderFailure {
-  /** Fixed text, safe for failure messages, logs and operator surfaces. */
-  readonly reason: ProviderFailureReason
-  /** Allowlisted error class or source marker for logging. Upstream strings never pass through. */
-  readonly errorName: ProviderFailureErrorName
-}
+] as const satisfies readonly ProviderFailureErrorName[]
 
 function knownErrorName(name: string | undefined): ProviderFailureErrorName {
   return KNOWN_ERROR_NAMES.find(known => known === name) ?? 'unknown'

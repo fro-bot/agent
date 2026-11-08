@@ -16,7 +16,7 @@ import {
   mockRuntime,
   setupHappyPath,
 } from './test-helpers.js'
-import * as runCoreModule from './run-core.js'
+import * as runCoreModule from './run-core-shared.js'
 import {createRepoQuiescenceChecker} from './repo-quiescence.js'
 /* eslint-enable perfectionist/sort-imports */
 

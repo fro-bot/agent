@@ -512,3 +512,10 @@ export type DeleteBackupResult =
       readonly reason: 'invalid-id' | 'not-found' | 'maintenance-hold' | 'recovery-in-progress'
     }
   | {readonly kind: 'failed'}
+
+/** Minimal structured logger the workspace-agent supervisors, proxies and credential helpers take. */
+export interface Logger {
+  readonly info: (msg: string, meta?: Record<string, unknown>) => void
+  readonly warn: (msg: string, meta?: Record<string, unknown>) => void
+  readonly error: (msg: string, meta?: Record<string, unknown>) => void
+}

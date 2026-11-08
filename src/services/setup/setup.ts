@@ -14,7 +14,7 @@ import {parseAuthJsonInput, populateAuthJson} from './auth-json.js'
 import {buildCIConfig} from './ci-config.js'
 import {parseProviderKeysV2} from './credential-files-v2.js'
 import {configureGhAuth, configureGitIdentity} from './gh-auth.js'
-import {defaultOpenCodeConfigDir} from './no-task-reuse-config.js'
+import {defaultOpenCodeConfigDir} from './opencode-config-dir.js'
 import {
   getPlatformInfo,
   installOpenCode,

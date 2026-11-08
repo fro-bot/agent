@@ -1,27 +1,28 @@
 import type {ActionOpenCodeV2Client, OwnershipLedger} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
-import type {AttemptObservation, FailureObservation, TurnEvidence} from './attempt-outcome.js'
+import type {AttemptObservation, AttemptResult, FailureObservation, TurnEvidence} from './attempt-outcome.js'
+import type {ExecutionDeadline} from './execution-deadline.js'
 import type {AttemptResultV2} from './live-observation-v2.js'
-import type {AttemptResult} from './prompt-sender.js'
-import type {ExecutionDeadline} from './retry.js'
-import type {FormAskedResponderV2, PermissionAskedResponderV2} from './streaming-v2.js'
-import type {EventStreamResult} from './streaming.js'
+import type {EventStreamResult, FormAskedResponderV2, PermissionAskedResponderV2} from './streaming-v2.js'
+import {createLLMFetchError} from '@fro-bot/runtime'
 import {toErrorMessage} from '../../shared/errors.js'
-import {reduceAttemptOutcome} from './attempt-outcome.js'
+import {reduceAttemptOutcome, shouldRetryFromOutcome} from './attempt-outcome.js'
+import {createDeadlineExceededError} from './execution-deadline.js'
 import {createOwnedWorkReconcilerV2} from './reconcile-v2.js'
-import {awaitStreamConnected, createDeadlineExceededError, createStreamNotConnectedResult} from './retry.js'
 import {
+  ledgerBlocksCompletion,
   observeRootTerminal,
   pollForSessionCompletionObservationV2,
   snapshotFailuresV2,
+  waitForAbortableDelay,
+  waitForEventProcessorShutdown,
   type PollOptionsV2,
 } from './session-poll-v2.js'
-import {ledgerBlocksCompletion, waitForAbortableDelay, waitForEventProcessorShutdown} from './session-poll.js'
 import {createActivityTrackerV2, processEventStreamV2} from './streaming-v2.js'
 
 /**
  * One prompt attempt on OpenCode V2: the sibling of `runPromptAttempt` in `retry.ts`. The pre-send retry constants
- * (`MAX_LLM_RETRIES`, `RETRY_DELAYS_MS`) and the deadline are shared with V1 and live there. There is no continuation
+ * (`MAX_LLM_RETRIES`, `RETRY_DELAYS_MS`) and the deadline are shared with V1 and live here. There is no continuation
  * prompt on V2: a turn that fails after the send is the end of the run.
  *
  * Order, which is what keeps a late connection from losing events: the stream is subscribed by the caller, the event
@@ -427,5 +428,110 @@ export async function runPromptAttemptV2(options: RunPromptAttemptV2Options): Pr
   } finally {
     reconciler?.dispose()
     if (!kept) await stopEventProcessor()
+  }
+}
+
+/**
+ * How long a new prompt waits for the event stream to announce itself (`server.connected`) before the attempt fails
+ * without sending it. The wait is also bounded by the run's execution deadline, whichever comes first.
+ */
+export const EVENT_STREAM_CONNECT_TIMEOUT_MS = 10_000
+
+export const MAX_LLM_RETRIES = 4
+export const RETRY_DELAYS_MS = [5_000, 15_000, 30_000, 60_000] as const
+
+export type StreamConnectOutcome = 'connected' | 'stream-ended' | 'timeout' | 'deadline'
+
+/**
+ * Waits for the event stream's `server.connected` frame, or for the reason it will not come.
+ *
+ * `deadline` means the run's time ran out first (the caller rejects as a deadline expiry, like any other
+ * deadline-bounded step); `timeout` means the full 10 s passed with time to spare; `stream-ended` means the stream
+ * ended, or the attempt was cancelled, first.
+ */
+export async function awaitStreamConnected(options: {
+  readonly connected: Promise<void>
+  readonly streamEnded: Promise<unknown>
+  readonly signal: AbortSignal
+  readonly deadline: ExecutionDeadline | undefined
+}): Promise<StreamConnectOutcome> {
+  const {connected, streamEnded, signal, deadline} = options
+  // Decided before any timer is armed: an expired deadline wins over everything else.
+  if (deadline != null && (deadline.signal.aborted || deadline.isExpired() || deadline.remainingMs() <= 0)) {
+    return 'deadline'
+  }
+  if (signal.aborted) return 'stream-ended'
+  const remainingMs = deadline?.remainingMs() ?? Number.POSITIVE_INFINITY
+  // The timer is the clipped remaining time, not the 10 s cap, when the run has less than 10 s left.
+  const clipped = remainingMs < EVENT_STREAM_CONNECT_TIMEOUT_MS
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let onAbort: (() => void) | undefined
+  try {
+    const timeout = new Promise<StreamConnectOutcome>(resolve => {
+      timer = setTimeout(
+        () => {
+          resolve(clipped || deadline?.isExpired() === true ? 'deadline' : 'timeout')
+        },
+        Math.min(EVENT_STREAM_CONNECT_TIMEOUT_MS, remainingMs),
+      )
+    })
+    const aborted = new Promise<StreamConnectOutcome>(resolve => {
+      onAbort = () => {
+        resolve(deadline?.signal.aborted === true ? 'deadline' : 'stream-ended')
+      }
+      signal.addEventListener('abort', onAbort, {once: true})
+    })
+    return await Promise.race([
+      connected.then((): StreamConnectOutcome => 'connected'),
+      streamEnded.then((): StreamConnectOutcome => 'stream-ended'),
+      timeout,
+      aborted,
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+    if (onAbort !== undefined) signal.removeEventListener('abort', onAbort)
+  }
+}
+
+/**
+ * The attempt result for a stream that did not connect before the prompt. Nothing reached the remote, so it has the
+ * shape of a failed prompt submission (`submit_failed`), and it carries the same retryable transport error
+ * (`llm_fetch_error`) a transport failure of the submission itself does: the retry loop (`MAX_LLM_RETRIES`, with its
+ * backoff bounded by the deadline) then resends the original prompt, and each attempt subscribes a fresh stream.
+ * `cause` is the discontinuity recorded when an error ended the stream, if one did; only its name and message are
+ * surfaced.
+ */
+export function createStreamNotConnectedResult(
+  reason: 'timeout' | 'stream-ended',
+  logger: Logger,
+  sessionId: string,
+  cause: EventStreamResult['discontinuity'],
+): AttemptResult {
+  const causeParts = cause?.errorName == null ? undefined : {errorName: cause.errorName, errorMessage: cause.message}
+  const detail = causeParts == null ? '' : ` (${causeParts.errorName}: ${causeParts.errorMessage})`
+  const message =
+    reason === 'timeout'
+      ? `Event stream did not connect within ${EVENT_STREAM_CONNECT_TIMEOUT_MS / 1000}s; the prompt was not sent`
+      : `Event stream ended before it connected${detail}; the prompt was not sent`
+  logger.warning('Event stream did not connect before the prompt', {sessionId, reason, ...causeParts})
+  const llmError = createLLMFetchError(message)
+  const outcome = 'submit_failed' as const
+  return {
+    success: false,
+    error: message,
+    llmError,
+    outcome,
+    shouldRetry: shouldRetryFromOutcome(outcome),
+    settlement: {kind: 'failure-observed'},
+    eventStreamResult: {
+      tokens: null,
+      model: null,
+      cost: null,
+      prsCreated: [],
+      commitsCreated: [],
+      commentsPosted: 0,
+      llmError,
+      classificationPath: 'fallback',
+    },
   }
 }

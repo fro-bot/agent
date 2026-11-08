@@ -17,7 +17,6 @@ import type {OutputMode, ResolvedOutputMode, TokenUsage} from '../../shared/type
 import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {BrokeredPushPlan} from './brokered-push-plan.js'
 import type {CacheRestorePhaseResult, CacheRestoreV2PhaseResult} from './cache-restore.js'
-import type {ExecutionBackend} from './execution-backend.js'
 import type {RoutingPhaseResult} from './routing.js'
 import type {SessionPrepPhaseResult} from './session-prep.js'
 import * as fs from 'node:fs/promises'
@@ -43,7 +42,7 @@ import {createLogger} from '../../shared/logger.js'
 import {STATE_KEYS} from '../config/state-keys.js'
 import {resolveBrokeredPushPlan} from './brokered-push-plan.js'
 import {isCacheRestoreV2} from './cache-restore-kind.js'
-import {createExecutionBackendV2} from './execute-v2.js'
+import {createExecutionBackendV2, type ExecutionBackend} from './execute-v2.js'
 import {buildSessionSearchQuery} from './session-prep.js'
 
 export interface ExecutePhaseResult {

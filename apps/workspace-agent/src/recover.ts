@@ -19,7 +19,7 @@ import type {CheckoutLayoutRunner} from './checkout-profile.js'
 import type {GitProfile, GitRunnerFn} from './git-safety.js'
 import type {PackStreamOptions} from './git-stream.js'
 import type {JournalListEntry, RecoveryJournal, RecoveryJournalPhase, UpdateJournal} from './journal.js'
-import type {InstanceDisposer} from './opencode-instance.js'
+import type {InstanceDisposer} from './opencode-instance-v2.js'
 import type {
   DirtyCounts,
   ExecuteRecoveryRequest,

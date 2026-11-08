@@ -1,8 +1,8 @@
-import type {DrainRejectCode} from '../execute/drain-completion.js'
+import type {DrainRejectCode} from '../execute/drain-completion-v2.js'
 import type {OperatorWaitReason} from './wait-reason.js'
 
 import {describe, expect, it} from 'vitest'
-import {DRAIN_REJECT_CODES} from '../execute/drain-completion.js'
+import {DRAIN_REJECT_CODES} from '../execute/drain-completion-v2.js'
 import {
   DRAIN_REJECT_CODE_TO_WAIT_REASON,
   isOperatorWaitReason,

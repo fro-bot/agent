@@ -16,6 +16,7 @@ import * as streamingModule from '../discord/streaming.js'
 import {totalRecoveryBudgetMs} from './checkout-recovery.js'
 import * as attachModule from './opencode-attach.js'
 import * as promptModule from './prompt.js'
+import * as runCoreSharedModule from './run-core-shared.js'
 import * as runCoreModule from './run-core.js'
 
 // ---------------------------------------------------------------------------
@@ -95,6 +96,9 @@ vi.mock('./prompt.js', () => ({
 
 vi.mock('./run-core.js', () => ({
   runOpenCodeCore: vi.fn().mockResolvedValue(undefined),
+}))
+
+vi.mock('./run-core-shared.js', () => ({
   RunCoreError: class RunCoreError extends Error {
     readonly kind: string
     readonly quarantined: boolean
@@ -880,7 +884,7 @@ export async function awaitLaunchWorkRun(
 export function mockRunOpenCodeCoreAbortedBy(viaRegistryAbort: () => void) {
   mockRunOpenCodeCore.mockImplementation(async () => {
     viaRegistryAbort()
-    throw new runCoreModule.RunCoreError('timeout', 'run-core: signal aborted')
+    throw new runCoreSharedModule.RunCoreError('timeout', 'run-core: signal aborted')
   })
 }
 

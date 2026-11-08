@@ -16,7 +16,7 @@ import {
   mockRuntime,
   setupHappyPath,
 } from './test-helpers.js'
-import * as runCoreModule from './run-core.js'
+import * as runCoreModule from './run-core-shared.js'
 import {abortRegistry} from './abort-registry.js'
 import {cancelRun, createInFlightCancels} from './cancel.js'
 import {isRunLive, isRunQuarantined} from './live-run-registry.js'

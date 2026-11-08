@@ -15,7 +15,7 @@ tags:
   - harness
   - recovery
 applies_when:
-  - A repo runs semantic-release with the default `tagFormat: 'v${version}'` AND also publishes other GitHub Releases (sub-package binaries, etc.)
+  - "A repo runs semantic-release with the default `tagFormat: 'v${version}'` AND also publishes other GitHub Releases (sub-package binaries, etc.)"
   - You discover the next product version computed wrong (a major/minor jump) after a release
   - You need to migrate a GitHub Release to a different tag name
   - You're tempted to reach for semantic-release config to "exclude tags by pattern" — there is none
