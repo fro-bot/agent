@@ -109,6 +109,7 @@ function makeApprovalRegistry(overrides: Partial<ApprovalRegistry> = {}): Approv
     pending: vi.fn().mockReturnValue([]),
     hasPendingForScope: vi.fn().mockReturnValue(true),
     describePendingForScope: vi.fn().mockReturnValue([]),
+    describePendingForRun: vi.fn().mockReturnValue([]),
     handleDecision: vi.fn(),
     confirmReply: vi.fn(),
     applySettlement: vi.fn().mockResolvedValue(undefined),
@@ -124,12 +125,15 @@ function makeDeps(
     readonly logger?: GatewayLogger
     readonly approvalRegistry?: ApprovalRegistry
     readonly replySink?: ReplySink & {readonly sentCalls: SentCall[]}
+    readonly onRegistered?: (request: PermissionRequest) => void
   } = {},
 ): DiscordApprovalTransportDeps & {readonly replySink: ReplySink & {readonly sentCalls: SentCall[]}} {
   return {
     approvalRegistry: overrides.approvalRegistry ?? makeApprovalRegistry(),
     replySink: overrides.replySink ?? makeReplySink(),
     threadId: 'thread_1',
+    runId: 'run_1',
+    onRegistered: overrides.onRegistered,
     directory: '/workspace/proj',
     approvalDeadlineMs: undefined,
     onDeadlineSettled: undefined,
@@ -172,6 +176,67 @@ describe('createDiscordApprovalOnPending — happy path', () => {
     // #then the request was never auto-rejected or marked post-failed
     expect(approvalRegistry.applySettlement).not.toHaveBeenCalled()
     expect(approvalRegistry.markMessagePostFailed).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Run identity and the announce hook (#2115)
+// ---------------------------------------------------------------------------
+
+describe('createDiscordApprovalOnPending — run identity', () => {
+  it('registers the request under the thread id AND the run that raised it', () => {
+    // #given
+    const approvalRegistry = makeApprovalRegistry()
+
+    // #when
+    createDiscordApprovalOnPending(makeDeps({approvalRegistry}))(makeRequest())
+
+    // #then the thread id still scopes the Discord button; the run id lets the dashboard reach the request
+    expect(approvalRegistry.register).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({approvalScopeId: 'thread_1', runId: 'run_1'}),
+    )
+  })
+
+  it('announces the request once registered, before any Discord post', () => {
+    // #given
+    const order: string[] = []
+    const approvalRegistry = makeApprovalRegistry({
+      register: vi.fn(() => {
+        order.push('register')
+      }),
+    })
+    const replySink = makeReplySink()
+    vi.mocked(replySink.send).mockImplementation(async () => {
+      order.push('send')
+      return {success: true, data: {id: 'm'}}
+    })
+    const onRegistered = vi.fn(() => {
+      order.push('announce')
+    })
+
+    // #when
+    createDiscordApprovalOnPending(makeDeps({approvalRegistry, replySink, onRegistered}))(makeRequest())
+
+    // #then the dashboard frame never races ahead of the registry entry, and never waits for Discord
+    expect(onRegistered).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({requestID: 'per_1'}))
+    expect(order.slice(0, 3)).toEqual(['register', 'announce', 'send'])
+  })
+
+  it('an announce hook that throws neither escapes nor stops the Discord card', async () => {
+    // #given
+    const logger = makeLogger()
+    const replySink = makeReplySink()
+    const onRegistered = vi.fn(() => {
+      throw new Error('observer down')
+    })
+    const deps = makeDeps({replySink, onRegistered, logger})
+
+    // #when / #then
+    expect(() => createDiscordApprovalOnPending(deps)(makeRequest())).not.toThrow()
+    await vi.waitFor(() => {
+      expect(replySink.sentCalls.some(call => call.options.embeds !== undefined)).toBe(true)
+    })
+    expect(logger.warn).toHaveBeenCalled()
   })
 })
 

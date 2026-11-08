@@ -13,7 +13,7 @@
  *      predicate the read routes use; anything but `allowed` → notFoundResponse
  *   5. Parse + validate decision from body against PermissionReply allowlist
  *   6. Build WebOperatorActor from the operator auth context
- *   7. registry.handleDecision({requestID, approvalScopeId: run.run_id, decision, actor})
+ *   7. registry.handleDecision({requestID, approvalScopeId: run.run_id, runId: run.run_id, decision, actor})
  *   8. Emit ApprovalDecisionEvent audit record
  *   9. Map DecisionOutcome via toOperatorDecisionState → JSON response
  *
@@ -217,14 +217,17 @@ export function buildDecisionRoute(app: Hono, deps: DecisionRouteDeps): void {
       }
 
       // ── Gate 7: Settle through the registry ───────────────────────────────
-      // handleDecision is the ONLY settlement path. approvalScopeId is run.run_id
-      // resolved server-side — NEVER from the client.
+      // handleDecision is the ONLY settlement path. runId is the URL run, already resolved to a repo the
+      // operator may act on: the registry accepts the decision only for a request that run raised (a Discord
+      // run's approval is registered under its thread id, which the dashboard never holds), and answers
+      // not-found for any other — the same as an unknown id.
       // The requestId comes from the URL param (not the body).
       const requestId = c.req.param('requestId') ?? ''
 
       const outcome = await deps.registry.handleDecision({
         requestID: requestId,
         approvalScopeId: runId,
+        runId,
         decision,
         actor,
       })

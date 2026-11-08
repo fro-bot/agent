@@ -13,7 +13,7 @@
  *   4. resolveRepoAccess (bound AND not denylisted, one binding read); anything
  *      but `allowed` → notFoundResponse
  *   5. Per-operator rate limit (keyed on operator identity)
- *   6. Return registry.describePendingForScope(runId) as a bounded DTO list
+ *   6. Return registry.describePendingForRun(runId) as a bounded DTO list
  *      (hard-capped at PENDING_APPROVALS_MAX_RESULTS entries)
  *
  * Security invariants:
@@ -67,7 +67,7 @@ export interface PendingApprovalsRouteDeps {
   /** Bindings lookup for deny-key resolution. */
   readonly bindingsLookup: BindingsLookup
   /** Approval registry — the sole source of pending request detail. */
-  readonly registry: Pick<ApprovalRegistry, 'describePendingForScope'>
+  readonly registry: Pick<ApprovalRegistry, 'describePendingForRun'>
   /** Structured logger. */
   readonly logger: OperatorLogger
   /** Injectable clock. */
@@ -171,10 +171,11 @@ export function buildPendingApprovalsRoute(app: Hono, deps: PendingApprovalsRout
     }
 
     // ── Gate 6: Return bounded pending approval DTOs ─────────────────────────
-    // describePendingForScope returns only open/claimed entries for this runId.
+    // describePendingForRun returns only the open entries raised by this run, whichever surface started it (a
+    // Discord run registers under its thread id; the entry carries the run id).
     // Hard-cap the result to PENDING_APPROVALS_MAX_RESULTS (defensive).
     // An empty list is a valid authorized response — not an oracle.
-    const all = deps.registry.describePendingForScope(runId)
+    const all = deps.registry.describePendingForRun(runId)
     const approvals = all.length > PENDING_APPROVALS_MAX_RESULTS ? all.slice(0, PENDING_APPROVALS_MAX_RESULTS) : all
 
     return c.json({approvals}, 200)

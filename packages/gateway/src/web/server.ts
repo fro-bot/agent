@@ -258,10 +258,7 @@ export interface OperatorServerDeps {
    * When absent, neither route is registered (opt-in). GET /operator/runs also
    * requires it (waiting overlay), as well as questionRegistry.
    */
-  readonly approvalRegistry?: Pick<
-    ApprovalRegistry,
-    'handleDecision' | 'describePendingForScope' | 'hasPendingForScope'
-  >
+  readonly approvalRegistry?: Pick<ApprovalRegistry, 'handleDecision' | 'describePendingForRun' | 'hasPendingForScope'>
   /**
    * Question registry for the question routes. When present (alongside the browser guard,
    * sessionStore, runIndex, denylistCache, bindingsLookup, allowlist, and auditLogger), the
@@ -953,7 +950,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   //   3. resolveRepoAccess (bound AND not denylisted, one binding read)
   //   4. Parse + validate decision from body ({decision: 'once'|'always'|'reject'})
   //   5. Build WebOperatorActor from session
-  //   6. registry.handleDecision({requestID, approvalScopeId: runId, decision, actor})
+  //   6. registry.handleDecision({requestID, approvalScopeId: runId, runId, decision, actor})
   //   7. Emit ApprovalDecisionEvent audit record
   //   8. Map DecisionOutcome via toOperatorDecisionState → JSON {state}
   //
@@ -1036,7 +1033,7 @@ export function buildOperatorApp(deps: OperatorServerDeps, config: OperatorServe
   //   2. resolveRepoFromRunIndex (server-owned runId → repo lookup + owner/repo split)
   //   3. resolveRepoAccess (bound AND not denylisted, one binding read)
   //   4. Per-operator rate limit (operator-keyed)
-  //   5. registry.describePendingForScope(runId) → bounded DTO list (hard-capped)
+  //   5. registry.describePendingForRun(runId) → bounded DTO list (hard-capped)
   //
   // Every failure at gates 2–3 returns the identical no-oracle notFoundResponse.
   // A gate throw degrades to the same denial, not a distinguishable 500.

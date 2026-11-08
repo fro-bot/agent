@@ -253,7 +253,7 @@ function makeBrowserGuardStubDeps(): OperatorServerDeps {
     // Provide approvalRegistry so the decision and pending-approvals routes are registered.
     approvalRegistry: {
       handleDecision: vi.fn(async () => 'ok' as const),
-      describePendingForScope: vi.fn(() => []),
+      describePendingForRun: vi.fn(() => []),
       hasPendingForScope: vi.fn(() => false),
     },
     // Provide questionRegistry so the question routes and GET /operator/runs (waiting overlay)
@@ -293,6 +293,7 @@ function makeBrowserGuardStubDeps(): OperatorServerDeps {
         pending: vi.fn(() => []),
         hasPendingForScope: vi.fn(() => false),
         describePendingForScope: vi.fn(() => []),
+        describePendingForRun: vi.fn(() => []),
         handleDecision: vi.fn(async () => 'ok' as const),
         confirmReply: vi.fn(),
         applySettlement: vi.fn(async () => undefined),

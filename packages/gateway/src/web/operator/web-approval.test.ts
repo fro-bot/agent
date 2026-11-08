@@ -18,7 +18,7 @@ import type {ApprovalFrameData} from '../../operator-contract/approval-frame.js'
 import type {WebApprovalTransportDeps} from './web-approval.js'
 import {describe, expect, it, vi} from 'vitest'
 import {APPROVAL_DETAIL_MAX_LENGTH} from '../../approvals/approval-detail.js'
-import {createWebApprovalOnPending} from './web-approval.js'
+import {createWebApprovalOnPending, createWebApprovalOnRegistered} from './web-approval.js'
 
 // ---------------------------------------------------------------------------
 // Stub factories
@@ -44,6 +44,7 @@ function makeApprovalRegistry(): ApprovalRegistry {
     pending: vi.fn(() => []),
     hasPendingForScope: vi.fn(() => false),
     describePendingForScope: vi.fn(() => []),
+    describePendingForRun: vi.fn(() => []),
     handleDecision: vi.fn(async () => 'ok' as const),
     confirmReply: vi.fn(),
     applySettlement: vi.fn(async () => undefined),
@@ -110,6 +111,20 @@ describe('createWebApprovalOnPending', () => {
           approvalScopeId: 'run-uuid-1234',
           directory: '/workspace/owner/repo',
         }),
+      )
+    })
+
+    it('registers the run that raised the request, so the run-scoped routes reach it', () => {
+      // #given
+      const ctx = makeApprovalTransportContext()
+      const onPending = createWebApprovalOnPending(makeDeps())(ctx)
+
+      // #when
+      onPending(makePermissionRequest())
+
+      // #then
+      expect(ctx.approvalRegistry.register).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({runId: 'run-uuid-1234'}),
       )
     })
 
@@ -577,5 +592,89 @@ describe('createWebApprovalOnPending', () => {
         expect.objectContaining({requestID: 'req-2', command: 'echo 2'}),
       )
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// createWebApprovalOnRegistered — the announce half, for runs another transport registers (Discord)
+// ---------------------------------------------------------------------------
+
+function setup(deps = makeDeps()) {
+  const approvalRegistry = makeApprovalRegistry()
+  const announce = createWebApprovalOnRegistered(deps)({
+    approvalRegistry,
+    runId: 'run-discord-1',
+    repo: 'owner/repo',
+  })
+  return {approvalRegistry, announce, deps}
+}
+
+describe('createWebApprovalOnRegistered', () => {
+  it('emits the open frame for the run and registers nothing', () => {
+    // #given
+    const {approvalRegistry, announce, deps} = setup()
+
+    // #when the Discord transport has registered a request and announces it
+    announce(makePermissionRequest({requestID: 'req-d', command: 'ls'}))
+
+    // #then
+    expect(deps.observeApproval).toHaveBeenCalledExactlyOnceWith('run-discord-1', {
+      requestID: 'req-d',
+      permission: 'bash',
+      command: 'ls',
+      settled: false,
+    })
+    expect(approvalRegistry.register).not.toHaveBeenCalled()
+  })
+
+  it('attaches a settle renderer that emits the settled frame on any settlement', async () => {
+    // #given
+    const {approvalRegistry, announce, deps} = setup()
+    announce(makePermissionRequest({requestID: 'req-d'}))
+    const [requestID, render] = vi.mocked(approvalRegistry.attachMessage).mock.calls[0] ?? []
+    expect(requestID).toBe('req-d')
+    vi.mocked(deps.observeApproval).mockClear()
+
+    // #when the registry settles it (any reason, any actor)
+    await render?.(makePermissionRequest({requestID: 'req-d'}), 'reject', null, 'disposed')
+
+    // #then
+    expect(deps.observeApproval).toHaveBeenCalledExactlyOnceWith('run-discord-1', {requestID: 'req-d', settled: true})
+  })
+
+  it('attaches the settle renderer before the open frame, so a frame that is dropped can still settle', () => {
+    // #given
+    const order: string[] = []
+    const deps = makeDeps({
+      observeApproval: vi.fn(() => {
+        order.push('observe')
+      }),
+    })
+    const approvalRegistry = makeApprovalRegistry()
+    vi.mocked(approvalRegistry.attachMessage).mockImplementation(() => {
+      order.push('attach')
+    })
+
+    // #when
+    createWebApprovalOnRegistered(deps)({approvalRegistry, runId: 'r', repo: 'o/r'})(makePermissionRequest())
+
+    // #then
+    expect(order).toEqual(['attach', 'observe'])
+  })
+
+  it('is fail-soft: observer throws on open and on settle never escape', async () => {
+    // #given
+    const deps = makeDeps({
+      observeApproval: vi.fn(() => {
+        throw new Error('boom')
+      }),
+    })
+    const {approvalRegistry, announce} = setup(deps)
+
+    // #when / #then
+    expect(() => announce(makePermissionRequest())).not.toThrow()
+    const render = vi.mocked(approvalRegistry.attachMessage).mock.calls[0]?.[1]
+    await expect(render?.(makePermissionRequest(), 'reject', null, 'disposed')).resolves.toBeUndefined()
+    expect(deps.logger.warn).toHaveBeenCalledTimes(2)
   })
 })

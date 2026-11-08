@@ -1945,3 +1945,335 @@ describe('reject-only requests (truncated detail)', () => {
     expect(registry.describePendingForScope('chan_1')).toHaveLength(1)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Run-scoped lookup and decision (#2115): an entry carries the run that raised it, so a web operator reaches a
+// Discord-run approval (registered under the thread id) by run id, never by the thread id.
+// ---------------------------------------------------------------------------
+
+describe('run-scoped lookup and decision', () => {
+  const THREAD = 'thread_99'
+  const webActor: ApprovalActor = {kind: 'web-operator', githubUserId: 1, login: 'alice', sessionCorrelationId: 's'}
+
+  function registerDiscordRun(registry: ReturnType<typeof createApprovalRegistry>, requestID: string, runId: string) {
+    const effects = makeEffects()
+    registry.register(
+      makeParams({
+        requestID,
+        request: makeRequest({requestID, permission: 'bash', command: 'ls'}),
+        approvalScopeId: THREAD,
+        runId,
+        effects,
+      }),
+    )
+    return effects
+  }
+
+  describe('describePendingForRun', () => {
+    it('lists the open approvals raised by the run, whatever scope they were registered under', () => {
+      // #given a Discord run (thread scope) and a web run (run scope), each with one approval
+      const registry = createApprovalRegistry({logger: makeLogger()})
+      registerDiscordRun(registry, 'per_d', 'run_discord')
+      registry.register(
+        makeParams({
+          requestID: 'per_w',
+          request: makeRequest({requestID: 'per_w'}),
+          approvalScopeId: 'run_web',
+          runId: 'run_web',
+        }),
+      )
+
+      // #when / #then each run sees only its own
+      expect(registry.describePendingForRun('run_discord').map(a => a.requestID)).toEqual(['per_d'])
+      expect(registry.describePendingForRun('run_web').map(a => a.requestID)).toEqual(['per_w'])
+    })
+
+    it('does not list another run, the thread id, or an entry registered without a run id', () => {
+      // #given
+      const registry = createApprovalRegistry({logger: makeLogger()})
+      registerDiscordRun(registry, 'per_d', 'run_discord')
+      registry.register(makeParams({requestID: 'per_legacy', request: makeRequest({requestID: 'per_legacy'})}))
+
+      // #when / #then
+      expect(registry.describePendingForRun('run_other')).toEqual([])
+      expect(registry.describePendingForRun(THREAD)).toEqual([])
+      expect(registry.describePendingForRun('')).toEqual([])
+    })
+
+    it('lists only open entries, with the bounded detail', async () => {
+      // #given one open approval and one that a click already claimed
+      const registry = createApprovalRegistry({logger: makeLogger()})
+      registerDiscordRun(registry, 'per_open', 'run_discord')
+      const effects = registerDiscordRun(registry, 'per_claimed', 'run_discord')
+      let release: () => void = () => undefined
+      effects.postReply = vi.fn().mockImplementation(
+        async () =>
+          new Promise(resolve => {
+            release = () => resolve({ok: true})
+          }),
+      )
+      const claim = registry.handleDecision({
+        requestID: 'per_claimed',
+        approvalScopeId: THREAD,
+        decision: 'once',
+        actor: makeActor(),
+      })
+
+      // #when / #then
+      expect(registry.describePendingForRun('run_discord')).toEqual([
+        {requestID: 'per_open', permission: 'bash', command: 'ls'},
+      ])
+      release()
+      await claim
+    })
+  })
+
+  describe('web-operator decision bound to the run', () => {
+    it('settles an approval registered under the thread id when the run id matches', async () => {
+      // #given a Discord-run approval
+      const registry = createApprovalRegistry({logger: makeLogger()})
+      const effects = registerDiscordRun(registry, 'per_d', 'run_discord')
+
+      // #when the dashboard decides it by run id
+      const outcome = await registry.handleDecision({
+        requestID: 'per_d',
+        approvalScopeId: 'run_discord',
+        runId: 'run_discord',
+        decision: 'once',
+        actor: webActor,
+      })
+
+      // #then it settles through the same gate
+      expect(outcome).toBe('ok')
+      expect(effects.postReply).toHaveBeenCalledExactlyOnceWith('per_d', '/workspace/proj', 'once')
+    })
+
+    it("answers not-found, never channel-mismatch, for another run's request id, and claims nothing", async () => {
+      // #given an approval of run A
+      const registry = createApprovalRegistry({logger: makeLogger()})
+      const effects = registerDiscordRun(registry, 'per_d', 'run_a')
+
+      // #when an operator decides it through run B's URL
+      const outcome = await registry.handleDecision({
+        requestID: 'per_d',
+        approvalScopeId: 'run_b',
+        runId: 'run_b',
+        decision: 'once',
+        actor: webActor,
+      })
+
+      // #then it looks exactly like an unknown request, and the entry is untouched
+      expect(outcome).toBe('not-found')
+      expect(effects.postReply).not.toHaveBeenCalled()
+      expect(registry.describePendingForRun('run_a')).toHaveLength(1)
+    })
+
+    it('answers not-found when the entry carries no run id (fail closed)', async () => {
+      // #given an entry registered without a run id
+      const registry = createApprovalRegistry({logger: makeLogger()})
+      const effects = makeEffects()
+      registry.register(makeParams({effects, approvalScopeId: 'run_x'}))
+
+      // #when
+      const outcome = await registry.handleDecision({
+        requestID: 'per_1',
+        approvalScopeId: 'run_x',
+        runId: 'run_x',
+        decision: 'once',
+        actor: webActor,
+      })
+
+      // #then
+      expect(outcome).toBe('not-found')
+      expect(effects.postReply).not.toHaveBeenCalled()
+    })
+
+    it('checks the run before the reject-only refusal, so a wrong run learns nothing', async () => {
+      // #given a truncated (reject-only) approval of run A
+      const registry = createApprovalRegistry({logger: makeLogger()})
+      registry.register(
+        makeParams({
+          request: makeRequest({permission: 'bash', command: 'x'.repeat(5000)}),
+          approvalScopeId: THREAD,
+          runId: 'run_a',
+        }),
+      )
+
+      // #when / #then run B gets not-found; run A gets the reject-only refusal
+      expect(
+        await registry.handleDecision({
+          requestID: 'per_1',
+          approvalScopeId: 'run_b',
+          runId: 'run_b',
+          decision: 'once',
+          actor: webActor,
+        }),
+      ).toBe('not-found')
+      expect(
+        await registry.handleDecision({
+          requestID: 'per_1',
+          approvalScopeId: 'run_a',
+          runId: 'run_a',
+          decision: 'once',
+          actor: webActor,
+        }),
+      ).toBe('reject-only')
+    })
+  })
+
+  describe('Discord button verification stays on the thread scope', () => {
+    it('refuses a click from another channel even when the entry carries a run id', async () => {
+      // #given
+      const registry = createApprovalRegistry({logger: makeLogger()})
+      const effects = registerDiscordRun(registry, 'per_d', 'run_discord')
+
+      // #when a Discord user clicks from a different channel, and again with the run id passed as the scope
+      const wrongChannel = await registry.handleDecision({
+        requestID: 'per_d',
+        approvalScopeId: 'thread_other',
+        decision: 'once',
+        actor: makeActor(),
+      })
+      const runIdAsScope = await registry.handleDecision({
+        requestID: 'per_d',
+        approvalScopeId: 'run_discord',
+        runId: 'run_discord',
+        decision: 'once',
+        actor: makeActor(),
+      })
+
+      // #then both are scope mismatches: the run binding is for web operators only
+      expect(wrongChannel).toBe('channel-mismatch')
+      expect(runIdAsScope).toBe('channel-mismatch')
+      expect(effects.postReply).not.toHaveBeenCalled()
+    })
+
+    it('still accepts the click from the thread', async () => {
+      const registry = createApprovalRegistry({logger: makeLogger()})
+      registerDiscordRun(registry, 'per_d', 'run_discord')
+
+      expect(
+        await registry.handleDecision({
+          requestID: 'per_d',
+          approvalScopeId: THREAD,
+          decision: 'once',
+          actor: makeActor(),
+        }),
+      ).toBe('ok')
+    })
+  })
+
+  describe('a Discord click racing a dashboard decision', () => {
+    it('settles exactly once: one winner, the loser is already-claimed', async () => {
+      // #given a Discord-run approval and a reply that stays in flight
+      const registry = createApprovalRegistry({logger: makeLogger()})
+      const effects = registerDiscordRun(registry, 'per_d', 'run_discord')
+      let release: () => void = () => undefined
+      effects.postReply = vi.fn().mockImplementation(
+        async () =>
+          new Promise(resolve => {
+            release = () => resolve({ok: true})
+          }),
+      )
+
+      // #when the dashboard and the Discord button both decide
+      const dashboard = registry.handleDecision({
+        requestID: 'per_d',
+        approvalScopeId: 'run_discord',
+        runId: 'run_discord',
+        decision: 'once',
+        actor: webActor,
+      })
+      const click = await registry.handleDecision({
+        requestID: 'per_d',
+        approvalScopeId: THREAD,
+        decision: 'reject',
+        actor: makeActor(),
+      })
+      release()
+
+      // #then the dashboard won, the click lost, and only one reply went upstream
+      expect(click).toBe('already-claimed')
+      expect(await dashboard).toBe('ok')
+      expect(effects.postReply).toHaveBeenCalledTimes(1)
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Settle renderers: a list, so a transport that attaches nothing still gets its settle hook
+// ---------------------------------------------------------------------------
+
+describe('settle renderers', () => {
+  it('runs every attached renderer on a settlement, in attach order', async () => {
+    // #given two transports attached to one entry
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    registry.register(makeParams())
+    const order: string[] = []
+    registry.attachMessage('per_1', async () => {
+      order.push('sse')
+    })
+    registry.attachMessage('per_1', async () => {
+      order.push('discord')
+    })
+
+    // #when the run tears down
+    await registry.disposeRun('ses_1', 'run ended')
+
+    // #then both ran, once each
+    expect(order).toEqual(['sse', 'discord'])
+  })
+
+  it('a renderer that throws does not stop the others', async () => {
+    // #given
+    const logger = makeLogger()
+    const registry = createApprovalRegistry({logger})
+    registry.register(makeParams())
+    const second = makeRenderFn()
+    registry.attachMessage('per_1', async () => {
+      throw new Error('boom')
+    })
+    registry.attachMessage('per_1', second)
+
+    // #when
+    await registry.disposeRun('ses_1', 'run ended')
+
+    // #then
+    expect(second).toHaveBeenCalledOnce()
+  })
+
+  it('supersedes through every renderer of the replaced entry', async () => {
+    // #given an entry with two renderers
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    registry.register(makeParams())
+    const first = makeRenderFn()
+    const second = makeRenderFn()
+    registry.attachMessage('per_1', first)
+    registry.attachMessage('per_1', second)
+
+    // #when the request id is re-asked
+    registry.register(makeParams())
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // #then
+    for (const fn of [first, second]) {
+      expect((fn as Mock).mock.calls.map(call => call[3] as string)).toEqual(['superseded'])
+    }
+  })
+
+  it('still settles the renderers attached before a failed embed post', async () => {
+    // #given a renderer attached at register time and an embed post that failed
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    registry.register(makeParams())
+    const sse = makeRenderFn()
+    registry.attachMessage('per_1', sse)
+    registry.markMessagePostFailed('per_1')
+
+    // #when the run tears down
+    await registry.disposeRun('ses_1', 'run ended')
+
+    // #then the settle hook still fired
+    expect(sse).toHaveBeenCalledOnce()
+    expect((sse as Mock).mock.calls[0]?.[3]).toBe('disposed')
+  })
+})

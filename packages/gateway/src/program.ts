@@ -85,6 +85,7 @@ import {createPushHealthTracker} from './web/operator-push/push-health.js'
 import {createPushSender} from './web/operator-push/push-sender.js'
 import {createOperatorPushSubscriptionStore} from './web/operator-push/subscription-store.js'
 import {shouldNotify} from './web/operator-push/trigger-policy.js'
+import {createWebApprovalOnRegistered} from './web/operator/web-approval.js'
 import {createWebQuestionOnRegistered} from './web/operator/web-question.js'
 import {createRunObservationManager} from './web/sse/manager.js'
 import {createWorkspaceClient} from './workspace-api/client.js'
@@ -845,6 +846,13 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
           ],
           logger,
         ),
+      // A Discord-launched run's approvals are announced on its SSE stream too (open and settle frames), so the
+      // dashboard sees what a web run's would. Web-launched runs announce through their own transport instead.
+      createApprovalOnRegistered: ({approvalRegistry: registry, runId, repo}) =>
+        createWebApprovalOnRegistered({
+          observeApproval: (observedRunId, data) => runObservationManager.observeApproval(observedRunId, data),
+          logger,
+        })({approvalRegistry: registry, runId, repo}),
       approvalMode: config.approvalMode,
       statusMode: config.statusMode,
       // Workspace readiness gate — uses the same :9100 base as the clone endpoint.

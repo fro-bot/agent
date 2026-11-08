@@ -74,6 +74,17 @@ export interface DiscordApprovalTransportDeps {
    * the interaction came from the correct thread/channel.
    */
   readonly threadId: string
+  /**
+   * The run that raised the request. Stored on the registry entry (alongside the thread scope) so the operator
+   * routes reach a Discord-run approval by run id, which is all a dashboard operator holds.
+   */
+  readonly runId: string
+  /**
+   * Called once per request, right after it is registered and before anything is posted to Discord: announces the
+   * request to the run's operator-stream subscribers (open frame + settle renderer). Optional; fail-soft: a throw
+   * is logged and never stops the Discord card.
+   */
+  readonly onRegistered?: ((request: PermissionRequest) => void) | undefined
   /** Workspace directory for reply routing (passed to registry.register). */
   readonly directory: string
   /** Per-approval deadline in ms (passed to registry.register). */
@@ -146,6 +157,9 @@ export function isTerminalDeliveryFailure(error: unknown): boolean {
  * 4. Posts the approval embed + buttons (fire-and-forget).
  * 5. Attaches the settled-embed render function on success.
  *
+ * Between 2 and 3 it announces the request to the run's operator stream (`onRegistered`), so a dashboard sees a
+ * Discord run's approvals like a web run's.
+ *
  * Must not throw — the coordinator wraps it defensively.
  *
  * @param deps - Discord transport dependencies.
@@ -157,6 +171,8 @@ export function createDiscordApprovalOnPending(
     approvalRegistry,
     replySink,
     threadId,
+    runId,
+    onRegistered,
     directory,
     approvalDeadlineMs,
     onDeadlineSettled,
@@ -234,6 +250,7 @@ export function createDiscordApprovalOnPending(
       requestID,
       sessionID,
       approvalScopeId: threadId,
+      runId,
       directory,
       request: req,
       effects: {postReply: postReplyForRequest},
@@ -241,6 +258,19 @@ export function createDiscordApprovalOnPending(
       onDeadlineSettled,
       rejectOnly,
     })
+
+    // Announce to the run's operator stream. After register (a decision can settle even if the frame is dropped)
+    // and before the card is posted: the settle renderer it attaches does not depend on the card ever posting.
+    if (onRegistered !== undefined) {
+      try {
+        onRegistered(req)
+      } catch (error: unknown) {
+        logger.warn(
+          {requestID, err: toErrorMessage(error)},
+          'discord-transport: operator-stream announce threw (fail-soft; registered, the Discord card still posts)',
+        )
+      }
+    }
 
     // Post a visible waiting-for-approval status BEFORE the embed so the
     // user sees the run is blocked even if the embed send is slow.
