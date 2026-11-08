@@ -51,7 +51,18 @@ export type FlushResult =
   | {readonly kind: 'attachment'; readonly charCount: number}
   | {readonly kind: 'empty'}
   | {readonly kind: 'skipped-visible'}
+  | {readonly kind: 'skipped-empty'}
   | {readonly kind: 'error'; readonly message: string}
+
+/** Per-call flush options. Omitting them keeps the default behavior. */
+export interface FlushOptions {
+  /**
+   * Do not post the `_(no output)_` placeholder for an empty/whitespace buffer; return
+   * `{kind:'skipped-empty'}` instead. For callers that already told the thread the run ended (e.g. a
+   * cancel notice). Non-empty text still flushes normally.
+   */
+  readonly suppressEmptyNotice?: boolean
+}
 
 /** Dependencies injected into the sink factory. */
 export interface StreamSinkDeps {
@@ -82,9 +93,10 @@ export interface DiscordStreamSink {
    * - Long text (>2000 chars): summary line + `.md` attachment.
    * - Empty/whitespace AND no visible output already sent: "no output" message.
    * - Empty/whitespace AND visible output already sent (e.g. approval status): `{kind:'skipped-visible'}`, no send.
+   * - Empty/whitespace with `suppressEmptyNotice`: `{kind:'skipped-empty'}`, no send.
    * - On `thread.send` rejection: returns `{kind:'error'}` (does not throw).
    */
-  readonly flush: () => Promise<FlushResult>
+  readonly flush: (options?: FlushOptions) => Promise<FlushResult>
   /** Read the current buffered text without flushing. */
   readonly buffered: () => string
   /**
@@ -160,7 +172,7 @@ export function createDiscordStreamSink(thread: SinkThread, deps: StreamSinkDeps
 
   const hasVisibleOutput = (): boolean => visibleOutputSent === true || pendingVisibleOutput > 0
 
-  const flush = async (): Promise<FlushResult> => {
+  const flush = async (options?: FlushOptions): Promise<FlushResult> => {
     const text = buffer
     const sendTarget: SendCapable = thread
 
@@ -172,6 +184,9 @@ export function createDiscordStreamSink(thread: SinkThread, deps: StreamSinkDeps
       // pair in the timeout race where flush() runs before classification reads hasVisibleOutput().
       if (visibleOutputSent === true || pendingVisibleOutput > 0) {
         return {kind: 'skipped-visible'}
+      }
+      if (options?.suppressEmptyNotice === true) {
+        return {kind: 'skipped-empty'}
       }
       // Genuinely empty run → post the "no output" fallback
       const emptyResult = await sendMessage(sendTarget, {content: EMPTY_OUTPUT_MESSAGE}, ioLogger)

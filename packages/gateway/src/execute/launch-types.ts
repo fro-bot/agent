@@ -203,7 +203,7 @@ export interface StatusSink {
  * const replySink: ReplySink = {
  *   // Streaming output — delegate to DiscordStreamSink
  *   append: text => streamSink.append(text),
- *   flush: () => streamSink.flush(),
+ *   flush: options => streamSink.flush(options),
  *   buffered: () => streamSink.buffered(),
  *   hasVisibleOutput: () => streamSink.hasVisibleOutput(),
  *   markVisibleOutputSent: () => streamSink.markVisibleOutputSent(),
@@ -237,10 +237,14 @@ export interface ReplySink {
    * - Empty/whitespace with no prior visible output: "no output" placeholder.
    * - Empty/whitespace with prior visible output: no-op (`skipped-visible`).
    *
-   * Maps to `sink.flush()` in the Discord adapter.
+   * `suppressEmptyNotice`: skip the "no output" placeholder for an empty buffer. Used on the
+   * cancel path, where the cancel notice already told the thread the run ended. Only affects
+   * transports that post such a placeholder; a web sink still pushes its terminal output frame.
+   *
+   * Maps to `sink.flush(options)` in the Discord adapter.
    * Called after `runOpenCodeCore` completes (`:610` in `run.ts`).
    */
-  readonly flush: () => Promise<unknown>
+  readonly flush: (options?: {readonly suppressEmptyNotice?: boolean}) => Promise<unknown>
 
   /**
    * Read the current buffered text without flushing.

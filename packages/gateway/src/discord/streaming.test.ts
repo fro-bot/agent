@@ -194,6 +194,64 @@ describe('createDiscordStreamSink', () => {
     })
   })
 
+  describe('flush({suppressEmptyNotice: true})', () => {
+    it('sends nothing and returns skipped-empty when the buffer is empty', async () => {
+      // #given
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+
+      // #when
+      const result = await sink.flush({suppressEmptyNotice: true})
+
+      // #then
+      expect(result.kind).toBe('skipped-empty')
+      expect(thread._send).not.toHaveBeenCalled()
+    })
+
+    it('sends nothing when the buffer is only whitespace', async () => {
+      // #given
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      sink.append('   \n\t  ')
+
+      // #when
+      const result = await sink.flush({suppressEmptyNotice: true})
+
+      // #then
+      expect(result.kind).toBe('skipped-empty')
+      expect(thread._send).not.toHaveBeenCalled()
+    })
+
+    it('still flushes non-empty text', async () => {
+      // #given
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      sink.append(SHORT_TEXT)
+
+      // #when
+      const result = await sink.flush({suppressEmptyNotice: true})
+
+      // #then
+      expect(result.kind).toBe('sent')
+      expect(firstCallArg<{content: string}>(thread._send).content).toBe(SHORT_TEXT)
+    })
+
+    it('does not mark visible output, so a later default flush still posts the placeholder', async () => {
+      // #given
+      const thread = makeThread()
+      const sink = createDiscordStreamSink(thread)
+      await sink.flush({suppressEmptyNotice: true})
+
+      // #when
+      const result = await sink.flush()
+
+      // #then
+      expect(sink.hasVisibleOutput()).toBe(false)
+      expect(result.kind).toBe('empty')
+      expect(thread._send).toHaveBeenCalledOnce()
+    })
+  })
+
   describe('error path — thread.send rejects', () => {
     it('returns {kind:"error"} on short-text send failure without throwing', async () => {
       // #given

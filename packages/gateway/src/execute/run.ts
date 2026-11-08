@@ -2025,7 +2025,9 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         // cancel suppresses the user-facing failure reply entirely (see below) — there
         // is no "final reply" on this path to attach a starting-state line to, and this
         // flush is exactly the agent's pre-cancel partial output, unmodified.
-        await replySink.flush().catch((flushError: unknown) => {
+        // `suppressEmptyNotice`: the cancellation notice already told the thread the run ended, so a
+        // run cancelled with nothing streamed must not follow it with a `_(no output)_` placeholder.
+        await replySink.flush({suppressEmptyNotice: true}).catch((flushError: unknown) => {
           logger.warn({repo, runId, err: String(flushError)}, 'run: sink.flush failed in cancel path')
         })
 
@@ -2793,8 +2795,8 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
     append: (text: string) => {
       realReplySink?.append(text)
     },
-    flush: async () => {
-      if (realReplySink !== null) return realReplySink.flush()
+    flush: async options => {
+      if (realReplySink !== null) return realReplySink.flush(options)
       return undefined
     },
     buffered: () => realReplySink?.buffered() ?? '',
@@ -2850,7 +2852,7 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
         return sendMessage(rawThread, options, logger)
       },
       append: (text: string) => streamSink.append(text),
-      flush: async () => streamSink.flush(),
+      flush: async options => streamSink.flush(options),
       buffered: () => streamSink.buffered(),
       hasVisibleOutput: () => streamSink.hasVisibleOutput(),
       markVisibleOutputSent: () => streamSink.markVisibleOutputSent(),
