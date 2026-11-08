@@ -31,6 +31,7 @@ describe('PULL_REQUEST_QUERY', () => {
     expect(PULL_REQUEST_QUERY).toContain('query')
     expect(PULL_REQUEST_QUERY).toContain('repository')
     expect(PULL_REQUEST_QUERY).toContain('pullRequest')
+    expect(PULL_REQUEST_QUERY).toContain('headRefOid')
     expect(PULL_REQUEST_QUERY).toContain('commits')
     expect(PULL_REQUEST_QUERY).toContain('files')
     expect(PULL_REQUEST_QUERY).toContain('reviews')

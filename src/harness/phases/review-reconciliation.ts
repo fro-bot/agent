@@ -42,6 +42,11 @@ export interface ReviewReconciliationParams {
    * under file-convention).
    */
   readonly isFileConventionDelivery: boolean
+  /**
+   * The head SHA the agent reviewed (`resolveReviewedHeadSha`), captured before execution.
+   * `null` fails closed: the APPROVE is never pinned to a delivery-time fetch.
+   */
+  readonly reviewedHeadSha: string | null
   /** True when the agent session completed successfully */
   readonly agentSucceeded: boolean
   /** Run start time in milliseconds (Date.now() at run start) */
@@ -128,6 +133,7 @@ export async function runReviewReconciliation(
     runStartMs,
     isFileConventionDelivery,
     knownExecutionVeto,
+    reviewedHeadSha,
     receipt,
   } = params
 
@@ -162,6 +168,11 @@ export async function runReviewReconciliation(
   if (knownExecutionVeto === true) {
     logger.info('Review reconciliation: skipping, known execution veto', {prNumber})
     return {reconciled: false, reason: 'known-execution-veto'}
+  }
+
+  if (reviewedHeadSha == null) {
+    logger.warning('Review reconciliation: no reviewed head SHA available, refusing to approve', {prNumber})
+    return {reconciled: false, reason: 'no-reviewed-head'}
   }
 
   // -------------------------------------------------------------------------
@@ -255,7 +266,8 @@ export async function runReviewReconciliation(
     }
 
     // Step 5+6: Re-fetch PR head immediately before submitting (closes the
-    // TOCTOU window) and submit formal APPROVE, pinned to the reviewed SHA.
+    // TOCTOU window) and submit formal APPROVE, pinned to the head the agent reviewed
+    // (aborts if the PR is no longer there).
     const submitOutcome = await submitReviewWithHeadGuard(
       {
         octokit,
@@ -264,7 +276,7 @@ export async function runReviewReconciliation(
         prNumber,
         event: 'APPROVE',
         body: 'Approving to match the review verdict above.',
-        currentHeadSha,
+        reviewedHeadSha,
         ...(receipt == null
           ? {}
           : {

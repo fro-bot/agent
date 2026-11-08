@@ -17,6 +17,7 @@ import type {InvocationOutcome, InvocationVerificationFacts} from './outcome.js'
 import * as core from '@actions/core'
 import {applyTerminalReaction} from '../features/agent/index.js'
 import {createMetricsCollector, writeInvocationOutcomeSummary} from '../features/observability/index.js'
+import {resolveReviewedHeadSha} from '../features/reviews/reviewed-head.js'
 import {resolveSessionGeneration} from '../services/cache/cache-key.js'
 import {createReviewDeliveryReceiptOperations} from '../services/github/review-delivery-receipt.js'
 import {getGitHubRunAttempt, getGitHubWorkspace, getInvocationIdentity} from '../shared/env.js'
@@ -395,6 +396,7 @@ export async function run(): Promise<number> {
         isPullRequestReviewTrigger,
         responseModeIsGithub: bootstrap.inputs.responseMode === 'github',
         agentSucceeded: execution.success,
+        reviewedHeadSha: resolveReviewedHeadSha(routing.agentContext, reconciliationTriggerContext),
         runStartMs: startTime,
         isFileConventionDelivery: bootstrap.delivery === 'file-convention',
         knownExecutionVeto,

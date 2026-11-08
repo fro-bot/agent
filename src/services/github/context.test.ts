@@ -149,6 +149,7 @@ describe('normalizeEvent for pull_request reviewer fields', () => {
       action: 'review_requested',
       requested_reviewer: {login: 'fro-bot[bot]', type: 'Bot'},
       pull_request: {
+        head: {sha: 'event-head-sha'},
         number: 123,
         title: 'feat: add reviewer trigger',
         body: 'Please review this PR',
@@ -168,6 +169,7 @@ describe('normalizeEvent for pull_request reviewer fields', () => {
     if (event.type !== 'pull_request') {
       throw new Error('Expected pull_request event')
     }
+    expect(event.pullRequest.headSha).toBe('event-head-sha')
     expect(event.requestedReviewer).toEqual({login: 'fro-bot[bot]', type: 'Bot'})
     expect(event.pullRequest.requestedReviewers).toEqual([{login: 'fro-bot[bot]', type: 'Bot'}])
   })
@@ -178,6 +180,7 @@ describe('normalizeEvent for pull_request reviewer fields', () => {
       action: 'review_requested',
       requested_team: {name: 'Platform Team', slug: 'platform-team'},
       pull_request: {
+        head: {sha: 'event-head-sha'},
         number: 124,
         title: 'feat: team review request',
         body: 'Team review requested',
@@ -212,6 +215,7 @@ describe('normalizeEvent for pull_request labels', () => {
     const payload = {
       action: 'synchronize',
       pull_request: {
+        head: {sha: 'event-head-sha'},
         number: 200,
         title: 'feat: add labels support',
         body: 'body',
@@ -243,6 +247,7 @@ describe('normalizeEvent for pull_request labels', () => {
     const payload = {
       action: 'synchronize',
       pull_request: {
+        head: {sha: 'event-head-sha'},
         number: 201,
         title: 'feat: no labels field',
         body: 'body',
@@ -270,6 +275,7 @@ describe('normalizeEvent for pull_request labels', () => {
     const payload = {
       action: 'synchronize',
       pull_request: {
+        head: {sha: 'event-head-sha'},
         number: 202,
         title: 'feat: empty labels',
         body: 'body',
@@ -298,6 +304,7 @@ describe('normalizeEvent for pull_request labels', () => {
     const payload = {
       action: 'synchronize',
       pull_request: {
+        head: {sha: 'event-head-sha'},
         number: 203,
         title: 'feat: label with empty name',
         body: 'body',

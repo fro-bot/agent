@@ -135,6 +135,8 @@ export interface PullRequestContext {
   readonly createdAt: string
   readonly baseBranch: string
   readonly headBranch: string
+  /** Head commit SHA of the PR at hydration time -- the revision this run was handed. */
+  readonly headSha: string
   readonly isFork: boolean
   readonly labels: readonly ContextLabel[]
   readonly assignees: readonly ContextAssignee[]
@@ -173,6 +175,8 @@ export interface TriggerTarget {
   readonly line?: number
   readonly diffHunk?: string
   readonly commitId?: string
+  /** Head commit SHA from the `pull_request` event payload (pull_request only). */
+  readonly headSha?: string
 }
 
 export interface ParsedCommand {

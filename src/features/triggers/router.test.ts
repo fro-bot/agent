@@ -947,6 +947,7 @@ describe('routeEvent', () => {
       const payload = {
         action: 'opened',
         pull_request: {
+          head: {sha: 'event-head-sha'},
           number: 99,
           title: 'feat: add new feature',
           body: 'Description of the feature',
@@ -974,6 +975,7 @@ describe('routeEvent', () => {
       expect(result.context.target?.kind).toBe('pr')
       expect(result.context.target?.number).toBe(99)
       expect(result.context.target?.isDraft).toBe(false)
+      expect(result.context.target?.headSha).toBe('event-head-sha')
     })
 
     it('maps normalized labels onto target.labels', () => {
@@ -981,6 +983,7 @@ describe('routeEvent', () => {
       const payload = {
         action: 'synchronize',
         pull_request: {
+          head: {sha: 'event-head-sha'},
           number: 99,
           title: 'feat: add new feature',
           body: 'Description of the feature',
@@ -1016,6 +1019,7 @@ describe('routeEvent', () => {
       const payload = {
         action: 'synchronize',
         pull_request: {
+          head: {sha: 'event-head-sha'},
           number: 99,
           title: 'feat: add new feature',
           body: 'Description',
@@ -1047,6 +1051,7 @@ describe('routeEvent', () => {
       const payload = {
         action: 'reopened',
         pull_request: {
+          head: {sha: 'event-head-sha'},
           number: 99,
           title: 'feat: add new feature',
           body: 'Description',
@@ -1078,6 +1083,7 @@ describe('routeEvent', () => {
       const payload = {
         action: 'opened',
         pull_request: {
+          head: {sha: 'event-head-sha'},
           number: 99,
           title: 'feat: WIP feature',
           body: 'Description',
@@ -1109,6 +1115,7 @@ describe('routeEvent', () => {
       const payload = {
         action: 'opened',
         pull_request: {
+          head: {sha: 'event-head-sha'},
           number: 99,
           title: 'feat: WIP feature',
           body: 'Description',
@@ -1140,6 +1147,7 @@ describe('routeEvent', () => {
       const payload = {
         action: 'closed',
         pull_request: {
+          head: {sha: 'event-head-sha'},
           number: 99,
           title: 'feat: add new feature',
           body: 'Description',
@@ -1170,6 +1178,7 @@ describe('routeEvent', () => {
       const payload = {
         action: 'opened',
         pull_request: {
+          head: {sha: 'event-head-sha'},
           number: 99,
           title: 'chore(deps): update dependencies',
           body: 'Automated dependency update',
@@ -1201,6 +1210,7 @@ describe('routeEvent', () => {
       const payload = {
         action: 'opened',
         pull_request: {
+          head: {sha: 'event-head-sha'},
           number: 99,
           title: 'chore(deps): update dependencies',
           body: 'Automated dependency update',
@@ -1232,6 +1242,7 @@ describe('routeEvent', () => {
       const payload = {
         action: 'opened',
         pull_request: {
+          head: {sha: 'event-head-sha'},
           number: 99,
           title: 'feat: add new feature',
           body: 'Description',
@@ -1266,6 +1277,7 @@ describe('routeEvent', () => {
       const payload = {
         action: 'review_requested',
         pull_request: {
+          head: {sha: 'event-head-sha'},
           number: 99,
           title: 'feat: bot-authored PR',
           body: 'Automated changes',
@@ -1297,6 +1309,7 @@ describe('routeEvent', () => {
       const payload = {
         action: 'ready_for_review',
         pull_request: {
+          head: {sha: 'event-head-sha'},
           number: 22,
           title: 'fix: SPA routing on GitHub Pages',
           body: 'Automated fix',
@@ -1327,6 +1340,7 @@ describe('routeEvent', () => {
       const payload = {
         action: 'review_requested',
         pull_request: {
+          head: {sha: 'event-head-sha'},
           number: 99,
           title: 'feat: bot-authored PR',
           body: 'Automated changes',
@@ -1357,6 +1371,7 @@ describe('routeEvent', () => {
       const payload = {
         action: 'opened',
         pull_request: {
+          head: {sha: 'event-head-sha'},
           number: 99,
           title: 'feat: new feature',
           body: 'Description',
@@ -1389,6 +1404,7 @@ describe('routeEvent', () => {
       const payload = {
         action: 'created',
         pull_request: {
+          head: {sha: 'event-head-sha'},
           number: 99,
           title: 'feat: add new feature',
           locked: false,
@@ -1431,6 +1447,7 @@ describe('routeEvent', () => {
       const payload = {
         action: 'edited',
         pull_request: {
+          head: {sha: 'event-head-sha'},
           number: 99,
           title: 'feat: add new feature',
           locked: false,
@@ -1467,6 +1484,7 @@ describe('routeEvent', () => {
       const payload = {
         action: 'created',
         pull_request: {
+          head: {sha: 'event-head-sha'},
           number: 99,
           title: 'feat: add new feature',
           locked: false,
