@@ -66,7 +66,7 @@ function setup(embed: EmbedOutcome = 'posted', approvalDeadlineMs?: number) {
   const registry = createApprovalRegistry({logger})
   const frames: {runId: string; data: ApprovalFrameData}[] = []
   const edit = vi.fn().mockResolvedValue({})
-  const postReply = vi.fn(async () => ({ok: true}))
+  const postReply = vi.fn(async (_requestID: string, _directory: string, _decision: string) => ({ok: true}))
 
   const cards: {edit: ReturnType<typeof vi.fn>; settle: (result: unknown) => void}[] = []
   const send = vi.fn(async (_target: string, options: {embeds?: readonly unknown[]}) => {
@@ -144,6 +144,7 @@ function setup(embed: EmbedOutcome = 'posted', approvalDeadlineMs?: number) {
     cardDescription,
     settledFrames,
     openFrames,
+    send,
     cards,
     postCard,
     failCard,
@@ -573,5 +574,139 @@ describe('Discord-launched run: a re-ask while the first card is still posting',
     expect(registry.describePendingForRun(RUN_ID)).toHaveLength(1)
     expect(postReply).not.toHaveBeenCalled()
     expect(settledFrames('per_1')).toHaveLength(framesBefore)
+  })
+})
+
+describe('Discord-launched run: a card that fails while the request is not open', () => {
+  const NOTICE = 'automatically denied'
+  const noticeCount = (send: ReturnType<typeof setup>['send']) =>
+    send.mock.calls.filter(call => (call[1] as {content?: string}).content?.includes(NOTICE) === true).length
+
+  const dashboardApprove = async (registry: ReturnType<typeof createApprovalRegistry>) =>
+    registry.handleDecision({
+      requestID: 'per_1',
+      approvalScopeId: RUN_ID,
+      runId: RUN_ID,
+      decision: 'once',
+      actor: WEB_OPERATOR,
+    })
+
+  it('a terminal card failure during a claimed dashboard decision leaves the decision to settle', async () => {
+    // #given the card send is held, the dashboard approves, and the upstream reply is still pending
+    const {onPending, registry, postReply, failCard, send, settledFrames} = setup('deferred')
+    let land: (value: {ok: boolean}) => void = () => undefined
+    postReply.mockImplementation(
+      async () =>
+        new Promise<{ok: boolean}>(resolve => {
+          land = resolve
+        }),
+    )
+    onPending(makeRequest())
+    await flush()
+    const decision = dashboardApprove(registry)
+    await flush()
+
+    // #when the card then fails terminally
+    failCard(0, true)
+    await flush()
+
+    // #then the claimed entry was not disposed, nothing was denied, and no notice was posted
+    expect(registry.has('per_1')).toBe(true)
+    expect(postReply).toHaveBeenCalledExactlyOnceWith('per_1', '/workspace/acme/widget', 'once')
+    expect(noticeCount(send)).toBe(0)
+    expect(settledFrames('per_1')).toHaveLength(0)
+
+    // #when the approval lands and OpenCode echoes it
+    land({ok: true})
+    await expect(decision).resolves.toBe('ok')
+    registry.confirmReply({requestID: 'per_1', sessionID: SESSION_ID, reply: 'once'})
+    await flush()
+
+    // #then the decision stands: one upstream reply (the approval), one settle frame, still no denial notice
+    expect(postReply).toHaveBeenCalledTimes(1)
+    expect(settledFrames('per_1')).toHaveLength(1)
+    expect(noticeCount(send)).toBe(0)
+    expect(registry.has('per_1')).toBe(false)
+  })
+
+  it('a retryable card failure during a claimed decision changes nothing either', async () => {
+    // #given
+    const {onPending, registry, postReply, failCard, send, settledFrames} = setup('deferred')
+    let land: (value: {ok: boolean}) => void = () => undefined
+    postReply.mockImplementation(
+      async () =>
+        new Promise<{ok: boolean}>(resolve => {
+          land = resolve
+        }),
+    )
+    onPending(makeRequest())
+    await flush()
+    const decision = dashboardApprove(registry)
+    await flush()
+
+    // #when
+    failCard(0, false)
+    await flush()
+    land({ok: true})
+    await decision
+    registry.confirmReply({requestID: 'per_1', sessionID: SESSION_ID, reply: 'once'})
+    await flush()
+
+    // #then
+    expect(noticeCount(send)).toBe(0)
+    expect(settledFrames('per_1')).toHaveLength(1)
+    expect(postReply).toHaveBeenCalledTimes(1)
+  })
+
+  it('when the claimed decision’s upstream reply then fails, the request reopens as the failed-reply path does', async () => {
+    // #given a held card, a claimed dashboard approval, and a terminal card failure
+    const {onPending, registry, postReply, failCard, send, settledFrames} = setup('deferred')
+    let land: (value: {ok: boolean}) => void = () => undefined
+    postReply.mockImplementationOnce(
+      async () =>
+        new Promise<{ok: boolean}>(resolve => {
+          land = resolve
+        }),
+    )
+    onPending(makeRequest())
+    await flush()
+    const decision = dashboardApprove(registry)
+    await flush()
+    failCard(0, true)
+    await flush()
+
+    // #when the reply fails
+    land({ok: false})
+
+    // #then the existing failed-reply path applies: reopened for another decision, no duplicate settle, no notice
+    await expect(decision).resolves.toBe('reply-failed')
+    expect(registry.describePendingForRun(RUN_ID)).toHaveLength(1)
+    expect(settledFrames('per_1')).toHaveLength(0)
+    expect(noticeCount(send)).toBe(0)
+    expect(postReply).toHaveBeenCalledTimes(1)
+
+    // #and the run ending later settles it exactly once, with the one reject the teardown owns
+    await registry.disposeRun(SESSION_ID, 'run ended')
+    expect(settledFrames('per_1')).toHaveLength(1)
+    expect(postReply.mock.calls.map(call => call[2])).toEqual(['once', 'reject'])
+  })
+
+  it('an unclaimed request whose card fails terminally is still auto-rejected, once, with the notice', async () => {
+    // #given an open request and a held card
+    const {onPending, registry, postReply, failCard, send, settledFrames} = setup('deferred')
+    onPending(makeRequest())
+    await flush()
+
+    // #when the card fails terminally
+    failCard(0, true)
+    await vi.waitFor(() => {
+      expect(registry.has('per_1')).toBe(false)
+    })
+    await flush()
+
+    // #then rejected upstream once, one notice, one settle frame
+    expect(postReply).toHaveBeenCalledExactlyOnceWith('per_1', '/workspace/acme/widget', 'reject')
+    expect(noticeCount(send)).toBe(1)
+    expect(settledFrames('per_1')).toHaveLength(1)
   })
 })

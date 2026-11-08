@@ -220,6 +220,7 @@ export function makeApprovalRegistry(): ApprovalRegistry {
     autoApprove: vi.fn().mockResolvedValue('not-found'),
     attachMessage: vi.fn(),
     markMessagePostFailed: vi.fn(),
+    rejectUndeliverable: vi.fn().mockResolvedValue('rejected'),
     confirmReply: vi.fn(),
     disposeRun: vi.fn(),
     disposeAll: vi.fn().mockResolvedValue(undefined),

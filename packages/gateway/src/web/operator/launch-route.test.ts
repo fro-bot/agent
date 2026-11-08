@@ -100,6 +100,7 @@ function makeApprovalRegistry(): ApprovalRegistry {
     register: vi.fn(),
     attachMessage: vi.fn(),
     markMessagePostFailed: vi.fn(),
+    rejectUndeliverable: vi.fn().mockResolvedValue('rejected'),
     has: vi.fn(() => false),
     pending: vi.fn(() => []),
     hasPendingForScope: vi.fn(() => false),

@@ -102,9 +102,10 @@ function makeReplySink(
 
 function makeApprovalRegistry(overrides: Partial<ApprovalRegistry> = {}): ApprovalRegistry {
   return {
-    register: vi.fn(),
+    register: vi.fn(() => Symbol('registration')),
     attachMessage: vi.fn(),
     markMessagePostFailed: vi.fn(),
+    rejectUndeliverable: vi.fn().mockResolvedValue('rejected'),
     has: vi.fn().mockReturnValue(true),
     pending: vi.fn().mockReturnValue([]),
     hasPendingForScope: vi.fn().mockReturnValue(true),
@@ -174,7 +175,7 @@ describe('createDiscordApprovalOnPending — happy path', () => {
     })
 
     // #then the request was never auto-rejected or marked post-failed
-    expect(approvalRegistry.applySettlement).not.toHaveBeenCalled()
+    expect(approvalRegistry.rejectUndeliverable).not.toHaveBeenCalled()
     expect(approvalRegistry.markMessagePostFailed).not.toHaveBeenCalled()
   })
 })
@@ -241,6 +242,7 @@ describe('createDiscordApprovalOnPending — run identity', () => {
     const approvalRegistry = makeApprovalRegistry({
       register: vi.fn(() => {
         order.push('register')
+        return Symbol('registration')
       }),
     })
     const replySink = makeReplySink()
@@ -392,11 +394,9 @@ describe('createDiscordApprovalOnPending — terminal delivery failure', () => {
 
     // #then the permission is auto-rejected on the server
     await vi.waitFor(() => {
-      expect(approvalRegistry.applySettlement).toHaveBeenCalledOnce()
+      expect(approvalRegistry.rejectUndeliverable).toHaveBeenCalledOnce()
     })
-    expect(approvalRegistry.applySettlement).toHaveBeenCalledWith(
-      expect.objectContaining({requestID: request.requestID, decision: 'reject'}),
-    )
+    expect(approvalRegistry.rejectUndeliverable).toHaveBeenCalledWith(request.requestID, expect.any(Symbol))
 
     // #then the entry is also marked post-failed (existing retryable-friendly bookkeeping)
     expect(approvalRegistry.markMessagePostFailed).toHaveBeenCalledWith(request.requestID)
@@ -431,7 +431,7 @@ describe('createDiscordApprovalOnPending — retryable delivery failure', () => 
 
     // #then the permission is proven NOT rejected — the entry stays registered so a
     // human decision (or a later successful retry path) can still settle it.
-    expect(approvalRegistry.applySettlement).not.toHaveBeenCalled()
+    expect(approvalRegistry.rejectUndeliverable).not.toHaveBeenCalled()
   })
 })
 
@@ -440,7 +440,7 @@ describe('createDiscordApprovalOnPending — retryable delivery failure', () => 
 // ---------------------------------------------------------------------------
 
 describe('createDiscordApprovalOnPending — settles exactly once', () => {
-  it('calls applySettlement exactly once when the terminal failure surfaces via the embed .catch() path', async () => {
+  it('asks the registry to reject exactly once when the terminal failure surfaces via the embed .catch() path', async () => {
     // #given a transport whose embed send promise rejects (network-level) with a terminal error
     const approvalRegistry = makeApprovalRegistry()
     const replySink = makeReplySink({embedRejection: makeUnknownChannelError()})
@@ -451,10 +451,10 @@ describe('createDiscordApprovalOnPending — settles exactly once', () => {
     // #when a permission is requested and the embed send rejects terminally
     onPending(request)
 
-    // #then applySettlement is called exactly once — not double-settled between
+    // #then the registry is asked exactly once — not double-settled between
     // markMessagePostFailed's bookkeeping and the auto-reject.
     await vi.waitFor(() => {
-      expect(approvalRegistry.applySettlement).toHaveBeenCalledOnce()
+      expect(approvalRegistry.rejectUndeliverable).toHaveBeenCalledOnce()
     })
     expect(approvalRegistry.markMessagePostFailed).toHaveBeenCalledOnce()
   })
@@ -477,7 +477,7 @@ describe('createDiscordApprovalOnPending — operator-visible auto-reject', () =
     // #when a permission is requested and the embed post fails terminally
     onPending(request)
     await vi.waitFor(() => {
-      expect(approvalRegistry.applySettlement).toHaveBeenCalledOnce()
+      expect(approvalRegistry.rejectUndeliverable).toHaveBeenCalledOnce()
     })
 
     // #then a distinct error-level log line names the undeliverable-notification cause —
@@ -496,5 +496,33 @@ describe('createDiscordApprovalOnPending — operator-visible auto-reject', () =
       )
       expect(notifyCall).toBeDefined()
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Scenario 6: the registry decides whether a delivery failure may reject
+// ---------------------------------------------------------------------------
+
+describe('createDiscordApprovalOnPending — delivery failure of a request that is no longer open', () => {
+  it('posts no denial notice and logs no auto-reject when the registry skips it (claimed, settled, or replaced)', async () => {
+    // #given a terminal failure for a request the registry will not reject
+    const approvalRegistry = makeApprovalRegistry({rejectUndeliverable: vi.fn().mockResolvedValue('skipped')})
+    const logger = makeLogger()
+    const replySink = makeReplySink({embedResult: {success: false, error: makeUnknownChannelError()}})
+    const request = makeRequest()
+
+    // #when
+    createDiscordApprovalOnPending(makeDeps({approvalRegistry, replySink, logger}))(request)
+    await vi.waitFor(() => {
+      expect(approvalRegistry.rejectUndeliverable).toHaveBeenCalledOnce()
+    })
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // #then nothing is announced as denied, and the registry was asked about this registration only
+    expect(replySink.sentCalls.some(call => call.options.content?.includes('automatically denied') === true)).toBe(
+      false,
+    )
+    expect(logger.error).not.toHaveBeenCalled()
+    expect(approvalRegistry.rejectUndeliverable).toHaveBeenCalledWith(request.requestID, expect.any(Symbol))
   })
 })

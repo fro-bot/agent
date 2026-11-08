@@ -156,6 +156,7 @@ function makeRunMentionDeps(): MentionDeps['run'] {
       autoApprove: vi.fn().mockResolvedValue('not-found'),
       attachMessage: vi.fn(),
       markMessagePostFailed: vi.fn(),
+      rejectUndeliverable: vi.fn().mockResolvedValue('rejected'),
       disposeRun: vi.fn(),
       confirmReply: vi.fn(),
       disposeAll: vi.fn(),

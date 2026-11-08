@@ -37,7 +37,7 @@ import type {SettledDecider} from '../discord/approvals.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {PostReplyFactory, ReplySink} from '../execute/launch-types.js'
 import type {PermissionReply, PermissionRequest, SettlementReason} from './coordinator.js'
-import type {ApprovalActor, ApprovalRegistry} from './registry.js'
+import type {ApprovalActor, ApprovalRegistry, RegistrationId} from './registry.js'
 
 import {toErrorMessage} from '@fro-bot/runtime'
 import {DiscordAPIError, RESTJSONErrorCodes} from 'discord.js'
@@ -121,6 +121,10 @@ interface CardOutcome {
  * edited or the post fails.
  */
 interface CardState {
+  /** The registration this card belongs to; the only one a delivery failure of this card may reject. */
+  readonly registration: RegistrationId
+  /** The post failed for good: there will be no card, so a later settlement has nothing to retain an edit for. */
+  dead: boolean
   message: Message | undefined
   /** The registration has settled by some path (decision, deadline, teardown, supersede). */
   settled: boolean
@@ -212,44 +216,49 @@ export function createDiscordApprovalOnPending(
    * entry stays `open` (via `markMessagePostFailed`) so a later settlement
    * can still POST the reply once a human decides.
    *
-   * For a terminal failure: rejects the permission on the server via
-   * `applySettlement` (which also settles/deletes the registry entry —
-   * exactly once, since the entry is deleted inside `applySettlement` and a
-   * second call for the same `requestID` is a no-op), and posts a best-effort
-   * operator-visible note to the run's thread — the run's output channel this
-   * transport already uses — worded distinctly from a human denial or a
-   * deadline timeout so a pattern of delivery failures is diagnosable rather
-   * than reading as arbitrary refusals.
+   * For a terminal failure: asks the registry to reject the permission, retire the entry, and report back
+   * (`rejectUndeliverable`). The registry does so only if the entry is still THIS registration and still `open`,
+   * checked and claimed in one synchronous step. If an operator decision is already in flight (`claimed`) the entry
+   * is left alone, because that approval may still succeed and run the tool: it settles through its own path, and
+   * nothing is announced as denied. The operator-visible note (worded distinctly from a human denial or a deadline
+   * timeout, so a pattern of delivery failures is diagnosable) is posted only when the registry did reject.
    */
-  function handleUndeliverable(requestID: string, error: unknown): void {
+  function handleUndeliverable(requestID: string, registration: RegistrationId, error: unknown): void {
     if (!isTerminalDeliveryFailure(error)) return
 
     const code = error instanceof DiscordAPIError ? error.code : undefined
-    logger.error(
-      {requestID, code, err: toErrorMessage(error)},
-      'discord-transport: approval notification undeliverable (terminal Discord error) — auto-rejecting on the server',
-    )
 
     // eslint-disable-next-line no-void
     void approvalRegistry
-      .applySettlement({requestID, decision: 'reject', reason: 'disposed'})
+      .rejectUndeliverable(requestID, registration)
+      .then(outcome => {
+        if (outcome === 'skipped') {
+          logger.warn(
+            {requestID, code},
+            'discord-transport: approval notification undeliverable, but the request is already decided or in flight — left to settle',
+          )
+          return
+        }
+        logger.error(
+          {requestID, code, err: toErrorMessage(error)},
+          'discord-transport: approval notification undeliverable (terminal Discord error) — auto-rejected on the server',
+        )
+        // Best-effort operator-visible note. If the thread itself is gone this send will also fail — that
+        // failure is swallowed here; the logger.error above is the durable signal that always reaches an operator.
+        // eslint-disable-next-line no-void
+        void replySink
+          .send('thread', {
+            content:
+              'A tool approval could not be delivered and was automatically denied (Discord notification failed to send).',
+          })
+          .catch(() => {})
+      })
       .catch((settleError: unknown) => {
         logger.error(
           {requestID, err: toErrorMessage(settleError)},
-          'discord-transport: applySettlement threw while auto-rejecting an undeliverable approval',
+          'discord-transport: rejectUndeliverable threw while auto-rejecting an undeliverable approval',
         )
       })
-
-    // Best-effort operator-visible note. If the thread itself is gone this
-    // send will also fail — that failure is swallowed here; the logger.error
-    // above is the durable signal that always reaches an operator.
-    // eslint-disable-next-line no-void
-    void replySink
-      .send('thread', {
-        content:
-          'A tool approval could not be delivered and was automatically denied (Discord notification failed to send).',
-      })
-      .catch(() => {})
   }
 
   /** Edit a posted card to the settled state, with the decider's origin. Best-effort: a failed edit is logged. */
@@ -284,12 +293,13 @@ export function createDiscordApprovalOnPending(
    */
   function cardPostFailed(card: CardState, requestID: string, error: unknown): void {
     card.pendingEdit = undefined
+    card.dead = true
     if (card.settled) {
       logger.debug({requestID}, 'discord-transport: card post failed after the request settled — nothing to do')
       return
     }
     approvalRegistry.markMessagePostFailed(requestID)
-    handleUndeliverable(requestID, error)
+    handleUndeliverable(requestID, card.registration, error)
   }
 
   return function onPending(req: PermissionRequest): void {
@@ -312,7 +322,7 @@ export function createDiscordApprovalOnPending(
     // approvalScopeId: use threadId (set by threadFactory after thread creation).
     // For non-Discord paths (in-memory sinks), threadId is '' — the registry
     // still works; the approvalScopeId is only used for button-handler lookup.
-    approvalRegistry.register({
+    const registration = approvalRegistry.register({
       requestID,
       sessionID,
       approvalScopeId: threadId,
@@ -345,7 +355,7 @@ export function createDiscordApprovalOnPending(
     // this registration only: a request that re-asks the same id gets its own card state, so neither card can be
     // edited for the other's outcome. It runs after the announce renderer, so the dashboard frame never waits on
     // a Discord edit.
-    const card: CardState = {message: undefined, settled: false, pendingEdit: undefined}
+    const card: CardState = {registration, dead: false, message: undefined, settled: false, pendingEdit: undefined}
     approvalRegistry.attachMessage(
       requestID,
       async (
@@ -357,8 +367,9 @@ export function createDiscordApprovalOnPending(
         card.settled = true
         const outcome: CardOutcome = {permReq, decision, actor, reason}
         if (card.message === undefined) {
-          // Card still posting: keep the outcome until it posts, or drop it if the post fails.
-          card.pendingEdit = outcome
+          // Card still posting: keep the outcome until it posts. A card that already failed for good will never
+          // post, so there is nothing to keep it for.
+          if (!card.dead) card.pendingEdit = outcome
           return
         }
         await settleCard(card.message, outcome)

@@ -1817,6 +1817,7 @@ describe('approval transport selection', () => {
       const approvalRegistry = makeApprovalRegistry()
       vi.mocked(approvalRegistry.register).mockImplementation(() => {
         order.push('register')
+        return Symbol('registration')
       })
       const announce = vi.fn(() => {
         order.push('announce')

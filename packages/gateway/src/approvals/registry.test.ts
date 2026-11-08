@@ -2277,3 +2277,90 @@ describe('settle renderers', () => {
     expect((sse as Mock).mock.calls[0]?.[3]).toBe('disposed')
   })
 })
+
+// ---------------------------------------------------------------------------
+// rejectUndeliverable: the delivery-failure auto-reject is atomic and specific to one registration
+// ---------------------------------------------------------------------------
+
+describe('rejectUndeliverable', () => {
+  it('rejects and retires an entry that is still open, for the registration that asked', async () => {
+    // #given an open entry
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    const effects = makeEffects()
+    const registration = registry.register(makeParams({effects}))
+
+    // #when its card is found undeliverable
+    const outcome = await registry.rejectUndeliverable('per_1', registration)
+
+    // #then it was rejected upstream once and is gone
+    expect(outcome).toBe('rejected')
+    expect(effects.postReply).toHaveBeenCalledExactlyOnceWith('per_1', '/workspace/proj', 'reject')
+    expect(registry.has('per_1')).toBe(false)
+  })
+
+  it('leaves a claimed entry alone: its decision is in flight and settles normally', async () => {
+    // #given an operator decision whose upstream reply is still pending
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    let land: (value: {ok: boolean}) => void = () => undefined
+    const postReply = vi.fn().mockImplementationOnce(
+      async () =>
+        new Promise<{ok: boolean}>(resolve => {
+          land = resolve
+        }),
+    )
+    const registration = registry.register(makeParams({effects: makeEffects({postReply})}))
+    const decision = registry.handleDecision({
+      requestID: 'per_1',
+      approvalScopeId: 'chan_1',
+      decision: 'once',
+      actor: makeActor(),
+    })
+
+    // #when the card is then found undeliverable
+    const outcome = await registry.rejectUndeliverable('per_1', registration)
+
+    // #then nothing was disposed or denied, and the decision stands
+    expect(outcome).toBe('skipped')
+    expect(registry.has('per_1')).toBe(true)
+    land({ok: true})
+    await expect(decision).resolves.toBe('ok')
+    expect(postReply).toHaveBeenCalledExactlyOnceWith('per_1', '/workspace/proj', 'once')
+  })
+
+  it('does nothing for an entry that already settled', async () => {
+    // #given
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    const effects = makeEffects()
+    const registration = registry.register(makeParams({effects}))
+    registry.confirmReply({requestID: 'per_1', sessionID: 'ses_1', reply: 'once'})
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // #when / #then
+    expect(await registry.rejectUndeliverable('per_1', registration)).toBe('skipped')
+    expect(effects.postReply).not.toHaveBeenCalled()
+  })
+
+  it('does nothing for a different registration of the same request id (a re-ask)', async () => {
+    // #given the first registration, then a re-ask of the same id
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    const first = registry.register(makeParams({effects: makeEffects()}))
+    const secondEffects = makeEffects()
+    const second = registry.register(makeParams({effects: secondEffects}))
+    expect(second).not.toBe(first)
+
+    // #when the first one's card is found undeliverable
+    const outcome = await registry.rejectUndeliverable('per_1', first)
+
+    // #then the successor is untouched
+    expect(outcome).toBe('skipped')
+    expect(registry.has('per_1')).toBe(true)
+    expect(secondEffects.postReply).not.toHaveBeenCalled()
+    // #and the successor can still be rejected by its own registration
+    expect(await registry.rejectUndeliverable('per_1', second)).toBe('rejected')
+  })
+
+  it('does nothing for an unknown request id', async () => {
+    const registry = createApprovalRegistry({logger: makeLogger()})
+    expect(await registry.rejectUndeliverable('per_nope', Symbol('stale'))).toBe('skipped')
+  })
+})

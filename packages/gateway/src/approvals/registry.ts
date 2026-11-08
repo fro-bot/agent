@@ -133,6 +133,12 @@ export interface ApprovalSideEffects {
   ) => Promise<{readonly ok: boolean; readonly error?: string}>
 }
 
+/**
+ * Opaque identity of one `register` call. A request id can be registered again (a re-ask), so an operation that must
+ * apply to exactly the registration it was started for takes this, not the id.
+ */
+export type RegistrationId = symbol
+
 export interface RegisterParams {
   readonly requestID: string
   readonly sessionID: string
@@ -192,8 +198,11 @@ export type DecisionOutcome =
 export type {EntryState} from './request-gate.js'
 
 export interface ApprovalRegistry {
-  /** Register a new entry BEFORE sending the approval embed/notification. */
-  register: (params: RegisterParams) => void
+  /**
+   * Register a new entry BEFORE sending the approval embed/notification. Returns the identity of this registration,
+   * for {@link ApprovalRegistry.rejectUndeliverable}.
+   */
+  register: (params: RegisterParams) => RegistrationId
   /**
    * Attach a settle renderer to a registered entry. Renderers accumulate (one per transport: the SSE settle frame,
    * the Discord card edit) and all run, in attach order, on every settlement path. A transport that cannot attach
@@ -206,6 +215,14 @@ export interface ApprovalRegistry {
    * the render step is skipped since there is nothing to edit.
    */
   markMessagePostFailed: (requestID: string) => void
+  /**
+   * The approval notification can never be delivered (terminal Discord error): reject the permission and retire the
+   * entry, but only if this is still the SAME registration AND it is still `open`. The check and the claim happen in
+   * one synchronous step, so nothing can interleave. An entry that is `claimed` (an operator decision is in flight,
+   * and its approval may still succeed), settled, replaced by a re-ask, or unknown is left exactly as it is, and
+   * `'skipped'` tells the caller not to announce a denial. The in-flight decision then settles through its own path.
+   */
+  rejectUndeliverable: (requestID: string, registration: RegistrationId) => Promise<'rejected' | 'skipped'>
   has: (requestID: string) => boolean
   pending: () => readonly string[]
   /**
@@ -294,6 +311,8 @@ export interface ApprovalPayload {
   readonly effects: ApprovalSideEffects
   /** Only `reject` is accepted: part of the request is hidden from the operator. Fixed at registration. */
   readonly rejectOnly: boolean
+  /** Identity of the `register` call that created this entry. */
+  readonly registration: RegistrationId
   /** The run that raised the request; null when the registrant did not say. */
   readonly runId: string | null
   /** Settle renderers pushed by attachMessage, one per transport that can show the settlement. */
@@ -369,17 +388,18 @@ export function createApprovalRegistry(deps: {
   // register
   // -------------------------------------------------------------------------
 
-  function register(params: RegisterParams): void {
+  function register(params: RegisterParams): RegistrationId {
     const {requestID, sessionID, approvalScopeId, directory, request, effects, deadlineMs, onDeadlineSettled} = params
     // Fail closed when any part of what is being approved is hidden: the frame's detail was cut by length, or the
     // transport said its own surface cannot show it in full.
     const rejectOnly = params.rejectOnly === true || isRequestDetailTruncated(request)
+    const registration: RegistrationId = Symbol(`approval:${requestID}`)
     const entry: ApprovalGateEntry = {
       family: 'approval',
       requestID,
       sessionID,
       scopeId: approvalScopeId,
-      payload: {request, directory, effects, rejectOnly, runId: params.runId ?? null, renderFns: []},
+      payload: {request, directory, effects, rejectOnly, registration, runId: params.runId ?? null, renderFns: []},
       ops: {
         // The next two return the underlying promise instead of wrapping it in an async function:
         // an async wrapper adds microtask ticks to the fail-close chain, whose depth the
@@ -412,6 +432,7 @@ export function createApprovalRegistry(deps: {
       }
       logger.warn({requestID}, 'ApprovalRegistry: duplicate requestID — overwriting (re-ask)')
     }
+    return registration
   }
 
   // -------------------------------------------------------------------------
@@ -434,6 +455,21 @@ export function createApprovalRegistry(deps: {
       return
     }
     logger.warn({requestID}, 'ApprovalRegistry: embed post failed — entry stays registered, the card render is skipped')
+  }
+
+  // -------------------------------------------------------------------------
+  // rejectUndeliverable
+  // -------------------------------------------------------------------------
+
+  async function rejectUndeliverable(requestID: string, registration: RegistrationId): Promise<'rejected' | 'skipped'> {
+    const entry = getEntry(requestID)
+    if (entry === undefined || entry.payload.registration !== registration || entry.state !== 'open') {
+      return 'skipped'
+    }
+    // No await between the check above and the claim inside applySettlement (it reads the entry and takes the gate's
+    // retire step synchronously), so a decision cannot slip in between.
+    await applySettlement({requestID, decision: 'reject', reason: 'disposed'})
+    return 'rejected'
   }
 
   // -------------------------------------------------------------------------
@@ -788,6 +824,7 @@ export function createApprovalRegistry(deps: {
     register,
     attachMessage,
     markMessagePostFailed,
+    rejectUndeliverable,
     has,
     pending,
     hasPendingForScope,
