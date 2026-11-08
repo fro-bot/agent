@@ -72,6 +72,14 @@
       extractVersionTemplate: '^bun-v(?<version>.*)$',
     },
     {
+      // The npm CLI the workspace image installs for agent tasks, replacing the base's bundled npm (#2117).
+      customType: 'regex',
+      managerFilePatterns: ['/deploy\\/workspace\\.Dockerfile/'],
+      matchStrings: ['ARG NPM_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)'],
+      depNameTemplate: 'npm',
+      datasourceTemplate: 'npm',
+    },
+    {
       // Tracks the stock OpenCode V2 pin. The Dockerfile's `opencode-v2` stage and the Action's
       // installOpenCode both read this file. Bumping `version` alone leaves the per-asset sha256
       // digests stale, and both consumers fail closed on that: the packageRules entry below regenerates
