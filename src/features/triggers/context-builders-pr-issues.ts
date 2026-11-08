@@ -84,6 +84,7 @@ export function buildPullRequestContextData(
     body: event.pullRequest.body,
     locked: event.pullRequest.locked,
     isDraft: event.pullRequest.draft,
+    headSha: event.pullRequest.headSha,
     requestedReviewerLogin: event.requestedReviewer?.login,
     requestedTeamSlug: event.requestedTeam?.slug,
     requestedReviewerLogins: event.pullRequest.requestedReviewers.map(reviewer => reviewer.login),

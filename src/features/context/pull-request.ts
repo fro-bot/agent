@@ -120,6 +120,7 @@ export async function hydratePullRequestContext(
     createdAt: pr.createdAt,
     baseBranch: pr.baseRefName,
     headBranch: pr.headRefName,
+    headSha: pr.headRefOid,
     isFork,
     labels,
     assignees,

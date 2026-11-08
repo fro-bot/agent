@@ -181,7 +181,7 @@ describe('submitReviewWithHeadGuard', () => {
         prNumber: 1,
         event: 'APPROVE',
         body: 'lgtm',
-        currentHeadSha: 'head-sha-abc',
+        reviewedHeadSha: 'head-sha-abc',
       },
       logger,
     )
@@ -214,7 +214,7 @@ describe('submitReviewWithHeadGuard', () => {
         prNumber: 1,
         event: 'APPROVE',
         body: 'lgtm',
-        currentHeadSha: 'head-sha-abc',
+        reviewedHeadSha: 'head-sha-abc',
       },
       logger,
     )
@@ -222,6 +222,62 @@ describe('submitReviewWithHeadGuard', () => {
     // #then submission is blocked and no review is created
     expect(outcome).toEqual({submitted: false, reason: 'head-moved-before-submit'})
     expect((octokit as unknown as MockOctokit).rest.pulls.createReview).not.toHaveBeenCalled()
+  })
+})
+
+describe('submitReviewWithHeadGuard reviewed-head pinning (#2124)', () => {
+  let logger: Logger
+
+  beforeEach(() => {
+    logger = createMockLogger()
+  })
+
+  it('aborts when the PR head at submit differs from the reviewed head, even though both delivery-time fetches agree', async () => {
+    // #given the agent reviewed A and the PR has since moved to B (every fetch reads B)
+    const octokit = makeOctokit({
+      getPR: () => ({
+        data: {
+          head: {sha: 'head-B', repo: {full_name: 'owner/repo'}},
+          base: {repo: {full_name: 'owner/repo'}},
+          user: {login: 'pr-author'},
+        },
+      }),
+    }) as unknown as Octokit
+
+    // #when submitting with the reviewed head A
+    const outcome = await submitReviewWithHeadGuard(
+      {octokit, owner: 'owner', repo: 'repo', prNumber: 1, event: 'APPROVE', body: 'lgtm', reviewedHeadSha: 'head-A'},
+      logger,
+    )
+
+    // #then the review is dropped; it is never attributed to B
+    expect(outcome).toEqual({submitted: false, reason: 'head-moved-before-submit'})
+    expect((octokit as unknown as MockOctokit).rest.pulls.createReview).not.toHaveBeenCalled()
+  })
+
+  it('pins commit_id to the reviewed head and reports it as the submitted commit', async () => {
+    // #given the PR still sits at the reviewed head
+    const octokit = makeOctokit() as unknown as Octokit
+
+    // #when submitting
+    const outcome = await submitReviewWithHeadGuard(
+      {
+        octokit,
+        owner: 'owner',
+        repo: 'repo',
+        prNumber: 1,
+        event: 'REQUEST_CHANGES',
+        body: 'fix',
+        reviewedHeadSha: 'head-sha-abc',
+      },
+      logger,
+    )
+
+    // #then the POST and the outcome both carry the reviewed head
+    expect(outcome).toMatchObject({submitted: true, commitSha: 'head-sha-abc'})
+    expect((octokit as unknown as MockOctokit).rest.pulls.createReview).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({commit_id: 'head-sha-abc'}),
+    )
   })
 })
 
@@ -263,7 +319,7 @@ describe('submitReviewWithHeadGuard publication receipt', () => {
         prNumber: 1,
         event: 'APPROVE',
         body: 'lgtm',
-        currentHeadSha: 'head-sha-abc',
+        reviewedHeadSha: 'head-sha-abc',
         receipt: {ops, identity: IDENTITY, attempt: 1},
       },
       logger,
@@ -304,7 +360,7 @@ describe('submitReviewWithHeadGuard publication receipt', () => {
         prNumber: 1,
         event: 'APPROVE',
         body: 'lgtm',
-        currentHeadSha: 'head-sha-abc',
+        reviewedHeadSha: 'head-sha-abc',
         receipt: {ops, identity: IDENTITY, attempt: 1},
       },
       logger,
@@ -336,7 +392,7 @@ describe('submitReviewWithHeadGuard publication receipt', () => {
         prNumber: 1,
         event: 'APPROVE',
         body: 'lgtm',
-        currentHeadSha: 'head-sha-abc',
+        reviewedHeadSha: 'head-sha-abc',
         receipt: {ops, identity: IDENTITY, attempt: 2},
       },
       logger,
@@ -360,7 +416,7 @@ describe('submitReviewWithHeadGuard publication receipt', () => {
         prNumber: 1,
         event: 'APPROVE',
         body: 'lgtm',
-        currentHeadSha: 'head-sha-abc',
+        reviewedHeadSha: 'head-sha-abc',
       },
       logger,
     )
@@ -407,7 +463,7 @@ describe('submitReviewWithHeadGuard publication receipt', () => {
         prNumber: 1,
         event: 'APPROVE',
         body: 'lgtm',
-        currentHeadSha: 'head-sha-abc',
+        reviewedHeadSha: 'head-sha-abc',
         receipt: {ops, identity: IDENTITY, attempt: 1},
       },
       logger,
@@ -466,7 +522,7 @@ describe('submitReviewWithHeadGuard publication receipt', () => {
         prNumber: 1,
         event: 'APPROVE',
         body: 'lgtm',
-        currentHeadSha: 'head-sha-abc',
+        reviewedHeadSha: 'head-sha-abc',
         receipt: {ops, identity: IDENTITY, attempt: 1},
       },
       logger,
@@ -497,7 +553,7 @@ describe('submitReviewWithHeadGuard publication receipt', () => {
         prNumber: 1,
         event: 'APPROVE',
         body: 'lgtm',
-        currentHeadSha: 'head-sha-abc',
+        reviewedHeadSha: 'head-sha-abc',
         receipt: {ops, identity: IDENTITY, attempt: 1},
       },
       logger,
@@ -533,7 +589,7 @@ describe('submitReviewWithHeadGuard publication receipt', () => {
         prNumber: 1,
         event: 'APPROVE',
         body: 'lgtm',
-        currentHeadSha: 'head-sha-abc',
+        reviewedHeadSha: 'head-sha-abc',
         receipt: {ops, identity: IDENTITY, attempt: 1},
       },
       logger,
@@ -574,7 +630,7 @@ describe('submitReviewWithHeadGuard publication receipt', () => {
         prNumber: 1,
         event: 'REQUEST_CHANGES',
         body: 'please address these issues',
-        currentHeadSha: 'head-sha-abc',
+        reviewedHeadSha: 'head-sha-abc',
         receipt: {ops, identity: IDENTITY, attempt: 1},
       },
       logger,

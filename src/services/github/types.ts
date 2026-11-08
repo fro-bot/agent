@@ -101,6 +101,8 @@ export interface NormalizedPullRequestEvent {
     readonly body: string | null
     readonly locked: boolean
     readonly draft: boolean
+    /** `pull_request.head.sha` from the event payload -- immutable for the run. */
+    readonly headSha: string
     readonly authorAssociation: string
     readonly requestedReviewers: readonly {readonly login: string; readonly type: string}[]
     readonly labels: readonly string[]

@@ -245,6 +245,7 @@ export async function fallbackPullRequestContext(
       createdAt: pr.created_at,
       baseBranch: pr.base.ref,
       headBranch: pr.head.ref,
+      headSha: pr.head.sha,
       isFork,
       labels,
       assignees,

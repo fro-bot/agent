@@ -238,7 +238,7 @@ export interface ReplySink {
    * - Empty/whitespace with prior visible output: no-op (`skipped-visible`).
    *
    * `suppressEmptyNotice`: skip the "no output" placeholder for an empty buffer. Used on the
-   * cancel path, where the cancel notice already told the thread the run ended. Only affects
+   * cancel and failure paths, where the cancel notice / failure reply already tells the thread the run ended. Only affects
    * transports that post such a placeholder; a web sink still pushes its terminal output frame.
    *
    * Maps to `sink.flush(options)` in the Discord adapter.
