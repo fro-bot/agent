@@ -1,8 +1,10 @@
 ---
 type: subsystem
-last-updated: "2026-11-02"
-updated-by: "f8ee76a3"
+last-updated: "2026-11-08"
+updated-by: "f7c20f94"
 sources:
+  - packages/runtime/src/agent/workspace-config-v2.ts
+  - deploy/gateway.Dockerfile
   - tsdown.config.ts
   - src/services/setup/ci-config-v2.ts
   - src/services/setup/mcp-servers-v2.ts
@@ -104,11 +106,11 @@ Default versions are defined in `packages/runtime/src/shared/constants.ts` (shar
 
 These can be overridden per-run via action inputs (`opencode-version`, `systematic-version`). Stock tool pins are updated via Renovate-managed PRs. The OpenCode default is the stock V2 pin in `opencode-v2-pin.json`: Renovate bumps its `version` and a post-upgrade task regenerates the per-asset digests. A harness release does not change the Action default.
 
-The bundled Systematic default is currently `3.29.0`, shared by V1 and V2. Its pin participates in the tools-cache key, so advancing it triggers a fresh plugin installation even when the OpenCode binary itself is already cached.
+The bundled Systematic default is currently `3.32.0`, shared by V1 and V2. Its pin participates in the tools-cache key, so advancing it triggers a fresh plugin installation even when the OpenCode binary itself is already cached.
 
 Bun is the package manager for this project's own workspace, not a tool the Action installs. Every workflow in this repository gets its Bun from the root `package.json` `packageManager` field through `.github/actions/setup`, which fails the job if the installed Bun differs from it.
 
-`DEFAULT_OPENCODE_VERSION` is the **stock OpenCode V2 pin** (currently `2.2.5`), read from `packages/runtime/src/shared/opencode-v2-pin.json`, which records the version and each release asset's SHA-256. Installation requires both the recorded digest and the release's `SHA256SUMS` line to match. The build checks that the version and digests survive bundling (`tsdown.config.ts`). `latest` selects this same recorded pin without an upstream lookup.
+`DEFAULT_OPENCODE_VERSION` is the **stock OpenCode V2 pin** (currently `2.2.6`), read from `packages/runtime/src/shared/opencode-v2-pin.json`, which records the version and each release asset's SHA-256. Installation requires both the recorded digest and the release's `SHA256SUMS` line to match. The build checks that the version and digests survive bundling (`tsdown.config.ts`). `latest` selects this same recorded pin without an upstream lookup.
 
 The previous Action default, `1.19.5+harness.bf7f7dfe`, remains selectable through `opencode-version` as a rollback path. The workspace image still defaults to that V1 harness build; switching the Action default does not switch the gateway/workspace deployment.
 
@@ -128,6 +130,8 @@ Held execution claims from a killed invocation are cleared in the restored datab
 
 ### Effective configuration and permissions
 
+The Action also denies the native `websearch` action on V2; the workspace policy does not add that CI-specific deny. These tool rules steer the model's available actions, not the filesystem or network security boundary: an allowed shell can exercise the permissions and egress the process actually has.
+
 V2 uses `plugins`, an ordered top-level `permissions` list, `update: disable`, and `experimental.subagent_depth: 1` (`permission-rules-v2.ts`). These are generation-specific spellings, not the V1 config shape. The Action strips operator permission/tool overrides from top-level and agent maps before assembling the harness rules, and disables project-config loading at spawn.
 
 Outside-checkout access defaults to deny in CI. Exceptions name the run-attempt response and attachment directories, an eligible integration work directory, and the installed Systematic skills directory. Secret-shaped reads and edits are denied while `.env.example` remains accessible. `question`, session moves, and worktree creation are denied. The post-spawn permission gate inspects effective per-agent rules, so writing an intended config alone cannot establish readiness.
@@ -135,6 +139,8 @@ Outside-checkout access defaults to deny in CI. Exceptions name the run-attempt 
 The bundled-skills exception fixes a precedence problem shared with V1: a catch-all outside-directory deny could shadow OpenCode's own skill grant, leaving a loaded skill unable to read its references or execute its scripts. The resolver admits only the exact installed version's `@fro.bot/systematic/skills` directory, including the newest installed V2 generation directory. It grants neither the entire package cache nor arbitrary symlink destinations. Edit tools are denied there, but this is not filesystem read-only protection: shell commands can still write within an allowed external directory. A missing resolution warns and adds no grant.
 
 ### Caller MCP servers
+
+On credential-withheld triggers, `buildCIConfigV2` rejects `{env:...}` references anywhere in the operator configuration before MCP filtering. Upstream substitutes environment values into config text before parsing, so even an allowlisted but attacker-influenced environment value could otherwise add JSON structure after the harness checked it. This whole-config rejection is distinct from the non-fatal per-server filtering below.
 
 `opencode-config` `mcp` reaches V2 through `mcp-servers-v2.ts`, which `buildCIConfigV2` calls before it builds the permission rules. V2 2.2.5 reads two spellings, the legacy `mcp.<name>` map and the native `mcp.servers.<name>` map; both parse into one typed list (`local` with `command`/`cwd`/`environment`, `remote` with `url`/`headers`/`oauth`), and a bad shape fails setup with an error that names the server and field but never a value. The config is not rewritten into one spelling, because the native server schema (`disabled`, a `timeout` object, snake_case `oauth`) is not something the harness can read from the pinned source; entries pass through as authored. A server literally named `servers` or `timeout` is a server only when its value has `type`, the same rule upstream applies.
 
@@ -145,6 +151,10 @@ On a credential-withheld trigger (`resolveResponseDelivery`, the `pull_request`,
 On a provisioned run `mcp` passes through after validation. The parser checks what the 2.2.5 source shows: the legacy server schema in full, `mcp.timeout` as a positive integer or an object of positive integers, and for native entries the fields both spellings share. Native-only fields (`protocol`, the snake_case `oauth` keys) pass through because the native schema is not in the readable source. A string field that holds a `{env:}` or `{file:}` reference also passes without a format check, because the server substitutes it before it reads the config: a whole-value `url` reference is accepted, a literal `url` still needs to be http(s), and a referenced `type` parses as a server of unresolved kind whose launch fields are not checked. Structure (`command` an array, `environment` and `headers` maps) is still checked as written. The credential disposition comes from `cache-restore.ts` to `startActionOpenCodeV2` to `buildCIConfigV2` as a required input. The V1 path is unchanged: it passes `mcp` through without validation or trigger rules.
 
 ### Server and workspace boundary
+
+V2 workspace provisioning does not create `auth.json` and removes a stale one. Credentials are supplied through the authenticated per-spawn API instead, avoiding an unused secret-bearing file in the agent's home. `workspace-config-v2.ts` sets the per-location idle timeout to ten minutes rather than upstream's sixty, releasing idle location memory without changing the gateway's completion gate.
+
+The runtime images separate tool needs as well. `deploy/gateway.Dockerfile` removes npm, Yarn, and Corepack because the daemon needs no package manager. `deploy/workspace.Dockerfile` supplies the verified Bun binary and npm/npx `12.2.2` for agent tasks, replacing the base image's npm tree and removing Yarn and Corepack. This image provisioning is separate from Action setup, which installs no JavaScript runtime.
 
 `packages/runtime/src/agent/server-v2.ts` runs `serve --stdio` with held stdin, an explicit loopback port, a per-spawn Basic credential, and a scrubbed child environment. Readiness includes the agent endpoint and an active-plugin check, followed by the surface's permission and credential gates. Shutdown interrupts remaining sessions, closes stdin, and confirms process exit; [[Background Subagents and Ownership]] explains the directory-release check that precedes it.
 

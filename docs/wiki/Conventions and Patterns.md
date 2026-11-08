@@ -1,12 +1,14 @@
 ---
 type: convention
-last-updated: "2026-11-01"
-updated-by: "9a429e2a6ddc692bd6098b5504c225830af85bf9"
+last-updated: "2026-11-08"
+updated-by: "f7c20f94"
 sources:
   - packages/runtime/src/session/generation.ts
   - packages/runtime/src/agent/event-v2.ts
   - packages/runtime/src/agent/directory-quiescence-v2.ts
-  - src/harness/phases/execution-backend.ts
+  - src/harness/phases/execute-v2.ts
+  - src/features/agent/execution-deadline.ts
+  - packages/gateway/src/execute/run-core-shared.ts
   - src/features/agent/prompt-sender-v2.ts
   - AGENTS.md
   - src/harness/outcome.ts
@@ -184,6 +186,8 @@ Solved problems are written up under `docs/solutions/`, organized by category, e
 The project uses conventional commits: `type(scope): description`. Types include `feat`, `fix`, `docs`, `refactor`, `test`, `build`, `ci`, `chore`. The scope indicates the module or area affected.
 
 ## Boundary-Preserving Patterns
+
+Generation-neutral contracts have explicit homes rather than remaining exports of a legacy implementation. `execution-deadline.ts` and `attempt-outcome.ts` hold the Action's shared timing and result vocabulary; `run-core-shared.ts` holds the gateway's shared stream and error contracts. V1 modules consume these alongside V2, so retaining a rollback backend does not make it the architectural owner of the current path. [[Architecture Overview]] describes the generation selector.
 
 The conventions above preserve a few recurring boundaries: typed normalization separates external webhook payloads from business logic, injected loggers keep credential redaction on the output path, and non-force ref updates avoid replacing another writer's work. Type suppressions and hidden global context would weaken the evidence these boundaries provide, which explains their absence from the project's normal implementation style.
 

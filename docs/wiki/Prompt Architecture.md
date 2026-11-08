@@ -1,8 +1,9 @@
 ---
 type: subsystem
-last-updated: "2026-11-02"
-updated-by: "f8ee76a3"
+last-updated: "2026-11-08"
+updated-by: "f7c20f94"
 sources:
+  - src/harness/phases/brokered-push-plan.ts
   - src/features/agent/prompt-sender-v2.ts
   - src/features/agent/execution-v2.ts
   - src/features/agent/retry-v2.ts
@@ -107,6 +108,8 @@ How the agent is told to deliver its answer is decided in bootstrap by `resolveR
 Keeping this branch in the prompt builder (rather than in a separate agent instruction file) means the response protocol the model sees always matches what the harness will actually do with its output, so the two can never drift.
 
 ## Response Surfaces
+
+For an eligible same-repository PR comment, the file-convention protocol also explains the brokered push: the agent commits its edits locally and the Action pushes them after execution. `src/harness/phases/brokered-push-plan.ts` derives this instruction from trusted trigger, association, head-anchor, and hydrated PR facts before the prompt is built. It is absent for forks or incomplete context. The model does not report whether the push landed; the harness appends that outcome after its live checks, as described in [[Execution Lifecycle]].
 
 Delivery mode answers "how does the answer get posted." A second, orthogonal axis answers "what kind of artifact is this run allowed to produce," and it is carried by `ResponseSurface` (`packages/runtime/src/agent/response-file.ts`). Four surfaces exist: `issue-comment`, `pr-comment`, `pr-review`, and `pr-review-permitted`.
 
