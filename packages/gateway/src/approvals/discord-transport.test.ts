@@ -183,6 +183,44 @@ describe('createDiscordApprovalOnPending — happy path', () => {
 // Run identity and the announce hook (#2115)
 // ---------------------------------------------------------------------------
 
+describe('createDiscordApprovalOnPending — card renderer attaches at registration', () => {
+  it('attaches the settle renderer synchronously, before the embed send resolves', () => {
+    // #given an embed send that never resolves
+    const approvalRegistry = makeApprovalRegistry()
+    const replySink = makeReplySink()
+    vi.mocked(replySink.send).mockImplementation(async () => new Promise(() => undefined))
+
+    // #when a request is raised
+    createDiscordApprovalOnPending(makeDeps({approvalRegistry, replySink}))(makeRequest())
+
+    // #then a decision that lands now still finds the card's renderer
+    expect(approvalRegistry.attachMessage).toHaveBeenCalledExactlyOnceWith('per_1', expect.any(Function))
+  })
+
+  it('attaches after the operator-stream announce, so the dashboard frame never waits on a Discord edit', () => {
+    // #given
+    const order: string[] = []
+    const approvalRegistry = makeApprovalRegistry({
+      attachMessage: vi.fn(() => {
+        order.push('attach-card')
+      }),
+    })
+
+    // #when
+    createDiscordApprovalOnPending(
+      makeDeps({
+        approvalRegistry,
+        onRegistered: () => {
+          order.push('announce')
+        },
+      }),
+    )(makeRequest())
+
+    // #then
+    expect(order).toEqual(['announce', 'attach-card'])
+  })
+})
+
 describe('createDiscordApprovalOnPending — run identity', () => {
   it('registers the request under the thread id AND the run that raised it', () => {
     // #given
@@ -261,6 +299,10 @@ async function settleCardAs(actor: ApprovalActor): Promise<string | undefined> {
     reason: 'replied',
   ) => Promise<void>
   await render(request, 'once', actor, 'replied')
+  // The renderer is attached at registration, so it may run before the card posts: the edit lands once it does.
+  await vi.waitFor(() => {
+    expect(edit).toHaveBeenCalledOnce()
+  })
   const edited = edit.mock.calls[0]?.[0] as {embeds: readonly {toJSON: () => {description?: string}}[]}
   return edited.embeds[0]?.toJSON().description
 }

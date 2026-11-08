@@ -45,9 +45,11 @@
  *
  * ### register-before-send
  *
- * Callers MUST call `register()` before attempting to post the Discord embed.
- * Once the embed is posted successfully, call `attachMessage(requestID, renderFn)`
- * so that settled state can edit the message.
+ * Callers MUST call `register()` before attempting to post the Discord embed,
+ * and attach their settle renderer (`attachMessage(requestID, renderFn)`) right
+ * after it, NOT after the post resolves: a decision can land while the post is in
+ * flight, and a renderer attached later would find the entry already settled and
+ * gone. A renderer that has no message to edit yet keeps the outcome until it has.
  * If the send fails, call `markMessagePostFailed(requestID)` — the entry stays
  * registered so the permission can still be POSTed when it settles.
  */

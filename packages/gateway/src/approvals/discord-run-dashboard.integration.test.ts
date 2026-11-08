@@ -52,11 +52,14 @@ function terminalDiscordError(): DiscordAPIError {
   )
 }
 
-type EmbedOutcome = 'posted' | 'retryable-failure' | 'terminal-failure'
+type EmbedOutcome = 'posted' | 'retryable-failure' | 'terminal-failure' | 'deferred'
 
 /**
  * Wires one Discord-launched run exactly as `run.ts` + `program.ts` do: the registry is shared, the Discord
  * transport registers, and the web announcer is its `onRegistered` hook.
+ *
+ * `'deferred'` leaves every embed send in flight: each call is a `card` the test settles with `postCard` /
+ * `failCard`, so a decision can land while the Discord post is still pending.
  */
 function setup(embed: EmbedOutcome = 'posted', approvalDeadlineMs?: number) {
   const logger = makeLogger()
@@ -65,8 +68,15 @@ function setup(embed: EmbedOutcome = 'posted', approvalDeadlineMs?: number) {
   const edit = vi.fn().mockResolvedValue({})
   const postReply = vi.fn(async () => ({ok: true}))
 
+  const cards: {edit: ReturnType<typeof vi.fn>; settle: (result: unknown) => void}[] = []
   const send = vi.fn(async (_target: string, options: {embeds?: readonly unknown[]}) => {
     if (options.embeds === undefined) return {success: true, data: {id: 'msg_other'}}
+    if (embed === 'deferred') {
+      const cardEdit = vi.fn().mockResolvedValue({})
+      return new Promise<unknown>(resolve => {
+        cards.push({edit: cardEdit, settle: resolve})
+      })
+    }
     if (embed === 'posted') return {success: true, data: {id: 'msg_embed', edit}}
     return {success: false, error: embed === 'terminal-failure' ? terminalDiscordError() : new Error('rate limited')}
   })
@@ -110,7 +120,35 @@ function setup(embed: EmbedOutcome = 'posted', approvalDeadlineMs?: number) {
   const openFrames = (requestID: string) =>
     frames.filter(f => f.data.requestID === requestID && f.data.settled === false)
 
-  return {registry, frames, edit, postReply, onPending, cardDescription, settledFrames, openFrames}
+  /** The deferred send number `index` resolves with a posted message. */
+  const postCard = (index = 0) => {
+    const card = cards[index]
+    card?.settle({success: true, data: {id: `msg_${index}`, edit: card.edit}})
+    return card?.edit
+  }
+  const failCard = (index = 0, terminal = false) => {
+    cards[index]?.settle({success: false, error: terminal ? terminalDiscordError() : new Error('rate limited')})
+  }
+  const descriptionOf = (cardEdit: ReturnType<typeof vi.fn> | undefined): string | undefined => {
+    const edited = cardEdit?.mock.calls[0]?.[0] as
+      {embeds: readonly {toJSON: () => {description?: string}}[]} | undefined
+    return edited?.embeds[0]?.toJSON().description
+  }
+
+  return {
+    registry,
+    frames,
+    edit,
+    postReply,
+    onPending,
+    cardDescription,
+    settledFrames,
+    openFrames,
+    cards,
+    postCard,
+    failCard,
+    descriptionOf,
+  }
 }
 
 const flush = async () => new Promise<void>(resolve => setTimeout(resolve, 0))
@@ -318,5 +356,222 @@ describe('Discord-launched run: the settle frame on every path', () => {
     // #then both are settled for the dashboard
     expect(settledFrames('per_1')).toHaveLength(1)
     expect(settledFrames('per_2')).toHaveLength(1)
+  })
+})
+
+describe('Discord-launched run: a decision that lands while the card is still posting', () => {
+  const dashboardApprove = async (registry: ReturnType<typeof createApprovalRegistry>, requestID = 'per_1') => {
+    const outcome = await registry.handleDecision({
+      requestID,
+      approvalScopeId: RUN_ID,
+      runId: RUN_ID,
+      decision: 'once',
+      actor: WEB_OPERATOR,
+    })
+    registry.confirmReply({requestID, sessionID: SESSION_ID, reply: 'once'})
+    await flush()
+    return outcome
+  }
+
+  it('edits the card to settled once the post resolves, and sends one settle frame', async () => {
+    // #given the embed send is still in flight
+    const {onPending, registry, postCard, descriptionOf, settledFrames} = setup('deferred')
+    onPending(makeRequest())
+    await flush()
+
+    // #when the dashboard approves it before the card posts, then the post resolves
+    expect(await dashboardApprove(registry)).toBe('ok')
+    expect(settledFrames('per_1')).toHaveLength(1)
+    const cardEdit = postCard()
+    await flush()
+
+    // #then the late card is edited once, attributed to the dashboard, with no second settle frame
+    expect(cardEdit).toHaveBeenCalledTimes(1)
+    expect(descriptionOf(cardEdit)).toBe('Approved by alice (dashboard)')
+    expect(settledFrames('per_1')).toHaveLength(1)
+    expect(registry.has('per_1')).toBe(false)
+  })
+
+  it('settles a late card for a Discord-click decision the same way', async () => {
+    // #given
+    const {onPending, registry, postCard, descriptionOf} = setup('deferred')
+    onPending(makeRequest())
+    await flush()
+
+    // #when the button on an earlier-visible surface decides it first
+    await registry.handleDecision({
+      requestID: 'per_1',
+      approvalScopeId: THREAD_ID,
+      decision: 'reject',
+      actor: DISCORD_USER,
+    })
+    registry.confirmReply({requestID: 'per_1', sessionID: SESSION_ID, reply: 'reject'})
+    await flush()
+    const cardEdit = postCard()
+    await flush()
+
+    // #then
+    expect(cardEdit).toHaveBeenCalledTimes(1)
+    expect(descriptionOf(cardEdit)).toBe('Denied by <@123456789>')
+  })
+
+  it('a teardown during the send settles the late card as ended, with one settle frame', async () => {
+    // #given
+    const {onPending, registry, postCard, cards, settledFrames} = setup('deferred')
+    onPending(makeRequest())
+    await flush()
+
+    // #when the run ends before the card posts
+    await registry.disposeRun(SESSION_ID, 'run ended')
+    const cardEdit = postCard()
+    await flush()
+
+    // #then the card no longer looks active, and the dashboard was told exactly once
+    expect(cards).toHaveLength(1)
+    expect(cardEdit).toHaveBeenCalledTimes(1)
+    const edited = cardEdit?.mock.calls[0]?.[0] as {components: readonly unknown[]}
+    expect(edited.components).toEqual([])
+    expect(settledFrames('per_1')).toHaveLength(1)
+  })
+
+  it('a deadline during the send settles the late card, with one settle frame', async () => {
+    vi.useFakeTimers()
+    try {
+      // #given a request with a deadline and a card still posting
+      const {onPending, registry, postCard, settledFrames} = setup('deferred', 5_000)
+      onPending(makeRequest())
+      await vi.advanceTimersByTimeAsync(0)
+
+      // #when the deadline passes, then the post resolves
+      await vi.advanceTimersByTimeAsync(6_000)
+      expect(registry.has('per_1')).toBe(false)
+      const cardEdit = postCard()
+      await vi.advanceTimersByTimeAsync(0)
+
+      // #then
+      expect(cardEdit).toHaveBeenCalledTimes(1)
+      expect(settledFrames('per_1')).toHaveLength(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a request that supersedes the first one never receives the first request’s late card', async () => {
+    // #given request per_1 settled early, then the same id is asked again with its own card in flight
+    const {onPending, registry, postCard, cards, descriptionOf, settledFrames} = setup('deferred')
+    onPending(makeRequest())
+    await flush()
+    await dashboardApprove(registry)
+    onPending(makeRequest())
+    await flush()
+    expect(cards).toHaveLength(2)
+
+    // #when the first request's card posts late
+    const oldEdit = postCard(0)
+    await flush()
+
+    // #then only the first card was settled; the new request is still open and untouched
+    expect(descriptionOf(oldEdit)).toBe('Approved by alice (dashboard)')
+    expect(registry.has('per_1')).toBe(true)
+    expect(registry.describePendingForRun(RUN_ID)).toHaveLength(1)
+    const newEdit = cards[1]?.edit
+    expect(newEdit).not.toHaveBeenCalled()
+    expect(settledFrames('per_1')).toHaveLength(1)
+
+    // #and the new card, once posted, is a live card for the new request: nothing is edited yet
+    postCard(1)
+    await flush()
+    expect(newEdit).not.toHaveBeenCalled()
+    expect(oldEdit).toHaveBeenCalledTimes(1)
+  })
+
+  it('a send that fails after an early settle neither double-settles nor leaks the entry', async () => {
+    // #given
+    const {onPending, registry, failCard, edit, cards, settledFrames} = setup('deferred')
+    onPending(makeRequest())
+    await flush()
+    await dashboardApprove(registry)
+
+    // #when the post then fails (retryable)
+    failCard(0)
+    await flush()
+
+    // #then still one settle frame, nothing edited, nothing left in the registry
+    expect(settledFrames('per_1')).toHaveLength(1)
+    expect(edit).not.toHaveBeenCalled()
+    expect(cards[0]?.edit).not.toHaveBeenCalled()
+    expect(registry.has('per_1')).toBe(false)
+    expect(registry.pending()).toEqual([])
+  })
+
+  it('an undeliverable card after an early settle sends no second settle frame and rejects nothing again', async () => {
+    // #given
+    const {onPending, registry, failCard, postReply, settledFrames} = setup('deferred')
+    onPending(makeRequest())
+    await flush()
+    await dashboardApprove(registry)
+    postReply.mockClear()
+
+    // #when the post fails terminally after the settle
+    failCard(0, true)
+    await flush()
+
+    // #then the auto-reject finds nothing to settle: no extra reply, no extra frame
+    expect(postReply).not.toHaveBeenCalled()
+    expect(settledFrames('per_1')).toHaveLength(1)
+    expect(registry.has('per_1')).toBe(false)
+  })
+})
+
+describe('Discord-launched run: a re-ask while the first card is still posting', () => {
+  it("edits the first card as superseded, and the first card never becomes the new request's card", async () => {
+    // #given request per_1 open with its card in flight, then the same id is asked again
+    const {onPending, registry, postCard, cards, descriptionOf} = setup('deferred')
+    onPending(makeRequest())
+    await flush()
+    onPending(makeRequest())
+    await flush()
+    expect(cards).toHaveLength(2)
+
+    // #when both cards post, the old one last, and then the new request is approved from the dashboard
+    const newEdit = postCard(1)
+    const oldEdit = postCard(0)
+    await flush()
+    await registry.handleDecision({
+      requestID: 'per_1',
+      approvalScopeId: RUN_ID,
+      runId: RUN_ID,
+      decision: 'once',
+      actor: WEB_OPERATOR,
+    })
+    registry.confirmReply({requestID: 'per_1', sessionID: SESSION_ID, reply: 'once'})
+    await flush()
+
+    // #then the old card was closed once for the re-ask and is untouched by the new outcome
+    expect(oldEdit).toHaveBeenCalledTimes(1)
+    expect(descriptionOf(oldEdit)).not.toBe('Approved by alice (dashboard)')
+    // #and the new card shows the new request's decision, once
+    expect(newEdit).toHaveBeenCalledTimes(1)
+    expect(descriptionOf(newEdit)).toBe('Approved by alice (dashboard)')
+  })
+
+  it('a stale undeliverable failure of the first card does not reject the new request', async () => {
+    // #given a re-ask while the first card is in flight
+    const {onPending, registry, failCard, postReply, settledFrames} = setup('deferred')
+    onPending(makeRequest())
+    await flush()
+    onPending(makeRequest())
+    await flush()
+    const framesBefore = settledFrames('per_1').length
+
+    // #when the first card's post fails terminally
+    failCard(0, true)
+    await flush()
+
+    // #then the new request is still open, nothing was rejected upstream, and no extra settle frame went out
+    expect(registry.has('per_1')).toBe(true)
+    expect(registry.describePendingForRun(RUN_ID)).toHaveLength(1)
+    expect(postReply).not.toHaveBeenCalled()
+    expect(settledFrames('per_1')).toHaveLength(framesBefore)
   })
 })
