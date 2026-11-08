@@ -82,6 +82,12 @@ export const DEFAULT_TERMINAL_REPLAY_MAX_BYTES = 8 * 1024 * 1024
 /** Max open question frames kept for reconnect replay, per run. Live delivery is not limited by this. */
 export const MAX_OPEN_QUESTION_REPLAY_PER_RUN = 8
 
+/**
+ * Max open approval frames kept for reconnect replay, per run. Live delivery is not limited by this; an approval
+ * evicted from the replay set is still open in the registry, and the browser's GET reconciliation recovers it.
+ */
+export const MAX_OPEN_APPROVAL_REPLAY_PER_RUN = 8
+
 const TERMINAL_STATUSES = new Set<OperatorRunStatus['status']>(['succeeded', 'failed', 'cancelled'])
 
 function isTerminal(status: OperatorRunStatus['status']): boolean {
@@ -329,6 +335,10 @@ export interface RunObservationManager {
    * The settle/clear frame should be enqueued BEFORE the terminal status fans
    * out so the browser can dismiss the prompt before the run closes.
    *
+   * Open approval frames are also replayed to a subscriber that connects while the request is pending (reconnect
+   * reconciliation), exactly like open questions: bounded per run (`MAX_OPEN_APPROVAL_REPLAY_PER_RUN`, oldest
+   * evicted), removed on settle, cleared on terminal and shutdown, and never holding a settled request.
+   *
    * Does NOT add any mutating run API to the deps — observer-only by construction.
    * Drops silently when the manager is shut down or the run has already reached
    * terminal state (out-of-order async guard).
@@ -521,6 +531,13 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
    * request on settle, per run on terminal, and entirely on shutdown.
    */
   const openQuestionFrames = new Map<string, Map<string, QuestionFrame>>()
+
+  /**
+   * Open (unsettled) approval frames per run, replayed to a subscriber that connects mid-request. Same shape and
+   * lifecycle as {@link openQuestionFrames}. Approval frames are bounded by `boundApprovalDetail` (about 8 KB), so
+   * unlike question frames they need no per-frame size guard.
+   */
+  const openApprovalFrames = new Map<string, Map<string, ApprovalFrame>>()
 
   /**
    * Per live run: the last base status (overlay not applied) and its repository key. A scope refresh
@@ -1241,6 +1258,10 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     if (isTerminalPhase === true) {
       cancelInFlightObservations(runId)
       fenceTerminalRun(runId)
+      // The fence drops every later approval frame, settle frames included, and a terminal projection can fail
+      // without emitting a terminal frame. Either way nothing would ever clear a still-open frame, so a
+      // reconnecting operator would be shown a request of a finished run. A run that is ending has none pending.
+      openApprovalFrames.delete(runId)
     }
 
     const token = registerInFlightObservation(runId)
@@ -1350,8 +1371,9 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     // frame just enqueued above) before finalizing the subscriber.
     latestStatusCache.delete(runId)
     outputSeqCounters.delete(runId)
-    // A terminal run has no pending question; late subscribers get the terminal replay only.
+    // A terminal run has no pending question or approval; late subscribers get the terminal replay only.
     openQuestionFrames.delete(runId)
+    openApprovalFrames.delete(runId)
 
     // Move final output to terminal replay cache (with TTL) instead of
     // deleting it. Late subscribers connecting within the TTL receive the cached
@@ -1491,6 +1513,32 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     }
 
     const frame: ApprovalFrame = {type: 'approval', runId, data}
+
+    // Keep the replay set in step: a settled request must never reappear on reconnect, an open one must.
+    if (data.settled === true) {
+      const open = openApprovalFrames.get(runId)
+      if (open !== undefined) {
+        open.delete(data.requestID)
+        if (open.size === 0) {
+          openApprovalFrames.delete(runId)
+        }
+      }
+    } else {
+      let open = openApprovalFrames.get(runId)
+      if (open === undefined) {
+        open = new Map()
+        openApprovalFrames.set(runId, open)
+      }
+      // Re-observing an id keeps one entry at the newest position.
+      open.delete(data.requestID)
+      open.set(data.requestID, frame)
+      if (open.size > MAX_OPEN_APPROVAL_REPLAY_PER_RUN) {
+        const oldest = open.keys().next().value
+        if (oldest !== undefined) {
+          open.delete(oldest)
+        }
+      }
+    }
 
     // Fan out via the non-coalescing path — approval frames are rare and must
     // arrive intact. Overflow drops the subscriber (same as status frames),
@@ -1739,6 +1787,14 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
       }
     }
 
+    // Reconnect reconciliation, as for questions: every still-open approval, after the status snapshot.
+    const openApprovals = openApprovalFrames.get(runId)
+    if (openApprovals !== undefined) {
+      for (const approvalFrame of openApprovals.values()) {
+        enqueueFrame(sub, approvalFrame)
+      }
+    }
+
     // Deliver the cached final output frame (if any) after the status snapshot.
     // This ensures a late subscriber (connecting after the run's final output frame
     // but before terminal) receives the complete answer.
@@ -1817,6 +1873,7 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
     latestOutputCache.clear()
     outputSeqCounters.clear()
     openQuestionFrames.clear()
+    openApprovalFrames.clear()
     retainedRuns.clear()
     runsByScope.clear()
     scopeByRun.clear()
