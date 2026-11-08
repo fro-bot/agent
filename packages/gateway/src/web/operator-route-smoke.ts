@@ -158,7 +158,7 @@ function makeStubRunIndex() {
 function makeStubApprovalRegistry() {
   return {
     handleDecision: async () => 'not-found' as const,
-    describePendingForScope: () => [],
+    describePendingForRun: () => [],
     hasPendingForScope: () => false,
   }
 }

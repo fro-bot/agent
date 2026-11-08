@@ -114,6 +114,16 @@ export interface QuestionTransportContext {
   readonly replySink: ReplySink
 }
 
+/**
+ * What an approval announcer needs to know about the run it announces for. The registry is the program-scoped one
+ * the Discord transport registers in: the announcer attaches its settle renderer to the entries it holds.
+ */
+export interface ApprovalAnnounceContext {
+  readonly approvalRegistry: ApprovalRegistry
+  readonly runId: string
+  readonly repo: string
+}
+
 export interface RunMentionDeps {
   readonly coordinationConfig: CoordinationConfig
   readonly identity: string
@@ -167,6 +177,14 @@ export interface RunMentionDeps {
    * Absent: questions are still registered and answerable, just not announced.
    */
   readonly createQuestionOnRegistered?: (context: QuestionTransportContext) => (request: QuestionAskedRequest) => void
+  /**
+   * Builds the per-run hook that announces a newly registered approval on the run's operator stream (open frame
+   * plus the settle renderer), the approval analog of `createQuestionOnRegistered`. Used only when the run raises
+   * its approvals through the Discord transport: a launch that supplies its own `createApprovalOnPending` (web)
+   * announces for itself. Runs after the registry holds the entry and before the Discord card is posted. Absent:
+   * a Discord run's approvals still register and are decidable in Discord, just not visible to the dashboard.
+   */
+  readonly createApprovalOnRegistered?: (context: ApprovalAnnounceContext) => (request: PermissionRequest) => void
   /**
    * Gateway approval mode. Propagated from `GatewayConfig.approvalMode`.
    * Currently only `approval-required` is supported.
@@ -1654,6 +1672,8 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
               approvalRegistry,
               replySink,
               threadId,
+              runId,
+              onRegistered: deps.createApprovalOnRegistered?.({approvalRegistry, runId, repo}),
               directory: sessionDirectory,
               approvalDeadlineMs,
               onDeadlineSettled: async () => {
@@ -2025,7 +2045,9 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
         // cancel suppresses the user-facing failure reply entirely (see below) — there
         // is no "final reply" on this path to attach a starting-state line to, and this
         // flush is exactly the agent's pre-cancel partial output, unmodified.
-        await replySink.flush().catch((flushError: unknown) => {
+        // `suppressEmptyNotice`: the cancellation notice already told the thread the run ended, so a
+        // run cancelled with nothing streamed must not follow it with a `_(no output)_` placeholder.
+        await replySink.flush({suppressEmptyNotice: true}).catch((flushError: unknown) => {
           logger.warn({repo, runId, err: String(flushError)}, 'run: sink.flush failed in cancel path')
         })
 
@@ -2793,8 +2815,8 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
     append: (text: string) => {
       realReplySink?.append(text)
     },
-    flush: async () => {
-      if (realReplySink !== null) return realReplySink.flush()
+    flush: async options => {
+      if (realReplySink !== null) return realReplySink.flush(options)
       return undefined
     },
     buffered: () => realReplySink?.buffered() ?? '',
@@ -2850,7 +2872,7 @@ export async function runMention(message: Message, binding: RepoBinding, deps: R
         return sendMessage(rawThread, options, logger)
       },
       append: (text: string) => streamSink.append(text),
-      flush: async () => streamSink.flush(),
+      flush: async options => streamSink.flush(options),
       buffered: () => streamSink.buffered(),
       hasVisibleOutput: () => streamSink.hasVisibleOutput(),
       markVisibleOutputSent: () => streamSink.markVisibleOutputSent(),

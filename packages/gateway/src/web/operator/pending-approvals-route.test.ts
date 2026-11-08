@@ -63,7 +63,7 @@ function makeBindingsLookup(
 
 function makeRegistry(approvals: readonly PendingApprovalDTO[] = []): PendingApprovalsRouteDeps['registry'] {
   return {
-    describePendingForScope: vi.fn((_scopeId: string) => approvals),
+    describePendingForRun: vi.fn((_scopeId: string) => approvals),
   }
 }
 
@@ -214,7 +214,7 @@ describe('GET pending-approvals — NO-ORACLE DENIAL (load-bearing)', () => {
     expect(response.status).toBe(404)
     const body = (await response.json()) as {error: string}
     expect(body.error).toBe('not-found')
-    expect(vi.mocked(registry.describePendingForScope)).not.toHaveBeenCalled()
+    expect(vi.mocked(registry.describePendingForRun)).not.toHaveBeenCalled()
   })
 
   it('unbound repo → 404 no-oracle denial', async () => {
@@ -486,17 +486,17 @@ describe('GET pending-approvals — multiple concurrent open requests (R14)', ()
 })
 
 // ---------------------------------------------------------------------------
-// LOAD-BEARING TEST 8: describePendingForScope is called with the server-side runId
+// LOAD-BEARING TEST 8: describePendingForRun is called with the server-side runId
 // ---------------------------------------------------------------------------
 
 describe('GET pending-approvals — registry called with server-side runId', () => {
-  it('describePendingForScope is called with the runId from the URL (server-resolved)', async () => {
+  it('describePendingForRun is called with the runId from the URL (server-resolved)', async () => {
     const registry = makeRegistry([])
     const deps = makeDeps({registry})
     const app = buildApp(deps)
 
     await getApprovals(app, 'run-server-id-xyz')
 
-    expect(vi.mocked(registry.describePendingForScope)).toHaveBeenCalledWith('run-server-id-xyz')
+    expect(vi.mocked(registry.describePendingForRun)).toHaveBeenCalledWith('run-server-id-xyz')
   })
 })

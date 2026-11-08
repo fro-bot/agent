@@ -523,6 +523,15 @@ The image's `ENTRYPOINT` runs `tini` as pid 1; the workspace-agent service is it
 
 Both images build on `node:<ver>-alpine3.24@sha256:…`, and the base image is digest-pinned. Alpine packages installed with `apk add` are not pinned: they float within the base image's Alpine branch (3.24), because that branch's index drops older versions and exact pins would break the build. Rebuilding the same ref can therefore pick up newer packages, so the package layer is not byte-reproducible. A deployed image digest is immutable. To move to a new Alpine minor, change the base tag's `-alpine3.X` suffix and digest together.
 
+#### Package managers in the images
+
+Neither runtime image keeps the npm, yarn and corepack that the `node:alpine` base bundles. npm's own dependency tree carries advisories that repository overrides can't reach (#2117).
+
+- **Gateway:** no package manager. The build fails if any of them survives.
+- **Workspace:** agent tasks (uid 10001) get **Bun** (`bun`, `bunx`), which is the binary the `build-deps` stage verified, and **npm 12** (`npm`, `npx`) at the exact `NPM_VERSION` build arg, which Renovate tracks.
+
+Both tools reach `registry.npmjs.org` through the existing egress allowlist.
+
 #### Reuse guard (baked plugin + managed config)
 
 Gateway runs reject any `task` tool call that carries a non-empty `task_id` before the task executes (see [Background Subagents and Ownership](../docs/wiki/Background%20Subagents%20and%20Ownership.md#background-subagent-ownership-ledger-gateway) for why). On a V1 (harness) workspace image the guard is two root-owned, read-only files. A V2 image replaces both: its managed config (`deploy/managed-config/opencode-v2.json`) only disables self-update, and the guard is the `task` reuse check in the `@fro.bot/opencode-plugin` the image installs (see [OpenCode V2](#opencode-v2)). The rest of this section describes the V1 files:

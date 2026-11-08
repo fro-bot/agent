@@ -2324,7 +2324,7 @@ function makeStubRunIndex(): NonNullable<OperatorServerDeps['runIndex']> {
 function makeStubApprovalRegistry(): NonNullable<OperatorServerDeps['approvalRegistry']> {
   return {
     handleDecision: async () => 'not-found' as const,
-    describePendingForScope: () => [],
+    describePendingForRun: () => [],
     hasPendingForScope: () => false,
   }
 }
