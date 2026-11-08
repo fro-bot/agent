@@ -26,6 +26,7 @@ import {toErrorMessage} from '../../shared/errors.js'
 import {readThread} from '../comments/reader.js'
 import {postComment} from '../comments/writer.js'
 import {checkForkOrSelfGuard, submitReviewWithHeadGuard} from '../reviews/review-guards.js'
+import {resolveReviewedHeadSha} from '../reviews/reviewed-head.js'
 import {resolveResponseSurface} from './response-file.js'
 
 /**
@@ -577,6 +578,20 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
       ? withMarker(appendDeliveryFooter(qualifyForKnownExecutionVeto(parsed.body), deliveryFooter))
       : body
 
+  // The head the agent was handed, captured before execution. Fail closed when it is unknown:
+  // substituting the PR head fetched now would re-introduce the bug this pin exists to prevent
+  // (a push during the run silently re-attributing the review to a commit the agent never saw).
+  // Like a moved head, an unattestable review is dropped, not degraded to a comment.
+  const reviewedHeadSha = resolveReviewedHeadSha(agentContext, triggerResult.context)
+  if (reviewedHeadSha == null) {
+    logger.warning('Response-post: no reviewed head SHA available, refusing to submit review', {
+      prNumber: target.number,
+      surface,
+      eventType: triggerResult.context.eventType,
+    })
+    return failure('review-guard-blocked', 'Review guard blocked submission: no-reviewed-head')
+  }
+
   const guard = await checkForkOrSelfGuard(
     {octokit, owner: target.owner, repo: target.repo, prNumber: target.number, botLogin, event: reviewEvent},
     logger,
@@ -618,7 +633,7 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
         prNumber: target.number,
         event: reviewEvent,
         body: reviewSubmitBody,
-        currentHeadSha: guard.currentHeadSha,
+        reviewedHeadSha,
         ...(reviewDeliveryReceiptOps == null
           ? {}
           : {

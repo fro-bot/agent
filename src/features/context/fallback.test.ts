@@ -210,7 +210,7 @@ describe('fallbackPullRequestContext', () => {
               created_at: '2024-01-01T00:00:00Z',
               user: {login: 'contributor'},
               base: {ref: 'main', repo: {owner: {login: 'owner'}}},
-              head: {ref: 'feature', repo: {owner: {login: 'owner'}}},
+              head: {ref: 'feature', sha: 'fallback-head-sha', repo: {owner: {login: 'owner'}}},
               labels: [],
               assignees: [],
               author_association: 'COLLABORATOR',
@@ -240,6 +240,7 @@ describe('fallbackPullRequestContext', () => {
     expect(result?.number).toBe(456)
     expect(result?.baseBranch).toBe('main')
     expect(result?.headBranch).toBe('feature')
+    expect(result?.headSha).toBe('fallback-head-sha')
     expect(result?.isFork).toBe(false)
     expect(result?.commits).toHaveLength(1)
     expect(result?.files).toHaveLength(1)

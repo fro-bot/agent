@@ -80,6 +80,8 @@ export interface TriggerTarget {
   readonly diffHunk?: string
   /** Commit ID for review comments (pull_request_review_comment only) */
   readonly commitId?: string
+  /** Head commit SHA from the `pull_request` event payload (pull_request only) */
+  readonly headSha?: string
 }
 
 /**

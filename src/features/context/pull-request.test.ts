@@ -25,6 +25,7 @@ describe('hydratePullRequestContext', () => {
           author: {login: 'contributor'},
           baseRefName: 'main',
           headRefName: 'feature-branch',
+          headRefOid: '0123456789abcdef0123456789abcdef01234567',
           baseRepository: {owner: {login: 'owner'}},
           headRepository: {owner: {login: 'owner'}},
           labels: {nodes: [{name: 'enhancement', color: '00ff00'}]},
@@ -91,6 +92,7 @@ describe('hydratePullRequestContext', () => {
     expect(result?.title).toBe('Add new feature')
     expect(result?.baseBranch).toBe('main')
     expect(result?.headBranch).toBe('feature-branch')
+    expect(result?.headSha).toBe('0123456789abcdef0123456789abcdef01234567')
     expect(result?.isFork).toBe(false)
     expect(result?.comments).toHaveLength(1)
     expect(result?.comments[0]?.id).toBe('comment-1')

@@ -137,6 +137,7 @@ export function normalizeEvent(eventType: EventType, payload: unknown): Normaliz
           body: p.pull_request.body ?? null,
           locked: p.pull_request.locked ?? false,
           draft: p.pull_request.draft ?? false,
+          headSha: p.pull_request.head.sha,
           authorAssociation: p.pull_request.author_association ?? 'NONE',
           requestedReviewers,
           labels,
