@@ -243,6 +243,7 @@ async function askAndDecideOnBothSurfaces(frame: object) {
     approvalRegistry: discordRegistry,
     replySink,
     threadId: 'thread_1',
+    runId: RUN_ID,
     directory: '/workspace/o/r',
     approvalDeadlineMs: 60_000,
     onDeadlineSettled: undefined,

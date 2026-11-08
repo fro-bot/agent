@@ -47,6 +47,7 @@ vi.mock('./approvals/registry.js', () => ({
     autoApprove: vi.fn().mockResolvedValue('not-found'),
     attachMessage: vi.fn(),
     markMessagePostFailed: vi.fn(),
+    rejectUndeliverable: vi.fn().mockResolvedValue('rejected'),
     confirmReply: vi.fn(),
     disposeRun: vi.fn(),
     disposeAll: vi.fn().mockResolvedValue(undefined),
@@ -1080,11 +1081,13 @@ describe('button interaction handler (approval flow)', () => {
       pending: vi.fn().mockReturnValue([]),
       hasPendingForScope: vi.fn().mockReturnValue(false),
       describePendingForScope: vi.fn().mockReturnValue([]),
+      describePendingForRun: vi.fn().mockReturnValue([]),
       handleDecision: vi.fn().mockResolvedValue('ok'),
       applySettlement: vi.fn().mockResolvedValue(undefined),
       autoApprove: vi.fn().mockResolvedValue('not-found'),
       attachMessage: vi.fn(),
       markMessagePostFailed: vi.fn(),
+      rejectUndeliverable: vi.fn().mockResolvedValue('rejected'),
       confirmReply: vi.fn(),
       disposeRun: vi.fn(),
       disposeAll: vi.fn().mockResolvedValue(undefined),
@@ -2446,11 +2449,13 @@ describe('launch route wiring — POST /operator/runs', () => {
       pending: vi.fn().mockReturnValue([]),
       hasPendingForScope: vi.fn().mockReturnValue(false),
       describePendingForScope: vi.fn().mockReturnValue([]),
+      describePendingForRun: vi.fn().mockReturnValue([]),
       handleDecision: vi.fn().mockResolvedValue('ok'),
       applySettlement: vi.fn().mockResolvedValue(undefined),
       autoApprove: vi.fn().mockResolvedValue('not-found'),
       attachMessage: vi.fn(),
       markMessagePostFailed: vi.fn(),
+      rejectUndeliverable: vi.fn().mockResolvedValue('rejected'),
       confirmReply: vi.fn(),
       disposeRun: vi.fn(),
       disposeAll: vi.fn().mockResolvedValue(undefined),
@@ -2653,6 +2658,45 @@ describe('launch route wiring — POST /operator/runs', () => {
     // #then the SSE open frame is emitted and nothing is posted to Discord
     expect(frames.filter(frame => frame.type === 'question')).toHaveLength(1)
     expect(send).not.toHaveBeenCalled()
+  })
+
+  it("announces a Discord-launched run's registered approvals on its SSE stream (open, then settled)", async () => {
+    // #given the run deps' approval hook and a subscriber on a Discord-launched run's stream
+    const serverDeps = await captureOperatorServerDeps()
+    const runDeps = serverDeps.launchWorkDeps
+    const manager = serverDeps.runObservationManager
+    if (runDeps?.createApprovalOnRegistered === undefined || manager === undefined) {
+      throw new Error('expected the approval wiring on the run deps')
+    }
+    const frames: import('./web/sse/manager.js').ObservationFrame[] = []
+    manager.subscribe('run-discord-1', {
+      onEvent: frame => {
+        frames.push(frame)
+      },
+      onClose: () => undefined,
+    })
+    const attachMessage = vi.fn()
+    const approvalRegistry = {attachMessage} as unknown as import('./approvals/registry.js').ApprovalRegistry
+
+    // #when the Discord transport has registered a request and the hook announces it
+    runDeps.createApprovalOnRegistered({approvalRegistry, runId: 'run-discord-1', repo: 'acme/widget'})({
+      requestID: 'per_d1',
+      sessionID: 'sess-1',
+      permission: 'bash',
+      patterns: [],
+      title: 'Run command: ls',
+      command: 'ls',
+    })
+    const render = attachMessage.mock.calls[0]?.[1] as (...args: unknown[]) => Promise<void>
+    await render({}, 'reject', null, 'disposed')
+    await new Promise<void>(resolve => {
+      setTimeout(resolve, 0)
+    })
+
+    // #then the stream saw the open frame, then the settle frame
+    const approvalFrames = frames.filter(frame => frame.type === 'approval')
+    expect(approvalFrames.map(frame => frame.data.settled)).toEqual([false, true])
+    expect(approvalFrames[0]).toMatchObject({runId: 'run-discord-1', data: {requestID: 'per_d1', command: 'ls'}})
   })
 
   /**

@@ -16,6 +16,13 @@
  * and swallowed. The registration already happened and the deadline still
  * settles fail-closed.
  *
+ * ### two halves
+ *
+ * {@link createWebApprovalOnRegistered} is the announce half: it attaches the settle renderer and emits the open
+ * frame for a request some transport has ALREADY registered. A Discord-launched run uses it alone (the Discord
+ * transport registers), so the run's SSE subscribers see its approvals like a web run's.
+ * {@link createWebApprovalOnPending} is register + announce, for web-launched runs.
+ *
  * ### no visible-output claim
  *
  * The approval frame is a UI event, not agent output. This transport does NOT
@@ -24,7 +31,7 @@
  */
 
 import type {PermissionReply, PermissionRequest, SettlementReason} from '../../approvals/coordinator.js'
-import type {ApprovalActor} from '../../approvals/registry.js'
+import type {ApprovalActor, ApprovalRegistry} from '../../approvals/registry.js'
 import type {ApprovalTransportContext, LaunchWorkRequest} from '../../execute/launch-types.js'
 import type {ApprovalFrameData} from '../../operator-contract/approval-frame.js'
 import type {OperatorLogger} from '../server.js'
@@ -34,6 +41,16 @@ import {boundApprovalDetail} from '../../approvals/approval-detail.js'
 // ---------------------------------------------------------------------------
 // Deps
 // ---------------------------------------------------------------------------
+
+/** Per-run context of the announce half. */
+export interface WebApprovalAnnounceContext {
+  /** Program-scoped registry; the announcer attaches its settle renderer here. */
+  readonly approvalRegistry: Pick<ApprovalRegistry, 'attachMessage'>
+  /** Stable UUID for this run; the SSE fan-out key. */
+  readonly runId: string
+  /** `owner/repo` for logging and correlation. */
+  readonly repo: string
+}
 
 export interface WebApprovalTransportDeps {
   /**
@@ -49,58 +66,29 @@ export interface WebApprovalTransportDeps {
 }
 
 // ---------------------------------------------------------------------------
-// createWebApprovalOnPending
+// createWebApprovalOnRegistered
 // ---------------------------------------------------------------------------
 
 /**
- * Factory for the web approval transport.
+ * Factory for the announce half of the web approval transport.
  *
- * Returns a `createApprovalOnPending` function suitable for
- * `LaunchWorkRequest.createApprovalOnPending`. When the engine calls this
- * factory with the `ApprovalTransportContext`, it returns an `onPending`
- * callback that:
+ * Returns, per run, a hook to call AFTER the request is registered in the registry. It:
  *
- * 1. Registers the request in the approval registry with
- *    `approvalScopeId = ctx.runId` (register-before-fan-out).
- * 2. Calls `observeApproval(ctx.runId, boundDetail)` to fan out the SSE
- *    approval frame, applying `boundApprovalDetail` to command/filepath.
- *
- * The fan-out is fail-soft: if `observeApproval` throws, the error is logged
- * at warn and swallowed. The registration already happened and the deadline
- * still settles fail-closed.
+ * 1. Attaches a settle renderer FIRST, so the `settled: true` frame is emitted on every settlement path
+ *    (decision echo, deadline, cascade, supersede, teardown) even if the open frame below was dropped or the
+ *    other transport's card never posted. Fail-soft: a throw is logged and swallowed (the settlement happened).
+ * 2. Emits the open frame with `command` / `filepath` bounded by `boundApprovalDetail`. Fail-soft likewise.
  */
-export function createWebApprovalOnPending(
+export function createWebApprovalOnRegistered(
   deps: WebApprovalTransportDeps,
-): NonNullable<LaunchWorkRequest['createApprovalOnPending']> {
+): (ctx: WebApprovalAnnounceContext) => (request: PermissionRequest) => void {
   const {observeApproval, logger} = deps
 
-  return (ctx: ApprovalTransportContext): ((request: PermissionRequest) => void) => {
+  return (ctx: WebApprovalAnnounceContext): ((request: PermissionRequest) => void) => {
     return (req: PermissionRequest): void => {
-      const {requestID, sessionID} = req
+      const {requestID} = req
 
-      // Per-request postReply closure — captures sessionID for the SDK call.
-      const postReplyForRequest = ctx.postReplyFactory(sessionID)
-
-      // register-before-fan-out: register the entry in the shared registry
-      // BEFORE emitting the SSE frame. This ensures a decision can settle
-      // even if the SSE send is dropped.
-      ctx.approvalRegistry.register({
-        requestID,
-        sessionID,
-        approvalScopeId: ctx.runId,
-        directory: ctx.directory,
-        request: req,
-        effects: {postReply: postReplyForRequest},
-        deadlineMs: ctx.approvalDeadlineMs,
-      })
-
-      // Attach the settle/clear render function so the registry calls it on
-      // EVERY settlement path (confirmReply, settleByDeadline, failCloseNow,
-      // cascadeReject, applySettlement, disposeRun). The renderFn emits the
-      // settled:true SSE frame so the browser dismisses the approval prompt.
-      //
-      // Fail-soft: errors are logged at warn and swallowed — the settlement
-      // itself already happened; the frame is advisory.
+      // The renderer is attached before the open frame. It runs on EVERY settlement path.
       ctx.approvalRegistry.attachMessage(
         requestID,
         async (
@@ -113,11 +101,7 @@ export function createWebApprovalOnPending(
             observeApproval(ctx.runId, {requestID, settled: true})
           } catch (error: unknown) {
             logger.warn(
-              {
-                runId: ctx.runId,
-                requestID,
-                err: toErrorMessage(error),
-              },
+              {runId: ctx.runId, requestID, err: toErrorMessage(error)},
               'web-approval: renderFn settle-frame threw (fail-soft; settlement already applied)',
             )
           }
@@ -145,15 +129,58 @@ export function createWebApprovalOnPending(
         observeApproval(ctx.runId, frameData)
       } catch (error: unknown) {
         logger.warn(
-          {
-            runId: ctx.runId,
-            repo: ctx.repo,
-            requestID,
-            err: toErrorMessage(error),
-          },
+          {runId: ctx.runId, repo: ctx.repo, requestID, err: toErrorMessage(error)},
           'web-approval: observeApproval threw (fail-soft; registry entry registered, deadline will settle)',
         )
       }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// createWebApprovalOnPending
+// ---------------------------------------------------------------------------
+
+/**
+ * Factory for the web approval transport.
+ *
+ * Returns a `createApprovalOnPending` function suitable for
+ * `LaunchWorkRequest.createApprovalOnPending`. When the engine calls this
+ * factory with the `ApprovalTransportContext`, it returns an `onPending`
+ * callback that:
+ *
+ * 1. Registers the request in the approval registry with
+ *    `approvalScopeId = ctx.runId` and `runId = ctx.runId` (register-before-fan-out).
+ * 2. Announces it (see {@link createWebApprovalOnRegistered}).
+ */
+export function createWebApprovalOnPending(
+  deps: WebApprovalTransportDeps,
+): NonNullable<LaunchWorkRequest['createApprovalOnPending']> {
+  const announce = createWebApprovalOnRegistered(deps)
+
+  return (ctx: ApprovalTransportContext): ((request: PermissionRequest) => void) => {
+    const announceForRun = announce(ctx)
+    return (req: PermissionRequest): void => {
+      const {requestID, sessionID} = req
+
+      // Per-request postReply closure — captures sessionID for the SDK call.
+      const postReplyForRequest = ctx.postReplyFactory(sessionID)
+
+      // register-before-fan-out: register the entry in the shared registry
+      // BEFORE emitting the SSE frame. This ensures a decision can settle
+      // even if the SSE send is dropped.
+      ctx.approvalRegistry.register({
+        requestID,
+        sessionID,
+        approvalScopeId: ctx.runId,
+        runId: ctx.runId,
+        directory: ctx.directory,
+        request: req,
+        effects: {postReply: postReplyForRequest},
+        deadlineMs: ctx.approvalDeadlineMs,
+      })
+
+      announceForRun(req)
     }
   }
 }

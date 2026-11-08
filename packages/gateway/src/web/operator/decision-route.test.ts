@@ -270,6 +270,17 @@ describe('POST decision — SCOPE BINDING (load-bearing)', () => {
     )
   })
 
+  it('handleDecision binds the decision to the URL run (runId), so a Discord-run approval is reachable', async () => {
+    const registry = makeRegistry('ok')
+    const app = buildApp(makeDeps({registry}))
+
+    await postDecision(app, 'run-server-id', 'req-123')
+
+    expect(vi.mocked(registry.handleDecision)).toHaveBeenCalledWith(
+      expect.objectContaining({runId: 'run-server-id', requestID: 'req-123'}),
+    )
+  })
+
   it('handleDecision is called with the typed WebOperatorActor (R9)', async () => {
     const registry = makeRegistry('ok')
     const deps = makeDeps({registry})

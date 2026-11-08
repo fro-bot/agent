@@ -102,13 +102,15 @@ function makeReplySink(
 
 function makeApprovalRegistry(overrides: Partial<ApprovalRegistry> = {}): ApprovalRegistry {
   return {
-    register: vi.fn(),
+    register: vi.fn(() => Symbol('registration')),
     attachMessage: vi.fn(),
     markMessagePostFailed: vi.fn(),
+    rejectUndeliverable: vi.fn().mockResolvedValue('rejected'),
     has: vi.fn().mockReturnValue(true),
     pending: vi.fn().mockReturnValue([]),
     hasPendingForScope: vi.fn().mockReturnValue(true),
     describePendingForScope: vi.fn().mockReturnValue([]),
+    describePendingForRun: vi.fn().mockReturnValue([]),
     handleDecision: vi.fn(),
     confirmReply: vi.fn(),
     applySettlement: vi.fn().mockResolvedValue(undefined),
@@ -124,12 +126,15 @@ function makeDeps(
     readonly logger?: GatewayLogger
     readonly approvalRegistry?: ApprovalRegistry
     readonly replySink?: ReplySink & {readonly sentCalls: SentCall[]}
+    readonly onRegistered?: (request: PermissionRequest) => void
   } = {},
 ): DiscordApprovalTransportDeps & {readonly replySink: ReplySink & {readonly sentCalls: SentCall[]}} {
   return {
     approvalRegistry: overrides.approvalRegistry ?? makeApprovalRegistry(),
     replySink: overrides.replySink ?? makeReplySink(),
     threadId: 'thread_1',
+    runId: 'run_1',
+    onRegistered: overrides.onRegistered,
     directory: '/workspace/proj',
     approvalDeadlineMs: undefined,
     onDeadlineSettled: undefined,
@@ -170,8 +175,108 @@ describe('createDiscordApprovalOnPending — happy path', () => {
     })
 
     // #then the request was never auto-rejected or marked post-failed
-    expect(approvalRegistry.applySettlement).not.toHaveBeenCalled()
+    expect(approvalRegistry.rejectUndeliverable).not.toHaveBeenCalled()
     expect(approvalRegistry.markMessagePostFailed).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Run identity and the announce hook (#2115)
+// ---------------------------------------------------------------------------
+
+describe('createDiscordApprovalOnPending — card renderer attaches at registration', () => {
+  it('attaches the settle renderer synchronously, before the embed send resolves', () => {
+    // #given an embed send that never resolves
+    const approvalRegistry = makeApprovalRegistry()
+    const replySink = makeReplySink()
+    vi.mocked(replySink.send).mockImplementation(async () => new Promise(() => undefined))
+
+    // #when a request is raised
+    createDiscordApprovalOnPending(makeDeps({approvalRegistry, replySink}))(makeRequest())
+
+    // #then a decision that lands now still finds the card's renderer
+    expect(approvalRegistry.attachMessage).toHaveBeenCalledExactlyOnceWith('per_1', expect.any(Function))
+  })
+
+  it('attaches after the operator-stream announce, so the dashboard frame never waits on a Discord edit', () => {
+    // #given
+    const order: string[] = []
+    const approvalRegistry = makeApprovalRegistry({
+      attachMessage: vi.fn(() => {
+        order.push('attach-card')
+      }),
+    })
+
+    // #when
+    createDiscordApprovalOnPending(
+      makeDeps({
+        approvalRegistry,
+        onRegistered: () => {
+          order.push('announce')
+        },
+      }),
+    )(makeRequest())
+
+    // #then
+    expect(order).toEqual(['announce', 'attach-card'])
+  })
+})
+
+describe('createDiscordApprovalOnPending — run identity', () => {
+  it('registers the request under the thread id AND the run that raised it', () => {
+    // #given
+    const approvalRegistry = makeApprovalRegistry()
+
+    // #when
+    createDiscordApprovalOnPending(makeDeps({approvalRegistry}))(makeRequest())
+
+    // #then the thread id still scopes the Discord button; the run id lets the dashboard reach the request
+    expect(approvalRegistry.register).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({approvalScopeId: 'thread_1', runId: 'run_1'}),
+    )
+  })
+
+  it('announces the request once registered, before any Discord post', () => {
+    // #given
+    const order: string[] = []
+    const approvalRegistry = makeApprovalRegistry({
+      register: vi.fn(() => {
+        order.push('register')
+        return Symbol('registration')
+      }),
+    })
+    const replySink = makeReplySink()
+    vi.mocked(replySink.send).mockImplementation(async () => {
+      order.push('send')
+      return {success: true, data: {id: 'm'}}
+    })
+    const onRegistered = vi.fn(() => {
+      order.push('announce')
+    })
+
+    // #when
+    createDiscordApprovalOnPending(makeDeps({approvalRegistry, replySink, onRegistered}))(makeRequest())
+
+    // #then the dashboard frame never races ahead of the registry entry, and never waits for Discord
+    expect(onRegistered).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({requestID: 'per_1'}))
+    expect(order.slice(0, 3)).toEqual(['register', 'announce', 'send'])
+  })
+
+  it('an announce hook that throws neither escapes nor stops the Discord card', async () => {
+    // #given
+    const logger = makeLogger()
+    const replySink = makeReplySink()
+    const onRegistered = vi.fn(() => {
+      throw new Error('observer down')
+    })
+    const deps = makeDeps({replySink, onRegistered, logger})
+
+    // #when / #then
+    expect(() => createDiscordApprovalOnPending(deps)(makeRequest())).not.toThrow()
+    await vi.waitFor(() => {
+      expect(replySink.sentCalls.some(call => call.options.embeds !== undefined)).toBe(true)
+    })
+    expect(logger.warn).toHaveBeenCalled()
   })
 })
 
@@ -196,6 +301,10 @@ async function settleCardAs(actor: ApprovalActor): Promise<string | undefined> {
     reason: 'replied',
   ) => Promise<void>
   await render(request, 'once', actor, 'replied')
+  // The renderer is attached at registration, so it may run before the card posts: the edit lands once it does.
+  await vi.waitFor(() => {
+    expect(edit).toHaveBeenCalledOnce()
+  })
   const edited = edit.mock.calls[0]?.[0] as {embeds: readonly {toJSON: () => {description?: string}}[]}
   return edited.embeds[0]?.toJSON().description
 }
@@ -285,11 +394,9 @@ describe('createDiscordApprovalOnPending — terminal delivery failure', () => {
 
     // #then the permission is auto-rejected on the server
     await vi.waitFor(() => {
-      expect(approvalRegistry.applySettlement).toHaveBeenCalledOnce()
+      expect(approvalRegistry.rejectUndeliverable).toHaveBeenCalledOnce()
     })
-    expect(approvalRegistry.applySettlement).toHaveBeenCalledWith(
-      expect.objectContaining({requestID: request.requestID, decision: 'reject'}),
-    )
+    expect(approvalRegistry.rejectUndeliverable).toHaveBeenCalledWith(request.requestID, expect.any(Symbol))
 
     // #then the entry is also marked post-failed (existing retryable-friendly bookkeeping)
     expect(approvalRegistry.markMessagePostFailed).toHaveBeenCalledWith(request.requestID)
@@ -324,7 +431,7 @@ describe('createDiscordApprovalOnPending — retryable delivery failure', () => 
 
     // #then the permission is proven NOT rejected — the entry stays registered so a
     // human decision (or a later successful retry path) can still settle it.
-    expect(approvalRegistry.applySettlement).not.toHaveBeenCalled()
+    expect(approvalRegistry.rejectUndeliverable).not.toHaveBeenCalled()
   })
 })
 
@@ -333,7 +440,7 @@ describe('createDiscordApprovalOnPending — retryable delivery failure', () => 
 // ---------------------------------------------------------------------------
 
 describe('createDiscordApprovalOnPending — settles exactly once', () => {
-  it('calls applySettlement exactly once when the terminal failure surfaces via the embed .catch() path', async () => {
+  it('asks the registry to reject exactly once when the terminal failure surfaces via the embed .catch() path', async () => {
     // #given a transport whose embed send promise rejects (network-level) with a terminal error
     const approvalRegistry = makeApprovalRegistry()
     const replySink = makeReplySink({embedRejection: makeUnknownChannelError()})
@@ -344,10 +451,10 @@ describe('createDiscordApprovalOnPending — settles exactly once', () => {
     // #when a permission is requested and the embed send rejects terminally
     onPending(request)
 
-    // #then applySettlement is called exactly once — not double-settled between
+    // #then the registry is asked exactly once — not double-settled between
     // markMessagePostFailed's bookkeeping and the auto-reject.
     await vi.waitFor(() => {
-      expect(approvalRegistry.applySettlement).toHaveBeenCalledOnce()
+      expect(approvalRegistry.rejectUndeliverable).toHaveBeenCalledOnce()
     })
     expect(approvalRegistry.markMessagePostFailed).toHaveBeenCalledOnce()
   })
@@ -370,7 +477,7 @@ describe('createDiscordApprovalOnPending — operator-visible auto-reject', () =
     // #when a permission is requested and the embed post fails terminally
     onPending(request)
     await vi.waitFor(() => {
-      expect(approvalRegistry.applySettlement).toHaveBeenCalledOnce()
+      expect(approvalRegistry.rejectUndeliverable).toHaveBeenCalledOnce()
     })
 
     // #then a distinct error-level log line names the undeliverable-notification cause —
@@ -389,5 +496,33 @@ describe('createDiscordApprovalOnPending — operator-visible auto-reject', () =
       )
       expect(notifyCall).toBeDefined()
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Scenario 6: the registry decides whether a delivery failure may reject
+// ---------------------------------------------------------------------------
+
+describe('createDiscordApprovalOnPending — delivery failure of a request that is no longer open', () => {
+  it('posts no denial notice and logs no auto-reject when the registry skips it (claimed, settled, or replaced)', async () => {
+    // #given a terminal failure for a request the registry will not reject
+    const approvalRegistry = makeApprovalRegistry({rejectUndeliverable: vi.fn().mockResolvedValue('skipped')})
+    const logger = makeLogger()
+    const replySink = makeReplySink({embedResult: {success: false, error: makeUnknownChannelError()}})
+    const request = makeRequest()
+
+    // #when
+    createDiscordApprovalOnPending(makeDeps({approvalRegistry, replySink, logger}))(request)
+    await vi.waitFor(() => {
+      expect(approvalRegistry.rejectUndeliverable).toHaveBeenCalledOnce()
+    })
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // #then nothing is announced as denied, and the registry was asked about this registration only
+    expect(replySink.sentCalls.some(call => call.options.content?.includes('automatically denied') === true)).toBe(
+      false,
+    )
+    expect(logger.error).not.toHaveBeenCalled()
+    expect(approvalRegistry.rejectUndeliverable).toHaveBeenCalledWith(request.requestID, expect.any(Symbol))
   })
 })

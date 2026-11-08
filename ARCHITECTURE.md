@@ -328,7 +328,7 @@ Idle evidence in `pollForSessionCompletionObservation` (`src/features/agent/sess
 
 ### Approval Denial on Undeliverable Discord Notification
 
-`createDiscordApprovalOnPending` (`packages/gateway/src/approvals/discord-transport.ts`) posts the approval embed. A TERMINAL Discord failure (`UnknownChannel` / `MissingAccess`, matched on `DiscordAPIError.code`, never message text) makes `handleUndeliverable` deny server-side via `approvalRegistry.applySettlement`, rather than wait out the budget. Retryable failures leave the entry open. The denial is deliberately visible: logged at `error` with a distinct thread note.
+`createDiscordApprovalOnPending` (`packages/gateway/src/approvals/discord-transport.ts`) posts the approval embed. A TERMINAL Discord failure (`UnknownChannel` / `MissingAccess`, matched on `DiscordAPIError.code`, never message text) makes `handleUndeliverable` deny server-side via `approvalRegistry.rejectUndeliverable`, rather than wait out the budget. The registry rejects only if the entry is still the same registration and still `open`; a request whose operator decision is already in flight (`claimed`), already settled, or replaced by a re-ask is left to settle on its own path and no denial is announced. Retryable failures leave the entry open. The denial is deliberately visible: logged at `error` with a distinct thread note.
 
 > See also: [Operator Web Control Surface](docs/wiki/Operator%20Web%20Control%20Surface.md#approval-denial-on-undeliverable-discord-notification)
 

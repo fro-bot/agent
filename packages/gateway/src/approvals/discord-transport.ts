@@ -37,7 +37,7 @@ import type {SettledDecider} from '../discord/approvals.js'
 import type {GatewayLogger} from '../discord/client.js'
 import type {PostReplyFactory, ReplySink} from '../execute/launch-types.js'
 import type {PermissionReply, PermissionRequest, SettlementReason} from './coordinator.js'
-import type {ApprovalActor, ApprovalRegistry} from './registry.js'
+import type {ApprovalActor, ApprovalRegistry, RegistrationId} from './registry.js'
 
 import {toErrorMessage} from '@fro-bot/runtime'
 import {DiscordAPIError, RESTJSONErrorCodes} from 'discord.js'
@@ -74,6 +74,17 @@ export interface DiscordApprovalTransportDeps {
    * the interaction came from the correct thread/channel.
    */
   readonly threadId: string
+  /**
+   * The run that raised the request. Stored on the registry entry (alongside the thread scope) so the operator
+   * routes reach a Discord-run approval by run id, which is all a dashboard operator holds.
+   */
+  readonly runId: string
+  /**
+   * Called once per request, right after it is registered and before anything is posted to Discord: announces the
+   * request to the run's operator-stream subscribers (open frame + settle renderer). Optional; fail-soft: a throw
+   * is logged and never stops the Discord card.
+   */
+  readonly onRegistered?: ((request: PermissionRequest) => void) | undefined
   /** Workspace directory for reply routing (passed to registry.register). */
   readonly directory: string
   /** Per-approval deadline in ms (passed to registry.register). */
@@ -89,6 +100,35 @@ export interface DiscordApprovalTransportDeps {
    */
   readonly postReplyFactory: PostReplyFactory
   readonly logger: GatewayLogger
+}
+
+// ---------------------------------------------------------------------------
+// Per-registration card state
+// ---------------------------------------------------------------------------
+
+/** What a settlement told the renderer: enough to draw the settled card. */
+interface CardOutcome {
+  readonly permReq: PermissionRequest
+  readonly decision: PermissionReply
+  readonly actor: ApprovalActor | null
+  readonly reason: SettlementReason
+}
+
+/**
+ * The card of one registered request. Created per `onPending` call and captured by that call's renderer and send
+ * continuations only, so it cannot be reached by a later request that reuses the id, and it is garbage once those
+ * finish. `pendingEdit` is the only retained outcome: held while the post is in flight, cleared when the card is
+ * edited or the post fails.
+ */
+interface CardState {
+  /** The registration this card belongs to; the only one a delivery failure of this card may reject. */
+  readonly registration: RegistrationId
+  /** The post failed for good: there will be no card, so a later settlement has nothing to retain an edit for. */
+  dead: boolean
+  message: Message | undefined
+  /** The registration has settled by some path (decision, deadline, teardown, supersede). */
+  settled: boolean
+  pendingEdit: CardOutcome | undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -144,7 +184,11 @@ export function isTerminalDeliveryFailure(error: unknown): boolean {
  * 2. Registers the entry in the approval registry (register-before-send).
  * 3. Posts a "Waiting for tool approval…" status message (fire-and-forget).
  * 4. Posts the approval embed + buttons (fire-and-forget).
- * 5. Attaches the settled-embed render function on success.
+ * 5. Edits the card to its settled state; the renderer is attached at registration so a settlement that lands while
+ *    the post is in flight is applied when the card posts.
+ *
+ * Between 2 and 3 it announces the request to the run's operator stream (`onRegistered`), so a dashboard sees a
+ * Discord run's approvals like a web run's.
  *
  * Must not throw — the coordinator wraps it defensively.
  *
@@ -157,6 +201,8 @@ export function createDiscordApprovalOnPending(
     approvalRegistry,
     replySink,
     threadId,
+    runId,
+    onRegistered,
     directory,
     approvalDeadlineMs,
     onDeadlineSettled,
@@ -170,44 +216,90 @@ export function createDiscordApprovalOnPending(
    * entry stays `open` (via `markMessagePostFailed`) so a later settlement
    * can still POST the reply once a human decides.
    *
-   * For a terminal failure: rejects the permission on the server via
-   * `applySettlement` (which also settles/deletes the registry entry —
-   * exactly once, since the entry is deleted inside `applySettlement` and a
-   * second call for the same `requestID` is a no-op), and posts a best-effort
-   * operator-visible note to the run's thread — the run's output channel this
-   * transport already uses — worded distinctly from a human denial or a
-   * deadline timeout so a pattern of delivery failures is diagnosable rather
-   * than reading as arbitrary refusals.
+   * For a terminal failure: asks the registry to reject the permission, retire the entry, and report back
+   * (`rejectUndeliverable`). The registry does so only if the entry is still THIS registration and still `open`,
+   * checked and claimed in one synchronous step. If an operator decision is already in flight (`claimed`) the entry
+   * is left alone, because that approval may still succeed and run the tool: it settles through its own path, and
+   * nothing is announced as denied. The operator-visible note (worded distinctly from a human denial or a deadline
+   * timeout, so a pattern of delivery failures is diagnosable) is posted only when the registry did reject.
    */
-  function handleUndeliverable(requestID: string, error: unknown): void {
+  function handleUndeliverable(requestID: string, registration: RegistrationId, error: unknown): void {
     if (!isTerminalDeliveryFailure(error)) return
 
     const code = error instanceof DiscordAPIError ? error.code : undefined
-    logger.error(
-      {requestID, code, err: toErrorMessage(error)},
-      'discord-transport: approval notification undeliverable (terminal Discord error) — auto-rejecting on the server',
-    )
 
     // eslint-disable-next-line no-void
     void approvalRegistry
-      .applySettlement({requestID, decision: 'reject', reason: 'disposed'})
+      .rejectUndeliverable(requestID, registration)
+      .then(outcome => {
+        if (outcome === 'skipped') {
+          logger.warn(
+            {requestID, code},
+            'discord-transport: approval notification undeliverable, but the request is already decided or in flight — left to settle',
+          )
+          return
+        }
+        logger.error(
+          {requestID, code, err: toErrorMessage(error)},
+          'discord-transport: approval notification undeliverable (terminal Discord error) — auto-rejected on the server',
+        )
+        // Best-effort operator-visible note. If the thread itself is gone this send will also fail — that
+        // failure is swallowed here; the logger.error above is the durable signal that always reaches an operator.
+        // eslint-disable-next-line no-void
+        void replySink
+          .send('thread', {
+            content:
+              'A tool approval could not be delivered and was automatically denied (Discord notification failed to send).',
+          })
+          .catch(() => {})
+      })
       .catch((settleError: unknown) => {
         logger.error(
           {requestID, err: toErrorMessage(settleError)},
-          'discord-transport: applySettlement threw while auto-rejecting an undeliverable approval',
+          'discord-transport: rejectUndeliverable threw while auto-rejecting an undeliverable approval',
         )
       })
+  }
 
-    // Best-effort operator-visible note. If the thread itself is gone this
-    // send will also fail — that failure is swallowed here; the logger.error
-    // above is the durable signal that always reaches an operator.
-    // eslint-disable-next-line no-void
-    void replySink
-      .send('thread', {
-        content:
-          'A tool approval could not be delivered and was automatically denied (Discord notification failed to send).',
-      })
-      .catch(() => {})
+  /** Edit a posted card to the settled state, with the decider's origin. Best-effort: a failed edit is logged. */
+  async function settleCard(message: Message, outcome: CardOutcome): Promise<void> {
+    const {permReq, decision, actor, reason} = outcome
+    // Pass the actor's origin through so the embed mentions a Discord user but shows a
+    // web operator's GitHub login as plain text (Discord cannot resolve it as a mention).
+    const decidedBy: SettledDecider | undefined =
+      actor === null || actor.kind === 'run-grant'
+        ? undefined
+        : actor.kind === 'discord-user'
+          ? {kind: 'discord-user', userId: actor.userId}
+          : {kind: 'web', login: actor.login}
+    const editResult = await editMessage(
+      message,
+      {embeds: [buildSettledEmbed(permReq, decision, {decidedBy, reason})], components: []},
+      logger,
+    )
+    if (editResult.success === false) {
+      logger.warn(
+        {requestID: permReq.requestID, err: editResult.error.message},
+        'discord-transport: failed to edit approval message',
+      )
+    }
+  }
+
+  /**
+   * The embed post failed. A card whose request already settled (a decision, deadline, teardown, or a re-ask landed
+   * while the post was in flight) has nothing left to deliver or reject: its retained outcome is dropped, and the
+   * registry is NOT touched, because by id it may now hold a successor request that this stale failure must not
+   * mark failed or auto-reject. Otherwise the existing handling applies.
+   */
+  function cardPostFailed(card: CardState, requestID: string, error: unknown): void {
+    card.pendingEdit = undefined
+    card.dead = true
+    if (card.settled) {
+      logger.debug({requestID}, 'discord-transport: card post failed after the request settled — nothing to do')
+      return
+    }
+    approvalRegistry.markMessagePostFailed(requestID)
+    handleUndeliverable(requestID, card.registration, error)
   }
 
   return function onPending(req: PermissionRequest): void {
@@ -230,10 +322,11 @@ export function createDiscordApprovalOnPending(
     // approvalScopeId: use threadId (set by threadFactory after thread creation).
     // For non-Discord paths (in-memory sinks), threadId is '' — the registry
     // still works; the approvalScopeId is only used for button-handler lookup.
-    approvalRegistry.register({
+    const registration = approvalRegistry.register({
       requestID,
       sessionID,
       approvalScopeId: threadId,
+      runId,
       directory,
       request: req,
       effects: {postReply: postReplyForRequest},
@@ -241,6 +334,47 @@ export function createDiscordApprovalOnPending(
       onDeadlineSettled,
       rejectOnly,
     })
+
+    // Announce to the run's operator stream. After register (a decision can settle even if the frame is dropped)
+    // and before the card is posted: the settle renderer it attaches does not depend on the card ever posting.
+    if (onRegistered !== undefined) {
+      try {
+        onRegistered(req)
+      } catch (error: unknown) {
+        logger.warn(
+          {requestID, err: toErrorMessage(error)},
+          'discord-transport: operator-stream announce threw (fail-soft; registered, the Discord card still posts)',
+        )
+      }
+    }
+
+    // The card's settle renderer attaches HERE, at registration, not after the send resolves. A decision can land
+    // while the embed send is still in flight (the dashboard sees the request as soon as it is announced above), and
+    // a renderer attached later would find the entry settled and gone, leaving an active-looking card that never
+    // shows the decision. Attached now, it records the outcome and the card is edited once it exists. It belongs to
+    // this registration only: a request that re-asks the same id gets its own card state, so neither card can be
+    // edited for the other's outcome. It runs after the announce renderer, so the dashboard frame never waits on
+    // a Discord edit.
+    const card: CardState = {registration, dead: false, message: undefined, settled: false, pendingEdit: undefined}
+    approvalRegistry.attachMessage(
+      requestID,
+      async (
+        permReq: PermissionRequest,
+        decision: PermissionReply,
+        actor: ApprovalActor | null,
+        reason: SettlementReason,
+      ) => {
+        card.settled = true
+        const outcome: CardOutcome = {permReq, decision, actor, reason}
+        if (card.message === undefined) {
+          // Card still posting: keep the outcome until it posts. A card that already failed for good will never
+          // post, so there is nothing to keep it for.
+          if (!card.dead) card.pendingEdit = outcome
+          return
+        }
+        await settleCard(card.message, outcome)
+      },
+    )
 
     // Post a visible waiting-for-approval status BEFORE the embed so the
     // user sees the run is blocked even if the embed send is slow.
@@ -301,42 +435,18 @@ export function createDiscordApprovalOnPending(
           // flush() does not add a misleading _(no output)_.
           settleEmbed(true)
           const postedMessage = r.data
-          if (postedMessage !== undefined) {
-            // Attach the render function now that we have a message reference.
-            // The `result as Message` cast is resolved here — inside the Discord
-            // transport where it's a clean Discord concern.
-            approvalRegistry.attachMessage(
-              requestID,
-              async (
-                permReq: PermissionRequest,
-                decision: PermissionReply,
-                actor: ApprovalActor | null,
-                reason: SettlementReason,
-              ) => {
-                // Pass the actor's origin through so the embed mentions a Discord user but shows a
-                // web operator's GitHub login as plain text (Discord cannot resolve it as a mention).
-                const decidedBy: SettledDecider | undefined =
-                  actor === null || actor.kind === 'run-grant'
-                    ? undefined
-                    : actor.kind === 'discord-user'
-                      ? {kind: 'discord-user', userId: actor.userId}
-                      : {kind: 'web', login: actor.login}
-                const editResult = await editMessage(
-                  postedMessage,
-                  {
-                    embeds: [buildSettledEmbed(permReq, decision, {decidedBy, reason})],
-                    components: [],
-                  },
-                  logger,
-                )
-                if (editResult.success === false) {
-                  logger.warn(
-                    {requestID: permReq.requestID, err: editResult.error.message},
-                    'discord-transport: failed to edit approval message',
-                  )
-                }
-              },
-            )
+          if (postedMessage === undefined) {
+            card.pendingEdit = undefined
+          } else {
+            // The card exists now: the renderer attached at registration can edit it. If the request already
+            // settled while the post was in flight, edit it to that outcome now, exactly once, and drop it.
+            card.message = postedMessage
+            const late = card.pendingEdit
+            card.pendingEdit = undefined
+            if (late !== undefined) {
+              // eslint-disable-next-line no-void
+              void settleCard(postedMessage, late)
+            }
           }
         } else {
           settleEmbed(false)
@@ -345,8 +455,7 @@ export function createDiscordApprovalOnPending(
             {requestID, err: failureError?.message ?? 'unknown'},
             'discord-transport: failed to post approval embed',
           )
-          approvalRegistry.markMessagePostFailed(requestID)
-          handleUndeliverable(requestID, failureError)
+          cardPostFailed(card, requestID, failureError)
         }
       })
       .catch((error: unknown) => {
@@ -358,8 +467,7 @@ export function createDiscordApprovalOnPending(
           {requestID, err: toErrorMessage(error)},
           'discord-transport: approval embed send rejected unexpectedly',
         )
-        approvalRegistry.markMessagePostFailed(requestID)
-        handleUndeliverable(requestID, error)
+        cardPostFailed(card, requestID, error)
       })
   }
 }
