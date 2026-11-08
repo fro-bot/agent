@@ -32,7 +32,8 @@ import * as runCoreModule from './run-core-shared.js'
 const CANCEL_RUN_ID = 'cancel-run-id-1'
 
 // Drives the REAL Discord stream sink (over a fake thread) behind a ReplySink, because the in-memory sink
-// never posts the `_(no output)_` placeholder (#2116).
+// never posts the `_(no output)_` placeholder (#2116). `send('thread', ...)` (the failure reply) lands on the same
+// fake thread so message order is observable (#2119).
 async function makeRealStreamReplySink(): Promise<{
   readonly replySink: ReplySink
   readonly threadSend: ReturnType<typeof vi.fn>
@@ -42,7 +43,10 @@ async function makeRealStreamReplySink(): Promise<{
   const threadSend = vi.fn().mockResolvedValue(undefined)
   const stream = createDiscordStreamSink({send: threadSend})
   const replySink: ReplySink = {
-    send: vi.fn().mockResolvedValue({success: true, data: undefined}),
+    send: vi.fn().mockImplementation(async (_target: unknown, payload: {readonly content?: string}) => {
+      await threadSend({content: payload.content})
+      return {success: true, data: undefined}
+    }),
     append: text => stream.append(text),
     flush: async options => stream.flush(options),
     buffered: () => stream.buffered(),
@@ -72,6 +76,22 @@ async function runCancelled(runId: string, bufferedText: string): Promise<Return
   const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
   expect(transitionPhases).toContain('CANCELLED')
   abortRegistry.delete(runId)
+  return threadSend
+}
+
+async function runFailed(runId: string, bufferedText: string): Promise<ReturnType<typeof vi.fn>> {
+  const {launchWork} = await import('./run.js')
+  setupHappyPath()
+  mockRunOpenCodeCore.mockRejectedValue(new runCoreModule.RunCoreError('timeout', 'wall-clock limit reached'))
+  const {replySink, threadSend} = await makeRealStreamReplySink()
+  if (bufferedText !== '') replySink.append(bufferedText)
+  const request = makeInMemoryRequest({replySink})
+  ;(request as {runId?: string}).runId = runId
+  await awaitLaunchWorkRun(launchWork, request, makeDeps())
+
+  const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
+  expect(transitionPhases).toContain('FAILED')
+  expect(transitionPhases).not.toContain('CANCELLED')
   return threadSend
 }
 
@@ -1096,25 +1116,78 @@ describe('operator cancel — abort-registry integration', () => {
       // #then
       expect(sentContents(threadSend)).toEqual(['partial output streamed before cancel'])
     })
+  })
 
-    it('non-cancelled failure with an empty buffer still posts _(no output)_', async () => {
-      // #given — a run that fails (not cancelled) having streamed nothing. A COMPLETED run cannot
-      // exercise this at engine level: its provenance line is appended to the buffer before flush.
+  describe("#2119 — empty-output placeholder before a failed run's reply", () => {
+    it('failed run with an empty buffer posts only the failure reply (no _(no output)_)', async () => {
+      // #given/#when
+      const threadSend = await runFailed('fail-empty-run-id-1', '')
+
+      // #then
+      const sent = sentContents(threadSend)
+      expect(sent).toHaveLength(1)
+      expect(sent[0]).toContain('time limit')
+      expect(sent).not.toContain('_(no output)_')
+    })
+
+    it('failed run with a whitespace-only buffer posts only the failure reply', async () => {
+      // #given/#when
+      const threadSend = await runFailed('fail-whitespace-run-id-1', '  \n\t ')
+
+      // #then
+      const sent = sentContents(threadSend)
+      expect(sent).toHaveLength(1)
+      expect(sent[0]).toContain('time limit')
+      expect(sent).not.toContain('_(no output)_')
+    })
+
+    it('failed run with partial output flushes it, then posts the failure reply', async () => {
+      // #given/#when
+      const threadSend = await runFailed('fail-partial-run-id-1', 'partial output streamed before failure')
+
+      // #then
+      const sent = sentContents(threadSend)
+      expect(sent).toHaveLength(2)
+      expect(sent[0]).toBe('partial output streamed before failure')
+      expect(sent[1]).toContain('time limit')
+      expect(sent[1]).toContain('after posting updates above')
+    })
+
+    it('empty failed run uses the no-visible-output wording, not "after posting updates above"', async () => {
+      // #given/#when
+      const threadSend = await runFailed('fail-wording-run-id-1', '')
+
+      // #then
+      const sent = sentContents(threadSend)
+      expect(sent).toHaveLength(1)
+      expect(sent[0]).toContain('time limit. Please try again.')
+      expect(sent[0]).not.toContain('after posting updates above')
+    })
+
+    it('operator cancel landing during the FAILED write posts nothing (no placeholder, no failure reply)', async () => {
+      // #given — the run fails, and a cancel lands while the FAILED transition is being written
+      const CANCEL_DURING_FAILED_RUN_ID = 'fail-cancel-during-write-run-id-1'
       const {launchWork} = await import('./run.js')
       setupHappyPath()
-      mockRunOpenCodeCore.mockRejectedValue(new runCoreModule.RunCoreError('stream-ended', 'stream closed'))
+      mockRunOpenCodeCore.mockRejectedValue(new runCoreModule.RunCoreError('timeout', 'wall-clock limit reached'))
+      mockRuntime.transitionRun.mockImplementation(
+        async (_config: unknown, _identity: unknown, _repo: unknown, _runId: unknown, phase: unknown) => {
+          if (phase === 'FAILED') abortRegistry.abort(CANCEL_DURING_FAILED_RUN_ID, 'operator cancel')
+          return {success: true as const, data: {etag: 'run-etag-v2', state: buildMockRunState()}}
+        },
+      )
       const {replySink, threadSend} = await makeRealStreamReplySink()
       const request = makeInMemoryRequest({replySink})
-      ;(request as {runId?: string}).runId = 'fail-empty-run-id-1'
+      ;(request as {runId?: string}).runId = CANCEL_DURING_FAILED_RUN_ID
 
       // #when
       await awaitLaunchWorkRun(launchWork, request, makeDeps())
 
-      // #then — settled FAILED (not CANCELLED) and the placeholder is unchanged
+      // #then
       const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
       expect(transitionPhases).toContain('FAILED')
-      expect(transitionPhases).not.toContain('CANCELLED')
-      expect(sentContents(threadSend)).toEqual(['_(no output)_'])
+      expect(sentContents(threadSend)).toEqual([])
+      abortRegistry.delete(CANCEL_DURING_FAILED_RUN_ID)
     })
   })
 
