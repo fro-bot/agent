@@ -1610,6 +1610,44 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
   }
 
   // ---------------------------------------------------------------------------
+  // Subscribe-time replay of open questions and approvals
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Queue the run's open question frames, then its open approval frames, for a new subscriber, spending at most
+   * half the subscriber queue cap in total. Each frame is bounded alone, but eight maximum-size approvals escape to
+   * more than the whole default queue, and subscribe queues the replay synchronously behind a snapshot write that is
+   * still in flight: queued past the cap, the subscriber would be dropped, the replay discarded, and every reconnect
+   * would repeat it. So replay goes in order until the next frame would not fit, and the rest are skipped (logged
+   * with counts only, never request text). A skipped request is not lost: it is still open in its registry, the
+   * dashboard's listing fetch on connect recovers it, and its settle frame still reaches the live stream.
+   */
+  function replayOpenRequests(sub: SubscriberState, runId: string): void {
+    const frames: ObservationFrame[] = [
+      ...(openQuestionFrames.get(runId)?.values() ?? []),
+      ...(openApprovalFrames.get(runId)?.values() ?? []),
+    ]
+    const budget = Math.floor(subscriberQueueCapBytes / 2)
+    let spent = 0
+    let replayed = 0
+    for (const frame of frames) {
+      const bytes = estimateFrameBytes(frame)
+      if (spent + bytes > budget) {
+        break
+      }
+      spent += bytes
+      replayed++
+      enqueueFrame(sub, frame)
+    }
+    if (replayed < frames.length) {
+      logger.debug(
+        {runId, replayed, skipped: frames.length - replayed, budgetBytes: budget},
+        'manager: subscribe replay budget reached — skipped open requests are recovered by the listing fallback',
+      )
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Durable cache-miss resolution
   // ---------------------------------------------------------------------------
 
@@ -1777,23 +1815,10 @@ export function createRunObservationManager(deps: RunObservationManagerDeps): Ru
       enqueueFrame(sub, snapshotFrame)
     }
 
-    // Reconnect reconciliation: deliver every still-open question after the
-    // status snapshot so the browser can re-render the prompt. Settled
-    // questions were removed from the set when they settled.
-    const openQuestions = openQuestionFrames.get(runId)
-    if (openQuestions !== undefined) {
-      for (const questionFrame of openQuestions.values()) {
-        enqueueFrame(sub, questionFrame)
-      }
-    }
-
-    // Reconnect reconciliation, as for questions: every still-open approval, after the status snapshot.
-    const openApprovals = openApprovalFrames.get(runId)
-    if (openApprovals !== undefined) {
-      for (const approvalFrame of openApprovals.values()) {
-        enqueueFrame(sub, approvalFrame)
-      }
-    }
+    // Reconnect reconciliation: after the status snapshot, re-deliver the run's still-open questions and then its
+    // still-open approvals, within one byte budget (see replayOpenRequests). Settled requests were removed from the
+    // sets when they settled.
+    replayOpenRequests(sub, runId)
 
     // Deliver the cached final output frame (if any) after the status snapshot.
     // This ensures a late subscriber (connecting after the run's final output frame

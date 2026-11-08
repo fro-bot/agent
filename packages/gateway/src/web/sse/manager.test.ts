@@ -35,6 +35,7 @@ import {PHASE_TO_WEB_STATUS} from '../../operator-contract/run-status.js'
 import {projectRunStatusWithKey} from '../../redaction/surface-gate.js'
 import {
   createRunObservationManager,
+  DEFAULT_SUBSCRIBER_QUEUE_CAP_BYTES,
   MAX_OPEN_APPROVAL_REPLAY_PER_RUN,
   MAX_OPEN_QUESTION_REPLAY_PER_RUN,
 } from './manager.js'
@@ -3214,6 +3215,178 @@ describe('observeApproval — reconnect reconciliation', () => {
 
     // #then
     expect(frames.filter(f => f.type === 'approval')).toHaveLength(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Subscribe replay is budgeted: replaying open questions and approvals must never overflow the subscriber queue
+// ---------------------------------------------------------------------------
+
+/** A subscriber whose consumer is held on the first write, as a slow network client is, then released. */
+function slowSubscriber(manager: RunObservationManager, runId: string) {
+  const frames: ObservationFrame[] = []
+  const closes: string[] = []
+  let release: () => void = () => undefined
+  const gate = new Promise<void>(resolve => {
+    release = resolve
+  })
+  manager.subscribe(runId, {
+    onEvent: async frame => {
+      await gate
+      frames.push(frame)
+    },
+    onClose: reason => {
+      closes.push(reason)
+    },
+  })
+  return {frames, closes, release}
+}
+
+async function settleSubscriber(release: () => void): Promise<void> {
+  release()
+  await drain()
+  await drain()
+}
+
+describe('subscribe replay budget', () => {
+  /** Backslashes double when JSON-escaped, so a maximum-size (4096-char) detail costs about 8 KiB on the wire. */
+  const escapedApproval = (requestID: string) =>
+    ({requestID, permission: 'bash', command: '\\'.repeat(4096), settled: false}) as const
+  const bigQuestion = (requestID: string, chars: number): QuestionFrameData => ({
+    requestID,
+    runId: 'run-001',
+    questions: [{header: 'Pick', text: 'x'.repeat(chars), options: [], multiple: false, custom: true}],
+    settled: false,
+  })
+
+  it('eight maximum-size escaped approvals do not drop the subscriber; replay stops at the budget', async () => {
+    // #given eight open approvals whose escaped frames together exceed the default 64 KiB queue
+    const debug = vi.fn()
+    const {manager} = makeManager(async () => makeOperatorRunStatus(), {
+      logger: {info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug},
+    })
+    await manager.observe(makeRunState({phase: 'EXECUTING'}))
+    for (let i = 0; i < MAX_OPEN_APPROVAL_REPLAY_PER_RUN; i++) {
+      manager.observeApproval('run-001', escapedApproval(`req-${i}`))
+    }
+    expect(
+      JSON.stringify({type: 'approval', runId: 'run-001', data: escapedApproval('req-0')}).length * 8,
+    ).toBeGreaterThan(DEFAULT_SUBSCRIBER_QUEUE_CAP_BYTES)
+
+    // #when a slow operator reconnects
+    const sub = slowSubscriber(manager, 'run-001')
+    await settleSubscriber(sub.release)
+
+    // #then it stays connected, and the replay holds only what fits well inside the queue
+    expect(sub.closes).toEqual([])
+    const replayed = sub.frames.filter(f => f.type === 'approval')
+    expect(replayed.length).toBeGreaterThan(0)
+    expect(replayed.length).toBeLessThan(MAX_OPEN_APPROVAL_REPLAY_PER_RUN)
+    const replayedBytes = replayed.reduce((sum, f) => sum + JSON.stringify(f).length, 0)
+    expect(replayedBytes).toBeLessThanOrEqual(DEFAULT_SUBSCRIBER_QUEUE_CAP_BYTES / 2)
+    // #and the oldest are the ones kept, in order, and the skip is logged without request text
+    expect(replayed.map(f => (f.type === 'approval' ? f.data.requestID : ''))).toEqual(
+      Array.from({length: replayed.length}, (_, i) => `req-${i}`),
+    )
+    expect(debug).toHaveBeenCalledWith(
+      expect.objectContaining({runId: 'run-001', skipped: MAX_OPEN_APPROVAL_REPLAY_PER_RUN - replayed.length}),
+      expect.stringContaining('replay'),
+    )
+
+    manager.shutdown()
+  })
+
+  it('the same reconnect repeated never loops: every attempt stays connected', async () => {
+    // #given
+    const {manager} = makeManager(async () => makeOperatorRunStatus())
+    await manager.observe(makeRunState({phase: 'EXECUTING'}))
+    for (let i = 0; i < MAX_OPEN_APPROVAL_REPLAY_PER_RUN; i++) {
+      manager.observeApproval('run-001', escapedApproval(`req-${i}`))
+    }
+
+    // #when the operator reconnects three times
+    const attempts = [1, 2, 3].map(() => slowSubscriber(manager, 'run-001'))
+    for (const attempt of attempts) await settleSubscriber(attempt.release)
+
+    // #then none was dropped, and each got the same replay
+    expect(attempts.map(a => a.closes)).toEqual([[], [], []])
+    const counts = attempts.map(a => a.frames.filter(f => f.type === 'approval').length)
+    expect(new Set(counts).size).toBe(1)
+
+    manager.shutdown()
+  })
+
+  it('replays every open question and approval when together they fit the budget', async () => {
+    // #given two questions and three small approvals
+    const {manager} = makeManager(async () => makeOperatorRunStatus())
+    await manager.observe(makeRunState({phase: 'EXECUTING'}))
+    manager.observeQuestion('run-001', openQuestion('q-1'))
+    manager.observeQuestion('run-001', openQuestion('q-2'))
+    for (const id of ['req-1', 'req-2', 'req-3']) {
+      manager.observeApproval('run-001', {requestID: id, permission: 'bash', command: 'ls', settled: false})
+    }
+
+    // #when
+    const sub = slowSubscriber(manager, 'run-001')
+    await settleSubscriber(sub.release)
+
+    // #then all five, after the status snapshot, questions first
+    expect(sub.closes).toEqual([])
+    expect(sub.frames.map(f => f.type)).toEqual(['status', 'question', 'question', 'approval', 'approval', 'approval'])
+
+    manager.shutdown()
+  })
+
+  it('shares one budget between questions and approvals: big questions leave less room for approvals', async () => {
+    // #given questions that use most of the budget, and several approvals after them
+    const debug = vi.fn()
+    const {manager} = makeManager(async () => makeOperatorRunStatus(), {
+      logger: {info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug},
+    })
+    await manager.observe(makeRunState({phase: 'EXECUTING'}))
+    manager.observeQuestion('run-001', bigQuestion('q-1', 12_000))
+    manager.observeQuestion('run-001', bigQuestion('q-2', 12_000))
+    for (let i = 0; i < 4; i++) {
+      manager.observeApproval('run-001', escapedApproval(`req-${i}`))
+    }
+
+    // #when
+    const sub = slowSubscriber(manager, 'run-001')
+    await settleSubscriber(sub.release)
+
+    // #then both questions fit, the approvals are cut to what is left, and the subscriber stays connected
+    expect(sub.closes).toEqual([])
+    expect(sub.frames.filter(f => f.type === 'question')).toHaveLength(2)
+    const replayedBytes = sub.frames
+      .filter(f => f.type === 'question' || f.type === 'approval')
+      .reduce((sum, f) => sum + JSON.stringify(f).length, 0)
+    expect(replayedBytes).toBeLessThanOrEqual(DEFAULT_SUBSCRIBER_QUEUE_CAP_BYTES / 2)
+    expect(sub.frames.filter(f => f.type === 'approval').length).toBeLessThan(4)
+    expect(debug).toHaveBeenCalledWith(expect.objectContaining({runId: 'run-001'}), expect.stringContaining('replay'))
+
+    manager.shutdown()
+  })
+
+  it('a skipped approval is still live: a later settle frame and the listing fallback are unaffected', async () => {
+    // #given an approval left out of a reconnect's replay
+    const {manager} = makeManager(async () => makeOperatorRunStatus())
+    await manager.observe(makeRunState({phase: 'EXECUTING'}))
+    for (let i = 0; i < MAX_OPEN_APPROVAL_REPLAY_PER_RUN; i++) {
+      manager.observeApproval('run-001', escapedApproval(`req-${i}`))
+    }
+    const sub = slowSubscriber(manager, 'run-001')
+    await settleSubscriber(sub.release)
+
+    // #when it settles live
+    const before = sub.frames.length
+    manager.observeApproval('run-001', {requestID: `req-${MAX_OPEN_APPROVAL_REPLAY_PER_RUN - 1}`, settled: true})
+    await drain()
+
+    // #then the settle frame still reaches the subscriber
+    expect(sub.frames.length).toBe(before + 1)
+    expect(sub.closes).toEqual([])
+
+    manager.shutdown()
   })
 })
 
