@@ -76,6 +76,7 @@ function inputs(overrides: Partial<ActionInputs> = {}): ActionInputs {
     responseMode: 'github',
     reviewSkipLabel: null,
     brokeredPushExtraPaths: [],
+    repoSkills: false,
     storeConfig: {enabled: false, bucket: '', region: '', prefix: 'fro-bot-state'},
     ...overrides,
   }
@@ -159,6 +160,21 @@ describe('runCacheRestore on OpenCode V2', () => {
     // the password is registered for masking through the Actions runner
     ;(call.maskSecret as (value: string) => void)('pw')
     expect(mocks.setSecret).toHaveBeenCalledWith('pw')
+  })
+
+  it('threads the repo skills source to the V2 start, and passes none when there is none', async () => {
+    // #given a trusted run's staged source
+    mocks.startActionOpenCodeV2.mockResolvedValue({success: true, data: v2Handle().handle})
+    const {runCacheRestore} = await import('./cache-restore.js')
+    const repoSkills = {sourceDir: '/runner/tmp/x/source-tree/.agents/skills', stagingRoot: '/runner/tmp/x'}
+
+    // #when restoring with it, then without it
+    await runCacheRestore(bootstrap(V2_VERSION), createMetricsCollector(), repoSkills)
+    await runCacheRestore(bootstrap(V2_VERSION), createMetricsCollector())
+
+    // #then the V2 start received the source the first time, and null the second
+    expect(mocks.startActionOpenCodeV2.mock.calls[0]?.[0]).toMatchObject({repoSkills})
+    expect(mocks.startActionOpenCodeV2.mock.calls[1]?.[0]).toMatchObject({repoSkills: null})
   })
 
   it.each([

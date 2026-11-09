@@ -107,6 +107,7 @@ function bootstrap(): BootstrapPhaseResult {
       responseMode: 'github',
       reviewSkipLabel: null,
       brokeredPushExtraPaths: [],
+      repoSkills: false,
     },
     logger: mocks.logger,
     opencodeResult: {path: 'opencode', version: '2.2.5', didSetup: false},

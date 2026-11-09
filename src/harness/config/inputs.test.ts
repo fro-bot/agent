@@ -496,6 +496,59 @@ describe('parseActionInputs', () => {
     })
   })
 
+  describe('repo-skills', () => {
+    it('defaults to false when the input is empty', () => {
+      // #given no repo-skills input
+      mockInputs({})
+
+      // #when parsing action inputs
+      const result = parseActionInputs()
+
+      // #then the opt-in is off
+      expect(result.success && result.data.repoSkills).toBe(false)
+    })
+
+    it.each([
+      ['false', false],
+      ['FALSE', false],
+      ['true', true],
+      [' True ', true],
+    ])('parses %j as %s', (value, expected) => {
+      // #given an explicit repo-skills value
+      mockInputs({'repo-skills': value})
+
+      // #when parsing action inputs
+      const result = parseActionInputs()
+
+      // #then it is read case-insensitively and trimmed
+      expect(result.success && result.data.repoSkills).toBe(expected)
+    })
+
+    it.each(['yes', '1', 'on'])('rejects %j instead of guessing', value => {
+      // #given a value that is not true or false
+      mockInputs({'repo-skills': value})
+
+      // #when parsing action inputs
+      const result = parseActionInputs()
+
+      // #then the error names the input and the valid values
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.message).toContain('repo-skills')
+    })
+
+    it('pins the false action metadata default', () => {
+      // #given the committed action metadata
+      const actionYaml = readFileSync(resolve(import.meta.dirname, '../../../action.yaml'), 'utf8')
+
+      // #when locating the repo-skills input block
+      const block = /\n {2}repo-skills:\n([\s\S]*?)(?=\n {2}[\w-]+:\n|\n\S)/.exec(actionYaml)?.[1] ?? ''
+
+      // #then the opt-in is disabled by default
+      expect(block.length).toBeGreaterThan(0)
+      expect(block).toContain("default: 'false'")
+    })
+  })
+
   describe('with invalid inputs', () => {
     it('returns normalized brokered-push extra paths', () => {
       // #given consumer paths supplied through the action input

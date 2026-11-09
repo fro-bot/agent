@@ -74,6 +74,7 @@ function createActionInputs(overrides: Partial<ActionInputs> = {}): ActionInputs
     responseMode: 'github',
     reviewSkipLabel: null,
     brokeredPushExtraPaths: [],
+    repoSkills: false,
     storeConfig: {
       enabled: false,
       bucket: '',

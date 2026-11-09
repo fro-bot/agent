@@ -7,6 +7,7 @@ import {DatabaseSync} from 'node:sqlite'
 import {clearHeldClaims} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi, type Mock} from 'vitest'
 import {pluginCacheDir, resolvePluginSpecsV2} from '../../services/setup/plugin-install-v2.js'
+import {createRepoSkillsStagingRoot} from '../../services/setup/repo-skills.js'
 import {createMockLogger, serializeLoggerCalls, unwrapErr, unwrapOk} from '../../shared/test-helpers.js'
 import {ok} from '../../shared/types.js'
 import {startActionOpenCodeV2} from './v2-server.js'
@@ -90,6 +91,10 @@ function populatePluginCache(cacheHome: string): void {
 function spawnedConfig(deps: Partial<StartActionOpenCodeV2Deps>): {mcp?: unknown} {
   const config = vi.mocked(deps.startServer as StartServer).mock.calls[0]?.[0].config
   return config as {mcp?: unknown}
+}
+
+function spawnedContent(deps: Partial<StartActionOpenCodeV2Deps>): Record<string, unknown> {
+  return vi.mocked(deps.startServer as StartServer).mock.calls[0]?.[0].config as Record<string, unknown>
 }
 
 describe('startActionOpenCodeV2', () => {
@@ -792,6 +797,171 @@ describe('startActionOpenCodeV2', () => {
       expect(check.prepare('SELECT COUNT(*) AS c FROM kv').get()?.c).toBe(1)
       expect(check.prepare('SELECT COUNT(*) AS c FROM session_v2').get()?.c).toBe(2)
       check.close()
+    })
+  })
+
+  describe('repo skills (fro-bot/agent#2129)', () => {
+    const SYSTEMATIC_PACKAGE = '@fro.bot/systematic'
+    let sourceDir: string
+    let stagingRoot: string
+
+    function populateBundledSkills(): string {
+      const version = unwrapOk(resolvePluginSpecsV2('latest')).systematicVersion
+      const skillsDir = path.join(
+        cacheHome,
+        'opencode',
+        'npm',
+        `${SYSTEMATIC_PACKAGE}@${version}`,
+        '1800000000000',
+        'node_modules',
+        SYSTEMATIC_PACKAGE,
+        'skills',
+      )
+      fs.mkdirSync(path.join(skillsDir, 'ce-review'), {recursive: true})
+      fs.writeFileSync(path.join(skillsDir, 'ce-review', 'SKILL.md'), '---\nname: ce:review\n---\nbundled\n')
+      return fs.realpathSync(skillsDir)
+    }
+
+    function writeRepoSkill(id: string, body = 'REPO-SKILL-BODY-CANARY'): void {
+      fs.mkdirSync(path.join(sourceDir, id, 'references'), {recursive: true})
+      fs.writeFileSync(path.join(sourceDir, id, 'SKILL.md'), `---\nname: ${id}\ndescription: d\n---\n${body}\n`)
+      fs.writeFileSync(path.join(sourceDir, id, 'references', 'r.md'), 'ref\n')
+    }
+
+    beforeEach(() => {
+      sourceDir = path.join(root, 'checkout', '.agents', 'skills')
+      fs.mkdirSync(sourceDir, {recursive: true})
+      stagingRoot = unwrapOk(createRepoSkillsStagingRoot(runnerTemp))
+    })
+
+    it('copies admitted skills into the run-scoped directory and names it in skills.paths', async () => {
+      // #given a trusted source with one skill, and the bundled skills installed
+      const bundled = populateBundledSkills()
+      writeRepoSkill('repo-probe')
+      const server = fakeServer()
+      const deps = recordingDeps(server)
+      const logger = createMockLogger()
+
+      // #when starting with repo skills
+      const result = await startActionOpenCodeV2(options({deps, logger, repoSkills: {sourceDir, stagingRoot}}))
+
+      // #then the server is told to scan the copy, and the real permission gate passed with it as an exception
+      expect(result.success).toBe(true)
+      const copy = path.join(stagingRoot, 'skills')
+      const content = spawnedContent(deps)
+      expect(content.skills).toEqual({paths: [copy]})
+      expect(fs.readFileSync(path.join(copy, 'repo-probe', 'references', 'r.md'), 'utf8')).toBe('ref\n')
+      const rules = content.permissions as {action: string; resource: string; effect: string}[]
+      expect(rules).toContainEqual({action: 'external_directory', resource: `${copy}/*`, effect: 'allow'})
+      expect(rules).toContainEqual({action: 'edit', resource: `${copy}/*`, effect: 'deny'})
+      expect(rules).toContainEqual({action: 'external_directory', resource: `${bundled}/*`, effect: 'allow'})
+      // #and it is outside the checkout, under RUNNER_TEMP
+      expect(copy.startsWith(fs.realpathSync(runnerTemp))).toBe(true)
+      // #and one info line reports the count and skipped ids, with no file content
+      const infoLines = vi.mocked(logger.info).mock.calls.filter(call => String(call[0]).includes('Repository skills'))
+      expect(infoLines).toHaveLength(1)
+      expect(infoLines[0]?.[1]).toEqual({admitted: 1, skipped: []})
+      expect(serializeLoggerCalls(logger)).not.toContain('REPO-SKILL-BODY-CANARY')
+    })
+
+    it('skips a colliding skill, loads the rest and reports the skipped id', async () => {
+      // #given a repo skill with a bundled skill's id and a normal one
+      populateBundledSkills()
+      writeRepoSkill('ce-review', 'SHADOW-BODY-CANARY')
+      writeRepoSkill('ok')
+      const deps = recordingDeps(fakeServer())
+      const logger = createMockLogger()
+
+      // #when starting
+      const result = await startActionOpenCodeV2(options({deps, logger, repoSkills: {sourceDir, stagingRoot}}))
+
+      // #then the shadowing skill never reaches the copy
+      expect(result.success).toBe(true)
+      const copy = path.join(stagingRoot, 'skills')
+      expect(fs.readdirSync(copy)).toEqual(['ok'])
+      const infoLine = vi.mocked(logger.info).mock.calls.find(call => String(call[0]).includes('Repository skills'))
+      expect(infoLine?.[1]).toEqual({admitted: 1, skipped: ['ce-review']})
+      expect(serializeLoggerCalls(logger)).not.toContain('SHADOW-BODY-CANARY')
+    })
+
+    it('adds no skills path and no exception when nothing is admitted', async () => {
+      // #given a source whose only skill is refused
+      populateBundledSkills()
+      writeRepoSkill('ce-review')
+      const deps = recordingDeps(fakeServer())
+
+      // #when starting
+      const result = await startActionOpenCodeV2(options({deps, repoSkills: {sourceDir, stagingRoot}}))
+
+      // #then the config is the one a run without repo skills gets
+      expect(result.success).toBe(true)
+      const content = spawnedContent(deps)
+      expect('skills' in content).toBe(false)
+      expect(JSON.stringify(content.permissions)).not.toContain(stagingRoot)
+      expect(fs.existsSync(path.join(stagingRoot, 'skills'))).toBe(false)
+    })
+
+    it('loads no repo skills, and still starts, when the bundled skills directory cannot be found', async () => {
+      // #given no installed Systematic skills (collisions cannot be ruled out)
+      writeRepoSkill('repo-probe')
+      const deps = recordingDeps(fakeServer())
+      const logger = createMockLogger()
+
+      // #when starting
+      const result = await startActionOpenCodeV2(options({deps, logger, repoSkills: {sourceDir, stagingRoot}}))
+
+      // #then the run starts without them and says why
+      expect(result.success).toBe(true)
+      expect('skills' in spawnedContent(deps)).toBe(false)
+      expect(
+        vi
+          .mocked(logger.warning)
+          .mock.calls.map(call => String(call[0]))
+          .join('\n'),
+      ).toContain('Repository skills are not loaded')
+    })
+
+    it('starts with no repo skills, warns without a path and discards the partial staging when admission throws', async () => {
+      // #given an admission that leaves a partial copy and then throws an error whose message holds a path
+      populateBundledSkills()
+      const admitRepoSkills = vi.fn(async () => {
+        fs.mkdirSync(path.join(stagingRoot, 'skills', 'half'), {recursive: true})
+        fs.mkdirSync(path.join(stagingRoot, 'source-tree', '.agents'), {recursive: true})
+        throw Object.assign(new Error('EIO reading /secret/checkout/path'), {code: 'EIO'})
+      })
+      const deps = recordingDeps(fakeServer(), {admitRepoSkills})
+      const logger = createMockLogger()
+
+      // #when starting
+      const result = await startActionOpenCodeV2(options({deps, logger, repoSkills: {sourceDir, stagingRoot}}))
+
+      // #then the run starts as one without the input, and the partial staging is gone
+      expect(result.success).toBe(true)
+      expect(admitRepoSkills).toHaveBeenCalledTimes(1)
+      expect('skills' in spawnedContent(deps)).toBe(false)
+      expect(JSON.stringify(spawnedContent(deps).permissions)).not.toContain(stagingRoot)
+      expect(fs.readdirSync(stagingRoot)).toEqual([])
+      // #and the warning names the code, not the path
+      const logged = serializeLoggerCalls(logger)
+      expect(logged).toContain('admission failed unexpectedly')
+      expect(logged).toContain('EIO')
+      expect(logged).not.toContain('/secret/checkout/path')
+    })
+
+    it('emits nothing skill-related when repoSkills is not given', async () => {
+      // #given bundled skills and a populated checkout, but a run that is not trusted or opted in
+      populateBundledSkills()
+      writeRepoSkill('repo-probe')
+      const deps = recordingDeps(fakeServer())
+
+      // #when starting without repoSkills
+      const result = await startActionOpenCodeV2(options({deps}))
+
+      // #then the checkout's skills are neither copied nor named
+      expect(result.success).toBe(true)
+      const content = spawnedContent(deps)
+      expect('skills' in content).toBe(false)
+      expect(fs.existsSync(path.join(stagingRoot, 'skills'))).toBe(false)
     })
   })
 })
