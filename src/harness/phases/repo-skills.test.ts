@@ -87,7 +87,10 @@ describe('resolveRepoSkillsSource', () => {
     lookupPullRequestHeadRepo = vi.fn<RepoSkillsDeps['lookupPullRequestHeadRepo']>(async () => 'fro-bot/agent')
     lookupDefaultBranch = vi.fn<RepoSkillsDeps['lookupDefaultBranch']>(async () => 'trunk')
     stageDefaultBranchSkills = vi.fn<RepoSkillsDeps['stageDefaultBranchSkills']>(async options =>
-      ok(path.join(options.stagingRoot, 'source-tree', '.agents', 'skills')),
+      ok({
+        sourceDir: path.join(options.stagingRoot, 'source-tree', '.agents', 'skills'),
+        symlinkedSkillIds: ['linked-skill'],
+      }),
     )
     deps = {
       exec: {} as ExecAdapter,
@@ -171,6 +174,8 @@ describe('resolveRepoSkillsSource', () => {
     expect(source?.sourceDir).toBe(path.join(source?.stagingRoot ?? '', 'source-tree', '.agents', 'skills'))
     expect(path.dirname(source?.stagingRoot ?? '')).toBe(runnerTemp)
     expect(source?.sourceDir.startsWith(workspace)).toBe(false)
+    // #and the ids of skills that held a symlink travel with the source, for admission
+    expect(source?.symlinkedSkillIds).toEqual(['linked-skill'])
   })
 
   it('denies a stranger issue before looking anything up or staging anything', async () => {

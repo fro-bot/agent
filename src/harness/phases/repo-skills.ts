@@ -1,6 +1,6 @@
 import type {Result} from '@bfra.me/es/result'
 import type {GitHubContext, Octokit} from '../../services/github/types.js'
-import type {RepoSkillsSource, StageDefaultBranchSkillsOptions} from '../../services/setup/repo-skills.js'
+import type {RepoSkillsSource, StageDefaultBranchSkillsOptions, StagedSkills} from '../../services/setup/repo-skills.js'
 import type {ExecAdapter} from '../../services/setup/types.js'
 import type {Logger} from '../../shared/logger.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
@@ -37,7 +37,7 @@ export interface RepoSkillsDeps {
   readonly lookupDefaultBranch: () => Promise<string | null>
   readonly stageDefaultBranchSkills: (
     options: StageDefaultBranchSkillsOptions,
-  ) => Promise<Result<string | null, string>>
+  ) => Promise<Result<StagedSkills | null, string>>
 }
 
 export interface ResolveRepoSkillsSourceOptions {
@@ -105,14 +105,14 @@ export async function resolveRepoSkillsSource(
       await removeStagingRoot(stagingRoot)
       return null
     }
-    const sourceDir = staged.data
+    const stagedSkills = staged.data
 
-    if (sourceDir === null) {
+    if (stagedSkills === null) {
       logger.info('Repository skills are enabled but the default branch has no .agents/skills')
       await removeStagingRoot(stagingRoot)
       return null
     }
-    return {sourceDir, stagingRoot}
+    return {sourceDir: stagedSkills.sourceDir, symlinkedSkillIds: stagedSkills.symlinkedSkillIds, stagingRoot}
   } catch (error) {
     logger.warning(`Repository skills are not loaded: ${toErrorMessage(error)}`)
     if (stagingRoot !== null) await removeStagingRoot(stagingRoot)

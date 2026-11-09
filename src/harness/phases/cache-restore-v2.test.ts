@@ -166,7 +166,11 @@ describe('runCacheRestore on OpenCode V2', () => {
     // #given a trusted run's staged source
     mocks.startActionOpenCodeV2.mockResolvedValue({success: true, data: v2Handle().handle})
     const {runCacheRestore} = await import('./cache-restore.js')
-    const repoSkills = {sourceDir: '/runner/tmp/x/source-tree/.agents/skills', stagingRoot: '/runner/tmp/x'}
+    const repoSkills = {
+      symlinkedSkillIds: [],
+      sourceDir: '/runner/tmp/x/source-tree/.agents/skills',
+      stagingRoot: '/runner/tmp/x',
+    }
 
     // #when restoring with it, then without it
     await runCacheRestore(bootstrap(V2_VERSION), createMetricsCollector(), repoSkills)

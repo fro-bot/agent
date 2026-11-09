@@ -313,7 +313,7 @@ describe('run on an OpenCode V2 server', () => {
     const {runCacheRestore} = await import('./phases/cache-restore.js')
     const {runRepoSkills} = await import('./phases/repo-skills.js')
     await arrange()
-    const source = {sourceDir: '/tmp/x/source-tree/.agents/skills', stagingRoot: '/tmp/x'}
+    const source = {symlinkedSkillIds: [], sourceDir: '/tmp/x/source-tree/.agents/skills', stagingRoot: '/tmp/x'}
     vi.mocked(runRepoSkills).mockResolvedValue(source)
 
     // #when
@@ -328,6 +328,7 @@ describe('run on an OpenCode V2 server', () => {
 
   describe('repo skills staging cleanup', () => {
     const source = {
+      symlinkedSkillIds: [],
       sourceDir: '/tmp/fro-bot-repo-skills-x/source-tree/.agents/skills',
       stagingRoot: '/tmp/fro-bot-repo-skills-x',
     }

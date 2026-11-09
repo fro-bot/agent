@@ -843,7 +843,9 @@ describe('startActionOpenCodeV2', () => {
       const logger = createMockLogger()
 
       // #when starting with repo skills
-      const result = await startActionOpenCodeV2(options({deps, logger, repoSkills: {sourceDir, stagingRoot}}))
+      const result = await startActionOpenCodeV2(
+        options({deps, logger, repoSkills: {sourceDir, stagingRoot, symlinkedSkillIds: []}}),
+      )
 
       // #then the server is told to scan the copy, and the real permission gate passed with it as an exception
       expect(result.success).toBe(true)
@@ -864,6 +866,26 @@ describe('startActionOpenCodeV2', () => {
       expect(serializeLoggerCalls(logger)).not.toContain('REPO-SKILL-BODY-CANARY')
     })
 
+    it('hands the symlinked skill ids from staging to admission, so a link-holding skill is rejected', async () => {
+      // #given a clean-looking copy of a skill that staging reported as holding a symlink, and a sibling
+      populateBundledSkills()
+      writeRepoSkill('tainted')
+      writeRepoSkill('clean')
+      const deps = recordingDeps(fakeServer())
+      const logger = createMockLogger()
+
+      // #when starting with that report
+      const result = await startActionOpenCodeV2(
+        options({deps, logger, repoSkills: {sourceDir, stagingRoot, symlinkedSkillIds: ['tainted']}}),
+      )
+
+      // #then only the sibling is copied, and the log names the rejected id
+      expect(result.success).toBe(true)
+      expect(fs.readdirSync(path.join(stagingRoot, 'skills'))).toEqual(['clean'])
+      const infoLine = vi.mocked(logger.info).mock.calls.find(call => String(call[0]).includes('Repository skills'))
+      expect(infoLine?.[1]).toEqual({admitted: 1, skipped: ['tainted']})
+    })
+
     it('skips a colliding skill, loads the rest and reports the skipped id', async () => {
       // #given a repo skill with a bundled skill's id and a normal one
       populateBundledSkills()
@@ -873,7 +895,9 @@ describe('startActionOpenCodeV2', () => {
       const logger = createMockLogger()
 
       // #when starting
-      const result = await startActionOpenCodeV2(options({deps, logger, repoSkills: {sourceDir, stagingRoot}}))
+      const result = await startActionOpenCodeV2(
+        options({deps, logger, repoSkills: {sourceDir, stagingRoot, symlinkedSkillIds: []}}),
+      )
 
       // #then the shadowing skill never reaches the copy
       expect(result.success).toBe(true)
@@ -891,7 +915,9 @@ describe('startActionOpenCodeV2', () => {
       const deps = recordingDeps(fakeServer())
 
       // #when starting
-      const result = await startActionOpenCodeV2(options({deps, repoSkills: {sourceDir, stagingRoot}}))
+      const result = await startActionOpenCodeV2(
+        options({deps, repoSkills: {sourceDir, stagingRoot, symlinkedSkillIds: []}}),
+      )
 
       // #then the config is the one a run without repo skills gets
       expect(result.success).toBe(true)
@@ -908,7 +934,9 @@ describe('startActionOpenCodeV2', () => {
       const logger = createMockLogger()
 
       // #when starting
-      const result = await startActionOpenCodeV2(options({deps, logger, repoSkills: {sourceDir, stagingRoot}}))
+      const result = await startActionOpenCodeV2(
+        options({deps, logger, repoSkills: {sourceDir, stagingRoot, symlinkedSkillIds: []}}),
+      )
 
       // #then the run starts without them and says why
       expect(result.success).toBe(true)
@@ -933,7 +961,9 @@ describe('startActionOpenCodeV2', () => {
       const logger = createMockLogger()
 
       // #when starting
-      const result = await startActionOpenCodeV2(options({deps, logger, repoSkills: {sourceDir, stagingRoot}}))
+      const result = await startActionOpenCodeV2(
+        options({deps, logger, repoSkills: {sourceDir, stagingRoot, symlinkedSkillIds: []}}),
+      )
 
       // #then the run starts as one without the input, and the partial staging is gone
       expect(result.success).toBe(true)

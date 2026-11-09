@@ -19,6 +19,7 @@ import {
   REPO_SKILLS_DIRECTORY_NAME,
   safeRelativeSkillPath,
   stageDefaultBranchSkills,
+  type StagedSkills,
 } from './repo-skills.js'
 
 const GIT_ENV = {
@@ -86,8 +87,9 @@ function frame(oid: string, content: Buffer | string, type = 'blob', size?: numb
  * rest succeed. Records the commands and what was sent on stdin.
  */
 function fakeExec(
-  listing: string,
+  listing: Buffer | string,
   catFile: Buffer = Buffer.alloc(0),
+  onCatFile?: () => void,
 ): {exec: ExecAdapter; commands: string[][]; inputs: string[]} {
   const commands: string[][] = []
   const inputs: string[] = []
@@ -98,6 +100,7 @@ function fakeExec(
       commands.push([command, ...(args ?? [])])
       if (args?.includes('ls-tree') === true) options?.listeners?.stdout?.(Buffer.from(listing))
       if (args?.includes('cat-file') === true) {
+        onCatFile?.()
         inputs.push(options?.input?.toString('utf8') ?? '')
         options?.listeners?.stdout?.(catFile)
       }
@@ -107,11 +110,76 @@ function fakeExec(
   return {exec, commands, inputs}
 }
 
+/** Runs everything for real and records what was fed to `cat-file --batch`. */
+function fakeExecOverReal(): {exec: ExecAdapter; inputs: string[]} {
+  const real = createExecAdapter()
+  const inputs: string[] = []
+  const exec: ExecAdapter = {
+    ...real,
+    execWithTimeout: async (command, args, timeoutMs, options) => {
+      if (args?.includes('cat-file') === true) inputs.push(options?.input?.toString('utf8') ?? '')
+      return (real.execWithTimeout as NonNullable<typeof real.execWithTimeout>)(command, args, timeoutMs, options)
+    },
+  }
+  return {exec, inputs}
+}
+
 const OID = 'a'.repeat(40)
 
 /** One `git ls-tree -r -l -z` record under the skills root. */
 const blob = (file: string, size = 1, mode = '100644'): string =>
   `${mode} blob ${'a'.repeat(40)} ${String(size).padStart(7)}\t.agents/skills/${file}\0`
+
+interface RawTreeEntry {
+  readonly mode: string
+  readonly type: 'blob' | 'tree'
+  readonly oid: string
+  /** Raw name bytes: git allows any byte except NUL and `/`. */
+  readonly name: Buffer | string
+}
+
+/** `git hash-object -w`: stores a blob and returns its id. */
+function hashObject(cwd: string, content: Buffer | string): string {
+  return execFileSync('git', ['hash-object', '-w', '--stdin'], {
+    cwd,
+    env: GIT_ENV,
+    input: content,
+    encoding: 'utf8',
+  }).trim()
+}
+
+/** `git mktree -z`: stores a tree whose names may be arbitrary bytes (a filesystem could not hold some of them). */
+function mktree(cwd: string, entries: readonly RawTreeEntry[]): string {
+  const input = Buffer.concat(
+    entries.map(entry =>
+      Buffer.concat([
+        Buffer.from(`${entry.mode} ${entry.type} ${entry.oid}\t`),
+        Buffer.from(entry.name),
+        Buffer.from([0]),
+      ]),
+    ),
+  )
+  return execFileSync('git', ['mktree', '-z'], {cwd, env: GIT_ENV, input, encoding: 'utf8'}).trim()
+}
+
+/** Commits `tree` as the new tip of main. */
+function commitAsMain(cwd: string, tree: string): void {
+  const commit = execFileSync('git', ['commit-tree', tree, '-m', 'raw tree'], {
+    cwd,
+    env: GIT_ENV,
+    encoding: 'utf8',
+  }).trim()
+  git(cwd, 'update-ref', 'refs/heads/main', commit)
+}
+
+/** One `ls-tree -r -l -z` record whose path is raw bytes. */
+function rawRecord(mode: string, type: string, size: string, pathBytes: Buffer | string): Buffer {
+  return Buffer.concat([
+    Buffer.from(`${mode} ${type} ${OID} ${size.padStart(7)}\t`),
+    Buffer.from(pathBytes),
+    Buffer.from([0]),
+  ])
+}
 
 describe('repo-skills', () => {
   let root: string
@@ -232,7 +300,7 @@ describe('repo-skills', () => {
         record('160000', 'commit', '-', '.agents/skills/a/sub')
 
       // #when parsing
-      const entries = unwrapOk(parseTreeListing(stdout))
+      const entries = unwrapOk(parseTreeListing(Buffer.from(stdout)))
 
       // #then each field is read, with a dash size as null
       expect(entries).toEqual([
@@ -248,7 +316,7 @@ describe('repo-skills', () => {
       const stdout = record('100644', 'blob', '2', '.agents/skills/we ird/ta\tb\nc.md')
 
       // #when parsing
-      const entries = unwrapOk(parseTreeListing(stdout))
+      const entries = unwrapOk(parseTreeListing(Buffer.from(stdout)))
 
       // #then the path is whole
       expect(entries[0]?.path).toBe('.agents/skills/we ird/ta\tb\nc.md')
@@ -256,7 +324,7 @@ describe('repo-skills', () => {
 
     it('parses the empty listing as no entries', () => {
       // #given / #when / #then
-      expect(unwrapOk(parseTreeListing(''))).toEqual([])
+      expect(unwrapOk(parseTreeListing(Buffer.alloc(0)))).toEqual([])
     })
 
     it.each([
@@ -269,10 +337,110 @@ describe('repo-skills', () => {
     ])('fails closed on %s', (_label, stdout) => {
       // #given a record git would not write
       // #when parsing
-      const error = unwrapErr(parseTreeListing(stdout))
+      const error = unwrapErr(parseTreeListing(Buffer.from(stdout)))
 
       // #then it is an error, not a partial listing
       expect(error).toContain('listing')
+    })
+  })
+
+  describe('parseTreeListing path integrity', () => {
+    const P = '.agents/skills/'
+    const listing = (...records: Buffer[]): Buffer => Buffer.concat(records)
+    const file = (name: Buffer | string, mode = '100644', type = 'blob'): Buffer =>
+      rawRecord(mode, type, type === 'tree' ? '-' : '1', Buffer.concat([Buffer.from(P), Buffer.from(name)]))
+    const directory = (name: string): Buffer => file(name, '040000', 'tree')
+
+    it.each([
+      ['a lone invalid byte', Buffer.from([0x61, 0xff])],
+      ['a truncated multi-byte sequence', Buffer.from([0x61, 0xc3])],
+      ['an overlong encoding', Buffer.from([0xc0, 0xaf])],
+      ['an encoded surrogate', Buffer.from([0xed, 0xa0, 0x80])],
+      ['a continuation byte alone', Buffer.from([0x80])],
+    ])('refuses the whole listing for %s, naming no path', (_label, name) => {
+      // #given a valid git name that is not valid UTF-8, beside a clean entry
+      // #when parsing the raw -z bytes
+      const error = unwrapErr(parseTreeListing(listing(file('fine.md'), file(Buffer.concat([Buffer.from('x'), name])))))
+
+      // #then it is refused for its encoding, and the message holds no part of the path
+      expect(error).toContain('UTF-8')
+      expect(error).not.toContain('fine')
+      expect(error).not.toContain('x')
+    })
+
+    it('decodes two different invalid names to no string at all instead of one shared replacement character', () => {
+      // #given the reviewer's pair, which a lossy decode would collapse into one name
+      const first = Buffer.concat([Buffer.from('lnk'), Buffer.from([0xfe])])
+      const second = Buffer.concat([Buffer.from('lnk'), Buffer.from([0xff])])
+
+      // #when parsing each
+      // #then both are refused
+      expect(parseTreeListing(listing(file(first))).success).toBe(false)
+      expect(parseTreeListing(listing(file(second))).success).toBe(false)
+    })
+
+    it('accepts valid multi-byte names, including a literal U+FFFD', () => {
+      // #given accented, emoji and replacement-character names, all valid UTF-8
+      const entries = unwrapOk(
+        parseTreeListing(listing(file('caf\u00E9.md'), file('\u{1F680}.md'), file('odd\uFFFD.md'))),
+      )
+
+      // #then they parse to the strings they spell
+      expect(entries.map(entry => entry.path)).toEqual([`${P}caf\u00E9.md`, `${P}\u{1F680}.md`, `${P}odd\uFFFD.md`])
+    })
+
+    it('keeps a leading byte-order mark in a path instead of silently dropping it', () => {
+      // #given a path that begins with U+FEFF (a lenient decoder strips it, merging two names)
+      const entries = unwrapOk(parseTreeListing(listing(rawRecord('100644', 'blob', '1', '\uFEFF.agents/skills/a.md'))))
+
+      // #then the mark is part of the path
+      expect(entries[0]?.path).toBe('\uFEFF.agents/skills/a.md')
+    })
+
+    it('refuses a path listed twice', () => {
+      // #given the same path twice
+      const error = unwrapErr(parseTreeListing(listing(file('a.md'), file('a.md'))))
+
+      // #then
+      expect(error).toContain('duplicate')
+    })
+
+    it.each([
+      ['case', 'Skill.md', 'skill.md'],
+      ['Unicode normalization', 'caf\u00E9.md', 'cafe\u0301.md'],
+    ])('refuses two paths that differ only by %s, which a folding filesystem would merge', (_label, one, two) => {
+      // #given two names one filesystem entry could hold
+      const error = unwrapErr(parseTreeListing(listing(file(one), file(two))))
+
+      // #then
+      expect(error).toContain('duplicate')
+    })
+
+    it.each([
+      ['a blob', '100644', 'blob'],
+      ['a symlink', '120000', 'blob'],
+    ])('refuses %s that is also the directory of another entry', (_label, mode, type) => {
+      // #given `a/b` as a non-tree entry and `a/b/c` beneath it
+      const error = unwrapErr(parseTreeListing(listing(file('a/b', mode, type), file('a/b/c'))))
+
+      // #then
+      expect(error).toContain('directory')
+    })
+
+    it('refuses a non-tree entry that is an ancestor of a deeper one regardless of listing order', () => {
+      // #given the deeper path listed first
+      const error = unwrapErr(parseTreeListing(listing(file('a/b/c'), file('a/b'))))
+
+      // #then
+      expect(error).toContain('directory')
+    })
+
+    it('accepts a tree entry with its children', () => {
+      // #given an ordinary directory and its file
+      // #then
+      expect(
+        parseTreeListing(listing(directory('a'), file('a/b.md'), directory('a/c'), file('a/c/d.md'))).success,
+      ).toBe(true)
     })
   })
 
@@ -487,6 +655,51 @@ describe('repo-skills', () => {
       expect(unwrapOk(result).admitted).toEqual(['repo-probe'])
       expect(fs.readdirSync(staging)).toEqual([REPO_SKILLS_DIRECTORY_NAME])
       expect(fs.readdirSync(path.join(staging, REPO_SKILLS_DIRECTORY_NAME))).toEqual(['repo-probe'])
+    })
+
+    it('rejects exactly the skills named as holding a symlink, even though no link is on disk, and keeps the rest', async () => {
+      // #given two clean-looking skills on disk, one of which staging reported as holding a symlink
+      writeFile(path.join(source, 'tainted', 'SKILL.md'), skillMd('tainted'))
+      writeFile(path.join(source, 'clean', 'SKILL.md'), skillMd('clean'))
+
+      // #when admitting with that report
+      const logger = createMockLogger()
+      const admitted = unwrapOk(
+        await admitRepoSkills({
+          sourceDir: source,
+          stagingRoot: staging,
+          bundledSkillsDirectories: [bundled],
+          symlinkedSkillIds: ['tainted'],
+          logger,
+        }),
+      )
+
+      // #then only the reported one is rejected, with the symlink reason and the usual log
+      expect(admitted.admitted).toEqual(['clean'])
+      expect(admitted.skipped).toEqual([{id: 'tainted', reason: 'symlink'}])
+      expect(fs.existsSync(path.join(staging, 'skills', 'tainted'))).toBe(false)
+      expect(logger.warning).toHaveBeenCalledWith('Skipped a repository skill', {id: 'tainted', reason: 'symlink'})
+    })
+
+    it('reports a symlinked skill that has no directory on disk, with a log-safe id', async () => {
+      // #given a reported id with no directory (the whole skill was a link) and a hostile-looking name
+      writeFile(path.join(source, 'clean', 'SKILL.md'), skillMd('clean'))
+
+      // #when admitting
+      const admitted = unwrapOk(
+        await admitRepoSkills({
+          sourceDir: source,
+          stagingRoot: staging,
+          bundledSkillsDirectories: [bundled],
+          symlinkedSkillIds: ['gone', 'bad\nname'],
+          logger: createMockLogger(),
+        }),
+      )
+
+      // #then each is reported once as a symlink, the newline neutralized
+      expect(admitted.skipped.map(skill => skill.id).toSorted()).toEqual(['bad?name', 'gone'])
+      expect(admitted.skipped.every(skill => skill.reason === 'symlink')).toBe(true)
+      expect(admitted.admitted).toEqual(['clean'])
     })
 
     it('copies a skill with its references and scripts into the run-scoped skills directory', async () => {
@@ -796,6 +1009,10 @@ describe('repo-skills', () => {
       git(workspace, 'commit', '-qm', 'pr')
     }
 
+    async function stageDir(overrides: Partial<Parameters<typeof stageDefaultBranchSkills>[0]> = {}) {
+      return unwrapOk(await stage(overrides))?.sourceDir ?? null
+    }
+
     /** Directories only, for tests where git must not (or cannot) run. */
     function setUpBareDirectories(): void {
       staging = path.join(root, 'staging')
@@ -820,12 +1037,12 @@ describe('repo-skills', () => {
       setUpRepos()
 
       // #when staging
-      const sourceDir = unwrapOk(await stage())
+      const sourceDir = (await stageDir()) as string
 
       // #then the extracted tree is main's content, with the branch's additions absent
       expect(sourceDir).toBe(path.join(staging, 'source-tree', '.agents', 'skills'))
-      expect(listFiles(sourceDir as string)).toEqual(['probe/SKILL.md', 'probe/references/r.md'])
-      const body = fs.readFileSync(path.join(sourceDir as string, 'probe', 'SKILL.md'), 'utf8')
+      expect(listFiles(sourceDir)).toEqual(['probe/SKILL.md', 'probe/references/r.md'])
+      const body = fs.readFileSync(path.join(sourceDir, 'probe', 'SKILL.md'), 'utf8')
       expect(body).toContain('MAIN-VERSION')
       expect(body).not.toContain('PR-HEAD-VERSION')
     })
@@ -838,10 +1055,10 @@ describe('repo-skills', () => {
       git(origin, 'commit', '-qam', 'moved on')
 
       // #when staging
-      const sourceDir = unwrapOk(await stage())
+      const sourceDir = (await stageDir()) as string
 
       // #then the fresh fetch won: neither the planted ref nor the checkout's old origin/main is read
-      const body = fs.readFileSync(path.join(sourceDir as string, 'probe', 'SKILL.md'), 'utf8')
+      const body = fs.readFileSync(path.join(sourceDir, 'probe', 'SKILL.md'), 'utf8')
       expect(body).toContain('MAIN-MOVED-ON')
       expect(body).not.toContain('PR-HEAD-VERSION')
     })
@@ -854,12 +1071,12 @@ describe('repo-skills', () => {
       const {exec, calls} = recordingExec()
 
       // #when staging
-      const sourceDir = unwrapOk(await stage({exec}))
+      const sourceDir = (await stageDir({exec})) as string
 
       // #then every command ran in the staging root, the rewrite did not redirect the fetch, and the checkout is unchanged
       expect(calls.length).toBeGreaterThan(0)
       expect(new Set(calls.map(call => call.cwd))).toEqual(new Set([staging]))
-      expect(fs.readFileSync(path.join(sourceDir as string, 'probe', 'SKILL.md'), 'utf8')).toContain('MAIN-VERSION')
+      expect(fs.readFileSync(path.join(sourceDir, 'probe', 'SKILL.md'), 'utf8')).toContain('MAIN-VERSION')
       expect(git(workspace, 'for-each-ref')).toBe(before)
       expect(fs.existsSync(path.join(workspace, '.git', 'shallow'))).toBe(false)
     })
@@ -904,29 +1121,87 @@ describe('repo-skills', () => {
       expect(unwrapOk(staged)).toBeNull()
     })
 
-    it('hands a committed symlink to the admission filter, which rejects it', async () => {
-      // #given a default branch whose skill contains a committed symlink
+    it('writes no symlink, reports the skills that held one, and admission rejects exactly those', async () => {
+      // #given a default branch with a symlink inside one skill, a symlink AS a skill directory, and a clean sibling
       setUpRepos()
       fs.symlinkSync('/etc/hosts', path.join(origin, '.agents', 'skills', 'probe', 'references', 'link.md'))
+      fs.symlinkSync('probe', path.join(origin, '.agents', 'skills', 'linked'))
+      writeFile(path.join(origin, '.agents', 'skills', 'other', 'SKILL.md'), skillMd('other'))
       git(origin, 'add', '-A')
       git(origin, 'commit', '-qm', 'link')
       const bundled = path.join(root, 'bundled', '@fro.bot', 'systematic', 'skills')
       writeFile(path.join(bundled, 'ce-review', 'SKILL.md'), skillMd('ce:review'))
+      const {exec, inputs} = fakeExecOverReal()
 
-      // #when staging and admitting
-      const sourceDir = unwrapOk(await stage()) as string
+      // #when staging and admitting with what staging reported
+      const staged = unwrapOk(await stage({exec})) as StagedSkills
+      const onDisk = fs.readdirSync(staged.sourceDir, {recursive: true, withFileTypes: true})
+      const logger = createMockLogger()
       const admitted = unwrapOk(
         await admitRepoSkills({
-          sourceDir,
+          sourceDir: staged.sourceDir,
           stagingRoot: staging,
           bundledSkillsDirectories: [bundled],
-          logger: createMockLogger(),
+          symlinkedSkillIds: staged.symlinkedSkillIds,
+          logger,
         }),
       )
 
-      // #then the skill is rejected as a whole
-      expect(admitted.skipped).toEqual([{id: 'probe', reason: 'symlink'}])
-      expect(admitted.directory).toBeNull()
+      // #then nothing on disk is a symlink, the link entries were never even read, and the ids were reported
+      expect(onDisk.some(entry => entry.isSymbolicLink())).toBe(false)
+      expect(fs.existsSync(path.join(staged.sourceDir, 'linked'))).toBe(false)
+      expect(fs.existsSync(path.join(staged.sourceDir, 'probe', 'references', 'link.md'))).toBe(false)
+      expect(staged.symlinkedSkillIds.toSorted()).toEqual(['linked', 'probe'])
+      expect(inputs).toHaveLength(1)
+      // #and admission rejects those two as symlinks, whether or not a directory exists for them, and keeps the sibling
+      expect(admitted.skipped.toSorted((x, y) => x.id.localeCompare(y.id))).toEqual([
+        {id: 'linked', reason: 'symlink'},
+        {id: 'probe', reason: 'symlink'},
+      ])
+      expect(admitted.admitted).toEqual(['other'])
+      expect(serializeLoggerCalls(logger)).toContain('symlink')
+    })
+
+    it('reports a clean tree with no symlinked skill ids', async () => {
+      // #given the plain fixture
+      setUpRepos()
+
+      // #when staging
+      const staged = unwrapOk(await stage()) as StagedSkills
+
+      // #then there is nothing to reject
+      expect(staged.symlinkedSkillIds).toEqual([])
+    })
+
+    it('refuses the whole source when two names alias through different invalid UTF-8 bytes', async () => {
+      // #given a tree where `lnk\xfe` (a symlink to the exposed skills directory) and `lnk\xff` (a directory holding a
+      // reserved `report` skill) both decode to `lnk\uFFFD`: the old writer made the link, then wrote the reserved skill
+      // through it into the exposed directory
+      setUpRepos()
+      const reserved = hashObject(origin, 'RESERVED-SKILL-PLANTED\n')
+      const link = hashObject(origin, '../../../skills')
+      const reportTree = mktree(origin, [{mode: '100644', type: 'blob', oid: reserved, name: 'SKILL.md'}])
+      const aliasTree = mktree(origin, [{mode: '040000', type: 'tree', oid: reportTree, name: 'report'}])
+      const okTree = mktree(origin, [
+        {mode: '100644', type: 'blob', oid: hashObject(origin, skillMd('ok')), name: 'SKILL.md'},
+      ])
+      const skillsTree = mktree(origin, [
+        {mode: '120000', type: 'blob', oid: link, name: Buffer.from([0x6c, 0x6e, 0x6b, 0xfe])},
+        {mode: '040000', type: 'tree', oid: aliasTree, name: Buffer.from([0x6c, 0x6e, 0x6b, 0xff])},
+        {mode: '040000', type: 'tree', oid: okTree, name: 'ok'},
+      ])
+      const agentsTree = mktree(origin, [{mode: '040000', type: 'tree', oid: skillsTree, name: 'skills'}])
+      commitAsMain(origin, mktree(origin, [{mode: '040000', type: 'tree', oid: agentsTree, name: '.agents'}]))
+      fs.mkdirSync(path.join(staging, 'skills'))
+
+      // #when staging
+      const error = unwrapErr(await stage())
+
+      // #then the source is refused for its encoding, naming no path, and nothing reached the exposed directory
+      expect(error).toContain('UTF-8')
+      expect(error).not.toContain('lnk')
+      expect(fs.readdirSync(path.join(staging, 'skills'))).toEqual([])
+      expect(fs.readdirSync(staging)).toEqual(['skills'])
     })
 
     it('fails closed when the default branch cannot be fetched, with no fallback to the checkout', async () => {
@@ -1178,11 +1453,11 @@ describe('repo-skills', () => {
         const {exec, commands, inputs} = fakeExec(blob('s/SKILL.md', 10), frame(OID, '0123456789'))
 
         // #when staging
-        const staged = unwrapOk(await stage({exec}))
+        const staged = (await stageDir({exec})) as string
 
         // #then the blob was read by id, written raw, and neither archive nor tar ran
         expect(inputs).toEqual([`${OID}\n`])
-        expect(fs.readFileSync(path.join(staged as string, 's', 'SKILL.md'), 'utf8')).toBe('0123456789')
+        expect(fs.readFileSync(path.join(staged, 's', 'SKILL.md'), 'utf8')).toBe('0123456789')
         expect(ran(commands, 'archive')).toBe(false)
         expect(ran(commands, 'tar')).toBe(false)
       })
@@ -1247,7 +1522,7 @@ describe('repo-skills', () => {
         git(origin, 'commit', '-qm', 'six deep')
 
         // #when staging and admitting
-        const sourceDir = unwrapOk(await stage()) as string
+        const sourceDir = (await stageDir()) as string
         const admitted = unwrapOk(
           await admitRepoSkills({
             sourceDir,
@@ -1275,6 +1550,107 @@ describe('repo-skills', () => {
         expect(error).toContain('deep')
         expect(calls.some(call => call.args.includes('cat-file'))).toBe(false)
       })
+    })
+
+    describe('path integrity at the source (aliasing, duplicates, planted links)', () => {
+      const entry = (file: string, mode = '100644', type = 'blob'): Buffer =>
+        rawRecord(mode, type, type === 'tree' ? '-' : '3', `.agents/skills/${file}`)
+
+      it('refuses a listing with invalid UTF-8 before reading or writing anything', async () => {
+        // #given two blobs, one of which is named with an invalid byte
+        setUpBareDirectories()
+        const {exec, commands} = fakeExec(
+          Buffer.concat([
+            entry('ok/SKILL.md'),
+            rawRecord('100644', 'blob', '3', Buffer.from('.agents/skills/b\xFF/SKILL.md', 'latin1')),
+          ]),
+          Buffer.concat([frame(OID, 'abc'), frame(OID, 'abc')]),
+        )
+
+        // #when staging
+        const error = unwrapErr(await stage({exec}))
+
+        // #then the source is refused, cat-file never ran and nothing is on disk
+        expect(error).toContain('UTF-8')
+        expect(commands.some(command => command.includes('cat-file'))).toBe(false)
+        expect(fs.readdirSync(staging)).toEqual([])
+      })
+
+      it.each([
+        ['a duplicate path', [entry('a/SKILL.md'), entry('a/SKILL.md')], 'duplicate'],
+        ['paths that differ only by case', [entry('a/SKILL.md'), entry('a/skill.md')], 'duplicate'],
+        ['a blob that is also a directory', [entry('a/b'), entry('a/b/c')], 'directory'],
+      ])('refuses %s before reading or writing anything', async (_label, records, word) => {
+        // #given a listing with the flaw
+        setUpBareDirectories()
+        const {exec, commands} = fakeExec(Buffer.concat(records), Buffer.concat(records.map(() => frame(OID, 'abc'))))
+
+        // #when staging
+        const error = unwrapErr(await stage({exec}))
+
+        // #then the whole source is refused, naming no path
+        expect(error).toContain(word)
+        expect(commands.some(command => command.includes('cat-file'))).toBe(false)
+        expect(fs.readdirSync(staging)).toEqual([])
+      })
+
+      it('does not ask cat-file for symlink blobs and reports the skills that hold them', async () => {
+        // #given a listing with a file and a symlink in the same skill
+        setUpBareDirectories()
+        const {exec, inputs} = fakeExec(
+          Buffer.concat([entry('s', '040000', 'tree'), entry('s/SKILL.md'), entry('s/link', '120000')]),
+          frame(OID, 'abc'),
+        )
+
+        // #when staging
+        const staged = unwrapOk(await stage({exec})) as StagedSkills
+
+        // #then one blob was read, the link is not on disk and the skill is reported
+        expect(inputs).toEqual([`${OID}\n`])
+        expect(fs.readdirSync(staged.sourceDir, {recursive: true})).toEqual(['s', path.join('s', 'SKILL.md')])
+        expect(staged.symlinkedSkillIds).toEqual(['s'])
+      })
+
+      const plantAgents = (outside: string, extract: string): void => {
+        fs.mkdirSync(extract)
+        fs.symlinkSync(outside, path.join(extract, '.agents'))
+      }
+      const plantExtractRoot = (outside: string, extract: string): void => {
+        fs.symlinkSync(outside, extract)
+      }
+      const plantSkill = (outside: string, extract: string): void => {
+        fs.mkdirSync(path.join(extract, '.agents', 'skills'), {recursive: true})
+        fs.symlinkSync(outside, path.join(extract, '.agents', 'skills', 'probe'))
+      }
+      const withTree = (): Buffer => Buffer.concat([entry('probe', '040000', 'tree'), entry('probe/SKILL.md')])
+      const fileOnly = (): Buffer => entry('probe/SKILL.md')
+      const treeOnly = (): Buffer => entry('probe', '040000', 'tree')
+
+      it.each([
+        ['the .agents directory', plantAgents, withTree],
+        ['the extract root', plantExtractRoot, withTree],
+        ['a skill directory', plantSkill, withTree],
+        ['a skill directory reached only through a file entry', plantSkill, fileOnly],
+        ['a skill directory reached only through a tree entry', plantSkill, treeOnly],
+      ])(
+        'fails closed, writing nothing outside, when %s was replaced by a symlink',
+        async (_label, plant, makeListing) => {
+          // #given a symlink planted into the extract tree while the blobs were being read
+          setUpBareDirectories()
+          const outside = path.join(root, 'outside')
+          fs.mkdirSync(outside)
+          const blobs = makeListing === treeOnly ? Buffer.alloc(0) : frame(OID, 'abc')
+          const {exec} = fakeExec(makeListing(), blobs, () => plant(outside, path.join(staging, 'source-tree')))
+
+          // #when staging
+          const error = unwrapErr(await stage({exec}))
+
+          // #then the write refused to walk through it, the outside directory is untouched and the tree was removed
+          expect(error).toContain('write')
+          expect(fs.readdirSync(outside)).toEqual([])
+          expect(fs.readdirSync(staging)).toEqual([])
+        },
+      )
     })
 
     describe('raw blob materialization (no git archive, no attribute processing)', () => {
@@ -1306,7 +1682,7 @@ describe('repo-skills', () => {
         expect(stored('.agents/skills/probe/SKILL.md').length).toBeLessThan(20_000)
 
         // #when staging, reading what was staged, and admitting
-        const sourceDir = unwrapOk(await stage()) as string
+        const sourceDir = (await stageDir()) as string
         const stagedBytes = fs.readFileSync(path.join(sourceDir, 'probe', 'SKILL.md'))
         const bundled = path.join(root, 'bundled', '@fro.bot', 'systematic', 'skills')
         writeFile(path.join(bundled, 'ce-review', 'SKILL.md'), skillMd('ce:review'))
@@ -1334,7 +1710,7 @@ describe('repo-skills', () => {
         const {ident, crlf} = commitExpandingAttributes()
 
         // #when staging
-        const sourceDir = unwrapOk(await stage()) as string
+        const sourceDir = (await stageDir()) as string
 
         // #then the bytes equal what is stored: `$Id$` is not expanded and no CR was added
         const identBytes = fs.readFileSync(path.join(sourceDir, 'probe', 'references', 'x.ident.md'))
@@ -1372,7 +1748,7 @@ describe('repo-skills', () => {
         git(origin, 'commit', '-qm', 'script')
 
         // #when staging
-        const sourceDir = unwrapOk(await stage()) as string
+        const sourceDir = (await stageDir()) as string
 
         // #then modes are owner-only, and the executable bit survives as owner-execute
         const mode = (file: string): number => fs.statSync(path.join(sourceDir, file)).mode & 0o777
@@ -1380,36 +1756,6 @@ describe('repo-skills', () => {
         expect(mode('probe/scripts/run.sh')).toBe(0o700)
         expect(mode('probe')).toBe(0o700)
         expect(mode('probe/scripts')).toBe(0o700)
-      })
-
-      it('creates a committed symlink as a real, unfollowed symlink that admission then rejects', async () => {
-        // #given a skill holding a symlink to a file outside it
-        setUpRepos()
-        fs.symlinkSync('/etc/hosts', path.join(origin, '.agents', 'skills', 'probe', 'references', 'link.md'))
-        git(origin, 'add', '-A')
-        git(origin, 'commit', '-qm', 'link')
-        const bundled = path.join(root, 'bundled', '@fro.bot', 'systematic', 'skills')
-        writeFile(path.join(bundled, 'ce-review', 'SKILL.md'), skillMd('ce:review'))
-
-        // #when staging, inspecting the link, and admitting
-        const sourceDir = unwrapOk(await stage()) as string
-        const link = path.join(sourceDir, 'probe', 'references', 'link.md')
-        const isLink = fs.lstatSync(link).isSymbolicLink()
-        const target = fs.readlinkSync(link)
-        const admitted = unwrapOk(
-          await admitRepoSkills({
-            sourceDir,
-            stagingRoot: staging,
-            bundledSkillsDirectories: [bundled],
-            logger: createMockLogger(),
-          }),
-        )
-
-        // #then it is a symlink with the stored target, and the whole skill is rejected
-        expect(isLink).toBe(true)
-        expect(target).toBe('/etc/hosts')
-        expect(admitted.skipped).toEqual([{id: 'probe', reason: 'symlink'}])
-        expect(admitted.directory).toBeNull()
       })
 
       const listing = (...files: string[]): string => files.map(file => blob(file, 3)).join('')
@@ -1446,18 +1792,19 @@ describe('repo-skills', () => {
         expect(fs.readdirSync(staging)).toEqual([])
       })
 
-      it('fails closed, writing nothing, when the same path is listed twice', async () => {
-        // #given two entries for one path (git never writes this)
+      it('fails closed, overwriting nothing, when a file already exists at a path it would create', async () => {
+        // #given a regular file planted at the destination while the blobs were being read
         setUpBareDirectories()
-        const {exec} = fakeExec(
-          listing('s/SKILL.md', 's/SKILL.md'),
-          Buffer.concat([frame(OID, 'abc'), frame(OID, 'abc')]),
-        )
+        const planted = path.join(staging, 'source-tree', '.agents', 'skills', 's', 'SKILL.md')
+        const {exec} = fakeExec(listing('s/SKILL.md'), frame(OID, 'abc'), () => {
+          fs.mkdirSync(path.dirname(planted), {recursive: true})
+          fs.writeFileSync(planted, 'PLANTED')
+        })
 
         // #when staging
         const error = unwrapErr(await stage({exec}))
 
-        // #then the exclusive create refused the second and the first was cleaned up
+        // #then the exclusive create refused it and the tree was removed
         expect(error).toContain('write')
         expect(fs.readdirSync(staging)).toEqual([])
       })

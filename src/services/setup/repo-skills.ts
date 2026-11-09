@@ -164,6 +164,13 @@ export async function removeRepoSkillsStagingRoot(
 
 // --- Source -----------------------------------------------------------------------------------------------------------
 
+/** What staging hands on: where the candidate skills are on disk, and which of them held a symlink (not written). */
+export interface StagedSkills {
+  readonly sourceDir: string
+  /** Ids of skills with a symlink entry. Admission rejects exactly these, so a link is never needed on disk. */
+  readonly symlinkedSkillIds: readonly string[]
+}
+
 export interface StageDefaultBranchSkillsOptions {
   readonly exec: ExecAdapter
   /** The base repository, `owner/repo`. */
@@ -240,29 +247,90 @@ export interface TreeEntry {
   readonly path: string
 }
 
-const TREE_RECORD = /^(\d{6}) (blob|commit|tree) ([\da-f]{40}|[\da-f]{64}) +(\d+|-)\t([\s\S]+)$/
+const TREE_HEADER = /^(\d{6}) (blob|commit|tree) ([\da-f]{40}|[\da-f]{64}) +(\d+|-)$/
+
+/** Two names a case- or normalization-folding filesystem would store as one entry. */
+function foldPath(entryPath: string): string {
+  return entryPath.normalize('NFC').toLowerCase()
+}
 
 /**
- * Parses `git ls-tree -r -l -z -t` output: NUL-terminated records of `<mode> SP <type> SP <object> SP+ <size> TAB <path>`.
- * `-z` leaves the path raw (no quoting; it may hold spaces, tabs or newlines). Any record that does not parse fails the
- * whole listing: a partial reading is not a safe reading.
+ * Refuses a listing in which two entries could land on one filesystem entry, or one entry would have to be both a file and
+ * a directory. Names are compared as git printed them (after the strict UTF-8 decode) and folded for case and Unicode
+ * normalization, because a runner may be macOS or Windows. Messages never carry a path.
  */
-export function parseTreeListing(stdout: string): Result<readonly TreeEntry[], string> {
-  if (stdout === '') return ok([])
-  if (!stdout.endsWith('\0')) return err('The default branch tree listing was cut short; repo skills are not loaded')
+function checkTreeShape(entries: readonly TreeEntry[]): Result<void, string> {
+  const byPath = new Map<string, TreeEntry>()
+  for (const entry of entries) {
+    const key = foldPath(entry.path)
+    if (byPath.has(key)) return err('The default branch skills contain duplicate paths; repo skills are not loaded')
+    byPath.set(key, entry)
+  }
+  for (const entry of entries) {
+    const segments = foldPath(entry.path).split('/')
+    for (let length = 1; length < segments.length; length += 1) {
+      const ancestor = byPath.get(segments.slice(0, length).join('/'))
+      if (ancestor !== undefined && ancestor.type !== 'tree') {
+        return err('The default branch skills contain a path that is also a directory; repo skills are not loaded')
+      }
+    }
+  }
+  return ok(undefined)
+}
+
+/**
+ * Parses the RAW bytes of `git ls-tree -r -l -z -t`: NUL-terminated records of
+ * `<mode> SP <type> SP <object> SP+ <size> TAB <path>`. The header is ASCII; the path is everything after the first tab,
+ * decoded here as strict UTF-8 (`fatal`, BOM kept). Decoding the whole output to a string first would turn every invalid
+ * byte into U+FFFD, and two different git names would become one JS string: that aliasing is the bug this prevents. Any
+ * record that does not parse, any path that is not valid UTF-8, and any listing whose paths collide (`checkTreeShape`)
+ * fails the whole source: a partial reading is not a safe reading. Messages never carry a path.
+ */
+export function parseTreeListing(raw: Buffer): Result<readonly TreeEntry[], string> {
+  if (raw.length === 0) return ok([])
+  if (raw.at(-1) !== 0) return err('The default branch tree listing was cut short; repo skills are not loaded')
+  const decoder = new TextDecoder('utf-8', {fatal: true, ignoreBOM: true})
   const entries: TreeEntry[] = []
-  for (const record of stdout.slice(0, -1).split('\0')) {
-    const match = TREE_RECORD.exec(record)
-    if (match === null) return err('The default branch tree listing could not be read; repo skills are not loaded')
+  let position = 0
+  while (position < raw.length) {
+    const end = raw.indexOf(0, position)
+    const record = raw.subarray(position, end)
+    position = end + 1
+    const tab = record.indexOf(0x09)
+    const match = tab === -1 ? null : TREE_HEADER.exec(record.toString('latin1', 0, tab))
+    if (match === null || tab === record.length - 1) {
+      return err('The default branch tree listing could not be read; repo skills are not loaded')
+    }
+    let entryPath: string
+    try {
+      entryPath = decoder.decode(record.subarray(tab + 1))
+    } catch {
+      return err('The default branch skills contain a path that is not valid UTF-8; repo skills are not loaded')
+    }
     entries.push({
       mode: match[1] as string,
       type: match[2] as TreeEntry['type'],
       oid: match[3] as string,
       size: match[4] === '-' ? null : Number.parseInt(match[4] as string, 10),
-      path: match[5] as string,
+      path: entryPath,
     })
   }
-  return ok(entries)
+  const shape = checkTreeShape(entries)
+  return shape.success ? ok(entries) : shape
+}
+
+/**
+ * The ids (first path component below `.agents/skills`) of the skills that hold a symlink entry. Symlinks are never
+ * written to disk, so admission is told these ids and rejects exactly those skills.
+ */
+function symlinkedSkillIdsOf(entries: readonly TreeEntry[]): readonly string[] {
+  const root = `${SKILLS_GIT_PATH}/`
+  const ids = new Set<string>()
+  for (const entry of entries) {
+    if (entry.mode === '120000' && entry.path.startsWith(root))
+      ids.add(entry.path.slice(root.length).split('/')[0] as string)
+  }
+  return [...ids].toSorted()
 }
 
 /**
@@ -371,9 +439,12 @@ const NO_FOLLOW = fs.constants.O_NOFOLLOW ?? 0
 
 /**
  * Writes the listed tree under `extractRoot` from the stored blobs, with no attribute, filter, eol or ident processing.
- * Directories are 0700; files are created exclusively and without following a symlink at the leaf, 0600 (0700 when the
- * blob is executable, so a skill's scripts keep working); a mode 120000 blob becomes a real symlink to the stored target,
- * never followed. Any other mode is an error. The caller removes `extractRoot` on failure.
+ * `entries` holds trees and regular-file blobs only: a symlink is NEVER written (the caller reports its skill instead), so
+ * no link can exist for a later entry to be written through. Even so, every directory is made one segment at a time,
+ * `lstat`ed to be a real directory (never a symlink) whose real path is exactly where it should be inside the extract
+ * root's real path; no `recursive` mkdir ever crosses an untrusted segment. Files are created exclusively and without
+ * following a symlink at the leaf, 0600 (0700 when executable so a skill's scripts keep working); directories are 0700.
+ * The caller removes `extractRoot` on failure.
  */
 async function writeTree(
   extractRoot: string,
@@ -382,24 +453,46 @@ async function writeTree(
 ): Promise<Result<void, string>> {
   const failure = err('Could not write the default branch skills; repo skills are not loaded')
   try {
+    try {
+      await fsp.mkdir(extractRoot, {mode: 0o700})
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+    }
+    const rootStats = await fsp.lstat(extractRoot)
+    // `lstat` does not follow a link, so a symlink is not a directory here.
+    if (!rootStats.isDirectory()) return failure
+    const realRoot = await fsp.realpath(extractRoot)
+
+    const ensureDirectory = async (relative: string): Promise<boolean> => {
+      const walked: string[] = []
+      for (const segment of relative.split('/')) {
+        walked.push(segment)
+        const current = path.join(extractRoot, ...walked)
+        let stats = await fsp.lstat(current).catch((error: NodeJS.ErrnoException) => {
+          if (error.code === 'ENOENT') return null
+          throw error
+        })
+        if (stats === null) {
+          await fsp.mkdir(current, {mode: 0o700})
+          stats = await fsp.lstat(current)
+        }
+        if (!stats.isDirectory()) return false
+        if ((await fsp.realpath(current)) !== path.join(realRoot, ...walked)) return false
+      }
+      return true
+    }
+
     let blobIndex = 0
     for (const entry of entries) {
-      const destination = path.join(extractRoot, entry.path)
       if (entry.type === 'tree') {
-        await fsp.mkdir(destination, {recursive: true, mode: 0o700})
+        if (!(await ensureDirectory(entry.path))) return failure
         continue
       }
       const body = bodies[blobIndex] as Buffer
       blobIndex += 1
-      await fsp.mkdir(path.dirname(destination), {recursive: true, mode: 0o700})
-      if (entry.mode === '120000') {
-        const target = body.toString('utf8')
-        if (target.length === 0 || target.includes('\0')) return failure
-        await fsp.symlink(target, destination)
-        continue
-      }
+      if (!(await ensureDirectory(path.posix.dirname(entry.path)))) return failure
       const handle = await fsp.open(
-        destination,
+        path.join(extractRoot, entry.path),
         fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | NO_FOLLOW,
         entry.mode === '100755' ? 0o700 : 0o600,
       )
@@ -438,7 +531,7 @@ type CommandOutcome =
  */
 export async function stageDefaultBranchSkills(
   options: StageDefaultBranchSkillsOptions,
-): Promise<Result<string | null, string>> {
+): Promise<Result<StagedSkills | null, string>> {
   const {exec, repository, defaultBranch, stagingRoot, logger} = options
   const limits = {...DEFAULT_REPO_SKILLS_LIMITS, ...options.limits}
   const execWithTimeout = exec.execWithTimeout
@@ -549,7 +642,7 @@ export async function stageDefaultBranchSkills(
         'The default branch skills exceed the staging budget (the tree listing is too large to read); repo skills are not loaded',
       )
     }
-    const entries = parseTreeListing(listed.stdout)
+    const entries = parseTreeListing(listed.raw)
     if (!entries.success) return entries
     if (!entries.data.some(entry => entry.path.startsWith(`${SKILLS_GIT_PATH}/`))) {
       logger.debug('The default branch has no .agents/skills', {defaultBranch})
@@ -566,8 +659,13 @@ export async function stageDefaultBranchSkills(
       const safe = safeRelativeSkillPath(entry.path)
       if (!safe.success) return safe
     }
-    const blobs = underRoot.filter(entry => entry.type === 'blob')
-    if (blobs.some(entry => entry.size === null || (entry.mode !== '120000' && !FILE_MODES.has(entry.mode)))) {
+    // Symlinks (mode 120000) are counted by the budget above and reported below, but never read or written.
+    const symlinkedSkillIds = symlinkedSkillIdsOf(underRoot)
+    const blobs = underRoot.filter(entry => entry.type === 'blob' && entry.mode !== '120000')
+    if (
+      underRoot.some(entry => entry.type === 'blob' && entry.mode !== '120000' && !FILE_MODES.has(entry.mode)) ||
+      blobs.some(entry => entry.size === null)
+    ) {
       return err('The default branch skills contain an entry with an unsupported mode; repo skills are not loaded')
     }
     const expected = blobs.map(entry => ({oid: entry.oid, size: entry.size as number}))
@@ -591,11 +689,14 @@ export async function stageDefaultBranchSkills(
     const bodies = parseCatFileBatch(read.raw, expected, limits.maxBytes)
     if (!bodies.success) return bodies
 
-    await fsp.mkdir(path.join(extractRoot, ...SKILLS_SEGMENTS), {recursive: true, mode: 0o700})
-    const written = await writeTree(extractRoot, underRoot, bodies.data)
+    const written = await writeTree(
+      extractRoot,
+      underRoot.filter(entry => entry.mode !== '120000'),
+      bodies.data,
+    )
     if (!written.success) return written
     succeeded = true
-    return ok(path.join(extractRoot, ...SKILLS_SEGMENTS))
+    return ok({sourceDir: path.join(extractRoot, ...SKILLS_SEGMENTS), symlinkedSkillIds})
   } catch (error) {
     logger.debug('Reading the default branch skills threw', {error: error instanceof Error ? error.name : 'unknown'})
     return err('Reading the default branch skills failed; repo skills are not loaded')
@@ -632,6 +733,8 @@ export interface SkippedRepoSkill {
  */
 export interface RepoSkillsSource {
   readonly sourceDir: string
+  /** Ids of skills that held a symlink in the default branch (not written to disk); admission rejects them. */
+  readonly symlinkedSkillIds: readonly string[]
   readonly stagingRoot: string
 }
 
@@ -642,6 +745,8 @@ export interface AdmitRepoSkillsOptions {
   readonly stagingRoot: string
   /** The installed Systematic skills directory (`resolveSystematicSkillsDirsV2`). Empty refuses the whole feature. */
   readonly bundledSkillsDirectories: readonly string[]
+  /** Ids staging reported as holding a symlink. Rejected as `symlink` whether or not a directory exists for them. */
+  readonly symlinkedSkillIds?: readonly string[]
   readonly logger: Logger
   readonly limits?: Partial<RepoSkillsLimits>
 }
@@ -833,9 +938,18 @@ async function admit(options: AdmitRepoSkillsOptions): Promise<Result<AdmitRepoS
     logger.warning('Skipped a repository skill', {id, reason})
   }
 
+  // Staging never writes a symlink, so the skills that held one look clean on disk: they are rejected by id.
+  const symlinked = new Set(options.symlinkedSkillIds ?? [])
+  const rejectedSymlinked = new Set<string>()
+
   for (const entry of entries) {
     if (entry.name.startsWith('.')) continue
     const id = displayId(entry.name)
+    if (symlinked.has(entry.name)) {
+      rejectedSymlinked.add(entry.name)
+      skip(id, 'symlink')
+      continue
+    }
     if (entry.isSymbolicLink()) {
       skip(id, 'symlink')
       continue
@@ -899,6 +1013,11 @@ async function admit(options: AdmitRepoSkillsOptions): Promise<Result<AdmitRepoS
     usedFiles += inventory.files.length
     usedBytes += inventory.bytes
     admitted.push(entry.name)
+  }
+
+  // A skill that was only a link has no directory to meet above; it is still reported, once.
+  for (const linkedId of symlinked) {
+    if (!rejectedSymlinked.has(linkedId)) skip(displayId(linkedId), 'symlink')
   }
 
   // The extracted default-branch tree and the scratch space have done their job; only the admitted copy stays.

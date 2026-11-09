@@ -204,6 +204,7 @@ export async function startActionOpenCodeV2(
         sourceDir: options.repoSkills.sourceDir,
         stagingRoot: options.repoSkills.stagingRoot,
         bundledSkillsDirectories,
+        symlinkedSkillIds: options.repoSkills.symlinkedSkillIds,
         logger,
       })
       if (admission.success) {

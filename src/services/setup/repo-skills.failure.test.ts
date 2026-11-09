@@ -5,6 +5,7 @@
  * partial mock of `node:fs/promises`; everything else is the real filesystem.
  */
 
+import {Buffer} from 'node:buffer'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
@@ -15,6 +16,9 @@ const faults = vi.hoisted(() => ({
   readdir: '',
   open: '',
   rename: '',
+  realpath: '',
+  /** Report every path as its own real path, as if nothing were a link. */
+  realpathEcho: false,
   rm: false,
 }))
 
@@ -34,6 +38,11 @@ vi.mock('node:fs/promises', async importOriginal => {
       if (faults.open !== '' && String(args[0]).includes(faults.open)) throw fault('ENOENT')
       return actual.open(...args)
     }),
+    realpath: vi.fn(async (...args: Parameters<typeof actual.realpath>) => {
+      if (faults.realpathEcho) return String(args[0])
+      if (faults.realpath !== '' && String(args[0]).includes(faults.realpath)) return '/elsewhere/outside'
+      return actual.realpath(...args)
+    }),
     rename: vi.fn(async (...args: Parameters<typeof actual.rename>) => {
       if (faults.rename !== '' && String(args[0]).includes(faults.rename)) throw fault('EXDEV')
       return actual.rename(...args)
@@ -46,7 +55,7 @@ vi.mock('node:fs/promises', async importOriginal => {
   return {...patched, default: patched}
 })
 
-const {admitRepoSkills} = await import('./repo-skills.js')
+const {admitRepoSkills, stageDefaultBranchSkills} = await import('./repo-skills.js')
 
 function writeFile(file: string, content: string): void {
   fs.mkdirSync(path.dirname(file), {recursive: true})
@@ -65,6 +74,8 @@ describe('admitRepoSkills failure injection', () => {
     faults.readdir = ''
     faults.open = ''
     faults.rename = ''
+    faults.realpath = ''
+    faults.realpathEcho = false
     faults.rm = false
     root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'repo-skills-fault-')))
     source = path.join(root, 'source')
@@ -80,6 +91,8 @@ describe('admitRepoSkills failure injection', () => {
     faults.readdir = ''
     faults.open = ''
     faults.rename = ''
+    faults.realpath = ''
+    faults.realpathEcho = false
     faults.rm = false
     fs.rmSync(root, {recursive: true, force: true})
   })
@@ -186,5 +199,93 @@ describe('admitRepoSkills failure injection', () => {
     // #then admission still returns a result
     const admitted = unwrapOk(await result)
     expect(admitted.skipped).toEqual([{id: 'vanish', reason: 'copy-failed'}])
+  })
+
+  it('fails closed when a directory in the extract tree resolves outside the extract root', async () => {
+    // #given a listing for one skill and a filesystem where the `probe` directory's real path leaves the extract root
+    const oid = 'a'.repeat(40)
+    const listing = Buffer.concat([
+      Buffer.from(`040000 tree ${oid}       -\t.agents/skills/probe\0`),
+      Buffer.from(`100644 blob ${oid}       3\t.agents/skills/probe/SKILL.md\0`),
+    ])
+    const exec = {
+      exec: vi.fn(),
+      getExecOutput: vi.fn(),
+      execWithTimeout: async (
+        _command: string,
+        args: string[] | undefined,
+        _timeout: number,
+        options?: {input?: Buffer; listeners?: {stdout?: (data: Buffer) => void}},
+      ) => {
+        if (args?.includes('ls-tree') === true) options?.listeners?.stdout?.(listing)
+        if (args?.includes('cat-file') === true) options?.listeners?.stdout?.(Buffer.from(`${oid} blob 3\nabc\n`))
+        return 0
+      },
+    }
+    faults.realpath = `${path.sep}probe`
+
+    // #when staging
+    const error = unwrapErr(
+      await stageDefaultBranchSkills({
+        exec,
+        repository: 'fro-bot/agent',
+        defaultBranch: 'main',
+        stagingRoot: staging,
+        logger: createMockLogger(),
+        env: {},
+        serverUrl: 'https://github.com',
+      }),
+    )
+
+    // #then the write refused it, and nothing is left
+    expect(error).toContain('write')
+    expect(fs.readdirSync(staging)).toEqual([])
+  })
+
+  it('refuses a symlinked directory by itself, even when the real-path check has nothing to say', async () => {
+    // #given a link planted at a skill directory, and a real-path check that reports every path as itself
+    const oid = 'a'.repeat(40)
+    const outside = path.join(root, 'outside')
+    fs.mkdirSync(outside)
+    const listing = Buffer.concat([
+      Buffer.from(`040000 tree ${oid}       -\t.agents/skills/probe\0`),
+      Buffer.from(`100644 blob ${oid}       3\t.agents/skills/probe/SKILL.md\0`),
+    ])
+    const exec = {
+      exec: vi.fn(),
+      getExecOutput: vi.fn(),
+      execWithTimeout: async (
+        _command: string,
+        args: string[] | undefined,
+        _timeout: number,
+        options?: {listeners?: {stdout?: (data: Buffer) => void}},
+      ) => {
+        if (args?.includes('ls-tree') === true) options?.listeners?.stdout?.(listing)
+        if (args?.includes('cat-file') === true) {
+          fs.mkdirSync(path.join(staging, 'source-tree', '.agents', 'skills'), {recursive: true})
+          fs.symlinkSync(outside, path.join(staging, 'source-tree', '.agents', 'skills', 'probe'))
+          options?.listeners?.stdout?.(Buffer.from(`${oid} blob 3\nabc\n`))
+        }
+        return 0
+      },
+    }
+    faults.realpathEcho = true
+
+    // #when staging
+    const error = unwrapErr(
+      await stageDefaultBranchSkills({
+        exec,
+        repository: 'fro-bot/agent',
+        defaultBranch: 'main',
+        stagingRoot: staging,
+        logger: createMockLogger(),
+        env: {},
+        serverUrl: 'https://github.com',
+      }),
+    )
+
+    // #then the directory check alone refused it
+    expect(error).toContain('write')
+    expect(fs.readdirSync(outside)).toEqual([])
   })
 })
