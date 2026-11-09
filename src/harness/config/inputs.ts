@@ -4,7 +4,7 @@ import type {ActionInputs, ModelConfig, OutputMode, ResponseMode} from '../../sh
 import process from 'node:process'
 import * as core from '@actions/core'
 import * as github from '@actions/github'
-import {parseObjectStoreSettings} from '@fro-bot/runtime'
+import {parseObjectStoreSettings, selectOpenCodeGeneration} from '@fro-bot/runtime'
 import {parseBrokeredPushExtraPaths} from '../../shared/brokered-push-paths.js'
 import {
   DEFAULT_DEDUP_WINDOW_MS,
@@ -61,6 +61,14 @@ function parseTimeoutMs(value: string, inputName = 'timeout'): number {
 
   return parsed
 }
+
+/**
+ * The last Action release that still ran OpenCode V1. A workflow that needs V1 pins the Action to this tag
+ * (`fro-bot/agent@v0.137.0`); the README's "Moving to OpenCode V2" section is the rollback reference.
+ */
+export const LAST_V1_ACTION_RELEASE = 'v0.137.0'
+
+const OPENCODE_VERSION_PATTERN = /^v?\d+\.\d+\.\d+(?:[.-][\w.-]+)?(?:\+[\w.-]+)?$/
 
 const VALID_OUTPUT_MODES = ['auto', 'working-dir', 'branch-pr'] as const
 const VALID_RESPONSE_MODES = ['github', 'none'] as const
@@ -226,8 +234,7 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     }
 
     // Setup consolidation inputs
-    const opencodeVersionRaw = core.getInput('opencode-version').trim()
-    const opencodeVersion = opencodeVersionRaw.length > 0 ? opencodeVersionRaw : DEFAULT_OPENCODE_VERSION
+    const opencodeVersion = parseOpenCodeVersion(core.getInput('opencode-version').trim())
 
     const skipCacheRaw = core.getInput('skip-cache').trim().toLowerCase()
     const skipCache = skipCacheRaw === 'true'
@@ -298,6 +305,51 @@ function parseRepoSkills(input: string): boolean {
   if (value === '' || value === 'false') return false
   if (value === 'true') return true
   throw new Error(`Invalid repo-skills value: "${input.trim()}". Valid values: true, false`)
+}
+
+/**
+ * Resolve the `opencode-version` input. The Action runs exactly one OpenCode release: the recorded V2 pin. Unset and
+ * `latest` mean that pin, and the pin itself is accepted with or without a `v` prefix, normalized to one spelling.
+ *
+ * Everything else is an input error, decided here before setup can look anything up or download anything. A V1 value
+ * (stock or harness build, either spelling) says V1 is no longer run. Any other V2 version is refused too: setup's
+ * stock-V2 policy would reject it, but `ensureOpenCodeAvailable` reuses a binary already on the runner whose version
+ * matches the request before setup runs, so a pre-installed non-pin V2 binary would otherwise run unpinned and
+ * unverified.
+ *
+ * `latest` is mapped first because `selectOpenCodeGeneration` cannot read it.
+ */
+function parseOpenCodeVersion(input: string): string {
+  if (input.length === 0 || input === 'latest') {
+    return DEFAULT_OPENCODE_VERSION
+  }
+
+  // Same shape the installer accepts (a path-traversal guard there too), checked here so a malformed value is an input
+  // error and never reaches a download URL.
+  const generation = OPENCODE_VERSION_PATTERN.test(input) ? selectOpenCodeGeneration(input) : null
+  if (generation === null || generation.success === false) {
+    throw new Error(
+      `Input 'opencode-version' value "${input}" is not an OpenCode version. Leave it unset to use the pinned OpenCode V2 release (${DEFAULT_OPENCODE_VERSION}).`,
+    )
+  }
+
+  if (generation.data === 'v1') {
+    throw new Error(
+      `Input 'opencode-version' value "${input}" selects OpenCode V1, which this Action no longer runs. ` +
+        `Leave the input unset to use the pinned OpenCode V2 release (${DEFAULT_OPENCODE_VERSION}), ` +
+        `or pin the Action itself to fro-bot/agent@${LAST_V1_ACTION_RELEASE} to keep running V1. ` +
+        `See "Moving to OpenCode V2" in the README.`,
+    )
+  }
+
+  if (input !== DEFAULT_OPENCODE_VERSION && input !== `v${DEFAULT_OPENCODE_VERSION}`) {
+    throw new Error(
+      `Input 'opencode-version' value "${input}" is not the pinned OpenCode V2 release: only the recorded release ` +
+        `(${DEFAULT_OPENCODE_VERSION}) is supported. Leave the input unset to use it.`,
+    )
+  }
+
+  return DEFAULT_OPENCODE_VERSION
 }
 
 function parseOutputMode(input: string): OutputMode {

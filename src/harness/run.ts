@@ -6,7 +6,6 @@ import type {
   OwnershipLedger,
   ResponseMode,
 } from '@fro-bot/runtime'
-import type {OpenCodeServerHandle} from '../features/agent/index.js'
 import type {ReactionContext} from '../features/agent/types.js'
 import type {AttachmentResult} from '../features/attachments/index.js'
 import type {InvocationSkipDetail} from '../features/observability/index.js'
@@ -18,9 +17,8 @@ import * as core from '@actions/core'
 import {applyTerminalReaction} from '../features/agent/index.js'
 import {createMetricsCollector, writeInvocationOutcomeSummary} from '../features/observability/index.js'
 import {resolveReviewedHeadSha} from '../features/reviews/reviewed-head.js'
-import {resolveSessionGeneration} from '../services/cache/cache-key.js'
 import {createReviewDeliveryReceiptOperations} from '../services/github/review-delivery-receipt.js'
-import {getGitHubRunAttempt, getGitHubWorkspace, getInvocationIdentity} from '../shared/env.js'
+import {getGitHubRunAttempt, getInvocationIdentity} from '../shared/env.js'
 import {toErrorMessage} from '../shared/errors.js'
 import {createLogger} from '../shared/logger.js'
 import {setActionOutputs, setInvocationOutcomeOutput} from './config/outputs.js'
@@ -30,7 +28,6 @@ import {runAcknowledge} from './phases/acknowledge.js'
 import {runAcquireLock, type LeaseController} from './phases/acquire-lock.js'
 import {runBootstrap} from './phases/bootstrap.js'
 import {resolveBrokeredPushPlan} from './phases/brokered-push-plan.js'
-import {isCacheRestoreV2} from './phases/cache-restore-kind.js'
 import {runCacheRestore} from './phases/cache-restore.js'
 import {runCleanup} from './phases/cleanup.js'
 import {runBlockedLabelClear} from './phases/coordination-clear.js'
@@ -39,9 +36,7 @@ import {runDedup, saveDedupMarker} from './phases/dedup.js'
 import {
   computeDrainDeadlineMs,
   resolveRequestedOutputModeState,
-  runDrain,
   runExecute,
-  type DrainOutcome,
   type ExecutePhaseResult,
 } from './phases/execute.js'
 import {runFinalizeWithResult} from './phases/finalize.js'
@@ -62,8 +57,6 @@ export async function run(): Promise<number> {
   let exitCode = 0
   let githubClient: Octokit | null = null
   let attachmentResult: AttachmentResult | null = null
-  let detectedOpencodeVersion: string | null = null
-  let serverHandle: OpenCodeServerHandle | null = null
   let serverHandleV2: OpenCodeV2ServerHandle | null = null
   // Set once the V2 server has been released (drained or stopped, then shut down). A run that left the try block without
   // reaching that point is released in the `finally` before cleanup.
@@ -86,13 +79,17 @@ export async function run(): Promise<number> {
   let skipSessionPersistence = false
   // Why persistence is skipped, when it is not the lock. Shown in the cleanup warning in place of the lock message.
   let persistenceDeclineReason: string | undefined
+  // Positive evidence that this invocation restored the cache and started the V2 server. Until then the OpenCode data on
+  // the runner is whatever it already held (a persistent runner keeps its own), not this run's history, so no phase
+  // before this point may persist it: the cleanup save and the post hook's retry both key off this.
+  let sessionStateVouched = false
   // Hoisted out of the try block (like lockEtag above) because runCleanup runs from the
   // outer finally block, where a `const` declared inside try is out of scope. Populated
   // right after runExecute returns; stays undefined only when execution never ran
   // (SKIP_AGENT_EXECUTION=true) or the try block failed before reaching that point --
   // both cases runCleanup treats as an empty, persistence-safe ledger.
   let ownershipLedger: OwnershipLedger | undefined
-  // V2 only, hoisted like the ledger so the release in the `finally` block can still stop the observation if a phase
+  // Hoisted like the ledger so the release in the `finally` block can still stop the observation if a phase
   // between execution and the release threw. It comes from `runExecute`'s result.
   let liveObservation: ExecutePhaseResult['liveObservation']
   let requestedOutputModeState: OutputModeRequestState = 'omitted'
@@ -170,7 +167,6 @@ export async function run(): Promise<number> {
       setUnavailableActionOutputs(Date.now() - startTime)
       return 1
     }
-    detectedOpencodeVersion = bootstrap.opencodeResult.version
     storeConfig = bootstrap.inputs.storeConfig
     sessionRetention = bootstrap.inputs.sessionRetention
     responseMode = bootstrap.inputs.responseMode
@@ -262,17 +258,17 @@ export async function run(): Promise<number> {
     if (cacheRestore == null) {
       deliveryOutcome = 'failed'
       setUnavailableActionOutputs(Date.now() - startTime)
-      // A V2 start that fails (credentials, gates, the V1 import wait) must not write session state: the database may
-      // be mid-import or half-gated, and the post hook would otherwise save whatever is on disk. V1 is unchanged.
-      if (resolveSessionGeneration(bootstrap.opencodeResult.version) === 'v2') {
-        skipSessionPersistence = true
-        persistenceDeclineReason = 'the OpenCode V2 server did not complete its start, so no session state is saved'
-        core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
-      }
+      // A start that fails (credentials, gates, the V1 import wait) must not write session state: the database may
+      // be mid-import or half-gated, and the post hook would otherwise save whatever is on disk.
+      skipSessionPersistence = true
+      persistenceDeclineReason = 'the OpenCode V2 server did not complete its start, so no session state is saved'
+      core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
       return 1
     }
-    if (isCacheRestoreV2(cacheRestore)) serverHandleV2 = cacheRestore.serverHandle
-    else serverHandle = cacheRestore.serverHandle
+    serverHandleV2 = cacheRestore.serverHandle
+    sessionStateVouched = true
+    // Armed here and nowhere earlier: the post hook retries a save only for a run that got this far.
+    core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'true')
 
     const sessionPrep = await runSessionPrep(bootstrap, routing, cacheRestore, metrics)
     attachmentResult = sessionPrep.attachmentResult
@@ -281,75 +277,50 @@ export async function run(): Promise<number> {
     // pushes its changes; finalize keeps its own, deliberately wider, decision so a failure to push stays loud.
     const brokeredPushPlan = resolveBrokeredPushPlan(bootstrap, routing)
 
-    let execution = await runExecute(
-      bootstrap,
-      routing,
-      cacheRestore,
-      sessionPrep,
-      metrics,
-      startTime,
-      brokeredPushPlan,
-    )
+    let execution = await runExecute(bootstrap, routing, cacheRestore, sessionPrep, metrics, brokeredPushPlan)
     ownershipLedger = execution.ownershipLedger
     liveObservation = execution.liveObservation
     // Sticky, invocation-scoped facts -- feed the invocation-outcome assessment
     // (src/harness/outcome.ts), never `execution.success` itself.
     observationGap = execution.observationGap === true
 
-    // Drain: owned background work settles before anything below this point
-    // publishes, persists, or releases (Unit 10). `execution.ownershipLedger` is
-    // populated whenever execution actually ran (Unit 11); it is only absent when
-    // `SKIP_AGENT_EXECUTION=true` skipped execution entirely, in which case this
-    // call is a no-op exactly like before.
+    // Release: owned background work settles before anything below this point publishes, persists, or releases
+    // (Unit 10). The server is released by its directory, not by the ledger (probe P2: root idle is not terminal):
+    // drain a succeeded run, stop anything else, confirm the directory quiet, then shut the server down. A run that
+    // cannot be confirmed quiet must not be saved, whatever the ledger says.
     const drainLogger = createLogger({phase: 'drain'})
-    let drainResult: DrainOutcome
-    if (isCacheRestoreV2(cacheRestore)) {
-      // V2 is released by its directory, not by the ledger (probe P2: root idle is not terminal): drain a succeeded run,
-      // stop anything else, confirm the directory quiet, then shut the server down. A run that cannot be confirmed quiet
-      // must not be saved, whatever the ledger says.
-      const release = await runReleaseV2(
-        releaseOptionsFromExecution(execution, {
-          serverHandle: cacheRestore.serverHandle,
-          runStartedAt: startTime,
-          deadlineMs: computeDrainDeadlineMs(bootstrap.inputs.timeoutMs, execution.executionDurationMs),
-          sessionRetention,
-          logger: drainLogger,
-        }),
-      )
-      serverReleasedV2 = true
-      drainResult = release.drain
-      serverExitUnconfirmed = release.serverExitUnconfirmed === true
-      if (execution.sendUncertain === true) {
-        // The prompt may have run without this run seeing it. The stop path above already confirmed the directory quiet,
-        // but the session's content may include work this run cannot account for, so nothing is saved or endorsed.
-        promptSendUncertain = true
-        skipSessionPersistence = true
-        persistenceDeclineReason ??=
-          'the prompt acknowledgment was lost, so what the session holds cannot be vouched for'
-        core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
-      }
-      if (release.observed !== undefined) {
-        // The root's turns after the attempt returned (a notice starting a second one) are part of the run: the last
-        // one decides whether it succeeded, and what it did joins the artifacts and usage.
-        const merged = mergeObservedTurn(execution, release.observed)
-        recordObservedTurn(execution, merged, metrics)
-        execution = merged
-        observationGap = execution.observationGap === true
-      }
-      if (release.persistenceDeclineReason !== undefined) {
-        skipSessionPersistence = true
-        persistenceDeclineReason = release.persistenceDeclineReason
-        core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
-      }
-    } else {
-      drainResult = await runDrain({
-        ledger: execution.ownershipLedger,
-        client: cacheRestore.serverHandle.client,
-        parentSessionId: execution.sessionId,
-        directory: getGitHubWorkspace(),
+    const release = await runReleaseV2(
+      releaseOptionsFromExecution(execution, {
+        serverHandle: cacheRestore.serverHandle,
+        runStartedAt: startTime,
         deadlineMs: computeDrainDeadlineMs(bootstrap.inputs.timeoutMs, execution.executionDurationMs),
+        sessionRetention,
         logger: drainLogger,
-      })
+      }),
+    )
+    serverReleasedV2 = true
+    const drainResult = release.drain
+    serverExitUnconfirmed = release.serverExitUnconfirmed === true
+    if (execution.sendUncertain === true) {
+      // The prompt may have run without this run seeing it. The stop path above already confirmed the directory quiet,
+      // but the session's content may include work this run cannot account for, so nothing is saved or endorsed.
+      promptSendUncertain = true
+      skipSessionPersistence = true
+      persistenceDeclineReason ??= 'the prompt acknowledgment was lost, so what the session holds cannot be vouched for'
+      core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
+    }
+    if (release.observed !== undefined) {
+      // The root's turns after the attempt returned (a notice starting a second one) are part of the run: the last
+      // one decides whether it succeeded, and what it did joins the artifacts and usage.
+      const merged = mergeObservedTurn(execution, release.observed)
+      recordObservedTurn(execution, merged, metrics)
+      execution = merged
+      observationGap = execution.observationGap === true
+    }
+    if (release.persistenceDeclineReason !== undefined) {
+      skipSessionPersistence = true
+      persistenceDeclineReason = release.persistenceDeclineReason
+      core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
     }
     if (drainResult.expired) {
       drainLogger.warning('Drain deadline reached before owned work settled; run reports incomplete', {
@@ -362,13 +333,10 @@ export async function run(): Promise<number> {
     // (see ExecutePhaseResult.recoveryBoundaryUnresolved) -- the top-level drain above only
     // ever observes the recovery session's own ledger, never the overflowed session's.
     //
-    // A V2 drain that expired is incomplete whether or not the stop after it confirmed the directory quiet: the response
-    // was produced while owned work was still running, so it may describe work that was then cut off. (V1 reads only
-    // `unknownCount`, because its cancellation reports each child it confirmed stopped.)
+    // A drain that expired is incomplete whether or not the stop after it confirmed the directory quiet: the response
+    // was produced while owned work was still running, so it may describe work that was then cut off.
     ownershipUnresolved =
-      drainResult.unknownCount > 0 ||
-      execution.recoveryBoundaryUnresolved === true ||
-      (isCacheRestoreV2(cacheRestore) && drainResult.expired)
+      drainResult.unknownCount > 0 || execution.recoveryBoundaryUnresolved === true || drainResult.expired
 
     // `true` when this invocation already knows, before publication, that its own execution
     // was not fully observed -- computed from exactly the two facts above, both genuinely
@@ -481,15 +449,17 @@ export async function run(): Promise<number> {
         core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
       }
     }
+    if (!sessionStateVouched && !skipSessionPersistence) {
+      skipSessionPersistence = true
+      persistenceDeclineReason =
+        "the run ended before the OpenCode V2 server started, so the OpenCode data on this runner is not this run's session state and is not saved"
+    }
     const cleanupResult = await runCleanup({
       bootstrapLogger,
       reactionCtx,
       githubClient,
       attachmentResult,
-      serverHandle,
       ...(serverHandleV2 === null ? {} : {serverHandleV2}),
-      sessionRetention,
-      detectedOpencodeVersion,
       storeConfig,
       metrics,
       agentIdentity: 'github',

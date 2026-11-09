@@ -105,11 +105,10 @@ describe('resolveRepoSkillsSource', () => {
     fs.rmSync(root, {recursive: true, force: true})
   })
 
-  function resolve(event: NormalizedEvent, overrides: {enabled?: boolean; generation?: 'v1' | 'v2'} = {}) {
+  function resolve(event: NormalizedEvent, overrides: {enabled?: boolean} = {}) {
     const logger = createMockLogger()
     const promise = resolveRepoSkillsSource({
       enabled: overrides.enabled ?? true,
-      generation: overrides.generation ?? 'v2',
       githubContext: context(event),
       githubToken: 'ghs_token',
       logger,
@@ -133,17 +132,6 @@ describe('resolveRepoSkillsSource', () => {
     expect(serializeLoggerCalls(logger)).toBe('[]')
   })
 
-  it('ignores the input on the V1 generation, with a warning', async () => {
-    // #given V1 (deprecated, untouched)
-    // #when resolving
-    const {promise, logger} = resolve(schedule, {generation: 'v1'})
-
-    // #then nothing is staged
-    expect(await promise).toBeNull()
-    expect(leftovers()).toEqual([])
-    expect(serializeLoggerCalls(logger)).toContain('V1')
-  })
-
   it.each([
     ['a scheduled run', schedule],
     ['a workflow_dispatch', dispatch],
@@ -159,7 +147,6 @@ describe('resolveRepoSkillsSource', () => {
     // #when resolving
     const source = await resolveRepoSkillsSource({
       enabled: true,
-      generation: 'v2',
       githubContext,
       githubToken: 'ghs_token',
       logger: createMockLogger(),
@@ -443,7 +430,6 @@ describe('createRepoSkillsLookups', () => {
     // #when resolving
     const source = await resolveRepoSkillsSource({
       enabled: true,
-      generation: 'v2',
       githubContext: context(schedule),
       githubToken: 't',
       logger,

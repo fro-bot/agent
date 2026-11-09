@@ -6,10 +6,11 @@ import * as path from 'node:path'
 import process from 'node:process'
 import {fileURLToPath, pathToFileURL} from 'node:url'
 import {afterAll, beforeAll, expect, it} from 'vitest'
+import {DEFAULT_OPENCODE_VERSION} from './shared/constants.js'
 
 // The fake `opencode` reports this version, and runMain pins the same value via `opencode-version`: the Action only
 // reuses an existing binary whose `--version` exactly equals the pin, so the two must stay in lockstep.
-const MOCK_OPENCODE_VERSION = '1.1.2'
+const MOCK_OPENCODE_VERSION = DEFAULT_OPENCODE_VERSION
 
 // Isolated temp directories for test data and mock tools
 let testDataDir: string
@@ -21,7 +22,12 @@ beforeAll(() => {
 
   // Create mock opencode binary that responds to --version
   const mockOpenCode = path.join(mockBinDir, 'opencode')
-  writeFileSync(mockOpenCode, `#!/bin/sh\necho "OpenCode ${MOCK_OPENCODE_VERSION}"`, 'utf8')
+  // MOCK_OPENCODE_LOG, when set, records every invocation, so a test can prove the binary was never executed.
+  writeFileSync(
+    mockOpenCode,
+    `#!/bin/sh\nif [ -n "$MOCK_OPENCODE_LOG" ]; then echo "$@" >> "$MOCK_OPENCODE_LOG"; fi\necho "OpenCode \${MOCK_OPENCODE_VERSION:-${MOCK_OPENCODE_VERSION}}"`,
+    'utf8',
+  )
   chmodSync(mockOpenCode, 0o755)
 })
 
@@ -182,8 +188,60 @@ it('fails when server bootstrap fails', {timeout: 15000}, async () => {
 
   expect(code).not.toBe(0)
   expect(stdout).toContain('bootstrap')
-  // #then the guard the Action writes before every server start landed in the child's isolated config dir
-  expect(existsSync(path.join(testDataDir, 'xdg-config', 'opencode', 'fro-bot', 'no-task-reuse.mjs'))).toBe(true)
+})
+
+it('rejects a V1 opencode-version at input parsing, naming the value and the way back', async () => {
+  // #given a workflow that still pins a V1 harness build
+  const {stdout, stderr, code} = await runMain({
+    'INPUT_GITHUB-TOKEN': 'ghp_test123',
+    'INPUT_AUTH-JSON': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
+    'INPUT_OPENCODE-VERSION': '1.19.5+harness.bf7f7dfe',
+    GITHUB_OUTPUT: '/dev/null',
+    GITHUB_REPOSITORY: 'test/repo',
+    GITHUB_REF_NAME: 'main',
+    GITHUB_RUN_ID: '12345',
+    RUNNER_OS: 'Linux',
+    GITHUB_EVENT_NAME: 'push',
+    SKIP_CACHE: 'true',
+  })
+
+  // #then the Action fails at parsing with the named error, before any setup or download
+  expect(code).not.toBe(0)
+  const output = `${stdout}\n${stderr}`
+  expect(output).toContain("Input 'opencode-version'")
+  expect(output).toContain('1.19.5+harness.bf7f7dfe')
+  expect(output).toContain('no longer runs')
+  expect(output).not.toContain('Downloading OpenCode')
+})
+
+it('never reaches a pre-installed non-pin V2 binary: the version is refused at parsing', async () => {
+  // #given an OpenCode 2.3.0 binary on PATH and a workflow that asks for exactly that version, which the Action would
+  // otherwise reuse before setup could apply the pin policy
+  const logFile = path.join(testDataDir, 'non-pin-binary-calls.log')
+
+  const {stdout, stderr, code} = await runMain({
+    'INPUT_GITHUB-TOKEN': 'ghp_test123',
+    'INPUT_AUTH-JSON': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
+    'INPUT_OPENCODE-VERSION': '2.3.0',
+    MOCK_OPENCODE_VERSION: '2.3.0',
+    MOCK_OPENCODE_LOG: logFile,
+    GITHUB_OUTPUT: '/dev/null',
+    GITHUB_REPOSITORY: 'test/repo',
+    GITHUB_REF_NAME: 'main',
+    GITHUB_RUN_ID: '12345',
+    RUNNER_OS: 'Linux',
+    GITHUB_EVENT_NAME: 'push',
+    SKIP_CACHE: 'true',
+  })
+
+  // #then the Action fails naming the value and the pin, and the binary was never executed (not even `--version`)
+  expect(code).not.toBe(0)
+  const output = `${stdout}\n${stderr}`
+  expect(output).toContain("Input 'opencode-version'")
+  expect(output).toContain('"2.3.0"')
+  expect(output).toContain(DEFAULT_OPENCODE_VERSION)
+  expect(output).toContain('only the recorded release')
+  expect(existsSync(logFile)).toBe(false)
 })
 
 it('kills a child that exceeds its timeout and preserves partial output', async () => {

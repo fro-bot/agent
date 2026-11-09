@@ -6,11 +6,11 @@ This document describes the system design, invariants, and data flows for the fr
 
 ## Bird's-Eye Overview
 
-This monorepo ships three distinct deployable surfaces from one codebase:
+This monorepo ships its deployable surfaces from one codebase:
 
 - **GitHub Action** — a CI harness that runs OpenCode agents in response to GitHub webhook events (issues, PRs, comments, reviews, scheduled runs, workflow dispatches). The Action entry points are `src/main.ts` and `src/post.ts`; the real logic lives in the 4-layer `src/` tree and `packages/runtime/`. Sessions persist across CI runs via GitHub Actions cache when the trigger permits cache writes, and via an S3-compatible object store; `issue_comment` and `issues` runs cannot write the cache and depend on the object store for continuity.
 - **`@fro-bot/gateway`** (`packages/gateway/`) — a Discord-first daemon that listens for `@fro-bot` mentions in bound guild channels and runs OpenCode inside a sandboxed workspace container. Includes an operator web surface (Hono, gateway-net only), an inbound announce webhook, and an S3-backed coordination layer. The `/fro-bot dispatch` slash command is a separate, simpler path: it asks the bound repo's `fro-bot.yaml` workflow to run via the GitHub Actions API and returns the run URL — it never touches the gateway's queue, concurrency cap, or run-state.
-- **`@fro.bot/harness`** (`packages/harness/`) — a patched OpenCode binary built via an LLM-merge integration pipeline. Published to npm and GitHub Releases; the Action setup phase downloads the checksum-verified release tarball (not the npm package) as the default OpenCode binary, and reuses an existing `opencode` only when it reports exactly the pinned version. The npm package ships `harness` and `opencode` commands (see [`packages/harness/README.md`](packages/harness/README.md)).
+- **`@fro.bot/harness`** (`packages/harness/`) — the patched OpenCode build package, retired from every runtime path: the Action and the gateway run stock OpenCode V2 only. Its release workflows are removed; the final build (`1.19.5+harness.bf7f7dfe`) and the published packages stay available, and the package source remains until its removal.
 
 Supporting packages: `@fro-bot/runtime` (`packages/runtime/`) owns shared runtime primitives and version-pin constants; `@fro-bot/action` (`apps/action/`) is a thin workspace wrapper whose build produces the committed root `dist/`; `@fro-bot/workspace-agent` (`apps/workspace-agent/`) is the Hono HTTP sidecar inside the workspace container. `@fro.bot/opencode-plugin` (`packages/opencode-plugin/`) is the OpenCode V2 plugin published to npm: the `session_*` tools plus a guard that rejects `subagent` calls resuming a session. V2 skips a plugin that fails to load and keeps serving, so its id (`fro-bot.opencode-plugin`) is fixed and the surfaces confirm it by id; no surface loads it yet.
 
@@ -25,14 +25,14 @@ Symbols verified against the live source tree. Where a symbol has moved to `pack
 | `run` | Function | `src/harness/run.ts` | Main entry, phase orchestration |
 | `runPost` | Function | `src/harness/post.ts` | Post-action cache save |
 | `runSetup` | Function | `src/services/setup/setup.ts` | Setup orchestration |
-| `buildCIConfig` | Function | `src/services/setup/ci-config.ts` | CI config assembly with plugin injection |
+| `buildCIConfigV2` | Function | `src/services/setup/ci-config-v2.ts` | CI config assembly, passed to the server at start |
 | `writeSystematicConfig` | Function | `src/services/setup/systematic-config.ts` | Systematic plugin config writer |
-| `installSystematicPlugin` | Function | `src/services/setup/systematic-plugin.ts` | Setup-time Systematic install |
+| `installPluginsV2` | Function | `src/services/setup/plugin-install-v2.ts` | Setup-time Systematic and fro.bot plugin install |
 | `restoreCache` | Function | `src/services/cache/restore.ts` | Restore OpenCode state |
 | `saveCache` | Function | `src/services/cache/save.ts` | Persist state; returns a `CacheSaveResult` |
 | `toCacheSaveStateValue` | Function | `src/shared/cache-save-result.ts` | `CacheSaveResult` → `CACHE_SAVED` value |
 | `checkpointDatabase` | Function | `src/services/cache/checkpoint.ts` | Merge SQLite WAL into the main DB |
-| `executeOpenCode` | Function | `src/features/agent/execution.ts` | SDK execution orchestration |
+| `executeOpenCodeV2` | Function | `src/features/agent/execution-v2.ts` | V2 execution orchestration |
 | `runDrain` | Function | `src/harness/phases/execute.ts` | Drain phase for owned background work |
 | `normalizeEvent` / `parseGitHubContext` | Function | `src/services/github/context.ts` | Raw payload → `NormalizedEvent`; global context → `GitHubContext` |
 | `routeEvent` | Function | `src/features/triggers/router.ts` | Event routing |
@@ -52,18 +52,18 @@ Symbols verified against the live source tree. Where a symbol has moved to `pack
 | --- | --- | --- | --- |
 | `buildAgentPrompt` / `buildAgentContextSection` | Function | `packages/runtime/src/agent/prompt.ts` | XML-tagged prompt with authority hierarchy |
 | `buildHarnessRulesSection` | Function | `packages/runtime/src/agent/prompt-thread.ts` | Non-negotiable harness rules |
-| `sendPromptToSession` | Function | `src/features/agent/prompt-sender.ts` | Send prompt to SDK session |
-| `runPromptAttempt` | Function | `src/features/agent/retry.ts` | Prompt with retry logic |
-| `pollForSessionCompletion` | Function | `src/features/agent/session-poll.ts` | Poll SDK for completion |
-| `processEventStream` | Function | `src/features/agent/streaming.ts` | Process SDK event stream |
-| `bootstrapOpenCodeServer` | Function | `packages/runtime/src/agent/server.ts` (delegate: `src/features/agent/server-adapter.ts`) | SDK server lifecycle |
+| `sendPromptToSessionV2` | Function | `src/features/agent/prompt-sender-v2.ts` | Send prompt to a V2 session |
+| `runPromptAttemptV2` | Function | `src/features/agent/retry-v2.ts` | Prompt with retry logic |
+| `pollForSessionCompletionObservationV2` | Function | `src/features/agent/session-poll-v2.ts` | Poll for completion |
+| `processEventStreamV2` | Function | `src/features/agent/streaming-v2.ts` | Process the V2 event stream |
+| `startActionOpenCodeV2` | Function | `src/harness/phases/v2-server.ts` | V2 server lifecycle for the Action |
 | `createLeaseLoop` | Function | `packages/runtime/src/coordination/lease-loop.ts` | Shared lock-lease renewal loop (Action and gateway) |
 | `createOwnershipLedger` | Function | `packages/runtime/src/agent/ownership-ledger.ts` | Background subagent ownership ledger |
 | `reconcileLedgerOnce` / `createLedgerReconciler` | Function | `packages/runtime/src/agent/ledger-reconcile.ts` | Settle dropped ledger entries |
 | `createRemoteQuestionClient` | Function | `packages/runtime/src/agent/remote-question-client.ts` | v2-SDK `question` reply/reject client |
 | `TriggerDirective` | Interface | `packages/runtime/src/agent/prompt.ts` | Directive + appendMode for triggers |
 | `DEFAULT_SYSTEMATIC_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Pinned Systematic version |
-| `DEFAULT_OPENCODE_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Stock OpenCode V2 pin, derived from `opencode-v2-pin.json` (Action default; the workspace image still defaults to the V1 harness build) |
+| `DEFAULT_OPENCODE_VERSION` | Constant | `packages/runtime/src/shared/constants.ts` | Stock OpenCode V2 pin, derived from `opencode-v2-pin.json` (the only version the Action runs; a V1 `opencode-version` is rejected at input parsing) |
 | `opencode-v2-pin.json` | JSON | `packages/runtime/src/shared/opencode-v2-pin.json` | Stock V2 version + asset sha256 |
 
 ### `packages/gateway/`
@@ -138,11 +138,11 @@ main.ts
         │     acknowledgeReceipt (reaction + comment stub)
         ├─→ cache-restore phase
         │     S3 first → Actions cache; repair the restored SQLite database (WAL checkpoint or
-        │     clean slate); bootstrapOpenCodeServer probes instance-scoped readiness
+        │     clean slate); startActionOpenCodeV2 starts the V2 server
         ├─→ session-prep phase
         │     processAttachments → buildAgentPrompt (packages/runtime)
         ├─→ execute phase
-        │     executeOpenCode → sendPromptToSession → runPromptAttempt → processEventStream (SSE)
+        │     executeOpenCodeV2 → sendPromptToSessionV2 → runPromptAttemptV2 → processEventStreamV2 (SSE)
         │     (permission asks auto-denied; `question` tool never offered; adopted background
         │      children tracked by a per-invocation OwnershipLedger)
         ├─→ drain phase
@@ -206,28 +206,6 @@ Discord messageCreate event
 
 > See also: [Architecture Overview](docs/wiki/Architecture%20Overview.md#annotated-data-flow) · [Operator Web Control Surface](docs/wiki/Operator%20Web%20Control%20Surface.md)
 
-### 3. Harness Release Pipeline
-
-Triggered by `workflow_dispatch` or a push of a `harness-v*` tag on `.github/workflows/harness-release.yaml`.
-
-```
-harness-release.yaml (workflow_dispatch OR push: harness-v* tag)
-  │
-  ├─→ prepare-integrate job
-  │     resolve base_version → render prompt from packages/harness/prompt.txt
-  ├─→ integrate job (skipped when has_refs == 'false')
-  │     .github/workflows/fro-bot.yaml agent: clone anomalyco/opencode → merge configured refs
-  │     (harness.config.json carry policy) → build + verify → push refs/harness-integrate/<version>
-  ├─→ build matrix (linux-x64, linux-arm64, darwin-x64, darwin-arm64)
-  │     fetch the integration ref (or stock tag) → build-platform.ts → emit integration_commit
-  └─→ publish job (all-or-nothing; requires build + release-binaries success)
-        OIDC trusted publishing (id-token: write, publish job only)
-        → npm publish @fro.bot/harness + 4 per-platform packages
-        → GitHub Release (OpenCode-shaped assets + SHA256SUMS)
-```
-
-> See also: [Architecture Overview](docs/wiki/Architecture%20Overview.md#annotated-data-flow)
-
 ## Cross-Cutting Concerns
 
 ### Redaction and Logging Gate
@@ -253,10 +231,6 @@ Agent prompts are assembled from named XML-tagged sections with an explicit auth
 Session persistence spans two distinct layers that are easy to conflate. During execution, the **agent-side** layer is a set of always-on native OpenCode file tools that let the model query prior sessions directly. Around execution, the **action-side** layer is a set of runtime utilities that summarize, prune, and write session state. Both layers share the same SDK-backed persisted session store, but neither calls the other directly.
 
 > See also: [Session Persistence](docs/wiki/Session%20Persistence.md) — canonical reference for the native tool inventory, config-dir registration, fallback behavior, and detailed session lifecycle.
-
-### OIDC Trusted Publishing
-
-The harness release workflow publishes to npm via OIDC (no long-lived npm token). `id-token: write` is scoped to the `publish` job only; `integrate` and `build` jobs run with `contents: read` and no `id-token`. Each of the five packages (`@fro.bot/harness` + four per-platform packages) requires a one-time trusted-publisher configuration on npmjs.com before OIDC publishes can succeed.
 
 ### SQLite WAL Checkpoint Repair (Cache Bootstrap Trap)
 
@@ -309,19 +283,19 @@ Per-repo S3 conditional-write locks (`If-None-Match` / `If-Match`) built by `get
 
 ### Background Subagent Ownership Ledger (Action)
 
-`runExecute` (`src/harness/phases/execute.ts`) creates one `OwnershipLedger` per invocation and threads it to `processEventStream` (`src/features/agent/streaming.ts`). Settlement comes only from the injected `<task id state>` notice on the root session; a descendant's `session.idle` / `session.error` never ends the root's turn.
+`runExecute` (`src/harness/phases/execute.ts`) creates one `OwnershipLedger` per invocation and threads it to `processEventStreamV2` (`src/features/agent/streaming-v2.ts`). Settlement comes only from the injected `<task id state>` notice on the root session; a descendant's `session.idle` / `session.error` never ends the root's turn.
 
 - `runDrain` runs between execute and review reconciliation: reconcile, poll `isDrainComplete()` to the shared deadline, then abort whatever is not `settled`. `runCleanup` consumes `isPersistenceSafe()` (`ownership-declined`).
-- `buildCIConfig` (`src/services/setup/ci-config.ts`) pins `subagent_depth` to `1` in every mode, overriding operator values with a warning.
-- The `task_id` reuse guard (`deploy/plugins/no-task-reuse.mjs`, built into committed `dist/no-task-reuse.js`) is loaded by `bootstrapOpenCodeServer` (`src/features/agent/server-adapter.ts`) before every server start.
+- `buildCIConfigV2` (`src/services/setup/ci-config-v2.ts`) strips `subagent_depth` from the operator config with a warning.
+- On V2 the `@fro.bot/opencode-plugin` guard rejects `task_id` reuse, so each background job has its own child session.
 
 > See also: [Background Subagents and Ownership](docs/wiki/Background%20Subagents%20and%20Ownership.md#background-subagent-ownership-ledger-action)
 
 ### Generation-Scoped Completion Evidence (Action)
 
-Idle evidence in `pollForSessionCompletionObservation` (`src/features/agent/session-poll.ts`) is scoped to a generation, not a sticky flag: `ActivityTracker.rootFreshness` (`src/features/agent/streaming.ts`) carries a `revision` advanced only by `invalidateRootFreshness()` on ROOT-session activity, and `hasFreshIdleCandidate()` holds only while the stamped revision is current and no `pendingParentMessageId` barrier is set.
+The root's turn ends on the V2 terminal event (`observeRootTerminal`, `src/features/agent/session-poll-v2.ts`), read from the per-invocation `ActivityTrackerV2` (`src/features/agent/streaming-v2.ts`).
 
-- The idle candidate is not the only gate: the qualified-message path (`detectMessageActivity`) and `ledgerBlocksCompletion()` guard every admission point.
+- `ledgerBlocksCompletion()` guards every admission point: an unsettled ledger entry holds completion.
 - A provisional observation never releases a guard or authorizes completion; unavailable evidence reaches the watchdog or deadline, never a guessed success.
 
 > See also: [Background Subagents and Ownership](docs/wiki/Background%20Subagents%20and%20Ownership.md#generation-scoped-completion-evidence-action)
@@ -404,6 +378,6 @@ The workspace-agent **service** (`apps/workspace-agent/src/main.ts`) stays root 
 
 ### Systematic Plugin Install (Setup-Time, Not Server-Boot)
 
-`installSystematicPlugin` (`src/services/setup/systematic-plugin.ts`) runs the OpenCode CLI's `plugin` command during setup on a tools-cache miss, before `saveToolsCache`, so a degraded npm registry never stalls server boot. It is bounded (420 s) and non-fatal (the server's own install is the fallback, and `saveToolsCache` is skipped), runs with a `filterAgentEnv`-scrubbed environment, and uses a throwaway `OPENCODE_DB` so it never leaves a WAL beside the real session database.
+`installPluginsV2` (`src/services/setup/plugin-install-v2.ts`) installs `@fro.bot/systematic` and `@fro.bot/opencode-plugin` at exact versions during setup, before the server starts and before `saveToolsCache`, so a degraded npm registry never stalls server boot. Each install is bounded, and a failure fails startup with a named error.
 
 > See also: [Setup and Configuration](docs/wiki/Setup%20and%20Configuration.md#systematic-plugin-install-setup-time-not-server-boot)

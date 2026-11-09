@@ -195,7 +195,7 @@ A few inputs most workflows touch:
 | `agent` | No | — | Agent to use (a primary agent, not a subagent). Defaults to OpenCode's built-in `build` agent |
 | `model` | No | — | Model override in `provider/model` format |
 | `timeout` | No | `1800000` | OpenCode execution timeout in milliseconds; Action-internal only, not the job timeout (`0` = no Action-internal deadline) |
-| `opencode-version` | No | Source-pinned (stock OpenCode V2) | OpenCode CLI version to install. The default, and `latest`, is the stock OpenCode V2 release pinned in the Action (digest-verified); V2 installs only that pinned version. A harness build (`1.19.5+harness.bf7f7dfe`) or a V1 version still installs when pinned explicitly. An existing opencode is reused only when it reports exactly this version (the `-harness.` and `+harness.` spellings are equivalent); otherwise the pinned build is installed. |
+| `opencode-version` | No | Source-pinned (stock OpenCode V2) | OpenCode CLI version to install. Unset, and `latest`, mean the stock OpenCode V2 release pinned in the Action (digest-verified). Only that recorded release is supported: the exact pin, with or without a leading `v`, is accepted, and any other version fails input parsing before anything is downloaded or reused. A V1 value (a stock `1.x` version or a `+harness.`/`-harness.` build) fails the same way, with an error saying the Action no longer runs V1. See [Moving to OpenCode V2](#moving-to-opencode-v2). An existing opencode is reused only when it reports exactly the pinned version. |
 | `systematic-version` | No | Source-pinned | Systematic plugin version to register |
 | `skip-cache` | No | `false` | Skip session cache restore |
 | `repo-skills` | No | `false` | OpenCode V2 only. Load the repository's `.agents/skills` on trusted runs: `schedule` and `workflow_dispatch`, or a same-repository `pull_request`, `issue_comment` or `issues` event from an `OWNER`, `MEMBER` or `COLLABORATOR`. Skills always come from the default branch, freshly fetched from the base repository on every run — never the checkout, a dispatched branch or a PR head. They are copied into a run-scoped directory (symlinks rejected, size bounded, bundled skill names protected) that is removed when the run ends; project config stays disabled |
@@ -277,16 +277,18 @@ On OpenCode V2 you can give the agent [MCP](https://modelcontextprotocol.io/) se
 - **A bad shape fails setup** on those other triggers. A server needs `type`, plus a non-empty `command` array (local) or an `http(s)` `url` (remote). `environment` and `headers` must be string maps, `enabled` and `codemode` booleans, `timeout` a positive integer, and `mcp.timeout` a positive integer or an object of positive integers. Two names that become the same tool prefix are rejected. Fields only the native `mcp.servers` spelling has are passed through for OpenCode to check, and so is any string that holds a `{env:...}` or `{file:...}` reference (a `url`, a `type`, a number): OpenCode resolves it first, so it checks the result.
 - **The Action adds no permission rule for a server.** The default agent already allows MCP tools; the read-only subagents (`explore`, `title`, `summary`) do not get them. `permission` in `opencode-config` is still stripped. Only add servers you trust with the run.
 - **The model reaches the tools through Code Mode** (`tools.<server>.<tool>(...)` inside OpenCode's `execute` tool) unless you set `"codemode": false` on the server. Servers connect in the background after startup, so a slow-starting server may not be usable on the first turn.
-- **V2 only.** The V2 config is passed to the server at start and is not written to disk. The V1 path (a pinned V1 `opencode-version`) writes `opencode.json`, where the agent can read it, so it keeps passing `mcp` through unchanged: no validation and no trigger rule, so the withheld-trigger filter above does not apply there.
+- **The config is not written to disk.** It is passed to the server at start, so the agent cannot read it from the workspace.
 
 ## Moving to OpenCode V2
 
-The Action now runs stock [OpenCode V2](https://opencode.ai/) by default instead of the patched harness build. This is a breaking change for workflows that leave `opencode-version` unset.
+The Action runs stock [OpenCode V2](https://opencode.ai/) only. The V1 path and the patched harness build are gone from the Action. This is a breaking change for any workflow that pins `opencode-version` to a V1 value.
 
+- **`opencode-version`**: leave it unset (or `latest`) for the pinned V2 release. A V1 value (`1.19.4`, `1.19.5+harness.bf7f7dfe`, `1.19.5-harness.bf7f7dfe`) fails input parsing with an error that names the input and the value. So does any other version that is not the pin (for example `2.3.0`): only the recorded release is supported, and a matching binary already on the runner is never reached. The Action never tries to download it.
 - **`auth-json`**: only `{"type": "api", "key": "..."}` entries are accepted. An old `{"apiKey": "..."}` entry, or an `oauth`/`wellknown` entry, fails setup.
 - **`opencode-config`**: `permission`, `tools`, `autoupdate` and `subagent_depth` are stripped with a warning, not translated.
-- **Session history**: the first V2 run imports your V1 session history, waiting up to 300 seconds. V2 saves only to its own cache and S3 keys, so the V1 data is left untouched.
-- **Rollback**: pin `opencode-version` to the V1 harness build (`1.19.5+harness.bf7f7dfe`). A V1 run does not see sessions created on V2.
+- **Session history**: a V2 run still imports a V1 session database and restores V1 cache and S3 entries when it finds no V2 one. V2 saves only to its own cache and S3 keys, so the V1 data is left untouched. A run saves session state only after it has restored the cache and started the V2 server: a run that ends earlier (a rejected input, a failed setup, a skipped event) saves nothing, so stale data on a persistent runner can't replace good V2 history.
+- **Rollback**: pin the Action itself to the last release that still ran V1, `fro-bot/agent@v0.137.0`, and set `opencode-version` to the V1 harness build (`1.19.5+harness.bf7f7dfe`) if you want V1. Release tags are immutable, so the pin keeps working. Releases after `v0.137.0` run V2 only.
+- **History forks on rollback.** A V1 run cannot see sessions created on V2, and a later V2 run keeps its own copy. Nothing reconciles the two.
 
 See [Setup and Configuration](docs/wiki/Setup%20and%20Configuration.md) for how the version is resolved and verified.
 
@@ -310,7 +312,7 @@ bun run lint      # Lint (includes the committed-dist/ check)
 
 ## Documentation
 
-- **[ARCHITECTURE.md](ARCHITECTURE.md)** — system design, invariants, the three execution flows, and cross-cutting concerns.
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** — system design, invariants, the execution flows, and cross-cutting concerns.
 - **[STRUCTURE.md](STRUCTURE.md)** — directory layout, key file locations, and where to add new code.
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** — setup, the command surface, testing standards, and commit conventions.
 - **[SECURITY.md](SECURITY.md)** — vulnerability reporting and the security posture.

@@ -128,14 +128,12 @@ async function persistRunState(logger: Logger): Promise<void> {
   // since this post hook is the last chance to persist state for the run.
   const cacheSaved = parseCacheSaveStateValue(core.getState(STATE_KEYS.CACHE_SAVED))
   const sessionId = core.getState(STATE_KEYS.SESSION_ID) || null
-  const opencodeVersion = core.getState(STATE_KEYS.OPENCODE_VERSION) || null
   const storeConfig = reconstructStoreConfigFromState()
 
   logger.debug('Post-action state', {
     shouldSaveCache,
     cacheSaved,
     sessionId,
-    opencodeVersion,
     hasStoreConfig: storeConfig != null,
   })
 
@@ -228,7 +226,6 @@ async function persistRunState(logger: Logger): Promise<void> {
         storagePath: getOpenCodeStoragePath(),
         authPath: getOpenCodeAuthPath(),
         projectIdPath,
-        opencodeVersion,
         ...(storeConfig == null ? {} : {storeConfig}),
         // The main step releases the coordination lease before this step runs (and a run that never held
         // one has none), so this retry holds no lease. The object store keeps ONE shared session object per

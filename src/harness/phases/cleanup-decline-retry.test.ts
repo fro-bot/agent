@@ -84,9 +84,6 @@ describe('a cleanup-declined cache save is retried by the post hook (decline rec
       reactionCtx: null,
       githubClient: null,
       attachmentResult: null,
-      serverHandle: null,
-      sessionRetention: null,
-      detectedOpencodeVersion: '1.0.0',
       storeConfig: storeEnabled
         ? {enabled: true, bucket: 'bucket', region: 'us-east-1', prefix: 'fro-bot-state'}
         : {enabled: false, bucket: '', region: '', prefix: ''},
@@ -370,9 +367,6 @@ describe('the post hook honors a persistence-safety decline instead of retrying 
       reactionCtx: null,
       githubClient: null,
       attachmentResult: null,
-      serverHandle: null,
-      sessionRetention: null,
-      detectedOpencodeVersion: '1.0.0',
       storeConfig: {enabled: true, bucket: 'bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
       metrics: createMetricsCollector(),
       agentIdentity: 'github',
@@ -418,14 +412,16 @@ describe('the post hook honors a persistence-safety decline instead of retrying 
   it('a run declining for unconfirmed server quiescence is not retried by the post step', async () => {
     // #given the OpenCode server's shutdown could not confirm it had stopped writing
     const {saveCache} = await import('../../services/cache/index.js')
-    const serverHandle = {
-      client: {} as never,
-      server: {url: 'http://127.0.0.1:4096', close: vi.fn()},
-      shutdown: vi.fn().mockResolvedValue({quiesced: false}),
-    }
+    const serverHandleV2 = {
+      url: 'http://127.0.0.1:4096',
+      shutdown: vi.fn().mockResolvedValue({
+        interrupts: {stopped: [], notRunning: [], unconfirmed: []},
+        exit: {outcome: 'unconfirmed', code: null, signal: null},
+      }),
+    } as unknown as NonNullable<CleanupPhaseOptions['serverHandleV2']>
 
     await runCleanupWithOverrides({
-      serverHandle,
+      serverHandleV2,
       storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
     })
 

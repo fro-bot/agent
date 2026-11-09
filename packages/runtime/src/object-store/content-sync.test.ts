@@ -68,7 +68,7 @@ describe('content sync', () => {
     // was removed: per-key upload/overwrite here is not atomic across two files)
     expect(result).toEqual({uploaded: 1, failed: 0})
     expect(upload).toHaveBeenCalledTimes(1)
-    expect(upload.mock.calls.map(([key]) => key)).toEqual(['fro-bot-state/github/owner/repo/sessions/opencode.db'])
+    expect(upload.mock.calls.map(([key]) => key)).toEqual(['fro-bot-state/github/owner/repo/sessions-v2/opencode.db'])
   })
 
   it('uploads 1 DB file when WAL and SHM are absent', async () => {
@@ -82,7 +82,7 @@ describe('content sync', () => {
     expect(result).toEqual({uploaded: 1, failed: 0})
     expect(upload).toHaveBeenCalledTimes(1)
     expect(upload).toHaveBeenCalledWith(
-      'fro-bot-state/github/owner/repo/sessions/opencode.db',
+      'fro-bot-state/github/owner/repo/sessions-v2/opencode.db',
       path.join(dbDir, 'opencode.db'),
     )
   })
@@ -231,9 +231,9 @@ describe('content sync', () => {
   it('downloads all keys returned by list', async () => {
     const list = vi.fn<ObjectStoreAdapter['list']>(async () =>
       ok([
-        'fro-bot-state/github/owner/repo/sessions/opencode.db',
-        'fro-bot-state/github/owner/repo/sessions/opencode.db-wal',
-        'fro-bot-state/github/owner/repo/sessions/opencode.db-shm',
+        'fro-bot-state/github/owner/repo/sessions-v2/opencode.db',
+        'fro-bot-state/github/owner/repo/sessions-v2/opencode.db-wal',
+        'fro-bot-state/github/owner/repo/sessions-v2/opencode.db-shm',
       ]),
     )
     const download = vi.fn<ObjectStoreAdapter['download']>(async (key: string, localPath: string) => {
@@ -246,7 +246,7 @@ describe('content sync', () => {
     const result = await syncSessionsFromStore(adapter, config, 'github', 'owner/repo', storagePath, createLogger())
 
     expect(result).toEqual({downloaded: 3, failed: 0, mainDbRestored: true})
-    expect(list).toHaveBeenCalledWith('fro-bot-state/github/owner/repo/sessions/')
+    expect(list).toHaveBeenCalledWith('fro-bot-state/github/owner/repo/sessions-v2/')
     expect(download).toHaveBeenCalledTimes(3)
     const currentDbDir = path.dirname(storagePath)
     await expect(fs.readFile(path.join(currentDbDir, 'opencode.db'), 'utf8')).resolves.toContain('opencode.db')
@@ -258,7 +258,7 @@ describe('content sync', () => {
     const logger = createLogger()
     const download = vi.fn(async () => ok(undefined))
     const adapter = createAdapter({
-      list: async () => ok(['fro-bot-state/github/owner/repo/sessions/../escape.db']),
+      list: async () => ok(['fro-bot-state/github/owner/repo/sessions-v2/../escape.db']),
       download,
     })
 
@@ -389,14 +389,14 @@ describe('content sync, V2 generation', () => {
     expect(store.download).not.toHaveBeenCalled()
   })
 
-  it('never lists or downloads sessions-v2 objects when restoring V1', async () => {
+  it('restores V2 by default and V1 only when asked, never listing the other prefix', async () => {
     // #given both generations in the bucket
     const store = createStore({
       [`${v1Prefix}opencode.db`]: 'v1-db',
       [`${v2Prefix}opencode.db`]: 'v2-db',
     })
 
-    // #when restoring with the default (V1) and the explicit V1 generation
+    // #when restoring with the default and with the explicit V1 generation (the restore fallback)
     const implicit = await syncSessionsFromStore(
       store.adapter,
       config,
@@ -415,20 +415,20 @@ describe('content sync, V2 generation', () => {
       'v1',
     )
 
-    // #then only the V1 object is downloaded, because 'sessions/' never prefixes 'sessions-v2/'
+    // #then each call touches only its own prefix, because 'sessions/' never prefixes 'sessions-v2/'
     expect(implicit).toEqual({downloaded: 1, failed: 0, mainDbRestored: true})
     expect(explicit).toEqual(implicit)
-    expect(store.download.mock.calls.map(([key]) => key)).toEqual([`${v1Prefix}opencode.db`, `${v1Prefix}opencode.db`])
-    expect(store.list.mock.calls.map(([prefix]) => prefix)).toEqual([v1Prefix, v1Prefix])
+    expect(store.download.mock.calls.map(([key]) => key)).toEqual([`${v2Prefix}opencode.db`, `${v1Prefix}opencode.db`])
+    expect(store.list.mock.calls.map(([prefix]) => prefix)).toEqual([v2Prefix, v1Prefix])
   })
 
-  it('keeps V1 uploads byte-identical when the generation is omitted', async () => {
-    // #given a database #when uploading without a generation #then it lands under sessions/ only
+  it('uploads under sessions-v2 when the generation is omitted', async () => {
+    // #given a database #when uploading without a generation #then it lands under sessions-v2/ only
     await fs.writeFile(path.join(dbDir, 'opencode.db'), 'db')
     const store = createStore()
 
     await syncSessionsToStore(store.adapter, config, 'github', 'owner/repo', storagePath, createLogger())
 
-    expect([...store.objects.keys()]).toEqual([`${v1Prefix}opencode.db`])
+    expect([...store.objects.keys()]).toEqual([`${v2Prefix}opencode.db`])
   })
 })

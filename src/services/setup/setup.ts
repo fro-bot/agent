@@ -1,34 +1,27 @@
-import type {Logger, OpenCodeInstallResult, SetupInputs, SetupResult} from './types.js'
-import {mkdir, writeFile} from 'node:fs/promises'
-import {homedir} from 'node:os'
+import type {OpenCodeInstallResult, SetupInputs, SetupResult} from './types.js'
 import {join} from 'node:path'
 import process from 'node:process'
 import * as core from '@actions/core'
 import {getOctokit} from '@actions/github'
-import {FRO_BOT_PLUGIN_VERSION, resolveSystematicSkillsDirsV1} from '@fro-bot/runtime'
-import {getRunnerOS, getXdgDataHome} from '../../shared/env.js'
+import {FRO_BOT_PLUGIN_VERSION} from '@fro-bot/runtime'
+import {getRunnerOS} from '../../shared/env.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {createLogger} from '../../shared/logger.js'
 import {createExecAdapter, createToolCacheAdapter} from './adapters.js'
-import {parseAuthJsonInput, populateAuthJson} from './auth-json.js'
-import {buildCIConfig} from './ci-config.js'
+import {parseAuthJsonInput} from './auth-json.js'
 import {parseProviderKeysV2} from './credential-files-v2.js'
 import {configureGhAuth, configureGitIdentity} from './gh-auth.js'
 import {defaultOpenCodeConfigDir} from './opencode-config-dir.js'
 import {
   getPlatformInfo,
   installOpenCode,
-  isStockV2Pin,
   opencodeBinaryPath,
   RECORDED_V2_PIN,
   resolveRequestedVersion,
   resolveStockV2Policy,
-  toolCacheVersion,
 } from './opencode.js'
 import {arePluginsCachedV2, installPluginsV2, resolveCacheHome, resolvePluginSpecsV2} from './plugin-install-v2.js'
-import {writeSessionToolsFile} from './session-tools-config.js'
 import {writeSystematicConfig} from './systematic-config.js'
-import {installSystematicPlugin} from './systematic-plugin.js'
 import {restoreToolsCache, saveToolsCache} from './tools-cache.js'
 
 // OpenCode reads boolean env flags through Effect's Config.boolean (true/yes/on/1/y vs false/no/off/0/n) and
@@ -36,13 +29,6 @@ import {restoreToolsCache, saveToolsCache} from './tools-cache.js'
 function isTruthyFlag(value: string | undefined): boolean {
   const normalized = value?.trim().toLowerCase() ?? ''
   return normalized !== '' && !['0', 'false', 'no', 'off', 'n'].includes(normalized)
-}
-
-const quietLogger: Logger = {
-  debug: () => undefined,
-  info: () => undefined,
-  warning: () => undefined,
-  error: () => undefined,
 }
 
 export async function runSetup(inputs: SetupInputs, githubToken: string): Promise<SetupResult | null> {
@@ -64,59 +50,51 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
     }
 
     // Determine OpenCode version. `latest` is the recorded V2 pin: no upstream lookup, so it cannot resolve to an
-    // unverified release. An explicit version (a V2 pin, a V1 harness build, a stock V1) is used as given.
+    // unverified release. Any other value is held to the pin by the policy below.
     const version = resolveRequestedVersion(inputs.opencodeVersion)
 
-    // A stock V2 pin is checked against the recorded pin BEFORE any cache is consulted, and every
-    // reusable V2 installation is keyed by the recorded digest. An unpinned version, a platform with
-    // no recorded digest, or a cache entry written before digests were recorded can never be accepted.
-    let v2Policy: ReturnType<typeof resolveStockV2Policy> | undefined
-    if (isStockV2Pin(version)) {
-      try {
-        v2Policy = resolveStockV2Policy(version, getPlatformInfo(), RECORDED_V2_PIN)
-      } catch (error) {
-        core.setFailed(`Failed to install OpenCode: ${toErrorMessage(error)}`)
-        return null
-      }
+    // The version is checked against the recorded pin BEFORE any cache is consulted, and every reusable
+    // installation is keyed by the recorded digest. An unpinned version, a platform with no recorded digest, or a
+    // cache entry written before digests were recorded can never be accepted.
+    let v2Policy: ReturnType<typeof resolveStockV2Policy>
+    try {
+      v2Policy = resolveStockV2Policy(version, getPlatformInfo(), RECORDED_V2_PIN)
+    } catch (error) {
+      core.setFailed(`Failed to install OpenCode: ${toErrorMessage(error)}`)
+      return null
     }
 
-    // OpenCode V2 (a stock pin) installs its plugins as exact versions, writes its provider keys as {file:} references
-    // at spawn time and never writes auth.json. Everything below that differs is gated on this.
-    let v2Specs: readonly string[] | undefined
-    let v2SystematicVersion: string | undefined
-    if (v2Policy !== undefined) {
-      const keys = parseProviderKeysV2(authConfig)
-      if (!keys.success) {
-        core.setFailed(`Invalid auth-json for OpenCode V2: ${keys.error.message}`)
-        return null
-      }
-      const specs = resolvePluginSpecsV2(inputs.systematicVersion)
-      if (!specs.success) {
-        core.setFailed(specs.error.message)
-        return null
-      }
-      v2Specs = specs.data.specs
-      v2SystematicVersion = specs.data.systematicVersion
+    // OpenCode V2 installs its plugins as exact versions, writes its provider keys as {file:} references at spawn
+    // time and never writes auth.json.
+    const keys = parseProviderKeysV2(authConfig)
+    if (!keys.success) {
+      core.setFailed(`Invalid auth-json for OpenCode V2: ${keys.error.message}`)
+      return null
     }
+    const specs = resolvePluginSpecsV2(inputs.systematicVersion)
+    if (!specs.success) {
+      core.setFailed(specs.error.message)
+      return null
+    }
+    const v2Specs = specs.data.specs
 
-    // V2 resolves `latest` to the pinned exact version, so the tools-cache key names what is actually installed.
-    const systematicVersion = v2SystematicVersion ?? inputs.systematicVersion
+    // `latest` resolves to the pinned exact version, so the tools-cache key names what is actually installed.
+    const systematicVersion = specs.data.systematicVersion
 
     // Restore tools cache before installs
     const runnerToolCache = process.env.RUNNER_TOOL_CACHE ?? '/opt/hostedtoolcache'
     const toolCachePath = join(runnerToolCache, 'opencode')
     const configDir = defaultOpenCodeConfigDir()
     // V2 finds its plugins under the cache home the server will read, so that is the directory the tools cache carries.
-    const opencodeCachePath =
-      v2Specs === undefined ? join(homedir(), '.cache', 'opencode') : join(resolveCacheHome(process.env), 'opencode')
+    const opencodeCachePath = join(resolveCacheHome(process.env), 'opencode')
     const runnerOS = getRunnerOS()
-    const frobotPluginKey = v2Specs === undefined ? {} : {frobotPluginVersion: FRO_BOT_PLUGIN_VERSION}
+    const frobotPluginKey = {frobotPluginVersion: FRO_BOT_PLUGIN_VERSION}
 
     const toolsCacheResult = await restoreToolsCache({
       logger,
       os: runnerOS,
       opencodeVersion: version,
-      ...(v2Policy === undefined ? {} : {opencodeDigestId: v2Policy.cacheId}),
+      opencodeDigestId: v2Policy.cacheId,
       systematicVersion,
       ...frobotPluginKey,
       toolCachePath,
@@ -125,29 +103,13 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
 
     const toolsCacheStatus: 'hit' | 'miss' = toolsCacheResult.hit ? 'hit' : 'miss'
 
-    let opencodeResult: OpenCodeInstallResult | undefined
-
-    // V2 never takes this shortcut: installOpenCode looks up the digest-bound identity itself.
-    if (toolsCacheResult.hit && v2Policy === undefined) {
-      const cachedPath = toolCache.find('opencode', toolCacheVersion(version))
-      if (cachedPath.length > 0) {
-        opencodeResult = {path: cachedPath, version, cached: true}
-        logger.info('Tools cache hit, using cached OpenCode CLI', {version})
-      } else {
-        logger.warning('Tools cache hit but binary not found in tool-cache, falling through to install', {
-          requestedVersion: version,
-          restoredKey: toolsCacheResult.restoredKey,
-        })
-      }
-    }
-
-    if (opencodeResult == null) {
-      try {
-        opencodeResult = await installOpenCode(version, logger, toolCache, execAdapter)
-      } catch (error) {
-        core.setFailed(`Failed to install OpenCode: ${toErrorMessage(error)}`)
-        return null
-      }
+    // Never short-circuits on a tools-cache hit: installOpenCode looks up the digest-bound identity itself.
+    let opencodeResult: OpenCodeInstallResult
+    try {
+      opencodeResult = await installOpenCode(version, logger, toolCache, execAdapter)
+    } catch (error) {
+      core.setFailed(`Failed to install OpenCode: ${toErrorMessage(error)}`)
+      return null
     }
 
     // Write Systematic config — always honored
@@ -159,159 +121,52 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
       }
     }
 
-    // Native session tools are always-on on V1. V2 gets them from the fro.bot plugin, which is installed below.
-    if (v2Specs === undefined) {
-      await writeSessionToolsFile(configDir, logger)
-    }
-
-    // OPENCODE_PURE makes OpenCode skip every external plugin (plugin/index.ts:181), Systematic and the
-    // task-reuse guard included, and the guard's config layer is no exception. filterAgentEnv denies it for
-    // the server child; say so rather than letting an operator think it took effect. (The guard itself is
-    // provisioned at server start, not here: features/agent/server-adapter.ts.)
+    // OPENCODE_PURE makes OpenCode skip every external plugin, Systematic and the fro.bot plugin included.
+    // filterAgentEnv denies it for the server child; say so rather than letting an operator think it took effect.
     if (isTruthyFlag(process.env.OPENCODE_PURE)) {
       logger.warning(
-        'OPENCODE_PURE is set in the runner environment; it is withheld from the OpenCode server so the task-reuse guard and Systematic plugins still load.',
+        'OPENCODE_PURE is set in the runner environment; it is withheld from the OpenCode server so the Systematic and fro.bot plugins still load.',
       )
     }
 
-    // V1 writes its config here. V2 builds its config at spawn time (`buildCIConfigV2`, called from the cache-restore
-    // phase): it carries run-scoped paths and the provider key files, and must exist even when this setup is skipped
-    // because a matching binary is already installed. Nothing V2 is written to the global config or exported.
-    //
-    // Written once here so an invalid `opencode-config` fails before any install, and once more after the Systematic
-    // install when the installed skills directory could be resolved (it does not exist yet on a cache miss). The second
-    // build gets a muted logger: its warnings repeat the first build's.
-    const writeV1Config = async (systematicSkillsDirs: readonly string[], buildLogger: Logger): Promise<boolean> => {
-      const ciConfigResult = buildCIConfig(
-        {
-          opencodeConfig: inputs.opencodeConfig,
-          systematicVersion,
-          integrationWorkDir: process.env.FRO_BOT_INTEGRATION_WORK_DIR,
-          systematicSkillsDirs,
-        },
-        buildLogger,
-      )
-      if (ciConfigResult.error != null) {
-        core.setFailed(ciConfigResult.error)
-        return false
-      }
-
-      const opencodeConfigPath = join(configDir, 'opencode.json')
-      await mkdir(configDir, {recursive: true})
-
-      // Start fresh from the CI config: no merge with a local or restored opencode.json
-      const freshConfigJson = JSON.stringify(ciConfigResult.config, null, 2)
-      core.exportVariable('OPENCODE_CONFIG_CONTENT', freshConfigJson)
-      await writeFile(opencodeConfigPath, freshConfigJson)
-      logger.info('Wrote fresh OpenCode config', {
-        path: opencodeConfigPath,
-        pluginCount: Array.isArray(ciConfigResult.config.plugin) ? ciConfigResult.config.plugin.length : 0,
-      })
-      return true
-    }
-    if (v2Specs === undefined && !(await writeV1Config([], logger))) {
-      return null
-    }
+    // The config is built at spawn time (`buildCIConfigV2`, called from the cache-restore phase): it carries
+    // run-scoped paths and the provider key files, and must exist even when this setup is skipped because a matching
+    // binary is already installed. Nothing is written to the global config or exported here.
 
     core.addPath(opencodeResult.path)
 
-    // V2: install both plugins as exact versions before the server ever starts, each under its own bound, unless the
+    // Install both plugins as exact versions before the server ever starts, each under its own bound, unless the
     // cache already holds them. A failure fails startup: the server would otherwise install them at boot with no
-    // bound, or skip a plugin that failed to load and keep serving. The V1 Systematic install below is not involved.
-    if (v2Specs !== undefined) {
-      const cacheHome = resolveCacheHome(process.env)
-      let installedNow = false
-      if (await arePluginsCachedV2(cacheHome, v2Specs)) {
-        logger.info('OpenCode V2 plugins already in the cache', {specs: v2Specs})
-      } else {
-        const installed = await installPluginsV2({
-          logger,
-          execAdapter,
-          opencodeBinaryPath: opencodeBinaryPath(opencodeResult.path),
-          specs: v2Specs,
-          cacheHome,
-        })
-        if (!installed.success) {
-          core.setFailed(`OpenCode plugin install failed: ${installed.error.message}`)
-          return null
-        }
-        installedNow = true
-      }
-      if (installedNow || toolsCacheResult.hit === false) {
-        await saveToolsCache({
-          logger,
-          os: runnerOS,
-          opencodeVersion: version,
-          ...(v2Policy === undefined ? {} : {opencodeDigestId: v2Policy.cacheId}),
-          systematicVersion,
-          ...frobotPluginKey,
-          toolCachePath,
-          opencodeCachePath,
-        })
-      }
-    }
-
-    // Both disjuncts are needed — the two flags are independent, not nested. A tools-cache hit
-    // whose binary went missing falls through to a fresh install (cached: false), which still needs
-    // the plugin installed and the cache re-saved; and `installOpenCode` reports cached: true from
-    // RUNNER_TOOL_CACHE alone, so a tools-cache key miss (bumped systematicVersion, or an earlier
-    // invocation that skipped its save) must still install and save even on a warm tool cache.
-    if (v2Specs === undefined && (opencodeResult.cached !== true || toolsCacheResult.hit === false)) {
-      const systematicPluginInstall = await installSystematicPlugin({
+    // bound, or skip a plugin that failed to load and keep serving.
+    const cacheHome = resolveCacheHome(process.env)
+    let installedNow = false
+    if (await arePluginsCachedV2(cacheHome, v2Specs)) {
+      logger.info('OpenCode V2 plugins already in the cache', {specs: v2Specs})
+    } else {
+      const installed = await installPluginsV2({
         logger,
         execAdapter,
         opencodeBinaryPath: opencodeBinaryPath(opencodeResult.path),
-        systematicVersion,
+        specs: v2Specs,
+        cacheHome,
       })
-
-      if (systematicPluginInstall.status === 'installed') {
-        await saveToolsCache({
-          logger,
-          os: runnerOS,
-          opencodeVersion: version,
-          ...(v2Policy === undefined ? {} : {opencodeDigestId: v2Policy.cacheId}),
-          systematicVersion,
-          toolCachePath,
-          opencodeCachePath,
-        })
-      } else {
-        // Name the likely cause when the parent env had NPM_CONFIG_* set: the install child
-        // (systematic-plugin.ts) deliberately does not inherit NPM_CONFIG_* so a network-fetched
-        // package's lifecycle scripts can't see registry/proxy overrides. List key NAMES only —
-        // never values — and never propose allowlisting; that would defeat the scrub.
-        // Case-insensitive: filterAgentEnv is deny-by-default, so lowercase `npm_config_*` (what
-        // npm itself exports) is dropped from the child too.
-        const npmConfigKeys = Object.keys(process.env).filter(key => key.toUpperCase().startsWith('NPM_CONFIG_'))
-        const npmConfigNote =
-          npmConfigKeys.length > 0
-            ? ` The install child does not inherit NPM_CONFIG_* environment variables (present in the parent env: ${npmConfigKeys.join(', ')}), which may explain the failure.`
-            : ''
-        const warningMessage = `Skipping tools cache save because Systematic plugin install did not complete${npmConfigNote}`
-        logger.warning(warningMessage, {
-          status: systematicPluginInstall.status,
-        })
-        core.warning(warningMessage)
-      }
-    }
-
-    // The bundled skills' own references and scripts live in the installed package, outside the checkout, and the
-    // build agent's `external_directory` deny shadows the allow OpenCode adds for them (fro-bot/agent#2009). Re-allow
-    // that one directory. Unresolved (the plugin is not installed, or the install failed): say so and add nothing,
-    // since the run can still do useful work without the skills' supporting files.
-    if (v2Specs === undefined) {
-      const systematicSkillsDirs = await resolveSystematicSkillsDirsV1(
-        resolveCacheHome(process.env),
-        systematicVersion,
-        logger,
-      )
-      if (systematicSkillsDirs.length === 0) {
-        logger.warning(
-          'Bundled Systematic skills directory not found; skills cannot read their own references under the external_directory deny',
-          {systematicVersion},
-        )
-      } else if (!(await writeV1Config(systematicSkillsDirs, quietLogger))) {
+      if (!installed.success) {
+        core.setFailed(`OpenCode plugin install failed: ${installed.error.message}`)
         return null
       }
+      installedNow = true
+    }
+    if (installedNow || toolsCacheResult.hit === false) {
+      await saveToolsCache({
+        logger,
+        os: runnerOS,
+        opencodeVersion: version,
+        opencodeDigestId: v2Policy.cacheId,
+        systematicVersion,
+        ...frobotPluginKey,
+        toolCachePath,
+        opencodeCachePath,
+      })
     }
 
     core.setOutput('opencode-path', opencodeResult.path)
@@ -340,14 +195,8 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
 
     await configureGitIdentity(octokit, ghResult.botLogin, logger, execAdapter)
 
-    // Populate auth.json. V2 never writes it: its provider keys become 0600 files referenced from the config at spawn
-    // time, so the V2 migration that imports auth.json (m39) has nothing to import and the saved database holds no key.
-    if (v2Specs === undefined) {
-      const storagePath = join(getXdgDataHome(), 'opencode')
-      const authJsonPath = await populateAuthJson(authConfig, storagePath, logger)
-      core.setOutput('auth-json-path', authJsonPath)
-      logger.info('auth.json populated', {path: authJsonPath})
-    }
+    // auth.json is never written: provider keys become 0600 files referenced from the config at spawn time, so the
+    // V2 migration that imports auth.json (m39) has nothing to import and the saved database holds no key.
 
     const duration = Date.now() - startTime
 

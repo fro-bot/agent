@@ -23,7 +23,6 @@ sources:
   - src/shared/cache-save-result.ts
   - src/features/observability/job-summary.ts
   - src/features/agent/attempt-outcome.ts
-  - src/features/agent/execution.ts
   - packages/runtime/src/agent/ownership-ledger.ts
   - packages/runtime/src/agent/ledger-reconcile.ts
   - packages/runtime/src/agent/error-format/format.ts
@@ -38,10 +37,6 @@ sources:
   - src/harness/phases/cache-restore.ts
   - src/harness/phases/session-prep.ts
   - src/harness/phases/execute.ts
-  - src/features/agent/retry.ts
-  - src/features/agent/session-poll.ts
-  - src/features/agent/streaming.ts
-  - src/features/agent/prompt-sender.ts
   - src/features/agent/response-file.ts
   - src/harness/phases/finalize.ts
   - src/harness/phases/cleanup.ts
@@ -78,7 +73,7 @@ sources:
   - RFCs/RFC-019-S3-Storage-Backend.md
   - ARCHITECTURE.md
   - src/services/cache/types.ts
-summary: "Action phases across OpenCode V1 and V2, from bootstrap and prompt submission through verified release and persistence"
+summary: "Action phases on OpenCode V2, from bootstrap and prompt submission through verified release and persistence"
 ---
 
 # Execution Lifecycle
@@ -87,7 +82,7 @@ Every Fro Bot run follows the same phase sequence, orchestrated by `src/harness/
 
 ## Phase Sequence
 
-The phase order is shared by both generations. The resolved executable version selects the server, session reader, execution backend, and release path together; it is not independently inferred at each call. The Action defaults to the recorded stock V2 pin and its `-v2.ts` implementations. Explicit V1 pins retain the compatibility path.
+The Action runs only OpenCode V2: the recorded stock pin and its `-v2.ts` implementations. A V1 `opencode-version` is rejected at input parsing, so no phase has a V1 branch.
 
 ```text
 main.ts
@@ -155,9 +150,7 @@ Posts visual feedback so the user knows the agent received their request. For co
 
 Restores the OpenCode storage directory from S3 backup first when configured, then falls back to GitHub Actions cache. The cache key is scoped by repository, branch, and OS to prevent cross-branch contamination. After restore, the module checks for corruption (unreadable directory, version mismatch) and falls back to clean state if needed. Credentials (`auth.json`) that may have leaked into cache from a prior run are deleted as a security measure.
 
-This phase also bootstraps the OpenCode SDK server and establishes a client connection — the server handle is reused throughout the remaining phases. Bootstrap does not report success on the SDK's own signal alone (a stdout string match satisfied once the HTTP listener binds, before this instance's lazy config/plugin/service init has run); it issues one bounded, instance-scoped `session.list` probe first, so a blocked instance bootstrap fails here, by name, instead of surfacing later as an unexplained request failure.
-
-That readiness mechanism is V1-specific. V2 uses `src/harness/phases/v2-server.ts`: prepare owner-only provider-key files, remove stale `auth.json`, ensure both required plugins are installed, assemble the ordered permission rules, clear held execution claims from restored state, then spawn and verify plugins, effective permissions, and provider authentication. Finally it waits for the V1 history-import endpoint to report completed. A failed gate shuts the server down and disables both main-step and post-hook session saves, avoiding persistence of half-imported or half-gated state. See [[Setup and Configuration]] and [[Session Persistence]].
+This phase also starts the OpenCode V2 server (`src/harness/phases/v2-server.ts`): prepare owner-only provider-key files, remove stale `auth.json`, ensure both required plugins are installed, assemble the ordered permission rules, clear held execution claims from restored state, then spawn and verify plugins, effective permissions, and provider authentication. Finally it waits for the V1 history-import endpoint to report completed. A failed gate shuts the server down and disables the main-step cache save.
 
 ## 7. Session Prep
 
@@ -171,37 +164,9 @@ V2 reads context through the native `/api/session` and session-context routes (`
 
 `execute-v2.ts` selects a backend whose session creation, prompt submission, overflow recovery, and prior-work search all use V2. Agent and model are session properties, while a prompt carries text and files. The event subscription must connect before the first send because the stream has no replay.
 
-V2 does not replay a failed admitted turn with the V1 continuation loop. The server handles transient provider retries. The Action retries eligible pre-send connection failures or explicit submission refusals; a transport failure of the prompt POST is instead `sendUncertain`. The request may already have been admitted, so resending could duplicate external effects. That case fails, stops the directory, and declines persistence and endorsement even if teardown later looks quiet.
+V2 does not replay a failed admitted turn. The server handles transient provider retries. The Action retries eligible pre-send connection failures or explicit submission refusals; a transport failure of the prompt POST is instead `sendUncertain`. The request may already have been admitted, so resending could duplicate external effects. That case fails, stops the directory, and declines persistence and endorsement even if teardown later looks quiet.
 
 The V2 consumer rejects permission requests and cancels forms in CI. Native events are normalized into root freshness, subagent and shell ownership, usage, and artifact observations. Successful execution leaves its observer running through release, since a queued notice may start a later root turn whose output or failure belongs to this same invocation.
-
-### V1 execution and continuation
-
-The SDK-specific details and continuation-prompt policy below describe the retained V1 path.
-
-The core phase. Calls `executeOpenCode()` which creates (or continues) an SDK session, sends the assembled prompt, and streams events back in real time. The SDK lifecycle follows the pattern: spawn server, connect client, create session, send prompt, process event stream, close.
-
-If a turn fails with a retryable error, the system retries up to three times with a continuation prompt. A configurable timeout (default: 30 minutes) bounds execution if the agent runs too long — but that bound is an internal execution deadline, not the whole GitHub Actions job timeout. The distinction matters: the deadline aborts only the agent's own work so that Finalize and Cleanup still get a bounded budget to preserve outcomes and persist state (`action.yaml` documents this boundary, and the job's own `timeout-minutes` remains the outer backstop). A run that hits the deadline is reported as a genuine terminal failure rather than a silent hang, and a pre-deadline terminal result is kept distinct from the bounded post-result teardown that follows it, so cleanup can never overwrite the real outcome.
-
-A permission ask raised mid-run no longer blocks until that deadline. OpenCode can emit an interactive permission request during a turn — a shell command, an out-of-tree file write — and in CI there is no operator to answer it, so an unanswered ask would previously pin the run open until the execution deadline elapsed. The streaming consumer (`src/features/agent/streaming.ts`) **denies and logs** any such ask as it arrives, and the two native ask defaults that are actually reachable in CI are denied at config time (see [[Setup and Configuration]]).
-
-Two properties of that branch are load-bearing, and both were learned the hard way. First, the ask is answered **regardless of which session raised it** — the branch checks only that the event names a session at all, and targets the reply at that session rather than the root. Routing asks through the same ownership filter used for activity events meant a background subagent's ask was silently skipped, so the child blocked forever, the root blocked on the child, and the run died at its CI job cap having delivered nothing observable. Second, the reply is **not awaited inside the stream loop**: awaiting it reproduced the same stall one layer up, where a single slow reply holds every subsequent event behind it. A failed reply is logged and execution continues, because throwing would abort the stream for every other in-flight ask and event. This is safe on the Action specifically because the harness starts its own loopback OpenCode server per run and wires an unconditional-reject responder to it, so every well-formed ask on that subscription belongs to this run's own process tree. The gateway deliberately keeps its ownership check on the same branch — it has a real human-answerable approval path, where answering everything would leak one run's approval into another run's thread. See [[Background Subagents and Ownership]].
-
-Each attempt now resolves to a **classified outcome** rather than a bare "retry or not" boolean (`src/features/agent/retry.ts`). The outcome distinguishes a submission that never reached the server (`submit_failed`) from a turn that actually ran and then failed, and among failed turns it separates retryable from terminal. The retry decision is _derived_ from that outcome — only a retryable turn failure retries — which keeps the classification, not a side-effect flag, as the authoritative signal. The prompt is never sent into an unconnected stream: the SDK's event stream is lazy (no request until the first read) and OpenCode replays nothing to a late connection, so a new prompt waits for the stream's first frame, `server.connected` (the server registers its listener before it emits it), for at most 10 s or the time the run has left. A stream that ends or stays silent before then fails the attempt as `submit_failed` with nothing sent. One subtlety this guards against: the event stream is connected _before_ the prompt is submitted, so if submission returns a transport error while the server has already accepted the prompt and begun working, the attempt is reclassified from `submit_failed` to a turn failure rather than resending the original prompt into a session that is already running it.
-
-Not every provider error is retryable. Classification prefers structured SDK evidence, then HTTP status, and finally a prose pattern when no stable marker is available (`packages/runtime/src/agent/error-format/format.ts`, with the error vocabulary in `types.ts`). A provider's `isRetryable` flag supports retrying an otherwise unclassified API failure, but known terminal classifications take precedence. Quota exhaustion (`quota_exceeded`) and rejected provider authentication (`provider_auth_error`) fail fast instead of consuming attempts on an unchanged limit or credential. The activity tracker latches the first terminal signal because provider retry activity, or a later `wait()` resolution, must not turn an observed failure into success. Polling also reconciles terminal evidence the event stream missed. Unresolvable-model failures follow the same fail-fast policy, described below.
-
-Completion evidence itself is scoped to a generation rather than read as a sticky flag. `ActivityTracker.rootFreshness` (`src/features/agent/streaming.ts`) carries a monotonic revision that advances only on renewed root-session activity, and an idle observation is stamped with the revision it was seen at, so evidence from a superseded generation cannot authorize finishing a later turn. This matters concretely because a background subagent's completion injects another parent turn onto the root session, and upstream persists that user message before the runner that will answer it starts running — a plain sticky idle-received flag read during that window could complete a turn that is still in flight. A completion timestamp is not a success certificate either: upstream stamps `time.completed` during processor cleanup, including failed and intermediate processing, so a qualified candidate additionally needs a finish reason present and not `tool-calls`/`unknown`, correlation to the latest root user message once one has been observed (a no-op in the common single-turn case, since `latestRootUserMessageId` is positively known only after a new root user turn — such as an injected background-task-completion turn — has been seen, and the pending-parent check is the operative guard until then), no non-provider-executed tool part left unless cleanup marked it an interrupted orphan, two consecutive observations, `session.status()` corroborating inactivity, and a drained ownership ledger. The governing rule underneath all of it is that a provisional observation may record evidence or tighten a guard, but it may never release a guard or authorize completion on its own — barrier resolution and revalidation clearing are committed only at final admission, synchronously with the settlement it protects. The accepted consequence is that a run whose evidence is genuinely unavailable now reaches the watchdog or the deadline rather than reporting an unproven success.
-
-The continuation prompt sent on a retry is no longer a fixed string that asserted a "network error (fetch failed)" cause regardless of what actually happened. It is built from the observed error type (`src/features/agent/prompt-sender.ts`), so a rate-limit retry says rate limit and a timeout says timeout, and it asks the model to _continue the remaining objective_ rather than to "resume" — a distinction that matters because a credential-provisioned run is additionally told to verify what has already landed (external changes and response artifacts) before acting, so it does not repeat a side effect that already succeeded. Recovery also treats the response file by _status_ rather than mere existence (`src/features/agent/response-file.ts`): an agent that created the file and then overflowed before writing a body leaves it empty, so the harness inspects the file and proceeds with recovery only when the deliverable is genuinely absent, declining to recover — rather than silently posting nothing — when the file exists but cannot be parsed. Recovery also probes where the write actually landed. An earlier version searched a fallback path (`_temp/fro-bot-response/<runId>-<attempt>/<nonce>.md`) the write never used, so a stray file went unrecovered. The deny rule that keeps the model out of that fallback directory and the recovery probe that scans it are now derived from a single shared definition (`packages/runtime/src/agent/response-file.ts`), so the guard and the recovery can no longer drift apart and point at different paths.
-
-When a terminal failure reaches the user, its diagnostics are handled carefully: provider-controlled error text is kept out of the trusted failure summary the action delivers, so a hostile or noisy provider message cannot smuggle content into the run's authoritative outcome. The structured session error is preserved through teardown rather than being swallowed by the cleanup path, which is what lets a failed run deliver an accurate, trustworthy failure notice instead of a generic one.
-
-An unresolvable model is also terminal. OpenCode reports this as a generic `UnknownError`, so `classifyModelNotFoundError` (`packages/runtime/src/agent/error-format/format.ts`) recognizes its model-not-found message and extracts only the model identifier and up to five validated suggestion identifiers. The Action records `model_not_found` as a latched terminal signal and stops the turn without waiting for the inactivity watchdog or retrying the same configuration. The job summary carries the classifier's suggested action, distinguishing an incorrect model ID or an unavailable model catalog from a transient transport failure. See [[Troubleshooting]].
-
-Usage accounting is per assistant message, not a running total supplied by OpenCode. The stream consumer retains the latest snapshot for each owned session/message pair and sums those snapshots, so repeated updates replace one message's contribution while later root turns and adopted descendants add their own tokens and cost. Final message retrieval uses the same additive interpretation rather than overwriting streamed totals with the last root reply.
-
-Reasoning and response text share the SDK's text-delta shape. The Action records reasoning-part IDs from `message.part.updated` and excludes their later deltas from response text, matching the gateway. A delta arriving before its part is registered remains indistinguishable and is appended; neither surface infers a part's kind from its content.
 
 ## 9. Drain
 
@@ -212,18 +177,6 @@ Reasoning and response text share the SDK's text-delta shape. The Action records
 The observer remains open until the directory decision. Later root turns are merged into success/failure, artifacts, and usage before Finalize. Pruning runs after that observation ends, while the server is still available. Shutdown then confirms the child process exited. Thus V2 has already shut down before review reconciliation and response delivery, and Cleanup handles persistence rather than repeating that lifecycle.
 
 An exceptional exit before this phase still runs a stop-and-release attempt from `run.ts`'s outer `finally`. An unconfirmed stop or server exit declines saving; an expired successful-run drain remains incomplete even if cancellation subsequently confirms quiet, because work was cut short. A failed overflow stop also prevents starting a replacement session in the same checkout.
-
-### V1 ledger drain
-
-Execute can finish while work it started is still running. OpenCode's background subagent dispatch returns immediately and leaves the child running as a detached fiber, and the parent session reports idle without consulting it — so the root's turn ending is no longer the same event as the run's work ending. The drain phase (`runDrain`, `src/harness/phases/execute.ts`) exists to reconcile those two.
-
-Its position in the sequence is the design. Drain sits after Execute returns and strictly before Review Reconciliation, Finalize, and Cleanup, because everything below it either publishes a result, persists state, or releases the coordination lock — and each of those is wrong to do on top of a live writer. Folding drain into Cleanup would have been simpler and would have published a response describing work still changing underneath it.
-
-Drain reconciles the run's ownership ledger once unconditionally, then returns immediately if it is drained; an empty ledger makes no remote calls. Otherwise it polls until the ledger drains or its deadline expires, at which point every entry not confirmed settled is individually aborted and then re-checked, and anything still unconfirmed is recorded as unknown rather than assumed finished. The drain budget is carved out of the same wall-clock budget as execution — the total timeout minus a 30-second teardown reserve minus what execution already spent — so one deadline covers both rather than letting drain extend a finite run indefinitely.
-
-With `timeout: 0`, drain has no Action deadline and keeps waiting while reconciliation observes owned work running. Three consecutive passes observing no tracked live child while ownership remains unresolved end that wait and enter cancellation, so an unreachable server cannot prevent cleanup forever. Every drain reconciliation pass and child abort is bounded to five seconds with an aborted signal; an abandoned pass cannot later mutate the ledger. [[Background Subagents and Ownership]] details the distinction between observed liveness and an unresolved ledger entry.
-
-When there is no ledger, or when execution never ran, the phase is a complete no-op. [[Background Subagents and Ownership]] covers the ledger's states, the reconciliation rules, and the parallel design on the gateway.
 
 ## 10. Review Reconciliation
 
@@ -237,7 +190,7 @@ The phase is **fail-safe**: any error logs a warning and no-ops. It never throws
 
 ## 11. Finalize
 
-Collects metrics and sets action outputs (session ID, cache status, duration), and owns response delivery. On V1 the preceding execution path writes a synthetic summary and Finalize prunes sessions. V2 writes no session summary and has already pruned during release, before shutting down the server, so these operations are not repeated here.
+Collects metrics and sets action outputs (session ID, cache status, duration), and owns response delivery. The run writes no session summary and has already pruned during release, before shutting down the server, so neither is repeated here.
 
 The Actions job summary is HTML, while the comment footer is Markdown. `src/shared/summary-html.ts` builds escaped links, emphasis, code spans, and paragraphs for `job-summary.ts`, because GitHub does not interpret Markdown inside the toolkit's HTML tables and lists. Dynamic diagnostic text is escaped once, and remediation paragraphs stay outside the tables, preserving readable links and line breaks without treating error text as markup.
 
@@ -284,6 +237,8 @@ Two state keys cross the process boundary between the main step and the post hoo
 `skipped-empty` is worth calling out as the case that does _not_ fold into `skipped`. "No cacheable content existed" is a point-in-time filesystem observation, not a configuration constant, so the post hook retries it: the retry re-runs the SQLite checkpoint before re-checking for content, a small cost weighed against losing a session.
 
 `CLEANUP_METADATA_WRITTEN` answers a question `CACHE_SAVED` structurally cannot. Cleanup uploads a rich run-metadata payload — token usage, timing, session IDs, PRs and commits, errors — to the object store, and the post hook has only a thin `cleanupSkipped: true` placeholder to write. But `run.ts` seeds `CACHE_SAVED` with `not-persisted` before cleanup ever executes, so that value is equally consistent with "cleanup ran and its cache write was denied" and "cleanup never ran at all." Using it to gate the metadata write meant the placeholder could clobber the real payload. The dedicated key is set unconditionally by cleanup, independent of the cache outcome, and the post hook writes its placeholder only when the key is absent.
+
+A run saves session state only after it has restored the cache and started the V2 server. `run.ts` writes `shouldSaveCache=false` first and flips it to `true` only once the server is up, and it declines the cleanup save for a run that ended earlier: a rejected input, a failed setup, a skipped event, or a failed restore. Until the server starts, the OpenCode data on the runner is whatever the runner already held, not this run's history, and saving it under the V2 keys could overwrite good history. A crash after the server started still gets the post hook's retry, under the same V2 keys.
 
 ## Event Types
 
@@ -374,8 +329,8 @@ main.ts
         │     processAttachments → buildAgentPrompt (packages/runtime)
         │
         ├─→ execute phase
-        │     executeOpenCode → bootstrapOpenCodeServer → sendPromptToSession
-        │       → runPromptAttempt → processEventStream (SSE)
+        │     executeOpenCodeV2 → sendPromptToSessionV2
+        │       → runPromptAttemptV2 → processEventStreamV2 (SSE)
         │     (onPermissionAsked auto-denies any permission.asked event immediately —
         │      there is no interactive approval path in CI, so an unanswered ask must
         │      never be left to block the run until the execution deadline)

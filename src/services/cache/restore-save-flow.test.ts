@@ -12,6 +12,7 @@ import * as core from '@actions/core'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {err, ok} from '../../shared/types.js'
 import {restoreCache, saveCache, type CacheAdapter, type RestoreCacheOptions, type SaveCacheOptions} from './index.js'
+import {buildCachePathsV1Sqlite} from './paths.js'
 
 // The checkpoint decline path writes a job summary via core.summary. None of these tests
 // depend on real @actions/core behavior otherwise (logging uses the local test logger
@@ -157,7 +158,6 @@ describe('restore/save object-store integration flow', () => {
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '1.2.0',
       cacheAdapter: cache.adapter,
       storeConfig: testStoreConfig,
       storeAdapter: store.adapter,
@@ -185,7 +185,6 @@ describe('restore/save object-store integration flow', () => {
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '1.2.0',
       cacheAdapter: cache.adapter,
       storeConfig: testStoreConfig,
       storeAdapter: store.adapter,
@@ -196,7 +195,7 @@ describe('restore/save object-store integration flow', () => {
 
     // #then object store and cache both receive the save
     expect(saveResult).toMatchObject({cachePersisted: true, storePersisted: true, outcome: 'persisted'})
-    expect(store.objects.get('fro-bot-state/github/owner/repo/sessions/opencode.db')?.toString('utf8')).toBe(
+    expect(store.objects.get('fro-bot-state/github/owner/repo/sessions-v2/opencode.db')?.toString('utf8')).toBe(
       'first-run-db',
     )
     expect(cache.saveCache).toHaveBeenCalledWith([storagePath, dbPath], expect.any(String))
@@ -205,7 +204,9 @@ describe('restore/save object-store integration flow', () => {
   it('restores from object store on second run after cache miss', async () => {
     const cache = createMockCacheAdapter(undefined)
     const store = createInMemoryStoreAdapter({
-      initialObjects: new Map([['fro-bot-state/github/owner/repo/sessions/opencode.db', Buffer.from('second-run-db')]]),
+      initialObjects: new Map([
+        ['fro-bot-state/github/owner/repo/sessions-v2/opencode.db', Buffer.from('second-run-db')],
+      ]),
     })
 
     const restoreOptions: RestoreCacheOptions = {
@@ -213,7 +214,6 @@ describe('restore/save object-store integration flow', () => {
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '1.2.0',
       cacheAdapter: cache.adapter,
       storeConfig: testStoreConfig,
       storeAdapter: store.adapter,
@@ -237,7 +237,7 @@ describe('restore/save object-store integration flow', () => {
     const cache = createMockCacheAdapter('restored-cache-key')
     const store = createInMemoryStoreAdapter({
       initialObjects: new Map([
-        ['fro-bot-state/github/owner/repo/sessions/opencode.db', Buffer.from('fresh-store-db')],
+        ['fro-bot-state/github/owner/repo/sessions-v2/opencode.db', Buffer.from('fresh-store-db')],
       ]),
     })
 
@@ -250,7 +250,6 @@ describe('restore/save object-store integration flow', () => {
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '1.2.0',
       cacheAdapter: cache.adapter,
       storeConfig: testStoreConfig,
       storeAdapter: store.adapter,
@@ -275,7 +274,6 @@ describe('restore/save object-store integration flow', () => {
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '1.2.0',
       cacheAdapter: cache.adapter,
       storeConfig: testStoreConfig,
       storeAdapter: store.adapter,
@@ -286,7 +284,7 @@ describe('restore/save object-store integration flow', () => {
 
     // #then both object store and cache receive the authoritative session database
     expect(saveResult).toMatchObject({cachePersisted: true, storePersisted: true, outcome: 'persisted'})
-    expect(store.objects.get('fro-bot-state/github/owner/repo/sessions/opencode.db')?.toString('utf8')).toBe(
+    expect(store.objects.get('fro-bot-state/github/owner/repo/sessions-v2/opencode.db')?.toString('utf8')).toBe(
       'fresh-store-db',
     )
     expect(cache.saveCache).toHaveBeenCalledWith([storagePath, dbPath], expect.any(String))
@@ -295,7 +293,7 @@ describe('restore/save object-store integration flow', () => {
   it('rejects malicious object-store keys during restore', async () => {
     const cache = createMockCacheAdapter(undefined)
     const store = createInMemoryStoreAdapter({
-      initialObjects: new Map([['fro-bot-state/github/owner/repo/sessions/../escape.db', Buffer.from('escape')]]),
+      initialObjects: new Map([['fro-bot-state/github/owner/repo/sessions-v2/../escape.db', Buffer.from('escape')]]),
     })
 
     const restoreOptions: RestoreCacheOptions = {
@@ -303,7 +301,6 @@ describe('restore/save object-store integration flow', () => {
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '1.2.0',
       cacheAdapter: cache.adapter,
       storeConfig: testStoreConfig,
       storeAdapter: store.adapter,
@@ -338,7 +335,6 @@ describe('restore/save object-store integration flow', () => {
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '1.2.0',
       cacheAdapter: cache.adapter,
       storeConfig: testStoreConfig,
       storeAdapter: store.adapter,
@@ -385,7 +381,6 @@ describe('restore/save object-store integration flow', () => {
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '1.2.0',
       cacheAdapter: cache.adapter,
       storeConfig: testStoreConfig,
       storeAdapter: store.adapter,
@@ -400,9 +395,9 @@ describe('restore/save object-store integration flow', () => {
     // #then the object store receives only the main db — neither sidecar ever crosses the
     // boundary — and the cache adapter agrees
     expect(saveResult).toMatchObject({cachePersisted: true, storePersisted: true, outcome: 'persisted'})
-    expect(store.objects.has('fro-bot-state/github/owner/repo/sessions/opencode.db')).toBe(true)
-    expect(store.objects.has('fro-bot-state/github/owner/repo/sessions/opencode.db-wal')).toBe(false)
-    expect(store.objects.has('fro-bot-state/github/owner/repo/sessions/opencode.db-shm')).toBe(false)
+    expect(store.objects.has('fro-bot-state/github/owner/repo/sessions-v2/opencode.db')).toBe(true)
+    expect(store.objects.has('fro-bot-state/github/owner/repo/sessions-v2/opencode.db-wal')).toBe(false)
+    expect(store.objects.has('fro-bot-state/github/owner/repo/sessions-v2/opencode.db-shm')).toBe(false)
     expect(cache.saveCache).toHaveBeenCalledWith([storagePath, dbPath], expect.any(String))
 
     db.close()
@@ -412,9 +407,9 @@ describe('restore/save object-store integration flow', () => {
     const cache = createMockCacheAdapter(undefined)
     const store = createInMemoryStoreAdapter({
       initialObjects: new Map([
-        ['fro-bot-state/github/owner/repo/sessions/opencode.db', Buffer.from('object-store-db')],
+        ['fro-bot-state/github/owner/repo/sessions-v2/opencode.db', Buffer.from('object-store-db')],
         // A shm object uploaded before this fix shipped; download must remain tolerant of it.
-        ['fro-bot-state/github/owner/repo/sessions/opencode.db-shm', Buffer.from('stale-machine-local-shm')],
+        ['fro-bot-state/github/owner/repo/sessions-v2/opencode.db-shm', Buffer.from('stale-machine-local-shm')],
       ]),
     })
 
@@ -423,7 +418,6 @@ describe('restore/save object-store integration flow', () => {
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '1.2.0',
       cacheAdapter: cache.adapter,
       storeConfig: testStoreConfig,
       storeAdapter: store.adapter,
@@ -467,7 +461,6 @@ describe('restore/save object-store integration flow', () => {
       logger,
       storagePath,
       authPath,
-      opencodeVersion: '1.2.0',
       cacheAdapter: cache.adapter,
       storeConfig: testStoreConfig,
       storeAdapter: store.adapter,
@@ -516,9 +509,9 @@ describe('restore/save object-store integration flow', () => {
     // reached, proving the wal was genuinely downloaded and not merely absent.
     const store = createInMemoryStoreAdapter({
       initialObjects: new Map([
-        ['fro-bot-state/github/owner/repo/sessions/opencode.db', Buffer.from('object-store-db')],
-        ['fro-bot-state/github/owner/repo/sessions/opencode.db-wal', Buffer.from('stale-generation-wal')],
-        ['fro-bot-state/github/owner/repo/sessions/zzz-throw-trigger', Buffer.from('irrelevant')],
+        ['fro-bot-state/github/owner/repo/sessions-v2/opencode.db', Buffer.from('object-store-db')],
+        ['fro-bot-state/github/owner/repo/sessions-v2/opencode.db-wal', Buffer.from('stale-generation-wal')],
+        ['fro-bot-state/github/owner/repo/sessions-v2/zzz-throw-trigger', Buffer.from('irrelevant')],
       ]),
     })
     store.download.mockImplementation(async (key, localPath) => {
@@ -545,7 +538,6 @@ describe('restore/save object-store integration flow', () => {
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '1.2.0',
       cacheAdapter: {restoreCache: actionsCacheRestore, saveCache: async () => 1},
       storeConfig: testStoreConfig,
       storeAdapter: store.adapter,
@@ -582,7 +574,7 @@ function restoredRestoreKeys(restoreCache: ReturnType<typeof createTieredCacheAd
   return restoreCache.mock.calls.map(([, , restoreKeys]) => restoreKeys)
 }
 
-describe('restore/save flow across session generations', () => {
+describe('restore/save flow: V2 keys first, V1 as the restore fallback', () => {
   const v1ObjectKey = 'fro-bot-state/github/owner/repo/sessions/opencode.db'
   const v2ObjectKey = 'fro-bot-state/github/owner/repo/sessions-v2/opencode.db'
   const v2BranchKey = 'opencode-v2-storage-github-owner-repo-main-'
@@ -610,17 +602,12 @@ describe('restore/save flow across session generations', () => {
     await fs.rm(tempDir, {recursive: true, force: true})
   })
 
-  function restoreOptions(
-    opencodeVersion: string | null,
-    cache: CacheAdapter,
-    store?: ObjectStoreAdapter,
-  ): RestoreCacheOptions {
+  function restoreOptions(cache: CacheAdapter, store?: ObjectStoreAdapter): RestoreCacheOptions {
     return {
       components: testComponents,
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion,
       cacheAdapter: cache,
       ...(store === undefined ? {} : {storeConfig: testStoreConfig, storeAdapter: store}),
     }
@@ -637,8 +624,8 @@ describe('restore/save flow across session generations', () => {
         ]),
       })
 
-      // #when a V2 run restores
-      const result = await restoreCache(restoreOptions('2.2.0', cache.adapter, store.adapter))
+      // #when a run restores
+      const result = await restoreCache(restoreOptions(cache.adapter, store.adapter))
 
       // #then the V2 object wins, the V1 prefix is never listed, and the cache is not consulted
       expect(result).toMatchObject({hit: true, source: 'storage'})
@@ -652,8 +639,8 @@ describe('restore/save flow across session generations', () => {
       const cache = createTieredCacheAdapter({[v2BranchKey]: 'v2-branch-hit'})
       const store = createInMemoryStoreAdapter({initialObjects: new Map([[v1ObjectKey, Buffer.from('v1-db')]])})
 
-      // #when a V2 run restores
-      const result = await restoreCache(restoreOptions('2.2.0', cache.adapter, store.adapter))
+      // #when a run restores
+      const result = await restoreCache(restoreOptions(cache.adapter, store.adapter))
 
       // #then V2 is tried first, V1 is restored second, and the cache stays untouched
       expect(result).toMatchObject({hit: true, source: 'storage'})
@@ -671,8 +658,8 @@ describe('restore/save flow across session generations', () => {
       const store = createInMemoryStoreAdapter({initialObjects: new Map([[v1ObjectKey, Buffer.from('v1-db')]])})
       store.list.mockImplementationOnce(async () => err(new Error('listing denied')))
 
-      // #when a V2 run restores
-      const result = await restoreCache(restoreOptions('2.2.0', cache.adapter, store.adapter))
+      // #when a run restores
+      const result = await restoreCache(restoreOptions(cache.adapter, store.adapter))
 
       // #then the V1 object still restores
       expect(result).toMatchObject({hit: true, source: 'storage'})
@@ -685,35 +672,13 @@ describe('restore/save flow across session generations', () => {
       const store = createInMemoryStoreAdapter()
       await fs.mkdir(storagePath, {recursive: true})
 
-      // #when a V2 run restores
-      const result = await restoreCache(restoreOptions('2.2.0', cache.adapter, store.adapter))
+      // #when a run restores
+      const result = await restoreCache(restoreOptions(cache.adapter, store.adapter))
 
       // #then both S3 prefixes were tried and the cache supplied the hit
       expect(result).toMatchObject({hit: true, source: 'cache'})
       expect(store.list).toHaveBeenCalledTimes(2)
       expect(restoredRestoreKeys(cache.restoreCache)).toEqual([[v2BranchKey]])
-    })
-
-    it('never lists sessions-v2 during a V1 restore', async () => {
-      // #given both generations in the bucket
-      const cache = createTieredCacheAdapter()
-      const store = createInMemoryStoreAdapter({
-        initialObjects: new Map([
-          [v1ObjectKey, Buffer.from('v1-db')],
-          [v2ObjectKey, Buffer.from('v2-db')],
-        ]),
-      })
-
-      // #when a V1 run (and a run with no version state) restores
-      await restoreCache(restoreOptions('1.19.4', cache.adapter, store.adapter))
-      await restoreCache(restoreOptions(null, cache.adapter, store.adapter))
-
-      // #then only the V1 prefix is ever listed and only V1 data lands
-      expect(store.list.mock.calls.map(([prefix]) => prefix)).toEqual([
-        'fro-bot-state/github/owner/repo/sessions/',
-        'fro-bot-state/github/owner/repo/sessions/',
-      ])
-      await expect(fs.readFile(dbPath, 'utf8')).resolves.toBe('v1-db')
     })
   })
 
@@ -751,7 +716,7 @@ describe('restore/save flow across session generations', () => {
       await fs.mkdir(storagePath, {recursive: true})
 
       // #when restoring
-      const result = await restoreCache(restoreOptions('2.2.0', cache.adapter))
+      const result = await restoreCache(restoreOptions(cache.adapter))
 
       // #then the tiers were tried in order, stopping at the first hit
       expect(result).toMatchObject({hit: true, source: 'cache', key: tier.expectedKey})
@@ -763,8 +728,8 @@ describe('restore/save flow across session generations', () => {
       const cache = createTieredCacheAdapter({[v1BranchKey]: 'v1-branch-entry', [v2RepoKey]: 'v2-repo-entry'})
       await fs.mkdir(storagePath, {recursive: true})
 
-      // #when a V2 run restores
-      const result = await restoreCache(restoreOptions('2.2.0', cache.adapter))
+      // #when a run restores
+      const result = await restoreCache(restoreOptions(cache.adapter))
 
       // #then the V2 branch tier misses and the V1 branch tier wins, as the precedence order says
       expect(result).toMatchObject({hit: true, key: 'v1-branch-entry'})
@@ -774,8 +739,8 @@ describe('restore/save flow across session generations', () => {
       // #given an empty cache
       const cache = createTieredCacheAdapter()
 
-      // #when a V2 run restores
-      const result = await restoreCache(restoreOptions('2.2.0', cache.adapter))
+      // #when a run restores
+      const result = await restoreCache(restoreOptions(cache.adapter))
 
       // #then every tier was tried in order and the restore is a miss with a prepared storage directory
       expect(result).toMatchObject({hit: false, source: null})
@@ -783,73 +748,43 @@ describe('restore/save flow across session generations', () => {
       expect((await fs.stat(storagePath)).isDirectory()).toBe(true)
     })
 
-    it.each(['2.2.0', 'v2.2.0'])(
-      "asks each tier with that generation's own primary key and path list for %s",
-      async v2Version => {
-        // #given an empty cache, a project id path, and the path list a current V1 SQLite save writes
-        const cache = createTieredCacheAdapter()
-        const projectIdPath = path.join(tempDir, '.git', 'opencode')
-        const v1SaveCache = createTieredCacheAdapter()
-        await fs.mkdir(storagePath, {recursive: true})
-        await fs.writeFile(dbPath, 'v1-run-db', 'utf8')
-        await saveCache({
-          components: testComponents,
-          runId: 1,
-          logger: createTestLogger(),
-          storagePath,
-          authPath,
-          projectIdPath,
-          opencodeVersion: '1.19.4',
-          cacheAdapter: v1SaveCache.adapter,
-        })
-        const v1SavePaths = v1SaveCache.saveCache.mock.calls[0]?.[0] ?? []
+    it("asks each tier with that generation's own primary key and path list", async () => {
+      // #given an empty cache, a project id path, and the path list a V1 SQLite save wrote
+      const cache = createTieredCacheAdapter()
+      const projectIdPath = path.join(tempDir, '.git', 'opencode')
+      const v1SavePaths = buildCachePathsV1Sqlite(storagePath, projectIdPath)
+      await fs.mkdir(storagePath, {recursive: true})
 
-        // #when a V2 run restores
-        await restoreCache({...restoreOptions(v2Version, cache.adapter), projectIdPath})
+      // #when a run restores
+      await restoreCache({...restoreOptions(cache.adapter), projectIdPath})
 
-        // #then the V2 tiers use the V2 primary key and the V1 tiers use the V1 primary key
-        const primaryKeys = cache.restoreCache.mock.calls.map(([, primaryKey]) => primaryKey)
-        expect(primaryKeys).toEqual([
-          'opencode-v2-storage-github-owner-repo-main-Linux',
-          'opencode-storage-github-owner-repo-main-Linux',
-          'opencode-v2-storage-github-owner-repo-main-Linux',
-          'opencode-storage-github-owner-repo-main-Linux',
-        ])
-        for (const [paths] of cache.restoreCache.mock.calls) {
-          expect(paths).toEqual([storagePath, projectIdPath, dbPath])
-        }
+      // #then the V2 tiers use the V2 primary key and the V1 tiers use the V1 primary key
+      const primaryKeys = cache.restoreCache.mock.calls.map(([, primaryKey]) => primaryKey)
+      expect(primaryKeys).toEqual([
+        'opencode-v2-storage-github-owner-repo-main-Linux',
+        'opencode-storage-github-owner-repo-main-Linux',
+        'opencode-v2-storage-github-owner-repo-main-Linux',
+        'opencode-storage-github-owner-repo-main-Linux',
+      ])
+      for (const [paths] of cache.restoreCache.mock.calls) {
+        expect(paths).toEqual([storagePath, projectIdPath, dbPath])
+      }
 
-        // #then each V1 tier asks for the entry version a V1 SQLite save writes, so it can match an existing entry
-        expect(v1SavePaths).toEqual([storagePath, projectIdPath, dbPath])
-        const getCacheVersion = loadGetCacheVersion()
-        const v1TierCalls = cache.restoreCache.mock.calls.filter(
-          ([, primaryKey]) => primaryKey === 'opencode-storage-github-owner-repo-main-Linux',
-        )
-        expect(v1TierCalls).toHaveLength(2)
-        for (const [paths] of v1TierCalls) {
-          expect(getCacheVersion(paths)).toBe(getCacheVersion([...v1SavePaths]))
-        }
-      },
-    )
-
-    it('makes exactly one V1 call, with V1 keys only, when there is no V2 version state', async () => {
-      // #given a cache that misses, and each form of "no V2 version state"
-      for (const version of [null, undefined, '1.2.0', '1.19.4+harness.5bde2635']) {
-        const cache = createTieredCacheAdapter()
-
-        // #when restoring
-        await restoreCache(restoreOptions(version ?? null, cache.adapter))
-
-        // #then the restore is byte-identical to the pre-V2 call: one call, V1 primary key, V1 restore keys
-        expect(cache.restoreCache).toHaveBeenCalledTimes(1)
-        expect(cache.restoreCache.mock.calls[0]?.[1]).toBe('opencode-storage-github-owner-repo-main-Linux')
-        expect(cache.restoreCache.mock.calls[0]?.[2]).toEqual([v1BranchKey, v1RepoKey])
+      // #then each V1 tier asks for the entry version a V1 SQLite save wrote, so it can match an existing entry
+      expect(v1SavePaths).toEqual([storagePath, projectIdPath, dbPath])
+      const getCacheVersion = loadGetCacheVersion()
+      const v1TierCalls = cache.restoreCache.mock.calls.filter(
+        ([, primaryKey]) => primaryKey === 'opencode-storage-github-owner-repo-main-Linux',
+      )
+      expect(v1TierCalls).toHaveLength(2)
+      for (const [paths] of v1TierCalls) {
+        expect(getCacheVersion(paths)).toBe(getCacheVersion([...v1SavePaths]))
       }
     })
   })
 
   describe('saves', () => {
-    it('writes V2 keys only: sessions-v2 in the bucket and opencode-v2-storage in the cache', async () => {
+    it('writes V2 keys only, with no version state needed: sessions-v2 in the bucket and opencode-v2-storage in the cache', async () => {
       // #given a V2 run with a database to persist
       const cache = createTieredCacheAdapter()
       const store = createInMemoryStoreAdapter()
@@ -863,7 +798,6 @@ describe('restore/save flow across session generations', () => {
         logger: createTestLogger(),
         storagePath,
         authPath,
-        opencodeVersion: '2.2.0',
         cacheAdapter: cache.adapter,
         storeConfig: testStoreConfig,
         storeAdapter: store.adapter,
@@ -887,14 +821,13 @@ describe('restore/save flow across session generations', () => {
       await fs.mkdir(storagePath, {recursive: true})
       await fs.writeFile(dbPath, 'v2-run-db', 'utf8')
 
-      // #when a V2 run saves
+      // #when a run saves
       await saveCache({
         components: testComponents,
         runId: 808,
         logger: createTestLogger(),
         storagePath,
         authPath,
-        opencodeVersion: '2.2.0',
         cacheAdapter: cache.adapter,
         storeConfig: testStoreConfig,
         storeAdapter: store.adapter,
@@ -920,43 +853,11 @@ describe('restore/save flow across session generations', () => {
         logger: createTestLogger(),
         storagePath,
         authPath,
-        opencodeVersion: '2.2.0',
         cacheAdapter: cache.adapter,
       })
 
       // #then the save is reported as rejected, not persisted
       expect(result).toMatchObject({cachePersisted: false, outcome: 'cache-rejected'})
-    })
-
-    it('saves under V1 keys only when there is no V2 version state', async () => {
-      // #given each form of "no V2 version state" and a database to persist
-      for (const [index, version] of [null, undefined, '1.2.0'].entries()) {
-        const cache = createTieredCacheAdapter()
-        const store = createInMemoryStoreAdapter()
-        await fs.mkdir(storagePath, {recursive: true})
-        await fs.writeFile(path.join(storagePath, 'session.json'), '{"session":"created"}', 'utf8')
-        await fs.writeFile(dbPath, 'v1-run-db', 'utf8')
-
-        // #when saving
-        await saveCache({
-          components: testComponents,
-          runId: 1000 + index,
-          logger: createTestLogger(),
-          storagePath,
-          authPath,
-          ...(version === undefined ? {} : {opencodeVersion: version}),
-          cacheAdapter: cache.adapter,
-          storeConfig: testStoreConfig,
-          storeAdapter: store.adapter,
-        })
-
-        // #then only V1 names are written
-        expect([...store.objects.keys()]).toEqual([v1ObjectKey])
-        expect(cache.saveCache).toHaveBeenCalledTimes(1)
-        expect(cache.saveCache.mock.calls[0]?.[1]).toBe(
-          `opencode-storage-github-owner-repo-main-Linux-${1000 + index}-1`,
-        )
-      }
     })
   })
 
@@ -973,7 +874,6 @@ describe('restore/save flow across session generations', () => {
         logger: createTestLogger(),
         storagePath,
         authPath,
-        opencodeVersion: '2.2.0',
         cacheAdapter: cache.adapter,
         storeConfig: testStoreConfig,
         storeAdapter: store.adapter,
@@ -981,7 +881,7 @@ describe('restore/save flow across session generations', () => {
       await fs.rm(dbPath)
 
       // #when the next V2 run restores
-      const result = await restoreCache(restoreOptions('2.2.0', cache.adapter, store.adapter))
+      const result = await restoreCache(restoreOptions(cache.adapter, store.adapter))
 
       // #then it gets the V2 session back from the V2 object
       expect(result).toMatchObject({hit: true, source: 'storage'})

@@ -5,7 +5,6 @@ import * as path from 'node:path'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMetricsCollector} from '../../features/observability/index.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
-import {ok} from '../../shared/types.js'
 
 const mocks = vi.hoisted(() => ({
   restoreCache: vi.fn(),
@@ -13,7 +12,6 @@ const mocks = vi.hoisted(() => ({
   cleanStorage: vi.fn(),
   verifyDatabaseUsable: vi.fn(),
   ensureProjectId: vi.fn(),
-  bootstrapOpenCodeServer: vi.fn(),
   startActionOpenCodeV2: vi.fn(),
   setFailed: vi.fn(),
   setSecret: vi.fn(),
@@ -26,8 +24,6 @@ vi.mock('@actions/core', () => ({
   warning: vi.fn(),
   debug: vi.fn(),
 }))
-
-vi.mock('../../features/agent/index.js', () => ({bootstrapOpenCodeServer: mocks.bootstrapOpenCodeServer}))
 
 vi.mock('../../services/cache/index.js', () => ({
   buildCacheKeyComponents: () => ({agentIdentity: 'github', repo: 'owner/repo', ref: 'main', os: 'Linux'}),
@@ -125,14 +121,13 @@ describe('runCacheRestore on OpenCode V2', () => {
     mocks.checkpointDatabase.mockResolvedValue({status: 'nothing-to-checkpoint'})
     mocks.verifyDatabaseUsable.mockResolvedValue({usable: true})
     mocks.ensureProjectId.mockResolvedValue({projectId: 'a'.repeat(40), source: 'cached'})
-    mocks.bootstrapOpenCodeServer.mockResolvedValue(ok({}))
   })
 
   afterEach(() => {
     vi.unstubAllEnvs()
   })
 
-  it('starts the V2 server with the run, restore and credential facts and never the V1 bootstrap', async () => {
+  it('starts the V2 server with the run, restore and credential facts', async () => {
     // #given
     const {handle} = v2Handle()
     mocks.startActionOpenCodeV2.mockResolvedValue({success: true, data: handle})
@@ -142,7 +137,6 @@ describe('runCacheRestore on OpenCode V2', () => {
     await runCacheRestore(bootstrap(V2_VERSION), createMetricsCollector())
 
     // #then
-    expect(mocks.bootstrapOpenCodeServer).not.toHaveBeenCalled()
     const call = mocks.startActionOpenCodeV2.mock.calls[0]?.[0] as Record<string, unknown>
     expect(call).toMatchObject({
       binaryPath: '/opt/opencode',
@@ -231,8 +225,8 @@ describe('runCacheRestore on OpenCode V2', () => {
     // #when
     const result = await runCacheRestore(bootstrap(V2_VERSION), createMetricsCollector())
 
-    // #then the server is left running for the loop, tagged as V2, and nothing failed
-    expect(result).toMatchObject({generation: 'v2', serverHandle: handle})
+    // #then the server is left running for the loop and nothing failed
+    expect(result).toMatchObject({serverHandle: handle})
     expect(shutdown).not.toHaveBeenCalled()
     expect(mocks.setFailed).not.toHaveBeenCalled()
   })
@@ -262,20 +256,4 @@ describe('runCacheRestore on OpenCode V2', () => {
 
     expect(mocks.startActionOpenCodeV2.mock.calls[0]?.[0]).toMatchObject({model: null})
   })
-
-  it.each(['1.19.4', '1.19.4+harness.5bde2635', 'latest', 'not-a-version'])(
-    'leaves the V1 bootstrap alone for the version %j',
-    async version => {
-      // #given
-      const {runCacheRestore} = await import('./cache-restore.js')
-
-      // #when
-      const result = await runCacheRestore(bootstrap(version), createMetricsCollector())
-
-      // #then
-      expect(result).not.toBeNull()
-      expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalledTimes(1)
-      expect(mocks.startActionOpenCodeV2).not.toHaveBeenCalled()
-    },
-  )
 })

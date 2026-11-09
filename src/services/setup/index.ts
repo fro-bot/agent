@@ -1,8 +1,6 @@
 // Setup module public exports
 export {createExecAdapter, createToolCacheAdapter} from './adapters.js'
 export {parseAuthJsonInput, populateAuthJson} from './auth-json.js'
-export {buildCIConfig} from './ci-config.js'
-export type {CIConfigResult} from './ci-config.js'
 export {deepMerge} from './deep-merge.js'
 export {configureGhAuth, configureGitIdentity, getBotUserId} from './gh-auth.js'
 export {installOpenCode} from './opencode.js'

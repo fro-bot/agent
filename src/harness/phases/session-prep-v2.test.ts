@@ -1,20 +1,17 @@
 /**
- * Session prep on an OpenCode V2 run: continuity and prior-work context come from the V2 server's own routes, never from
- * the V1 SDK client (a V2 handle has none). The V1 tests live in `session-prep.test.ts`, unedited.
+ * Session prep: continuity and prior-work context come from the V2 server's own routes.
  */
 import type {OpenCodeV2ServerHandle} from '@fro-bot/runtime'
 import type {MetricsCollector} from '../../features/observability/index.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
-import type {CacheRestoreV2PhaseResult} from './cache-restore.js'
+import type {CacheRestorePhaseResult} from './cache-restore.js'
 import type {RoutingPhaseResult} from './routing.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {runSessionPrep} from './session-prep.js'
 
 const mocks = vi.hoisted(() => ({
   parseAttachmentUrls: vi.fn(() => []),
-  listSessions: vi.fn(),
-  resolveSessionForLogicalKey: vi.fn(),
-  searchSessions: vi.fn(),
+  buildLogicalKey: vi.fn(),
   logger: {debug: vi.fn(), info: vi.fn(), warning: vi.fn(), error: vi.fn()},
 }))
 
@@ -22,10 +19,7 @@ vi.mock('@fro-bot/runtime', async importOriginal => {
   const original: typeof import('@fro-bot/runtime') = await importOriginal()
   return {
     ...original,
-    buildLogicalKey: vi.fn(() => ({key: 'issue-42', entityType: 'issue', entityId: '42'})),
-    listSessions: mocks.listSessions,
-    resolveSessionForLogicalKey: mocks.resolveSessionForLogicalKey,
-    searchSessions: mocks.searchSessions,
+    buildLogicalKey: mocks.buildLogicalKey,
   }
 })
 vi.mock('../../features/attachments/index.js', () => ({
@@ -45,7 +39,7 @@ function session(id: string, title: string, updated: number) {
   return {id, projectID: 'prj', title, time: {created: 1, updated}, location: {directory: '/workspace/repo'}}
 }
 
-function cacheRestore(sessions: readonly unknown[], listStatus = 200): CacheRestoreV2PhaseResult {
+function cacheRestore(sessions: readonly unknown[], listStatus = 200): CacheRestorePhaseResult {
   const fetchRoute = vi.fn(async (path: string) => {
     if (path.startsWith('/api/session?')) {
       return new Response(JSON.stringify({data: sessions, cursor: {}}), {status: listStatus})
@@ -53,7 +47,6 @@ function cacheRestore(sessions: readonly unknown[], listStatus = 200): CacheRest
     return new Response(JSON.stringify({data: []}), {status: 200})
   })
   return {
-    generation: 'v2',
     cacheResult: {hit: false, key: null, restoredPath: null, corrupted: false, source: null},
     cacheStatus: 'miss',
     serverHandle: {
@@ -71,9 +64,10 @@ const routing = {
 } as unknown as RoutingPhaseResult
 const metrics = {addSessionUsed: vi.fn()} as unknown as MetricsCollector
 
-describe('runSessionPrep on an OpenCode V2 server', () => {
+describe('runSessionPrep', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    mocks.buildLogicalKey.mockReturnValue({key: 'issue-42', entityType: 'issue', entityId: '42'})
   })
 
   it('continues the session whose V2 title is the logical key, reading through the V2 routes only', async () => {
@@ -89,9 +83,6 @@ describe('runSessionPrep on an OpenCode V2 server', () => {
       isContinuation: true,
       sessionTitle: 'fro-bot: issue-42',
     })
-    expect(mocks.resolveSessionForLogicalKey).not.toHaveBeenCalled()
-    expect(mocks.listSessions).not.toHaveBeenCalled()
-    expect(mocks.searchSessions).not.toHaveBeenCalled()
     expect(result.recentSessions.map(item => item.id)).toEqual(['ses_thread', 'ses_other'])
   })
 
@@ -108,5 +99,29 @@ describe('runSessionPrep on an OpenCode V2 server', () => {
       'Session continuity: lookup error, will create new',
       expect.objectContaining({logicalKey: 'issue-42'}),
     )
+  })
+
+  it("resolves the logical key with the running job's invocation identity", async () => {
+    // #given the Observe job of a run is preparing its session
+    const restore = cacheRestore([])
+
+    // #when session preparation builds the logical key
+    await runSessionPrep(bootstrap, routing, restore, metrics)
+
+    // #then run-scoped (schedule/dispatch) keys are qualified by the job, so Observe cannot continue Remediate's root
+    // session
+    expect(mocks.buildLogicalKey).toHaveBeenCalledWith(routing.triggerResult.context, 'fro-bot-observe')
+  })
+
+  it('does not invent continuity when no logical key exists', async () => {
+    // #given an event that has no logical session identity
+    mocks.buildLogicalKey.mockReturnValue(null)
+    const restore = cacheRestore([session('ses_thread', 'fro-bot: issue-42', 9)])
+
+    // #when session preparation runs
+    const result = await runSessionPrep(bootstrap, routing, restore, metrics)
+
+    // #then no continuation identity is fabricated
+    expect(result).toMatchObject({logicalKey: null, continueSessionId: null, isContinuation: false, sessionTitle: null})
   })
 })

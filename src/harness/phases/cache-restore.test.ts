@@ -1,5 +1,4 @@
-import type {ObjectStoreAdapter} from '@fro-bot/runtime'
-import type {OpenCodeServerHandle} from '../../features/agent/index.js'
+import type {ObjectStoreAdapter, OpenCodeV2ServerHandle} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
 import type {ActionInputs, CacheResult} from '../../shared/types.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
@@ -24,7 +23,7 @@ const mocks = vi.hoisted(() => ({
   cleanStorage: vi.fn(),
   verifyDatabaseUsable: vi.fn(),
   ensureProjectId: vi.fn(),
-  bootstrapOpenCodeServer: vi.fn(),
+  startActionOpenCodeV2: vi.fn(),
   getGitHubWorkspace: vi.fn(),
   getOpenCodeAuthPath: vi.fn(),
   getOpenCodeStoragePath: vi.fn(),
@@ -35,8 +34,8 @@ const mocks = vi.hoisted(() => ({
   loggerError: vi.fn<Logger['error']>(),
 }))
 
-vi.mock('../../features/agent/index.js', () => ({
-  bootstrapOpenCodeServer: mocks.bootstrapOpenCodeServer,
+vi.mock('./v2-server.js', () => ({
+  startActionOpenCodeV2: mocks.startActionOpenCodeV2,
 }))
 
 vi.mock('../../services/cache/index.js', () => ({
@@ -55,6 +54,8 @@ vi.mock('../../shared/env.js', () => ({
   getGitHubWorkspace: mocks.getGitHubWorkspace,
   getOpenCodeAuthPath: mocks.getOpenCodeAuthPath,
   getOpenCodeStoragePath: mocks.getOpenCodeStoragePath,
+  getGitHubRunId: () => 777,
+  getGitHubRunAttempt: () => 1,
 }))
 
 // Only used by the object-store e2e suite below, which sets storeConfig.enabled: true and
@@ -84,10 +85,9 @@ const expectedDbPath = path.join(testDbDir, DB_MAIN_BASENAME)
 const expectedWalPath = path.join(testDbDir, DB_WAL_BASENAME)
 
 const stubServerHandle = {
-  client: {} as unknown as OpenCodeServerHandle['client'],
-  server: {url: 'http://localhost:0', close: vi.fn()},
-  shutdown: vi.fn().mockResolvedValue({quiesced: true}),
-} satisfies OpenCodeServerHandle
+  url: 'http://127.0.0.1:0',
+  shutdown: vi.fn(),
+} as unknown as OpenCodeV2ServerHandle
 
 function createActionInputs(overrides: Partial<ActionInputs> = {}): ActionInputs {
   return {
@@ -96,7 +96,7 @@ function createActionInputs(overrides: Partial<ActionInputs> = {}): ActionInputs
     trustedHeadSha: '',
     prompt: null,
     sessionRetention: 50,
-    opencodeVersion: '1.0.0',
+    opencodeVersion: '2.2.5',
     outputMode: 'branch-pr',
     agent: null,
     model: null,
@@ -125,7 +125,7 @@ function createBootstrapPhaseResult(overrides: Partial<BootstrapPhaseResult> = {
   return {
     inputs: createActionInputs(),
     logger: createMockLogger(),
-    opencodeResult: {path: '/usr/local/bin/opencode', version: '1.0.0', didSetup: false},
+    opencodeResult: {path: '/usr/local/bin/opencode', version: '2.2.5', didSetup: false},
     delivery: 'model-gh',
     responseFilePath: null,
     responseFilePathCandidates: null,
@@ -155,14 +155,14 @@ describe('runCacheRestore database repair', () => {
       os: 'Linux',
     })
     // Deliberately non-normalized (path.resolve collapses the '..' segment) so a test that
-    // asserts bootstrapOpenCodeServer receives the *normalized* form actually proves
+    // asserts startActionOpenCodeV2 receives the *normalized* form actually proves
     // normalizeWorkspacePath ran, rather than passing vacuously because the raw and
     // normalized forms happened to be byte-identical.
     mocks.getGitHubWorkspace.mockReturnValue('/tmp/../workspace')
     mocks.getOpenCodeAuthPath.mockReturnValue('/xdg/opencode/auth.json')
     mocks.getOpenCodeStoragePath.mockReturnValue(testStoragePath)
     mocks.ensureProjectId.mockResolvedValue({projectId: 'a'.repeat(40), source: 'cached'})
-    mocks.bootstrapOpenCodeServer.mockResolvedValue(ok(stubServerHandle))
+    mocks.startActionOpenCodeV2.mockResolvedValue(ok(stubServerHandle))
     mocks.verifyDatabaseUsable.mockResolvedValue({usable: true})
   })
 
@@ -186,17 +186,12 @@ describe('runCacheRestore database repair', () => {
     expect(mocks.loggerInfo).toHaveBeenCalledWith(
       'Repaired restored database: checkpointed write-ahead log before bootstrap',
     )
-    expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalled()
+    expect(mocks.startActionOpenCodeV2).toHaveBeenCalled()
     // Pins the exact positional shape so passing projectIdPath (also in scope here) by
     // mistake instead of the normalized workspace path is caught, not silently accepted.
     // The raw mocked workspace ('/tmp/../workspace') and the normalized form ('/workspace')
     // deliberately differ, so this assertion only passes if normalizeWorkspacePath actually ran.
-    expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.anything(),
-      '/workspace',
-      expect.anything(),
-    )
+    expect(mocks.startActionOpenCodeV2).toHaveBeenCalledWith(expect.objectContaining({workspacePath: '/workspace'}))
   })
 
   it('leaves an already-clean, usable database alone and logs nothing about repair', async () => {
@@ -257,7 +252,7 @@ describe('runCacheRestore database repair', () => {
       corrupted: true,
       source: null,
     })
-    expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalled()
+    expect(mocks.startActionOpenCodeV2).toHaveBeenCalled()
   })
 
   it('performs no repair or usability probe on a cache miss', async () => {
@@ -275,7 +270,7 @@ describe('runCacheRestore database repair', () => {
     expect(result).not.toBeNull()
     expect(mocks.checkpointDatabase).not.toHaveBeenCalled()
     expect(mocks.verifyDatabaseUsable).not.toHaveBeenCalled()
-    expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalled()
+    expect(mocks.startActionOpenCodeV2).toHaveBeenCalled()
   })
 
   it('does not fail the run when repair fails on a non-structural (busy/locked) database — bootstrap is still attempted', async () => {
@@ -297,7 +292,7 @@ describe('runCacheRestore database repair', () => {
     expect(mocks.cleanStorage).not.toHaveBeenCalled()
     expect(result?.cacheStatus).toBe('hit')
     expect(result?.cacheResult.hit).toBe(true)
-    expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalled()
+    expect(mocks.startActionOpenCodeV2).toHaveBeenCalled()
   })
 
   it('reports usable: true (leave-alone) for a non-structural checkpoint failure like "unable to open database file", not wiping storage', async () => {
@@ -321,7 +316,7 @@ describe('runCacheRestore database repair', () => {
     expect(result?.cacheStatus).toBe('hit')
     expect(result?.cacheResult.hit).toBe(true)
     expect(result?.cacheResult.corrupted).toBe(false)
-    expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalled()
+    expect(mocks.startActionOpenCodeV2).toHaveBeenCalled()
   })
 
   it('cleans storage and reports a corrupted cache when repair fails on a structurally corrupt database', async () => {
@@ -356,10 +351,10 @@ describe('runCacheRestore database repair', () => {
       corrupted: true,
       source: null,
     })
-    expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalled()
+    expect(mocks.startActionOpenCodeV2).toHaveBeenCalled()
   })
 
-  it('repairs the database after restore completes and before bootstrapOpenCodeServer is called', async () => {
+  it('repairs the database after restore completes and before startActionOpenCodeV2 is called', async () => {
     // #given mocks that each record their invocation order
     const order: string[] = []
     mocks.restoreCache.mockImplementation(async () => {
@@ -370,8 +365,8 @@ describe('runCacheRestore database repair', () => {
       order.push('checkpointDatabase')
       return {status: 'nothing-to-checkpoint'}
     })
-    mocks.bootstrapOpenCodeServer.mockImplementation(async () => {
-      order.push('bootstrapOpenCodeServer')
+    mocks.startActionOpenCodeV2.mockImplementation(async () => {
+      order.push('startActionOpenCodeV2')
       return ok(stubServerHandle)
     })
     const {runCacheRestore} = await import('./cache-restore.js')
@@ -382,7 +377,7 @@ describe('runCacheRestore database repair', () => {
     // #then the repair happens strictly between restore and bootstrap — an ordering
     // regression here would silently move the checkpoint cost back inside the bootstrap
     // budget it was moved out of
-    expect(order).toEqual(['restoreCache', 'checkpointDatabase', 'bootstrapOpenCodeServer'])
+    expect(order).toEqual(['restoreCache', 'checkpointDatabase', 'startActionOpenCodeV2'])
   })
 })
 
@@ -418,7 +413,7 @@ describe('runCacheRestore database repair (end-to-end against a real database)',
     mocks.getOpenCodeAuthPath.mockReturnValue(path.join(tempDir, 'auth.json'))
     mocks.getOpenCodeStoragePath.mockReturnValue(realStoragePath)
     mocks.ensureProjectId.mockResolvedValue({projectId: 'a'.repeat(40), source: 'cached'})
-    mocks.bootstrapOpenCodeServer.mockResolvedValue(ok(stubServerHandle))
+    mocks.startActionOpenCodeV2.mockResolvedValue(ok(stubServerHandle))
     mocks.restoreCache.mockResolvedValue(
       createCacheResult({hit: true, corrupted: false, source: 'cache', restoredPath: realStoragePath}),
     )
@@ -463,7 +458,7 @@ describe('runCacheRestore database repair (end-to-end against a real database)',
     // mock reporting success — and bootstrap still ran
     expect(result).not.toBeNull()
     expect((await fs.stat(walPath)).size).toBe(0)
-    expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalled()
+    expect(mocks.startActionOpenCodeV2).toHaveBeenCalled()
 
     // #then the data that lived only in the write-ahead log survived the checkpoint
     const verifyDb = new DatabaseSync(dbPath)
@@ -499,7 +494,7 @@ describe('runCacheRestore database repair (end-to-end against a real database)',
     await expect(fs.access(dbPath)).rejects.toThrow()
     await expect(fs.access(walPath)).rejects.toThrow()
     await expect(fs.readdir(realStoragePath)).resolves.toEqual([])
-    expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalled()
+    expect(mocks.startActionOpenCodeV2).toHaveBeenCalled()
   })
 
   it('retries and reports a non-structural failure for a real locked database, leaving storage intact and still running bootstrap', async () => {
@@ -530,7 +525,7 @@ describe('runCacheRestore database repair (end-to-end against a real database)',
       'Failed to repair restored database before bootstrap',
       expect.any(Object),
     )
-    expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalled()
+    expect(mocks.startActionOpenCodeV2).toHaveBeenCalled()
 
     holder.exec('COMMIT')
   })
@@ -556,7 +551,7 @@ describe('runCacheRestore database repair (end-to-end against a real database)',
     expect(result?.cacheResult.restoredPath).toBeNull()
     await expect(fs.access(dbPath)).rejects.toThrow()
     await expect(fs.readdir(realStoragePath)).resolves.toEqual([])
-    expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalled()
+    expect(mocks.startActionOpenCodeV2).toHaveBeenCalled()
   })
 
   it('passes a healthy, cleanly-checkpointed database with no write-ahead log through untouched — the common path must not regress', async () => {
@@ -589,7 +584,7 @@ describe('runCacheRestore database repair (end-to-end against a real database)',
     } finally {
       verifyDb.close()
     }
-    expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalled()
+    expect(mocks.startActionOpenCodeV2).toHaveBeenCalled()
   })
 })
 
@@ -644,7 +639,7 @@ describe('runCacheRestore usability probe via the object-store restore source (e
     mocks.getOpenCodeAuthPath.mockReturnValue(path.join(tempDir, 'auth.json'))
     mocks.getOpenCodeStoragePath.mockReturnValue(realStoragePath)
     mocks.ensureProjectId.mockResolvedValue({projectId: 'a'.repeat(40), source: 'cached'})
-    mocks.bootstrapOpenCodeServer.mockResolvedValue(ok(stubServerHandle))
+    mocks.startActionOpenCodeV2.mockResolvedValue(ok(stubServerHandle))
     // Delegate to the real restore/checkpoint/probe implementations so this suite exercises
     // the actual restoreFromObjectStore -> syncSessionsFromStore -> checkpointDatabase ->
     // verifyDatabaseUsable chain, not a mocked CacheResult shape.
@@ -689,7 +684,7 @@ describe('runCacheRestore usability probe via the object-store restore source (e
     expect(result?.cacheResult.restoredPath).toBeNull()
     await expect(fs.access(dbPath)).rejects.toThrow()
     await expect(fs.readdir(realStoragePath)).resolves.toEqual([])
-    expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalled()
+    expect(mocks.startActionOpenCodeV2).toHaveBeenCalled()
   })
 
   it('removes a stale write-ahead log downloaded from the object store before the restored database is ever opened (fresh db + stale wal never reaches SQLite)', async () => {
@@ -747,6 +742,6 @@ describe('runCacheRestore usability probe via the object-store restore source (e
     } finally {
       verifyDb.close()
     }
-    expect(mocks.bootstrapOpenCodeServer).toHaveBeenCalled()
+    expect(mocks.startActionOpenCodeV2).toHaveBeenCalled()
   })
 })

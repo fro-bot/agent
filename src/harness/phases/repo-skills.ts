@@ -8,7 +8,6 @@ import type {RoutingPhaseResult} from './routing.js'
 import * as fs from 'node:fs/promises'
 import process from 'node:process'
 import {evaluateRepoSkillsTrust, needsPullRequestHeadLookup} from '../../features/agent/repo-skills-trust.js'
-import {resolveSessionGeneration} from '../../services/cache/cache-key.js'
 import {createExecAdapter} from '../../services/setup/adapters.js'
 import {
   createRepoSkillsStagingRoot,
@@ -43,7 +42,6 @@ export interface RepoSkillsDeps {
 export interface ResolveRepoSkillsSourceOptions {
   /** The `repo-skills` input. */
   readonly enabled: boolean
-  readonly generation: 'v1' | 'v2'
   readonly githubContext: GitHubContext
   /** Used only to let a checkout without the default branch fetch it. Never logged. */
   readonly githubToken: string
@@ -54,12 +52,8 @@ export interface ResolveRepoSkillsSourceOptions {
 export async function resolveRepoSkillsSource(
   options: ResolveRepoSkillsSourceOptions,
 ): Promise<RepoSkillsSource | null> {
-  const {enabled, generation, githubContext, githubToken, logger, deps} = options
+  const {enabled, githubContext, githubToken, logger, deps} = options
   if (!enabled) return null
-  if (generation !== 'v2') {
-    logger.warning('repo-skills is not supported on the OpenCode V1 generation and is ignored')
-    return null
-  }
 
   let stagingRoot: string | null = null
   try {
@@ -194,7 +188,6 @@ export async function runRepoSkills(
   const githubContext = routing.triggerResult.context.raw as GitHubContext
   return resolveRepoSkillsSource({
     enabled: bootstrap.inputs.repoSkills,
-    generation: resolveSessionGeneration(bootstrap.opencodeResult.version),
     githubContext,
     githubToken: bootstrap.inputs.githubToken,
     logger,

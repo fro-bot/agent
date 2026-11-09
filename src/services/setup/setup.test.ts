@@ -1,25 +1,22 @@
 import type {SetupInputs} from './types.js'
 
 import * as fs from 'node:fs/promises'
-import {homedir} from 'node:os'
 import {join} from 'node:path'
 import * as core from '@actions/core'
 import * as exec from '@actions/exec'
 import * as github from '@actions/github'
 import * as tc from '@actions/tool-cache'
-import {DEFAULT_SYSTEMATIC_VERSION, FRO_BOT_PLUGIN_VERSION, resolveSystematicSkillsDirsV1} from '@fro-bot/runtime'
+import {DEFAULT_SYSTEMATIC_VERSION, FRO_BOT_PLUGIN_VERSION} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {getPlatformInfo, installOpenCode, RECORDED_V2_PIN} from './opencode.js'
 import * as pluginInstallV2 from './plugin-install-v2.js'
-import * as sessionToolsConfig from './session-tools-config.js'
 import {runSetup} from './setup.js'
-import * as systematicPlugin from './systematic-plugin.js'
 import * as toolsCache from './tools-cache.js'
 
 function createSetupInputs(overrides: Partial<SetupInputs> = {}): SetupInputs {
   return {
-    opencodeVersion: '1.2.24',
-    authJson: '{"anthropic": {"api_key": "sk-ant-test"}}',
+    opencodeVersion: RECORDED_V2_PIN.version,
+    authJson: '{"anthropic": {"type": "api", "key": "sk-ant-test"}}',
     appId: null,
     privateKey: null,
     opencodeConfig: null,
@@ -109,37 +106,12 @@ vi.mock('./adapters.js', () => ({
   })),
 }))
 
-// Mock session-tools-config module so tests can assert the native session tools file is
-// actually written, not just that some unrelated mkdir happened.
-vi.mock('./session-tools-config.js', () => ({
-  writeSessionToolsFile: vi.fn().mockResolvedValue(undefined),
-}))
-
 // The V2 plugin install is a real-filesystem module; this suite mocks node:fs/promises, so its own tests
 // (plugin-install-v2.test.ts) cover the install and this suite covers how setup uses it.
 vi.mock('./plugin-install-v2.js', async importOriginal => {
   const actual = await importOriginal<typeof import('./plugin-install-v2.js')>()
   return {...actual, installPluginsV2: vi.fn(), arePluginsCachedV2: vi.fn()}
 })
-
-// The skills-directory resolver reads the real filesystem, which this suite mocks out; the resolver has its own tests
-// (packages/runtime/src/agent/bundled-skills-dir.test.ts) and this suite covers how setup uses its answer.
-vi.mock('@fro-bot/runtime', async importOriginal => {
-  const actual = await importOriginal<typeof import('@fro-bot/runtime')>()
-  return {...actual, resolveSystematicSkillsDirsV1: vi.fn()}
-})
-
-vi.mock('./systematic-plugin.js', () => ({
-  installSystematicPlugin: vi.fn().mockResolvedValue({status: 'installed', duration: 1}),
-}))
-
-/** The OPENCODE_CONFIG_CONTENT values setup exported, in order. */
-function exportedConfigs(): Record<string, unknown>[] {
-  return vi
-    .mocked(core.exportVariable)
-    .mock.calls.filter(([name]) => name === 'OPENCODE_CONFIG_CONTENT')
-    .map(([, value]) => JSON.parse(String(value)) as Record<string, unknown>)
-}
 
 describe('setup', () => {
   const originalEnv = process.env
@@ -189,12 +161,8 @@ describe('setup', () => {
     // Default exec.getExecOutput mock
     vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
 
-    // Re-apply session-tools-config mock cleared by vi.resetAllMocks() above.
-    vi.mocked(sessionToolsConfig.writeSessionToolsFile).mockResolvedValue(undefined)
-    vi.mocked(systematicPlugin.installSystematicPlugin).mockResolvedValue({status: 'installed', duration: 1})
     vi.mocked(pluginInstallV2.arePluginsCachedV2).mockResolvedValue(false)
     vi.mocked(pluginInstallV2.installPluginsV2).mockResolvedValue({success: true, data: undefined})
-    vi.mocked(resolveSystematicSkillsDirsV1).mockResolvedValue([])
   })
 
   afterEach(() => {
@@ -202,45 +170,27 @@ describe('setup', () => {
   })
 
   describe('runSetup', () => {
-    it('installs OpenCode when not cached', async () => {
-      // #given
+    it('installs the recorded pin when OpenCode is not cached', async () => {
+      // #given a miss in the tool cache, and an install that succeeds
       vi.mocked(tc.find).mockReturnValue('')
-      vi.mocked(tc.downloadTool).mockResolvedValue('/tmp/opencode.zip')
-      vi.mocked(tc.extractZip).mockResolvedValue('/tmp/opencode')
-      vi.mocked(tc.extractTar).mockResolvedValue('/tmp/opencode')
-      vi.mocked(tc.cacheDir).mockResolvedValue('/cached/opencode')
-      vi.mocked(exec.getExecOutput).mockImplementation(async (cmd: string, args?: string[]) => {
-        if (cmd === 'gh' && args?.[0] === 'api' && args?.[1] === '/user') {
-          return {exitCode: 0, stdout: 'fro-bot', stderr: ''}
-        }
-        if (cmd === 'file') {
-          const isZipPlatform = process.platform === 'darwin' || process.platform === 'win32'
-          const output = isZipPlatform ? 'Zip archive data' : 'gzip compressed data'
-          return {exitCode: 0, stdout: output, stderr: ''}
-        }
-        return {exitCode: 0, stdout: '', stderr: ''}
+      vi.mocked(installOpenCode).mockResolvedValueOnce({
+        path: '/opt/hostedtoolcache/opencode/fresh',
+        version: RECORDED_V2_PIN.version,
+        cached: false,
       })
       vi.mocked(exec.exec).mockResolvedValue(0)
       vi.mocked(fs.writeFile).mockResolvedValue()
       vi.mocked(fs.mkdir).mockResolvedValue(undefined)
       vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
 
-      vi.stubGlobal(
-        'fetch',
-        vi.fn().mockResolvedValue({
-          ok: true,
-          json: async () => Promise.resolve({tag_name: 'v1.0.300'}),
-        }),
-      )
-
       // #when
       const result = await runSetup(createSetupInputs(), 'ghs_test_token')
 
-      // #then
+      // #then the pin is what gets installed and put on PATH
       expect(core.setFailed).not.toHaveBeenCalled()
       expect(result).not.toBeNull()
-      expect(tc.downloadTool).toHaveBeenCalled()
-      expect(core.addPath).toHaveBeenCalled()
+      expect(vi.mocked(installOpenCode).mock.calls[0]?.[0]).toBe(RECORDED_V2_PIN.version)
+      expect(core.addPath).toHaveBeenCalledWith('/opt/hostedtoolcache/opencode/fresh')
     })
 
     it('uses cached OpenCode when available', async () => {
@@ -262,26 +212,6 @@ describe('setup', () => {
       // #then
       expect(tc.downloadTool).not.toHaveBeenCalled()
       expect(core.addPath).toHaveBeenCalledWith('/cached/opencode/1.0.300')
-    })
-
-    it('writes auth.json with correct permissions', async () => {
-      // #given
-      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
-      vi.mocked(exec.getExecOutput).mockResolvedValue({
-        exitCode: 0,
-        stdout: '{"tag_name": "v1.0.300"}',
-        stderr: '',
-      })
-      vi.mocked(exec.exec).mockResolvedValue(0)
-      vi.mocked(fs.writeFile).mockResolvedValue()
-      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
-      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
-
-      // #when
-      await runSetup(createSetupInputs(), 'ghs_test_token')
-
-      // #then
-      expect(fs.writeFile).toHaveBeenCalledWith(expect.stringContaining('auth.json'), expect.any(String), {mode: 0o600})
     })
 
     it('exports GH_TOKEN environment variable', async () => {
@@ -357,108 +287,7 @@ describe('setup', () => {
       }
     })
 
-    it('exports OPENCODE_CONFIG_CONTENT environment variable', async () => {
-      // #given
-      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
-      vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
-      vi.mocked(exec.exec).mockResolvedValue(0)
-      vi.mocked(fs.writeFile).mockResolvedValue()
-      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
-      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
-
-      // #when
-      await runSetup(createSetupInputs(), 'ghs_test_token')
-
-      // #then
-      expect(core.exportVariable).toHaveBeenCalledWith('OPENCODE_CONFIG_CONTENT', expect.any(String))
-    })
-
-    it('fails when opencode-config parses to JSON null', async () => {
-      // #given
-      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
-      vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
-      vi.mocked(exec.exec).mockResolvedValue(0)
-      vi.mocked(fs.writeFile).mockResolvedValue()
-      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
-      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
-
-      // #when
-      const result = await runSetup(createSetupInputs({opencodeConfig: 'null'}), 'ghs_test_token')
-
-      // #then
-      expect(result).toBe(null)
-      expect(core.setFailed).toHaveBeenCalledWith('opencode-config must be a JSON object')
-    })
-
-    it('fails with explicit message when opencode-config is invalid JSON', async () => {
-      // #given
-      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
-      vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
-      vi.mocked(exec.exec).mockResolvedValue(0)
-      vi.mocked(fs.writeFile).mockResolvedValue()
-      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
-      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
-
-      // #when
-      const result = await runSetup(createSetupInputs({opencodeConfig: '{invalid-json}'}), 'ghs_test_token')
-
-      // #then
-      expect(result).toBe(null)
-      expect(core.setFailed).toHaveBeenCalledWith('opencode-config must be valid JSON')
-    })
-
-    it('fails when opencode-config is an array', async () => {
-      // #given
-      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
-      vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
-      vi.mocked(exec.exec).mockResolvedValue(0)
-      vi.mocked(fs.writeFile).mockResolvedValue()
-      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
-      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
-
-      // #when
-      const result = await runSetup(createSetupInputs({opencodeConfig: '["model", "claude-opus-4"]'}), 'ghs_test_token')
-
-      // #then
-      expect(result).toBe(null)
-      expect(core.setFailed).toHaveBeenCalledWith('opencode-config must be a JSON object')
-    })
-
-    it('fails when opencode-config is a number', async () => {
-      // #given
-      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
-      vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
-      vi.mocked(exec.exec).mockResolvedValue(0)
-      vi.mocked(fs.writeFile).mockResolvedValue()
-      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
-      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
-
-      // #when
-      const result = await runSetup(createSetupInputs({opencodeConfig: '42'}), 'ghs_test_token')
-
-      // #then
-      expect(result).toBe(null)
-      expect(core.setFailed).toHaveBeenCalledWith('opencode-config must be a JSON object')
-    })
-
-    it('fails when opencode-config is a string', async () => {
-      // #given
-      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
-      vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
-      vi.mocked(exec.exec).mockResolvedValue(0)
-      vi.mocked(fs.writeFile).mockResolvedValue()
-      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
-      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
-
-      // #when
-      const result = await runSetup(createSetupInputs({opencodeConfig: '"just-a-string"'}), 'ghs_test_token')
-
-      // #then
-      expect(result).toBe(null)
-      expect(core.setFailed).toHaveBeenCalledWith('opencode-config must be a JSON object')
-    })
-
-    it('sets outputs for opencode-path and auth-json-path', async () => {
+    it('sets the opencode-path output and no auth-json-path output', async () => {
       // #given
       vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
       vi.mocked(exec.getExecOutput).mockResolvedValue({
@@ -477,7 +306,9 @@ describe('setup', () => {
       // #then the opencode-path output is the install DIRECTORY, matching what goes on PATH and
       // what RFC-011 documents. It is deliberately not the executable — consumers add it to PATH.
       expect(core.setOutput).toHaveBeenCalledWith('opencode-path', '/cached/opencode/1.0.300')
-      expect(core.setOutput).toHaveBeenCalledWith('auth-json-path', expect.stringContaining('auth.json'))
+      expect(core.setOutput).toHaveBeenCalledWith('opencode-version', RECORDED_V2_PIN.version)
+      // auth.json is never written, so there is no path to report
+      expect(vi.mocked(core.setOutput).mock.calls.map(call => call[0])).not.toContain('auth-json-path')
 
       // #and the setup action does not export OPENCODE_PATH. RFC-012 says so, and that claim is
       // load-bearing: the variable is read back as an executable by verifyOpenCodeAvailable and by
@@ -544,7 +375,7 @@ describe('setup', () => {
       expect(exec.exec).not.toHaveBeenCalledWith('git', expect.arrayContaining(['user.email']), expect.anything())
     })
 
-    describe('default config', () => {
+    describe('Systematic config and OPENCODE_PURE', () => {
       beforeEach(() => {
         vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
         vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '', stderr: ''})
@@ -552,41 +383,6 @@ describe('setup', () => {
         vi.mocked(fs.writeFile).mockResolvedValue()
         vi.mocked(fs.mkdir).mockResolvedValue(undefined)
         vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
-      })
-
-      it('writes config with default_agent build', async () => {
-        // #given - default inputs
-
-        // #when
-        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
-
-        // #then
-        expect(result).not.toBeNull()
-        expect(core.exportVariable).toHaveBeenCalledWith('OPENCODE_CONFIG_CONTENT', expect.any(String))
-
-        // Verify the config JSON has default_agent: build
-        const configExportCall = vi
-          .mocked(core.exportVariable)
-          .mock.calls.find(([name]) => name === 'OPENCODE_CONFIG_CONTENT')
-        expect(configExportCall).toBeDefined()
-        const configJson = configExportCall![1] as string
-        const config = JSON.parse(configJson) as Record<string, unknown>
-        expect(config.default_agent).toBe('build')
-      })
-
-      it('creates the OpenCode config directory before writing the config', async () => {
-        // #given - setup owns config dir creation; with XDG_CONFIG_HOME unset the
-        // default is `~/.config/opencode` under the suite's isolated (temp) HOME
-        delete process.env.XDG_CONFIG_HOME
-        const configDir = join(homedir(), '.config', 'opencode')
-
-        // #when
-        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
-
-        // #then
-        expect(result).not.toBeNull()
-        expect(fs.mkdir).toHaveBeenCalledWith(configDir, {recursive: true})
-        expect(fs.writeFile).toHaveBeenCalledWith(join(configDir, 'opencode.json'), expect.any(String))
       })
 
       it('writes Systematic config when provided', async () => {
@@ -605,19 +401,6 @@ describe('setup', () => {
         expect(systematicConfigCall).toBeDefined()
         const written = JSON.parse(systematicConfigCall![1] as string) as Record<string, unknown>
         expect(written).toMatchObject({agents: {default: 'build'}, mode: 'strict'})
-      })
-
-      it('always attempts to write the session tools file', async () => {
-        // #given
-
-        // #when
-        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
-
-        // #then
-        expect(result).not.toBeNull()
-        expect(sessionToolsConfig.writeSessionToolsFile).toHaveBeenCalledTimes(1)
-        const [configDirArg] = vi.mocked(sessionToolsConfig.writeSessionToolsFile).mock.calls[0] ?? []
-        expect(typeof configDirArg).toBe('string')
       })
 
       it('warns that OPENCODE_PURE is withheld from the server when the runner sets it', async () => {
@@ -643,29 +426,6 @@ describe('setup', () => {
         // #then
         expect(result).not.toBeNull()
         expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining('OPENCODE_PURE is set'))
-      })
-
-      it('writes fresh config without merging existing opencode.json', async () => {
-        // #given - simulate an existing opencode.json with stale data
-        vi.mocked(fs.readFile).mockResolvedValue(
-          JSON.stringify({default_agent: 'custom', plugin: ['stale-plugin@3.7.4']}),
-        )
-
-        // #when
-        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
-
-        // #then - fresh config has build and none of the stale plugins
-        expect(result).not.toBeNull()
-        const configExportCall = vi
-          .mocked(core.exportVariable)
-          .mock.calls.find(([name]) => name === 'OPENCODE_CONFIG_CONTENT')
-        expect(configExportCall).toBeDefined()
-        expect(typeof configExportCall?.[1]).toBe('string')
-        const config = JSON.parse(String(configExportCall?.[1])) as Record<string, unknown>
-        expect(config.default_agent).toBe('build')
-
-        const configPlugins = config.plugin as unknown[]
-        expect(configPlugins?.some(p => typeof p === 'string' && p.includes('stale-plugin'))).toBe(false)
       })
     })
 
@@ -707,91 +467,6 @@ describe('setup', () => {
         vi.mocked(toolsCache.saveToolsCache).mockResolvedValue(true)
       })
 
-      describe('bundled Systematic skills directory', () => {
-        const SKILLS_DIR =
-          '/home/runner/.cache/opencode/packages/@fro.bot/systematic@2.1.0/node_modules/@fro.bot/systematic/skills'
-
-        it('resolves the directory after the Systematic install, from the cache home and the installed version', async () => {
-          // #given the plugin install produces the directory
-          process.env.XDG_CACHE_HOME = '/custom/cache'
-          vi.mocked(resolveSystematicSkillsDirsV1).mockResolvedValue([SKILLS_DIR])
-
-          // #when
-          await runSetup(createSetupInputs(), 'ghs_test_token')
-
-          // #then it is looked up where OpenCode installs (honouring XDG_CACHE_HOME), for the version installed,
-          // and only once the install has run: on a cache miss the directory does not exist before
-          expect(resolveSystematicSkillsDirsV1).toHaveBeenCalledWith('/custom/cache', '2.1.0', expect.anything())
-          const installOrder = vi.mocked(systematicPlugin.installSystematicPlugin).mock.invocationCallOrder[0] ?? 0
-          const resolveOrder = vi.mocked(resolveSystematicSkillsDirsV1).mock.invocationCallOrder[0] ?? 0
-          expect(resolveOrder).toBeGreaterThan(installOrder)
-        })
-
-        it('re-allows exactly that directory in the config the server loads, after the deny', async () => {
-          // #given
-          vi.mocked(resolveSystematicSkillsDirsV1).mockResolvedValue([SKILLS_DIR])
-
-          // #when
-          await runSetup(createSetupInputs(), 'ghs_test_token')
-
-          // #then the last exported config carries the allow behind the build agent's wildcard deny
-          const final = exportedConfigs().at(-1) as {
-            permission: {external_directory: Record<string, string>}
-            agent: {build: {permission: {external_directory: Record<string, string>}}}
-          }
-          const buildRules = Object.entries(final.agent.build.permission.external_directory)
-          expect(buildRules.at(-1)).toEqual([`${SKILLS_DIR}/*`, 'allow'])
-          expect(buildRules[0]).toEqual(['*', 'deny'])
-          expect(final.permission.external_directory[`${SKILLS_DIR}/*`]).toBe('allow')
-          // #then the file the config is persisted to matches what is exported
-          const written = vi
-            .mocked(fs.writeFile)
-            .mock.calls.filter(([target]) => String(target).endsWith('opencode.json'))
-            .map(([, data]) => String(data))
-            .at(-1)
-          expect(JSON.parse(written ?? '{}')).toEqual(final)
-        })
-
-        it('writes the config before any install too, so an invalid opencode-config still fails first', async () => {
-          // #given
-          vi.mocked(resolveSystematicSkillsDirsV1).mockResolvedValue([SKILLS_DIR])
-
-          // #when
-          await runSetup(createSetupInputs(), 'ghs_test_token')
-
-          // #then a first, directory-less write precedes the install and the second follows it
-          const exportOrders = vi
-            .mocked(core.exportVariable)
-            .mock.calls.flatMap(([name], index) =>
-              name === 'OPENCODE_CONFIG_CONTENT'
-                ? [vi.mocked(core.exportVariable).mock.invocationCallOrder[index] ?? 0]
-                : [],
-            )
-          const installOrder = vi.mocked(systematicPlugin.installSystematicPlugin).mock.invocationCallOrder[0] ?? 0
-          expect(exportOrders).toHaveLength(2)
-          expect(exportOrders[0]).toBeLessThan(installOrder)
-          expect(exportOrders[1]).toBeGreaterThan(installOrder)
-          expect(JSON.stringify(exportedConfigs()[0])).not.toContain(SKILLS_DIR)
-        })
-
-        it('warns and adds nothing when the directory cannot be resolved, without failing the run', async () => {
-          // #given the plugin is not installed
-          vi.mocked(resolveSystematicSkillsDirsV1).mockResolvedValue([])
-
-          // #when
-          const result = await runSetup(createSetupInputs(), 'ghs_test_token')
-
-          // #then setup still succeeds, says so once, and writes the config only once, without a skills rule
-          expect(result).not.toBeNull()
-          expect(core.setFailed).not.toHaveBeenCalled()
-          expect(core.warning).toHaveBeenCalledWith(
-            expect.stringContaining('Bundled Systematic skills directory not found'),
-          )
-          expect(exportedConfigs()).toHaveLength(1)
-          expect(JSON.stringify(exportedConfigs()[0])).not.toContain('/skills')
-        })
-      })
-
       it('calls restoreToolsCache before install functions', async () => {
         // #given
 
@@ -807,165 +482,62 @@ describe('setup', () => {
         expect(callArgs?.systematicVersion).toBe('2.1.0')
       })
 
-      it('calls saveToolsCache after successful installs on cache miss', async () => {
-        // #given
+      it('installs the plugins and saves the tools cache on a miss, plugins first', async () => {
+        // #given a tools-cache miss and a binary the tool cache already holds
+        vi.mocked(tc.find).mockReturnValue('/opt/hostedtoolcache/opencode/2.2.6-sha/x64')
 
         // #when
-        await runSetup(createSetupInputs(), 'ghs_test_token')
+        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
 
-        // #then
+        // #then the plugins are installed with the executable (never the directory put on PATH), and only then saved
+        expect(result?.toolsCacheStatus).toBe('miss')
+        const addedPath = vi.mocked(core.addPath).mock.calls.at(0)?.[0]
+        expect(addedPath).toBe('/opt/hostedtoolcache/opencode/2.2.6-sha/x64')
+        const installArgs = vi.mocked(pluginInstallV2.installPluginsV2).mock.calls.at(0)?.[0]
+        expect(installArgs?.opencodeBinaryPath).toBe(join(addedPath ?? '', 'opencode'))
+        expect(installArgs?.opencodeBinaryPath).not.toBe(addedPath)
+        expect(result?.opencodePath).toBe(addedPath)
+        expect(result?.opencodeBinaryPath).toBe(join(addedPath ?? '', 'opencode'))
         expect(toolsCache.saveToolsCache).toHaveBeenCalledTimes(1)
-        const saveArgs = vi.mocked(toolsCache.saveToolsCache).mock.calls[0]?.[0]
-        expect(saveArgs).toBeDefined()
-        expect(saveArgs?.toolCachePath).toContain('opencode')
-      })
-
-      it('does not save cache when the plugin install times out', async () => {
-        // #given an install that exhausts its budget without completing
-        vi.mocked(systematicPlugin.installSystematicPlugin).mockResolvedValue({status: 'timed-out', duration: 420_000})
-
-        // #when setup runs
-        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
-
-        // #then the incomplete install is not persisted in the cache
-        expect(toolsCache.saveToolsCache).not.toHaveBeenCalled()
-        expect(result).not.toBeNull()
-      })
-
-      it('continues setup when the plugin install times out', async () => {
-        // #given an install that exhausts its budget without completing
-        vi.mocked(systematicPlugin.installSystematicPlugin).mockResolvedValue({status: 'timed-out', duration: 420_000})
-
-        // #when setup runs
-        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
-
-        // #then setup still finishes
-        expect(result).not.toBeNull()
-      })
-
-      it('continues setup without saving cache when the plugin install fails', async () => {
-        // #given an install that exits unsuccessfully
-        vi.mocked(systematicPlugin.installSystematicPlugin).mockResolvedValue({status: 'failed', duration: 1_000})
-
-        // #when setup runs
-        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
-
-        // #then setup still finishes, but the incomplete install is not persisted in the cache
-        expect(toolsCache.saveToolsCache).not.toHaveBeenCalled()
-        expect(core.warning).toHaveBeenCalledWith(
-          'Skipping tools cache save because Systematic plugin install did not complete',
-        )
-        expect(result).not.toBeNull()
-      })
-
-      it('names the scrubbed NPM_CONFIG_* keys in the warning when the parent env had them set', async () => {
-        // #given an install that fails, with an NPM_CONFIG_* var set in the parent env
-        vi.mocked(systematicPlugin.installSystematicPlugin).mockResolvedValue({status: 'failed', duration: 1_000})
-        process.env.NPM_CONFIG_REGISTRY = 'https://registry.example.com'
-
-        try {
-          // #when setup runs
-          await runSetup(createSetupInputs(), 'ghs_test_token')
-
-          // #then the warning names the scrubbed key (never the value)
-          expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('NPM_CONFIG_REGISTRY'))
-          const warningArg = vi
-            .mocked(core.warning)
-            .mock.calls.find(
-              ([message]) => typeof message === 'string' && message.includes('Skipping tools cache save'),
-            )?.[0]
-          expect(warningArg).not.toContain('registry.example.com')
-        } finally {
-          delete process.env.NPM_CONFIG_REGISTRY
-        }
-      })
-
-      it('does not mention NPM_CONFIG_* in the warning when none is set', async () => {
-        // #given an install that fails, with no NPM_CONFIG_* vars in the parent env
-        vi.mocked(systematicPlugin.installSystematicPlugin).mockResolvedValue({status: 'failed', duration: 1_000})
-
-        // #when setup runs
-        await runSetup(createSetupInputs(), 'ghs_test_token')
-
-        // #then the base message is unchanged
-        expect(core.warning).toHaveBeenCalledWith(
-          'Skipping tools cache save because Systematic plugin install did not complete',
-        )
-      })
-
-      it('installs the Systematic plugin after writing config and before saving a cache miss', async () => {
-        // #given a tools cache miss
-
-        // #when setup writes its config and completes installation
-        await runSetup(createSetupInputs(), 'ghs_test_token')
-
-        // #then OpenCode performs the plugin install before the tools cache is saved, using the
-        // resolved binary path (not the bare 'opencode' command name, and not the install
-        // directory — spawning that fails EACCES)
-        expect(systematicPlugin.installSystematicPlugin).toHaveBeenCalledWith(
-          expect.objectContaining({
-            opencodeBinaryPath: join('/opt/hostedtoolcache/opencode/1.0.300/x64', 'opencode'),
-            systematicVersion: '2.1.0',
-          }),
-        )
-        const installOrder = vi.mocked(systematicPlugin.installSystematicPlugin).mock.invocationCallOrder[0]
+        expect(vi.mocked(toolsCache.saveToolsCache).mock.calls[0]?.[0].toolCachePath).toContain('opencode')
+        const installOrder = vi.mocked(pluginInstallV2.installPluginsV2).mock.invocationCallOrder[0]
         const saveOrder = vi.mocked(toolsCache.saveToolsCache).mock.invocationCallOrder[0]
-        expect(installOrder).toBeDefined()
-        expect(saveOrder).toBeDefined()
         expect(installOrder).toBeLessThan(saveOrder ?? Number.POSITIVE_INFINITY)
       })
 
-      it('skips installs and save on tools cache hit when binary is findable', async () => {
-        // #given
-        vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
-          hit: true,
-          restoredKey: 'opencode-tools-v2-Linux-oc-1.0.300-sys-2.1.0',
-        })
-        vi.mocked(tc.find).mockReturnValue('/opt/hostedtoolcache/opencode/1.0.300/x64')
+      it('skips the plugin install and the save on a tools-cache hit that already holds the plugins', async () => {
+        // #given a hit, a findable binary and plugins the restored cache already holds
+        vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({hit: true, restoredKey: 'opencode-tools-v2-key'})
+        vi.mocked(tc.find).mockReturnValue('/opt/hostedtoolcache/opencode/2.2.6-sha/x64')
+        vi.mocked(pluginInstallV2.arePluginsCachedV2).mockResolvedValue(true)
 
         // #when
         const result = await runSetup(createSetupInputs(), 'ghs_test_token')
 
         // #then
         expect(tc.downloadTool).not.toHaveBeenCalled()
+        expect(pluginInstallV2.installPluginsV2).not.toHaveBeenCalled()
         expect(toolsCache.saveToolsCache).not.toHaveBeenCalled()
-        expect(systematicPlugin.installSystematicPlugin).not.toHaveBeenCalled()
-        expect(result).not.toBeNull()
         expect(result?.toolsCacheStatus).toBe('hit')
       })
 
-      it('keeps V1 cache identities unchanged: no digest id, bare version lookup', async () => {
-        // #given a V1 pin with a warm tools cache and a warm tool cache
+      it('reinstalls when the tools cache hits but the binary is not findable, and never puts the cache root on PATH', async () => {
+        // #given a hit whose binary is missing from the tool cache
         vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({hit: true, restoredKey: 'opencode-tools-v2-key'})
-        vi.mocked(tc.find).mockReturnValue('/opt/hostedtoolcache/opencode/1.19.4/x64')
+        vi.mocked(pluginInstallV2.arePluginsCachedV2).mockResolvedValue(true)
+        vi.mocked(installOpenCode).mockResolvedValueOnce({
+          path: '/opt/hostedtoolcache/opencode/2.2.6-sha/x64',
+          version: RECORDED_V2_PIN.version,
+          cached: false,
+        })
 
         // #when
-        const result = await runSetup(createSetupInputs({opencodeVersion: '1.19.4'}), 'ghs_test_token')
+        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
 
-        // #then
-        const restoreArgs = vi.mocked(toolsCache.restoreToolsCache).mock.calls[0]?.[0]
-        expect(restoreArgs?.opencodeVersion).toBe('1.19.4')
-        expect(restoreArgs).not.toHaveProperty('opencodeDigestId')
-        expect(tc.find).toHaveBeenCalledWith('opencode', '1.19.4')
-        expect(tc.downloadTool).not.toHaveBeenCalled()
-        expect(result?.toolsCacheStatus).toBe('hit')
-      })
-
-      it('keeps a V1 harness pin on the V1 path: prerelease tool-cache identity, no digest id', async () => {
-        // #given the previous default, pinned explicitly as a rollback, with warm caches
-        const harnessPin = '1.19.4+harness.5bde2635'
-        vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({hit: true, restoredKey: 'opencode-tools-v2-key'})
-        vi.mocked(tc.find).mockReturnValue('/opt/hostedtoolcache/opencode/1.19.4-harness.5bde2635/x64')
-
-        // #when
-        const result = await runSetup(createSetupInputs({opencodeVersion: harnessPin}), 'ghs_test_token')
-
-        // #then it is neither rejected as an unpinned V2 nor given a V2 digest identity
-        const restoreArgs = vi.mocked(toolsCache.restoreToolsCache).mock.calls[0]?.[0]
-        expect(restoreArgs?.opencodeVersion).toBe(harnessPin)
-        expect(restoreArgs).not.toHaveProperty('opencodeDigestId')
-        expect(tc.find).toHaveBeenCalledWith('opencode', '1.19.4-harness.5bde2635')
-        expect(core.setFailed).not.toHaveBeenCalled()
+        // #then the binary is reinstalled and the install directory (not the raw cache root) goes on PATH
+        expect(installOpenCode).toHaveBeenCalledTimes(1)
+        expect(core.addPath).toHaveBeenCalledWith('/opt/hostedtoolcache/opencode/2.2.6-sha/x64')
+        expect(core.addPath).not.toHaveBeenCalledWith('/opt/hostedtoolcache/opencode')
         expect(result).not.toBeNull()
       })
 
@@ -982,7 +554,7 @@ describe('setup', () => {
           })
 
         it('resolves "latest" to the recorded pin with no network lookup', async () => {
-          // #given a network that would name an unverified stock V1 as upstream's latest
+          // #given a network that would name an unverified stock release as upstream's latest
           const fetchSpy = vi
             .spyOn(globalThis, 'fetch')
             .mockResolvedValue(new Response(JSON.stringify({tag_name: 'v1.19.5'}), {status: 200}))
@@ -1117,7 +689,7 @@ describe('setup', () => {
           const withAuth = (authJson: string, overrides: Partial<SetupInputs> = {}) =>
             createSetupInputs({opencodeVersion: RECORDED_V2_PIN.version, authJson, ...overrides})
 
-          it('installs both plugins at exact versions through the V2 installer and not through the V1 one', async () => {
+          it('installs both plugins at exact versions through the V2 installer', async () => {
             // #when
             const result = await runSetup(v2Inputs(), 'ghs_test_token')
 
@@ -1126,7 +698,6 @@ describe('setup', () => {
             const call = vi.mocked(pluginInstallV2.installPluginsV2).mock.calls[0]?.[0]
             expect(call?.specs).toEqual([SYSTEMATIC_SPEC, FRO_BOT_SPEC])
             expect(call?.opencodeBinaryPath).toBe('/opt/hostedtoolcache/opencode/fresh/opencode')
-            expect(systematicPlugin.installSystematicPlugin).not.toHaveBeenCalled()
           })
 
           it('resolves "latest" to the pinned Systematic version before installing', async () => {
@@ -1206,7 +777,7 @@ describe('setup', () => {
             expect(core.setOutput).not.toHaveBeenCalledWith('opencode-path', expect.anything())
           })
 
-          it('writes no auth.json, no config file, no exported config and no V1 session tools file', async () => {
+          it('writes no auth.json, no config file and no exported config', async () => {
             // #when
             await runSetup(withAuth(JSON.stringify({anthropic: {type: 'api', key: CANARY}})), 'ghs_test_token')
 
@@ -1216,7 +787,6 @@ describe('setup', () => {
             expect(JSON.stringify(vi.mocked(fs.writeFile).mock.calls)).not.toContain(CANARY)
             expect(core.exportVariable).not.toHaveBeenCalledWith('OPENCODE_CONFIG_CONTENT', expect.anything())
             expect(core.setOutput).not.toHaveBeenCalledWith('auth-json-path', expect.anything())
-            expect(sessionToolsConfig.writeSessionToolsFile).not.toHaveBeenCalled()
           })
 
           it.each([
@@ -1237,174 +807,7 @@ describe('setup', () => {
             expect(toolsCache.restoreToolsCache).not.toHaveBeenCalled()
             expect(pluginInstallV2.installPluginsV2).not.toHaveBeenCalled()
           })
-
-          it('keeps the V1 behaviour for a V1 pin: V1 install, auth.json, config', async () => {
-            // #given the default V1 inputs
-            vi.mocked(tc.find).mockReturnValue('/opt/hostedtoolcache/opencode/v1')
-            vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({hit: false, restoredKey: null})
-
-            // #when
-            await runSetup(createSetupInputs(), 'ghs_test_token')
-
-            // #then
-            expect(systematicPlugin.installSystematicPlugin).toHaveBeenCalled()
-            expect(pluginInstallV2.installPluginsV2).not.toHaveBeenCalled()
-            expect(core.exportVariable).toHaveBeenCalledWith('OPENCODE_CONFIG_CONTENT', expect.any(String))
-            expect(sessionToolsConfig.writeSessionToolsFile).toHaveBeenCalled()
-            expect(vi.mocked(toolsCache.restoreToolsCache).mock.calls[0]?.[0]).not.toHaveProperty('frobotPluginVersion')
-          })
         })
-      })
-
-      it('falls through to install when tools cache hits but binary not findable', async () => {
-        // #given
-        vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
-          hit: true,
-          restoredKey: 'opencode-tools-v2-Linux-oc-1.0.299-sys-2.1.0',
-        })
-        vi.mocked(tc.find).mockReturnValue('')
-        vi.mocked(tc.downloadTool).mockResolvedValue('/tmp/opencode.tar.gz')
-        vi.mocked(tc.extractTar).mockResolvedValue('/tmp/opencode')
-        vi.mocked(tc.extractZip).mockResolvedValue('/tmp/opencode')
-        vi.mocked(tc.cacheDir).mockResolvedValue('/opt/hostedtoolcache/opencode/1.0.300/x64')
-        vi.stubGlobal(
-          'fetch',
-          vi.fn().mockResolvedValue({
-            ok: true,
-            json: async () => ({tag_name: 'v1.0.300'}),
-          }),
-        )
-        vi.mocked(exec.getExecOutput).mockImplementation(async (cmd: string, args?: string[]) => {
-          if (cmd === 'gh' && args?.[0] === 'api' && args?.[1] === '/user') {
-            return {exitCode: 0, stdout: 'fro-bot', stderr: ''}
-          }
-          if (cmd === 'file') {
-            const isZip = process.platform === 'darwin' || process.platform === 'win32'
-            return {exitCode: 0, stdout: isZip ? 'Zip archive data' : 'gzip compressed data', stderr: ''}
-          }
-          return {exitCode: 0, stdout: '', stderr: ''}
-        })
-
-        // #when
-        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
-
-        // #then a cache hit with a missing binary still triggers a real reinstall, and the gate
-        // (opencodeResult.cached !== true) still fires the Systematic install + cache save
-        expect(tc.downloadTool).toHaveBeenCalled()
-        expect(result).not.toBeNull()
-        expect(core.addPath).toHaveBeenCalledWith('/opt/hostedtoolcache/opencode/1.0.300/x64')
-        expect(systematicPlugin.installSystematicPlugin).toHaveBeenCalledWith(
-          expect.objectContaining({opencodeBinaryPath: join('/opt/hostedtoolcache/opencode/1.0.300/x64', 'opencode')}),
-        )
-        expect(toolsCache.saveToolsCache).toHaveBeenCalledTimes(1)
-      })
-
-      it('hands the plugin installer an executable, never the directory it puts on PATH', async () => {
-        // #given a normal install — `OpenCodeInstallResult.path` is the tool-cache DIRECTORY
-
-        // #when setup runs
-        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
-
-        // #then the two consumers of that directory must not receive the same string: core.addPath
-        // takes the directory, while the install child is spawned directly and must get the binary
-        // inside it. Collapsing these spawns a directory and fails EACCES in milliseconds, which
-        // is fail-soft — the tools cache save is skipped and never warms again.
-        const addedPath = vi.mocked(core.addPath).mock.calls.at(0)?.[0]
-        const installArgs = vi.mocked(systematicPlugin.installSystematicPlugin).mock.calls.at(0)?.[0]
-        expect(addedPath).toBe('/opt/hostedtoolcache/opencode/1.0.300/x64')
-        expect(installArgs?.opencodeBinaryPath).not.toBe(addedPath)
-        expect(installArgs?.opencodeBinaryPath).toBe(join(addedPath ?? '', 'opencode'))
-
-        // #and the returned result carries both halves under names that say which is which. These
-        // are adjacent fields of one object literal differing by a single call, so without this
-        // the split is enforced only by that call and a comment.
-        expect(result?.opencodePath).toBe(addedPath)
-        expect(result?.opencodeBinaryPath).toBe(join(addedPath ?? '', 'opencode'))
-        expect(result?.opencodeBinaryPath).not.toBe(result?.opencodePath)
-      })
-
-      it('still installs and saves on a tools cache miss when the tool cache already holds the binary', async () => {
-        // #given the tools cache key missed (e.g. a bumped systematicVersion, or an earlier
-        // invocation whose save was skipped) but RUNNER_TOOL_CACHE still resolves the binary, so
-        // installOpenCode reports cached: true without the Actions tools cache being involved
-        vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({hit: false, restoredKey: null})
-        vi.mocked(tc.find).mockReturnValue('/opt/hostedtoolcache/opencode/1.0.300/x64')
-
-        // #when
-        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
-
-        // #then the plugin install and the cache save both still run — gating on the binary alone
-        // would skip both here and leave the config pointing at a plugin version never installed
-        expect(tc.downloadTool).not.toHaveBeenCalled()
-        expect(systematicPlugin.installSystematicPlugin).toHaveBeenCalledWith(
-          expect.objectContaining({opencodeBinaryPath: join('/opt/hostedtoolcache/opencode/1.0.300/x64', 'opencode')}),
-        )
-        expect(toolsCache.saveToolsCache).toHaveBeenCalledTimes(1)
-        expect(result?.toolsCacheStatus).toBe('miss')
-      })
-
-      it('never adds raw toolCachePath directory to PATH', async () => {
-        // #given
-        vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
-          hit: true,
-          restoredKey: 'opencode-tools-v2-Linux-oc-1.0.299-sys-2.1.0',
-        })
-        vi.mocked(tc.find).mockReturnValue('')
-        vi.mocked(tc.downloadTool).mockResolvedValue('/tmp/opencode.tar.gz')
-        vi.mocked(tc.extractTar).mockResolvedValue('/tmp/opencode')
-        vi.mocked(tc.extractZip).mockResolvedValue('/tmp/opencode')
-        vi.mocked(tc.cacheDir).mockResolvedValue('/opt/hostedtoolcache/opencode/1.0.300/x64')
-        vi.stubGlobal(
-          'fetch',
-          vi.fn().mockResolvedValue({
-            ok: true,
-            json: async () => ({tag_name: 'v1.0.300'}),
-          }),
-        )
-        vi.mocked(exec.getExecOutput).mockImplementation(async (cmd: string, args?: string[]) => {
-          if (cmd === 'gh' && args?.[0] === 'api' && args?.[1] === '/user') {
-            return {exitCode: 0, stdout: 'fro-bot', stderr: ''}
-          }
-          if (cmd === 'file') {
-            const isZip = process.platform === 'darwin' || process.platform === 'win32'
-            return {exitCode: 0, stdout: isZip ? 'Zip archive data' : 'gzip compressed data', stderr: ''}
-          }
-          return {exitCode: 0, stdout: '', stderr: ''}
-        })
-
-        // #when
-        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
-
-        // #then
-        expect(core.setFailed).not.toHaveBeenCalled()
-        expect(core.addPath).not.toHaveBeenCalledWith('/opt/hostedtoolcache/opencode')
-        expect(result).not.toBeNull()
-      })
-
-      it('includes toolsCacheStatus in SetupResult on cache miss', async () => {
-        // #given
-
-        // #when
-        const result = await runSetup(createSetupInputs(), 'ghs_test_token')
-
-        // #then
-        expect(result).not.toBeNull()
-        expect(result?.toolsCacheStatus).toBe('miss')
-      })
-
-      it('does not call saveToolsCache on tools cache hit', async () => {
-        // #given a cache hit where the binary is actually found (opencodeResult.cached === true)
-        vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({
-          hit: true,
-          restoredKey: 'opencode-tools-v2-Linux-oc-1.0.300-sys-2.1.0',
-        })
-        vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
-
-        // #when
-        await runSetup(createSetupInputs(), 'ghs_test_token')
-
-        // #then
-        expect(toolsCache.saveToolsCache).not.toHaveBeenCalled()
       })
     })
 

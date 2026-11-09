@@ -8,10 +8,15 @@ import * as path from 'node:path'
 import process from 'node:process'
 import * as core from '@actions/core'
 import * as github from '@actions/github'
-import {buildResponseFileDir, buildResponseFilePathCandidates, resolveResponseDelivery} from '@fro-bot/runtime'
-import {ensureOpenCodeAvailable} from '../../features/agent/index.js'
+import {
+  buildResponseFileDir,
+  buildResponseFilePathCandidates,
+  ensureOpenCodeAvailable,
+  resolveResponseDelivery,
+} from '@fro-bot/runtime'
 import {createExecAdapter} from '../../services/setup/adapters.js'
 import {assertNoPersistedGitCredentials} from '../../services/setup/git-credential-check.js'
+import {runtimeSetupAdapter} from '../../services/setup/runtime-setup-adapter.js'
 import {getGitHubRunAttempt, getGitHubRunId} from '../../shared/env.js'
 import {createLogger} from '../../shared/logger.js'
 import {parseActionInputs} from '../config/inputs.js'
@@ -86,16 +91,19 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
 
   const responseFile = await resolveResponseFilePath(delivery, logger)
 
-  const opencodeResult = await ensureOpenCodeAvailable({
-    logger,
-    opencodeVersion: inputs.opencodeVersion,
-    githubToken: inputs.githubToken,
-    authJson: inputs.authJson,
-    systematicVersion: inputs.systematicVersion,
-    opencodeConfig: inputs.opencodeConfig,
-    systematicConfig: inputs.systematicConfig,
-    credential,
-  })
+  const opencodeResult = await ensureOpenCodeAvailable(
+    {
+      logger,
+      opencodeVersion: inputs.opencodeVersion,
+      githubToken: inputs.githubToken,
+      authJson: inputs.authJson,
+      systematicVersion: inputs.systematicVersion,
+      opencodeConfig: inputs.opencodeConfig,
+      systematicConfig: inputs.systematicConfig,
+      credential,
+    },
+    runtimeSetupAdapter,
+  )
 
   if (opencodeResult.didSetup) {
     logger.info('OpenCode auto-setup completed', {version: opencodeResult.version})
@@ -103,7 +111,6 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
     logger.info('OpenCode already available', {version: opencodeResult.version})
   }
 
-  core.saveState(STATE_KEYS.OPENCODE_VERSION, opencodeResult.version)
   core.saveState(STATE_KEYS.S3_ENABLED, String(inputs.storeConfig.enabled))
   core.saveState(STATE_KEYS.S3_BUCKET, inputs.storeConfig.bucket)
   core.saveState(STATE_KEYS.S3_REGION, inputs.storeConfig.region)

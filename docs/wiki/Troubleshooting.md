@@ -29,13 +29,13 @@ sources:
   - src/harness/outcome.ts
   - src/features/observability/job-summary.ts
   - packages/runtime/src/agent/error-format/format.ts
-  - src/features/agent/execution.ts
+  - src/features/agent/execution-v2.ts
   - docs/solutions/integration-issues/permission-ask-dropped-by-ownership-filter-2026-09-19.md
   - src/services/cache/save.ts
   - src/shared/cache-save-result.ts
   - src/services/cache/cache-key.ts
   - src/services/setup/opencode.ts
-  - src/services/setup/systematic-plugin.ts
+  - src/services/setup/plugin-install-v2.ts
   - src/shared/brokered-push-paths.ts
   - src/features/delegated/brokered-push.ts
   - src/features/delegated/brokered-push-validation.ts
