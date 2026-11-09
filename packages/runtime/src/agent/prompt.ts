@@ -40,6 +40,10 @@ import {
 const BROKERED_PUSH_INSTRUCTION =
   "- Commit your changes; the Action pushes them to the PR branch after the run. Don't run `git push`, and don't say whether the push landed — the result is added to your reply."
 
+/** A quoted heredoc reaches `gh` byte-for-byte; an inline quoted body gets its Markdown shell-expanded (#2134). */
+const GH_BODY_DELIVERY_RULE =
+  "Deliver the body on stdin with `--body-file -` and a quoted heredoc (`<<'EOF'` ... `EOF`) so the shell cannot expand backticks, `$`, or quotes in your Markdown; never inline the body in a shell argument. Choose a heredoc delimiter that does not appear in the body."
+
 export interface TriggerDirective {
   readonly directive: string
   readonly appendMode: boolean
@@ -116,7 +120,9 @@ function buildPullRequestDirective(responseDelivery: ResponseDelivery): string {
 
   return [
     'Review this pull request for code quality, potential bugs, and improvements.',
-    'Submit your review via `gh pr review` and choose the event that matches your verdict: `--approve` for a PASS verdict, `--request-changes` for a CONDITIONAL or REJECT verdict. Put your full response (including the Run Summary) in the --body.',
+    `Submit your review via \`gh pr review\` and choose the event that matches your verdict: \`--approve\` for a PASS verdict, \`--request-changes\` for a CONDITIONAL or REJECT verdict. Put your full response (including the Run Summary) in the review body. ${
+      GH_BODY_DELIVERY_RULE
+    }`,
     'A comment-only review does NOT satisfy a requested review and leaves the PR blocked on review-required. Once you reach a verdict you MUST approve or request changes — never deliver a verdict as a plain comment.',
     'This applies equally to re-reviews (after a push or dismissed review): a follow-up validation is still a review, not a comment. Always use `gh pr review --approve` or `gh pr review --request-changes` — never `gh pr comment` or `gh issue comment` — to deliver your verdict.',
     'Do not post a separate comment. If the author is a collaborator, prioritize actionable feedback over style nits.',
@@ -276,9 +282,18 @@ The \`gh\` CLI is pre-authenticated. Use it for all GitHub operations.${
           ? ` Post exactly one comment or review per run (see Response Protocol).
 
 \`\`\`bash
-gh pr comment ${issueNum} --body "Your response with Run Summary"
-gh pr review ${issueNum} --approve --body "Your review with Run Summary"
-gh issue comment ${issueNum} --body "Your response with Run Summary"
+gh pr comment ${issueNum} --body-file - <<'EOF'
+Your response with Run Summary
+EOF
+
+gh pr review ${issueNum} --approve --body-file - <<'EOF'
+Your review with Run Summary
+EOF
+
+gh issue comment ${issueNum} --body-file - <<'EOF'
+Your response with Run Summary
+EOF
+
 gh api repos/${context.repo}/pulls/${issueNum}/files --jq '.[].filename'
 \`\`\``
           : ''
@@ -838,7 +853,9 @@ ${runSummaryTemplate}${verdictExampleSection}`
 
   const surfacePolicy = RESPONSE_SURFACE_POLICIES[responseSurface]
   const reviewInstruction = surfacePolicy.verdictRequired
-    ? '5. **For PR reviews — match the event to your verdict.** Submit exactly ONE review via `gh pr review`: use `--approve` for a PASS verdict and `--request-changes` for a CONDITIONAL or REJECT verdict. Put your full response (analysis + Run Summary) in the `--body` argument. A comment-only review (`gh pr review --comment` or `gh pr comment`) does NOT count as the review and leaves the PR blocked on review-required — never use it to deliver a verdict. This applies equally on re-reviews (after a push or dismissed review): a follow-up validation is still a review event, not a comment. Do not post a separate PR comment afterward.'
+    ? `5. **For PR reviews — match the event to your verdict.** Submit exactly ONE review via \`gh pr review\`: use \`--approve\` for a PASS verdict and \`--request-changes\` for a CONDITIONAL or REJECT verdict. Put your full response (analysis + Run Summary) in the review body. ${
+        GH_BODY_DELIVERY_RULE
+      } A comment-only review (\`gh pr review --comment\` or \`gh pr comment\`) does NOT count as the review and leaves the PR blocked on review-required — never use it to deliver a verdict. This applies equally on re-reviews (after a push or dismissed review): a follow-up validation is still a review event, not a comment. Do not post a separate PR comment afterward.`
     : surfacePolicy.verdictPermitted
       ? '5. **For an optional PR review — choose the event that fits the response.** If your findings warrant a review event, submit exactly ONE review via `gh pr review`: use `--approve` for a PASS verdict or `--request-changes` for a CONDITIONAL or REJECT verdict. If the mention is a question or explanation, post exactly ONE PR comment instead. A review verdict is available on this surface but is not required; do not create a review merely because the trigger is on a PR.'
       : null
@@ -851,7 +868,7 @@ You MUST post exactly ONE comment or review per invocation. All of your output �
 2. **Include the Run Summary.** Append the Run Summary block (see template below) at the end of your response body. It is part of the same comment/review, not a separate post.
 3. **NEVER post the Run Summary as a separate comment.** This is the most common mistake. The Run Summary goes INSIDE your response.
 4. **Include the bot marker.** Your response must contain \`<!-- fro-bot-agent -->\` (inside the Run Summary block) so the system can identify your comment.
-${reviewInstruction == null ? '' : `${reviewInstruction}\n`}${reviewInstruction == null ? 5 : 6}. **For issue/PR comments:** Post a single \`gh issue comment ${issueNum}\` or \`gh pr comment ${issueNum}\` with your full response including Run Summary.
+${reviewInstruction == null ? '' : `${reviewInstruction}\n`}${reviewInstruction == null ? 5 : 6}. **For issue/PR comments:** Post a single \`gh issue comment ${issueNum}\` or \`gh pr comment ${issueNum}\` with your full response including Run Summary. ${GH_BODY_DELIVERY_RULE}
 
 **Response Format:**
 Every response you post — regardless of channel (issue, PR, discussion, review) — MUST follow this structure:

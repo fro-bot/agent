@@ -2529,6 +2529,49 @@ describe('buildAgentPrompt response delivery gating', () => {
     expect(prompt).not.toContain('gh` CLI is NOT available')
   })
 
+  describe('gh body delivery is shell-safe (#2134)', () => {
+    const ghSurfaces: readonly (readonly [ResponseSurface, TriggerContext['eventType'], string])[] = [
+      ['issue-comment', 'issue_comment', 'gh issue comment 42 --body-file - <<'],
+      ['pr-comment', 'pull_request_review_comment', 'gh pr comment 42 --body-file - <<'],
+      ['pr-review', 'pull_request', 'gh pr review 42 --approve --body-file - <<'],
+    ]
+
+    it.each(ghSurfaces)(
+      'shows a quoted-heredoc --body-file form for %s and no inline --body',
+      (surface, eventType, form) => {
+        // #given / #when
+        const prompt = buildPromptForDelivery('model-gh', null, eventType, surface)
+
+        // #then the example pipes a quoted heredoc to --body-file -
+        expect(prompt).toContain(`${form}'EOF'`)
+        // #and no instruction or example inlines the body in a shell-expanded argument
+        expect(prompt).not.toMatch(/--body\s+["']/u)
+        expect(prompt).not.toMatch(/--body(?![-\w])/u)
+        expect(prompt).not.toMatch(/(^|\s)-b\s+["']/mu)
+      },
+    )
+
+    it('tells the model to put the full response in a quoted-heredoc body file, not the --body argument', () => {
+      // #given / #when
+      const prompt = buildPromptForDelivery('model-gh', null, 'pull_request', 'pr-review')
+
+      // #then
+      expect(prompt).toContain('quoted heredoc')
+      expect(prompt).toContain('--body-file -')
+      expect(prompt).toContain("<<'EOF'")
+    })
+
+    it('keeps the review verdict flags and one-response rule alongside the safe form', () => {
+      // #given / #when
+      const prompt = buildPromptForDelivery('model-gh', null, 'pull_request', 'pr-review')
+
+      // #then
+      expect(prompt).toContain('`--approve` for a PASS verdict')
+      expect(prompt).toContain('`--request-changes` for a CONDITIONAL or REJECT verdict')
+      expect(prompt).toContain('exactly ONE')
+    })
+  })
+
   it('renders neither file-write nor gh-posting instructions for none delivery', () => {
     // #given / #when
     const prompt = buildPromptForDelivery('none', null, 'issue_comment', 'pr-review-permitted')
