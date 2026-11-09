@@ -39,6 +39,14 @@ export interface CIConfigV2Inputs {
    */
   readonly bundledSkillsDirectories?: readonly string[]
   /**
+   * The run-scoped copy of the repository's admitted skills (`admitRepoSkills`, fro-bot/agent#2129), under
+   * `RUNNER_TEMP`, outside the checkout. Named in the config's `skills.paths` so the server lists them while project
+   * discovery stays off. It gets the same treatment as the bundled directories (an `external_directory` allow so a skill
+   * reads its references and runs its scripts, an `edit` deny, an authorized exception of the permission gate) and is
+   * subject to the same SECURITY note. Absent when the run is not trusted, the input is off, or nothing was admitted.
+   */
+  readonly repoSkillsDirectory?: string
+  /**
    * Provider id to the absolute path of the file holding that provider's API key (`credential-files-v2.ts`). Each is
    * referenced as `provider.<id>.options.apiKey: "{file:/path}"`. The V1-shaped `options` is what the server migrates
    * into V2 `settings`, including the V1-to-V2 provider id mapping, so a provider id from `auth-json` and one from
@@ -120,6 +128,19 @@ function stripOperatorPermissions(operator: Record<string, unknown>, logger: Log
     )
   }
   return result
+}
+
+/**
+ * The operator's `skills` config with `directory` added to its paths. The server reads three spellings (a list, or a
+ * record with `paths` and `urls`); each keeps its own shape and everything the operator set.
+ */
+function withRepoSkillsPath(operatorSkills: unknown, directory: string): unknown {
+  if (Array.isArray(operatorSkills)) return [...(operatorSkills as unknown[]), directory]
+  if (isRecord(operatorSkills)) {
+    const paths = Array.isArray(operatorSkills.paths) ? (operatorSkills.paths as unknown[]) : []
+    return {...operatorSkills, paths: [...paths, directory]}
+  }
+  return {paths: [directory]}
 }
 
 /** The server's `{file:...}` substitution ends a reference at the first `}`. */
@@ -214,12 +235,17 @@ export function buildCIConfigV2(inputs: CIConfigV2Inputs, logger: Logger): Resul
     logger.debug('Skipping response-file and attachment exceptions: RUNNER_TEMP is not set')
   }
 
-  const bundledSkillsDirectories = inputs.bundledSkillsDirectories ?? []
+  // The repo skills copy is a skills directory like the bundled ones: readable for its references and scripts, never
+  // writable through the edit tools.
+  const skillsDirectories = [
+    ...(inputs.bundledSkillsDirectories ?? []),
+    ...(inputs.repoSkillsDirectory === undefined ? [] : [inputs.repoSkillsDirectory]),
+  ]
 
   const rules = buildPermissionRulesV2({
     outsideEffect: 'deny',
     allowedExternalDirectories: allowedDirectories,
-    bundledSkillsDirectories,
+    bundledSkillsDirectories: skillsDirectories,
     editDenyResources,
     denyQuestion: true,
     denyWebsearch: true,
@@ -243,6 +269,9 @@ export function buildCIConfigV2(inputs: CIConfigV2Inputs, logger: Logger): Resul
   const content = {
     ...operator,
     ...(provider === undefined ? {} : {provider}),
+    ...(inputs.repoSkillsDirectory === undefined
+      ? {}
+      : {skills: withRepoSkillsPath(operator.skills, inputs.repoSkillsDirectory)}),
     ...base,
     plugins: [...new Set([...inputs.plugins, ...operatorPlugins])],
     experimental: {...operatorExperimental, ...(base.experimental as Record<string, unknown>)},
@@ -252,13 +281,14 @@ export function buildCIConfigV2(inputs: CIConfigV2Inputs, logger: Logger): Resul
     hasUserConfig: inputs.opencodeConfig != null,
     pluginCount: content.plugins.length,
     keyFileProviders: Object.keys(keyFiles),
+    hasRepoSkills: inputs.repoSkillsDirectory !== undefined,
   })
 
   return ok({
     content,
     expectations: {
       outsidePolicy: 'deny',
-      allowedDirectories: [...allowedDirectories, ...bundledSkillsDirectories],
+      allowedDirectories: [...allowedDirectories, ...skillsDirectories],
       deniedActions: [...FORBIDDEN_TOOL_ACTIONS_V2, WEBSEARCH_ACTION_V2],
     },
   })

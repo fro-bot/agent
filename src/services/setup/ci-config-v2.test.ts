@@ -560,6 +560,115 @@ describe('buildCIConfigV2', () => {
     })
   })
 
+  describe('repoSkillsDirectory (fro-bot/agent#2129)', () => {
+    const REPO_SKILLS = `${RUNNER_TEMP}/fro-bot-repo-skills-abc123/skills`
+    const BUNDLED =
+      '/home/runner/.cache/opencode/npm/@fro.bot/systematic@9.9.9/1800000000000/node_modules/@fro.bot/systematic/skills'
+
+    it('points skills.paths at the run-scoped copy', () => {
+      // #given an admitted repo skills directory and no operator skills
+      const {content} = build({repoSkillsDirectory: REPO_SKILLS})
+
+      // #then the server is told to scan exactly that directory
+      expect(content.skills).toEqual({paths: [REPO_SKILLS]})
+    })
+
+    it('writes no skills key when no directory is given', () => {
+      // #given / #when no repo skills
+      const {content} = build()
+
+      // #then nothing skill-related is emitted and the permission rules equal the empty-list build
+      expect('skills' in content).toBe(false)
+      expect(content.permissions).toEqual(build({bundledSkillsDirectories: []}).content.permissions)
+    })
+
+    it('keeps an operator skills array and appends the directory', () => {
+      // #given an operator skills list
+      const {content} = build({
+        repoSkillsDirectory: REPO_SKILLS,
+        opencodeConfig: JSON.stringify({skills: ['/opt/team-skills']}),
+      })
+
+      // #then the operator's path stays first
+      expect(content.skills).toEqual(['/opt/team-skills', REPO_SKILLS])
+    })
+
+    it('keeps an operator skills record and appends the directory to its paths', () => {
+      // #given an operator skills record with paths and urls
+      const {content} = build({
+        repoSkillsDirectory: REPO_SKILLS,
+        opencodeConfig: JSON.stringify({skills: {paths: ['/opt/team-skills'], urls: ['https://example.com/skills']}}),
+      })
+
+      // #then urls are untouched and the directory joins the paths
+      expect(content.skills).toEqual({
+        paths: ['/opt/team-skills', REPO_SKILLS],
+        urls: ['https://example.com/skills'],
+      })
+    })
+
+    it('leaves an operator skills config alone when no directory is given', () => {
+      // #given an operator skills list and no repo skills
+      const {content} = build({opencodeConfig: JSON.stringify({skills: ['/opt/team-skills']})})
+
+      // #then it passes through as before
+      expect(content.skills).toEqual(['/opt/team-skills'])
+    })
+
+    it('lets a skill read its references and run its scripts there, and nothing else under RUNNER_TEMP', () => {
+      // #given the repo skills directory
+      const rules = permissionsOf(build({repoSkillsDirectory: REPO_SKILLS}).content)
+
+      // #then the copy is readable, a sibling directory under RUNNER_TEMP is not
+      expect(evaluatePermissionV2('external_directory', `${REPO_SKILLS}/*`, rules)).toBe('allow')
+      expect(evaluatePermissionV2('external_directory', `${REPO_SKILLS}/probe/references/*`, rules)).toBe('allow')
+      expect(evaluatePermissionV2('external_directory', `${RUNNER_TEMP}/fro-bot-repo-skills-abc123/*`, rules)).toBe(
+        'deny',
+      )
+      expect(evaluatePermissionV2('external_directory', `${RUNNER_TEMP}/*`, rules)).toBe('deny')
+    })
+
+    it('denies the edit tools there, like the bundled skills', () => {
+      // #given the repo skills directory
+      const rules = permissionsOf(build({repoSkillsDirectory: REPO_SKILLS}).content)
+
+      // #then the copy cannot be rewritten through edit, write or patch
+      expect(evaluatePermissionV2('edit', `${REPO_SKILLS}/probe/scripts/run.mjs`, rules)).toBe('deny')
+      expect(evaluatePermissionV2('edit', 'src/index.ts', rules)).not.toBe('deny')
+    })
+
+    it('is an authorized exception of the permission gate beside the bundled directory, so the real gate passes', async () => {
+      // #given both skills directories
+      const {content, expectations} = build({
+        repoSkillsDirectory: REPO_SKILLS,
+        bundledSkillsDirectories: [BUNDLED],
+      })
+      const agents = [
+        {id: 'build', permissions: [{action: '*', resource: '*', effect: 'allow'}, ...permissionsOf(content)]},
+      ]
+
+      // #when the gate reads the effective rules
+      const result = await verifyPermissionRules(
+        {listAgents: async () => ({location: {}, data: agents})},
+        expectations,
+        createMockLogger(),
+      )
+
+      // #then both are expected exceptions and it passes
+      expect(expectations.allowedDirectories).toEqual(expect.arrayContaining([REPO_SKILLS, BUNDLED]))
+      expect(result.success).toBe(true)
+    })
+
+    it.each(['skills', `${RUNNER_TEMP}/skills?`, `${RUNNER_TEMP}/*/skills`, '/'])(
+      'refuses the unusable directory %j',
+      directory => {
+        expect(buildCIConfigV2({...BASE_INPUTS, repoSkillsDirectory: directory}, createMockLogger()).success).toBe(
+          false,
+        )
+      },
+    )
+  })
+
   describe('{env:} references in opencode-config', () => {
     const RULE = /\{env:\} references.*credential-withheld.*pull_request, issue_comment, issues/s
 
