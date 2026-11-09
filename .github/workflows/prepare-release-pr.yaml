@@ -21,6 +21,9 @@ concurrency:
 
 jobs:
   prepare-release:
+    # Defense in depth: a dispatched ref supplies its own copy of this file, so the enforced
+    # boundary is a deployment environment restricted to the default branch.
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     name: Prepare Release PR
     runs-on: ubuntu-latest
     steps:
@@ -31,6 +34,13 @@ jobs:
           app-id: ${{ secrets.APPLICATION_ID }}
           private-key: ${{ secrets.APPLICATION_PRIVATE_KEY }}
           owner: ${{ github.repository_owner}}
+          repositories: ${{ github.event.repository.name }}
+          # contents: fetch the `release` branch and tags; push and delete the `next` branch.
+          # pull-requests: list, create, edit, view, close and merge the release PR.
+          # workflows: `next` and the release merge carry main's `.github/workflows` changes.
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
 
       - id: discover-release-pr
         name: Discover existing release PR

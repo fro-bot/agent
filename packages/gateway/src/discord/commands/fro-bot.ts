@@ -22,6 +22,7 @@ import type {RepoQuiescenceChecker} from '../../execute/repo-quiescence.js'
 import type {RunIndex} from '../../execute/run-index.js'
 import type {RunTask} from '../../execute/run.js'
 import type {DispatchWorkflow} from '../../github/dispatch.js'
+import type {DenylistCache} from '../../redaction/denylist.js'
 import type {ConfirmExpiredHolder, LockCoordinationLogger} from '../../runtime-effect.js'
 import type {GatewayLogger} from '../client.js'
 import type {AddProjectDeps} from './add-project.js'
@@ -93,6 +94,11 @@ export interface FroBotDeps extends AddProjectDeps {
   ) => Effect.Effect<ForceReleaseStaleLockResult, Error>
   /** GitHub Actions dispatch primitive, constructed once in program.ts. */
   readonly dispatchWorkflow: DispatchWorkflow
+  /**
+   * The shared denylist cache, so `dispatch` applies the same repo-access predicate as the operator web routes.
+   * Required (not optional): a missing cache must not silently skip the gate.
+   */
+  readonly denylistCache: Pick<DenylistCache, 'getDenylistState' | 'isRepoDenied'>
   /**
    * Shared cancellation engine deps, built once in program.ts for both transports (the same object the operator web
    * cancel route receives), so `/fro-bot cancel` works with the operator web endpoint disabled.
