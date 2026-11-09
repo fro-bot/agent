@@ -56,6 +56,12 @@ const ERROR_GLYPH = '⨯'
 const HIDDEN_TOOLS = new Set(['read', 'grep', 'glob', 'list'])
 
 /**
+ * Tools that never get a line, whatever their status. The `question` tool has its own card that shows the question and
+ * the answer; a line here would only repeat it, and V2 sets no title so the generic fallback would print the raw input.
+ */
+const SILENT_TOOLS = new Set(['question'])
+
+/**
  * Read-only bash command prefixes that are hidden like other read-only tools.
  * Matched against the first command token (leading word) of the bash command.
  * If uncertain or compound, treat as essential (shown) — conservative default.
@@ -194,12 +200,12 @@ function parsePatchCounts(patchText: string): {
 /**
  * Returns true if the tool should be shown in the Discord output.
  *
- * Hidden tools: read, grep, glob, list.
+ * Hidden tools: read, grep, glob, list. Silent tools (question) are hidden even when they errored.
  * Read-only bash commands are also hidden (see isReadOnlyBashCommand).
  * Everything else (edit, write, apply_patch, side-effecting bash, skill, task, MCP, unknown) → shown.
  */
 export function isEssentialTool(tool: string): boolean {
-  return !HIDDEN_TOOLS.has(tool)
+  return !HIDDEN_TOOLS.has(tool) && !SILENT_TOOLS.has(tool)
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +227,8 @@ export function summarizeTool(part: ExtractedToolPart): string | null {
   const {input, title, status} = state
 
   const isError = status === 'error'
+
+  if (SILENT_TOOLS.has(tool)) return null
 
   // Hidden tools (read, grep, glob, list): successful → null; errored → terse error line
   if (!isEssentialTool(tool)) {
