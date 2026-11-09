@@ -285,6 +285,7 @@ Withholding stops accidental exposure and casual authenticated use. It does not 
 Until the agent runs under a separate user, keep write credentials out of the job that runs the agent:
 
 - Give the agent job a read-only token, minimal `permissions:`, and `persist-credentials: false` on checkout.
+- Set `response-mode: none` so the agent job never tries to post with the read-only token. With the default `github`, comment, issue and PR runs still publish the response and fail when the token can't write.
 - Have the agent write its output (a patch, a PR or issue request, a comment body) to files and upload them as an artifact. Use `output-mode: working-dir` for code changes.
 - Publish from a separate job on a fresh runner. That job mints the write token, runs only trusted default-branch code, validates the handoff (paths, size, target repository and branch, no force updates) and never executes model output.
 
