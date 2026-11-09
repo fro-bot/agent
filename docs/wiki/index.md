@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-11-02"
-updated-by: "f8ee76a3"
+last-updated: "2026-11-08"
+updated-by: "f7c20f94"
 sources:
   - docs/wiki/Architecture Overview.md
   - docs/wiki/Background Subagents and Ownership.md
@@ -54,7 +54,7 @@ An Obsidian-powered project wiki maintained by Fro Bot. This vault provides huma
 
 ## About This Wiki
 
-Current coverage includes the Action's stock V2 default and explicit V1 rollback, directory-based release gates and verdict diagnostics, bounded completion waits, generation-isolated session restore and history import, file-referenced Action credentials, workspace credential provisioning, bundled-skill access, and run-local Always approvals. The workspace image retains its independent V1 harness default; the gateway selects its protocol from the image's reported version.
+Current coverage includes the Action's stock V2 default and explicit V1 rollback, generation-neutral execution contracts, directory-based release diagnostics, generation-isolated session restore, brokered-push prompt handoff, reviewed-head pinning, credential-withheld MCP filtering, and cross-surface approvals and cancellation. The Action currently pins OpenCode `2.2.6` and Systematic `3.32.0`. The workspace image retains its independent V1 harness default; the gateway selects its protocol from the image's reported version.
 
 - **Audience:** Human developers — contributors, reviewers, and maintainers
 - **Content:** Descriptive documentation (how the system works, why decisions were made)

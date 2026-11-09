@@ -1,8 +1,11 @@
 ---
 type: convention
-last-updated: "2026-11-02"
-updated-by: "f8ee76a3"
+last-updated: "2026-11-08"
+updated-by: "f7c20f94"
 sources:
+  - packages/runtime/src/agent/drain-progress-v2.ts
+  - src/features/reviews/reviewed-head.ts
+  - src/services/setup/ci-config-v2.ts
   - src/features/agent/retry-v2.ts
   - src/harness/phases/v2-server.ts
   - src/harness/phases/v1-import-wait.ts
@@ -72,6 +75,8 @@ If the agent does not react to a mention or event:
 - **Review access control** — only `OWNER`, `MEMBER`, and `COLLABORATOR` authors are processed; bot accounts and fork pull requests are skipped by design. A skipped run names its reason in a `Fro Bot skipped this event (<reason>)` notice and in the job summary's Invocation Outcome section. For a pull request from an unauthorized or bot author, see [Review Access and the Review-Request Path](#review-access-and-the-review-request-path).
 
 ## Review Access and the Review-Request Path
+
+A review blocked with `no-reviewed-head` or `head-moved-before-submit` is a delivery guard, not an authorization failure. The Action pins the review to the head captured before execution (`src/features/reviews/reviewed-head.ts`) and refuses to publish it against a newer live head. The guard also rechecks after a receipt reservation; [[Execution Lifecycle]] describes this distinction.
 
 A skipped run reports its reason in two places besides the log: a `core.notice` annotation (`Fro Bot skipped this event (<reason>): <message>`) and the **Skip reason** line under Invocation Outcome in the job summary. The skip posts no comment and no reaction.
 
@@ -160,6 +165,10 @@ SDK failures now retain readable envelope details in diagnostics rather than col
 `model_not_found` means OpenCode could not resolve the configured provider/model identifier, not that a network request to the model timed out. The Action stops immediately and reports a sanitized model ID and any validated suggestions, plus a suggested action in the job summary (`packages/runtime/src/agent/error-format/format.ts`, `src/features/agent/execution.ts`). The two usual causes are an incorrect identifier and a model catalog that did not load; the latter can occur when the job cannot reach `models.opencode.ai` and the model is not defined explicitly in OpenCode config. Repeating the same turn or increasing its timeout does not repair either configuration problem.
 
 ## Timeout Errors
+
+`Drain waiting on directory activity` identifies V2's current blockers: active session ids, running shell ids, and queued inbox counts with bounded metadata. Both Action and gateway log it when the blocking set changes and after sixty seconds of unchanged blocking activity; `Drain could not read the directory` names an unreadable stretch. Message and command text are excluded (`packages/runtime/src/agent/drain-progress-v2.ts`). A gateway drain-deadline line retains the latest blocking set. These diagnostics explain waiting without weakening the quiet-window requirement.
+
+On the dashboard, V2 directory confirmation and unreadable directory observations map to `confirming-completion`, rather than disappearing as unknown wait reasons. Known background children or confirmed background shells can show `awaiting-background-task` before the root first succeeds; a foreground shell alone is not that signal. [[Operator Web Control Surface]] describes the status overlay.
 
 `v2 session wait bound elapsed with no answer; asking again` is a renewed 60-second long poll, not a resent prompt or an execution timeout. A real wait failure instead logs `v2 session wait failed; relying on the poll watchdog for completion`. The overall run deadline still applies. [[Prompt Architecture]] explains the observation and submission boundary.
 

@@ -1,8 +1,9 @@
 ---
 type: subsystem
-last-updated: "2026-11-02"
-updated-by: "f8ee76a3"
+last-updated: "2026-11-08"
+updated-by: "f7c20f94"
 sources:
+  - packages/runtime/src/agent/drain-progress-v2.ts
   - packages/runtime/src/agent/ownership-ledger.ts
   - packages/runtime/src/agent/ledger-reconcile.ts
   - packages/runtime/src/agent/ledger-reconcile-v2.ts
@@ -90,6 +91,10 @@ Overflow recovery uses the same generation-specific backend as the original exec
 The Action emits one `Run release verdict` line from `src/features/agent/drain-v2.ts` before pre-shutdown work. It records the drain outcome, whether stopping was needed, directory quietness, observation count and passing quiet streak, successful shell deletions and actual session interruptions, unresolved ownership count, and any decline reason. These are bounded counts and states, not model-controlled shell commands. Quietness still needs a separately confirmed server shutdown before persistence is safe.
 
 ## Gateway: drain and quarantine
+
+Ownership snapshots are persisted serially by `packages/gateway/src/execute/run.ts`. While one conditional write is in flight, newer ledger changes replace a pending full snapshot rather than starting competing writes or unioning already-settled children back in. Identical successful snapshots are skipped, and terminal handling waits for the queue to become idle within a bounded budget before stopping the heartbeat. This reduces ETag conflicts without treating persisted ownership as release authority.
+
+Cancellation cannot release a quarantined run. The live-run registry records the hold independently of the stored terminal transition, so even a failed `FAILED` write cannot let a later cancel relabel uncertain work as safely cancelled. The hold and stop watch remain in control; see [[Operator Web Control Surface]].
 
 `packages/gateway/src/execute/run-core-v2.ts` owns its drain before returning, so heartbeat stop, terminal run-state writes, and concurrency-slot handoff occur after admission. Its completion gate also checks the root's reply and delivery evidence; directory stability is an additional release requirement, not a replacement for a useful answer.
 

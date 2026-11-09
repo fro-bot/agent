@@ -1,9 +1,12 @@
 ---
 type: architecture
-last-updated: "2026-11-02"
-updated-by: "f8ee76a3"
+last-updated: "2026-11-08"
+updated-by: "f7c20f94"
 sources:
-  - src/harness/phases/execution-backend.ts
+  - src/features/agent/execution-deadline.ts
+  - src/features/reviews/reviewed-head.ts
+  - src/harness/phases/brokered-push-plan.ts
+  - src/features/delegated/commit-message.ts
   - src/harness/phases/execute-v2.ts
   - src/harness/phases/release-v2.ts
   - src/harness/phases/observed-turn-v2.ts
@@ -224,6 +227,8 @@ When there is no ledger, or when execution never ran, the phase is a complete no
 
 ## 10. Review Reconciliation
 
+Both reconciliation and file-driven review delivery pin the review to the head captured before execution, not to a new head read during delivery. `resolveReviewedHeadSha` (`src/features/reviews/reviewed-head.ts`) uses the webhook head for `pull_request` and the head hydrated with the displayed diff for a PR comment. A missing pin fails closed. `review-guards.ts` compares the live head to that pin immediately before submission and again after a delivery-receipt reservation; a moved head blocks publication rather than attributing a review of the old code to the new code.
+
 Runs after Execute, before Finalize, only for `pull_request` review triggers on the model-`gh` posting path (`workflow_dispatch`/`schedule`). Calls `decideReconciliation()` in `src/features/reviews/review-reconciliation.ts` to inspect the agent's posted review body for a verdict signal. If the verdict warrants a formal GitHub APPROVE, the phase submits one automatically via the GitHub review API through the shared review guards (fork/self/head-SHA/TOCTOU). This removes the manual step of having the agent issue the `gh pr review --approve` command itself on approve-verdicts.
 
 For comment/review flows that post through the file convention (see Finalize), this phase **skips immediately** — the model posts no review of its own for reconciliation to reconcile, and Finalize owns the review post instead. The fork/self/head-SHA/TOCTOU guard set both paths share has been extracted into `src/features/reviews/review-guards.ts`, so a file-driven approve on a fork PR is blocked exactly as a reconciled one would be.
@@ -241,6 +246,8 @@ For `pull_request`/`issue_comment`/`issues` triggers, this phase also **posts th
 This design exists for a security reason, not just tidiness. Because the model no longer posts its own comment or review, it no longer needs a GitHub credential for those flows — so the credential is withheld from the OpenCode child entirely (see [[Setup and Configuration]]). The response file is treated as _untrusted payload_: it contributes only body content (and, for a review, an `approve`/`request-changes` verdict) within an envelope whose target, surface, and eligibility come from the trusted event. A fork PR cannot preseed a workspace file to redirect a post or forge an approval. `workflow_dispatch`/`schedule` runs keep `model-gh` delivery — they post via the model's own `gh` and are unchanged.
 
 ### Brokered push
+
+Before execution, `brokered-push-plan.ts` determines whether the prompt can describe the Action-managed push. Eligible agents are told to commit locally, not push or claim that a push landed; the post-run trust gates still decide delivery. `src/features/delegated/commit-message.ts` preserves a valid agent-authored commit message when reconstructing the change, while the trusted harness supplies the actual push result in the response footer. See [[Prompt Architecture]].
 
 Finalize also hosts an optional **brokered push** step for the file-convention path (RFC-010, `src/features/delegated/brokered-push.ts`). The credential-withholding design above means a comment-triggered agent cannot commit for itself — it has no `gh` token. Brokered push closes that gap for the narrow, trusted case of a same-repository pull-request comment: after a successful run that produced workspace edits but posted no comment of its own, the harness reconstructs those edits and commits them to the PR head branch on the model's behalf, using the action's own Octokit client rather than any credential the model can reach. This lets an authorized `@fro-bot` fix request land as a real commit while still keeping the token off the agent process.
 

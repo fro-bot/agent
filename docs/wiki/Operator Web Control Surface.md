@@ -1,8 +1,9 @@
 ---
 type: subsystem
-last-updated: "2026-11-02"
-updated-by: "f8ee76a3"
+last-updated: "2026-11-08"
+updated-by: "f7c20f94"
 sources:
+  - packages/gateway/src/execute/permission-detail-v2.ts
   - packages/gateway/src/execute/run-core-v2.ts
   - packages/gateway/src/execute/opencode-generation.ts
   - packages/gateway/src/execute/drain-completion-v2.ts
@@ -239,6 +240,8 @@ The run index this route reads from is server-owned; the operator never supplies
 
 ## Approving Tool Use
 
+Approval gates steer tool use, rather than establishing an operating-system sandbox. A permitted shell still has the process's filesystem and network access; workspace identity isolation and egress controls provide those boundaries. On V2, `execute/permission-detail-v2.ts` derives the displayed command or path from the permission event's resources, so both dashboard and Discord decisions show what the request concerns.
+
 Web-launched runs are no longer approval-free. When OpenCode hits a permission gate mid-run — a shell command, an out-of-tree file write — the same approval registry that backs Discord buttons (`registry.handleDecision` as the single settlement authority) also drives the web surface.
 
 The web approval transport (`web/operator/web-approval.ts`) follows a **register-before-fan-out** discipline: it registers the pending request in the shared registry first, attaches the settle/clear callback, and only then fans an SSE frame out to any watching browsers. If the fan-out throws, the error is logged and swallowed — the registry entry already exists and its deadline still settles fail-closed, so a dropped frame degrades the UI without weakening the gate.
@@ -270,6 +273,8 @@ The web question transport (`web/operator/web-question.ts`) follows the same **r
 **Discord.** For a Discord-launched run, the same request also appears in the run's thread. A single-question request that fits Discord's component limits renders natively with buttons or a select, Skip, and a text-answer modal when a custom answer is allowed. Any other shape posts a short notice saying a question is waiting and can be answered on this operator surface, and carries no question text. The request stays answerable here either way, and a Discord delivery failure never settles it.
 
 ## Cancelling a Run
+
+A quarantine hold is not cancellable. `execute/cancel.ts` checks the process's live quarantine registry before taking a cancellation path and again before a rendezvous write. The run may still read `EXECUTING` if its failed-state write did not land, but cancel cannot overwrite that uncertainty with `CANCELLED` or release its slot or lock. Failed and cancelled runs flush any partial output without adding an empty-output placeholder before their failure reply or cancellation notice (`execute/run.ts`).
 
 An operator can stop a run that is still in flight. `POST /operator/runs/:runId/cancel` (`web/operator/cancel-route.ts`) applies the same repo-access predicate as the other routes. The route resolves the run to its repository through the server-owned run index, re-runs the predicate, and (deliberately) applies the operator-keyed rate limit only _after_ it so a denied caller never consumes budget.
 
@@ -343,7 +348,7 @@ The surface exposes four authenticated operator routes (`web/operator-push/`):
 
 **Question notification.** The `question` trigger sends fixed copy only: the title and body are the keys `operator.question_pending.title` and `operator.question_pending.body`, with `data: {type: 'question', runId, route: '/operator#<runId>'}`. The route deep-links the dashboard to the asking run. When the run id does not match `^[\w-]{1,128}$`, the payload omits `runId` and the route falls back to `/`. The builder takes only the run id, so question text, options, repo, and prompt cannot reach the payload. It is sent for any run, Discord-launched or web-launched, once the question is registered.
 
-**Approval notification.** The `approval` trigger uses the same shape: `data: {type: 'approval', runId, route: '/operator#<runId>'}` with the fixed keys `operator.approval_needed.title` and `operator.approval_needed.body`, and the same fallback to `/` with no `runId` for a non-conforming id. The builder and `dispatchApprovalPending(approvalId, runId)` both take the run id, which only deep-links the payload; tool name, command, repo and prompt cannot reach it. The link opens the waiting run's card. A web-scope approval, registered under the run id, can be decided from the card. A Discord-scope approval is registered under the thread id, so the card shows the run as waiting while `GET /operator/runs/:runId/approvals` returns an empty list; it is decided in Discord. Run-failed notifications keep `route: '/'`.
+**Approval notification.** The `approval` trigger uses the same shape: `data: {type: 'approval', runId, route: '/operator#<runId>'}` with the fixed keys `operator.approval_needed.title` and `operator.approval_needed.body`, and the same fallback to `/` with no `runId` for a non-conforming id. The builder and `dispatchApprovalPending(approvalId, runId)` both take the run id, which only deep-links the payload; tool name, command, repo and prompt cannot reach it. The link opens the waiting run's card. Both web- and Discord-started runs expose approvals through the run-id listing and decision routes, even though Discord buttons remain thread-scoped. Run-failed notifications keep `route: '/'`.
 
 **Dispatch and deduplication.** Only three lifecycle events fan out a push: a run entering the approval-pending state, a run registering an agent question, and a run reaching the `FAILED` phase. Neither successful completion nor an operator logout sends a notification (logout instead _deactivates_ that operator's subscriptions). The dispatcher (`web/operator-push/dispatcher.ts`) coalesces bursts through a bounded in-memory dedupe cache (`dedupe-cache.ts`, default five-minute window keyed by the run/approval id and event kind; one question nudge per run covers every question the run asks within the window, while each approval nudges once, so two approvals on one run send two notifications), so a flurry of retries on one run does not spam every browser. Each broadcast records a single coarse `push.dispatch` audit entry carrying only delivered/dead/failed counts. When the push relay reports an endpoint is gone (HTTP 410/404), the dispatcher deactivates that subscription in place rather than retrying it.
 

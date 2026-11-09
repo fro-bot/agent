@@ -1,12 +1,14 @@
 ---
 type: architecture
-last-updated: "2026-11-02"
-updated-by: "f8ee76a3"
+last-updated: "2026-11-08"
+updated-by: "f7c20f94"
 sources:
   - packages/runtime/src/session/generation.ts
   - packages/runtime/src/agent/server-v2.ts
   - packages/runtime/src/agent/directory-quiescence-v2.ts
-  - src/harness/phases/execution-backend.ts
+  - src/harness/phases/execute-v2.ts
+  - src/features/agent/execution-deadline.ts
+  - packages/gateway/src/execute/run-core-shared.ts
   - src/harness/phases/release-v2.ts
   - packages/gateway/src/execute/opencode-generation.ts
   - packages/gateway/src/execute/run-core-v2.ts
@@ -116,11 +118,13 @@ All layers may also import from `@fro-bot/runtime`, which is treated as a peer d
 
 ### OpenCode generation boundary
 
-V1 and V2 implementations coexist. `packages/runtime/src/session/generation.ts` selects V2 for a parsed major version of two or higher. The Action selects from its resolved executable version, keeping execution and overflow recovery on one backend (`src/harness/phases/execution-backend.ts`). Its default is the digest-verified stock V2 pin; an explicit V1 harness version remains the rollback path. The workspace image still defaults to the V1 harness build, independently of the Action. The gateway reads the workspace's `/readyz` `opencodeVersion` for each run, so the workspace image's version selects both sides of the protocol. An unreadable reported workspace version blocks admission rather than guessing.
+V1 and V2 implementations coexist. `packages/runtime/src/session/generation.ts` selects V2 for a parsed major version of two or higher. The Action selects from its resolved executable version, keeping execution and overflow recovery on one backend (the `ExecutionBackend` contract in `src/harness/phases/execute-v2.ts`). Its default is the digest-verified stock V2 pin; an explicit V1 harness version remains the rollback path. The workspace image still defaults to the V1 harness build, independently of the Action. The gateway reads the workspace's `/readyz` `opencodeVersion` for each run, so the workspace image's version selects both sides of the protocol. An unreadable reported workspace version blocks admission rather than guessing.
 
 V1 uses the SDK session/status model. V2 uses authenticated `/api/` routes, its event envelope, active sessions, forms, shell jobs, and queued session inboxes. The shared V2 primitives normalize these into the harness's activity and ownership vocabulary, while each surface retains its own lifecycle policy. In particular, V2 release requires a stable, quiet directory, rather than an empty ownership ledger alone; see [[Background Subagents and Ownership]].
 
 ### Action entry points
+
+Shared execution policy no longer lives inside V1 implementation modules. The Action's deadline is in `src/features/agent/execution-deadline.ts`, and classified attempt results are in `attempt-outcome.ts`; the gateway's common sink, error, and ledger-hook contracts are in `packages/gateway/src/execute/run-core-shared.ts`. Both generations consume these boundaries without making the V2 path depend on the V1 core loop.
 
 The action defines two Node 24 entry points in `action.yaml`:
 
