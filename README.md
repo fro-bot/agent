@@ -111,6 +111,8 @@ Comment and issue triggers are gated by author association — only `OWNER`, `ME
 
 Trusted same-repository, non-fork PR mentions on `issue_comment` from `OWNER`, `MEMBER`, or `COLLABORATOR` can broker a fix commit directly to the PR head branch. Brokered pushes are limited to allowlisted product, docs, and test paths; config, scripts, and CI files are excluded. Use `brokered-push-extra-paths` to opt into additional comma-separated relative path prefixes when a consumer repository keeps product code elsewhere. The default is empty. Protected surfaces remain hard-denied at parse and enforcement time; do not include secrets or execution surfaces such as CI, scripts, manifests, lockfiles, Dockerfiles, or `.git/`. Keep checkout `persist-credentials: false` as shown in the example.
 
+**Credential limits.** On comment, review and issue triggers the action keeps `github-token` out of the agent's environment and `gh` config. That isn't an OS boundary: on Linux runners the agent runs as the same user as the action and can read the token from the action's `/proc` environment. Pass the agent job a token you'd accept it holding, and publish writes from a separate job when that matters. See [Withholding is not an OS boundary](docs/wiki/Setup%20and%20Configuration.md#withholding-is-not-an-os-boundary).
+
 ### Comment examples
 
 ```markdown
