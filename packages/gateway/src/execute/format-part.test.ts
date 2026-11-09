@@ -596,6 +596,30 @@ describe('summarizeTool', () => {
     })
   })
 
+  describe('question tool', () => {
+    const input = {questions: [{question: 'Which environment?', header: 'Env', options: [{label: 'staging'}]}]}
+
+    it('renders no line for the V2 shape (no title)', () => {
+      // #given / #when / #then — the question card carries the question and the answer
+      expect(summarizeTool(completedTool('question', input))).toBeNull()
+    })
+
+    it('renders no line for the V1 shape (title `Asked N question`)', () => {
+      // #given / #when / #then
+      expect(summarizeTool(completedTool('question', input, 'Asked 1 question'))).toBeNull()
+    })
+
+    it('renders no line when the question was dismissed', () => {
+      // #given / #when / #then
+      expect(summarizeTool(errorTool('question', input))).toBeNull()
+    })
+
+    it('is not an essential tool', () => {
+      // #given / #when / #then
+      expect(isEssentialTool('question')).toBe(false)
+    })
+  })
+
   describe('missing title/input fallbacks', () => {
     it('falls back to tool name when state.input is empty and no title', () => {
       // #given / #when / #then
