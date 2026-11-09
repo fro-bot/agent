@@ -5,14 +5,16 @@
  * disabled (`OPENCODE_DISABLE_PROJECT_CONFIG=1`); what the model gets is a run-scoped COPY, built by this module, that
  * the CI config names through `skills.paths`:
  *
- * 1. `stageDefaultBranchSkills` fetches the default branch fresh from the base repository into a throwaway repository
- *    and extracts `.agents/skills` from that exact commit with `git archive`. No ref, config or object in the checkout
+ * 1. `stageDefaultBranchSkills` fetches the default branch fresh from the base repository into a throwaway repository,
+ *    lists `.agents/skills` in that exact commit and checks the listing against a size budget, and only then extracts it
+ *    with `git archive`. No ref, config or object in the checkout
  *    is read or changed, so an earlier workflow step cannot plant or age the revision, and the PR head or a dispatched
  *    branch is never a source.
  * 2. `admitRepoSkills` copies only real skill directories: `<id>/SKILL.md` plus that directory's regular files. A symlink
  *    at any level rejects the skill and is never followed. Total size and file count are bounded. A skill whose
  *    directory name collides with a bundled Systematic skill or an OpenCode built-in is skipped, so a repository cannot
- *    shadow one.
+ *    shadow one. A skill is copied into a private scratch directory first and renamed into the directory handed to
+ *    `skills.paths` only once complete, so a failed copy is never discoverable.
  * 3. The copy lives under `RUNNER_TEMP`, outside the checkout and every cached path, and the run removes it at the end.
  *
  * Nothing here logs file contents. A skipped skill is named by its id only.
@@ -37,15 +39,23 @@ export const REPO_SKILLS_DIRECTORY_NAME = 'skills'
 const EXTRACT_DIRECTORY_NAME = 'source-tree'
 const FETCH_REPOSITORY_NAME = 'fetch.git'
 const ARCHIVE_FILE_NAME = 'source.tar'
+/** Where a skill is copied before it is renamed into the discoverable directory. Never under `skills.paths`. */
+const SCRATCH_DIRECTORY_NAME = 'scratch'
 /** Every staging root's directory name starts with this; removal refuses a path that does not. */
 export const REPO_SKILLS_STAGING_PREFIX = 'fro-bot-repo-skills-'
 
 export interface RepoSkillsLimits {
   /** Files copied across all admitted skills. */
   readonly maxFiles: number
-  /** Bytes copied across all admitted skills. */
+  /**
+   * Entries (files, symlinks, submodules AND directories) in the default branch's `.agents/skills` tree, counted before
+   * anything is extracted and counting what admission would reject. Twice `maxFiles`: directories are entries here, and a
+   * tree at the file limit still has a directory per skill.
+   */
+  readonly maxSourceEntries: number
+  /** Bytes copied across all admitted skills, and the byte budget of the source tree (the same number). */
   readonly maxBytes: number
-  /** Directory depth below a skill directory (OpenCode's scanner stops at 6). */
+  /** Directory depth below a skill directory, for the source tree and for admission (OpenCode's scanner stops at 6). */
   readonly maxDepth: number
   /** Bound on each git or tar command. */
   readonly commandTimeoutMs: number
@@ -53,6 +63,7 @@ export interface RepoSkillsLimits {
 
 export const DEFAULT_REPO_SKILLS_LIMITS: RepoSkillsLimits = {
   maxFiles: 500,
+  maxSourceEntries: 1000,
   maxBytes: 5 * 1024 * 1024,
   maxDepth: 6,
   commandTimeoutMs: 60_000,
@@ -213,8 +224,84 @@ function withAuthHeader(env: Record<string, string>, origin: string, token: stri
   }
 }
 
+/** `git ls-tree -r -l -z -t` bound on the stdout kept in memory: well above any tree within budget (~150 bytes an entry). */
+const LISTING_STDOUT_CAP_BYTES = 4 * 1024 * 1024
+
+export interface TreeEntry {
+  /** Six-digit octal mode: `100644`, `120000` (symlink), `040000` (tree), `160000` (submodule). */
+  readonly mode: string
+  readonly type: 'blob' | 'commit' | 'tree'
+  /** Blob size in bytes; null for trees and submodules (git prints a dash). */
+  readonly size: number | null
+  readonly path: string
+}
+
+const TREE_RECORD = /^(\d{6}) (blob|commit|tree) ([\da-f]{40}|[\da-f]{64}) +(\d+|-)\t([\s\S]+)$/
+
+/**
+ * Parses `git ls-tree -r -l -z -t` output: NUL-terminated records of `<mode> SP <type> SP <object> SP+ <size> TAB <path>`.
+ * `-z` leaves the path raw (no quoting; it may hold spaces, tabs or newlines). Any record that does not parse fails the
+ * whole listing: a partial reading is not a safe reading.
+ */
+export function parseTreeListing(stdout: string): Result<readonly TreeEntry[], string> {
+  if (stdout === '') return ok([])
+  if (!stdout.endsWith('\0')) return err('The default branch tree listing was cut short; repo skills are not loaded')
+  const entries: TreeEntry[] = []
+  for (const record of stdout.slice(0, -1).split('\0')) {
+    const match = TREE_RECORD.exec(record)
+    if (match === null) return err('The default branch tree listing could not be read; repo skills are not loaded')
+    entries.push({
+      mode: match[1] as string,
+      type: match[2] as TreeEntry['type'],
+      size: match[4] === '-' ? null : Number.parseInt(match[4] as string, 10),
+      path: match[5] as string,
+    })
+  }
+  return ok(entries)
+}
+
+/**
+ * Checks the default branch's skills tree against the budget before a byte of it is extracted. Every entry under
+ * `.agents/skills` counts, rejected ones included (a symlink admission will refuse still costs an extraction), and the
+ * blob sizes are summed. Fails on: too many entries, too many bytes, a path deeper than admission walks (a file may sit
+ * `maxDepth` directories below its skill directory), or a submodule, which `git archive` writes as an empty directory
+ * that admission could never tell from a real one. Messages carry counts and limits, never a path.
+ */
+export function checkSourceBudget(entries: readonly TreeEntry[], limits: RepoSkillsLimits): Result<void, string> {
+  const root = `${SKILLS_GIT_PATH}/`
+  let count = 0
+  let bytes = 0
+  let deepest = 0
+  for (const entry of entries) {
+    // `ls-tree` also prints the `.agents` and `.agents/skills` trees above the pathspec.
+    if (!entry.path.startsWith(root)) continue
+    if (entry.type === 'commit') return err('The default branch skills contain a submodule; repo skills are not loaded')
+    count += 1
+    bytes += entry.size ?? 0
+    // Components below the skill directory: `<id>/a/b/file` has two directories, `a` and `b`.
+    deepest = Math.max(deepest, entry.path.slice(root.length).split('/').length - 2)
+  }
+  if (count > limits.maxSourceEntries) {
+    return err(
+      `The default branch skills exceed the staging budget (${count} entries, limit ${limits.maxSourceEntries}); repo skills are not loaded`,
+    )
+  }
+  if (bytes > limits.maxBytes) {
+    return err(
+      `The default branch skills exceed the staging budget (${bytes} bytes, limit ${limits.maxBytes}); repo skills are not loaded`,
+    )
+  }
+  if (deepest > limits.maxDepth) {
+    return err(
+      `The default branch skills exceed the staging budget (${deepest} directories deep, limit ${limits.maxDepth}); repo skills are not loaded`,
+    )
+  }
+  return ok(undefined)
+}
+
 type CommandOutcome =
-  {readonly kind: 'exited'; readonly code: number; readonly stdout: string} | {readonly kind: 'timed-out'}
+  | {readonly kind: 'exited'; readonly code: number; readonly stdout: string; readonly truncated: boolean}
+  | {readonly kind: 'timed-out'}
 
 /**
  * Stages the default branch's `.agents/skills` into `<stagingRoot>/source-tree`. On every call it fetches the branch
@@ -223,8 +310,9 @@ type CommandOutcome =
  * checkout and never reads a ref that already exists there: the checkout's refs, config (`insteadOf`, hooks) and
  * shallow state are not trusted, and are not changed either.
  *
- * Returns the extracted skills directory, or null when the default branch has none. Every git and tar command is bounded
- * by a timeout; any failure is an error and the caller loads no repo skills.
+ * Returns the extracted skills directory, or null when the default branch has none. Before extracting it lists the subtree
+ * and refuses one over the entry, byte or depth budget (`checkSourceBudget`). Every git and tar command is bounded by a
+ * timeout; any failure is an error and the caller loads no repo skills.
  */
 export async function stageDefaultBranchSkills(
   options: StageDefaultBranchSkillsOptions,
@@ -270,18 +358,30 @@ export async function stageDefaultBranchSkills(
     command: string,
     args: string[],
     commandEnv: Record<string, string> = baseEnv,
+    stdoutCapBytes = Number.POSITIVE_INFINITY,
   ): Promise<CommandOutcome> => {
     const chunks: Buffer[] = []
+    let kept = 0
+    let truncated = false
     const code = await execWithTimeout(command, args, limits.commandTimeoutMs, {
       cwd: stagingRoot,
       env: commandEnv,
       silent: true,
       ignoreReturnCode: true,
-      listeners: {stdout: data => chunks.push(Buffer.from(data))},
+      listeners: {
+        stdout: data => {
+          if (kept + data.length > stdoutCapBytes) {
+            truncated = true
+            return
+          }
+          kept += data.length
+          chunks.push(Buffer.from(data))
+        },
+      },
     })
     return code === 'timed-out'
       ? {kind: 'timed-out'}
-      : {kind: 'exited', code, stdout: Buffer.concat(chunks).toString('utf8')}
+      : {kind: 'exited', code, stdout: Buffer.concat(chunks).toString('utf8'), truncated}
   }
 
   const timedOut = (step: string): Result<never, string> =>
@@ -309,14 +409,29 @@ export async function stageDefaultBranchSkills(
     if (fetched.kind === 'timed-out') return timedOut('fetching the default branch')
     if (fetched.code !== 0) return err('Could not fetch the default branch; repo skills are not loaded')
 
-    // Does the default branch have the directory at all? `ls-tree` exits 0 either way.
-    const listed = await run('git', git('ls-tree', '--name-only', privateRef, '--', SKILLS_GIT_PATH))
+    // List the subtree and check it against the budget BEFORE archiving: the fetch brought the objects, but nothing is
+    // written to the staging root until the tree is known to be within bounds. `ls-tree` exits 0 for a missing path.
+    const listed = await run(
+      'git',
+      git('ls-tree', '-r', '-l', '-z', '-t', privateRef, '--', SKILLS_GIT_PATH),
+      baseEnv,
+      LISTING_STDOUT_CAP_BYTES,
+    )
     if (listed.kind === 'timed-out') return timedOut('listing the default branch tree')
     if (listed.code !== 0) return err('Could not list the default branch tree; repo skills are not loaded')
-    if (listed.stdout.trim().length === 0) {
+    if (listed.truncated) {
+      return err(
+        'The default branch skills exceed the staging budget (the tree listing is too large to read); repo skills are not loaded',
+      )
+    }
+    const entries = parseTreeListing(listed.stdout)
+    if (!entries.success) return entries
+    if (!entries.data.some(entry => entry.path.startsWith(`${SKILLS_GIT_PATH}/`))) {
       logger.debug('The default branch has no .agents/skills', {defaultBranch})
       return ok(null)
     }
+    const withinBudget = checkSourceBudget(entries.data, limits)
+    if (!withinBudget.success) return withinBudget
 
     const archivePath = path.join(stagingRoot, ARCHIVE_FILE_NAME)
     const extractRoot = path.join(stagingRoot, EXTRACT_DIRECTORY_NAME)
@@ -516,6 +631,7 @@ async function copyRegularFile(source: string, destination: string): Promise<voi
 /** Removes what a failed admission left behind: the admitted copy and any extracted source tree. */
 export async function discardRepoSkillsStaging(stagingRoot: string): Promise<void> {
   await removeQuietly(path.join(stagingRoot, REPO_SKILLS_DIRECTORY_NAME))
+  await removeQuietly(path.join(stagingRoot, SCRATCH_DIRECTORY_NAME))
   await removeQuietly(path.join(stagingRoot, EXTRACT_DIRECTORY_NAME))
 }
 
@@ -558,6 +674,7 @@ async function admit(options: AdmitRepoSkillsOptions): Promise<Result<AdmitRepoS
   }
 
   const destinationRoot = path.join(stagingRoot, REPO_SKILLS_DIRECTORY_NAME)
+  const scratchRoot = path.join(stagingRoot, SCRATCH_DIRECTORY_NAME)
   const admitted: string[] = []
   const skipped: SkippedRepoSkill[] = []
   let usedFiles = 0
@@ -616,13 +733,17 @@ async function admit(options: AdmitRepoSkillsOptions): Promise<Result<AdmitRepoS
       continue
     }
 
-    const destination = path.join(destinationRoot, entry.name)
+    // Copy into scratch, a sibling of the discoverable root, and rename into place only when the copy is complete. A copy
+    // that fails, and a cleanup that also fails, leave debris in scratch: never in the directory `skills.paths` names.
+    const scratch = path.join(scratchRoot, entry.name)
     try {
       for (const file of inventory.files) {
-        await copyRegularFile(path.join(skillDir, file.relativePath), path.join(destination, file.relativePath))
+        await copyRegularFile(path.join(skillDir, file.relativePath), path.join(scratch, file.relativePath))
       }
+      await fsp.mkdir(destinationRoot, {recursive: true, mode: 0o700})
+      await fsp.rename(scratch, path.join(destinationRoot, entry.name))
     } catch {
-      await removeQuietly(destination)
+      await removeQuietly(scratch)
       skip(id, 'copy-failed')
       continue
     }
@@ -632,8 +753,9 @@ async function admit(options: AdmitRepoSkillsOptions): Promise<Result<AdmitRepoS
     admitted.push(entry.name)
   }
 
-  // The extracted default-branch tree has done its job; only the admitted copy stays.
+  // The extracted default-branch tree and the scratch space have done their job; only the admitted copy stays.
   await removeQuietly(path.join(stagingRoot, EXTRACT_DIRECTORY_NAME))
+  await removeQuietly(scratchRoot)
   if (admitted.length === 0) await removeQuietly(destinationRoot)
 
   return ok({directory: admitted.length === 0 ? null : destinationRoot, admitted, skipped})

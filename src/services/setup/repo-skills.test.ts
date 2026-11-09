@@ -10,7 +10,10 @@ import {createMockLogger, serializeLoggerCalls, unwrapErr, unwrapOk} from '../..
 import {createExecAdapter} from './adapters.js'
 import {
   admitRepoSkills,
+  checkSourceBudget,
   createRepoSkillsStagingRoot,
+  DEFAULT_REPO_SKILLS_LIMITS,
+  parseTreeListing,
   removeRepoSkillsStagingRoot,
   REPO_SKILLS_DIRECTORY_NAME,
   stageDefaultBranchSkills,
@@ -59,6 +62,21 @@ function recordingExec(): {exec: ExecAdapter; calls: {cwd: string | undefined; a
     },
   }
   return {exec, calls}
+}
+
+/** An exec adapter that fakes every git/tar command: `ls-tree` prints `listing`, the rest succeed. */
+function fakeExec(listing: string): {exec: ExecAdapter; commands: string[][]} {
+  const commands: string[][] = []
+  const exec: ExecAdapter = {
+    exec: vi.fn(),
+    getExecOutput: vi.fn(),
+    execWithTimeout: async (command, args, _timeoutMs, options: ExecOptions | undefined) => {
+      commands.push([command, ...(args ?? [])])
+      if (args?.includes('ls-tree') === true) options?.listeners?.stdout?.(Buffer.from(listing))
+      return 0
+    },
+  }
+  return {exec, commands}
 }
 
 describe('repo-skills', () => {
@@ -167,6 +185,139 @@ describe('repo-skills', () => {
     })
   })
 
+  describe('parseTreeListing', () => {
+    const record = (mode: string, type: string, size: string, file: string): string =>
+      `${mode} ${type} ${'a'.repeat(40)} ${size.padStart(7)}\t${file}\0`
+
+    it('parses mode, type, size and path from every NUL-terminated record', () => {
+      // #given a listing of a tree, a blob, a symlink and a gitlink
+      const stdout =
+        record('040000', 'tree', '-', '.agents/skills/a') +
+        record('100644', 'blob', '1234567', '.agents/skills/a/SKILL.md') +
+        record('120000', 'blob', '10', '.agents/skills/a/link') +
+        record('160000', 'commit', '-', '.agents/skills/a/sub')
+
+      // #when parsing
+      const entries = unwrapOk(parseTreeListing(stdout))
+
+      // #then each field is read, with a dash size as null
+      expect(entries).toEqual([
+        {mode: '040000', type: 'tree', size: null, path: '.agents/skills/a'},
+        {mode: '100644', type: 'blob', size: 1_234_567, path: '.agents/skills/a/SKILL.md'},
+        {mode: '120000', type: 'blob', size: 10, path: '.agents/skills/a/link'},
+        {mode: '160000', type: 'commit', size: null, path: '.agents/skills/a/sub'},
+      ])
+    })
+
+    it('keeps spaces, tabs and newlines in a path intact', () => {
+      // #given a path with each of them (no -z quoting is involved)
+      const stdout = record('100644', 'blob', '2', '.agents/skills/we ird/ta\tb\nc.md')
+
+      // #when parsing
+      const entries = unwrapOk(parseTreeListing(stdout))
+
+      // #then the path is whole
+      expect(entries[0]?.path).toBe('.agents/skills/we ird/ta\tb\nc.md')
+    })
+
+    it('parses the empty listing as no entries', () => {
+      // #given / #when / #then
+      expect(unwrapOk(parseTreeListing(''))).toEqual([])
+    })
+
+    it.each([
+      ['a missing tab', `100644 blob ${'a'.repeat(40)}       3 path\0`],
+      ['an unknown type', `100644 tag ${'a'.repeat(40)}       3\tpath\0`],
+      ['a short mode', `644 blob ${'a'.repeat(40)}       3\tpath\0`],
+      ['a bad object id', `100644 blob zzzz       3\tpath\0`],
+      ['a bad size', `100644 blob ${'a'.repeat(40)}     x3y\tpath\0`],
+      ['a missing terminator', `100644 blob ${'a'.repeat(40)}       3\tpath`],
+    ])('fails closed on %s', (_label, stdout) => {
+      // #given a record git would not write
+      // #when parsing
+      const error = unwrapErr(parseTreeListing(stdout))
+
+      // #then it is an error, not a partial listing
+      expect(error).toContain('listing')
+    })
+  })
+
+  describe('checkSourceBudget', () => {
+    const entry = (type: 'blob' | 'commit' | 'tree', file: string, size: number | null = 1, mode = '100644') => ({
+      mode,
+      type,
+      size,
+      path: `.agents/skills/${file}`,
+    })
+
+    it('ignores the ancestor trees that ls-tree prints above the skills root', () => {
+      // #given the .agents and .agents/skills entries and one file
+      const entries = [
+        {mode: '040000', type: 'tree' as const, size: null, path: '.agents'},
+        {mode: '040000', type: 'tree' as const, size: null, path: '.agents/skills'},
+        entry('tree', 'a', null, '040000'),
+        entry('blob', 'a/SKILL.md'),
+      ]
+
+      // #when checking with room for exactly the two real entries
+      const verdict = checkSourceBudget(entries, {...DEFAULT_REPO_SKILLS_LIMITS, maxSourceEntries: 2})
+
+      // #then it fits
+      expect(verdict.success).toBe(true)
+    })
+
+    it('counts every kind of entry, trees and symlinks included', () => {
+      // #given three trees and one symlink
+      const entries = [
+        entry('tree', 'a', null, '040000'),
+        entry('tree', 'a/b', null, '040000'),
+        entry('tree', 'a/b/c', null, '040000'),
+        entry('blob', 'a/b/c/link', 4, '120000'),
+      ]
+
+      // #when the budget is three entries
+      const error = unwrapErr(checkSourceBudget(entries, {...DEFAULT_REPO_SKILLS_LIMITS, maxSourceEntries: 3}))
+
+      // #then it is over, naming the count and not a path
+      expect(error).toContain('4 entries')
+      expect(error).not.toContain('link')
+    })
+
+    it('sums blob sizes and is over by one byte', () => {
+      // #given two blobs one byte over the limit
+      const limits = {...DEFAULT_REPO_SKILLS_LIMITS, maxBytes: 100}
+      const over = [entry('blob', 'a/SKILL.md', 60), entry('blob', 'a/big.md', 41)]
+      const at = [entry('blob', 'a/SKILL.md', 60), entry('blob', 'a/big.md', 40)]
+
+      // #when checking
+      // #then one byte over fails and exactly at the limit passes
+      expect(unwrapErr(checkSourceBudget(over, limits))).toContain('101 bytes')
+      expect(checkSourceBudget(at, limits).success).toBe(true)
+    })
+
+    it('refuses a submodule anywhere under the skills root', () => {
+      // #given a gitlink inside a skill
+      const entries = [entry('commit', 'a/sub', null, '160000')]
+
+      // #when checking
+      const error = unwrapErr(checkSourceBudget(entries, DEFAULT_REPO_SKILLS_LIMITS))
+
+      // #then the whole source is refused
+      expect(error).toContain('submodule')
+    })
+
+    it('admits a file exactly maxDepth directories below its skill and refuses one deeper', () => {
+      // #given files six and seven directories below the skill directory
+      const atLimit = entry('blob', 'skill/a/b/c/d/e/f/file.md')
+      const tooDeep = entry('blob', 'skill/a/b/c/d/e/f/g/file.md')
+
+      // #when checking with the default depth of six
+      // #then six passes and seven fails
+      expect(checkSourceBudget([atLimit], DEFAULT_REPO_SKILLS_LIMITS).success).toBe(true)
+      expect(unwrapErr(checkSourceBudget([tooDeep], DEFAULT_REPO_SKILLS_LIMITS))).toContain('deep')
+    })
+  })
+
   describe('admitRepoSkills', () => {
     let source: string
     let staging: string
@@ -193,6 +344,20 @@ describe('repo-skills', () => {
       })
       return {result, logger}
     }
+
+    it('leaves only the exposed directory behind: no scratch space and no extracted source tree', async () => {
+      // #given a skill and a leftover extracted tree
+      writeFile(path.join(source, 'repo-probe', 'SKILL.md'), skillMd('repo-probe'))
+      writeFile(path.join(staging, 'source-tree', 'x'), 'x')
+
+      // #when admitting
+      const {result} = await admit()
+
+      // #then the copy was staged through scratch and the scratch is gone, so only skills/ remains
+      expect(unwrapOk(result).admitted).toEqual(['repo-probe'])
+      expect(fs.readdirSync(staging)).toEqual([REPO_SKILLS_DIRECTORY_NAME])
+      expect(fs.readdirSync(path.join(staging, REPO_SKILLS_DIRECTORY_NAME))).toEqual(['repo-probe'])
+    })
 
     it('copies a skill with its references and scripts into the run-scoped skills directory', async () => {
       // #given a skill with nested regular files
@@ -775,6 +940,210 @@ describe('repo-skills', () => {
       // #then neither reaches git
       expect(seen.length).toBeGreaterThan(0)
       expect(seen.every(env => env?.GIT_DIR === undefined && env?.GIT_WORK_TREE === undefined)).toBe(true)
+    })
+
+    describe('source budget, checked before anything is materialized', () => {
+      const blob = (file: string, size = 1, mode = '100644'): string =>
+        `${mode} blob ${'a'.repeat(40)} ${String(size).padStart(7)}\t.agents/skills/${file}\0`
+
+      const ran = (commands: string[][], word: string): boolean => commands.some(command => command.includes(word))
+
+      function expectNothingMaterialized(commands: string[][]): void {
+        expect(ran(commands, 'archive')).toBe(false)
+        expect(ran(commands, 'tar')).toBe(false)
+        expect(fs.existsSync(path.join(staging, 'source-tree'))).toBe(false)
+        expect(fs.existsSync(path.join(staging, 'source.tar'))).toBe(false)
+      }
+
+      it('rejects a tree with too many entries without archiving or extracting', async () => {
+        // #given a listing one entry over the entry budget
+        setUpBareDirectories()
+        const {exec, commands} = fakeExec(
+          Array.from({length: DEFAULT_REPO_SKILLS_LIMITS.maxSourceEntries + 1}, (_, i) => blob(`s/f${i}.md`)).join(''),
+        )
+
+        // #when staging
+        const error = unwrapErr(await stage({exec}))
+
+        // #then it is refused for its size, and git archive never ran
+        expect(error).toContain('budget')
+        expect(error).toContain('entries')
+        expectNothingMaterialized(commands)
+      })
+
+      it('rejects a tree with too many bytes without archiving or extracting', async () => {
+        // #given one blob a byte over the byte budget
+        setUpBareDirectories()
+        const {exec, commands} = fakeExec(blob('s/SKILL.md', DEFAULT_REPO_SKILLS_LIMITS.maxBytes + 1))
+
+        // #when staging
+        const error = unwrapErr(await stage({exec}))
+
+        // #then it is refused for its bytes, and nothing was materialized
+        expect(error).toContain('budget')
+        expect(error).toContain('bytes')
+        expectNothingMaterialized(commands)
+      })
+
+      it('counts symlinks, which admission will reject, toward the budget', async () => {
+        // #given two files and two symlinks against a budget of three
+        setUpBareDirectories()
+        const {exec, commands} = fakeExec(
+          blob('s/SKILL.md') + blob('s/a.md') + blob('s/l1', 4, '120000') + blob('s/l2', 4, '120000'),
+        )
+
+        // #when staging
+        const error = unwrapErr(await stage({exec, limits: {maxSourceEntries: 3}}))
+
+        // #then the rejected entries were part of the count
+        expect(error).toContain('4 entries')
+        expectNothingMaterialized(commands)
+      })
+
+      it('rejects a tree of empty-looking directories by counting trees', async () => {
+        // #given four tree entries against a budget of three
+        setUpBareDirectories()
+        const trees = ['s', 's/a', 's/a/b', 's/a/b/c'].map(
+          directory => `040000 tree ${'a'.repeat(40)}       -\t.agents/skills/${directory}\0`,
+        )
+        const {exec, commands} = fakeExec(trees.join(''))
+
+        // #when staging
+        const error = unwrapErr(await stage({exec, limits: {maxSourceEntries: 3}}))
+
+        // #then they counted
+        expect(error).toContain('4 entries')
+        expectNothingMaterialized(commands)
+      })
+
+      it('rejects a listing that outgrows the output cap as over budget', async () => {
+        // #given a listing larger than the bounded read (hostile giant tree)
+        setUpBareDirectories()
+        const {exec, commands} = fakeExec(blob(`s/${'x'.repeat(5 * 1024 * 1024)}`))
+
+        // #when staging
+        const error = unwrapErr(await stage({exec}))
+
+        // #then it is refused without being parsed whole
+        expect(error).toContain('budget')
+        expectNothingMaterialized(commands)
+      })
+
+      it('refuses a malformed listing', async () => {
+        // #given output git would not write
+        setUpBareDirectories()
+        const {exec, commands} = fakeExec('not a tree listing\0')
+
+        // #when staging
+        const error = unwrapErr(await stage({exec}))
+
+        // #then it fails closed
+        expect(error).toContain('listing')
+        expectNothingMaterialized(commands)
+      })
+
+      it('archives and extracts a tree that fits', async () => {
+        // #given a listing within every limit
+        setUpBareDirectories()
+        const {exec, commands} = fakeExec(blob('s/SKILL.md', 10))
+
+        // #when staging
+        const staged = await stage({exec})
+
+        // #then the archive and extract steps ran
+        expect(staged.success).toBe(true)
+        expect(ran(commands, 'archive')).toBe(true)
+        expect(ran(commands, 'tar')).toBe(true)
+      })
+
+      it('runs ls-tree recursively with sizes and NUL separators on the fetched private ref, before the archive', async () => {
+        // #given a recording adapter over real git
+        setUpRepos()
+        const {exec, calls} = recordingExec()
+
+        // #when staging
+        unwrapOk(await stage({exec}))
+
+        // #then the listing used -r -l -z -t on the private ref, and came before git archive
+        const listIndex = calls.findIndex(call => call.args.includes('ls-tree'))
+        const archiveIndex = calls.findIndex(call => call.args.includes('archive'))
+        expect(calls[listIndex]?.args).toEqual(
+          expect.arrayContaining(['-r', '-l', '-z', '-t', `refs/fro-bot/repo-skills/${path.basename(staging)}`]),
+        )
+        expect(listIndex).toBeGreaterThan(-1)
+        expect(listIndex).toBeLessThan(archiveIndex)
+      })
+
+      it('refuses a submodule committed under the skills root, before the archive', async () => {
+        // #given a default branch with a gitlink inside a skill
+        setUpRepos()
+        git(origin, 'update-index', '--add', '--cacheinfo', `160000,${'1'.repeat(40)},.agents/skills/probe/sub`)
+        git(origin, 'commit', '-qm', 'submodule')
+        const {exec, calls} = recordingExec()
+
+        // #when staging
+        const error = unwrapErr(await stage({exec}))
+
+        // #then the whole source is refused and nothing was archived
+        expect(error).toContain('submodule')
+        expect(calls.some(call => call.args.includes('archive'))).toBe(false)
+        expect(fs.readdirSync(staging)).toEqual([])
+      })
+
+      it('refuses a committed symlink, as admission does, and counts it first', async () => {
+        // #given a default branch whose skill holds a symlink, against a budget of one entry
+        setUpRepos()
+        fs.symlinkSync('/etc/hosts', path.join(origin, '.agents', 'skills', 'probe', 'link.md'))
+        git(origin, 'add', '-A')
+        git(origin, 'commit', '-qm', 'link')
+        const {exec, calls} = recordingExec()
+
+        // #when staging against a tiny budget
+        const error = unwrapErr(await stage({exec, limits: {maxSourceEntries: 2}}))
+
+        // #then the symlink was counted (probe/, SKILL.md, references/, r.md, link.md) and nothing was archived
+        expect(error).toContain('5 entries')
+        expect(calls.some(call => call.args.includes('archive'))).toBe(false)
+      })
+
+      it('admits a file exactly at the depth limit and refuses one a directory deeper', async () => {
+        // #given a skill with a file six directories down on one branch state...
+        setUpRepos()
+        const bundled = path.join(root, 'bundled', '@fro.bot', 'systematic', 'skills')
+        writeFile(path.join(bundled, 'ce-review', 'SKILL.md'), skillMd('ce:review'))
+        writeFile(path.join(origin, '.agents', 'skills', 'probe', 'a', 'b', 'c', 'd', 'e', 'f', 'deep.md'), 'six\n')
+        git(origin, 'add', '-A')
+        git(origin, 'commit', '-qm', 'six deep')
+
+        // #when staging and admitting
+        const sourceDir = unwrapOk(await stage()) as string
+        const admitted = unwrapOk(
+          await admitRepoSkills({
+            sourceDir,
+            stagingRoot: staging,
+            bundledSkillsDirectories: [bundled],
+            logger: createMockLogger(),
+          }),
+        )
+
+        // #then the file at the limit was staged and admitted with its skill
+        expect(admitted.admitted).toEqual(['probe'])
+        expect(fs.existsSync(path.join(staging, 'skills', 'probe', 'a', 'b', 'c', 'd', 'e', 'f', 'deep.md'))).toBe(true)
+
+        // #and one directory deeper is refused before the archive runs
+        fs.rmSync(staging, {recursive: true, force: true})
+        fs.mkdirSync(staging)
+        writeFile(
+          path.join(origin, '.agents', 'skills', 'probe', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'deeper.md'),
+          'seven\n',
+        )
+        git(origin, 'add', '-A')
+        git(origin, 'commit', '-qm', 'seven deep')
+        const {exec, calls} = recordingExec()
+        const error = unwrapErr(await stage({exec}))
+        expect(error).toContain('deep')
+        expect(calls.some(call => call.args.includes('archive'))).toBe(false)
+      })
     })
   })
 })

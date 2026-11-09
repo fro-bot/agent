@@ -14,6 +14,7 @@ import {createMockLogger, serializeLoggerCalls, unwrapErr, unwrapOk} from '../..
 const faults = vi.hoisted(() => ({
   readdir: '',
   open: '',
+  rename: '',
   rm: false,
 }))
 
@@ -32,6 +33,10 @@ vi.mock('node:fs/promises', async importOriginal => {
     open: vi.fn(async (...args: Parameters<typeof actual.open>) => {
       if (faults.open !== '' && String(args[0]).includes(faults.open)) throw fault('ENOENT')
       return actual.open(...args)
+    }),
+    rename: vi.fn(async (...args: Parameters<typeof actual.rename>) => {
+      if (faults.rename !== '' && String(args[0]).includes(faults.rename)) throw fault('EXDEV')
+      return actual.rename(...args)
     }),
     rm: vi.fn(async (...args: Parameters<typeof actual.rm>) => {
       if (faults.rm) throw fault('EBUSY')
@@ -59,6 +64,7 @@ describe('admitRepoSkills failure injection', () => {
   beforeEach(() => {
     faults.readdir = ''
     faults.open = ''
+    faults.rename = ''
     faults.rm = false
     root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'repo-skills-fault-')))
     source = path.join(root, 'source')
@@ -73,6 +79,7 @@ describe('admitRepoSkills failure injection', () => {
   afterEach(() => {
     faults.readdir = ''
     faults.open = ''
+    faults.rename = ''
     faults.rm = false
     fs.rmSync(root, {recursive: true, force: true})
   })
@@ -131,6 +138,40 @@ describe('admitRepoSkills failure injection', () => {
     expect(admitted.skipped).toEqual([{id: 'vanish', reason: 'copy-failed'}])
     expect(admitted.admitted).toEqual(['good'])
     expect(fs.existsSync(path.join(staging, 'skills', 'vanish'))).toBe(false)
+  })
+
+  it('never exposes a skill whose copy failed and whose cleanup also failed, and still admits its sibling', async () => {
+    // #given SKILL.md copies, a later reference cannot be opened, and removal fails as well
+    writeFile(path.join(source, 'vanish', 'SKILL.md'), skillMd('vanish'))
+    writeFile(path.join(source, 'vanish', 'references', 'x.md'), 'x')
+    faults.open = `${path.sep}vanish${path.sep}references`
+    faults.rm = true
+
+    // #when admitting
+    const {result} = admit()
+
+    // #then the half-copied skill is not in the directory handed to skills.paths, and the sibling is
+    const admitted = unwrapOk(await result)
+    expect(admitted.skipped).toEqual([{id: 'vanish', reason: 'copy-failed'}])
+    expect(admitted.admitted).toEqual(['good'])
+    expect(admitted.directory).toBe(path.join(staging, 'skills'))
+    expect(fs.readdirSync(path.join(staging, 'skills'))).toEqual(['good'])
+    expect(fs.existsSync(path.join(staging, 'skills', 'vanish'))).toBe(false)
+  })
+
+  it('does not expose a skill whose final rename fails', async () => {
+    // #given a complete copy that cannot be moved into place
+    writeFile(path.join(source, 'stuck', 'SKILL.md'), skillMd('stuck'))
+    faults.rename = `${path.sep}stuck`
+    faults.rm = true
+
+    // #when admitting
+    const {result} = admit()
+
+    // #then it is skipped, nothing of it is in the exposed directory, the sibling is
+    const admitted = unwrapOk(await result)
+    expect(admitted.skipped).toEqual([{id: 'stuck', reason: 'copy-failed'}])
+    expect(fs.readdirSync(path.join(staging, 'skills'))).toEqual(['good'])
   })
 
   it('does not throw when removing a partial copy fails too', async () => {

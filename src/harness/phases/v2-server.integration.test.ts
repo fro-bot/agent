@@ -1139,6 +1139,24 @@ describe.skipIf(!hasBinary)('repo skills against the real stock binary (fro-bot/
     300_000,
   )
 
+  it('loads no repo skills, and leaves nothing staged, when the default branch tree is over the staging budget', async () => {
+    // #given a default branch whose skills tree has more entries than the budget allows
+    const box = newBox()
+    plant(path.join(box.repo, '.agents', 'skills', 'probe', 'SKILL.md'), skillFile('probe', 'PROBE'))
+    for (let index = 0; index <= 1000; index += 1) {
+      plant(path.join(box.repo, '.agents', 'skills', 'bulk', `f${index}.md`), 'x\n')
+    }
+    publishDefaultBranch(box)
+
+    // #when a trusted run stages
+    const source = await stage(box, SCHEDULE)
+
+    // #then it is refused before extraction: no source, and no staging directory left under RUNNER_TEMP
+    expect(source).toBeNull()
+    const runnerTemp = box.env.RUNNER_TEMP as string
+    expect(readdirSync(runnerTemp).filter(entry => entry.startsWith('fro-bot-repo-skills-'))).toEqual([])
+  }, 300_000)
+
   it('ignores a hostile project opencode.json, agent, command and skill frontmatter even on a trusted run', async () => {
     // #given a checkout full of project config an attacker would plant
     const box = newBox()
