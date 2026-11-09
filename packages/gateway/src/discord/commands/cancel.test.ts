@@ -86,6 +86,7 @@ function makeDeps(runs: readonly RunState[] = [makeRun()], overrides: Partial<Fr
     checkRepoQuiescence: vi.fn(),
     forceReleaseStaleLock: vi.fn(),
     dispatchWorkflow: vi.fn(),
+    denylistCache: {getDenylistState: vi.fn(async () => undefined), isRepoDenied: vi.fn(() => false)},
     cancelRunDeps: {sentinel: 'cancel-run-deps'} as unknown as FroBotDeps['cancelRunDeps'],
     // The live set is what the process still runs (past the queue, not ended); the scan lists every record.
     runIndex: {
