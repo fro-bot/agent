@@ -101,7 +101,7 @@ How the agent is told to deliver its answer is decided in bootstrap by `resolveR
 
 - **`model-gh`** — the historical behavior, used on `schedule` and `workflow_dispatch` runs. The agent is instructed to post its own single comment (`gh issue comment` / `gh pr comment`) or submit its own review (`gh pr review --approve` / `--request-changes`) matching its verdict. These runs hold a GitHub credential.
 
-- **`file-convention`** — used on comment and review triggers (`issue_comment`, `pull_request`, `issues`). The agent has no GitHub credential (see [[Setup and Configuration]]) and is told to write its full response — analysis plus Run Summary — to the run-scoped response file rather than calling `gh`. The action reads that file after the run and posts on the agent's behalf. For PR reviews, the prompt still asks the agent to record a PASS/CONDITIONAL/REJECT verdict, which the action maps to the matching GitHub review event.
+- **`file-convention`** — used on comment and review triggers (`issue_comment`, `pull_request`, `issues`). The agent is not given a GitHub credential (see [[Setup and Configuration]], including why that is not an OS boundary) and is told to write its full response — analysis plus Run Summary — to the run-scoped response file rather than calling `gh`. The action reads that file after the run and posts on the agent's behalf. For PR reviews, the prompt still asks the agent to record a PASS/CONDITIONAL/REJECT verdict, which the action maps to the matching GitHub review event.
 
 - **`none`** — used when the `response-mode: none` input suppresses all GitHub writes. The agent is told the run log itself is the response surface and to post nothing.
 
