@@ -146,6 +146,7 @@ function createBootstrap(): BootstrapPhaseResult {
       responseMode: 'github',
       reviewSkipLabel: null,
       brokeredPushExtraPaths: [],
+      repoSkills: false,
     },
     logger: createLogger({phase: 'test'}),
     opencodeResult: {path: 'opencode', version: '1.0.0', didSetup: false},

@@ -384,6 +384,83 @@ describe('runOpenCodeCoreV2: tool lines', () => {
     expect(onActivity).toHaveBeenCalledTimes(1)
   })
 
+  it('leaves the question tool out of the reply and the activity line, and keeps the text after it', async () => {
+    // #given — the stock v2.2.6 question tool: input `{questions:[...]}`, no title. The card shows the question and answer.
+    const onActivity = vi.fn()
+    const run = startRun({onActivity})
+    await vi.advanceTimersByTimeAsync(10)
+    const questions = [
+      {
+        question: 'Which environment should I deploy to?',
+        header: 'Environment',
+        options: [
+          {label: 'staging', description: 'Deploy to staging'},
+          {label: 'production', description: 'Deploy to production'},
+        ],
+        multiple: false,
+      },
+    ]
+
+    // #when
+    run.emit(
+      frames.toolStarted('question', 'call_q'),
+      frames.toolCalled('call_q', {questions}),
+      frames.toolSuccess('call_q'),
+      frames.delta('Deploying to staging.'),
+      frames.succeeded(),
+    )
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #then
+    const text = run.sink.text()
+    expect(text).not.toContain('(questions:')
+    expect(text).not.toContain('Which environment')
+    expect(text).not.toContain('question')
+    expect(text).toContain('Deploying to staging.')
+    expect(onActivity).not.toHaveBeenCalled()
+  })
+
+  it('leaves a dismissed question out of the reply too', async () => {
+    // #given
+    const run = startRun()
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #when
+    run.emit(
+      frames.toolStarted('question', 'call_q'),
+      frames.toolCalled('call_q', {questions: [{question: 'Proceed?', header: 'Go', options: []}]}),
+      frames.toolFailed('call_q'),
+      frames.delta('Stopping here.'),
+      frames.succeeded(),
+    )
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #then
+    expect(run.sink.text()).not.toContain('questions')
+    expect(run.sink.text()).not.toContain('⨯')
+    expect(run.sink.text()).toContain('Stopping here.')
+  })
+
+  it('still renders the fallback line for an MCP or unknown tool', async () => {
+    // #given
+    const onActivity = vi.fn()
+    const run = startRun({onActivity})
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #when
+    run.emit(
+      frames.toolStarted('somemcp_lookup', 'call_m'),
+      frames.toolCalled('call_m', {query: 'release notes'}),
+      frames.toolSuccess('call_m'),
+      frames.succeeded(),
+    )
+    await vi.advanceTimersByTimeAsync(10)
+
+    // #then
+    expect(run.sink.text()).toContain('(query: release notes)')
+    expect(onActivity).toHaveBeenCalledTimes(1)
+  })
+
   it('summarizes the calls inside an execute call, each once, and not the wrapper', async () => {
     // #given — Code Mode: one execute call carries two inner calls, reported by progress and again by the result
     const onActivity = vi.fn()

@@ -3,6 +3,7 @@ import type {ChatInputCommandInteraction, Guild} from 'discord.js'
 import type {ChannelQueue} from '../../execute/queue.js'
 import type {RunTask} from '../../execute/run.js'
 import type {DispatchOutcome, DispatchWorkflow} from '../../github/dispatch.js'
+import type {RepoKey} from '../../redaction/denylist.js'
 import type {FroBotDeps} from './fro-bot.js'
 
 import {Effect} from 'effect'
@@ -34,6 +35,27 @@ function makeQueue(): ChannelQueue<RunTask> {
   }
 }
 
+function makeBindingRecord(binding: {readonly owner: string; readonly repo: string}) {
+  return {
+    owner: binding.owner,
+    repo: binding.repo,
+    channelId: 'channel-1',
+    channelName: 'widget',
+    workspacePath: '/workspace/repos/acme/widget',
+    createdAt: new Date().toISOString(),
+    createdByDiscordId: 'user-1',
+    databaseId: 42,
+    nodeId: 'R_node_42',
+  }
+}
+
+function makeDenylistCache(denied = false): FroBotDeps['denylistCache'] {
+  return {
+    getDenylistState: vi.fn(async () => undefined),
+    isRepoDenied: vi.fn((_key: RepoKey) => denied),
+  }
+}
+
 function makeDeps(
   dispatchWorkflow: DispatchWorkflow,
   binding: {readonly owner: string; readonly repo: string} | null = {owner: 'acme', repo: 'widget'},
@@ -42,25 +64,15 @@ function makeDeps(
   return {
     bindingsStore: {
       createBinding: vi.fn(),
-      getBindingByRepo: vi.fn(),
-      getBindingByChannelId: vi.fn().mockResolvedValue(
-        binding === null
-          ? {success: true, data: null}
-          : {
-              success: true,
-              data: {
-                owner: binding.owner,
-                repo: binding.repo,
-                channelId: 'channel-1',
-                channelName: 'widget',
-                workspacePath: '/workspace/repos/acme/widget',
-                createdAt: new Date().toISOString(),
-                createdByDiscordId: 'user-1',
-              },
-            },
-      ),
+      getBindingByRepo: vi
+        .fn()
+        .mockResolvedValue({success: true, data: binding === null ? null : makeBindingRecord(binding)}),
+      getBindingByChannelId: vi
+        .fn()
+        .mockResolvedValue({success: true, data: binding === null ? null : makeBindingRecord(binding)}),
       listBindings: vi.fn(),
     },
+    denylistCache: makeDenylistCache(),
     appClient: {
       authForRepo: vi.fn(),
       authForWorkflowDispatch: vi.fn(),
@@ -261,5 +273,116 @@ describe('executeDispatch', () => {
 
     // #then
     expect(getReplyContent(editReply)).toContain(expectedCopy)
+  })
+
+  describe('repo access gate', () => {
+    const REFUSAL = /not available for dispatch/i
+
+    it('dispatches against the stored binding after a single access check', async () => {
+      // #given — a bound, non-denylisted repo whose stored case differs from nothing the user typed
+      const dispatchWorkflow = vi
+        .fn<DispatchWorkflow>()
+        .mockResolvedValue({outcome: 'dispatch-rejected', owner: 'acme', repo: 'widget'})
+      const deps = makeDeps(dispatchWorkflow)
+      const {interaction} = makeInteraction('run it')
+
+      // #when
+      await Effect.runPromise(executeDispatch(interaction, deps))
+
+      // #then — the policy was consulted with the binding's deny keys, then the dispatch ran
+      expect(deps.bindingsStore.getBindingByRepo).toHaveBeenCalledExactlyOnceWith('acme', 'widget')
+      expect(deps.denylistCache.isRepoDenied).toHaveBeenCalledExactlyOnceWith({databaseId: 42, nodeId: 'R_node_42'})
+      expect(dispatchWorkflow).toHaveBeenCalledExactlyOnceWith('acme', 'widget', 'run it')
+    })
+
+    it('refuses a denylisted repo without dispatching or disclosing it', async () => {
+      // #given
+      const dispatchWorkflow = vi.fn<DispatchWorkflow>()
+      const deps = makeDeps(dispatchWorkflow, {owner: 'acme', repo: 'widget'}, {denylistCache: makeDenylistCache(true)})
+      const {interaction, deferReply, editReply} = makeInteraction('run it')
+
+      // #when
+      await Effect.runPromise(executeDispatch(interaction, deps))
+
+      // #then — ephemeral refusal that names neither the repo nor the denylist
+      expect(deferReply).toHaveBeenCalledExactlyOnceWith({ephemeral: true})
+      expect(dispatchWorkflow).not.toHaveBeenCalled()
+      const content = getReplyContent(editReply)
+      expect(content).toMatch(REFUSAL)
+      expect(content).not.toMatch(/acme|widget|denylist|denied/i)
+    })
+
+    it('refuses a channel binding that has no current repo binding', async () => {
+      // #given — the channel resolves, but the repo-keyed read finds nothing
+      const dispatchWorkflow = vi.fn<DispatchWorkflow>()
+      const deps = makeDeps(dispatchWorkflow)
+      vi.mocked(deps.bindingsStore.getBindingByRepo).mockResolvedValue({success: true, data: null})
+      const {interaction, editReply} = makeInteraction('run it')
+
+      // #when
+      await Effect.runPromise(executeDispatch(interaction, deps))
+
+      // #then
+      expect(dispatchWorkflow).not.toHaveBeenCalled()
+      expect(getReplyContent(editReply)).toMatch(REFUSAL)
+    })
+
+    it.each([
+      [
+        'the binding store returns an error',
+        (deps: FroBotDeps) =>
+          vi.mocked(deps.bindingsStore.getBindingByRepo).mockResolvedValue({
+            success: false,
+            error: Object.assign(new Error('s3 down'), {code: 'BINDING_STORE_ERROR' as const}),
+          }),
+      ],
+      [
+        'the binding store throws',
+        (deps: FroBotDeps) => vi.mocked(deps.bindingsStore.getBindingByRepo).mockRejectedValue(new Error('boom')),
+      ],
+      [
+        'the denylist cannot be read',
+        (deps: FroBotDeps) =>
+          vi.mocked(deps.denylistCache.getDenylistState).mockRejectedValue(new Error('metadata down')),
+      ],
+    ] as const)('fails closed without dispatching when %s', async (_label, breakPolicy) => {
+      // #given
+      const dispatchWorkflow = vi.fn<DispatchWorkflow>()
+      const deps = makeDeps(dispatchWorkflow)
+      breakPolicy(deps)
+      const {interaction, editReply} = makeInteraction('run it')
+
+      // #when
+      await Effect.runPromise(executeDispatch(interaction, deps))
+
+      // #then — same refusal as a denied repo: the two cannot be told apart
+      expect(dispatchWorkflow).not.toHaveBeenCalled()
+      expect(getReplyContent(editReply)).toMatch(REFUSAL)
+    })
+
+    it('logs one shared label for denied and unavailable without the repo or task', async () => {
+      // #given
+      const denied = makeDeps(
+        vi.fn<DispatchWorkflow>(),
+        {owner: 'acme', repo: 'widget'},
+        {denylistCache: makeDenylistCache(true)},
+      )
+      const unavailable = makeDeps(vi.fn<DispatchWorkflow>())
+      vi.mocked(unavailable.bindingsStore.getBindingByRepo).mockRejectedValue(new Error('boom'))
+      const logs: unknown[] = []
+      for (const deps of [denied, unavailable]) {
+        vi.mocked(deps.gatewayLogger.warn).mockImplementation((ctx: unknown) => {
+          logs.push(ctx)
+        })
+        // #when
+        await Effect.runPromise(executeDispatch(makeInteraction('secret task').interaction, deps))
+      }
+
+      // #then
+      expect(logs).toEqual([
+        {command: 'dispatch', channelId: 'channel-1', gate: 'repo-denied'},
+        {command: 'dispatch', channelId: 'channel-1', gate: 'repo-unavailable'},
+      ])
+    })
   })
 })

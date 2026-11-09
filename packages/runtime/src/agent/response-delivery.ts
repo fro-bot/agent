@@ -18,14 +18,16 @@ type EventClassification = 'affected' | 'autonomous' | 'deferred-or-unknown'
  * model calling `gh` directly, so the GitHub credential must be withheld from
  * the agent regardless of responseMode.
  *
- * `autonomous` triggers (workflow_dispatch, schedule) run without a human
- * driving the event and are safe to provision the credential to.
+ * `autonomous` triggers (workflow_dispatch, schedule) provision the credential
+ * to the model so it can open branches and PRs itself.
  *
  * Everything else — including the deferred surfaces
  * (pull_request_review_comment, discussion_comment) and any unrecognized
  * event name — defaults to `deferred-or-unknown`, which resolves to
- * `provision`/`model-gh`. This is a safe default: unknown event names keep
- * today's behavior (credential provisioned, model calls gh directly).
+ * `provision`/`model-gh`.
+ *
+ * Withholding keeps the token out of the agent's env and gh config; it is not an
+ * OS boundary, since the agent can read the action's environ on Linux (#2135).
  */
 function classifyEvent(eventName: string): EventClassification {
   switch (eventName) {

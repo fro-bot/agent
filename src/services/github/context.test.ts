@@ -481,3 +481,66 @@ describe('getCommentTarget', () => {
     expect(target).toBeNull()
   })
 })
+
+function pullRequestPayload(head: Record<string, unknown>): Record<string, unknown> {
+  return {
+    action: 'opened',
+    pull_request: {
+      head: {sha: 'event-head-sha', ...head},
+      number: 7,
+      title: 'feat: head repo',
+      body: null,
+      locked: false,
+      draft: false,
+      author_association: 'MEMBER',
+      requested_reviewers: [],
+      labels: [],
+    },
+    sender: {login: 'contributor'},
+  }
+}
+
+function normalizeHeadRepoFullName(head: Record<string, unknown>): string | null {
+  const event = normalizeEvent('pull_request', pullRequestPayload(head))
+  if (event.type !== 'pull_request') {
+    throw new Error('Expected pull_request event')
+  }
+  return event.pullRequest.headRepoFullName
+}
+
+describe('normalizeEvent for pull_request head repository', () => {
+  it('carries the head repository full name for a same-repository pull request', () => {
+    // #given a pull_request payload whose head repo is the base repo
+    // #when normalizing the event
+    // #then the head repository full name is exposed on the normalized event
+    expect(normalizeHeadRepoFullName({repo: {full_name: 'fro-bot/agent'}})).toBe('fro-bot/agent')
+  })
+
+  it('carries the head repository full name for a fork pull request', () => {
+    // #given a pull_request payload whose head repo is a fork
+    // #when normalizing the event
+    // #then the fork's full name is exposed, never the base repo's
+    expect(normalizeHeadRepoFullName({repo: {full_name: 'contributor/agent'}})).toBe('contributor/agent')
+  })
+
+  it('reports null when the head repository is deleted', () => {
+    // #given a pull_request payload whose head repo is null (deleted fork)
+    // #when normalizing the event
+    // #then the fact is unknown, not defaulted
+    expect(normalizeHeadRepoFullName({repo: null})).toBeNull()
+  })
+
+  it('reports null when the head carries no repository at all', () => {
+    // #given a pull_request payload with no head.repo key
+    // #when normalizing the event
+    // #then the fact is unknown
+    expect(normalizeHeadRepoFullName({})).toBeNull()
+  })
+
+  it('reports null when full_name is not a string', () => {
+    // #given a malformed head.repo
+    // #when normalizing the event
+    // #then the fact is unknown
+    expect(normalizeHeadRepoFullName({repo: {full_name: 42}})).toBeNull()
+  })
+})

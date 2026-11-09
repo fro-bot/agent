@@ -232,6 +232,8 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     const skipCacheRaw = core.getInput('skip-cache').trim().toLowerCase()
     const skipCache = skipCacheRaw === 'true'
 
+    const repoSkills = parseRepoSkills(core.getInput('repo-skills'))
+
     const systematicVersionRaw = core.getInput('systematic-version').trim()
     const systematicVersion = systematicVersionRaw.length > 0 ? systematicVersionRaw : DEFAULT_SYSTEMATIC_VERSION
 
@@ -280,10 +282,22 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
       dedupWindow,
       reviewSkipLabel,
       brokeredPushExtraPaths,
+      repoSkills,
     })
   } catch (error) {
     return err(error instanceof Error ? error : new Error(String(error)))
   }
+}
+
+/**
+ * `repo-skills` is a security opt-in, so anything other than an explicit `true` or `false` is an error rather than a
+ * silent default. An empty value is the unset input.
+ */
+function parseRepoSkills(input: string): boolean {
+  const value = input.trim().toLowerCase()
+  if (value === '' || value === 'false') return false
+  if (value === 'true') return true
+  throw new Error(`Invalid repo-skills value: "${input.trim()}". Valid values: true, false`)
 }
 
 function parseOutputMode(input: string): OutputMode {

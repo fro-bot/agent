@@ -604,6 +604,7 @@ export function makeGatewayProgram(deps: GatewayProgramDeps, config: GatewayConf
       checkRepoQuiescence,
       forceReleaseStaleLock: forceReleaseStaleLockEffect,
       dispatchWorkflow,
+      denylistCache,
       cancelRunDeps,
       runIndex,
       listLiveRuns,

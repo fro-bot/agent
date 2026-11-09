@@ -95,6 +95,14 @@ inputs:
     description: Skip session cache restore (default false)
     required: false
     default: 'false'
+  repo-skills:
+    description: >-
+      Load the repository's .agents/skills on trusted OpenCode V2 runs (default false). Trusted runs are schedule and
+      workflow_dispatch, plus same-repository pull_request, issue_comment and issues events from an OWNER, MEMBER or
+      COLLABORATOR. Skills always come from the default branch, freshly fetched on every run, never from the checkout,
+      a dispatched branch or a PR head. Project config stays disabled.
+    required: false
+    default: 'false'
   opencode-config:
     description: >-
       JSON object to merge into the OpenCode config (OPENCODE_CONFIG_CONTENT).
