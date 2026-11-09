@@ -111,6 +111,8 @@ Comment and issue triggers are gated by author association — only `OWNER`, `ME
 
 Trusted same-repository, non-fork PR mentions on `issue_comment` from `OWNER`, `MEMBER`, or `COLLABORATOR` can broker a fix commit directly to the PR head branch. Brokered pushes are limited to allowlisted product, docs, and test paths; config, scripts, and CI files are excluded. Use `brokered-push-extra-paths` to opt into additional comma-separated relative path prefixes when a consumer repository keeps product code elsewhere. The default is empty. Protected surfaces remain hard-denied at parse and enforcement time; do not include secrets or execution surfaces such as CI, scripts, manifests, lockfiles, Dockerfiles, or `.git/`. Keep checkout `persist-credentials: false` as shown in the example.
 
+**Credential limits.** On comment, review and issue triggers the action keeps `github-token` out of the agent's environment and `gh` config. That isn't an OS boundary: on Linux runners the agent runs as the same user as the action and can read the token from the action's `/proc` environment. Pass the agent job a token you'd accept it holding, and publish writes from a separate job when that matters. See [Withholding is not an OS boundary](docs/wiki/Setup%20and%20Configuration.md#withholding-is-not-an-os-boundary).
+
 ### Comment examples
 
 ```markdown
@@ -196,6 +198,7 @@ A few inputs most workflows touch:
 | `opencode-version` | No | Source-pinned (stock OpenCode V2) | OpenCode CLI version to install. The default, and `latest`, is the stock OpenCode V2 release pinned in the Action (digest-verified); V2 installs only that pinned version. A harness build (`1.19.5+harness.bf7f7dfe`) or a V1 version still installs when pinned explicitly. An existing opencode is reused only when it reports exactly this version (the `-harness.` and `+harness.` spellings are equivalent); otherwise the pinned build is installed. |
 | `systematic-version` | No | Source-pinned | Systematic plugin version to register |
 | `skip-cache` | No | `false` | Skip session cache restore |
+| `repo-skills` | No | `false` | OpenCode V2 only. Load the repository's `.agents/skills` on trusted runs: `schedule` and `workflow_dispatch`, or a same-repository `pull_request`, `issue_comment` or `issues` event from an `OWNER`, `MEMBER` or `COLLABORATOR`. Skills always come from the default branch, freshly fetched from the base repository on every run — never the checkout, a dispatched branch or a PR head. They are copied into a run-scoped directory (symlinks rejected, size bounded, bundled skill names protected) that is removed when the run ends; project config stays disabled |
 | `opencode-config` | No | — | JSON deep-merged into the OpenCode config |
 | `systematic-config` | No | — | JSON deep-merged into the Systematic plugin config |
 | `dedup-window` | No | `600000` | Skip a run if the agent already ran for the same PR/issue within this window (ms); `0` disables |

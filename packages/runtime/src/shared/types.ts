@@ -109,6 +109,8 @@ export interface ActionInputs {
   readonly reviewSkipLabel: string | null
   // Additional relative path prefixes allowed for brokered pushes after protected-surface checks.
   readonly brokeredPushExtraPaths: readonly string[]
+  // Opt-in: admit the repository's `.agents/skills` on trusted OpenCode V2 runs (the `repo-skills` input).
+  readonly repoSkills: boolean
 }
 
 // Action outputs

@@ -1,8 +1,9 @@
 ---
 type: subsystem
-last-updated: "2026-11-02"
-updated-by: "f8ee76a3"
+last-updated: "2026-11-08"
+updated-by: "f7c20f94"
 sources:
+  - src/harness/phases/execute-v2.ts
   - packages/runtime/src/session/version.ts
   - packages/runtime/src/session/generation.ts
   - packages/runtime/src/session/storage-v2.ts
@@ -223,6 +224,8 @@ A session is kept if **either**:
 This "age OR count" approach prevents both unbounded growth (count limit) and premature deletion of recent sessions (age limit). When a parent session is pruned, its child sessions are cascade-deleted to avoid orphans.
 
 ## Run Summary Writeback
+
+Summary writeback is an optional backend capability, not a common finalization operation. The `ExecutionBackend` contract in `src/harness/phases/execute-v2.ts` exposes `writeSummary` for V1 and omits it for V2. V2 release still observes late work, refreshes usage, and prunes sessions before shutdown; it does not enqueue a synthetic summary. Cross-run discovery on V2 therefore relies on delivered conversation text and the session-history tools rather than a harness-generated writeback message. See [[Background Subagents and Ownership]].
 
 On V1, each run's session writeback records a structured summary of what the agent did, including the event type, repository, cache status, session ID, and errors. It becomes searchable by future runs through session search. The write happens during V1 execution, while the server remains available, and the summary is not treated as an authoritative run-state record.
 

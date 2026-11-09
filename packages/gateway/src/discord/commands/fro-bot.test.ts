@@ -115,6 +115,7 @@ function makeDeps(overrides?: Partial<FroBotDeps>): FroBotDeps {
     checkRepoQuiescence: vi.fn(),
     forceReleaseStaleLock: defaultForceRelease,
     dispatchWorkflow: vi.fn<DispatchWorkflow>(),
+    denylistCache: {getDenylistState: vi.fn(async () => undefined), isRepoDenied: vi.fn(() => false)},
     cancelRunDeps: {} as FroBotDeps['cancelRunDeps'],
     runIndex: {listRunsForRepo: vi.fn().mockResolvedValue([]), readRun: vi.fn().mockResolvedValue(undefined)},
     listLiveRuns: vi.fn().mockReturnValue([]),
@@ -221,21 +222,21 @@ describe('createFroBotCommand — dispatch', () => {
       runId: 1234,
       runUrl: 'https://github.com/acme/widget/actions/runs/1234',
     })
+    const binding = {
+      owner: 'acme',
+      repo: 'widget',
+      channelId: 'ch-test-123',
+      channelName: 'widget',
+      workspacePath: '/workspace/repos/acme/widget',
+      createdAt: new Date().toISOString(),
+      createdByDiscordId: 'user-authorized-123',
+      databaseId: 42,
+      nodeId: 'R_node_42',
+    }
     const bindingsStore = {
       createBinding: vi.fn(),
-      getBindingByRepo: vi.fn(),
-      getBindingByChannelId: vi.fn().mockResolvedValue({
-        success: true,
-        data: {
-          owner: 'acme',
-          repo: 'widget',
-          channelId: 'ch-test-123',
-          channelName: 'widget',
-          workspacePath: '/workspace/repos/acme/widget',
-          createdAt: new Date().toISOString(),
-          createdByDiscordId: 'user-authorized-123',
-        },
-      }),
+      getBindingByRepo: vi.fn().mockResolvedValue({success: true, data: binding}),
+      getBindingByChannelId: vi.fn().mockResolvedValue({success: true, data: binding}),
       listBindings: vi.fn(),
     }
     const deps = makeDeps({bindingsStore, dispatchWorkflow})

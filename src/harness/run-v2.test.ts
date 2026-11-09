@@ -58,6 +58,11 @@ vi.mock('./phases/cache-restore.js', () => ({
   runCacheRestore: vi.fn(),
 }))
 
+vi.mock('./phases/repo-skills.js', () => ({
+  runRepoSkills: vi.fn(async () => null),
+  removeRepoSkillsStaging: vi.fn(async () => undefined),
+}))
+
 vi.mock('./phases/cleanup.js', () => ({
   runCleanup: vi.fn().mockResolvedValue({quiescenceConfirmed: true, continuityUnverified: false}),
 }))
@@ -150,6 +155,7 @@ function createBootstrap(): BootstrapPhaseResult {
       responseMode: 'github',
       reviewSkipLabel: null,
       brokeredPushExtraPaths: [],
+      repoSkills: false,
     },
     logger: createLogger({phase: 'test'}),
     opencodeResult: {path: 'opencode', version: '1.0.0', didSetup: false},
@@ -300,6 +306,92 @@ async function arrange(
 describe('run on an OpenCode V2 server', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+  })
+
+  it('decides repo skills after routing and hands the result to the cache-restore start', async () => {
+    // #given a trusted run whose repo skills phase staged a source
+    const {runCacheRestore} = await import('./phases/cache-restore.js')
+    const {runRepoSkills} = await import('./phases/repo-skills.js')
+    await arrange()
+    const source = {symlinkedSkillIds: [], sourceDir: '/tmp/x/source-tree/.agents/skills', stagingRoot: '/tmp/x'}
+    vi.mocked(runRepoSkills).mockResolvedValue(source)
+
+    // #when
+    await run()
+
+    // #then the phase saw the bootstrap and routing results, and the start received its source
+    const [bootstrapArg, routingArg] = vi.mocked(runRepoSkills).mock.calls[0] ?? []
+    expect(bootstrapArg?.opencodeResult.version).toBe('2.2.5')
+    expect(routingArg?.botLogin).toBe('fro-bot')
+    expect(vi.mocked(runCacheRestore).mock.calls[0]?.[2]).toBe(source)
+  })
+
+  describe('repo skills staging cleanup', () => {
+    const source = {
+      symlinkedSkillIds: [],
+      sourceDir: '/tmp/fro-bot-repo-skills-x/source-tree/.agents/skills',
+      stagingRoot: '/tmp/fro-bot-repo-skills-x',
+    }
+
+    it('removes the staging root after cleanup has stopped the server, on a successful run', async () => {
+      // #given a run that staged repo skills and succeeds
+      const {runCleanup} = await import('./phases/cleanup.js')
+      const {removeRepoSkillsStaging, runRepoSkills} = await import('./phases/repo-skills.js')
+      await arrange()
+      vi.mocked(runRepoSkills).mockResolvedValue(source)
+
+      // #when
+      await run()
+
+      // #then it is removed once, and only after runCleanup (which shuts the server down) returned
+      expect(vi.mocked(removeRepoSkillsStaging)).toHaveBeenCalledTimes(1)
+      expect(vi.mocked(removeRepoSkillsStaging)).toHaveBeenCalledWith(source.stagingRoot)
+      const cleanupOrder = vi.mocked(runCleanup).mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY
+      const removalOrder = vi.mocked(removeRepoSkillsStaging).mock.invocationCallOrder[0] ?? 0
+      expect(removalOrder).toBeGreaterThan(cleanupOrder)
+    })
+
+    it('removes it when a phase throws after the server started', async () => {
+      // #given execution that throws
+      const {removeRepoSkillsStaging, runRepoSkills} = await import('./phases/repo-skills.js')
+      await arrange({executeError: new Error('boom')})
+      vi.mocked(runRepoSkills).mockResolvedValue(source)
+
+      // #when
+      await run()
+
+      // #then the finally block still removes it
+      expect(vi.mocked(removeRepoSkillsStaging)).toHaveBeenCalledWith(source.stagingRoot)
+    })
+
+    it('removes it when the server failed to start', async () => {
+      // #given a cache-restore (server start) that fails
+      const {runCacheRestore} = await import('./phases/cache-restore.js')
+      const {removeRepoSkillsStaging, runRepoSkills} = await import('./phases/repo-skills.js')
+      await arrange()
+      vi.mocked(runRepoSkills).mockResolvedValue(source)
+      vi.mocked(runCacheRestore).mockResolvedValue(null)
+
+      // #when
+      const exitCode = await run()
+
+      // #then the run failed and the staging root is removed anyway
+      expect(exitCode).toBe(1)
+      expect(vi.mocked(removeRepoSkillsStaging)).toHaveBeenCalledWith(source.stagingRoot)
+    })
+
+    it('asks for no removal when nothing was staged', async () => {
+      // #given a run without repo skills
+      const {removeRepoSkillsStaging, runRepoSkills} = await import('./phases/repo-skills.js')
+      await arrange()
+      vi.mocked(runRepoSkills).mockResolvedValue(null)
+
+      // #when
+      await run()
+
+      // #then the (no-op) removal receives null
+      expect(vi.mocked(removeRepoSkillsStaging)).toHaveBeenCalledWith(null)
+    })
   })
 
   it('runs execution on the V2 handle, releases it through the V2 drain instead of the V1 client, and cleans up', async () => {

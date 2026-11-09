@@ -47,6 +47,7 @@ import {
 import {runFinalizeWithResult} from './phases/finalize.js'
 import {mergeObservedTurn, recordObservedTurn} from './phases/observed-turn-v2.js'
 import {releaseOptionsFromExecution, runReleaseV2} from './phases/release-v2.js'
+import {removeRepoSkillsStaging, runRepoSkills} from './phases/repo-skills.js'
 import {runReviewReconciliation} from './phases/review-reconciliation.js'
 import {runRouting} from './phases/routing.js'
 import {runSessionPrep} from './phases/session-prep.js'
@@ -67,6 +68,9 @@ export async function run(): Promise<number> {
   // Set once the V2 server has been released (drained or stopped, then shut down). A run that left the try block without
   // reaching that point is released in the `finally` before cleanup.
   let serverReleasedV2 = false
+  // The run-scoped repo skills staging root under RUNNER_TEMP, or null. Hoisted so the `finally` block removes it once the
+  // server has stopped, whichever path the run took (fro-bot/agent#2129).
+  let repoSkillsStagingRoot: string | null = null
   let repo = ''
   let runId = ''
   let sessionRetention: number | null = null
@@ -249,7 +253,12 @@ export async function run(): Promise<number> {
 
     reactionCtx = await runAcknowledge(routing, bootstrap.logger)
 
-    const cacheRestore = await runCacheRestore(bootstrap, metrics)
+    // After routing so a skipped event never pays for a trust lookup or a git fetch (fro-bot/agent#2129). Null unless
+    // `repo-skills` is on, the run is V2 and the trust predicate admitted it.
+    const repoSkills = await runRepoSkills(bootstrap, routing)
+    repoSkillsStagingRoot = repoSkills?.stagingRoot ?? null
+
+    const cacheRestore = await runCacheRestore(bootstrap, metrics, repoSkills)
     if (cacheRestore == null) {
       deliveryOutcome = 'failed'
       setUnavailableActionOutputs(Date.now() - startTime)
@@ -491,6 +500,9 @@ export async function run(): Promise<number> {
       leaseRenewal,
       skipSessionPersistence,
       ...(persistenceDeclineReason === undefined ? {} : {persistenceDeclineReason}),
+    }).finally(async () => {
+      // runCleanup shuts the V2 server down; only then is the staging root, which the server reads, safe to remove.
+      await removeRepoSkillsStaging(repoSkillsStagingRoot)
     })
 
     // FINAL assessment: the single call to this pure function, made only now that

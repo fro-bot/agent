@@ -1,14 +1,19 @@
 ---
 type: subsystem
-last-updated: "2026-11-02"
-updated-by: "f8ee76a3"
+last-updated: "2026-11-08"
+updated-by: "f7c20f94"
 sources:
+  - packages/runtime/src/agent/workspace-config-v2.ts
+  - deploy/gateway.Dockerfile
   - tsdown.config.ts
   - src/services/setup/ci-config-v2.ts
   - src/services/setup/mcp-servers-v2.ts
   - src/services/setup/credential-files-v2.ts
   - src/services/setup/plugin-install-v2.ts
   - src/harness/phases/v2-server.ts
+  - src/harness/phases/repo-skills.ts
+  - src/services/setup/repo-skills.ts
+  - src/features/agent/repo-skills-trust.ts
   - packages/runtime/src/agent/server-v2.ts
   - packages/runtime/src/agent/permission-rules-v2.ts
   - packages/runtime/src/agent/permission-gate-v2.ts
@@ -104,11 +109,11 @@ Default versions are defined in `packages/runtime/src/shared/constants.ts` (shar
 
 These can be overridden per-run via action inputs (`opencode-version`, `systematic-version`). Stock tool pins are updated via Renovate-managed PRs. The OpenCode default is the stock V2 pin in `opencode-v2-pin.json`: Renovate bumps its `version` and a post-upgrade task regenerates the per-asset digests. A harness release does not change the Action default.
 
-The bundled Systematic default is currently `3.29.0`, shared by V1 and V2. Its pin participates in the tools-cache key, so advancing it triggers a fresh plugin installation even when the OpenCode binary itself is already cached.
+The bundled Systematic default is currently `3.32.0`, shared by V1 and V2. Its pin participates in the tools-cache key, so advancing it triggers a fresh plugin installation even when the OpenCode binary itself is already cached.
 
 Bun is the package manager for this project's own workspace, not a tool the Action installs. Every workflow in this repository gets its Bun from the root `package.json` `packageManager` field through `.github/actions/setup`, which fails the job if the installed Bun differs from it.
 
-`DEFAULT_OPENCODE_VERSION` is the **stock OpenCode V2 pin** (currently `2.2.5`), read from `packages/runtime/src/shared/opencode-v2-pin.json`, which records the version and each release asset's SHA-256. Installation requires both the recorded digest and the release's `SHA256SUMS` line to match. The build checks that the version and digests survive bundling (`tsdown.config.ts`). `latest` selects this same recorded pin without an upstream lookup.
+`DEFAULT_OPENCODE_VERSION` is the **stock OpenCode V2 pin** (currently `2.2.6`), read from `packages/runtime/src/shared/opencode-v2-pin.json`, which records the version and each release asset's SHA-256. Installation requires both the recorded digest and the release's `SHA256SUMS` line to match. The build checks that the version and digests survive bundling (`tsdown.config.ts`). `latest` selects this same recorded pin without an upstream lookup.
 
 The previous Action default, `1.19.5+harness.bf7f7dfe`, remains selectable through `opencode-version` as a rollback path. The workspace image still defaults to that V1 harness build; switching the Action default does not switch the gateway/workspace deployment.
 
@@ -128,6 +133,8 @@ Held execution claims from a killed invocation are cleared in the restored datab
 
 ### Effective configuration and permissions
 
+The Action also denies the native `websearch` action on V2; the workspace policy does not add that CI-specific deny. These tool rules steer the model's available actions, not the filesystem or network security boundary: an allowed shell can exercise the permissions and egress the process actually has.
+
 V2 uses `plugins`, an ordered top-level `permissions` list, `update: disable`, and `experimental.subagent_depth: 1` (`permission-rules-v2.ts`). These are generation-specific spellings, not the V1 config shape. The Action strips operator permission/tool overrides from top-level and agent maps before assembling the harness rules, and disables project-config loading at spawn.
 
 Outside-checkout access defaults to deny in CI. Exceptions name the run-attempt response and attachment directories, an eligible integration work directory, and the installed Systematic skills directory. Secret-shaped reads and edits are denied while `.env.example` remains accessible. `question`, session moves, and worktree creation are denied. The post-spawn permission gate inspects effective per-agent rules, so writing an intended config alone cannot establish readiness.
@@ -135,6 +142,8 @@ Outside-checkout access defaults to deny in CI. Exceptions name the run-attempt 
 The bundled-skills exception fixes a precedence problem shared with V1: a catch-all outside-directory deny could shadow OpenCode's own skill grant, leaving a loaded skill unable to read its references or execute its scripts. The resolver admits only the exact installed version's `@fro.bot/systematic/skills` directory, including the newest installed V2 generation directory. It grants neither the entire package cache nor arbitrary symlink destinations. Edit tools are denied there, but this is not filesystem read-only protection: shell commands can still write within an allowed external directory. A missing resolution warns and adds no grant.
 
 ### Caller MCP servers
+
+On credential-withheld triggers, `buildCIConfigV2` rejects `{env:...}` references anywhere in the operator configuration before MCP filtering. Upstream substitutes environment values into config text before parsing, so even an allowlisted but attacker-influenced environment value could otherwise add JSON structure after the harness checked it. This whole-config rejection is distinct from the non-fatal per-server filtering below.
 
 `opencode-config` `mcp` reaches V2 through `mcp-servers-v2.ts`, which `buildCIConfigV2` calls before it builds the permission rules. V2 2.2.5 reads two spellings, the legacy `mcp.<name>` map and the native `mcp.servers.<name>` map; both parse into one typed list (`local` with `command`/`cwd`/`environment`, `remote` with `url`/`headers`/`oauth`), and a bad shape fails setup with an error that names the server and field but never a value. The config is not rewritten into one spelling, because the native server schema (`disabled`, a `timeout` object, snake_case `oauth`) is not something the harness can read from the pinned source; entries pass through as authored. A server literally named `servers` or `timeout` is a server only when its value has `type`, the same rule upstream applies.
 
@@ -145,6 +154,10 @@ On a credential-withheld trigger (`resolveResponseDelivery`, the `pull_request`,
 On a provisioned run `mcp` passes through after validation. The parser checks what the 2.2.5 source shows: the legacy server schema in full, `mcp.timeout` as a positive integer or an object of positive integers, and for native entries the fields both spellings share. Native-only fields (`protocol`, the snake_case `oauth` keys) pass through because the native schema is not in the readable source. A string field that holds a `{env:}` or `{file:}` reference also passes without a format check, because the server substitutes it before it reads the config: a whole-value `url` reference is accepted, a literal `url` still needs to be http(s), and a referenced `type` parses as a server of unresolved kind whose launch fields are not checked. Structure (`command` an array, `environment` and `headers` maps) is still checked as written. The credential disposition comes from `cache-restore.ts` to `startActionOpenCodeV2` to `buildCIConfigV2` as a required input. The V1 path is unchanged: it passes `mcp` through without validation or trigger rules.
 
 ### Server and workspace boundary
+
+V2 workspace provisioning does not create `auth.json` and removes a stale one. Credentials are supplied through the authenticated per-spawn API instead, avoiding an unused secret-bearing file in the agent's home. `workspace-config-v2.ts` sets the per-location idle timeout to ten minutes rather than upstream's sixty, releasing idle location memory without changing the gateway's completion gate.
+
+The runtime images separate tool needs as well. `deploy/gateway.Dockerfile` removes npm, Yarn, and Corepack because the daemon needs no package manager. `deploy/workspace.Dockerfile` supplies the verified Bun binary and npm/npx `12.2.2` for agent tasks, replacing the base image's npm tree and removing Yarn and Corepack. This image provisioning is separate from Action setup, which installs no JavaScript runtime.
 
 `packages/runtime/src/agent/server-v2.ts` runs `serve --stdio` with held stdin, an explicit loopback port, a per-spawn Basic credential, and a scrubbed child environment. Readiness includes the agent endpoint and an active-plugin check, followed by the surface's permission and credential gates. Shutdown interrupts remaining sessions, closes stdin, and confirms process exit; [[Background Subagents and Ownership]] explains the directory-release check that precedes it.
 
@@ -261,9 +274,22 @@ Credentials are handled with care:
 
 ### GitHub credential disposition
 
-The GitHub token the agent might use to post is provisioned **conditionally**, driven by the response-delivery decision computed in [[Execution Lifecycle|bootstrap]]. On comment and review flows (`issue_comment`, `pull_request`, `issues`) the credential is **withheld** — `configureGhAuth()` skips setting `GH_TOKEN`, skips writing the `gh` `hosts.yml`, and clears any ambient `GH_CONFIG_DIR` from earlier workflow steps. The rationale is that on those flows the action posts the agent's answer itself (the file-convention delivery path), so the model has no legitimate need to call `gh` — and a credential the model never receives is a credential a prompt-injected model cannot exfiltrate from disk or environment. A preflight check (`git-credential-check.ts`) additionally asserts that no persisted git credential is present in the _effective_ git config for the workspace — local, global, system, worktree-scoped, or anything pulled in via `include`/`includeIf` — plus the `origin` remote URL, on these flows, which is why consumers are asked to check out with `persist-credentials: false`. Because the check reads global and system scope too, a credential planted anywhere on the runner (not just this checkout) is caught — but on a reused, non-ephemeral runner that also means a global/system config planted by an earlier job stays visible to every later job until the runner is recycled. The check has two narrow fail-open exceptions — no git binary, and a workspace that is not a git repository at all — and both are compatibility exemptions, not proof a credential is absent: they mean part of the check could not run, not that it ran and found nothing. Autonomous flows (`schedule`, `workflow_dispatch`) keep the credential provisioned, because they legitimately create branches, commits, and PRs on their own.
+The GitHub token the agent might use to post is provisioned **conditionally**, driven by the response-delivery decision computed in [[Execution Lifecycle|bootstrap]]. On comment and review flows (`issue_comment`, `pull_request`, `issues`) the credential is **withheld** — `configureGhAuth()` skips setting `GH_TOKEN`, skips writing the `gh` `hosts.yml`, and clears any ambient `GH_CONFIG_DIR` from earlier workflow steps. The rationale is that on those flows the action posts the agent's answer itself (the file-convention delivery path), so the model has no legitimate need to call `gh`, and the credential is kept out of the agent's environment, `gh` config and prompt. A preflight check (`git-credential-check.ts`) additionally asserts that no persisted git credential is present in the _effective_ git config for the workspace — local, global, system, worktree-scoped, or anything pulled in via `include`/`includeIf` — plus the `origin` remote URL, on these flows, which is why consumers are asked to check out with `persist-credentials: false`. Because the check reads global and system scope too, a credential planted anywhere on the runner (not just this checkout) is caught — but on a reused, non-ephemeral runner that also means a global/system config planted by an earlier job stays visible to every later job until the runner is recycled. The check has two narrow fail-open exceptions — no git binary, and a workspace that is not a git repository at all — and both are compatibility exemptions, not proof a credential is absent: they mean part of the check could not run, not that it ran and found nothing. Autonomous flows (`schedule`, `workflow_dispatch`) keep the credential provisioned, because they legitimately create branches, commits, and PRs on their own.
 
 When a same-repo PR comment produces workspace edits, the action still needs a way to land them despite withholding the token — this is what the [[Execution Lifecycle|brokered push]] step provides. It commits on the model's behalf through the action's own Octokit client, so the write is gated by trusted event facts and a path allowlist (`brokered-push-validation.ts`) rather than by handing the agent a credential. Keeping `persist-credentials: false` remains essential: it ensures the withheld token has no residual copy in `.git/config` that a same-user shell inside the agent could read.
+
+### Withholding is not an OS boundary
+
+Withholding stops accidental exposure and casual authenticated use. It does not stop deliberate extraction. The action's own process receives `github-token` as `INPUT_GITHUB-TOKEN`, and the agent runs as the same user on the same machine. On GitHub-hosted Linux runners, a process the agent starts can read that token from the action process's `/proc/<pid>/environ`. Deleting the variable in Node does not remove it from the process's initial environment, and the runner's `ptrace_scope` does not block the read ([#2135](https://github.com/fro-bot/agent/issues/2135)). The same applies on every trigger, and very likely to `ACTIONS_RUNTIME_TOKEN`.
+
+Until the agent runs under a separate user, keep write credentials out of the job that runs the agent:
+
+- Give the agent job a read-only token, minimal `permissions:`, and `persist-credentials: false` on checkout.
+- Set `response-mode: none` so the agent job never tries to post with the read-only token. With the default `github`, comment, issue and PR runs still publish the response and fail when the token can't write.
+- Have the agent write its output (a patch, a PR or issue request, a comment body) to files and upload them as an artifact. Use `output-mode: working-dir` for code changes.
+- Publish from a separate job on a fresh runner. That job mints the write token, runs only trusted default-branch code, validates the handoff (paths, size, target repository and branch, no force updates) and never executes model output.
+
+Treat everything the agent produces as untrusted, including restored session state.
 
 ### Environment scrubbing at agent spawn
 
@@ -279,6 +305,7 @@ The action accepts over 20 inputs defined in `action.yaml`, grouped into core, a
 - `output-mode` controls the delivery contract for `schedule` and `workflow_dispatch` runs (`auto`, `working-dir`, `branch-pr`; default `auto`). The compatibility value `auto` deterministically resolves to `working-dir`; use `branch-pr` explicitly when branch/PR delivery is required. The `output-mode` input has no effect on non-manual event types (issue comments, PRs, etc.), which always return `null`. See [Delivery-mode contract for manual workflow triggers](../solutions/workflow-issues/delivery-mode-contract-for-manual-triggers-2026-04-17.md) for the historical design rationale.
 - `agent` selects the OpenCode agent. When unset, uses OpenCode's built-in `build` agent. Must be a primary agent, not a subagent.
 - `review-skip-label` (default `skip-agent-review`) names a PR label that suppresses the automatic review on `pull_request` events when present (case-insensitive). Setting it empty disables the opt-out. The label is a passive suppressor, not a hard block: an authorized `@fro-bot` mention in the PR body still runs on opened/synchronize/reopened/edited actions, and an explicit review request naming the bot both admits the event and beats the label. The suppression is evaluated in the routing phase (see [[Execution Lifecycle]]).
+- `repo-skills` (default `false`, OpenCode V2 only) loads the repository's `.agents/skills` on trusted runs while project config stays disabled. Trust is an allow list, not the credential disposition: `schedule` and `workflow_dispatch`, or `pull_request`, `issue_comment` and `issues` from an `OWNER`, `MEMBER` or `COLLABORATOR`, with PR-scoped events also requiring the head repository to equal the run's repository (a maintainer commenting on a fork PR is denied, as is anything with missing facts). Every eligible run reads the default branch, fetched fresh from the base repository into a throwaway repository and written to disk as raw stored blobs with `git cat-file --batch` (never `git archive`, which would apply committed `.gitattributes` such as `export-subst` and expand a blob past the budget); the checkout, a dispatched branch and a PR head are never a source, and no ref or config in the checkout is read. The fetched tree is listed from raw `-z` bytes with a strict UTF-8 decode and refused if any path is invalid UTF-8, duplicated (case- and normalization-folded), or both a file and a directory; symlinks are never written to disk (a skill that contains one is rejected by id at admission). It is then checked against a budget (1000 entries, 5 MiB, 6 directories deep, no submodules) before anything is extracted. An admission filter copies only real `<id>/SKILL.md` directories into a run-scoped directory under `RUNNER_TEMP`, publishing each skill by rename only once its copy is complete: symlinks reject the skill, size and file count are bounded, and a skill whose directory name collides with a bundled Systematic skill or an OpenCode built-in is skipped (OpenCode keys skills by directory name; the frontmatter `name` is display text). The copy is named in `skills.paths`, gets the bundled-skills `external_directory` allow and `edit` deny, and is removed when the run ends. See `src/services/setup/repo-skills.ts` and `src/features/agent/repo-skills-trust.ts`.
 - `model` overrides the LLM model in `provider/model` format.
 - `timeout` controls the execution timeout (default: 30 minutes, 0 for no limit).
 - `s3-backup` / `s3-bucket` / `aws-region` / `s3-endpoint` / `s3-prefix` / `s3-expected-bucket-owner` / `s3-allow-insecure-endpoint` / `s3-sse-encryption` / `s3-sse-kms-key-id` enable and configure the durable S3-compatible object store (see [[Session Persistence]]). Input validation always rejects these metadata targets: `169.254.169.254`, `169.254.170.2`, `100.100.100.200`, `fd00:ec2::254`, their IPv4-mapped and translated forms, and `metadata.google.internal`. It also rejects loopback, private, link-local, unspecified, CGNAT, and documentation addresses unless `s3-allow-insecure-endpoint` is `true`. It enforces HTTPS unless that flag is set. Known limits: hostnames are not DNS-resolved, and NAT64, IPv4-compatible IPv6, the benchmarking range `198.18.0.0/15`, `.internal` and `.local` names, and the bare single-label name `metadata` are not classified.

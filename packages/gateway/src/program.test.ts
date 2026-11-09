@@ -773,8 +773,12 @@ describe('makeGatewayProgram', () => {
 
     // #then — program wiring passes a callable dispatcher without using module-global state
     expect(getCommandRegistrySpy).toHaveBeenCalledOnce()
-    const commandDeps = getCommandRegistrySpy.mock.calls[0]?.[0] as {dispatchWorkflow?: unknown} | undefined
+    const commandDeps = getCommandRegistrySpy.mock.calls[0]?.[0] as
+      {dispatchWorkflow?: unknown; denylistCache?: {isRepoDenied?: unknown; getDenylistState?: unknown}} | undefined
     expect(typeof commandDeps?.dispatchWorkflow).toBe('function')
+    // The Discord dispatch gate needs the shared denylist cache; a missing one must not reach the registry.
+    expect(typeof commandDeps?.denylistCache?.isRepoDenied).toBe('function')
+    expect(typeof commandDeps?.denylistCache?.getDenylistState).toBe('function')
   })
 
   it('builds the cancel deps for /fro-bot cancel even when the operator web endpoint is disabled', async () => {

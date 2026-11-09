@@ -191,9 +191,10 @@ describe('POST /operator/dispatch — all structured outcomes', () => {
     // #when
     const response = await postDispatch(app, {repo: 'acme/widget', task: 'do work'})
 
-    // #then
+    // #then — one dispatch for the bound repo, whatever the outcome
     expect(response.status).toBe(200)
     expect(await response.json()).toEqual({outcome})
+    expect(dispatchWorkflow).toHaveBeenCalledExactlyOnceWith('acme', 'widget', 'do work')
   })
 })
 
@@ -411,6 +412,32 @@ describe('POST /operator/dispatch — gate ordering and errors', () => {
     expect(response.status).toBe(404)
     expect(await response.json()).toEqual({error: 'not-found'})
     expect(dispatchWorkflow).not.toHaveBeenCalled()
+  })
+
+  it('returns the uniform 404 and makes no dispatch when the denylist cannot be read (fail closed)', async () => {
+    // #given — the binding exists, but the policy source throws
+    const denylistCache: DispatchRouteDeps['denylistCache'] = {
+      getDenylistState: vi.fn(async () => {
+        throw new Error('metadata unavailable')
+      }),
+      isRepoDenied: vi.fn(() => false),
+    }
+    const dispatchWorkflow: DispatchWorkflow = vi.fn()
+    const auditLogger = makeAuditLogger()
+    const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
+    const app = buildApp(makeDeps({denylistCache, dispatchWorkflow, auditLogger, logger}))
+
+    // #when
+    const response = await postDispatch(app, {repo: 'acme/widget', task: 'do work'})
+
+    // #then
+    expect(response.status).toBe(404)
+    expect(await response.json()).toEqual({error: 'not-found'})
+    expect(dispatchWorkflow).not.toHaveBeenCalled()
+    expect(auditLogger.info).not.toHaveBeenCalled()
+    expect(logger.warn.mock.calls.map(call => call[0] as unknown)).toEqual([
+      {githubUserId: 1001, gate: 'repo-unavailable'},
+    ])
   })
 
   it.each([

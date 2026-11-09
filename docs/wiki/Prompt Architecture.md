@@ -1,8 +1,9 @@
 ---
 type: subsystem
-last-updated: "2026-11-02"
-updated-by: "f8ee76a3"
+last-updated: "2026-11-08"
+updated-by: "f7c20f94"
 sources:
+  - src/harness/phases/brokered-push-plan.ts
   - src/features/agent/prompt-sender-v2.ts
   - src/features/agent/execution-v2.ts
   - src/features/agent/retry-v2.ts
@@ -100,13 +101,15 @@ How the agent is told to deliver its answer is decided in bootstrap by `resolveR
 
 - **`model-gh`** — the historical behavior, used on `schedule` and `workflow_dispatch` runs. The agent is instructed to post its own single comment (`gh issue comment` / `gh pr comment`) or submit its own review (`gh pr review --approve` / `--request-changes`) matching its verdict. These runs hold a GitHub credential.
 
-- **`file-convention`** — used on comment and review triggers (`issue_comment`, `pull_request`, `issues`). The agent has no GitHub credential (see [[Setup and Configuration]]) and is told to write its full response — analysis plus Run Summary — to the run-scoped response file rather than calling `gh`. The action reads that file after the run and posts on the agent's behalf. For PR reviews, the prompt still asks the agent to record a PASS/CONDITIONAL/REJECT verdict, which the action maps to the matching GitHub review event.
+- **`file-convention`** — used on comment and review triggers (`issue_comment`, `pull_request`, `issues`). The agent is not given a GitHub credential (see [[Setup and Configuration]], including why that is not an OS boundary) and is told to write its full response — analysis plus Run Summary — to the run-scoped response file rather than calling `gh`. The action reads that file after the run and posts on the agent's behalf. For PR reviews, the prompt still asks the agent to record a PASS/CONDITIONAL/REJECT verdict, which the action maps to the matching GitHub review event.
 
 - **`none`** — used when the `response-mode: none` input suppresses all GitHub writes. The agent is told the run log itself is the response surface and to post nothing.
 
 Keeping this branch in the prompt builder (rather than in a separate agent instruction file) means the response protocol the model sees always matches what the harness will actually do with its output, so the two can never drift.
 
 ## Response Surfaces
+
+For an eligible same-repository PR comment, the file-convention protocol also explains the brokered push: the agent commits its edits locally and the Action pushes them after execution. `src/harness/phases/brokered-push-plan.ts` derives this instruction from trusted trigger, association, head-anchor, and hydrated PR facts before the prompt is built. It is absent for forks or incomplete context. The model does not report whether the push landed; the harness appends that outcome after its live checks, as described in [[Execution Lifecycle]].
 
 Delivery mode answers "how does the answer get posted." A second, orthogonal axis answers "what kind of artifact is this run allowed to produce," and it is carried by `ResponseSurface` (`packages/runtime/src/agent/response-file.ts`). Four surfaces exist: `issue-comment`, `pr-comment`, `pr-review`, and `pr-review-permitted`.
 

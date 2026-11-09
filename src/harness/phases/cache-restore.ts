@@ -1,6 +1,7 @@
 import type {OpenCodeV2ServerHandle} from '@fro-bot/runtime'
 import type {OpenCodeServerHandle} from '../../features/agent/index.js'
 import type {MetricsCollector} from '../../features/observability/index.js'
+import type {RepoSkillsSource} from '../../services/setup/repo-skills.js'
 import type {CacheResult} from '../../shared/types.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
 import * as path from 'node:path'
@@ -50,6 +51,7 @@ export interface CacheRestoreV2PhaseResult {
 export async function runCacheRestore(
   bootstrap: BootstrapPhaseResult,
   metrics: MetricsCollector,
+  repoSkills: RepoSkillsSource | null = null,
 ): Promise<CacheRestorePhaseResult | CacheRestoreV2PhaseResult | null> {
   const cacheComponents = buildCacheKeyComponents()
 
@@ -162,7 +164,7 @@ export async function runCacheRestore(
     // The V1 server bootstrap below is not reachable on V2. This is the only place that selects the generation's
     // server: the repair above is generation-neutral (the V1 and V2 databases share a file name and a WAL).
     // The caller owns the live server from here: the V2 execution loop runs on it and cleanup shuts it down.
-    return startV2Server(bootstrap, workspacePath, storagePath, cacheResult, cacheStatus)
+    return startV2Server(bootstrap, workspacePath, storagePath, cacheResult, cacheStatus, repoSkills)
   }
 
   const serverLogger = createLogger({phase: 'server-bootstrap'})
@@ -198,6 +200,7 @@ async function startV2Server(
   storagePath: string,
   cacheResult: CacheResult,
   cacheStatus: 'corrupted' | 'hit' | 'miss',
+  repoSkills: RepoSkillsSource | null,
 ): Promise<CacheRestoreV2PhaseResult | null> {
   const serverLogger = createLogger({phase: 'server-bootstrap'})
   const {inputs, opencodeResult} = bootstrap
@@ -216,6 +219,8 @@ async function startV2Server(
     // Same classification `runBootstrap` resolved from `github.context.eventName` (the same variable). It decides which
     // caller MCP servers the config keeps: a withheld run is driven by untrusted text.
     credential: resolveResponseDelivery(process.env.GITHUB_EVENT_NAME ?? '', inputs.responseMode).credential,
+    // Decided after routing (`runRepoSkills`): null unless the input is on and the trust predicate admitted this run.
+    repoSkills,
     runId: getGitHubRunId(),
     runAttempt: getGitHubRunAttempt(),
     logger: serverLogger,

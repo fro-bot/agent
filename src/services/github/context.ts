@@ -35,6 +35,18 @@ export function classifyEventType(eventName: string): EventType {
   }
 }
 
+/**
+ * `head.repo.full_name`, or null when the head repository is deleted, absent or malformed. A null is an unknown, never
+ * a default: callers deciding trust treat it as untrusted (fork-or-unknown).
+ */
+function readHeadRepoFullName(head: unknown): string | null {
+  if (typeof head !== 'object' || head === null) return null
+  const repo: unknown = (head as {readonly repo?: unknown}).repo
+  if (typeof repo !== 'object' || repo === null) return null
+  const fullName: unknown = (repo as {readonly full_name?: unknown}).full_name
+  return typeof fullName === 'string' && fullName.length > 0 ? fullName : null
+}
+
 export function normalizeEvent(eventType: EventType, payload: unknown): NormalizedEvent {
   switch (eventType) {
     case 'issue_comment': {
@@ -138,6 +150,7 @@ export function normalizeEvent(eventType: EventType, payload: unknown): Normaliz
           locked: p.pull_request.locked ?? false,
           draft: p.pull_request.draft ?? false,
           headSha: p.pull_request.head.sha,
+          headRepoFullName: readHeadRepoFullName(p.pull_request.head),
           authorAssociation: p.pull_request.author_association ?? 'NONE',
           requestedReviewers,
           labels,

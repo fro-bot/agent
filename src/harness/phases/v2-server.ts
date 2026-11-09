@@ -1,6 +1,7 @@
 import type {Result} from '@bfra.me/es/result'
 import type {CredentialDisposition, OpenCodeV2ServerHandle, StartOpenCodeV2ServerOptions} from '@fro-bot/runtime'
 import type {InstallPluginsV2Options, PluginInstallV2Error} from '../../services/setup/plugin-install-v2.js'
+import type {RepoSkillsSource} from '../../services/setup/repo-skills.js'
 import type {Logger} from '../../shared/logger.js'
 import type {V1DatabaseFacts, V1ImportWaitError, WaitForV1ImportOptions} from './v1-import-wait.js'
 import {err, ok} from '@bfra.me/es/result'
@@ -30,6 +31,7 @@ import {
   resolveCacheHome,
   resolvePluginSpecsV2,
 } from '../../services/setup/plugin-install-v2.js'
+import {admitRepoSkills, discardRepoSkillsStaging} from '../../services/setup/repo-skills.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {readV1DatabaseFacts, waitForV1Import} from './v1-import-wait.js'
 
@@ -48,7 +50,9 @@ import {readV1DatabaseFacts, waitForV1Import} from './v1-import-wait.js'
  *    anything else gets the bounded installer.
  * 3. Config. `buildCIConfigV2` (the outside-directory deny with run-scoped exceptions, `question` denied, the plugins)
  *    plus a `{file:}` reference per key file. After the plugins, because one exception is the installed Systematic
- *    skills directory (fro-bot/agent#2009), and its generation directory only exists once the plugin is cached.
+ *    skills directory (fro-bot/agent#2009), and its generation directory only exists once the plugin is cached. For a
+ *    trusted run with `repo-skills` on (fro-bot/agent#2129) the admission filter also runs here, for the same reason: it
+ *    checks repo skill names against that directory, and the admitted copy joins the config as `skills.paths`.
  * 4. Held claims. `clearHeldClaims` runs on the restored database before the spawn: a V2 server resumes a claim a
  *    killed run left behind. A fresh database, a V1 database (no claim tables) and a database no V2 server opened are
  *    no-ops.
@@ -91,6 +95,12 @@ export interface StartActionOpenCodeV2Options {
   readonly env: NodeJS.ProcessEnv
   /** The run's credential disposition; `withhold` drops caller MCP servers an untrusted trigger could reach. */
   readonly credential: CredentialDisposition
+  /**
+   * Candidate repository skills for a run the trust predicate admitted (`repo-skills`, fro-bot/agent#2129); null or
+   * absent otherwise. Admitted here, after the plugin install, because collisions with the installed bundled skills are
+   * checked against the plugin's own skills directory.
+   */
+  readonly repoSkills?: RepoSkillsSource | null
   readonly runId: string | number
   readonly runAttempt: string | number
   readonly logger: Logger
@@ -107,6 +117,7 @@ export interface StartActionOpenCodeV2Deps {
     options: Omit<InstallPluginsV2Options, 'execAdapter'>,
   ) => Promise<Result<void, PluginInstallV2Error>>
   readonly clearClaims: typeof clearHeldClaims
+  readonly admitRepoSkills: typeof admitRepoSkills
   readonly waitForImport: (options: WaitForV1ImportOptions) => Promise<Result<unknown, V1ImportWaitError>>
   readonly readDatabaseFacts: (dbPath: string) => V1DatabaseFacts
   readonly startOptions?: Partial<StartOpenCodeV2ServerOptions>
@@ -118,6 +129,7 @@ const defaultDeps: StartActionOpenCodeV2Deps = {
   startServer: startOpenCodeV2Server,
   installPlugins: async installOptions => installPluginsV2({...installOptions, execAdapter: createExecAdapter()}),
   clearClaims: clearHeldClaims,
+  admitRepoSkills,
   waitForImport: waitForV1Import,
   readDatabaseFacts: readV1DatabaseFacts,
 }
@@ -182,6 +194,39 @@ export async function startActionOpenCodeV2(
       {systematicVersion: specs.data.systematicVersion},
     )
   }
+
+  // Repository skills: a run-scoped copy of the admissible ones, never the checkout in place. Fail soft: a refusal logs
+  // why and the run proceeds exactly as a run without the input.
+  let repoSkillsDirectory: string | undefined
+  if (options.repoSkills != null) {
+    try {
+      const admission = await deps.admitRepoSkills({
+        sourceDir: options.repoSkills.sourceDir,
+        stagingRoot: options.repoSkills.stagingRoot,
+        bundledSkillsDirectories,
+        symlinkedSkillIds: options.repoSkills.symlinkedSkillIds,
+        logger,
+      })
+      if (admission.success) {
+        repoSkillsDirectory = admission.data.directory ?? undefined
+        logger.info('Repository skills admitted', {
+          admitted: admission.data.admitted.length,
+          skipped: admission.data.skipped.map(skill => skill.id),
+        })
+      } else {
+        logger.warning(`Repository skills are not loaded: ${admission.error}`)
+      }
+    } catch (error) {
+      // Admission reads and copies a checkout-derived tree; nothing it throws may fail the run. Warn with the error code
+      // only (a message can carry a path), drop what was staged, and start as a run without the input.
+      logger.warning('Repository skills are not loaded: admission failed unexpectedly', {
+        error: (error as NodeJS.ErrnoException).code ?? (error instanceof Error ? error.name : 'unknown'),
+      })
+      repoSkillsDirectory = undefined
+      await discardRepoSkillsStaging(options.repoSkills.stagingRoot)
+    }
+  }
+
   const built = buildCIConfigV2(
     {
       opencodeConfig: options.opencodeConfig,
@@ -195,6 +240,7 @@ export async function startActionOpenCodeV2(
         : {integrationWorkDir: options.env.FRO_BOT_INTEGRATION_WORK_DIR}),
       providerKeyFiles: files.data.keyFiles,
       bundledSkillsDirectories,
+      ...(repoSkillsDirectory === undefined ? {} : {repoSkillsDirectory}),
     },
     logger,
   )
