@@ -13,6 +13,7 @@ import type {AuthDecision, GuildCommandCtx} from './guild-command.js'
 
 import {Effect} from 'effect'
 
+import {resolveRepoAccess} from '../../web/operator/route-helpers.js'
 import {editInteraction} from '../io.js'
 import {userIsAuthorized} from '../mentions.js'
 import {INTERNAL_ERROR_COPY, makeGuildCommand} from './guild-command.js'
@@ -24,6 +25,10 @@ function invalidTaskCopy(): string {
 function repoSlug(owner: string, repo: string): string {
   return `${owner}/${repo}`
 }
+
+// One refusal for denied, unbound and policy-unavailable repos: the copy must not reveal which, nor whether a
+// denylist exists. Mirrors the operator launch route's uniform 404.
+const REPO_ACCESS_REFUSAL_COPY = 'This repository is not available for dispatch.'
 
 function acceptedCopy(owner: string, repo: string, runUrl: string | undefined): string {
   if (runUrl === undefined) {
@@ -90,7 +95,8 @@ export function buildDispatchSpec(deps: FroBotDeps): {
         return
       }
 
-      if (bindingResult.data === null) {
+      const channelBinding = bindingResult.data
+      if (channelBinding === null) {
         yield* editInteraction(
           ctx.interaction,
           {content: 'This channel is not bound to a repository. Use `/fro-bot add-project` first.'},
@@ -99,7 +105,24 @@ export function buildDispatchSpec(deps: FroBotDeps): {
         return
       }
 
-      const {owner, repo} = bindingResult.data
+      // Same predicate as the operator web routes: bound AND not denylisted, fail-closed. It re-reads the binding by
+      // repo, so the dispatch below targets the stored binding, never the channel row's spelling.
+      const access = yield* Effect.promise(async () =>
+        resolveRepoAccess(channelBinding.owner, channelBinding.repo, {
+          bindingsLookup: deps.bindingsStore,
+          denylistCache: deps.denylistCache,
+        }),
+      )
+      if (access.kind !== 'allowed') {
+        ctx.log.warn(
+          {channelId, gate: access.kind === 'denied' ? 'repo-denied' : 'repo-unavailable'},
+          'dispatch: denied — repo access',
+        )
+        yield* editInteraction(ctx.interaction, {content: REPO_ACCESS_REFUSAL_COPY}, ctx.log)
+        return
+      }
+
+      const {owner, repo} = access.binding
       const outcome = yield* Effect.tryPromise({
         try: async () => deps.dispatchWorkflow(owner, repo, task),
         catch: error => (error instanceof Error ? error : new Error(String(error))),
