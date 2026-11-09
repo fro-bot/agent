@@ -6,8 +6,9 @@
  * the CI config names through `skills.paths`:
  *
  * 1. `stageDefaultBranchSkills` fetches the default branch fresh from the base repository into a throwaway repository,
- *    lists `.agents/skills` in that exact commit and checks the listing against a size budget, and only then extracts it
- *    with `git archive`. No ref, config or object in the checkout
+ *    lists `.agents/skills` in that exact commit, checks the listing against a size budget, and only then writes each
+ *    listed blob to disk RAW (`git cat-file --batch`). Never `git archive`: it honours committed `.gitattributes`
+ *    (`export-subst`, `ident`, `eol`) and can turn a few KiB of stored blobs into megabytes past the budget. No ref, config or object in the checkout
  *    is read or changed, so an earlier workflow step cannot plant or age the revision, and the PR head or a dispatched
  *    branch is never a source.
  * 2. `admitRepoSkills` copies only real skill directories: `<id>/SKILL.md` plus that directory's regular files. A symlink
@@ -38,7 +39,6 @@ const SKILLS_GIT_PATH = SKILLS_SEGMENTS.join('/')
 export const REPO_SKILLS_DIRECTORY_NAME = 'skills'
 const EXTRACT_DIRECTORY_NAME = 'source-tree'
 const FETCH_REPOSITORY_NAME = 'fetch.git'
-const ARCHIVE_FILE_NAME = 'source.tar'
 /** Where a skill is copied before it is renamed into the discoverable directory. Never under `skills.paths`. */
 const SCRATCH_DIRECTORY_NAME = 'scratch'
 /** Every staging root's directory name starts with this; removal refuses a path that does not. */
@@ -57,7 +57,7 @@ export interface RepoSkillsLimits {
   readonly maxBytes: number
   /** Directory depth below a skill directory, for the source tree and for admission (OpenCode's scanner stops at 6). */
   readonly maxDepth: number
-  /** Bound on each git or tar command. */
+  /** Bound on each git command. */
   readonly commandTimeoutMs: number
 }
 
@@ -226,11 +226,15 @@ function withAuthHeader(env: Record<string, string>, origin: string, token: stri
 
 /** `git ls-tree -r -l -z -t` bound on the stdout kept in memory: well above any tree within budget (~150 bytes an entry). */
 const LISTING_STDOUT_CAP_BYTES = 4 * 1024 * 1024
+/** `cat-file --batch` frames: `<oid> blob <size>\n` plus a trailing `\n`; 64-hex object ids and a 10-digit size fit in this. */
+const CAT_FILE_FRAME_ALLOWANCE_BYTES = 128
 
 export interface TreeEntry {
   /** Six-digit octal mode: `100644`, `120000` (symlink), `040000` (tree), `160000` (submodule). */
   readonly mode: string
   readonly type: 'blob' | 'commit' | 'tree'
+  /** The object id, as git printed it. */
+  readonly oid: string
   /** Blob size in bytes; null for trees and submodules (git prints a dash). */
   readonly size: number | null
   readonly path: string
@@ -253,6 +257,7 @@ export function parseTreeListing(stdout: string): Result<readonly TreeEntry[], s
     entries.push({
       mode: match[1] as string,
       type: match[2] as TreeEntry['type'],
+      oid: match[3] as string,
       size: match[4] === '-' ? null : Number.parseInt(match[4] as string, 10),
       path: match[5] as string,
     })
@@ -261,11 +266,11 @@ export function parseTreeListing(stdout: string): Result<readonly TreeEntry[], s
 }
 
 /**
- * Checks the default branch's skills tree against the budget before a byte of it is extracted. Every entry under
- * `.agents/skills` counts, rejected ones included (a symlink admission will refuse still costs an extraction), and the
+ * Checks the default branch's skills tree against the budget before a byte of it is written. Every entry under
+ * `.agents/skills` counts, rejected ones included (a symlink admission will refuse still costs a write), and the
  * blob sizes are summed. Fails on: too many entries, too many bytes, a path deeper than admission walks (a file may sit
- * `maxDepth` directories below its skill directory), or a submodule, which `git archive` writes as an empty directory
- * that admission could never tell from a real one. Messages carry counts and limits, never a path.
+ * `maxDepth` directories below its skill directory), or a submodule, which has no blob to write and that
+ * admission could never tell from a real directory. Messages carry counts and limits, never a path.
  */
 export function checkSourceBudget(entries: readonly TreeEntry[], limits: RepoSkillsLimits): Result<void, string> {
   const root = `${SKILLS_GIT_PATH}/`
@@ -299,19 +304,136 @@ export function checkSourceBudget(entries: readonly TreeEntry[], limits: RepoSki
   return ok(undefined)
 }
 
+/**
+ * Validates a listed path before it is joined to the extract root: under `.agents/skills/`, no absolute path, and no empty,
+ * `.` or `..` segment or NUL byte. Git does not produce these; this defends the write if a listing ever does. The
+ * message never carries the path.
+ */
+export function safeRelativeSkillPath(entryPath: string): Result<string, string> {
+  const unsafe = err('The default branch skills contain an unsafe path; repo skills are not loaded')
+  // The prefix check also refuses every absolute path.
+  if (entryPath.includes('\0') || !entryPath.startsWith(`${SKILLS_GIT_PATH}/`)) return unsafe
+  const segments = entryPath.split('/')
+  if (segments.some(segment => segment === '' || segment === '.' || segment === '..')) return unsafe
+  return ok(entryPath)
+}
+
+export interface ExpectedBlob {
+  readonly oid: string
+  readonly size: number
+}
+
+/**
+ * Parses `git cat-file --batch` output against the listing it was fed from: for each expected blob in order, a
+ * `<oid> blob <size>\n` header, exactly `size` bytes, and a `\n`. Fails closed on anything that disagrees: another object
+ * id, a type other than blob, a missing object, a size other than the listing's, a cut-off frame, or bytes after the last
+ * frame. A running byte counter refuses any frame that would take the total past `maxBytes` or past the listing's own
+ * total, before its body is read. Returns slices of `raw` (no copies). Messages never carry content.
+ */
+export function parseCatFileBatch(
+  raw: Buffer,
+  expected: readonly ExpectedBlob[],
+  maxBytes: number,
+): Result<readonly Buffer[], string> {
+  const failure = (reason: string): Result<never, string> =>
+    err(`The default branch blob read failed (${reason}); repo skills are not loaded`)
+  const listedTotal = expected.reduce((sum, blob) => sum + blob.size, 0)
+  const allowance = Math.min(maxBytes, listedTotal)
+  const bodies: Buffer[] = []
+  let position = 0
+  let total = 0
+  for (const blob of expected) {
+    const newline = raw.indexOf(0x0a, position)
+    if (newline === -1) return failure('truncated output')
+    const header = raw.toString('latin1', position, newline)
+    if (header === `${blob.oid} missing`) return failure('an object is missing')
+    const match = /^([\da-f]{40}|[\da-f]{64}) (\w+) (\d+)$/.exec(header)
+    if (match === null || match[1] !== blob.oid || match[2] !== 'blob') {
+      return failure('an object mismatch with the listing')
+    }
+    const size = Number.parseInt(match[3] as string, 10)
+    // The counter comes first: a claimed size is refused before any of its body is looked at.
+    if (total + size > allowance) return failure('the total exceeds the staging budget')
+    if (size !== blob.size) return failure('a size mismatch with the listing')
+    const start = newline + 1
+    const end = start + size
+    if (raw.length < end + 1 || raw[end] !== 0x0a) return failure('truncated output')
+    total += size
+    bodies.push(raw.subarray(start, end))
+    position = end + 1
+  }
+  if (position !== raw.length) return failure('trailing output')
+  return ok(bodies)
+}
+
+const FILE_MODES = new Set(['100644', '100755'])
+const NO_FOLLOW = fs.constants.O_NOFOLLOW ?? 0
+
+/**
+ * Writes the listed tree under `extractRoot` from the stored blobs, with no attribute, filter, eol or ident processing.
+ * Directories are 0700; files are created exclusively and without following a symlink at the leaf, 0600 (0700 when the
+ * blob is executable, so a skill's scripts keep working); a mode 120000 blob becomes a real symlink to the stored target,
+ * never followed. Any other mode is an error. The caller removes `extractRoot` on failure.
+ */
+async function writeTree(
+  extractRoot: string,
+  entries: readonly TreeEntry[],
+  bodies: readonly Buffer[],
+): Promise<Result<void, string>> {
+  const failure = err('Could not write the default branch skills; repo skills are not loaded')
+  try {
+    let blobIndex = 0
+    for (const entry of entries) {
+      const destination = path.join(extractRoot, entry.path)
+      if (entry.type === 'tree') {
+        await fsp.mkdir(destination, {recursive: true, mode: 0o700})
+        continue
+      }
+      const body = bodies[blobIndex] as Buffer
+      blobIndex += 1
+      await fsp.mkdir(path.dirname(destination), {recursive: true, mode: 0o700})
+      if (entry.mode === '120000') {
+        const target = body.toString('utf8')
+        if (target.length === 0 || target.includes('\0')) return failure
+        await fsp.symlink(target, destination)
+        continue
+      }
+      const handle = await fsp.open(
+        destination,
+        fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | NO_FOLLOW,
+        entry.mode === '100755' ? 0o700 : 0o600,
+      )
+      try {
+        await handle.writeFile(body)
+      } finally {
+        await handle.close()
+      }
+    }
+  } catch {
+    return failure
+  }
+  return ok(undefined)
+}
+
 type CommandOutcome =
-  | {readonly kind: 'exited'; readonly code: number; readonly stdout: string; readonly truncated: boolean}
+  | {
+      readonly kind: 'exited'
+      readonly code: number
+      readonly stdout: string
+      readonly raw: Buffer
+      readonly truncated: boolean
+    }
   | {readonly kind: 'timed-out'}
 
 /**
  * Stages the default branch's `.agents/skills` into `<stagingRoot>/source-tree`. On every call it fetches the branch
  * afresh from the base repository into a private ref (`refs/fro-bot/repo-skills/<key>`) of a throwaway bare repository
- * under the staging root, archives that exact commit, and deletes the throwaway repository. It never runs git in the
+ * under the staging root, writes that exact commit's skill blobs raw, and deletes the throwaway repository. It never runs git in the
  * checkout and never reads a ref that already exists there: the checkout's refs, config (`insteadOf`, hooks) and
  * shallow state are not trusted, and are not changed either.
  *
- * Returns the extracted skills directory, or null when the default branch has none. Before extracting it lists the subtree
- * and refuses one over the entry, byte or depth budget (`checkSourceBudget`). Every git and tar command is bounded by a
+ * Returns the extracted skills directory, or null when the default branch has none. Before writing anything it lists the
+ * subtree and refuses one over the entry, byte or depth budget (`checkSourceBudget`). Every git command is bounded by a
  * timeout; any failure is an error and the caller loads no repo skills.
  */
 export async function stageDefaultBranchSkills(
@@ -359,6 +481,7 @@ export async function stageDefaultBranchSkills(
     args: string[],
     commandEnv: Record<string, string> = baseEnv,
     stdoutCapBytes = Number.POSITIVE_INFINITY,
+    input?: Buffer,
   ): Promise<CommandOutcome> => {
     const chunks: Buffer[] = []
     let kept = 0
@@ -368,6 +491,7 @@ export async function stageDefaultBranchSkills(
       env: commandEnv,
       silent: true,
       ignoreReturnCode: true,
+      ...(input === undefined ? {} : {input}),
       listeners: {
         stdout: data => {
           if (kept + data.length > stdoutCapBytes) {
@@ -381,12 +505,13 @@ export async function stageDefaultBranchSkills(
     })
     return code === 'timed-out'
       ? {kind: 'timed-out'}
-      : {kind: 'exited', code, stdout: Buffer.concat(chunks).toString('utf8'), truncated}
+      : {kind: 'exited', code, stdout: Buffer.concat(chunks).toString('utf8'), raw: Buffer.concat(chunks), truncated}
   }
 
   const timedOut = (step: string): Result<never, string> =>
     err(`Reading the default branch skills timed out while ${step}`)
 
+  let succeeded = false
   try {
     const initialized = await run('git', ['init', '--bare', '--quiet', gitDir])
     if (initialized.kind === 'timed-out') return timedOut('preparing the fetch')
@@ -433,21 +558,43 @@ export async function stageDefaultBranchSkills(
     const withinBudget = checkSourceBudget(entries.data, limits)
     if (!withinBudget.success) return withinBudget
 
-    const archivePath = path.join(stagingRoot, ARCHIVE_FILE_NAME)
+    // Write the stored blobs, raw. `cat-file --batch` applies no attribute, filter, eol or ident processing, and the
+    // listing that passed the budget decides what is read: no path is walked by git here.
     const extractRoot = path.join(stagingRoot, EXTRACT_DIRECTORY_NAME)
-    const archived = await run(
-      'git',
-      git('archive', '--format=tar', `--output=${archivePath}`, privateRef, SKILLS_GIT_PATH),
-    )
-    if (archived.kind === 'timed-out') return timedOut('archiving the default branch skills')
-    if (archived.code !== 0) return err('Could not archive the default branch skills; repo skills are not loaded')
-
-    await fsp.mkdir(extractRoot, {recursive: true, mode: 0o700})
-    const extracted = await run('tar', ['-xf', archivePath, '-C', extractRoot])
-    if (extracted.kind === 'timed-out') return timedOut('extracting the default branch skills')
-    if (extracted.code !== 0) {
-      return err('Could not extract the default branch skills archive; repo skills are not loaded')
+    const underRoot = entries.data.filter(entry => entry.path.startsWith(`${SKILLS_GIT_PATH}/`))
+    for (const entry of underRoot) {
+      const safe = safeRelativeSkillPath(entry.path)
+      if (!safe.success) return safe
     }
+    const blobs = underRoot.filter(entry => entry.type === 'blob')
+    if (blobs.some(entry => entry.size === null || (entry.mode !== '120000' && !FILE_MODES.has(entry.mode)))) {
+      return err('The default branch skills contain an entry with an unsupported mode; repo skills are not loaded')
+    }
+    const expected = blobs.map(entry => ({oid: entry.oid, size: entry.size as number}))
+    // Output is the bodies plus one short header and newline each: capped at the listed bytes and a header allowance.
+    const catFileCap =
+      expected.reduce((sum, blob) => sum + blob.size, 0) + expected.length * CAT_FILE_FRAME_ALLOWANCE_BYTES
+    const read = await run(
+      'git',
+      git('cat-file', '--batch'),
+      baseEnv,
+      catFileCap,
+      Buffer.from(blobs.map(entry => `${entry.oid}\n`).join('')),
+    )
+    if (read.kind === 'timed-out') return timedOut('reading the default branch blobs')
+    if (read.code !== 0) return err('Could not read the default branch blobs; repo skills are not loaded')
+    if (read.truncated) {
+      return err(
+        'The default branch blob read failed (the output exceeds the staging budget); repo skills are not loaded',
+      )
+    }
+    const bodies = parseCatFileBatch(read.raw, expected, limits.maxBytes)
+    if (!bodies.success) return bodies
+
+    await fsp.mkdir(path.join(extractRoot, ...SKILLS_SEGMENTS), {recursive: true, mode: 0o700})
+    const written = await writeTree(extractRoot, underRoot, bodies.data)
+    if (!written.success) return written
+    succeeded = true
     return ok(path.join(extractRoot, ...SKILLS_SEGMENTS))
   } catch (error) {
     logger.debug('Reading the default branch skills threw', {error: error instanceof Error ? error.name : 'unknown'})
@@ -455,7 +602,8 @@ export async function stageDefaultBranchSkills(
   } finally {
     // The private ref lives only in this repository; removing it removes the ref and every fetched object.
     await removeQuietly(gitDir)
-    await removeQuietly(path.join(stagingRoot, ARCHIVE_FILE_NAME))
+    // A failure leaves no partial tree: only a complete write is kept.
+    if (!succeeded) await removeQuietly(path.join(stagingRoot, EXTRACT_DIRECTORY_NAME))
   }
 }
 

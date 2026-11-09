@@ -912,9 +912,10 @@ describe.skipIf(!hasBinary)('repo skills against the real stock binary (fro-bot/
    * fetches from: a bare repository at `<root>/server/fro-bot/agent.git`, served over `file://` through
    * `GITHUB_SERVER_URL`. Whatever the checkout holds afterwards (another branch, more skills) is not on the server.
    */
-  function publishDefaultBranch(box: Sandbox): void {
+  function publishDefaultBranch(box: Sandbox, messageFile?: string): void {
     gitIn(box.repo, 'add', '-A')
-    gitIn(box.repo, 'commit', '-qm', 'default branch')
+    if (messageFile === undefined) gitIn(box.repo, 'commit', '-qm', 'default branch')
+    else gitIn(box.repo, 'commit', '-qF', messageFile)
     mkdirSync(path.join(box.root, 'server', 'fro-bot'), {recursive: true})
     gitIn(box.repo, 'clone', '--bare', '-q', box.repo, path.join(box.root, 'server', 'fro-bot', 'agent.git'))
   }
@@ -1155,6 +1156,29 @@ describe.skipIf(!hasBinary)('repo skills against the real stock binary (fro-bot/
     expect(source).toBeNull()
     const runnerTemp = box.env.RUNNER_TEMP as string
     expect(readdirSync(runnerTemp).filter(entry => entry.startsWith('fro-bot-repo-skills-'))).toEqual([])
+  }, 300_000)
+
+  it('lists a repo skill with its stored bytes when committed attributes would expand it (export-subst)', async () => {
+    // #given a default branch whose .gitattributes (`export-subst`) and 8 KiB commit message make `git archive` expand each
+    // `$Format:%B$` marker into the message, so a ~12 KB skill would become megabytes
+    const box = newBox()
+    const marker = '$Format:%B$'
+    plant(path.join(box.repo, '.gitattributes'), '* export-subst\n')
+    plant(path.join(box.repo, '.agents', 'skills', 'probe', 'SKILL.md'), skillFile('probe', marker.repeat(1024)))
+    plant(path.join(box.root, 'message.txt'), `big message\n\n${'M'.repeat(8 * 1024)}\n`)
+    publishDefaultBranch(box, path.join(box.root, 'message.txt'))
+
+    // #when a trusted run stages and the real server starts
+    const source = await stage(box, SCHEDULE)
+    expect(source).not.toBeNull()
+    const {handle} = await startServer(box, {repoSkills: source})
+    const probe = (await listSkills(handle)).find(skill => skill.id === 'probe')
+
+    // #then the skill is listed with the markers as committed, not expanded
+    expect(probe).toBeDefined()
+    expect(probe?.content).toContain(marker)
+    expect(probe?.content).not.toContain('MMMMMMMMMM')
+    expect((probe?.content.length ?? 0) < 20_000).toBe(true)
   }, 300_000)
 
   it('ignores a hostile project opencode.json, agent, command and skill frontmatter even on a trusted run', async () => {

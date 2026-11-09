@@ -13,9 +13,11 @@ import {
   checkSourceBudget,
   createRepoSkillsStagingRoot,
   DEFAULT_REPO_SKILLS_LIMITS,
+  parseCatFileBatch,
   parseTreeListing,
   removeRepoSkillsStagingRoot,
   REPO_SKILLS_DIRECTORY_NAME,
+  safeRelativeSkillPath,
   stageDefaultBranchSkills,
 } from './repo-skills.js'
 
@@ -50,34 +52,66 @@ function listFiles(dir: string): string[] {
     .toSorted()
 }
 
-/** An exec adapter that records every command's cwd and arguments and then runs it for real. */
-function recordingExec(): {exec: ExecAdapter; calls: {cwd: string | undefined; args: string[]}[]} {
+interface RecordedCall {
+  readonly command: string
+  readonly cwd: string | undefined
+  readonly args: string[]
+  readonly env: Record<string, string> | undefined
+  readonly timeoutMs: number
+  readonly input: Buffer | undefined
+}
+
+/** An exec adapter that records every command and then runs it for real. */
+function recordingExec(): {exec: ExecAdapter; calls: RecordedCall[]} {
   const real = createExecAdapter()
-  const calls: {cwd: string | undefined; args: string[]}[] = []
+  const calls: RecordedCall[] = []
   const exec: ExecAdapter = {
     ...real,
     execWithTimeout: async (command, args, timeoutMs, options) => {
-      calls.push({cwd: options?.cwd, args: args ?? []})
+      calls.push({command, cwd: options?.cwd, args: args ?? [], env: options?.env, timeoutMs, input: options?.input})
       return (real.execWithTimeout as NonNullable<typeof real.execWithTimeout>)(command, args, timeoutMs, options)
     },
   }
   return {exec, calls}
 }
 
-/** An exec adapter that fakes every git/tar command: `ls-tree` prints `listing`, the rest succeed. */
-function fakeExec(listing: string): {exec: ExecAdapter; commands: string[][]} {
+/** The `git cat-file --batch` framing for one object. */
+function frame(oid: string, content: Buffer | string, type = 'blob', size?: number): Buffer {
+  const body = Buffer.from(content)
+  return Buffer.concat([Buffer.from(`${oid} ${type} ${size ?? body.length}\n`), body, Buffer.from('\n')])
+}
+
+/**
+ * An exec adapter that fakes every git command: `ls-tree` prints `listing`, `cat-file --batch` prints `catFile`, the
+ * rest succeed. Records the commands and what was sent on stdin.
+ */
+function fakeExec(
+  listing: string,
+  catFile: Buffer = Buffer.alloc(0),
+): {exec: ExecAdapter; commands: string[][]; inputs: string[]} {
   const commands: string[][] = []
+  const inputs: string[] = []
   const exec: ExecAdapter = {
     exec: vi.fn(),
     getExecOutput: vi.fn(),
     execWithTimeout: async (command, args, _timeoutMs, options: ExecOptions | undefined) => {
       commands.push([command, ...(args ?? [])])
       if (args?.includes('ls-tree') === true) options?.listeners?.stdout?.(Buffer.from(listing))
+      if (args?.includes('cat-file') === true) {
+        inputs.push(options?.input?.toString('utf8') ?? '')
+        options?.listeners?.stdout?.(catFile)
+      }
       return 0
     },
   }
-  return {exec, commands}
+  return {exec, commands, inputs}
 }
+
+const OID = 'a'.repeat(40)
+
+/** One `git ls-tree -r -l -z` record under the skills root. */
+const blob = (file: string, size = 1, mode = '100644'): string =>
+  `${mode} blob ${'a'.repeat(40)} ${String(size).padStart(7)}\t.agents/skills/${file}\0`
 
 describe('repo-skills', () => {
   let root: string
@@ -202,10 +236,10 @@ describe('repo-skills', () => {
 
       // #then each field is read, with a dash size as null
       expect(entries).toEqual([
-        {mode: '040000', type: 'tree', size: null, path: '.agents/skills/a'},
-        {mode: '100644', type: 'blob', size: 1_234_567, path: '.agents/skills/a/SKILL.md'},
-        {mode: '120000', type: 'blob', size: 10, path: '.agents/skills/a/link'},
-        {mode: '160000', type: 'commit', size: null, path: '.agents/skills/a/sub'},
+        {mode: '040000', type: 'tree', oid: OID, size: null, path: '.agents/skills/a'},
+        {mode: '100644', type: 'blob', oid: OID, size: 1_234_567, path: '.agents/skills/a/SKILL.md'},
+        {mode: '120000', type: 'blob', oid: OID, size: 10, path: '.agents/skills/a/link'},
+        {mode: '160000', type: 'commit', oid: OID, size: null, path: '.agents/skills/a/sub'},
       ])
     })
 
@@ -246,6 +280,7 @@ describe('repo-skills', () => {
     const entry = (type: 'blob' | 'commit' | 'tree', file: string, size: number | null = 1, mode = '100644') => ({
       mode,
       type,
+      oid: OID,
       size,
       path: `.agents/skills/${file}`,
     })
@@ -253,8 +288,8 @@ describe('repo-skills', () => {
     it('ignores the ancestor trees that ls-tree prints above the skills root', () => {
       // #given the .agents and .agents/skills entries and one file
       const entries = [
-        {mode: '040000', type: 'tree' as const, size: null, path: '.agents'},
-        {mode: '040000', type: 'tree' as const, size: null, path: '.agents/skills'},
+        {mode: '040000', type: 'tree' as const, oid: OID, size: null, path: '.agents'},
+        {mode: '040000', type: 'tree' as const, oid: OID, size: null, path: '.agents/skills'},
         entry('tree', 'a', null, '040000'),
         entry('blob', 'a/SKILL.md'),
       ]
@@ -315,6 +350,101 @@ describe('repo-skills', () => {
       // #then six passes and seven fails
       expect(checkSourceBudget([atLimit], DEFAULT_REPO_SKILLS_LIMITS).success).toBe(true)
       expect(unwrapErr(checkSourceBudget([tooDeep], DEFAULT_REPO_SKILLS_LIMITS))).toContain('deep')
+    })
+  })
+
+  describe('safeRelativeSkillPath', () => {
+    it('accepts a plain path under the skills root', () => {
+      // #given / #when / #then
+      expect(unwrapOk(safeRelativeSkillPath('.agents/skills/a/references/x.md'))).toBe(
+        '.agents/skills/a/references/x.md',
+      )
+    })
+
+    it.each([
+      ['a parent segment', '.agents/skills/../escape'],
+      ['a nested parent segment', '.agents/skills/a/../../../escape'],
+      ['a dot segment', '.agents/skills/./x'],
+      ['an empty segment', '.agents/skills//x'],
+      ['a trailing slash', '.agents/skills/a/'],
+      ['an absolute path', '/etc/passwd'],
+      ['a path outside the skills root', '.agents/other/x'],
+      ['a NUL byte', '.agents/skills/a\0b'],
+    ])('refuses %s', (_label, entryPath) => {
+      // #given a path git would not produce
+      // #when validating
+      const error = unwrapErr(safeRelativeSkillPath(entryPath))
+
+      // #then it is refused without echoing the path
+      expect(error).toContain('unsafe')
+      expect(error).not.toContain('escape')
+    })
+  })
+
+  describe('parseCatFileBatch', () => {
+    const expected = (...sizes: number[]) => sizes.map(size => ({oid: OID, size}))
+
+    it('returns each blob body, byte for byte, including NUL and newline bytes', () => {
+      // #given two frames, one with awkward bytes and one empty
+      const first = Buffer.from([0x24, 0x0a, 0x00, 0xff, 0x0a])
+      const raw = Buffer.concat([frame(OID, first), frame(OID, '')])
+
+      // #when parsing against the listing
+      const bodies = unwrapOk(parseCatFileBatch(raw, expected(5, 0), DEFAULT_REPO_SKILLS_LIMITS.maxBytes))
+
+      // #then the bodies are exact
+      expect(bodies.map(body => [...body])).toEqual([[...first], []])
+    })
+
+    it.each([
+      ['a different object id', frame('b'.repeat(40), 'abc'), 'mismatch'],
+      ['a non-blob type', frame(OID, 'abc', 'tree'), 'mismatch'],
+      ['a smaller size than listed', frame(OID, 'ab'), 'mismatch'],
+      ['a missing object', Buffer.from(`${OID} missing\n`), 'missing'],
+      ['a header with no newline', Buffer.from(`${OID} blob 3`), 'truncated'],
+      ['a body cut short', Buffer.concat([Buffer.from(`${OID} blob 3\nab`)]), 'truncated'],
+      ['a missing terminator', Buffer.from(`${OID} blob 3\nabc`), 'truncated'],
+      ['a wrong terminator', Buffer.from(`${OID} blob 3\nabcX`), 'truncated'],
+      ['a garbled header', Buffer.from('hello world\nabc\n'), 'mismatch'],
+      ['trailing bytes after the last frame', Buffer.concat([frame(OID, 'abc'), Buffer.from('extra')]), 'trailing'],
+    ])('fails closed on %s', (_label, raw, word) => {
+      // #given output that disagrees with a listing of one three-byte blob
+      // #when parsing
+      const error = unwrapErr(parseCatFileBatch(raw, expected(3), DEFAULT_REPO_SKILLS_LIMITS.maxBytes))
+
+      // #then it is refused, naming the kind of problem and no content
+      expect(error).toContain(word)
+      expect(error).not.toContain('abc')
+    })
+
+    it('stops at a declared size larger than the listing without reading the body', () => {
+      // #given a header that claims far more than the listing, with no body behind it
+      const raw = Buffer.from(`${OID} blob 99999999\n`)
+
+      // #when parsing
+      const error = unwrapErr(parseCatFileBatch(raw, expected(3), DEFAULT_REPO_SKILLS_LIMITS.maxBytes))
+
+      // #then the running counter refused it
+      expect(error).toContain('exceeds')
+    })
+
+    it('aborts when the running total passes maxBytes even if every size matches its listing', () => {
+      // #given a listing that itself is over the byte limit (defense in depth)
+      const raw = Buffer.concat([frame(OID, 'abcd'), frame(OID, 'efgh')])
+
+      // #when parsing with a limit of seven bytes
+      const error = unwrapErr(parseCatFileBatch(raw, expected(4, 4), 7))
+
+      // #then the counter stopped it
+      expect(error).toContain('exceeds')
+    })
+
+    it('fails when fewer frames arrive than the listing has blobs', () => {
+      // #given one frame for two blobs
+      const error = unwrapErr(parseCatFileBatch(frame(OID, 'abc'), expected(3, 3), DEFAULT_REPO_SKILLS_LIMITS.maxBytes))
+
+      // #then it is truncated
+      expect(error).toContain('truncated')
     })
   })
 
@@ -752,9 +882,12 @@ describe('repo-skills', () => {
           `+refs/heads/main:refs/fro-bot/repo-skills/${path.basename(staging)}`,
         ]),
       )
-      // #and the archive reads that exact private ref, and nothing but the extracted tree remains
-      const archiveCall = calls.find(call => call.args.includes('archive'))
-      expect(archiveCall?.args).toContain(`refs/fro-bot/repo-skills/${path.basename(staging)}`)
+      // #and the listing read that exact private ref, blobs came from cat-file in the throwaway repository, and nothing
+      // but the extracted tree remains
+      const listCall = calls.find(call => call.args.includes('ls-tree'))
+      expect(listCall?.args).toContain(`refs/fro-bot/repo-skills/${path.basename(staging)}`)
+      const catCall = calls.find(call => call.args.includes('cat-file'))
+      expect(catCall?.args).toEqual([`--git-dir=${path.join(staging, 'fetch.git')}`, 'cat-file', '--batch'])
       expect(fs.readdirSync(staging)).toEqual(['source-tree'])
     })
 
@@ -808,14 +941,14 @@ describe('repo-skills', () => {
       expect(fs.readdirSync(staging)).toEqual([])
     })
 
-    it('fails closed when git archive times out', async () => {
-      // #given an exec adapter whose archive step times out
+    it('fails closed when reading the blobs times out', async () => {
+      // #given an exec adapter whose cat-file step times out
       setUpRepos()
       const real = createExecAdapter()
       const exec: ExecAdapter = {
         ...real,
         execWithTimeout: async (command, args, timeoutMs, options) =>
-          args?.includes('archive')
+          args?.includes('cat-file')
             ? 'timed-out'
             : (real.execWithTimeout as NonNullable<typeof real.execWithTimeout>)(command, args, timeoutMs, options),
       }
@@ -943,19 +1076,16 @@ describe('repo-skills', () => {
     })
 
     describe('source budget, checked before anything is materialized', () => {
-      const blob = (file: string, size = 1, mode = '100644'): string =>
-        `${mode} blob ${'a'.repeat(40)} ${String(size).padStart(7)}\t.agents/skills/${file}\0`
-
       const ran = (commands: string[][], word: string): boolean => commands.some(command => command.includes(word))
 
       function expectNothingMaterialized(commands: string[][]): void {
+        expect(ran(commands, 'cat-file')).toBe(false)
         expect(ran(commands, 'archive')).toBe(false)
         expect(ran(commands, 'tar')).toBe(false)
         expect(fs.existsSync(path.join(staging, 'source-tree'))).toBe(false)
-        expect(fs.existsSync(path.join(staging, 'source.tar'))).toBe(false)
       }
 
-      it('rejects a tree with too many entries without archiving or extracting', async () => {
+      it('rejects a tree with too many entries without reading or writing a blob', async () => {
         // #given a listing one entry over the entry budget
         setUpBareDirectories()
         const {exec, commands} = fakeExec(
@@ -965,13 +1095,13 @@ describe('repo-skills', () => {
         // #when staging
         const error = unwrapErr(await stage({exec}))
 
-        // #then it is refused for its size, and git archive never ran
+        // #then it is refused for its size, and no blob was read
         expect(error).toContain('budget')
         expect(error).toContain('entries')
         expectNothingMaterialized(commands)
       })
 
-      it('rejects a tree with too many bytes without archiving or extracting', async () => {
+      it('rejects a tree with too many bytes without reading or writing a blob', async () => {
         // #given one blob a byte over the byte budget
         setUpBareDirectories()
         const {exec, commands} = fakeExec(blob('s/SKILL.md', DEFAULT_REPO_SKILLS_LIMITS.maxBytes + 1))
@@ -1042,21 +1172,22 @@ describe('repo-skills', () => {
         expectNothingMaterialized(commands)
       })
 
-      it('archives and extracts a tree that fits', async () => {
-        // #given a listing within every limit
+      it('materializes a tree that fits from cat-file, with no archive and no tar', async () => {
+        // #given a listing within every limit and a matching cat-file answer
         setUpBareDirectories()
-        const {exec, commands} = fakeExec(blob('s/SKILL.md', 10))
+        const {exec, commands, inputs} = fakeExec(blob('s/SKILL.md', 10), frame(OID, '0123456789'))
 
         // #when staging
-        const staged = await stage({exec})
+        const staged = unwrapOk(await stage({exec}))
 
-        // #then the archive and extract steps ran
-        expect(staged.success).toBe(true)
-        expect(ran(commands, 'archive')).toBe(true)
-        expect(ran(commands, 'tar')).toBe(true)
+        // #then the blob was read by id, written raw, and neither archive nor tar ran
+        expect(inputs).toEqual([`${OID}\n`])
+        expect(fs.readFileSync(path.join(staged as string, 's', 'SKILL.md'), 'utf8')).toBe('0123456789')
+        expect(ran(commands, 'archive')).toBe(false)
+        expect(ran(commands, 'tar')).toBe(false)
       })
 
-      it('runs ls-tree recursively with sizes and NUL separators on the fetched private ref, before the archive', async () => {
+      it('runs ls-tree recursively with sizes and NUL separators on the fetched private ref, before cat-file', async () => {
         // #given a recording adapter over real git
         setUpRepos()
         const {exec, calls} = recordingExec()
@@ -1064,17 +1195,17 @@ describe('repo-skills', () => {
         // #when staging
         unwrapOk(await stage({exec}))
 
-        // #then the listing used -r -l -z -t on the private ref, and came before git archive
+        // #then the listing used -r -l -z -t on the private ref, and came before cat-file
         const listIndex = calls.findIndex(call => call.args.includes('ls-tree'))
-        const archiveIndex = calls.findIndex(call => call.args.includes('archive'))
+        const catFileIndex = calls.findIndex(call => call.args.includes('cat-file'))
         expect(calls[listIndex]?.args).toEqual(
           expect.arrayContaining(['-r', '-l', '-z', '-t', `refs/fro-bot/repo-skills/${path.basename(staging)}`]),
         )
         expect(listIndex).toBeGreaterThan(-1)
-        expect(listIndex).toBeLessThan(archiveIndex)
+        expect(listIndex).toBeLessThan(catFileIndex)
       })
 
-      it('refuses a submodule committed under the skills root, before the archive', async () => {
+      it('refuses a submodule committed under the skills root, before any blob is read', async () => {
         // #given a default branch with a gitlink inside a skill
         setUpRepos()
         git(origin, 'update-index', '--add', '--cacheinfo', `160000,${'1'.repeat(40)},.agents/skills/probe/sub`)
@@ -1084,9 +1215,9 @@ describe('repo-skills', () => {
         // #when staging
         const error = unwrapErr(await stage({exec}))
 
-        // #then the whole source is refused and nothing was archived
+        // #then the whole source is refused and no blob was read
         expect(error).toContain('submodule')
-        expect(calls.some(call => call.args.includes('archive'))).toBe(false)
+        expect(calls.some(call => call.args.includes('cat-file'))).toBe(false)
         expect(fs.readdirSync(staging)).toEqual([])
       })
 
@@ -1101,9 +1232,9 @@ describe('repo-skills', () => {
         // #when staging against a tiny budget
         const error = unwrapErr(await stage({exec, limits: {maxSourceEntries: 2}}))
 
-        // #then the symlink was counted (probe/, SKILL.md, references/, r.md, link.md) and nothing was archived
+        // #then the symlink was counted (probe/, SKILL.md, references/, r.md, link.md) and no blob was read
         expect(error).toContain('5 entries')
-        expect(calls.some(call => call.args.includes('archive'))).toBe(false)
+        expect(calls.some(call => call.args.includes('cat-file'))).toBe(false)
       })
 
       it('admits a file exactly at the depth limit and refuses one a directory deeper', async () => {
@@ -1130,7 +1261,7 @@ describe('repo-skills', () => {
         expect(admitted.admitted).toEqual(['probe'])
         expect(fs.existsSync(path.join(staging, 'skills', 'probe', 'a', 'b', 'c', 'd', 'e', 'f', 'deep.md'))).toBe(true)
 
-        // #and one directory deeper is refused before the archive runs
+        // #and one directory deeper is refused before any blob is read
         fs.rmSync(staging, {recursive: true, force: true})
         fs.mkdirSync(staging)
         writeFile(
@@ -1142,7 +1273,244 @@ describe('repo-skills', () => {
         const {exec, calls} = recordingExec()
         const error = unwrapErr(await stage({exec}))
         expect(error).toContain('deep')
-        expect(calls.some(call => call.args.includes('archive'))).toBe(false)
+        expect(calls.some(call => call.args.includes('cat-file'))).toBe(false)
+      })
+    })
+
+    describe('raw blob materialization (no git archive, no attribute processing)', () => {
+      const MARKER = '$Format:%B$'
+
+      /** `git cat-file blob` of a path in origin's HEAD: the stored bytes. */
+      const stored = (file: string): Buffer =>
+        execFileSync('git', ['cat-file', 'blob', `HEAD:${file}`], {cwd: origin, env: GIT_ENV})
+
+      /** The reviewer's probe: export-subst, ident and eol attributes plus a large commit message. */
+      function commitExpandingAttributes(): {skill: string; ident: string; crlf: string} {
+        const skill = skillMd('probe', MARKER.repeat(1024))
+        const ident = '$Id$\nbody\n'
+        const crlf = 'one\ntwo\n'
+        writeFile(path.join(origin, '.gitattributes'), '* export-subst\n*.ident.md ident\n*.crlf.md text eol=crlf\n')
+        writeFile(path.join(origin, '.agents', 'skills', 'probe', 'SKILL.md'), skill)
+        writeFile(path.join(origin, '.agents', 'skills', 'probe', 'references', 'x.ident.md'), ident)
+        writeFile(path.join(origin, '.agents', 'skills', 'probe', 'references', 'x.crlf.md'), crlf)
+        writeFile(path.join(root, 'message.txt'), `big message\n\n${'M'.repeat(8 * 1024)}\n`)
+        git(origin, 'add', '-A')
+        git(origin, 'commit', '-qF', path.join(root, 'message.txt'))
+        return {skill, ident, crlf}
+      }
+
+      it('stages the stored bytes of a blob that export-subst would expand past the budget', async () => {
+        // #given a default branch whose attributes make `git archive` turn ~12 KB of blobs into megabytes
+        setUpRepos()
+        const {skill} = commitExpandingAttributes()
+        expect(stored('.agents/skills/probe/SKILL.md').length).toBeLessThan(20_000)
+
+        // #when staging, reading what was staged, and admitting
+        const sourceDir = unwrapOk(await stage()) as string
+        const stagedBytes = fs.readFileSync(path.join(sourceDir, 'probe', 'SKILL.md'))
+        const bundled = path.join(root, 'bundled', '@fro.bot', 'systematic', 'skills')
+        writeFile(path.join(bundled, 'ce-review', 'SKILL.md'), skillMd('ce:review'))
+        const admitted = unwrapOk(
+          await admitRepoSkills({
+            sourceDir,
+            stagingRoot: staging,
+            bundledSkillsDirectories: [bundled],
+            logger: createMockLogger(),
+          }),
+        )
+
+        // #then the staged and the admitted skill are the raw blob: markers intact, nothing expanded
+        expect(admitted.admitted).toEqual(['probe'])
+        for (const staged of [stagedBytes, fs.readFileSync(path.join(staging, 'skills', 'probe', 'SKILL.md'))]) {
+          expect(staged.equals(Buffer.from(skill))).toBe(true)
+          expect(staged.toString('utf8')).toContain(MARKER)
+          expect(staged.length).toBeLessThan(DEFAULT_REPO_SKILLS_LIMITS.maxBytes)
+        }
+      })
+
+      it('does not apply ident or eol conversion to staged blobs', async () => {
+        // #given blobs with ident and text eol=crlf attributes
+        setUpRepos()
+        const {ident, crlf} = commitExpandingAttributes()
+
+        // #when staging
+        const sourceDir = unwrapOk(await stage()) as string
+
+        // #then the bytes equal what is stored: `$Id$` is not expanded and no CR was added
+        const identBytes = fs.readFileSync(path.join(sourceDir, 'probe', 'references', 'x.ident.md'))
+        const crlfBytes = fs.readFileSync(path.join(sourceDir, 'probe', 'references', 'x.crlf.md'))
+        expect(identBytes.toString('utf8')).toBe(ident)
+        expect(crlfBytes.toString('utf8')).toBe(crlf)
+        expect(crlfBytes.includes(0x0d)).toBe(false)
+        expect(identBytes.equals(stored('.agents/skills/probe/references/x.ident.md'))).toBe(true)
+      })
+
+      it('never runs git archive or tar, and runs cat-file --batch bounded, in the staging root, with git redirection stripped', async () => {
+        // #given a recording adapter over real git, and a hostile GIT_DIR in the environment
+        setUpRepos()
+        const {exec, calls} = recordingExec()
+
+        // #when staging
+        unwrapOk(await stage({exec, env: {...GIT_ENV, GIT_DIR: '/evil/.git', GIT_WORK_TREE: '/evil'}}))
+
+        // #then no archive or tar, one cat-file whose stdin is the object ids, and every command was bounded and scrubbed
+        expect(calls.some(call => call.args.includes('archive') || call.command === 'tar')).toBe(false)
+        const catCalls = calls.filter(call => call.args.includes('cat-file'))
+        expect(catCalls).toHaveLength(1)
+        expect(catCalls[0]?.input?.toString('utf8')).toMatch(/^([\da-f]{40}\n)+$/)
+        expect(new Set(calls.map(call => call.cwd))).toEqual(new Set([staging]))
+        expect(calls.every(call => call.timeoutMs === DEFAULT_REPO_SKILLS_LIMITS.commandTimeoutMs)).toBe(true)
+        expect(calls.every(call => call.env?.GIT_DIR === undefined && call.env?.GIT_WORK_TREE === undefined)).toBe(true)
+      })
+
+      it('writes files 0600 (0700 when executable) and directories 0700', async () => {
+        // #given a skill with a plain file and an executable script
+        setUpRepos()
+        writeFile(path.join(origin, '.agents', 'skills', 'probe', 'scripts', 'run.sh'), '#!/bin/sh\n')
+        git(origin, 'add', '-A')
+        git(origin, 'update-index', '--chmod=+x', '.agents/skills/probe/scripts/run.sh')
+        git(origin, 'commit', '-qm', 'script')
+
+        // #when staging
+        const sourceDir = unwrapOk(await stage()) as string
+
+        // #then modes are owner-only, and the executable bit survives as owner-execute
+        const mode = (file: string): number => fs.statSync(path.join(sourceDir, file)).mode & 0o777
+        expect(mode('probe/SKILL.md')).toBe(0o600)
+        expect(mode('probe/scripts/run.sh')).toBe(0o700)
+        expect(mode('probe')).toBe(0o700)
+        expect(mode('probe/scripts')).toBe(0o700)
+      })
+
+      it('creates a committed symlink as a real, unfollowed symlink that admission then rejects', async () => {
+        // #given a skill holding a symlink to a file outside it
+        setUpRepos()
+        fs.symlinkSync('/etc/hosts', path.join(origin, '.agents', 'skills', 'probe', 'references', 'link.md'))
+        git(origin, 'add', '-A')
+        git(origin, 'commit', '-qm', 'link')
+        const bundled = path.join(root, 'bundled', '@fro.bot', 'systematic', 'skills')
+        writeFile(path.join(bundled, 'ce-review', 'SKILL.md'), skillMd('ce:review'))
+
+        // #when staging, inspecting the link, and admitting
+        const sourceDir = unwrapOk(await stage()) as string
+        const link = path.join(sourceDir, 'probe', 'references', 'link.md')
+        const isLink = fs.lstatSync(link).isSymbolicLink()
+        const target = fs.readlinkSync(link)
+        const admitted = unwrapOk(
+          await admitRepoSkills({
+            sourceDir,
+            stagingRoot: staging,
+            bundledSkillsDirectories: [bundled],
+            logger: createMockLogger(),
+          }),
+        )
+
+        // #then it is a symlink with the stored target, and the whole skill is rejected
+        expect(isLink).toBe(true)
+        expect(target).toBe('/etc/hosts')
+        expect(admitted.skipped).toEqual([{id: 'probe', reason: 'symlink'}])
+        expect(admitted.directory).toBeNull()
+      })
+
+      const listing = (...files: string[]): string => files.map(file => blob(file, 3)).join('')
+
+      it.each([
+        ['a smaller size than listed', frame(OID, 'ab'), 'mismatch'],
+        ['a different type', frame(OID, 'abc', 'tree'), 'mismatch'],
+        ['a missing object', Buffer.from(`${OID} missing\n`), 'missing'],
+        ['a larger size than listed', frame(OID, 'abcd'), 'exceeds'],
+        ['trailing output', Buffer.concat([frame(OID, 'abc'), Buffer.from('junk')]), 'trailing'],
+      ])('fails closed on %s and leaves nothing behind', async (_label, catFile, word) => {
+        // #given a listing of one three-byte blob and a cat-file answer that disagrees with it
+        setUpBareDirectories()
+        const {exec} = fakeExec(listing('s/SKILL.md'), catFile)
+
+        // #when staging
+        const error = unwrapErr(await stage({exec}))
+
+        // #then it is refused and the staging root holds nothing
+        expect(error).toContain(word)
+        expect(fs.readdirSync(staging)).toEqual([])
+      })
+
+      it('aborts when cat-file output outgrows the listing, without parsing it', async () => {
+        // #given a ten-byte listing and two megabytes of output
+        setUpBareDirectories()
+        const {exec} = fakeExec(blob('s/SKILL.md', 10), Buffer.alloc(2 * 1024 * 1024, 0x61))
+
+        // #when staging
+        const error = unwrapErr(await stage({exec}))
+
+        // #then the capped read refused it and nothing is left
+        expect(error).toContain('exceeds')
+        expect(fs.readdirSync(staging)).toEqual([])
+      })
+
+      it('fails closed, writing nothing, when the same path is listed twice', async () => {
+        // #given two entries for one path (git never writes this)
+        setUpBareDirectories()
+        const {exec} = fakeExec(
+          listing('s/SKILL.md', 's/SKILL.md'),
+          Buffer.concat([frame(OID, 'abc'), frame(OID, 'abc')]),
+        )
+
+        // #when staging
+        const error = unwrapErr(await stage({exec}))
+
+        // #then the exclusive create refused the second and the first was cleaned up
+        expect(error).toContain('write')
+        expect(fs.readdirSync(staging)).toEqual([])
+      })
+
+      it.each(['s/../../escape.md', 's/./x.md', 's//x.md'])(
+        'refuses the unsafe path %j before any blob is read or written',
+        async file => {
+          // #given a listing with a path git would not produce
+          setUpBareDirectories()
+          const {exec, commands} = fakeExec(listing(file), frame(OID, 'abc'))
+
+          // #when staging
+          const error = unwrapErr(await stage({exec}))
+
+          // #then it is refused, cat-file never ran, and nothing escaped the extract root
+          expect(error).toContain('unsafe')
+          expect(commands.some(command => command.includes('cat-file'))).toBe(false)
+          expect(fs.readdirSync(staging)).toEqual([])
+          expect(fs.existsSync(path.join(root, 'escape.md'))).toBe(false)
+        },
+      )
+
+      it('refuses an entry with a mode other than file, executable file, symlink or tree', async () => {
+        // #given a legacy group-writable mode
+        setUpBareDirectories()
+        const {exec} = fakeExec(blob('s/SKILL.md', 3, '100664'), frame(OID, 'abc'))
+
+        // #when staging
+        const error = unwrapErr(await stage({exec}))
+
+        // #then it fails closed, nothing left
+        expect(error).toContain('mode')
+        expect(fs.readdirSync(staging)).toEqual([])
+      })
+
+      it('fails closed and cleans up when cat-file times out', async () => {
+        // #given cat-file that times out after the listing
+        setUpRepos()
+        const real = createExecAdapter()
+        const exec: ExecAdapter = {
+          ...real,
+          execWithTimeout: async (command, args, timeoutMs, options) =>
+            args?.includes('cat-file')
+              ? 'timed-out'
+              : (real.execWithTimeout as NonNullable<typeof real.execWithTimeout>)(command, args, timeoutMs, options),
+        }
+
+        // #when staging
+        const error = unwrapErr(await stage({exec}))
+
+        // #then
+        expect(error).toContain('timed out')
+        expect(fs.readdirSync(staging)).toEqual([])
       })
     })
   })
