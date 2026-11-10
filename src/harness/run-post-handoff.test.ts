@@ -252,6 +252,8 @@ describe('run -> post handoff: session state is saved only for a run that starte
     process.env.GITHUB_EVENT_NAME = 'issues'
     process.env.RUNNER_OS = 'Linux'
     process.env.RUNNER_TEMP = tempDir
+    // CI sets GITHUB_JOB, which job-qualifies the save key; pin it so the expected key holds everywhere.
+    vi.stubEnv('GITHUB_JOB', '')
     delete process.env.SKIP_CACHE
     delete process.env.OPENCODE_PROMPT_ARTIFACT
 
@@ -266,6 +268,7 @@ describe('run -> post handoff: session state is saved only for a run that starte
   })
 
   afterEach(async () => {
+    vi.unstubAllEnvs()
     await fs.rm(tempDir, {recursive: true, force: true})
     for (const key of [
       'XDG_DATA_HOME',
