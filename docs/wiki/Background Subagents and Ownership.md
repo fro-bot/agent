@@ -13,9 +13,8 @@ sources:
   - packages/runtime/src/agent/shell-notice.ts
   - packages/runtime/src/agent/directory-quiescence-v2.ts
   - packages/runtime/src/agent/server-v2.ts
-  - src/features/agent/streaming.ts
   - src/features/agent/streaming-v2.ts
-  - src/features/agent/session-poll.ts
+  - src/features/agent/streaming-v2.ts
   - src/features/agent/drain-v2.ts
   - src/harness/phases/execute.ts
   - src/harness/phases/release-v2.ts
@@ -33,7 +32,6 @@ sources:
   - packages/gateway/src/execute/opencode-generation.ts
   - packages/gateway/src/execute/repo-quiescence-v2.ts
   - packages/opencode-plugin/src/task-reuse-guard.ts
-  - src/services/setup/no-task-reuse-config.ts
   - src/services/setup/ci-config-v2.ts
   - packages/runtime/src/agent/permission-rules-v2.ts
   - docs/solutions/integration-issues/permission-ask-dropped-by-ownership-filter-2026-09-19.md

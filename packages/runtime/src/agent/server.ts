@@ -491,53 +491,17 @@ export interface EnsureOpenCodeOptions {
 }
 
 /**
- * Canonical form for comparing a pinned OpenCode version with what a binary reports.
- *
- * The harness binary self-reports `<base>+harness.<sha>` (`packages/harness/scripts/verify-binary.ts`
- * pins that exactly), while the Action's setup also accepts the equivalent `<base>-harness.<sha>`
- * release-tag spelling as `opencode-version`. The installer also accepts a leading `v` (`v1.18.34`,
- * `v1.18.34-harness.<sha>`; see `assertValidVersion` and `buildDownloadUrl` in services/setup/opencode.ts),
- * and no binary prints one. Only those two spelling differences are folded -- a single `v` that precedes a
- * digit, and `-harness.` vs `+harness.`. Everything else (including `latest`, `vlatest`, and partial versions,
- * which no binary ever prints) compares as-is, so those never match.
+ * Provision OpenCode and this invocation's environment. Setup ALWAYS runs: it carries per-invocation work that no
+ * binary already on the runner can stand in for (gh CLI auth, git identity, the Systematic config, the provider keys),
+ * so a binary that reports the pinned version -- on a self-hosted runner, or left on PATH by an earlier step in the
+ * same job -- is never a reason to skip it. Setup stays cheap on a warm runner: it restores the binary from the tools
+ * cache, digest-checked, rather than downloading it again.
  */
-function canonicalOpenCodeVersion(version: string): string {
-  return version
-    .trim()
-    .replace(/^v(?=\d)/, '')
-    .replace(/^(\d+\.\d+\.\d+)-harness\./, '$1+harness.')
-}
-
 export async function ensureOpenCodeAvailable(
   options: EnsureOpenCodeOptions,
   setupAdapter: SetupAdapter,
 ): Promise<EnsureOpenCodeResult> {
   const {logger, opencodeVersion} = options
-  const existingPath = process.env.OPENCODE_PATH ?? null
-  const check = await setupAdapter.verifyOpenCodeAvailable(existingPath, logger)
-
-  // An existing binary is reused only when it reports exactly the pinned version, harness suffix
-  // included. Anything else that merely answers `--version` -- stock opencode, an older harness build,
-  // a global @fro.bot/harness shim on PATH -- must not displace the pinned, checksum-verified download.
-  if (check.available && check.version != null) {
-    if (canonicalOpenCodeVersion(check.version) === canonicalOpenCodeVersion(opencodeVersion)) {
-      logger.info('OpenCode already available', {version: check.version})
-      return {path: existingPath ?? 'opencode', version: check.version, didSetup: false}
-    }
-    const mismatch = {
-      foundVersion: check.version,
-      requestedVersion: opencodeVersion,
-      source: existingPath === null ? 'PATH' : 'OPENCODE_PATH',
-    }
-    // An explicit OPENCODE_PATH is an operator choice about to be replaced; surface that louder than a PATH hit.
-    if (existingPath === null) {
-      logger.info('Existing OpenCode does not match the pinned version, running auto-setup', mismatch)
-    } else {
-      logger.warning('Existing OpenCode does not match the pinned version, running auto-setup', mismatch)
-    }
-  } else {
-    logger.info('OpenCode not found, running auto-setup', {requestedVersion: opencodeVersion})
-  }
   const setupInputs: SetupInputs = {
     opencodeVersion,
     authJson: options.authJson,
@@ -554,17 +518,25 @@ export async function ensureOpenCodeAvailable(
   }
 
   // These take different halves of the same install on purpose. `addToPath` wants the directory;
-  // OPENCODE_PATH is read back as an executable — by `verifyOpenCodeAvailable` above, by
-  // @fro.bot/harness's `resolveBinary()`, and by every child that inherits it (filterAgentEnv
-  // allows the OPENCODE_ prefix through). Assigning the directory here made all three exec it.
+  // OPENCODE_PATH is read back as an executable — by @fro.bot/harness's `resolveBinary()` and by every child
+  // that inherits it (filterAgentEnv allows the OPENCODE_ prefix through). Assigning the directory here made
+  // them exec it.
   setupAdapter.addToPath(setupResult.opencodePath)
+  const replacedPath = process.env.OPENCODE_PATH
+  if (replacedPath != null && replacedPath !== '' && replacedPath !== setupResult.opencodeBinaryPath) {
+    // The Action runs the binary setup verified, not whatever the operator pointed OPENCODE_PATH at.
+    logger.warning('OPENCODE_PATH points at a different binary; the Action uses the one setup installed', {
+      replacedPath,
+      usedPath: setupResult.opencodeBinaryPath,
+    })
+  }
   process.env.OPENCODE_PATH = setupResult.opencodeBinaryPath
   // Log both halves: the whole failure mode here is "which of these two strings got exported",
   // so a recurrence should be diagnosable from the run log alone.
-  logger.info('Auto-setup completed', {
+  logger.info('OpenCode setup completed', {
     version: setupResult.opencodeVersion,
     path: setupResult.opencodePath,
     binaryPath: setupResult.opencodeBinaryPath,
   })
-  return {path: setupResult.opencodeBinaryPath, version: setupResult.opencodeVersion, didSetup: true}
+  return {path: setupResult.opencodeBinaryPath, version: setupResult.opencodeVersion}
 }

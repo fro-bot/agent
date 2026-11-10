@@ -1,8 +1,7 @@
 /**
- * build-platform.test.ts — workflow guard + enforceBunVersion coverage + source-tree mode.
+ * build-platform.test.ts — enforceBunVersion coverage + source-tree mode.
  *
  * Tests:
- *   1. Workflow guard: harness-release.yaml installs workspace dependencies before the harness build.
  *   2. enforceBunVersion: exact match → no throw/exit; mismatch → process.exit(1);
  *      bun not found → process.exit(1).
  *   3. parseArgs: --source-tree parsed into BuildArgs; --integration-commit still required.
@@ -19,9 +18,7 @@
 import type {BuildArgs} from './build-platform.js'
 import {execFileSync, spawnSync} from 'node:child_process'
 import {readdirSync, readFileSync, statSync, writeFileSync} from 'node:fs'
-import path from 'node:path'
 import process from 'node:process'
-import {fileURLToPath} from 'node:url'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {HARNESS_BUN_VERSION} from '../src/bun-version.js'
 import {buildHarnessVersion} from '../src/version.js'
@@ -39,27 +36,6 @@ import {
   TARGET_ORIGINAL,
   verifyBuiltBinary,
 } from './build-platform.js'
-
-// ---------------------------------------------------------------------------
-// Drift guard
-// ---------------------------------------------------------------------------
-
-describe('drift guard: harness-release.yaml', () => {
-  it('installs workspace dependencies before building the harness package', async () => {
-    // #given — harness build imports root tsconfig/tooling, so release CI must install the workspace, not just the package.
-    const thisDir = path.dirname(fileURLToPath(import.meta.url))
-    const repoRoot = path.resolve(thisDir, '..', '..', '..')
-    const workflowPath = path.join(repoRoot, '.github', 'workflows', 'harness-release.yaml')
-
-    // #when
-    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs')
-    const content = realFs.readFileSync(workflowPath, 'utf8')
-
-    // #then
-    expect(content).toContain('run: bun install --frozen-lockfile')
-    expect(content).not.toContain('run: bun install --filter @fro.bot/harness --frozen-lockfile')
-  })
-})
 
 // ---------------------------------------------------------------------------
 // Module-level mocks (hoisted by Vitest)

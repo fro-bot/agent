@@ -1,17 +1,16 @@
 # AGENT MODULE
 
-OpenCode SDK execution with GitHub context injection, multi-section prompt construction, and UX feedback loops.
+OpenCode V2 execution with GitHub context injection, multi-section prompt construction, and UX feedback loops.
 
 ## WHERE TO LOOK
 
 | Component     | File               | Responsibility                                                          |
 | ------------- | ------------------ | ----------------------------------------------------------------------- |
-| **Execution** | `execution.ts`     | SDK session creation, prompt retry loop, result collection (178 L)      |
-| **Prompting** | `prompt-sender.ts` | Prompt body construction, model resolution (73 L)                       |
-| **Retry**     | `retry.ts`         | Retry constants, `runPromptAttempt` with event stream (94 L)            |
-| **Server**    | `server.ts`        | SDK server bootstrap, health check, setup option wiring (110 L)         |
-| **Polling**   | `session-poll.ts`  | Poll for session completion, event processor shutdown (110 L)           |
-| **Streaming** | `streaming.ts`     | Event stream processing, artifact detection (137 L)                     |
+| **Execution** | `execution-v2.ts` | V2 session creation, prompt attempts, result collection |
+| **Prompting** | `prompt-sender-v2.ts` | Prompt submission to a V2 session, model resolution |
+| **Retry**     | `retry-v2.ts`      | `runPromptAttemptV2` with the event stream |
+| **Polling**   | `session-poll-v2.ts` | Completion observation, event processor shutdown |
+| **Streaming** | `streaming-v2.ts`  | V2 event stream processing, artifact detection |
 | **Context**   | `context.ts`       | Gathers event data from NormalizedEvent, diff, hydrated context         |
 | **UX**        | `reactions.ts`     | Emojis (👀/🎉/😕), `agent: working` label state machine (140 L)         |
 | **Prompt**    | `prompt.ts`        | Multi-section prompt with response protocol and output contract (420 L) |
@@ -21,7 +20,7 @@ OpenCode SDK execution with GitHub context injection, multi-section prompt const
 
 ## KEY EXPORTS
 
-- `executeOpenCode(prompt, config, logger)`: Main SDK execution entry point
+- `executeOpenCodeV2(...)`: Main execution entry point (V2 server, raw HTTP/SSE)
 - `collectAgentContext(logger)`: Hydrates event metadata from NormalizedEvent
 - `buildAgentPrompt(options, logger)`: Compiles multi-section prompt
 - `buildTaskSection(context, promptInput, resolvedMode)`: Task directive with append-mode and Delivery Mode preamble
@@ -83,13 +82,12 @@ The Action derives the response surface from trusted routing context and carries
 
 ## PATTERNS
 
-- **SDK Lifecycle (RFC-013)**: Spawn server → connect client → create session → send prompt → stream events → close
-- **No `question` tool in CI**: `bootstrapOpenCodeServer` (runtime `server.ts`) pins `OPENCODE_CLIENT=fro-bot-action` and clears `OPENCODE_ENABLE_QUESTION_TOOL` so upstream never registers the tool (`tool/registry.ts:207`); a pending question has no server timeout and nobody can answer. Do not rely on `permission.question: deny` — an agent-level `allow` (a plugin or custom agent can ship one) overrides it. Do not add `question.*` stream handling unless the tool is re-enabled
-- **Task-reuse guard at server start**: `server-adapter.ts`'s `bootstrapOpenCodeServer` (the Action's only server-start path) writes the guard plugin file and passes `{plugin: [guard spec]}` as the runtime bootstrap's `config` option, which the SDK sends as `OPENCODE_CONFIG_CONTENT` — a layer loaded after the global, project and `.opencode` config, so none of them can drop it. It returns an `err` without starting if the file write fails, covers `didSetup: false` runs where `runSetup` never executed, and never reads or edits a user config file. The gateway uses the runtime bootstrap directly with no config and is unaffected (#1757)
-- **Per-message usage accounting**: Upstream reports `tokens`/`cost` on each assistant MESSAGE for that message only (new message per prompt-loop iteration; one message re-fires `message.updated`). `processEventStream` keeps `usageByMessage` keyed by message id (latest wins), `summarizeMessageUsage` sums it across all owned sessions, and `executeOpenCode` merges retry attempts by message id via `mergeAttemptUsage`. Never reduce this to per-session latest-wins (drops every turn but the last). No resumed-session baseline filter is needed — SSE delivers only post-subscribe events
-- **Connection Retry**: 30 retries with 1s delay to account for async server startup
+- **Lifecycle**: Start the V2 server (`startActionOpenCodeV2`) → create or continue a session → send prompt → stream events → shut down
+- **No `question` tool in CI**: nobody can answer in CI and a pending question blocks until the deadline (#1756), so the V2 permission rules (`buildPermissionRulesV2`) deny it
+- **Task-reuse guard**: the `@fro.bot/opencode-plugin` guard rejects a `subagent` call that carries a `sessionID`, so each background job has its own child session
+- **Per-message usage accounting**: Upstream reports `tokens`/`cost` on each assistant MESSAGE for that message only (new message per prompt-loop iteration; one message re-fires `message.updated`). `processEventStreamV2` keeps `usageByMessage` keyed by message id (latest wins), `summarizeMessageUsage` sums it across all owned sessions, and `executeOpenCode` merges retry attempts by message id via `mergeAttemptUsage`. Never reduce this to per-session latest-wins (drops every turn but the last). No resumed-session baseline filter is needed — SSE delivers only post-subscribe events
 - **V2 has no post-send retry**: a V2 turn that fails after the prompt was sent ends the run (V2 retries transient provider errors itself); only a stream that never connected, or a prompt the server refused, is sent again. A transport failure of the POST is `sendUncertain`: never resent, save declined. V1 keeps its continuation-prompt loop
-- **Event Streaming**: SSE subscription provides real-time progress logging to CI console. The SDK stream is lazy and OpenCode replays nothing to a late connection, so `runPromptAttempt` waits for the stream's `server.connected` frame (reported by `processEventStream`'s `onStreamConnected`, handled before the unarmed-turn guard) before the baseline read and `startPrompt`, bounded by `EVENT_STREAM_CONNECT_TIMEOUT_MS` (10 s) and the execution deadline. Only a new prompt waits; a stream that ends or stays silent first fails the attempt as `submit_failed` with nothing sent, and a deadline expiry rejects as `DeadlineExceededError`
+- **Event Streaming**: SSE subscription provides real-time progress logging to CI console. The SDK stream is lazy and OpenCode replays nothing to a late connection, so `runPromptAttemptV2` waits for the stream's `server.connected` frame (reported by `processEventStream`'s `onStreamConnected`, handled before the unarmed-turn guard) before the baseline read and `startPrompt`, bounded by `EVENT_STREAM_CONNECT_TIMEOUT_MS` (10 s) and the execution deadline. Only a new prompt waits; a stream that ends or stays silent first fails the attempt as `submit_failed` with nothing sent, and a deadline expiry rejects as `DeadlineExceededError`
 - **Reaction-based UX**: Non-fatal state machine (Eyes → Hooray/Confused); failures never crash execution
 - **Context Budgeting**: Two-tier enforcement (50 files fetched, 20 files injected into prompt)
 - **NormalizedEvent Intake**: `collectAgentContext` reads from `NormalizedEvent` (not raw payloads)

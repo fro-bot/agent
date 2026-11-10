@@ -5,7 +5,6 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import {fileURLToPath} from 'node:url'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import {buildCachePaths} from './paths.js'
 import {restoreCache} from './restore.js'
 import {saveCache} from './save.js'
 
@@ -32,72 +31,6 @@ function loadGetCacheVersion(): (
   }
   return cacheUtils.getCacheVersion
 }
-
-describe('buildCachePaths', () => {
-  const storagePath = '/tmp/workspace/storage'
-  const projectIdPath = '/tmp/workspace/.project-id'
-
-  it('includes opencode.db (and no -wal/-shm sidecars) for a sqlite backend', async () => {
-    const paths = await buildCachePaths(storagePath, projectIdPath, '1.2.0')
-
-    expect(paths).toEqual([storagePath, projectIdPath, path.join('/tmp/workspace', 'opencode.db')])
-  })
-
-  it('omits opencode.db entirely for a non-sqlite backend', async () => {
-    const paths = await buildCachePaths(storagePath, projectIdPath, '1.0.0')
-
-    expect(paths).toEqual([storagePath, projectIdPath])
-  })
-
-  it('omits projectIdPath when not provided', async () => {
-    const paths = await buildCachePaths(storagePath, undefined, '1.0.0')
-
-    expect(paths).toEqual([storagePath])
-  })
-
-  describe('with a null opencodeVersion', () => {
-    // A null version makes isSqliteBackend probe process.env.XDG_DATA_HOME (or
-    // ~/.local/share) for a global opencode.db, not anything derived from storagePath —
-    // so the result of buildCachePaths(..., null) depends on filesystem state at call
-    // time, not purely on its arguments. Restore and save must therefore be called with
-    // the same (non-null, ideally) version for the shared-hash guarantee this module
-    // exists for to hold; passing null on one side and a string on the other can make the
-    // two calls disagree about whether opencode.db is included at all.
-    let xdgDataHome: string
-    let originalXdgDataHome: string | undefined
-
-    beforeEach(async () => {
-      xdgDataHome = await fs.mkdtemp(path.join(os.tmpdir(), 'paths-test-xdg-'))
-      originalXdgDataHome = process.env.XDG_DATA_HOME
-      process.env.XDG_DATA_HOME = xdgDataHome
-    })
-
-    afterEach(async () => {
-      if (originalXdgDataHome === undefined) {
-        delete process.env.XDG_DATA_HOME
-      } else {
-        process.env.XDG_DATA_HOME = originalXdgDataHome
-      }
-      await fs.rm(xdgDataHome, {recursive: true, force: true})
-    })
-
-    it('includes opencode.db when the global db exists on disk', async () => {
-      const dbDir = path.join(xdgDataHome, 'opencode')
-      await fs.mkdir(dbDir, {recursive: true})
-      await fs.writeFile(path.join(dbDir, 'opencode.db'), 'data')
-
-      const paths = await buildCachePaths(storagePath, projectIdPath, null)
-
-      expect(paths).toEqual([storagePath, projectIdPath, path.join('/tmp/workspace', 'opencode.db')])
-    })
-
-    it('omits opencode.db when the global db does not exist on disk', async () => {
-      const paths = await buildCachePaths(storagePath, projectIdPath, null)
-
-      expect(paths).toEqual([storagePath, projectIdPath])
-    })
-  })
-})
 
 function createTestLogger() {
   return {
@@ -132,7 +65,7 @@ describe('restore/save cache-version parity (adapter boundary)', () => {
     // A non-empty opencode.db with no -wal beside it: checkpointDatabase sees a missing
     // write-ahead log and reports 'nothing-to-checkpoint' without ever opening the file as
     // SQLite, so this needs no real database — just a nonzero-size file at the path
-    // buildCachePaths (called with a sqlite-backend version) selects.
+    // buildCachePathsV2 selects.
     await fs.writeFile(path.join(tempDir, 'opencode.db'), 'db data')
   })
 
@@ -147,7 +80,7 @@ describe('restore/save cache-version parity (adapter boundary)', () => {
     const saveCacheFn = vi.fn<CacheAdapter['saveCache']>().mockResolvedValue(1)
 
     // #given restoreCache and saveCache each driven with the same components, storage
-    // paths, and a sqlite-backend opencode version, with the object store disabled
+    // paths, with the object store disabled
     // (storeConfig omitted) and a spy CacheAdapter standing in for @actions/cache
     await restoreCache({
       components: testComponents,
@@ -155,7 +88,6 @@ describe('restore/save cache-version parity (adapter boundary)', () => {
       storagePath,
       authPath,
       projectIdPath,
-      opencodeVersion: '1.2.0',
       cacheAdapter: {restoreCache: restoreCacheFn, saveCache: async () => 1},
     })
 
@@ -166,14 +98,15 @@ describe('restore/save cache-version parity (adapter boundary)', () => {
       storagePath,
       authPath,
       projectIdPath,
-      opencodeVersion: '1.2.0',
       cacheAdapter: {restoreCache: async () => undefined, saveCache: saveCacheFn},
     })
 
     // #when reading the exact path lists each real call site handed its adapter -- both
     // sides must actually have reached it, or an early return on either (SKIP_CACHE, a
     // declined save) would leave this comparing two fallbacks and passing for nothing
-    expect(restoreCacheFn).toHaveBeenCalledTimes(1)
+    //
+    // (A restore walks four tiers, V2 first; the first call is the V2 tier a save is later restored by.)
+    expect(restoreCacheFn).toHaveBeenCalled()
     expect(saveCacheFn).toHaveBeenCalledTimes(1)
     const restorePaths = restoreCacheFn.mock.calls[0]?.[0] ?? []
     const savePaths = saveCacheFn.mock.calls[0]?.[0] ?? []

@@ -1,5 +1,4 @@
 import type {OpenCodeV2ServerHandle} from '@fro-bot/runtime'
-import type {OpenCodeServerHandle} from '../../features/agent/index.js'
 import type {MetricsCollector} from '../../features/observability/index.js'
 import type {RepoSkillsSource} from '../../services/setup/repo-skills.js'
 import type {CacheResult} from '../../shared/types.js'
@@ -8,8 +7,6 @@ import * as path from 'node:path'
 import process from 'node:process'
 import * as core from '@actions/core'
 import {DB_V2_MAIN_BASENAME, resolveResponseDelivery} from '@fro-bot/runtime'
-import {bootstrapOpenCodeServer} from '../../features/agent/index.js'
-import {resolveSessionGeneration} from '../../services/cache/cache-key.js'
 import {
   buildCacheKeyComponents,
   checkpointDatabase,
@@ -30,19 +27,11 @@ import {createLogger} from '../../shared/logger.js'
 import {normalizeWorkspacePath} from '../../shared/paths.js'
 import {startActionOpenCodeV2} from './v2-server.js'
 
-export interface CacheRestorePhaseResult {
-  readonly cacheResult: CacheResult
-  readonly cacheStatus: 'corrupted' | 'hit' | 'miss'
-  readonly serverHandle: OpenCodeServerHandle
-}
-
 /**
- * What the V2 execution loop receives: the restored cache facts and a server that is spawned, gated (plugins,
- * permissions, credentials) and past its V1 import. No prompt has been sent. `generation` is the discriminant: a V1
- * result carries no such field (V1 behaviour is untouched), so `isCacheRestoreV2` is the one way to tell them apart.
+ * What the execution loop receives: the restored cache facts and a server that is spawned, gated (plugins,
+ * permissions, credentials) and past its V1 import. No prompt has been sent.
  */
-export interface CacheRestoreV2PhaseResult {
-  readonly generation: 'v2'
+export interface CacheRestorePhaseResult {
   readonly cacheResult: CacheResult
   readonly cacheStatus: 'corrupted' | 'hit' | 'miss'
   readonly serverHandle: OpenCodeV2ServerHandle
@@ -52,7 +41,7 @@ export async function runCacheRestore(
   bootstrap: BootstrapPhaseResult,
   metrics: MetricsCollector,
   repoSkills: RepoSkillsSource | null = null,
-): Promise<CacheRestorePhaseResult | CacheRestoreV2PhaseResult | null> {
+): Promise<CacheRestorePhaseResult | null> {
   const cacheComponents = buildCacheKeyComponents()
 
   const cacheLogger = createLogger({phase: 'cache'})
@@ -67,7 +56,6 @@ export async function runCacheRestore(
     storagePath,
     authPath: getOpenCodeAuthPath(),
     projectIdPath,
-    opencodeVersion: bootstrap.opencodeResult.version,
     storeConfig: bootstrap.inputs.storeConfig,
   })
 
@@ -87,7 +75,7 @@ export async function runCacheRestore(
   // prefixes returning the most recent entry, and save keys are unique per run, so a run
   // that declines to save leaves a poisoned entry as the newest one for the next restore
   // to hit again. Checkpointing here — outside the bootstrap budget that only times
-  // createOpencode — heals a stuck repository in place instead of discarding its history.
+  // the server start — heals a stuck repository in place instead of discarding its history.
   // Only a 'hit' has a restored database to repair: a miss has nothing on disk yet, and a
   // 'corrupted' result already had its DB family deleted by cleanStorage.
   if (cacheStatus === 'hit') {
@@ -160,38 +148,8 @@ export async function runCacheRestore(
     }
   }
 
-  if (resolveSessionGeneration(bootstrap.opencodeResult.version) === 'v2') {
-    // The V1 server bootstrap below is not reachable on V2. This is the only place that selects the generation's
-    // server: the repair above is generation-neutral (the V1 and V2 databases share a file name and a WAL).
-    // The caller owns the live server from here: the V2 execution loop runs on it and cleanup shuts it down.
-    return startV2Server(bootstrap, workspacePath, storagePath, cacheResult, cacheStatus, repoSkills)
-  }
-
-  const serverLogger = createLogger({phase: 'server-bootstrap'})
-  const abortController = new AbortController()
-  // Normalized to match what the harness's own session-scoped calls use
-  // (session-prep.ts, cleanup.ts) -- the probe must warm the same instance the harness
-  // will actually address, or a divergence here silently defeats the readiness check.
-  const bootstrapResult = await bootstrapOpenCodeServer(
-    abortController.signal,
-    serverLogger,
-    normalizeWorkspacePath(workspacePath),
-    bootstrap.inputs.serverBootstrapTimeoutMs,
-  )
-
-  if (!bootstrapResult.success) {
-    core.setFailed(`OpenCode server bootstrap failed: ${bootstrapResult.error.message}`)
-    return null
-  }
-
-  const serverHandle = bootstrapResult.data
-  serverLogger.info('SDK server bootstrapped successfully')
-
-  return {
-    cacheResult,
-    cacheStatus,
-    serverHandle,
-  }
+  // The caller owns the live server from here: the execution loop runs on it and cleanup shuts it down.
+  return startV2Server(bootstrap, workspacePath, storagePath, cacheResult, cacheStatus, repoSkills)
 }
 
 async function startV2Server(
@@ -201,7 +159,7 @@ async function startV2Server(
   cacheResult: CacheResult,
   cacheStatus: 'corrupted' | 'hit' | 'miss',
   repoSkills: RepoSkillsSource | null,
-): Promise<CacheRestoreV2PhaseResult | null> {
+): Promise<CacheRestorePhaseResult | null> {
   const serverLogger = createLogger({phase: 'server-bootstrap'})
   const {inputs, opencodeResult} = bootstrap
   const started = await startActionOpenCodeV2({
@@ -231,5 +189,5 @@ async function startV2Server(
     core.setFailed(`OpenCode V2 start failed (${started.error.stage}): ${started.error.message}`)
     return null
   }
-  return {generation: 'v2', cacheResult, cacheStatus, serverHandle: started.data}
+  return {cacheResult, cacheStatus, serverHandle: started.data}
 }

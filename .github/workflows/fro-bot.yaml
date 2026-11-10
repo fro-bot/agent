@@ -39,7 +39,7 @@ on:
         description: Release tag for narration runs; enables the trusted apply job
         type: string
         default: ''
-  # Called by other workflows (e.g. harness-release) to run Fro Bot with a
+  # Called by other workflows (e.g. a downstream repository's) to run Fro Bot with a
   # specific model and/or prompt. Secrets are inherited from the caller via
   # `secrets: inherit` — no secret passthrough inputs needed.
   # NOTE: when called, github.event_name reflects the CALLER's triggering event

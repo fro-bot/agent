@@ -62,7 +62,6 @@ sources:
   - src/features/triggers/skip-conditions-pr.ts
   - src/features/delegated/brokered-push.ts
   - scripts/harness/mint-app-token.ts
-  - .github/workflows/harness-integrate.yaml
   - packages/harness/harness.config.json
   - apps/workspace-agent/src/main.ts
   - apps/workspace-agent/src/server.ts
@@ -118,9 +117,9 @@ All layers may also import from `@fro-bot/runtime`, which is treated as a peer d
 
 ### OpenCode generation boundary
 
-V1 and V2 implementations coexist. `packages/runtime/src/session/generation.ts` selects V2 for a parsed major version of two or higher. The Action selects from its resolved executable version, keeping execution and overflow recovery on one backend (the `ExecutionBackend` contract in `src/harness/phases/execute-v2.ts`). Its default is the digest-verified stock V2 pin; an explicit V1 harness version remains the rollback path. The workspace image still defaults to the V1 harness build, independently of the Action. The gateway reads the workspace's `/readyz` `opencodeVersion` for each run, so the workspace image's version selects both sides of the protocol. An unreadable reported workspace version blocks admission rather than guessing.
+The Action runs OpenCode V2 only. `packages/runtime/src/session/generation.ts` still selects V2 for a parsed major version of two or higher, and the gateway and workspace still use it until their own cut. The Action's input parser rejects a V1 `opencode-version` before setup (`parseOpenCodeVersion`), and the execution backend is the `ExecutionBackend` contract in `src/harness/phases/execute-v2.ts`. The Action's only version is the digest-verified stock V2 pin; to keep running V1, pin the Action to its last pre-cut release (`fro-bot/agent@v0.137.0`). The workspace image still defaults to the V1 harness build, independently of the Action.
 
-V1 uses the SDK session/status model. V2 uses authenticated `/api/` routes, its event envelope, active sessions, forms, shell jobs, and queued session inboxes. The shared V2 primitives normalize these into the harness's activity and ownership vocabulary, while each surface retains its own lifecycle policy. In particular, V2 release requires a stable, quiet directory, rather than an empty ownership ledger alone; see [[Background Subagents and Ownership]].
+V2 uses authenticated `/api/` routes, its event envelope, active sessions, forms, shell jobs, and queued session inboxes. The shared V2 primitives normalize these into the harness's activity and ownership vocabulary. In particular, V2 release requires a stable, quiet directory, rather than an empty ownership ledger alone; see [[Background Subagents and Ownership]].
 
 ### Action entry points
 
@@ -142,8 +141,6 @@ Both entry points are thin wrappers. `main.ts` delegates to `harness/run.ts`; `p
 The CLI is a drop-in replacement — all arguments pass through to the patched OpenCode binary. Own subcommands (`info`, `patches`, `doctor`) report provenance (upstream tag, integration refs, build SHA) and health. The `integrate` merge step (`integrate.ts`) runs the OpenCode merge agent in CI over prompt-injectable upstream PR content, so both of its GitHub credentials are short-lived and minted just-in-time rather than drawn from durable secrets. The merge agent's own auth is minted from an OIDC broker (`scripts/harness/mint-broker-credential.ts`), and the credential used to `git push` the merge result is a scoped GitHub App installation token — single-repo, `contents: write`-only, roughly one-hour TTL — minted inline by a trusted no-post step (`scripts/harness/mint-app-token.ts`) that validates the returned token's scope all-or-nothing and fails closed on any mismatch. Neither mint has a durable-credential fallback, and the App private key is mapped only to the mint step's environment, never to job-level env or disk. As further defense-in-depth, the harness masks the `github-token` value and scrubs the raw `INPUT_GITHUB-TOKEN` copy from the merge child's environment so the OpenCode subprocess never inherits it.
 
 The package ships as `@fro.bot/harness` (the main resolver) plus four per-platform packages (`@fro.bot/harness-linux-x64`, `-linux-arm64`, `-darwin-x64`, `-darwin-arm64`), each containing only its native binary. Its two commands have different roles: `harness` reserves provenance and maintenance subcommands, while `opencode` passes every argument directly to the native binary. Both passthrough paths share `run-passthrough.ts`, which resolves without a version-probe subprocess, forwards signals, and propagates the child's exit. Resolution selects an explicit native `OPENCODE_PATH`, then the platform package, and searches `PATH` only with `HARNESS_ALLOW_PATH_FALLBACK=1`; realpath and inode checks reject the shims themselves to prevent recursion. The advisory `postinstall` check is not required for command execution. Per-platform `optionalDependencies` are injected at publish time and are not listed in the workspace `package.json`. [[Setup and Configuration]] explains how Action setup separately verifies the requested version.
-
-The dedicated integration workflow (`.github/workflows/harness-integrate.yaml`) mints the App push token **before** running the merge agent. Its private key is supplied only to that pre-agent step, so no later step reintroduces it after agent-influenced code has run. The masked token output reaches trusted finalization, not the agent's environment. A 40-minute cap on the agent step leaves headroom within the token's roughly one-hour lifetime; a push after expiry fails closed rather than minting again in the modified workspace.
 
 ### Gateway Package (`packages/gateway/`)
 
@@ -223,7 +220,7 @@ The full, unabridged symbol rows for entries that [ARCHITECTURE.md](../../ARCHIT
 
 | Symbol | Type | Location | Role |
 | --- | --- | --- | --- |
-| `installSystematicPlugin` | Function | `src/services/setup/systematic-plugin.ts` | Setup-time Systematic plugin install (keeps npm install off the server's boot path) |
+| `installPluginsV2` | Function | `src/services/setup/plugin-install-v2.ts` | Setup-time plugin install at exact versions (keeps npm install off the server's boot path) |
 | `saveCache` | Function | `src/services/cache/save.ts` | Persist state to cache; returns a `CacheSaveResult` (two independent persistence axes + a named outcome), not a boolean |
 | `toCacheSaveStateValue` | Function | `src/shared/cache-save-result.ts` | Exhaustiveness-pinned mapper from `CacheSaveResult` to the `CACHE_SAVED` state handoff value |
 | `checkpointDatabase` | Function | `src/services/cache/checkpoint.ts` | Merge SQLite WAL into main DB before save/restore hand-off |
@@ -242,9 +239,9 @@ The full, unabridged symbol rows for entries that [ARCHITECTURE.md](../../ARCHIT
 | `buildAgentPrompt` | Function | `packages/runtime/src/agent/prompt.ts` | XML-tagged prompt with authority hierarchy |
 | `buildAgentContextSection` | Function | `packages/runtime/src/agent/prompt.ts` | Consolidated agent operations block |
 | `buildHarnessRulesSection` | Function | `packages/runtime/src/agent/prompt-thread.ts` | Non-negotiable rules with precedence declaration |
-| `runPromptAttempt` | Function | `src/features/agent/retry.ts` | Execute prompt with retry logic |
-| `pollForSessionCompletion` | Function | `src/features/agent/session-poll.ts` | Poll SDK for completion status |
-| `bootstrapOpenCodeServer` | Function | `packages/runtime/src/agent/server.ts` (delegate: `src/features/agent/server-adapter.ts`) | Initialize SDK server lifecycle; probes instance-scoped readiness before reporting success |
+| `runPromptAttemptV2` | Function | `src/features/agent/retry-v2.ts` | Execute prompt with retry logic |
+| `pollForSessionCompletionObservationV2` | Function | `src/features/agent/session-poll-v2.ts` | Poll for completion status |
+| `startActionOpenCodeV2` | Function | `src/harness/phases/v2-server.ts` | Start and verify the Action's V2 server |
 | `createOwnershipLedger` | Function | `packages/runtime/src/agent/ownership-ledger.ts` | In-memory 3-state (outstanding/settled/unknown) ledger for background subagent executions, keyed by child session id |
 | `reconcileLedgerOnce` / `createLedgerReconciler` | Function | `packages/runtime/src/agent/ledger-reconcile.ts` | Settles tracked ledger entries whose settlement event the SSE stream never delivered, against `children()`/`liveSessionIds()` (both scoped to the run's directory); never adopts an untracked session |
 | `createRemoteQuestionClient` | Function | `packages/runtime/src/agent/remote-question-client.ts` | Narrow v2-SDK client over OpenCode's `question` reply/reject endpoints (the v1 client does not expose them); every call carries the workspace `directory` |
@@ -367,34 +364,7 @@ Discord messageCreate event
                     on failure → FAILED; coarse error reply to thread
 ```
 
-### Harness Release Pipeline
-
-```text
-harness-release.yaml (workflow_dispatch OR push: harness-v* tag)
-  │
-  ├─→ prepare-integrate job
-  │     resolve base_version → render prompt from packages/harness/prompt.txt
-  │     → emit: base_version, rendered_prompt, has_refs
-  │
-  ├─→ integrate job (skipped when has_refs == 'false')
-  │     uses: .github/workflows/harness-integrate.yaml (explicit secrets, short-lived credentials)
-  │     agent:
-  │       clone anomalyco/opencode → create integration branch at base tag
-  │       → merge configured refs (harness.config.json carry-policy allowlist)
-  │       → build + verify host CLI
-  │       → push to refs/harness-integrate/<version>
-  │
-  ├─→ build matrix (linux-x64, linux-arm64, darwin-x64, darwin-arm64)
-  │     needs: [prepare-integrate, integrate]
-  │     fetch refs/harness-integrate/<version> (or stock tag if has_refs=false)
-  │     → build-platform.ts --source-tree <tree> --integration-commit <sha>
-  │     → emit: integration_commit
-  │
-  └─→ publish job (all-or-nothing; requires build + release-binaries success)
-        OIDC trusted publishing (id-token: write, publish job only)
-        → npm publish @fro.bot/harness + 4 per-platform packages
-        → GitHub Release (OpenCode-shaped assets + SHA256SUMS)
-```
+The harness release workflows (`harness-release.yaml`, `harness-integrate.yaml`) were removed with the Action's V1 cut. Published harness releases and npm packages stay available.
 
 ## Design Decisions
 

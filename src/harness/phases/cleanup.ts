@@ -1,5 +1,4 @@
 import type {ObjectStoreConfig, OpenCodeV2ServerHandle, OwnershipLedger} from '@fro-bot/runtime'
-import type {OpenCodeServerHandle} from '../../features/agent/index.js'
 import type {ReactionContext} from '../../features/agent/types.js'
 import type {AttachmentResult} from '../../features/attachments/index.js'
 import type {MetricsCollector} from '../../features/observability/metrics.js'
@@ -18,9 +17,7 @@ import {
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   DEFAULT_LOCK_TTL_SECONDS,
   DEFAULT_PENDING_STALE_THRESHOLD_MS,
-  DEFAULT_PRUNING_CONFIG,
   DEFAULT_STALE_THRESHOLD_MS,
-  pruneSessions,
   releaseLock,
   syncArtifactsToStore,
   syncMetadataToStore,
@@ -43,7 +40,6 @@ import {
 } from '../../shared/env.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {createLogger} from '../../shared/logger.js'
-import {normalizeWorkspacePath} from '../../shared/paths.js'
 import {setCacheSaveResultOutput} from '../config/outputs.js'
 import {STATE_KEYS} from '../config/state-keys.js'
 import {ACTION_LOCK_SCOPE} from './acquire-lock.js'
@@ -53,14 +49,8 @@ export interface CleanupPhaseOptions {
   readonly reactionCtx: ReactionContext | null
   readonly githubClient: Octokit | null
   readonly attachmentResult: AttachmentResult | null
-  readonly serverHandle: OpenCodeServerHandle | null
-  /**
-   * The server of an OpenCode V2 run, in place of `serverHandle` (a run has one or the other). Kept as its own field so
-   * the V1 handle type, and every V1 caller of this phase, are unchanged.
-   */
+  /** The run's OpenCode V2 server, shut down here before the cache save. Absent when execution never started one. */
   readonly serverHandleV2?: OpenCodeV2ServerHandle | null
-  readonly sessionRetention: number | null
-  readonly detectedOpencodeVersion: string | null
   readonly storeConfig: ObjectStoreConfig
   readonly metrics: MetricsCollector
   readonly agentIdentity: AgentIdentity
@@ -98,7 +88,7 @@ export interface CleanupPhaseOptions {
   readonly skipSessionPersistence?: boolean
   /**
    * Why `skipSessionPersistence` is set when the reason is not the coordination lock (an OpenCode V2 start that did not
-   * complete). Replaces the lock wording in the decline warning. Ignored unless `skipSessionPersistence` is true.
+   * complete, or a run that ended before it began). Replaces the lock wording in the decline warning. Ignored unless `skipSessionPersistence` is true.
    */
   readonly persistenceDeclineReason?: string
 }
@@ -133,10 +123,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
     reactionCtx,
     githubClient,
     attachmentResult,
-    serverHandle,
     serverHandleV2 = null,
-    sessionRetention,
-    detectedOpencodeVersion,
     storeConfig,
     metrics,
     agentIdentity,
@@ -166,7 +153,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
   // `true` -- that was the false-certification bug this default exists to close. See also
   // the individual try/catch around each best-effort step below, which keeps those failures
   // from skipping the shutdown attempt itself in the first place.
-  let quiescenceConfirmed = serverHandle == null && serverHandleV2 == null
+  let quiescenceConfirmed = serverHandleV2 == null
   let continuityUnverified = false
 
   try {
@@ -227,36 +214,10 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
       }
     }
 
-    const pruneLogger = createLogger({phase: 'prune'})
     const finalWorkspace = getGitHubWorkspace()
-    // V2 has no SDK client to prune through, so `serverHandleV2` is not pruned here. A V2 run is pruned over
-    // `DELETE /api/session/:id` by its release step (`release-v2.ts` -> `prune-v2.ts`), which runs before this phase
-    // because pruning needs a live server and a directory already confirmed quiet, and the release shuts the server down.
-    if (serverHandle != null) {
-      try {
-        const normalizedFinalWorkspace = normalizeWorkspacePath(finalWorkspace)
-        const pruningConfig = {
-          ...DEFAULT_PRUNING_CONFIG,
-          maxSessions: sessionRetention == null ? DEFAULT_PRUNING_CONFIG.maxSessions : sessionRetention,
-        }
-        const pruneResult = await pruneSessions(
-          serverHandle.client,
-          normalizedFinalWorkspace,
-          pruningConfig,
-          pruneLogger,
-        )
-        if (pruneResult.prunedCount > 0) {
-          pruneLogger.info('Pruned old sessions', {
-            pruned: pruneResult.prunedCount,
-            remaining: pruneResult.remainingCount,
-          })
-        }
-      } catch (pruneError) {
-        pruneLogger.warning('Session pruning failed (non-fatal); shutdown still proceeds', {
-          error: toErrorMessage(pruneError),
-        })
-      }
-    }
+    // Sessions are not pruned here. A run is pruned over `DELETE /api/session/:id` by its release step
+    // (`release-v2.ts` -> `prune-v2.ts`), which runs before this phase because pruning needs a live server and a
+    // directory already confirmed quiet, and the release shuts the server down.
 
     // Shut down the OpenCode server BEFORE saving the cache.
     // Shutdown does NOT itself trigger a SQLite WAL checkpoint: merging the write-ahead
@@ -275,13 +236,10 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
     // unknown ownership-ledger entry -- persistence must decline rather than risk a
     // checkpoint racing a still-live writer. No server handle at all (e.g.
     // SKIP_AGENT_EXECUTION=true) has no writer to be unconfirmed about, so it stays true.
-    if (serverHandle != null || serverHandleV2 != null) {
+    if (serverHandleV2 != null) {
       try {
-        // V1 reports `quiesced`; V2 reports how the exit was confirmed. An exit it could not confirm is the same fact.
-        const quiesced =
-          serverHandleV2 == null
-            ? (await serverHandle?.shutdown())?.quiesced === true
-            : (await serverHandleV2.shutdown()).exit.outcome !== 'unconfirmed'
+        // The shutdown reports how the exit was confirmed; an exit it could not confirm leaves a writer unconfirmed.
+        const quiesced = (await serverHandleV2.shutdown()).exit.outcome !== 'unconfirmed'
         quiescenceConfirmed = quiesced
         if (!quiesced) {
           bootstrapLogger.warning(
@@ -423,7 +381,6 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
         storagePath: getOpenCodeStoragePath(),
         authPath: getOpenCodeAuthPath(),
         projectIdPath: finalProjectIdPath,
-        opencodeVersion: detectedOpencodeVersion,
         storeConfig,
         objectStorePublish: holdsLease ? 'publish' : 'withhold',
       })

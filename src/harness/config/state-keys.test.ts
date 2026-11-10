@@ -16,10 +16,6 @@ describe('state-keys', () => {
       expect(STATE_KEYS.CACHE_SAVED).toBe('cacheSaved')
     })
 
-    it('contains opencodeVersion key', () => {
-      expect(STATE_KEYS.OPENCODE_VERSION).toBe('opencodeVersion')
-    })
-
     it('contains artifactUploaded key', () => {
       expect(STATE_KEYS.ARTIFACT_UPLOADED).toBe('artifactUploaded')
     })
@@ -53,7 +49,7 @@ describe('state-keys', () => {
     })
 
     it('has correct number of keys', () => {
-      expect(Object.keys(STATE_KEYS)).toHaveLength(18)
+      expect(Object.keys(STATE_KEYS)).toHaveLength(17)
     })
 
     it('values are string type compatible', () => {

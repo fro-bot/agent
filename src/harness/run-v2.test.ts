@@ -1,6 +1,6 @@
 import type {OpenCodeV2ServerHandle, OwnershipLedger} from '@fro-bot/runtime'
 import type {BootstrapPhaseResult} from './phases/bootstrap.js'
-import type {CacheRestoreV2PhaseResult} from './phases/cache-restore.js'
+import type {CacheRestorePhaseResult} from './phases/cache-restore.js'
 import type {RoutingPhaseResult} from './phases/routing.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {createLogger} from '../shared/logger.js'
@@ -92,7 +92,6 @@ vi.mock('@fro-bot/runtime', async importOriginal => {
 
 vi.mock('./phases/execute.js', () => ({
   computeDrainDeadlineMs: vi.fn(() => 60_000),
-  runDrain: vi.fn().mockResolvedValue({expired: false, cancelledCount: 0, settledCount: 0, unknownCount: 0}),
   runExecute: vi.fn(),
   resolveRequestedOutputModeState: vi.fn(() => 'omitted'),
 }))
@@ -158,7 +157,7 @@ function createBootstrap(): BootstrapPhaseResult {
       repoSkills: false,
     },
     logger: createLogger({phase: 'test'}),
-    opencodeResult: {path: 'opencode', version: '1.0.0', didSetup: false},
+    opencodeResult: {path: 'opencode', version: '1.0.0'},
     delivery: 'model-gh',
     responseFilePath: null,
     responseFilePathCandidates: null,
@@ -254,8 +253,7 @@ async function arrange(
     botLogin: 'fro-bot',
   })
   const v2Handle = {url: 'http://127.0.0.1:1', shutdown: vi.fn()} as unknown as OpenCodeV2ServerHandle
-  const cacheRestore: CacheRestoreV2PhaseResult = {
-    generation: 'v2',
+  const cacheRestore: CacheRestorePhaseResult = {
     cacheResult: {hit: false, key: 'k', restoredPath: null, corrupted: false, source: null},
     cacheStatus: 'miss',
     serverHandle: v2Handle,
@@ -394,9 +392,9 @@ describe('run on an OpenCode V2 server', () => {
     })
   })
 
-  it('runs execution on the V2 handle, releases it through the V2 drain instead of the V1 client, and cleans up', async () => {
-    // #given a V2 cache-restore result whose handle has no SDK client
-    const {runExecute, runDrain} = await import('./phases/execute.js')
+  it('runs execution on the V2 handle, releases it through the V2 release, and cleans up', async () => {
+    // #given a cache-restore result carrying the V2 handle
+    const {runExecute} = await import('./phases/execute.js')
     const {runCleanup} = await import('./phases/cleanup.js')
     const {runReleaseV2} = await import('./phases/release-v2.js')
     const {cacheRestore, v2Handle, ledger} = await arrange()
@@ -404,9 +402,8 @@ describe('run on an OpenCode V2 server', () => {
     // #when
     await run()
 
-    // #then the V1 drain (which needs the SDK client) is not called; the V2 release is, for a succeeded run, with the
-    // ledger, the root session and the retention the run was configured with
-    expect(vi.mocked(runDrain)).not.toHaveBeenCalled()
+    // #then the release runs for a succeeded run, with the ledger, the root session and the retention the run was
+    // configured with
     expect(vi.mocked(runExecute).mock.calls[0]?.[2]).toBe(cacheRestore)
     expect(vi.mocked(runReleaseV2)).toHaveBeenCalledTimes(1)
     expect(vi.mocked(runReleaseV2).mock.calls[0]?.[0]).toMatchObject({
@@ -418,10 +415,9 @@ describe('run on an OpenCode V2 server', () => {
       sessionRetention: 50,
     })
 
-    // #and cleanup is handed the V2 server in its own field, and no V1 handle
+    // #and cleanup is handed the V2 server
     const cleanupOptions = vi.mocked(runCleanup).mock.calls[0]?.[0]
     expect(cleanupOptions?.serverHandleV2).toBe(v2Handle)
-    expect(cleanupOptions?.serverHandle).toBeNull()
     expect(cleanupOptions?.skipSessionPersistence).toBe(false)
   })
 
@@ -660,5 +656,132 @@ describe('run on an OpenCode V2 server', () => {
 
     // #then
     expect(vi.mocked(runReleaseV2)).toHaveBeenCalledTimes(1)
+  })
+})
+
+// Session state on the runner is only worth saving for a run that restored the cache and started the V2 server: until
+// then the database on disk is whatever the runner already held, not this invocation's history.
+async function cleanupOptions() {
+  const {runCleanup} = await import('./phases/cleanup.js')
+  return vi.mocked(runCleanup).mock.calls[0]?.[0]
+}
+
+describe('run persistence: only a run that started the V2 server may save session state', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('declines the save when bootstrap rejects the inputs (a V1 version, or malformed input)', async () => {
+    // #given bootstrap that returns null, as it does after an input or setup failure
+    const {runBootstrap} = await import('./phases/bootstrap.js')
+    await arrange()
+    vi.mocked(runBootstrap).mockResolvedValue(null)
+
+    // #when
+    const exitCode = await run()
+
+    // #then cleanup still runs, but with the save declined and a reason that says why
+    expect(exitCode).toBe(1)
+    const options = await cleanupOptions()
+    expect(options).toMatchObject({skipSessionPersistence: true})
+    expect(options?.persistenceDeclineReason).toMatch(/before the OpenCode V2 server started/)
+  })
+
+  it('declines the save when bootstrap throws (a setup failure such as a download error)', async () => {
+    // #given
+    const {runBootstrap} = await import('./phases/bootstrap.js')
+    await arrange()
+    vi.mocked(runBootstrap).mockRejectedValue(new Error('download failed: 504'))
+
+    // #when
+    await run()
+
+    // #then
+    expect(await cleanupOptions()).toMatchObject({skipSessionPersistence: true})
+  })
+
+  it('declines the save when routing skips the event', async () => {
+    // #given a skipped event: nothing was restored for it
+    const {runRouting} = await import('./phases/routing.js')
+    await arrange()
+    vi.mocked(runRouting).mockResolvedValue({skipped: true, skipReason: 'no_mention', skipMessage: 'nothing to do'})
+
+    // #when
+    await run()
+
+    // #then
+    expect(await cleanupOptions()).toMatchObject({skipSessionPersistence: true})
+  })
+
+  it('declines the save when dedup skips the run', async () => {
+    // #given
+    const {runDedup} = await import('./phases/dedup.js')
+    await arrange()
+    vi.mocked(runDedup).mockResolvedValue({shouldProceed: false} as Awaited<ReturnType<typeof runDedup>>)
+
+    // #when
+    await run()
+
+    // #then
+    expect(await cleanupOptions()).toMatchObject({skipSessionPersistence: true})
+  })
+
+  it('declines the save when the cache restore phase throws before the server is up', async () => {
+    // #given
+    const {runCacheRestore} = await import('./phases/cache-restore.js')
+    await arrange()
+    vi.mocked(runCacheRestore).mockRejectedValue(new Error('restore blew up'))
+
+    // #when
+    await run()
+
+    // #then
+    expect(await cleanupOptions()).toMatchObject({skipSessionPersistence: true})
+  })
+
+  it('does not decline a run that started the server, even when execution then throws', async () => {
+    // #given a server that started and an execution that crashed afterwards
+    await arrange({executeError: new Error('boom')})
+
+    // #when
+    await run()
+
+    // #then the save is not declined by this rule (the release and ledger gates still apply downstream)
+    const options = await cleanupOptions()
+    expect(options?.skipSessionPersistence).not.toBe(true)
+  })
+
+  it('does not decline a run that completed normally', async () => {
+    // #given
+    await arrange()
+
+    // #when
+    await run()
+
+    // #then
+    const options = await cleanupOptions()
+    expect(options?.skipSessionPersistence).not.toBe(true)
+    expect(options?.persistenceDeclineReason).toBeUndefined()
+  })
+
+  it('arms the post-hook save only once the server has started', async () => {
+    // #given
+    const core = await import('@actions/core')
+    const {runCacheRestore} = await import('./phases/cache-restore.js')
+    const {cacheRestore} = await arrange()
+    const order: string[] = []
+    vi.mocked(runCacheRestore).mockImplementation(async () => {
+      order.push('server-started')
+      return cacheRestore
+    })
+    vi.mocked(core.saveState).mockImplementation((key, value) => {
+      if (key === 'should-save-cache') order.push(`should-save-cache=${String(value)}`)
+    })
+
+    // #when
+    await run()
+
+    // #then it is false at the start and true only after the server started
+    expect(order.slice(0, 3)).toEqual(['should-save-cache=false', 'server-started', 'should-save-cache=true'])
   })
 })

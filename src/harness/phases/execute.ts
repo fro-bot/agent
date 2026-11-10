@@ -5,8 +5,6 @@ import type {
   OutputModeMigrationState,
   OutputModeRequestState,
   OwnershipLedger,
-  ReconcileLedgerOptions,
-  SessionClient,
   SessionSearchResult,
 } from '@fro-bot/runtime'
 import type {LiveObservationV2} from '../../features/agent/live-observation-v2.js'
@@ -16,32 +14,18 @@ import type {Logger} from '../../shared/logger.js'
 import type {OutputMode, ResolvedOutputMode, TokenUsage} from '../../shared/types.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {BrokeredPushPlan} from './brokered-push-plan.js'
-import type {CacheRestorePhaseResult, CacheRestoreV2PhaseResult} from './cache-restore.js'
+import type {CacheRestorePhaseResult} from './cache-restore.js'
 import type {RoutingPhaseResult} from './routing.js'
 import type {SessionPrepPhaseResult} from './session-prep.js'
 import * as fs from 'node:fs/promises'
 import process from 'node:process'
 import * as core from '@actions/core'
-import {
-  archiveSession,
-  createLedgerReconciler,
-  createOwnershipLedger,
-  createSdkLedgerReconcileAdapter,
-  findLatestSession,
-  reconcileLedgerOnce,
-  resolveResponseDelivery,
-  searchSessions,
-  writeSessionSummary,
-} from '@fro-bot/runtime'
-import {executeOpenCode, resolveOutputMode} from '../../features/agent/index.js'
+import {createOwnershipLedger, resolveResponseDelivery} from '@fro-bot/runtime'
+import {resolveOutputMode} from '../../features/agent/index.js'
 import {inspectResponseFile, resolveResponseSurface} from '../../features/agent/response-file.js'
-import {sleep} from '../../shared/async.js'
-import {getGitHubWorkspace} from '../../shared/env.js'
-import {toErrorMessage} from '../../shared/errors.js'
 import {createLogger} from '../../shared/logger.js'
 import {STATE_KEYS} from '../config/state-keys.js'
 import {resolveBrokeredPushPlan} from './brokered-push-plan.js'
-import {isCacheRestoreV2} from './cache-restore-kind.js'
 import {createExecutionBackendV2, type ExecutionBackend} from './execute-v2.js'
 import {buildSessionSearchQuery} from './session-prep.js'
 
@@ -144,43 +128,10 @@ function resolveOutputModeMigration(
   }
 }
 
-/**
- * The one generation selector of the execute phase. V1 is the exact set of calls `runExecute` always made; V2 is the
- * sibling in `execute-v2.ts`. Nothing else in this phase branches on the generation.
- */
-function selectExecutionBackend(cacheRestore: CacheRestorePhaseResult | CacheRestoreV2PhaseResult): ExecutionBackend {
-  if (isCacheRestoreV2(cacheRestore)) return createExecutionBackendV2(cacheRestore)
-
-  const {serverHandle} = cacheRestore
-  return {
-    execute: async (promptOptions, logger, config, ledger) =>
-      executeOpenCode(promptOptions, logger, config, serverHandle, ledger),
-    drainOverflowed: async (ledger, sessionId, logger) =>
-      runDrain({
-        ledger,
-        client: serverHandle.client,
-        parentSessionId: sessionId,
-        directory: getGitHubWorkspace(),
-        deadlineMs: 0,
-        logger,
-      }),
-    archive: async (sessionId, logger) => archiveSession(serverHandle.server.url, sessionId, logger),
-    searchPriorWork: async (query, workspace, excludeSessionIds, logger) =>
-      searchSessions(query, serverHandle.client, workspace, {limit: 5, excludeSessionIds}, logger),
-    findLatestSessionId: async (afterTimestamp, workspace, logger) => {
-      const latestSession = await findLatestSession(serverHandle.client, workspace, afterTimestamp, logger)
-      return latestSession == null ? null : latestSession.session.id
-    },
-    writeSummary: async (sessionId, summary, logger) => {
-      await writeSessionSummary(sessionId, summary, serverHandle.client, logger)
-    },
-  }
-}
-
 interface ContextOverflowRecoveryOptions {
   readonly bootstrap: BootstrapPhaseResult
   readonly routing: RoutingPhaseResult
-  /** The generation selected once in `runExecute`; the recovery restart runs on the same one. */
+  /** The backend `runExecute` built; the recovery restart runs on the same server. */
   readonly backend: ExecutionBackend
   readonly sessionPrep: SessionPrepPhaseResult
   readonly metrics: MetricsCollector
@@ -192,7 +143,6 @@ interface ContextOverflowRecoveryOptions {
   readonly overflowedSessionId: string
   /** The ledger backing the overflowed session's own execution -- cancelled and settled before it is archived. */
   readonly overflowedLedger: OwnershipLedger
-  readonly resolveSessionId: (candidateSessionId: string | null, afterTimestamp: number) => Promise<string | null>
 }
 
 async function recoverFromContextOverflow(options: ContextOverflowRecoveryOptions): Promise<ExecutePhaseResult> {
@@ -209,7 +159,6 @@ async function recoverFromContextOverflow(options: ContextOverflowRecoveryOption
     overflowedResult,
     overflowedSessionId,
     overflowedLedger,
-    resolveSessionId,
   } = options
 
   // Cancel and settle work the overflowed session still owns BEFORE archiving it:
@@ -304,14 +253,13 @@ async function recoverFromContextOverflow(options: ContextOverflowRecoveryOption
   // replacement's own observation is the one the result carries to the release. An early return above keeps the
   // overflowed run's in its result instead, for the release to stop.
   await overflowedResult.liveObservation?.stop()
-  const recoveryStartTime = Date.now()
   const recoveryExecResult = await backend.execute(
     recoveryPromptOptions,
     execLogger,
     recoveryExecutionConfig,
     recoveryLedger,
   )
-  const recoverySessionId = await resolveSessionId(recoveryExecResult.sessionId, recoveryStartTime)
+  const recoverySessionId = recoveryExecResult.sessionId
 
   if (recoveryExecResult.llmError?.type === 'context_overflow' && recoverySessionId != null) {
     const recoveryArchiveSucceeded = await backend.archive(recoverySessionId, execLogger)
@@ -351,15 +299,14 @@ async function recoverFromContextOverflow(options: ContextOverflowRecoveryOption
 export async function runExecute(
   bootstrap: BootstrapPhaseResult,
   routing: RoutingPhaseResult,
-  cacheRestore: CacheRestorePhaseResult | CacheRestoreV2PhaseResult,
+  cacheRestore: CacheRestorePhaseResult,
   sessionPrep: SessionPrepPhaseResult,
   metrics: MetricsCollector,
-  startTime: number,
   // Resolved once per invocation (run.ts) and shared with finalize; defaults to resolving here for callers
   // that do not thread it. Either way the prompt and the broker read the same decision.
   brokeredPushPlan: BrokeredPushPlan = resolveBrokeredPushPlan(bootstrap, routing),
 ): Promise<ExecutePhaseResult> {
-  const backend = selectExecutionBackend(cacheRestore)
+  const backend = createExecutionBackendV2(cacheRestore)
   const outputModeMigration = resolveOutputModeMigration(
     routing.triggerResult.context.eventType,
     bootstrap.inputs.outputMode,
@@ -430,32 +377,14 @@ export async function runExecute(
         'provision',
     }
 
-    const resolveSessionId = async (
-      candidateSessionId: string | null,
-      afterTimestamp: number,
-    ): Promise<string | null> => {
-      if (candidateSessionId != null) return candidateSessionId
-
-      const sessionLogger = createLogger({phase: 'session'})
-      const latestSessionId = await backend.findLatestSessionId(
-        afterTimestamp,
-        sessionPrep.normalizedWorkspace,
-        sessionLogger,
-      )
-      if (latestSessionId == null) return null
-
-      sessionLogger.debug('Identified session from execution', {sessionId: latestSessionId})
-      return latestSessionId
-    }
-
     // One ledger per invocation, not per attempt: constructed once here and threaded
-    // through to every LLM retry attempt inside `executeOpenCode` (plan Unit 11, Part 1
+    // through to every LLM retry attempt inside `executeOpenCodeV2` (plan Unit 11, Part 1
     // and Part 2). Overflow recovery below replaces it with a fresh one rather than
     // reusing this one across the session boundary.
     const ledger = createOwnershipLedger()
     const execResult = await backend.execute(promptOptions, execLogger, executionConfig, ledger)
 
-    const sessionId = await resolveSessionId(execResult.sessionId, executionStartTime)
+    const sessionId = execResult.sessionId
 
     result = {
       ...execResult,
@@ -497,7 +426,6 @@ export async function runExecute(
         overflowedResult: result,
         overflowedSessionId: sessionId,
         overflowedLedger: ledger,
-        resolveSessionId,
       })
     }
 
@@ -534,28 +462,6 @@ export async function runExecute(
     metrics.incrementComments()
   }
 
-  if (result.sessionId != null && backend.writeSummary !== undefined) {
-    const sessionLogger = createLogger({phase: 'session'})
-    await backend.writeSummary(
-      result.sessionId,
-      {
-        eventType: routing.agentContext.eventName,
-        repo: routing.agentContext.repo,
-        ref: routing.agentContext.ref,
-        runId: Number(routing.agentContext.runId),
-        cacheStatus: cacheRestore.cacheStatus,
-        sessionIds: [result.sessionId],
-        logicalKey: sessionPrep.logicalKey?.key,
-        createdPRs: [...result.prsCreated],
-        createdCommits: [...result.commitsCreated],
-        duration: Math.round((Date.now() - startTime) / 1000),
-        tokenUsage: result.tokenUsage,
-      },
-      sessionLogger,
-    )
-    sessionLogger.debug('Wrote session summary', {sessionId: result.sessionId})
-  }
-
   return {
     ...result,
     executionDurationMs: Date.now() - executionStartTime,
@@ -563,21 +469,8 @@ export async function runExecute(
 }
 
 /**
- * Drain: owned background work settles before the caller proceeds to
- * finalize, publish, persist, or release anything (plan Unit 10). Placed
- * ahead of finalize rather than inside cleanup, because a drain inside
- * cleanup would publish a response describing work that is still changing
- * underneath it.
- *
- * No-op (zero calls, immediate return) when `ledger` is not supplied --
- * matching the established no-ledger-means-single-session convention from
- * Units 4, 8, and 9. This is no longer a hypothetical: `src/harness/run.ts`
- * threads `execution.ownershipLedger` (populated by `runExecute` below
- * whenever execution actually ran) into this call, so a real run's
- * background dispatches are adopted and drained here. The `ledger`
- * parameter now goes unpopulated only when `SKIP_AGENT_EXECUTION=true`
- * skipped execution entirely -- in which case this call remains the same
- * no-op it always was.
+ * What draining owned background work left behind. `release-v2.ts` produces it for the V2 release, and `run.ts` reads
+ * it to decide whether the run is complete: drain finishes before anything publishes, persists, or releases.
  */
 export interface DrainOutcome {
   /** `true` once the deadline was reached before the ledger fully drained. */
@@ -590,38 +483,8 @@ export interface DrainOutcome {
   readonly unknownCount: number
 }
 
-export interface RunDrainOptions {
-  /** Absent means single-session: this call is a complete no-op. */
-  readonly ledger?: OwnershipLedger
-  readonly client: SessionClient | null
-  readonly parentSessionId: string | null
-  /** Directory the session runs in (`getGitHubWorkspace()`, as in `executeOpenCode`); reconciliation is scoped to it. */
-  readonly directory: string
-  /** Remaining budget for drain, already excluding the teardown reserve. `Number.POSITIVE_INFINITY` means no deadline. */
-  readonly deadlineMs: number
-  readonly logger: Logger
-  /** Interval between periodic reconciliation passes. Defaults to `createLedgerReconciler`'s own default. */
-  readonly reconcileIntervalMs?: number
-  /** How often the wait loop re-checks `ledger.isDrainComplete()`. */
-  readonly pollIntervalMs?: number
-}
-
 /** Reserve of the invocation's total timeout set aside for teardown after drain returns. */
 export const DEFAULT_DRAIN_TEARDOWN_RESERVE_MS = 30_000
-const DEFAULT_DRAIN_POLL_INTERVAL_MS = 250
-/** Bound on each upstream call the drain makes: a reconcile pass or a child abort. */
-const DRAIN_CALL_TIMEOUT_MS = 5_000
-
-/**
- * With no drain deadline, how many consecutive reconcile passes may observe no tracked session running before
- * drain stops waiting. Work a pass observes running (a tracked session that is a live direct child of the parent)
- * is waited for without a time cap, whatever its ledger state. Unreachable work cannot be waited on: a dead server
- * fails every pass, and an entry that is not a direct child of the parent is never seen as a live child. Only
- * meaningful when the deadline is infinite; a finite deadline always waits for it.
- */
-export const UNOBSERVABLE_PASSES_BEFORE_DRAIN_EXIT = 3
-
-const NO_DRAIN_OUTCOME: DrainOutcome = {expired: false, cancelledCount: 0, settledCount: 0, unknownCount: 0}
 
 /**
  * Remaining drain budget: the invocation's total timeout, minus what
@@ -644,247 +507,4 @@ export function computeDrainDeadlineMs(
 ): number {
   if (totalTimeoutMs <= 0) return Number.POSITIVE_INFINITY
   return Math.max(0, totalTimeoutMs - teardownReserveMs - executionDurationMs)
-}
-
-type BoundedCall<T> = {readonly timedOut: false; readonly value: T} | {readonly timedOut: true}
-
-/**
- * Runs one upstream call under `DRAIN_CALL_TIMEOUT_MS`. The race bounds this await; the signal handed to `call`
- * is aborted at the bound so a client that honors it stops the request. A call that ignores the signal is
- * abandoned, not awaited further, and its late result is the caller's to ignore.
- */
-async function boundedCall<T>(call: (signal: AbortSignal) => Promise<T>): Promise<BoundedCall<T>> {
-  const controller = new AbortController()
-  let timer: ReturnType<typeof setTimeout> | undefined
-  const timeout = new Promise<{readonly timedOut: true}>(resolve => {
-    timer = setTimeout(() => {
-      controller.abort()
-      resolve({timedOut: true})
-    }, DRAIN_CALL_TIMEOUT_MS)
-  })
-  try {
-    return await Promise.race([
-      (async () => call(controller.signal))().then((value): BoundedCall<T> => ({timedOut: false, value})),
-      timeout,
-    ])
-  } finally {
-    if (timer !== undefined) clearTimeout(timer)
-  }
-}
-
-/**
- * One reconcile pass under `DRAIN_CALL_TIMEOUT_MS`. A pass that does not finish in time fails like any other
- * failed pass: outstanding entries become `unknown`. Once the bound has passed, the abandoned pass can no longer
- * change the ledger, so a late answer cannot overturn the decision the drain already made. `isClosed` marks a
- * drain that has already decided (its wait loop ended): from then on the pass is inert whenever it answers.
- *
- * Resolves `true` only when the pass finished and saw a tracked session running (a live direct child of the
- * parent). A pass that failed or timed out observed nothing, so it resolves `false`.
- */
-async function reconcileBounded(
-  options: ReconcileLedgerOptions,
-  isClosed: () => boolean = () => false,
-): Promise<boolean> {
-  const {ledger, logger} = options
-  let abandoned = false
-  const inert = (): boolean => abandoned || isClosed()
-  const guardedLedger: OwnershipLedger = {
-    ...ledger,
-    settle: sessionId => {
-      if (!inert()) ledger.settle(sessionId)
-    },
-    markUnknown: sessionId => {
-      if (!inert()) ledger.markUnknown(sessionId)
-    },
-  }
-
-  const result = await boundedCall(async signal => reconcileLedgerOnce({...options, ledger: guardedLedger, signal}))
-  if (result.timedOut === false) {
-    return result.value.success && result.value.data.liveTrackedSessionIds.size > 0
-  }
-
-  abandoned = true
-  if (isClosed()) return false
-  const outstanding = ledger.snapshot().filter(entry => entry.state === 'outstanding')
-  for (const entry of outstanding) ledger.markUnknown(entry.sessionId)
-  logger.warning('Ledger reconciliation timed out; marking outstanding entries unknown rather than settling them', {
-    source: 'reconcileBounded',
-    parentSessionId: options.parentSessionId,
-    unknownCount: outstanding.length,
-    timeoutMs: DRAIN_CALL_TIMEOUT_MS,
-  })
-  return false
-}
-
-async function cancelOutstanding(options: {
-  readonly ledger: OwnershipLedger
-  readonly client: SessionClient
-  readonly logger: Logger
-  readonly reconcileOptions: ReconcileLedgerOptions
-}): Promise<DrainOutcome> {
-  const {ledger, client, logger, reconcileOptions} = options
-
-  // Final reconciliation pass BEFORE building the cancel set, so the set
-  // reflects liveness as of now rather than a stale earlier snapshot: an entry
-  // that settled in the meantime is not needlessly aborted, and one still live
-  // is still cancelled. Reconciliation only ever settles or downgrades entries
-  // the ledger already tracks -- it cannot discover an untracked child, since
-  // nothing upstream distinguishes a background child session from a foreground
-  // one.
-  await reconcileBounded(reconcileOptions)
-
-  // Cancel everything not confirmed settled -- outstanding AND unknown. An
-  // `unknown` entry (a dropped event, or every reconciliation attempt so far
-  // failing) is exactly the one most likely still live; it needs the explicit
-  // abort at least as much as an `outstanding` one does.
-  const unsettledEntries = ledger.snapshot().filter(entry => entry.state !== 'settled')
-
-  logger.warning('Drain deadline reached — cancelling unsettled owned work; run reports incomplete', {
-    unsettled: unsettledEntries.length,
-  })
-
-  await Promise.allSettled(
-    unsettledEntries.map(async entry => {
-      if (typeof client.session.abort !== 'function') return
-      try {
-        // A fresh signal per call: the execution deadline that just expired must not also cancel the
-        // cancellation request itself, and a hung call must neither stall the drain nor outlive its bound.
-        const result = await boundedCall(async signal => client.session.abort({path: {id: entry.sessionId}, signal}))
-        // The SDK resolves a failed request with the failure in `error` instead of throwing.
-        const envelopeError = result.timedOut
-          ? undefined
-          : (result.value as {readonly error?: unknown} | undefined)?.error
-        if (result.timedOut || envelopeError != null) {
-          logger.warning('Failed to abort owned session during drain-deadline cancellation', {
-            sessionId: entry.sessionId,
-            error: result.timedOut ? `abort timed out after ${DRAIN_CALL_TIMEOUT_MS}ms` : toErrorMessage(envelopeError),
-          })
-        }
-      } catch (error) {
-        logger.warning('Failed to abort owned session during drain-deadline cancellation', {
-          sessionId: entry.sessionId,
-          error: toErrorMessage(error),
-        })
-      }
-    }),
-  )
-
-  // A cancellation request is not proof the child stopped -- only a positive
-  // liveness check confirms it. Run one more reconciliation pass so a session
-  // that already went idle is settled (confirmed) rather than left unknown.
-  await reconcileBounded(reconcileOptions)
-
-  const settledCount = unsettledEntries.filter(cancelled => {
-    const current = ledger.snapshot().find(candidate => candidate.sessionId === cancelled.sessionId)
-    return current?.state === 'settled'
-  }).length
-
-  // Anything reconciliation still could not positively confirm as settled falls
-  // through to unknown: the cancellation was requested but nothing here
-  // confirms the child actually stopped (see docs/solutions/logic-errors/
-  // submission-failure-does-not-prove-the-work-never-started-2026-08-08.md).
-  for (const entry of ledger.snapshot()) {
-    if (entry.state !== 'settled') ledger.markUnknown(entry.sessionId)
-  }
-
-  return {
-    expired: true,
-    cancelledCount: unsettledEntries.length,
-    settledCount,
-    unknownCount: ledger.unknown(),
-  }
-}
-
-export async function runDrain(options: RunDrainOptions): Promise<DrainOutcome> {
-  const {
-    ledger,
-    client,
-    parentSessionId,
-    directory,
-    deadlineMs,
-    logger,
-    reconcileIntervalMs,
-    pollIntervalMs = DEFAULT_DRAIN_POLL_INTERVAL_MS,
-  } = options
-
-  if (ledger === undefined) return NO_DRAIN_OUTCOME
-
-  if (client === null || parentSessionId === null) {
-    // Nothing outstanding can be verified without a client and a session to
-    // reconcile against -- honest state is unknown, never a claimed drain.
-    const outstandingEntries = ledger.snapshot().filter(entry => entry.state === 'outstanding')
-    for (const entry of outstandingEntries) ledger.markUnknown(entry.sessionId)
-    if (outstandingEntries.length > 0) {
-      logger.warning('Drain could not reconcile owned work: no session client available', {
-        outstanding: outstandingEntries.length,
-      })
-    }
-    return {
-      expired: outstandingEntries.length > 0,
-      cancelledCount: 0,
-      settledCount: 0,
-      unknownCount: ledger.unknown(),
-    }
-  }
-
-  const adapter = createSdkLedgerReconcileAdapter(client, directory)
-  const reconcileOptions: ReconcileLedgerOptions = {ledger, adapter, parentSessionId, logger}
-
-  // Unconditional first pass, regardless of the ledger's current outstanding
-  // count: reconciliation is the only way this ledger can learn that a
-  // TRACKED entry's completion/settlement event was dropped -- a stream that
-  // stays silent about an already-adopted entry has nothing else to trigger a
-  // re-check (plan's central hazard, Unit 3). This does NOT cover a dispatch
-  // whose adoption event itself was never observed: reconciliation settles
-  // what the ledger already tracks, it never adopts an untracked session (see
-  // `packages/runtime/src/agent/ledger-reconcile.ts`'s module doc for why that
-  // was tried and removed -- reconciliation's two inputs, `children()` and
-  // `liveSessionIds()`, cannot tell an ordinary foreground subagent from a
-  // background dispatch once the adoption event itself is lost). A
-  // discriminant does exist on the persisted tool part, which nothing here
-  // reads today -- see that module doc for the verified shape and for what a
-  // reader of it would additionally have to get right.
-  let consecutiveUnobservablePasses = 0
-  let waitEnded = false
-  // One bounded, guarded pass. A pass that did not observe any tracked session running (it failed, timed out, or
-  // saw no tracked entry as a live direct child) while work is still unsettled extends the streak; a pass that saw
-  // one running resets it, whatever state the ledger holds for it: a transient failure leaves a running child
-  // `unknown`, and the ledger never moves it back. Passes after the wait loop has ended count for nothing and,
-  // being inert, change nothing.
-  const reconcilePass = async (): Promise<void> => {
-    const observedRunning = await reconcileBounded(reconcileOptions, () => waitEnded)
-    if (waitEnded) return
-    const workRemains = ledger.snapshot().some(entry => entry.state !== 'settled')
-    consecutiveUnobservablePasses = workRemains && observedRunning === false ? consecutiveUnobservablePasses + 1 : 0
-  }
-  const hasDeadline = Number.isFinite(deadlineMs)
-  const unobservable = (): boolean =>
-    hasDeadline === false && consecutiveUnobservablePasses >= UNOBSERVABLE_PASSES_BEFORE_DRAIN_EXIT
-
-  await reconcilePass()
-
-  if (ledger.isDrainComplete()) return {...NO_DRAIN_OUTCOME, unknownCount: ledger.unknown()}
-
-  if (deadlineMs > 0) {
-    // Each periodic tick is a bounded, guarded pass like every other drain pass. Once the wait loop has ended the
-    // drain has decided, so a pass still in flight can no longer change the ledger.
-    const reconciler = createLedgerReconciler({
-      ...reconcileOptions,
-      intervalMs: reconcileIntervalMs,
-      runPass: reconcilePass,
-    })
-    const deadlineAt = Date.now() + deadlineMs
-    try {
-      while (ledger.isDrainComplete() === false && Date.now() < deadlineAt && unobservable() === false) {
-        await sleep(Math.max(0, Math.min(pollIntervalMs, deadlineAt - Date.now())))
-      }
-    } finally {
-      reconciler.dispose()
-      waitEnded = true
-    }
-  }
-
-  if (ledger.isDrainComplete()) return {...NO_DRAIN_OUTCOME, unknownCount: ledger.unknown()}
-
-  return cancelOutstanding({ledger, client, logger, reconcileOptions})
 }

@@ -81,8 +81,10 @@ describe('invocation identity across a multi-job run', () => {
     expect(observe.saveKey).not.toBe(remediate.saveKey)
     expect(observe.artifactName).not.toBe(remediate.artifactName)
     expect(observe.sessionKey).not.toBe(remediate.sessionKey)
-    expect(remediate.saveKey).toBe('opencode-storage-github-fro-bot-.github-main-Linux-38026680860-1-fro-bot-remediate')
-    expect(observe.saveKey).toBe('opencode-storage-github-fro-bot-.github-main-Linux-38026680860-1-fro-bot-observe')
+    expect(remediate.saveKey).toBe(
+      'opencode-v2-storage-github-fro-bot-.github-main-Linux-38026680860-1-fro-bot-remediate',
+    )
+    expect(observe.saveKey).toBe('opencode-v2-storage-github-fro-bot-.github-main-Linux-38026680860-1-fro-bot-observe')
     expect(observe.artifactName).toBe('opencode-logs-38026680860-1-fro-bot-observe')
     expect(observe.sessionKey).toMatch(/^schedule-[0-9a-f]{8}-38026680860-fro-bot-observe$/)
   })
@@ -115,7 +117,7 @@ describe('invocation identity across a multi-job run', () => {
 
   it('old-format entries (no identity suffix) remain restorable by prefix', () => {
     // #given the entry Remediate saved before this change, and the restore prefixes a new Observe run uses
-    const oldEntry = 'opencode-storage-github-fro-bot-.github-main-Linux-38026680860-1'
+    const oldEntry = 'opencode-v2-storage-github-fro-bot-.github-main-Linux-38026680860-1'
     const [refScoped, repoScoped] = buildRestoreKeys(components)
 
     // #then it still matches both prefixes (restore keys never include the run ID or identity)
