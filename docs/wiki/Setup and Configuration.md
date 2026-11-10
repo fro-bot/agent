@@ -66,7 +66,7 @@ summary: "Generation-aware tool installation, permission gates, provider credent
 
 The setup module (`src/services/setup/`) bootstraps the CI environment before agent execution can begin. It installs runtime dependencies, configures authentication, assembles the OpenCode configuration, and manages a tools cache to speed up subsequent runs.
 
-Before setup is skipped, `ensureOpenCodeAvailable()` in `packages/runtime/src/agent/server.ts` compares the available executable's reported version with the requested pin, including the harness suffix. A single leading `v` and the equivalent `-harness.`/`+harness.` spellings are normalized; a different stock release, harness build, or provenance-reporting shim triggers auto-setup instead of displacing the pinned download. An explicit `OPENCODE_PATH` mismatch emits a warning because setup is replacing an operator-selected executable.
+Setup runs on every invocation. `ensureOpenCodeAvailable()` in `packages/runtime/src/agent/server.ts` has no shortcut for a binary that is already on the runner, even one that reports the pinned version (a self-hosted runner, or an earlier fro-bot step in the same job, whose `addPath` persists): setup also carries the per-invocation work no existing binary can supply — gh CLI auth, git identity, the Systematic config and the provider keys. A warm runner stays cheap because setup restores the binary from the tools cache with its digest checked. The Action then runs the binary setup provides and exports it as `OPENCODE_PATH`; an operator-set `OPENCODE_PATH` that names something else is replaced, with a warning.
 
 ## Installation Sequence
 
@@ -101,7 +101,7 @@ Default versions are defined in `packages/runtime/src/shared/constants.ts` (shar
 | OpenCode CLI | `DEFAULT_OPENCODE_VERSION`   | The AI coding agent platform             |
 | Systematic   | `DEFAULT_SYSTEMATIC_VERSION` | OpenCode plugin for structured workflows |
 
-`systematic-version` can be overridden per run. `opencode-version` accepts only the recorded V2 pin (unset, `latest`, or the exact pin with or without a `v`): any other value fails input parsing, so a pre-installed binary of another version is never reused. Stock tool pins are updated via Renovate-managed PRs. The OpenCode default is the stock V2 pin in `opencode-v2-pin.json`: Renovate bumps its `version` and a post-upgrade task regenerates the per-asset digests. A harness release does not change the Action default.
+`systematic-version` can be overridden per run. `opencode-version` accepts only the recorded V2 pin (unset, `latest`, or the exact pin with or without a `v`): any other value fails input parsing, so a binary of another version already on the runner is never used. Stock tool pins are updated via Renovate-managed PRs. The OpenCode default is the stock V2 pin in `opencode-v2-pin.json`: Renovate bumps its `version` and a post-upgrade task regenerates the per-asset digests. A harness release does not change the Action default.
 
 The bundled Systematic default is currently `3.32.0`, shared by V1 and V2. Its pin participates in the tools-cache key, so advancing it triggers a fresh plugin installation even when the OpenCode binary itself is already cached.
 

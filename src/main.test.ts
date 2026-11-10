@@ -1,26 +1,53 @@
 import type {Buffer} from 'node:buffer'
 import {spawn} from 'node:child_process'
-import {chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync} from 'node:fs'
+import {chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync} from 'node:fs'
+import {createServer, type Server} from 'node:http'
 import {tmpdir} from 'node:os'
 import * as path from 'node:path'
 import process from 'node:process'
 import {fileURLToPath, pathToFileURL} from 'node:url'
+import {FRO_BOT_PLUGIN_VERSION} from '@fro-bot/runtime'
 import {afterAll, beforeAll, expect, it} from 'vitest'
-import {DEFAULT_OPENCODE_VERSION} from './shared/constants.js'
+import {getPlatformInfo, RECORDED_V2_PIN, resolveStockV2Policy} from './services/setup/opencode.js'
+import {pluginCacheDir, resolvePluginSpecsV2} from './services/setup/plugin-install-v2.js'
+import {DEFAULT_OPENCODE_VERSION, DEFAULT_SYSTEMATIC_VERSION} from './shared/constants.js'
 
-// The fake `opencode` reports this version, and runMain pins the same value via `opencode-version`: the Action only
-// reuses an existing binary whose `--version` exactly equals the pin, so the two must stay in lockstep.
+// The fake `opencode` binaries report this version. Setup runs on every invocation, so the bundle needs an install it can
+// find without a download: `seedHermeticSetup` plants one in the tool cache under the digest-bound name setup looks up.
 const MOCK_OPENCODE_VERSION = DEFAULT_OPENCODE_VERSION
 
 // Isolated temp directories for test data and mock tools
 let testDataDir: string
 let mockBinDir: string
+// Stands in for the services setup talks to, so the bundled Action completes setup offline and fast: the Actions cache
+// (a lookup answers "no entry", 204; without a reachable service the cache client retries with backoff for longer than
+// these tests run) and the GitHub API (the bot identity lookups behind gh auth and the git identity).
+let runnerServices: Server
+let runnerServicesUrl = ''
 
-beforeAll(() => {
+beforeAll(async () => {
+  runnerServices = createServer((request, response) => {
+    const url = request.url ?? ''
+    if (url.startsWith('/user') || url.startsWith('/users/')) {
+      response.setHeader('content-type', 'application/json')
+      response.end(JSON.stringify({login: 'fro-bot[bot]', id: 4242, type: 'Bot'}))
+      return
+    }
+    response.statusCode = 204
+    response.end()
+  })
+  await new Promise<void>(resolve => runnerServices.listen(0, '127.0.0.1', resolve))
+  const address = runnerServices.address()
+  if (address === null || typeof address === 'string') throw new Error('runner services stand-in did not bind a port')
+  runnerServicesUrl = `http://127.0.0.1:${String(address.port)}`
+
   testDataDir = mkdtempSync(path.join(tmpdir(), 'fro-bot-test-'))
   mockBinDir = mkdtempSync(path.join(tmpdir(), 'fro-bot-mock-bin-'))
 
   // Create mock opencode binary that responds to --version
+  mkdirSync(path.join(testDataDir, 'home'), {recursive: true})
+  seedHermeticSetup()
+
   const mockOpenCode = path.join(mockBinDir, 'opencode')
   // MOCK_OPENCODE_LOG, when set, records every invocation, so a test can prove the binary was never executed.
   writeFileSync(
@@ -29,12 +56,47 @@ beforeAll(() => {
     'utf8',
   )
   chmodSync(mockOpenCode, 0o755)
+
+  // `gh auth login --with-token` would otherwise validate the fake token against github.com.
+  const mockGh = path.join(mockBinDir, 'gh')
+  writeFileSync(mockGh, '#!/bin/sh\nexit 0\n', 'utf8')
+  chmodSync(mockGh, 0o755)
 })
 
-afterAll(() => {
+afterAll(async () => {
+  await new Promise<void>(resolve => runnerServices.close(() => resolve()))
   rmSync(testDataDir, {recursive: true, force: true})
   rmSync(mockBinDir, {recursive: true, force: true})
 })
+
+/**
+ * The Action always runs setup, which restores OpenCode from the runner tool cache when the digest-bound entry is
+ * there. Plant that entry (a script that reports the pin) and both plugin cache directories, so the bundled Action
+ * under test completes setup offline instead of downloading a release.
+ */
+function seedHermeticSetup(): void {
+  const {cacheVersion} = resolveStockV2Policy(DEFAULT_OPENCODE_VERSION, getPlatformInfo(), RECORDED_V2_PIN)
+  const {arch} = getPlatformInfo()
+  const versionDir = path.join(toolCacheDir(), 'opencode', cacheVersion)
+  const installDir = path.join(versionDir, arch)
+  mkdirSync(installDir, {recursive: true})
+  const binary = path.join(installDir, 'opencode')
+  writeFileSync(binary, `#!/bin/sh\necho "opencode v${DEFAULT_OPENCODE_VERSION}"`, 'utf8')
+  chmodSync(binary, 0o755)
+  writeFileSync(`${installDir}.complete`, '', 'utf8')
+
+  const specs = resolvePluginSpecsV2(DEFAULT_SYSTEMATIC_VERSION)
+  if (!specs.success) throw new Error(specs.error.message)
+  for (const spec of specs.data.specs) {
+    const dir = pluginCacheDir(path.join(testDataDir, 'xdg-cache'), spec)
+    mkdirSync(dir, {recursive: true})
+    writeFileSync(path.join(dir, 'package.json'), JSON.stringify({name: spec, version: FRO_BOT_PLUGIN_VERSION}), 'utf8')
+  }
+}
+
+function toolCacheDir(): string {
+  return path.join(testDataDir, 'toolcache')
+}
 
 function isolatedHomeEnv(): Record<string, string> {
   return {
@@ -43,6 +105,9 @@ function isolatedHomeEnv(): Record<string, string> {
     XDG_DATA_HOME: testDataDir,
     XDG_STATE_HOME: path.join(testDataDir, 'xdg-state'),
     XDG_CACHE_HOME: path.join(testDataDir, 'xdg-cache'),
+    RUNNER_TOOL_CACHE: toolCacheDir(),
+    ACTIONS_CACHE_URL: `${runnerServicesUrl}/`,
+    ACTIONS_RUNTIME_TOKEN: 'test-runtime-token',
   }
 }
 
@@ -123,13 +188,14 @@ async function runMain(
     {
       'INPUT_OPENCODE-VERSION': MOCK_OPENCODE_VERSION,
       ...env,
-      GITHUB_API_URL: 'http://127.0.0.1:1',
+      GITHUB_API_URL: runnerServicesUrl,
     },
     timeoutMs,
   )
 }
 
-it('runs successfully with valid inputs', async () => {
+// Setup now runs in the child on every invocation (offline, from the seeded cache), so allow for a loaded machine.
+it('runs successfully with valid inputs', {timeout: 15000}, async () => {
   // Use 'push' event so routing skips — avoids unconditional bootstrap in test env
   const eventPayload = {ref: 'refs/heads/main'}
   const eventFile = path.join(testDataDir, 'push-event.json')

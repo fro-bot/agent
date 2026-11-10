@@ -82,7 +82,7 @@ function bootstrap(version: string, overrides: Partial<ActionInputs> = {}): Boot
   return {
     inputs: inputs(overrides),
     logger: createMockLogger(),
-    opencodeResult: {path: '/opt/opencode', version, didSetup: true},
+    opencodeResult: {path: '/opt/opencode', version},
     delivery: 'model-gh',
     responseFilePath: null,
     responseFilePathCandidates: null,

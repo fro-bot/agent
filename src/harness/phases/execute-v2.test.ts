@@ -99,7 +99,7 @@ function bootstrap(): BootstrapPhaseResult {
       repoSkills: false,
     },
     logger: mocks.logger,
-    opencodeResult: {path: 'opencode', version: '2.2.5', didSetup: false},
+    opencodeResult: {path: 'opencode', version: '2.2.5'},
     delivery: 'model-gh',
     responseFilePath: null,
     responseFilePathCandidates: null,

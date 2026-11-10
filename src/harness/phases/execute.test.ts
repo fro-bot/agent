@@ -122,7 +122,7 @@ function createBootstrap(
       repoSkills: false,
     },
     logger: mocks.logger,
-    opencodeResult: {path: 'opencode', version: '1.0.0', didSetup: false},
+    opencodeResult: {path: 'opencode', version: '1.0.0'},
     delivery: overrides.delivery ?? 'model-gh',
     responseFilePath: overrides.responseFilePath ?? null,
     responseFilePathCandidates: null,

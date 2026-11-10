@@ -105,11 +105,7 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
     runtimeSetupAdapter,
   )
 
-  if (opencodeResult.didSetup) {
-    logger.info('OpenCode auto-setup completed', {version: opencodeResult.version})
-  } else {
-    logger.info('OpenCode already available', {version: opencodeResult.version})
-  }
+  logger.info('OpenCode ready', {version: opencodeResult.version})
 
   core.saveState(STATE_KEYS.S3_ENABLED, String(inputs.storeConfig.enabled))
   core.saveState(STATE_KEYS.S3_BUCKET, inputs.storeConfig.bucket)

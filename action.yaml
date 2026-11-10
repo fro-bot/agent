@@ -86,7 +86,7 @@ inputs:
     required: false
     default: '5000'
   opencode-version:
-    description: OpenCode CLI version to install if auto-setup is needed. Defaults to the stock OpenCode V2 release pinned in source code if not set (`latest` means the same pin). Only that recorded release is supported (the exact pin, with or without a leading `v`); any other value is rejected at input parsing, before anything is looked up or downloaded. A V1 value (a stock 1.x version or a `+harness.`/`-harness.` build) is rejected because the Action no longer runs V1; to keep running V1, pin the Action to the last pre-cut release (see "Moving to OpenCode V2" in the README). An existing opencode is reused only when it reports exactly the pinned version.
+    description: OpenCode CLI version to install if auto-setup is needed. Defaults to the stock OpenCode V2 release pinned in source code if not set (`latest` means the same pin). Only that recorded release is supported (the exact pin, with or without a leading `v`); any other value is rejected at input parsing, before anything is looked up or downloaded. A V1 value (a stock 1.x version or a `+harness.`/`-harness.` build) is rejected because the Action no longer runs V1; to keep running V1, pin the Action to the last pre-cut release (see "Moving to OpenCode V2" in the README). Setup runs on every invocation, and the Action uses the binary setup provides, not one already on the runner.
     required: false
   systematic-version:
     description: Systematic plugin version to register with OpenCode. Defaults to version pinned in source code if not set.

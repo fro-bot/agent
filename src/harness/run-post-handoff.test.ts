@@ -210,7 +210,6 @@ async function armPhasesUpToRestore(): Promise<void> {
   vi.mocked(ensureOpenCodeAvailable).mockResolvedValue({
     path: '/opt/opencode',
     version: DEFAULT_OPENCODE_VERSION,
-    didSetup: false,
   })
   const {runRouting} = await import('./phases/routing.js')
   vi.mocked(runRouting).mockResolvedValue(routingResult())

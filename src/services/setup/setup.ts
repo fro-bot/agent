@@ -130,8 +130,7 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
     }
 
     // The config is built at spawn time (`buildCIConfigV2`, called from the cache-restore phase): it carries
-    // run-scoped paths and the provider key files, and must exist even when this setup is skipped because a matching
-    // binary is already installed. Nothing is written to the global config or exported here.
+    // run-scoped paths and the provider key files. Nothing is written to the global config or exported here.
 
     core.addPath(opencodeResult.path)
 

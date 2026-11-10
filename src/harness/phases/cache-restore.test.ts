@@ -125,7 +125,7 @@ function createBootstrapPhaseResult(overrides: Partial<BootstrapPhaseResult> = {
   return {
     inputs: createActionInputs(),
     logger: createMockLogger(),
-    opencodeResult: {path: '/usr/local/bin/opencode', version: '2.2.5', didSetup: false},
+    opencodeResult: {path: '/usr/local/bin/opencode', version: '2.2.5'},
     delivery: 'model-gh',
     responseFilePath: null,
     responseFilePathCandidates: null,

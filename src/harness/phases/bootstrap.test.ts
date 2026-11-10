@@ -101,7 +101,6 @@ describe('runBootstrap response-delivery wiring', () => {
 
     mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs()})
     mocks.ensureOpenCodeAvailable.mockResolvedValue({
-      didSetup: false,
       version: DEFAULT_OPENCODE_VERSION,
     })
     mocks.assertNoPersistedGitCredentials.mockResolvedValue(ok(undefined))
@@ -386,7 +385,6 @@ describe('runBootstrap git-credential-check wiring', () => {
 
     mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs()})
     mocks.ensureOpenCodeAvailable.mockResolvedValue({
-      didSetup: false,
       version: DEFAULT_OPENCODE_VERSION,
     })
     mocks.assertNoPersistedGitCredentials.mockResolvedValue(ok(undefined))

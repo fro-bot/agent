@@ -157,7 +157,7 @@ function createBootstrap(): BootstrapPhaseResult {
       repoSkills: false,
     },
     logger: createLogger({phase: 'test'}),
-    opencodeResult: {path: 'opencode', version: '1.0.0', didSetup: false},
+    opencodeResult: {path: 'opencode', version: '1.0.0'},
     delivery: 'model-gh',
     responseFilePath: null,
     responseFilePathCandidates: null,

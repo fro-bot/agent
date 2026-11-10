@@ -312,10 +312,9 @@ function parseRepoSkills(input: string): boolean {
  * `latest` mean that pin, and the pin itself is accepted with or without a `v` prefix, normalized to one spelling.
  *
  * Everything else is an input error, decided here before setup can look anything up or download anything. A V1 value
- * (stock or harness build, either spelling) says V1 is no longer run. Any other V2 version is refused too: setup's
- * stock-V2 policy would reject it, but `ensureOpenCodeAvailable` reuses a binary already on the runner whose version
- * matches the request before setup runs, so a pre-installed non-pin V2 binary would otherwise run unpinned and
- * unverified.
+ * (stock or harness build, either spelling) says V1 is no longer run. Any other V2 version is refused too. Setup's
+ * stock-V2 policy would reject it as well, but only after setup has started; failing here means no network call and
+ * one error for every unsupported value.
  *
  * `latest` is mapped first because `selectOpenCodeGeneration` cannot read it.
  */
