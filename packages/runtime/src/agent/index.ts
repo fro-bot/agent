@@ -247,8 +247,6 @@ export type {
 } from './server-v2.js'
 export {bootstrapOpenCodeServer, ensureOpenCodeAvailable} from './server.js'
 export type {OpenCodeServerHandle, ShutdownResult} from './server.js'
-export {createSessionTools, info, list, read, search} from './session-tools.js'
-export type {SessionToolDefinition, SessionTools} from './session-tools.js'
 export type {SetupAdapter} from './setup-adapter.js'
 export {reconcileShellsOnce} from './shell-jobs-v2.js'
 export type {ReconcileShellsOptions, ShellApi, ShellReconcileObservation} from './shell-jobs-v2.js'

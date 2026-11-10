@@ -1,4 +1,3 @@
-import type {Logger} from '../shared/logger.js'
 import type {CredentialDisposition} from './response-delivery.js'
 
 /**
@@ -17,10 +16,6 @@ export interface SetupInputs {
 }
 
 export interface SetupAdapter {
-  readonly verifyOpenCodeAvailable: (
-    opencodePath: string | null,
-    logger: Logger,
-  ) => Promise<{available: boolean; version: string | null}>
   readonly runSetup: (
     inputs: SetupInputs,
     githubToken: string,

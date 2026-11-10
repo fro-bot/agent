@@ -359,5 +359,4 @@ export interface EnsureOpenCodeResult {
   /** Executable path, never the install directory — callers may spawn it. */
   readonly path: string
   readonly version: string
-  readonly didSetup: boolean
 }

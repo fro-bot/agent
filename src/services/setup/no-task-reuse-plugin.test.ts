@@ -1,9 +1,5 @@
-import * as fs from 'node:fs/promises'
-import * as path from 'node:path'
-import {pathToFileURL} from 'node:url'
 import {describe, expect, it} from 'vitest'
-// The single source of truth. The gateway image COPYs this file as-is; the Action's tsdown build relocates it
-// to dist/no-task-reuse.js. Same logic, one file, so these cases are the contract for both surfaces.
+// The single source of truth. The gateway image COPYs this file as-is.
 import sourcePlugin, {rejectTaskReuse, TASK_REUSE_REJECTION} from '../../../deploy/plugins/no-task-reuse.mjs'
 
 type Plugin = typeof sourcePlugin
@@ -12,8 +8,6 @@ interface PluginModule {
   readonly rejectTaskReuse: typeof rejectTaskReuse
   readonly TASK_REUSE_REJECTION: string
 }
-
-const DIST_ASSET_PATH = path.join(import.meta.dirname, '..', '..', '..', 'dist', 'no-task-reuse.js')
 
 const base = {description: 'd', prompt: 'p', subagent_type: 'general'}
 const INPUT = {tool: 'task', sessionID: 'ses_root', callID: 'call_1'}
@@ -107,38 +101,3 @@ function exercise(mod: PluginModule): void {
 describe('deploy/plugins/no-task-reuse.mjs (source of truth)', () => {
   exercise({default: sourcePlugin, rejectTaskReuse, TASK_REUSE_REJECTION})
 })
-
-describe('dist/no-task-reuse.js (the bundle the Action ships)', () => {
-  it('behaves exactly as the source, case for case', async () => {
-    // #given the committed bundle: a missing one is a packaging fault, not a reason to skip the check, because
-    // the Action copies this file and an unbuilt checkout would otherwise pass while shipping no guard
-    const present = await fs.access(DIST_ASSET_PATH).then(
-      () => true,
-      () => false,
-    )
-    expect(present, `${DIST_ASSET_PATH} is missing: run \`bun run build\` and commit dist/`).toBe(true)
-    const built = (await import(pathToFileURL(DIST_ASSET_PATH).href)) as PluginModule
-
-    // #then the exports and the model-visible rejection are identical to the source
-    expect(built.TASK_REUSE_REJECTION).toBe(TASK_REUSE_REJECTION)
-    expect(built.default.id).toBe(sourcePlugin.id)
-
-    // #then and every accept/reject decision matches
-    for (const {args} of [...REJECTED, ...PASSED]) {
-      const sourceOutcome = outcome(() => rejectTaskReuse(INPUT, {args}))
-      const builtOutcome = outcome(() => built.rejectTaskReuse(INPUT, {args}))
-      expect(builtOutcome).toEqual(sourceOutcome)
-    }
-    expect(outcome(() => built.rejectTaskReuse({...INPUT, tool: 'bash'}, {args: {task_id: 'x'}}))).toBe('pass')
-    expect(Object.keys(await built.default.server())).toEqual(['tool.execute.before'])
-  })
-})
-
-function outcome(fn: () => void): string {
-  try {
-    fn()
-    return 'pass'
-  } catch (error) {
-    return error instanceof Error ? `throw:${error.message}` : 'throw:?'
-  }
-}

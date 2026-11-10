@@ -1,13 +1,12 @@
 /**
- * The generation selector of `runExecute`: one choice, made once, that covers the main run AND the overflow-recovery
- * restart. The V1 side is pinned by `execute.test.ts` (unedited); this file pins that V1 stays off the V2 executor and
- * that a V2 run never reaches the V1 one.
+ * `runExecute` on the V2 backend: one backend, built once, that covers the main run AND the overflow-recovery restart.
+ * The gating logic around it (when a recovery runs at all) is pinned by `execute.test.ts`.
  */
 import type {OpenCodeV2ServerHandle, OwnershipLedger, SessionSearchResult} from '@fro-bot/runtime'
 import type {AgentResult} from '../../features/agent/types.js'
 import type {MetricsCollector} from '../../features/observability/index.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
-import type {CacheRestorePhaseResult, CacheRestoreV2PhaseResult} from './cache-restore.js'
+import type {CacheRestorePhaseResult} from './cache-restore.js'
 import type {RoutingPhaseResult} from './routing.js'
 import type {SessionPrepPhaseResult} from './session-prep.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
@@ -15,12 +14,7 @@ import {ARCHIVE_TIMEOUT_MS} from './execute-v2.js'
 import {runExecute} from './execute.js'
 
 const mocks = vi.hoisted(() => ({
-  executeOpenCode: vi.fn(),
   executeOpenCodeV2: vi.fn(),
-  archiveSession: vi.fn(),
-  searchSessions: vi.fn(),
-  writeSessionSummary: vi.fn(),
-  findLatestSession: vi.fn(),
   updateSession: vi.fn(),
   stopAndConfirmQuietV2: vi.fn(),
   getInput: vi.fn(),
@@ -41,15 +35,10 @@ vi.mock('@fro-bot/runtime', async importOriginal => {
   const original: typeof import('@fro-bot/runtime') = await importOriginal()
   return {
     ...original,
-    archiveSession: mocks.archiveSession,
-    findLatestSession: mocks.findLatestSession,
-    searchSessions: mocks.searchSessions,
-    writeSessionSummary: mocks.writeSessionSummary,
     resolveResponseDelivery: vi.fn(() => ({delivery: 'file-convention', credential: 'withhold'})),
   }
 })
 vi.mock('../../features/agent/index.js', () => ({
-  executeOpenCode: mocks.executeOpenCode,
   resolveOutputMode: vi.fn(() => 'branch-pr'),
 }))
 vi.mock('../../features/agent/execution-v2.js', () => ({
@@ -110,7 +99,7 @@ function bootstrap(): BootstrapPhaseResult {
       repoSkills: false,
     },
     logger: mocks.logger,
-    opencodeResult: {path: 'opencode', version: '2.2.5', didSetup: false},
+    opencodeResult: {path: 'opencode', version: '2.2.5'},
     delivery: 'model-gh',
     responseFilePath: null,
     responseFilePathCandidates: null,
@@ -194,21 +183,8 @@ function metrics(): MetricsCollector {
   }
 }
 
-function v1CacheRestore(): CacheRestorePhaseResult {
+function makeCacheRestore(): CacheRestorePhaseResult {
   return {
-    cacheResult: {hit: true, key: 'k', restoredPath: '/c', corrupted: false, source: 'cache'},
-    cacheStatus: 'hit',
-    serverHandle: {
-      client: {} as CacheRestorePhaseResult['serverHandle']['client'],
-      server: {url: 'http://127.0.0.1:4096', close: vi.fn()},
-      shutdown: vi.fn().mockResolvedValue({quiesced: true}),
-    },
-  }
-}
-
-function v2CacheRestore(): CacheRestoreV2PhaseResult {
-  return {
-    generation: 'v2',
     cacheResult: {hit: true, key: 'k', restoredPath: '/c', corrupted: false, source: 'cache'},
     cacheStatus: 'hit',
     serverHandle: {
@@ -221,50 +197,30 @@ function v2CacheRestore(): CacheRestoreV2PhaseResult {
   }
 }
 
-describe('runExecute generation selector', () => {
+describe('runExecute on the V2 backend', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mocks.getInput.mockReturnValue('branch-pr')
-    mocks.archiveSession.mockResolvedValue(true)
-    mocks.searchSessions.mockResolvedValue([])
     mocks.updateSession.mockResolvedValue({success: true, data: undefined})
     mocks.stopAndConfirmQuietV2.mockResolvedValue({quiet: true})
   })
 
-  it('leaves a V1 run on the V1 executor and never touches the V2 one', async () => {
+  it('runs on the V2 executor with the invocation ledger', async () => {
     // #given
-    mocks.executeOpenCode.mockResolvedValue(agentResult({success: true, exitCode: 0, error: null, llmError: null}))
-
-    // #when
-    const result = await runExecute(bootstrap(), routing(), v1CacheRestore(), sessionPrep(), metrics(), 0)
-
-    // #then
-    expect(result.success).toBe(true)
-    expect(mocks.executeOpenCode).toHaveBeenCalledTimes(1)
-    expect(mocks.executeOpenCodeV2).not.toHaveBeenCalled()
-    expect(mocks.writeSessionSummary).toHaveBeenCalledTimes(1)
-  })
-
-  it('runs a V2 run on the V2 executor with the invocation ledger and never touches the V1 one', async () => {
-    // #given
-    const cacheRestore = v2CacheRestore()
+    const cacheRestore = makeCacheRestore()
     mocks.executeOpenCodeV2.mockResolvedValue(
       agentResult({success: true, exitCode: 0, error: null, llmError: null, sessionId: 'ses_v2'}),
     )
 
     // #when
-    const result = await runExecute(bootstrap(), routing(), cacheRestore, sessionPrep(), metrics(), 0)
+    const result = await runExecute(bootstrap(), routing(), cacheRestore, sessionPrep(), metrics())
 
     // #then
     expect(result).toMatchObject({success: true, sessionId: 'ses_v2'})
-    expect(mocks.executeOpenCode).not.toHaveBeenCalled()
     expect(mocks.executeOpenCodeV2).toHaveBeenCalledTimes(1)
     const call = mocks.executeOpenCodeV2.mock.calls[0]
     expect(call?.[3]).toBe(cacheRestore.serverHandle)
     expect(call?.[4]).toBe(result.ownershipLedger)
-    // V2 writes no run summary into the session: the SDK client is V1's, and the V2 route that adds text only queues it
-    // in the inbox, where nothing delivers it before the server exits (#2029).
-    expect(mocks.writeSessionSummary).not.toHaveBeenCalled()
   })
 
   it('routes the overflow-recovery restart through the V2 executor, archiving over the V2 route', async () => {
@@ -279,15 +235,13 @@ describe('runExecute generation selector', () => {
     // #when
     let result: Awaited<ReturnType<typeof runExecute>>
     try {
-      result = await runExecute(bootstrap(), routing(), v2CacheRestore(), sessionPrep(), metrics(), 0)
+      result = await runExecute(bootstrap(), routing(), makeCacheRestore(), sessionPrep(), metrics())
     } finally {
       nowSpy.mockRestore()
     }
 
-    // #then both calls ran on V2, V1 ran nothing, and the overflowed session was archived by the V2 route
+    // #then both calls ran on V2, and the overflowed session was archived by the V2 route
     expect(mocks.executeOpenCodeV2).toHaveBeenCalledTimes(2)
-    expect(mocks.executeOpenCode).not.toHaveBeenCalled()
-    expect(mocks.archiveSession).not.toHaveBeenCalled()
     expect(mocks.updateSession).toHaveBeenCalledWith(
       expect.objectContaining({sessionId: 'overflowed-session', archived: true}),
     )
@@ -315,7 +269,7 @@ describe('runExecute generation selector', () => {
       })
 
     // #when
-    const result = await runExecute(bootstrap(), routing(), v2CacheRestore(), sessionPrep(), metrics(), 0)
+    const result = await runExecute(bootstrap(), routing(), makeCacheRestore(), sessionPrep(), metrics())
 
     // #then the overflowed observation ended at the restart; the result carries the replacement's
     expect(overflowedStop).toHaveBeenCalledTimes(1)
@@ -333,7 +287,7 @@ describe('runExecute generation selector', () => {
     })
 
     // #when
-    const result = await runExecute(bootstrap(), routing(), v2CacheRestore(), sessionPrep(), metrics(), 0)
+    const result = await runExecute(bootstrap(), routing(), makeCacheRestore(), sessionPrep(), metrics())
 
     // #then it is neither stopped here nor dropped
     expect(stop).not.toHaveBeenCalled()
@@ -353,7 +307,7 @@ describe('runExecute generation selector', () => {
       // #when
       // No Action deadline, so the time the archive burns does not use up the restart's budget.
       const noDeadline = {...bootstrap(), inputs: {...bootstrap().inputs, timeoutMs: 0}}
-      const running = runExecute(noDeadline, routing(), v2CacheRestore(), sessionPrep(), metrics(), 0).then(value => {
+      const running = runExecute(noDeadline, routing(), makeCacheRestore(), sessionPrep(), metrics()).then(value => {
         result = value
       })
       await vi.advanceTimersByTimeAsync(ARCHIVE_TIMEOUT_MS - 1_000)
@@ -377,7 +331,7 @@ describe('runExecute generation selector', () => {
     mocks.executeOpenCodeV2.mockResolvedValueOnce({...agentResult(), sendUncertain: true})
 
     // #when
-    const result = await runExecute(bootstrap(), routing(), v2CacheRestore(), sessionPrep(), metrics(), 0)
+    const result = await runExecute(bootstrap(), routing(), makeCacheRestore(), sessionPrep(), metrics())
 
     // #then nothing was replayed: no stop-and-archive, no replacement, and the flag that vetoes publication and the
     // save is still on the result
@@ -396,7 +350,7 @@ describe('runExecute generation selector', () => {
     })
 
     // #when
-    const result = await runExecute(bootstrap(), routing(), v2CacheRestore(), sessionPrep(), metrics(), 0)
+    const result = await runExecute(bootstrap(), routing(), makeCacheRestore(), sessionPrep(), metrics())
 
     // #then the flag survives the boundary, so the run is vetoed
     expect(mocks.executeOpenCodeV2).toHaveBeenCalledTimes(2)
@@ -412,7 +366,7 @@ describe('runExecute generation selector', () => {
       )
 
     // #when
-    const result = await runExecute(bootstrap(), routing(), v2CacheRestore(), sessionPrep(), metrics(), 0)
+    const result = await runExecute(bootstrap(), routing(), makeCacheRestore(), sessionPrep(), metrics())
 
     // #then
     expect(result).toMatchObject({success: true, observationGap: true})
@@ -426,7 +380,7 @@ describe('runExecute generation selector', () => {
       .mockResolvedValueOnce(agentResult({success: true, exitCode: 0, error: null, llmError: null}))
 
     // #when
-    const result = await runExecute(bootstrap(), routing(), v2CacheRestore(), sessionPrep(), metrics(), 0)
+    const result = await runExecute(bootstrap(), routing(), makeCacheRestore(), sessionPrep(), metrics())
 
     // #then
     expect(result.overflowRecovery).toMatchObject({archiveSucceeded: false})
@@ -445,12 +399,11 @@ describe('runExecute generation selector', () => {
     )
 
     // #when
-    const result = await runExecute(bootstrap(), routing(), v2CacheRestore(), sessionPrep(), metrics(), 0)
+    const result = await runExecute(bootstrap(), routing(), makeCacheRestore(), sessionPrep(), metrics())
 
     // #then nothing was archived and no replacement prompt went out
     expect(mocks.executeOpenCodeV2).toHaveBeenCalledTimes(1)
     expect(mocks.updateSession).not.toHaveBeenCalledWith(expect.objectContaining({archived: true}))
-    expect(mocks.searchSessions).not.toHaveBeenCalled()
 
     // #and the overflowed result stands, failed and unresolved, for the normal stop and decline path
     expect(result).toMatchObject({
@@ -468,7 +421,7 @@ describe('runExecute generation selector', () => {
     mocks.executeOpenCodeV2.mockResolvedValueOnce(agentResult())
 
     // #when
-    const result = await runExecute(bootstrap(), routing(), v2CacheRestore(), sessionPrep(), metrics(), 0)
+    const result = await runExecute(bootstrap(), routing(), makeCacheRestore(), sessionPrep(), metrics())
 
     // #then an empty ledger does not make an unconfirmed stop look clean
     expect(mocks.executeOpenCodeV2).toHaveBeenCalledTimes(1)
@@ -486,7 +439,7 @@ describe('runExecute generation selector', () => {
     )
 
     // #when
-    const result = await runExecute(bootstrap(), routing(), v2CacheRestore(), sessionPrep(), metrics(), 0)
+    const result = await runExecute(bootstrap(), routing(), makeCacheRestore(), sessionPrep(), metrics())
 
     // #then
     expect(mocks.executeOpenCodeV2).toHaveBeenCalledTimes(1)
@@ -515,7 +468,7 @@ describe('runExecute generation selector', () => {
       .mockResolvedValueOnce(agentResult({success: true, exitCode: 0, error: null, llmError: null}))
 
     // #when
-    const result = await runExecute(bootstrap(), routing(), v2CacheRestore(), sessionPrep(), metrics(), 0)
+    const result = await runExecute(bootstrap(), routing(), makeCacheRestore(), sessionPrep(), metrics())
 
     // #then the stop is aimed at the overflowed session's directory and comes first; nothing is left unresolved
     expect(calls.slice(0, 2)).toEqual(['stop', 'archive'])
@@ -533,8 +486,8 @@ describe('runExecute generation selector', () => {
       }
       return new Response('{}', {status: 404})
     })
-    const cacheRestore = v2CacheRestore()
-    const withFetch: CacheRestoreV2PhaseResult = {
+    const cacheRestore = makeCacheRestore()
+    const withFetch: CacheRestorePhaseResult = {
       ...cacheRestore,
       serverHandle: {...cacheRestore.serverHandle, fetch: fetchRoute},
     }
@@ -544,10 +497,9 @@ describe('runExecute generation selector', () => {
     const recoveryContext: readonly SessionSearchResult[] = []
 
     // #when
-    const result = await runExecute(bootstrap(), routing(), withFetch, sessionPrep(), metrics(), 0)
+    const result = await runExecute(bootstrap(), routing(), withFetch, sessionPrep(), metrics())
 
-    // #then the V1 search was never used, and the V2 listing went through the server's own route
-    expect(mocks.searchSessions).not.toHaveBeenCalled()
+    // #then the V2 listing went through the server's own route
     expect(fetchRoute).toHaveBeenCalledWith(expect.stringContaining('/api/session?'), expect.anything())
     expect(result.overflowRecovery?.recovered).toBe(true)
     expect(recoveryContext).toEqual([])

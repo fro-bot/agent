@@ -2,8 +2,7 @@
 
 // Mints a short-lived GitHub App installation token for autonomous workflow runs.
 //
-// Security contract (docs/plans/2026-07-11-002-feat-inline-app-token-mint-integrate-plan.md),
-// mirroring scripts/harness/mint-broker-credential.ts:
+// Security contract (docs/plans/2026-07-11-002-feat-inline-app-token-mint-integrate-plan.md):
 //   1. Read the App private key from process.env and IMMEDIATELY mask it via
 //      core.setSecret, before any parsing, HTTP call, error log, or stack
 //      trace can surface it.
@@ -30,7 +29,7 @@
 // This file uses no sibling .ts imports. main() is exported (not called at
 // module top level) and only invoked by the guard at the bottom of this
 // file, which fires solely when the script is executed directly — mirrors
-// mint-broker-credential.ts and packages/harness/scripts/build-platform.ts.
+// packages/harness/scripts/build-platform.ts.
 // This keeps the module import-safe for the test file (imported under
 // Vitest, .js extension), while `node --experimental-strip-types` execution
 // still runs main().
@@ -119,8 +118,7 @@ export type ValidateTokenResponseResult =
 
 /**
  * Validate the installation access-token response ALL-OR-NOTHING. Pure — no
- * I/O, never throws; every branch returns a discriminated result. Mirrors
- * validateBrokerResponse in mint-broker-credential.ts.
+ * I/O, never throws; every branch returns a discriminated result.
  */
 export function validateTokenResponse(
   parsed: unknown,

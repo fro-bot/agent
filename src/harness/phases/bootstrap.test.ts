@@ -4,6 +4,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import process from 'node:process'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import {DEFAULT_OPENCODE_VERSION} from '../../shared/constants.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {err, ok} from '../../shared/types.js'
 
@@ -38,9 +39,10 @@ vi.mock('../config/inputs.js', () => ({
   parseActionInputs: mocks.parseActionInputs,
 }))
 
-vi.mock('../../features/agent/index.js', () => ({
-  ensureOpenCodeAvailable: mocks.ensureOpenCodeAvailable,
-}))
+vi.mock('@fro-bot/runtime', async importOriginal => {
+  const original = await importOriginal<typeof import('@fro-bot/runtime')>()
+  return {...original, ensureOpenCodeAvailable: mocks.ensureOpenCodeAvailable}
+})
 
 // The real preflight shells out to git; these response-delivery wiring tests don't exercise it —
 // its own real-git behavior is covered exhaustively by git-credential-check.integration.test.ts.
@@ -60,7 +62,7 @@ function createActionInputs(overrides: Partial<ActionInputs> = {}): ActionInputs
     trustedHeadSha: '',
     prompt: null,
     sessionRetention: 50,
-    opencodeVersion: '1.0.0',
+    opencodeVersion: DEFAULT_OPENCODE_VERSION,
     outputMode: 'branch-pr',
     agent: null,
     model: null,
@@ -99,8 +101,7 @@ describe('runBootstrap response-delivery wiring', () => {
 
     mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs()})
     mocks.ensureOpenCodeAvailable.mockResolvedValue({
-      didSetup: false,
-      version: '1.0.0',
+      version: DEFAULT_OPENCODE_VERSION,
     })
     mocks.assertNoPersistedGitCredentials.mockResolvedValue(ok(undefined))
   })
@@ -384,8 +385,7 @@ describe('runBootstrap git-credential-check wiring', () => {
 
     mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs()})
     mocks.ensureOpenCodeAvailable.mockResolvedValue({
-      didSetup: false,
-      version: '1.0.0',
+      version: DEFAULT_OPENCODE_VERSION,
     })
     mocks.assertNoPersistedGitCredentials.mockResolvedValue(ok(undefined))
   })

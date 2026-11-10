@@ -80,34 +80,4 @@ export default defineConfig([
     plugins: [defaultVersionInvariantPlugin()],
     noExternal: sharedNoExternal,
   },
-  {
-    // Dedicated build: session-tools.js is copied standalone into the CI OpenCode
-    // config dir (U3) as `tool/session.js`, so it must be a single file with no
-    // sibling-chunk dependency. Building it as its own tsdown config (separate
-    // rolldown invocation) prevents rolldown from splitting shared helpers into
-    // chunks shared with main.js/post.js.
-    entry: ['apps/action/src/session-tools.ts'],
-    fixedExtension: false,
-    deps: {onlyBundle: false},
-    minify: true,
-    sourcemap: false,
-    dts: false,
-    clean: false,
-    outputOptions: {
-      inlineDynamicImports: true,
-    },
-    noExternal: sharedNoExternal,
-  },
-  {
-    // The task-reuse guard shares ONE source with the gateway image: deploy/plugins/no-task-reuse.mjs is
-    // dependency-free plain ESM, so this build only relocates it to dist/no-task-reuse.js (setup copies it
-    // into the CI OpenCode config dir). Unminified so the shipped guard is readable in review.
-    entry: ['deploy/plugins/no-task-reuse.mjs'],
-    fixedExtension: false,
-    deps: {onlyBundle: false},
-    minify: false,
-    sourcemap: false,
-    dts: false,
-    clean: false,
-  },
 ])

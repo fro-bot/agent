@@ -12,7 +12,7 @@ sources:
   - src/features/agent/prompt-sender-v2.ts
   - AGENTS.md
   - src/harness/outcome.ts
-  - src/features/agent/streaming.ts
+  - src/features/agent/streaming-v2.ts
   - packages/runtime/src/agent/ownership-ledger.ts
   - packages/runtime/src/agent/server.ts
   - src/shared/cache-save-result.ts

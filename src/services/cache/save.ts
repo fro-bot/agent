@@ -10,9 +10,9 @@ import {STORAGE_VERSION} from '../../shared/constants.js'
 import {getGitHubRunAttempt, getInvocationIdentity} from '../../shared/env.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {htmlParagraph, htmlStrong, htmlText} from '../../shared/summary-html.js'
-import {buildSaveCacheKey, resolveSessionGeneration} from './cache-key.js'
+import {buildSaveCacheKey} from './cache-key.js'
 import {checkpointDatabase} from './checkpoint.js'
-import {buildCachePaths, buildCachePathsV2, deleteAuthJson} from './paths.js'
+import {buildCachePathsV2, deleteAuthJson} from './paths.js'
 import {defaultCacheAdapter, type SaveCacheOptions} from './types.js'
 
 async function writeStorageVersion(storagePath: string): Promise<void> {
@@ -123,16 +123,7 @@ async function writeCheckpointDeclineSummary(reason: string, logger: Logger): Pr
 }
 
 export async function saveCache(options: SaveCacheOptions): Promise<CacheSaveResult> {
-  const {
-    components,
-    runId,
-    logger,
-    storagePath,
-    authPath,
-    projectIdPath,
-    opencodeVersion,
-    cacheAdapter = defaultCacheAdapter,
-  } = options
+  const {components, runId, logger, storagePath, authPath, projectIdPath, cacheAdapter = defaultCacheAdapter} = options
 
   if (process.env.SKIP_CACHE === 'true') {
     logger.debug('Skipping cache save (SKIP_CACHE=true)')
@@ -144,9 +135,10 @@ export async function saveCache(options: SaveCacheOptions): Promise<CacheSaveRes
   // process-wide runner facts, not per-call configuration. Deriving both here is also what
   // guarantees the post-action retry (post.ts) saves under exactly the key cleanup would have.
   //
-  // V2 saves write only V2 keys (`opencode-v2-storage-*` in the cache, `sessions-v2/` in the object store); V1
-  // saves are unchanged. The generation comes from the same `opencodeVersion` the restore and the post hook use.
-  const generation = resolveSessionGeneration(opencodeVersion)
+  // Saves write only V2 keys (`opencode-v2-storage-*` in the cache, `sessions-v2/` in the object store), and the post
+  // hook saves under the same keys as cleanup. Whether to save at all is not decided here: `run.ts` declines the cleanup
+  // save, and never arms the post hook, for a run that ended before the V2 server started.
+  const generation: SessionGeneration = 'v2'
   const saveKey = buildSaveCacheKey(components, runId, getGitHubRunAttempt(), getInvocationIdentity(), generation)
   // Tracked across the try block (and visible to the catch below) because the store sync
   // and the cache write are independent backends: a thrown error from the cache write
@@ -179,10 +171,7 @@ export async function saveCache(options: SaveCacheOptions): Promise<CacheSaveRes
       return {cachePersisted: false, storePersisted: false, outcome: 'checkpoint-declined'}
     }
 
-    const cachePaths =
-      generation === 'v2'
-        ? buildCachePathsV2(storagePath, projectIdPath)
-        : await buildCachePaths(storagePath, projectIdPath, opencodeVersion)
+    const cachePaths = buildCachePathsV2(storagePath, projectIdPath)
     logger.info('Saving cache', {saveKey, paths: cachePaths})
 
     const hasContent = await hasCacheableContent(storagePath, cachePaths, generation)

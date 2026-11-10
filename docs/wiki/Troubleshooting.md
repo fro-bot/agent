@@ -29,13 +29,13 @@ sources:
   - src/harness/outcome.ts
   - src/features/observability/job-summary.ts
   - packages/runtime/src/agent/error-format/format.ts
-  - src/features/agent/execution.ts
+  - src/features/agent/execution-v2.ts
   - docs/solutions/integration-issues/permission-ask-dropped-by-ownership-filter-2026-09-19.md
   - src/services/cache/save.ts
   - src/shared/cache-save-result.ts
   - src/services/cache/cache-key.ts
   - src/services/setup/opencode.ts
-  - src/services/setup/systematic-plugin.ts
+  - src/services/setup/plugin-install-v2.ts
   - src/shared/brokered-push-paths.ts
   - src/features/delegated/brokered-push.ts
   - src/features/delegated/brokered-push-validation.ts
@@ -153,7 +153,7 @@ The platform and executable-path checks apply across generations; the advisory S
 If the run fails during setup rather than during agent execution:
 
 - **`Unsupported platform: <platform>/<arch>`** — the action supports Linux and macOS on x64 or arm64 only. This is rejected by name before any download is attempted. Windows runners and architectures outside that matrix are not supported. The default V2 pin also requires a recorded digest for the selected asset. See [[Setup and Configuration]].
-- **`EACCES` when spawning OpenCode** — historically caused by handing a consumer the install _directory_ where an executable path was required. If this recurs, the auto-setup log line records both the directory and the resolved binary path, which is enough to tell which one was exported as `OPENCODE_PATH`.
+- **`EACCES` when spawning OpenCode** — historically caused by handing a consumer the install _directory_ where an executable path was required. If this recurs, the `OpenCode setup completed` log line records both the directory and the resolved binary path, which is enough to tell which one was exported as `OPENCODE_PATH`.
 - **`Skipping tools cache save because Systematic plugin install did not complete`** — setup continues without the plugin rather than failing the run, so this is a warning, not a fatal error. Two hints accompany it. If the parent environment carries `NPM_CONFIG_*` variables, the warning names them and notes that the install child deliberately does not inherit them; that scrub is intentional and should not be worked around by allowlisting those keys. If the failure was a spawn error, the warning carries a path diagnosis stating what was actually found at the binary path — absent, a dangling symlink, a directory, or present-but-not-executable — along with the tail of the child's stderr.
 
 There is no install fallback. A V1 request (a harness build or a stock V1 version) that fails to download or verify fails the run with an error naming the requested version; it never falls back to the V2 pin. A failed V2 pin install fails the run, and a V2 version with no recorded digest is rejected before any download. [[Setup and Configuration]] explains the version identity and verification boundaries.

@@ -16,7 +16,7 @@ Highest-traffic entry points — see [STRUCTURE.md](STRUCTURE.md) for the full d
 | Task                     | Location                                                                             |
 | ------------------------ | ------------------------------------------------------------------------------------ |
 | Action orchestration     | `src/harness/run.ts` (`run`)                                                         |
-| Agent SDK execution      | `src/features/agent/execution.ts` (`executeOpenCode`)                                |
+| Agent execution (V2)     | `src/features/agent/execution-v2.ts` (`executeOpenCodeV2`)                           |
 | Event routing            | `src/features/triggers/router.ts` (`routeEvent`)                                     |
 | Event parsing / types    | `src/services/github/context.ts`, `src/services/github/types.ts` (`NormalizedEvent`) |
 | Prompt building          | `packages/runtime/src/agent/prompt.ts` (`buildAgentPrompt`)                          |
@@ -31,7 +31,7 @@ Highest-traffic entry points — see [STRUCTURE.md](STRUCTURE.md) for the full d
 - **Functions only**: No ES6 classes; closures for stateful patterns
 - **Logger injection**: Every function takes `logger` parameter
 - **Result types**: `Result<T, E>` from `@bfra.me/es` for recoverable errors
-- **Readonly interfaces**: All properties use `readonly` — except per-invocation mutable trackers threaded through the SSE event loop (`ActivityTracker` and its `RootFreshnessTracker` in `src/features/agent/streaming.ts`), where functional updates would allocate per token delta
+- **Readonly interfaces**: All properties use `readonly` — except per-invocation mutable trackers threaded through the SSE event loop (`ActivityTrackerV2` in `src/features/agent/streaming-v2.ts`), where functional updates would allocate per token delta
 - **Strict booleans**: No implicit falsy checks (`!value`); use explicit comparisons
 - **Adapter pattern**: `CacheAdapter`, `ExecAdapter` for testable I/O
 - **Prettier**: 120-char line width via `@bfra.me/prettier-config/120-proof`
@@ -70,9 +70,9 @@ For architecture (the four-layer rule, committed `dist/`, NormalizedEvent, dual 
 
 - **Node 24 required**: Matches `action.yaml` runtime
 - **19 RFCs total**: Foundation, cache, GitHub client, sessions, triggers, security, observability, comments, PR review, delegated work, setup, execution, SDK mode, file attachments, GraphQL context, additional triggers, post-action hook, agent-invokable delegated work, S3 backend
-- **SDK-based execution**: Uses `@opencode-ai/sdk` for server lifecycle + event streaming
+- **V2-only execution**: the Action runs only stock OpenCode V2, digest-pinned in `packages/runtime/src/shared/opencode-v2-pin.json`. A V1 `opencode-version` is rejected at input parsing (`parseOpenCodeVersion` in `src/harness/config/inputs.ts`); rollback is pinning the Action to the last pre-cut release (see the README's "Moving to OpenCode V2")
 - **Bundled Systematic plugin**: Setup injects `@fro.bot/systematic@<version>` into CI OpenCode config by default
-- **No `question` tool in CI**: the Action server is spawned with `OPENCODE_CLIENT=fro-bot-action` and `OPENCODE_ENABLE_QUESTION_TOOL` cleared (`pinQuestionToolOff` in `packages/runtime/src/agent/server.ts`) so upstream never registers the interactive `question` tool — nobody can answer in CI and a pending question blocks until the deadline (#1756). An operator value is overridden with a warning; the gateway is unaffected
+- **No `question` tool in CI**: nobody can answer in CI and a pending question blocks until the deadline (#1756), so the V2 permission rules (`buildPermissionRulesV2`) deny it; the gateway is unaffected
 - **Persistent memory**: Sessions survive across CI runs via Actions cache when the trigger permits cache writes; mention-driven `issue_comment` and `issues` runs require `s3-backup` for continuity
 - **Documented solutions**: `docs/solutions/` holds solutions to past problems (bugs, best practices, workflow patterns), organized by category with YAML frontmatter (`module`, `tags`, `problem_type`) — searchable when implementing or debugging in a documented area. `module` must use the closed taxonomy enforced by `scripts/module-taxonomy.test.ts`; update that exported list deliberately when a new subsystem is established
 - **Pre-push hook**: Rebuilds the Action bundle and fails if the committed `dist/` differs. Lint and the other package builds run at commit (`lint-staged`) and in CI

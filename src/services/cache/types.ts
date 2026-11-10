@@ -23,7 +23,6 @@ export interface RestoreCacheOptions {
   readonly storagePath: string
   readonly authPath: string
   readonly projectIdPath?: string
-  readonly opencodeVersion?: string | null
   readonly storeConfig?: ObjectStoreConfig
   readonly storeAdapter?: ObjectStoreAdapter
   readonly cacheAdapter?: CacheAdapter
@@ -50,7 +49,6 @@ export interface SaveCacheOptions {
   readonly storagePath: string
   readonly authPath: string
   readonly projectIdPath?: string
-  readonly opencodeVersion?: string | null
   readonly storeConfig?: ObjectStoreConfig
   readonly storeAdapter?: ObjectStoreAdapter
   readonly objectStorePublish?: ObjectStorePublish

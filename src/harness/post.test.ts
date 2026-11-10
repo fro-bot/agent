@@ -84,6 +84,22 @@ async function runPostWithRealSave(state: Record<string, string>) {
   return vi.mocked(actionsCache.saveCache)
 }
 
+// The upload keys the post hook wrote to the object store, from the real saveCache.
+async function uploadedKeysFor(state: Record<string, string>): Promise<readonly string[]> {
+  const {createS3Adapter} = await import('@fro-bot/runtime')
+  const uploaded: string[] = []
+  vi.mocked(createS3Adapter).mockReturnValue({
+    upload: async key => {
+      uploaded.push(key)
+      return ok(undefined)
+    },
+    download: async () => ok(undefined),
+    list: async () => ok([]),
+  })
+  await runPostWithRealSave(state)
+  return uploaded
+}
+
 describe('post action', () => {
   beforeEach(() => {
     vi.resetModules()
@@ -315,7 +331,7 @@ describe('post action', () => {
       delete process.env.GITHUB_WORKSPACE
     })
 
-    describe('session generation', () => {
+    describe('session keys', () => {
       let dataHome: string
       let dbPath: string
 
@@ -334,42 +350,48 @@ describe('post action', () => {
         await fs.rm(dataHome, {recursive: true, force: true})
       })
 
-      it('saves only V2 keys when the version state is a V2 pin', async () => {
-        // #given the main step recorded a V2 OpenCode version and an object store is configured
-        const actionsSave = await runPostWithRealSave({
-          shouldSaveCache: 'true',
-          cacheSaved: 'not-persisted',
-          opencodeVersion: '2.2.0',
-          ...storeState,
-        })
+      // The state `run.ts` leaves behind for a main step that crashed AFTER the V2 server started and before cleanup
+      // saved: `shouldSaveCache` is armed only at that point, and `cacheSaved` still holds its initial value. The run ->
+      // post handoff itself (state written by the real `run`, read by the real post hook) is in run-post-handoff.test.ts.
+      const crashedAfterServerStart = {shouldSaveCache: 'true', cacheSaved: 'not-persisted', ...storeState}
 
-        // #then the cache write uses the V2 key and path list, and nothing is saved under a V1 name
+      it('retries the save under V2 keys after a crash that came after the server started, and publishes nothing to the object store', async () => {
+        // #given
+        const uploaded = await uploadedKeysFor(crashedAfterServerStart)
+
+        // #then the cache write uses the V2 key and path list...
+        const {saveCache: actionsSave} = await import('@actions/cache')
         expect(actionsSave).toHaveBeenCalledTimes(1)
         expect(actionsSave).toHaveBeenCalledWith(
           [path.join(dataHome, 'opencode', 'storage'), '/runner/work/repo/repo/.git/opencode', dbPath],
           'opencode-v2-storage-github-test-owner-test-repo-main-Linux-12345-1',
         )
+
+        // #and the object-store publish stays withheld (the main step released the lease), so nothing is written under
+        // a V1 name there either. The V2 namespace itself is pinned in restore-save-flow.test.ts.
+        expect(uploaded).toEqual([])
       })
 
-      it('takes the V1 path when there is no version state', async () => {
-        // #given a main step that crashed before it saved the version
-        const actionsSave = await runPostWithRealSave({shouldSaveCache: 'true', cacheSaved: 'not-persisted'})
+      it('does not save when the main step ended before the server started (shouldSaveCache stays false)', async () => {
+        // #given the state `run` leaves for a bootstrap, setup or restore failure: it was never armed
+        const actionsSave = await runPostWithRealSave({shouldSaveCache: 'false', cacheSaved: 'not-persisted'})
 
-        // #then the save is the V1 save, byte for byte
-        expect(actionsSave).toHaveBeenCalledTimes(1)
-        expect(actionsSave.mock.calls[0]?.[1]).toBe('opencode-storage-github-test-owner-test-repo-main-Linux-12345-1')
+        // #then the post hook saves nothing, however much OpenCode data the runner holds
+        expect(actionsSave).not.toHaveBeenCalled()
       })
 
-      it('takes the V1 path for a V1 version state', async () => {
-        // #given a recorded V1 harness version
+      it('ignores a leftover OpenCode version state: the post hook always saves V2', async () => {
+        // #given state written by an older main step that recorded a V1 harness version
         const actionsSave = await runPostWithRealSave({
-          shouldSaveCache: 'true',
-          cacheSaved: 'not-persisted',
+          ...crashedAfterServerStart,
           opencodeVersion: '1.19.4+harness.5bde2635',
         })
 
-        // #then the V1 key is used
-        expect(actionsSave.mock.calls[0]?.[1]).toBe('opencode-storage-github-test-owner-test-repo-main-Linux-12345-1')
+        // #then the version is not read, and the key is the V2 key
+        expect(actionsSave).toHaveBeenCalledTimes(1)
+        expect(actionsSave.mock.calls[0]?.[1]).toBe(
+          'opencode-v2-storage-github-test-owner-test-repo-main-Linux-12345-1',
+        )
       })
     })
 

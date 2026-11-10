@@ -9,13 +9,12 @@ import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 // This suite pins the control-flow ordering save.ts's hasCacheableContent doc comment
 // depends on: a 'failed' checkpoint outcome must make saveCache return before
-// buildCachePaths is ever called, which is what makes it safe for that comment to
+// buildCachePathsV2 is ever called, which is what makes it safe for that comment to
 // say the write-ahead log can no longer be the sole holder of unmerged content by the
 // time hasCacheableContent runs. A future change that reintroduced a decline-then-inspect
 // path (checkpoint fails, but path-building and content inspection still proceed) would
 // fail this test without needing to know anything about save.ts's internals.
 const mocks = vi.hoisted(() => ({
-  buildCachePaths: vi.fn(),
   buildCachePathsV2: vi.fn(),
 }))
 
@@ -23,7 +22,6 @@ vi.mock('./paths.js', async importOriginal => {
   const original = await importOriginal<typeof import('./paths.js')>()
   return {
     ...original,
-    buildCachePaths: mocks.buildCachePaths.mockImplementation(original.buildCachePaths),
     buildCachePathsV2: mocks.buildCachePathsV2.mockImplementation(original.buildCachePathsV2),
   }
 })
@@ -73,11 +71,9 @@ describe('saveCache checkpoint-then-paths ordering', () => {
     await fs.rm(tempDir, {recursive: true, force: true})
   })
 
-  it('returns false without ever calling buildCachePaths when the checkpoint fails', async () => {
-    // #given a database held under an exclusive lock by an in-progress transaction on
-    // another connection, guaranteeing a real 'failed' checkpoint outcome — the harness's
-    // only signal that a writer is still alive, since serverHandle.shutdown() cannot
-    // observe the child process's exit
+  it('returns without building cache paths when the checkpoint fails', async () => {
+    // #given a database held under an exclusive lock by an in-progress transaction on another connection,
+    // guaranteeing a real 'failed' checkpoint outcome -- the harness's only signal that a writer is still alive
     const holder = new DatabaseSync(dbPath)
     holder.exec('PRAGMA journal_mode=WAL')
     holder.exec('CREATE TABLE sessions(id INTEGER PRIMARY KEY, data TEXT)')
@@ -95,78 +91,20 @@ describe('saveCache checkpoint-then-paths ordering', () => {
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '1.2.0',
       cacheAdapter: createStubCacheAdapter(),
     })
 
-    // #then the save is declined, and — the property this test exists to pin —
-    // buildCachePaths is never reached, because the checkpoint's failure returns
-    // before the path-building and content-inspection block below it ever runs
-    expect(result).toMatchObject({cachePersisted: false, storePersisted: false, outcome: 'checkpoint-declined'})
-    expect(mocks.buildCachePaths).not.toHaveBeenCalled()
-
-    holder.exec('COMMIT')
-    holder.close()
-  })
-
-  it('does call buildCachePaths once the checkpoint resolves (control case, proves the mock is wired correctly)', async () => {
-    // #given a healthy workspace with no database at all — checkpointDatabase resolves
-    // 'nothing-to-checkpoint' rather than 'failed'
-    await fs.writeFile(path.join(storagePath, 'session.json'), '{"session":"created"}', 'utf8')
-
-    const {saveCache} = await import('./save.js')
-
-    // #when saving cache
-    const result = await saveCache({
-      components: testComponents,
-      runId: 12345,
-      logger: createTestLogger(),
-      storagePath,
-      authPath,
-      opencodeVersion: '1.2.0',
-      cacheAdapter: createStubCacheAdapter(),
-    })
-
-    // #then the save proceeds and buildCachePaths is reached — confirming the mock
-    // above would have caught a missing call in the failed-checkpoint case, rather than
-    // silently passing because it is never exercised at all
-    expect(result).toMatchObject({cachePersisted: true, outcome: 'persisted'})
-    expect(mocks.buildCachePaths).toHaveBeenCalledTimes(1)
-  })
-  it("returns without building V2 cache paths when a V2 run's checkpoint fails", async () => {
-    // #given a database held under an exclusive lock, and a V2 run
-    const holder = new DatabaseSync(dbPath)
-    holder.exec('PRAGMA journal_mode=WAL')
-    holder.exec('CREATE TABLE sessions(id INTEGER PRIMARY KEY, data TEXT)')
-    holder.exec("INSERT INTO sessions (data) VALUES ('session-1')")
-    holder.exec('PRAGMA locking_mode=EXCLUSIVE')
-    holder.exec('BEGIN IMMEDIATE')
-    holder.exec("INSERT INTO sessions (data) VALUES ('in-flight')")
-
-    const {saveCache} = await import('./save.js')
-
-    // #when saving cache
-    const result = await saveCache({
-      components: testComponents,
-      runId: 12345,
-      logger: createTestLogger(),
-      storagePath,
-      authPath,
-      opencodeVersion: '2.2.0',
-      cacheAdapter: createStubCacheAdapter(),
-    })
-
-    // #then the V2 path builder is never reached, the same ordering the V1 path guarantees
+    // #then the save is declined, and -- the property this test exists to pin -- the path builder is never reached,
+    // because the checkpoint's failure returns before the path-building and content-inspection block below it runs
     expect(result).toMatchObject({cachePersisted: false, storePersisted: false, outcome: 'checkpoint-declined'})
     expect(mocks.buildCachePathsV2).not.toHaveBeenCalled()
-    expect(mocks.buildCachePaths).not.toHaveBeenCalled()
 
     holder.exec('COMMIT')
     holder.close()
   })
 
-  it("builds V2 paths, and only V2 paths, once a V2 run's checkpoint resolves", async () => {
-    // #given a healthy workspace and a V2 run
+  it('builds the cache paths once the checkpoint resolves (control case, proves the mock is wired correctly)', async () => {
+    // #given a healthy workspace with no database at all -- checkpointDatabase resolves 'nothing-to-checkpoint'
     await fs.writeFile(path.join(storagePath, 'session.json'), '{"session":"created"}', 'utf8')
 
     const {saveCache} = await import('./save.js')
@@ -178,13 +116,12 @@ describe('saveCache checkpoint-then-paths ordering', () => {
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '2.2.0',
       cacheAdapter: createStubCacheAdapter(),
     })
 
-    // #then the V2 builder supplies the list and the V1 builder is not consulted
+    // #then the save proceeds and the builder is reached -- confirming the mock above would have caught a missing call
+    // in the failed-checkpoint case, rather than silently passing because it is never exercised at all
     expect(result).toMatchObject({cachePersisted: true, outcome: 'persisted'})
     expect(mocks.buildCachePathsV2).toHaveBeenCalledTimes(1)
-    expect(mocks.buildCachePaths).not.toHaveBeenCalled()
   })
 })

@@ -1,5 +1,4 @@
-import type {FilePartInput} from '@opencode-ai/sdk'
-import type {AttachmentResult, AttachmentUrl, SkippedAttachment, ValidatedAttachment} from './types.js'
+import type {AttachmentResult, AttachmentUrl, FilePartInput, SkippedAttachment, ValidatedAttachment} from './types.js'
 import {pathToFileURL} from 'node:url'
 
 /**

@@ -64,6 +64,14 @@ function createMockStoreAdapter(overrides: Partial<ObjectStoreAdapter> = {}): Ob
   }
 }
 
+/**
+ * An object-store listing that holds `keys` under the V2 `sessions-v2/` namespace only, as a real bucket would: the V1
+ * `sessions/` listing (the restore fallback) finds nothing.
+ */
+function onlyV2Listing(keys: readonly string[]) {
+  return vi.fn(async (prefix: string) => ok(prefix.endsWith('/sessions-v2/') ? [...keys] : []))
+}
+
 const testStoreConfig: ObjectStoreConfig = {
   enabled: true,
   bucket: 'test-bucket',
@@ -141,7 +149,7 @@ describe('restoreCache', () => {
 
     const cacheRestore = vi.fn<CacheAdapter['restoreCache']>(async () => 'cache-key')
     const storeAdapter = createMockStoreAdapter({
-      list: vi.fn(async () => ok(['fro-bot-state/github/owner/repo/sessions/opencode.db'])),
+      list: onlyV2Listing(['fro-bot-state/github/owner/repo/sessions-v2/opencode.db']),
       download: vi.fn(async (_key: string, localPath: string) => {
         await fs.mkdir(path.dirname(localPath), {recursive: true})
         await fs.writeFile(localPath, 'fresh-store-db')
@@ -181,7 +189,7 @@ describe('restoreCache', () => {
       return 'cache-key'
     })
     const storeAdapter = createMockStoreAdapter({
-      list: vi.fn(async () => ok(['fro-bot-state/github/owner/repo/sessions/opencode.db'])),
+      list: onlyV2Listing(['fro-bot-state/github/owner/repo/sessions-v2/opencode.db']),
       download: vi.fn(async (_key: string, localPath: string) => {
         await fs.mkdir(path.dirname(localPath), {recursive: true})
         await fs.writeFile(localPath, 'corrupt-store-db')
@@ -226,7 +234,7 @@ describe('restoreCache', () => {
 
     const cacheRestore = vi.fn<CacheAdapter['restoreCache']>(async () => 'cache-key')
     const storeAdapter = createMockStoreAdapter({
-      list: vi.fn(async () => ok(['fro-bot-state/github/owner/repo/sessions/opencode.db'])),
+      list: onlyV2Listing(['fro-bot-state/github/owner/repo/sessions-v2/opencode.db']),
       download: vi.fn(async (_key: string, localPath: string) => {
         await fs.mkdir(path.dirname(localPath), {recursive: true})
         await fs.writeFile(localPath, 'versioned-store-db')
@@ -261,7 +269,7 @@ describe('restoreCache', () => {
     await fs.writeFile(path.join(storagePath, 'session.db'), 'cached-state')
 
     const cacheRestore = vi.fn<CacheAdapter['restoreCache']>(async () => 'cache-key')
-    const storeList = vi.fn(async () => ok(['fro-bot-state/github/owner/repo/sessions/opencode.db-wal']))
+    const storeList = onlyV2Listing(['fro-bot-state/github/owner/repo/sessions-v2/opencode.db-wal'])
     const storeDownload = vi.fn<ObjectStoreAdapter['download']>(async (_key, localPath) => {
       await fs.mkdir(path.dirname(localPath), {recursive: true})
       await fs.writeFile(localPath, 'sidecar')
@@ -291,7 +299,8 @@ describe('restoreCache', () => {
     // deleted immediately after the object-store sync returns, not left on disk for
     // whatever the Actions cache restores next to be paired with.
     expect(result).toMatchObject({hit: true, source: 'cache', key: 'cache-key'})
-    expect(storeList).toHaveBeenCalledTimes(1)
+    // the V2 listing, then the V1 fallback listing (which finds nothing)
+    expect(storeList).toHaveBeenCalledTimes(2)
     expect(storeDownload).toHaveBeenCalledTimes(1)
     await expect(fs.access(path.join(path.dirname(storagePath), 'opencode.db-wal'))).rejects.toThrow()
     expect(cacheRestore).toHaveBeenCalledTimes(1)
@@ -305,7 +314,7 @@ describe('restoreCache', () => {
     // behind here would still be sitting beside whatever fresh opencode.db bootstrap
     // creates next
     const cacheRestore = vi.fn<CacheAdapter['restoreCache']>(async () => undefined)
-    const storeList = vi.fn(async () => ok(['fro-bot-state/github/owner/repo/sessions/opencode.db-wal']))
+    const storeList = onlyV2Listing(['fro-bot-state/github/owner/repo/sessions-v2/opencode.db-wal'])
     const storeDownload = vi.fn<ObjectStoreAdapter['download']>(async (_key, localPath) => {
       await fs.mkdir(path.dirname(localPath), {recursive: true})
       await fs.writeFile(localPath, 'stale-generation-wal')
@@ -339,7 +348,7 @@ describe('restoreCache', () => {
     await fs.writeFile(path.join(storagePath, 'session.db'), 'cached-state')
 
     const cacheRestore = vi.fn<CacheAdapter['restoreCache']>(async () => 'cache-key')
-    const storeList = vi.fn(async () => ok([]))
+    const storeList = onlyV2Listing([])
 
     // #when restoring cache
     const result = await restoreCache({
@@ -390,7 +399,8 @@ describe('restoreCache', () => {
 
     // #then the object-store failure is non-fatal and cache restore succeeds
     expect(result).toMatchObject({hit: true, source: 'cache', key: 'cache-key'})
-    expect(storeList).toHaveBeenCalledTimes(1)
+    // each object-store tier fails soft, V2 then V1
+    expect(storeList).toHaveBeenCalledTimes(2)
     expect(cacheRestore).toHaveBeenCalledTimes(1)
     expect(storeList.mock.invocationCallOrder[0]).toBeLessThan(cacheRestore.mock.invocationCallOrder[0] ?? 0)
   })
@@ -398,7 +408,7 @@ describe('restoreCache', () => {
   it('returns a clean miss when cache and object store are both empty', async () => {
     // #given an empty cache and an empty enabled object store
     const cacheRestore = vi.fn<CacheAdapter['restoreCache']>(async () => undefined)
-    const storeList = vi.fn(async () => ok([]))
+    const storeList = onlyV2Listing([])
 
     // #when restoring cache
     const result = await restoreCache({
@@ -422,8 +432,9 @@ describe('restoreCache', () => {
       corrupted: false,
       source: null,
     })
-    expect(storeList).toHaveBeenCalledTimes(1)
-    expect(cacheRestore).toHaveBeenCalledTimes(1)
+    // both object-store tiers, then all four Actions-cache tiers
+    expect(storeList).toHaveBeenCalledTimes(2)
+    expect(cacheRestore).toHaveBeenCalledTimes(4)
     expect(storeList.mock.invocationCallOrder[0]).toBeLessThan(cacheRestore.mock.invocationCallOrder[0] ?? 0)
   })
 
@@ -568,7 +579,6 @@ describe('restoreCache', () => {
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '1.17.6',
       cacheAdapter: {restoreCache: restoreCacheSpy, saveCache: async () => 1},
     }
 
@@ -812,7 +822,7 @@ describe('restoreCache', () => {
   })
 
   it('restores from object store on cache miss when configured', async () => {
-    const list = vi.fn(async () => ok(['fro-bot-state/github/owner/repo/sessions/opencode.db']))
+    const list = onlyV2Listing(['fro-bot-state/github/owner/repo/sessions-v2/opencode.db'])
     const download = vi.fn(async (key: string, localPath: string) => {
       await fs.mkdir(path.dirname(localPath), {recursive: true})
       await fs.writeFile(localPath, key)
@@ -831,7 +841,7 @@ describe('restoreCache', () => {
     })
 
     expect(result).toMatchObject({hit: true, source: 'storage', corrupted: false, restoredPath: storagePath})
-    expect(list).toHaveBeenCalledWith('fro-bot-state/github/owner/repo/sessions/')
+    expect(list).toHaveBeenCalledWith('fro-bot-state/github/owner/repo/sessions-v2/')
     await expect(fs.readFile(path.join(path.dirname(storagePath), 'opencode.db'), 'utf8')).resolves.toContain(
       'opencode.db',
     )
@@ -863,7 +873,7 @@ describe('restoreCache', () => {
       error: vi.fn(),
     }
     const storeAdapter = createMockStoreAdapter({
-      list: async () => ok(['fro-bot-state/github/owner/repo/sessions/opencode.db']),
+      list: onlyV2Listing(['fro-bot-state/github/owner/repo/sessions-v2/opencode.db']),
       download: async () => ({success: false, error: new Error('download failed')}),
     })
 
@@ -896,7 +906,7 @@ describe('restoreCache', () => {
     }
     const download = vi.fn(async () => ok(undefined))
     const storeAdapter = createMockStoreAdapter({
-      list: async () => ok(['fro-bot-state/github/owner/repo/sessions/../escape.db']),
+      list: onlyV2Listing(['fro-bot-state/github/owner/repo/sessions-v2/../escape.db']),
       download,
     })
 
@@ -949,7 +959,6 @@ describe('restoreCache', () => {
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '1.2.0',
       cacheAdapter: adapter,
     }
 
@@ -1112,7 +1121,7 @@ describe('saveCache', () => {
     // #then the failure sentinel is reported as an unpersisted cache
     expect(result).toMatchObject({cachePersisted: false, storePersisted: false, outcome: 'cache-rejected'})
     expect(logger.warning).toHaveBeenCalledWith('Cache save did not persist', {
-      saveKey: 'opencode-storage-github-owner-repo-main-Linux-98765-1',
+      saveKey: 'opencode-v2-storage-github-owner-repo-main-Linux-98765-1',
     })
   })
 
@@ -1177,7 +1186,6 @@ describe('saveCache', () => {
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '1.3.13',
       cacheAdapter: {
         restoreCache: async () => undefined,
         saveCache: saveCacheSpy,
@@ -1191,7 +1199,7 @@ describe('saveCache', () => {
     // to zero bytes by the checkpoint, not unlinked, since the connection stays open)
     expect(result).toMatchObject({cachePersisted: true, storePersisted: true, outcome: 'persisted'})
     expect(upload).toHaveBeenCalledTimes(1)
-    expect(upload.mock.calls[0]?.[0]).toBe('fro-bot-state/github/owner/repo/sessions/opencode.db')
+    expect(upload.mock.calls[0]?.[0]).toBe('fro-bot-state/github/owner/repo/sessions-v2/opencode.db')
     expect(saveCacheSpy).toHaveBeenCalledTimes(1)
     expect(upload.mock.invocationCallOrder[0]).toBeLessThan(saveCacheSpy.mock.invocationCallOrder[0] ?? 0)
 
@@ -1336,7 +1344,6 @@ describe('saveCache', () => {
       logger,
       storagePath,
       authPath,
-      opencodeVersion: '1.3.13',
       cacheAdapter: {
         restoreCache: async () => undefined,
         saveCache: saveCacheSpy,
@@ -1374,7 +1381,6 @@ describe('saveCache', () => {
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '1.3.13',
       cacheAdapter: {
         restoreCache: async () => undefined,
         saveCache: saveCacheSpy,
@@ -1494,7 +1500,6 @@ describe('saveCache', () => {
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '1.17.6',
       cacheAdapter: {
         restoreCache: async () => undefined,
         saveCache: saveCacheSpy,
@@ -1523,7 +1528,6 @@ describe('saveCache', () => {
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '1.17.6',
       cacheAdapter: createMockCacheAdapter({saveResult: 1}),
     }
 
@@ -1544,7 +1548,6 @@ describe('saveCache', () => {
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '1.17.6',
       cacheAdapter: {
         restoreCache: async () => undefined,
         saveCache: saveCacheSpy,
@@ -1572,7 +1575,6 @@ describe('saveCache', () => {
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '1.17.6',
       cacheAdapter: {
         restoreCache: async () => undefined,
         saveCache: saveCacheSpy,
@@ -1611,7 +1613,6 @@ describe('saveCache', () => {
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '1.17.6',
       cacheAdapter: {
         restoreCache: async () => undefined,
         saveCache: saveCacheSpy,
@@ -1643,7 +1644,6 @@ describe('saveCache', () => {
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '1.17.6',
       cacheAdapter: {
         restoreCache: async () => undefined,
         saveCache: saveCacheSpy,
@@ -1672,7 +1672,6 @@ describe('saveCache', () => {
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '1.17.6',
       cacheAdapter: {
         restoreCache: async () => undefined,
         saveCache: saveCacheSpy,
@@ -1742,7 +1741,7 @@ describe('saveCache', () => {
     expect(toCacheSaveStateValue(result)).toBe('not-persisted')
     expect(logger.warning).toHaveBeenCalledWith(
       "Cache key already exists; this invocation's state was not saved under it",
-      {saveKey: 'opencode-storage-github-owner-repo-main-Linux-98765-1'},
+      {saveKey: 'opencode-v2-storage-github-owner-repo-main-Linux-98765-1'},
     )
   })
 
@@ -1789,8 +1788,8 @@ describe('saveCache', () => {
       const observe = await saveKeyFor({job: 'fro-bot-observe', attempt: '1'})
 
       // #then keys differ and carry the job after run ID and attempt
-      expect(remediate).toBe('opencode-storage-github-owner-repo-main-Linux-38026680860-1-fro-bot-remediate')
-      expect(observe).toBe('opencode-storage-github-owner-repo-main-Linux-38026680860-1-fro-bot-observe')
+      expect(remediate).toBe('opencode-v2-storage-github-owner-repo-main-Linux-38026680860-1-fro-bot-remediate')
+      expect(observe).toBe('opencode-v2-storage-github-owner-repo-main-Linux-38026680860-1-fro-bot-observe')
     })
 
     it('re-run attempt 2 of the same job saves under a distinct, savable key', async () => {
@@ -1800,7 +1799,7 @@ describe('saveCache', () => {
 
       // #then the re-run does not collide with attempt 1's reservation
       expect(attempt2).not.toBe(attempt1)
-      expect(attempt2).toBe('opencode-storage-github-owner-repo-main-Linux-38026680860-2-fro-bot-observe')
+      expect(attempt2).toBe('opencode-v2-storage-github-owner-repo-main-Linux-38026680860-2-fro-bot-observe')
     })
 
     it('the post-hook retry derives the identical key the main step tried (no state hand-off needed)', async () => {
@@ -1993,7 +1992,6 @@ describe('saveCache', () => {
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '1.3.13',
       cacheAdapter: adapter,
     }
 
@@ -2031,7 +2029,6 @@ describe('saveCache', () => {
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '1.3.13',
       cacheAdapter: adapter,
     }
 
@@ -2227,13 +2224,12 @@ describe('restoreCache, V2 session generation', () => {
       'opencode-storage-github-owner-repo-main-Linux-1-1': {version: '1', db: 'v1'},
     })
 
-    // #when a V2 run restores
+    // #when a run restores
     const result = await restoreCache({
       components: testComponents,
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '2.2.0',
       cacheAdapter: cache.adapter,
     })
 
@@ -2254,7 +2250,6 @@ describe('restoreCache, V2 session generation', () => {
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '2.2.0',
       cacheAdapter: cache.adapter,
     })
 
@@ -2263,37 +2258,18 @@ describe('restoreCache, V2 session generation', () => {
     await expect(fs.access(path.join(tempDir, 'opencode.db'))).rejects.toThrow()
   })
 
-  it('does not cross-match: a V1 run ignores a V2 entry, and a V2 run lists V2 before V1', async () => {
-    // #given a cache that holds only a V2 entry
-    const v2Only = createExtractingAdapter({
-      'opencode-v2-storage-github-owner-repo-main-Linux-1-1': {version: '1', db: 'v2'},
-    })
-
-    // #when a V1 run restores
-    const v1Result = await restoreCache({
-      components: testComponents,
-      logger: createTestLogger(),
-      storagePath,
-      authPath,
-      opencodeVersion: '1.19.4',
-      cacheAdapter: v2Only.adapter,
-    })
-
-    // #then it never offers a V2 prefix and so misses
-    expect(v1Result).toMatchObject({hit: false})
-    expect(v2Only.calls).toEqual(['opencode-storage-github-owner-repo-main-', 'opencode-storage-github-owner-repo-'])
-    expect(v2Only.calls.some(key => key.startsWith('opencode-v2-storage-'))).toBe(false)
-
-    // #when a V2 run restores from the same cache
+  it('lists V2 before V1: a V2 entry is hit at the first tier, so the V1 prefixes are never offered', async () => {
+    // #given a cache that holds a V2 entry
     const v2Cache = createExtractingAdapter({
       'opencode-v2-storage-github-owner-repo-main-Linux-1-1': {version: '1', db: 'v2'},
     })
+
+    // #when a run restores from it
     const v2Result = await restoreCache({
       components: testComponents,
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '2.2.0',
       cacheAdapter: v2Cache.adapter,
     })
 
@@ -2322,7 +2298,6 @@ describe('restoreCache, V2 session generation', () => {
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '2.2.0',
       cacheAdapter: createMockCacheAdapter({restoreResult: undefined}),
       storeConfig: testStoreConfig,
       storeAdapter: store,
@@ -2358,7 +2333,6 @@ describe('restoreCache, V2 session generation', () => {
       logger: createTestLogger(),
       storagePath,
       authPath,
-      opencodeVersion: '2.2.0',
       cacheAdapter: createMockCacheAdapter({restoreResult: undefined}),
       storeConfig: testStoreConfig,
       storeAdapter: store,

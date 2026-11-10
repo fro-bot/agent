@@ -52,7 +52,7 @@ describe('runRouting', () => {
         prompt: 'test prompt',
       },
       logger: createMockLogger(),
-      opencodeResult: {path: '/tmp/opencode', version: '1.0.0', didSetup: false},
+      opencodeResult: {path: '/tmp/opencode', version: '1.0.0'},
     } as BootstrapPhaseResult
 
     vi.mocked(parseGitHubContext).mockReturnValue({
@@ -123,7 +123,7 @@ describe('runRouting', () => {
         reviewSkipLabel: 'skip-agent-review',
       },
       logger: createMockLogger(),
-      opencodeResult: {path: '/tmp/opencode', version: '1.0.0', didSetup: false},
+      opencodeResult: {path: '/tmp/opencode', version: '1.0.0'},
     } as BootstrapPhaseResult
 
     vi.mocked(parseGitHubContext).mockReturnValue({
@@ -195,7 +195,7 @@ describe('runRouting', () => {
     const bootstrap = {
       inputs: {githubToken: 'ghp_test123', prompt: 'test prompt'},
       logger: createMockLogger(),
-      opencodeResult: {path: '/tmp/opencode', version: '1.0.0', didSetup: false},
+      opencodeResult: {path: '/tmp/opencode', version: '1.0.0'},
     } as BootstrapPhaseResult
 
     vi.mocked(parseGitHubContext).mockReturnValue({
@@ -236,7 +236,7 @@ describe('runRouting', () => {
     const bootstrap = {
       inputs: {githubToken: 'ghp_test123', prompt: 'test prompt'},
       logger: createMockLogger(),
-      opencodeResult: {path: '/tmp/opencode', version: '1.0.0', didSetup: false},
+      opencodeResult: {path: '/tmp/opencode', version: '1.0.0'},
     } as BootstrapPhaseResult
 
     vi.mocked(parseGitHubContext).mockReturnValue({

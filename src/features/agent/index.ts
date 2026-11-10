@@ -5,7 +5,6 @@
  * - Context collection from GitHub Actions
  * - Prompt construction with session/CLI instructions
  * - Reactions and labels for acknowledgment UX
- * - OpenCode SDK execution (RFC-013)
  */
 
 // Context collection
@@ -15,7 +14,6 @@ export type {CollectAgentContextOptions} from './context.js'
 // Diff context collection (RFC-009) - used internally by collectAgentContext
 export {collectDiffContext} from './diff-context.js'
 
-export {executeOpenCode} from './execution.js'
 export {resolveOutputMode} from './output-mode.js'
 // Prompt construction
 export {buildAgentPrompt, buildTaskSection, getTriggerDirective} from './prompt.js'
@@ -33,10 +31,6 @@ export {
   updateReactionOnIncomplete,
   updateReactionOnSuccess,
 } from './reactions.js'
-
-// OpenCode execution (RFC-013: SDK mode)
-export {bootstrapOpenCodeServer, ensureOpenCodeAvailable} from './server-adapter.js'
-export type {OpenCodeServerHandle} from './server-adapter.js'
 
 // Types
 export type {

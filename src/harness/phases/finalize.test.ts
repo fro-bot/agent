@@ -67,7 +67,7 @@ function createBootstrap(overrides: Partial<BootstrapPhaseResult> = {}): Bootstr
   return {
     inputs: {agent: null} as BootstrapPhaseResult['inputs'],
     logger: createMockLogger(),
-    opencodeResult: {didSetup: false, version: '1.0.0'} as BootstrapPhaseResult['opencodeResult'],
+    opencodeResult: {version: '1.0.0'} as BootstrapPhaseResult['opencodeResult'],
     delivery: 'file-convention',
     responseFilePath: '/tmp/fro-bot-response.md',
     responseFilePathCandidates: null,

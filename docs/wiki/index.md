@@ -28,7 +28,7 @@ An Obsidian-powered project wiki maintained by Fro Bot. This vault provides huma
 | Page | Type | Summary |
 | --- | --- | --- |
 | [Architecture Overview](Architecture%20Overview.md) | architecture | Monorepo structure, module map, and the boundary between gateway execution and workspace checkout management |
-| [Execution Lifecycle](Execution%20Lifecycle.md) | architecture | Action phases across OpenCode V1 and V2, from bootstrap and prompt submission through verified release and persistence |
+| [Execution Lifecycle](Execution%20Lifecycle.md) | architecture | Action phases on OpenCode V2, from bootstrap and prompt submission through verified release and persistence |
 
 ### Subsystems
 
@@ -54,7 +54,7 @@ An Obsidian-powered project wiki maintained by Fro Bot. This vault provides huma
 
 ## About This Wiki
 
-Current coverage includes the Action's stock V2 default and explicit V1 rollback, generation-neutral execution contracts, directory-based release diagnostics, generation-isolated session restore, brokered-push prompt handoff, reviewed-head pinning, credential-withheld MCP filtering, and cross-surface approvals and cancellation. The Action currently pins OpenCode `2.2.6` and Systematic `3.32.0`. The workspace image retains its independent V1 harness default; the gateway selects its protocol from the image's reported version.
+Current coverage includes the Action's stock-V2-only runtime and the pre-cut rollback tag, generation-neutral execution contracts, directory-based release diagnostics, generation-isolated session restore, brokered-push prompt handoff, reviewed-head pinning, credential-withheld MCP filtering, and cross-surface approvals and cancellation. The Action currently pins OpenCode `2.2.6` and Systematic `3.32.0`. The workspace image retains its independent V1 harness default; the gateway selects its protocol from the image's reported version.
 
 - **Audience:** Human developers — contributors, reviewers, and maintainers
 - **Content:** Descriptive documentation (how the system works, why decisions were made)

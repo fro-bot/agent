@@ -1,9 +1,26 @@
+import type {OpenCodeV2ServerHandle} from '@fro-bot/runtime'
 import type {LeaseController} from './acquire-lock.js'
 import type {CleanupPhaseOptions} from './cleanup.js'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMetricsCollector} from '../../features/observability/index.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {err, ok} from '../../shared/types.js'
+
+function createV2Handle(quiesced: boolean): OpenCodeV2ServerHandle {
+  return {
+    url: 'http://127.0.0.1:4096',
+    pid: 1,
+    directory: '/tmp/workspace',
+    fetch: vi.fn(),
+    authorizationHeader: () => 'Basic x',
+    exited: Promise.resolve({code: 0, signal: null}),
+    registerOwnedSession: vi.fn(),
+    shutdown: vi.fn().mockResolvedValue({
+      interrupts: {stopped: [], notRunning: [], unconfirmed: []},
+      exit: {outcome: quiesced ? 'graceful' : 'unconfirmed', code: 0, signal: null},
+    }),
+  }
+}
 
 vi.mock('@actions/core', () => ({
   saveState: vi.fn(),
@@ -66,11 +83,7 @@ vi.mock('@fro-bot/runtime', async importOriginal => {
 })
 
 describe('runCleanup', () => {
-  const createServerHandle = (): NonNullable<CleanupPhaseOptions['serverHandle']> => ({
-    client: {} as NonNullable<CleanupPhaseOptions['serverHandle']>['client'],
-    server: {url: 'http://127.0.0.1:4096', close: vi.fn()},
-    shutdown: vi.fn().mockResolvedValue({quiesced: true}),
-  })
+  const createServerHandle = (): NonNullable<CleanupPhaseOptions['serverHandleV2']> => createV2Handle(true)
 
   beforeEach(() => {
     vi.resetModules()
@@ -117,9 +130,6 @@ describe('runCleanup', () => {
       reactionCtx: null,
       githubClient: null,
       attachmentResult: null,
-      serverHandle: null,
-      sessionRetention: null,
-      detectedOpencodeVersion: '1.0.0',
       storeConfig: {enabled: true, bucket: 'bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
       metrics,
       agentIdentity: 'github',
@@ -178,9 +188,6 @@ describe('runCleanup', () => {
       reactionCtx: null,
       githubClient: null,
       attachmentResult: null,
-      serverHandle: null,
-      sessionRetention: null,
-      detectedOpencodeVersion: '1.0.0',
       storeConfig: {enabled: true, bucket: 'bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
       metrics: createMetricsCollector(),
       agentIdentity: 'github',
@@ -203,9 +210,6 @@ describe('runCleanup', () => {
       reactionCtx: null,
       githubClient: null,
       attachmentResult: null,
-      serverHandle: null,
-      sessionRetention: null,
-      detectedOpencodeVersion: '1.0.0',
       storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
       metrics: createMetricsCollector(),
       agentIdentity: 'github',
@@ -236,9 +240,6 @@ describe('runCleanup', () => {
         reactionCtx: null,
         githubClient: null,
         attachmentResult: null,
-        serverHandle: null,
-        sessionRetention: null,
-        detectedOpencodeVersion: '1.0.0',
         storeConfig: {enabled: true, bucket: 'bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
         metrics: createMetricsCollector(),
         agentIdentity: 'github',
@@ -271,9 +272,6 @@ describe('runCleanup', () => {
         reactionCtx: null,
         githubClient: null,
         attachmentResult: null,
-        serverHandle: null,
-        sessionRetention: null,
-        detectedOpencodeVersion: '1.0.0',
         storeConfig: {
           enabled: true,
           bucket: 'bucket',
@@ -291,102 +289,12 @@ describe('runCleanup', () => {
     expect(syncMetadataToStore).toHaveBeenCalled()
   })
 
-  it('passes configured session retention to pruning while preserving the age limit', async () => {
-    // #given a live server and a configured session retention value
-    const {pruneSessions} = await import('@fro-bot/runtime')
-    const {runCleanup} = await import('./cleanup.js')
-
-    // #when cleanup prunes sessions
-    await runCleanup({
-      bootstrapLogger: createMockLogger(),
-      reactionCtx: null,
-      githubClient: null,
-      attachmentResult: null,
-      serverHandle: createServerHandle(),
-      sessionRetention: 10,
-      detectedOpencodeVersion: '1.0.0',
-      storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
-      metrics: createMetricsCollector(),
-      agentIdentity: 'github',
-      repo: 'owner/repo',
-      runId: 'run-123',
-      lockEtag: null,
-    })
-
-    // #then the configured count is used without changing the age limit
-    expect(pruneSessions).toHaveBeenCalledWith(
-      {},
-      '/tmp/workspace',
-      {maxSessions: 10, maxAgeDays: 30},
-      expect.any(Object),
-    )
-  })
-
-  it('keeps the current pruning config when the default retention is used', async () => {
-    // #given a live server and the input's default retention value
-    const {DEFAULT_PRUNING_CONFIG, pruneSessions} = await import('@fro-bot/runtime')
-    const {runCleanup} = await import('./cleanup.js')
-
-    // #when cleanup prunes sessions
-    await runCleanup({
-      bootstrapLogger: createMockLogger(),
-      reactionCtx: null,
-      githubClient: null,
-      attachmentResult: null,
-      serverHandle: createServerHandle(),
-      sessionRetention: 50,
-      detectedOpencodeVersion: '1.0.0',
-      storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
-      metrics: createMetricsCollector(),
-      agentIdentity: 'github',
-      repo: 'owner/repo',
-      runId: 'run-123',
-      lockEtag: null,
-    })
-
-    // #then pruning receives today's hardcoded config unchanged
-    expect(pruneSessions).toHaveBeenCalledWith({}, '/tmp/workspace', DEFAULT_PRUNING_CONFIG, expect.any(Object))
-  })
-
-  it('keeps the current pruning config when no retention is configured', async () => {
-    // #given a live server and no retention value at all — the branch a consumer
-    // who never set the input actually takes, which differs from passing the
-    // default value explicitly
-    const {DEFAULT_PRUNING_CONFIG, pruneSessions} = await import('@fro-bot/runtime')
-    const {runCleanup} = await import('./cleanup.js')
-
-    // #when cleanup prunes sessions
-    await runCleanup({
-      bootstrapLogger: createMockLogger(),
-      reactionCtx: null,
-      githubClient: null,
-      attachmentResult: null,
-      serverHandle: createServerHandle(),
-      sessionRetention: null,
-      detectedOpencodeVersion: '1.0.0',
-      storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
-      metrics: createMetricsCollector(),
-      agentIdentity: 'github',
-      repo: 'owner/repo',
-      runId: 'run-123',
-      lockEtag: null,
-    })
-
-    // #then behaviour is byte-identical to today's — this is the property that
-    // makes wiring the input safe to ship rather than a behaviour change
-    expect(pruneSessions).toHaveBeenCalledWith({}, '/tmp/workspace', DEFAULT_PRUNING_CONFIG, expect.any(Object))
-  })
-
   it('warns when shutdown() cannot confirm quiescence, so an operator can see the checkpoint that follows may have raced a writer', async () => {
     // #given a server handle whose shutdown() times out without confirming the child
     // exited — every other test in this suite mocks shutdown as quiesced: true, so this
     // branch (cleanup.ts's `if (!shutdownResult.quiesced)`) is otherwise never observed
     const logger = createMockLogger()
-    const serverHandle: NonNullable<CleanupPhaseOptions['serverHandle']> = {
-      client: {} as NonNullable<CleanupPhaseOptions['serverHandle']>['client'],
-      server: {url: 'http://127.0.0.1:4096', close: vi.fn()},
-      shutdown: vi.fn().mockResolvedValue({quiesced: false}),
-    }
+    const serverHandle = createV2Handle(false)
     const {runCleanup} = await import('./cleanup.js')
 
     // #when cleanup shuts the server down
@@ -395,9 +303,7 @@ describe('runCleanup', () => {
       reactionCtx: null,
       githubClient: null,
       attachmentResult: null,
-      serverHandle,
-      sessionRetention: null,
-      detectedOpencodeVersion: '1.0.0',
+      serverHandleV2: serverHandle,
       storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
       metrics: createMetricsCollector(),
       agentIdentity: 'github',
@@ -435,9 +341,7 @@ describe('runCleanup', () => {
       reactionCtx: null,
       githubClient: null,
       attachmentResult: null,
-      serverHandle,
-      sessionRetention: null,
-      detectedOpencodeVersion: '1.0.0',
+      serverHandleV2: serverHandle,
       storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
       metrics: createMetricsCollector(),
       agentIdentity: 'github',
@@ -466,9 +370,7 @@ describe('runCleanup', () => {
       reactionCtx: null,
       githubClient: null,
       attachmentResult: {processed: [], skipped: [], modifiedBody: '', fileParts: [], tempFiles: ['/tmp/a']},
-      serverHandle,
-      sessionRetention: null,
-      detectedOpencodeVersion: '1.0.0',
+      serverHandleV2: serverHandle,
       storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
       metrics: createMetricsCollector(),
       agentIdentity: 'github',
@@ -494,9 +396,7 @@ describe('runCleanup', () => {
       reactionCtx: null,
       githubClient: null,
       attachmentResult: null,
-      serverHandle,
-      sessionRetention: null,
-      detectedOpencodeVersion: '1.0.0',
+      serverHandleV2: serverHandle,
       storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
       metrics: createMetricsCollector(),
       agentIdentity: 'github',
@@ -519,9 +419,6 @@ describe('runCleanup', () => {
       reactionCtx: null,
       githubClient: null,
       attachmentResult: null,
-      serverHandle: null,
-      sessionRetention: null,
-      detectedOpencodeVersion: '1.0.0',
       storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
       metrics: createMetricsCollector(),
       agentIdentity: 'github',
@@ -557,9 +454,6 @@ describe('runCleanup', () => {
         reactionCtx: null,
         githubClient: null,
         attachmentResult: null,
-        serverHandle: null,
-        sessionRetention: null,
-        detectedOpencodeVersion: '1.0.0',
         storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
         metrics: createMetricsCollector(),
         agentIdentity: 'github',
@@ -578,40 +472,11 @@ describe('runCleanup', () => {
     // #and the artifact upload still ran afterward
     expect(uploadLogArtifact).toHaveBeenCalled()
   })
-
-  it('skips pruning when there is no live server handle', async () => {
-    // #given no live server handle
-    const {pruneSessions} = await import('@fro-bot/runtime')
-    const {runCleanup} = await import('./cleanup.js')
-
-    // #when cleanup runs
-    await runCleanup({
-      bootstrapLogger: createMockLogger(),
-      reactionCtx: null,
-      githubClient: null,
-      attachmentResult: null,
-      serverHandle: null,
-      sessionRetention: 10,
-      detectedOpencodeVersion: '1.0.0',
-      storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
-      metrics: createMetricsCollector(),
-      agentIdentity: 'github',
-      repo: 'owner/repo',
-      runId: 'run-123',
-      lockEtag: null,
-    })
-
-    // #then pruning is skipped
-    expect(pruneSessions).not.toHaveBeenCalled()
-  })
 })
 
 describe('runCleanup persistence safety gate (plan Unit 12)', () => {
-  const createServerHandle = (quiesced = true): NonNullable<CleanupPhaseOptions['serverHandle']> => ({
-    client: {} as NonNullable<CleanupPhaseOptions['serverHandle']>['client'],
-    server: {url: 'http://127.0.0.1:4096', close: vi.fn()},
-    shutdown: vi.fn().mockResolvedValue({quiesced}),
-  })
+  const createServerHandle = (quiesced = true): NonNullable<CleanupPhaseOptions['serverHandleV2']> =>
+    createV2Handle(quiesced)
 
   const createLeaseController = (overrides?: Partial<LeaseController>): LeaseController => ({
     hasFailed: () => false,
@@ -625,9 +490,6 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
     reactionCtx: null,
     githubClient: null,
     attachmentResult: null,
-    serverHandle: null,
-    sessionRetention: null,
-    detectedOpencodeVersion: '1.0.0',
     storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
     metrics: createMetricsCollector(),
     agentIdentity: 'github',
@@ -701,7 +563,7 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
     const {runCleanup} = await import('./cleanup.js')
 
     // #when cleanup runs
-    await runCleanup(baseOptions({serverHandle: createServerHandle(false)}))
+    await runCleanup(baseOptions({serverHandleV2: createServerHandle(false)}))
 
     // #then saveCache is never attempted, and the state is 'declined-for-safety' so the
     // post hook honors the decline instead of retrying it
@@ -1078,9 +940,6 @@ describe('runCleanup attachment directory removal', () => {
     reactionCtx: null,
     githubClient: null,
     attachmentResult: null,
-    serverHandle: null,
-    sessionRetention: null,
-    detectedOpencodeVersion: '1.0.0',
     storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
     metrics: createMetricsCollector(),
     agentIdentity: 'github',
