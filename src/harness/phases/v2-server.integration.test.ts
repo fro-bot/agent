@@ -382,7 +382,9 @@ describe.skipIf(!hasBinary)('startActionOpenCodeV2 against the real stock binary
     for (const provider of providers) await provider.stop()
     for (const provider of skillProviders) await provider.stop()
     for (const box of sandboxes) rmSync(box.root, {recursive: true, force: true})
-  })
+    // Fifteen real servers shut down one after another; the 10s default hook budget is not enough (execute-v2's suite
+    // sets the same explicit budget for the same reason).
+  }, 120_000)
 
   it('starts on a restored V1 database with a held claim: claims cleared, import completed, gates passed with a {file:} key, no credential at rest', async () => {
     // #given a restored cache, a stale auth.json from an older run, and the plugins installed the way setup installs them
@@ -924,7 +926,6 @@ describe.skipIf(!hasBinary)('repo skills against the real stock binary (fro-bot/
   async function stage(box: Sandbox, event: NormalizedEvent, ref?: string): Promise<RepoSkillsSource | null> {
     return resolveRepoSkillsSource({
       enabled: true,
-      generation: 'v2',
       githubContext: eventContext(event, ref),
       githubToken: 'unused',
       logger: createMockLogger(),

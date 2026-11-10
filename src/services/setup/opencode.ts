@@ -5,14 +5,11 @@ import {createReadStream, readFileSync} from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import {selectOpenCodeGeneration} from '@fro-bot/runtime'
 import v2PinFile from '../../../packages/runtime/src/shared/opencode-v2-pin.json'
 import {toErrorMessage} from '../../shared/errors.js'
 
 const TOOL_NAME = 'opencode'
 const DOWNLOAD_BASE_URL = 'https://github.com/anomalyco/opencode/releases/download'
-const HARNESS_DOWNLOAD_BASE_URL = 'https://github.com/fro-bot/agent/releases/download'
-const HARNESS_MARKER = '+harness.'
 
 /**
  * The pinned stock V2 release: its version and the sha256 of each asset we install.
@@ -31,7 +28,7 @@ export const RECORDED_V2_PIN: V2Pin = v2PinFile
 /**
  * Resolve the requested `opencode-version`. `latest` means the recorded V2 pin: no network lookup, so it never
  * follows upstream's `releases/latest` (an unverified stock release with no recorded digest). Any explicit
- * version, harness build or stock, is returned unchanged.
+ * version is returned unchanged; `resolveStockV2Policy` then accepts only the pin.
  */
 export function resolveRequestedVersion(requested: string, v2Pin: V2Pin = RECORDED_V2_PIN): string {
   return requested === 'latest' ? v2Pin.version : requested
@@ -47,8 +44,7 @@ const V2_CACHE_DIGEST_LENGTH = 16
  * and what `core.addPath` expects. Spawning it directly fails with EACCES. Callers that need an
  * executable must go through here rather than passing the directory to a child process.
  *
- * No Windows extension: `getPlatformInfo` rejects `win32` before any install runs, matching
- * `@fro.bot/harness`'s own supported matrix.
+ * No Windows extension: `getPlatformInfo` rejects `win32` before any install runs.
  */
 export function opencodeBinaryPath(installDir: string): string {
   return path.join(installDir, TOOL_NAME)
@@ -56,72 +52,10 @@ export function opencodeBinaryPath(installDir: string): string {
 
 /**
  * Semver-ish pattern for version validation (defense-in-depth, path-traversal guard).
- * Matches: 1.2.3, 1.2.3-rc.1, 1.2.3+harness.abc12345, 1.2.3-harness.abc12345
+ * Matches: 2.2.6, 2.2.6-rc.1, 2.2.6+build.1
  * Rejects: anything with `/`, `..`, shell metacharacters, or other traversal sequences.
  */
 const SEMVER_PATTERN = /^\d+\.\d+\.\d+(?:[.-][\w.-]+)?(?:\+[\w.-]+)?$/
-
-/**
- * Returns true when the version string is a harness-pinned build.
- *
- * Harness versions use either the `+harness.<sha>` build-metadata suffix
- * (semver §10) or the equivalent `-harness.<sha>` prerelease suffix, e.g.
- * `1.17.3+harness.abc12345` or `1.17.3-harness.abc12345`. Both forms identify
- * fro-bot/agent harness releases; the hyphen form is also the public release-tag
- * form users may copy from GitHub.
- */
-export function isHarnessVersion(version: string): boolean {
-  return version.includes(HARNESS_MARKER) || version.includes('-harness.')
-}
-
-/**
- * Convert a harness build version to its prerelease representation.
- *
- * This form is used for both the @actions/tool-cache key and the harness release
- * tag. `@actions/tool-cache` passes the version through `semver.clean()` internally
- * (find, cacheDir, _createToolPath). `semver.clean('1.17.3+harness.2c9cdbd2')`
- * strips build-metadata and returns `'1.17.3'` — colliding with a stock 1.17.3
- * cache entry. Converting the `+harness.` build-metadata marker to `-harness.`
- * (a prerelease segment) preserves the full identity:
- * `semver.clean('1.17.3-harness.2c9cdbd2') === '1.17.3-harness.2c9cdbd2'`.
- * Release tags use the same prerelease segment so Renovate's stable-candidate
- * discovery excludes harness releases.
- *
- * Only the `+harness.` marker is converted — an already-prerelease `-harness.`
- * form and all other version forms are returned unchanged.
- */
-export function toHarnessReleaseTag(version: string): string {
-  return version.includes(HARNESS_MARKER) ? version.replace(HARNESS_MARKER, '-harness.') : version
-}
-
-/**
- * Convert a version string to the form used by @actions/tool-cache.
- *
- * This delegates to `toHarnessReleaseTag`; the cache behavior is intentionally
- * unchanged, including leaving non-harness versions untouched.
- */
-export function toolCacheVersion(version: string): string {
-  return toHarnessReleaseTag(version)
-}
-
-/**
- * Returns true when the version's major is 2 or higher (a V2 pin), with or without a `v` prefix.
- *
- * The rule is the runtime's `selectOpenCodeGeneration`, the one selector every caller shares. Anything it cannot read
- * (e.g. `latest`) is not a V2 pin.
- */
-export function isV2Version(version: string): boolean {
-  const generation = selectOpenCodeGeneration(version)
-  return generation.success && generation.data === 'v2'
-}
-
-/**
- * A stock (anomalyco/opencode) V2 pin. Harness builds keep their own, already fail-closed, path
- * regardless of major.
- */
-export function isStockV2Pin(version: string): boolean {
-  return isV2Version(version) && !isHarnessVersion(version)
-}
 
 /**
  * Get platform information for binary downloads.
@@ -130,9 +64,7 @@ export function getPlatformInfo(): PlatformInfo {
   const platform = os.platform()
   const arch = os.arch()
 
-  // Fail here rather than three layers down, and gate both halves — the message promises both.
-  // The harness publishes linux/darwin × x64/arm64 only (`packages/harness/src/platform.ts`), and
-  // the default OpenCode version is a harness build, so an unsupported platform would otherwise
+  // The release publishes linux/darwin × x64/arm64 only, so an unsupported platform would otherwise
   // name an asset that is never published, and an unsupported arch would silently resolve to the
   // x64 asset and download a binary that cannot execute. Both surfaced with no indication that
   // the platform was the problem.
@@ -153,20 +85,6 @@ export function getPlatformInfo(): PlatformInfo {
 }
 
 /**
- * Encode a harness version string as a URL-safe release tag.
- *
- * Harness release tags are NON-v-prefixed (e.g. `1.17.3-harness.<sha>`).
- * Strips any leading `v` and percent-encodes any `+` as `%2B` so this helper
- * remains safe for legacy tags — GitHub stores tags URL-encoded and a raw `+`
- * is misread as a space. Current harness callers map `+harness.` to
- * `-harness.` before reaching this function.
- */
-function encodeHarnessTag(version: string): string {
-  const rawTag = version.startsWith('v') ? version.slice(1) : version
-  return rawTag.replaceAll('+', '%2B')
-}
-
-/**
  * Validate that a version string is semver-ish (defense-in-depth, path-traversal guard).
  *
  * Throws if the version contains `/`, `..`, or any character outside the allowed set.
@@ -183,14 +101,7 @@ function assertValidVersion(version: string): void {
 }
 
 /**
- * Build download URL for OpenCode binary.
- *
- * Harness-pinned versions (containing `+harness.` or `-harness.`) are routed
- * to the fro-bot/agent releases. Their release tag is derived with
- * `toHarnessReleaseTag`, which maps the `+harness.` input form to the
- * `-harness.` release-tag form and leaves an existing hyphen form unchanged.
- * Stock versions route to anomalyco/opencode
- * with no encoding changes.
+ * Build the download URL for an OpenCode release asset (anomalyco/opencode, no encoding changes).
  *
  * Throws if the version does not match the semver-ish pattern (path-traversal guard).
  */
@@ -198,37 +109,22 @@ export function buildDownloadUrl(version: string, info: PlatformInfo): string {
   assertValidVersion(version)
 
   const filename = `opencode-${info.os}-${info.arch}${info.ext}`
-
-  if (isHarnessVersion(version)) {
-    const encodedTag = encodeHarnessTag(toHarnessReleaseTag(version))
-    return `${HARNESS_DOWNLOAD_BASE_URL}/${encodedTag}/${filename}`
-  }
-
   const versionTag = version.startsWith('v') ? version : `v${version}`
   return `${DOWNLOAD_BASE_URL}/${versionTag}/${filename}`
 }
 
 /**
- * Build the SHA256SUMS asset URL for a harness or stock V2 release.
+ * Build the SHA256SUMS asset URL for a release.
  *
  * The SHA256SUMS file lives in the same release as the archive, at the same
- * base URL but with filename `SHA256SUMS`. The release tag is derived with
- * `toHarnessReleaseTag`, matching `buildDownloadUrl`.
+ * base URL but with filename `SHA256SUMS`.
  *
- * Throws if `version` is neither a harness version nor a stock V2 version —
- * stock releases below V2 publish no SHA256SUMS.
+ * Throws if the version does not match the semver-ish pattern (path-traversal guard).
  */
 export function buildChecksumsUrl(version: string): string {
   assertValidVersion(version)
-  if (isStockV2Pin(version)) {
-    const versionTag = version.startsWith('v') ? version : `v${version}`
-    return `${DOWNLOAD_BASE_URL}/${versionTag}/SHA256SUMS`
-  }
-  if (!isHarnessVersion(version)) {
-    throw new Error('buildChecksumsUrl requires a harness version (must contain +harness. or -harness.)')
-  }
-  const encodedTag = encodeHarnessTag(toHarnessReleaseTag(version))
-  return `${HARNESS_DOWNLOAD_BASE_URL}/${encodedTag}/SHA256SUMS`
+  const versionTag = version.startsWith('v') ? version : `v${version}`
+  return `${DOWNLOAD_BASE_URL}/${versionTag}/SHA256SUMS`
 }
 
 /**
@@ -238,22 +134,19 @@ export function buildChecksumsUrl(version: string): string {
  * computes the archive's sha256 with node:crypto, and asserts the hashes match
  * for this platform's asset filename. Throws on mismatch or missing line.
  *
- * Called for harness versions and for stock V2 pins (`buildChecksumsUrl` throws
- * for any other version — stock releases below V2 publish no SHA256SUMS).
- *
- * `recordedDigest` is passed only for a stock V2 pin: the SHA256SUMS line must
- * ALSO equal the digest recorded in the repo, so replacing the archive and
- * SHA256SUMS together upstream is not enough to pass.
+ * `recordedDigest`: the SHA256SUMS line must ALSO equal the digest recorded in
+ * the repo, so replacing the archive and SHA256SUMS together upstream is not
+ * enough to pass.
  *
  * No shell commands (cat, shasum) are used — platform-independent by design.
  */
-async function verifyHarnessChecksum(
+async function verifyChecksum(
   archivePath: string,
   version: string,
   platformInfo: PlatformInfo,
   toolCache: ToolCacheAdapter,
   logger: Logger,
-  recordedDigest?: string,
+  recordedDigest: string,
 ): Promise<void> {
   const checksumsUrl = buildChecksumsUrl(version)
   logger.debug('Downloading SHA256SUMS for release', {url: checksumsUrl})
@@ -283,7 +176,7 @@ async function verifyHarnessChecksum(
     throw new Error(`Could not parse hash from SHA256SUMS line: ${matchingLine}`)
   }
 
-  if (recordedDigest !== undefined && expectedHash.toLowerCase() !== recordedDigest.toLowerCase()) {
+  if (expectedHash.toLowerCase() !== recordedDigest.toLowerCase()) {
     throw new Error(
       `SHA256SUMS entry for ${archiveFilename} disagrees with the recorded digest: ` +
         `SHA256SUMS has ${expectedHash}, recorded ${recordedDigest}`,
@@ -315,18 +208,14 @@ async function verifyHarnessChecksum(
  * Validate downloaded archive is not corrupted.
  * Uses `file` command on Unix to check file type.
  *
- * This is the only check on STOCK (anomalyco/opencode) V1 downloads. Harness
- * downloads use `verifyHarnessChecksum` instead; a stock V2 pin runs both.
- *
- * `failClosed` (stock V2 pins): a check that cannot run THROWS instead of
- * passing, so a missing `file` binary never counts as a valid archive.
+ * Fail closed: a check that cannot run THROWS instead of passing, so a missing
+ * `file` binary never counts as a valid archive.
  */
 async function validateDownload(
   downloadPath: string,
   ext: string,
   logger: Logger,
   execAdapter: ExecAdapter,
-  failClosed = false,
 ): Promise<boolean> {
   try {
     const {stdout} = await execAdapter.getExecOutput('file', [downloadPath], {silent: true})
@@ -339,24 +228,14 @@ async function validateDownload(
     }
     return isValid
   } catch (error) {
-    if (failClosed) {
-      throw new Error(`Could not validate download (file command unavailable): ${toErrorMessage(error)}`)
-    }
-    logger.debug('Could not validate download (file command unavailable)')
-    return true // Assume valid if we can't check
+    throw new Error(`Could not validate download (file command unavailable): ${toErrorMessage(error)}`)
   }
 }
 
 /**
- * Install OpenCode CLI. There is no fallback: the caller has already chosen V1 or V2 setup, caches and session keys
- * from the requested version, so a binary of the other generation would run against the wrong setup.
- *
- * V1 requests (a harness build, or a stock version below V2) fail closed. Any download, checksum or
- * validation failure THROWS an error naming the requested version and the reason: a harness pin must resolve to
- * the exact harness binary, and a stock V1 failure must not turn into a V2 install.
- *
- * V2 requests (major 2 or higher) install through `installStockV2`, digest-verified or throwing, with no retry. A V2
- * version with no recorded digest never reaches here: `runSetup` rejects it first.
+ * Install the OpenCode CLI. Only the pinned stock V2 release installs: the digest-bound policy runs first, so a
+ * version or platform with no recorded digest fails before any cache lookup or download. Every failure throws, with
+ * no fallback to another version.
  */
 export async function installOpenCode(
   version: string,
@@ -365,37 +244,11 @@ export async function installOpenCode(
   execAdapter: ExecAdapter,
   v2Pin: V2Pin = RECORDED_V2_PIN,
 ): Promise<OpenCodeInstallResult> {
-  const platformInfo = getPlatformInfo()
-
-  if (isStockV2Pin(version)) {
-    return installStockV2(version, platformInfo, logger, toolCache, execAdapter, v2Pin)
-  }
-
-  // Check cache first
-  const cachedPath = toolCache.find(TOOL_NAME, toolCacheVersion(version), platformInfo.arch)
-  if (cachedPath.length > 0) {
-    logger.info('OpenCode found in cache', {version, path: cachedPath})
-    return {path: cachedPath, version, cached: true}
-  }
-
-  try {
-    return await downloadAndInstall(version, platformInfo, logger, toolCache, execAdapter)
-  } catch (error) {
-    if (isHarnessVersion(version)) {
-      throw new Error(
-        `Harness OpenCode download/verify failed for explicit pin "${version}": ${toErrorMessage(error)}. ` +
-          `No fallback is attempted for an explicit harness pin (fail-closed).`,
-      )
-    }
-    throw new Error(
-      `Failed to install OpenCode ${version}: ${toErrorMessage(error)}. ` +
-        `No fallback is attempted for a V1 request: the V2 pin is a different generation (fail-closed).`,
-    )
-  }
+  return installStockV2(version, getPlatformInfo(), logger, toolCache, execAdapter, v2Pin)
 }
 
 /**
- * What a stock V2 pin is allowed to install on this platform, and the cache identity that binds any
+ * What the pinned release is allowed to install on this platform, and the cache identity that binds any
  * reusable installation to the recorded digest.
  */
 export interface StockV2Policy {
@@ -412,9 +265,8 @@ export interface StockV2Policy {
  * recorded digest. Call it BEFORE consulting any cache (the local tool cache or the persistent tools
  * cache): a cache hit must never be accepted for a version or platform the pin does not cover.
  *
- * The returned identity ties every reusable V2 installation to the recorded digest. An entry cached
+ * The returned identity ties every reusable installation to the recorded digest. An entry cached
  * under the bare version by an earlier release, or under a different digest, can never match it.
- * V1 and harness pins keep their existing identities; this applies to stock V2 only.
  */
 export function resolveStockV2Policy(version: string, platformInfo: PlatformInfo, v2Pin: V2Pin): StockV2Policy {
   const bareVersion = version.startsWith('v') ? version.slice(1) : version
@@ -480,29 +332,17 @@ async function downloadAndInstall(
   logger: Logger,
   toolCache: ToolCacheAdapter,
   execAdapter: ExecAdapter,
-  v2Install?: Pick<StockV2Policy, 'recordedDigest' | 'cacheVersion'>,
+  install: Pick<StockV2Policy, 'recordedDigest' | 'cacheVersion'>,
 ): Promise<OpenCodeInstallResult> {
   logger.info('Downloading OpenCode', {version})
   const downloadUrl = buildDownloadUrl(version, platformInfo)
   const downloadPath = await toolCache.downloadTool(downloadUrl)
 
-  if (v2Install !== undefined) {
-    // Stock V2 pin: digest + SHA256SUMS verification, then a magic-byte check that cannot be skipped.
-    await verifyHarnessChecksum(downloadPath, version, platformInfo, toolCache, logger, v2Install.recordedDigest)
-    const isValid = await validateDownload(downloadPath, platformInfo.ext, logger, execAdapter, true)
-    if (!isValid) {
-      throw new Error('Downloaded archive appears corrupted')
-    }
-  } else if (isHarnessVersion(version)) {
-    // Harness releases publish a SHA256SUMS asset — verify before extraction.
-    // execAdapter is not passed: verification uses node:crypto + node:fs only.
-    await verifyHarnessChecksum(downloadPath, version, platformInfo, toolCache, logger)
-  } else {
-    // Stock releases below V2: use magic-byte check only (no SHA256SUMS asset exists).
-    const isValid = await validateDownload(downloadPath, platformInfo.ext, logger, execAdapter)
-    if (!isValid) {
-      throw new Error('Downloaded archive appears corrupted')
-    }
+  // Digest + SHA256SUMS verification, then a magic-byte check that cannot be skipped.
+  await verifyChecksum(downloadPath, version, platformInfo, toolCache, logger, install.recordedDigest)
+  const isValid = await validateDownload(downloadPath, platformInfo.ext, logger, execAdapter)
+  if (!isValid) {
+    throw new Error('Downloaded archive appears corrupted')
   }
 
   logger.info('Extracting OpenCode')
@@ -510,12 +350,7 @@ async function downloadAndInstall(
     platformInfo.ext === '.zip' ? await toolCache.extractZip(downloadPath) : await toolCache.extractTar(downloadPath)
 
   logger.info('Caching OpenCode')
-  const toolPath = await toolCache.cacheDir(
-    extractedPath,
-    TOOL_NAME,
-    v2Install?.cacheVersion ?? toolCacheVersion(version),
-    platformInfo.arch,
-  )
+  const toolPath = await toolCache.cacheDir(extractedPath, TOOL_NAME, install.cacheVersion, platformInfo.arch)
 
   logger.info('OpenCode installed', {version, path: toolPath})
   return {path: toolPath, version, cached: false}

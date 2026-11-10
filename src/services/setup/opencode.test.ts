@@ -4,6 +4,7 @@ import {Buffer} from 'node:buffer'
 import {createHash} from 'node:crypto'
 import {EventEmitter} from 'node:events'
 import path from 'node:path'
+import {selectOpenCodeGeneration} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {DEFAULT_OPENCODE_VERSION} from '../../shared/constants.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
@@ -12,15 +13,10 @@ import {
   buildDownloadUrl,
   getPlatformInfo,
   installOpenCode,
-  isHarnessVersion,
-  isStockV2Pin,
-  isV2Version,
   opencodeBinaryPath,
   RECORDED_V2_PIN,
   resolveRequestedVersion,
   resolveStockV2Policy,
-  toHarnessReleaseTag,
-  toolCacheVersion,
 } from './opencode.js'
 
 // ---------------------------------------------------------------------------
@@ -127,7 +123,7 @@ describe('opencode', () => {
   describe('opencodeBinaryPath', () => {
     it('resolves the executable inside an install directory', () => {
       // #given the tool-cache directory installOpenCode returns
-      const installDir = '/opt/hostedtoolcache/opencode/1.18.29-harness.88b6b5fb/x64'
+      const installDir = '/opt/hostedtoolcache/opencode/2.2.6-sha256-0123456789abcdef/x64'
 
       // #when the executable is resolved
       const binary = opencodeBinaryPath(installDir)
@@ -243,58 +239,6 @@ describe('opencode', () => {
       expect(url).toBe('https://github.com/anomalyco/opencode/releases/download/v1.17.3/opencode-linux-x64.tar.gz')
     })
 
-    it('builds harness URL for linux-x64 with the hyphen release tag', () => {
-      // #given
-      const info: PlatformInfo = {os: 'linux', arch: 'x64', ext: '.tar.gz'}
-
-      // #when
-      const url = buildDownloadUrl('1.17.3+harness.abc12345', info)
-
-      // #then — harness tags are NON-v-prefixed; stock tags keep their v-prefix
-      expect(url).toBe(
-        'https://github.com/fro-bot/agent/releases/download/1.17.3-harness.abc12345/opencode-linux-x64.tar.gz',
-      )
-    })
-
-    it('builds harness URL for darwin-arm64 with the hyphen release tag', () => {
-      // #given
-      const info: PlatformInfo = {os: 'darwin', arch: 'arm64', ext: '.zip'}
-
-      // #when
-      const url = buildDownloadUrl('1.17.3+harness.abc12345', info)
-
-      // #then — harness tags are NON-v-prefixed; stock tags keep their v-prefix
-      expect(url).toBe(
-        'https://github.com/fro-bot/agent/releases/download/1.17.3-harness.abc12345/opencode-darwin-arm64.zip',
-      )
-    })
-
-    it('maps a +harness. VERSION input to a -harness. TAG in the download URL', () => {
-      // #given
-      const info: PlatformInfo = {os: 'linux', arch: 'x64', ext: '.tar.gz'}
-
-      // #when
-      const url = buildDownloadUrl('1.17.3+harness.abc12345', info)
-
-      // #then — the binary version identity stays in +harness. form, while its release tag uses -harness.
-      expect(url).toContain('/releases/download/1.17.3-harness.abc12345/')
-      expect(url).not.toContain('%2B')
-    })
-
-    it('stock download uses v-prefix; harness download does NOT — paths differ correctly', () => {
-      // #given — regression guard: the two paths must diverge on the v-prefix
-      const info: PlatformInfo = {os: 'linux', arch: 'x64', ext: '.tar.gz'}
-
-      // #when
-      const stockUrl = buildDownloadUrl('1.17.3', info)
-      const harnessUrl = buildDownloadUrl('1.17.3+harness.abc12345', info)
-
-      // #then — stock keeps v-prefix; harness has no v-prefix
-      expect(stockUrl).toContain('/releases/download/v1.17.3/')
-      expect(harnessUrl).toContain('/releases/download/1.17.3-harness.')
-      expect(harnessUrl).not.toContain('/releases/download/v1.17.3-harness.')
-    })
-
     it('rejects a version containing path traversal (../) — semver guard', () => {
       // #given
       const info: PlatformInfo = {os: 'linux', arch: 'x64', ext: '.tar.gz'}
@@ -309,109 +253,6 @@ describe('opencode', () => {
 
       // #when / #then
       expect(() => buildDownloadUrl('1.0.0/evil', info)).toThrow(/Invalid version string/)
-    })
-  })
-
-  describe('buildChecksumsUrl', () => {
-    it('returns correct non-v hyphen-tagged SHA256SUMS URL for a harness version', () => {
-      // #given / #when
-      const url = buildChecksumsUrl('1.17.3+harness.abc12345')
-
-      // #then — harness release tags are NON-v-prefixed
-      expect(url).toBe('https://github.com/fro-bot/agent/releases/download/1.17.3-harness.abc12345/SHA256SUMS')
-    })
-
-    it('throws for a stock (non-harness) version', () => {
-      // #given / #when / #then
-      expect(() => buildChecksumsUrl('1.17.3')).toThrow(/requires a harness version/)
-    })
-
-    it('accepts the hyphen release-tag form when supplied as a version input', () => {
-      // #given / #when
-      const url = buildChecksumsUrl('1.17.3-harness.abc12345')
-
-      // #then — the public release-tag form is already the canonical target.
-      expect(url).toBe('https://github.com/fro-bot/agent/releases/download/1.17.3-harness.abc12345/SHA256SUMS')
-    })
-
-    it('maps a +harness. VERSION input to a -harness. TAG in the checksums URL', () => {
-      // #given / #when
-      const url = buildChecksumsUrl('1.17.3+harness.abc12345')
-
-      // #then — both URL builders target the same hyphen-tagged release.
-      expect(url).toBe('https://github.com/fro-bot/agent/releases/download/1.17.3-harness.abc12345/SHA256SUMS')
-      expect(url).not.toContain('%2B')
-    })
-
-    it('throws for a version containing path traversal (../) — semver guard', () => {
-      // #given — a traversal-containing string that also contains +harness. to bypass the isHarnessVersion check
-      // assertValidVersion must fire BEFORE isHarnessVersion so traversal is rejected regardless
-      // #when / #then
-      expect(() => buildChecksumsUrl('../evil+harness.abc12345')).toThrow(/Invalid version string/)
-    })
-  })
-
-  describe('isHarnessVersion', () => {
-    it('returns true for a version containing +harness.', () => {
-      // #given / #when / #then
-      expect(isHarnessVersion('1.17.3+harness.abc12345')).toBe(true)
-    })
-
-    it('returns true for a harness version with v prefix', () => {
-      // #given / #when / #then
-      expect(isHarnessVersion('v1.17.3+harness.abc12345')).toBe(true)
-    })
-
-    it('returns false for a plain stock version', () => {
-      // #given / #when / #then
-      expect(isHarnessVersion('1.17.3')).toBe(false)
-    })
-
-    it('returns true for a hyphen-form version copied from the public release tag', () => {
-      // #given / #when / #then
-      expect(isHarnessVersion('1.17.3-harness.abc12345')).toBe(true)
-    })
-
-    it('returns false for latest', () => {
-      // #given / #when / #then
-      expect(isHarnessVersion('latest')).toBe(false)
-    })
-  })
-
-  describe('toolCacheVersion', () => {
-    it('converts +harness. build-metadata to -harness. prerelease form', () => {
-      // #given / #when / #then
-      expect(toolCacheVersion('1.17.3+harness.2c9cdbd2')).toBe('1.17.3-harness.2c9cdbd2')
-    })
-
-    it('leaves a plain stock version unchanged', () => {
-      // #given / #when / #then
-      expect(toolCacheVersion('1.17.3')).toBe('1.17.3')
-    })
-
-    it('leaves an already-prerelease hyphen form unchanged (no double-convert)', () => {
-      // #given / #when / #then
-      expect(toolCacheVersion('1.17.3-harness.x')).toBe('1.17.3-harness.x')
-    })
-
-    it('leaves "latest" unchanged', () => {
-      // #given / #when / #then
-      expect(toolCacheVersion('latest')).toBe('latest')
-    })
-
-    it('proves no collision: converted form is distinct from stock 1.17.3', () => {
-      // #given
-      const converted = toolCacheVersion('1.17.3+harness.2c9cdbd2')
-
-      // #then — preserves the full harness identity (and is therefore distinct from stock 1.17.3)
-      expect(converted).toBe('1.17.3-harness.2c9cdbd2')
-    })
-  })
-
-  describe('toHarnessReleaseTag', () => {
-    it('leaves an already-prerelease hyphen form unchanged', () => {
-      // #given / #when / #then
-      expect(toHarnessReleaseTag('1.17.3-harness.x')).toBe('1.17.3-harness.x')
     })
   })
 
@@ -444,434 +285,14 @@ describe('opencode', () => {
     )
   })
 
-  describe('installOpenCode', () => {
-    it('returns cached path when tool is found in cache', async () => {
-      // #given
-      const mockToolCache = createMockToolCache({
-        find: vi.fn().mockReturnValue('/cached/opencode/1.0.0'),
-      })
-      const mockExec = createMockExecAdapter()
-
-      // #when
-      const result = await installOpenCode('1.0.0', mockLogger, mockToolCache, mockExec)
-
-      // #then
-      expect(result.cached).toBe(true)
-      expect(result.path).toBe('/cached/opencode/1.0.0')
-      expect(result.version).toBe('1.0.0')
-      expect(mockToolCache.downloadTool).not.toHaveBeenCalled()
-    })
-
-    it('tool-cache collision guard: find is called with -harness. form for a harness version', async () => {
-      // #given — harness version must use the prerelease form at the find call site
-      // to avoid semver.clean() stripping build-metadata and colliding with stock 1.17.3
-      const HARNESS_VERSION = '1.17.3+harness.2c9cdbd2'
-      const mockToolCache = createMockToolCache({
-        find: vi.fn().mockReturnValue('/cached/opencode/harness'),
-      })
-      const mockExec = createMockExecAdapter()
-
-      // #when
-      const result = await installOpenCode(HARNESS_VERSION, mockLogger, mockToolCache, mockExec)
-
-      // #then — cache hit path; version in result keeps the raw +harness. form
-      expect(result.cached).toBe(true)
-      expect(result.version).toBe(HARNESS_VERSION)
-      // find must have been called with the converted -harness. form
-      expect(mockToolCache.find).toHaveBeenCalledWith('opencode', '1.17.3-harness.2c9cdbd2', expect.any(String))
-      // download must NOT have been called (cache hit)
-      expect(mockToolCache.downloadTool).not.toHaveBeenCalled()
-    })
-
-    it('downloads and caches on cache miss', async () => {
-      // #given
-      Object.defineProperty(process, 'platform', {value: 'linux'})
-      Object.defineProperty(process, 'arch', {value: 'x64'})
-
-      const mockToolCache = createMockToolCache({
-        find: vi.fn().mockReturnValue(''),
-        downloadTool: vi.fn().mockResolvedValue('/tmp/opencode.tar.gz'),
-        extractTar: vi.fn().mockResolvedValue('/tmp/extracted'),
-        cacheDir: vi.fn().mockResolvedValue('/cached/opencode/1.0.0'),
-      })
-      const mockExec = createMockExecAdapter({
-        exec: vi.fn().mockResolvedValue(0),
-        getExecOutput: vi.fn().mockResolvedValue({
-          exitCode: 0,
-          stdout: 'gzip compressed data',
-          stderr: '',
-        }),
-      })
-
-      // #when
-      const result = await installOpenCode('1.0.0', mockLogger, mockToolCache, mockExec)
-
-      // #then
-      expect(result.cached).toBe(false)
-      expect(result.path).toBe('/cached/opencode/1.0.0')
-      expect(mockToolCache.downloadTool).toHaveBeenCalled()
-      expect(mockToolCache.extractTar).toHaveBeenCalled()
-      expect(mockToolCache.cacheDir).toHaveBeenCalled()
-    })
-
-    it('rejects an unsupported platform before touching the cache or the network', async () => {
-      // #given a win32 host
-      Object.defineProperty(process, 'platform', {value: 'win32'})
-      Object.defineProperty(process, 'arch', {value: 'x64'})
-      const mockToolCache = createMockToolCache({find: vi.fn().mockReturnValue('')})
-      const mockExec = createMockExecAdapter()
-
-      // #when/#then the rejection propagates rather than being swallowed. Placement is the whole
-      // mechanism: the gate runs before the tool-cache lookup and OUTSIDE the stock-fallback
-      // `try`, so moving the call inside it would silently turn a hard platform failure back into
-      // a fallback download attempt with every other test still green.
-      await expect(installOpenCode('1.0.0', mockLogger, mockToolCache, mockExec)).rejects.toThrow(
-        /Unsupported platform: win32\/x64/,
-      )
-      expect(mockToolCache.find).not.toHaveBeenCalled()
-      expect(mockToolCache.downloadTool).not.toHaveBeenCalled()
-    })
-
-    it('fails the install when the downloaded archive is not the expected type', async () => {
-      // #given a darwin host and a `file` that reports something other than a zip — reachable now
-      // that validateDownload has no platform escape hatch
-      Object.defineProperty(process, 'platform', {value: 'darwin'})
-      Object.defineProperty(process, 'arch', {value: 'arm64'})
-      const mockToolCache = createMockToolCache({find: vi.fn().mockReturnValue('')})
-      const mockExec = createMockExecAdapter({
-        getExecOutput: vi.fn().mockResolvedValue({exitCode: 0, stdout: 'HTML document text', stderr: ''}),
-      })
-
-      // #when/#then the magic-byte check rejects instead of caching a bad artifact
-      await expect(installOpenCode('1.0.0', mockLogger, mockToolCache, mockExec)).rejects.toThrow(
-        /Downloaded archive appears corrupted/,
-      )
-      expect(mockToolCache.cacheDir).not.toHaveBeenCalled()
-    })
-
-    it('uses extractZip for macOS', async () => {
-      // #given
-      Object.defineProperty(process, 'platform', {value: 'darwin'})
-      Object.defineProperty(process, 'arch', {value: 'x64'})
-
-      const mockToolCache = createMockToolCache({
-        find: vi.fn().mockReturnValue(''),
-        extractZip: vi.fn().mockResolvedValue('/tmp/extracted'),
-      })
-      // `file` must report a zip: validateDownload no longer has a platform escape hatch, so a
-      // .zip archive is magic-byte checked on every supported platform
-      const mockExec = createMockExecAdapter({
-        getExecOutput: vi.fn().mockResolvedValue({exitCode: 0, stdout: 'Zip archive data', stderr: ''}),
-      })
-
-      // #when
-      await installOpenCode('1.0.0', mockLogger, mockToolCache, mockExec)
-
-      // #then
-      expect(mockToolCache.extractZip).toHaveBeenCalled()
-      expect(mockToolCache.extractTar).not.toHaveBeenCalled()
-    })
-
-    it('a failed stock V1 request fails closed: names the version, installs no V2 binary', async () => {
-      // #given a V1 request whose download fails
-      Object.defineProperty(process, 'platform', {value: 'linux'})
-      Object.defineProperty(process, 'arch', {value: 'x64'})
-      const mockToolCache = createMockToolCache({
-        find: vi.fn().mockReturnValue(''),
-        downloadTool: vi.fn().mockRejectedValue(new Error('Network error')),
-      })
-
-      // #when/#then it throws naming the requested version and the reason
-      await expect(installOpenCode('1.999.0', mockLogger, mockToolCache, createMockExecAdapter())).rejects.toThrow(
-        /Failed to install OpenCode 1\.999\.0: Network error.*No fallback.*different generation/,
-      )
-
-      // #then exactly one attempt, and nothing of the other generation was fetched, extracted or cached
-      expect(mockToolCache.downloadTool).toHaveBeenCalledTimes(1)
-      expect(downloadedUrls(mockToolCache).some(url => url.includes(`v${RECORDED_V2_PIN.version}`))).toBe(false)
-      expect(downloadedUrls(mockToolCache).some(url => url.endsWith('SHA256SUMS'))).toBe(false)
-      expect(mockToolCache.extractTar).not.toHaveBeenCalled()
-      expect(mockToolCache.cacheDir).not.toHaveBeenCalled()
-    })
-
-    it('a stock V1 archive that fails validation fails closed instead of falling back', async () => {
-      // #given a V1 download that `file` does not recognise
-      Object.defineProperty(process, 'platform', {value: 'linux'})
-      Object.defineProperty(process, 'arch', {value: 'x64'})
-      const mockToolCache = createMockToolCache({find: vi.fn().mockReturnValue('')})
-      const mockExec = createMockExecAdapter({
-        getExecOutput: vi.fn().mockResolvedValue({exitCode: 0, stdout: 'HTML document text', stderr: ''}),
-      })
-
-      // #when/#then
-      await expect(installOpenCode('1.17.3', mockLogger, mockToolCache, mockExec)).rejects.toThrow(
-        /Failed to install OpenCode 1\.17\.3: Downloaded archive appears corrupted/,
-      )
-      expect(mockToolCache.downloadTool).toHaveBeenCalledTimes(1)
-      expect(mockToolCache.cacheDir).not.toHaveBeenCalled()
-    })
-
-    it('fail-closed: harness-pin checksum mismatch throws, does NOT fall back to stock', async () => {
-      // #given — FIX 2: explicit harness pin must fail closed, no stock downgrade
-      Object.defineProperty(process, 'platform', {value: 'linux'})
-      Object.defineProperty(process, 'arch', {value: 'x64'})
-
-      const HARNESS_VERSION = '1.17.3+harness.abc12345'
-      const ARCHIVE_FILENAME = 'opencode-linux-x64.tar.gz'
-      const ARCHIVE_PATH = '/tmp/opencode-linux-x64.tar.gz'
-      const CHECKSUMS_PATH = '/tmp/SHA256SUMS'
-      const WRONG_HASH = 'b'.repeat(64)
-
-      // SHA256SUMS file contains the WRONG hash (archive will hash to something different)
-      const mismatchChecksums = `${WRONG_HASH}  ${ARCHIVE_FILENAME}\n`
-
-      const mockToolCache = createMockToolCache({
-        find: vi.fn().mockReturnValue(''),
-        downloadTool: vi.fn().mockImplementation(async (url: string) => {
-          if (url.endsWith('SHA256SUMS')) return Promise.resolve(CHECKSUMS_PATH)
-          return Promise.resolve(ARCHIVE_PATH)
-        }),
-      })
-
-      // SHA256SUMS via readFileSync; archive bytes via createReadStream (streaming path)
-      fsState.readFileSyncImpl = (path: unknown) => {
-        if (path === CHECKSUMS_PATH) return mismatchChecksums
-        return Buffer.alloc(0)
-      }
-      // Archive bytes — will hash to something that does NOT match WRONG_HASH
-      fsState.createReadStreamImpl = (_path: unknown) => Buffer.from('fake-archive-bytes')
-
-      const mockExec = createMockExecAdapter()
-
-      // #when / #then — must throw, NOT fall back
-      await expect(installOpenCode(HARNESS_VERSION, mockLogger, mockToolCache, mockExec)).rejects.toThrow(
-        /fail-closed|harness.*failed|SHA256 mismatch/i,
-      )
-
-      // Confirm no fallback was attempted (no stock anomalyco downloads)
-      const calls = (mockToolCache.downloadTool as ReturnType<typeof vi.fn>).mock.calls as [string][]
-      const stockCalls = calls.filter(([url]) => url.includes('anomalyco'))
-      expect(stockCalls).toHaveLength(0)
-    })
-
-    it('fail-closed: harness-pin 404 (SHA256SUMS download fails) throws, does NOT fall back to stock', async () => {
-      // #given — FIX 2: harness pin 404 must fail closed
-      Object.defineProperty(process, 'platform', {value: 'linux'})
-      Object.defineProperty(process, 'arch', {value: 'x64'})
-
-      const HARNESS_VERSION = '1.17.3+harness.abc12345'
-
-      const mockToolCache = createMockToolCache({
-        find: vi.fn().mockReturnValue(''),
-        downloadTool: vi.fn().mockImplementation(async (url: string) => {
-          if (url.endsWith('SHA256SUMS')) throw new Error('HTTP 404: Not Found')
-          return Promise.resolve('/tmp/opencode-linux-x64.tar.gz')
-        }),
-      })
-      const mockExec = createMockExecAdapter()
-
-      // #when / #then — must throw, NOT fall back
-      await expect(installOpenCode(HARNESS_VERSION, mockLogger, mockToolCache, mockExec)).rejects.toThrow(
-        /fail-closed|harness.*failed|404/i,
-      )
-
-      // Confirm no stock fallback download was attempted
-      const calls = (mockToolCache.downloadTool as ReturnType<typeof vi.fn>).mock.calls as [string][]
-      const stockCalls = calls.filter(([url]) => url.includes('anomalyco'))
-      expect(stockCalls).toHaveLength(0)
-    })
-
-    it('fail-closed: hyphen-form harness pin uses the harness URL and does not fall back to stock', async () => {
-      // #given — users may copy the hyphen-form identity directly from the Releases page
-      Object.defineProperty(process, 'platform', {value: 'linux'})
-      Object.defineProperty(process, 'arch', {value: 'x64'})
-
-      const HARNESS_VERSION = '1.17.3-harness.abc12345'
-      const mockToolCache = createMockToolCache({
-        find: vi.fn().mockReturnValue(''),
-        downloadTool: vi.fn().mockImplementation(async (url: string) => {
-          if (url.endsWith('SHA256SUMS')) throw new Error('HTTP 404: Not Found')
-          return Promise.resolve('/tmp/opencode-linux-x64.tar.gz')
-        }),
-      })
-      const mockExec = createMockExecAdapter()
-
-      // #when / #then — the full install path must take the harness branch and fail closed
-      await expect(installOpenCode(HARNESS_VERSION, mockLogger, mockToolCache, mockExec)).rejects.toThrow(
-        /fail-closed|harness.*failed|404/i,
-      )
-
-      const calls = (mockToolCache.downloadTool as ReturnType<typeof vi.fn>).mock.calls as [string][]
-      expect(calls[0]?.[0]).toContain('https://github.com/fro-bot/agent/releases/download/1.17.3-harness.abc12345/')
-      expect(calls.some(([url]) => url.endsWith('SHA256SUMS'))).toBe(true)
-      expect(calls.filter(([url]) => url.includes('anomalyco'))).toHaveLength(0)
-      expect(mockLogger.warning).not.toHaveBeenCalled()
-    })
-  })
-
   describe('DEFAULT_OPENCODE_VERSION', () => {
     it('is the recorded stock V2 pin: one source of truth, opencode-v2-pin.json', () => {
       expect(DEFAULT_OPENCODE_VERSION).toBe(RECORDED_V2_PIN.version)
     })
 
     it('is a stock V2 pin with no harness build metadata', () => {
-      expect(isStockV2Pin(DEFAULT_OPENCODE_VERSION)).toBe(true)
-      expect(isHarnessVersion(DEFAULT_OPENCODE_VERSION)).toBe(false)
+      expect(selectOpenCodeGeneration(DEFAULT_OPENCODE_VERSION)).toEqual({success: true, data: 'v2'})
       expect(DEFAULT_OPENCODE_VERSION).toMatch(/^\d+\.\d+\.\d+$/)
-    })
-  })
-
-  describe('harness SHA256 verification', () => {
-    const HARNESS_VERSION = '1.17.3+harness.abc12345'
-    const ARCHIVE_FILENAME = 'opencode-linux-x64.tar.gz'
-    const ARCHIVE_PATH = '/tmp/opencode-linux-x64.tar.gz'
-    const CHECKSUMS_PATH = '/tmp/SHA256SUMS'
-
-    function createHarnessToolCache(overrides: Partial<ToolCacheAdapter> = {}): ToolCacheAdapter {
-      return createMockToolCache({
-        find: vi.fn().mockReturnValue(''),
-        downloadTool: vi.fn().mockImplementation(async (url: string) => {
-          if (url.endsWith('SHA256SUMS')) {
-            return Promise.resolve(CHECKSUMS_PATH)
-          }
-          return Promise.resolve(ARCHIVE_PATH)
-        }),
-        extractTar: vi.fn().mockResolvedValue('/tmp/extracted'),
-        cacheDir: vi.fn().mockResolvedValue('/cached/opencode/harness'),
-        ...overrides,
-      })
-    }
-
-    it('happy path: harness version downloads SHA256SUMS and verifies hash via streaming node:crypto (no exec calls)', async () => {
-      // #given — hash computed via streaming createReadStream + node:crypto, no shasum/cat exec calls
-      Object.defineProperty(process, 'platform', {value: 'linux'})
-      Object.defineProperty(process, 'arch', {value: 'x64'})
-
-      const archiveBytes = Buffer.from('fake-archive-content')
-      const realHash = createHash('sha256').update(archiveBytes).digest('hex')
-      const checksums = `${realHash}  ${ARCHIVE_FILENAME}\n`
-
-      const mockToolCache = createHarnessToolCache()
-      const mockExec = createMockExecAdapter()
-
-      // SHA256SUMS is still read via readFileSync (it's tiny); archive is streamed via createReadStream
-      fsState.readFileSyncImpl = (path: unknown) => {
-        if (path === CHECKSUMS_PATH) return checksums
-        return Buffer.alloc(0)
-      }
-      fsState.createReadStreamImpl = (path: unknown) => {
-        if (path === ARCHIVE_PATH) return archiveBytes
-        return Buffer.alloc(0)
-      }
-
-      // #when
-      const result = await installOpenCode(HARNESS_VERSION, mockLogger, mockToolCache, mockExec)
-
-      // #then
-      expect(result.cached).toBe(false)
-      expect(result.version).toBe(HARNESS_VERSION)
-      // SHA256SUMS must have been downloaded (two downloadTool calls: archive + SHA256SUMS)
-      expect(mockToolCache.downloadTool).toHaveBeenCalledTimes(2)
-      const calls = (mockToolCache.downloadTool as ReturnType<typeof vi.fn>).mock.calls as [string][]
-      expect(calls.some(([url]) => url.endsWith('SHA256SUMS'))).toBe(true)
-      // Extraction should proceed
-      expect(mockToolCache.extractTar).toHaveBeenCalled()
-      // No exec calls for shasum or cat — streaming node:crypto path only
-      expect(mockExec.getExecOutput).not.toHaveBeenCalledWith('shasum', expect.anything(), expect.anything())
-      expect(mockExec.getExecOutput).not.toHaveBeenCalledWith('cat', expect.anything(), expect.anything())
-      // tool-cache collision guard: cacheDir must be called with the -harness. prerelease form,
-      // NOT the raw +harness. build-metadata form (which semver.clean() would strip to '1.17.3')
-      expect(mockToolCache.cacheDir).toHaveBeenCalledWith(
-        expect.any(String),
-        'opencode',
-        '1.17.3-harness.abc12345',
-        'x64',
-      )
-      // Download URL must use the hyphen release-tag form derived from the raw +harness. version.
-      const downloadCalls = (mockToolCache.downloadTool as ReturnType<typeof vi.fn>).mock.calls as [string][]
-      const archiveCall = downloadCalls.find(([url]) => !url.endsWith('SHA256SUMS'))
-      expect(archiveCall?.[0]).toContain('-harness.')
-      expect(archiveCall?.[0]).not.toContain('%2Bharness.')
-    })
-
-    it('exact filename match: decoy line with prefix does not match real archive filename', async () => {
-      // #given — exact filename match, not endsWith
-      Object.defineProperty(process, 'platform', {value: 'linux'})
-      Object.defineProperty(process, 'arch', {value: 'x64'})
-
-      const archiveBytes = Buffer.from('real-archive-content')
-      const realHash = createHash('sha256').update(archiveBytes).digest('hex')
-      const decoyHash = 'c'.repeat(64)
-
-      // SHA256SUMS with a decoy line that endsWith the real filename but is NOT an exact match
-      const checksums = `${decoyHash}  x-opencode-linux-x64.tar.gz\n${realHash}  ${ARCHIVE_FILENAME}\n`
-
-      const mockToolCache = createHarnessToolCache()
-      const mockExec = createMockExecAdapter()
-
-      // SHA256SUMS via readFileSync; archive bytes via createReadStream
-      fsState.readFileSyncImpl = (path: unknown) => {
-        if (path === CHECKSUMS_PATH) return checksums
-        return Buffer.alloc(0)
-      }
-      fsState.createReadStreamImpl = (path: unknown) => {
-        if (path === ARCHIVE_PATH) return archiveBytes
-        return Buffer.alloc(0)
-      }
-
-      // #when — should succeed using the REAL line's hash, not the decoy
-      const result = await installOpenCode(HARNESS_VERSION, mockLogger, mockToolCache, mockExec)
-
-      // #then — resolved to the real hash, not the decoy
-      expect(result.version).toBe(HARNESS_VERSION)
-    })
-
-    it('happy path: stock version uses magic-byte validateDownload only, no SHA256SUMS download', async () => {
-      // #given
-      Object.defineProperty(process, 'platform', {value: 'linux'})
-      Object.defineProperty(process, 'arch', {value: 'x64'})
-
-      const mockToolCache = createMockToolCache({
-        find: vi.fn().mockReturnValue(''),
-        downloadTool: vi.fn().mockResolvedValue('/tmp/opencode.tar.gz'),
-        extractTar: vi.fn().mockResolvedValue('/tmp/extracted'),
-        cacheDir: vi.fn().mockResolvedValue('/cached/opencode/1.17.3'),
-      })
-      const mockExec = createMockExecAdapter({
-        getExecOutput: vi.fn().mockResolvedValue({exitCode: 0, stdout: 'gzip compressed data', stderr: ''}),
-      })
-
-      // #when
-      const result = await installOpenCode('1.17.3', mockLogger, mockToolCache, mockExec)
-
-      // #then
-      expect(result.version).toBe('1.17.3')
-      // Only ONE downloadTool call (archive only, no SHA256SUMS)
-      expect(mockToolCache.downloadTool).toHaveBeenCalledTimes(1)
-      const calls = (mockToolCache.downloadTool as ReturnType<typeof vi.fn>).mock.calls as [string][]
-      expect(calls.every(([url]) => !url.endsWith('SHA256SUMS'))).toBe(true)
-    })
-  })
-
-  describe('isV2Version', () => {
-    it('is true from major 2 upward, with or without a v prefix', () => {
-      expect(isV2Version('2.2.0')).toBe(true)
-      expect(isV2Version('v2.2.0')).toBe(true)
-      expect(isV2Version('10.0.1')).toBe(true)
-    })
-
-    it('is false for major 0 and 1, including the previous harness default', () => {
-      expect(isV2Version('1.19.4')).toBe(false)
-      expect(isV2Version('0.9.0')).toBe(false)
-      expect(isV2Version('1.19.4+harness.5bde2635')).toBe(false)
-    })
-
-    it('is true for the current default', () => {
-      expect(isV2Version(DEFAULT_OPENCODE_VERSION)).toBe(true)
-    })
-
-    it('is false for non-version input such as latest', () => {
-      expect(isV2Version('latest')).toBe(false)
     })
   })
 
@@ -887,7 +308,7 @@ describe('opencode', () => {
     it('pins a V2 version with a sha256 for every asset the Action and workspace use', () => {
       // #given the committed pin file
       // #then it is itself a V2 version and every digest is a lowercase sha256
-      expect(isV2Version(RECORDED_V2_PIN.version)).toBe(true)
+      expect(selectOpenCodeGeneration(RECORDED_V2_PIN.version)).toEqual({success: true, data: 'v2'})
       expect(Object.keys(RECORDED_V2_PIN.assets).sort()).toEqual([
         'opencode-darwin-arm64.zip',
         'opencode-darwin-x64.zip',
@@ -920,18 +341,6 @@ describe('opencode', () => {
         extractTar: vi.fn().mockResolvedValue('/tmp/extracted'),
         cacheDir: vi.fn().mockResolvedValue('/cached/opencode/2.2.0'),
         ...overrides,
-      })
-    }
-
-    /** A tool cache whose first download (the requested version) fails; later downloads serve the pin archive. */
-    function failFirstDownload(): ToolCacheAdapter {
-      let downloads = 0
-      return createV2ToolCache({
-        downloadTool: vi.fn().mockImplementation(async (url: string) => {
-          downloads++
-          if (downloads === 1) throw new Error('Download failed')
-          return Promise.resolve(url.endsWith('SHA256SUMS') ? CHECKSUMS_PATH : ARCHIVE_PATH)
-        }),
       })
     }
 
@@ -1077,6 +486,57 @@ describe('opencode', () => {
       expect(mockLogger.warning).not.toHaveBeenCalled()
     })
 
+    it.each(['1.19.5', '1.19.4', 'v1.19.4', '0.9.0', '1.19.5+harness.bf7f7dfe', '1.19.5-harness.bf7f7dfe'])(
+      'rejects the V1 version %s before any cache lookup or download',
+      async version => {
+        // #given a warm tool cache and an archive that would verify
+        serve({checksums: `${archiveHash}  ${ARCHIVE_FILENAME}\n`})
+        const toolCache = createV2ToolCache({find: vi.fn().mockReturnValue('/warm')})
+
+        // #when/#then the pin policy refuses it and names the only pinned version
+        await expect(installOpenCode(version, mockLogger, toolCache, createGzipExec(), recordedPin)).rejects.toThrow(
+          /only 2\.2\.0 is pinned/,
+        )
+        expect(toolCache.find).not.toHaveBeenCalled()
+        expect(toolCache.downloadTool).not.toHaveBeenCalled()
+        expect(toolCache.cacheDir).not.toHaveBeenCalled()
+      },
+    )
+
+    it('rejects an unsupported platform before touching the cache or the network', async () => {
+      // #given a win32 host
+      Object.defineProperty(process, 'platform', {value: 'win32'})
+      Object.defineProperty(process, 'arch', {value: 'x64'})
+      const toolCache = createV2ToolCache()
+
+      // #when/#then the rejection propagates before the cache lookup, not as a download attempt
+      await expect(installOpenCode(V2_VERSION, mockLogger, toolCache, createGzipExec(), recordedPin)).rejects.toThrow(
+        /Unsupported platform: win32\/x64/,
+      )
+      expect(toolCache.find).not.toHaveBeenCalled()
+      expect(toolCache.downloadTool).not.toHaveBeenCalled()
+    })
+
+    it('extracts a macOS archive with extractZip', async () => {
+      // #given a darwin host whose recorded asset is a zip that `file` recognises
+      Object.defineProperty(process, 'platform', {value: 'darwin'})
+      Object.defineProperty(process, 'arch', {value: 'arm64'})
+      const zipFilename = 'opencode-darwin-arm64.zip'
+      const zipPin: V2Pin = {version: V2_VERSION, assets: {[zipFilename]: archiveHash}}
+      serve({checksums: `${archiveHash}  ${zipFilename}\n`})
+      const toolCache = createV2ToolCache({extractZip: vi.fn().mockResolvedValue('/tmp/extracted')})
+      const exec = createMockExecAdapter({
+        getExecOutput: vi.fn().mockResolvedValue({exitCode: 0, stdout: 'Zip archive data', stderr: ''}),
+      })
+
+      // #when
+      await installOpenCode(V2_VERSION, mockLogger, toolCache, exec, zipPin)
+
+      // #then
+      expect(toolCache.extractZip).toHaveBeenCalledTimes(1)
+      expect(toolCache.extractTar).not.toHaveBeenCalled()
+    })
+
     describe('cache identity', () => {
       const ID = `sha256-${archiveHash.slice(0, 16)}`
       const BOUND_VERSION = `${V2_VERSION}-${ID}`
@@ -1198,73 +658,7 @@ describe('opencode', () => {
       })
     })
 
-    describe('isStockV2Pin', () => {
-      it('is true for stock major 2+, false for V1, harness builds and non-versions', () => {
-        expect(isStockV2Pin('2.2.0')).toBe(true)
-        expect(isStockV2Pin('1.19.4')).toBe(false)
-        expect(isStockV2Pin('2.0.0+harness.abc12345')).toBe(false)
-        expect(isStockV2Pin('latest')).toBe(false)
-      })
-    })
-
-    it('a V1 pin still takes the V1 path: magic-byte check only, fail-open, plain cache identity', async () => {
-      // #given a stock 1.x pin and a `file` command that is missing
-      const toolCache = createV2ToolCache({cacheDir: vi.fn().mockResolvedValue('/cached/opencode/1.17.3')})
-      const exec = createGzipExec({getExecOutput: vi.fn().mockRejectedValue(new Error('spawn file ENOENT'))})
-
-      // #when
-      const result = await installOpenCode('1.17.3', mockLogger, toolCache, exec, recordedPin)
-
-      // #then it never fetched SHA256SUMS, passed validation without `file`, and kept the digest-free identity
-      expect(result.version).toBe('1.17.3')
-      expect(toolCache.find).toHaveBeenCalledWith('opencode', '1.17.3', 'x64')
-      expect(toolCache.cacheDir).toHaveBeenCalledWith('/tmp/extracted', 'opencode', '1.17.3', 'x64')
-      expect(downloadedUrls(toolCache).some(url => url.endsWith('SHA256SUMS'))).toBe(false)
-    })
-
-    describe('a failed install never crosses generations', () => {
-      const V2_URL_FRAGMENT = `/v${V2_VERSION}/`
-
-      function expectNoV2Install(toolCache: ToolCacheAdapter): void {
-        expect(downloadedUrls(toolCache).some(url => url.includes(V2_URL_FRAGMENT))).toBe(false)
-        expect(downloadedUrls(toolCache).some(url => url.endsWith('SHA256SUMS'))).toBe(false)
-        expect(toolCache.extractTar).not.toHaveBeenCalled()
-        expect(toolCache.cacheDir).not.toHaveBeenCalled()
-      }
-
-      it('a failed stock V1 request does not install the V2 pin, even though it would verify', async () => {
-        // #given a genuine, fully verifiable V2 pin archive, and a V1 request whose own download fails
-        serve({checksums: `${archiveHash}  ${ARCHIVE_FILENAME}\n`})
-        const toolCache = failFirstDownload()
-
-        // #when/#then it fails, naming the request and the reason
-        await expect(installOpenCode('1.999.0', mockLogger, toolCache, createGzipExec(), recordedPin)).rejects.toThrow(
-          /Failed to install OpenCode 1\.999\.0: Download failed.*No fallback/,
-        )
-        expect(toolCache.downloadTool).toHaveBeenCalledTimes(1)
-        expectNoV2Install(toolCache)
-      })
-
-      it('a failed V1 harness request does not install the V2 pin', async () => {
-        // #given a harness release whose SHA256SUMS download fails, next to a verifiable V2 pin
-        serve({checksums: `${archiveHash}  ${ARCHIVE_FILENAME}\n`})
-        const toolCache = createV2ToolCache({
-          downloadTool: vi.fn().mockImplementation(async (url: string) => {
-            if (url.endsWith('SHA256SUMS')) throw new Error('HTTP 404: Not Found')
-            return Promise.resolve(ARCHIVE_PATH)
-          }),
-        })
-
-        // #when/#then
-        await expect(
-          installOpenCode('1.19.4+harness.5bde2635', mockLogger, toolCache, createGzipExec(), recordedPin),
-        ).rejects.toThrow(
-          /Harness OpenCode download\/verify failed for explicit pin "1\.19\.4\+harness\.5bde2635".*404/,
-        )
-        expect(downloadedUrls(toolCache).some(url => url.includes(V2_URL_FRAGMENT))).toBe(false)
-        expect(toolCache.cacheDir).not.toHaveBeenCalled()
-      })
-
+    describe('a failed install never falls back', () => {
       it('a V2 version with no recorded digest fails before any cache or download, with no fallback to the pin', async () => {
         // #given a V2 request the pin file has no digests for, next to a genuine pin archive and a warm cache
         serve({checksums: `${archiveHash}  ${ARCHIVE_FILENAME}\n`})
@@ -1300,54 +694,6 @@ describe('opencode', () => {
           installOpenCode(`v${V2_VERSION}`, mockLogger, toolCache, createGzipExec(), recordedPin),
         ).rejects.toThrow(/HTTP 503/)
         expect(toolCache.downloadTool).toHaveBeenCalledTimes(1)
-      })
-    })
-
-    describe('V1 stays resolvable', () => {
-      const HARNESS_V1 = '1.19.4+harness.5bde2635'
-
-      it('installs a V1 harness pin from fro-bot/agent releases, checksum-verified', async () => {
-        // #given a harness release whose archive matches its SHA256SUMS line
-        serve({checksums: `${archiveHash}  ${ARCHIVE_FILENAME}\n`})
-        const toolCache = createV2ToolCache({cacheDir: vi.fn().mockResolvedValue('/cached/opencode/harness')})
-
-        // #when
-        const result = await installOpenCode(HARNESS_V1, mockLogger, toolCache, createGzipExec())
-
-        // #then it comes from the harness release, not the stock V2 feed, under the prerelease cache identity
-        expect(result).toEqual({path: '/cached/opencode/harness', version: HARNESS_V1, cached: false})
-        expect(downloadedUrls(toolCache)).toEqual([
-          `https://github.com/fro-bot/agent/releases/download/1.19.4-harness.5bde2635/${ARCHIVE_FILENAME}`,
-          'https://github.com/fro-bot/agent/releases/download/1.19.4-harness.5bde2635/SHA256SUMS',
-        ])
-        expect(toolCache.cacheDir).toHaveBeenCalledWith('/tmp/extracted', 'opencode', '1.19.4-harness.5bde2635', 'x64')
-      })
-
-      it('fails closed on a harness pin whose archive does not match, with no V2 fallback', async () => {
-        // #given a tampered harness archive
-        serve({checksums: `${archiveHash}  ${ARCHIVE_FILENAME}\n`, archive: Buffer.from('tampered-archive')})
-        const toolCache = createV2ToolCache()
-
-        // #when/#then
-        await expect(installOpenCode(HARNESS_V1, mockLogger, toolCache, createGzipExec())).rejects.toThrow(
-          /Harness OpenCode download\/verify failed.*fail-closed/s,
-        )
-        expect(downloadedUrls(toolCache).some(url => url.includes('anomalyco'))).toBe(false)
-      })
-
-      it('installs an explicit stock V1 version from anomalyco/opencode, magic-byte checked, no SHA256SUMS', async () => {
-        // #given
-        const toolCache = createV2ToolCache({cacheDir: vi.fn().mockResolvedValue('/cached/opencode/1.19.4')})
-
-        // #when
-        const result = await installOpenCode('1.19.4', mockLogger, toolCache, createGzipExec())
-
-        // #then
-        expect(result).toEqual({path: '/cached/opencode/1.19.4', version: '1.19.4', cached: false})
-        expect(downloadedUrls(toolCache)).toEqual([
-          `https://github.com/anomalyco/opencode/releases/download/v1.19.4/${ARCHIVE_FILENAME}`,
-        ])
-        expect(toolCache.cacheDir).toHaveBeenCalledWith('/tmp/extracted', 'opencode', '1.19.4', 'x64')
       })
     })
   })

@@ -8,7 +8,6 @@ import {
   DB_V2_FAMILY_BASENAMES,
   DB_V2_MAIN_BASENAME,
   getSessionDbBasenames,
-  isSqliteBackend,
 } from '@fro-bot/runtime'
 import {toErrorMessage} from '../../shared/errors.js'
 
@@ -96,7 +95,7 @@ export function buildDbFamilyPaths(storagePath: string): string[] {
 }
 
 /** The machine-local wal-index sidecar path beside `storagePath`. Never valid to transport. */
-export function buildDbShmPath(storagePath: string, generation: SessionGeneration = 'v1'): string {
+export function buildDbShmPath(storagePath: string, generation: SessionGeneration = 'v2'): string {
   return path.join(path.dirname(storagePath), getSessionDbBasenames(generation).shm)
 }
 
@@ -106,41 +105,13 @@ export function buildDbShmPath(storagePath: string, generation: SessionGeneratio
  * write-ahead log before anything opens the database -- see `DB_TRANSPORTABLE_BASENAMES`
  * in `packages/runtime/src/session/version.ts` for why that log can no longer be trusted.
  */
-export function buildDbWalPath(storagePath: string, generation: SessionGeneration = 'v1'): string {
+export function buildDbWalPath(storagePath: string, generation: SessionGeneration = 'v2'): string {
   return path.join(path.dirname(storagePath), getSessionDbBasenames(generation).wal)
 }
 
 /**
- * The single path list passed to both `@actions/cache`'s restoreCache and saveCache.
- * Called identically by restore.ts and save.ts — see the comment above for why a second,
- * merely-equivalent definition is not an acceptable alternative.
- *
- * Only pure when `opencodeVersion` is a string: a `null` version makes `isSqliteBackend`
- * probe whether the global `opencode.db` exists on disk at call time (see
- * `packages/runtime/src/session/version.ts`), so the result depends on filesystem state,
- * not just these arguments — restore and save must be given the same version for the
- * shared-hash guarantee above to hold.
- */
-export async function buildCachePaths(
-  storagePath: string,
-  projectIdPath: string | undefined,
-  opencodeVersion: string | null | undefined,
-): Promise<string[]> {
-  if (await isSqliteBackend(opencodeVersion ?? null)) {
-    return buildCachePathsV1Sqlite(storagePath, projectIdPath)
-  }
-  const paths = [storagePath]
-  if (projectIdPath != null) {
-    paths.push(projectIdPath)
-  }
-  return paths
-}
-
-/**
- * The path list a V1 SQLite save writes, built without consulting any version. A V2 run restoring its V1 fallback
- * tiers needs exactly this list: those tiers look up entries a V1 SQLite run saved, and `@actions/cache` hashes the
- * path list into the entry version. Deriving it from the V2 version string instead is wrong (a `v2.2.0` input
- * parses as NaN in `isSqliteBackend` and drops the database path).
+ * The path list a V1 SQLite save wrote. A V2 run restoring its V1 fallback tiers needs exactly this list: those
+ * tiers look up entries a V1 SQLite run saved, and `@actions/cache` hashes the path list into the entry version.
  */
 export function buildCachePathsV1Sqlite(storagePath: string, projectIdPath: string | undefined): string[] {
   const paths = [storagePath]
@@ -152,9 +123,10 @@ export function buildCachePathsV1Sqlite(storagePath: string, projectIdPath: stri
 }
 
 /**
- * The V2 sibling of `buildCachePaths`, passed to both `restoreCache` and `saveCache` on a V2 run (same shared-hash
- * rule as above). The V2 database filename is `DB_V2_MAIN_BASENAME`, the one constant the V2 object-store upload
- * also reads. No `isSqliteBackend` probe: every V2 release stores sessions in SQLite.
+ * The path list passed to both `restoreCache` and `saveCache`. Restore and save must build it the same way, from this
+ * function, or a save's version silently stops matching what restore asks for. The database filename is
+ * `DB_V2_MAIN_BASENAME`, the one constant the object-store upload also reads. There is no `isSqliteBackend` probe:
+ * every V2 release stores sessions in SQLite.
  */
 export function buildCachePathsV2(storagePath: string, projectIdPath: string | undefined): string[] {
   const paths = [storagePath]

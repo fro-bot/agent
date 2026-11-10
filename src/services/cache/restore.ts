@@ -6,15 +6,8 @@ import process from 'node:process'
 import {createS3Adapter, getSessionDbBasenames, syncSessionsFromStore} from '@fro-bot/runtime'
 import {STORAGE_VERSION} from '../../shared/constants.js'
 import {toErrorMessage} from '../../shared/errors.js'
+import {buildPrimaryCacheKey, buildRestoreTiers, classifyRestoreHit, type RestoreTier} from './cache-key.js'
 import {
-  buildPrimaryCacheKey,
-  buildRestoreTiers,
-  classifyRestoreHit,
-  resolveSessionGeneration,
-  type RestoreTier,
-} from './cache-key.js'
-import {
-  buildCachePaths,
   buildCachePathsV1Sqlite,
   buildCachePathsV2,
   buildDbFamilyPaths,
@@ -264,14 +257,11 @@ function restoreAfterCorruption(restoredKey: string): CacheResult {
 }
 
 /**
- * Object-store restore order: the run's own generation first, then V1 when the run is V2. The first hit wins. A
- * miss that left corrupted storage behind is reported as corrupted even when a later attempt also misses.
+ * Object-store restore order: V2 first, then the V1 fallback. The first hit wins. A miss that left corrupted storage
+ * behind is reported as corrupted even when a later attempt also misses.
  */
-async function restoreFromObjectStoreTiers(
-  options: RestoreCacheOptions,
-  generation: SessionGeneration,
-): Promise<CacheResult> {
-  const attempts: readonly SessionGeneration[] = generation === 'v2' ? ['v2', 'v1'] : ['v1']
+async function restoreFromObjectStoreTiers(options: RestoreCacheOptions): Promise<CacheResult> {
+  const attempts: readonly SessionGeneration[] = ['v2', 'v1']
   let corrupted = false
 
   for (const attempt of attempts) {
@@ -297,63 +287,43 @@ interface CacheTierHit {
 }
 
 interface CacheRestorePlan {
-  readonly generation: SessionGeneration
   readonly tiers: readonly RestoreTier[]
   readonly pathsFor: (generation: SessionGeneration) => string[]
 }
 
 /**
  * Builds every key and path list a restore needs before anything touches disk, so the object-store attempts that
- * run first cannot change what the cache is asked for (`buildCachePaths` probes the filesystem when no version is
- * known).
+ * run first cannot change what the cache is asked for.
  */
-async function planCacheRestore(
-  options: RestoreCacheOptions,
-  generation: SessionGeneration,
-): Promise<CacheRestorePlan> {
-  const {components, logger, storagePath, projectIdPath, opencodeVersion} = options
-  // A V2 run's V1 fallback tiers look up entries a V1 SQLite run saved, so their path list is the V1 SQLite list
-  // outright, never derived from the V2 version string.
-  const v1Paths =
-    generation === 'v2'
-      ? buildCachePathsV1Sqlite(storagePath, projectIdPath)
-      : await buildCachePaths(storagePath, projectIdPath, opencodeVersion)
-  const v2Paths = generation === 'v2' ? buildCachePathsV2(storagePath, projectIdPath) : v1Paths
-  const tiers = buildRestoreTiers(components, generation)
+function planCacheRestore(options: RestoreCacheOptions): CacheRestorePlan {
+  const {components, logger, storagePath, projectIdPath} = options
+  // The V1 fallback tiers look up entries a V1 SQLite run saved, so their path list is the V1 SQLite list outright.
+  const v1Paths = buildCachePathsV1Sqlite(storagePath, projectIdPath)
+  const v2Paths = buildCachePathsV2(storagePath, projectIdPath)
+  const tiers = buildRestoreTiers(components)
   const plan: CacheRestorePlan = {
-    generation,
     tiers,
     pathsFor: tierGeneration => (tierGeneration === 'v2' ? v2Paths : v1Paths),
   }
 
   logger.info('Restoring cache', {
-    primaryKey: buildPrimaryCacheKey(components, generation),
+    primaryKey: buildPrimaryCacheKey(components),
     restoreKeys: tiers.map(tier => tier.key),
-    paths: plan.pathsFor(generation),
+    paths: plan.pathsFor('v2'),
   })
 
   return plan
 }
 
 /**
- * Actions-cache restore. A V1 run makes the one call it always made. A V2 run walks the tiers in order, V2 branch,
- * V1 branch, V2 repo, V1 repo, one call each with that generation's own primary key and path list, and stops at
- * the first hit.
+ * Actions-cache restore. Walks the tiers in order, V2 branch, V1 branch, V2 repo, V1 repo, one call each with that
+ * generation's own primary key and path list, and stops at the first hit.
  */
 async function restoreFromCacheTiers(
   options: RestoreCacheOptions,
   plan: CacheRestorePlan,
 ): Promise<CacheTierHit | undefined> {
   const {components, cacheAdapter = defaultCacheAdapter} = options
-
-  if (plan.generation === 'v1') {
-    const restoredKey = await cacheAdapter.restoreCache(
-      plan.pathsFor('v1'),
-      buildPrimaryCacheKey(components),
-      plan.tiers.map(tier => tier.key),
-    )
-    return restoredKey == null ? undefined : {key: restoredKey, generation: 'v1'}
-  }
 
   for (const tier of plan.tiers) {
     const restoredKey = await cacheAdapter.restoreCache(
@@ -370,7 +340,7 @@ async function restoreFromCacheTiers(
 }
 
 export async function restoreCache(options: RestoreCacheOptions): Promise<CacheResult> {
-  const {components, logger, storagePath, authPath, opencodeVersion} = options
+  const {components, logger, storagePath, authPath} = options
 
   if (process.env.SKIP_CACHE === 'true') {
     logger.debug('Skipping cache restore (SKIP_CACHE=true)')
@@ -384,10 +354,9 @@ export async function restoreCache(options: RestoreCacheOptions): Promise<CacheR
     }
   }
 
-  const generation = resolveSessionGeneration(opencodeVersion)
-  const plan = await planCacheRestore(options, generation)
+  const plan = planCacheRestore(options)
 
-  const objectStoreResult = await restoreFromObjectStoreTiers(options, generation)
+  const objectStoreResult = await restoreFromObjectStoreTiers(options)
   if (objectStoreResult.hit === true) {
     return objectStoreResult
   }

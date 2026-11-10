@@ -8,7 +8,6 @@ import {routeEvent} from '../../features/triggers/index.js'
 import {getRepositoryPermission} from '../../services/github/api.js'
 import {createClient, getBotLogin, parseGitHubContext} from '../../services/github/index.js'
 import {createLogger} from '../../shared/logger.js'
-import {STATE_KEYS} from '../config/state-keys.js'
 
 export interface RoutingPhaseResult {
   readonly githubClient: Octokit
@@ -80,8 +79,6 @@ export async function runRouting(
     hasMention: triggerResult.context.hasMention,
     command: triggerResult.context.command?.action ?? null,
   })
-
-  core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'true')
 
   const agentContext = await collectAgentContext({
     logger: contextLogger,

@@ -33,8 +33,6 @@ export const STATE_KEYS = {
   LOCK_HOLDER_JOB: 'lockHolderJob',
   /** `acquisition_token` of that lock; the post hook releases only while the record still carries it. */
   LOCK_ACQUISITION_TOKEN: 'lockAcquisitionToken',
-  /** OpenCode version detected during main action (for post-action cache path calculation) */
-  OPENCODE_VERSION: 'opencodeVersion',
   S3_ENABLED: 'storeConfig.enabled',
   S3_BUCKET: 'storeConfig.bucket',
   S3_REGION: 'storeConfig.region',

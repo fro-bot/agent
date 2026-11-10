@@ -76,7 +76,7 @@ export async function syncSessionsToStore(
   repo: string,
   sessionStoragePath: string,
   logger: Logger,
-  generation: SessionGeneration = 'v1',
+  generation: SessionGeneration = 'v2',
 ): Promise<{uploaded: number; failed: number}> {
   const prefix = buildSessionsPrefix(config, identity, repo, generation)
   if (prefix == null) {
@@ -119,7 +119,7 @@ export async function syncSessionsFromStore(
   repo: string,
   sessionStoragePath: string,
   logger: Logger,
-  generation: SessionGeneration = 'v1',
+  generation: SessionGeneration = 'v2',
 ): Promise<{downloaded: number; failed: number; mainDbRestored: boolean}> {
   const prefix = buildSessionsPrefix(config, identity, repo, generation)
   if (prefix == null) {

@@ -78,10 +78,7 @@ function options(serverHandleV2: OpenCodeV2ServerHandle): CleanupPhaseOptions {
     reactionCtx: null,
     githubClient: null,
     attachmentResult: null,
-    serverHandle: null,
     serverHandleV2,
-    sessionRetention: null,
-    detectedOpencodeVersion: '2.2.5',
     storeConfig: {enabled: false, bucket: '', region: '', prefix: ''},
     metrics: createMetricsCollector(),
     agentIdentity: 'github',
@@ -145,9 +142,9 @@ describe('runCleanup on an OpenCode V2 server', () => {
     // #when
     await runCleanup(options(handle))
 
-    // #then the V2 save names the V2 generation, whose database `saveCache` checkpoints before it reads sizes
+    // #then the save runs after the shutdown, and names no generation: V2 is the only one `saveCache` writes
     expect(order).toEqual(['shutdown', 'save'])
-    expect(vi.mocked(saveCache).mock.calls[0]?.[0]).toMatchObject({opencodeVersion: '2.2.5'})
+    expect(vi.mocked(saveCache).mock.calls[0]?.[0]).not.toHaveProperty('opencodeVersion')
   })
 
   it('does not save when the release declined persistence (the directory was not confirmed quiet)', async () => {

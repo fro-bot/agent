@@ -43,10 +43,9 @@ import {readV1DatabaseFacts, waitForV1Import} from './v1-import-wait.js'
  * 1. Credentials. `auth-json` is narrowed to API-key entries, each written to its own 0600 file outside every cached
  *    path (`credential-files-v2.ts`), and any `auth.json` already at the XDG path (a restore, an earlier run) is deleted so
  *    V2's m39 migration has nothing to import into the database the post hook saves.
- * 2. Plugin preparation. Setup installs both plugins under their own bound, but a matching binary that is already
- *    installed skips setup, and a missing plugin would then install during server readiness, whose deadline is shorter
- *    than the healthy install tail (181-370 s measured; the bound is 420 s). So this runs before every spawn,
- *    whatever setup or the tools cache did: a cache that already holds both exact specs costs two directory reads, and
+ * 2. Plugin preparation. Setup installs both plugins under their own bound, but a missing plugin would otherwise
+ *    install during server readiness, whose deadline is shorter than the healthy install tail (181-370 s measured; the
+ *    bound is 420 s). So this runs before every spawn, whatever setup or the tools cache did: a cache that already holds both exact specs costs two directory reads, and
  *    anything else gets the bounded installer.
  * 3. Config. `buildCIConfigV2` (the outside-directory deny with run-scoped exceptions, `question` denied, the plugins)
  *    plus a `{file:}` reference per key file. After the plugins, because one exception is the installed Systematic

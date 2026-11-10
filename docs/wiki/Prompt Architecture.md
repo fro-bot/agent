@@ -12,7 +12,7 @@ sources:
   - packages/runtime/src/agent/prompt.ts
   - packages/runtime/src/agent/response-file.ts
   - packages/runtime/src/agent/prompt-thread.ts
-  - src/features/agent/prompt-sender.ts
+  - src/features/agent/prompt-sender-v2.ts
   - packages/runtime/src/shared/errors.ts
   - packages/runtime/src/agent/output-mode.ts
   - packages/runtime/src/agent/response-delivery.ts
@@ -135,7 +135,7 @@ After V2 submission, `src/features/agent/retry-v2.ts` observes completion throug
 
 ### V1 SDK submission
 
-The assembled prompt text and reference files are sent to an OpenCode SDK session by `sendPromptToSession()` in `src/features/agent/prompt-sender.ts`. (This module lives in the action layer — the runtime no longer carries a parallel prompt-sender after the execution stack was consolidated; see [[Architecture Overview]].) The function handles model resolution (if a model override is configured), directory scoping to the GitHub workspace, and the construction of the SDK message payload with both text and file parts. For retry attempts after LLM failures, a short continuation prompt is sent instead of the full initial prompt, since the session already has the full context. That continuation text is built from the observed error type rather than a fixed string, and asks the model to continue the remaining objective rather than blindly resume — the [[Execution Lifecycle]] covers how the attempt outcome is classified and how the continuation is phrased.
+The assembled prompt text and reference files are sent to an OpenCode V2 session by `sendPromptToSessionV2()` in `src/features/agent/prompt-sender-v2.ts`. (This module lives in the action layer — the runtime no longer carries a parallel prompt-sender after the execution stack was consolidated; see [[Architecture Overview]].) The function handles model resolution (if a model override is configured), directory scoping to the GitHub workspace, and the construction of the SDK message payload with both text and file parts. For retry attempts after LLM failures, a short continuation prompt is sent instead of the full initial prompt, since the session already has the full context. That continuation text is built from the observed error type rather than a fixed string, and asks the model to continue the remaining objective rather than blindly resume — the [[Execution Lifecycle]] covers how the attempt outcome is classified and how the continuation is phrased.
 
 Submission is also where the run's completion evidence is armed. Immediately before the prompt is sent, the retry loop resets the root-freshness tracker so the attempt starts with no accumulated evidence that a turn has ended. This matters because the send is the boundary between "nothing is running" and "something is," and any idle observation carried across that boundary would describe the previous turn. See [[Background Subagents and Ownership]].
 

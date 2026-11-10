@@ -1,6 +1,5 @@
 import type {SessionGeneration} from '@fro-bot/runtime'
 import type {AgentIdentity} from '../../shared/types.js'
-import {selectOpenCodeGeneration} from '@fro-bot/runtime'
 import {CACHE_PREFIX, CACHE_V2_PREFIX} from '../../shared/constants.js'
 import {getGitHubRefName, getGitHubRepository, getRunnerOS} from '../../shared/env.js'
 
@@ -17,20 +16,6 @@ const CACHE_PREFIXES: Readonly<Record<SessionGeneration, string>> = {
 }
 
 /**
- * Picks the session generation from the resolved OpenCode version that bootstrap saves to state
- * (`STATE_KEYS.OPENCODE_VERSION`). A major version of 2 or above is V2. A missing version, an unparseable one
- * and every V1 version (including harness builds) are V1, so a run with no V2 state behaves as it always did.
- * The restore, save and post-hook paths all call this with the same value.
- *
- * The selection is the runtime's `selectOpenCodeGeneration`; this keeps only the cache-key decision that an
- * unreadable version is V1, because a cache key must always pick a side.
- */
-export function resolveSessionGeneration(version: string | null | undefined): SessionGeneration {
-  const selected = selectOpenCodeGeneration(version ?? undefined)
-  return selected.success ? selected.data : 'v1'
-}
-
-/**
  * Sanitize repository name for use in cache keys.
  * Replaces forward slashes with dashes to create valid cache key segments.
  */
@@ -40,10 +25,10 @@ function sanitizeRepoName(repo: string): string {
 
 /**
  * Generate primary cache key with full specificity.
- * Pattern: {prefix}-{agent}-{sanitizedRepo}-{ref}-{os}, where the prefix is `opencode-storage` for V1 and
- * `opencode-v2-storage` for V2.
+ * Pattern: {prefix}-{agent}-{sanitizedRepo}-{ref}-{os}, where the prefix is `opencode-v2-storage` for V2 (the default)
+ * and `opencode-storage` for V1 (only the restore fallback tiers ask for it).
  */
-export function buildPrimaryCacheKey(components: CacheKeyComponents, generation: SessionGeneration = 'v1'): string {
+export function buildPrimaryCacheKey(components: CacheKeyComponents, generation: SessionGeneration = 'v2'): string {
   const {agentIdentity, repo, ref, os} = components
   const sanitizedRepo = sanitizeRepoName(repo)
   return `${CACHE_PREFIXES[generation]}-${agentIdentity}-${sanitizedRepo}-${ref}-${os}`
@@ -57,7 +42,7 @@ export function buildPrimaryCacheKey(components: CacheKeyComponents, generation:
  */
 export function buildRestoreKeys(
   components: CacheKeyComponents,
-  generation: SessionGeneration = 'v1',
+  generation: SessionGeneration = 'v2',
 ): readonly string[] {
   const {branch, repo} = buildScopedRestoreKeys(components, generation)
   return [branch, repo] as const
@@ -81,24 +66,14 @@ export interface RestoreTier {
 }
 
 /**
- * The Actions-cache restore tiers, in the order they are tried. A V1 run has today's two tiers. A V2 run tries V2
- * before V1 at each scope: V2 branch, V1 branch, V2 repo, V1 repo.
+ * The Actions-cache restore tiers, in the order they are tried. V2 comes before V1 at each scope: V2 branch, V1
+ * branch, V2 repo, V1 repo. The V1 tiers are the fallback for a repo whose only history was saved by a V1 run.
  *
  * Each tier is its own `restoreCache` call because @actions/cache derives an entry's version from the path list
  * the call passes, and the two generations build their lists separately.
  */
-export function buildRestoreTiers(
-  components: CacheKeyComponents,
-  generation: SessionGeneration,
-): readonly RestoreTier[] {
+export function buildRestoreTiers(components: CacheKeyComponents): readonly RestoreTier[] {
   const v1 = buildScopedRestoreKeys(components, 'v1')
-  if (generation === 'v1') {
-    return [
-      {generation: 'v1', scope: 'branch', key: v1.branch},
-      {generation: 'v1', scope: 'repo', key: v1.repo},
-    ]
-  }
-
   const v2 = buildScopedRestoreKeys(components, 'v2')
   return [
     {generation: 'v2', scope: 'branch', key: v2.branch},
@@ -165,7 +140,7 @@ export function buildSaveCacheKey(
   runId: number,
   runAttempt: number,
   invocationIdentity: string | null,
-  generation: SessionGeneration = 'v1',
+  generation: SessionGeneration = 'v2',
 ): string {
   const base = `${buildPrimaryCacheKey(components, generation)}-${runId}-${runAttempt}`
   return invocationIdentity == null ? base : `${base}-${invocationIdentity}`

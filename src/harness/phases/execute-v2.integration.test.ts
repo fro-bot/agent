@@ -17,7 +17,7 @@
 import type {AddressInfo} from 'node:net'
 import type {CredentialDisposition, OpenCodeV2ServerHandle} from '@fro-bot/runtime'
 import type {BootstrapPhaseResult} from './bootstrap.js'
-import type {CacheRestoreV2PhaseResult} from './cache-restore.js'
+import type {CacheRestorePhaseResult} from './cache-restore.js'
 import type {RoutingPhaseResult} from './routing.js'
 import type {SessionPrepPhaseResult} from './session-prep.js'
 import {Buffer} from 'node:buffer'
@@ -361,8 +361,7 @@ async function executePhase(
   box: Sandbox,
   timeoutMs: number,
 ): Promise<Awaited<ReturnType<typeof runExecute>>> {
-  const cacheRestore: CacheRestoreV2PhaseResult = {
-    generation: 'v2',
+  const cacheRestore: CacheRestorePhaseResult = {
     cacheResult: {hit: false, key: 'k', restoredPath: null, corrupted: false, source: null},
     cacheStatus: 'miss',
     serverHandle,
@@ -378,7 +377,7 @@ async function executePhase(
         responseMode: 'github',
       },
       logger: createMockLogger(),
-      opencodeResult: {path: BINARY as string, version: pin.version, didSetup: false},
+      opencodeResult: {path: BINARY as string, version: pin.version},
       delivery: 'model-gh',
       responseFilePath: null,
     } as unknown as BootstrapPhaseResult,
@@ -450,7 +449,6 @@ async function executePhase(
       recordError: vi.fn(),
       getMetrics: vi.fn(),
     },
-    Date.now(),
   )
 }
 
@@ -647,8 +645,7 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
         return response
       },
     } as OpenCodeV2ServerHandle
-    const cacheRestore: CacheRestoreV2PhaseResult = {
-      generation: 'v2',
+    const cacheRestore: CacheRestorePhaseResult = {
       cacheResult: {hit: false, key: 'k', restoredPath: null, corrupted: false, source: null},
       cacheStatus: 'miss',
       serverHandle,
@@ -667,7 +664,7 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
           responseMode: 'github',
         },
         logger,
-        opencodeResult: {path: BINARY as string, version: pin.version, didSetup: false},
+        opencodeResult: {path: BINARY as string, version: pin.version},
         delivery: 'model-gh',
         responseFilePath: null,
       } as unknown as BootstrapPhaseResult,
@@ -739,7 +736,6 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
         recordError: vi.fn(),
         getMetrics: vi.fn(),
       },
-      Date.now(),
     )
 
     // #then the run completed successfully on its own session

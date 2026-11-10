@@ -1,7 +1,6 @@
-import type {OwnershipLedger} from '@fro-bot/runtime'
+import type {OpenCodeV2ServerHandle, OwnershipLedger} from '@fro-bot/runtime'
 import type {LeaseController} from './phases/acquire-lock.js'
 import type {BootstrapPhaseResult} from './phases/bootstrap.js'
-import type {CacheRestorePhaseResult} from './phases/cache-restore.js'
 import type {RoutingPhaseResult} from './phases/routing.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {createLogger} from '../shared/logger.js'
@@ -89,7 +88,6 @@ vi.mock('@fro-bot/runtime', async importOriginal => {
 
 vi.mock('./phases/execute.js', () => ({
   computeDrainDeadlineMs: vi.fn(() => 60_000),
-  runDrain: vi.fn().mockResolvedValue({expired: false, cancelledCount: 0, settledCount: 0, unknownCount: 0}),
   runExecute: vi.fn(),
   resolveRequestedOutputModeState: vi.fn(() => 'omitted'),
 }))
@@ -97,6 +95,15 @@ vi.mock('./phases/execute.js', () => ({
 vi.mock('./phases/finalize.js', () => ({
   runFinalize: vi.fn(),
   runFinalizeWithResult: vi.fn().mockResolvedValue({exitCode: 0, deliveryKind: 'none'}),
+}))
+
+// Only the release itself is faked: the options builder stays real, so these tests assert the handoff `run.ts` makes.
+vi.mock('./phases/release-v2.js', async importOriginal => ({
+  ...(await importOriginal<typeof import('./phases/release-v2.js')>()),
+  runReleaseV2: vi.fn(async () => ({
+    drain: {expired: false, cancelledCount: 0, settledCount: 0, unknownCount: 0},
+    persistenceDeclineReason: undefined,
+  })),
 }))
 
 vi.mock('./phases/review-reconciliation.js', () => ({
@@ -137,7 +144,7 @@ function createBootstrap(): BootstrapPhaseResult {
       model: null,
       timeoutMs: 1_000,
       serverBootstrapTimeoutMs: 5000,
-      opencodeVersion: '1.0.0',
+      opencodeVersion: '2.2.6',
       skipCache: false,
       systematicVersion: '1.0.0',
       opencodeConfig: null,
@@ -149,7 +156,7 @@ function createBootstrap(): BootstrapPhaseResult {
       repoSkills: false,
     },
     logger: createLogger({phase: 'test'}),
-    opencodeResult: {path: 'opencode', version: '1.0.0', didSetup: false},
+    opencodeResult: {path: 'opencode', version: '2.2.6'},
     delivery: 'model-gh',
     responseFilePath: null,
     responseFilePathCandidates: null,
@@ -203,7 +210,7 @@ function createRouting(): RoutingPhaseResult {
   }
 }
 
-async function runWithFailedCacheRestore(version: string) {
+async function runWithFailedCacheRestore() {
   const {runBootstrap} = await import('./phases/bootstrap.js')
   const {runRouting} = await import('./phases/routing.js')
   const {runDedup} = await import('./phases/dedup.js')
@@ -212,7 +219,7 @@ async function runWithFailedCacheRestore(version: string) {
   const {runCacheRestore} = await import('./phases/cache-restore.js')
 
   const bootstrap = createBootstrap()
-  vi.mocked(runBootstrap).mockResolvedValue({...bootstrap, opencodeResult: {...bootstrap.opencodeResult, version}})
+  vi.mocked(runBootstrap).mockResolvedValue(bootstrap)
   vi.mocked(runRouting).mockResolvedValue(createRouting())
   vi.mocked(runDedup).mockResolvedValue({shouldProceed: true, entity: {entityType: 'pr', entityNumber: 42}})
   vi.mocked(runAcquireLock).mockResolvedValue({outcome: 's3-disabled'})
@@ -570,7 +577,7 @@ describe('run', () => {
       const {runCleanup} = await import('./phases/cleanup.js')
 
       // #when
-      const exitCode = await runWithFailedCacheRestore('2.2.5')
+      const exitCode = await runWithFailedCacheRestore()
 
       // #then cleanup is told not to save, with the reason, and the post hook is disabled
       expect(exitCode).toBe(1)
@@ -578,25 +585,6 @@ describe('run', () => {
       expect(options?.skipSessionPersistence).toBe(true)
       expect(options?.persistenceDeclineReason).toContain('OpenCode V2 server did not complete its start')
       expect(vi.mocked(core.saveState)).toHaveBeenLastCalledWith('should-save-cache', 'false')
-    })
-
-    it('leaves persistence untouched when a V1 start failed, as before', async () => {
-      // #given
-      const core = await import('@actions/core')
-      const {runCleanup} = await import('./phases/cleanup.js')
-
-      // #when
-      const exitCode = await runWithFailedCacheRestore('1.19.4')
-
-      // #then
-      expect(exitCode).toBe(1)
-      const options = vi.mocked(runCleanup).mock.calls[0]?.[0]
-      expect(options?.skipSessionPersistence).toBe(false)
-      expect(options).not.toHaveProperty('persistenceDeclineReason')
-      expect(vi.mocked(core.saveState)).not.toHaveBeenCalledWith('should-save-cache', 'true')
-      expect(vi.mocked(core.saveState).mock.calls.filter(call => call[0] === 'should-save-cache')).toEqual([
-        ['should-save-cache', 'false'],
-      ])
     })
   })
 
@@ -611,7 +599,8 @@ describe('run', () => {
     const {runAcknowledge} = await import('./phases/acknowledge.js')
     const {runCacheRestore} = await import('./phases/cache-restore.js')
     const {runSessionPrep} = await import('./phases/session-prep.js')
-    const {runExecute, runDrain, computeDrainDeadlineMs} = await import('./phases/execute.js')
+    const {runExecute, computeDrainDeadlineMs} = await import('./phases/execute.js')
+    const {runReleaseV2} = await import('./phases/release-v2.js')
     const {runReviewReconciliation} = await import('./phases/review-reconciliation.js')
     const {runFinalizeWithResult} = await import('./phases/finalize.js')
     const {runCleanup} = await import('./phases/cleanup.js')
@@ -625,7 +614,7 @@ describe('run', () => {
       currentEtag: () => 'lock-etag-renewed',
       stop: vi.fn().mockResolvedValue(undefined),
     }
-    // A deliberately arbitrary, non-round value: if `runDrain`'s deadline were ever pinned
+    // A deliberately arbitrary, non-round value: if the release's deadline were ever pinned
     // to a hardcoded literal instead of derived from `computeDrainDeadlineMs`'s return, this
     // value would not appear and the assertion below would fail for the right reason.
     const derivedDeadlineMs = 741_213
@@ -652,10 +641,9 @@ describe('run', () => {
         cacheResult: {hit: false, key: 'cache-key', restoredPath: '', corrupted: false, source: 'cache'},
         cacheStatus: 'miss',
         serverHandle: {
-          client: {} as CacheRestorePhaseResult['serverHandle']['client'],
-          server: {url: 'http://127.0.0.1:4096', close: vi.fn()},
-          shutdown: vi.fn().mockResolvedValue({quiesced: true}),
-        },
+          url: 'http://127.0.0.1:4096',
+          shutdown: vi.fn(),
+        } as unknown as OpenCodeV2ServerHandle,
       }
     })
     vi.mocked(runSessionPrep).mockResolvedValue({
@@ -691,9 +679,12 @@ describe('run', () => {
       }
     })
     vi.mocked(computeDrainDeadlineMs).mockReturnValue(derivedDeadlineMs)
-    vi.mocked(runDrain).mockImplementation(async () => {
+    vi.mocked(runReleaseV2).mockImplementation(async () => {
       callOrder.push('drain')
-      return {expired: false, cancelledCount: 0, settledCount: 0, unknownCount: 0}
+      return {
+        drain: {expired: false, cancelledCount: 0, settledCount: 0, unknownCount: 0},
+        persistenceDeclineReason: undefined,
+      }
     })
     vi.mocked(runReviewReconciliation).mockImplementation(async () => {
       callOrder.push('review-reconciliation')
@@ -721,11 +712,10 @@ describe('run', () => {
     // #then drain receives the same ledger instance execution produced (identity, not shape)
     // and the parent session id from the execute result -- a regression that dropped either
     // wire would silently disable drain while this test's ordering assertion stayed green
-    expect(vi.mocked(runDrain)).toHaveBeenCalledWith(
+    expect(vi.mocked(runReleaseV2)).toHaveBeenCalledWith(
       expect.objectContaining({
         ledger: ledgerInstance,
-        parentSessionId: 'ses_root',
-        directory: '/github/workspace',
+        rootSessionId: 'ses_root',
       }),
     )
     vi.unstubAllEnvs()
@@ -735,7 +725,7 @@ describe('run', () => {
     // is the function's return value, and that the function was fed the run's real timeout
     // and execution-duration inputs
     expect(vi.mocked(computeDrainDeadlineMs)).toHaveBeenCalledWith(1_000, 10)
-    expect(vi.mocked(runDrain)).toHaveBeenCalledWith(expect.objectContaining({deadlineMs: derivedDeadlineMs}))
+    expect(vi.mocked(runReleaseV2)).toHaveBeenCalledWith(expect.objectContaining({deadlineMs: derivedDeadlineMs}))
 
     // #then cleanup receives the same ledger instance and the lease controller acquired
     // during the lock phase -- dropping either would silently disable persistence gating
@@ -776,10 +766,9 @@ describe('run', () => {
       cacheResult: {hit: false, key: 'cache-key', restoredPath: '', corrupted: false, source: 'cache'},
       cacheStatus: 'miss',
       serverHandle: {
-        client: {} as CacheRestorePhaseResult['serverHandle']['client'],
-        server: {url: 'http://127.0.0.1:4096', close: vi.fn()},
-        shutdown: vi.fn().mockResolvedValue({quiesced: true}),
-      },
+        url: 'http://127.0.0.1:4096',
+        shutdown: vi.fn(),
+      } as unknown as OpenCodeV2ServerHandle,
     })
     vi.mocked(runSessionPrep).mockResolvedValue({
       recentSessions: [],
@@ -846,7 +835,8 @@ async function mockHappyPathThrough(overrides?: {
   const {runAcknowledge} = await import('./phases/acknowledge.js')
   const {runCacheRestore} = await import('./phases/cache-restore.js')
   const {runSessionPrep} = await import('./phases/session-prep.js')
-  const {runExecute, runDrain} = await import('./phases/execute.js')
+  const {runExecute} = await import('./phases/execute.js')
+  const {runReleaseV2} = await import('./phases/release-v2.js')
   const {runReviewReconciliation} = await import('./phases/review-reconciliation.js')
   const {runFinalizeWithResult} = await import('./phases/finalize.js')
   const {runCleanup} = await import('./phases/cleanup.js')
@@ -868,10 +858,9 @@ async function mockHappyPathThrough(overrides?: {
     cacheResult: {hit: false, key: 'cache-key', restoredPath: '', corrupted: false, source: 'cache'},
     cacheStatus: 'miss',
     serverHandle: {
-      client: {} as CacheRestorePhaseResult['serverHandle']['client'],
-      server: {url: 'http://127.0.0.1:4096', close: vi.fn()},
-      shutdown: vi.fn().mockResolvedValue({quiesced: true}),
-    },
+      url: 'http://127.0.0.1:4096',
+      shutdown: vi.fn(),
+    } as unknown as OpenCodeV2ServerHandle,
   })
   vi.mocked(runSessionPrep).mockResolvedValue({
     recentSessions: [],
@@ -903,11 +892,14 @@ async function mockHappyPathThrough(overrides?: {
     ownershipLedger: {} as OwnershipLedger,
   })
   const unknownCount = overrides?.drainUnknownCount ?? 0
-  vi.mocked(runDrain).mockResolvedValue({
-    expired: unknownCount > 0,
-    cancelledCount: 0,
-    settledCount: 0,
-    unknownCount,
+  vi.mocked(runReleaseV2).mockResolvedValue({
+    drain: {
+      expired: unknownCount > 0,
+      cancelledCount: 0,
+      settledCount: 0,
+      unknownCount,
+    },
+    persistenceDeclineReason: undefined,
   })
   vi.mocked(runReviewReconciliation).mockResolvedValue({reconciled: false, reason: 'not-applicable'})
   vi.mocked(runFinalizeWithResult).mockResolvedValue({
@@ -1212,7 +1204,8 @@ describe('knownExecutionVeto threading (src/harness/run.ts)', () => {
     const {runAcknowledge} = await import('./phases/acknowledge.js')
     const {runCacheRestore} = await import('./phases/cache-restore.js')
     const {runSessionPrep} = await import('./phases/session-prep.js')
-    const {runExecute, runDrain} = await import('./phases/execute.js')
+    const {runExecute} = await import('./phases/execute.js')
+    const {runReleaseV2} = await import('./phases/release-v2.js')
     const {runReviewReconciliation} = await import('./phases/review-reconciliation.js')
     const {runFinalizeWithResult} = await import('./phases/finalize.js')
     const {runCleanup} = await import('./phases/cleanup.js')
@@ -1232,10 +1225,9 @@ describe('knownExecutionVeto threading (src/harness/run.ts)', () => {
       cacheResult: {hit: false, key: 'cache-key', restoredPath: '', corrupted: false, source: 'cache'},
       cacheStatus: 'miss',
       serverHandle: {
-        client: {} as CacheRestorePhaseResult['serverHandle']['client'],
-        server: {url: 'http://127.0.0.1:4096', close: vi.fn()},
-        shutdown: vi.fn().mockResolvedValue({quiesced: true}),
-      },
+        url: 'http://127.0.0.1:4096',
+        shutdown: vi.fn(),
+      } as unknown as OpenCodeV2ServerHandle,
     })
     vi.mocked(runSessionPrep).mockResolvedValue({
       recentSessions: [],
@@ -1266,7 +1258,10 @@ describe('knownExecutionVeto threading (src/harness/run.ts)', () => {
       executionDurationMs: 10,
       ownershipLedger: {} as OwnershipLedger,
     })
-    vi.mocked(runDrain).mockResolvedValue({expired: false, cancelledCount: 0, settledCount: 0, unknownCount: 0})
+    vi.mocked(runReleaseV2).mockResolvedValue({
+      drain: {expired: false, cancelledCount: 0, settledCount: 0, unknownCount: 0},
+      persistenceDeclineReason: undefined,
+    })
     vi.mocked(runReviewReconciliation).mockResolvedValue({reconciled: false, reason: 'not-applicable'})
     vi.mocked(runFinalizeWithResult).mockResolvedValue({exitCode: 0, deliveryKind: 'comment'})
     vi.mocked(runCleanup).mockResolvedValue({quiescenceConfirmed: true, continuityUnverified: false})

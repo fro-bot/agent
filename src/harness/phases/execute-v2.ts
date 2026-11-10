@@ -2,15 +2,14 @@ import type {OwnershipLedger, SessionSearchResult} from '@fro-bot/runtime'
 import type {AgentResultV2} from '../../features/agent/live-observation-v2.js'
 import type {ExecutionConfig, PromptOptions} from '../../features/agent/types.js'
 import type {Logger} from '../../shared/logger.js'
-import type {RunSummary} from '../../shared/types.js'
-import type {CacheRestoreV2PhaseResult} from './cache-restore.js'
+import type {CacheRestorePhaseResult} from './cache-restore.js'
 import {searchSessionsV2} from '@fro-bot/runtime/session-v2'
 import {stopAndConfirmQuietV2} from '../../features/agent/drain-v2.js'
 import {createActionClientV2, executeOpenCodeV2} from '../../features/agent/execution-v2.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {createSessionReaderV2} from './session-v2.js'
 
-/** What draining the overflowed session's own work left behind (the V1 `DrainOutcome` fields the recovery reads). */
+/** What draining the overflowed session's own work left behind (the `DrainOutcome` fields the recovery reads). */
 export interface OverflowDrainOutcome {
   readonly unknownCount: number
   /**
@@ -22,9 +21,8 @@ export interface OverflowDrainOutcome {
 }
 
 /**
- * Everything `runExecute` needs from the OpenCode generation it runs on. This is the one selector: `runExecute` builds a
- * backend once (V1 in `execute.ts`, V2 in `execute-v2.ts`) and uses it for the main run AND the context-overflow
- * recovery restart, so the two `executeOpenCode` call sites can never end up on different generations.
+ * Everything `runExecute` needs from the OpenCode server it runs on. `runExecute` builds the backend once and uses it
+ * for the main run AND the context-overflow recovery restart, so the two execute call sites share one server.
  */
 export interface ExecutionBackend {
   /** Run one prompt to completion on this generation. */
@@ -47,26 +45,20 @@ export interface ExecutionBackend {
     excludeSessionIds: readonly string[],
     logger: Logger,
   ) => Promise<readonly SessionSearchResult[]>
-  /** The newest session created after `afterTimestamp`, for a run that did not report its session id. */
-  readonly findLatestSessionId: (afterTimestamp: number, workspace: string, logger: Logger) => Promise<string | null>
-  /**
-   * Append the run summary to the session so a later run can find it (V1). Absent on V2: its only route for adding text
-   * to a session, `POST /api/session/:id/synthetic`, admits the text to the session inbox and delivers it at the next
-   * step boundary. With `resume: false` and the server about to shut down nothing ever delivers it, so the write left a
-   * queued item in the saved database (#2029) and never put a message in the transcript.
-   */
-  readonly writeSummary?: (sessionId: string, summary: RunSummary, logger: Logger) => Promise<void>
+  // There is no run-summary write. The only V2 route for adding text to a session, `POST /api/session/:id/synthetic`,
+  // admits the text to the session inbox and delivers it at the next step boundary. With `resume: false` and the server
+  // about to shut down nothing ever delivers it, so the write left a queued item in the saved database (#2029) and
+  // never put a message in the transcript.
 }
 
 /**
- * The OpenCode V2 side of `runExecute`'s selector (`execute.ts`): the same operations as V1 except the summary write,
- * over the V2 server's routes. The retry policy, deadline and one-comment protocol are not here; they are shared with V1 inside
- * `executeOpenCodeV2`.
+ * The backend `runExecute` runs on: the OpenCode V2 server's routes. The retry policy, deadline and one-comment
+ * protocol are not here; they live inside `executeOpenCodeV2`.
  */
 /** The longest the overflow archive may take. It is best-effort: a session left unarchived is re-continued next run. */
 export const ARCHIVE_TIMEOUT_MS = 10_000
 
-export function createExecutionBackendV2(cacheRestore: CacheRestoreV2PhaseResult): ExecutionBackend {
+export function createExecutionBackendV2(cacheRestore: CacheRestorePhaseResult): ExecutionBackend {
   const {serverHandle} = cacheRestore
   const client = createActionClientV2(serverHandle)
   const runStartedAt = Date.now()
@@ -140,10 +132,8 @@ export function createExecutionBackendV2(cacheRestore: CacheRestoreV2PhaseResult
       return searched.data
     },
 
-    // The V2 loop creates the session itself and reports its id, so there is nothing to look up afterwards.
-    findLatestSessionId: async () => null,
-
-    // No `writeSummary`: see `ExecutionBackend.writeSummary`. V2 has no way to append a delivered message without starting
-    // a turn, and a synthetic input left queued (#2029) keeps the next run's drain from ever going quiet.
+    // The V2 loop creates the session itself and reports its id, so nothing looks it up afterwards. And no run summary
+    // is written: V2 has no way to append a delivered message without starting a turn, and a synthetic input left
+    // queued (#2029) keeps the next run's drain from ever going quiet.
   }
 }

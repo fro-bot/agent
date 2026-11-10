@@ -2,8 +2,9 @@ import {readFileSync} from 'node:fs'
 import {resolve} from 'node:path'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
-import {DEFAULT_S3_PREFIX, DEFAULT_SYSTEMATIC_VERSION} from '../../shared/constants.js'
-import {parseActionInputs, parseModelInput} from './inputs.js'
+import {RECORDED_V2_PIN} from '../../services/setup/opencode.js'
+import {DEFAULT_OPENCODE_VERSION, DEFAULT_S3_PREFIX, DEFAULT_SYSTEMATIC_VERSION} from '../../shared/constants.js'
+import {LAST_V1_ACTION_RELEASE, parseActionInputs, parseModelInput} from './inputs.js'
 
 const mocks = vi.hoisted(() => ({
   getInput: vi.fn<(name: string) => string>(),
@@ -143,6 +144,108 @@ describe('parseActionInputs', () => {
 
       expect(result.success).toBe(true)
       expect(result.success && result.data.outputMode).toBe('branch-pr')
+    })
+
+    describe('opencode-version', () => {
+      it.each([
+        ['unset', ''],
+        ['latest', 'latest'],
+      ])('resolves %s to the recorded OpenCode V2 pin', (_label, value) => {
+        // #given
+        mockInputs({'opencode-version': value})
+
+        // #when
+        const result = parseActionInputs()
+
+        // #then
+        expect(result.success && result.data.opencodeVersion).toBe(DEFAULT_OPENCODE_VERSION)
+        expect(DEFAULT_OPENCODE_VERSION).toBe(RECORDED_V2_PIN.version)
+      })
+
+      it.each([
+        ['the exact pin', RECORDED_V2_PIN.version],
+        ['the pin with surrounding whitespace', `  ${RECORDED_V2_PIN.version} `],
+        ['the pin with a v prefix', `v${RECORDED_V2_PIN.version}`],
+      ])('accepts %s and normalizes it to the pin', (_label, value) => {
+        // #given
+        mockInputs({'opencode-version': value})
+
+        // #when
+        const result = parseActionInputs()
+
+        // #then the same string comes out whichever spelling went in, so nothing downstream sees a second spelling
+        expect(result.success && result.data.opencodeVersion).toBe(RECORDED_V2_PIN.version)
+      })
+
+      it.each(['2.3.0', 'v2.2.5', '2.9.9', '2.2.6-beta.1', '2.2.6+build.7', 'v2.2.60', '3.0.0'])(
+        'rejects the non-pin V2 version %s at parsing, naming the value and the pin',
+        value => {
+          // #given a V2 version other than the recorded release: a matching binary already on the runner would
+          // otherwise be reused before setup could apply the pin policy
+          mockInputs({'opencode-version': value})
+
+          // #when
+          const result = parseActionInputs()
+
+          // #then
+          expect(result.success).toBe(false)
+          const message = result.success ? '' : result.error.message
+          expect(message).toContain("Input 'opencode-version'")
+          expect(message).toContain(`"${value}"`)
+          expect(message).toContain(RECORDED_V2_PIN.version)
+          expect(message).toContain('only the recorded release')
+          expect(message).not.toContain('selects OpenCode V1')
+        },
+      )
+
+      it.each(['1.19.5+harness.bf7f7dfe', '1.19.5-harness.bf7f7dfe', '1.19.4', 'v1.19.4', '0.9.0'])(
+        'rejects the V1 value %s with an error that names the input, the value and the way back',
+        value => {
+          // #given
+          mockInputs({'opencode-version': value})
+
+          // #when
+          const result = parseActionInputs()
+
+          // #then the error says V1 is not run and points at the README section and the last V1 release
+          expect(result.success).toBe(false)
+          const message = result.success ? '' : result.error.message
+          expect(message).toContain("Input 'opencode-version'")
+          expect(message).toContain(`"${value}"`)
+          expect(message).toContain('no longer runs')
+          expect(message).toContain('Moving to OpenCode V2')
+          expect(message).toMatch(/fro-bot\/agent@v\d+\.\d+\.\d+/)
+          expect(message).toContain(`fro-bot/agent@${LAST_V1_ACTION_RELEASE}`)
+        },
+      )
+
+      it('keeps the docs that name the rollback tag in step with LAST_V1_ACTION_RELEASE', () => {
+        // #given the one constant the error message reads
+        const docs = ['README.md', 'docs/wiki/Setup and Configuration.md', 'docs/wiki/Architecture Overview.md']
+
+        // #then every page that tells an operator which tag to pin names the same tag, so a release bump is one edit
+        const named = docs.filter(doc =>
+          readFileSync(resolve(import.meta.dirname, '../../..', doc), 'utf8').includes(
+            `fro-bot/agent@${LAST_V1_ACTION_RELEASE}`,
+          ),
+        )
+        expect(named).toEqual(docs)
+      })
+
+      it.each(['not-a-version', '../evil', '2.2.6/../../x', '1.x'])(
+        'rejects the malformed value %s at parsing',
+        value => {
+          // #given
+          mockInputs({'opencode-version': value})
+
+          // #when
+          const result = parseActionInputs()
+
+          // #then it never reaches setup, where a lookup or download could happen
+          expect(result.success).toBe(false)
+          expect(!result.success && result.error.message).toContain("Input 'opencode-version'")
+        },
+      )
     })
 
     it('parses response-mode default value as github when input is empty', () => {

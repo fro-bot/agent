@@ -29,7 +29,7 @@ The origin requirements cut V1 once V2 is proven, with no side-by-side period af
 - R3. Remove `@opencode-ai/sdk` from the tree and from `dist/` (origin R9).
 - R4. Remove the remote V1 restore tiers (S3 `sessions/` and the V1 Actions-cache entries). Gate the S3 tier on a read-only count. Delete no data (origin R13-R16). The cache tier needs no gate: GitHub evicts caches not accessed in 7 days, and since the V2 default every V1 entry has either been superseded by a V2 save, which wins precedence, or sat idle.
 - R5. Retire `packages/harness`, its release workflows and its Renovate managers. Published npm packages and tags stay (origin R2, R3).
-- R6. Keep V2 behaviour unchanged at every step: restore precedence, save keys for runs that reach the server, the V1 database import wait, archive on overflow, and release-tag discovery. The one deliberate change is that a post-hook save after a failed bootstrap uses V2 keys instead of falling back to V1 (Unit 3).
+- R6. Keep V2 behaviour unchanged at every step: restore precedence, save keys for runs that reach the server, the V1 database import wait, archive on overflow, and release-tag discovery. The deliberate changes are that every save uses V2 keys instead of falling back to V1, and that a run which ends before the V2 server starts saves nothing, in cleanup or in the post hook (Unit 3).
 - R7. Every pull request passes the required checks by itself, and the committed `dist/` matches a fresh build.
 
 ## Scope Boundaries
@@ -160,7 +160,7 @@ The origin requirements cut V1 once V2 is proven, with no side-by-side period af
 - **Retire the V1 evals instead of porting them.** They are V1 end to end: harness binary spawn, `noReply` seeding, OAuth auth. The baseline is pinned to a 1.18 harness build and has not been regenerated since September. Their offline tests run inside the required `Test` check through `test:evals`, so deleting them drops those assertions, but every one covers V1 code that Unit 3 deletes. Porting would need a new seeding design and a paid baseline run.
 - **Delete `harness-integrate.yaml` and `harness-release.yaml` with the Action cut.** After Unit 3 they can't build, because they run the local Action on the V1 harness build. 1.19.5 is the final V1 base, so no workflow is left broken. The package itself stays until Unit 7.
 - **Reject V1 pins at input parsing (D4).** Map unset and `latest` to the pin first, because `selectOpenCodeGeneration` returns an error for `latest`. Then use the selector, so stock V1 and both harness spellings are rejected. `resolveStockV2Policy` still rejects V2 versions that aren't the pin. The input itself stays; only an old value is an error.
-- **Move V2-only defaults with the Action cut, not the data-tier cut.** `resolveSessionGeneration` and seven helper defaults fall back to V1 when state is missing. A bootstrap failure would make the post hook save under V1 keys. Unit 3 flips them. Unit 6 removes only the V1 read tiers.
+- **Move V2-only defaults with the Action cut, not the data-tier cut.** `resolveSessionGeneration` and seven helper defaults fall back to V1 when state is missing. Once the V1 path is gone nothing may fall back to V1 keys, so Unit 3 flips them to V2. A run that ends before the V2 server starts must not save at all: the data on the runner is not its own history. Unit 6 removes only the V1 read tiers.
 - **The gateway gates on the workspace version instead of selecting by it.** A missing, unreadable or below-2 `opencodeVersion` marks the workspace not ready. Unit 4 extends the existing fail-closed path, which today covers only an unreadable value. `/readyz` keeps its shape, so the type mirror and the drift guard need no change.
 - **The workspace image requires `OPENCODE_VERSION` as a build-arg.** A Docker `ARG` default can't be read from a file, and a literal default would be a second copy of the pin that drifts on every Renovate bump. A no-arg build fails fast with a message that names the pin file. Infra already passes the build-arg. CI smoke and the deploy docs pass it from the pin.
 - **Rollback is documented, not engineered (D3).** After Unit 3, rollback means pinning the Action to the last pre-cut release tag. After Unit 4, it means redeploying the prior image pair from GHCR. V1 and V2 history fork on rollback: a V1 run cannot see V2 work, and a later V2 run keeps its own copy. The docs say this plainly. Nothing reconciles the two.
@@ -201,7 +201,7 @@ flowchart LR
 
 ## Implementation Units
 
-- [ ] **Unit 1: Split V2-used code out of V1 modules**
+- [x] **Unit 1: Split V2-used code out of V1 modules** (#2110)
 
 **Goal:** No V2 module imports a V1 module that a later unit deletes. Every later deletion then becomes a file list plus `tsc`.
 
@@ -246,7 +246,7 @@ flowchart LR
 - No `-v2` module imports a file that Units 3-5 delete.
 - `dist/` is rebuilt and reproducible across two builds.
 
-- [ ] **Unit 2: Retire the V1 evals**
+- [x] **Unit 2: Retire the V1 evals** (#2112)
 
 **Goal:** Remove the V1-only eval suite, so the Action and the harness lose their last non-production consumer.
 
@@ -275,9 +275,20 @@ flowchart LR
 - No remaining non-historical reference to `evals/`.
 - `dist/` is unchanged.
 
-- [ ] **Unit 3: V2-only Action**
+- [x] **Unit 3: V2-only Action**
 
-**Goal:** The Action runs only OpenCode V2, rejects a V1 `opencode-version` at input parsing, and saves V2 keys even after a bootstrap failure.
+**Goal:** The Action runs only OpenCode V2, rejects a V1 `opencode-version` at input parsing, saves V2 keys, and persists session state only for a run that restored the cache and started the V2 server.
+
+**As built:** these differ from the file list below.
+
+- `src/features/attachments/injector.ts` stays, because `session-prep.ts` still uses `buildAttachmentResult`.
+- `src/services/setup/systematic-plugin.ts` and its test are deleted, since no code used them any more.
+- `resolveSessionGeneration` and `STATE_KEYS.OPENCODE_VERSION` are removed instead of flipped. Post and cleanup saves no longer carry a version.
+- `packages/runtime/src/object-store/content-sync.ts` defaults to V2 as well.
+- `packages/harness/scripts/build-platform.test.ts` loses its `harness-release.yaml` drift guard.
+- `parseOpenCodeVersion` also rejects malformed values before any URL is built.
+- The workflow deletions ship in the same commit, because `scripts/fro-bot-workflow.test.ts` reads them.
+- `ci.yaml` needed no edit.
 
 **Requirements:** R1, R5 (the harness workflow deletion), R6, R7
 
@@ -326,7 +337,7 @@ flowchart LR
 - Error path: `1.19.5+harness.bf7f7dfe`, `1.19.5-harness.bf7f7dfe`, `1.19.4`, `v1.19.4` and `0.9.0` each fail parsing with the named error, and no tool-cache lookup or download happens.
 - Error path: a V2 version that isn't the pin is still rejected by the stock-V2 policy.
 - Edge case: a malformed version string fails at parsing and never reaches the network.
-- Integration: when bootstrap fails before the version is saved, the post hook still saves under V2 keys and the V2 S3 namespace.
+- Integration: a run that ends before the V2 server starts (a rejected V1 input, a setup failure, a failed restore) makes no Actions-cache and no object-store call, in cleanup or in the post hook. A crash after the server started still saves under V2 keys, through cleanup or the post hook's retry.
 - Integration: a V2 run with only a V1 cache or S3 entry still restores it and imports it (the fallback tiers are unchanged).
 - Characterization: `buildCIConfigV2` (`src/services/setup/ci-config-v2.ts`) output is byte-identical to main for the existing input cases.
 
@@ -395,6 +406,7 @@ flowchart LR
 - Modify: `packages/runtime/src/shared/constants.ts`, `tsdown.config.ts` (the inline SDK rule), the root and runtime `package.json`, and `bun.lock`. The lockfile change needs approval first.
 - Modify: `.github/renovate.json5`. Remove `@opencode-ai/sdk` from the group and from the V1 cap names. Keep the `anomalyco/opencode` cap and the harness base manager until Unit 7.
 - Modify: `scripts/bfra-me-exemption-guard.test.ts`, `AGENTS.md`, `.github/copilot-instructions.md`, `.agents/skills/versioned-tool/SKILL.md` and `src/services/session/AGENTS.md`.
+- Modify: the `@opencode-ai/sdk` entry in `dist/THIRD_PARTY_NOTICES.txt` (it drops when the dependency goes), the comments in `-v2` modules that still name their deleted V1 sibling (for example "sibling of `execution.ts`"), and any V1 wording left in the wiki pages Session Persistence, Operator Web Control Surface and Conventions.
 
 **Approach:**
 
@@ -482,7 +494,7 @@ flowchart LR
 
 - **Interaction graph:** the Action phases (bootstrap, cache-restore, session-prep, execute, cleanup, post), the gateway run admission and quiescence, the workspace supervisor selection, Renovate, CI's required checks and the release tooling.
 - **Error propagation:** a V1 pin now fails at input parsing as an Action failure with a named message. A non-V2 workspace reads as not ready on the gateway's existing path.
-- **State lifecycle risks:** a post-hook save after a failed bootstrap must use V2 keys (Unit 3). Removing the restore tiers must not change saves (Unit 6). On rollback, V1 and V2 history fork.
+- **State lifecycle risks:** every save uses V2 keys, and a run that ends before the V2 server starts saves nothing (Unit 3). Removing the restore tiers must not change saves (Unit 6). On rollback, V1 and V2 history fork.
 - **API surface parity:** the `opencode-version` input keeps its name and its default. Only V1 values become errors. `/readyz` keeps its shape. The V2 pin file path is fixed because infra reads it.
 - **Integration coverage:** the Action self-test, the real-binary V2 suites (run locally; no workflow runs them), the image smokes, and the post-release infra deploy check.
 - **Unchanged invariants:**
