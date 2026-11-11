@@ -33,8 +33,6 @@ import {
   releaseLockIfHolder,
   syncArtifactsToStore,
   syncMetadataToStore,
-  syncSessionsFromStore,
-  syncSessionsToStore,
   transitionRun,
   validateProviderSemantics,
 } from '@fro-bot/runtime'
@@ -191,32 +189,6 @@ export const validateProviderSemanticsEffect = (
 // ---------------------------------------------------------------------------
 // S3 sync helpers — plain Promise returns (no Result tag)
 // ---------------------------------------------------------------------------
-
-export const syncSessionsToStoreEffect = (
-  adapter: ObjectStoreAdapter,
-  config: ObjectStoreConfig,
-  identity: string,
-  repo: string,
-  sessionStoragePath: string,
-  logger: Logger,
-): Effect.Effect<{uploaded: number; failed: number}, Error> =>
-  Effect.tryPromise({
-    try: async () => syncSessionsToStore(adapter, config, identity, repo, sessionStoragePath, logger),
-    catch: error => (error instanceof Error ? error : new Error(String(error))),
-  })
-
-export const syncSessionsFromStoreEffect = (
-  adapter: ObjectStoreAdapter,
-  config: ObjectStoreConfig,
-  identity: string,
-  repo: string,
-  sessionStoragePath: string,
-  logger: Logger,
-): Effect.Effect<{downloaded: number; failed: number; mainDbRestored: boolean}, Error> =>
-  Effect.tryPromise({
-    try: async () => syncSessionsFromStore(adapter, config, identity, repo, sessionStoragePath, logger),
-    catch: error => (error instanceof Error ? error : new Error(String(error))),
-  })
 
 export const syncArtifactsToStoreEffect = (
   adapter: ObjectStoreAdapter,

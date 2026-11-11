@@ -1,9 +1,9 @@
 /**
- * Bearer-to-Basic reverse proxy for a stock OpenCode V2 server: the sibling of `opencode-proxy.ts`.
+ * Bearer-to-Basic reverse proxy for a stock OpenCode V2 server.
  *
  * This is the SOLE sandbox-net-reachable OpenCode entry point. The raw server is loopback-bound.
  *
- * What differs from the V1 proxy (all measured against v2.2.0, probe P14):
+ * Measured against v2.2.0 (probe P14):
  * - The server demands Basic auth with a per-spawn password. The caller presents the gateway's bearer; the proxy
  *   checks it and replaces it with the credential of the server that is ready right now, read from the holder on
  *   every request, never captured. A respawn changes the password, so a captured value would answer 401 forever.
@@ -58,7 +58,7 @@ const PROXY_ERROR_HEADER = 'x-fro-bot-proxy-error'
 /** Default inactivity timeout: 30 seconds. */
 const PROXY_TIMEOUT_DEFAULT_MS = 30_000
 
-/** Same contract as the V1 proxy: fail-soft to the default for a missing or invalid value. */
+/** Fail-soft to the default for a missing or invalid value. */
 function readProxyTimeoutMs(): number {
   const raw = process.env.WORKSPACE_PROXY_TIMEOUT_MS
   if (raw === undefined || raw === '') return PROXY_TIMEOUT_DEFAULT_MS
@@ -159,7 +159,7 @@ export interface OpencodeProxyHandle {
   readonly close: () => Promise<void>
 }
 
-/** Create the V2 proxy. The handle is the V1 handle, so `main.ts` drives either the same way. */
+/** Create the proxy. */
 export function createOpencodeProxyV2(options: OpencodeProxyV2Options): OpencodeProxyHandle {
   const {token, upstreamUrl, logger, credentials} = options
   const inactivityTimeoutMs = options.timeoutMs === undefined ? readProxyTimeoutMs() : options.timeoutMs

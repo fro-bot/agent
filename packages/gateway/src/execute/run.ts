@@ -1,4 +1,4 @@
-import type {CoordinationConfig, Result, RunState, SessionGeneration} from '@fro-bot/runtime'
+import type {CoordinationConfig, Result, RunState} from '@fro-bot/runtime'
 import type {Message} from 'discord.js'
 import type {PermissionRequest} from '../approvals/coordinator.js'
 import type {QuestionAskedRequest} from '../approvals/question-coordinator.js'
@@ -68,8 +68,6 @@ import {settleAmbiguousRecovery, tryAutoRecoverDirtyCheckout} from './checkout-r
 import {markRunEnded, markRunLive, markRunQuarantined} from './live-run-registry.js'
 import {releaseLockOrByOwnership} from './lock-release.js'
 import {attachOpencodeV2} from './opencode-attach-v2.js'
-import {attachOpencode} from './opencode-attach.js'
-import {createPostReplyFactoryV1} from './permission-reply-v1.js'
 import {createPostReplyFactoryV2} from './permission-reply-v2.js'
 import {
   CLIENT_TIMEOUT_REPLY,
@@ -90,11 +88,9 @@ import {
   toRemoteFreshnessFromUpdateReady,
 } from './provenance.js'
 import {createFormDirectoryV2, createQuestionEffectsV2} from './question-client-v2.js'
-import {createQuestionEffects} from './question-client.js'
 import {QUARANTINE_HOLD_WINDOW_MS} from './root-stop-v2.js'
 import {RunCoreError} from './run-core-shared.js'
 import {runOpenCodeCoreV2} from './run-core-v2.js'
-import {runOpenCodeCore} from './run-core.js'
 import {toRuntimeLogger} from './runtime-logger.js'
 import {TERMINAL_WRITE_RETRY, transitionRetryingStaleEtag} from './stale-etag-transition.js'
 
@@ -854,7 +850,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
   // Minted per acquisition: the holder fields repeat across this gateway's runs, so renewal adoption and the
   // ownership release match on it. Declared here, not at acquisition, because the outer finally releases with it.
   const acquisitionToken = crypto.randomUUID()
-  // ── Quarantine — set only when `runOpenCodeCore` throws a `RunCoreError` with
+  // ── Quarantine — set only when `runOpenCodeCoreV2` throws a `RunCoreError` with
   // `quarantined: true`: its termination barrier could NOT confirm that this run's
   // owned background sessions actually stopped. Declared at this (outer-try-spanning)
   // scope, not inside the inner try, because BOTH the inner finally (heartbeat/lock)
@@ -880,18 +876,15 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
     // This prevents creating a thread, acquiring a lock, or creating run-state
     // for a workspace that is not yet serving OpenCode.
     let workspaceReady = false
-    // The OpenCode generation the workspace runs, read from the version it reports on its control API. A workspace
-    // that reports none runs V1. A version that is present but unreadable selects neither loop: not ready.
-    let openCodeGeneration: SessionGeneration = 'v1'
+    // Only a workspace that reports an OpenCode V2 version (major 2 or above) is ready. A missing, older or unreadable
+    // version is not: the gateway has no other loop to run it on.
     try {
       const readyzResult = await readyz()
       workspaceReady = readyzResult.success === true && readyzResult.data.ready === true
       if (workspaceReady && readyzResult.success === true) {
         const selected = selectOpenCodeGeneration(readyzResult.data.opencodeVersion)
-        if (selected.success) {
-          openCodeGeneration = selected.data
-        } else {
-          logger.warn({channelId, repo}, 'run: the workspace reported an unreadable OpenCode version — not ready')
+        if (!selected.success || selected.data !== 'v2') {
+          logger.warn({channelId, repo}, 'run: the workspace does not report an OpenCode V2 version — not ready')
           workspaceReady = false
         }
       }
@@ -1083,11 +1076,11 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
     // ── Ownership ledger — tracks background subagents this run dispatches ──
     //
-    // Created fresh per run and handed to `runOpenCodeCore`, which adopts an
+    // Created fresh per run and handed to `runOpenCodeCoreV2`, which adopts an
     // entry when it observes a background dispatch and settles/unknowns entries
-    // via its own reconciliation. `runOpenCodeCore` does not return until the
+    // via its own reconciliation. `runOpenCodeCoreV2` does not return until the
     // ledger drains (or the run's deadline expires) — so everything below that
-    // already runs after `runOpenCodeCore` resolves (heartbeat.stop, the
+    // already runs after `runOpenCodeCoreV2` resolves (heartbeat.stop, the
     // COMPLETED/FAILED/CANCELLED transition, and the outer handoff finally)
     // naturally runs only after drain, with no separate drain stage needed here.
     const ownershipLedger = createOwnershipLedger()
@@ -1591,11 +1584,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
       // ── Execute prompt via OpenCode ─────────────────────────────────────────────────────────────────────────────────────────
 
-      // One attach per run, by the generation the workspace reported. The V1 handle and the V2 client never coexist.
-      const openCode =
-        openCodeGeneration === 'v2'
-          ? ({generation: 'v2', client: attachOpencodeV2(attachUrl, attachToken)} as const)
-          : ({generation: 'v1', handle: attachOpencode(attachUrl, attachToken)} as const)
+      const client = attachOpencodeV2(attachUrl, attachToken)
       const promptText =
         request.promptBuilder === undefined
           ? buildDiscordPrompt({
@@ -1627,8 +1616,8 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
       // ── Cancel signal composition ───────────────────────────────────────────────
       // The run's effective signal is any-of(ceiling timeout, operator cancel). No
-      // parallel abort mechanism: run-core's own internal AbortSignal.any (inactivity
-      // composition) nests cleanly on top of this — run-core's interface is unchanged.
+      // parallel abort mechanism: run-core-v2's own internal AbortSignal.any (inactivity
+      // composition) nests cleanly on top of this — run-core-v2's interface is unchanged.
       const effectiveSignal = AbortSignal.any([timeoutSignal, cancelSignal])
 
       // ── Approval coordinator — per-run, wired to the program-scoped registry ──
@@ -1650,16 +1639,12 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       // Promise.race approach. AbortSignal.timeout is self-cleaning.
       //
       // ── "Always" is scoped to this run ──────────────────────────────────────────────
-      // Upstream stores an `always` beyond the run (V2: a saved row for the whole project; V1: the directory's approved
-      // list), so the gateway never sends it: both generations' reply factories downgrade it to `once`. The operator's
-      // Always becomes a grant in this run's own in-memory set instead, which the coordinator uses to answer later
+      // Upstream stores an `always` beyond the run (a saved row for the whole project), so the gateway never sends it:
+      // the reply factory downgrades it to `once`. The operator's Always becomes a grant in this run's own in-memory set instead, which the coordinator uses to answer later
       // matching asks from the run's owned sessions, and which is dropped on every terminal path (see the `finally`
       // below and the coordinator's `dispose`). Nothing here outlives the run, and no other run can read it.
       const runGrants = createRunGrants({logger, runId})
-      const upstreamReplyFactory: PostReplyFactory =
-        openCode.generation === 'v2'
-          ? createPostReplyFactoryV2(openCode.client)
-          : createPostReplyFactoryV1(openCode.handle)
+      const upstreamReplyFactory: PostReplyFactory = createPostReplyFactoryV2(client)
       const postReplyFactory = scopeAlwaysToRun(upstreamReplyFactory, runGrants)
 
       // ── Approval transport selection — resolved before coordinator creation ──────
@@ -1737,8 +1722,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
       })
 
       // ── Question coordinator — per-run, wired to the program-scoped question registry ──
-      // Effects come from a v2 client with the v1 handle's base URL and bearer, and the run's
-      // canonical directory. The deadline is evaluated when a question is asked, from the budget
+      // Effects come from the run's V2 client. The deadline is evaluated when a question is asked, from the budget
       // left then (not at run start), so a late question never outlives the hard abort. Scope
       // matches cancellation's: the Discord thread for Discord runs, the run id otherwise.
       // The open question forms of this run: V2 addresses a reply by session and form id, which the loop records here.
@@ -1757,14 +1741,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           : createQuestionCoordinator({
               logger,
               registry: deps.questionRegistry,
-              effects:
-                openCode.generation === 'v2'
-                  ? createQuestionEffectsV2({client: openCode.client, forms: v2Forms})
-                  : createQuestionEffects({
-                      baseURL: attachUrl,
-                      token: attachToken,
-                      directory: sessionDirectory,
-                    }),
+              effects: createQuestionEffectsV2({client, forms: v2Forms}),
               scopeId: request.surface === 'discord' ? threadId : runId,
               runId,
               computeDeadlineMs: () => computeApprovalDeadlineMs(Math.max(0, runTimeoutMs - (Date.now() - runStartMs))),
@@ -1772,7 +1749,9 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
             })
 
       try {
-        const commonCoreParams = {
+        await runOpenCodeCoreV2({
+          client,
+          forms: v2Forms,
           directory: sessionDirectory,
           promptText: promptTextWithProvenance,
           sink: replySink,
@@ -1793,10 +1772,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
           },
           ownershipLedger,
           onOwnershipChange: persistOwnership,
-        }
-        await (openCode.generation === 'v2'
-          ? runOpenCodeCoreV2({...commonCoreParams, client: openCode.client, forms: v2Forms})
-          : runOpenCodeCore({...commonCoreParams, handle: openCode.handle}))
+        })
       } finally {
         // Fail-closed: dispose any still-open coordinator entries so pending approvals
         // don't hang if the run ended (normally or via error) before they were settled.
@@ -1909,7 +1885,7 @@ async function executeWorkOnHeldSlot(task: RunTask): Promise<void> {
 
       if (isQuarantined) {
         // ── Quarantine path ─────────────────────────────────────────────────────────
-        // run-core's termination barrier could NOT confirm this run's owned background
+        // run-core-v2's termination barrier could NOT confirm this run's owned background
         // sessions actually stopped. Report failure, but do NOT stop the heartbeat, do
         // NOT release the lock, and do NOT hand off the slot below — a live writer may
         // still be mutating the workspace. The heartbeat keeps renewing the lock lease

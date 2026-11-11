@@ -1,9 +1,9 @@
 /**
- * Provider-failure labelling for the OpenCode V2 event loop: the sibling of `provider-failure.ts`.
+ * Provider-failure labelling for the OpenCode V2 event loop.
  *
  * V2 reports a terminal failure as `session.execution.failed` with a structured error `{type, message, status,
- * retryAfterMs}` (`packages/schema/src/session-error.ts`). The shared classifier (`classifyProviderFailure`) takes the
- * same typed signal the V1 loop builds, so the V2 error is mapped onto it field by field. Classification reads
+ * retryAfterMs}` (`packages/schema/src/session-error.ts`). The shared classifier (`classifyProviderFailure`) takes a
+ * typed signal, so the V2 error is mapped onto it field by field. Classification reads
  * upstream fields but NEVER returns them: every result is a closed, fixed `reason`. The error `type` and `message` are
  * provider- or plugin-controlled, so the logged error name is always `unknown`, never the upstream string.
  *

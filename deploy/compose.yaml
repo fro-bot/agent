@@ -254,11 +254,9 @@ services:
       WORKSPACE_OPENCODE_TOKEN_FILE: /run/workspace-agent/secrets/workspace_opencode_token
       # OpenCode provider credentials (auth.json blob). Required for the @mention
       # loop; optional for clone-only deployments. The entrypoint validates it as
-      # root. On a V1 image it hands the blob to an agent-uid (10001) subprocess over
-      # stdin — never argv — which writes auth.json (0600) under the agent's own
-      # home. A V2 image writes no auth.json: the root supervisor reads this file and
-      # provisions each OpenCode spawn from it. See deploy/workspace-entrypoint.sh and
-      # deploy/scripts/provision-agent-config.mjs.
+      # root. No auth.json is written under the agent's home: the root supervisor reads
+      # this file and provisions each OpenCode spawn from it. See
+      # deploy/workspace-entrypoint.sh and deploy/scripts/provision-agent-config.mjs.
       WORKSPACE_OPENCODE_AUTH_FILE: /run/workspace-agent/secrets/workspace_opencode_auth
       # OpenCode model + provider config for the mention loop (operator config,
       # not secrets — the provider key lives in the auth.json secret above).

@@ -12,13 +12,12 @@ import {
   makeInMemoryReplySink,
   makeInMemoryRequest,
   makeMessage,
-  mockRunOpenCodeCore,
   mockRunOpenCodeCoreAbortedBy,
+  mockRunOpenCodeCoreV2,
   mockRuntime,
   setupHappyPath,
 } from './test-helpers.js'
 import {abortRegistry} from './abort-registry.js'
-import * as attachModule from './opencode-attach.js'
 import * as promptModule from './prompt.js'
 import * as runCoreModule from './run-core-shared.js'
 /* eslint-enable perfectionist/sort-imports */
@@ -63,7 +62,7 @@ const sentContents = (threadSend: ReturnType<typeof vi.fn>): string[] =>
 async function runCancelled(runId: string, bufferedText: string): Promise<ReturnType<typeof vi.fn>> {
   const {launchWork} = await import('./run.js')
   setupHappyPath()
-  mockRunOpenCodeCore.mockImplementation(async () => {
+  mockRunOpenCodeCoreV2.mockImplementation(async () => {
     abortRegistry.abort(runId, 'operator cancel')
     throw new runCoreModule.RunCoreError('timeout', 'combined signal aborted')
   })
@@ -82,7 +81,7 @@ async function runCancelled(runId: string, bufferedText: string): Promise<Return
 async function runFailed(runId: string, bufferedText: string): Promise<ReturnType<typeof vi.fn>> {
   const {launchWork} = await import('./run.js')
   setupHappyPath()
-  mockRunOpenCodeCore.mockRejectedValue(new runCoreModule.RunCoreError('timeout', 'wall-clock limit reached'))
+  mockRunOpenCodeCoreV2.mockRejectedValue(new runCoreModule.RunCoreError('timeout', 'wall-clock limit reached'))
   const {replySink, threadSend} = await makeRealStreamReplySink()
   if (bufferedText !== '') replySink.append(bufferedText)
   const request = makeInMemoryRequest({replySink})
@@ -104,7 +103,7 @@ describe('operator cancel — abort-registry integration', () => {
   })
 
   it('registered run aborted via registry settles CANCELLED (not FAILED), notifies SSE observer, releases lock+slot, deletes registry entry', async () => {
-    // #given — happy-path runtime mocks, but runOpenCodeCore aborts the run's own
+    // #given — happy-path runtime mocks, but runOpenCodeCoreV2 aborts the run's own
     // registry entry mid-flight (simulating an operator cancel firing during execution)
     const {launchWork} = await import('./run.js')
     const ackState = buildMockRunState({phase: 'ACKNOWLEDGED', run_id: CANCEL_RUN_ID})
@@ -130,10 +129,6 @@ describe('operator cancel — abort-registry integration', () => {
       stop: heartbeatStop,
       isRunning: false,
     })
-    vi.mocked(attachModule.attachOpencode).mockReturnValue({
-      server: {url: 'http://workspace:9200'},
-      session: {create: vi.fn(), prompt: vi.fn()},
-    } as unknown as ReturnType<typeof attachModule.attachOpencode>)
     vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
 
     const cancelledByMetadata = {
@@ -230,10 +225,6 @@ describe('operator cancel — abort-registry integration', () => {
       stop: heartbeatStop,
       isRunning: false,
     })
-    vi.mocked(attachModule.attachOpencode).mockReturnValue({
-      server: {url: 'http://workspace:9200'},
-      session: {create: vi.fn(), prompt: vi.fn()},
-    } as unknown as ReturnType<typeof attachModule.attachOpencode>)
     vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
 
     const HB_FAIL_CANCEL_RUN_ID = 'hb-fail-cancel-run-id'
@@ -289,10 +280,6 @@ describe('operator cancel — abort-registry integration', () => {
       }),
       isRunning: false,
     })
-    vi.mocked(attachModule.attachOpencode).mockReturnValue({
-      server: {url: 'http://workspace:9200'},
-      session: {create: vi.fn(), prompt: vi.fn()},
-    } as unknown as ReturnType<typeof attachModule.attachOpencode>)
     vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
     mockRunOpenCodeCoreAbortedBy(() => {
       abortRegistry.abort(RUN_ID, 'operator cancel')
@@ -357,10 +344,6 @@ describe('operator cancel — abort-registry integration', () => {
       stop: heartbeatStop,
       isRunning: false,
     })
-    vi.mocked(attachModule.attachOpencode).mockReturnValue({
-      server: {url: 'http://workspace:9200'},
-      session: {create: vi.fn(), prompt: vi.fn()},
-    } as unknown as ReturnType<typeof attachModule.attachOpencode>)
     vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
 
     const CANCEL_FALLBACK_RUN_ID = 'cancel-fallback-run-id'
@@ -449,10 +432,6 @@ describe('operator cancel — abort-registry integration', () => {
       stop: heartbeatStop,
       isRunning: false,
     })
-    vi.mocked(attachModule.attachOpencode).mockReturnValue({
-      server: {url: 'http://workspace:9200'},
-      session: {create: vi.fn(), prompt: vi.fn()},
-    } as unknown as ReturnType<typeof attachModule.attachOpencode>)
     vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
 
     const CANCEL_FALLBACK_PUSH_RUN_ID = 'cancel-fallback-push-run-id'
@@ -503,12 +482,8 @@ describe('operator cancel — abort-registry integration', () => {
       stop: heartbeatStop,
       isRunning: false,
     })
-    vi.mocked(attachModule.attachOpencode).mockReturnValue({
-      server: {url: 'http://workspace:9200'},
-      session: {create: vi.fn(), prompt: vi.fn()},
-    } as unknown as ReturnType<typeof attachModule.attachOpencode>)
     vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
-    mockRunOpenCodeCore.mockRejectedValue(new Error('run core in-flight failure'))
+    mockRunOpenCodeCoreV2.mockRejectedValue(new Error('run core in-flight failure'))
 
     const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
     const pushDispatcher = {
@@ -573,10 +548,6 @@ describe('operator cancel — abort-registry integration', () => {
         stop: heartbeatStop,
         isRunning: false,
       })
-      vi.mocked(attachModule.attachOpencode).mockReturnValue({
-        server: {url: 'http://workspace:9200'},
-        session: {create: vi.fn(), prompt: vi.fn()},
-      } as unknown as ReturnType<typeof attachModule.attachOpencode>)
       vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
 
       const TERMINAL_RUN_ID = `cancel-fallback-terminal-run-id-${terminalPhase}`
@@ -647,10 +618,6 @@ describe('operator cancel — abort-registry integration', () => {
       stop: heartbeatStop,
       isRunning: false,
     })
-    vi.mocked(attachModule.attachOpencode).mockReturnValue({
-      server: {url: 'http://workspace:9200'},
-      session: {create: vi.fn(), prompt: vi.fn()},
-    } as unknown as ReturnType<typeof attachModule.attachOpencode>)
     vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
 
     const READFAIL_RUN_ID = 'cancel-fallback-readfail-run-id'
@@ -721,10 +688,6 @@ describe('operator cancel — abort-registry integration', () => {
       stop: heartbeatStop,
       isRunning: false,
     })
-    vi.mocked(attachModule.attachOpencode).mockReturnValue({
-      server: {url: 'http://workspace:9200'},
-      session: {create: vi.fn(), prompt: vi.fn()},
-    } as unknown as ReturnType<typeof attachModule.attachOpencode>)
     vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
 
     const PARSEFAIL_RUN_ID = 'cancel-fallback-parsefail-run-id'
@@ -791,10 +754,6 @@ describe('operator cancel — abort-registry integration', () => {
       stop: heartbeatStop,
       isRunning: false,
     })
-    vi.mocked(attachModule.attachOpencode).mockReturnValue({
-      server: {url: 'http://workspace:9200'},
-      session: {create: vi.fn(), prompt: vi.fn()},
-    } as unknown as ReturnType<typeof attachModule.attachOpencode>)
     vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
 
     const NOADAPTER_RUN_ID = 'cancel-fallback-noadapter-run-id'
@@ -911,10 +870,6 @@ describe('operator cancel — abort-registry integration', () => {
       stop: heartbeatStop,
       isRunning: false,
     })
-    vi.mocked(attachModule.attachOpencode).mockReturnValue({
-      server: {url: 'http://workspace:9200'},
-      session: {create: vi.fn(), prompt: vi.fn()},
-    } as unknown as ReturnType<typeof attachModule.attachOpencode>)
     vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
 
     const PIN_RUN_ID = 'cancel-fallback-pin-run-id'
@@ -951,7 +906,7 @@ describe('operator cancel — abort-registry integration', () => {
     // never aborted. The run must still land FAILED with timeout messaging.
     const {launchWork} = await import('./run.js')
     setupHappyPath()
-    mockRunOpenCodeCore.mockRejectedValue(new runCoreModule.RunCoreError('timeout', 'wall-clock timeout'))
+    mockRunOpenCodeCoreV2.mockRejectedValue(new runCoreModule.RunCoreError('timeout', 'wall-clock timeout'))
 
     const request = makeInMemoryRequest()
     const TIMEOUT_RUN_ID = 'timeout-run-id-1'
@@ -980,7 +935,7 @@ describe('operator cancel — abort-registry integration', () => {
     setupHappyPath()
 
     const RACE_RUN_ID = 'race-run-id-1'
-    mockRunOpenCodeCore.mockImplementation(async () => {
+    mockRunOpenCodeCoreV2.mockImplementation(async () => {
       abortRegistry.abort(RACE_RUN_ID, 'operator cancel wins the race')
       throw new runCoreModule.RunCoreError('timeout', 'combined signal aborted')
     })
@@ -1007,7 +962,7 @@ describe('operator cancel — abort-registry integration', () => {
     mockRuntime.releaseLock.mockResolvedValue({success: false as const, error: new Error('release failed')})
 
     const LOCK_FAIL_RUN_ID = 'lock-fail-run-id-1'
-    mockRunOpenCodeCore.mockImplementation(async () => {
+    mockRunOpenCodeCoreV2.mockImplementation(async () => {
       abortRegistry.abort(LOCK_FAIL_RUN_ID, 'operator cancel')
       throw new runCoreModule.RunCoreError('timeout', 'combined signal aborted')
     })
@@ -1036,14 +991,14 @@ describe('operator cancel — abort-registry integration', () => {
   })
 
   it('#1055 class: stream never settles after abort — run promise still resolves bounded, no unhandled rejection', async () => {
-    // #given — runOpenCodeCore that hangs unless it observes the abort, then rejects
+    // #given — runOpenCodeCoreV2 that hangs unless it observes the abort, then rejects
     // (mirrors run-core's makeAbortableStream: the abort signal races the hung iterator
     // rather than waiting on it forever).
     const {launchWork} = await import('./run.js')
     setupHappyPath()
 
     const NEVER_SETTLE_RUN_ID = 'never-settle-run-id-1'
-    mockRunOpenCodeCore.mockImplementation(async () => {
+    mockRunOpenCodeCoreV2.mockImplementation(async () => {
       abortRegistry.abort(NEVER_SETTLE_RUN_ID, 'operator cancel')
       // Simulate run-core's abort-aware race resolving promptly instead of hanging
       // on a stream that never emits again.
@@ -1071,7 +1026,7 @@ describe('operator cancel — abort-registry integration', () => {
     setupHappyPath()
 
     const PARTIAL_OUTPUT_RUN_ID = 'partial-output-run-id-1'
-    mockRunOpenCodeCore.mockImplementation(async () => {
+    mockRunOpenCodeCoreV2.mockImplementation(async () => {
       abortRegistry.abort(PARTIAL_OUTPUT_RUN_ID, 'operator cancel')
       throw new runCoreModule.RunCoreError('timeout', 'combined signal aborted')
     })
@@ -1169,7 +1124,7 @@ describe('operator cancel — abort-registry integration', () => {
       const CANCEL_DURING_FAILED_RUN_ID = 'fail-cancel-during-write-run-id-1'
       const {launchWork} = await import('./run.js')
       setupHappyPath()
-      mockRunOpenCodeCore.mockRejectedValue(new runCoreModule.RunCoreError('timeout', 'wall-clock limit reached'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new runCoreModule.RunCoreError('timeout', 'wall-clock limit reached'))
       mockRuntime.transitionRun.mockImplementation(
         async (_config: unknown, _identity: unknown, _repo: unknown, _runId: unknown, phase: unknown) => {
           if (phase === 'FAILED') abortRegistry.abort(CANCEL_DURING_FAILED_RUN_ID, 'operator cancel')
@@ -1272,7 +1227,7 @@ describe('operator cancel — abort-registry integration', () => {
 
     // #and — lock released, execution never attempted, clean exit
     expect(mockRuntime.releaseLock).toHaveBeenCalled()
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
   })
 })
 
@@ -1286,7 +1241,7 @@ describe('failureKind persistence on FAILED transitions', () => {
     const {runMention} = await import('./run.js')
     const {RunCoreError} = runCoreModule
     setupHappyPath()
-    mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('inactivity-timeout', 'no progress'))
+    mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('inactivity-timeout', 'no progress'))
 
     const deps = makeDeps()
     const message = makeMessage()
@@ -1305,7 +1260,7 @@ describe('failureKind persistence on FAILED transitions', () => {
     const {runMention} = await import('./run.js')
     const {RunCoreError} = runCoreModule
     setupHappyPath()
-    mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+    mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
 
     const deps = makeDeps()
     const message = makeMessage()
@@ -1327,7 +1282,7 @@ describe('failureKind persistence on FAILED transitions', () => {
     const {runMention} = await import('./run.js')
     const {RunCoreError} = runCoreModule
     setupHappyPath()
-    mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('unreachable', 'network error'))
+    mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('unreachable', 'network error'))
 
     const deps = makeDeps()
     const message = makeMessage()
@@ -1348,7 +1303,7 @@ describe('failureKind persistence on FAILED transitions', () => {
     // #given — a plain Error, not a RunCoreError
     const {runMention} = await import('./run.js')
     setupHappyPath()
-    mockRunOpenCodeCore.mockRejectedValue(new Error('boom'))
+    mockRunOpenCodeCoreV2.mockRejectedValue(new Error('boom'))
 
     const deps = makeDeps()
     const message = makeMessage()
@@ -1443,7 +1398,7 @@ describe('failureKind persistence on FAILED transitions', () => {
     )
 
     const {RunCoreError} = runCoreModule
-    mockRunOpenCodeCore.mockImplementation(async () => {
+    mockRunOpenCodeCoreV2.mockImplementation(async () => {
       abortRegistry.abort(FALLBACK_RUN_ID, 'operator cancel')
       throw new RunCoreError('inactivity-timeout', 'no progress')
     })
@@ -1540,7 +1495,7 @@ describe('failureKind persistence on FAILED transitions', () => {
     const {runMention} = await import('./run.js')
     const {RunCoreError} = runCoreModule
     setupHappyPath()
-    mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('drain-timeout', 'drain deadline expired'))
+    mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('drain-timeout', 'drain deadline expired'))
 
     const deps = makeDeps()
     const message = makeMessage()

@@ -8,11 +8,9 @@
  */
 
 import type {CreateAppFn, ExitFn, ServeFn} from './main.js'
-import type {InstanceDisposer} from './opencode-instance-v2.js'
-import type {CreateInstanceDisposerOptions} from './opencode-instance.js'
-import type {OpencodeProxyHandle} from './opencode-proxy-v2.js'
-import type {OpencodeProxyOptions} from './opencode-proxy.js'
-import type {RunSupervisedOpencodeOptions} from './opencode-server.js'
+import type {CreateInstanceDisposerV2Options, InstanceDisposer} from './opencode-instance-v2.js'
+import type {OpencodeProxyHandle, OpencodeProxyV2Options} from './opencode-proxy-v2.js'
+import type {RunSupervisedOpencodeV2Options} from './opencode-server-v2.js'
 import type {ProxyListeningRef, ServerDeps} from './server.js'
 
 import http from 'node:http'
@@ -21,6 +19,9 @@ import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {JOURNAL_RECONCILE_TIMEOUT_MS, SERVER_LISTEN_TIMEOUT_MS, startWorkspaceAgent} from './main.js'
 
 // ── Fake helpers ──────────────────────────────────────────────────────────────
+
+/** The V2 version a real image bakes. Startup refuses to run without it. */
+const IMAGE_ENV = {WORKSPACE_IMAGE_OPENCODE_VERSION: '2.2.6'} as const
 
 /**
  * Build a fake OpencodeProxyHandle that never actually binds a port.
@@ -61,8 +62,8 @@ function makeFakeServeFn(callLog: string[]) {
  * Build a fake runSupervisedOpencode that records the options it was called with
  * and resolves immediately.
  */
-function makeFakeSupervisorFn(callLog: string[], capturedOptions: {value?: RunSupervisedOpencodeOptions}) {
-  return vi.fn(async (options: RunSupervisedOpencodeOptions): Promise<void> => {
+function makeFakeSupervisorFn(callLog: string[], capturedOptions: {value?: RunSupervisedOpencodeV2Options}) {
+  return vi.fn(async (options: RunSupervisedOpencodeV2Options): Promise<void> => {
     callLog.push('runSupervisedOpencode')
     capturedOptions.value = options
   })
@@ -72,7 +73,7 @@ function makeFakeSupervisorFn(callLog: string[], capturedOptions: {value?: RunSu
  * Build a fake createOpencodeProxy that returns a fake proxy handle.
  */
 function makeFakeProxyFactory(callLog: string[], proxyListeningRef?: ProxyListeningRef) {
-  return vi.fn((_options: OpencodeProxyOptions): OpencodeProxyHandle => {
+  return vi.fn((_options: OpencodeProxyV2Options): OpencodeProxyHandle => {
     callLog.push('createOpencodeProxy')
     return makeFakeProxy(callLog, proxyListeningRef)
   })
@@ -148,8 +149,12 @@ describe('startWorkspaceAgent', () => {
     it('passes WORKSPACE_OPENCODE_READY_TIMEOUT_MS from env to the supervisor', async () => {
       // #given
       const callLog: string[] = []
-      const capturedOptions: {value?: RunSupervisedOpencodeOptions} = {}
-      const fakeEnv: NodeJS.ProcessEnv = {WORKSPACE_OPENCODE_READY_TIMEOUT_MS: '5000', WORKSPACE_OPENCODE_TOKEN: 'tok'}
+      const capturedOptions: {value?: RunSupervisedOpencodeV2Options} = {}
+      const fakeEnv: NodeJS.ProcessEnv = {
+        ...IMAGE_ENV,
+        WORKSPACE_OPENCODE_READY_TIMEOUT_MS: '5000',
+        WORKSPACE_OPENCODE_TOKEN: 'tok',
+      }
       const fakeServeFn = makeFakeServeFn(callLog)
       const fakeSupervisorFn = makeFakeSupervisorFn(callLog, capturedOptions)
       const fakeProxyFactory = makeFakeProxyFactory(callLog)
@@ -172,8 +177,8 @@ describe('startWorkspaceAgent', () => {
     it('uses the default 60000ms when WORKSPACE_OPENCODE_READY_TIMEOUT_MS is absent', async () => {
       // #given
       const callLog: string[] = []
-      const capturedOptions: {value?: RunSupervisedOpencodeOptions} = {}
-      const fakeEnv: NodeJS.ProcessEnv = {}
+      const capturedOptions: {value?: RunSupervisedOpencodeV2Options} = {}
+      const fakeEnv: NodeJS.ProcessEnv = {...IMAGE_ENV}
       const fakeServeFn = makeFakeServeFn(callLog)
       const fakeSupervisorFn = makeFakeSupervisorFn(callLog, capturedOptions)
       const fakeProxyFactory = makeFakeProxyFactory(callLog)
@@ -204,8 +209,8 @@ describe('startWorkspaceAgent', () => {
       //   3. proxy.listen() — proxy bind on :9200, awaited until settled
       //   4. runSupervisedOpencode() — supervisor (fire-and-forget), spawned last
       const callLog: string[] = []
-      const capturedOptions: {value?: RunSupervisedOpencodeOptions} = {}
-      const fakeEnv: NodeJS.ProcessEnv = {}
+      const capturedOptions: {value?: RunSupervisedOpencodeV2Options} = {}
+      const fakeEnv: NodeJS.ProcessEnv = {...IMAGE_ENV}
       const fakeServeFn = makeFakeServeFn(callLog)
       const fakeSupervisorFn = makeFakeSupervisorFn(callLog, capturedOptions)
       const fakeProxyFactory = makeFakeProxyFactory(callLog)
@@ -241,13 +246,13 @@ describe('startWorkspaceAgent', () => {
       // #given — proxy.listen() resolves only after a delay, so a call-order assertion alone
       // would not catch a regression that calls runSupervisedOpencode before the bind RESOLVES.
       const callLog: string[] = []
-      const capturedOptions: {value?: RunSupervisedOpencodeOptions} = {}
-      const fakeEnv: NodeJS.ProcessEnv = {}
+      const capturedOptions: {value?: RunSupervisedOpencodeV2Options} = {}
+      const fakeEnv: NodeJS.ProcessEnv = {...IMAGE_ENV}
       const fakeServeFn = makeFakeServeFn(callLog)
       const fakeSupervisorFn = makeFakeSupervisorFn(callLog, capturedOptions)
 
       let proxyListenResolved = false
-      const fakeProxyFactory = vi.fn((_options: OpencodeProxyOptions): OpencodeProxyHandle => {
+      const fakeProxyFactory = vi.fn((_options: OpencodeProxyV2Options): OpencodeProxyHandle => {
         callLog.push('createOpencodeProxy')
         const server = new http.Server()
         return {
@@ -289,10 +294,10 @@ describe('startWorkspaceAgent', () => {
       // WORKSPACE_OPENCODE_READY_TIMEOUT_MS is accessed, and checking that
       // access happens before serve() is called.
       const callLog: string[] = []
-      const capturedOptions: {value?: RunSupervisedOpencodeOptions} = {}
+      const capturedOptions: {value?: RunSupervisedOpencodeV2Options} = {}
 
       // Proxy the env object to record when the timeout key is read
-      const rawEnv: NodeJS.ProcessEnv = {WORKSPACE_OPENCODE_READY_TIMEOUT_MS: '12345'}
+      const rawEnv: NodeJS.ProcessEnv = {...IMAGE_ENV, WORKSPACE_OPENCODE_READY_TIMEOUT_MS: '12345'}
       const fakeEnv = new Proxy(rawEnv, {
         get(target, prop) {
           if (prop === 'WORKSPACE_OPENCODE_READY_TIMEOUT_MS') {
@@ -311,7 +316,7 @@ describe('startWorkspaceAgent', () => {
         },
       )
 
-      const fakeSupervisorFn = vi.fn(async (options: RunSupervisedOpencodeOptions): Promise<void> => {
+      const fakeSupervisorFn = vi.fn(async (options: RunSupervisedOpencodeV2Options): Promise<void> => {
         callLog.push('runSupervisedOpencode')
         capturedOptions.value = options
       })
@@ -346,8 +351,8 @@ describe('startWorkspaceAgent', () => {
     it('sets proxyListeningRef.listening = true after proxy.listen resolves', async () => {
       // #given
       const callLog: string[] = []
-      const capturedOptions: {value?: RunSupervisedOpencodeOptions} = {}
-      const fakeEnv: NodeJS.ProcessEnv = {}
+      const capturedOptions: {value?: RunSupervisedOpencodeV2Options} = {}
+      const fakeEnv: NodeJS.ProcessEnv = {...IMAGE_ENV}
       const proxyListeningRef: ProxyListeningRef = {listening: false}
 
       const fakeServeFn = makeFakeServeFn(callLog)
@@ -381,15 +386,15 @@ describe('startWorkspaceAgent', () => {
       // #given — a fake proxy whose listen() always rejects (simulates a :9200 bind failure)
       const callLog: string[] = []
       const exitLog: string[] = []
-      const capturedOptions: {value?: RunSupervisedOpencodeOptions} = {}
-      const fakeEnv: NodeJS.ProcessEnv = {}
+      const capturedOptions: {value?: RunSupervisedOpencodeV2Options} = {}
+      const fakeEnv: NodeJS.ProcessEnv = {...IMAGE_ENV}
       const fakeServeFn = makeFakeServeFn(callLog)
       const fakeSupervisorFn = makeFakeSupervisorFn(callLog, capturedOptions)
       const fakeExitFn = makeFakeExitFn(exitLog)
 
       const proxyListeningRef: ProxyListeningRef = {listening: false}
 
-      const fakeProxyFactory = vi.fn((_options: OpencodeProxyOptions): OpencodeProxyHandle => {
+      const fakeProxyFactory = vi.fn((_options: OpencodeProxyV2Options): OpencodeProxyHandle => {
         const server = new http.Server()
         return {
           server,
@@ -435,14 +440,14 @@ describe('startWorkspaceAgent', () => {
       // #given — a fake proxy that exposes the real server so we can fire events post-startup
       const callLog: string[] = []
       const exitLog: string[] = []
-      const capturedOptions: {value?: RunSupervisedOpencodeOptions} = {}
-      const fakeEnv: NodeJS.ProcessEnv = {}
+      const capturedOptions: {value?: RunSupervisedOpencodeV2Options} = {}
+      const fakeEnv: NodeJS.ProcessEnv = {...IMAGE_ENV}
       const fakeServeFn = makeFakeServeFn(callLog)
       const fakeSupervisorFn = makeFakeSupervisorFn(callLog, capturedOptions)
       const fakeExitFn = makeFakeExitFn(exitLog)
 
       let capturedServer: http.Server | undefined
-      const fakeProxyFactory = vi.fn((_options: OpencodeProxyOptions): OpencodeProxyHandle => {
+      const fakeProxyFactory = vi.fn((_options: OpencodeProxyV2Options): OpencodeProxyHandle => {
         const server = new http.Server()
         capturedServer = server
         return {
@@ -483,14 +488,14 @@ describe('startWorkspaceAgent', () => {
       // #given — same setup as the 'close' test
       const callLog: string[] = []
       const exitLog: string[] = []
-      const capturedOptions: {value?: RunSupervisedOpencodeOptions} = {}
-      const fakeEnv: NodeJS.ProcessEnv = {}
+      const capturedOptions: {value?: RunSupervisedOpencodeV2Options} = {}
+      const fakeEnv: NodeJS.ProcessEnv = {...IMAGE_ENV}
       const fakeServeFn = makeFakeServeFn(callLog)
       const fakeSupervisorFn = makeFakeSupervisorFn(callLog, capturedOptions)
       const fakeExitFn = makeFakeExitFn(exitLog)
 
       let capturedServer: http.Server | undefined
-      const fakeProxyFactory = vi.fn((_options: OpencodeProxyOptions): OpencodeProxyHandle => {
+      const fakeProxyFactory = vi.fn((_options: OpencodeProxyV2Options): OpencodeProxyHandle => {
         const server = new http.Server()
         capturedServer = server
         return {
@@ -534,8 +539,8 @@ describe('startWorkspaceAgent', () => {
 
       const callLog: string[] = []
       const exitLog: string[] = []
-      const capturedOptions: {value?: RunSupervisedOpencodeOptions} = {}
-      const fakeEnv: NodeJS.ProcessEnv = {}
+      const capturedOptions: {value?: RunSupervisedOpencodeV2Options} = {}
+      const fakeEnv: NodeJS.ProcessEnv = {...IMAGE_ENV}
       // makeControllableServeFn (not makeFakeServeFn): makeFakeServeFn fires the listening
       // callback SYNCHRONOUSLY from inside serveFn, before the `boundServer = serveFn(...)`
       // assignment in main.ts completes — harmless for tests that never reach shutdown(), but
@@ -544,7 +549,7 @@ describe('startWorkspaceAgent', () => {
       const fakeSupervisorFn = makeFakeSupervisorFn(callLog, capturedOptions)
       const fakeExitFn = makeFakeExitFn(exitLog)
 
-      const fakeProxyFactory = vi.fn((_options: OpencodeProxyOptions): OpencodeProxyHandle => {
+      const fakeProxyFactory = vi.fn((_options: OpencodeProxyV2Options): OpencodeProxyHandle => {
         const server = new http.Server()
         return {
           server,
@@ -603,12 +608,12 @@ describe('startWorkspaceAgent', () => {
       // #given — token read and :9100 bind both succeed; only the proxy factory throws.
       const callLog: string[] = []
       const exitLog: string[] = []
-      const capturedOptions: {value?: RunSupervisedOpencodeOptions} = {}
-      const fakeEnv: NodeJS.ProcessEnv = {}
+      const capturedOptions: {value?: RunSupervisedOpencodeV2Options} = {}
+      const fakeEnv: NodeJS.ProcessEnv = {...IMAGE_ENV}
       const fakeServeFn = makeFakeServeFn(callLog)
       const fakeSupervisorFn = makeFakeSupervisorFn(callLog, capturedOptions)
       const fakeExitFn = makeFakeExitFn(exitLog)
-      const throwingProxyFactory = vi.fn((_options: OpencodeProxyOptions): OpencodeProxyHandle => {
+      const throwingProxyFactory = vi.fn((_options: OpencodeProxyV2Options): OpencodeProxyHandle => {
         callLog.push('createOpencodeProxy')
         throw new Error('cannot construct proxy')
       })
@@ -638,8 +643,8 @@ describe('startWorkspaceAgent', () => {
       // production exit path, and assert serveFn was never invoked — nothing bound.
       const callLog: string[] = []
       const exitLog: string[] = []
-      const capturedOptions: {value?: RunSupervisedOpencodeOptions} = {}
-      const fakeEnv: NodeJS.ProcessEnv = {}
+      const capturedOptions: {value?: RunSupervisedOpencodeV2Options} = {}
+      const fakeEnv: NodeJS.ProcessEnv = {...IMAGE_ENV}
       const fakeServeFn = makeFakeServeFn(callLog)
       const fakeSupervisorFn = makeFakeSupervisorFn(callLog, capturedOptions)
       const fakeProxyFactory = makeFakeProxyFactory(callLog)
@@ -680,8 +685,8 @@ describe('startWorkspaceAgent', () => {
     it('does not create the proxy or spawn OpenCode until the :9100 listening callback fires', async () => {
       // #given
       const callLog: string[] = []
-      const capturedOptions: {value?: RunSupervisedOpencodeOptions} = {}
-      const fakeEnv: NodeJS.ProcessEnv = {}
+      const capturedOptions: {value?: RunSupervisedOpencodeV2Options} = {}
+      const fakeEnv: NodeJS.ProcessEnv = {...IMAGE_ENV}
       const {serveFn: fakeServeFn, fireListening} = makeControllableServeFn(callLog)
       const fakeSupervisorFn = makeFakeSupervisorFn(callLog, capturedOptions)
       const fakeProxyFactory = makeFakeProxyFactory(callLog)
@@ -722,8 +727,8 @@ describe('startWorkspaceAgent', () => {
       // #given
       const callLog: string[] = []
       const exitLog: string[] = []
-      const capturedOptions: {value?: RunSupervisedOpencodeOptions} = {}
-      const fakeEnv: NodeJS.ProcessEnv = {}
+      const capturedOptions: {value?: RunSupervisedOpencodeV2Options} = {}
+      const fakeEnv: NodeJS.ProcessEnv = {...IMAGE_ENV}
       const {serveFn: fakeServeFn, fireError} = makeControllableServeFn(callLog)
       const fakeSupervisorFn = makeFakeSupervisorFn(callLog, capturedOptions)
       const fakeProxyFactory = makeFakeProxyFactory(callLog)
@@ -770,8 +775,8 @@ describe('startWorkspaceAgent', () => {
         // #given — a serve fn that never calls back and never errors
         const callLog: string[] = []
         const exitLog: string[] = []
-        const capturedOptions: {value?: RunSupervisedOpencodeOptions} = {}
-        const fakeEnv: NodeJS.ProcessEnv = {}
+        const capturedOptions: {value?: RunSupervisedOpencodeV2Options} = {}
+        const fakeEnv: NodeJS.ProcessEnv = {...IMAGE_ENV}
         const {serveFn: fakeServeFn} = makeControllableServeFn(callLog)
         const fakeSupervisorFn = makeFakeSupervisorFn(callLog, capturedOptions)
         const fakeProxyFactory = makeFakeProxyFactory(callLog)
@@ -815,7 +820,7 @@ describe('startWorkspaceAgent — startup journal reconciliation race timer (C5a
     // #given — reconciliation resolves immediately, well inside the deadline
     const callLog: string[] = []
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
-    const fakeEnv: NodeJS.ProcessEnv = {WORKSPACE_OPENCODE_TOKEN: 'tok'}
+    const fakeEnv: NodeJS.ProcessEnv = {...IMAGE_ENV, WORKSPACE_OPENCODE_TOKEN: 'tok'}
 
     // #when
     await startWorkspaceAgent({
@@ -844,7 +849,7 @@ describe('startWorkspaceAgent — recovery-journal reconciliation (slice 5c)', (
     // #given
     const callLog: string[] = []
     const order: string[] = []
-    const fakeEnv: NodeJS.ProcessEnv = {WORKSPACE_OPENCODE_TOKEN: 'tok'}
+    const fakeEnv: NodeJS.ProcessEnv = {...IMAGE_ENV, WORKSPACE_OPENCODE_TOKEN: 'tok'}
 
     // #when
     await startWorkspaceAgent({
@@ -872,7 +877,7 @@ describe('startWorkspaceAgent — recovery-journal reconciliation (slice 5c)', (
     const callLog: string[] = []
     const order: string[] = []
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
-    const fakeEnv: NodeJS.ProcessEnv = {WORKSPACE_OPENCODE_TOKEN: 'tok'}
+    const fakeEnv: NodeJS.ProcessEnv = {...IMAGE_ENV, WORKSPACE_OPENCODE_TOKEN: 'tok'}
 
     // #when — recovery reconciliation never resolves; update reconciliation resolves immediately
     const startPromise = startWorkspaceAgent({
@@ -905,7 +910,7 @@ describe('startWorkspaceAgent — recovery-journal reconciliation (slice 5c)', (
     vi.useFakeTimers()
     const callLog: string[] = []
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
-    const fakeEnv: NodeJS.ProcessEnv = {WORKSPACE_OPENCODE_TOKEN: 'tok'}
+    const fakeEnv: NodeJS.ProcessEnv = {...IMAGE_ENV, WORKSPACE_OPENCODE_TOKEN: 'tok'}
 
     // #when
     await startWorkspaceAgent({
@@ -938,7 +943,7 @@ describe('startWorkspaceAgent — control-API logger wiring (#1889)', () => {
     try {
       // #when
       await startWorkspaceAgent({
-        env: {WORKSPACE_OPENCODE_TOKEN: 'tok'},
+        env: {...IMAGE_ENV, WORKSPACE_OPENCODE_TOKEN: 'tok'},
         serveFn: makeFakeServeFn(callLog),
         runSupervisedOpencodeFn: makeFakeSupervisorFn(callLog, {}),
         createOpencodeProxyFn: makeFakeProxyFactory(callLog),
@@ -965,6 +970,7 @@ describe('startWorkspaceAgent — updateNetworkConfig wiring (A1)', () => {
     const callLog: string[] = []
     const captured: {value?: ServerDeps} = {}
     const fakeEnv: NodeJS.ProcessEnv = {
+      ...IMAGE_ENV,
       WORKSPACE_OPENCODE_TOKEN: 'tok',
       HTTPS_PROXY: 'http://mitmproxy:8080',
       NO_PROXY: '10.0.0.0/8',
@@ -993,6 +999,7 @@ describe('startWorkspaceAgent — updateNetworkConfig wiring (A1)', () => {
     const callLog: string[] = []
     const captured: {value?: ServerDeps} = {}
     const fakeEnv: NodeJS.ProcessEnv = {
+      ...IMAGE_ENV,
       WORKSPACE_OPENCODE_TOKEN: 'tok',
       GIT_SSL_CAINFO: '/etc/ssl/certs/mitmproxy-ca.pem',
     }
@@ -1017,7 +1024,7 @@ describe('startWorkspaceAgent — updateNetworkConfig wiring (A1)', () => {
     // #given
     const callLog: string[] = []
     const captured: {value?: ServerDeps} = {}
-    const fakeEnv: NodeJS.ProcessEnv = {WORKSPACE_OPENCODE_TOKEN: 'tok'}
+    const fakeEnv: NodeJS.ProcessEnv = {...IMAGE_ENV, WORKSPACE_OPENCODE_TOKEN: 'tok'}
 
     // #when
     await startWorkspaceAgent({
@@ -1041,13 +1048,13 @@ describe('startWorkspaceAgent \u2014 OpenCode instance disposer wiring', () => {
     // #given
     const callLog: string[] = []
     const captured: {value?: ServerDeps} = {}
-    const supervisorOptions: {value?: RunSupervisedOpencodeOptions} = {}
+    const supervisorOptions: {value?: RunSupervisedOpencodeV2Options} = {}
     const disposer: InstanceDisposer = async () => ({kind: 'disposed'})
-    const createInstanceDisposerFn = vi.fn((_options: CreateInstanceDisposerOptions) => disposer)
+    const createInstanceDisposerFn = vi.fn((_options: CreateInstanceDisposerV2Options) => disposer)
 
     // #when
     await startWorkspaceAgent({
-      env: {WORKSPACE_OPENCODE_TOKEN: 'tok'},
+      env: {...IMAGE_ENV, WORKSPACE_OPENCODE_TOKEN: 'tok'},
       serveFn: makeFakeServeFn(callLog),
       runSupervisedOpencodeFn: makeFakeSupervisorFn(callLog, supervisorOptions),
       createOpencodeProxyFn: makeFakeProxyFactory(callLog),

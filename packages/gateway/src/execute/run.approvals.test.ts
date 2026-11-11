@@ -12,12 +12,12 @@ import {
   makeThread,
   mockCreateDiscordStreamSink,
   mockCreatePermissionCoordinator,
-  mockRunOpenCodeCore,
+  mockRunOpenCodeCoreV2,
   mockRuntime,
   setupHappyPath,
 } from './test-helpers.js'
 import type * as coordinatorModule from '../approvals/coordinator.js'
-import * as attachModule from './opencode-attach.js'
+import * as attachModule from './opencode-attach-v2.js'
 import * as runCoreModule from './run-core-shared.js'
 /* eslint-enable perfectionist/sort-imports */
 
@@ -26,6 +26,11 @@ import * as runCoreModule from './run-core-shared.js'
 // dispose/shutdown, the throwing-factory regression, transport selection, and
 // the adjoining approval-mode / registry-deadline coverage.
 // ---------------------------------------------------------------------------
+
+/** A V2 client `replyPermission` that accepts every reply. */
+function replyPermissionOk() {
+  return vi.fn().mockResolvedValue({success: true as const, data: undefined})
+}
 
 describe('runMention', () => {
   beforeEach(() => {
@@ -37,7 +42,7 @@ describe('runMention', () => {
   describe('approval pending-visibility race', () => {
     it('approval send STARTED but UNRESOLVED when timeout fires → visible-output timeout copy chosen', async () => {
       // #given — the approval send promise never resolves before the timeout fires.
-      // This is the core race: onPending fires (marking pending), runOpenCodeCore throws
+      // This is the core race: onPending fires (marking pending), runOpenCodeCoreV2 throws
       // timeout, classification reads hasVisibleOutput() → true (pending counts as visible).
       const {runMention} = await import('./run.js')
       const {RunCoreError} = runCoreModule
@@ -72,9 +77,9 @@ describe('runMention', () => {
       })
       thread.send.mockReturnValueOnce(neverResolves).mockReturnValueOnce(neverResolves).mockResolvedValue(undefined)
 
-      // runOpenCodeCore calls onPending (triggering the fire-and-forget sends)
+      // runOpenCodeCoreV2 calls onPending (triggering the fire-and-forget sends)
       // then throws a timeout error — simulating the race condition.
-      mockRunOpenCodeCore.mockImplementation(async () => {
+      mockRunOpenCodeCoreV2.mockImplementation(async () => {
         if (capturedOnPending !== undefined) {
           capturedOnPending({
             requestID: 'req-race-1',
@@ -142,7 +147,7 @@ describe('runMention', () => {
       })
       thread.send.mockReturnValueOnce(neverResolves).mockReturnValueOnce(neverResolves).mockResolvedValue(undefined)
 
-      mockRunOpenCodeCore.mockImplementation(async () => {
+      mockRunOpenCodeCoreV2.mockImplementation(async () => {
         if (capturedOnPending !== undefined) {
           capturedOnPending({
             requestID: 'req-fix1-regression',
@@ -209,9 +214,9 @@ describe('runMention', () => {
       sendRejected.catch(() => undefined)
       thread.send.mockReturnValueOnce(sendRejected).mockReturnValueOnce(sendRejected).mockResolvedValue(undefined)
 
-      // runOpenCodeCore calls onPending then throws timeout.
+      // runOpenCodeCoreV2 calls onPending then throws timeout.
       // The approval sends reject first (microtask queue), then timeout is classified.
-      mockRunOpenCodeCore.mockImplementation(async () => {
+      mockRunOpenCodeCoreV2.mockImplementation(async () => {
         if (capturedOnPending !== undefined) {
           capturedOnPending({
             requestID: 'req-reject-1',
@@ -269,8 +274,8 @@ describe('runMention', () => {
       const fakeApprovalMessage = {id: 'msg-approval-race', edit: vi.fn()}
       thread.send.mockResolvedValue(fakeApprovalMessage)
 
-      // runOpenCodeCore calls onPending, yields so sends resolve, then throws timeout.
-      mockRunOpenCodeCore.mockImplementation(async () => {
+      // runOpenCodeCoreV2 calls onPending, yields so sends resolve, then throws timeout.
+      mockRunOpenCodeCoreV2.mockImplementation(async () => {
         if (capturedOnPending !== undefined) {
           capturedOnPending({
             requestID: 'req-resolve-1',
@@ -306,7 +311,7 @@ describe('runMention', () => {
       const statefulSink = makeStatefulPendingSinkMock()
       mockCreateDiscordStreamSink.mockReturnValue(statefulSink)
 
-      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
 
       const thread = makeThread()
       const message = makeMessage(thread)
@@ -329,7 +334,7 @@ describe('runMention', () => {
   // ── Approval mode propagation ────────────────────────────────────────────
 
   describe('approval mode propagation', () => {
-    it('approval-required: runOpenCodeCore is called with approvalMode === "approval-required"', async () => {
+    it('approval-required: runOpenCodeCoreV2 is called with approvalMode === "approval-required"', async () => {
       // #given — default approval-required mode
       const {runMention} = await import('./run.js')
       setupHappyPath()
@@ -340,9 +345,9 @@ describe('runMention', () => {
       // #when
       await runMention(message, makeBinding(), deps)
 
-      // #then — runOpenCodeCore called with approvalMode exactly 'approval-required'
-      expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
-      const coreParams = mockRunOpenCodeCore.mock.calls[0]?.[0] as {approvalMode?: string}
+      // #then — runOpenCodeCoreV2 called with approvalMode exactly 'approval-required'
+      expect(mockRunOpenCodeCoreV2).toHaveBeenCalledOnce()
+      const coreParams = mockRunOpenCodeCoreV2.mock.calls[0]?.[0] as {approvalMode?: string}
       expect(coreParams.approvalMode).toBe('approval-required')
     })
   })
@@ -351,7 +356,7 @@ describe('runMention', () => {
 
   describe('approval coordinator wiring', () => {
     it('no permission asked → registry.register and registry.applySettlement are never called', async () => {
-      // #given — runOpenCodeCore resolves without triggering any permission callbacks
+      // #given — runOpenCodeCoreV2 resolves without triggering any permission callbacks
       const {runMention} = await import('./run.js')
       setupHappyPath()
 
@@ -553,7 +558,7 @@ describe('runMention', () => {
       // #given
       const {runMention} = await import('./run.js')
       setupHappyPath()
-      mockRunOpenCodeCore.mockRejectedValue(new Error('boom'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new Error('boom'))
 
       const disposeFn = vi.fn()
       mockCreatePermissionCoordinator.mockReturnValue({
@@ -575,22 +580,17 @@ describe('runMention', () => {
       expect(disposeFn).toHaveBeenCalledWith('run ended')
     })
 
-    it('postReply closure: calls handle.client.postSessionIdPermissionsPermissionId with query.directory — guards silent-no-op regression', async () => {
-      // Regression guard: the OpenCode V1 reply route silently no-ops when `query.directory` is
-      // absent (returns 200 but does not resolve the pending permission). This test pins that the
-      // closure wired into registry.register actually forwards the workspace directory.
+    it('postReply closure: the registered effect answers the ask on the run’s V2 client by session and request id', async () => {
+      // This test pins that the closure wired into registry.register reaches the run's client.
 
       // #given
       const {runMention} = await import('./run.js')
       setupHappyPath()
 
-      const postSessionIdPermissionsPermissionId = vi.fn().mockResolvedValue({error: null})
-
-      vi.mocked(attachModule.attachOpencode).mockReturnValue({
-        server: {url: 'http://workspace:9200'},
-        session: {create: vi.fn(), prompt: vi.fn()},
-        client: {postSessionIdPermissionsPermissionId},
-      } as unknown as ReturnType<typeof attachModule.attachOpencode>)
+      const replyPermission = replyPermissionOk()
+      vi.mocked(attachModule.attachOpencodeV2).mockReturnValue({replyPermission} as unknown as ReturnType<
+        typeof attachModule.attachOpencodeV2
+      >)
 
       const approvalRegistry = makeApprovalRegistry()
       const thread = makeThread()
@@ -641,13 +641,9 @@ describe('runMention', () => {
       // #when — invoke the postReply closure
       await capturedPostReply('req-seam-999', canonicalDirectory, 'once')
 
-      // #then — SDK endpoint called with session + permissionID in path AND directory in query
-      expect(postSessionIdPermissionsPermissionId).toHaveBeenCalledExactlyOnceWith(
-        expect.objectContaining({
-          path: {id: fakeRequest.sessionID, permissionID: fakeRequest.requestID},
-          body: {response: 'once'},
-          query: {directory: canonicalDirectory},
-        }),
+      // #then — the V2 reply carries the session and request id
+      expect(replyPermission).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({sessionId: fakeRequest.sessionID, requestId: fakeRequest.requestID, decision: 'once'}),
       )
     })
 
@@ -686,23 +682,21 @@ describe('runMention', () => {
         }
       }
 
-      it('sends once upstream when the operator picks Always on a V1 run, and keeps the grant for the run', async () => {
-        // #given a V1 run whose operator surface posts through the registered effects, while the run is live
+      it('sends once upstream when the operator picks Always, and keeps the grant for the run', async () => {
+        // #given a run whose operator surface posts through the registered effects, while the run is live
         const {runMention} = await import('./run.js')
         setupHappyPath()
-        const postSessionIdPermissionsPermissionId = vi.fn().mockResolvedValue({error: null})
-        vi.mocked(attachModule.attachOpencode).mockReturnValue({
-          server: {url: 'http://workspace:9200'},
-          session: {create: vi.fn(), prompt: vi.fn()},
-          client: {postSessionIdPermissionsPermissionId},
-        } as unknown as ReturnType<typeof attachModule.attachOpencode>)
+        const replyPermission = replyPermissionOk()
+        vi.mocked(attachModule.attachOpencodeV2).mockReturnValue({replyPermission} as unknown as ReturnType<
+          typeof attachModule.attachOpencodeV2
+        >)
         const approvalRegistry = makeApprovalRegistry()
         const thread = makeThread()
         thread.send.mockResolvedValue({id: 'msg-approval', edit: vi.fn()})
         const captured = captureCoordinatorDeps()
         let result: {ok: boolean} | undefined
         let coveredDuringRun: boolean | undefined
-        mockRunOpenCodeCore.mockImplementation(async () => {
+        mockRunOpenCodeCoreV2.mockImplementation(async () => {
           const {onPending, runGrants} = captured.deps()
           if (onPending === undefined || runGrants === undefined) throw new Error('coordinator not wired')
           // The mocked coordinator never sees the ask, so note it the way the real one does.
@@ -722,9 +716,7 @@ describe('runMention', () => {
 
         // #then upstream got once, never always
         expect(result?.ok).toBe(true)
-        expect(postSessionIdPermissionsPermissionId).toHaveBeenCalledExactlyOnceWith(
-          expect.objectContaining({body: {response: 'once'}}),
-        )
+        expect(replyPermission).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({decision: 'once'}))
         // #and the run kept the grant for the rest of the run, then dropped it with the run
         expect(coveredDuringRun).toBe(true)
         expect(captured.deps().runGrants?.grants.isDropped()).toBe(true)
@@ -753,12 +745,10 @@ describe('runMention', () => {
         // #given
         const {runMention} = await import('./run.js')
         setupHappyPath()
-        const postSessionIdPermissionsPermissionId = vi.fn().mockResolvedValue({error: null})
-        vi.mocked(attachModule.attachOpencode).mockReturnValue({
-          server: {url: 'http://workspace:9200'},
-          session: {create: vi.fn(), prompt: vi.fn()},
-          client: {postSessionIdPermissionsPermissionId},
-        } as unknown as ReturnType<typeof attachModule.attachOpencode>)
+        const replyPermission = replyPermissionOk()
+        vi.mocked(attachModule.attachOpencodeV2).mockReturnValue({replyPermission} as unknown as ReturnType<
+          typeof attachModule.attachOpencodeV2
+        >)
         const captured = captureCoordinatorDeps()
         await runMention(makeMessage(), makeBinding(), makeDeps())
         const {runGrants} = captured.deps()
@@ -771,10 +761,8 @@ describe('runMention', () => {
         // #then
         expect(once.ok).toBe(true)
         expect(reject.ok).toBe(true)
-        const sentBodies = (postSessionIdPermissionsPermissionId.mock.calls as [{body: unknown}][]).map(
-          ([input]) => input.body,
-        )
-        expect(sentBodies).toEqual([{response: 'once'}, {response: 'reject'}])
+        const sentDecisions = (replyPermission.mock.calls as [{decision: unknown}][]).map(([input]) => input.decision)
+        expect(sentDecisions).toEqual(['once', 'reject'])
         expect(runGrants.runId).toEqual(expect.any(String))
       })
 
@@ -791,7 +779,7 @@ describe('runMention', () => {
         setupHappyPath()
         const captured = captureCoordinatorDeps()
         let coveredDuringRun: boolean | undefined
-        mockRunOpenCodeCore.mockImplementation(async () => {
+        mockRunOpenCodeCoreV2.mockImplementation(async () => {
           const {runGrants} = captured.deps()
           runGrants?.grants.noteAsked(RM_ASK)
           runGrants?.grants.grant(RM_ASK.requestID)
@@ -838,7 +826,7 @@ describe('runMention', () => {
       })
     })
 
-    it('coordinator is passed into runOpenCodeCore as the coordinator param', async () => {
+    it('coordinator is passed into runOpenCodeCoreV2 as the coordinator param', async () => {
       // #given
       const {runMention} = await import('./run.js')
       setupHappyPath()
@@ -859,8 +847,8 @@ describe('runMention', () => {
       // #when
       await runMention(message, makeBinding(), deps)
 
-      // #then — runOpenCodeCore received the coordinator
-      expect(mockRunOpenCodeCore).toHaveBeenCalledWith(
+      // #then — runOpenCodeCoreV2 received the coordinator
+      expect(mockRunOpenCodeCoreV2).toHaveBeenCalledWith(
         expect.objectContaining({
           coordinator: fakeCoordinator,
         }),
@@ -1238,7 +1226,7 @@ describe('runMention', () => {
     })
 
     it('hard abort signal and approval deadline both use remaining budget from the same origin — not raw runTimeoutMs', async () => {
-      // Regression guard: AbortSignal.timeout() passed to runOpenCodeCore must use
+      // Regression guard: AbortSignal.timeout() passed to runOpenCodeCoreV2 must use
       // remainingBudgetMs (runTimeoutMs − elapsed), not the raw configured runTimeoutMs.
       // We simulate elapsed setup time by controlling Date.now() so the two values differ.
 
@@ -1395,8 +1383,8 @@ describe('approval: pending wait → decision → run continues', () => {
       }
     })
 
-    // runOpenCodeCore calls onPermissionAsked and awaits the result
-    mockRunOpenCodeCore.mockImplementation(async params => {
+    // runOpenCodeCoreV2 calls onPermissionAsked and awaits the result
+    mockRunOpenCodeCoreV2.mockImplementation(async params => {
       const {coordinator} = params as {coordinator: import('../approvals/coordinator.js').PermissionCoordinator}
       const reply = await coordinator.onPermissionAsked({
         requestID: 'req-approved-1',
@@ -1439,8 +1427,8 @@ describe('approval: pending wait → decision → run continues', () => {
       }
     })
 
-    // runOpenCodeCore calls onPermissionAsked, gets 'reject', and throws
-    mockRunOpenCodeCore.mockImplementation(async params => {
+    // runOpenCodeCoreV2 calls onPermissionAsked, gets 'reject', and throws
+    mockRunOpenCodeCoreV2.mockImplementation(async params => {
       const {coordinator} = params as {coordinator: import('../approvals/coordinator.js').PermissionCoordinator}
       const reply = await coordinator.onPermissionAsked({
         requestID: 'req-rejected-1',
@@ -1661,7 +1649,7 @@ describe('approval dispose/shutdown: onDispose fail-closes pending registry entr
     mockCreatePermissionCoordinator.mockImplementation(coordinatorDeps =>
       realCreatePermissionCoordinator(coordinatorDeps),
     )
-    mockRunOpenCodeCore.mockImplementation(async params => {
+    mockRunOpenCodeCoreV2.mockImplementation(async params => {
       registry.register({
         requestID: 'req-stream-1',
         sessionID: 'ses-stream',
@@ -1702,7 +1690,7 @@ describe('approval dispose/shutdown: onDispose fail-closes pending registry entr
     await runMention(makeMessage(), makeBinding(), makeDeps())
 
     // #then — without this wiring the watchdog is off and run-core tests still pass
-    const coreParams = mockRunOpenCodeCore.mock.calls[0]?.[0] as {streamSilenceTimeoutMs?: number}
+    const coreParams = mockRunOpenCodeCoreV2.mock.calls[0]?.[0] as {streamSilenceTimeoutMs?: number}
     expect(coreParams.streamSilenceTimeoutMs).toBe(STREAM_SILENCE_TIMEOUT_MS)
     expect(STREAM_SILENCE_TIMEOUT_MS).toBeGreaterThan(0)
   })
@@ -1796,7 +1784,7 @@ describe('approval transport selection', () => {
     // #then — coordinator was created with an onPending callback (Discord transport wired)
     expect(capturedOnPending).toBeDefined()
     // #and — execution completed (Discord path unchanged)
-    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+    expect(mockRunOpenCodeCoreV2).toHaveBeenCalledOnce()
   })
 
   describe('operator-stream announce for a Discord-launched run (#2115)', () => {
@@ -2041,7 +2029,7 @@ describe('approval transport selection', () => {
     }
 
     // #then — execution completed (web surface is now a valid Surface value)
-    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+    expect(mockRunOpenCodeCoreV2).toHaveBeenCalledOnce()
     // #and — acquireLock was called with 'web' surface (no cast, no error)
     expect(mockRuntime.acquireLock).toHaveBeenCalledWith(
       expect.anything(),

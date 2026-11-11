@@ -14,22 +14,18 @@ sources:
   - packages/runtime/src/agent/directory-quiescence-v2.ts
   - packages/runtime/src/agent/server-v2.ts
   - src/features/agent/streaming-v2.ts
-  - src/features/agent/streaming-v2.ts
   - src/features/agent/drain-v2.ts
   - src/harness/phases/execute.ts
   - src/harness/phases/release-v2.ts
   - src/harness/phases/cleanup.ts
   - src/harness/run.ts
   - src/harness/outcome.ts
-  - packages/gateway/src/execute/run-core.ts
   - packages/gateway/src/execute/run-core-v2.ts
   - packages/gateway/src/execute/drain-completion-v2.ts
   - packages/gateway/src/execute/settle-owned-sessions-v2.ts
-  - packages/gateway/src/execute/root-stop.ts
   - packages/gateway/src/execute/root-stop-v2.ts
   - packages/gateway/src/execute/run.ts
   - packages/gateway/src/execute/recovery.ts
-  - packages/gateway/src/execute/opencode-generation.ts
   - packages/gateway/src/execute/repo-quiescence-v2.ts
   - packages/opencode-plugin/src/task-reuse-guard.ts
   - src/services/setup/ci-config-v2.ts
@@ -50,11 +46,11 @@ Fro Bot therefore separates **ownership accounting** from **release evidence**. 
 
 Subagent entries are keyed by child session ID. Reused dispatch identifiers cannot safely identify an execution, and a delayed completion must never settle a newer job. V2 also tracks background shells, using namespaced shell keys so shell IDs cannot be mistaken for session IDs. Those entries support progress, accounting, and reconciliation; they are not independently sufficient evidence that a directory is safe to release.
 
-Ownership is learned from observed dispatch metadata. On V1, a completed `task` part with background metadata identifies its child session. On V2, `event-v2.ts` projects native events into the shared activity vocabulary, including subagent and shell dispatches. Once adopted, descendants contribute tool activity, usage, and human requests to their owning run. Their terminal errors do not automatically fail the root: the root can explain or recover from a child's failure through its follow-up turn.
+Ownership is learned from observed dispatch metadata. `event-v2.ts` projects native events into the shared activity vocabulary, including subagent and shell dispatches. Once adopted, descendants contribute tool activity, usage, and human requests to their owning run. Their terminal errors do not automatically fail the root: the root can explain or recover from a child's failure through its follow-up turn.
 
 ## Reconciliation and notices
 
-Reconciliation repairs a missed settlement, not a missed adoption. V1's `ledger-reconcile.ts` checks that a tracked session is a direct child of the expected parent and separately checks directory-scoped liveness. A confirmed child that is no longer live settles; failed reads or mismatched parentage remain unknown. It never adopts every child returned by discovery, because a foreground delegation has the same child-session shape as a background dispatch.
+Reconciliation repairs a missed settlement, not a missed adoption. The ledger reconciler checks that a tracked session is a direct child of the expected parent and separately checks directory-scoped liveness. A confirmed child that is no longer live settles; failed reads or mismatched parentage remain unknown. It never adopts every child returned by discovery, because a foreground delegation has the same child-session shape as a background dispatch.
 
 V2's `ledger-reconcile-v2.ts` and `shell-jobs-v2.ts` perform the corresponding session and shell checks. Shared notice parsers (`subagent-notice.ts`, `shell-notice.ts`) recognize upstream completion messages that can wake the parent. Ledger settlement and the parent's response to a notice are separate events: a child can stop before the notice is queued, and the parent's old terminal reply says nothing about the next turn.
 
@@ -98,19 +94,13 @@ Cancellation cannot release a quarantined run. The live-run registry records the
 
 Failure passes through `settle-owned-sessions-v2.ts`, which repeatedly stops directory activity and attempts to confirm quiet. An unconfirmed stop marks the failure quarantined. The run retains its heartbeat and channel slot during a bounded hold; `root-stop-v2.ts` continues stopping observed activity during that hold. Afterwards the slot is freed, but the lock is left to expire rather than explicitly released on uncertain evidence. An owned session observed moving outside the directory also prevents confirmed release.
 
-Startup recovery and lock-takeover checks select the appropriate generation from workspace readiness. A busy or unreadable workspace blocks startup repair; recovery never deletes coordination locks. Persisted ownership is diagnostic, not authority to conclude that a writer is gone. The periodic stranded-run sweep separately repairs stale records without releasing locks; [[Troubleshooting]] describes that distinction.
-
-## V1 compatibility path
-
-V1 retains its SDK-based drain. The Action's `runDrain` in `src/harness/phases/execute.ts` reconciles tracked children, waits within the remaining timeout minus the teardown reserve, and aborts unresolved entries on expiry. With no Action timeout it stops waiting after three consecutive passes that observe no tracked live work while ownership remains unresolved. Individual drain reads and aborts remain bounded.
-
-V1 completion evidence is generation-scoped: renewed root activity invalidates an old idle observation, and the latest root user turn must have a qualified terminal reply. The gateway's V1 barrier additionally confirms an aborted root through its latest terminal assistant reply and liveness, rather than accepting absence from the live set alone. An abort issued while prompt preparation is still underway can otherwise report success without stopping the later runner.
+Startup recovery and lock-takeover checks read workspace activity from the V2 server (`repo-quiescence-v2.ts`). A busy or unreadable workspace blocks startup repair; recovery never deletes coordination locks. Persisted ownership is diagnostic, not authority to conclude that a writer is gone. The periodic stranded-run sweep separately repairs stale records without releasing locks; [[Troubleshooting]] describes that distinction.
 
 ## Requests, reuse, and configuration
 
-The Action rejects interactive requests rather than waiting for an absent human. Its V1 permission responder answers every well-formed ask on its private server without awaiting the reply inside the stream loop. V2 similarly rejects permission asks and cancels forms. The gateway instead routes owned requests through its shared approval and question registries; applying CI's unconditional rejection there would cross run boundaries and bypass human interaction.
+The Action rejects interactive requests rather than waiting for an absent human. It rejects permission asks and cancels forms. The gateway instead routes owned requests through its shared approval and question registries; applying CI's unconditional rejection there would cross run boundaries and bypass human interaction.
 
-Both generations prevent subagent-session reuse before dispatch. V1 installs the local `no-task-reuse` guard; V2's `@fro.bot/opencode-plugin` rejects a `subagent` call carrying a `sessionID`. A fresh child session per job makes completion attribution meaningful. Subagent depth remains pinned to one, with V2 expressing it under `experimental.subagent_depth`. Session moves and worktree creation are denied on V2 because they would weaken directory ownership.
+The Action and the gateway prevent subagent-session reuse before dispatch: `@fro.bot/opencode-plugin` rejects a `subagent` call carrying a `sessionID`. A fresh child session per job makes completion attribution meaningful. Subagent depth remains pinned to one, expressed under `experimental.subagent_depth`. Session moves and worktree creation are denied because they would weaken directory ownership.
 
 [[Setup and Configuration]] explains the effective-rule gate, run-attempt attachment access, and the narrow grant allowing bundled skills to read their own references outside the checkout.
 

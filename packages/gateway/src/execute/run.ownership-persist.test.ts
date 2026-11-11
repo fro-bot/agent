@@ -6,7 +6,7 @@ import {
   makeBinding,
   makeDeps,
   makeMessage,
-  mockRunOpenCodeCore,
+  mockRunOpenCodeCoreV2,
   setupHappyPath,
 } from './test-helpers.js'
 
@@ -93,7 +93,7 @@ async function startRun(deps: ReturnType<typeof makeDeps>) {
   const {runMention} = await import('./run.js')
   let hook: OnOwnershipChange | undefined
   let release: (() => void) | undefined
-  mockRunOpenCodeCore.mockImplementation(async params => {
+  mockRunOpenCodeCoreV2.mockImplementation(async params => {
     hook = (params as {onOwnershipChange?: OnOwnershipChange}).onOwnershipChange
     await new Promise<void>(resolve => {
       release = resolve

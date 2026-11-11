@@ -1,6 +1,7 @@
 import type {ConfirmExpiredHolder} from '@fro-bot/runtime'
-import type {SessionStatusClient} from './repo-quiescence.js'
+import type {ActiveSessionsClient} from './repo-quiescence-v2.js'
 
+import {ok} from '@fro-bot/runtime'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 /* eslint-disable perfectionist/sort-imports -- ./test-helpers.js must import before any real module
    it mocks, to register vi.mock() side effects before those modules are evaluated */
@@ -9,32 +10,17 @@ import {
   makeDeps,
   makeMessage,
   makeUpdateFn,
-  mockRunOpenCodeCore,
+  mockRunOpenCodeCoreV2,
   mockRuntime,
   setupHappyPath,
 } from './test-helpers.js'
-import {createRepoQuiescenceChecker} from './repo-quiescence.js'
+import {createRepoQuiescenceCheckerV2} from './repo-quiescence-v2.js'
 /* eslint-enable perfectionist/sort-imports */
 
 // ---------------------------------------------------------------------------
-// `session.status` returns `{}` for ANY directory without sessions, so the quiescence check is only sound if it
-// queries exactly the directory the run's sessions use. Both must derive from `canonicalWorkspaceTarget`.
+// A directory without sessions reads as quiet, so the quiescence check is only sound if it places sessions in exactly
+// the directory the run's sessions use. Both must derive from `canonicalWorkspaceTarget`.
 // ---------------------------------------------------------------------------
-
-function jsonResponse() {
-  return {
-    ok: true,
-    status: 200,
-    headers: {
-      get: (name: string): string | null =>
-        name.toLowerCase() === 'content-type'
-          ? 'application/json'
-          : name.toLowerCase() === 'content-length'
-            ? '2'
-            : null,
-    },
-  }
-}
 
 describe('session directory ↔ quiescence directory', () => {
   beforeEach(() => {
@@ -49,15 +35,15 @@ describe('session directory ↔ quiescence directory', () => {
     const {runMention} = await import('./run.js')
     setupHappyPath()
     const queried: string[] = []
-    const client: SessionStatusClient = {
-      session: {
-        status: vi.fn(async ({query}: {query: {directory: string}}) => {
-          queried.push(query.directory)
-          return {data: {}, response: jsonResponse()}
-        }),
+    const client: ActiveSessionsClient = {
+      session: {active: async () => ({}), list: vi.fn(async () => ({data: []}))},
+      getSession: async ({sessionId}) => ok({id: sessionId, parentId: null, directory: null, outcome: null}),
+      listShells: async ({directory}) => {
+        queried.push(directory)
+        return ok([])
       },
     }
-    const checkRepoQuiescence = createRepoQuiescenceChecker({
+    const checkRepoQuiescence = createRepoQuiescenceCheckerV2({
       workspaceOpencodeUrl: 'http://workspace:9200',
       workspaceOpencodeToken: 'secret-bearer-token',
       logger: {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
@@ -78,7 +64,7 @@ describe('session directory ↔ quiescence directory', () => {
     })
 
     // #then — one canonical directory for both, never the stored path
-    const sessionDirectory = (mockRunOpenCodeCore.mock.calls[0]?.[0] as {directory: string}).directory
+    const sessionDirectory = (mockRunOpenCodeCoreV2.mock.calls[0]?.[0] as {directory: string}).directory
     expect(sessionDirectory).toBe('/workspace/repos/acme/widget')
     expect(queried).toEqual([sessionDirectory])
     expect(sessionDirectory).not.toBe('/old/stale/path')

@@ -52,7 +52,7 @@ process.stdout.write(JSON.stringify({totalBytes, entryCount: entries, complete: 
 
 const WALK_KILL_REAP_GRACE_MS = 2_000
 
-/** Minimal duck-typed child handle this module needs — mirrors opencode-server.ts's `ChildHandle`/`SpawnFn` pattern, so a test can inject a fake without a real subprocess. `stdout`/`stderr` are optional EventEmitter-like objects, matching `child_process.ChildProcess`'s own shape when `stdio` requests a pipe. */
+/** Minimal duck-typed child handle this module needs — mirrors opencode-server-v2.ts's spawn-injection pattern, so a test can inject a fake without a real subprocess. `stdout`/`stderr` are optional EventEmitter-like objects, matching `child_process.ChildProcess`'s own shape when `stdio` requests a pipe. */
 export interface WalkChildHandle {
   readonly pid?: number
   readonly kill: (signal?: NodeJS.Signals | number) => boolean
@@ -89,7 +89,7 @@ const WALK_CWD = '/'
  * (Review round F, F1) Built from scratch — NEVER `{...process.env}` — so the agent-uid child can
  * never inherit `WORKSPACE_OPENCODE_TOKEN`, `GITHUB_TOKEN`, any secret-file path, `NODE_OPTIONS`,
  * `NODE_PATH`, `LD_*`, or any other ambient variable the root service happens to be carrying.
- * Mirrors opencode-server.ts's `buildOpencodeEnv` allowlist-construction STYLE (an explicit object
+ * Mirrors opencode-server-v2.ts's `buildOpencodeV2Env` allowlist-construction STYLE (an explicit object
  * literal, not a filter over the parent env) without importing anything OpenCode-specific.
  */
 function buildWalkEnv(): NodeJS.ProcessEnv {

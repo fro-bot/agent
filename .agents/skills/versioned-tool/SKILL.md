@@ -15,7 +15,7 @@ This project manages external CLI tools through a **single-source-of-truth versi
 | --- | --- | --- | --- |
 | OpenCode (action default) | `DEFAULT_OPENCODE_VERSION`, derived from `version` in `packages/runtime/src/shared/opencode-v2-pin.json` | `opencode-version` | Pin-coupled: Renovate bumps the JSON file (see below) |
 | OpenCode (workspace image, V1 default) | `ARG OPENCODE_VERSION` in `deploy/workspace.Dockerfile` | _(internal only)_ | _Release-job coupled — NOT Renovate (see below)_ |
-| OpenCode (workspace image, V2) | `version` in `packages/runtime/src/shared/opencode-v2-pin.json`, passed as the workspace build's `--build-arg OPENCODE_VERSION` | _(internal only)_ | `github-releases` (`anomalyco/opencode`, major 2 only; custom manager on the JSON file) |
+| OpenCode (workspace image, V2) | `version` in `packages/runtime/src/shared/opencode-v2-pin.json`, read by the workspace build's `version-gate` stage (`OPENCODE_VERSION` build-arg defaults to it) | _(internal only)_ | `github-releases` (`anomalyco/opencode`, major 2 only; custom manager on the JSON file) |
 | Systematic | `DEFAULT_SYSTEMATIC_VERSION` | `systematic-version` | `npm` (`@fro.bot/systematic`) |
 | OpenCode (harness base) | `base_version` in `packages/harness/harness.config.json` | _(internal only — config-JSON, not a TS constant)_ | `github-releases` (`anomalyco/opencode`) |
 

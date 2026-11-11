@@ -1,10 +1,8 @@
 /**
- * What the V2 gateway run loop (`run-core-v2.ts`) and the run pipeline (`run.ts`) share with the V1 loop
- * (`run-core.ts`): the typed error `run.ts` maps to coarse Discord replies, the minimal sink the loop writes to, the
+ * What the V2 gateway run loop (`run-core-v2.ts`) and the run pipeline (`run.ts`) share: the typed error `run.ts` maps to coarse Discord replies, the minimal sink the loop writes to, the
  * ledger-change wrapper, and the first-frame and abortable-stream helpers.
  *
- * Lives in its own module so neither loop imports the other. `run-core-v2.ts` is already large, so these are not
- * folded into it.
+ * Lives in its own module because `run-core-v2.ts` is already large.
  */
 
 import type {OwnershipEntryState, OwnershipLedger} from '@fro-bot/runtime'
@@ -31,7 +29,7 @@ export type RunCoreErrorKind =
   | 'workspace-unavailable' // clone failed for a reason that will not resolve on its own (e.g. the repo does not exist or is inaccessible) — do not invite a retry
 
 /**
- * Error thrown by `runOpenCodeCore` on any failure path.
+ * Error thrown by `runOpenCodeCoreV2` on any failure path.
  *
  * The `message` field is for internal logging only — never post it to Discord.
  * `run.ts` maps `kind` to coarse user-visible replies.
@@ -76,11 +74,11 @@ export class RunCoreError extends Error {
 }
 
 /**
- * Minimal streaming sink interface required by `runOpenCodeCore`.
+ * Minimal streaming sink interface required by `runOpenCodeCoreV2`.
  *
- * `runOpenCodeCore` only calls `sink.append(text)` — it never calls `flush()`,
+ * `runOpenCodeCoreV2` only calls `sink.append(text)` — it never calls `flush()`,
  * `buffered()`, or any other method. The caller (`run.ts`) is responsible for
- * flushing after `runOpenCodeCore` resolves.
+ * flushing after `runOpenCodeCoreV2` resolves.
  *
  * Both `ReplySink` (from `execute/launch-types.ts`) and `DiscordStreamSink`
  * (from `discord/streaming.ts`) satisfy this interface structurally, so no
@@ -128,7 +126,7 @@ function statesEqual(
  * entry is persisted.
  *
  * `onAdopted` is the gateway's hook point for registering a directly-observed
- * dispatch with `coordinator.addOwnedSession` — see `runOpenCodeCore`. In
+ * dispatch with `coordinator.addOwnedSession` — see `runOpenCodeCoreV2`. In
  * practice this fires only from the `task`-tool-completion path: reconciliation
  * never calls `adopt` (it settles or downgrades already-tracked entries only —
  * see `@fro-bot/runtime`'s `ledger-reconcile.ts` module doc), so a
@@ -143,7 +141,7 @@ function statesEqual(
  * `createLedgerReconciler`/`reconcileLedgerOnce` untouched.
  *
  * Exported for direct unit testing of the no-op detection: through the real
- * `runOpenCodeCore` → `reconcileLedgerOnce` path, `settle`/`markUnknown` can
+ * `runOpenCodeCoreV2` → `reconcileLedgerOnce` path, `settle`/`markUnknown` can
  * only ever be called once per entry per genuine transition (the reconcile
  * loop snapshots once and skips non-outstanding/non-unknown entries), so a
  * true duplicate call cannot be forced deterministically through that

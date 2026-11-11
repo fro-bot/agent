@@ -36,7 +36,7 @@
  *   accounts for them and text after a summary is topped up rather than double-separated.
  *
  * The tracker returns the exact string to append; it owns no delivery evidence. The reply-delivery fence records
- * each part's own text (never the separator) as the delta is accepted — see `run-core.ts` for why that is safe with
+ * each part's own text (never the separator) as the delta is accepted — see `run-core-v2.ts` for why that is safe with
  * hold-and-flush.
  */
 

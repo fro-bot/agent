@@ -1,6 +1,6 @@
 /**
- * Termination barrier for a run on OpenCode V2: the sibling of `settle-owned-sessions.ts`. The contract is the same (the
- * run's lock is not released while a writer it started can still touch the checkout); what differs is what is believed.
+ * Termination barrier for a run on OpenCode V2. The contract: the run's lock is not released while a writer it started
+ * can still touch the checkout.
  *
  * Stock v2.2.0 cannot prove that no session of the run can still be woken: a background shell's DELETE, a subagent's
  * completion and a queued notice all wake a session in a step the event stream does not show, and no REST route says a
