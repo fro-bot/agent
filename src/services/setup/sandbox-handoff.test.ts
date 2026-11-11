@@ -268,24 +268,154 @@ describe('sandbox take-back', () => {
     // #when taken back
     const outcome = await takeBack(fx.manifest, handed.data, fx.deps)
 
-    // #then the sandbox's inodes are chowned back per root, ACLs cleared per tree and recorded modes restored
+    // #then the sandbox's inodes are chowned back per root (with owner rwX on non-links in the same pass)
     expect(outcome.status).toBe('restored')
     const argv = mutating(fx.calls).map(call => call.join(' '))
     for (const root of [fx.manifest.workspace, ...fx.manifest.handedOver]) {
       expect(argv).toContain(
-        `${TOOLS.find} -P ${root} -xdev -user ${SANDBOX_UID} -exec ${TOOLS.chown} -h ${fx.manifest.ids.runnerUid}:${fx.manifest.ids.runnerGid} {} +`,
+        `${TOOLS.find} -P ${root} -xdev -user ${SANDBOX_UID} -exec ${TOOLS.chown} -h ${fx.manifest.ids.runnerUid}:${fx.manifest.ids.runnerGid} {} + ! -type l -exec ${TOOLS.chmod} u+rwX {} +`,
       )
     }
-    expect(argv).toContain(`${TOOLS.setfacl} -R -P -b ${fx.manifest.workspace}`)
+    // #and recorded modes are restored
     expect(argv).toContain(
       `${TOOLS.chmod} ${(fs.statSync(fx.manifest.runnerHome).mode & 0o7777).toString(8).padStart(4, '0')} ${fx.manifest.runnerHome}`,
     )
     // #and the chown comes before any ACL removal
-    const lastChown = argv.map(l => l.includes('-exec')).lastIndexOf(true)
-    const firstB = argv.findIndex(l => l.includes('-b '))
-    expect(lastChown).toBeLessThan(firstB)
+    const lastChown = argv.map(l => l.includes(` -user ${SANDBOX_UID} -exec`)).lastIndexOf(true)
+    const firstRemoval = argv.findIndex(l => l.includes(' -x u:') || l.includes(' -d -x u:'))
+    expect(lastChown).toBeGreaterThanOrEqual(0)
+    expect(lastChown).toBeLessThan(firstRemoval)
     // #and the private snapshot is gone
     expect(fs.existsSync(handed.data.snapshotDir)).toBe(false)
+  })
+
+  it("removes only this run's ACL entries, access and default, and never wipes a tree with -b", async () => {
+    // #given a completed handoff over a checkout, handed-over dirs and a readable dir
+    const handed = await handedOff()
+    fx.calls.length = 0
+    const {runnerUid} = fx.manifest.ids
+
+    // #when taken back
+    await takeBack(fx.manifest, handed.data, fx.deps)
+    const argv = mutating(fx.calls).map(call => call.join(' '))
+
+    // #then the checkout loses the sandbox's access entry and both users' default entries
+    const ws = fx.manifest.workspace
+    expect(argv).toContain(`${TOOLS.setfacl} -R -P -x u:${SANDBOX_UID} ${ws}`)
+    expect(argv).toContain(
+      `${TOOLS.find} -P ${ws} -xdev -type d -exec ${TOOLS.setfacl} -P -d -x u:${SANDBOX_UID},u:${runnerUid} {} +`,
+    )
+    // #and a handed-over dir loses only the runner entry handoff added; a readable dir only the sandbox's
+    const handedDir = fx.manifest.handedOver[0] ?? ''
+    expect(argv).toContain(`${TOOLS.setfacl} -R -P -x u:${runnerUid} ${handedDir}`)
+    const readable = fx.manifest.readable[0] ?? ''
+    expect(argv).toContain(`${TOOLS.setfacl} -R -P -x u:${SANDBOX_UID} ${readable}`)
+    expect(argv).toContain(
+      `${TOOLS.find} -P ${readable} -xdev -type d -exec ${TOOLS.setfacl} -P -d -x u:${SANDBOX_UID} {} +`,
+    )
+    // #and -b is used only on the individual chain dirs the handoff recorded, never on a tree
+    const trees = [ws, ...fx.manifest.handedOver, ...fx.manifest.readable]
+    expect(argv.filter(line => line.includes(' -b ') && trees.some(tree => line.endsWith(` ${tree}`)))).toEqual([])
+    expect(argv.some(line => line.includes(' -R ') && line.includes(' -b '))).toBe(false)
+  })
+
+  it('uses the same entry-by-entry removal when a partial handoff rolls back', async () => {
+    // #given a handoff that fails after the checkout and the handed-over dirs were granted
+    fx.failWhen.predicate = argv => argv.includes(`u:${SANDBOX_UID}:rX`) && argv.includes('-R')
+
+    // #when
+    const result = await handOff(fx.manifest, fx.deps)
+
+    // #then the rollback removed this run's entries and wiped no tree
+    expect(result.success).toBe(false)
+    const argv = mutating(fx.calls).map(call => call.join(' '))
+    expect(argv).toContain(`${TOOLS.setfacl} -R -P -x u:${SANDBOX_UID} ${fx.manifest.workspace}`)
+    expect(argv.some(line => line.includes(' -R ') && line.includes(' -b '))).toBe(false)
+  })
+
+  it('moves the trusted git metadata into place by rename, so it needs no free space', async () => {
+    // #given a handoff and the inode of the trusted copy
+    const handed = await handedOff()
+    const gitDir = path.join(fx.manifest.workspace, '.git')
+    const trusted = path.join(handed.data.snapshotDir, 'git', 'config')
+    const trustedInode = fs.statSync(trusted).ino
+    fs.rmSync(path.join(gitDir, 'config'))
+    fs.writeFileSync(path.join(gitDir, 'config'), '[core]\n\tfsmonitor = /tmp/payload\n')
+
+    // #when taken back
+    const outcome = await takeBack(fx.manifest, handed.data, fx.deps)
+
+    // #then the file in .git is the very inode of the trusted copy (a rename), not a fresh copy
+    expect(outcome.status).toBe('restored')
+    expect(fs.statSync(path.join(gitDir, 'config')).ino).toBe(trustedInode)
+    expect(fs.readFileSync(path.join(gitDir, 'config'), 'utf8')).toBe('[core]\n\trepositoryformatversion = 0\n')
+  })
+
+  it('is unsafe when a command is killed on its deadline, naming the timeout', async () => {
+    // #given the checkout chown being killed (exit null)
+    const handed = await handedOff()
+    fx.failWhen.predicate = null
+    const baseRun = fx.deps.run
+    const deps = {
+      ...fx.deps,
+      run: (async (argv, options) => {
+        if (argv.includes(TOOLS.chown) && argv.includes(fx.manifest.workspace)) return {exitCode: null, stdout: ''}
+        return baseRun(argv, options)
+      }) satisfies PrivilegedRun,
+    }
+
+    // #when
+    const outcome = await takeBack(fx.manifest, handed.data, deps)
+
+    // #then
+    expect(outcome.status === 'unsafe' && outcome.reason).toContain('timed out')
+  })
+
+  it('gives every take-back command what is left of a shared deadline and starts none after it', async () => {
+    // #given a clock the commands advance and a small budget
+    const handed = await handedOff()
+    let clock = 0
+    const seen: (number | undefined)[] = []
+    const started: string[] = []
+    const baseRun = fx.deps.run
+    const deps: HandoffDeps = {
+      ...fx.deps,
+      now: () => clock,
+      budgetMs: 1000,
+      run: async (argv, options) => {
+        seen.push(options?.timeoutMs)
+        started.push(argv.join(' '))
+        clock += 400
+        return baseRun(argv, options)
+      },
+    }
+
+    // #when taken back
+    const outcome = await takeBack(fx.manifest, handed.data, deps)
+
+    // #then each command was bounded by the time left, and the third onward never started
+    expect(seen.slice(0, 3)).toEqual([1000, 600, 200])
+    expect(seen.every(value => value !== undefined && value <= 1000)).toBe(true)
+    expect(started.length).toBe(3)
+    expect(outcome.status).toBe('unsafe')
+  })
+
+  it('still reverts the runner-surface locks when the sandbox files could not be restored', async () => {
+    // #given sandbox-owned files left behind (the data restore fails)
+    const handed = await handedOff()
+    fx.leftover.value = `${fx.manifest.workspace}/leftover\n`
+    fx.calls.length = 0
+
+    // #when taken back
+    const outcome = await takeBack(fx.manifest, handed.data, fx.deps)
+
+    // #then the result is unsafe, but the runner temp mode and the chain dir ACLs were still reverted
+    expect(outcome.status).toBe('unsafe')
+    const argv = mutating(fx.calls).map(call => call.join(' '))
+    expect(argv).toContain(
+      `${TOOLS.chmod} ${(fs.statSync(fx.manifest.runnerTemp).mode & 0o7777).toString(8).padStart(4, '0')} ${fx.manifest.runnerTemp}`,
+    )
+    expect(argv).toContain(`${TOOLS.setfacl} -P -b ${fx.manifest.runnerHome}`)
   })
 
   it('restores an extended ACL it recorded rather than only clearing it', async () => {

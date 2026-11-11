@@ -1,13 +1,15 @@
 import type {SandboxToolPaths} from '../../services/setup/sandbox-preflight.js'
-import type {ExecAdapter} from '../../services/setup/types.js'
-import type {SandboxLifecycleDeps} from './sandbox-lifecycle.js'
+import type {ExecAdapter, ExecOptions} from '../../services/setup/types.js'
+import type {SandboxLifecycleDeps, SignalHost} from './sandbox-lifecycle.js'
+import {Buffer} from 'node:buffer'
+import {EventEmitter} from 'node:events'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import {err, ok} from '@bfra.me/es/result'
 import {afterEach, beforeEach, describe, expect, it, vi, type Mock} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
-import {createPrivilegedRun, createSandboxLifecycle} from './sandbox-lifecycle.js'
+import {createPrivilegedRun, createSandboxLifecycle, DEFAULT_PRIVILEGED_TIMEOUT_MS} from './sandbox-lifecycle.js'
 
 const TOOLS = Object.fromEntries(
   [
@@ -68,6 +70,21 @@ function createHarness(): Harness {
     ids: () => ({uid: 1001, gid: 1001}),
   } as unknown as SandboxLifecycleDeps
   return {deps, mocks, exec, sudoCalls}
+}
+
+function fakeHost(): SignalHost & {readonly emitter: EventEmitter; readonly killed: string[]} {
+  const emitter = new EventEmitter()
+  const killed: string[] = []
+  return {
+    pid: 4242,
+    emitter,
+    killed,
+    on: (signal, listener) => emitter.on(signal, listener),
+    off: (signal, listener) => emitter.off(signal, listener),
+    kill: (pid, signal) => {
+      killed.push(`${pid}:${signal}`)
+    },
+  }
 }
 
 describe('createSandboxLifecycle', () => {
@@ -241,7 +258,7 @@ describe('createSandboxLifecycle', () => {
     expect(harness.mocks.deleteAccount).not.toHaveBeenCalled()
   })
 
-  it('keeps the account when take-back is unsafe', async () => {
+  it('still deletes the account after a confirmed stop when take-back is unsafe', async () => {
     // #given an unsafe take-back
     const harness = createHarness()
     harness.mocks.takeBack.mockResolvedValue({status: 'unsafe', reason: 'ancestor /x is a symlink'})
@@ -251,9 +268,93 @@ describe('createSandboxLifecycle', () => {
     // #when released
     const outcome = await lifecycle.release()
 
-    // #then the reason is surfaced and the uid stays reserved for the files still carrying it
+    // #then the reason is surfaced, and since nothing runs as the uid any more the account is deleted anyway
     expect(outcome).toEqual({stop: 'stopped', restore: 'unsafe', reason: 'ancestor /x is a symlink'})
+    expect(harness.mocks.deleteAccount).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps the account, and takes nothing back, when the stop is not confirmed', async () => {
+    // #given processes that survive the kill bound
+    const harness = createHarness()
+    harness.mocks.stop.mockResolvedValue('unconfirmed')
+    const lifecycle = create(harness)
+    await lifecycle.prepare({keyFilePaths: [], ghConfigDir: null, repoSkills: null})
+
+    // #when released
+    const outcome = await lifecycle.release()
+
+    // #then the sandbox might still be writing: no take-back, no delete
+    expect(outcome.stop).toBe('unconfirmed')
+    expect(outcome.restore).toBe('unsafe')
+    expect(harness.mocks.takeBack).not.toHaveBeenCalled()
     expect(harness.mocks.deleteAccount).not.toHaveBeenCalled()
+  })
+
+  describe('termination signals', () => {
+    it('installs handlers before the account exists and removes them after a normal release', async () => {
+      // #given a lifecycle whose account creation observes the handlers
+      const harness = createHarness()
+      const host = fakeHost()
+      let listenersWhenCreating = -1
+      harness.mocks.createAccount.mockImplementation(async () => {
+        listenersWhenCreating = host.emitter.listenerCount('SIGTERM') + host.emitter.listenerCount('SIGINT')
+        return ok(ACCOUNT)
+      })
+      const lifecycle = create(harness, {signals: host})
+
+      // #when prepared and released normally
+      await lifecycle.prepare({keyFilePaths: [], ghConfigDir: null, repoSkills: null})
+      expect(host.emitter.listenerCount('SIGTERM')).toBe(1)
+      await lifecycle.release()
+
+      // #then they were in place first and are gone after
+      expect(listenersWhenCreating).toBe(2)
+      expect(host.emitter.listenerCount('SIGTERM')).toBe(0)
+      expect(host.emitter.listenerCount('SIGINT')).toBe(0)
+      expect(host.killed).toEqual([])
+    })
+
+    it('stops the sandbox and takes its files back on a signal, then re-raises it once; a second signal is ignored', async () => {
+      // #given a prepared sandbox
+      const harness = createHarness()
+      const host = fakeHost()
+      const lifecycle = create(harness, {signals: host})
+      await lifecycle.prepare({keyFilePaths: [], ghConfigDir: null, repoSkills: null})
+
+      // #when SIGTERM arrives twice (the exec adapter re-raises it)
+      host.emitter.emit('SIGTERM')
+      host.emitter.emit('SIGTERM')
+      await vi.waitFor(() => {
+        expect(host.killed).toEqual(['4242:SIGTERM'])
+      })
+
+      // #then teardown ran once, in order, and only afterwards was the signal re-raised with the handlers gone
+      expect(harness.mocks.stop).toHaveBeenCalledTimes(1)
+      expect(harness.mocks.takeBack).toHaveBeenCalledTimes(1)
+      expect(harness.mocks.stop.mock.invocationCallOrder[0]).toBeLessThan(
+        harness.mocks.takeBack.mock.invocationCallOrder[0] ?? 0,
+      )
+      expect(host.emitter.listenerCount('SIGTERM')).toBe(0)
+      expect(host.emitter.listenerCount('SIGINT')).toBe(0)
+    })
+
+    it('ends the process anyway when the teardown does not finish within its budget', async () => {
+      // #given a stop that never returns
+      const harness = createHarness()
+      harness.mocks.stop.mockImplementation(async () => new Promise<never>(() => undefined))
+      const host = fakeHost()
+      const lifecycle = create(harness, {signals: host, signalTeardownBudgetMs: 20})
+      await lifecycle.prepare({keyFilePaths: [], ghConfigDir: null, repoSkills: null})
+
+      // #when SIGINT arrives
+      host.emitter.emit('SIGINT')
+
+      // #then the signal is still re-raised, bounded by the budget
+      await vi.waitFor(() => {
+        expect(host.killed).toEqual(['4242:SIGINT'])
+      })
+      expect(harness.mocks.takeBack).not.toHaveBeenCalled()
+    })
   })
 
   it('reports an exception during release as unsafe instead of throwing', async () => {
@@ -288,5 +389,48 @@ describe('createPrivilegedRun', () => {
       expect.objectContaining({cwd: '/', ignoreReturnCode: true}),
     )
     expect(result).toEqual({exitCode: 3, stdout: 'out'})
+  })
+
+  it('bounds every command, defaulting the timeout, and reports a killed command as a null exit', async () => {
+    // #given an adapter whose timeout path fires
+    const execWithTimeout = vi.fn(
+      async (_command: string, _args: string[] | undefined, _timeout: number, _options?: ExecOptions) =>
+        'timed-out' as const,
+    )
+    const getExecOutput = vi.fn()
+    const run = createPrivilegedRun({exec: vi.fn(), execWithTimeout, getExecOutput}, '/usr/bin/sudo')
+
+    // #when run with no timeout and with an explicit one
+    const defaulted = await run(['/usr/bin/find', '/x'])
+    await run(['/usr/bin/find', '/x'], {timeoutMs: 1234})
+
+    // #then both went through the killing path, with the default and the caller's bound, and report no exit code
+    expect(defaulted).toEqual({exitCode: null, stdout: ''})
+    expect(getExecOutput).not.toHaveBeenCalled()
+    expect(execWithTimeout.mock.calls.map(call => call[2])).toEqual([DEFAULT_PRIVILEGED_TIMEOUT_MS, 1234])
+    expect(execWithTimeout).toHaveBeenCalledWith(
+      '/usr/bin/sudo',
+      ['-n', '--', '/usr/bin/find', '/x'],
+      expect.any(Number),
+      expect.objectContaining({cwd: '/'}),
+    )
+  })
+
+  it('returns the exit code and the collected stdout when the command finishes in time', async () => {
+    // #given a command that prints and exits 1
+    const execWithTimeout = vi.fn(
+      async (_command: string, _args: string[] | undefined, _timeout: number, options?: ExecOptions) => {
+        options?.listeners?.stdout?.(Buffer.from('hel'))
+        options?.listeners?.stdout?.(Buffer.from('lo'))
+        return 1
+      },
+    )
+    const run = createPrivilegedRun({exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()}, '/usr/bin/sudo')
+
+    // #when
+    const result = await run(['/usr/bin/pgrep', '-u', '998'])
+
+    // #then
+    expect(result).toEqual({exitCode: 1, stdout: 'hello'})
   })
 })

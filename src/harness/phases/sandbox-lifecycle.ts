@@ -15,6 +15,7 @@ import type {
 import type {SandboxToolPaths} from '../../services/setup/sandbox-preflight.js'
 import type {ExecAdapter} from '../../services/setup/types.js'
 import type {Logger} from '../../shared/logger.js'
+import {Buffer} from 'node:buffer'
 import * as fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -67,6 +68,21 @@ export interface SandboxLifecycle {
   readonly isActive: () => boolean
 }
 
+/** The slice of `process` the signal handling uses; injectable so the tests need no real signals. */
+export interface SignalHost {
+  readonly pid: number
+  readonly on: (signal: 'SIGINT' | 'SIGTERM', listener: () => void) => unknown
+  readonly off: (signal: 'SIGINT' | 'SIGTERM', listener: () => void) => unknown
+  readonly kill: (pid: number, signal: 'SIGINT' | 'SIGTERM') => unknown
+}
+
+/**
+ * Longest a cancellation waits for the sandbox to be stopped and taken back before the process ends anyway. GitHub
+ * escalates a cancelled step from SIGINT to SIGTERM and then SIGKILL within about ten seconds, so a longer wait would be
+ * cut off. If the take-back does not finish in time the post hook still declines to read or save anything.
+ */
+export const SIGNAL_TEARDOWN_BUDGET_MS = 10_000
+
 export interface SandboxLifecycleOptions {
   readonly tools: SandboxToolPaths
   readonly env: NodeJS.ProcessEnv
@@ -80,6 +96,9 @@ export interface SandboxLifecycleOptions {
   readonly runnerHome?: string
   readonly exec?: ExecAdapter
   readonly deps?: Partial<SandboxLifecycleDeps>
+  /** Defaults to the real `process`. */
+  readonly signals?: SignalHost
+  readonly signalTeardownBudgetMs?: number
 }
 
 export interface SandboxLifecycleDeps {
@@ -102,15 +121,29 @@ const defaultDeps: SandboxLifecycleDeps = {
   ids: () => ({uid: process.getuid?.() ?? -1, gid: process.getgid?.() ?? -1}),
 }
 
-/** The sudo wrapper every privileged step goes through. `argv[0]` is an absolute path resolved by the preflight. */
+/** Applied to a privileged command that names no timeout of its own (`useradd`, `userdel`, `mkdir`, ...). */
+export const DEFAULT_PRIVILEGED_TIMEOUT_MS = 60_000
+
+/**
+ * The sudo wrapper every privileged step goes through. `argv[0]` is an absolute path resolved by the preflight. Every
+ * command runs under a timeout (the caller's, else {@link DEFAULT_PRIVILEGED_TIMEOUT_MS}): on expiry the adapter kills the
+ * command's process group and the result is `exitCode: null`, which callers treat as a failure.
+ */
 export function createPrivilegedRun(exec: ExecAdapter, sudoPath: string): PrivilegedRun {
-  return async argv => {
-    const output = await exec.getExecOutput(sudoPath, ['-n', '--', ...argv], {
-      silent: true,
-      ignoreReturnCode: true,
+  return async (argv, options) => {
+    const args = ['-n', '--', ...argv]
+    const timeoutMs = options?.timeoutMs ?? DEFAULT_PRIVILEGED_TIMEOUT_MS
+    if (exec.execWithTimeout == null) {
+      const output = await exec.getExecOutput(sudoPath, args, {silent: true, ignoreReturnCode: true, cwd: '/'})
+      return {exitCode: output.exitCode, stdout: output.stdout}
+    }
+    const chunks: Buffer[] = []
+    const outcome = await exec.execWithTimeout(sudoPath, args, timeoutMs, {
       cwd: '/',
+      listeners: {stdout: data => chunks.push(data)},
     })
-    return {exitCode: output.exitCode, stdout: output.stdout}
+    if (outcome === 'timed-out') return {exitCode: null, stdout: ''}
+    return {exitCode: outcome, stdout: Buffer.concat(chunks).toString('utf8')}
   }
 }
 
@@ -131,6 +164,45 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   let journal: HandoffJournal | null = null
   let released: Promise<SandboxReleaseResult> | undefined
   let active = false
+
+  // SIGINT/SIGTERM: stop the sandbox user's processes (which aborts the server and every tool under it) and take its files
+  // back before the process ends. Installed before the account exists and removed once release has finished. The exec
+  // adapter's own once-handlers also fire on the same signal and re-raise it, so this handler runs at most once.
+  const signalHost: SignalHost = options.signals ?? process
+  const installedSignalListeners: ['SIGINT' | 'SIGTERM', () => void][] = []
+  let signalled = false
+  const removeSignalHandlers = (): void => {
+    for (const [signal, listener] of installedSignalListeners.splice(0)) signalHost.off(signal, listener)
+  }
+  // Bound once `release` is defined below; the handlers only run after `prepare`, so it is always set by then.
+  let releaseRef: () => Promise<SandboxReleaseResult> = async () => ({stop: 'never-started', restore: 'not-needed'})
+  const onSignal = async (signal: 'SIGINT' | 'SIGTERM'): Promise<void> => {
+    if (signalled) return
+    signalled = true
+    logger.warning('Received a termination signal; stopping the sandbox before exiting', {signal})
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const timedOut = new Promise<'timeout'>(resolve => {
+      timer = setTimeout(() => resolve('timeout'), options.signalTeardownBudgetMs ?? SIGNAL_TEARDOWN_BUDGET_MS)
+    })
+    const outcome = await Promise.race([releaseRef().catch(() => 'failed' as const), timedOut])
+    if (timer !== undefined) clearTimeout(timer)
+    if (outcome === 'timeout' || outcome === 'failed') {
+      logger.error('The sandbox was not confirmed stopped and restored before exiting on a signal')
+    }
+    removeSignalHandlers()
+    // The handlers are gone, so this ends the process with the signal's default action.
+    signalHost.kill(signalHost.pid, signal)
+  }
+  const installSignalHandlers = (): void => {
+    if (installedSignalListeners.length > 0) return
+    for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+      const listener = (): void => {
+        onSignal(signal).catch(() => undefined)
+      }
+      installedSignalListeners.push([signal, listener])
+      signalHost.on(signal, listener)
+    }
+  }
 
   const identityDeps = (): SandboxIdentityDeps => ({run, readText: deps.readText, logger})
   const handoffDeps = (): HandoffDeps => ({
@@ -158,13 +230,12 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     }
     let restore: TakeBackOutcome = {status: 'restored'}
     if (manifest !== null && journal !== null) restore = await deps.takeBack(manifest, journal, handoffDeps())
-    if (restore.status === 'unsafe') {
-      logger.error('Sandbox take-back was unsafe', {reason: restore.reason})
-      return {stop, restore: 'unsafe', reason: restore.reason}
-    }
+    if (restore.status === 'unsafe') logger.error('Sandbox take-back was unsafe', {reason: restore.reason})
+    // The stop is confirmed, so nothing runs as this uid any more: the account goes whether or not the files came back.
     const deleted = await deps.deleteAccount(account, tools, identityDeps())
     if (deleted === 'failed')
       logger.warning('The sandbox account could not be deleted; the VM is torn down after the job')
+    if (restore.status === 'unsafe') return {stop, restore: 'unsafe', reason: restore.reason}
     logger.info('Sandbox stopped and restored', {uid: account.uid})
     return {stop, restore: 'restored'}
   }
@@ -178,12 +249,17 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       })
       .finally(() => {
         active = false
+        // A signal in flight removes them itself, after the teardown it is waiting on.
+        if (!signalled) removeSignalHandlers()
       })
     return released
   }
 
+  releaseRef = release
+
   const prepare = async (input: SandboxPrepareInput): Promise<Result<OpenCodeV2SandboxLaunch, string>> => {
     try {
+      installSignalHandlers()
       const created = await deps.createAccount(tools, identityDeps())
       if (!created.success) return err(created.error.message)
       account = created.data

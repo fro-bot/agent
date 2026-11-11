@@ -198,6 +198,32 @@ describe('stopSandboxProcesses', () => {
     expect(system.calls.at(-1)).toEqual([TOOLS.pgrep, '-u', '998'])
   })
 
+  it('gives every pkill and pgrep the time left of the bound, and ends unconfirmed when they hang', async () => {
+    // #given a runner whose commands never finish (exit null, as a killed-on-timeout command reports) and a fake clock
+    let clock = 0
+    const timeouts: number[] = []
+    const hung: PrivilegedRun = async (_argv, options) => {
+      timeouts.push(options?.timeoutMs ?? -1)
+      clock += options?.timeoutMs ?? 0
+      return {exitCode: null, stdout: ''}
+    }
+    const system = createFakeSystem()
+
+    // #when stopped with a 1s bound
+    const outcome = await stopSandboxProcesses(
+      {uid: 998},
+      TOOLS,
+      {...system.deps, run: hung, now: () => clock, sleep: async () => undefined},
+      {boundMs: 1000, pollMs: 10},
+    )
+
+    // #then nothing is proven, the loop stops at the deadline, and no command was allowed past what was left
+    expect(outcome).toBe('unconfirmed')
+    expect(timeouts.length).toBeGreaterThan(0)
+    expect(timeouts.every(timeoutMs => timeoutMs > 0 && timeoutMs <= 1000)).toBe(true)
+    expect(clock).toBeLessThanOrEqual(1000 + 1)
+  })
+
   it('reports unconfirmed, and never deletes, when processes survive past the bound', async () => {
     // #given a process pkill cannot remove
     const system = createFakeSystem()

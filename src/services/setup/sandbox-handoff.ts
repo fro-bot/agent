@@ -20,8 +20,22 @@ import {toErrorMessage} from '../../shared/errors.js'
  *
  * Take-back runs only after the sandbox is verified dead. It never follows a link: roots and ancestors are checked
  * first, `find -P -xdev -user <sandbox uid> -exec chown -h` moves back only inodes the sandbox owns (a hardlink to a
- * runner-owned file keeps its owner), and the trusted `.git` metadata copy is written over whatever the model left.
+ * runner-owned file keeps its owner; the same pass gives the owner `rwX` on non-links, so a mode-000 file the model made is
+ * readable again), and the trusted `.git` metadata is renamed over whatever the model left (a rename needs no free space).
+ *
+ * ACLs are removed entry by entry (`setfacl -x u:<uid>`, access and default), never wiped with `-b`: an ACL that existed
+ * before the run survives. Every privileged command runs under a deadline; a command that does not finish in time is
+ * killed and counts as a failure, so take-back ends `unsafe` instead of hanging.
  */
+
+/** Total budget for the privileged commands of one handoff (including its rollback on failure uses the take-back budget). */
+export const HANDOFF_BUDGET_MS = 120_000
+/**
+ * Total budget for the privileged commands of one take-back. Sized for a checkout with a large `node_modules` (a recursive
+ * `find`/`chown` over a few hundred thousand inodes takes seconds), with room for the ACL passes; a command still running at
+ * the deadline is killed.
+ */
+export const TAKE_BACK_BUDGET_MS = 120_000
 
 export interface HandoffIds {
   readonly runnerUid: number
@@ -58,6 +72,10 @@ export interface HandoffDeps {
   readonly run: PrivilegedRun
   readonly tools: HandoffTools
   readonly logger: Logger
+  /** Clock for the command deadlines. Defaults to `Date.now`. */
+  readonly now?: () => number
+  /** Overrides the total budget of one handoff or take-back (tests). */
+  readonly budgetMs?: number
 }
 
 interface TouchedPath {
@@ -76,14 +94,22 @@ interface GitSnapshot {
   readonly info: boolean
 }
 
+interface AclTree {
+  readonly path: string
+  /** Uids given a named access entry on every inode of the tree. */
+  readonly accessUids: readonly number[]
+  /** Uids given a named default entry on every directory of the tree. */
+  readonly defaultUids: readonly number[]
+}
+
 /** What handoff changed, so take-back reverses exactly that. */
 export interface HandoffJournal {
   readonly snapshotDir: string
   readonly touched: TouchedPath[]
   /** Roots whose runner-owned inodes were chowned to the sandbox. */
   readonly chowned: string[]
-  /** Roots a recursive ACL was applied to; `setfacl -R -P -b` clears them. */
-  readonly aclTrees: string[]
+  /** Roots a recursive ACL was applied to, with exactly the uids this run named, so take-back removes only those. */
+  readonly aclTrees: AclTree[]
   git: GitSnapshot | null
   /** True when `.git` existed at handoff. A `.git` that appears during the run is unsafe. */
   gitPresent: boolean
@@ -112,9 +138,31 @@ function ancestorsOf(target: string): string[] {
 
 async function must(run: PrivilegedRun, argv: readonly string[], what: string): Promise<string> {
   const result = await run(argv)
-  if (result.exitCode !== 0) throw new HandoffError(`${what} failed (exit ${result.exitCode})`)
+  if (result.exitCode !== 0) {
+    throw new HandoffError(
+      `${what} ${result.exitCode === null ? 'timed out or was killed' : `failed (exit ${result.exitCode})`}`,
+    )
+  }
   return result.stdout
 }
+
+/**
+ * Wraps `run` so every command gets the time left of one shared deadline (and is killed when it runs out). Once the
+ * deadline has passed no further command is started: it reports `exitCode: null`, which every caller treats as a failure.
+ */
+function withDeadline(deps: HandoffDeps, budgetMs: number): HandoffDeps {
+  const now = deps.now ?? Date.now
+  const deadline = now() + (deps.budgetMs ?? budgetMs)
+  const run: PrivilegedRun = async (argv, options) => {
+    const remaining = deadline - now()
+    if (remaining <= 0) return {exitCode: null, stdout: ''}
+    const asked = options?.timeoutMs
+    return deps.run(argv, {timeoutMs: asked === undefined ? remaining : Math.min(asked, remaining)})
+  }
+  return {...deps, run}
+}
+
+const aclSpec = (uids: readonly number[]): string => uids.map(uid => `u:${uid}`).join(',')
 
 function everyRoot(manifest: HandoffManifest): string[] {
   return [manifest.workspace, ...manifest.handedOver, ...manifest.readable]
@@ -246,7 +294,11 @@ export async function planLocks(manifest: HandoffManifest): Promise<LockPlan> {
 }
 
 /** Applies every change with sudo and records each so take-back can reverse it. Rolls back on any failure. */
-export async function handOff(manifest: HandoffManifest, deps: HandoffDeps): Promise<Result<HandoffJournal, string>> {
+export async function handOff(
+  manifest: HandoffManifest,
+  rawDeps: HandoffDeps,
+): Promise<Result<HandoffJournal, string>> {
+  const deps = withDeadline(rawDeps, HANDOFF_BUDGET_MS)
   const {run, tools} = deps
   const {runnerUid, sandboxUid, sandboxGid} = manifest.ids
   // Created as the runner before the first check, so every root exists when it is verified.
@@ -283,7 +335,7 @@ export async function handOff(manifest: HandoffManifest, deps: HandoffDeps): Pro
     }
 
     // 3. Checkout: ACL for the sandbox, default entries for both users so new files stay reachable for the runner.
-    journal.aclTrees.push(manifest.workspace)
+    journal.aclTrees.push({path: manifest.workspace, accessUids: [sandboxUid], defaultUids: [sandboxUid, runnerUid]})
     await must(run, [tools.setfacl, '-R', '-P', '-m', `u:${sandboxUid}:rwX`, manifest.workspace], 'checkout ACL')
     await must(
       run,
@@ -328,7 +380,7 @@ export async function handOff(manifest: HandoffManifest, deps: HandoffDeps): Pro
         ],
         `handing ${dir} to the sandbox`,
       )
-      journal.aclTrees.push(dir)
+      journal.aclTrees.push({path: dir, accessUids: [runnerUid], defaultUids: [runnerUid]})
       await must(
         run,
         [
@@ -352,7 +404,7 @@ export async function handOff(manifest: HandoffManifest, deps: HandoffDeps): Pro
 
     // 5. Read-only grants.
     for (const dir of manifest.readable) {
-      journal.aclTrees.push(dir)
+      journal.aclTrees.push({path: dir, accessUids: [sandboxUid], defaultUids: [sandboxUid]})
       await must(run, [tools.setfacl, '-R', '-P', '-m', `u:${sandboxUid}:rX`, dir], `read grant on ${dir}`)
       await must(
         run,
@@ -378,8 +430,8 @@ export async function handOff(manifest: HandoffManifest, deps: HandoffDeps): Pro
   } catch (error) {
     const message = error instanceof HandoffError ? error.message : toErrorMessage(error)
     deps.logger.warning('Sandbox handoff failed; rolling back', {error: message})
-    // The sandbox never ran, so there is nothing to stop; take-back reverses what was recorded.
-    const rollback = await takeBack(manifest, journal, deps)
+    // The sandbox never ran, so there is nothing to stop; take-back reverses what was recorded (on its own budget).
+    const rollback = await takeBack(manifest, journal, rawDeps)
     return err(
       `Sandbox handoff failed: ${message}${rollback.status === 'restored' ? '' : ` (rollback incomplete: ${rollback.reason})`}`,
     )
@@ -442,25 +494,39 @@ async function snapshotGit(manifest: HandoffManifest, journal: HandoffJournal): 
 }
 
 /**
- * Reverses handoff, in this order: verify, chown the sandbox's inodes back, restore the git metadata, remove ACLs and
- * restore recorded modes. Only call after the sandbox is verified dead. Any failure returns `unsafe`; nothing is
- * retried or skipped.
+ * Reverses handoff, in this order: verify, chown the sandbox's inodes back (and give the owner `rwX`), restore the git
+ * metadata, remove this run's ACL entries; then, independently, revert the runner-surface locks (modes and ACLs of the
+ * chain and temp dirs). Only call after the sandbox is verified dead.
+ *
+ * A failed root or ancestor check returns `unsafe` before anything moves or any lock is reverted: a swapped link there
+ * could redirect a privileged command. Any other failure ends `unsafe` too, but the lock reversal still runs: those
+ * paths are runner-owned and unrelated to what the sandbox wrote, and the sandbox is dead, so leaving the runner's own
+ * files locked helps nothing.
  */
 export async function takeBack(
   manifest: HandoffManifest,
   journal: HandoffJournal,
-  deps: HandoffDeps,
+  rawDeps: HandoffDeps,
 ): Promise<TakeBackOutcome> {
+  const deps = withDeadline(rawDeps, TAKE_BACK_BUDGET_MS)
   const {run, tools} = deps
   const {runnerUid, runnerGid, sandboxUid} = manifest.ids
+
+  let problem: string | null = null
   try {
-    const problem = await verifyRoots(manifest, deps, 'take-back')
-    if (problem !== null) return {status: 'unsafe', reason: problem}
+    const rootProblem = await verifyRoots(manifest, deps, 'take-back')
+    if (rootProblem !== null) return {status: 'unsafe', reason: rootProblem}
     // Checked before anything is moved: a swapped `.git` must not be walked, restored into or followed.
     const gitDirProblem = await checkGitDir(manifest, journal, 'before')
     if (gitDirProblem !== null) return {status: 'unsafe', reason: gitDirProblem}
+  } catch (error) {
+    return {status: 'unsafe', reason: error instanceof HandoffError ? error.message : toErrorMessage(error)}
+  }
 
+  try {
     for (const root of [manifest.workspace, ...journal.chowned]) {
+      // One pass: every inode the sandbox owns goes back to the runner, and a non-link gets owner `rwX` so a mode-000
+      // file or directory the model made is readable again. `-exec ... +` defers both, so `-user` is evaluated first.
       await must(
         run,
         [
@@ -476,22 +542,78 @@ export async function takeBack(
           `${runnerUid}:${runnerGid}`,
           '{}',
           '+',
+          '!',
+          '-type',
+          'l',
+          '-exec',
+          tools.chmod,
+          'u+rwX',
+          '{}',
+          '+',
         ],
         `taking ${root} back`,
       )
       const remaining = await run([tools.find, '-P', root, '-xdev', '-user', String(sandboxUid), '-print', '-quit'])
       if (remaining.exitCode !== 0 || remaining.stdout.trim().length > 0) {
-        return {status: 'unsafe', reason: `${root} still holds files owned by the sandbox`}
+        problem = `${root} still holds files owned by the sandbox`
+        break
       }
     }
 
-    const gitProblem = await restoreGit(manifest, journal)
-    if (gitProblem !== null) return {status: 'unsafe', reason: gitProblem}
+    if (problem === null) problem = await restoreGit(manifest, journal)
 
-    for (const tree of journal.aclTrees) {
-      await must(run, [tools.setfacl, '-R', '-P', '-b', tree], `clearing ACLs on ${tree}`)
+    if (problem === null) {
+      for (const tree of journal.aclTrees) {
+        if (tree.accessUids.length > 0) {
+          await must(
+            run,
+            [tools.setfacl, '-R', '-P', '-x', aclSpec(tree.accessUids), tree.path],
+            `removing this run's ACL entries from ${tree.path}`,
+          )
+        }
+        if (tree.defaultUids.length > 0) {
+          await must(
+            run,
+            [
+              tools.find,
+              '-P',
+              tree.path,
+              '-xdev',
+              '-type',
+              'd',
+              '-exec',
+              tools.setfacl,
+              '-P',
+              '-d',
+              '-x',
+              aclSpec(tree.defaultUids),
+              '{}',
+              '+',
+            ],
+            `removing this run's default ACL entries from ${tree.path}`,
+          )
+        }
+      }
     }
-    for (const entry of [...journal.touched].reverse()) {
+  } catch (error) {
+    problem = error instanceof HandoffError ? error.message : toErrorMessage(error)
+  }
+
+  // Independent of the above: the runner-owned chain and temp dirs the handoff locked.
+  const lockProblem = await revertLocks(journal, deps)
+
+  const failure = problem ?? lockProblem
+  if (failure !== null) return {status: 'unsafe', reason: failure}
+  await fs.rm(journal.snapshotDir, {recursive: true, force: true})
+  return {status: 'restored'}
+}
+
+/** Restores the recorded mode and ACL of every lock the handoff applied. Returns the first failure, or null. */
+async function revertLocks(journal: HandoffJournal, deps: HandoffDeps): Promise<string | null> {
+  const {run, tools} = deps
+  let first: string | null = null
+  for (const entry of [...journal.touched].reverse()) {
+    try {
       await must(run, [tools.setfacl, '-P', '-b', entry.path], `clearing the ACL of ${entry.path}`)
       await must(
         run,
@@ -505,12 +627,11 @@ export async function takeBack(
           `restoring the ACL of ${entry.path}`,
         )
       }
+    } catch (error) {
+      first ??= error instanceof HandoffError ? error.message : toErrorMessage(error)
     }
-  } catch (error) {
-    return {status: 'unsafe', reason: error instanceof HandoffError ? error.message : toErrorMessage(error)}
   }
-  await fs.rm(journal.snapshotDir, {recursive: true, force: true})
-  return {status: 'restored'}
+  return first
 }
 
 /**
@@ -535,7 +656,12 @@ async function checkGitDir(
   return null
 }
 
-/** Writes the pre-model git metadata over whatever the model left and drops any new `config.worktree`. */
+/**
+ * Puts the pre-model git metadata back over whatever the model left and drops any new `config.worktree`. The trusted
+ * copy sits in the private snapshot dir on the runner's temp filesystem, and each item is moved into place with a rename,
+ * which needs no free space (the model's version is removed first). When the snapshot and the checkout are on different
+ * filesystems the rename cannot work (`EXDEV`) and the item is copied instead.
+ */
 async function restoreGit(manifest: HandoffManifest, journal: HandoffJournal): Promise<string | null> {
   const problem = await checkGitDir(manifest, journal, 'after')
   if (problem !== null) return problem
@@ -552,8 +678,13 @@ async function restoreGit(manifest: HandoffManifest, journal: HandoffJournal): P
     const target = path.join(gitDir, item)
     // rm on a symlink removes the link itself, never its target.
     await fs.rm(target, {recursive: true, force: true})
-    if (present[item] === true) {
-      await fs.cp(path.join(journal.git.dir, item), target, {recursive: true, verbatimSymlinks: true})
+    if (present[item] !== true) continue
+    const source = path.join(journal.git.dir, item)
+    try {
+      await fs.rename(source, target)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EXDEV') throw error
+      await fs.cp(source, target, {recursive: true, verbatimSymlinks: true})
     }
   }
   return null

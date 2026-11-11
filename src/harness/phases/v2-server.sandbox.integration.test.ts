@@ -323,7 +323,10 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
       category: 'info',
       cmd:
         `cd ${q(workspace)} && umask 077 && echo secret > m-0600 && mkdir -p m-0700/inner && echo x > m-0700/inner/f && ` +
-        `ln -s ${q(sentinel)} m-link && ln README.md m-hardlink && R create_takeback_fixtures INFO ok`,
+        `ln -s ${q(sentinel)} m-link && ln README.md m-hardlink && ` +
+        // Mode-000 file and directory: take-back must leave the owner rwX so the runner can read them again.
+        `echo z > m-000 && chmod 000 m-000 && mkdir m-000d && echo y > m-000d/f && chmod 000 m-000d && ` +
+        `R create_takeback_fixtures INFO ok`,
     },
     {
       // Hostile git state the runner-side restore must undo (asserted after release).
@@ -356,6 +359,18 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
       fs.writeFileSync(file, 'canary', {mode: 0o644})
     }
     initWorkspace(workspace)
+    // ACLs that existed before the run: a named access entry on a file and a dir, and a named default entry on the dir.
+    // Take-back removes only this run's entries, so these must survive it.
+    fs.writeFileSync(path.join(workspace, 'pre-acl'), 'pre-existing ACL\n')
+    fs.mkdirSync(path.join(workspace, 'pre-acl-dir'))
+    for (const args of [
+      ['-m', 'u:nobody:r-x', path.join(workspace, 'pre-acl')],
+      ['-m', 'u:nobody:r-x', path.join(workspace, 'pre-acl-dir')],
+      ['-d', '-m', 'u:nobody:r-x', path.join(workspace, 'pre-acl-dir')],
+    ]) {
+      const result = spawnSync('setfacl', args, {encoding: 'utf8'})
+      if (result.status !== 0) throw new Error(`setfacl ${args.join(' ')}: ${result.stderr}`)
+    }
 
     // The provider starts first: a probe command embeds its port, and the steps are read lazily.
     provider = await startScriptedProvider(probes)
@@ -478,6 +493,27 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
     expect(fs.statSync(sentinel).mode & 0o777).toBe(0o600)
     // #and the hardlinked runner file kept its owner
     expect(owned(path.join(workspace, 'README.md'))).toBe(runnerUid)
+  })
+
+  it('makes mode-000 files and directories the model created readable by the runner again', () => {
+    // #given the model created a mode-000 file and a mode-000 directory holding a file
+    expect(released?.restore).toBe('restored')
+    // #then the same take-back pass gave the owner rwX, so the runner reads them (it could not before)
+    expect(fs.readFileSync(path.join(workspace, 'm-000'), 'utf8').trim()).toBe('z')
+    expect(fs.readFileSync(path.join(workspace, 'm-000d', 'f'), 'utf8').trim()).toBe('y')
+  })
+
+  it("removes only this run's ACL entries: a pre-existing named ACL survives and no default entry of this run remains", () => {
+    // #given ACLs that existed before the run, and the handoff's own access and default entries
+    const read = (target: string): string => spawnSync('getfacl', ['-p', target], {encoding: 'utf8'}).stdout
+    // #then the pre-existing named access entries and the pre-existing default entry are intact
+    expect(read(path.join(workspace, 'pre-acl'))).toContain('user:nobody:r-x')
+    expect(read(path.join(workspace, 'pre-acl-dir'))).toContain('user:nobody:r-x')
+    expect(read(path.join(workspace, 'pre-acl-dir'))).toContain('default:user:nobody:r-x')
+    // #and nothing of this run is left: no entry for the (deleted, so numeric) sandbox uid, none for the runner
+    const tree = spawnSync('getfacl', ['-R', '-p', workspace, responseDir], {encoding: 'utf8'}).stdout
+    expect(tree).not.toMatch(/^(default:)?user:\d+:/m)
+    expect(tree).not.toMatch(new RegExp(`^(default:)?user:${os.userInfo().username}:`, 'm'))
   })
 
   it('restores trusted git metadata over what the model wrote', () => {

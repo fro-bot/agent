@@ -212,9 +212,12 @@ export async function stopSandboxProcesses(
   const uid = String(account.uid)
 
   for (;;) {
+    // Each command gets what is left of the bound and is killed when it runs out; a hung pkill/pgrep proves nothing and
+    // the loop ends `unconfirmed` at the deadline instead of hanging the run.
+    const remaining = Math.max(1, deadline - now())
     try {
-      await deps.run([tools.pkill, '-KILL', '-u', uid])
-      const probe = await deps.run([tools.pgrep, '-u', uid])
+      await deps.run([tools.pkill, '-KILL', '-u', uid], {timeoutMs: remaining})
+      const probe = await deps.run([tools.pgrep, '-u', uid], {timeoutMs: Math.max(1, deadline - now())})
       // pgrep: 0 = matched, 1 = nothing matched. Anything else is an error and proves nothing.
       if (probe.exitCode === 1) return 'stopped'
     } catch (error) {
