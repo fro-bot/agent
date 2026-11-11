@@ -8,6 +8,11 @@
 export const STATE_KEYS = {
   /** Whether the main action processed an event (vs skipped) */
   SHOULD_SAVE_CACHE: 'shouldSaveCache',
+  /**
+   * `'true'` when the run used `isolate-agent`. The post hook never retries a session save for such a run: the sandbox
+   * user wrote that state, and only the main step can confirm it stopped and was restored.
+   */
+  ISOLATED_RUN: 'isolatedRun',
   /** Session ID used in this run (for logging) */
   SESSION_ID: 'sessionId',
   /** Whether main action already saved cache successfully */

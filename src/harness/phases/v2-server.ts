@@ -1,9 +1,16 @@
 import type {Result} from '@bfra.me/es/result'
-import type {CredentialDisposition, OpenCodeV2ServerHandle, StartOpenCodeV2ServerOptions} from '@fro-bot/runtime'
+import type {
+  CredentialDisposition,
+  OpenCodeV2SandboxLaunch,
+  OpenCodeV2ServerHandle,
+  StartOpenCodeV2ServerOptions,
+} from '@fro-bot/runtime'
 import type {InstallPluginsV2Options, PluginInstallV2Error} from '../../services/setup/plugin-install-v2.js'
 import type {RepoSkillsSource} from '../../services/setup/repo-skills.js'
 import type {Logger} from '../../shared/logger.js'
+import type {SandboxLifecycle} from './sandbox-lifecycle.js'
 import type {V1DatabaseFacts, V1ImportWaitError, WaitForV1ImportOptions} from './v1-import-wait.js'
+import * as path from 'node:path'
 import {err, ok} from '@bfra.me/es/result'
 import {
   clearHeldClaims,
@@ -66,7 +73,15 @@ import {readV1DatabaseFacts, waitForV1Import} from './v1-import-wait.js'
  */
 
 export type V2StartStage =
-  'config' | 'credential-gate' | 'credentials' | 'held-claims' | 'import-wait' | 'permission-gate' | 'plugins' | 'spawn'
+  | 'config'
+  | 'credential-gate'
+  | 'credentials'
+  | 'held-claims'
+  | 'import-wait'
+  | 'permission-gate'
+  | 'plugins'
+  | 'sandbox'
+  | 'spawn'
 
 export interface V2StartError {
   readonly stage: V2StartStage
@@ -100,6 +115,12 @@ export interface StartActionOpenCodeV2Options {
    * checked against the plugin's own skills directory.
    */
   readonly repoSkills?: RepoSkillsSource | null
+  /**
+   * `isolate-agent`: when present, the account and handoff happen after the held-claim clear and before the spawn, the
+   * server launches through sudo and setpriv, and every failure path releases it. The caller releases it on every later
+   * path. Null or absent leaves the launch exactly as it was.
+   */
+  readonly sandbox?: SandboxLifecycle | null
   readonly runId: string | number
   readonly runAttempt: string | number
   readonly logger: Logger
@@ -252,22 +273,55 @@ export async function startActionOpenCodeV2(
     return stageError('held-claims', 'Could not clear held execution claims in the restored OpenCode database')
   }
 
+  // --- 4b. Sandbox account and handoff (isolate-agent) -----------------------------------------------------
+  //
+  // After the last runner-side write to the restored database (the claim clear) and before the spawn. A failure here
+  // has already rolled itself back inside `prepare`.
+  let sandboxLaunch: OpenCodeV2SandboxLaunch | undefined
+  let childEnv = options.env
+  if (options.sandbox != null) {
+    const ghConfigDir = provisionedGhConfigDir(options.env)
+    // A `GH_CONFIG_DIR` that is not the provisioned temp dir (an ambient one from an earlier step) is not handed over,
+    // so it must not reach the child as a path the sandbox cannot read.
+    childEnv = withoutKey(options.env, 'GH_CONFIG_DIR')
+    const prepared = await options.sandbox.prepare({
+      keyFilePaths: Object.values(files.data.keyFiles),
+      ghConfigDir,
+      repoSkills:
+        options.repoSkills == null
+          ? null
+          : {stagingRoot: options.repoSkills.stagingRoot, admittedDir: repoSkillsDirectory ?? null},
+    })
+    if (!prepared.success) return stageError('sandbox', `isolate-agent setup failed: ${prepared.error}`)
+    sandboxLaunch = prepared.data
+    if (ghConfigDir !== null) childEnv = {...childEnv, GH_CONFIG_DIR: ghConfigDir}
+  }
+
   // --- 5. Spawn (plugin gate inside) -------------------------------------------------------------------------
-  const started = await deps.startServer(
-    {
-      binaryPath: options.binaryPath,
-      directory: options.workspacePath,
-      expectedPluginIds: [SYSTEMATIC_V2_PLUGIN_ID, FRO_BOT_PLUGIN_ID],
-      config: built.data.content,
-      env: options.env,
-      ...(options.signal === undefined ? {} : {signal: options.signal}),
-      ...(options.maskSecret === undefined ? {} : {maskSecret: options.maskSecret}),
-      ...deps.startOptions,
-    },
-    logger,
-  )
+  let started: Awaited<ReturnType<typeof deps.startServer>>
+  try {
+    started = await deps.startServer(
+      {
+        binaryPath: options.binaryPath,
+        directory: options.workspacePath,
+        expectedPluginIds: [SYSTEMATIC_V2_PLUGIN_ID, FRO_BOT_PLUGIN_ID],
+        config: built.data.content,
+        env: childEnv,
+        ...(sandboxLaunch === undefined ? {} : {sandbox: sandboxLaunch}),
+        ...(options.signal === undefined ? {} : {signal: options.signal}),
+        ...(options.maskSecret === undefined ? {} : {maskSecret: options.maskSecret}),
+        ...deps.startOptions,
+      },
+      logger,
+    )
+  } catch (error) {
+    await releaseSandboxAfterFailure(options.sandbox, logger)
+    throw error
+  }
   if (!started.success) {
     const failure = started.error
+    // The runtime already terminated the child; this confirms no sandbox process is left, then takes everything back.
+    await releaseSandboxAfterFailure(options.sandbox, logger)
     return stageError(
       failure.kind === 'plugin-gate' ? 'plugins' : 'spawn',
       `OpenCode V2 server failed to start: ${failure.message}`,
@@ -284,6 +338,7 @@ export async function startActionOpenCodeV2(
     } catch (error) {
       logger.error('OpenCode V2 server shutdown after a failed start threw', {error: toErrorMessage(error)})
     }
+    await releaseSandboxAfterFailure(options.sandbox, logger)
     return stageError(stage, message)
   }
 
@@ -338,4 +393,37 @@ export async function startActionOpenCodeV2(
     plugins: specs.data.specs,
   })
   return ok(handle)
+}
+
+/**
+ * The temp `GH_CONFIG_DIR` provision mode writes (`gh-config-*` directly under `RUNNER_TEMP`), or null. Anything else is
+ * ambient state from an earlier step and is not handed to the sandbox.
+ */
+function provisionedGhConfigDir(env: NodeJS.ProcessEnv): string | null {
+  const dir = env.GH_CONFIG_DIR
+  const runnerTemp = env.RUNNER_TEMP
+  if (dir === undefined || dir.length === 0 || runnerTemp === undefined || runnerTemp.length === 0) return null
+  return path.dirname(dir) === path.resolve(runnerTemp) && path.basename(dir).startsWith('gh-config-') ? dir : null
+}
+
+function withoutKey(env: NodeJS.ProcessEnv, key: string): NodeJS.ProcessEnv {
+  const copy = {...env}
+  delete copy[key]
+  return copy
+}
+
+/**
+ * Stops every sandbox process and takes everything back after a failed start. An unsafe outcome is logged here; the
+ * start already failed, so the caller declines persistence for the run either way.
+ */
+async function releaseSandboxAfterFailure(sandbox: SandboxLifecycle | null | undefined, logger: Logger): Promise<void> {
+  if (sandbox == null) return
+  try {
+    const outcome = await sandbox.release()
+    if (outcome.restore === 'unsafe') {
+      logger.error('The sandbox could not be restored after a failed start', {reason: outcome.reason})
+    }
+  } catch (error) {
+    logger.error('Releasing the sandbox after a failed start threw', {error: toErrorMessage(error)})
+  }
 }

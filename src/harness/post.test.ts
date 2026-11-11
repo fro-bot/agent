@@ -164,6 +164,48 @@ describe('post action', () => {
       },
     )
 
+    it.each(['not-persisted', '', 'garbage'])(
+      'never retries the save for an isolate-agent run (cacheSaved=%j)',
+      async cacheSaved => {
+        // #given the main step armed the save for a sandbox run but never recorded a confirmed, restored persist
+        const core = await import('@actions/core')
+        vi.mocked(core.getState).mockImplementation((key: string) => {
+          if (key === 'shouldSaveCache') return 'true'
+          if (key === 'isolatedRun') return 'true'
+          if (key === 'cacheSaved') return cacheSaved
+          return ''
+        })
+        const {runPost} = await import('./post.js')
+        const logger = createMockLogger()
+
+        // #when the post hook runs
+        await runPost({logger})
+
+        // #then it declines: a retry could checkpoint a database a live sandbox process is still writing
+        const {saveCache} = await import('../services/cache/index.js')
+        expect(saveCache).not.toHaveBeenCalled()
+        expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining('isolate-agent'), expect.any(Object))
+      },
+    )
+
+    it('still retries the save for a run that was not isolated', async () => {
+      // #given the same not-persisted state without the isolated marker
+      const core = await import('@actions/core')
+      vi.mocked(core.getState).mockImplementation((key: string) => {
+        if (key === 'shouldSaveCache') return 'true'
+        if (key === 'cacheSaved') return 'not-persisted'
+        return ''
+      })
+      const {runPost} = await import('./post.js')
+
+      // #when
+      await runPost({logger: createMockLogger()})
+
+      // #then the existing retry is unchanged
+      const {saveCache} = await import('../services/cache/index.js')
+      expect(saveCache).toHaveBeenCalledTimes(1)
+    })
+
     it('should skip cache save when cache was already saved', async () => {
       const core = await import('@actions/core')
       vi.mocked(core.getState).mockImplementation((key: string) => {

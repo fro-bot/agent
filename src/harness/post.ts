@@ -187,6 +187,21 @@ async function persistRunState(logger: Logger): Promise<void> {
       'post-skip-safety',
       logger,
     )
+  } else if (core.getState(STATE_KEYS.ISOLATED_RUN) === 'true') {
+    // `isolate-agent`: the sandbox user wrote this state. The main step's `finally` stops its processes, takes the files
+    // back and only then persists, so reaching here with `not-persisted` means that did not complete or was skipped for
+    // a reason this process cannot verify (it has no sandbox account, journal or process view). Retrying a save could
+    // checkpoint a database a live sandbox process is still writing, so it never retries. Nothing is killed or deleted
+    // here either: the main step owns that, and the hosted VM is discarded after the job.
+    logger.warning(
+      'Skipping post-action save: this run used isolate-agent and the main step did not confirm the sandbox was stopped and restored',
+      {cacheSaved},
+    )
+    await writeCacheSaveResultSummary(
+      {cachePersisted: false, storePersisted: false, outcome: 'ownership-declined'},
+      'post-skip-safety',
+      logger,
+    )
   } else {
     const runId = String(getGitHubRunId())
     try {
