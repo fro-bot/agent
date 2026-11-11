@@ -3,7 +3,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
-import {findUnsafeSessionPath, saveCache} from './save.js'
+import {findUnsafeSessionPath, saveCache, writeStorageVersion} from './save.js'
 
 describe('session path safety before a save', () => {
   let dir: string
@@ -77,5 +77,66 @@ describe('session path safety before a save', () => {
     // #then it is declined for safety and nothing was saved
     expect(result.outcome).toBe('ownership-declined')
     expect(cacheAdapter.saveCache).not.toHaveBeenCalled()
+  })
+
+  describe('storage/.version', () => {
+    it('is flagged when it is a symlink or a directory, and accepted when it is a regular file', async () => {
+      // #given a regular .version first (the control)
+      const version = path.join(storagePath, '.version')
+      fs.writeFileSync(version, '1')
+      expect(await findUnsafeSessionPath(storagePath, projectIdPath, [])).toBeNull()
+
+      // #when it becomes a symlink, then a directory
+      fs.rmSync(version)
+      fs.symlinkSync(secret, version)
+      expect(await findUnsafeSessionPath(storagePath, projectIdPath, [])).toBe(version)
+      fs.rmSync(version)
+      fs.mkdirSync(version)
+
+      // #then both are refused
+      expect(await findUnsafeSessionPath(storagePath, projectIdPath, [])).toBe(version)
+    })
+
+    it('declines the save and leaves the link target alone when .version is a symlink', async () => {
+      // #given .version linked to a runner-owned file
+      fs.symlinkSync(secret, path.join(storagePath, '.version'))
+      const cacheAdapter = {saveCache: vi.fn(async () => 1), restoreCache: vi.fn()}
+
+      // #when saving
+      const result = await saveCache({
+        components: {agentIdentity: 'github', repo: 'o/r', ref: 'main', os: 'Linux'} as never,
+        runId: 1,
+        logger: createMockLogger(),
+        storagePath,
+        authPath: path.join(dataDir, 'auth.json'),
+        projectIdPath,
+        cacheAdapter,
+      })
+
+      // #then it is declined, nothing was saved, and the target keeps its content
+      expect(result.outcome).toBe('ownership-declined')
+      expect(cacheAdapter.saveCache).not.toHaveBeenCalled()
+      expect(fs.readFileSync(secret, 'utf8')).toBe('runner secret')
+    })
+
+    it('writes through a temp file and a rename, so a link planted at the last moment is replaced, never followed', async () => {
+      // #given the control: the planted link IS followed by a plain write
+      const version = path.join(storagePath, '.version')
+      fs.symlinkSync(secret, version)
+      fs.writeFileSync(version, 'followed')
+      expect(fs.readFileSync(secret, 'utf8')).toBe('followed')
+      fs.writeFileSync(secret, 'runner secret')
+      fs.rmSync(version)
+      fs.symlinkSync(secret, version)
+
+      // #when writeStorageVersion runs over a link
+      await writeStorageVersion(storagePath)
+
+      // #then .version is now a regular file with the version, the target is untouched, and no temp file is left
+      expect(fs.lstatSync(version).isFile()).toBe(true)
+      expect(fs.readFileSync(version, 'utf8')).toBe('1')
+      expect(fs.readFileSync(secret, 'utf8')).toBe('runner secret')
+      expect(fs.readdirSync(storagePath).filter(name => name.startsWith('.version'))).toEqual(['.version'])
+    })
   })
 })
