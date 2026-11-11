@@ -533,13 +533,13 @@ sequenceDiagram
 
 Units 1–6 are implemented on `feat/isolate-agent-uid`. Divergences from the plan:
 
-- **Take-back of the checkout is not a per-file ACL restore.** The checkout gets `setfacl` rwX plus default ACLs for the sandbox user. Take-back chowns every sandbox-owned inode back to the runner (`chown -h`, so links stay links) and then strips the ACL entries with `setfacl -R -P -b`. The checkout's original ACLs (none on hosted runners) are not individually replayed.
+- **Take-back of the checkout is not a per-file ACL restore.** The checkout gets `setfacl` rwX plus default ACLs for the sandbox user. Take-back chowns every sandbox-owned inode back to the runner (`chown -h`, so links stay links) and then removes only the entries this run added, by uid (`setfacl -R -P -x u:<uid>` for access, `find -type d -exec setfacl -d -x` for default), so an ACL that existed before the run survives. The same pass gives the owner `u+rwX` on non-links, so a mode-000 file the model made is readable again. The recorded chain/temp-dir locks are reverted with `-b` plus the stored original, and that reversal runs even when the sandbox files could not be restored (the result is still `unsafe`).
 - **Runner-side diff uses `--ignore-submodules=dirty`, not `none`.** With `none`, git runs `git status` inside a gitlink's repository and executes that repository's own `core.fsmonitor`; a positive control proves it. `dirty` never enters the submodule, still reports the recorded gitlink commit, and reconstruction still rejects gitlinks. `--no-textconv` and `--no-ext-diff` are kept, but no fixture can observe them: `--raw` never runs a textconv.
 - **Hardened git lives in one wrapper**, `src/features/delegated/trusted-git.ts`, used by `reconstruct-changes.ts` and `commit-message.ts`. It adds a replaced environment, a pinned `PATH` and a timeout. Non-isolated runs use it too.
 - **The lifecycle is created in `cache-restore.ts`** (where the server starts) and returned on the phase result. `run.ts` releases it right after the V2 server release and again in `finally` for any path that left earlier; a `sandboxSettled` flag stops a double release.
 - **New `sandbox` start stage** in `V2StartStage`, and a new `ISOLATED_RUN` state key written before the save is armed. The post hook declines to retry any isolated `not-persisted` run.
 - **`saveCache` declines with `ownership-declined`** when the data dir, storage dir, project-id file or a database file is a symlink or special file, before any checkpoint or upload.
-- **S3 upload reads through a verified handle** into memory (1 GiB cap) instead of streaming from the path, so a swapped path cannot be followed.
+- **S3 upload streams from a verified handle** (`openVerifiedReadStream`: no-follow open plus `fstat` on the same handle) with `ContentLength` taken from that handle. There is no size cap.
 - **The real-runner suite now covers the four rows first left out**, as three more suites after the boundary one in `v2-server.sandbox.integration.test.ts` (shared scripted-provider helpers in `v2-server.sandbox.harness.ts`). None has run yet: they skip off a hosted runner and are first proven by the `Sandbox integration` job.
   - **Admitted repo skill:** the skill goes through the real `admitRepoSkills` into a real staging root. The model reads it and cannot write to it, and cannot list the staging root or read a runner-only file beside it.
   - **Provision-mode `gh`:** the model sees `GH_CONFIG_DIR`, and `gh auth token --hostname <dummy host>` returns a dummy token from the handed-over `hosts.yml`. The runner's own `~/.config/gh/hosts.yml` is unreadable. `gh api user` itself is not run: `gh` speaks https to any host except `github.localhost`, so a local stub cannot serve it without a TLS setup.
@@ -548,3 +548,18 @@ Units 1–6 are implemented on `feat/isolate-agent-uid`. Divergences from the pl
 - **Still not covered:** repo-skill loading through OpenCode's own skill tool (only the OS-level read is checked), and anything at the Action level (`run.ts` ordering stays in unit tests and the isolated `Test GitHub Action` run).
 - **The binary is installed under `/opt`** by the CI job so the sandbox user can execute it. The handoff does not grant access to the binary path, which on a real run lives in the world-readable tool cache.
 - **The `Sandbox integration` job is not in the `release` job's `needs`.** Adding it is a CI/release change left for a decision.
+
+### Review-pass changes (after the first build)
+
+Eleven findings from review, each with a test and a revert-check:
+
+- **Persisted checkout credentials.** With `isolate-agent` on, `assertNoPersistedGitCredentials` runs on every trigger, not only withheld ones; a hit fails the run before setup and names `persist-credentials: false`. The `test-action` checkout now sets `persist-credentials: false` unconditionally (the workflow test pins it). This edit to `ci.yaml` landed in the fix commit, not the `ci:` commit.
+- **Unsafe release reads nothing sandbox-writable.** New `SANDBOX_UNSAFE` state key and `sandboxOutputUntrusted` cleanup option. After an unsafe or unconfirmed release, cleanup skips the object-store artifact sync and the log artifact upload, and the post hook skips its upload. Runner-generated metadata still goes out.
+- **A throwing post-spawn gate** now stops the server and releases the sandbox before rethrowing (`runGates` wrapped in `stopAfterFailure`).
+- **Account deletion** follows a confirmed stop even when take-back is unsafe (nothing runs as the uid any more). It stays blocked when the stop is unconfirmed.
+- **Every privileged command has a deadline.** `createPrivilegedRun` uses `execWithTimeout` (default 60 s) and reports a killed command as `exitCode: null`; handoff and take-back each share a 120 s budget; `stopSandboxProcesses` gives `pkill`/`pgrep` the time left of its bound.
+- **Signals.** `SIGINT`/`SIGTERM` stop the sandbox and attempt take-back within 10 s, then re-raise the signal. Handlers are installed before the account exists and removed after release.
+- **Git metadata is restored by `rename`** from the snapshot (copy only on `EXDEV`), so a full disk cannot leave the model's version in place.
+- **`storage/.version`** is written through an exclusive temp file and a rename, and a non-regular `.version` makes `saveCache` decline.
+- **Populated submodules.** With isolation on, reconstruction reads gitlinks from `ls-files --stage`, declines by name when any gitlink directory holds a `.git`, and keeps `--ignore-submodules=dirty`. With isolation off it is back to the original `none`. The flag runs `finalize.ts` -> `brokered-push.ts` -> `reconstruct-changes.ts`.
+- **Real-runner suite additions** (CI only): mode-000 file and directory readable again after take-back; a pre-existing named ACL and default ACL survive while none of this run's entries remain.
