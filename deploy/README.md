@@ -546,15 +546,13 @@ The workspace image runs stock OpenCode V2 only. The gateway needs no setting fo
 
 **The pin.** `packages/runtime/src/shared/opencode-v2-pin.json` holds the V2 `version` and the sha256 of each release asset. The Dockerfile's `opencode-v2` stage and the Action's `installOpenCode` both read it. The stage downloads the musl asset for the target architecture and requires the archive to match the pinned digest and the release's `SHA256SUMS` line; any mismatch aborts the build, with no fallback.
 
-**The build-arg is required.** `OPENCODE_VERSION` has no default, because a Docker `ARG` default cannot be read from a file and a literal would be a second copy of the pin. Pass the pinned version on the **workspace** build only:
+**The build-arg is optional and defaults to the pin.** `OPENCODE_VERSION` is the version in `opencode-v2-pin.json`; leave it unset (as `compose.yaml` does) and the image builds that version. A Docker `ARG` default cannot be read from a file, so the Dockerfile's first stage (`version-gate`) resolves it and records the result in `/usr/local/share/fro-bot/opencode-version`, which every later stage and the entrypoint read:
 
 ```bash
-docker build -f deploy/workspace.Dockerfile \
-  --build-arg OPENCODE_VERSION="$(node -p 'require("./packages/runtime/src/shared/opencode-v2-pin.json").version')" \
-  -t workspace-v2 .
+docker build -f deploy/workspace.Dockerfile -t workspace-v2 .
 ```
 
-The first stage of the Dockerfile (`version-gate`) refuses a build whose `OPENCODE_VERSION` is unset, malformed, not a V2 version, a retired `+harness` build, or not equal to the pin's `version`. Every other stage starts from it, so the build fails there with a message that names the pin file, before any package or binary is downloaded. The gateway image has no OpenCode version. Whatever builds the deployed images (for example `marcusrbrown/infra`) passes the build-arg in its workspace build step only.
+An explicit value is only a check. The gate refuses a build whose `OPENCODE_VERSION` contains disallowed characters, is a retired `+harness` build, is not a V2 version (`latest` included), or is a V2 version other than the pin's `version`. Every other stage starts from it, so the build fails there with a message that names the pin file, before any package or binary is downloaded. The gateway image has no OpenCode version. A build of the deployed images (for example in `marcusrbrown/infra`) needs no build-arg; passing one is only worthwhile as a check that the pin it expects is the pin in this tree.
 
 **What the image carries.** The binary is the stock `opencode-linux-*-musl` release. `@fro.bot/systematic` and `@fro.bot/opencode-plugin` are installed at image build and loaded from the config content the workspace agent passes at each spawn; nothing installs at boot, so readiness needs no network and no provider. The base config (`/usr/local/share/fro-bot/opencode.base.json`) is `{"update":"disable"}` with no plugin entry, and `/etc/opencode/opencode.json` is `deploy/managed-config/opencode-v2.json`. The image sets `WORKSPACE_IMAGE_OPENCODE_VERSION` to the build-arg; the workspace agent exits at startup with a named error when it is unset or is not a V2 version.
 

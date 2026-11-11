@@ -203,7 +203,7 @@ Recovery preserves the whole checkout against the five-generation/10 GiB retenti
 
 The operator contract does not select the OpenCode version. For every admitted run the gateway reads workspace readiness and admits it only when `opencodeVersion` is major 2 or higher; a missing, older or unreadable version is not ready, and no run is admitted. Native permission and form requests map onto the shared approval/question registries, so browser authorization and decision routes are shared.
 
-The workspace image takes its OpenCode version from the required `OPENCODE_VERSION` build-arg, which must equal the pin in `packages/runtime/src/shared/opencode-v2-pin.json`; a build without it fails. [[Setup and Configuration]] describes the separate installation boundaries.
+The workspace image takes its OpenCode version from the pin in `packages/runtime/src/shared/opencode-v2-pin.json`; the optional `OPENCODE_VERSION` build-arg defaults to it, and any other value fails the build. [[Setup and Configuration]] describes the separate installation boundaries.
 
 `POST /operator/runs` (`web/operator/launch-route.ts`) is a fire-and-return endpoint: the operator submits a repository and a prompt, and the server responds `202` with a `runId` almost immediately, leaving the operator to observe progress over SSE. Before anything launches, the request passes an ordered gauntlet: the browser guard, an operator-keyed rate limit, session identity resolution, body validation, the prompt checks (below), **server-owned binding resolution** (the client names a repo but the server resolves the actual binding — client-supplied paths or owners are ignored) followed by the denylist check, both inside the single repo-access predicate, and finally a per-operator idempotency guard.
 

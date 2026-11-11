@@ -10,38 +10,43 @@
 #   - 9200 (OpenCode bearer-token proxy) — sandbox-net reachable (gateway attaches here)
 #   - 54321 (raw OpenCode server) — loopback (127.0.0.1) ONLY, never exposed
 #
-# OPENCODE_VERSION is a required build argument with no default: the V2 version in
+# OPENCODE_VERSION is an optional build argument that defaults to the V2 version in
 # packages/runtime/src/shared/opencode-v2-pin.json. A Docker ARG default cannot be
-# read from a file, and a literal default would be a second copy of the pin that
-# drifts on every bump. The musl asset from anomalyco/opencode is verified against the
-# digest recorded in that file (the `opencode-v2` stage below). Build with:
-#   docker build -f deploy/workspace.Dockerfile \
-#     --build-arg OPENCODE_VERSION="$(node -p 'require("./packages/runtime/src/shared/opencode-v2-pin.json").version')" .
+# read from a file, so the `version-gate` stage resolves it: unset or empty means the
+# pin, and any explicit value must equal the pin. The resolved version is written to
+# /usr/local/share/fro-bot/opencode-version, which every later stage reads, so no
+# stage can disagree with the gate. The musl asset from anomalyco/opencode is verified
+# against the digest recorded in the pin file (the `opencode-v2` stage below). Build with:
+#   docker build -f deploy/workspace.Dockerfile .
 # SYSTEMATIC_VERSION tracks DEFAULT_SYSTEMATIC_VERSION in
 # packages/runtime/src/shared/constants.ts.
 
-# ── Stage 0: version-gate (refuses a build that is not given the pinned V2 version) ──
-# Every other stage starts FROM this one, so a missing or non-V2 OPENCODE_VERSION fails the build here, before any
-# download or package install. The pin file is bind-mounted from the build context for the check, so it does not
-# land in any image layer.
+# ── Stage 0: version-gate (resolves the OpenCode V2 version and refuses anything but the pin) ──
+# Every other stage starts FROM this one, so a non-V2, harness or unpinned OPENCODE_VERSION fails the build here, before
+# any download or package install. An unset or empty OPENCODE_VERSION means the version in the pin file. The pin file is
+# bind-mounted from the build context for the check, so it does not land in any image layer; the resolved version does,
+# as /usr/local/share/fro-bot/opencode-version, and the later stages and the entrypoint read it from there.
 FROM node:24.22.2-alpine3.24@sha256:a34ab6d7f6f4813f4d0c5469d74685604b962fbdbf5793a7bc7b4998ecb867c8 AS version-gate
 
 ARG OPENCODE_VERSION
 
 RUN --mount=type=bind,source=packages/runtime/src/shared/opencode-v2-pin.json,target=/opt/opencode-v2-pin.json \
     set -eu \
-    && hint="pass --build-arg OPENCODE_VERSION=<version> from packages/runtime/src/shared/opencode-v2-pin.json" \
-    && case "${OPENCODE_VERSION:-}" in \
-         '') echo "OPENCODE_VERSION is required: ${hint}" >&2; exit 1 ;; \
-         *[!0-9A-Za-z.+_-]*) echo "OPENCODE_VERSION contains disallowed characters: ${OPENCODE_VERSION}" >&2; exit 1 ;; \
-         *harness*) echo "OPENCODE_VERSION ${OPENCODE_VERSION} is a retired V1 harness build: this image runs OpenCode V2 only; ${hint}" >&2; exit 1 ;; \
-         [2-9].*|[1-9][0-9]*.*) : ;; \
-         *) echo "OPENCODE_VERSION ${OPENCODE_VERSION} is not an OpenCode V2 version: this image runs V2 only; ${hint}" >&2; exit 1 ;; \
-       esac \
     && pin_version="$(node -p 'JSON.parse(fs.readFileSync(process.argv[1], "utf8")).version' /opt/opencode-v2-pin.json)" \
-    && if [ "${pin_version}" != "${OPENCODE_VERSION}" ]; then \
-         echo "OPENCODE_VERSION ${OPENCODE_VERSION} is not the pinned V2 version ${pin_version} (packages/runtime/src/shared/opencode-v2-pin.json)" >&2; exit 1; \
-       fi
+    && resolved="${OPENCODE_VERSION:-${pin_version}}" \
+    && case "${resolved}" in \
+         *[!0-9A-Za-z.+_-]*) echo "OPENCODE_VERSION contains disallowed characters: ${resolved}" >&2; exit 1 ;; \
+         *harness*) echo "OPENCODE_VERSION ${resolved} is a retired V1 harness build: this image runs OpenCode V2 only; omit the build-arg to build the pin in packages/runtime/src/shared/opencode-v2-pin.json" >&2; exit 1 ;; \
+         [2-9].*|[1-9][0-9]*.*) : ;; \
+         *) echo "OPENCODE_VERSION ${resolved} is not an OpenCode V2 version: this image runs V2 only; omit the build-arg to build the pin in packages/runtime/src/shared/opencode-v2-pin.json" >&2; exit 1 ;; \
+       esac \
+    && if [ "${resolved}" != "${pin_version}" ]; then \
+         echo "OPENCODE_VERSION ${resolved} is not the pinned V2 version ${pin_version} (packages/runtime/src/shared/opencode-v2-pin.json)" >&2; exit 1; \
+       fi \
+    && mkdir -p /usr/local/share/fro-bot \
+    && printf '%s' "${resolved}" > /usr/local/share/fro-bot/opencode-version \
+    && chmod 0644 /usr/local/share/fro-bot/opencode-version \
+    && echo "OpenCode V2 version: ${resolved}"
 
 # ── Stage 1: build-deps (full workspace, dev deps, workspace-agent build) ──────
 # Forked into `workspace-test` below BEFORE dev dependencies are pruned, then
@@ -177,17 +182,16 @@ RUN rm -rf node_modules apps/*/node_modules packages/*/node_modules \
 
 # ── Stage 1c: opencode-v2 (stock V2 binary, digest-verified) ──────────────────
 # Build it alone with:
-#   docker build --target opencode-v2 --build-arg OPENCODE_VERSION=<pinned version> -f deploy/workspace.Dockerfile .
+#   docker build --target opencode-v2 -f deploy/workspace.Dockerfile .
 #
 # The recorded digest is read from the SAME JSON file the Action's
 # installOpenCode imports (packages/runtime/src/shared/opencode-v2-pin.json), with
 # node — already in this base image — so no digest is hand-copied here. The archive
 # must match BOTH that digest and the release's SHA256SUMS line. Any failure
 # aborts the build: no fallback version, no retry-around-mismatch, no skipped check.
-# The version-gate stage has already refused any OPENCODE_VERSION that is not the pinned V2 version.
+# The version-gate stage has already refused any OPENCODE_VERSION that is not the pinned V2 version and recorded it.
 FROM version-gate AS opencode-v2
 
-ARG OPENCODE_VERSION
 ARG TARGETARCH
 
 COPY packages/runtime/src/shared/opencode-v2-pin.json /opt/opencode-v2-pin.json
@@ -206,7 +210,8 @@ RUN set -euo pipefail \
          echo "opencode-v2-pin.json has no valid sha256 for ${oc_asset}" >&2; exit 1; \
        fi \
     && apk add --no-cache curl \
-    && oc_base_url="https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}" \
+    && oc_version="$(cat /usr/local/share/fro-bot/opencode-version)" \
+    && oc_base_url="https://github.com/anomalyco/opencode/releases/download/v${oc_version}" \
     && curl -fsSL --connect-timeout 30 --max-time 120 --retry 3 --retry-delay 2 -o "/tmp/${oc_asset}" "${oc_base_url}/${oc_asset}" \
     && curl -fsSL --connect-timeout 30 --max-time 120 --retry 3 --retry-delay 2 -o /tmp/SHA256SUMS "${oc_base_url}/SHA256SUMS" \
     # The SHA256SUMS line must equal the recorded digest, and so must the archive.
@@ -224,7 +229,7 @@ RUN set -euo pipefail \
     && tar -xz -C /out -f "/tmp/${oc_asset}" \
     && chmod 755 /out/opencode \
     # Tell the runtime stage which version this output was verified for.
-    && printf '%s' "${OPENCODE_VERSION}" > /out/VERSION \
+    && printf '%s' "${oc_version}" > /out/VERSION \
     && rm -f "/tmp/${oc_asset}" /tmp/SHA256SUMS
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
@@ -233,8 +238,6 @@ FROM version-gate AS runtime
 WORKDIR /app
 
 # Pinned tool versions (track the runtime constants noted in the header).
-# OPENCODE_VERSION has no default: it is the V2 version in opencode-v2-pin.json (see the header and version-gate).
-ARG OPENCODE_VERSION
 ARG SYSTEMATIC_VERSION=3.32.1
 
 # System packages come from the base image's Alpine 3.24 branch and are not
@@ -332,12 +335,12 @@ ENV HOME=/var/lib/workspace-agent/home
 
 # Bake the stock OpenCode V2 CLI that the `opencode-v2` stage verified against the digest recorded in
 # opencode-v2-pin.json. The step refuses output that is missing or was verified for a different version, so every stage
-# must be built with the same --build-arg OPENCODE_VERSION.
+# must be built from the version the gate recorded.
 ARG TARGETARCH
 COPY --from=opencode-v2 /out/ /tmp/opencode-v2/
 RUN set -euo pipefail \
-    && if [ "$(cat /tmp/opencode-v2/VERSION 2>/dev/null || true)" != "${OPENCODE_VERSION}" ] || [ ! -x /tmp/opencode-v2/opencode ]; then \
-         echo "no verified V2 binary for OPENCODE_VERSION ${OPENCODE_VERSION}: pass the same --build-arg OPENCODE_VERSION to every stage" >&2; exit 1; \
+    && if [ "$(cat /tmp/opencode-v2/VERSION 2>/dev/null || true)" != "$(cat /usr/local/share/fro-bot/opencode-version)" ] || [ ! -x /tmp/opencode-v2/opencode ]; then \
+         echo "no verified V2 binary for the version the gate recorded ($(cat /usr/local/share/fro-bot/opencode-version))" >&2; exit 1; \
        fi \
     && install -m 755 /tmp/opencode-v2/opencode /usr/local/bin/opencode \
     && rm -rf /tmp/opencode-v2 \
@@ -355,10 +358,10 @@ RUN sh /usr/local/lib/workspace-scripts/install-opencode-v2-plugins.sh \
       "@fro.bot/systematic@${SYSTEMATIC_VERSION}" \
       "@fro.bot/opencode-plugin@${FRO_BOT_PLUGIN_VERSION}"
 
-# Which OpenCode this image carries, reported on /readyz. The workspace agent refuses to start without a V2 value, and
-# the gateway admits a run only when it reads one. It is the same build argument that selected the binary above, so the
-# two cannot disagree; it is not an operator setting.
-ENV WORKSPACE_IMAGE_OPENCODE_VERSION=${OPENCODE_VERSION}
+# Which OpenCode this image carries, reported on /readyz. The entrypoint exports it as WORKSPACE_IMAGE_OPENCODE_VERSION
+# from /usr/local/share/fro-bot/opencode-version (the file the gate wrote and the install above read), so the reported
+# version and the binary cannot disagree; it is not an operator setting. The workspace agent refuses to start without a
+# V2 value, and the gateway admits a run only when it reads one.
 
 # Base workspace OpenCode config: disable updates. The model and provider block are NOT baked — the entrypoint
 # overlays them at runtime from WORKSPACE_OPENCODE_MODEL and

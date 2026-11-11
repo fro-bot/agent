@@ -306,4 +306,12 @@ fi
 # The supervisor itself stays uid 0 (compose.yaml user: "0:0") — it spawns
 # OpenCode as uid 10001 (apps/workspace-agent/src owns that spawn logic).
 # ---------------------------------------------------------------------------
+#
+# The OpenCode version the image carries comes from the file the Dockerfile's version-gate stage wrote, never from the
+# operator's environment, so the version reported on /readyz is the one that was installed.
+if ! WORKSPACE_IMAGE_OPENCODE_VERSION="$(cat /usr/local/share/fro-bot/opencode-version)" || [ -z "$WORKSPACE_IMAGE_OPENCODE_VERSION" ]; then
+  echo "workspace-entrypoint: /usr/local/share/fro-bot/opencode-version is missing or empty — refusing to start." >&2
+  exit 1
+fi
+export WORKSPACE_IMAGE_OPENCODE_VERSION
 exec node /app/apps/workspace-agent/dist/main.mjs

@@ -33,7 +33,7 @@ function argDefault(name) {
   return match[1]
 }
 
-/** The `ARG OPENCODE_VERSION` lines of the Dockerfile: one per stage that reads it, none with a default. */
+/** The `ARG OPENCODE_VERSION` lines of the Dockerfile: only the version gate reads the build argument. */
 const opencodeVersionArgs = dockerfile.split('\n').filter(line => /^ARG OPENCODE_VERSION\b/.test(line))
 
 /** The version-gate stage: its `FROM` line to the next `FROM`. */
@@ -83,11 +83,16 @@ test('nothing installs a plugin at boot', () => {
   assert.doesNotMatch(supervisor, /plugin add|'install'|"install"/)
 })
 
-test('the image carries the version the workspace agent starts on, from the same build argument as the binary', () => {
-  // #then the ENV name is the one main.ts reads, and its value is the OPENCODE_VERSION that chose the binary
+test('the image carries the version the workspace agent starts on, from the file the gate wrote', () => {
+  // #then the gate records the resolved version in the one file every later stage and the entrypoint read
+  assert.match(gateStage, /printf '%s' "\$\{resolved\}" > \/usr\/local\/share\/fro-bot\/opencode-version/)
+  assert.match(dockerfile, /oc_version="\$\(cat \/usr\/local\/share\/fro-bot\/opencode-version\)"/)
+  // and the entrypoint exports it under the name main.ts reads, so no image ENV can disagree with the binary
   const name = /export const IMAGE_OPENCODE_VERSION_ENV = '([^']+)'/.exec(imageVersion)?.[1]
   assert.ok(name, 'opencode-generation.ts has no IMAGE_OPENCODE_VERSION_ENV')
-  assert.match(dockerfile, new RegExp(`^ENV ${name}=\\$\\{OPENCODE_VERSION\\}$`, 'm'))
+  assert.match(entrypoint, new RegExp(`^export ${name}$`, 'm'))
+  assert.match(entrypoint, new RegExp(`${name}="\\$\\(cat /usr/local/share/fro-bot/opencode-version\\)"`))
+  assert.doesNotMatch(dockerfile, new RegExp(`^ENV ${name}`, 'm'))
 })
 
 test('the image sets no OpenCode flag the V2 child does not receive', () => {
@@ -125,10 +130,29 @@ test('the workspace agent expects the same plugin ids the V2 image is smoke-test
   assert.equal(constant('FRO_BOT_PLUGIN_ID'), 'fro-bot.opencode-plugin')
 })
 
-test('the build takes OPENCODE_VERSION as a required argument: no ARG carries a default', () => {
+test('OPENCODE_VERSION is optional: only the gate declares it, with no literal default, and it resolves to the pin', () => {
   // #then a literal default would be a second copy of the pin (packages/runtime/src/shared/opencode-v2-pin.json)
-  assert.ok(opencodeVersionArgs.length >= 3, 'the gate, the opencode-v2 stage and the runtime stage each declare it')
-  for (const line of opencodeVersionArgs) assert.equal(line, 'ARG OPENCODE_VERSION', `${line} carries a default`)
+  assert.deepEqual(opencodeVersionArgs, ['ARG OPENCODE_VERSION'])
+  assert.ok(gateStage.includes('ARG OPENCODE_VERSION'), 'the gate declares the argument')
+  // unset and empty both mean the pin
+  assert.match(gateStage, /resolved="\$\{OPENCODE_VERSION:-\$\{pin_version\}\}"/)
+  // no later stage reads the raw argument
+  assert.doesNotMatch(dockerfile.slice(dockerfile.indexOf('# ── Stage 1: build-deps')), /\$\{OPENCODE_VERSION\}/)
+})
+
+test('the compose workspace build reaches the gate: it passes no OPENCODE_VERSION, or the pin', () => {
+  // #given the workspace service's build block in compose.yaml
+  const compose = read('deploy/compose.yaml')
+  const block = /^ {4}build:\n((?: {6,}.*\n|\n)*?)(?= {0,4}\S)/m
+  const builds = [...compose.matchAll(new RegExp(block.source, 'gm'))].map(match => match[1])
+  const workspaceBuild = builds.find(body => body.includes('deploy/workspace.Dockerfile'))
+  assert.ok(workspaceBuild, 'compose.yaml has no workspace build using deploy/workspace.Dockerfile')
+
+  // #then a value there must be the pin (the gate refuses any other), and an absent one defaults to it
+  const pin = JSON.parse(read('packages/runtime/src/shared/opencode-v2-pin.json')).version
+  const passed = /OPENCODE_VERSION[:=]\s*(\S+)/.exec(workspaceBuild)?.[1]
+  if (passed !== undefined) assert.equal(passed.replace(/^["']|["']$/g, ''), pin)
+  assert.doesNotMatch(workspaceBuild, /harness/)
 })
 
 test('every stage starts from the version gate, so a bad version fails before any download', () => {
@@ -146,9 +170,10 @@ test('every stage starts from the version gate, so a bad version fails before an
   }
 })
 
-test('the gate refuses an unset, malformed, V1, harness or unpinned version and names the pin file', () => {
+test('the gate refuses a malformed, V1, harness or unpinned version and names the pin file', () => {
   // #then
-  assert.match(gateStage, /''\) echo "OPENCODE_VERSION is required/)
+  assert.doesNotMatch(gateStage, /is required/)
+  assert.match(gateStage, /\*\[!0-9A-Za-z\.\+_-\]\*\) echo "OPENCODE_VERSION contains disallowed characters/)
   assert.match(gateStage, /\*harness\*\) echo/)
   assert.match(gateStage, /\[2-9\]\.\*\|\[1-9\]\[0-9\]\*\.\*\) : ;;/)
   assert.match(gateStage, /is not the pinned V2 version/)

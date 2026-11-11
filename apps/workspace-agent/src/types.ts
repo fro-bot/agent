@@ -325,7 +325,7 @@ export interface ReadyzResponse {
    */
   readonly opencode: 'ready' | 'starting' | 'down' | 'degraded' | 'unknown'
   /**
-   * The OpenCode version this image runs (`WORKSPACE_IMAGE_OPENCODE_VERSION`, set by the Dockerfile). The gateway
+   * The OpenCode version this image runs (`WORKSPACE_IMAGE_OPENCODE_VERSION`, exported by the entrypoint from the image's recorded version). The gateway
    * admits a run only when it is a V2 version (major 2 or above); a missing or older version reads as not ready.
    * Present while not ready too, so the gateway does not wait for readiness to read it.
    */
