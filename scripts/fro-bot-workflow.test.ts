@@ -555,7 +555,7 @@ describe('CI workflow: Test GitHub Action deadline', () => {
 })
 
 describe('CI workflow: Test GitHub Action checkout', () => {
-  it('never persists checkout credentials, because test-action runs the Action with isolate-agent', () => {
+  it('persists no checkout credentials and does not enable isolate-agent on the local install', () => {
     // #given the checkout step in the test-action job's own PAT-authenticated checkout, and the step that runs the Action
     const steps = stepsFor(CI_WORKFLOW_PATH, 'test-action')
     const checkout = steps.find(step => step.name === 'Checkout repository')
@@ -565,14 +565,25 @@ describe('CI workflow: Test GitHub Action checkout', () => {
     if (runAction === undefined) throw new TypeError('test-action has no step that runs the local Action')
     const runWith = runAction.with as Record<string, unknown>
 
-    // #then isolate-agent is on, so the Action refuses a checkout that persisted credentials on every trigger: the
-    // checkout must persist none, on every trigger (a literal false, not an expression)
-    expect(runWith['isolate-agent']).toBe('true')
+    // #then the checkout persists no credentials on any trigger (a literal false, not an expression)
     expect(checkoutWith['persist-credentials']).toBe(false)
+
+    // #then isolate-agent is NOT enabled: `uses: ./` installs the Action inside the writable checkout, which the
+    // isolate-agent preflight refuses. Isolation is proven by the Sandbox integration job against a hosted runner.
+    expect(runWith).not.toHaveProperty('isolate-agent')
 
     // #then the existing ref/token wiring for this checkout is unchanged
     expect(checkoutWith.token).toBe('${' + '{ secrets.FRO_BOT_PAT }}')
     expect(checkoutWith.ref).toBe('${' + "{ github.event.pull_request.head.sha || '' }}")
+  })
+
+  it('runs the sandbox suite in the Sandbox integration job instead', () => {
+    // #given the job that proves isolate-agent
+    const steps = stepsFor(CI_WORKFLOW_PATH, 'sandbox-integration')
+    const commands = steps.map(step => String(step.run ?? '')).join('\n')
+
+    // #then it runs the sandbox suite file
+    expect(commands).toContain('v2-server.sandbox.integration.test.ts')
   })
 })
 
