@@ -577,12 +577,11 @@ jobs:
           echo "OK: action harness entry not present in bundle"
       - name: Build workspace Docker image
         run: |
-          # The image takes OPENCODE_VERSION as a required build-arg and refuses anything but the V2 pin, so it is
-          # read from the pin file (never hard-coded here) and bumps in one place.
-          v2_version="$(node -p 'JSON.parse(fs.readFileSync("packages/runtime/src/shared/opencode-v2-pin.json", "utf8")).version')"
-          echo "V2 pin: ${v2_version}"
+          # No OPENCODE_VERSION build-arg, exactly like `docker compose build`: the image builds the version in
+          # packages/runtime/src/shared/opencode-v2-pin.json, so this build is also the default-pin build. The V2 smoke
+          # steps below read the same file to assert the built binary is that version.
           for attempt in 1 2 3; do
-            if docker build --build-arg "OPENCODE_VERSION=${v2_version}" -f deploy/workspace.Dockerfile -t fro-bot-workspace:smoke .; then
+            if docker build -f deploy/workspace.Dockerfile -t fro-bot-workspace:smoke .; then
               exit 0
             fi
             echo "::warning::docker build attempt ${attempt} failed"
@@ -598,9 +597,8 @@ jobs:
           # Alpine `apk` git rather than this runner's git. Same build context and
           # retry pattern as the runtime image build above; `docker run` failing
           # (non-zero exit from vitest) fails this step via the job's `set -e` default.
-          v2_version="$(node -p 'JSON.parse(fs.readFileSync("packages/runtime/src/shared/opencode-v2-pin.json", "utf8")).version')"
           for attempt in 1 2 3; do
-            if docker build --target workspace-test --build-arg "OPENCODE_VERSION=${v2_version}" -f deploy/workspace.Dockerfile -t fro-bot-workspace:test .; then
+            if docker build --target workspace-test -f deploy/workspace.Dockerfile -t fro-bot-workspace:test .; then
               break
             fi
             echo "::warning::docker build (workspace-test) attempt ${attempt} failed"
@@ -1099,23 +1097,37 @@ jobs:
           echo "$logs" | grep -q "auth: absent"
           docker exec "$cid" sh -c '! test -f /home/opencode/.local/share/opencode/auth.json'
           echo "OK: whitespace auth file treated as absent — clone-only boots, no auth.json written"
-      - name: Version gate negative test (no OPENCODE_VERSION, a V1 or an unpinned version must abort before any download)
+      - name: Version gate (the default builds the pin; a harness, V1, unpinned or non-V2 version aborts before any download)
         run: |
           set -u
-          # The version-gate stage (deploy/workspace.Dockerfile) is the first step of every other stage, so a build
-          # that is not given the pinned V2 version must fail there, before any package or binary is downloaded.
-          # --no-cache: prevents a false pass from layer reuse of a prior build.
+          # The version-gate stage (deploy/workspace.Dockerfile) is the first step of every other stage. An unset
+          # OPENCODE_VERSION resolves to the pin; any explicit value must equal it. --no-cache prevents a false pass
+          # from layer reuse of a prior build.
           pin_file=packages/runtime/src/shared/opencode-v2-pin.json
-          for bad_version in '' '1.19.5+harness.bf7f7dfe' '1.19.4' 'latest'; do
-            build_args=(--no-cache -f deploy/workspace.Dockerfile -t fro-bot-workspace:version-gate-test .)
-            if [ -n "${bad_version}" ]; then build_args=(--build-arg "OPENCODE_VERSION=${bad_version}" "${build_args[@]}"); fi
-            build_output="$(docker build "${build_args[@]}" 2>&1)" && {
+          pin="$(node -p 'JSON.parse(fs.readFileSync("packages/runtime/src/shared/opencode-v2-pin.json", "utf8")).version')"
+
+          # Positive: the gate stage alone, so this costs seconds and downloads nothing. It prints the resolved version.
+          # The full no-arg build is the "Build workspace Docker image" step above, so it is not repeated here.
+          for build_arg in '' "OPENCODE_VERSION=${pin}"; do
+            args=(--no-cache --progress=plain --target version-gate -f deploy/workspace.Dockerfile -t fro-bot-workspace:version-gate-test .)
+            if [ -n "${build_arg}" ]; then args=(--build-arg "${build_arg}" "${args[@]}"); fi
+            gate_output="$(docker build "${args[@]}" 2>&1)" || { echo "${gate_output}"; echo "REGRESSION: the gate refused '${build_arg}'"; exit 1; }
+            echo "${gate_output}" | grep -qF "OpenCode V2 version: ${pin}" || { echo "${gate_output}"; echo "REGRESSION: the gate did not resolve ${pin} for '${build_arg}'"; exit 1; }
+            echo "OK: gate resolved ${pin} for '${build_arg}'"
+          done
+
+          # Negative: the full build, so the failure must come from the gate and nothing downstream may run.
+          for bad_version in '1.19.5+harness.bf7f7dfe' '1.19.4' 'latest' '2.0.0'; do
+            build_output="$(docker build --no-cache --build-arg "OPENCODE_VERSION=${bad_version}" -f deploy/workspace.Dockerfile -t fro-bot-workspace:version-gate-test . 2>&1)" && {
               echo "REGRESSION: docker build succeeded with OPENCODE_VERSION='${bad_version}'"
               exit 1
             }
             echo "--- docker build output for OPENCODE_VERSION='${bad_version}' (expected failure) ---"
             echo "${build_output}"
             echo "${build_output}" | grep -qF "${pin_file}" || { echo "REGRESSION: the failure does not name ${pin_file}"; exit 1; }
+            if [ "${bad_version}" = "2.0.0" ]; then
+              echo "${build_output}" | grep -qF "is not the pinned V2 version ${pin}" || { echo "REGRESSION: 2.0.0 was not refused as a pin mismatch"; exit 1; }
+            fi
             if echo "${build_output}" | grep -qE 'curl -fsSL|apk add|SHA256 mismatch'; then
               echo "REGRESSION: a download step ran before the version gate refused '${bad_version}'"
               exit 1
