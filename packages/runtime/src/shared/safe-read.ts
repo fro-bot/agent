@@ -1,4 +1,5 @@
 import type {FileHandle} from 'node:fs/promises'
+import type {Readable} from 'node:stream'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 
@@ -69,5 +70,23 @@ export async function readTextNoFollow(file: string, options: SafeReadOptions = 
     return await handle.readFile('utf8')
   } finally {
     await handle.close()
+  }
+}
+
+/**
+ * A stream of a regular file's bytes, opened without following a final symlink and checked with `fstat` on the same
+ * handle. No size cap: this is for files uploaded as a stream (a session database can be large). The stream owns the
+ * handle and closes it when it ends or is destroyed. `size` is the length at open time, from the handle.
+ */
+export async function openVerifiedReadStream(
+  file: string,
+): Promise<{readonly stream: Readable; readonly size: number}> {
+  const handle = await openRegularFileNoFollow(file, {maxBytes: Number.POSITIVE_INFINITY})
+  try {
+    const {size} = await handle.stat()
+    return {stream: handle.createReadStream({autoClose: true, start: 0}), size}
+  } catch (error) {
+    await handle.close()
+    throw error
   }
 }
