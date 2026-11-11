@@ -1215,6 +1215,48 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
     expect(server.shutdown.mock.invocationCallOrder[0]).toBeLessThan(sandbox.release.mock.invocationCallOrder[0] ?? 0)
   })
 
+  it('stops the server and releases the sandbox, then rethrows, when a post-spawn gate throws', async () => {
+    // #given a healthy spawn and an import wait that throws instead of returning a failure
+    const server = fakeServer()
+    const deps = depsFor(server, {waitForImport: vi.fn(async () => Promise.reject(new Error('gate blew up')))})
+    const sandbox = fakeSandbox()
+
+    // #when / #then it surfaces the error, but only after the server is down and the sandbox is taken back
+    await expect(run(sandbox.sandbox, deps)).rejects.toThrow('gate blew up')
+    expect(server.shutdown).toHaveBeenCalledTimes(1)
+    expect(sandbox.release).toHaveBeenCalledTimes(1)
+    expect(server.shutdown.mock.invocationCallOrder[0]).toBeLessThan(sandbox.release.mock.invocationCallOrder[0] ?? 0)
+  })
+
+  it('stops the server when a post-spawn gate throws and isolation is off', async () => {
+    // #given the same throw without a sandbox
+    const server = fakeServer()
+    const deps = depsFor(server, {waitForImport: vi.fn(async () => Promise.reject(new Error('gate blew up')))})
+
+    // #when / #then the handle is never left running
+    await expect(run(null, deps)).rejects.toThrow('gate blew up')
+    expect(server.shutdown).toHaveBeenCalledTimes(1)
+  })
+
+  it('stops the server and releases the sandbox when the permission gate itself throws', async () => {
+    // #given an agent listing that throws
+    const server = fakeServer()
+    server.fetch.mockImplementation(async () => Promise.reject(new Error('socket hang up')))
+    const deps = depsFor(server)
+    const sandbox = fakeSandbox()
+
+    // #when
+    const outcome = await run(sandbox.sandbox, deps).then(
+      value => ({thrown: false as const, value}),
+      () => ({thrown: true as const}),
+    )
+
+    // #then whether the gate converts the error into a failure or lets it throw, nothing is left running
+    expect(outcome.thrown || !outcome.value.success).toBe(true)
+    expect(server.shutdown).toHaveBeenCalledTimes(1)
+    expect(sandbox.release).toHaveBeenCalledTimes(1)
+  })
+
   it('releases the sandbox and rethrows when the spawn throws', async () => {
     // #given a spawn that throws
     const server = fakeServer()

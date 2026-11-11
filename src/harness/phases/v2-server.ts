@@ -329,7 +329,9 @@ export async function startActionOpenCodeV2(
   }
   const handle = started.data
 
-  const failAfterSpawn = async (stage: V2StartStage, message: string): Promise<Result<never, V2StartError>> => {
+  // The handle and the sandbox are owned here until every gate below has passed. Any failure, returned or thrown, stops
+  // the server first (so nothing writes while files are taken back) and then releases the sandbox.
+  const stopAfterFailure = async (): Promise<void> => {
     try {
       const shutdown = await handle.shutdown()
       if (shutdown.exit.outcome === 'unconfirmed') {
@@ -339,60 +341,73 @@ export async function startActionOpenCodeV2(
       logger.error('OpenCode V2 server shutdown after a failed start threw', {error: toErrorMessage(error)})
     }
     await releaseSandboxAfterFailure(options.sandbox, logger)
+  }
+
+  const failAfterSpawn = async (stage: V2StartStage, message: string): Promise<Result<never, V2StartError>> => {
+    await stopAfterFailure()
     return stageError(stage, message)
   }
 
-  // --- 6. Permission gate, then credential gate -------------------------------------------------------------
-  const permissions = await verifyPermissionRules(
-    {
-      listAgents: async () => {
-        // `GET /api/agent` answering 503 is not-ready, not "no agents"; the spawn's own readiness gate has already
-        // waited it out, so a non-200 here is a failure to read, not a pass.
-        const response = await handle.fetch('/api/agent', {signal: AbortSignal.timeout(GATE_REQUEST_TIMEOUT_MS)})
-        if (!response.ok) throw new Error(`GET /api/agent answered HTTP ${response.status}`)
-        return response.json()
+  const runGates = async (): Promise<Result<OpenCodeV2ServerHandle, V2StartError>> => {
+    // --- 6. Permission gate, then credential gate -------------------------------------------------------------
+    const permissions = await verifyPermissionRules(
+      {
+        listAgents: async () => {
+          // `GET /api/agent` answering 503 is not-ready, not "no agents"; the spawn's own readiness gate has already
+          // waited it out, so a non-200 here is a failure to read, not a pass.
+          const response = await handle.fetch('/api/agent', {signal: AbortSignal.timeout(GATE_REQUEST_TIMEOUT_MS)})
+          if (!response.ok) throw new Error(`GET /api/agent answered HTTP ${response.status}`)
+          return response.json()
+        },
       },
-    },
-    built.data.expectations,
-    logger,
-  )
-  if (!permissions.success) {
-    return failAfterSpawn('permission-gate', `OpenCode permission gate failed: ${permissions.error.message}`)
-  }
-
-  const spawnConfig = spawnConfigFromConfig(built.data.content)
-  const modelProvider = modelProviderId(options.model ?? spawnConfig.model)
-  const requiredProviders = modelProvider === undefined ? keys.data.map(entry => entry.providerId) : [modelProvider]
-  if (requiredProviders.length === 0) {
-    logger.info('No model or provider credentials configured, credential gate skipped')
-  } else {
-    const credentials = await verifyCredentialGate({
-      handle,
-      requestTimeoutMs: GATE_REQUEST_TIMEOUT_MS,
-      ...(options.signal === undefined ? {} : {signal: options.signal}),
-      providers: requiredProviders,
-      configuredAuth: spawnConfig.authenticatedProviders,
-      remedy: 'Add an API-key entry for it to the auth-json input.',
-    })
-    if (!credentials.success) {
-      return failAfterSpawn('credential-gate', `OpenCode credential gate failed: ${credentials.error.message}`)
+      built.data.expectations,
+      logger,
+    )
+    if (!permissions.success) {
+      return failAfterSpawn('permission-gate', `OpenCode permission gate failed: ${permissions.error.message}`)
     }
+
+    const spawnConfig = spawnConfigFromConfig(built.data.content)
+    const modelProvider = modelProviderId(options.model ?? spawnConfig.model)
+    const requiredProviders = modelProvider === undefined ? keys.data.map(entry => entry.providerId) : [modelProvider]
+    if (requiredProviders.length === 0) {
+      logger.info('No model or provider credentials configured, credential gate skipped')
+    } else {
+      const credentials = await verifyCredentialGate({
+        handle,
+        requestTimeoutMs: GATE_REQUEST_TIMEOUT_MS,
+        ...(options.signal === undefined ? {} : {signal: options.signal}),
+        providers: requiredProviders,
+        configuredAuth: spawnConfig.authenticatedProviders,
+        remedy: 'Add an API-key entry for it to the auth-json input.',
+      })
+      if (!credentials.success) {
+        return failAfterSpawn('credential-gate', `OpenCode credential gate failed: ${credentials.error.message}`)
+      }
+    }
+
+    // --- 7. Import wait ----------------------------------------------------------------------------------------
+    const imported = await deps.waitForImport({
+      fetch: handle.fetch,
+      logger,
+      facts,
+      ...(options.signal === undefined ? {} : {signal: options.signal}),
+    })
+    if (!imported.success) return failAfterSpawn('import-wait', imported.error.message)
+
+    logger.info('OpenCode V2 server is started and gated', {
+      providers: keys.data.map(entry => entry.providerId),
+      plugins: specs.data.specs,
+    })
+    return ok(handle)
   }
 
-  // --- 7. Import wait ----------------------------------------------------------------------------------------
-  const imported = await deps.waitForImport({
-    fetch: handle.fetch,
-    logger,
-    facts,
-    ...(options.signal === undefined ? {} : {signal: options.signal}),
-  })
-  if (!imported.success) return failAfterSpawn('import-wait', imported.error.message)
-
-  logger.info('OpenCode V2 server is started and gated', {
-    providers: keys.data.map(entry => entry.providerId),
-    plugins: specs.data.specs,
-  })
-  return ok(handle)
+  try {
+    return await runGates()
+  } catch (error) {
+    await stopAfterFailure()
+    throw error
+  }
 }
 
 /**
