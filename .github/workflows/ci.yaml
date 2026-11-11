@@ -165,7 +165,7 @@ jobs:
           FRO_BOT_OPENCODE_V2_BIN: ${{ steps.opencode.outputs.binary }}
           # A dummy value, never a real secret: the suite checks the model shell cannot read it from /proc.
           PROBE_DUMMY_TOKEN: dummy-probe-token-not-a-secret
-        run: bun run test src/harness/phases/v2-server.sandbox.integration
+        run: bunx vitest run src/harness/phases/v2-server.sandbox.integration.test.ts
 
   test-action:
     if: >-
