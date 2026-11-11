@@ -27,6 +27,13 @@ vi.mock('node:fs/promises', async () => {
   return {...actual, readFile: fsMocks.readFile, readdir: fsMocks.readdir}
 })
 
+// The flow tests below drive the read through `fsMocks.readFile`. The no-follow reader is mocked onto it so they keep
+// testing delivery behavior; its refusals (symlink, FIFO, directory, size) are tested for real in response-read-safety.test.ts.
+vi.mock('@fro-bot/runtime', async importOriginal => {
+  const original = await importOriginal<typeof import('@fro-bot/runtime')>()
+  return {...original, readTextNoFollow: async (file: string) => fsMocks.readFile(file, 'utf8') as Promise<string>}
+})
+
 function makeHydratedPullRequest(headSha: string): PullRequestContext {
   return {
     type: 'pull_request',

@@ -13,9 +13,13 @@ import {
   S3Client,
 } from '@aws-sdk/client-s3'
 import {toErrorMessage} from '../shared/errors.js'
+import {openRegularFileNoFollow} from '../shared/safe-read.js'
 import {err, ok} from '../shared/types.js'
 import {getEffectiveEncryption} from './encryption.js'
 import {createObjectStoreOperationError, type ObjectStoreAdapter, type ObjectStoreConfig} from './types.js'
+
+/** Upper bound for one uploaded session file. */
+const MAX_UPLOAD_BYTES = 1024 * 1024 * 1024
 
 function sanitizeS3ErrorMessage(message: string): string {
   return message
@@ -146,15 +150,24 @@ export function createS3Adapter(config: ObjectStoreConfig, logger: Logger): Obje
       logger.debug('Uploading object store file', {key, localPath})
 
       try {
+        // Read through a verified handle: a symlink or special file planted where a session file belongs (by a sandbox
+        // user, for example) is refused rather than uploaded. Session files are small enough to hold in memory.
+        const handle = await openRegularFileNoFollow(localPath, {maxBytes: MAX_UPLOAD_BYTES})
+        let body: Buffer
+        try {
+          body = await handle.readFile()
+        } finally {
+          await handle.close()
+        }
         const commandInput: {
-          Body: fs.ReadStream
+          Body: Buffer
           Bucket: string
           ExpectedBucketOwner?: string
           Key: string
           ServerSideEncryption: 'AES256' | 'aws:kms'
           SSEKMSKeyId?: string
         } = {
-          Body: fs.createReadStream(localPath),
+          Body: body,
           Bucket: config.bucket,
           ExpectedBucketOwner: config.expectedBucketOwner,
           Key: key,

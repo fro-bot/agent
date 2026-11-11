@@ -194,6 +194,12 @@ export async function syncArtifactsToStore(
   } catch {
     return {uploaded: 0, failed: 0}
   }
+  // A symlinked log directory (planted by a sandboxed agent) would upload whatever it points at.
+  const logStats = await fs.lstat(logPath).catch(() => null)
+  if (logStats === null || logStats.isSymbolicLink() || !logStats.isDirectory()) {
+    logger.warning('Artifact log path is not a plain directory; skipping upload', {logPath})
+    return {uploaded: 0, failed: 0}
+  }
 
   let uploaded = 0
   let failed = 0

@@ -165,6 +165,23 @@ describe('createS3Adapter', () => {
     })
   })
 
+  it('refuses to upload a symlink and sends nothing', async () => {
+    // #given a session file that is a symlink to a runner-owned secret (planted where a database belongs)
+    sendMock.mockResolvedValue({})
+    const adapter = createS3Adapter(baseConfig, createLogger())
+    const secret = path.join(tempDir, 'secret.txt')
+    await fs.writeFile(secret, 'runner secret')
+    const localPath = path.join(tempDir, 'opencode.db')
+    await fs.symlink(secret, localPath)
+
+    // #when uploaded
+    const result = await adapter.upload('fro-bot-state/github/owner/repo/sessions/opencode.db', localPath)
+
+    // #then it fails and no request was made
+    expect(result.success).toBe(false)
+    expect(sendMock).not.toHaveBeenCalled()
+  })
+
   it('defaults to AES256 when custom endpoint is set', async () => {
     sendMock.mockResolvedValue({})
     const logger = createLogger()

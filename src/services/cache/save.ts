@@ -122,6 +122,31 @@ async function writeCheckpointDeclineSummary(reason: string, logger: Logger): Pr
   }
 }
 
+/**
+ * The first session path a less-trusted writer left as something other than what a save expects, or null. The sandbox
+ * user of `isolate-agent` can plant a symlink where the data directory, the storage directory or the project-id file
+ * belongs, or where a database file belongs; saving or uploading through one would read a runner-owned file. Missing
+ * paths are fine (a first run has none).
+ */
+export async function findUnsafeSessionPath(
+  storagePath: string,
+  projectIdPath: string | undefined,
+  dbFileNames: readonly string[],
+): Promise<string | null> {
+  const dbDir = path.dirname(storagePath)
+  const mustNotBeLinks = projectIdPath === undefined ? [dbDir, storagePath] : [dbDir, storagePath, projectIdPath]
+  for (const candidate of mustNotBeLinks) {
+    const stats = await fs.lstat(candidate).catch(() => null)
+    if (stats?.isSymbolicLink() === true) return candidate
+  }
+  for (const name of dbFileNames) {
+    const candidate = path.join(dbDir, name)
+    const stats = await fs.lstat(candidate).catch(() => null)
+    if (stats !== null && !stats.isFile()) return candidate
+  }
+  return null
+}
+
 export async function saveCache(options: SaveCacheOptions): Promise<CacheSaveResult> {
   const {components, runId, logger, storagePath, authPath, projectIdPath, cacheAdapter = defaultCacheAdapter} = options
 
@@ -147,6 +172,18 @@ export async function saveCache(options: SaveCacheOptions): Promise<CacheSaveRes
   let storePersisted = false
 
   try {
+    // Before anything reads or writes the session files: a link or special file where they belong is never followed.
+    const dbNames = getSessionDbBasenames(generation)
+    const unsafePath = await findUnsafeSessionPath(storagePath, projectIdPath, [
+      dbNames.main,
+      dbNames.wal,
+      ...dbNames.transportable,
+    ])
+    if (unsafePath !== null) {
+      logger.warning('Declining cache save: a session path is a symlink or not a regular file', {path: unsafePath})
+      return {cachePersisted: false, storePersisted: false, outcome: 'ownership-declined'}
+    }
+
     await deleteAuthJson(authPath, storagePath, logger)
 
     // Checkpoint before anything inspects file sizes, builds the save path list, or

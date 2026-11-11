@@ -35,6 +35,12 @@ export async function uploadLogArtifact(options: ArtifactUploadOptions): Promise
     logger.info('Log directory does not exist, skipping artifact upload', {logPath})
     return false
   }
+  // A symlinked log directory (planted by a sandboxed agent) would upload whatever it points at.
+  const logStats = await fs.lstat(logPath).catch(() => null)
+  if (logStats === null || logStats.isSymbolicLink() || !logStats.isDirectory()) {
+    logger.warning('Log path is not a plain directory, skipping artifact upload', {logPath})
+    return false
+  }
 
   const files = await collectFiles(logPath)
   if (files.length === 0) {
