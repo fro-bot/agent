@@ -99,6 +99,25 @@ describe('reconstructChanges', () => {
     expect(args).not.toContain('origin')
   })
 
+  it('runs both reads through the trusted wrapper: hardened argv, replaced environment, no entering submodules', async () => {
+    // #given a clean diff
+    const execAdapter = createMockExecAdapter()
+
+    // #when reconstructed
+    await reconstructChanges(execAdapter, TRUSTED_HEAD_SHA, '/workspace', logger)
+
+    // #then each call carries the global hardening, replaced env and the submodule/textconv/ext-diff restrictions
+    const calls = vi.mocked(execAdapter.getExecOutput).mock.calls
+    expect(calls).toHaveLength(2)
+    for (const [, args, options] of calls) {
+      expect(args?.slice(0, 5)).toEqual(['--no-pager', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null'])
+      expect(options?.env).toMatchObject({GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0'})
+    }
+    const diffArgs = calls[0]?.[1] ?? []
+    expect(diffArgs).toEqual(expect.arrayContaining(['--no-ext-diff', '--no-textconv', '--ignore-submodules=dirty']))
+    expect(diffArgs).not.toContain('--ignore-submodules=none')
+  })
+
   it('represents deleted files without reading or dereferencing them', async () => {
     // #given a trusted anchor and a raw git diff containing a deleted regular file
     const execAdapter = createMockExecAdapter(rawDiffEntry('100644', '000000', 'D', 'src/removed.ts'))

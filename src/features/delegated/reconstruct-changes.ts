@@ -10,18 +10,15 @@ import {resolve, sep} from 'node:path'
 import {TextDecoder} from 'node:util'
 import {err, ok} from '@bfra.me/es/result'
 import {validateFilePath, validateFiles} from './commit.js'
+import {runTrustedGit} from './trusted-git.js'
 import {FILE_VALIDATION} from './types.js'
 
 const SHA1_PATTERN = /^[0-9a-f]{40}$/i
 const ZERO_MODE = '000000'
 const REGULAR_FILE_MODE = '100644'
 const UTF8_DECODER = new TextDecoder('utf-8', {fatal: true})
-const GIT_ENV = {
-  GIT_CONFIG_NOSYSTEM: '1',
-  GIT_CONFIG_GLOBAL: '/dev/null',
-  GIT_CONFIG_SYSTEM: '/dev/null',
-  GIT_PAGER: 'cat',
-} as const
+/** Bound on each reconstruction git call. A stalled git is killed (its process group), not abandoned. */
+export const RECONSTRUCT_GIT_TIMEOUT_MS = 60_000
 
 interface RawDiffEntry {
   readonly oldMode: string
@@ -53,49 +50,48 @@ export async function reconstructChanges(
   }
 
   try {
-    const diffResult = await execAdapter.getExecOutput(
-      'git',
+    // `dirty`, not `all`: a gitlink's recorded commit still shows (and is still rejected below), but git never runs
+    // inside the submodule. `none` runs `git status` there, which executes that repository's own `core.fsmonitor`.
+    const diffResult = await runTrustedGit(
+      execAdapter,
       [
-        '--no-pager',
         '-c',
         'core.quotepath=false',
         'diff',
         '--no-ext-diff',
         '--no-textconv',
         '--no-renames',
-        '--ignore-submodules=none',
+        '--ignore-submodules=dirty',
         '--raw',
         '-z',
         trustedHeadSha,
         '--',
       ],
-      {
-        cwd: repoRoot,
-        env: GIT_ENV,
-        ignoreReturnCode: true,
-        silent: true,
-      },
+      repoRoot,
+      {timeoutMs: RECONSTRUCT_GIT_TIMEOUT_MS},
     )
-
-    if (diffResult.exitCode !== 0) {
-      const detail = diffResult.stderr.trim()
+    if (diffResult.kind === 'timed-out') {
+      logger.warning('Brokered push reconstruction diff timed out and was killed')
+      return err(new Error('Unable to diff workspace against trusted head SHA: git timed out'))
+    }
+    if (diffResult.kind === 'unavailable' || diffResult.exitCode !== 0) {
+      const detail = diffResult.kind === 'completed' ? diffResult.stderr.trim() : 'git was unavailable'
       logger.warning('Brokered push reconstruction diff failed', {error: detail})
       return err(new Error(`Unable to diff workspace against trusted head SHA: ${detail}`.trim()))
     }
 
-    const untrackedResult = await execAdapter.getExecOutput(
-      'git',
-      ['--no-pager', '-c', 'core.quotepath=false', 'ls-files', '--others', '--exclude-standard', '-z', '--'],
-      {
-        cwd: repoRoot,
-        env: GIT_ENV,
-        ignoreReturnCode: true,
-        silent: true,
-      },
+    const untrackedResult = await runTrustedGit(
+      execAdapter,
+      ['-c', 'core.quotepath=false', 'ls-files', '--others', '--exclude-standard', '-z', '--'],
+      repoRoot,
+      {timeoutMs: RECONSTRUCT_GIT_TIMEOUT_MS},
     )
-
-    if (untrackedResult.exitCode !== 0) {
-      const detail = untrackedResult.stderr.trim()
+    if (untrackedResult.kind === 'timed-out') {
+      logger.warning('Brokered push reconstruction untracked-file lookup timed out and was killed')
+      return err(new Error('Unable to enumerate untracked workspace files: git timed out'))
+    }
+    if (untrackedResult.kind === 'unavailable' || untrackedResult.exitCode !== 0) {
+      const detail = untrackedResult.kind === 'completed' ? untrackedResult.stderr.trim() : 'git was unavailable'
       logger.warning('Brokered push reconstruction untracked-file lookup failed', {error: detail})
       return err(new Error(`Unable to enumerate untracked workspace files: ${detail}`.trim()))
     }
