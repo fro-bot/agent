@@ -111,6 +111,7 @@ function createActionInputs(overrides: Partial<ActionInputs> = {}): ActionInputs
     reviewSkipLabel: null,
     brokeredPushExtraPaths: [],
     repoSkills: false,
+    isolateAgent: false,
     storeConfig: {
       enabled: false,
       bucket: '',
@@ -130,6 +131,7 @@ function createBootstrapPhaseResult(overrides: Partial<BootstrapPhaseResult> = {
     responseFilePath: null,
     responseFilePathCandidates: null,
     trustedHeadSha: '',
+    sandboxTools: null,
     ...overrides,
   }
 }

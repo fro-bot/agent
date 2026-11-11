@@ -111,6 +111,8 @@ export interface ActionInputs {
   readonly brokeredPushExtraPaths: readonly string[]
   // Opt-in: admit the repository's `.agents/skills` on trusted OpenCode V2 runs (the `repo-skills` input).
   readonly repoSkills: boolean
+  // Opt-in: run the OpenCode V2 server and its tools as a separate local user (the `isolate-agent` input).
+  readonly isolateAgent: boolean
 }
 
 // Action outputs

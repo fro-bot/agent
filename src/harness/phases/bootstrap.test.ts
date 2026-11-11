@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   ensureOpenCodeAvailable: vi.fn(),
   randomUUID: vi.fn(),
   assertNoPersistedGitCredentials: vi.fn(),
+  runSandboxPreflight: vi.fn(),
 }))
 
 vi.mock('@actions/core', () => ({
@@ -51,6 +52,11 @@ vi.mock('../../services/setup/git-credential-check.js', () => ({
   assertNoPersistedGitCredentials: mocks.assertNoPersistedGitCredentials,
 }))
 
+vi.mock('../../services/setup/sandbox-preflight.js', () => ({
+  runSandboxPreflight: mocks.runSandboxPreflight,
+  createSandboxPreflightDeps: () => ({}),
+}))
+
 vi.mock('../../shared/logger.js', () => ({
   createLogger: () => ({debug: vi.fn(), info: vi.fn(), warning: vi.fn(), error: vi.fn()}),
 }))
@@ -77,6 +83,7 @@ function createActionInputs(overrides: Partial<ActionInputs> = {}): ActionInputs
     reviewSkipLabel: null,
     brokeredPushExtraPaths: [],
     repoSkills: false,
+    isolateAgent: false,
     storeConfig: {
       enabled: false,
       bucket: '',
@@ -485,5 +492,73 @@ describe('runBootstrap git-credential-check wiring', () => {
     expect(result).not.toBeNull()
     expect(result?.delivery).toBe('none')
     expect(mocks.assertNoPersistedGitCredentials).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('runBootstrap isolate-agent preflight', () => {
+  const tools = {sudo: '/usr/bin/sudo', setpriv: '/usr/bin/setpriv'}
+
+  beforeEach(async () => {
+    vi.clearAllMocks()
+    runnerTempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fro-bot-bootstrap-iso-'))
+    vi.stubEnv('RUNNER_TEMP', runnerTempDir)
+    mocks.githubContext.eventName = 'issues'
+    mocks.randomUUID.mockReturnValue('test-nonce')
+    mocks.ensureOpenCodeAvailable.mockResolvedValue({version: DEFAULT_OPENCODE_VERSION})
+    mocks.assertNoPersistedGitCredentials.mockResolvedValue(ok(undefined))
+  })
+
+  afterEach(async () => {
+    vi.restoreAllMocks()
+    vi.unstubAllEnvs()
+    await fs.rm(runnerTempDir, {recursive: true, force: true})
+  })
+
+  it('stops before any setup or directory creation when the runner is unsupported', async () => {
+    // #given isolation is on and the preflight rejects the runner
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: true})})
+    mocks.runSandboxPreflight.mockResolvedValue({
+      ok: false,
+      check: 'sudo',
+      message: 'isolate-agent is not supported on this runner (sudo): passwordless sudo is required',
+    })
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when bootstrap runs
+    const result = await runBootstrap(createMockLogger())
+
+    // #then it fails with the check's message and nothing was set up
+    expect(result).toBeNull()
+    expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('(sudo)'))
+    expect(mocks.ensureOpenCodeAvailable).not.toHaveBeenCalled()
+    expect(mocks.assertNoPersistedGitCredentials).not.toHaveBeenCalled()
+    expect(await fs.readdir(runnerTempDir)).toEqual([])
+  })
+
+  it('carries the resolved tool paths forward when the runner is supported', async () => {
+    // #given isolation is on and the preflight passes
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: true})})
+    mocks.runSandboxPreflight.mockResolvedValue({ok: true, tools})
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when bootstrap runs
+    const result = await runBootstrap(createMockLogger())
+
+    // #then setup proceeds and the tools are handed to later phases
+    expect(result?.sandboxTools).toEqual(tools)
+    expect(mocks.ensureOpenCodeAvailable).toHaveBeenCalledTimes(1)
+  })
+
+  it('runs no preflight and carries no tools when isolation is off', async () => {
+    // #given the input is off
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: false})})
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when bootstrap runs
+    const result = await runBootstrap(createMockLogger())
+
+    // #then the preflight never ran
+    expect(mocks.runSandboxPreflight).not.toHaveBeenCalled()
+    expect(result?.sandboxTools).toBeNull()
   })
 })

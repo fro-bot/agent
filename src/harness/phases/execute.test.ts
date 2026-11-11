@@ -120,6 +120,7 @@ function createBootstrap(
       reviewSkipLabel: null,
       brokeredPushExtraPaths: [],
       repoSkills: false,
+      isolateAgent: false,
     },
     logger: mocks.logger,
     opencodeResult: {path: 'opencode', version: '1.0.0'},
@@ -127,6 +128,7 @@ function createBootstrap(
     responseFilePath: overrides.responseFilePath ?? null,
     responseFilePathCandidates: null,
     trustedHeadSha: '',
+    sandboxTools: null,
   }
 }
 

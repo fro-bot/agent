@@ -154,6 +154,7 @@ function createBootstrap(): BootstrapPhaseResult {
       reviewSkipLabel: null,
       brokeredPushExtraPaths: [],
       repoSkills: false,
+      isolateAgent: false,
     },
     logger: createLogger({phase: 'test'}),
     opencodeResult: {path: 'opencode', version: '2.2.6'},
@@ -161,6 +162,7 @@ function createBootstrap(): BootstrapPhaseResult {
     responseFilePath: null,
     responseFilePathCandidates: null,
     trustedHeadSha: '',
+    sandboxTools: null,
   }
 }
 

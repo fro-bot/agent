@@ -1,5 +1,6 @@
 import type {ResponseDelivery, ResponseFilePathCandidates} from '@fro-bot/runtime'
 import type {EnsureOpenCodeResult} from '../../features/agent/types.js'
+import type {SandboxToolPaths} from '../../services/setup/sandbox-preflight.js'
 import type {Logger} from '../../shared/logger.js'
 import type {ActionInputs} from '../../shared/types.js'
 import * as crypto from 'node:crypto'
@@ -17,6 +18,7 @@ import {
 import {createExecAdapter} from '../../services/setup/adapters.js'
 import {assertNoPersistedGitCredentials} from '../../services/setup/git-credential-check.js'
 import {runtimeSetupAdapter} from '../../services/setup/runtime-setup-adapter.js'
+import {createSandboxPreflightDeps, runSandboxPreflight} from '../../services/setup/sandbox-preflight.js'
 import {getGitHubRunAttempt, getGitHubRunId} from '../../shared/env.js'
 import {createLogger} from '../../shared/logger.js'
 import {parseActionInputs} from '../config/inputs.js'
@@ -47,6 +49,11 @@ export interface BootstrapPhaseResult {
   readonly responseFilePathCandidates: ResponseFilePathCandidates | null
   /** Trusted PR head SHA captured by workflow setup; empty when brokered push is unavailable. */
   readonly trustedHeadSha: string
+  /**
+   * Absolute paths of the privileged tools the sandbox uses. Non-null iff `isolate-agent` is on and the runner passed
+   * the preflight; null means the run is not isolated.
+   */
+  readonly sandboxTools: SandboxToolPaths | null
 }
 
 export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPhaseResult | null> {
@@ -70,6 +77,18 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
     hasModelOverride: inputs.model != null,
     timeoutMs: inputs.timeoutMs,
   })
+
+  // Fail closed before any setup, credential check or directory creation: an unsupported runner leaves nothing to
+  // undo. Skipped entirely (no check, no log) when the input is off.
+  let sandboxTools: SandboxToolPaths | null = null
+  if (inputs.isolateAgent) {
+    const preflight = await runSandboxPreflight({...createSandboxPreflightDeps(createExecAdapter(), logger)})
+    if (!preflight.ok) {
+      core.setFailed(preflight.message)
+      return null
+    }
+    sandboxTools = preflight.tools
+  }
 
   // Resolved once, from the raw event name, before setup runs any credential
   // provisioning — routing later asserts its own classification agrees.
@@ -126,6 +145,7 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
     responseFilePath: responseFile?.responseFilePath ?? null,
     responseFilePathCandidates: responseFile?.responseFilePathCandidates ?? null,
     trustedHeadSha: inputs.trustedHeadSha,
+    sandboxTools,
   }
 }
 

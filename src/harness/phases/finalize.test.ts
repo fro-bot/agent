@@ -72,6 +72,7 @@ function createBootstrap(overrides: Partial<BootstrapPhaseResult> = {}): Bootstr
     responseFilePath: '/tmp/fro-bot-response.md',
     responseFilePathCandidates: null,
     trustedHeadSha: '',
+    sandboxTools: null,
     ...overrides,
   }
 }
