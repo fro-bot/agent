@@ -1,12 +1,12 @@
 /**
- * Repo workspace quiescence for an OpenCode V2 workspace: the V2 sibling of `repo-quiescence.ts`.
+ * Repo workspace quiescence for an OpenCode V2 workspace (the contract and directory resolution live in
+ * `repo-quiescence.ts`).
  *
- * V1 asked `session.status` for one directory. V2 has no per-directory status, so the busy set is the server's global
- * active list with each entry located by its stored directory (`listActiveSessionIdsInDirectoryV2`, probes P2 and P9).
- * The cost follows the sessions running on the server, not the history stored under the directory. The
- * contract is the same: only `clear` permits replacing or deleting an expired lease, `busy` and `unknown` both block,
- * and every failure (transport, non-2xx, bad shape, timeout, bad repo) resolves to `unknown`. No retries, no cached
- * clearance.
+ * V2 has no per-directory status, so the busy set is the server's global active list with each entry located by its
+ * stored directory (`listActiveSessionIdsInDirectoryV2`, probes P2 and P9). The cost follows the sessions running on
+ * the server, not the history stored under the directory. Only `clear` permits replacing or deleting an expired
+ * lease, `busy` and `unknown` both block, and every failure (transport, non-2xx, bad shape, timeout, bad repo)
+ * resolves to `unknown`. No retries, no cached clearance.
  *
  * The directory match is an exact string against the directory the session was created with, so the join uses the same
  * canonical workspace directory the run creates its sessions under (`canonicalWorkspaceDirectory`). The gateway cannot

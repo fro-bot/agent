@@ -145,7 +145,7 @@ export interface StatusSink {
    *   the reply sink to deliver the answer.
    *
    * Maps to `statusController.resolveToAnswer(text)` in the Discord adapter.
-   * Called by the engine after `runOpenCodeCore` succeeds (`:608` in `run.ts`).
+   * Called by the engine after `runOpenCodeCoreV2` succeeds (`:608` in `run.ts`).
    */
   readonly resolveToAnswer: (text: string) => Promise<TransitionResult>
 
@@ -176,7 +176,7 @@ export interface StatusSink {
    * Called at four points in the engine:
    * - `'working'`          after EXECUTING transition (`:370`)
    * - `'awaiting-approval'` when an approval is pending (`:465`)
-   * - `'succeeded'`        after `runOpenCodeCore` completes (`:574`)
+   * - `'succeeded'`        after `runOpenCodeCoreV2` completes (`:574`)
    * - `'failed'`           in the error path (`:635`)
    */
   readonly setReaction: (state: RunReactionState) => void
@@ -242,7 +242,7 @@ export interface ReplySink {
    * transports that post such a placeholder; a web sink still pushes its terminal output frame.
    *
    * Maps to `sink.flush(options)` in the Discord adapter.
-   * Called after `runOpenCodeCore` completes (`:610` in `run.ts`).
+   * Called after `runOpenCodeCoreV2` completes (`:610` in `run.ts`).
    */
   readonly flush: (options?: {readonly suppressEmptyNotice?: boolean}) => Promise<unknown>
 

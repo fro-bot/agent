@@ -1,5 +1,5 @@
 /**
- * Remote-attach client for an OpenCode V2 workspace: the V2 sibling of `opencode-attach.ts`.
+ * Remote-attach client for an OpenCode V2 workspace.
  *
  * Injects the workspace bearer token as an `Authorization` header on every request, including the SSE `/event`
  * subscription. The proxy swaps it for the server's own credentials.

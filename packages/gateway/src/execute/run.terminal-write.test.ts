@@ -7,7 +7,7 @@ import {
   buildMockRunState,
   makeDeps,
   makeInMemoryRequest,
-  mockRunOpenCodeCore,
+  mockRunOpenCodeCoreV2,
   mockRuntime,
   setupHappyPath,
 } from './test-helpers.js'
@@ -105,7 +105,7 @@ describe('terminal RunState writes retry', () => {
     // #given
     setupHappyPath()
     failTerminal('FAILED', 2)
-    mockRunOpenCodeCore.mockRejectedValue(new runCoreModule.RunCoreError('timeout', 'timed out'))
+    mockRunOpenCodeCoreV2.mockRejectedValue(new runCoreModule.RunCoreError('timeout', 'timed out'))
     const logger = makeLogger()
     const deps = makeDeps({coordinationConfig: configStoring('EXECUTING'), logger})
 
@@ -121,7 +121,7 @@ describe('terminal RunState writes retry', () => {
     // #given every FAILED write fails
     setupHappyPath()
     failTerminal('FAILED', Number.POSITIVE_INFINITY)
-    mockRunOpenCodeCore.mockRejectedValue(new runCoreModule.RunCoreError('timeout', 'timed out'))
+    mockRunOpenCodeCoreV2.mockRejectedValue(new runCoreModule.RunCoreError('timeout', 'timed out'))
     const {launchWork} = await import('./run.js')
     const deps = makeDeps({coordinationConfig: configStoring('EXECUTING')})
 
@@ -150,7 +150,7 @@ describe('terminal RunState writes retry', () => {
     // #given every FAILED write loses
     setupHappyPath()
     failTerminal('FAILED', Number.POSITIVE_INFINITY)
-    mockRunOpenCodeCore.mockRejectedValue(new runCoreModule.RunCoreError('timeout', 'timed out'))
+    mockRunOpenCodeCoreV2.mockRejectedValue(new runCoreModule.RunCoreError('timeout', 'timed out'))
     const logger = makeLogger()
     const pushDispatcher = {
       dispatchApprovalPending: vi.fn().mockResolvedValue(undefined),
@@ -183,7 +183,7 @@ describe('terminal RunState writes retry', () => {
     // #given another writer already completed the run
     setupHappyPath()
     failTerminal('FAILED', Number.POSITIVE_INFINITY)
-    mockRunOpenCodeCore.mockRejectedValue(new runCoreModule.RunCoreError('timeout', 'timed out'))
+    mockRunOpenCodeCoreV2.mockRejectedValue(new runCoreModule.RunCoreError('timeout', 'timed out'))
     const request = makeInMemoryRequest()
     const deps = makeDeps({coordinationConfig: configStoring('COMPLETED')})
 
@@ -205,7 +205,7 @@ describe('terminal RunState writes retry', () => {
         data: {etag: 'etag-after', state: buildMockRunState({phase: args[4] as 'FAILED'})},
       }
     })
-    mockRunOpenCodeCore.mockRejectedValue(new runCoreModule.RunCoreError('timeout', 'timed out'))
+    mockRunOpenCodeCoreV2.mockRejectedValue(new runCoreModule.RunCoreError('timeout', 'timed out'))
     const request = makeInMemoryRequest()
     const deps = makeDeps({coordinationConfig: configStoring('EXECUTING')})
     const {launchWork} = await import('./run.js')
@@ -266,7 +266,7 @@ describe('terminal RunState writes retry', () => {
     // #given the barrier could not confirm owned work stopped, and every FAILED write loses
     setupHappyPath()
     failTerminal('FAILED', Number.POSITIVE_INFINITY)
-    mockRunOpenCodeCore.mockRejectedValue(new runCoreModule.RunCoreError('session-error', 'quota exceeded', true))
+    mockRunOpenCodeCoreV2.mockRejectedValue(new runCoreModule.RunCoreError('session-error', 'quota exceeded', true))
     const pushDispatcher = {
       dispatchApprovalPending: vi.fn().mockResolvedValue(undefined),
       dispatchRunFailed: vi.fn().mockResolvedValue(undefined),

@@ -1,13 +1,11 @@
 /**
- * Drain-completion gate for a gateway run that adopted background work, on OpenCode V2: the sibling of
- * `drain-completion.ts`.
+ * Drain-completion gate for a gateway run that adopted background work, on OpenCode V2.
  *
  * Why it exists is unchanged. A background child finishes, the server queues a notice for the PARENT, and the parent
  * runs again to take it in (probe P2: `started, succeeded, started, succeeded` about 0.8 s apart). So the first root
  * idle after a dispatch is not terminal, and a settled ledger alone is not completion.
  *
- * What differs is the evidence. V1 had to reconstruct the root's state from REST message lists. V2 publishes the root's
- * executions on the stream (`session.execution.started` / `succeeded`) and says when a queued inbox item enters a turn
+ * The evidence is the stream. V2 publishes the root's executions on the stream (`session.execution.started` / `succeeded`) and says when a queued inbox item enters a turn
  * (`session.inbox.delivered`), so the gate keeps that state itself. Success is admitted only when ALL of these hold at one
  * commit point:
  * - the ledger reports drain-complete (`unknown` still blocks, exactly as before);

@@ -367,7 +367,7 @@ describe('approval flow — cross-seam integration', () => {
   //
   // These exercise the registry/coordinator seam directly, below run-core's
   // ownership-routing gate. In production only an owned session's events
-  // reach `coordinator.onPermissionAsked` at all (run-core.test.ts covers that
+  // reach `coordinator.onPermissionAsked` at all (run-core-v2.test.ts covers that
   // gate); here SESSION_A models a run's root and SESSION_B/SESSION_C model
   // two descendant sessions already adopted by that same run, to prove the
   // registry settles each independently regardless of which session in the

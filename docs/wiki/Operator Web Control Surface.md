@@ -5,22 +5,18 @@ updated-by: "f7c20f94"
 sources:
   - packages/gateway/src/execute/permission-detail-v2.ts
   - packages/gateway/src/execute/run-core-v2.ts
-  - packages/gateway/src/execute/opencode-generation.ts
   - packages/gateway/src/execute/drain-completion-v2.ts
   - packages/gateway/src/execute/settle-owned-sessions-v2.ts
   - packages/gateway/src/execute/question-client-v2.ts
-  - packages/gateway/src/execute/permission-reply-v1.ts
   - packages/gateway/src/execute/permission-reply-v2.ts
   - packages/gateway/src/execute/stranded-run-sweep.ts
   - packages/gateway/src/approvals/run-grants.ts
   - packages/gateway/src/approvals/coordinator.ts
   - packages/runtime/src/agent/directory-quiescence-v2.ts
   - packages/gateway/src/execute/run.ts
-  - packages/gateway/src/execute/run-core.ts
-  - packages/gateway/src/execute/drain-completion.ts
   - packages/gateway/src/execute/wait-reason-registry.ts
   - packages/gateway/src/operator-contract/wait-reason.ts
-  - packages/gateway/src/execute/provider-failure.ts
+  - packages/gateway/src/execute/provider-failure-v2.ts
   - packages/gateway/src/execute/provenance.ts
   - packages/gateway/src/execute/preparation-reply.ts
   - packages/gateway/src/execute/checkout-recovery.ts
@@ -76,7 +72,6 @@ sources:
   - packages/runtime/src/net/ip-classification.ts
   - packages/gateway/src/web/operator-push/dedupe-cache.ts
   - packages/gateway/src/web/operator-push/config-keys.ts
-  - packages/gateway/src/web/audit.ts
   - packages/gateway/src/program.ts
   - docs/privacy/operator-push-retention.md
   - packages/gateway/src/operator-contract/identity.ts
@@ -206,9 +201,9 @@ Recovery preserves the whole checkout against the five-generation/10 GiB retenti
 
 ### Browser launch
 
-The operator contract does not select the OpenCode generation. For every admitted run the gateway reads workspace readiness and chooses the V1 or V2 core loop from `opencodeVersion`; a missing version preserves V1 compatibility and an unreadable version blocks execution. V2 maps native permission and form requests onto the same approval/question registries, so browser authorization and decision routes remain shared.
+The operator contract does not select the OpenCode version. For every admitted run the gateway reads workspace readiness and admits it only when `opencodeVersion` is major 2 or higher; a missing, older or unreadable version is not ready, and no run is admitted. Native permission and form requests map onto the shared approval/question registries, so browser authorization and decision routes are shared.
 
-The Action's stock V2 default is independent of this selection. The workspace image still defaults to the V1 harness build, and an operator deployment changes generation through its image version rather than inheriting the Action's default pin. [[Setup and Configuration]] describes the separate installation boundaries.
+The workspace image takes its OpenCode version from the required `OPENCODE_VERSION` build-arg, which must equal the pin in `packages/runtime/src/shared/opencode-v2-pin.json`; a build without it fails. [[Setup and Configuration]] describes the separate installation boundaries.
 
 `POST /operator/runs` (`web/operator/launch-route.ts`) is a fire-and-return endpoint: the operator submits a repository and a prompt, and the server responds `202` with a `runId` almost immediately, leaving the operator to observe progress over SSE. Before anything launches, the request passes an ordered gauntlet: the browser guard, an operator-keyed rate limit, session identity resolution, body validation, the prompt checks (below), **server-owned binding resolution** (the client names a repo but the server resolves the actual binding — client-supplied paths or owners are ignored) followed by the denylist check, both inside the single repo-access predicate, and finally a per-operator idempotency guard.
 
@@ -394,7 +389,7 @@ When an agent calls OpenCode's `question` tool, OpenCode emits `question.asked` 
 
 **Mandatory deadline.** A question registers with a positive deadline or not at all. The coordinator derives it at ask time from the budget the run has left (`computeApprovalDeadlineMs`: at least 60 s, at most half the remaining budget, 30 s clear of the hard abort, capped at 13 minutes). When the run has 90 s or less left, the question is skipped immediately with an empty reply rather than registered, because an entry with no deadline would block the agent until the hard abort. The deadline is a skip, so an unanswered question never fails the run.
 
-**Human-wait gauge and drain.** `run-core.ts` keeps a gauge of request ids a human still has to settle, approvals and questions alike. The inactivity watchdog is paused while the gauge is non-empty and re-armed with a fresh window only when the last id is released. The guard lives in the one re-arm path (`resetInactivity`), so activity (text deltas, tool completions, an owned child, a parallel tool) never re-arms the watchdog while any wait is held or while the run drains; only releasing the last wait outside drain does. Release comes from OpenCode's echo and from the gate's per-request terminal notification (`requestGate.onTerminal`), which also fires for settlements that produce no echo: deadline skip, failed reply, teardown. Both directions are idempotent by request id, and a skipped-without-registering question releases its own wait. The gauge never influences drain: human waits are independent of completion, which requires ledger settlement, each child's notice or cancel evidence, and root freshness (see the drain-completion gate in [[Background Subagents and Ownership]]). While draining, a release neither re-arms the watchdog nor completes the drain: the watchdog stays paused and the run deadline (or a cancel) is the only bound, so a quiet but valid background child is never aborted as a `drain-timeout` by the inactivity timer. A root `question` call blocks inside the root runner, and a foreground child keeps the root blocked on its `task` tool, so root idle with a question pending can only mean an owned background child, which the ledger already holds. A question still pending when the run completes is rejected by run teardown. The event stream has its own silence watchdog, which the gauge never pauses: 30 seconds with no event at all, heartbeats included, ends the run as `stream-ended` even while an approval or question is pending, and the pending request is rejected as the termination barrier starts, before any root abort.
+**Human-wait gauge and drain.** `run-core-v2.ts` keeps a gauge of request ids a human still has to settle, approvals and questions alike. The inactivity watchdog is paused while the gauge is non-empty and re-armed with a fresh window only when the last id is released. The guard lives in the one re-arm path (`resetInactivity`), so activity (text deltas, tool completions, an owned child, a parallel tool) never re-arms the watchdog while any wait is held or while the run drains; only releasing the last wait outside drain does. Release comes from OpenCode's echo and from the gate's per-request terminal notification (`requestGate.onTerminal`), which also fires for settlements that produce no echo: deadline skip, failed reply, teardown. Both directions are idempotent by request id, and a skipped-without-registering question releases its own wait. The gauge never influences drain: human waits are independent of completion, which requires a drained ledger, delivered notices, current root idle evidence and a quiet directory (see the drain-completion gate in [[Background Subagents and Ownership]]). While draining, a release neither re-arms the watchdog nor completes the drain: the watchdog stays paused and the run deadline (or a cancel) is the only bound, so a quiet but valid background child is never aborted as a `drain-timeout` by the inactivity timer. A root `question` call blocks inside the root runner, and a foreground child keeps the root blocked on its `task` tool, so root idle with a question pending can only mean an owned background child, which the ledger already holds. A question still pending when the run completes is rejected by run teardown. The event stream has its own silence watchdog, which the gauge never pauses: 30 seconds with no event at all, heartbeats included, ends the run as `stream-ended` even while an approval or question is pending, and the pending request is rejected as the termination barrier starts, before any root abort.
 
 **Teardown.** Each registry disposes only its own family (`disposeRun` / `disposeAll`); the run's approval coordinator and question coordinator each tear down their own entries (the termination barrier starts that teardown before it aborts the root, and the run's final cleanup runs it again, idempotently), and gateway shutdown uses the gate's explicit `disposeAllAcrossFamilies`. A question or approval whose reply POST is still in flight when it is torn down leaves the gate at once; if that reply then fails, the request is rejected once (a question `reject`, a permission `reject` reply — otherwise it would stay pending in OpenCode with no owner), and if it succeeds nothing more is sent. Recovery has one owner: when the deadline had already expired during the claim, the gate's own deadline fail-close (flagged `recoveryStarted` on the entry) already sends the family's deadline reply, so the family sends no second reply; a teardown that lands mid-fail-close also leaves the render and the single terminal event to `retire`. Callers reach the gate only through whole lifecycle operations (`put`, `admit` → `submit`, `settleEcho`, `settleNow`, `retire`); no caller can clear a timer, remove an entry, or emit the terminal notification on its own.
 

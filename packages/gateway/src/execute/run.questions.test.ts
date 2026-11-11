@@ -1,4 +1,6 @@
+import type {V2FormField} from '@fro-bot/runtime'
 import type {QuestionCoordinator} from '../approvals/question-coordinator.js'
+import type {FormDirectoryV2} from './question-client-v2.js'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 /* eslint-disable perfectionist/sort-imports -- ./test-helpers.js must import before any real module
    it mocks, to register vi.mock() side effects before those modules are evaluated */
@@ -10,41 +12,39 @@ import {
   makeInMemoryRequest,
   makeMessage,
   makeThread,
-  mockRunOpenCodeCore,
+  mockRunOpenCodeCoreV2,
   mockRuntime,
   setupHappyPath,
 } from './test-helpers.js'
 import {createQuestionRegistry} from '../approvals/question-registry.js'
 import {createRequestGate} from '../approvals/request-gate.js'
 import {abortRegistry} from './abort-registry.js'
-import * as attachModule from './opencode-attach.js'
+import * as attachModule from './opencode-attach-v2.js'
 import * as runCoreModule from './run-core-shared.js'
 /* eslint-enable perfectionist/sort-imports */
 
 // ---------------------------------------------------------------------------
 // Question bridging — run.ts wiring: the shared gate reaches the run, the
-// effects are built from a v2 client that mirrors the v1 handle's URL, auth and
-// canonical directory, and pending questions are rejected at teardown.
+// effects answer the run's forms on its V2 client, and pending questions are
+// rejected at teardown.
 // ---------------------------------------------------------------------------
-
-const mockCreateV2Client = vi.hoisted(() => vi.fn())
-vi.mock('@opencode-ai/sdk/v2/client', () => ({
-  createOpencodeClient: (...args: unknown[]): unknown => mockCreateV2Client(...args),
-}))
 
 const ANY_SIGNAL: unknown = expect.any(AbortSignal)
 const ANY_STRING: unknown = expect.any(String)
 const ANY_FUNCTION: unknown = expect.any(Function)
 const ANY_SINK: unknown = expect.objectContaining({send: ANY_FUNCTION})
 
-const CANONICAL_DIRECTORY = '/workspace/repos/acme/widget'
 const WIRE_RUN_ID = 'question-run-id-1'
 const SECRET_TEXT = 'S3CRET-HOOK-ERROR'
 
+/** The run's V2 client: a question is a form, answered with `replyForm` and dismissed with `cancelForm`. */
 function makeV2Client() {
-  const reply = vi.fn().mockResolvedValue({data: true, error: undefined})
-  const reject = vi.fn().mockResolvedValue({data: true, error: undefined})
-  mockCreateV2Client.mockReturnValue({question: {reply, reject}})
+  const reply = vi.fn().mockResolvedValue({success: true as const, data: undefined})
+  const reject = vi.fn().mockResolvedValue({success: true as const, data: undefined})
+  vi.mocked(attachModule.attachOpencodeV2).mockReturnValue({
+    replyForm: reply,
+    cancelForm: reject,
+  } as unknown as ReturnType<typeof attachModule.attachOpencodeV2>)
   return {reply, reject}
 }
 
@@ -61,11 +61,27 @@ const ASKED = {
   questions: [{question: 'Which environment?', header: 'Env', options: [], multiple: false, custom: true}],
 } as const
 
-/** The question coordinator `run.ts` handed to `runOpenCodeCore`. */
+const ASKED_FIELDS: readonly V2FormField[] = [
+  {key: 'q0', type: 'string', title: 'Env', description: 'Which environment?', options: []},
+]
+
+/** What the run loop records for an open question form, so the effects can answer it. */
+function rememberAsked(forms: FormDirectoryV2 | undefined): void {
+  if (forms === undefined) throw new Error('runOpenCodeCoreV2 received no form directory')
+  forms.remember('que_1', {sessionId: 'sess-1', fields: ASKED_FIELDS})
+}
+
+/** The question coordinator `run.ts` handed to `runOpenCodeCoreV2`. */
 function capturedQuestions(): QuestionCoordinator {
-  const params = mockRunOpenCodeCore.mock.calls[0]?.[0]
-  if (params?.questions === undefined) throw new Error('runOpenCodeCore received no question coordinator')
+  const params = mockRunOpenCodeCoreV2.mock.calls[0]?.[0]
+  if (params?.questions === undefined) throw new Error('runOpenCodeCoreV2 received no question coordinator')
   return params.questions
+}
+
+/** Ask `ASKED` the way the run loop does: record its form, then hand it to the coordinator. */
+async function ask(asked: Parameters<QuestionCoordinator['onAsked']>[0] = ASKED) {
+  rememberAsked(mockRunOpenCodeCoreV2.mock.calls[0]?.[0]?.forms)
+  return capturedQuestions().onAsked(asked)
 }
 
 describe('run question wiring', () => {
@@ -74,7 +90,7 @@ describe('run question wiring', () => {
     abortRegistry.delete(WIRE_RUN_ID)
   })
 
-  it('passes the question coordinator and the gate subscription to runOpenCodeCore', async () => {
+  it('passes the question coordinator and the gate subscription to runOpenCodeCoreV2', async () => {
     // #given deps carrying the shared registry and gate
     const {runMention} = await import('./run.js')
     setupHappyPath()
@@ -85,7 +101,7 @@ describe('run question wiring', () => {
     await runMention(makeMessage(), makeBinding(), deps)
 
     // #then
-    const params = mockRunOpenCodeCore.mock.calls[0]?.[0]
+    const params = mockRunOpenCodeCoreV2.mock.calls[0]?.[0]
     expect(params?.questions).toBeDefined()
     expect(params?.onHumanWaitTerminal).toBe(requestGate.onTerminal)
   })
@@ -99,13 +115,12 @@ describe('run question wiring', () => {
     await runMention(makeMessage(), makeBinding(), makeDeps())
 
     // #then
-    const params = mockRunOpenCodeCore.mock.calls[0]?.[0]
+    const params = mockRunOpenCodeCoreV2.mock.calls[0]?.[0]
     expect(params?.questions).toBeUndefined()
     expect(params?.onHumanWaitTerminal).toBeUndefined()
-    expect(mockCreateV2Client).not.toHaveBeenCalled()
   })
 
-  it('builds the v2 client with the v1 handle URL and bearer header', async () => {
+  it('attaches the V2 client with the workspace URL and bearer token', async () => {
     // #given
     const {runMention} = await import('./run.js')
     setupHappyPath()
@@ -115,15 +130,14 @@ describe('run question wiring', () => {
     // #when
     await runMention(makeMessage(), makeBinding(), deps)
 
-    // #then the v1 handle and the v2 client were built from the same URL and token
-    expect(attachModule.attachOpencode).toHaveBeenCalledExactlyOnceWith('http://workspace:9200', 'secret-bearer-token')
-    expect(mockCreateV2Client).toHaveBeenCalledExactlyOnceWith({
-      baseUrl: 'http://workspace:9200',
-      headers: {Authorization: 'Bearer secret-bearer-token'},
-    })
+    // #then
+    expect(attachModule.attachOpencodeV2).toHaveBeenCalledExactlyOnceWith(
+      'http://workspace:9200',
+      'secret-bearer-token',
+    )
   })
 
-  it('effects: skip calls the v2 question.reply endpoint with the canonical directory', async () => {
+  it('effects: skip replies to the form with no answers', async () => {
     // #given a question registered through the run's coordinator
     const {runMention} = await import('./run.js')
     setupHappyPath()
@@ -131,7 +145,7 @@ describe('run question wiring', () => {
     const thread = makeThread()
     const {deps, questionRegistry} = makeQuestionDeps()
     await runMention(makeMessage(thread), makeBinding(), deps)
-    await expect(capturedQuestions().onAsked(ASKED)).resolves.toBe('registered')
+    await expect(ask()).resolves.toBe('registered')
 
     // #when an operator skips it
     const outcome = await questionRegistry.decide({
@@ -141,15 +155,14 @@ describe('run question wiring', () => {
       actor: {kind: 'discord-user', userId: 'user-1'},
     })
 
-    // #then the reply carries the request id, one empty answer, and the canonical (not stored) directory
+    // #then the reply carries the asking session, the form id and an empty answer
     expect(outcome).toEqual({kind: 'ok'})
     expect(reply).toHaveBeenCalledExactlyOnceWith(
-      {requestID: 'que_1', directory: CANONICAL_DIRECTORY, answers: [[]]},
-      expect.objectContaining({signal: ANY_SIGNAL}),
+      expect.objectContaining({sessionId: 'sess-1', formId: 'que_1', answer: {}, signal: ANY_SIGNAL}),
     )
   })
 
-  it('effects: a Discord run binds the question to its thread; the answer reaches question.reply', async () => {
+  it('effects: a Discord run binds the question to its thread; the answer reaches the form', async () => {
     // #given
     const {runMention} = await import('./run.js')
     setupHappyPath()
@@ -157,7 +170,7 @@ describe('run question wiring', () => {
     const thread = makeThread()
     const {deps, questionRegistry} = makeQuestionDeps()
     await runMention(makeMessage(thread), makeBinding(), deps)
-    await capturedQuestions().onAsked({
+    await ask({
       ...ASKED,
       questions: [
         {question: 'Pick', header: 'P', options: [{label: 'a', description: ''}], multiple: false, custom: false},
@@ -177,21 +190,20 @@ describe('run question wiring', () => {
 
     // #then
     expect(reply).toHaveBeenCalledExactlyOnceWith(
-      {requestID: 'que_1', directory: CANONICAL_DIRECTORY, answers: [['a']]},
-      expect.anything(),
+      expect.objectContaining({sessionId: 'sess-1', formId: 'que_1', answer: {q0: 'a'}}),
     )
   })
 
-  it('effects: a response.error from question.reply is an error result, never a throw', async () => {
-    // #given the endpoint reports an error in the response envelope
+  it('effects: a failed form reply is an error result, never a throw', async () => {
+    // #given the reply fails
     const {runMention} = await import('./run.js')
     setupHappyPath()
     const {reply} = makeV2Client()
-    reply.mockResolvedValue({data: undefined, error: {name: 'NotFoundError', data: {message: 'secret answer text'}}})
+    reply.mockResolvedValue({success: false as const, error: {kind: 'http', status: 404}})
     const thread = makeThread()
     const {deps, questionRegistry, logger} = makeQuestionDeps()
     await runMention(makeMessage(thread), makeBinding(), deps)
-    await capturedQuestions().onAsked(ASKED)
+    await ask()
 
     // #when
     const outcome = await questionRegistry.decide({
@@ -201,7 +213,7 @@ describe('run question wiring', () => {
       actor: {kind: 'discord-user', userId: 'user-1'},
     })
 
-    // #then the gate sees a failed reply (claim released), and no SDK error text reached the logs
+    // #then the gate sees a failed reply (claim released), and no response text reached the logs
     expect(outcome).toEqual({kind: 'reply-failed'})
     expect(questionRegistry.describePendingForScope(thread.id)).toHaveLength(1)
     expect(JSON.stringify(logger.error.mock.calls) + JSON.stringify(logger.warn.mock.calls)).not.toContain(
@@ -209,13 +221,14 @@ describe('run question wiring', () => {
     )
   })
 
-  it('teardown after run-core throws rejects the pending question via question.reject with the canonical directory', async () => {
+  it('teardown after the run loop throws cancels the pending question’s form', async () => {
     // #given a question registered during a run that then fails
     const {runMention} = await import('./run.js')
     setupHappyPath()
     const {reject, reply} = makeV2Client()
     const {deps, questionRegistry} = makeQuestionDeps()
-    mockRunOpenCodeCore.mockImplementation(async params => {
+    mockRunOpenCodeCoreV2.mockImplementation(async params => {
+      rememberAsked(params.forms)
       await params.questions?.onAsked(ASKED)
       throw new runCoreModule.RunCoreError('timeout', 'boom')
     })
@@ -225,8 +238,7 @@ describe('run question wiring', () => {
 
     // #then the question was rejected (ending the turn), not skipped, and left the registry
     expect(reject).toHaveBeenCalledExactlyOnceWith(
-      {requestID: 'que_1', directory: CANONICAL_DIRECTORY},
-      expect.objectContaining({signal: ANY_SIGNAL}),
+      expect.objectContaining({sessionId: 'sess-1', formId: 'que_1', signal: ANY_SIGNAL}),
     )
     expect(reply).not.toHaveBeenCalled()
     expect(questionRegistry.pending()).toEqual([])
@@ -238,7 +250,8 @@ describe('run question wiring', () => {
     setupHappyPath()
     const {reject} = makeV2Client()
     const {deps, questionRegistry} = makeQuestionDeps()
-    mockRunOpenCodeCore.mockImplementation(async params => {
+    mockRunOpenCodeCoreV2.mockImplementation(async params => {
+      rememberAsked(params.forms)
       await params.questions?.onAsked(ASKED)
     })
 
@@ -260,7 +273,8 @@ describe('run question wiring', () => {
       success: true as const,
       data: {etag: 'etag-x', state: cancelledState},
     })
-    mockRunOpenCodeCore.mockImplementation(async params => {
+    mockRunOpenCodeCoreV2.mockImplementation(async params => {
+      rememberAsked(params.forms)
       await params.questions?.onAsked(ASKED)
       abortRegistry.abort(WIRE_RUN_ID, 'operator cancel', {
         kind: 'web-operator',
@@ -279,10 +293,7 @@ describe('run question wiring', () => {
     await awaitLaunchWorkRun(launchWork, request, deps)
 
     // #then
-    expect(reject).toHaveBeenCalledExactlyOnceWith(
-      {requestID: 'que_1', directory: CANONICAL_DIRECTORY},
-      expect.anything(),
-    )
+    expect(reject).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({sessionId: 'sess-1', formId: 'que_1'}))
     expect(questionRegistry.pending()).toEqual([])
     const phases = mockRuntime.transitionRun.mock.calls.map((call: unknown[]) => call[4] as string)
     expect(phases).toContain('CANCELLED')
@@ -303,7 +314,7 @@ describe('run question wiring', () => {
     await runMention(makeMessage(), makeBinding(), {...deps, createQuestionOnRegistered})
 
     // #when the run's coordinator registers a question
-    await capturedQuestions().onAsked(ASKED)
+    await ask()
 
     // #then the hook was built once with the run's id and repo, and ran after registration
     expect(createQuestionOnRegistered).toHaveBeenCalledExactlyOnceWith(
@@ -334,7 +345,7 @@ describe('run question wiring', () => {
     await runMention(makeMessage(), makeBinding(), {...deps, createQuestionOnRegistered})
 
     // #when
-    const outcome = await capturedQuestions().onAsked(ASKED)
+    const outcome = await ask()
 
     // #then still registered, and the log carries no error text
     expect(outcome).toBe('registered')
@@ -357,8 +368,8 @@ describe('run question wiring', () => {
     await runMention(makeMessage(), makeBinding(), {...deps, operatorPushDispatcher})
 
     // #when a question registers, then the same id is asked again
-    await capturedQuestions().onAsked(ASKED)
-    await capturedQuestions().onAsked(ASKED)
+    await ask()
+    await ask()
 
     // #then one push, carrying only the run id — never the request id or any text
     expect(dispatchQuestionPending).toHaveBeenCalledExactlyOnceWith(expect.any(String))
@@ -387,7 +398,7 @@ describe('run question wiring', () => {
     })
 
     // #when
-    const outcome = await capturedQuestions().onAsked(ASKED)
+    const outcome = await ask()
 
     // #then no human wait begins, so no announcement and no nudge
     expect(outcome).toBe('skipped')
@@ -411,7 +422,7 @@ describe('run question wiring', () => {
     })
 
     // #when / #then
-    await expect(capturedQuestions().onAsked(ASKED)).resolves.toBe('registered')
+    await expect(ask()).resolves.toBe('registered')
   })
 
   it('computes the question deadline from the budget left when the question is asked', async () => {
@@ -424,13 +435,12 @@ describe('run question wiring', () => {
     await runMention(makeMessage(), makeBinding(), shortDeps)
 
     // #when a question is asked
-    const outcome = await capturedQuestions().onAsked(ASKED)
+    const outcome = await ask()
 
     // #then it is skipped immediately (empty reply) instead of registered
     expect(outcome).toBe('skipped')
     expect(reply).toHaveBeenCalledExactlyOnceWith(
-      {requestID: 'que_1', directory: CANONICAL_DIRECTORY, answers: [[]]},
-      expect.anything(),
+      expect.objectContaining({sessionId: 'sess-1', formId: 'que_1', answer: {}}),
     )
     expect(questionRegistry.pending()).toEqual([])
   })

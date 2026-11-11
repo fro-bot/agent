@@ -10,7 +10,6 @@ sources:
   - src/features/agent/execution-deadline.ts
   - packages/gateway/src/execute/run-core-shared.ts
   - src/harness/phases/release-v2.ts
-  - packages/gateway/src/execute/opencode-generation.ts
   - packages/gateway/src/execute/run-core-v2.ts
   - packages/gateway/src/approvals/run-grants.ts
   - packages/opencode-plugin/src/index.ts
@@ -25,8 +24,7 @@ sources:
   - packages/runtime/src/agent/ownership-ledger.ts
   - packages/runtime/src/agent/ledger-reconcile.ts
   - packages/runtime/src/coordination/run-state.ts
-  - packages/gateway/src/execute/run-core.ts
-  - packages/gateway/src/execute/settle-owned-sessions.ts
+  - packages/gateway/src/execute/settle-owned-sessions-v2.ts
   - packages/gateway/src/execute/recovery.ts
   - src/harness/config/state-keys.ts
   - src/services/cache/save.ts
@@ -42,7 +40,6 @@ sources:
   - packages/gateway/src/main.ts
   - packages/gateway/src/execute/run.ts
   - packages/gateway/src/execute/checkout-recovery.ts
-  - apps/workspace-agent/src/opencode-proxy.ts
   - packages/runtime/src/object-store/settings.ts
   - packages/runtime/src/repo/slug.ts
   - packages/gateway/src/http/server.ts
@@ -65,7 +62,6 @@ sources:
   - packages/harness/harness.config.json
   - apps/workspace-agent/src/main.ts
   - apps/workspace-agent/src/server.ts
-  - apps/workspace-agent/src/opencode-server.ts
   - apps/workspace-agent/src/update.ts
   - apps/workspace-agent/src/recover.ts
   - apps/workspace-agent/src/journal.ts
@@ -117,13 +113,13 @@ All layers may also import from `@fro-bot/runtime`, which is treated as a peer d
 
 ### OpenCode generation boundary
 
-The Action runs OpenCode V2 only. `packages/runtime/src/session/generation.ts` still selects V2 for a parsed major version of two or higher, and the gateway and workspace still use it until their own cut. The Action's input parser rejects a V1 `opencode-version` before setup (`parseOpenCodeVersion`), and the execution backend is the `ExecutionBackend` contract in `src/harness/phases/execute-v2.ts`. The Action's only version is the digest-verified stock V2 pin; to keep running V1, pin the Action to its last pre-cut release (`fro-bot/agent@v0.137.0`). The workspace image still defaults to the V1 harness build, independently of the Action.
+The Action, the gateway and the workspace image run OpenCode V2 only. The Action's input parser rejects a V1 `opencode-version` before setup (`parseOpenCodeVersion`), and the execution backend is the `ExecutionBackend` contract in `src/harness/phases/execute-v2.ts`. The Action's only version is the digest-verified stock V2 pin. The gateway admits a run only when the workspace reports a major-2-or-higher `opencodeVersion`, and the workspace image refuses to build or start on anything else. To keep running V1, pin the Action to its last pre-cut release (`fro-bot/agent@v0.137.0`) and redeploy the previous image pair from GHCR.
 
 V2 uses authenticated `/api/` routes, its event envelope, active sessions, forms, shell jobs, and queued session inboxes. The shared V2 primitives normalize these into the harness's activity and ownership vocabulary. In particular, V2 release requires a stable, quiet directory, rather than an empty ownership ledger alone; see [[Background Subagents and Ownership]].
 
 ### Action entry points
 
-Shared execution policy no longer lives inside V1 implementation modules. The Action's deadline is in `src/features/agent/execution-deadline.ts`, and classified attempt results are in `attempt-outcome.ts`; the gateway's common sink, error, and ledger-hook contracts are in `packages/gateway/src/execute/run-core-shared.ts`. Both generations consume these boundaries without making the V2 path depend on the V1 core loop.
+Shared execution policy no longer lives inside V1 implementation modules. The Action's deadline is in `src/features/agent/execution-deadline.ts`, and classified attempt results are in `attempt-outcome.ts`; the gateway's common sink, error, and ledger-hook contracts are in `packages/gateway/src/execute/run-core-shared.ts`. The Action and the gateway consume these boundaries.
 
 The action defines two Node 24 entry points in `action.yaml`:
 
@@ -148,9 +144,9 @@ The Discord gateway (`@fro-bot/gateway`) is a long-running daemon that bridges D
 
 **Discord** (`discord/`) — Client lifecycle wrapper (`client.ts`), slash command registry (`commands/`), mention handler (`mentions.ts`), channel helpers (`channels.ts`), presence updates (`presence.ts`), and streaming (`streaming.ts`). The streaming module relays OpenCode event output back into the Discord thread as the run progresses. The `/fro-bot` parent command hosts subcommands built through a shared guild-command factory (`guild-command.ts`) that owns the defer → guild-guard → authorize → work → failure-reply pipeline: `ping`, `add-project` (bind a repo to a channel), `clear-queue`, `cancel` (request cancellation of the executing run for the channel or run thread; see [[Operator Web Control Surface#Cancelling a Run]]), and `force-release-lock`. A `dispatch` subcommand (`commands/dispatch.ts`) is deliberately different from the mention path — instead of entering the gateway's per-channel queue or acquiring a local execution slot, it only asks GitHub Actions to accept a `workflow_dispatch` for the channel's bound repository and reports back the accepted run link. That request is issued through the gateway's GitHub App client and dispatch helper (`github/app-client.ts`, `github/dispatch.ts`), so a Discord operator can kick off an autonomous Action run without the gateway itself executing it.
 
-**Execute** (`execute/`) — The agent-execution pipeline triggered by an `@fro-bot` mention or a web launch. `run.ts` orchestrates the full run: acquires the coordination lock, creates a run-state record with heartbeat, and delegates to `run-core.ts` for session creation, prompt send, and event-stream routing. `opencode-attach.ts` connects to the remote OpenCode server, `prompt.ts` builds the Discord prompt, `concurrency.ts` enforces per-channel run limits via a serial queue (`queue.ts`), and `recovery.ts` handles interrupted runs. An in-memory abort registry (`abort-registry.ts`) plus `cancel.ts` back operator-initiated cancellation: a run registered under its `runId` can be aborted mid-flight and settles as `CANCELLED` rather than `FAILED` (see [[Operator Web Control Surface]]). `run-core.ts` also counts inbound events so a stalled run can be distinguished from a lost-event timeout. Permission events emitted by OpenCode during a run are forwarded to Discord approval buttons via the approvals subsystem.
+**Execute** (`execute/`) — The agent-execution pipeline triggered by an `@fro-bot` mention or a web launch. `run.ts` orchestrates the full run: acquires the coordination lock, creates a run-state record with heartbeat, and delegates to `run-core-v2.ts` for session creation, prompt send, and event-stream routing. `opencode-attach-v2.ts` connects to the remote OpenCode server, `prompt.ts` builds the Discord prompt, `concurrency.ts` enforces per-channel run limits via a serial queue (`queue.ts`), and `recovery.ts` handles interrupted runs. An in-memory abort registry (`abort-registry.ts`) plus `cancel.ts` back operator-initiated cancellation: a run registered under its `runId` can be aborted mid-flight and settles as `CANCELLED` rather than `FAILED` (see [[Operator Web Control Surface]]). `run-core-v2.ts` also counts inbound events so a stalled run can be distinguished from a lost-event timeout. Permission events emitted by OpenCode during a run are forwarded to Discord approval buttons via the approvals subsystem.
 
-The gateway has no separate drain stage: its selected core loop owns completion before returning. V1's `run-core.ts` checks the ledger and parent's follow-up reply; V2's `run-core-v2.ts` also requires a stable, quiet directory. Each generation has a termination barrier that confirms stopped work rather than trusting an abort receipt. Unconfirmed teardown quarantines the run, holding its channel slot for a bounded window. Startup recovery checks generation-appropriate workspace activity rather than trusting persisted ownership, and never deletes coordination locks. See [[Background Subagents and Ownership]].
+The gateway has no separate drain stage: `run-core-v2.ts` owns completion before returning, and requires a stable, quiet directory before it releases the run. The termination barrier confirms stopped work rather than trusting an abort receipt. Unconfirmed teardown quarantines the run, holding its channel slot for a bounded window. Startup recovery checks workspace activity rather than trusting persisted ownership, and never deletes coordination locks. See [[Background Subagents and Ownership]].
 
 **Approvals** (`approvals/`) — Discord approval UI for OpenCode permission gate events. When OpenCode asks for a file-system or shell permission during a gateway run, the coordinator (`coordinator.ts`) registers the pending request and the registry (`registry.ts`) manages the entry lifecycle across all in-flight runs. A Discord button click claims the entry (preventing duplicate replies), calls back to OpenCode's reply endpoint, and the authoritative `permission.replied` event from the SDK confirms settlement. The registry is the single source of truth; the coordinator is a thin forwarder bridging the SDK event stream to the registry.
 
@@ -180,7 +176,7 @@ The control API (`server.ts`) clones repositories (`POST /clone`), inspects chec
 
 The service retains root authority for protected staging, journal, and network fetch operations, but the OpenCode server and its tools run under a separate unprivileged identity. Fresh clones are staged in a root-owned directory and handed off through a symlink-safe filesystem walk; git operations against an existing agent-owned checkout run as that agent identity. See [[Setup and Configuration]] for the deployment boundary.
 
-The OpenCode server binds to loopback only. V1 uses `opencode-server.ts` and `opencode-proxy.ts`; V2 uses their `-v2.ts` siblings, with a fresh database and Basic credential per spawn. The V2 proxy exchanges the gateway's bearer for that credential and forwards only the gateway client's route allowlist, excluding credential enumeration. The gateway does not own the remote server's lifetime; the workspace supervisor does.
+The OpenCode server binds to loopback only. The workspace runs it through `opencode-server-v2.ts` and `opencode-proxy-v2.ts`, with a fresh database and Basic credential per spawn. The proxy exchanges the gateway's bearer for that credential and forwards only the gateway client's route allowlist, excluding credential enumeration. The gateway does not own the remote server's lifetime; the workspace supervisor does.
 
 The proxy ties connection lifetimes together: an upstream error or incomplete close destroys the downstream response, while a departed SSE consumer destroys its upstream event request. SSE remains exempt from the ordinary inactivity timeout; connection teardown prevents that exemption from leaving abandoned subscriptions alive.
 
@@ -263,14 +259,14 @@ The full, unabridged symbol rows for entries that [ARCHITECTURE.md](../../ARCHIT
 | `handleQuestionInteraction` | Function | `packages/gateway/src/discord/question-interactions.ts` | Option/Skip/text buttons, select menu, and answer modal: authorizes, maps option indices to raw labels, and decides through the gate with a Discord actor scoped to the thread |
 | `buildPendingQuestionsRoute` / `buildQuestionDecisionRoute` | Function | `packages/gateway/src/web/operator/{pending-questions-route,question-decision-route}.ts` | `GET /operator/runs/:runId/questions` (reconciliation listing) and `POST /operator/runs/:runId/questions/:requestId/decision` (answer or skip; a refused body is `400 {error: 'bad request', reason, questionIndex}`, the standard operator error envelope) |
 | `createWebQuestionOnRegistered` | Function | `packages/gateway/src/web/operator/web-question.ts` | Web question transport: emits the SSE open frame after registration and attaches the settle-frame render; fail-soft |
-| `createQuestionEffects` | Function | `packages/gateway/src/execute/question-client.ts` | Per-run `replyQuestion` / `rejectQuestion` effects over the v2 SDK client; failures collapse to reason codes, never SDK error text |
+| `createQuestionEffectsV2` | Function | `packages/gateway/src/execute/question-client-v2.ts` | Per-run `replyQuestion` / `rejectQuestion` effects over the v2 SDK client; failures collapse to reason codes, never SDK error text |
 | `recoverStaleRuns` | Function | `packages/gateway/src/execute/recovery.ts` | Startup sweep: terminalizes stale active runs only when the repo's OpenCode workspace is confirmed clear (busy/unknown leaves run and lock untouched); never deletes coordination locks. Also the periodic stranded-run sweep's worker (`EXECUTING` only, unowned only, no workspace gate) |
 | `classifyInspectResult` | Function | `packages/gateway/src/execute/provenance.ts` | Classifies a workspace `inspect()` result into a run-blocking `checkout-substituted` failure or a `CheckoutProvenance` the run carries forward |
 | `parseOperatorCheckoutProvenance` | Function | `packages/gateway/src/operator-contract/provenance.ts` | Field-by-field validator projecting persisted `runState.details.checkoutProvenance` into the wire-decoupled operator DTO |
 | `inspectCheckout` | Function | `apps/workspace-agent/src/inspect.ts` | `POST /inspect` handler: read-only report of an existing checkout (HEAD, worktree state, in-progress operation) |
 | `executeClone` | Function | `apps/workspace-agent/src/clone.ts` | `POST /clone` handler: clones into root-owned staging, validates HEAD, hands ownership to the agent uid, then publishes by `rename` |
 | `handOffToAgent` | Function | `apps/workspace-agent/src/handoff.ts` | Filesystem-only (`lstat`/`lchown`) ownership walk of a staged clone to `AGENT_UID`/`AGENT_GID`; bounded by deadline and entry cap |
-| `buildOpencodeLaunchSpec` | Function | `apps/workspace-agent/src/opencode-server.ts` | Single launch spec for every OpenCode spawn: fixed executable path, agent uid/gid, allowlist-constructed env (`buildOpencodeEnv`) |
+| `buildOpencodeV2Env` | Function | `apps/workspace-agent/src/opencode-server-v2.ts` | Allowlist-constructed child environment for every OpenCode spawn: agent home, fixed `PATH`, proxy and CA settings; no `WORKSPACE_*` secret reaches it |
 | `gitInvocation` | Function | `apps/workspace-agent/src/git-safety.ts` | Shared neutralized, credential-free git invocation (sealed config, exact `safe.directory`) for any git run against an agent-owned checkout |
 | `createApp` | Function | `apps/workspace-agent/src/server.ts` | Workspace control-API Hono app; required `auth` union (`bearer` \| `disabled-for-tests`) gates every route except `/healthz`/`/readyz` |
 | `withRepoLock` | Function | `apps/workspace-agent/src/repo-mutex.ts` | Single per-repo operation mutex (keyed by `repoMutexKey`) shared by clone, update, recovery, and backup deletion; `markRepoHeld` sets a sticky maintenance hold on any unconfirmed subprocess termination, cleared only by a workspace restart |
@@ -293,7 +289,7 @@ The fully annotated gateway mention-loop and harness release trees that [ARCHITE
 
 ### Gateway Mention-Loop
 
-The detailed event names below describe V1. A V2 workspace selects `run-core-v2.ts`, normalizes native subagent, shell, and form events, and waits for directory stability before the same terminal run-state and lock-release steps.
+`run-core-v2.ts` normalizes native subagent, shell, and form events and waits for directory stability before the terminal run-state and lock-release steps.
 
 ```text
 Discord messageCreate event
@@ -330,7 +326,7 @@ Discord messageCreate event
               ├─→ run-state lifecycle
               │     PENDING → ACKNOWLEDGED → EXECUTING
               │
-              ├─→ execute/run-core.ts
+              ├─→ execute/run-core-v2.ts
               │     buildDiscordPrompt (+ provenance block appended) → OpenCode (workspace:9200, bearer auth)
               │     → SSE event stream → discord/streaming.ts → thread reply
               │
@@ -354,11 +350,11 @@ Discord messageCreate event
               │     (pauses the inactivity watchdog while any approval or question is pending)
               │
               └─→ completion
-                    root session.idle with a background dispatch adopted → drain
+                    root execution succeeded with a background dispatch adopted → drain
                       (periodic reconciliation until settled or the run deadline expires)
-                      (completion needs ledger settlement AND each child's completion notice or cancel
-                      evidence AND root freshness; human waits are independent: a pending question never
-                      holds or ends it, and the inactivity watchdog stays paused for the whole drain)
+                      (completion needs a drained ledger, every notice delivered, current root idle
+                      evidence AND a quiet directory; human waits are independent: a pending question
+                      never holds or ends it, and the inactivity watchdog stays paused for the whole drain)
                     code-written "started from" provenance line appended to the final reply
                     run → COMPLETED; heartbeat stop; lock release
                     on failure → FAILED; coarse error reply to thread

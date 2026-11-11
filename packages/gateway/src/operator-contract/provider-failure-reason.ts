@@ -6,7 +6,7 @@
  * alone cannot express (every provider failure collapses to `session-error`).
  *
  * Decoupling: the wire values are a contract of their own. The internal vocabulary
- * (`execute/provider-failure.ts`) is imported type-only and mapped through a `satisfies` table, so a new
+ * (`execute/provider-failure-v2.ts`) is imported type-only and mapped through a `satisfies` table, so a new
  * internal reason fails compilation until it is given a wire value, while renaming an internal spelling
  * never changes the wire.
  *

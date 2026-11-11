@@ -185,7 +185,7 @@ Discord messageCreate event
               │     with EXECUTING; refused/failed ends the run with a CheckoutPreparation reply
               │     (a `dirty` refusal first tries one automatic recovery, then updates again)
               ├─→ run-state lifecycle: PENDING → ACKNOWLEDGED → EXECUTING
-              ├─→ execute/run-core.ts
+              ├─→ execute/run-core-v2.ts
               │     buildDiscordPrompt → OpenCode (workspace:9200, bearer auth)
               │     → SSE event stream → discord/streaming.ts → thread reply
               ├─→ background dispatch observation: completed `task` with
@@ -272,12 +272,12 @@ Per-repo S3 conditional-write locks (`If-None-Match` / `If-Match`) built by `get
 
 ### Background Subagent Ownership Ledger (Gateway)
 
-`runMention` creates a per-run `OwnershipLedger` (`packages/runtime/src/agent/ownership-ledger.ts`) for `runOpenCodeCore` (`packages/gateway/src/execute/run-core.ts`), keyed on child session id (never job id). Entries are `outstanding`, `settled`, or `unknown`, and `unknown` blocks both `isDrainComplete()` and `isPersistenceSafe()`.
+`runMention` creates a per-run `OwnershipLedger` (`packages/runtime/src/agent/ownership-ledger.ts`) for `runOpenCodeCoreV2` (`packages/gateway/src/execute/run-core-v2.ts`), keyed on child session id (never job id). Entries are `outstanding`, `settled`, or `unknown`, and `unknown` blocks both `isDrainComplete()` and `isPersistenceSafe()`.
 
-- Root `session.idle` with a non-empty ledger enters drain. The drain-completion gate (`execute/drain-completion.ts`) requires each child's notice, current-generation root idle, and a REST-confirmed terminal root reply. Reconciliation settles tracked entries only; it never adopts.
-- Teardown settles through `settleOwnedSessions`; an unconfirmed root or child means `quarantined` (held lock, no slot hand-off).
-- `deploy/plugins/no-task-reuse.mjs` rejects any `task` call with a non-empty `task_id`, so each background job has its own child session. On V2 the `@fro.bot/opencode-plugin` guard does this.
-- Each run picks its loop from the workspace's `/readyz` `opencodeVersion`: V1 `run-core.ts`, V2 `run-core-v2.ts` (with the `-v2` drain and settle modules).
+- Root `session.idle` with a non-empty ledger enters drain. The drain-completion gate (`execute/drain-completion-v2.ts`) releases the run only when the ledger is drained, every queued notice has been delivered, root idle evidence is current, and the run's directory has stayed quiet. Reconciliation settles tracked entries only; it never adopts.
+- Teardown settles through `settleOwnedSessionsV2`; an unconfirmed root or child means `quarantined` (held lock, no slot hand-off).
+- The `@fro.bot/opencode-plugin` guard rejects a `subagent` call carrying a `sessionID`, so each background job has its own child session.
+- A run is admitted only when the workspace's `/readyz` `opencodeVersion` is major 2 or higher; the image refuses to build or start on anything else.
 
 > See also: [Background Subagents and Ownership](docs/wiki/Background%20Subagents%20and%20Ownership.md#background-subagent-ownership-ledger-gateway)
 
@@ -311,7 +311,7 @@ The root's turn ends on the V2 terminal event (`observeRootTerminal`, `src/featu
 `question.asked` from the root session or an adopted background child is a second family of human wait next to tool approvals; asks from sessions the run does not own are ignored. `createRequestGate` (`packages/gateway/src/approvals/request-gate.ts`) is the single settlement path for both families: one-winner `open → claimed → confirmed` states, a registry-owned deadline, authoritative echo settlement, and exactly one terminal notification per request.
 
 - Skip and deadline reply with an empty answer (the agent continues); reject is for cancel, teardown, and malformed or oversize asks only.
-- `run-core.ts` pauses the inactivity watchdog while any human wait is pending; the gauge never influences drain.
+- `run-core-v2.ts` pauses the inactivity watchdog while any human wait is pending; the gauge never influences drain.
 - Question and answer text is untrusted plain text: bounded and control-stripped (`approvals/question-detail.ts`), rendered inert, never logged. Options are named by index, never label.
 
 > See also: [Operator Web Control Surface](docs/wiki/Operator%20Web%20Control%20Surface.md#agent-questions-gateway)
@@ -328,7 +328,7 @@ Gateway runs share one checkout per repository and record what they started from
 
 ### OpenCode File Watcher Disabled By Default
 
-Neither surface consumes file-change events, so `bootstrapOpenCodeServer` (`packages/runtime/src/agent/server.ts`) sets `OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER=true` before spawn, only when the value is unset or empty, so an explicit operator value (including `false`) wins. `deploy/workspace.Dockerfile` bakes the same default. Accepted tradeoff: OpenCode's cached VCS branch can go stale after a checkout.
+The Action and the workspace do not consume file-change events, so `bootstrapOpenCodeServer` (`packages/runtime/src/agent/server.ts`) sets `OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER=true` before spawn, only when the value is unset or empty, so an explicit operator value (including `false`) wins. The workspace's V2 server keeps V2's default: probe P3 found no difference with the watcher on or off, and the child environment is an allowlist that does not forward the flag. Accepted tradeoff: OpenCode's cached VCS branch can go stale after a checkout.
 
 > See also: [Background Subagents and Ownership](docs/wiki/Background%20Subagents%20and%20Ownership.md#opencode-file-watcher-disabled-by-default)
 

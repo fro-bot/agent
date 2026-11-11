@@ -1,30 +1,52 @@
 # Workspace executor image.
 #
-# Builds apps/workspace-agent (clone API + OpenCode SDK server + bearer proxy)
-# and bakes the OpenCode CLI so the deployed workspace can actually serve
+# Builds apps/workspace-agent (clone API + bearer proxy + OpenCode V2 supervisor)
+# and bakes the stock OpenCode V2 CLI so the deployed workspace can actually serve
 # /clone (for /fro-bot add-project) and host an OpenCode server (for the
 # @fro-bot mention loop).
 #
 # Port model (enforced by main.ts + compose, not published here):
 #   - 9100 (Hono API: /healthz, /clone) — sandbox-net reachable
 #   - 9200 (OpenCode bearer-token proxy) — sandbox-net reachable (gateway attaches here)
-#   - 54321 (raw OpenCode SDK server) — loopback (127.0.0.1) ONLY, never exposed
+#   - 54321 (raw OpenCode server) — loopback (127.0.0.1) ONLY, never exposed
 #
-# OPENCODE_VERSION pins the harness OpenCode build for the workspace image
-# (from fro-bot/agent releases, bumped in lockstep with the action default by
-# the harness-release workflow; the merge gate on the auto-PR is the control).
+# OPENCODE_VERSION is a required build argument with no default: the V2 version in
+# packages/runtime/src/shared/opencode-v2-pin.json. A Docker ARG default cannot be
+# read from a file, and a literal default would be a second copy of the pin that
+# drifts on every bump. The musl asset from anomalyco/opencode is verified against the
+# digest recorded in that file (the `opencode-v2` stage below). Build with:
+#   docker build -f deploy/workspace.Dockerfile \
+#     --build-arg OPENCODE_VERSION="$(node -p 'require("./packages/runtime/src/shared/opencode-v2-pin.json").version')" .
 # SYSTEMATIC_VERSION tracks DEFAULT_SYSTEMATIC_VERSION in
 # packages/runtime/src/shared/constants.ts.
-#
-# An OPENCODE_VERSION with major 2 or higher selects the stock V2 install path
-# instead (the `opencode-v2` stage below): the musl asset from anomalyco/opencode,
-# verified against the digest recorded in
-# packages/runtime/src/shared/opencode-v2-pin.json.
+
+# ── Stage 0: version-gate (refuses a build that is not given the pinned V2 version) ──
+# Every other stage starts FROM this one, so a missing or non-V2 OPENCODE_VERSION fails the build here, before any
+# download or package install. The pin file is bind-mounted from the build context for the check, so it does not
+# land in any image layer.
+FROM node:24.22.2-alpine3.24@sha256:a34ab6d7f6f4813f4d0c5469d74685604b962fbdbf5793a7bc7b4998ecb867c8 AS version-gate
+
+ARG OPENCODE_VERSION
+
+RUN --mount=type=bind,source=packages/runtime/src/shared/opencode-v2-pin.json,target=/opt/opencode-v2-pin.json \
+    set -eu \
+    && hint="pass --build-arg OPENCODE_VERSION=<version> from packages/runtime/src/shared/opencode-v2-pin.json" \
+    && case "${OPENCODE_VERSION:-}" in \
+         '') echo "OPENCODE_VERSION is required: ${hint}" >&2; exit 1 ;; \
+         *[!0-9A-Za-z.+_-]*) echo "OPENCODE_VERSION contains disallowed characters: ${OPENCODE_VERSION}" >&2; exit 1 ;; \
+         *harness*) echo "OPENCODE_VERSION ${OPENCODE_VERSION} is a retired V1 harness build: this image runs OpenCode V2 only; ${hint}" >&2; exit 1 ;; \
+         [2-9].*|[1-9][0-9]*.*) : ;; \
+         *) echo "OPENCODE_VERSION ${OPENCODE_VERSION} is not an OpenCode V2 version: this image runs V2 only; ${hint}" >&2; exit 1 ;; \
+       esac \
+    && pin_version="$(node -p 'JSON.parse(fs.readFileSync(process.argv[1], "utf8")).version' /opt/opencode-v2-pin.json)" \
+    && if [ "${pin_version}" != "${OPENCODE_VERSION}" ]; then \
+         echo "OPENCODE_VERSION ${OPENCODE_VERSION} is not the pinned V2 version ${pin_version} (packages/runtime/src/shared/opencode-v2-pin.json)" >&2; exit 1; \
+       fi
 
 # ── Stage 1: build-deps (full workspace, dev deps, workspace-agent build) ──────
 # Forked into `workspace-test` below BEFORE dev dependencies are pruned, then
 # continued as `build` (prune to production) for the runtime stage to copy from.
-FROM node:24.22.2-alpine3.24@sha256:a34ab6d7f6f4813f4d0c5469d74685604b962fbdbf5793a7bc7b4998ecb867c8 AS build-deps
+FROM version-gate AS build-deps
 
 WORKDIR /workspace
 
@@ -154,22 +176,16 @@ RUN rm -rf node_modules apps/*/node_modules packages/*/node_modules \
     && bun install --production --frozen-lockfile --ignore-scripts
 
 # ── Stage 1c: opencode-v2 (stock V2 binary, digest-verified) ──────────────────
-# Runs only when OPENCODE_VERSION has major 2 or higher and is not a harness
-# build; otherwise it leaves /out empty and the runtime stage takes the harness
-# path. Build it alone with:
-#   docker build --target opencode-v2 --build-arg OPENCODE_VERSION=2.2.0 -f deploy/workspace.Dockerfile .
+# Build it alone with:
+#   docker build --target opencode-v2 --build-arg OPENCODE_VERSION=<pinned version> -f deploy/workspace.Dockerfile .
 #
 # The recorded digest is read from the SAME JSON file the Action's
 # installOpenCode imports (packages/runtime/src/shared/opencode-v2-pin.json), with
 # node — already in this base image — so no digest is hand-copied here. The archive
 # must match BOTH that digest and the release's SHA256SUMS line. Any failure
 # aborts the build: no fallback version, no retry-around-mismatch, no skipped check.
-#
-# OPENCODE_VERSION has no default here on purpose: the runtime stage's ARG owns the
-# default (a second default would drift, and the harness-release sync job rewrites
-# only the first `ARG OPENCODE_VERSION=` line). An unset value leaves /out empty;
-# the runtime stage then refuses a V2 version it finds no matching /out/VERSION for.
-FROM node:24.22.2-alpine3.24@sha256:a34ab6d7f6f4813f4d0c5469d74685604b962fbdbf5793a7bc7b4998ecb867c8 AS opencode-v2
+# The version-gate stage has already refused any OPENCODE_VERSION that is not the pinned V2 version.
+FROM version-gate AS opencode-v2
 
 ARG OPENCODE_VERSION
 ARG TARGETARCH
@@ -178,25 +194,13 @@ COPY packages/runtime/src/shared/opencode-v2-pin.json /opt/opencode-v2-pin.json
 
 RUN set -euo pipefail \
     && mkdir -p /out \
-    # Keep this version test in sync with the V2 arm in the runtime stage.
-    && case "${OPENCODE_VERSION:-}" in \
-         *[!0-9A-Za-z.+_-]*) \
-           echo "OPENCODE_VERSION contains disallowed characters: ${OPENCODE_VERSION}" >&2; exit 1 ;; \
-         *harness*) exit 0 ;; \
-         [2-9].*|[1-9][0-9]*.*) : ;; \
-         *) exit 0 ;; \
-       esac \
     # Fixed allowlist of musl assets (Alpine), keyed by TARGETARCH.
     && case "${TARGETARCH}" in \
          amd64) oc_asset="opencode-linux-x64-musl.tar.gz" ;; \
          arm64) oc_asset="opencode-linux-arm64-musl.tar.gz" ;; \
          *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
        esac \
-    # Read the pinned version and this asset's digest from the shared JSON file.
-    && pin_version="$(node -p 'JSON.parse(fs.readFileSync(process.argv[1], "utf8")).version' /opt/opencode-v2-pin.json)" \
-    && if [ "${pin_version}" != "${OPENCODE_VERSION}" ]; then \
-         echo "OPENCODE_VERSION ${OPENCODE_VERSION} is not the pinned V2 version ${pin_version} (packages/runtime/src/shared/opencode-v2-pin.json)" >&2; exit 1; \
-       fi \
+    # Read this asset's digest from the shared JSON file.
     && recorded_hash="$(node -p 'JSON.parse(fs.readFileSync(process.argv[1], "utf8")).assets[process.argv[2]] ?? ""' /opt/opencode-v2-pin.json "${oc_asset}")" \
     && if [ "${#recorded_hash}" -ne 64 ]; then \
          echo "opencode-v2-pin.json has no valid sha256 for ${oc_asset}" >&2; exit 1; \
@@ -224,15 +228,13 @@ RUN set -euo pipefail \
     && rm -f "/tmp/${oc_asset}" /tmp/SHA256SUMS
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
-FROM node:24.22.2-alpine3.24@sha256:a34ab6d7f6f4813f4d0c5469d74685604b962fbdbf5793a7bc7b4998ecb867c8 AS runtime
+FROM version-gate AS runtime
 
 WORKDIR /app
 
 # Pinned tool versions (track the runtime constants noted in the header).
-# OPENCODE_VERSION is the harness build of OpenCode (fro-bot/agent releases),
-# in the form <base>+harness.<sha>. Bumped in lockstep with the action default
-# by the harness-release workflow; merge the auto-PR to advance both surfaces.
-ARG OPENCODE_VERSION=1.19.5+harness.bf7f7dfe
+# OPENCODE_VERSION has no default: it is the V2 version in opencode-v2-pin.json (see the header and version-gate).
+ARG OPENCODE_VERSION
 ARG SYSTEMATIC_VERSION=3.32.1
 
 # System packages come from the base image's Alpine 3.24 branch and are not
@@ -241,7 +243,7 @@ ARG SYSTEMATIC_VERSION=3.32.1
 #   git            — clone.ts runs `git clone` via execFile
 #   ca-certificates — entrypoint runs update-ca-certificates to trust the mitmproxy CA
 #   libgcc/libstdc++/ripgrep — required by the opencode musl binary (matches OpenCode's own image)
-#   curl           — fetch the opencode binary at build time
+#   curl           — the :9100 healthcheck probe (compose.yaml)
 #   setpriv        — drops privilege to the opencode agent uid for OpenCode's
 #                    own credential/config provisioning (see workspace-entrypoint.sh).
 #                    Alpine's setpriv ships as part of util-linux and supports
@@ -328,129 +330,41 @@ RUN mkdir -p /var/lib/workspace-agent/home \
     && chmod 0700 /var/lib/workspace-agent/home
 ENV HOME=/var/lib/workspace-agent/home
 
-# Bake the OpenCode CLI from the fro-bot/agent harness release.
-#
-# The harness build carries session/plugin/compaction patches not present in
-# stock OpenCode. The workspace uses the musl variant so it runs on Alpine.
-#
-# TARGETARCH is provided automatically by BuildKit (amd64 | arm64). amd64 uses
-# the AVX2-independent baseline variant (so the image runs on any x86 host
-# regardless of the builder's CPU features); arm64 has no baseline concept.
-#
-# Download source: https://github.com/fro-bot/agent/releases
-# Version form: <base>+harness.<sha> (e.g. 1.17.3+harness.2c9cdbd2)
-#
-# The version keeps +harness. build metadata while the release tag uses the
-# -harness. prerelease form. Mirrors toHarnessReleaseTag() in
-# src/services/setup/opencode.ts.
-#
-# SHA256SUMS verification is fail-closed: any download failure, checksum fetch
-# failure, hash mismatch, missing entry, or partial download aborts the build
-# immediately with no fallback (no cached binary, no stock fallback, no retry).
-#
-# Stock V2 (OPENCODE_VERSION major 2 or higher, not a harness build): the first
-# step below installs the binary the `opencode-v2` stage already verified against
-# the recorded digest, then exits the RUN. It refuses output that is missing or was
-# verified for a different version. Anything else falls through to the harness
-# path unchanged.
+# Bake the stock OpenCode V2 CLI that the `opencode-v2` stage verified against the digest recorded in
+# opencode-v2-pin.json. The step refuses output that is missing or was verified for a different version, so every stage
+# must be built with the same --build-arg OPENCODE_VERSION.
 ARG TARGETARCH
 COPY --from=opencode-v2 /out/ /tmp/opencode-v2/
 RUN set -euo pipefail \
-    # Keep this version test in sync with the one in the opencode-v2 stage.
-    && case "${OPENCODE_VERSION}" in \
-         *[!0-9A-Za-z.+_-]*) : ;; \
-         *harness*) rm -rf /tmp/opencode-v2 ;; \
-         [2-9].*|[1-9][0-9]*.*) \
-           if [ "$(cat /tmp/opencode-v2/VERSION 2>/dev/null || true)" != "${OPENCODE_VERSION}" ] || [ ! -x /tmp/opencode-v2/opencode ]; then \
-             echo "no verified V2 binary for OPENCODE_VERSION ${OPENCODE_VERSION}: pass the same --build-arg OPENCODE_VERSION to every stage" >&2; exit 1; \
-           fi; \
-           install -m 755 /tmp/opencode-v2/opencode /usr/local/bin/opencode; \
-           rm -rf /tmp/opencode-v2; \
-           opencode --version; \
-           exit 0 ;; \
-         *) rm -rf /tmp/opencode-v2 ;; \
-       esac \
-    # Validate the version string before interpolation (defense-in-depth:
-    # rejects path traversal, shell metacharacters, and unexpected forms).
-    && case "${OPENCODE_VERSION}" in \
-         *[!0-9A-Za-z.+_-]*) \
-           echo "OPENCODE_VERSION contains disallowed characters: ${OPENCODE_VERSION}" >&2; exit 1 ;; \
-         *+harness.*) : ;; \
-         *) echo "OPENCODE_VERSION does not match expected <base>+harness.<sha> form: ${OPENCODE_VERSION}" >&2; exit 1 ;; \
-       esac \
-    # Fixed allowlist: only these two asset names are permitted (no free-form interpolation).
-    && case "${TARGETARCH}" in \
-         amd64) oc_asset="opencode-linux-x64-baseline-musl" ;; \
-         arm64) oc_asset="opencode-linux-arm64-musl" ;; \
-         *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
-       esac \
-    # Derive the prerelease tag from the build-metadata version form.
-    && tag_version="${OPENCODE_VERSION//+harness./-harness.}" \
-    && base_url="https://github.com/fro-bot/agent/releases/download/${tag_version}" \
-    # Download the asset archive and the SHA256SUMS file for this release.
-    # --retry 3 --retry-delay 2: absorbs transient CDN blips; persistent 404/auth still aborts.
-    && curl -fsSL --connect-timeout 30 --max-time 120 --retry 3 --retry-delay 2 -o "/tmp/${oc_asset}.tar.gz" "${base_url}/${oc_asset}.tar.gz" \
-    && curl -fsSL --connect-timeout 30 --max-time 120 --retry 3 --retry-delay 2 -o /tmp/SHA256SUMS "${base_url}/SHA256SUMS" \
-    # Verify the asset's SHA256 against the SHA256SUMS entry — fail closed on any mismatch.
-    && expected_hash="$(awk -v f="${oc_asset}.tar.gz" '$2 == f {print $1}' /tmp/SHA256SUMS)" \
-    && if [ -z "${expected_hash}" ]; then \
-         echo "SHA256SUMS does not contain an entry for ${oc_asset}.tar.gz" >&2; exit 1; \
+    && if [ "$(cat /tmp/opencode-v2/VERSION 2>/dev/null || true)" != "${OPENCODE_VERSION}" ] || [ ! -x /tmp/opencode-v2/opencode ]; then \
+         echo "no verified V2 binary for OPENCODE_VERSION ${OPENCODE_VERSION}: pass the same --build-arg OPENCODE_VERSION to every stage" >&2; exit 1; \
        fi \
-    && actual_hash="$(sha256sum "/tmp/${oc_asset}.tar.gz" | awk '{print $1}')" \
-    && if [ "${actual_hash}" != "${expected_hash}" ]; then \
-         echo "SHA256 mismatch for ${oc_asset}.tar.gz: expected ${expected_hash}, got ${actual_hash}" >&2; exit 1; \
-       fi \
-    # Hash verified — extract, install, and confirm the binary reports its version.
-    && tar -xz -C /usr/local/bin -f "/tmp/${oc_asset}.tar.gz" \
-    && chmod 755 /usr/local/bin/opencode \
-    && rm -f "/tmp/${oc_asset}.tar.gz" /tmp/SHA256SUMS \
+    && install -m 755 /tmp/opencode-v2/opencode /usr/local/bin/opencode \
+    && rm -rf /tmp/opencode-v2 \
     && opencode --version
 
-# Stock V2 (same version test as above): install the Systematic and fro-bot plugins into the agent's cache NOW, at
-# build time, as uid 10001 and under a bound. The server then finds them by spec at boot with no registry access,
-# which is what the --network none smoke test proves. An unbounded boot-time install would hang `GET /api/agent`
-# for as long as the registry hangs (probe P10). Systematic installs at SYSTEMATIC_VERSION (declared above; V1 and V2
-# share it), and the versions must equal DEFAULT_SYSTEMATIC_VERSION and FRO_BOT_PLUGIN_VERSION in
-# packages/runtime/src/shared/constants.ts; deploy/scripts/workspace-v2-image.test.mjs keeps them in step, and the
-# plugin gate refuses a server whose plugins differ from what the workspace expects.
-# Harness and V1 builds skip this step entirely.
+# Install the Systematic and fro-bot plugins into the agent's cache NOW, at build time, as uid 10001 and under a bound.
+# The server then finds them by spec at boot with no registry access, which is what the --network none smoke test
+# proves. An unbounded boot-time install would hang `GET /api/agent` for as long as the registry hangs (probe P10).
+# Systematic installs at SYSTEMATIC_VERSION (declared above), and the versions must equal DEFAULT_SYSTEMATIC_VERSION
+# and FRO_BOT_PLUGIN_VERSION in packages/runtime/src/shared/constants.ts; deploy/scripts/workspace-v2-image.test.mjs
+# keeps them in step, and the plugin gate refuses a server whose plugins differ from what the workspace expects.
 ARG FRO_BOT_PLUGIN_VERSION=0.1.0
 COPY deploy/scripts/install-opencode-v2-plugins.sh /usr/local/lib/workspace-scripts/install-opencode-v2-plugins.sh
-RUN set -euo pipefail \
-    && case "${OPENCODE_VERSION}" in \
-         *[!0-9A-Za-z.+_-]*) echo "OPENCODE_VERSION contains disallowed characters: ${OPENCODE_VERSION}" >&2; exit 1 ;; \
-         *harness*) exit 0 ;; \
-         [2-9].*|[1-9][0-9]*.*) : ;; \
-         *) exit 0 ;; \
-       esac \
-    && sh /usr/local/lib/workspace-scripts/install-opencode-v2-plugins.sh \
-         "@fro.bot/systematic@${SYSTEMATIC_VERSION}" \
-         "@fro.bot/opencode-plugin@${FRO_BOT_PLUGIN_VERSION}"
+RUN sh /usr/local/lib/workspace-scripts/install-opencode-v2-plugins.sh \
+      "@fro.bot/systematic@${SYSTEMATIC_VERSION}" \
+      "@fro.bot/opencode-plugin@${FRO_BOT_PLUGIN_VERSION}"
 
-# Disable OpenCode's file watcher by default: nothing in this container consumes
-# file-change events, so the watcher is pure overhead. A deployer can still
-# override this through compose. Accepted consequence: OpenCode's cached VCS
-# branch can go stale after a checkout, since that cache refreshes from watcher
-# events (see deploy/README.md).
-ENV OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER=true
-
-# Enable OpenCode's background-subagent dispatch (task({background: true})) by
-# default: the ownership-ledger, drain, and descendant-event-routing machinery
-# this repo built for it is otherwise unreachable dead code. A deployer can
-# still override this through compose.
-ENV OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true
-
-# Which OpenCode this image carries. The workspace agent selects its V1 or V2 supervised runner, proxy and disposer
-# from it (major 2 or above is V2) and reports it on /readyz, where the gateway picks its run loop. It is the same
-# build argument that selected the binary above, so the two cannot disagree; it is not an operator setting.
+# Which OpenCode this image carries, reported on /readyz. The workspace agent refuses to start without a V2 value, and
+# the gateway admits a run only when it reads one. It is the same build argument that selected the binary above, so the
+# two cannot disagree; it is not an operator setting.
 ENV WORKSPACE_IMAGE_OPENCODE_VERSION=${OPENCODE_VERSION}
 
-# Base workspace OpenCode config: declare the Systematic plugin and disable
-# autoupdate. The model and provider block are NOT baked — the entrypoint
+# Base workspace OpenCode config: disable updates. The model and provider block are NOT baked — the entrypoint
 # overlays them at runtime from WORKSPACE_OPENCODE_MODEL and
 # WORKSPACE_OPENCODE_CONFIG so a deployer selects the provider/baseURL (e.g.
 # cliproxyapi) and model, mirroring the action's `model` + `opencode-config`
-# inputs. Only the mention-loop agent uses the plugin; clone does not.
+# inputs.
 #
 # Baked to a trusted, root-owned, world-readable (not writable) path OUTSIDE
 # any per-uid home — NOT /root/.config, which is the service's own home and
@@ -459,49 +373,25 @@ ENV WORKSPACE_IMAGE_OPENCODE_VERSION=${OPENCODE_VERSION}
 # is sufficient — no write access is needed) and writes the merged result to
 # the agent's own $XDG_CONFIG_HOME.
 #
-# Stock V2 gets a base without a plugin entry: the Systematic and fro-bot plugins are listed in the config content the
-# workspace agent passes at spawn (and installed at build time above), and `plugin` is the V1 key. The entrypoint
-# rewrites the global file it builds from this base at every start, so a plugin listed only there would not survive.
+# No plugin entry: the Systematic and fro-bot plugins are listed in the config content the workspace agent passes at
+# spawn (and installed at build time above). The entrypoint rewrites the global file it builds from this base at every
+# start, so a plugin listed only there would not survive.
 RUN mkdir -p /usr/local/share/fro-bot \
-    && case "${OPENCODE_VERSION}" in \
-         *harness*) v2=0 ;; \
-         [2-9].*|[1-9][0-9]*.*) v2=1 ;; \
-         *) v2=0 ;; \
-       esac \
-    && if [ "${v2}" = 1 ]; then \
-         printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "update": "disable"\n}\n' \
-           > /usr/local/share/fro-bot/opencode.base.json; \
-       else \
-         printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "autoupdate": false,\n  "plugin": ["@fro.bot/systematic@%s"]\n}\n' "${SYSTEMATIC_VERSION}" \
-           > /usr/local/share/fro-bot/opencode.base.json; \
-       fi \
+    && printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "update": "disable"\n}\n' \
+         > /usr/local/share/fro-bot/opencode.base.json \
     && chown 0:0 /usr/local/share/fro-bot/opencode.base.json \
     && chmod 0644 /usr/local/share/fro-bot/opencode.base.json
 
-# Task-reuse guard (deploy/plugins/no-task-reuse.mjs), loaded through OpenCode's
-# managed config layer. That layer merges last and concatenates plugin arrays, so
-# agent-written config cannot remove it; both files stay root-owned 0644. The
-# path in managed-config/opencode.json must match the COPY destination
-# (pinned by deploy/scripts/managed-config.test.mjs).
-RUN mkdir -p /usr/local/lib/fro-bot/plugins /etc/opencode \
-    && chown 0:0 /usr/local/lib/fro-bot /usr/local/lib/fro-bot/plugins /etc/opencode \
-    && chmod 0755 /usr/local/lib/fro-bot /usr/local/lib/fro-bot/plugins /etc/opencode
-COPY deploy/plugins/no-task-reuse.mjs /usr/local/lib/fro-bot/plugins/no-task-reuse.mjs
-COPY deploy/managed-config/opencode.json /etc/opencode/opencode.json
-RUN chown 0:0 /usr/local/lib/fro-bot/plugins/no-task-reuse.mjs /etc/opencode/opencode.json \
-    && chmod 0644 /usr/local/lib/fro-bot/plugins/no-task-reuse.mjs /etc/opencode/opencode.json
-
-# Stock V2 replaces the managed config with its V2 form (deploy/managed-config/opencode-v2.json). The reuse guard is
-# the fro-bot plugin there, loaded from the config content, so the V1 plugin file above stays in the image but is
-# not referenced. Root-owned and 0644 like the V1 file.
-COPY deploy/managed-config/opencode-v2.json /usr/local/share/fro-bot/opencode-managed.v2.json
-RUN case "${OPENCODE_VERSION}" in \
-      *harness*) : ;; \
-      [2-9].*|[1-9][0-9]*.*) cp /usr/local/share/fro-bot/opencode-managed.v2.json /etc/opencode/opencode.json ;; \
-      *) : ;; \
-    esac \
-    && chown 0:0 /usr/local/share/fro-bot/opencode-managed.v2.json /etc/opencode/opencode.json \
-    && chmod 0644 /usr/local/share/fro-bot/opencode-managed.v2.json /etc/opencode/opencode.json
+# Managed OpenCode config (deploy/managed-config/opencode-v2.json). OpenCode loads /etc/opencode/opencode.json (the
+# Linux managed config dir) last, so a root-owned file at that path is a layer the agent can add to but never remove
+# from. Root-owned and 0644, in a root-owned 0755 directory (pinned by deploy/scripts/managed-config.test.mjs).
+# The task-reuse guard is the fro-bot plugin, loaded from the config content the workspace agent passes at spawn.
+RUN mkdir -p /etc/opencode \
+    && chown 0:0 /etc/opencode \
+    && chmod 0755 /etc/opencode
+COPY deploy/managed-config/opencode-v2.json /etc/opencode/opencode.json
+RUN chown 0:0 /etc/opencode/opencode.json \
+    && chmod 0644 /etc/opencode/opencode.json
 
 # Production node_modules + bundled entrypoint (mirror gateway.Dockerfile layout).
 COPY --from=build /workspace/node_modules ./node_modules

@@ -224,8 +224,8 @@ const DEFAULT_DELETE_BACKUP_TIMEOUT_MS = 30_000 // 30 seconds
 
 /**
  * The workspace's own timeout for the best-effort OpenCode instance dispose it runs inside every
- * successful `/recover` (`DEFAULT_INSTANCE_DISPOSE_TIMEOUT_MS` in apps/workspace-agent
- * `opencode-instance.ts`). Copied, not imported, because the workspace is a separate container; a
+ * successful `/recover` (`DEFAULT_INSTANCE_DISPOSE_TIMEOUT_MS_V2` in apps/workspace-agent
+ * `opencode-instance-v2.ts`). Copied, not imported, because the workspace is a separate container; a
  * test reads the workspace source and fails when the two drift.
  */
 export const WORKSPACE_INSTANCE_DISPOSE_CEILING_MS = 5_000
@@ -333,7 +333,7 @@ export function createWorkspaceClient(options: WorkspaceClientOptions): Workspac
    * POST a JSON body and read the JSON answer, with ONE deadline covering the whole exchange:
    * the request, the status check and the body read. The deadline is a plain `setTimeout`-driven
    * abort (not `AbortSignal.timeout`, which is not reliably fake-timer-controlled — see
-   * execute/run-core.ts), and it stays armed until the body is parsed: headers can arrive and the
+   * execute/run-core-v2.ts), and it stays armed until the body is parsed: headers can arrive and the
    * body still stall, and a run holding the repo lock must not hang on that. An abort at either
    * point is `timeout`. A status the caller does not accept returns `http-error` without reading
    * the body. Never logs the request or response body.

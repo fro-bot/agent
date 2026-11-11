@@ -1,13 +1,12 @@
-// Static checks on the V2 branch of deploy/workspace.Dockerfile. Docker is not run here, so these pin what can be
-// read from the files: the plugin versions match the constants the workspace agent expects, the plugins are
-// installed at build time and never at boot, the V1 outputs are the ones V1 had, and the image carries the version the
-// workspace agent selects on. Run with `node --test deploy/scripts/*.test.mjs`.
+// Static checks on deploy/workspace.Dockerfile. Docker is not run here, so these pin what can be read from the files:
+// the build refuses anything but the pinned V2 version before any download, the plugin versions match the constants the
+// workspace agent expects, the plugins are installed at build time and never at boot, and the image carries the version
+// the workspace agent starts on. Run with `node --test deploy/scripts/*.test.mjs`.
 //
 // What these cannot show, and the V2 image smoke test (deploy/scripts/v2-image-smoke.mjs) must: that the built image
 // starts as uid 10001 with no network, loads both plugins, and passes the permission gate.
 
 import assert from 'node:assert/strict'
-import {spawnSync} from 'node:child_process'
 import fs from 'node:fs'
 import {test} from 'node:test'
 
@@ -16,7 +15,7 @@ const read = path => fs.readFileSync(new URL(path, REPO), 'utf8')
 
 const dockerfile = read('deploy/workspace.Dockerfile')
 const constants = read('packages/runtime/src/shared/constants.ts')
-const generation = read('apps/workspace-agent/src/opencode-generation.ts')
+const imageVersion = read('apps/workspace-agent/src/opencode-generation.ts')
 const entrypoint = read('deploy/workspace-entrypoint.sh')
 const managedV2 = JSON.parse(read('deploy/managed-config/opencode-v2.json'))
 
@@ -34,7 +33,11 @@ function argDefault(name) {
   return match[1]
 }
 
-const V2_VERSION_ARM = '[2-9].*|[1-9][0-9]*.*)'
+/** The `ARG OPENCODE_VERSION` lines of the Dockerfile: one per stage that reads it, none with a default. */
+const opencodeVersionArgs = dockerfile.split('\n').filter(line => /^ARG OPENCODE_VERSION\b/.test(line))
+
+/** The version-gate stage: its `FROM` line to the next `FROM`. */
+const gateStage = /^FROM [^\n]* AS version-gate\n[\s\S]*?(?=^FROM )/m.exec(dockerfile)?.[0] ?? ''
 
 test('the plugin versions the image installs are the ones the workspace agent expects', () => {
   // #then the build-time ARG defaults equal the runtime constants, so the specs the server is told to load are the
@@ -51,16 +54,14 @@ test('the plugin pins are exact versions, and V2 has no Systematic pin of its ow
   assert.doesNotMatch(dockerfile, /SYSTEMATIC_V2_VERSION/)
 })
 
-test('the plugins are installed at build time by the bounded script, behind the V2 version test', () => {
+test('the plugins are installed at build time by the bounded script, with exactly the two pinned specs', () => {
   // #given the RUN that installs them
-  const run = /RUN set -euo pipefail[^\n]*\n(?:[^\n]*\\\n)*?[^\n]*install-opencode-v2-plugins\.sh[^\n]*\n(?:[^\n]*\\\n)*[^\n]*\n/.exec(
+  const run = /RUN sh \/usr\/local\/lib\/workspace-scripts\/install-opencode-v2-plugins\.sh[^\n]*\n(?:[^\n]*\\\n)*[^\n]*\n/.exec(
     dockerfile,
   )
   assert.ok(run, 'the plugin install RUN is missing')
 
-  // #then it is skipped for harness and V1 builds, and passes exactly the two pinned specs
-  assert.match(run[0], /\*harness\*\) exit 0/)
-  assert.ok(run[0].includes(V2_VERSION_ARM))
+  // #then
   assert.ok(run[0].includes('"@fro.bot/systematic@${SYSTEMATIC_VERSION}"'))
   assert.ok(run[0].includes('"@fro.bot/opencode-plugin@${FRO_BOT_PLUGIN_VERSION}"'))
 })
@@ -69,7 +70,7 @@ test('the install runs after the agent account exists and after the binary is in
   // #then
   const account = dockerfile.indexOf('adduser -D -H -u 10001')
   const binary = dockerfile.indexOf('opencode --version')
-  const plugins = dockerfile.indexOf('&& sh /usr/local/lib/workspace-scripts/install-opencode-v2-plugins.sh')
+  const plugins = dockerfile.indexOf('RUN sh /usr/local/lib/workspace-scripts/install-opencode-v2-plugins.sh')
   assert.ok(account > 0 && binary > 0 && plugins > 0)
   assert.ok(account < plugins, 'plugins install before the agent account exists')
   assert.ok(binary < plugins, 'plugins install before the binary')
@@ -82,27 +83,17 @@ test('nothing installs a plugin at boot', () => {
   assert.doesNotMatch(supervisor, /plugin add|'install'|"install"/)
 })
 
-test('the image carries the version the workspace agent selects on, from the same build argument as the binary', () => {
+test('the image carries the version the workspace agent starts on, from the same build argument as the binary', () => {
   // #then the ENV name is the one main.ts reads, and its value is the OPENCODE_VERSION that chose the binary
-  const name = /export const IMAGE_OPENCODE_VERSION_ENV = '([^']+)'/.exec(generation)?.[1]
+  const name = /export const IMAGE_OPENCODE_VERSION_ENV = '([^']+)'/.exec(imageVersion)?.[1]
   assert.ok(name, 'opencode-generation.ts has no IMAGE_OPENCODE_VERSION_ENV')
   assert.match(dockerfile, new RegExp(`^ENV ${name}=\\$\\{OPENCODE_VERSION\\}$`, 'm'))
 })
 
-test('the image leaves the V2 file watcher at its default and keeps the V1 flags the V1 child still gets', () => {
-  // #then
+test('the image sets no OpenCode flag the V2 child does not receive', () => {
+  // #then the child environment is an allowlist that forwards none of them, so an ENV here would only mislead
   assert.doesNotMatch(dockerfile, /OPENCODE_DISABLE_FILEWATCHER/)
-  assert.match(dockerfile, /^ENV OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER=true$/m)
-  assert.match(dockerfile, /^ENV OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true$/m)
-})
-
-test('the V1 base config is still written exactly as before for V1 and harness builds', () => {
-  // #then the V1 printf, with the V1 key and the V1 Systematic version, is the non-V2 arm
-  assert.ok(
-    dockerfile.includes(
-      `printf '{\\n  "$schema": "https://opencode.ai/config.json",\\n  "autoupdate": false,\\n  "plugin": ["@fro.bot/systematic@%s"]\\n}\\n' "\${SYSTEMATIC_VERSION}"`,
-    ),
-  )
+  assert.doesNotMatch(dockerfile, /OPENCODE_EXPERIMENTAL_/)
 })
 
 test('the V2 base and managed configs carry no plugin entry: the plugins load from the config content', () => {
@@ -116,24 +107,11 @@ test('the V2 base and managed configs carry no plugin entry: the plugins load fr
   )
 })
 
-test('the V2 managed config is selected only for V2 and is root-owned and not agent-writable', () => {
+test('the V2 managed config is baked to the managed config dir, root-owned and not agent-writable', () => {
   // #then
-  assert.match(dockerfile, /COPY deploy\/managed-config\/opencode-v2\.json \/usr\/local\/share\/fro-bot\/opencode-managed\.v2\.json/)
-  assert.match(dockerfile, /cp \/usr\/local\/share\/fro-bot\/opencode-managed\.v2\.json \/etc\/opencode\/opencode\.json/)
-  assert.match(
-    dockerfile,
-    /chown 0:0 \/usr\/local\/share\/fro-bot\/opencode-managed\.v2\.json \/etc\/opencode\/opencode\.json/,
-  )
-  assert.match(
-    dockerfile,
-    /chmod 0644 \/usr\/local\/share\/fro-bot\/opencode-managed\.v2\.json \/etc\/opencode\/opencode\.json/,
-  )
-})
-
-test('every version test in the runtime stage and the V2 stage uses the same V2 arm', () => {
-  // #then a drifted pattern would send one step down the V1 path and another down the V2 path
-  const arms = dockerfile.split(V2_VERSION_ARM).length - 1
-  assert.ok(arms >= 5, `expected the V2 arm in at least five version tests, found ${arms}`)
+  assert.match(dockerfile, /^COPY deploy\/managed-config\/opencode-v2\.json \/etc\/opencode\/opencode\.json$/m)
+  assert.match(dockerfile, /chown 0:0 \/etc\/opencode\/opencode\.json/)
+  assert.match(dockerfile, /chmod 0644 \/etc\/opencode\/opencode\.json/)
 })
 
 test('the build stage has the runtime source the V2 runner is bundled from', () => {
@@ -147,39 +125,52 @@ test('the workspace agent expects the same plugin ids the V2 image is smoke-test
   assert.equal(constant('FRO_BOT_PLUGIN_ID'), 'fro-bot.opencode-plugin')
 })
 
-/** The entrypoint's V2 selection (`case "${WORKSPACE_IMAGE_OPENCODE_VERSION:-}" in ... esac`), run by `sh`. */
-function entrypointSelectsV2(version) {
-  const match = /^case "\$\{WORKSPACE_IMAGE_OPENCODE_VERSION:-\}" in\n[\s\S]*?^esac$/m.exec(entrypoint)
-  assert.ok(match, 'the entrypoint has no WORKSPACE_IMAGE_OPENCODE_VERSION selection')
-  const result = spawnSync('sh', ['-c', `${match[0]}\nprintf %s "$OPENCODE_V2"`], {
-    encoding: 'utf8',
-    env: {PATH: process.env.PATH, ...(version === undefined ? {} : {WORKSPACE_IMAGE_OPENCODE_VERSION: version})},
-  })
-  assert.equal(result.status, 0, result.stderr)
-  return result.stdout === 'true'
-}
-
-test('the entrypoint selects V2 from the baked version with the same arm the Dockerfile uses', () => {
-  // #then the entrypoint, the Dockerfile and the workspace agent agree on which images are V2
-  assert.ok(entrypoint.includes(V2_VERSION_ARM))
-  assert.equal(entrypointSelectsV2(argDefault('OPENCODE_VERSION')), false)
-  assert.equal(entrypointSelectsV2(JSON.parse(read('packages/runtime/src/shared/opencode-v2-pin.json')).version), true)
-  assert.equal(entrypointSelectsV2('2.2.5'), true)
-  assert.equal(entrypointSelectsV2('10.0.0'), true)
-  assert.equal(entrypointSelectsV2('1.19.4+harness.5bde2635'), false)
-  assert.equal(entrypointSelectsV2(''), false)
-  assert.equal(entrypointSelectsV2(undefined), false)
+test('the build takes OPENCODE_VERSION as a required argument: no ARG carries a default', () => {
+  // #then a literal default would be a second copy of the pin (packages/runtime/src/shared/opencode-v2-pin.json)
+  assert.ok(opencodeVersionArgs.length >= 3, 'the gate, the opencode-v2 stage and the runtime stage each declare it')
+  for (const line of opencodeVersionArgs) assert.equal(line, 'ARG OPENCODE_VERSION', `${line} carries a default`)
 })
 
-test('the entrypoint hands the secret to the agent-uid provisioner and asks for no auth.json only on V2', () => {
-  // #then V1 keeps piping the blob; V2 clears it and passes the flag, both ahead of the one provisioning call
-  const v2Block = /if \[ "\$OPENCODE_V2" = true \]; then\n  AUTH_RAW=""\n  provision_flags="--no-auth-json"\nfi/.exec(
-    entrypoint,
-  )
-  assert.ok(v2Block, 'the V2 branch clears AUTH_RAW and sets --no-auth-json')
-  assert.ok(entrypoint.indexOf(v2Block[0]) < entrypoint.indexOf('printf \'%s\' "$AUTH_RAW" | setpriv'))
+test('every stage starts from the version gate, so a bad version fails before any download', () => {
+  // #given the gate and every other stage's FROM
+  const froms = [...dockerfile.matchAll(/^FROM (\S+)(?: AS (\S+))?$/gm)].map(match => ({base: match[1], name: match[2]}))
+  const gate = froms.find(from => from.name === 'version-gate')
+  assert.ok(gate, 'the Dockerfile has no version-gate stage')
+
+  // #then no stage reaches a registry image except through it
+  for (const from of froms.filter(from => from.name !== 'version-gate')) {
+    assert.ok(['version-gate', 'build-deps'].includes(from.base), `${from.name} starts from ${from.base}`)
+  }
+  for (const name of ['build-deps', 'opencode-v2', 'runtime']) {
+    assert.equal(froms.find(from => from.name === name)?.base, 'version-gate', `${name} does not start from the gate`)
+  }
+})
+
+test('the gate refuses an unset, malformed, V1, harness or unpinned version and names the pin file', () => {
+  // #then
+  assert.match(gateStage, /''\) echo "OPENCODE_VERSION is required/)
+  assert.match(gateStage, /\*harness\*\) echo/)
+  assert.match(gateStage, /\[2-9\]\.\*\|\[1-9\]\[0-9\]\*\.\*\) : ;;/)
+  assert.match(gateStage, /is not the pinned V2 version/)
+  assert.ok(gateStage.includes('packages/runtime/src/shared/opencode-v2-pin.json'))
+  // the pin is bind-mounted for the check, not copied into a layer every stage inherits
+  assert.match(gateStage, /--mount=type=bind,source=packages\/runtime\/src\/shared\/opencode-v2-pin\.json/)
+  assert.doesNotMatch(gateStage, /^COPY /m)
+})
+
+test('the retired V1 install paths are gone', () => {
+  // #then
+  assert.doesNotMatch(dockerfile, /fro-bot\/agent\/releases/)
+  assert.doesNotMatch(dockerfile, /no-task-reuse|\/usr\/local\/lib\/fro-bot\/plugins/)
+  assert.doesNotMatch(dockerfile, /"autoupdate": false/)
+})
+
+test('the entrypoint hands the agent-uid provisioner no secret and no auth.json flag', () => {
+  // #then the one provisioning call takes the base, the stale auth.json path and the config path, with stdin closed
   assert.match(
     entrypoint,
-    /provision-agent-config\.mjs" "\$BASE_CONFIG_PATH" "\$AUTH_DEST" "\$CONFIG_DEST" \$\{provision_flags:\+"\$provision_flags"\}/,
+    /provision-agent-config\.mjs" "\$BASE_CONFIG_PATH" "\$STALE_AUTH_PATH" "\$CONFIG_DEST" <\/dev\/null/,
   )
+  assert.doesNotMatch(entrypoint, /AUTH_RAW|--no-auth-json|OPENCODE_V2/)
+  assert.doesNotMatch(entrypoint, /printf '%s' .*\| setpriv/)
 })

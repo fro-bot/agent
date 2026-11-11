@@ -217,7 +217,7 @@ export interface UpdateNetworkConfig {
  *   `proxy` as "never consult the ambient environment" — this function IS the one sanctioned place
  *   ambient proxy env is read, exactly once, at startup; every later `/update` call receives the
  *   already-resolved value, never re-reads `process.env` itself.
- * - CA bundle: `GIT_SSL_CAINFO` — the same env var name `opencode-server.ts`'s `CA_BUNDLE_ENV_NAMES`
+ * - CA bundle: `GIT_SSL_CAINFO` — the same env var name `opencode-server-v2.ts`'s `CA_BUNDLE_ENV_NAMES`
  *   already forwards into the OpenCode child process for the identical purpose (trusting the
  *   mitmproxy-installed CA). Reusing the identical name means a single value in the container's
  *   environment configures CA trust for both OpenCode's own egress and `/update`'s network git

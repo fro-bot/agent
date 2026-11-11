@@ -1,9 +1,9 @@
 /**
- * Execute+stream core for the gateway on OpenCode V2 (v2.2.0): the sibling of `run-core.ts`.
+ * Execute+stream core for the gateway on OpenCode V2 (v2.2.0).
  *
  * Responsibility boundary, unchanged: this owns session creation, prompt send, event subscription, event → sink routing
  * and resolution. It does NOT own the lock, run-state lifecycle, heartbeat, mention routing or the authorization gate;
- * those live in `run.ts` and are shared by both generations. It throws the same `RunCoreError`, so `run.ts` maps `kind`
+ * those live in `run.ts`. It throws the same `RunCoreError`, so `run.ts` maps `kind`
  * to coarse Discord replies exactly as before.
  *
  * What V2 changes, and where it shows:

@@ -1,14 +1,13 @@
 /**
- * Tests for the V2 selector in main.ts. The image bakes WORKSPACE_IMAGE_OPENCODE_VERSION; major 2 or above injects the
- * V2 supervised runner, proxy and disposer, anything else leaves startup exactly as the V1 tests pin it.
+ * Tests for the image-version gate in main.ts. The image bakes WORKSPACE_IMAGE_OPENCODE_VERSION; startup wires the V2
+ * supervised runner, proxy and disposer from a V2 version, and exits before it binds anything for an unset, V1 or
+ * malformed one.
  */
 
 import type {CreateAppFn, ExitFn} from './main.js'
 import type {CreateInstanceDisposerV2Options} from './opencode-instance-v2.js'
 import type {OpencodeProxyHandle, OpencodeProxyV2Options} from './opencode-proxy-v2.js'
-import type {OpencodeProxyOptions} from './opencode-proxy.js'
 import type {RunSupervisedOpencodeV2Options} from './opencode-server-v2.js'
-import type {RunSupervisedOpencodeOptions} from './opencode-server.js'
 import type {ServerDeps} from './server.js'
 
 import http from 'node:http'
@@ -53,12 +52,9 @@ function makeExitFn(exitLog: string[]): ExitFn {
 
 interface Harness {
   readonly callLog: string[]
-  readonly v1Runner: ReturnType<typeof vi.fn>
-  readonly v2Runner: ReturnType<typeof vi.fn>
-  readonly v1Proxy: ReturnType<typeof vi.fn>
-  readonly v2Proxy: ReturnType<typeof vi.fn>
-  readonly v1Disposer: ReturnType<typeof vi.fn>
-  readonly v2Disposer: ReturnType<typeof vi.fn>
+  readonly runner: ReturnType<typeof vi.fn>
+  readonly proxy: ReturnType<typeof vi.fn>
+  readonly disposer: ReturnType<typeof vi.fn>
   readonly appDeps: {value?: ServerDeps}
   readonly deps: Parameters<typeof startWorkspaceAgent>[0]
 }
@@ -69,34 +65,23 @@ function harness(
 ): Harness {
   const callLog: string[] = []
   const appDeps: {value?: ServerDeps} = {}
-  const v1Runner = vi.fn(async (_options: RunSupervisedOpencodeOptions) => {
-    callLog.push('runV1')
-  })
-  const v2Runner = vi.fn(async (_options: RunSupervisedOpencodeV2Options) => {
+  const runner = vi.fn(async (_options: RunSupervisedOpencodeV2Options) => {
     callLog.push('runV2')
   })
-  const v1Proxy = vi.fn((_options: OpencodeProxyOptions) => {
-    callLog.push('proxyV1')
-    return makeFakeProxy(callLog)
-  })
-  const v2Proxy = vi.fn((_options: OpencodeProxyV2Options) => {
+  const proxy = vi.fn((_options: OpencodeProxyV2Options) => {
     callLog.push('proxyV2')
     return makeFakeProxy(callLog)
   })
-  const v1Disposer = vi.fn(() => async () => ({kind: 'skipped' as const}))
-  const v2Disposer = vi.fn((_options: CreateInstanceDisposerV2Options) => async () => ({kind: 'skipped' as const}))
+  const disposer = vi.fn((_options: CreateInstanceDisposerV2Options) => async () => ({kind: 'skipped' as const}))
   const createAppFn: CreateAppFn = deps => {
     appDeps.value = deps
     return new Hono()
   }
   return {
     callLog,
-    v1Runner,
-    v2Runner,
-    v1Proxy,
-    v2Proxy,
-    v1Disposer,
-    v2Disposer,
+    runner,
+    proxy,
+    disposer,
     appDeps,
     deps: {
       env,
@@ -105,12 +90,9 @@ function harness(
       reconcileUpdateJournalsFn: noopReconcile,
       reconcileRecoveryJournalsFn: noopReconcile,
       createAppFn,
-      runSupervisedOpencodeFn: v1Runner,
-      createOpencodeProxyFn: v1Proxy,
-      createInstanceDisposerFn: v1Disposer,
-      runSupervisedOpencodeV2Fn: v2Runner,
-      createOpencodeProxyV2Fn: v2Proxy,
-      createInstanceDisposerV2Fn: v2Disposer,
+      runSupervisedOpencodeFn: runner,
+      createOpencodeProxyFn: proxy,
+      createInstanceDisposerFn: disposer,
       ...extra,
     },
   }
@@ -125,88 +107,52 @@ async function terminate(h: Harness): Promise<string[]> {
   return h.callLog
 }
 
-describe('startWorkspaceAgent — OpenCode generation selector', () => {
+describe('startWorkspaceAgent — OpenCode image version', () => {
   afterEach(() => {
     process.removeAllListeners('SIGTERM')
     process.removeAllListeners('SIGINT')
     vi.restoreAllMocks()
   })
 
-  describe('V1 (variable unset or a V1 version)', () => {
-    it('uses the V1 runner, proxy and disposer when the image sets nothing, and reports no version', async () => {
-      // #given an image that predates the variable
-      const h = harness({})
-
-      // #when
-      await startWorkspaceAgent(h.deps)
-
-      // #then exactly the V1 trio is wired
-      expect(h.v1Runner).toHaveBeenCalledTimes(1)
-      expect(h.v1Proxy).toHaveBeenCalledTimes(1)
-      expect(h.v1Disposer).toHaveBeenCalledTimes(1)
-      expect(h.v2Runner).not.toHaveBeenCalled()
-      expect(h.v2Proxy).not.toHaveBeenCalled()
-      expect(h.v2Disposer).not.toHaveBeenCalled()
-      expect(h.appDeps.value).toBeDefined()
-      expect(h.appDeps.value).not.toHaveProperty('opencodeVersion')
-    })
-
-    it('keeps the V1 trio for a V1 image version and reports that version', async () => {
-      // #given
-      const h = harness({WORKSPACE_IMAGE_OPENCODE_VERSION: '1.19.4+harness.5bde2635'})
+  describe('a V2 image version', () => {
+    it('wires the runner, proxy and disposer, and reports the version', async () => {
+      // #given an image that installed stock 2.2.6
+      const h = harness({WORKSPACE_IMAGE_OPENCODE_VERSION: '2.2.6', WORKSPACE_OPENCODE_READY_TIMEOUT_MS: '7000'})
 
       // #when
       await startWorkspaceAgent(h.deps)
 
       // #then
-      expect(h.v1Runner).toHaveBeenCalledTimes(1)
-      expect(h.v2Runner).not.toHaveBeenCalled()
-      expect(h.appDeps.value?.opencodeVersion).toBe('1.19.4+harness.5bde2635')
-    })
-  })
-
-  describe('V2 (major 2 or above)', () => {
-    it('uses the V2 runner, proxy and disposer, and reports the version', async () => {
-      // #given an image that installed stock 2.2.0
-      const h = harness({WORKSPACE_IMAGE_OPENCODE_VERSION: '2.2.0', WORKSPACE_OPENCODE_READY_TIMEOUT_MS: '7000'})
-
-      // #when
-      await startWorkspaceAgent(h.deps)
-
-      // #then exactly the V2 trio is wired
-      expect(h.v2Runner).toHaveBeenCalledTimes(1)
-      expect(h.v2Proxy).toHaveBeenCalledTimes(1)
-      expect(h.v2Disposer).toHaveBeenCalledTimes(1)
-      expect(h.v1Runner).not.toHaveBeenCalled()
-      expect(h.v1Proxy).not.toHaveBeenCalled()
-      expect(h.v1Disposer).not.toHaveBeenCalled()
-      expect(h.appDeps.value?.opencodeVersion).toBe('2.2.0')
-      expect(h.v2Runner.mock.calls[0]?.[0]).toMatchObject({rootDir: '/workspace/repos', readyTimeoutMs: 7000})
-      expect(h.v2Proxy.mock.calls[0]?.[0]).toMatchObject({
+      expect(h.runner).toHaveBeenCalledTimes(1)
+      expect(h.proxy).toHaveBeenCalledTimes(1)
+      expect(h.disposer).toHaveBeenCalledTimes(1)
+      expect(h.appDeps.value?.opencodeVersion).toBe('2.2.6')
+      expect(h.runner.mock.calls[0]?.[0]).toMatchObject({rootDir: '/workspace/repos', readyTimeoutMs: 7000})
+      expect(h.proxy.mock.calls[0]?.[0]).toMatchObject({
         token: 'gateway-bearer',
         upstreamUrl: 'http://127.0.0.1:54321',
       })
-      expect(h.v2Disposer.mock.calls[0]?.[0]).toMatchObject({upstreamUrl: 'http://127.0.0.1:54321'})
+      expect(h.disposer.mock.calls[0]?.[0]).toMatchObject({upstreamUrl: 'http://127.0.0.1:54321'})
     })
 
     it('hands the runner, the proxy and the disposer the same credential holder', async () => {
       // #given
-      const h = harness({WORKSPACE_IMAGE_OPENCODE_VERSION: '2.2.0'})
+      const h = harness({WORKSPACE_IMAGE_OPENCODE_VERSION: '2.2.6'})
 
       // #when
       await startWorkspaceAgent(h.deps)
 
       // #then one holder: what the runner publishes is what the proxy and the disposer read
-      const runnerHolder = (h.v2Runner.mock.calls[0]?.[0] as RunSupervisedOpencodeV2Options).credentials
-      const proxyHolder = (h.v2Proxy.mock.calls[0]?.[0] as OpencodeProxyV2Options).credentials
-      const disposerHolder = (h.v2Disposer.mock.calls[0]?.[0] as CreateInstanceDisposerV2Options).credentials
+      const runnerHolder = (h.runner.mock.calls[0]?.[0] as RunSupervisedOpencodeV2Options).credentials
+      const proxyHolder = (h.proxy.mock.calls[0]?.[0] as OpencodeProxyV2Options).credentials
+      const disposerHolder = (h.disposer.mock.calls[0]?.[0] as CreateInstanceDisposerV2Options).credentials
       expect(proxyHolder).toBe(runnerHolder)
       expect(disposerHolder).toBe(runnerHolder)
     })
 
     it('keeps the startup order: serve, proxy created, proxy listening, and only then the runner', async () => {
       // #given
-      const h = harness({WORKSPACE_IMAGE_OPENCODE_VERSION: '2.2.0'})
+      const h = harness({WORKSPACE_IMAGE_OPENCODE_VERSION: '2.2.6'})
 
       // #when
       await startWorkspaceAgent(h.deps)
@@ -217,12 +163,12 @@ describe('startWorkspaceAgent — OpenCode generation selector', () => {
 
     it('lets the V2 disposer run only while the supervisor reports ready', async () => {
       // #given
-      const h = harness({WORKSPACE_IMAGE_OPENCODE_VERSION: '2.2.0'})
+      const h = harness({WORKSPACE_IMAGE_OPENCODE_VERSION: '2.2.6'})
       await startWorkspaceAgent(h.deps)
-      const options = h.v2Disposer.mock.calls[0]?.[0] as CreateInstanceDisposerV2Options
+      const options = h.disposer.mock.calls[0]?.[0] as CreateInstanceDisposerV2Options
 
       // #then the readiness predicate follows the status ref the app and the runner share
-      const statusRef = (h.v2Runner.mock.calls[0]?.[0] as RunSupervisedOpencodeV2Options).statusRef
+      const statusRef = (h.runner.mock.calls[0]?.[0] as RunSupervisedOpencodeV2Options).statusRef
       statusRef.status = 'starting'
       expect(options.isRunning?.()).toBe(false)
       statusRef.status = 'ready'
@@ -230,18 +176,28 @@ describe('startWorkspaceAgent — OpenCode generation selector', () => {
     })
   })
 
-  describe('a value that is set but is not a version', () => {
-    it('refuses to start and binds nothing, rather than guess a generation', async () => {
-      // #given an operator override that names no version
+  describe('an image without a V2 version', () => {
+    it.each([
+      ['unset', {}, 'WORKSPACE_IMAGE_OPENCODE_VERSION is not set'],
+      ['blank', {WORKSPACE_IMAGE_OPENCODE_VERSION: '  '}, 'WORKSPACE_IMAGE_OPENCODE_VERSION is not set'],
+      ['a V1 harness build', {WORKSPACE_IMAGE_OPENCODE_VERSION: '1.19.5+harness.bf7f7dfe'}, 'V2 only'],
+      ['a stock V1 build', {WORKSPACE_IMAGE_OPENCODE_VERSION: '1.19.4'}, 'V2 only'],
+      ['not a version', {WORKSPACE_IMAGE_OPENCODE_VERSION: 'latest'}, 'is not an OpenCode version'],
+    ])('exits 1 with a named error and binds nothing when the image version is %s', async (_label, env, expected) => {
+      // #given
       const exitLog: string[] = []
-      const h = harness({WORKSPACE_IMAGE_OPENCODE_VERSION: 'latest'}, {exitFn: makeExitFn(exitLog)})
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+      const h = harness(env, {exitFn: makeExitFn(exitLog)})
 
       // #when / #then
       await expect(startWorkspaceAgent(h.deps)).rejects.toThrow('exitFn(1)')
       expect(exitLog).toEqual(['exit(1)'])
       expect(h.callLog).toEqual([])
-      expect(h.v1Runner).not.toHaveBeenCalled()
-      expect(h.v2Runner).not.toHaveBeenCalled()
+      expect(h.runner).not.toHaveBeenCalled()
+      expect(errorSpy).toHaveBeenCalledWith(
+        'workspace-agent: cannot start — invalid OpenCode image version',
+        expect.objectContaining({message: expect.stringContaining(expected) as string}),
+      )
     })
   })
 
@@ -250,7 +206,7 @@ describe('startWorkspaceAgent — OpenCode generation selector', () => {
       // #given a V2 supervisor whose teardown takes a moment after the abort, and main.ts as the only SIGTERM handler
       process.removeAllListeners('SIGTERM')
       let finishTeardown: () => void = () => undefined
-      const h = harness({WORKSPACE_IMAGE_OPENCODE_VERSION: '2.2.0'})
+      const h = harness({WORKSPACE_IMAGE_OPENCODE_VERSION: '2.2.6'})
       const slowRunner = vi.fn(async (options: RunSupervisedOpencodeV2Options): Promise<void> => {
         h.callLog.push('runV2')
         await new Promise<void>(resolve => options.signal?.addEventListener('abort', () => resolve(), {once: true}))
@@ -260,7 +216,7 @@ describe('startWorkspaceAgent — OpenCode generation selector', () => {
         })
         h.callLog.push('teardown.done')
       })
-      await startWorkspaceAgent({...h.deps, runSupervisedOpencodeV2Fn: slowRunner})
+      await startWorkspaceAgent({...h.deps, runSupervisedOpencodeFn: slowRunner})
 
       // #when SIGTERM arrives
       const pending = terminate(h)

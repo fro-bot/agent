@@ -339,7 +339,7 @@ test('merge output contains no unexpected top-level keys beyond known safe set',
   assert.deepEqual(unexpectedKeys, [], `merge introduced unexpected top-level keys: ${unexpectedKeys.join(', ')}`)
 })
 
-// ─── Unit 6: subagent_depth pin (workspace-layer mirror of ci-config.ts R12) ─
+// ─── Unit 6: subagent_depth pin ─
 
 test('subagent_depth: no depth anywhere → forced to numeric 1, no warning', () => {
   const result = mergeConfig(BASE, '', '')
