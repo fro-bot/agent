@@ -232,11 +232,31 @@ export type {
   ResponseSurface,
   ResponseSurfacePolicy,
 } from './response-file.js'
-export {DEFAULT_OPENCODE_V2_TIMEOUTS, startOpenCodeV2Server} from './server-v2.js'
+export {
+  buildRunAsSandboxArgv,
+  buildSetprivDropArgs,
+  createSandboxAccount,
+  DEFAULT_SANDBOX_STOP_BOUND_MS,
+  deleteSandboxAccount,
+  SANDBOX_ACCOUNT_NAME,
+  stopSandboxProcesses,
+} from './sandbox-identity.js'
+export type {
+  PrivilegedRun,
+  PrivilegedRunResult,
+  SandboxAccount,
+  SandboxAccountError,
+  SandboxDeleteOutcome,
+  SandboxIdentityDeps,
+  SandboxIdentityTools,
+  SandboxStopOutcome,
+} from './sandbox-identity.js'
+export {buildSandboxLaunch, DEFAULT_OPENCODE_V2_TIMEOUTS, startOpenCodeV2Server} from './server-v2.js'
 export type {
   OpenCodeV2ExitInfo,
   OpenCodeV2ExitOutcome,
   OpenCodeV2PluginProblem,
+  OpenCodeV2SandboxLaunch,
   OpenCodeV2ServerHandle,
   OpenCodeV2ShutdownOptions,
   OpenCodeV2ShutdownResult,

@@ -24,6 +24,10 @@ export const SANDBOX_TOOL_NAMES = [
   'pgrep',
   'find',
   'chown',
+  'chmod',
+  'mkdir',
+  'env',
+  'git',
 ] as const
 
 export type SandboxToolName = (typeof SANDBOX_TOOL_NAMES)[number]
