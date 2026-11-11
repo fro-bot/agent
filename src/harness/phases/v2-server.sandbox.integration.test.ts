@@ -1,4 +1,3 @@
-import type {Server} from 'node:http'
 /**
  * Real-runner proof of `isolate-agent` (fro-bot/agent#2135, Phase 3).
  *
@@ -10,23 +9,55 @@ import type {Server} from 'node:http'
  * tool shell as the sandbox user. Each "blocked" probe has a positive control: the same command run as the runner must
  * succeed (be OPEN), otherwise a BLOCKED result proves nothing.
  *
+ * Four suites run one after another (the sandbox account name is fixed, so two never overlap):
+ *   1. the boundary: blocked and works rows, identity, quiescence, take-back;
+ *   2. a provisioned `gh` config and an admitted repo skill;
+ *   3. the persistence round trip (restore, isolated run, checkpoint and save, restore, isolated run);
+ *   4. hostile git state written through the model's shell, then runner-side git after take-back.
+ *
  *   FRO_BOT_SANDBOX_INTEGRATION=1 FRO_BOT_OPENCODE_V2_BIN=/path/to/opencode bun run test src/harness/phases/v2-server.sandbox
  */
-import type {OpenCodeV2ServerHandle} from '@fro-bot/runtime'
+import type {SandboxToolPaths} from '../../services/setup/sandbox-preflight.js'
+import type {Logger} from '../../shared/logger.js'
 import type {SandboxLifecycle, SandboxReleaseResult} from './sandbox-lifecycle.js'
-import {Buffer} from 'node:buffer'
+import type {Probe, Row, ScriptedProvider} from './v2-server.sandbox.harness.js'
 import {spawnSync} from 'node:child_process'
+import {createHash} from 'node:crypto'
 import * as fs from 'node:fs'
-import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
-import {startOpenCodeV2Server} from '@fro-bot/runtime'
+import {DatabaseSync} from 'node:sqlite'
+import {getSessionDbBasenames} from '@fro-bot/runtime'
 import {afterAll, beforeAll, describe, expect, it} from 'vitest'
+import {resolveBrokeredPushCommitMessage} from '../../features/delegated/commit-message.js'
+import {reconstructChanges} from '../../features/delegated/reconstruct-changes.js'
+import {
+  buildCacheKeyComponents,
+  buildPrimaryCacheKey,
+  buildSaveCacheKey,
+  restoreCache,
+  saveCache,
+  type CacheAdapter,
+  type CacheKeyComponents,
+} from '../../services/cache/index.js'
+import {buildCachePathsV2} from '../../services/cache/paths.js'
 import {createExecAdapter} from '../../services/setup/adapters.js'
+import {admitRepoSkills, createRepoSkillsStagingRoot} from '../../services/setup/repo-skills.js'
 import {createSandboxPreflightDeps, runSandboxPreflight} from '../../services/setup/sandbox-preflight.js'
+import {STORAGE_VERSION} from '../../shared/constants.js'
+import {getGitHubRunAttempt, getInvocationIdentity} from '../../shared/env.js'
 import {createLogger} from '../../shared/logger.js'
 import {createSandboxLifecycle} from './sandbox-lifecycle.js'
+import {
+  failuresFor,
+  parseRows,
+  PRELUDE,
+  q,
+  readProbe,
+  startScriptedProvider,
+  startScriptedSession,
+} from './v2-server.sandbox.harness.js'
 
 const BINARY = process.env.FRO_BOT_OPENCODE_V2_BIN
 const gated =
@@ -37,40 +68,145 @@ const gated =
   BINARY.length > 0
 
 const TOKEN_MARK = process.env.PROBE_DUMMY_TOKEN ?? 'dummy-probe-token'
-const PRELUDE = String.raw`R(){ echo "RESULT $1 $2 $3"; }; ev(){ head -c 240 | tr '\n\r\t' '   '; }; `
-const q = (value: string): string => `'${value.replaceAll("'", String.raw`'\''`)}'`
+const runnerHome = os.userInfo().homedir
+const runnerTemp = process.env.RUNNER_TEMP ?? path.join(runnerHome, 'work', '_temp')
 
-interface Probe {
-  readonly id: string
-  readonly category: 'blocked' | 'works' | 'info'
-  readonly cmd: string
-  /** Run the same command as the runner and require OPEN. */
-  readonly control?: boolean
-}
+// --- Helpers shared by the four suites ---------------------------------------------------------------------------------
 
-interface Row {
-  readonly status: string
-  readonly evidence: string
-}
-
-function parseRows(text: string): Map<string, Row[]> {
-  const rows = new Map<string, Row[]>()
-  for (const match of text.matchAll(/RESULT ([a-z0-9_]+) (BLOCKED|OPEN|WORKS|FAILED|INFO) ([^\n"]*)/g)) {
-    const [, id, status, evidence] = match
-    if (id === undefined || status === undefined) continue
-    rows.set(id, [...(rows.get(id) ?? []), {status, evidence: (evidence ?? '').trim()}])
+/** The runner's own environment, minus the throwaway XDG paths the test harness sets, so paths resolve as the Action's do. */
+function hostedEnv(workspace: string, xdgRoot?: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    HOME: runnerHome,
+    RUNNER_TEMP: runnerTemp,
+    GITHUB_WORKSPACE: workspace,
   }
-  return rows
+  for (const name of ['XDG_DATA_HOME', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME']) delete env[name]
+  if (xdgRoot !== undefined) {
+    env.XDG_DATA_HOME = path.join(xdgRoot, 'data')
+    env.XDG_CONFIG_HOME = path.join(xdgRoot, 'config')
+    env.XDG_CACHE_HOME = path.join(xdgRoot, 'cache')
+    env.XDG_STATE_HOME = path.join(xdgRoot, 'state')
+  }
+  return env
 }
 
-/** `BLOCKED` when the command could not read `file`; `OPEN` when it could. Read-only so a control cannot corrupt state. */
-const readProbe = (id: string, file: string): string =>
-  `f=${q(file)}; o=$( { cat "$f" >/dev/null; } 2>&1 ); rc=$?; ` +
-  `if [ $rc -ne 0 ]; then R ${id} BLOCKED "rc=$rc [$(printf %s "$o" | ev)]"; else R ${id} OPEN "readable"; fi`
+function git(cwd: string, ...args: string[]): string {
+  const result = spawnSync('git', args, {cwd, encoding: 'utf8'})
+  if (result.status !== 0) throw new Error(`git ${args.join(' ')}: ${result.stderr}`)
+  return result.stdout
+}
+
+/** A one-commit checkout owned by the runner. Returns the commit, which stands in for the trusted head SHA. */
+function initWorkspace(workspace: string): string {
+  fs.mkdirSync(workspace, {recursive: true})
+  git(workspace, 'init', '-q', '-b', 'main')
+  git(workspace, 'config', 'user.name', 'Runner Setup')
+  git(workspace, 'config', 'user.email', 'setup@example.invalid')
+  fs.writeFileSync(path.join(workspace, 'README.md'), '# fixture\n')
+  git(workspace, 'add', '.')
+  git(workspace, 'commit', '-qm', 'init')
+  // The identity setup configures globally for the runner; the sandbox must receive the same one.
+  spawnSync('git', ['config', '--global', 'user.name', 'Fro Bot'])
+  spawnSync('git', ['config', '--global', 'user.email', 'fro-bot@example.invalid'])
+  return git(workspace, 'rev-parse', 'HEAD').trim()
+}
+
+/** Runs each control probe as the runner. A blocked row is only evidence when its control row is OPEN. */
+function runControls(steps: readonly Probe[], cwd: string, env: NodeJS.ProcessEnv): Map<string, Row[]> {
+  return new Map(
+    steps
+      .filter(step => step.control === true)
+      .map(step => {
+        const result = spawnSync('bash', ['-c', PRELUDE + step.cmd], {encoding: 'utf8', cwd, env})
+        return [step.id, parseRows(result.stdout + result.stderr).get(step.id) ?? []] as const
+      }),
+  )
+}
+
+function uncontrolledRows(controls: ReadonlyMap<string, readonly Row[]>): string[] {
+  const bad: string[] = []
+  for (const [id, controlRows] of controls) {
+    if (controlRows.length === 0 || controlRows.some(row => row.status !== 'OPEN')) {
+      bad.push(`${id}: ${JSON.stringify(controlRows)}`)
+    }
+  }
+  return bad
+}
+
+interface IsolatedRunOptions {
+  readonly tools: SandboxToolPaths
+  readonly env: NodeJS.ProcessEnv
+  readonly workspace: string
+  readonly responseDir: string
+  readonly keyFile: string
+  readonly steps: readonly Probe[]
+  readonly logger: Logger
+  readonly ghConfigDir?: string
+  readonly repoSkills?: {readonly stagingRoot: string; readonly admittedDir: string | null}
+  /** Called with the lifecycle as soon as it exists, so a suite's `afterAll` can release it if the run throws. */
+  readonly onLifecycle?: (lifecycle: SandboxLifecycle) => void
+}
+
+interface IsolatedRunResult {
+  readonly rows: ReadonlyMap<string, readonly Row[]>
+  readonly released: SandboxReleaseResult
+}
+
+/** One whole isolated run: handoff, launch as the sandbox, one scripted turn, graceful stop, verify, take back. */
+async function runIsolated(options: IsolatedRunOptions): Promise<IsolatedRunResult> {
+  const provider: ScriptedProvider = await startScriptedProvider(() => options.steps)
+  const lifecycle = createSandboxLifecycle({
+    tools: options.tools,
+    env: options.env,
+    runnerHome,
+    workspacePath: options.workspace,
+    responseDir: options.responseDir,
+    logger: options.logger,
+  })
+  options.onLifecycle?.(lifecycle)
+  try {
+    const prepared = await lifecycle.prepare({
+      keyFilePaths: [options.keyFile],
+      ghConfigDir: options.ghConfigDir ?? null,
+      repoSkills: options.repoSkills ?? null,
+    })
+    if (!prepared.success) throw new Error(prepared.error)
+    const handle = await startScriptedSession({
+      binary: BINARY ?? '',
+      workspace: options.workspace,
+      env: options.env,
+      sandbox: prepared.data,
+      keyFile: options.keyFile,
+      provider,
+      logger: options.logger,
+    })
+    const rows = parseRows(provider.state.results.join('\n'))
+    await handle.shutdown()
+    const released = await lifecycle.release()
+    return {rows, released}
+  } finally {
+    await lifecycle.release()
+    await provider.close()
+  }
+}
+
+function writeKeyFile(keyDir: string): string {
+  fs.mkdirSync(keyDir, {recursive: true})
+  const keyFile = path.join(keyDir, 'fake.key')
+  fs.writeFileSync(keyFile, 'sk-fake-canary', {mode: 0o600})
+  return keyFile
+}
+
+async function preflightTools(logger: Logger): Promise<SandboxToolPaths> {
+  const preflight = await runSandboxPreflight({...createSandboxPreflightDeps(createExecAdapter(), logger)})
+  if (!preflight.ok) throw new Error(preflight.message)
+  return preflight.tools
+}
+
+// --- 1. The boundary ---------------------------------------------------------------------------------------------------
 
 describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted runner', () => {
-  const runnerHome = os.userInfo().homedir
-  const runnerTemp = process.env.RUNNER_TEMP ?? path.join(runnerHome, 'work', '_temp')
   const logger = createLogger({phase: 'sandbox-integration'})
   const scratch = path.join(runnerTemp, `sandbox-it-${process.pid}`)
   const workspace = path.join(scratch, 'ws')
@@ -84,32 +220,16 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
     cache: path.join(runnerHome, '.cache', 'sandbox-it-canary', 'c.txt'),
     docker: path.join(runnerHome, '.docker', 'config.json'),
   }
-  // The runner's own environment, minus the throwaway XDG paths the test harness sets, so the lifecycle resolves the
-  // paths the Action would.
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
-    HOME: runnerHome,
-    RUNNER_TEMP: runnerTemp,
-    GITHUB_WORKSPACE: workspace,
-  }
-  for (const name of ['XDG_DATA_HOME', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME']) delete env[name]
+  const env = hostedEnv(workspace)
 
-  let provider: Server | undefined
+  let provider: ScriptedProvider | undefined
   let providerPort = 0
-  let handle: OpenCodeV2ServerHandle | undefined
   let lifecycle: SandboxLifecycle | undefined
   let released: SandboxReleaseResult | undefined
   let rows = new Map<string, Row[]>()
   let controls = new Map<string, Row[]>()
   let identityLine = ''
   let straysAfterRelease = ''
-
-  /** Rows of probe `id` that are missing or not `expected`; empty means the probe came out as expected. */
-  const failuresFor = (id: string, expected: string): string[] => {
-    const found = rows.get(id)
-    if (found === undefined || found.length === 0) return [`${id}: no result`]
-    return found.filter(row => row.status !== expected).map(row => `${id}: ${row.status} ${row.evidence}`)
-  }
 
   const probes = (): Probe[] => [
     {
@@ -223,182 +343,48 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
   ]
 
   beforeAll(async () => {
-    const preflight = await runSandboxPreflight({...createSandboxPreflightDeps(createExecAdapter(), logger)})
-    if (!preflight.ok) throw new Error(preflight.message)
+    const tools = await preflightTools(logger)
 
     // --- Fixtures the runner owns -----------------------------------------------------------------------------
-    for (const dir of [workspace, responseDir, keyDir, secretDir]) fs.mkdirSync(dir, {recursive: true})
+    for (const dir of [responseDir, secretDir]) fs.mkdirSync(dir, {recursive: true})
     fs.chmodSync(secretDir, 0o700)
     fs.writeFileSync(path.join(secretDir, 'secret.txt'), 'top secret')
     fs.writeFileSync(sentinel, 'sentinel-content', {mode: 0o600})
-    fs.writeFileSync(path.join(keyDir, 'fake.key'), 'sk-fake-canary', {mode: 0o600})
+    const keyFile = writeKeyFile(keyDir)
     for (const file of Object.values(canaries)) {
       fs.mkdirSync(path.dirname(file), {recursive: true})
       fs.writeFileSync(file, 'canary', {mode: 0o644})
     }
-    const git = (...args: string[]): void => {
-      const result = spawnSync('git', args, {cwd: workspace, encoding: 'utf8'})
-      if (result.status !== 0) throw new Error(`git ${args.join(' ')}: ${result.stderr}`)
-    }
-    git('init', '-q', '-b', 'main')
-    git('config', 'user.name', 'Runner Setup')
-    git('config', 'user.email', 'setup@example.invalid')
-    fs.writeFileSync(path.join(workspace, 'README.md'), '# fixture\n')
-    git('add', '.')
-    git('commit', '-qm', 'init')
-    // The identity setup configures globally for the runner; the sandbox must receive the same one.
-    spawnSync('git', ['config', '--global', 'user.name', 'Fro Bot'])
-    spawnSync('git', ['config', '--global', 'user.email', 'fro-bot@example.invalid'])
+    initWorkspace(workspace)
+
+    // The provider starts first: a probe command embeds its port, and the steps are read lazily.
+    provider = await startScriptedProvider(probes)
+    providerPort = provider.port
 
     // --- Positive controls: the same probes as the runner must be OPEN --------------------------------------------
-    // Provider port is needed by a probe command, so the provider starts first.
-    const steps = probes()
-    const state = {results: [] as string[], done: false}
-    provider = http.createServer((req, res) => {
-      if (req.method === 'GET') {
-        res.writeHead(200, {'content-type': 'application/json'})
-        res.end(JSON.stringify({object: 'list', data: [{id: 'fixture-model', object: 'model'}]}))
-        return
-      }
-      const chunks: Buffer[] = []
-      req.on('data', (chunk: Buffer) => chunks.push(chunk))
-      req.on('end', () => {
-        const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
-          tools?: {function?: {name?: string}}[]
-          messages?: {role: string; content: unknown}[]
-        }
-        const send = (delta: object, finish: string | null): void => {
-          res.write(
-            `data: ${JSON.stringify({id: 'c', object: 'chat.completion.chunk', created: 1, model: 'fixture-model', choices: [{index: 0, delta, finish_reason: finish}]})}\n\n`,
-          )
-        }
-        res.writeHead(200, {'content-type': 'text/event-stream', 'cache-control': 'no-cache'})
-        const tools = (body.tools ?? []).map(tool => tool.function?.name ?? '')
-        if (tools.length === 0) {
-          send({role: 'assistant', content: 'Probe title'}, null)
-          send({}, 'stop')
-          res.end('data: [DONE]\n\n')
-          return
-        }
-        const toolName = tools.find(name => name === 'bash') ?? tools.find(name => name === 'shell') ?? 'bash'
-        const toolMessages = (body.messages ?? []).filter(message => message.role === 'tool')
-        const last = toolMessages.at(-1)
-        if (last !== undefined) {
-          state.results[toolMessages.length - 1] =
-            typeof last.content === 'string' ? last.content : JSON.stringify(last.content)
-        }
-        const index = toolMessages.length
-        const step = steps[index]
-        if (step === undefined) {
-          state.done = true
-          send({role: 'assistant', content: 'probes done'}, null)
-          send({}, 'stop')
-        } else {
-          send(
-            {
-              role: 'assistant',
-              tool_calls: [
-                {
-                  index: 0,
-                  id: `call_${index}`,
-                  type: 'function',
-                  function: {
-                    name: toolName,
-                    arguments: JSON.stringify({command: PRELUDE + step.cmd, description: step.id}),
-                  },
-                },
-              ],
-            },
-            null,
-          )
-          send({}, 'tool_calls')
-        }
-        res.end('data: [DONE]\n\n')
-      })
-    })
-    await new Promise<void>(resolve => provider?.listen(0, '127.0.0.1', resolve))
-    const address = provider.address()
-    providerPort = typeof address === 'object' && address !== null ? address.port : 0
-    // Probe commands embed the provider port, so rebuild them now that it is known.
-    steps.splice(0, steps.length, ...probes())
-
-    controls = new Map(
-      steps
-        .filter(step => step.control === true)
-        .map(step => {
-          const result = spawnSync('bash', ['-c', PRELUDE + step.cmd], {
-            encoding: 'utf8',
-            cwd: workspace,
-            env: process.env,
-          })
-          return [step.id, parseRows(result.stdout + result.stderr).get(step.id) ?? []] as const
-        }),
-    )
+    controls = runControls(probes(), workspace, process.env)
 
     // --- Hand over, launch, drive one turn --------------------------------------------------------------------------
     lifecycle = createSandboxLifecycle({
-      tools: preflight.tools,
+      tools,
       env,
       runnerHome,
       workspacePath: workspace,
       responseDir,
       logger,
     })
-    const prepared = await lifecycle.prepare({
-      keyFilePaths: [path.join(keyDir, 'fake.key')],
-      ghConfigDir: null,
-      repoSkills: null,
-    })
+    const prepared = await lifecycle.prepare({keyFilePaths: [keyFile], ghConfigDir: null, repoSkills: null})
     if (!prepared.success) throw new Error(prepared.error)
-
-    const started = await startOpenCodeV2Server(
-      {
-        binaryPath: BINARY ?? '',
-        directory: workspace,
-        expectedPluginIds: [],
-        env,
-        sandbox: prepared.data,
-        config: {
-          share: 'disabled',
-          model: 'fake/fixture-model',
-          plugins: [],
-          provider: {
-            fake: {
-              npm: '@ai-sdk/openai-compatible',
-              name: 'Fake',
-              options: {
-                baseURL: `http://127.0.0.1:${providerPort}/v1`,
-                apiKey: `{file:${path.join(keyDir, 'fake.key')}}`,
-              },
-              models: {'fixture-model': {name: 'Fixture', tool_call: true, limit: {context: 100_000, output: 8000}}},
-            },
-          },
-          // This suite tests the OS boundary, not OpenCode's permission layer.
-          permission: {bash: 'allow', edit: 'allow', external_directory: 'allow', question: 'deny'},
-        },
-        timeouts: {agentReadyTimeoutMs: 90_000},
-      },
+    const handle = await startScriptedSession({
+      binary: BINARY ?? '',
+      workspace,
+      env,
+      sandbox: prepared.data,
+      keyFile,
+      provider,
       logger,
-    )
-    if (!started.success) throw new Error(`server start failed: ${started.error.message}`)
-    handle = started.data
-
-    const created = (await (
-      await handle.fetch('/api/session', {
-        method: 'POST',
-        headers: {'content-type': 'application/json'},
-        body: JSON.stringify({location: {directory: workspace}}),
-      })
-    ).json()) as {data: {id: string}}
-    handle.registerOwnedSession(created.data.id)
-    await handle.fetch(`/api/session/${created.data.id}/prompt`, {
-      method: 'POST',
-      headers: {'content-type': 'application/json'},
-      body: JSON.stringify({text: 'run the probes'}),
     })
-    const deadline = Date.now() + 240_000
-    while (!state.done && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 500))
-    rows = parseRows(state.results.join('\n'))
+    rows = parseRows(provider.state.results.join('\n'))
     identityLine = rows.get('identity')?.[0]?.evidence ?? ''
 
     // --- Stop, verify, take back ------------------------------------------------------------------------------
@@ -410,7 +396,7 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
   afterAll(async () => {
     // A failed run must not leave the account or processes behind on a shared developer runner.
     await lifecycle?.release()
-    await new Promise<void>(resolve => (provider === undefined ? resolve() : provider.close(() => resolve())))
+    await provider?.close()
     fs.rmSync(scratch, {recursive: true, force: true})
     for (const file of Object.values(canaries)) fs.rmSync(file, {force: true})
     fs.rmSync(path.dirname(canaries.config), {recursive: true, force: true})
@@ -420,13 +406,7 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
   it('has a positive control for every blocked row: the runner can do what the sandbox cannot', () => {
     // #given the controls ran as the runner before the sandbox started
     // #then each blocked probe with a control was OPEN for the runner (a BLOCKED sandbox result is only evidence then)
-    const uncontrolled: string[] = []
-    for (const [id, controlRows] of controls) {
-      if (controlRows.length === 0 || controlRows.some(row => row.status !== 'OPEN')) {
-        uncontrolled.push(`${id}: ${JSON.stringify(controlRows)}`)
-      }
-    }
-    expect(uncontrolled).toEqual([])
+    expect(uncontrolledRows(controls)).toEqual([])
   })
 
   it.each([
@@ -444,7 +424,7 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
   ])('blocks %s from the model shell', id => {
     // #given the scripted model ran the probe in its real tool shell
     // #then it was BLOCKED
-    expect(failuresFor(id, 'BLOCKED')).toEqual([])
+    expect(failuresFor(rows, id, 'BLOCKED')).toEqual([])
   })
 
   it.each(['checkout_rw_and_git', 'tools', 'provider_request', 'sandbox_dirs_writable', 'key_file_readable'])(
@@ -452,7 +432,7 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
     id => {
       // #given the same real tool shell
       // #then the capability the model needs still works
-      expect(failuresFor(id, 'WORKS')).toEqual([])
+      expect(failuresFor(rows, id, 'WORKS')).toEqual([])
     },
   )
 
@@ -520,5 +500,606 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
     const acl = spawnSync('getfacl', ['-R', '-p', workspace], {encoding: 'utf8'}).stdout
     expect(acl).not.toContain('user:fro-bot-sandbox')
     expect(acl).not.toMatch(/^user:\d+:/m)
+  })
+})
+
+// --- 2. A provisioned gh config and an admitted repo skill --------------------------------------------------------------
+
+describe.skipIf(!gated)('isolate-agent with a provisioned gh config and an admitted repo skill', () => {
+  const logger = createLogger({phase: 'sandbox-integration-provision'})
+  const scratch = path.join(runnerTemp, `sandbox-it-prov-${process.pid}`)
+  const workspace = path.join(scratch, 'ws')
+  const responseDir = path.join(scratch, 'response')
+  const keyDir = path.join(scratch, 'keys')
+  // The shape the Action provisions in provision mode: a `gh-config-*` directory directly under RUNNER_TEMP.
+  const ghConfigDir = path.join(runnerTemp, `gh-config-it-${process.pid}`)
+  const ghHost = 'gh.example.test'
+  // A syntactically plausible dummy. It is never a real token and no network call is made with it.
+  const ghDummyToken = 'gho_dummyDummyDummyDummyDummyDummy000000'
+  // The runner's own gh config. Only created when absent, and only then removed.
+  const runnerGhHosts = path.join(runnerHome, '.config', 'gh', 'hosts.yml')
+  let createdRunnerGhHosts = false
+  const skillMarker = `SKILL-MARKER-${process.pid}`
+  let stagingRoot = ''
+  let admittedDir = ''
+  let lifecycle: SandboxLifecycle | undefined
+  let rows: ReadonlyMap<string, readonly Row[]> = new Map()
+  let controls = new Map<string, Row[]>()
+  let released: SandboxReleaseResult | undefined
+
+  const probes = (): Probe[] => [
+    {
+      id: 'gh_config_dir_env',
+      category: 'works',
+      cmd: `[ "$GH_CONFIG_DIR" = ${q(ghConfigDir)} ] && R gh_config_dir_env WORKS "$GH_CONFIG_DIR" || R gh_config_dir_env FAILED "[$GH_CONFIG_DIR]"`,
+    },
+    {
+      // `gh auth token` reads the token from the configured hosts.yml without any network call.
+      id: 'gh_auth_token',
+      category: 'works',
+      cmd:
+        `t=$(gh auth token --hostname ${ghHost} 2>&1); ` +
+        `if [ "$t" = ${q(ghDummyToken)} ]; then R gh_auth_token WORKS "provisioned token readable by design"; ` +
+        `else R gh_auth_token FAILED "$(printf %s "$t" | ev)"; fi`,
+    },
+    {
+      id: 'gh_runner_hosts',
+      category: 'blocked',
+      control: true,
+      cmd: readProbe('gh_runner_hosts', runnerGhHosts),
+    },
+    {
+      id: 'skill_read',
+      category: 'works',
+      cmd:
+        `f=${q(path.join(admittedDir, 'demo-skill', 'SKILL.md'))}; ` +
+        `if grep -q ${q(skillMarker)} "$f" 2>/dev/null; then R skill_read WORKS "admitted skill readable"; else R skill_read FAILED "$(cat "$f" 2>&1 | ev)"; fi`,
+    },
+    {
+      id: 'skill_dir_read_only',
+      category: 'blocked',
+      control: true,
+      cmd:
+        `t=${q(path.join(admittedDir, 'demo-skill'))}/.w-$$; ` +
+        `if ( : > "$t" ) 2>/dev/null; then rm -f "$t"; R skill_dir_read_only OPEN "writable"; else R skill_dir_read_only BLOCKED "not writable"; fi`,
+    },
+    {
+      id: 'staging_root_listing',
+      category: 'blocked',
+      control: true,
+      cmd:
+        `o=$(ls -A ${q(stagingRoot)} 2>&1); rc=$?; ` +
+        `if [ $rc -eq 0 ]; then R staging_root_listing OPEN "listable"; else R staging_root_listing BLOCKED "rc=$rc $(printf %s "$o" | ev)"; fi`,
+    },
+    {
+      id: 'staging_root_other_file',
+      category: 'blocked',
+      control: true,
+      cmd: readProbe('staging_root_other_file', path.join(stagingRoot, 'runner-only-note.txt')),
+    },
+  ]
+
+  beforeAll(async () => {
+    const tools = await preflightTools(logger)
+    for (const dir of [responseDir, workspace]) fs.mkdirSync(dir, {recursive: true})
+    initWorkspace(workspace)
+    const keyFile = writeKeyFile(keyDir)
+
+    // The provisioned gh config: a runner-owned 0700 directory with a dummy hosts entry.
+    fs.mkdirSync(ghConfigDir, {mode: 0o700})
+    fs.writeFileSync(
+      path.join(ghConfigDir, 'hosts.yml'),
+      `${ghHost}:\n    oauth_token: ${ghDummyToken}\n    user: dummy-user\n    git_protocol: https\n`,
+      {mode: 0o600},
+    )
+    if (!fs.existsSync(runnerGhHosts)) {
+      fs.mkdirSync(path.dirname(runnerGhHosts), {recursive: true})
+      fs.writeFileSync(runnerGhHosts, 'github.com:\n    oauth_token: runner-dummy\n    user: runner\n', {mode: 0o644})
+      createdRunnerGhHosts = true
+    }
+
+    // The admitted repo skill goes through the Action's real admission, into a real staging root.
+    const staging = createRepoSkillsStagingRoot(runnerTemp)
+    if (!staging.success) throw new Error(staging.error)
+    stagingRoot = staging.data
+    const sourceDir = path.join(stagingRoot, 'source-tree')
+    fs.mkdirSync(path.join(sourceDir, 'demo-skill'), {recursive: true})
+    fs.writeFileSync(
+      path.join(sourceDir, 'demo-skill', 'SKILL.md'),
+      `---\nname: demo-skill\ndescription: A demo skill for the sandbox suite\n---\n${skillMarker}\n`,
+    )
+    fs.writeFileSync(path.join(stagingRoot, 'runner-only-note.txt'), 'runner only', {mode: 0o600})
+    const bundled = path.join(scratch, 'bundled-skills')
+    fs.mkdirSync(path.join(bundled, 'bundled-one'), {recursive: true})
+    fs.writeFileSync(
+      path.join(bundled, 'bundled-one', 'SKILL.md'),
+      '---\nname: bundled-one\ndescription: A stand-in for a bundled skill\n---\nbundled\n',
+    )
+    const admission = await admitRepoSkills({
+      sourceDir,
+      stagingRoot,
+      bundledSkillsDirectories: [bundled],
+      symlinkedSkillIds: [],
+      logger,
+    })
+    if (!admission.success) throw new Error(admission.error)
+    if (admission.data.directory === null) throw new Error('the demo skill was not admitted')
+    admittedDir = admission.data.directory
+
+    const env = hostedEnv(workspace)
+    controls = runControls(probes(), workspace, env)
+    const result = await runIsolated({
+      tools,
+      env,
+      workspace,
+      responseDir,
+      keyFile,
+      steps: probes(),
+      logger,
+      ghConfigDir,
+      repoSkills: {stagingRoot, admittedDir},
+      onLifecycle: value => {
+        lifecycle = value
+      },
+    })
+    rows = result.rows
+    released = result.released
+  }, 600_000)
+
+  afterAll(async () => {
+    await lifecycle?.release()
+    fs.rmSync(scratch, {recursive: true, force: true})
+    fs.rmSync(ghConfigDir, {recursive: true, force: true})
+    if (stagingRoot !== '') fs.rmSync(stagingRoot, {recursive: true, force: true})
+    if (createdRunnerGhHosts) fs.rmSync(runnerGhHosts, {force: true})
+  }, 120_000)
+
+  it('has a positive control for every blocked row of this suite', () => {
+    // #given the controls ran as the runner before the sandbox started
+    // #then the runner could read the gh config, write the skill dir, list the staging root and read the other file
+    expect(uncontrolledRows(controls)).toEqual([])
+  })
+
+  it('gives the model the provisioned gh config: GH_CONFIG_DIR is set and `gh auth token` returns the dummy token', () => {
+    // #given the config dir was handed over and named in the server environment
+    // #then the model's gh reads it
+    expect(failuresFor(rows, 'gh_config_dir_env', 'WORKS')).toEqual([])
+    expect(failuresFor(rows, 'gh_auth_token', 'WORKS')).toEqual([])
+  })
+
+  it("keeps the runner's own gh config out of reach", () => {
+    // #given the runner has its own ~/.config/gh/hosts.yml
+    // #then the model cannot read it (the control proved the runner can)
+    expect(failuresFor(rows, 'gh_runner_hosts', 'BLOCKED')).toEqual([])
+  })
+
+  it('lets the model read an admitted repo skill but not write to it, and sees nothing else of the staging root', () => {
+    // #given the staging root is traverse-only and only the admitted skills tree is readable
+    // #then the skill reads, the skills dir is read-only, the staging root cannot be listed and its other file is unreadable
+    expect(failuresFor(rows, 'skill_read', 'WORKS')).toEqual([])
+    expect(failuresFor(rows, 'skill_dir_read_only', 'BLOCKED')).toEqual([])
+    expect(failuresFor(rows, 'staging_root_listing', 'BLOCKED')).toEqual([])
+    expect(failuresFor(rows, 'staging_root_other_file', 'BLOCKED')).toEqual([])
+  })
+
+  it('takes everything back and leaves the admitted skill and the gh config as the runner had them', () => {
+    // #given the release finished
+    expect(released?.stop).toBe('stopped')
+    expect(released?.restore).toBe('restored')
+    const runnerUid = os.userInfo().uid
+    // #then the skill is intact and runner-owned, and the gh hosts file is unchanged and runner-owned
+    const skill = path.join(admittedDir, 'demo-skill', 'SKILL.md')
+    expect(fs.readFileSync(skill, 'utf8')).toContain(skillMarker)
+    expect(fs.statSync(skill).uid).toBe(runnerUid)
+    const hosts = path.join(ghConfigDir, 'hosts.yml')
+    expect(fs.readFileSync(hosts, 'utf8')).toContain(ghDummyToken)
+    expect(fs.statSync(hosts).uid).toBe(runnerUid)
+    const acl = spawnSync('getfacl', ['-R', '-p', ghConfigDir, stagingRoot], {encoding: 'utf8'}).stdout
+    expect(acl).not.toMatch(/^user:\d+:/m)
+  })
+})
+
+// --- 3. The persistence round trip --------------------------------------------------------------------------------------
+
+interface StoredCacheEntry {
+  readonly key: string
+  readonly paths: readonly string[]
+  readonly dir: string
+}
+
+/** A cache backend on a local directory. Records every call so the suite can compare restore paths with save paths. */
+function createLocalDirCacheAdapter(root: string): {
+  readonly adapter: CacheAdapter
+  readonly entries: StoredCacheEntry[]
+  readonly restoreCalls: {readonly paths: readonly string[]; readonly primaryKey: string}[]
+} {
+  fs.mkdirSync(root, {recursive: true})
+  const entries: StoredCacheEntry[] = []
+  const restoreCalls: {paths: readonly string[]; primaryKey: string}[] = []
+  // @actions/cache keys an entry's restorability on a hash of the path list: the same list means the same version.
+  const versionOf = (paths: readonly string[]): string => createHash('sha256').update(paths.join('|')).digest('hex')
+  const adapter: CacheAdapter = {
+    saveCache: async (paths, key) => {
+      const dir = path.join(root, `${entries.length}-${versionOf(paths).slice(0, 12)}`)
+      fs.mkdirSync(dir, {recursive: true})
+      for (const [index, source] of paths.entries()) {
+        if (fs.existsSync(source)) {
+          fs.cpSync(source, path.join(dir, String(index)), {recursive: true, verbatimSymlinks: true})
+        }
+      }
+      entries.push({key, paths: [...paths], dir})
+      return entries.length
+    },
+    restoreCache: async (paths, primaryKey, restoreKeys) => {
+      restoreCalls.push({paths: [...paths], primaryKey})
+      const wanted = [primaryKey, ...restoreKeys]
+      const hit = entries
+        .toReversed()
+        .find(entry => versionOf(entry.paths) === versionOf(paths) && wanted.some(key => entry.key.startsWith(key)))
+      if (hit === undefined) return undefined
+      for (const [index, target] of paths.entries()) {
+        const source = path.join(hit.dir, String(index))
+        if (!fs.existsSync(source)) continue
+        fs.mkdirSync(path.dirname(target), {recursive: true})
+        fs.cpSync(source, target, {recursive: true, verbatimSymlinks: true})
+      }
+      return hit.key
+    },
+  }
+  return {adapter, entries, restoreCalls}
+}
+
+function fileSizeOrZero(file: string): number {
+  try {
+    return fs.statSync(file).size
+  } catch {
+    return 0
+  }
+}
+
+function readSessionIds(dbPath: string): string[] {
+  const db = new DatabaseSync(dbPath)
+  try {
+    return db
+      .prepare('SELECT id FROM session ORDER BY id')
+      .all()
+      .map(row => String((row as {id: unknown}).id))
+  } finally {
+    db.close()
+  }
+}
+
+function integrityCheck(dbPath: string): string {
+  const db = new DatabaseSync(dbPath)
+  try {
+    const row = db.prepare('PRAGMA integrity_check').get() as {integrity_check?: unknown} | undefined
+    return String(row?.integrity_check)
+  } finally {
+    db.close()
+  }
+}
+
+describe.skipIf(!gated)('isolate-agent session persistence round trip', () => {
+  const logger = createLogger({phase: 'sandbox-integration-persistence'})
+  const scratch = path.join(runnerTemp, `sandbox-it-persist-${process.pid}`)
+  const workspace = path.join(scratch, 'ws')
+  const responseDir = path.join(scratch, 'response')
+  const keyDir = path.join(scratch, 'keys')
+  const xdgRoot = path.join(scratch, 'xdg')
+  const dataDir = path.join(xdgRoot, 'data', 'opencode')
+  const storagePath = path.join(dataDir, 'storage')
+  const authPath = path.join(dataDir, 'auth.json')
+  const projectIdPath = path.join(workspace, '.git', 'opencode')
+  const dbName = getSessionDbBasenames('v2').main
+  const dbPath = path.join(dataDir, dbName)
+  const walPath = path.join(dataDir, getSessionDbBasenames('v2').wal)
+  const components: CacheKeyComponents = {...buildCacheKeyComponents(), repo: 'sandbox-it/persist', ref: 'main'}
+  const runId = 4242
+  let lifecycle: SandboxLifecycle | undefined
+
+  const facts = {
+    coldRestoreHit: true,
+    run1: undefined as IsolatedRunResult | undefined,
+    run2: undefined as IsolatedRunResult | undefined,
+    sessionsAfterRun1: [] as string[],
+    walBytesBeforeSave: -1,
+    saveOutcome: undefined as Awaited<ReturnType<typeof saveCache>> | undefined,
+    walBytesAfterSave: -1,
+    integrityAfterSave: '',
+    saved: undefined as StoredCacheEntry | undefined,
+    restoreHit: undefined as Awaited<ReturnType<typeof restoreCache>> | undefined,
+    restoreCallPaths: [] as (readonly string[])[],
+    versionFile: '',
+    walBytesAfterRestore: -1,
+    integrityAfterRestore: '',
+    sessionsAfterRestore: [] as string[],
+    sessionsAfterRun2: [] as string[],
+    integrityAfterRun2: '',
+  }
+
+  beforeAll(async () => {
+    const tools = await preflightTools(logger)
+    for (const dir of [responseDir]) fs.mkdirSync(dir, {recursive: true})
+    initWorkspace(workspace)
+    const keyFile = writeKeyFile(keyDir)
+    const env = hostedEnv(workspace, xdgRoot)
+    const backend = createLocalDirCacheAdapter(path.join(scratch, 'cache-backend'))
+    const cacheOptions = {components, logger, storagePath, authPath, projectIdPath, cacheAdapter: backend.adapter}
+
+    // --- Run 1: a cold restore, then an isolated run that writes a session and a storage file ------------------------------
+    const cold = await restoreCache(cacheOptions)
+    facts.coldRestoreHit = cold.hit
+    facts.run1 = await runIsolated({
+      tools,
+      env,
+      workspace,
+      responseDir,
+      keyFile,
+      logger,
+      onLifecycle: value => {
+        lifecycle = value
+      },
+      steps: [
+        {
+          id: 'persist_write_storage',
+          category: 'works',
+          cmd:
+            `echo storage-from-the-sandbox > "$XDG_DATA_HOME/opencode/storage/sandbox-note.txt" && ` +
+            `R persist_write_storage WORKS "wrote storage" || R persist_write_storage FAILED "write failed"`,
+        },
+      ],
+    })
+    facts.sessionsAfterRun1 = readSessionIds(dbPath)
+
+    // --- Checkpoint and save through the real save path ----------------------------------------------------------------------
+    facts.walBytesBeforeSave = fileSizeOrZero(walPath)
+    facts.saveOutcome = await saveCache({...cacheOptions, runId})
+    facts.walBytesAfterSave = fileSizeOrZero(walPath)
+    facts.integrityAfterSave = integrityCheck(dbPath)
+    facts.saved = backend.entries.at(-1)
+
+    // --- Run 2: wipe local state, restore, and run isolated again on the restored database ---------------------------------
+    fs.rmSync(dataDir, {recursive: true, force: true})
+    facts.restoreHit = await restoreCache(cacheOptions)
+    facts.restoreCallPaths = backend.restoreCalls.map(call => call.paths)
+    facts.versionFile = fs.readFileSync(path.join(storagePath, '.version'), 'utf8').trim()
+    facts.walBytesAfterRestore = fileSizeOrZero(walPath)
+    facts.integrityAfterRestore = integrityCheck(dbPath)
+    facts.sessionsAfterRestore = readSessionIds(dbPath)
+    facts.run2 = await runIsolated({
+      tools,
+      env,
+      workspace,
+      responseDir,
+      keyFile,
+      logger,
+      onLifecycle: value => {
+        lifecycle = value
+      },
+      steps: [
+        {
+          id: 'persist_read_restored',
+          category: 'works',
+          cmd:
+            `d="$XDG_DATA_HOME/opencode"; ` +
+            `[ "$(cat "$d/storage/sandbox-note.txt" 2>/dev/null)" = storage-from-the-sandbox ] && [ -r "$d/${dbName}" ] && [ -w "$d/${dbName}" ] && ` +
+            `R persist_read_restored WORKS "restored storage and database usable by the sandbox" || R persist_read_restored FAILED "unusable"`,
+        },
+      ],
+    })
+    facts.sessionsAfterRun2 = readSessionIds(dbPath)
+    facts.integrityAfterRun2 = integrityCheck(dbPath)
+  }, 900_000)
+
+  afterAll(async () => {
+    await lifecycle?.release()
+    fs.rmSync(scratch, {recursive: true, force: true})
+  }, 120_000)
+
+  it('starts cold, then the first isolated run writes to storage and the lifecycle stops and restores cleanly', () => {
+    // #given an empty cache backend
+    expect(facts.coldRestoreHit).toBe(false)
+    // #then run 1 worked in its sandbox, stopped, restored, and left a session in the database
+    expect(failuresFor(facts.run1?.rows ?? new Map(), 'persist_write_storage', 'WORKS')).toEqual([])
+    expect(facts.run1?.released.stop).toBe('stopped')
+    expect(facts.run1?.released.restore).toBe('restored')
+    expect(facts.sessionsAfterRun1.length).toBeGreaterThan(0)
+  })
+
+  it('saves through the real save path: persisted, the expected key and paths, a clean WAL and a sound database', () => {
+    // #given the sandbox-written state after take-back
+    // #then the real saveCache persisted it under the save key, with exactly the path list a restore will ask for
+    expect(facts.saveOutcome).toMatchObject({cachePersisted: true, outcome: 'persisted'})
+    expect(facts.saved?.key).toBe(buildSaveCacheKey(components, runId, getGitHubRunAttempt(), getInvocationIdentity()))
+    expect(facts.saved?.key.startsWith(buildPrimaryCacheKey(components))).toBe(true)
+    expect(facts.saved?.paths).toEqual(buildCachePathsV2(storagePath, projectIdPath))
+    // #and the checkpoint left no write-ahead log behind and the database is sound
+    expect(facts.walBytesAfterSave).toBe(0)
+    expect(facts.integrityAfterSave).toBe('ok')
+  })
+
+  it('restores in the second run: a hit on the same key, with identical paths (so the same cache version)', () => {
+    // #given local state was wiped and the same options restored
+    // #then it is a clean cache hit on the saved key
+    expect(facts.restoreHit).toMatchObject({hit: true, corrupted: false, source: 'cache', key: facts.saved?.key})
+    // #and some restore request used exactly the path list the save used
+    expect(facts.restoreCallPaths).toContainEqual(facts.saved?.paths)
+    // #and the storage version marker is the current one
+    expect(facts.versionFile).toBe(String(STORAGE_VERSION))
+  })
+
+  it('restores a clean, sound database holding the first run session', () => {
+    // #given the restored files
+    // #then there is no WAL, the database passes integrity_check and it still holds run 1's sessions
+    expect(facts.walBytesAfterRestore).toBe(0)
+    expect(facts.integrityAfterRestore).toBe('ok')
+    expect(facts.sessionsAfterRestore).toEqual(facts.sessionsAfterRun1)
+  })
+
+  it('runs isolated again on the restored state: the sandbox uses it and the run adds a session', () => {
+    // #given the second isolated run started on the restored files
+    // #then the sandbox could read the storage note and read and write the database
+    expect(failuresFor(facts.run2?.rows ?? new Map(), 'persist_read_restored', 'WORKS')).toEqual([])
+    expect(facts.run2?.released.stop).toBe('stopped')
+    expect(facts.run2?.released.restore).toBe('restored')
+    // #and the database kept every earlier session, gained one, and is still sound
+    expect(facts.sessionsAfterRun2).toEqual(expect.arrayContaining(facts.sessionsAfterRun1))
+    expect(facts.sessionsAfterRun2.length).toBeGreaterThan(facts.sessionsAfterRun1.length)
+    expect(facts.integrityAfterRun2).toBe('ok')
+  })
+})
+
+// --- 4. Hostile git state written through the model's shell -------------------------------------------------------------
+
+describe.skipIf(!gated)('isolate-agent hostile git state through a real model shell', () => {
+  const logger = createLogger({phase: 'sandbox-integration-git'})
+  const scratch = path.join(runnerTemp, `sandbox-it-git-${process.pid}`)
+  const workspace = path.join(scratch, 'ws')
+  const responseDir = path.join(scratch, 'response')
+  const keyDir = path.join(scratch, 'keys')
+  // The payload scripts live in the response dir (handed to the sandbox, outside the checkout). They write their markers
+  // into a directory only the runner can write, so a marker proves a RUNNER-side git ran the payload.
+  const payloadDir = path.join(responseDir, 'hostile')
+  const markerDir = path.join(scratch, 'markers')
+  const payloads = ['fsmon', 'textconv', 'clean', 'hook'] as const
+  const markerOf = (name: string): string => path.join(markerDir, `ran-${name}`)
+  const hostileConfig =
+    `[core]\n\tfsmonitor = ${path.join(payloadDir, 'fsmon.sh')}\n` +
+    `[diff "x"]\n\ttextconv = ${path.join(payloadDir, 'textconv.sh')}\n` +
+    `[filter "x"]\n\tclean = ${path.join(payloadDir, 'clean.sh')}\n`
+  const hookBody = `#!/bin/sh\nexec ${path.join(payloadDir, 'hook.sh')}\n`
+  const commitSubject = 'fix: sandbox commit'
+  let trustedHead = ''
+  let lifecycle: SandboxLifecycle | undefined
+  let result: IsolatedRunResult | undefined
+  let markersFromControl: string[] = []
+  const after = {
+    configAfterTakeBack: '',
+    hookExistsAfterTakeBack: true,
+    markersAfterTrustedGit: [] as string[],
+    reconstruct: undefined as Awaited<ReturnType<typeof reconstructChanges>> | undefined,
+    commitMessage: '',
+  }
+
+  const probes = (): Probe[] => [
+    {
+      // Commit first, with a clean config, so the model never runs git under the hostile config it writes next.
+      id: 'git_model_commit',
+      category: 'works',
+      cmd:
+        `${String.raw`cd ${q(workspace)} && printf '*.dat diff=x filter=x\n' > .gitattributes && echo v1 > data.dat && `}git add .gitattributes data.dat && git commit -qm ${q(commitSubject)} 2>&1 && ` +
+        `R git_model_commit WORKS "$(git log -1 --format=%s)" || R git_model_commit FAILED "$(git status 2>&1 | ev)"`,
+    },
+    {
+      id: 'git_hostile_payloads',
+      category: 'info',
+      cmd: `mkdir -p ${q(payloadDir)} && for n in ${payloads.join(' ')}; do ${String.raw`printf '#!/bin/sh\necho ran >> %s/ran-%s\ncat\n' ${q(markerDir)} "$n" > ${q(payloadDir)}/"$n".sh && chmod +x ${q(payloadDir)}/"$n".sh; done && `}R git_hostile_payloads INFO ok`,
+    },
+    {
+      // Replace .git/config by rename (fsmonitor, textconv, a clean filter) and plant a post-index-change hook.
+      id: 'git_hostile_config',
+      category: 'info',
+      cmd:
+        `cd ${q(workspace)} && cat .git/config > .git/config.new && printf %b ${q(hostileConfig.replaceAll('\n', String.raw`\n`).replaceAll('\t', String.raw`\t`))} >> .git/config.new && ` +
+        `mv -f .git/config.new .git/config && printf %b ${q(hookBody.replaceAll('\n', String.raw`\n`))} > .git/hooks/post-index-change && ` +
+        `chmod +x .git/hooks/post-index-change && R git_hostile_config INFO ok`,
+    },
+    {
+      // Dirty tracked and untracked files without invoking git, and age a tracked file so the index is stale.
+      id: 'git_dirty_worktree',
+      category: 'info',
+      cmd:
+        `cd ${q(workspace)} && echo 'v2 edited by the model' > data.dat && echo untracked > untracked-by-model.txt && ` +
+        `touch -d 2001-01-01 README.md && R git_dirty_worktree INFO ok`,
+    },
+  ]
+
+  beforeAll(async () => {
+    const tools = await preflightTools(logger)
+    for (const dir of [responseDir, markerDir]) fs.mkdirSync(dir, {recursive: true})
+    trustedHead = initWorkspace(workspace)
+    const keyFile = writeKeyFile(keyDir)
+    const env = hostedEnv(workspace)
+
+    result = await runIsolated({
+      tools,
+      env,
+      workspace,
+      responseDir,
+      keyFile,
+      logger,
+      steps: probes(),
+      onLifecycle: value => {
+        lifecycle = value
+      },
+    })
+
+    // --- Positive control: the same hostile state, plain git as the runner, in a copy -----------------------------------
+    // The take-back already undid the real checkout's config and hook, so rebuild exactly what the model wrote in a copy
+    // (the payload scripts are runner-owned and executable now) and run plain git there. Each payload must fire.
+    after.configAfterTakeBack = fs.readFileSync(path.join(workspace, '.git', 'config'), 'utf8')
+    after.hookExistsAfterTakeBack = fs.existsSync(path.join(workspace, '.git', 'hooks', 'post-index-change'))
+    const control = path.join(scratch, 'control-ws')
+    spawnSync('cp', ['-a', workspace, control])
+    fs.appendFileSync(path.join(control, '.git', 'config'), hostileConfig)
+    fs.writeFileSync(path.join(control, '.git', 'hooks', 'post-index-change'), hookBody, {mode: 0o755})
+    spawnSync('touch', ['-d', '2001-01-01', path.join(control, 'README.md')])
+    spawnSync('git', ['diff', 'HEAD'], {cwd: control, encoding: 'utf8'})
+    spawnSync('git', ['status', '--short'], {cwd: control, encoding: 'utf8'})
+    markersFromControl = payloads.filter(name => fs.existsSync(markerOf(name)))
+    for (const name of payloads) fs.rmSync(markerOf(name), {force: true})
+
+    // --- The Action's runner-side git, against the real post-take-back checkout ---------------------------------------
+    const adapter = createExecAdapter()
+    after.reconstruct = await reconstructChanges(adapter, trustedHead, workspace, logger)
+    after.commitMessage = await resolveBrokeredPushCommitMessage(adapter, trustedHead, workspace, logger, 'fallback')
+    after.markersAfterTrustedGit = payloads.filter(name => fs.existsSync(markerOf(name)))
+  }, 900_000)
+
+  afterAll(async () => {
+    await lifecycle?.release()
+    fs.rmSync(scratch, {recursive: true, force: true})
+  }, 120_000)
+
+  it('ran the whole script in the model shell: it committed, wrote the payloads and the hostile state', () => {
+    // #given the scripted model used its real tool shell
+    // #then the commit went through (the identity and checkout access work) and the setup steps ran
+    expect(failuresFor(result?.rows ?? new Map(), 'git_model_commit', 'WORKS')).toEqual([])
+    expect(failuresFor(result?.rows ?? new Map(), 'git_hostile_payloads', 'INFO')).toEqual([])
+    expect(failuresFor(result?.rows ?? new Map(), 'git_hostile_config', 'INFO')).toEqual([])
+    expect(failuresFor(result?.rows ?? new Map(), 'git_dirty_worktree', 'INFO')).toEqual([])
+    expect(result?.released.restore).toBe('restored')
+  })
+
+  it('positive control: plain git as the runner runs every payload against the hostile state', () => {
+    // #given the hostile config, hook and attributes the model wrote, rebuilt in a copy
+    // #then fsmonitor, textconv, the clean filter and the hook each fired, so a missing marker below means something
+    expect(markersFromControl).toEqual([...payloads])
+  })
+
+  it('take-back removed the hostile config and the hook from the real checkout', () => {
+    // #given the model replaced .git/config by rename and planted a hook
+    // #then the restored config has none of the payload and the hook is gone
+    expect(after.configAfterTakeBack).not.toContain('fsmonitor')
+    expect(after.configAfterTakeBack).not.toContain('textconv')
+    expect(after.configAfterTakeBack).not.toContain('clean')
+    expect(after.hookExistsAfterTakeBack).toBe(false)
+  })
+
+  it('reconstruction and the commit-message lookup run no payload and still return the model work', () => {
+    // #given runner-side git ran after take-back, through the trusted wrapper
+    // #then no payload ran as the runner
+    expect(after.markersAfterTrustedGit).toEqual([])
+    // #and the model's net changes against the trusted head are all there (none from inside .git)
+    expect(after.reconstruct?.success).toBe(true)
+    const changes =
+      after.reconstruct?.success === true && after.reconstruct.data.kind === 'changes'
+        ? after.reconstruct.data.changes
+        : []
+    const changed = changes.map(change => change.path)
+    expect(changed).toEqual(expect.arrayContaining(['.gitattributes', 'data.dat', 'untracked-by-model.txt']))
+    expect(changed.filter(file => file.startsWith('.git/'))).toEqual([])
+    // #and the lookup returns the subject of the commit the model made in its shell
+    expect(after.commitMessage).toBe(commitSubject)
   })
 })
