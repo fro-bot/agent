@@ -325,7 +325,8 @@ async function persistRunState(logger: Logger): Promise<void> {
     }
   }
 
-  if (isOpenCodePromptArtifactEnabled()) {
+  // An isolated run whose sandbox was not confirmed stopped and restored leaves the log directory sandbox-writable.
+  if (isOpenCodePromptArtifactEnabled() && core.getState(STATE_KEYS.SANDBOX_UNSAFE) !== 'true') {
     const artifactUploaded = core.getState(STATE_KEYS.ARTIFACT_UPLOADED)
     if (artifactUploaded !== 'true') {
       try {

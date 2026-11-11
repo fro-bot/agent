@@ -226,8 +226,8 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || '' }}
           token: ${{ secrets.FRO_BOT_PAT }}
-          # Withheld triggers must match response-delivery.ts's classifyEvent (credential: 'withhold').
-          persist-credentials: ${{ github.event_name != 'pull_request' }}
+          # isolate-agent refuses a checkout that persisted credentials: the agent user can read .git/config.
+          persist-credentials: false
 
       - name: Setup Node.js and Bun
         uses: ./.github/actions/setup

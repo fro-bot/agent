@@ -45,6 +45,7 @@ vi.mock('./config/state-keys.js', () => ({
     SHOULD_SAVE_CACHE: 'should-save-cache',
     CACHE_SAVED: 'cache-saved',
     ISOLATED_RUN: 'isolated-run',
+    SANDBOX_UNSAFE: 'sandbox-unsafe',
   },
 }))
 
@@ -832,7 +833,10 @@ describe('run with isolate-agent', () => {
     expect(saved.indexOf('isolated-run=true')).toBeGreaterThanOrEqual(0)
     expect(saved.indexOf('isolated-run=true')).toBeLessThan(saved.lastIndexOf('should-save-cache=true'))
     // #and persistence is not declined
-    expect(vi.mocked(runCleanup).mock.calls[0]?.[0]).toMatchObject({skipSessionPersistence: false})
+    expect(vi.mocked(runCleanup).mock.calls[0]?.[0]).toMatchObject({
+      skipSessionPersistence: false,
+      sandboxOutputUntrusted: false,
+    })
   })
 
   it.each([
@@ -853,7 +857,11 @@ describe('run with isolate-agent', () => {
     expect(exitCode).toBe(1)
     expect(vi.mocked(runFinalizeWithResult)).not.toHaveBeenCalled()
     expect(vi.mocked(runReviewReconciliation)).not.toHaveBeenCalled()
-    expect(vi.mocked(runCleanup).mock.calls[0]?.[0]).toMatchObject({skipSessionPersistence: true})
+    expect(vi.mocked(runCleanup).mock.calls[0]?.[0]).toMatchObject({
+      skipSessionPersistence: true,
+      sandboxOutputUntrusted: true,
+    })
+    expect(vi.mocked(core.saveState)).toHaveBeenCalledWith('sandbox-unsafe', 'true')
     expect(
       String(
         (vi.mocked(runCleanup).mock.calls[0]?.[0] as {persistenceDeclineReason?: string}).persistenceDeclineReason,
@@ -889,7 +897,10 @@ describe('run with isolate-agent', () => {
     await run()
 
     // #then
-    expect(vi.mocked(runCleanup).mock.calls[0]?.[0]).toMatchObject({skipSessionPersistence: true})
+    expect(vi.mocked(runCleanup).mock.calls[0]?.[0]).toMatchObject({
+      skipSessionPersistence: true,
+      sandboxOutputUntrusted: true,
+    })
   })
 
   it('touches no sandbox state when the run is not isolated', async () => {

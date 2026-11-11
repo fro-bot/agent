@@ -549,6 +549,57 @@ describe('runBootstrap isolate-agent preflight', () => {
     expect(mocks.ensureOpenCodeAvailable).toHaveBeenCalledTimes(1)
   })
 
+  it.each(['workflow_dispatch', 'schedule', 'issues'])(
+    'checks the checkout for persisted git credentials on %s when isolation is on',
+    async eventName => {
+      // #given isolation on; workflow_dispatch and schedule provision the credential, issues withholds it
+      mocks.githubContext.eventName = eventName
+      vi.stubEnv('GITHUB_WORKSPACE', path.join(runnerTempDir, 'repo'))
+      mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: true})})
+      mocks.runSandboxPreflight.mockResolvedValue({ok: true, tools})
+      const {runBootstrap} = await import('./bootstrap.js')
+
+      // #when
+      const result = await runBootstrap(createMockLogger())
+
+      // #then the sandbox user could read the checkout's .git/config, so the check ran, once
+      expect(result).not.toBeNull()
+      expect(mocks.assertNoPersistedGitCredentials).toHaveBeenCalledTimes(1)
+    },
+  )
+
+  it('fails closed on a provision trigger when the checkout persisted credentials, naming persist-credentials', async () => {
+    // #given a provision trigger, isolation on, and a checkout that kept its extraheader
+    mocks.githubContext.eventName = 'workflow_dispatch'
+    vi.stubEnv('GITHUB_WORKSPACE', path.join(runnerTempDir, 'repo'))
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: true})})
+    mocks.runSandboxPreflight.mockResolvedValue({ok: true, tools})
+    mocks.assertNoPersistedGitCredentials.mockResolvedValue(err('http.extraheader found'))
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when
+    const result = await runBootstrap(createMockLogger())
+
+    // #then it aborts before setup, with an actionable message
+    expect(result).toBeNull()
+    expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('persist-credentials: false') as string)
+    expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('isolate-agent') as string)
+    expect(mocks.ensureOpenCodeAvailable).not.toHaveBeenCalled()
+  })
+
+  it('still skips the credential check on a provision trigger when isolation is off', async () => {
+    // #given the same trigger without isolation
+    mocks.githubContext.eventName = 'workflow_dispatch'
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: false})})
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when
+    await runBootstrap(createMockLogger())
+
+    // #then behavior is unchanged
+    expect(mocks.assertNoPersistedGitCredentials).not.toHaveBeenCalled()
+  })
+
   it('runs no preflight and carries no tools when isolation is off', async () => {
     // #given the input is off
     mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: false})})

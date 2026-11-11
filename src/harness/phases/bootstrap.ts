@@ -99,11 +99,19 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
   // `persist-credentials: true` (the actions/checkout default) or a
   // credentialed remote URL would let the model's bash exfiltrate the same
   // token this delivery mode is designed to keep out of its reach.
-  if (credential === 'withhold') {
+  //
+  // With `isolate-agent` the check runs on every trigger: the checkout is handed to the sandbox user with read access, so
+  // an `http.*.extraheader` left in `.git/config` by `actions/checkout` is readable by the model even when the trigger
+  // provisions a credential on purpose (that credential is a different, narrower grant than the checkout's token).
+  if (credential === 'withhold' || inputs.isolateAgent) {
     const workspaceDir = process.env.GITHUB_WORKSPACE ?? process.cwd()
     const credentialCheck = await assertNoPersistedGitCredentials(createExecAdapter(), workspaceDir, logger)
     if (credentialCheck.success === false) {
-      core.setFailed(`Refusing to proceed with credential withheld: ${credentialCheck.error}`)
+      core.setFailed(
+        credential === 'withhold'
+          ? `Refusing to proceed with credential withheld: ${credentialCheck.error}`
+          : `Refusing to proceed with isolate-agent: the checkout carries a persisted git credential the agent user could read (${credentialCheck.error}). Set \`persist-credentials: false\` on actions/checkout.`,
+      )
       return null
     }
   }

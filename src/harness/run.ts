@@ -67,6 +67,13 @@ export async function run(): Promise<number> {
   let sandboxLifecycle: SandboxLifecycle | null = null
   // Set once the normal path has released the sandbox and recorded its outcome, so the `finally` does not repeat it.
   let sandboxSettled = false
+  // True once an isolated run's sandbox was not confirmed stopped and restored: everything the sandbox could write is
+  // then untrusted, so cleanup and the post hook read and publish none of it.
+  let sandboxOutputUntrusted = false
+  const markSandboxUntrusted = (): void => {
+    sandboxOutputUntrusted = true
+    core.saveState(STATE_KEYS.SANDBOX_UNSAFE, 'true')
+  }
   // The run-scoped repo skills staging root under RUNNER_TEMP, or null. Hoisted so the `finally` block removes it once the
   // server has stopped, whichever path the run took (fro-bot/agent#2129).
   let repoSkillsStagingRoot: string | null = null
@@ -317,6 +324,7 @@ export async function run(): Promise<number> {
       const sandboxOutcome = await sandboxLifecycle.release()
       sandboxSettled = true
       if (sandboxOutcome.restore !== 'restored') {
+        markSandboxUntrusted()
         skipSessionPersistence = true
         persistenceDeclineReason = `the isolate-agent sandbox was not confirmed stopped and restored (${sandboxOutcome.reason ?? 'unknown reason'}), so no session state is saved`
         core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
@@ -479,11 +487,13 @@ export async function run(): Promise<number> {
       try {
         const sandboxOutcome = await sandboxLifecycle.release()
         if (sandboxOutcome.restore !== 'restored') {
+          markSandboxUntrusted()
           skipSessionPersistence = true
           persistenceDeclineReason ??= `the isolate-agent sandbox was not confirmed stopped and restored (${sandboxOutcome.reason ?? 'unknown reason'}), so no session state is saved`
           core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
         }
       } catch (sandboxError) {
+        markSandboxUntrusted()
         skipSessionPersistence = true
         persistenceDeclineReason ??= `the isolate-agent sandbox could not be released (${toErrorMessage(sandboxError)}), so no session state is saved`
         core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
@@ -509,6 +519,7 @@ export async function run(): Promise<number> {
       ownershipLedger,
       leaseRenewal,
       skipSessionPersistence,
+      sandboxOutputUntrusted,
       ...(persistenceDeclineReason === undefined ? {} : {persistenceDeclineReason}),
     }).finally(async () => {
       // runCleanup shuts the V2 server down; only then is the staging root, which the server reads, safe to remove.

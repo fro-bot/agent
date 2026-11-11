@@ -13,6 +13,11 @@ export const STATE_KEYS = {
    * user wrote that state, and only the main step can confirm it stopped and was restored.
    */
   ISOLATED_RUN: 'isolatedRun',
+  /**
+   * `'true'` when an isolated run's sandbox was not confirmed stopped and restored. The post hook then reads no
+   * sandbox-writable path (the log directory) and uploads nothing from it.
+   */
+  SANDBOX_UNSAFE: 'sandboxUnsafe',
   /** Session ID used in this run (for logging) */
   SESSION_ID: 'sessionId',
   /** Whether main action already saved cache successfully */

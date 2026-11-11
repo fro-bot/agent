@@ -188,6 +188,36 @@ describe('post action', () => {
       },
     )
 
+    it('uploads no log artifact after an unsafe sandbox release, but still uploads for a safe isolated run', async () => {
+      // #given prompt-artifact upload on and an isolated run whose release was not restored
+      vi.stubEnv('OPENCODE_PROMPT_ARTIFACT', 'true')
+      const core = await import('@actions/core')
+      const {uploadLogArtifact} = await import('../services/artifact/index.js')
+      const state = (unsafe: boolean) => (key: string) => {
+        if (key === 'shouldSaveCache') return 'true'
+        if (key === 'isolatedRun') return 'true'
+        if (key === 'cacheSaved') return 'durable'
+        if (key === 'sandboxUnsafe') return unsafe ? 'true' : ''
+        return ''
+      }
+      const {runPost} = await import('./post.js')
+
+      // #when the post hook runs for the unsafe run
+      vi.mocked(core.getState).mockImplementation(state(true))
+      await runPost({logger: createMockLogger()})
+
+      // #then the sandbox-writable log directory is never read
+      expect(uploadLogArtifact).not.toHaveBeenCalled()
+
+      // #when it runs for a safe isolated run
+      vi.mocked(core.getState).mockImplementation(state(false))
+      await runPost({logger: createMockLogger()})
+
+      // #then the upload proceeds as before
+      expect(uploadLogArtifact).toHaveBeenCalledTimes(1)
+      vi.unstubAllEnvs()
+    })
+
     it('still retries the save for a run that was not isolated', async () => {
       // #given the same not-persisted state without the isolated marker
       const core = await import('@actions/core')
