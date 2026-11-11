@@ -13,7 +13,7 @@ import {resolveBrokeredPushCommitMessage} from './commit-message.js'
 import {reconstructChanges} from './reconstruct-changes.js'
 import {runTrustedGit, TRUSTED_GIT_ENV, TRUSTED_GIT_GLOBAL_ARGS} from './trusted-git.js'
 
-vi.setConfig({testTimeout: 60_000})
+vi.setConfig({testTimeout: 60_000, hookTimeout: 60_000})
 
 /**
  * Adversarial fixtures for the post-model git calls (fro-bot/agent#2135 R4). Each payload writes a marker file when it

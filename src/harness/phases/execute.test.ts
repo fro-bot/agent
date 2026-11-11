@@ -48,6 +48,9 @@ vi.mock('@fro-bot/runtime', async importOriginal => {
   return {
     ...original,
     parseResponseFile: mocks.parseResponseFile,
+    // Routed onto the readFile mock so these tests keep exercising recovery; the real no-follow refusals are tested in
+    // response-read-safety.test.ts.
+    readTextNoFollow: async (file: string): Promise<string> => mocks.readResponseFile(file, 'utf8') as Promise<string>,
     resolveResponseDelivery: mocks.resolveResponseDelivery,
   }
 })
