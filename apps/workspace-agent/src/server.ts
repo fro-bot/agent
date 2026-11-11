@@ -351,7 +351,7 @@ export function createApp(deps: ServerDeps): Hono {
   // Control-API bearer check — every route except /healthz and /readyz. Registered before any
   // route so it runs (and can short-circuit with 401) before body parsing, JSON parsing, or
   // owner/repo validation. Constant-time comparison; the presented header is never logged.
-  // See ServerDeps.auth above and the reuse rationale in opencode-proxy.ts.
+  // See ServerDeps.auth above and the reuse rationale in opencode-proxy-v2.ts.
   if (auth.kind === 'bearer') {
     const {token} = auth
     // An empty expected token would authenticate `Authorization: Bearer ` with nothing after it.

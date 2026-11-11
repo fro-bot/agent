@@ -136,7 +136,7 @@ export interface ExecuteRecoveryDeps {
   readonly removeStaging?: (path: string) => Promise<void>
 }
 
-/** The slice of the process logger recovery needs; structurally satisfied by `opencode-server.ts`'s `Logger`. */
+/** The slice of the process logger recovery needs; structurally satisfied by `types.ts`'s `Logger`. */
 export interface RecoveryLogger {
   readonly warn: (message: string, meta?: Record<string, unknown>) => void
 }

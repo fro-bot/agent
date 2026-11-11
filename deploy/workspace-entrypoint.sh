@@ -19,8 +19,7 @@
 #   2. Create/validate the protected directories, without following symlinks.
 #   3. Install the mitmproxy CA into the system trust store.
 #   4. Migrate any pre-existing root-owned checkouts to the agent uid.
-#   5. Provision OpenCode's merged config (and, on V1 images, auth.json) AS THE
-#      AGENT UID.
+#   5. Provision OpenCode's merged config AS THE AGENT UID.
 #   6. exec the workspace-agent supervisor (still uid 0 — see compose.yaml
 #      user: "0:0" — the supervisor spawns OpenCode itself as uid 10001;
 #      that spawn logic lives in apps/workspace-agent/src, not here).
@@ -203,24 +202,22 @@ if ! node "$SCRIPTS_DIR/migrate-repo-ownership.mjs" \
 fi
 
 # ---------------------------------------------------------------------------
-# Step 5: provision OpenCode's merged opencode.json (and, on V1 images, auth.json)
-# AS THE AGENT UID (10001), never as root.
+# Step 5: provision OpenCode's merged opencode.json AS THE AGENT UID (10001),
+# never as root.
 #
-# Why this has to drop privilege: both destination files live under
+# Why this has to drop privilege: the config destination lives under
 # /home/opencode, which the agent uid owns. If root wrote there directly —
-# as the old entrypoint did (auth.json copy) and as merge-config.mjs's
-# write-temp-then-rename pattern did — a symlink the agent (or anything it
-# ran) planted at either destination path would turn that privileged root
-# write into an arbitrary-path write anywhere on the filesystem. Running the
-# write as uid 10001 closes that class of attack entirely: the agent can
-# only ever redirect its own write into somewhere it could already write as
-# itself.
+# as merge-config.mjs's write-temp-then-rename pattern did — a symlink the
+# agent (or anything it ran) planted at the destination path would turn that
+# privileged root write into an arbitrary-path write anywhere on the
+# filesystem. Running the write as uid 10001 closes that class of attack
+# entirely: the agent can only ever redirect its own write into somewhere it
+# could already write as itself.
 #
-# Root's role is therefore reduced to: read the protected secret (which the
-# agent uid cannot reach — AUTH_SRC lives under the root-only
-# /run/workspace-agent/secrets), and hand the raw secret bytes to the
-# agent-uid subprocess over STDIN — never argv, which is visible to every
-# user on the host via process listings.
+# The provider credential never reaches the agent home. Root only validates
+# the protected secret (which the agent uid cannot reach — AUTH_SRC lives
+# under the root-only /run/workspace-agent/secrets); the workspace-agent
+# supervisor (root) provisions each OpenCode spawn from it over loopback.
 #
 # Privilege-drop tool: setpriv (from util-linux; see the Dockerfile for the
 # `apk add` and full rationale). `--reuid=10001 --regid=10001 --clear-groups`
@@ -244,24 +241,18 @@ fi
 # ~/.config, ~/.cache, ~/.local/state — conventional for anything under this
 # uid, even though these two scripts don't read them today). `env -i` wipes
 # the environment and rebuilds it from only this explicit allowlist; the
-# auth secret itself keeps arriving on stdin exactly as before, never as an
-# env var.
+# auth secret is not part of it.
 # ---------------------------------------------------------------------------
 AUTH_SRC="${WORKSPACE_OPENCODE_AUTH_FILE:-${RUNTIME_DIR}/secrets/workspace_opencode_auth}"
 BASE_CONFIG_PATH="/usr/local/share/fro-bot/opencode.base.json"
-AUTH_DEST="${AGENT_HOME}/.local/share/opencode/auth.json"
-# V2 is selected by the image's baked OPENCODE_VERSION major (the case patterns the Dockerfile uses); the workspace
-# agent reads the same variable (opencode-generation.ts). No value means V1.
-case "${WORKSPACE_IMAGE_OPENCODE_VERSION:-}" in
-  [2-9].*|[1-9][0-9]*.*) OPENCODE_V2=true ;;
-  *) OPENCODE_V2=false ;;
-esac
+# An auth.json an earlier run left under the agent home: provisioning removes it.
+STALE_AUTH_PATH="${AGENT_HOME}/.local/share/opencode/auth.json"
 CONFIG_DEST="${AGENT_HOME}/.config/opencode/opencode.json"
 
-# Read (as root) and compact the secret. Absence is fail-soft (clone-only
+# Read (as root) and validate the secret. Absence is fail-soft (clone-only
 # deployments boot without it); a read failure or malformed blob is
 # fail-fast. Whitespace-only means "unset" (matches readOptionalSecret).
-AUTH_RAW=""
+auth_was_present=false
 if [ -f "$AUTH_SRC" ]; then
   if ! _auth_compact=$(tr -d '[:space:]' < "$AUTH_SRC" 2>/dev/null); then
     echo "workspace-entrypoint: cannot read auth secret at $AUTH_SRC" >&2
@@ -272,29 +263,15 @@ if [ -f "$AUTH_SRC" ]; then
       echo "workspace-entrypoint: auth secret is present but invalid — refusing to start. Fix the credential blob and restart." >&2
       exit 1
     fi
-    # Re-read raw (uncompacted) content for the agent-uid subprocess — the
-    # provisioning script accepts and preserves whitespace-tolerant JSON.
-    AUTH_RAW="$(cat "$AUTH_SRC")"
+    auth_was_present=true
   fi
 fi
 
-# The single write step, dropped to the agent uid. AUTH_RAW travels only over
-# this pipe's stdin, never as a CLI argument or in an exported env var.
+# The single write step, dropped to the agent uid. No secret reaches it: OpenCode never reads auth.json on its fresh
+# per-spawn database, so nothing is written under the agent home and a stale auth.json is removed.
 # `if`-wrapped (rather than a bare assignment) so a non-zero exit does not
 # trip `set -e` before provision_rc can be captured.
-auth_was_present=false
-if [ -n "$AUTH_RAW" ]; then
-  auth_was_present=true
-fi
-# V2 never reads auth.json on its fresh per-spawn database: the supervisor (root) provisions each spawn from the
-# root-only secret over loopback. So V2 writes no copy under the agent home, gets no secret on stdin, and has a
-# stale auth.json from an earlier V1 run removed.
-provision_flags=""
-if [ "$OPENCODE_V2" = true ]; then
-  AUTH_RAW=""
-  provision_flags="--no-auth-json"
-fi
-if provision_output=$(printf '%s' "$AUTH_RAW" | setpriv --reuid="$AGENT_UID" --regid="$AGENT_GID" --clear-groups \
+if provision_output=$(setpriv --reuid="$AGENT_UID" --regid="$AGENT_GID" --clear-groups \
     env -i \
       PATH="$PATH" \
       HOME="$AGENT_HOME" \
@@ -304,20 +281,20 @@ if provision_output=$(printf '%s' "$AUTH_RAW" | setpriv --reuid="$AGENT_UID" --r
       XDG_STATE_HOME="${AGENT_HOME}/.local/state" \
       WORKSPACE_OPENCODE_MODEL="${WORKSPACE_OPENCODE_MODEL:-}" \
       WORKSPACE_OPENCODE_CONFIG="${WORKSPACE_OPENCODE_CONFIG:-}" \
-    node "$SCRIPTS_DIR/provision-agent-config.mjs" "$BASE_CONFIG_PATH" "$AUTH_DEST" "$CONFIG_DEST" ${provision_flags:+"$provision_flags"} 2>&1); then
+    node "$SCRIPTS_DIR/provision-agent-config.mjs" "$BASE_CONFIG_PATH" "$STALE_AUTH_PATH" "$CONFIG_DEST" </dev/null 2>&1); then
   provision_rc=0
 else
   provision_rc=$?
 fi
-unset AUTH_RAW _auth_compact
+unset _auth_compact
 
 echo "$provision_output" >&2
 if [ "$provision_rc" -ne 0 ]; then
-  echo "workspace-entrypoint: OpenCode config/auth provisioning failed — refusing to start. Fix the credential blob / WORKSPACE_OPENCODE_CONFIG / WORKSPACE_OPENCODE_MODEL and restart." >&2
+  echo "workspace-entrypoint: OpenCode config provisioning failed — refusing to start. Fix WORKSPACE_OPENCODE_CONFIG / WORKSPACE_OPENCODE_MODEL and restart." >&2
   exit 1
 fi
-if [ "$auth_was_present" = true ] && [ "$OPENCODE_V2" = true ]; then
-  echo "workspace-entrypoint: auth: present (OpenCode V2: the supervisor provisions each spawn, no auth.json written)" >&2
+if [ "$auth_was_present" = true ]; then
+  echo "workspace-entrypoint: auth: present (the supervisor provisions each spawn, no auth.json written)" >&2
 fi
 if [ "$auth_was_present" = false ]; then
   echo "workspace-entrypoint: auth: absent (mention loop will fail until configured; clone-only deployment is fine)" >&2
@@ -329,4 +306,12 @@ fi
 # The supervisor itself stays uid 0 (compose.yaml user: "0:0") — it spawns
 # OpenCode as uid 10001 (apps/workspace-agent/src owns that spawn logic).
 # ---------------------------------------------------------------------------
+#
+# The OpenCode version the image carries comes from the file the Dockerfile's version-gate stage wrote, never from the
+# operator's environment, so the version reported on /readyz is the one that was installed.
+if ! WORKSPACE_IMAGE_OPENCODE_VERSION="$(cat /usr/local/share/fro-bot/opencode-version)" || [ -z "$WORKSPACE_IMAGE_OPENCODE_VERSION" ]; then
+  echo "workspace-entrypoint: /usr/local/share/fro-bot/opencode-version is missing or empty — refusing to start." >&2
+  exit 1
+fi
+export WORKSPACE_IMAGE_OPENCODE_VERSION
 exec node /app/apps/workspace-agent/dist/main.mjs

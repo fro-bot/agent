@@ -12,7 +12,7 @@ import {
   makeStatusControllerMock,
   makeUpdateFn,
   mockCreateDiscordStreamSink,
-  mockRunOpenCodeCore,
+  mockRunOpenCodeCoreV2,
   mockRuntime,
   setupHappyPath,
 } from './test-helpers.js'
@@ -87,8 +87,8 @@ describe('checkout provenance', () => {
     await awaitLaunchWorkRun(launchWork, request, deps)
 
     // #then
-    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
-    const promptText = mockRunOpenCodeCore.mock.calls[0]?.[0]?.promptText as string
+    expect(mockRunOpenCodeCoreV2).toHaveBeenCalledOnce()
+    const promptText = mockRunOpenCodeCoreV2.mock.calls[0]?.[0]?.promptText as string
     expect(promptText).toContain('Checkout provenance')
     expect(promptText).toContain('Remote checked: default branch')
   })
@@ -105,7 +105,7 @@ describe('checkout provenance', () => {
 
     // #then — the engine appended provenance AFTER the custom builder ran; the builder
     // itself never mentions provenance, so this proves the engine inserted it, not the builder.
-    const promptText = mockRunOpenCodeCore.mock.calls[0]?.[0]?.promptText as string
+    const promptText = mockRunOpenCodeCoreV2.mock.calls[0]?.[0]?.promptText as string
     expect(promptText).toContain('CUSTOM WEB PROMPT')
     expect(promptText).toContain('Checkout provenance')
   })
@@ -114,7 +114,7 @@ describe('checkout provenance', () => {
     // #given
     const {launchWork} = await import('./run.js')
     setupHappyPath()
-    mockRunOpenCodeCore.mockImplementation(async params => {
+    mockRunOpenCodeCoreV2.mockImplementation(async params => {
       ;(params as {sink: {append: (t: string) => void}}).sink.append('the agent answer')
     })
     const request = makeInMemoryRequest()
@@ -135,7 +135,7 @@ describe('checkout provenance', () => {
     const {launchWork} = await import('./run.js')
     setupHappyPath()
     const {RunCoreError} = await import('./run-core-shared.js')
-    mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('stream-ended', 'stream closed'))
+    mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('stream-ended', 'stream closed'))
     const request = makeInMemoryRequest()
     const deps = makeDeps({update: makeUpdateFn('ready')})
 
@@ -196,7 +196,7 @@ describe('checkout provenance', () => {
     expect(mockRuntime.releaseLock).toHaveBeenCalledOnce()
 
     // #and — no agent session starts
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
   })
 
   it('checkout-substituted → the failure reply carries the withheld-provenance line (no SHA, no branch)', async () => {
@@ -318,7 +318,7 @@ describe('checkout provenance', () => {
     expect(mockRuntime.releaseLock).toHaveBeenCalled()
     // #and — the release uses the lock ETag heartbeat.stop() confirmed, not the acquisition ETag
     expect(mockRuntime.releaseLock.mock.calls[0]?.[2]).toBe('lock-etag-after-heartbeat')
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
     expect(request._replySink._sends).toHaveLength(0)
   })
 
@@ -402,7 +402,7 @@ describe('checkout provenance', () => {
 
       // #then the run proceeds into the agent session instead of failing
       expect(executingEtags()).toEqual(['ack-etag', 'etag-after-tick'])
-      expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+      expect(mockRunOpenCodeCoreV2).toHaveBeenCalledOnce()
       const phases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4])
       expect(phases).not.toContain('FAILED')
       expect(phases).toContain('COMPLETED')
@@ -481,7 +481,7 @@ describe('checkout provenance', () => {
         const executing = mockRuntime.transitionRun.mock.calls.filter((c: unknown[]) => c[4] === 'EXECUTING')
         expect(executing).toHaveLength(2)
         expect(executing[1]?.[5]).not.toBe(executing[0]?.[5])
-        expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+        expect(mockRunOpenCodeCoreV2).toHaveBeenCalledOnce()
         const stored = JSON.parse(objects.run.data) as {phase: string; details: Record<string, unknown>}
         expect(stored.phase).toBe('COMPLETED')
         expect(stored.details.checkoutProvenance).toBeDefined()
@@ -510,7 +510,7 @@ describe('checkout provenance', () => {
 
       // #then
       expect(executingEtags()).toEqual(['ack-etag'])
-      expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+      expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
       expect(mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4])).not.toContain('FAILED')
     })
 
@@ -527,7 +527,7 @@ describe('checkout provenance', () => {
 
         // #then the failure is not masked: no retry, no agent session
         expect(executingEtags()).toEqual(['ack-etag'])
-        expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+        expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
       },
     )
 
@@ -542,7 +542,7 @@ describe('checkout provenance', () => {
 
       // #then exactly one retry
       expect(executingEtags()).toEqual(['ack-etag', 'etag-after-tick'])
-      expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+      expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
     })
 
     it('exits cleanly when an operator cancel commits between the re-read and the retry', async () => {
@@ -559,7 +559,7 @@ describe('checkout provenance', () => {
 
       // #then one retry, two reads, no third write, and no agent session
       expect(executingEtags()).toEqual(['ack-etag', 'etag-after-tick'])
-      expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+      expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
 
       // #and the cancelled run is not reported as a failure anywhere
       expect(mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4])).not.toContain('FAILED')
@@ -586,7 +586,7 @@ describe('checkout provenance', () => {
 
       // #then one retry only: no third EXECUTING write, and the agent never starts
       expect(executingEtags()).toEqual(['ack-etag', 'etag-after-tick'])
-      expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+      expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
 
       // #and the run fails as it did before, and the lock is released
       expect(mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4])).toContain('FAILED')
@@ -668,7 +668,7 @@ describe('checkout provenance', () => {
     const errorSend = sends.find(s => s.content.length > 0)
     expect(errorSend).toBeDefined()
     expect(errorSend?.content).toContain('An operator needs to look at it')
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
   })
 
   it('corrected clone-failure mapping: an operator-side clone-error (invalid-repo) no longer yields the retry message', async () => {
@@ -698,7 +698,7 @@ describe('checkout provenance', () => {
     expect(errorSend?.content).toContain('An operator needs to look at it')
 
     // #and — no OpenCode session starts
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
   })
 
   it('checkout-handoff-failed is workspace-unavailable, not the retry-inviting message — a handoff failure (hardlink, filesystem boundary, deadline, entry cap) is deterministic and will not resolve on retry', async () => {
@@ -726,7 +726,7 @@ describe('checkout provenance', () => {
     expect(errorSend?.content).not.toContain('not reachable')
     expect(errorSend?.content).not.toContain('try again later')
     expect(errorSend?.content).toContain('An operator needs to look at it')
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
   })
 
   it('clone response-mismatch is workspace-unavailable, not the retry-inviting message — the path comparison gives the same answer on every retry, and ensure-clone.ts already logs it as a security signal', async () => {
@@ -754,7 +754,7 @@ describe('checkout provenance', () => {
     expect(errorSend?.content).not.toContain('not reachable')
     expect(errorSend?.content).not.toContain('try again later')
     expect(errorSend?.content).toContain('An operator needs to look at it')
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
   })
 
   it('clone-failed stays in the unreachable/retry bucket — it is transient-dominant since missing repos fail earlier, at auth', async () => {
@@ -978,7 +978,7 @@ describe('the deterministic provenance line appears exactly once per delivery mo
     // message, `replySink.buffered()`/`flush()` is the only delivery channel
     const {launchWork} = await import('./run.js')
     setupHappyPath()
-    mockRunOpenCodeCore.mockImplementation(async params => {
+    mockRunOpenCodeCoreV2.mockImplementation(async params => {
       ;(params as {sink: {append: (t: string) => void}}).sink.append('the agent answer')
     })
     const request = makeInMemoryRequest()
@@ -998,7 +998,7 @@ describe('the deterministic provenance line appears exactly once per delivery mo
     const {launchWork} = await import('./run.js')
     const {RunCoreError} = await import('./run-core-shared.js')
     setupHappyPath()
-    mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('stream-ended', 'stream closed', true))
+    mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('stream-ended', 'stream closed', true))
     const request = makeInMemoryRequest()
     const deps = makeDeps({update: makeUpdateFn('ready')})
 

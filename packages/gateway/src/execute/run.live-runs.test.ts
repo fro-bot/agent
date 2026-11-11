@@ -8,7 +8,7 @@ import {
   buildMockRunState,
   makeDeps,
   makeInMemoryRequest,
-  mockRunOpenCodeCore,
+  mockRunOpenCodeCoreV2,
   mockRuntime,
   setupHappyPath,
 } from './test-helpers.js'
@@ -133,7 +133,7 @@ describe('the live-run set', () => {
 
     // #then the run was already owned while the ACK was pending, and it executed
     expect(ownedWhileAckPending).toBe(true)
-    expect(mockRunOpenCodeCore).toHaveBeenCalled()
+    expect(mockRunOpenCodeCoreV2).toHaveBeenCalled()
   })
 
   it('leaves a run that failed to ACK not live, so the sweep can repair its record', async () => {
@@ -183,7 +183,7 @@ describe('the live-run set', () => {
     // #given the barrier could not confirm owned work stopped, and the quarantine FAILED write never lands
     setupHappyPath()
     failEveryWriteOf('FAILED')
-    mockRunOpenCodeCore.mockRejectedValue(new runCoreModule.RunCoreError('session-error', 'quota exceeded', true))
+    mockRunOpenCodeCoreV2.mockRejectedValue(new runCoreModule.RunCoreError('session-error', 'quota exceeded', true))
     const deps = makeDeps({coordinationConfig: storedRecord()})
     const {launchWork, QUARANTINE_HOLD_WINDOW_MS} = await import('./run.js')
 
@@ -208,7 +208,7 @@ describe('the live-run set', () => {
   it('drops a run that failed an ordinary way once its writes are done', async () => {
     // #given
     setupHappyPath()
-    mockRunOpenCodeCore.mockRejectedValue(new runCoreModule.RunCoreError('timeout', 'timed out'))
+    mockRunOpenCodeCoreV2.mockRejectedValue(new runCoreModule.RunCoreError('timeout', 'timed out'))
     const deps = makeDeps({coordinationConfig: storedRecord()})
     const {launchWork} = await import('./run.js')
 
@@ -254,7 +254,7 @@ describe('a cancel that lands while the FAILED write is retrying', () => {
         data: {etag: 'etag-after', state: buildMockRunState({phase: args[4] as 'FAILED'})},
       }
     })
-    mockRunOpenCodeCore.mockRejectedValue(new runCoreModule.RunCoreError('timeout', 'timed out'))
+    mockRunOpenCodeCoreV2.mockRejectedValue(new runCoreModule.RunCoreError('timeout', 'timed out'))
     const pushDispatcher = {
       dispatchApprovalPending: vi.fn().mockResolvedValue(undefined),
       dispatchRunFailed: vi.fn().mockResolvedValue(undefined),

@@ -13,12 +13,11 @@ import {
   mockCreateDiscordStreamSink,
   mockCreatePermissionCoordinator,
   mockCreateStatusController,
-  mockRunOpenCodeCore,
+  mockRunOpenCodeCoreV2,
   mockRuntime,
   setupHappyPath,
 } from './test-helpers.js'
 import * as reactionsModule from '../discord/reactions.js'
-import * as attachModule from './opencode-attach.js'
 import * as promptModule from './prompt.js'
 import * as runCoreModule from './run-core-shared.js'
 /* eslint-enable perfectionist/sort-imports */
@@ -68,11 +67,7 @@ describe('runMention', () => {
         }),
         isRunning: false,
       })
-      mockRunOpenCodeCore.mockResolvedValue(undefined)
-      vi.mocked(attachModule.attachOpencode).mockReturnValue({
-        server: {url: 'http://workspace:9200'},
-        session: {create: vi.fn(), prompt: vi.fn()},
-      } as unknown as ReturnType<typeof attachModule.attachOpencode>)
+      mockRunOpenCodeCoreV2.mockResolvedValue(undefined)
       vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
 
       const observeFn = vi.fn().mockResolvedValue(undefined)
@@ -114,11 +109,7 @@ describe('runMention', () => {
         }),
         isRunning: false,
       })
-      mockRunOpenCodeCore.mockRejectedValue(new Error('boom'))
-      vi.mocked(attachModule.attachOpencode).mockReturnValue({
-        server: {url: 'http://workspace:9200'},
-        session: {create: vi.fn(), prompt: vi.fn()},
-      } as unknown as ReturnType<typeof attachModule.attachOpencode>)
+      mockRunOpenCodeCoreV2.mockRejectedValue(new Error('boom'))
       vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
 
       const observeFn = vi.fn().mockResolvedValue(undefined)
@@ -341,7 +332,7 @@ describe('runMention', () => {
       // #given — track call order between flush and observe(FAILED)
       const {runMention} = await import('./run.js')
       setupHappyPath()
-      mockRunOpenCodeCore.mockRejectedValue(new Error('boom'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new Error('boom'))
 
       const callOrder: string[] = []
 
@@ -454,7 +445,7 @@ describe('runMention', () => {
       const {RunCoreError} = runCoreModule
       setupHappyPath()
       const ctrl = makeStatusControllerMock({resolveToFailureResult: {transition: 'handled'}})
-      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('session-error', 'LLM error'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('session-error', 'LLM error'))
 
       const thread = makeThread()
       const message = makeMessage(thread)
@@ -481,7 +472,7 @@ describe('runMention', () => {
       const {RunCoreError} = runCoreModule
       setupHappyPath()
       const ctrl = makeStatusControllerMock({resolveToFailureResult: {transition: 'delegated'}})
-      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('unreachable', 'connect failed'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('unreachable', 'connect failed'))
 
       const thread = makeThread()
       const message = makeMessage(thread)
@@ -547,7 +538,7 @@ describe('runMention', () => {
       const {runMention} = await import('./run.js')
       setupHappyPath()
       const ctrl = makeStatusControllerMock()
-      mockRunOpenCodeCore.mockRejectedValue(new Error('boom'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new Error('boom'))
 
       const deps = makeDeps()
       const message = makeMessage()
@@ -575,7 +566,7 @@ describe('runMention', () => {
       expect(mockCreateStatusController).toHaveBeenCalledWith(expect.objectContaining({mode: 'live-status'}))
     })
 
-    it('runOpenCodeCore receives onActivity and onBusy callbacks', async () => {
+    it('runOpenCodeCoreV2 receives onActivity and onBusy callbacks', async () => {
       // #given
       const {runMention} = await import('./run.js')
       setupHappyPath()
@@ -587,8 +578,8 @@ describe('runMention', () => {
       // #when
       await runMention(message, makeBinding(), deps)
 
-      // #then — runOpenCodeCore called with onActivity and onBusy
-      expect(mockRunOpenCodeCore).toHaveBeenCalledWith(
+      // #then — runOpenCodeCoreV2 called with onActivity and onBusy
+      expect(mockRunOpenCodeCoreV2).toHaveBeenCalledWith(
         expect.objectContaining({
           onActivity: expect.any(Function) as unknown,
           onBusy: expect.any(Function) as unknown,
@@ -597,13 +588,13 @@ describe('runMention', () => {
     })
 
     it('onActivity callback calls controller.noteActivity', async () => {
-      // #given — capture the onActivity callback from runOpenCodeCore
+      // #given — capture the onActivity callback from runOpenCodeCoreV2
       const {runMention} = await import('./run.js')
       setupHappyPath()
       const ctrl = makeStatusControllerMock()
 
       let capturedOnActivity: ((summary: string) => void) | undefined
-      mockRunOpenCodeCore.mockImplementation(async params => {
+      mockRunOpenCodeCoreV2.mockImplementation(async params => {
         capturedOnActivity = (params as {onActivity?: (s: string) => void}).onActivity
       })
 
@@ -621,13 +612,13 @@ describe('runMention', () => {
     })
 
     it('onBusy callback calls controller.setBusy', async () => {
-      // #given — capture the onBusy callback from runOpenCodeCore
+      // #given — capture the onBusy callback from runOpenCodeCoreV2
       const {runMention} = await import('./run.js')
       setupHappyPath()
       const ctrl = makeStatusControllerMock()
 
       let capturedOnBusy: ((busy: boolean) => void) | undefined
-      mockRunOpenCodeCore.mockImplementation(async params => {
+      mockRunOpenCodeCoreV2.mockImplementation(async params => {
         capturedOnBusy = (params as {onBusy?: (b: boolean) => void}).onBusy
       })
 
@@ -716,7 +707,7 @@ describe('runMention', () => {
       const {RunCoreError} = runCoreModule
       setupHappyPath()
       const ctrl = makeStatusControllerMock({resolveToFailureResult: {transition: 'delegated'}})
-      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('unreachable', 'connect failed'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('unreachable', 'connect failed'))
 
       const thread = makeThread()
       const message = makeMessage(thread)
@@ -776,7 +767,7 @@ describe('runMention', () => {
       const {RunCoreError} = runCoreModule
       setupHappyPath()
       const ctrl = makeStatusControllerMock({resolveToFailureResult: {transition: 'handled'}})
-      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('session-error', 'LLM error'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('session-error', 'LLM error'))
 
       const thread = makeThread()
       const message = makeMessage(thread)
@@ -839,7 +830,7 @@ describe('reaction wiring — lifecycle hooks', () => {
     // #given
     const {runMention} = await import('./run.js')
     setupHappyPath()
-    mockRunOpenCodeCore.mockRejectedValue(new Error('boom'))
+    mockRunOpenCodeCoreV2.mockRejectedValue(new Error('boom'))
     const message = makeMessage()
     const deps = makeDeps()
 
@@ -888,7 +879,7 @@ describe('reaction wiring — lifecycle hooks', () => {
       }
     })
 
-    mockRunOpenCodeCore.mockImplementation(async () => {
+    mockRunOpenCodeCoreV2.mockImplementation(async () => {
       // Invoke onPending to trigger the awaiting-approval reaction
       capturedOnPending?.({
         requestID: 'req-pending-1',
@@ -938,7 +929,7 @@ describe('reaction wiring — containment (failure isolation)', () => {
     const {runMention} = await import('./run.js')
     setupHappyPath()
     mockSetRunReaction.mockRejectedValue(new Error('reaction API exploded'))
-    mockRunOpenCodeCore.mockRejectedValue(new Error('run-core boom'))
+    mockRunOpenCodeCoreV2.mockRejectedValue(new Error('run-core boom'))
     const message = makeMessage()
     const deps = makeDeps()
 
@@ -1121,7 +1112,7 @@ describe('operatorPushDispatcher wiring', () => {
       }
     })
 
-    mockRunOpenCodeCore.mockImplementation(async () => {
+    mockRunOpenCodeCoreV2.mockImplementation(async () => {
       capturedOnPending?.({
         requestID: 'req-push-1',
         sessionID: 'sess-push',
@@ -1155,7 +1146,7 @@ describe('operatorPushDispatcher wiring', () => {
     const {RunCoreError} = runCoreModule
     setupHappyPath()
     const pushDispatcher = makePushDispatcher()
-    mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('inactivity-timeout', 'no progress'))
+    mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('inactivity-timeout', 'no progress'))
 
     const deps = makeDeps({operatorPushDispatcher: pushDispatcher})
     const message = makeMessage()
@@ -1174,7 +1165,7 @@ describe('operatorPushDispatcher wiring', () => {
     const {RunCoreError} = runCoreModule
     setupHappyPath()
     const pushDispatcher = makePushDispatcher()
-    mockRunOpenCodeCore.mockRejectedValue(
+    mockRunOpenCodeCoreV2.mockRejectedValue(
       new RunCoreError('session-error', 'Provider failure: provider auth unavailable'),
     )
 
@@ -1206,7 +1197,7 @@ describe('operatorPushDispatcher wiring', () => {
         isOwned: vi.fn().mockReturnValue(true),
       }
     })
-    mockRunOpenCodeCore.mockImplementation(async () => {
+    mockRunOpenCodeCoreV2.mockImplementation(async () => {
       capturedOnPending?.({
         requestID: 'req-inert-1',
         sessionID: 'sess-inert',
@@ -1248,7 +1239,7 @@ describe('operatorPushDispatcher wiring', () => {
         isOwned: vi.fn().mockReturnValue(true),
       }
     })
-    mockRunOpenCodeCore.mockImplementation(async () => {
+    mockRunOpenCodeCoreV2.mockImplementation(async () => {
       capturedOnPending?.({
         requestID: 'req-throw-1',
         sessionID: 'sess-throw',

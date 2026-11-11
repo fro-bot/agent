@@ -6,8 +6,8 @@
  * resolves with no auth. The supervisor therefore provisions the credentials itself, over loopback, after the server
  * is up and before it reports ready:
  *
- * 1. `parseAuthBlob` turns the root-only secret (the same `{"<provider>":{"type":"api","key":"…"}}` blob the V1 path
- *    writes to `auth.json`) into typed entries, once, before any spawn.
+ * 1. `parseAuthBlob` turns the root-only secret (the `{"<provider>":{"type":"api","key":"…"}}` blob the entrypoint
+ *    reads) into typed entries, once, before any spawn.
  * 2. `provisionCredentials` calls `POST /api/credential` once per provider (`value: {type: "key", key}`).
  * 3. `verifyCredentialGate` reads `GET /api/integration/<provider>` back and refuses unless the provider has a
  *    connection. That response lists connection ids and labels only, never the secret.

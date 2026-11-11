@@ -10,7 +10,7 @@ import {createOwnershipLedger} from '@fro-bot/runtime'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
 import {LIVE_RECONCILE_TIMEOUT_MS, reconcileLivePass} from './live-reconcile.js'
-import {DEFAULT_SETTLE_TIMEOUT_MS} from './settle-owned-sessions.js'
+import {DEFAULT_SETTLE_TIMEOUT_MS} from './settle-owned-sessions-v2.js'
 
 const PARENT = 'sess-root'
 

@@ -12,7 +12,7 @@ import {
   makeInMemoryRequest,
   makeMessage,
   mockCreatePermissionCoordinator,
-  mockRunOpenCodeCore,
+  mockRunOpenCodeCoreV2,
   mockRuntime,
   setupHappyPath,
 } from './test-helpers.js'
@@ -92,7 +92,7 @@ function fireApprovals(requests: readonly PermissionRequest[]): void {
       isOwned: vi.fn().mockReturnValue(true),
     }
   })
-  mockRunOpenCodeCore.mockImplementation(async () => {
+  mockRunOpenCodeCoreV2.mockImplementation(async () => {
     for (const request of requests) onPending?.(request)
   })
 }

@@ -21,8 +21,6 @@ import {
   releaseLockIfHolder,
   syncArtifactsToStore,
   syncMetadataToStore,
-  syncSessionsFromStore,
-  syncSessionsToStore,
   transitionRun,
   validateProviderSemantics,
 } from '@fro-bot/runtime'
@@ -38,8 +36,6 @@ import {
   releaseLockIfHolderEffect,
   syncArtifactsToStoreEffect,
   syncMetadataToStoreEffect,
-  syncSessionsFromStoreEffect,
-  syncSessionsToStoreEffect,
   transitionRunEffect,
   validateProviderSemanticsEffect,
 } from './runtime-effect.js'
@@ -55,8 +51,6 @@ vi.mock('@fro-bot/runtime', () => ({
   releaseLockIfHolder: vi.fn(),
   syncArtifactsToStore: vi.fn(),
   syncMetadataToStore: vi.fn(),
-  syncSessionsFromStore: vi.fn(),
-  syncSessionsToStore: vi.fn(),
   transitionRun: vi.fn(),
   validateProviderSemantics: vi.fn(),
 }))
@@ -71,8 +65,8 @@ const coordLogger = {debug: noop, info: noop}
 
 // Minimal CoordinationConfig stub — only shape matters for mocked calls
 const config = {} as Parameters<typeof acquireLockEffect>[0]
-const adapter = {} as Parameters<typeof syncSessionsToStoreEffect>[0]
-const storeConfig = {} as Parameters<typeof syncSessionsToStoreEffect>[1]
+const adapter = {} as Parameters<typeof syncArtifactsToStoreEffect>[0]
+const storeConfig = {} as Parameters<typeof syncArtifactsToStoreEffect>[1]
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -403,52 +397,6 @@ describe('validateProviderSemanticsEffect', () => {
 // ---------------------------------------------------------------------------
 // S3 sync helpers — plain Promise (no Result tag), test (1) and (3) only
 // ---------------------------------------------------------------------------
-
-describe('syncSessionsToStoreEffect', () => {
-  beforeEach(() => vi.resetAllMocks())
-
-  it('resolves to {uploaded, failed} on success', async () => {
-    vi.mocked(syncSessionsToStore).mockResolvedValue({uploaded: 2, failed: 0})
-
-    const exit = await Effect.runPromiseExit(
-      syncSessionsToStoreEffect(adapter, storeConfig, 'identity', 'repo', '/sessions', logger),
-    )
-
-    expect(exit).toMatchObject({_tag: 'Success', value: {uploaded: 2, failed: 0}})
-  })
-
-  it('fails when underlying function throws', async () => {
-    vi.mocked(syncSessionsToStore).mockRejectedValue(new Error('upload error'))
-
-    await assertEffectFailsWith(
-      syncSessionsToStoreEffect(adapter, storeConfig, 'identity', 'repo', '/sessions', logger),
-      'upload error',
-    )
-  })
-})
-
-describe('syncSessionsFromStoreEffect', () => {
-  beforeEach(() => vi.resetAllMocks())
-
-  it('resolves to {downloaded, failed, mainDbRestored} on success', async () => {
-    vi.mocked(syncSessionsFromStore).mockResolvedValue({downloaded: 3, failed: 0, mainDbRestored: true})
-
-    const exit = await Effect.runPromiseExit(
-      syncSessionsFromStoreEffect(adapter, storeConfig, 'identity', 'repo', '/sessions', logger),
-    )
-
-    expect(exit).toMatchObject({_tag: 'Success', value: {downloaded: 3, failed: 0, mainDbRestored: true}})
-  })
-
-  it('fails when underlying function throws', async () => {
-    vi.mocked(syncSessionsFromStore).mockRejectedValue(new Error('download error'))
-
-    await assertEffectFailsWith(
-      syncSessionsFromStoreEffect(adapter, storeConfig, 'identity', 'repo', '/sessions', logger),
-      'download error',
-    )
-  })
-})
 
 describe('syncArtifactsToStoreEffect', () => {
   beforeEach(() => vi.resetAllMocks())

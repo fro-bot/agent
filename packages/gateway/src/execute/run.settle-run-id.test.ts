@@ -1,6 +1,12 @@
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 
-import {awaitLaunchWorkRun, makeDeps, makeInMemoryRequest, mockRunOpenCodeCore, setupHappyPath} from './test-helpers.js'
+import {
+  awaitLaunchWorkRun,
+  makeDeps,
+  makeInMemoryRequest,
+  mockRunOpenCodeCoreV2,
+  setupHappyPath,
+} from './test-helpers.js'
 
 // ---------------------------------------------------------------------------
 // #1889 — the run id must reach the execution core, whose termination barrier stamps it on every
@@ -12,7 +18,7 @@ describe('run id hand-off to the execution core', () => {
     vi.clearAllMocks()
   })
 
-  it('passes the admitted run id to runOpenCodeCore', async () => {
+  it('passes the admitted run id to runOpenCodeCoreV2', async () => {
     // #given
     const {launchWork} = await import('./run.js')
     setupHappyPath()
@@ -25,6 +31,6 @@ describe('run id hand-off to the execution core', () => {
     // #then
     const runId = admission.accepted === true ? admission.runId : undefined
     expect(runId).toBeDefined()
-    expect(mockRunOpenCodeCore).toHaveBeenCalledWith(expect.objectContaining({runId}))
+    expect(mockRunOpenCodeCoreV2).toHaveBeenCalledWith(expect.objectContaining({runId}))
   })
 })

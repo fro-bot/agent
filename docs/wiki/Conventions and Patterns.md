@@ -120,7 +120,7 @@ Downstream code narrows via `event.type` before accessing variant-specific field
 
 ## Adapter Pattern
 
-Generation-specific adapters now keep V1 and V2 protocol differences explicit. The shared generation selector interprets versions once, and the Action's execution backend keeps prompt submission, overflow recovery, archiving, and search on the same generation. V2's event adapter translates its native envelope into the activity and ownership vocabulary rather than leaking raw transport shapes throughout the harness.
+Protocol adapters keep the V2 transport explicit. The shared version parser interprets versions once, and the Action's execution backend keeps prompt submission, overflow recovery, archiving, and search together. The event adapter translates V2's native envelope into the activity and ownership vocabulary rather than leaking raw transport shapes throughout the harness.
 
 This follows the same evidence discipline as named outcomes: a lost V2 prompt acknowledgment means uncertain admission, not permission to retry blindly, and an unreadable directory observation means unknown activity, not quiet. Completion uses consecutive bounded observations instead of equating a successful interrupt response with a stopped writer. [[Background Subagents and Ownership]] describes the release gate.
 

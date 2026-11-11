@@ -13,7 +13,6 @@ sources:
   - src/features/agent/drain-v2.ts
   - packages/runtime/src/agent/bundled-skills-dir.ts
   - packages/runtime/src/shared/opencode-v2-pin.json
-  - packages/gateway/src/execute/opencode-generation.ts
   - packages/gateway/src/execute/run-core-v2.ts
   - packages/gateway/src/approvals/run-grants.ts
   - apps/workspace-agent/src/opencode-credentials-v2.ts
@@ -46,13 +45,11 @@ sources:
   - packages/gateway/src/execute/live-run-registry.ts
   - packages/gateway/src/execute/recovery.ts
   - packages/gateway/src/execute/checkout-recovery.ts
-  - packages/gateway/src/execute/settle-owned-sessions.ts
-  - packages/gateway/src/execute/root-stop.ts
-  - packages/gateway/src/execute/run-core.ts
+  - packages/gateway/src/execute/settle-owned-sessions-v2.ts
+  - packages/gateway/src/execute/root-stop-v2.ts
   - apps/workspace-agent/src/server.ts
   - apps/workspace-agent/src/recover.ts
-  - apps/workspace-agent/src/opencode-instance.ts
-  - apps/workspace-agent/src/opencode-proxy.ts
+  - apps/workspace-agent/src/opencode-instance-v2.ts
   - packages/runtime/src/shared/errors.ts
   - packages/gateway/src/github/app-client.ts
   - docs/solutions/test-failures/gateway-operator-route-health-timeout-flake-2026-07-30.md
@@ -219,7 +216,7 @@ To clear a stuck gateway lock sooner, use `/fro-bot force-release-lock`; it dele
 
 ## A Gateway Run Was Refused or Cancelled
 
-The gateway selects its protocol from the workspace's reported `opencodeVersion` for each run. A present but unreadable value or failed readiness lookup is unavailable, not an implicit V1 choice. This also affects generation-aware workspace checks used by lock replacement and recovery. The detailed `server.connected` and `session.idle` diagnostics below are V1-specific; V2 uses its native event and directory-release path.
+The gateway admits a run only when the workspace's reported `opencodeVersion` is major 2 or higher. A missing, older or unreadable value, or a failed readiness lookup, is unavailable: the run is not admitted. This also affects the workspace checks used by lock replacement and recovery.
 
 The periodic stranded-run sweep now covers stale `EXECUTING` and `ACKNOWLEDGED` records, leaving `PENDING` alone. It skips runs owned by this process, including live and maintenance runs, and never deletes a lock. A repaired failed status is therefore not evidence that the workspace was cleared. Startup recovery still requires a clear generation-appropriate workspace observation.
 
@@ -235,15 +232,15 @@ When a gateway run ends before the agent starts, or a cancel does not seem to st
 - **`run: terminal transition failed — retrying with the stored ETag`** (gateway, warning) fires before each retry of a terminal RunState write that lost its conditional write or hit a store error. It carries `repo`, `runId`, `phase`, `retry`, `attempts` and `err`. Every terminal write makes up to three attempts, 500 ms then 1 s apart, each bounded to 5 s. **`run: terminal transition failed and the stored run is terminal or not this run — skipping retry`** means the record was already finished (or is another run's) and was left alone. **`run: terminal transition failed but the stored run is already terminal — adopting the stored record`** (gateway, info) means a write that timed out had committed: the stored record, with its own phase, is what observers receive. **`run: transitionRun <PHASE> failed`** (gateway, error) means every attempt failed: the failure reply and the operator push still went out, and the record stays in its last phase for the next recovery to repair; search by `runId`.
 - **`recovery: recovering stale run`** / **`recovery: run transitioned to FAILED`** (gateway) appear at startup and now also from the periodic stranded-run sweep, which repairs an `EXECUTING` record left behind by a failed terminal write or a dead process. **`recovery: run is owned by this process — skipping`** means the sweep saw a stale-looking record for a run still in the abort registry or an in-flight maintenance run and left it alone. **`stranded-run sweep: pass exceeded its bound — aborting it`** (warning) means a pass ran 4 minutes: its signal is aborted and the pass is abandoned, so the next tick starts a new one. **`stranded-run sweep: pass failed`** (error, with `err`) means a pass threw. **`run: operator cancel landed during the FAILED write — skipping the failure reply`** (info) means a cancel arrived while the terminal write was retrying; the cancel notice is the user's only message.
 - **`run-core: event stream did not connect before the prompt`** (gateway, error) means the OpenCode event stream did not announce itself with `server.connected` within 10 s, ended or failed first, or opened with some other frame. It carries `sessionId` and `detail` (`timeout`, `ended`, the transport error's message, or `first frame was <type>`). The prompt was never sent, so the run ends as `unreachable` with the transport error as its cause. A run that owns no other sessions sends no abort and is not quarantined; sessions it already owns from an earlier turn are settled through the termination barrier first, and the run is quarantined if they cannot be confirmed settled.
-- **`run-core: event stream closed before session.idle`** (gateway, error) means the OpenCode event stream ended without the root going idle. It carries `sessionId`, `totalEvents`, `activityEvents`, `lastEventType` and, when the transport reported a failure, `streamError` (the transport error's message, for example `fetch failed`). The stream is not reconnected; the run ends as `stream-ended` after the root is aborted and confirmed quiescent.
+- **`run-core: event stream closed before the root finished`** (gateway, error) means the OpenCode event stream ended without the root going idle. It carries `sessionId`, `totalEvents`, `activityEvents`, `lastEventType` and, when the transport reported a failure, `streamError` (the transport error's message, for example `fetch failed`). The stream is not reconnected; the run ends as `stream-ended` after the root is aborted and confirmed quiescent.
 - **`run-core: event stream silent — failing the run`** (gateway, error) means no event at all, heartbeats included, arrived for `silenceMs` (30000). It carries `sessionId`, the event counters and `lastEventType`. The run ends as `stream-ended` ("Event stream silent for 30s") even while an approval or question is pending, and the pending request is rejected when the termination barrier starts.
 - **`run-core: event stream announced itself again — stream was replaced`** (gateway, error) means a second `server.connected` arrived on one stream. Events between the two connections were never delivered, so the run ends as `stream-ended`.
-- **`settle-owned-sessions: ...`** and **`run-core: owned work could not be confirmed settled`** (gateway) carry `runId` as well as `rootSessionId`, so an abort that did not confirm, and the quarantine that follows, join to their run. Match the `rootSessionId` to the `sessionId` on the workspace's abort line to see whether the abort request reached OpenCode.
+- **`settle-owned-sessions: ...`** and **`run-core: owned work could not be confirmed settled`** (gateway) carry `runId` as well as `rootSessionId`, so an abort that did not confirm, and the quarantine that follows, join to their run. Match the `rootSessionId` to the `sessionId` on the workspace's interrupt line to see whether the abort request reached OpenCode.
 - **`settle-owned-sessions: the root is running after the abort`** (gateway, warn) means the root session showed up live after the barrier's first abort, so the abort had been sent before the prompt was running and did nothing. The barrier aborts it again on every poll until its terminal reply exists. When background work is open, no reply can confirm the root (OpenCode can start a notice turn the message list does not show yet), so the run is quarantined without polling and this watch aborts the root on every busy observation for the whole hold. **`root-watch: the root is running during the quarantine hold`** (warn) is the same observation during the quarantine hold, with `aborts` counting the extra aborts; **`root-watch: the root is confirmed stopped`** (info) and **`root-watch: quarantine hold ended without confirming the root stopped`** (warn) end the watch. All carry `runId` and `rootSessionId` and never message content.
 
 ## Workspace Stream Disconnects
 
-The workspace OpenCode proxy closes its downstream response when the upstream errors or closes incompletely. A workspace restart during an SSE stream therefore surfaces as a closed or failed stream rather than an indefinitely open connection. Conversely, a disconnected SSE client releases its upstream event request. SSE has no ordinary inactivity timeout, so silence alone still does not prove a failed connection (`apps/workspace-agent/src/opencode-proxy.ts`).
+The workspace OpenCode proxy closes its downstream response when the upstream errors or closes incompletely. A workspace restart during an SSE stream therefore surfaces as a closed or failed stream rather than an indefinitely open connection. Conversely, a disconnected SSE client releases its upstream event request. SSE has no ordinary inactivity timeout, so silence alone still does not prove a failed connection (`apps/workspace-agent/src/opencode-proxy-v2.ts`).
 
 ## Known Gateway Test Flake
 

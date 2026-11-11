@@ -21,7 +21,7 @@ import {
   makeThread,
   mockCreateDiscordStreamSink,
   mockCreatePermissionCoordinator,
-  mockRunOpenCodeCore,
+  mockRunOpenCodeCoreV2,
   mockRuntime,
   REPO,
   setupHappyPath,
@@ -87,7 +87,7 @@ describe('runMention', () => {
       expect(transitionPhases).toContain('COMPLETED')
 
       // #and — execution happened
-      expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+      expect(mockRunOpenCodeCoreV2).toHaveBeenCalledOnce()
 
       // #and — sink flushed
       expect(flushMock).toHaveBeenCalledOnce()
@@ -158,7 +158,7 @@ describe('runMention', () => {
       const {runMention} = await import('./run.js')
       const {RunCoreError} = runCoreModule
       setupHappyPath()
-      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('unreachable', 'connect ECONNREFUSED'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('unreachable', 'connect ECONNREFUSED'))
 
       const thread = makeThread()
       const message = makeMessage(thread)
@@ -192,7 +192,7 @@ describe('runMention', () => {
       const {runMention} = await import('./run.js')
       const {RunCoreError} = runCoreModule
       setupHappyPath()
-      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('auth', '401 Unauthorized'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('auth', '401 Unauthorized'))
 
       const thread = makeThread()
       const message = makeMessage(thread)
@@ -219,7 +219,7 @@ describe('runMention', () => {
       // #given
       const {runMention} = await import('./run.js')
       setupHappyPath()
-      mockRunOpenCodeCore.mockRejectedValue(new Error('something unknown happened'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new Error('something unknown happened'))
 
       const thread = makeThread()
       const message = makeMessage(thread)
@@ -241,7 +241,7 @@ describe('runMention', () => {
       // #given
       const {runMention} = await import('./run.js')
       setupHappyPath()
-      mockRunOpenCodeCore.mockRejectedValue(new Error('boom'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new Error('boom'))
 
       const deps = makeDeps()
       const message = makeMessage()
@@ -269,7 +269,7 @@ describe('runMention', () => {
         markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
         hasVisibleOutput: vi.fn().mockReturnValue(false),
       })
-      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
 
       const thread = makeThread()
       const message = makeMessage(thread)
@@ -300,7 +300,7 @@ describe('runMention', () => {
         markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
         hasVisibleOutput: vi.fn().mockReturnValue(false),
       })
-      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
 
       const thread = makeThread()
       const message = makeMessage(thread)
@@ -329,7 +329,7 @@ describe('runMention', () => {
         markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
         hasVisibleOutput: vi.fn().mockReturnValue(false),
       })
-      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'AbortError: signal timed out'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('timeout', 'AbortError: signal timed out'))
 
       const thread = makeThread()
       const message = makeMessage(thread)
@@ -357,7 +357,7 @@ describe('runMention', () => {
         markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
         hasVisibleOutput: vi.fn().mockReturnValue(true),
       })
-      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
 
       const thread = makeThread()
       const message = makeMessage(thread)
@@ -388,7 +388,7 @@ describe('runMention', () => {
         markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
         hasVisibleOutput: vi.fn().mockReturnValue(true),
       })
-      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
 
       const thread = makeThread()
       const message = makeMessage(thread)
@@ -417,7 +417,7 @@ describe('runMention', () => {
         markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
         hasVisibleOutput: vi.fn().mockReturnValue(true),
       })
-      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
 
       const thread = makeThread()
       const message = makeMessage(thread)
@@ -454,7 +454,7 @@ describe('runMention', () => {
         markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
         hasVisibleOutput: vi.fn().mockReturnValue(true),
       })
-      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
 
       const message = makeMessage(thread)
       const deps = makeDeps()
@@ -482,7 +482,7 @@ describe('runMention', () => {
         markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
         hasVisibleOutput: vi.fn().mockReturnValue(true), // visible output present — but stream-ended, not timeout
       })
-      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('stream-ended', 'stream closed'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('stream-ended', 'stream closed'))
 
       const thread = makeThread()
       const message = makeMessage(thread)
@@ -510,7 +510,7 @@ describe('runMention', () => {
         markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
         hasVisibleOutput: vi.fn().mockReturnValue(true),
       })
-      mockRunOpenCodeCore.mockRejectedValue(new Error('some unknown error'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new Error('some unknown error'))
 
       const thread = makeThread()
       const message = makeMessage(thread)
@@ -538,7 +538,7 @@ describe('runMention', () => {
         markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
         hasVisibleOutput: vi.fn().mockReturnValue(true),
       })
-      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
 
       const thread = makeThread()
       const message = makeMessage(thread)
@@ -567,7 +567,7 @@ describe('runMention', () => {
         markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
         hasVisibleOutput: vi.fn().mockReturnValue(false),
       })
-      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('stream-ended', 'stream closed'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('stream-ended', 'stream closed'))
 
       const thread = makeThread()
       const message = makeMessage(thread)
@@ -594,7 +594,7 @@ describe('runMention', () => {
         markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
         hasVisibleOutput: vi.fn().mockReturnValue(false),
       })
-      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('session-error', 'LLM quota exceeded'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('session-error', 'LLM quota exceeded'))
 
       const thread = makeThread()
       const message = makeMessage(thread)
@@ -651,7 +651,7 @@ describe('runMention', () => {
       setupHappyPath()
       const statefulSink = makeStatefulSinkMock('sent', /* flushShouldSetVisible */ true)
       mockCreateDiscordStreamSink.mockReturnValue(statefulSink)
-      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
 
       const thread = makeThread()
       const message = makeMessage(thread)
@@ -676,7 +676,7 @@ describe('runMention', () => {
       setupHappyPath()
       const statefulSink = makeStatefulSinkMock('attachment', /* flushShouldSetVisible */ true)
       mockCreateDiscordStreamSink.mockReturnValue(statefulSink)
-      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
 
       const thread = makeThread()
       const message = makeMessage(thread)
@@ -698,7 +698,7 @@ describe('runMention', () => {
       setupHappyPath()
       const statefulSink = makeStatefulSinkMock('empty', /* flushShouldSetVisible */ false)
       mockCreateDiscordStreamSink.mockReturnValue(statefulSink)
-      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
 
       const thread = makeThread()
       const message = makeMessage(thread)
@@ -732,7 +732,7 @@ describe('runMention', () => {
         markVisibleOutputPending: vi.fn().mockReturnValue(vi.fn()),
         hasVisibleOutput: hasVisibleOutputFn,
       })
-      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
 
       const thread = makeThread()
       const message = makeMessage(thread)
@@ -831,7 +831,7 @@ describe('runMention', () => {
       const {runMention} = await import('./run.js')
       setupHappyPath()
       const internalDetail = 'secret-internal-database-key-xyz'
-      mockRunOpenCodeCore.mockRejectedValue(new Error(internalDetail))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new Error(internalDetail))
 
       const thread = makeThread()
       const message = makeMessage(thread)
@@ -855,7 +855,7 @@ describe('runMention', () => {
       // #given
       const {runMention} = await import('./run.js')
       setupHappyPath()
-      mockRunOpenCodeCore.mockRejectedValue(new Error('boom'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new Error('boom'))
 
       const thread = makeThread()
       const message = makeMessage(thread)
@@ -883,7 +883,7 @@ describe('runMention', () => {
       setupHappyPath({stop: stopMock})
       // run-core throws so we reach the error catch with a stopped heartbeat
       const {RunCoreError} = runCoreModule
-      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
 
       const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
       const deps = makeDeps({logger})
@@ -922,7 +922,7 @@ describe('runMention', () => {
       })
       setupHappyPath({stop: vi.fn().mockResolvedValue({success: false, error: stopError})})
       const {RunCoreError} = runCoreModule
-      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
       const deps = makeDeps()
 
       // #when
@@ -1140,7 +1140,7 @@ describe('runMention', () => {
       const {runMention} = await import('./run.js')
       setupHappyPath({stop: failedStop({tickPending: true})})
       const {RunCoreError} = runCoreModule
-      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
 
       // #when
       await runMention(makeMessage(makeThread()), makeBinding(), makeDeps())
@@ -1561,7 +1561,7 @@ describe('launchWork — in-memory sink tests', () => {
     expect(request._replySink.flush).toHaveBeenCalled()
   })
 
-  it('happy path: launchWork calls runOpenCodeCore with the request promptText', async () => {
+  it('happy path: launchWork calls runOpenCodeCoreV2 with the request promptText', async () => {
     // #given
     const {launchWork} = await import('./run.js')
     setupHappyPath()
@@ -1572,8 +1572,8 @@ describe('launchWork — in-memory sink tests', () => {
     // #when — await the run promise so the run completes before asserting
     await awaitLaunchWorkRun(launchWork, request, deps)
 
-    // #then — runOpenCodeCore called with a promptText derived from the request
-    expect(mockRunOpenCodeCore).toHaveBeenCalledExactlyOnceWith(
+    // #then — runOpenCodeCoreV2 called with a promptText derived from the request
+    expect(mockRunOpenCodeCoreV2).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({
         promptText: expect.any(String) as unknown,
       }),
@@ -1623,11 +1623,11 @@ describe('launchWork — in-memory sink tests', () => {
   // ── Timeout ────────────────────────────────────────────────────────────────
 
   it('timeout: launchWork respects runTimeoutMs; statusSink receives failed reaction; replySink.send called with timeout message', async () => {
-    // #given — runOpenCodeCore throws timeout
+    // #given — runOpenCodeCoreV2 throws timeout
     const {launchWork} = await import('./run.js')
     const {RunCoreError} = runCoreModule
     setupHappyPath()
-    mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+    mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
 
     const request = makeInMemoryRequest()
     const deps = makeDeps({runTimeoutMs: 600_000})
@@ -1650,7 +1650,7 @@ describe('launchWork — in-memory sink tests', () => {
     const {launchWork} = await import('./run.js')
     const {RunCoreError} = runCoreModule
     setupHappyPath()
-    mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
+    mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('timeout', 'timed out'))
 
     const request = makeInMemoryRequest()
     const deps = makeDeps()

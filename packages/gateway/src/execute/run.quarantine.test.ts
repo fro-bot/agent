@@ -12,11 +12,10 @@ import {
   makeDeps,
   makeMessage,
   makePendingTask,
-  mockRunOpenCodeCore,
+  mockRunOpenCodeCoreV2,
   mockRuntime,
   setupHappyPath,
 } from './test-helpers.js'
-import * as attachModule from './opencode-attach.js'
 import * as promptModule from './prompt.js'
 import * as runCoreModule from './run-core-shared.js'
 /* eslint-enable perfectionist/sort-imports */
@@ -33,7 +32,7 @@ describe('termination barrier — quarantine (Unit 8)', () => {
   })
 
   it('a quarantined RunCoreError skips heartbeat.stop, releaseLock, and hand-off entirely', async () => {
-    // #given — runOpenCodeCore rejects with a RunCoreError whose termination barrier could
+    // #given — runOpenCodeCoreV2 rejects with a RunCoreError whose termination barrier could
     // NOT confirm this run's owned background sessions actually stopped. This is the load-
     // bearing complement the brief calls for: setupHappyPath's heartbeat.stop/releaseLock/
     // handoff would all fire immediately on ANY other rejection (see the plain
@@ -46,7 +45,9 @@ describe('termination barrier — quarantine (Unit 8)', () => {
       data: {runEtag: 'run-etag-after-heartbeat', lockEtag: 'lock-etag-after-heartbeat', runState: buildMockRunState()},
     })
     setupHappyPath({stop: stopFn})
-    mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('session-error', 'Session error: LLM quota exceeded', true))
+    mockRunOpenCodeCoreV2.mockRejectedValue(
+      new RunCoreError('session-error', 'Session error: LLM quota exceeded', true),
+    )
 
     const sharedConcurrency = makeDefaultConcurrency()
     const queue = makeDefaultQueue()
@@ -66,7 +67,7 @@ describe('termination barrier — quarantine (Unit 8)', () => {
     // #and — the concurrency slot is never released, and no queued task is started on it.
     const releaseFn = sharedConcurrency.release as ReturnType<typeof vi.fn>
     expect(releaseFn).not.toHaveBeenCalled()
-    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce() // only this run — no hand-off dispatch
+    expect(mockRunOpenCodeCoreV2).toHaveBeenCalledOnce() // only this run — no hand-off dispatch
 
     // #and — the run still reports failure (never success): a FAILED transition still lands.
     const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
@@ -79,7 +80,7 @@ describe('termination barrier — quarantine (Unit 8)', () => {
     const {runMention} = await import('./run.js')
     const {RunCoreError} = runCoreModule
     setupHappyPath()
-    mockRunOpenCodeCore.mockRejectedValueOnce(new RunCoreError('stream-ended', 'stream closed', true))
+    mockRunOpenCodeCoreV2.mockRejectedValueOnce(new RunCoreError('stream-ended', 'stream closed', true))
 
     const sharedConcurrency = makeDefaultConcurrency()
     const queue = makeDefaultQueue()
@@ -107,8 +108,8 @@ describe('termination barrier — quarantine (Unit 8)', () => {
     // executeWorkOnHeldSlot(nextTask)` in run.ts's outer finally) is fire-and-forget from
     // runMention's perspective: if quarantine ever regresses and the gate is skipped, that
     // promise chain (ensureClone → readyz → acquireLock → ACK/EXECUTING transitions →
-    // runOpenCodeCore) is still queued on the microtask queue the instant runMention
-    // resolves — nowhere near far enough along to have called runOpenCodeCore a second
+    // runOpenCodeCoreV2) is still queued on the microtask queue the instant runMention
+    // resolves — nowhere near far enough along to have called runOpenCodeCoreV2 a second
     // time yet. A bare assertion right after `await runMention(...)` would therefore pass
     // whether or not the hand-off actually happened, which is exactly the defect this test
     // exists to catch. Flushing across a macrotask boundary (setImmediate) drains the
@@ -121,8 +122,8 @@ describe('termination barrier — quarantine (Unit 8)', () => {
       setImmediate(resolve)
     })
 
-    // #then — runOpenCodeCore was called exactly once: the queued task was never started.
-    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+    // #then — runOpenCodeCoreV2 was called exactly once: the queued task was never started.
+    expect(mockRunOpenCodeCoreV2).toHaveBeenCalledOnce()
     const releaseFn = sharedConcurrency.release as ReturnType<typeof vi.fn>
     expect(releaseFn).not.toHaveBeenCalled()
   })
@@ -137,7 +138,7 @@ describe('termination barrier — quarantine (Unit 8)', () => {
       data: {runEtag: 'run-etag-after-heartbeat', lockEtag: 'lock-etag-after-heartbeat', runState: buildMockRunState()},
     })
     setupHappyPath({stop: stopFn})
-    mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('session-error', 'Session error: LLM quota exceeded'))
+    mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('session-error', 'Session error: LLM quota exceeded'))
 
     const deps = makeDeps()
     const message = makeMessage()
@@ -172,7 +173,7 @@ describe('termination barrier — quarantine (Unit 8)', () => {
         },
       })
       setupHappyPath({stop: stopFn})
-      mockRunOpenCodeCore.mockRejectedValue(
+      mockRunOpenCodeCoreV2.mockRejectedValue(
         new RunCoreError('session-error', 'Session error: LLM quota exceeded', true),
       )
 
@@ -206,7 +207,7 @@ describe('termination barrier — quarantine (Unit 8)', () => {
         },
       })
       setupHappyPath({stop: stopFn})
-      mockRunOpenCodeCore.mockRejectedValue(
+      mockRunOpenCodeCoreV2.mockRejectedValue(
         new RunCoreError('session-error', 'Session error: LLM quota exceeded', true),
       )
 
@@ -236,7 +237,7 @@ describe('termination barrier — quarantine (Unit 8)', () => {
       const {runMention, QUARANTINE_HOLD_WINDOW_MS} = await import('./run.js')
       const {RunCoreError} = runCoreModule
       setupHappyPath()
-      mockRunOpenCodeCore.mockRejectedValueOnce(new RunCoreError('stream-ended', 'stream closed', true))
+      mockRunOpenCodeCoreV2.mockRejectedValueOnce(new RunCoreError('stream-ended', 'stream closed', true))
 
       const sharedConcurrency = makeDefaultConcurrency()
       const queue = makeDefaultQueue()
@@ -250,12 +251,12 @@ describe('termination barrier — quarantine (Unit 8)', () => {
 
       // #when
       await runMention(message, makeBinding(), deps)
-      expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+      expect(mockRunOpenCodeCoreV2).toHaveBeenCalledOnce()
       await vi.advanceTimersByTimeAsync(QUARANTINE_HOLD_WINDOW_MS + 1_000)
 
       // #then — the queued task started on the freed slot, and once IT finishes
       // draining with an empty queue, the slot is released exactly once.
-      expect(mockRunOpenCodeCore).toHaveBeenCalledTimes(2)
+      expect(mockRunOpenCodeCoreV2).toHaveBeenCalledTimes(2)
       const releaseFn = sharedConcurrency.release as ReturnType<typeof vi.fn>
       expect(releaseFn).toHaveBeenCalledExactlyOnceWith(CHANNEL_ID)
     })
@@ -271,7 +272,7 @@ describe('termination barrier — quarantine (Unit 8)', () => {
       const {runMention, QUARANTINE_HOLD_WINDOW_MS} = await import('./run.js')
       const {RunCoreError} = runCoreModule
       setupHappyPath()
-      mockRunOpenCodeCore.mockRejectedValue(
+      mockRunOpenCodeCoreV2.mockRejectedValue(
         new RunCoreError('session-error', 'Session error: LLM quota exceeded', true),
       )
 
@@ -344,12 +345,8 @@ describe('termination barrier — quarantine (Unit 8)', () => {
         }),
         isRunning: false,
       })
-      vi.mocked(attachModule.attachOpencode).mockReturnValue({
-        server: {url: 'http://workspace:9200'},
-        session: {create: vi.fn(), prompt: vi.fn()},
-      } as unknown as ReturnType<typeof attachModule.attachOpencode>)
       vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
-      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('session-error', 'quota exceeded', true))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('session-error', 'quota exceeded', true))
 
       const deps = makeDeps({coordinationConfig})
       const message = makeMessage()
@@ -404,12 +401,8 @@ describe('termination barrier — quarantine (Unit 8)', () => {
         data: {runEtag: 'run-etag-after-heartbeat', lockEtag: 'lock-etag-after-heartbeat', runState: executingState},
       })
       mockRuntime.createHeartbeatController.mockReturnValue({start: vi.fn(), stop: stopFn, isRunning: false})
-      vi.mocked(attachModule.attachOpencode).mockReturnValue({
-        server: {url: 'http://workspace:9200'},
-        session: {create: vi.fn(), prompt: vi.fn()},
-      } as unknown as ReturnType<typeof attachModule.attachOpencode>)
       vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
-      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('session-error', 'quota exceeded', true))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('session-error', 'quota exceeded', true))
 
       const sharedConcurrency = makeDefaultConcurrency()
       const queue = makeDefaultQueue()
@@ -467,12 +460,8 @@ describe('termination barrier — quarantine (Unit 8)', () => {
         data: {etag: 'failed-etag', state: executingState},
       })
       mockRuntime.createHeartbeatController.mockImplementation(realCreateHeartbeatController)
-      vi.mocked(attachModule.attachOpencode).mockReturnValue({
-        server: {url: 'http://workspace:9200'},
-        session: {create: vi.fn(), prompt: vi.fn()},
-      } as unknown as ReturnType<typeof attachModule.attachOpencode>)
       vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
-      mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('session-error', 'quota exceeded', true))
+      mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('session-error', 'quota exceeded', true))
 
       const sharedConcurrency = makeDefaultConcurrency()
       const releaseFn = sharedConcurrency.release as ReturnType<typeof vi.fn>

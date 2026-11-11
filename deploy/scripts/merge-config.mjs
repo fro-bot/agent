@@ -53,7 +53,7 @@ export function mergeConfig(baseObj, overlayRaw, modelRaw) {
 
   const merged = {...baseObj, ...overlay}
 
-  // Preserve baked Systematic plugin: union, dedup, strings only.
+  // Keep the plugin entries of the base and the overlay: union, dedup, strings only.
   const basePlugins = Array.isArray(baseObj.plugin) ? baseObj.plugin : []
   const overlayPlugins = Array.isArray(overlay.plugin) ? overlay.plugin.filter(p => typeof p === 'string') : []
   merged.plugin = Array.from(new Set([...basePlugins, ...overlayPlugins]))
@@ -62,12 +62,11 @@ export function mergeConfig(baseObj, overlayRaw, modelRaw) {
   merged.autoupdate = false
 
   // Pin subagent_depth to 1, unconditionally, after the overlay spread — so no
-  // overlay value can survive. Workspace-layer mirror of the R12 pin in
-  // buildCIConfig (src/services/setup/ci-config.ts): upstream cancellation
-  // walks RUNNING jobs only, so a completed child that links the root session
-  // to a still-running grandchild is never walked at depth > 1, letting that
-  // grandchild outlive a cancellation meant to stop it. Depth one makes that
-  // path structurally unreachable.
+  // overlay value can survive. Upstream cancellation walks RUNNING jobs only,
+  // so a completed child that links the root session to a still-running
+  // grandchild is never walked at depth > 1, letting that grandchild outlive a
+  // cancellation meant to stop it. Depth one makes that path structurally
+  // unreachable (the server's own config content pins it the same way).
   const warnings = []
   const hasSuppliedDepth = Object.prototype.hasOwnProperty.call(merged, 'subagent_depth')
   const suppliedDepth = merged.subagent_depth

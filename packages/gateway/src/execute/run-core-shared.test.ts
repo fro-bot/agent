@@ -14,7 +14,7 @@ describe('wrapLedgerWithHooks — a call that changes nothing fires no persisten
 
   it('a settle of an already-settled entry fires no persistence write', () => {
     // #given — a direct unit test of the wrapper itself. Through the real
-    // `runOpenCodeCore` → `reconcileLedgerOnce` integration path, `settle()` can only
+    // `runOpenCodeCoreV2` → `reconcileLedgerOnce` integration path, `settle()` can only
     // ever be called once per entry per genuine transition (see `wrapLedgerWithHooks`'s
     // doc comment for why that path cannot force a true duplicate deterministically) —
     // exercising the wrapper directly is the reliable way to prove its no-op branch.

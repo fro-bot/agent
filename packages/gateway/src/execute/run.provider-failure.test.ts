@@ -13,7 +13,7 @@ import {
   makeInMemoryRequest,
   makeMessage,
   makeUpdateFn,
-  mockRunOpenCodeCore,
+  mockRunOpenCodeCoreV2,
   mockRuntime,
   setupHappyPath,
 } from './test-helpers.js'
@@ -25,7 +25,7 @@ import {abortRegistry} from './abort-registry.js'
 //
 // ./test-helpers.js replaces `RunCoreError` with a stand-in class, which would hide a reason that never
 // reaches `run.ts`. This file swaps the REAL `run-core` module back in (keeping the shared
-// `runOpenCodeCore` mock) BEFORE `run.js` is first imported, so every error below is a real
+// `runOpenCodeCoreV2` mock) BEFORE `run.js` is first imported, so every error below is a real
 // `RunCoreError` and the `instanceof` checks in `run.ts` run against the real class.
 // ---------------------------------------------------------------------------
 
@@ -82,7 +82,7 @@ describe('provider failure reason — persisted at the terminal FAILED write (re
       // #given — a provider failure that the barrier did not quarantine
       const {runMention} = await import('./run.js')
       setupHappyPath()
-      mockRunOpenCodeCore.mockRejectedValue(
+      mockRunOpenCodeCoreV2.mockRejectedValue(
         new RunCoreError('session-error', `Provider failure: ${internal}`, false, internal),
       )
 
@@ -98,7 +98,7 @@ describe('provider failure reason — persisted at the terminal FAILED write (re
     // #given — the barrier could not confirm owned work stopped
     const {runMention} = await import('./run.js')
     setupHappyPath()
-    mockRunOpenCodeCore.mockRejectedValue(
+    mockRunOpenCodeCoreV2.mockRejectedValue(
       new RunCoreError(
         'session-error',
         'Provider failure: provider auth unavailable',
@@ -155,7 +155,7 @@ describe('provider failure reason — persisted at the terminal FAILED write (re
         return {success: true as const, data: {etag: 'etag', state: buildMockRunState()}}
       },
     )
-    mockRunOpenCodeCore.mockRejectedValue(
+    mockRunOpenCodeCoreV2.mockRejectedValue(
       new RunCoreError('session-error', 'Provider failure: model not available', true, 'model not available'),
     )
 
@@ -178,7 +178,7 @@ describe('provider failure reason — persisted at the terminal FAILED write (re
     // #given
     const {runMention} = await import('./run.js')
     setupHappyPath()
-    mockRunOpenCodeCore.mockRejectedValue(new RunCoreError('session-error', 'Session error: something else'))
+    mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError('session-error', 'Session error: something else'))
 
     // #when
     await runMention(makeMessage(), makeBinding(), makeDeps())
@@ -203,7 +203,7 @@ describe('provider failure reason — persisted at the terminal FAILED write (re
     // #given — gate on kind: the reason refines `session-error` only
     const {runMention} = await import('./run.js')
     setupHappyPath()
-    mockRunOpenCodeCore.mockRejectedValue(new RunCoreError(kind, 'boom', false, 'provider auth unavailable'))
+    mockRunOpenCodeCoreV2.mockRejectedValue(new RunCoreError(kind, 'boom', false, 'provider auth unavailable'))
 
     // #when
     await runMention(makeMessage(), makeBinding(), makeDeps())
@@ -217,7 +217,7 @@ describe('provider failure reason — persisted at the terminal FAILED write (re
     // #given
     const {runMention} = await import('./run.js')
     setupHappyPath()
-    mockRunOpenCodeCore.mockRejectedValue(new Error('generic'))
+    mockRunOpenCodeCoreV2.mockRejectedValue(new Error('generic'))
 
     // #when
     await runMention(makeMessage(), makeBinding(), makeDeps())
@@ -245,14 +245,14 @@ describe('provider failure reason — persisted at the terminal FAILED write (re
     expect(writes).toHaveLength(1)
     expect(writes[0]?.detailsPatch).toBeDefined()
     expect('providerFailureReason' in (writes[0]?.detailsPatch ?? {})).toBe(false)
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
   })
 
   it('logs the closed reason and the error NAME — never the error message', async () => {
     // #given — a message carrying text that must not reach the log
     const {runMention} = await import('./run.js')
     setupHappyPath()
-    mockRunOpenCodeCore.mockRejectedValue(
+    mockRunOpenCodeCoreV2.mockRejectedValue(
       new RunCoreError('session-error', 'Provider failure: SENTINEL-PROMPT-TEXT', false, 'model not available'),
     )
     const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
@@ -280,7 +280,7 @@ describe('provider failure reason — racing an operator cancel (real RunCoreErr
   })
 
   function failWithProviderReasonAfterCancel(): void {
-    mockRunOpenCodeCore.mockImplementation(async () => {
+    mockRunOpenCodeCoreV2.mockImplementation(async () => {
       abortRegistry.abort(RUN_ID, 'operator cancel')
       throw new RunCoreError(
         'session-error',

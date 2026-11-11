@@ -12,7 +12,6 @@ sources:
   - packages/runtime/src/agent/prompt.ts
   - packages/runtime/src/agent/response-file.ts
   - packages/runtime/src/agent/prompt-thread.ts
-  - src/features/agent/prompt-sender-v2.ts
   - packages/runtime/src/shared/errors.ts
   - packages/runtime/src/agent/output-mode.ts
   - packages/runtime/src/agent/response-delivery.ts

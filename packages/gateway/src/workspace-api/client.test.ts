@@ -2225,10 +2225,10 @@ describe('totalRecoveryCeilingMs', () => {
   it("mirrors the workspace's own dispose timeout (separate container, so the constant is copied, not imported)", async () => {
     // #given the workspace source of truth
     const source = await readFile(
-      new URL('../../../../apps/workspace-agent/src/opencode-instance.ts', import.meta.url),
+      new URL('../../../../apps/workspace-agent/src/opencode-instance-v2.ts', import.meta.url),
       'utf8',
     )
-    const declared = /DEFAULT_INSTANCE_DISPOSE_TIMEOUT_MS\s*=\s*([\d_]+)/.exec(source)?.[1]
+    const declared = /DEFAULT_INSTANCE_DISPOSE_TIMEOUT_MS_V2\s*=\s*([\d_]+)/.exec(source)?.[1]
 
     // #when / #then a change over there must change the budget here
     expect(Number(declared?.replaceAll('_', ''))).toBe(WORKSPACE_INSTANCE_DISPOSE_CEILING_MS)

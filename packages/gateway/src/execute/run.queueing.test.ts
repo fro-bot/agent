@@ -10,7 +10,7 @@ import {
   makeMessage,
   makeOwnershipCoordinationConfig,
   makePendingTask,
-  mockRunOpenCodeCore,
+  mockRunOpenCodeCoreV2,
   setupHappyPath,
 } from './test-helpers.js'
 
@@ -62,7 +62,7 @@ describe('runMention', () => {
       expect(call.allowedMentions).toEqual({parse: []})
       // #and — startRun pipeline NOT invoked synchronously
       expect(message.startThread).not.toHaveBeenCalled()
-      expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+      expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
     })
 
     it('r1: busy + queue.enqueue returns "full" → terse "queue is full" reply (not queued ack)', async () => {
@@ -126,7 +126,7 @@ describe('runMention', () => {
       expect(tryAcquireFn).not.toHaveBeenCalled()
       // #and — startRun pipeline NOT invoked
       expect(message.startThread).not.toHaveBeenCalled()
-      expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+      expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
       // #and — queued ack sent
       expect(message.reply).toHaveBeenCalledOnce()
       const call = (message.reply as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {content: string}
@@ -169,8 +169,8 @@ describe('runMention', () => {
 
       // #then — takeNext was called (handoff attempted)
       expect(queue.takeNext).toHaveBeenCalledWith(CHANNEL_ID)
-      // #and — runOpenCodeCore called twice (once for original, once for queued task)
-      expect(mockRunOpenCodeCore).toHaveBeenCalledTimes(2)
+      // #and — runOpenCodeCoreV2 called twice (once for original, once for queued task)
+      expect(mockRunOpenCodeCoreV2).toHaveBeenCalledTimes(2)
       // #and — concurrency.release called exactly once (after the second run completes with empty queue)
       // The slot was handed off (not freed) between the two runs; release fires only after the last run.
       expect(releaseFn).toHaveBeenCalledExactlyOnceWith(CHANNEL_ID)
@@ -217,12 +217,12 @@ describe('runMention', () => {
       const releaseFn = vi.fn()
       const callOrder: string[] = []
 
-      // Track when release is called vs when runOpenCodeCore is called
+      // Track when release is called vs when runOpenCodeCoreV2 is called
       releaseFn.mockImplementation(() => {
         callOrder.push('release')
       })
-      mockRunOpenCodeCore.mockImplementation(async () => {
-        callOrder.push('runOpenCodeCore')
+      mockRunOpenCodeCoreV2.mockImplementation(async () => {
+        callOrder.push('runOpenCodeCoreV2')
       })
 
       const sharedConcurrency = {
@@ -248,12 +248,12 @@ describe('runMention', () => {
       await runMention(message, makeBinding(), deps)
       await new Promise(resolve => setTimeout(resolve, 10))
 
-      // #then — runOpenCodeCore called twice (two runs)
-      expect(callOrder.filter(e => e === 'runOpenCodeCore')).toHaveLength(2)
+      // #then — runOpenCodeCoreV2 called twice (two runs)
+      expect(callOrder.filter(e => e === 'runOpenCodeCoreV2')).toHaveLength(2)
       // #and — release NOT called between the two runs (no free-slot gap)
       // release should only be called AFTER the second run completes
-      const firstRunIdx = callOrder.indexOf('runOpenCodeCore')
-      const secondRunIdx = callOrder.lastIndexOf('runOpenCodeCore')
+      const firstRunIdx = callOrder.indexOf('runOpenCodeCoreV2')
+      const secondRunIdx = callOrder.lastIndexOf('runOpenCodeCoreV2')
       const releaseIdx = callOrder.indexOf('release')
       // release must come AFTER the second run, not between them
       expect(releaseIdx).toBeGreaterThan(secondRunIdx)
@@ -277,7 +277,7 @@ describe('runMention', () => {
       await runMention(message, makeBinding(), deps)
 
       // #then — full pipeline ran
-      expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+      expect(mockRunOpenCodeCoreV2).toHaveBeenCalledOnce()
       expect(message.startThread).toHaveBeenCalledOnce()
     })
 
@@ -335,7 +335,7 @@ describe('runMention', () => {
       ;(queue.takeNext as ReturnType<typeof vi.fn>).mockReturnValueOnce(pendingTask).mockReturnValue(undefined)
 
       // Second run (the handed-off one) throws
-      mockRunOpenCodeCore
+      mockRunOpenCodeCoreV2
         .mockResolvedValueOnce(undefined) // first run succeeds
         .mockRejectedValueOnce(new Error('handoff run failed')) // second run throws
 
@@ -377,7 +377,7 @@ describe('runMention', () => {
       })
 
       let runCount = 0
-      mockRunOpenCodeCore.mockImplementation(async () => {
+      mockRunOpenCodeCoreV2.mockImplementation(async () => {
         runCount++
         const thisRun = runCount
         runOrder.push(`run-${thisRun}`)
@@ -414,7 +414,7 @@ describe('runMention', () => {
       const msg2 = makeMessage()
       const msg3 = makeMessage()
 
-      // #when — start first mention (it will pause inside runOpenCodeCore)
+      // #when — start first mention (it will pause inside runOpenCodeCoreV2)
       const run1Promise = runMention(msg1, makeBinding(), deps1)
 
       // Yield to let run1 start and reach the pause point
@@ -553,8 +553,8 @@ describe('handoff unit tests (F8)', () => {
     releaseFn.mockImplementation(() => {
       callOrder.push('release')
     })
-    mockRunOpenCodeCore.mockImplementation(async () => {
-      callOrder.push('runOpenCodeCore')
+    mockRunOpenCodeCoreV2.mockImplementation(async () => {
+      callOrder.push('runOpenCodeCoreV2')
     })
 
     const sharedConcurrency = {
@@ -579,11 +579,11 @@ describe('handoff unit tests (F8)', () => {
     await runMention(message, makeBinding(), deps)
     await new Promise(resolve => setTimeout(resolve, 10))
 
-    // #then — (1) startRun ran for the next task (runOpenCodeCore called twice)
-    expect(callOrder.filter(e => e === 'runOpenCodeCore')).toHaveLength(2)
+    // #then — (1) startRun ran for the next task (runOpenCodeCoreV2 called twice)
+    expect(callOrder.filter(e => e === 'runOpenCodeCoreV2')).toHaveLength(2)
     // #and — (2) release NOT called during handoff (only after second run)
-    const firstRunIdx = callOrder.indexOf('runOpenCodeCore')
-    const secondRunIdx = callOrder.lastIndexOf('runOpenCodeCore')
+    const firstRunIdx = callOrder.indexOf('runOpenCodeCoreV2')
+    const secondRunIdx = callOrder.lastIndexOf('runOpenCodeCoreV2')
     const releaseIdx = callOrder.indexOf('release')
     expect(callOrder.slice(firstRunIdx + 1, secondRunIdx)).not.toContain('release')
     // #and — (3) release IS called after takeNext returns undefined
@@ -643,8 +643,8 @@ describe('drain (Unit 6) — slot/heartbeat/ownership-persistence integration', 
     vi.useRealTimers()
   })
 
-  it('heartbeat is not stopped until runOpenCodeCore resolves, even across a drain longer than the heartbeat interval', async () => {
-    // #given — fake timers; runOpenCodeCore (which owns the whole drain loop internally)
+  it('heartbeat is not stopped until runOpenCodeCoreV2 resolves, even across a drain longer than the heartbeat interval', async () => {
+    // #given — fake timers; runOpenCodeCoreV2 (which owns the whole drain loop internally)
     // is held open by a controlled promise so the test can advance time past a single
     // heartbeat interval (30s default) while the run is still "draining".
     vi.useFakeTimers()
@@ -657,7 +657,7 @@ describe('drain (Unit 6) — slot/heartbeat/ownership-persistence integration', 
     setupHappyPath({start: startFn, stop: stopFn})
 
     let resolveRun: (() => void) | undefined
-    mockRunOpenCodeCore.mockImplementation(
+    mockRunOpenCodeCoreV2.mockImplementation(
       async () =>
         new Promise<void>(resolve => {
           resolveRun = resolve
@@ -668,10 +668,10 @@ describe('drain (Unit 6) — slot/heartbeat/ownership-persistence integration', 
     const message = makeMessage()
     const runPromise = runMention(message, makeBinding(), deps)
 
-    // Let admission run through to heartbeat.start() + runOpenCodeCore being invoked.
+    // Let admission run through to heartbeat.start() + runOpenCodeCoreV2 being invoked.
     await vi.advanceTimersByTimeAsync(0)
     expect(startFn).toHaveBeenCalledOnce()
-    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+    expect(mockRunOpenCodeCoreV2).toHaveBeenCalledOnce()
 
     // #when — advance well past a single heartbeat interval while still draining.
     await vi.advanceTimersByTimeAsync(65_000)
@@ -681,7 +681,7 @@ describe('drain (Unit 6) — slot/heartbeat/ownership-persistence integration', 
     // kill the subagents — firing it while owned work is outstanding would be a bug.
     expect(stopFn).not.toHaveBeenCalled()
 
-    // #and — once drain completes (runOpenCodeCore resolves), stop() fires exactly once.
+    // #and — once drain completes (runOpenCodeCoreV2 resolves), stop() fires exactly once.
     resolveRun?.()
     await runPromise
     expect(stopFn).toHaveBeenCalledOnce()
@@ -698,7 +698,7 @@ describe('drain (Unit 6) — slot/heartbeat/ownership-persistence integration', 
     let capturedOnOwnershipChange:
       ((info: {readonly rootSessionId: string; readonly ownedSessionIds: readonly string[]}) => void) | undefined
     let resolveRun: (() => void) | undefined
-    mockRunOpenCodeCore.mockImplementation(async params => {
+    mockRunOpenCodeCoreV2.mockImplementation(async params => {
       capturedOnOwnershipChange = (params as {onOwnershipChange?: typeof capturedOnOwnershipChange}).onOwnershipChange
       await new Promise<void>(resolve => {
         resolveRun = resolve
@@ -716,7 +716,7 @@ describe('drain (Unit 6) — slot/heartbeat/ownership-persistence integration', 
     capturedOnOwnershipChange?.({rootSessionId: 'root-1', ownedSessionIds: ['child-1']})
     await new Promise(resolve => setTimeout(resolve, 10))
 
-    // #then — already persisted, before `runOpenCodeCore` (and therefore the run) has resolved.
+    // #then — already persisted, before `runOpenCodeCoreV2` (and therefore the run) has resolved.
     expect(writes().length).toBeGreaterThanOrEqual(1)
     const firstWrite = writes()[0]
     expect(firstWrite?.details.rootSessionId).toBe('root-1')
@@ -738,7 +738,7 @@ describe('drain (Unit 6) — slot/heartbeat/ownership-persistence integration', 
 
     let capturedOnOwnershipChange:
       ((info: {readonly rootSessionId: string; readonly ownedSessionIds: readonly string[]}) => void) | undefined
-    mockRunOpenCodeCore.mockImplementation(
+    mockRunOpenCodeCoreV2.mockImplementation(
       async params =>
         new Promise<void>(() => {
           // Deliberately never resolves — models a gateway crash mid-drain.
@@ -770,7 +770,7 @@ describe('drain (Unit 6) — slot/heartbeat/ownership-persistence integration', 
   })
 
   it('integration: a second queued run does not start until the first has finished draining', async () => {
-    // #given — the first run's runOpenCodeCore call is held open (simulating drain) while
+    // #given — the first run's runOpenCodeCoreV2 call is held open (simulating drain) while
     // a second message arrives and is enqueued for the same channel.
     const {runMention} = await import('./run.js')
     setupHappyPath()
@@ -791,14 +791,14 @@ describe('drain (Unit 6) — slot/heartbeat/ownership-persistence integration', 
 
     const callOrder: string[] = []
     let resolveFirstDrain: (() => void) | undefined
-    mockRunOpenCodeCore.mockImplementationOnce(async () => {
+    mockRunOpenCodeCoreV2.mockImplementationOnce(async () => {
       callOrder.push('run-1-start')
       await new Promise<void>(resolve => {
         resolveFirstDrain = resolve
       })
       callOrder.push('run-1-drain-complete')
     })
-    mockRunOpenCodeCore.mockImplementationOnce(async () => {
+    mockRunOpenCodeCoreV2.mockImplementationOnce(async () => {
       callOrder.push('run-2-start')
     })
 

@@ -19,7 +19,7 @@
  *   Clients must drive completion off the terminal status frame.
  *
  * Distinct assistant text parts/messages arrive already separated by a blank line (`\n\n`), inserted once by the
- * producer (`execute/run-core.ts`), so concatenating delta `text` yields the same string as the terminal frame.
+ * producer (`execute/run-core-v2.ts`), so concatenating delta `text` yields the same string as the terminal frame.
  * Clients must concatenate deltas verbatim and must not add their own separators.
  *
  * `seq` is monotonic per run (starts at 0, increments by 1 per frame). Clients
