@@ -714,6 +714,34 @@ describe('runFinalize file-convention delivery', () => {
     }
   })
 
+  it.each([
+    [true, true],
+    [false, false],
+    [undefined, false],
+  ])('tells brokered push whether the agent was isolated (isolateAgent=%s)', async (isolateAgent, expected) => {
+    // #given a trusted PR mention, with isolation on or off in the inputs
+    const bootstrap = createBootstrap({
+      trustedHeadSha: 'a'.repeat(40),
+      inputs: {agent: null, isolateAgent} as unknown as BootstrapPhaseResult['inputs'],
+    })
+    mocks.runBrokeredPush.mockResolvedValue({kind: 'bypass'})
+    mocks.runResponsePost.mockResolvedValue({delivered: true, kind: 'comment'})
+
+    // #when finalize runs
+    await runFinalize(
+      bootstrap,
+      createEligibleRouting(),
+      cacheRestore,
+      createExecution({success: true, commentsPosted: 0}),
+      createMetrics(),
+      Date.now(),
+      createMockLogger(),
+    )
+
+    // #then
+    expect(mocks.runBrokeredPush).toHaveBeenCalledWith(expect.objectContaining({isolated: expected}))
+  })
+
   it('threads the in-heap client into brokered push and preserves normal response delivery', async () => {
     // #given a successful trusted PR mention with a response file and no prior comment
     const bootstrap = createBootstrap({trustedHeadSha: 'a'.repeat(40)})

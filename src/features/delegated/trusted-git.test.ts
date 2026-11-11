@@ -227,12 +227,16 @@ describe('post-model git against a hostile checkout', () => {
       git(repo.repo, 'update-index', '--add', '--cacheinfo', `160000,${git(sub, 'rev-parse', 'HEAD').trim()},sub`)
       fs.appendFileSync(path.join(sub, 'g'), 'dirty\n')
 
-      // #when reconstructed
-      const result = await reconstructChanges(createExecAdapter(), repo.anchor, repo.repo, createMockLogger())
+      // #when reconstructed under isolation
+      const result = await reconstructChanges(createExecAdapter(), repo.anchor, repo.repo, createMockLogger(), {
+        isolated: true,
+      })
 
-      // #then nothing ran, and the gitlink is still detected and refused rather than silently dropped
+      // #then nothing ran, and the populated submodule is declined by name rather than silently dropped
       expect(repo.ran('submodule')).toBe(false)
       expect(result.success).toBe(false)
+      expect(!result.success && result.error.message).toContain('sub')
+      expect(!result.success && result.error.message).toContain('populated')
     })
 
     it('replaces the environment: no global config, a pinned PATH, no prompts', () => {

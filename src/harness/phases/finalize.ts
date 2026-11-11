@@ -361,6 +361,7 @@ export async function runFinalizeWithResult(
                 expectedHeadBranch,
                 repoRoot: process.env.GITHUB_WORKSPACE ?? process.cwd(),
                 extraPathPrefixes: bootstrap.inputs.brokeredPushExtraPaths,
+                isolated: bootstrap.inputs.isolateAgent === true,
                 signal: controller.signal,
               }),
             )
