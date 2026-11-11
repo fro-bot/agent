@@ -12,7 +12,7 @@ import {
   makeDefaultConcurrency,
   makeDeps,
   makeInMemoryRequest,
-  mockRunOpenCodeCore,
+  mockRunOpenCodeCoreV2,
   mockRuntime,
   setupHappyPath,
 } from './test-helpers.js'
@@ -108,7 +108,7 @@ async function quarantineARun(failPhases: readonly string[]) {
     stop: heartbeatStop,
     isRunning: false,
   })
-  mockRunOpenCodeCore.mockRejectedValue(new runCoreModule.RunCoreError('session-error', 'unconfirmed stop', true))
+  mockRunOpenCodeCoreV2.mockRejectedValue(new runCoreModule.RunCoreError('session-error', 'unconfirmed stop', true))
   const concurrency = makeDefaultConcurrency()
   const deps = makeDeps({coordinationConfig: store.coordinationConfig, concurrency})
   const {launchWork, QUARANTINE_HOLD_WINDOW_MS} = await import('./run.js')

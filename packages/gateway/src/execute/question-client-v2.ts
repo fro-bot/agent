@@ -1,12 +1,12 @@
 /**
- * Question reply/reject effects for a run on OpenCode V2: the sibling of `question-client.ts`.
+ * Question reply/reject effects for a run on OpenCode V2.
  *
  * V2 has no question route. The model's `question` tool asks a form, so a reply is a form reply and a reject is a form
  * cancel, both addressed by session id AND form id. The question registry hands the effects only a request id, which on
  * V2 is the form id. The run loop records each question form it forwards in a `FormDirectoryV2`; the effects read the
  * session and the field layout back from it. A form the directory does not hold is refused, never guessed at.
  *
- * Contract, as in V1: the effects never throw and never return response text. Every failure collapses to a short reason
+ * Contract: the effects never throw and never return response text. Every failure collapses to a short reason
  * code, because an error body can echo the question or answer text and must not reach logs.
  */
 

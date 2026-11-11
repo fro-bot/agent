@@ -35,7 +35,7 @@ fro-bot/agent/
 │   │   └── src/
 │   │       ├── discord/        # Discord client, mentions, commands, streaming
 │   │       ├── github/         # GitHub App client, Actions workflow-dispatch adapter
-│   │       ├── execute/        # run-core, queue, concurrency, recovery, checkout provenance
+│   │       ├── execute/        # run-core-v2, queue, concurrency, recovery, checkout provenance
 │   │       ├── web/            # Operator HTTP routes, auth, ingress trust, SSE, audit
 │   │       ├── workspace-api/  # Workspace API surface
 │   │       ├── approvals/      # Approval and question gate
@@ -94,7 +94,7 @@ fro-bot/agent/
 - **`packages/opencode-plugin/`** — Fro Bot's OpenCode V2 plugin, published to npm: the `session_*` tools and the `subagent` session-reuse guard, bundled with the V2 session code from `@fro-bot/runtime/session-v2`; touch when changing what the plugin gives the agent. The V2 workspace image installs it from npm at build time and loads it at each OpenCode spawn.
 - **`packages/runtime/`** — Shared runtime primitives consumed by both `src/` and `packages/gateway/`; owns the authoritative version-pin constants.
 - **`deploy/`** — Docker Compose stack, Dockerfiles, mitmproxy egress topology, and deploy validation scripts.
-- **`deploy/plugins/`**, **`deploy/managed-config/`** — the baked OpenCode reuse-guard plugin (`no-task-reuse.mjs`) and the root-owned managed config (`/etc/opencode/opencode.json`) that loads it; plain Node ESM / JSON, tested from `deploy/scripts/*.test.mjs`. The same `no-task-reuse.mjs` is the single source for the Action's guard: `tsdown.config.ts` builds it into `dist/no-task-reuse.js`, and `src/services/setup/no-task-reuse-config.ts` copies it into the CI OpenCode config dir at every Action server start (`no-task-reuse.d.mts` types it for the Vitest suite).
+- **`deploy/managed-config/`** — the root-owned managed OpenCode config (`opencode-v2.json`, copied to `/etc/opencode/opencode.json` in the workspace image); JSON, pinned by `deploy/scripts/managed-config.test.mjs`.
 - **`deploy/scripts/`** — Plain Node ESM (`.mjs`) helpers for deploy-time operations (auth validation, config merge, protected-dir creation, legacy checkout ownership migration, agent-side config provisioning, V2 plugin install and image smoke); uses `node --test`, not Vitest.
 - **`deploy/tests/`** — `isolation-harness.sh`, the CI acceptance harness that proves the service/agent uid boundary in a real container started with production's security posture.
 - **`scripts/`** — Repo-level build tooling: action dist builder, hidden-Unicode scrubber, third-party notices, release dispatch, `sync-opencode-v2-pin.ts` (regenerates the OpenCode V2 pin's digests), and `sync-opencode-plugin-effect.ts` (sets the plugin package's `effect` devDependency to the exact version `@opencode/plugin` pins); Renovate runs both as `bun run postupgrade`.

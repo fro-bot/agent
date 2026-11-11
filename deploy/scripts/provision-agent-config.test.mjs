@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import {test} from 'node:test'
-import {lstat, mkdir, mkdtemp, writeFile, readFile, rm, stat, symlink, open} from 'node:fs/promises'
+import {lstat, mkdir, mkdtemp, writeFile, readFile, rm, stat, symlink} from 'node:fs/promises'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 import {spawnSync} from 'node:child_process'
@@ -8,119 +8,33 @@ import {fileURLToPath} from 'node:url'
 
 import {provisionAgentConfig} from './provision-agent-config.mjs'
 
+// The base config the image bakes (deploy/workspace.Dockerfile): updates off, no plugin entry.
 const BASE_CONFIG = {
   $schema: 'https://opencode.ai/config.json',
-  autoupdate: false,
-  plugin: ['@fro.bot/systematic@3.20.0'],
+  update: 'disable',
 }
 
-async function makeTempRoot() {
-  return mkdtemp(join(tmpdir(), 'provision-agent-config-test-'))
+const AUTH_BLOB = JSON.stringify({anthropic: {type: 'api', key: 'sk-test'}})
+
+async function makeProvisionRoot() {
+  const root = await mkdtemp(join(tmpdir(), 'provision-agent-config-test-'))
+  const baseConfigPath = join(root, 'base.json')
+  await writeFile(baseConfigPath, JSON.stringify(BASE_CONFIG))
+  return {
+    root,
+    baseConfigPath,
+    staleAuthPath: join(root, 'home', '.local', 'share', 'opencode', 'auth.json'),
+    configDestPath: join(root, 'home', '.config', 'opencode', 'opencode.json'),
+  }
 }
 
-test('writes auth.json with 0600 when a valid auth blob is provided', async () => {
-  const root = await makeTempRoot()
+test('writes the merged opencode.json from the base, the overlay and the model', async () => {
+  const {root, baseConfigPath, staleAuthPath, configDestPath} = await makeProvisionRoot()
   try {
-    const baseConfigPath = join(root, 'base.json')
-    await writeFile(baseConfigPath, JSON.stringify(BASE_CONFIG))
-    const authDestPath = join(root, 'home', '.local', 'share', 'opencode', 'auth.json')
-    const configDestPath = join(root, 'home', '.config', 'opencode', 'opencode.json')
-    const authRaw = JSON.stringify({anthropic: {type: 'api', key: 'sk-test'}})
-
     const result = await provisionAgentConfig({
       baseConfigPath,
-      authDestPath,
+      staleAuthPath,
       configDestPath,
-      authRaw,
-      overlayRaw: '',
-      modelRaw: '',
-    })
-
-    assert.equal(result.ok, true)
-    assert.equal(result.authProvisioned, true)
-    // Open authDestPath once and take both the mode and the content from the
-    // same FileHandle (fstat under the hood) — a separate stat() followed by
-    // a separate readFile() on the same path is a TOCTOU race (CodeQL
-    // js/file-system-race): the path could be replaced between the two calls.
-    const authHandle = await open(authDestPath, 'r')
-    let written
-    try {
-      const st = await authHandle.stat()
-      assert.equal(st.mode & 0o777, 0o600)
-      written = await authHandle.readFile('utf8')
-    } finally {
-      await authHandle.close()
-    }
-    assert.equal(written, authRaw)
-  } finally {
-    await rm(root, {recursive: true, force: true})
-  }
-})
-
-test('skips auth.json entirely when authRaw is empty', async () => {
-  const root = await makeTempRoot()
-  try {
-    const baseConfigPath = join(root, 'base.json')
-    await writeFile(baseConfigPath, JSON.stringify(BASE_CONFIG))
-    const authDestPath = join(root, 'home', '.local', 'share', 'opencode', 'auth.json')
-    const configDestPath = join(root, 'home', '.config', 'opencode', 'opencode.json')
-
-    const result = await provisionAgentConfig({
-      baseConfigPath,
-      authDestPath,
-      configDestPath,
-      authRaw: '',
-      overlayRaw: '',
-      modelRaw: '',
-    })
-
-    assert.equal(result.ok, true)
-    assert.equal(result.authProvisioned, false)
-    await assert.rejects(stat(authDestPath))
-  } finally {
-    await rm(root, {recursive: true, force: true})
-  }
-})
-
-test('rejects an invalid auth blob and writes nothing', async () => {
-  const root = await makeTempRoot()
-  try {
-    const baseConfigPath = join(root, 'base.json')
-    await writeFile(baseConfigPath, JSON.stringify(BASE_CONFIG))
-    const authDestPath = join(root, 'home', '.local', 'share', 'opencode', 'auth.json')
-    const configDestPath = join(root, 'home', '.config', 'opencode', 'opencode.json')
-
-    const result = await provisionAgentConfig({
-      baseConfigPath,
-      authDestPath,
-      configDestPath,
-      authRaw: JSON.stringify({anthropic: {type: 'oauth'}}),
-      overlayRaw: '',
-      modelRaw: '',
-    })
-
-    assert.equal(result.ok, false)
-    assert.ok(result.error.includes('invalid'), `got: ${result.error}`)
-    await assert.rejects(stat(authDestPath))
-    await assert.rejects(stat(configDestPath))
-  } finally {
-    await rm(root, {recursive: true, force: true})
-  }
-})
-
-test('writes the merged opencode.json, preserving the baked plugin', async () => {
-  const root = await makeTempRoot()
-  try {
-    const baseConfigPath = join(root, 'base.json')
-    await writeFile(baseConfigPath, JSON.stringify(BASE_CONFIG))
-    const authDestPath = join(root, 'home', '.local', 'share', 'opencode', 'auth.json')
-    const configDestPath = join(root, 'home', '.config', 'opencode', 'opencode.json')
-
-    const result = await provisionAgentConfig({
-      baseConfigPath,
-      authDestPath,
-      configDestPath,
-      authRaw: '',
       overlayRaw: JSON.stringify({provider: {anthropic: {options: {baseURL: 'https://cliproxy.fro.bot/v1'}}}}),
       modelRaw: 'anthropic/claude-sonnet-4-6',
     })
@@ -128,26 +42,21 @@ test('writes the merged opencode.json, preserving the baked plugin', async () =>
     assert.equal(result.ok, true)
     const written = JSON.parse(await readFile(configDestPath, 'utf8'))
     assert.equal(written.model, 'anthropic/claude-sonnet-4-6')
-    assert.deepEqual(written.plugin, ['@fro.bot/systematic@3.20.0'])
+    assert.equal(written.update, 'disable')
     assert.equal(written.provider.anthropic.options.baseURL, 'https://cliproxy.fro.bot/v1')
+    assert.equal((await stat(configDestPath)).mode & 0o777, 0o644)
   } finally {
     await rm(root, {recursive: true, force: true})
   }
 })
 
 test('rejects a malformed overlay and writes nothing', async () => {
-  const root = await makeTempRoot()
+  const {root, baseConfigPath, staleAuthPath, configDestPath} = await makeProvisionRoot()
   try {
-    const baseConfigPath = join(root, 'base.json')
-    await writeFile(baseConfigPath, JSON.stringify(BASE_CONFIG))
-    const authDestPath = join(root, 'home', '.local', 'share', 'opencode', 'auth.json')
-    const configDestPath = join(root, 'home', '.config', 'opencode', 'opencode.json')
-
     const result = await provisionAgentConfig({
       baseConfigPath,
-      authDestPath,
+      staleAuthPath,
       configDestPath,
-      authRaw: '',
       overlayRaw: '{not valid json',
       modelRaw: '',
     })
@@ -159,145 +68,60 @@ test('rejects a malformed overlay and writes nothing', async () => {
   }
 })
 
-const SCRIPT = fileURLToPath(new URL('./provision-agent-config.mjs', import.meta.url))
-
-async function runCli({overlay, model}) {
-  const root = await makeTempRoot()
+test('never writes an auth.json, and removes a stale one left by an earlier run', async () => {
+  const {root, baseConfigPath, staleAuthPath, configDestPath} = await makeProvisionRoot()
   try {
-    const baseConfigPath = join(root, 'base.json')
-    await writeFile(baseConfigPath, JSON.stringify(BASE_CONFIG))
-    const result = spawnSync(
-      process.execPath,
-      [SCRIPT, baseConfigPath, join(root, 'auth.json'), join(root, 'opencode.json')],
-      {
-        input: '',
-        encoding: 'utf8',
-        env: {PATH: process.env.PATH, WORKSPACE_OPENCODE_CONFIG: overlay, WORKSPACE_OPENCODE_MODEL: model},
-      },
-    )
-    return {status: result.status, stderr: result.stderr}
-  } finally {
-    await rm(root, {recursive: true, force: true})
-  }
-}
+    await mkdir(join(staleAuthPath, '..'), {recursive: true})
+    await writeFile(staleAuthPath, AUTH_BLOB, {mode: 0o600})
 
-test('the startup marker says the overlay was merged into the config file, not that a provider loaded', async () => {
-  const {status, stderr} = await runCli({
-    overlay: JSON.stringify({provider: {anthropic: {options: {baseURL: 'https://cliproxy.fro.bot/v1'}}}}),
-    model: 'anthropic/claude-sonnet-4-6',
-  })
-
-  assert.equal(status, 0)
-  assert.match(stderr, /provider-overlay=merged-into-config-file/)
-  assert.doesNotMatch(stderr, /provider-overlay=applied/)
-})
-
-test('the startup marker reports none when no overlay is set', async () => {
-  const {status, stderr} = await runCli({overlay: '', model: ''})
-
-  assert.equal(status, 0)
-  assert.match(stderr, /provider-overlay=none/)
-})
-
-const AUTH_BLOB = JSON.stringify({anthropic: {type: 'api', key: 'sk-test'}})
-
-async function makeProvisionRoot() {
-  const root = await makeTempRoot()
-  const baseConfigPath = join(root, 'base.json')
-  await writeFile(baseConfigPath, JSON.stringify(BASE_CONFIG))
-  return {
-    root,
-    baseConfigPath,
-    authDestPath: join(root, 'home', '.local', 'share', 'opencode', 'auth.json'),
-    configDestPath: join(root, 'home', '.config', 'opencode', 'opencode.json'),
-  }
-}
-
-test('V2 (writeAuthJson: false) writes no auth.json even when a blob is passed, and still writes the config', async () => {
-  const {root, baseConfigPath, authDestPath, configDestPath} = await makeProvisionRoot()
-  try {
-    const result = await provisionAgentConfig({
-      baseConfigPath,
-      authDestPath,
-      configDestPath,
-      authRaw: AUTH_BLOB,
-      overlayRaw: '',
-      modelRaw: '',
-      writeAuthJson: false,
-    })
+    const result = await provisionAgentConfig({baseConfigPath, staleAuthPath, configDestPath, overlayRaw: '', modelRaw: ''})
 
     assert.equal(result.ok, true)
-    assert.equal(result.authProvisioned, false)
-    await assert.rejects(stat(authDestPath))
-    assert.equal(JSON.parse(await readFile(configDestPath, 'utf8')).autoupdate, false)
+    await assert.rejects(stat(staleAuthPath))
+    assert.equal(JSON.parse(await readFile(configDestPath, 'utf8')).update, 'disable')
   } finally {
     await rm(root, {recursive: true, force: true})
   }
 })
 
-test('V2 removes a stale auth.json left by an earlier V1 run', async () => {
-  const {root, baseConfigPath, authDestPath, configDestPath} = await makeProvisionRoot()
+test('succeeds when there is no stale auth.json to remove', async () => {
+  const {root, baseConfigPath, staleAuthPath, configDestPath} = await makeProvisionRoot()
   try {
-    await mkdir(join(authDestPath, '..'), {recursive: true})
-    await writeFile(authDestPath, AUTH_BLOB, {mode: 0o600})
-
-    const result = await provisionAgentConfig({
-      baseConfigPath,
-      authDestPath,
-      configDestPath,
-      authRaw: '',
-      overlayRaw: '',
-      modelRaw: '',
-      writeAuthJson: false,
-    })
+    const result = await provisionAgentConfig({baseConfigPath, staleAuthPath, configDestPath, overlayRaw: '', modelRaw: ''})
 
     assert.equal(result.ok, true)
-    await assert.rejects(stat(authDestPath))
+    await assert.rejects(stat(staleAuthPath))
   } finally {
     await rm(root, {recursive: true, force: true})
   }
 })
 
-test('V2 removes a stale auth.json that is a symlink without touching its target', async () => {
-  const {root, baseConfigPath, authDestPath, configDestPath} = await makeProvisionRoot()
+test('removes a stale auth.json that is a symlink without touching its target', async () => {
+  const {root, baseConfigPath, staleAuthPath, configDestPath} = await makeProvisionRoot()
   try {
     const target = join(root, 'elsewhere.txt')
     await writeFile(target, 'keep me')
-    await mkdir(join(authDestPath, '..'), {recursive: true})
-    await symlink(target, authDestPath)
+    await mkdir(join(staleAuthPath, '..'), {recursive: true})
+    await symlink(target, staleAuthPath)
 
-    const result = await provisionAgentConfig({
-      baseConfigPath,
-      authDestPath,
-      configDestPath,
-      authRaw: '',
-      overlayRaw: '',
-      modelRaw: '',
-      writeAuthJson: false,
-    })
+    const result = await provisionAgentConfig({baseConfigPath, staleAuthPath, configDestPath, overlayRaw: '', modelRaw: ''})
 
     assert.equal(result.ok, true)
-    await assert.rejects(lstat(authDestPath))
+    await assert.rejects(lstat(staleAuthPath))
     assert.equal(await readFile(target, 'utf8'), 'keep me')
   } finally {
     await rm(root, {recursive: true, force: true})
   }
 })
 
-test('V2 fails closed when a stale auth.json cannot be removed', async () => {
-  const {root, baseConfigPath, authDestPath, configDestPath} = await makeProvisionRoot()
+test('fails closed when a stale auth.json cannot be removed', async () => {
+  const {root, baseConfigPath, staleAuthPath, configDestPath} = await makeProvisionRoot()
   try {
-    await mkdir(authDestPath, {recursive: true})
+    // A non-empty directory at the path: `rm` without `recursive` refuses it.
+    await mkdir(staleAuthPath, {recursive: true})
+    await writeFile(join(staleAuthPath, 'inside'), 'x')
 
-    const result = await provisionAgentConfig({
-      baseConfigPath,
-      authDestPath,
-      configDestPath,
-      authRaw: '',
-      overlayRaw: '',
-      modelRaw: '',
-      writeAuthJson: false,
-    })
+    const result = await provisionAgentConfig({baseConfigPath, staleAuthPath, configDestPath, overlayRaw: '', modelRaw: ''})
 
     assert.equal(result.ok, false)
     assert.match(result.error, /cannot remove stale auth\.json/)
@@ -307,66 +131,70 @@ test('V2 fails closed when a stale auth.json cannot be removed', async () => {
   }
 })
 
-test('V1 (writeAuthJson omitted) still writes auth.json with 0600 and overwrites a previous one', async () => {
-  const {root, baseConfigPath, authDestPath, configDestPath} = await makeProvisionRoot()
-  try {
-    await mkdir(join(authDestPath, '..'), {recursive: true})
-    await writeFile(authDestPath, '{"old":true}', {mode: 0o600})
+const SCRIPT = fileURLToPath(new URL('./provision-agent-config.mjs', import.meta.url))
 
-    const result = await provisionAgentConfig({
-      baseConfigPath,
-      authDestPath,
-      configDestPath,
-      authRaw: AUTH_BLOB,
-      overlayRaw: '',
-      modelRaw: '',
-    })
-
-    assert.equal(result.ok, true)
-    assert.equal(result.authProvisioned, true)
-    const handle = await open(authDestPath, 'r')
-    try {
-      assert.equal((await handle.stat()).mode & 0o777, 0o600)
-      assert.equal(await handle.readFile('utf8'), AUTH_BLOB)
-    } finally {
-      await handle.close()
-    }
-  } finally {
-    await rm(root, {recursive: true, force: true})
-  }
-})
-
-function runCliWithAuth({args, input, authDestPath, baseConfigPath, configDestPath}) {
-  return spawnSync(process.execPath, [SCRIPT, baseConfigPath, authDestPath, configDestPath, ...args], {
+function runCli({args, overlay = '', model = '', input = ''}) {
+  return spawnSync(process.execPath, [SCRIPT, ...args], {
     input,
     encoding: 'utf8',
-    env: {PATH: process.env.PATH},
+    env: {PATH: process.env.PATH, WORKSPACE_OPENCODE_CONFIG: overlay, WORKSPACE_OPENCODE_MODEL: model},
   })
 }
 
-test('the CLI writes auth.json by default and drops it with --no-auth-json', async () => {
-  const {root, baseConfigPath, authDestPath, configDestPath} = await makeProvisionRoot()
+test('the startup marker says the overlay was merged into the config file, not that a provider loaded', async () => {
+  const {root, baseConfigPath, staleAuthPath, configDestPath} = await makeProvisionRoot()
   try {
-    const v1 = runCliWithAuth({args: [], input: AUTH_BLOB, authDestPath, baseConfigPath, configDestPath})
-    assert.equal(v1.status, 0, v1.stderr)
-    assert.match(v1.stderr, /auth: provisioned/)
-    assert.equal((await stat(authDestPath)).mode & 0o777, 0o600)
+    const {status, stderr} = runCli({
+      args: [baseConfigPath, staleAuthPath, configDestPath],
+      overlay: JSON.stringify({provider: {anthropic: {options: {baseURL: 'https://cliproxy.fro.bot/v1'}}}}),
+      model: 'anthropic/claude-sonnet-4-6',
+    })
 
-    const v2 = runCliWithAuth({args: ['--no-auth-json'], input: '', authDestPath, baseConfigPath, configDestPath})
-    assert.equal(v2.status, 0, v2.stderr)
-    assert.doesNotMatch(v2.stderr, /auth: provisioned/)
-    await assert.rejects(stat(authDestPath))
+    assert.equal(status, 0)
+    assert.match(stderr, /provider-overlay=merged-into-config-file/)
+    assert.doesNotMatch(stderr, /provider-overlay=applied/)
   } finally {
     await rm(root, {recursive: true, force: true})
   }
 })
 
-test('the CLI rejects a flag it does not know', async () => {
-  const {root, baseConfigPath, authDestPath, configDestPath} = await makeProvisionRoot()
+test('the startup marker reports none when no overlay is set', async () => {
+  const {root, baseConfigPath, staleAuthPath, configDestPath} = await makeProvisionRoot()
   try {
-    const result = runCliWithAuth({args: ['--no-auth'], input: '', authDestPath, baseConfigPath, configDestPath})
-    assert.equal(result.status, 2)
-    assert.match(result.stderr, /usage:/)
+    const {status, stderr} = runCli({args: [baseConfigPath, staleAuthPath, configDestPath]})
+
+    assert.equal(status, 0)
+    assert.match(stderr, /provider-overlay=none/)
+  } finally {
+    await rm(root, {recursive: true, force: true})
+  }
+})
+
+test('the CLI ignores anything on stdin: no credential is written, and a stale auth.json goes', async () => {
+  const {root, baseConfigPath, staleAuthPath, configDestPath} = await makeProvisionRoot()
+  try {
+    await mkdir(join(staleAuthPath, '..'), {recursive: true})
+    await writeFile(staleAuthPath, AUTH_BLOB, {mode: 0o600})
+
+    const result = runCli({args: [baseConfigPath, staleAuthPath, configDestPath], input: AUTH_BLOB})
+
+    assert.equal(result.status, 0, result.stderr)
+    assert.doesNotMatch(result.stderr, /auth: provisioned/)
+    await assert.rejects(stat(staleAuthPath))
+    assert.doesNotMatch(await readFile(configDestPath, 'utf8'), /sk-test/)
+  } finally {
+    await rm(root, {recursive: true, force: true})
+  }
+})
+
+test('the CLI rejects a missing argument or a flag it does not know', async () => {
+  const {root, baseConfigPath, staleAuthPath, configDestPath} = await makeProvisionRoot()
+  try {
+    for (const args of [[baseConfigPath, staleAuthPath], [baseConfigPath, staleAuthPath, configDestPath, '--no-auth-json']]) {
+      const result = runCli({args})
+      assert.equal(result.status, 2)
+      assert.match(result.stderr, /usage:/)
+    }
   } finally {
     await rm(root, {recursive: true, force: true})
   }

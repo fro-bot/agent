@@ -153,7 +153,7 @@ export const PHASE_TO_WEB_STATUS: Record<RunPhase, OperatorWebStatus> = {
 /**
  * The operator-facing failure-reason enum.
  *
- * A closed allowlist derived from RunCoreErrorKind (execute/run-core.ts) — the internal
+ * A closed allowlist derived from RunCoreErrorKind (execute/run-core-shared.ts) — the internal
  * error-kind vocabulary. 'unknown' is the fallback for any internal kind with no mapping
  * entry (defense-in-depth: unmapped/future/unrecognized kinds never leak past this gate).
  *
@@ -176,7 +176,7 @@ export type OperatorFailureKind =
  *
  * `satisfies Record<RunCoreErrorKind, OperatorFailureKind | undefined>` makes this
  * exhaustive over the RunCoreErrorKind union at compile time — adding a new
- * RunCoreErrorKind member in run-core.ts without adding an entry here is a compile
+ * RunCoreErrorKind member in run-core-shared.ts without adding an entry here is a compile
  * error. `undefined` is an explicit, intentional "maps to 'unknown'" entry (e.g.
  * 'missing-coordinator' has no operator-meaningful mapping), distinct from an
  * omitted key (which `satisfies` would reject).

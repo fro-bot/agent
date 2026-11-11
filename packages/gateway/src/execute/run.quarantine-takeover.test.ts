@@ -1,5 +1,5 @@
-import type {CoordinationConfig, LockRecord} from '@fro-bot/runtime'
-import type {SessionStatusClient} from './repo-quiescence.js'
+import type {CoordinationConfig, LockRecord, V2ShellSummary} from '@fro-bot/runtime'
+import type {ActiveSessionsClient} from './repo-quiescence-v2.js'
 
 import {err, ok} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
@@ -12,37 +12,24 @@ import {
   makeDefaultQueue,
   makeDeps,
   makeMessage,
-  mockRunOpenCodeCore,
+  mockRunOpenCodeCoreV2,
   mockRuntime,
   setupHappyPath,
 } from './test-helpers.js'
 import * as runCoreModule from './run-core-shared.js'
-import {createRepoQuiescenceChecker} from './repo-quiescence.js'
+import {createRepoQuiescenceCheckerV2} from './repo-quiescence-v2.js'
 /* eslint-enable perfectionist/sort-imports */
 
 // ---------------------------------------------------------------------------
 // Composed: a quarantined run's lock decays past its TTL; a NEW acquisition for the same repo goes through the
-// REAL acquireLock (in-memory store with real ETag semantics) and the REAL workspace checker. Only the
-// session-status client is faked. Busy/retry children must keep the old lock in place and the new run unexecuted.
+// REAL acquireLock (in-memory store with real ETag semantics) and the REAL workspace checker. Only the V2
+// client is faked. A running child or shell must keep the old lock in place and the new run unexecuted.
 // ---------------------------------------------------------------------------
 
 const NOW = new Date('2026-04-24T18:00:00.000Z')
 const LEASE_TTL_MS = 900_000
 
-function jsonResponse() {
-  return {
-    ok: true,
-    status: 200,
-    headers: {
-      get: (name: string): string | null =>
-        name.toLowerCase() === 'content-type'
-          ? 'application/json'
-          : name.toLowerCase() === 'content-length'
-            ? '10'
-            : null,
-    },
-  }
-}
+const REPO_DIRECTORY = '/workspace/repos/acme/widget'
 
 function createInMemoryLockConfig() {
   const objects = new Map<string, {data: string; etag: string}>()
@@ -81,11 +68,19 @@ function createInMemoryLockConfig() {
   return {config, lock}
 }
 
-function checkerWith(statuses: Record<string, unknown>) {
-  const client: SessionStatusClient = {
-    session: {status: vi.fn(async () => ({data: statuses, response: jsonResponse()}))},
+interface WorkspaceActivity {
+  /** Sessions the server reports active, all stored under the repo's directory. */
+  readonly active?: Readonly<Record<string, {readonly type: string}>>
+  readonly shells?: readonly V2ShellSummary[]
+}
+
+function checkerWith({active = {}, shells = []}: WorkspaceActivity) {
+  const client: ActiveSessionsClient = {
+    session: {active: async () => active, list: vi.fn(async () => ({data: []}))},
+    getSession: async ({sessionId}) => ok({id: sessionId, parentId: null, directory: REPO_DIRECTORY, outcome: null}),
+    listShells: async () => ok(shells),
   }
-  return createRepoQuiescenceChecker({
+  return createRepoQuiescenceCheckerV2({
     workspaceOpencodeUrl: 'http://workspace:9200',
     workspaceOpencodeToken: 'secret-bearer-token',
     logger: {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()},
@@ -102,7 +97,7 @@ async function quarantineThenExpire() {
   })
   setupHappyPath({stop: stopFn})
   mockRuntime.acquireLock.mockImplementation(actual.acquireLock)
-  mockRunOpenCodeCore.mockRejectedValueOnce(
+  mockRunOpenCodeCoreV2.mockRejectedValueOnce(
     new runCoreModule.RunCoreError('session-error', 'Session error: LLM quota exceeded', true),
   )
   const store = createInMemoryLockConfig()
@@ -130,9 +125,9 @@ describe('quarantined lock decay → new acquisition (composed)', () => {
   })
 
   it.each([
-    ['a busy child', {ses_root: {type: 'idle'}, ses_child: {type: 'busy'}}],
-    ['a retrying child', {ses_root: {type: 'idle'}, ses_child: {type: 'retry', attempt: 2, message: 'x', next: 1}}],
-  ])('%s keeps the expired lock in place and the new run never executes', async (_label, statuses) => {
+    ['a running child session', {active: {ses_child: {type: 'running'}}}],
+    ['a running background shell', {shells: [{id: 'shl_1', status: 'running'} as V2ShellSummary]}],
+  ])('%s keeps the expired lock in place and the new run never executes', async (_label, activity) => {
     // #given — quarantined run held its window, heartbeat stopped, lock was not released, TTL has passed
     const {runMention, store, stopFn, firstHolder} = await quarantineThenExpire()
     expect(stopFn).toHaveBeenCalledOnce()
@@ -141,7 +136,7 @@ describe('quarantined lock decay → new acquisition (composed)', () => {
     const logger = {debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn()}
     const deps = makeDeps({
       coordinationConfig: store.config,
-      checkRepoQuiescence: checkerWith(statuses),
+      checkRepoQuiescence: checkerWith(activity),
       concurrency: makeDefaultConcurrency(),
       queue: makeDefaultQueue(),
       logger,
@@ -152,7 +147,7 @@ describe('quarantined lock decay → new acquisition (composed)', () => {
 
     // #then — old lock untouched, new run did not execute, blocked/expired-holder path taken
     expect(store.lock()).toEqual(firstHolder)
-    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+    expect(mockRunOpenCodeCoreV2).toHaveBeenCalledOnce()
     expect(logger.info).toHaveBeenCalledWith(
       expect.objectContaining({outcome: 'expired-holder'}),
       'run: expired lease not corroborated — not taking over',
@@ -164,7 +159,7 @@ describe('quarantined lock decay → new acquisition (composed)', () => {
     const {runMention, store, firstHolder} = await quarantineThenExpire()
     const deps = makeDeps({
       coordinationConfig: store.config,
-      checkRepoQuiescence: checkerWith({ses_root: {type: 'idle'}}),
+      checkRepoQuiescence: checkerWith({}),
       concurrency: makeDefaultConcurrency(),
       queue: makeDefaultQueue(),
     })
@@ -173,7 +168,7 @@ describe('quarantined lock decay → new acquisition (composed)', () => {
     await runMention(makeMessage(), makeBinding(), deps)
 
     // #then — proves the composed harness really exercises takeover, so the blocked cases above are not vacuous
-    expect(mockRunOpenCodeCore).toHaveBeenCalledTimes(2)
+    expect(mockRunOpenCodeCoreV2).toHaveBeenCalledTimes(2)
     expect(firstHolder).not.toBeNull()
   })
 })

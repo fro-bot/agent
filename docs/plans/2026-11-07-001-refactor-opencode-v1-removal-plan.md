@@ -347,9 +347,21 @@ flowchart LR
 - The real-binary V2 suites pass locally against the pinned binary.
 - `dist/` is rebuilt, reproducible, and contains no V1 execution code reachable from the Action entry.
 
-- [ ] **Unit 4: V2-only gateway and workspace**
+- [x] **Unit 4: V2-only gateway and workspace**
 
 **Goal:** The gateway runs only the V2 loop and refuses a non-V2 workspace. The workspace image builds and runs only V2.
+
+**As built:** these differ from the file list below.
+
+- The readiness gate lives in `run.ts` and reuses `selectOpenCodeGeneration` from `@fro-bot/runtime`; the gateway's own `execute/opencode-generation.ts` is deleted. Its tests are `run.workspace-version.test.ts` (renamed from `run.v2-selection.test.ts`), not `run.test.ts`.
+- The V1 `run-core*.test.ts` suites are deleted with `run-core.ts`; the V2 loop keeps its own `run-core-v2*.test.ts` suites.
+- `deploy/managed-config/opencode.json` is deleted. Its only content was the `file://` entry for the no-task-reuse plugin, and the V1 image already replaced it with `opencode-v2.json` for V2. The Dockerfile now copies `opencode-v2.json` straight to `/etc/opencode/opencode.json`.
+- `OPENCODE_VERSION` is optional, not required. The `version-gate` stage that every other stage builds from resolves an unset or empty value to the version in the pin file and writes it to `/usr/local/share/fro-bot/opencode-version`, which the later stages and the entrypoint read. An explicit value is only a check: it must equal the pin, so `1.19.4`, `2.0.0`, `2.2.5`, `latest` and any `+harness` value fail before any download. A required arg broke `docker compose build`, which passes none. The decisions and test lines below that say "required" or "no-arg build fails" are superseded.
+- `WORKSPACE_IMAGE_OPENCODE_VERSION` is no longer an image `ENV`. The entrypoint exports it from the recorded file, because a Dockerfile `ENV` cannot read a file.
+- The `OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER` and `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` image envs are dropped, along with their smoke assertions. The V2 child environment is an allowlist that never forwards them.
+- The entrypoint and `provision-agent-config` no longer write `auth.json`; the supervisor provisions each spawn. The smoke asserts `auth: present` and no file under the agent home.
+- `ci.yaml` `workspace-smoke` builds one image (`:smoke`) from the pin file. The separate V1 build, the `+harness` checks, the Dockerfile-default tag check and the checksum negative test are replaced by a version-gate negative test.
+- `deploy/plugins/` is gone entirely. The root `src/services/setup/no-task-reuse-plugin.test.ts` is deleted too.
 
 **Requirements:** R2, R6, R7
 

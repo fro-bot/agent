@@ -1,6 +1,5 @@
 /**
- * OpenCode V2 server lifecycle for the workspace-agent: the sibling of `opencode-server.ts`, selected by `main.ts`
- * when the image carries a stock OpenCode with major version 2 or higher.
+ * OpenCode V2 server lifecycle for the workspace-agent: `main.ts` supervises the stock OpenCode the image carries.
  *
  * Spawn, password, readiness, plugin gate and shutdown come from `@fro-bot/runtime/workspace-v2`
  * (`startOpenCodeV2Server`). This module adds what only the workspace needs:
@@ -20,7 +19,7 @@
  *    never put in the environment of anything but the spawn, and never serialised with the holder.
  * 3. A failed start, a failed gate or an unexpected exit clears the credential at once, so the proxy fails closed
  *    instead of forwarding with a password the next server does not hold.
- * 4. Bounded respawn: max attempts, with a stable-run reset, as in the V1 supervisor.
+ * 4. Bounded respawn: max attempts, with a stable-run reset.
  */
 
 import type {OpenCodeV2ServerHandle, Logger as RuntimeLogger} from '@fro-bot/runtime/workspace-v2'
@@ -116,7 +115,7 @@ function copyEnvIfSet(source: NodeJS.ProcessEnv, target: Record<string, string>,
  *
  * The file watcher stays at V2's default: probe P3 found no difference with it on or off, so
  * `OPENCODE_DISABLE_FILEWATCHER` is neither set nor defaulted here, and the allowlist does not forward it from the
- * parent. V2 has no environment flag for background subagents (they are native), so no V1 flag is carried over.
+ * parent. V2 has no environment flag for background subagents (they are native).
  */
 export function buildOpencodeV2Env(parentEnv: NodeJS.ProcessEnv, databasePath: string): NodeJS.ProcessEnv {
   const env: Record<string, string> = {

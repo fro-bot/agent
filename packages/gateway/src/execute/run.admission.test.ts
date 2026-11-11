@@ -16,7 +16,7 @@ import {
   makeReadyzFn,
   makeThread,
   makeUpdateFn,
-  mockRunOpenCodeCore,
+  mockRunOpenCodeCoreV2,
   mockRuntime,
   OWNER,
   REPO,
@@ -24,7 +24,6 @@ import {
   type runtimeModule,
 } from './test-helpers.js'
 import {OPERATOR_LAUNCH_PROMPT_MAX_LENGTH} from '../operator-contract/launch-prompt.js'
-import * as attachModule from './opencode-attach.js'
 import * as promptModule from './prompt.js'
 import {getInFlightRuns} from './run.js'
 /* eslint-enable perfectionist/sort-imports */
@@ -171,7 +170,7 @@ describe('runMention', () => {
 
       // #then — ensureClone was called (update reported no-checkout); execution proceeded
       expect(ensureClone).toHaveBeenCalledWith(OWNER, REPO)
-      expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+      expect(mockRunOpenCodeCoreV2).toHaveBeenCalledOnce()
     })
 
     it('ensure-clone failure (post-lock) → coarse reply in the thread, lock and slot released', async () => {
@@ -285,7 +284,7 @@ describe('runMention', () => {
       expect(ensureClone).not.toHaveBeenCalled()
     })
 
-    it('runOpenCodeCore receives the canonical owner/repo directory, not stale binding.workspacePath', async () => {
+    it('runOpenCodeCoreV2 receives the canonical owner/repo directory, not stale binding.workspacePath', async () => {
       // #given — binding has a stale workspacePath; ensureClone returns the canonical path
       const {runMention} = await import('./run.js')
       setupHappyPath()
@@ -298,9 +297,9 @@ describe('runMention', () => {
       // #when
       await runMention(msg, staleBinding, deps)
 
-      // #then — runOpenCodeCore called with the canonical path
-      expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
-      const coreParams = mockRunOpenCodeCore.mock.calls[0]?.[0] as {directory?: string}
+      // #then — runOpenCodeCoreV2 called with the canonical path
+      expect(mockRunOpenCodeCoreV2).toHaveBeenCalledOnce()
+      const coreParams = mockRunOpenCodeCoreV2.mock.calls[0]?.[0] as {directory?: string}
       expect(coreParams.directory).toBe(canonicalPath)
       expect(coreParams.directory).not.toBe('/old/stale/path')
     })
@@ -318,7 +317,7 @@ describe('runMention', () => {
 
       // #then
       expect(ensureClone).not.toHaveBeenCalled()
-      const coreParams = mockRunOpenCodeCore.mock.calls[0]?.[0] as {directory?: string}
+      const coreParams = mockRunOpenCodeCoreV2.mock.calls[0]?.[0] as {directory?: string}
       expect(coreParams.directory).toBe('/workspace/repos/acme/widget')
     })
 
@@ -335,7 +334,7 @@ describe('runMention', () => {
       await runMention(makeMessage(), makeBinding(), deps)
 
       // #then — no OpenCode session; the run is terminalized FAILED; the retry /update never happens
-      expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+      expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
       expect(update).toHaveBeenCalledOnce()
       expect(mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)).toContain('FAILED')
     })
@@ -356,7 +355,7 @@ describe('runMention', () => {
       expect(update.mock.calls[0]?.[0]).toBe('acme')
       expect(update.mock.calls[0]?.[1]).toBe('widget')
       expect(ensureClone).toHaveBeenCalledWith('acme', 'widget')
-      const coreParams = mockRunOpenCodeCore.mock.calls[0]?.[0] as {directory?: string}
+      const coreParams = mockRunOpenCodeCoreV2.mock.calls[0]?.[0] as {directory?: string}
       expect(coreParams.directory).toBe('/workspace/repos/acme/widget')
     })
   })
@@ -567,7 +566,7 @@ describe('runMention', () => {
 
       // #then — readyz called; execution proceeded
       expect(readyz).toHaveBeenCalledOnce()
-      expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+      expect(mockRunOpenCodeCoreV2).toHaveBeenCalledOnce()
     })
 
     it('readyz=not-ready → coarse reply, no thread created, concurrency slot released', async () => {
@@ -840,8 +839,8 @@ describe('runIndex.register() wiring (FIX 5)', () => {
     // #and — run was terminalized to FAILED (transitionRun FAILED called)
     const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
     expect(transitionPhases).toContain('FAILED')
-    // #and — runOpenCodeCore was NOT called (run was rejected before execution)
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    // #and — runOpenCodeCoreV2 was NOT called (run was rejected before execution)
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
   })
 
   it('runIndex is optional — omitting it does not break run execution', async () => {
@@ -856,7 +855,7 @@ describe('runIndex.register() wiring (FIX 5)', () => {
     await runMention(message, makeBinding(), deps)
 
     // #then — execution completed normally
-    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+    expect(mockRunOpenCodeCoreV2).toHaveBeenCalledOnce()
   })
 })
 
@@ -873,9 +872,9 @@ describe('launchWork admission', () => {
     const {launchWork} = await import('./run.js')
     setupHappyPath()
 
-    // Make runOpenCodeCore hang indefinitely
+    // Make runOpenCodeCoreV2 hang indefinitely
     let resolveRun: (() => void) | undefined
-    mockRunOpenCodeCore.mockImplementation(
+    mockRunOpenCodeCoreV2.mockImplementation(
       async () =>
         new Promise<void>(resolve => {
           resolveRun = resolve
@@ -897,8 +896,8 @@ describe('launchWork admission', () => {
     // Yield to the event loop so executeWorkOnHeldSlot can start
     await new Promise(resolve => setTimeout(resolve, 0))
 
-    // #and — runOpenCodeCore was called (run started, even though launchWork returned early)
-    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+    // #and — runOpenCodeCoreV2 was called (run started, even though launchWork returned early)
+    expect(mockRunOpenCodeCoreV2).toHaveBeenCalledOnce()
 
     // Resolve the hanging run so the test can clean up
     resolveRun?.()
@@ -1084,8 +1083,8 @@ describe('launchWork admission', () => {
     const transitionPhases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
     expect(transitionPhases).toContain('FAILED')
 
-    // #and — runOpenCodeCore NOT called (run was rejected before execution)
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    // #and — runOpenCodeCoreV2 NOT called (run was rejected before execution)
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
   })
 
   // ── Exactly ONE createRun per run ──────────────────────────────────────────
@@ -1138,11 +1137,7 @@ describe('launchWork admission', () => {
       }),
       isRunning: false,
     })
-    mockRunOpenCodeCore.mockResolvedValue(undefined)
-    vi.mocked(attachModule.attachOpencode).mockReturnValue({
-      server: {url: 'http://workspace:9200'},
-      session: {create: vi.fn(), prompt: vi.fn()},
-    } as unknown as ReturnType<typeof attachModule.attachOpencode>)
+    mockRunOpenCodeCoreV2.mockResolvedValue(undefined)
     vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
 
     const observeFn = vi.fn().mockResolvedValue(undefined)
@@ -1284,8 +1279,8 @@ describe('early-abort gates terminalize to FAILED', () => {
     const errorSend = sends.find(s => s.content.includes('not reachable'))
     expect(errorSend).toBeDefined()
 
-    // #and — runOpenCodeCore NOT called (clone fails before OpenCode starts)
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    // #and — runOpenCodeCoreV2 NOT called (clone fails before OpenCode starts)
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
   })
 
   // ── Gate 2: readyz not-ready ───────────────────────────────────────────────
@@ -1321,8 +1316,8 @@ describe('early-abort gates terminalize to FAILED', () => {
     const errorSend = sends.find(s => s.content.includes('not reachable'))
     expect(errorSend).toBeDefined()
 
-    // #and — runOpenCodeCore NOT called
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    // #and — runOpenCodeCoreV2 NOT called
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
   })
 
   // ── Gate 3a: threadFactory throws ─────────────────────────────────────────
@@ -1481,8 +1476,8 @@ describe('early-abort gates terminalize to FAILED', () => {
     // No S3 detail leaked
     expect(sends.every(s => !s.content.includes('S3'))).toBe(true)
 
-    // #and — runOpenCodeCore NOT called
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    // #and — runOpenCodeCoreV2 NOT called
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
   })
 
   // ── Gate 4b: lock not acquired (held by another) ───────────────────────────
@@ -1528,8 +1523,8 @@ describe('early-abort gates terminalize to FAILED', () => {
     // Holder ID NOT leaked
     expect(sends.every(s => !s.content.includes('other-gateway'))).toBe(true)
 
-    // #and — runOpenCodeCore NOT called
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    // #and — runOpenCodeCoreV2 NOT called
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
   })
 
   it('gate 4b (expired lease not corroborated): hands the shared checker to acquireLock, terminalizes, never executes', async () => {
@@ -1575,7 +1570,7 @@ describe('early-abort gates terminalize to FAILED', () => {
     expect(sends.some(s => s.content.includes('may still be running'))).toBe(true)
     expect(sends.every(s => !s.content.includes('other-gateway'))).toBe(true)
     expect(mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)).toContain('FAILED')
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
   })
 
   // ── Gate 5: ACK transition fail ────────────────────────────────────────────
@@ -1626,8 +1621,8 @@ describe('early-abort gates terminalize to FAILED', () => {
     const errorSend = sends.find(s => s.content.includes('Could not start'))
     expect(errorSend).toBeDefined()
 
-    // #and — runOpenCodeCore NOT called
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    // #and — runOpenCodeCoreV2 NOT called
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
   })
 
   // ── Dual-finally: gate that THROWS still terminalizes ─────────────────────
@@ -1786,7 +1781,7 @@ describe('early-abort gates terminalize to FAILED', () => {
     expect(mockRuntime.createRun).toHaveBeenCalledOnce()
 
     // #and — execution happened
-    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+    expect(mockRunOpenCodeCoreV2).toHaveBeenCalledOnce()
   })
 })
 
@@ -1964,7 +1959,7 @@ describe('failureKind threading (early-abort gates)', () => {
     // #given — a plain Error from the core run (generic failure, not a pre-ACK gate)
     const {runMention} = await import('./run.js')
     setupHappyPath()
-    mockRunOpenCodeCore.mockRejectedValue(new Error('boom'))
+    mockRunOpenCodeCoreV2.mockRejectedValue(new Error('boom'))
 
     const deps = makeDeps()
     const message = makeMessage()

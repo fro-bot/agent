@@ -19,7 +19,7 @@
 // ---------------------------------------------------------------------------
 
 /**
- * The extracted tool shape that run-core.ts pulls from a completed tool part.
+ * The extracted tool shape that run-core-v2.ts pulls from a completed tool part.
  *
  * Fields consumed per tool:
  *   edit        → state.input.filePath, state.input.newString, state.input.oldString
@@ -386,6 +386,6 @@ export function formatToolPart(part: ExtractedToolPart): string | null {
 
 /**
  * Returns true if the bash command is read-only (should be hidden).
- * Exported for testing; run-core.ts uses this via formatToolPart indirectly.
+ * Exported for testing; run-core-v2.ts uses this via formatToolPart indirectly.
  */
 export {isReadOnlyBashCommand}

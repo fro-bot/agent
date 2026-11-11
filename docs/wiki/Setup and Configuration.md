@@ -34,7 +34,6 @@ sources:
   - src/services/setup/adapters.ts
   - src/services/setup/opencode.ts
   - src/services/setup/types.ts
-  - deploy/plugins/no-task-reuse.mjs
   - packages/harness/src/platform.ts
   - src/services/setup/gh-auth.ts
   - src/services/setup/git-credential-check.ts
@@ -47,7 +46,6 @@ sources:
   - packages/harness/src/version.ts
   - scripts/harness/duplicate-harness-release-tags.ts
   - packages/runtime/src/shared/constants.ts
-  - packages/runtime/src/shared/opencode-v2-pin.json
   - packages/runtime/src/object-store/settings.ts
   - packages/runtime/src/object-store/encryption.ts
   - packages/gateway/src/object-store-config.ts
@@ -109,7 +107,7 @@ Bun is the package manager for this project's own workspace, not a tool the Acti
 
 `DEFAULT_OPENCODE_VERSION` is the **stock OpenCode V2 pin** (currently `2.2.6`), read from `packages/runtime/src/shared/opencode-v2-pin.json`, which records the version and each release asset's SHA-256. Installation requires both the recorded digest and the release's `SHA256SUMS` line to match. The build checks that the version and digests survive bundling (`tsdown.config.ts`). `latest` selects this same recorded pin without an upstream lookup.
 
-The Action no longer runs V1. A V1 `opencode-version` (a stock 1.x version or a `+harness.`/`-harness.` build) fails input parsing with an error that names the input and the value, and so does any V2 version other than the pin. To keep running V1, pin the Action to its last pre-cut release, `fro-bot/agent@v0.137.0`, and set `opencode-version` to the final V1 harness build `1.19.5+harness.bf7f7dfe`. A V1 run cannot see sessions created on V2, and a later V2 run keeps its own copy; nothing reconciles the two. The workspace image still defaults to the V1 harness build until the gateway cut.
+The Action no longer runs V1. A V1 `opencode-version` (a stock 1.x version or a `+harness.`/`-harness.` build) fails input parsing with an error that names the input and the value, and so does any V2 version other than the pin. To keep running V1, pin the Action to its last pre-cut release, `fro-bot/agent@v0.137.0`, and set `opencode-version` to the final V1 harness build `1.19.5+harness.bf7f7dfe`. A V1 run cannot see sessions created on V2, and a later V2 run keeps its own copy; nothing reconciles the two. The gateway and the workspace image are V2-only too; to roll back past the cut, redeploy the previous image pair from GHCR.
 
 ## OpenCode V2 setup
 
@@ -195,7 +193,7 @@ The same bearer used by the gateway to attach to the OpenCode proxy on port 9200
 
 ### Server-start task-reuse guard
 
-On the Action, the `@fro.bot/opencode-plugin` guard rejects a `subagent` call that carries a `sessionID`, so each background job has its own child session. The workspace image still bakes the separate `deploy/plugins/no-task-reuse.mjs` guard for the gateway until the gateway cut.
+The `@fro.bot/opencode-plugin` guard rejects a `subagent` call that carries a `sessionID`, so each background job has its own child session, on the Action and on the workspace (loaded from the config content the workspace agent passes at spawn).
 
 ## Tools Cache
 
@@ -217,7 +215,7 @@ A denied tools-cache write is now surfaced as a failure rather than swallowed. W
 
 Credentials are handled with care:
 
-- **Provider authentication** uses an ephemeral `auth.json` on V1, owner-only key files referenced by config on the V2 Action, and loopback credential provisioning on the V2 workspace. Credentials are regenerated from secrets, outside the session transport.
+- **Provider authentication** uses owner-only key files referenced by config on the Action, and loopback credential provisioning on the workspace. Credentials are regenerated from secrets, outside the session transport.
 - **Git identity** is forced to `{bot}[bot]` so commits made by the agent have a clear audit trail.
 
 ### GitHub credential disposition
@@ -290,7 +288,7 @@ Nobody can answer an interactive `question` in a CI run, and a pending question 
 
 The workspace container runs two identities. The workspace-agent **service** (`apps/workspace-agent/src/main.ts`) stays root (uid 0) because it hands checkouts to the agent and supervises its processes, but `deploy/compose.yaml` drops every capability except `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `SETUID`, `SETGID`, `KILL`, sets `no-new-privileges`, and disables core dumps. **OpenCode and everything it spawns** run as the unprivileged `opencode` account (`AGENT_UID`/`AGENT_GID` `10001`). `apps/workspace-agent/src/identity.ts` is the single source of truth for the uid/gid, the agent home and XDG tree (`/home/opencode`), the separate `SERVICE_HOME` (`/var/lib/workspace-agent/home`), the root-owned state/staging directory names, and the absolute `OPENCODE_EXECUTABLE_PATH`; `deploy/workspace.Dockerfile` creates the account and directories with the same values, so change both together.
 
-- **OpenCode launch.** Every spawn site goes through `buildOpencodeLaunchSpec` (`apps/workspace-agent/src/opencode-server.ts`): absolute executable path (never resolved through `PATH`), agent uid/gid, and an environment _constructed_ from an allowlist by `buildOpencodeEnv` — agent home/XDG/`TMPDIR`, a fixed `PATH`, proxy, CA bundle, locale, and `OPENCODE_*` flags only. `WORKSPACE_*` settings, secret-file paths, tokens, and `GIT_*`/loader overrides cannot reach the child by construction, not by filtering. The service binds its control ports before OpenCode starts so the agent cannot race it for them.
+- **OpenCode launch.** The spawn goes through `startOpenCodeV2Server` (`apps/workspace-agent/src/opencode-server-v2.ts`): absolute executable path (never resolved through `PATH`), agent uid/gid, and an environment _constructed_ from an allowlist by `buildOpencodeV2Env` — agent home/XDG/`TMPDIR`, a fixed `PATH`, proxy, CA bundle, locale, and `OPENCODE_*` flags only. `WORKSPACE_*` settings, secret-file paths, tokens, and `GIT_*`/loader overrides cannot reach the child by construction, not by filtering. The service binds its control ports before OpenCode starts so the agent cannot race it for them.
 - **Clone and handoff.** `executeClone` (`apps/workspace-agent/src/clone.ts`) clones into root-owned staging (`/workspace/repos/.workspace-agent/staging/`, `0700`, on the same volume), resolves and validates HEAD while the tree is still root's, hands every entry to the agent via `handOffToAgent` (`apps/workspace-agent/src/handoff.ts` — `lstat`/`lchown` only, never follows a symlink, never crosses `st_dev`, fails the clone on a hardlink, bounded by deadline and entry cap), then publishes with a single `rename`. Staging is emptied on every failure path. Clone runs under the shared per-repo mutex (`apps/workspace-agent/src/repo-mutex.ts`) and refuses with `journal-in-progress` (409) before touching anything when `apps/workspace-agent/src/journal.ts` reports an outstanding journal for the repo — found or `malformed`, never treated as absent. The only git that runs as root with credentials is the clone itself, in staging; the `repo-exists` check and post-rename race-check run as the agent through `apps/workspace-agent/src/git-safety.ts`.
 - **Control-API auth.** `/clone` and `/inspect` on `:9100` require `Authorization: Bearer <WORKSPACE_OPENCODE_TOKEN>` — the same root-only secret the `:9200` OpenCode proxy uses — so the agent uid cannot call the control API over loopback. `createApp` (`apps/workspace-agent/src/server.ts`) takes a required `auth` discriminated union with no default; the check runs before body parsing, compares constant-time (length-guarded `timingSafeEqual`), and returns a fixed 401. The gateway sends the bearer from `createWorkspaceClient` (`packages/gateway/src/workspace-api/client.ts`); roll the gateway and workspace images together, since a token mismatch rejects every clone.
 - **Checkout-update primitives.** Credentialed fetches run only against a root-owned bare mirror under the state directory's `fetch/` store (`FETCH_STORE_DIR_NAME` in `apps/workspace-agent/src/identity.ts`); objects cross into the agent-owned checkout only as a `pack-objects --stdout | index-pack --stdin --strict` stream (`runPackStream`, `apps/workspace-agent/src/git-stream.ts`), never by local fetch or alternates. Admission checks against an existing checkout — config inventory, layout, temp-index cleanliness, path-obstruction preflight — live in `apps/workspace-agent/src/checkout-profile.ts` and run as the agent through the network/local-update git profiles in `apps/workspace-agent/src/git-safety.ts`. The egress proxy and CA bundle `/update`'s network half needs are read once at startup (`readUpdateNetworkConfig`, `apps/workspace-agent/src/config.ts`), never re-read per call. Adversarial real-git fixtures live in `apps/workspace-agent/src/update-fixtures/`.

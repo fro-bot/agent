@@ -2,7 +2,7 @@
  * Minimal Discord prompt builder.
  *
  * Keeps prompt construction separate from execution so it is independently
- * testable and the execution core (`run-core.ts`) stays free of string
+ * testable and the execution core (`run-core-v2.ts`) stays free of string
  * formatting concerns.
  */
 

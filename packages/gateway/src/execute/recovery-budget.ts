@@ -1,7 +1,7 @@
 /**
  * The wall-clock budget one automatic dirty-checkout recovery needs (`checkout-recovery.ts`), kept in
  * its own dependency-light module so `config.ts` can check the run timeout against it at startup
- * without importing the OpenCode attach stack that `repo-quiescence.ts` pulls in.
+ * without importing the OpenCode attach stack that `repo-quiescence-v2.ts` pulls in.
  */
 
 import {INSTALLATION_TOKEN_MINT_TIMEOUT_MS} from '../github/app-client.js'

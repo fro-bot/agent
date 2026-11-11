@@ -14,10 +14,10 @@ import * as discordApprovalsModule from '../discord/approvals.js'
 import * as statusMessageModule from '../discord/status-message.js'
 import * as streamingModule from '../discord/streaming.js'
 import {totalRecoveryBudgetMs} from './checkout-recovery.js'
-import * as attachModule from './opencode-attach.js'
+import * as attachModule from './opencode-attach-v2.js'
 import * as promptModule from './prompt.js'
 import * as runCoreSharedModule from './run-core-shared.js'
-import * as runCoreModule from './run-core.js'
+import * as runCoreModule from './run-core-v2.js'
 
 // ---------------------------------------------------------------------------
 // Shared test setup for the run.test.ts split. Mocks external collaborators so
@@ -61,16 +61,8 @@ vi.mock('../discord/approvals.js', () => ({
   DENY_PREFIX: 'fb-deny:',
 }))
 
-vi.mock('./opencode-attach.js', () => ({
-  attachOpencode: vi.fn().mockReturnValue({
-    promptAsync: vi.fn(),
-    subscribe: vi.fn(),
-    client: {
-      permission: {
-        reply: vi.fn().mockResolvedValue({data: null, error: null}),
-      },
-    },
-  }),
+vi.mock('./opencode-attach-v2.js', () => ({
+  attachOpencodeV2: vi.fn().mockReturnValue({kind: 'v2-client'}),
 }))
 
 vi.mock('../discord/streaming.js', () => ({
@@ -94,8 +86,8 @@ vi.mock('./prompt.js', () => ({
   },
 }))
 
-vi.mock('./run-core.js', () => ({
-  runOpenCodeCore: vi.fn().mockResolvedValue(undefined),
+vi.mock('./run-core-v2.js', () => ({
+  runOpenCodeCoreV2: vi.fn().mockResolvedValue(undefined),
 }))
 
 vi.mock('./run-core-shared.js', () => ({
@@ -140,7 +132,7 @@ vi.mock('../discord/reactions.js', () => ({
 // ---------------------------------------------------------------------------
 
 export const mockRuntime = vi.mocked(runtimeModule)
-export const mockRunOpenCodeCore = vi.mocked(runCoreModule.runOpenCodeCore)
+export const mockRunOpenCodeCoreV2 = vi.mocked(runCoreModule.runOpenCodeCoreV2)
 export const mockCreateDiscordStreamSink = vi.mocked(streamingModule.createDiscordStreamSink)
 export const mockCreatePermissionCoordinator = vi.mocked(coordinatorModule.createPermissionCoordinator)
 export const mockCreateStatusController = vi.mocked(statusMessageModule.createStatusController)
@@ -444,12 +436,18 @@ export function makeEnsureCloneFn(result: 'success' | 'failure' = 'success') {
       })
 }
 
+/** The OpenCode version a ready test workspace reports; the gateway admits a run only on a V2 version. */
+export const WORKSPACE_OPENCODE_VERSION = '2.2.6'
+
 export function makeReadyzFn(result: 'ready' | 'not-ready' | 'throws' = 'ready') {
   if (result === 'throws') {
     return vi.fn().mockRejectedValue(new Error('readyz threw'))
   }
   return result === 'ready'
-    ? vi.fn().mockResolvedValue({success: true as const, data: {ready: true, opencode: 'ready'}})
+    ? vi.fn().mockResolvedValue({
+        success: true as const,
+        data: {ready: true, opencode: 'ready', opencodeVersion: WORKSPACE_OPENCODE_VERSION},
+      })
     : vi.fn().mockResolvedValue({success: true as const, data: {ready: false, opencode: 'starting'}})
 }
 
@@ -676,14 +674,10 @@ export function setupHappyPath(heartbeatOverrides?: {
   mockCreateDiscordStreamSink.mockReturnValue(
     makeStreamSinkMock() as unknown as ReturnType<typeof streamingModule.createDiscordStreamSink>,
   )
-  mockRunOpenCodeCore.mockResolvedValue(undefined)
-  vi.mocked(attachModule.attachOpencode).mockReturnValue({
-    server: {url: 'http://workspace:9200'},
-    session: {
-      create: vi.fn(),
-      prompt: vi.fn(),
-    },
-  } as unknown as ReturnType<typeof attachModule.attachOpencode>)
+  mockRunOpenCodeCoreV2.mockResolvedValue(undefined)
+  vi.mocked(attachModule.attachOpencodeV2).mockReturnValue({
+    kind: 'v2-client',
+  } as unknown as ReturnType<typeof attachModule.attachOpencodeV2>)
   vi.mocked(promptModule.buildDiscordPrompt).mockReturnValue('Repository: acme/widget\n\ndo the thing')
 }
 
@@ -878,13 +872,13 @@ export async function awaitLaunchWorkRun(
 }
 
 /**
- * Simulate `runOpenCodeCore` observing the cancel signal fire and throwing
+ * Simulate `runOpenCodeCoreV2` observing the cancel signal fire and throwing
  * the same way the real implementation would once its combined signal aborts:
- * a `RunCoreError('timeout', ...)` (run-core does not add a distinct
+ * a `RunCoreError('timeout', ...)` (run-core-v2 does not add a distinct
  * 'cancelled' kind — classification happens in run.ts via registry probe).
  */
 export function mockRunOpenCodeCoreAbortedBy(viaRegistryAbort: () => void) {
-  mockRunOpenCodeCore.mockImplementation(async () => {
+  mockRunOpenCodeCoreV2.mockImplementation(async () => {
     viaRegistryAbort()
     throw new runCoreSharedModule.RunCoreError('timeout', 'run-core: signal aborted')
   })

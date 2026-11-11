@@ -8,9 +8,9 @@
  *
  * "Delivered" means accepted by the run's append path. A segment's whitespace-only lead-in may be held by the text
  * boundary tracker (so a paragraph separator can still go before it) and is flushed to the sink when the event loop
- * exits; the caller owns that invariant (see `run-core.ts`). Only each part's own text is recorded, never a separator.
+ * exits; the caller owns that invariant (see `run-core-v2.ts`). Only each part's own text is recorded, never a separator.
  *
- * Delivery semantics follow `run-core.ts`: the sink receives text from `message.part.delta` and
+ * Delivery semantics follow `run-core-v2.ts`: the sink receives text from `message.part.delta` and
  * `session.next.text.delta` only. A text part that arrives as a whole `message.part.updated` is never appended
  * (that handler only acts on `reasoning` and `tool` parts) and is NOT delivery evidence here: it cannot be
  * told apart from deltas that were lost, so a reply that only ever arrived whole keeps the run incomplete.

@@ -1,5 +1,5 @@
 /**
- * Stopping what a run left running in its directory, on OpenCode V2: the sibling of `root-stop.ts`.
+ * Stopping what a run left running in its directory, on OpenCode V2.
  *
  * `POST /api/session/:id/interrupt` is a request, and its reply cannot be read as a stop (`{interrupted: false}` is also
  * what a prompt that is not admitted yet returns, probe P1). `DELETE /api/shell/:id` answers 204 for an unknown id, and a
@@ -33,7 +33,7 @@ export const ROOT_WATCH_REQUEST_TIMEOUT_MS = 5_000
  * Upper bound, in milliseconds, on how long a quarantined run's lock lease and
  * concurrency slot are held past the failure that quarantined it.
  *
- * The termination barrier (`settle-owned-sessions.ts`) already spends up to
+ * The termination barrier (`settle-owned-sessions-v2.ts`) already spends up to
  * `DEFAULT_SETTLE_TIMEOUT_MS` (15 s) trying to confirm settlement before giving
  * up and quarantining. This window is deliberately much larger than that bound —
  * roughly 20x — so a background child that is genuinely still finishing a write

@@ -18,7 +18,7 @@ import {
   makeQuiescenceFn,
   makeRecoverFn,
   makeRecoveryPreviewData,
-  mockRunOpenCodeCore,
+  mockRunOpenCodeCoreV2,
   mockRuntime,
   OWNER,
   REPO,
@@ -69,7 +69,7 @@ describe('checkout preparation: outcome mapping', () => {
       reason: 'dirty',
       changedPaths: ['a.txt', 'b.txt'],
     })
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
     const sent = request._replySink._sends[0]
     expect(sent?.content).toContain("The checkout has uncommitted or untracked changes, so I can't update it safely.")
     expect(sent?.content).toContain('Use the button below')
@@ -95,7 +95,7 @@ describe('checkout preparation: outcome mapping', () => {
       mutationStarted: false,
       permanent: false,
     })
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
     expect(request._replySink._sends[0]?.content).toContain("couldn't reach the repository's remote right now")
   })
 
@@ -108,7 +108,7 @@ describe('checkout preparation: outcome mapping', () => {
 
     await awaitLaunchWorkRun(launchWork, request, deps)
 
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
     const sent = request._replySink._sends[0]
     expect(sent?.content).toContain('the workspace has put this repository on hold')
     expect(sent?.content).not.toContain('recover-checkout')
@@ -126,7 +126,7 @@ describe('checkout preparation: outcome mapping', () => {
 
     await awaitLaunchWorkRun(launchWork, request, deps)
 
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
     expect(request._replySink._sends[0]?.content).toContain("couldn't be confirmed to have stopped")
   })
 
@@ -141,7 +141,7 @@ describe('checkout preparation: outcome mapping', () => {
     const phases = mockRuntime.transitionRun.mock.calls.map((c: unknown[]) => c[4] as string)
     expect(phases).toContain('EXECUTING')
     expect(phases).not.toContain('FAILED')
-    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+    expect(mockRunOpenCodeCoreV2).toHaveBeenCalledOnce()
   })
 })
 
@@ -179,7 +179,7 @@ describe('checkout preparation: client timeout', () => {
     expect(mockRuntime.releaseLock).toHaveBeenCalledOnce()
     const releaseCall = mockRuntime.releaseLock.mock.calls[0] as unknown[]
     expect(releaseCall[2]).toBe('lock-etag-after-heartbeat')
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
   })
 })
 
@@ -402,7 +402,7 @@ describe('checkout preparation: clone-then-update lock discipline', () => {
     expect(mockRuntime.acquireLock).toHaveBeenCalledOnce()
     expect(ensureClone).toHaveBeenCalledOnce()
     expect(mockRuntime.releaseLock).toHaveBeenCalledOnce()
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
   })
 })
 
@@ -440,7 +440,7 @@ describe('checkout preparation: invalid owner/repo binding', () => {
       // #then — nothing touched the workspace or started a session
       expect(update).not.toHaveBeenCalled()
       expect(ensureClone).not.toHaveBeenCalled()
-      expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+      expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
       // #and — the run is failed as workspace-unavailable
       const failedCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'FAILED')
       expect(failedCall).toBeDefined()
@@ -656,7 +656,7 @@ describe('checkout preparation: automatic recovery of a dirty checkout', () => {
     // #then the run executes, and is never failed
     expect(transitionPhases()).toContain('EXECUTING')
     expect(transitionPhases()).not.toContain('FAILED')
-    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+    expect(mockRunOpenCodeCoreV2).toHaveBeenCalledOnce()
     // #then the final answer carries the backup note exactly once, with no extra send
     expect(occurrences(finalAnswer(run.request), DEFAULT_BACKUP_ID)).toBe(1)
     expect(finalAnswer(run.request)).toContain('preserved it as backup')
@@ -671,7 +671,7 @@ describe('checkout preparation: automatic recovery of a dirty checkout', () => {
     // #then
     expect(run.update).toHaveBeenCalledTimes(2)
     expect(transitionPhases()).toContain('EXECUTING')
-    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+    expect(mockRunOpenCodeCoreV2).toHaveBeenCalledOnce()
     expect(occurrences(finalAnswer(run.request), DEFAULT_BACKUP_ID)).toBe(1)
   })
 
@@ -704,7 +704,7 @@ describe('checkout preparation: automatic recovery of a dirty checkout', () => {
     // #then
     expect(recover).toHaveBeenCalledOnce()
     expect(update).toHaveBeenCalledTimes(2)
-    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+    expect(mockRunOpenCodeCoreV2).toHaveBeenCalledOnce()
   })
 
   it('runs the whole recovery while the repo lock is still held', async () => {
@@ -760,7 +760,7 @@ describe('checkout preparation: automatic recovery is gated', () => {
     expect(reply.content).toContain(DIRTY_CLAUSE)
     expect(reply.content.endsWith(RECOVER_SUFFIX)).toBe(true)
     expect(reply.components).toHaveLength(1)
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
   })
 
   it.each(['busy', 'unknown'] as const)("keeps today's refusal when quiescence is %s", async quiescence => {
@@ -874,7 +874,7 @@ describe('checkout preparation: a recover refusal that moved nothing', () => {
       reason: 'dirty',
       changedPaths: ['a.txt'],
     })
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
   })
 
   it('insufficient-disk-space names the cause, with no RECOVER_SUFFIX and no button', async () => {
@@ -917,7 +917,7 @@ describe('checkout preparation: a recover refusal that moved nothing', () => {
     expect(reply.content.endsWith(RECOVER_SUFFIX)).toBe(true)
     expect(reply.content).not.toContain('backup')
     expect(reply.components).toHaveLength(1)
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
   })
 })
 
@@ -957,7 +957,7 @@ describe('checkout preparation: a recover outcome where something may have moved
       expect(occurrences(reply.content, RECOVERY_ATTEMPTED_NOTE)).toBe(1)
       expect(reply.content).not.toContain(DEFAULT_BACKUP_ID)
       expect(reply.components).toHaveLength(1)
-      expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+      expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
     },
   )
 
@@ -973,7 +973,7 @@ describe('checkout preparation: a recover outcome where something may have moved
       // #then
       expect(run.update).toHaveBeenCalledTimes(2)
       expect(transitionPhases()).toContain('EXECUTING')
-      expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+      expect(mockRunOpenCodeCoreV2).toHaveBeenCalledOnce()
       const answer = finalAnswer(run.request)
       expect(answer).toContain('/fro-bot checkout-backup list')
       expect(occurrences(answer, 'checkout-backup list')).toBe(1)
@@ -1018,7 +1018,7 @@ describe('checkout preparation: the follow-up update after a successful recovery
     // the button still rides on the refusal text
     expect(reply.content.endsWith(RECOVER_SUFFIX)).toBe(true)
     expect(reply.components).toHaveLength(1)
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
     const failedCall = mockRuntime.transitionRun.mock.calls.find((c: unknown[]) => c[4] === 'FAILED')
     const detailsOptions = failedCall?.[7] as {detailsPatch?: {checkoutPreparation?: unknown}}
     expect(detailsOptions?.detailsPatch?.checkoutPreparation).toEqual({
@@ -1084,7 +1084,7 @@ describe('checkout preparation: the follow-up update after a successful recovery
     expect(resolveToFailure).toHaveBeenCalledOnce()
     expect(occurrences(resolveToFailure.mock.calls[0]?.[0] as string, DEFAULT_BACKUP_ID)).toBe(1)
     expect(run.recover).toHaveBeenCalledOnce()
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
   })
 })
 
@@ -1122,7 +1122,7 @@ describe('checkout preparation: operator cancel during preparation (deferred, pi
     expect(cancelOutcome).toBe(false)
     // ... and the run is not cancelled: it continues to EXECUTING
     expect(transitionPhases()).toContain('EXECUTING')
-    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+    expect(mockRunOpenCodeCoreV2).toHaveBeenCalledOnce()
     expect(abortRegistry.isAborted(run.runId)).toBe(false)
   })
 })
@@ -1139,8 +1139,8 @@ describe('checkout preparation: the session directory after a recovery', () => {
     // #then the checkout is replaced IN PLACE at the canonical path, so the session directory is
     // unchanged by a recovery and quiescence was queried for that same repo
     expect(run.checkRepoQuiescence.mock.calls[0]?.[0]).toMatchObject({repo: `${OWNER}/${REPO}`})
-    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
-    const coreArgs = mockRunOpenCodeCore.mock.calls[0]?.[0] as {directory?: string} | undefined
+    expect(mockRunOpenCodeCoreV2).toHaveBeenCalledOnce()
+    const coreArgs = mockRunOpenCodeCoreV2.mock.calls[0]?.[0] as {directory?: string} | undefined
     expect(coreArgs?.directory).toBe(`/workspace/repos/${OWNER}/${REPO}`)
   })
 })
@@ -1234,7 +1234,7 @@ describe('checkout preparation: an ambiguous recovery whose backup the lookup fi
     expect(occurrences(answer, BACKUP_ID)).toBe(1)
     expect(answer).not.toContain('gen-someone-else')
     expect(answer).not.toContain(RECOVERY_ATTEMPTED_NOTE)
-    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+    expect(mockRunOpenCodeCoreV2).toHaveBeenCalledOnce()
   })
 
   it('names the id on a refusal from the second update, and keeps the Recover button', async () => {
@@ -1287,7 +1287,7 @@ describe('checkout preparation: an ambiguous recovery whose backup the lookup fi
 
     // #then
     expect(occurrences(failureText(run), BACKUP_ID)).toBe(1)
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
   })
 
   it('names the id when the follow-up update is checkout-substituted', async () => {
@@ -1371,7 +1371,7 @@ describe('checkout preparation: an ambiguous recovery whose backup is not found 
       const answer = finalAnswer(run.request)
       expect(occurrences(answer, RECOVERY_ATTEMPTED_NOTE)).toBe(1)
       expect(answer).not.toContain(BACKUP_ID)
-      expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+      expect(mockRunOpenCodeCoreV2).toHaveBeenCalledOnce()
     },
   )
 
@@ -1456,7 +1456,7 @@ describe('checkout preparation: a recovered checkout that the follow-up update r
     const text = failureText(run)
     expect(occurrences(text, DEFAULT_BACKUP_ID)).toBe(1)
     expect(text).toContain(`${OWNER}/${REPO}`)
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
   })
 
   it('a substituted checkout with no recovery involved carries no recovery note', async () => {
@@ -1667,7 +1667,7 @@ describe('checkout preparation: a follow-up update that rejects after a recovery
     const text = failureText(run)
     expect(occurrences(text, DEFAULT_BACKUP_ID)).toBe(1)
     expect(trailingNote(text)).not.toMatch(/install/i)
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
   })
 })
 
@@ -1703,7 +1703,7 @@ describe('checkout preparation: rollback-failed on the automatic path', () => {
       expect(reply.content).toBe(ROLLBACK_TEXT)
       expect(reply.content).not.toContain(RECOVER_SUFFIX)
       expect(reply.components).toBeUndefined()
-      expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+      expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
     },
   )
 
@@ -1723,7 +1723,7 @@ describe('checkout preparation: rollback-failed on the automatic path', () => {
 
     // #then
     expect(transitionPhases()).toContain('EXECUTING')
-    expect(mockRunOpenCodeCore).toHaveBeenCalledOnce()
+    expect(mockRunOpenCodeCoreV2).toHaveBeenCalledOnce()
     const answer = finalAnswer(run.request)
     expect(occurrences(answer, RECOVERY_ATTEMPTED_NOTE)).toBe(1)
     expect(answer).not.toContain(ROLLBACK_TEXT)
@@ -1805,7 +1805,7 @@ describe('checkout preparation: a stalled installation-token mint during recover
     expect(reply.content).not.toContain(RECOVERY_ATTEMPTED_NOTE)
     expect(reply.content).not.toContain(DEFAULT_BACKUP_ID)
     expect(reply.components).toHaveLength(1)
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
   })
 
   it('releases the repo lock exactly as any other refusal does', async () => {
@@ -1876,7 +1876,7 @@ describe('checkout preparation: a stalled installation-token mint before the fir
     expect(Date.now() - started).toBeLessThan(5_000)
     expect(workspaceUpdate).not.toHaveBeenCalled()
     expect(failureText(run)).toBe(expected)
-    expect(mockRunOpenCodeCore).not.toHaveBeenCalled()
+    expect(mockRunOpenCodeCoreV2).not.toHaveBeenCalled()
   })
 
   it('is not the state-unknown "update timed out" reply: no update request was ever sent', async () => {

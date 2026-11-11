@@ -1,11 +1,11 @@
 /**
- * Best-effort disposal of a stock OpenCode V2 server's cached location: the sibling of `opencode-instance.ts`.
+ * Best-effort disposal of a stock OpenCode V2 server's cached location.
  *
  * Probe P3 (v2.2.0): after a checkout is swapped in place, `fs/find` already returned the new tree within a few
  * milliseconds with no action at all, so neither refresh is required for correctness. Where a disposer is still
  * wired, this uses the narrower of the two that work: `DELETE /api/debug/location?location[directory]=<dir>` evicts
  * one location. `POST /api/location/reload` rebuilds every loaded location and cancels pending permissions and
- * forms, which is wider than a recovery should ever be. The V1 route (`/instance/dispose`) does not exist on V2.
+ * forms, which is wider than a recovery should ever be.
  *
  * The call goes straight to the loopback upstream, not through the :9200 proxy, and it must authenticate as the
  * server that is running now, so it reads the same credential holder the proxy reads. It is purely advisory (the

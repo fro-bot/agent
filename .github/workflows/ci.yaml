@@ -577,6 +577,9 @@ jobs:
           echo "OK: action harness entry not present in bundle"
       - name: Build workspace Docker image
         run: |
+          # No OPENCODE_VERSION build-arg, exactly like `docker compose build`: the image builds the version in
+          # packages/runtime/src/shared/opencode-v2-pin.json, so this build is also the default-pin build. The V2 smoke
+          # steps below read the same file to assert the built binary is that version.
           for attempt in 1 2 3; do
             if docker build -f deploy/workspace.Dockerfile -t fro-bot-workspace:smoke .; then
               exit 0
@@ -642,45 +645,16 @@ jobs:
             exit 1
           fi
           # Prove the opencode binary is on PATH and runs (musl compatibility).
-          # Also confirm the binary is the harness build (+harness.<sha>), not stock OpenCode.
           oc_version="$(docker exec "$cid" opencode --version)"
           echo "opencode --version: ${oc_version}"
-          if ! echo "${oc_version}" | grep -qF "+harness."; then
-            echo "REGRESSION: opencode --version output does not contain '+harness.' — workspace may be running stock OpenCode"
-            echo "Got: ${oc_version}"
-            exit 1
-          fi
-          echo "OK: harness build confirmed (${oc_version})"
           # Auth absent (no secret mounted) → fail-soft: boots, logs auth: absent.
           echo "$logs" | grep -q "auth: absent"
-          # No model/provider overlay → base config stands: Systematic plugin baked,
+          # No model/provider overlay → base config stands: updates disabled and
           # NO model field (deployer supplies it), and the overlay-absent log line.
           echo "$logs" | grep -q "provider-overlay=none"
-          docker exec "$cid" sh -c 'grep -q "@fro.bot/systematic" /home/opencode/.config/opencode/opencode.json'
+          docker exec "$cid" sh -c 'grep -q "\"update\": \"disable\"" /home/opencode/.config/opencode/opencode.json'
           docker exec "$cid" sh -c '! grep -q "\"model\"" /home/opencode/.config/opencode/opencode.json'
-          # The image bakes the file-watcher opt-out. Nothing else asserts it, and dropping
-          # the ENV costs performance with no other signal, so pin it here.
-          docker exec "$cid" sh -c '[ "$OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER" = "true" ]'
-          # The image bakes the background-subagents opt-in too -- same reasoning as the
-          # watcher assertion above: nothing else asserts it, so pin it here.
-          docker exec "$cid" sh -c '[ "$OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS" = "true" ]'
-          echo "OK: clone API up on :9100, opencode present, base config (no baked model), watcher disabled, background subagents enabled, auth fail-soft"
-      - name: Build workspace Docker image (OpenCode V2)
-        run: |
-          # The V2 leg of this job. The Dockerfile selects the stock V2 binary when OPENCODE_VERSION
-          # has major 2 or higher; the only valid value is the pin, so it is read from the pin file
-          # (never hard-coded here) and bumps in one place. Every stage before the OpenCode version
-          # is shared with the V1 build above and comes from this runner's layer cache.
-          v2_version="$(node -p 'JSON.parse(fs.readFileSync("packages/runtime/src/shared/opencode-v2-pin.json", "utf8")).version')"
-          echo "V2 pin: ${v2_version}"
-          for attempt in 1 2 3; do
-            if docker build --build-arg "OPENCODE_VERSION=${v2_version}" -f deploy/workspace.Dockerfile -t fro-bot-workspace:smoke-v2 .; then
-              exit 0
-            fi
-            echo "::warning::docker build (V2) attempt ${attempt} failed"
-            [ "${attempt}" -eq 3 ] && { echo "docker build (V2) failed after 3 attempts"; exit 1; }
-            sleep $((attempt * 15))
-          done
+          echo "OK: clone API up on :9100, opencode present, base config (no baked model), auth fail-soft"
       - name: Smoke-test workspace image (OpenCode V2 boots through its entrypoint, no network)
         run: |
           set -euo pipefail
@@ -700,19 +674,19 @@ jobs:
             -e XDG_DATA_HOME=/home/opencode/.local/share -e XDG_CACHE_HOME=/home/opencode/.cache \
             -e XDG_STATE_HOME=/home/opencode/.local/state \
             -v "$PWD/deploy/scripts/v2-image-smoke.mjs:/smoke.mjs:ro" \
-            --entrypoint node fro-bot-workspace:smoke-v2 /smoke.mjs \
+            --entrypoint node fro-bot-workspace:smoke /smoke.mjs \
             "@fro.bot/systematic@${systematic_version}" "@fro.bot/opencode-plugin@${plugin_version}"
 
           # 2. The real entrypoint, with the production security posture and no network. /readyz is 200
           #    only after the supervisor's plugin gate (systematic + fro-bot.opencode-plugin active) and
-          #    permission gate pass, and it echoes the version the gateway selects its V2 loop from.
+          #    permission gate pass, and it echoes the version the gateway admits runs on.
           #    Readiness needs no provider and no network: the plugins are installed at image build.
           cid="$(docker run -d --network none \
             -e WORKSPACE_OPENCODE_TOKEN=dummy-smoke-token \
             -e MITMPROXY_CA_WAIT_SECONDS=0 \
             -e NO_PROXY='*' \
             $WORKSPACE_DOCKER_SECURITY_FLAGS \
-            fro-bot-workspace:smoke-v2)"
+            fro-bot-workspace:smoke)"
           cleanup() { docker rm -f "$cid" >/dev/null 2>&1 || true; }
           trap cleanup EXIT
 
@@ -767,7 +741,7 @@ jobs:
           # skips, so every V2 model call went out with no key. The supervisor now provisions the root-only
           # credential blob into each spawn over loopback. This step proves it through the real entrypoint:
           # a no-network fake Anthropic-compatible provider runs INSIDE the container (loopback only) and answers
-          # 401 unless the request carries the provisioned dummy key in x-api-key, the header V1 sent.
+          # 401 unless the request carries the provisioned dummy key in x-api-key, the header the provider API expects.
           smoke_key='sk-ci-v2-smoke-dummy-not-real'
           fake_port=9701
           # The trap goes in before anything it cleans up exists, so a failed mktemp or `docker run` still removes the
@@ -798,7 +772,7 @@ jobs:
             $WORKSPACE_DOCKER_SECURITY_FLAGS \
             -v "${auth_dir}/auth.json:/run/workspace-agent/secrets/workspace_opencode_auth:ro" \
             -v "$PWD/deploy/scripts/fake-anthropic-provider.mjs:/fake-provider.mjs:ro" \
-            fro-bot-workspace:smoke-v2)"
+            fro-bot-workspace:smoke)"
 
           docker exec -d "${cid}" node /fake-provider.mjs "${fake_port}" "${smoke_key}"
           fake_up=false
@@ -890,7 +864,7 @@ jobs:
             -e WORKSPACE_OPENCODE_CONFIG="{\"provider\":{\"anthropic\":{\"options\":{\"baseURL\":\"http://127.0.0.1:${fake_port}/v1\"}}}}" \
             $WORKSPACE_DOCKER_SECURITY_FLAGS \
             -v "$PWD/deploy/scripts/fake-anthropic-provider.mjs:/fake-provider.mjs:ro" \
-            fro-bot-workspace:smoke-v2)"
+            fro-bot-workspace:smoke)"
           cleanup() {
             status=$?
             if [ "${status}" -ne 0 ]; then
@@ -942,13 +916,12 @@ jobs:
           echo "${hits}" | node -e 'if (JSON.parse(fs.readFileSync(0, "utf8")).requests.length !== 0) process.exit(1)' \
             || { echo "REGRESSION: a model request reached the provider with no credential provisioned"; exit 1; }
           echo "OK: no credential → the credential gate refused readiness and no model request was made"
-      - name: Smoke-test auth provisioning (valid blob → auth.json written 0600)
+      - name: Smoke-test auth provisioning (valid blob → validated, no auth.json written)
         run: |
           set -e
-          # NOTE: This proves the entrypoint VALIDATES and WRITES the credential
-          # file with correct perms — NOT that the credential authenticates or
-          # that a model-backed turn completes. A real provider turn needs live
-          # credentials and is covered by manual end-to-end mention-loop validation against a deployed workspace.
+          # NOTE: This proves the entrypoint VALIDATES the credential file and writes no copy under the agent
+          # home — NOT that the credential authenticates or that a model-backed turn completes. The supervisor
+          # provisions the key into each spawn; the provider credential step above proves it reaches a model request.
           printf '{"anthropic":{"type":"api","key":"sk-dummy-not-real"}}' > /tmp/auth.json
           cid="$(docker run -d \
             -e WORKSPACE_OPENCODE_TOKEN=dummy-smoke-token \
@@ -967,13 +940,13 @@ jobs:
           logs="$(docker logs "$cid" 2>&1)"
           echo "--- workspace logs ---"; echo "$logs"
           [ "$ok" = "true" ] || { echo "REGRESSION: /healthz down with auth provisioned"; exit 1; }
-          echo "$logs" | grep -q "auth: provisioned"
-          # auth.json written with 0600 perms; content must NOT appear in logs.
-          docker exec "$cid" sh -c 'test "$(stat -c %u:%a /home/opencode/.local/share/opencode/auth.json)" = "10001:600"'
+          echo "$logs" | grep -q "auth: present"
+          # No auth.json under the agent home; the secret must NOT appear in logs.
+          docker exec "$cid" sh -c '! test -e /home/opencode/.local/share/opencode/auth.json'
           if echo "$logs" | grep -q "sk-dummy-not-real"; then
             echo "REGRESSION: auth secret leaked into logs"; exit 1
           fi
-          echo "OK: valid auth blob → auth.json written 0600, auth: provisioned, no secret in logs"
+          echo "OK: valid auth blob → validated, auth: present, no auth.json written, no secret in logs"
       - name: Smoke-test auth validation (malformed blob → fail fast)
         run: |
           set -e
@@ -999,16 +972,15 @@ jobs:
           set -e
           # Mirrors the production deploy: a provider baseURL block + model string,
           # the same shape marcusrbrown/infra feeds the action for cliproxyapi.
-          # The overlay is deliberately HOSTILE — it also sets plugin:[] and
-          # autoupdate:true to prove the merger preserves the baked Systematic
-          # plugin and keeps the OpenCode version pin (autoupdate stays false).
+          # The overlay is deliberately HOSTILE — it also sets autoupdate:true to
+          # prove the merger keeps the update pin (autoupdate stays false).
           cid="$(docker run -d \
             -e WORKSPACE_OPENCODE_TOKEN=dummy-smoke-token \
             -e MITMPROXY_CA_WAIT_SECONDS=0 \
             -e NO_PROXY='*' \
             $WORKSPACE_DOCKER_SECURITY_FLAGS \
             -e WORKSPACE_OPENCODE_MODEL='anthropic/claude-sonnet-4-6' \
-            -e 'WORKSPACE_OPENCODE_CONFIG={"autoupdate":true,"plugin":[],"provider":{"anthropic":{"options":{"baseURL":"https://cliproxy.fro.bot/v1"}}}}' \
+            -e 'WORKSPACE_OPENCODE_CONFIG={"autoupdate":true,"provider":{"anthropic":{"options":{"baseURL":"https://cliproxy.fro.bot/v1"}}}}' \
             fro-bot-workspace:smoke)"
           cleanup() { docker rm -f "$cid" >/dev/null 2>&1 || true; }
           trap cleanup EXIT
@@ -1022,12 +994,12 @@ jobs:
           [ "$ok" = "true" ] || { echo "REGRESSION: /healthz down with config overlay"; exit 1; }
           echo "$logs" | grep -q "provider-overlay=merged-into-config-file"
           # Effective config carries the overlaid model + provider baseURL, AND the
-          # hostile overlay could NOT drop the plugin or re-enable autoupdate.
+          # hostile overlay could NOT re-enable autoupdate.
           docker exec "$cid" sh -c 'grep -q "\"model\": \"anthropic/claude-sonnet-4-6\"" /home/opencode/.config/opencode/opencode.json'
           docker exec "$cid" sh -c 'grep -q "cliproxy.fro.bot/v1" /home/opencode/.config/opencode/opencode.json'
-          docker exec "$cid" sh -c 'grep -q "@fro.bot/systematic" /home/opencode/.config/opencode/opencode.json'
+          docker exec "$cid" sh -c 'grep -q "\"update\": \"disable\"" /home/opencode/.config/opencode/opencode.json'
           docker exec "$cid" sh -c 'grep -q "\"autoupdate\": false" /home/opencode/.config/opencode/opencode.json'
-          echo "OK: overlay applied; Systematic plugin preserved + autoupdate stays pinned despite hostile overlay"
+          echo "OK: overlay applied; update stays disabled and autoupdate stays pinned despite hostile overlay"
       - name: Smoke-test config validation (malformed overlay → fail fast)
         run: |
           set -e
@@ -1068,12 +1040,12 @@ jobs:
           logs="$(docker logs "$cid" 2>&1)"
           echo "--- workspace logs ---"; echo "$logs"
           [ "$ok" = "true" ] || { echo "REGRESSION: /healthz down with combined auth+model+overlay"; exit 1; }
-          echo "$logs" | grep -q "auth: provisioned"
+          echo "$logs" | grep -q "auth: present"
           echo "$logs" | grep -q "provider-overlay=merged-into-config-file"
-          docker exec "$cid" sh -c 'test "$(stat -c %u:%a /home/opencode/.local/share/opencode/auth.json)" = "10001:600"'
+          docker exec "$cid" sh -c '! test -e /home/opencode/.local/share/opencode/auth.json'
           docker exec "$cid" sh -c 'grep -q "\"model\": \"anthropic/claude-sonnet-4-6\"" /home/opencode/.config/opencode/opencode.json'
           docker exec "$cid" sh -c 'grep -q "cliproxy.fro.bot/v1" /home/opencode/.config/opencode/opencode.json'
-          docker exec "$cid" sh -c 'grep -q "@fro.bot/systematic" /home/opencode/.config/opencode/opencode.json'
+          docker exec "$cid" sh -c 'grep -q "\"update\": \"disable\"" /home/opencode/.config/opencode/opencode.json'
           docker exec "$cid" sh -c 'grep -q "\"autoupdate\": false" /home/opencode/.config/opencode/opencode.json'
           echo "OK: combined auth + model + provider overlay — all assertions passed"
       - name: Smoke-test model-only overlay
@@ -1099,8 +1071,8 @@ jobs:
           echo "$logs" | grep -q "provider-overlay=none"
           docker exec "$cid" sh -c 'grep -q "\"model\": \"anthropic/claude-sonnet-4-6\"" /home/opencode/.config/opencode/opencode.json'
           docker exec "$cid" sh -c '! grep -q "\"provider\"" /home/opencode/.config/opencode/opencode.json'
-          docker exec "$cid" sh -c 'grep -q "@fro.bot/systematic" /home/opencode/.config/opencode/opencode.json'
-          echo "OK: model-only overlay — model present, no provider key, plugin preserved"
+          docker exec "$cid" sh -c 'grep -q "\"update\": \"disable\"" /home/opencode/.config/opencode/opencode.json'
+          echo "OK: model-only overlay — model present, no provider key, updates disabled"
       - name: Smoke-test empty auth file (whitespace → absent, clone-only boots)
         run: |
           set -e
@@ -1125,60 +1097,43 @@ jobs:
           echo "$logs" | grep -q "auth: absent"
           docker exec "$cid" sh -c '! test -f /home/opencode/.local/share/opencode/auth.json'
           echo "OK: whitespace auth file treated as absent — clone-only boots, no auth.json written"
-      - name: Check harness release tag URL (positive checksum path test)
+      - name: Version gate (the default builds the pin; a harness, V1, unpinned or non-V2 version aborts before any download)
         run: |
-          set -euo pipefail
-          # The workspace image's own default (deploy/workspace.Dockerfile) stays the V1 harness build until V1 is
-          # cut; the Action's DEFAULT_OPENCODE_VERSION is the stock V2 pin and no longer a harness build.
-          default_version="$(sed -n 's/^ARG OPENCODE_VERSION=//p' deploy/workspace.Dockerfile | head -n 1)"
-          case "${default_version}" in
-            *+harness.*) : ;;
-            *) echo "Dockerfile ARG OPENCODE_VERSION is not a harness version: ${default_version}" >&2; exit 1 ;;
-          esac
-          tag_version="${default_version//+harness./-harness.}"
-          sums_url="https://github.com/fro-bot/agent/releases/download/${tag_version}/SHA256SUMS"
-          http_status="$(curl --silent --show-error --location --retry 3 --retry-delay 2 \
-            --output /dev/null --write-out '%{http_code}' "${sums_url}")"
-          if [ "${http_status}" != "200" ]; then
-            echo "Expected ${sums_url} to return HTTP 200, got ${http_status}" >&2
-            exit 1
-          fi
-          echo "OK: ${sums_url} returned HTTP ${http_status}"
+          set -u
+          # The version-gate stage (deploy/workspace.Dockerfile) is the first step of every other stage. An unset
+          # OPENCODE_VERSION resolves to the pin; any explicit value must equal it. --no-cache prevents a false pass
+          # from layer reuse of a prior build.
+          pin_file=packages/runtime/src/shared/opencode-v2-pin.json
+          pin="$(node -p 'JSON.parse(fs.readFileSync("packages/runtime/src/shared/opencode-v2-pin.json", "utf8")).version')"
 
-      - name: Checksum fail-closed negative test (bogus version → build must abort)
-        run: |
-          # Negative test: prove the Dockerfile's SHA256SUMS verification is fail-closed.
-          # Use a version that passes the <base>+harness.<sha> format guard but has
-          # no corresponding release — the asset download or SHA256SUMS fetch will
-          # 404/fail, and the build must exit non-zero.
-          #
-          # --no-cache: prevents a false-pass via layer cache reuse from a prior build.
-          # Secondary guard: capture stderr and assert the failure is specifically the
-          # download/checksum path (curl 404, SHA256SUMS missing entry, or hash mismatch),
-          # not an unrelated stage-1 failure (e.g. network/apk). A stage-1 failure would
-          # still satisfy the primary assertion but would not prove fail-closed behaviour.
-          bogus_version="1.17.3+harness.deadbeef"
-          build_args=(
-            --no-cache
-            --build-arg "OPENCODE_VERSION=${bogus_version}"
-            -f deploy/workspace.Dockerfile
-            -t fro-bot-workspace:bogus-checksum-test
-            .
-          )
-          build_output="$(docker build "${build_args[@]}" 2>&1)" && {
-            echo "REGRESSION: docker build succeeded with bogus version '${bogus_version}' — SHA256SUMS fail-closed check is broken"
-            exit 1
-          }
-          echo "--- docker build output (expected failure) ---"
-          echo "${build_output}"
-          # Secondary guard: confirm the failure is in the download/checksum path.
-          # Acceptable signals: curl exit/error, URL 404, or Dockerfile error strings.
-          if echo "${build_output}" | grep -qiE \
-            'curl|SHA256SUMS does not contain|does not match expected|404'; then
-            echo "OK: docker build correctly aborted for bogus version '${bogus_version}' — failure is in the download/checksum path (fail-closed verified)"
-          else
-            echo "::warning::Checksum negative test: docker build failed for bogus version '${bogus_version}' but the failure signal is NOT in the expected download/checksum path (curl/SHA256SUMS/hash-mismatch). Fail-closed still holds — the build aborted — but the failure may be a stage-1 (network/apk) issue rather than the checksum path. Investigate if this recurs. Build output is printed above."
-          fi
+          # Positive: the gate stage alone, so this costs seconds and downloads nothing. It prints the resolved version.
+          # The full no-arg build is the "Build workspace Docker image" step above, so it is not repeated here.
+          for build_arg in '' "OPENCODE_VERSION=${pin}"; do
+            args=(--no-cache --progress=plain --target version-gate -f deploy/workspace.Dockerfile -t fro-bot-workspace:version-gate-test .)
+            if [ -n "${build_arg}" ]; then args=(--build-arg "${build_arg}" "${args[@]}"); fi
+            gate_output="$(docker build "${args[@]}" 2>&1)" || { echo "${gate_output}"; echo "REGRESSION: the gate refused '${build_arg}'"; exit 1; }
+            echo "${gate_output}" | grep -qF "OpenCode V2 version: ${pin}" || { echo "${gate_output}"; echo "REGRESSION: the gate did not resolve ${pin} for '${build_arg}'"; exit 1; }
+            echo "OK: gate resolved ${pin} for '${build_arg}'"
+          done
+
+          # Negative: the full build, so the failure must come from the gate and nothing downstream may run.
+          for bad_version in '1.19.5+harness.bf7f7dfe' '1.19.4' 'latest' '2.0.0'; do
+            build_output="$(docker build --no-cache --build-arg "OPENCODE_VERSION=${bad_version}" -f deploy/workspace.Dockerfile -t fro-bot-workspace:version-gate-test . 2>&1)" && {
+              echo "REGRESSION: docker build succeeded with OPENCODE_VERSION='${bad_version}'"
+              exit 1
+            }
+            echo "--- docker build output for OPENCODE_VERSION='${bad_version}' (expected failure) ---"
+            echo "${build_output}"
+            echo "${build_output}" | grep -qF "${pin_file}" || { echo "REGRESSION: the failure does not name ${pin_file}"; exit 1; }
+            if [ "${bad_version}" = "2.0.0" ]; then
+              echo "${build_output}" | grep -qF "is not the pinned V2 version ${pin}" || { echo "REGRESSION: 2.0.0 was not refused as a pin mismatch"; exit 1; }
+            fi
+            if echo "${build_output}" | grep -qE 'curl -fsSL|apk add|SHA256 mismatch'; then
+              echo "REGRESSION: a download step ran before the version gate refused '${bad_version}'"
+              exit 1
+            fi
+            echo "OK: OPENCODE_VERSION='${bad_version}' refused at the version gate"
+          done
 
       - name: Live egress containment smoke
         timeout-minutes: 8
