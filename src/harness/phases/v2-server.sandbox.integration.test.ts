@@ -199,7 +199,12 @@ function writeKeyFile(keyDir: string): string {
 }
 
 async function preflightTools(logger: Logger): Promise<SandboxToolPaths> {
-  const preflight = await runSandboxPreflight({...createSandboxPreflightDeps(createExecAdapter(), logger)})
+  // This suite runs from the checkout, which the action-location gate refuses for a real run. The gate has its own unit
+  // tests; here the install is declared to be a published location so the rest of the preflight is exercised for real.
+  const preflight = await runSandboxPreflight({
+    ...createSandboxPreflightDeps(createExecAdapter(), logger),
+    actionPaths: ['/opt/fro-bot-published-action/dist', '/opt/fro-bot-published-action'],
+  })
   if (!preflight.ok) throw new Error(preflight.message)
   return preflight.tools
 }

@@ -109,7 +109,9 @@ inputs:
       (default false). GitHub-hosted Linux runners only, with passwordless sudo; the run fails before setup on any
       other runner. This stops the agent from reading the Action's process environment (which holds the workflow
       token), the workflow command files and the runner's private directories. The provider key and the server
-      password stay readable by the agent. See the README for the full list of what is and is not blocked.
+      password stay readable by the agent. Requires a published `fro-bot/agent@<ref>`; a local `uses: ./` install is
+      refused because the Action's own files would be writable by the agent. See the README for the full list of what
+      is and is not blocked.
     required: false
     default: 'false'
   opencode-config:

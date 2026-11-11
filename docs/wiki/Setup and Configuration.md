@@ -234,6 +234,8 @@ Set `isolate-agent: true` (default `false`) and the Action runs the OpenCode ser
 
 The checkout must not carry persisted credentials: `actions/checkout` must run with `persist-credentials: false`, because the agent user can read `.git/config`. The Action checks this on every trigger when the input is on and fails the run before setup if it finds one.
 
+The Action itself must be installed outside every path the agent can write: use a published `fro-bot/agent@<ref>`, which GitHub installs under the runner's `_actions` directory. A local `uses: ./` install is unsupported with isolation, because `dist/post.js` and `action.yaml` would sit inside the checkout, the agent could rewrite them, and the runner would then run them as itself in the post step. The preflight refuses any install location that is inside, equal to, or the parent of a writable path (the checkout, the OpenCode data, config, cache and state directories, or the runner temp tree), after resolving symlinks, and tells the caller to use a published ref.
+
 Requirements: a GitHub-hosted Linux runner, not running as root or in a container job, passwordless `sudo`, `setpriv`/`setfacl`/`useradd`/`userdel`/`pkill`/`pgrep`/`find` present, and `fs.protected_hardlinks`/`fs.protected_symlinks` on. Any miss fails the run before setup with the failed check named. Self-hosted runners are unsupported even if they report a hosted environment, and so are two isolated steps in one job at the same time.
 
 Blocked from the agent's shell: the Action's `/proc/<pid>/environ` and its ancestors' (which hold `INPUT_GITHUB-TOKEN`), `$GITHUB_ENV` and `$GITHUB_OUTPUT`, private directories under `RUNNER_TEMP`, the runner's home (default-deny, with only the granted paths opened), `sudo` and the Docker socket.

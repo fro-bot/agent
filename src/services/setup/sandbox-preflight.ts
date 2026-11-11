@@ -1,7 +1,9 @@
 import type {Logger} from '../../shared/logger.js'
 import type {ExecAdapter} from './types.js'
 import * as fs from 'node:fs/promises'
+import * as path from 'node:path'
 import process from 'node:process'
+import {fileURLToPath} from 'node:url'
 
 /**
  * Fail-closed capability check for `isolate-agent: true`.
@@ -34,7 +36,14 @@ export type SandboxToolName = (typeof SANDBOX_TOOL_NAMES)[number]
 export type SandboxToolPaths = Readonly<Record<SandboxToolName, string>>
 
 export type SandboxPreflightCheck =
-  'runner-environment' | 'platform' | 'root-user' | 'container-job' | 'sudo' | 'tool' | 'protected-links'
+  | 'runner-environment'
+  | 'platform'
+  | 'root-user'
+  | 'container-job'
+  | 'action-location'
+  | 'sudo'
+  | 'tool'
+  | 'protected-links'
 
 export type SandboxPreflightResult =
   | {readonly ok: true; readonly tools: SandboxToolPaths}
@@ -50,6 +59,14 @@ export interface SandboxPreflightDeps {
   readonly isExecutable: (absolutePath: string) => Promise<boolean>
   readonly pathExists: (absolutePath: string) => Promise<boolean>
   readonly readText: (absolutePath: string) => Promise<string | null>
+  /**
+   * Where the running Action is installed: `GITHUB_ACTION_PATH` when the runner sets it, plus the directory of the
+   * running bundle and its parent. Empty when it cannot be determined, which fails the check.
+   */
+  readonly actionPaths: readonly string[]
+  readonly realpath: (absolutePath: string) => Promise<string>
+  /** The working directory, the workspace when `GITHUB_WORKSPACE` is unset (the same fallback bootstrap uses). */
+  readonly cwd: string
   readonly logger: Logger
 }
 
@@ -93,6 +110,9 @@ export async function runSandboxPreflight(deps: SandboxPreflightDeps): Promise<S
     }
   }
 
+  const location = await checkActionLocation(deps)
+  if (location !== null) return location
+
   const tools = await resolveTools(deps)
   if (!tools.ok) return tools.result
 
@@ -113,6 +133,67 @@ export async function runSandboxPreflight(deps: SandboxPreflightDeps): Promise<S
 
   deps.logger.debug('Sandbox preflight passed', {tools: tools.paths})
   return {ok: true, tools: tools.paths}
+}
+
+function isInsideOrEqual(parent: string, child: string): boolean {
+  const relative = path.relative(parent, child)
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
+}
+
+/**
+ * The directories the sandbox user can write once handoff has run: the checkout, the four OpenCode XDG dirs, and the
+ * runner temp tree (response, credential, gh-config and attachment dirs all live under it). A superset is fine: this only
+ * decides whether the Action's own files are exposed.
+ */
+export function sandboxWritableRoots(env: NodeJS.ProcessEnv, cwd: string): readonly string[] {
+  const home = env.HOME ?? ''
+  const xdg = (name: string, fallback: string): string => {
+    const value = env[name]
+    return value !== undefined && value.length > 0 && path.isAbsolute(value) ? value : path.join(home, fallback)
+  }
+  const roots = [
+    env.GITHUB_WORKSPACE !== undefined && env.GITHUB_WORKSPACE.length > 0 ? env.GITHUB_WORKSPACE : cwd,
+    path.join(xdg('XDG_DATA_HOME', '.local/share'), 'opencode'),
+    path.join(xdg('XDG_CONFIG_HOME', '.config'), 'opencode'),
+    path.join(xdg('XDG_CACHE_HOME', '.cache'), 'opencode'),
+    path.join(xdg('XDG_STATE_HOME', '.local/state'), 'opencode'),
+  ]
+  if (env.RUNNER_TEMP !== undefined && env.RUNNER_TEMP.length > 0) roots.push(env.RUNNER_TEMP)
+  return roots.map(root => path.resolve(root))
+}
+
+/**
+ * The Action's own files (`dist/post.js`, `action.yaml`) run later as the runner. If the sandbox can write the place they
+ * live, it can plant code that runs with the runner's privileges. `uses: ./` installs the Action inside the checkout, so
+ * it is refused; a published `fro-bot/agent@<ref>` lives under `_actions`, outside every writable root.
+ */
+async function checkActionLocation(deps: SandboxPreflightDeps): Promise<SandboxPreflightResult | null> {
+  const advice =
+    'use a published `fro-bot/agent@<ref>` instead of a local `uses: ./` install, so the Action is not stored where the agent user can write'
+  const candidates = [...deps.actionPaths]
+  const reported = deps.env.GITHUB_ACTION_PATH
+  if (reported !== undefined && reported.length > 0) candidates.push(reported)
+  if (candidates.length === 0) {
+    return fail('action-location', `the Action's install location could not be determined; ${advice}`)
+  }
+  const roots = sandboxWritableRoots(deps.env, deps.cwd)
+  for (const candidate of candidates) {
+    let resolved: string
+    try {
+      resolved = await deps.realpath(path.resolve(candidate))
+    } catch {
+      resolved = path.resolve(candidate)
+    }
+    for (const root of roots) {
+      if (isInsideOrEqual(root, resolved) || isInsideOrEqual(resolved, root)) {
+        return fail(
+          'action-location',
+          `the Action is installed at ${resolved}, which overlaps the writable path ${root}; ${advice}`,
+        )
+      }
+    }
+  }
+  return null
 }
 
 async function resolveTools(
@@ -143,7 +224,17 @@ export function createSandboxPreflightDeps(
   logger: Logger,
 ): Pick<
   SandboxPreflightDeps,
-  'exec' | 'env' | 'platform' | 'uid' | 'isExecutable' | 'pathExists' | 'readText' | 'logger'
+  | 'exec'
+  | 'env'
+  | 'platform'
+  | 'uid'
+  | 'isExecutable'
+  | 'pathExists'
+  | 'readText'
+  | 'actionPaths'
+  | 'realpath'
+  | 'cwd'
+  | 'logger'
 > {
   return {
     exec,
@@ -175,6 +266,19 @@ export function createSandboxPreflightDeps(
         return null
       }
     },
+    actionPaths: bundleInstallPaths(),
+    realpath: async absolutePath => fs.realpath(absolutePath),
+    cwd: process.cwd(),
     logger,
+  }
+}
+
+/** The running bundle's directory and its parent (`dist/` and the Action root). Empty if the location is not a file URL. */
+function bundleInstallPaths(): readonly string[] {
+  try {
+    const bundleDir = path.dirname(fileURLToPath(import.meta.url))
+    return [bundleDir, path.dirname(bundleDir)]
+  } catch {
+    return []
   }
 }

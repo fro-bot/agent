@@ -367,6 +367,7 @@ The workspace-agent **service** (`apps/workspace-agent/src/main.ts`) stays root 
 
 With `isolate-agent`, the Action creates a per-run local user, hands it only the paths the agent needs, and launches the OpenCode server as that user (`packages/runtime/src/agent/sandbox-identity.ts`, `src/harness/phases/sandbox-lifecycle.ts`, `src/services/setup/sandbox-handoff.ts`, preflight in `src/services/setup/sandbox-preflight.ts`). The agent can no longer read the Action's process environment or the runner's private files.
 
+- The preflight refuses an Action install that overlaps a writable path (a local `uses: ./` lives in the checkout); isolation needs a published `fro-bot/agent@<ref>`.
 - The order is fixed: handoff after the held-claim clear and before the spawn; on exit, shut down the server, kill and verify every sandbox process, take files back, then read, publish and persist.
 - An unconfirmed stop or unsafe take-back fails the run and declines publication and persistence; the post hook never retries a save for an isolated run.
 - Runner-side git runs through `src/features/delegated/trusted-git.ts` against metadata restored from a pre-agent copy; reads of sandbox-writable paths refuse symlinks and special files (`packages/runtime/src/shared/safe-read.ts`).
