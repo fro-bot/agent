@@ -1033,13 +1033,21 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
     xdg: {data: '/d', config: '/c', cache: '/k', state: '/s'},
   } as const
 
+  interface LaunchLog {
+    readonly reports: {readonly value: unknown; readonly unconfirmed: boolean}[]
+    readonly signals: AbortSignal[]
+  }
+
   function fakeSandbox(
     prepare?: SandboxLifecycle['prepare'],
-    isActive: () => boolean = () => true,
+    refuseLaunch?: string,
   ): {
     readonly sandbox: SandboxLifecycle
     readonly prepare: ReturnType<typeof vi.fn>
     readonly release: ReturnType<typeof vi.fn>
+    readonly launch: ReturnType<typeof vi.fn>
+    readonly log: LaunchLog
+    readonly abort: () => void
   } {
     const prepareMock = vi.fn(
       prepare ??
@@ -1052,10 +1060,22 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
       order.push('release')
       return {stop: 'stopped' as const, restore: 'restored' as const}
     })
+    const controller = new AbortController()
+    const log: LaunchLog = {reports: [], signals: []}
+    const launch = vi.fn(async (spawn: Parameters<SandboxLifecycle['launch']>[0]) => {
+      if (refuseLaunch !== undefined) return err(refuseLaunch)
+      log.signals.push(controller.signal)
+      const report = await spawn({spec: LAUNCH, signal: controller.signal})
+      log.reports.push(report)
+      return ok(report.value)
+    })
     return {
-      sandbox: {prepare: prepareMock, release, isActive},
+      sandbox: {prepare: prepareMock, release, launch} as unknown as SandboxLifecycle,
       prepare: prepareMock,
       release,
+      launch,
+      log,
+      abort: () => controller.abort(),
     }
   }
 
@@ -1271,52 +1291,85 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
     expect(sandbox.release).toHaveBeenCalledTimes(1)
   })
 
-  describe('a termination signal during the start', () => {
-    it('does not spawn the server when the signal arrived between prepare and spawn', async () => {
-      // #given the sandbox was prepared, then a signal began its teardown before the spawn
-      let active = true
+  describe('the sandbox launch', () => {
+    it('spawns through the lifecycle, handing the server the launch spec and the lifecycle abort signal', async () => {
+      // #given a prepared sandbox
       const server = fakeServer()
       const deps = depsFor(server)
-      const sandbox = fakeSandbox(
-        async () => {
-          const prepared = ok(LAUNCH)
-          active = false
-          return prepared
-        },
-        () => active,
-      )
+      const sandbox = fakeSandbox()
 
-      // #when the start continues
+      // #when the start runs
       const result = await run(sandbox.sandbox, deps)
 
-      // #then no process was started as the sandbox user, and the failure names the sandbox stage
+      // #then the spawn happened inside launch, with the spec, and its signal reaches the server start
+      expect(result.success).toBe(true)
+      expect(sandbox.launch).toHaveBeenCalledTimes(1)
+      const startOptions = vi.mocked(deps.startServer).mock.calls[0]?.[0]
+      expect(startOptions?.sandbox).toBe(LAUNCH)
+      expect(startOptions?.signal).toBe(sandbox.log.signals[0])
+      expect(sandbox.log.reports.map(report => report.unconfirmed)).toEqual([false])
+    })
+
+    it('never spawns when the lifecycle refuses the launch (the teardown has begun), and releases', async () => {
+      // #given a lifecycle that has closed admission
+      const server = fakeServer()
+      const deps = depsFor(server)
+      const sandbox = fakeSandbox(undefined, 'the teardown has begun')
+
+      // #when
+      const result = await run(sandbox.sandbox, deps)
+
+      // #then the start fails at the sandbox stage and no server was started
       expect(result.success).toBe(false)
       expect(!result.success && result.error.stage).toBe('sandbox')
       expect(deps.startServer).not.toHaveBeenCalled()
       expect(sandbox.release).toHaveBeenCalledTimes(1)
     })
 
-    it('stops a server that came up while the signal was tearing the sandbox down', async () => {
-      // #given the signal lands during the spawn
-      let active = true
+    it('aborts a start that is in flight when the lifecycle aborts, and fails the start', async () => {
+      // #given a server start that waits for its abort signal
       const server = fakeServer()
+      const sandbox = fakeSandbox()
       const deps = depsFor(server, {
         startServer: vi.fn<StartServer>(async spawnOptions => {
-          active = false
-          server.loadConfig(spawnOptions.config)
-          return {success: true, data: server.handle}
+          await new Promise<void>(resolve => spawnOptions.signal?.addEventListener('abort', () => resolve()))
+          return {success: false, error: {kind: 'aborted', message: 'cancelled', cleanup: 'graceful'}}
         }),
       })
-      const sandbox = fakeSandbox(undefined, () => active)
+
+      // #when the start is running and the lifecycle aborts (the signal's teardown)
+      const starting = run(sandbox.sandbox, deps)
+      await vi.waitFor(() => {
+        expect(deps.startServer).toHaveBeenCalled()
+      })
+      sandbox.abort()
+      const result = await starting
+
+      // #then
+      expect(result.success).toBe(false)
+      expect(sandbox.release).toHaveBeenCalled()
+    })
+
+    it.each([
+      ['unconfirmed', true],
+      ['graceful', false],
+      ['forced', false],
+    ] as const)('reports a failed start whose own cleanup was %s as unconfirmed=%s', async (cleanup, unconfirmed) => {
+      // #given a start that fails with that cleanup outcome
+      const server = fakeServer()
+      const sandbox = fakeSandbox()
+      const deps = depsFor(server, {
+        startServer: vi.fn<StartServer>(async () => ({
+          success: false,
+          error: {kind: 'spawn-failed', message: 'nope', cleanup},
+        })),
+      })
 
       // #when
-      const result = await run(sandbox.sandbox, deps)
+      await run(sandbox.sandbox, deps)
 
-      // #then the start fails, the fresh server is shut down and the sandbox is released
-      expect(result.success).toBe(false)
-      expect(!result.success && result.error.stage).toBe('sandbox')
-      expect(server.shutdown).toHaveBeenCalledTimes(1)
-      expect(sandbox.release).toHaveBeenCalled()
+      // #then the lifecycle was told, so its release cannot report a clean stop
+      expect(sandbox.log.reports.map(report => report.unconfirmed)).toEqual([unconfirmed])
     })
   })
 })

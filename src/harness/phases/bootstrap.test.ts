@@ -607,7 +607,7 @@ describe('runBootstrap isolate-agent preflight', () => {
 
   it('creates the sandbox lifecycle here, so the run owns it before the server starts, and records its state', async () => {
     // #given isolation on, a supported runner and a file-convention response path
-    const lifecycle = {prepare: vi.fn(), release: vi.fn(), isActive: vi.fn()}
+    const lifecycle = {prepare: vi.fn(), release: vi.fn(), launch: vi.fn()}
     mocks.createSandboxLifecycle.mockReturnValue(lifecycle)
     mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: true})})
     mocks.runSandboxPreflight.mockResolvedValue({ok: true, tools})

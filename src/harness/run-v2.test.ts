@@ -798,7 +798,7 @@ describe('run with isolate-agent', () => {
 
   function fakeSandbox(outcome: SandboxReleaseResult) {
     const release = vi.fn(async () => outcome)
-    return {sandbox: {prepare: vi.fn(), release, isActive: () => true} as unknown as SandboxLifecycle, release}
+    return {sandbox: {prepare: vi.fn(), launch: vi.fn(), release} as unknown as SandboxLifecycle, release}
   }
 
   const RESTORED: SandboxReleaseResult = {stop: 'stopped', restore: 'restored'}

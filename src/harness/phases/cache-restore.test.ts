@@ -387,7 +387,7 @@ describe('runCacheRestore database repair', () => {
     // #given an isolated run: the lifecycle was created by bootstrap
     mocks.restoreCache.mockResolvedValue(createCacheResult({hit: true, corrupted: false, source: 'cache'}))
     mocks.checkpointDatabase.mockResolvedValue({status: 'nothing-to-checkpoint'})
-    const sandbox = {prepare: vi.fn(), release: vi.fn(), isActive: vi.fn()} as unknown as SandboxLifecycle
+    const sandbox = {prepare: vi.fn(), release: vi.fn(), launch: vi.fn()} as unknown as SandboxLifecycle
     const {runCacheRestore} = await import('./cache-restore.js')
 
     // #when

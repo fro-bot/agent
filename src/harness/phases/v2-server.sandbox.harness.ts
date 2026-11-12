@@ -5,8 +5,9 @@ import type {Server} from 'node:http'
  * starts the server as the sandbox user and drives one turn. Nothing here is product code and nothing here runs outside
  * that suite.
  */
-import type {OpenCodeV2SandboxLaunch, OpenCodeV2ServerHandle} from '@fro-bot/runtime'
+import type {OpenCodeV2ServerHandle} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
+import type {SandboxLifecycle} from './sandbox-lifecycle.js'
 import {Buffer} from 'node:buffer'
 import http from 'node:http'
 import {DatabaseSync} from 'node:sqlite'
@@ -192,7 +193,7 @@ export interface ScriptedSessionOptions {
   readonly binary: string
   readonly workspace: string
   readonly env: NodeJS.ProcessEnv
-  readonly sandbox: OpenCodeV2SandboxLaunch
+  readonly lifecycle: SandboxLifecycle
   readonly keyFile: string
   readonly provider: ScriptedProvider
   readonly logger: Logger
@@ -205,32 +206,40 @@ export interface ScriptedSessionOptions {
  */
 export async function startScriptedSession(options: ScriptedSessionOptions): Promise<OpenCodeV2ServerHandle> {
   const {provider, workspace} = options
-  const started = await startOpenCodeV2Server(
-    {
-      binaryPath: options.binary,
-      directory: workspace,
-      expectedPluginIds: [],
-      env: options.env,
-      sandbox: options.sandbox,
-      config: {
-        share: 'disabled',
-        model: 'fake/fixture-model',
-        plugins: [],
-        provider: {
-          fake: {
-            npm: '@ai-sdk/openai-compatible',
-            name: 'Fake',
-            options: {baseURL: `http://127.0.0.1:${provider.port}/v1`, apiKey: `{file:${options.keyFile}}`},
-            models: {'fixture-model': {name: 'Fixture', tool_call: true, limit: {context: 100_000, output: 8000}}},
+  // Through the lifecycle's launch, as the Action does: the attempt is registered before port allocation, and a teardown
+  // that begins waits for it. Starting the server directly would bypass what the suite is meant to prove.
+  const launched = await options.lifecycle.launch(async context => {
+    const result = await startOpenCodeV2Server(
+      {
+        binaryPath: options.binary,
+        directory: workspace,
+        expectedPluginIds: [],
+        env: options.env,
+        sandbox: context.spec,
+        signal: context.signal,
+        config: {
+          share: 'disabled',
+          model: 'fake/fixture-model',
+          plugins: [],
+          provider: {
+            fake: {
+              npm: '@ai-sdk/openai-compatible',
+              name: 'Fake',
+              options: {baseURL: `http://127.0.0.1:${provider.port}/v1`, apiKey: `{file:${options.keyFile}}`},
+              models: {'fixture-model': {name: 'Fixture', tool_call: true, limit: {context: 100_000, output: 8000}}},
+            },
           },
+          // This suite tests the OS boundary, not OpenCode's permission layer.
+          permission: {bash: 'allow', edit: 'allow', external_directory: 'allow', question: 'deny'},
         },
-        // This suite tests the OS boundary, not OpenCode's permission layer.
-        permission: {bash: 'allow', edit: 'allow', external_directory: 'allow', question: 'deny'},
+        timeouts: {agentReadyTimeoutMs: 90_000},
       },
-      timeouts: {agentReadyTimeoutMs: 90_000},
-    },
-    options.logger,
-  )
+      options.logger,
+    )
+    return {value: result, unconfirmed: !result.success && result.error.cleanup === 'unconfirmed'}
+  })
+  if (!launched.success) throw new Error(`launch refused: ${launched.error}`)
+  const started = launched.data
   if (!started.success) throw new Error(`server start failed: ${started.error.message}`)
   const handle = started.data
 

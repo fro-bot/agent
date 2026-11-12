@@ -277,7 +277,6 @@ export async function startActionOpenCodeV2(
   //
   // After the last runner-side write to the restored database (the claim clear) and before the spawn. A failure here
   // has already rolled itself back inside `prepare`.
-  let sandboxLaunch: OpenCodeV2SandboxLaunch | undefined
   let childEnv = options.env
   if (options.sandbox != null) {
     const ghConfigDir = provisionedGhConfigDir(options.env)
@@ -293,34 +292,51 @@ export async function startActionOpenCodeV2(
           : {stagingRoot: options.repoSkills.stagingRoot, admittedDir: repoSkillsDirectory ?? null},
     })
     if (!prepared.success) return stageError('sandbox', `isolate-agent setup failed: ${prepared.error}`)
-    sandboxLaunch = prepared.data
     if (ghConfigDir !== null) childEnv = {...childEnv, GH_CONFIG_DIR: ghConfigDir}
   }
 
-  // A termination signal that arrived while the sandbox was being prepared has already begun its teardown. Starting the
-  // server now would run a process as the sandbox user after the teardown verified none was left.
-  if (options.sandbox != null && !options.sandbox.isActive()) {
-    await releaseSandboxAfterFailure(options.sandbox, logger)
-    return stageError('sandbox', 'isolate-agent setup was cancelled by a signal before the server started')
-  }
-
   // --- 5. Spawn (plugin gate inside) -------------------------------------------------------------------------
+  //
+  // With a sandbox the spawn goes through `sandbox.launch`, which records the attempt before port allocation begins and is
+  // refused once the teardown has begun. `release` waits for the attempt to settle (and aborts it) before it verifies the
+  // sandbox uid is empty, so a signal can no longer slip between this check and the privileged launch.
+  const spawnOptions = (extra: {readonly sandbox?: OpenCodeV2SandboxLaunch; readonly signal?: AbortSignal}) => ({
+    binaryPath: options.binaryPath,
+    directory: options.workspacePath,
+    expectedPluginIds: [SYSTEMATIC_V2_PLUGIN_ID, FRO_BOT_PLUGIN_ID],
+    config: built.data.content,
+    env: childEnv,
+    ...(extra.sandbox === undefined ? {} : {sandbox: extra.sandbox}),
+    ...(extra.signal === undefined ? {} : {signal: extra.signal}),
+    ...(options.maskSecret === undefined ? {} : {maskSecret: options.maskSecret}),
+    ...deps.startOptions,
+  })
+
   let started: Awaited<ReturnType<typeof deps.startServer>>
   try {
-    started = await deps.startServer(
-      {
-        binaryPath: options.binaryPath,
-        directory: options.workspacePath,
-        expectedPluginIds: [SYSTEMATIC_V2_PLUGIN_ID, FRO_BOT_PLUGIN_ID],
-        config: built.data.content,
-        env: childEnv,
-        ...(sandboxLaunch === undefined ? {} : {sandbox: sandboxLaunch}),
-        ...(options.signal === undefined ? {} : {signal: options.signal}),
-        ...(options.maskSecret === undefined ? {} : {maskSecret: options.maskSecret}),
-        ...deps.startOptions,
-      },
-      logger,
-    )
+    if (options.sandbox == null) {
+      started = await deps.startServer(
+        spawnOptions({...(options.signal === undefined ? {} : {signal: options.signal})}),
+        logger,
+      )
+    } else {
+      const launched = await options.sandbox.launch(async context => {
+        const result = await deps.startServer(
+          spawnOptions({
+            sandbox: context.spec,
+            signal: options.signal === undefined ? context.signal : AbortSignal.any([options.signal, context.signal]),
+          }),
+          logger,
+        )
+        // A start that failed and could not confirm its own child exited leaves the uid sweep untrustworthy.
+        return {value: result, unconfirmed: !result.success && result.error.cleanup === 'unconfirmed'}
+      })
+      if (!launched.success) {
+        await releaseSandboxAfterFailure(options.sandbox, logger)
+        return stageError('sandbox', `isolate-agent launch refused: ${launched.error}`)
+      }
+      started = launched.data
+    }
   } catch (error) {
     await releaseSandboxAfterFailure(options.sandbox, logger)
     throw error
@@ -356,10 +372,6 @@ export async function startActionOpenCodeV2(
   }
 
   const runGates = async (): Promise<Result<OpenCodeV2ServerHandle, V2StartError>> => {
-    // The same signal can land during the spawn itself; the server that came up is not covered by the teardown's check.
-    if (options.sandbox != null && !options.sandbox.isActive()) {
-      return failAfterSpawn('sandbox', 'isolate-agent was cancelled by a signal while the server was starting')
-    }
     // --- 6. Permission gate, then credential gate -------------------------------------------------------------
     const permissions = await verifyPermissionRules(
       {

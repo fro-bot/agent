@@ -246,7 +246,6 @@ describe('createSandboxLifecycle', () => {
     expect(order).toEqual(['stop', 'takeBack', 'delete'])
     expect(first).toEqual({stop: 'stopped', restore: 'restored'})
     expect(second).toBe(first)
-    expect(lifecycle.isActive()).toBe(false)
   })
 
   it('does not take back or delete when the stop cannot be confirmed', async () => {
@@ -296,6 +295,212 @@ describe('createSandboxLifecycle', () => {
     expect(outcome.restore).toBe('unsafe')
     expect(harness.mocks.takeBack).not.toHaveBeenCalled()
     expect(harness.mocks.deleteAccount).not.toHaveBeenCalled()
+  })
+
+  describe('launch: the lifecycle owns every process-producing operation', () => {
+    const prepareInput = {keyFilePaths: [], ghConfigDir: null, repoSkills: null}
+    const quietReport = <T>(value: T) => ({value, unconfirmed: false})
+
+    async function prepared(overrides: Partial<Parameters<typeof createSandboxLifecycle>[0]> = {}) {
+      const harness = createHarness()
+      const host = fakeHost()
+      const states: string[] = []
+      const lifecycle = create(harness, {signals: host, recordState: state => states.push(state), ...overrides})
+      expect((await lifecycle.prepare(prepareInput)).success).toBe(true)
+      return {harness, host, states, lifecycle}
+    }
+
+    it('hands the spawn the launch spec and returns its value', async () => {
+      // #given a prepared sandbox
+      const {lifecycle} = await prepared()
+
+      // #when a launch runs
+      const result = await lifecycle.launch(async context => quietReport(context.spec.account.name))
+
+      // #then
+      expect(result).toEqual(ok('fro-bot-sandbox'))
+    })
+
+    it('refuses a launch before prepare, and after release', async () => {
+      // #given a lifecycle that has not been prepared, and one that was released
+      const harness = createHarness()
+      const fresh = create(harness)
+      const done = await prepared()
+      await done.lifecycle.release()
+      const spawn = vi.fn(async () => quietReport('x'))
+
+      // #when
+      const early = await fresh.launch(spawn)
+      const late = await done.lifecycle.launch(spawn)
+
+      // #then neither ran the spawn
+      expect(early.success).toBe(false)
+      expect(late.success).toBe(false)
+      expect(spawn).not.toHaveBeenCalled()
+    })
+
+    it('closes admission synchronously when release is called, before anything is awaited', async () => {
+      // #given a prepared sandbox
+      const {lifecycle} = await prepared()
+      const spawn = vi.fn(async () => quietReport('x'))
+
+      // #when release starts and, in the same tick, a launch is attempted
+      const releasing = lifecycle.release()
+      const attempt = lifecycle.launch(spawn)
+
+      // #then the launch is refused although release has not yet awaited anything
+      expect((await attempt).success).toBe(false)
+      expect(spawn).not.toHaveBeenCalled()
+      await releasing
+    })
+
+    it('records the attempt before the spawn first awaits, so a release in that window waits for it', async () => {
+      // #given a spawn that suspends at its first await (like port allocation)
+      const {harness, lifecycle} = await prepared()
+      const port = deferred<void>()
+      let spawned = false
+      const attempt = lifecycle.launch(async () => {
+        await port.promise
+        spawned = true
+        return quietReport('server')
+      })
+
+      // #when release starts while the spawn is still waiting for its port
+      const releasing = lifecycle.release()
+      await Promise.resolve()
+      await Promise.resolve()
+
+      // #then nothing has been stopped, taken back or deleted yet
+      expect(harness.mocks.stop).not.toHaveBeenCalled()
+      expect(harness.mocks.takeBack).not.toHaveBeenCalled()
+      expect(harness.mocks.deleteAccount).not.toHaveBeenCalled()
+
+      // #when the spawn settles
+      port.resolve()
+      await attempt
+      await releasing
+
+      // #then the stop that follows comes after the launch finished, so it sees the process the launch created
+      expect(spawned).toBe(true)
+      const stopOrder = harness.mocks.stop.mock.invocationCallOrder[0] ?? 0
+      expect(stopOrder).toBeGreaterThan(0)
+    })
+
+    it('aborts the spawn through its signal when release begins', async () => {
+      // #given a spawn that waits for the abort
+      const {lifecycle} = await prepared()
+      const seen = deferred<boolean>()
+      const attempt = lifecycle.launch(async context => {
+        context.signal.addEventListener('abort', () => seen.resolve(true))
+        await seen.promise
+        return quietReport('aborted')
+      })
+
+      // #when release begins
+      const releasing = lifecycle.release()
+
+      // #then the spawn was told to stop, and release completed once it had
+      expect(await seen.promise).toBe(true)
+      await attempt
+      expect(await releasing).toEqual({stop: 'stopped', restore: 'restored'})
+    })
+
+    it('waits for a signal during port allocation, then stops, takes back and deletes in that order', async () => {
+      // #given a spawn that is still allocating its port
+      const {harness, host, lifecycle} = await prepared()
+      const port = deferred<void>()
+      const attempt = lifecycle.launch(async () => {
+        await port.promise
+        return quietReport('server')
+      })
+
+      // #when SIGTERM arrives
+      host.emitter.emit('SIGTERM')
+      await Promise.resolve()
+      expect(harness.mocks.stop).not.toHaveBeenCalled()
+      port.resolve()
+      await attempt
+
+      // #then the teardown ran after the launch settled, in order, and the signal was re-raised afterwards
+      await vi.waitFor(() => {
+        expect(host.killed).toEqual(['4242:SIGTERM'])
+      })
+      const order = [harness.mocks.stop, harness.mocks.takeBack, harness.mocks.deleteAccount].map(
+        mock => mock.mock.invocationCallOrder[0] ?? 0,
+      )
+      expect(order[0]).toBeGreaterThan(0)
+      expect(order).toEqual([...order].sort((x, y) => x - y))
+    })
+
+    it('waits for a signal during the privileged launch itself (the child exists, readiness is pending)', async () => {
+      // #given a spawn past port allocation and waiting for readiness
+      const {harness, host, lifecycle} = await prepared()
+      const ready = deferred<void>()
+      const attempt = lifecycle.launch(async context => {
+        context.signal.addEventListener('abort', () => ready.resolve())
+        await ready.promise
+        return quietReport('cleaned-up')
+      })
+
+      // #when SIGINT arrives
+      host.emitter.emit('SIGINT')
+      await attempt
+
+      // #then the abort let the launcher clean up first; only then was the account's uid verified empty and files taken back
+      await vi.waitFor(() => {
+        expect(host.killed).toEqual(['4242:SIGINT'])
+      })
+      expect(harness.mocks.stop).toHaveBeenCalledTimes(1)
+      expect(harness.mocks.takeBack).toHaveBeenCalledTimes(1)
+    })
+
+    it('reports unconfirmed when the launcher could not confirm its child is gone: no take-back, account kept, state unsafe', async () => {
+      // #given a launcher whose own cleanup was unconfirmed
+      const {harness, states, lifecycle} = await prepared()
+      await lifecycle.launch(async () => ({value: 'failed-start', unconfirmed: true}))
+
+      // #when released
+      const outcome = await lifecycle.release()
+
+      // #then
+      expect(outcome.stop).toBe('unconfirmed')
+      expect(outcome.restore).toBe('unsafe')
+      expect(harness.mocks.takeBack).not.toHaveBeenCalled()
+      expect(harness.mocks.deleteAccount).not.toHaveBeenCalled()
+      expect(states.at(-1)).toBe('unsafe')
+    })
+
+    it('treats a spawn that throws as unconfirmed and rethrows', async () => {
+      // #given a spawn that throws
+      const {harness, lifecycle} = await prepared()
+
+      // #when
+      await expect(
+        lifecycle.launch(async () => {
+          throw new Error('spawn blew up')
+        }),
+      ).rejects.toThrow('spawn blew up')
+
+      // #then what it may have started is unknown, so the release is unconfirmed
+      const outcome = await lifecycle.release()
+      expect(outcome.stop).toBe('unconfirmed')
+      expect(harness.mocks.takeBack).not.toHaveBeenCalled()
+    })
+
+    it('does not wait forever for a spawn that ignores the abort: unconfirmed after its settle budget', async () => {
+      // #given a spawn that never settles, and a small settle budget
+      const {harness, lifecycle} = await prepared({launchSettleBudgetMs: 20})
+      lifecycle.launch(async () => new Promise<never>(() => undefined)).catch(() => undefined)
+
+      // #when released
+      const outcome = await lifecycle.release()
+
+      // #then fail closed: no take-back, no account deletion
+      expect(outcome.stop).toBe('unconfirmed')
+      expect(outcome.restore).toBe('unsafe')
+      expect(harness.mocks.takeBack).not.toHaveBeenCalled()
+      expect(harness.mocks.deleteAccount).not.toHaveBeenCalled()
+    })
   })
 
   describe('teardown state', () => {
@@ -504,13 +709,14 @@ describe('createSandboxLifecycle', () => {
       const lifecycle = create(harness, {signals: host, recordState: state => states.push(state)})
       const prepared = await lifecycle.prepare({keyFilePaths: [], ghConfigDir: null, repoSkills: null})
       expect(prepared.success).toBe(true)
-      expect(lifecycle.isActive()).toBe(true)
 
       // #when SIGTERM arrives in the gap before the spawn
       host.emitter.emit('SIGTERM')
 
-      // #then a caller that is about to spawn sees it at once, before the teardown has even finished
-      expect(lifecycle.isActive()).toBe(false)
+      // #then a launch attempted at once is refused, before the teardown has even finished
+      const spawn = vi.fn(async () => ({value: 'x', unconfirmed: false}))
+      expect((await lifecycle.launch(spawn)).success).toBe(false)
+      expect(spawn).not.toHaveBeenCalled()
       await vi.waitFor(() => {
         expect(host.killed).toEqual(['4242:SIGTERM'])
       })

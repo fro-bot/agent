@@ -61,12 +61,37 @@ export interface SandboxReleaseResult {
   readonly reason?: string
 }
 
+/** What a launch is given: the launch spec for the sandbox user and a signal that aborts when the teardown begins. */
+export interface SandboxLaunchContext {
+  readonly spec: OpenCodeV2SandboxLaunch
+  readonly signal: AbortSignal
+}
+
+/**
+ * What a launch reports back. `unconfirmed` is true when the launcher could not confirm that the process it started (or
+ * tried to) is gone: the teardown then cannot trust a uid sweep and fails closed.
+ */
+export interface SandboxLaunchReport<T> {
+  readonly value: T
+  readonly unconfirmed: boolean
+}
+
 export interface SandboxLifecycle {
   readonly prepare: (input: SandboxPrepareInput) => Promise<Result<OpenCodeV2SandboxLaunch, string>>
+  /**
+   * Runs the one operation that creates a process as the sandbox user (port allocation, the privileged spawn, readiness).
+   * The attempt is recorded before `spawn` first awaits, and `release` waits for it to settle before it verifies the uid is
+   * empty and takes files back, so a launch that is still in flight can never create a process after the verification.
+   * Refused (`err`) before `prepare` has succeeded and once `release` has begun.
+   */
+  readonly launch: <T>(
+    spawn: (context: SandboxLaunchContext) => Promise<SandboxLaunchReport<T>>,
+  ) => Promise<Result<T, string>>
   readonly release: () => Promise<SandboxReleaseResult>
-  /** True once an account exists and until `release` has finished. */
-  readonly isActive: () => boolean
 }
+
+/** Longest `release` waits for an in-flight launch to settle after aborting it, before it fails closed as unconfirmed. */
+export const LAUNCH_SETTLE_BUDGET_MS = 30_000
 
 /** The slice of `process` the signal handling uses; injectable so the tests need no real signals. */
 export interface SignalHost {
@@ -107,6 +132,8 @@ export interface SandboxLifecycleOptions {
   /** Defaults to the real `process`. */
   readonly signals?: SignalHost
   readonly signalTeardownBudgetMs?: number
+  /** Overrides {@link LAUNCH_SETTLE_BUDGET_MS} (tests). */
+  readonly launchSettleBudgetMs?: number
   /** Called synchronously with each state change. Must not throw. */
   readonly recordState?: (state: SandboxRunState) => void
 }
@@ -157,6 +184,19 @@ export function createPrivilegedRun(exec: ExecAdapter, sudoPath: string): Privil
   }
 }
 
+/** Resolves true if `promise` settles within `ms`, false otherwise. Clears its timer either way. */
+async function settlesWithin(promise: Promise<unknown>, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timedOut = new Promise<false>(resolve => {
+    timer = setTimeout(() => resolve(false), ms)
+  })
+  try {
+    return await Promise.race([promise.then(() => true as const), timedOut])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
 function xdgBase(env: NodeJS.ProcessEnv, name: string, fallback: string, home: string): string {
   const value = env[name]
   return value !== undefined && value.length > 0 && path.isAbsolute(value) ? value : path.join(home, fallback)
@@ -173,12 +213,22 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   let manifest: HandoffManifest | null = null
   let journal: HandoffJournal | null = null
   let released: Promise<SandboxReleaseResult> | undefined
-  let active = false
   // The in-flight `prepare`. Teardown waits for it, so a signal can never read a half-built state (no account yet, or no
   // journal for a handoff still running) and cache a release it did not earn.
   let preparing: Promise<unknown> | undefined
   // A signal arrived: preparation stops at its next checkpoint and tears down what exists.
   let cancelled = false
+  // Admission to `launch`: closed synchronously by the first `release` (or signal), never reopened.
+  let admissionClosed = false
+  let launchSpec: OpenCodeV2SandboxLaunch | null = null
+  // Every launch attempt in flight, with the controller that aborts it.
+  const pendingLaunches = new Map<Promise<unknown>, AbortController>()
+  // Set when a launcher could not confirm its own cleanup (or threw): the uid sweep cannot be trusted.
+  let launchUnconfirmed = false
+  const closeAdmission = (): void => {
+    admissionClosed = true
+    for (const controller of pendingLaunches.values()) controller.abort()
+  }
   const record = (state: SandboxRunState): void => {
     try {
       options.recordState?.(state)
@@ -202,6 +252,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     if (signalled) return
     signalled = true
     cancelled = true
+    closeAdmission()
     logger.warning('Received a termination signal; stopping the sandbox before exiting', {signal})
     let timer: ReturnType<typeof setTimeout> | undefined
     const timedOut = new Promise<'timeout'>(resolve => {
@@ -245,6 +296,15 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   const doRelease = async (): Promise<SandboxReleaseResult> => {
     if (account === null) return {stop: 'never-started', restore: 'not-needed'}
     const stop = await deps.stop(account, tools, identityDeps())
+    if (launchUnconfirmed) {
+      // Best effort above; but the launcher itself could not say its child is gone, so nothing may be trusted: no take-back,
+      // and the account is kept (a live uid must not lose its account).
+      return {
+        stop: 'unconfirmed',
+        restore: 'unsafe',
+        reason: 'the process launch could not confirm its server was stopped; the sandbox output cannot be trusted',
+      }
+    }
     if (stop === 'unconfirmed') {
       // Nothing below may run: the sandbox could still be writing.
       return {
@@ -278,17 +338,57 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
         return result
       })
       .finally(() => {
-        active = false
         // A signal in flight removes them itself, after the teardown it is waiting on.
         if (!signalled) removeSignalHandlers()
       })
     return released
   }
 
-  /** Public teardown: lets an in-flight preparation reach a checkpoint first, so it runs on the real state. */
+  /**
+   * Public teardown. Admission closes synchronously, before anything is awaited. Then it waits for the in-flight preparation
+   * and launch to reach a stopping point (aborting the launch), so the stop and the take-back run on the real state.
+   */
   const release = async (): Promise<SandboxReleaseResult> => {
-    if (preparing !== undefined) await preparing.catch(() => undefined)
-    return releaseNow()
+    closeAdmission()
+    return (async () => {
+      if (preparing !== undefined) await preparing.catch(() => undefined)
+      if (pendingLaunches.size > 0) {
+        const settled = await settlesWithin(
+          Promise.allSettled([...pendingLaunches.keys()]),
+          options.launchSettleBudgetMs ?? LAUNCH_SETTLE_BUDGET_MS,
+        )
+        if (!settled) {
+          launchUnconfirmed = true
+          logger.error('A sandbox launch did not settle after it was aborted; the teardown fails closed')
+        }
+      }
+      return releaseNow()
+    })()
+  }
+
+  const launch: SandboxLifecycle['launch'] = async spawn => {
+    // Everything up to the registration below is synchronous: a release that starts after this call sees the attempt.
+    if (admissionClosed || cancelled || launchSpec === null || account === null) {
+      return err('the sandbox is not accepting a launch (not prepared, or the teardown has begun)')
+    }
+    const controller = new AbortController()
+    const report = (async (): Promise<Result<unknown, string>> => {
+      try {
+        const done = await spawn({spec: launchSpec, signal: controller.signal})
+        if (done.unconfirmed) launchUnconfirmed = true
+        return ok(done.value)
+      } catch (error) {
+        // Whether it started something before throwing is unknown.
+        launchUnconfirmed = true
+        throw error
+      }
+    })()
+    pendingLaunches.set(report, controller)
+    try {
+      return (await report) as Result<never, string>
+    } finally {
+      pendingLaunches.delete(report)
+    }
   }
 
   releaseRef = release
@@ -306,7 +406,6 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       const created = await deps.createAccount(tools, identityDeps())
       if (!created.success) return err(created.error.message)
       account = created.data
-      active = true
       if (cancelled) return await failAndRelease('isolate-agent setup was cancelled by a signal')
 
       const runnerTemp = env.RUNNER_TEMP
@@ -360,7 +459,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       await runAsSandbox([tools.mkdir, '-m', '0700', sandboxTmp])
       await writeSandboxGitConfig(options.workspacePath)
 
-      return ok({
+      const spec: OpenCodeV2SandboxLaunch = {
         sudoPath: tools.sudo,
         setprivPath: tools.setpriv,
         envPath: tools.env,
@@ -369,7 +468,9 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
         tmpdir: sandboxTmp,
         xdg: {data: dataBase, config: configBase, cache: cacheBase, state: stateBase},
         ...(input.ghConfigDir === null ? {} : {extraEnv: {GH_CONFIG_DIR: input.ghConfigDir}}),
-      })
+      }
+      launchSpec = spec
+      return ok(spec)
     } catch (error) {
       return failAndRelease(`Sandbox setup failed: ${toErrorMessage(error)}`)
     }
@@ -408,5 +509,5 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   }
 
   // False from the moment a signal begins the teardown (not when it ends), so a caller about to spawn the server sees it.
-  return {prepare, release, isActive: () => active && !cancelled}
+  return {prepare, launch, release}
 }
