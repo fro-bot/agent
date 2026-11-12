@@ -6,6 +6,7 @@ import * as path from 'node:path'
 import {err, ok} from '@bfra.me/es/result'
 import {describePrivilegedFailure, isWithin} from '@fro-bot/runtime'
 import {toErrorMessage} from '../../shared/errors.js'
+import {auditTrustedGitMetadata} from './git-snapshot-audit.js'
 
 /**
  * Handoff and take-back of the paths `isolate-agent` shares with the sandbox user (fro-bot/agent#2135).
@@ -501,6 +502,13 @@ async function snapshotGit(manifest: HandoffManifest, journal: HandoffJournal): 
   }
   const redirect = await commondirProblem(gitDir)
   if (redirect !== null) throw new HandoffError(redirect)
+  const untrusted = await auditTrustedGitMetadata({
+    gitDir,
+    workspace: manifest.workspace,
+    runnerHome: manifest.runnerHome,
+    writableRoots: [manifest.workspace, ...manifest.handedOver],
+  })
+  if (untrusted !== null) throw new HandoffError(`the git metadata cannot be trusted: ${untrusted}`)
   journal.gitPresent = true
   const present: Record<string, boolean> = {}
   for (const item of GIT_METADATA) {

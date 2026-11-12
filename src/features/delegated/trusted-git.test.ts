@@ -130,6 +130,13 @@ async function restoreThenRun(repo: Repo, hostile: () => void): Promise<void> {
   await runPostModelGit(repo)
 }
 
+/** A model-controlled file in the checkout that defines the clean filter `.gitattributes` selects. */
+function plantModelConfig(repo: Repo, name: string, file: string): void {
+  fs.writeFileSync(path.join(repo.repo, file), `[filter "x"]\n\tclean = ${repo.payload(name)}\n`)
+  fs.writeFileSync(path.join(repo.repo, '.gitattributes'), '* filter=x\n')
+  dirtyWorktree(repo.repo)
+}
+
 describe('post-model git against a hostile checkout', () => {
   let repo: Repo
 
@@ -206,6 +213,72 @@ describe('post-model git against a hostile checkout', () => {
       fs.appendFileSync(path.join(sub, 'g'), 'dirty\n')
       git(repo.repo, 'diff', '--ignore-submodules=none', '--raw', repo.anchor)
       expect(repo.ran('submodule')).toBe(true)
+    })
+  })
+
+  describe('trusting the pre-run metadata: include.path and a symlinked config', () => {
+    const deps = () => ({
+      run: fakeRun,
+      tools: {setfacl: '/s', getfacl: '/g', find: '/f', chown: '/c', chmod: '/m'},
+      logger: createMockLogger(),
+    })
+
+    it('positive control: a config that includes a checkout file runs its filter even through the hardened wrapper', async () => {
+      // #given the pre-run config includes ../model.config (relative to .git/, so a file in the checkout)
+      plantModelConfig(repo, 'include', 'model.config')
+      fs.appendFileSync(path.join(repo.repo, '.git', 'config'), '[include]\n\tpath = ../model.config\n')
+
+      // #when the Action's own post-model git calls run, with fsmonitor and hooks disabled as they always are
+      await runPostModelGit(repo)
+
+      // #then the payload still ran as the runner: restoring the config from a snapshot would restore this too
+      expect(repo.ran('include')).toBe(true)
+    })
+
+    it('handoff refuses that config, so the sandbox never starts and no payload runs', async () => {
+      // #given the same config
+      plantModelConfig(repo, 'include-guarded', 'model.config')
+      fs.appendFileSync(path.join(repo.repo, '.git', 'config'), '[include]\n\tpath = ../model.config\n')
+
+      // #when handed off
+      const handed = await handOff(manifestFor(repo), deps())
+
+      // #then
+      expect(!handed.success && handed.error).toContain('include.path')
+      expect(repo.ran('include-guarded')).toBe(false)
+    })
+
+    it("positive control: a .git/config symlinked into the checkout is the model's config, and runs its filter", async () => {
+      // #given a config that is a symlink to a checkout file defining the filter
+      plantModelConfig(repo, 'linked', 'linked.cfg')
+      const config = path.join(repo.repo, '.git', 'config')
+      fs.writeFileSync(
+        path.join(repo.repo, 'linked.cfg'),
+        `[core]\n\trepositoryformatversion = 0\n${fs.readFileSync(path.join(repo.repo, 'linked.cfg'), 'utf8')}`,
+      )
+      fs.rmSync(config)
+      fs.symlinkSync(path.join(repo.repo, 'linked.cfg'), config)
+
+      // #when
+      await runPostModelGit(repo)
+
+      // #then
+      expect(repo.ran('linked')).toBe(true)
+    })
+
+    it('handoff refuses the symlinked config', async () => {
+      // #given
+      plantModelConfig(repo, 'linked-guarded', 'linked.cfg')
+      const config = path.join(repo.repo, '.git', 'config')
+      fs.rmSync(config)
+      fs.symlinkSync(path.join(repo.repo, 'linked.cfg'), config)
+
+      // #when
+      const handed = await handOff(manifestFor(repo), deps())
+
+      // #then
+      expect(!handed.success && handed.error).toMatch(/config.*symlink/)
+      expect(repo.ran('linked-guarded')).toBe(false)
     })
   })
 

@@ -176,6 +176,126 @@ describe('sandbox handoff', () => {
     expect(mutating(fx.calls)).toEqual([])
   })
 
+  describe('the trusted git snapshot', () => {
+    const gitPath = (name: string): string => path.join(fx.manifest.workspace, '.git', name)
+    const writeConfig = (text: string): void => {
+      fs.writeFileSync(gitPath('config'), `[core]\n\trepositoryformatversion = 0\n${text}`)
+    }
+    const refused = async (): Promise<string> => {
+      const result = await handOff(fx.manifest, fx.deps)
+      expect(result.success).toBe(false)
+      // refused before any privileged mutation, and the rollback left nothing granted
+      expect(mutating(fx.calls).filter(call => !call.includes('-print'))).toEqual([])
+      return result.success ? '' : result.error
+    }
+
+    it('does not refuse a path that only appears in a comment, or a path outside every writable root', async () => {
+      // #given a comment naming the checkout, an include outside the roots, and a ~ include under the home but not a root
+      writeConfig(
+        `[core]\n\tfsmonitor = /usr/bin/true # ${fx.manifest.workspace}/not-this\n` +
+          `[include]\n\tpath = ~/.gitconfig-local\n[alias]\n\tlg = log --oneline\n`,
+      )
+
+      // #when / #then
+      expect((await handOff(fx.manifest, fx.deps)).success).toBe(true)
+    })
+
+    it('accepts an ordinary checkout config, including a safe.directory that names the checkout itself', async () => {
+      // #given what a hosted checkout leaves: a remote, a branch, an identity, a hooksPath of /dev/null, safe.directory
+      writeConfig(
+        `[remote "origin"]\n\turl = https://github.com/o/r\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n` +
+          `[branch "main"]\n\tremote = origin\n\tmerge = refs/heads/main\n[user]\n\tname = Fixture\n` +
+          `[core]\n\thooksPath = /dev/null\n[safe]\n\tdirectory = ${fx.manifest.workspace}\n` +
+          `[credential]\n\thelper = store\n[include]\n\tpath = /etc/gitconfig-extra\n`,
+      )
+
+      // #when / #then it is trusted as is (the positive control: the audit does not refuse a normal checkout)
+      expect((await handOff(fx.manifest, fx.deps)).success).toBe(true)
+    })
+
+    it.each([
+      [
+        'a relative include (resolves inside .git, in the checkout)',
+        '[include]\n\tpath = ../model.config\n',
+        /include\.path/,
+      ],
+      ['an absolute include inside the checkout', '[include]\n\tpath = WS/model.config\n', /include\.path/],
+      ['a conditional include inside the checkout', '[includeIf "gitdir:WS/"]\n\tpath = WS/m.config\n', /includeif/i],
+      ['core.attributesFile inside the checkout', '[core]\n\tattributesFile = WS/attrs\n', /attributesfile/i],
+      ['core.excludesFile inside the checkout', '[core]\n\texcludesFile = WS/ignore\n', /excludesfile/i],
+      ['core.hooksPath inside the checkout', '[core]\n\thooksPath = WS/hooks\n', /hookspath/i],
+      ['core.fsmonitor naming a script in the checkout', '[core]\n\tfsmonitor = WS/fsmon.sh\n', /fsmonitor/i],
+      ['a clean filter that runs ./script.sh', '[filter "x"]\n\tclean = ./clean.sh\n', /filter\.x\.clean/],
+      ['an alias that shells out to the checkout', '[alias]\n\tgo = !WS/go.sh\n', /alias\.go/],
+      ['a credential helper in the checkout', '[credential]\n\thelper = !WS/helper\n', /credential\.helper/],
+      ['a path in a handed-over directory', '[core]\n\tsshCommand = HANDED/ssh.sh\n', /sshcommand/i],
+      [
+        'a value continued over two lines, where neither half alone is inside the checkout',
+        '[core]\n\tfsmonitor = WSDIR/\\\nWSBASE/fsmon.sh\n',
+        /fsmonitor/i,
+      ],
+      ['a quoted value', '[core]\n\tfsmonitor = "WS/fsmon.sh"\n', /fsmonitor/i],
+      ['a # inside quotes (not a comment)', '[alias]\n\tgo = "!echo # WS/x"\n', /alias\.go/],
+      ['a ~ that expands into the checkout', '[include]\n\tpath = ~/work/agent/agent/m.config\n', /include\.path/],
+    ])('refuses a config with %s', async (_label, text, pattern) => {
+      // #given a trusted config that names a file the sandbox can write
+      const handed = fx.manifest.handedOver[0] ?? ''
+      const ws = fx.manifest.workspace
+      writeConfig(
+        text
+          .replaceAll('WSDIR', path.dirname(ws))
+          .replaceAll('WSBASE', path.basename(ws))
+          .replaceAll('WS', ws)
+          .replaceAll('HANDED', handed),
+      )
+
+      // #when / #then it is refused by key and root
+      const message = await refused()
+      expect(message).toMatch(pattern)
+      expect(message).toContain('writable')
+    })
+
+    it('also audits config.worktree', async () => {
+      // #given
+      fs.writeFileSync(gitPath('config.worktree'), `[core]\n\tfsmonitor = ${fx.manifest.workspace}/fsmon.sh\n`)
+
+      // #when / #then
+      expect(await refused()).toMatch(/fsmonitor/i)
+    })
+
+    it.each([
+      ['config', (target: string) => target],
+      ['config.worktree', (target: string) => target],
+    ])('refuses %s when it is a symlink, even to a harmless file', async (name, dest) => {
+      // #given a symlink where a regular file should be
+      const harmless = path.join(fx.root, 'harmless.cfg')
+      fs.writeFileSync(harmless, '[core]\n')
+      fs.rmSync(gitPath(name), {force: true})
+      fs.symlinkSync(dest(harmless), gitPath(name))
+
+      // #when / #then the snapshot would preserve the link verbatim, so it is refused by name
+      expect(await refused()).toMatch(new RegExp(`${name.replace('.', String.raw`\.`)}.*symlink`))
+    })
+
+    it('refuses a symlink nested in hooks/ or info/', async () => {
+      // #given
+      fs.symlinkSync('../../model-attributes', gitPath('info/attributes'))
+
+      // #when / #then
+      expect(await refused()).toMatch(/info\/attributes.*symlink/)
+    })
+
+    it('refuses a special file in the snapshot', async () => {
+      // #given a FIFO among the hooks (mkfifo)
+      const {spawnSync} = await import('node:child_process')
+      const made = spawnSync('mkfifo', [gitPath('hooks/fifo-hook')])
+      if (made.status !== 0) return
+
+      // #when / #then
+      expect(await refused()).toMatch(/hooks\/fifo-hook/)
+    })
+  })
+
   describe('the reserved _actions subtree', () => {
     const actions = (fxx: Fixture): string => path.join(path.dirname(fxx.manifest.runnerTemp), '_actions')
 
