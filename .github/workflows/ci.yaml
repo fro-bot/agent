@@ -159,33 +159,6 @@ jobs:
           tar -xzf "${RUNNER_TEMP}/${asset}" -C "${RUNNER_TEMP}/oc-extract"
           sudo install -m 0755 -D "${RUNNER_TEMP}/oc-extract/opencode" /opt/fro-bot-sandbox-it/opencode
           echo "binary=/opt/fro-bot-sandbox-it/opencode" >> "${GITHUB_OUTPUT}"
-      # Diagnostic for the slow first `useradd` seen on hosted runners (fro-bot/agent#2135): the same command the suite runs, on a
-      # throwaway name, timed, with the process tree sampled while it runs. It never fails the job and removes what it made.
-      - name: Probe useradd timing (diagnostic)
-        continue-on-error: true
-        timeout-minutes: 3
-        run: |
-          set +e
-          sudo -n -V | head -1
-          sudo -n -V | grep -i -E 'pty|log' | head -5
-          dpkg -l 2>/dev/null | awk '/^ii/ && $2 ~ /^(nscd|sssd|systemd-userdbd|libnss-systemd|auditd)/ {print $2, $3}'
-          pgrep -a -f 'nscd|sssd|auditd|userdbd' | head -5
-          probe="fro-useradd-probe"
-          start=$(date +%s.%N)
-          sudo -n /usr/sbin/useradd --system --user-group --no-log-init --create-home --home-dir "/home/${probe}" \
-            --shell /bin/bash --comment 'fro-bot probe' "${probe}" &
-          pid=$!
-          for second in 1 2 3 5 8 13 21 34; do
-            sleep 1
-            if ! kill -0 "${pid}" 2>/dev/null; then break; fi
-            echo "--- still running after ~${second}s"
-            ps -eo pid,ppid,pgid,stat,etime,wchan:20,args --forest | awk -v p="${pid}" 'NR==1 || $1==p || $2==p || /useradd|nscd|sss_cache|userdbd|audit/' | head -20
-          done
-          wait "${pid}"
-          echo "useradd exit=$? after $(echo "$(date +%s.%N) - ${start}" | bc)s"
-          getent passwd "${probe}"
-          sudo -n /usr/sbin/userdel --remove "${probe}"
-          echo "userdel exit=$?"
       - name: Run the sandbox suite
         env:
           FRO_BOT_SANDBOX_INTEGRATION: '1'
