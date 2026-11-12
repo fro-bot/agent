@@ -188,34 +188,65 @@ describe('post action', () => {
       },
     )
 
-    it('uploads no log artifact after an unsafe sandbox release, but still uploads for a safe isolated run', async () => {
-      // #given prompt-artifact upload on and an isolated run whose release was not restored
-      vi.stubEnv('OPENCODE_PROMPT_ARTIFACT', 'true')
-      const core = await import('@actions/core')
-      const {uploadLogArtifact} = await import('../services/artifact/index.js')
-      const state = (unsafe: boolean) => (key: string) => {
-        if (key === 'shouldSaveCache') return 'true'
-        if (key === 'isolatedRun') return 'true'
-        if (key === 'cacheSaved') return 'durable'
-        if (key === 'sandboxUnsafe') return unsafe ? 'true' : ''
-        return ''
-      }
-      const {runPost} = await import('./post.js')
+    describe('log uploads on isolated runs (the log directory is sandbox-writable)', () => {
+      const armedIsolated = {shouldSaveCache: 'true', isolatedRun: 'true', cacheSaved: 'not-persisted'}
 
-      // #when the post hook runs for the unsafe run
-      vi.mocked(core.getState).mockImplementation(state(true))
-      await runPost({logger: createMockLogger()})
+      it.each([
+        ['no teardown state at all (the main step never recorded a result)', {...armedIsolated}],
+        ['a pending teardown (the main step died before it finished)', {...armedIsolated, sandboxState: 'pending'}],
+        ['an unsafe teardown', {...armedIsolated, sandboxState: 'unsafe'}],
+        [
+          'a pending teardown before the isolated marker was ever written',
+          {shouldSaveCache: 'true', sandboxState: 'pending'},
+        ],
+      ])('uploads nothing, artifacts included, with %s', async (_label, state) => {
+        // #given prompt artifacts and the object store both on, and an armed run without a confirmed restore
+        vi.stubEnv('OPENCODE_PROMPT_ARTIFACT', 'true')
+        await stubState({...storeState, ...state, cleanupMetadataWritten: 'true'})
+        const {uploadLogArtifact} = await import('../services/artifact/index.js')
+        const {syncArtifactsToStore} = await import('@fro-bot/runtime')
+        const {runPost} = await import('./post.js')
 
-      // #then the sandbox-writable log directory is never read
-      expect(uploadLogArtifact).not.toHaveBeenCalled()
+        // #when the post hook runs
+        await runPost({logger: createMockLogger()})
 
-      // #when it runs for a safe isolated run
-      vi.mocked(core.getState).mockImplementation(state(false))
-      await runPost({logger: createMockLogger()})
+        // #then neither log backend was touched
+        expect(uploadLogArtifact).not.toHaveBeenCalled()
+        expect(syncArtifactsToStore).not.toHaveBeenCalled()
+        vi.unstubAllEnvs()
+      })
 
-      // #then the upload proceeds as before
-      expect(uploadLogArtifact).toHaveBeenCalledTimes(1)
-      vi.unstubAllEnvs()
+      it('uploads the Actions artifact when the teardown was restored', async () => {
+        // #given an isolated run whose main step recorded a confirmed restore
+        vi.stubEnv('OPENCODE_PROMPT_ARTIFACT', 'true')
+        await stubState({...armedIsolated, sandboxState: 'restored'})
+        const {uploadLogArtifact} = await import('../services/artifact/index.js')
+        const {runPost} = await import('./post.js')
+
+        // #when
+        await runPost({logger: createMockLogger()})
+
+        // #then
+        expect(uploadLogArtifact).toHaveBeenCalledTimes(1)
+        vi.unstubAllEnvs()
+      })
+
+      it('uploads the Actions artifact and syncs the object store for a run that never used isolation', async () => {
+        // #given no isolation marker and no teardown state
+        vi.stubEnv('OPENCODE_PROMPT_ARTIFACT', 'true')
+        await stubState({...storeState, shouldSaveCache: 'true', cacheSaved: 'not-persisted'})
+        const {uploadLogArtifact} = await import('../services/artifact/index.js')
+        const {syncArtifactsToStore} = await import('@fro-bot/runtime')
+        const {runPost} = await import('./post.js')
+
+        // #when
+        await runPost({logger: createMockLogger()})
+
+        // #then behavior is exactly what it was
+        expect(uploadLogArtifact).toHaveBeenCalledTimes(1)
+        expect(syncArtifactsToStore).toHaveBeenCalledTimes(1)
+        vi.unstubAllEnvs()
+      })
     })
 
     it('still retries the save for a run that was not isolated', async () => {

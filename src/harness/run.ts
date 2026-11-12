@@ -70,9 +70,9 @@ export async function run(): Promise<number> {
   // True once an isolated run's sandbox was not confirmed stopped and restored: everything the sandbox could write is
   // then untrusted, so cleanup and the post hook read and publish none of it.
   let sandboxOutputUntrusted = false
+  // The lifecycle itself records the `unsafe` state for the post hook on every release that is not a confirmed restore.
   const markSandboxUntrusted = (): void => {
     sandboxOutputUntrusted = true
-    core.saveState(STATE_KEYS.SANDBOX_UNSAFE, 'true')
   }
   // The run-scoped repo skills staging root under RUNNER_TEMP, or null. Hoisted so the `finally` block removes it once the
   // server has stopped, whichever path the run took (fro-bot/agent#2129).
@@ -180,6 +180,8 @@ export async function run(): Promise<number> {
       setUnavailableActionOutputs(Date.now() - startTime)
       return 1
     }
+    // Owned from here on: every exit path below releases it, including a V2 start that fails or throws.
+    sandboxLifecycle = bootstrap.sandbox ?? null
     storeConfig = bootstrap.inputs.storeConfig
     sessionRetention = bootstrap.inputs.sessionRetention
     responseMode = bootstrap.inputs.responseMode
@@ -279,7 +281,7 @@ export async function run(): Promise<number> {
       return 1
     }
     serverHandleV2 = cacheRestore.serverHandle
-    sandboxLifecycle = cacheRestore.sandbox ?? null
+    sandboxLifecycle = cacheRestore.sandbox ?? sandboxLifecycle
     sessionStateVouched = true
     // Before the save is armed: the post hook must know, whenever it sees the arm, that this state came from a sandbox.
     if (sandboxLifecycle !== null) core.saveState(STATE_KEYS.ISOLATED_RUN, 'true')

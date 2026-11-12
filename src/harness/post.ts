@@ -120,6 +120,9 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
   }
 }
 
+const SANDBOX_LOGS_SKIPPED =
+  'Skipping the log upload: the isolate-agent sandbox was not confirmed stopped and restored, so its log directory is not read'
+
 async function persistRunState(logger: Logger): Promise<void> {
   const shouldSaveCache = core.getState(STATE_KEYS.SHOULD_SAVE_CACHE)
   // parseCacheSaveStateValue treats an absent key (main step crashed before cleanup ran)
@@ -129,6 +132,12 @@ async function persistRunState(logger: Logger): Promise<void> {
   const cacheSaved = parseCacheSaveStateValue(core.getState(STATE_KEYS.CACHE_SAVED))
   const sessionId = core.getState(STATE_KEYS.SESSION_ID) || null
   const storeConfig = reconstructStoreConfigFromState()
+  // On an isolated run the log directory is sandbox-writable until the main step confirms the teardown. Only an explicit
+  // `restored` opens it: a missing state (the main step died), `pending` and `unsafe` all keep it closed. A run that never
+  // touched the sandbox has neither marker and is unaffected.
+  const isolatedRun = core.getState(STATE_KEYS.ISOLATED_RUN) === 'true'
+  const sandboxState = core.getState(STATE_KEYS.SANDBOX_STATE)
+  const logsTrusted = sandboxState === 'restored' || (sandboxState === '' && !isolatedRun)
 
   logger.debug('Post-action state', {
     shouldSaveCache,
@@ -187,7 +196,7 @@ async function persistRunState(logger: Logger): Promise<void> {
       'post-skip-safety',
       logger,
     )
-  } else if (core.getState(STATE_KEYS.ISOLATED_RUN) === 'true') {
+  } else if (isolatedRun) {
     // `isolate-agent`: the sandbox user wrote this state. The main step's `finally` stops its processes, takes the files
     // back and only then persists, so reaching here with `not-persisted` means that did not complete or was skipped for
     // a reason this process cannot verify (it has no sandbox account, journal or process view). Retrying a save could
@@ -316,7 +325,19 @@ async function persistRunState(logger: Logger): Promise<void> {
             objectStoreLogger,
           )
         }
-        await syncArtifactsToStore(adapter, storeConfig, 'github', repo, runId, getOpenCodeLogPath(), objectStoreLogger)
+        if (logsTrusted) {
+          await syncArtifactsToStore(
+            adapter,
+            storeConfig,
+            'github',
+            repo,
+            runId,
+            getOpenCodeLogPath(),
+            objectStoreLogger,
+          )
+        } else {
+          objectStoreLogger.warning(SANDBOX_LOGS_SKIPPED)
+        }
       } catch (error) {
         logger.warning('Post-action object store sync failed (non-fatal)', {
           error: toErrorMessage(error),
@@ -325,8 +346,9 @@ async function persistRunState(logger: Logger): Promise<void> {
     }
   }
 
-  // An isolated run whose sandbox was not confirmed stopped and restored leaves the log directory sandbox-writable.
-  if (isOpenCodePromptArtifactEnabled() && core.getState(STATE_KEYS.SANDBOX_UNSAFE) !== 'true') {
+  if (isOpenCodePromptArtifactEnabled() && !logsTrusted) {
+    logger.warning(SANDBOX_LOGS_SKIPPED)
+  } else if (isOpenCodePromptArtifactEnabled()) {
     const artifactUploaded = core.getState(STATE_KEYS.ARTIFACT_UPLOADED)
     if (artifactUploaded !== 'true') {
       try {

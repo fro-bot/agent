@@ -87,6 +87,14 @@ function fakeHost(): SignalHost & {readonly emitter: EventEmitter; readonly kill
   }
 }
 
+function deferred<T>(): {readonly promise: Promise<T>; readonly resolve: (value: T) => void} {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>(settle => {
+    resolve = settle
+  })
+  return {promise, resolve}
+}
+
 describe('createSandboxLifecycle', () => {
   let temp: string
 
@@ -290,6 +298,65 @@ describe('createSandboxLifecycle', () => {
     expect(harness.mocks.deleteAccount).not.toHaveBeenCalled()
   })
 
+  describe('teardown state', () => {
+    const prepareInput = {keyFilePaths: [], ghConfigDir: null, repoSkills: null}
+
+    it('records pending before the account exists, and restored only after a confirmed release', async () => {
+      // #given a recorder, and an account creation that observes it
+      const harness = createHarness()
+      const states: string[] = []
+      let seenWhenCreating: string[] = []
+      harness.mocks.createAccount.mockImplementation(async () => {
+        seenWhenCreating = [...states]
+        return ok(ACCOUNT)
+      })
+      const lifecycle = create(harness, {recordState: state => states.push(state)})
+
+      // #when prepared, then released
+      await lifecycle.prepare(prepareInput)
+      expect(states).toEqual(['pending'])
+      await lifecycle.release()
+
+      // #then pending was recorded first, and restored only at the end
+      expect(seenWhenCreating).toEqual(['pending'])
+      expect(states).toEqual(['pending', 'restored'])
+    })
+
+    it.each([
+      ['an unsafe take-back', (h: Harness) => h.mocks.takeBack.mockResolvedValue({status: 'unsafe', reason: 'x'})],
+      ['an unconfirmed stop', (h: Harness) => h.mocks.stop.mockResolvedValue('unconfirmed')],
+      ['a release that throws', (h: Harness) => h.mocks.stop.mockRejectedValue(new Error('sudo vanished'))],
+    ])('records unsafe for %s, never restored', async (_label, arrange) => {
+      // #given a teardown that cannot be confirmed
+      const harness = createHarness()
+      arrange(harness)
+      const states: string[] = []
+      const lifecycle = create(harness, {recordState: state => states.push(state)})
+      await lifecycle.prepare(prepareInput)
+
+      // #when released
+      await lifecycle.release()
+
+      // #then
+      expect(states).toEqual(['pending', 'unsafe'])
+    })
+
+    it('records pending and then restored for a failed preparation that was rolled back', async () => {
+      // #given a handoff that fails (it rolled itself back)
+      const harness = createHarness()
+      harness.mocks.handOff.mockResolvedValue(err('chown failed'))
+      const states: string[] = []
+      const lifecycle = create(harness, {recordState: state => states.push(state)})
+
+      // #when preparation fails
+      const prepared = await lifecycle.prepare(prepareInput)
+
+      // #then the account was removed and the state says so
+      expect(prepared.success).toBe(false)
+      expect(states).toEqual(['pending', 'restored'])
+    })
+  })
+
   describe('termination signals', () => {
     it('installs handlers before the account exists and removes them after a normal release', async () => {
       // #given a lifecycle whose account creation observes the handlers
@@ -336,6 +403,95 @@ describe('createSandboxLifecycle', () => {
       )
       expect(host.emitter.listenerCount('SIGTERM')).toBe(0)
       expect(host.emitter.listenerCount('SIGINT')).toBe(0)
+    })
+
+    it('waits for account creation, then tears down the real account instead of caching a never-started release', async () => {
+      // #given a signal that arrives while the account is still being created
+      const harness = createHarness()
+      const host = fakeHost()
+      const creation = deferred<Awaited<ReturnType<SandboxLifecycleDeps['createAccount']>>>()
+      harness.mocks.createAccount.mockImplementation(async () => creation.promise)
+      const lifecycle = create(harness, {signals: host})
+      const preparing = lifecycle.prepare({keyFilePaths: [], ghConfigDir: null, repoSkills: null})
+      await vi.waitFor(() => {
+        expect(harness.mocks.createAccount).toHaveBeenCalledTimes(1)
+      })
+
+      // #when SIGTERM arrives mid-creation, and the creation then completes
+      host.emitter.emit('SIGTERM')
+      await Promise.resolve()
+      expect(harness.mocks.stop).not.toHaveBeenCalled()
+      creation.resolve(ok(ACCOUNT))
+      const prepared = await preparing
+
+      // #then preparation was abandoned without handing anything over, and the real account was stopped and deleted
+      expect(prepared.success).toBe(false)
+      await vi.waitFor(() => {
+        expect(host.killed).toEqual(['4242:SIGTERM'])
+      })
+      expect(harness.mocks.handOff).not.toHaveBeenCalled()
+      expect(harness.mocks.stop).toHaveBeenCalledWith(
+        expect.objectContaining({uid: ACCOUNT.uid}),
+        expect.anything(),
+        expect.anything(),
+      )
+      expect(harness.mocks.deleteAccount).toHaveBeenCalledTimes(1)
+      // #and the cached release is the earned one, not a never-started result
+      expect(await lifecycle.release()).toEqual({stop: 'stopped', restore: 'restored'})
+    })
+
+    it('waits for the handoff, then takes back using the real journal', async () => {
+      // #given a signal that arrives while files are being handed over
+      const harness = createHarness()
+      const host = fakeHost()
+      const handoff = deferred<Awaited<ReturnType<SandboxLifecycleDeps['handOff']>>>()
+      const journal = {snapshotDir: '/journal', touched: [], chowned: [], aclTrees: [], git: null, gitPresent: false}
+      harness.mocks.handOff.mockImplementation(async () => handoff.promise)
+      const lifecycle = create(harness, {signals: host})
+      const preparing = lifecycle.prepare({keyFilePaths: [], ghConfigDir: null, repoSkills: null})
+      await vi.waitFor(() => {
+        expect(harness.mocks.handOff).toHaveBeenCalledTimes(1)
+      })
+
+      // #when SIGINT arrives mid-handoff, and the handoff then completes
+      host.emitter.emit('SIGINT')
+      await Promise.resolve()
+      expect(harness.mocks.takeBack).not.toHaveBeenCalled()
+      handoff.resolve(ok(journal))
+      const prepared = await preparing
+
+      // #then preparation did not go on to a launch spec for a server nobody will stop
+      expect(prepared.success).toBe(false)
+
+      // #and take-back ran on the journal the handoff produced, before the account was deleted, then the signal was re-raised
+      await vi.waitFor(() => {
+        expect(host.killed).toEqual(['4242:SIGINT'])
+      })
+      expect(harness.mocks.takeBack).toHaveBeenCalledTimes(1)
+      expect(harness.mocks.takeBack.mock.calls[0]?.[1]).toBe(journal)
+      expect(harness.mocks.takeBack.mock.invocationCallOrder[0]).toBeLessThan(
+        harness.mocks.deleteAccount.mock.invocationCallOrder[0] ?? 0,
+      )
+    })
+
+    it('refuses to prepare once a signal has been received', async () => {
+      // #given a signal before preparation starts
+      const harness = createHarness()
+      const host = fakeHost()
+      const lifecycle = create(harness, {signals: host})
+      await lifecycle.prepare({keyFilePaths: [], ghConfigDir: null, repoSkills: null})
+      host.emitter.emit('SIGTERM')
+      await vi.waitFor(() => {
+        expect(host.killed).toHaveLength(1)
+      })
+      harness.mocks.createAccount.mockClear()
+
+      // #when preparation is attempted again
+      const again = await lifecycle.prepare({keyFilePaths: [], ghConfigDir: null, repoSkills: null})
+
+      // #then no second account is created
+      expect(again.success).toBe(false)
+      expect(harness.mocks.createAccount).not.toHaveBeenCalled()
     })
 
     it('ends the process anyway when the teardown does not finish within its budget', async () => {

@@ -83,6 +83,14 @@ export interface SignalHost {
  */
 export const SIGNAL_TEARDOWN_BUDGET_MS = 10_000
 
+/**
+ * What the lifecycle tells the rest of the run about the sandbox, for the process and for the post hook:
+ * `pending` from before the account exists until the teardown finishes; `restored` only once the sandbox is verified
+ * stopped and its files are back (or it never started); `unsafe` otherwise. Anything but `restored` means the
+ * sandbox-writable paths must not be read or published.
+ */
+export type SandboxRunState = 'pending' | 'restored' | 'unsafe'
+
 export interface SandboxLifecycleOptions {
   readonly tools: SandboxToolPaths
   readonly env: NodeJS.ProcessEnv
@@ -99,6 +107,8 @@ export interface SandboxLifecycleOptions {
   /** Defaults to the real `process`. */
   readonly signals?: SignalHost
   readonly signalTeardownBudgetMs?: number
+  /** Called synchronously with each state change. Must not throw. */
+  readonly recordState?: (state: SandboxRunState) => void
 }
 
 export interface SandboxLifecycleDeps {
@@ -164,6 +174,18 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   let journal: HandoffJournal | null = null
   let released: Promise<SandboxReleaseResult> | undefined
   let active = false
+  // The in-flight `prepare`. Teardown waits for it, so a signal can never read a half-built state (no account yet, or no
+  // journal for a handoff still running) and cache a release it did not earn.
+  let preparing: Promise<unknown> | undefined
+  // A signal arrived: preparation stops at its next checkpoint and tears down what exists.
+  let cancelled = false
+  const record = (state: SandboxRunState): void => {
+    try {
+      options.recordState?.(state)
+    } catch (error) {
+      logger.warning('Recording the sandbox state failed', {error: toErrorMessage(error)})
+    }
+  }
 
   // SIGINT/SIGTERM: stop the sandbox user's processes (which aborts the server and every tool under it) and take its files
   // back before the process ends. Installed before the account exists and removed once release has finished. The exec
@@ -179,6 +201,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   const onSignal = async (signal: 'SIGINT' | 'SIGTERM'): Promise<void> => {
     if (signalled) return
     signalled = true
+    cancelled = true
     logger.warning('Received a termination signal; stopping the sandbox before exiting', {signal})
     let timer: ReturnType<typeof setTimeout> | undefined
     const timedOut = new Promise<'timeout'>(resolve => {
@@ -240,12 +263,17 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     return {stop, restore: 'restored'}
   }
 
-  const release = async (): Promise<SandboxReleaseResult> => {
+  /** The one teardown. Memoized; never waits for `prepare`, so `prepare` itself can use it to roll back. */
+  const releaseNow = async (): Promise<SandboxReleaseResult> => {
     released ??= doRelease()
       .catch((error: unknown): SandboxReleaseResult => {
         const reason = toErrorMessage(error)
         logger.error('Sandbox release threw', {error: reason})
         return {stop: account === null ? 'never-started' : 'unconfirmed', restore: 'unsafe', reason}
+      })
+      .then(result => {
+        record(result.restore === 'unsafe' ? 'unsafe' : 'restored')
+        return result
       })
       .finally(() => {
         active = false
@@ -255,15 +283,29 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     return released
   }
 
+  /** Public teardown: lets an in-flight preparation reach a checkpoint first, so it runs on the real state. */
+  const release = async (): Promise<SandboxReleaseResult> => {
+    if (preparing !== undefined) await preparing.catch(() => undefined)
+    return releaseNow()
+  }
+
   releaseRef = release
 
   const prepare = async (input: SandboxPrepareInput): Promise<Result<OpenCodeV2SandboxLaunch, string>> => {
+    if (cancelled || released !== undefined) return err('isolate-agent setup was cancelled before it started')
+    record('pending')
+    preparing = prepareInner(input)
+    return preparing as Promise<Result<OpenCodeV2SandboxLaunch, string>>
+  }
+
+  async function prepareInner(input: SandboxPrepareInput): Promise<Result<OpenCodeV2SandboxLaunch, string>> {
     try {
       installSignalHandlers()
       const created = await deps.createAccount(tools, identityDeps())
       if (!created.success) return err(created.error.message)
       account = created.data
       active = true
+      if (cancelled) return await failAndRelease('isolate-agent setup was cancelled by a signal')
 
       const runnerTemp = env.RUNNER_TEMP
       if (runnerTemp === undefined || runnerTemp.length === 0) {
@@ -302,6 +344,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
         traverseOnly: input.repoSkills?.admittedDir == null ? [] : [input.repoSkills.stagingRoot],
         tighten: [runnerTemp, path.join(runnerTemp, '_runner_file_commands')],
       }
+      if (cancelled) return await failAndRelease('isolate-agent setup was cancelled by a signal')
       const handed = await deps.handOff(manifest, handoffDeps())
       if (!handed.success) {
         // handOff already rolled back what it recorded. The journal is not kept; release only stops and deletes.
@@ -309,6 +352,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
         return await failAndRelease(handed.error)
       }
       journal = handed.data
+      if (cancelled) return await failAndRelease('isolate-agent setup was cancelled by a signal')
 
       const sandboxTmp = path.join(account.home, 'tmp')
       await runAsSandbox([tools.mkdir, '-m', '0700', sandboxTmp])
@@ -330,7 +374,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   }
 
   async function failAndRelease(message: string): Promise<Result<never, string>> {
-    const outcome = await release()
+    const outcome = await releaseNow()
     const suffix = outcome.restore === 'unsafe' ? ` (cleanup incomplete: ${outcome.reason ?? 'unknown'})` : ''
     return err(`${message}${suffix}`)
   }

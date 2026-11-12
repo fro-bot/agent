@@ -7,7 +7,7 @@ import type {SandboxLifecycle} from './sandbox-lifecycle.js'
 import * as path from 'node:path'
 import process from 'node:process'
 import * as core from '@actions/core'
-import {buildAttachmentDir, DB_V2_MAIN_BASENAME, resolveResponseDelivery} from '@fro-bot/runtime'
+import {DB_V2_MAIN_BASENAME, resolveResponseDelivery} from '@fro-bot/runtime'
 import {
   buildCacheKeyComponents,
   checkpointDatabase,
@@ -26,7 +26,6 @@ import {
 } from '../../shared/env.js'
 import {createLogger} from '../../shared/logger.js'
 import {normalizeWorkspacePath} from '../../shared/paths.js'
-import {createSandboxLifecycle} from './sandbox-lifecycle.js'
 import {startActionOpenCodeV2} from './v2-server.js'
 
 /**
@@ -169,21 +168,9 @@ async function startV2Server(
 ): Promise<CacheRestorePhaseResult | null> {
   const serverLogger = createLogger({phase: 'server-bootstrap'})
   const {inputs, opencodeResult} = bootstrap
-  const runnerTemp = process.env.RUNNER_TEMP?.trim() ?? ''
-  const sandbox =
-    bootstrap.sandboxTools === null
-      ? null
-      : createSandboxLifecycle({
-          tools: bootstrap.sandboxTools,
-          env: process.env,
-          workspacePath,
-          responseDir: bootstrap.responseFilePath === null ? null : path.dirname(bootstrap.responseFilePath),
-          attachmentDir:
-            runnerTemp.length === 0
-              ? null
-              : buildAttachmentDir({runnerTemp, runId: getGitHubRunId(), runAttempt: getGitHubRunAttempt()}),
-          logger: createLogger({phase: 'sandbox'}),
-        })
+  // Created by bootstrap, which is what lets the run release it (and read whether it was restored) even when this start
+  // fails or throws.
+  const sandbox = bootstrap.sandbox ?? null
   const started = await startActionOpenCodeV2({
     binaryPath: opencodeResult.path,
     // Normalized to match what the harness's own session-scoped calls use: the gates and every later request address

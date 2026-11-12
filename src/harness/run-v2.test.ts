@@ -45,7 +45,7 @@ vi.mock('./config/state-keys.js', () => ({
     SHOULD_SAVE_CACHE: 'should-save-cache',
     CACHE_SAVED: 'cache-saved',
     ISOLATED_RUN: 'isolated-run',
-    SANDBOX_UNSAFE: 'sandbox-unsafe',
+    SANDBOX_STATE: 'sandbox-state',
   },
 }))
 
@@ -811,6 +811,22 @@ describe('run with isolate-agent', () => {
     return {...arranged, release}
   }
 
+  async function arrangeFailedStart(outcome: SandboxReleaseResult) {
+    const {runBootstrap} = await import('./phases/bootstrap.js')
+    const {runCacheRestore} = await import('./phases/cache-restore.js')
+    const arranged = await arrange({})
+    const {sandbox, release} = fakeSandbox(outcome)
+    // The lifecycle belongs to the bootstrap result, so the run holds it even though the start returned nothing.
+    const bootstrap = createBootstrap()
+    vi.mocked(runBootstrap).mockResolvedValue({
+      ...bootstrap,
+      opencodeResult: {...bootstrap.opencodeResult, version: '2.2.5'},
+      sandbox,
+    })
+    vi.mocked(runCacheRestore).mockResolvedValue(null)
+    return {...arranged, release}
+  }
+
   it('releases the sandbox after the server release and before finalize, then lets finalize and cleanup proceed', async () => {
     // #given an isolated run whose sandbox stops and restores cleanly
     const core = await import('@actions/core')
@@ -861,7 +877,6 @@ describe('run with isolate-agent', () => {
       skipSessionPersistence: true,
       sandboxOutputUntrusted: true,
     })
-    expect(vi.mocked(core.saveState)).toHaveBeenCalledWith('sandbox-unsafe', 'true')
     expect(
       String(
         (vi.mocked(runCleanup).mock.calls[0]?.[0] as {persistenceDeclineReason?: string}).persistenceDeclineReason,
@@ -869,6 +884,45 @@ describe('run with isolate-agent', () => {
     ).toContain(outcome.reason)
     expect(vi.mocked(core.saveState)).toHaveBeenCalledWith('should-save-cache', 'false')
     expect(vi.mocked(core.setFailed)).toHaveBeenCalledWith(expect.stringContaining(outcome.reason))
+  })
+
+  describe('a start that fails after the sandbox was prepared', () => {
+    it('reads and publishes no sandbox-writable log when the release after the failed start was unsafe', async () => {
+      // #given the V2 start failed after the sandbox was prepared, and its release was not confirmed restored
+      const {runCleanup} = await import('./phases/cleanup.js')
+      const {release} = await arrangeFailedStart({
+        stop: 'stopped',
+        restore: 'unsafe',
+        reason: 'ancestor /x is a symlink',
+      })
+
+      // #when
+      const exitCode = await run()
+
+      // #then the run failed, the same (memoized) release was consulted, and cleanup is told to touch neither log backend
+      expect(exitCode).toBe(1)
+      expect(release).toHaveBeenCalled()
+      expect(vi.mocked(runCleanup).mock.calls[0]?.[0]).toMatchObject({
+        skipSessionPersistence: true,
+        sandboxOutputUntrusted: true,
+      })
+    })
+
+    it('keeps the log backends open when the release after the failed start was confirmed restored', async () => {
+      // #given the same failed start with a clean release
+      const {runCleanup} = await import('./phases/cleanup.js')
+      await arrangeFailedStart(RESTORED)
+
+      // #when
+      const exitCode = await run()
+
+      // #then persistence is still declined (the start failed) but the logs are trusted
+      expect(exitCode).toBe(1)
+      expect(vi.mocked(runCleanup).mock.calls[0]?.[0]).toMatchObject({
+        skipSessionPersistence: true,
+        sandboxOutputUntrusted: false,
+      })
+    })
   })
 
   it('stops and restores the sandbox on an exception mid-execution, before cleanup saves anything', async () => {

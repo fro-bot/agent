@@ -10,6 +10,7 @@ import process from 'node:process'
 import * as core from '@actions/core'
 import * as github from '@actions/github'
 import {
+  buildAttachmentDir,
   buildResponseFileDir,
   buildResponseFilePathCandidates,
   ensureOpenCodeAvailable,
@@ -19,10 +20,11 @@ import {createExecAdapter} from '../../services/setup/adapters.js'
 import {assertNoPersistedGitCredentials} from '../../services/setup/git-credential-check.js'
 import {runtimeSetupAdapter} from '../../services/setup/runtime-setup-adapter.js'
 import {createSandboxPreflightDeps, runSandboxPreflight} from '../../services/setup/sandbox-preflight.js'
-import {getGitHubRunAttempt, getGitHubRunId} from '../../shared/env.js'
+import {getGitHubRunAttempt, getGitHubRunId, getGitHubWorkspace} from '../../shared/env.js'
 import {createLogger} from '../../shared/logger.js'
 import {parseActionInputs} from '../config/inputs.js'
 import {STATE_KEYS} from '../config/state-keys.js'
+import {createSandboxLifecycle, type SandboxLifecycle} from './sandbox-lifecycle.js'
 
 export interface BootstrapPhaseResult {
   readonly inputs: ActionInputs
@@ -54,6 +56,12 @@ export interface BootstrapPhaseResult {
    * the preflight; null means the run is not isolated.
    */
   readonly sandboxTools: SandboxToolPaths | null
+  /**
+   * The `isolate-agent` lifecycle, created here so the run owns it before anything can fail: whichever path the run
+   * takes, `run.ts` releases it (the release is memoized) and learns whether the sandbox was restored. Null or absent
+   * when the run is not isolated.
+   */
+  readonly sandbox?: SandboxLifecycle | null
 }
 
 export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPhaseResult | null> {
@@ -154,7 +162,26 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
     responseFilePathCandidates: responseFile?.responseFilePathCandidates ?? null,
     trustedHeadSha: inputs.trustedHeadSha,
     sandboxTools,
+    sandbox: createRunSandbox(sandboxTools, responseFile?.responseFilePath ?? null),
   }
+}
+
+/** The lifecycle for an isolated run, or null. Every state change is written for the post hook. */
+function createRunSandbox(tools: SandboxToolPaths | null, responseFilePath: string | null): SandboxLifecycle | null {
+  if (tools === null) return null
+  const runnerTemp = process.env.RUNNER_TEMP?.trim() ?? ''
+  return createSandboxLifecycle({
+    tools,
+    env: process.env,
+    workspacePath: getGitHubWorkspace(),
+    responseDir: responseFilePath === null ? null : path.dirname(responseFilePath),
+    attachmentDir:
+      runnerTemp.length === 0
+        ? null
+        : buildAttachmentDir({runnerTemp, runId: getGitHubRunId(), runAttempt: getGitHubRunAttempt()}),
+    logger: createLogger({phase: 'sandbox'}),
+    recordState: state => core.saveState(STATE_KEYS.SANDBOX_STATE, state),
+  })
 }
 
 /**

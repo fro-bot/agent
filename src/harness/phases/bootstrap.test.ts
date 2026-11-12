@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => ({
   randomUUID: vi.fn(),
   assertNoPersistedGitCredentials: vi.fn(),
   runSandboxPreflight: vi.fn(),
+  createSandboxLifecycle: vi.fn(),
 }))
 
 vi.mock('@actions/core', () => ({
@@ -50,6 +51,10 @@ vi.mock('@fro-bot/runtime', async importOriginal => {
 // Mocked here only, not globally: other suites still exercise the real function.
 vi.mock('../../services/setup/git-credential-check.js', () => ({
   assertNoPersistedGitCredentials: mocks.assertNoPersistedGitCredentials,
+}))
+
+vi.mock('./sandbox-lifecycle.js', () => ({
+  createSandboxLifecycle: mocks.createSandboxLifecycle,
 }))
 
 vi.mock('../../services/setup/sandbox-preflight.js', () => ({
@@ -598,6 +603,45 @@ describe('runBootstrap isolate-agent preflight', () => {
 
     // #then behavior is unchanged
     expect(mocks.assertNoPersistedGitCredentials).not.toHaveBeenCalled()
+  })
+
+  it('creates the sandbox lifecycle here, so the run owns it before the server starts, and records its state', async () => {
+    // #given isolation on, a supported runner and a file-convention response path
+    const lifecycle = {prepare: vi.fn(), release: vi.fn(), isActive: vi.fn()}
+    mocks.createSandboxLifecycle.mockReturnValue(lifecycle)
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: true})})
+    mocks.runSandboxPreflight.mockResolvedValue({ok: true, tools})
+    vi.stubEnv('GITHUB_WORKSPACE', path.join(runnerTempDir, 'repo'))
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when bootstrap runs
+    const result = await runBootstrap(createMockLogger())
+
+    // #then the lifecycle is on the result, built from the resolved tools and the run's own paths
+    expect(result?.sandbox).toBe(lifecycle)
+    const options = mocks.createSandboxLifecycle.mock.calls[0]?.[0] as {
+      tools: unknown
+      workspacePath: string
+      recordState: (state: string) => void
+    }
+    expect(options.tools).toBe(tools)
+    expect(options.workspacePath).toBe(path.join(runnerTempDir, 'repo'))
+    // #and its state changes are written for the post hook
+    options.recordState('pending')
+    expect(mocks.saveState).toHaveBeenCalledWith('sandboxState', 'pending')
+  })
+
+  it('creates no lifecycle when isolation is off', async () => {
+    // #given the input is off
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: false})})
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when bootstrap runs
+    const result = await runBootstrap(createMockLogger())
+
+    // #then
+    expect(result?.sandbox ?? null).toBeNull()
+    expect(mocks.createSandboxLifecycle).not.toHaveBeenCalled()
   })
 
   it('runs no preflight and carries no tools when isolation is off', async () => {

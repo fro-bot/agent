@@ -14,10 +14,12 @@ export const STATE_KEYS = {
    */
   ISOLATED_RUN: 'isolatedRun',
   /**
-   * `'true'` when an isolated run's sandbox was not confirmed stopped and restored. The post hook then reads no
-   * sandbox-writable path (the log directory) and uploads nothing from it.
+   * The sandbox teardown state (`pending`, `restored` or `unsafe`), written by the sandbox lifecycle: `pending` before
+   * the account exists, `restored` only after a confirmed stop and take-back. On an isolated run the post hook reads and
+   * uploads nothing from the sandbox-writable log directory unless this is `restored`: missing, `pending` and `unsafe`
+   * all mean the main step did not finish the teardown.
    */
-  SANDBOX_UNSAFE: 'sandboxUnsafe',
+  SANDBOX_STATE: 'sandboxState',
   /** Session ID used in this run (for logging) */
   SESSION_ID: 'sessionId',
   /** Whether main action already saved cache successfully */
