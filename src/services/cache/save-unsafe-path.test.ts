@@ -133,8 +133,14 @@ describe('session path safety before a save', () => {
       await writeStorageVersion(storagePath)
 
       // #then .version is now a regular file with the version, the target is untouched, and no temp file is left
-      expect(fs.lstatSync(version).isFile()).toBe(true)
-      expect(fs.readFileSync(version, 'utf8')).toBe('1')
+      // One handle for the kind check and the read, so the file cannot change between them.
+      const fd = fs.openSync(version, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)
+      try {
+        expect(fs.fstatSync(fd).isFile()).toBe(true)
+        expect(fs.readFileSync(fd, 'utf8')).toBe('1')
+      } finally {
+        fs.closeSync(fd)
+      }
       expect(fs.readFileSync(secret, 'utf8')).toBe('runner secret')
       expect(fs.readdirSync(storagePath).filter(name => name.startsWith('.version'))).toEqual(['.version'])
     })

@@ -55,6 +55,8 @@ import {
   PRELUDE,
   q,
   readProbe,
+  safeEnvPath,
+  safeEnvToken,
   startScriptedProvider,
   startScriptedSession,
 } from './v2-server.sandbox.harness.js'
@@ -67,9 +69,9 @@ const gated =
   BINARY !== undefined &&
   BINARY.length > 0
 
-const TOKEN_MARK = process.env.PROBE_DUMMY_TOKEN ?? 'dummy-probe-token'
+const TOKEN_MARK = safeEnvToken(process.env.PROBE_DUMMY_TOKEN, 'dummy-probe-token')
 const runnerHome = os.userInfo().homedir
-const runnerTemp = process.env.RUNNER_TEMP ?? path.join(runnerHome, 'work', '_temp')
+const runnerTemp = safeEnvPath(process.env.RUNNER_TEMP, path.join(runnerHome, 'work', '_temp'))
 
 // --- Helpers shared by the four suites ---------------------------------------------------------------------------------
 
@@ -260,13 +262,13 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
       id: 'github_env',
       category: 'blocked',
       control: true,
-      cmd: readProbe('github_env', env.GITHUB_ENV ?? '/nonexistent'),
+      cmd: readProbe('github_env', safeEnvPath(env.GITHUB_ENV, '/nonexistent')),
     },
     {
       id: 'github_output',
       category: 'blocked',
       control: true,
-      cmd: readProbe('github_output', env.GITHUB_OUTPUT ?? '/nonexistent'),
+      cmd: readProbe('github_output', safeEnvPath(env.GITHUB_OUTPUT, '/nonexistent')),
     },
     {
       id: 'runner_temp_0700',
@@ -633,10 +635,16 @@ describe.skipIf(!gated)('isolate-agent with a provisioned gh config and an admit
       `${ghHost}:\n    oauth_token: ${ghDummyToken}\n    user: dummy-user\n    git_protocol: https\n`,
       {mode: 0o600},
     )
-    if (!fs.existsSync(runnerGhHosts)) {
-      fs.mkdirSync(path.dirname(runnerGhHosts), {recursive: true})
-      fs.writeFileSync(runnerGhHosts, 'github.com:\n    oauth_token: runner-dummy\n    user: runner\n', {mode: 0o644})
+    // Created exclusively (`wx`): no separate existence check, so nothing can slip in between the check and the write.
+    fs.mkdirSync(path.dirname(runnerGhHosts), {recursive: true})
+    try {
+      fs.writeFileSync(runnerGhHosts, 'github.com:\n    oauth_token: runner-dummy\n    user: runner\n', {
+        mode: 0o644,
+        flag: 'wx',
+      })
       createdRunnerGhHosts = true
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
     }
 
     // The admitted repo skill goes through the Action's real admission, into a real staging root.

@@ -500,7 +500,7 @@ describe('runExecute overflow recovery', () => {
 
   it('deletes a stale file-convention response before the fresh attempt', async () => {
     // #given the first attempt overflows after writing a response artifact
-    const responseFilePath = '/tmp/fro-bot-response.md'
+    const responseFilePath = '/fixture/fro-bot-response.md'
     const recoveredResult = createAgentResult({
       success: true,
       exitCode: 0,
@@ -620,7 +620,7 @@ describe('runExecute overflow recovery', () => {
 
     // #when the execute phase runs
     const result = await runExecute(
-      createBootstrap(1_000, {delivery: 'file-convention', responseFilePath: '/tmp/fro-bot-response.md'}),
+      createBootstrap(1_000, {delivery: 'file-convention', responseFilePath: '/fixture/fro-bot-response.md'}),
       createRouting(),
       createCacheRestore(),
       createSessionPrep(),
@@ -654,7 +654,7 @@ describe('runExecute overflow recovery', () => {
 
     // #when the execute phase runs
     const result = await runExecute(
-      createBootstrap(1_000, {delivery: 'file-convention', responseFilePath: '/tmp/fro-bot-response.md'}),
+      createBootstrap(1_000, {delivery: 'file-convention', responseFilePath: '/fixture/fro-bot-response.md'}),
       createRouting(),
       createCacheRestore(),
       createSessionPrep(),
@@ -682,7 +682,7 @@ describe('runExecute overflow recovery', () => {
 
     // #when the execute phase runs
     const result = await runExecute(
-      createBootstrap(1_000, {delivery: 'file-convention', responseFilePath: '/tmp/fro-bot-response.md'}),
+      createBootstrap(1_000, {delivery: 'file-convention', responseFilePath: '/fixture/fro-bot-response.md'}),
       createRouting(),
       createCacheRestore(),
       createSessionPrep(),
@@ -711,7 +711,7 @@ describe('runExecute overflow recovery', () => {
 
     // #when the execute phase runs
     const result = await runExecute(
-      createBootstrap(1_000, {delivery: 'file-convention', responseFilePath: '/tmp/fro-bot-response.md'}),
+      createBootstrap(1_000, {delivery: 'file-convention', responseFilePath: '/fixture/fro-bot-response.md'}),
       createRouting(),
       createCacheRestore(),
       createSessionPrep(),
@@ -852,7 +852,7 @@ function createEligibleInputs(overrides: {readonly isFork?: boolean} = {}): {
   routing: RoutingPhaseResult
 } {
   const bootstrap: BootstrapPhaseResult = {
-    ...createBootstrap(1_000, {delivery: 'file-convention', responseFilePath: '/tmp/fro-bot-response.md'}),
+    ...createBootstrap(1_000, {delivery: 'file-convention', responseFilePath: '/fixture/fro-bot-response.md'}),
     trustedHeadSha: 'a'.repeat(40),
   }
   const baseRouting = createRouting()

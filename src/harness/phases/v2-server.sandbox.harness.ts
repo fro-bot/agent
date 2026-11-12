@@ -14,6 +14,23 @@ import {startOpenCodeV2Server} from '@fro-bot/runtime'
 export const PRELUDE = String.raw`R(){ echo "RESULT $1 $2 $3"; }; ev(){ head -c 240 | tr '\n\r\t' '   '; }; `
 export const q = (value: string): string => `'${value.replaceAll("'", String.raw`'\''`)}'`
 
+const SAFE_ABSOLUTE_PATH = /^\/[\w@%+=:,./-]+$/
+const SAFE_TOKEN = /^[\w.-]+$/
+
+/**
+ * An environment-derived path that is about to be embedded in a shell command string. Only a plain absolute path with no
+ * parent segment is accepted; anything else (unset, relative, or carrying shell metacharacters) yields `fallback`, so a
+ * hostile environment cannot change what the command does.
+ */
+export function safeEnvPath(value: string | undefined, fallback: string): string {
+  return value !== undefined && SAFE_ABSOLUTE_PATH.test(value) && !value.split('/').includes('..') ? value : fallback
+}
+
+/** Same idea for an environment-derived token: word characters, dots and dashes only. */
+export function safeEnvToken(value: string | undefined, fallback: string): string {
+  return value !== undefined && SAFE_TOKEN.test(value) ? value : fallback
+}
+
 export interface Probe {
   readonly id: string
   readonly category: 'blocked' | 'works' | 'info'
