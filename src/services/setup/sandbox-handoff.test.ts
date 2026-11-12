@@ -188,9 +188,15 @@ describe('sandbox handoff', () => {
     const refused = async (): Promise<string> => {
       const result = await handOff(fx.manifest, fx.deps)
       expect(result.success).toBe(false)
-      // refused before any privileged mutation, and the rollback left nothing granted
-      expect(mutating(fx.calls)).toEqual([])
-      return result.success ? '' : result.error
+      // refused before any lock or grant; the only privileged commands are the rollback's own chown back of inodes the
+      // sandbox owns (there are none)
+      const applied = mutating(fx.calls).filter(call => !call.includes('-user') || !call.includes(String(SANDBOX_UID)))
+      expect(applied).toEqual([])
+      // the .git was there before the audit refused it, so the rollback is complete rather than blaming the run for creating it
+      const message = result.success ? '' : result.error
+      expect(message).not.toContain('rollback incomplete')
+      expect(message).not.toContain('created during the run')
+      return message
     }
 
     /** What actions/checkout leaves in `.git/config` for a normal (shallow, no-credentials) checkout. */
@@ -226,6 +232,35 @@ describe('sandbox handoff', () => {
       writeConfig(checkoutConfig(fx.manifest.workspace))
 
       // #when / #then it is trusted as is
+      const result = await handOff(fx.manifest, fx.deps)
+      expect(result.success ? 'ok' : result.error).toBe('ok')
+    })
+
+    it('positive control: the exact local config of a real hosted actions/checkout (git-lfs installed) is accepted', async () => {
+      // #given the keys `git config --local --list --name-only` printed on a GitHub-hosted runner after actions/checkout v7;
+      // git-lfs 3.x is installed system-wide there, which is why the checkout writes lfs.repositoryformatversion
+      writeConfig(
+        [
+          '[core]',
+          '\trepositoryformatversion = 0',
+          '\tfilemode = true',
+          '\tbare = false',
+          '\tlogallrefupdates = true',
+          '[remote "origin"]',
+          '\turl = https://github.com/fro-bot/.github',
+          '\tfetch = +refs/heads/*:refs/remotes/origin/*',
+          '[branch "probe/isolate-agent-live"]',
+          '\tremote = origin',
+          '\tmerge = refs/heads/probe/isolate-agent-live',
+          '[gc]',
+          '\tauto = 0',
+          '[lfs]',
+          '\trepositoryformatversion = 0',
+          '',
+        ].join('\n'),
+      )
+
+      // #when / #then it is trusted as is, and the rollback has nothing to report
       const result = await handOff(fx.manifest, fx.deps)
       expect(result.success ? 'ok' : result.error).toBe('ok')
     })
@@ -267,6 +302,10 @@ describe('sandbox handoff', () => {
       ['a remote with an unknown option', '[remote "origin"]\n\tuploadpack = ./x\n', 'remote.origin.uploadpack'],
       ['a branch with an unknown option', '[branch "main"]\n\tmergeOptions = --x\n', 'branch.main.mergeoptions'],
       ['an unknown section', '[whatever]\n\tx = y\n', 'whatever.x'],
+      ['lfs.url in local config', '[lfs]\n\turl = https://x/lfs\n', 'lfs.url'],
+      ['lfs.url beside the allowed lfs key', '[lfs]\n\trepositoryformatversion = 0\n\turl = https://x\n', 'lfs.url'],
+      ['lfs.customtransfer.*', '[lfs "customtransfer.x"]\n\tpath = ./xfer\n', 'lfs.customtransfer.x.path'],
+      ['an lfs filter in local config', '[filter "lfs"]\n\tclean = git-lfs clean -- %f\n', 'filter.lfs.clean'],
     ])('refuses %s, naming the key', async (_label, text, key) => {
       // #given a config with one key outside the allowlist, beside an otherwise normal checkout config
       writeConfig(`${checkoutConfig(fx.manifest.workspace)}${text}`)
