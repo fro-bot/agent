@@ -3,6 +3,7 @@ import type {MetricsCollector} from '../../features/observability/index.js'
 import type {RepoSkillsSource} from '../../services/setup/repo-skills.js'
 import type {CacheResult} from '../../shared/types.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
+import type {SandboxLifecycle} from './sandbox-lifecycle.js'
 import * as path from 'node:path'
 import process from 'node:process'
 import * as core from '@actions/core'
@@ -35,6 +36,11 @@ export interface CacheRestorePhaseResult {
   readonly cacheResult: CacheResult
   readonly cacheStatus: 'corrupted' | 'hit' | 'miss'
   readonly serverHandle: OpenCodeV2ServerHandle
+  /**
+   * The `isolate-agent` lifecycle when the run is isolated. The caller releases it (stop, verify, take back) after the
+   * server is shut down and before anything reads the sandbox's output. Absent for a normal run.
+   */
+  readonly sandbox?: SandboxLifecycle | null
 }
 
 export async function runCacheRestore(
@@ -162,6 +168,9 @@ async function startV2Server(
 ): Promise<CacheRestorePhaseResult | null> {
   const serverLogger = createLogger({phase: 'server-bootstrap'})
   const {inputs, opencodeResult} = bootstrap
+  // Created by bootstrap, which is what lets the run release it (and read whether it was restored) even when this start
+  // fails or throws.
+  const sandbox = bootstrap.sandbox ?? null
   const started = await startActionOpenCodeV2({
     binaryPath: opencodeResult.path,
     // Normalized to match what the harness's own session-scoped calls use: the gates and every later request address
@@ -183,11 +192,12 @@ async function startV2Server(
     runAttempt: getGitHubRunAttempt(),
     logger: serverLogger,
     maskSecret: value => core.setSecret(value),
+    sandbox,
   })
 
   if (!started.success) {
     core.setFailed(`OpenCode V2 start failed (${started.error.stage}): ${started.error.message}`)
     return null
   }
-  return {cacheResult, cacheStatus, serverHandle: started.data}
+  return {cacheResult, cacheStatus, serverHandle: started.data, sandbox}
 }

@@ -26,8 +26,9 @@ type EventClassification = 'affected' | 'autonomous' | 'deferred-or-unknown'
  * event name — defaults to `deferred-or-unknown`, which resolves to
  * `provision`/`model-gh`.
  *
- * Withholding keeps the token out of the agent's env and gh config; it is not an
- * OS boundary, since the agent can read the action's environ on Linux (#2135).
+ * Withholding keeps the token out of the agent's env and gh config; on its own it is
+ * not an OS boundary, since the agent can read the action's environ on Linux. The
+ * `isolate-agent` input runs the agent as a separate user to provide one (#2135).
  */
 function classifyEvent(eventName: string): EventClassification {
   switch (eventName) {

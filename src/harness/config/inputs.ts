@@ -240,6 +240,7 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     const skipCache = skipCacheRaw === 'true'
 
     const repoSkills = parseRepoSkills(core.getInput('repo-skills'))
+    const isolateAgent = parseIsolateAgent(core.getInput('isolate-agent'))
 
     const systematicVersionRaw = core.getInput('systematic-version').trim()
     const systematicVersion = systematicVersionRaw.length > 0 ? systematicVersionRaw : DEFAULT_SYSTEMATIC_VERSION
@@ -290,6 +291,7 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
       reviewSkipLabel,
       brokeredPushExtraPaths,
       repoSkills,
+      isolateAgent,
     })
   } catch (error) {
     return err(error instanceof Error ? error : new Error(String(error)))
@@ -305,6 +307,17 @@ function parseRepoSkills(input: string): boolean {
   if (value === '' || value === 'false') return false
   if (value === 'true') return true
   throw new Error(`Invalid repo-skills value: "${input.trim()}". Valid values: true, false`)
+}
+
+/**
+ * `isolate-agent` is a security opt-in that changes how the server is launched, so anything other than an explicit
+ * `true` or `false` is an error rather than a silent opt-out. An empty value is the unset input.
+ */
+function parseIsolateAgent(input: string): boolean {
+  const value = input.trim().toLowerCase()
+  if (value === '' || value === 'false') return false
+  if (value === 'true') return true
+  throw new Error(`Invalid isolate-agent value: "${input.trim()}". Valid values: true, false`)
 }
 
 /**

@@ -48,6 +48,9 @@ vi.mock('@fro-bot/runtime', async importOriginal => {
   return {
     ...original,
     parseResponseFile: mocks.parseResponseFile,
+    // Routed onto the readFile mock so these tests keep exercising recovery; the real no-follow refusals are tested in
+    // response-read-safety.test.ts.
+    readTextNoFollow: async (file: string): Promise<string> => mocks.readResponseFile(file, 'utf8') as Promise<string>,
     resolveResponseDelivery: mocks.resolveResponseDelivery,
   }
 })
@@ -120,6 +123,7 @@ function createBootstrap(
       reviewSkipLabel: null,
       brokeredPushExtraPaths: [],
       repoSkills: false,
+      isolateAgent: false,
     },
     logger: mocks.logger,
     opencodeResult: {path: 'opencode', version: '1.0.0'},
@@ -127,6 +131,7 @@ function createBootstrap(
     responseFilePath: overrides.responseFilePath ?? null,
     responseFilePathCandidates: null,
     trustedHeadSha: '',
+    sandboxTools: null,
   }
 }
 
@@ -495,7 +500,7 @@ describe('runExecute overflow recovery', () => {
 
   it('deletes a stale file-convention response before the fresh attempt', async () => {
     // #given the first attempt overflows after writing a response artifact
-    const responseFilePath = '/tmp/fro-bot-response.md'
+    const responseFilePath = '/fixture/fro-bot-response.md'
     const recoveredResult = createAgentResult({
       success: true,
       exitCode: 0,
@@ -615,7 +620,7 @@ describe('runExecute overflow recovery', () => {
 
     // #when the execute phase runs
     const result = await runExecute(
-      createBootstrap(1_000, {delivery: 'file-convention', responseFilePath: '/tmp/fro-bot-response.md'}),
+      createBootstrap(1_000, {delivery: 'file-convention', responseFilePath: '/fixture/fro-bot-response.md'}),
       createRouting(),
       createCacheRestore(),
       createSessionPrep(),
@@ -649,7 +654,7 @@ describe('runExecute overflow recovery', () => {
 
     // #when the execute phase runs
     const result = await runExecute(
-      createBootstrap(1_000, {delivery: 'file-convention', responseFilePath: '/tmp/fro-bot-response.md'}),
+      createBootstrap(1_000, {delivery: 'file-convention', responseFilePath: '/fixture/fro-bot-response.md'}),
       createRouting(),
       createCacheRestore(),
       createSessionPrep(),
@@ -677,7 +682,7 @@ describe('runExecute overflow recovery', () => {
 
     // #when the execute phase runs
     const result = await runExecute(
-      createBootstrap(1_000, {delivery: 'file-convention', responseFilePath: '/tmp/fro-bot-response.md'}),
+      createBootstrap(1_000, {delivery: 'file-convention', responseFilePath: '/fixture/fro-bot-response.md'}),
       createRouting(),
       createCacheRestore(),
       createSessionPrep(),
@@ -706,7 +711,7 @@ describe('runExecute overflow recovery', () => {
 
     // #when the execute phase runs
     const result = await runExecute(
-      createBootstrap(1_000, {delivery: 'file-convention', responseFilePath: '/tmp/fro-bot-response.md'}),
+      createBootstrap(1_000, {delivery: 'file-convention', responseFilePath: '/fixture/fro-bot-response.md'}),
       createRouting(),
       createCacheRestore(),
       createSessionPrep(),
@@ -847,7 +852,7 @@ function createEligibleInputs(overrides: {readonly isFork?: boolean} = {}): {
   routing: RoutingPhaseResult
 } {
   const bootstrap: BootstrapPhaseResult = {
-    ...createBootstrap(1_000, {delivery: 'file-convention', responseFilePath: '/tmp/fro-bot-response.md'}),
+    ...createBootstrap(1_000, {delivery: 'file-convention', responseFilePath: '/fixture/fro-bot-response.md'}),
     trustedHeadSha: 'a'.repeat(40),
   }
   const baseRouting = createRouting()

@@ -97,6 +97,7 @@ function bootstrap(): BootstrapPhaseResult {
       reviewSkipLabel: null,
       brokeredPushExtraPaths: [],
       repoSkills: false,
+      isolateAgent: false,
     },
     logger: mocks.logger,
     opencodeResult: {path: 'opencode', version: '2.2.5'},

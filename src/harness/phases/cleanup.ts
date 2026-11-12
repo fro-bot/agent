@@ -91,6 +91,12 @@ export interface CleanupPhaseOptions {
    * complete, or a run that ended before it began). Replaces the lock wording in the decline warning. Ignored unless `skipSessionPersistence` is true.
    */
   readonly persistenceDeclineReason?: string
+  /**
+   * `true` when an `isolate-agent` sandbox was not confirmed stopped and restored. The log directory is then
+   * sandbox-writable, so cleanup reads and publishes nothing from it (no object-store artifact sync, no log artifact
+   * upload). Runner-generated metadata is unaffected.
+   */
+  readonly sandboxOutputUntrusted?: boolean
 }
 
 /**
@@ -134,6 +140,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
     leaseRenewal,
     skipSessionPersistence = false,
     persistenceDeclineReason,
+    sandboxOutputUntrusted = false,
   } = options
 
   // Populated below (quiescence during the shutdown step; lease continuity at the very end,
@@ -259,15 +266,14 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
       try {
         const adapter = createS3Adapter(storeConfig, objectStoreLogger)
         const logPath = getOpenCodeLogPath()
-        const artifactResult = await syncArtifactsToStore(
-          adapter,
-          storeConfig,
-          agentIdentity,
-          repo,
-          runId,
-          logPath,
-          objectStoreLogger,
-        )
+        const artifactResult = sandboxOutputUntrusted
+          ? {uploaded: 0, failed: 0}
+          : await syncArtifactsToStore(adapter, storeConfig, agentIdentity, repo, runId, logPath, objectStoreLogger)
+        if (sandboxOutputUntrusted) {
+          objectStoreLogger.warning(
+            'Skipping the object-store artifact sync: the isolate-agent sandbox was not confirmed stopped and restored, so its log directory is not read',
+          )
+        }
         const snapshot = metrics.getMetrics()
         const sessionIds = [...new Set([...snapshot.sessionsUsed, ...snapshot.sessionsCreated])]
         const metadata = {
@@ -419,7 +425,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
       declineReason == null && storePublishWithheld ? 'lease-not-acquired' : undefined,
     )
 
-    if (isOpenCodePromptArtifactEnabled()) {
+    if (isOpenCodePromptArtifactEnabled() && !sandboxOutputUntrusted) {
       const artifactLogger = createLogger({phase: 'artifact-upload'})
       const artifactUploaded = await uploadLogArtifact({
         logPath: getOpenCodeLogPath(),

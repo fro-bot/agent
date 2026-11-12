@@ -16,6 +16,8 @@ const mocks = vi.hoisted(() => ({
   ensureOpenCodeAvailable: vi.fn(),
   randomUUID: vi.fn(),
   assertNoPersistedGitCredentials: vi.fn(),
+  runSandboxPreflight: vi.fn(),
+  createSandboxLifecycle: vi.fn(),
 }))
 
 vi.mock('@actions/core', () => ({
@@ -51,6 +53,15 @@ vi.mock('../../services/setup/git-credential-check.js', () => ({
   assertNoPersistedGitCredentials: mocks.assertNoPersistedGitCredentials,
 }))
 
+vi.mock('./sandbox-lifecycle.js', () => ({
+  createSandboxLifecycle: mocks.createSandboxLifecycle,
+}))
+
+vi.mock('../../services/setup/sandbox-preflight.js', () => ({
+  runSandboxPreflight: mocks.runSandboxPreflight,
+  createSandboxPreflightDeps: () => ({}),
+}))
+
 vi.mock('../../shared/logger.js', () => ({
   createLogger: () => ({debug: vi.fn(), info: vi.fn(), warning: vi.fn(), error: vi.fn()}),
 }))
@@ -77,6 +88,7 @@ function createActionInputs(overrides: Partial<ActionInputs> = {}): ActionInputs
     reviewSkipLabel: null,
     brokeredPushExtraPaths: [],
     repoSkills: false,
+    isolateAgent: false,
     storeConfig: {
       enabled: false,
       bucket: '',
@@ -485,5 +497,163 @@ describe('runBootstrap git-credential-check wiring', () => {
     expect(result).not.toBeNull()
     expect(result?.delivery).toBe('none')
     expect(mocks.assertNoPersistedGitCredentials).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('runBootstrap isolate-agent preflight', () => {
+  const tools = {sudo: '/usr/bin/sudo', setpriv: '/usr/bin/setpriv'}
+
+  beforeEach(async () => {
+    vi.clearAllMocks()
+    runnerTempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fro-bot-bootstrap-iso-'))
+    vi.stubEnv('RUNNER_TEMP', runnerTempDir)
+    mocks.githubContext.eventName = 'issues'
+    mocks.randomUUID.mockReturnValue('test-nonce')
+    mocks.ensureOpenCodeAvailable.mockResolvedValue({version: DEFAULT_OPENCODE_VERSION})
+    mocks.assertNoPersistedGitCredentials.mockResolvedValue(ok(undefined))
+  })
+
+  afterEach(async () => {
+    vi.restoreAllMocks()
+    vi.unstubAllEnvs()
+    await fs.rm(runnerTempDir, {recursive: true, force: true})
+  })
+
+  it('stops before any setup or directory creation when the runner is unsupported', async () => {
+    // #given isolation is on and the preflight rejects the runner
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: true})})
+    mocks.runSandboxPreflight.mockResolvedValue({
+      ok: false,
+      check: 'sudo',
+      message: 'isolate-agent is not supported on this runner (sudo): passwordless sudo is required',
+    })
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when bootstrap runs
+    const result = await runBootstrap(createMockLogger())
+
+    // #then it fails with the check's message and nothing was set up
+    expect(result).toBeNull()
+    expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('(sudo)'))
+    expect(mocks.ensureOpenCodeAvailable).not.toHaveBeenCalled()
+    expect(mocks.assertNoPersistedGitCredentials).not.toHaveBeenCalled()
+    expect(await fs.readdir(runnerTempDir)).toEqual([])
+  })
+
+  it('carries the resolved tool paths forward when the runner is supported', async () => {
+    // #given isolation is on and the preflight passes
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: true})})
+    mocks.runSandboxPreflight.mockResolvedValue({ok: true, tools})
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when bootstrap runs
+    const result = await runBootstrap(createMockLogger())
+
+    // #then setup proceeds and the tools are handed to later phases
+    expect(result?.sandboxTools).toEqual(tools)
+    expect(mocks.ensureOpenCodeAvailable).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['workflow_dispatch', 'schedule', 'issues'])(
+    'checks the checkout for persisted git credentials on %s when isolation is on',
+    async eventName => {
+      // #given isolation on; workflow_dispatch and schedule provision the credential, issues withholds it
+      mocks.githubContext.eventName = eventName
+      vi.stubEnv('GITHUB_WORKSPACE', path.join(runnerTempDir, 'repo'))
+      mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: true})})
+      mocks.runSandboxPreflight.mockResolvedValue({ok: true, tools})
+      const {runBootstrap} = await import('./bootstrap.js')
+
+      // #when
+      const result = await runBootstrap(createMockLogger())
+
+      // #then the sandbox user could read the checkout's .git/config, so the check ran, once
+      expect(result).not.toBeNull()
+      expect(mocks.assertNoPersistedGitCredentials).toHaveBeenCalledTimes(1)
+    },
+  )
+
+  it('fails closed on a provision trigger when the checkout persisted credentials, naming persist-credentials', async () => {
+    // #given a provision trigger, isolation on, and a checkout that kept its extraheader
+    mocks.githubContext.eventName = 'workflow_dispatch'
+    vi.stubEnv('GITHUB_WORKSPACE', path.join(runnerTempDir, 'repo'))
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: true})})
+    mocks.runSandboxPreflight.mockResolvedValue({ok: true, tools})
+    mocks.assertNoPersistedGitCredentials.mockResolvedValue(err('http.extraheader found'))
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when
+    const result = await runBootstrap(createMockLogger())
+
+    // #then it aborts before setup, with an actionable message
+    expect(result).toBeNull()
+    expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('persist-credentials: false') as string)
+    expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('isolate-agent') as string)
+    expect(mocks.ensureOpenCodeAvailable).not.toHaveBeenCalled()
+  })
+
+  it('still skips the credential check on a provision trigger when isolation is off', async () => {
+    // #given the same trigger without isolation
+    mocks.githubContext.eventName = 'workflow_dispatch'
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: false})})
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when
+    await runBootstrap(createMockLogger())
+
+    // #then behavior is unchanged
+    expect(mocks.assertNoPersistedGitCredentials).not.toHaveBeenCalled()
+  })
+
+  it('creates the sandbox lifecycle here, so the run owns it before the server starts, and records its state', async () => {
+    // #given isolation on, a supported runner and a file-convention response path
+    const lifecycle = {prepare: vi.fn(), release: vi.fn(), launch: vi.fn()}
+    mocks.createSandboxLifecycle.mockReturnValue(lifecycle)
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: true})})
+    mocks.runSandboxPreflight.mockResolvedValue({ok: true, tools})
+    vi.stubEnv('GITHUB_WORKSPACE', path.join(runnerTempDir, 'repo'))
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when bootstrap runs
+    const result = await runBootstrap(createMockLogger())
+
+    // #then the lifecycle is on the result, built from the resolved tools and the run's own paths
+    expect(result?.sandbox).toBe(lifecycle)
+    const options = mocks.createSandboxLifecycle.mock.calls[0]?.[0] as {
+      tools: unknown
+      workspacePath: string
+      recordState: (state: string) => void
+    }
+    expect(options.tools).toBe(tools)
+    expect(options.workspacePath).toBe(path.join(runnerTempDir, 'repo'))
+    // #and its state changes are written for the post hook
+    options.recordState('pending')
+    expect(mocks.saveState).toHaveBeenCalledWith('sandboxState', 'pending')
+  })
+
+  it('creates no lifecycle when isolation is off', async () => {
+    // #given the input is off
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: false})})
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when bootstrap runs
+    const result = await runBootstrap(createMockLogger())
+
+    // #then
+    expect(result?.sandbox ?? null).toBeNull()
+    expect(mocks.createSandboxLifecycle).not.toHaveBeenCalled()
+  })
+
+  it('runs no preflight and carries no tools when isolation is off', async () => {
+    // #given the input is off
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: false})})
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when bootstrap runs
+    const result = await runBootstrap(createMockLogger())
+
+    // #then the preflight never ran
+    expect(mocks.runSandboxPreflight).not.toHaveBeenCalled()
+    expect(result?.sandboxTools).toBeNull()
   })
 })

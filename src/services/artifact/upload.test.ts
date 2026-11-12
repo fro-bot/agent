@@ -7,6 +7,7 @@ const {mockUploadArtifact} = vi.hoisted(() => ({
 
 vi.mock('node:fs/promises', () => ({
   access: vi.fn(),
+  lstat: vi.fn(),
   readdir: vi.fn(),
 }))
 
@@ -17,8 +18,28 @@ vi.mock('@actions/artifact', () => ({
 }))
 
 describe('uploadLogArtifact', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks()
+    // A plain directory unless a test says otherwise.
+    const fs = await import('node:fs/promises')
+    vi.mocked(fs.lstat).mockResolvedValue({isSymbolicLink: () => false, isDirectory: () => true} as never)
+  })
+
+  it('skips the upload, without listing, when the log path is a symlink', async () => {
+    // #given a log path a sandboxed agent replaced with a symlink
+    const fs = await import('node:fs/promises')
+    vi.mocked(fs.access).mockResolvedValue(undefined)
+    vi.mocked(fs.lstat).mockResolvedValue({isSymbolicLink: () => true, isDirectory: () => false} as never)
+    const {uploadLogArtifact} = await import('./upload.js')
+    const logger = createMockLogger()
+
+    // #when upload is attempted
+    const result = await uploadLogArtifact({logPath: '/log', runId: 1, runAttempt: 1, invocationIdentity: null, logger})
+
+    // #then nothing is listed or uploaded
+    expect(result).toBe(false)
+    expect(fs.readdir).not.toHaveBeenCalled()
+    expect(mockUploadArtifact).not.toHaveBeenCalled()
   })
 
   it('returns false when log directory does not exist', async () => {

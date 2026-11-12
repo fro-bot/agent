@@ -20,7 +20,12 @@ import type {ReviewEvent} from '../reviews/types.js'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import process from 'node:process'
-import {parseResponseFile, RESPONSE_FILE_VERDICT_REJECTION_REASONS, RESPONSE_SURFACE_POLICIES} from '@fro-bot/runtime'
+import {
+  parseResponseFile,
+  readTextNoFollow,
+  RESPONSE_FILE_VERDICT_REJECTION_REASONS,
+  RESPONSE_SURFACE_POLICIES,
+} from '@fro-bot/runtime'
 import {BOT_COMMENT_MARKER, type CommentTarget, type Octokit} from '../../services/github/types.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {readThread} from '../comments/reader.js'
@@ -197,17 +202,23 @@ export async function readAndParseResponseFile(
     ...(params.responseFilePathCandidates?.fallbackPaths ?? []).filter(candidate => candidate !== responseFilePath),
   ]
   const candidateBasenames = new Set(responseFilePathCandidates.map(candidate => path.basename(candidate)))
+  const workspaceDir =
+    process.env.GITHUB_WORKSPACE === undefined || process.env.GITHUB_WORKSPACE.length === 0
+      ? undefined
+      : process.env.GITHUB_WORKSPACE
   let raw: string | undefined
   let actualResponseFilePath = responseFilePath
   let readError: unknown
   try {
-    raw = await fs.readFile(responseFilePath, 'utf8')
+    raw = await readTextNoFollow(responseFilePath)
   } catch (error) {
     readError = error
     if (errorCode(error) === 'ENOENT') {
       for (const candidate of responseFilePathCandidates.slice(1)) {
         try {
-          raw = await fs.readFile(candidate, 'utf8')
+          // Fallback candidates live under the checkout, which the sandbox user can shape: no symlinked directory in the
+          // middle of the path may lead the read outside it.
+          raw = await readTextNoFollow(candidate, workspaceDir === undefined ? {} : {within: workspaceDir})
           actualResponseFilePath = candidate
           break
         } catch (candidateError) {

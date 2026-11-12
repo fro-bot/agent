@@ -2,6 +2,7 @@ import type {ObjectStoreAdapter, OpenCodeV2ServerHandle} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
 import type {ActionInputs, CacheResult} from '../../shared/types.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
+import type {SandboxLifecycle} from './sandbox-lifecycle.js'
 import {Buffer} from 'node:buffer'
 import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
@@ -111,6 +112,7 @@ function createActionInputs(overrides: Partial<ActionInputs> = {}): ActionInputs
     reviewSkipLabel: null,
     brokeredPushExtraPaths: [],
     repoSkills: false,
+    isolateAgent: false,
     storeConfig: {
       enabled: false,
       bucket: '',
@@ -130,6 +132,7 @@ function createBootstrapPhaseResult(overrides: Partial<BootstrapPhaseResult> = {
     responseFilePath: null,
     responseFilePathCandidates: null,
     trustedHeadSha: '',
+    sandboxTools: null,
     ...overrides,
   }
 }
@@ -378,6 +381,35 @@ describe('runCacheRestore database repair', () => {
     // regression here would silently move the checkpoint cost back inside the bootstrap
     // budget it was moved out of
     expect(order).toEqual(['restoreCache', 'checkpointDatabase', 'startActionOpenCodeV2'])
+  })
+
+  it('hands the lifecycle the bootstrap created to the start, and returns it on the result', async () => {
+    // #given an isolated run: the lifecycle was created by bootstrap
+    mocks.restoreCache.mockResolvedValue(createCacheResult({hit: true, corrupted: false, source: 'cache'}))
+    mocks.checkpointDatabase.mockResolvedValue({status: 'nothing-to-checkpoint'})
+    const sandbox = {prepare: vi.fn(), release: vi.fn(), launch: vi.fn()} as unknown as SandboxLifecycle
+    const {runCacheRestore} = await import('./cache-restore.js')
+
+    // #when
+    const result = await runCacheRestore(createBootstrapPhaseResult({sandbox}), createMetricsCollector())
+
+    // #then the same object reaches the start (so its failure paths release it) and the phase result
+    expect(mocks.startActionOpenCodeV2).toHaveBeenCalledWith(expect.objectContaining({sandbox}))
+    expect(result?.sandbox).toBe(sandbox)
+  })
+
+  it('passes no sandbox for a run that is not isolated', async () => {
+    // #given no lifecycle on the bootstrap result
+    mocks.restoreCache.mockResolvedValue(createCacheResult({hit: true, corrupted: false, source: 'cache'}))
+    mocks.checkpointDatabase.mockResolvedValue({status: 'nothing-to-checkpoint'})
+    const {runCacheRestore} = await import('./cache-restore.js')
+
+    // #when
+    const result = await runCacheRestore(createBootstrapPhaseResult(), createMetricsCollector())
+
+    // #then
+    expect(mocks.startActionOpenCodeV2).toHaveBeenCalledWith(expect.objectContaining({sandbox: null}))
+    expect(result?.sandbox ?? null).toBeNull()
   })
 })
 

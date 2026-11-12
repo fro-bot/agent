@@ -462,7 +462,15 @@ describe('resolveBrokeredPushCommitMessage lookup bounds', () => {
     expect(calls).toHaveLength(2)
     for (const [command, args, timeoutMs] of calls) {
       expect(command).toBe('git')
-      expect(args.slice(0, 3)).toEqual(['--no-pager', '-c', 'log.showSignature=false'])
+      expect(args.slice(0, 7)).toEqual([
+        '--no-pager',
+        '-c',
+        'core.fsmonitor=false',
+        '-c',
+        'core.hooksPath=/dev/null',
+        '-c',
+        'log.showSignature=false',
+      ])
       expect(timeoutMs).toBeLessThanOrEqual(5_000)
     }
     expect(calls[1]?.[1]).toContain('--no-show-signature')

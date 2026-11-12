@@ -1,9 +1,9 @@
 import type {ExecAdapter} from '../../services/setup/types.js'
 import type {Logger} from '../../shared/logger.js'
 
-import {Buffer} from 'node:buffer'
 import {TextDecoder, TextEncoder} from 'node:util'
 import {toErrorMessage} from '../../shared/errors.js'
+import {runTrustedGit} from './trusted-git.js'
 
 export const MAX_COMMIT_SUBJECT_LENGTH = 72
 export const MAX_COMMIT_BODY_BYTES = 4096
@@ -13,12 +13,6 @@ export const COMMIT_MESSAGE_LOOKUP_TIMEOUT_MS = 5_000
 const MAX_SANITIZE_PASSES = 10
 
 const SHA1_PATTERN = /^[0-9a-f]{40}$/i
-const GIT_ENV = {
-  GIT_CONFIG_NOSYSTEM: '1',
-  GIT_CONFIG_GLOBAL: '/dev/null',
-  GIT_CONFIG_SYSTEM: '/dev/null',
-  GIT_PAGER: 'cat',
-} as const
 
 /** Tokens GitHub (and common CI setups) honor to skip workflow runs on a push. */
 const SKIP_WORKFLOW_TOKEN =
@@ -149,42 +143,18 @@ export async function resolveBrokeredPushCommitMessage(
   }
 }
 
-type GitRun =
-  | {readonly kind: 'completed'; readonly exitCode: number; readonly stdout: string; readonly stderr: string}
-  | {readonly kind: 'timed-out'}
-  | {readonly kind: 'unavailable'}
+type GitRun = Awaited<ReturnType<typeof runTrustedGit>>
 
 /**
- * Run one argv-form git call under `COMMIT_MESSAGE_LOOKUP_TIMEOUT_MS`. The adapter's `execWithTimeout`
- * kills the child's whole process group on expiry; without it there is no bound, so the lookup is skipped.
+ * Run one argv-form git call under `COMMIT_MESSAGE_LOOKUP_TIMEOUT_MS`, through the trusted wrapper. The adapter's
+ * `execWithTimeout` kills the child's whole process group on expiry; without it there is no bound, so the lookup is
+ * skipped.
  */
 async function runGit(execAdapter: ExecAdapter, args: readonly string[], repoRoot: string): Promise<GitRun> {
-  if (execAdapter.execWithTimeout == null) {
-    return {kind: 'unavailable'}
-  }
-
-  const stdout: Buffer[] = []
-  const stderr: Buffer[] = []
-  const exitCode = await execAdapter.execWithTimeout(
-    'git',
-    ['--no-pager', '-c', 'log.showSignature=false', ...args],
-    COMMIT_MESSAGE_LOOKUP_TIMEOUT_MS,
-    {
-      cwd: repoRoot,
-      env: GIT_ENV,
-      listeners: {stdout: data => stdout.push(data), stderr: data => stderr.push(data)},
-    },
-  )
-  if (exitCode === 'timed-out') {
-    return {kind: 'timed-out'}
-  }
-
-  return {
-    kind: 'completed',
-    exitCode,
-    stdout: Buffer.concat(stdout).toString('utf-8'),
-    stderr: Buffer.concat(stderr).toString('utf-8'),
-  }
+  return runTrustedGit(execAdapter, ['-c', 'log.showSignature=false', ...args], repoRoot, {
+    timeoutMs: COMMIT_MESSAGE_LOOKUP_TIMEOUT_MS,
+    requireTimeout: true,
+  })
 }
 
 function warnLookupBounded(logger: Logger, kind: 'timed-out' | 'unavailable', fallback: string): string {

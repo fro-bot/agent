@@ -1,7 +1,7 @@
 import type {ChildProcess} from 'node:child_process'
 import type {ExecAdapter, ToolCacheAdapter} from './types.js'
 import {Buffer} from 'node:buffer'
-import {spawn} from 'node:child_process'
+import {spawn, spawnSync} from 'node:child_process'
 import process from 'node:process'
 import * as exec from '@actions/exec'
 import * as tc from '@actions/tool-cache'
@@ -17,6 +17,31 @@ function forwardOutput(listener: ((data: Buffer) => void) | undefined, data: unk
     return
   }
   listener(Buffer.from(String(data)))
+}
+
+/**
+ * Who owns signal handling. By default the exec adapter does: on SIGTERM/SIGINT it kills the running child's process group and
+ * re-raises the signal. A component that has its own teardown to run (the isolate-agent lifecycle) takes ownership for as long
+ * as it needs, and the adapter then does nothing on a signal: it neither kills the commands that teardown is running (a
+ * second signal, as the runner escalates a cancelled step, would otherwise SIGKILL a `chown -R` midway) nor re-raises the
+ * signal before the owner has finished. The owner ends the process itself.
+ */
+let signalOwners = 0
+
+/** True while some component owns signal handling. */
+export function isSignalOwned(): boolean {
+  return signalOwners > 0
+}
+
+/** Takes signal ownership until the returned function is called (idempotent). Holders are counted. */
+export function holdSignalOwnership(): () => void {
+  signalOwners += 1
+  let held = true
+  return () => {
+    if (!held) return
+    held = false
+    signalOwners -= 1
+  }
 }
 
 /**
@@ -42,6 +67,51 @@ function hasChildExited(child: ChildProcess): boolean {
  * Returns whether a signal was actually sent — `false` when the child had already exited, so
  * callers never treat a merely-scheduled kill as proof the process was reaped.
  */
+/** Longest listing handed to `onTimeout`: enough to see a parent, the command and a few helpers. */
+const SNAPSHOT_MAX_ROWS = 25
+const SNAPSHOT_MAX_ARGS = 140
+
+/**
+ * A listing of `rootPid` and everything under it (its process group and its descendants by parent), from `ps`. Used on the
+ * timeout path only, to say what a hung command was still waiting on. Best effort: any failure yields a one-line reason.
+ */
+function snapshotProcessTree(rootPid: number | undefined): string {
+  if (rootPid === undefined || process.platform === 'win32') return 'process listing unavailable'
+  const listing = spawnSync('ps', ['-eo', 'pid=,ppid=,pgid=,stat=,etime=,args='], {encoding: 'utf8', timeout: 2_000})
+  if (listing.status !== 0 || typeof listing.stdout !== 'string') return 'process listing unavailable'
+  const rows = listing.stdout
+    .split('\n')
+    .map(line => /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)(?:\s(.*))?$/.exec(line))
+    .filter((match): match is RegExpExecArray => match !== null)
+    .map(match => ({
+      pid: Number(match[1]),
+      ppid: Number(match[2]),
+      pgid: Number(match[3]),
+      stat: match[4] ?? '',
+      etime: match[5] ?? '',
+      args: (match[6] ?? '').trim().slice(0, SNAPSHOT_MAX_ARGS),
+    }))
+  const inTree = new Set<number>([rootPid])
+  let grew = true
+  while (grew) {
+    grew = false
+    for (const row of rows) {
+      if (!inTree.has(row.pid) && (row.pgid === rootPid || inTree.has(row.ppid))) {
+        inTree.add(row.pid)
+        grew = true
+      }
+    }
+  }
+  const lines = rows
+    .filter(row => inTree.has(row.pid))
+    .slice(0, SNAPSHOT_MAX_ROWS)
+    .map(row => `${row.pid} ${row.ppid} ${row.pgid} ${row.stat} ${row.etime} ${row.args}`)
+  return [
+    'PID PPID PGID STAT ELAPSED COMMAND',
+    ...(lines.length === 0 ? ['(the command is no longer running)'] : lines),
+  ].join('\n')
+}
+
 function killChildProcessGroup(child: ChildProcess, signal: NodeJS.Signals): boolean {
   if (hasChildExited(child)) {
     // The child already exited — `close` just hasn't fired yet. Signalling now could hit a
@@ -112,6 +182,9 @@ async function execWithTimeout(
       process.off('exit', handleParentExit)
     }
     function handleParentSignal(signal: NodeJS.Signals): void {
+      // Someone else is tearing down; this command is part of that, so it keeps running. The listener stays registered
+      // (it is `on`, not `once`) and is removed when the command finishes.
+      if (signalOwners > 0) return
       killChildProcessGroup(child, 'SIGKILL')
       removeParentSignalListeners()
       process.kill(process.pid, signal)
@@ -122,8 +195,8 @@ async function execWithTimeout(
     function handleParentSigint(): void {
       handleParentSignal('SIGINT')
     }
-    process.once('SIGTERM', handleParentSigterm)
-    process.once('SIGINT', handleParentSigint)
+    process.on('SIGTERM', handleParentSigterm)
+    process.on('SIGINT', handleParentSigint)
     process.on('exit', handleParentExit)
 
     const finish = (result: number | 'timed-out'): void => {
@@ -157,6 +230,13 @@ async function execWithTimeout(
 
     timeoutId = setTimeout(() => {
       if (finished) return
+      if (options?.onTimeout != null) {
+        try {
+          options.onTimeout(snapshotProcessTree(child.pid))
+        } catch {
+          // A diagnostic must never change how the timeout is handled.
+        }
+      }
       if (killChildProcessGroup(child, 'SIGTERM')) timedOut = true
       killId = setTimeout(() => {
         if (finished) return
