@@ -6,7 +6,7 @@ import * as path from 'node:path'
 import {err, ok} from '@bfra.me/es/result'
 import {describePrivilegedFailure, isWithin} from '@fro-bot/runtime'
 import {toErrorMessage} from '../../shared/errors.js'
-import {auditTrustedGitMetadata} from './git-snapshot-audit.js'
+import {auditGitConfigKeys, auditGitMetadataEntries} from './git-snapshot-audit.js'
 
 /**
  * Handoff and take-back of the paths `isolate-agent` shares with the sandbox user (fro-bot/agent#2135).
@@ -49,6 +49,8 @@ export interface HandoffIds {
 }
 
 export interface HandoffTools {
+  /** Parses the trusted git config at handoff (`git config --file`); never used on the model's files. */
+  readonly git: string
   readonly setfacl: string
   readonly getfacl: string
   readonly find: string
@@ -349,7 +351,7 @@ export async function handOff(
 
   try {
     // 1. Trusted copy of the git metadata the runner will rely on after the model has run.
-    await snapshotGit(manifest, journal)
+    await snapshotGit(manifest, journal, deps.tools.git)
 
     // 2. Locks: record, then apply.
     const plan = await planLocks(manifest)
@@ -487,7 +489,7 @@ async function recordMeta(target: string, journal: HandoffJournal, deps: Handoff
   journal.touched.push({path: target, mode: stats.mode & 0o7777, aclFile, extended})
 }
 
-async function snapshotGit(manifest: HandoffManifest, journal: HandoffJournal): Promise<void> {
+async function snapshotGit(manifest: HandoffManifest, journal: HandoffJournal, git: string): Promise<void> {
   const gitDir = path.join(manifest.workspace, '.git')
   let stats
   try {
@@ -502,14 +504,8 @@ async function snapshotGit(manifest: HandoffManifest, journal: HandoffJournal): 
   }
   const redirect = await commondirProblem(gitDir)
   if (redirect !== null) throw new HandoffError(redirect)
-  const untrusted = await auditTrustedGitMetadata({
-    gitDir,
-    workspace: manifest.workspace,
-    runnerHome: manifest.runnerHome,
-    writableRoots: [manifest.workspace, ...manifest.handedOver],
-  })
-  if (untrusted !== null) throw new HandoffError(`the git metadata cannot be trusted: ${untrusted}`)
-  journal.gitPresent = true
+  const entryProblem = await auditGitMetadataEntries(gitDir)
+  if (entryProblem !== null) throw new HandoffError(`the git metadata cannot be trusted: ${entryProblem}`)
   const present: Record<string, boolean> = {}
   for (const item of GIT_METADATA) {
     const source = path.join(gitDir, item)
@@ -527,6 +523,10 @@ async function snapshotGit(manifest: HandoffManifest, journal: HandoffJournal): 
       force: false,
     })
   }
+  // The allowlist is applied to the copy that take-back will restore, not to the live file, so what was audited is what is kept.
+  const configProblem = await auditGitConfigKeys({gitDir: path.join(journal.snapshotDir, 'git'), git})
+  if (configProblem !== null) throw new HandoffError(`the git metadata cannot be trusted: ${configProblem}`)
+  journal.gitPresent = true
   journal.git = {
     dir: path.join(journal.snapshotDir, 'git'),
     config: present.config === true,

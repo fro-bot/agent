@@ -1,50 +1,82 @@
+import {execFile} from 'node:child_process'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
-import {isWithin, readTextNoFollow} from '@fro-bot/runtime'
+import {readTextNoFollow} from '@fro-bot/runtime'
 
 /**
  * Audit of the "trusted" `.git` metadata (`config`, `config.worktree`, `hooks/`, `info/`) before it is snapshotted.
  *
- * Take-back restores these items from a copy taken at handoff, and the runner-side git calls that follow trust the
- * restored files. The copy preserves symlinks, and a config can name files by path, so "restored from the snapshot" is only
- * trustworthy when the snapshot itself leads nowhere the sandbox can write. Two rules, both fail-closed:
+ * Take-back restores these items from a copy taken at handoff, and the runner-side git calls that follow trust the restored
+ * files. "Restored from the snapshot" is only as trustworthy as the snapshot, so it is held to two fail-closed rules:
  *
- * 1. The snapshot contains no symlink and no special file. A restored `.git/config` that is a symlink into the checkout is
- *    the model's config, whatever the copy says.
- * 2. The config does not reference a path inside a sandbox-writable root through a key that makes git read or run it
- *    (`include.path`, `core.attributesFile`, a filter, an alias, ...). A relative `include.path` resolves against `.git/`,
- *    which is inside the checkout.
+ * 1. The metadata contains no symlink and no special file. A restored `.git/config` that is a symlink into the checkout is the
+ *    model's config, whatever the copy says.
+ * 2. The config contains only keys that `actions/checkout` writes (the allowlist below). Everything else fails closed and is
+ *    named: include and includeIf, filter, diff and merge drivers, aliases, `core.hooksPath`, `attributesFile`, `excludesFile`,
+ *    `fsmonitor`, `sshCommand`, credential and http settings, submodules. An allowlist replaces reasoning about which keys make
+ *    git run a command or read a file: a key nobody listed is not trusted.
  *
- * Supported baseline: a hosted checkout's repo-local config, which has a remote, branches, an identity and `safe.directory`.
- * A repo-local config that points at files under the checkout is outside it and is refused, not repaired.
+ * The config is parsed by git itself (`git config --file <copy> --list --null --no-includes`), never by a parser of ours.
+ * That reads one file, follows no include, runs no hook and needs no repository.
+ *
+ * Supported baseline: the repo-local config of a hosted checkout (`persist-credentials: false`, no submodules). A checkout
+ * that needs other keys is outside it and is refused, not repaired.
  */
 
 const MAX_CONFIG_BYTES = 1024 * 1024
+const GIT_TIMEOUT_MS = 10_000
 const METADATA_ITEMS = ['config', 'config.worktree', 'hooks', 'info'] as const
+const CONFIG_FILES = ['config', 'config.worktree'] as const
+
+/** Keys written by actions/checkout, lower-cased the way `git config --list` prints them. */
+const ALLOWED_KEYS: ReadonlySet<string> = new Set([
+  'core.repositoryformatversion',
+  'core.filemode',
+  'core.bare',
+  'core.logallrefupdates',
+  'core.ignorecase',
+  'core.precomposeunicode',
+  'core.symlinks',
+  'extensions.worktreeconfig',
+  'gc.auto',
+  'safe.directory',
+])
+
+/** `<section>.<name>.<variable>`: the name keeps its case in git's output, the section and variable are lower-cased. */
+const ALLOWED_KEY_PATTERNS: readonly RegExp[] = [
+  /^remote\..+\.(?:url|fetch|promisor|partialclonefilter)$/,
+  /^branch\..+\.(?:remote|merge)$/,
+]
 
 export interface SnapshotAuditInput {
-  /** The checkout's `.git` directory. */
+  /** The directory that holds the copies of `config`, `config.worktree`, `hooks/` and `info/`. */
   readonly gitDir: string
-  /** The checkout (the working directory of runner-side git). */
-  readonly workspace: string
-  /** The runner's home, for `~` in values. */
-  readonly runnerHome: string
-  /** Every directory the sandbox can write once handoff has run. */
-  readonly writableRoots: readonly string[]
+  /** The absolute path of the git binary (from the preflight). */
+  readonly git: string
 }
 
-/** Why the metadata cannot be trusted, or `null` when it can. Names a key or a path, never a value's content. */
-export async function auditTrustedGitMetadata(input: SnapshotAuditInput): Promise<string | null> {
+/** Rule 1: no symlink and no special file anywhere in the metadata. Returns the reason, or `null`. */
+export async function auditGitMetadataEntries(gitDir: string): Promise<string | null> {
   for (const item of METADATA_ITEMS) {
-    const problem = await findUnsafeEntry(path.join(input.gitDir, item), item)
+    const problem = await findUnsafeEntry(path.join(gitDir, item), item)
     if (problem !== null) return problem
   }
-  for (const name of ['config', 'config.worktree'] as const) {
-    const config = await readConfig(path.join(input.gitDir, name))
-    if (config === null) continue
-    if (config.problem !== undefined) return `.git/${name} cannot be audited: ${config.problem}`
-    const problem = findWritableReference(config.text, name, input)
-    if (problem !== null) return problem
+  return null
+}
+
+/** Rule 2: every key of `config` and `config.worktree` is on the allowlist. Returns the reason, or `null`. */
+export async function auditGitConfigKeys(input: SnapshotAuditInput): Promise<string | null> {
+  for (const name of CONFIG_FILES) {
+    const file = path.join(input.gitDir, name)
+    const text = await readConfigText(file)
+    if (text === null) continue
+    if (text.problem !== undefined) return `.git/${name} cannot be audited: ${text.problem}`
+    const listed = await listKeys(input.git, file)
+    if (listed.problem !== undefined) return `.git/${name} could not be parsed by git: ${listed.problem}`
+    for (const [key, value] of listed.entries) {
+      const refusal = refuseKey(key, value)
+      if (refusal !== null) return `.git/${name} ${refusal}`
+    }
   }
   return null
 }
@@ -70,11 +102,8 @@ async function findUnsafeEntry(target: string, relative: string): Promise<string
   return null
 }
 
-/**
- * The config's text, read without following a final symlink and only if it is a regular file within the size bound
- * (`safe-read`). Absent is `null`; anything else that stops the read is a reason the file cannot be audited.
- */
-async function readConfig(
+/** Absent is `null`. The read is bounded and never follows a symlink (a regular file only), so git is not handed a link. */
+async function readConfigText(
   file: string,
 ): Promise<
   {readonly text: string; readonly problem?: undefined} | {readonly text?: undefined; readonly problem: string} | null
@@ -91,110 +120,52 @@ async function readConfig(
   }
 }
 
-interface ConfigEntry {
-  /** `section.variable` or `section.subsection.variable`, section and variable lower-cased. */
-  readonly key: string
-  readonly value: string
-}
+type KeyList =
+  | {readonly entries: readonly (readonly [string, string])[]; readonly problem?: undefined}
+  | {readonly entries?: undefined; readonly problem: string}
 
-/** A small reader for git's config syntax: sections, subsections, quoting, comments and backslash continuation. */
-export function parseGitConfig(text: string): ConfigEntry[] {
-  const entries: ConfigEntry[] = []
-  let section = ''
-  const lines = text.replaceAll('\r\n', '\n').split('\n')
-  for (let index = 0; index < lines.length; index++) {
-    let line = (lines[index] ?? '').trim()
-    while (line.endsWith('\\') && index + 1 < lines.length) {
-      index += 1
-      line = `${line.slice(0, -1)}${(lines[index] ?? '').trim()}`
-    }
-    if (line.length === 0 || line.startsWith('#') || line.startsWith(';')) continue
-    const header = /^\[\s*([\w.-]+)(?:\s+"((?:[^"\\]|\\.)*)")?\s*\]/.exec(line)
-    if (header !== null) {
-      const name = (header[1] ?? '').toLowerCase()
-      section = header[2] === undefined ? name : `${name}.${header[2].replaceAll(/\\(.)/g, '$1')}`
-      line = line.slice(header[0].length).trim()
-      if (line.length === 0) continue
-    }
-    const equals = line.indexOf('=')
-    const name = (equals === -1 ? line : line.slice(0, equals)).trim()
-    if (!/^[A-Z][\w-]*$/i.test(name)) continue
-    const variable = name.toLowerCase()
-    entries.push({
-      key: section.length === 0 ? variable : `${section}.${variable}`,
-      value: equals === -1 ? '' : unquote(line.slice(equals + 1)),
-    })
+/** `git config --file <file> --list --null --no-includes`: entries are `key\nvalue\0` (`key\0` for a valueless key). */
+async function listKeys(git: string, file: string): Promise<KeyList> {
+  const env = {
+    PATH: '/usr/bin:/bin',
+    LC_ALL: 'C',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_TERMINAL_PROMPT: '0',
   }
-  return entries
+  return new Promise<KeyList>(resolve => {
+    execFile(
+      git,
+      ['config', '--file', file, '--list', '--null', '--no-includes'],
+      {cwd: '/', env, timeout: GIT_TIMEOUT_MS, maxBuffer: 4 * MAX_CONFIG_BYTES, encoding: 'utf8'},
+      (error, stdout, stderr) => {
+        if (error !== null) {
+          const firstLine = stderr.split('\n').find(line => line.trim().length > 0)
+          resolve({problem: (firstLine ?? error.message).trim().slice(0, 200)})
+          return
+        }
+        const entries = stdout
+          .split('\0')
+          .filter(entry => entry.length > 0)
+          .map((entry): readonly [string, string] => {
+            const newline = entry.indexOf('\n')
+            return newline === -1 ? [entry, ''] : [entry.slice(0, newline), entry.slice(newline + 1)]
+          })
+        resolve({entries})
+      },
+    )
+  })
 }
 
-function unquote(raw: string): string {
-  let out = ''
-  let quoted = false
-  for (let index = 0; index < raw.length; index++) {
-    const char = raw[index] ?? ''
-    if (char === '\\' && index + 1 < raw.length) {
-      index += 1
-      out += raw[index] ?? ''
-    } else if (char === '"') {
-      quoted = !quoted
-    } else if (!quoted && (char === '#' || char === ';')) {
-      break
-    } else {
-      out += char
-    }
+/** The reason a key is refused, or `null`. Names the key, never its value (a value can hold a secret). */
+function refuseKey(key: string, value: string): string | null {
+  const allowed = ALLOWED_KEYS.has(key) || ALLOWED_KEY_PATTERNS.some(pattern => pattern.test(key))
+  if (!allowed) {
+    return `sets ${key}, which is not on the allowlist of keys a checkout writes; git could read or run what it names`
   }
-  return out.trim()
-}
-
-/** Keys whose value is a path git reads. A relative value resolves against `.git/` (inside the checkout). */
-const PATH_KEYS: readonly RegExp[] = [
-  /^include\.path$/,
-  /^includeif\..+\.path$/,
-  /^core\.(?:attributesfile|excludesfile|hookspath)$/,
-  /^http\.(?:cookiefile|sslcainfo|sslcert|sslkey)$/,
-]
-
-/** Keys whose value is a command line git runs. Only absolute paths and `./`-relative paths are checked. */
-const COMMAND_KEYS: readonly RegExp[] = [
-  /^core\.(?:fsmonitor|sshcommand|askpass|editor|pager|gitproxy)$/,
-  /^credential\.(?:.+\.)?helper$/,
-  /^gpg\.(?:.+\.)?program$/,
-  /^diff\.external$/,
-  /^diff\..+\.(?:textconv|command)$/,
-  /^filter\..+\.(?:clean|smudge|process)$/,
-  /^merge\..+\.driver$/,
-  /^(?:difftool|mergetool)\..+\.(?:cmd|path)$/,
-  /^alias\..+$/,
-  /^pager\..+$/,
-  /^sequence\.editor$/,
-  /^uploadpack\.packobjectshook$/,
-]
-
-function findWritableReference(text: string, file: string, input: SnapshotAuditInput): string | null {
-  const roots = input.writableRoots.map(root => path.resolve(root))
-  for (const {key, value} of parseGitConfig(text)) {
-    const isPath = PATH_KEYS.some(pattern => pattern.test(key))
-    const isCommand = COMMAND_KEYS.some(pattern => pattern.test(key))
-    if (!isPath && !isCommand) continue
-    for (const token of value.match(/[^\s'"`;|&()<>=!]+/g) ?? []) {
-      const resolved = resolveToken(token, isPath, input)
-      if (resolved === null) continue
-      const root = roots.find(candidate => isWithin(candidate, resolved))
-      if (root !== undefined) {
-        return `${file} sets ${key} to a path inside the sandbox-writable ${root}; git would read or run what the sandbox can change`
-      }
-    }
+  // A url can name a transport helper that runs a command on use (`ext::sh -c ...`, `fd::...`).
+  if (/^remote\..+\.url$/.test(key) && value.includes('::')) {
+    return `sets ${key} to a transport helper (a value with "::"), which can run a command`
   }
-  return null
-}
-
-/** The absolute path a token names, or `null` when it does not name a path. */
-function resolveToken(token: string, isPathKey: boolean, input: SnapshotAuditInput): string | null {
-  if (token.startsWith('~/')) return path.resolve(input.runnerHome, token.slice(2))
-  if (token.startsWith('$HOME/')) return path.resolve(input.runnerHome, token.slice(6))
-  if (path.isAbsolute(token)) return path.resolve(token)
-  if (isPathKey) return path.resolve(input.gitDir, token)
-  if (token.startsWith('./') || token.startsWith('../')) return path.resolve(input.workspace, token)
   return null
 }

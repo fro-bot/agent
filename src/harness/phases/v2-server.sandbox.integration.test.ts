@@ -105,11 +105,11 @@ function git(cwd: string, ...args: string[]): string {
 function initWorkspace(workspace: string): string {
   fs.mkdirSync(workspace, {recursive: true})
   git(workspace, 'init', '-q', '-b', 'main')
-  git(workspace, 'config', 'user.name', 'Runner Setup')
-  git(workspace, 'config', 'user.email', 'setup@example.invalid')
   fs.writeFileSync(path.join(workspace, 'README.md'), '# fixture\n')
   git(workspace, 'add', '.')
-  git(workspace, 'commit', '-qm', 'init')
+  // The identity is passed for this commit only: handoff trusts just the keys a hosted checkout writes, and a checkout's
+  // repo config has no user section.
+  git(workspace, '-c', 'user.name=Runner Setup', '-c', 'user.email=setup@example.invalid', 'commit', '-qm', 'init')
   // The identity setup configures globally for the runner; the sandbox must receive the same one.
   spawnSync('git', ['config', '--global', 'user.name', 'Fro Bot'])
   spawnSync('git', ['config', '--global', 'user.email', 'fro-bot@example.invalid'])

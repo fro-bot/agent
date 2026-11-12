@@ -1,6 +1,6 @@
 import type {PrivilegedRun} from '@fro-bot/runtime'
 import type {HandoffManifest} from '../../services/setup/sandbox-handoff.js'
-import {execFileSync} from 'node:child_process'
+import {execFileSync, spawnSync} from 'node:child_process'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
@@ -21,8 +21,21 @@ vi.setConfig({testTimeout: 60_000, hookTimeout: 60_000})
  * missing marker after the trusted call proves the fix rather than a fixture that never fired.
  */
 
+// The identity comes from the environment, not from `user.*` in the repo config: the handoff audit trusts only the keys a
+// hosted checkout writes, and a checkout's config has no user section.
+const IDENTITY = {
+  GIT_AUTHOR_NAME: 'Fixture',
+  GIT_AUTHOR_EMAIL: 'fixture@example.invalid',
+  GIT_COMMITTER_NAME: 'Fixture',
+  GIT_COMMITTER_EMAIL: 'fixture@example.invalid',
+}
 const git = (cwd: string, ...args: string[]): string =>
-  execFileSync('git', args, {cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe']})
+  execFileSync('git', args, {
+    cwd,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: {...process.env, ...IDENTITY},
+  })
 
 interface Repo {
   readonly root: string
@@ -40,8 +53,6 @@ function makeRepo(): Repo {
   fs.mkdirSync(repo, {recursive: true})
   fs.mkdirSync(path.join(root, 'work', '_temp'))
   git(repo, 'init', '-q', '-b', 'main')
-  git(repo, 'config', 'user.name', 'Fixture')
-  git(repo, 'config', 'user.email', 'fixture@example.invalid')
   fs.writeFileSync(path.join(repo, 'tracked.txt'), 'anchor\n')
   git(repo, 'add', '.')
   git(repo, 'commit', '-qm', 'anchor')
@@ -106,6 +117,16 @@ function manifestFor(repo: Repo): HandoffManifest {
   }
 }
 
+// The handoff audit parses the trusted config with real git; every other tool is a fake that is never executed.
+const TOOLS = {
+  git: spawnSync('which', ['git'], {encoding: 'utf8'}).stdout.trim(),
+  setfacl: '/s',
+  getfacl: '/g',
+  find: '/f',
+  chown: '/c',
+  chmod: '/m',
+}
+
 const fakeRun: PrivilegedRun = async argv => ({
   exitCode: 0,
   stdout: argv.includes('-print') ? '' : '# file: x\nuser::rwx\ngroup::r-x\nother::r-x\n',
@@ -115,7 +136,7 @@ async function restoreThenRun(repo: Repo, hostile: () => void): Promise<void> {
   const manifest = manifestFor(repo)
   const handed = await handOff(manifest, {
     run: fakeRun,
-    tools: {setfacl: '/s', getfacl: '/g', find: '/f', chown: '/c', chmod: '/m'},
+    tools: TOOLS,
     logger: createMockLogger(),
   })
   if (!handed.success) throw new Error(handed.error)
@@ -123,7 +144,7 @@ async function restoreThenRun(repo: Repo, hostile: () => void): Promise<void> {
   hostile()
   const outcome = await takeBack(manifest, handed.data, {
     run: fakeRun,
-    tools: {setfacl: '/s', getfacl: '/g', find: '/f', chown: '/c', chmod: '/m'},
+    tools: TOOLS,
     logger: createMockLogger(),
   })
   expect(outcome.status).toBe('restored')
@@ -219,7 +240,7 @@ describe('post-model git against a hostile checkout', () => {
   describe('trusting the pre-run metadata: include.path and a symlinked config', () => {
     const deps = () => ({
       run: fakeRun,
-      tools: {setfacl: '/s', getfacl: '/g', find: '/f', chown: '/c', chmod: '/m'},
+      tools: TOOLS,
       logger: createMockLogger(),
     })
 
@@ -312,7 +333,7 @@ describe('post-model git against a hostile checkout', () => {
       const manifest = manifestFor(repo)
       const deps = {
         run: fakeRun,
-        tools: {setfacl: '/s', getfacl: '/g', find: '/f', chown: '/c', chmod: '/m'},
+        tools: TOOLS,
         logger: createMockLogger(),
       }
       const handed = await handOff(manifest, deps)
@@ -336,7 +357,7 @@ describe('post-model git against a hostile checkout', () => {
       // #when handed off
       const handed = await handOff(manifestFor(repo), {
         run: fakeRun,
-        tools: {setfacl: '/s', getfacl: '/g', find: '/f', chown: '/c', chmod: '/m'},
+        tools: TOOLS,
         logger: createMockLogger(),
       })
 

@@ -352,6 +352,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       find: tools.find,
       chown: tools.chown,
       chmod: tools.chmod,
+      git: tools.git,
     },
     logger,
   })
