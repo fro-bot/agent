@@ -40,6 +40,9 @@ const ALLOWED_KEYS: ReadonlySet<string> = new Set([
   'extensions.worktreeconfig',
   'gc.auto',
   'safe.directory',
+  // git-lfs writes this format integer into the local config of every checkout once it is installed system-wide (as on the
+  // hosted images). It is inert: only this one `lfs.*` key. `lfs.url`, `lfs.*transfer*` and `filter.lfs.*` stay refused.
+  'lfs.repositoryformatversion',
 ])
 
 /** `<section>.<name>.<variable>`: the name keeps its case in git's output, the section and variable are lower-cased. */
