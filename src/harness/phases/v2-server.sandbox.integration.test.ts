@@ -50,11 +50,13 @@ import {getGitHubRunAttempt, getInvocationIdentity} from '../../shared/env.js'
 import {createLogger} from '../../shared/logger.js'
 import {createSandboxLifecycle} from './sandbox-lifecycle.js'
 import {
+  describeReconstruction,
   failuresFor,
   parseRows,
   PRELUDE,
   q,
   readProbe,
+  readSessionIds,
   safeEnvPath,
   safeEnvToken,
   startScriptedProvider,
@@ -523,6 +525,22 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
     expect(tree).not.toMatch(new RegExp(`^(default:)?user:${os.userInfo().username}:`, 'm'))
   })
 
+  it('leaves the files the model created non-executable: take-back must not widen the ACL mask', () => {
+    // #given regular files the model created without ever setting an execute bit
+    const files = ['model-wrote.txt', 'm-0600', path.join('m-0700', 'inner', 'f')]
+    // #when their modes are read after take-back
+    const modes = Object.fromEntries(
+      files.map(file => [file, (fs.lstatSync(path.join(workspace, file)).mode & 0o777).toString(8).padStart(3, '0')]),
+    )
+    // #then none has an execute bit in any class. A removed named entry used to make setfacl recalculate the mask as the
+    // union of the stored entries (wider than the mask the file was created with), so the group class gained x, and
+    // reconstruction then refused the file as executable
+    const executable = Object.entries(modes)
+      .filter(([, mode]) => /[1357]/.test(mode))
+      .map(([file, mode]) => `${file}: ${mode}`)
+    expect(executable).toEqual([])
+  })
+
   it('restores trusted git metadata over what the model wrote', () => {
     // #given the model replaced .git/config with an fsmonitor payload and planted a pre-commit hook
     // #then take-back put the pre-model versions back
@@ -806,18 +824,6 @@ function fileSizeOrZero(file: string): number {
   }
 }
 
-function readSessionIds(dbPath: string): string[] {
-  const db = new DatabaseSync(dbPath)
-  try {
-    return db
-      .prepare('SELECT id FROM session ORDER BY id')
-      .all()
-      .map(row => String((row as {id: unknown}).id))
-  } finally {
-    db.close()
-  }
-}
-
 function integrityCheck(dbPath: string): string {
   const db = new DatabaseSync(dbPath)
   try {
@@ -1054,12 +1060,14 @@ describe.skipIf(!gated)('isolate-agent hostile git state through a real model sh
         `chmod +x .git/hooks/post-index-change && R git_hostile_config INFO ok`,
     },
     {
-      // Dirty tracked and untracked files without invoking git, and age a tracked file so the index is stale.
+      // Dirty tracked and untracked files without invoking git, and age a tracked file so the index is stale. The aged file
+      // is one the model owns: `touch -d` needs ownership (an ACL grants only touch-to-now), and the runner-owned README.md
+      // refused it, which ended the && chain before the row was printed.
       id: 'git_dirty_worktree',
       category: 'info',
       cmd:
         `cd ${q(workspace)} && echo 'v2 edited by the model' > data.dat && echo untracked > untracked-by-model.txt && ` +
-        `touch -d 2001-01-01 README.md && R git_dirty_worktree INFO ok`,
+        `touch -d 2001-01-01 data.dat && R git_dirty_worktree INFO ok`,
     },
   ]
 
@@ -1092,7 +1100,7 @@ describe.skipIf(!gated)('isolate-agent hostile git state through a real model sh
     spawnSync('cp', ['-a', workspace, control])
     fs.appendFileSync(path.join(control, '.git', 'config'), hostileConfig)
     fs.writeFileSync(path.join(control, '.git', 'hooks', 'post-index-change'), hookBody, {mode: 0o755})
-    spawnSync('touch', ['-d', '2001-01-01', path.join(control, 'README.md')])
+    spawnSync('touch', ['-d', '2001-01-01', path.join(control, 'data.dat')])
     spawnSync('git', ['diff', 'HEAD'], {cwd: control, encoding: 'utf8'})
     spawnSync('git', ['status', '--short'], {cwd: control, encoding: 'utf8'})
     markersFromControl = payloads.filter(name => fs.existsSync(markerOf(name)))
@@ -1136,11 +1144,18 @@ describe.skipIf(!gated)('isolate-agent hostile git state through a real model sh
   })
 
   it('reconstruction and the commit-message lookup run no payload and still return the model work', () => {
+    // #given the raw rows the model script printed, in case a step went missing
+    const scriptRows: Record<string, string[]> = {}
+    for (const [id, rows] of result?.rows ?? new Map<string, readonly Row[]>()) {
+      scriptRows[id] = rows.map(row => `${row.status} ${row.evidence}`)
+    }
+    expect(scriptRows).toHaveProperty('git_dirty_worktree')
     // #given runner-side git ran after take-back, through the trusted wrapper
     // #then no payload ran as the runner
     expect(after.markersAfterTrustedGit).toEqual([])
     // #and the model's net changes against the trusted head are all there (none from inside .git)
-    expect(after.reconstruct?.success).toBe(true)
+    // (the description carries the refusal reason, so a failure here names it instead of printing `false`)
+    expect(describeReconstruction(after.reconstruct)).toBe('ok')
     const changes =
       after.reconstruct?.success === true && after.reconstruct.data.kind === 'changes'
         ? after.reconstruct.data.changes

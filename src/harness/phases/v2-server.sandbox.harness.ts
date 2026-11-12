@@ -9,6 +9,7 @@ import type {OpenCodeV2SandboxLaunch, OpenCodeV2ServerHandle} from '@fro-bot/run
 import type {Logger} from '../../shared/logger.js'
 import {Buffer} from 'node:buffer'
 import http from 'node:http'
+import {DatabaseSync} from 'node:sqlite'
 import {startOpenCodeV2Server} from '@fro-bot/runtime'
 
 export const PRELUDE = String.raw`R(){ echo "RESULT $1 $2 $3"; }; ev(){ head -c 240 | tr '\n\r\t' '   '; }; `
@@ -29,6 +30,41 @@ export function safeEnvPath(value: string | undefined, fallback: string): string
 /** Same idea for an environment-derived token: word characters, dots and dashes only. */
 export function safeEnvToken(value: string | undefined, fallback: string): string {
   return value !== undefined && SAFE_TOKEN.test(value) ? value : fallback
+}
+
+/**
+ * The ids of the sessions in a V2 database. V2 keeps them in `session_v2` (there is no `session` table in 2.2.x); if that
+ * table is missing the error lists the tables that exist, so a schema change names itself instead of reading as a test bug.
+ */
+export function readSessionIds(dbPath: string): string[] {
+  const db = new DatabaseSync(dbPath)
+  try {
+    const tables = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+      .all()
+      .map(row => String((row as {name: unknown}).name))
+    if (!tables.includes('session_v2')) {
+      throw new Error(`${dbPath} has no session_v2 table; tables: ${tables.join(', ')}`)
+    }
+    return db
+      .prepare('SELECT id FROM session_v2 ORDER BY id')
+      .all()
+      .map(row => String((row as {id: unknown}).id))
+  } finally {
+    db.close()
+  }
+}
+
+/** One line for an assertion: `ok`, or why a reconstruction was refused, so a CI failure names the reason. */
+export function describeReconstruction(
+  result:
+    | {readonly success: true; readonly data: {readonly kind: string}}
+    | {readonly success: false; readonly error: Error}
+    | undefined,
+): string {
+  if (result === undefined) return 'reconstruction did not run'
+  if (!result.success) return `reconstruction failed: ${result.error.message}`
+  return result.data.kind === 'changes' ? 'ok' : `reconstruction returned kind ${result.data.kind}`
 }
 
 export interface Probe {

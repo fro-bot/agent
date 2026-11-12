@@ -23,8 +23,10 @@ import {toErrorMessage} from '../../shared/errors.js'
  * runner-owned file keeps its owner; the same pass gives the owner `rwX` on non-links, so a mode-000 file the model made is
  * readable again), and the trusted `.git` metadata is renamed over whatever the model left (a rename needs no free space).
  *
- * ACLs are removed entry by entry (`setfacl -x u:<uid>`, access and default), never wiped with `-b`: an ACL that existed
- * before the run survives. Every privileged command runs under a deadline; a command that does not finish in time is
+ * ACLs are removed entry by entry (`setfacl -n -x u:<uid>`, access and default), never wiped with `-b`: an ACL that existed
+ * before the run survives. `-n` matters: a file the sandbox creates inherits named entries from the default ACL that are wider
+ * than its mask, and without `-n` setfacl recalculates the mask as the union of what is left, which turns a `rw-` file into one
+ * whose group class has `x`. The mask stays as it was, so the file keeps the mode the sandbox created it with. Every privileged command runs under a deadline; a command that does not finish in time is
  * killed and counts as a failure, so take-back ends `unsafe` instead of hanging.
  */
 
@@ -335,7 +337,12 @@ export async function handOff(
     }
 
     // 3. Checkout: ACL for the sandbox, default entries for both users so new files stay reachable for the runner.
-    journal.aclTrees.push({path: manifest.workspace, accessUids: [sandboxUid], defaultUids: [sandboxUid, runnerUid]})
+    // The default entries name the runner too, so a file the sandbox creates inherits `user:<runner>` as an access entry.
+    journal.aclTrees.push({
+      path: manifest.workspace,
+      accessUids: [sandboxUid, runnerUid],
+      defaultUids: [sandboxUid, runnerUid],
+    })
     await must(run, [tools.setfacl, '-R', '-P', '-m', `u:${sandboxUid}:rwX`, manifest.workspace], 'checkout ACL')
     await must(
       run,
@@ -569,7 +576,7 @@ export async function takeBack(
         if (tree.accessUids.length > 0) {
           await must(
             run,
-            [tools.setfacl, '-R', '-P', '-x', aclSpec(tree.accessUids), tree.path],
+            [tools.setfacl, '-R', '-P', '-n', '-x', aclSpec(tree.accessUids), tree.path],
             `removing this run's ACL entries from ${tree.path}`,
           )
         }
@@ -587,6 +594,7 @@ export async function takeBack(
               tools.setfacl,
               '-P',
               '-d',
+              '-n',
               '-x',
               aclSpec(tree.defaultUids),
               '{}',

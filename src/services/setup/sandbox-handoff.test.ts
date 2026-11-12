@@ -326,22 +326,41 @@ describe('sandbox take-back', () => {
 
     // #then the checkout loses the sandbox's access entry and both users' default entries
     const ws = fx.manifest.workspace
-    expect(argv).toContain(`${TOOLS.setfacl} -R -P -x u:${SANDBOX_UID} ${ws}`)
+    expect(argv).toContain(`${TOOLS.setfacl} -R -P -n -x u:${SANDBOX_UID},u:${runnerUid} ${ws}`)
     expect(argv).toContain(
-      `${TOOLS.find} -P ${ws} -xdev -type d -exec ${TOOLS.setfacl} -P -d -x u:${SANDBOX_UID},u:${runnerUid} {} +`,
+      `${TOOLS.find} -P ${ws} -xdev -type d -exec ${TOOLS.setfacl} -P -d -n -x u:${SANDBOX_UID},u:${runnerUid} {} +`,
     )
     // #and a handed-over dir loses only the runner entry handoff added; a readable dir only the sandbox's
     const handedDir = fx.manifest.handedOver[0] ?? ''
-    expect(argv).toContain(`${TOOLS.setfacl} -R -P -x u:${runnerUid} ${handedDir}`)
+    expect(argv).toContain(`${TOOLS.setfacl} -R -P -n -x u:${runnerUid} ${handedDir}`)
     const readable = fx.manifest.readable[0] ?? ''
-    expect(argv).toContain(`${TOOLS.setfacl} -R -P -x u:${SANDBOX_UID} ${readable}`)
+    expect(argv).toContain(`${TOOLS.setfacl} -R -P -n -x u:${SANDBOX_UID} ${readable}`)
     expect(argv).toContain(
-      `${TOOLS.find} -P ${readable} -xdev -type d -exec ${TOOLS.setfacl} -P -d -x u:${SANDBOX_UID} {} +`,
+      `${TOOLS.find} -P ${readable} -xdev -type d -exec ${TOOLS.setfacl} -P -d -n -x u:${SANDBOX_UID} {} +`,
     )
     // #and -b is used only on the individual chain dirs the handoff recorded, never on a tree
     const trees = [ws, ...fx.manifest.handedOver, ...fx.manifest.readable]
     expect(argv.filter(line => line.includes(' -b ') && trees.some(tree => line.endsWith(` ${tree}`)))).toEqual([])
     expect(argv.some(line => line.includes(' -R ') && line.includes(' -b '))).toBe(false)
+  })
+
+  it('removes the runner entry the default ACL gave model-created files, without recalculating the mask', async () => {
+    // #given a completed handoff: the checkout's default ACL names the runner, so every file the sandbox creates inherits
+    // an access entry `user:<runner>:rwx` (a stored entry wider than the file's mask)
+    const handed = await handedOff()
+    fx.calls.length = 0
+    const {runnerUid} = fx.manifest.ids
+
+    // #when taken back
+    await takeBack(fx.manifest, handed.data, fx.deps)
+    const removals = mutating(fx.calls).filter(call => call.includes('-x'))
+
+    // #then every removal names the runner where handoff added it, and every one passes -n: removing an entry makes
+    // setfacl recalculate the mask as the union of the stored entries, which would turn a file the model created as
+    // rw- into one whose group class has x, and reconstruction refuses an executable file
+    expect(removals.some(call => call.includes(`u:${SANDBOX_UID},u:${runnerUid}`))).toBe(true)
+    expect(removals.length).toBeGreaterThan(0)
+    expect(removals.filter(call => !call.includes('-n')).map(call => call.join(' '))).toEqual([])
   })
 
   it('uses the same entry-by-entry removal when a partial handoff rolls back', async () => {
@@ -354,7 +373,9 @@ describe('sandbox take-back', () => {
     // #then the rollback removed this run's entries and wiped no tree
     expect(result.success).toBe(false)
     const argv = mutating(fx.calls).map(call => call.join(' '))
-    expect(argv).toContain(`${TOOLS.setfacl} -R -P -x u:${SANDBOX_UID} ${fx.manifest.workspace}`)
+    expect(argv).toContain(
+      `${TOOLS.setfacl} -R -P -n -x u:${SANDBOX_UID},u:${fx.manifest.ids.runnerUid} ${fx.manifest.workspace}`,
+    )
     expect(argv.some(line => line.includes(' -R ') && line.includes(' -b '))).toBe(false)
   })
 
