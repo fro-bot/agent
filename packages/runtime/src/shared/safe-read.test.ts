@@ -82,6 +82,20 @@ describe('readTextNoFollow', () => {
     expect(await codeOf(async () => readTextNoFollow(viaLink, {within: workspace}))).toBe('EOUTSIDE')
   })
 
+  it('reads a file under a real directory whose name starts with two dots, and still refuses a shared-prefix sibling', async () => {
+    // #given a workspace holding a directory literally named ..action, and a sibling that shares the workspace's name prefix
+    const workspace = path.join(dir, 'ws')
+    const sibling = path.join(dir, 'ws-other')
+    fs.mkdirSync(path.join(workspace, '..action'), {recursive: true})
+    fs.mkdirSync(sibling)
+    fs.writeFileSync(path.join(workspace, '..action', 'r.md'), 'inside')
+    fs.writeFileSync(path.join(sibling, 'r.md'), 'outside')
+
+    // #then a real ..action directory is inside (it is not a climb), and the sibling is outside
+    expect(await readTextNoFollow(path.join(workspace, '..action', 'r.md'), {within: workspace})).toBe('inside')
+    expect(await codeOf(async () => readTextNoFollow(path.join(sibling, 'r.md'), {within: workspace}))).toBe('EOUTSIDE')
+  })
+
   it('closes the handle when it refuses', async () => {
     const target = path.join(dir, 'a-dir')
     fs.mkdirSync(target)

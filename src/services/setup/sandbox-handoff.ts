@@ -4,6 +4,7 @@ import type {Logger} from '../../shared/logger.js'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import {err, ok} from '@bfra.me/es/result'
+import {isWithin} from '@fro-bot/runtime'
 import {toErrorMessage} from '../../shared/errors.js'
 
 /**
@@ -123,9 +124,9 @@ class HandoffError extends Error {}
 
 const GIT_METADATA = ['config', 'config.worktree', 'hooks', 'info'] as const
 
+/** Strictly inside: a descendant, not the parent itself. */
 function inside(parent: string, child: string): boolean {
-  const relative = path.relative(parent, child)
-  return relative.length > 0 && !relative.startsWith('..') && !path.isAbsolute(relative)
+  return path.relative(parent, child).length > 0 && isWithin(parent, child)
 }
 
 function ancestorsOf(target: string): string[] {
@@ -166,6 +167,26 @@ function withDeadline(deps: HandoffDeps, budgetMs: number): HandoffDeps {
 
 const aclSpec = (uids: readonly number[]): string => uids.map(uid => `u:${uid}`).join(',')
 
+/** The runner's downloaded-actions tree. Its install must stay immutable to the sandbox: the runner executes it at post time. */
+const RESERVED_ACTIONS_DIR = '_actions'
+
+/**
+ * `<work>/_actions` is a reserved privileged subtree: no grant may equal it, contain it (it, or any ancestor of it), or lie
+ * under it. The runner reloads the action manifest and opens the post script from there, as itself, after the sandbox has
+ * stopped; a writable grant that reaches it would let the sandbox rewrite code the runner then runs. The work directory is
+ * the parent of `RUNNER_TEMP`, so nothing here assumes where the runner is installed.
+ */
+function reservedSubtreeProblem(manifest: HandoffManifest): string | null {
+  const reserved = path.join(path.dirname(path.resolve(manifest.runnerTemp)), RESERVED_ACTIONS_DIR)
+  const grants = [manifest.workspace, ...manifest.handedOver, ...manifest.readable, ...manifest.traverseOnly]
+  for (const grant of grants) {
+    if (isWithin(reserved, grant) || isWithin(grant, reserved)) {
+      return `grant ${grant} overlaps the reserved ${reserved} subtree, which the sandbox may never be given`
+    }
+  }
+  return null
+}
+
 function everyRoot(manifest: HandoffManifest): string[] {
   return [manifest.workspace, ...manifest.handedOver, ...manifest.readable]
 }
@@ -182,6 +203,8 @@ export async function verifyRoots(
   phase: 'handoff' | 'take-back',
 ): Promise<string | null> {
   const {runnerUid, sandboxUid} = manifest.ids
+  const reserved = reservedSubtreeProblem(manifest)
+  if (reserved !== null) return reserved
   const ancestors = new Set<string>()
   const check = async (
     target: string,

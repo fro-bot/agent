@@ -2,6 +2,7 @@ import type {FileHandle} from 'node:fs/promises'
 import type {Readable} from 'node:stream'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
+import {isWithin} from './path-within.js'
 
 /**
  * Reads of paths a less-trusted writer could have shaped.
@@ -33,8 +34,7 @@ function refusal(code: string, message: string): NodeJS.ErrnoException {
 
 async function assertWithin(file: string, within: string): Promise<void> {
   const [realParent, realRoot] = await Promise.all([fs.realpath(path.dirname(file)), fs.realpath(within)])
-  const relative = path.relative(realRoot, realParent)
-  if (relative.startsWith('..') || path.isAbsolute(relative)) {
+  if (!isWithin(realRoot, realParent)) {
     throw refusal('EOUTSIDE', `Refusing to read ${file}: it resolves outside ${within}`)
   }
 }

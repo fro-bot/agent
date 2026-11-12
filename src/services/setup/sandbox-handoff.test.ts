@@ -175,6 +175,59 @@ describe('sandbox handoff', () => {
     expect(mutating(fx.calls)).toEqual([])
   })
 
+  describe('the reserved _actions subtree', () => {
+    const actions = (fxx: Fixture): string => path.join(path.dirname(fxx.manifest.runnerTemp), '_actions')
+
+    it.each([
+      ['the checkout equals _actions', (a: string) => ({workspace: a})],
+      ['the checkout sits under _actions', (a: string) => ({workspace: path.join(a, 'fro-bot', 'agent', 'v1')})],
+      ['the checkout contains _actions (it is the work directory)', (a: string) => ({workspace: path.dirname(a)})],
+      ['a handed-over directory sits under _actions', (a: string) => ({handedOver: [path.join(a, 'fro-bot')]})],
+      ['a handed-over directory is _actions', (a: string) => ({handedOver: [a]})],
+      ['a handed-over directory contains _actions', (a: string) => ({handedOver: [path.dirname(a)]})],
+      ['a readable directory sits under _actions', (a: string) => ({readable: [path.join(a, 'fro-bot')]})],
+      ['a traverse-only directory is under _actions', (a: string) => ({traverseOnly: [path.join(a, 'fro-bot')]})],
+    ])('refuses to hand over when %s, before any mutation', async (_label, override) => {
+      // #given a grant that equals, contains or lies under the runner's downloaded-actions tree
+      const a = actions(fx)
+      fs.mkdirSync(path.join(a, 'fro-bot', 'agent', 'v1'), {recursive: true})
+      const reserved = {...fx.manifest, ...override(a)}
+
+      // #when handed off
+      const result = await handOff(reserved, fx.deps)
+
+      // #then it is refused by name and nothing was changed
+      expect(!result.success && result.error).toContain('_actions')
+      expect(mutating(fx.calls)).toEqual([])
+    })
+
+    it('applies the same rule before take-back', async () => {
+      // #given a manifest that is reserved-overlapping at take-back time
+      const a = actions(fx)
+      const problem = await verifyRoots({...fx.manifest, handedOver: [a]}, fx.deps, 'take-back')
+
+      // #then
+      expect(problem).toContain('_actions')
+    })
+
+    it('allows siblings that merely share the name prefix, and a directory named ..action beside it', async () => {
+      // #given grants beside _actions: _actions-cache and ..action (a real directory, not a climb)
+      const work = path.dirname(fx.manifest.runnerTemp)
+      const siblings = [path.join(work, '_actions-cache'), path.join(work, '..action')]
+      for (const dir of siblings) fs.mkdirSync(dir, {recursive: true})
+
+      // #when verified
+      const problem = await verifyRoots(
+        {...fx.manifest, readable: [...fx.manifest.readable, ...siblings]},
+        fx.deps,
+        'handoff',
+      )
+
+      // #then neither is reserved
+      expect(problem).toBeNull()
+    })
+  })
+
   it('refuses a root or ancestor owned by someone else', async () => {
     // #given a runner uid that does not match the owner of anything on disk
     const foreign = {...fx.manifest, ids: {...fx.manifest.ids, runnerUid: (process.getuid?.() ?? 0) + 4242}}
@@ -670,6 +723,27 @@ describe('planLocks', () => {
       // #then the symlink is skipped
       expect(plan.deny.some(entry => entry.endsWith('linked-etc'))).toBe(false)
       expect(plan.deny.length).toBeGreaterThan(5)
+    } finally {
+      fs.rmSync(fx.root, {recursive: true, force: true})
+    }
+  })
+
+  it('still denies the secrets beside a grant when the directory on the way to it is named ..something', async () => {
+    // #given a grant at <temp>/..x/resp, with a runner-only file beside it in the directory named ..x
+    const fx = buildFixture()
+    try {
+      // (a temp tree outside the runner home, so only the temp-tree rule can cover it)
+      const temp = path.join(fx.root, 'tmpx')
+      const chainDir = path.join(temp, '..x')
+      const grant = path.join(chainDir, 'resp')
+      fs.mkdirSync(grant, {recursive: true})
+      fs.writeFileSync(path.join(chainDir, 'secret.txt'), 'runner only')
+
+      // #when the lock plan is made
+      const plan = await planLocks({...fx.manifest, runnerTemp: temp, handedOver: [grant]})
+
+      // #then the directory counts as inside the temp tree (a name starting with two dots is not a climb), so the secret is denied
+      expect(plan.deny).toContain(path.join(chainDir, 'secret.txt'))
     } finally {
       fs.rmSync(fx.root, {recursive: true, force: true})
     }

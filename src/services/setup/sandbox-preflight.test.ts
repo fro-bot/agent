@@ -1,5 +1,6 @@
 import type {SandboxPreflightDeps} from './sandbox-preflight.js'
 import type {ExecAdapter} from './types.js'
+import path from 'node:path'
 import {describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {
@@ -9,6 +10,8 @@ import {
   TRUSTED_TOOL_DIRS,
 } from './sandbox-preflight.js'
 
+type EntryKind = 'directory' | 'file' | 'symlink' | 'other'
+
 interface Overrides {
   readonly env?: NodeJS.ProcessEnv
   readonly platform?: NodeJS.Platform
@@ -17,12 +20,14 @@ interface Overrides {
   readonly containerMarker?: string
   readonly sudoExitCode?: number
   readonly sysctls?: Readonly<Record<string, string | null>>
-  /** Where the Action is installed (bundle dir and its parent). Defaults to a published-action location. */
-  readonly actionPaths?: readonly string[]
+  /** The directory of the running bundle, as Node resolved it (canonical). Defaults to `<install>/dist`. */
+  readonly bundleDir?: string | null
+  /** The script path the runner started the Action with (`process.argv[1]`). Defaults to `<install>/dist/main.js`. */
+  readonly invokedAs?: string | null
+  /** The filesystem as `lstat` sees it. Defaults to a complete published install at `PUBLISHED_ROOT`. */
+  readonly entries?: ReadonlyMap<string, EntryKind>
   /** Maps a path to its real path, as `fs.realpath` would. */
   readonly realpaths?: Readonly<Record<string, string>>
-  /** The script path the runner started the Action with (`process.argv[1]`); defaults to `main.js` in the first install path. */
-  readonly invokedAs?: string | null
 }
 
 const HOSTED_ENV: NodeJS.ProcessEnv = {
@@ -31,11 +36,25 @@ const HOSTED_ENV: NodeJS.ProcessEnv = {
   HOME: '/home/runner',
   GITHUB_WORKSPACE: '/home/runner/work/repo/repo',
   RUNNER_TEMP: '/home/runner/work/_temp',
+  GITHUB_ACTION_REPOSITORY: 'fro-bot/agent',
+  GITHUB_ACTION_PATH: '/home/runner/work/_actions/fro-bot/agent/v1',
 }
-const PUBLISHED_ACTION = [
-  '/home/runner/work/_actions/fro-bot/agent/v1/dist',
-  '/home/runner/work/_actions/fro-bot/agent/v1',
-]
+const WORK = '/home/runner/work'
+const PUBLISHED_ROOT = '/home/runner/work/_actions/fro-bot/agent/v1'
+
+/** A complete published install: every directory from the work dir down to `dist`, plus the manifest and the entry scripts. */
+function publishedEntries(root: string, work = WORK): Map<string, EntryKind> {
+  const entries = new Map<string, EntryKind>()
+  let current = work
+  entries.set(current, 'directory')
+  for (const part of root.slice(work.length + 1).split('/')) {
+    current = `${current}/${part}`
+    entries.set(current, 'directory')
+  }
+  entries.set(`${root}/dist`, 'directory')
+  for (const file of ['action.yaml', 'dist/main.js', 'dist/post.js']) entries.set(`${root}/${file}`, 'file')
+  return entries
+}
 
 function createDeps(overrides: Overrides = {}) {
   const getExecOutput = vi.fn<ExecAdapter['getExecOutput']>(async () => ({
@@ -64,18 +83,25 @@ function createDeps(overrides: Overrides = {}) {
       const key = absolutePath.replace('/proc/sys/fs/', '')
       return sysctls[key] ?? null
     },
-    actionPaths: overrides.actionPaths ?? PUBLISHED_ACTION,
-    invokedAs:
-      overrides.invokedAs === undefined
-        ? ((overrides.actionPaths ?? PUBLISHED_ACTION)[0] ?? null) === null
-          ? null
-          : `${(overrides.actionPaths ?? PUBLISHED_ACTION)[0]}/main.js`
-        : overrides.invokedAs,
+    bundleDir: overrides.bundleDir === undefined ? `${PUBLISHED_ROOT}/dist` : overrides.bundleDir,
+    invokedAs: overrides.invokedAs === undefined ? `${PUBLISHED_ROOT}/dist/main.js` : overrides.invokedAs,
+    lstat: async absolutePath => (overrides.entries ?? publishedEntries(PUBLISHED_ROOT)).get(absolutePath) ?? null,
     realpath: async absolutePath => overrides.realpaths?.[absolutePath] ?? absolutePath,
     cwd: '/home/runner/work/repo/repo',
     logger: createMockLogger(),
   }
   return {deps, getExecOutput}
+}
+
+async function expectRefused(deps: SandboxPreflightDeps, getExecOutput: {mock: unknown}, reason?: RegExp) {
+  const result = await runSandboxPreflight(deps)
+  expect(result.ok).toBe(false)
+  if (result.ok) throw new Error('unreachable')
+  expect(result.check).toBe('action-location')
+  expect(result.message).toContain('fro-bot/agent@')
+  if (reason !== undefined) expect(result.message).toMatch(reason)
+  // refused before any privileged probe
+  expect((getExecOutput as {mock: {calls: unknown[]}}).mock.calls).toHaveLength(0)
 }
 
 describe('runSandboxPreflight', () => {
@@ -155,240 +181,248 @@ describe('runSandboxPreflight', () => {
     expect(getExecOutput).not.toHaveBeenCalled()
   })
 
-  describe('action install location', () => {
+  describe('published installs only', () => {
     const WORKSPACE = '/home/runner/work/repo/repo'
+    const withInstall = (root: string, extra: Partial<Parameters<typeof createDeps>[0]> = {}) =>
+      createDeps({
+        env: {...HOSTED_ENV, GITHUB_ACTION_PATH: root},
+        bundleDir: `${root}/dist`,
+        invokedAs: `${root}/dist/main.js`,
+        entries: publishedEntries(root),
+        ...extra,
+      })
 
-    it('passes for a published action outside every writable root', async () => {
-      // #given the Action installed under _actions, beside the workspace
+    it('passes for a published install', async () => {
+      // #given the Action installed under the runner's _actions tree, started from it
       const {deps} = createDeps()
 
       // #when / #then
       expect((await runSandboxPreflight(deps)).ok).toBe(true)
     })
 
-    it.each([
-      ['equal to the workspace (uses: ./)', [`${WORKSPACE}/dist`, WORKSPACE]],
-      ['nested in the workspace', [`${WORKSPACE}/.github/actions/agent/dist`, `${WORKSPACE}/.github/actions/agent`]],
-      ['a parent of the workspace', ['/home/runner/work/repo/dist', '/home/runner/work/repo']],
-      [
-        'inside a handed-over XDG data dir',
-        ['/home/runner/.local/share/opencode/x/dist', '/home/runner/.local/share/opencode/x'],
-      ],
-      ['inside the runner temp tree', ['/home/runner/work/_temp/act/dist', '/home/runner/work/_temp/act']],
-      ['a parent of the runner home XDG roots', ['/home/runner/dist', '/home/runner']],
-    ])('fails closed before any tool probe when the install is %s', async (_label, actionPaths) => {
-      // #given the Action installed where the sandbox user could rewrite it
-      const {deps, getExecOutput} = createDeps({actionPaths})
-
-      // #when
-      const result = await runSandboxPreflight(deps)
-
-      // #then it names the reason, points at a published ref, and probes nothing privileged
-      expect(result.ok).toBe(false)
-      if (result.ok) throw new Error('unreachable')
-      expect(result.check).toBe('action-location')
-      expect(result.message).toContain('fro-bot/agent@')
-      expect(getExecOutput).not.toHaveBeenCalled()
-    })
-
-    it('resolves symlinks first, so a published-looking path that points into the workspace is refused', async () => {
-      // #given a link under _actions that resolves into the checkout
-      const {deps} = createDeps({
-        actionPaths: ['/home/runner/work/_actions/fro-bot/agent/v1'],
-        realpaths: {'/home/runner/work/_actions/fro-bot/agent/v1': `${WORKSPACE}/vendored`},
+    it('derives the work directory from RUNNER_TEMP instead of assuming /home/runner/work', async () => {
+      // #given a runner whose work directory is elsewhere
+      const work = '/srv/gha/work'
+      const root = `${work}/_actions/fro-bot/agent/v1`
+      const {deps} = withInstall(root, {
+        env: {...HOSTED_ENV, RUNNER_TEMP: `${work}/_temp`, GITHUB_ACTION_PATH: root},
+        entries: publishedEntries(root, work),
       })
-
-      // #when / #then
-      const result = await runSandboxPreflight(deps)
-      expect(!result.ok && result.check).toBe('action-location')
-    })
-
-    it('honors a GITHUB_ACTION_PATH that differs from the bundle location', async () => {
-      // #given the bundle looks safe, but the runner reports the action inside the workspace
-      const {deps} = createDeps({env: {...HOSTED_ENV, GITHUB_ACTION_PATH: WORKSPACE}})
-
-      // #when / #then
-      const result = await runSandboxPreflight(deps)
-      expect(!result.ok && result.check).toBe('action-location')
-    })
-
-    it('does not mistake a sibling with a shared name prefix for an overlap', async () => {
-      // #given an install dir whose name merely starts with the workspace's
-      const {deps} = createDeps({actionPaths: [`${WORKSPACE}-tools/dist`, `${WORKSPACE}-tools`]})
 
       // #when / #then
       expect((await runSandboxPreflight(deps)).ok).toBe(true)
     })
 
-    describe('lexical and canonical paths', () => {
-      const PUBLISHED_CANONICAL = '/home/runner/work/_actions/fro-bot/agent/v1'
-
-      it('rejects an alias inside the checkout that points at a protected install outside it', async () => {
-        // #given `uses: ./x`, where x is a symlink in the checkout to a protected install: the runner starts the Action
-        // from the alias, so the sandbox could replace that symlink with a directory of its own
-        const alias = `${WORKSPACE}/x/dist/main.js`
-        const {deps, getExecOutput} = createDeps({
-          actionPaths: [`${PUBLISHED_CANONICAL}/dist`, PUBLISHED_CANONICAL],
-          invokedAs: alias,
-          realpaths: {[alias]: `${PUBLISHED_CANONICAL}/dist/main.js`},
-        })
-
-        // #when
-        const result = await runSandboxPreflight(deps)
-
-        // #then it is refused on the lexical path even though the canonical one is safe, and nothing was probed
-        expect(!result.ok && result.check).toBe('action-location')
-        expect(!result.ok && result.message).toContain(alias)
-        expect(getExecOutput).not.toHaveBeenCalled()
-      })
-
-      it('rejects a GITHUB_ACTION_PATH alias inside the checkout that resolves outside it', async () => {
-        // #given the runner-reported path is the alias
-        const alias = `${WORKSPACE}/x`
-        const {deps} = createDeps({
-          env: {...HOSTED_ENV, GITHUB_ACTION_PATH: alias},
-          actionPaths: [`${PUBLISHED_CANONICAL}/dist`, PUBLISHED_CANONICAL],
-          invokedAs: `${PUBLISHED_CANONICAL}/dist/main.js`,
-          realpaths: {[alias]: PUBLISHED_CANONICAL},
-        })
-
-        // #when / #then
-        const result = await runSandboxPreflight(deps)
-        expect(!result.ok && result.check).toBe('action-location')
-      })
-
-      it('rejects when the canonical path is inside a writable root but the lexical one is not', async () => {
-        // #given a path that looks safe but resolves into the checkout
-        const lexical = '/home/runner/work/_actions/fro-bot/agent/v1'
-        const {deps} = createDeps({
-          actionPaths: [lexical],
-          invokedAs: `${lexical}/main.js`,
-          realpaths: {[lexical]: `${WORKSPACE}/vendored`, [`${lexical}/main.js`]: `${WORKSPACE}/vendored/main.js`},
-        })
-
-        // #when / #then
-        expect((await runSandboxPreflight(deps)).ok).toBe(false)
-      })
-
-      it('compares against the canonical form of a writable root too (a workspace that is itself a link)', async () => {
-        // #given a checkout path that is a link to /srv/real-ws, and an install living under the link's target
-        const {deps} = createDeps({
-          env: {...HOSTED_ENV, GITHUB_WORKSPACE: '/home/runner/work/link'},
-          actionPaths: ['/srv/real-ws/tools/dist', '/srv/real-ws/tools'],
-          invokedAs: '/srv/real-ws/tools/dist/main.js',
-          realpaths: {'/home/runner/work/link': '/srv/real-ws'},
-        })
-
-        // #when / #then
-        const result = await runSandboxPreflight(deps)
-        expect(!result.ok && result.check).toBe('action-location')
-      })
-
-      it('accepts a published install invoked through its own path', async () => {
-        // #given the runner started the Action from the _actions install
-        const {deps} = createDeps({
-          actionPaths: [`${PUBLISHED_CANONICAL}/dist`, PUBLISHED_CANONICAL],
-          invokedAs: `${PUBLISHED_CANONICAL}/dist/main.js`,
-        })
+    it.each(['v1', 'feature/x', 'release/2026/11', '..action'])(
+      'passes for the ref %s (a ref may contain "/")',
+      async ref => {
+        // #given a published install whose ref is shown
+        const root = `${WORK}/_actions/fro-bot/agent/${ref}`
+        const {deps} = withInstall(root)
 
         // #when / #then
         expect((await runSandboxPreflight(deps)).ok).toBe(true)
+      },
+    )
+
+    it('passes for a repository literally named ..action under _actions (a real directory, not a climb)', async () => {
+      // #given
+      const root = `${WORK}/_actions/fro-bot/..action/v1`
+      const {deps} = withInstall(root)
+
+      // #when / #then
+      expect((await runSandboxPreflight(deps)).ok).toBe(true)
+    })
+
+    it('refuses a local install (uses: ./) before probing anything', async () => {
+      // #given the Action started from the checkout
+      const root = WORKSPACE
+      const {deps, getExecOutput} = withInstall(root, {entries: publishedEntries(`${WORK}/_actions/x/y/z`)})
+
+      // #when / #then
+      await expectRefused(deps, getExecOutput)
+    })
+
+    it('refuses a checkout directory named ..action (the path that used to read as a climb out of the workspace)', async () => {
+      // #given `uses: ./..action`
+      const root = `${WORKSPACE}/..action`
+      const {deps, getExecOutput} = withInstall(root)
+
+      // #when / #then
+      await expectRefused(deps, getExecOutput)
+    })
+
+    it.each([
+      ['_actions itself', `${WORK}/_actions`],
+      ['an owner directory', `${WORK}/_actions/fro-bot`],
+      ['a repository directory without a ref', `${WORK}/_actions/fro-bot/agent`],
+      ['a sibling of _actions', `${WORK}/_temp/fro-bot/agent/v1`],
+      ['a path that climbs out of _actions', `${WORK}/_actions/fro-bot/agent/../../../repo/repo`],
+    ])('refuses %s as the install root', async (_label, root) => {
+      // #given an invocation path that is not <work>/_actions/<owner>/<repo>/<ref>
+      const {deps, getExecOutput} = withInstall(root, {entries: publishedEntries(path.resolve(root))})
+
+      // #when / #then
+      await expectRefused(deps, getExecOutput)
+    })
+
+    it.each([
+      ['the work directory', WORK],
+      ['_actions', `${WORK}/_actions`],
+      ['the owner directory', `${WORK}/_actions/fro-bot`],
+      ['the repository directory', `${WORK}/_actions/fro-bot/agent`],
+      ['the ref directory', PUBLISHED_ROOT],
+      ['dist', `${PUBLISHED_ROOT}/dist`],
+    ])('refuses a symlink at %s, even when it points at a protected install', async (_label, linked) => {
+      // #given that component is a symlink (to somewhere protected, so the canonical path looks fine)
+      const entries = publishedEntries(PUBLISHED_ROOT)
+      entries.set(linked, 'symlink')
+      const {deps, getExecOutput} = withInstall(PUBLISHED_ROOT, {entries})
+
+      // #when / #then
+      await expectRefused(deps, getExecOutput, /symlink/)
+    })
+
+    it('refuses an intermediate hop: protected -> writable -> protected', async () => {
+      // #given _actions/.../v1 is a link into the checkout, which links back to a protected install
+      const entries = publishedEntries(PUBLISHED_ROOT)
+      entries.set(PUBLISHED_ROOT, 'symlink')
+      entries.set(`${WORKSPACE}/hop`, 'symlink')
+      const {deps, getExecOutput} = withInstall(PUBLISHED_ROOT, {
+        entries,
+        realpaths: {[PUBLISHED_ROOT]: '/opt/protected-agent', [`${WORKSPACE}/hop`]: '/opt/protected-agent'},
       })
 
-      it('fails closed when nothing says how the Action was started (no GITHUB_ACTION_PATH, no script path)', async () => {
-        // #given a canonical install that looks fine, but no invocation path to compare it with
-        const {deps} = createDeps({
-          actionPaths: [`${PUBLISHED_CANONICAL}/dist`, PUBLISHED_CANONICAL],
-          invokedAs: null,
-        })
+      // #when / #then the walk stops at the first link; the endpoints being protected does not matter
+      await expectRefused(deps, getExecOutput, /symlink/)
+    })
 
-        // #when
-        const result = await runSandboxPreflight(deps)
+    it.each([
+      ['action.yaml is a symlink', `${PUBLISHED_ROOT}/action.yaml`, 'symlink'],
+      ['action.yaml is a directory', `${PUBLISHED_ROOT}/action.yaml`, 'directory'],
+      ['main.js is a symlink', `${PUBLISHED_ROOT}/dist/main.js`, 'symlink'],
+      ['post.js is a symlink', `${PUBLISHED_ROOT}/dist/post.js`, 'symlink'],
+      ['post.js is a FIFO or device', `${PUBLISHED_ROOT}/dist/post.js`, 'other'],
+    ] as const)('refuses an install where %s', async (_label, target, kind) => {
+      // #given the file the runner reloads or executes is not a regular file
+      const entries = publishedEntries(PUBLISHED_ROOT)
+      entries.set(target, kind)
+      const {deps, getExecOutput} = withInstall(PUBLISHED_ROOT, {entries})
 
-        // #then
-        expect(!result.ok && result.check).toBe('action-location')
-        expect(!result.ok && result.message).toContain('how the Action was started')
-      })
+      // #when / #then
+      await expectRefused(deps, getExecOutput, /regular file/)
+    })
 
-      it('fails closed when the script path is not this install (inconclusive), without GITHUB_ACTION_PATH', async () => {
-        // #given argv[1] belongs to some other program, so it says nothing about where this bundle was started from
-        const {deps} = createDeps({
-          actionPaths: [`${PUBLISHED_CANONICAL}/dist`, PUBLISHED_CANONICAL],
-          invokedAs: '/usr/local/bin/bun-runner.js',
-        })
+    it('accepts action.yml in place of action.yaml, and refuses neither being present', async () => {
+      // #given only action.yml
+      const entries = publishedEntries(PUBLISHED_ROOT)
+      entries.delete(`${PUBLISHED_ROOT}/action.yaml`)
+      entries.set(`${PUBLISHED_ROOT}/action.yml`, 'file')
+      expect((await runSandboxPreflight(withInstall(PUBLISHED_ROOT, {entries}).deps)).ok).toBe(true)
+
+      // #and neither
+      entries.delete(`${PUBLISHED_ROOT}/action.yml`)
+      const {deps, getExecOutput} = withInstall(PUBLISHED_ROOT, {entries})
+      await expectRefused(deps, getExecOutput, /action\.ya?ml/)
+    })
+
+    it('refuses an empty or missing GITHUB_ACTION_REPOSITORY (provenance only), but never accepts on it alone', async () => {
+      for (const value of ['', undefined]) {
+        // #given a published layout with no repository provenance
+        const {deps, getExecOutput} = createDeps({env: {...HOSTED_ENV, GITHUB_ACTION_REPOSITORY: value}})
 
         // #when / #then
-        const result = await runSandboxPreflight(deps)
-        expect(!result.ok && result.check).toBe('action-location')
+        await expectRefused(deps, getExecOutput, /GITHUB_ACTION_REPOSITORY/)
+      }
+
+      // #and a repository name with a local layout is still refused
+      const {deps, getExecOutput} = withInstall(WORKSPACE)
+      await expectRefused(deps, getExecOutput)
+    })
+
+    it('refuses when the bundle that is running is not the one the runner started', async () => {
+      // #given the invocation path says _actions, but the running bundle lives in the checkout
+      const {deps, getExecOutput} = withInstall(PUBLISHED_ROOT, {bundleDir: `${WORKSPACE}/dist`})
+
+      // #when / #then
+      await expectRefused(deps, getExecOutput, /bundle/)
+    })
+
+    it('refuses when GITHUB_ACTION_PATH and the script path disagree', async () => {
+      // #given two published installs, one reported and the other started
+      const other = `${WORK}/_actions/fro-bot/agent/v2`
+      const {deps, getExecOutput} = withInstall(PUBLISHED_ROOT, {invokedAs: `${other}/dist/main.js`})
+
+      // #when / #then
+      await expectRefused(deps, getExecOutput)
+    })
+
+    it('derives the install from the script path when GITHUB_ACTION_PATH is unset', async () => {
+      // #given only argv[1]
+      const {deps} = withInstall(PUBLISHED_ROOT, {env: {...HOSTED_ENV, GITHUB_ACTION_PATH: undefined}})
+
+      // #when / #then
+      expect((await runSandboxPreflight(deps)).ok).toBe(true)
+    })
+
+    it('fails closed when neither GITHUB_ACTION_PATH nor a script path says how the Action was started', async () => {
+      // #given a perfectly good canonical bundle, but no lexical invocation
+      const {deps, getExecOutput} = withInstall(PUBLISHED_ROOT, {
+        env: {...HOSTED_ENV, GITHUB_ACTION_PATH: undefined},
+        invokedAs: null,
       })
 
-      it('lets a GITHUB_ACTION_PATH that names this install settle it when the script path is unavailable', async () => {
-        // #given only the runner-reported path, and it is this install
-        const {deps} = createDeps({
-          env: {...HOSTED_ENV, GITHUB_ACTION_PATH: PUBLISHED_CANONICAL},
-          actionPaths: [`${PUBLISHED_CANONICAL}/dist`, PUBLISHED_CANONICAL],
-          invokedAs: null,
-        })
+      // #when / #then
+      await expectRefused(deps, getExecOutput, /how the Action was started/)
+    })
 
-        // #when / #then
-        expect((await runSandboxPreflight(deps)).ok).toBe(true)
-      })
+    it('fails closed without RUNNER_TEMP, since the work directory cannot be derived', async () => {
+      // #given
+      const {deps, getExecOutput} = createDeps({env: {...HOSTED_ENV, RUNNER_TEMP: undefined}})
+
+      // #when / #then
+      await expectRefused(deps, getExecOutput, /work directory/)
+    })
+
+    it('fails closed when the running bundle location is unknown', async () => {
+      // #given
+      const {deps, getExecOutput} = withInstall(PUBLISHED_ROOT, {bundleDir: null})
+
+      // #when / #then
+      await expectRefused(deps, getExecOutput, /bundle/)
+    })
+
+    it('refuses a missing component rather than assuming it exists', async () => {
+      // #given dist is absent
+      const entries = publishedEntries(PUBLISHED_ROOT)
+      entries.delete(`${PUBLISHED_ROOT}/dist`)
+      const {deps, getExecOutput} = withInstall(PUBLISHED_ROOT, {entries})
+
+      // #when / #then
+      await expectRefused(deps, getExecOutput, /dist/)
     })
 
     describe('discoverActionLocation', () => {
-      it('reads the script path and the bundle location, and reports the missing pieces as null/empty', () => {
+      it('reads the script path and the canonical bundle directory', () => {
         // #given the pieces Node gives a running script
         const found = discoverActionLocation({
-          argv: ['/usr/bin/node', '/home/runner/work/_actions/fro-bot/agent/v1/dist/main.js'],
-          moduleUrl: 'file:///home/runner/work/_actions/fro-bot/agent/v1/dist/main.js',
+          argv: ['/usr/bin/node', `${PUBLISHED_ROOT}/dist/main.js`],
+          moduleUrl: `file://${PUBLISHED_ROOT}/dist/main.js`,
         })
 
-        // #then the bundle's directory and its parent come from the module URL, and the invocation from argv[1]
-        expect(found.invokedAs).toBe('/home/runner/work/_actions/fro-bot/agent/v1/dist/main.js')
-        expect(found.actionPaths).toEqual([
-          '/home/runner/work/_actions/fro-bot/agent/v1/dist',
-          '/home/runner/work/_actions/fro-bot/agent/v1',
-        ])
+        // #then
+        expect(found.invokedAs).toBe(`${PUBLISHED_ROOT}/dist/main.js`)
+        expect(found.bundleDir).toBe(`${PUBLISHED_ROOT}/dist`)
       })
 
-      it('has no invocation without argv[1], and no install paths for a module URL that is not a file URL', () => {
-        // #given a bare argv and a non-file URL
+      it('has no invocation without argv[1] and no bundle for a module URL that is not a file URL', () => {
+        // #given
         const found = discoverActionLocation({argv: ['/usr/bin/node'], moduleUrl: 'data:text/javascript,x'})
 
         // #then
         expect(found.invokedAs).toBeNull()
-        expect(found.actionPaths).toEqual([])
+        expect(found.bundleDir).toBeNull()
       })
-
-      it('keeps an argv[1] that is a relative path as given, for the caller to resolve and reject or accept', () => {
-        // #given `node ./x/dist/main.js`
-        const found = discoverActionLocation({
-          argv: ['/usr/bin/node', './x/dist/main.js'],
-          moduleUrl: 'file:///opt/a/dist/main.js',
-        })
-
-        // #then
-        expect(found.invokedAs).toBe('./x/dist/main.js')
-      })
-    })
-
-    it('fails closed when the install location cannot be determined', async () => {
-      // #given no location at all
-      const {deps} = createDeps({actionPaths: []})
-
-      // #when / #then
-      const result = await runSandboxPreflight(deps)
-      expect(!result.ok && result.check).toBe('action-location')
-    })
-
-    it('uses the working directory as the workspace when GITHUB_WORKSPACE is unset', async () => {
-      // #given no GITHUB_WORKSPACE, and an install equal to the cwd
-      const env = {...HOSTED_ENV, GITHUB_WORKSPACE: undefined}
-      const {deps} = createDeps({env, actionPaths: [WORKSPACE]})
-
-      // #when / #then
-      const result = await runSandboxPreflight(deps)
-      expect(!result.ok && result.check).toBe('action-location')
     })
   })
 })

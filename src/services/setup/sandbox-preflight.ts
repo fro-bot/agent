@@ -4,6 +4,7 @@ import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import process from 'node:process'
 import {fileURLToPath} from 'node:url'
+import {isWithin} from '@fro-bot/runtime'
 
 /**
  * Fail-closed capability check for `isolate-agent: true`.
@@ -45,6 +46,8 @@ export type SandboxPreflightCheck =
   | 'tool'
   | 'protected-links'
 
+export type ActionEntryKind = 'directory' | 'file' | 'symlink' | 'other'
+
 export type SandboxPreflightResult =
   | {readonly ok: true; readonly tools: SandboxToolPaths}
   | {readonly ok: false; readonly check: SandboxPreflightCheck; readonly message: string}
@@ -60,16 +63,17 @@ export interface SandboxPreflightDeps {
   readonly pathExists: (absolutePath: string) => Promise<boolean>
   readonly readText: (absolutePath: string) => Promise<string | null>
   /**
-   * Where the running Action is installed: `GITHUB_ACTION_PATH` when the runner sets it, plus the directory of the
-   * running bundle and its parent. Empty when it cannot be determined, which fails the check.
+   * The directory of the running bundle, canonical (Node resolves the main module through symlinks). `null` when it
+   * cannot be determined.
    */
-  readonly actionPaths: readonly string[]
+  readonly bundleDir: string | null
   /**
    * The script path the runner started the Action with (`process.argv[1]`), exactly as given: a path through a symlink
-   * stays lexical. `null` when it is not available. For `uses: ./x` this is `<checkout>/x/dist/main.js` even if `x` is a
-   * symlink to an install somewhere else, which is the path the sandbox user could replace.
+   * stays lexical. `null` when it is not available.
    */
   readonly invokedAs: string | null
+  /** `lstat` without following a final symlink: what kind of entry is at the path, or `null` when nothing is there. */
+  readonly lstat: (absolutePath: string) => Promise<ActionEntryKind | null>
   readonly realpath: (absolutePath: string) => Promise<string>
   /** The working directory, the workspace when `GITHUB_WORKSPACE` is unset (the same fallback bootstrap uses). */
   readonly cwd: string
@@ -141,126 +145,116 @@ export async function runSandboxPreflight(deps: SandboxPreflightDeps): Promise<S
   return {ok: true, tools: tools.paths}
 }
 
-function isInsideOrEqual(parent: string, child: string): boolean {
-  const relative = path.relative(parent, child)
-  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
-}
+/** The sub-path of the runner's work directory that holds downloaded actions. Reserved: the sandbox may never write it. */
+export const ACTIONS_DIR_NAME = '_actions'
 
-/**
- * The directories the sandbox user can write once handoff has run: the checkout, the four OpenCode XDG dirs, and the
- * runner temp tree (response, credential, gh-config and attachment dirs all live under it). A superset is fine: this only
- * decides whether the Action's own files are exposed.
- */
-export function sandboxWritableRoots(env: NodeJS.ProcessEnv, cwd: string): readonly string[] {
-  const home = env.HOME ?? ''
-  const xdg = (name: string, fallback: string): string => {
-    const value = env[name]
-    return value !== undefined && value.length > 0 && path.isAbsolute(value) ? value : path.join(home, fallback)
-  }
-  const roots = [
-    env.GITHUB_WORKSPACE !== undefined && env.GITHUB_WORKSPACE.length > 0 ? env.GITHUB_WORKSPACE : cwd,
-    path.join(xdg('XDG_DATA_HOME', '.local/share'), 'opencode'),
-    path.join(xdg('XDG_CONFIG_HOME', '.config'), 'opencode'),
-    path.join(xdg('XDG_CACHE_HOME', '.cache'), 'opencode'),
-    path.join(xdg('XDG_STATE_HOME', '.local/state'), 'opencode'),
-  ]
-  if (env.RUNNER_TEMP !== undefined && env.RUNNER_TEMP.length > 0) roots.push(env.RUNNER_TEMP)
-  return roots.map(root => path.resolve(root))
-}
-
-/** Where the running bundle lives and how it was started, from the pieces Node gives a script. */
+/** The pieces Node gives a running script: the canonical bundle directory and the lexical script path. */
 export function discoverActionLocation(input: {readonly argv: readonly string[]; readonly moduleUrl: string}): {
-  readonly actionPaths: readonly string[]
+  readonly bundleDir: string | null
   readonly invokedAs: string | null
 } {
   const invoked = input.argv[1]
   const invokedAs = invoked !== undefined && invoked.length > 0 ? invoked : null
   try {
-    const bundleDir = path.dirname(fileURLToPath(input.moduleUrl))
-    return {actionPaths: [bundleDir, path.dirname(bundleDir)], invokedAs}
+    return {bundleDir: path.dirname(fileURLToPath(input.moduleUrl)), invokedAs}
   } catch {
-    return {actionPaths: [], invokedAs}
+    return {bundleDir: null, invokedAs}
   }
 }
 
+const RUNNER_ENTRY_SCRIPTS = ['dist/main.js', 'dist/post.js'] as const
+const MANIFEST_NAMES = ['action.yaml', 'action.yml'] as const
+
 /**
- * The Action's own files (`dist/post.js`, `action.yaml`) run later as the runner. If the sandbox can write the place they
- * live, it can plant code that runs with the runner's privileges. `uses: ./` installs the Action inside the checkout, so
- * it is refused; a published `fro-bot/agent@<ref>` lives under `_actions`, outside every writable root.
+ * `isolate-agent` supports a published install only: `fro-bot/agent@<ref>`, which the runner downloads to
+ * `<work>/_actions/<owner>/<repo>/<ref...>/` (a ref may contain `/`).
  *
- * Every location is checked twice, as given (lexical) and after `realpath` (canonical), against every writable root in
- * both forms. The lexical check is the one that matters for an alias: `uses: ./x` with `x` a symlink to a protected
- * install resolves to a safe canonical path, but the runner starts the Action from `<checkout>/x`, which the sandbox can
- * replace with a directory of its own.
+ * The runner reloads the action manifest and opens the post script by path at post time, as the runner user, so the whole
+ * install must be immutable to the sandbox. A local `uses: ./` install sits in the checkout (writable), and an alias, a
+ * `..action` directory, or any symlink on the way to a protected copy can be replaced by the sandbox. Rather than rule out
+ * each of those, the invariant is: the invocation path lies under `<work>/_actions/<owner>/<repo>/<ref>`, and every
+ * component from the work directory down to `dist/` is a real directory, with the manifest and the entry scripts regular
+ * files. `_actions` is a reserved subtree that handoff refuses to grant (see `sandbox-handoff.ts`).
  *
- * The invocation path (`GITHUB_ACTION_PATH`, which the runner sets only for some actions, and the script path) is what
- * ties the canonical install to how the runner will start it. If neither is available, or none of them lies in this
- * install, nothing says where the runner will look, so the check fails closed.
+ * `GITHUB_ACTION_REPOSITORY` must be set, as provenance only: it says the runner thinks this is a downloaded action, and
+ * decides nothing without the walk.
  */
 async function checkActionLocation(deps: SandboxPreflightDeps): Promise<SandboxPreflightResult | null> {
   const advice =
-    'use a published `fro-bot/agent@<ref>` instead of a local `uses: ./` install, so the Action is not stored where the agent user can write'
-  const canonical = async (target: string): Promise<string> => {
-    try {
-      return await deps.realpath(target)
-    } catch {
-      return target
-    }
+    'use a published `fro-bot/agent@<ref>` (GitHub-hosted Linux only) instead of a local `uses: ./` install, so the Action is not stored where the agent user can write'
+  const refuse = (reason: string): SandboxPreflightResult => fail('action-location', `${reason}; ${advice}`)
+
+  const runnerTemp = deps.env.RUNNER_TEMP
+  if (runnerTemp === undefined || runnerTemp.length === 0 || !path.isAbsolute(runnerTemp)) {
+    return refuse('RUNNER_TEMP is not set, so the runner work directory cannot be derived')
+  }
+  const work = path.resolve(path.dirname(path.resolve(runnerTemp)))
+  const actionsRoot = path.join(work, ACTIONS_DIR_NAME)
+
+  const repository = deps.env.GITHUB_ACTION_REPOSITORY
+  if (repository === undefined || repository.length === 0) {
+    return refuse('GITHUB_ACTION_REPOSITORY is not set, so this does not look like a downloaded action')
   }
 
-  // `GITHUB_ACTION_PATH` is the install root. The script path is a file in `<root>/dist/`.
   const reported = deps.env.GITHUB_ACTION_PATH
   const reportedRoot = reported !== undefined && reported.length > 0 ? path.resolve(deps.cwd, reported) : null
   const scriptPath =
     deps.invokedAs !== null && deps.invokedAs.length > 0 ? path.resolve(deps.cwd, deps.invokedAs) : null
-  const invocations = [reportedRoot, scriptPath].filter((value): value is string => value !== null)
-  if (deps.actionPaths.length === 0) {
-    return fail('action-location', `the Action's install location could not be determined; ${advice}`)
+  if (reportedRoot === null && scriptPath === null) {
+    return refuse('it could not be determined how the Action was started (no GITHUB_ACTION_PATH and no script path)')
   }
-  if (invocations.length === 0) {
-    return fail('action-location', `it could not be determined how the Action was started; ${advice}`)
-  }
-
-  // At least one invocation path must lead into this install, or it says nothing about where the runner will look.
-  const installs = await Promise.all(deps.actionPaths.map(async install => canonical(path.resolve(install))))
-  let conclusive = false
-  for (const invocation of invocations) {
-    const real = await canonical(invocation)
-    if (installs.some(install => isInsideOrEqual(install, real) || isInsideOrEqual(real, install))) conclusive = true
-  }
-  if (!conclusive) {
-    return fail(
-      'action-location',
-      `how the Action was started (${invocations.join(', ')}) does not lead to the installed bundle (${installs.join(', ')}); ${advice}`,
-    )
+  if (deps.bundleDir === null) {
+    return refuse('the location of the running bundle could not be determined')
   }
 
-  const roots = new Set<string>()
-  for (const root of sandboxWritableRoots(deps.env, deps.cwd)) {
-    roots.add(root)
-    roots.add(await canonical(root))
+  // The install root: the runner-reported path, else the directory above the bundle directory the script was started from.
+  const installRoot = reportedRoot ?? path.dirname(path.dirname(scriptPath as string))
+  if (scriptPath !== null && path.dirname(scriptPath) !== path.join(installRoot, 'dist')) {
+    return refuse(`the script ${scriptPath} is not ${path.join(installRoot, 'dist')}/<file>`)
   }
 
-  // Each location, as given and resolved, plus the directories the runner would also load from (script dir, install root).
-  const lexicalLocations = [
-    ...deps.actionPaths.map(install => path.resolve(install)),
-    ...(reportedRoot === null ? [] : [reportedRoot]),
-    ...(scriptPath === null ? [] : [scriptPath, path.dirname(scriptPath), path.dirname(path.dirname(scriptPath))]),
-  ]
-  const locations = new Set<string>()
-  for (const lexical of lexicalLocations) {
-    locations.add(lexical)
-    locations.add(await canonical(lexical))
+  const parts = isWithin(actionsRoot, installRoot) ? path.relative(actionsRoot, installRoot).split(path.sep) : []
+  if (parts.length < 3 || parts.includes('') || parts.includes('..')) {
+    return refuse(`the Action is started from ${installRoot}, which is not ${actionsRoot}/<owner>/<repo>/<ref>`)
   }
-  for (const location of locations) {
-    for (const root of roots) {
-      if (isInsideOrEqual(root, location) || isInsideOrEqual(location, root)) {
-        return fail(
-          'action-location',
-          `the Action is reached through ${location}, which overlaps the writable path ${root}; ${advice}`,
-        )
-      }
-    }
+
+  // Walk every component from the work directory through dist/ with lstat: each must be a real directory.
+  const walk: string[] = [work]
+  let current = work
+  for (const part of [ACTIONS_DIR_NAME, ...parts, 'dist']) {
+    current = path.join(current, part)
+    walk.push(current)
+  }
+  for (const component of walk) {
+    const kind = await deps.lstat(component)
+    if (kind === null) return refuse(`${component} does not exist`)
+    if (kind === 'symlink') return refuse(`${component} is a symlink`)
+    if (kind !== 'directory') return refuse(`${component} is not a directory`)
+  }
+
+  // The manifest and the scripts the runner executes must be regular files (a link or device could be re-pointed).
+  const manifests: ActionEntryKind[] = []
+  for (const name of MANIFEST_NAMES) {
+    const kind = await deps.lstat(path.join(installRoot, name))
+    if (kind !== null) manifests.push(kind)
+  }
+  if (manifests.length === 0) return refuse(`${installRoot} has no action.yaml or action.yml`)
+  if (manifests.some(kind => kind !== 'file'))
+    return refuse(`the action manifest in ${installRoot} is not a regular file`)
+  for (const script of RUNNER_ENTRY_SCRIPTS) {
+    const kind = await deps.lstat(path.join(installRoot, script))
+    if (kind !== 'file') return refuse(`${path.join(installRoot, script)} is not a regular file`)
+  }
+
+  // What is running is what the runner started: the canonical bundle directory is the walked one.
+  let canonicalBundle: string
+  try {
+    canonicalBundle = await deps.realpath(path.join(installRoot, 'dist'))
+  } catch {
+    canonicalBundle = path.join(installRoot, 'dist')
+  }
+  if (path.resolve(deps.bundleDir) !== path.resolve(canonicalBundle)) {
+    return refuse(`the running bundle is in ${deps.bundleDir}, not in ${canonicalBundle}`)
   }
   return null
 }
@@ -300,8 +294,9 @@ export function createSandboxPreflightDeps(
   | 'isExecutable'
   | 'pathExists'
   | 'readText'
-  | 'actionPaths'
+  | 'bundleDir'
   | 'invokedAs'
+  | 'lstat'
   | 'realpath'
   | 'cwd'
   | 'logger'
@@ -337,6 +332,16 @@ export function createSandboxPreflightDeps(
       }
     },
     ...discoverActionLocation({argv: process.argv, moduleUrl: import.meta.url}),
+    lstat: async absolutePath => {
+      try {
+        const stats = await fs.lstat(absolutePath)
+        if (stats.isSymbolicLink()) return 'symlink'
+        if (stats.isDirectory()) return 'directory'
+        return stats.isFile() ? 'file' : 'other'
+      } catch {
+        return null
+      }
+    },
     realpath: async absolutePath => fs.realpath(absolutePath),
     cwd: process.cwd(),
     logger,

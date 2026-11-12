@@ -202,13 +202,37 @@ function writeKeyFile(keyDir: string): string {
   return keyFile
 }
 
+/**
+ * A real published-action layout in the runner's work directory: `<work>/_actions/<owner>/<repo>/<ref>/` with the manifest
+ * and the entry scripts as regular files, every component a real directory. This is what the preflight's walk looks for,
+ * so the gate runs for real instead of being told where the Action lives. The suite itself runs from the checkout, so the
+ * layout is a stand-in the preflight is pointed at (`bundleDir`, `invokedAs`); the walk and the file checks are the real ones.
+ */
+const fakeActionRoot = path.join(path.dirname(runnerTemp), '_actions', 'fro-bot-sandbox-it', 'agent', 'refs', 'v1')
+
+function createPublishedActionLayout(): void {
+  fs.mkdirSync(path.join(fakeActionRoot, 'dist'), {recursive: true})
+  fs.writeFileSync(
+    path.join(fakeActionRoot, 'action.yaml'),
+    'name: sandbox-it\nruns:\n  using: node24\n  main: dist/main.js\n',
+  )
+  for (const script of ['main.js', 'post.js'])
+    fs.writeFileSync(path.join(fakeActionRoot, 'dist', script), '// stand-in\n')
+}
+
+afterAll(() => {
+  // The whole owner directory is ours; never touch the runner's real _actions entries.
+  fs.rmSync(path.join(path.dirname(runnerTemp), '_actions', 'fro-bot-sandbox-it'), {recursive: true, force: true})
+})
+
 async function preflightTools(logger: Logger): Promise<SandboxToolPaths> {
-  // This suite runs from the checkout, which the action-location gate refuses for a real run. The gate has its own unit
-  // tests; here the install is declared to be a published location so the rest of the preflight is exercised for real.
+  createPublishedActionLayout()
+  const base = createSandboxPreflightDeps(createExecAdapter(), logger)
   const preflight = await runSandboxPreflight({
-    ...createSandboxPreflightDeps(createExecAdapter(), logger),
-    actionPaths: ['/opt/fro-bot-published-action/dist', '/opt/fro-bot-published-action'],
-    invokedAs: '/opt/fro-bot-published-action/dist/main.js',
+    ...base,
+    env: {...base.env, GITHUB_ACTION_PATH: fakeActionRoot, GITHUB_ACTION_REPOSITORY: 'fro-bot-sandbox-it/agent'},
+    bundleDir: path.join(fakeActionRoot, 'dist'),
+    invokedAs: path.join(fakeActionRoot, 'dist', 'main.js'),
   })
   if (!preflight.ok) throw new Error(preflight.message)
   return preflight.tools
