@@ -57,9 +57,11 @@ beforeAll(async () => {
   )
   chmodSync(mockOpenCode, 0o755)
 
-  // `gh auth login --with-token` would otherwise validate the fake token against github.com.
+  // `gh auth login --with-token` would otherwise validate the fake token against github.com. The stub must drain stdin:
+  // setup writes the token to it, and a stub that exits first breaks the pipe. On Linux that surfaces as an unhandled
+  // EPIPE on the child's stdin, which crashes the Action with exit 1 on a large share of runs.
   const mockGh = path.join(mockBinDir, 'gh')
-  writeFileSync(mockGh, '#!/bin/sh\nexit 0\n', 'utf8')
+  writeFileSync(mockGh, '#!/bin/sh\ncat >/dev/null\nexit 0\n', 'utf8')
   chmodSync(mockGh, 0o755)
 })
 
@@ -201,7 +203,7 @@ it('runs successfully with valid inputs', {timeout: 15000}, async () => {
   const eventFile = path.join(testDataDir, 'push-event.json')
   writeFileSync(eventFile, JSON.stringify(eventPayload), 'utf8')
 
-  const {stdout, code} = await runMain({
+  const {stdout, stderr, code} = await runMain({
     'INPUT_GITHUB-TOKEN': 'ghp_test123',
     'INPUT_AUTH-JSON': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
     'INPUT_SESSION-RETENTION': '50',
@@ -216,7 +218,8 @@ it('runs successfully with valid inputs', {timeout: 15000}, async () => {
     SKIP_AGENT_EXECUTION: 'true',
   })
 
-  expect(code).toBe(0)
+  // The message carries the child's output, so a non-zero exit explains itself instead of a bare `expected 1 to be 0`.
+  expect(code, `child exited with code ${String(code)}\nstdout:\n${stdout}\nstderr:\n${stderr}`).toBe(0)
   expect(stdout).toContain('Starting Fro Bot Agent')
 })
 
