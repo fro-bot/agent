@@ -197,8 +197,12 @@ export function createPrivilegedRun(
     }
     const chunks: Buffer[] = []
     let stderrTail = Buffer.alloc(0)
+    let processes: string | undefined
     const outcome = await exec.execWithTimeout(sudoPath, args, timeoutMs, {
       cwd: '/',
+      onTimeout: snapshot => {
+        processes = snapshot
+      },
       listeners: {
         stdout: data => chunks.push(data),
         stderr: data => {
@@ -208,7 +212,15 @@ export function createPrivilegedRun(
     })
     noteIfSlow()
     const stderr = stderrTail.toString('utf8')
-    if (outcome === 'timed-out') return {exitCode: null, stdout: '', stderr, timedOutAfterMs: timeoutMs}
+    if (outcome === 'timed-out') {
+      return {
+        exitCode: null,
+        stdout: '',
+        stderr,
+        timedOutAfterMs: timeoutMs,
+        ...(processes === undefined ? {} : {processes}),
+      }
+    }
     return {exitCode: outcome, stdout: Buffer.concat(chunks).toString('utf8'), stderr}
   }
 }
@@ -235,7 +247,22 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   const {tools, env, logger} = options
   const deps: SandboxLifecycleDeps = {...defaultDeps, ...options.deps}
   const exec = options.exec ?? createExecAdapter()
-  const run = createPrivilegedRun(exec, tools.sudo, {logger})
+  const rawRun = createPrivilegedRun(exec, tools.sudo, {logger})
+  // A privileged command that outlives its budget is killed, but a kill does not confirm that it stopped (it may be stuck in
+  // the kernel, or hold work half done), and it may still be changing what the teardown is about to trust. Any timeout, however
+  // the adapter settled it, makes the run unsafe: the account is kept and nothing is called restored.
+  const timeouts: {command: string | null} = {command: null}
+  const timedOut = (): string | null => timeouts.command
+  const run: PrivilegedRun = async (argv, runOptions) => {
+    const result = await rawRun(argv, runOptions)
+    if (result.timedOutAfterMs !== undefined && timeouts.command === null) {
+      timeouts.command = `${path.basename(argv[0] ?? 'command')} timed out after ${result.timedOutAfterMs}ms`
+      logger.error('A privileged command timed out; the sandbox run can no longer be trusted', {
+        command: timeouts.command,
+      })
+    }
+    return result
+  }
   const runnerHome = options.runnerHome ?? env.HOME ?? os.userInfo().homedir
 
   let account: SandboxAccount | null = null
@@ -330,8 +357,21 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   })
 
   const doRelease = async (): Promise<SandboxReleaseResult> => {
-    if (account === null) return {stop: 'never-started', restore: 'not-needed'}
+    if (account === null) {
+      // No account was recorded, but a `useradd` that timed out may have made one: that is not "nothing happened".
+      if (timedOut() !== null) {
+        return {stop: 'never-started', restore: 'unsafe', reason: `${timedOut()}; the account was not removed`}
+      }
+      return {stop: 'never-started', restore: 'not-needed'}
+    }
     const stop = await deps.stop(account, tools, identityDeps())
+    if (timedOut() !== null) {
+      return {
+        stop: 'unconfirmed',
+        restore: 'unsafe',
+        reason: `${timedOut()}; a killed command is not known to have stopped, so the account is kept and nothing is taken back`,
+      }
+    }
     if (launchUnconfirmed) {
       // Best effort above; but the launcher itself could not say its child is gone, so nothing may be trusted: no take-back,
       // and the account is kept (a live uid must not lose its account).
@@ -352,11 +392,23 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     let restore: TakeBackOutcome = {status: 'restored'}
     if (manifest !== null && journal !== null) restore = await deps.takeBack(manifest, journal, handoffDeps())
     if (restore.status === 'unsafe') logger.error('Sandbox take-back was unsafe', {reason: restore.reason})
+    const timedOutDuringTakeBack = timedOut()
+    if (timedOutDuringTakeBack !== null && restore.status === 'restored') {
+      return {
+        stop,
+        restore: 'unsafe',
+        reason: `${timedOutDuringTakeBack} during the take-back; a killed command is not known to have stopped, so the account is kept`,
+      }
+    }
     // The stop is confirmed, so nothing runs as this uid any more: the account goes whether or not the files came back.
     const deleted = await deps.deleteAccount(account, tools, identityDeps())
     if (deleted === 'failed')
       logger.warning('The sandbox account could not be deleted; the VM is torn down after the job')
     if (restore.status === 'unsafe') return {stop, restore: 'unsafe', reason: restore.reason}
+    const timedOutDuringDelete = timedOut()
+    if (timedOutDuringDelete !== null) {
+      return {stop, restore: 'unsafe', reason: `${timedOutDuringDelete} while the account was being removed`}
+    }
     logger.info('Sandbox stopped and restored', {uid: account.uid})
     return {stop, restore: 'restored'}
   }
@@ -440,7 +492,10 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     try {
       installSignalHandlers()
       const created = await deps.createAccount(tools, identityDeps())
-      if (!created.success) return err(created.error.message)
+      if (!created.success) {
+        // A creation that timed out left the account in place; run the teardown so the state is `unsafe`, not `pending`.
+        return timedOut() === null ? err(created.error.message) : await failAndRelease(created.error.message)
+      }
       account = created.data
       if (cancelled) return await failAndRelease('isolate-agent setup was cancelled by a signal')
 

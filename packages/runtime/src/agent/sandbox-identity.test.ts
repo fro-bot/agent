@@ -176,9 +176,76 @@ describe('createSandboxAccount', () => {
       // #when
       const result = await createSandboxAccount(TOOLS, system.deps)
 
-      // #then the message separates "hung before creating" from "created, then hung" and the half-account is still removed
+      // #then the message separates "hung before creating" from "created, then hung"
       expect(!result.success && result.error.message).toContain('account present at timeout: yes')
+    })
+
+    it('never removes the account after a timeout: a killed useradd is not known to have stopped', async () => {
+      // #given a useradd that outlived its budget and whose account exists
+      const system = createFakeSystem({
+        useraddResult: {exitCode: null, stdout: '', stderr: '', timedOutAfterMs: 60_000},
+        createDespiteResult: true,
+      })
+
+      // #when
+      const result = await createSandboxAccount(TOOLS, system.deps)
+
+      // #then userdel never ran (the useradd could still be finishing), the failure says so, and it is flagged as a timeout
+      expect(toolNames(system.calls)).not.toContain('userdel')
+      expect(!result.success && result.error.message).toContain('left in place')
+      expect(!result.success && 'timedOut' in result.error && result.error.timedOut).toBe(true)
+    })
+
+    it('does flag an ordinary failure as not timed out, and still cleans up after it', async () => {
+      // #given a useradd that exits non-zero after creating the account
+      const system = createFakeSystem({
+        useraddResult: {exitCode: 9, stdout: '', stderr: 'boom'},
+        createDespiteResult: true,
+      })
+
+      // #when
+      const result = await createSandboxAccount(TOOLS, system.deps)
+
+      // #then it was cleaned up and is not a timeout
       expect(toolNames(system.calls)).toContain('userdel')
+      expect(!result.success && 'timedOut' in result.error).toBe(false)
+    })
+
+    it('includes the processes that were running at the timeout, on one bounded line', async () => {
+      // #given a killed useradd with the snapshot the runner took
+      const processes = [
+        'PID PPID PGID STAT ELAPSED COMMAND',
+        '4101 4090 4101 S 01:00 sudo -n -- /usr/sbin/useradd x',
+        '4102 4101 4101 S 01:00 /usr/sbin/useradd x',
+      ].join('\n')
+      const system = createFakeSystem({
+        useraddResult: {exitCode: null, stdout: '', stderr: '', timedOutAfterMs: 60_000, processes},
+      })
+
+      // #when
+      const result = await createSandboxAccount(TOOLS, system.deps)
+
+      // #then
+      const message = result.success ? '' : result.error.message
+      expect(message).toContain('processes at timeout: ')
+      expect(message).toContain('4102 4101 4101 S 01:00 /usr/sbin/useradd x')
+      expect(message).not.toContain('\n')
+    })
+
+    it('bounds the process listing in the message', async () => {
+      // #given a snapshot far longer than the bound
+      const processes = Array.from({length: 200}, (_, index) => `${index} 1 1 S 00:01 /usr/bin/thing-${index}`).join(
+        '\n',
+      )
+      const system = createFakeSystem({
+        useraddResult: {exitCode: null, stdout: '', stderr: '', timedOutAfterMs: 60_000, processes},
+      })
+
+      // #when
+      const result = await createSandboxAccount(TOOLS, system.deps)
+
+      // #then
+      expect(!result.success && result.error.message.length).toBeLessThan(1500)
     })
 
     it('includes the exit code and stderr tail for an ordinary failure, bounded to one line', async () => {

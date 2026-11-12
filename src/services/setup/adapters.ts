@@ -1,7 +1,7 @@
 import type {ChildProcess} from 'node:child_process'
 import type {ExecAdapter, ToolCacheAdapter} from './types.js'
 import {Buffer} from 'node:buffer'
-import {spawn} from 'node:child_process'
+import {spawn, spawnSync} from 'node:child_process'
 import process from 'node:process'
 import * as exec from '@actions/exec'
 import * as tc from '@actions/tool-cache'
@@ -67,6 +67,51 @@ function hasChildExited(child: ChildProcess): boolean {
  * Returns whether a signal was actually sent — `false` when the child had already exited, so
  * callers never treat a merely-scheduled kill as proof the process was reaped.
  */
+/** Longest listing handed to `onTimeout`: enough to see a parent, the command and a few helpers. */
+const SNAPSHOT_MAX_ROWS = 25
+const SNAPSHOT_MAX_ARGS = 140
+
+/**
+ * A listing of `rootPid` and everything under it (its process group and its descendants by parent), from `ps`. Used on the
+ * timeout path only, to say what a hung command was still waiting on. Best effort: any failure yields a one-line reason.
+ */
+function snapshotProcessTree(rootPid: number | undefined): string {
+  if (rootPid === undefined || process.platform === 'win32') return 'process listing unavailable'
+  const listing = spawnSync('ps', ['-eo', 'pid=,ppid=,pgid=,stat=,etime=,args='], {encoding: 'utf8', timeout: 2_000})
+  if (listing.status !== 0 || typeof listing.stdout !== 'string') return 'process listing unavailable'
+  const rows = listing.stdout
+    .split('\n')
+    .map(line => /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)(?:\s(.*))?$/.exec(line))
+    .filter((match): match is RegExpExecArray => match !== null)
+    .map(match => ({
+      pid: Number(match[1]),
+      ppid: Number(match[2]),
+      pgid: Number(match[3]),
+      stat: match[4] ?? '',
+      etime: match[5] ?? '',
+      args: (match[6] ?? '').trim().slice(0, SNAPSHOT_MAX_ARGS),
+    }))
+  const inTree = new Set<number>([rootPid])
+  let grew = true
+  while (grew) {
+    grew = false
+    for (const row of rows) {
+      if (!inTree.has(row.pid) && (row.pgid === rootPid || inTree.has(row.ppid))) {
+        inTree.add(row.pid)
+        grew = true
+      }
+    }
+  }
+  const lines = rows
+    .filter(row => inTree.has(row.pid))
+    .slice(0, SNAPSHOT_MAX_ROWS)
+    .map(row => `${row.pid} ${row.ppid} ${row.pgid} ${row.stat} ${row.etime} ${row.args}`)
+  return [
+    'PID PPID PGID STAT ELAPSED COMMAND',
+    ...(lines.length === 0 ? ['(the command is no longer running)'] : lines),
+  ].join('\n')
+}
+
 function killChildProcessGroup(child: ChildProcess, signal: NodeJS.Signals): boolean {
   if (hasChildExited(child)) {
     // The child already exited — `close` just hasn't fired yet. Signalling now could hit a
@@ -185,6 +230,13 @@ async function execWithTimeout(
 
     timeoutId = setTimeout(() => {
       if (finished) return
+      if (options?.onTimeout != null) {
+        try {
+          options.onTimeout(snapshotProcessTree(child.pid))
+        } catch {
+          // A diagnostic must never change how the timeout is handled.
+        }
+      }
       if (killChildProcessGroup(child, 'SIGTERM')) timedOut = true
       killId = setTimeout(() => {
         if (finished) return

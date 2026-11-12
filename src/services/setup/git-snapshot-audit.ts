@@ -1,6 +1,6 @@
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
-import {isWithin} from '@fro-bot/runtime'
+import {isWithin, readTextNoFollow} from '@fro-bot/runtime'
 
 /**
  * Audit of the "trusted" `.git` metadata (`config`, `config.worktree`, `hooks/`, `info/`) before it is snapshotted.
@@ -42,8 +42,8 @@ export async function auditTrustedGitMetadata(input: SnapshotAuditInput): Promis
   for (const name of ['config', 'config.worktree'] as const) {
     const config = await readConfig(path.join(input.gitDir, name))
     if (config === null) continue
-    if (config === 'oversize') return `.git/${name} is larger than ${MAX_CONFIG_BYTES} bytes and cannot be audited`
-    const problem = findWritableReference(config, name, input)
+    if (config.problem !== undefined) return `.git/${name} cannot be audited: ${config.problem}`
+    const problem = findWritableReference(config.text, name, input)
     if (problem !== null) return problem
   }
   return null
@@ -70,19 +70,24 @@ async function findUnsafeEntry(target: string, relative: string): Promise<string
   return null
 }
 
-async function readConfig(file: string): Promise<string | 'oversize' | null> {
-  let handle
+/**
+ * The config's text, read without following a final symlink and only if it is a regular file within the size bound
+ * (`safe-read`). Absent is `null`; anything else that stops the read is a reason the file cannot be audited.
+ */
+async function readConfig(
+  file: string,
+): Promise<
+  {readonly text: string; readonly problem?: undefined} | {readonly text?: undefined; readonly problem: string} | null
+> {
   try {
-    handle = await fs.open(file, 'r')
-  } catch {
-    return null
-  }
-  try {
-    const stats = await handle.stat()
-    if (stats.size > MAX_CONFIG_BYTES) return 'oversize'
-    return await handle.readFile('utf8')
-  } finally {
-    await handle.close()
+    return {text: await readTextNoFollow(file, {maxBytes: MAX_CONFIG_BYTES})}
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ENOENT') return null
+    return {
+      problem:
+        code === 'EFBIG' ? `it is larger than ${MAX_CONFIG_BYTES} bytes` : `it could not be read (${code ?? 'error'})`,
+    }
   }
 }
 

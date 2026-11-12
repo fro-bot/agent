@@ -7,6 +7,7 @@ import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import {err, ok} from '@bfra.me/es/result'
+import {createSandboxAccount} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi, type Mock} from 'vitest'
 import {isSignalOwned} from '../../services/setup/adapters.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
@@ -94,6 +95,18 @@ function deferred<T>(): {readonly promise: Promise<T>; readonly resolve: (value:
     resolve = settle
   })
   return {promise, resolve}
+}
+
+/** An exec adapter whose commands whose argv contains `hangOn` never exit: they are killed on their budget. */
+function hangingExec(hangOn: string, seen: string[]): ExecAdapter {
+  return {
+    exec: vi.fn(async () => 0),
+    getExecOutput: vi.fn(async () => ({exitCode: 0, stdout: '', stderr: ''})),
+    execWithTimeout: vi.fn(async (_command: string, args: string[] | undefined) => {
+      seen.push((args ?? []).join(' '))
+      return (args ?? []).some(arg => arg.endsWith(hangOn)) ? ('timed-out' as const) : 0
+    }),
+  }
 }
 
 describe('createSandboxLifecycle', () => {
@@ -577,6 +590,170 @@ describe('createSandboxLifecycle', () => {
     })
   })
 
+  describe('a privileged command that times out is never confirmed', () => {
+    const prepareInput = {keyFilePaths: [], ghConfigDir: null, repoSkills: null}
+    const PASSWD = 'root:x:0:0:root:/root:/bin/bash\nrunner:x:1001:1001::/home/runner:/bin/bash\n'
+    const GROUP = 'root:x:0:\nrunner:x:1001:\n'
+
+    it('keeps the account and ends unsafe when useradd times out, so state is never restored', async () => {
+      // #given the real account creation, with a useradd that never exits (and an account that exists at the timeout)
+      const harness = createHarness()
+      const seen: string[] = []
+      const states: string[] = []
+      let passwd = PASSWD
+      const lifecycle = create(harness, {
+        exec: hangingExec('useradd', seen),
+        signals: fakeHost(),
+        recordState: state => states.push(state),
+        deps: {
+          ...harness.deps,
+          createAccount: createSandboxAccount,
+          readText: async file => {
+            if (file === '/etc/group') return GROUP
+            // useradd got as far as creating the account before it hung
+            passwd = seen.some(line => line.endsWith('useradd') || line.includes('useradd '))
+              ? `${PASSWD}fro-bot-sandbox:x:998:997::/home/fro-bot-sandbox:/bin/bash\n`
+              : PASSWD
+            return passwd
+          },
+        },
+      })
+
+      // #when prepared and then released
+      const prepared = await lifecycle.prepare(prepareInput)
+      // (the failed preparation itself must already have recorded unsafe: a caller that never calls release must not read pending)
+      const stateAfterPrepare = states.at(-1)
+      const released = await lifecycle.release()
+
+      // #then preparation failed, nothing ever deleted the account, and the run never claimed it was restored
+      expect(prepared.success).toBe(false)
+      expect(stateAfterPrepare).toBe('unsafe')
+      expect(seen.some(line => line.includes('userdel'))).toBe(false)
+      expect(released.restore).toBe('unsafe')
+      expect(states).not.toContain('restored')
+      expect(states.at(-1)).toBe('unsafe')
+      expect(harness.mocks.takeBack).not.toHaveBeenCalled()
+      expect(harness.mocks.deleteAccount).not.toHaveBeenCalled()
+    })
+
+    it('keeps the account and records unsafe when a handoff command times out', async () => {
+      // #given a handoff whose privileged command never exits (then reports the failure, as the real one does)
+      const harness = createHarness()
+      const states: string[] = []
+      const seen: string[] = []
+      harness.mocks.handOff.mockImplementation(async (_manifest, handoffDeps) => {
+        await handoffDeps.run(['/usr/bin/setfacl', '-hang'])
+        return err('Sandbox handoff failed: checkout ACL timed out after 120000ms')
+      })
+      const lifecycle = create(harness, {
+        exec: hangingExec('-hang', seen),
+        signals: fakeHost(),
+        recordState: state => states.push(state),
+      })
+
+      // #when
+      const prepared = await lifecycle.prepare(prepareInput)
+
+      // #then preparation failed through the rollback, which kept the account: no take-back, no deletion, unsafe
+      expect(prepared.success).toBe(false)
+      expect(harness.mocks.deleteAccount).not.toHaveBeenCalled()
+      expect(harness.mocks.takeBack).not.toHaveBeenCalled()
+      expect(states).not.toContain('restored')
+      expect(states.at(-1)).toBe('unsafe')
+    })
+
+    it('ends unsafe when the stop sweep times out, even if it then reports stopped', async () => {
+      // #given a prepared sandbox whose stop step runs a command that never exits
+      const harness = createHarness()
+      const states: string[] = []
+      const seen: string[] = []
+      harness.mocks.stop.mockImplementation(async (_account, _tools, identityDeps) => {
+        await identityDeps.run(['/usr/bin/pkill', '-hang'])
+        return 'stopped'
+      })
+      const lifecycle = create(harness, {
+        exec: hangingExec('-hang', seen),
+        signals: fakeHost(),
+        recordState: state => states.push(state),
+      })
+      await lifecycle.prepare(prepareInput)
+
+      // #when released
+      const released = await lifecycle.release()
+
+      // #then the account stays and nothing is taken back
+      expect(released.restore).toBe('unsafe')
+      expect(released.reason).toMatch(/timed out/)
+      expect(harness.mocks.takeBack).not.toHaveBeenCalled()
+      expect(harness.mocks.deleteAccount).not.toHaveBeenCalled()
+      expect(states.at(-1)).toBe('unsafe')
+    })
+
+    it('ends unsafe, keeping the account, when a take-back command times out but take-back still reports restored', async () => {
+      // #given a take-back whose best-effort command hung (the step itself does not treat that as fatal)
+      const harness = createHarness()
+      const states: string[] = []
+      const seen: string[] = []
+      harness.mocks.takeBack.mockImplementation(async (_manifest, _journal, handoffDeps) => {
+        await handoffDeps.run(['/usr/bin/chmod', '-hang'])
+        return {status: 'restored' as const}
+      })
+      const lifecycle = create(harness, {
+        exec: hangingExec('-hang', seen),
+        signals: fakeHost(),
+        recordState: state => states.push(state),
+      })
+      await lifecycle.prepare(prepareInput)
+
+      // #when
+      const released = await lifecycle.release()
+
+      // #then
+      expect(released.restore).toBe('unsafe')
+      expect(harness.mocks.deleteAccount).not.toHaveBeenCalled()
+      expect(states).not.toContain('restored')
+    })
+
+    it('ends unsafe when userdel times out, rather than reporting restored with the account possibly still there', async () => {
+      // #given an account deletion whose command hung
+      const harness = createHarness()
+      const states: string[] = []
+      const seen: string[] = []
+      harness.mocks.deleteAccount.mockImplementation(async (_account, _tools, identityDeps) => {
+        await identityDeps.run(['/usr/sbin/userdel', '-hang'])
+        return 'failed' as const
+      })
+      const lifecycle = create(harness, {
+        exec: hangingExec('-hang', seen),
+        signals: fakeHost(),
+        recordState: state => states.push(state),
+      })
+      await lifecycle.prepare(prepareInput)
+
+      // #when
+      const released = await lifecycle.release()
+
+      // #then
+      expect(released.restore).toBe('unsafe')
+      expect(states).not.toContain('restored')
+    })
+
+    it('still restores normally when nothing timed out', async () => {
+      // #given a fully healthy run
+      const harness = createHarness()
+      const states: string[] = []
+      const lifecycle = create(harness, {signals: fakeHost(), recordState: state => states.push(state)})
+      await lifecycle.prepare(prepareInput)
+
+      // #when
+      const released = await lifecycle.release()
+
+      // #then
+      expect(released).toEqual({stop: 'stopped', restore: 'restored'})
+      expect(states.at(-1)).toBe('restored')
+    })
+  })
+
   describe('teardown state', () => {
     const prepareInput = {keyFilePaths: [], ghConfigDir: null, repoSkills: null}
 
@@ -937,6 +1114,23 @@ describe('createPrivilegedRun', () => {
       stderr: 'first line\nuseradd: stuck on /etc/passwd',
       timedOutAfterMs: 4321,
     })
+  })
+
+  it('asks the adapter for a process snapshot on timeout and returns it', async () => {
+    // #given an adapter that reports a snapshot and then a timeout
+    const execWithTimeout = vi.fn(
+      async (_command: string, _args: string[] | undefined, _timeout: number, options?: ExecOptions) => {
+        options?.onTimeout?.('PID PPID PGID STAT ELAPSED COMMAND\n9 8 9 S 01:00 /usr/sbin/useradd x')
+        return 'timed-out' as const
+      },
+    )
+    const run = createPrivilegedRun({exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()}, '/usr/bin/sudo')
+
+    // #when
+    const result = await run(['/usr/sbin/useradd', 'x'], {timeoutMs: 60_000})
+
+    // #then
+    expect(result.processes).toContain('9 8 9 S 01:00 /usr/sbin/useradd x')
   })
 
   it('keeps only the last 2048 bytes of stderr', async () => {

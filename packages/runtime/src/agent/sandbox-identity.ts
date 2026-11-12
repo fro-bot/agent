@@ -29,6 +29,8 @@ export interface PrivilegedRunResult {
   readonly stderr?: string
   /** Set when the command was killed for running past this many milliseconds. */
   readonly timedOutAfterMs?: number
+  /** For a killed command: a listing of the processes still running under it at the moment of the timeout. */
+  readonly processes?: string
 }
 
 /** The budget of the `useradd` that creates the sandbox account. Pinned by a unit test; a change is a decision. */
@@ -36,6 +38,9 @@ export const SANDBOX_ACCOUNT_CREATE_TIMEOUT_MS = 60_000
 
 /** How much of a command's stderr goes into an error message. */
 const ERROR_STDERR_CHARS = 300
+
+/** How much of a process listing goes into an error message. */
+const ERROR_PROCESSES_CHARS = 700
 
 /**
  * A short, one-line reason a privileged command did not succeed: `timed out after Nms` for a killed one, else its exit
@@ -47,7 +52,10 @@ export function describePrivilegedFailure(what: string, result: PrivilegedRunRes
   else if (result.exitCode === null) how = 'did not run to completion'
   else how = `failed (exit ${result.exitCode})`
   const tail = (result.stderr ?? '').replaceAll(/\s+/g, ' ').trim().slice(-ERROR_STDERR_CHARS)
-  return tail.length === 0 ? `${what} ${how}` : `${what} ${how}; stderr: ${tail}`
+  const stderrPart = tail.length === 0 ? '' : `; stderr: ${tail}`
+  const listing = (result.processes ?? '').split('\n').slice(1).join(' | ').replaceAll(/\s+/g, ' ').trim()
+  const processesPart = listing.length === 0 ? '' : `; processes at timeout: ${listing.slice(0, ERROR_PROCESSES_CHARS)}`
+  return `${what} ${how}${stderrPart}${processesPart}`
 }
 
 /** Runs `argv` as root. `argv[0]` is an absolute path. Never throws for a non-zero exit. */
@@ -82,7 +90,13 @@ export interface SandboxIdentityDeps {
 }
 
 export type SandboxAccountError =
-  {readonly kind: 'exists'; readonly message: string} | {readonly kind: 'create-failed'; readonly message: string}
+  | {readonly kind: 'exists'; readonly message: string}
+  | {
+      readonly kind: 'create-failed'
+      readonly message: string
+      /** True when `useradd` was killed on its budget: it is not known to have stopped, so nothing was cleaned up. */
+      readonly timedOut?: true
+    }
 
 interface PasswdEntry {
   readonly name: string
@@ -175,12 +189,19 @@ export async function createSandboxAccount(
       created.timedOutAfterMs === undefined
         ? ''
         : `; account present at timeout: ${(await accountExists(name, deps)) ? 'yes' : 'no'}`
+    const failure = describePrivilegedFailure('useradd for the sandbox account', created)
+    if (created.timedOutAfterMs !== undefined) {
+      // A timeout never confirms that the command stopped: it may still be creating the account or its home, and a `userdel`
+      // racing it could leave a worse half-state. The account is left in place and the caller treats the run as unsafe.
+      return err({
+        kind: 'create-failed',
+        message: `${failure}${presence}; the account was left in place because useradd is not known to have stopped`,
+        timedOut: true,
+      })
+    }
     // useradd can fail after creating part of the account; remove only what now exists under the name we just checked.
     await removeIfPresent(name, tools, deps)
-    return err({
-      kind: 'create-failed',
-      message: `${describePrivilegedFailure('useradd for the sandbox account', created)}${presence}`,
-    })
+    return err({kind: 'create-failed', message: `${failure}${presence}`})
   }
 
   const account = await readBackAccount(name, deps)

@@ -255,6 +255,14 @@ describe('sandbox handoff', () => {
       expect(message).toContain('writable')
     })
 
+    it('refuses an unreadable or oversize config by name instead of skipping it', async () => {
+      // #given a config over the audit's size bound
+      fs.writeFileSync(gitPath('config'), `[core]\n${'#'.repeat(1024 * 1024 + 1)}\n`)
+
+      // #when / #then it cannot be audited, so it is not trusted
+      expect(await refused()).toMatch(/config.*cannot be audited/)
+    })
+
     it('also audits config.worktree', async () => {
       // #given
       fs.writeFileSync(gitPath('config.worktree'), `[core]\n\tfsmonitor = ${fx.manifest.workspace}/fsmon.sh\n`)
@@ -576,7 +584,7 @@ describe('sandbox take-back', () => {
     const trusted = path.join(handed.data.snapshotDir, 'git', 'config')
     const trustedInode = fs.statSync(trusted).ino
     fs.rmSync(path.join(gitDir, 'config'))
-    fs.writeFileSync(path.join(gitDir, 'config'), '[core]\n\tfsmonitor = /tmp/payload\n')
+    fs.writeFileSync(path.join(gitDir, 'config'), `[core]\n\tfsmonitor = ${path.join(fx.root, 'payload')}\n`)
 
     // #when taken back
     const outcome = await takeBack(fx.manifest, handed.data, fx.deps)
@@ -747,9 +755,12 @@ describe('sandbox take-back', () => {
     const handed = await handedOff()
     const gitDir = path.join(fx.manifest.workspace, '.git')
     fs.rmSync(path.join(gitDir, 'config'))
-    fs.writeFileSync(path.join(gitDir, 'config'), '[core]\n\tfsmonitor = /tmp/payload\n[include]\n\tpath = /tmp/evil\n')
-    fs.writeFileSync(path.join(gitDir, 'config.worktree'), '[core]\n\tfsmonitor = /tmp/payload2\n')
-    fs.writeFileSync(path.join(gitDir, 'hooks', 'pre-commit'), '#!/bin/sh\ntouch /tmp/hook\n')
+    fs.writeFileSync(
+      path.join(gitDir, 'config'),
+      `[core]\n\tfsmonitor = ${path.join(fx.root, 'payload')}\n[include]\n\tpath = ${path.join(fx.root, 'evil')}\n`,
+    )
+    fs.writeFileSync(path.join(gitDir, 'config.worktree'), `[core]\n\tfsmonitor = ${path.join(fx.root, 'payload2')}\n`)
+    fs.writeFileSync(path.join(gitDir, 'hooks', 'pre-commit'), `#!/bin/sh\ntouch ${path.join(fx.root, 'hook')}\n`)
     fs.writeFileSync(path.join(gitDir, 'info', 'attributes'), '* filter=x\n')
     fs.writeFileSync(path.join(gitDir, 'info', 'exclude'), '# tampered\n')
 

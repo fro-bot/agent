@@ -1,3 +1,4 @@
+import {spawnSync} from 'node:child_process'
 import process from 'node:process'
 import {describe, expect, it, vi} from 'vitest'
 import {createExecAdapter, holdSignalOwnership} from './adapters.js'
@@ -42,6 +43,70 @@ async function startChild(): Promise<{
   if (listener === undefined || added.length !== 1) throw new Error('the adapter registered no SIGTERM listener')
   return {listener: listener as () => void, finish: async () => result}
 }
+
+describe('timeout diagnostics', () => {
+  it('hands the process tree under the command to onTimeout before it kills anything, then reports timed-out', async () => {
+    // #given a shell that starts a background sleeper (a grandchild in the same group) and then waits
+    const execWithTimeout = createExecAdapter().execWithTimeout
+    if (execWithTimeout === undefined) throw new Error('execWithTimeout is not configured')
+    const snapshots: string[] = []
+
+    // #when it outlives its budget
+    const result = await execWithTimeout('sh', ['-c', 'sleep 30 & wait'], 600, {
+      silent: true,
+      onTimeout: snapshot => snapshots.push(snapshot),
+    })
+
+    // #then the snapshot was taken once, while both processes were alive: it names the shell and its sleeper
+    expect(result).toBe('timed-out')
+    expect(snapshots).toHaveLength(1)
+    expect(snapshots[0]).toMatch(/sleep 30/)
+    expect(snapshots[0]).toMatch(/sh -c sleep 30 & wait/)
+    expect(snapshots[0]).toMatch(/^\s*PID\s+PPID\s+PGID\s+STAT\s+ELAPSED\s+COMMAND/m)
+  })
+
+  it('also lists a descendant that left the process group (a helper that called setsid)', async () => {
+    // #given a node process whose child is detached into its own group, so only the parent chain links them
+    const execWithTimeout = createExecAdapter().execWithTimeout
+    if (execWithTimeout === undefined) throw new Error('execWithTimeout is not configured')
+    const snapshots: string[] = []
+    const script =
+      "require('node:child_process').spawn('sleep',['31'],{detached:true,stdio:'ignore'}).unref();setTimeout(()=>{},30000)"
+
+    // #when it times out
+    await execWithTimeout(process.execPath, ['-e', script], 1_200, {silent: true, onTimeout: s => snapshots.push(s)})
+
+    // #then the detached sleeper is in the listing although it is in another process group
+    expect(snapshots[0]).toMatch(/sleep 31/)
+    spawnSync('pkill', ['-f', 'sleep 31'])
+  })
+
+  it('takes no snapshot for a command that finishes in time, and survives a throwing onTimeout', async () => {
+    // #given
+    const execWithTimeout = createExecAdapter().execWithTimeout
+    if (execWithTimeout === undefined) throw new Error('execWithTimeout is not configured')
+    const onTimeout = vi.fn()
+
+    // #when a command finishes
+    const finished = await execWithTimeout(process.execPath, ['-e', 'process.exit(0)'], 5_000, {
+      silent: true,
+      onTimeout,
+    })
+
+    // #and another times out while its callback throws
+    const timedOut = await execWithTimeout('sleep', ['30'], 300, {
+      silent: true,
+      onTimeout: () => {
+        throw new Error('callback blew up')
+      },
+    })
+
+    // #then the first never called it; the second still ended as timed-out
+    expect(finished).toBe(0)
+    expect(onTimeout).not.toHaveBeenCalled()
+    expect(timedOut).toBe('timed-out')
+  })
+})
 
 describe('signal ownership', () => {
   it('kills its child and re-raises the signal when nobody owns signal handling', async () => {
