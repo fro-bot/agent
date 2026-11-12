@@ -105,6 +105,9 @@ function git(cwd: string, ...args: string[]): string {
 function initWorkspace(workspace: string): string {
   fs.mkdirSync(workspace, {recursive: true})
   git(workspace, 'init', '-q', '-b', 'main')
+  // The hosted image has git-lfs installed system-wide, so a real actions/checkout writes this format integer into the local
+  // config. Set directly so the suite mirrors that checkout whether or not git-lfs is installed where it runs.
+  git(workspace, 'config', '--local', 'lfs.repositoryformatversion', '0')
   fs.writeFileSync(path.join(workspace, 'README.md'), '# fixture\n')
   git(workspace, 'add', '.')
   // The identity is passed for this commit only: handoff trusts just the keys a hosted checkout writes, and a checkout's

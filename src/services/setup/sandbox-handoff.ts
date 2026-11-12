@@ -497,6 +497,9 @@ async function snapshotGit(manifest: HandoffManifest, journal: HandoffJournal, g
   } catch {
     return
   }
+  // Recorded on first sight, before any check can refuse: rollback compares against this, and a .git that handoff itself
+  // refused was not created during the run.
+  journal.gitPresent = true
   if (stats.isSymbolicLink() || !stats.isDirectory()) {
     throw new HandoffError(
       'the checkout .git is not a plain directory (a symlink or a gitfile); it cannot be snapshotted',
@@ -526,7 +529,6 @@ async function snapshotGit(manifest: HandoffManifest, journal: HandoffJournal, g
   // The allowlist is applied to the copy that take-back will restore, not to the live file, so what was audited is what is kept.
   const configProblem = await auditGitConfigKeys({gitDir: path.join(journal.snapshotDir, 'git'), git})
   if (configProblem !== null) throw new HandoffError(`the git metadata cannot be trusted: ${configProblem}`)
-  journal.gitPresent = true
   journal.git = {
     dir: path.join(journal.snapshotDir, 'git'),
     config: present.config === true,
