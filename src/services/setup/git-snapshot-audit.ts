@@ -43,6 +43,10 @@ const ALLOWED_KEYS: ReadonlySet<string> = new Set([
   // git-lfs writes this format integer into the local config of every checkout once it is installed system-wide (as on the
   // hosted images). It is inert: only this one `lfs.*` key. `lfs.url`, `lfs.*transfer*` and `filter.lfs.*` stay refused.
   'lfs.repositoryformatversion',
+  // `git sparse-checkout disable` (run by actions/checkout) leaves these in config.worktree: inert booleans choosing paths.
+  'core.sparsecheckout',
+  'core.sparsecheckoutcone',
+  'index.sparse',
 ])
 
 /** `<section>.<name>.<variable>`: the name keeps its case in git's output, the section and variable are lower-cased. */
