@@ -69,9 +69,10 @@ function createBootstrap(overrides: Partial<BootstrapPhaseResult> = {}): Bootstr
     logger: createMockLogger(),
     opencodeResult: {version: '1.0.0'} as BootstrapPhaseResult['opencodeResult'],
     delivery: 'file-convention',
-    responseFilePath: '/tmp/fro-bot-response.md',
+    responseFilePath: '/fixture/fro-bot-response.md',
     responseFilePathCandidates: null,
     trustedHeadSha: '',
+    sandboxTools: null,
     ...overrides,
   }
 }
@@ -366,7 +367,7 @@ describe('runFinalize file-convention delivery', () => {
 
     // #then the existing fail-closed delivery path remains exclusive
     expect(mocks.postComment).not.toHaveBeenCalled()
-    expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('/tmp'))
+    expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('/fixture'))
   })
 
   it('posts one trusted comment and preserves the primary execution failure when the failed agent wrote no artifact', async () => {
@@ -533,7 +534,7 @@ describe('runFinalize file-convention delivery', () => {
 
       // #then non-file-read failures remain fail-closed without a fallback post
       expect(mocks.postComment).not.toHaveBeenCalled()
-      expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('/tmp'))
+      expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('/fixture'))
     }
   })
 
@@ -711,6 +712,34 @@ describe('runFinalize file-convention delivery', () => {
     } finally {
       clearTimeoutSpy.mockRestore()
     }
+  })
+
+  it.each([
+    [true, true],
+    [false, false],
+    [undefined, false],
+  ])('tells brokered push whether the agent was isolated (isolateAgent=%s)', async (isolateAgent, expected) => {
+    // #given a trusted PR mention, with isolation on or off in the inputs
+    const bootstrap = createBootstrap({
+      trustedHeadSha: 'a'.repeat(40),
+      inputs: {agent: null, isolateAgent} as unknown as BootstrapPhaseResult['inputs'],
+    })
+    mocks.runBrokeredPush.mockResolvedValue({kind: 'bypass'})
+    mocks.runResponsePost.mockResolvedValue({delivered: true, kind: 'comment'})
+
+    // #when finalize runs
+    await runFinalize(
+      bootstrap,
+      createEligibleRouting(),
+      cacheRestore,
+      createExecution({success: true, commentsPosted: 0}),
+      createMetrics(),
+      Date.now(),
+      createMockLogger(),
+    )
+
+    // #then
+    expect(mocks.runBrokeredPush).toHaveBeenCalledWith(expect.objectContaining({isolated: expected}))
   })
 
   it('threads the in-heap client into brokered push and preserves normal response delivery', async () => {
@@ -1819,7 +1848,7 @@ describe('runFinalize quota_exceeded llmError handling', () => {
 
   it('posts a rebuilt quota_exceeded comment to the exact PR target for file-convention delivery, never calling runResponsePost', async () => {
     // #given file-convention delivery, a PR target, and a quota_exceeded llmError
-    const bootstrap = createBootstrap({delivery: 'file-convention', responseFilePath: '/tmp/fro-bot-response.md'})
+    const bootstrap = createBootstrap({delivery: 'file-convention', responseFilePath: '/fixture/fro-bot-response.md'})
     const routing = createRouting({
       agentContext: {
         eventName: 'pull_request',

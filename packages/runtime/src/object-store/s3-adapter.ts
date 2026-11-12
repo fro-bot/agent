@@ -13,6 +13,7 @@ import {
   S3Client,
 } from '@aws-sdk/client-s3'
 import {toErrorMessage} from '../shared/errors.js'
+import {openVerifiedReadStream} from '../shared/safe-read.js'
 import {err, ok} from '../shared/types.js'
 import {getEffectiveEncryption} from './encryption.js'
 import {createObjectStoreOperationError, type ObjectStoreAdapter, type ObjectStoreConfig} from './types.js'
@@ -145,17 +146,25 @@ export function createS3Adapter(config: ObjectStoreConfig, logger: Logger): Obje
     upload: async (key, localPath) => {
       logger.debug('Uploading object store file', {key, localPath})
 
+      let stream: Readable | undefined
       try {
+        // Streamed from a verified handle: a symlink or special file planted where a session file belongs (by a sandbox
+        // user, for example) is refused rather than uploaded, and the handle that was checked is the one that is read. The
+        // length comes from that same handle, so the SDK need not re-stat a path.
+        const verified = await openVerifiedReadStream(localPath)
+        stream = verified.stream
         const commandInput: {
-          Body: fs.ReadStream
+          Body: Readable
           Bucket: string
+          ContentLength: number
           ExpectedBucketOwner?: string
           Key: string
           ServerSideEncryption: 'AES256' | 'aws:kms'
           SSEKMSKeyId?: string
         } = {
-          Body: fs.createReadStream(localPath),
+          Body: verified.stream,
           Bucket: config.bucket,
+          ContentLength: verified.size,
           ExpectedBucketOwner: config.expectedBucketOwner,
           Key: key,
           ServerSideEncryption: effectiveEncryption,
@@ -174,6 +183,9 @@ export function createS3Adapter(config: ObjectStoreConfig, logger: Logger): Obje
         return ok(undefined)
       } catch (error) {
         return err(logS3Error(logger, 'upload', error))
+      } finally {
+        // Closes the handle when the request never consumed the stream (and is a no-op after it ended).
+        stream?.destroy()
       }
     },
     download: async (key, localPath) => {

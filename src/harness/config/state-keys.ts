@@ -8,6 +8,18 @@
 export const STATE_KEYS = {
   /** Whether the main action processed an event (vs skipped) */
   SHOULD_SAVE_CACHE: 'shouldSaveCache',
+  /**
+   * `'true'` when the run used `isolate-agent`. The post hook never retries a session save for such a run: the sandbox
+   * user wrote that state, and only the main step can confirm it stopped and was restored.
+   */
+  ISOLATED_RUN: 'isolatedRun',
+  /**
+   * The sandbox teardown state (`pending`, `restored` or `unsafe`), written by the sandbox lifecycle: `pending` before
+   * the account exists, `restored` only after a confirmed stop and take-back. On an isolated run the post hook reads and
+   * uploads nothing from the sandbox-writable log directory unless this is `restored`: missing, `pending` and `unsafe`
+   * all mean the main step did not finish the teardown.
+   */
+  SANDBOX_STATE: 'sandboxState',
   /** Session ID used in this run (for logging) */
   SESSION_ID: 'sessionId',
   /** Whether main action already saved cache successfully */

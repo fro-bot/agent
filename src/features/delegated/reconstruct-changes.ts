@@ -10,24 +10,30 @@ import {resolve, sep} from 'node:path'
 import {TextDecoder} from 'node:util'
 import {err, ok} from '@bfra.me/es/result'
 import {validateFilePath, validateFiles} from './commit.js'
+import {runTrustedGit} from './trusted-git.js'
 import {FILE_VALIDATION} from './types.js'
 
 const SHA1_PATTERN = /^[0-9a-f]{40}$/i
 const ZERO_MODE = '000000'
 const REGULAR_FILE_MODE = '100644'
 const UTF8_DECODER = new TextDecoder('utf-8', {fatal: true})
-const GIT_ENV = {
-  GIT_CONFIG_NOSYSTEM: '1',
-  GIT_CONFIG_GLOBAL: '/dev/null',
-  GIT_CONFIG_SYSTEM: '/dev/null',
-  GIT_PAGER: 'cat',
-} as const
+/** Bound on each reconstruction git call. A stalled git is killed (its process group), not abandoned. */
+export const RECONSTRUCT_GIT_TIMEOUT_MS = 60_000
 
 interface RawDiffEntry {
   readonly oldMode: string
   readonly newMode: string
   readonly status: string
   readonly path: string
+}
+
+export interface ReconstructChangesOptions {
+  /**
+   * `isolate-agent` is on. The diff then never enters a submodule (`--ignore-submodules=dirty`), and reconstruction is
+   * declined when any gitlink recorded in the index has a populated directory. Without isolation behavior is unchanged
+   * (`--ignore-submodules=none`).
+   */
+  readonly isolated?: boolean
 }
 
 export type ReconstructChangesOutcome =
@@ -46,6 +52,7 @@ export async function reconstructChanges(
   trustedHeadSha: string,
   repoRoot: string,
   logger: Logger,
+  options: ReconstructChangesOptions = {},
 ): Promise<Result<ReconstructChangesOutcome, Error>> {
   if (SHA1_PATTERN.test(trustedHeadSha) === false) {
     logger.debug('Brokered push reconstruction bypassed because the trusted head SHA is malformed')
@@ -53,49 +60,64 @@ export async function reconstructChanges(
   }
 
   try {
-    const diffResult = await execAdapter.getExecOutput(
-      'git',
+    if (options.isolated === true) {
+      const populated = await findPopulatedGitlink(execAdapter, repoRoot)
+      if (populated.success === false) {
+        logger.warning('Brokered push reconstruction could not read the index gitlinks', {
+          error: populated.error.message,
+        })
+        return err(populated.error)
+      }
+      if (populated.data !== null) {
+        const detail = `Brokered push reconstruction is declined: submodule ${populated.data} is populated, and isolate-agent will not run git inside a directory the agent could have written`
+        logger.warning('Brokered push reconstruction declined for a populated submodule', {submodule: populated.data})
+        return err(new Error(detail))
+      }
+    }
+
+    // Under isolation `dirty`, not `none`: a gitlink's recorded commit still shows (and is still rejected below), but git
+    // never runs inside the submodule. `none` runs `git status` there, which executes that repository's own
+    // `core.fsmonitor`. Without isolation the original `none` is kept.
+    const diffResult = await runTrustedGit(
+      execAdapter,
       [
-        '--no-pager',
         '-c',
         'core.quotepath=false',
         'diff',
         '--no-ext-diff',
         '--no-textconv',
         '--no-renames',
-        '--ignore-submodules=none',
+        options.isolated === true ? '--ignore-submodules=dirty' : '--ignore-submodules=none',
         '--raw',
         '-z',
         trustedHeadSha,
         '--',
       ],
-      {
-        cwd: repoRoot,
-        env: GIT_ENV,
-        ignoreReturnCode: true,
-        silent: true,
-      },
+      repoRoot,
+      {timeoutMs: RECONSTRUCT_GIT_TIMEOUT_MS},
     )
-
-    if (diffResult.exitCode !== 0) {
-      const detail = diffResult.stderr.trim()
+    if (diffResult.kind === 'timed-out') {
+      logger.warning('Brokered push reconstruction diff timed out and was killed')
+      return err(new Error('Unable to diff workspace against trusted head SHA: git timed out'))
+    }
+    if (diffResult.kind === 'unavailable' || diffResult.exitCode !== 0) {
+      const detail = diffResult.kind === 'completed' ? diffResult.stderr.trim() : 'git was unavailable'
       logger.warning('Brokered push reconstruction diff failed', {error: detail})
       return err(new Error(`Unable to diff workspace against trusted head SHA: ${detail}`.trim()))
     }
 
-    const untrackedResult = await execAdapter.getExecOutput(
-      'git',
-      ['--no-pager', '-c', 'core.quotepath=false', 'ls-files', '--others', '--exclude-standard', '-z', '--'],
-      {
-        cwd: repoRoot,
-        env: GIT_ENV,
-        ignoreReturnCode: true,
-        silent: true,
-      },
+    const untrackedResult = await runTrustedGit(
+      execAdapter,
+      ['-c', 'core.quotepath=false', 'ls-files', '--others', '--exclude-standard', '-z', '--'],
+      repoRoot,
+      {timeoutMs: RECONSTRUCT_GIT_TIMEOUT_MS},
     )
-
-    if (untrackedResult.exitCode !== 0) {
-      const detail = untrackedResult.stderr.trim()
+    if (untrackedResult.kind === 'timed-out') {
+      logger.warning('Brokered push reconstruction untracked-file lookup timed out and was killed')
+      return err(new Error('Unable to enumerate untracked workspace files: git timed out'))
+    }
+    if (untrackedResult.kind === 'unavailable' || untrackedResult.exitCode !== 0) {
+      const detail = untrackedResult.kind === 'completed' ? untrackedResult.stderr.trim() : 'git was unavailable'
       logger.warning('Brokered push reconstruction untracked-file lookup failed', {error: detail})
       return err(new Error(`Unable to enumerate untracked workspace files: ${detail}`.trim()))
     }
@@ -175,6 +197,36 @@ function mergeRawDiffAndUntracked(
   }
 
   return [...entriesByPath.values()]
+}
+
+/**
+ * The first gitlink path recorded in the index whose directory holds a `.git` (a populated submodule), or null. The
+ * gitlinks are read as data with `ls-files --stage` (mode 160000), which does not enter a submodule; only the existence
+ * of `<path>/.git` is checked, with `lstat`, never by running git there.
+ */
+async function findPopulatedGitlink(execAdapter: ExecAdapter, repoRoot: string): Promise<Result<string | null, Error>> {
+  const staged = await runTrustedGit(execAdapter, ['ls-files', '--stage', '-z', '--'], repoRoot, {
+    timeoutMs: RECONSTRUCT_GIT_TIMEOUT_MS,
+  })
+  if (staged.kind === 'timed-out') return err(new Error('Unable to read the index gitlinks: git timed out'))
+  if (staged.kind === 'unavailable' || staged.exitCode !== 0) {
+    const detail = staged.kind === 'completed' ? staged.stderr.trim() : 'git was unavailable'
+    return err(new Error(`Unable to read the index gitlinks: ${detail}`.trim()))
+  }
+  for (const record of staged.stdout.split('\0')) {
+    const match = /^160000 [0-9a-f]+ \d\t(.+)$/s.exec(record)
+    if (match?.[1] === undefined) continue
+    const gitlinkPath = match[1]
+    const dotGit = resolve(repoRoot, gitlinkPath, '.git')
+    if (!dotGit.startsWith(resolve(repoRoot) + sep)) continue
+    try {
+      await fs.lstat(dotGit)
+      return ok(gitlinkPath)
+    } catch {
+      // No `.git` there: an unpopulated submodule directory.
+    }
+  }
+  return ok(null)
 }
 
 function parseRawDiff(stdout: string): RawDiffEntry[] {

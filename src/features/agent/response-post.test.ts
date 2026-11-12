@@ -27,6 +27,13 @@ vi.mock('node:fs/promises', async () => {
   return {...actual, readFile: fsMocks.readFile, readdir: fsMocks.readdir}
 })
 
+// The flow tests below drive the read through `fsMocks.readFile`. The no-follow reader is mocked onto it so they keep
+// testing delivery behavior; its refusals (symlink, FIFO, directory, size) are tested for real in response-read-safety.test.ts.
+vi.mock('@fro-bot/runtime', async importOriginal => {
+  const original = await importOriginal<typeof import('@fro-bot/runtime')>()
+  return {...original, readTextNoFollow: async (file: string) => fsMocks.readFile(file, 'utf8') as Promise<string>}
+})
+
 function makeHydratedPullRequest(headSha: string): PullRequestContext {
   return {
     type: 'pull_request',
@@ -557,8 +564,8 @@ describe('readAndParseResponseFile read failures', () => {
 
   it('does not probe fallback candidates for a non-ENOENT primary read error', async () => {
     // #given a primary read failure that is not a missing-file error
-    const responseFilePath = '/tmp/primary/response.md'
-    const fallbackPath = '/tmp/fallback/response.md'
+    const responseFilePath = '/fixture/primary/response.md'
+    const fallbackPath = '/fixture/fallback/response.md'
     const error = Object.assign(new Error('permission denied'), {code: 'EACCES'})
     fsMocks.readFile.mockReset().mockRejectedValue(error)
 
@@ -580,9 +587,9 @@ describe('readAndParseResponseFile read failures', () => {
 
   it('stops probing after a non-ENOENT first fallback read error', async () => {
     // #given a missing primary artifact and a denied first fallback
-    const responseFilePath = '/tmp/primary/response.md'
-    const firstFallbackPath = '/tmp/first-fallback/response.md'
-    const secondFallbackPath = '/tmp/second-fallback/response.md'
+    const responseFilePath = '/fixture/primary/response.md'
+    const firstFallbackPath = '/fixture/first-fallback/response.md'
+    const secondFallbackPath = '/fixture/second-fallback/response.md'
     const missing = Object.assign(new Error('missing'), {code: 'ENOENT'})
     const denied = Object.assign(new Error('permission denied'), {code: 'EACCES'})
     fsMocks.readFile.mockReset().mockImplementation(async (filePath: string) => {
@@ -837,7 +844,7 @@ describe('runResponsePost', () => {
         triggerResult: makeTriggerResult('pull_request'),
         botLogin: 'fro-bot[bot]',
         responseFilePath: filePath,
-        responseFilePathCandidates: {expectedPath: filePath, fallbackPaths: ['/tmp/unused-fallback.md']},
+        responseFilePathCandidates: {expectedPath: filePath, fallbackPaths: ['/fixture/unused-fallback.md']},
       },
       logger,
     )

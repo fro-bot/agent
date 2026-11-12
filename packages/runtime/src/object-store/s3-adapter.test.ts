@@ -165,6 +165,63 @@ describe('createS3Adapter', () => {
     })
   })
 
+  it('streams the upload from the verified file handle with an exact ContentLength, not a buffered copy', async () => {
+    // #given a session database and a send that reads the body as the SDK would
+    const received: Buffer[] = []
+    sendMock.mockImplementation(async (command: {input: {Body: Readable}}) => {
+      for await (const chunk of command.input.Body) received.push(Buffer.from(chunk as Uint8Array))
+      return {}
+    })
+    const adapter = createS3Adapter(baseConfig, createLogger())
+    const localPath = path.join(tempDir, 'opencode.db')
+    await fs.writeFile(localPath, 'db-bytes-0123456789')
+
+    // #when uploaded
+    const result = await adapter.upload('fro-bot-state/github/owner/repo/sessions/opencode.db', localPath)
+
+    // #then the body was a readable stream that yielded the file, and the length is declared from the open handle
+    expect(result.success).toBe(true)
+    const input = getCommandInput(0)
+    expect(input.Body).toBeInstanceOf(Readable)
+    expect(input.ContentLength).toBe(Buffer.byteLength('db-bytes-0123456789'))
+    expect(Buffer.concat(received).toString('utf8')).toBe('db-bytes-0123456789')
+  })
+
+  it('has no size cap: a file larger than 1 GiB (sparse) is streamed, not refused', async () => {
+    // #given a sparse 1.5 GiB file, which a buffered read with a 1 GiB cap would have refused
+    sendMock.mockResolvedValue({})
+    const adapter = createS3Adapter(baseConfig, createLogger())
+    const localPath = path.join(tempDir, 'opencode.db')
+    await fs.writeFile(localPath, '')
+    await fs.truncate(localPath, 1.5 * 1024 * 1024 * 1024)
+
+    // #when uploaded
+    const result = await adapter.upload('fro-bot-state/github/owner/repo/sessions/opencode.db', localPath)
+
+    // #then it is sent as a stream of the full length, with nothing read into memory
+    expect(result.success).toBe(true)
+    const input = getCommandInput(0)
+    expect(input.ContentLength).toBe(1.5 * 1024 * 1024 * 1024)
+    expect(input.Body).toBeInstanceOf(Readable)
+  })
+
+  it('refuses to upload a symlink and sends nothing', async () => {
+    // #given a session file that is a symlink to a runner-owned secret (planted where a database belongs)
+    sendMock.mockResolvedValue({})
+    const adapter = createS3Adapter(baseConfig, createLogger())
+    const secret = path.join(tempDir, 'secret.txt')
+    await fs.writeFile(secret, 'runner secret')
+    const localPath = path.join(tempDir, 'opencode.db')
+    await fs.symlink(secret, localPath)
+
+    // #when uploaded
+    const result = await adapter.upload('fro-bot-state/github/owner/repo/sessions/opencode.db', localPath)
+
+    // #then it fails and no request was made
+    expect(result.success).toBe(false)
+    expect(sendMock).not.toHaveBeenCalled()
+  })
+
   it('defaults to AES256 when custom endpoint is set', async () => {
     sendMock.mockResolvedValue({})
     const logger = createLogger()

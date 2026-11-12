@@ -13,6 +13,7 @@ import type {TriggerContext} from '../features/triggers/types.js'
 import type {DeduplicationEntity} from '../services/cache/dedup.js'
 import type {Octokit} from '../services/github/types.js'
 import type {InvocationOutcome, InvocationVerificationFacts} from './outcome.js'
+import type {SandboxLifecycle} from './phases/sandbox-lifecycle.js'
 import * as core from '@actions/core'
 import {applyTerminalReaction} from '../features/agent/index.js'
 import {createMetricsCollector, writeInvocationOutcomeSummary} from '../features/observability/index.js'
@@ -61,6 +62,18 @@ export async function run(): Promise<number> {
   // Set once the V2 server has been released (drained or stopped, then shut down). A run that left the try block without
   // reaching that point is released in the `finally` before cleanup.
   let serverReleasedV2 = false
+  // The `isolate-agent` lifecycle, or null. Hoisted so the `finally` block stops and restores the sandbox on every path
+  // that left the try block before the normal release did.
+  let sandboxLifecycle: SandboxLifecycle | null = null
+  // Set once the normal path has released the sandbox and recorded its outcome, so the `finally` does not repeat it.
+  let sandboxSettled = false
+  // True once an isolated run's sandbox was not confirmed stopped and restored: everything the sandbox could write is
+  // then untrusted, so cleanup and the post hook read and publish none of it.
+  let sandboxOutputUntrusted = false
+  // The lifecycle itself records the `unsafe` state for the post hook on every release that is not a confirmed restore.
+  const markSandboxUntrusted = (): void => {
+    sandboxOutputUntrusted = true
+  }
   // The run-scoped repo skills staging root under RUNNER_TEMP, or null. Hoisted so the `finally` block removes it once the
   // server has stopped, whichever path the run took (fro-bot/agent#2129).
   let repoSkillsStagingRoot: string | null = null
@@ -167,6 +180,8 @@ export async function run(): Promise<number> {
       setUnavailableActionOutputs(Date.now() - startTime)
       return 1
     }
+    // Owned from here on: every exit path below releases it, including a V2 start that fails or throws.
+    sandboxLifecycle = bootstrap.sandbox ?? null
     storeConfig = bootstrap.inputs.storeConfig
     sessionRetention = bootstrap.inputs.sessionRetention
     responseMode = bootstrap.inputs.responseMode
@@ -266,7 +281,10 @@ export async function run(): Promise<number> {
       return 1
     }
     serverHandleV2 = cacheRestore.serverHandle
+    sandboxLifecycle = cacheRestore.sandbox ?? sandboxLifecycle
     sessionStateVouched = true
+    // Before the save is armed: the post hook must know, whenever it sees the arm, that this state came from a sandbox.
+    if (sandboxLifecycle !== null) core.saveState(STATE_KEYS.ISOLATED_RUN, 'true')
     // Armed here and nowhere earlier: the post hook retries a save only for a run that got this far.
     core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'true')
 
@@ -301,6 +319,22 @@ export async function run(): Promise<number> {
     serverReleasedV2 = true
     const drainResult = release.drain
     serverExitUnconfirmed = release.serverExitUnconfirmed === true
+    // The server is shut down. Before anything below reads what the sandbox wrote (the response file, the checkout,
+    // the database), kill and verify every process of the sandbox user and take its files back. An unconfirmed stop or an
+    // unsafe restore fails the run here: no response is read, nothing is pushed, nothing is checkpointed or saved.
+    if (sandboxLifecycle !== null) {
+      const sandboxOutcome = await sandboxLifecycle.release()
+      sandboxSettled = true
+      if (sandboxOutcome.restore !== 'restored') {
+        markSandboxUntrusted()
+        skipSessionPersistence = true
+        persistenceDeclineReason = `the isolate-agent sandbox was not confirmed stopped and restored (${sandboxOutcome.reason ?? 'unknown reason'}), so no session state is saved`
+        core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
+        throw new Error(
+          `isolate-agent: the sandbox was not confirmed stopped and restored: ${sandboxOutcome.reason ?? 'unknown reason'}`,
+        )
+      }
+    }
     if (execution.sendUncertain === true) {
       // The prompt may have run without this run seeing it. The stop path above already confirmed the directory quiet,
       // but the session's content may include work this run cannot account for, so nothing is saved or endorsed.
@@ -449,6 +483,24 @@ export async function run(): Promise<number> {
         core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
       }
     }
+    // Any path that left the try block before the normal release (an exception, a failed phase) still owns a live
+    // sandbox. Stop and restore it before cleanup checkpoints or saves anything.
+    if (sandboxLifecycle !== null && !sandboxSettled) {
+      try {
+        const sandboxOutcome = await sandboxLifecycle.release()
+        if (sandboxOutcome.restore !== 'restored') {
+          markSandboxUntrusted()
+          skipSessionPersistence = true
+          persistenceDeclineReason ??= `the isolate-agent sandbox was not confirmed stopped and restored (${sandboxOutcome.reason ?? 'unknown reason'}), so no session state is saved`
+          core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
+        }
+      } catch (sandboxError) {
+        markSandboxUntrusted()
+        skipSessionPersistence = true
+        persistenceDeclineReason ??= `the isolate-agent sandbox could not be released (${toErrorMessage(sandboxError)}), so no session state is saved`
+        core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
+      }
+    }
     if (!sessionStateVouched && !skipSessionPersistence) {
       skipSessionPersistence = true
       persistenceDeclineReason =
@@ -469,6 +521,7 @@ export async function run(): Promise<number> {
       ownershipLedger,
       leaseRenewal,
       skipSessionPersistence,
+      sandboxOutputUntrusted,
       ...(persistenceDeclineReason === undefined ? {} : {persistenceDeclineReason}),
     }).finally(async () => {
       // runCleanup shuts the V2 server down; only then is the staging root, which the server reads, safe to remove.

@@ -28,6 +28,8 @@ export interface BrokeredPushParams {
   readonly expectedHeadBranch: string
   readonly repoRoot: string
   readonly extraPathPrefixes: readonly string[]
+  /** `isolate-agent` is on: reconstruction never enters a submodule and declines a populated one. */
+  readonly isolated?: boolean
   readonly signal?: AbortSignal
 }
 
@@ -76,7 +78,9 @@ export async function runBrokeredPush(params: BrokeredPushParams): Promise<Broke
       )
     }
 
-    const reconstruction = await reconstructChanges(execAdapter, trustedHeadSha, repoRoot, logger)
+    const reconstruction = await reconstructChanges(execAdapter, trustedHeadSha, repoRoot, logger, {
+      isolated: params.isolated === true,
+    })
     if (reconstruction.success === false) {
       const timedOut = isBrokeredPushTimeout(reconstruction.error, signal)
       return failLoud(

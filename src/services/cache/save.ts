@@ -15,10 +15,22 @@ import {checkpointDatabase} from './checkpoint.js'
 import {buildCachePathsV2, deleteAuthJson} from './paths.js'
 import {defaultCacheAdapter, type SaveCacheOptions} from './types.js'
 
-async function writeStorageVersion(storagePath: string): Promise<void> {
+/**
+ * Writes `storage/.version` as a new regular file and renames it over the old one. A plain write would follow a final
+ * symlink the sandbox user of `isolate-agent` could have planted there; a rename replaces the link itself and never touches
+ * its target. The temp name is exclusive (`wx`, which also refuses to follow a link at that name).
+ */
+export async function writeStorageVersion(storagePath: string): Promise<void> {
   const versionFile = path.join(storagePath, '.version')
   await fs.mkdir(storagePath, {recursive: true})
-  await fs.writeFile(versionFile, String(STORAGE_VERSION), 'utf8')
+  const temp = path.join(storagePath, `.version.${process.pid}.${Date.now().toString(36)}.tmp`)
+  try {
+    await fs.writeFile(temp, String(STORAGE_VERSION), {encoding: 'utf8', flag: 'wx', mode: 0o644})
+    await fs.rename(temp, versionFile)
+  } catch (error) {
+    await fs.rm(temp, {force: true})
+    throw error
+  }
 }
 
 async function directoryHasContent(dirPath: string): Promise<boolean> {
@@ -122,6 +134,35 @@ async function writeCheckpointDeclineSummary(reason: string, logger: Logger): Pr
   }
 }
 
+/**
+ * The first session path a less-trusted writer left as something other than what a save expects, or null. The sandbox
+ * user of `isolate-agent` can plant a symlink where the data directory, the storage directory or the project-id file
+ * belongs, or where a database file belongs; saving or uploading through one would read a runner-owned file. Missing
+ * paths are fine (a first run has none).
+ */
+export async function findUnsafeSessionPath(
+  storagePath: string,
+  projectIdPath: string | undefined,
+  dbFileNames: readonly string[],
+): Promise<string | null> {
+  const dbDir = path.dirname(storagePath)
+  const mustNotBeLinks = projectIdPath === undefined ? [dbDir, storagePath] : [dbDir, storagePath, projectIdPath]
+  for (const candidate of mustNotBeLinks) {
+    const stats = await fs.lstat(candidate).catch(() => null)
+    if (stats?.isSymbolicLink() === true) return candidate
+  }
+  for (const name of dbFileNames) {
+    const candidate = path.join(dbDir, name)
+    const stats = await fs.lstat(candidate).catch(() => null)
+    if (stats !== null && !stats.isFile()) return candidate
+  }
+  // `storage/.version` is rewritten on every save: a link or special file there is never replaced or followed.
+  const versionFile = path.join(storagePath, '.version')
+  const versionStats = await fs.lstat(versionFile).catch(() => null)
+  if (versionStats !== null && !versionStats.isFile()) return versionFile
+  return null
+}
+
 export async function saveCache(options: SaveCacheOptions): Promise<CacheSaveResult> {
   const {components, runId, logger, storagePath, authPath, projectIdPath, cacheAdapter = defaultCacheAdapter} = options
 
@@ -147,6 +188,18 @@ export async function saveCache(options: SaveCacheOptions): Promise<CacheSaveRes
   let storePersisted = false
 
   try {
+    // Before anything reads or writes the session files: a link or special file where they belong is never followed.
+    const dbNames = getSessionDbBasenames(generation)
+    const unsafePath = await findUnsafeSessionPath(storagePath, projectIdPath, [
+      dbNames.main,
+      dbNames.wal,
+      ...dbNames.transportable,
+    ])
+    if (unsafePath !== null) {
+      logger.warning('Declining cache save: a session path is a symlink or not a regular file', {path: unsafePath})
+      return {cachePersisted: false, storePersisted: false, outcome: 'ownership-declined'}
+    }
+
     await deleteAuthJson(authPath, storagePath, logger)
 
     // Checkpoint before anything inspects file sizes, builds the save path list, or

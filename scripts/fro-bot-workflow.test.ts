@@ -6,8 +6,6 @@ import {join} from 'node:path'
 import {describe, expect, it} from 'vitest'
 import {parse} from 'yaml'
 
-import {resolveResponseDelivery} from '../packages/runtime/src/agent/response-delivery.js'
-
 interface WorkflowStep {
   readonly id?: string
   readonly name?: string
@@ -541,25 +539,6 @@ describe('fro-bot workflow — owner-wide App token routing', () => {
   })
 })
 
-// Bounded to this one known expression form; not a general GHA expression evaluator.
-function parseNotEqualsEventName(expression: string): string {
-  const match = /^github\.event_name != '([^']*)'$/.exec(expression)
-  if (match === null) {
-    throw new TypeError(`unsupported persist-credentials expression: ${expression}`)
-  }
-  return match[1] ?? ''
-}
-
-// The oracle for which triggers this workflow can actually fire under is the workflow's own
-// declared `on:` map, never a list re-typed by hand here (which would silently drift from it).
-function declaredTriggers(workflowPath: string): readonly string[] {
-  const on = loadRawWorkflow(workflowPath).on
-  if (on === null || typeof on !== 'object' || Array.isArray(on)) {
-    throw new TypeError(`${workflowPath} 'on' triggers must be a mapping`)
-  }
-  return Object.keys(on)
-}
-
 describe('CI workflow: Test GitHub Action deadline', () => {
   it("ends the action's own deadline at least ten minutes before the job clock", () => {
     // #given the job's cap and the action's timeout input
@@ -576,35 +555,35 @@ describe('CI workflow: Test GitHub Action deadline', () => {
 })
 
 describe('CI workflow: Test GitHub Action checkout', () => {
-  it('disables persisted checkout credentials only for pull_request, preserving other triggers', () => {
-    // #given the checkout step in the test-action job's own PAT-authenticated checkout
+  it('persists no checkout credentials and does not enable isolate-agent on the local install', () => {
+    // #given the checkout step in the test-action job's own PAT-authenticated checkout, and the step that runs the Action
     const steps = stepsFor(CI_WORKFLOW_PATH, 'test-action')
     const checkout = steps.find(step => step.name === 'Checkout repository')
     if (checkout === undefined) throw new TypeError('test-action Checkout repository step is missing')
     const checkoutWith = checkout.with as Record<string, unknown>
-    const persistCredentialsExpression = expressionFrom(
-      checkoutWith['persist-credentials'],
-      'test-action persist-credentials',
-    )
+    const runAction = steps.find(step => step.uses === './')
+    if (runAction === undefined) throw new TypeError('test-action has no step that runs the local Action')
+    const runWith = runAction.with as Record<string, unknown>
 
-    // #then the expression withholds persistence for exactly one event
-    const excludedEvent = parseNotEqualsEventName(persistCredentialsExpression)
-    expect(excludedEvent).toBe('pull_request')
+    // #then the checkout persists no credentials on any trigger (a literal false, not an expression)
+    expect(checkoutWith['persist-credentials']).toBe(false)
 
-    // #then for every trigger this workflow actually declares, the YAML expression's persist
-    // decision must match the real credential policy in response-delivery.ts -- not a literal
-    // re-assertion of the same expression, and not a hand-maintained trigger list as the oracle.
-    for (const eventName of declaredTriggers(CI_WORKFLOW_PATH)) {
-      const yamlPersists = eventName !== excludedEvent
-      const policyProvisions = resolveResponseDelivery(eventName, 'github').credential === 'provision'
-      expect(yamlPersists, `persist-credentials for ${eventName} must match the response-delivery policy`).toBe(
-        policyProvisions,
-      )
-    }
+    // #then isolate-agent is NOT enabled: `uses: ./` installs the Action inside the writable checkout, which the
+    // isolate-agent preflight refuses. Isolation is proven by the Sandbox integration job against a hosted runner.
+    expect(runWith).not.toHaveProperty('isolate-agent')
 
     // #then the existing ref/token wiring for this checkout is unchanged
     expect(checkoutWith.token).toBe('${' + '{ secrets.FRO_BOT_PAT }}')
     expect(checkoutWith.ref).toBe('${' + "{ github.event.pull_request.head.sha || '' }}")
+  })
+
+  it('runs the sandbox suite in the Sandbox integration job instead', () => {
+    // #given the job that proves isolate-agent
+    const steps = stepsFor(CI_WORKFLOW_PATH, 'sandbox-integration')
+    const commands = steps.map(step => String(step.run ?? '')).join('\n')
+
+    // #then it runs the sandbox suite file
+    expect(commands).toContain('v2-server.sandbox.integration.test.ts')
   })
 })
 

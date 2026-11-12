@@ -141,6 +141,11 @@ export interface ExecAdapter {
 }
 
 export interface ExecOptions {
+  /**
+   * Called once, by `execWithTimeout` only, at the moment a command outlives its budget and before anything is signalled, with a
+   * listing of the process (and its descendants) that is still running. For diagnosing a hang; it must not throw.
+   */
+  readonly onTimeout?: (processSnapshot: string) => void
   readonly cwd?: string
   readonly env?: Record<string, string>
   readonly silent?: boolean

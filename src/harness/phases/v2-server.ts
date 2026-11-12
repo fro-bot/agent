@@ -1,9 +1,16 @@
 import type {Result} from '@bfra.me/es/result'
-import type {CredentialDisposition, OpenCodeV2ServerHandle, StartOpenCodeV2ServerOptions} from '@fro-bot/runtime'
+import type {
+  CredentialDisposition,
+  OpenCodeV2SandboxLaunch,
+  OpenCodeV2ServerHandle,
+  StartOpenCodeV2ServerOptions,
+} from '@fro-bot/runtime'
 import type {InstallPluginsV2Options, PluginInstallV2Error} from '../../services/setup/plugin-install-v2.js'
 import type {RepoSkillsSource} from '../../services/setup/repo-skills.js'
 import type {Logger} from '../../shared/logger.js'
+import type {SandboxLifecycle} from './sandbox-lifecycle.js'
 import type {V1DatabaseFacts, V1ImportWaitError, WaitForV1ImportOptions} from './v1-import-wait.js'
+import * as path from 'node:path'
 import {err, ok} from '@bfra.me/es/result'
 import {
   clearHeldClaims,
@@ -66,7 +73,15 @@ import {readV1DatabaseFacts, waitForV1Import} from './v1-import-wait.js'
  */
 
 export type V2StartStage =
-  'config' | 'credential-gate' | 'credentials' | 'held-claims' | 'import-wait' | 'permission-gate' | 'plugins' | 'spawn'
+  | 'config'
+  | 'credential-gate'
+  | 'credentials'
+  | 'held-claims'
+  | 'import-wait'
+  | 'permission-gate'
+  | 'plugins'
+  | 'sandbox'
+  | 'spawn'
 
 export interface V2StartError {
   readonly stage: V2StartStage
@@ -100,6 +115,12 @@ export interface StartActionOpenCodeV2Options {
    * checked against the plugin's own skills directory.
    */
   readonly repoSkills?: RepoSkillsSource | null
+  /**
+   * `isolate-agent`: when present, the account and handoff happen after the held-claim clear and before the spawn, the
+   * server launches through sudo and setpriv, and every failure path releases it. The caller releases it on every later
+   * path. Null or absent leaves the launch exactly as it was.
+   */
+  readonly sandbox?: SandboxLifecycle | null
   readonly runId: string | number
   readonly runAttempt: string | number
   readonly logger: Logger
@@ -252,22 +273,78 @@ export async function startActionOpenCodeV2(
     return stageError('held-claims', 'Could not clear held execution claims in the restored OpenCode database')
   }
 
+  // --- 4b. Sandbox account and handoff (isolate-agent) -----------------------------------------------------
+  //
+  // After the last runner-side write to the restored database (the claim clear) and before the spawn. A failure here
+  // has already rolled itself back inside `prepare`.
+  let childEnv = options.env
+  if (options.sandbox != null) {
+    const ghConfigDir = provisionedGhConfigDir(options.env)
+    // A `GH_CONFIG_DIR` that is not the provisioned temp dir (an ambient one from an earlier step) is not handed over,
+    // so it must not reach the child as a path the sandbox cannot read.
+    childEnv = withoutKey(options.env, 'GH_CONFIG_DIR')
+    const prepared = await options.sandbox.prepare({
+      keyFilePaths: Object.values(files.data.keyFiles),
+      ghConfigDir,
+      repoSkills:
+        options.repoSkills == null
+          ? null
+          : {stagingRoot: options.repoSkills.stagingRoot, admittedDir: repoSkillsDirectory ?? null},
+    })
+    if (!prepared.success) return stageError('sandbox', `isolate-agent setup failed: ${prepared.error}`)
+    if (ghConfigDir !== null) childEnv = {...childEnv, GH_CONFIG_DIR: ghConfigDir}
+  }
+
   // --- 5. Spawn (plugin gate inside) -------------------------------------------------------------------------
-  const started = await deps.startServer(
-    {
-      binaryPath: options.binaryPath,
-      directory: options.workspacePath,
-      expectedPluginIds: [SYSTEMATIC_V2_PLUGIN_ID, FRO_BOT_PLUGIN_ID],
-      config: built.data.content,
-      env: options.env,
-      ...(options.signal === undefined ? {} : {signal: options.signal}),
-      ...(options.maskSecret === undefined ? {} : {maskSecret: options.maskSecret}),
-      ...deps.startOptions,
-    },
-    logger,
-  )
+  //
+  // With a sandbox the spawn goes through `sandbox.launch`, which records the attempt before port allocation begins and is
+  // refused once the teardown has begun. `release` waits for the attempt to settle (and aborts it) before it verifies the
+  // sandbox uid is empty, so a signal can no longer slip between this check and the privileged launch.
+  const spawnOptions = (extra: {readonly sandbox?: OpenCodeV2SandboxLaunch; readonly signal?: AbortSignal}) => ({
+    binaryPath: options.binaryPath,
+    directory: options.workspacePath,
+    expectedPluginIds: [SYSTEMATIC_V2_PLUGIN_ID, FRO_BOT_PLUGIN_ID],
+    config: built.data.content,
+    env: childEnv,
+    ...(extra.sandbox === undefined ? {} : {sandbox: extra.sandbox}),
+    ...(extra.signal === undefined ? {} : {signal: extra.signal}),
+    ...(options.maskSecret === undefined ? {} : {maskSecret: options.maskSecret}),
+    ...deps.startOptions,
+  })
+
+  let started: Awaited<ReturnType<typeof deps.startServer>>
+  try {
+    if (options.sandbox == null) {
+      started = await deps.startServer(
+        spawnOptions({...(options.signal === undefined ? {} : {signal: options.signal})}),
+        logger,
+      )
+    } else {
+      const launched = await options.sandbox.launch(async context => {
+        const result = await deps.startServer(
+          spawnOptions({
+            sandbox: context.spec,
+            signal: options.signal === undefined ? context.signal : AbortSignal.any([options.signal, context.signal]),
+          }),
+          logger,
+        )
+        // A start that failed and could not confirm its own child exited leaves the uid sweep untrustworthy.
+        return {value: result, unconfirmed: !result.success && result.error.cleanup === 'unconfirmed'}
+      })
+      if (!launched.success) {
+        await releaseSandboxAfterFailure(options.sandbox, logger)
+        return stageError('sandbox', `isolate-agent launch refused: ${launched.error}`)
+      }
+      started = launched.data
+    }
+  } catch (error) {
+    await releaseSandboxAfterFailure(options.sandbox, logger)
+    throw error
+  }
   if (!started.success) {
     const failure = started.error
+    // The runtime already terminated the child; this confirms no sandbox process is left, then takes everything back.
+    await releaseSandboxAfterFailure(options.sandbox, logger)
     return stageError(
       failure.kind === 'plugin-gate' ? 'plugins' : 'spawn',
       `OpenCode V2 server failed to start: ${failure.message}`,
@@ -275,7 +352,9 @@ export async function startActionOpenCodeV2(
   }
   const handle = started.data
 
-  const failAfterSpawn = async (stage: V2StartStage, message: string): Promise<Result<never, V2StartError>> => {
+  // The handle and the sandbox are owned here until every gate below has passed. Any failure, returned or thrown, stops
+  // the server first (so nothing writes while files are taken back) and then releases the sandbox.
+  const stopAfterFailure = async (): Promise<void> => {
     try {
       const shutdown = await handle.shutdown()
       if (shutdown.exit.outcome === 'unconfirmed') {
@@ -284,58 +363,105 @@ export async function startActionOpenCodeV2(
     } catch (error) {
       logger.error('OpenCode V2 server shutdown after a failed start threw', {error: toErrorMessage(error)})
     }
+    await releaseSandboxAfterFailure(options.sandbox, logger)
+  }
+
+  const failAfterSpawn = async (stage: V2StartStage, message: string): Promise<Result<never, V2StartError>> => {
+    await stopAfterFailure()
     return stageError(stage, message)
   }
 
-  // --- 6. Permission gate, then credential gate -------------------------------------------------------------
-  const permissions = await verifyPermissionRules(
-    {
-      listAgents: async () => {
-        // `GET /api/agent` answering 503 is not-ready, not "no agents"; the spawn's own readiness gate has already
-        // waited it out, so a non-200 here is a failure to read, not a pass.
-        const response = await handle.fetch('/api/agent', {signal: AbortSignal.timeout(GATE_REQUEST_TIMEOUT_MS)})
-        if (!response.ok) throw new Error(`GET /api/agent answered HTTP ${response.status}`)
-        return response.json()
+  const runGates = async (): Promise<Result<OpenCodeV2ServerHandle, V2StartError>> => {
+    // --- 6. Permission gate, then credential gate -------------------------------------------------------------
+    const permissions = await verifyPermissionRules(
+      {
+        listAgents: async () => {
+          // `GET /api/agent` answering 503 is not-ready, not "no agents"; the spawn's own readiness gate has already
+          // waited it out, so a non-200 here is a failure to read, not a pass.
+          const response = await handle.fetch('/api/agent', {signal: AbortSignal.timeout(GATE_REQUEST_TIMEOUT_MS)})
+          if (!response.ok) throw new Error(`GET /api/agent answered HTTP ${response.status}`)
+          return response.json()
+        },
       },
-    },
-    built.data.expectations,
-    logger,
-  )
-  if (!permissions.success) {
-    return failAfterSpawn('permission-gate', `OpenCode permission gate failed: ${permissions.error.message}`)
-  }
-
-  const spawnConfig = spawnConfigFromConfig(built.data.content)
-  const modelProvider = modelProviderId(options.model ?? spawnConfig.model)
-  const requiredProviders = modelProvider === undefined ? keys.data.map(entry => entry.providerId) : [modelProvider]
-  if (requiredProviders.length === 0) {
-    logger.info('No model or provider credentials configured, credential gate skipped')
-  } else {
-    const credentials = await verifyCredentialGate({
-      handle,
-      requestTimeoutMs: GATE_REQUEST_TIMEOUT_MS,
-      ...(options.signal === undefined ? {} : {signal: options.signal}),
-      providers: requiredProviders,
-      configuredAuth: spawnConfig.authenticatedProviders,
-      remedy: 'Add an API-key entry for it to the auth-json input.',
-    })
-    if (!credentials.success) {
-      return failAfterSpawn('credential-gate', `OpenCode credential gate failed: ${credentials.error.message}`)
+      built.data.expectations,
+      logger,
+    )
+    if (!permissions.success) {
+      return failAfterSpawn('permission-gate', `OpenCode permission gate failed: ${permissions.error.message}`)
     }
+
+    const spawnConfig = spawnConfigFromConfig(built.data.content)
+    const modelProvider = modelProviderId(options.model ?? spawnConfig.model)
+    const requiredProviders = modelProvider === undefined ? keys.data.map(entry => entry.providerId) : [modelProvider]
+    if (requiredProviders.length === 0) {
+      logger.info('No model or provider credentials configured, credential gate skipped')
+    } else {
+      const credentials = await verifyCredentialGate({
+        handle,
+        requestTimeoutMs: GATE_REQUEST_TIMEOUT_MS,
+        ...(options.signal === undefined ? {} : {signal: options.signal}),
+        providers: requiredProviders,
+        configuredAuth: spawnConfig.authenticatedProviders,
+        remedy: 'Add an API-key entry for it to the auth-json input.',
+      })
+      if (!credentials.success) {
+        return failAfterSpawn('credential-gate', `OpenCode credential gate failed: ${credentials.error.message}`)
+      }
+    }
+
+    // --- 7. Import wait ----------------------------------------------------------------------------------------
+    const imported = await deps.waitForImport({
+      fetch: handle.fetch,
+      logger,
+      facts,
+      ...(options.signal === undefined ? {} : {signal: options.signal}),
+    })
+    if (!imported.success) return failAfterSpawn('import-wait', imported.error.message)
+
+    logger.info('OpenCode V2 server is started and gated', {
+      providers: keys.data.map(entry => entry.providerId),
+      plugins: specs.data.specs,
+    })
+    return ok(handle)
   }
 
-  // --- 7. Import wait ----------------------------------------------------------------------------------------
-  const imported = await deps.waitForImport({
-    fetch: handle.fetch,
-    logger,
-    facts,
-    ...(options.signal === undefined ? {} : {signal: options.signal}),
-  })
-  if (!imported.success) return failAfterSpawn('import-wait', imported.error.message)
+  try {
+    return await runGates()
+  } catch (error) {
+    await stopAfterFailure()
+    throw error
+  }
+}
 
-  logger.info('OpenCode V2 server is started and gated', {
-    providers: keys.data.map(entry => entry.providerId),
-    plugins: specs.data.specs,
-  })
-  return ok(handle)
+/**
+ * The temp `GH_CONFIG_DIR` provision mode writes (`gh-config-*` directly under `RUNNER_TEMP`), or null. Anything else is
+ * ambient state from an earlier step and is not handed to the sandbox.
+ */
+function provisionedGhConfigDir(env: NodeJS.ProcessEnv): string | null {
+  const dir = env.GH_CONFIG_DIR
+  const runnerTemp = env.RUNNER_TEMP
+  if (dir === undefined || dir.length === 0 || runnerTemp === undefined || runnerTemp.length === 0) return null
+  return path.dirname(dir) === path.resolve(runnerTemp) && path.basename(dir).startsWith('gh-config-') ? dir : null
+}
+
+function withoutKey(env: NodeJS.ProcessEnv, key: string): NodeJS.ProcessEnv {
+  const copy = {...env}
+  delete copy[key]
+  return copy
+}
+
+/**
+ * Stops every sandbox process and takes everything back after a failed start. An unsafe outcome is logged here; the
+ * start already failed, so the caller declines persistence for the run either way.
+ */
+async function releaseSandboxAfterFailure(sandbox: SandboxLifecycle | null | undefined, logger: Logger): Promise<void> {
+  if (sandbox == null) return
+  try {
+    const outcome = await sandbox.release()
+    if (outcome.restore === 'unsafe') {
+      logger.error('The sandbox could not be restored after a failed start', {reason: outcome.reason})
+    }
+  } catch (error) {
+    logger.error('Releasing the sandbox after a failed start threw', {error: toErrorMessage(error)})
+  }
 }

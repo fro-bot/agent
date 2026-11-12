@@ -1,9 +1,11 @@
 import type {OpenCodeV2ServerHandle, OpenCodeV2ShutdownResult} from '@fro-bot/runtime'
+import type {SandboxLifecycle} from './sandbox-lifecycle.js'
 import type {StartActionOpenCodeV2Deps, StartActionOpenCodeV2Options} from './v2-server.js'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import {DatabaseSync} from 'node:sqlite'
+import {err} from '@bfra.me/es/result'
 import {clearHeldClaims} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi, type Mock} from 'vitest'
 import {pluginCacheDir, resolvePluginSpecsV2} from '../../services/setup/plugin-install-v2.js'
@@ -992,6 +994,382 @@ describe('startActionOpenCodeV2', () => {
       const content = spawnedContent(deps)
       expect('skills' in content).toBe(false)
       expect(fs.existsSync(path.join(stagingRoot, 'skills'))).toBe(false)
+    })
+  })
+})
+
+describe('startActionOpenCodeV2 with isolate-agent', () => {
+  let root: string
+  let runnerTemp: string
+  let dbPath: string
+  let authPath: string
+  let cacheHome: string
+  let order: string[]
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'v2-server-sandbox-test-'))
+    runnerTemp = path.join(root, 'runner-temp')
+    fs.mkdirSync(runnerTemp)
+    cacheHome = path.join(root, 'cache')
+    populatePluginCache(cacheHome)
+    const dataDir = path.join(root, 'data', 'opencode')
+    fs.mkdirSync(dataDir, {recursive: true})
+    dbPath = path.join(dataDir, 'opencode.db')
+    authPath = path.join(dataDir, 'auth.json')
+    order = []
+  })
+
+  afterEach(() => {
+    fs.rmSync(root, {recursive: true, force: true})
+  })
+
+  const LAUNCH = {
+    sudoPath: '/usr/bin/sudo',
+    setprivPath: '/usr/bin/setpriv',
+    envPath: '/usr/bin/env',
+    account: {name: 'fro-bot-sandbox', uid: 998, gid: 997, home: '/home/fro-bot-sandbox'},
+    path: '/usr/bin',
+    tmpdir: '/home/fro-bot-sandbox/tmp',
+    xdg: {data: '/d', config: '/c', cache: '/k', state: '/s'},
+  } as const
+
+  interface LaunchLog {
+    readonly reports: {readonly value: unknown; readonly unconfirmed: boolean}[]
+    readonly signals: AbortSignal[]
+  }
+
+  function fakeSandbox(
+    prepare?: SandboxLifecycle['prepare'],
+    refuseLaunch?: string,
+  ): {
+    readonly sandbox: SandboxLifecycle
+    readonly prepare: ReturnType<typeof vi.fn>
+    readonly release: ReturnType<typeof vi.fn>
+    readonly launch: ReturnType<typeof vi.fn>
+    readonly log: LaunchLog
+    readonly abort: () => void
+  } {
+    const prepareMock = vi.fn(
+      prepare ??
+        (async () => {
+          order.push('prepare')
+          return ok(LAUNCH)
+        }),
+    )
+    const release = vi.fn(async () => {
+      order.push('release')
+      return {stop: 'stopped' as const, restore: 'restored' as const}
+    })
+    const controller = new AbortController()
+    const log: LaunchLog = {reports: [], signals: []}
+    const launch = vi.fn(async (spawn: Parameters<SandboxLifecycle['launch']>[0]) => {
+      if (refuseLaunch !== undefined) return err(refuseLaunch)
+      log.signals.push(controller.signal)
+      const report = await spawn({spec: LAUNCH, signal: controller.signal})
+      log.reports.push(report)
+      return ok(report.value)
+    })
+    return {
+      sandbox: {prepare: prepareMock, release, launch} as unknown as SandboxLifecycle,
+      prepare: prepareMock,
+      release,
+      launch,
+      log,
+      abort: () => controller.abort(),
+    }
+  }
+
+  async function run(
+    sandbox: SandboxLifecycle | null,
+    deps: Partial<StartActionOpenCodeV2Deps>,
+    env: NodeJS.ProcessEnv = {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome},
+  ) {
+    return startActionOpenCodeV2({
+      binaryPath: '/opt/opencode',
+      workspacePath: '/workspace',
+      authJson: JSON.stringify({anthropic: {type: 'api', key: CANARY}}),
+      opencodeConfig: null,
+      credential: 'provision',
+      systematicVersion: 'latest',
+      model: 'anthropic/claude-sonnet',
+      dbPath,
+      authPath,
+      env,
+      runId: 42,
+      runAttempt: 1,
+      logger: createMockLogger(),
+      sandbox,
+      deps,
+    })
+  }
+
+  function depsFor(server: FakeServer, overrides: Partial<StartActionOpenCodeV2Deps> = {}) {
+    return {
+      startServer: vi.fn<StartServer>(async spawnOptions => {
+        order.push('spawn')
+        server.loadConfig(spawnOptions.config)
+        return {success: true, data: server.handle}
+      }),
+      clearClaims: vi.fn<typeof clearHeldClaims>(async () => {
+        order.push('clear-claims')
+        return ok({status: 'no-database'})
+      }),
+      waitForImport: vi.fn(async () => ({success: true, data: undefined}) as const),
+      readDatabaseFacts: () => ({bytes: null, sessions: null}),
+      installPlugins: vi.fn<InstallPlugins>(async () => ok(undefined)),
+      ...overrides,
+    } satisfies Partial<StartActionOpenCodeV2Deps>
+  }
+
+  it('prepares the sandbox after the claim clear and before the spawn, and launches through it', async () => {
+    // #given an isolated run
+    const server = fakeServer()
+    const deps = depsFor(server)
+    const sandbox = fakeSandbox()
+
+    // #when started
+    const result = await run(sandbox.sandbox, deps)
+
+    // #then the runner's last database write precedes the handoff, which precedes the spawn
+    expect(result.success).toBe(true)
+    expect(order).toEqual(['clear-claims', 'prepare', 'spawn'])
+    const prepared = sandbox.prepare.mock.calls[0]?.[0] as {keyFilePaths: string[]; ghConfigDir: null; repoSkills: null}
+    expect(prepared.keyFilePaths).toHaveLength(1)
+    expect(prepared.keyFilePaths[0]).toMatch(/anthropic\.key$/)
+    expect(vi.mocked(deps.startServer).mock.calls[0]?.[0].sandbox).toEqual(LAUNCH)
+    expect(sandbox.release).not.toHaveBeenCalled()
+  })
+
+  it('does not add a sandbox to the spawn when isolation is off', async () => {
+    // #given no lifecycle
+    const server = fakeServer()
+    const deps = depsFor(server)
+
+    // #when started
+    await run(null, deps)
+
+    // #then the spawn options are exactly the unisolated ones
+    expect('sandbox' in (vi.mocked(deps.startServer).mock.calls[0]?.[0] ?? {})).toBe(false)
+  })
+
+  it('hands over only the provisioned gh config dir and drops an ambient one from the child env', async () => {
+    // #given a provisioned gh-config dir and, separately, an ambient GH_CONFIG_DIR elsewhere
+    const provisioned = path.join(runnerTemp, 'gh-config-abc123')
+    const server = fakeServer()
+    const deps = depsFor(server)
+    const sandbox = fakeSandbox()
+
+    // #when started with the provisioned one
+    await run(sandbox.sandbox, deps, {
+      RUNNER_TEMP: runnerTemp,
+      PATH: '/usr/bin',
+      XDG_CACHE_HOME: cacheHome,
+      GH_CONFIG_DIR: provisioned,
+    })
+
+    // #then it is handed over and kept in the child env
+    expect((sandbox.prepare.mock.calls[0]?.[0] as {ghConfigDir: string | null}).ghConfigDir).toBe(provisioned)
+    expect(vi.mocked(deps.startServer).mock.calls[0]?.[0].env?.GH_CONFIG_DIR).toBe(provisioned)
+
+    // #when started with an ambient one
+    const ambientDeps = depsFor(fakeServer())
+    const ambient = fakeSandbox()
+    await run(ambient.sandbox, ambientDeps, {
+      RUNNER_TEMP: runnerTemp,
+      PATH: '/usr/bin',
+      XDG_CACHE_HOME: cacheHome,
+      GH_CONFIG_DIR: '/home/runner/.config/gh',
+    })
+
+    // #then it is neither handed over nor passed on
+    expect((ambient.prepare.mock.calls[0]?.[0] as {ghConfigDir: string | null}).ghConfigDir).toBeNull()
+    expect(vi.mocked(ambientDeps.startServer).mock.calls[0]?.[0].env?.GH_CONFIG_DIR).toBeUndefined()
+  })
+
+  it('fails at the sandbox stage without spawning when setup fails', async () => {
+    // #given a handoff that fails
+    const server = fakeServer()
+    const deps = depsFor(server)
+    const sandbox = fakeSandbox(async () => err('Sandbox handoff failed: checkout ACL failed'))
+
+    // #when started
+    const result = await run(sandbox.sandbox, deps)
+
+    // #then no server was spawned and the stage names the cause
+    const error = unwrapErr(result)
+    expect(error.stage).toBe('sandbox')
+    expect(error.message).toContain('checkout ACL failed')
+    expect(deps.startServer).not.toHaveBeenCalled()
+  })
+
+  it('releases the sandbox when the spawn fails, so a failed start leaves no sandbox process', async () => {
+    // #given a spawn that fails after the handoff
+    const server = fakeServer()
+    const deps = depsFor(server, {
+      startServer: vi.fn<StartServer>(async () => ({
+        success: false,
+        error: {kind: 'exited-early', message: 'exited', cleanup: 'forced'},
+      })),
+    })
+    const sandbox = fakeSandbox()
+
+    // #when started
+    const result = await run(sandbox.sandbox, deps)
+
+    // #then it fails and the sandbox was stopped and restored
+    expect(result.success).toBe(false)
+    expect(sandbox.release).toHaveBeenCalledTimes(1)
+  })
+
+  it('shuts the server down, then releases the sandbox, when a gate fails after the spawn', async () => {
+    // #given an import wait that fails after a healthy spawn
+    const server = fakeServer()
+    const deps = depsFor(server, {
+      waitForImport: vi.fn(async () => ({success: false, error: {message: 'import stuck'}}) as never),
+    })
+    const sandbox = fakeSandbox()
+
+    // #when started
+    const result = await run(sandbox.sandbox, deps)
+
+    // #then the order is shutdown, then release
+    expect(result.success).toBe(false)
+    expect(server.shutdown).toHaveBeenCalledTimes(1)
+    expect(server.shutdown.mock.invocationCallOrder[0]).toBeLessThan(sandbox.release.mock.invocationCallOrder[0] ?? 0)
+  })
+
+  it('stops the server and releases the sandbox, then rethrows, when a post-spawn gate throws', async () => {
+    // #given a healthy spawn and an import wait that throws instead of returning a failure
+    const server = fakeServer()
+    const deps = depsFor(server, {waitForImport: vi.fn(async () => Promise.reject(new Error('gate blew up')))})
+    const sandbox = fakeSandbox()
+
+    // #when / #then it surfaces the error, but only after the server is down and the sandbox is taken back
+    await expect(run(sandbox.sandbox, deps)).rejects.toThrow('gate blew up')
+    expect(server.shutdown).toHaveBeenCalledTimes(1)
+    expect(sandbox.release).toHaveBeenCalledTimes(1)
+    expect(server.shutdown.mock.invocationCallOrder[0]).toBeLessThan(sandbox.release.mock.invocationCallOrder[0] ?? 0)
+  })
+
+  it('stops the server when a post-spawn gate throws and isolation is off', async () => {
+    // #given the same throw without a sandbox
+    const server = fakeServer()
+    const deps = depsFor(server, {waitForImport: vi.fn(async () => Promise.reject(new Error('gate blew up')))})
+
+    // #when / #then the handle is never left running
+    await expect(run(null, deps)).rejects.toThrow('gate blew up')
+    expect(server.shutdown).toHaveBeenCalledTimes(1)
+  })
+
+  it('stops the server and releases the sandbox when the permission gate itself throws', async () => {
+    // #given an agent listing that throws
+    const server = fakeServer()
+    server.fetch.mockImplementation(async () => Promise.reject(new Error('socket hang up')))
+    const deps = depsFor(server)
+    const sandbox = fakeSandbox()
+
+    // #when
+    const outcome = await run(sandbox.sandbox, deps).then(
+      value => ({thrown: false as const, value}),
+      () => ({thrown: true as const}),
+    )
+
+    // #then whether the gate converts the error into a failure or lets it throw, nothing is left running
+    expect(outcome.thrown || !outcome.value.success).toBe(true)
+    expect(server.shutdown).toHaveBeenCalledTimes(1)
+    expect(sandbox.release).toHaveBeenCalledTimes(1)
+  })
+
+  it('releases the sandbox and rethrows when the spawn throws', async () => {
+    // #given a spawn that throws
+    const server = fakeServer()
+    const deps = depsFor(server, {startServer: vi.fn<StartServer>(async () => Promise.reject(new Error('boom')))})
+    const sandbox = fakeSandbox()
+
+    // #when / #then
+    await expect(run(sandbox.sandbox, deps)).rejects.toThrow('boom')
+    expect(sandbox.release).toHaveBeenCalledTimes(1)
+  })
+
+  describe('the sandbox launch', () => {
+    it('spawns through the lifecycle, handing the server the launch spec and the lifecycle abort signal', async () => {
+      // #given a prepared sandbox
+      const server = fakeServer()
+      const deps = depsFor(server)
+      const sandbox = fakeSandbox()
+
+      // #when the start runs
+      const result = await run(sandbox.sandbox, deps)
+
+      // #then the spawn happened inside launch, with the spec, and its signal reaches the server start
+      expect(result.success).toBe(true)
+      expect(sandbox.launch).toHaveBeenCalledTimes(1)
+      const startOptions = vi.mocked(deps.startServer).mock.calls[0]?.[0]
+      expect(startOptions?.sandbox).toBe(LAUNCH)
+      expect(startOptions?.signal).toBe(sandbox.log.signals[0])
+      expect(sandbox.log.reports.map(report => report.unconfirmed)).toEqual([false])
+    })
+
+    it('never spawns when the lifecycle refuses the launch (the teardown has begun), and releases', async () => {
+      // #given a lifecycle that has closed admission
+      const server = fakeServer()
+      const deps = depsFor(server)
+      const sandbox = fakeSandbox(undefined, 'the teardown has begun')
+
+      // #when
+      const result = await run(sandbox.sandbox, deps)
+
+      // #then the start fails at the sandbox stage and no server was started
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.stage).toBe('sandbox')
+      expect(deps.startServer).not.toHaveBeenCalled()
+      expect(sandbox.release).toHaveBeenCalledTimes(1)
+    })
+
+    it('aborts a start that is in flight when the lifecycle aborts, and fails the start', async () => {
+      // #given a server start that waits for its abort signal
+      const server = fakeServer()
+      const sandbox = fakeSandbox()
+      const deps = depsFor(server, {
+        startServer: vi.fn<StartServer>(async spawnOptions => {
+          await new Promise<void>(resolve => spawnOptions.signal?.addEventListener('abort', () => resolve()))
+          return {success: false, error: {kind: 'aborted', message: 'cancelled', cleanup: 'graceful'}}
+        }),
+      })
+
+      // #when the start is running and the lifecycle aborts (the signal's teardown)
+      const starting = run(sandbox.sandbox, deps)
+      await vi.waitFor(() => {
+        expect(deps.startServer).toHaveBeenCalled()
+      })
+      sandbox.abort()
+      const result = await starting
+
+      // #then
+      expect(result.success).toBe(false)
+      expect(sandbox.release).toHaveBeenCalled()
+    })
+
+    it.each([
+      ['unconfirmed', true],
+      ['graceful', false],
+      ['forced', false],
+    ] as const)('reports a failed start whose own cleanup was %s as unconfirmed=%s', async (cleanup, unconfirmed) => {
+      // #given a start that fails with that cleanup outcome
+      const server = fakeServer()
+      const sandbox = fakeSandbox()
+      const deps = depsFor(server, {
+        startServer: vi.fn<StartServer>(async () => ({
+          success: false,
+          error: {kind: 'spawn-failed', message: 'nope', cleanup},
+        })),
+      })
+
+      // #when
+      await run(sandbox.sandbox, deps)
+
+      // #then the lifecycle was told, so its release cannot report a clean stop
+      expect(sandbox.log.reports.map(report => report.unconfirmed)).toEqual([unconfirmed])
     })
   })
 })
