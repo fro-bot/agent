@@ -1,5 +1,6 @@
 import type {ResponseDelivery, ResponseFilePathCandidates} from '@fro-bot/runtime'
 import type {EnsureOpenCodeResult} from '../../features/agent/types.js'
+import type {SandboxToolPaths} from '../../services/setup/sandbox-preflight.js'
 import type {Logger} from '../../shared/logger.js'
 import type {ActionInputs} from '../../shared/types.js'
 import * as crypto from 'node:crypto'
@@ -9,6 +10,7 @@ import process from 'node:process'
 import * as core from '@actions/core'
 import * as github from '@actions/github'
 import {
+  buildAttachmentDir,
   buildResponseFileDir,
   buildResponseFilePathCandidates,
   ensureOpenCodeAvailable,
@@ -17,10 +19,12 @@ import {
 import {createExecAdapter} from '../../services/setup/adapters.js'
 import {assertNoPersistedGitCredentials} from '../../services/setup/git-credential-check.js'
 import {runtimeSetupAdapter} from '../../services/setup/runtime-setup-adapter.js'
-import {getGitHubRunAttempt, getGitHubRunId} from '../../shared/env.js'
+import {createSandboxPreflightDeps, runSandboxPreflight} from '../../services/setup/sandbox-preflight.js'
+import {getGitHubRunAttempt, getGitHubRunId, getGitHubWorkspace} from '../../shared/env.js'
 import {createLogger} from '../../shared/logger.js'
 import {parseActionInputs} from '../config/inputs.js'
 import {STATE_KEYS} from '../config/state-keys.js'
+import {createSandboxLifecycle, type SandboxLifecycle} from './sandbox-lifecycle.js'
 
 export interface BootstrapPhaseResult {
   readonly inputs: ActionInputs
@@ -47,6 +51,17 @@ export interface BootstrapPhaseResult {
   readonly responseFilePathCandidates: ResponseFilePathCandidates | null
   /** Trusted PR head SHA captured by workflow setup; empty when brokered push is unavailable. */
   readonly trustedHeadSha: string
+  /**
+   * Absolute paths of the privileged tools the sandbox uses. Non-null iff `isolate-agent` is on and the runner passed
+   * the preflight; null means the run is not isolated.
+   */
+  readonly sandboxTools: SandboxToolPaths | null
+  /**
+   * The `isolate-agent` lifecycle, created here so the run owns it before anything can fail: whichever path the run
+   * takes, `run.ts` releases it (the release is memoized) and learns whether the sandbox was restored. Null or absent
+   * when the run is not isolated.
+   */
+  readonly sandbox?: SandboxLifecycle | null
 }
 
 export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPhaseResult | null> {
@@ -71,6 +86,18 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
     timeoutMs: inputs.timeoutMs,
   })
 
+  // Fail closed before any setup, credential check or directory creation: an unsupported runner leaves nothing to
+  // undo. Skipped entirely (no check, no log) when the input is off.
+  let sandboxTools: SandboxToolPaths | null = null
+  if (inputs.isolateAgent) {
+    const preflight = await runSandboxPreflight({...createSandboxPreflightDeps(createExecAdapter(), logger)})
+    if (!preflight.ok) {
+      core.setFailed(preflight.message)
+      return null
+    }
+    sandboxTools = preflight.tools
+  }
+
   // Resolved once, from the raw event name, before setup runs any credential
   // provisioning — routing later asserts its own classification agrees.
   const {credential, delivery} = resolveResponseDelivery(github.context.eventName, inputs.responseMode)
@@ -80,11 +107,19 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
   // `persist-credentials: true` (the actions/checkout default) or a
   // credentialed remote URL would let the model's bash exfiltrate the same
   // token this delivery mode is designed to keep out of its reach.
-  if (credential === 'withhold') {
+  //
+  // With `isolate-agent` the check runs on every trigger: the checkout is handed to the sandbox user with read access, so
+  // an `http.*.extraheader` left in `.git/config` by `actions/checkout` is readable by the model even when the trigger
+  // provisions a credential on purpose (that credential is a different, narrower grant than the checkout's token).
+  if (credential === 'withhold' || inputs.isolateAgent) {
     const workspaceDir = process.env.GITHUB_WORKSPACE ?? process.cwd()
     const credentialCheck = await assertNoPersistedGitCredentials(createExecAdapter(), workspaceDir, logger)
     if (credentialCheck.success === false) {
-      core.setFailed(`Refusing to proceed with credential withheld: ${credentialCheck.error}`)
+      core.setFailed(
+        credential === 'withhold'
+          ? `Refusing to proceed with credential withheld: ${credentialCheck.error}`
+          : `Refusing to proceed with isolate-agent: the checkout carries a persisted git credential the agent user could read (${credentialCheck.error}). Set \`persist-credentials: false\` on actions/checkout.`,
+      )
       return null
     }
   }
@@ -126,7 +161,27 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
     responseFilePath: responseFile?.responseFilePath ?? null,
     responseFilePathCandidates: responseFile?.responseFilePathCandidates ?? null,
     trustedHeadSha: inputs.trustedHeadSha,
+    sandboxTools,
+    sandbox: createRunSandbox(sandboxTools, responseFile?.responseFilePath ?? null),
   }
+}
+
+/** The lifecycle for an isolated run, or null. Every state change is written for the post hook. */
+function createRunSandbox(tools: SandboxToolPaths | null, responseFilePath: string | null): SandboxLifecycle | null {
+  if (tools === null) return null
+  const runnerTemp = process.env.RUNNER_TEMP?.trim() ?? ''
+  return createSandboxLifecycle({
+    tools,
+    env: process.env,
+    workspacePath: getGitHubWorkspace(),
+    responseDir: responseFilePath === null ? null : path.dirname(responseFilePath),
+    attachmentDir:
+      runnerTemp.length === 0
+        ? null
+        : buildAttachmentDir({runnerTemp, runId: getGitHubRunId(), runAttempt: getGitHubRunAttempt()}),
+    logger: createLogger({phase: 'sandbox'}),
+    recordState: state => core.saveState(STATE_KEYS.SANDBOX_STATE, state),
+  })
 }
 
 /**

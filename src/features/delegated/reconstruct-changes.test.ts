@@ -22,10 +22,19 @@ vi.mock('node:fs/promises', () => ({
 
 const TRUSTED_HEAD_SHA = 'a'.repeat(40)
 
-function createMockExecAdapter(stdout = '', exitCode = 0, stderr = '', untrackedStdout = ''): ExecAdapter {
+function createMockExecAdapter(
+  stdout = '',
+  exitCode = 0,
+  stderr = '',
+  untrackedStdout = '',
+  stageStdout = '',
+): ExecAdapter {
   return {
     exec: vi.fn().mockResolvedValue(0),
     getExecOutput: vi.fn().mockImplementation(async (_command: string, args?: string[]) => {
+      if (args?.includes('--stage') === true) {
+        return {stdout: stageStdout, stderr: '', exitCode: 0}
+      }
       if (args?.includes('ls-files') === true) {
         return {stdout: untrackedStdout, stderr: '', exitCode: 0}
       }
@@ -52,6 +61,19 @@ function createMockFileHandle(filePath: string): FileHandle {
 
 function rawDiffEntry(oldMode: string, newMode: string, status: string, path: string): string {
   return `:${oldMode} ${newMode} ${'a'.repeat(40)} ${'b'.repeat(40)} ${status}\0${path}\0`
+}
+
+function populate(populatedPaths: readonly string[]): void {
+  vi.mocked(fs.lstat).mockImplementation(async filePath => {
+    const target = String(filePath)
+    if (
+      target.endsWith(`${path.sep}.git`) &&
+      !populatedPaths.some(entry => target.endsWith(`${entry}${path.sep}.git`))
+    ) {
+      throw Object.assign(new Error('ENOENT'), {code: 'ENOENT'})
+    }
+    return regularFileStats()
+  })
 }
 
 describe('reconstructChanges', () => {
@@ -97,6 +119,81 @@ describe('reconstructChanges', () => {
     const args = vi.mocked(execAdapter.getExecOutput).mock.calls[0]?.[1] ?? []
     expect(args).not.toContain('HEAD')
     expect(args).not.toContain('origin')
+  })
+
+  it('runs both reads through the trusted wrapper: hardened argv, replaced environment, no entering submodules', async () => {
+    // #given a clean diff
+    const execAdapter = createMockExecAdapter()
+
+    // #when reconstructed
+    await reconstructChanges(execAdapter, TRUSTED_HEAD_SHA, '/workspace', logger)
+
+    // #then each call carries the global hardening, replaced env and the submodule/textconv/ext-diff restrictions
+    const calls = vi.mocked(execAdapter.getExecOutput).mock.calls
+    expect(calls).toHaveLength(2)
+    for (const [, args, options] of calls) {
+      expect(args?.slice(0, 5)).toEqual(['--no-pager', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null'])
+      expect(options?.env).toMatchObject({GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0'})
+    }
+    const diffArgs = calls[0]?.[1] ?? []
+    expect(diffArgs).toEqual(expect.arrayContaining(['--no-ext-diff', '--no-textconv', '--ignore-submodules=none']))
+    expect(diffArgs).not.toContain('--ignore-submodules=dirty')
+    // #and no gitlink lookup happens: behavior without isolation is exactly what it was
+    expect(calls.some(([, args]) => args?.includes('--stage') === true)).toBe(false)
+  })
+
+  describe('with isolate-agent on', () => {
+    const stage = (mode: string, file: string): string => `${mode} ${'c'.repeat(40)} 0\t${file}\0`
+
+    it('keeps --ignore-submodules=dirty and reads the gitlinks from the index as data', async () => {
+      // #given a clean diff, an index with a gitlink whose directory is empty (not populated)
+      populate([])
+      const execAdapter = createMockExecAdapter('', 0, '', '', stage('160000', 'vendor/lib'))
+
+      // #when reconstructed under isolation
+      const result = await reconstructChanges(execAdapter, TRUSTED_HEAD_SHA, '/workspace', logger, {isolated: true})
+
+      // #then it proceeds, the diff never enters a submodule, and the gitlinks came from ls-files --stage
+      expect(result).toEqual({success: true, data: {kind: 'nothing-to-deliver'}})
+      const calls = vi.mocked(execAdapter.getExecOutput).mock.calls
+      const diffArgs = calls.find(([, args]) => args?.includes('diff') === true)?.[1] ?? []
+      expect(diffArgs).toContain('--ignore-submodules=dirty')
+      expect(diffArgs).not.toContain('--ignore-submodules=none')
+      expect(calls.some(([, args]) => args?.includes('--stage') === true && args.includes('ls-files'))).toBe(true)
+    })
+
+    it('declines with a named reason, before any diff, when a gitlink is populated', async () => {
+      // #given a gitlink whose directory holds a .git
+      populate(['vendor/lib'])
+      const execAdapter = createMockExecAdapter('', 0, '', '', stage('100644', 'a.txt') + stage('160000', 'vendor/lib'))
+
+      // #when reconstructed under isolation
+      const result = await reconstructChanges(execAdapter, TRUSTED_HEAD_SHA, '/workspace', logger, {isolated: true})
+
+      // #then the reason names the submodule and no diff ran
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.message).toContain('vendor/lib')
+      expect(!result.success && result.error.message).toContain('populated')
+      const calls = vi.mocked(execAdapter.getExecOutput).mock.calls
+      expect(calls.some(([, args]) => args?.includes('diff') === true)).toBe(false)
+    })
+
+    it('fails loudly, never proceeding, when the index cannot be read', async () => {
+      // #given an ls-files --stage failure
+      const execAdapter = createMockExecAdapter()
+      vi.mocked(execAdapter.getExecOutput).mockImplementation(async (_command: string, args?: string[]) =>
+        args?.includes('--stage') === true
+          ? {stdout: '', stderr: 'fatal: index file corrupt', exitCode: 128}
+          : {stdout: '', stderr: '', exitCode: 0},
+      )
+
+      // #when
+      const result = await reconstructChanges(execAdapter, TRUSTED_HEAD_SHA, '/workspace', logger, {isolated: true})
+
+      // #then
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.message).toContain('index file corrupt')
+    })
   })
 
   it('represents deleted files without reading or dereferencing them', async () => {

@@ -652,6 +652,59 @@ describe('parseActionInputs', () => {
     })
   })
 
+  describe('isolate-agent', () => {
+    it('defaults to false when the input is empty', () => {
+      // #given no isolate-agent input
+      mockInputs({})
+
+      // #when parsing action inputs
+      const result = parseActionInputs()
+
+      // #then the opt-in is off
+      expect(result.success && result.data.isolateAgent).toBe(false)
+    })
+
+    it.each([
+      ['false', false],
+      ['FALSE', false],
+      ['true', true],
+      [' True ', true],
+    ])('parses %j as %s', (value, expected) => {
+      // #given an explicit isolate-agent value
+      mockInputs({'isolate-agent': value})
+
+      // #when parsing action inputs
+      const result = parseActionInputs()
+
+      // #then it is read case-insensitively and trimmed
+      expect(result.success && result.data.isolateAgent).toBe(expected)
+    })
+
+    it.each(['yes', '1', 'on'])('rejects %j instead of silently opting out', value => {
+      // #given a value that is not true or false
+      mockInputs({'isolate-agent': value})
+
+      // #when parsing action inputs
+      const result = parseActionInputs()
+
+      // #then the error names the input and the valid values
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.message).toContain('isolate-agent')
+    })
+
+    it('pins the false action metadata default', () => {
+      // #given the committed action metadata
+      const actionYaml = readFileSync(resolve(import.meta.dirname, '../../../action.yaml'), 'utf8')
+
+      // #when locating the isolate-agent input block
+      const block = /\n {2}isolate-agent:\n([\s\S]*?)(?=\n {2}[\w-]+:\n|\n\S)/.exec(actionYaml)?.[1] ?? ''
+
+      // #then the opt-in is disabled by default
+      expect(block.length).toBeGreaterThan(0)
+      expect(block).toContain("default: 'false'")
+    })
+  })
+
   describe('with invalid inputs', () => {
     it('returns normalized brokered-push extra paths', () => {
       // #given consumer paths supplied through the action input

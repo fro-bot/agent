@@ -171,6 +171,40 @@ describe('runCleanup', () => {
     expect(saveState).toHaveBeenCalledWith('cleanupMetadataWritten', 'true')
   })
 
+  it('reads and publishes no sandbox-writable log path when the sandbox output is untrusted, but still writes metadata', async () => {
+    // #given an unsafe sandbox release, S3 on and prompt-artifact upload on
+    const {createS3Adapter, syncArtifactsToStore, syncMetadataToStore} = await import('@fro-bot/runtime')
+    const {uploadLogArtifact} = await import('../../services/artifact/index.js')
+    vi.mocked(createS3Adapter).mockReturnValue({
+      upload: async () => ok(undefined),
+      download: async () => ok(undefined),
+      list: async () => ok([]),
+    })
+    process.env.OPENCODE_PROMPT_ARTIFACT = 'true'
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs with the sandbox flagged
+    await runCleanup({
+      bootstrapLogger: createMockLogger(),
+      reactionCtx: null,
+      githubClient: null,
+      attachmentResult: null,
+      storeConfig: {enabled: true, bucket: 'bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
+      metrics: createMetricsCollector(),
+      agentIdentity: 'github',
+      repo: 'owner/repo',
+      runId: 'run-123',
+      lockEtag: null,
+      sandboxOutputUntrusted: true,
+    })
+
+    // #then neither the object-store artifact sync nor the log artifact upload touched the log directory
+    expect(syncArtifactsToStore).not.toHaveBeenCalled()
+    expect(uploadLogArtifact).not.toHaveBeenCalled()
+    // #and the runner-generated metadata still went out
+    expect(syncMetadataToStore).toHaveBeenCalled()
+  })
+
   it('does not mark cleanup metadata written when the upload fails', async () => {
     // #given the metadata upload itself fails -- the rich payload never landed, so post.ts
     // must still be free to write its own placeholder rather than silently skipping

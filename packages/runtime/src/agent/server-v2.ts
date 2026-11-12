@@ -10,6 +10,7 @@ import {sleep} from '../shared/async.js'
 import {toErrorMessage} from '../shared/errors.js'
 import {err, ok} from '../shared/types.js'
 import {filterAgentEnv} from './filter-env.js'
+import {buildSetprivDropArgs} from './sandbox-identity.js'
 
 /**
  * Spawn, authenticate to, gate and shut down a stock OpenCode V2 server (`serve --stdio`).
@@ -152,6 +153,37 @@ export interface OpenCodeV2Deps {
   readonly killGroup: (pid: number, signal: NodeJS.Signals) => void
 }
 
+/**
+ * Launch the server as an unprivileged sandbox user from a non-root caller (`isolate-agent`).
+ *
+ * Node's own `uid`/`gid` spawn options need root, which the Action does not have. This mode wraps the server in
+ * `sudo -n --preserve-env=<names> -- setpriv <drop> -- env <identity> <binary>`: `setpriv` has to run as root to clear
+ * the supplementary groups, then drops. Secret values (the server password, the config content) reach the child only
+ * through the preserved-name list and never appear in argv. sudo-rs ignores `-E`, hence the explicit list.
+ *
+ * Everything non-secret that names the user's own places (`HOME`, `XDG_*`, `PATH`, ...) is set with `env` after the
+ * drop, because `sudo` resets those. The caller resolves the XDG paths from the *runner's* environment, so a restored
+ * database and cached plugins stay where cache restore and save expect them.
+ */
+export interface OpenCodeV2SandboxLaunch {
+  /** Absolute paths, resolved by the preflight. */
+  readonly sudoPath: string
+  readonly setprivPath: string
+  readonly envPath: string
+  readonly account: {readonly name: string; readonly uid: number; readonly gid: number; readonly home: string}
+  /** Fixed `PATH` for the child. */
+  readonly path: string
+  readonly tmpdir: string
+  readonly xdg: {
+    readonly data: string
+    readonly config: string
+    readonly cache: string
+    readonly state: string
+  }
+  /** Further non-secret variables, e.g. `GH_CONFIG_DIR` pointing into the sandbox. Set after the drop. */
+  readonly extraEnv?: Readonly<Record<string, string>>
+}
+
 export interface StartOpenCodeV2ServerOptions {
   /** The verified stock binary. */
   readonly binaryPath: string
@@ -171,6 +203,8 @@ export interface StartOpenCodeV2ServerOptions {
    */
   readonly uid?: number
   readonly gid?: number
+  /** Launch through sudo and setpriv as a sandbox user. Mutually exclusive with `uid`/`gid`. */
+  readonly sandbox?: OpenCodeV2SandboxLaunch
   readonly timeouts?: Partial<OpenCodeV2Timeouts>
   /**
    * The caller's deadline, honoured for the server's whole life. Aborting during startup fails the start. Aborting
@@ -361,6 +395,56 @@ function startError(
   return {kind, message, ...extra}
 }
 
+const SANDBOX_ENV_NAME = /^[A-Z_]\w*$/i
+
+/**
+ * Pure: the argv and environment of a sandboxed launch. Exported for tests that pin the exact command.
+ * `baseEnv` is the already-filtered child environment, secrets included.
+ */
+export function buildSandboxLaunch(
+  sandbox: OpenCodeV2SandboxLaunch,
+  binaryPath: string,
+  serveArgs: readonly string[],
+  baseEnv: NodeJS.ProcessEnv,
+): {readonly command: string; readonly args: readonly string[]; readonly env: NodeJS.ProcessEnv} {
+  const identityEnv: Record<string, string> = {
+    HOME: sandbox.account.home,
+    USER: sandbox.account.name,
+    LOGNAME: sandbox.account.name,
+    TMPDIR: sandbox.tmpdir,
+    PATH: sandbox.path,
+    XDG_DATA_HOME: sandbox.xdg.data,
+    XDG_CONFIG_HOME: sandbox.xdg.config,
+    XDG_CACHE_HOME: sandbox.xdg.cache,
+    XDG_STATE_HOME: sandbox.xdg.state,
+    ...sandbox.extraEnv,
+  }
+  const identityNames = new Set(Object.keys(identityEnv))
+  // Everything else the filter let through, by name only. A name that is not a plain identifier is dropped rather
+  // than interpolated into the sudo option.
+  const preserved = Object.entries(baseEnv)
+    .filter(([name, value]) => value !== undefined && SANDBOX_ENV_NAME.test(name) && !identityNames.has(name))
+    .map(([name]) => name)
+  const env: NodeJS.ProcessEnv = {}
+  for (const name of preserved) env[name] = baseEnv[name]
+  return {
+    command: sandbox.sudoPath,
+    args: [
+      '-n',
+      `--preserve-env=${preserved.join(',')}`,
+      '--',
+      sandbox.setprivPath,
+      ...buildSetprivDropArgs(sandbox.account),
+      '--',
+      sandbox.envPath,
+      ...Object.entries(identityEnv).map(([name, value]) => `${name}=${value}`),
+      binaryPath,
+      ...serveArgs,
+    ],
+    env,
+  }
+}
+
 export async function startOpenCodeV2Server(
   options: StartOpenCodeV2ServerOptions,
   logger: Logger,
@@ -375,6 +459,9 @@ export async function startOpenCodeV2Server(
   // A uid without a gid would keep the caller's group, which is half a privilege drop.
   if ((options.uid === undefined) !== (options.gid === undefined)) {
     return err(startError('invalid-options', 'The OpenCode V2 server uid and gid must be given together'))
+  }
+  if (options.sandbox !== undefined && options.uid !== undefined) {
+    return err(startError('invalid-options', 'The OpenCode V2 server sandbox launch excludes uid and gid'))
   }
 
   // Per spawn, never reused and never logged. 256 random bits.
@@ -414,11 +501,17 @@ export async function startOpenCodeV2Server(
   // A self-update would replace the digest-verified binary mid-run.
   childEnv.OPENCODE_DISABLE_AUTOUPDATE = '1'
 
+  const serveArgs = ['serve', '--stdio', '--hostname', LOOPBACK, '--port', String(port)]
+  const launch =
+    options.sandbox === undefined
+      ? {command: options.binaryPath, args: serveArgs, env: childEnv}
+      : buildSandboxLaunch(options.sandbox, options.binaryPath, serveArgs, childEnv)
+
   let child: ChildProcess
   try {
-    child = spawn(options.binaryPath, ['serve', '--stdio', '--hostname', LOOPBACK, '--port', String(port)], {
+    child = spawn(launch.command, launch.args, {
       cwd: options.directory,
-      env: childEnv,
+      env: launch.env,
       // A held pipe: with 'ignore' the server exits after about 150 ms (P15). stderr is not captured because the
       // server may echo config content, which can hold provider credentials.
       stdio: ['pipe', 'pipe', 'ignore'],

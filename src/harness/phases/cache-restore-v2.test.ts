@@ -73,6 +73,7 @@ function inputs(overrides: Partial<ActionInputs> = {}): ActionInputs {
     reviewSkipLabel: null,
     brokeredPushExtraPaths: [],
     repoSkills: false,
+    isolateAgent: false,
     storeConfig: {enabled: false, bucket: '', region: '', prefix: 'fro-bot-state'},
     ...overrides,
   }
@@ -87,6 +88,7 @@ function bootstrap(version: string, overrides: Partial<ActionInputs> = {}): Boot
     responseFilePath: null,
     responseFilePathCandidates: null,
     trustedHeadSha: '',
+    sandboxTools: null,
   }
 }
 

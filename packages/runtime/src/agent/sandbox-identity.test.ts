@@ -1,0 +1,486 @@
+import type {PrivilegedRun, PrivilegedRunResult, SandboxIdentityDeps, SandboxIdentityTools} from './sandbox-identity.js'
+import {describe, expect, it} from 'vitest'
+import {
+  buildRunAsSandboxArgv,
+  buildSetprivDropArgs,
+  createSandboxAccount,
+  deleteSandboxAccount,
+  SANDBOX_ACCOUNT_CREATE_TIMEOUT_MS,
+  SANDBOX_ACCOUNT_NAME,
+  stopSandboxProcesses,
+} from './sandbox-identity.js'
+
+const TOOLS: SandboxIdentityTools = {
+  setpriv: '/usr/bin/setpriv',
+  useradd: '/usr/sbin/useradd',
+  userdel: '/usr/sbin/userdel',
+  pkill: '/usr/bin/pkill',
+  pgrep: '/usr/bin/pgrep',
+  chmod: '/usr/bin/chmod',
+}
+
+interface FakeSystemOptions {
+  readonly passwd?: string[]
+  readonly group?: string[]
+  readonly failUseradd?: boolean
+  /** Extra passwd line added by useradd, simulating a uid collision. */
+  readonly collidingUid?: boolean
+  readonly failChmod?: boolean
+  /** What useradd returns instead of succeeding. */
+  readonly useraddResult?: PrivilegedRunResult
+  /** When useradd returns `useraddResult`, still create the account (a hung useradd that had already finished its work). */
+  readonly createDespiteResult?: boolean
+  /** How long (on the fake clock) a useradd takes. */
+  readonly useraddElapsedMs?: number
+}
+
+/** A tiny model of the host: passwd, group, a process table and a log of every privileged argv. */
+function createFakeSystem(options: FakeSystemOptions = {}) {
+  const passwd = [
+    ...(options.passwd ?? ['root:x:0:0:root:/root:/bin/bash', 'runner:x:1001:1001::/home/runner:/bin/bash']),
+  ]
+  const group = [...(options.group ?? ['root:x:0:', 'runner:x:1001:'])]
+  const calls: string[][] = []
+  const useraddOptions: ({readonly timeoutMs?: number} | undefined)[] = []
+  const infoLog: {readonly message: string; readonly context?: unknown}[] = []
+  const state = {
+    procs: [] as string[],
+    /** Processes spawned by a hostile parent right after each pkill, before the next pgrep. */
+    respawnAfterKill: 0,
+    survivors: false,
+    now: 0,
+  }
+
+  const run: PrivilegedRun = async (argv, runOptions) => {
+    calls.push([...argv])
+    if (argv[0] === TOOLS.useradd) useraddOptions.push(runOptions)
+    const tool = argv[0]?.split('/').pop() ?? ''
+    switch (tool) {
+      case 'useradd': {
+        state.now += options.useraddElapsedMs ?? 0
+        if (options.useraddResult !== undefined) {
+          if (options.createDespiteResult === true) {
+            passwd.push(`${SANDBOX_ACCOUNT_NAME}:x:998:997::/home/${SANDBOX_ACCOUNT_NAME}:/bin/bash`)
+          }
+          return options.useraddResult
+        }
+        if (options.failUseradd === true) return {exitCode: 9, stdout: ''}
+        passwd.push(`${SANDBOX_ACCOUNT_NAME}:x:998:997::/home/${SANDBOX_ACCOUNT_NAME}:/bin/bash`)
+        group.push(`${SANDBOX_ACCOUNT_NAME}:x:997:`)
+        if (options.collidingUid === true) passwd.push('other:x:998:998::/home/other:/bin/false')
+        return {exitCode: 0, stdout: ''}
+      }
+      case 'chmod':
+        return {exitCode: options.failChmod === true ? 1 : 0, stdout: ''}
+      case 'userdel': {
+        const name = argv.at(-1) ?? ''
+        const index = passwd.findIndex(line => line.startsWith(`${name}:`))
+        if (index === -1) return {exitCode: 6, stdout: ''}
+        passwd.splice(index, 1)
+        const groupIndex = group.findIndex(line => line.startsWith(`${name}:`))
+        if (groupIndex !== -1) group.splice(groupIndex, 1)
+        return {exitCode: 0, stdout: ''}
+      }
+      case 'pkill': {
+        const killed = state.procs.length > 0
+        if (!state.survivors) state.procs = []
+        if (state.respawnAfterKill > 0) {
+          state.respawnAfterKill -= 1
+          state.procs = ['respawned']
+        }
+        return {exitCode: killed ? 0 : 1, stdout: ''}
+      }
+      case 'pgrep':
+        return {exitCode: state.procs.length > 0 ? 0 : 1, stdout: state.procs.join('\n')}
+      default:
+        return {exitCode: 127, stdout: ''}
+    }
+  }
+
+  const deps: SandboxIdentityDeps = {
+    run,
+    readText: async file => {
+      if (file === '/etc/passwd') return `${passwd.join('\n')}\n`
+      if (file === '/etc/group') return `${group.join('\n')}\n`
+      return null
+    },
+    now: () => state.now,
+    sleep: async ms => {
+      state.now += ms
+    },
+    logger: {
+      debug: () => undefined,
+      info: (message, context) => infoLog.push({message, context}),
+      warning: () => undefined,
+      error: () => undefined,
+    },
+  }
+  return {deps, calls, state, passwd, group, useraddOptions, infoLog}
+}
+
+const toolNames = (calls: readonly string[][]): string[] => calls.map(call => call[0]?.split('/').pop() ?? '')
+
+describe('createSandboxAccount', () => {
+  it('creates a system user with its own group and a 0700 home, and reads back the allocated ids', async () => {
+    // #given a host without the account
+    const system = createFakeSystem()
+
+    // #when the account is created
+    const result = await createSandboxAccount(TOOLS, system.deps)
+
+    // #then the ids come from the host, the home is locked and no supplementary group was requested
+    expect(result.success && result.data).toEqual({
+      name: 'fro-bot-sandbox',
+      uid: 998,
+      gid: 997,
+      home: '/home/fro-bot-sandbox',
+    })
+    const useradd = system.calls.find(call => call[0] === TOOLS.useradd) ?? []
+    expect(useradd).toEqual(expect.arrayContaining(['--system', '--user-group', '--create-home']))
+    expect(useradd).not.toContain('--groups')
+    expect(system.calls).toContainEqual([TOOLS.chmod, '0700', '/home/fro-bot-sandbox'])
+  })
+
+  describe('the useradd budget and its failure messages', () => {
+    it('gives useradd its own pinned budget instead of the generic default', async () => {
+      // #given a host that creates the account
+      const system = createFakeSystem()
+
+      // #when
+      await createSandboxAccount(TOOLS, system.deps)
+
+      // #then useradd ran with the account-creation budget, and that budget is the value this test pins
+      expect(system.useraddOptions).toEqual([{timeoutMs: SANDBOX_ACCOUNT_CREATE_TIMEOUT_MS}])
+      // A cold hosted runner's first useradd sat in uninterruptible I/O wait for 99 s (CI probe, fro-bot/agent#2135).
+      expect(SANDBOX_ACCOUNT_CREATE_TIMEOUT_MS).toBe(180_000)
+    })
+
+    it('logs at info, with the tool and elapsed time only, when account creation takes more than 10 s', async () => {
+      // #given a useradd that takes 99 s on the clock
+      const system = createFakeSystem({useraddElapsedMs: 99_000})
+
+      // #when
+      const result = await createSandboxAccount(TOOLS, system.deps)
+
+      // #then it still succeeds, and the slow creation was logged once with nothing else in it
+      expect(result.success).toBe(true)
+      expect(system.infoLog.filter(entry => entry.message === 'Sandbox account creation was slow')).toEqual([
+        {message: 'Sandbox account creation was slow', context: {tool: 'useradd', elapsedMs: 99_000}},
+      ])
+    })
+
+    it('does not log a creation that took 10 s or less', async () => {
+      // #given
+      const system = createFakeSystem({useraddElapsedMs: 10_000})
+
+      // #when
+      await createSandboxAccount(TOOLS, system.deps)
+
+      // #then
+      expect(system.infoLog.some(entry => entry.message === 'Sandbox account creation was slow')).toBe(false)
+    })
+
+    it('says "timed out after Nms", includes the stderr tail, and whether the account had been created', async () => {
+      // #given a useradd the runner had to kill, which printed a warning first
+      const system = createFakeSystem({
+        useraddResult: {
+          exitCode: null,
+          stdout: '',
+          stderr: 'useradd: warning: the home directory already exists.',
+          timedOutAfterMs: 60_000,
+        },
+      })
+
+      // #when
+      const result = await createSandboxAccount(TOOLS, system.deps)
+
+      // #then the reason is a timeout (not "exit null"), with the evidence
+      expect(!result.success && result.error.message).toContain('timed out after 60000ms')
+      expect(!result.success && result.error.message).toContain('the home directory already exists')
+      expect(!result.success && result.error.message).toContain('account present at timeout: no')
+      expect(!result.success && result.error.message).not.toContain('exit null')
+    })
+
+    it('reports a useradd that finished its work but never closed its pipes: the account was present at the timeout', async () => {
+      // #given a killed useradd whose account exists anyway
+      const system = createFakeSystem({
+        useraddResult: {exitCode: null, stdout: '', stderr: '', timedOutAfterMs: 60_000},
+        createDespiteResult: true,
+      })
+
+      // #when
+      const result = await createSandboxAccount(TOOLS, system.deps)
+
+      // #then the message separates "hung before creating" from "created, then hung"
+      expect(!result.success && result.error.message).toContain('account present at timeout: yes')
+    })
+
+    it('never removes the account after a timeout: a killed useradd is not known to have stopped', async () => {
+      // #given a useradd that outlived its budget and whose account exists
+      const system = createFakeSystem({
+        useraddResult: {exitCode: null, stdout: '', stderr: '', timedOutAfterMs: 60_000},
+        createDespiteResult: true,
+      })
+
+      // #when
+      const result = await createSandboxAccount(TOOLS, system.deps)
+
+      // #then userdel never ran (the useradd could still be finishing), the failure says so, and it is flagged as a timeout
+      expect(toolNames(system.calls)).not.toContain('userdel')
+      expect(!result.success && result.error.message).toContain('left in place')
+      expect(!result.success && 'timedOut' in result.error && result.error.timedOut).toBe(true)
+    })
+
+    it('does flag an ordinary failure as not timed out, and still cleans up after it', async () => {
+      // #given a useradd that exits non-zero after creating the account
+      const system = createFakeSystem({
+        useraddResult: {exitCode: 9, stdout: '', stderr: 'boom'},
+        createDespiteResult: true,
+      })
+
+      // #when
+      const result = await createSandboxAccount(TOOLS, system.deps)
+
+      // #then it was cleaned up and is not a timeout
+      expect(toolNames(system.calls)).toContain('userdel')
+      expect(!result.success && 'timedOut' in result.error).toBe(false)
+    })
+
+    it('includes the processes that were running at the timeout, on one bounded line', async () => {
+      // #given a killed useradd with the snapshot the runner took
+      const processes = [
+        'PID PPID PGID STAT ELAPSED COMMAND',
+        '4101 4090 4101 S 01:00 sudo -n -- /usr/sbin/useradd x',
+        '4102 4101 4101 S 01:00 /usr/sbin/useradd x',
+      ].join('\n')
+      const system = createFakeSystem({
+        useraddResult: {exitCode: null, stdout: '', stderr: '', timedOutAfterMs: 60_000, processes},
+      })
+
+      // #when
+      const result = await createSandboxAccount(TOOLS, system.deps)
+
+      // #then
+      const message = result.success ? '' : result.error.message
+      expect(message).toContain('processes at timeout: ')
+      expect(message).toContain('4102 4101 4101 S 01:00 /usr/sbin/useradd x')
+      expect(message).not.toContain('\n')
+    })
+
+    it('bounds the process listing in the message', async () => {
+      // #given a snapshot far longer than the bound
+      const processes = Array.from({length: 200}, (_, index) => `${index} 1 1 S 00:01 /usr/bin/thing-${index}`).join(
+        '\n',
+      )
+      const system = createFakeSystem({
+        useraddResult: {exitCode: null, stdout: '', stderr: '', timedOutAfterMs: 60_000, processes},
+      })
+
+      // #when
+      const result = await createSandboxAccount(TOOLS, system.deps)
+
+      // #then
+      expect(!result.success && result.error.message.length).toBeLessThan(1500)
+    })
+
+    it('includes the exit code and stderr tail for an ordinary failure, bounded to one line', async () => {
+      // #given a useradd that fails with a long, multi-line stderr
+      const noisy = `${'x'.repeat(5000)}\nuseradd: cannot lock /etc/passwd; try again later.`
+      const system = createFakeSystem({useraddResult: {exitCode: 1, stdout: '', stderr: noisy}})
+
+      // #when
+      const result = await createSandboxAccount(TOOLS, system.deps)
+
+      // #then
+      const message = result.success ? '' : result.error.message
+      expect(message).toContain('exit 1')
+      expect(message).toContain('cannot lock /etc/passwd')
+      expect(message).not.toContain('\n')
+      expect(message.length).toBeLessThan(700)
+    })
+  })
+
+  it('refuses an existing account and deletes nothing', async () => {
+    // #given an account of that name that already exists
+    const system = createFakeSystem({
+      passwd: ['fro-bot-sandbox:x:900:900::/home/fro-bot-sandbox:/bin/bash'],
+      group: ['fro-bot-sandbox:x:900:'],
+    })
+
+    // #when creation is attempted
+    const result = await createSandboxAccount(TOOLS, system.deps)
+
+    // #then it is refused without adoption, creation or deletion
+    expect(!result.success && result.error.kind).toBe('exists')
+    expect(toolNames(system.calls)).toEqual([])
+  })
+
+  it('refuses a pre-existing group of that name', async () => {
+    // #given a group with the sandbox name but no user
+    const system = createFakeSystem({group: ['root:x:0:', 'fro-bot-sandbox:x:900:runner']})
+
+    // #when creation is attempted
+    const result = await createSandboxAccount(TOOLS, system.deps)
+
+    // #then it is refused
+    expect(!result.success && result.error.kind).toBe('exists')
+    expect(toolNames(system.calls)).not.toContain('useradd')
+  })
+
+  it('removes a partially created account when useradd fails after creating it', async () => {
+    // #given a useradd that fails
+    const system = createFakeSystem({failUseradd: true})
+
+    // #when creation is attempted
+    const result = await createSandboxAccount(TOOLS, system.deps)
+
+    // #then it reports the failure and, finding nothing created, deletes nothing
+    expect(!result.success && result.error.kind).toBe('create-failed')
+    expect(toolNames(system.calls)).not.toContain('userdel')
+  })
+
+  it('rolls the account back when its uid is shared with another account', async () => {
+    // #given a host where the allocated uid is already in use
+    const system = createFakeSystem({collidingUid: true})
+
+    // #when creation is attempted
+    const result = await createSandboxAccount(TOOLS, system.deps)
+
+    // #then it fails closed and removes the account it just created
+    expect(!result.success && result.error.kind).toBe('create-failed')
+    expect(toolNames(system.calls)).toContain('userdel')
+  })
+
+  it('removes the account when the home cannot be locked down', async () => {
+    // #given a chmod that fails
+    const system = createFakeSystem({failChmod: true})
+
+    // #when creation is attempted
+    const result = await createSandboxAccount(TOOLS, system.deps)
+
+    // #then the account does not survive
+    expect(result.success).toBe(false)
+    expect(system.passwd.some(line => line.startsWith('fro-bot-sandbox:'))).toBe(false)
+  })
+})
+
+describe('stopSandboxProcesses', () => {
+  it('kills the uid and confirms nothing is left', async () => {
+    // #given sandbox processes
+    const system = createFakeSystem()
+    system.state.procs = ['server', 'setsid-child']
+
+    // #when stopped
+    const outcome = await stopSandboxProcesses({uid: 998}, TOOLS, system.deps)
+
+    // #then the kill ran against the uid and the verification came back empty
+    expect(outcome).toBe('stopped')
+    expect(system.calls).toContainEqual([TOOLS.pkill, '-KILL', '-u', '998'])
+    expect(system.calls.at(-1)).toEqual([TOOLS.pgrep, '-u', '998'])
+  })
+
+  it('gives every pkill and pgrep the time left of the bound, and ends unconfirmed when they hang', async () => {
+    // #given a runner whose commands never finish (exit null, as a killed-on-timeout command reports) and a fake clock
+    let clock = 0
+    const timeouts: number[] = []
+    const hung: PrivilegedRun = async (_argv, options) => {
+      timeouts.push(options?.timeoutMs ?? -1)
+      clock += options?.timeoutMs ?? 0
+      return {exitCode: null, stdout: ''}
+    }
+    const system = createFakeSystem()
+
+    // #when stopped with a 1s bound
+    const outcome = await stopSandboxProcesses(
+      {uid: 998},
+      TOOLS,
+      {...system.deps, run: hung, now: () => clock, sleep: async () => undefined},
+      {boundMs: 1000, pollMs: 10},
+    )
+
+    // #then nothing is proven, the loop stops at the deadline, and no command was allowed past what was left
+    expect(outcome).toBe('unconfirmed')
+    expect(timeouts.length).toBeGreaterThan(0)
+    expect(timeouts.every(timeoutMs => timeoutMs > 0 && timeoutMs <= 1000)).toBe(true)
+    expect(clock).toBeLessThanOrEqual(1000 + 1)
+  })
+
+  it('reports unconfirmed, and never deletes, when processes survive past the bound', async () => {
+    // #given a process pkill cannot remove
+    const system = createFakeSystem()
+    system.state.procs = ['stuck']
+    system.state.survivors = true
+
+    // #when stopped with a short bound
+    const outcome = await stopSandboxProcesses({uid: 998}, TOOLS, system.deps, {boundMs: 500, pollMs: 100})
+
+    // #then the outcome is unconfirmed and the loop kept trying until the bound
+    expect(outcome).toBe('unconfirmed')
+    expect(system.calls.filter(call => call[0] === TOOLS.pkill).length).toBeGreaterThan(2)
+    expect(toolNames(system.calls)).not.toContain('userdel')
+  })
+
+  it('kills a process that reappears between pkill and pgrep on the next pass', async () => {
+    // #given a hostile parent that spawns a replacement right after the first kill
+    const system = createFakeSystem()
+    system.state.procs = ['server']
+    system.state.respawnAfterKill = 1
+
+    // #when stopped
+    const outcome = await stopSandboxProcesses({uid: 998}, TOOLS, system.deps, {boundMs: 5000})
+
+    // #then the second pass removes the replacement
+    expect(outcome).toBe('stopped')
+    expect(system.calls.filter(call => call[0] === TOOLS.pkill)).toHaveLength(2)
+  })
+
+  it('treats a pgrep error as no proof of absence', async () => {
+    // #given a pgrep that cannot run
+    const system = createFakeSystem()
+    const failing: SandboxIdentityDeps = {
+      ...system.deps,
+      run: async argv => (argv[0] === TOOLS.pgrep ? {exitCode: 2, stdout: ''} : {exitCode: 1, stdout: ''}),
+    }
+
+    // #when stopped
+    const outcome = await stopSandboxProcesses({uid: 998}, TOOLS, failing, {boundMs: 300, pollMs: 100})
+
+    // #then an error is not mistaken for an empty process table
+    expect(outcome).toBe('unconfirmed')
+  })
+})
+
+describe('deleteSandboxAccount', () => {
+  it('deletes the account with its home', async () => {
+    const system = createFakeSystem()
+    const created = await createSandboxAccount(TOOLS, system.deps)
+    if (!created.success) throw new Error('unreachable')
+
+    // #when deleted
+    const outcome = await deleteSandboxAccount(created.data, TOOLS, system.deps)
+
+    // #then the account and its home are removed
+    expect(outcome).toBe('deleted')
+    expect(system.calls.at(-1)).toEqual([TOOLS.userdel, '--remove', 'fro-bot-sandbox'])
+  })
+})
+
+describe('privilege drop arguments', () => {
+  it('pins the exact flags', () => {
+    expect(buildSetprivDropArgs({uid: 5, gid: 6})).toEqual([
+      '--reuid=5',
+      '--regid=6',
+      '--clear-groups',
+      '--no-new-privs',
+      '--inh-caps=-all',
+      '--bounding-set=-all',
+      '--ambient-caps=-all',
+    ])
+    expect(buildRunAsSandboxArgv({uid: 5, gid: 6}, TOOLS, ['/usr/bin/id'])).toEqual([
+      '/usr/bin/setpriv',
+      ...buildSetprivDropArgs({uid: 5, gid: 6}),
+      '--',
+      '/usr/bin/id',
+    ])
+  })
+})

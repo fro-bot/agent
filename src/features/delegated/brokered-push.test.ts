@@ -90,6 +90,7 @@ async function run(
     readonly signal?: AbortSignal
     readonly trustedHeadSha?: string
     readonly extraPathPrefixes?: readonly string[]
+    readonly isolated?: boolean
   } = {},
 ) {
   return runBrokeredPush({
@@ -109,6 +110,7 @@ async function run(
     expectedHeadBranch: BRANCH,
     repoRoot: '/workspace',
     extraPathPrefixes: options.extraPathPrefixes ?? [],
+    ...(options.isolated === undefined ? {} : {isolated: options.isolated}),
     signal: options.signal,
   })
 }
@@ -272,6 +274,42 @@ describe('runBrokeredPush', () => {
     expect(outcome).toEqual({kind: 'bypass'})
     expect(mocks.checkPermission).not.toHaveBeenCalled()
     expect(mocks.reconstructChanges).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    [true, {isolated: true}],
+    [undefined, {isolated: false}],
+  ])('hands reconstruction the isolation flag (isolated=%s)', async (isolated, expected) => {
+    // #given all gates pass
+    mocks.evaluateEarlyGate.mockReturnValue(eligibleGateOutcome())
+    mocks.checkPermission.mockResolvedValue({decision: 'allowed', permission: 'write'})
+    mocks.reconstructChanges.mockResolvedValue({success: true, data: {kind: 'nothing-to-deliver'}})
+
+    // #when run with or without isolation
+    await run({...(isolated === undefined ? {} : {isolated})})
+
+    // #then reconstruction was told, and an unisolated run keeps the original behavior
+    expect(mocks.reconstructChanges).toHaveBeenCalledWith(
+      expect.anything(),
+      TRUSTED_HEAD_SHA,
+      '/workspace',
+      expect.anything(),
+      expected,
+    )
+  })
+
+  it('surfaces a populated-submodule decline loudly as a reconstruction failure', async () => {
+    // #given reconstruction declining under isolation
+    mocks.evaluateEarlyGate.mockReturnValue(eligibleGateOutcome())
+    mocks.checkPermission.mockResolvedValue({decision: 'allowed', permission: 'write'})
+    mocks.reconstructChanges.mockResolvedValue({success: false, error: new Error('submodule vendor/lib is populated')})
+
+    // #when
+    const outcome = await run({isolated: true})
+
+    // #then it is a named fail-loud, not a silent bypass
+    expect(outcome).toMatchObject({kind: 'fail-loud', failureClass: 'reconstruction'})
+    expect(outcome.kind === 'fail-loud' && outcome.reason).toContain('vendor/lib')
   })
 
   it('returns nothing-to-deliver for an empty net diff without writing', async () => {

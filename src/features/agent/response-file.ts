@@ -1,7 +1,6 @@
 import type {AgentContext, ResponseSurface, TriggerContext} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
-import * as fs from 'node:fs/promises'
-import {parseResponseFile} from '@fro-bot/runtime'
+import {parseResponseFile, readTextNoFollow} from '@fro-bot/runtime'
 import {toErrorMessage} from '../../shared/errors.js'
 import {isAuthorizedAssociation} from '../triggers/author-utils.js'
 import {ALLOWED_ASSOCIATIONS} from '../triggers/types.js'
@@ -52,7 +51,7 @@ export async function inspectResponseFile(
 
   let raw: string
   try {
-    raw = await fs.readFile(responseFilePath, 'utf8')
+    raw = await readTextNoFollow(responseFilePath)
   } catch (error) {
     if (isMissingFileError(error)) return 'absent'
     logger.warning('Response-file status is unknown; declining recovery', {
