@@ -8,6 +8,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import {err, ok} from '@bfra.me/es/result'
 import {afterEach, beforeEach, describe, expect, it, vi, type Mock} from 'vitest'
+import {isSignalOwned} from '../../services/setup/adapters.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {createPrivilegedRun, createSandboxLifecycle, DEFAULT_PRIVILEGED_TIMEOUT_MS} from './sandbox-lifecycle.js'
 
@@ -97,16 +98,25 @@ function deferred<T>(): {readonly promise: Promise<T>; readonly resolve: (value:
 
 describe('createSandboxLifecycle', () => {
   let temp: string
+  // Every lifecycle holds process-wide signal ownership until it is released; a test that never releases its own must not
+  // leak the hold into the next one.
+  const created: {readonly release: () => Promise<unknown>}[] = []
 
   beforeEach(() => {
     temp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'sandbox-lifecycle-')))
   })
-  afterEach(() => {
+  afterEach(async () => {
+    // (bounded: a test about a teardown that never finishes leaves a release that never resolves)
+    await Promise.allSettled(
+      created
+        .splice(0)
+        .map(async lifecycle => Promise.race([lifecycle.release(), new Promise(resolve => setTimeout(resolve, 50))])),
+    )
     fs.rmSync(temp, {recursive: true, force: true})
   })
 
   function create(harness: Harness, overrides: Partial<Parameters<typeof createSandboxLifecycle>[0]> = {}) {
-    return createSandboxLifecycle({
+    const lifecycle = createSandboxLifecycle({
       tools: TOOLS,
       env: {HOME: '/home/runner', RUNNER_TEMP: temp, XDG_DATA_HOME: '/custom/data'},
       runnerHome: '/home/runner',
@@ -118,6 +128,8 @@ describe('createSandboxLifecycle', () => {
       deps: harness.deps,
       ...overrides,
     })
+    created.push(lifecycle)
+    return lifecycle
   }
 
   it('builds the manifest from the runner-resolved paths and returns the launch spec', async () => {
@@ -500,6 +512,68 @@ describe('createSandboxLifecycle', () => {
       expect(outcome.restore).toBe('unsafe')
       expect(harness.mocks.takeBack).not.toHaveBeenCalled()
       expect(harness.mocks.deleteAccount).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('signal ownership', () => {
+    const prepareInput = {keyFilePaths: [], ghConfigDir: null, repoSkills: null}
+
+    it('owns signal handling from prepare until release, and gives it back afterwards', async () => {
+      // #given a lifecycle that has not been prepared
+      const harness = createHarness()
+      const lifecycle = create(harness, {signals: fakeHost()})
+      expect(isSignalOwned()).toBe(false)
+
+      // #when prepared
+      await lifecycle.prepare(prepareInput)
+
+      // #then the exec adapter defers to it
+      expect(isSignalOwned()).toBe(true)
+
+      // #when released
+      await lifecycle.release()
+
+      // #then the adapter is back in charge (a leaked hold would make every later command ignore signals)
+      expect(isSignalOwned()).toBe(false)
+    })
+
+    it('gives ownership back when a signal has run the teardown, before the signal is re-raised', async () => {
+      // #given a prepared lifecycle and a host that records when the signal is re-raised
+      const harness = createHarness()
+      const host = fakeHost()
+      const owned: boolean[] = []
+      const raising = {
+        ...host,
+        kill: (pid: number, signal: 'SIGINT' | 'SIGTERM') => {
+          owned.push(isSignalOwned())
+          host.kill(pid, signal)
+        },
+      }
+      const lifecycle = create(harness, {signals: raising})
+      await lifecycle.prepare(prepareInput)
+
+      // #when SIGTERM arrives
+      host.emitter.emit('SIGTERM')
+      await vi.waitFor(() => {
+        expect(host.killed).toEqual(['4242:SIGTERM'])
+      })
+
+      // #then at the moment of the re-raise the adapter had its say back
+      expect(owned).toEqual([false])
+    })
+
+    it('does not own signal handling when preparation fails before any handler is needed', async () => {
+      // #given a lifecycle whose account creation fails
+      const harness = createHarness()
+      harness.mocks.createAccount.mockResolvedValue(err({kind: 'create-failed', message: 'nope'}))
+      const lifecycle = create(harness, {signals: fakeHost()})
+
+      // #when
+      await lifecycle.prepare(prepareInput)
+      await lifecycle.release()
+
+      // #then nothing is left held
+      expect(isSignalOwned()).toBe(false)
     })
   })
 

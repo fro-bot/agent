@@ -28,7 +28,7 @@ import {
   deleteSandboxAccount,
   stopSandboxProcesses,
 } from '@fro-bot/runtime'
-import {createExecAdapter} from '../../services/setup/adapters.js'
+import {createExecAdapter, holdSignalOwnership} from '../../services/setup/adapters.js'
 import {handOff, takeBack} from '../../services/setup/sandbox-handoff.js'
 import {toErrorMessage} from '../../shared/errors.js'
 
@@ -272,7 +272,13 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   const signalHost: SignalHost = options.signals ?? process
   const installedSignalListeners: ['SIGINT' | 'SIGTERM', () => void][] = []
   let signalled = false
+  // Held from the first handler until the last is removed: while the sandbox is live this lifecycle decides what a signal
+  // does. The exec adapter would otherwise SIGKILL the teardown's own commands on a second signal, and re-raise before the
+  // teardown had finished.
+  let releaseSignalOwnership: (() => void) | null = null
   const removeSignalHandlers = (): void => {
+    releaseSignalOwnership?.()
+    releaseSignalOwnership = null
     for (const [signal, listener] of installedSignalListeners.splice(0)) signalHost.off(signal, listener)
   }
   // Bound once `release` is defined below; the handlers only run after `prepare`, so it is always set by then.
@@ -300,6 +306,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   }
   const installSignalHandlers = (): void => {
     if (installedSignalListeners.length > 0) return
+    releaseSignalOwnership = holdSignalOwnership()
     for (const signal of ['SIGINT', 'SIGTERM'] as const) {
       const listener = (): void => {
         onSignal(signal).catch(() => undefined)

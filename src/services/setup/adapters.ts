@@ -20,6 +20,31 @@ function forwardOutput(listener: ((data: Buffer) => void) | undefined, data: unk
 }
 
 /**
+ * Who owns signal handling. By default the exec adapter does: on SIGTERM/SIGINT it kills the running child's process group and
+ * re-raises the signal. A component that has its own teardown to run (the isolate-agent lifecycle) takes ownership for as long
+ * as it needs, and the adapter then does nothing on a signal: it neither kills the commands that teardown is running (a
+ * second signal, as the runner escalates a cancelled step, would otherwise SIGKILL a `chown -R` midway) nor re-raises the
+ * signal before the owner has finished. The owner ends the process itself.
+ */
+let signalOwners = 0
+
+/** True while some component owns signal handling. */
+export function isSignalOwned(): boolean {
+  return signalOwners > 0
+}
+
+/** Takes signal ownership until the returned function is called (idempotent). Holders are counted. */
+export function holdSignalOwnership(): () => void {
+  signalOwners += 1
+  let held = true
+  return () => {
+    if (!held) return
+    held = false
+    signalOwners -= 1
+  }
+}
+
+/**
  * True once the child has already exited, even if the `close` event hasn't fired yet.
  *
  * `exitCode`/`signalCode` flip synchronously on the child's own `exit` event, which can happen
@@ -112,6 +137,9 @@ async function execWithTimeout(
       process.off('exit', handleParentExit)
     }
     function handleParentSignal(signal: NodeJS.Signals): void {
+      // Someone else is tearing down; this command is part of that, so it keeps running. The listener stays registered
+      // (it is `on`, not `once`) and is removed when the command finishes.
+      if (signalOwners > 0) return
       killChildProcessGroup(child, 'SIGKILL')
       removeParentSignalListeners()
       process.kill(process.pid, signal)
@@ -122,8 +150,8 @@ async function execWithTimeout(
     function handleParentSigint(): void {
       handleParentSignal('SIGINT')
     }
-    process.once('SIGTERM', handleParentSigterm)
-    process.once('SIGINT', handleParentSigint)
+    process.on('SIGTERM', handleParentSigterm)
+    process.on('SIGINT', handleParentSigint)
     process.on('exit', handleParentExit)
 
     const finish = (result: number | 'timed-out'): void => {
