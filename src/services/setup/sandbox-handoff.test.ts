@@ -265,6 +265,39 @@ describe('sandbox handoff', () => {
       expect(result.success ? 'ok' : result.error).toBe('ok')
     })
 
+    it('positive control: the config.worktree a real actions/checkout v7 leaves behind (sparse-checkout disabled) is accepted', async () => {
+      // #given checkout v7 sets extensions.worktreeConfig, runs `git sparse-checkout disable`, then unsets the extension. That
+      // leaves a real config.worktree (git ignores it from then on, the audit still reads it) beside the lfs local config
+      writeConfig(
+        [
+          '[core]',
+          '\trepositoryformatversion = 0',
+          '\tfilemode = true',
+          '\tbare = false',
+          '\tlogallrefupdates = true',
+          '[remote "origin"]',
+          '\turl = https://github.com/fro-bot/.github',
+          '\tfetch = +refs/heads/*:refs/remotes/origin/*',
+          '[branch "probe/isolate-agent-live"]',
+          '\tremote = origin',
+          '\tmerge = refs/heads/probe/isolate-agent-live',
+          '[gc]',
+          '\tauto = 0',
+          '[lfs]',
+          '\trepositoryformatversion = 0',
+          '',
+        ].join('\n'),
+      )
+      fs.writeFileSync(
+        gitPath('config.worktree'),
+        '[core]\n\tsparseCheckout = false\n\tsparseCheckoutCone = false\n[index]\n\tsparse = false\n',
+      )
+
+      // #when / #then it is trusted as is
+      const result = await handOff(fx.manifest, fx.deps)
+      expect(result.success ? 'ok' : result.error).toBe('ok')
+    })
+
     it('positive control: the same config in config.worktree is accepted too', async () => {
       // #given
       fs.writeFileSync(gitPath('config.worktree'), '[core]\n\tfilemode = true\n')
