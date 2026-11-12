@@ -108,6 +108,11 @@ function initWorkspace(workspace: string): string {
   // The hosted image has git-lfs installed system-wide, so a real actions/checkout writes this format integer into the local
   // config. Set directly so the suite mirrors that checkout whether or not git-lfs is installed where it runs.
   git(workspace, 'config', '--local', 'lfs.repositoryformatversion', '0')
+  // actions/checkout v7 does the same with sparse checkout: enable the worktree config, disable sparse checkout, unset the
+  // extension. That leaves a real .git/config.worktree (core.sparseCheckout etc.) that git ignores but the audit reads.
+  git(workspace, 'config', '--local', 'extensions.worktreeConfig', 'true')
+  git(workspace, 'sparse-checkout', 'disable')
+  git(workspace, 'config', '--local', '--unset-all', 'extensions.worktreeConfig')
   fs.writeFileSync(path.join(workspace, 'README.md'), '# fixture\n')
   git(workspace, 'add', '.')
   // The identity is passed for this commit only: handoff trusts just the keys a hosted checkout writes, and a checkout's
