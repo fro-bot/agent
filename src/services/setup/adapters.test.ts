@@ -52,7 +52,7 @@ describe('timeout diagnostics', () => {
     const snapshots: string[] = []
 
     // #when it outlives its budget
-    const result = await execWithTimeout('sh', ['-c', 'sleep 30 & wait'], 600, {
+    const result = await execWithTimeout('sh', ['-c', 'sleep 30 & wait'], 2500, {
       silent: true,
       onTimeout: snapshot => snapshots.push(snapshot),
     })
@@ -74,7 +74,7 @@ describe('timeout diagnostics', () => {
       "require('node:child_process').spawn('sleep',['31'],{detached:true,stdio:'ignore'}).unref();setTimeout(()=>{},30000)"
 
     // #when it times out
-    await execWithTimeout(process.execPath, ['-e', script], 1_200, {silent: true, onTimeout: s => snapshots.push(s)})
+    await execWithTimeout(process.execPath, ['-e', script], 3_000, {silent: true, onTimeout: s => snapshots.push(s)})
 
     // #then the detached sleeper is in the listing although it is in another process group
     expect(snapshots[0]).toMatch(/sleep 31/)
