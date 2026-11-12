@@ -394,11 +394,17 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     if (manifest !== null && journal !== null) restore = await deps.takeBack(manifest, journal, handoffDeps())
     if (restore.status === 'unsafe') logger.error('Sandbox take-back was unsafe', {reason: restore.reason})
     const timedOutDuringTakeBack = timedOut()
-    if (timedOutDuringTakeBack !== null && restore.status === 'restored') {
+    if (timedOutDuringTakeBack !== null) {
+      // Whatever take-back concluded: a command it ran was killed and is not known to have stopped, and it may still be
+      // changing the files or the account. Keep the account. Its own reason (a timeout it named, say) is the one worth
+      // reporting; ours covers a take-back that did not notice.
       return {
         stop,
         restore: 'unsafe',
-        reason: `${timedOutDuringTakeBack} during the take-back; a killed command is not known to have stopped, so the account is kept`,
+        reason:
+          restore.status === 'unsafe'
+            ? restore.reason
+            : `${timedOutDuringTakeBack} during the take-back; a killed command is not known to have stopped, so the account is kept`,
       }
     }
     // The stop is confirmed, so nothing runs as this uid any more: the account goes whether or not the files came back.

@@ -714,6 +714,49 @@ describe('createSandboxLifecycle', () => {
       expect(states).not.toContain('restored')
     })
 
+    it('production-shaped: a take-back that times out and returns unsafe never reaches userdel, and keeps its own reason', async () => {
+      // #given a take-back like the real one: its privileged command hangs, and it reports `unsafe` with the timeout as the reason
+      const harness = createHarness()
+      const states: string[] = []
+      const seen: string[] = []
+      harness.mocks.takeBack.mockImplementation(async (_manifest, _journal, handoffDeps) => {
+        await handoffDeps.run(['/usr/bin/chown', '-hang'])
+        return {status: 'unsafe' as const, reason: 'taking the checkout back timed out after 120000ms'}
+      })
+      const lifecycle = create(harness, {
+        exec: hangingExec('-hang', seen),
+        signals: fakeHost(),
+        recordState: state => states.push(state),
+      })
+      await lifecycle.prepare(prepareInput)
+
+      // #when released
+      const released = await lifecycle.release()
+
+      // #then the account was neither deleted nor touched by any userdel, the state is unsafe, and the take-back's reason survived
+      expect(harness.mocks.deleteAccount).not.toHaveBeenCalled()
+      expect(seen.some(line => line.includes('userdel'))).toBe(false)
+      expect(released.restore).toBe('unsafe')
+      expect(released.reason).toBe('taking the checkout back timed out after 120000ms')
+      expect(states).not.toContain('restored')
+      expect(states.at(-1)).toBe('unsafe')
+    })
+
+    it('production-shaped: a take-back that returns unsafe WITHOUT any timeout still deletes the account (the stop was confirmed)', async () => {
+      // #given an unsafe take-back for an ordinary reason
+      const harness = createHarness()
+      harness.mocks.takeBack.mockResolvedValue({status: 'unsafe' as const, reason: '.git/commondir exists'})
+      const lifecycle = create(harness, {signals: fakeHost()})
+      await lifecycle.prepare(prepareInput)
+
+      // #when
+      const released = await lifecycle.release()
+
+      // #then the old behaviour holds: nothing runs as that uid any more, so the account goes
+      expect(harness.mocks.deleteAccount).toHaveBeenCalledTimes(1)
+      expect(released).toEqual({stop: 'stopped', restore: 'unsafe', reason: '.git/commondir exists'})
+    })
+
     it('ends unsafe when userdel times out, rather than reporting restored with the account possibly still there', async () => {
       // #given an account deletion whose command hung
       const harness = createHarness()
