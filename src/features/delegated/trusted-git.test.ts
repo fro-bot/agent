@@ -64,6 +64,19 @@ function writeHostileConfig(repo: string, extra: string): void {
   fs.writeFileSync(config, `${existing}${extra}`)
 }
 
+/**
+ * `.git/commondir` makes git read its config, objects and refs from another directory. A model can copy `.git` to a
+ * second place inside the checkout, put a clean filter in THAT config, and point `commondir` at it: restoring
+ * `.git/config` then restores nothing git reads. The filter is selected by a tracked `.gitattributes`.
+ */
+function plantCommondir(repo: Repo, name: string): void {
+  const evil = path.join(repo.repo, 'evil-common')
+  fs.cpSync(path.join(repo.repo, '.git'), evil, {recursive: true})
+  fs.appendFileSync(path.join(evil, 'config'), `[filter "x"]\n\tclean = ${repo.payload(name)}\n`)
+  fs.writeFileSync(path.join(repo.repo, '.gitattributes'), '* filter=x\n')
+  fs.writeFileSync(path.join(repo.repo, '.git', 'commondir'), '../evil-common\n')
+}
+
 /** Dirty the worktree so a diff has to hash content (clean filters) and refresh the index (fsmonitor, index hooks). */
 function dirtyWorktree(repo: string): void {
   fs.writeFileSync(path.join(repo, 'tracked.txt'), 'changed by the model\n')
@@ -193,6 +206,69 @@ describe('post-model git against a hostile checkout', () => {
       fs.appendFileSync(path.join(sub, 'g'), 'dirty\n')
       git(repo.repo, 'diff', '--ignore-submodules=none', '--raw', repo.anchor)
       expect(repo.ran('submodule')).toBe(true)
+    })
+  })
+
+  describe('commondir redirect', () => {
+    it('positive control: plain git with a planted commondir runs the clean filter as the runner', () => {
+      // #given a checkout whose .git/commondir points at a copy carrying a clean filter
+      plantCommondir(repo, 'commondir')
+      dirtyWorktree(repo.repo)
+
+      // #when plain git diffs the worktree against the anchor (which hashes content through the clean filter)
+      git(repo.repo, 'diff', '--raw', repo.anchor)
+
+      // #then the payload ran: the fixture is real
+      expect(repo.ran('commondir')).toBe(true)
+    })
+
+    it('positive control: the hardened wrapper alone does not stop it, because the config git reads is not .git/config', async () => {
+      // #given the redirect, with .git/config itself untouched (so restoring it would change nothing)
+      plantCommondir(repo, 'wrapper')
+      dirtyWorktree(repo.repo)
+
+      // #when the Action's own post-model git calls run against it
+      await runPostModelGit(repo)
+
+      // #then the filter ran as the runner: only refusing the redirect protects the runner-side git
+      expect(repo.ran('wrapper')).toBe(true)
+    })
+
+    it('take-back is unsafe, so the runner-side git calls never run against it', async () => {
+      // #given a handoff, then a model that plants the commondir redirect and dirties the tree
+      const manifest = manifestFor(repo)
+      const deps = {
+        run: fakeRun,
+        tools: {setfacl: '/s', getfacl: '/g', find: '/f', chown: '/c', chmod: '/m'},
+        logger: createMockLogger(),
+      }
+      const handed = await handOff(manifest, deps)
+      if (!handed.success) throw new Error(handed.error)
+      plantCommondir(repo, 'guarded')
+      dirtyWorktree(repo.repo)
+
+      // #when taken back
+      const outcome = await takeBack(manifest, handed.data, deps)
+
+      // #then it is unsafe by name; the caller declines to reconstruct or build a commit message, and nothing ran
+      expect(outcome.status === 'unsafe' && outcome.reason).toContain('commondir')
+      expect(repo.ran('guarded')).toBe(false)
+      expect(fs.existsSync(path.join(repo.repo, '.git', 'commondir'))).toBe(true)
+    })
+
+    it('handoff refuses a checkout that already has a commondir', async () => {
+      // #given a checkout redirected before the sandbox ever starts
+      plantCommondir(repo, 'preexisting')
+
+      // #when handed off
+      const handed = await handOff(manifestFor(repo), {
+        run: fakeRun,
+        tools: {setfacl: '/s', getfacl: '/g', find: '/f', chown: '/c', chmod: '/m'},
+        logger: createMockLogger(),
+      })
+
+      // #then
+      expect(!handed.success && handed.error).toContain('commondir')
     })
   })
 

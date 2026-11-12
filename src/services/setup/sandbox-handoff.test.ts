@@ -230,6 +230,31 @@ describe('sandbox handoff', () => {
     expect(argv.some(l => l.startsWith(`${TOOLS.chmod} `) && !l.includes('0700'))).toBe(true)
   })
 
+  it('refuses a .git/commondir that already exists at handoff, changing nothing', async () => {
+    // #given a checkout whose .git already redirects its config and objects elsewhere
+    fs.writeFileSync(path.join(fx.manifest.workspace, '.git', 'commondir'), '../elsewhere\n')
+
+    // #when handed off
+    const result = await handOff(fx.manifest, fx.deps)
+
+    // #then it is refused by name before any privileged command ran
+    expect(!result.success && result.error).toContain('commondir')
+    expect(mutating(fx.calls)).toEqual([])
+  })
+
+  it('refuses a gitfile .git at handoff', async () => {
+    // #given .git replaced by a gitfile
+    const gitDir = path.join(fx.manifest.workspace, '.git')
+    fs.rmSync(gitDir, {recursive: true})
+    fs.writeFileSync(gitDir, 'gitdir: /somewhere/else\n')
+
+    // #when handed off
+    const result = await handOff(fx.manifest, fx.deps)
+
+    // #then
+    expect(!result.success && result.error).toContain('.git')
+  })
+
   it('refuses a .git that is a gitfile or symlink at handoff', async () => {
     // #given .git replaced by a symlink
     const gitDir = path.join(fx.manifest.workspace, '.git')
@@ -544,6 +569,60 @@ describe('sandbox take-back', () => {
     expect(outcome.status).toBe('restored')
     expect(fs.lstatSync(path.join(gitDir, 'hooks')).isDirectory()).toBe(true)
     expect(fs.readFileSync(path.join(target, 'keep'), 'utf8')).toBe('keep')
+  })
+
+  it('is unsafe, and deletes nothing, when the model planted .git/commondir', async () => {
+    // #given a handoff over a clean .git, then a commondir written by the sandbox
+    const handed = await handedOff()
+    const commondir = path.join(fx.manifest.workspace, '.git', 'commondir')
+    fs.writeFileSync(commondir, '../evil\n')
+    fx.calls.length = 0
+
+    // #when taken back
+    const outcome = await takeBack(fx.manifest, handed.data, fx.deps)
+
+    // #then it is unsafe by name, nothing was moved, and the evidence was left in place (refuse, don't repair)
+    expect(outcome.status === 'unsafe' && outcome.reason).toContain('commondir')
+    expect(mutating(fx.calls)).toEqual([])
+    expect(fs.readFileSync(commondir, 'utf8')).toBe('../evil\n')
+  })
+
+  it.skipIf(process.getuid?.() === 0)(
+    'treats an unreadable .git as a possible commondir: unsafe, never assumed clean',
+    async () => {
+      // #given a .git the sandbox made untraversable, so "does commondir exist" cannot be answered
+      const handed = await handedOff()
+      const gitDir = path.join(fx.manifest.workspace, '.git')
+      fs.chmodSync(gitDir, 0o000)
+      fx.calls.length = 0
+
+      try {
+        // #when taken back
+        const outcome = await takeBack(fx.manifest, handed.data, fx.deps)
+
+        // #then a lookup that is not a clean "absent" is refused
+        expect(outcome.status).toBe('unsafe')
+        expect(mutating(fx.calls)).toEqual([])
+      } finally {
+        fs.chmodSync(gitDir, 0o755)
+      }
+    },
+  )
+
+  it('is unsafe when the model replaced .git with a gitfile', async () => {
+    // #given a handoff, then .git swapped for a gitfile
+    const handed = await handedOff()
+    const gitDir = path.join(fx.manifest.workspace, '.git')
+    fs.rmSync(gitDir, {recursive: true})
+    fs.writeFileSync(gitDir, 'gitdir: /somewhere/else\n')
+    fx.calls.length = 0
+
+    // #when taken back
+    const outcome = await takeBack(fx.manifest, handed.data, fx.deps)
+
+    // #then
+    expect(outcome.status).toBe('unsafe')
+    expect(mutating(fx.calls)).toEqual([])
   })
 
   it('is unsafe when .git was created during a run that started without one', async () => {

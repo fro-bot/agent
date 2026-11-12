@@ -466,6 +466,8 @@ async function snapshotGit(manifest: HandoffManifest, journal: HandoffJournal): 
       'the checkout .git is not a plain directory (a symlink or a gitfile); it cannot be snapshotted',
     )
   }
+  const redirect = await commondirProblem(gitDir)
+  if (redirect !== null) throw new HandoffError(redirect)
   journal.gitPresent = true
   const present: Record<string, boolean> = {}
   for (const item of GIT_METADATA) {
@@ -635,6 +637,20 @@ async function revertLocks(journal: HandoffJournal, deps: HandoffDeps): Promise<
 }
 
 /**
+ * `.git/commondir` redirects git's config, objects and refs to another directory, so restoring `.git/config` restores
+ * nothing git reads. It is never created by a normal checkout, so any `commondir` is refused (not deleted: the evidence
+ * stays). Anything but a clean "no such file" counts as present.
+ */
+async function commondirProblem(gitDir: string): Promise<string | null> {
+  try {
+    await fs.lstat(path.join(gitDir, 'commondir'))
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+  }
+  return '.git/commondir exists: git would read its config and objects from another directory, so the checkout is refused'
+}
+
+/**
  * `.git` must be the same kind of thing it was at handoff: a plain directory (not a symlink, not a gitfile), and absent
  * only if it was absent. `before` runs ahead of the chown (the sandbox may still own it); `after` requires the runner.
  */
@@ -651,6 +667,8 @@ async function checkGitDir(
     return journal.gitPresent ? '.git disappeared during the run' : null
   }
   if (stats.isSymbolicLink() || !stats.isDirectory()) return '.git is no longer a plain directory'
+  const redirect = await commondirProblem(gitDir)
+  if (redirect !== null) return redirect
   if (!journal.gitPresent) return '.git was created during the run'
   if (when === 'after' && stats.uid !== manifest.ids.runnerUid) return '.git is not owned by the runner after take-back'
   return null
