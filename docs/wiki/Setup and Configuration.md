@@ -240,6 +240,8 @@ Only a published install is supported: `fro-bot/agent@<ref>`, which GitHub downl
 
 Writable checkout content stays untrusted for later steps of the same workflow job: anything the agent wrote there (scripts, a `.github` directory, hooks) can still be run by a step that trusts it. Take-back makes the files the runner's own; it does not make them safe to execute. Provisioned credentials (the `gh` config in provision mode) and the provider key stay readable by the model.
 
+Setup time: on a cold hosted runner the first `useradd` can sit in uninterruptible disk wait for a long time (99 s was measured; later calls take about a second), so an isolated run can spend up to about 2 minutes on account setup. The account-creation step is allowed 180 s, logs at info when it takes more than 10 s, and, if it does time out, leaves the account in place and ends the run `unsafe` instead of removing it.
+
 Requirements: a GitHub-hosted Linux runner, not running as root or in a container job, passwordless `sudo`, `setpriv`/`setfacl`/`useradd`/`userdel`/`pkill`/`pgrep`/`find` present, and `fs.protected_hardlinks`/`fs.protected_symlinks` on. Any miss fails the run before setup with the failed check named. Self-hosted runners are unsupported even if they report a hosted environment, and so are two isolated steps in one job at the same time.
 
 Blocked from the agent's shell: the Action's `/proc/<pid>/environ` and its ancestors' (which hold `INPUT_GITHUB-TOKEN`), `$GITHUB_ENV` and `$GITHUB_OUTPUT`, private directories under `RUNNER_TEMP`, the runner's home (default-deny, with only the granted paths opened), `sudo` and the Docker socket.
