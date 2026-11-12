@@ -405,6 +405,27 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
       const result = spawnSync('setfacl', args, {encoding: 'utf8'})
       if (result.status !== 0) throw new Error(`setfacl ${args.join(' ')}: ${result.stderr}`)
     }
+    // Runner grants that existed before the run: a named entry on a ROOT-owned file (which take-back never chowns), and a
+    // named DEFAULT entry on an existing runner-owned directory. Neither may be touched. The runner is the file owner on
+    // the second, so its default entry is the thing a handoff that wrote `default:user:<runner>` would have overwritten.
+    const me = os.userInfo().username
+    fs.writeFileSync(path.join(workspace, 'pre-acl-root'), 'root owned, runner granted\n')
+    fs.mkdirSync(path.join(workspace, 'pre-acl-runner-default'))
+    for (const args of [
+      ['chown', 'root', path.join(workspace, 'pre-acl-root')],
+      ['setfacl', '-m', `u:${me}:r--`, path.join(workspace, 'pre-acl-root')],
+    ]) {
+      const result = spawnSync('sudo', ['-n', ...args], {encoding: 'utf8'})
+      if (result.status !== 0) throw new Error(`sudo ${args.join(' ')}: ${result.stderr}`)
+    }
+    const defaultResult = spawnSync(
+      'setfacl',
+      ['-d', '-m', `u:${me}:r-x`, path.join(workspace, 'pre-acl-runner-default')],
+      {
+        encoding: 'utf8',
+      },
+    )
+    if (defaultResult.status !== 0) throw new Error(`setfacl -d: ${defaultResult.stderr}`)
 
     // The provider starts first: a probe command embeds its port, and the steps are read lazily.
     provider = await startScriptedProvider(probes)
@@ -516,9 +537,12 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
     expect(owned(path.join(workspace, 'm-0700'))).toBe(runnerUid)
     expect(fs.readFileSync(path.join(workspace, 'm-0700', 'inner', 'f'), 'utf8').trim()).toBe('x')
     // #and nothing under the roots still belongs to the sandbox
-    const leftover = spawnSync('find', [workspace, responseDir, '-xdev', '!', '-user', String(runnerUid)], {
-      encoding: 'utf8',
-    })
+    // (the root-owned file the setup made on purpose is not the sandbox's)
+    const leftover = spawnSync(
+      'find',
+      [workspace, responseDir, '-xdev', '!', '-user', String(runnerUid), '!', '-name', 'pre-acl-root'],
+      {encoding: 'utf8'},
+    )
     expect(leftover.stdout.trim()).toBe('')
     // #and the symlink is still a symlink, and the sentinel it pointed at was never touched
     expect(fs.lstatSync(path.join(workspace, 'm-link')).isSymbolicLink()).toBe(true)
@@ -544,10 +568,31 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
     expect(read(path.join(workspace, 'pre-acl'))).toContain('user:nobody:r-x')
     expect(read(path.join(workspace, 'pre-acl-dir'))).toContain('user:nobody:r-x')
     expect(read(path.join(workspace, 'pre-acl-dir'))).toContain('default:user:nobody:r-x')
-    // #and nothing of this run is left: no entry for the (deleted, so numeric) sandbox uid, none for the runner
+    // #and nothing of this run is left: no entry for the (deleted, so numeric) sandbox uid, anywhere
     const tree = spawnSync('getfacl', ['-R', '-p', workspace, responseDir], {encoding: 'utf8'}).stdout
     expect(tree).not.toMatch(/^(default:)?user:\d+:/m)
-    expect(tree).not.toMatch(new RegExp(`^(default:)?user:${os.userInfo().username}:`, 'm'))
+    // #and the runner has no entry in the handed-over directory beyond the ones it had before (none)
+    const me = os.userInfo().username
+    const handed = spawnSync('getfacl', ['-R', '-p', responseDir], {encoding: 'utf8'}).stdout
+    expect(handed).not.toMatch(new RegExp(`^(default:)?user:${me}:`, 'm'))
+  })
+
+  it('leaves the runner grants that existed before the run alone, and gives model-created checkout files none of their own', () => {
+    // #given a runner entry on a root-owned file and a runner default entry on a runner-owned directory, both from before
+    const me = os.userInfo().username
+    const read = (target: string): string => spawnSync('getfacl', ['-p', target], {encoding: 'utf8'}).stdout
+    // #then both survived take-back exactly (the mask-preserving removal touched neither)
+    expect(read(path.join(workspace, 'pre-acl-root'))).toContain(`user:${me}:r--`)
+    expect(read(path.join(workspace, 'pre-acl-runner-default'))).toContain(`default:user:${me}:r-x`)
+    // #and the only checkout paths that name the runner are those two: nothing this run created inherited an entry
+    const tree = spawnSync('getfacl', ['-R', '-p', workspace], {encoding: 'utf8'}).stdout
+    const named = tree
+      .split('\n\n')
+      .filter(block => new RegExp(`^(default:)?user:${me}:`, 'm').test(block))
+      .map(block => /# file: (.*)/.exec(block)?.[1] ?? '')
+      .map(file => path.relative(workspace, file))
+      .toSorted()
+    expect(named).toEqual(['pre-acl-root', 'pre-acl-runner-default'])
   })
 
   it('leaves the files the model created non-executable: take-back must not widen the ACL mask', () => {

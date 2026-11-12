@@ -359,13 +359,12 @@ export async function handOff(
       await must(run, [tools.setfacl, '-P', '-m', `u:${sandboxUid}:---`, target], `deny entry on ${target}`)
     }
 
-    // 3. Checkout: ACL for the sandbox, default entries for both users so new files stay reachable for the runner.
-    // The default entries name the runner too, so a file the sandbox creates inherits `user:<runner>` as an access entry.
-    journal.aclTrees.push({
-      path: manifest.workspace,
-      accessUids: [sandboxUid, runnerUid],
-      defaultUids: [sandboxUid, runnerUid],
-    })
+    // 3. Checkout: an ACL and a default entry for the sandbox, and nothing for the runner. The runner owns the checkout and
+    // reads or writes nothing inside it while the sandbox is live (every runner-side read happens after take-back, as root's
+    // chown has returned the inodes to the runner). A default entry naming the runner would be inherited by every file the
+    // sandbox creates as an access entry that is wider than the file's mask, and removing it at take-back would also delete
+    // a runner grant that existed before the run on a file this run never touched.
+    journal.aclTrees.push({path: manifest.workspace, accessUids: [sandboxUid], defaultUids: [sandboxUid]})
     await must(run, [tools.setfacl, '-R', '-P', '-m', `u:${sandboxUid}:rwX`, manifest.workspace], 'checkout ACL')
     await must(
       run,
@@ -381,7 +380,7 @@ export async function handOff(
         '-P',
         '-d',
         '-m',
-        `u:${sandboxUid}:rwX,u:${runnerUid}:rwX`,
+        `u:${sandboxUid}:rwX`,
         '{}',
         '+',
       ],
