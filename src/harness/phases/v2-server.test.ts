@@ -590,13 +590,173 @@ describe('startActionOpenCodeV2', () => {
     })
   })
 
-  it('fails the permission gate when the agent list cannot be read', async () => {
-    const server = fakeServer({agentStatus: 503})
+  describe('permission gate agent-list retry', () => {
+    // Fast timing so the tests run the real loop on real timers; production values are 7 s / 500 ms / 30 s.
+    const FAST = {attemptTimeoutMs: 50, retryDelayMs: 5, deadlineMs: 100}
 
-    const result = await startActionOpenCodeV2(options({deps: recordingDeps(server)}))
+    type AgentStep = 'ok' | 'status-503' | 'status-500' | 'malformed' | Error
 
-    expect(result).toMatchObject({success: false, error: {stage: 'permission-gate'}})
-    expect(server.shutdown).toHaveBeenCalledTimes(1)
+    /** Scripts the answers to `GET /api/agent` in order; the last step repeats. Other routes behave as the fake does. */
+    function scripted(steps: readonly AgentStep[]): FakeServer {
+      const server = fakeServer()
+      const real = server.fetch.getMockImplementation()
+      if (real === undefined) throw new Error('fakeServer has no fetch implementation')
+      let index = 0
+      server.fetch.mockImplementation(async pathname => {
+        if (pathname !== '/api/agent') return real(pathname)
+        const step = steps[Math.min(index, steps.length - 1)] as AgentStep
+        index += 1
+        if (step instanceof Error) throw step
+        if (step === 'status-503') return new Response('{}', {status: 503})
+        if (step === 'status-500') return new Response('{}', {status: 500})
+        if (step === 'malformed') return new Response('<html>not json', {status: 200})
+        return real(pathname)
+      })
+      return server
+    }
+
+    const agentCalls = (server: FakeServer): number => server.fetch.mock.calls.filter(c => c[0] === '/api/agent').length
+    const timeoutError = (): Error => new DOMException('The operation was aborted due to timeout', 'TimeoutError')
+    const abortError = (): Error => new DOMException('This operation was aborted', 'AbortError')
+
+    it('passes after a 503 while plugins activate, logging the retry at debug', async () => {
+      // #given
+      const server = scripted(['status-503', 'ok'])
+      const logger = createMockLogger()
+
+      // #when
+      const result = await startActionOpenCodeV2(
+        options({logger, deps: {...recordingDeps(server), agentListRetry: FAST}}),
+      )
+
+      // #then
+      expect(result.success).toBe(true)
+      expect(agentCalls(server)).toBe(2)
+      expect(server.shutdown).not.toHaveBeenCalled()
+      expect(logger.debug).toHaveBeenCalledWith(
+        expect.stringContaining('retrying'),
+        expect.objectContaining({attempt: 1, cause: 'HTTP 503'}),
+      )
+    })
+
+    it.each([
+      ['a client timeout', timeoutError],
+      ['an abort', abortError],
+    ])('passes after %s on the first attempt', async (_label, makeError) => {
+      // #given
+      const server = scripted([makeError(), 'ok'])
+
+      // #when
+      const result = await startActionOpenCodeV2(options({deps: {...recordingDeps(server), agentListRetry: FAST}}))
+
+      // #then
+      expect(result.success).toBe(true)
+      expect(agentCalls(server)).toBe(2)
+    })
+
+    it('fails after the deadline on a persistent 503, naming the retries, the last cause and the attempts', async () => {
+      // #given
+      const server = scripted(['status-503'])
+
+      // #when
+      const result = await startActionOpenCodeV2(options({deps: {...recordingDeps(server), agentListRetry: FAST}}))
+
+      // #then
+      expect(result).toMatchObject({success: false, error: {stage: 'permission-gate'}})
+      const attempts = agentCalls(server)
+      expect(attempts).toBeGreaterThan(1)
+      const message = unwrapErr(result).message
+      expect(message).toContain('retried')
+      expect(message).toContain('last cause: HTTP 503')
+      expect(message).toContain(`after ${attempts} attempts`)
+      expect(server.shutdown).toHaveBeenCalledTimes(1)
+    })
+
+    it('fails with the timeout as the last cause when every attempt times out', async () => {
+      // #given
+      const server = scripted([timeoutError()])
+
+      // #when
+      const result = await startActionOpenCodeV2(options({deps: {...recordingDeps(server), agentListRetry: FAST}}))
+
+      // #then
+      expect(result).toMatchObject({success: false, error: {stage: 'permission-gate'}})
+      expect(unwrapErr(result).message).toContain('last cause: timed out')
+      expect(agentCalls(server)).toBeGreaterThan(1)
+    })
+
+    it('does not retry when no further attempt fits before the deadline', async () => {
+      // #given
+      const server = scripted(['status-503'])
+      const agentListRetry = {attemptTimeoutMs: 50, retryDelayMs: 5, deadlineMs: 40}
+
+      // #when
+      const result = await startActionOpenCodeV2(options({deps: {...recordingDeps(server), agentListRetry}}))
+
+      // #then
+      expect(agentCalls(server)).toBe(1)
+      expect(unwrapErr(result).message).toContain('after 1 attempt')
+    })
+
+    it('fails immediately, without a retry, on HTTP 500', async () => {
+      // #given
+      const server = scripted(['status-500', 'ok'])
+
+      // #when
+      const result = await startActionOpenCodeV2(options({deps: {...recordingDeps(server), agentListRetry: FAST}}))
+
+      // #then
+      expect(result).toMatchObject({success: false, error: {stage: 'permission-gate'}})
+      expect(unwrapErr(result).message).toContain('GET /api/agent answered HTTP 500')
+      expect(unwrapErr(result).message).not.toContain('retried')
+      expect(agentCalls(server)).toBe(1)
+      expect(server.shutdown).toHaveBeenCalledTimes(1)
+    })
+
+    it('fails immediately, without a retry, on a malformed body', async () => {
+      // #given
+      const server = scripted(['malformed', 'ok'])
+
+      // #when
+      const result = await startActionOpenCodeV2(options({deps: {...recordingDeps(server), agentListRetry: FAST}}))
+
+      // #then
+      expect(result).toMatchObject({success: false, error: {stage: 'permission-gate'}})
+      expect(unwrapErr(result).message).not.toContain('retried')
+      expect(agentCalls(server)).toBe(1)
+    })
+
+    it('fails immediately, without a retry, on a network error that is not a timeout', async () => {
+      // #given
+      const server = scripted([new TypeError('fetch failed'), 'ok'])
+
+      // #when
+      const result = await startActionOpenCodeV2(options({deps: {...recordingDeps(server), agentListRetry: FAST}}))
+
+      // #then
+      expect(result).toMatchObject({success: false, error: {stage: 'permission-gate'}})
+      expect(unwrapErr(result).message).toContain('fetch failed')
+      expect(agentCalls(server)).toBe(1)
+    })
+
+    it('does not retry an abort the caller asked for', async () => {
+      // #given
+      const server = scripted([abortError(), 'ok'])
+      const controller = new AbortController()
+      controller.abort()
+
+      // #when
+      // A deadline too short for a retry: only the caller-abort guard keeps the message from claiming a retry.
+      const agentListRetry = {attemptTimeoutMs: 50, retryDelayMs: 5, deadlineMs: 40}
+      const result = await startActionOpenCodeV2(
+        options({signal: controller.signal, deps: {...recordingDeps(server), agentListRetry}}),
+      )
+
+      // #then
+      expect(result).toMatchObject({success: false, error: {stage: 'permission-gate'}})
+      expect(unwrapErr(result).message).not.toContain('retried')
+      expect(agentCalls(server)).toBe(1)
+    })
   })
 
   it('fails with the plugin stage when the spawn reports a plugin that is not active', async () => {
