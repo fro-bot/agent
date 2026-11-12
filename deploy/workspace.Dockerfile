@@ -26,7 +26,7 @@
 # any download or package install. An unset or empty OPENCODE_VERSION means the version in the pin file. The pin file is
 # bind-mounted from the build context for the check, so it does not land in any image layer; the resolved version does,
 # as /usr/local/share/fro-bot/opencode-version, and the later stages and the entrypoint read it from there.
-FROM node:24.22.2-alpine3.24@sha256:a34ab6d7f6f4813f4d0c5469d74685604b962fbdbf5793a7bc7b4998ecb867c8 AS version-gate
+FROM node:24.22.3-alpine3.24@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5 AS version-gate
 
 ARG OPENCODE_VERSION
 
