@@ -33,8 +33,14 @@ export interface PrivilegedRunResult {
   readonly processes?: string
 }
 
-/** The budget of the `useradd` that creates the sandbox account. Pinned by a unit test; a change is a decision. */
-export const SANDBOX_ACCOUNT_CREATE_TIMEOUT_MS = 60_000
+/**
+ * The budget of the `useradd` that creates the sandbox account. A cold hosted runner's first `useradd` was measured sitting in
+ * uninterruptible I/O wait for 99 s before it exited 0, so 180 s. Pinned by a unit test; a change is a decision.
+ */
+export const SANDBOX_ACCOUNT_CREATE_TIMEOUT_MS = 180_000
+
+/** Account creation slower than this is logged (tool and elapsed time only). */
+const SLOW_ACCOUNT_CREATION_MS = 10_000
 
 /** How much of a command's stderr goes into an error message. */
 const ERROR_STDERR_CHARS = 300
@@ -165,6 +171,8 @@ export async function createSandboxAccount(
     })
   }
 
+  const clock = deps.now ?? Date.now
+  const creationStarted = clock()
   const created = await deps.run(
     [
       tools.useradd,
@@ -182,6 +190,10 @@ export async function createSandboxAccount(
     ],
     {timeoutMs: SANDBOX_ACCOUNT_CREATE_TIMEOUT_MS},
   )
+  const creationElapsedMs = clock() - creationStarted
+  if (creationElapsedMs > SLOW_ACCOUNT_CREATION_MS) {
+    deps.logger.info('Sandbox account creation was slow', {tool: 'useradd', elapsedMs: creationElapsedMs})
+  }
   if (created.exitCode !== 0) {
     // For a killed command, say whether the account existed at that moment: "never got as far as creating it" and "created it,
     // then did not exit" are different problems, and the removal below destroys the evidence.

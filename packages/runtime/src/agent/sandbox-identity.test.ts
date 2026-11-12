@@ -30,6 +30,8 @@ interface FakeSystemOptions {
   readonly useraddResult?: PrivilegedRunResult
   /** When useradd returns `useraddResult`, still create the account (a hung useradd that had already finished its work). */
   readonly createDespiteResult?: boolean
+  /** How long (on the fake clock) a useradd takes. */
+  readonly useraddElapsedMs?: number
 }
 
 /** A tiny model of the host: passwd, group, a process table and a log of every privileged argv. */
@@ -40,6 +42,7 @@ function createFakeSystem(options: FakeSystemOptions = {}) {
   const group = [...(options.group ?? ['root:x:0:', 'runner:x:1001:'])]
   const calls: string[][] = []
   const useraddOptions: ({readonly timeoutMs?: number} | undefined)[] = []
+  const infoLog: {readonly message: string; readonly context?: unknown}[] = []
   const state = {
     procs: [] as string[],
     /** Processes spawned by a hostile parent right after each pkill, before the next pgrep. */
@@ -54,6 +57,7 @@ function createFakeSystem(options: FakeSystemOptions = {}) {
     const tool = argv[0]?.split('/').pop() ?? ''
     switch (tool) {
       case 'useradd': {
+        state.now += options.useraddElapsedMs ?? 0
         if (options.useraddResult !== undefined) {
           if (options.createDespiteResult === true) {
             passwd.push(`${SANDBOX_ACCOUNT_NAME}:x:998:997::/home/${SANDBOX_ACCOUNT_NAME}:/bin/bash`)
@@ -104,9 +108,14 @@ function createFakeSystem(options: FakeSystemOptions = {}) {
     sleep: async ms => {
       state.now += ms
     },
-    logger: {debug: () => undefined, info: () => undefined, warning: () => undefined, error: () => undefined},
+    logger: {
+      debug: () => undefined,
+      info: (message, context) => infoLog.push({message, context}),
+      warning: () => undefined,
+      error: () => undefined,
+    },
   }
-  return {deps, calls, state, passwd, group, useraddOptions}
+  return {deps, calls, state, passwd, group, useraddOptions, infoLog}
 }
 
 const toolNames = (calls: readonly string[][]): string[] => calls.map(call => call[0]?.split('/').pop() ?? '')
@@ -142,7 +151,33 @@ describe('createSandboxAccount', () => {
 
       // #then useradd ran with the account-creation budget, and that budget is the value this test pins
       expect(system.useraddOptions).toEqual([{timeoutMs: SANDBOX_ACCOUNT_CREATE_TIMEOUT_MS}])
-      expect(SANDBOX_ACCOUNT_CREATE_TIMEOUT_MS).toBe(60_000)
+      // A cold hosted runner's first useradd sat in uninterruptible I/O wait for 99 s (CI probe, fro-bot/agent#2135).
+      expect(SANDBOX_ACCOUNT_CREATE_TIMEOUT_MS).toBe(180_000)
+    })
+
+    it('logs at info, with the tool and elapsed time only, when account creation takes more than 10 s', async () => {
+      // #given a useradd that takes 99 s on the clock
+      const system = createFakeSystem({useraddElapsedMs: 99_000})
+
+      // #when
+      const result = await createSandboxAccount(TOOLS, system.deps)
+
+      // #then it still succeeds, and the slow creation was logged once with nothing else in it
+      expect(result.success).toBe(true)
+      expect(system.infoLog.filter(entry => entry.message === 'Sandbox account creation was slow')).toEqual([
+        {message: 'Sandbox account creation was slow', context: {tool: 'useradd', elapsedMs: 99_000}},
+      ])
+    })
+
+    it('does not log a creation that took 10 s or less', async () => {
+      // #given
+      const system = createFakeSystem({useraddElapsedMs: 10_000})
+
+      // #when
+      await createSandboxAccount(TOOLS, system.deps)
+
+      // #then
+      expect(system.infoLog.some(entry => entry.message === 'Sandbox account creation was slow')).toBe(false)
     })
 
     it('says "timed out after Nms", includes the stderr tail, and whether the account had been created', async () => {
