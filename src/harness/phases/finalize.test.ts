@@ -69,7 +69,7 @@ function createBootstrap(overrides: Partial<BootstrapPhaseResult> = {}): Bootstr
     logger: createMockLogger(),
     opencodeResult: {version: '1.0.0'} as BootstrapPhaseResult['opencodeResult'],
     delivery: 'file-convention',
-    responseFilePath: '/tmp/fro-bot-response.md',
+    responseFilePath: '/fixture/fro-bot-response.md',
     responseFilePathCandidates: null,
     trustedHeadSha: '',
     sandboxTools: null,
@@ -367,7 +367,7 @@ describe('runFinalize file-convention delivery', () => {
 
     // #then the existing fail-closed delivery path remains exclusive
     expect(mocks.postComment).not.toHaveBeenCalled()
-    expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('/tmp'))
+    expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('/fixture'))
   })
 
   it('posts one trusted comment and preserves the primary execution failure when the failed agent wrote no artifact', async () => {
@@ -534,7 +534,7 @@ describe('runFinalize file-convention delivery', () => {
 
       // #then non-file-read failures remain fail-closed without a fallback post
       expect(mocks.postComment).not.toHaveBeenCalled()
-      expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('/tmp'))
+      expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('/fixture'))
     }
   })
 
@@ -1848,7 +1848,7 @@ describe('runFinalize quota_exceeded llmError handling', () => {
 
   it('posts a rebuilt quota_exceeded comment to the exact PR target for file-convention delivery, never calling runResponsePost', async () => {
     // #given file-convention delivery, a PR target, and a quota_exceeded llmError
-    const bootstrap = createBootstrap({delivery: 'file-convention', responseFilePath: '/tmp/fro-bot-response.md'})
+    const bootstrap = createBootstrap({delivery: 'file-convention', responseFilePath: '/fixture/fro-bot-response.md'})
     const routing = createRouting({
       agentContext: {
         eventName: 'pull_request',

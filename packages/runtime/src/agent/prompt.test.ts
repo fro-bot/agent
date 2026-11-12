@@ -2704,7 +2704,7 @@ describe('buildAgentPrompt response delivery gating', () => {
 
   it('keeps each response delivery contract item exact in generated prompt text', () => {
     // #given
-    const responseFilePath = '/tmp/fro-bot-response/1-1/nonce123.md'
+    const responseFilePath = '/fixture/fro-bot-response/1-1/nonce123.md'
 
     // #when
     const filePrompt = buildPromptForDelivery('file-convention', responseFilePath, 'pull_request', 'pr-review')
