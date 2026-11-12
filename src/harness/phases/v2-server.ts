@@ -11,6 +11,7 @@ import type {Logger} from '../../shared/logger.js'
 import type {SandboxLifecycle} from './sandbox-lifecycle.js'
 import type {V1DatabaseFacts, V1ImportWaitError, WaitForV1ImportOptions} from './v1-import-wait.js'
 import * as path from 'node:path'
+import {setTimeout as delay} from 'node:timers/promises'
 import {err, ok} from '@bfra.me/es/result'
 import {
   clearHeldClaims,
@@ -141,9 +142,82 @@ export interface StartActionOpenCodeV2Deps {
   readonly waitForImport: (options: WaitForV1ImportOptions) => Promise<Result<unknown, V1ImportWaitError>>
   readonly readDatabaseFacts: (dbPath: string) => V1DatabaseFacts
   readonly startOptions?: Partial<StartOpenCodeV2ServerOptions>
+  /** Overrides the permission gate's agent-list retry timing (tests). */
+  readonly agentListRetry?: Partial<AgentListRetryPolicy>
 }
 
 const GATE_REQUEST_TIMEOUT_MS = 5_000
+
+/**
+ * `GET /api/agent` waits for plugin activation, and the server gives up on that wait after 5 s with a 503. A client
+ * attempt bound above that lets the server's own 503 arrive first; a gate that failed on a slow activation (measured
+ * 4.0-4.2 s on a healthy run) then retries instead of failing the run. The deadline bounds every attempt and backoff:
+ * the gate has no other outer timeout (the spawn's readiness waits end before it), only the caller's `signal`.
+ */
+interface AgentListRetryPolicy {
+  readonly attemptTimeoutMs: number
+  readonly retryDelayMs: number
+  readonly deadlineMs: number
+}
+
+const DEFAULT_AGENT_LIST_RETRY: AgentListRetryPolicy = {
+  attemptTimeoutMs: 7_000,
+  retryDelayMs: 500,
+  deadlineMs: 30_000,
+}
+
+function isTimeoutOrAbort(error: unknown): boolean {
+  return error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')
+}
+
+/**
+ * Reads `GET /api/agent`, retrying only while the server is not ready: an HTTP 503, or a client timeout/abort. Any other
+ * status, any other thrown error (including a caller-requested abort) and a body that is not JSON fail at once, as they
+ * always did, so the gate stays fail-closed. A retry starts only when a full attempt still fits before the deadline.
+ */
+async function readAgentList(
+  fetchRoute: OpenCodeV2ServerHandle['fetch'],
+  policy: AgentListRetryPolicy,
+  logger: Logger,
+  signal: AbortSignal | undefined,
+): Promise<unknown> {
+  const startedAt = Date.now()
+  for (let attempt = 1; ; attempt++) {
+    const bound = AbortSignal.timeout(policy.attemptTimeoutMs)
+    let cause: string
+    try {
+      const response = await fetchRoute('/api/agent', {
+        signal: signal === undefined ? bound : AbortSignal.any([signal, bound]),
+      })
+      if (response.status === 503) {
+        await response.body?.cancel().catch(() => undefined)
+        cause = 'HTTP 503'
+      } else if (response.ok) {
+        return await response.json()
+      } else {
+        throw new Error(`GET /api/agent answered HTTP ${response.status}`)
+      }
+    } catch (error) {
+      if (!isTimeoutOrAbort(error) || signal?.aborted === true) throw error
+      cause = 'timed out'
+    }
+
+    const elapsedMs = Date.now() - startedAt
+    if (elapsedMs + policy.retryDelayMs + policy.attemptTimeoutMs > policy.deadlineMs) {
+      throw new Error(
+        `GET /api/agent was not ready after ${attempt} ${attempt === 1 ? 'attempt' : 'attempts'} over ${elapsedMs}ms ` +
+          `(retried on HTTP 503 or timeout); last cause: ${cause}`,
+      )
+    }
+    logger.debug('OpenCode V2 agent list not ready, retrying the permission gate read', {
+      attempt,
+      cause,
+      elapsedMs,
+      retryDelayMs: policy.retryDelayMs,
+    })
+    await delay(policy.retryDelayMs, undefined, signal === undefined ? undefined : {signal})
+  }
+}
 
 const defaultDeps: StartActionOpenCodeV2Deps = {
   startServer: startOpenCodeV2Server,
@@ -375,13 +449,9 @@ export async function startActionOpenCodeV2(
     // --- 6. Permission gate, then credential gate -------------------------------------------------------------
     const permissions = await verifyPermissionRules(
       {
-        listAgents: async () => {
-          // `GET /api/agent` answering 503 is not-ready, not "no agents"; the spawn's own readiness gate has already
-          // waited it out, so a non-200 here is a failure to read, not a pass.
-          const response = await handle.fetch('/api/agent', {signal: AbortSignal.timeout(GATE_REQUEST_TIMEOUT_MS)})
-          if (!response.ok) throw new Error(`GET /api/agent answered HTTP ${response.status}`)
-          return response.json()
-        },
+        // A 503 is not-ready, never "no agents" and never a pass: it is retried to the deadline and then fails.
+        listAgents: async () =>
+          readAgentList(handle.fetch, {...DEFAULT_AGENT_LIST_RETRY, ...deps.agentListRetry}, logger, options.signal),
       },
       built.data.expectations,
       logger,
