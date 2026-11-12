@@ -814,7 +814,7 @@ describe('createPrivilegedRun', () => {
       ['-n', '--', '/usr/bin/pkill', '-KILL', '-u', '998'],
       expect.objectContaining({cwd: '/', ignoreReturnCode: true}),
     )
-    expect(result).toEqual({exitCode: 3, stdout: 'out'})
+    expect(result).toEqual({exitCode: 3, stdout: 'out', stderr: ''})
   })
 
   it('bounds every command, defaulting the timeout, and reports a killed command as a null exit', async () => {
@@ -831,7 +831,7 @@ describe('createPrivilegedRun', () => {
     await run(['/usr/bin/find', '/x'], {timeoutMs: 1234})
 
     // #then both went through the killing path, with the default and the caller's bound, and report no exit code
-    expect(defaulted).toEqual({exitCode: null, stdout: ''})
+    expect(defaulted).toEqual({exitCode: null, stdout: '', stderr: '', timedOutAfterMs: DEFAULT_PRIVILEGED_TIMEOUT_MS})
     expect(getExecOutput).not.toHaveBeenCalled()
     expect(execWithTimeout.mock.calls.map(call => call[2])).toEqual([DEFAULT_PRIVILEGED_TIMEOUT_MS, 1234])
     expect(execWithTimeout).toHaveBeenCalledWith(
@@ -840,6 +840,68 @@ describe('createPrivilegedRun', () => {
       expect.any(Number),
       expect.objectContaining({cwd: '/'}),
     )
+  })
+
+  it('reports how long a killed command was given and the tail of its stderr', async () => {
+    // #given a command that printed to stderr and then hung past its budget
+    const execWithTimeout = vi.fn(
+      async (_command: string, _args: string[] | undefined, _timeout: number, options?: ExecOptions) => {
+        options?.listeners?.stderr?.(Buffer.from('first line\n'))
+        options?.listeners?.stderr?.(Buffer.from('useradd: stuck on /etc/passwd'))
+        return 'timed-out' as const
+      },
+    )
+    const run = createPrivilegedRun({exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()}, '/usr/bin/sudo')
+
+    // #when
+    const result = await run(['/usr/sbin/useradd', 'x'], {timeoutMs: 4321})
+
+    // #then
+    expect(result).toEqual({
+      exitCode: null,
+      stdout: '',
+      stderr: 'first line\nuseradd: stuck on /etc/passwd',
+      timedOutAfterMs: 4321,
+    })
+  })
+
+  it('keeps only the last 2048 bytes of stderr', async () => {
+    // #given a command with far more stderr than that
+    const execWithTimeout = vi.fn(
+      async (_command: string, _args: string[] | undefined, _timeout: number, options?: ExecOptions) => {
+        options?.listeners?.stderr?.(Buffer.from('a'.repeat(5000)))
+        options?.listeners?.stderr?.(Buffer.from('END'))
+        return 1
+      },
+    )
+    const run = createPrivilegedRun({exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()}, '/usr/bin/sudo')
+
+    // #when
+    const result = await run(['/usr/bin/find', '/x'])
+
+    // #then
+    expect(result.stderr?.length).toBe(2048)
+    expect(result.stderr?.endsWith('END')).toBe(true)
+  })
+
+  it('logs a command that took long, with its tool name and duration, but not its arguments', async () => {
+    // #given a clock that advances 7 s during the command
+    let now = 1000
+    const execWithTimeout = vi.fn(async () => {
+      now += 7000
+      return 0
+    })
+    const logger = createMockLogger()
+    const run = createPrivilegedRun({exec: vi.fn(), execWithTimeout, getExecOutput: vi.fn()}, '/usr/bin/sudo', {
+      logger,
+      now: () => now,
+    })
+
+    // #when
+    await run(['/usr/sbin/useradd', '--comment', 'a secret-looking arg', 'fro-bot-sandbox'])
+
+    // #then
+    expect(logger.warning).toHaveBeenCalledWith('A privileged command was slow', {tool: 'useradd', elapsedMs: 7000})
   })
 
   it('returns the exit code and the collected stdout when the command finishes in time', async () => {
@@ -857,6 +919,6 @@ describe('createPrivilegedRun', () => {
     const result = await run(['/usr/bin/pgrep', '-u', '998'])
 
     // #then
-    expect(result).toEqual({exitCode: 1, stdout: 'hello'})
+    expect(result).toEqual({exitCode: 1, stdout: 'hello', stderr: ''})
   })
 })

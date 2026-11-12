@@ -475,7 +475,9 @@ describe('sandbox take-back', () => {
     const deps = {
       ...fx.deps,
       run: (async (argv, options) => {
-        if (argv.includes(TOOLS.chown) && argv.includes(fx.manifest.workspace)) return {exitCode: null, stdout: ''}
+        if (argv.includes(TOOLS.chown) && argv.includes(fx.manifest.workspace)) {
+          return {exitCode: null, stdout: '', stderr: 'chown: stuck on a busy inode', timedOutAfterMs: 4321}
+        }
         return baseRun(argv, options)
       }) satisfies PrivilegedRun,
     }
@@ -484,7 +486,8 @@ describe('sandbox take-back', () => {
     const outcome = await takeBack(fx.manifest, handed.data, deps)
 
     // #then
-    expect(outcome.status === 'unsafe' && outcome.reason).toContain('timed out')
+    expect(outcome.status === 'unsafe' && outcome.reason).toContain('timed out after 4321ms')
+    expect(outcome.status === 'unsafe' && outcome.reason).toContain('stuck on a busy inode')
   })
 
   it('gives every take-back command what is left of a shared deadline and starts none after it', async () => {

@@ -158,6 +158,10 @@ const defaultDeps: SandboxLifecycleDeps = {
   ids: () => ({uid: process.getuid?.() ?? -1, gid: process.getgid?.() ?? -1}),
 }
 
+/** A privileged command that takes this long is logged: slow `useradd` or `setfacl` calls are what a hung step looks like. */
+const SLOW_PRIVILEGED_COMMAND_MS = 5000
+const STDERR_TAIL_BYTES = 2048
+
 /** Applied to a privileged command that names no timeout of its own (`useradd`, `userdel`, `mkdir`, ...). */
 export const DEFAULT_PRIVILEGED_TIMEOUT_MS = 60_000
 
@@ -166,21 +170,46 @@ export const DEFAULT_PRIVILEGED_TIMEOUT_MS = 60_000
  * command runs under a timeout (the caller's, else {@link DEFAULT_PRIVILEGED_TIMEOUT_MS}): on expiry the adapter kills the
  * command's process group and the result is `exitCode: null`, which callers treat as a failure.
  */
-export function createPrivilegedRun(exec: ExecAdapter, sudoPath: string): PrivilegedRun {
+export function createPrivilegedRun(
+  exec: ExecAdapter,
+  sudoPath: string,
+  diagnostics: {readonly logger?: Logger; readonly now?: () => number} = {},
+): PrivilegedRun {
+  const now = diagnostics.now ?? Date.now
   return async (argv, options) => {
     const args = ['-n', '--', ...argv]
     const timeoutMs = options?.timeoutMs ?? DEFAULT_PRIVILEGED_TIMEOUT_MS
+    const started = now()
+    // Names the tool only: the arguments may carry paths the log should not hold, and the duration is the evidence wanted.
+    const noteIfSlow = (): void => {
+      const elapsedMs = now() - started
+      if (elapsedMs >= SLOW_PRIVILEGED_COMMAND_MS) {
+        diagnostics.logger?.warning('A privileged command was slow', {
+          tool: path.basename(argv[0] ?? 'command'),
+          elapsedMs,
+        })
+      }
+    }
     if (exec.execWithTimeout == null) {
       const output = await exec.getExecOutput(sudoPath, args, {silent: true, ignoreReturnCode: true, cwd: '/'})
-      return {exitCode: output.exitCode, stdout: output.stdout}
+      noteIfSlow()
+      return {exitCode: output.exitCode, stdout: output.stdout, stderr: output.stderr.slice(-STDERR_TAIL_BYTES)}
     }
     const chunks: Buffer[] = []
+    let stderrTail = Buffer.alloc(0)
     const outcome = await exec.execWithTimeout(sudoPath, args, timeoutMs, {
       cwd: '/',
-      listeners: {stdout: data => chunks.push(data)},
+      listeners: {
+        stdout: data => chunks.push(data),
+        stderr: data => {
+          stderrTail = Buffer.concat([stderrTail, data]).subarray(-STDERR_TAIL_BYTES)
+        },
+      },
     })
-    if (outcome === 'timed-out') return {exitCode: null, stdout: ''}
-    return {exitCode: outcome, stdout: Buffer.concat(chunks).toString('utf8')}
+    noteIfSlow()
+    const stderr = stderrTail.toString('utf8')
+    if (outcome === 'timed-out') return {exitCode: null, stdout: '', stderr, timedOutAfterMs: timeoutMs}
+    return {exitCode: outcome, stdout: Buffer.concat(chunks).toString('utf8'), stderr}
   }
 }
 
@@ -206,7 +235,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   const {tools, env, logger} = options
   const deps: SandboxLifecycleDeps = {...defaultDeps, ...options.deps}
   const exec = options.exec ?? createExecAdapter()
-  const run = createPrivilegedRun(exec, tools.sudo)
+  const run = createPrivilegedRun(exec, tools.sudo, {logger})
   const runnerHome = options.runnerHome ?? env.HOME ?? os.userInfo().homedir
 
   let account: SandboxAccount | null = null

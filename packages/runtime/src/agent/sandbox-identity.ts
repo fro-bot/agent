@@ -22,8 +22,32 @@ export const DEFAULT_SANDBOX_STOP_BOUND_MS = 15_000
 const DEFAULT_STOP_POLL_MS = 100
 
 export interface PrivilegedRunResult {
+  /** `null` when the command was killed for running past its budget (see `timedOutAfterMs`). */
   readonly exitCode: number | null
   readonly stdout: string
+  /** The last 2048 bytes of stderr, when the runner collects it. */
+  readonly stderr?: string
+  /** Set when the command was killed for running past this many milliseconds. */
+  readonly timedOutAfterMs?: number
+}
+
+/** The budget of the `useradd` that creates the sandbox account. Pinned by a unit test; a change is a decision. */
+export const SANDBOX_ACCOUNT_CREATE_TIMEOUT_MS = 60_000
+
+/** How much of a command's stderr goes into an error message. */
+const ERROR_STDERR_CHARS = 300
+
+/**
+ * A short, one-line reason a privileged command did not succeed: `timed out after Nms` for a killed one, else its exit
+ * code, then the tail of its stderr. Tool output only; commands here never print secrets, and the tail is bounded.
+ */
+export function describePrivilegedFailure(what: string, result: PrivilegedRunResult): string {
+  let how: string
+  if (result.timedOutAfterMs !== undefined) how = `timed out after ${result.timedOutAfterMs}ms`
+  else if (result.exitCode === null) how = 'did not run to completion'
+  else how = `failed (exit ${result.exitCode})`
+  const tail = (result.stderr ?? '').replaceAll(/\s+/g, ' ').trim().slice(-ERROR_STDERR_CHARS)
+  return tail.length === 0 ? `${what} ${how}` : `${what} ${how}; stderr: ${tail}`
 }
 
 /** Runs `argv` as root. `argv[0]` is an absolute path. Never throws for a non-zero exit. */
@@ -127,24 +151,36 @@ export async function createSandboxAccount(
     })
   }
 
-  const created = await deps.run([
-    tools.useradd,
-    '--system',
-    '--user-group',
-    '--no-log-init',
-    '--create-home',
-    '--home-dir',
-    home,
-    '--shell',
-    '/bin/bash',
-    '--comment',
-    'fro-bot sandbox',
-    name,
-  ])
+  const created = await deps.run(
+    [
+      tools.useradd,
+      '--system',
+      '--user-group',
+      '--no-log-init',
+      '--create-home',
+      '--home-dir',
+      home,
+      '--shell',
+      '/bin/bash',
+      '--comment',
+      'fro-bot sandbox',
+      name,
+    ],
+    {timeoutMs: SANDBOX_ACCOUNT_CREATE_TIMEOUT_MS},
+  )
   if (created.exitCode !== 0) {
+    // For a killed command, say whether the account existed at that moment: "never got as far as creating it" and "created it,
+    // then did not exit" are different problems, and the removal below destroys the evidence.
+    const presence =
+      created.timedOutAfterMs === undefined
+        ? ''
+        : `; account present at timeout: ${(await accountExists(name, deps)) ? 'yes' : 'no'}`
     // useradd can fail after creating part of the account; remove only what now exists under the name we just checked.
     await removeIfPresent(name, tools, deps)
-    return err({kind: 'create-failed', message: `useradd failed for the sandbox account (exit ${created.exitCode})`})
+    return err({
+      kind: 'create-failed',
+      message: `${describePrivilegedFailure('useradd for the sandbox account', created)}${presence}`,
+    })
   }
 
   const account = await readBackAccount(name, deps)
@@ -159,6 +195,11 @@ export async function createSandboxAccount(
   }
   deps.logger.info('Sandbox account created', {name, uid: account.uid})
   return ok(account)
+}
+
+async function accountExists(name: string, deps: SandboxIdentityDeps): Promise<boolean> {
+  const passwdText = await deps.readText('/etc/passwd')
+  return passwdText !== null && parsePasswd(passwdText).some(entry => entry.name === name)
 }
 
 async function readBackAccount(name: string, deps: SandboxIdentityDeps): Promise<SandboxAccount | null> {

@@ -238,6 +238,8 @@ export {
   createSandboxAccount,
   DEFAULT_SANDBOX_STOP_BOUND_MS,
   deleteSandboxAccount,
+  describePrivilegedFailure,
+  SANDBOX_ACCOUNT_CREATE_TIMEOUT_MS,
   SANDBOX_ACCOUNT_NAME,
   stopSandboxProcesses,
 } from './sandbox-identity.js'

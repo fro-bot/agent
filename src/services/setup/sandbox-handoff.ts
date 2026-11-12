@@ -4,7 +4,7 @@ import type {Logger} from '../../shared/logger.js'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import {err, ok} from '@bfra.me/es/result'
-import {isWithin} from '@fro-bot/runtime'
+import {describePrivilegedFailure, isWithin} from '@fro-bot/runtime'
 import {toErrorMessage} from '../../shared/errors.js'
 
 /**
@@ -142,9 +142,7 @@ function ancestorsOf(target: string): string[] {
 async function must(run: PrivilegedRun, argv: readonly string[], what: string): Promise<string> {
   const result = await run(argv)
   if (result.exitCode !== 0) {
-    throw new HandoffError(
-      `${what} ${result.exitCode === null ? 'timed out or was killed' : `failed (exit ${result.exitCode})`}`,
-    )
+    throw new HandoffError(describePrivilegedFailure(what, result))
   }
   return result.stdout
 }
@@ -158,7 +156,13 @@ function withDeadline(deps: HandoffDeps, budgetMs: number): HandoffDeps {
   const deadline = now() + (deps.budgetMs ?? budgetMs)
   const run: PrivilegedRun = async (argv, options) => {
     const remaining = deadline - now()
-    if (remaining <= 0) return {exitCode: null, stdout: ''}
+    if (remaining <= 0) {
+      return {
+        exitCode: null,
+        stdout: '',
+        stderr: 'the shared handoff deadline had already passed before this command started',
+      }
+    }
     const asked = options?.timeoutMs
     return deps.run(argv, {timeoutMs: asked === undefined ? remaining : Math.min(asked, remaining)})
   }
