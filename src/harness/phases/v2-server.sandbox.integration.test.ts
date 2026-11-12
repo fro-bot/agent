@@ -208,6 +208,7 @@ async function preflightTools(logger: Logger): Promise<SandboxToolPaths> {
   const preflight = await runSandboxPreflight({
     ...createSandboxPreflightDeps(createExecAdapter(), logger),
     actionPaths: ['/opt/fro-bot-published-action/dist', '/opt/fro-bot-published-action'],
+    invokedAs: '/opt/fro-bot-published-action/dist/main.js',
   })
   if (!preflight.ok) throw new Error(preflight.message)
   return preflight.tools

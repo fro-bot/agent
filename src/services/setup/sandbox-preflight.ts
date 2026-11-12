@@ -64,6 +64,12 @@ export interface SandboxPreflightDeps {
    * running bundle and its parent. Empty when it cannot be determined, which fails the check.
    */
   readonly actionPaths: readonly string[]
+  /**
+   * The script path the runner started the Action with (`process.argv[1]`), exactly as given: a path through a symlink
+   * stays lexical. `null` when it is not available. For `uses: ./x` this is `<checkout>/x/dist/main.js` even if `x` is a
+   * symlink to an install somewhere else, which is the path the sandbox user could replace.
+   */
+  readonly invokedAs: string | null
   readonly realpath: (absolutePath: string) => Promise<string>
   /** The working directory, the workspace when `GITHUB_WORKSPACE` is unset (the same fallback bootstrap uses). */
   readonly cwd: string
@@ -162,33 +168,96 @@ export function sandboxWritableRoots(env: NodeJS.ProcessEnv, cwd: string): reado
   return roots.map(root => path.resolve(root))
 }
 
+/** Where the running bundle lives and how it was started, from the pieces Node gives a script. */
+export function discoverActionLocation(input: {readonly argv: readonly string[]; readonly moduleUrl: string}): {
+  readonly actionPaths: readonly string[]
+  readonly invokedAs: string | null
+} {
+  const invoked = input.argv[1]
+  const invokedAs = invoked !== undefined && invoked.length > 0 ? invoked : null
+  try {
+    const bundleDir = path.dirname(fileURLToPath(input.moduleUrl))
+    return {actionPaths: [bundleDir, path.dirname(bundleDir)], invokedAs}
+  } catch {
+    return {actionPaths: [], invokedAs}
+  }
+}
+
 /**
  * The Action's own files (`dist/post.js`, `action.yaml`) run later as the runner. If the sandbox can write the place they
  * live, it can plant code that runs with the runner's privileges. `uses: ./` installs the Action inside the checkout, so
  * it is refused; a published `fro-bot/agent@<ref>` lives under `_actions`, outside every writable root.
+ *
+ * Every location is checked twice, as given (lexical) and after `realpath` (canonical), against every writable root in
+ * both forms. The lexical check is the one that matters for an alias: `uses: ./x` with `x` a symlink to a protected
+ * install resolves to a safe canonical path, but the runner starts the Action from `<checkout>/x`, which the sandbox can
+ * replace with a directory of its own.
+ *
+ * The invocation path (`GITHUB_ACTION_PATH`, which the runner sets only for some actions, and the script path) is what
+ * ties the canonical install to how the runner will start it. If neither is available, or none of them lies in this
+ * install, nothing says where the runner will look, so the check fails closed.
  */
 async function checkActionLocation(deps: SandboxPreflightDeps): Promise<SandboxPreflightResult | null> {
   const advice =
     'use a published `fro-bot/agent@<ref>` instead of a local `uses: ./` install, so the Action is not stored where the agent user can write'
-  const candidates = [...deps.actionPaths]
+  const canonical = async (target: string): Promise<string> => {
+    try {
+      return await deps.realpath(target)
+    } catch {
+      return target
+    }
+  }
+
+  // `GITHUB_ACTION_PATH` is the install root. The script path is a file in `<root>/dist/`.
   const reported = deps.env.GITHUB_ACTION_PATH
-  if (reported !== undefined && reported.length > 0) candidates.push(reported)
-  if (candidates.length === 0) {
+  const reportedRoot = reported !== undefined && reported.length > 0 ? path.resolve(deps.cwd, reported) : null
+  const scriptPath =
+    deps.invokedAs !== null && deps.invokedAs.length > 0 ? path.resolve(deps.cwd, deps.invokedAs) : null
+  const invocations = [reportedRoot, scriptPath].filter((value): value is string => value !== null)
+  if (deps.actionPaths.length === 0) {
     return fail('action-location', `the Action's install location could not be determined; ${advice}`)
   }
-  const roots = sandboxWritableRoots(deps.env, deps.cwd)
-  for (const candidate of candidates) {
-    let resolved: string
-    try {
-      resolved = await deps.realpath(path.resolve(candidate))
-    } catch {
-      resolved = path.resolve(candidate)
-    }
+  if (invocations.length === 0) {
+    return fail('action-location', `it could not be determined how the Action was started; ${advice}`)
+  }
+
+  // At least one invocation path must lead into this install, or it says nothing about where the runner will look.
+  const installs = await Promise.all(deps.actionPaths.map(async install => canonical(path.resolve(install))))
+  let conclusive = false
+  for (const invocation of invocations) {
+    const real = await canonical(invocation)
+    if (installs.some(install => isInsideOrEqual(install, real) || isInsideOrEqual(real, install))) conclusive = true
+  }
+  if (!conclusive) {
+    return fail(
+      'action-location',
+      `how the Action was started (${invocations.join(', ')}) does not lead to the installed bundle (${installs.join(', ')}); ${advice}`,
+    )
+  }
+
+  const roots = new Set<string>()
+  for (const root of sandboxWritableRoots(deps.env, deps.cwd)) {
+    roots.add(root)
+    roots.add(await canonical(root))
+  }
+
+  // Each location, as given and resolved, plus the directories the runner would also load from (script dir, install root).
+  const lexicalLocations = [
+    ...deps.actionPaths.map(install => path.resolve(install)),
+    ...(reportedRoot === null ? [] : [reportedRoot]),
+    ...(scriptPath === null ? [] : [scriptPath, path.dirname(scriptPath), path.dirname(path.dirname(scriptPath))]),
+  ]
+  const locations = new Set<string>()
+  for (const lexical of lexicalLocations) {
+    locations.add(lexical)
+    locations.add(await canonical(lexical))
+  }
+  for (const location of locations) {
     for (const root of roots) {
-      if (isInsideOrEqual(root, resolved) || isInsideOrEqual(resolved, root)) {
+      if (isInsideOrEqual(root, location) || isInsideOrEqual(location, root)) {
         return fail(
           'action-location',
-          `the Action is installed at ${resolved}, which overlaps the writable path ${root}; ${advice}`,
+          `the Action is reached through ${location}, which overlaps the writable path ${root}; ${advice}`,
         )
       }
     }
@@ -232,6 +301,7 @@ export function createSandboxPreflightDeps(
   | 'pathExists'
   | 'readText'
   | 'actionPaths'
+  | 'invokedAs'
   | 'realpath'
   | 'cwd'
   | 'logger'
@@ -266,19 +336,9 @@ export function createSandboxPreflightDeps(
         return null
       }
     },
-    actionPaths: bundleInstallPaths(),
+    ...discoverActionLocation({argv: process.argv, moduleUrl: import.meta.url}),
     realpath: async absolutePath => fs.realpath(absolutePath),
     cwd: process.cwd(),
     logger,
-  }
-}
-
-/** The running bundle's directory and its parent (`dist/` and the Action root). Empty if the location is not a file URL. */
-function bundleInstallPaths(): readonly string[] {
-  try {
-    const bundleDir = path.dirname(fileURLToPath(import.meta.url))
-    return [bundleDir, path.dirname(bundleDir)]
-  } catch {
-    return []
   }
 }
