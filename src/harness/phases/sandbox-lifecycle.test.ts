@@ -494,6 +494,70 @@ describe('createSandboxLifecycle', () => {
       expect(harness.mocks.createAccount).not.toHaveBeenCalled()
     })
 
+    it('between prepare and spawn: reports inactive from the signal on, tears down using the journal, never spawns on a stale launch', async () => {
+      // #given a fully prepared sandbox (handoff done, launch spec returned) whose server has not started yet
+      const harness = createHarness()
+      const host = fakeHost()
+      const journal = {snapshotDir: '/journal', touched: [], chowned: [], aclTrees: [], git: null, gitPresent: false}
+      harness.mocks.handOff.mockResolvedValue(ok(journal))
+      const states: string[] = []
+      const lifecycle = create(harness, {signals: host, recordState: state => states.push(state)})
+      const prepared = await lifecycle.prepare({keyFilePaths: [], ghConfigDir: null, repoSkills: null})
+      expect(prepared.success).toBe(true)
+      expect(lifecycle.isActive()).toBe(true)
+
+      // #when SIGTERM arrives in the gap before the spawn
+      host.emitter.emit('SIGTERM')
+
+      // #then a caller that is about to spawn sees it at once, before the teardown has even finished
+      expect(lifecycle.isActive()).toBe(false)
+      await vi.waitFor(() => {
+        expect(host.killed).toEqual(['4242:SIGTERM'])
+      })
+      // #and the teardown used the real journal, then deleted the account, and only then reported restored
+      expect(harness.mocks.takeBack.mock.calls[0]?.[1]).toBe(journal)
+      expect(harness.mocks.deleteAccount).toHaveBeenCalledTimes(1)
+      expect(states).toEqual(['pending', 'restored'])
+    })
+
+    it.each([
+      ['account creation', 'createAccount'],
+      ['handoff', 'handOff'],
+    ] as const)('reports no restored when %s outlasts the teardown budget', async (_label, stepName) => {
+      // #given a step that does not finish before the 20 ms budget, and a recorder
+      const harness = createHarness()
+      const host = fakeHost()
+      const gate = deferred<unknown>()
+      harness.mocks[stepName].mockImplementation((async () => gate.promise) as never)
+      const states: string[] = []
+      const lifecycle = create(harness, {
+        signals: host,
+        signalTeardownBudgetMs: 20,
+        recordState: state => states.push(state),
+      })
+      const preparing = lifecycle.prepare({keyFilePaths: [], ghConfigDir: null, repoSkills: null})
+      await vi.waitFor(() => {
+        expect(harness.mocks[stepName]).toHaveBeenCalledTimes(1)
+      })
+
+      // #when the signal arrives and the budget runs out with the step still running
+      host.emitter.emit('SIGINT')
+      await vi.waitFor(() => {
+        expect(host.killed).toEqual(['4242:SIGINT'])
+      })
+
+      // #then the signal was re-raised without ever recording a restore: the state the post hook sees is not restored
+      expect(states).not.toContain('restored')
+      expect(states.at(-1)).toBe('unsafe')
+      expect(harness.mocks.deleteAccount).not.toHaveBeenCalled()
+      gate.resolve(
+        stepName === 'createAccount'
+          ? ok(ACCOUNT)
+          : ok({snapshotDir: '/j', touched: [], chowned: [], aclTrees: [], git: null, gitPresent: false}),
+      )
+      await preparing
+    })
+
     it('ends the process anyway when the teardown does not finish within its budget', async () => {
       // #given a stop that never returns
       const harness = createHarness()

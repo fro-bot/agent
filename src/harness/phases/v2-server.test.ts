@@ -1033,7 +1033,10 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
     xdg: {data: '/d', config: '/c', cache: '/k', state: '/s'},
   } as const
 
-  function fakeSandbox(prepare?: SandboxLifecycle['prepare']): {
+  function fakeSandbox(
+    prepare?: SandboxLifecycle['prepare'],
+    isActive: () => boolean = () => true,
+  ): {
     readonly sandbox: SandboxLifecycle
     readonly prepare: ReturnType<typeof vi.fn>
     readonly release: ReturnType<typeof vi.fn>
@@ -1050,7 +1053,7 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
       return {stop: 'stopped' as const, restore: 'restored' as const}
     })
     return {
-      sandbox: {prepare: prepareMock, release, isActive: () => true},
+      sandbox: {prepare: prepareMock, release, isActive},
       prepare: prepareMock,
       release,
     }
@@ -1266,5 +1269,54 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
     // #when / #then
     await expect(run(sandbox.sandbox, deps)).rejects.toThrow('boom')
     expect(sandbox.release).toHaveBeenCalledTimes(1)
+  })
+
+  describe('a termination signal during the start', () => {
+    it('does not spawn the server when the signal arrived between prepare and spawn', async () => {
+      // #given the sandbox was prepared, then a signal began its teardown before the spawn
+      let active = true
+      const server = fakeServer()
+      const deps = depsFor(server)
+      const sandbox = fakeSandbox(
+        async () => {
+          const prepared = ok(LAUNCH)
+          active = false
+          return prepared
+        },
+        () => active,
+      )
+
+      // #when the start continues
+      const result = await run(sandbox.sandbox, deps)
+
+      // #then no process was started as the sandbox user, and the failure names the sandbox stage
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.stage).toBe('sandbox')
+      expect(deps.startServer).not.toHaveBeenCalled()
+      expect(sandbox.release).toHaveBeenCalledTimes(1)
+    })
+
+    it('stops a server that came up while the signal was tearing the sandbox down', async () => {
+      // #given the signal lands during the spawn
+      let active = true
+      const server = fakeServer()
+      const deps = depsFor(server, {
+        startServer: vi.fn<StartServer>(async spawnOptions => {
+          active = false
+          server.loadConfig(spawnOptions.config)
+          return {success: true, data: server.handle}
+        }),
+      })
+      const sandbox = fakeSandbox(undefined, () => active)
+
+      // #when
+      const result = await run(sandbox.sandbox, deps)
+
+      // #then the start fails, the fresh server is shut down and the sandbox is released
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.stage).toBe('sandbox')
+      expect(server.shutdown).toHaveBeenCalledTimes(1)
+      expect(sandbox.release).toHaveBeenCalled()
+    })
   })
 })

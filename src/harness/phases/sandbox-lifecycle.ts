@@ -211,6 +211,8 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     if (timer !== undefined) clearTimeout(timer)
     if (outcome === 'timeout' || outcome === 'failed') {
       logger.error('The sandbox was not confirmed stopped and restored before exiting on a signal')
+      // The post hook must not read a `pending` left behind as "nothing happened": say outright that it is not restored.
+      record('unsafe')
     }
     removeSignalHandlers()
     // The handlers are gone, so this ends the process with the signal's default action.
@@ -405,5 +407,6 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     }
   }
 
-  return {prepare, release, isActive: () => active}
+  // False from the moment a signal begins the teardown (not when it ends), so a caller about to spawn the server sees it.
+  return {prepare, release, isActive: () => active && !cancelled}
 }

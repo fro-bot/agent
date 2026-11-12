@@ -297,6 +297,13 @@ export async function startActionOpenCodeV2(
     if (ghConfigDir !== null) childEnv = {...childEnv, GH_CONFIG_DIR: ghConfigDir}
   }
 
+  // A termination signal that arrived while the sandbox was being prepared has already begun its teardown. Starting the
+  // server now would run a process as the sandbox user after the teardown verified none was left.
+  if (options.sandbox != null && !options.sandbox.isActive()) {
+    await releaseSandboxAfterFailure(options.sandbox, logger)
+    return stageError('sandbox', 'isolate-agent setup was cancelled by a signal before the server started')
+  }
+
   // --- 5. Spawn (plugin gate inside) -------------------------------------------------------------------------
   let started: Awaited<ReturnType<typeof deps.startServer>>
   try {
@@ -349,6 +356,10 @@ export async function startActionOpenCodeV2(
   }
 
   const runGates = async (): Promise<Result<OpenCodeV2ServerHandle, V2StartError>> => {
+    // The same signal can land during the spawn itself; the server that came up is not covered by the teardown's check.
+    if (options.sandbox != null && !options.sandbox.isActive()) {
+      return failAfterSpawn('sandbox', 'isolate-agent was cancelled by a signal while the server was starting')
+    }
     // --- 6. Permission gate, then credential gate -------------------------------------------------------------
     const permissions = await verifyPermissionRules(
       {
