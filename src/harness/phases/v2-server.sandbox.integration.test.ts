@@ -1254,6 +1254,8 @@ describe.skipIf(!gated)('isolate-agent hostile git state through a real model sh
 // A model that cannot change `.git/config` (take-back restores it) can still redirect git's config: it copies `.git`
 // into the checkout, puts a clean filter in THAT copy's config, and points `.git/commondir` at it. Restoring the real
 // config restores nothing git reads, so take-back must refuse the redirect (unsafe) and the caller must run no git.
+// This suite ends `unsafe` by design, which leaves the default XDG storage owned by the sandbox uid. Any suite after it
+// must use its own XDG roots (`hostedEnv(workspace, xdgRoot)`).
 describe.skipIf(!gated)('isolate-agent .git/commondir redirect through a real model shell', () => {
   const logger = createLogger({phase: 'sandbox-integration-commondir'})
   const scratch = path.join(runnerTemp, `sandbox-it-commondir-${process.pid}`)
@@ -1386,6 +1388,10 @@ describe.skipIf(!gated)('isolate-agent key proxy through a real model shell', ()
   const scratch = path.join(runnerTemp, `sandbox-it-key-proxy-${process.pid}`)
   const workspace = path.join(scratch, 'ws')
   const responseDir = path.join(scratch, 'response')
+  // Its own XDG roots. The suite before this one (the `.git/commondir` redirect) ends `unsafe` on purpose: nothing is taken
+  // back, so the default XDG storage under the runner's home stays owned by the sandbox uid and a later handoff on those
+  // paths is refused. The account itself is deleted once the stop is confirmed, so only the files are left behind.
+  const xdgRoot = path.join(scratch, 'xdg')
   const REAL_KEY = 'sk-real-proxy-canary-7f3a91'
   let provider: ScriptedProvider | undefined
   let upstream: TlsUpstream | undefined
@@ -1458,7 +1464,7 @@ describe.skipIf(!gated)('isolate-agent key proxy through a real model shell', ()
     initWorkspace(workspace)
     provider = await startScriptedProvider(() => probes())
     upstream = await startTlsUpstream(forwardToProvider(provider.port))
-    const env = hostedEnv(workspace)
+    const env = hostedEnv(workspace, xdgRoot)
     lifecycle = createSandboxLifecycle({
       tools,
       env,
