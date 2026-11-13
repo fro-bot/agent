@@ -98,6 +98,28 @@ export function validateEndpoint(endpoint: string, allowInsecureEndpoint: boolea
   return ok(parsedEndpoint)
 }
 
+/**
+ * A provider upstream the key proxy sends a credential to: a literal `https:` URL with no userinfo, query or fragment,
+ * and not a cloud metadata host. Loopback and private addresses are allowed, because an operator's gateway can sit on
+ * an internal network. The message names the rule and never quotes the value.
+ */
+export function validateUpstreamUrl(value: string): Result<URL, string> {
+  let parsed: URL
+  try {
+    parsed = new URL(value)
+  } catch {
+    return err('the upstream must be a valid URL')
+  }
+  if (parsed.protocol !== 'https:') return err('the upstream must use https')
+  if (parsed.username.length > 0 || parsed.password.length > 0) return err('the upstream must not include credentials')
+  if (parsed.search.length > 0 || parsed.hash.length > 0)
+    return err('the upstream must not include a query or fragment')
+  if (classifyHostname(parsed.hostname) === 'metadata') {
+    return err('the upstream must not target cloud instance metadata services')
+  }
+  return ok(parsed)
+}
+
 export function validatePrefix(prefix: string): Result<string, ValidationError> {
   const normalizedPrefix = prefix.trim()
 

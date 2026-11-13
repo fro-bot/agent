@@ -109,6 +109,14 @@ function hangingExec(hangOn: string, seen: string[]): ExecAdapter {
   }
 }
 
+function lateStart() {
+  const ready = deferred<void>()
+  const died = new AbortController()
+  const stop = vi.fn(async () => ({outcome: 'stopped' as const, crashed: false}))
+  const proxy = {died: died.signal, stop}
+  return {ready, stop, proxy}
+}
+
 describe('createSandboxLifecycle', () => {
   let temp: string
   // Every lifecycle holds process-wide signal ownership until it is released; a test that never releases its own must not
@@ -1074,6 +1082,332 @@ describe('createSandboxLifecycle', () => {
         expect(host.killed).toEqual(['4242:SIGINT'])
       })
       expect(harness.mocks.takeBack).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('the key proxy the lifecycle owns', () => {
+    type StopOutcome = 'already-exited' | 'killed' | 'stopped' | 'unconfirmed'
+
+    function fakeProxy(options: {outcome?: StopOutcome; crashed?: boolean; order?: string[]} = {}) {
+      const died = new AbortController()
+      const stop = vi.fn(async () => {
+        options.order?.push('proxy-stop')
+        return {outcome: options.outcome ?? 'stopped', crashed: options.crashed ?? false}
+      })
+      return {proxy: {died: died.signal, stop}, stop, died}
+    }
+
+    const report = <T>(proxy: T | null, unconfirmed = false) => ({proxy, unconfirmed})
+
+    it('starts the proxy under signal ownership, before any account exists, and stops it last on release', async () => {
+      // #given a harness that records the order of the teardown steps
+      const harness = createHarness()
+      const order: string[] = []
+      harness.mocks.stop.mockImplementation(async () => {
+        order.push('sandbox-stop')
+        return 'stopped' as const
+      })
+      harness.mocks.takeBack.mockImplementation(async () => {
+        order.push('take-back')
+        return {status: 'restored' as const}
+      })
+      harness.mocks.deleteAccount.mockImplementation(async () => {
+        order.push('delete-account')
+        return 'deleted' as const
+      })
+      const host = fakeHost()
+      const lifecycle = create(harness, {signals: host})
+      const {proxy, stop} = fakeProxy({order})
+
+      // #when the proxy starts first, then the sandbox is prepared and released
+      let ownedDuringStart: boolean | undefined
+      const started = await lifecycle.startKeyProxy(async () => {
+        ownedDuringStart = isSignalOwned()
+        return report(proxy)
+      })
+      await lifecycle.prepare({keyFilePaths: [], ghConfigDir: null, repoSkills: null})
+      const outcome = await lifecycle.release()
+
+      // #then signals were owned before the spawn, and the proxy stopped after the sandbox was taken back
+      expect(ownedDuringStart).toBe(true)
+      expect(started).toEqual({success: true, data: proxy})
+      expect(order).toEqual(['sandbox-stop', 'take-back', 'delete-account', 'proxy-stop'])
+      expect(stop).toHaveBeenCalledTimes(1)
+      expect(outcome).toEqual({stop: 'stopped', restore: 'restored', proxy: 'stopped'})
+    })
+
+    it('stops the proxy when no sandbox account was ever created', async () => {
+      // #given a proxy and a release with no prepare
+      const harness = createHarness()
+      const lifecycle = create(harness)
+      const {proxy, stop} = fakeProxy()
+      await lifecycle.startKeyProxy(async () => report(proxy))
+
+      // #when released
+      const outcome = await lifecycle.release()
+
+      // #then the proxy is stopped and the sandbox steps never ran
+      expect(stop).toHaveBeenCalledTimes(1)
+      expect(harness.mocks.stop).not.toHaveBeenCalled()
+      expect(outcome).toEqual({stop: 'never-started', restore: 'not-needed', proxy: 'stopped'})
+    })
+
+    it('stops the proxy once however many times release is called', async () => {
+      const harness = createHarness()
+      const lifecycle = create(harness)
+      const {proxy, stop} = fakeProxy()
+      await lifecycle.startKeyProxy(async () => report(proxy))
+
+      const [first, second] = await Promise.all([lifecycle.release(), lifecycle.release()])
+      await lifecycle.release()
+
+      expect(first).toEqual(second)
+      expect(stop).toHaveBeenCalledTimes(1)
+    })
+
+    it('records the run unsafe when the proxy exit cannot be confirmed', async () => {
+      // #given a proxy that cannot be confirmed stopped
+      const harness = createHarness()
+      const states: string[] = []
+      const lifecycle = create(harness, {recordState: state => states.push(state)})
+      const {proxy} = fakeProxy({outcome: 'unconfirmed'})
+      await lifecycle.startKeyProxy(async () => report(proxy))
+      await lifecycle.prepare({keyFilePaths: [], ghConfigDir: null, repoSkills: null})
+
+      // #when released
+      const outcome = await lifecycle.release()
+
+      // #then nothing is called restored, even though the sandbox itself was
+      expect(outcome.restore).toBe('unsafe')
+      expect(outcome.proxy).toBe('unconfirmed')
+      expect(outcome.reason).toMatch(/key proxy/)
+      expect(states.at(-1)).toBe('unsafe')
+    })
+
+    it('records the run unsafe when no sandbox was created and the proxy exit cannot be confirmed', async () => {
+      const harness = createHarness()
+      const lifecycle = create(harness)
+      const {proxy} = fakeProxy({outcome: 'unconfirmed'})
+      await lifecycle.startKeyProxy(async () => report(proxy))
+
+      const outcome = await lifecycle.release()
+
+      expect(outcome).toMatchObject({stop: 'never-started', restore: 'unsafe', proxy: 'unconfirmed'})
+    })
+
+    it('reports a proxy that died on its own as crashed, with the sandbox still restored', async () => {
+      const harness = createHarness()
+      const lifecycle = create(harness)
+      const {proxy} = fakeProxy({outcome: 'already-exited', crashed: true})
+      await lifecycle.startKeyProxy(async () => report(proxy))
+      await lifecycle.prepare({keyFilePaths: [], ghConfigDir: null, repoSkills: null})
+
+      const outcome = await lifecycle.release()
+
+      expect(outcome).toEqual({stop: 'stopped', restore: 'restored', proxy: 'crashed'})
+    })
+
+    it('treats a start that could not confirm its child is gone as unsafe', async () => {
+      // #given a start that failed and left an unconfirmed child
+      const harness = createHarness()
+      const lifecycle = create(harness)
+      const started = await lifecycle.startKeyProxy(async () => report(null, true))
+
+      // #when released
+      const outcome = await lifecycle.release()
+
+      // #then the start result is "no proxy" and the release is unsafe
+      expect(started).toEqual({success: true, data: null})
+      expect(outcome).toMatchObject({restore: 'unsafe', proxy: 'unconfirmed'})
+    })
+
+    it('treats a start that throws as unsafe and still rejects to its caller', async () => {
+      const harness = createHarness()
+      const lifecycle = create(harness)
+
+      await expect(
+        lifecycle.startKeyProxy(async () => {
+          throw new Error('spawn blew up')
+        }),
+      ).rejects.toThrow('spawn blew up')
+
+      expect(await lifecycle.release()).toMatchObject({restore: 'unsafe', proxy: 'unconfirmed'})
+    })
+
+    it('refuses a second proxy, and any proxy once the teardown has begun', async () => {
+      const harness = createHarness()
+      const lifecycle = create(harness)
+      const {proxy} = fakeProxy()
+      await lifecycle.startKeyProxy(async () => report(proxy))
+
+      const second = await lifecycle.startKeyProxy(async () => report(proxy))
+      await lifecycle.release()
+      const afterRelease = await lifecycle.startKeyProxy(async () => report(proxy))
+
+      expect(second.success).toBe(false)
+      expect(afterRelease.success).toBe(false)
+    })
+
+    it('never starts a proxy after SIGTERM arrived before the spawn', async () => {
+      // #given a signal before the proxy is requested
+      const harness = createHarness()
+      const host = fakeHost()
+      const lifecycle = create(harness, {signals: host})
+      const {proxy, stop} = fakeProxy()
+      await lifecycle.startKeyProxy(async () => report(proxy))
+      host.emitter.emit('SIGTERM')
+      await vi.waitFor(() => {
+        expect(host.killed).toEqual(['4242:SIGTERM'])
+      })
+
+      // #when another start is requested
+      const starter = vi.fn(async () => report(proxy))
+      const refused = await lifecycle.startKeyProxy(starter)
+
+      // #then it is refused and the earlier proxy was stopped
+      expect(refused.success).toBe(false)
+      expect(starter).not.toHaveBeenCalled()
+      expect(stop).toHaveBeenCalledTimes(1)
+    })
+
+    it('waits for a start that SIGTERM interrupts during readiness, then stops what it produced', async () => {
+      // #given a proxy start that is still waiting for its ready line
+      const harness = createHarness()
+      const host = fakeHost()
+      const lifecycle = create(harness, {signals: host})
+      const ready = deferred<void>()
+      const {proxy, stop} = fakeProxy()
+      let startSignal: AbortSignal | undefined
+      const starting = lifecycle.startKeyProxy(async context => {
+        startSignal = context.signal
+        await ready.promise
+        return report(proxy)
+      })
+
+      // #when SIGTERM arrives mid-start
+      host.emitter.emit('SIGTERM')
+      await Promise.resolve()
+
+      // #then the start was told to abort, and nothing is stopped or re-raised until it settles
+      expect(startSignal?.aborted).toBe(true)
+      expect(stop).not.toHaveBeenCalled()
+      expect(host.killed).toEqual([])
+
+      // #when the start produces its proxy anyway
+      ready.resolve()
+      await starting
+
+      // #then it is stopped before the signal is re-raised
+      await vi.waitFor(() => {
+        expect(host.killed).toEqual(['4242:SIGTERM'])
+      })
+      expect(stop).toHaveBeenCalledTimes(1)
+    })
+
+    it('stops a ready proxy when SIGTERM lands before prepare, and refuses the prepare', async () => {
+      // #given a running proxy and no prepare yet
+      const harness = createHarness()
+      const host = fakeHost()
+      const lifecycle = create(harness, {signals: host})
+      const {proxy, stop} = fakeProxy()
+      await lifecycle.startKeyProxy(async () => report(proxy))
+
+      // #when the signal arrives, then prepare is attempted
+      host.emitter.emit('SIGTERM')
+      await vi.waitFor(() => {
+        expect(host.killed).toEqual(['4242:SIGTERM'])
+      })
+      const prepared = await lifecycle.prepare({keyFilePaths: [], ghConfigDir: null, repoSkills: null})
+
+      // #then the proxy is stopped, and no account was created
+      expect(stop).toHaveBeenCalledTimes(1)
+      expect(prepared.success).toBe(false)
+      expect(harness.mocks.createAccount).not.toHaveBeenCalled()
+    })
+
+    it('fails closed when a start does not settle within the launch budget after it is aborted', async () => {
+      // #given a start that ignores its abort and never settles
+      const harness = createHarness()
+      const lifecycle = create(harness, {launchSettleBudgetMs: 30})
+      lifecycle.startKeyProxy(async () => new Promise<never>(() => undefined)).catch(() => undefined)
+
+      // #when released
+      const outcome = await lifecycle.release()
+
+      // #then the run is unsafe
+      expect(outcome).toMatchObject({restore: 'unsafe', proxy: 'unconfirmed'})
+    })
+  })
+
+  describe('a key proxy that is ready only after the release gave up waiting for its start', () => {
+    it('still stops the proxy when it turns up late, and the run stays unsafe', async () => {
+      // #given a start that ignores its abort and becomes ready after the settle budget
+      const harness = createHarness()
+      const lifecycle = create(harness, {launchSettleBudgetMs: 30})
+      const {ready, stop, proxy} = lateStart()
+      const starting = lifecycle.startKeyProxy(async () => {
+        await ready.promise
+        return {proxy, unconfirmed: false}
+      })
+
+      // #when the release gives up waiting and finishes
+      const outcome = await lifecycle.release()
+      expect(outcome).toMatchObject({restore: 'unsafe', proxy: 'unconfirmed'})
+      expect(stop).not.toHaveBeenCalled()
+
+      // #and the start then produces its proxy
+      ready.resolve()
+      const started = await starting
+
+      // #then the caller is handed no proxy (not a stopped one), that proxy is stopped once, and the outcome is unchanged
+      expect(started).toEqual({success: true, data: null})
+      await vi.waitFor(() => {
+        expect(stop).toHaveBeenCalledTimes(1)
+      })
+      expect(await lifecycle.release()).toBe(outcome)
+    })
+
+    it('does not stop a proxy twice when the release did wait for it', async () => {
+      // #given a start that settles within the budget
+      const harness = createHarness()
+      const lifecycle = create(harness, {launchSettleBudgetMs: 2000})
+      const {ready, stop, proxy} = lateStart()
+      const starting = lifecycle.startKeyProxy(async () => {
+        await ready.promise
+        return {proxy, unconfirmed: false}
+      })
+
+      // #when it becomes ready while the release is waiting
+      const releasing = lifecycle.release()
+      ready.resolve()
+      await starting
+      const outcome = await releasing
+
+      // #then it is stopped once, by the release, and the run is not unsafe
+      expect(stop).toHaveBeenCalledTimes(1)
+      expect(outcome).toMatchObject({proxy: 'stopped'})
+      expect(outcome.restore).not.toBe('unsafe')
+    })
+
+    it('logs and swallows a stop that throws for a late proxy', async () => {
+      const harness = createHarness()
+      const lifecycle = create(harness, {launchSettleBudgetMs: 30})
+      const ready = deferred<void>()
+      const stop = vi.fn(async () => Promise.reject(new Error('stop failed')))
+      const starting = lifecycle.startKeyProxy(async () => {
+        await ready.promise
+        return {proxy: {died: new AbortController().signal, stop}, unconfirmed: false}
+      })
+
+      await lifecycle.release()
+      ready.resolve()
+
+      // #then the caller is handed no proxy, whatever the stop did
+      await expect(starting).resolves.toEqual({success: true, data: null})
+
+      await vi.waitFor(() => {
+        expect(stop).toHaveBeenCalledTimes(1)
+      })
     })
   })
 

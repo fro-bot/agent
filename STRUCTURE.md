@@ -87,7 +87,7 @@ fro-bot/agent/
 - **`src/services/`** — Adapters that talk to external systems (GitHub API, Actions cache, S3, tool installers); no business logic.
 - **`src/features/`** — Business logic organized by capability; imports from `shared/` and `services/` only.
 - **`src/harness/`** — Entry points and phase orchestration; the only layer allowed to compose across all others.
-- **`apps/action/`** — Thin workspace package whose sole purpose is re-exporting `src/main.ts` and `src/post.ts`; its build produces the committed root `dist/`.
+- **`apps/action/`** — Thin workspace package that re-exports `src/main.ts` and `src/post.ts`, plus the `key-proxy.ts` entry (the `isolate-agent` key proxy child); its build produces the committed root `dist/`.
 - **`apps/workspace-agent/`** — Hono HTTP service that runs inside the workspace container (clone setup with staged root→agent ownership handoff, read-only `POST /inspect` checkout observation, `POST /update` checkout fast-forward, `POST /recover/preview`+`/recover` quarantine-and-replace, `GET`/`DELETE /backups` generations, bearer-gated control API, per-repo mutex and journal store, checkout-update git primitives, supervised unprivileged OpenCode); touch when adding workspace-side API endpoints. Serialize every mutating repo operation through `src/repo-mutex.ts` (also the sticky, restart-only maintenance hold) and record in-flight update/recovery state in `src/journal.ts`; real-git adversarial fixtures live in `src/update-fixtures/`. Import uid/gid/path constants from `src/identity.ts` (mirrored in `deploy/workspace.Dockerfile`) and run any git against an existing checkout through `src/git-safety.ts` as the agent uid — never as the root service. Checkout size/entry counts go through `src/agent-walk.ts`'s agent-uid or sealed-fd walker, never a root-owned path lookup. Checkout types in `src/types.ts` are mirrored in `packages/gateway/src/workspace-api/types.ts` and pinned by `scripts/checkout-types-drift-guard.test.ts` — change both sides together.
 - **`packages/gateway/`** — Discord-first daemon and operator web surface; the largest package, containing the mention loop, command handlers, approval gate, redaction pipeline, and the `web/ingress/` trusted-proxy client-address resolver that keys the unauthenticated operator-surface rate limits and OAuth bindings.
 - **`packages/harness/`** — Patched-OpenCode build and publish pipeline, retired from every runtime path (the Action and gateway run stock V2); its release workflows are removed and the source stays until the package is removed.
@@ -111,7 +111,7 @@ fro-bot/agent/
 
 | Package | Path | Role |
 | --- | --- | --- |
-| `@fro-bot/action` | `apps/action/` | Thin wrapper re-exporting root `src/`; build produces committed `dist/` |
+| `@fro-bot/action` | `apps/action/` | Thin wrapper re-exporting root `src/` and the key proxy entry; build produces committed `dist/` |
 | `@fro-bot/workspace-agent` | `apps/workspace-agent/` | Hono HTTP service in the workspace container |
 | `@fro-bot/gateway` | `packages/gateway/` | Discord daemon, operator web surface, mention loop, redaction |
 | `@fro.bot/harness` | `packages/harness/` | Patched-OpenCode build and publish pipeline; ships the `harness` and `opencode` commands |

@@ -194,7 +194,10 @@ export interface ScriptedSessionOptions {
   readonly workspace: string
   readonly env: NodeJS.ProcessEnv
   readonly lifecycle: SandboxLifecycle
-  readonly keyFile: string
+  /** The provider key file, referenced from the config. Omit it when `proxy` supplies the base URL and credential. */
+  readonly keyFile?: string
+  /** A key proxy's base URL and placeholder for the provider, in place of the direct URL and the key file. */
+  readonly proxy?: {readonly baseURL: string; readonly apiKey: string}
   readonly provider: ScriptedProvider
   readonly logger: Logger
   readonly turnTimeoutMs?: number
@@ -225,7 +228,10 @@ export async function startScriptedSession(options: ScriptedSessionOptions): Pro
             fake: {
               npm: '@ai-sdk/openai-compatible',
               name: 'Fake',
-              options: {baseURL: `http://127.0.0.1:${provider.port}/v1`, apiKey: `{file:${options.keyFile}}`},
+              options: options.proxy ?? {
+                baseURL: `http://127.0.0.1:${provider.port}/v1`,
+                apiKey: `{file:${options.keyFile ?? ''}}`,
+              },
               models: {'fixture-model': {name: 'Fixture', tool_call: true, limit: {context: 100_000, output: 8000}}},
             },
           },

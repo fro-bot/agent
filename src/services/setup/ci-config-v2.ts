@@ -54,6 +54,12 @@ export interface CIConfigV2Inputs {
    */
   readonly providerKeyFiles?: Readonly<Record<string, string>>
   /**
+   * `isolate-agent` runs: provider id to the key proxy's loopback base URL (`http://127.0.0.1:<port>/<id>`) and the
+   * run's placeholder key. Replaces the key file reference: the config holds no real key and no path to one. The
+   * operator's own base URL for the provider, in either spelling, is replaced. Exclusive with `providerKeyFiles`.
+   */
+  readonly proxiedProviders?: Readonly<Record<string, {readonly baseURL: string; readonly apiKey: string}>>
+  /**
    * The run's credential disposition (`resolveResponseDelivery`). Required, so a caller cannot omit it into the
    * permissive reading. On `withhold` (`pull_request`, `issue_comment`, `issues`) untrusted text drives the model, so
    * the operator's `mcp` is cut to its static local servers (`applyOperatorMcpV2`).
@@ -143,6 +149,9 @@ function withRepoSkillsPath(operatorSkills: unknown, directory: string): unknown
   return {paths: [directory]}
 }
 
+/** The key proxy's base URL for a provider: loopback, a port, and the provider id as the only path segment. */
+const PROXY_BASE_URL_PATTERN = /^http:\/\/127\.0\.0\.1:\d{1,5}\/([\w.-]+)$/
+
 /** The server's `{file:...}` substitution ends a reference at the first `}`. */
 const KEY_FILE_PATH_PATTERN = /^\/[^}\n\r"\\]+$/
 
@@ -164,6 +173,48 @@ function withProviderKeyFiles(
     provider[providerId] = {...existing, options: {...existingOptions, apiKey: `{file:${keyFile}}`}}
   }
   return ok(provider)
+}
+
+/** A provider block without its provider-level `api` URL, which would otherwise name the real upstream. */
+function withoutApi(block: Record<string, unknown>): Record<string, unknown> {
+  const copy = {...block}
+  delete copy.api
+  return copy
+}
+
+/**
+ * `provider.<id>.options` (the V1 spelling the server migrates) and, when the operator wrote one, `providers.<id>.settings`
+ * (the V2 spelling) both point at the proxy with the placeholder, so no spelling keeps the real upstream. A provider-level
+ * `api` URL is dropped. Every other operator setting for the provider is kept.
+ */
+function withProxiedProviders(
+  operatorProvider: unknown,
+  operatorProviders: unknown,
+  proxied: Readonly<Record<string, {readonly baseURL: string; readonly apiKey: string}>>,
+): Result<
+  {readonly provider: Record<string, unknown>; readonly providers: Record<string, unknown> | undefined},
+  string
+> {
+  const provider: Record<string, unknown> = isRecord(operatorProvider) ? {...operatorProvider} : {}
+  const providers: Record<string, unknown> | undefined = isRecord(operatorProviders)
+    ? {...operatorProviders}
+    : undefined
+  for (const [providerId, {baseURL, apiKey}] of Object.entries(proxied)) {
+    if (PROXY_BASE_URL_PATTERN.exec(baseURL)?.[1] !== providerId) {
+      return err(`Provider "${providerId}": the proxied base URL must be http://127.0.0.1:<port>/${providerId}`)
+    }
+    const existing = isRecord(provider[providerId]) ? provider[providerId] : {}
+    const existingRest = withoutApi(existing)
+    const existingOptions = isRecord(existingRest.options) ? existingRest.options : {}
+    provider[providerId] = {...existingRest, options: {...existingOptions, apiKey, baseURL}}
+
+    if (providers !== undefined && isRecord(providers[providerId])) {
+      const v2Rest = withoutApi(providers[providerId])
+      const settings = isRecord(v2Rest.settings) ? v2Rest.settings : {}
+      providers[providerId] = {...v2Rest, settings: {...settings, apiKey, baseURL}}
+    }
+  }
+  return ok({provider, providers})
 }
 
 /**
@@ -259,16 +310,27 @@ export function buildCIConfigV2(inputs: CIConfigV2Inputs, logger: Logger): Resul
   const operatorExperimental = isRecord(operator.experimental) ? operator.experimental : {}
 
   const keyFiles = inputs.providerKeyFiles ?? {}
+  const proxied = inputs.proxiedProviders ?? {}
+  if (Object.keys(keyFiles).length > 0 && Object.keys(proxied).length > 0) {
+    return err('provider key files and proxied providers cannot be combined')
+  }
   let provider: Record<string, unknown> | undefined
+  let providers: Record<string, unknown> | undefined
   if (Object.keys(keyFiles).length > 0) {
     const merged = withProviderKeyFiles(operator.provider, keyFiles)
     if (!merged.success) return err(merged.error)
     provider = merged.data
+  } else if (Object.keys(proxied).length > 0) {
+    const merged = withProxiedProviders(operator.provider, operator.providers, proxied)
+    if (!merged.success) return err(merged.error)
+    provider = merged.data.provider
+    providers = merged.data.providers
   }
 
   const content = {
     ...operator,
     ...(provider === undefined ? {} : {provider}),
+    ...(providers === undefined ? {} : {providers}),
     ...(inputs.repoSkillsDirectory === undefined
       ? {}
       : {skills: withRepoSkillsPath(operator.skills, inputs.repoSkillsDirectory)}),
@@ -281,6 +343,7 @@ export function buildCIConfigV2(inputs: CIConfigV2Inputs, logger: Logger): Resul
     hasUserConfig: inputs.opencodeConfig != null,
     pluginCount: content.plugins.length,
     keyFileProviders: Object.keys(keyFiles),
+    proxiedProviders: Object.keys(proxied),
     hasRepoSkills: inputs.repoSkillsDirectory !== undefined,
   })
 

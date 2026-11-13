@@ -59,6 +59,32 @@ export interface SandboxReleaseResult {
   readonly restore: 'not-needed' | 'restored' | 'unsafe'
   /** Why `restore` is `unsafe`, or why the stop was unconfirmed. Names a path or a check, never a secret. */
   readonly reason?: string
+  /**
+   * What became of the key proxy the lifecycle owned; absent when it owned none. `crashed`: it exited before the teardown
+   * asked it to, so the run's model requests cannot be trusted to have completed. `unconfirmed` also makes `restore`
+   * `unsafe`.
+   */
+  readonly proxy?: 'crashed' | 'stopped' | 'unconfirmed'
+}
+
+/** What the lifecycle needs of the key proxy it owns (`key-proxy-process.ts`). */
+export interface OwnedKeyProxy {
+  /** Aborts when the proxy exits without being asked to. */
+  readonly died: AbortSignal
+  /** Idempotent. `unconfirmed` means the exit was not observed. `crashed` means it exited before it was asked to. */
+  readonly stop: () => Promise<{
+    readonly outcome: 'already-exited' | 'killed' | 'stopped' | 'unconfirmed'
+    readonly crashed: boolean
+  }>
+}
+
+/**
+ * What a proxy start reports back. `proxy` is null when it failed. `unconfirmed` is true when it could not confirm that a
+ * child it started (or tried to) is gone: the teardown then fails closed.
+ */
+export interface KeyProxyStartReport<T extends OwnedKeyProxy> {
+  readonly proxy: T | null
+  readonly unconfirmed: boolean
 }
 
 /** What a launch is given: the launch spec for the sandbox user and a signal that aborts when the teardown begins. */
@@ -88,6 +114,16 @@ export interface SandboxLifecycle {
     spawn: (context: SandboxLaunchContext) => Promise<SandboxLaunchReport<T>>,
   ) => Promise<Result<T, string>>
   readonly release: () => Promise<SandboxReleaseResult>
+  /**
+   * Starts the key proxy under this lifecycle's ownership. Signal handling is taken before `start` runs and the attempt is
+   * recorded before it first awaits, so a signal or a `release` that begins mid-start aborts it (`context.signal`), waits for
+   * it, and stops whatever it produced. Works before `prepare` and without it: `release` stops the proxy on every branch,
+   * after the sandbox is taken back. Refused (`err`) once the teardown has begun, and for a second proxy. A `start` that
+   * throws rejects here, and the teardown then fails closed.
+   */
+  readonly startKeyProxy: <T extends OwnedKeyProxy>(
+    start: (context: {readonly signal: AbortSignal}) => Promise<KeyProxyStartReport<T>>,
+  ) => Promise<Result<T | null, string>>
 }
 
 /** Longest `release` waits for an in-flight launch to settle after aborting it, before it fails closed as unconfirmed. */
@@ -281,9 +317,17 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   const pendingLaunches = new Map<Promise<unknown>, AbortController>()
   // Set when a launcher could not confirm its own cleanup (or threw): the uid sweep cannot be trusted.
   let launchUnconfirmed = false
+  // The key proxy: at most one, started through `startKeyProxy`, stopped last by the teardown.
+  let proxy: OwnedKeyProxy | null = null
+  let proxyStart: Promise<unknown> | undefined
+  let proxyStartController: AbortController | undefined
+  let proxyUnconfirmed = false
+  // Set once the teardown has taken its decision about the proxy. A proxy that turns up after that is stopped on the spot.
+  let proxyTeardownDone = false
   const closeAdmission = (): void => {
     admissionClosed = true
     for (const controller of pendingLaunches.values()) controller.abort()
+    proxyStartController?.abort()
   }
   const record = (state: SandboxRunState): void => {
     try {
@@ -357,7 +401,21 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     logger,
   })
 
-  const doRelease = async (): Promise<SandboxReleaseResult> => {
+  /** Stops the key proxy, if the lifecycle owns one, and says what became of it. */
+  const stopProxy = async (): Promise<'crashed' | 'none' | 'stopped' | 'unconfirmed'> => {
+    proxyTeardownDone = true
+    if (proxy === null) return proxyUnconfirmed ? 'unconfirmed' : 'none'
+    try {
+      const result = await proxy.stop()
+      if (result.outcome === 'unconfirmed' || proxyUnconfirmed) return 'unconfirmed'
+      return result.crashed ? 'crashed' : 'stopped'
+    } catch (error) {
+      logger.error('Stopping the key proxy threw', {error: toErrorMessage(error)})
+      return 'unconfirmed'
+    }
+  }
+
+  const releaseSandbox = async (): Promise<SandboxReleaseResult> => {
     if (account === null) {
       // No account was recorded, but a `useradd` that timed out may have made one: that is not "nothing happened".
       if (timedOut() !== null) {
@@ -420,6 +478,29 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     return {stop, restore: 'restored'}
   }
 
+  /** The sandbox teardown, then the proxy: the sandbox's own requests are over before the proxy goes. */
+  const doRelease = async (): Promise<SandboxReleaseResult> => {
+    let sandbox: SandboxReleaseResult
+    let proxyStatus: Awaited<ReturnType<typeof stopProxy>>
+    try {
+      sandbox = await releaseSandbox()
+    } finally {
+      // A throw from the sandbox teardown must not leave the proxy running.
+      proxyStatus = await stopProxy()
+    }
+    if (proxyStatus === 'none') return sandbox
+    if (proxyStatus === 'unconfirmed') {
+      logger.error('The key proxy exit could not be confirmed; the run can no longer be trusted')
+      return {
+        ...sandbox,
+        restore: 'unsafe',
+        reason: sandbox.reason ?? 'the key proxy exit could not be confirmed, so the run cannot be trusted',
+        proxy: 'unconfirmed',
+      }
+    }
+    return {...sandbox, proxy: proxyStatus}
+  }
+
   /** The one teardown. Memoized; never waits for `prepare`, so `prepare` itself can use it to roll back. */
   const releaseNow = async (): Promise<SandboxReleaseResult> => {
     released ??= doRelease()
@@ -457,6 +538,16 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
           logger.error('A sandbox launch did not settle after it was aborted; the teardown fails closed')
         }
       }
+      if (proxyStart !== undefined) {
+        const settled = await settlesWithin(
+          proxyStart.catch(() => undefined),
+          options.launchSettleBudgetMs ?? LAUNCH_SETTLE_BUDGET_MS,
+        )
+        if (!settled) {
+          proxyUnconfirmed = true
+          logger.error('The key proxy start did not settle after it was aborted; the teardown fails closed')
+        }
+      }
       return releaseNow()
     })()
   }
@@ -484,6 +575,41 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     } finally {
       pendingLaunches.delete(report)
     }
+  }
+
+  const startKeyProxy: SandboxLifecycle['startKeyProxy'] = async start => {
+    // Everything up to the registration below is synchronous: a release that starts after this call sees the attempt.
+    if (admissionClosed || cancelled || proxyStart !== undefined) {
+      return err('the sandbox is not accepting a key proxy (the teardown has begun, or one is already running)')
+    }
+    // Signal ownership before the spawn: from here a signal reaches the teardown, which stops the proxy.
+    installSignalHandlers()
+    const controller = new AbortController()
+    proxyStartController = controller
+    const attempt = (async () => {
+      try {
+        const report = await start({signal: controller.signal})
+        if (report.unconfirmed) proxyUnconfirmed = true
+        if (report.proxy === null) return null
+        if (proxyTeardownDone) {
+          // The release gave up waiting for this start (the run is already `unsafe`), and it was ready after all: nothing
+          // may be left running, and the caller is not handed a proxy it must not use.
+          logger.error('The key proxy became ready after the teardown; stopping it')
+          await report.proxy.stop().catch((error: unknown) => {
+            logger.error('Stopping the late key proxy threw', {error: toErrorMessage(error)})
+          })
+          return null
+        }
+        proxy = report.proxy
+        return report.proxy
+      } catch (error) {
+        // Whether it started something before throwing is unknown.
+        proxyUnconfirmed = true
+        throw error
+      }
+    })()
+    proxyStart = attempt
+    return ok(await attempt)
   }
 
   releaseRef = release
@@ -607,5 +733,5 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   }
 
   // False from the moment a signal begins the teardown (not when it ends), so a caller about to spawn the server sees it.
-  return {prepare, launch, release}
+  return {prepare, launch, release, startKeyProxy}
 }
