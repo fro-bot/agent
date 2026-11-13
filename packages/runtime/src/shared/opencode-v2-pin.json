@@ -1,11 +1,11 @@
 {
-  "version": "2.2.6",
+  "version": "2.2.7",
   "assets": {
-    "opencode-linux-x64.tar.gz": "08bb21d6326ce740d91cce7ebe88a6536933f6e1e30353b91a06b01f25da306c",
-    "opencode-linux-arm64.tar.gz": "f2d27600c367e45057d6a16f6a5c2aa8d77b41a9b10d4bc3d849c2f88870e944",
-    "opencode-darwin-x64.zip": "b2962dc445d873df56ae7d3ba7e66502b046bbc4dafa820eca18d0303a98a29c",
-    "opencode-darwin-arm64.zip": "15491608f6b0bc4debe5eac35eab629a2b07ea9a1fbac68ad53bcea59fcc4b45",
-    "opencode-linux-x64-musl.tar.gz": "97ce1345a1fdbfb105d9cdf23c57385ac30ed1495ef329dbdbf09c917b479f21",
-    "opencode-linux-arm64-musl.tar.gz": "ef1907a3ac88f92669fbbe4f7a94b7117208b63b5cc02b2cc2db29243e744291"
+    "opencode-linux-x64.tar.gz": "89a6cee227b54bc011179c528a5e63176032462b1a5e21723b616801cddc2ca7",
+    "opencode-linux-arm64.tar.gz": "c1682057f0815cb2abdd6e00305f1146ebaf1c167f0335cdb74ddc80008120e7",
+    "opencode-darwin-x64.zip": "3e4ea96ece041218cc74bc7c7d5cd202ff1f7983e32fc7ab6c58d532445e7961",
+    "opencode-darwin-arm64.zip": "811c42be9cad489ea8c411ead49e06f691deee4957ba9a0a56a159a7d6c1abdc",
+    "opencode-linux-x64-musl.tar.gz": "c1801a36bf61e03eafac8d7f4521a200e4d3cd76cf43b36621cb78b460b851ee",
+    "opencode-linux-arm64-musl.tar.gz": "a03405f94ae02db7acb0870cf32030bab86460dc7faf524780e9cae305526b96"
   }
 }
