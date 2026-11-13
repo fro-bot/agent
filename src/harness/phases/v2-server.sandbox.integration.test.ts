@@ -9,11 +9,12 @@
  * tool shell as the sandbox user. Each "blocked" probe has a positive control: the same command run as the runner must
  * succeed (be OPEN), otherwise a BLOCKED result proves nothing.
  *
- * Four suites run one after another (the sandbox account name is fixed, so two never overlap):
+ * Five suites run one after another (the sandbox account name is fixed, so two never overlap):
  *   1. the boundary: blocked and works rows, identity, quiescence, take-back;
  *   2. a provisioned `gh` config and an admitted repo skill;
  *   3. the persistence round trip (restore, isolated run, checkpoint and save, restore, isolated run);
- *   4. hostile git state written through the model's shell, then runner-side git after take-back.
+ *   4. hostile git state written through the model's shell, then runner-side git after take-back;
+ *   5. the key proxy: the model reaches the provider only through it, and the real key is nowhere the sandbox can read.
  *
  *   FRO_BOT_SANDBOX_INTEGRATION=1 FRO_BOT_OPENCODE_V2_BIN=/path/to/opencode bun run test src/harness/phases/v2-server.sandbox
  */
@@ -24,12 +25,15 @@ import type {Probe, Row, ScriptedProvider} from './v2-server.sandbox.harness.js'
 import {spawnSync} from 'node:child_process'
 import {createHash} from 'node:crypto'
 import * as fs from 'node:fs'
+import http from 'node:http'
+import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 import {DatabaseSync} from 'node:sqlite'
 import {getSessionDbBasenames} from '@fro-bot/runtime'
 import {afterAll, beforeAll, describe, expect, it} from 'vitest'
+import {startTlsUpstream, type TlsUpstream} from '../../../packages/runtime/src/agent/key-proxy-test-kit.js'
 import {resolveBrokeredPushCommitMessage} from '../../features/delegated/commit-message.js'
 import {reconstructChanges} from '../../features/delegated/reconstruct-changes.js'
 import {
@@ -48,6 +52,7 @@ import {createSandboxPreflightDeps, runSandboxPreflight} from '../../services/se
 import {STORAGE_VERSION} from '../../shared/constants.js'
 import {getGitHubRunAttempt, getInvocationIdentity} from '../../shared/env.js'
 import {createLogger} from '../../shared/logger.js'
+import {startKeyProxyProcess, type KeyProxyProcess} from './key-proxy-process.js'
 import {createSandboxLifecycle} from './sandbox-lifecycle.js'
 import {
   describeReconstruction,
@@ -224,7 +229,7 @@ function createPublishedActionLayout(): void {
     path.join(fakeActionRoot, 'action.yaml'),
     'name: sandbox-it\nruns:\n  using: node24\n  main: dist/main.js\n',
   )
-  for (const script of ['main.js', 'post.js'])
+  for (const script of ['main.js', 'post.js', 'key-proxy.js'])
     fs.writeFileSync(path.join(fakeActionRoot, 'dist', script), '// stand-in\n')
 }
 
@@ -1334,5 +1339,219 @@ describe.skipIf(!gated)('isolate-agent .git/commondir redirect through a real mo
     expect(result?.released.restore).toBe('unsafe')
     expect(result?.released.reason ?? '').toContain('commondir')
     expect(fs.existsSync(path.join(workspace, '.git', 'commondir'))).toBe(true)
+  })
+})
+
+// --- 5. The key proxy --------------------------------------------------------------------------------------------------
+
+/** Passes each request to the scripted provider's plain-HTTP port, so the real model turn runs behind the TLS upstream. */
+function forwardToProvider(port: number): (request: TlsUpstream['requests'][number], res: http.ServerResponse) => void {
+  return (request, res) => {
+    const outbound = http.request(
+      {
+        host: '127.0.0.1',
+        port,
+        method: request.method,
+        path: request.url,
+        headers: {
+          'content-type': String(request.headers['content-type'] ?? 'application/json'),
+          'content-length': request.body.length,
+        },
+      },
+      response => {
+        res.writeHead(response.statusCode ?? 502, response.headers)
+        response.pipe(res)
+      },
+    )
+    outbound.on('error', () => {
+      if (res.headersSent) res.destroy()
+      else res.writeHead(502).end()
+    })
+    outbound.end(request.body)
+  }
+}
+
+function findBunOnPath(): string {
+  const found = spawnSync('which', ['bun'], {encoding: 'utf8'})
+  if (found.status !== 0 || found.stdout.trim().length === 0) throw new Error('bun is required on PATH for this suite')
+  return found.stdout.trim()
+}
+
+const PROXY_SOURCE_ENTRY = path.join(process.cwd(), 'apps', 'action', 'src', 'key-proxy.ts')
+
+// The provider key never reaches the sandbox: the proxy child (runner user, empty environment) holds it, the sandboxed
+// server holds a placeholder that only works on the proxy's loopback port, and the model turn goes through the proxy.
+describe.skipIf(!gated)('isolate-agent key proxy through a real model shell', () => {
+  const logger = createLogger({phase: 'sandbox-integration-key-proxy'})
+  const scratch = path.join(runnerTemp, `sandbox-it-key-proxy-${process.pid}`)
+  const workspace = path.join(scratch, 'ws')
+  const responseDir = path.join(scratch, 'response')
+  const REAL_KEY = 'sk-real-proxy-canary-7f3a91'
+  let provider: ScriptedProvider | undefined
+  let upstream: TlsUpstream | undefined
+  let lifecycle: SandboxLifecycle | undefined
+  let proxy: KeyProxyProcess | undefined
+  let rows = new Map<string, Row[]>()
+  let released: SandboxReleaseResult | undefined
+  let reachableAfterRelease = true
+
+  const curlStatus = (
+    id: string,
+    header: string | null,
+    route: string,
+    wantStatus: string,
+    passStatus: string,
+  ): string =>
+    `c=$(curl -sS -o /dev/null --max-time 10 -w '%{http_code}' ${header === null ? '' : `-H ${q(header)}`} ${q(`http://127.0.0.1:${proxy?.port}${route}`)} 2>&1); ` +
+    `[ "$c" = ${wantStatus} ] && R ${id} ${passStatus} "$c" || R ${id} FAILED "[$c]"`
+
+  const probes = (): Probe[] => {
+    const bearer = `Authorization: Bearer ${proxy?.placeholder ?? ''}`
+    return [
+      {
+        // The positive control for the rows below: the placeholder is accepted and the request reaches the upstream.
+        id: 'proxy_models_with_placeholder',
+        category: 'works',
+        cmd: curlStatus('proxy_models_with_placeholder', bearer, '/fake/models', '200', 'WORKS'),
+      },
+      {
+        id: 'proxy_refuses_wrong_credential',
+        category: 'blocked',
+        cmd: curlStatus(
+          'proxy_refuses_wrong_credential',
+          'Authorization: Bearer not-the-placeholder',
+          '/fake/models',
+          '401',
+          'BLOCKED',
+        ),
+      },
+      {
+        id: 'proxy_refuses_missing_credential',
+        category: 'blocked',
+        cmd: curlStatus('proxy_refuses_missing_credential', null, '/fake/models', '401', 'BLOCKED'),
+      },
+      {
+        id: 'proxy_refuses_unlisted_route',
+        category: 'blocked',
+        cmd: curlStatus('proxy_refuses_unlisted_route', bearer, '/fake/files', '404', 'BLOCKED'),
+      },
+      {
+        id: 'proxy_refuses_unknown_provider',
+        category: 'blocked',
+        cmd: curlStatus('proxy_refuses_unknown_provider', bearer, '/other/models', '404', 'BLOCKED'),
+      },
+      {
+        // grep must work (control), then the real key must be in none of the places the sandbox can read.
+        id: 'real_key_absent',
+        category: 'blocked',
+        cmd:
+          `printf %s ${q(REAL_KEY)} | grep -qF ${q(REAL_KEY)} || { R real_key_absent FAILED "grep control"; exit 0; }; ${String.raw`hits=$( { tr '\0' '\n' < /proc/$PPID/environ; tr '\0' '\n' < /proc/self/environ; `}cat /proc/${proxy?.pid}/cmdline /proc/${proxy?.pid}/environ; ` +
+          `grep -rIlF ${q(REAL_KEY)} "$HOME" "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME" ${q(responseDir)} ${q(workspace)}; } 2>/dev/null | grep -cF ${q(REAL_KEY)} ); ` +
+          `[ "$hits" = 0 ] && R real_key_absent BLOCKED "no copy of the key in env, proxy argv or readable files" || R real_key_absent OPEN "copies=$hits"`,
+      },
+    ]
+  }
+
+  beforeAll(async () => {
+    const tools = await preflightTools(logger)
+    fs.mkdirSync(responseDir, {recursive: true})
+    initWorkspace(workspace)
+    provider = await startScriptedProvider(() => probes())
+    upstream = await startTlsUpstream(forwardToProvider(provider.port))
+    const env = hostedEnv(workspace)
+    lifecycle = createSandboxLifecycle({
+      tools,
+      env,
+      runnerHome,
+      workspacePath: workspace,
+      responseDir,
+      logger,
+    })
+    const started = await lifecycle.startKeyProxy(async context => {
+      const result = await startKeyProxyProcess({
+        providers: [
+          {providerId: 'fake', key: REAL_KEY, baseUrl: `${upstream?.origin ?? ''}/v1`, protocols: ['openai-chat']},
+        ],
+        logger,
+        launcher: {command: findBunOnPath(), args: [PROXY_SOURCE_ENTRY]},
+        testing: {upstreamCa: upstream?.ca ?? ''},
+        signal: context.signal,
+      })
+      return result.success
+        ? {proxy: result.data, unconfirmed: false}
+        : {proxy: null, unconfirmed: result.error.cleanup === 'unconfirmed'}
+    })
+    if (!started.success || started.data === null) throw new Error('key proxy did not start')
+    proxy = started.data
+
+    const prepared = await lifecycle.prepare({keyFilePaths: [], ghConfigDir: null, repoSkills: null})
+    if (!prepared.success) throw new Error(prepared.error)
+    const handle = await startScriptedSession({
+      binary: BINARY ?? '',
+      workspace,
+      env,
+      lifecycle,
+      provider,
+      proxy: {baseURL: proxy.baseUrl('fake'), apiKey: proxy.placeholder},
+      logger,
+    })
+    rows = parseRows(provider.state.results.join('\n'))
+    await handle.shutdown()
+    released = await lifecycle.release()
+    reachableAfterRelease = await new Promise<boolean>(resolve => {
+      const socket = net.connect({host: '127.0.0.1', port: proxy?.port ?? 0})
+      socket.once('connect', () => {
+        socket.destroy()
+        resolve(true)
+      })
+      socket.once('error', () => resolve(false))
+    })
+  }, 900_000)
+
+  afterAll(async () => {
+    await lifecycle?.release()
+    await provider?.close()
+    await upstream?.close()
+    try {
+      fs.rmSync(scratch, {recursive: true, force: true})
+    } catch {
+      // the job's VM is discarded
+    }
+  }, 120_000)
+
+  it('accepts the placeholder on the proxy, and refuses a wrong or missing credential, an unlisted route and an unknown provider', () => {
+    // #given the scripted model's own shell, as the sandbox user
+    // #then the one accepted request is the positive control for the four refusals
+    expect(failuresFor(rows, 'proxy_models_with_placeholder', 'WORKS')).toEqual([])
+    for (const id of [
+      'proxy_refuses_wrong_credential',
+      'proxy_refuses_missing_credential',
+      'proxy_refuses_unlisted_route',
+      'proxy_refuses_unknown_provider',
+    ]) {
+      expect(failuresFor(rows, id, 'BLOCKED')).toEqual([])
+    }
+  })
+
+  it('leaves no copy of the real key where the sandbox can read it', () => {
+    expect(failuresFor(rows, 'real_key_absent', 'BLOCKED')).toEqual([])
+  })
+
+  it('sends the model turn through the proxy with the real key, and never the placeholder', () => {
+    // #given everything the upstream received
+    const seen = upstream?.requests ?? []
+
+    // #then the model's chat completion arrived, every request carried the real key, and none carried the placeholder
+    expect(seen.some(request => request.method === 'POST' && request.url === '/v1/chat/completions')).toBe(true)
+    for (const request of seen) {
+      expect(request.headers.authorization).toBe(`Bearer ${REAL_KEY}`)
+      expect(JSON.stringify(request.headers)).not.toContain(proxy?.placeholder ?? 'unset')
+    }
+  })
+
+  it('stops the proxy after the sandbox is stopped and restored, and closes its port', () => {
+    expect(released?.proxy).toBe('stopped')
+    expect(released?.restore).toBe('restored')
+    expect(reachableAfterRelease).toBe(false)
   })
 })
