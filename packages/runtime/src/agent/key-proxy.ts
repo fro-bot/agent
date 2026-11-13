@@ -4,7 +4,7 @@ import type {Logger} from '../shared/logger.js'
 import type {Result} from '../shared/types.js'
 import type {KeyProxyRoute} from './key-proxy-routes.js'
 import {Buffer} from 'node:buffer'
-import {createHash, timingSafeEqual} from 'node:crypto'
+import {timingSafeEqual} from 'node:crypto'
 import http from 'node:http'
 import https from 'node:https'
 import {Transform} from 'node:stream'
@@ -25,7 +25,7 @@ import {matchKeyProxyRoute} from './key-proxy-routes.js'
  *    (a `Map` lookup), and its method, path and query are one of that provider's routes. Everything else is answered
  *    locally and sends nothing upstream.
  * 2. The credential header the route's protocol uses must carry the run's placeholder, compared with `timingSafeEqual`
- *    over fixed-size digests. No other client credential header is forwarded, and the real credential is set last.
+ *    (a different length is refused first; the length is fixed and public). No other client credential header is forwarded, and the real credential is set last.
  * 3. Outbound headers are built from a short allowlist. Hop-by-hop headers, and any header named in `Connection`, are
  *    dropped. `accept-encoding` is always `identity`.
  * 4. A 3xx from the upstream is never followed and never passed on: the client gets a local 502.
@@ -132,6 +132,9 @@ const SUCCESS_RESPONSE_HEADERS: readonly string[] = [
 /** Upstream response headers passed to the client on a non-2xx whose body is forwarded. */
 const ERROR_RESPONSE_HEADERS: readonly string[] = ['content-type', 'retry-after', 'retry-after-ms']
 
+/** Upstream response headers kept on the fixed generic error that replaces a compressed or oversized error body. */
+const GENERIC_ERROR_RESPONSE_HEADERS: readonly string[] = ['retry-after', 'retry-after-ms']
+
 /** Headers that only describe one hop. Named by RFC 9110 §7.6.1 and its relatives. */
 const HOP_BY_HOP: ReadonlySet<string> = new Set([
   'connection',
@@ -165,8 +168,13 @@ interface MatchedRoute {
 /** Set on the byte counter when the request body outgrows the bound. */
 const REQUEST_TOO_LARGE = new Error('request body too large')
 
-function digestOf(value: string): Buffer {
-  return createHash('sha256').update(value).digest()
+/**
+ * Constant-time compare of the presented credential with the run's placeholder. The placeholder's length is fixed and
+ * public, so a length mismatch is answered at once and leaks nothing.
+ */
+function matchesPlaceholder(presented: string, placeholder: Buffer): boolean {
+  const bytes = Buffer.from(presented)
+  return bytes.length === placeholder.length && timingSafeEqual(bytes, placeholder)
 }
 
 function countRawHeader(rawHeaders: readonly string[], name: string): number {
@@ -253,7 +261,7 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
   if (!providers.success) return err(providers.error)
   const byId = providers.data
 
-  const placeholderDigest = digestOf(options.placeholder)
+  const placeholderBytes = Buffer.from(options.placeholder)
   const agent = new https.Agent({
     keepAlive: false,
     rejectUnauthorized: true,
@@ -301,7 +309,7 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
   const isAuthorized = (req: IncomingMessage, route: KeyProxyRoute): boolean => {
     const presented = presentedCredential(req, route)
     if (presented === undefined) return false
-    return timingSafeEqual(digestOf(presented), placeholderDigest)
+    return matchesPlaceholder(presented, placeholderBytes)
   }
 
   const outboundHeaders = (req: IncomingMessage, matched: MatchedRoute, hasBody: boolean): http.OutgoingHttpHeaders => {
@@ -326,13 +334,12 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
     return headers
   }
 
-  const pickHeaders = (source: IncomingHttpHeaders, names: readonly string[]): http.OutgoingHttpHeaders => {
-    const picked: http.OutgoingHttpHeaders = {}
+  /** Copies the allowlisted upstream headers onto the response. Every name set is one from a constant allowlist. */
+  const copyHeaders = (res: ServerResponse, source: IncomingHttpHeaders, names: readonly string[]): void => {
     for (const name of names) {
-      const value = source[name]
-      if (value !== undefined) picked[name] = value
+      const value = headerValue(source[name])
+      if (value !== undefined) res.setHeader(name, value)
     }
-    return picked
   }
 
   /** Reads a non-2xx body whole, redacts the key and forwards it; or replaces it with the fixed generic error. */
@@ -347,12 +354,10 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
       upstreamRes.destroy()
       stop()
       logger.warning('key-proxy: upstream error replaced', {category, status, provider: provider.id})
-      const headers = pickHeaders(upstreamRes.headers, ['retry-after', 'retry-after-ms'])
-      res.writeHead(status, {
-        ...headers,
-        'content-type': 'application/json',
-        'content-length': Buffer.byteLength(GENERIC_UPSTREAM_ERROR),
-      })
+      copyHeaders(res, upstreamRes.headers, GENERIC_ERROR_RESPONSE_HEADERS)
+      res.setHeader('content-type', 'application/json')
+      res.setHeader('content-length', String(Buffer.byteLength(GENERIC_UPSTREAM_ERROR)))
+      res.writeHead(status)
       res.end(GENERIC_UPSTREAM_ERROR)
     }
 
@@ -385,10 +390,9 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
       stop()
       let body: Buffer = Buffer.concat(chunks)
       for (const secret of provider.secrets) body = replaceAll(body, secret, Buffer.from(REDACTED))
-      res.writeHead(status, {
-        ...pickHeaders(upstreamRes.headers, ERROR_RESPONSE_HEADERS),
-        'content-length': body.length,
-      })
+      copyHeaders(res, upstreamRes.headers, ERROR_RESPONSE_HEADERS)
+      res.setHeader('content-length', String(body.length))
+      res.writeHead(status)
       res.end(body)
     })
   }
@@ -489,7 +493,8 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
         forwardError(upstreamRes, status, target.provider, res, stop)
         return
       }
-      res.writeHead(status, pickHeaders(upstreamRes.headers, SUCCESS_RESPONSE_HEADERS))
+      copyHeaders(res, upstreamRes.headers, SUCCESS_RESPONSE_HEADERS)
+      res.writeHead(status)
       pipeline(upstreamRes, res)
         .catch(() => {
           // The upstream died or the client left. The head is out, so the only honest ending is an aborted stream.

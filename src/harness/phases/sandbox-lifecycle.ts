@@ -478,7 +478,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   /** The sandbox teardown, then the proxy: the sandbox's own requests are over before the proxy goes. */
   const doRelease = async (): Promise<SandboxReleaseResult> => {
     let sandbox: SandboxReleaseResult
-    let proxyStatus: Awaited<ReturnType<typeof stopProxy>> = 'none'
+    let proxyStatus: Awaited<ReturnType<typeof stopProxy>>
     try {
       sandbox = await releaseSandbox()
     } finally {
