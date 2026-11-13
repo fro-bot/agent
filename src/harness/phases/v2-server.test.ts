@@ -1,4 +1,5 @@
 import type {OpenCodeV2ServerHandle, OpenCodeV2ShutdownResult} from '@fro-bot/runtime'
+import type {KeyProxyProbeResult} from './key-proxy-probe.js'
 import type {KeyProxyProcess} from './key-proxy-process.js'
 import type {SandboxLifecycle} from './sandbox-lifecycle.js'
 import type {StartActionOpenCodeV2Deps, StartActionOpenCodeV2Options} from './v2-server.js'
@@ -211,7 +212,8 @@ describe('startActionOpenCodeV2', () => {
     // #given two API keys and an operator config that sets a base URL, a timeout and a key reference
     const server = fakeServer()
     const startKeyProxy = vi.fn()
-    const deps = recordingDeps(server, {startKeyProxy})
+    const probeKeyProxy = vi.fn()
+    const deps = recordingDeps(server, {startKeyProxy, probeKeyProxy})
     const opencodeConfig = JSON.stringify({
       provider: {
         anthropic: {options: {baseURL: 'https://gw.example/v1', timeout: 600_000}},
@@ -267,6 +269,7 @@ describe('startActionOpenCodeV2', () => {
 
     // #then no proxy was involved
     expect(startKeyProxy).not.toHaveBeenCalled()
+    expect(probeKeyProxy).not.toHaveBeenCalled()
   })
 
   it('installs the plugins under the bound before the spawn when a matching binary meets an empty plugin cache', async () => {
@@ -1360,6 +1363,7 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
     keyProxy = fakeKeyProxy()
     return {
       startKeyProxy: vi.fn<StartActionOpenCodeV2Deps['startKeyProxy']>(async () => ok(keyProxy.proxy)),
+      probeKeyProxy: vi.fn<StartActionOpenCodeV2Deps['probeKeyProxy']>(async () => ({status: 'passed'})),
       startServer: vi.fn<StartServer>(async spawnOptions => {
         order.push('spawn')
         server.loadConfig(spawnOptions.config)
@@ -1842,6 +1846,207 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
       expect(result.success).toBe(true)
       expect(deps.startKeyProxy).not.toHaveBeenCalled()
       expect(sandbox.startKeyProxy).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('the start-up probe', () => {
+    const TWO_KEYS = JSON.stringify({
+      anthropic: {type: 'api', key: CANARY},
+      openai: {type: 'api', key: `${CANARY}-oai`},
+    })
+
+    async function runWith(
+      sandbox: SandboxLifecycle,
+      deps: Partial<StartActionOpenCodeV2Deps>,
+      overrides: {
+        readonly model?: string | null
+        readonly authJson?: string
+        readonly logger?: ReturnType<typeof createMockLogger>
+      } = {},
+    ) {
+      return startActionOpenCodeV2({
+        binaryPath: '/opt/opencode',
+        workspacePath: '/workspace',
+        authJson: overrides.authJson ?? TWO_KEYS,
+        opencodeConfig: null,
+        credential: 'provision',
+        systematicVersion: 'latest',
+        model: overrides.model === undefined ? 'anthropic/claude-sonnet' : overrides.model,
+        dbPath,
+        authPath,
+        env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome},
+        runId: 42,
+        runAttempt: 1,
+        logger: overrides.logger ?? createMockLogger(),
+        sandbox,
+        deps,
+      })
+    }
+
+    it('probes only the provider of the selected model, through the owned proxy', async () => {
+      // #given two configured providers and a model on the first
+      const server = fakeServer()
+      const deps = depsFor(server)
+      const sandbox = fakeSandbox()
+
+      // #when an isolated run starts
+      const result = await runWith(sandbox.sandbox, deps)
+
+      // #then one probe ran, for anthropic only, with the proxy's placeholder and the run's signal
+      expect(result.success).toBe(true)
+      expect(deps.probeKeyProxy).toHaveBeenCalledTimes(1)
+      const probeOptions = vi.mocked(deps.probeKeyProxy).mock.calls[0]?.[0]
+      expect(probeOptions?.plan.providerId).toBe('anthropic')
+      expect(probeOptions?.proxy.placeholder).toBe(PROXY_PLACEHOLDER)
+      expect(probeOptions?.proxy.baseUrl('anthropic')).toBe('http://127.0.0.1:43111/anthropic')
+    })
+
+    it('probes the other provider when the model is on it', async () => {
+      const server = fakeServer()
+      const deps = depsFor(server)
+
+      await runWith(fakeSandbox().sandbox, deps, {model: 'openai/gpt-5'})
+
+      expect(vi.mocked(deps.probeKeyProxy).mock.calls.map(call => call[0].plan.providerId)).toEqual(['openai'])
+    })
+
+    it('runs the probe after the permission gate and before the import wait', async () => {
+      // #given the order of the gates
+      const server = fakeServer()
+      const callOrder: string[] = []
+      const original = server.fetch.getMockImplementation()
+      server.fetch.mockImplementation(async pathname => {
+        if (pathname === '/api/agent') callOrder.push('permission-gate')
+        return (await original?.(pathname)) ?? new Response('{}', {status: 404})
+      })
+      const deps = depsFor(server, {
+        probeKeyProxy: vi.fn<StartActionOpenCodeV2Deps['probeKeyProxy']>(async () => {
+          callOrder.push('probe')
+          return {status: 'passed'}
+        }),
+        waitForImport: vi.fn(async () => {
+          callOrder.push('import-wait')
+          return {success: true, data: undefined} as const
+        }),
+      })
+
+      // #when
+      await runWith(fakeSandbox().sandbox, deps)
+
+      // #then
+      expect(callOrder.indexOf('permission-gate')).toBeLessThan(callOrder.indexOf('probe'))
+      expect(callOrder.indexOf('probe')).toBeLessThan(callOrder.indexOf('import-wait'))
+    })
+
+    it('fails at the key-proxy stage on auth-rejected, stops the server first, and releases', async () => {
+      // #given an upstream that rejects the key
+      const server = fakeServer()
+      const deps = depsFor(server, {
+        probeKeyProxy: vi.fn<StartActionOpenCodeV2Deps['probeKeyProxy']>(
+          async () =>
+            ({
+              status: 'failed',
+              class: 'auth-rejected',
+              message: 'Provider "anthropic" rejected its key at start-up (auth-rejected, HTTP 401).',
+            }) satisfies KeyProxyProbeResult,
+        ),
+      })
+      const sandbox = fakeSandbox()
+
+      // #when
+      const result = await runWith(sandbox.sandbox, deps)
+
+      // #then it failed before the model could start: server stopped, then the sandbox released, and no import wait
+      const error = unwrapErr(result)
+      expect(error.stage).toBe('key-proxy')
+      expect(error.message).toContain('auth-rejected')
+      expect(error.message).toContain('anthropic')
+      expect(server.shutdown).toHaveBeenCalledTimes(1)
+      expect(sandbox.release).toHaveBeenCalledTimes(1)
+      expect(server.shutdown.mock.invocationCallOrder[0]).toBeLessThan(sandbox.release.mock.invocationCallOrder[0] ?? 0)
+      expect(deps.waitForImport).not.toHaveBeenCalled()
+    })
+
+    it.each(['rate-limited', 'unreachable', 'unverifiable'] as const)(
+      'continues the run on a %s warning',
+      async warningClass => {
+        const server = fakeServer()
+        const deps = depsFor(server, {
+          probeKeyProxy: vi.fn<StartActionOpenCodeV2Deps['probeKeyProxy']>(async () => ({
+            status: 'warned',
+            class: warningClass,
+          })),
+        })
+
+        const result = await runWith(fakeSandbox().sandbox, deps)
+
+        expect(result.success).toBe(true)
+        expect(server.shutdown).not.toHaveBeenCalled()
+        expect(deps.waitForImport).toHaveBeenCalledTimes(1)
+      },
+    )
+
+    it('fails at the key-proxy stage when the run is aborted during the probe', async () => {
+      const server = fakeServer()
+      const deps = depsFor(server, {
+        probeKeyProxy: vi.fn<StartActionOpenCodeV2Deps['probeKeyProxy']>(async () => ({
+          status: 'aborted',
+          message: 'Key proxy probe for provider "anthropic" was aborted with the run',
+        })),
+      })
+      const sandbox = fakeSandbox()
+
+      const result = await runWith(sandbox.sandbox, deps)
+
+      expect(unwrapErr(result).stage).toBe('key-proxy')
+      expect(server.shutdown).toHaveBeenCalledTimes(1)
+      expect(sandbox.release).toHaveBeenCalledTimes(1)
+    })
+
+    it('stops the server and releases when the probe throws', async () => {
+      const server = fakeServer()
+      const deps = depsFor(server, {
+        probeKeyProxy: vi.fn<StartActionOpenCodeV2Deps['probeKeyProxy']>(async () =>
+          Promise.reject(new Error('probe blew up')),
+        ),
+      })
+      const sandbox = fakeSandbox()
+
+      await expect(runWith(sandbox.sandbox, deps)).rejects.toThrow('probe blew up')
+
+      expect(server.shutdown).toHaveBeenCalledTimes(1)
+      expect(sandbox.release).toHaveBeenCalledTimes(1)
+    })
+
+    it('skips the probe, with an info line, when no model is selected', async () => {
+      const server = fakeServer()
+      const deps = depsFor(server)
+      const logger = createMockLogger()
+
+      const result = await runWith(fakeSandbox().sandbox, deps, {model: null, logger})
+
+      expect(result.success).toBe(true)
+      expect(deps.probeKeyProxy).not.toHaveBeenCalled()
+      expect(logger.info).toHaveBeenCalledWith(expect.stringContaining('probe skipped'), expect.anything())
+    })
+
+    it('skips the probe when the selected model is on a provider the proxy does not serve', async () => {
+      const server = fakeServer()
+      const deps = depsFor(server)
+
+      await runWith(fakeSandbox().sandbox, deps, {model: 'groq/llama'})
+
+      // (the credential gate decides whether that provider is usable)
+      expect(deps.probeKeyProxy).not.toHaveBeenCalled()
+    })
+
+    it('makes no probe when there are no API keys', async () => {
+      const server = fakeServer()
+      const deps = depsFor(server)
+
+      await runWith(fakeSandbox().sandbox, deps, {authJson: '{}', model: null})
+
+      expect(deps.probeKeyProxy).not.toHaveBeenCalled()
     })
   })
 

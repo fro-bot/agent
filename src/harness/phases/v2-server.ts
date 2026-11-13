@@ -46,6 +46,7 @@ import {
 } from '../../services/setup/plugin-install-v2.js'
 import {admitRepoSkills, discardRepoSkillsStaging} from '../../services/setup/repo-skills.js'
 import {toErrorMessage} from '../../shared/errors.js'
+import {probeKeyProxy} from './key-proxy-probe.js'
 import {startKeyProxyProcess} from './key-proxy-process.js'
 import {readV1DatabaseFacts, waitForV1Import} from './v1-import-wait.js'
 
@@ -151,6 +152,8 @@ export interface StartActionOpenCodeV2Deps {
   readonly startOptions?: Partial<StartOpenCodeV2ServerOptions>
   /** Starts the key proxy child of an `isolate-agent` run. */
   readonly startKeyProxy: typeof startKeyProxyProcess
+  /** The start-up probe of the selected provider through the key proxy (isolated runs only). */
+  readonly probeKeyProxy: typeof probeKeyProxy
   /**
    * Test seams for the key proxy supervisor (launcher, upstream CA, timeouts). Production never sets them: nothing reachable
    * from an input, the environment or `opencode-config` can.
@@ -237,6 +240,7 @@ async function readAgentList(
 const defaultDeps: StartActionOpenCodeV2Deps = {
   startServer: startOpenCodeV2Server,
   startKeyProxy: startKeyProxyProcess,
+  probeKeyProxy,
   installPlugins: async installOptions => installPluginsV2({...installOptions, execAdapter: createExecAdapter()}),
   clearClaims: clearHeldClaims,
   admitRepoSkills,
@@ -544,6 +548,31 @@ export async function startActionOpenCodeV2(
 
     const spawnConfig = spawnConfigFromConfig(built.content)
     const modelProvider = modelProviderId(options.model ?? spawnConfig.model)
+
+    // --- 6b. Key proxy probe (isolate-agent) ---------------------------------------------------------------
+    //
+    // The credential gate above is satisfied by the placeholder, so for an isolated run this is the real check of the key.
+    // Only the selected model's provider is probed: another provider's bad key must not block a run that never uses it.
+    if (owned.proxy !== null) {
+      const plan =
+        modelProvider === undefined ? undefined : proxyPlans.find(entry => entry.providerId === modelProvider)
+      if (plan === undefined) {
+        logger.info('Key proxy probe skipped: the selected model is not on a provider the key proxy serves', {
+          provider: modelProvider ?? null,
+        })
+      } else {
+        const probe = await deps.probeKeyProxy({
+          plan,
+          proxy: {baseUrl: owned.proxy.baseUrl, placeholder: owned.proxy.placeholder},
+          logger,
+          ...(runSignal === undefined ? {} : {signal: runSignal}),
+        })
+        if (probe.status === 'failed' || probe.status === 'aborted') {
+          return failAfterSpawn('key-proxy', probe.message)
+        }
+      }
+    }
+
     const requiredProviders = modelProvider === undefined ? keys.data.map(entry => entry.providerId) : [modelProvider]
     if (requiredProviders.length === 0) {
       logger.info('No model or provider credentials configured, credential gate skipped')
