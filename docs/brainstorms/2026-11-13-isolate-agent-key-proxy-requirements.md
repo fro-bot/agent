@@ -27,7 +27,7 @@ The key is a cliproxy key. One key authenticates every cliproxy route, with no p
 
 **Proxy behavior**
 - R3. Model requests reach the real provider with the real credential attached outside the sandbox. Streaming, long responses and provider errors behave as they do on a non-isolated run.
-- R4. The proxy works for every provider the Action provisions from `auth-json` today. Those are API-type entries such as `anthropic` and `openai`, including one whose base URL comes from the caller's `opencode-config` (for example cliproxy).
+- R4. The proxy is gateway-agnostic. It works for every API-type `auth-json` provider whose requests use the Anthropic Messages, OpenAI Responses or OpenAI Chat protocol. The upstream is the operator's configured base URL when one is set, for example a self-hosted gateway, and otherwise the provider's default endpoint. Under isolation, a provider that can't be mapped is refused with a fix, for example one that signs requests.
 - R5. For each provisioned provider, the proxy forwards only an allowlist of method-and-path routes (inference and model listing) to that provider's fixed upstream. It answers anything else locally and never attaches the key to it.
 - R6. The proxy discards every client-supplied credential header and hop-by-hop header, then sets its own credential. It accepts origin-form requests only, never follows a redirect, and never logs request or response headers.
 - R7. The proxy refuses to start unless every upstream is HTTPS. The upstream map is fixed at start and nothing a request carries can change it.
@@ -36,11 +36,16 @@ The key is a cliproxy key. One key authenticates every cliproxy route, with no p
 - R10. A malformed or oversized request gets an error, and the proxy keeps serving. If the proxy cannot start or stops serving, the run fails closed and never falls back to handing the sandbox the real key.
 
 **Start-up check**
-- R11. At start, a bounded auth probe through the proxy proves each required provider accepts its credential, using that provider's model-list route. On a 401 or 403, or no answer within the bound, the run fails before the model starts.
+- R11. At start, a bounded probe of the selected provider's model-list route goes through the proxy. A 401 or 403 fails the run before the model starts. Any other non-2xx, a rate limit, or no answer within the bound logs a warning that names the case, and the run continues. A 2xx means only that the upstream did not reject the key. If an upstream's model list needs no auth, the probe proves only that the upstream is reachable.
 
 **Errors and docs**
 - R12. Every isolation preflight refusal names its fix in the error, for example `persist-credentials: false`, a published `fro-bot/agent@<ref>`, a GitHub-hosted Linux runner, or `isolate-agent: false`.
-- R13. The `isolate-agent` docs say what isolation now hides (provider keys) and what stays reachable: the server password, model spend through the proxy during the run, and credentials a trigger provisions on purpose (the `gh` config in provision mode). The docs live in one canonical section that the README links to.
+- R13. The `isolate-agent` docs state what isolation now hides: the provider keys from `auth-json`. They also state what stays reachable:
+  - the server password, and with it the server's config API;
+  - model spend through the proxy during the run;
+  - credentials a trigger provisions on purpose, such as the `gh` config in provision mode.
+
+  The docs also cover two residuals. The upstream is trusted not to echo the key. The proxy is not an egress control. The docs live in one canonical section, and the README links to it.
 
 ---
 
@@ -50,7 +55,7 @@ The key is a cliproxy key. One key authenticates every cliproxy route, with no p
 - AE2. **Covers R5.** In an isolated run, the model sends the proxy a request with the placeholder, the correct provider host and a path outside the allowlist (a cliproxy management route, say). The proxy answers locally, and no request carrying the key goes upstream.
 - AE3. **Covers R6.** In an isolated run, the model sends a request through the proxy with its own `x-api-key` or `Authorization` header, or an upstream answers with a 3xx. The proxy forwards only its own credential and does not follow the redirect.
 - AE4. **Covers R10.** In an isolated run, the model sends the proxy a malformed or oversized request. It gets an error, and later model requests still work. If the proxy process dies, the next model request fails and the run fails.
-- AE5. **Covers R11.** In an isolated run whose provider key upstream rejects the key, the run fails at start with a credential error before the model runs.
+- AE5. **Covers R11.** In an isolated run where the upstream rejects the key with a 401, the run fails at start with a credential error before the model runs. If the upstream serves only inference and answers 404 on the model list, the run warns and continues.
 - AE6. **Covers R2.** In a run with `isolate-agent` off, credential files and config are the same as before this change.
 
 ---
@@ -80,7 +85,7 @@ The key is a cliproxy key. One key authenticates every cliproxy route, with no p
 - **The proxy runs only under isolation.** Without isolation the model runs as the runner user and could read the proxy's process environment, so the proxy would add complexity and protect nothing.
 - **Allowlisted routes, not just a pinned host.** The cliproxy key opens every cliproxy route, so a host pin alone would still let an injected model reach management routes with the real key.
 - **The flip is a separate decision.** The proxy needs nothing from it. A single operator can get the same coverage by turning the input on in each compatible caller, so whether the flip is worth a breaking release is decided after the proxy ships.
-- The isolate-agent plan is recorded as completed in `docs/plans/2026-11-10-001-feat-isolate-agent-uid-plan.md`. It lists a second tool uid as deferred future work; this doc replaces that with the proxy.
+- The isolate-agent plan is recorded as active in `docs/plans/2026-11-10-001-feat-isolate-agent-uid-plan.md`. It lists a second tool uid as deferred future work; this doc replaces that with the proxy.
 
 ---
 
@@ -95,10 +100,7 @@ The key is a cliproxy key. One key authenticates every cliproxy route, with no p
 
 ### Deferred to Planning
 
-- [Affects R4, R5][Needs research] Which methods and paths each provider's SDK uses, so the allowlist covers inference and model listing and nothing more. Whether any provider signs requests in a way a header rewrite would break.
-- [Affects R5, R9][Technical] Whether the proxy routes by path prefix or uses one port per provider.
-- [Affects R11][Needs research] Each provider's model-list route as an auth probe: whether it costs anything and what rate limits apply.
-- [Affects R3][Technical] Whether any upstream echoes the credential in an error body or header, and whether the proxy should redact the key from responses.
+- [Affects R11][Needs research] Whether each provider's model-list route costs anything, and what rate limits apply.
 
 ---
 
