@@ -369,10 +369,11 @@ With `isolate-agent`, the Action creates a per-run local user, hands it only the
 
 - Published installs only: the preflight walks `<work>/_actions/<owner>/<repo>/<ref>/dist` with `lstat` and refuses a local `uses: ./`, an alias or any symlink on the way; `_actions` is a reserved subtree no handoff grant may touch. Every process-producing step goes through `lifecycle.launch`, which `release` waits for, and the lifecycle is the sole owner of signal handling while a sandbox is live.
 - The order is fixed: handoff after the held-claim clear and before the spawn; on exit, shut down the server, kill and verify every sandbox process, take files back, then read, publish and persist.
+- Provider keys never reach the agent's user: a key proxy child (`dist/key-proxy.js`, `packages/runtime/src/agent/key-proxy.ts`) holds them and swaps in the real key for the agent's per-run placeholder. The lifecycle starts it first and stops it last; an unconfirmed or early exit fails the run. Config mapping: `src/services/setup/key-proxy-providers.ts`.
 - An unconfirmed stop or unsafe take-back fails the run and declines publication and persistence; the post hook never retries a save for an isolated run.
 - Runner-side git runs through `src/features/delegated/trusted-git.ts` against metadata restored from a pre-agent copy; reads of sandbox-writable paths refuse symlinks and special files (`packages/runtime/src/shared/safe-read.ts`).
 
-> See also: [Setup and Configuration](docs/wiki/Setup%20and%20Configuration.md#withholding-is-not-an-os-boundary)
+> See also: [Setup and Configuration](docs/wiki/Setup%20and%20Configuration.md#withholding-is-not-an-os-boundary), [key proxy](docs/wiki/Setup%20and%20Configuration.md#isolate-agent-the-key-proxy)
 
 ### Operator Ingress Trust Policy (Gateway)
 

@@ -69,7 +69,7 @@ const sharedNoExternal = (id: string): boolean => {
 
 export default defineConfig([
   {
-    entry: ['apps/action/src/main.ts', 'apps/action/src/post.ts'],
+    entry: ['apps/action/src/main.ts', 'apps/action/src/post.ts', 'apps/action/src/key-proxy.ts'],
     fixedExtension: false,
     deps: {onlyBundle: false},
     minify: true,

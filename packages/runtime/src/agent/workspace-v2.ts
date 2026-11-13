@@ -34,6 +34,10 @@ export type {
   VerifyCredentialGateOptions,
 } from './credential-gate-v2.js'
 
+export {isForwardableTarget} from './forwardable-target.js'
+
+export type {RouteMatcher} from './forwardable-target.js'
+
 export {isGatewayRouteV2, V2_GATEWAY_ROUTES} from './gateway-routes-v2.js'
 
 export type {V2GatewayRoute} from './gateway-routes-v2.js'

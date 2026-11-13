@@ -48,6 +48,9 @@ import {runReviewReconciliation} from './phases/review-reconciliation.js'
 import {runRouting} from './phases/routing.js'
 import {runSessionPrep} from './phases/session-prep.js'
 
+const KEY_PROXY_CRASHED_DECLINE_REASON =
+  'the isolate-agent key proxy exited unexpectedly, so the run is incomplete and no session state is saved'
+
 export async function run(): Promise<number> {
   const startTime = Date.now()
   const bootstrapLogger = createLogger({phase: 'bootstrap'})
@@ -334,6 +337,14 @@ export async function run(): Promise<number> {
           `isolate-agent: the sandbox was not confirmed stopped and restored: ${sandboxOutcome.reason ?? 'unknown reason'}`,
         )
       }
+      if (sandboxOutcome.proxy === 'crashed') {
+        // The key proxy exited before the teardown asked it to: model requests after that point failed, so the run is
+        // incomplete whatever the session says. Nothing is published or saved.
+        skipSessionPersistence = true
+        persistenceDeclineReason = KEY_PROXY_CRASHED_DECLINE_REASON
+        core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
+        throw new Error('isolate-agent: the key proxy exited unexpectedly during the run')
+      }
     }
     if (execution.sendUncertain === true) {
       // The prompt may have run without this run seeing it. The stop path above already confirmed the directory quiet,
@@ -492,6 +503,10 @@ export async function run(): Promise<number> {
           markSandboxUntrusted()
           skipSessionPersistence = true
           persistenceDeclineReason ??= `the isolate-agent sandbox was not confirmed stopped and restored (${sandboxOutcome.reason ?? 'unknown reason'}), so no session state is saved`
+          core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
+        } else if (sandboxOutcome.proxy === 'crashed') {
+          skipSessionPersistence = true
+          persistenceDeclineReason ??= KEY_PROXY_CRASHED_DECLINE_REASON
           core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
         }
       } catch (sandboxError) {

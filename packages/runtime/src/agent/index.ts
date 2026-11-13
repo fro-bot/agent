@@ -104,10 +104,35 @@ export type {
   V2InterruptReason,
 } from './event-v2.js'
 export {filterAgentEnv} from './filter-env.js'
+export {isForwardableTarget} from './forwardable-target.js'
+export type {RouteMatcher} from './forwardable-target.js'
 export {clearHeldClaims} from './held-claims-v2.js'
 export type {ClearHeldClaimsOutcome} from './held-claims-v2.js'
 export {createInactivityTimer} from './inactivity-timer.js'
 export type {InactivityTimer} from './inactivity-timer.js'
+export {
+  buildKeyProxyUpstream,
+  KEY_PROXY_DEFAULT_PROVIDER_IDS,
+  KEY_PROXY_PROTOCOLS,
+  matchKeyProxyRoute,
+} from './key-proxy-routes.js'
+export type {
+  BuildKeyProxyUpstreamOptions,
+  KeyProxyAuthStyle,
+  KeyProxyProtocol,
+  KeyProxyRoute,
+  KeyProxyUpstream,
+} from './key-proxy-routes.js'
+export {
+  encodeKeyProxyConfig,
+  KEY_PROXY_CONFIG_VERSION,
+  KEY_PROXY_MAX_CONFIG_BYTES,
+  parseKeyProxyChildLine,
+  parseKeyProxyConfig,
+  readKeyProxyFrameLength,
+} from './key-proxy-wire.js'
+export type {KeyProxyChildErrorCode, KeyProxyChildLine, KeyProxyWireConfig} from './key-proxy-wire.js'
+export type {KeyProxyLimits, KeyProxyProviderConfig, KeyProxyServer, StartKeyProxyOptions} from './key-proxy.js'
 export {
   createV2LedgerReconcileAdapter,
   DEFAULT_V2_LIST_MAX_PAGES,
